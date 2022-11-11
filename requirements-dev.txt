@@ -1,0 +1,16 @@
+sanic
+git+https://github.com/samuelcolvin/arq
+gino
+python-dotenv
+alembic
+ijson
+python-dateutil
+aiofile
+async_unzip
+httpx
+humanize
+pyaml
+pytz
+msgpack
+pylightxl
+fastcrc
