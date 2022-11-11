@@ -21,7 +21,7 @@ else:
 HTTP_CHUNK_SIZE = 512 * 1024
 headers = {'user-agent': 'Mozilla/5.0 (compatible; Healthporta Healthcare MRF API Importer/1.0; +https://github.com/EndurantDevs/healthcare-mrf-api)'}
 
-timeout = httpx.Timeout(20.0)
+timeout = httpx.Timeout(30.0)
 client = httpx.AsyncClient(transport=transport, timeout=timeout, headers=headers, follow_redirects=True)
 
 async def download_it(url):
@@ -91,12 +91,17 @@ def make_class(Base, table_suffix):
     return MyClass
 
 err_obj_list = []
+err_obj_key = {}
 
 async def log_error(type, error, issuer_array, url, source, level, cls):
     for issuer_id in issuer_array:
         checksum = '|'.join([type, str(error), str(issuer_id), str(url), source, level])
         checksum = bytes(checksum, 'utf-8')
         checksum = crc32.cksum(checksum)
+        if checksum in err_obj_key:
+            return
+
+        err_obj_key[checksum] = True
         err_obj_list.append({
             'issuer_id': issuer_id,
             'checksum': checksum,
@@ -106,13 +111,14 @@ async def log_error(type, error, issuer_array, url, source, level, cls):
             'source': source,
             'level': level
         })
-        if len(err_obj_list) > 99:
+        if len(err_obj_list) > 200:
             await flush_error_log(cls)
-            
+
 
 async def flush_error_log(cls):
     await push_objects(err_obj_list, cls)
     err_obj_list.clear()
+    err_obj_key.clear()
 
 
 async def push_objects(obj_list, cls):

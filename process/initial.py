@@ -32,10 +32,12 @@ async def process_plan(ctx, task):
     with tempfile.TemporaryDirectory() as tmpdirname:
         p = Path(task.get('url'))
         tmp_filename = str(PurePath(str(tmpdirname), p.name))
-
-        await download_it_and_save(task.get('url'), tmp_filename,
-                                   context={'issuer_array': task['issuer_array'], 'source': 'plans'},
-                                   logger=myimportlog)
+        try:
+            await download_it_and_save(task.get('url'), tmp_filename,
+                                       context={'issuer_array': task['issuer_array'], 'source': 'plans'},
+                                       logger=myimportlog)
+        except:
+            return
 
         async with async_open(tmp_filename, 'rb') as afp:
             plan_obj = []
