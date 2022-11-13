@@ -15,7 +15,7 @@ class MRF:
     on_startup = startup
     on_shutdown = shutdown
     max_jobs=10
-    queue_read_limit = 5
+    # queue_read_limit = 5
     redis_settings = RedisSettings.from_dsn(os.environ.get('HLTHPRT_REDIS_ADDRESS'))
     job_serializer = msgpack.packb
     job_deserializer = lambda b: msgpack.unpackb(b, raw=False)

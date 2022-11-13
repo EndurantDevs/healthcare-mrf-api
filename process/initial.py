@@ -307,6 +307,9 @@ async def init_file(ctx):
                 else:
                     url2issuer[obj['mrf_url']] = [obj['issuer_id'], ]
             count += 1
+            if not (count % 100):
+                await push_objects(obj_list, myissuer)
+                obj_list.clear()
 
         url_list = list(set(url_list))
         await push_objects(obj_list, myissuer)
