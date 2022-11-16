@@ -3,7 +3,7 @@ aiofiles==22.1.0
 alembic==1.8.1
 anyio==3.6.1
 appdirs==1.4.4
-arq @ git+https://github.com/samuelcolvin/arq@1495be6c234509df1dfdc0db620388d909c8cdb8
+arq==0.24
 async-timeout==4.0.2
 async-unzip==0.2.1
 asyncpg==0.26.0

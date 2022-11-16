@@ -1,5 +1,5 @@
 import os
-from sqlalchemy import DateTime, Column, String, Integer, Float, BigInteger, Boolean, ARRAY, JSON, DATE, TEXT
+from sqlalchemy import DateTime, Column, String, Integer, Float, BigInteger, Boolean, ARRAY, JSON, TIMESTAMP, TEXT
 
 from db.connection import db
 from db.json_mixin import JSONOutputMixin
@@ -79,7 +79,7 @@ class Plan(db.Model, JSONOutputMixin):
     plan_contact = Column(String)
     network = Column(ARRAY(String))
     benefits = Column(ARRAY(JSON))
-    last_updated_on = Column(DATE)
+    last_updated_on = Column(TIMESTAMP)
 
 
 class PlanTransparency(db.Model, JSONOutputMixin):

@@ -51,7 +51,7 @@ async def process_plan(ctx, task):
                                     'plan_id', 'plan_id_type', 'marketing_name', 'summary_url', 'plan_contact',
                                     'network',
                                     'formulary', 'last_updated_on'):
-                                if not (k in res and res[k]):
+                                if not (k in res and res[k] is not None):
                                     await log_error('err',
                                                     f"Mandatory field `{k}` is not present or incorrect. Plan ID: "
                                                     f"{res['plan_id']}, year: {year}",
@@ -78,7 +78,8 @@ async def process_plan(ctx, task):
                                 'plan_contact': res['plan_contact'],
                                 'network': [(k['network_tier']) for k in res['network']],
                                 'benefits': res.get('benefits', []),
-                                'last_updated_on': parse_date(res['last_updated_on'], fuzzy=True)
+                                'last_updated_on': datetime.datetime.combine(
+                                    parse_date(res['last_updated_on'], fuzzy=True), datetime.datetime.min.time())
                             }
                             plan_obj.append(obj)
                             if count > int(os.environ.get('HLTHPRT_SAVE_PER_PACK', 50)):
@@ -101,9 +102,9 @@ async def process_plan(ctx, task):
                                         formulary['cost_sharing']:
                                     try:
                                         for k in ('drug_tier', 'mail_order'):
-                                            if not (k in res and res[k]):
+                                            if not (k in formulary and formulary[k] is not None):
                                                 await log_error('err',
-                                                                f"Mandatory field `{k}` in `Formulary` sub-type is "
+                                                                f"Mandatory field `{k}` in Formulary (`formulary`) sub-type is "
                                                                 f"not present or "
                                                                 f"incorrect. Plan ID: "
                                                                 f"{res['plan_id']}, year: {year}",
@@ -113,9 +114,9 @@ async def process_plan(ctx, task):
                                         for cost_sharing in formulary['cost_sharing']:
                                             for k in ('pharmacy_type', 'copay_amount', 'copay_opt', 'coinsurance_rate',
                                                       'coinsurance_opt'):
-                                                if not (k in res and res[k]):
+                                                if not (k in cost_sharing):
                                                     await log_error('err',
-                                                                    f"Mandatory field `{k}` in `Cost Sharing` "
+                                                                    f"Mandatory field `{k}` in Cost Sharing (`cost_sharing`) "
                                                                     f"sub-type is not present or "
                                                                     f"incorrect. Plan ID: "
                                                                     f"{res['plan_id']}, year: {year}",
