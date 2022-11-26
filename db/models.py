@@ -39,6 +39,7 @@ class Issuer(db.Model, JSONOutputMixin):
     state = Column(String(2))
     issuer_id = Column(Integer)
     issuer_name = Column(String)
+    issuer_marketing_name = Column(String)
     mrf_url = Column(String)
     data_contact_email = Column(String)
 
@@ -80,6 +81,19 @@ class Plan(db.Model, JSONOutputMixin):
     network = Column(ARRAY(String))
     benefits = Column(ARRAY(JSON))
     last_updated_on = Column(TIMESTAMP)
+
+class PlanAttributes(db.Model, JSONOutputMixin):
+    __tablename__ = 'plan_attributes'
+    __main_table__ = __tablename__
+    __table_args__ = (
+        {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
+    )
+    __my_index_elements__ = ['full_plan_id', 'year', 'attr_name']
+    full_plan_id = Column(db.String(17), nullable=False)
+    year = Column(Integer)
+    attr_name = Column(String)
+    attr_value = Column(String)
+
 
 
 class PlanTransparency(db.Model, JSONOutputMixin):
