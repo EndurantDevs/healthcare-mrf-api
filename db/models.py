@@ -1,5 +1,5 @@
 import os
-from sqlalchemy import DateTime, Column, String, Integer, Float, BigInteger, Boolean, ARRAY, JSON, TIMESTAMP, TEXT
+from sqlalchemy import DateTime, DATE, Column, String, Integer, Float, BigInteger, Boolean, ARRAY, JSON, TIMESTAMP, TEXT
 
 from db.connection import db
 from db.json_mixin import JSONOutputMixin
@@ -114,3 +114,108 @@ class PlanTransparency(db.Model, JSONOutputMixin):
     plan_type = Column(String)
     metal = Column(String)
     claims_payment_policies_url = Column(String)
+
+class NPIData(db.Model, JSONOutputMixin):
+    __tablename__ = 'npi'
+    __main_table__ = __tablename__
+    __table_args__ = (
+        {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
+    )
+    __my_index_elements__ = ['npi']
+    npi = Column(BigInteger)
+    employer_identification_number = Column(String)
+    entity_type_code = Column(Integer)
+    replacement_npi = Column(BigInteger)
+    provider_organization_name = Column(String)
+    provider_last_name = Column(String)
+    provider_first_name = Column(String)
+    provider_middle_name = Column(String)
+    provider_name_prefix_text = Column(String)
+    provider_name_suffix_text = Column(String)
+    provider_credential_text = Column(String)
+    provider_other_organization_name = Column(String)
+    provider_other_organization_name_type_code = Column(String)
+    provider_other_last_name = Column(String)
+    provider_other_first_name = Column(String)
+    provider_other_middle_name = Column(String)
+    provider_other_name_prefix_text = Column(String)
+    provider_other_name_suffix_text = Column(String)
+    provider_other_credential_text = Column(String)
+    provider_other_last_name_type_code = Column(String)
+    provider_first_line_business_mailing_address = Column(String)
+    provider_second_line_business_mailing_address = Column(String)
+    provider_business_mailing_address_city_name = Column(String)
+    provider_business_mailing_address_state_name = Column(String)
+    provider_business_mailing_address_postal_code = Column(String)
+    provider_business_mailing_address_country_code = Column(String)
+    provider_business_mailing_address_telephone_number = Column(String)
+    provider_business_mailing_address_fax_number = Column(String)
+    provider_first_line_business_practice_location_address = Column(String)
+    provider_second_line_business_practice_location_address = Column(String)
+    provider_business_practice_location_address_city_name = Column(String)
+    provider_business_practice_location_address_state_name = Column(String)
+    provider_business_practice_location_address_postal_code = Column(String)
+    provider_business_practice_location_address_country_code = Column(String)
+    provider_business_practice_location_address_telephone_number = Column(String)
+    provider_business_practice_location_address_fax_number = Column(String)
+    provider_enumeration_date = Column(DATE)
+    last_update_date = Column(DATE)
+    npi_deactivation_reason_code = Column(String)
+    npi_deactivation_date = Column(DATE)
+    npi_reactivation_date = Column(DATE)
+    provider_gender_code = Column(String)
+    authorized_official_last_name = Column(String)
+    authorized_official_first_name = Column(String)
+    authorized_official_middle_name = Column(String)
+    authorized_official_title_or_position = Column(String)
+    authorized_official_telephone_number = Column(String)
+    is_sole_proprietor = Column(String)
+    is_organization_subpart = Column(String)
+    parent_organization_lbn = Column(String)
+    parent_organization_tin = Column(String)
+    authorized_official_name_prefix_text = Column(String)
+    authorized_official_name_suffix_text = Column(String)
+    authorized_official_credential_text = Column(String)
+    certification_date = Column(DATE)
+
+class NPIDataTaxonomy(db.Model, JSONOutputMixin):
+    __tablename__ = 'npi_taxonomy'
+    __main_table__ = __tablename__
+    __table_args__ = (
+        {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
+    )
+    __my_index_elements__ = ['npi', 'checksum']
+
+    npi = Column(BigInteger)
+    checksum = Column(BigInteger)
+    healthcare_provider_taxonomy_code = Column(String)
+    provider_license_number = Column(String)
+    provider_license_number_state_code = Column(String)
+    healthcare_provider_primary_taxonomy_switch = Column(String)
+
+class NPIDataOtherIdentifier(db.Model, JSONOutputMixin):
+    __tablename__ = 'npi_other_identifier'
+    __main_table__ = __tablename__
+    __table_args__ = (
+        {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
+    )
+    __my_index_elements__ = ['npi', 'checksum']
+
+    npi = Column(BigInteger)
+    checksum = Column(BigInteger)
+    other_provider_identifier = Column(String)
+    other_provider_identifier_type_code = Column(String)
+    other_provider_identifier_state = Column(String)
+    other_provider_identifier_issuer = Column(String)
+
+class NPIDataTaxonomyGroup(db.Model, JSONOutputMixin):
+    __tablename__ = 'npi_taxonomy_group'
+    __main_table__ = __tablename__
+    __table_args__ = (
+        {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
+    )
+    __my_index_elements__ = ['npi', 'checksum']
+
+    npi = Column(BigInteger)
+    checksum = Column(BigInteger)
+    healthcare_provider_taxonomy_group = Column(String)

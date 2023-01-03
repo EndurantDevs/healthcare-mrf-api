@@ -1,7 +1,9 @@
 import os
 import datetime
 import httpx
+from pathlib import Path, PurePath
 import gino
+from aioshutil import copyfile
 import ssl
 from gino.exceptions import GinoException
 from asyncpg.exceptions import UniqueViolationError, InterfaceError
@@ -41,36 +43,45 @@ async def download_it_and_save_nostream(url, filepath):
 
 
 
-async def download_it_and_save(url, filepath, context=None, logger=None):
-    async with async_open(filepath, 'wb+') as afp:
-        try:
-            async with client.stream('GET', url) as response:
-                try:
-                    response.raise_for_status()
-                except httpx.HTTPStatusError as exc:
-                    if context and logger:
-                        await log_error('err',
-                                        f"Error response {exc.response.status_code} while requesting {exc.request.url!r}.",
-                                        context['issuer_array'], url, context['source'], 'network', logger)
-                    Retry()
+async def download_it_and_save(url, filepath, chunk_size=None, context=None, logger=None, cache_dir=None):
+    max_chunk_size = chunk_size if chunk_size else HTTP_CHUNK_SIZE
+    file_with_dir = None
+    if cache_dir:
+        file_with_dir = str(PurePath(str(cache_dir), str(return_checksum([url]))))
+    if cache_dir and file_with_dir and os.path.exists(file_with_dir):
+        await copyfile(file_with_dir, filepath)
+    else:
+        async with async_open(filepath, 'wb+') as afp:
+            try:
+                async with client.stream('GET', url) as response:
+                    try:
+                        response.raise_for_status()
+                    except httpx.HTTPStatusError as exc:
+                        if context and logger:
+                            await log_error('err',
+                                            f"Error response {exc.response.status_code} while requesting {exc.request.url!r}.",
+                                            context['issuer_array'], url, context['source'], 'network', logger)
+                        Retry()
 
-                try:
-                    async for chunk in response.aiter_bytes(chunk_size=HTTP_CHUNK_SIZE):
-                        await afp.write(chunk)
-                except (httpx.RequestError, httpx.ReadTimeout, httpx.TimeoutException, httpx.ReadError, httpx.NetworkError) as err:
-                    if context and logger:
-                        await log_error('err',
-                                        f"Error response while downloading "
-                                        f"{exc.request.url!r}.",
-                                        context['issuer_array'], url, context['source'], 'network', logger)
-                    Retry()
-        except ssl.SSLCertVerificationError as err:
-            if context and logger:
-                await log_error('err',
-                                f"SSL Error. {err}"
-                                f"URL: {url}.",
-                                context['issuer_array'], url, context['source'], 'network', logger)
-            Retry()
+                    try:
+                        async for chunk in response.aiter_bytes(chunk_size=max_chunk_size):
+                            await afp.write(chunk)
+                    except (httpx.RequestError, httpx.ReadTimeout, httpx.TimeoutException, httpx.ReadError, httpx.NetworkError) as err:
+                        if context and logger:
+                            await log_error('err',
+                                            f"Error response while downloading "
+                                            f"{exc.request.url!r}.",
+                                            context['issuer_array'], url, context['source'], 'network', logger)
+                        Retry()
+            except ssl.SSLCertVerificationError as err:
+                if context and logger:
+                    await log_error('err',
+                                    f"SSL Error. {err}"
+                                    f"URL: {url}.",
+                                    context['issuer_array'], url, context['source'], 'network', logger)
+                Retry()
+        if cache_dir and file_with_dir:
+            await copyfile(filepath, file_with_dir)
 
 
 def make_class(Base, table_suffix):
@@ -93,11 +104,16 @@ def make_class(Base, table_suffix):
 err_obj_list = []
 err_obj_key = {}
 
+def return_checksum(arr: list):
+    for i in range(0, len(arr)):
+        arr[i] = str(arr[i])
+    checksum = '|'.join(arr)
+    checksum = bytes(checksum, 'utf-8')
+    return crc32.cksum(checksum)
+
 async def log_error(type, error, issuer_array, url, source, level, cls):
     for issuer_id in issuer_array:
-        checksum = '|'.join([type, str(error), str(issuer_id), str(url), source, level])
-        checksum = bytes(checksum, 'utf-8')
-        checksum = crc32.cksum(checksum)
+        checksum = return_checksum([type, str(error), str(issuer_id), str(url), source, level])
         if checksum in err_obj_key:
             return
 
@@ -121,7 +137,7 @@ async def flush_error_log(cls):
     err_obj_key.clear()
 
 
-async def push_objects(obj_list, cls):
+async def push_objects_slow(obj_list, cls):
     if obj_list:
         try:
             if hasattr(cls, "__my_index_elements__"):
@@ -136,6 +152,71 @@ async def push_objects(obj_list, cls):
                 except (GinoException, UniqueViolationError) as e:
                     print(e)
 
+class IterateList:
+
+    def __init__(self, obj_list):
+        self.end = len(obj_list)
+        self.start = 0
+        self.obj_list = obj_list
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self.start < self.end:
+            cur_pos = self.start
+            self.start += 1
+            return list(self.obj_list[cur_pos].values())
+        else:
+            raise StopAsyncIteration
+
+
+async def push_objects(obj_list, cls, rewrite=False):
+    if obj_list:
+        if len(obj_list) == 1:
+            return await push_objects_slow(obj_list, cls)
+
+        try:
+            async with db.acquire() as conn:
+                await conn.raw_connection.copy_records_to_table(cls.__tablename__,
+                                                                schema_name=cls.__table_args__[0]['schema'],
+                                                                columns=obj_list[0].keys(), records=IterateList(obj_list))
+            # print("All good!")
+        except ValueError:
+            print(f"INPUT arr: {obj_list}")
+        except UniqueViolationError:
+            # print("It is here!")
+            try:
+                rows_per_insert = 200
+                obj_length = len(obj_list)
+                insert_number = int (obj_length / rows_per_insert)
+                #fix this - rewrite the slow part!!
+                for i in range(0, insert_number+1):
+                    rows_to = (i+1)*rows_per_insert
+                    if rows_to > obj_length:
+                        rows_to = obj_length
+                    if rewrite:
+                        await cls.insert().gino.all(obj_list[i * rows_per_insert:rows_to])
+                    else:
+                        if hasattr(cls, "__my_index_elements__"):
+                            await insert(cls).values(obj_list[i * rows_per_insert:rows_to]).on_conflict_do_nothing(
+                                index_elements=cls.__my_index_elements__).gino.model(cls).status()
+                        else:
+                            await cls.insert().gino.all(obj_list[i*rows_per_insert:rows_to])
+            except (GinoException, UniqueViolationError, InterfaceError):
+                # print("So bad, It is here!")
+                for obj in obj_list:
+                    try:
+                        if rewrite:
+                            # print(f"UPDATING: {obj}")
+                            await insert(cls).values([obj]).on_conflict_do_update(
+                                index_elements=cls.__my_index_elements__,
+                                set_=obj
+                            ).gino.model(cls).status()
+                        else:
+                            await cls.insert().gino.all([obj])
+                    except (GinoException, UniqueViolationError) as e:
+                        print(e)
 
 def print_time_info(start):
     now = datetime.datetime.now()

@@ -46,7 +46,7 @@ async def all_plans(request):
 @blueprint.get('/all/variants')
 async def all_plans(request):
     plan_data = await db.select(
-        [Plan.marketing_name, Plan.plan_id, PlanAttributes.full_plan_id, Plan.year]).select_from(Plan.join(PlanAttributes, Plan.plan_id == func.substr(PlanAttributes.full_plan_id, 1, 14))).\
+        [Plan.marketing_name, Plan.plan_id, PlanAttributes.full_plan_id, Plan.year]).select_from(Plan.join(PlanAttributes, ((Plan.plan_id == func.substr(PlanAttributes.full_plan_id, 1, 14)) & (Plan.year == PlanAttributes.year)))).\
         group_by(PlanAttributes.full_plan_id, Plan.plan_id, Plan.marketing_name, Plan.year).gino.all()
     data = []
     for p in plan_data:

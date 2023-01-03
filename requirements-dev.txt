@@ -15,3 +15,5 @@ pytz
 msgpack
 pylightxl
 fastcrc
+socksio
+aioshutil
