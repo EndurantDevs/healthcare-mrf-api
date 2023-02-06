@@ -9,14 +9,19 @@ from gino.exceptions import GinoException
 from asyncpg.exceptions import UniqueViolationError, InterfaceError
 from aiofile import async_open
 from arq import Retry
-from fastcrc import crc32
+from fastcrc import crc32, crc16
 import humanize
 from sqlalchemy.dialects.postgresql import insert
 from db.connection import db
+from random import choice
+import json
 from db.json_mixin import JSONOutputMixin
 
 if os.environ.get('HLTHPRT_SOCKS_PROXY'):
-    transport = httpx.AsyncHTTPTransport(retries=3, proxy=httpx.Proxy(os.environ['HLTHPRT_SOCKS_PROXY']))
+    print(os.environ.get('HLTHPRT_SOCKS_PROXY'))
+    print(json.loads(os.environ.get('HLTHPRT_SOCKS_PROXY')))
+    transport = httpx.AsyncHTTPTransport(retries=3,
+                                         proxy=httpx.Proxy(choice(json.loads(os.environ['HLTHPRT_SOCKS_PROXY']))))
 else:
     transport = httpx.AsyncHTTPTransport(retries=3)
 
@@ -104,12 +109,15 @@ def make_class(Base, table_suffix):
 err_obj_list = []
 err_obj_key = {}
 
-def return_checksum(arr: list):
+def return_checksum(arr: list, crc=32):
     for i in range(0, len(arr)):
         arr[i] = str(arr[i])
     checksum = '|'.join(arr)
     checksum = bytes(checksum, 'utf-8')
+    if crc == 16:
+        return crc16.xmodem(checksum)
     return crc32.cksum(checksum)
+
 
 async def log_error(type, error, issuer_array, url, source, level, cls):
     for issuer_id in issuer_array:

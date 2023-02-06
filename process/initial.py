@@ -283,7 +283,7 @@ async def init_file(ctx):
 
         tmp_filename = glob.glob(f"{tmpdirname}/*.xlsx")[0]
         xls_file = xl.readxl(tmp_filename)
-        ws_name = xls_file.ws_names[1]
+        ws_name = xls_file.ws_names[-1]
         os.unlink(tmp_filename)
 
         count = 0
@@ -363,6 +363,14 @@ async def shutdown(ctx):
     db_schema = os.getenv('DB_SCHEMA') if os.getenv('DB_SCHEMA') else 'mrf'
     await db.status("CREATE EXTENSION IF NOT EXISTS pg_trgm;")
     await db.status("CREATE EXTENSION IF NOT EXISTS btree_gin;")
+
+    test = make_class(Plan, import_date)
+    plans_count = await db.func.count(test.plan_id).gino.scalar()
+    if (not plans_count) or (plans_count < 500):
+        print(f"Failed Import: Plans number:{plans_count}")
+        exit(1)
+
+
 
     tables = {}
     async with db.transaction():

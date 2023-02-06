@@ -7,23 +7,25 @@ import click
 from asyncpg import connection
 from asyncpg.connection import ServerCapabilities
 from sanic import Sanic
+
+env_path = Path(__file__).absolute().parent / '.env'
+from dotenv import load_dotenv
+load_dotenv(dotenv_path=env_path)
 from api import init_api
 
-from dotenv import load_dotenv
+
 import arq.cli
 
 from db.migrator import db_group
 
-
-env_path = Path(__file__).absolute().parent / '.env'
-load_dotenv(dotenv_path=env_path)
 with open(os.environ['HLTHPRT_LOG_CFG'], encoding="utf-8") as fobj:
     logging.config.dictConfig(yaml.safe_load(fobj))
 
 from process import process_group
 
 
-
+api = Sanic('mrf-api', env_prefix="HLTHPRT_")
+init_api(api)
 
 @click.command(help="Run sanic server")
 @click.option('--host', help='Setup host ip to listen up, default to 0.0.0.0', default='0.0.0.0')
@@ -39,10 +41,8 @@ def start(host, port, workers, debug, accesslog):
         sql_reset=False,
         sql_close_all=False
     )
-    api = Sanic(__name__, env_prefix="HLTHPRT_")
     if debug:
         os.environ['HLTHPRT_DB_ECHO'] = 'True'
-    init_api(api)
     with open(api.config['LOG_CFG']) as fobj:
         logging.config.dictConfig(yaml.safe_load(fobj))
     api.run(

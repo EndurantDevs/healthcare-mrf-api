@@ -1,5 +1,5 @@
 import os
-from sqlalchemy import DateTime, DATE, Column, String, Integer, Float, BigInteger, Boolean, ARRAY, JSON, TIMESTAMP, TEXT
+from sqlalchemy import DateTime, Numeric, DATE, Column, String, Integer, Float, BigInteger, Boolean, ARRAY, JSON, TIMESTAMP, TEXT
 
 from db.connection import db
 from db.json_mixin import JSONOutputMixin
@@ -95,7 +95,6 @@ class PlanAttributes(db.Model, JSONOutputMixin):
     attr_value = Column(String)
 
 
-
 class PlanTransparency(db.Model, JSONOutputMixin):
     __tablename__ = 'plan_transparency'
     __main_table__ = __tablename__
@@ -114,6 +113,7 @@ class PlanTransparency(db.Model, JSONOutputMixin):
     plan_type = Column(String)
     metal = Column(String)
     claims_payment_policies_url = Column(String)
+
 
 class NPIData(db.Model, JSONOutputMixin):
     __tablename__ = 'npi'
@@ -142,22 +142,6 @@ class NPIData(db.Model, JSONOutputMixin):
     provider_other_name_suffix_text = Column(String)
     provider_other_credential_text = Column(String)
     provider_other_last_name_type_code = Column(String)
-    provider_first_line_business_mailing_address = Column(String)
-    provider_second_line_business_mailing_address = Column(String)
-    provider_business_mailing_address_city_name = Column(String)
-    provider_business_mailing_address_state_name = Column(String)
-    provider_business_mailing_address_postal_code = Column(String)
-    provider_business_mailing_address_country_code = Column(String)
-    provider_business_mailing_address_telephone_number = Column(String)
-    provider_business_mailing_address_fax_number = Column(String)
-    provider_first_line_business_practice_location_address = Column(String)
-    provider_second_line_business_practice_location_address = Column(String)
-    provider_business_practice_location_address_city_name = Column(String)
-    provider_business_practice_location_address_state_name = Column(String)
-    provider_business_practice_location_address_postal_code = Column(String)
-    provider_business_practice_location_address_country_code = Column(String)
-    provider_business_practice_location_address_telephone_number = Column(String)
-    provider_business_practice_location_address_fax_number = Column(String)
     provider_enumeration_date = Column(DATE)
     last_update_date = Column(DATE)
     npi_deactivation_reason_code = Column(String)
@@ -185,6 +169,7 @@ class NPIDataTaxonomy(db.Model, JSONOutputMixin):
         {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['npi', 'checksum']
+    __my_additional_indexes__ = [{'index_elements': ('healthcare_provider_taxonomy_code', 'npi',)}, ]
 
     npi = Column(BigInteger)
     checksum = Column(BigInteger)
@@ -219,3 +204,72 @@ class NPIDataTaxonomyGroup(db.Model, JSONOutputMixin):
     npi = Column(BigInteger)
     checksum = Column(BigInteger)
     healthcare_provider_taxonomy_group = Column(String)
+
+
+class NUCCTaxonomy(db.Model, JSONOutputMixin):
+    __tablename__ = 'nucc_taxonomy'
+    __main_table__ = __tablename__
+    __table_args__ = (
+        {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
+    )
+    __my_index_elements__ = ['code']
+    __my_additional_indexes__ = [{'index_elements': ('int_code',)}, {'index_elements': ('display_name',)}]
+
+    int_code = Column(Integer)
+    code = Column(String)
+    grouping = Column(String)
+    classification = Column(String)
+    specialization = Column(String)
+    definition = Column(TEXT)
+    notes = Column(TEXT)
+    display_name = Column(String)
+    section = Column(String)
+
+
+
+class AddressPrototype(db.Model, JSONOutputMixin):
+    __table_args__ = (
+        {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
+    )
+
+    checksum = Column(BigInteger)
+    first_line = Column(String)
+    second_line  = Column(String)
+    city_name = Column(String)
+    state_name = Column(String)
+    postal_code = Column(String)
+    country_code = Column(String)
+    telephone_number = Column(String)
+    fax_number = Column(String)
+    formatted_address = Column(String)
+    lat = Column(Numeric(scale=8, precision=11, asdecimal=False, decimal_return_scale=None))
+    long = Column(Numeric(scale=8, precision=11, asdecimal=False, decimal_return_scale=None))
+    date_added = Column(DATE)
+    place_id = Column(String)
+
+
+class AddressArchive(AddressPrototype):
+    __tablename__ = 'address_archive'
+    __main_table__ = __tablename__
+    __my_index_elements__ = ['checksum']
+    # __my_additional_indexes__ = [{'index_elements': ('healthcare_provider_taxonomy_code', 'npi',)}, ]
+
+
+class NPIAddress(AddressPrototype):
+    __tablename__ = 'npi_address'
+    __main_table__ = __tablename__
+    __my_index_elements__ = ['npi', 'checksum', 'type']
+    __my_additional_indexes__ = [{'index_elements': ('postal_code',)},
+        {'index_elements': ('checksum',), 'using': 'gin'},
+        {'index_elements': ('city_name', 'state_name', 'country_code'), 'using': 'gin'},
+        {'index_elements': (
+        'Geography(ST_MakePoint(long, lat))', 'taxonomy_array gist__intbig_ops', 'plans_array gist__intbig_ops'),
+            'using': 'gist',
+            'name': 'geo_index_with_taxonomy_and_plans'}]
+
+    npi = Column(BigInteger)
+    type = Column(String)
+    taxonomy_array = Column(ARRAY(Integer))
+    plans_array = Column(ARRAY(Integer))
+
+    # NPI	Provider Secondary Practice Location Address- Address Line 1	Provider Secondary Practice Location Address-  Address Line 2	Provider Secondary Practice Location Address - City Name	Provider Secondary Practice Location Address - State Name	Provider Secondary Practice Location Address - Postal Code	Provider Secondary Practice Location Address - Country Code (If outside U.S.)	Provider Secondary Practice Location Address - Telephone Number	Provider Secondary Practice Location Address - Telephone Extension	Provider Practice Location Address - Fax Number

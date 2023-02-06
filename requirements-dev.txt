@@ -1,6 +1,6 @@
 aiocsv
 sanic
-git+https://github.com/samuelcolvin/arq
+arq
 gino
 python-dotenv
 alembic
