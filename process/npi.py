@@ -337,7 +337,6 @@ GROUP BY npi) as b WHERE addr.npi = b.npi;""")
                 f"long = b.long, "
                 f"place_id = b.place_id FROM {db_schema}.address_archive as b WHERE a.checksum = b.checksum")
 
-
         if hasattr(cls, '__my_additional_indexes__') and cls.__my_additional_indexes__:
             for index in cls.__my_additional_indexes__:
                 index_name = index.get('name', '_'.join(index.get('index_elements')))
@@ -350,7 +349,7 @@ GROUP BY npi) as b WHERE addr.npi = b.npi;""")
                 print(create_index_sql)
                 x = await db.status(create_index_sql)
 
-        print(f"VACUUM FULL ANALYZE {db_schema}.{obj.__tablename__};");
+        print(f"Post-Index VACUUM FULL ANALYZE {db_schema}.{obj.__tablename__};");
         await db.status(f"VACUUM FULL ANALYZE {db_schema}.{obj.__tablename__};")
 
     async with db.transaction() as tx:

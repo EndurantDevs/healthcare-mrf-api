@@ -16,7 +16,7 @@ import pylightxl as xl
 from sqlalchemy.dialects.postgresql import insert
 
 from process.ext.utils import download_it_and_save, make_class, push_objects, log_error, print_time_info, \
-    flush_error_log
+    flush_error_log, return_checksum
 from db.models import ImportHistory, ImportLog, Issuer, Plan, PlanFormulary, PlanTransparency, db
 from db.connection import init_db
 from asyncpg import DuplicateTableError
@@ -79,7 +79,8 @@ async def process_plan(ctx, task):
                                 'network': [(k['network_tier']) for k in res['network']],
                                 'benefits': res.get('benefits', []),
                                 'last_updated_on': datetime.datetime.combine(
-                                    parse_date(res['last_updated_on'], fuzzy=True), datetime.datetime.min.time())
+                                    parse_date(res['last_updated_on'], fuzzy=True), datetime.datetime.min.time()),
+                                'checksum': return_checksum([res['plan_id'].lower(), year], crc=32)
                             }
                             plan_obj.append(obj)
                             if count > int(os.environ.get('HLTHPRT_SAVE_PER_PACK', 50)):

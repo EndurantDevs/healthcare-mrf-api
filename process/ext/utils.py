@@ -18,8 +18,6 @@ import json
 from db.json_mixin import JSONOutputMixin
 
 if os.environ.get('HLTHPRT_SOCKS_PROXY'):
-    print(os.environ.get('HLTHPRT_SOCKS_PROXY'))
-    print(json.loads(os.environ.get('HLTHPRT_SOCKS_PROXY')))
     transport = httpx.AsyncHTTPTransport(retries=3,
                                          proxy=httpx.Proxy(choice(json.loads(os.environ['HLTHPRT_SOCKS_PROXY']))))
 else:
@@ -116,7 +114,7 @@ def return_checksum(arr: list, crc=32):
     checksum = bytes(checksum, 'utf-8')
     if crc == 16:
         return crc16.xmodem(checksum)
-    return crc32.cksum(checksum)
+    return crc32.cksum(checksum)-2147483648
 
 
 async def log_error(type, error, issuer_array, url, source, level, cls):

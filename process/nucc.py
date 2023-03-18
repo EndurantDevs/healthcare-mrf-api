@@ -46,7 +46,7 @@ async def process_data(ctx):
 
             row_list = []
             myNUCCTaxonomy = make_class(NUCCTaxonomy, import_date)
-            async with async_open(tmp_filename, 'r') as afp:
+            async with async_open(tmp_filename, 'r', encoding='latin1') as afp:
                 async for row in AsyncDictReader(afp, delimiter=","):
                     if not (row['Code']):
                         continue
@@ -60,14 +60,12 @@ async def process_data(ctx):
                             obj[csv_map[key]] = None
                             continue
                         obj[csv_map[key]] = t
-                    obj['int_code'] = return_checksum([obj['code'],], crc=16)
+                    obj['int_code'] = return_checksum([obj['code'],], crc=32)
                     row_list.append(obj)
-                    if count > 9999:
+                    if count / 9999 == 0:
                         await push_objects(row_list, myNUCCTaxonomy)
                         row_list.clear()
-                        count = 0
-                    else:
-                        count += 1
+
 
             await push_objects(row_list, myNUCCTaxonomy)
             print(f"Processed: {count}")

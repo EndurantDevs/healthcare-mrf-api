@@ -1,5 +1,6 @@
 import os
-from sqlalchemy import DateTime, Numeric, DATE, Column, String, Integer, Float, BigInteger, Boolean, ARRAY, JSON, TIMESTAMP, TEXT
+from sqlalchemy import DateTime, Numeric, DATE, Column,\
+    String, Integer, Float, BigInteger, Boolean, ARRAY, JSON, TIMESTAMP, TEXT
 
 from db.connection import db
 from db.json_mixin import JSONOutputMixin
@@ -23,7 +24,7 @@ class ImportLog(db.Model, JSONOutputMixin):
     )
     __my_index_elements__ = ['issuer_id', 'checksum']
     issuer_id = Column(Integer)
-    checksum = Column(BigInteger)
+    checksum = Column(Integer)
     type = Column(String(4))
     text = Column(String)
     url = Column(String)
@@ -61,6 +62,43 @@ class PlanFormulary(db.Model, JSONOutputMixin):
     coinsurance_opt = Column(String)
 
 
+class PlanIndividual(db.Model, JSONOutputMixin):
+    __tablename__ = 'plan_individual'
+    __main_table__ = __tablename__
+    __table_args__ = (
+        {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
+    )
+    __my_index_elements__ = ['plan_id', 'year', 'drug_tier', 'pharmacy_type']
+    __my_additional_indexes__ = [{'index_elements': ('int_code',)}, {'index_elements': ('display_name',)}]
+    plan_id = Column(db.String(14), nullable=False)
+    year = Column(Integer)
+    drug_tier = Column(String)
+    mail_order = Column(Boolean)
+    pharmacy_type = Column(String)
+    copay_amount = Column(Float)
+    copay_opt = Column(String)
+    coinsurance_rate = Column(Float)
+    coinsurance_opt = Column(String)
+
+
+class PlanFacility(db.Model, JSONOutputMixin):
+    __tablename__ = 'plan_facility'
+    __main_table__ = __tablename__
+    __table_args__ = (
+        {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
+    )
+    __my_index_elements__ = ['plan_id', 'year', 'drug_tier', 'pharmacy_type']
+    __my_additional_indexes__ = [{'index_elements': ('int_code',)}, {'index_elements': ('display_name',)}]
+    plan_id = Column(db.String(14), nullable=False)
+    year = Column(Integer)
+    drug_tier = Column(String)
+    mail_order = Column(Boolean)
+    pharmacy_type = Column(String)
+    copay_amount = Column(Float)
+    copay_opt = Column(String)
+    coinsurance_rate = Column(Float)
+    coinsurance_opt = Column(String)
+
 class Plan(db.Model, JSONOutputMixin):
     __tablename__ = 'plan'
     __main_table__ = __tablename__
@@ -81,6 +119,7 @@ class Plan(db.Model, JSONOutputMixin):
     network = Column(ARRAY(String))
     benefits = Column(ARRAY(JSON))
     last_updated_on = Column(TIMESTAMP)
+    checksum = Column(Integer)
 
 class PlanAttributes(db.Model, JSONOutputMixin):
     __tablename__ = 'plan_attributes'
@@ -122,10 +161,10 @@ class NPIData(db.Model, JSONOutputMixin):
         {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['npi']
-    npi = Column(BigInteger)
+    npi = Column(Integer)
     employer_identification_number = Column(String)
     entity_type_code = Column(Integer)
-    replacement_npi = Column(BigInteger)
+    replacement_npi = Column(Integer)
     provider_organization_name = Column(String)
     provider_last_name = Column(String)
     provider_first_name = Column(String)
@@ -171,8 +210,8 @@ class NPIDataTaxonomy(db.Model, JSONOutputMixin):
     __my_index_elements__ = ['npi', 'checksum']
     __my_additional_indexes__ = [{'index_elements': ('healthcare_provider_taxonomy_code', 'npi',)}, ]
 
-    npi = Column(BigInteger)
-    checksum = Column(BigInteger)
+    npi = Column(Integer)
+    checksum = Column(Integer)
     healthcare_provider_taxonomy_code = Column(String)
     provider_license_number = Column(String)
     provider_license_number_state_code = Column(String)
@@ -186,8 +225,8 @@ class NPIDataOtherIdentifier(db.Model, JSONOutputMixin):
     )
     __my_index_elements__ = ['npi', 'checksum']
 
-    npi = Column(BigInteger)
-    checksum = Column(BigInteger)
+    npi = Column(Integer)
+    checksum = Column(Integer)
     other_provider_identifier = Column(String)
     other_provider_identifier_type_code = Column(String)
     other_provider_identifier_state = Column(String)
@@ -201,8 +240,8 @@ class NPIDataTaxonomyGroup(db.Model, JSONOutputMixin):
     )
     __my_index_elements__ = ['npi', 'checksum']
 
-    npi = Column(BigInteger)
-    checksum = Column(BigInteger)
+    npi = Column(Integer)
+    checksum = Column(Integer)
     healthcare_provider_taxonomy_group = Column(String)
 
 
@@ -232,7 +271,7 @@ class AddressPrototype(db.Model, JSONOutputMixin):
         {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
 
-    checksum = Column(BigInteger)
+    checksum = Column(Integer)
     first_line = Column(String)
     second_line  = Column(String)
     city_name = Column(String)
@@ -267,7 +306,7 @@ class NPIAddress(AddressPrototype):
             'using': 'gist',
             'name': 'geo_index_with_taxonomy_and_plans'}]
 
-    npi = Column(BigInteger)
+    npi = Column(Integer)
     type = Column(String)
     taxonomy_array = Column(ARRAY(Integer))
     plans_array = Column(ARRAY(Integer))

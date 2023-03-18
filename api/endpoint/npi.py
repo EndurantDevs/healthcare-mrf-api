@@ -261,36 +261,40 @@ async def get_npi(request, npi):
 
                 t_addr = t_addr.replace(' , ', ' ')
                 if not (x.long and x.lat):
-                    raw_sql = text(f"""SELECT
-                           g.rating,
-                           ST_X(g.geomout) As lon,
-                           ST_Y(g.geomout) As lat,
-                            pprint_addy(g.addy) as formatted_address
-                            from mrf.npi, 
-                            standardize_address('us_lex',
-                                 'us_gaz', 'us_rules', :addr) as addr,
-                            geocode((
-                                (addr).house_num,  --address
-                                null,              --predirabbrev
-                                (addr).name,       --streetname
-                                (addr).suftype,    --streettypeabbrev
-                                null,              --postdirabbrev
-                                (addr).unit,       --internal
-                                (addr).city,       --location
-                                (addr).state,      --stateabbrev
-                                (addr).postcode,   --zip
-                                true,               --parsed
-                                null,               -- zip4
-                                (addr).house_num    -- address_alphanumeric
-                            )::norm_addy) as g
-                           where npi = :npi""")
-                    addr = await conn.status(raw_sql, addr=t_addr, npi=npi)
                     d = x.to_json_dict()
-                    if addr and len(addr[-1]) and addr[-1][0] and addr[-1][0][0] < 15:
-                        d['long'] = addr[-1][0][1]
-                        d['lat'] = addr[-1][0][2]
-                        d['formatted_address'] = addr[-1][0][3]
-                        d['place_id'] = None
+                    try:
+                        raw_sql = text(f"""SELECT
+                               g.rating,
+                               ST_X(g.geomout) As lon,
+                               ST_Y(g.geomout) As lat,
+                                pprint_addy(g.addy) as formatted_address
+                                from mrf.npi, 
+                                standardize_address('us_lex',
+                                     'us_gaz', 'us_rules', :addr) as addr,
+                                geocode((
+                                    (addr).house_num,  --address
+                                    null,              --predirabbrev
+                                    (addr).name,       --streetname
+                                    (addr).suftype,    --streettypeabbrev
+                                    null,              --postdirabbrev
+                                    (addr).unit,       --internal
+                                    (addr).city,       --location
+                                    (addr).state,      --stateabbrev
+                                    (addr).postcode,   --zip
+                                    true,               --parsed
+                                    null,               -- zip4
+                                    (addr).house_num    -- address_alphanumeric
+                                )::norm_addy) as g
+                               where npi = :npi""")
+                        addr = await conn.status(raw_sql, addr=t_addr, npi=npi)
+
+                        if addr and len(addr[-1]) and addr[-1][0] and addr[-1][0][0] < 15:
+                            d['long'] = addr[-1][0][1]
+                            d['lat'] = addr[-1][0][2]
+                            d['formatted_address'] = addr[-1][0][3]
+                            d['place_id'] = None
+                    except:
+                        pass
 
                     if not d['lat']:
                         try:
