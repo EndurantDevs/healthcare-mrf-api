@@ -17,7 +17,7 @@ from sqlalchemy.dialects.postgresql import insert
 
 from process.ext.utils import download_it_and_save, make_class, push_objects, log_error, print_time_info, \
     flush_error_log, return_checksum
-from db.models import ImportHistory, ImportLog, Issuer, Plan, PlanFormulary, PlanTransparency, db
+from db.models import PlanNPIRaw, PlanNetworkTierRaw, ImportHistory, ImportLog, Issuer, Plan, PlanFormulary, PlanTransparency, db
 from db.connection import init_db
 from asyncpg import DuplicateTableError
 
@@ -60,8 +60,10 @@ async def process_plan(ctx, task):
 
                             if not int(res['plan_id'][:5]) in task.get('issuer_array'):
                                 await log_error('err',
-                                                f"File describes the issuer that is not defined/allowed by the index CMS PUF."
-                                                f"Issuer of Plan: {int(res['plan_id'][:5])}. Allowed issuer list: {''.join(task.get('issuer_array'))}"
+                                                f"File describes the issuer that is not defined/allowed by the index "
+                                                f"CMS PUF."
+                                                f"Issuer of Plan: {int(res['plan_id'][:5])}. Allowed issuer list: "
+                                                f"{', '.join([str(x) for x in task.get('issuer_array')])}"
                                                 f"Plan ID: {res['plan_id']}, year: {year}",
                                                 task.get('issuer_array'), task.get('url'), 'plans', 'json', myimportlog)
 
@@ -77,7 +79,7 @@ async def process_plan(ctx, task):
                                 'formulary_url': res.get('formulary_url', ''),
                                 'plan_contact': res['plan_contact'],
                                 'network': [(k['network_tier']) for k in res['network']],
-                                'benefits': res.get('benefits', []),
+                                'benefits': [json.dumps(x) for x in res.get('benefits', [])],
                                 'last_updated_on': datetime.datetime.combine(
                                     parse_date(res['last_updated_on'], fuzzy=True), datetime.datetime.min.time()),
                                 'checksum': return_checksum([res['plan_id'].lower(), year], crc=32)
@@ -91,9 +93,6 @@ async def process_plan(ctx, task):
                                 count += 1
                         except:
                             pass
-                        await push_objects(plan_obj, myplan)
-                        plan_obj = []
-                        count = 0
 
                     count = 0
                     for year in res['years']:
@@ -105,7 +104,8 @@ async def process_plan(ctx, task):
                                         for k in ('drug_tier', 'mail_order'):
                                             if not (k in formulary and formulary[k] is not None):
                                                 await log_error('err',
-                                                                f"Mandatory field `{k}` in Formulary (`formulary`) sub-type is "
+                                                                f"Mandatory field `{k}` in Formulary (`formulary`) "
+                                                                f"sub-type is "
                                                                 f"not present or "
                                                                 f"incorrect. Plan ID: "
                                                                 f"{res['plan_id']}, year: {year}",
@@ -114,10 +114,11 @@ async def process_plan(ctx, task):
                                                                 myimportlog)
                                         for cost_sharing in formulary['cost_sharing']:
                                             for k in ('pharmacy_type', 'copay_amount', 'copay_opt', 'coinsurance_rate',
-                                                      'coinsurance_opt'):
+                                            'coinsurance_opt'):
                                                 if not (k in cost_sharing):
                                                     await log_error('err',
-                                                                    f"Mandatory field `{k}` in Cost Sharing (`cost_sharing`) "
+                                                                    f"Mandatory field `{k}` in Cost Sharing ("
+                                                                    f"`cost_sharing`) "
                                                                     f"sub-type is not present or "
                                                                     f"incorrect. Plan ID: "
                                                                     f"{res['plan_id']}, year: {year}",
@@ -148,18 +149,23 @@ async def process_plan(ctx, task):
                                                 count += 1
                                     except:
                                         pass
-                                    await push_objects(planformulary_obj, myplanformulary)
+
                                     planformulary_obj = []
                                     count = 0
                                 else:
                                     await log_error('warn',
-                                                    f"Recommended field 'cost_sharing' is not present or incorrect. Plan ID: {res['plan_id']}, year: {year}",
+                                                    f"Recommended field 'cost_sharing' is not present or incorrect. "
+                                                    f"Plan ID: {res['plan_id']}, year: {year}",
                                                     task.get('issuer_array'), task.get('url'), 'plans', 'json',
                                                     myimportlog)
                         else:
                             await log_error('err',
-                                            f"Mandatory field 'formulary' is not present or incorrect. Plan ID: {res['plan_id']}, year: {year}",
+                                            f"Mandatory field 'formulary' is not present or incorrect. Plan ID: "
+                                            f"{res['plan_id']}, year: {year}",
                                             task.get('issuer_array'), task.get('url'), 'plans', 'json', myimportlog)
+
+                await push_objects(plan_obj, myplan)
+                await push_objects(planformulary_obj, myplanformulary)
             except ijson.JSONError as exc:
                 await log_error('err',
                                 f"JSON Parsing Error: {exc}",
@@ -169,6 +175,189 @@ async def process_plan(ctx, task):
                 await log_error('err',
                                 f"Incomplete JSON: can't read expected data. {exc}",
                                 task.get('issuer_array'), task.get('url'), 'plans', 'json', myimportlog)
+                return
+    await flush_error_log(myimportlog)
+    return 1
+
+
+async def process_provider(ctx, task):
+    import_date = ctx['import_date']
+    current_year = datetime.datetime.now().year
+    myimportlog = make_class(ImportLog, import_date)
+    myplan_npi = make_class(PlanNPIRaw, import_date)
+    myplan_networktier = make_class(PlanNetworkTierRaw, import_date)
+
+    print('Starting Provider file data download: ', task.get('url'))
+    with tempfile.TemporaryDirectory() as tmpdirname:
+        p = Path(task.get('url'))
+        tmp_filename = str(PurePath(str(tmpdirname), p.name))
+        try:
+            await download_it_and_save(task.get('url'), tmp_filename,
+                                       context={'issuer_array': task['issuer_array'], 'source': 'providers'},
+                                       logger=myimportlog)
+        except:
+            return
+        async with async_open(tmp_filename, 'rb') as afp:
+            plan_npi_obj_dict = {}
+            plan_network_year = {}
+            count = 0
+            try:
+                async for res in ijson.items(afp, "item", use_float=True):
+                    my_network_tiers = {}
+                    not_good = False
+                    my_years = set()
+                    if not (res.get('plans', None) and res['plans']):
+                        continue
+                    for plan in res['plans']:
+                        # try:
+                        #     for k in (
+                        #             'npi', 'type', 'plans', 'addresses', 'last_updated_on'):
+                        #         if not (k in res and res[k] is not None):
+                        #             await log_error('err',
+                        #                             f"Mandatory field `{k}` for providers data is not present or "
+                        #                             f"incorrect. Plan ID: "
+                        #                             f"{plan['plan_id']}, NPI: {res.get('npi', None)}",
+                        #                             task.get('issuer_array'), task.get('url'), 'plans', 'json',
+                        #                             myimportlog)
+
+                            # if not int(plan['plan_id'][:5]) in task.get('issuer_array'):
+                            #     await log_error('err',
+                            #                     f"File describes the issuer that is not defined/allowed by the index "
+                            #                     f"CMS PUF."
+                            #                     f"Issuer of Plan: {int(plan['plan_id'][:5])}. Allowed issuer list: "
+                            #                     f"{''.join([str(x) for x in task.get('issuer_array')])}"
+                            #                     f"Plan ID: {plan['plan_id']}, NPI: {res.get('npi', None)}",
+                            #                     task.get('issuer_array'), task.get('url'), 'providers', 'json',
+                            #                     myimportlog)
+                        if not (res.get('npi', 0) and res.get('npi').isdigit() and plan.get('plan_id', None) and plan['plan_id'] and plan.get('years', None)
+                                and (0 < int(res.get('npi', 0)) < 4294967295)):
+                            not_good = True
+                            break
+                        if not (12 < len(plan['plan_id']) <=14):
+                            continue
+
+
+                        for x in plan.get('years', []):
+                            if x and (current_year+1 >= int(x) >= current_year):
+                                my_years.add(int(x))
+
+                        issuer_id = int(plan['plan_id'][0:5])
+                        for year in my_years:
+                            checksum_plan = return_checksum([plan['plan_id'], plan['network_tier'], issuer_id, year])
+                            checksum_network = return_checksum([plan['network_tier'], issuer_id, year])
+                            plan_network_year[checksum_plan] = {
+                                'plan_id': plan['plan_id'],
+                                'network_tier': plan['network_tier'],
+                                'issuer_id': issuer_id,
+                                'year': year,
+                                'checksum_network': checksum_network
+                            }
+                            my_network_tiers[checksum_network] = {
+                                'network_tier': plan['network_tier'],
+                                'issuer_id': issuer_id,
+                                'year': year,
+                                'checksum_network': checksum_network
+                            }
+                    if not_good:
+                        continue
+
+                    name = res.get('name', {})
+                    if not name:
+                        name = {}
+                    languages = res.get('languages', [])
+                    if not languages:
+                        languages = []
+                    addresses = res.get('addresses', [])
+                    if not addresses:
+                        addresses = []
+
+                    obj = {
+                        'npi': int(res['npi']),
+                        'network_tier': '',
+                        'checksum_network': '',
+                        'year': 0,
+                        'issuer_id': 0,
+                        'name_or_facility_name': '',
+                        'specialty_or_facility_type': [],
+                        'type': str(res.get('type', '')),
+                        'prefix': name.get('prefix', None),
+                        'first_name': name.get('first', None),
+                        'middle_name': name.get('middle', None),
+                        'last_name': name.get('last', None),
+                        'suffix': name.get('suffix', None),
+                        'addresses': [json.dumps(x) for x in addresses],
+                        'accepting': res.get('accepting', None),
+                        'gender': res.get('gender', None),
+                        'languages': [str(x) for x in languages],
+                        'last_updated_on': datetime.datetime.combine(
+                            parse_date(res['last_updated_on'], fuzzy=True), datetime.datetime.min.time())
+                    }
+
+                    if ('facility_name' in res) and res.get('facility_name', None) and res.get('facility_name',
+                                                                                               '').strip():
+                        # for k in (
+                        #         'facility_name', 'facility_type'):
+                        #     if not (k in res and res[k] is not None):
+                        #         await log_error('err',
+                        #                         f"Mandatory field `{k}` for providers data is not present or "
+                        #                         f"incorrect. Plan ID: "
+                        #                         f"{plan['plan_id']}, NPI: {res.get('npi', None)}",
+                        #                         task.get('issuer_array'), task.get('url'), 'providers', 'json',
+                        #                         myimportlog)
+
+                        obj['name_or_facility_name'] = str(res.get('facility_name', '').strip())
+                        obj['specialty_or_facility_type'] = [str(x) for x in res.get('facility_type', [])]
+                    else:
+                        # for k in (
+                        #         'name', 'first', 'last', 'speciality', 'accepting'):
+                        #     if not (k in res and res[k] is not None):
+                        #         await log_error('err',
+                        #                         f"Mandatory field `{k}` for providers data is not present or "
+                        #                         f"incorrect. Plan ID: "
+                        #                         f"{plan['plan_id']}, NPI: {res.get('npi', None)}",
+                        #                         task.get('issuer_array'), task.get('url'), 'providers', 'json',
+                        #                         myimportlog)
+
+                        obj['name_or_facility_name'] = ''
+                        for k in ('prefix', 'first', 'middle', 'last', 'suffix'):
+                            if (k in name) and (name.get(k, None)):
+                                obj['name_or_facility_name'] += f"{name.get(k, '').strip()} "
+                        obj['name_or_facility_name'] = obj['name_or_facility_name'].strip()
+                        obj['specialty_or_facility_type'] = [str(x) for x in res.get('specialty', [])]
+
+
+                    for x in my_network_tiers.values():
+                        obj['network_tier'] = x['network_tier']
+                        obj['checksum_network'] = x['checksum_network']
+                        obj['issuer_id'] = x['issuer_id']
+                        obj['year'] = x['year']
+                        plan_npi_obj_dict['_'.join([str(obj['npi']), str(x['checksum_network'])])] = obj
+
+                        # if count > 10 * int(os.environ.get('HLTHPRT_SAVE_PER_PACK', 50)):
+                        #     await push_objects(list(plan_npi_obj_dict.values()), myplan_npi)
+                        #     plan_npi_obj_dict = {}
+                        #     count = 0
+                        # else:
+                        #     count += 1
+                        #     # except Exception as e:
+                        #     #     print(repr(e))
+                        #     #     # print('res: ', res)
+                        #     #     # print('plan: ', plan)
+                        #     #     print('WTF>', obj)
+                        #     #     pass
+                await push_objects(list(plan_npi_obj_dict.values()), myplan_npi)
+                await push_objects(list(plan_network_year.values()), myplan_networktier)
+
+
+            except ijson.JSONError as exc:
+                await log_error('err',
+                                f"JSON Parsing Error: {exc}",
+                                task.get('issuer_array'), task.get('url'), 'providers', 'json', myimportlog)
+                return
+            except ijson.IncompleteJSONError as exc:
+                await log_error('err',
+                                f"Incomplete JSON: can't read expected data. {exc}",
+                                task.get('issuer_array'), task.get('url'), 'providers', 'json', myimportlog)
                 return
     await flush_error_log(myimportlog)
     return 1
@@ -190,6 +379,24 @@ async def process_json_index(ctx, task):
                                              use_float=True):  # , 'formulary_urls', 'provider_urls'
                     print(f"Plan URL: {url}")
                     await redis.enqueue_job('process_plan', {'url': url, 'issuer_array': issuer_array})
+                    # break
+            except ijson.JSONError as exc:
+                await log_error('err',
+                                f"JSON Parsing Error: {exc}",
+                                task.get('issuer_array'), task.get('url'), 'json_index', 'json', myimportlog)
+                return
+            except ijson.IncompleteJSONError as exc:
+                await log_error('err',
+                                f"Incomplete JSON: can't read expected data. {exc}",
+                                task.get('issuer_array'), task.get('url'), 'index', 'json', myimportlog)
+                return
+
+        async with async_open(tmp_filename, 'rb') as afp:
+            try:
+                async for url in ijson.items(afp, "provider_urls.item",
+                                             use_float=True):  # , 'formulary_urls', 'provider_urls'
+                    print(f"Provider URL: {url}")
+                    await redis.enqueue_job('process_provider', {'url': url, 'issuer_array': issuer_array})
                     # break
             except ijson.JSONError as exc:
                 await log_error('err',
@@ -340,10 +547,8 @@ async def startup(ctx):
                 f"{db_schema}.{obj.__tablename__} ({', '.join(obj.__my_index_elements__)});")
     except DuplicateTableError:
         pass
-
-    tables = {} # for the future complex usage
-
-    for cls in (Issuer, Plan, PlanFormulary, PlanTransparency, ImportLog):
+    tables = {}  # for the future complex usage
+    for cls in (Issuer, Plan, PlanFormulary, PlanTransparency, ImportLog, PlanNPIRaw, PlanNetworkTierRaw):
         tables[cls.__main_table__] = make_class(cls, import_date)
         obj = tables[cls.__main_table__]
         await db.status(f"DROP TABLE IF EXISTS {db_schema}.{obj.__main_table__}_{import_date};")
@@ -352,8 +557,6 @@ async def startup(ctx):
             await db.status(
                 f"CREATE UNIQUE INDEX {obj.__tablename__}_idx_primary ON "
                 f"{db_schema}.{obj.__tablename__} ({', '.join(obj.__my_index_elements__)});")
-
-
     print("Preparing done")
 
 
@@ -371,11 +574,9 @@ async def shutdown(ctx):
         print(f"Failed Import: Plans number:{plans_count}")
         exit(1)
 
-
-
     tables = {}
     async with db.transaction():
-        for cls in (Issuer, Plan, PlanFormulary, PlanTransparency, ImportLog):
+        for cls in (Issuer, Plan, PlanFormulary, PlanTransparency, ImportLog, PlanNPIRaw, PlanNetworkTierRaw):
             tables[cls.__main_table__] = make_class(cls, import_date)
             obj = tables[cls.__main_table__]
             table = obj.__main_table__

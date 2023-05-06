@@ -1,11 +1,11 @@
 FROM python:3.11-bullseye
 
 WORKDIR /wheels
-ADD ./requirements-dev.txt /wheels
+ADD ./requirements.txt /wheels
 
 WORKDIR /opt
 RUN apt update && apt install -y nginx libaio1 && python3 -m venv venv && . venv/bin/activate && pip install --no-compile --upgrade pip && \
-	pip install --no-compile -r /wheels/requirements-dev.txt -f /wheels \
+	pip install --no-compile -r /wheels/requirements.txt -f /wheels \
         && rm -rf /wheels \
         && rm -rf /root/.cache/pip/* && \
         find . -name *.pyc -execdir rm -f {} \;

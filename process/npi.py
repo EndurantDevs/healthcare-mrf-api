@@ -315,7 +315,6 @@ async def shutdown(ctx):
 
     processing_classes_array = (NPIData, NPIDataTaxonomyGroup, NPIDataOtherIdentifier, NPIDataTaxonomy, NPIAddress,)
 
-
     for cls in processing_classes_array:
         tables[cls.__main_table__] = make_class(cls, import_date)
         obj = tables[cls.__main_table__]

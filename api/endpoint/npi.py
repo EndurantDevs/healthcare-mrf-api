@@ -12,7 +12,8 @@ import sanic.exceptions
 from sanic import response
 from sanic import Blueprint
 
-from db.models import db, NPIData, NPIAddress, AddressArchive, NPIDataTaxonomy, NPIDataTaxonomyGroup, NUCCTaxonomy
+from db.models import db, Issuer, Plan, PlanNPIRaw, NPIData, NPIAddress, AddressArchive, NPIDataTaxonomy, \
+    NPIDataTaxonomyGroup, NUCCTaxonomy
 
 blueprint = Blueprint('npi', url_prefix='/npi', version=1)
 
@@ -20,7 +21,13 @@ blueprint = Blueprint('npi', url_prefix='/npi', version=1)
 @blueprint.get('/')
 async def npi_index_status(request):
     async def get_npi_count():
-        async with db.acquire():
+        """
+    The get_npi_count function returns the number of NPI records in the database.
+
+    :return: The number of records in the npidata table
+    :doc-author: Trelent
+    """
+    async with db.acquire():
             return await db.func.count(NPIData.npi).gino.scalar()
 
     async def get_npi_address_count():
@@ -64,7 +71,7 @@ where healthcare_provider_taxonomy_code = ANY (codes);""")
     async def get_results(start, limit, classification, section, display_name):
         where = []
         if classification:
-            where.append('classification = :classification')
+            where.append('classification = = :classification')
         if section:
             where.append('section = :section')
         if display_name:
@@ -137,7 +144,13 @@ async def get_near_npi(request):
     name_like = request.args.get('name_like')
     exclude_npi = int(request.args.get("exclude_npi", 0))
     limit = int(request.args.get('limit', 5))
+    zip_codes = []
+    for zip_c in request.args.get('zip_codes', '').split(','):
+        if not zip_c:
+            continue
+        zip_codes.append(zip_c.strip())
     radius = int(request.args.get('radius', 30))
+
     async with db.acquire() as conn:
         res = []
         exclude_npi_sql = ""
@@ -146,6 +159,11 @@ async def get_near_npi(request):
             exclude_npi_sql = "and a.npi <> :exclude_npi"
 
         where = []
+        if zip_codes:
+
+            print("WTF ", len(zip_codes))
+            radius = 1000
+            exclude_npi_sql += " and SUBSTRING(a.postal_code, 1, 5) = ANY (:zip_codes)"
         if classification:
             where.append('classification = :classification')
         if section:
@@ -156,7 +174,7 @@ async def get_near_npi(request):
             where.append('code = ANY(:codes)')
         if name_like:
             name_like = f'%{name_like}%'
-            ilike_name = " and (d.provider_last_name ilike :name_like OR d.provider_other_organization_name ilike :name_like OR d.provider_organization_name ilike :name_like)"
+            ilike_name += " and (d.provider_last_name ilike :name_like OR d.provider_other_organization_name ilike :name_like OR d.provider_organization_name ilike :name_like)"
         q = f"""select round(cast(st_distance(Geography(ST_MakePoint(q.long, q.lat)),
                               Geography(ST_MakePoint(:in_long, :in_lat))) / 1609.34 as numeric), 2) as distance,
        q.*, d.*
@@ -174,7 +192,7 @@ ORDER by round(cast(st_distance(Geography(ST_MakePoint(a.long, a.lat)),
 """
         for r in await conn.all(text(q), in_long=in_long, in_lat=in_lat, classification=classification, limit=limit, radius=radius,
                                 exclude_npi=exclude_npi, section=section, display_name=display_name, name_like=name_like,
-                                codes=codes,):
+                                codes=codes, zip_codes=zip_codes,):
             obj = {}
             count = 0
             obj['distance'] = r[count]
@@ -219,6 +237,35 @@ async def get_full_taxonomy_list(request, npi):
         for x in await db.select([NPIDataTaxonomy.__table__.columns,NUCCTaxonomy.__table__.columns]).where(NPIDataTaxonomy.npi == npi).where(NUCCTaxonomy.code == NPIDataTaxonomy.healthcare_provider_taxonomy_code).gino.all():
             t.append(x.to_json_dict())
     return response.json(t)
+
+
+@blueprint.get('/plans_by_npi/<npi>')
+async def get_plans_by_npi(request, npi):
+
+    data = []
+    plan_data = []
+    issuer_data = []
+    npi = int(npi)
+
+    # async def get_plans_list(plan_arr):
+    #     t = {}
+    #     q = Plan.query.where(Plan.plan_id == db.func.any(plan_arr)).where(Plan.year == int(2023)).gino
+    #     async with db.acquire() as conn:
+    #         for x in await q.all():
+    #             t[x.plan_id] = x.to_json_dict()
+    #     return t
+
+    q = db.select([PlanNPIRaw, Issuer]).where(Issuer.issuer_id == PlanNPIRaw.issuer_id).where(
+        PlanNPIRaw.npi == npi).order_by(PlanNPIRaw.issuer_id.desc()).gino.load((PlanNPIRaw, Issuer))
+
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            async for x in q.iterate():
+                data.append({'npi_info': x[0].to_json_dict(), 'issuer_info': x[1].to_json_dict()})
+
+
+    return response.json({'npi_data': data, 'plan_data': plan_data, 'issuer_data': issuer_data})
+
 
 
 @blueprint.get('/id/<npi>')
@@ -288,7 +335,7 @@ async def get_npi(request, npi):
                                where npi = :npi""")
                         addr = await conn.status(raw_sql, addr=t_addr, npi=npi)
 
-                        if addr and len(addr[-1]) and addr[-1][0] and addr[-1][0][0] < 15:
+                        if addr and len(addr[-1]) and addr[-1][0] and addr[-1][0][0] < 5:
                             d['long'] = addr[-1][0][1]
                             d['lat'] = addr[-1][0][2]
                             d['formatted_address'] = addr[-1][0][3]

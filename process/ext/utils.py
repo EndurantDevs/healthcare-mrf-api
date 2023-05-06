@@ -188,8 +188,9 @@ async def push_objects(obj_list, cls, rewrite=False):
                                                                 schema_name=cls.__table_args__[0]['schema'],
                                                                 columns=obj_list[0].keys(), records=IterateList(obj_list))
             # print("All good!")
-        except ValueError:
+        except ValueError as exc:
             print(f"INPUT arr: {obj_list}")
+            print(exc)
         except UniqueViolationError:
             # print("It is here!")
             try:

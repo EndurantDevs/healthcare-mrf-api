@@ -154,6 +154,57 @@ class PlanTransparency(db.Model, JSONOutputMixin):
     claims_payment_policies_url = Column(String)
 
 
+class PlanNPIRaw(db.Model, JSONOutputMixin):
+    __tablename__ = 'plan_npi_raw'
+    __main_table__ = __tablename__
+    __table_args__ = (
+        {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
+    )
+    __my_index_elements__ = ['npi', 'checksum_network']
+    __my_additional_indexes__ = [
+        {'index_elements': ('issuer_id', 'network_tier', 'year'), 'using': 'gin'},]
+
+
+    npi = Column(Integer)
+    checksum_network = Column(Integer)
+    type =  Column(String)
+    last_updated_on = Column(TIMESTAMP)
+    network_tier = Column(String)
+    issuer_id = Column(Integer)
+    year = Column(Integer)
+    name_or_facility_name = Column(String)
+    prefix = Column(String)
+    first_name = Column(String)
+    middle_name = Column(String)
+    last_name = Column(String)
+    suffix = Column(String)
+    addresses = Column(ARRAY(JSON))
+    specialty_or_facility_type = Column(ARRAY(String))
+    accepting = Column(String)
+    gender = Column(String)
+    languages = Column(ARRAY(String))
+
+
+
+class PlanNetworkTierRaw(db.Model, JSONOutputMixin):
+    __tablename__ = 'plan_networktier'
+    __main_table__ = __tablename__
+    __table_args__ = (
+        {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
+    )
+    __my_index_elements__ = ['plan_id', 'checksum_network']
+    __my_additional_indexes__ = [
+        {'index_elements': ('issuer_id', 'network_tier', 'year'), 'using': 'gin'},
+        {'index_elements': ('checksum_network'), 'using': 'gin'}, ]
+
+
+    plan_id = Column(String(14))
+    network_tier = Column(String)
+    issuer_id = Column(Integer)
+    year = Column(Integer)
+    checksum_network = Column(Integer)
+
+
 class NPIData(db.Model, JSONOutputMixin):
     __tablename__ = 'npi'
     __main_table__ = __tablename__
