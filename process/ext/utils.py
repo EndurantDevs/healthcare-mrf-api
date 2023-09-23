@@ -47,6 +47,7 @@ async def download_it_and_save_nostream(url, filepath):
 
 
 async def download_it_and_save(url, filepath, chunk_size=None, context=None, logger=None, cache_dir=None):
+    print(f"Downloading {url}")
     max_chunk_size = chunk_size if chunk_size else HTTP_CHUNK_SIZE
     file_with_dir = None
     if cache_dir:

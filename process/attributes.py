@@ -16,9 +16,13 @@ from aiofile import async_open
 from async_unzip.unzipper import unzip
 
 from process.ext.utils import download_it_and_save, make_class, push_objects, log_error, print_time_info, \
-    flush_error_log
-from db.models import Issuer, PlanAttributes, db
+    flush_error_log, return_checksum
+from dateutil.parser import parse as parse_date
+from db.models import Issuer, Plan, PlanAttributes, db
 from db.connection import init_db
+
+from api.for_human import plan_attributes_labels_to_key
+
 
 latin_pattern= re.compile(r'[^\x00-\x7f]')
 
@@ -114,7 +118,7 @@ async def process_attributes(ctx, task):
 
                         attr_obj_list.append(obj)
 
-                if count > 100:
+                if count > 10000:
                     #int(os.environ.get('HLTHPRT_SAVE_PER_PACK', 100)):
                     total_count += count
                     await redis.enqueue_job('save_attributes', {'attr_obj_list': attr_obj_list})
@@ -130,6 +134,10 @@ async def process_attributes(ctx, task):
 
             if attr_obj_list:
                 await push_objects(attr_obj_list, myplanattributes)
+
+
+
+
 
         #     obj_list = []
         #     for ws_name in xls_file.ws_names:
@@ -228,6 +236,119 @@ async def process_attributes(ctx, task):
         #     # break
 
 
+async def process_state_attributes(ctx, task):
+    redis = ctx['redis']
+
+    print('Downloading data from: ', task['url'])
+
+    import_date = ctx['import_date']
+    myplanattributes = make_class(PlanAttributes, import_date)
+
+
+    with tempfile.TemporaryDirectory() as tmpdirname:
+        p = 'attr.csv'
+        tmp_filename = str(PurePath(str(tmpdirname), p + '.zip'))
+        await download_it_and_save(task['url'], tmp_filename)
+        await unzip(tmp_filename, tmpdirname)
+
+        tmp_filename = glob.glob(f"{tmpdirname}/*Plans*.csv")[0]
+        total_count = 0
+        attr_obj_list = []
+
+        plan_list = {}
+
+        count = 0
+        #return 1
+
+        async with async_open(tmp_filename, 'r') as afp:
+            async for row in AsyncDictReader(afp, delimiter=","):
+                if not (row['STANDARD COMPONENT ID'] and row['PLAN ID']):
+                    continue
+                count += 1
+                for key in row:
+                    if not ((key in ('StandardComponentId',)) and (row[key] is None)) and (t := str(row[key]).strip()):
+                        obj = {
+                            'full_plan_id': row['PLAN ID'],
+                            'year': int(task['year']),  # int(row['\ufeffBusinessYear'])
+                            'attr_name': re.sub(latin_pattern,r'', plan_attributes_labels_to_key[key]),
+                            'attr_value': t
+                        }
+
+                        attr_obj_list.append(obj)
+
+                if count > 10000:
+                    #int(os.environ.get('HLTHPRT_SAVE_PER_PACK', 100)):
+                    total_count += count
+                    await redis.enqueue_job('save_attributes', {'attr_obj_list': attr_obj_list})
+                    # await push_objects(attr_obj_list, myplanattributes)
+                    # test = {}
+                    # for x in attr_obj_list:
+                    #     test[x['full_plan_id']] = 1
+                    # print(f"{task['year']}: processed {total_count} + rows {len(attr_obj_list)} -- {row['StandardComponentId']} -- {len(test.keys())}")
+                    attr_obj_list.clear()
+                    count = 0
+                else:
+                    count += 1
+
+            if attr_obj_list:
+                await push_objects(attr_obj_list, myplanattributes)
+
+
+        # async with async_open(tmp_filename, 'r') as afp:
+        #     async for row in AsyncDictReader(afp, delimiter=","):
+        #         import pprint
+        #         real_key = {}
+        #         for key in attributes_labels:
+        #             real_key[key.lower()] = key
+        #
+        #         for key in row:
+        #             row[key] = real_key.get(''.join(x for x in key.lower() if not x.isspace()), None)
+        #
+        #         pprint.pprint(row)
+        #         exit(1)
+        #
+        #         if not (row['STANDARD COMPONENT ID'] and row['PLAN ID']):
+        #             continue
+        #         count += 1
+        #         # for key in row:
+        #         # this must be re-written to unify with other Plan Attributes
+        #         # too much hardcoding!!
+        #         if t := str(row.get('BENEFIT NAME', '').strip()):
+        #             if row['IS COVERED'].lower() == 'yes':
+        #                 value = 'Covered.'
+        #             else:
+        #                 value = 'Not Covered.'
+        #
+        #             if row['QUANTITY LIMIT ON SVC'].lower() == 'yes':
+        #                 value += f" {row['LIMIT QUANTITY']} {row['LIMIT UNIT']}."
+        #
+        #             if t2 := row['EXPLANATION'].strip():
+        #                 value += f" {t2}"
+        #             obj = {
+        #                 'full_plan_id': row['PLAN ID'],
+        #                 'year': int(task['year']),  # int(row['\ufeffBusinessYear'])
+        #                 'attr_name': re.sub(latin_pattern,r'', t),
+        #                 'attr_value': value
+        #             }
+        #
+        #             attr_obj_list.append(obj)
+        #
+        #         if count > 10000:
+        #             #int(os.environ.get('HLTHPRT_SAVE_PER_PACK', 100)):
+        #             total_count += count
+        #             await redis.enqueue_job('save_attributes', {'attr_obj_list': attr_obj_list})
+        #             # await push_objects(attr_obj_list, myplanattributes)
+        #             # test = {}
+        #             # for x in attr_obj_list:
+        #             #     test[x['full_plan_id']] = 1
+        #             # print(f"{task['year']}: processed {total_count} + rows {len(attr_obj_list)} -- {row['StandardComponentId']} -- {len(test.keys())}")
+        #             attr_obj_list.clear()
+        #             count = 0
+        #         else:
+        #             count += 1
+        #
+        #     if attr_obj_list:
+        #         await push_objects(attr_obj_list, myplanattributes)
 
 
 async def main():
@@ -235,6 +356,15 @@ async def main():
                               job_serializer=msgpack.packb,
                               job_deserializer=lambda b: msgpack.unpackb(b, raw=False))
     attribute_files = json.loads(os.environ['HLTHPRT_CMSGOV_PLAN_ATTRIBUTES_URL_PUF'])
+    state_attribute_files = json.loads(os.environ['HLTHPRT_CMSGOV_STATE_PLAN_ATTRIBUTES_URL_PUF'])
+
+
+    print("Starting to process STATE Plan Attribute files..")
+    for file in state_attribute_files:
+        print("Adding: ", file)
+        x = await redis.enqueue_job('process_state_attributes', {'url': file['url'], 'year': file['year']})
+
+    print("Starting to process Plan Attribute files..")
     for file in attribute_files:
         print("Adding: ", file)
         x = await redis.enqueue_job('process_attributes', {'url': file['url'], 'year': file['year']})

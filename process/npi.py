@@ -330,11 +330,25 @@ UPDATE {db_schema}.{obj.__tablename__} as addr SET taxonomy_array=b.res FROM (
 select npi, ARRAY_AGG(x.int_code) as res from mrf.npi_taxonomy_{import_date}
 INNER JOIN x ON healthcare_provider_taxonomy_code = x.target_code
 GROUP BY npi) as b WHERE addr.npi = b.npi;""")
+
             print("Updating NPI Addresses Geo from Archive...")
             await db.status(
                 f"UPDATE {db_schema}.{obj.__tablename__} as a SET formatted_address = b.formatted_address, lat = b.lat, "
                 f"long = b.long, "
                 f"place_id = b.place_id FROM {db_schema}.address_archive as b WHERE a.checksum = b.checksum")
+
+            print("Updating NPI Plan-Network Array from Plans Import Data...")
+            await db.status(
+                f"""UPDATE {db_schema}.{obj.__tablename__} as a 
+                SET
+                    plans_network_array = n_list
+                FROM (SELECT
+                    npi, ARRAY_AGG(DISTINCT checksum_network) as n_list
+                    FROM
+                    {db_schema}.plan_npi_raw
+                    GROUP BY npi) as b
+                WHERE
+                    a.npi = b.npi;""")
 
         if hasattr(cls, '__my_additional_indexes__') and cls.__my_additional_indexes__:
             for index in cls.__my_additional_indexes__:

@@ -21,7 +21,7 @@ async def get_issuer_data(request, issuer_id):
         data['plans'].append(p.to_json_dict())
     return response.json(data)
 
-@blueprint.get('/')
+@blueprint.get('/', name="issuer_list")
 @blueprint.get('/state/<state>')
 async def get_issuers(request, state=None):
     data = []

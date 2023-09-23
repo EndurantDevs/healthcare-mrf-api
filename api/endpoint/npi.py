@@ -71,11 +71,13 @@ where healthcare_provider_taxonomy_code = ANY (codes);""")
     async def get_results(start, limit, classification, section, display_name):
         where = []
         if classification:
-            where.append('classification = = :classification')
+            where.append('classification = :classification')
         if section:
             where.append('section = :section')
         if display_name:
             where.append('display_name = :display_name')
+
+        print('where:', where)
         q = text(f"""select b.*, g.* from  mrf.npi as b, (select c.*
     from 
          mrf.npi_address as c,
@@ -94,21 +96,6 @@ where healthcare_provider_taxonomy_code = ANY (codes);""")
                     count += 1
                     obj[c.key] = r[count]
                 temp = NPIAddress.__table__.columns
-                # temp = ['npi',
-                #     'type',
-                #     'checksum',
-                #     'first_line',
-                #     'second_line',
-                #     'city_name',
-                #     'state_name',
-                #     'postal_code',
-                #     'country_code',
-                #     'telephone_number',
-                #     'fax_number',
-                #     'formatted_address',
-                #     'lat',
-                #     'long',
-                #     'date_added', 'taxonomy_array', 'place_id']
                 for c in temp:
                     count += 1
                     obj[c.key] = r[count]
@@ -121,23 +108,23 @@ where healthcare_provider_taxonomy_code = ANY (codes);""")
     )
     return response.json({'total': total, 'rows': rows}, default=str)
 
-# @blueprint.get('/all/variants')
-# async def all_plans(request):
-#     plan_data = await db.select(
-#         [Plan.marketing_name, Plan.plan_id, PlanAttributes.full_plan_id, Plan.year]).select_from(Plan.join(PlanAttributes, ((Plan.plan_id == func.substr(PlanAttributes.full_plan_id, 1, 14)) & (Plan.year == PlanAttributes.year)))).\
-#         group_by(PlanAttributes.full_plan_id, Plan.plan_id, Plan.marketing_name, Plan.year).gino.all()
-#     data = []
-#     for p in plan_data:
-#         data.append({'marketing_name': p[0], 'plan_id': p[1], 'full_plan_id': p[2], 'year': p[3]})
-#     return response.json(data)
 
 @blueprint.get('/near/')
 async def get_near_npi(request):
-    in_long = float(request.args.get("long"))
-    in_lat = float(request.args.get("lat"))
+    in_long, in_lat = None, None
+    if request.args.get("long"):
+        in_long = float(request.args.get("long"))
+    if request.args.get("lat"):
+        in_lat = float(request.args.get("lat"))
+
+
     codes = request.args.get("codes")
     if codes:
         codes = [x.strip() for x in codes.split(',')]
+
+    plan_network = request.args.get("plan_network")
+    if plan_network:
+        plan_network = [int(x) for x in plan_network.split(',')]
     classification = request.args.get("classification")
     section = request.args.get('section')
     display_name = request.args.get('display_name')
@@ -149,21 +136,29 @@ async def get_near_npi(request):
         if not zip_c:
             continue
         zip_codes.append(zip_c.strip())
-    radius = int(request.args.get('radius', 30))
+    radius = int(request.args.get('radius', 10))
 
     async with db.acquire() as conn:
+        if (not (in_long and in_lat)) and zip_codes and zip_codes[0]:
+            q = "select intptlat, intptlon from zcta5 where zcta5ce=:zip_code limit 1;"
+            for r in await conn.all(text(q), zip_code=zip_codes[0]):
+                in_long = float(r['intptlon'])
+                in_lat = float(r['intptlat'])
+
         res = []
-        exclude_npi_sql = ""
+        extended_where = ""
         ilike_name = ""
         if exclude_npi:
-            exclude_npi_sql = "and a.npi <> :exclude_npi"
+            extended_where += "and a.npi <> :exclude_npi"
+        if plan_network:
+            extended_where += "and a.plans_network_array && (:plan_network_array)"
 
         where = []
         if zip_codes:
-
-            print("WTF ", len(zip_codes))
+            ## fix the issue with blank in_long!!
+            ## add center of zip code radius by default
             radius = 1000
-            exclude_npi_sql += " and SUBSTRING(a.postal_code, 1, 5) = ANY (:zip_codes)"
+            extended_where += " and SUBSTRING(a.postal_code, 1, 5) = ANY (:zip_codes)"
         if classification:
             where.append('classification = :classification')
         if section:
@@ -186,32 +181,18 @@ where ST_DWithin(Geography(ST_MakePoint(long, lat)),
                  :radius * 1609.34)
   and a.taxonomy_array && g.codes
   and a.type = 'primary'
-  {exclude_npi_sql}
+  {extended_where}
 ORDER by round(cast(st_distance(Geography(ST_MakePoint(a.long, a.lat)),
                               Geography(ST_MakePoint(:in_long, :in_lat))) / 1609.34 as numeric), 2) asc LIMIT :limit) as q WHERE q.npi=d.npi{ilike_name};
 """
         for r in await conn.all(text(q), in_long=in_long, in_lat=in_lat, classification=classification, limit=limit, radius=radius,
                                 exclude_npi=exclude_npi, section=section, display_name=display_name, name_like=name_like,
-                                codes=codes, zip_codes=zip_codes,):
+                                codes=codes, zip_codes=zip_codes, plan_network_array=plan_network):
             obj = {}
             count = 0
             obj['distance'] = r[count]
             temp = NPIAddress.__table__.columns
-            # temp = ['npi',
-            #     'type',
-            #     'checksum',
-            #     'first_line',
-            #     'second_line',
-            #     'city_name',
-            #     'state_name',
-            #     'postal_code',
-            #     'country_code',
-            #     'telephone_number',
-            #     'fax_number',
-            #     'formatted_address',
-            #     'lat',
-            #     'long',
-            #     'date_added', 'taxonomy_array', 'place_id']
+
             for c in temp:
                 count += 1
                 obj[c.key] = r[count]

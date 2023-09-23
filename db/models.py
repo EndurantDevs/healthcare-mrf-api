@@ -37,6 +37,7 @@ class Issuer(db.Model, JSONOutputMixin):
     __table_args__ = (
         {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
+    __my_index_elements__ = ['issuer_id']
     state = Column(String(2))
     issuer_id = Column(Integer)
     issuer_name = Column(String)
@@ -353,13 +354,13 @@ class NPIAddress(AddressPrototype):
         {'index_elements': ('checksum',), 'using': 'gin'},
         {'index_elements': ('city_name', 'state_name', 'country_code'), 'using': 'gin'},
         {'index_elements': (
-        'Geography(ST_MakePoint(long, lat))', 'taxonomy_array gist__intbig_ops', 'plans_array gist__intbig_ops'),
+        'Geography(ST_MakePoint(long, lat))', 'taxonomy_array gist__intbig_ops', 'plans_network_array gist__intbig_ops'),
             'using': 'gist',
             'name': 'geo_index_with_taxonomy_and_plans'}]
 
     npi = Column(Integer)
     type = Column(String)
     taxonomy_array = Column(ARRAY(Integer))
-    plans_array = Column(ARRAY(Integer))
+    plans_network_array = Column(ARRAY(Integer))
 
     # NPI	Provider Secondary Practice Location Address- Address Line 1	Provider Secondary Practice Location Address-  Address Line 2	Provider Secondary Practice Location Address - City Name	Provider Secondary Practice Location Address - State Name	Provider Secondary Practice Location Address - Postal Code	Provider Secondary Practice Location Address - Country Code (If outside U.S.)	Provider Secondary Practice Location Address - Telephone Number	Provider Secondary Practice Location Address - Telephone Extension	Provider Practice Location Address - Fax Number

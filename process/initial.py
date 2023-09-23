@@ -14,6 +14,7 @@ from aiofile import async_open
 from async_unzip.unzipper import unzip
 import pylightxl as xl
 from sqlalchemy.dialects.postgresql import insert
+from aiocsv import AsyncDictReader
 
 from process.ext.utils import download_it_and_save, make_class, push_objects, log_error, print_time_info, \
     flush_error_log, return_checksum
@@ -23,6 +24,14 @@ from asyncpg import DuplicateTableError
 
 
 async def process_plan(ctx, task):
+    """
+    The process_plan function is responsible for downloading the plan data from the CMS PUF,
+        parsing it and saving to a database.
+
+    :param ctx: Pass the import_date to the function
+    :param task: Pass the task object to the function
+    :return: 1 if there is no error
+    """
     import_date = ctx['import_date']
     myplan = make_class(Plan, import_date)
     myplanformulary = make_class(PlanFormulary, import_date)
@@ -181,6 +190,18 @@ async def process_plan(ctx, task):
 
 
 async def process_provider(ctx, task):
+    """
+    The process_provider function is responsible for downloading the provider data from the CMS PUF website,
+        parsing it into a JSON object, and then inserting that data into our database.
+
+        The function takes in two arguments: ctx and task. Ctx is a dictionary containing information about the
+        current import date (the date of which we are importing data). Task contains information about what URL to
+        download from as well as what issuers are allowed to be imported based on our index file.
+
+    :param ctx: Pass the import_date value to the function
+    :param task: Pass the url of the file to be downloaded
+    :return: 1 if the file is successfully processed
+    """
     import_date = ctx['import_date']
     current_year = datetime.datetime.now().year
     myimportlog = make_class(ImportLog, import_date)
@@ -364,6 +385,16 @@ async def process_provider(ctx, task):
 
 
 async def process_json_index(ctx, task):
+    """
+    The process_json_index function is called by the process_index function.
+    It downloads a JSON file containing URLs to other files, and then queues up jobs for those files.
+    The JSON file contains two arrays: plan_urls and provider_urls.  The plan URLs are queued as 'process_plan' jobs,
+    and the provider URLs are queued as 'process_provider' jobs.
+
+    :param ctx: Pass the redis connection to the function
+    :param task: Pass the url to download and the issuer_array
+    :return: A list of urls to the plan and provider json files
+    """
     redis = ctx['redis']
     issuer_array = task['issuer_array']
     myimportlog = make_class(ImportLog, ctx['import_date'])
@@ -410,7 +441,121 @@ async def process_json_index(ctx, task):
                 return
 
 
+async def import_unknown_state_issuers_data():
+    plan_list = {}
+    issuer_list = {}
+
+    attribute_files = json.loads(os.environ['HLTHPRT_CMSGOV_PLAN_ATTRIBUTES_URL_PUF'])
+    for file in attribute_files:
+        with tempfile.TemporaryDirectory() as tmpdirname:
+            p = 'attr.csv'
+            tmp_filename = str(PurePath(str(tmpdirname), p + '.zip'))
+            await download_it_and_save(file['url'], tmp_filename)
+            await unzip(tmp_filename, tmpdirname)
+
+            tmp_filename = glob.glob(f"{tmpdirname}/*.csv")[0]
+
+            count = 0
+            # return 1
+
+            async with async_open(tmp_filename, 'r', encoding='utf-8-sig') as afp:
+                async for row in AsyncDictReader(afp, delimiter=","):
+                    if not (row['StandardComponentId'] and row['PlanId']):
+                        continue
+                    for key in row:
+                        if not ((key in ('StandardComponentId',)) and (row[key] is None)) and not (
+                                f"{row['StandardComponentId']}_{row['BusinessYear']}" in plan_list):
+                            plan_list[f"{row['StandardComponentId']}_{row['BusinessYear']}"] = {
+                                'plan_id': row['StandardComponentId'],
+                                'plan_id_type': 'CMS-HIOS-PLAN-ID',
+                                'year': int(row['BusinessYear']),
+                                'issuer_id': int(row['IssuerId']),
+                                'state': str(row['StateCode']).upper(),
+                                'marketing_name': row['PlanMarketingName'],
+                                'summary_url': row['URLForSummaryofBenefitsCoverage'],
+                                'marketing_url': row['PlanBrochure'],
+                                'formulary_url': row['FormularyURL'],
+                                'plan_contact': '',
+                                'network': [row['NetworkId']],
+                                'benefits': [],
+                                'last_updated_on': datetime.datetime.combine(
+                                    parse_date(row['ImportDate'], fuzzy=True), datetime.datetime.min.time()),
+                                'checksum': return_checksum(
+                                    [row['StandardComponentId'].lower(), int(row['BusinessYear'])], crc=32)
+                            }
+
+                            issuer_list[int(row['IssuerId'])] = {
+                                'state': str(row['StateCode']).upper(),
+                                'issuer_id': int(row['IssuerId']),
+                                'mrf_url': '',
+                                'issuer_name': row['IssuerMarketPlaceMarketingName'].strip() if row[
+                                    'IssuerMarketPlaceMarketingName'].strip() else row['IssuerId']
+                            }
+                        # except:
+                        #     from pprint import pprint
+                        #     pprint(row)
+
+    state_attribute_files = json.loads(os.environ['HLTHPRT_CMSGOV_STATE_PLAN_ATTRIBUTES_URL_PUF'])
+    for file in state_attribute_files:
+        with tempfile.TemporaryDirectory() as tmpdirname:
+            p = 'attr.csv'
+            tmp_filename = str(PurePath(str(tmpdirname), p + '.zip'))
+            await download_it_and_save(file['url'], tmp_filename)
+            await unzip(tmp_filename, tmpdirname)
+
+            tmp_filename = glob.glob(f"{tmpdirname}/*Plans*.csv")[0]
+
+
+            count = 0
+            # return 1
+
+            async with async_open(tmp_filename, 'r') as afp:
+                async for row in AsyncDictReader(afp, delimiter=","):
+                    if not (row['STANDARD COMPONENT ID'] and row['PLAN ID']):
+                        continue
+                    for key in row:
+                        if not ((key in ('StandardComponentId',)) and (row[key] is None)) and not (
+                                f"{row['STANDARD COMPONENT ID']}_{row['BUSINESS YEAR']}" in plan_list):
+                            plan_list[f"{row['STANDARD COMPONENT ID'].upper()}_{row['BUSINESS YEAR']}"] = {
+                                'plan_id': row['STANDARD COMPONENT ID'],
+                                'plan_id_type': 'STATE-HIOS-PLAN-ID',
+                                'year': int(row['BUSINESS YEAR']),
+                                'issuer_id': int(row['ISSUER ID']),
+                                'state': str(row['STATE CODE']).upper(),
+                                'marketing_name': row['PLAN MARKETING NAME'],
+                                'summary_url': row['URL FOR SUMMARY OF BENEFITS COVERAGE'],
+                                'marketing_url': row['PLAN BROCHURE'],
+                                'formulary_url': row['FORMULARY URL'],
+                                'plan_contact': '',
+                                'network': [row['NETWORK ID']],
+                                'benefits': [],
+                                'last_updated_on': datetime.datetime.combine(
+                                    parse_date(row['IMPORT DATE'], fuzzy=True), datetime.datetime.min.time()),
+                                'checksum': return_checksum(
+                                    [row['STANDARD COMPONENT ID'].lower(), int(row['BUSINESS YEAR'])], crc=32)
+                            }
+
+                            issuer_list[int(row['ISSUER ID'])] = {
+                                'state': str(row['STATE CODE']).upper(),
+                                'issuer_id': int(row['ISSUER ID']),
+                                'mrf_url': '',
+                                'issuer_name': row['ISSUER NAME'].strip() if row['ISSUER NAME'].strip() else row[
+                                    'ISSUER ID']
+                            }
+
+    return (issuer_list, plan_list)
+
+
 async def init_file(ctx):
+    """
+    The init_file function is the first function called in this file.
+    It downloads a zip file from the CMS website, unzips it, and then parses through each worksheet to create an object for each row of data.
+    The objects are then pushed into a database using GINO ORM.
+
+    :param ctx: Pass information between functions
+    :return: The following:
+
+    """
     redis = ctx['redis']
 
     print('Downloading data from: ', os.environ['HLTHPRT_CMSGOV_MRF_URL_PUF'])
@@ -418,6 +563,7 @@ async def init_file(ctx):
     import_date = ctx['import_date']
     ctx['context']['run'] += 1
     myissuer = make_class(Issuer, import_date)
+    myplan = make_class(Plan, import_date)
     myplantransparency = make_class(PlanTransparency, import_date)
 
     with tempfile.TemporaryDirectory() as tmpdirname:
@@ -523,12 +669,25 @@ async def init_file(ctx):
         url_list = list(set(url_list))
         await push_objects(obj_list, myissuer)
 
+        (issuer_list, plan_list) = await import_unknown_state_issuers_data()
+        await asyncio.gather(push_objects(list(issuer_list.values()), myissuer),
+                             push_objects(list(plan_list.values()), myplan))
+
         for url in url_list:
             await redis.enqueue_job('process_json_index', {'url': url, 'issuer_array': url2issuer[url]})
             # break
 
 
 async def startup(ctx):
+    """
+    The startup function is called once at the beginning of a run.
+    It can be used to initialize resources that will be needed by tasks, such as database connections.
+    The startup function receives one argument: a dictionary containing the context for this run.
+
+    :param ctx: Pass data between the functions
+    :return: A dictionary of context variables
+
+    """
     loop = asyncio.get_event_loop()
     ctx['context'] = {}
     ctx['context']['start'] = datetime.datetime.now()
@@ -561,6 +720,14 @@ async def startup(ctx):
 
 
 async def shutdown(ctx):
+    """
+    The shutdown function is called after the import process has completed.
+    It should be used to clean up any temporary tables or files that were created during the import process.
+
+
+    :param ctx: Pass the context of the import process to other functions
+    :return: A coroutine
+    """
     import_date = ctx['import_date']
     myimportlog = make_class(ImportLog, ctx['import_date'])
     await flush_error_log(myimportlog)
@@ -602,6 +769,11 @@ async def shutdown(ctx):
 
 
 async def main():
+    """
+    The main function is the entry point of the application.
+
+    :return: A coroutine
+    """
     redis = await create_pool(RedisSettings.from_dsn(os.environ.get('HLTHPRT_REDIS_ADDRESS')),
                               job_serializer=msgpack.packb,
                               job_deserializer=lambda b: msgpack.unpackb(b, raw=False))
