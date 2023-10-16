@@ -9,7 +9,7 @@ from arq.connections import RedisSettings
 from process.initial import main as initiate_mrf, init_file, startup as initial_startup, shutdown as initial_shutdown, \
     process_plan, process_json_index, process_provider
 from process.attributes import main as initiate_plan_attributes, save_attributes, process_state_attributes, \
-    process_attributes, startup as attr_startup, shutdown as attr_shutdown
+    process_attributes, process_prices, startup as attr_startup, shutdown as attr_shutdown
 from process.npi import main as initiate_npi, process_npi_chunk, save_npi_data, startup as npi_startup, \
     shutdown as npi_shutdown, process_data as process_npi_data
 from process.nucc import main as initiate_nucc, startup as nucc_startup, shutdown as nucc_shutdown, \
@@ -32,14 +32,14 @@ class MRF:
 
 
 class Attributes:
-    functions = [process_attributes, process_state_attributes, save_attributes]
+    functions = [process_attributes, process_state_attributes, process_prices, save_attributes]
     on_startup = attr_startup
     on_shutdown = attr_shutdown
     max_jobs=20
     queue_read_limit = 5
     redis_settings = RedisSettings.from_dsn(os.environ.get('HLTHPRT_REDIS_ADDRESS'))
-    job_serializer = msgpack.packb
-    job_deserializer = lambda b: msgpack.unpackb(b, raw=False)
+    job_serializer = lambda b: msgpack.packb(b, datetime=True)
+    job_deserializer = lambda b: msgpack.unpackb(b, timestamp=3, raw=False)
 
 
 class NPI:

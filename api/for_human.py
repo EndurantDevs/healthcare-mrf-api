@@ -338,9 +338,9 @@ attributes_labels = {
     'TEHBDedInnTier2FamilyPerGroup': 'Combined Medical and Drug EHB Deductible, In Network (Tier 2), Family Per Group',
     'TEHBDedInnTier2Coinsurance': 'Combined Medical and Drug EHB Deductible, In Network (Tier 2), Default Coinsurance',
     'TEHBDedOutOfNetIndividual': 'Combined Medical and Drug EHB Deductible, Out of Network, Individual',
-    'TEHBDedOutofNetFamily': 'Combined Medical and Drug EHB Deductible, Out of Network, Family',
-    'TEHBDedOutofNetFamilyPerPerson': 'Combined Medical and Drug EHB Deductible, Out of Network, Family Per Person',
-    'TEHBDedOutofNetFamilyPerGroup': 'Combined Medical and Drug EHB Deductible, Out of Network, Family Per Group',
+    'TEHBDedOutOfNetFamily': 'Combined Medical and Drug EHB Deductible, Out of Network, Family',
+    'TEHBDedOutOfNetFamilyPerPerson': 'Combined Medical and Drug EHB Deductible, Out of Network, Family Per Person',
+    'TEHBDedOutOfNetFamilyPerGroup': 'Combined Medical and Drug EHB Deductible, Out of Network, Family Per Group',
     'TEHBDedCombInnOonIndividual': 'Combined Medical and Drug EHB Deductible, Combined In/Out of Network, Individual',
     'TEHBDedCombInnOonFamily': 'Combined Medical and Drug EHB Deductible, Combined In/Out of Network, Family',
     'TEHBDedCombInnOonFamilyPerPerson': 'Combined Medical and Drug EHB Deductible, Combined In/Out of Network, '

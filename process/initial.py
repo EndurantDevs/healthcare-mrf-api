@@ -15,6 +15,7 @@ from async_unzip.unzipper import unzip
 import pylightxl as xl
 from sqlalchemy.dialects.postgresql import insert
 from aiocsv import AsyncDictReader
+import zipfile
 
 from process.ext.utils import download_it_and_save, make_class, push_objects, log_error, print_time_info, \
     flush_error_log, return_checksum
@@ -488,6 +489,7 @@ async def import_unknown_state_issuers_data():
                                 'state': str(row['StateCode']).upper(),
                                 'issuer_id': int(row['IssuerId']),
                                 'mrf_url': '',
+                                'data_contact_email': '',
                                 'issuer_name': row['IssuerMarketPlaceMarketingName'].strip() if row[
                                     'IssuerMarketPlaceMarketingName'].strip() else row['IssuerId']
                             }
@@ -539,11 +541,52 @@ async def import_unknown_state_issuers_data():
                                 'state': str(row['STATE CODE']).upper(),
                                 'issuer_id': int(row['ISSUER ID']),
                                 'mrf_url': '',
+                                'data_contact_email': '',
                                 'issuer_name': row['ISSUER NAME'].strip() if row['ISSUER NAME'].strip() else row[
                                     'ISSUER ID']
                             }
 
     return (issuer_list, plan_list)
+
+
+async def update_issuer_names_data():
+    issuer_list = {}
+    my_files = json.loads(os.environ['HLTHPRT_CMSGOV_RATE_REVIEW_URL_PUF'])
+    for file in my_files:
+        with tempfile.TemporaryDirectory() as tmpdirname:
+            p = 'some_file'
+            tmp_filename = str(PurePath(str(tmpdirname), p + '.zip'))
+            await download_it_and_save(file['url'], tmp_filename)
+            print(f"Trying to unpack1: {tmp_filename}")
+
+            #temp solution
+            with zipfile.ZipFile(tmp_filename, 'r') as zip_ref:
+                zip_ref.extractall(tmpdirname)
+
+            tmp_filename = glob.glob(f"{tmpdirname}/*PUF*.zip")[0]
+            print(f"Trying to unpack: {tmp_filename}")
+            tmpdirname  = str(PurePath(str(tmpdirname), 'PUF_FILES'))
+            # temp solution
+            with zipfile.ZipFile(tmp_filename, 'r') as zip_ref:
+                zip_ref.extractall(tmpdirname)
+            print(glob.glob(f"{tmpdirname}/*PUF*.csv"))
+
+            count = 0
+            # return 1
+            csv_files = glob.glob(f"{tmpdirname}/*PUF*.csv")
+            for tmp_filename in csv_files:
+                async with async_open(tmp_filename, 'r') as afp:
+                    async for row in AsyncDictReader(afp, delimiter=","):
+                        issuer_list[int(row['ISSUER_ID'])] = {
+                            'state': str(row['STATE']).upper(),
+                            'issuer_id': int(row['ISSUER_ID']),
+                            'mrf_url': '',
+                            'data_contact_email': '',
+                            'issuer_name': row['COMPANY'].strip() if row['COMPANY'].strip() else row[
+                                'ISSUER_ID']
+                        }
+
+    return issuer_list
 
 
 async def init_file(ctx):
@@ -630,6 +673,11 @@ async def init_file(ctx):
 
                 await push_objects(obj_list, myplantransparency)
 
+        (issuer_list, plan_list) = await import_unknown_state_issuers_data()
+        issuer_list.update(await update_issuer_names_data())
+        await push_objects(list(plan_list.values()), myplan)
+        del plan_list
+
         p = 'mrf_puf.xlsx'
         tmp_filename = str(PurePath(str(tmpdirname), p + '.zip'))
         await download_it_and_save(os.environ['HLTHPRT_CMSGOV_MRF_URL_PUF'], tmp_filename)
@@ -662,16 +710,13 @@ async def init_file(ctx):
                 else:
                     url2issuer[obj['mrf_url']] = [obj['issuer_id'], ]
             count += 1
-            if not (count % 100):
-                await push_objects(obj_list, myissuer)
-                obj_list.clear()
 
         url_list = list(set(url_list))
-        await push_objects(obj_list, myissuer)
 
-        (issuer_list, plan_list) = await import_unknown_state_issuers_data()
-        await asyncio.gather(push_objects(list(issuer_list.values()), myissuer),
-                             push_objects(list(plan_list.values()), myplan))
+        for x in obj_list:
+            issuer_list.update({x['issuer_id']: x})
+
+        await push_objects(list(issuer_list.values()), myissuer)
 
         for url in url_list:
             await redis.enqueue_job('process_json_index', {'url': url, 'issuer_array': url2issuer[url]})

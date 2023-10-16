@@ -9,7 +9,8 @@ import sanic.exceptions
 from sanic import response
 from sanic import Blueprint
 
-from db.models import db, PlanNetworkTierRaw, PlanNPIRaw, Plan, PlanFormulary, Issuer, ImportLog, PlanAttributes
+from db.models import db, PlanPrices, PlanNetworkTierRaw, PlanNPIRaw, Plan, PlanFormulary, Issuer, ImportLog, \
+    PlanAttributes
 
 blueprint = Blueprint('plan', url_prefix='/plan', version=1)
 
@@ -111,6 +112,41 @@ The function takes in a request object and returns a JSON response with the plan
         return data.values()
 
     return response.json({'plans': list(await get_plans(text))})
+
+
+@blueprint.get('/price/<plan_id>', name="get_price_plan_by_plan_id")
+@blueprint.get('/price/<plan_id>/year', name="get_price_plan_by_plan_id_and_year")
+async def get_price_plan(request, plan_id, year=None, variant=None):
+    age = request.args.get("age")
+    rating_area = request.args.get("rating_area")
+
+    q = PlanPrices.query.where(PlanPrices.plan_id == plan_id)
+    if year:
+        try:
+            year = int(year)
+        except:
+            raise sanic.exceptions.BadRequest
+        q = q.where(PlanPrices.year == year)
+
+    if age:
+        try:
+            age = int(age)
+        except:
+            raise sanic.exceptions.BadRequest
+        q = q.where(PlanPrices.min_age <= age).where(PlanPrices.max_age >= age)
+
+    if rating_area:
+        q = q.where(PlanPrices.rating_area_id == rating_area)
+
+    q = q.order_by(PlanPrices.year, PlanPrices.rating_area_id, PlanPrices.min_age)
+
+    res = []
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            async for x in q.gino.iterate():
+                res.append(x.to_json_dict())
+
+    return response.json(res)
 
 
 @blueprint.get('/id/<plan_id>', name="get_plan_by_plan_id")

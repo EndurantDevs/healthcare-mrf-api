@@ -1,6 +1,8 @@
 import os
 from sqlalchemy import DateTime, Numeric, DATE, Column,\
-    String, Integer, Float, BigInteger, Boolean, ARRAY, JSON, TIMESTAMP, TEXT
+    String, Integer, Float, BigInteger, Boolean, ARRAY, JSON, TIMESTAMP, TEXT, SMALLINT
+
+from sqlalchemy.dialects.postgresql import MONEY
 
 from db.connection import db
 from db.json_mixin import JSONOutputMixin
@@ -129,10 +131,51 @@ class PlanAttributes(db.Model, JSONOutputMixin):
         {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['full_plan_id', 'year', 'attr_name']
+    __my_additional_indexes__ = [
+        {'index_elements': ('full_plan_id gin_trgm_ops', 'year'),
+            'using': 'gin',
+            'name': 'find_all_variants'}]
     full_plan_id = Column(db.String(17), nullable=False)
     year = Column(Integer)
     attr_name = Column(String)
     attr_value = Column(String)
+
+
+class PlanPrices(db.Model, JSONOutputMixin):
+    __tablename__ = 'plan_prices'
+    __main_table__ = __tablename__
+    __table_args__ = (
+        {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
+    )
+    __my_index_elements__ = ['plan_id', 'year', 'checksum', ]
+    __my_additional_indexes__ = [
+        {'index_elements': ('state', 'year', 'min_age', 'max_age', 'rating_area_id', 'couple'),
+            'using': 'gin',
+            'name': 'find_plan'}]
+
+    plan_id = Column(db.String(14), nullable=False)
+    year = Column(Integer)
+    state = Column(String(2))
+    checksum = Column(Integer)
+    rate_effective_date = Column(DATE)
+    rate_expiration_date = Column(DATE)
+    rating_area_id = Column(String)
+    tobacco = Column(String)
+    min_age = Column(SMALLINT)
+    max_age = Column(SMALLINT)
+    individual_rate = Column(Numeric(scale=2, precision=8, asdecimal=False, decimal_return_scale=None))
+    individual_tobacco_rate = Column(Numeric(scale=2, precision=8, asdecimal=False, decimal_return_scale=None))
+    couple = Column(Numeric(scale=2, precision=8, asdecimal=False, decimal_return_scale=None))
+    primary_subscriber_and_one_dependent = Column(
+        Numeric(scale=2, precision=8, asdecimal=False, decimal_return_scale=None))
+    primary_subscriber_and_two_dependents = Column(
+        Numeric(scale=2, precision=8, asdecimal=False, decimal_return_scale=None))
+    primary_subscriber_and_three_or_more_dependents = Column(
+        Numeric(scale=2, precision=8, asdecimal=False, decimal_return_scale=None))
+    couple_and_one_dependent = Column(Numeric(scale=2, precision=8, asdecimal=False, decimal_return_scale=None))
+    couple_and_two_dependents = Column(Numeric(scale=2, precision=8, asdecimal=False, decimal_return_scale=None))
+    couple_and_three_or_more_dependents = Column(
+        Numeric(scale=2, precision=8, asdecimal=False, decimal_return_scale=None))
 
 
 class PlanTransparency(db.Model, JSONOutputMixin):
