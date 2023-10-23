@@ -2,7 +2,12 @@ import os
 import datetime
 import httpx
 from pathlib import Path, PurePath
-import gino
+import asyncio
+
+import pytz
+
+from db.connection import init_db, db
+
 from aioshutil import copyfile
 import ssl
 from gino.exceptions import GinoException
@@ -12,7 +17,6 @@ from arq import Retry
 from fastcrc import crc32, crc16
 import humanize
 from sqlalchemy.dialects.postgresql import insert
-from db.connection import db
 from random import choice
 import json
 from db.json_mixin import JSONOutputMixin
@@ -45,6 +49,8 @@ async def download_it_and_save_nostream(url, filepath):
             Retry()
 
 
+async def db_startup(ctx):
+    await my_init_db(db)
 
 async def download_it_and_save(url, filepath, chunk_size=None, context=None, logger=None, cache_dir=None):
     print(f"Downloading {url}")
@@ -161,10 +167,11 @@ async def push_objects_slow(obj_list, cls):
 
 class IterateList:
 
-    def __init__(self, obj_list):
+    def __init__(self, obj_list, order):
         self.end = len(obj_list)
         self.start = 0
         self.obj_list = obj_list
+        self.obj_order = order
 
     def __aiter__(self):
         return self
@@ -173,9 +180,15 @@ class IterateList:
         if self.start < self.end:
             cur_pos = self.start
             self.start += 1
-            return list(self.obj_list[cur_pos].values())
+            return [self.obj_list[cur_pos][k] for k in self.obj_order]
         else:
             raise StopAsyncIteration
+
+
+async def my_init_db(db):
+    loop = asyncio.get_event_loop()
+    await init_db(db, loop)
+
 
 
 async def push_objects(obj_list, cls, rewrite=False):
@@ -187,7 +200,7 @@ async def push_objects(obj_list, cls, rewrite=False):
             async with db.acquire() as conn:
                 await conn.raw_connection.copy_records_to_table(cls.__tablename__,
                                                                 schema_name=cls.__table_args__[0]['schema'],
-                                                                columns=obj_list[0].keys(), records=IterateList(obj_list))
+                                                                columns=obj_list[0].keys(), records=IterateList(obj_list, obj_list[0].keys()))
             # print("All good!")
         except ValueError as exc:
             print(f"INPUT arr: {obj_list}")
@@ -227,7 +240,8 @@ async def push_objects(obj_list, cls, rewrite=False):
                         print(e)
 
 def print_time_info(start):
-    now = datetime.datetime.now()
+    now = datetime.datetime.utcnow()
+    now = now.replace(tzinfo=pytz.utc)
     delta = now - start
     print('Import Time Delta: ', delta)
     print('Import took ', humanize.naturaldelta(delta))

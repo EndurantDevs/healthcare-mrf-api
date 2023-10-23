@@ -22,7 +22,7 @@ from async_unzip.unzipper import unzip
 
 from process.ext.utils import return_checksum, download_it, download_it_and_save, download_it_and_save_nostream, \
     make_class, push_objects, log_error, print_time_info, \
-    flush_error_log
+    flush_error_log, my_init_db
 
 from db.models import AddressArchive, NPIAddress, NPIData, NPIDataTaxonomyGroup, NPIDataOtherIdentifier, \
     NPIDataTaxonomy, db
@@ -167,6 +167,10 @@ async def process_data(ctx):
     # 110722_111322</a>
 
     for p in re.findall(r'(NPPES_Data_Dissemination.*.zip)', html_source.text):
+        if p.endswith('021223_Weekly.zip') or p.endswith('020523_Weekly.zip') or p.endswith(
+                '030523_Weekly.zip') or p.endswith('031223_Weekly.zip'):
+            continue
+
         with tempfile.TemporaryDirectory() as tmpdirname:
             print(f"Found: {p}")
             #await unzip('/users/nick/downloads/NPPES_Data_Dissemination_November_2022.zip', tmpdirname, __debug=True)
@@ -269,12 +273,11 @@ async def process_data(ctx):
 
 
 async def startup(ctx):
-    loop = asyncio.get_event_loop()
+    await my_init_db(db)
     ctx['context'] = {}
     ctx['context']['start'] = datetime.datetime.now()
     ctx['context']['run'] = 0
     ctx['import_date'] = datetime.datetime.now().strftime("%Y%m%d")
-    await init_db(db, loop)
     import_date = ctx['import_date']
     db_schema = os.getenv('HLTHPRT_DB_SCHEMA') if os.getenv('HLTHPRT_DB_SCHEMA') else 'mrf'
 

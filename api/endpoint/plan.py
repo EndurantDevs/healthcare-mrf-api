@@ -11,6 +11,7 @@ from sanic import Blueprint
 
 from db.models import db, PlanPrices, PlanNetworkTierRaw, PlanNPIRaw, Plan, PlanFormulary, Issuer, ImportLog, \
     PlanAttributes
+from db.tiger_models import ZipState
 
 blueprint = Blueprint('plan', url_prefix='/plan', version=1)
 
@@ -85,8 +86,15 @@ The function takes in a request object and returns a JSON response with the plan
 :return: The list of plans that match the query
 """
     text = request.args.get("query")
+    state = request.args.get("state")
+    zip_code = request.args.get("zip_code")
     async def get_plans(text, limit=10):
-        q =  await Plan.query.where(db.func.lower(Plan.marketing_name).ilike('%' + text.lower() + '%') | db.func.lower(Plan.plan_id).ilike('%' + text.lower() + '%')).limit(100).gino.all()
+        q = Plan.query.where(db.func.lower(Plan.marketing_name).ilike('%' + text.lower() + '%') | db.func.lower(Plan.plan_id).ilike('%' + text.lower() + '%')).limit(100)
+        if state:
+            q = q.where(Plan.state==state)
+        elif zip_code:
+            q = q.where(ZipState.zip == zip_code).where(Plan.state == ZipState.stusps)
+        q = await q.gino.all()
         plan_id = []
         data = {}
         for x in q:
@@ -97,9 +105,14 @@ The function takes in a request object and returns a JSON response with the plan
         if not plan_id:
             return []
 
-        for (x, y, z) in await db.select([db.func.array_agg(
-                db.func.distinct(PlanNetworkTierRaw.plan_id, PlanNetworkTierRaw.checksum_network, PlanNetworkTierRaw.network_tier))]).where(
-                PlanNetworkTierRaw.plan_id == db.func.any(plan_id)).gino.scalar():
+        res = await db.select([db.func.array_agg(
+            db.func.distinct(PlanNetworkTierRaw.plan_id, PlanNetworkTierRaw.checksum_network,
+                             PlanNetworkTierRaw.network_tier))]).where(
+            PlanNetworkTierRaw.plan_id == db.func.any(plan_id)).gino.scalar()
+        if not res:
+            return []
+
+        for (x, y, z) in res:
             data[x]['network_checksum'][y] = z
 
         del_array=set()
@@ -112,6 +125,67 @@ The function takes in a request object and returns a JSON response with the plan
         return data.values()
 
     return response.json({'plans': list(await get_plans(text))})
+
+
+@blueprint.get('/search', name="find_a_plan")
+async def find_a_plan(request):
+    age = request.args.get("age")
+    state = request.args.get("state")
+    rating_area = request.args.get("rating_area")
+    zip_code = request.args.get("zip_code")
+    year = request.args.get("year")
+    limit = request.args.get("limit")
+    page = request.args.get("page")
+
+    if not limit:
+        limit = 100
+    if not page:
+        page = 1
+
+    q = db.select([Plan.plan_id, db.func.min(PlanPrices.individual_rate), db.func.max(PlanPrices.individual_rate)]).where(
+        Plan.plan_id == PlanPrices.plan_id).where(Plan.year == PlanPrices.year)
+    # .where(
+        #PlanNPIRaw.npi == npi).order_by(PlanNPIRaw.issuer_id.desc()).gino.load((PlanNPIRaw, Issuer))
+
+    # async with db.acquire() as conn:
+    #     async with conn.transaction():
+    #         async for x in q.iterate():
+    #             data.append({'npi_info': x[0].to_json_dict(), 'issuer_info': x[1].to_json_dict()})
+
+    if state:
+        q = q.where(Plan.state == state)
+    elif zip_code:
+        q = q.where(ZipState.zip == zip_code).where(Plan.state == ZipState.stusps)
+
+    if year:
+        try:
+            year = int(year)
+        except:
+            raise sanic.exceptions.BadRequest
+        q = q.where(Plan.year == year)
+
+    if age:
+        try:
+            age = int(age)
+        except:
+            raise sanic.exceptions.BadRequest
+        q = q.where(PlanPrices.min_age <= age).where(PlanPrices.max_age >= age)
+
+    if rating_area:
+        q = q.where(PlanPrices.rating_area_id == rating_area)
+
+    q = q.limit(10).group_by(Plan.plan_id, Plan.year)
+
+        #q.order_by(PlanPrices.year, PlanPrices.rating_area_id, PlanPrices.min_age)
+
+    res = []
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            async for x in q.gino.iterate():
+                res.append(list(x))
+
+    return response.json(res)
+
 
 
 @blueprint.get('/price/<plan_id>', name="get_price_plan_by_plan_id")

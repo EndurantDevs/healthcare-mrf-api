@@ -17,3 +17,4 @@ pylightxl
 fastcrc
 socksio
 aioshutil
+ruamel.ext.msgpack

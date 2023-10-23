@@ -19,8 +19,9 @@ import zipfile
 
 from process.ext.utils import download_it_and_save, make_class, push_objects, log_error, print_time_info, \
     flush_error_log, return_checksum
-from db.models import PlanNPIRaw, PlanNetworkTierRaw, ImportHistory, ImportLog, Issuer, Plan, PlanFormulary, PlanTransparency, db
-from db.connection import init_db
+from db.models import PlanNPIRaw, PlanNetworkTierRaw, ImportHistory, ImportLog, Issuer, Plan, PlanFormulary, \
+    PlanTransparency, db
+from process.ext.utils import my_init_db
 from asyncpg import DuplicateTableError
 
 
@@ -33,7 +34,10 @@ async def process_plan(ctx, task):
     :param task: Pass the task object to the function
     :return: 1 if there is no error
     """
-    import_date = ctx['import_date']
+    if 'context' in task:
+        ctx['context'] = task['context']
+    import_date = ctx['context']['import_date']
+
     myplan = make_class(Plan, import_date)
     myplanformulary = make_class(PlanFormulary, import_date)
     myimportlog = make_class(ImportLog, import_date)
@@ -203,7 +207,10 @@ async def process_provider(ctx, task):
     :param task: Pass the url of the file to be downloaded
     :return: 1 if the file is successfully processed
     """
-    import_date = ctx['import_date']
+    if 'context' in task:
+        ctx['context'] = task['context']
+    import_date = ctx['context']['import_date']
+
     current_year = datetime.datetime.now().year
     myimportlog = make_class(ImportLog, import_date)
     myplan_npi = make_class(PlanNPIRaw, import_date)
@@ -242,25 +249,25 @@ async def process_provider(ctx, task):
                         #                             task.get('issuer_array'), task.get('url'), 'plans', 'json',
                         #                             myimportlog)
 
-                            # if not int(plan['plan_id'][:5]) in task.get('issuer_array'):
-                            #     await log_error('err',
-                            #                     f"File describes the issuer that is not defined/allowed by the index "
-                            #                     f"CMS PUF."
-                            #                     f"Issuer of Plan: {int(plan['plan_id'][:5])}. Allowed issuer list: "
-                            #                     f"{''.join([str(x) for x in task.get('issuer_array')])}"
-                            #                     f"Plan ID: {plan['plan_id']}, NPI: {res.get('npi', None)}",
-                            #                     task.get('issuer_array'), task.get('url'), 'providers', 'json',
-                            #                     myimportlog)
-                        if not (res.get('npi', 0) and res.get('npi').isdigit() and plan.get('plan_id', None) and plan['plan_id'] and plan.get('years', None)
+                        # if not int(plan['plan_id'][:5]) in task.get('issuer_array'):
+                        #     await log_error('err',
+                        #                     f"File describes the issuer that is not defined/allowed by the index "
+                        #                     f"CMS PUF."
+                        #                     f"Issuer of Plan: {int(plan['plan_id'][:5])}. Allowed issuer list: "
+                        #                     f"{''.join([str(x) for x in task.get('issuer_array')])}"
+                        #                     f"Plan ID: {plan['plan_id']}, NPI: {res.get('npi', None)}",
+                        #                     task.get('issuer_array'), task.get('url'), 'providers', 'json',
+                        #                     myimportlog)
+                        if not (res.get('npi', 0) and res.get('npi').isdigit() and plan.get('plan_id', None) and plan[
+                            'plan_id'] and plan.get('years', None)
                                 and (0 < int(res.get('npi', 0)) < 4294967295)):
                             not_good = True
                             break
-                        if not (12 < len(plan['plan_id']) <=14):
+                        if not (12 < len(plan['plan_id']) <= 14):
                             continue
 
-
                         for x in plan.get('years', []):
-                            if x and (current_year+1 >= int(x) >= current_year):
+                            if x and (current_year + 1 >= int(x) >= current_year):
                                 my_years.add(int(x))
 
                         issuer_id = int(plan['plan_id'][0:5])
@@ -347,7 +354,6 @@ async def process_provider(ctx, task):
                         obj['name_or_facility_name'] = obj['name_or_facility_name'].strip()
                         obj['specialty_or_facility_type'] = [str(x) for x in res.get('specialty', [])]
 
-
                     for x in my_network_tiers.values():
                         obj['network_tier'] = x['network_tier']
                         obj['checksum_network'] = x['checksum_network']
@@ -398,7 +404,12 @@ async def process_json_index(ctx, task):
     """
     redis = ctx['redis']
     issuer_array = task['issuer_array']
-    myimportlog = make_class(ImportLog, ctx['import_date'])
+    print(f'CTX: {ctx} \n TASK: {task}')
+    if 'context' in task:
+        ctx['context'] = task['context']
+    import_date = ctx['context']['import_date']
+
+    myimportlog = make_class(ImportLog, import_date)
     with tempfile.TemporaryDirectory() as tmpdirname:
         p = Path(task.get('url'))
         tmp_filename = str(PurePath(str(tmpdirname), p.name))
@@ -410,7 +421,8 @@ async def process_json_index(ctx, task):
                 async for url in ijson.items(afp, "plan_urls.item",
                                              use_float=True):  # , 'formulary_urls', 'provider_urls'
                     print(f"Plan URL: {url}")
-                    await redis.enqueue_job('process_plan', {'url': url, 'issuer_array': issuer_array})
+                    await redis.enqueue_job('process_plan', {'url': url, 'issuer_array': issuer_array,
+                        'context': ctx['context']})
                     # break
             except ijson.JSONError as exc:
                 await log_error('err',
@@ -428,7 +440,8 @@ async def process_json_index(ctx, task):
                 async for url in ijson.items(afp, "provider_urls.item",
                                              use_float=True):  # , 'formulary_urls', 'provider_urls'
                     print(f"Provider URL: {url}")
-                    await redis.enqueue_job('process_provider', {'url': url, 'issuer_array': issuer_array})
+                    await redis.enqueue_job('process_provider',
+                                            {'url': url, 'issuer_array': issuer_array, 'context': ctx['context']})
                     # break
             except ijson.JSONError as exc:
                 await log_error('err',
@@ -490,6 +503,7 @@ async def import_unknown_state_issuers_data():
                                 'issuer_id': int(row['IssuerId']),
                                 'mrf_url': '',
                                 'data_contact_email': '',
+                                'issuer_marketing_name': '',
                                 'issuer_name': row['IssuerMarketPlaceMarketingName'].strip() if row[
                                     'IssuerMarketPlaceMarketingName'].strip() else row['IssuerId']
                             }
@@ -506,7 +520,6 @@ async def import_unknown_state_issuers_data():
             await unzip(tmp_filename, tmpdirname)
 
             tmp_filename = glob.glob(f"{tmpdirname}/*Plans*.csv")[0]
-
 
             count = 0
             # return 1
@@ -542,6 +555,7 @@ async def import_unknown_state_issuers_data():
                                 'issuer_id': int(row['ISSUER ID']),
                                 'mrf_url': '',
                                 'data_contact_email': '',
+                                'issuer_marketing_name': '',
                                 'issuer_name': row['ISSUER NAME'].strip() if row['ISSUER NAME'].strip() else row[
                                     'ISSUER ID']
                             }
@@ -559,13 +573,13 @@ async def update_issuer_names_data():
             await download_it_and_save(file['url'], tmp_filename)
             print(f"Trying to unpack1: {tmp_filename}")
 
-            #temp solution
+            # temp solution
             with zipfile.ZipFile(tmp_filename, 'r') as zip_ref:
                 zip_ref.extractall(tmpdirname)
 
             tmp_filename = glob.glob(f"{tmpdirname}/*PUF*.zip")[0]
             print(f"Trying to unpack: {tmp_filename}")
-            tmpdirname  = str(PurePath(str(tmpdirname), 'PUF_FILES'))
+            tmpdirname = str(PurePath(str(tmpdirname), 'PUF_FILES'))
             # temp solution
             with zipfile.ZipFile(tmp_filename, 'r') as zip_ref:
                 zip_ref.extractall(tmpdirname)
@@ -582,6 +596,7 @@ async def update_issuer_names_data():
                             'issuer_id': int(row['ISSUER_ID']),
                             'mrf_url': '',
                             'data_contact_email': '',
+                            'issuer_marketing_name': '',
                             'issuer_name': row['COMPANY'].strip() if row['COMPANY'].strip() else row[
                                 'ISSUER_ID']
                         }
@@ -592,7 +607,8 @@ async def update_issuer_names_data():
 async def init_file(ctx):
     """
     The init_file function is the first function called in this file.
-    It downloads a zip file from the CMS website, unzips it, and then parses through each worksheet to create an object for each row of data.
+    It downloads a zip file from the CMS website, unzips it, and then parses through each worksheet to create an
+    object for each row of data.
     The objects are then pushed into a database using GINO ORM.
 
     :param ctx: Pass information between functions
@@ -603,7 +619,7 @@ async def init_file(ctx):
 
     print('Downloading data from: ', os.environ['HLTHPRT_CMSGOV_MRF_URL_PUF'])
 
-    import_date = ctx['import_date']
+    import_date = ctx['context']['import_date']
     ctx['context']['run'] += 1
     myissuer = make_class(Issuer, import_date)
     myplan = make_class(Plan, import_date)
@@ -675,8 +691,6 @@ async def init_file(ctx):
 
         (issuer_list, plan_list) = await import_unknown_state_issuers_data()
         issuer_list.update(await update_issuer_names_data())
-        await push_objects(list(plan_list.values()), myplan)
-        del plan_list
 
         p = 'mrf_puf.xlsx'
         tmp_filename = str(PurePath(str(tmpdirname), p + '.zip'))
@@ -700,6 +714,7 @@ async def init_file(ctx):
                 obj['state'] = row[0].upper()
                 obj['issuer_id'] = int(row[1])
                 obj['mrf_url'] = row[2]
+                obj['issuer_marketing_name'] = ''
                 issuer_name = await myplantransparency.select('issuer_name').where(
                     myplantransparency.issuer_id == obj['issuer_id']).gino.scalar()
                 obj['issuer_name'] = issuer_name if issuer_name else 'N/A'
@@ -716,10 +731,16 @@ async def init_file(ctx):
         for x in obj_list:
             issuer_list.update({x['issuer_id']: x})
 
-        await push_objects(list(issuer_list.values()), myissuer)
+        await asyncio.gather(push_objects(list(issuer_list.values()), myissuer),
+                             push_objects(list(plan_list.values()), myplan))
 
         for url in url_list:
-            await redis.enqueue_job('process_json_index', {'url': url, 'issuer_array': url2issuer[url]})
+            await redis.enqueue_job('process_json_index',
+                                    {'url': url, 'issuer_array': url2issuer[url], 'context': ctx['context']},
+                                    _queue_name='arq:MRF')
+
+        await redis.enqueue_job('shutdown', {'context': ctx['context']}, _job_id='shutdown_mrf',
+                                        _queue_name='arq:MRF_finish')
             # break
 
 
@@ -733,13 +754,12 @@ async def startup(ctx):
     :return: A dictionary of context variables
 
     """
-    loop = asyncio.get_event_loop()
+    await my_init_db(db)
     ctx['context'] = {}
     ctx['context']['start'] = datetime.datetime.now()
     ctx['context']['run'] = 0
-    ctx['import_date'] = datetime.datetime.now().strftime("%Y%m%d")
-    await init_db(db, loop)
-    import_date = ctx['import_date']
+    ctx['context']['import_date'] = datetime.datetime.now().strftime("%Y%m%d")
+    import_date = ctx['context']['import_date']
     db_schema = os.getenv('HLTHPRT_DB_SCHEMA') if os.getenv('HLTHPRT_DB_SCHEMA') else 'mrf'
 
     try:
@@ -764,7 +784,7 @@ async def startup(ctx):
     print("Preparing done")
 
 
-async def shutdown(ctx):
+async def shutdown(ctx, task):
     """
     The shutdown function is called after the import process has completed.
     It should be used to clean up any temporary tables or files that were created during the import process.
@@ -773,8 +793,10 @@ async def shutdown(ctx):
     :param ctx: Pass the context of the import process to other functions
     :return: A coroutine
     """
-    import_date = ctx['import_date']
-    myimportlog = make_class(ImportLog, ctx['import_date'])
+    if 'context' in task:
+        ctx['context'] = task['context']
+    import_date = ctx['context']['import_date']
+    myimportlog = make_class(ImportLog, import_date)
     await flush_error_log(myimportlog)
     db_schema = os.getenv('DB_SCHEMA') if os.getenv('DB_SCHEMA') else 'mrf'
     await db.status("CREATE EXTENSION IF NOT EXISTS pg_trgm;")
@@ -822,4 +844,11 @@ async def main():
     redis = await create_pool(RedisSettings.from_dsn(os.environ.get('HLTHPRT_REDIS_ADDRESS')),
                               job_serializer=msgpack.packb,
                               job_deserializer=lambda b: msgpack.unpackb(b, raw=False))
-    x = await redis.enqueue_job('init_file')
+    x = await redis.enqueue_job('init_file', _queue_name='arq:MRF_start')
+
+
+async def finish_main():
+    redis = await create_pool(RedisSettings.from_dsn(os.environ.get('HLTHPRT_REDIS_ADDRESS')),
+                              job_serializer=msgpack.packb,
+                              job_deserializer=lambda b: msgpack.unpackb(b, raw=False))
+    x = await redis.enqueue_job('shutdown')

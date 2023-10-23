@@ -19,7 +19,7 @@ from async_unzip.unzipper import unzip
 from process.ext.utils import download_it_and_save, make_class, push_objects, log_error, print_time_info, \
     flush_error_log, return_checksum
 from dateutil.parser import parse as parse_date
-from db.models import Issuer, Plan, PlanAttributes, PlanPrices, db
+from db.models import Issuer, Plan, PlanAttributes, PlanPrices, PlanRatingAreas, db
 from db.connection import init_db
 
 from api.for_human import plan_attributes_labels_to_key
@@ -30,7 +30,7 @@ latin_pattern= re.compile(r'[^\x00-\x7f]')
 async def startup(ctx):
     loop = asyncio.get_event_loop()
     ctx['context'] = {}
-    ctx['context']['start'] = datetime.datetime.now()
+    ctx['context']['start'] = datetime.datetime.utcnow().replace(tzinfo=pytz.utc)
     ctx['context']['run'] = 0
     ctx['import_date'] = datetime.datetime.now().strftime("%Y%m%d")
     await init_db(db, loop)
@@ -39,7 +39,7 @@ async def startup(ctx):
 
     tables = {}  # for the future complex usage
 
-    for cls in (PlanAttributes, PlanPrices, ):
+    for cls in (PlanAttributes, PlanPrices, PlanRatingAreas, ):
         tables[cls.__main_table__] = make_class(cls, import_date)
         obj = tables[cls.__main_table__]
         await db.status(f"DROP TABLE IF EXISTS {db_schema}.{obj.__main_table__}_{import_date};")
@@ -56,7 +56,7 @@ async def shutdown(ctx):
     db_schema = os.getenv('DB_SCHEMA') if os.getenv('DB_SCHEMA') else 'mrf'
     tables = {}
 
-    processing_classes_array = (PlanAttributes, PlanPrices, )
+    processing_classes_array = (PlanAttributes, PlanPrices, PlanRatingAreas, )
 
     for cls in processing_classes_array:
         tables[cls.__main_table__] = make_class(cls, import_date)
@@ -174,9 +174,30 @@ async def process_attributes(ctx, task):
             if attr_obj_list:
                 await push_objects(attr_obj_list, myplanattributes)
 
+
+async def process_rating_areas(ctx):
+    redis = ctx['redis']
+    print('Importing Rating Areas')
+    import_date = ctx['import_date']
+    myplanrating = make_class(PlanRatingAreas, import_date)
+    attr_obj_list = []
+    async with async_open('data/rating_areas.csv', 'r', encoding="utf-8") as afp:
+        async for row in AsyncDictReader(afp, delimiter=";"):
+            obj = {
+                'state': row['STATE CODE'].upper(),
+                'county': row['COUNTY'],
+                'zip3': row['ZIP3'],
+                'rating_area_id': row['RATING AREA ID'],
+                'market': row['MARKET'],
+            }
+            attr_obj_list.append(obj)
+
+    if attr_obj_list:
+        await push_objects(attr_obj_list, myplanrating)
+
 async def process_prices(ctx, task):
     redis = ctx['redis']
-
+    await process_rating_areas(ctx)
     print('Downloading data from: ', task['url'])
 
     import_date = ctx['import_date']

@@ -21,7 +21,7 @@ from db.migrator import db_group
 with open(os.environ['HLTHPRT_LOG_CFG'], encoding="utf-8") as fobj:
     logging.config.dictConfig(yaml.safe_load(fobj))
 
-from process import process_group
+from process import process_group, process_group_end
 
 
 api = Sanic('mrf-api', env_prefix="HLTHPRT_")
@@ -68,6 +68,7 @@ def cli():
 
 cli.add_command(server)
 cli.add_command(process_group, name="start")
+cli.add_command(process_group_end, name="finish")
 cli.add_command(db_group, name="db")
 cli.add_command(arq.cli.cli, name="worker")
 

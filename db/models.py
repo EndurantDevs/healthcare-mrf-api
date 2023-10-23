@@ -2,8 +2,6 @@ import os
 from sqlalchemy import DateTime, Numeric, DATE, Column,\
     String, Integer, Float, BigInteger, Boolean, ARRAY, JSON, TIMESTAMP, TEXT, SMALLINT
 
-from sqlalchemy.dialects.postgresql import MONEY
-
 from db.connection import db
 from db.json_mixin import JSONOutputMixin
 
@@ -139,6 +137,20 @@ class PlanAttributes(db.Model, JSONOutputMixin):
     year = Column(Integer)
     attr_name = Column(String)
     attr_value = Column(String)
+
+class PlanRatingAreas(db.Model, JSONOutputMixin):
+    __tablename__ = 'plan_rating_areas'
+    __main_table__ = __tablename__
+    __table_args__ = (
+        {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
+    )
+    __my_index_elements__ = ['county', 'zip3', 'state', 'market']
+
+    state = Column(String(2))
+    rating_area_id = Column(String)
+    county = Column(String)
+    zip3 = Column(String)
+    market = Column(String)
 
 
 class PlanPrices(db.Model, JSONOutputMixin):

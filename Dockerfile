@@ -4,7 +4,7 @@ WORKDIR /wheels
 ADD ./requirements-dev.txt /wheels
 
 WORKDIR /opt
-RUN apt update && apt install -y nginx libaio1 && python3 -m venv venv && . venv/bin/activate && pip install --no-compile --upgrade pip && \
+RUN apt update && apt install -y nginx libaio1 parallel && python3 -m venv venv && . venv/bin/activate && pip install --no-compile --upgrade pip && \
 	pip install --no-compile -r /wheels/requirements-dev.txt -f /wheels \
         && rm -rf /wheels \
         && rm -rf /root/.cache/pip/* && \
@@ -51,6 +51,7 @@ RUN chmod a+x /usr/local/bin/start_api.sh /usr/local/bin/run_import.sh
 
 COPY api/ /opt/api/
 COPY db/ /opt/db/
+COPY data/ /opt/data/
 COPY alembic/ /opt/alembic/
 COPY process/ /opt/process/
 COPY logging.yaml main.py alembic.ini /opt/
