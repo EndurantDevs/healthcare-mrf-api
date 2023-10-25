@@ -66,6 +66,7 @@ class Attributes:
     on_shutdown = attr_shutdown
     max_jobs=20
     queue_read_limit = 5
+    job_timeout = 3600
     redis_settings = RedisSettings.from_dsn(os.environ.get('HLTHPRT_REDIS_ADDRESS'))
     job_serializer = lambda b: packb(b, datetime=True)
     job_deserializer = lambda b: unpackb(b, timestamp=3, raw=False)
