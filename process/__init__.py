@@ -9,7 +9,7 @@ from arq.connections import RedisSettings
 from process.initial import main as initiate_mrf, finish_main as finish_mrf, init_file, startup as initial_startup, \
     shutdown as initial_shutdown, process_plan, process_json_index, process_provider
 from process.attributes import main as initiate_plan_attributes, save_attributes, process_state_attributes, \
-    process_attributes, process_prices, startup as attr_startup, shutdown as attr_shutdown
+    process_attributes, process_prices, process_benefits, startup as attr_startup, shutdown as attr_shutdown
 from process.npi import main as initiate_npi, process_npi_chunk, save_npi_data, startup as npi_startup, \
     shutdown as npi_shutdown, process_data as process_npi_data
 from process.nucc import main as initiate_nucc, startup as nucc_startup, shutdown as nucc_shutdown, \
@@ -36,8 +36,8 @@ class MRF:
     functions = [process_plan, process_json_index, process_provider]
     on_startup = db_startup
     # on_shutdown = init_shutdown
-    max_jobs = 20
-    queue_read_limit = 10
+    max_jobs = int(os.environ.get('HLTHPRT_MAX_MRF_JOBS')) if os.environ.get('HLTHPRT_MAX_MRF_JOBS') else 20
+    queue_read_limit = 5*max_jobs
     job_timeout = 3600
     burst = True
     queue_name = 'arq:MRF'
@@ -61,7 +61,7 @@ class MRF_finish:
 
 
 class Attributes:
-    functions = [process_attributes, process_state_attributes, process_prices, save_attributes]
+    functions = [process_attributes, process_state_attributes, process_prices, process_benefits, save_attributes]
     on_startup = attr_startup
     on_shutdown = attr_shutdown
     max_jobs=20

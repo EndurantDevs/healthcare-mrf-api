@@ -27,7 +27,7 @@ if os.environ.get('HLTHPRT_SOCKS_PROXY'):
 else:
     transport = httpx.AsyncHTTPTransport(retries=3)
 
-HTTP_CHUNK_SIZE = 512 * 1024
+HTTP_CHUNK_SIZE = 1024 * 1024
 headers = {'user-agent': 'Mozilla/5.0 (compatible; Healthporta Healthcare MRF API Importer/1.0; +https://github.com/EndurantDevs/healthcare-mrf-api)'}
 
 timeout = httpx.Timeout(30.0)

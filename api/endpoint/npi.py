@@ -260,16 +260,23 @@ async def get_npi(request, npi):
                                                place_id=place_id)\
                     .where(NPIAddress.checksum == checksum).gino.status()
                 temp = AddressArchive.__table__.columns
-                async for x in NPIAddress.query.where(NPIAddress.checksum == checksum).gino.iterate():
-                    obj = {}
-                    t = x.to_dict()
-                    for c in temp:
-                        obj[c.key] = t[c.key]
+                x = await NPIAddress.query.where(NPIAddress.checksum == checksum).gino.first()
+                obj = {}
+                t = x.to_dict()
+                for c in temp:
+                    obj[c.key] = t[c.key]
 
-                    await insert(AddressArchive).values([obj]).on_conflict_do_update(
-                        index_elements=AddressArchive.__my_index_elements__,
-                        set_=obj
-                    ).gino.model(AddressArchive).status()
+        # long = long,
+        # lat = lat,
+        # formatted_address = formatted_address,
+        # place_id = place_id
+        #         del obj['checksum']
+                # await AddressArchive.update.values(obj) \
+                #     .where(AddressArchive.checksum == checksum).gino.status()
+                await insert(AddressArchive).values([obj]).on_conflict_do_update(
+                    index_elements=AddressArchive.__my_index_elements__,
+                    set_=obj
+                ).gino.model(AddressArchive).status()
 
     async def get_npi_data(npi):
         async with db.acquire():
@@ -324,6 +331,21 @@ async def get_npi(request, npi):
                     except:
                         pass
 
+                    update_geo = False
+                    if request.app.config.get('NPI_API_UPDATE_GEOCODE') and not d['lat']:
+                        update_geo = True
+
+                    if not d['lat']:
+                        try:
+                            res = await AddressArchive.query.where(AddressArchive.checksum == x.checksum).gino.first()
+                            if res:
+                                d['long'] = res.long
+                                d['lat'] = res.lat
+                                d['formatted_address'] = res.formatted_address
+                                d['place_id'] = res.place_id
+                        except:
+                            pass
+
                     if not d['lat']:
                         try:
                             params = {
@@ -362,7 +384,7 @@ async def get_npi(request, npi):
                                 d['place_id'] = geo_data['results'][0]['place_id']
                         except:
                             pass
-                    if os.getenv('HLTHPRT_NPI_API_UPDATE_GEOCODE') and d.get('lat'):
+                    if update_geo and d.get('lat'):
                         request.app.add_task(update_addr_coordinates(x.checksum, d['long'], d['lat'], d['formatted_address'], d['place_id']))
                     t.append(d)
                 else:

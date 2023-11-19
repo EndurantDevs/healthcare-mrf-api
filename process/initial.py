@@ -661,18 +661,18 @@ async def init_file(ctx):
                 for row in xls_file.ws(ws=ws_name).rows:
                     if count > 2:
                         obj = {}
-                        obj['state'] = row[template['state']].upper()
-                        obj['issuer_name'] = row[template['issuer_name']]
+                        obj['state'] = str(row[template['state']].upper())
+                        obj['issuer_name'] = str(row[template['issuer_name']])
                         obj['issuer_id'] = int(row[template['issuer_id']])
                         obj['new_issuer_to_exchange'] = True if row[template['new_issuer_to_exchange']] in (
                             'Yes', 'yes', 'y') else False
                         obj['sadp_only'] = True if row[template['sadp_only']] in ('Yes', 'yes', 'y') else False
-                        obj['plan_id'] = row[template['plan_id']]
+                        obj['plan_id'] = str(row[template['plan_id']])
                         obj['year'] = int(file['year'])
-                        obj['qhp_sadp'] = row[template['qhp_sadp']]
-                        obj['plan_type'] = row[template['plan_type']]
-                        obj['metal'] = row[template['metal']]
-                        obj['claims_payment_policies_url'] = row[template['claims_payment_policies_url']]
+                        obj['qhp_sadp'] = str(row[template['qhp_sadp']])
+                        obj['plan_type'] = str(row[template['plan_type']])
+                        obj['metal'] = str(row[template['metal']])
+                        obj['claims_payment_policies_url'] = str(row[template['claims_payment_policies_url']])
 
                         obj_list.append(obj)
                         if count > int(os.environ.get('HLTHPRT_SAVE_PER_PACK', 50)):
