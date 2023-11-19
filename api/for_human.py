@@ -17,7 +17,7 @@ plan_attributes_labels_to_key = {'AV CALCULATOR OUTPUT NUMBER': 'AVCalculatorOut
     'DEHB DED INN TIER2 COINSURANCE': 'DEHBDedInnTier2Coinsurance',
     'DEHB DED INN TIER2 FAMILY': 'DEHBDedInnTier2Family',
     'DEHB DED INN TIER2 INDIVIDUAL': 'DEHBDedInnTier2Individual',
-    'DEHB DED OUT OF NET FAMILY': 'DEHBDedOutofNetFamily',
+    'DEHB DED OUT OF NET FAMILY': 'DEHBDedOutOfNetFamily',
     'DEHB DED OUT OF NET INDIVIDUAL': 'DEHBDedOutOfNetIndividual',
     'DEHB INN TIER 1 FAMILY MOOP': 'DEHBInnTier1FamilyMOOP',
     'DEHB INN TIER 1 INDIVIDUAL MOOP': 'DEHBInnTier1IndividualMOOP',
@@ -131,6 +131,29 @@ plan_attributes_labels_to_key = {'AV CALCULATOR OUTPUT NUMBER': 'AVCalculatorOut
     'URL FOR SUMMARY OF BENEFITS COVERAGE': 'URLForSummaryofBenefitsCoverage',
     'VERSION NUMBER': 'VersionNumber',
     'WELLNESS PROGRAM OFFERED': 'WellnessProgramOffered'}
+
+benefits_labels = {
+    "year": "Year",
+    "plan_id": "Plan ID",
+    "full_plan_id": "Full Plan ID",
+    "benefit_name": "Benefit Name",
+    "copay_inn_tier1": "Copayment In Network, Tier 1",
+    "copay_inn_tier2": "Copayment In Network, Tier 2",
+    "copay_outof_net": "Copayment Out of Network",
+    "coins_inn_tier1": "Coinsurance In Network, Tier 1",
+    "coins_inn_tier2": "Coinsurance In Network, Tier 2",
+    "coins_outof_net": "Coinsurance Out of Network",
+    "is_ehb": "Is EHB",
+    "is_covered": "Is Covered",
+    "quant_limit_on_svc": "Quantitative Limit on Service",
+    "limit_unit": "Limit Unit",
+    "exclusions": "Exclusions",
+    "explanation": "Explanation",
+    "ehb_var_reason": "EHB Variation Reason",
+    "is_excl_from_inn_mo": "Is Excluded From In Network MOOP",
+    "is_excl_from_oon_mo": "Is Excluded From Out of Network MOOP",
+}
+
 
 attributes_labels = {
     'BusinessYear': 'Business Year',
@@ -318,9 +341,9 @@ attributes_labels = {
     'DEHBDedInnTier2FamilyPerGroup': 'Drug EHB Deductible, In Network (Tier 2), Family Per Group',
     'DEHBDedInnTier2Coinsurance': 'Drug EHB Deductible, In Network (Tier 2), Default Coinsurance',
     'DEHBDedOutOfNetIndividual': 'Drug EHB Deductible, Out of Network, Individual',
-    'DEHBDedOutofNetFamily': 'Drug EHB Deductible, Out of Network, Family',
-    'DEHBDedOutofNetFamilyPerPerson': 'Drug EHB Deductible, Out of Network, Family Per Person',
-    'DEHBDedOutofNetFamilyPerGroup': 'Drug EHB Deductible, Out of Network, Family Per Group',
+    'DEHBDedOutOfNetFamily': 'Drug EHB Deductible, Out of Network, Family',
+    'DEHBDedOutOfNetFamilyPerPerson': 'Drug EHB Deductible, Out of Network, Family Per Person',
+    'DEHBDedOutOfNetFamilyPerGroup': 'Drug EHB Deductible, Out of Network, Family Per Group',
     'DEHBDedCombInnOonIndividual': 'Drug EHB Deductible, Combined In/Out of Network, Individual',
     'DEHBDedCombInnOonFamily': 'Drug EHB Deductible, Combined In/Out of Network, Family',
     'DEHBDedCombInnOonFamilyPerPerson': 'Drug EHB Deductible, Combined In/Out of Network, Family Per Person',

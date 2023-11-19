@@ -426,4 +426,4 @@ async def main():
     redis = await create_pool(RedisSettings.from_dsn(os.environ.get('HLTHPRT_REDIS_ADDRESS')),
                               job_serializer=msgpack.packb,
                               job_deserializer=lambda b: msgpack.unpackb(b, raw=False))
-    x = await redis.enqueue_job('process_data')
+    x = await redis.enqueue_job('process_data', _queue_name='arq:NPI')

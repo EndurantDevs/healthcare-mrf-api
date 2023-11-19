@@ -18,3 +18,7 @@ fastcrc
 socksio
 aioshutil
 ruamel.ext.msgpack
+us
+unicode-slugify
+sanic_ext
+Jinja2

@@ -1,6 +1,6 @@
 import asyncio
 from datetime import datetime
-from api.for_human import attributes_labels
+from api.for_human import attributes_labels, benefits_labels
 import urllib.parse
 from sqlalchemy.sql import func
 from urllib.parse import unquote_plus
@@ -9,7 +9,7 @@ import sanic.exceptions
 from sanic import response
 from sanic import Blueprint
 
-from db.models import db, PlanPrices, PlanNetworkTierRaw, PlanNPIRaw, Plan, PlanFormulary, Issuer, ImportLog, \
+from db.models import db, PlanPrices, PlanBenefits, PlanNetworkTierRaw, PlanNPIRaw, Plan, PlanFormulary, Issuer, ImportLog, \
     PlanAttributes
 from db.tiger_models import ZipState
 
@@ -117,7 +117,6 @@ The function takes in a request object and returns a JSON response with the plan
 
         del_array=set()
         for key in data:
-            print(key)
             if not data[key]['network_checksum']:
                 del_array.add(key)
         for key in del_array:
@@ -136,16 +135,64 @@ async def find_a_plan(request):
     year = request.args.get("year")
     limit = request.args.get("limit")
     page = request.args.get("page")
+    order = request.args.get("order")
+    order_by = request.args.get("order_by")
+
+
+    order_field = {
+        'plan_id': Plan.plan_id,
+        'marketing_name': Plan.marketing_name,
+        'issuer_id': Plan.issuer_id,
+        'price': PlanPrices.individual_rate,
+    }
+
+    if order_by not in order_field:
+        order_by = 'plan_id'
+
+    if order and (t := order.lower() in ('desc', 'asc')):
+        order = t
+    else:
+        order = 'asc'
 
     if not limit:
         limit = 100
-    if not page:
-        page = 1
+    else:
+        try: 
+            limit = int(limit)
+        except ValueError:
+            limit = 100
 
-    q = db.select([Plan.plan_id, db.func.min(PlanPrices.individual_rate), db.func.max(PlanPrices.individual_rate)]).where(
-        Plan.plan_id == PlanPrices.plan_id).where(Plan.year == PlanPrices.year)
+    if not page:
+        page = 0
+    else:
+        try:
+            page = int(page)
+        except ValueError:
+            page = 1
+        page = int(page)-1
+        if page < 0:
+            page = 0
+
+    q = db.select(
+        [
+            Plan.plan_id.label('found_plan_id'),
+            db.func.min(PlanPrices.individual_rate).label('min_individual_rate'),
+            db.func.max(PlanPrices.individual_rate).label('max_individual_rate'),
+            Plan.year.label('year')
+        ]
+    ).where(Plan.plan_id == PlanPrices.plan_id).where(Plan.year == PlanPrices.year)
+
+    count_q = db.select(
+        [
+            db.func.count(db.distinct(db.tuple_(Plan.plan_id, Plan.year)))
+        ]
+    ).where(Plan.plan_id == PlanPrices.plan_id).where(Plan.year == PlanPrices.year)
+
+    plan_attr_q = PlanAttributes.query
+    plan_benefits_q = PlanBenefits.query
+
     # .where(
-        #PlanNPIRaw.npi == npi).order_by(PlanNPIRaw.issuer_id.desc()).gino.load((PlanNPIRaw, Issuer))
+    #PlanNPIRaw.npi == npi).order_by(PlanNPIRaw.issuer_id.desc()).gino.load((PlanNPIRaw, Issuer))
 
     # async with db.acquire() as conn:
     #     async with conn.transaction():
@@ -154,8 +201,10 @@ async def find_a_plan(request):
 
     if state:
         q = q.where(Plan.state == state)
+        count_q = count_q.where(Plan.state == state)
     elif zip_code:
         q = q.where(ZipState.zip == zip_code).where(Plan.state == ZipState.stusps)
+        count_q = count_q.where(ZipState.zip == zip_code).where(Plan.state == ZipState.stusps)
 
     if year:
         try:
@@ -163,6 +212,15 @@ async def find_a_plan(request):
         except:
             raise sanic.exceptions.BadRequest
         q = q.where(Plan.year == year)
+        count_q = count_q.where(Plan.year == year)
+        plan_attr_q = plan_attr_q.where(PlanAttributes.year == year)
+        plan_benefits_q = plan_benefits_q.where(PlanBenefits.year == year)
+    else:
+        subq = db.select([db.func.max(Plan.year)]).limit(1).as_scalar()
+        q = q.where(Plan.year == subq)
+        count_q = count_q.where(Plan.year == subq)
+        plan_attr_q = plan_attr_q.where(PlanAttributes.year == subq)
+        plan_benefits_q = plan_benefits_q.where(PlanBenefits.year == subq)
 
     if age:
         try:
@@ -170,21 +228,67 @@ async def find_a_plan(request):
         except:
             raise sanic.exceptions.BadRequest
         q = q.where(PlanPrices.min_age <= age).where(PlanPrices.max_age >= age)
+        count_q = count_q.where(PlanPrices.min_age <= age).where(PlanPrices.max_age >= age)
 
     if rating_area:
         q = q.where(PlanPrices.rating_area_id == rating_area)
+        count_q = count_q.where(PlanPrices.rating_area_id == rating_area)
+    async def get_plans_count(q):
+        async with db.acquire() as conn:
+            async with conn.transaction() as tx:
+                # (bind=tx.connection)
+                return await q.gino.scalar()
 
-    q = q.limit(10).group_by(Plan.plan_id, Plan.year)
+    count = asyncio.create_task(get_plans_count(count_q))
 
-        #q.order_by(PlanPrices.year, PlanPrices.rating_area_id, PlanPrices.min_age)
+    q = q.limit(limit).offset(limit * page + 1).group_by(Plan.plan_id, Plan.year).order_by(
+        order_field[order_by].asc() if order == 'asc' else order_field[order_by].desc())
+    q = q.alias("prices_result")
 
-    res = []
+    main_q = db.select([Plan, q.c.min_individual_rate, q.c.max_individual_rate]).select_from(
+        Plan.join(q, (Plan.plan_id == q.c.found_plan_id) & (Plan.year == q.c.year))).gino.load(
+        (
+            Plan,
+            db.Column('min_individual_rate',
+                      db.Numeric(scale=2, precision=8, asdecimal=False, decimal_return_scale=None)),
+            db.Column('max_individual_rate',
+                      db.Numeric(scale=2, precision=8, asdecimal=False, decimal_return_scale=None))
+        ))
+
+    res = {}
+    count = await count
+    found_array = []
     async with db.acquire() as conn:
-        async with conn.transaction():
-            async for x in q.gino.iterate():
-                res.append(list(x))
+        async with conn.transaction() as tx:
+            async for x in main_q.iterate():
+                t = x[0].to_json_dict()
+                found_array.append(t['plan_id']+'-00')
+                t['price_range'] = {
+                    'min': float(x[1]),
+                    'max': float(x[2])
+                }
+                res[t['plan_id']] = t
+                res[t['plan_id']]['attributes'] = {}
+                res[t['plan_id']]['plan_benefits'] = {}
 
-    return response.json(res)
+
+
+
+    plan_attr_q = plan_attr_q.where(PlanAttributes.full_plan_id.in_(found_array))
+
+    async with db.acquire() as conn:
+        async with conn.transaction() as tx:
+            async for x in plan_attr_q.gino.iterate():
+                res[x.full_plan_id[:-3]]['attributes'][x.attr_name] = x.attr_value
+
+    plan_benefits_q = plan_benefits_q.where(PlanBenefits.full_plan_id.in_(found_array))
+
+    async with db.acquire() as conn:
+        async with conn.transaction() as tx:
+            async for x in plan_benefits_q.gino.iterate():
+                res[x.full_plan_id[:-3]]['plan_benefits'][x.benefit_name] = x.to_json_dict()
+
+    return response.json({'total': count, 'results': list(res.values())})
 
 
 
@@ -261,6 +365,7 @@ async def get_plan(request, plan_id, year=None, variant=None):
     if variant:
         if variant in data['variants']:
             data['variant_attributes'] = {}
+            data['variant_benefits'] = {}
             for x in await PlanAttributes.query.where(PlanAttributes.year == int(year)).where(
                     PlanAttributes.full_plan_id == variant).order_by(PlanAttributes.attr_name.asc()).gino.all():
                 t = x.to_json_dict()
@@ -268,6 +373,50 @@ async def get_plan(request, plan_id, year=None, variant=None):
                 data['variant_attributes'][k] = {'attr_value': t['attr_value']}
                 if l := attributes_labels.get(k, None):
                     data['variant_attributes'][k]['human_attr_name'] = l
+
+            for x in await PlanBenefits.query.where(PlanBenefits.year == int(year)).where(
+                    PlanBenefits.full_plan_id == variant).order_by(PlanBenefits.benefit_name.asc()).gino.all():
+                t = x.to_json_dict()
+                del t['full_plan_id']
+                del t['year']
+                del t['plan_id']
+                k = t['benefit_name']
+
+                t['in_network_tier1'] = None
+                t['in_network_tier2'] = None
+                t['out_network'] = None
+
+                if t['copay_inn_tier1'] and (t['copay_inn_tier1'] != 'Not Applicable'):
+                    t['in_network_tier1'] = t['copay_inn_tier1']
+                if t['coins_inn_tier1'] and (t['coins_inn_tier1'] != 'Not Applicable'):
+                    if t.get('in_network_tier1', None):
+                        if not (t['in_network_tier1'] == 'No Charge' and t['coins_inn_tier1'] == 'No Charge'):
+                            t['in_network_tier1'] += ', ' + t['coins_inn_tier1']
+                    else:
+                        t['in_network_tier1'] = t['coins_inn_tier1']
+
+                if t['copay_inn_tier2'] and (t['copay_inn_tier2'] != 'Not Applicable'):
+                   t['in_network_tier2'] = t['copay_inn_tier2']
+                if t['coins_inn_tier2'] and (t['coins_inn_tier2'] != 'Not Applicable'):
+                    if t.get('in_network_tier2', None):
+                        if not (t['in_network_tier2'] == 'No Charge' and t['coins_inn_tier2'] == 'No Charge'):
+                            t['in_network_tier2'] += ', ' + t['coins_inn_tier2']
+                    else:
+                        t['in_network_tier2'] = t['coins_inn_tier2']
+
+                if t['copay_outof_net'] and (t['copay_outof_net'] != 'Not Applicable'):
+                   t['out_network'] = t['copay_outof_net']
+                if t['coins_outof_net'] and (t['coins_outof_net'] != 'Not Applicable'):
+                    if t.get('out_network', None):
+                        if not (t['out_network'] == 'No Charge' and t['coins_outof_net'] == 'No Charge'):
+                            t['out_network'] += ', ' + t['coins_outof_net']
+                    else:
+                        t['out_network'] = t['coins_outof_net']
+
+
+                data['variant_benefits'][k] = t
+                if l := benefits_labels.get(k, None):
+                    data['variant_benefits'][k]['human_attr_name'] = l
         else:
             raise sanic.exceptions.NotFound
 

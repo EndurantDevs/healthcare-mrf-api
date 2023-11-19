@@ -16,68 +16,100 @@ import pylightxl as xl
 from aiofile import async_open
 from async_unzip.unzipper import unzip
 
-from process.ext.utils import download_it_and_save, make_class, push_objects, log_error, print_time_info, \
-    flush_error_log, return_checksum
+from process.ext.utils import (
+    download_it_and_save,
+    make_class,
+    push_objects,
+    log_error,
+    print_time_info,
+    flush_error_log,
+    return_checksum,
+)
 from dateutil.parser import parse as parse_date
-from db.models import Issuer, Plan, PlanAttributes, PlanPrices, PlanRatingAreas, db
+from db.models import (
+    Issuer,
+    Plan,
+    PlanBenefits,
+    PlanAttributes,
+    PlanPrices,
+    PlanRatingAreas,
+    db,
+)
 from db.connection import init_db
 
 from api.for_human import plan_attributes_labels_to_key
 
 
-latin_pattern= re.compile(r'[^\x00-\x7f]')
+latin_pattern = re.compile(r"[^\x00-\x7f]")
+
 
 async def startup(ctx):
     loop = asyncio.get_event_loop()
-    ctx['context'] = {}
-    ctx['context']['start'] = datetime.datetime.utcnow().replace(tzinfo=pytz.utc)
-    ctx['context']['run'] = 0
-    ctx['import_date'] = datetime.datetime.now().strftime("%Y%m%d")
+    ctx["context"] = {}
+    ctx["context"]["start"] = datetime.datetime.utcnow().replace(tzinfo=pytz.utc)
+    ctx["context"]["run"] = 0
+    ctx["import_date"] = datetime.datetime.now().strftime("%Y%m%d")
     await init_db(db, loop)
-    import_date = ctx['import_date']
-    db_schema = os.getenv('HLTHPRT_DB_SCHEMA') if os.getenv('HLTHPRT_DB_SCHEMA') else 'mrf'
+    import_date = ctx["import_date"]
+    db_schema = (
+        os.getenv("HLTHPRT_DB_SCHEMA") if os.getenv("HLTHPRT_DB_SCHEMA") else "mrf"
+    )
 
     tables = {}  # for the future complex usage
 
-    for cls in (PlanAttributes, PlanPrices, PlanRatingAreas, ):
+    for cls in (
+        PlanAttributes,
+        PlanPrices,
+        PlanRatingAreas,
+        PlanBenefits,
+    ):
         tables[cls.__main_table__] = make_class(cls, import_date)
         obj = tables[cls.__main_table__]
-        await db.status(f"DROP TABLE IF EXISTS {db_schema}.{obj.__main_table__}_{import_date};")
+        await db.status(
+            f"DROP TABLE IF EXISTS {db_schema}.{obj.__main_table__}_{import_date};"
+        )
         await obj.__table__.gino.create()
         if hasattr(obj, "__my_index_elements__"):
             await db.status(
                 f"CREATE UNIQUE INDEX {obj.__tablename__}_idx_primary ON "
-                f"{db_schema}.{obj.__tablename__} ({', '.join(obj.__my_index_elements__)});")
+                f"{db_schema}.{obj.__tablename__} ({', '.join(obj.__my_index_elements__)});"
+            )
 
     print("Preparing done")
 
+
 async def shutdown(ctx):
-    import_date = ctx['import_date']
-    db_schema = os.getenv('DB_SCHEMA') if os.getenv('DB_SCHEMA') else 'mrf'
+    import_date = ctx["import_date"]
+    db_schema = os.getenv("DB_SCHEMA") if os.getenv("DB_SCHEMA") else "mrf"
     tables = {}
 
-    processing_classes_array = (PlanAttributes, PlanPrices, PlanRatingAreas, )
+    processing_classes_array = (
+        PlanAttributes,
+        PlanPrices,
+        PlanRatingAreas,
+        PlanBenefits,
+    )
 
     for cls in processing_classes_array:
         tables[cls.__main_table__] = make_class(cls, import_date)
         obj = tables[cls.__main_table__]
 
-        if hasattr(cls, '__my_additional_indexes__') and cls.__my_additional_indexes__:
+        if hasattr(cls, "__my_additional_indexes__") and cls.__my_additional_indexes__:
             for index in cls.__my_additional_indexes__:
-                index_name = index.get('name', '_'.join(index.get('index_elements')))
+                index_name = index.get("name", "_".join(index.get("index_elements")))
                 using = ""
-                if t := index.get('using'):
+                if t := index.get("using"):
                     using = f"USING {t} "
-                create_index_sql = f"CREATE INDEX IF NOT EXISTS {obj.__tablename__}_idx_{index_name} " \
-                                   f"ON {db_schema}.{obj.__tablename__}  {using}" \
-                                   f"({', '.join(index.get('index_elements'))});"
+                create_index_sql = (
+                    f"CREATE INDEX IF NOT EXISTS {obj.__tablename__}_idx_{index_name} "
+                    f"ON {db_schema}.{obj.__tablename__}  {using}"
+                    f"({', '.join(index.get('index_elements'))});"
+                )
                 print(create_index_sql)
                 x = await db.status(create_index_sql)
 
-        print(f"Post-Index VACUUM FULL ANALYZE {db_schema}.{obj.__tablename__};");
+        print(f"Post-Index VACUUM FULL ANALYZE {db_schema}.{obj.__tablename__};")
         await db.status(f"VACUUM FULL ANALYZE {db_schema}.{obj.__tablename__};")
-
-
 
     async with db.transaction() as tx:
         for cls in processing_classes_array:
@@ -86,53 +118,72 @@ async def shutdown(ctx):
 
             table = obj.__main_table__
             await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
-            await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{table} RENAME TO {table}_old;")
-            await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{obj.__tablename__} RENAME TO {table};")
+            await db.status(
+                f"ALTER TABLE IF EXISTS {db_schema}.{table} RENAME TO {table}_old;"
+            )
+            await db.status(
+                f"ALTER TABLE IF EXISTS {db_schema}.{obj.__tablename__} RENAME TO {table};"
+            )
 
-            await db.status(f"ALTER INDEX IF EXISTS "
-                            f"{db_schema}.{table}_idx_primary RENAME TO "
-                            f"{table}_idx_primary_old;")
+            await db.status(
+                f"ALTER INDEX IF EXISTS "
+                f"{db_schema}.{table}_idx_primary RENAME TO "
+                f"{table}_idx_primary_old;"
+            )
 
-            await db.status(f"ALTER INDEX IF EXISTS "
-                            f"{db_schema}.{obj.__tablename__}_idx_primary RENAME TO "
-                            f"{table}_idx_primary;")
+            await db.status(
+                f"ALTER INDEX IF EXISTS "
+                f"{db_schema}.{obj.__tablename__}_idx_primary RENAME TO "
+                f"{table}_idx_primary;"
+            )
 
-            if hasattr(cls, '__my_additional_indexes__') and obj.__my_additional_indexes__:
+            if (
+                hasattr(cls, "__my_additional_indexes__")
+                and obj.__my_additional_indexes__
+            ):
                 for index in obj.__my_additional_indexes__:
-                    index_name = index.get('name', '_'.join(index.get('index_elements')))
-                    await db.status(f"ALTER INDEX IF EXISTS "
-                                    f"{db_schema}.{table}_idx_{index_name} RENAME TO "
-                                    f"{table}_idx_{index_name}_old;")
-                    await db.status(f"ALTER INDEX IF EXISTS "
-                                    f"{db_schema}.{obj.__tablename__}_idx_{index_name} RENAME TO "
-                                    f"{table}_idx_{index_name};")
+                    index_name = index.get(
+                        "name", "_".join(index.get("index_elements"))
+                    )
+                    await db.status(
+                        f"ALTER INDEX IF EXISTS "
+                        f"{db_schema}.{table}_idx_{index_name} RENAME TO "
+                        f"{table}_idx_{index_name}_old;"
+                    )
+                    await db.status(
+                        f"ALTER INDEX IF EXISTS "
+                        f"{db_schema}.{obj.__tablename__}_idx_{index_name} RENAME TO "
+                        f"{table}_idx_{index_name};"
+                    )
 
-    print_time_info(ctx['context']['start'])
+    print_time_info(ctx["context"]["start"])
 
 
 async def save_attributes(ctx, task):
-    import_date = ctx['import_date']
-    if ('type' in task) and task['type'] == 'PlanPrices':
+    import_date = ctx["import_date"]
+    if ("type" in task) and task["type"] == "PlanPrices":
         myplanattributes = make_class(PlanPrices, import_date)
     else:
-        myplanattributes = make_class(PlanAttributes, import_date)
-    await push_objects(task['attr_obj_list'], myplanattributes)
+        if ("type" in task) and task["type"] == "PlanBenefits":
+            myplanattributes = make_class(PlanBenefits, import_date)
+        else:
+            myplanattributes = make_class(PlanAttributes, import_date)
+    await push_objects(task["attr_obj_list"], myplanattributes)
 
 
 async def process_attributes(ctx, task):
-    redis = ctx['redis']
+    redis = ctx["redis"]
 
-    print('Downloading data from: ', task['url'])
+    print("Downloading data from: ", task["url"])
 
-    import_date = ctx['import_date']
+    import_date = ctx["import_date"]
     myissuer = make_class(Issuer, import_date)
     myplanattributes = make_class(PlanAttributes, import_date)
 
-
     with tempfile.TemporaryDirectory() as tmpdirname:
-        p = 'attr.csv'
-        tmp_filename = str(PurePath(str(tmpdirname), p + '.zip'))
-        await download_it_and_save(task['url'], tmp_filename)
+        p = "attr.csv"
+        tmp_filename = str(PurePath(str(tmpdirname), p + ".zip"))
+        await download_it_and_save(task["url"], tmp_filename)
         await unzip(tmp_filename, tmpdirname)
 
         tmp_filename = glob.glob(f"{tmpdirname}/*.csv")[0]
@@ -140,27 +191,31 @@ async def process_attributes(ctx, task):
         attr_obj_list = []
 
         count = 0
-        #return 1
-        async with async_open(tmp_filename, 'r') as afp:
+        # return 1
+        async with async_open(tmp_filename, "r") as afp:
             async for row in AsyncDictReader(afp, delimiter=","):
-                if not (row['StandardComponentId'] and row['PlanId']):
+                if not (row["StandardComponentId"] and row["PlanId"]):
                     continue
                 count += 1
                 for key in row:
-                    if not ((key in ('StandardComponentId',)) and (row[key] is None)) and (t := str(row[key]).strip()):
+                    if not (
+                        (key in ("StandardComponentId",)) and (row[key] is None)
+                    ) and (t := str(row[key]).strip()):
                         obj = {
-                            'full_plan_id': row['PlanId'],
-                            'year': int(task['year']),  # int(row['\ufeffBusinessYear'])
-                            'attr_name': re.sub(latin_pattern,r'', key),
-                            'attr_value': t
+                            "full_plan_id": row["PlanId"],
+                            "year": int(task["year"]),  # int(row['\ufeffBusinessYear'])
+                            "attr_name": re.sub(latin_pattern, r"", key),
+                            "attr_value": t,
                         }
 
                         attr_obj_list.append(obj)
 
                 if count > 10000:
-                    #int(os.environ.get('HLTHPRT_SAVE_PER_PACK', 100)):
+                    # int(os.environ.get('HLTHPRT_SAVE_PER_PACK', 100)):
                     total_count += count
-                    await redis.enqueue_job('save_attributes', {'attr_obj_list': attr_obj_list})
+                    await redis.enqueue_job(
+                        "save_attributes", {"attr_obj_list": attr_obj_list}
+                    )
                     # await push_objects(attr_obj_list, myplanattributes)
                     # test = {}
                     # for x in attr_obj_list:
@@ -175,39 +230,124 @@ async def process_attributes(ctx, task):
                 await push_objects(attr_obj_list, myplanattributes)
 
 
+async def process_benefits(ctx, task):
+    redis = ctx["redis"]
+    print("Downloading data from: ", task["url"])
+
+    import_date = ctx["import_date"]
+    myplanbenefits = make_class(PlanBenefits, import_date)
+
+    with tempfile.TemporaryDirectory() as tmpdirname:
+        p = "benefits.csv"
+        tmp_filename = str(PurePath(str(tmpdirname), p + ".zip"))
+        await download_it_and_save(task["url"], tmp_filename)
+        await unzip(tmp_filename, tmpdirname)
+
+        tmp_filename = glob.glob(f"{tmpdirname}/*.csv")[0]
+        total_count = 0
+        attr_obj_list = []
+
+        count = 0
+        # return 1
+        async with async_open(tmp_filename, "r") as afp:
+            async for row in AsyncDictReader(afp, delimiter=","):
+                obj = {
+                    "year": None,
+                    "plan_id": row["StandardComponentId"],
+                    "full_plan_id": row["PlanId"],
+                    "benefit_name": row["BenefitName"],
+                    "copay_inn_tier1": row["CopayInnTier1"],
+                    "copay_inn_tier2": row["CopayInnTier2"],
+                    "copay_outof_net": row["CopayOutofNet"],
+                    "coins_inn_tier1": row["CoinsInnTier1"],
+                    "coins_inn_tier2": row["CoinsInnTier2"],
+                    "coins_outof_net": row["CoinsOutofNet"],
+                    "is_ehb": True if row["IsEHB"].lower().strip() in ("yes", "y") else False,
+                    "is_covered": True
+                    if row["IsCovered"].lower().strip() == "covered"
+                    else False
+                    if row["IsCovered"].lower().strip() == "not covered"
+                    else None,
+                    "quant_limit_on_svc": True if row["QuantLimitOnSvc"].lower().strip() in ("yes", "y") else False,
+                    "limit_qty": None,
+                    "limit_unit": row["LimitUnit"],
+                    "exclusions": row["Exclusions"],
+                    "explanation": row["Explanation"],
+                    "ehb_var_reason": row["EHBVarReason"],
+                    "is_excl_from_inn_mo": True
+                    if row["IsExclFromInnMOOP"].lower().strip() in ("yes", "y")
+                    else False
+                    if row["IsExclFromInnMOOP"].lower().strip() in ("no", "n")
+                    else None,
+                    "is_excl_from_oon_mo": True
+                    if row["IsExclFromOonMOOP"].lower().strip() in ("yes", "y")
+                    else False
+                    if row["IsExclFromOonMOOP"].lower().strip() in ("no", "n")
+                    else None,
+                }
+
+                if row["LimitQty"]:
+                    try:
+                        obj["limit_qty"] = float(row["LimitQty"])
+                    except ValueError:
+                        pass
+
+                if row["BusinessYear"]:
+                    try:
+                        obj["year"] = int(row["BusinessYear"])
+                    except ValueError:
+                        continue
+
+                attr_obj_list.append(obj)
+
+                if count > 50000:
+                    total_count += count
+                    await redis.enqueue_job(
+                        "save_attributes",
+                        {"type": "PlanBenefits", "attr_obj_list": attr_obj_list},
+                    )
+                    attr_obj_list.clear()
+                    count = 0
+                else:
+                    count += 1
+
+            if attr_obj_list:
+                await push_objects(attr_obj_list, myplanbenefits)
+
 async def process_rating_areas(ctx):
-    redis = ctx['redis']
-    print('Importing Rating Areas')
-    import_date = ctx['import_date']
+    redis = ctx["redis"]
+    print("Importing Rating Areas")
+    import_date = ctx["import_date"]
     myplanrating = make_class(PlanRatingAreas, import_date)
     attr_obj_list = []
-    async with async_open('data/rating_areas.csv', 'r', encoding="utf-8") as afp:
+    async with async_open("data/rating_areas.csv", "r", encoding="utf-8") as afp:
         async for row in AsyncDictReader(afp, delimiter=";"):
             obj = {
-                'state': row['STATE CODE'].upper(),
-                'county': row['COUNTY'],
-                'zip3': row['ZIP3'],
-                'rating_area_id': row['RATING AREA ID'],
-                'market': row['MARKET'],
+                "state": row["STATE CODE"].upper(),
+                "county": row["COUNTY"],
+                "zip3": row["ZIP3"],
+                "rating_area_id": row["RATING AREA ID"],
+                "market": row["MARKET"],
             }
             attr_obj_list.append(obj)
 
     if attr_obj_list:
         await push_objects(attr_obj_list, myplanrating)
 
-async def process_prices(ctx, task):
-    redis = ctx['redis']
-    await process_rating_areas(ctx)
-    print('Downloading data from: ', task['url'])
 
-    import_date = ctx['import_date']
+async def process_prices(ctx, task):
+    redis = ctx["redis"]
+    await process_rating_areas(ctx)
+    print("Downloading data from: ", task["url"])
+
+    import_date = ctx["import_date"]
     myissuer = make_class(Issuer, import_date)
     myplanprices = make_class(PlanPrices, import_date)
 
     with tempfile.TemporaryDirectory() as tmpdirname:
-        p = 'rate.csv'
-        tmp_filename = str(PurePath(str(tmpdirname), p + '.zip'))
-        await download_it_and_save(task['url'], tmp_filename)
+        p = "rate.csv"
+        tmp_filename = str(PurePath(str(tmpdirname), p + ".zip"))
+        await download_it_and_save(task["url"], tmp_filename)
         await unzip(tmp_filename, tmpdirname)
 
         tmp_filename = glob.glob(f"{tmpdirname}/*.csv")[0]
@@ -216,60 +356,98 @@ async def process_prices(ctx, task):
 
         count = 0
 
-        range_regex = re.compile(r'^(\d+)-(\d+)$')
-        int_more_regex = re.compile(r'^(\d+) and over$')
-        clean_int = re.compile(r'^(\d+)$')
-        async with async_open(tmp_filename, 'r') as afp:
+        range_regex = re.compile(r"^(\d+)-(\d+)$")
+        int_more_regex = re.compile(r"^(\d+) and over$")
+        clean_int = re.compile(r"^(\d+)$")
+        async with async_open(tmp_filename, "r") as afp:
             async for row in AsyncDictReader(afp, delimiter=","):
-                if not row['PlanId']:
+                if not row["PlanId"]:
                     continue
                 count += 1
 
                 obj = {
-                    'plan_id': row['PlanId'],
-                    'state': row['StateCode'].upper(),
-                    'year': int(task['year']),
-                    'rate_effective_date': pytz.utc.localize(
-                        parse_date(row['RateEffectiveDate'], fuzzy=True)) if row['RateEffectiveDate'] else None,
-                    'rate_expiration_date': pytz.utc.localize(
-                        parse_date(row['RateExpirationDate'], fuzzy=True)) if row[
-                        'RateExpirationDate'] else None,
-                    'rating_area_id': row['RatingAreaId'],
-                    'tobacco': row['Tobacco'],
-                    'min_age': 0,
-                    'max_age': 125,
-                    'individual_rate': float(row['IndividualRate']) if row['IndividualRate'] else None,
-                    'individual_tobacco_rate': float(row['IndividualTobaccoRate']) if row['IndividualTobaccoRate'] else None,
-                    'couple': float(row['Couple']) if row['Couple'] else None,
-                    'primary_subscriber_and_one_dependent': float(row['PrimarySubscriberAndOneDependent']) if row['PrimarySubscriberAndOneDependent'] else None,
-                    'primary_subscriber_and_two_dependents': float(row['PrimarySubscriberAndTwoDependents']) if row['PrimarySubscriberAndTwoDependents'] else None,
-                    'primary_subscriber_and_three_or_more_dependents': float(row[
-                        'PrimarySubscriberAndThreeOrMoreDependents']) if row[
-                        'PrimarySubscriberAndThreeOrMoreDependents'] else None,
-                    'couple_and_one_dependent': float(row['CoupleAndOneDependent']) if row['CoupleAndOneDependent'] else None,
-                    'couple_and_two_dependents': float(row['CoupleAndTwoDependents']) if row['CoupleAndTwoDependents'] else None,
-                    'couple_and_three_or_more_dependents': float(row['CoupleAndThreeOrMoreDependents']) if row['CoupleAndThreeOrMoreDependents'] else None,
+                    "plan_id": row["PlanId"],
+                    "state": row["StateCode"].upper(),
+                    "year": int(task["year"]),
+                    "rate_effective_date": pytz.utc.localize(
+                        parse_date(row["RateEffectiveDate"], fuzzy=True)
+                    )
+                    if row["RateEffectiveDate"]
+                    else None,
+                    "rate_expiration_date": pytz.utc.localize(
+                        parse_date(row["RateExpirationDate"], fuzzy=True)
+                    )
+                    if row["RateExpirationDate"]
+                    else None,
+                    "rating_area_id": row["RatingAreaId"],
+                    "tobacco": row["Tobacco"],
+                    "min_age": 0,
+                    "max_age": 125,
+                    "individual_rate": float(row["IndividualRate"])
+                    if row["IndividualRate"]
+                    else None,
+                    "individual_tobacco_rate": float(row["IndividualTobaccoRate"])
+                    if row["IndividualTobaccoRate"]
+                    else None,
+                    "couple": float(row["Couple"]) if row["Couple"] else None,
+                    "primary_subscriber_and_one_dependent": float(
+                        row["PrimarySubscriberAndOneDependent"]
+                    )
+                    if row["PrimarySubscriberAndOneDependent"]
+                    else None,
+                    "primary_subscriber_and_two_dependents": float(
+                        row["PrimarySubscriberAndTwoDependents"]
+                    )
+                    if row["PrimarySubscriberAndTwoDependents"]
+                    else None,
+                    "primary_subscriber_and_three_or_more_dependents": float(
+                        row["PrimarySubscriberAndThreeOrMoreDependents"]
+                    )
+                    if row["PrimarySubscriberAndThreeOrMoreDependents"]
+                    else None,
+                    "couple_and_one_dependent": float(row["CoupleAndOneDependent"])
+                    if row["CoupleAndOneDependent"]
+                    else None,
+                    "couple_and_two_dependents": float(row["CoupleAndTwoDependents"])
+                    if row["CoupleAndTwoDependents"]
+                    else None,
+                    "couple_and_three_or_more_dependents": float(
+                        row["CoupleAndThreeOrMoreDependents"]
+                    )
+                    if row["CoupleAndThreeOrMoreDependents"]
+                    else None,
                 }
 
-                match row['Age'].strip():
+                match row["Age"].strip():
                     case x if t := clean_int.search(x):
-                        obj['min_age'] = int(t.group(1))
-                        obj['max_age'] = obj['min_age']
+                        obj["min_age"] = int(t.group(1))
+                        obj["max_age"] = obj["min_age"]
                     case x if t := range_regex.search(x):
-                        obj['min_age'] = int(t.group(1))
-                        obj['max_age'] = int(t.group(2))
+                        obj["min_age"] = int(t.group(1))
+                        obj["max_age"] = int(t.group(2))
                     case x if t := int_more_regex.search(x):
-                        obj['min_age'] = int(t.group(1))
+                        obj["min_age"] = int(t.group(1))
 
-                obj['checksum'] = return_checksum(
-                    [obj['plan_id'], obj['year'], obj['rate_effective_date'], obj['rate_expiration_date'],
-                        obj['rating_area_id'], obj['min_age'], obj['max_age']])
+                obj["checksum"] = return_checksum(
+                    [
+                        obj["plan_id"],
+                        obj["year"],
+                        obj["rate_effective_date"],
+                        obj["rate_expiration_date"],
+                        obj["rating_area_id"],
+                        obj["min_age"],
+                        obj["max_age"],
+                    ]
+                )
 
                 attr_obj_list.append(obj)
 
                 if count > 1000000:
                     total_count += count
-                    await redis.enqueue_job('save_attributes', {'type': 'PlanPrices', 'attr_obj_list': attr_obj_list})
+                    await redis.enqueue_job(
+                        "save_attributes",
+                        {"type": "PlanPrices", "attr_obj_list": attr_obj_list},
+                    )
                     attr_obj_list.clear()
                     count = 0
                 else:
@@ -277,8 +455,6 @@ async def process_prices(ctx, task):
 
             if attr_obj_list:
                 await push_objects(attr_obj_list, myplanprices)
-
-
 
         #     obj_list = []
         #     for ws_name in xls_file.ws_names:
@@ -378,18 +554,17 @@ async def process_prices(ctx, task):
 
 
 async def process_state_attributes(ctx, task):
-    redis = ctx['redis']
+    redis = ctx["redis"]
 
-    print('Downloading data from: ', task['url'])
+    print("Downloading data from: ", task["url"])
 
-    import_date = ctx['import_date']
+    import_date = ctx["import_date"]
     myplanattributes = make_class(PlanAttributes, import_date)
 
-
     with tempfile.TemporaryDirectory() as tmpdirname:
-        p = 'attr.csv'
-        tmp_filename = str(PurePath(str(tmpdirname), p + '.zip'))
-        await download_it_and_save(task['url'], tmp_filename)
+        p = "attr.csv"
+        tmp_filename = str(PurePath(str(tmpdirname), p + ".zip"))
+        await download_it_and_save(task["url"], tmp_filename)
         await unzip(tmp_filename, tmpdirname)
 
         tmp_filename = glob.glob(f"{tmpdirname}/*Plans*.csv")[0]
@@ -399,28 +574,34 @@ async def process_state_attributes(ctx, task):
         plan_list = {}
 
         count = 0
-        #return 1
+        # return 1
 
-        async with async_open(tmp_filename, 'r') as afp:
+        async with async_open(tmp_filename, "r") as afp:
             async for row in AsyncDictReader(afp, delimiter=","):
-                if not (row['STANDARD COMPONENT ID'] and row['PLAN ID']):
+                if not (row["STANDARD COMPONENT ID"] and row["PLAN ID"]):
                     continue
                 count += 1
                 for key in row:
-                    if not ((key in ('StandardComponentId',)) and (row[key] is None)) and (t := str(row[key]).strip()):
+                    if not (
+                        (key in ("StandardComponentId",)) and (row[key] is None)
+                    ) and (t := str(row[key]).strip()):
                         obj = {
-                            'full_plan_id': row['PLAN ID'],
-                            'year': int(task['year']),  # int(row['\ufeffBusinessYear'])
-                            'attr_name': re.sub(latin_pattern,r'', plan_attributes_labels_to_key[key]),
-                            'attr_value': t
+                            "full_plan_id": row["PLAN ID"],
+                            "year": int(task["year"]),  # int(row['\ufeffBusinessYear'])
+                            "attr_name": re.sub(
+                                latin_pattern, r"", plan_attributes_labels_to_key[key]
+                            ),
+                            "attr_value": t,
                         }
 
                         attr_obj_list.append(obj)
 
                 if count > 10000:
-                    #int(os.environ.get('HLTHPRT_SAVE_PER_PACK', 100)):
+                    # int(os.environ.get('HLTHPRT_SAVE_PER_PACK', 100)):
                     total_count += count
-                    await redis.enqueue_job('save_attributes', {'attr_obj_list': attr_obj_list})
+                    await redis.enqueue_job(
+                        "save_attributes", {"attr_obj_list": attr_obj_list}
+                    )
                     # await push_objects(attr_obj_list, myplanattributes)
                     # test = {}
                     # for x in attr_obj_list:
@@ -433,7 +614,6 @@ async def process_state_attributes(ctx, task):
 
             if attr_obj_list:
                 await push_objects(attr_obj_list, myplanattributes)
-
 
         # async with async_open(tmp_filename, 'r') as afp:
         #     async for row in AsyncDictReader(afp, delimiter=","):
@@ -493,27 +673,44 @@ async def process_state_attributes(ctx, task):
 
 
 async def main():
-    redis = await create_pool(RedisSettings.from_dsn(os.environ.get('HLTHPRT_REDIS_ADDRESS')),
-                              job_serializer=msgpack.packb,
-                              job_deserializer=lambda b: msgpack.unpackb(b, raw=False))
-    attribute_files = json.loads(os.environ['HLTHPRT_CMSGOV_PLAN_ATTRIBUTES_URL_PUF'])
-    state_attribute_files = json.loads(os.environ['HLTHPRT_CMSGOV_STATE_PLAN_ATTRIBUTES_URL_PUF'])
+    redis = await create_pool(
+        RedisSettings.from_dsn(os.environ.get("HLTHPRT_REDIS_ADDRESS")),
+        job_serializer=msgpack.packb,
+        job_deserializer=lambda b: msgpack.unpackb(b, raw=False),
+    )
+    attribute_files = json.loads(os.environ["HLTHPRT_CMSGOV_PLAN_ATTRIBUTES_URL_PUF"])
+    state_attribute_files = json.loads(
+        os.environ["HLTHPRT_CMSGOV_STATE_PLAN_ATTRIBUTES_URL_PUF"]
+    )
 
-    price_files = json.loads(os.environ['HLTHPRT_CMSGOV_PRICE_PLAN_URL_PUF'])
+    price_files = json.loads(os.environ["HLTHPRT_CMSGOV_PRICE_PLAN_URL_PUF"])
 
+    benefits_files = json.loads(os.environ["HLTHPRT_CMSGOV_BENEFITS_URL_PUF"])
 
     print("Starting to process STATE Plan Attribute files..")
     for file in state_attribute_files:
         print("Adding: ", file)
-        x = await redis.enqueue_job('process_state_attributes', {'url': file['url'], 'year': file['year']})
-
+        x = await redis.enqueue_job(
+            "process_state_attributes", {"url": file["url"], "year": file["year"]}
+        )
 
     print("Starting to process Plan Attribute files..")
     for file in attribute_files:
         print("Adding: ", file)
-        x = await redis.enqueue_job('process_attributes', {'url': file['url'], 'year': file['year']})
+        x = await redis.enqueue_job(
+            "process_attributes", {"url": file["url"], "year": file["year"]}
+        )
 
     print("Starting to process Plan Prices files..")
     for file in price_files:
         print("Adding: ", file)
-        x = await redis.enqueue_job('process_prices', {'url': file['url'], 'year': file['year']})
+        x = await redis.enqueue_job(
+            "process_prices", {"url": file["url"], "year": file["year"]}
+        )
+
+    print("Starting to process Plan Benefits files..")
+    for file in benefits_files:
+        print("Adding: ", file)
+        x = await redis.enqueue_job(
+            "process_benefits", {"url": file["url"], "year": file["year"]}
+        )

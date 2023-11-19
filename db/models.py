@@ -138,6 +138,35 @@ class PlanAttributes(db.Model, JSONOutputMixin):
     attr_name = Column(String)
     attr_value = Column(String)
 
+class PlanBenefits(db.Model, JSONOutputMixin):
+    __tablename__ = 'plan_benefits'
+    __main_table__ = __tablename__
+    __table_args__ = (
+        {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
+    )
+    __my_index_elements__ = ['full_plan_id', 'year', 'benefit_name']
+    plan_id = Column(db.String(14), nullable=False)
+    full_plan_id = Column(db.String(17), nullable=False)
+    year = Column(Integer)
+    benefit_name = Column(String)
+    copay_inn_tier1 = Column(String)
+    copay_inn_tier2 = Column(String)
+    copay_outof_net = Column(String)
+    coins_inn_tier1 = Column(String)
+    coins_inn_tier2 = Column(String)
+    coins_outof_net = Column(String)
+    is_ehb = Column(Boolean)
+    is_covered = Column(Boolean)
+    quant_limit_on_svc = Column(Boolean)
+    limit_qty = Column(Float)
+    limit_unit = Column(String)
+    exclusions = Column(String)
+    explanation = Column(String)
+    ehb_var_reason = Column(String)
+    is_excl_from_inn_mo = Column(Boolean)
+    is_excl_from_oon_mo = Column(Boolean)
+
+
 class PlanRatingAreas(db.Model, JSONOutputMixin):
     __tablename__ = 'plan_rating_areas'
     __main_table__ = __tablename__
