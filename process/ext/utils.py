@@ -9,9 +9,10 @@ import pytz
 from db.connection import init_db, db
 
 from aioshutil import copyfile
+from sqlalchemy import Index, and_
 import ssl
 from gino.exceptions import GinoException
-from asyncpg.exceptions import UniqueViolationError, InterfaceError
+from asyncpg.exceptions import UniqueViolationError, InterfaceError, InvalidColumnReferenceError
 from aiofile import async_open
 from arq import Retry
 from fastcrc import crc32, crc16
@@ -21,20 +22,24 @@ from random import choice
 import json
 from db.json_mixin import JSONOutputMixin
 
-if os.environ.get('HLTHPRT_SOCKS_PROXY'):
+if os.environ.get('HLTHPRT_SOCKS_PROXY1'):
     transport = httpx.AsyncHTTPTransport(retries=3,
                                          proxy=httpx.Proxy(choice(json.loads(os.environ['HLTHPRT_SOCKS_PROXY']))))
 else:
     transport = httpx.AsyncHTTPTransport(retries=3)
 
 HTTP_CHUNK_SIZE = 1024 * 1024
-headers = {'user-agent': 'Mozilla/5.0 (compatible; Healthporta Healthcare MRF API Importer/1.0; +https://github.com/EndurantDevs/healthcare-mrf-api)'}
+headers = {'user-agent': 'Mozilla/5.0 (compatible; Healthporta Healthcare MRF API Importer/1.1; +https://github.com/EndurantDevs/healthcare-mrf-api)'}
 
 timeout = httpx.Timeout(30.0)
-client = httpx.AsyncClient(transport=transport, timeout=timeout, headers=headers, follow_redirects=True)
+client = httpx.AsyncClient(transport=transport, headers=headers, timeout=timeout, follow_redirects=True)
 
-async def download_it(url):
-    r = await client.get(url)
+async def download_it(url, local_timeout=None):
+    if local_timeout:
+        local_timeout = httpx.Timeout(local_timeout)
+        r = await client.get(url, timeout=local_timeout)
+    else:
+        r = await client.get(url)
     return r
 
 
@@ -227,21 +232,63 @@ async def push_objects(obj_list, cls, rewrite=False):
             except (GinoException, UniqueViolationError, InterfaceError):
                 # print("So bad, It is here!")
                 for obj in obj_list:
-                    try:
                         if rewrite:
                             # print(f"UPDATING: {obj}")
-                            await insert(cls).values([obj]).on_conflict_do_update(
-                                index_elements=cls.__my_index_elements__,
-                                set_=obj
-                            ).gino.model(cls).status()
+                            index_array = [{'index_elements': cls.__my_index_elements__},]
+                            if hasattr(cls, "__my_initial_indexes__"):
+                                for index in (cls.__my_initial_indexes__):
+                                    index_name = index.get("name", "_".join(index.get("index_elements")))
+                                    index_array.append({'constraint': f'{cls.__tablename__}_idx_{index_name}',
+                                                       'index_elements': index.get("index_elements")})
+
+                            for index in (index_array):
+                                index_and_array = []
+                                for i in index.get("index_elements"):
+                                    index_and_array.append(and_(getattr(cls, i) == obj[i]))
+                                try:
+                                    if ('index_elements' in index) and ('constraint' in index):
+                                        # print('NO-NO!')
+                                        # print((await cls.query.where(and_(*index_and_array)).gino.first()).to_json_dict())
+                                        await insert(cls).values([obj]).on_conflict_do_update(
+                                            index_where=and_(*index_and_array),
+                                            index_elements=index['index_elements'],
+                                            #index['index_elements'],
+                                            #constraint=index['constraint'],
+                                            set_=obj
+                                        ).gino.model(cls).status()
+                                        # print((await cls.query.where(and_(*index_and_array)).gino.first()).to_json_dict())
+                                        # print('YO-YO!')
+                                    else:
+                                        await insert(cls).values([obj]).on_conflict_do_update(
+                                            index_elements=index['index_elements'],
+                                            set_=obj
+                                        ).gino.model(cls).status()
+                                    break
+                                except (GinoException, UniqueViolationError) as e:
+                                    if hasattr(cls, "__my_initial_indexes__") and 'constraint' in index:
+                                        print(f"FAILED: {obj}, Index: {index}")
+                                    continue
+                                except (InvalidColumnReferenceError, InterfaceError) as e:
+                                    async with db.acquire() as conn:
+                                        async with conn.transaction():
+                                            del_q = cls.delete
+                                            for i in index.get("index_elements"):
+                                                del_q = del_q.where(getattr(cls, i) == obj[i])
+                                            # print(del_q)
+                                            # print((await cls.query.where(and_(*index_and_array)).gino.first()).to_json_dict())
+                                            await del_q.gino.status()
+                                            await cls.insert().gino.all([obj])
+                                            # print((await cls.query.where(and_(*index_and_array)).gino.first()).to_json_dict())
                         else:
-                            await cls.insert().gino.all([obj])
-                    except (GinoException, UniqueViolationError) as e:
-                        print(e)
+                            try:
+                                await cls.insert().gino.all([obj])
+                            except (GinoException, UniqueViolationError) as e:
+                                print(e)
 
 def print_time_info(start):
     now = datetime.datetime.utcnow()
     now = now.replace(tzinfo=pytz.utc)
+    start = start.replace(tzinfo=pytz.utc)
     delta = now - start
     print('Import Time Delta: ', delta)
     print('Import took ', humanize.naturaldelta(delta))

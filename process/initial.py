@@ -101,7 +101,7 @@ async def process_plan(ctx, task):
                             plan_obj.append(obj)
                             if count > int(os.environ.get('HLTHPRT_SAVE_PER_PACK', 50)):
                                 await push_objects(plan_obj, myplan)
-                                plan_obj = []
+                                plan_obj.clear()
                                 count = 0
                             else:
                                 count += 1
@@ -157,14 +157,14 @@ async def process_plan(ctx, task):
                                             planformulary_obj.append(obj)
                                             if count > int(os.environ.get('HLTHPRT_SAVE_PER_PACK', 50)):
                                                 await push_objects(planformulary_obj, myplanformulary)
-                                                planformulary_obj = []
+                                                planformulary_obj.clear()
                                                 count = 0
                                             else:
                                                 count += 1
                                     except:
                                         pass
 
-                                    planformulary_obj = []
+                                    planformulary_obj.clear()
                                     count = 0
                                 else:
                                     await log_error('warn',
@@ -178,8 +178,8 @@ async def process_plan(ctx, task):
                                             f"{res['plan_id']}, year: {year}",
                                             task.get('issuer_array'), task.get('url'), 'plans', 'json', myimportlog)
 
-                await push_objects(plan_obj, myplan)
-                await push_objects(planformulary_obj, myplanformulary)
+                await asyncio.gather(push_objects(plan_obj, myplan),
+                                     push_objects(planformulary_obj, myplanformulary))
             except ijson.JSONError as exc:
                 await log_error('err',
                                 f"JSON Parsing Error: {exc}",
@@ -207,6 +207,8 @@ async def process_provider(ctx, task):
     :param task: Pass the url of the file to be downloaded
     :return: 1 if the file is successfully processed
     """
+    redis = ctx['redis']
+
     if 'context' in task:
         ctx['context'] = task['context']
     import_date = ctx['context']['import_date']
@@ -373,8 +375,38 @@ async def process_provider(ctx, task):
                         #     #     # print('plan: ', plan)
                         #     #     print('WTF>', obj)
                         #     #     pass
-                await push_objects(list(plan_npi_obj_dict.values()), myplan_npi)
-                await push_objects(list(plan_network_year.values()), myplan_networktier)
+                    count += 1
+                    if count > 10000:
+                        # await redis.enqueue_job('save_mrf_data',
+                        #                         {
+                        #                             'plan_npi': list(plan_npi_obj_dict.values()),
+                        #                             'plan_networktier': list(plan_network_year.values()),
+                        #                             'context': ctx['context']
+                        #                         },
+                        #                         _defer_by=datetime.timedelta(minutes=-100)
+                        #                         )
+                        await asyncio.gather(
+                            push_objects(list(plan_npi_obj_dict.values()), myplan_npi),
+                            push_objects(list(plan_network_year.values()), myplan_networktier)
+                        )
+                        count = 0
+                        plan_npi_obj_dict.clear()
+                        plan_network_year.clear()
+
+                # await redis.enqueue_job('save_mrf_data',
+                #                         {
+                #                             'plan_npi': list(plan_npi_obj_dict.values()),
+                #                             'plan_networktier': list(plan_network_year.values()),
+                #                             'context': ctx['context']
+                #                         },
+                #                                 _defer_by=datetime.timedelta(minutes=-100)
+                #                         )
+                await asyncio.gather(
+                    push_objects(list(plan_npi_obj_dict.values()), myplan_npi),
+                    push_objects(list(plan_network_year.values()), myplan_networktier)
+                )
+                plan_npi_obj_dict.clear()
+                plan_network_year.clear()
 
 
             except ijson.JSONError as exc:
@@ -389,6 +421,37 @@ async def process_provider(ctx, task):
                 return
     await flush_error_log(myimportlog)
     return 1
+
+
+async def save_mrf_data(ctx, task):
+    if 'context' in task:
+        ctx['context'] = task['context']
+    import_date = ctx['context']['import_date']
+
+    x = []
+    print("Got task for saving MRF data")
+    for key in task:
+        match key:
+            case 'plan_npi':
+                myplan_npi = make_class(PlanNPIRaw, import_date)
+                x.append(push_objects(task['plan_npi'], myplan_npi, rewrite=True))
+            case 'plan_networktier':
+                myplan_networktier = make_class(PlanNetworkTierRaw, import_date)
+                x.append(push_objects(task['plan_networktier'], myplan_networktier, rewrite=True))
+            # case 'npi_other_id_list':
+            #     mynpidataotheridentifier = make_class(NPIDataOtherIdentifier, import_date)
+            #     x.append(push_objects(task['npi_other_id_list'], mynpidataotheridentifier, rewrite=True))
+            # case 'npi_taxonomy_group_list':
+            #     mynpidatataxonomygroup = make_class(NPIDataTaxonomyGroup, import_date)
+            #     x.append(push_objects(task['npi_taxonomy_group_list'], mynpidatataxonomygroup, rewrite=True))
+            # case 'npi_address_list':
+            #     mynpiaddress = make_class(NPIAddress, import_date)
+            #     x.append(push_objects(task['npi_address_list'], mynpiaddress, rewrite=True))
+            case 'context':
+                pass
+            case _:
+                print('Some wrong key passed')
+    await asyncio.gather(*x)
 
 
 async def process_json_index(ctx, task):
@@ -465,7 +528,11 @@ async def import_unknown_state_issuers_data():
             p = 'attr.csv'
             tmp_filename = str(PurePath(str(tmpdirname), p + '.zip'))
             await download_it_and_save(file['url'], tmp_filename)
-            await unzip(tmp_filename, tmpdirname)
+            try:
+                await unzip(tmp_filename, tmpdirname)
+            except:
+                with zipfile.ZipFile(tmp_filename, 'r') as zip_ref:
+                    zip_ref.extractall(tmpdirname)
 
             tmp_filename = glob.glob(f"{tmpdirname}/*.csv")[0]
 

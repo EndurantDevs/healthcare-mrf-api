@@ -75,6 +75,38 @@ async def all_plans_variants(request):
     return response.json(data)
 
 
+@blueprint.get('/network/id/<checksum>')
+async def get_network_by_checksum(request, checksum):
+    data = await PlanNetworkTierRaw.query.where(PlanNetworkTierRaw.checksum_network == int(checksum)).gino.first()
+
+    data = await (db.select([db.func.array_agg(
+        db.func.distinct(PlanNetworkTierRaw.plan_id)), PlanNetworkTierRaw.checksum_network,
+        PlanNetworkTierRaw.network_tier, PlanNetworkTierRaw.issuer_id, Issuer.issuer_name,
+        Issuer.issuer_marketing_name, Issuer.state]).select_from(PlanNetworkTierRaw.join(Issuer, Issuer.issuer_id == PlanNetworkTierRaw.issuer_id))
+                  .where(
+        PlanNetworkTierRaw.checksum_network == int(checksum)).group_by(
+        PlanNetworkTierRaw.checksum_network, PlanNetworkTierRaw.network_tier, PlanNetworkTierRaw.issuer_id,
+        Issuer.issuer_name, Issuer.issuer_marketing_name, Issuer.state)
+                  .gino.all())
+
+
+    if not data:
+        raise sanic.exceptions.NotFound
+    data = data[0]
+    res = {
+        'plans': data[0],
+        'checksum': data[1],
+        'network_tier': data[2],
+        'issuer': data[3],
+        'issuer_name': data[4],
+        'issuer_marketing_name': data[5],
+        'issuer_display_name': data[5] if data[5] else data[4],
+        'issuer_state': data[6]
+    }
+    res['network_tier'] = res['network_tier'].replace('-', ' ').replace('  ', ' ')
+    return response.json(res)
+
+
 @blueprint.get('/network/autocomplete')
 async def get_autocomplete_list(request):
     """
@@ -89,11 +121,14 @@ The function takes in a request object and returns a JSON response with the plan
     state = request.args.get("state")
     zip_code = request.args.get("zip_code")
     async def get_plans(text, limit=10):
-        q = Plan.query.where(db.func.lower(Plan.marketing_name).ilike('%' + text.lower() + '%') | db.func.lower(Plan.plan_id).ilike('%' + text.lower() + '%')).limit(100)
+        q = Plan.query.where(db.func.lower(Plan.marketing_name).ilike('%' + text.lower() + '%') | db.func.lower(Plan.plan_id).ilike('%' + text.lower() + '%') | db.func.lower(Issuer.issuer_marketing_name).ilike('%' + text.lower() + '%') | db.func.lower(Issuer.issuer_name).ilike('%' + text.lower() + '%')).limit(100)
+        q = q.where(Plan.issuer_id==Issuer.issuer_id)
+        q = q.where(Plan.plan_id == PlanNetworkTierRaw.plan_id).where(Plan.year == PlanNetworkTierRaw.year).where(PlanNetworkTierRaw.checksum_network != None)
         if state:
             q = q.where(Plan.state==state)
         elif zip_code:
             q = q.where(ZipState.zip == zip_code).where(Plan.state == ZipState.stusps)
+        q = q.limit(limit)
         q = await q.gino.all()
         plan_id = []
         data = {}

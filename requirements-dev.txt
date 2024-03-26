@@ -1,5 +1,6 @@
 aiocsv
 sanic
+asyncpg>=0.29.0
 arq
 gino
 python-dotenv
@@ -22,3 +23,4 @@ us
 unicode-slugify
 sanic_ext
 Jinja2
+geopandas

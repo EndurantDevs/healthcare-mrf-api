@@ -8,6 +8,7 @@ import json
 from dateutil.parser import parse as parse_date
 import glob
 import re
+import zipfile
 from arq import create_pool
 from arq.connections import RedisSettings
 from pathlib import Path, PurePath
@@ -39,7 +40,6 @@ async def process_npi_chunk(ctx, task):
     npi_taxonomy_list_dict = {}
     npi_other_id_list_dict = {}
     npi_taxonomy_group_list_dict = {}
-    npi_taxonomy_group_list_dict = {}
     npi_address_list_dict = {}
 
     npi_csv_map = task['npi_csv_map']
@@ -67,8 +67,8 @@ async def process_npi_chunk(ctx, task):
             obj = {
                 'first_line': row['Provider First Line Business Practice Location Address'],
                 'second_line': row['Provider Second Line Business Practice Location Address'],
-                'city_name': row['Provider Business Practice Location Address City Name'],
-                'state_name': row['Provider Business Practice Location Address State Name'],
+                'city_name': row.get('Provider Business Practice Location Address City Name', '').upper(),
+                'state_name': row.get('Provider Business Practice Location Address State Name', '').upper(),
                 'postal_code': row['Provider Business Practice Location Address Postal Code'],
                 'country_code': row['Provider Business Practice Location Address Country Code (If outside U.S.)'],
             }
@@ -88,8 +88,8 @@ async def process_npi_chunk(ctx, task):
             obj = {
                 'first_line': row['Provider First Line Business Mailing Address'],
                 'second_line': row['Provider Second Line Business Mailing Address'],
-                'city_name': row['Provider Business Mailing Address City Name'],
-                'state_name': row['Provider Business Mailing Address State Name'],
+                'city_name': row.get('Provider Business Mailing Address City Name', '').upper(),
+                'state_name': row.get('Provider Business Mailing Address State Name', '').upper(),
                 'postal_code': row['Provider Business Mailing Address Postal Code'],
                 'country_code': row['Provider Business Mailing Address Country Code (If outside U.S.)'],
             }
@@ -148,19 +148,25 @@ async def process_npi_chunk(ctx, task):
             else:
                 break
 
-    await redis.enqueue_job('save_npi_data', {
-        'npi_obj_list': npi_obj_list,
-        'npi_taxonomy_list': list(npi_taxonomy_list_dict.values()),
-        'npi_other_id_list': list(npi_other_id_list_dict.values()),
-        'npi_taxonomy_group_list': list(npi_taxonomy_group_list_dict.values()),
-        'npi_address_list': list(npi_address_list_dict.values()),
-    })
+    t = {
+            'npi_obj_list': npi_obj_list,
+            'npi_taxonomy_list': list(npi_taxonomy_list_dict.values()),
+            'npi_other_id_list': list(npi_other_id_list_dict.values()),
+            'npi_taxonomy_group_list': list(npi_taxonomy_group_list_dict.values()),
+            'npi_address_list': list(npi_address_list_dict.values()),
+        }
+    if task.get('direct'):
+        await save_npi_data(ctx, t)
+        print(f'Processed {len(npi_obj_list)} rows directly')
+    else:
+        await redis.enqueue_job('save_npi_data', t)
 
 
 
 async def process_data(ctx):
     import_date = ctx['import_date']
     redis = ctx['redis']
+    print(os.environ['HLTHPRT_NPPES_DOWNLOAD_URL_DIR'] + os.environ['HLTHPRT_NPPES_DOWNLOAD_URL_FILE'])
     html_source = await download_it(
         os.environ['HLTHPRT_NPPES_DOWNLOAD_URL_DIR'] + os.environ['HLTHPRT_NPPES_DOWNLOAD_URL_FILE'])
     # re./NPPES_Data_Dissemination_110722_111322_Weekly.zip">NPPES Data Dissemination - Weekly Update -
@@ -179,7 +185,11 @@ async def process_data(ctx):
             await download_it_and_save(os.environ['HLTHPRT_NPPES_DOWNLOAD_URL_DIR'] + p, tmp_filename,
                                        chunk_size=10 * 1024 * 1024, cache_dir='/tmp')
             print(f"Downloaded: {p}")
-            await unzip(tmp_filename, tmpdirname, buffer_size= 10 * 1024 * 1024)
+            try:
+                await unzip(tmp_filename, tmpdirname, buffer_size= 10 * 1024 * 1024)
+            except:
+                with zipfile.ZipFile(tmp_filename, 'r') as zip_ref:
+                    zip_ref.extractall(tmpdirname)
 
             npi_file = [fn for fn in glob.glob(f"{tmpdirname}/npi*.csv")
                 if not os.path.basename(fn).endswith('_fileheader.csv')][0]
@@ -213,36 +223,47 @@ async def process_data(ctx):
 
 
             row_list = []
+            coros = []
             async with async_open(npi_file, 'r') as afp:
                 async for row in AsyncDictReader(afp, delimiter=","):
                     if not (row['NPI']):
                         continue
-                    count += 1
                     if not count % 100_000:
                         print(f"Processed: {count}")
                     row_list.append(row)
-                    if count > 9999:
-                        await process_npi_chunk(ctx, {'row_list': row_list,
+                    if count > 199998:
+                        print(f"Sending to DB: {count}")
+                        coros.append(asyncio.create_task(process_npi_chunk(ctx, {'row_list': row_list.copy(),
                             'npi_csv_map': npi_csv_map,
-                            'npi_csv_map_reverse': npi_csv_map_reverse})
+                            'npi_csv_map_reverse': npi_csv_map_reverse,
+                            'direct': True,
+                            })))
                         row_list.clear()
                         count = 0
                     else:
                         count += 1
+
+            coros.append(asyncio.create_task(process_npi_chunk(ctx, {'row_list': row_list.copy(),
+                'npi_csv_map': npi_csv_map,
+                'npi_csv_map_reverse': npi_csv_map_reverse,
+                'direct': True,
+            })))
+            await asyncio.gather(*coros)
+            coros.clear()
+            row_list.clear()
 
             npi_address_list_dict = {}
             async with async_open(pl_file, 'r') as afp:
                 async for row in AsyncDictReader(afp, delimiter=","):
                     if not (row['NPI'] or row['Provider Secondary Practice Location Address- Address Line 1']):
                         continue
-                    count += 1
                     if not count % 100_000:
                         print(f"Processed: {count}")
                     obj = {
                         'first_line': row['Provider Secondary Practice Location Address- Address Line 1'],
                         'second_line': row['Provider Secondary Practice Location Address-  Address Line 2'],
-                        'city_name': row['Provider Secondary Practice Location Address - City Name'],
-                        'state_name': row['Provider Secondary Practice Location Address - State Name'],
+                        'city_name': row.get('Provider Secondary Practice Location Address - City Name', '').upper(),
+                        'state_name': row.get('Provider Secondary Practice Location Address - State Name', '').upper(),
                         'postal_code': row['Provider Secondary Practice Location Address - Postal Code'],
                         'country_code': row['Provider Secondary Practice Location Address - Country Code (If outside U.S.)'],
                     }
@@ -257,17 +278,23 @@ async def process_data(ctx):
                     })
                     npi_address_list_dict['_'.join([str(obj['npi']), str(obj['checksum']), obj['type'], ])] = obj
 
-                    if count > 9999:
-                        await redis.enqueue_job('save_npi_data', {
-                            'npi_address_list': list(npi_address_list_dict.values()),
-                        })
-                        npi_address_list_dict = {}
+                    if count > 199999:
+                        print(f"Sending to DB: {count}")
+                        coros.append(asyncio.create_task(save_npi_data(ctx, {'npi_address_list': list(npi_address_list_dict.copy().values())})))
+                        # await redis.enqueue_job('save_npi_data', {
+                        #     'npi_address_list': list(npi_address_list_dict.values()),
+                        # })
+                        npi_address_list_dict.clear()
                         count = 0
                     else:
                         count += 1
-            await redis.enqueue_job('save_npi_data', {
-                'npi_address_list': list(npi_address_list_dict.values()),
-            })
+            # await redis.enqueue_job('save_npi_data', {
+            #     'npi_address_list': list(npi_address_list_dict.values()),
+            # })
+            coros.append(asyncio.create_task(save_npi_data(ctx, {'npi_address_list': list(npi_address_list_dict.copy().values())})))
+            await asyncio.gather(*coros)
+            coros.clear()
+            npi_address_list_dict.clear()
 
             print(f"Processed: {count}")
 
@@ -302,6 +329,27 @@ async def startup(ctx):
             await db.status(
                 f"CREATE UNIQUE INDEX {obj.__tablename__}_idx_primary ON "
                 f"{db_schema}.{obj.__tablename__} ({', '.join(obj.__my_index_elements__)});")
+
+        if hasattr(cls, "__my_initial_indexes__") and cls.__my_initial_indexes__:
+            for index in cls.__my_initial_indexes__:
+                index_name = index.get("name", "_".join(index.get("index_elements")))
+                using = ""
+                if t := index.get("using"):
+                    using = f"USING {t} "
+
+                unique = ' '
+                if index.get('unique'):
+                    unique = ' UNIQUE '
+                where = ''
+                if index.get('where'):
+                    where = f' WHERE {index.get("where")} '
+                create_index_sql = (
+                    f"CREATE{unique}INDEX IF NOT EXISTS {obj.__tablename__}_idx_{index_name} "
+                    f"ON {db_schema}.{obj.__tablename__}  {using}"
+                    f"({', '.join(index.get('index_elements'))}){where};"
+                )
+                print(create_index_sql)
+                x = await db.status(create_index_sql)
 
     print("Preparing done")
 
@@ -384,15 +432,20 @@ GROUP BY npi) as b WHERE addr.npi = b.npi;""")
                             f"{db_schema}.{obj.__tablename__}_idx_primary RENAME TO "
                             f"{table}_idx_primary;")
 
+            move_indexes = []
+            if hasattr(cls, "__my_initial_indexes__") and cls.__my_initial_indexes__:
+                move_indexes += cls.__my_initial_indexes__
             if hasattr(cls, '__my_additional_indexes__') and obj.__my_additional_indexes__:
-                for index in obj.__my_additional_indexes__:
-                    index_name = index.get('name', '_'.join(index.get('index_elements')))
-                    await db.status(f"ALTER INDEX IF EXISTS "
-                                    f"{db_schema}.{table}_idx_{index_name} RENAME TO "
-                                    f"{table}_idx_{index_name}_old;")
-                    await db.status(f"ALTER INDEX IF EXISTS "
-                                    f"{db_schema}.{obj.__tablename__}_idx_{index_name} RENAME TO "
-                                    f"{table}_idx_{index_name};")
+                move_indexes += obj.__my_additional_indexes__
+
+            for index in move_indexes:
+                index_name = index.get('name', '_'.join(index.get('index_elements')))
+                await db.status(f"ALTER INDEX IF EXISTS "
+                                f"{db_schema}.{table}_idx_{index_name} RENAME TO "
+                                f"{table}_idx_{index_name}_old;")
+                await db.status(f"ALTER INDEX IF EXISTS "
+                                f"{db_schema}.{obj.__tablename__}_idx_{index_name} RENAME TO "
+                                f"{table}_idx_{index_name};")
 
     print_time_info(ctx['context']['start'])
 

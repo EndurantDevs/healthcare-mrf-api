@@ -11,6 +11,7 @@ from arq import create_pool
 from arq.connections import RedisSettings
 from pathlib import Path, PurePath
 from aiocsv import AsyncDictReader
+import zipfile
 
 import pylightxl as xl
 from aiofile import async_open
@@ -100,10 +101,17 @@ async def shutdown(ctx):
                 using = ""
                 if t := index.get("using"):
                     using = f"USING {t} "
+
+                unique = ' '
+                if index.get('unique'):
+                    unique = ' UNIQUE '
+                where = ''
+                if index.get('where'):
+                    where = f' WHERE {index.get("where")} '
                 create_index_sql = (
-                    f"CREATE INDEX IF NOT EXISTS {obj.__tablename__}_idx_{index_name} "
+                    f"CREATE{unique}INDEX IF NOT EXISTS {obj.__tablename__}_idx_{index_name} "
                     f"ON {db_schema}.{obj.__tablename__}  {using}"
-                    f"({', '.join(index.get('index_elements'))});"
+                    f"({', '.join(index.get('index_elements'))}){where};"
                 )
                 print(create_index_sql)
                 x = await db.status(create_index_sql)
@@ -184,7 +192,11 @@ async def process_attributes(ctx, task):
         p = "attr.csv"
         tmp_filename = str(PurePath(str(tmpdirname), p + ".zip"))
         await download_it_and_save(task["url"], tmp_filename)
-        await unzip(tmp_filename, tmpdirname)
+        try:
+            await unzip(tmp_filename, tmpdirname)
+        except:
+            with zipfile.ZipFile(tmp_filename, 'r') as zip_ref:
+                zip_ref.extractall(tmpdirname)
 
         tmp_filename = glob.glob(f"{tmpdirname}/*.csv")[0]
         total_count = 0
@@ -241,7 +253,11 @@ async def process_benefits(ctx, task):
         p = "benefits.csv"
         tmp_filename = str(PurePath(str(tmpdirname), p + ".zip"))
         await download_it_and_save(task["url"], tmp_filename)
-        await unzip(tmp_filename, tmpdirname)
+        try:
+            await unzip(tmp_filename, tmpdirname)
+        except:
+            with zipfile.ZipFile(tmp_filename, 'r') as zip_ref:
+                zip_ref.extractall(tmpdirname)
 
         tmp_filename = glob.glob(f"{tmpdirname}/*.csv")[0]
         total_count = 0
@@ -348,7 +364,11 @@ async def process_prices(ctx, task):
         p = "rate.csv"
         tmp_filename = str(PurePath(str(tmpdirname), p + ".zip"))
         await download_it_and_save(task["url"], tmp_filename)
-        await unzip(tmp_filename, tmpdirname)
+        try:
+            await unzip(tmp_filename, tmpdirname)
+        except:
+            with zipfile.ZipFile(tmp_filename, 'r') as zip_ref:
+                zip_ref.extractall(tmpdirname)
 
         tmp_filename = glob.glob(f"{tmpdirname}/*.csv")[0]
         total_count = 0
@@ -565,7 +585,11 @@ async def process_state_attributes(ctx, task):
         p = "attr.csv"
         tmp_filename = str(PurePath(str(tmpdirname), p + ".zip"))
         await download_it_and_save(task["url"], tmp_filename)
-        await unzip(tmp_filename, tmpdirname)
+        try:
+            await unzip(tmp_filename, tmpdirname)
+        except:
+            with zipfile.ZipFile(tmp_filename, 'r') as zip_ref:
+                zip_ref.extractall(tmpdirname)
 
         tmp_filename = glob.glob(f"{tmpdirname}/*Plans*.csv")[0]
         total_count = 0
