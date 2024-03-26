@@ -297,7 +297,21 @@ class NPIData(db.Model, JSONOutputMixin):
         {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['npi']
-    npi = Column(Integer)
+    __my_additional_indexes__ = [
+        {'index_elements': (
+            "LOWER(COALESCE(provider_first_name,'') || ' ' || COALESCE(provider_last_name,'') || ' ' || COALESCE("
+            "provider_organization_name,'') || ' ' || COALESCE(provider_other_organization_name,'')) gin_trgm_ops",
+            'entity_type_code'),
+            'using': 'gin',
+            'name': 'partial_search_autocomplete'},
+        {'index_elements': (
+            'npi',
+            "LOWER(COALESCE(provider_first_name,'') || ' ' || COALESCE(provider_last_name,'') || ' ' || COALESCE("
+            "provider_organization_name,'') || ' ' || COALESCE(provider_other_organization_name,'')) gin_trgm_ops",
+            'entity_type_code'),
+            'using': 'gin',
+            'name': 'partial_search_helper'}]
+    npi = Column(Integer, primary_key=True)
     employer_identification_number = Column(String)
     entity_type_code = Column(Integer)
     replacement_npi = Column(Integer)
@@ -388,7 +402,8 @@ class NUCCTaxonomy(db.Model, JSONOutputMixin):
         {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['code']
-    __my_additional_indexes__ = [{'index_elements': ('int_code',)}, {'index_elements': ('display_name',)}]
+    __my_additional_indexes__ = [{'index_elements': ('int_code',)}, {'index_elements': ('display_name',)},
+        {'index_elements': ('classification','section'), 'using': 'gin'} ]
 
     int_code = Column(Integer)
     code = Column(String)
@@ -407,7 +422,7 @@ class AddressPrototype(db.Model, JSONOutputMixin):
         {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
 
-    checksum = Column(Integer)
+    checksum = Column(Integer, primary_key=True)
     first_line = Column(String)
     second_line  = Column(String)
     city_name = Column(String)
@@ -434,17 +449,39 @@ class NPIAddress(AddressPrototype):
     __tablename__ = 'npi_address'
     __main_table__ = __tablename__
     __my_index_elements__ = ['npi', 'checksum', 'type']
-    __my_additional_indexes__ = [{'index_elements': ('postal_code',)},
+    __my_initial_indexes__ = [{'index_elements': ('npi', 'type'), 'unique': True, 'where': "type='primary' or type='secondary'"}]
+    __my_additional_indexes__ = [
+        {'index_elements': ('postal_code',)},
         {'index_elements': ('checksum',), 'using': 'gin'},
         {'index_elements': ('city_name', 'state_name', 'country_code'), 'using': 'gin'},
+        {'index_elements': (
+            'taxonomy_array gin__int_ops',
+            'plans_network_array gin__int_ops'),
+            'using': 'gin',
+            'name': 'taxonomy_plans_network'},
+        {'index_elements': (
+            'plans_network_array gin__int_ops',
+            'taxonomy_array gin__int_ops',
+            'state_name',
+            'city_name'
+            ),
+            'using': 'gin',
+            'name': 'plans_network_taxonomy'},
+        {'index_elements': (
+            'taxonomy_array gin__int_ops',
+            'telephone_number',
+            'plans_network_array gin__int_ops',
+        ),
+            'using': 'gin',
+            'name': 'plans_network_taxonomy_phone'},
         {'index_elements': (
         'Geography(ST_MakePoint(long, lat))', 'taxonomy_array gist__intbig_ops', 'plans_network_array gist__intbig_ops'),
             'using': 'gist',
             'name': 'geo_index_with_taxonomy_and_plans'}]
 
-    npi = Column(Integer)
-    type = Column(String)
-    taxonomy_array = Column(ARRAY(Integer))
-    plans_network_array = Column(ARRAY(Integer))
+    npi = Column(Integer, primary_key=True)
+    type = Column(String, primary_key=True)
+    taxonomy_array = Column(ARRAY(Integer), nullable=False, server_default="{0}")
+    plans_network_array = Column(ARRAY(Integer), nullable=False, server_default="{0}")
 
     # NPI	Provider Secondary Practice Location Address- Address Line 1	Provider Secondary Practice Location Address-  Address Line 2	Provider Secondary Practice Location Address - City Name	Provider Secondary Practice Location Address - State Name	Provider Secondary Practice Location Address - Postal Code	Provider Secondary Practice Location Address - Country Code (If outside U.S.)	Provider Secondary Practice Location Address - Telephone Number	Provider Secondary Practice Location Address - Telephone Extension	Provider Practice Location Address - Fax Number

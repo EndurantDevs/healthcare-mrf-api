@@ -2,7 +2,7 @@ import sanic.exceptions
 from sanic import response
 from sanic import Blueprint
 
-from db.models import db, Plan, Issuer, ImportLog
+from db.models import db, Plan, Issuer, ImportLog, PlanNetworkTierRaw
 
 blueprint = Blueprint('issuer', url_prefix='/issuer', version=1)
 
@@ -12,13 +12,32 @@ async def get_issuer_data(request, issuer_id):
     if not data:
         raise sanic.exceptions.NotFound
     data = data.to_json_dict()
-    plans = await Plan.query.where(Plan.issuer_id == int(issuer_id)).order_by(Plan.year.desc(), Plan.marketing_name.asc()).gino.all()
+
+    # await Plan.query.where(Plan.issuer_id == int(issuer_id)).order_by(Plan.year.desc(), Plan.marketing_name.asc()).gino.all()
+
+
     data['plans'] = []
-    data['plans_count'] = len(plans)
     data['import_errors'] = await db.select([db.func.count(ImportLog.checksum)]).where(ImportLog.issuer_id == int(issuer_id)).gino.scalar()
 
-    for p in plans:
-        data['plans'].append(p.to_json_dict())
+    plans = (db.select([Plan, PlanNetworkTierRaw]).
+             select_from(Plan.join(PlanNetworkTierRaw, Plan.plan_id == PlanNetworkTierRaw.plan_id, isouter=True)).
+             where(Plan.issuer_id == int(issuer_id)).
+             order_by(Plan.year.desc(), Plan.marketing_name.asc()).gino.load((Plan, PlanNetworkTierRaw)))
+
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            async for x in plans.iterate():
+                plan = x[0].to_json_dict()
+                plan['network'] = {'cmsgov_network': plan.get('network')}
+                if x[1]:
+                    network = x[1].to_json_dict()
+                    plan['network'].update({
+                        'network_tier': network.get('network_tier'),
+                        'display_name': network.get('network_tier').replace('-', ' ').replace('  ', ' '),
+                        'checksum': network.get('checksum_network')})
+                data['plans'].append(plan)
+    data['plans_count'] = len(data['plans'])
+
     return response.json(data)
 
 @blueprint.get('/', name="issuer_list")
