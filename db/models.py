@@ -477,7 +477,7 @@ class NPIAddress(AddressPrototype):
         {'index_elements': (
         'Geography(ST_MakePoint(long, lat))', 'taxonomy_array gist__intbig_ops', 'plans_network_array gist__intbig_ops'),
             'using': 'gist',
-            'name': 'geo_index_with_taxonomy_and_plans'}]
+            'name': 'geo_index_with_taxonomy_and_plans','where': "type='primary' or type='secondary'"}]
 
     npi = Column(Integer, primary_key=True)
     type = Column(String, primary_key=True)
