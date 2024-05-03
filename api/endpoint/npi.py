@@ -329,7 +329,8 @@ async def get_near_npi(request):
                q.*, d.*
         from mrf.npi as d,
         (select round(cast(st_distance(Geography(ST_MakePoint(a.long, a.lat)),
-                                      Geography(ST_MakePoint(:in_long, :in_lat))) / 1609.34 as numeric), 2) as distance, a.* from mrf.npi_address as a,
+                                      Geography(ST_MakePoint(:in_long, :in_lat))) / 1609.34 as numeric), 
+                                      2) as distance, a.* from mrf.npi_address as a,
              (select ARRAY_AGG(int_code) as codes from mrf.nucc_taxonomy where {' and '.join(where)}) as g
         where ST_DWithin(Geography(ST_MakePoint(long, lat)),
                          Geography(ST_MakePoint(:in_long, :in_lat)),
@@ -468,13 +469,12 @@ async def get_npi(request, npi):
 
 
     async def _update_address(x):
-        if x['lat']:
+        if x.get('lat'):
             return x
-        postal_code = x['postal_code']
+        postal_code = x.get('postal_code')
         if postal_code and len(postal_code)>5:
             postal_code = f"{postal_code[0:5]}-{postal_code[5:]}"
-        t_addr = ', '.join([x['first_line'], x['second_line'], x['city_name'], f"{x['state_name']} {postal_code}"])
-
+        t_addr = ', '.join([x.get('first_line',''), x.get('second_line',''), x.get('city_name',''), f"{x.get('state_name','')} {postal_code}"])
         t_addr = t_addr.replace(' , ', ' ')
 
         d = x
@@ -640,15 +640,15 @@ async def get_npi(request, npi):
 
             g = db.select([NPIAddress]).where(
                 (NPIAddress.npi == npi) & or_(NPIAddress.type == 'primary', NPIAddress.type == 'secondary')).order_by(
-                NPIAddress.type).group_by(NPIAddress.npi, NPIAddress.type, NPIAddress.checksum).alias('address_list')
+                NPIAddress.type).alias('address_list')
 
             query = db.select(
-                [NPIData, func.json_agg(literal_column('"'+ NPIDataTaxonomy.__tablename__+'"')), func.json_agg(literal_column('"'+ NPIDataTaxonomyGroup.__tablename__+'"')),
-                #    func.json_agg(literal_column('"'+ 'address_list' +'"'))
+                [NPIData, func.json_agg(literal_column('distinct "'+ NPIDataTaxonomy.__tablename__+'"')), func.json_agg(literal_column('distinct "'+ NPIDataTaxonomyGroup.__tablename__+'"')),
+                    func.json_agg(literal_column('distinct "'+ 'address_list' +'"'))
                 ]).select_from(
-                NPIData.outerjoin(NPIDataTaxonomy, NPIData.npi == NPIDataTaxonomy.npi).outerjoin(NPIDataTaxonomyGroup, NPIData.npi == NPIDataTaxonomyGroup.npi)
+                NPIData.outerjoin(NPIDataTaxonomy, NPIData.npi == NPIDataTaxonomy.npi).outerjoin(NPIDataTaxonomyGroup, NPIData.npi == NPIDataTaxonomyGroup.npi).outerjoin(g, NPIData.npi == g.c.npi)
             ).where(NPIData.npi == npi).group_by(NPIData.npi)
-            #.select_from(g)
+
 
 
 
@@ -670,22 +670,23 @@ async def get_npi(request, npi):
             if r[count]:
                 obj['taxonomy_group_list'].extend([q for q in r[count] if q])
 
-            # count += 1
-            # if r[count]:
-            #     obj['address_list'] = r[count]
+            count += 1
+            if r[count]:
+                obj['address_list'] = r[count]
 
             return obj
 
     npi = int(npi)
 
-    data, address_list = await asyncio.gather(test_combined(npi), get_address_list(npi))
+    data = await test_combined(npi)
 
-    if address_list:
+    if data['address_list']:
         new_address_list = []
         update_address_tasks = []
-        for a in address_list:
+        for a in data['address_list']:
             # if not a['lat']:
-            update_address_tasks.append(_update_address(a))
+            if a:
+                update_address_tasks.append(_update_address(a))
             # else:
             #     new_address_list.append(a)
         if update_address_tasks:

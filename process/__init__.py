@@ -37,7 +37,7 @@ class MRF:
     on_startup = db_startup
     # on_shutdown = init_shutdown
     max_jobs = int(os.environ.get('HLTHPRT_MAX_MRF_JOBS')) if os.environ.get('HLTHPRT_MAX_MRF_JOBS') else 20
-    queue_read_limit = 5*max_jobs
+    queue_read_limit = 2*max_jobs
     job_timeout = 7200
     burst = True
     queue_name = 'arq:MRF'
