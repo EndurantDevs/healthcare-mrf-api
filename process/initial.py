@@ -762,7 +762,11 @@ async def init_file(ctx):
         p = 'mrf_puf.xlsx'
         tmp_filename = str(PurePath(str(tmpdirname), p + '.zip'))
         await download_it_and_save(os.environ['HLTHPRT_CMSGOV_MRF_URL_PUF'], tmp_filename)
-        await unzip(tmp_filename, tmpdirname)
+        try:
+            await unzip(tmp_filename, tmpdirname)
+        except:
+            with zipfile.ZipFile(tmp_filename, 'r') as zip_ref:
+                zip_ref.extractall(tmpdirname)
 
         tmp_filename = glob.glob(f"{tmpdirname}/*.xlsx")[0]
         xls_file = xl.readxl(tmp_filename)
