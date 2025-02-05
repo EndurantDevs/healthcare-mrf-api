@@ -644,12 +644,12 @@ async def update_issuer_names_data():
             with zipfile.ZipFile(tmp_filename, 'r') as zip_ref:
                 zip_ref.extractall(tmpdirname)
 
-            tmp_filename = glob.glob(f"{tmpdirname}/*PUF*.zip")[0]
-            print(f"Trying to unpack: {tmp_filename}")
-            tmpdirname = str(PurePath(str(tmpdirname), 'PUF_FILES'))
-            # temp solution
-            with zipfile.ZipFile(tmp_filename, 'r') as zip_ref:
-                zip_ref.extractall(tmpdirname)
+            # tmp_filename = glob.glob(f"{tmpdirname}/*PUF*.zip")[0]
+            # print(f"Trying to unpack: {tmp_filename}")
+            # tmpdirname = str(PurePath(str(tmpdirname), 'PUF_FILES'))
+            # # temp solution
+            # with zipfile.ZipFile(tmp_filename, 'r') as zip_ref:
+            #     zip_ref.extractall(tmpdirname)
             print(glob.glob(f"{tmpdirname}/*PUF*.csv"))
 
             count = 0
@@ -698,7 +698,12 @@ async def init_file(ctx):
             p = 'transp.xlsx'
             tmp_filename = str(PurePath(str(tmpdirname), p + '.zip'))
             await download_it_and_save(file['url'], tmp_filename)
-            await unzip(tmp_filename, tmpdirname)
+
+            try:
+                await unzip(tmp_filename, tmpdirname)
+            except:
+                with zipfile.ZipFile(tmp_filename, 'r') as zip_ref:
+                    zip_ref.extractall(tmpdirname)
 
             tmp_filename = glob.glob(f"{tmpdirname}/*.xlsx")[0]
             xls_file = xl.readxl(tmp_filename)
