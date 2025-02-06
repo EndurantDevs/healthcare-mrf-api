@@ -2,7 +2,7 @@ aiocsv
 sanic
 asyncpg>=0.29.0
 arq
-gino
+gino>=1.1.0rc1
 python-dotenv
 alembic
 ijson
