@@ -1,10 +1,10 @@
-FROM python:3.11-bullseye
+FROM public.ecr.aws/docker/library/python:3.13-slim-bullseye
 
 WORKDIR /wheels
 ADD ./requirements-dev.txt /wheels
 
 WORKDIR /opt
-RUN apt update && apt install -y nginx libaio1 parallel && python3 -m venv venv && . venv/bin/activate && pip install --no-compile --upgrade pip && \
+RUN apt update && apt install -y gcc nginx libaio1 parallel && apt autopurge && python3 -m venv venv && . venv/bin/activate && pip install --no-compile --upgrade pip && \
 	pip install --no-compile -r /wheels/requirements-dev.txt -f /wheels \
         && rm -rf /wheels \
         && rm -rf /root/.cache/pip/* && \

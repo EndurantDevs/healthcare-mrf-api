@@ -31,6 +31,7 @@ from db.connection import init_db
 
 latin_pattern= re.compile(r'[^\x00-\x7f]')
 
+internal_tasks = set()
 
 async def process_npi_chunk(ctx, task):
     import_date = ctx['import_date']
@@ -156,8 +157,10 @@ async def process_npi_chunk(ctx, task):
             'npi_address_list': list(npi_address_list_dict.values()),
         }
     if task.get('direct'):
-        await save_npi_data(ctx, t)
-        print(f'Processed {len(npi_obj_list)} rows directly')
+        task = asyncio.create_task(save_npi_data(ctx, t))
+        internal_tasks.add(task)
+        task.add_done_callback(internal_tasks.discard)
+        print(f'Processing.. {len(npi_obj_list)} rows directly')
     else:
         await redis.enqueue_job('save_npi_data', t)
 
@@ -172,10 +175,7 @@ async def process_data(ctx):
     # re./NPPES_Data_Dissemination_110722_111322_Weekly.zip">NPPES Data Dissemination - Weekly Update -
     # 110722_111322</a>
 
-    for p in re.findall(r'(NPPES_Data_Dissemination.*.zip)', html_source.text):
-        if p.endswith('021223_Weekly.zip') or p.endswith('020523_Weekly.zip') or p.endswith(
-                '030523_Weekly.zip') or p.endswith('031223_Weekly.zip'):
-            continue
+    for p in re.findall(r'(NPPES_Data_Dissemination.*_V2.zip)', html_source.text):
 
         with tempfile.TemporaryDirectory() as tmpdirname:
             print(f"Found: {p}")
@@ -249,6 +249,9 @@ async def process_data(ctx):
                 'direct': True,
             })))
             await asyncio.gather(*coros)
+            while internal_tasks:
+                print(f"Tasks remaining: {len(internal_tasks)}")
+                await asyncio.sleep(2)
             coros.clear()
             row_list.clear()
 

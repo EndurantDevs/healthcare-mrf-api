@@ -9,7 +9,7 @@ import pytz
 from db.connection import init_db, db
 
 from aioshutil import copyfile
-from sqlalchemy import Index, and_
+from sqlalchemy import Index, and_, inspect
 import ssl
 from gino.exceptions import GinoException
 from asyncpg.exceptions import UniqueViolationError, InterfaceError, InvalidColumnReferenceError
@@ -202,6 +202,7 @@ async def push_objects(obj_list, cls, rewrite=False):
             return await push_objects_slow(obj_list, cls)
 
         try:
+            #raise UniqueViolationError
             async with db.acquire() as conn:
                 await conn.raw_connection.copy_records_to_table(cls.__tablename__,
                                                                 schema_name=cls.__table_args__[0]['schema'],
@@ -222,13 +223,34 @@ async def push_objects(obj_list, cls, rewrite=False):
                     if rows_to > obj_length:
                         rows_to = obj_length
                     if rewrite:
-                        await cls.insert().gino.all(obj_list[i * rows_per_insert:rows_to])
+                        async with db.acquire() as conn:
+                            for o in obj_list[i * rows_per_insert:rows_to]:
+                                stmt = insert(cls.__table__).values(o)
+                                primary_keys = [key.name for key in inspect(cls.__table__).primary_key]
+                                update_dict = {c.name: o[c.name] for c in stmt.excluded if (not c.primary_key and c.name in o)}
+                                s = stmt.on_conflict_do_update(
+                                    index_elements= primary_keys,
+                                    set_=update_dict)
+                                await s.gino.model(cls).status()
+                                #await conn.raw_connection.execute(s.compile())
+
+                        # async with db.acquire() as conn:
+                        #     for o in obj_list[i * rows_per_insert:rows_to]:
+                        #         async with conn.transaction():
+                        #             await conn.execute(cls.insert().values(o))
+
+                        #await cls.insert().gino.all(obj_list[i * rows_per_insert:rows_to])
                     else:
                         if hasattr(cls, "__my_index_elements__"):
                             await insert(cls).values(obj_list[i * rows_per_insert:rows_to]).on_conflict_do_nothing(
                                 index_elements=cls.__my_index_elements__).gino.model(cls).status()
                         else:
-                            await cls.insert().gino.all(obj_list[i*rows_per_insert:rows_to])
+                            async with db.acquire() as conn:
+                                for o in obj_list[i * rows_per_insert:rows_to]:
+                                    async with conn.transaction():
+                                        s = cls.insert().values(o)
+                                        await s.gino.model(cls).status()
+                            #await cls.insert().gino.all(obj_list[i*rows_per_insert:rows_to])
             except (GinoException, UniqueViolationError, InterfaceError):
                 # print("So bad, It is here!")
                 for obj in obj_list:
@@ -269,21 +291,37 @@ async def push_objects(obj_list, cls, rewrite=False):
                                         print(f"FAILED: {obj}, Index: {index}")
                                     continue
                                 except (InvalidColumnReferenceError, InterfaceError) as e:
-                                    async with db.acquire() as conn:
-                                        async with conn.transaction():
-                                            del_q = cls.delete
-                                            for i in index.get("index_elements"):
-                                                del_q = del_q.where(getattr(cls, i) == obj[i])
-                                            # print(del_q)
-                                            # print((await cls.query.where(and_(*index_and_array)).gino.first()).to_json_dict())
-                                            await del_q.gino.status()
-                                            await cls.insert().gino.all([obj])
-                                            # print((await cls.query.where(and_(*index_and_array)).gino.first()).to_json_dict())
+                                    try:
+                                        async with db.acquire() as conn:
+                                            async with conn.transaction():
+                                                del_q = cls.delete
+                                                for i in index.get("index_elements"):
+                                                    del_q = del_q.where(getattr(cls, i) == obj[i])
+                                                # print(del_q)
+                                                # print((await cls.query.where(and_(*index_and_array)).gino.first()).to_json_dict())
+                                                await del_q.gino.status()
+                                                async with db.acquire() as conn:
+                                                    for o in obj:
+                                                        async with conn.transaction():
+                                                            s = cls.insert().values(o)
+                                                            await s.gino.model(cls).status()
+                                                #await cls.insert().gino.all([obj])
+
+                                                # print((await cls.query.where(and_(*index_and_array)).gino.first()).to_json_dict())
+                                    except Exception as e:
+                                        pass
+                                        #print(e)
                         else:
                             try:
-                                await cls.insert().gino.all([obj])
-                            except (GinoException, UniqueViolationError) as e:
-                                print(e)
+                                async with db.acquire() as conn:
+                                    for o in obj:
+                                        async with conn.transaction():
+                                            s = cls.insert().values(o)
+                                            await s.gino.model(cls).status()
+                                #await cls.insert().gino.all([obj])
+                            except Exception as e:
+                                #print(e)
+                                pass
 
 def print_time_info(start):
     now = datetime.datetime.utcnow()
