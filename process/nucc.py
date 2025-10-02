@@ -24,7 +24,7 @@ async def process_data(ctx):
     html_source = await download_it(
         os.environ['HLTHPRT_NUCC_DOWNLOAD_URL_DIR'] + os.environ['HLTHPRT_NUCC_DOWNLOAD_URL_FILE'])
 
-    for p in re.findall(r'\"(.*?nucc_taxonomy.*?\.csv)\"', html_source.text):
+    for p in re.findall(r'\"(.*?nucc_taxonomy.*?\.csv)\"', html_source):
         with tempfile.TemporaryDirectory() as tmpdirname:
             print(f"Found: {p}")
             file_name = p.split('/')[-1]
@@ -33,7 +33,7 @@ async def process_data(ctx):
                                        chunk_size=10 * 1024 * 1024, cache_dir='/tmp')
             print(f"Downloaded: {p}")
             csv_map, csv_map_reverse = ({}, {})
-            async with async_open(tmp_filename, 'r') as afp:
+            async with async_open(tmp_filename, 'r', encoding='utf-8-sig') as afp:
                 async for row in AsyncDictReader(afp, delimiter=","):
                     for key in row:
                         t = re.sub(r"\(.*\)", r"", key.lower()).strip().replace(' ', '_')
@@ -46,7 +46,7 @@ async def process_data(ctx):
 
             row_list = []
             myNUCCTaxonomy = make_class(NUCCTaxonomy, import_date)
-            async with async_open(tmp_filename, 'r', encoding='latin1') as afp:
+            async with async_open(tmp_filename, 'r', encoding='utf-8-sig') as afp:
                 async for row in AsyncDictReader(afp, delimiter=","):
                     if not (row['Code']):
                         continue

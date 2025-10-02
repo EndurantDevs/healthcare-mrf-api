@@ -1,7 +1,10 @@
 aiocsv
+aiohttp
+redis[hiredis]>6.0.0
 sanic
 asyncpg>=0.29.0
-arq
+#arq
+git+https://github.com/dnikolayev/arq.git
 gino>=1.1.0rc1
 python-dotenv
 alembic
@@ -22,5 +25,5 @@ ruamel.ext.msgpack
 us
 unicode-slugify
 sanic_ext
-Jinja2
 geopandas
+Jinja2

@@ -204,7 +204,7 @@ async def process_attributes(ctx, task):
 
         count = 0
         # return 1
-        async with async_open(tmp_filename, "r") as afp:
+        async with async_open(tmp_filename, "r", encoding='utf-8-sig') as afp:
             async for row in AsyncDictReader(afp, delimiter=","):
                 if not (row["StandardComponentId"] and row["PlanId"]):
                     continue
@@ -265,7 +265,7 @@ async def process_benefits(ctx, task):
 
         count = 0
         # return 1
-        async with async_open(tmp_filename, "r") as afp:
+        async with async_open(tmp_filename, "r", encoding='utf-8-sig') as afp:
             async for row in AsyncDictReader(afp, delimiter=","):
                 obj = {
                     "year": None,
@@ -307,12 +307,16 @@ async def process_benefits(ctx, task):
                         obj["limit_qty"] = float(row["LimitQty"])
                     except ValueError:
                         pass
-
-                if row["BusinessYear"]:
-                    try:
-                        obj["year"] = int(row["BusinessYear"])
-                    except ValueError:
-                        continue
+                
+                try:
+                    if row["BusinessYear"]:
+                        try:
+                            obj["year"] = int(row["BusinessYear"])
+                        except ValueError:
+                            continue
+                except KeyError:
+                    print(row)
+                    exit(1)
 
                 attr_obj_list.append(obj)
 
@@ -336,7 +340,7 @@ async def process_rating_areas(ctx):
     import_date = ctx["import_date"]
     myplanrating = make_class(PlanRatingAreas, import_date)
     attr_obj_list = []
-    async with async_open("data/rating_areas.csv", "r", encoding="utf-8") as afp:
+    async with async_open("data/rating_areas.csv", "r", encoding='utf-8-sig') as afp:
         async for row in AsyncDictReader(afp, delimiter=";"):
             obj = {
                 "state": row["STATE CODE"].upper(),
@@ -379,7 +383,7 @@ async def process_prices(ctx, task):
         range_regex = re.compile(r"^(\d+)-(\d+)$")
         int_more_regex = re.compile(r"^(\d+) and over$")
         clean_int = re.compile(r"^(\d+)$")
-        async with async_open(tmp_filename, "r") as afp:
+        async with async_open(tmp_filename, "r", encoding='utf-8-sig') as afp:
             async for row in AsyncDictReader(afp, delimiter=","):
                 if not row["PlanId"]:
                     continue
@@ -600,7 +604,7 @@ async def process_state_attributes(ctx, task):
         count = 0
         # return 1
 
-        async with async_open(tmp_filename, "r") as afp:
+        async with async_open(tmp_filename, "r", encoding='utf-8-sig') as afp:
             async for row in AsyncDictReader(afp, delimiter=","):
                 if not (row["STANDARD COMPONENT ID"] and row["PLAN ID"]):
                     continue

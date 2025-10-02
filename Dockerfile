@@ -4,11 +4,12 @@ WORKDIR /wheels
 ADD ./requirements-dev.txt /wheels
 
 WORKDIR /opt
-RUN apt update && apt install -y gcc nginx libaio1 parallel && apt autopurge && python3 -m venv venv && . venv/bin/activate && pip install --no-compile --upgrade pip && \
+RUN apt-get update && apt update && apt install -y gcc nginx git curl libaio1 parallel && apt autopurge && python3 -m venv venv && . venv/bin/activate && pip install --no-compile --upgrade pip && \
 	pip install --no-compile -r /wheels/requirements-dev.txt -f /wheels \
         && rm -rf /wheels \
         && rm -rf /root/.cache/pip/* && \
-        find . -name *.pyc -execdir rm -f {} \;
+        find . -name *.pyc -execdir rm -f {} \; \
+        && apt autoremove -y
 
 ARG HLTHPRT_LOG_CFG=./logging.yaml
 ARG HLTHPRT_RELEASE="dev"

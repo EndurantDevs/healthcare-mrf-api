@@ -31,10 +31,16 @@ async def get_issuer_data(request, issuer_id):
                 plan['network'] = {'cmsgov_network': plan.get('network')}
                 if x[1]:
                     network = x[1].to_json_dict()
+                    network_tier = network.get('network_tier', '')
+                    network_checksum = network.get('checksum_network', '')
+                    if not network_checksum:
+                        network_checksum = 0
+                    if not network_tier:
+                        network_tier = 'N/A'
                     plan['network'].update({
-                        'network_tier': network.get('network_tier'),
-                        'display_name': network.get('network_tier').replace('-', ' ').replace('  ', ' '),
-                        'checksum': network.get('checksum_network')})
+                        'network_tier': network_tier,
+                        'display_name': network_tier.replace('-', ' ').replace('  ', ' '),
+                        'checksum': network_checksum})
                 data['plans'].append(plan)
     data['plans_count'] = len(data['plans'])
 
