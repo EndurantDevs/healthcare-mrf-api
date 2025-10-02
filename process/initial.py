@@ -237,7 +237,7 @@ async def process_provider(ctx, task):
                     my_network_tiers = {}
                     not_good = False
                     my_years = set()
-                    if not (res.get('plans', None) and res['plans']):
+                    if not (res and (res.get('plans', None) and res['plans'])):
                         continue
                     for plan in res['plans']:
                         # try:
@@ -584,47 +584,86 @@ async def import_unknown_state_issuers_data():
             p = 'attr.csv'
             tmp_filename = str(PurePath(str(tmpdirname), p + '.zip'))
             await download_it_and_save(file['url'], tmp_filename)
-            await unzip(tmp_filename, tmpdirname)
+            try:
+                await unzip(tmp_filename, tmpdirname)
+            except:
+                with zipfile.ZipFile(tmp_filename, 'r') as zip_ref:
+                    zip_ref.extractall(tmpdirname)
 
-            tmp_filename = glob.glob(f"{tmpdirname}/*Plans*.csv")[0]
+            try:
+                csv_files = glob.glob(f"{tmpdirname}/*Plans*.csv")
+                if csv_files:
+                    tmp_filename = csv_files[0]
+                else:
+                    tmp_filename = glob.glob(f"{tmpdirname}/*.csv")[0]
+            except:
+                tmp_filename = glob.glob(f"{tmpdirname}/*.csv")[0]
 
             count = 0
             # return 1
 
-            async with async_open(tmp_filename, 'r') as afp:
+            def to_camel_case(s):
+                parts = s.split()
+                return ''.join(word.capitalize() for word in parts)
+
+            unique_keys = {
+                'STANDARD COMPONENT ID': 'STANDARD COMPONENT ID',
+                'PLAN ID': 'PLAN ID',
+                'BUSINESS YEAR': 'BUSINESS YEAR',
+                'ISSUER ID': 'ISSUER ID',
+                'STATE CODE': 'STATE CODE',
+                'PLAN MARKETING NAME': 'PLAN MARKETING NAME',
+                'URL FOR SUMMARY OF BENEFITS COVERAGE': 'URL FOR SUMMARY OF BENEFITS COVERAGE',
+                'PLAN BROCHURE': 'PLAN BROCHURE',
+                'FORMULARY URL': 'FORMULARY URL',
+                'IMPORT DATE': 'IMPORT DATE',
+                'NETWORK ID': 'NETWORK ID',
+                'ISSUER NAME': 'ISSUER NAME'
+            }
+
+            async with async_open(tmp_filename, 'r', encoding='utf-8-sig') as afp:
                 async for row in AsyncDictReader(afp, delimiter=","):
-                    if not (row['STANDARD COMPONENT ID'] and row['PLAN ID']):
+                    if (row.get('STANDARD COMPONENT ID') and row.get('PLAN ID')):
+                        continue
+                    else:
+                        for key in unique_keys:
+                                unique_keys[key] = to_camel_case(unique_keys[key])
+                    break
+            
+            
+            async with async_open(tmp_filename, 'r', encoding='utf-8-sig') as afp:
+                async for row in AsyncDictReader(afp, delimiter=","):
+                    if row.get(unique_keys['STANDARD COMPONENT ID']) and row.get(unique_keys['PLAN ID']):
                         continue
                     for key in row:
-                        if not ((key in ('StandardComponentId',)) and (row[key] is None)) and not (
-                                f"{row['STANDARD COMPONENT ID']}_{row['BUSINESS YEAR']}" in plan_list):
-                            plan_list[f"{row['STANDARD COMPONENT ID'].upper()}_{row['BUSINESS YEAR']}"] = {
-                                'plan_id': row['STANDARD COMPONENT ID'],
+                        if not ((key in (unique_keys['STANDARD COMPONENT ID'],)) and (row.get(key) is None)) and not (
+                                f"{row.get(unique_keys['STANDARD COMPONENT ID']).upper()}_{row.get(unique_keys['BUSINESS YEAR'])}" in plan_list):
+                            plan_list[f"{row.get(unique_keys['STANDARD COMPONENT ID']).upper()}_{row.get(unique_keys['BUSINESS YEAR'])}"] = {
+                                'plan_id': row.get(unique_keys['STANDARD COMPONENT ID']),
                                 'plan_id_type': 'STATE-HIOS-PLAN-ID',
-                                'year': int(row['BUSINESS YEAR']),
-                                'issuer_id': int(row['ISSUER ID']),
-                                'state': str(row['STATE CODE']).upper(),
-                                'marketing_name': row['PLAN MARKETING NAME'],
-                                'summary_url': row['URL FOR SUMMARY OF BENEFITS COVERAGE'],
-                                'marketing_url': row['PLAN BROCHURE'],
-                                'formulary_url': row['FORMULARY URL'],
+                                'year': int(row.get(unique_keys['BUSINESS YEAR'])),
+                                'issuer_id': int(row.get(unique_keys['ISSUER ID'])),
+                                'state': str(row.get(unique_keys['STATE CODE'])).upper(),
+                                'marketing_name': row.get(unique_keys['PLAN MARKETING NAME']),
+                                'summary_url': row.get(unique_keys['URL FOR SUMMARY OF BENEFITS COVERAGE']),
+                                'marketing_url': row.get(unique_keys['PLAN BROCHURE']),
+                                'formulary_url': row.get(unique_keys['FORMULARY URL']),
                                 'plan_contact': '',
-                                'network': [row['NETWORK ID']],
+                                'network': [row.get(unique_keys['NETWORK ID'])],
                                 'benefits': [],
                                 'last_updated_on': datetime.datetime.combine(
-                                    parse_date(row['IMPORT DATE'], fuzzy=True), datetime.datetime.min.time()),
+                                    parse_date(row.get(unique_keys['IMPORT DATE']), fuzzy=True), datetime.datetime.min.time()),
                                 'checksum': return_checksum(
-                                    [row['STANDARD COMPONENT ID'].lower(), int(row['BUSINESS YEAR'])], crc=32)
+                                    [row.get(unique_keys['STANDARD COMPONENT ID']).lower(), int(row.get(unique_keys['BUSINESS YEAR']))], crc=32)
                             }
 
-                            issuer_list[int(row['ISSUER ID'])] = {
-                                'state': str(row['STATE CODE']).upper(),
-                                'issuer_id': int(row['ISSUER ID']),
+                            issuer_list[int(row.get(unique_keys['ISSUER ID']))] = {
+                                'state': str(row.get(unique_keys['STATE CODE'])).upper(),
+                                'issuer_id': int(row.get(unique_keys['ISSUER ID'])),
                                 'mrf_url': '',
                                 'data_contact_email': '',
                                 'issuer_marketing_name': '',
-                                'issuer_name': row['ISSUER NAME'].strip() if row['ISSUER NAME'].strip() else row[
-                                    'ISSUER ID']
+                                'issuer_name': row.get(unique_keys['ISSUER NAME']).strip() if row.get(unique_keys['ISSUER NAME']).strip() else row.get(unique_keys['ISSUER ID'])
                             }
 
     return (issuer_list, plan_list)
@@ -656,7 +695,7 @@ async def update_issuer_names_data():
             # return 1
             csv_files = glob.glob(f"{tmpdirname}/*PUF*.csv")
             for tmp_filename in csv_files:
-                async with async_open(tmp_filename, 'r') as afp:
+                async with async_open(tmp_filename, 'r', encoding='utf-8-sig') as afp:
                     async for row in AsyncDictReader(afp, delimiter=","):
                         issuer_list[int(row['ISSUER_ID'])] = {
                             'state': str(row['STATE']).upper(),

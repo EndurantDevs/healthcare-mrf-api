@@ -321,6 +321,7 @@ class NPIData(db.Model, JSONOutputMixin):
     provider_middle_name = Column(String)
     provider_name_prefix_text = Column(String)
     provider_name_suffix_text = Column(String)
+    provider_sex_code = Column(String)
     provider_credential_text = Column(String)
     provider_other_organization_name = Column(String)
     provider_other_organization_name_type_code = Column(String)
@@ -336,7 +337,6 @@ class NPIData(db.Model, JSONOutputMixin):
     npi_deactivation_reason_code = Column(String)
     npi_deactivation_date = Column(DATE)
     npi_reactivation_date = Column(DATE)
-    provider_gender_code = Column(String)
     authorized_official_last_name = Column(String)
     authorized_official_first_name = Column(String)
     authorized_official_middle_name = Column(String)
@@ -350,6 +350,7 @@ class NPIData(db.Model, JSONOutputMixin):
     authorized_official_name_suffix_text = Column(String)
     authorized_official_credential_text = Column(String)
     certification_date = Column(DATE)
+    
 
 class NPIDataTaxonomy(db.Model, JSONOutputMixin):
     __tablename__ = 'npi_taxonomy'
@@ -375,8 +376,8 @@ class NPIDataOtherIdentifier(db.Model, JSONOutputMixin):
     )
     __my_index_elements__ = ['npi', 'checksum']
 
-    npi = Column(Integer)
-    checksum = Column(Integer)
+    npi = Column(Integer, primary_key=True)
+    checksum = Column(Integer, primary_key=True)
     other_provider_identifier = Column(String)
     other_provider_identifier_type_code = Column(String)
     other_provider_identifier_state = Column(String)
@@ -448,8 +449,8 @@ class AddressArchive(AddressPrototype):
 class NPIAddress(AddressPrototype):
     __tablename__ = 'npi_address'
     __main_table__ = __tablename__
-    __my_index_elements__ = ['npi', 'checksum', 'type']
-    __my_initial_indexes__ = [{'index_elements': ('npi', 'type'), 'unique': True, 'where': "type='primary' or type='secondary'"}]
+    __my_index_elements__ = ['npi', 'type', 'checksum']
+    #__my_initial_indexes__ = [{'index_elements': ('npi', 'type'), 'unique': True, 'where': "type='primary'"}] #  or type='secondary'
     __my_additional_indexes__ = [
         {'index_elements': ('postal_code',)},
         {'index_elements': ('checksum',), 'using': 'gin'},
@@ -460,13 +461,13 @@ class NPIAddress(AddressPrototype):
             'using': 'gin',
             'name': 'taxonomy_plans_network'},
         {'index_elements': (
-            'plans_network_array gin__int_ops',
+            'telephone_number',
             'taxonomy_array gin__int_ops',
-            'state_name',
-            'city_name'
+            'type',
+            'npi'
             ),
             'using': 'gin',
-            'name': 'plans_network_taxonomy'},
+            'name': 'phone_taxonomy_type_npi'},
         {'index_elements': (
             'taxonomy_array gin__int_ops',
             'telephone_number',

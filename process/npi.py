@@ -52,7 +52,7 @@ async def process_npi_chunk(ctx, task):
 
         for key in npi_csv_map:
             t = row[key]
-            if not t:
+            if not t or str(t).upper() == '<UNAVAIL>':
                 obj[npi_csv_map[key]] = None
                 continue
             if npi_csv_map[key] in ('replacement_npi', 'entity_type_code', 'npi',):
@@ -104,6 +104,7 @@ async def process_npi_chunk(ctx, task):
                 'date_added': pytz.utc.localize(parse_date(row['Last Update Date'], fuzzy=True)) if row[
                     'Last Update Date'] else None
             })
+            
             npi_address_list_dict['_'.join([str(obj['npi']), str(obj['checksum']), obj['type'],])] = obj
 
         for i in range(1, 16):
@@ -174,9 +175,12 @@ async def process_data(ctx):
         os.environ['HLTHPRT_NPPES_DOWNLOAD_URL_DIR'] + os.environ['HLTHPRT_NPPES_DOWNLOAD_URL_FILE'])
     # re./NPPES_Data_Dissemination_110722_111322_Weekly.zip">NPPES Data Dissemination - Weekly Update -
     # 110722_111322</a>
-
-    for p in re.findall(r'(NPPES_Data_Dissemination.*_V2.zip)', html_source.text):
-
+    count_files = 0
+    SQL_CHUNK_SIZE = 99999
+    for p in re.findall(r'(NPPES_Data_Dissemination.*_V2.zip)', html_source):
+        count_files = count_files + 1
+        current_sql_chunk_size = SQL_CHUNK_SIZE
+        print(f"Round {count_files} for {p}")
         with tempfile.TemporaryDirectory() as tmpdirname:
             print(f"Found: {p}")
             #await unzip('/users/nick/downloads/NPPES_Data_Dissemination_November_2022.zip', tmpdirname, __debug=True)
@@ -185,9 +189,19 @@ async def process_data(ctx):
             await download_it_and_save(os.environ['HLTHPRT_NPPES_DOWNLOAD_URL_DIR'] + p, tmp_filename,
                                        chunk_size=10 * 1024 * 1024, cache_dir='/tmp')
             print(f"Downloaded: {p}")
+            
+            if os.environ.get("DEBUG"):
+                print(f"DEBUG: Downloaded file {tmp_filename}, size: {os.path.getsize(tmp_filename)} bytes")
+                if os.path.getsize(tmp_filename) > 100 * 1024 * 1024:
+                    print(f"File {tmp_filename} is too big, skipping")
+                    continue
+            else:
+                print(f"Downloaded file size: {os.path.getsize(tmp_filename)} bytes")
+
             try:
                 await unzip(tmp_filename, tmpdirname, buffer_size= 10 * 1024 * 1024)
             except:
+                print(f"Failed to unzip {tmp_filename}, trying with zipfile")
                 with zipfile.ZipFile(tmp_filename, 'r') as zip_ref:
                     zip_ref.extractall(tmpdirname)
 
@@ -197,6 +211,71 @@ async def process_data(ctx):
                 if not os.path.basename(fn).endswith('_fileheader.csv')][0]
             other_file = [fn for fn in glob.glob(f"{tmpdirname}/other*.csv")
                 if not os.path.basename(fn).endswith('_fileheader.csv')][0]
+            
+            if count_files > 1:
+                # Collect all NPIs from npi_file and pl_file
+                current_sql_chunk_size = SQL_CHUNK_SIZE // 26
+                npi_set = set()
+                async with async_open(npi_file, 'r') as afp:
+                    async for row in AsyncDictReader(afp, delimiter=","):
+                        if row.get('NPI'):
+                            npi_set.add(int(row['NPI']))
+                            
+                for cls in (NPIData, NPIDataTaxonomyGroup, NPIDataTaxonomy, NPIAddress):
+                    table = make_class(cls, import_date)
+                    npi_list = list(npi_set)
+                    chunk_size = 1000
+                    npi_column = getattr(table, 'npi')
+                    for i in range(0, len(npi_list), chunk_size):
+                        chunk = npi_list[i:i + chunk_size]
+                        s = table.delete.where(npi_column.in_(chunk))
+                        if cls is NPIAddress:
+                            s = s.where((table.type == 'primary') | (table.type == 'mail'))
+                        await s.gino.status()
+                print(f"Cleaned up models for {len(npi_set)} NPIs due to multiple files.")
+                
+                npi_set.clear()
+                            
+                async with async_open(pl_file, 'r') as afp:
+                    async for row in AsyncDictReader(afp, delimiter=","):
+                        if row.get('NPI'):
+                            npi_set.add(int(row['NPI']))
+                
+                for cls in (NPIAddress,):
+                    table = make_class(cls, import_date)
+                    npi_list = list(npi_set)
+                    chunk_size = 10000
+                    npi_column = getattr(table, 'npi')
+                    for i in range(0, len(npi_list), chunk_size):
+                        chunk = npi_list[i:i + chunk_size] 
+                        s = table.delete.where(npi_column.in_(chunk))
+                        if cls is NPIAddress:
+                            s = s.where(table.type == 'secondary')
+                        await s.gino.status()
+                        
+                npi_set.clear()
+                        
+                async with async_open(other_file, 'r') as afp:
+                    async for row in AsyncDictReader(afp, delimiter=","):
+                        if row.get('NPI'):
+                            npi_set.add(int(row['NPI']))
+                
+                for cls in (NPIDataOtherIdentifier,):
+                    table = make_class(cls, import_date)
+                    npi_list = list(npi_set)
+                    chunk_size = 10000
+                    npi_column = getattr(table, 'npi')
+                    for i in range(0, len(npi_list), chunk_size):
+                        chunk = npi_list[i:i + chunk_size] 
+                        s = table.delete.where(npi_column.in_(chunk))
+                        await s.gino.status()
+                        
+                print(f"Cleaned up models for {len(npi_set)} NPIs due to multiple files.")
+
+            
+            
+            
+            
             endpoint_file = [fn for fn in glob.glob(f"{tmpdirname}/endpoint*.csv")
                 if not os.path.basename(fn).endswith('_fileheader.csv')][0]
             for t in (endpoint_file, other_file, pl_file, npi_file):
@@ -217,7 +296,6 @@ async def process_data(ctx):
                         npi_csv_map[key] = t
                         npi_csv_map_reverse[t] = key
                     break
-
             count = 0
             total_count = 0
 
@@ -228,10 +306,10 @@ async def process_data(ctx):
                 async for row in AsyncDictReader(afp, delimiter=","):
                     if not (row['NPI']):
                         continue
-                    if not count % 100_000:
+                    if not count % current_sql_chunk_size:
                         print(f"Processed: {count}")
                     row_list.append(row)
-                    if count > 199998:
+                    if count > current_sql_chunk_size:
                         print(f"Sending to DB: {count}")
                         coros.append(asyncio.create_task(process_npi_chunk(ctx, {'row_list': row_list.copy(),
                             'npi_csv_map': npi_csv_map,
@@ -248,20 +326,51 @@ async def process_data(ctx):
                 'npi_csv_map_reverse': npi_csv_map_reverse,
                 'direct': True,
             })))
-            await asyncio.gather(*coros)
-            while internal_tasks:
-                print(f"Tasks remaining: {len(internal_tasks)}")
-                await asyncio.sleep(2)
-            coros.clear()
+            # await asyncio.gather(*coros)
+            # while internal_tasks:
+            #     print(f"Tasks remaining: {len(internal_tasks)}")
+            #     await asyncio.sleep(2)
+            # coros.clear()
             row_list.clear()
+
+            npi_other_org_list_dict = {}
+
+            async with async_open(other_file, 'r') as afp:
+                async for row in AsyncDictReader(afp, delimiter=","):
+                    if not row['NPI']:
+                        continue
+                    if not count % current_sql_chunk_size:
+                        print(f"Other Names Processed: {count}")
+                    obj = {
+                        'npi': int(row['NPI']),
+                        'other_provider_identifier': row['Provider Other Organization Name'],
+                        'other_provider_identifier_type_code': row['Provider Other Organization Name Type Code'],
+                    }
+                    checksum = return_checksum(list(obj.values()))
+                    obj['checksum'] = checksum
+                    npi_other_org_list_dict[checksum] = obj
+
+                    if count > current_sql_chunk_size:
+                        print(f"Sending to DB: {count}")
+                        coros.append(asyncio.create_task(save_npi_data(ctx, {'npi_other_id_list': list(npi_other_org_list_dict.copy().values())})))
+                        npi_other_org_list_dict.clear()
+                        count = 0
+                    else:
+                        count += 1
+
+            coros.append(asyncio.create_task(save_npi_data(ctx, {'npi_other_id_list': list(npi_other_org_list_dict.copy().values())})))
+            #await asyncio.gather(*coros)
+            #coros.clear()
+            npi_other_org_list_dict.clear()
+
 
             npi_address_list_dict = {}
             async with async_open(pl_file, 'r') as afp:
                 async for row in AsyncDictReader(afp, delimiter=","):
                     if not (row['NPI'] or row['Provider Secondary Practice Location Address- Address Line 1']):
                         continue
-                    if not count % 100_000:
-                        print(f"Processed: {count}")
+                    if not count % current_sql_chunk_size:
+                        print(f"Secondary Addresses Processed: {count}")
                     obj = {
                         'first_line': row['Provider Secondary Practice Location Address- Address Line 1'],
                         'second_line': row['Provider Secondary Practice Location Address-  Address Line 2'],
@@ -281,8 +390,8 @@ async def process_data(ctx):
                     })
                     npi_address_list_dict['_'.join([str(obj['npi']), str(obj['checksum']), obj['type'], ])] = obj
 
-                    if count > 199999:
-                        print(f"Sending to DB: {count}")
+                    if count > current_sql_chunk_size:
+                        print(f"Sending Secondary to DB: {count}")
                         coros.append(asyncio.create_task(save_npi_data(ctx, {'npi_address_list': list(npi_address_list_dict.copy().values())})))
                         # await redis.enqueue_job('save_npi_data', {
                         #     'npi_address_list': list(npi_address_list_dict.values()),
@@ -296,7 +405,6 @@ async def process_data(ctx):
             # })
             coros.append(asyncio.create_task(save_npi_data(ctx, {'npi_address_list': list(npi_address_list_dict.copy().values())})))
             await asyncio.gather(*coros)
-            coros.clear()
             npi_address_list_dict.clear()
 
             print(f"Processed: {count}")
@@ -368,56 +476,64 @@ async def shutdown(ctx):
         exit(1)
 
     processing_classes_array = (NPIData, NPIDataTaxonomyGroup, NPIDataOtherIdentifier, NPIDataTaxonomy, NPIAddress,)
+    async with db.transaction() as tx:
+        for cls in processing_classes_array:
+            tables[cls.__main_table__] = make_class(cls, import_date)
+            obj = tables[cls.__main_table__]
+            if cls is NPIAddress:
+                print("Updating NUCC Taxonomy for NPI Addresses...")
+                await db.status(f"""WITH x AS (
+    SELECT
+        int_code, code as target_code
+    FROM
+        {db_schema}.nucc_taxonomy
+    )
+    UPDATE {db_schema}.{obj.__tablename__} as addr SET taxonomy_array=b.res FROM (
+    select npi, ARRAY_AGG(x.int_code) as res from mrf.npi_taxonomy_{import_date}
+    INNER JOIN x ON healthcare_provider_taxonomy_code = x.target_code
+    GROUP BY npi) as b WHERE addr.npi = b.npi;""")
 
-    for cls in processing_classes_array:
-        tables[cls.__main_table__] = make_class(cls, import_date)
-        obj = tables[cls.__main_table__]
-        if cls is NPIAddress:
-            print("Updating NUCC Taxonomy for NPI Addresses...")
-            await db.status(f"""WITH x AS (
-SELECT
-    int_code, code as target_code
-FROM
-    {db_schema}.nucc_taxonomy
-)
-UPDATE {db_schema}.{obj.__tablename__} as addr SET taxonomy_array=b.res FROM (
-select npi, ARRAY_AGG(x.int_code) as res from mrf.npi_taxonomy_{import_date}
-INNER JOIN x ON healthcare_provider_taxonomy_code = x.target_code
-GROUP BY npi) as b WHERE addr.npi = b.npi;""")
+                print("Updating NPI Addresses Geo from Archive...")
+                await db.status(
+                    f"UPDATE {db_schema}.{obj.__tablename__} as a SET formatted_address = b.formatted_address, lat = b.lat, "
+                    f"long = b.long, "
+                    f"place_id = b.place_id FROM {db_schema}.address_archive as b WHERE a.checksum = b.checksum")
 
-            print("Updating NPI Addresses Geo from Archive...")
-            await db.status(
-                f"UPDATE {db_schema}.{obj.__tablename__} as a SET formatted_address = b.formatted_address, lat = b.lat, "
-                f"long = b.long, "
-                f"place_id = b.place_id FROM {db_schema}.address_archive as b WHERE a.checksum = b.checksum")
+                print("Updating NPI Plan-Network Array from Plans Import Data...")
+                await db.status(
+                    f"""UPDATE {db_schema}.{obj.__tablename__} as a 
+                    SET
+                        plans_network_array = n_list
+                    FROM (SELECT
+                        npi, ARRAY_AGG(DISTINCT checksum_network) as n_list
+                        FROM
+                        {db_schema}.plan_npi_raw
+                        GROUP BY npi) as b
+                    WHERE
+                        a.npi = b.npi;""")
 
-            print("Updating NPI Plan-Network Array from Plans Import Data...")
-            await db.status(
-                f"""UPDATE {db_schema}.{obj.__tablename__} as a 
-                SET
-                    plans_network_array = n_list
-                FROM (SELECT
-                    npi, ARRAY_AGG(DISTINCT checksum_network) as n_list
-                    FROM
-                    {db_schema}.plan_npi_raw
-                    GROUP BY npi) as b
-                WHERE
-                    a.npi = b.npi;""")
-
-        if hasattr(cls, '__my_additional_indexes__') and cls.__my_additional_indexes__:
-            for index in cls.__my_additional_indexes__:
-                index_name = index.get('name', '_'.join(index.get('index_elements')))
-                using = ""
-                if t:=index.get('using'):
-                    using = f"USING {t} "
-                create_index_sql = f"CREATE INDEX IF NOT EXISTS {obj.__tablename__}_idx_{index_name} " \
-                                   f"ON {db_schema}.{obj.__tablename__}  {using}" \
-                                   f"({', '.join(index.get('index_elements'))});"
-                print(create_index_sql)
-                x = await db.status(create_index_sql)
-
-        print(f"Post-Index VACUUM FULL ANALYZE {db_schema}.{obj.__tablename__};");
+            if hasattr(cls, '__my_additional_indexes__') and cls.__my_additional_indexes__:
+                for index in cls.__my_additional_indexes__:
+                    index_name = index.get('name', '_'.join(index.get('index_elements')))
+                    using = ""
+                    if t:=index.get('using'):
+                        using = f"USING {t} "
+                    create_index_sql = f"CREATE INDEX IF NOT EXISTS {obj.__tablename__}_idx_{index_name} " \
+                                    f"ON {db_schema}.{obj.__tablename__}  {using}" \
+                                    f"({', '.join(index.get('index_elements'))});"
+                    print(create_index_sql)
+                    x = await db.status(create_index_sql)
+                    
+    # Run VACUUM FULL ANALYZE in parallel for all tables
+    async def vacuum_table(obj):
+        print(f"Post-Index VACUUM FULL ANALYZE {db_schema}.{obj.__tablename__};")
         await db.status(f"VACUUM FULL ANALYZE {db_schema}.{obj.__tablename__};")
+
+    vacuum_tasks = [
+        vacuum_table(tables[cls.__main_table__])
+        for cls in processing_classes_array
+    ]
+    await asyncio.gather(*vacuum_tasks)
 
     async with db.transaction() as tx:
         for cls in processing_classes_array:
@@ -466,7 +582,7 @@ async def save_npi_data(ctx, task):
                 x.append(push_objects(task['npi_taxonomy_list'], mynpidatataxonomy, rewrite=True))
             case 'npi_other_id_list':
                 mynpidataotheridentifier = make_class(NPIDataOtherIdentifier, import_date)
-                x.append(push_objects(task['npi_other_id_list'], mynpidataotheridentifier, rewrite=True))
+                x.append(push_objects(task['npi_other_id_list'], mynpidataotheridentifier))
             case 'npi_taxonomy_group_list':
                 mynpidatataxonomygroup = make_class(NPIDataTaxonomyGroup, import_date)
                 x.append(push_objects(task['npi_taxonomy_group_list'], mynpidatataxonomygroup, rewrite=True))

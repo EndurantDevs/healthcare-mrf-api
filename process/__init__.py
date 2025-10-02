@@ -1,6 +1,5 @@
 import os
 import asyncio
-import uvloop
 import click
 from ruamel.ext.msgpack import packb, unpackb
 
@@ -16,7 +15,6 @@ from process.nucc import main as initiate_nucc, startup as nucc_startup, shutdow
     process_data as process_nucc_data
 from process.ext.utils import db_startup
 
-uvloop.install()
 
 class MRF_start:
     functions = [init_file]

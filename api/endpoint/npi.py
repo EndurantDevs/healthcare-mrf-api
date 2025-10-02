@@ -49,6 +49,146 @@ async def npi_index_status(request):
 
     return response.json(data)
 
+@blueprint.get('/active_pharmacists')
+async def active_pharmacists(request):
+    state = request.args.get("state", None)
+    specialization = request.args.get("specialization", None)
+    if state and len(state) == 2:
+        state = state.upper()
+    else:
+        state = None
+
+    sql = text(
+        """
+        WITH pharmacy_taxonomy AS (
+            SELECT ARRAY_AGG(int_code) AS codes
+            FROM mrf.nucc_taxonomy
+            WHERE classification = 'Pharmacy'
+        ),
+        pharmacist_taxonomy AS (
+            SELECT ARRAY_AGG(int_code) AS codes
+            FROM mrf.nucc_taxonomy
+            WHERE 
+               """
+        + (
+            "specialization= :specialization" if specialization
+            else "classification = 'Pharmacist'"
+        )
+        + """
+        )
+        SELECT COUNT(DISTINCT phm.npi) AS active_pharmacist_count
+        FROM mrf.npi_address ph
+        JOIN mrf.npi_address phm ON ph.telephone_number = phm.telephone_number AND phm.type = 'primary' AND ph.type = 'primary'
+               AND ph.state_name = phm.state_name
+        WHERE ph.taxonomy_array && (SELECT codes FROM pharmacy_taxonomy)
+        AND phm.taxonomy_array && (SELECT codes FROM pharmacist_taxonomy)
+        """
+        + ("AND ph.state_name = :state" if state else "")
+    )
+
+    async with db.acquire() as conn:
+        result = await conn.first(sql, state=state, specialization=specialization)
+    return response.json({"count": result[0] if result else 0})
+
+@blueprint.get('/pharmacists_per_pharmacy')
+async def pharmacists_per_pharmacy(request):
+    state = request.args.get("state", None)
+    if state and len(state) == 2:
+        state = state.upper()
+    else:
+        state = None
+
+    sql = text("""
+        WITH pharmacy_taxonomy AS (
+            SELECT ARRAY_AGG(int_code) AS codes
+            FROM mrf.nucc_taxonomy
+            WHERE classification = 'Pharmacy'
+        ),
+        pharmacist_taxonomy AS (
+            SELECT ARRAY_AGG(int_code) AS codes
+            FROM mrf.nucc_taxonomy
+            WHERE classification = 'Pharmacist'
+        ),
+        pharmacy_counts AS (
+            SELECT ph.npi AS pharmacy_npi, COUNT(DISTINCT phm.npi) AS pharmacist_count
+            FROM mrf.npi_address ph
+            JOIN mrf.npi_address phm ON ph.telephone_number = phm.telephone_number AND phm.type = 'primary' AND ph.type = 'primary' 
+               AND ph.state_name = phm.state_name
+            WHERE ph.taxonomy_array && (SELECT codes FROM pharmacy_taxonomy)
+            AND phm.taxonomy_array && (SELECT codes FROM pharmacist_taxonomy)
+            """ + ("AND ph.state_name = :state" if state else "") + """
+            GROUP BY ph.npi
+        )
+        SELECT 
+        CASE 
+            WHEN pharmacist_count = 1 THEN '1'
+            WHEN pharmacist_count = 2 THEN '2'
+            WHEN pharmacist_count = 3 THEN '3'
+            WHEN pharmacist_count = 4 THEN '4'
+            WHEN pharmacist_count = 5 THEN '5'
+            WHEN pharmacist_count = 6 THEN '6'
+            WHEN pharmacist_count = 7 THEN '7'
+            WHEN pharmacist_count = 8 THEN '8'
+            WHEN pharmacist_count = 9 THEN '9'
+            WHEN pharmacist_count = 10 THEN '10'
+            WHEN pharmacist_count = 11 THEN '11'
+            WHEN pharmacist_count = 12 THEN '12'
+            WHEN pharmacist_count = 13 THEN '13'
+            WHEN pharmacist_count = 14 THEN '14'
+            WHEN pharmacist_count = 15 THEN '15'
+            WHEN pharmacist_count = 16 THEN '16'
+            WHEN pharmacist_count = 17 THEN '17'
+            WHEN pharmacist_count = 18 THEN '18'
+            WHEN pharmacist_count = 19 THEN '19'
+            WHEN pharmacist_count = 20 THEN '20'
+            WHEN pharmacist_count = 21 THEN '21'
+            WHEN pharmacist_count = 22 THEN '22'
+            WHEN pharmacist_count = 23 THEN '23'
+            WHEN pharmacist_count = 24 THEN '24'
+            WHEN pharmacist_count = 25 THEN '25'
+            ELSE '25+'
+        END AS pharmacist_group,
+        COUNT(*) AS pharmacy_count
+        FROM pharmacy_counts
+        GROUP BY pharmacist_group
+        ORDER BY pharmacist_group DESC
+    """)
+
+    async with db.acquire() as conn:
+        result = await conn.all(sql, state=state)
+    data = [{"pharmacist_group": row[0], "pharmacy_count": row[1]} for row in result]
+    return response.json(data)
+
+
+@blueprint.get("/pharmacists_in_pharmacies")
+async def pharmacists_in_pharmacies(request):
+    name_like = request.args.get("name_like", "").lower()
+    if not name_like:
+        return response.json({"count": 0})
+
+    sql = text("""
+        WITH pharmacy_taxonomy AS (
+            SELECT ARRAY_AGG(int_code) AS codes
+            FROM mrf.nucc_taxonomy
+            WHERE classification = 'Pharmacy'
+        ),
+        pharmacist_taxonomy AS (
+            SELECT ARRAY_AGG(int_code) AS codes
+            FROM mrf.nucc_taxonomy
+            WHERE classification = 'Pharmacist'
+        )
+        SELECT COUNT(DISTINCT phm.npi) AS pharmacist_count
+        FROM mrf.npi_address ph
+        JOIN mrf.npi_address phm ON ph.telephone_number = phm.telephone_number AND phm.type = 'primary' AND ph.type = 'primary' AND ph.state_name = phm.state_name
+        JOIN mrf.npi d ON ph.npi = d.npi
+        WHERE ph.taxonomy_array && (SELECT codes FROM pharmacy_taxonomy)
+        AND phm.taxonomy_array && (SELECT codes FROM pharmacist_taxonomy)
+        AND LOWER(COALESCE(d.provider_first_name,'') || ' ' || COALESCE(d.provider_last_name,'') || ' ' || COALESCE(d.provider_organization_name,'') || ' ' || COALESCE(d.provider_other_organization_name,'')) LIKE :name_like
+    """)
+
+    async with db.acquire() as conn:
+        result = await conn.first(sql, name_like=f"%{name_like}%")
+    return response.json({"count": result[0] if result else 0})
 
 @blueprint.get('/all')
 async def get_all(request):
@@ -58,6 +198,7 @@ async def get_all(request):
     start = float(request.args.get("start", 0))
     limit = float(request.args.get("limit", 0))
     classification = request.args.get("classification")
+    specialization = request.args.get("specialization")
     section = request.args.get("section")
     display_name = request.args.get("display_name")
     plan_network = request.args.get("plan_network")
@@ -74,10 +215,12 @@ async def get_all(request):
         plan_network = [int(x) for x in plan_network.split(',')]
 
     async def get_count(classification, section, display_name, plan_network=None, name_like=None, codes=None, has_insurance=None,
-                        city=None, state=None, response_format=None):
+                        city=None, state=None, response_format=None, specialization=None):
         where = []
         if classification:
             where.append('classification = :classification')
+        if specialization:
+            where.append('specialization = :specialization')
         if section:
             where.append('section = :section')
         if display_name:
@@ -154,15 +297,15 @@ async def get_all(request):
             async with db.acquire() as conn:
                 return dict(await conn.all(q, classification=classification, section=section, display_name=display_name,
                                        plan_network_array=plan_network, name_like=name_like, codes=codes, city=city,
-                                       state=state))
+                                       state=state, specialization=specialization))
         else:
             q = f"select count(distinct (mrf.npi_address.npi)) " + q
             q = text(q)
             async with db.acquire() as conn:
                 return (await conn.all(q, classification=classification, section=section, display_name=display_name,
-                                       plan_network_array=plan_network, name_like=name_like, codes=codes, city=city, state=state))[0][0]
+                                       plan_network_array=plan_network, name_like=name_like, codes=codes, city=city, state=state, specialization=specialization))[0][0]
 
-    async def get_results(start, limit, classification, section, display_name, plan_network, name_like=None):
+    async def get_results(start, limit, classification, section, display_name, plan_network, name_like=None, specialization=None):
         where = []
         main_where = ["b.npi=g.npi"]
         tables = ['mrf.npi_address']
@@ -170,6 +313,8 @@ async def get_all(request):
         address_where = ["c.taxonomy_array && q.codes", "c.type = 'primary'"]
         if classification:
             where.append('classification = :classification')
+        if specialization:
+            where.append('specialization = :specialization')
         if section:
             where.append('section = :section')
         if display_name:
@@ -199,7 +344,7 @@ async def get_all(request):
         res = {}
         async with db.acquire() as conn:
             for r in await conn.all(q, start=start, limit=limit, classification=classification, section=section,
-                                    display_name=display_name, plan_network_array=plan_network, name_like=name_like):
+                                    display_name=display_name, plan_network_array=plan_network, name_like=name_like, specialization=specialization):
                 obj = {'taxonomy_list': []}
                 count = 0
                 for c in NPIData.__table__.columns:
@@ -225,12 +370,12 @@ async def get_all(request):
 
     if count_only:
         rows = await get_count(classification, section, display_name, plan_network, name_like, codes, has_insurance,
-                               city, state, response_format)
+                               city, state, response_format, specialization=specialization)
         return response.json({'rows': rows}, default=str)
 
     total, rows = await asyncio.gather(
-        get_count(classification, section, display_name, plan_network),
-        get_results(start, limit, classification, section, display_name, plan_network)
+        get_count(classification, section, display_name, plan_network, specialization=specialization),
+        get_results(start, limit, classification, section, display_name, plan_network, specialization=specialization)
     )
     return response.json({'total': total, 'rows': rows}, default=str)
 
@@ -433,7 +578,6 @@ async def get_plans_by_npi(request, npi):
     return response.json({'npi_data': data, 'plan_data': plan_data, 'issuer_data': issuer_data})
 
 
-
 @blueprint.get('/id/<npi>')
 async def get_npi(request, npi):
     force_address_update = request.args.get('force_address_update', 0)
@@ -483,7 +627,7 @@ async def get_npi(request, npi):
             d['lat'] = None
             d['formatted_address'] = None
             d['place_id'] = None
-
+        
         if (not d['lat']):
 
             # try:
@@ -519,7 +663,6 @@ async def get_npi(request, npi):
             #         d['place_id'] = None
             # except:
             #     pass
-
             update_geo = False
             if request.app.config.get('NPI_API_UPDATE_GEOCODE') and not d['lat']:
                 update_geo = True
@@ -547,7 +690,7 @@ async def get_npi(request, npi):
                         encoded_params = '&'.join((encoded_params,qp,))
                     url = request.app.config.get('GEOCODE_MAPBOX_STYLE_URL')+encoded_params
                     resp = await download_it(url, local_timeout=5)
-                    geo_data = json.loads(resp.content)
+                    geo_data = json.loads(resp)
                     if geo_data.get('features', []):
                         d['long'] = geo_data['features'][0]['geometry']['coordinates'][0]
                         d['lat'] = geo_data['features'][0]['geometry']['coordinates'][1]
@@ -569,13 +712,14 @@ async def get_npi(request, npi):
                         encoded_params = '&'.join((encoded_params,qp,))
                     url = '?'.join((request.app.config.get('GEOCODE_GOOGLE_STYLE_URL'), encoded_params,))
                     resp = await download_it(url)
-                    geo_data = json.loads(resp.content)
+                    geo_data = json.loads(resp)
                     if geo_data.get('results', []):
                         d['long'] = geo_data['results'][0]['geometry']['location']['lng']
                         d['lat'] = geo_data['results'][0]['geometry']['location']['lat']
                         d['formatted_address'] = geo_data['results'][0]['formatted_address']
                         d['place_id'] = geo_data['results'][0]['place_id']
-                except:
+                except Exception as e:
+                    print(f"Error in geocoding Google: {t_addr}, {e}")
                     pass
 
             if update_geo and d.get('lat'):
@@ -648,11 +792,6 @@ async def get_npi(request, npi):
                 ]).select_from(
                 NPIData.outerjoin(NPIDataTaxonomy, NPIData.npi == NPIDataTaxonomy.npi).outerjoin(NPIDataTaxonomyGroup, NPIData.npi == NPIDataTaxonomyGroup.npi).outerjoin(g, NPIData.npi == g.c.npi)
             ).where(NPIData.npi == npi).group_by(NPIData.npi)
-
-
-
-
-
 
             r = await query.gino.all()
             if not r:
