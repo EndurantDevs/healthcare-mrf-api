@@ -1,17 +1,18 @@
 import os
 from sqlalchemy import DateTime, Numeric, DATE, Column,\
-    String, Integer, Float, BigInteger, Boolean, ARRAY, JSON, TIMESTAMP, TEXT, SMALLINT
+    String, Integer, Float, BigInteger, Boolean, ARRAY, JSON, TIMESTAMP, TEXT, SMALLINT, PrimaryKeyConstraint
 
-from db.connection import db
+from db.sqlalchemy import Base, db
 from db.json_mixin import JSONOutputMixin
 
 
 
-class ZipState(db.Model, JSONOutputMixin):
+class ZipState(Base, JSONOutputMixin):
     __tablename__ = 'zip_state'
     __schema__ = 'tiger'
     __main_table__ = __tablename__
     __table_args__ = (
+        PrimaryKeyConstraint('zip'),
         {'schema': 'tiger', 'extend_existing': True},
     )
 
@@ -20,11 +21,12 @@ class ZipState(db.Model, JSONOutputMixin):
     statefp = Column(Integer)
 
 
-class State(db.Model, JSONOutputMixin):
+class State(Base, JSONOutputMixin):
     __tablename__ = 'state'
     __schema__ = 'tiger'
     __main_table__ = __tablename__
     __table_args__ = (
+        PrimaryKeyConstraint('statefp'),
         {'schema': 'tiger', 'extend_existing': True},
     )
 
@@ -41,11 +43,12 @@ class State(db.Model, JSONOutputMixin):
     geom = Column(JSON)
 
 
-class Zip_zcta5(db.Model, JSONOutputMixin):
+class Zip_zcta5(Base, JSONOutputMixin):
     __tablename__ = 'zcta5'
     __schema__ = 'tiger'
     __main_table__ = __tablename__
     __table_args__ = (
+        PrimaryKeyConstraint('gid'),
         {'schema': 'tiger', 'extend_existing': True},
     )
 
@@ -61,5 +64,4 @@ class Zip_zcta5(db.Model, JSONOutputMixin):
     intptlon = Column(String(12))
     partflg = Column(String(1))
     the_geom = Column(String)
-
 

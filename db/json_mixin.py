@@ -56,7 +56,7 @@ class JSONOutputMixin:
         return json.dumps(self.to_dict(), default=extended_encoder)
 
     def _get_column_items(self):
-        for column in type(self):
+        for column in type(self).__table__.columns:
             value = getattr(self, column.name)
             if (value is None) and (column.default is not None):
                 value = column.default.arg

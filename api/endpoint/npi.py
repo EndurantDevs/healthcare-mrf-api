@@ -6,7 +6,6 @@ from datetime import datetime
 from process.ext.utils import download_it
 import urllib.parse
 from sqlalchemy import or_, select
-from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.sql import func, tuple_, text, literal_column, distinct
 
 import sanic.exceptions
@@ -544,7 +543,12 @@ async def get_full_taxonomy_list(request, npi):
     #     group_by(PlanAttributes.full_plan_id, Plan.plan_id, Plan.marketing_name, Plan.year).gino.all()
     data = []
     async with db.acquire() as conn:
-        for x in await db.select([NPIDataTaxonomy.__table__.columns,NUCCTaxonomy.__table__.columns]).where(NPIDataTaxonomy.npi == npi).where(NUCCTaxonomy.code == NPIDataTaxonomy.healthcare_provider_taxonomy_code).gino.all():
+        for x in await db.select(
+            NPIDataTaxonomy.__table__,
+            NUCCTaxonomy.__table__,
+        ).where(NPIDataTaxonomy.npi == npi).where(
+            NUCCTaxonomy.code == NPIDataTaxonomy.healthcare_provider_taxonomy_code
+        ).gino.all():
             t.append(x.to_json_dict())
     return response.json(t)
 
@@ -565,7 +569,7 @@ async def get_plans_by_npi(request, npi):
     #             t[x.plan_id] = x.to_json_dict()
     #     return t
 
-    q = db.select([PlanNPIRaw, Issuer]).where(Issuer.issuer_id == PlanNPIRaw.issuer_id).where(
+    q = db.select(PlanNPIRaw, Issuer).where(Issuer.issuer_id == PlanNPIRaw.issuer_id).where(
         PlanNPIRaw.npi == npi).order_by(PlanNPIRaw.issuer_id.desc()).gino.load((PlanNPIRaw, Issuer))
 
     async with db.acquire() as conn:
@@ -603,7 +607,7 @@ async def get_npi(request, npi):
                 # await AddressArchive.update.values(obj) \
                 #     .where(AddressArchive.checksum == checksum).gino.status()
                 try:
-                    await insert(AddressArchive).values([obj]).on_conflict_do_update(
+                    await db.insert(AddressArchive).values([obj]).on_conflict_do_update(
                         index_elements=AddressArchive.__my_index_elements__,
                         set_=obj
                     ).gino.model(AddressArchive).status()
@@ -780,17 +784,47 @@ async def get_npi(request, npi):
 
     async def test_combined(npi):
         async with db.acquire() as conn:
+            npi_data_table = NPIData.__table__
+            taxonomy_table = NPIDataTaxonomy.__table__
+            taxonomy_group_table = NPIDataTaxonomyGroup.__table__
+            address_table = NPIAddress.__table__
 
-            g = db.select([NPIAddress]).where(
-                (NPIAddress.npi == npi) & or_(NPIAddress.type == 'primary', NPIAddress.type == 'secondary')).order_by(
-                NPIAddress.type).alias('address_list')
+            address_subquery = (
+                select(address_table)
+                .where(
+                    (address_table.c.npi == npi)
+                    & or_(
+                        address_table.c.type == "primary",
+                        address_table.c.type == "secondary",
+                    )
+                )
+                .order_by(address_table.c.type)
+                .alias("address_list")
+            )
 
             query = db.select(
-                [NPIData, func.json_agg(literal_column('distinct "'+ NPIDataTaxonomy.__tablename__+'"')), func.json_agg(literal_column('distinct "'+ NPIDataTaxonomyGroup.__tablename__+'"')),
-                    func.json_agg(literal_column('distinct "'+ 'address_list' +'"'))
-                ]).select_from(
-                NPIData.outerjoin(NPIDataTaxonomy, NPIData.npi == NPIDataTaxonomy.npi).outerjoin(NPIDataTaxonomyGroup, NPIData.npi == NPIDataTaxonomyGroup.npi).outerjoin(g, NPIData.npi == g.c.npi)
-            ).where(NPIData.npi == npi).group_by(NPIData.npi)
+                npi_data_table,
+                func.json_agg(
+                    literal_column(
+                        f'distinct "{NPIDataTaxonomy.__tablename__}"'
+                    )
+                ),
+                func.json_agg(
+                    literal_column(
+                        f'distinct "{NPIDataTaxonomyGroup.__tablename__}"'
+                    )
+                ),
+                func.json_agg(literal_column('distinct "address_list"')),
+            ).select_from(
+                npi_data_table.outerjoin(
+                    taxonomy_table, npi_data_table.c.npi == taxonomy_table.c.npi
+                )
+                .outerjoin(
+                    taxonomy_group_table,
+                    npi_data_table.c.npi == taxonomy_group_table.c.npi,
+                )
+                .outerjoin(address_subquery, npi_data_table.c.npi == address_subquery.c.npi)
+            ).where(npi_data_table.c.npi == npi).group_by(npi_data_table.c.npi)
 
             r = await query.gino.all()
             if not r:

@@ -13,7 +13,6 @@ from dateutil.parser import parse as parse_date
 from aiofile import async_open
 from async_unzip.unzipper import unzip
 import pylightxl as xl
-from sqlalchemy.dialects.postgresql import insert
 from aiocsv import AsyncDictReader
 import zipfile
 
@@ -941,7 +940,7 @@ async def shutdown(ctx, task):
                             f"{db_schema}.{obj.__tablename__}_idx_primary RENAME TO "
                             f"{table}_idx_primary;")
 
-    await insert(ImportHistory).values(import_id=import_date, when=db.func.now()).on_conflict_do_update(
+    await db.insert(ImportHistory).values(import_id=import_date, when=db.func.now()).on_conflict_do_update(
         index_elements=ImportHistory.__my_index_elements__,
         index_where=ImportHistory.import_id.__eq__(import_date),
         set_=dict(when=db.func.now())) \
