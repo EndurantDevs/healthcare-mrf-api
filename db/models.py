@@ -1,14 +1,16 @@
 import os
 from sqlalchemy import DateTime, Numeric, DATE, Column,\
-    String, Integer, Float, BigInteger, Boolean, ARRAY, JSON, TIMESTAMP, TEXT, SMALLINT
+    String, Integer, Float, BigInteger, Boolean, ARRAY, JSON, TIMESTAMP, TEXT, SMALLINT, PrimaryKeyConstraint
+from sqlalchemy.orm import declared_attr
 
-from db.connection import db
+from db.sqlalchemy import Base, db
 from db.json_mixin import JSONOutputMixin
 
-class ImportHistory(db.Model, JSONOutputMixin):
+class ImportHistory(Base, JSONOutputMixin):
     __tablename__ = 'history'
     __main_table__ = __tablename__
     __table_args__ = (
+        PrimaryKeyConstraint('import_id'),
         {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['import_id']
@@ -16,10 +18,11 @@ class ImportHistory(db.Model, JSONOutputMixin):
     json_status = Column(JSON)
     when = Column(DateTime)
 
-class ImportLog(db.Model, JSONOutputMixin):
+class ImportLog(Base, JSONOutputMixin):
     __tablename__ = 'log'
     __main_table__ = __tablename__
     __table_args__ = (
+        PrimaryKeyConstraint('issuer_id', 'checksum'),
         {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['issuer_id', 'checksum']
@@ -31,10 +34,11 @@ class ImportLog(db.Model, JSONOutputMixin):
     source = Column(String) #plans, index, providers, etc.
     level = Column(String)  #network, json, etc.
 
-class Issuer(db.Model, JSONOutputMixin):
+class Issuer(Base, JSONOutputMixin):
     __tablename__ = 'issuer'
     __main_table__ = __tablename__
     __table_args__ = (
+        PrimaryKeyConstraint('issuer_id'),
         {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['issuer_id']
@@ -45,14 +49,15 @@ class Issuer(db.Model, JSONOutputMixin):
     mrf_url = Column(String)
     data_contact_email = Column(String)
 
-class PlanFormulary(db.Model, JSONOutputMixin):
+class PlanFormulary(Base, JSONOutputMixin):
     __tablename__ = 'plan_formulary'
     __main_table__ = __tablename__
     __table_args__ = (
+        PrimaryKeyConstraint('plan_id', 'year', 'drug_tier', 'pharmacy_type'),
         {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['plan_id', 'year', 'drug_tier', 'pharmacy_type']
-    plan_id = Column(db.String(14), nullable=False)
+    plan_id = Column(String(14), nullable=False)
     year = Column(Integer)
     drug_tier = Column(String)
     mail_order = Column(Boolean)
@@ -63,15 +68,16 @@ class PlanFormulary(db.Model, JSONOutputMixin):
     coinsurance_opt = Column(String)
 
 
-class PlanIndividual(db.Model, JSONOutputMixin):
+class PlanIndividual(Base, JSONOutputMixin):
     __tablename__ = 'plan_individual'
     __main_table__ = __tablename__
     __table_args__ = (
+        PrimaryKeyConstraint('plan_id', 'year', 'drug_tier', 'pharmacy_type'),
         {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['plan_id', 'year', 'drug_tier', 'pharmacy_type']
     __my_additional_indexes__ = [{'index_elements': ('int_code',)}, {'index_elements': ('display_name',)}]
-    plan_id = Column(db.String(14), nullable=False)
+    plan_id = Column(String(14), nullable=False)
     year = Column(Integer)
     drug_tier = Column(String)
     mail_order = Column(Boolean)
@@ -82,15 +88,16 @@ class PlanIndividual(db.Model, JSONOutputMixin):
     coinsurance_opt = Column(String)
 
 
-class PlanFacility(db.Model, JSONOutputMixin):
+class PlanFacility(Base, JSONOutputMixin):
     __tablename__ = 'plan_facility'
     __main_table__ = __tablename__
     __table_args__ = (
+        PrimaryKeyConstraint('plan_id', 'year', 'drug_tier', 'pharmacy_type'),
         {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['plan_id', 'year', 'drug_tier', 'pharmacy_type']
     __my_additional_indexes__ = [{'index_elements': ('int_code',)}, {'index_elements': ('display_name',)}]
-    plan_id = Column(db.String(14), nullable=False)
+    plan_id = Column(String(14), nullable=False)
     year = Column(Integer)
     drug_tier = Column(String)
     mail_order = Column(Boolean)
@@ -100,14 +107,15 @@ class PlanFacility(db.Model, JSONOutputMixin):
     coinsurance_rate = Column(Float)
     coinsurance_opt = Column(String)
 
-class Plan(db.Model, JSONOutputMixin):
+class Plan(Base, JSONOutputMixin):
     __tablename__ = 'plan'
     __main_table__ = __tablename__
     __table_args__ = (
+        PrimaryKeyConstraint('plan_id', 'year'),
         {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['plan_id', 'year']
-    plan_id = Column(db.String(14), nullable=False)  # len == 14
+    plan_id = Column(String(14), nullable=False)  # len == 14
     year = Column(Integer)
     issuer_id = Column(Integer)
     state = Column(String(2))
@@ -122,10 +130,11 @@ class Plan(db.Model, JSONOutputMixin):
     last_updated_on = Column(TIMESTAMP)
     checksum = Column(Integer)
 
-class PlanAttributes(db.Model, JSONOutputMixin):
+class PlanAttributes(Base, JSONOutputMixin):
     __tablename__ = 'plan_attributes'
     __main_table__ = __tablename__
     __table_args__ = (
+        PrimaryKeyConstraint('full_plan_id', 'year', 'attr_name'),
         {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['full_plan_id', 'year', 'attr_name']
@@ -133,20 +142,21 @@ class PlanAttributes(db.Model, JSONOutputMixin):
         {'index_elements': ('full_plan_id gin_trgm_ops', 'year'),
             'using': 'gin',
             'name': 'find_all_variants'}]
-    full_plan_id = Column(db.String(17), nullable=False)
+    full_plan_id = Column(String(17), nullable=False)
     year = Column(Integer)
     attr_name = Column(String)
     attr_value = Column(String)
 
-class PlanBenefits(db.Model, JSONOutputMixin):
+class PlanBenefits(Base, JSONOutputMixin):
     __tablename__ = 'plan_benefits'
     __main_table__ = __tablename__
     __table_args__ = (
+        PrimaryKeyConstraint('full_plan_id', 'year', 'benefit_name'),
         {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['full_plan_id', 'year', 'benefit_name']
-    plan_id = Column(db.String(14), nullable=False)
-    full_plan_id = Column(db.String(17), nullable=False)
+    plan_id = Column(String(14), nullable=False)
+    full_plan_id = Column(String(17), nullable=False)
     year = Column(Integer)
     benefit_name = Column(String)
     copay_inn_tier1 = Column(String)
@@ -167,10 +177,11 @@ class PlanBenefits(db.Model, JSONOutputMixin):
     is_excl_from_oon_mo = Column(Boolean)
 
 
-class PlanRatingAreas(db.Model, JSONOutputMixin):
+class PlanRatingAreas(Base, JSONOutputMixin):
     __tablename__ = 'plan_rating_areas'
     __main_table__ = __tablename__
     __table_args__ = (
+        PrimaryKeyConstraint('county', 'zip3', 'state', 'market'),
         {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['county', 'zip3', 'state', 'market']
@@ -182,10 +193,11 @@ class PlanRatingAreas(db.Model, JSONOutputMixin):
     market = Column(String)
 
 
-class PlanPrices(db.Model, JSONOutputMixin):
+class PlanPrices(Base, JSONOutputMixin):
     __tablename__ = 'plan_prices'
     __main_table__ = __tablename__
     __table_args__ = (
+        PrimaryKeyConstraint('plan_id', 'year', 'checksum'),
         {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['plan_id', 'year', 'checksum', ]
@@ -194,7 +206,7 @@ class PlanPrices(db.Model, JSONOutputMixin):
             'using': 'gin',
             'name': 'find_plan'}]
 
-    plan_id = Column(db.String(14), nullable=False)
+    plan_id = Column(String(14), nullable=False)
     year = Column(Integer)
     state = Column(String(2))
     checksum = Column(Integer)
@@ -219,10 +231,11 @@ class PlanPrices(db.Model, JSONOutputMixin):
         Numeric(scale=2, precision=8, asdecimal=False, decimal_return_scale=None))
 
 
-class PlanTransparency(db.Model, JSONOutputMixin):
+class PlanTransparency(Base, JSONOutputMixin):
     __tablename__ = 'plan_transparency'
     __main_table__ = __tablename__
     __table_args__ = (
+        PrimaryKeyConstraint('plan_id', 'year'),
         {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['plan_id', 'year']
@@ -231,7 +244,7 @@ class PlanTransparency(db.Model, JSONOutputMixin):
     issuer_id = Column(Integer)
     new_issuer_to_exchange = Column(Boolean)
     sadp_only = Column(Boolean)
-    plan_id = Column(db.String(14), nullable=False)  # len == 14
+    plan_id = Column(String(14), nullable=False)  # len == 14
     year = Column(Integer)
     qhp_sadp = Column(String)
     plan_type = Column(String)
@@ -239,10 +252,11 @@ class PlanTransparency(db.Model, JSONOutputMixin):
     claims_payment_policies_url = Column(String)
 
 
-class PlanNPIRaw(db.Model, JSONOutputMixin):
+class PlanNPIRaw(Base, JSONOutputMixin):
     __tablename__ = 'plan_npi_raw'
     __main_table__ = __tablename__
     __table_args__ = (
+        PrimaryKeyConstraint('npi', 'checksum_network'),
         {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['npi', 'checksum_network']
@@ -271,10 +285,11 @@ class PlanNPIRaw(db.Model, JSONOutputMixin):
 
 
 
-class PlanNetworkTierRaw(db.Model, JSONOutputMixin):
+class PlanNetworkTierRaw(Base, JSONOutputMixin):
     __tablename__ = 'plan_networktier'
     __main_table__ = __tablename__
     __table_args__ = (
+        PrimaryKeyConstraint('plan_id', 'checksum_network'),
         {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['plan_id', 'checksum_network']
@@ -290,10 +305,11 @@ class PlanNetworkTierRaw(db.Model, JSONOutputMixin):
     checksum_network = Column(Integer)
 
 
-class NPIData(db.Model, JSONOutputMixin):
+class NPIData(Base, JSONOutputMixin):
     __tablename__ = 'npi'
     __main_table__ = __tablename__
     __table_args__ = (
+        PrimaryKeyConstraint('npi'),
         {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['npi']
@@ -352,10 +368,11 @@ class NPIData(db.Model, JSONOutputMixin):
     certification_date = Column(DATE)
     
 
-class NPIDataTaxonomy(db.Model, JSONOutputMixin):
+class NPIDataTaxonomy(Base, JSONOutputMixin):
     __tablename__ = 'npi_taxonomy'
     __main_table__ = __tablename__
     __table_args__ = (
+        PrimaryKeyConstraint('npi', 'checksum'),
         {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['npi', 'checksum']
@@ -368,10 +385,11 @@ class NPIDataTaxonomy(db.Model, JSONOutputMixin):
     provider_license_number_state_code = Column(String)
     healthcare_provider_primary_taxonomy_switch = Column(String)
 
-class NPIDataOtherIdentifier(db.Model, JSONOutputMixin):
+class NPIDataOtherIdentifier(Base, JSONOutputMixin):
     __tablename__ = 'npi_other_identifier'
     __main_table__ = __tablename__
     __table_args__ = (
+        PrimaryKeyConstraint('npi', 'checksum'),
         {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['npi', 'checksum']
@@ -383,10 +401,11 @@ class NPIDataOtherIdentifier(db.Model, JSONOutputMixin):
     other_provider_identifier_state = Column(String)
     other_provider_identifier_issuer = Column(String)
 
-class NPIDataTaxonomyGroup(db.Model, JSONOutputMixin):
+class NPIDataTaxonomyGroup(Base, JSONOutputMixin):
     __tablename__ = 'npi_taxonomy_group'
     __main_table__ = __tablename__
     __table_args__ = (
+        PrimaryKeyConstraint('npi', 'checksum'),
         {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['npi', 'checksum']
@@ -396,10 +415,11 @@ class NPIDataTaxonomyGroup(db.Model, JSONOutputMixin):
     healthcare_provider_taxonomy_group = Column(String)
 
 
-class NUCCTaxonomy(db.Model, JSONOutputMixin):
+class NUCCTaxonomy(Base, JSONOutputMixin):
     __tablename__ = 'nucc_taxonomy'
     __main_table__ = __tablename__
     __table_args__ = (
+        PrimaryKeyConstraint('code'),
         {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['code']
@@ -418,10 +438,12 @@ class NUCCTaxonomy(db.Model, JSONOutputMixin):
 
 
 
-class AddressPrototype(db.Model, JSONOutputMixin):
-    __table_args__ = (
-        {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
-    )
+class AddressPrototype(Base, JSONOutputMixin):
+    __abstract__ = True
+
+    @declared_attr
+    def __table_args__(cls):
+        return {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True}
 
     checksum = Column(Integer, primary_key=True)
     first_line = Column(String)

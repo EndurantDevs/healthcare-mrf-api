@@ -5,7 +5,7 @@ from sqlalchemy import engine_from_config
 from sqlalchemy import pool
 
 from alembic import context
-from db.models import db
+from db.sqlalchemy import db
 import os
 
 
@@ -23,7 +23,7 @@ fileConfig(config.config_file_name)
 # for 'autogenerate' support
 # from myapp import mymodel
 # target_metadata = mymodel.Base.metadata
-target_metadata = db
+target_metadata = db.metadata
 
 
 exclude_tables = [name.strip() for name in config.get_section('alembic:exclude', {}).get('tables', '').split(',')]

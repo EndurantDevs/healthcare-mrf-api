@@ -11,13 +11,12 @@ from db.connection import init_db, db
 from aioshutil import copyfile
 from sqlalchemy import Index, and_, inspect
 import ssl
-from gino.exceptions import GinoException
+from sqlalchemy.exc import SQLAlchemyError
 from asyncpg.exceptions import UniqueViolationError, InterfaceError, InvalidColumnReferenceError, CardinalityViolationError
 from aiofile import async_open
 from arq import Retry
 from fastcrc import crc32, crc16
 import humanize
-from sqlalchemy.dialects.postgresql import insert
 from random import choice
 import json
 from db.json_mixin import JSONOutputMixin
@@ -169,15 +168,15 @@ async def push_objects_slow(obj_list, cls):
     if obj_list:
         try:
             if hasattr(cls, "__my_index_elements__"):
-                await insert(cls).values(obj_list).on_conflict_do_nothing(index_elements=cls.__my_index_elements__)\
+                await db.insert(cls).values(obj_list).on_conflict_do_nothing(index_elements=cls.__my_index_elements__)\
                     .gino.model(cls).status()
             else:
                 await cls.insert().gino.all(obj_list)
-        except (GinoException, UniqueViolationError, InterfaceError):
+        except (SQLAlchemyError, UniqueViolationError, InterfaceError):
             for obj in obj_list:
                 try:
                     await cls.insert().gino.all([obj])
-                except (GinoException, UniqueViolationError) as e:
+                except (SQLAlchemyError, UniqueViolationError) as e:
                     print(e)
 
 class IterateList:
@@ -260,7 +259,7 @@ async def push_objects(obj_list, cls, rewrite=False):
                                     index_elements = cls.__my_initial_indexes__
                                 else:
                                     index_elements = [key.name for key in inspect(cls.__table__).primary_key]
-                                stmt = insert(cls)
+                                stmt = db.insert(cls)
                                 update_dict = {}
                                 
                                 
@@ -282,14 +281,14 @@ async def push_objects(obj_list, cls, rewrite=False):
                                     # print(await stmt.gino.status())
                             else:
                                 if hasattr(cls, "__my_index_elements__"):
-                                    x = insert(cls).values(obj_arr).on_conflict_do_nothing(
+                                    x = db.insert(cls).values(obj_arr).on_conflict_do_nothing(
                                         # constraint=inspect(cls.__table__).primary_key
                                         index_elements=cls.__my_index_elements__
                                     )
                                     #print(f"INSERTING: {x} for {cls.__tablename__}")
                                     await x.gino.model(cls).status()
                                 else:
-                                    await insert(cls).values(obj_arr).gino.model(cls).status()
+                                    await db.insert(cls).values(obj_arr).gino.model(cls).status()
                                     
                 except (UniqueViolationError, InvalidColumnReferenceError, CardinalityViolationError):
                     # Fallback to a slower, batch-based upsert.
@@ -300,7 +299,7 @@ async def push_objects(obj_list, cls, rewrite=False):
                             async with semaphore:
                                 try:
                                     if rewrite:
-                                        stmt = insert(cls).values(obj)
+                                        stmt = db.insert(cls).values(obj)
                                         update_dict = {
                                             c.name: obj[c.name]
                                             for c in cls.__table__.c
@@ -324,10 +323,10 @@ async def push_objects(obj_list, cls, rewrite=False):
                                             ).gino.status()
                                     else:
                                         if hasattr(cls, "__my_index_elements__"):
-                                            await insert(cls).values(obj).on_conflict_do_nothing(
+                                            await db.insert(cls).values(obj).on_conflict_do_nothing(
                                                 constraint=inspect(cls.__table__).primary_key).gino.model(cls).status()
                                         else:
-                                            await insert(cls).values(obj).gino.model(cls).status()
+                                            await db.insert(cls).values(obj).gino.model(cls).status()
 
                                 # except UniqueViolationError:
                                 #     if rewrite:
@@ -352,7 +351,7 @@ async def push_objects(obj_list, cls, rewrite=False):
                                 #                 #print(f"Resolving unique violation for {obj} via delete/insert for {where_clause}.")
                                 #                 x = await cls.delete.where(where_clause).gino.status()
                                 #                 print(f"Deleted {x} rows for {obj['npi']}.")
-                                #                 await insert(cls).values([obj]).on_conflict_do_update(
+                                #                 await db.insert(cls).values([obj]).on_conflict_do_update(
                                 #                         index_elements=inspect(cls.__table__).primary_key,
                                 #                         set_=obj
                                 #                     ).gino.model(cls).status()
@@ -363,7 +362,7 @@ async def push_objects(obj_list, cls, rewrite=False):
                                 #     else:
                                 #         # If not rewriting, a unique violation is expected to be skipped.
                                 #         pass
-                                except (GinoException, InterfaceError, UniqueViolationError) as e:
+                                except (SQLAlchemyError, InterfaceError, UniqueViolationError) as e:
                                     print(f"Failed to process object {obj}: {e}")
                                     # Continue with the next object in the chunk.
                                     pass
@@ -395,7 +394,7 @@ async def push_objects(obj_list, cls, rewrite=False):
             #         if rewrite:
             #             async with db.acquire() as conn:
             #                 for o in obj_list[i * rows_per_insert:rows_to]:
-            #                     stmt = insert(cls.__table__).values(o)
+            #                     stmt = db.insert(cls.__table__).values(o)
             #                     primary_keys = [key.name for key in inspect(cls.__table__).primary_key]
             #                     update_dict = {c.name: o[c.name] for c in stmt.excluded if (not c.primary_key and c.name in o)}
             #                     s = stmt.on_conflict_do_update(
@@ -412,7 +411,7 @@ async def push_objects(obj_list, cls, rewrite=False):
             #             #await cls.insert().gino.all(obj_list[i * rows_per_insert:rows_to])
             #         else:
             #             if hasattr(cls, "__my_index_elements__"):
-            #                 await insert(cls).values(obj_list[i * rows_per_insert:rows_to]).on_conflict_do_nothing(
+            #                 await db.insert(cls).values(obj_list[i * rows_per_insert:rows_to]).on_conflict_do_nothing(
             #                     index_elements=cls.__my_index_elements__).gino.model(cls).status()
             #             else:
             #                 async with db.acquire() as conn:
@@ -421,7 +420,7 @@ async def push_objects(obj_list, cls, rewrite=False):
             #                             s = cls.insert().values(o)
             #                             await s.gino.model(cls).status()
             #                     #await cls.insert().gino.all(obj_list[i*rows_per_insert:rows_to])
-            #     except (GinoException, UniqueViolationError, InterfaceError):
+            #     except (SQLAlchemyError, UniqueViolationError, InterfaceError):
             #         # print("So bad, It is here!")
             #         for obj in obj_list:
             #                 if rewrite:
@@ -441,7 +440,7 @@ async def push_objects(obj_list, cls, rewrite=False):
             #                             if ('index_elements' in index) and ('constraint' in index):
             #                                 # print('NO-NO!')
             #                                 # print((await cls.query.where(and_(*index_and_array)).gino.first()).to_json_dict())
-            #                                 await insert(cls).values([obj]).on_conflict_do_update(
+            #                                 await db.insert(cls).values([obj]).on_conflict_do_update(
             #                                     index_where=and_(*index_and_array),
             #                                     index_elements=index['index_elements'],
             #                                     #index['index_elements'],
@@ -451,12 +450,12 @@ async def push_objects(obj_list, cls, rewrite=False):
             #                                 # print((await cls.query.where(and_(*index_and_array)).gino.first()).to_json_dict())
             #                                 # print('YO-YO!')
             #                             else:
-            #                                 await insert(cls).values([obj]).on_conflict_do_update(
+            #                                 await db.insert(cls).values([obj]).on_conflict_do_update(
             #                                     index_elements=index['index_elements'],
             #                                     set_=obj
             #                                 ).gino.model(cls).status()
             #                             break
-            #                         except (GinoException, UniqueViolationError) as e:
+            #                         except (SQLAlchemyError, UniqueViolationError) as e:
             #                             if hasattr(cls, "__my_initial_indexes__") and 'constraint' in index:
             #                                 print(f"FAILED: {obj}, Index: {index}")
             #                             continue
