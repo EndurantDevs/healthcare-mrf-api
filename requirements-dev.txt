@@ -27,3 +27,8 @@ unicode-slugify
 sanic_ext
 geopandas
 Jinja2
+pytest
+pytest-asyncio
+pytest-cov
+pytest-mock
+sanic-testing

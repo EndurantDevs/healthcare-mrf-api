@@ -21,24 +21,23 @@ from db.models import db, Issuer, Plan, PlanNPIRaw, NPIData, NPIAddress, Address
 blueprint = Blueprint('npi', url_prefix='/npi', version=1)
 
 
-@blueprint.get('/')
-async def npi_index_status(request):
+async def _compute_npi_counts():
     async def get_npi_count():
-        """
-    The get_npi_count function returns the number of NPI records in the database.
-
-    :return: The number of records in the npidata table
-    :doc-author: Trelent
-    """
-    async with db.acquire():
+        async with db.acquire():
             return await db.func.count(NPIData.npi).gino.scalar()
 
     async def get_npi_address_count():
         async with db.acquire():
-            return await db.func.count(tuple_(NPIAddress.npi, NPIAddress.checksum, NPIAddress.type)).gino.scalar()
+            return await db.func.count(
+                tuple_(NPIAddress.npi, NPIAddress.checksum, NPIAddress.type)
+            ).gino.scalar()
+
+    return await asyncio.gather(get_npi_count(), get_npi_address_count())
 
 
-    npi_count, npi_address_count = await asyncio.gather(get_npi_count(), get_npi_address_count())
+@blueprint.get('/')
+async def npi_index_status(request):
+    npi_count, npi_address_count = await _compute_npi_counts()
     data = {
         'date': datetime.utcnow().isoformat(),
         'release': request.app.config.get('RELEASE'),
