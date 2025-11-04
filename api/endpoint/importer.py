@@ -8,25 +8,41 @@ from db.models import db, Issuer, Plan, ImportLog, ImportHistory
 blueprint = Blueprint('import', url_prefix='/import', version=1)
 
 
-@blueprint.get('/')
-async def last_import_stats(request):
-    states_data = {}
-    states_data['issuer_number'] = {}
-    states_data['plan_number'] = {}
+async def _collect_import_stats():
+    states_data = {"issuer_number": {}, "plan_number": {}}
 
     async with db.transaction():
-        states_data['issuer_number'] = dict(await db.select([Plan.state, db.func.count(db.func.distinct(Plan.issuer_id))]).group_by(Plan.state).gino.all())
-        states_data['plan_number'] = dict(await db.select([Plan.state, db.func.count(db.func.distinct(Plan.plan_id))]).group_by(Plan.state).gino.all())
+        states_data["issuer_number"] = dict(
+            await db.select(
+                [Plan.state, db.func.count(db.func.distinct(Plan.issuer_id))]
+            )
+            .group_by(Plan.state)
+            .gino.all()
+        )
+        states_data["plan_number"] = dict(
+            await db.select(
+                [Plan.state, db.func.count(db.func.distinct(Plan.plan_id))]
+            )
+            .group_by(Plan.state)
+            .gino.all()
+        )
 
-        data = {
-            'plans_count': await db.func.count(Plan.plan_id).gino.scalar(),
-            'import_log_errors': await db.func.count(ImportLog.checksum).gino.scalar(),
-            'import_date': await ImportHistory.select('when').order_by(ImportHistory.when.desc()).limit(1).gino.scalar(),
-            'issuers_number': await db.func.count(Issuer.issuer_id).gino.scalar(),
-            'issuers_by_state': states_data['issuer_number'],
-            'plans_by_state': states_data['plan_number'],
+        return {
+            "plans_count": await db.func.count(Plan.plan_id).gino.scalar(),
+            "import_log_errors": await db.func.count(ImportLog.checksum).gino.scalar(),
+            "import_date": await ImportHistory.select("when")
+            .order_by(ImportHistory.when.desc())
+            .limit(1)
+            .gino.scalar(),
+            "issuers_number": await db.func.count(Issuer.issuer_id).gino.scalar(),
+            "issuers_by_state": states_data["issuer_number"],
+            "plans_by_state": states_data["plan_number"],
         }
 
+
+@blueprint.get('/')
+async def last_import_stats(request):
+    data = await _collect_import_stats()
     return response.json(data, default=str)
 
 

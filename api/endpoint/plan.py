@@ -75,36 +75,76 @@ async def all_plans_variants(request):
     return response.json(data)
 
 
+async def _fetch_network_entry(checksum: int):
+    rows = await db.select([
+        PlanNetworkTierRaw.plan_id,
+        PlanNetworkTierRaw.year,
+        PlanNetworkTierRaw.checksum_network,
+        PlanNetworkTierRaw.network_tier,
+        Issuer.issuer_id,
+        Issuer.issuer_name,
+        Issuer.issuer_marketing_name,
+        Issuer.state,
+    ]).select_from(
+        PlanNetworkTierRaw.join(Issuer, Issuer.issuer_id == PlanNetworkTierRaw.issuer_id)
+    ).where(
+        PlanNetworkTierRaw.checksum_network == checksum
+    ).gino.all()
+
+    if not rows:
+        return None
+
+    plans = []
+    seen = set()
+    for plan_id, year, *_rest in rows:
+        key = (plan_id, year)
+        if key not in seen:
+            plans.append({"plan_id": plan_id, "year": year})
+            seen.add(key)
+
+    _, _, checksum_value, network_tier, issuer_id, issuer_name, issuer_marketing_name, issuer_state = rows[0]
+    issuer_marketing_name = issuer_marketing_name or ""
+    return {
+        "plans": plans,
+        "checksum": checksum_value,
+        "network_tier": network_tier.replace('-', ' ').replace('  ', ' '),
+        "issuer": issuer_id,
+        "issuer_name": issuer_name,
+        "issuer_marketing_name": issuer_marketing_name,
+        "issuer_display_name": issuer_marketing_name or issuer_name,
+        "issuer_state": issuer_state,
+    }
+
+
 @blueprint.get('/network/id/<checksum>')
 async def get_network_by_checksum(request, checksum):
-    data = await PlanNetworkTierRaw.query.where(PlanNetworkTierRaw.checksum_network == int(checksum)).gino.first()
-
-    data = await (db.select([db.func.array_agg(
-        db.func.distinct(PlanNetworkTierRaw.plan_id)), PlanNetworkTierRaw.checksum_network,
-        PlanNetworkTierRaw.network_tier, PlanNetworkTierRaw.issuer_id, Issuer.issuer_name,
-        Issuer.issuer_marketing_name, Issuer.state]).select_from(PlanNetworkTierRaw.join(Issuer, Issuer.issuer_id == PlanNetworkTierRaw.issuer_id))
-                  .where(
-        PlanNetworkTierRaw.checksum_network == int(checksum)).group_by(
-        PlanNetworkTierRaw.checksum_network, PlanNetworkTierRaw.network_tier, PlanNetworkTierRaw.issuer_id,
-        Issuer.issuer_name, Issuer.issuer_marketing_name, Issuer.state)
-                  .gino.all())
-
-
-    if not data:
+    entry = await _fetch_network_entry(int(checksum))
+    if entry is None:
         raise sanic.exceptions.NotFound
-    data = data[0]
-    res = {
-        'plans': data[0],
-        'checksum': data[1],
-        'network_tier': data[2],
-        'issuer': data[3],
-        'issuer_name': data[4],
-        'issuer_marketing_name': data[5],
-        'issuer_display_name': data[5] if data[5] else data[4],
-        'issuer_state': data[6]
-    }
-    res['network_tier'] = res['network_tier'].replace('-', ' ').replace('  ', ' ')
-    return response.json(res)
+    return response.json(entry)
+
+
+@blueprint.get('/network/multiple/<checksums>')
+async def get_networks_by_checksums(request, checksums):
+    values = [value.strip() for value in checksums.split(',') if value.strip()]
+    payload = []
+    seen_checksums = set()
+    for value in values:
+        try:
+            checksum = int(value)
+        except ValueError:
+            continue
+        if checksum in seen_checksums:
+            continue
+        seen_checksums.add(checksum)
+        entry = await _fetch_network_entry(checksum)
+        if entry:
+            payload.append(entry)
+
+    if not payload:
+        raise sanic.exceptions.NotFound
+
+    return response.json(payload)
 
 
 @blueprint.get('/network/autocomplete')
