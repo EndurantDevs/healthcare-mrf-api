@@ -25,6 +25,8 @@ HTTP_CHUNK_SIZE = 1024 * 1024
 headers = {'user-agent': 'Mozilla/5.0 (compatible; Healthporta Healthcare MRF API Importer/1.1; +https://github.com/EndurantDevs/healthcare-mrf-api)'}
 timeout = aiohttp.ClientTimeout(total=60.0)
 
+_DYNAMIC_CLASS_CACHE = {}
+
 async def get_http_client():
     client = None
     if os.environ.get('HLTHPRT_SOCKS_PROXY1'):
@@ -108,22 +110,46 @@ async def download_it_and_save(url, filepath, chunk_size=None, context=None, log
             await copyfile(filepath, file_with_dir)
 
 
-def make_class(Base, table_suffix):
-    temp = None
-    if hasattr(Base, '__table__'):
-        try:
-            temp = Base.__table__
-            delattr(Base, '__table__')
-        except AttributeError:
-            pass
+def make_class(model_cls, table_suffix):
+    table_suffix = str(table_suffix)
+    cache_key = (model_cls, table_suffix)
+    if cache_key in _DYNAMIC_CLASS_CACHE:
+        return _DYNAMIC_CLASS_CACHE[cache_key]
 
-    class MyClass(Base):
-        __tablename__ = '_'.join([Base.__tablename__, table_suffix])
+    new_table_name = "_".join([model_cls.__tablename__, table_suffix])
+    metadata = model_cls.metadata
 
-    if temp is not None:
-        Base.__table__ = temp
+    if new_table_name in metadata.tables:
+        new_table = metadata.tables[new_table_name]
+    else:
+        new_table = model_cls.__table__.tometadata(metadata, name=new_table_name)
 
-    return MyClass
+    mapper_args = dict(getattr(model_cls, "__mapper_args__", {}))
+    mapper_args["concrete"] = True
+
+    attrs = {
+        "__tablename__": new_table_name,
+        "__table__": new_table,
+        "__mapper_args__": mapper_args,
+        "__module__": model_cls.__module__,
+    }
+
+    for attr_name in (
+        "__my_index_elements__",
+        "__my_additional_indexes__",
+        "__main_table__",
+    ):
+        if hasattr(model_cls, attr_name):
+            attrs[attr_name] = getattr(model_cls, attr_name)
+
+    bases = tuple(base for base in model_cls.__bases__ if base is not object)
+    if not bases:
+        bases = (model_cls,)
+
+    dynamic_name = f"{model_cls.__name__}_{table_suffix}"
+    dynamic_cls = type(dynamic_name, bases, attrs)
+    _DYNAMIC_CLASS_CACHE[cache_key] = dynamic_cls
+    return dynamic_cls
 
 err_obj_list = []
 err_obj_key = {}
@@ -168,14 +194,21 @@ async def push_objects_slow(obj_list, cls):
     if obj_list:
         try:
             if hasattr(cls, "__my_index_elements__"):
-                await db.insert(cls).values(obj_list).on_conflict_do_nothing(index_elements=cls.__my_index_elements__)\
-                    .gino.model(cls).status()
+                stmt = (
+                    db.insert(cls)
+                    .values(obj_list)
+                    .on_conflict_do_nothing(index_elements=cls.__my_index_elements__)
+                )
+                await stmt.status()
             else:
-                await cls.insert().gino.all(obj_list)
+                await db.insert(cls).values(obj_list).status()
         except (SQLAlchemyError, UniqueViolationError, InterfaceError):
             for obj in obj_list:
                 try:
-                    await cls.insert().gino.all([obj])
+                    stmt = db.insert(cls).values(obj)
+                    if hasattr(cls, "__my_index_elements__"):
+                        stmt = stmt.on_conflict_do_nothing(index_elements=cls.__my_index_elements__)
+                    await stmt.status()
                 except (SQLAlchemyError, UniqueViolationError) as e:
                     print(e)
 
@@ -226,282 +259,70 @@ async def push_objects(obj_list, cls, rewrite=False):
         try:
             #raise UniqueViolationError
             async with db.acquire() as conn:
-                await conn.raw_connection.copy_records_to_table(cls.__tablename__,
-                                                                schema_name=cls.__table_args__[0]['schema'],
-                                                                columns=obj_list[0].keys(), records=IterateList(obj_list, obj_list[0].keys()))
+                raw_conn = conn.raw_connection
+                driver_conn = getattr(raw_conn, "driver_connection", raw_conn)
+                copy_method = getattr(driver_conn, "copy_records_to_table", None)
+                if copy_method is None:
+                    raise NotImplementedError("Active database driver does not expose copy_records_to_table")
+                schema_name = getattr(cls.__table__, "schema", None)
+                if schema_name is None:
+                    table_args = getattr(cls, "__table_args__", None)
+                    if isinstance(table_args, dict):
+                        schema_name = table_args.get("schema")
+                    elif isinstance(table_args, (tuple, list)):
+                        for arg in table_args:
+                            if isinstance(arg, dict) and "schema" in arg:
+                                schema_name = arg["schema"]
+                                break
+
+                await copy_method(
+                    cls.__tablename__,
+                    schema_name=schema_name,
+                    columns=list(obj_list[0].keys()),
+                    records=IterateList(obj_list, obj_list[0].keys()),
+                )
             # print("All good!")
         except ValueError as exc:
             print(f"INPUT arr: {obj_list}")
             print(exc)
-        except UniqueViolationError:
+        except (UniqueViolationError, NotImplementedError):
 
-            rows_per_insert = 100
-            
-            
-            # def deduplicate_dicts(dict_list, key_fields):
-            #     seen = {}
-            #     for idx, d in enumerate(dict_list):
-            #         key = tuple(d.get(k) for k in key_fields)
-            #         checksum = return_checksum(list(key))
-            #         seen[checksum] = idx  # always keep the last occurrence
+            def _conflict_targets():
+                if hasattr(cls, "__my_initial_indexes__") and cls.__my_initial_indexes__:
+                    for index in cls.__my_initial_indexes__:
+                        elements = index.get("index_elements")
+                        if elements:
+                            return elements
+                primary_keys = [key.name for key in inspect(cls.__table__).primary_key]
+                return primary_keys or None
 
-            #     # Only keep dicts whose index is in the set of last occurrences
-            #     result = [dict_list[i] for i in sorted(seen.values())]
-            #     return result
-            # Process each object in the chunk individually for robust error handling.
-            async def upsert_array_worker(obj_arr, semaphore):
-                if not obj_arr:
-                    return
-                try:
-                    async with semaphore:
-                            if rewrite:
-                                if hasattr(cls, "__my_initial_indexes__"):
-                                    index_elements = cls.__my_initial_indexes__
-                                else:
-                                    index_elements = [key.name for key in inspect(cls.__table__).primary_key]
-                                stmt = db.insert(cls)
-                                update_dict = {}
-                                
-                                
-                                for i in obj_arr:
-                                    update_dict = {
-                                        c.name: i[c.name]
-                                        for c in cls.__table__.c
-                                        if not c.primary_key and c.name in i
-                                    }
-                                    print(f"UPDATING: {update_dict} for {cls.__tablename__}")
-                                    await stmt.values([update_dict,]).on_conflict_do_update(
-                                        # constraint=inspect(cls.__table__).primary_key,
-                                        index_elements=index_elements,
-                                        set_=update_dict
-                                    ).gino.status()
-                                    
-                                    # print(f"Primary keys: {index_elements} for {cls.__tablename__} via {inspect(cls.__table__).primary_key}")
-                                    # print(stmt)
-                                    # print(await stmt.gino.status())
-                            else:
-                                if hasattr(cls, "__my_index_elements__"):
-                                    x = db.insert(cls).values(obj_arr).on_conflict_do_nothing(
-                                        # constraint=inspect(cls.__table__).primary_key
-                                        index_elements=cls.__my_index_elements__
-                                    )
-                                    #print(f"INSERTING: {x} for {cls.__tablename__}")
-                                    await x.gino.model(cls).status()
-                                else:
-                                    await db.insert(cls).values(obj_arr).gino.model(cls).status()
-                                    
-                except (UniqueViolationError, InvalidColumnReferenceError, CardinalityViolationError):
-                    # Fallback to a slower, batch-based upsert.
-                    for i in range(0, len(obj_list), rows_per_insert):
-                        chunk = obj_list[i:i + rows_per_insert]
-                        # Process each object in the chunk individually for robust error handling.
-                        async def upsert_worker(obj, semaphore):
-                            async with semaphore:
-                                try:
-                                    if rewrite:
-                                        stmt = db.insert(cls).values(obj)
-                                        update_dict = {
-                                            c.name: obj[c.name]
-                                            for c in cls.__table__.c
-                                            if not c.primary_key and c.name in obj
-                                        }
-                                        if hasattr(cls, "__my_initial_indexes__"):
-                                            for i in (cls.__my_initial_indexes__):
-                                                index_elements = i.get("index_elements", [])
-                                                if all(key in obj for key in index_elements):
-                                                    where_clause = and_(*(getattr(cls, key) == obj[key] for key in index_elements))
-                                                    await cls.delete.where(where_clause).gino.status()
-                                                    stmt = stmt.on_conflict_do_update(
-                                                        index_elements=i.get("index_elements", []),
-                                                        set_=update_dict
-                                                    )
-                                                    await stmt.gino.status()
-                                        else:
-                                            await stmt.on_conflict_do_update(
-                                                constraint=inspect(cls.__table__).primary_key,
-                                                set_=update_dict
-                                            ).gino.status()
-                                    else:
-                                        if hasattr(cls, "__my_index_elements__"):
-                                            await db.insert(cls).values(obj).on_conflict_do_nothing(
-                                                constraint=inspect(cls.__table__).primary_key).gino.model(cls).status()
-                                        else:
-                                            await db.insert(cls).values(obj).gino.model(cls).status()
-
-                                # except UniqueViolationError:
-                                #     if rewrite:
-                                #         try:
-                                #             # Fallback for rewrite=True: delete the conflicting row and insert again.
-                                #             primary_keys = [key.name for key in inspect(cls.__table__).primary_key]
-                                #             # If __my_index_elements__ exists, build an OR clause for those as well
-                                #             where_clauses = []
-                                #             if all(key in obj for key in primary_keys):
-                                #                 where_clauses.append(and_(*(getattr(cls, key) == obj[key] for key in primary_keys)))
-                                #             if hasattr(cls, "__my_initial_indexes__"):
-                                #                 for i in (cls.__my_initial_indexes__):
-                                #                     index_elements = i.get("index_elements", [])
-                                #                     if all(key in obj for key in index_elements):
-                                #                         where_clauses.append(and_(*(getattr(cls, key) == obj[key] for key in index_elements)))
-                                #             if where_clauses:
-                                #                 where_clause = where_clauses[0]
-                                #                 if len(where_clauses) > 1:
-                                #                     where_clause = or_(*where_clauses)
-                                #                 # print(f"Resolving unique violation for {obj} via delete/insert for {where_clause}.")
-                                #                 # Delete the conflicting row(s) first.
-                                #                 #print(f"Resolving unique violation for {obj} via delete/insert for {where_clause}.")
-                                #                 x = await cls.delete.where(where_clause).gino.status()
-                                #                 print(f"Deleted {x} rows for {obj['npi']}.")
-                                #                 await db.insert(cls).values([obj]).on_conflict_do_update(
-                                #                         index_elements=inspect(cls.__table__).primary_key,
-                                #                         set_=obj
-                                #                     ).gino.model(cls).status()
-                                #             else:
-                                #                 print(f"Cannot resolve unique violation for {obj} via delete: PK or index missing.")
-                                #         except Exception as e:
-                                #             print(f"Failed to resolve unique violation for {obj} via delete/insert: {e}")
-                                #     else:
-                                #         # If not rewriting, a unique violation is expected to be skipped.
-                                #         pass
-                                except (SQLAlchemyError, InterfaceError, UniqueViolationError) as e:
-                                    print(f"Failed to process object {obj}: {e}")
-                                    # Continue with the next object in the chunk.
-                                    pass
-
-                        # Limit concurrency to 100 tasks.
-                        semaphore = asyncio.Semaphore(200)
-                        tasks = [upsert_worker(obj, semaphore) for obj in chunk]
-                        await asyncio.gather(*tasks)
+            if rewrite:
+                targets = _conflict_targets()
+                for obj in obj_list:
+                    update_dict = {
+                        c.name: obj[c.name]
+                        for c in cls.__table__.c
+                        if not c.primary_key and c.name in obj
+                    }
+                    stmt = db.insert(cls.__table__).values(obj)
+                    if targets:
+                        stmt = stmt.on_conflict_do_update(
+                            index_elements=targets,
+                            set_=update_dict,
+                        )
+                    else:
+                        stmt = stmt.on_conflict_do_update(
+                            constraint=inspect(cls.__table__).primary_key,
+                            set_=update_dict,
+                        )
+                    await stmt.status()
+            else:
+                stmt = db.insert(cls.__table__).values(obj_list)
+                if hasattr(cls, "__my_index_elements__"):
+                    stmt = stmt.on_conflict_do_nothing(index_elements=cls.__my_index_elements__)
+                await stmt.status()
 
                 
-            semaphore = asyncio.Semaphore(100)
-            tasks = [upsert_array_worker(obj_list[i:i + rows_per_insert], semaphore) for i in range(0, len(obj_list), rows_per_insert)]
-            await asyncio.gather(*tasks)
-            
-            
-            
-            
-            
-            # # print("It is here!")
-            # rows_per_insert = 200
-            # obj_length = len(obj_list)
-            # insert_number = int (obj_length / rows_per_insert)
-            # #fix this - rewrite the slow part!!
-            # for i in range(0, insert_number+1):
-            #     rows_to = (i+1)*rows_per_insert
-            #     if rows_to > obj_length:
-            #         rows_to = obj_length
-            #     try:
-            #         if rewrite:
-            #             async with db.acquire() as conn:
-            #                 for o in obj_list[i * rows_per_insert:rows_to]:
-            #                     stmt = db.insert(cls.__table__).values(o)
-            #                     primary_keys = [key.name for key in inspect(cls.__table__).primary_key]
-            #                     update_dict = {c.name: o[c.name] for c in stmt.excluded if (not c.primary_key and c.name in o)}
-            #                     s = stmt.on_conflict_do_update(
-            #                         index_elements= primary_keys,
-            #                         set_=update_dict)
-            #                     await s.gino.model(cls).status()
-            #                     #await conn.raw_connection.execute(s.compile())
-
-            #             # async with db.acquire() as conn:
-            #             #     for o in obj_list[i * rows_per_insert:rows_to]:
-            #             #         async with conn.transaction():
-            #             #             await conn.execute(cls.insert().values(o))
-
-            #             #await cls.insert().gino.all(obj_list[i * rows_per_insert:rows_to])
-            #         else:
-            #             if hasattr(cls, "__my_index_elements__"):
-            #                 await db.insert(cls).values(obj_list[i * rows_per_insert:rows_to]).on_conflict_do_nothing(
-            #                     index_elements=cls.__my_index_elements__).gino.model(cls).status()
-            #             else:
-            #                 async with db.acquire() as conn:
-            #                     for o in obj_list[i * rows_per_insert:rows_to]:
-            #                         async with conn.transaction():
-            #                             s = cls.insert().values(o)
-            #                             await s.gino.model(cls).status()
-            #                     #await cls.insert().gino.all(obj_list[i*rows_per_insert:rows_to])
-            #     except (SQLAlchemyError, UniqueViolationError, InterfaceError):
-            #         # print("So bad, It is here!")
-            #         for obj in obj_list:
-            #                 if rewrite:
-            #                     # print(f"UPDATING: {obj}")
-            #                     index_array = [{'index_elements': cls.__my_index_elements__},]
-            #                     if hasattr(cls, "__my_initial_indexes__"):
-            #                         for index in (cls.__my_initial_indexes__):
-            #                             index_name = index.get("name", "_".join(index.get("index_elements")))
-            #                             index_array.append({'constraint': f'{cls.__tablename__}_idx_{index_name}',
-            #                                             'index_elements': index.get("index_elements")})
-
-            #                     for index in (index_array):
-            #                         index_and_array = []
-            #                         for i in index.get("index_elements"):
-            #                             index_and_array.append(and_(getattr(cls, i) == obj[i]))
-            #                         try:
-            #                             if ('index_elements' in index) and ('constraint' in index):
-            #                                 # print('NO-NO!')
-            #                                 # print((await cls.query.where(and_(*index_and_array)).gino.first()).to_json_dict())
-            #                                 await db.insert(cls).values([obj]).on_conflict_do_update(
-            #                                     index_where=and_(*index_and_array),
-            #                                     index_elements=index['index_elements'],
-            #                                     #index['index_elements'],
-            #                                     #constraint=index['constraint'],
-            #                                     set_=obj
-            #                                 ).gino.model(cls).status()
-            #                                 # print((await cls.query.where(and_(*index_and_array)).gino.first()).to_json_dict())
-            #                                 # print('YO-YO!')
-            #                             else:
-            #                                 await db.insert(cls).values([obj]).on_conflict_do_update(
-            #                                     index_elements=index['index_elements'],
-            #                                     set_=obj
-            #                                 ).gino.model(cls).status()
-            #                             break
-            #                         except (SQLAlchemyError, UniqueViolationError) as e:
-            #                             if hasattr(cls, "__my_initial_indexes__") and 'constraint' in index:
-            #                                 print(f"FAILED: {obj}, Index: {index}")
-            #                             continue
-            #                         except (InvalidColumnReferenceError, InterfaceError) as e:
-            #                             try:
-            #                                 async with db.acquire() as conn:
-            #                                     async with conn.transaction():
-            #                                         del_q = cls.delete
-            #                                         for i in index.get("index_elements"):
-            #                                             del_q = del_q.where(getattr(cls, i) == obj[i])
-            #                                         # print(del_q)
-            #                                         # print((await cls.query.where(and_(*index_and_array)).gino.first()).to_json_dict())
-            #                                         await del_q.gino.status()
-                                                
-    
-            #                                     # Run up to 100 tasks in parallel for inserting objects
-            #                                 semaphore = asyncio.Semaphore(100)
-            #                                 async def insert_obj(o):
-            #                                     async with semaphore:
-            #                                         try:
-            #                                             async with db.acquire() as conn:
-            #                                                 async with conn.transaction():
-            #                                                     print(f"Inserting: {o}")
-            #                                                     s = cls.insert().values(o)
-            #                                                     await s.gino.model(cls).status()
-            #                                         except Exception as e:
-            #                                             print(f"Rewrite error: {e}")
-            #                                             pass
-
-            #                                 await asyncio.gather(*(insert_obj(list(obj_item.values())) for obj_item in obj))
-            #                                         # print((await cls.query.where(and_(*index_and_array)).gino.first()).to_json_dict())
-            #                             except Exception as e:
-            #                                 print(f"Final Rewrite error: {e}")
-            #                                 pass
-            #                                 #print(e)
-            #                 else:
-            #                     try:
-            #                         async with db.acquire() as conn:
-            #                             for o in obj:
-            #                                 async with conn.transaction():
-            #                                     s = cls.insert().values(o)
-            #                                     await s.gino.model(cls).status()
-            #                         #await cls.insert().gino.all([obj])
-            #                     except Exception as e:
-            #                         #print(e)
-            #                         pass
 import logging
 from sqlalchemy import or_
 def print_time_info(start):

@@ -5,7 +5,7 @@ import random
 from datetime import datetime
 from process.ext.utils import download_it
 import urllib.parse
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, update
 from sqlalchemy.sql import func, tuple_, text, literal_column, distinct
 
 import sanic.exceptions
@@ -22,14 +22,11 @@ blueprint = Blueprint('npi', url_prefix='/npi', version=1)
 
 async def _compute_npi_counts():
     async def get_npi_count():
-        async with db.acquire():
-            return await db.func.count(NPIData.npi).gino.scalar()
+        return await db.scalar(select(func.count(NPIData.npi)))
 
     async def get_npi_address_count():
-        async with db.acquire():
-            return await db.func.count(
-                tuple_(NPIAddress.npi, NPIAddress.checksum, NPIAddress.type)
-            ).gino.scalar()
+        return await db.scalar(
+            select(func.count(tuple_(NPIAddress.npi, NPIAddress.checksum, NPIAddress.type))))
 
     return await asyncio.gather(get_npi_count(), get_npi_address_count())
 
@@ -540,16 +537,18 @@ async def get_full_taxonomy_list(request, npi):
     #     [Plan.marketing_name, Plan.plan_id, PlanAttributes.full_plan_id, Plan.year]).select_from(
     #     Plan.join(PlanAttributes, ((Plan.plan_id == func.substr(PlanAttributes.full_plan_id, 1, 14)) & (
     #                 Plan.year == PlanAttributes.year)))). \
-    #     group_by(PlanAttributes.full_plan_id, Plan.plan_id, Plan.marketing_name, Plan.year).gino.all()
+    #     group_by(PlanAttributes.full_plan_id, Plan.plan_id, Plan.marketing_name, Plan.year).all()
     data = []
-    async with db.acquire() as conn:
-        for x in await db.select(
-            NPIDataTaxonomy.__table__,
-            NUCCTaxonomy.__table__,
-        ).where(NPIDataTaxonomy.npi == npi).where(
-            NUCCTaxonomy.code == NPIDataTaxonomy.healthcare_provider_taxonomy_code
-        ).gino.all():
-            t.append(x.to_json_dict())
+    stmt = (
+        select(NPIDataTaxonomy, NUCCTaxonomy)
+        .where(NPIDataTaxonomy.npi == npi)
+        .where(NUCCTaxonomy.code == NPIDataTaxonomy.healthcare_provider_taxonomy_code)
+    )
+    result = await db.execute(stmt)
+    for taxonomy, nucc in result.all():
+        payload = taxonomy.to_json_dict()
+        payload["nucc_taxonomy"] = nucc.to_json_dict()
+        t.append(payload)
     return response.json(t)
 
 
@@ -563,19 +562,22 @@ async def get_plans_by_npi(request, npi):
 
     # async def get_plans_list(plan_arr):
     #     t = {}
-    #     q = Plan.query.where(Plan.plan_id == db.func.any(plan_arr)).where(Plan.year == int(2023)).gino
+    #     q = Plan.query.where(Plan.plan_id == db.func.any(plan_arr)).where(Plan.year == int(2023))
     #     async with db.acquire() as conn:
     #         for x in await q.all():
     #             t[x.plan_id] = x.to_json_dict()
     #     return t
 
-    q = db.select(PlanNPIRaw, Issuer).where(Issuer.issuer_id == PlanNPIRaw.issuer_id).where(
-        PlanNPIRaw.npi == npi).order_by(PlanNPIRaw.issuer_id.desc()).gino.load((PlanNPIRaw, Issuer))
+    query = db.select(PlanNPIRaw, Issuer).where(
+        Issuer.issuer_id == PlanNPIRaw.issuer_id
+    ).where(
+        PlanNPIRaw.npi == npi
+    ).order_by(
+        PlanNPIRaw.issuer_id.desc()
+    )
 
-    async with db.acquire() as conn:
-        async with conn.transaction():
-            async for x in q.iterate():
-                data.append({'npi_info': x[0].to_json_dict(), 'issuer_info': x[1].to_json_dict()})
+    async for plan_raw, issuer in query.iterate():
+        data.append({'npi_info': plan_raw.to_json_dict(), 'issuer_info': issuer.to_json_dict()})
 
 
     return response.json({'npi_data': data, 'plan_data': plan_data, 'issuer_data': issuer_data})
@@ -585,34 +587,42 @@ async def get_plans_by_npi(request, npi):
 async def get_npi(request, npi):
     force_address_update = request.args.get('force_address_update', 0)
     async def update_addr_coordinates(checksum, long, lat, formatted_address, place_id):
-        async with db.acquire() as conn:
-            async with conn.transaction() as tx:
-                await NPIAddress.update.values(long=long,
-                                               lat=lat,
-                                               formatted_address=formatted_address,
-                                               place_id=place_id)\
-                    .where(NPIAddress.checksum == checksum).gino.status()
-                temp = AddressArchive.__table__.columns
-                x = await NPIAddress.query.where(NPIAddress.checksum == checksum).gino.first()
-                obj = {}
-                t = x.to_dict()
-                for c in temp:
-                    obj[c.key] = t[c.key]
+        await (
+            db.update(NPIAddress)
+            .where(NPIAddress.checksum == checksum)
+            .values(
+                long=long,
+                lat=lat,
+                formatted_address=formatted_address,
+                place_id=place_id,
+            )
+            .status()
+        )
+        row = await db.scalar(select(NPIAddress).where(NPIAddress.checksum == checksum))
+        if row is None:
+            return
+        obj = {
+            column.key: getattr(row, column.key, None)
+            for column in AddressArchive.__table__.columns
+        }
 
         # long = long,
         # lat = lat,
         # formatted_address = formatted_address,
         # place_id = place_id
         #         del obj['checksum']
-                # await AddressArchive.update.values(obj) \
-                #     .where(AddressArchive.checksum == checksum).gino.status()
-                try:
-                    await db.insert(AddressArchive).values([obj]).on_conflict_do_update(
-                        index_elements=AddressArchive.__my_index_elements__,
-                        set_=obj
-                    ).gino.model(AddressArchive).status()
-                except Exception as e:
-                    print(f"exception: {e}")
+        try:
+            await (
+                db.insert(AddressArchive)
+                .values(obj)
+                .on_conflict_do_update(
+                    index_elements=AddressArchive.__my_index_elements__,
+                    set_=obj,
+                )
+                .status()
+            )
+        except Exception as e:
+            print(f"exception: {e}")
 
 
     async def _update_address(x):
@@ -671,15 +681,14 @@ async def get_npi(request, npi):
                 update_geo = True
 
             if (not d['lat']) and (not force_address_update):
-                try:
-                    res = await AddressArchive.query.where(AddressArchive.checksum == x.checksum).gino.first()
-                    if res:
-                        d['long'] = res.long
-                        d['lat'] = res.lat
-                        d['formatted_address'] = res.formatted_address
-                        d['place_id'] = res.place_id
-                except:
-                    pass
+                res = await db.scalar(
+                    select(AddressArchive).where(AddressArchive.checksum == x['checksum'])
+                )
+                if res:
+                    d['long'] = res.long
+                    d['lat'] = res.lat
+                    d['formatted_address'] = res.formatted_address
+                    d['place_id'] = res.place_id
 
             if not d['lat']:
                 try:
@@ -741,34 +750,35 @@ async def get_npi(request, npi):
     #             ]).select_from(
     #             select(npi_agg)NPIData,
     #         join(NPIDataTaxonomy, NPIData.npi == NPIDataTaxonomy.npi)).where(NPIData.npi == npi).group_by(
-    #             NPIData.npi).gino.first()
+    #             NPIData.npi).first()
     #
     #         print(r)
     #        # t = conn.db.session.query(NPIData, NPIDataTaxonomy).join(NPIDataTaxonomy, NPIData.npi == NPIDataTaxonomy.npi)
     #
     #         # t = NPIData.query
     #         #t  t.join(NPIDataTaxonomy, NPIData.npi == NPIDataTaxonomy.npi)
-    #         #t = await t.where(NPIData.npi == npi).gino.first()
+    #         #t = await t.where(NPIData.npi == npi).first()
     #     return ''
     #     #t.to_json_dict()
 
     async def get_npi_data(npi):
-        async with db.acquire():
-            t = await NPIData.query.where(NPIData.npi == npi).gino.first()
-        return t.to_json_dict()
+        t = await db.scalar(select(NPIData).where(NPIData.npi == npi))
+        return t.to_json_dict() if t else {}
     
     async def get_taxonomy_list(npi):
         t = []
-        async with db.acquire():
-            for x in await NPIDataTaxonomy.query.where(NPIDataTaxonomy.npi == npi).gino.all():
-                t.append(x.to_json_dict())
+        result = await db.execute(select(NPIDataTaxonomy).where(NPIDataTaxonomy.npi == npi))
+        for item in result.scalars():
+            t.append(item.to_json_dict())
         return t
 
     async def get_taxonomy_group_list(npi):
         t = []
-        async with db.acquire():
-            for x in await NPIDataTaxonomyGroup.query.where(NPIDataTaxonomyGroup.npi == npi).gino.all():
-                t.append(x.to_json_dict())
+        result = await db.execute(
+            select(NPIDataTaxonomyGroup).where(NPIDataTaxonomyGroup.npi == npi)
+        )
+        for item in result.scalars():
+            t.append(item.to_json_dict())
         return t
 
 
@@ -777,9 +787,8 @@ async def get_npi(request, npi):
         g = NPIAddress.query.where(
             (NPIAddress.npi == npi) & or_(NPIAddress.type == 'primary', NPIAddress.type == 'secondary')).order_by(
             NPIAddress.type)
-        async with db.acquire():
-            for x in await g.gino.all():
-                t.append(x.to_json_dict())
+        for item in await g.all():
+            t.append(item.to_json_dict())
         return t
 
     async def test_combined(npi):
@@ -826,7 +835,7 @@ async def get_npi(request, npi):
                 .outerjoin(address_subquery, npi_data_table.c.npi == address_subquery.c.npi)
             ).where(npi_data_table.c.npi == npi).group_by(npi_data_table.c.npi)
 
-            r = await query.gino.all()
+            r = await query.all()
             if not r:
                 return {}
             r = r[0]

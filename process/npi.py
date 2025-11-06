@@ -14,6 +14,7 @@ from arq.connections import RedisSettings
 from pathlib import Path, PurePath
 from aiocsv import AsyncDictReader, AsyncReader
 from asyncpg import DuplicateTableError
+from sqlalchemy import select, func
 import csv
 
 
@@ -167,7 +168,11 @@ async def process_npi_chunk(ctx, task):
 
 
 
-async def process_data(ctx):
+async def process_data(ctx):  # pragma: no cover
+    # Track whether any work actually ran so shutdown can distinguish "no jobs" from a bad import
+    ctx.setdefault('context', {})
+    ctx['context']['run'] = ctx['context'].get('run', 0) + 1
+
     import_date = ctx['import_date']
     redis = ctx['redis']
     print(os.environ['HLTHPRT_NPPES_DOWNLOAD_URL_DIR'] + os.environ['HLTHPRT_NPPES_DOWNLOAD_URL_FILE'])
@@ -176,7 +181,7 @@ async def process_data(ctx):
     # re./NPPES_Data_Dissemination_110722_111322_Weekly.zip">NPPES Data Dissemination - Weekly Update -
     # 110722_111322</a>
     count_files = 0
-    SQL_CHUNK_SIZE = 99999
+    SQL_CHUNK_SIZE = 299999
     for p in re.findall(r'(NPPES_Data_Dissemination.*_V2.zip)', html_source):
         count_files = count_files + 1
         current_sql_chunk_size = SQL_CHUNK_SIZE
@@ -228,10 +233,10 @@ async def process_data(ctx):
                     npi_column = getattr(table, 'npi')
                     for i in range(0, len(npi_list), chunk_size):
                         chunk = npi_list[i:i + chunk_size]
-                        s = table.delete.where(npi_column.in_(chunk))
+                        delete_stmt = db.delete(table.__table__).where(npi_column.in_(chunk))
                         if cls is NPIAddress:
-                            s = s.where((table.type == 'primary') | (table.type == 'mail'))
-                        await s.gino.status()
+                            delete_stmt = delete_stmt.where((table.type == 'primary') | (table.type == 'mail'))
+                        await delete_stmt.status()
                 print(f"Cleaned up models for {len(npi_set)} NPIs due to multiple files.")
                 
                 npi_set.clear()
@@ -248,10 +253,10 @@ async def process_data(ctx):
                     npi_column = getattr(table, 'npi')
                     for i in range(0, len(npi_list), chunk_size):
                         chunk = npi_list[i:i + chunk_size] 
-                        s = table.delete.where(npi_column.in_(chunk))
+                        delete_stmt = db.delete(table.__table__).where(npi_column.in_(chunk))
                         if cls is NPIAddress:
-                            s = s.where(table.type == 'secondary')
-                        await s.gino.status()
+                            delete_stmt = delete_stmt.where(table.type == 'secondary')
+                        await delete_stmt.status()
                         
                 npi_set.clear()
                         
@@ -267,8 +272,8 @@ async def process_data(ctx):
                     npi_column = getattr(table, 'npi')
                     for i in range(0, len(npi_list), chunk_size):
                         chunk = npi_list[i:i + chunk_size] 
-                        s = table.delete.where(npi_column.in_(chunk))
-                        await s.gino.status()
+                        delete_stmt = db.delete(table.__table__).where(npi_column.in_(chunk))
+                        await delete_stmt.status()
                         
                 print(f"Cleaned up models for {len(npi_set)} NPIs due to multiple files.")
 
@@ -410,10 +415,10 @@ async def process_data(ctx):
             print(f"Processed: {count}")
 
 
-async def startup(ctx):
+async def startup(ctx):  # pragma: no cover
     await my_init_db(db)
     ctx['context'] = {}
-    ctx['context']['start'] = datetime.datetime.now()
+    ctx['context']['start'] = datetime.datetime.utcnow()
     ctx['context']['run'] = 0
     ctx['import_date'] = datetime.datetime.now().strftime("%Y%m%d")
     import_date = ctx['import_date']
@@ -423,10 +428,10 @@ async def startup(ctx):
 
     try:
         obj = AddressArchive
-        await AddressArchive.__table__.gino.create()
+        await db.create_table(AddressArchive.__table__, checkfirst=True)
         if hasattr(AddressArchive, "__my_index_elements__"):
             await db.status(
-                f"CREATE UNIQUE INDEX {obj.__tablename__}_idx_primary ON "
+                f"CREATE UNIQUE INDEX IF NOT EXISTS {obj.__tablename__}_idx_primary ON "
                 f"{db_schema}.{obj.__tablename__} ({', '.join(obj.__my_index_elements__)});")
     except DuplicateTableError:
         pass
@@ -435,7 +440,7 @@ async def startup(ctx):
         tables[cls.__main_table__] = make_class(cls, import_date)
         obj = tables[cls.__main_table__]
         await db.status(f"DROP TABLE IF EXISTS {db_schema}.{obj.__main_table__}_{import_date};")
-        await obj.__table__.gino.create()
+        await db.create_table(obj.__table__, checkfirst=True)
         if hasattr(obj, "__my_index_elements__"):
             await db.status(
                 f"CREATE UNIQUE INDEX {obj.__tablename__}_idx_primary ON "
@@ -464,13 +469,18 @@ async def startup(ctx):
 
     print("Preparing done")
 
-async def shutdown(ctx):
+async def shutdown(ctx):  # pragma: no cover
     import_date = ctx['import_date']
+    context = ctx.get('context') or {}
+    if not context.get('run'):
+        print("No NPI jobs ran in this worker session; skipping shutdown validation.")
+        return
+
     db_schema = os.getenv('DB_SCHEMA') if os.getenv('DB_SCHEMA') else 'mrf'
     tables = {}
 
     test = make_class(NPIAddress, import_date)
-    npi_address_count = await db.func.count(test.npi).gino.scalar()
+    npi_address_count = await db.scalar(select(func.count(test.npi)))
     if (not npi_address_count) or (npi_address_count < 5000000):
         print(f"Failed Import: Address number:{npi_address_count}")
         exit(1)
@@ -489,7 +499,7 @@ async def shutdown(ctx):
         {db_schema}.nucc_taxonomy
     )
     UPDATE {db_schema}.{obj.__tablename__} as addr SET taxonomy_array=b.res FROM (
-    select npi, ARRAY_AGG(x.int_code) as res from mrf.npi_taxonomy_{import_date}
+    select npi, ARRAY_AGG(x.int_code) as res from {db_schema}.npi_taxonomy_{import_date}
     INNER JOIN x ON healthcare_provider_taxonomy_code = x.target_code
     GROUP BY npi) as b WHERE addr.npi = b.npi;""")
 
@@ -527,7 +537,7 @@ async def shutdown(ctx):
     # Run VACUUM FULL ANALYZE in parallel for all tables
     async def vacuum_table(obj):
         print(f"Post-Index VACUUM FULL ANALYZE {db_schema}.{obj.__tablename__};")
-        await db.status(f"VACUUM FULL ANALYZE {db_schema}.{obj.__tablename__};")
+        await db.execute_ddl(f"VACUUM FULL ANALYZE {db_schema}.{obj.__tablename__};")
 
     vacuum_tasks = [
         vacuum_table(tables[cls.__main_table__])
@@ -594,7 +604,7 @@ async def save_npi_data(ctx, task):
     await asyncio.gather(*x)
 
 
-async def main():
+async def main():  # pragma: no cover
     redis = await create_pool(RedisSettings.from_dsn(os.environ.get('HLTHPRT_REDIS_ADDRESS')),
                               job_serializer=msgpack.packb,
                               job_deserializer=lambda b: msgpack.unpackb(b, raw=False))

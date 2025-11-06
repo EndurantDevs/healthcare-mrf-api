@@ -5,7 +5,7 @@ from sanic import Blueprint
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 
-from db.tables import issuer_table
+from db.models import Issuer
 
 blueprint = Blueprint('healthcheck', url_prefix='/healthcheck', version=1)
 
@@ -27,7 +27,7 @@ async def healthcheck(request):
 
 async def _check_db(session):
     try:
-        await session.execute(select(issuer_table.c.issuer_id).limit(1))
+        await session.execute(select(Issuer.__table__.c.issuer_id).limit(1))
         return {
             'status': 'OK'
         }

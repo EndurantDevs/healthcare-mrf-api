@@ -2,7 +2,7 @@ import os
 from sqlalchemy import DateTime, Numeric, DATE, Column,\
     String, Integer, Float, BigInteger, Boolean, ARRAY, JSON, TIMESTAMP, TEXT, SMALLINT, PrimaryKeyConstraint
 
-from db.sqlalchemy import Base, db
+from db.connection import Base, db
 from db.json_mixin import JSONOutputMixin
 
 
@@ -64,4 +64,3 @@ class Zip_zcta5(Base, JSONOutputMixin):
     intptlon = Column(String(12))
     partflg = Column(String(1))
     the_geom = Column(String)
-

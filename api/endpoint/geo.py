@@ -7,7 +7,10 @@ from sqlalchemy.exc import ProgrammingError
 
 from asyncpg import UndefinedTableError
 
-from db.tables import zip_state_table, zip_zcta5_table
+from db.tiger_models import ZipState, Zip_zcta5
+
+zip_state_table = ZipState.__table__
+zip_zcta5_table = Zip_zcta5.__table__
 blueprint = Blueprint('geo', url_prefix='/geo', version=1)
 
 
