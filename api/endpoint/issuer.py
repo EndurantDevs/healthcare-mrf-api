@@ -2,13 +2,13 @@ import sanic.exceptions
 from sanic import Blueprint, response
 from sqlalchemy import and_, select
 
-from db.sqlalchemy import db as sa_db
-from db.tables import (
-    import_log_table,
-    issuer_table,
-    plan_network_tier_table,
-    plan_table,
-)
+from db.connection import db as sa_db
+from db.models import ImportLog, Issuer, Plan, PlanNetworkTierRaw
+
+import_log_table = ImportLog.__table__
+issuer_table = Issuer.__table__
+plan_table = Plan.__table__
+plan_network_tier_table = PlanNetworkTierRaw.__table__
 
 
 blueprint = Blueprint("issuer", url_prefix="/issuer", version=1)

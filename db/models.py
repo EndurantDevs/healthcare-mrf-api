@@ -3,7 +3,7 @@ from sqlalchemy import DateTime, Numeric, DATE, Column,\
     String, Integer, Float, BigInteger, Boolean, ARRAY, JSON, TIMESTAMP, TEXT, SMALLINT, PrimaryKeyConstraint
 from sqlalchemy.orm import declared_attr
 
-from db.sqlalchemy import Base, db
+from db.connection import Base, db
 from db.json_mixin import JSONOutputMixin
 
 class ImportHistory(Base, JSONOutputMixin):
@@ -142,6 +142,7 @@ class PlanAttributes(Base, JSONOutputMixin):
         {'index_elements': ('full_plan_id gin_trgm_ops', 'year'),
             'using': 'gin',
             'name': 'find_all_variants'}]
+    plan_id = Column(String(14))
     full_plan_id = Column(String(17), nullable=False)
     year = Column(Integer)
     attr_name = Column(String)
@@ -473,9 +474,10 @@ class NPIAddress(AddressPrototype):
     __main_table__ = __tablename__
     __my_index_elements__ = ['npi', 'type', 'checksum']
     #__my_initial_indexes__ = [{'index_elements': ('npi', 'type'), 'unique': True, 'where': "type='primary'"}] #  or type='secondary'
+    __my_initial_indexes__ = [{'index_elements': ('checksum',), 'using': 'gin'}]
+
     __my_additional_indexes__ = [
         {'index_elements': ('postal_code',)},
-        {'index_elements': ('checksum',), 'using': 'gin'},
         {'index_elements': ('city_name', 'state_name', 'country_code'), 'using': 'gin'},
         {'index_elements': (
             'taxonomy_array gin__int_ops',

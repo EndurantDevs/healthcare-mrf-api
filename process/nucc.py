@@ -62,7 +62,7 @@ async def process_data(ctx):
                         obj[csv_map[key]] = t
                     obj['int_code'] = return_checksum([obj['code'],], crc=32)
                     row_list.append(obj)
-                    if count / 9999 == 0:
+                    if count % 9999 == 0:
                         await push_objects(row_list, myNUCCTaxonomy)
                         row_list.clear()
 
@@ -75,9 +75,9 @@ async def process_data(ctx):
 async def startup(ctx):
     loop = asyncio.get_event_loop()
     ctx['context'] = {}
-    ctx['context']['start'] = datetime.datetime.now()
+    ctx['context']['start'] = datetime.datetime.utcnow()
     ctx['context']['run'] = 0
-    ctx['import_date'] = datetime.datetime.now().strftime("%Y%m%d")
+    ctx['import_date'] = datetime.datetime.utcnow().strftime("%Y%m%d")
     await init_db(db, loop)
     import_date = ctx['import_date']
     db_schema = os.getenv('HLTHPRT_DB_SCHEMA') if os.getenv('HLTHPRT_DB_SCHEMA') else 'mrf'
@@ -88,7 +88,7 @@ async def startup(ctx):
         tables[cls.__main_table__] = make_class(cls, import_date)
         obj = tables[cls.__main_table__]
         await db.status(f"DROP TABLE IF EXISTS {db_schema}.{obj.__main_table__}_{import_date};")
-        await obj.__table__.gino.create()
+        await db.create_table(obj.__table__, checkfirst=True)
         if hasattr(obj, "__my_index_elements__"):
             await db.status(
                 f"CREATE UNIQUE INDEX {obj.__tablename__}_idx_primary ON "

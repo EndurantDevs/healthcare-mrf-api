@@ -8,7 +8,7 @@ import asyncio
 import uvloop
 uvloop.install()
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-loop = asyncio.new_event_loop()
+asyncio.set_event_loop(asyncio.new_event_loop())
     
 from asyncpg import connection
 from asyncpg.connection import ServerCapabilities

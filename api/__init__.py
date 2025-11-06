@@ -1,5 +1,5 @@
 from sanic.blueprints import Blueprint
-from db.sqlalchemy import db
+from db.connection import db
 from api.endpoint.healthcheck import blueprint as v1_healthcheck
 from api.endpoint.plan import blueprint as v1_plan
 from api.endpoint.importer import blueprint as v1_import

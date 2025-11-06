@@ -22,6 +22,7 @@ from db.models import PlanNPIRaw, PlanNetworkTierRaw, ImportHistory, ImportLog, 
     PlanTransparency, db
 from process.ext.utils import my_init_db
 from asyncpg import DuplicateTableError
+from sqlalchemy import select, func
 
 
 async def process_plan(ctx, task):
@@ -829,8 +830,10 @@ async def init_file(ctx):
                 obj['issuer_id'] = int(row[1])
                 obj['mrf_url'] = row[2]
                 obj['issuer_marketing_name'] = ''
-                issuer_name = await myplantransparency.select('issuer_name').where(
-                    myplantransparency.issuer_id == obj['issuer_id']).gino.scalar()
+                issuer_stmt = select(myplantransparency.issuer_name).where(
+                    myplantransparency.issuer_id == obj['issuer_id']
+                )
+                issuer_name = await db.scalar(issuer_stmt)
                 obj['issuer_name'] = issuer_name if issuer_name else 'N/A'
                 obj['data_contact_email'] = row[3]
                 obj_list.append(obj)
@@ -878,7 +881,7 @@ async def startup(ctx):
 
     try:
         obj = ImportHistory
-        await ImportHistory.__table__.gino.create()
+        await db.create_table(ImportHistory.__table__, checkfirst=True)
         if hasattr(ImportHistory, "__my_index_elements__"):
             await db.status(
                 f"CREATE UNIQUE INDEX {obj.__tablename__}_idx_primary ON "
@@ -890,7 +893,7 @@ async def startup(ctx):
         tables[cls.__main_table__] = make_class(cls, import_date)
         obj = tables[cls.__main_table__]
         await db.status(f"DROP TABLE IF EXISTS {db_schema}.{obj.__main_table__}_{import_date};")
-        await obj.__table__.gino.create()
+        await db.create_table(obj.__table__, checkfirst=True)
         if hasattr(obj, "__my_index_elements__"):
             await db.status(
                 f"CREATE UNIQUE INDEX {obj.__tablename__}_idx_primary ON "
@@ -917,7 +920,7 @@ async def shutdown(ctx, task):
     await db.status("CREATE EXTENSION IF NOT EXISTS btree_gin;")
 
     test = make_class(Plan, import_date)
-    plans_count = await db.func.count(test.plan_id).gino.scalar()
+    plans_count = await db.scalar(select(func.count(test.plan_id)))
     if (not plans_count) or (plans_count < 500):
         print(f"Failed Import: Plans number:{plans_count}")
         exit(1)
@@ -940,12 +943,17 @@ async def shutdown(ctx, task):
                             f"{db_schema}.{obj.__tablename__}_idx_primary RENAME TO "
                             f"{table}_idx_primary;")
 
-    await db.insert(ImportHistory).values(import_id=import_date, when=db.func.now()).on_conflict_do_update(
-        index_elements=ImportHistory.__my_index_elements__,
-        index_where=ImportHistory.import_id.__eq__(import_date),
-        set_=dict(when=db.func.now())) \
-        .gino.model(ImportHistory).status()
-    print('Plans in DB: ', await db.func.count(Plan.plan_id).gino.scalar())  # pylint: disable=E1101
+    upsert_history = (
+        db.insert(ImportHistory)
+        .values(import_id=import_date, when=db.func.now())
+        .on_conflict_do_update(
+            index_elements=ImportHistory.__my_index_elements__,
+            index_where=ImportHistory.import_id.__eq__(import_date),
+            set_=dict(when=db.func.now()),
+        )
+    )
+    await upsert_history.status()
+    print('Plans in DB: ', await db.scalar(select(func.count(Plan.plan_id))))  # pylint: disable=E1101
     print_time_info(ctx['context']['start'])
 
 

@@ -8,19 +8,30 @@ from sanic import Blueprint, response
 from sqlalchemy import and_, or_, select
 
 from api.for_human import attributes_labels, benefits_labels
-from db.sqlalchemy import db as sa_db
-from db.tables import (
-    import_log_table,
-    issuer_table,
-    plan_attributes_table,
-    plan_benefits_table,
-    plan_formulary_table,
-    plan_network_tier_table,
-    plan_npi_table,
-    plan_prices_table,
-    plan_table,
-    zip_state_table,
+from db.connection import db as sa_db
+from db.models import (
+    ImportLog,
+    Issuer,
+    Plan,
+    PlanAttributes,
+    PlanBenefits,
+    PlanFormulary,
+    PlanNetworkTierRaw,
+    PlanNPIRaw,
+    PlanPrices,
 )
+from db.tiger_models import ZipState
+
+plan_table = Plan.__table__
+plan_attributes_table = PlanAttributes.__table__
+plan_benefits_table = PlanBenefits.__table__
+plan_formulary_table = PlanFormulary.__table__
+plan_network_tier_table = PlanNetworkTierRaw.__table__
+plan_npi_table = PlanNPIRaw.__table__
+plan_prices_table = PlanPrices.__table__
+import_log_table = ImportLog.__table__
+issuer_table = Issuer.__table__
+zip_state_table = ZipState.__table__
 
 
 blueprint = Blueprint("plan", url_prefix="/plan", version=1)

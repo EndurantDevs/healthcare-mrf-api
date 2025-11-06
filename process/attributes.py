@@ -69,7 +69,7 @@ async def startup(ctx):
         await db.status(
             f"DROP TABLE IF EXISTS {db_schema}.{obj.__main_table__}_{import_date};"
         )
-        await obj.__table__.gino.create()
+        await db.create_table(obj.__table__, checkfirst=True)
         if hasattr(obj, "__my_index_elements__"):
             await db.status(
                 f"CREATE UNIQUE INDEX {obj.__tablename__}_idx_primary ON "
@@ -556,7 +556,7 @@ async def process_prices(ctx, task):
         #         obj['issuer_id'] = int(row[1])
         #         obj['mrf_url'] = row[2]
         #         issuer_name = await myplantransparency.select('issuer_name').where(
-        #             myplantransparency.issuer_id == obj['issuer_id']).gino.scalar()
+        #             myplantransparency.issuer_id == obj['issuer_id'])
         #         obj['issuer_name'] = issuer_name if issuer_name else 'N/A'
         #         obj['data_contact_email'] = row[3]
         #         obj_list.append(obj)

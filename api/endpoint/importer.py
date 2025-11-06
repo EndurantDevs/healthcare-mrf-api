@@ -3,6 +3,8 @@ from sanic import response
 from sanic import Blueprint
 
 
+from sqlalchemy import select, func, distinct
+
 from db.models import db, Issuer, Plan, ImportLog, ImportHistory
 
 blueprint = Blueprint('import', url_prefix='/import', version=1)
@@ -12,29 +14,24 @@ async def _collect_import_stats():
     states_data = {"issuer_number": {}, "plan_number": {}}
 
     async with db.transaction():
-        states_data["issuer_number"] = dict(
-            await db.select(
-                [Plan.state, db.func.count(db.func.distinct(Plan.issuer_id))]
-            )
-            .group_by(Plan.state)
-            .gino.all()
+        issuer_rows = await db.all(
+            select(Plan.state, func.count(distinct(Plan.issuer_id))).group_by(Plan.state)
         )
-        states_data["plan_number"] = dict(
-            await db.select(
-                [Plan.state, db.func.count(db.func.distinct(Plan.plan_id))]
-            )
-            .group_by(Plan.state)
-            .gino.all()
+        plan_rows = await db.all(
+            select(Plan.state, func.count(distinct(Plan.plan_id))).group_by(Plan.state)
         )
+        states_data["issuer_number"] = {row[0]: row[1] for row in issuer_rows}
+        states_data["plan_number"] = {row[0]: row[1] for row in plan_rows}
 
         return {
-            "plans_count": await db.func.count(Plan.plan_id).gino.scalar(),
-            "import_log_errors": await db.func.count(ImportLog.checksum).gino.scalar(),
-            "import_date": await ImportHistory.select("when")
-            .order_by(ImportHistory.when.desc())
-            .limit(1)
-            .gino.scalar(),
-            "issuers_number": await db.func.count(Issuer.issuer_id).gino.scalar(),
+            "plans_count": await db.scalar(select(func.count(Plan.plan_id))),
+            "import_log_errors": await db.scalar(select(func.count(ImportLog.checksum))),
+            "import_date": await db.scalar(
+                select(ImportHistory.when)
+                .order_by(ImportHistory.when.desc())
+                .limit(1)
+            ),
+            "issuers_number": await db.scalar(select(func.count(Issuer.issuer_id))),
             "issuers_by_state": states_data["issuer_number"],
             "plans_by_state": states_data["plan_number"],
         }
@@ -48,12 +45,15 @@ async def last_import_stats(request):
 
 @blueprint.get('/issuer/<issuer_id>')
 async def issuer_import_data(request, issuer_id):
-    data = await Issuer.query.where(Issuer.issuer_id == int(issuer_id)).gino.first()
-    if not data:
+    issuer_stmt = select(Issuer).where(Issuer.issuer_id == int(issuer_id))
+    issuer = await db.scalar(issuer_stmt)
+    if not issuer:
         raise sanic.exceptions.NotFound
-    data = data.to_json_dict()
+    data = issuer.to_json_dict()
 
-    err_log = await ImportLog.query.where(ImportLog.issuer_id == int(issuer_id)).gino.all()
+    logs_stmt = select(ImportLog).where(ImportLog.issuer_id == int(issuer_id))
+    logs_result = await db.execute(logs_stmt)
+    err_log = logs_result.scalars().all()
     data['err_log'] = []
     data['import_errors_count'] = len(err_log)
 
