@@ -1,12 +1,9 @@
 import os
 import asyncio
 import click
-from ruamel.ext.msgpack import packb, unpackb
-
-from arq.connections import RedisSettings
 
 from process.initial import main as initiate_mrf, finish_main as finish_mrf, init_file, startup as initial_startup, \
-    shutdown as initial_shutdown, process_plan, process_json_index, process_provider, save_mrf_data
+    shutdown as shutdown_mrf, process_plan, process_json_index, process_provider, save_mrf_data
 from process.attributes import main as initiate_plan_attributes, save_attributes, process_state_attributes, \
     process_attributes, process_prices, process_benefits, startup as attr_startup, shutdown as attr_shutdown
 from process.npi import main as initiate_npi, process_npi_chunk, save_npi_data, startup as npi_startup, \
@@ -14,48 +11,34 @@ from process.npi import main as initiate_npi, process_npi_chunk, save_npi_data, 
 from process.nucc import main as initiate_nucc, startup as nucc_startup, shutdown as nucc_shutdown, \
     process_data as process_nucc_data
 from process.ext.utils import db_startup
-
-
-class MRF_start:
-    functions = [init_file]
-    on_startup = initial_startup
-    # on_shutdown = initial_shutdown
-    max_jobs = 20
-    queue_read_limit = 10
-    job_timeout = 3600
-    burst = True
-    queue_name = 'arq:MRF_start'
-    redis_settings = RedisSettings.from_dsn(os.environ.get('HLTHPRT_REDIS_ADDRESS'))
-    job_serializer = lambda b: packb(b, datetime=True)
-    job_deserializer = lambda b: unpackb(b, timestamp=3, raw=False)
+from process.serialization import deserialize_job, serialize_job
+from process.redis_config import build_redis_settings
 
 
 class MRF:
-    functions = [save_mrf_data, process_plan, process_json_index, process_provider]
-    on_startup = db_startup
-    # on_shutdown = init_shutdown
+    functions = [init_file, save_mrf_data, process_plan, process_json_index, process_provider]
+    on_startup = initial_startup
     max_jobs = int(os.environ.get('HLTHPRT_MAX_MRF_JOBS')) if os.environ.get('HLTHPRT_MAX_MRF_JOBS') else 20
     queue_read_limit = 2*max_jobs
     job_timeout = 7200
     burst = True
     queue_name = 'arq:MRF'
-    redis_settings = RedisSettings.from_dsn(os.environ.get('HLTHPRT_REDIS_ADDRESS'))
-    job_serializer = lambda b: packb(b, datetime=True)
-    job_deserializer = lambda b: unpackb(b, timestamp=3, raw=False)
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
 
 
 class MRF_finish:
-    functions = [initial_shutdown]
+    functions = [shutdown_mrf]
     on_startup = db_startup
-    # on_shutdown = initial_shutdown
     max_jobs = 20
     queue_read_limit = 10
     job_timeout = 14400
     burst = True
     queue_name = 'arq:MRF_finish'
-    redis_settings = RedisSettings.from_dsn(os.environ.get('HLTHPRT_REDIS_ADDRESS'))
-    job_serializer = lambda b: packb(b, datetime=True)
-    job_deserializer = lambda b: unpackb(b, timestamp=3, raw=False)
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
 
 
 class Attributes:
@@ -65,9 +48,9 @@ class Attributes:
     max_jobs=20
     queue_read_limit = 5
     job_timeout = 3600
-    redis_settings = RedisSettings.from_dsn(os.environ.get('HLTHPRT_REDIS_ADDRESS'))
-    job_serializer = lambda b: packb(b, datetime=True)
-    job_deserializer = lambda b: unpackb(b, timestamp=3, raw=False)
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
 
 
 class NPI:
@@ -78,23 +61,22 @@ class NPI:
     queue_read_limit = 5
     queue_name = 'arq:NPI'
     job_timeout=86400
-    redis_settings = RedisSettings.from_dsn(os.environ.get('HLTHPRT_REDIS_ADDRESS'))
-    job_serializer = lambda b: packb(b, datetime=True)
-    job_deserializer = lambda b: unpackb(b, timestamp=3, raw=False)
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
 
 
 class NPI_finish:
     functions = [npi_shutdown]
     on_startup = db_startup
-    # on_shutdown = initial_shutdown
     max_jobs = 20
     queue_read_limit = 10
     job_timeout = 3600
     burst = True
     queue_name = 'arq:NPI_finish'
-    redis_settings = RedisSettings.from_dsn(os.environ.get('HLTHPRT_REDIS_ADDRESS'))
-    job_serializer = lambda b: packb(b, datetime=True)
-    job_deserializer = lambda b: unpackb(b, timestamp=3, raw=False)
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
 
 
 class NUCC:
@@ -104,9 +86,9 @@ class NUCC:
     max_jobs=20
     queue_read_limit = 5
     job_timeout=86400
-    redis_settings = RedisSettings.from_dsn(os.environ.get('HLTHPRT_REDIS_ADDRESS'))
-    job_serializer = lambda b: packb(b, datetime=True)
-    job_deserializer = lambda b: unpackb(b, timestamp=3, raw=False)
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
 
 
 @click.group()
@@ -124,8 +106,9 @@ def process_group_end():
 
 
 @click.command(help="Run CMSGOV MRF Import")
-def mrf():
-    asyncio.run(initiate_mrf())
+@click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
+def mrf(test: bool):
+    asyncio.run(initiate_mrf(test_mode=test))
 
 @click.command(help="Finish CMSGOV MRF Import")
 def mrf_end():
@@ -137,13 +120,15 @@ def plan_attributes():
     asyncio.run(initiate_plan_attributes())
 
 @click.command(help="Run NPPES Import with Weekly updates")
-def npi():
-    asyncio.run(initiate_npi())
+@click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
+def npi(test: bool):
+    asyncio.run(initiate_npi(test_mode=test))
 
 
 @click.command(help="Run NUCC Taxonomy Import")
-def nucc():
-    asyncio.run(initiate_nucc())
+@click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
+def nucc(test: bool):
+    asyncio.run(initiate_nucc(test_mode=test))
 
 
 process_group.add_command(mrf)

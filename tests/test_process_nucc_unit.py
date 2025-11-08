@@ -127,13 +127,20 @@ async def test_main_enqueues_job(monkeypatch, nucc_module):
     fake_pool = SimpleNamespace(enqueue_job=AsyncMock())
     monkeypatch.setattr(nucc_module, "create_pool", AsyncMock(return_value=fake_pool))
 
-    class DummyRedisSettings:
-        @staticmethod
-        def from_dsn(dsn):
-            return ("settings", dsn)
-
-    monkeypatch.setattr(nucc_module, "RedisSettings", DummyRedisSettings)
+    monkeypatch.setattr(nucc_module, "build_redis_settings", lambda: ("settings", "redis://localhost"))
 
     await nucc_module.main()
 
-    fake_pool.enqueue_job.assert_awaited_once_with("process_data")
+    fake_pool.enqueue_job.assert_awaited_once_with("process_data", {"test_mode": False})
+
+
+@pytest.mark.asyncio
+async def test_main_enqueues_job_test_mode(monkeypatch, nucc_module):
+    fake_pool = SimpleNamespace(enqueue_job=AsyncMock())
+    monkeypatch.setattr(nucc_module, "create_pool", AsyncMock(return_value=fake_pool))
+
+    monkeypatch.setattr(nucc_module, "build_redis_settings", lambda: ("settings", "redis://localhost"))
+
+    await nucc_module.main(test_mode=True)
+
+    fake_pool.enqueue_job.assert_awaited_once_with("process_data", {"test_mode": True})

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextvars
+import inspect
 import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -19,7 +20,6 @@ from sqlalchemy.engine.url import URL
 from sqlalchemy.schema import Table as SATable
 from sqlalchemy.sql import Executable, Select
 from sqlalchemy.sql.dml import Delete, Insert, Update
-from sqlalchemy.sql.elements import ClauseElement
 
 try:
     from sqlalchemy.ext.asyncio import (
@@ -46,20 +46,6 @@ else:
     class Base(DeclarativeBase):
         __abstract__ = True
 
-        def __init_subclass__(cls, **kwargs):
-            super().__init_subclass__(**kwargs)
-            database = globals().get("db")
-            if database is not None and hasattr(cls, "__table__"):
-                attach_gino(cls.__table__, database)
-
-        @classmethod
-        def query(cls):
-            return globals()["db"].select(cls)
-
-        @classmethod
-        def insert(cls):
-            return globals()["db"].insert(cls)
-
 
 def _wrap_statement(db: "Database", stmt: Any) -> Any:
     if isinstance(stmt, Select):
@@ -70,8 +56,6 @@ def _wrap_statement(db: "Database", stmt: Any) -> Any:
         return UpdateAdapter(db, stmt)
     if isinstance(stmt, Delete):
         return DeleteAdapter(db, stmt)
-    if isinstance(stmt, ClauseElement):
-        return attach_gino(stmt, db)
     return stmt
 
 
@@ -79,59 +63,6 @@ def _coerce_columns(columns: Tuple[Any, ...]) -> Tuple[Any, ...]:
     if len(columns) == 1 and isinstance(columns[0], (list, tuple, set)):
         columns = tuple(columns[0])
     return columns
-
-
-class StatementExecutor:
-    def __init__(self, db: "Database", stmt: Executable):
-        self._db = db
-        self._stmt = stmt
-
-    def model(self, _model: Any) -> "StatementExecutor":
-        return self
-
-    async def all(self, **params: Any):
-        async with self._db.session() as session:
-            result = await session.execute(self._stmt, params)
-            return result.all()
-
-    async def first(self, **params: Any):
-        async with self._db.session() as session:
-            result = await session.execute(self._stmt, params)
-            return result.first()
-
-    async def scalar(self, **params: Any):
-        async with self._db.session() as session:
-            result = await session.execute(self._stmt, params)
-            return result.scalar()
-
-    async def status(self, **params: Any):
-        async with self._db.session() as session:
-            result = await session.execute(self._stmt, params)
-            return getattr(result, "rowcount", None)
-
-    async def iterate(self, **params: Any):
-        async with self._db.session() as session:
-            result = await session.execute(self._stmt, params)
-            for row in result:
-                yield row
-
-    async def load(self, _models: Any, **params: Any):
-        async with self._db.session() as session:
-            result = await session.execute(self._stmt, params)
-            return result.all()
-
-
-class TableExecutor:
-    def __init__(self, db: "Database", table: SATable):
-        self._db = db
-        self._table = table
-
-    async def create(self, **kwargs: Any):
-        if self._db.engine is None:
-            await self._db.connect()
-        assert self._db.engine is not None
-        async with self._db.engine.begin() as connection:
-            await connection.run_sync(self._table.create, **kwargs)
 
 
 class StatementAdapter:
@@ -202,23 +133,9 @@ class FuncProxy:
         attr = getattr(sa_func, item)
 
         def _call(*args: Any, **kwargs: Any):
-            expr = attr(*args, **kwargs)
-            return attach_gino(expr, self._db)
+            return attr(*args, **kwargs)
 
         return _call
-
-
-def attach_gino(expression: Any, db: "Database"):
-    if hasattr(expression, "gino"):
-        return expression
-    if isinstance(expression, SATable):
-        executor = TableExecutor(db, expression)
-    elif isinstance(expression, Executable):
-        executor = StatementExecutor(db, expression)
-    else:
-        executor = StatementExecutor(db, sa_select(expression))
-    setattr(expression, "gino", executor)
-    return expression
 
 
 class ConnectionProxy:
@@ -246,6 +163,10 @@ class ConnectionProxy:
         stmt = sa_text(stmt) if isinstance(stmt, str) else stmt
         result = await self._connection.execute(stmt, params)
         return getattr(result, "rowcount", None)
+
+    @asynccontextmanager
+    async def transaction(self):
+        yield self
 
     async def close(self):
         return None
@@ -396,7 +317,9 @@ class Database:
             await self.connect()
         assert self.engine is not None
         async with self.engine.connect() as connection:
-            autocommit_conn = await connection.execution_options(isolation_level="AUTOCOMMIT")
+            autocommit_conn = connection.execution_options(isolation_level="AUTOCOMMIT")
+            if inspect.isawaitable(autocommit_conn):
+                autocommit_conn = await autocommit_conn
             await autocommit_conn.exec_driver_sql(statement)
 
     @asynccontextmanager
@@ -494,13 +417,11 @@ __all__ = [
     "Base",
     "Database",
     "ConnectionProxy",
-    "StatementExecutor",
     "SelectAdapter",
     "InsertAdapter",
     "UpdateAdapter",
     "DeleteAdapter",
     "FuncProxy",
-    "attach_gino",
     "current_session",
     "db",
     "init_db",

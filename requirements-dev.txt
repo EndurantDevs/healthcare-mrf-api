@@ -1,5 +1,6 @@
 aiocsv
 aiohttp
+aiohttp-socks
 redis[hiredis]>6.0.0
 sanic
 asyncpg>=0.29.0

@@ -3,10 +3,8 @@ import asyncio
 import os
 import glob
 import tempfile
-import msgpack
 from pathlib import Path, PurePath
 from arq import create_pool
-from arq.connections import RedisSettings
 import ijson
 import json
 from dateutil.parser import parse as parse_date
@@ -23,6 +21,21 @@ from db.models import PlanNPIRaw, PlanNetworkTierRaw, ImportHistory, ImportLog, 
 from process.ext.utils import my_init_db
 from asyncpg import DuplicateTableError
 from sqlalchemy import select, func
+from process.serialization import serialize_job, deserialize_job
+from process.redis_config import build_redis_settings
+
+
+TEST_PLAN_TRANSPARENCY_ROWS = 25
+TEST_UNKNOWN_STATE_ROWS = 50
+TEST_PLAN_URLS = 2
+TEST_PROVIDER_URLS = 2
+TEST_PLAN_RECORDS = 30
+TEST_PROVIDER_RECORDS = 60
+TEST_MIN_PLAN_COUNT = 1
+
+
+def is_test_mode(ctx: dict) -> bool:
+    return bool(ctx.get("context", {}).get("test_mode"))
 
 
 async def process_plan(ctx, task):
@@ -37,6 +50,10 @@ async def process_plan(ctx, task):
     if 'context' in task:
         ctx['context'] = task['context']
     import_date = ctx['context']['import_date']
+    test_mode = is_test_mode(ctx)
+    plan_limit = TEST_PLAN_RECORDS if test_mode else None
+    test_mode = is_test_mode(ctx)
+    provider_limit = TEST_PROVIDER_RECORDS if test_mode else None
 
     myplan = make_class(Plan, import_date)
     myplanformulary = make_class(PlanFormulary, import_date)
@@ -57,9 +74,15 @@ async def process_plan(ctx, task):
             plan_obj = []
             planformulary_obj = []
             count = 0
+            processed_plans = 0
+            stop_processing = False
             try:
                 async for res in ijson.items(afp, "item", use_float=True):
+                    if stop_processing:
+                        break
                     for year in res['years']:
+                        if stop_processing:
+                            break
                         try:
                             for k in (
                                     'plan_id', 'plan_id_type', 'marketing_name', 'summary_url', 'plan_contact',
@@ -99,6 +122,10 @@ async def process_plan(ctx, task):
                                 'checksum': return_checksum([res['plan_id'].lower(), year], crc=32)
                             }
                             plan_obj.append(obj)
+                            processed_plans += 1
+                            if plan_limit and processed_plans >= plan_limit:
+                                stop_processing = True
+                                break
                             if count > int(os.environ.get('HLTHPRT_SAVE_PER_PACK', 50)):
                                 await push_objects(plan_obj, myplan)
                                 plan_obj.clear()
@@ -110,6 +137,8 @@ async def process_plan(ctx, task):
 
                     count = 0
                     for year in res['years']:
+                        if stop_processing:
+                            break
                         if 'formulary' in res and res['formulary']:
                             for formulary in res['formulary']:
                                 if formulary and type(formulary) is dict and ('cost_sharing' in formulary) and \
@@ -171,12 +200,14 @@ async def process_plan(ctx, task):
                                                     f"Recommended field 'cost_sharing' is not present or incorrect. "
                                                     f"Plan ID: {res['plan_id']}, year: {year}",
                                                     task.get('issuer_array'), task.get('url'), 'plans', 'json',
-                                                    myimportlog)
+                                           myimportlog)
                         else:
                             await log_error('err',
                                             f"Mandatory field 'formulary' is not present or incorrect. Plan ID: "
                                             f"{res['plan_id']}, year: {year}",
                                             task.get('issuer_array'), task.get('url'), 'plans', 'json', myimportlog)
+                    if stop_processing:
+                        break
 
                 await asyncio.gather(push_objects(plan_obj, myplan),
                                      push_objects(planformulary_obj, myplanformulary))
@@ -212,6 +243,8 @@ async def process_provider(ctx, task):
     if 'context' in task:
         ctx['context'] = task['context']
     import_date = ctx['context']['import_date']
+    test_mode = is_test_mode(ctx)
+    provider_limit = TEST_PROVIDER_RECORDS if test_mode else None
 
     current_year = datetime.datetime.now().year
     myimportlog = make_class(ImportLog, import_date)
@@ -232,8 +265,11 @@ async def process_provider(ctx, task):
             plan_npi_obj_dict = {}
             plan_network_year = {}
             count = 0
+            processed_providers = 0
             try:
                 async for res in ijson.items(afp, "item", use_float=True):
+                    if provider_limit and processed_providers >= provider_limit:
+                        break
                     my_network_tiers = {}
                     not_good = False
                     my_years = set()
@@ -407,7 +443,7 @@ async def process_provider(ctx, task):
                 )
                 plan_npi_obj_dict.clear()
                 plan_network_year.clear()
-
+                processed_providers += 1
 
             except ijson.JSONError as exc:
                 await log_error('err',
@@ -479,6 +515,12 @@ async def process_json_index(ctx, task):
         await download_it_and_save(task.get('url'), tmp_filename,
                                    context={'issuer_array': task['issuer_array'], 'source': 'json_index'},
                                    logger=myimportlog)
+        test_mode = is_test_mode(ctx)
+        plan_limit = TEST_PLAN_URLS if test_mode else None
+        provider_limit = TEST_PROVIDER_URLS if test_mode else None
+        enqueued_plans = 0
+        enqueued_providers = 0
+
         async with async_open(tmp_filename, 'rb') as afp:
             try:
                 async for url in ijson.items(afp, "plan_urls.item",
@@ -487,6 +529,9 @@ async def process_json_index(ctx, task):
                     await redis.enqueue_job('process_plan', {'url': url, 'issuer_array': issuer_array,
                         'context': ctx['context']})
                     # break
+                    enqueued_plans += 1
+                    if plan_limit and enqueued_plans >= plan_limit:
+                        break
             except ijson.JSONError as exc:
                 await log_error('err',
                                 f"JSON Parsing Error: {exc}",
@@ -506,6 +551,9 @@ async def process_json_index(ctx, task):
                     await redis.enqueue_job('process_provider',
                                             {'url': url, 'issuer_array': issuer_array, 'context': ctx['context']})
                     # break
+                    enqueued_providers += 1
+                    if provider_limit and enqueued_providers >= provider_limit:
+                        break
             except ijson.JSONError as exc:
                 await log_error('err',
                                 f"JSON Parsing Error: {exc}",
@@ -518,11 +566,13 @@ async def process_json_index(ctx, task):
                 return
 
 
-async def import_unknown_state_issuers_data():
+async def import_unknown_state_issuers_data(test_mode: bool = False):
     plan_list = {}
     issuer_list = {}
 
     attribute_files = json.loads(os.environ['HLTHPRT_CMSGOV_PLAN_ATTRIBUTES_URL_PUF'])
+    processed_rows = 0
+    row_limit = TEST_UNKNOWN_STATE_ROWS if test_mode else None
     for file in attribute_files:
         with tempfile.TemporaryDirectory() as tmpdirname:
             p = 'attr.csv'
@@ -635,6 +685,7 @@ async def import_unknown_state_issuers_data():
                 async for row in AsyncDictReader(afp, delimiter=","):
                     if row.get(unique_keys['STANDARD COMPONENT ID']) and row.get(unique_keys['PLAN ID']):
                         continue
+                    added = False
                     for key in row:
                         if not ((key in (unique_keys['STANDARD COMPONENT ID'],)) and (row.get(key) is None)) and not (
                                 f"{row.get(unique_keys['STANDARD COMPONENT ID']).upper()}_{row.get(unique_keys['BUSINESS YEAR'])}" in plan_list):
@@ -665,13 +716,24 @@ async def import_unknown_state_issuers_data():
                                 'issuer_marketing_name': '',
                                 'issuer_name': row.get(unique_keys['ISSUER NAME']).strip() if row.get(unique_keys['ISSUER NAME']).strip() else row.get(unique_keys['ISSUER ID'])
                             }
+                            if not added:
+                                processed_rows += 1
+                                added = True
+                            if row_limit and processed_rows >= row_limit:
+                                break
+                    if row_limit and processed_rows >= row_limit:
+                        break
+        if row_limit and processed_rows >= row_limit:
+            break
 
     return (issuer_list, plan_list)
 
 
-async def update_issuer_names_data():
+async def update_issuer_names_data(test_mode: bool = False):
     issuer_list = {}
     my_files = json.loads(os.environ['HLTHPRT_CMSGOV_RATE_REVIEW_URL_PUF'])
+    processed_rows = 0
+    row_limit = TEST_UNKNOWN_STATE_ROWS if test_mode else None
     for file in my_files:
         with tempfile.TemporaryDirectory() as tmpdirname:
             p = 'some_file'
@@ -706,11 +768,18 @@ async def update_issuer_names_data():
                             'issuer_name': row['COMPANY'].strip() if row['COMPANY'].strip() else row[
                                 'ISSUER_ID']
                         }
+                        processed_rows += 1
+                        if row_limit and processed_rows >= row_limit:
+                            break
+                if row_limit and processed_rows >= row_limit:
+                    break
+        if row_limit and processed_rows >= row_limit:
+            break
 
     return issuer_list
 
 
-async def init_file(ctx):
+async def init_file(ctx, task=None):
     """
     The init_file function is the first function called in this file.
     It downloads a zip file from the CMS website, unzips it, and then parses through each worksheet to create an
@@ -721,7 +790,11 @@ async def init_file(ctx):
     :return: The following:
 
     """
+    task = task or {}
+    test_mode = bool(task.get('test_mode'))
     redis = ctx['redis']
+    ctx.setdefault('context', {})
+    ctx['context']['test_mode'] = test_mode
 
     print('Downloading data from: ', os.environ['HLTHPRT_CMSGOV_MRF_URL_PUF'])
 
@@ -733,7 +806,9 @@ async def init_file(ctx):
 
     with tempfile.TemporaryDirectory() as tmpdirname:
         transparent_files = json.loads(os.environ['HLTHPRT_CMSGOV_PLAN_TRANSPARENCY_URL_PUF'])
-        for file in transparent_files:
+        for file_idx, file in enumerate(transparent_files):
+            if test_mode and file_idx >= 1:
+                break
             p = 'transp.xlsx'
             tmp_filename = str(PurePath(str(tmpdirname), p + '.zip'))
             await download_it_and_save(file['url'], tmp_filename)
@@ -790,6 +865,8 @@ async def init_file(ctx):
                             count = 3
                             await push_objects(obj_list, myplantransparency)
                             obj_list = []
+                        if test_mode and len(obj_list) >= TEST_PLAN_TRANSPARENCY_ROWS:
+                            break
                     elif count == 2:
                         i = 0
                         for name in row:
@@ -799,9 +876,14 @@ async def init_file(ctx):
                     count += 1
 
                 await push_objects(obj_list, myplantransparency)
+                if test_mode and len(obj_list) >= TEST_PLAN_TRANSPARENCY_ROWS:
+                    break
 
-        (issuer_list, plan_list) = await import_unknown_state_issuers_data()
-        issuer_list.update(await update_issuer_names_data())
+        (issuer_list, plan_list) = await import_unknown_state_issuers_data(test_mode=test_mode)
+        issuer_list.update(await update_issuer_names_data(test_mode=test_mode))
+        if test_mode:
+            issuer_list = dict(list(issuer_list.items())[:TEST_UNKNOWN_STATE_ROWS])
+            plan_list = dict(list(plan_list.items())[:TEST_UNKNOWN_STATE_ROWS])
 
         p = 'mrf_puf.xlsx'
         tmp_filename = str(PurePath(str(tmpdirname), p + '.zip'))
@@ -851,12 +933,16 @@ async def init_file(ctx):
         await asyncio.gather(push_objects(list(issuer_list.values()), myissuer),
                              push_objects(list(plan_list.values()), myplan))
 
-        for url in url_list:
+        max_urls = TEST_PLAN_URLS if test_mode else None
+
+        for idx, url in enumerate(url_list):
             await redis.enqueue_job('process_json_index',
                                     {'url': url, 'issuer_array': url2issuer[url], 'context': ctx['context']},
                                     _queue_name='arq:MRF')
+            if max_urls and idx + 1 >= max_urls:
+                break
 
-        await redis.enqueue_job('shutdown', {'context': ctx['context']}, _job_id='shutdown_mrf',
+        await redis.enqueue_job('shutdown', {'context': ctx['context'], 'test_mode': test_mode}, _job_id='shutdown_mrf',
                                         _queue_name='arq:MRF_finish')
             # break
 
@@ -873,9 +959,9 @@ async def startup(ctx):
     """
     await my_init_db(db)
     ctx['context'] = {}
-    ctx['context']['start'] = datetime.datetime.now()
+    ctx['context']['start'] = datetime.datetime.utcnow()
     ctx['context']['run'] = 0
-    ctx['context']['import_date'] = datetime.datetime.now().strftime("%Y%m%d")
+    ctx['context']['import_date'] = datetime.datetime.utcnow().strftime("%Y%m%d")
     import_date = ctx['context']['import_date']
     db_schema = os.getenv('HLTHPRT_DB_SCHEMA') if os.getenv('HLTHPRT_DB_SCHEMA') else 'mrf'
 
@@ -884,7 +970,7 @@ async def startup(ctx):
         await db.create_table(ImportHistory.__table__, checkfirst=True)
         if hasattr(ImportHistory, "__my_index_elements__"):
             await db.status(
-                f"CREATE UNIQUE INDEX {obj.__tablename__}_idx_primary ON "
+                f"CREATE UNIQUE INDEX IF NOT EXISTS {obj.__tablename__}_idx_primary ON "
                 f"{db_schema}.{obj.__tablename__} ({', '.join(obj.__my_index_elements__)});")
     except DuplicateTableError:
         pass
@@ -896,7 +982,7 @@ async def startup(ctx):
         await db.create_table(obj.__table__, checkfirst=True)
         if hasattr(obj, "__my_index_elements__"):
             await db.status(
-                f"CREATE UNIQUE INDEX {obj.__tablename__}_idx_primary ON "
+                f"CREATE UNIQUE INDEX IF NOT EXISTS {obj.__tablename__}_idx_primary ON "
                 f"{db_schema}.{obj.__tablename__} ({', '.join(obj.__my_index_elements__)});")
     print("Preparing done")
 
@@ -913,6 +999,7 @@ async def shutdown(ctx, task):
     if 'context' in task:
         ctx['context'] = task['context']
     import_date = ctx['context']['import_date']
+    test_mode = is_test_mode(ctx)
     myimportlog = make_class(ImportLog, import_date)
     await flush_error_log(myimportlog)
     db_schema = os.getenv('DB_SCHEMA') if os.getenv('DB_SCHEMA') else 'mrf'
@@ -921,9 +1008,12 @@ async def shutdown(ctx, task):
 
     test = make_class(Plan, import_date)
     plans_count = await db.scalar(select(func.count(test.plan_id)))
-    if (not plans_count) or (plans_count < 500):
-        print(f"Failed Import: Plans number:{plans_count}")
-        exit(1)
+    if test_mode:
+        print(f"Test mode: imported {plans_count} plan rows (no minimum enforced).")
+    else:
+        if (not plans_count) or (plans_count < 500):
+            print(f"Failed Import: Plans number:{plans_count}")
+            exit(1)
 
     tables = {}
     async with db.transaction():
@@ -957,20 +1047,20 @@ async def shutdown(ctx, task):
     print_time_info(ctx['context']['start'])
 
 
-async def main():
+async def main(test_mode: bool = False):
     """
     The main function is the entry point of the application.
 
     :return: A coroutine
     """
-    redis = await create_pool(RedisSettings.from_dsn(os.environ.get('HLTHPRT_REDIS_ADDRESS')),
-                              job_serializer=msgpack.packb,
-                              job_deserializer=lambda b: msgpack.unpackb(b, raw=False))
-    x = await redis.enqueue_job('init_file', _queue_name='arq:MRF_start')
+    redis = await create_pool(build_redis_settings(),
+                              job_serializer=serialize_job,
+                              job_deserializer=deserialize_job)
+    await redis.enqueue_job('init_file', {'test_mode': test_mode}, _queue_name='arq:MRF')
 
 
 async def finish_main():
-    redis = await create_pool(RedisSettings.from_dsn(os.environ.get('HLTHPRT_REDIS_ADDRESS')),
-                              job_serializer=msgpack.packb,
-                              job_deserializer=lambda b: msgpack.unpackb(b, raw=False))
-    x = await redis.enqueue_job('shutdown')
+    redis = await create_pool(build_redis_settings(),
+                              job_serializer=serialize_job,
+                              job_deserializer=deserialize_job)
+    await redis.enqueue_job('shutdown', _queue_name='arq:MRF_finish')

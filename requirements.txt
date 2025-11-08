@@ -1,6 +1,7 @@
 aiocsv==1.2.3
 aiofile==3.8.1
 aiofiles==22.1.0
+aiohttp-socks==0.8.4
 aioshutil==1.2
 alembic==1.9.1
 anyio==3.6.2

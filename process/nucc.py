@@ -1,11 +1,9 @@
 import os
-import msgpack
 import asyncio
 import datetime
 import tempfile
 import re
 from arq import create_pool
-from arq.connections import RedisSettings
 from pathlib import Path, PurePath
 from aiocsv import AsyncDictReader
 from aiofile import async_open
@@ -15,16 +13,31 @@ from process.ext.utils import download_it, download_it_and_save, \
 
 from db.models import NUCCTaxonomy, db
 from db.connection import init_db
+from process.serialization import serialize_job, deserialize_job
+from process.redis_config import build_redis_settings
 
 latin_pattern= re.compile(r'[^\x00-\x7f]')
 
+TEST_NUCC_ROWS = 500
+TEST_NUCC_MAX_FILES = 1
 
-async def process_data(ctx):
+
+def is_test_mode(ctx: dict) -> bool:
+    return bool(ctx.get("context", {}).get("test_mode"))
+
+
+async def process_data(ctx, task=None):
+    task = task or {}
     import_date = ctx['import_date']
+    ctx.setdefault('context', {})
+    test_mode = bool(task.get('test_mode', ctx['context'].get('test_mode', False)))
+    ctx['context']['test_mode'] = test_mode
     html_source = await download_it(
         os.environ['HLTHPRT_NUCC_DOWNLOAD_URL_DIR'] + os.environ['HLTHPRT_NUCC_DOWNLOAD_URL_FILE'])
 
-    for p in re.findall(r'\"(.*?nucc_taxonomy.*?\.csv)\"', html_source):
+    for file_index, p in enumerate(re.findall(r'\"(.*?nucc_taxonomy.*?\.csv)\"', html_source)):
+        if test_mode and file_index >= TEST_NUCC_MAX_FILES:
+            break
         with tempfile.TemporaryDirectory() as tmpdirname:
             print(f"Found: {p}")
             file_name = p.split('/')[-1]
@@ -51,6 +64,8 @@ async def process_data(ctx):
                     if not (row['Code']):
                         continue
                     count += 1
+                    if test_mode and count > TEST_NUCC_ROWS:
+                        break
                     if not count % 100_000:
                         print(f"Processed: {count}")
                     obj = {}
@@ -77,6 +92,7 @@ async def startup(ctx):
     ctx['context'] = {}
     ctx['context']['start'] = datetime.datetime.utcnow()
     ctx['context']['run'] = 0
+    ctx['context']['test_mode'] = False
     ctx['import_date'] = datetime.datetime.utcnow().strftime("%Y%m%d")
     await init_db(db, loop)
     import_date = ctx['import_date']
@@ -121,8 +137,8 @@ async def shutdown(ctx):
     print_time_info(ctx['context']['start'])
 
 
-async def main():
-    redis = await create_pool(RedisSettings.from_dsn(os.environ.get('HLTHPRT_REDIS_ADDRESS')),
-                              job_serializer=msgpack.packb,
-                              job_deserializer=lambda b: msgpack.unpackb(b, raw=False))
-    x = await redis.enqueue_job('process_data')
+async def main(test_mode: bool = False):
+    redis = await create_pool(build_redis_settings(),
+                              job_serializer=serialize_job,
+                              job_deserializer=deserialize_job)
+    await redis.enqueue_job('process_data', {'test_mode': test_mode})

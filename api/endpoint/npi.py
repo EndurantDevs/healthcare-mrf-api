@@ -783,13 +783,19 @@ async def get_npi(request, npi):
 
 
     async def get_address_list(npi):
-        t = []
-        g = NPIAddress.query.where(
-            (NPIAddress.npi == npi) & or_(NPIAddress.type == 'primary', NPIAddress.type == 'secondary')).order_by(
-            NPIAddress.type)
-        for item in await g.all():
-            t.append(item.to_json_dict())
-        return t
+        stmt = (
+            select(NPIAddress)
+            .where(
+                (NPIAddress.npi == npi)
+                & or_(
+                    NPIAddress.type == "primary",
+                    NPIAddress.type == "secondary",
+                )
+            )
+            .order_by(NPIAddress.type)
+        )
+        result = await db.execute(stmt)
+        return [item.to_json_dict() for item in result.scalars().all()]
 
     async def test_combined(npi):
         async with db.acquire() as conn:
@@ -861,20 +867,18 @@ async def get_npi(request, npi):
 
     data = await test_combined(npi)
 
-    if data['address_list']:
-        new_address_list = []
-        update_address_tasks = []
-        for a in data['address_list']:
-            # if not a['lat']:
-            if a:
-                update_address_tasks.append(_update_address(a))
-            # else:
-            #     new_address_list.append(a)
-        if update_address_tasks:
-            data['address_list'] = list(await asyncio.gather(*update_address_tasks))
-
     if not data:
         raise sanic.exceptions.NotFound
+
+    addresses = data.get("address_list") or []
+    if addresses:
+        update_address_tasks = [_update_address(a) for a in addresses if a]
+        if update_address_tasks:
+            data["address_list"] = list(await asyncio.gather(*update_address_tasks))
+        else:
+            data["address_list"] = []
+    else:
+        data["address_list"] = []
 
     # data.update({
     #     'address_list': address_list,
