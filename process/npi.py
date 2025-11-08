@@ -1,5 +1,4 @@
 import os
-import msgpack
 import asyncio
 import datetime
 import pytz
@@ -10,7 +9,6 @@ import glob
 import re
 import zipfile
 from arq import create_pool
-from arq.connections import RedisSettings
 from pathlib import Path, PurePath
 from aiocsv import AsyncDictReader, AsyncReader
 from asyncpg import DuplicateTableError
@@ -29,10 +27,20 @@ from process.ext.utils import return_checksum, download_it, download_it_and_save
 from db.models import AddressArchive, NPIAddress, NPIData, NPIDataTaxonomyGroup, NPIDataOtherIdentifier, \
     NPIDataTaxonomy, db
 from db.connection import init_db
+from process.serialization import serialize_job, deserialize_job
+from process.redis_config import build_redis_settings
 
 latin_pattern= re.compile(r'[^\x00-\x7f]')
 
 internal_tasks = set()
+
+TEST_NPI_MAX_FILES = 1
+TEST_NPI_ROWS = 1000
+TEST_NPI_OTHER_ROWS = 500
+
+
+def is_test_mode(ctx: dict) -> bool:
+    return bool(ctx.get("context", {}).get("test_mode"))
 
 async def process_npi_chunk(ctx, task):
     import_date = ctx['import_date']
@@ -168,9 +176,14 @@ async def process_npi_chunk(ctx, task):
 
 
 
-async def process_data(ctx):  # pragma: no cover
+async def process_data(ctx, task=None):  # pragma: no cover
     # Track whether any work actually ran so shutdown can distinguish "no jobs" from a bad import
+    task = task or {}
     ctx.setdefault('context', {})
+    if 'test_mode' in task:
+        ctx['context']['test_mode'] = bool(task.get('test_mode'))
+    test_mode = bool(ctx['context'].get('test_mode', False))
+
     ctx['context']['run'] = ctx['context'].get('run', 0) + 1
 
     import_date = ctx['import_date']
@@ -182,9 +195,14 @@ async def process_data(ctx):  # pragma: no cover
     # 110722_111322</a>
     count_files = 0
     SQL_CHUNK_SIZE = 299999
-    for p in re.findall(r'(NPPES_Data_Dissemination.*_V2.zip)', html_source):
+    file_limit = TEST_NPI_MAX_FILES if test_mode else None
+    for file_idx, p in enumerate(re.findall(r'(NPPES_Data_Dissemination.*_V2.zip)', html_source)):
+        if file_limit and file_idx >= file_limit:
+            break
         count_files = count_files + 1
         current_sql_chunk_size = SQL_CHUNK_SIZE
+        if test_mode:
+            current_sql_chunk_size = min(current_sql_chunk_size, TEST_NPI_ROWS)
         print(f"Round {count_files} for {p}")
         with tempfile.TemporaryDirectory() as tmpdirname:
             print(f"Found: {p}")
@@ -307,6 +325,7 @@ async def process_data(ctx):  # pragma: no cover
 
             row_list = []
             coros = []
+            processed_rows = 0
             async with async_open(npi_file, 'r') as afp:
                 async for row in AsyncDictReader(afp, delimiter=","):
                     if not (row['NPI']):
@@ -314,6 +333,7 @@ async def process_data(ctx):  # pragma: no cover
                     if not count % current_sql_chunk_size:
                         print(f"Processed: {count}")
                     row_list.append(row)
+                    processed_rows += 1
                     if count > current_sql_chunk_size:
                         print(f"Sending to DB: {count}")
                         coros.append(asyncio.create_task(process_npi_chunk(ctx, {'row_list': row_list.copy(),
@@ -325,6 +345,8 @@ async def process_data(ctx):  # pragma: no cover
                         count = 0
                     else:
                         count += 1
+                    if test_mode and processed_rows >= TEST_NPI_ROWS:
+                        break
 
             coros.append(asyncio.create_task(process_npi_chunk(ctx, {'row_list': row_list.copy(),
                 'npi_csv_map': npi_csv_map,
@@ -341,6 +363,7 @@ async def process_data(ctx):  # pragma: no cover
             npi_other_org_list_dict = {}
 
             async with async_open(other_file, 'r') as afp:
+                processed_other = 0
                 async for row in AsyncDictReader(afp, delimiter=","):
                     if not row['NPI']:
                         continue
@@ -362,6 +385,9 @@ async def process_data(ctx):  # pragma: no cover
                         count = 0
                     else:
                         count += 1
+                    processed_other += 1
+                    if test_mode and processed_other >= TEST_NPI_OTHER_ROWS:
+                        break
 
             coros.append(asyncio.create_task(save_npi_data(ctx, {'npi_other_id_list': list(npi_other_org_list_dict.copy().values())})))
             #await asyncio.gather(*coros)
@@ -420,6 +446,7 @@ async def startup(ctx):  # pragma: no cover
     ctx['context'] = {}
     ctx['context']['start'] = datetime.datetime.utcnow()
     ctx['context']['run'] = 0
+    ctx['context']['test_mode'] = False
     ctx['import_date'] = datetime.datetime.now().strftime("%Y%m%d")
     import_date = ctx['import_date']
     db_schema = os.getenv('HLTHPRT_DB_SCHEMA') if os.getenv('HLTHPRT_DB_SCHEMA') else 'mrf'
@@ -481,9 +508,12 @@ async def shutdown(ctx):  # pragma: no cover
 
     test = make_class(NPIAddress, import_date)
     npi_address_count = await db.scalar(select(func.count(test.npi)))
-    if (not npi_address_count) or (npi_address_count < 5000000):
-        print(f"Failed Import: Address number:{npi_address_count}")
-        exit(1)
+    if context.get("test_mode"):
+        print(f"Test mode: imported {npi_address_count} NPI addresses (no minimum enforced).")
+    else:
+        if (not npi_address_count) or (npi_address_count < 5000000):
+            print(f"Failed Import: Address number:{npi_address_count}")
+            exit(1)
 
     processing_classes_array = (NPIData, NPIDataTaxonomyGroup, NPIDataOtherIdentifier, NPIDataTaxonomy, NPIAddress,)
     async with db.transaction() as tx:
@@ -604,8 +634,8 @@ async def save_npi_data(ctx, task):
     await asyncio.gather(*x)
 
 
-async def main():  # pragma: no cover
-    redis = await create_pool(RedisSettings.from_dsn(os.environ.get('HLTHPRT_REDIS_ADDRESS')),
-                              job_serializer=msgpack.packb,
-                              job_deserializer=lambda b: msgpack.unpackb(b, raw=False))
-    x = await redis.enqueue_job('process_data', _queue_name='arq:NPI')
+async def main(test_mode: bool = False):  # pragma: no cover
+    redis = await create_pool(build_redis_settings(),
+                              job_serializer=serialize_job,
+                              job_deserializer=deserialize_job)
+    await redis.enqueue_job('process_data', {'test_mode': test_mode}, _queue_name='arq:NPI')

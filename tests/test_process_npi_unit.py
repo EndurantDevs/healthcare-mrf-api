@@ -285,20 +285,32 @@ async def test_main_enqueues_process_job(monkeypatch, npi_module):
 
     fake_pool = SimpleNamespace(enqueue_job=AsyncMock())
 
-    monkeypatch.setenv("HLTHPRT_REDIS_ADDRESS", "redis://localhost")
     monkeypatch.setattr(
         npi_module,
         "create_pool",
         AsyncMock(return_value=fake_pool),
     )
 
-    class DummyRedisSettings:
-        @staticmethod
-        def from_dsn(dsn):
-            return ("settings", dsn)
-
-    monkeypatch.setattr(npi_module, "RedisSettings", DummyRedisSettings)
+    monkeypatch.setattr(npi_module, "build_redis_settings", lambda: ("settings", "redis://localhost"))
 
     await npi_module.main()
 
-    fake_pool.enqueue_job.assert_awaited_once_with("process_data", _queue_name="arq:NPI")
+    fake_pool.enqueue_job.assert_awaited_once_with("process_data", {"test_mode": False}, _queue_name="arq:NPI")
+
+
+@pytest.mark.asyncio
+async def test_main_enqueues_process_job_test_mode(monkeypatch, npi_module):
+
+    fake_pool = SimpleNamespace(enqueue_job=AsyncMock())
+
+    monkeypatch.setattr(
+        npi_module,
+        "create_pool",
+        AsyncMock(return_value=fake_pool),
+    )
+
+    monkeypatch.setattr(npi_module, "build_redis_settings", lambda: ("settings", "redis://localhost"))
+
+    await npi_module.main(test_mode=True)
+
+    fake_pool.enqueue_job.assert_awaited_once_with("process_data", {"test_mode": True}, _queue_name="arq:NPI")

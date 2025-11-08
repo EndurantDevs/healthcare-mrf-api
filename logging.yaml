@@ -13,9 +13,6 @@ handlers:
     stream: ext://sys.stdout
 
 loggers:
-  gino:
-    level: WARNING
-    handlers: [console]
   arq:
     level: DEBUG
     handlers: [console]

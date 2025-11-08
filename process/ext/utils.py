@@ -3,6 +3,7 @@ import datetime
 from pathlib import Path, PurePath
 import asyncio
 import aiohttp
+from aiohttp_socks import ProxyConnector
 
 import pytz
 
@@ -20,22 +21,42 @@ import humanize
 from random import choice
 import json
 from db.json_mixin import JSONOutputMixin
+from dateutil.parser import parse as parse_date
 
 HTTP_CHUNK_SIZE = 1024 * 1024
 headers = {'user-agent': 'Mozilla/5.0 (compatible; Healthporta Healthcare MRF API Importer/1.1; +https://github.com/EndurantDevs/healthcare-mrf-api)'}
 timeout = aiohttp.ClientTimeout(total=60.0)
+def _default_rows_per_insert() -> int:
+    try:
+        return max(int(os.getenv("HLTHPRT_ROWS_PER_INSERT", "1000")), 1)
+    except ValueError:
+        return 1000
+
+
+ROWS_PER_INSERT = _default_rows_per_insert()
 
 _DYNAMIC_CLASS_CACHE = {}
 
 async def get_http_client():
     client = None
-    if os.environ.get('HLTHPRT_SOCKS_PROXY1'):
-        proxies = json.loads(os.environ['HLTHPRT_SOCKS_PROXY'])
-        proxy_url = choice(proxies)
-        client = aiohttp.ClientSession(timeout=timeout, headers=headers, proxy=proxy_url)
+    proxy_raw = os.environ.get('HLTHPRT_SOCKS_PROXY')
+    if proxy_raw:
+        try:
+            proxies = json.loads(proxy_raw)
+        except json.JSONDecodeError:
+            proxies = []
+        if proxies:
+            proxy_url = choice(proxies)
+            if proxy_url.startswith('socks'):
+                connector = ProxyConnector.from_url(proxy_url)
+                client = aiohttp.ClientSession(timeout=timeout, headers=headers, connector=connector)
+            else:
+                client = aiohttp.ClientSession(timeout=timeout, headers=headers, proxy=proxy_url)
+        else:
+            client = aiohttp.ClientSession(timeout=timeout, headers=headers)
     else:
         client = aiohttp.ClientSession(timeout=timeout, headers=headers)
-    
+
     return client
 
 
@@ -62,7 +83,7 @@ async def download_it_and_save_nostream(url, filepath):
                 await afp.write(await response.read())
             else:
                 print(url, ' returns ', response.status)
-                Retry()
+                raise Retry(defer=60)
 
 
 async def db_startup(ctx):
@@ -89,23 +110,32 @@ async def download_it_and_save(url, filepath, chunk_size=None, context=None, log
                                 await log_error('err',
                                         f"Error response {exc.status} while requesting {exc.request_info.real_url!r}.",
                                         context['issuer_array'], url, context['source'], 'network', logger)
-                            Retry()
+                            raise Retry(defer=60)
 
                         try:
                             async for chunk in response.content.iter_chunked(max_chunk_size):
                                 await afp.write(chunk)
                         except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+                            print(f"[retry] download_it_and_save chunk read failed for {url}: {err!r}")
                             if context and logger:
                                 await log_error('err',
                                         f"Error response while downloading {url!r}.",
                                         context['issuer_array'], url, context['source'], 'network', logger)
-                            Retry()
+                            raise Retry(defer=60)
+                except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+                    print(f"[retry] download_it_and_save request failed for {url}: {err!r}")
+                    if context and logger:
+                        await log_error('err',
+                                f"Network error: {err} while downloading {url!r}.",
+                                context['issuer_array'], url, context['source'], 'network', logger)
+                    raise Retry(defer=60)
                 except ssl.SSLCertVerificationError as err:
+                    print(f"[retry] download_it_and_save SSL error for {url}: {err!r}")
                     if context and logger:
                         await log_error('err',
                                 f"SSL Error. {err} URL: {url}.",
                                 context['issuer_array'], url, context['source'], 'network', logger)
-                Retry()
+                    raise Retry(defer=60)
         if cache_dir and file_with_dir:
             await copyfile(filepath, file_with_dir)
 
@@ -285,7 +315,8 @@ async def push_objects(obj_list, cls, rewrite=False):
         except ValueError as exc:
             print(f"INPUT arr: {obj_list}")
             print(exc)
-        except (UniqueViolationError, NotImplementedError):
+        except (UniqueViolationError, NotImplementedError, InvalidColumnReferenceError, CardinalityViolationError, InterfaceError) as err:
+            print(f"copy_records_to_table fallback due to {err}")
 
             def _conflict_targets():
                 if hasattr(cls, "__my_initial_indexes__") and cls.__my_initial_indexes__:
@@ -317,18 +348,76 @@ async def push_objects(obj_list, cls, rewrite=False):
                         )
                     await stmt.status()
             else:
-                stmt = db.insert(cls.__table__).values(obj_list)
-                if hasattr(cls, "__my_index_elements__"):
-                    stmt = stmt.on_conflict_do_nothing(index_elements=cls.__my_index_elements__)
-                await stmt.status()
+                def _chunk_records(sequence):
+                    chunk_size = ROWS_PER_INSERT or 1000
+                    for start in range(0, len(sequence), chunk_size):
+                        yield sequence[start:start + chunk_size]
+
+                for chunk in _chunk_records(obj_list):
+                    stmt = db.insert(cls.__table__).values(chunk)
+                    if hasattr(cls, "__my_index_elements__"):
+                        stmt = stmt.on_conflict_do_nothing(index_elements=cls.__my_index_elements__)
+                    try:
+                        await stmt.status()
+                    except (SQLAlchemyError, InterfaceError) as chunk_err:
+                        print(f"Batch insert failed ({chunk_err}); retrying one-by-one")
+                        for obj in chunk:
+                            try:
+                                single_stmt = db.insert(cls.__table__).values(obj)
+                                if hasattr(cls, "__my_index_elements__"):
+                                    single_stmt = single_stmt.on_conflict_do_nothing(index_elements=cls.__my_index_elements__)
+                                await single_stmt.status()
+                            except (SQLAlchemyError, UniqueViolationError, InterfaceError) as single_err:
+                                print(single_err)
+            return
 
                 
 import logging
 from sqlalchemy import or_
+
+
+def _coerce_datetime(value):
+    if isinstance(value, datetime.datetime):
+        return value
+    if isinstance(value, dict):
+        type_tag = value.get("__type__")
+        if type_tag == "datetime":
+            iso_value = value.get("value")
+            if isinstance(iso_value, str):
+                try:
+                    return datetime.datetime.fromisoformat(iso_value)
+                except ValueError:
+                    try:
+                        return parse_date(iso_value)
+                    except (ValueError, TypeError):
+                        return None
+        if type_tag == "repr":
+            return _coerce_datetime(value.get("repr"))
+        # silently ignore other tagged dicts
+        if "__type__" not in value:
+            return _coerce_datetime(value.get("value"))
+        return None
+    if isinstance(value, str):
+        try:
+            return datetime.datetime.fromisoformat(value)
+        except ValueError:
+            try:
+                return parse_date(value)
+            except (ValueError, TypeError):
+                return None
+    return None
+
+
 def print_time_info(start):
     now = datetime.datetime.utcnow()
+    start_dt = _coerce_datetime(start)
+    if start_dt is None:
+        print("Import timing unavailable (start timestamp missing).")
+        return
+
     now = now.replace(tzinfo=pytz.utc)
-    start = start.replace(tzinfo=pytz.utc)
-    delta = now - start
+    if start_dt.tzinfo is None:
+        start_dt = start_dt.replace(tzinfo=pytz.utc)
+    delta = now - start_dt
     print('Import Time Delta: ', delta)
     print('Import took ', humanize.naturaldelta(delta))
