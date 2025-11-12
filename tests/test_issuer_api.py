@@ -1,10 +1,12 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+
 import json
 import types
 
 import pytest
 import sanic.exceptions
 
-from api.endpoint.issuer import get_issuer_data, get_issuers
+from api.endpoint.issuer import get_issuer_data, get_issuers, _row_to_dict
 
 
 class FakeRow(dict):
@@ -121,3 +123,38 @@ async def test_get_issuers(monkeypatch):
     assert len(payload) == 2
     assert payload[0]["import_errors"] == 2
     assert payload[1]["plan_count"] == 6
+
+
+@pytest.mark.asyncio
+async def test_get_issuers_with_state():
+    issuer_rows = [FakeRow({"issuer_id": 1, "issuer_name": "A", "state": "WI"})]
+    error_rows = [(1, 2)]
+    plan_rows = [(1, 5)]
+    session = FakeSession(
+        [FakeResult(issuer_rows), FakeResult(error_rows), FakeResult(plan_rows)]
+    )
+    response = await get_issuers(
+        types.SimpleNamespace(args={}, ctx=types.SimpleNamespace(sa_session=session)), "wi"
+    )
+    payload = json.loads(response.body)
+    assert payload[0]["plan_count"] == 5
+    assert payload[0]["import_errors"] == 2
+
+
+
+@pytest.mark.asyncio
+async def test_get_issuer_data_missing_session():
+    request = types.SimpleNamespace(ctx=types.SimpleNamespace(sa_session=None))
+    with pytest.raises(RuntimeError):
+        await get_issuer_data(request, "1")
+
+
+def test_row_to_dict_plain_dict():
+    assert _row_to_dict({"k": "v"}) == {"k": "v"}
+
+
+@pytest.mark.asyncio
+async def test_get_issuers_missing_session():
+    request = types.SimpleNamespace(ctx=types.SimpleNamespace(sa_session=None), args={})
+    with pytest.raises(RuntimeError):
+        await get_issuers(request, None)

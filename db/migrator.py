@@ -1,3 +1,5 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+
 from pathlib import Path
 import click
 from dotenv import load_dotenv

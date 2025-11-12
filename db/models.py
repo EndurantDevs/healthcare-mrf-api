@@ -1,17 +1,32 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+
 import os
 from sqlalchemy import DateTime, Numeric, DATE, Column,\
-    String, Integer, Float, BigInteger, Boolean, ARRAY, JSON, TIMESTAMP, TEXT, SMALLINT, PrimaryKeyConstraint
+    String, Integer, Float, BigInteger, Boolean, ARRAY, JSON, TIMESTAMP, TEXT, SMALLINT, PrimaryKeyConstraint, text
 from sqlalchemy.orm import declared_attr
 
 from db.connection import Base, db
 from db.json_mixin import JSONOutputMixin
+
+NAME_SEARCH_VECTOR = (
+    "LOWER("
+    "COALESCE(provider_first_name,'') || ' ' || "
+    "COALESCE(provider_last_name,'') || ' ' || "
+    "COALESCE(provider_organization_name,'') || ' ' || "
+    "COALESCE(provider_other_organization_name,'') || ' ' || "
+    "COALESCE(do_business_as_text,'')"
+    ")"
+)
+
+NAME_SEARCH_VECTOR_WITH_OP = f"{NAME_SEARCH_VECTOR} gin_trgm_ops"
+
 
 class ImportHistory(Base, JSONOutputMixin):
     __tablename__ = 'history'
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint('import_id'),
-        {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['import_id']
     import_id = Column(String)
@@ -23,7 +38,7 @@ class ImportLog(Base, JSONOutputMixin):
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint('issuer_id', 'checksum'),
-        {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['issuer_id', 'checksum']
     issuer_id = Column(Integer)
@@ -39,7 +54,7 @@ class Issuer(Base, JSONOutputMixin):
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint('issuer_id'),
-        {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['issuer_id']
     state = Column(String(2))
@@ -54,7 +69,7 @@ class PlanFormulary(Base, JSONOutputMixin):
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint('plan_id', 'year', 'drug_tier', 'pharmacy_type'),
-        {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['plan_id', 'year', 'drug_tier', 'pharmacy_type']
     plan_id = Column(String(14), nullable=False)
@@ -73,7 +88,7 @@ class PlanIndividual(Base, JSONOutputMixin):
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint('plan_id', 'year', 'drug_tier', 'pharmacy_type'),
-        {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['plan_id', 'year', 'drug_tier', 'pharmacy_type']
     __my_additional_indexes__ = [{'index_elements': ('int_code',)}, {'index_elements': ('display_name',)}]
@@ -93,7 +108,7 @@ class PlanFacility(Base, JSONOutputMixin):
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint('plan_id', 'year', 'drug_tier', 'pharmacy_type'),
-        {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['plan_id', 'year', 'drug_tier', 'pharmacy_type']
     __my_additional_indexes__ = [{'index_elements': ('int_code',)}, {'index_elements': ('display_name',)}]
@@ -112,7 +127,7 @@ class Plan(Base, JSONOutputMixin):
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint('plan_id', 'year'),
-        {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['plan_id', 'year']
     plan_id = Column(String(14), nullable=False)  # len == 14
@@ -135,7 +150,7 @@ class PlanAttributes(Base, JSONOutputMixin):
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint('full_plan_id', 'year', 'attr_name'),
-        {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['full_plan_id', 'year', 'attr_name']
     __my_additional_indexes__ = [
@@ -153,7 +168,7 @@ class PlanBenefits(Base, JSONOutputMixin):
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint('full_plan_id', 'year', 'benefit_name'),
-        {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['full_plan_id', 'year', 'benefit_name']
     plan_id = Column(String(14), nullable=False)
@@ -183,7 +198,7 @@ class PlanRatingAreas(Base, JSONOutputMixin):
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint('county', 'zip3', 'state', 'market'),
-        {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['county', 'zip3', 'state', 'market']
 
@@ -199,7 +214,7 @@ class PlanPrices(Base, JSONOutputMixin):
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint('plan_id', 'year', 'checksum'),
-        {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['plan_id', 'year', 'checksum', ]
     __my_additional_indexes__ = [
@@ -237,7 +252,7 @@ class PlanTransparency(Base, JSONOutputMixin):
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint('plan_id', 'year'),
-        {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['plan_id', 'year']
     state = Column(String(2))
@@ -258,7 +273,7 @@ class PlanNPIRaw(Base, JSONOutputMixin):
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint('npi', 'checksum_network'),
-        {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['npi', 'checksum_network']
     __my_additional_indexes__ = [
@@ -291,7 +306,7 @@ class PlanNetworkTierRaw(Base, JSONOutputMixin):
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint('plan_id', 'checksum_network'),
-        {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['plan_id', 'checksum_network']
     __my_additional_indexes__ = [
@@ -311,20 +326,13 @@ class NPIData(Base, JSONOutputMixin):
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint('npi'),
-        {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['npi']
     __my_additional_indexes__ = [
         {'index_elements': (
-            "LOWER(COALESCE(provider_first_name,'') || ' ' || COALESCE(provider_last_name,'') || ' ' || COALESCE("
-            "provider_organization_name,'') || ' ' || COALESCE(provider_other_organization_name,'')) gin_trgm_ops",
-            'entity_type_code'),
-            'using': 'gin',
-            'name': 'partial_search_autocomplete'},
-        {'index_elements': (
             'npi',
-            "LOWER(COALESCE(provider_first_name,'') || ' ' || COALESCE(provider_last_name,'') || ' ' || COALESCE("
-            "provider_organization_name,'') || ' ' || COALESCE(provider_other_organization_name,'')) gin_trgm_ops",
+            NAME_SEARCH_VECTOR_WITH_OP,
             'entity_type_code'),
             'using': 'gin',
             'name': 'partial_search_helper'}]
@@ -367,14 +375,21 @@ class NPIData(Base, JSONOutputMixin):
     authorized_official_name_suffix_text = Column(String)
     authorized_official_credential_text = Column(String)
     certification_date = Column(DATE)
-    
+    do_business_as = Column(
+        ARRAY(String),
+        nullable=False,
+        server_default=text("ARRAY[]::varchar[]"),
+        default=list,
+    )
+    do_business_as_text = Column(String)
+
 
 class NPIDataTaxonomy(Base, JSONOutputMixin):
     __tablename__ = 'npi_taxonomy'
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint('npi', 'checksum'),
-        {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['npi', 'checksum']
     __my_additional_indexes__ = [{'index_elements': ('healthcare_provider_taxonomy_code', 'npi',)}, ]
@@ -391,7 +406,7 @@ class NPIDataOtherIdentifier(Base, JSONOutputMixin):
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint('npi', 'checksum'),
-        {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['npi', 'checksum']
 
@@ -407,7 +422,7 @@ class NPIDataTaxonomyGroup(Base, JSONOutputMixin):
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint('npi', 'checksum'),
-        {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['npi', 'checksum']
 
@@ -421,7 +436,7 @@ class NUCCTaxonomy(Base, JSONOutputMixin):
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint('code'),
-        {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['code']
     __my_additional_indexes__ = [{'index_elements': ('int_code',)}, {'index_elements': ('display_name',)},
@@ -444,7 +459,7 @@ class AddressPrototype(Base, JSONOutputMixin):
 
     @declared_attr
     def __table_args__(cls):
-        return {'schema': os.getenv('DB_SCHEMA') or 'mrf', 'extend_existing': True}
+        return {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True}
 
     checksum = Column(Integer, primary_key=True)
     first_line = Column(String)

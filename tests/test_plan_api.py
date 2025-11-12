@@ -1,3 +1,5 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+
 import asyncio
 import json
 import types
@@ -6,15 +8,20 @@ import pytest
 import sanic.exceptions
 
 from api.endpoint.plan import (
-    get_network_by_checksum,
-    get_networks_by_checksums,
-    index_status,
+    _fetch_network_entry,
+    _get_session,
+    _result_rows,
+    _result_scalar,
+    _row_to_dict,
     all_plans,
     all_plans_variants,
-    get_autocomplete_list,
     find_a_plan,
-    get_price_plan,
+    get_autocomplete_list,
+    get_network_by_checksum,
+    get_networks_by_checksums,
     get_plan,
+    get_price_plan,
+    index_status,
 )
 
 
@@ -133,7 +140,8 @@ async def test_plan_all_plans_variants():
                     }
                 ]
             )
-        ]
+        ],
+        args={"limit": "10", "offset": "5"},
     )
     response = await all_plans_variants(request)
     payload = json.loads(response.body)
@@ -171,10 +179,11 @@ async def test_plan_get_autocomplete_success():
     assert lookup["P456"]["network_checksum"] == {"222": "SILVER"}
 
 
-def test_plan_find_plan_bad_year():
+@pytest.mark.asyncio
+async def test_plan_find_plan_bad_year():
     request = make_request([], args={"year": "bad"})
     with pytest.raises(sanic.exceptions.BadRequest):
-        asyncio.get_event_loop().run_until_complete(find_a_plan(request))
+        await find_a_plan(request)
 
 
 def test_plan_get_price_plan_bad_age():
@@ -286,3 +295,320 @@ async def test_plan_find_plan_success():
     assert result["price_range"] == {"min": 100.0, "max": 200.0}
     assert result["attributes"]["Coverage"] == "Standard"
     assert result["plan_benefits"]["Primary Care Visit"]["benefit_name"] == "Primary Care Visit"
+
+
+def test_get_session_missing():
+    with pytest.raises(RuntimeError):
+        _get_session(types.SimpleNamespace(ctx=types.SimpleNamespace(sa_session=None)))
+
+
+def test_row_to_dict_variants():
+    class MappingRow:
+        def __init__(self):
+            self._mapping = {"a": 1}
+
+    assert _row_to_dict(MappingRow()) == {"a": 1}
+    assert _row_to_dict({"b": 2}) == {"b": 2}
+    class BadRow:
+        def __iter__(self):
+            raise TypeError
+    assert _row_to_dict(BadRow()) == {}
+
+
+def test_result_rows_and_scalar_helpers():
+    class NoAll:
+        def __iter__(self):
+            return iter([(1,), (2,)])
+    assert _result_rows(NoAll()) == [(1,), (2,)]
+
+    class BareResult:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def all(self):
+            return self._rows
+
+    result = BareResult([("value",)])
+    assert _result_scalar(result) == "value"
+    dict_result = BareResult([{"k": "v"}])
+    assert _result_scalar(dict_result) == "v"
+
+
+@pytest.mark.asyncio
+async def test_fetch_network_entry(monkeypatch):
+    rows = [
+        {
+            "plan_id": "P1",
+            "year": 2024,
+            "checksum_network": 10,
+            "network_tier": "PREFERRED",
+            "issuer_id": 5,
+            "issuer_name": "Issuer",
+            "issuer_marketing_name": "Issuer Inc",
+            "issuer_state": "CA",
+        },
+        {
+            "plan_id": "P1",
+            "year": 2024,
+            "checksum_network": 10,
+            "network_tier": "PREFERRED",
+            "issuer_id": 5,
+            "issuer_name": "Issuer",
+            "issuer_marketing_name": "Issuer Inc",
+            "issuer_state": "CA",
+        },
+    ]
+    session = FakeSession([FakeResult(rows=rows)])
+    entry = await _fetch_network_entry(session, 10)
+    assert entry["issuer"] == 5
+    assert entry["plans"] == [{"plan_id": "P1", "year": 2024}]
+
+
+@pytest.mark.asyncio
+async def test_fetch_network_entry_missing():
+    session = FakeSession([FakeResult(rows=[])])
+    assert await _fetch_network_entry(session, 99) is None
+
+
+@pytest.mark.asyncio
+async def test_plan_get_autocomplete_with_state():
+    request = make_request(
+        [
+            FakeResult(
+                rows=[
+                    {
+                        "plan_id": "PX",
+                        "marketing_name": "Plan X",
+                        "network_checksum": {},
+                    }
+                ]
+            ),
+            FakeResult(rows=[("PX", 222, "PLATINUM")]),
+        ],
+        args={"query": "plan", "state": "tx"},
+    )
+    response = await get_autocomplete_list(request)
+    payload = json.loads(response.body)
+    assert payload["plans"][0]["network_checksum"] == {"222": "PLATINUM"}
+
+
+@pytest.mark.asyncio
+async def test_plan_get_autocomplete_with_zip():
+    request = make_request(
+        [
+            FakeResult(
+                rows=[
+                    {
+                        "plan_id": "PZ",
+                        "marketing_name": "Plan Z",
+                        "network_checksum": {},
+                    }
+                ]
+            ),
+            FakeResult(rows=[("PZ", 333, "GOLD")]),
+        ],
+        args={"query": "plan", "zip_code": "02110"},
+    )
+    response = await get_autocomplete_list(request)
+    payload = json.loads(response.body)
+    assert payload["plans"][0]["network_checksum"] == {"333": "GOLD"}
+
+
+@pytest.mark.asyncio
+async def test_find_a_plan_success():
+    request = make_request(
+        [
+            FakeResult(rows=[(5,)], scalar=5),
+            FakeResult(rows=[{"plan_id": "P1", "min_rate": 10, "max_rate": 20}]),
+            FakeResult(rows=[{"plan_id": "P1", "attr_name": "FormularyId", "attr_value": "val"}]),
+            FakeResult(rows=[{"plan_id": "P1", "benefit_name": "benefit_name", "copay_inn_tier1": "10", "coins_inn_tier1": "20", "copay_inn_tier2": "Not Applicable", "coins_inn_tier2": None, "copay_outof_net": "30", "coins_outof_net": "40"}]),
+        ],
+        args={"age": "30", "year": "2024", "order": "invalid"},
+    )
+    response = await find_a_plan(request)
+    payload = json.loads(response.body)
+    assert payload["total"] == 5
+    assert payload["results"][0]["attributes"]["FormularyId"] == "val"
+    assert payload["results"][0]["plan_benefits"]["benefit_name"]["copay_inn_tier1"] == "10"
+
+
+@pytest.mark.asyncio
+async def test_find_a_plan_no_results():
+    request = make_request(
+        [
+            FakeResult(rows=[(0,)]),
+            FakeResult(rows=[]),
+        ],
+        args={},
+    )
+    response = await find_a_plan(request)
+    payload = json.loads(response.body)
+    assert payload == {"total": 0, "results": []}
+
+
+@pytest.mark.asyncio
+async def test_get_price_plan_with_year():
+    request = make_request(
+        [FakeResult(rows=[{"plan_id": "P1"}])],
+        args={"age": "30"},
+    )
+    response = await get_price_plan(request, "P1", year="2024")
+    payload = json.loads(response.body)
+    assert payload == [{"plan_id": "P1"}]
+
+
+@pytest.mark.asyncio
+async def test_get_plan_with_variant(monkeypatch):
+    request = make_request(
+        [
+            FakeResult(rows=[{"plan_id": "P1", "year": 2024, "issuer_id": 7}]),
+            FakeResult(rows=[("checksum", "TIER1")]),
+            FakeResult(rows=[], scalar="Issuer"),
+            FakeResult(rows=[{"drug": "abc"}]),
+            FakeResult(rows=[("P1-01",)]),
+            FakeResult(rows=[{"attr_name": "FormularyId", "attr_value": "val"}]),
+            FakeResult(
+                rows=[
+                    {
+                        "benefit_name": "benefit_name",
+                        "copay_inn_tier1": "5",
+                        "coins_inn_tier1": "10",
+                        "copay_inn_tier2": "Not Applicable",
+                        "coins_inn_tier2": None,
+                        "copay_outof_net": "15",
+                        "coins_outof_net": "20",
+                        "full_plan_id": "P1-01",
+                        "year": 2024,
+                        "plan_id": "P1",
+                    }
+                ]
+            ),
+        ]
+    )
+    response = await get_plan(request, "P1", year="2024", variant="P1-01")
+    payload = json.loads(response.body)
+    assert payload["issuer_name"] == "Issuer"
+    assert payload["variant_attributes"]["FormularyId"]["attr_value"] == "val"
+    assert payload["variant_attributes"]["FormularyId"]["human_attr_name"] == "Formulary ID"
+    assert payload["variant_benefits"]["benefit_name"]["in_network_tier1"] == "5, 10"
+    assert payload["variant_benefits"]["benefit_name"]["human_attr_name"] == "Benefit Name"
+
+
+@pytest.mark.asyncio
+async def test_get_plan_variant_not_found():
+    request = make_request(
+        [
+            FakeResult(rows=[{"plan_id": "P1", "year": 2024, "issuer_id": 7}]),
+            FakeResult(rows=[("checksum", "TIER1")]),
+            FakeResult(rows=[], scalar="Issuer"),
+            FakeResult(rows=[{"drug": "abc"}]),
+            FakeResult(rows=[("P1-01",)]),
+        ]
+    )
+    with pytest.raises(sanic.exceptions.NotFound):
+        await get_plan(request, "P1", year="2024", variant="P1-99")
+
+def test_result_rows_handles_typeerror():
+    class BadAll:
+        def all(self):
+            raise TypeError
+
+        def __iter__(self):
+            return iter([1, 2])
+
+    assert _result_rows(BadAll()) == [1, 2]
+
+
+def test_result_scalar_empty():
+    assert _result_scalar(FakeResult(rows=[])) is None
+
+
+@pytest.mark.asyncio
+async def test_get_networks_by_checksums_skips_invalid(monkeypatch):
+    async def fake_fetch(_session, checksum):
+        return {"checksum": checksum, "plans": []}
+
+    monkeypatch.setattr("api.endpoint.plan._fetch_network_entry", fake_fetch)
+    session = FakeSession([])
+    request = types.SimpleNamespace(ctx=types.SimpleNamespace(sa_session=session))
+    response = await get_networks_by_checksums(request, "bad,1")
+    payload = json.loads(response.body)
+    assert [entry["checksum"] for entry in payload] == [1]
+
+
+@pytest.mark.asyncio
+async def test_find_a_plan_skips_missing_plan_id():
+    request = make_request(
+        [
+            FakeResult(rows=[(0,)]),
+            FakeResult(rows=[{"plan_id": None}]),
+        ],
+        args={},
+    )
+    response = await find_a_plan(request)
+    payload = json.loads(response.body)
+    assert payload == {"total": 0, "results": []}
+
+
+@pytest.mark.asyncio
+async def test_plan_get_price_plan_bad_year_value():
+    request = make_request([], args={})
+    with pytest.raises(sanic.exceptions.BadRequest):
+        await get_price_plan(request, "123", year="bad")
+
+def test_result_scalar_tuple():
+    class TupleResult:
+        def __init__(self):
+            self._rows = [(1, 2)]
+
+        def all(self):
+            return self._rows
+
+    assert _result_scalar(TupleResult()) == 1
+
+
+@pytest.mark.asyncio
+async def test_get_network_by_checksum_not_found(monkeypatch):
+    async def fake_fetch(_session, _checksum):
+        return None
+
+    monkeypatch.setattr("api.endpoint.plan._fetch_network_entry", fake_fetch)
+    request = make_request([], args={})
+    with pytest.raises(sanic.exceptions.NotFound):
+        await get_network_by_checksum(request, "123")
+
+
+@pytest.mark.asyncio
+async def test_plan_get_autocomplete_no_query():
+    request = make_request([], args={})
+    response = await get_autocomplete_list(request)
+    assert json.loads(response.body) == {"plans": []}
+
+
+@pytest.mark.asyncio
+async def test_find_a_plan_invalid_limit_page():
+    request = make_request(
+        [
+            FakeResult(rows=[(0,)]),
+            FakeResult(rows=[]),
+        ],
+        args={"limit": "bad", "page": "bad"},
+    )
+    response = await find_a_plan(request)
+    payload = json.loads(response.body)
+    assert payload == {"total": 0, "results": []}
+
+
+def test_result_scalar_empty_iterable():
+    assert _result_scalar([]) is None
+
+
+def test_result_scalar_simple_value():
+    assert _result_scalar(['alpha']) == 'alpha'
+
+
+@pytest.mark.asyncio
+async def test_find_a_plan_invalid_age():
+    request = make_request([], args={'age': 'not-a-number'})
+    with pytest.raises(sanic.exceptions.BadRequest):
+        await find_a_plan(request)

@@ -1,3 +1,5 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+
 import asyncio
 import os
 from contextlib import asynccontextmanager

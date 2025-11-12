@@ -1,3 +1,5 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+
 import asyncio
 from datetime import datetime
 from api.for_human import attributes_labels

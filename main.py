@@ -1,4 +1,6 @@
 #!/usr/bin/env python
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+
 import os
 import logging.config
 from pathlib import Path

@@ -1,3 +1,5 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+
 plan_attributes_labels_to_key = {'AV CALCULATOR OUTPUT NUMBER': 'AVCalculatorOutputNumber',
     'BEGIN PRIMARY CARE COST SHARING AFTER NUMBER OF VISITS': 'BeginPrimaryCareCostSharingAfterNumberOfVisits',
     'BEGIN PRIMARY CARE DEDUCTIBLE COINSURANCE AFTER NUMBER OF COPAYS':

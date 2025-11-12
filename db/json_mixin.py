@@ -1,3 +1,5 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+
 import json
 from uuid import UUID
 from datetime import datetime, date

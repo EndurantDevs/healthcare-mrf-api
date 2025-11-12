@@ -1,3 +1,5 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+
 from __future__ import annotations
 
 from datetime import datetime

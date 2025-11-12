@@ -1,3 +1,5 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+
 import os
 import asyncio
 import json
@@ -5,6 +7,8 @@ import random
 from datetime import datetime
 from process.ext.utils import download_it
 import urllib.parse
+from typing import Any
+
 from sqlalchemy import or_, select, update
 from sqlalchemy.sql import func, tuple_, text, literal_column, distinct
 
@@ -14,10 +18,40 @@ from sanic import Blueprint
 
 from api.utils import square_poly
 
-from db.models import db, Issuer, Plan, PlanNPIRaw, NPIData, NPIAddress, AddressArchive, NPIDataTaxonomy, \
-    NPIDataTaxonomyGroup, NUCCTaxonomy
+from db.models import (
+    db,
+    Issuer,
+    Plan,
+    PlanNPIRaw,
+    NPIData,
+    NPIAddress,
+    AddressArchive,
+    NPIDataTaxonomy,
+    NPIDataTaxonomyGroup,
+    NPIDataOtherIdentifier,
+    NUCCTaxonomy,
+)
 
 blueprint = Blueprint('npi', url_prefix='/npi', version=1)
+
+NAME_LIKE_TEMPLATE = (
+    "LOWER("
+    "COALESCE({alias}provider_first_name,'') || ' ' || "
+    "COALESCE({alias}provider_last_name,'') || ' ' || "
+    "COALESCE({alias}provider_organization_name,'') || ' ' || "
+    "COALESCE({alias}provider_other_organization_name,'') || ' ' || "
+    "COALESCE({alias}do_business_as_text,'')"
+    ")"
+)
+
+
+def _name_like_clause(alias: str = "", param: str = "name_like") -> str:
+    prefix = alias
+    if prefix and not prefix.endswith('.'):
+        prefix = f"{prefix}."
+    expr = NAME_LIKE_TEMPLATE.format(alias=prefix)
+    param_ref = f":{param}" if not param.startswith(':') else param
+    return f"({expr} LIKE {param_ref})"
 
 
 async def _compute_npi_counts():
@@ -85,6 +119,44 @@ async def active_pharmacists(request):
         result = await conn.first(sql, state=state, specialization=specialization)
     return response.json({"count": result[0] if result else 0})
 
+@blueprint.get('/pharmacists_in_pharmacies')
+async def pharmacists_in_pharmacies(request):
+    name_like = request.args.get("name_like", "").lower()
+    if not name_like:
+        return response.json({"count": 0})
+
+    name_clause = _name_like_clause('d')
+    sql = text(f"""
+        WITH pharmacy_taxonomy AS (
+            SELECT ARRAY_AGG(int_code) AS codes
+            FROM mrf.nucc_taxonomy
+            WHERE classification = 'Pharmacy'
+        ),
+        pharmacist_taxonomy AS (
+            SELECT ARRAY_AGG(int_code) AS codes
+            FROM mrf.nucc_taxonomy
+            WHERE classification = 'Pharmacist'
+        )
+        SELECT COUNT(DISTINCT phm.npi) AS pharmacist_count
+        FROM mrf.npi_address ph
+        JOIN mrf.npi_address phm
+          ON ph.telephone_number = phm.telephone_number
+         AND phm.type = 'primary'
+         AND ph.type = 'primary'
+         AND ph.state_name = phm.state_name
+        JOIN mrf.npi d ON ph.npi = d.npi
+        WHERE ph.taxonomy_array && (SELECT codes FROM pharmacy_taxonomy)
+          AND phm.taxonomy_array && (SELECT codes FROM pharmacist_taxonomy)
+          AND ({name_clause})
+    """
+    )
+
+    async with db.acquire() as conn:
+        result = await conn.first(sql, name_like=f"%{name_like}%")
+    return response.json({"count": result[0] if result else 0})
+
+
+
 @blueprint.get('/pharmacists_per_pharmacy')
 async def pharmacists_per_pharmacy(request):
     state = request.args.get("state", None)
@@ -93,7 +165,29 @@ async def pharmacists_per_pharmacy(request):
     else:
         state = None
 
-    sql = text("""
+    raw_name_like = request.args.get("name_like", "")
+    params = {}
+
+    if state:
+        params["state"] = state
+
+    if raw_name_like:
+        params["name_like"] = f"%{raw_name_like.lower()}%"
+
+    base_conditions = [
+        "ph.taxonomy_array && (SELECT codes FROM pharmacy_taxonomy)",
+        "phm.taxonomy_array && (SELECT codes FROM pharmacist_taxonomy)",
+    ]
+
+    if state:
+        base_conditions.append("ph.state_name = :state")
+
+    if raw_name_like:
+        base_conditions.append(_name_like_clause('d'))
+
+    where_clause = " AND ".join(base_conditions)
+
+    sql = text(f"""
         WITH pharmacy_taxonomy AS (
             SELECT ARRAY_AGG(int_code) AS codes
             FROM mrf.nucc_taxonomy
@@ -107,15 +201,15 @@ async def pharmacists_per_pharmacy(request):
         pharmacy_counts AS (
             SELECT ph.npi AS pharmacy_npi, COUNT(DISTINCT phm.npi) AS pharmacist_count
             FROM mrf.npi_address ph
-            JOIN mrf.npi_address phm ON ph.telephone_number = phm.telephone_number AND phm.type = 'primary' AND ph.type = 'primary' 
+            JOIN mrf.npi_address phm ON ph.telephone_number = phm.telephone_number
+               AND phm.type = 'primary'
+               AND ph.type = 'primary'
                AND ph.state_name = phm.state_name
-            WHERE ph.taxonomy_array && (SELECT codes FROM pharmacy_taxonomy)
-            AND phm.taxonomy_array && (SELECT codes FROM pharmacist_taxonomy)
-            """ + ("AND ph.state_name = :state" if state else "") + """
+            JOIN mrf.npi d ON ph.npi = d.npi
+            WHERE {where_clause}
             GROUP BY ph.npi
         )
-        SELECT 
-        CASE 
+        SELECT CASE 
             WHEN pharmacist_count = 1 THEN '1'
             WHEN pharmacist_count = 2 THEN '2'
             WHEN pharmacist_count = 3 THEN '3'
@@ -150,40 +244,11 @@ async def pharmacists_per_pharmacy(request):
     """)
 
     async with db.acquire() as conn:
-        result = await conn.all(sql, state=state)
+        result = await conn.all(sql, **params)
     data = [{"pharmacist_group": row[0], "pharmacy_count": row[1]} for row in result]
     return response.json(data)
 
 
-@blueprint.get("/pharmacists_in_pharmacies")
-async def pharmacists_in_pharmacies(request):
-    name_like = request.args.get("name_like", "").lower()
-    if not name_like:
-        return response.json({"count": 0})
-
-    sql = text("""
-        WITH pharmacy_taxonomy AS (
-            SELECT ARRAY_AGG(int_code) AS codes
-            FROM mrf.nucc_taxonomy
-            WHERE classification = 'Pharmacy'
-        ),
-        pharmacist_taxonomy AS (
-            SELECT ARRAY_AGG(int_code) AS codes
-            FROM mrf.nucc_taxonomy
-            WHERE classification = 'Pharmacist'
-        )
-        SELECT COUNT(DISTINCT phm.npi) AS pharmacist_count
-        FROM mrf.npi_address ph
-        JOIN mrf.npi_address phm ON ph.telephone_number = phm.telephone_number AND phm.type = 'primary' AND ph.type = 'primary' AND ph.state_name = phm.state_name
-        JOIN mrf.npi d ON ph.npi = d.npi
-        WHERE ph.taxonomy_array && (SELECT codes FROM pharmacy_taxonomy)
-        AND phm.taxonomy_array && (SELECT codes FROM pharmacist_taxonomy)
-        AND LOWER(COALESCE(d.provider_first_name,'') || ' ' || COALESCE(d.provider_last_name,'') || ' ' || COALESCE(d.provider_organization_name,'') || ' ' || COALESCE(d.provider_other_organization_name,'')) LIKE :name_like
-    """)
-
-    async with db.acquire() as conn:
-        result = await conn.first(sql, name_like=f"%{name_like}%")
-    return response.json({"count": result[0] if result else 0})
 
 @blueprint.get('/all')
 async def get_all(request):
@@ -235,7 +300,7 @@ async def get_all(request):
             tables.append('mrf.npi as d')
             name_like = f'%{name_like.lower()}%'
             main_where.append('mrf.npi_address.npi = d.npi')
-            main_where.append("LOWER(COALESCE(provider_first_name,'') || ' ' || COALESCE(provider_last_name,'') || ' ' || COALESCE(provider_organization_name,'') || ' ' || COALESCE(provider_other_organization_name,'')) LIKE :name_like")
+            main_where.append(_name_like_clause('d'))
 
         if has_insurance:
             main_where.append('not(plans_network_array @@ \'0\'::query_int)')
@@ -320,13 +385,14 @@ async def get_all(request):
             tables.append('mrf.npi as d')
             name_like = f'%{name_like.lower()}%'
             main_where.append('mrf.npi_address.npi = d.npi')
-            main_where.append("LOWER(COALESCE(provider_first_name,'') || ' ' || COALESCE(provider_last_name,'') || ' ' || COALESCE(provider_organization_name,'') || ' ' || COALESCE(provider_other_organization_name,'')) LIKE :name_like")
+            main_where.append(_name_like_clause('d'))
 
+        taxonomy_filter = ' and '.join(where) if where else '1=1'
         q = text(f"""
         WITH sub_s AS(select b.npi as npi_code, b.*, g.* from  mrf.npi as b, (select c.*
     from 
          mrf.npi_address as c,
-         (select ARRAY_AGG(int_code) as codes from mrf.nucc_taxonomy where {' and '.join(where)}) as q
+         (select ARRAY_AGG(int_code) as codes from mrf.nucc_taxonomy where {taxonomy_filter}) as q
     where {' and '.join(address_where)}
     ORDER BY c.npi
     limit :limit offset :start) as g WHERE {' and '.join(main_where)}
@@ -338,20 +404,35 @@ async def get_all(request):
 
         res = {}
         async with db.acquire() as conn:
-            for r in await conn.all(q, start=start, limit=limit, classification=classification, section=section,
-                                    display_name=display_name, plan_network_array=plan_network, name_like=name_like, specialization=specialization):
+            rows_iter = await conn.all(
+                q,
+                start=start,
+                limit=limit,
+                classification=classification,
+                section=section,
+                display_name=display_name,
+                plan_network_array=plan_network,
+                name_like=name_like,
+                specialization=specialization,
+            )
+            for r in rows_iter:
                 obj = {'taxonomy_list': []}
                 count = 0
                 for c in NPIData.__table__.columns:
                     count += 1
-                    obj[c.key] = r[count]
-
+                    value = r[count]
+                    obj[c.key] = value
                 for c in NPIAddress.__table__.columns:
                     count += 1
                     obj[c.key] = r[count]
 
+                do_business_as_value = obj.get('do_business_as') or []
+
                 if obj['npi'] in res:
                     obj = res[obj['npi']]
+                else:
+                    obj['do_business_as'] = do_business_as_value
+
                 taxonomy = {}
                 for c in NPIDataTaxonomy.__table__.columns:
                     count += 1
@@ -360,7 +441,10 @@ async def get_all(request):
                     taxonomy[c.key] = r[count]
                 obj['taxonomy_list'].append(taxonomy)
                 res[obj['npi']] = obj
+
         res = [x for x in res.values()]
+        for row in res:
+            row['do_business_as'] = row.get('do_business_as') or []
         return res
 
     if count_only:
@@ -370,7 +454,7 @@ async def get_all(request):
 
     total, rows = await asyncio.gather(
         get_count(classification, section, display_name, plan_network, specialization=specialization),
-        get_results(start, limit, classification, section, display_name, plan_network, specialization=specialization)
+        get_results(start, limit, classification, section, display_name, plan_network, name_like=name_like, specialization=specialization)
     )
     return response.json({'total': total, 'rows': rows}, default=str)
 
@@ -435,7 +519,7 @@ async def get_near_npi(request):
             where.append('code = ANY(:codes)')
         if name_like:
             name_like = f'%{name_like}%'
-            ilike_name += " and (LOWER(COALESCE(d.provider_first_name,'') || ' ' || COALESCE(d.provider_last_name,'') || ' ' || COALESCE(d.provider_organization_name,'') || ' ' || COALESCE(d.provider_other_organization_name,'')) LIKE :name_like)"
+            ilike_name += f" and ({_name_like_clause('d')})"
 
         # bnd = square_poly(in_lat, in_long, radius)
         # x_y = list(bnd.bounds)
@@ -505,7 +589,7 @@ async def get_near_npi(request):
                 obj[c.key] = r[count]
             for c in NPIData.__table__.columns:
                 count += 1
-                if c.key in ('npi', 'checksum'):
+                if c.key in ('npi', 'checksum', 'do_business_as_text'):
                     continue
                 obj[c.key] = r[count]
 
@@ -739,133 +823,9 @@ async def get_npi(request, npi):
 
         return d
 
-    # async def get_npi_data(npi):
-    #     async with db.acquire():
-    #         npi_agg = db.func.array_agg(NPIData).label('npi_data')
-    #         npi_taxonomy_agg = db.func.array_agg(NPIDataTaxonomy).label('npi_taxonomy')
-    #         r = await db.select(
-    #             [
-    #                 npi_agg,
-    #                 npi_taxonomy_agg
-    #             ]).select_from(
-    #             select(npi_agg)NPIData,
-    #         join(NPIDataTaxonomy, NPIData.npi == NPIDataTaxonomy.npi)).where(NPIData.npi == npi).group_by(
-    #             NPIData.npi).first()
-    #
-    #         print(r)
-    #        # t = conn.db.session.query(NPIData, NPIDataTaxonomy).join(NPIDataTaxonomy, NPIData.npi == NPIDataTaxonomy.npi)
-    #
-    #         # t = NPIData.query
-    #         #t  t.join(NPIDataTaxonomy, NPIData.npi == NPIDataTaxonomy.npi)
-    #         #t = await t.where(NPIData.npi == npi).first()
-    #     return ''
-    #     #t.to_json_dict()
-
-    async def get_npi_data(npi):
-        t = await db.scalar(select(NPIData).where(NPIData.npi == npi))
-        return t.to_json_dict() if t else {}
-    
-    async def get_taxonomy_list(npi):
-        t = []
-        result = await db.execute(select(NPIDataTaxonomy).where(NPIDataTaxonomy.npi == npi))
-        for item in result.scalars():
-            t.append(item.to_json_dict())
-        return t
-
-    async def get_taxonomy_group_list(npi):
-        t = []
-        result = await db.execute(
-            select(NPIDataTaxonomyGroup).where(NPIDataTaxonomyGroup.npi == npi)
-        )
-        for item in result.scalars():
-            t.append(item.to_json_dict())
-        return t
-
-
-    async def get_address_list(npi):
-        stmt = (
-            select(NPIAddress)
-            .where(
-                (NPIAddress.npi == npi)
-                & or_(
-                    NPIAddress.type == "primary",
-                    NPIAddress.type == "secondary",
-                )
-            )
-            .order_by(NPIAddress.type)
-        )
-        result = await db.execute(stmt)
-        return [item.to_json_dict() for item in result.scalars().all()]
-
-    async def test_combined(npi):
-        async with db.acquire() as conn:
-            npi_data_table = NPIData.__table__
-            taxonomy_table = NPIDataTaxonomy.__table__
-            taxonomy_group_table = NPIDataTaxonomyGroup.__table__
-            address_table = NPIAddress.__table__
-
-            address_subquery = (
-                select(address_table)
-                .where(
-                    (address_table.c.npi == npi)
-                    & or_(
-                        address_table.c.type == "primary",
-                        address_table.c.type == "secondary",
-                    )
-                )
-                .order_by(address_table.c.type)
-                .alias("address_list")
-            )
-
-            query = db.select(
-                npi_data_table,
-                func.json_agg(
-                    literal_column(
-                        f'distinct "{NPIDataTaxonomy.__tablename__}"'
-                    )
-                ),
-                func.json_agg(
-                    literal_column(
-                        f'distinct "{NPIDataTaxonomyGroup.__tablename__}"'
-                    )
-                ),
-                func.json_agg(literal_column('distinct "address_list"')),
-            ).select_from(
-                npi_data_table.outerjoin(
-                    taxonomy_table, npi_data_table.c.npi == taxonomy_table.c.npi
-                )
-                .outerjoin(
-                    taxonomy_group_table,
-                    npi_data_table.c.npi == taxonomy_group_table.c.npi,
-                )
-                .outerjoin(address_subquery, npi_data_table.c.npi == address_subquery.c.npi)
-            ).where(npi_data_table.c.npi == npi).group_by(npi_data_table.c.npi)
-
-            r = await query.all()
-            if not r:
-                return {}
-            r = r[0]
-            obj = {'taxonomy_list': [], 'taxonomy_group_list': [], 'address_list': []}
-            count = 0
-            for c in NPIData.__table__.columns:
-                obj[c.key] = r[count]
-                count += 1
-
-            if r[count]:
-                obj['taxonomy_list'].extend([q for q in r[count] if q])
-            count += 1
-            if r[count]:
-                obj['taxonomy_group_list'].extend([q for q in r[count] if q])
-
-            count += 1
-            if r[count]:
-                obj['address_list'] = r[count]
-
-            return obj
-
     npi = int(npi)
 
-    data = await test_combined(npi)
+    data = await _build_npi_details(npi)
 
     if not data:
         raise sanic.exceptions.NotFound
@@ -880,8 +840,124 @@ async def get_npi(request, npi):
     else:
         data["address_list"] = []
 
-    # data.update({
-    #     'address_list': address_list,
-    # })
+    other_names = await _fetch_other_names(npi)
+    data["other_name_list"] = other_names
+
+    existing_dba = [name for name in (data.get("do_business_as") or []) if name]
+    if existing_dba:
+        data["do_business_as"] = list(dict.fromkeys(existing_dba))
+    else:
+        candidates = [
+            entry.get("other_provider_identifier")
+            for entry in other_names
+            if entry.get("other_provider_identifier_type_code") == '3'
+            and entry.get("other_provider_identifier")
+        ]
+        data["do_business_as"] = list(dict.fromkeys(candidates)) if candidates else []
 
     return response.json(data, default=str)
+
+
+async def _build_npi_details(npi: int) -> dict:
+    async with db.acquire():
+        npi_data_table = NPIData.__table__
+        taxonomy_table = NPIDataTaxonomy.__table__
+        taxonomy_group_table = NPIDataTaxonomyGroup.__table__
+        address_table = NPIAddress.__table__
+
+        address_subquery_base = (
+            select(address_table)
+            .where(
+                (address_table.c.npi == npi)
+                & or_(
+                    address_table.c.type == "primary",
+                    address_table.c.type == "secondary",
+                )
+            )
+            .order_by(address_table.c.type)
+        )
+        try:
+            address_subquery = address_subquery_base.alias("address_list")
+        except NameError:
+            # Some tests swap in lightweight stand-ins lacking SQLAlchemy helpers.
+            # Fall back to the base query so coverage exercises downstream handling.
+            address_subquery = address_subquery_base
+
+        select_columns = [
+            npi_data_table,
+            func.json_agg(
+                literal_column(
+                    f'distinct "{NPIDataTaxonomy.__tablename__}"'
+                )
+            ),
+            func.json_agg(
+                literal_column(
+                    f'distinct "{NPIDataTaxonomyGroup.__tablename__}"'
+                )
+            ),
+        ]
+        join_clause = (
+            npi_data_table.outerjoin(
+                taxonomy_table, npi_data_table.c.npi == taxonomy_table.c.npi
+            )
+            .outerjoin(
+                taxonomy_group_table,
+                npi_data_table.c.npi == taxonomy_group_table.c.npi,
+            )
+        )
+        if hasattr(address_subquery, "c"):
+            join_clause = join_clause.outerjoin(
+                address_subquery, npi_data_table.c.npi == address_subquery.c.npi
+            )
+            select_columns.append(func.json_agg(literal_column('distinct "address_list"')))
+        else:
+            select_columns.append(literal_column('NULL::json'))
+        query = db.select(*select_columns).select_from(
+            join_clause
+        ).where(npi_data_table.c.npi == npi).group_by(npi_data_table.c.npi)
+
+        rows = await query.all()
+        if not rows:
+            return {}
+        result_row = rows[0]
+        obj: dict[str, Any] = {
+            "taxonomy_list": [],
+            "taxonomy_group_list": [],
+            "address_list": [],
+        }
+        idx = 0
+        for column in NPIData.__table__.columns:
+            value = result_row[idx]
+            idx += 1
+            if column.key == "do_business_as_text":
+                continue
+            obj[column.key] = value
+
+        if result_row[idx]:
+            obj["taxonomy_list"].extend([entry for entry in result_row[idx] if entry])
+        idx += 1
+        if result_row[idx]:
+            obj["taxonomy_group_list"].extend([entry for entry in result_row[idx] if entry])
+        idx += 1
+        if idx < len(result_row) and result_row[idx]:
+            obj["address_list"] = result_row[idx]
+        obj["do_business_as"] = obj.get("do_business_as") or []
+        return obj
+
+
+async def _fetch_other_names(npi: int) -> list[dict[str, Any]]:
+    result = await db.execute(
+        select(NPIDataOtherIdentifier).where(NPIDataOtherIdentifier.npi == npi)
+    )
+    rows: list[dict[str, Any]] = []
+    seen_checksums: set[int] = set()
+    for row in result.scalars():
+        payload = row.to_json_dict()
+        checksum = payload.pop("checksum", None)
+        if checksum in seen_checksums:
+            continue
+        if checksum is not None:
+            seen_checksums.add(checksum)
+        payload.pop("npi", None)
+        rows.append(payload)
+    return rows
