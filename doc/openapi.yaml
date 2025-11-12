@@ -1,0 +1,1259 @@
+openapi: 3.0.3
+info:
+  title: HealthPorta Healthcare MRF API
+  version: "1.0.0"
+  description: |
+    OpenAPI description for the HealthPorta Healthcare MRF API.  The API
+    is versioned under `/api/v1` and served by a Sanic application.  All
+    endpoints return JSON.  Unless noted otherwise, error responses use
+    the `Error` schema.
+servers:
+  - url: http://localhost:8085/api/v1
+paths:
+  /healthcheck/:
+    get:
+      summary: Health check and release metadata
+      responses:
+        '200':
+          description: Service status payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthcheckResponse'
+  /plan/:
+    get:
+      summary: Platform plan import status
+      responses:
+        '200':
+          description: Summary of plan, network, and import log metrics
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlanIndexStatus'
+  /plan/all:
+    get:
+      summary: List all plans
+      responses:
+        '200':
+          description: Array of plan records
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/PlanRecord'
+  /plan/all/variants:
+    get:
+      summary: List plan variants with optional pagination
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+          description: Maximum number of rows to return
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+          description: Offset to apply when paging results
+      responses:
+        '200':
+          description: Array of plan variant summaries
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/PlanVariantSummary'
+  /plan/network/id/{checksum}:
+    get:
+      summary: Fetch network details by checksum
+      parameters:
+        - name: checksum
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Network entry and issuer metadata
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlanNetworkEntry'
+        '404':
+          description: Network checksum not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /plan/network/multiple/{checksums}:
+    get:
+      summary: Fetch multiple network entries
+      parameters:
+        - name: checksums
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Comma-separated list of network checksum integers
+      responses:
+        '200':
+          description: Array of network entries
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/PlanNetworkEntry'
+        '404':
+          description: None of the requested checksums returned data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /plan/network/autocomplete:
+    get:
+      summary: Autocomplete plans by marketing name or plan ID
+      parameters:
+        - name: query
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Text fragment to match against plan marketing name or ID
+        - name: state
+          in: query
+          schema:
+            type: string
+            minLength: 2
+            maxLength: 2
+          description: Optional two-letter state filter
+        - name: zip_code
+          in: query
+          schema:
+            type: string
+          description: Optional ZIP code filter; ignored if `state` supplied
+      responses:
+        '200':
+          description: Autocomplete payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlanAutocompleteResponse'
+  /plan/search:
+    get:
+      summary: Search plans with optional demographic filters
+      parameters:
+        - name: age
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+          description: Member age used for pricing filters
+        - name: rating_area
+          in: query
+          schema:
+            type: string
+          description: Rating area identifier
+        - name: zip_code
+          in: query
+          schema:
+            type: string
+          description: ZIP code value for geographic filtering
+        - name: year
+          in: query
+          schema:
+            type: integer
+          description: Plan year to match
+        - name: limit
+          in: query
+          schema:
+            type: integer
+          description: Maximum number of rows per page (defaults to 100)
+        - name: page
+          in: query
+          schema:
+            type: integer
+          description: 1-based page number (defaults to 1)
+        - name: order
+          in: query
+          schema:
+            type: string
+            enum: [asc, desc]
+          description: Sort direction for results (defaults to asc)
+        - name: order_by
+          in: query
+          schema:
+            type: string
+          description: Field to order by (defaults to plan_id)
+      responses:
+        '200':
+          description: Paginated plan search payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlanSearchResponse'
+        '400':
+          description: Invalid numeric filters (age/year) supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /plan/price/{plan_id}:
+    get:
+      summary: Retrieve price rows for a plan
+      parameters:
+        - name: plan_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: age
+          in: query
+          schema:
+            type: integer
+          description: Optional age filter; validated but not applied server-side
+        - name: rating_area
+          in: query
+          schema:
+            type: string
+          description: Optional rating area filter; validated but not applied server-side
+      responses:
+        '200':
+          description: Array of price entries
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/PlanPriceEntry'
+        '400':
+          description: Invalid age supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /plan/price/{plan_id}/year:
+    get:
+      summary: Retrieve price rows for a plan and year
+      parameters:
+        - name: plan_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: age
+          in: query
+          schema:
+            type: integer
+          description: Optional age filter; validated but not applied server-side
+        - name: rating_area
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Array of price entries
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/PlanPriceEntry'
+        '400':
+          description: Invalid age or year supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /plan/id/{plan_id}:
+    get:
+      summary: Retrieve plan metadata
+      parameters:
+        - name: plan_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Plan metadata including variants and networks
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlanDetail'
+        '404':
+          description: Plan not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /plan/id/{plan_id}/{year}:
+    get:
+      summary: Retrieve plan metadata for a specific year
+      parameters:
+        - name: plan_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: year
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Plan metadata filtered to the given year
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlanDetail'
+        '404':
+          description: Plan not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /plan/id/{plan_id}/{year}/{variant}:
+    get:
+      summary: Retrieve a specific plan variant
+      parameters:
+        - name: plan_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: year
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: variant
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Plan metadata including variant attributes and benefits
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlanDetail'
+        '404':
+          description: Plan or variant not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /import/:
+    get:
+      summary: Summarize last import statistics
+      responses:
+        '200':
+          description: Import statistics and state-level tallies
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImporterStats'
+  /import/issuer/{issuer_id}:
+    get:
+      summary: Fetch import information for a specific issuer
+      parameters:
+        - name: issuer_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Issuer metadata and import errors
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImporterIssuerDetail'
+        '404':
+          description: Issuer not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /issuer/id/{issuer_id}:
+    get:
+      summary: Retrieve issuer details and plans
+      parameters:
+        - name: issuer_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Issuer data, import errors, and plans
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssuerDetail'
+        '404':
+          description: Issuer not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /issuer/:
+    get:
+      summary: List issuers across all states
+      responses:
+        '200':
+          description: Array of issuer summaries
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/IssuerSummary'
+        '404':
+          description: No issuers found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /issuer/state/{state}:
+    get:
+      summary: List issuers for a specific state
+      parameters:
+        - name: state
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 2
+            maxLength: 2
+      responses:
+        '200':
+          description: Array of issuer summaries for the state
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/IssuerSummary'
+        '404':
+          description: No issuers found for the state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /geo/get:
+    get:
+      summary: Echo geo metadata for quick status checks
+      parameters:
+        - name: zip_code
+          in: query
+          required: true
+          schema:
+            type: number
+          description: ZIP code provided as a numeric value
+        - name: lat
+          in: query
+          required: true
+          schema:
+            type: number
+          description: Latitude to report back in the response metadata
+      responses:
+        '200':
+          description: Minimal geo response with release metadata
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GeoPingResponse'
+  /geo/zip/{zip_code}:
+    get:
+      summary: Look up ZIP centroid and state
+      parameters:
+        - name: zip_code
+          in: path
+          required: true
+          schema:
+            type: string
+          description: 5-digit ZIP code (padding handled server-side)
+      responses:
+        '200':
+          description: ZIP geolocation payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GeoZipResponse'
+        '404':
+          description: ZIP code not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Underlying TIGER tables unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /nucc/:
+    get:
+      summary: NUCC endpoint heartbeat
+      responses:
+        '200':
+          description: Empty object (endpoint reserved for future use)
+          content:
+            application/json:
+              schema:
+                type: object
+  /nucc/all:
+    get:
+      summary: List NUCC taxonomy codes
+      responses:
+        '200':
+          description: Array of NUCC taxonomy entries
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/NuccTaxonomy'
+  /npi/:
+    get:
+      summary: NPI index status metadata
+      responses:
+        '200':
+          description: Counts and release metadata for NPI data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NpiIndexStatus'
+  /npi/active_pharmacists:
+    get:
+      summary: Count pharmacists colocated with pharmacies using shared phone numbers
+      parameters:
+        - name: state
+          in: query
+          schema:
+            type: string
+            minLength: 2
+            maxLength: 2
+          description: Restrict match to a two-letter state code
+        - name: specialization
+          in: query
+          schema:
+            type: string
+          description: NUCC specialization name to use instead of default pharmacist classification
+      responses:
+        '200':
+          description: Count payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CountResponse'
+  /npi/pharmacists_in_pharmacies:
+    get:
+      summary: Count pharmacists colocated with pharmacies filtered by pharmacy name
+      parameters:
+        - name: name_like
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Case-insensitive fragment matched against pharmacy names
+      responses:
+        '200':
+          description: Count payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CountResponse'
+  /npi/pharmacists_per_pharmacy:
+    get:
+      summary: Histogram of pharmacist counts per pharmacy
+      parameters:
+        - name: state
+          in: query
+          schema:
+            type: string
+            minLength: 2
+            maxLength: 2
+          description: Optional state filter applied to pharmacies
+        - name: name_like
+          in: query
+          schema:
+            type: string
+          description: Case-insensitive fragment matched against pharmacy names
+      responses:
+        '200':
+          description: Array of pharmacist count buckets
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/PharmacistBucket'
+  /npi/all:
+    get:
+      summary: Search NPI directory
+      parameters:
+        - name: count_only
+          in: query
+          schema:
+            type: number
+          description: When non-zero, only the aggregate count is returned
+        - name: format
+          in: query
+          schema:
+            type: string
+            enum: [classification, full_taxonomy]
+          description: Optional aggregation mode for `count_only`
+        - name: name_like
+          in: query
+          schema:
+            type: string
+          description: Case-insensitive fragment matched against provider names
+        - name: start
+          in: query
+          schema:
+            type: number
+          description: Offset applied to search results (default 0)
+        - name: limit
+          in: query
+          schema:
+            type: number
+          description: Maximum number of rows to return (default 0 = all)
+        - name: classification
+          in: query
+          schema:
+            type: string
+          description: NUCC classification filter
+        - name: specialization
+          in: query
+          schema:
+            type: string
+          description: NUCC specialization filter
+        - name: section
+          in: query
+          schema:
+            type: string
+        - name: display_name
+          in: query
+          schema:
+            type: string
+        - name: plan_network
+          in: query
+          schema:
+            type: string
+          description: Comma-separated list of plan network checksum integers
+        - name: has_insurance
+          in: query
+          schema:
+            type: string
+          description: Truthy flag that filters out NPIs with empty plan networks
+        - name: city
+          in: query
+          schema:
+            type: string
+        - name: state
+          in: query
+          schema:
+            type: string
+            minLength: 2
+            maxLength: 2
+        - name: codes
+          in: query
+          schema:
+            type: string
+          description: Comma-separated NUCC taxonomy codes to match
+      responses:
+        '200':
+          description: Either a count or full search payload
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/NpiCountResponse'
+                  - $ref: '#/components/schemas/NpiSearchResponse'
+  /npi/near/:
+    get:
+      summary: Find NPIs near a point or ZIP centroid
+      parameters:
+        - name: long
+          in: query
+          schema:
+            type: number
+          description: Longitude of the search point
+        - name: lat
+          in: query
+          schema:
+            type: number
+          description: Latitude of the search point
+        - name: codes
+          in: query
+          schema:
+            type: string
+          description: Comma-separated NUCC taxonomy codes to filter results
+        - name: plan_network
+          in: query
+          schema:
+            type: string
+          description: Comma-separated plan network checksums
+        - name: classification
+          in: query
+          schema:
+            type: string
+        - name: section
+          in: query
+          schema:
+            type: string
+        - name: display_name
+          in: query
+          schema:
+            type: string
+        - name: name_like
+          in: query
+          schema:
+            type: string
+          description: Case-insensitive fragment matched against provider names
+        - name: exclude_npi
+          in: query
+          schema:
+            type: integer
+          description: NPI to exclude from results
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+          description: Maximum result count (defaults to 5)
+        - name: zip_codes
+          in: query
+          schema:
+            type: string
+          description: Comma-separated ZIP codes used when coordinates are missing
+        - name: radius
+          in: query
+          schema:
+            type: integer
+          description: Search radius in miles (defaults to 10, overridden to 1000 for ZIP lookups)
+      responses:
+        '200':
+          description: Array of nearby NPI entries
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/NpiNearResult'
+  /npi/id/{npi}/full_taxonomy:
+    get:
+      summary: Retrieve taxonomy list for an NPI
+      parameters:
+        - name: npi
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Array of taxonomy entries joined with NUCC metadata
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/NpiTaxonomyWithNucc'
+  /npi/plans_by_npi/{npi}:
+    get:
+      summary: Retrieve plan associations for an NPI
+      parameters:
+        - name: npi
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Plan and issuer data for the NPI
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NpiPlansResponse'
+  /npi/id/{npi}:
+    get:
+      summary: Retrieve a detailed NPI profile
+      parameters:
+        - name: npi
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: force_address_update
+          in: query
+          schema:
+            type: integer
+          description: When non-zero, forces address geocoding refresh
+      responses:
+        '200':
+          description: NPI detail payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NpiRecord'
+        '404':
+          description: NPI not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+components:
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+        details:
+          type: string
+      additionalProperties: true
+    CountResponse:
+      type: object
+      properties:
+        count:
+          type: integer
+    PharmacistBucket:
+      type: object
+      properties:
+        pharmacist_group:
+          type: string
+        pharmacy_count:
+          type: integer
+    HealthcheckResponse:
+      type: object
+      properties:
+        date:
+          type: string
+          format: date-time
+        release:
+          type: string
+        environment:
+          type: string
+        database:
+          type: object
+          properties:
+            status:
+              type: string
+            details:
+              type: string
+          additionalProperties: true
+    PlanIndexStatus:
+      type: object
+      properties:
+        date:
+          type: string
+          format: date-time
+        release:
+          type: string
+        environment:
+          type: string
+        plan_count:
+          type: integer
+        plans_network_count:
+          type: integer
+        import_log_errors:
+          type: integer
+    PlanRecord:
+      type: object
+      properties:
+        plan_id:
+          type: string
+        marketing_name:
+          type: string
+        issuer_id:
+          type: integer
+        state:
+          type: string
+      additionalProperties: true
+    PlanVariantSummary:
+      type: object
+      properties:
+        marketing_name:
+          type: string
+        plan_id:
+          type: string
+        full_plan_id:
+          type: string
+        year:
+          type: integer
+    PlanNetworkEntry:
+      type: object
+      properties:
+        checksum:
+          type: integer
+        network_tier:
+          type: string
+        issuer:
+          type: integer
+        issuer_name:
+          type: string
+        issuer_marketing_name:
+          type: string
+        issuer_display_name:
+          type: string
+        issuer_state:
+          type: string
+        plans:
+          type: array
+          items:
+            type: object
+            properties:
+              plan_id:
+                type: string
+              year:
+                type: integer
+    PlanAutocompleteResponse:
+      type: object
+      properties:
+        plans:
+          type: array
+          items:
+            type: object
+            properties:
+              plan_id:
+                type: string
+              marketing_name:
+                type: string
+              network_checksum:
+                type: object
+                additionalProperties:
+                  type: string
+            additionalProperties: true
+    PlanSearchResponse:
+      type: object
+      properties:
+        total:
+          type: integer
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/PlanSearchResult'
+    PlanSearchResult:
+      type: object
+      properties:
+        plan_id:
+          type: string
+        price_range:
+          type: object
+          properties:
+            min:
+              type: number
+            max:
+              type: number
+        attributes:
+          type: object
+          additionalProperties:
+            type: string
+        plan_benefits:
+          type: object
+          additionalProperties:
+            type: object
+            additionalProperties: true
+      additionalProperties: true
+    PlanPriceEntry:
+      type: object
+      properties:
+        plan_id:
+          type: string
+        year:
+          type: integer
+        rating_area_id:
+          type: string
+        individual_rate:
+          type: number
+      additionalProperties: true
+    PlanDetail:
+      type: object
+      properties:
+        plan_id:
+          type: string
+        year:
+          type: integer
+        issuer_id:
+          type: integer
+        issuer_name:
+          type: string
+        network_checksum:
+          type: object
+          additionalProperties:
+            type: string
+        variants:
+          type: array
+          items:
+            type: string
+        variant_attributes:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              attr_value:
+                type: string
+              human_attr_name:
+                type: string
+        variant_benefits:
+          type: object
+          additionalProperties:
+            type: object
+            additionalProperties: true
+        formulary:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+      additionalProperties: true
+    ImporterStats:
+      type: object
+      properties:
+        plans_count:
+          type: integer
+        import_log_errors:
+          type: integer
+        import_date:
+          type: string
+          format: date-time
+        issuers_number:
+          type: integer
+        issuers_by_state:
+          type: object
+          additionalProperties:
+            type: integer
+        plans_by_state:
+          type: object
+          additionalProperties:
+            type: integer
+    ImporterIssuerDetail:
+      type: object
+      properties:
+        issuer_id:
+          type: integer
+        issuer_name:
+          type: string
+        import_errors_count:
+          type: integer
+        err_log:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+      additionalProperties: true
+    IssuerSummary:
+      type: object
+      properties:
+        issuer_id:
+          type: integer
+        issuer_name:
+          type: string
+        state:
+          type: string
+        import_errors:
+          type: integer
+        plan_count:
+          type: integer
+      additionalProperties: true
+    IssuerDetail:
+      allOf:
+        - $ref: '#/components/schemas/IssuerSummary'
+        - type: object
+          properties:
+            plans:
+              type: array
+              items:
+                type: object
+                additionalProperties: true
+    GeoPingResponse:
+      type: object
+      properties:
+        date:
+          type: string
+          format: date-time
+        release:
+          type: string
+        environment:
+          type: string
+      additionalProperties: true
+    GeoZipResponse:
+      type: object
+      properties:
+        zip_code:
+          type: string
+        lat:
+          type: number
+        long:
+          type: number
+        state:
+          type: string
+    NuccTaxonomy:
+      type: object
+      properties:
+        code:
+          type: string
+        classification:
+          type: string
+        specialization:
+          type: string
+      additionalProperties: true
+    NpiIndexStatus:
+      type: object
+      properties:
+        date:
+          type: string
+          format: date-time
+        release:
+          type: string
+        environment:
+          type: string
+        product_count:
+          type: integer
+        import_log_errors:
+          type: integer
+    NpiCountResponse:
+      type: object
+      properties:
+        rows:
+          type: integer
+    NpiSearchResponse:
+      type: object
+      properties:
+        total:
+          type: integer
+        rows:
+          type: array
+          items:
+            $ref: '#/components/schemas/NpiRecord'
+    NpiRecord:
+      type: object
+      properties:
+        npi:
+          type: integer
+        provider_organization_name:
+          type: string
+        provider_first_name:
+          type: string
+        provider_last_name:
+          type: string
+        do_business_as:
+          type: array
+          items:
+            type: string
+        taxonomy_list:
+          type: array
+          items:
+            $ref: '#/components/schemas/NpiTaxonomy'
+        taxonomy_group_list:
+          type: array
+          items:
+            $ref: '#/components/schemas/NpiTaxonomyGroup'
+        address_list:
+          type: array
+          items:
+            $ref: '#/components/schemas/NpiAddress'
+        other_name_list:
+          type: array
+          items:
+            $ref: '#/components/schemas/NpiOtherName'
+      additionalProperties: true
+    NpiTaxonomy:
+      type: object
+      properties:
+        healthcare_provider_taxonomy_code:
+          type: string
+        provider_license_number:
+          type: string
+        provider_license_number_state_code:
+          type: string
+        healthcare_provider_primary_taxonomy_switch:
+          type: string
+      additionalProperties: true
+    NpiTaxonomyGroup:
+      type: object
+      additionalProperties: true
+    NpiAddress:
+      type: object
+      properties:
+        type:
+          type: string
+        first_line:
+          type: string
+        second_line:
+          type: string
+        city_name:
+          type: string
+        state_name:
+          type: string
+        postal_code:
+          type: string
+        country_code:
+          type: string
+        telephone_number:
+          type: string
+        fax_number:
+          type: string
+        formatted_address:
+          type: string
+        lat:
+          type: number
+        long:
+          type: number
+      additionalProperties: true
+    NpiOtherName:
+      type: object
+      properties:
+        other_provider_identifier:
+          type: string
+        other_provider_identifier_type_code:
+          type: string
+        other_provider_identifier_state:
+          type: string
+        other_provider_identifier_issuer:
+          type: string
+    NpiTaxonomyWithNucc:
+      allOf:
+        - $ref: '#/components/schemas/NpiTaxonomy'
+        - type: object
+          properties:
+            nucc_taxonomy:
+              $ref: '#/components/schemas/NuccTaxonomy'
+    NpiPlansResponse:
+      type: object
+      properties:
+        npi_data:
+          type: array
+          items:
+            type: object
+            properties:
+              npi_info:
+                type: object
+                additionalProperties: true
+              issuer_info:
+                type: object
+                additionalProperties: true
+        plan_data:
+          type: array
+          items:
+            type: object
+        issuer_data:
+          type: array
+          items:
+            type: object
+    NpiNearResult:
+      allOf:
+        - $ref: '#/components/schemas/NpiRecord'
+        - type: object
+          properties:
+            distance:
+              type: number
+              description: Distance in miles from the reference point
