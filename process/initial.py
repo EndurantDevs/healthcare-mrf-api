@@ -1,3 +1,5 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+
 import datetime
 import asyncio
 import os
@@ -474,15 +476,15 @@ async def save_mrf_data(ctx, task):
             case 'plan_networktier':
                 myplan_networktier = make_class(PlanNetworkTierRaw, import_date)
                 x.append(push_objects(task['plan_networktier'], myplan_networktier, rewrite=True))
-            # case 'npi_other_id_list':
-            #     mynpidataotheridentifier = make_class(NPIDataOtherIdentifier, import_date)
-            #     x.append(push_objects(task['npi_other_id_list'], mynpidataotheridentifier, rewrite=True))
-            # case 'npi_taxonomy_group_list':
-            #     mynpidatataxonomygroup = make_class(NPIDataTaxonomyGroup, import_date)
-            #     x.append(push_objects(task['npi_taxonomy_group_list'], mynpidatataxonomygroup, rewrite=True))
-            # case 'npi_address_list':
-            #     mynpiaddress = make_class(NPIAddress, import_date)
-            #     x.append(push_objects(task['npi_address_list'], mynpiaddress, rewrite=True))
+            case 'npi_other_id_list':
+                mynpidataotheridentifier = make_class(NPIDataOtherIdentifier, import_date)
+                x.append(push_objects(task['npi_other_id_list'], mynpidataotheridentifier, rewrite=True))
+            case 'npi_taxonomy_group_list':
+                mynpidatataxonomygroup = make_class(NPIDataTaxonomyGroup, import_date)
+                x.append(push_objects(task['npi_taxonomy_group_list'], mynpidatataxonomygroup, rewrite=True))
+            case 'npi_address_list':
+                mynpiaddress = make_class(NPIAddress, import_date)
+                x.append(push_objects(task['npi_address_list'], mynpiaddress, rewrite=True))
             case 'context':
                 pass
             case _:
@@ -963,28 +965,6 @@ async def startup(ctx):
     ctx['context']['run'] = 0
     ctx['context']['import_date'] = datetime.datetime.utcnow().strftime("%Y%m%d")
     import_date = ctx['context']['import_date']
-    db_schema = os.getenv('HLTHPRT_DB_SCHEMA') if os.getenv('HLTHPRT_DB_SCHEMA') else 'mrf'
-
-    try:
-        obj = ImportHistory
-        await db.create_table(ImportHistory.__table__, checkfirst=True)
-        if hasattr(ImportHistory, "__my_index_elements__"):
-            await db.status(
-                f"CREATE UNIQUE INDEX IF NOT EXISTS {obj.__tablename__}_idx_primary ON "
-                f"{db_schema}.{obj.__tablename__} ({', '.join(obj.__my_index_elements__)});")
-    except DuplicateTableError:
-        pass
-    tables = {}  # for the future complex usage
-    for cls in (Issuer, Plan, PlanFormulary, PlanTransparency, ImportLog, PlanNPIRaw, PlanNetworkTierRaw):
-        tables[cls.__main_table__] = make_class(cls, import_date)
-        obj = tables[cls.__main_table__]
-        await db.status(f"DROP TABLE IF EXISTS {db_schema}.{obj.__main_table__}_{import_date};")
-        await db.create_table(obj.__table__, checkfirst=True)
-        if hasattr(obj, "__my_index_elements__"):
-            await db.status(
-                f"CREATE UNIQUE INDEX IF NOT EXISTS {obj.__tablename__}_idx_primary ON "
-                f"{db_schema}.{obj.__tablename__} ({', '.join(obj.__my_index_elements__)});")
-    print("Preparing done")
 
 
 async def shutdown(ctx, task):
@@ -1002,7 +982,7 @@ async def shutdown(ctx, task):
     test_mode = is_test_mode(ctx)
     myimportlog = make_class(ImportLog, import_date)
     await flush_error_log(myimportlog)
-    db_schema = os.getenv('DB_SCHEMA') if os.getenv('DB_SCHEMA') else 'mrf'
+    db_schema = os.getenv('HLTHPRT_DB_SCHEMA') if os.getenv('HLTHPRT_DB_SCHEMA') else 'mrf'
     await db.status("CREATE EXTENSION IF NOT EXISTS pg_trgm;")
     await db.status("CREATE EXTENSION IF NOT EXISTS btree_gin;")
 

@@ -1,3 +1,5 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+
 """Lightweight factories used across API and importer tests."""
 
 from __future__ import annotations

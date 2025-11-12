@@ -1,3 +1,5 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+
 import os
 from sqlalchemy import DateTime, Numeric, DATE, Column,\
     String, Integer, Float, BigInteger, Boolean, ARRAY, JSON, TIMESTAMP, TEXT, SMALLINT, PrimaryKeyConstraint

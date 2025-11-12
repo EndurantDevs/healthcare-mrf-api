@@ -1,3 +1,5 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+
 from sanic.blueprints import Blueprint
 from db.connection import db
 from api.endpoint.healthcheck import blueprint as v1_healthcheck

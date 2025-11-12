@@ -1,3 +1,5 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+
 from datetime import datetime
 
 from sanic import response

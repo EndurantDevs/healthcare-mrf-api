@@ -1,3 +1,5 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+
 import os
 import asyncio
 import datetime
@@ -373,6 +375,8 @@ async def process_data(ctx, task=None):  # pragma: no cover
                         'npi': int(row['NPI']),
                         'other_provider_identifier': row['Provider Other Organization Name'],
                         'other_provider_identifier_type_code': row['Provider Other Organization Name Type Code'],
+                        'other_provider_identifier_state': None,
+                        'other_provider_identifier_issuer': None,
                     }
                     checksum = return_checksum(list(obj.values()))
                     obj['checksum'] = checksum
@@ -495,6 +499,42 @@ async def startup(ctx):  # pragma: no cover
                 x = await db.status(create_index_sql)
 
     print("Preparing done")
+    
+
+async def refresh_do_business_as(target_table: str | None = None):
+    """
+    Populate the NPI.do_business_as array from other identifier entries (type code 3).
+    """
+    db_schema = os.getenv('HLTHPRT_DB_SCHEMA') if os.getenv('HLTHPRT_DB_SCHEMA') else 'mrf'
+    table = target_table or NPIData.__tablename__
+
+    reset_sql = (
+        f"UPDATE {db_schema}.{table} "
+        f"SET do_business_as = ARRAY[]::varchar[], do_business_as_text = ''"
+    )
+    await db.status(reset_sql)
+
+    update_sql = f"""
+        WITH sub AS (
+            SELECT
+                npi,
+                ARRAY_AGG(DISTINCT other_provider_identifier ORDER BY other_provider_identifier) AS names,
+                STRING_AGG(DISTINCT other_provider_identifier, ' ' ORDER BY other_provider_identifier) AS search_text
+            FROM {db_schema}.npi_other_identifier
+            WHERE other_provider_identifier_type_code = '3'
+            GROUP BY npi
+        )
+        UPDATE {db_schema}.{table} AS n
+        SET
+            do_business_as = sub.names,
+            do_business_as_text = COALESCE(sub.search_text, '')
+        FROM sub
+        WHERE n.npi = sub.npi;
+    """
+    await db.status(update_sql)
+
+
+
 
 async def shutdown(ctx):  # pragma: no cover
     import_date = ctx['import_date']
@@ -503,7 +543,7 @@ async def shutdown(ctx):  # pragma: no cover
         print("No NPI jobs ran in this worker session; skipping shutdown validation.")
         return
 
-    db_schema = os.getenv('DB_SCHEMA') if os.getenv('DB_SCHEMA') else 'mrf'
+    db_schema = os.getenv('HLTHPRT_DB_SCHEMA') if os.getenv('HLTHPRT_DB_SCHEMA') else 'mrf'
     tables = {}
 
     test = make_class(NPIAddress, import_date)
@@ -520,6 +560,11 @@ async def shutdown(ctx):  # pragma: no cover
         for cls in processing_classes_array:
             tables[cls.__main_table__] = make_class(cls, import_date)
             obj = tables[cls.__main_table__]
+            if cls is NPIDataOtherIdentifier:
+                print('Updating NPI do_business_as arrays from other identifiers...')
+                target_npi_cls = tables.get(NPIData.__main_table__)
+                target_table_name = target_npi_cls.__tablename__ if target_npi_cls else NPIData.__tablename__
+                await refresh_do_business_as(target_table=target_table_name)
             if cls is NPIAddress:
                 print("Updating NUCC Taxonomy for NPI Addresses...")
                 await db.status(f"""WITH x AS (
@@ -622,7 +667,8 @@ async def save_npi_data(ctx, task):
                 x.append(push_objects(task['npi_taxonomy_list'], mynpidatataxonomy, rewrite=True))
             case 'npi_other_id_list':
                 mynpidataotheridentifier = make_class(NPIDataOtherIdentifier, import_date)
-                x.append(push_objects(task['npi_other_id_list'], mynpidataotheridentifier))
+                unique = list({item['checksum']: item for item in task['npi_other_id_list']}.values())
+                x.append(push_objects(unique, mynpidataotheridentifier))
             case 'npi_taxonomy_group_list':
                 mynpidatataxonomygroup = make_class(NPIDataTaxonomyGroup, import_date)
                 x.append(push_objects(task['npi_taxonomy_group_list'], mynpidatataxonomygroup, rewrite=True))

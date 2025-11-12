@@ -1,3 +1,5 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+
 import os
 import asyncio
 import datetime
@@ -115,7 +117,7 @@ async def startup(ctx):
 
 async def shutdown(ctx):
     import_date = ctx['import_date']
-    db_schema = os.getenv('DB_SCHEMA') if os.getenv('DB_SCHEMA') else 'mrf'
+    db_schema = os.getenv('HLTHPRT_DB_SCHEMA') if os.getenv('HLTHPRT_DB_SCHEMA') else 'mrf'
     tables = {}
     async with db.transaction():
         for cls in (NUCCTaxonomy, ):

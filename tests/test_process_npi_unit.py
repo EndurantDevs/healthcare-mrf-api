@@ -1,3 +1,5 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+
 import importlib
 from pathlib import Path
 from types import SimpleNamespace

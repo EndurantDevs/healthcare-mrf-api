@@ -1,3 +1,5 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+
 import sanic.exceptions
 from sanic import response
 from sanic import Blueprint

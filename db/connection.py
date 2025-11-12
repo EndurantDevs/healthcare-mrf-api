@@ -1,3 +1,5 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+
 """SQLAlchemy 2 async infrastructure shared by API and workers."""
 
 from __future__ import annotations
