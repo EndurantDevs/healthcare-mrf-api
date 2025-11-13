@@ -23,6 +23,7 @@ from db.models import PlanNPIRaw, PlanNetworkTierRaw, ImportHistory, ImportLog, 
 from process.ext.utils import my_init_db
 from asyncpg import DuplicateTableError
 from sqlalchemy import select, func
+from sqlalchemy.exc import ProgrammingError, IntegrityError
 from process.serialization import serialize_job, deserialize_job
 from process.redis_config import build_redis_settings
 
@@ -950,21 +951,55 @@ async def init_file(ctx, task=None):
 
 
 async def startup(ctx):
-    """
-    The startup function is called once at the beginning of a run.
-    It can be used to initialize resources that will be needed by tasks, such as database connections.
-    The startup function receives one argument: a dictionary containing the context for this run.
-
-    :param ctx: Pass data between the functions
-    :return: A dictionary of context variables
-
-    """
+    """Initialize dynamic import tables for the current run."""
     await my_init_db(db)
     ctx['context'] = {}
     ctx['context']['start'] = datetime.datetime.utcnow()
     ctx['context']['run'] = 0
     ctx['context']['import_date'] = datetime.datetime.utcnow().strftime("%Y%m%d")
     import_date = ctx['context']['import_date']
+    db_schema = os.getenv('HLTHPRT_DB_SCHEMA') if os.getenv('HLTHPRT_DB_SCHEMA') else 'mrf'
+
+    await db.create_table(ImportHistory.__table__, checkfirst=True)
+    if hasattr(ImportHistory, '__my_index_elements__') and ImportHistory.__my_index_elements__:
+        cols = ', '.join(ImportHistory.__my_index_elements__)
+        try:
+            await db.status(
+                'CREATE UNIQUE INDEX IF NOT EXISTS ' +
+                f"{ImportHistory.__tablename__}_idx_primary ON " +
+                f"{db_schema}.{ImportHistory.__tablename__} ({cols});"
+            )
+        except IntegrityError:
+            pass
+
+    tables = {}
+    for cls in (Issuer, Plan, PlanFormulary, PlanTransparency, ImportLog, PlanNPIRaw, PlanNetworkTierRaw):
+        tables[cls.__main_table__] = make_class(cls, import_date)
+        obj = tables[cls.__main_table__]
+        try:
+            await db.status(
+                'DROP TABLE IF EXISTS ' +
+                f"{db_schema}.{obj.__tablename__};"
+            )
+        except ProgrammingError:
+            pass
+        try:
+            await db.create_table(obj.__table__, checkfirst=True)
+        except (ProgrammingError, DuplicateTableError, IntegrityError):
+            pass
+        if hasattr(obj, '__my_index_elements__') and obj.__my_index_elements__:
+            cols = ', '.join(obj.__my_index_elements__)
+            try:
+                await db.status(
+                    'CREATE UNIQUE INDEX IF NOT EXISTS ' +
+                    f"{obj.__tablename__}_idx_primary ON " +
+                    f"{db_schema}.{obj.__tablename__} ({cols});"
+                )
+            except IntegrityError:
+                pass
+
+    print('Preparing done')
+
 
 
 async def shutdown(ctx, task):

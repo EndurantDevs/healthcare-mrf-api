@@ -217,9 +217,18 @@ async def log_error(type, error, issuer_array, url, source, level, cls):
 
 
 async def flush_error_log(cls):
-    await push_objects(err_obj_list, cls)
+    if not err_obj_list:
+        return
+    payload = err_obj_list.copy()
     err_obj_list.clear()
     err_obj_key.clear()
+    try:
+        await push_objects(payload, cls)
+    except Exception:
+        err_obj_list.extend(payload)
+        for entry in payload:
+            err_obj_key[entry['checksum']] = True
+        raise
 
 
 async def push_objects_slow(obj_list, cls):
