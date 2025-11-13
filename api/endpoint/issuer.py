@@ -98,7 +98,7 @@ async def get_issuer_data(request, issuer_id):
     issuer_data["plans"] = plans
     issuer_data["plans_count"] = len(plans)
 
-    return response.json(issuer_data)
+    return response.json(issuer_data, default=str)
 
 
 @blueprint.get("/", name="issuer_list")
@@ -156,4 +156,4 @@ async def get_issuers(request, state=None):
         issuer["import_errors"] = error_counts.get(issuer_id, 0)
         issuer["plan_count"] = plan_counts.get(issuer_id, 0)
 
-    return response.json(issuers)
+    return response.json(issuers, default=str)

@@ -30,6 +30,19 @@ class MRF:
     job_deserializer = deserialize_job
 
 
+class MRF_start:
+    functions = [init_file]
+    on_startup = initial_startup
+    max_jobs = 20
+    queue_read_limit = 10
+    job_timeout = 3600
+    burst = True
+    queue_name = 'arq:MRF_start'
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
 class MRF_finish:
     functions = [shutdown_mrf]
     on_startup = db_startup

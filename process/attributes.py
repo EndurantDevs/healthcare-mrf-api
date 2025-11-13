@@ -119,7 +119,7 @@ async def shutdown(ctx):
                 x = await db.status(create_index_sql)
 
         print(f"Post-Index VACUUM FULL ANALYZE {db_schema}.{obj.__tablename__};")
-        await db.status(f"VACUUM FULL ANALYZE {db_schema}.{obj.__tablename__};")
+        await db.execute_ddl(f"VACUUM FULL ANALYZE {db_schema}.{obj.__tablename__};")
 
     async with db.transaction() as tx:
         for cls in processing_classes_array:

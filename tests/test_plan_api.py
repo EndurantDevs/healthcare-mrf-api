@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import asyncio
+import datetime
 import json
 import types
 
@@ -239,6 +240,7 @@ async def test_plan_get_plan_success():
         "year": 2024,
         "issuer_id": 42,
         "state": "TX",
+        "rate_effective_date": datetime.datetime(2025, 3, 25),
     }
     request = make_request(
         [
@@ -251,6 +253,7 @@ async def test_plan_get_plan_success():
     response = await get_plan(request, "P123")
     payload = json.loads(response.body)
     assert payload["plan_id"] == "P123"
+    assert payload["rate_effective_date"] == "2025-03-25 00:00:00"
     assert payload["network_checksum"] == {"77777": "PREFERRED"}
     assert payload["issuer_name"] == "Sample Issuer"
     assert payload["formulary"][0]["drug_tier"] == "Tier 1"
@@ -265,6 +268,7 @@ async def test_plan_find_plan_success():
         "state": "TX",
         "min_rate": 100.0,
         "max_rate": 200.0,
+        "rate_expiration_date": datetime.datetime(2025, 6, 4),
     }
     request = make_request(
         [
@@ -295,6 +299,7 @@ async def test_plan_find_plan_success():
     assert result["price_range"] == {"min": 100.0, "max": 200.0}
     assert result["attributes"]["Coverage"] == "Standard"
     assert result["plan_benefits"]["Primary Care Visit"]["benefit_name"] == "Primary Care Visit"
+    assert result["rate_expiration_date"] == "2025-06-04 00:00:00"
 
 
 def test_get_session_missing():

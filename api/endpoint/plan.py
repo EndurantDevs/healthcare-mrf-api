@@ -107,7 +107,7 @@ async def index_status(request):
         "plans_network_count": network_count,
         "import_log_errors": import_errors,
     }
-    return response.json(data)
+    return response.json(data, default=str)
 
 
 @blueprint.get("/all")
@@ -115,7 +115,7 @@ async def all_plans(request):
     session = _get_session(request)
     result = await session.execute(select(plan_table))
     rows = [_row_to_dict(row) for row in _result_rows(result)]
-    return response.json(rows)
+    return response.json(rows, default=str)
 
 
 @blueprint.get("/all/variants")
@@ -156,7 +156,7 @@ async def all_plans_variants(request):
                 "year": row_dict.get("year"),
             }
         )
-    return response.json(data)
+    return response.json(data, default=str)
 
 
 async def _fetch_network_entry(session, checksum):
@@ -217,7 +217,7 @@ async def get_network_by_checksum(request, checksum):
     entry = await _fetch_network_entry(session, int(checksum))
     if entry is None:
         raise sanic.exceptions.NotFound
-    return response.json(entry)
+    return response.json(entry, default=str)
 
 
 @blueprint.get("/network/multiple/<checksums>")
@@ -242,7 +242,7 @@ async def get_networks_by_checksums(request, checksums):
     if not payload:
         raise sanic.exceptions.NotFound
 
-    return response.json(payload)
+    return response.json(payload, default=str)
 
 
 @blueprint.get("/network/autocomplete")
@@ -250,7 +250,7 @@ async def get_autocomplete_list(request):
     session = _get_session(request)
     text = request.args.get("query")
     if not text:
-        return response.json({"plans": []})
+        return response.json({"plans": []}, default=str)
 
     state = request.args.get("state")
     zip_code = request.args.get("zip_code")
@@ -277,7 +277,7 @@ async def get_autocomplete_list(request):
     result = await session.execute(stmt)
     rows = _result_rows(result)
     if not rows:
-        return response.json({"plans": []})
+        return response.json({"plans": []}, default=str)
 
     plans = {}
     plan_ids = []
@@ -302,7 +302,7 @@ async def get_autocomplete_list(request):
             plans[plan_id]["network_checksum"][str(checksum)] = tier
 
     filtered = [plan for plan in plans.values() if plan["network_checksum"]]
-    return response.json({"plans": filtered})
+    return response.json({"plans": filtered}, default=str)
 
 
 @blueprint.get("/search", name="find_a_plan")
@@ -370,7 +370,7 @@ async def find_a_plan(request):
         )
 
     if not results:
-        return response.json({"total": total, "results": []})
+        return response.json({"total": total, "results": []}, default=str)
 
     attr_result = await session.execute(select(plan_attributes_table))
     for row in _result_rows(attr_result):
@@ -391,7 +391,7 @@ async def find_a_plan(request):
                 benefit_data["benefit_name"] = benefit_name
                 entry["plan_benefits"][benefit_name] = benefit_data
 
-    return response.json({"total": total, "results": results})
+    return response.json({"total": total, "results": results}, default=str)
 
 
 @blueprint.get("/price/<plan_id>", name="get_price_plan_by_plan_id")
@@ -416,7 +416,7 @@ async def get_price_plan(request, plan_id, year=None, variant=None):
     stmt = select(plan_prices_table).where(plan_prices_table.c.plan_id == plan_id)
     result = await session.execute(stmt)
     data = [_row_to_dict(row) for row in _result_rows(result)]
-    return response.json(data)
+    return response.json(data, default=str)
 
 
 @blueprint.get("/id/<plan_id>", name="get_plan_by_plan_id")
@@ -467,7 +467,7 @@ async def get_plan(request, plan_id, year=None, variant=None):
     plan_data["formulary"] = [_row_to_dict(row) for row in _result_rows(formulary_result)]
 
     if not year:
-        return response.json(plan_data)
+        return response.json(plan_data, default=str)
 
     variant_stmt = select(plan_attributes_table.c.full_plan_id).where(
         and_(
@@ -539,4 +539,4 @@ async def get_plan(request, plan_id, year=None, variant=None):
                 benefit_entry["human_attr_name"] = benefits_labels[name]
             plan_data["variant_benefits"][name] = benefit_entry
 
-    return response.json(plan_data)
+    return response.json(plan_data, default=str)
