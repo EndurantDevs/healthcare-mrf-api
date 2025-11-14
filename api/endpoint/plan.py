@@ -477,21 +477,140 @@ async def get_plan(request, plan_id, year=None, variant=None):
     ).order_by(plan_attributes_table.c.full_plan_id.asc())
 
     variant_result = await session.execute(variant_stmt)
-    variants = [row[0] if isinstance(row, (list, tuple)) else row for row in _result_rows(variant_result)]
+
+    def _unique(values):
+        seen = set()
+        ordered = []
+        for value in values:
+            if value is None:
+                continue
+            if isinstance(value, (list, tuple)):
+                if not value:
+                    continue
+                value = value[0]
+            elif isinstance(value, str):
+                trimmed = value.strip()
+                if trimmed.startswith("(") and trimmed.endswith(")"):
+                    trimmed = trimmed[1:-1].strip()
+                    if trimmed.endswith(","):
+                        trimmed = trimmed[:-1]
+                    if (trimmed.startswith("'") and trimmed.endswith("'")) or (
+                        trimmed.startswith('"') and trimmed.endswith('"')
+                    ):
+                        trimmed = trimmed[1:-1]
+                    value = trimmed
+                else:
+                    value = trimmed
+            normalized = str(value).strip()
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                ordered.append(normalized)
+        return ordered
+
+    variants = _unique([row[0] if isinstance(row, (list, tuple)) else row for row in _result_rows(variant_result)])
+
+    plan_data["attributes"] = {}
+    plan_data["plan_benefits"] = {}
+
+    def _normalize_single(value):
+        cleaned = _unique([value])
+        return cleaned[0] if cleaned else None
+
+    plan_attr_stmt = select(plan_attributes_table).where(
+        and_(
+            plan_attributes_table.c.year == int(year),
+            or_(
+                plan_attributes_table.c.plan_id == plan_id,
+                plan_attributes_table.c.full_plan_id.like(f"{plan_id}%"),
+            ),
+        )
+    )
+    plan_attr_result = await session.execute(plan_attr_stmt)
+    for row in _result_rows(plan_attr_result):
+        row_dict = _row_to_dict(row)
+        full_id = _normalize_single(row_dict.get("full_plan_id"))
+        if full_id and full_id not in variants:
+            variants.append(full_id)
+        name = row_dict.get("attr_name")
+        if name:
+            entry = {"attr_value": row_dict.get("attr_value")}
+            if name in attributes_labels:
+                entry["human_attr_name"] = attributes_labels[name]
+            plan_data["attributes"][name] = entry
+
+    plan_benefit_stmt = select(plan_benefits_table).where(
+        and_(
+            plan_benefits_table.c.year == int(year),
+            or_(
+                plan_benefits_table.c.plan_id == plan_id,
+                plan_benefits_table.c.full_plan_id.like(f"{plan_id}%"),
+            ),
+        )
+    )
+    plan_benefit_result = await session.execute(plan_benefit_stmt)
+
+    def _format_value(copay, coins):
+        values = []
+        if copay and copay != "Not Applicable":
+            values.append(copay)
+        if coins and coins != "Not Applicable":
+            values.append(coins)
+        return ", ".join(values) if values else None
+
+    for row in _result_rows(plan_benefit_result):
+        row_dict = _row_to_dict(row)
+        full_id = _normalize_single(row_dict.get("full_plan_id"))
+        if full_id and full_id not in variants:
+            variants.append(full_id)
+        name = row_dict.get("benefit_name")
+        if name:
+            benefit_entry = row_dict.copy()
+            for key in ("full_plan_id", "year", "plan_id"):
+                benefit_entry.pop(key, None)
+            benefit_entry["in_network_tier1"] = _format_value(
+                benefit_entry.pop("copay_inn_tier1", None),
+                benefit_entry.pop("coins_inn_tier1", None),
+            )
+            benefit_entry["in_network_tier2"] = _format_value(
+                benefit_entry.pop("copay_inn_tier2", None),
+                benefit_entry.pop("coins_inn_tier2", None),
+            )
+            benefit_entry["out_network"] = _format_value(
+                benefit_entry.pop("copay_outof_net", None),
+                benefit_entry.pop("coins_outof_net", None),
+            )
+            if name in benefits_labels:
+                benefit_entry["human_attr_name"] = benefits_labels[name]
+            plan_data["plan_benefits"][name] = benefit_entry
+
+    if not variants:
+        fallback_stmt = select(plan_attributes_table.c.full_plan_id).where(
+            and_(
+                plan_attributes_table.c.full_plan_id.like(f"{plan_id}%"),
+                plan_attributes_table.c.year == int(year),
+            )
+        ).order_by(plan_attributes_table.c.full_plan_id.asc())
+        fallback_result = await session.execute(fallback_stmt)
+        variants = _unique([row[0] if isinstance(row, (list, tuple)) else row for row in _result_rows(fallback_result)])
+
     plan_data["variants"] = variants
 
-    if variant:
-        if variant not in variants:
-            raise sanic.exceptions.NotFound
+    active_variant = _normalize_single(variant) if variant else (variants[0] if variants else None)
+    if variant and (active_variant not in variants):
+        raise sanic.exceptions.NotFound
 
+    plan_data["active_variant"] = active_variant
+    plan_data["variant_attributes"] = {}
+    plan_data["variant_benefits"] = {}
+
+    if active_variant:
         attr_stmt = select(plan_attributes_table).where(
             and_(
-                plan_attributes_table.c.full_plan_id == variant,
+                plan_attributes_table.c.full_plan_id == active_variant,
                 plan_attributes_table.c.year == int(year),
             )
         )
         attr_result = await session.execute(attr_stmt)
-        plan_data["variant_attributes"] = {}
         for row in _result_rows(attr_result):
             row_dict = _row_to_dict(row)
             name = row_dict.get("attr_name")
@@ -499,30 +618,22 @@ async def get_plan(request, plan_id, year=None, variant=None):
             if name in attributes_labels:
                 entry["human_attr_name"] = attributes_labels[name]
             plan_data["variant_attributes"][name] = entry
+            if name not in plan_data["attributes"]:
+                plan_data["attributes"][name] = entry
 
         benefit_stmt = select(plan_benefits_table).where(
             and_(
-                plan_benefits_table.c.full_plan_id == variant,
+                plan_benefits_table.c.full_plan_id == active_variant,
                 plan_benefits_table.c.year == int(year),
             )
         )
         benefit_result = await session.execute(benefit_stmt)
-        plan_data["variant_benefits"] = {}
         for row in _result_rows(benefit_result):
             row_dict = _row_to_dict(row)
             name = row_dict.get("benefit_name")
             benefit_entry = row_dict.copy()
             for key in ("full_plan_id", "year", "plan_id"):
                 benefit_entry.pop(key, None)
-
-            def _format_value(copay, coins):
-                values = []
-                if copay and copay != "Not Applicable":
-                    values.append(copay)
-                if coins and coins != "Not Applicable":
-                    values.append(coins)
-                return ", ".join(values) if values else None
-
             benefit_entry["in_network_tier1"] = _format_value(
                 benefit_entry.pop("copay_inn_tier1", None),
                 benefit_entry.pop("coins_inn_tier1", None),
@@ -538,5 +649,10 @@ async def get_plan(request, plan_id, year=None, variant=None):
             if name in benefits_labels:
                 benefit_entry["human_attr_name"] = benefits_labels[name]
             plan_data["variant_benefits"][name] = benefit_entry
-
+            if name not in plan_data["plan_benefits"]:
+                plan_data["plan_benefits"][name] = benefit_entry
+    if active_variant and not plan_data["variant_attributes"] and plan_data["attributes"]:
+        plan_data["variant_attributes"] = {k: dict(v) for k, v in plan_data["attributes"].items()}
+    if active_variant and not plan_data["variant_benefits"] and plan_data["plan_benefits"]:
+        plan_data["variant_benefits"] = {k: dict(v) for k, v in plan_data["plan_benefits"].items()}
     return response.json(plan_data, default=str)

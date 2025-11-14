@@ -46,6 +46,17 @@ from api.for_human import plan_attributes_labels_to_key
 latin_pattern = re.compile(r"[^\x00-\x7f]")
 
 
+def _normalize_plan_ids(standard_id, full_id):
+    standard = (standard_id or "").strip()
+    full = (full_id or "").strip()
+    if not full:
+        return None, None
+    if not standard:
+        base = full.split("-", 1)[0].strip()
+        standard = base[:14] if base else ""
+    return (standard or None, full)
+
+
 async def startup(ctx):
     loop = asyncio.get_event_loop()
     ctx["context"] = {}
@@ -208,7 +219,10 @@ async def process_attributes(ctx, task):
         # return 1
         async with async_open(tmp_filename, "r", encoding='utf-8-sig') as afp:
             async for row in AsyncDictReader(afp, delimiter=","):
-                if not (row["StandardComponentId"] and row["PlanId"]):
+                plan_id, full_plan_id = _normalize_plan_ids(
+                    row.get("StandardComponentId"), row.get("PlanId")
+                )
+                if not (plan_id and full_plan_id):
                     continue
                 count += 1
                 for key in row:
@@ -216,8 +230,8 @@ async def process_attributes(ctx, task):
                         (key in ("StandardComponentId",)) and (row[key] is None)
                     ) and (t := str(row[key]).strip()):
                         obj = {
-                            "plan_id": row["StandardComponentId"],
-                            "full_plan_id": row["PlanId"],
+                            "plan_id": plan_id,
+                            "full_plan_id": full_plan_id,
                             "year": int(task["year"]),  # int(row['\ufeffBusinessYear'])
                             "attr_name": re.sub(latin_pattern, r"", key),
                             "attr_value": t,
@@ -270,10 +284,16 @@ async def process_benefits(ctx, task):
         # return 1
         async with async_open(tmp_filename, "r", encoding='utf-8-sig') as afp:
             async for row in AsyncDictReader(afp, delimiter=","):
+                plan_id, full_plan_id = _normalize_plan_ids(
+                    row.get("StandardComponentId"), row.get("PlanId")
+                )
+                if not (plan_id and full_plan_id):
+                    continue
+
                 obj = {
                     "year": None,
-                    "plan_id": row["StandardComponentId"],
-                    "full_plan_id": row["PlanId"],
+                    "plan_id": plan_id,
+                    "full_plan_id": full_plan_id,
                     "benefit_name": row["BenefitName"],
                     "copay_inn_tier1": row["CopayInnTier1"],
                     "copay_inn_tier2": row["CopayInnTier2"],
@@ -609,7 +629,10 @@ async def process_state_attributes(ctx, task):
 
         async with async_open(tmp_filename, "r", encoding='utf-8-sig') as afp:
             async for row in AsyncDictReader(afp, delimiter=","):
-                if not (row["STANDARD COMPONENT ID"] and row["PLAN ID"]):
+                plan_id, full_plan_id = _normalize_plan_ids(
+                    row.get("STANDARD COMPONENT ID"), row.get("PLAN ID")
+                )
+                if not (plan_id and full_plan_id):
                     continue
                 count += 1
                 for key in row:
@@ -617,8 +640,8 @@ async def process_state_attributes(ctx, task):
                         (key in ("StandardComponentId",)) and (row[key] is None)
                     ) and (t := str(row[key]).strip()):
                         obj = {
-                            "plan_id": row["STANDARD COMPONENT ID"],
-                            "full_plan_id": row["PLAN ID"],
+                            "plan_id": plan_id,
+                            "full_plan_id": full_plan_id,
                             "year": int(task["year"]),  # int(row['\ufeffBusinessYear'])
                             "attr_name": re.sub(
                                 latin_pattern, r"", plan_attributes_labels_to_key[key]
