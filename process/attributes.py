@@ -216,6 +216,7 @@ async def process_attributes(ctx, task):
                         (key in ("StandardComponentId",)) and (row[key] is None)
                     ) and (t := str(row[key]).strip()):
                         obj = {
+                            "plan_id": row["StandardComponentId"],
                             "full_plan_id": row["PlanId"],
                             "year": int(task["year"]),  # int(row['\ufeffBusinessYear'])
                             "attr_name": re.sub(latin_pattern, r"", key),
@@ -616,6 +617,7 @@ async def process_state_attributes(ctx, task):
                         (key in ("StandardComponentId",)) and (row[key] is None)
                     ) and (t := str(row[key]).strip()):
                         obj = {
+                            "plan_id": row["STANDARD COMPONENT ID"],
                             "full_plan_id": row["PLAN ID"],
                             "year": int(task["year"]),  # int(row['\ufeffBusinessYear'])
                             "attr_name": re.sub(

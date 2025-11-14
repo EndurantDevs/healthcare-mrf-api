@@ -840,7 +840,12 @@ async def init_file(ctx, task=None):
     ctx.setdefault('context', {})
     ctx['context']['test_mode'] = test_mode
 
-    print('Downloading data from: ', os.environ['HLTHPRT_CMSGOV_MRF_URL_PUF'])
+    mrf_source = os.environ['HLTHPRT_CMSGOV_MRF_URL_PUF']
+    try:
+        mrf_urls = json.loads(mrf_source) if mrf_source.strip().startswith('[') else [mrf_source]
+    except json.JSONDecodeError as exc:
+        raise RuntimeError('Invalid HLTHPRT_CMSGOV_MRF_URL_PUF; must be JSON array or single URL') from exc
+    print('Downloading data from: ', ', '.join(mrf_urls))
 
     import_date = ctx['context']['import_date']
     await _prepare_import_tables(import_date)
@@ -951,11 +956,20 @@ async def init_file(ctx, task=None):
 
         for row in xls_file.ws(ws=ws_name).rows:
             if count != 0:
-                url_list.append(row[2])
+                mrf_urls = []
+                raw_url = row[2]
+                if raw_url:
+                    raw_url = str(raw_url).strip()
+                    if raw_url.startswith('['):
+                        try:
+                            mrf_urls = json.loads(raw_url)
+                        except json.JSONDecodeError:
+                            mrf_urls = [raw_url]
+                    else:
+                        mrf_urls = [raw_url]
                 obj = {}
                 obj['state'] = row[0].upper()
                 obj['issuer_id'] = int(row[1])
-                obj['mrf_url'] = row[2]
                 obj['issuer_marketing_name'] = ''
                 issuer_stmt = select(myplantransparency.issuer_name).where(
                     myplantransparency.issuer_id == obj['issuer_id']
@@ -963,17 +977,12 @@ async def init_file(ctx, task=None):
                 issuer_name = await db.scalar(issuer_stmt)
                 obj['issuer_name'] = issuer_name if issuer_name else 'N/A'
                 obj['data_contact_email'] = row[3]
-                obj_list.append(obj)
-                if obj['mrf_url'] in url2issuer:
-                    url2issuer[obj['mrf_url']].append(obj['issuer_id'])
-                else:
-                    url2issuer[obj['mrf_url']] = [obj['issuer_id'], ]
+                for url in mrf_urls:
+                    obj['mrf_url'] = url
+                    obj_list.append(obj.copy())
+                    url_list.append(url)
+                    url2issuer.setdefault(url, []).append(obj['issuer_id'])
             count += 1
-
-        url_list = list(set(url_list))
-
-        for x in obj_list:
-            issuer_list.update({x['issuer_id']: x})
 
         await asyncio.gather(push_objects(list(issuer_list.values()), myissuer),
                              push_objects(list(plan_list.values()), myplan))
