@@ -40,6 +40,47 @@ TEST_MIN_PLAN_COUNT = 1
 def is_test_mode(ctx: dict) -> bool:
     return bool(ctx.get("context", {}).get("test_mode"))
 
+async def _prepare_import_tables(import_date: str) -> None:
+    db_schema = os.getenv('HLTHPRT_DB_SCHEMA') if os.getenv('HLTHPRT_DB_SCHEMA') else 'mrf'
+
+    await db.create_table(ImportHistory.__table__, checkfirst=True)
+    if hasattr(ImportHistory, '__my_index_elements__') and ImportHistory.__my_index_elements__:
+        cols = ', '.join(ImportHistory.__my_index_elements__)
+        try:
+            await db.status(
+                'CREATE UNIQUE INDEX IF NOT EXISTS ' +
+                f"{ImportHistory.__tablename__}_idx_primary ON " +
+                f"{db_schema}.{ImportHistory.__tablename__} ({cols});"
+            )
+        except IntegrityError:
+            pass
+
+    for cls in (Issuer, Plan, PlanFormulary, PlanTransparency, ImportLog, PlanNPIRaw, PlanNetworkTierRaw):
+        obj = make_class(cls, import_date)
+        try:
+            await db.status(
+                'DROP TABLE IF EXISTS ' +
+                f"{db_schema}.{obj.__tablename__};"
+            )
+        except ProgrammingError:
+            pass
+        try:
+            await db.create_table(obj.__table__, checkfirst=True)
+        except (ProgrammingError, DuplicateTableError, IntegrityError):
+            pass
+        if hasattr(obj, '__my_index_elements__') and obj.__my_index_elements__:
+            cols = ', '.join(obj.__my_index_elements__)
+            try:
+                await db.status(
+                    'CREATE UNIQUE INDEX IF NOT EXISTS ' +
+                    f"{obj.__tablename__}_idx_primary ON " +
+                    f"{db_schema}.{obj.__tablename__} ({cols});"
+                )
+            except IntegrityError:
+                pass
+
+    print('Preparing done')
+
 
 async def process_plan(ctx, task):
     """
@@ -802,6 +843,7 @@ async def init_file(ctx, task=None):
     print('Downloading data from: ', os.environ['HLTHPRT_CMSGOV_MRF_URL_PUF'])
 
     import_date = ctx['context']['import_date']
+    await _prepare_import_tables(import_date)
     ctx['context']['run'] += 1
     myissuer = make_class(Issuer, import_date)
     myplan = make_class(Plan, import_date)
@@ -951,54 +993,11 @@ async def init_file(ctx, task=None):
 
 
 async def startup(ctx):
-    """Initialize dynamic import tables for the current run."""
     await my_init_db(db)
     ctx['context'] = {}
     ctx['context']['start'] = datetime.datetime.utcnow()
     ctx['context']['run'] = 0
     ctx['context']['import_date'] = datetime.datetime.utcnow().strftime("%Y%m%d")
-    import_date = ctx['context']['import_date']
-    db_schema = os.getenv('HLTHPRT_DB_SCHEMA') if os.getenv('HLTHPRT_DB_SCHEMA') else 'mrf'
-
-    await db.create_table(ImportHistory.__table__, checkfirst=True)
-    if hasattr(ImportHistory, '__my_index_elements__') and ImportHistory.__my_index_elements__:
-        cols = ', '.join(ImportHistory.__my_index_elements__)
-        try:
-            await db.status(
-                'CREATE UNIQUE INDEX IF NOT EXISTS ' +
-                f"{ImportHistory.__tablename__}_idx_primary ON " +
-                f"{db_schema}.{ImportHistory.__tablename__} ({cols});"
-            )
-        except IntegrityError:
-            pass
-
-    tables = {}
-    for cls in (Issuer, Plan, PlanFormulary, PlanTransparency, ImportLog, PlanNPIRaw, PlanNetworkTierRaw):
-        tables[cls.__main_table__] = make_class(cls, import_date)
-        obj = tables[cls.__main_table__]
-        try:
-            await db.status(
-                'DROP TABLE IF EXISTS ' +
-                f"{db_schema}.{obj.__tablename__};"
-            )
-        except ProgrammingError:
-            pass
-        try:
-            await db.create_table(obj.__table__, checkfirst=True)
-        except (ProgrammingError, DuplicateTableError, IntegrityError):
-            pass
-        if hasattr(obj, '__my_index_elements__') and obj.__my_index_elements__:
-            cols = ', '.join(obj.__my_index_elements__)
-            try:
-                await db.status(
-                    'CREATE UNIQUE INDEX IF NOT EXISTS ' +
-                    f"{obj.__tablename__}_idx_primary ON " +
-                    f"{db_schema}.{obj.__tablename__} ({cols});"
-                )
-            except IntegrityError:
-                pass
-
-    print('Preparing done')
 
 
 
