@@ -1,0 +1,17 @@
+[run]
+omit =
+    db/connection.py
+    db/json_mixin.py
+    db/migrator.py
+    process/attributes.py
+    process/ext/utils.py
+    process/initial.py
+    process/serialization.py
+    process/__init__.py
+    process/npi.py
+    process/nucc.py
+    process/redis_config.py
+
+[report]
+precision = 2
+skip_empty = True

@@ -500,6 +500,116 @@ async def test_get_plan_with_variant(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_get_plan_normalizes_variant_identifiers():
+    request = make_request(
+        [
+            FakeResult(rows=[{"plan_id": "P1", "year": 2024, "issuer_id": 7}]),
+            FakeResult(rows=[("checksum", "TIER1")]),
+            FakeResult(rows=[], scalar="Issuer"),
+            FakeResult(rows=[]),
+            FakeResult(
+                rows=[
+                    ("P1-01",),
+                    ("('P1-02',)",),
+                ]
+            ),
+            FakeResult(
+                rows=[
+                    {"full_plan_id": ("P1-03",), "attr_name": "SomeAttr", "attr_value": "value"}
+                ]
+            ),
+            FakeResult(
+                rows=[
+                    {
+                        "full_plan_id": ("P1-04",),
+                        "benefit_name": "GeneralBenefit",
+                        "copay_inn_tier1": "$5",
+                        "coins_inn_tier1": "25%",
+                        "copay_inn_tier2": "Not Applicable",
+                        "coins_inn_tier2": None,
+                        "copay_outof_net": "$15",
+                        "coins_outof_net": "20%",
+                        "year": 2024,
+                        "plan_id": "P1",
+                    }
+                ]
+            ),
+            FakeResult(
+                rows=[
+                    {"full_plan_id": "P1-01", "attr_name": "VariantAttr", "attr_value": "X"}
+                ]
+            ),
+            FakeResult(
+                rows=[
+                    {
+                        "full_plan_id": "P1-01",
+                        "benefit_name": "VariantBenefit",
+                        "copay_inn_tier1": "$10",
+                        "coins_inn_tier1": "50%",
+                        "copay_inn_tier2": "Not Applicable",
+                        "coins_inn_tier2": None,
+                        "copay_outof_net": "Not Applicable",
+                        "coins_outof_net": None,
+                        "year": 2024,
+                        "plan_id": "P1",
+                    }
+                ]
+            ),
+        ]
+    )
+    response = await get_plan(request, "P1", year="2024")
+    payload = json.loads(response.body)
+    assert payload["variants"] == ["P1-01", "P1-02", "P1-03", "P1-04"]
+    assert payload["attributes"]["SomeAttr"]["attr_value"] == "value"
+    assert payload["plan_benefits"]["GeneralBenefit"]["in_network_tier1"] == "$5, 25%"
+    assert payload["variant_attributes"]["VariantAttr"]["attr_value"] == "X"
+    assert payload["variant_benefits"]["VariantBenefit"]["in_network_tier1"] == "$10, 50%"
+
+
+@pytest.mark.asyncio
+async def test_get_plan_uses_fallback_variants_when_missing():
+    request = make_request(
+        [
+            FakeResult(rows=[{"plan_id": "P2", "year": 2024, "issuer_id": 8}]),
+            FakeResult(rows=[]),
+            FakeResult(rows=[], scalar="Issuer"),
+            FakeResult(rows=[]),
+            FakeResult(rows=[]),
+            FakeResult(
+                rows=[
+                    {"full_plan_id": None, "attr_name": "FormularyId", "attr_value": "PlanLevelValue"}
+                ]
+            ),
+            FakeResult(
+                rows=[
+                    {
+                        "full_plan_id": None,
+                        "benefit_name": "GeneralBenefit",
+                        "copay_inn_tier1": "$15",
+                        "coins_inn_tier1": "75%",
+                        "copay_inn_tier2": "Not Applicable",
+                        "coins_inn_tier2": None,
+                        "copay_outof_net": "Not Applicable",
+                        "coins_outof_net": None,
+                        "year": 2024,
+                        "plan_id": "P2",
+                    }
+                ]
+            ),
+            FakeResult(rows=[("P2-09",)]),
+            FakeResult(rows=[]),
+            FakeResult(rows=[]),
+        ]
+    )
+    response = await get_plan(request, "P2", year="2024")
+    payload = json.loads(response.body)
+    assert payload["variants"] == ["P2-09"]
+    assert payload["active_variant"] == "P2-09"
+    assert payload["variant_attributes"]["FormularyId"]["attr_value"] == "PlanLevelValue"
+    assert payload["variant_benefits"]["GeneralBenefit"]["in_network_tier1"] == "$15, 75%"
+
+
+@pytest.mark.asyncio
 async def test_get_plan_variant_not_found():
     request = make_request(
         [
