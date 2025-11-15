@@ -623,6 +623,60 @@ async def test_get_plan_variant_not_found():
     with pytest.raises(sanic.exceptions.NotFound):
         await get_plan(request, "P1", year="2024", variant="P1-99")
 
+
+@pytest.mark.asyncio
+async def test_plan_variants_unique_and_clean():
+    request = make_request(
+        [
+            FakeResult(rows=[{"plan_id": "P1", "year": 2024, "issuer_id": 7}]),
+            FakeResult(rows=[("checksum", "TIER1")]),
+            FakeResult(rows=[], scalar="Issuer Name"),
+            FakeResult(rows=[]),
+            FakeResult(rows=[("('P1-00',)",), ("('P1-01',)",)]),
+            FakeResult(
+                rows=[
+                    {"full_plan_id": "('P1-00',)", "attr_name": "AttrA", "attr_value": "A"},
+                    {"full_plan_id": "P1-02", "attr_name": "AttrB", "attr_value": "B"},
+                ]
+            ),
+            FakeResult(
+                rows=[
+                    {
+                        "full_plan_id": "('P1-00',)",
+                        "benefit_name": "BenefitA",
+                        "copay_inn_tier1": "$5",
+                        "coins_inn_tier1": "10%",
+                        "copay_inn_tier2": None,
+                        "coins_inn_tier2": None,
+                        "copay_outof_net": None,
+                        "coins_outof_net": None,
+                        "year": 2024,
+                        "plan_id": "P1",
+                    }
+                ]
+            ),
+            FakeResult(rows=[{"attr_name": "AttrA", "attr_value": "A"}]),
+            FakeResult(
+                rows=[
+                    {
+                        "benefit_name": "BenefitA",
+                        "copay_inn_tier1": "$5",
+                        "coins_inn_tier1": "10%",
+                        "copay_inn_tier2": None,
+                        "coins_inn_tier2": None,
+                        "copay_outof_net": None,
+                        "coins_outof_net": None,
+                        "year": 2024,
+                        "plan_id": "P1",
+                    }
+                ]
+            ),
+        ]
+    )
+    response = await get_plan(request, "P1", year="2024")
+    payload = json.loads(response.body)
+    assert payload["variants"] == ["P1-00", "P1-01", "P1-02"]
+
 def test_result_rows_handles_typeerror():
     class BadAll:
         def all(self):
