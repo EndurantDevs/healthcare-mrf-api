@@ -59,6 +59,6 @@ async def issuer_import_data(request, issuer_id):
     data['err_log'] = []
     data['import_errors_count'] = len(err_log)
 
-    for e in err_log:
-        data['err_log'].append(e.to_json_dict())
+    for err_entry in err_log:
+        data['err_log'].append(err_entry.to_json_dict())
     return response.json(data)

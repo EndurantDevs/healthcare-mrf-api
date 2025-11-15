@@ -11,7 +11,6 @@ from api.endpoint.nucc import blueprint as v1_nucc
 from api.endpoint.geo import blueprint as v1_geo
 
 
-
 def init_api(api):
     db.init_app(api)
     api_bluenprint = Blueprint.group([v1_healthcheck, v1_plan, v1_import, v1_issuer, v1_npi, v1_nucc, v1_geo],

@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 from datetime import datetime
-from urllib.parse import unquote_plus
-
 import sanic.exceptions
 from sanic import Blueprint, response
 from sqlalchemy import and_, or_, select
@@ -309,13 +307,13 @@ async def get_autocomplete_list(request):
 async def find_a_plan(request):
     args = request.args
     age = args.get("age")
-    rating_area = args.get("rating_area")
-    zip_code = args.get("zip_code")
+    args.get("rating_area")
+    args.get("zip_code")
     year = args.get("year")
     limit = args.get("limit") or 100
     page = args.get("page") or 1
-    order = args.get("order", "asc").lower()
-    order_by = args.get("order_by", "plan_id")
+    args.get("order", "asc")
+    args.get("order_by", "plan_id")
 
     try:
         limit = int(limit)
@@ -326,9 +324,6 @@ async def find_a_plan(request):
         page = max(int(page) - 1, 0)
     except (TypeError, ValueError):
         page = 0
-
-    if order not in {"asc", "desc"}:
-        order = "asc"
 
     if year:
         try:
@@ -399,7 +394,7 @@ async def find_a_plan(request):
 async def get_price_plan(request, plan_id, year=None, variant=None):
     session = _get_session(request)
     age = request.args.get("age")
-    rating_area = request.args.get("rating_area")
+    request.args.get("rating_area")
 
     if year:
         try:
