@@ -17,9 +17,9 @@ blueprint = Blueprint('geo', url_prefix='/geo', version=1)
 
 
 @blueprint.get('/get')
-async def get_geo(request):
-    zip_code = float(request.args.get("zip_code"))
-    in_lat = float(request.args.get("lat"))
+async def get_geo_status(request):
+    request.args.get("zip_code")
+    request.args.get("lat")
     data = {
         'date': datetime.utcnow().isoformat(),
         'release': request.app.config.get('RELEASE'),

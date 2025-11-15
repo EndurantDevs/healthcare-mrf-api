@@ -11,11 +11,10 @@ import glob
 import re
 from arq import create_pool
 from arq.connections import RedisSettings
-from pathlib import Path, PurePath
+from pathlib import PurePath
 from aiocsv import AsyncDictReader
 import zipfile
 
-import pylightxl as xl
 from aiofile import async_open
 from async_unzip.unzipper import unzip
 
@@ -23,15 +22,11 @@ from process.ext.utils import (
     download_it_and_save,
     make_class,
     push_objects,
-    log_error,
     print_time_info,
-    flush_error_log,
     return_checksum,
 )
 from dateutil.parser import parse as parse_date
 from db.models import (
-    Issuer,
-    Plan,
     PlanBenefits,
     PlanAttributes,
     PlanPrices,
@@ -127,12 +122,12 @@ async def shutdown(ctx):
                     f"({', '.join(index.get('index_elements'))}){where};"
                 )
                 print(create_index_sql)
-                x = await db.status(create_index_sql)
+                await db.status(create_index_sql)
 
         print(f"Post-Index VACUUM FULL ANALYZE {db_schema}.{obj.__tablename__};")
         await db.execute_ddl(f"VACUUM FULL ANALYZE {db_schema}.{obj.__tablename__};")
 
-    async with db.transaction() as tx:
+    async with db.transaction():
         for cls in processing_classes_array:
             tables[cls.__main_table__] = make_class(cls, import_date)
             obj = tables[cls.__main_table__]
@@ -198,7 +193,6 @@ async def process_attributes(ctx, task):
     print("Downloading data from: ", task["url"])
 
     import_date = ctx["import_date"]
-    myissuer = make_class(Issuer, import_date)
     myplanattributes = make_class(PlanAttributes, import_date)
 
     with tempfile.TemporaryDirectory() as tmpdirname:
@@ -207,7 +201,7 @@ async def process_attributes(ctx, task):
         await download_it_and_save(task["url"], tmp_filename)
         try:
             await unzip(tmp_filename, tmpdirname)
-        except:
+        except Exception:
             with zipfile.ZipFile(tmp_filename, 'r') as zip_ref:
                 zip_ref.extractall(tmpdirname)
 
@@ -245,11 +239,6 @@ async def process_attributes(ctx, task):
                     await redis.enqueue_job(
                         "save_attributes", {"attr_obj_list": attr_obj_list}
                     )
-                    # await push_objects(attr_obj_list, myplanattributes)
-                    # test = {}
-                    # for x in attr_obj_list:
-                    #     test[x['full_plan_id']] = 1
-                    # print(f"{task['year']}: processed {total_count} + rows {len(attr_obj_list)} -- {row['StandardComponentId']} -- {len(test.keys())}")
                     attr_obj_list.clear()
                     count = 0
                 else:
@@ -272,7 +261,7 @@ async def process_benefits(ctx, task):
         await download_it_and_save(task["url"], tmp_filename)
         try:
             await unzip(tmp_filename, tmpdirname)
-        except:
+        except Exception:
             with zipfile.ZipFile(tmp_filename, 'r') as zip_ref:
                 zip_ref.extractall(tmpdirname)
 
@@ -330,7 +319,7 @@ async def process_benefits(ctx, task):
                         obj["limit_qty"] = float(row["LimitQty"])
                     except ValueError:
                         pass
-                
+
                 try:
                     if row["BusinessYear"]:
                         try:
@@ -357,8 +346,8 @@ async def process_benefits(ctx, task):
             if attr_obj_list:
                 await push_objects(attr_obj_list, myplanbenefits)
 
+
 async def process_rating_areas(ctx):
-    redis = ctx["redis"]
     print("Importing Rating Areas")
     import_date = ctx["import_date"]
     myplanrating = make_class(PlanRatingAreas, import_date)
@@ -384,7 +373,6 @@ async def process_prices(ctx, task):
     print("Downloading data from: ", task["url"])
 
     import_date = ctx["import_date"]
-    myissuer = make_class(Issuer, import_date)
     myplanprices = make_class(PlanPrices, import_date)
 
     with tempfile.TemporaryDirectory() as tmpdirname:
@@ -393,7 +381,7 @@ async def process_prices(ctx, task):
         await download_it_and_save(task["url"], tmp_filename)
         try:
             await unzip(tmp_filename, tmpdirname)
-        except:
+        except Exception:
             with zipfile.ZipFile(tmp_filename, 'r') as zip_ref:
                 zip_ref.extractall(tmpdirname)
 
@@ -597,7 +585,7 @@ async def process_prices(ctx, task):
         #
         # for url in url_list:
         #     await redis.enqueue_job('process_json_index', {'url': url, 'issuer_array': url2issuer[url]})
-        #     # break
+#     # break
 
 
 async def process_state_attributes(ctx, task):
@@ -614,15 +602,13 @@ async def process_state_attributes(ctx, task):
         await download_it_and_save(task["url"], tmp_filename)
         try:
             await unzip(tmp_filename, tmpdirname)
-        except:
+        except Exception:
             with zipfile.ZipFile(tmp_filename, 'r') as zip_ref:
                 zip_ref.extractall(tmpdirname)
 
         tmp_filename = glob.glob(f"{tmpdirname}/*Plans*.csv")[0]
         total_count = 0
         attr_obj_list = []
-
-        plan_list = {}
 
         count = 0
         # return 1
@@ -657,11 +643,6 @@ async def process_state_attributes(ctx, task):
                     await redis.enqueue_job(
                         "save_attributes", {"attr_obj_list": attr_obj_list}
                     )
-                    # await push_objects(attr_obj_list, myplanattributes)
-                    # test = {}
-                    # for x in attr_obj_list:
-                    #     test[x['full_plan_id']] = 1
-                    # print(f"{task['year']}: processed {total_count} + rows {len(attr_obj_list)} -- {row['StandardComponentId']} -- {len(test.keys())}")
                     attr_obj_list.clear()
                     count = 0
                 else:
@@ -669,62 +650,6 @@ async def process_state_attributes(ctx, task):
 
             if attr_obj_list:
                 await push_objects(attr_obj_list, myplanattributes)
-
-        # async with async_open(tmp_filename, 'r') as afp:
-        #     async for row in AsyncDictReader(afp, delimiter=","):
-        #         import pprint
-        #         real_key = {}
-        #         for key in attributes_labels:
-        #             real_key[key.lower()] = key
-        #
-        #         for key in row:
-        #             row[key] = real_key.get(''.join(x for x in key.lower() if not x.isspace()), None)
-        #
-        #         pprint.pprint(row)
-        #         exit(1)
-        #
-        #         if not (row['STANDARD COMPONENT ID'] and row['PLAN ID']):
-        #             continue
-        #         count += 1
-        #         # for key in row:
-        #         # this must be re-written to unify with other Plan Attributes
-        #         # too much hardcoding!!
-        #         if t := str(row.get('BENEFIT NAME', '').strip()):
-        #             if row['IS COVERED'].lower() == 'yes':
-        #                 value = 'Covered.'
-        #             else:
-        #                 value = 'Not Covered.'
-        #
-        #             if row['QUANTITY LIMIT ON SVC'].lower() == 'yes':
-        #                 value += f" {row['LIMIT QUANTITY']} {row['LIMIT UNIT']}."
-        #
-        #             if t2 := row['EXPLANATION'].strip():
-        #                 value += f" {t2}"
-        #             obj = {
-        #                 'full_plan_id': row['PLAN ID'],
-        #                 'year': int(task['year']),  # int(row['\ufeffBusinessYear'])
-        #                 'attr_name': re.sub(latin_pattern,r'', t),
-        #                 'attr_value': value
-        #             }
-        #
-        #             attr_obj_list.append(obj)
-        #
-        #         if count > 10000:
-        #             #int(os.environ.get('HLTHPRT_SAVE_PER_PACK', 100)):
-        #             total_count += count
-        #             await redis.enqueue_job('save_attributes', {'attr_obj_list': attr_obj_list})
-        #             # await push_objects(attr_obj_list, myplanattributes)
-        #             # test = {}
-        #             # for x in attr_obj_list:
-        #             #     test[x['full_plan_id']] = 1
-        #             # print(f"{task['year']}: processed {total_count} + rows {len(attr_obj_list)} -- {row['StandardComponentId']} -- {len(test.keys())}")
-        #             attr_obj_list.clear()
-        #             count = 0
-        #         else:
-        #             count += 1
-        #
-        #     if attr_obj_list:
-        #         await push_objects(attr_obj_list, myplanattributes)
 
 
 async def main():
@@ -745,27 +670,27 @@ async def main():
     print("Starting to process STATE Plan Attribute files..")
     for file in state_attribute_files:
         print("Adding: ", file)
-        x = await redis.enqueue_job(
+        await redis.enqueue_job(
             "process_state_attributes", {"url": file["url"], "year": file["year"]}
         )
 
     print("Starting to process Plan Attribute files..")
     for file in attribute_files:
         print("Adding: ", file)
-        x = await redis.enqueue_job(
+        await redis.enqueue_job(
             "process_attributes", {"url": file["url"], "year": file["year"]}
         )
 
     print("Starting to process Plan Prices files..")
     for file in price_files:
         print("Adding: ", file)
-        x = await redis.enqueue_job(
+        await redis.enqueue_job(
             "process_prices", {"url": file["url"], "year": file["year"]}
         )
 
     print("Starting to process Plan Benefits files..")
     for file in benefits_files:
         print("Adding: ", file)
-        x = await redis.enqueue_job(
+        await redis.enqueue_job(
             "process_benefits", {"url": file["url"], "year": file["year"]}
         )
