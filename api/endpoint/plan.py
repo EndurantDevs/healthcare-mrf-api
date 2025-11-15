@@ -588,6 +588,7 @@ async def get_plan(request, plan_id, year=None, variant=None):
         fallback_result = await session.execute(fallback_stmt)
         variants = _unique([row[0] if isinstance(row, (list, tuple)) else row for row in _result_rows(fallback_result)])
 
+    variants = _unique(variants)
     plan_data["variants"] = variants
 
     active_variant = _normalize_single(variant) if variant else (variants[0] if variants else None)
