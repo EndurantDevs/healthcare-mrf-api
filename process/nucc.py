@@ -6,7 +6,7 @@ import datetime
 import tempfile
 import re
 from arq import create_pool
-from pathlib import Path, PurePath
+from pathlib import PurePath
 from aiocsv import AsyncDictReader
 from aiofile import async_open
 
@@ -60,10 +60,10 @@ async def process_data(ctx, task=None):
 
 
             row_list = []
-            myNUCCTaxonomy = make_class(NUCCTaxonomy, import_date)
+            nucc_taxonomy_cls = make_class(NUCCTaxonomy, import_date)
             async with async_open(tmp_filename, 'r', encoding='utf-8-sig') as afp:
                 async for row in AsyncDictReader(afp, delimiter=","):
-                    if not (row['Code']):
+                    if not row['Code']:
                         continue
                     count += 1
                     if test_mode and count > TEST_NUCC_ROWS:
@@ -71,20 +71,20 @@ async def process_data(ctx, task=None):
                     if not count % 100_000:
                         print(f"Processed: {count}")
                     obj = {}
-                    for key in csv_map:
+                    for key, mapped_key in csv_map.items():
                         t = row[key]
                         if not t:
-                            obj[csv_map[key]] = None
+                            obj[mapped_key] = None
                             continue
-                        obj[csv_map[key]] = t
+                        obj[mapped_key] = t
                     obj['int_code'] = return_checksum([obj['code'],], crc=32)
                     row_list.append(obj)
                     if count % 9999 == 0:
-                        await push_objects(row_list, myNUCCTaxonomy)
+                        await push_objects(row_list, nucc_taxonomy_cls)
                         row_list.clear()
 
 
-            await push_objects(row_list, myNUCCTaxonomy)
+            await push_objects(row_list, nucc_taxonomy_cls)
             print(f"Processed: {count}")
         return 1
 

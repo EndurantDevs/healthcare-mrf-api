@@ -17,9 +17,23 @@ blueprint = Blueprint("issuer", url_prefix="/issuer", version=1)
 
 
 def _row_to_dict(row):
-    if hasattr(row, "_mapping"):
-        return dict(row._mapping)
-    return dict(row)
+    mapping = getattr(row, "_mapping", None)
+    if mapping is not None:
+        try:
+            return dict(mapping)
+        except (TypeError, ValueError):
+            pass
+    if hasattr(row, "keys") and hasattr(row, "__getitem__"):
+        try:
+            return {key: row[key] for key in row.keys()}
+        except (TypeError, ValueError):
+            pass
+    if isinstance(row, dict):
+        return dict(row)
+    try:
+        return dict(row)
+    except (TypeError, ValueError):
+        return {}
 
 
 @blueprint.get("/id/<issuer_id>")

@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import os
+import sys
 import msgpack
 import asyncio
 import datetime
@@ -39,6 +40,26 @@ from api.for_human import plan_attributes_labels_to_key
 
 
 latin_pattern = re.compile(r"[^\x00-\x7f]")
+
+
+async def _safe_unzip(zip_path: str, destination: str) -> None:
+    try:
+        await unzip(zip_path, destination)
+    except (zipfile.BadZipFile, RuntimeError, ValueError) as exc:
+        print(f"Falling back to zipfile extraction for {zip_path}: {exc}")
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(destination)
+
+
+def _parse_flag(value, truthy: tuple[str, ...], falsy: tuple[str, ...]) -> bool | None:
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized in truthy:
+        return True
+    if normalized in falsy:
+        return False
+    return None
 
 
 def _normalize_plan_ids(standard_id, full_id):
@@ -199,11 +220,7 @@ async def process_attributes(ctx, task):
         p = "attr.csv"
         tmp_filename = str(PurePath(str(tmpdirname), p + ".zip"))
         await download_it_and_save(task["url"], tmp_filename)
-        try:
-            await unzip(tmp_filename, tmpdirname)
-        except Exception:
-            with zipfile.ZipFile(tmp_filename, 'r') as zip_ref:
-                zip_ref.extractall(tmpdirname)
+        await _safe_unzip(tmp_filename, tmpdirname)
 
         tmp_filename = glob.glob(f"{tmpdirname}/*.csv")[0]
         total_count = 0
@@ -216,7 +233,7 @@ async def process_attributes(ctx, task):
                 plan_id, full_plan_id = _normalize_plan_ids(
                     row.get("StandardComponentId"), row.get("PlanId")
                 )
-                if not (plan_id and full_plan_id):
+                if not plan_id or not full_plan_id:
                     continue
                 count += 1
                 for key in row:
@@ -259,11 +276,7 @@ async def process_benefits(ctx, task):
         p = "benefits.csv"
         tmp_filename = str(PurePath(str(tmpdirname), p + ".zip"))
         await download_it_and_save(task["url"], tmp_filename)
-        try:
-            await unzip(tmp_filename, tmpdirname)
-        except Exception:
-            with zipfile.ZipFile(tmp_filename, 'r') as zip_ref:
-                zip_ref.extractall(tmpdirname)
+        await _safe_unzip(tmp_filename, tmpdirname)
 
         tmp_filename = glob.glob(f"{tmpdirname}/*.csv")[0]
         total_count = 0
@@ -276,7 +289,7 @@ async def process_benefits(ctx, task):
                 plan_id, full_plan_id = _normalize_plan_ids(
                     row.get("StandardComponentId"), row.get("PlanId")
                 )
-                if not (plan_id and full_plan_id):
+                if not plan_id or not full_plan_id:
                     continue
 
                 obj = {
@@ -290,29 +303,29 @@ async def process_benefits(ctx, task):
                     "coins_inn_tier1": row["CoinsInnTier1"],
                     "coins_inn_tier2": row["CoinsInnTier2"],
                     "coins_outof_net": row["CoinsOutofNet"],
-                    "is_ehb": True if row["IsEHB"].lower().strip() in ("yes", "y") else False,
-                    "is_covered": True
-                    if row["IsCovered"].lower().strip() == "covered"
-                    else False
-                    if row["IsCovered"].lower().strip() == "not covered"
-                    else None,
-                    "quant_limit_on_svc": True if row["QuantLimitOnSvc"].lower().strip() in ("yes", "y") else False,
+                    "is_ehb": None,
+                    "is_covered": None,
+                    "quant_limit_on_svc": None,
                     "limit_qty": None,
                     "limit_unit": row["LimitUnit"],
                     "exclusions": row["Exclusions"],
                     "explanation": row["Explanation"],
                     "ehb_var_reason": row["EHBVarReason"],
-                    "is_excl_from_inn_mo": True
-                    if row["IsExclFromInnMOOP"].lower().strip() in ("yes", "y")
-                    else False
-                    if row["IsExclFromInnMOOP"].lower().strip() in ("no", "n")
-                    else None,
-                    "is_excl_from_oon_mo": True
-                    if row["IsExclFromOonMOOP"].lower().strip() in ("yes", "y")
-                    else False
-                    if row["IsExclFromOonMOOP"].lower().strip() in ("no", "n")
-                    else None,
+                    "is_excl_from_inn_mo": None,
+                    "is_excl_from_oon_mo": None,
                 }
+
+                obj["is_ehb"] = _parse_flag(row.get("IsEHB"), ("yes", "y"), ("no", "n"))
+                obj["is_covered"] = _parse_flag(row.get("IsCovered"), ("covered",), ("not covered",))
+                obj["quant_limit_on_svc"] = _parse_flag(
+                    row.get("QuantLimitOnSvc"), ("yes", "y"), ("no", "n")
+                )
+                obj["is_excl_from_inn_mo"] = _parse_flag(
+                    row.get("IsExclFromInnMOOP"), ("yes", "y"), ("no", "n")
+                )
+                obj["is_excl_from_oon_mo"] = _parse_flag(
+                    row.get("IsExclFromOonMOOP"), ("yes", "y"), ("no", "n")
+                )
 
                 if row["LimitQty"]:
                     try:
@@ -328,7 +341,7 @@ async def process_benefits(ctx, task):
                             continue
                 except KeyError:
                     print(row)
-                    exit(1)
+                    sys.exit(1)
 
                 attr_obj_list.append(obj)
 
@@ -379,11 +392,7 @@ async def process_prices(ctx, task):
         p = "rate.csv"
         tmp_filename = str(PurePath(str(tmpdirname), p + ".zip"))
         await download_it_and_save(task["url"], tmp_filename)
-        try:
-            await unzip(tmp_filename, tmpdirname)
-        except Exception:
-            with zipfile.ZipFile(tmp_filename, 'r') as zip_ref:
-                zip_ref.extractall(tmpdirname)
+        await _safe_unzip(tmp_filename, tmpdirname)
 
         tmp_filename = glob.glob(f"{tmpdirname}/*.csv")[0]
         total_count = 0
@@ -600,11 +609,7 @@ async def process_state_attributes(ctx, task):
         p = "attr.csv"
         tmp_filename = str(PurePath(str(tmpdirname), p + ".zip"))
         await download_it_and_save(task["url"], tmp_filename)
-        try:
-            await unzip(tmp_filename, tmpdirname)
-        except Exception:
-            with zipfile.ZipFile(tmp_filename, 'r') as zip_ref:
-                zip_ref.extractall(tmpdirname)
+        await _safe_unzip(tmp_filename, tmpdirname)
 
         tmp_filename = glob.glob(f"{tmpdirname}/*Plans*.csv")[0]
         total_count = 0
@@ -618,7 +623,7 @@ async def process_state_attributes(ctx, task):
                 plan_id, full_plan_id = _normalize_plan_ids(
                     row.get("STANDARD COMPONENT ID"), row.get("PLAN ID")
                 )
-                if not (plan_id and full_plan_id):
+                if not plan_id or not full_plan_id:
                     continue
                 count += 1
                 for key in row:

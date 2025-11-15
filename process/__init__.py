@@ -30,7 +30,7 @@ class MRF:
     job_deserializer = deserialize_job
 
 
-class MRF_start:
+class MRF_start:  # pylint: disable=invalid-name
     functions = [init_file]
     on_startup = initial_startup
     max_jobs = 20
@@ -43,7 +43,7 @@ class MRF_start:
     job_deserializer = deserialize_job
 
 
-class MRF_finish:
+class MRF_finish:  # pylint: disable=invalid-name
     functions = [shutdown_mrf]
     on_startup = db_startup
     max_jobs = 20
@@ -60,7 +60,7 @@ class Attributes:
     functions = [process_attributes, process_state_attributes, process_prices, process_benefits, save_attributes]
     on_startup = attr_startup
     on_shutdown = attr_shutdown
-    max_jobs=20
+    max_jobs = 20
     queue_read_limit = 5
     job_timeout = 3600
     redis_settings = build_redis_settings()
@@ -72,16 +72,16 @@ class NPI:
     functions = [process_npi_data, save_npi_data, process_npi_chunk]
     on_startup = npi_startup
     on_shutdown = npi_shutdown
-    max_jobs=20
+    max_jobs = 20
     queue_read_limit = 5
     queue_name = 'arq:NPI'
-    job_timeout=86400
+    job_timeout = 86400
     redis_settings = build_redis_settings()
     job_serializer = serialize_job
     job_deserializer = deserialize_job
 
 
-class NPI_finish:
+class NPI_finish:  # pylint: disable=invalid-name
     functions = [npi_shutdown]
     on_startup = db_startup
     max_jobs = 20
@@ -98,9 +98,9 @@ class NUCC:
     functions = [process_nucc_data]
     on_startup = nucc_startup
     on_shutdown = nucc_shutdown
-    max_jobs=20
+    max_jobs = 20
     queue_read_limit = 5
-    job_timeout=86400
+    job_timeout = 86400
     redis_settings = build_redis_settings()
     job_serializer = serialize_job
     job_deserializer = deserialize_job
