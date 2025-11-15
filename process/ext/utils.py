@@ -105,7 +105,7 @@ async def download_it_and_save(url, filepath, chunk_size=None, context=None, log
                 try:
                     async with client.get(url) as response:
                         try:
-                            #response.raise_for_status()
+                            # response.raise_for_status()
                             print(f"Response size: {response.content_length} bytes")
                         except aiohttp.ClientResponseError as exc:
                             if context and logger:
@@ -250,8 +250,8 @@ async def push_objects_slow(obj_list, cls):
                     if hasattr(cls, "__my_index_elements__"):
                         stmt = stmt.on_conflict_do_nothing(index_elements=cls.__my_index_elements__)
                     await stmt.status()
-                except (SQLAlchemyError, UniqueViolationError) as e:
-                    print(e)
+                except (SQLAlchemyError, UniqueViolationError) as exc:
+                    print(exc)
 
 class IterateList:
 
@@ -279,11 +279,11 @@ async def my_init_db(db):
 
 
 def deduplicate_dicts(dict_list, key_fields):
-                seen = {}
-                for d in dict_list:
-                    key = tuple(d.get(k) for k in key_fields)
-                    seen[key] = d  # keep the last occurrence
-                return list(seen.values())
+    seen = {}
+    for dict_entry in dict_list:
+        key = tuple(dict_entry.get(field) for field in key_fields)
+        seen[key] = dict_entry  # keep the last occurrence
+    return list(seen.values())
 
 
 async def push_objects(obj_list, cls, rewrite=False):
@@ -298,7 +298,7 @@ async def push_objects(obj_list, cls, rewrite=False):
         #     obj_list = deduplicate_dicts(obj_list, cls.__my_index_elements__)
         
         try:
-            #raise UniqueViolationError
+            # raise UniqueViolationError
             async with db.acquire() as conn:
                 raw_conn = conn.raw_connection
                 driver_conn = getattr(raw_conn, "driver_connection", raw_conn)

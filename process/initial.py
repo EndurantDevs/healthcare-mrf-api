@@ -1,10 +1,12 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+# pylint: disable=too-many-branches,too-many-locals,too-many-statements,too-many-nested-blocks,broad-exception-caught,too-many-return-statements,not-callable
 
 import asyncio
 import datetime
 import glob
 import logging
 import os
+import sys
 import tempfile
 import json
 from pathlib import Path, PurePath
@@ -63,6 +65,14 @@ logger = logging.getLogger(__name__)
 
 def is_test_mode(ctx: dict) -> bool:
     return bool(ctx.get("context", {}).get("test_mode"))
+
+
+def _truthy(value, truthy=("yes", "y", "true")) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() in truthy
+    return bool(value)
 
 
 async def _prepare_import_tables(import_date: str) -> None:
@@ -162,7 +172,7 @@ async def process_plan(ctx, task):
                                 "formulary",
                                 "last_updated_on",
                             ):
-                                if not (k in res and res[k] is not None):
+                                if k not in res or res[k] is None:
                                     await log_error(
                                         "err",
                                         f"Mandatory field `{k}` is not present or incorrect. Plan ID: "
@@ -174,7 +184,7 @@ async def process_plan(ctx, task):
                                         myimportlog,
                                     )
 
-                            if not int(res["plan_id"][:5]) in task.get("issuer_array"):
+                            if int(res["plan_id"][:5]) not in task.get("issuer_array"):
                                 await log_error(
                                     "err",
                                     f"File describes the issuer that is not defined/allowed by the index "
@@ -233,14 +243,13 @@ async def process_plan(ctx, task):
                         if "formulary" in res and res["formulary"]:
                             for formulary in res["formulary"]:
                                 if (
-                                    formulary
-                                    and type(formulary) is dict
+                                    isinstance(formulary, dict)
                                     and ("cost_sharing" in formulary)
                                     and formulary["cost_sharing"]
                                 ):
                                     try:
                                         for k in ("drug_tier", "mail_order"):
-                                            if not (k in formulary and formulary[k] is not None):
+                                            if k not in formulary or formulary[k] is None:
                                                 await log_error(
                                                     "err",
                                                     f"Mandatory field `{k}` in Formulary (`formulary`) "
@@ -262,7 +271,7 @@ async def process_plan(ctx, task):
                                                 "coinsurance_rate",
                                                 "coinsurance_opt",
                                             ):
-                                                if not (k in cost_sharing):
+                                                if k not in cost_sharing:
                                                     await log_error(
                                                         "err",
                                                         f"Mandatory field `{k}` in Cost Sharing ("
@@ -280,7 +289,7 @@ async def process_plan(ctx, task):
                                                 "plan_id": res["plan_id"],
                                                 "year": int(year),
                                                 "drug_tier": formulary.get("drug_tier", ""),
-                                                "mail_order": True if formulary.get("mail_order", False) else False,
+                                                "mail_order": bool(formulary.get("mail_order")),
                                                 "pharmacy_type": cost_sharing.get("pharmacy_type", ""),
                                                 "copay_amount": (
                                                     float(cost_sharing.get("copay_amount"))
@@ -338,10 +347,10 @@ async def process_plan(ctx, task):
                         break
 
                 await asyncio.gather(push_objects(plan_obj, myplan), push_objects(planformulary_obj, myplanformulary))
-            except ijson.JSONError as exc:
+            except ijson.IncompleteJSONError as exc:
                 await log_error(
                     "err",
-                    f"JSON Parsing Error: {exc}",
+                    f"Incomplete JSON: can't read expected data. {exc}",
                     task.get("issuer_array"),
                     task.get("url"),
                     "plans",
@@ -349,10 +358,10 @@ async def process_plan(ctx, task):
                     myimportlog,
                 )
                 return
-            except ijson.IncompleteJSONError as exc:
+            except ijson.JSONError as exc:
                 await log_error(
                     "err",
-                    f"Incomplete JSON: can't read expected data. {exc}",
+                    f"JSON Parsing Error: {exc}",
                     task.get("issuer_array"),
                     task.get("url"),
                     "plans",
@@ -414,7 +423,7 @@ async def process_provider(ctx, task):
                     my_network_tiers = {}
                     not_good = False
                     my_years = set()
-                    if not (res and (res.get("plans", None) and res["plans"])):
+                    if not res or not res.get("plans"):
                         continue
                     for plan in res["plans"]:
                         # try:
@@ -437,17 +446,14 @@ async def process_provider(ctx, task):
                         #                     f"Plan ID: {plan['plan_id']}, NPI: {res.get('npi', None)}",
                         #                     task.get('issuer_array'), task.get('url'), 'providers', 'json',
                         #                     myimportlog)
-                        if not (
-                            res.get("npi", 0)
-                            and res.get("npi").isdigit()
-                            and plan.get("plan_id", None)
-                            and plan["plan_id"]
-                            and plan.get("years", None)
-                            and (0 < int(res.get("npi", 0)) < 4294967295)
-                        ):
+                        npi_raw = res.get("npi", "")
+                        has_valid_npi = npi_raw and npi_raw.isdigit() and 0 < int(npi_raw) < 4294967295
+                        has_plan_id = bool(plan.get("plan_id"))
+                        has_years = bool(plan.get("years"))
+                        if not has_valid_npi or not has_plan_id or not has_years:
                             not_good = True
                             break
-                        if not (12 < len(plan["plan_id"]) <= 14):
+                        if len(plan["plan_id"]) <= 12 or len(plan["plan_id"]) > 14:
                             continue
 
                         for x in plan.get("years", []):
@@ -595,10 +601,10 @@ async def process_provider(ctx, task):
                 plan_network_year.clear()
                 processed_providers += 1
 
-            except ijson.JSONError as exc:
+            except ijson.IncompleteJSONError as exc:
                 await log_error(
                     "err",
-                    f"JSON Parsing Error: {exc}",
+                    f"Incomplete JSON: can't read expected data. {exc}",
                     task.get("issuer_array"),
                     task.get("url"),
                     "providers",
@@ -606,10 +612,10 @@ async def process_provider(ctx, task):
                     myimportlog,
                 )
                 return
-            except ijson.IncompleteJSONError as exc:
+            except ijson.JSONError as exc:
                 await log_error(
                     "err",
-                    f"Incomplete JSON: can't read expected data. {exc}",
+                    f"JSON Parsing Error: {exc}",
                     task.get("issuer_array"),
                     task.get("url"),
                     "providers",
@@ -710,17 +716,6 @@ async def process_json_index(ctx, task):
                     myimportlog,
                 )
                 return
-            except ijson.IncompleteJSONError as exc:
-                await log_error(
-                    "err",
-                    f"Incomplete JSON: can't read expected data. {exc}",
-                    task.get("issuer_array"),
-                    task.get("url"),
-                    "index",
-                    "json",
-                    myimportlog,
-                )
-                return
 
         async with async_open(tmp_filename, "rb") as afp:
             try:
@@ -735,17 +730,6 @@ async def process_json_index(ctx, task):
                     enqueued_providers += 1
                     if provider_limit and enqueued_providers >= provider_limit:
                         break
-            except ijson.JSONError as exc:
-                await log_error(
-                    "err",
-                    f"JSON Parsing Error: {exc}",
-                    task.get("issuer_array"),
-                    task.get("url"),
-                    "json_index",
-                    "json",
-                    myimportlog,
-                )
-                return
             except ijson.IncompleteJSONError as exc:
                 await log_error(
                     "err",
@@ -753,6 +737,17 @@ async def process_json_index(ctx, task):
                     task.get("issuer_array"),
                     task.get("url"),
                     "index",
+                    "json",
+                    myimportlog,
+                )
+                return
+            except ijson.JSONError as exc:
+                await log_error(
+                    "err",
+                    f"JSON Parsing Error: {exc}",
+                    task.get("issuer_array"),
+                    task.get("url"),
+                    "json_index",
                     "json",
                     myimportlog,
                 )
@@ -782,48 +777,47 @@ async def import_unknown_state_issuers_data(test_mode: bool = False):
 
             async with async_open(tmp_filename, "r", encoding="utf-8-sig") as afp:
                 async for row in AsyncDictReader(afp, delimiter=","):
-                    if not (row["StandardComponentId"] and row["PlanId"]):
+                    if not row["StandardComponentId"] or not row["PlanId"]:
                         continue
-                    for key in row:
-                        if not ((key in ("StandardComponentId",)) and (row[key] is None)) and not (
-                            f"{row['StandardComponentId']}_{row['BusinessYear']}" in plan_list
-                        ):
-                            plan_list[f"{row['StandardComponentId']}_{row['BusinessYear']}"] = {
-                                "plan_id": row["StandardComponentId"],
-                                "plan_id_type": "CMS-HIOS-PLAN-ID",
-                                "year": int(row["BusinessYear"]),
-                                "issuer_id": int(row["IssuerId"]),
-                                "state": str(row["StateCode"]).upper(),
-                                "marketing_name": row["PlanMarketingName"],
-                                "summary_url": row["URLForSummaryofBenefitsCoverage"],
-                                "marketing_url": row["PlanBrochure"],
-                                "formulary_url": row["FormularyURL"],
-                                "plan_contact": "",
-                                "network": [row["NetworkId"]],
-                                "benefits": [],
-                                "last_updated_on": datetime.datetime.combine(
-                                    parse_date(row["ImportDate"], fuzzy=True), datetime.datetime.min.time()
-                                ),
-                                "checksum": return_checksum(
-                                    [row["StandardComponentId"].lower(), int(row["BusinessYear"])], crc=32
-                                ),
-                            }
+                    plan_key = f"{row['StandardComponentId']}_{row['BusinessYear']}"
+                    if plan_key in plan_list:
+                        continue
+                    plan_list[plan_key] = {
+                        "plan_id": row["StandardComponentId"],
+                        "plan_id_type": "CMS-HIOS-PLAN-ID",
+                        "year": int(row["BusinessYear"]),
+                        "issuer_id": int(row["IssuerId"]),
+                        "state": str(row["StateCode"]).upper(),
+                        "marketing_name": row["PlanMarketingName"],
+                        "summary_url": row["URLForSummaryofBenefitsCoverage"],
+                        "marketing_url": row["PlanBrochure"],
+                        "formulary_url": row["FormularyURL"],
+                        "plan_contact": "",
+                        "network": [row["NetworkId"]],
+                        "benefits": [],
+                        "last_updated_on": datetime.datetime.combine(
+                            parse_date(row["ImportDate"], fuzzy=True), datetime.datetime.min.time()
+                        ),
+                        "checksum": return_checksum(
+                            [row["StandardComponentId"].lower(), int(row["BusinessYear"])], crc=32
+                        ),
+                    }
 
-                            issuer_list[int(row["IssuerId"])] = {
-                                "state": str(row["StateCode"]).upper(),
-                                "issuer_id": int(row["IssuerId"]),
-                                "mrf_url": "",
-                                "data_contact_email": "",
-                                "issuer_marketing_name": "",
-                                "issuer_name": (
-                                    row["IssuerMarketPlaceMarketingName"].strip()
-                                    if row["IssuerMarketPlaceMarketingName"].strip()
-                                    else row["IssuerId"]
-                                ),
-                            }
-                        # except:
-                        #     from pprint import pprint
-                        #     pprint(row)
+                    issuer_list[int(row["IssuerId"])] = {
+                        "state": str(row["StateCode"]).upper(),
+                        "issuer_id": int(row["IssuerId"]),
+                        "mrf_url": "",
+                        "data_contact_email": "",
+                        "issuer_marketing_name": "",
+                        "issuer_name": (
+                            row["IssuerMarketPlaceMarketingName"].strip()
+                            if row["IssuerMarketPlaceMarketingName"].strip()
+                            else row["IssuerId"]
+                        ),
+                    }
+                    # except:
+                    #     from pprint import pprint
+                    #     pprint(row)
 
     state_attribute_files = json.loads(os.environ["HLTHPRT_CMSGOV_STATE_PLAN_ATTRIBUTES_URL_PUF"])
     for file in state_attribute_files:
@@ -864,9 +858,8 @@ async def import_unknown_state_issuers_data(test_mode: bool = False):
                 async for row in AsyncDictReader(afp, delimiter=","):
                     if row.get("STANDARD COMPONENT ID") and row.get("PLAN ID"):
                         continue
-                    else:
-                        for key in unique_keys:
-                            unique_keys[key] = to_camel_case(unique_keys[key])
+                    for key in unique_keys:
+                        unique_keys[key] = to_camel_case(unique_keys[key])
                     break
 
             async with async_open(tmp_filename, "r", encoding="utf-8-sig") as afp:
@@ -1053,7 +1046,7 @@ async def init_file(ctx, task=None):
                     "Metal_Level": "metal",
                     "URL_Claims_Payment_Policies": "claims_payment_policies_url",
                 }
-                for k, v in convert.items():
+                for _, v in convert.items():
                     template[v] = -1
 
                 for row in xls_file.ws(ws=ws_name).rows:
@@ -1062,10 +1055,8 @@ async def init_file(ctx, task=None):
                         obj["state"] = str(row[template["state"]].upper())
                         obj["issuer_name"] = str(row[template["issuer_name"]])
                         obj["issuer_id"] = int(row[template["issuer_id"]])
-                        obj["new_issuer_to_exchange"] = (
-                            True if row[template["new_issuer_to_exchange"]] in ("Yes", "yes", "y") else False
-                        )
-                        obj["sadp_only"] = True if row[template["sadp_only"]] in ("Yes", "yes", "y") else False
+                        obj["new_issuer_to_exchange"] = _truthy(row[template["new_issuer_to_exchange"]], ("yes", "y"))
+                        obj["sadp_only"] = _truthy(row[template["sadp_only"]], ("yes", "y"))
                         obj["plan_id"] = str(row[template["plan_id"]])
                         obj["year"] = int(file["year"])
                         obj["qhp_sadp"] = str(row[template["qhp_sadp"]])
@@ -1222,9 +1213,9 @@ async def shutdown(ctx, task):
     if test_mode:
         print(f"Test mode: imported {plans_count} plan rows (no minimum enforced).")
     else:
-        if (not plans_count) or (plans_count < 500):
+        if not plans_count or plans_count < 500:
             print(f"Failed Import: Plans number:{plans_count}")
-            exit(1)
+            sys.exit(1)
 
     tables = {}
     async with db.transaction():
@@ -1251,8 +1242,8 @@ async def shutdown(ctx, task):
         .values(import_id=import_date, when=db.func.now())
         .on_conflict_do_update(
             index_elements=ImportHistory.__my_index_elements__,
-            index_where=ImportHistory.import_id.__eq__(import_date),
-            set_=dict(when=db.func.now()),
+            index_where=ImportHistory.import_id == import_date,
+            set_={"when": db.func.now()},
         )
     )
     await upsert_history.status()

@@ -45,13 +45,22 @@ def _get_session(request):
 
 
 def _row_to_dict(row):
-    if hasattr(row, "_mapping"):
-        return dict(row._mapping)
+    mapping = getattr(row, "_mapping", None)
+    if mapping is not None:
+        try:
+            return dict(mapping)
+        except (TypeError, ValueError):
+            pass
+    if hasattr(row, "keys") and hasattr(row, "__getitem__"):
+        try:
+            return {key: row[key] for key in row.keys()}
+        except (TypeError, ValueError):
+            pass
     if isinstance(row, dict):
         return dict(row)
     try:
         return dict(row)
-    except TypeError:
+    except (TypeError, ValueError):
         return {}
 
 
@@ -328,14 +337,14 @@ async def find_a_plan(request):
     if year:
         try:
             int(year)
-        except ValueError:
-            raise sanic.exceptions.BadRequest
+        except ValueError as exc:
+            raise sanic.exceptions.BadRequest from exc
 
     if age:
         try:
             int(age)
-        except ValueError:
-            raise sanic.exceptions.BadRequest
+        except ValueError as exc:
+            raise sanic.exceptions.BadRequest from exc
 
     session = _get_session(request)
 
@@ -395,18 +404,19 @@ async def get_price_plan(request, plan_id, year=None, variant=None):
     session = _get_session(request)
     age = request.args.get("age")
     request.args.get("rating_area")
+    _ = variant
 
     if year:
         try:
             int(year)
-        except ValueError:
-            raise sanic.exceptions.BadRequest
+        except ValueError as exc:
+            raise sanic.exceptions.BadRequest from exc
 
     if age:
         try:
             int(age)
-        except ValueError:
-            raise sanic.exceptions.BadRequest
+        except ValueError as exc:
+            raise sanic.exceptions.BadRequest from exc
 
     stmt = select(plan_prices_table).where(plan_prices_table.c.plan_id == plan_id)
     result = await session.execute(stmt)

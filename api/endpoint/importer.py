@@ -1,11 +1,12 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+# pylint: disable=not-callable
 
 import sanic.exceptions
 from sanic import response
 from sanic import Blueprint
 
 
-from sqlalchemy import select, func, distinct
+from sqlalchemy import distinct, func, select
 
 from db.models import db, Issuer, Plan, ImportLog, ImportHistory
 
@@ -40,13 +41,13 @@ async def _collect_import_stats():
 
 
 @blueprint.get('/')
-async def last_import_stats(request):
+async def last_import_stats(_request):
     data = await _collect_import_stats()
     return response.json(data, default=str)
 
 
 @blueprint.get('/issuer/<issuer_id>')
-async def issuer_import_data(request, issuer_id):
+async def issuer_import_data(_request, issuer_id):
     issuer_stmt = select(Issuer).where(Issuer.issuer_id == int(issuer_id))
     issuer = await db.scalar(issuer_stmt)
     if not issuer:

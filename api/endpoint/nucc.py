@@ -1,24 +1,17 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-import asyncio
-from datetime import datetime
-from api.for_human import attributes_labels
-import urllib.parse
-from sqlalchemy.sql import func
-
-import sanic.exceptions
 from sanic import response
 from sanic import Blueprint
 
 from sqlalchemy import select
 
-from db.models import db, NUCCTaxonomy
+from db.models import NUCCTaxonomy
 
 blueprint = Blueprint('nucc', url_prefix='/nucc', version=1)
 
 
 @blueprint.get('/')
-async def index_status_nucc(request):
+async def index_status_nucc(_request):
 
     return response.json({})
 

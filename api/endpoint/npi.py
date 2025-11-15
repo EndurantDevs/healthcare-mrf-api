@@ -1,4 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+# pylint: disable=not-callable
 
 import asyncio
 import json
@@ -10,8 +11,8 @@ from typing import Any
 
 from textwrap import dedent
 
-from sqlalchemy import or_, select
-from sqlalchemy.sql import func, tuple_, text, literal_column
+from sqlalchemy import func, or_, select
+from sqlalchemy.sql import tuple_, text, literal_column
 
 import sanic.exceptions
 from sanic import Blueprint, response
@@ -373,19 +374,32 @@ async def get_all(request):
     if plan_network:
         plan_network = [int(x) for x in plan_network.split(",")]
 
-    async def get_count(
-        classification,
-        section,
-        display_name,
-        plan_network=None,
-        name_like=None,
-        codes=None,
-        has_insurance=None,
-        city=None,
-        state=None,
-        response_format=None,
-        specialization=None,
-    ):
+    filters = {
+        "classification": classification,
+        "specialization": specialization,
+        "section": section,
+        "display_name": display_name,
+        "plan_network": plan_network,
+        "name_like": name_like,
+        "codes": codes,
+        "has_insurance": has_insurance,
+        "city": city,
+        "state": state,
+        "response_format": response_format,
+    }
+
+    async def get_count(filters):
+        classification = filters.get("classification")
+        specialization = filters.get("specialization")
+        section = filters.get("section")
+        display_name = filters.get("display_name")
+        plan_network = filters.get("plan_network")
+        name_like = filters.get("name_like")
+        codes = filters.get("codes")
+        has_insurance = filters.get("has_insurance")
+        city = filters.get("city")
+        state = filters.get("state")
+        response_format = filters.get("response_format")
         taxonomy_filters = []
         if classification:
             taxonomy_filters.append("classification = :classification")
@@ -480,9 +494,13 @@ async def get_all(request):
             return dict(rows)
         return rows[0][0] if rows else 0
 
-    async def get_results(
-        start, limit, classification, section, display_name, plan_network, name_like=None, specialization=None
-    ):
+    async def get_results(start, limit, filters):
+        classification = filters.get("classification")
+        section = filters.get("section")
+        display_name = filters.get("display_name")
+        plan_network = filters.get("plan_network")
+        name_like = filters.get("name_like")
+        specialization = filters.get("specialization")
         where = []
         main_where = ["b.npi=g.npi"]
         tables = ["mrf.npi_address"]
@@ -561,39 +579,18 @@ async def get_all(request):
                 obj["taxonomy_list"].append(taxonomy)
                 res[obj["npi"]] = obj
 
-        res = [x for x in res.values()]
+        res = list(res.values())
         for row in res:
             row["do_business_as"] = row.get("do_business_as") or []
         return res
 
     if count_only:
-        rows = await get_count(
-            classification,
-            section,
-            display_name,
-            plan_network,
-            name_like,
-            codes,
-            has_insurance,
-            city,
-            state,
-            response_format,
-            specialization=specialization,
-        )
+        rows = await get_count(filters)
         return response.json({"rows": rows}, default=str)
 
     total, rows = await asyncio.gather(
-        get_count(classification, section, display_name, plan_network, specialization=specialization),
-        get_results(
-            start,
-            limit,
-            classification,
-            section,
-            display_name,
-            plan_network,
-            name_like=name_like,
-            specialization=specialization,
-        ),
+        get_count(filters),
+        get_results(start, limit, filters),
     )
     return response.json({"total": total, "rows": rows}, default=str)
 
@@ -708,12 +705,12 @@ async def get_near_npi(request):
 
             res[obj["npi"]] = obj
 
-        res = [x for x in res.values()]
+        res = list(res.values())
     return response.json(res, default=str)
 
 
 @blueprint.get("/id/<npi>/full_taxonomy")
-async def get_full_taxonomy_list(request, npi):
+async def get_full_taxonomy_list(_request, npi):
     t = []
     npi = int(npi)
     # plan_data = await db.select(
@@ -735,7 +732,7 @@ async def get_full_taxonomy_list(request, npi):
 
 
 @blueprint.get("/plans_by_npi/<npi>")
-async def get_plans_by_npi(request, npi):
+async def get_plans_by_npi(_request, npi):
 
     data = []
     plan_data = []
@@ -799,7 +796,7 @@ async def get_npi(request, npi):
                 )
                 .status()
             )
-        except Exception as exc:
+        except Exception as exc:  # pylint: disable=broad-exception-caught
             logger.warning("Could not archive address checksum=%s: %s", checksum, exc)
 
     async def _update_address(x):
@@ -903,7 +900,7 @@ async def get_npi(request, npi):
                         else:
                             d["formatted_address"] = geo_data["features"][0]["place_name"]
                         d["place_id"] = None
-                except Exception as exc:
+                except Exception as exc:  # pylint: disable=broad-exception-caught
                     logger.debug("Mapbox geocoding failed for %s: %s", t_addr, exc)
 
             if not d["lat"]:
@@ -935,7 +932,7 @@ async def get_npi(request, npi):
                         d["lat"] = geo_data["results"][0]["geometry"]["location"]["lat"]
                         d["formatted_address"] = geo_data["results"][0]["formatted_address"]
                         d["place_id"] = geo_data["results"][0]["place_id"]
-                except Exception as exc:
+                except Exception as exc:  # pylint: disable=broad-exception-caught
                     logger.warning("Google geocoding failed for %s: %s", t_addr, exc)
 
             if update_geo and d.get("lat"):
