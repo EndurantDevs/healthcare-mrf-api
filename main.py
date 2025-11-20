@@ -71,7 +71,20 @@ server.add_command(start)
 
 @click.group()
 def cli():
-    pass
+    # Ensure every CLI invocation has an event loop so libraries relying on
+    # asyncio.get_event_loop() behave consistently (e.g. arq worker setup).
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            raise RuntimeError
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    else:
+        # If uvloop is installed (set above), ensure the active loop uses uvloop's implementation.
+        if uvloop is not None and not isinstance(loop, uvloop.Loop):
+            loop = uvloop.new_event_loop()
+            asyncio.set_event_loop(loop)
 
 
 cli.add_command(server)

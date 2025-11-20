@@ -28,6 +28,48 @@ from dateutil.parser import parse as parse_date
 HTTP_CHUNK_SIZE = 1024 * 1024
 headers = {'user-agent': 'Mozilla/5.0 (compatible; Healthporta Healthcare MRF API Importer/1.1; +https://github.com/EndurantDevs/healthcare-mrf-api)'}
 timeout = aiohttp.ClientTimeout(total=60.0)
+SECONDS_PER_MEGABYTE = float(os.getenv("HLTHPRT_SECONDS_PER_MB", "2.0"))
+HEAD_TIMEOUT_SECONDS = float(os.getenv("HLTHPRT_HEAD_TIMEOUT_SECONDS", "20.0"))
+MIN_STREAM_TIMEOUT = float(os.getenv("HLTHPRT_MIN_STREAM_TIMEOUT", "120.0"))
+
+
+def _estimate_timeout_seconds(size_bytes: int | None, chunk_size: int | None) -> float | None:
+    if not size_bytes or size_bytes <= 0:
+        return None
+    chunk_bytes = chunk_size or HTTP_CHUNK_SIZE
+    size_mb = size_bytes / (1024 * 1024)
+    # Provide a base allowance proportional to the number of chunks and overall size.
+    per_chunk_seconds = SECONDS_PER_MEGABYTE
+    estimated = max(size_mb * SECONDS_PER_MEGABYTE, (size_bytes / chunk_bytes) * per_chunk_seconds)
+    return max(MIN_STREAM_TIMEOUT, estimated)
+
+
+async def _determine_request_timeout(client: aiohttp.ClientSession, url: str, chunk_size: int | None) -> aiohttp.ClientTimeout:
+    """
+    Issue a lightweight HEAD request to infer the file size, scaling the download timeout proportionally.
+    Fallback to a generous default when HEAD is unsupported.
+    """
+    try:
+        async with client.head(
+            url,
+            allow_redirects=True,
+            timeout=aiohttp.ClientTimeout(total=HEAD_TIMEOUT_SECONDS),
+        ) as head_response:
+            content_length = head_response.headers.get("Content-Length")
+            if content_length:
+                try:
+                    size_bytes = int(content_length)
+                except ValueError:
+                    size_bytes = None
+                if size_bytes:
+                    seconds = _estimate_timeout_seconds(size_bytes, chunk_size)
+                    if seconds:
+                        return aiohttp.ClientTimeout(total=seconds, sock_read=seconds)
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        pass
+
+    fallback = max(MIN_STREAM_TIMEOUT, (timeout.total or 0) * 10 if timeout.total else 600.0)
+    return aiohttp.ClientTimeout(total=fallback, sock_read=fallback)
 def _default_rows_per_insert() -> int:
     try:
         return max(int(os.getenv("HLTHPRT_ROWS_PER_INSERT", "1000")), 1)
@@ -101,9 +143,11 @@ async def download_it_and_save(url, filepath, chunk_size=None, context=None, log
         await copyfile(file_with_dir, filepath)
     else:
         async with async_open(filepath, 'wb+') as afp:
-            async with await get_http_client() as client:
+            client = await get_http_client()
+            async with client:
+                request_timeout = await _determine_request_timeout(client, url, max_chunk_size)
                 try:
-                    async with client.get(url) as response:
+                    async with client.get(url, timeout=request_timeout) as response:
                         try:
                             # response.raise_for_status()
                             print(f"Response size: {response.content_length} bytes")
@@ -288,6 +332,14 @@ def deduplicate_dicts(dict_list, key_fields):
 
 async def push_objects(obj_list, cls, rewrite=False):
     if obj_list:
+        max_params = int(os.getenv("HLTHPRT_MAX_INSERT_PARAMETERS", "60000"))
+        if max_params > 0 and obj_list:
+            approx_columns = max(len(obj_list[0]), 1)
+            max_batch_size = max(max_params // approx_columns, 1)
+            if len(obj_list) > max_batch_size:
+                for start in range(0, len(obj_list), max_batch_size):
+                    await push_objects(obj_list[start:start + max_batch_size], cls, rewrite=rewrite)
+                return
         if len(obj_list) == 1 and not rewrite:
             return await push_objects_slow(obj_list, cls)
         
