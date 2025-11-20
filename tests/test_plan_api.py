@@ -25,6 +25,11 @@ from api.endpoint.plan import (
     index_status,
 )
 
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
 
 class FakeResult:
     def __init__(self, rows=None, scalar=None):

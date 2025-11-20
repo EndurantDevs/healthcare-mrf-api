@@ -4,6 +4,13 @@ import os
 import asyncio
 import click
 
+try:
+    import uvloop
+
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+except ImportError:
+    uvloop = None  # noqa: F841
+
 from process.initial import main as initiate_mrf, finish_main as finish_mrf, init_file, startup as initial_startup, \
     shutdown as shutdown_mrf, process_plan, process_json_index, process_provider, save_mrf_data
 from process.attributes import main as initiate_plan_attributes, save_attributes, process_state_attributes, \
