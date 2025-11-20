@@ -6,7 +6,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from sanic import Blueprint, response
 from sanic.exceptions import InvalidUsage, NotFound
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, or_, select, tuple_
 
 from db.models import Issuer, Plan, PlanDrugRaw, PlanFormulary
 
@@ -549,13 +549,16 @@ async def get_formulary_summary(request, formulary_id):
     plan_formulary_table = PlanFormulary.__table__
 
     total_stmt = (
-        select(func.count(plan_drug_table.c.rxnorm_id))
+        select(func.count(func.distinct(plan_drug_table.c.rxnorm_id)))
         .where(plan_drug_table.c.plan_id == plan_id)
     )
     total = (await session.execute(total_stmt)).scalar() or 0
 
     tier_stmt = (
-        select(plan_drug_table.c.drug_tier, func.count())
+        select(
+            plan_drug_table.c.drug_tier,
+            func.count(func.distinct(plan_drug_table.c.rxnorm_id)),
+        )
         .where(plan_drug_table.c.plan_id == plan_id)
         .group_by(plan_drug_table.c.drug_tier)
     )
@@ -566,7 +569,10 @@ async def get_formulary_summary(request, formulary_id):
         tier_counts[key] = int(row[1] or 0)
 
     auth_stmt = (
-        select(plan_drug_table.c.prior_authorization, func.count())
+        select(
+            plan_drug_table.c.prior_authorization,
+            func.count(func.distinct(plan_drug_table.c.rxnorm_id)),
+        )
         .where(plan_drug_table.c.plan_id == plan_id)
         .group_by(plan_drug_table.c.prior_authorization)
     )
@@ -576,7 +582,10 @@ async def get_formulary_summary(request, formulary_id):
         auth_counts[label] = int(row[1] or 0)
 
     step_stmt = (
-        select(plan_drug_table.c.step_therapy, func.count())
+        select(
+            plan_drug_table.c.step_therapy,
+            func.count(func.distinct(plan_drug_table.c.rxnorm_id)),
+        )
         .where(plan_drug_table.c.plan_id == plan_id)
         .group_by(plan_drug_table.c.step_therapy)
     )
@@ -586,7 +595,10 @@ async def get_formulary_summary(request, formulary_id):
         step_counts[label] = int(row[1] or 0)
 
     quantity_stmt = (
-        select(plan_drug_table.c.quantity_limit, func.count())
+        select(
+            plan_drug_table.c.quantity_limit,
+            func.count(func.distinct(plan_drug_table.c.rxnorm_id)),
+        )
         .where(plan_drug_table.c.plan_id == plan_id)
         .group_by(plan_drug_table.c.quantity_limit)
     )
@@ -727,22 +739,28 @@ async def formulary_statistics(request):
         issuer_table, plan_table.c.issuer_id == issuer_table.c.issuer_id
     ).join(plan_drug_table, plan_drug_table.c.plan_id == plan_table.c.plan_id)
 
+    pair_expr = tuple_(plan_table.c.plan_id, plan_drug_table.c.rxnorm_id)
+    count_distinct_pair = func.count(func.distinct(pair_expr))
+
     top_issuers_stmt = (
         select(
             issuer_table.c.issuer_id,
             issuer_table.c.issuer_name,
-            func.count(plan_drug_table.c.rxnorm_id).label("drug_count"),
+            count_distinct_pair.label("drug_count"),
         )
         .select_from(from_clause)
         .group_by(issuer_table.c.issuer_id, issuer_table.c.issuer_name)
-        .order_by(func.count(plan_drug_table.c.rxnorm_id).desc())
+        .order_by(count_distinct_pair.desc())
         .limit(5)
     )
     if filter_condition is not None:
         top_issuers_stmt = top_issuers_stmt.where(filter_condition)
 
     tier_stmt = (
-        select(plan_drug_table.c.drug_tier, func.count(plan_drug_table.c.rxnorm_id))
+        select(
+            plan_drug_table.c.drug_tier,
+            func.count(func.distinct(pair_expr)),
+        )
         .select_from(from_clause)
         .group_by(plan_drug_table.c.drug_tier)
     )
@@ -750,7 +768,10 @@ async def formulary_statistics(request):
         tier_stmt = tier_stmt.where(filter_condition)
 
     auth_stmt = (
-        select(plan_drug_table.c.prior_authorization, func.count(plan_drug_table.c.rxnorm_id))
+        select(
+            plan_drug_table.c.prior_authorization,
+            func.count(func.distinct(pair_expr)),
+        )
         .select_from(from_clause)
         .group_by(plan_drug_table.c.prior_authorization)
     )
@@ -758,7 +779,7 @@ async def formulary_statistics(request):
         auth_stmt = auth_stmt.where(filter_condition)
 
     total_drugs_stmt = (
-        select(func.count(plan_drug_table.c.rxnorm_id))
+        select(func.count(func.distinct(pair_expr)))
         .select_from(from_clause)
     )
     if filter_condition is not None:

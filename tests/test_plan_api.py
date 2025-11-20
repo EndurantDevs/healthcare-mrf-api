@@ -253,6 +253,7 @@ async def test_plan_get_plan_success():
             FakeResult(rows=[(77777, "PREFERRED")]),
             FakeResult(scalar="Sample Issuer"),
             FakeResult(rows=[{"plan_id": "P123", "year": 2024, "drug_tier": "Tier 1", "pharmacy_type": "Retail"}]),
+            FakeResult(rows=[], scalar=1),
         ]
     )
     response = await get_plan(request, "P123")
@@ -262,6 +263,8 @@ async def test_plan_get_plan_success():
     assert payload["network_checksum"] == {"77777": "PREFERRED"}
     assert payload["issuer_name"] == "Sample Issuer"
     assert payload["formulary"][0]["drug_tier"] == "Tier 1"
+    assert payload["formulary_drug_count"] == 1
+    assert payload["formulary_has_drug_data"] is True
 
 
 @pytest.mark.asyncio
@@ -475,6 +478,7 @@ async def test_get_plan_with_variant(monkeypatch):
             FakeResult(rows=[("checksum", "TIER1")]),
             FakeResult(rows=[], scalar="Issuer"),
             FakeResult(rows=[{"drug": "abc"}]),
+            FakeResult(rows=[], scalar=1),
             FakeResult(rows=[("P1-01",)]),
             FakeResult(rows=[{"attr_name": "FormularyId", "attr_value": "val"}]),
             FakeResult(
@@ -502,6 +506,7 @@ async def test_get_plan_with_variant(monkeypatch):
     assert payload["variant_attributes"]["FormularyId"]["human_attr_name"] == "Formulary ID"
     assert payload["variant_benefits"]["benefit_name"]["in_network_tier1"] == "5, 10"
     assert payload["variant_benefits"]["benefit_name"]["human_attr_name"] == "Benefit Name"
+    assert payload["formulary_has_drug_data"] is True
 
 
 @pytest.mark.asyncio
@@ -512,6 +517,7 @@ async def test_get_plan_normalizes_variant_identifiers():
             FakeResult(rows=[("checksum", "TIER1")]),
             FakeResult(rows=[], scalar="Issuer"),
             FakeResult(rows=[]),
+            FakeResult(rows=[], scalar=0),
             FakeResult(
                 rows=[
                     ("P1-01",),
@@ -569,6 +575,7 @@ async def test_get_plan_normalizes_variant_identifiers():
     assert payload["plan_benefits"]["GeneralBenefit"]["in_network_tier1"] == "$5, 25%"
     assert payload["variant_attributes"]["VariantAttr"]["attr_value"] == "X"
     assert payload["variant_benefits"]["VariantBenefit"]["in_network_tier1"] == "$10, 50%"
+    assert payload["formulary_has_drug_data"] is False
 
 
 @pytest.mark.asyncio
@@ -579,6 +586,7 @@ async def test_get_plan_uses_fallback_variants_when_missing():
             FakeResult(rows=[]),
             FakeResult(rows=[], scalar="Issuer"),
             FakeResult(rows=[]),
+            FakeResult(rows=[], scalar=0),
             FakeResult(rows=[]),
             FakeResult(
                 rows=[
@@ -612,6 +620,7 @@ async def test_get_plan_uses_fallback_variants_when_missing():
     assert payload["active_variant"] == "P2-09"
     assert payload["variant_attributes"]["FormularyId"]["attr_value"] == "PlanLevelValue"
     assert payload["variant_benefits"]["GeneralBenefit"]["in_network_tier1"] == "$15, 75%"
+    assert payload["formulary_has_drug_data"] is False
 
 
 @pytest.mark.asyncio
@@ -622,6 +631,7 @@ async def test_get_plan_variant_not_found():
             FakeResult(rows=[("checksum", "TIER1")]),
             FakeResult(rows=[], scalar="Issuer"),
             FakeResult(rows=[{"drug": "abc"}]),
+            FakeResult(rows=[], scalar=1),
             FakeResult(rows=[("P1-01",)]),
         ]
     )
@@ -637,6 +647,7 @@ async def test_plan_variants_unique_and_clean():
             FakeResult(rows=[("checksum", "TIER1")]),
             FakeResult(rows=[], scalar="Issuer Name"),
             FakeResult(rows=[]),
+            FakeResult(rows=[], scalar=0),
             FakeResult(rows=[("('P1-00',)",), ("('P1-01',)",)]),
             FakeResult(
                 rows=[
@@ -681,6 +692,7 @@ async def test_plan_variants_unique_and_clean():
     response = await get_plan(request, "P1", year="2024")
     payload = json.loads(response.body)
     assert payload["variants"] == ["P1-00", "P1-01", "P1-02"]
+    assert payload["formulary_has_drug_data"] is False
 
 def test_result_rows_handles_typeerror():
     class BadAll:

@@ -7,7 +7,7 @@ aioshutil
 aiosignal==1.4.0
 alembic
 arq==0.26.3
-async_unzip
+async_unzip>=0.5.5
 asyncpg>=0.29.0
 attrs==25.4.0
 coverage==7.11.0
