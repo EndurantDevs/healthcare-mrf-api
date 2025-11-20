@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 import sanic.exceptions
 from sanic import Blueprint, response
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, func, or_, select
 
 from api.for_human import attributes_labels, benefits_labels
 from db.connection import db as sa_db
@@ -15,6 +15,7 @@ from db.models import (
     Plan,
     PlanAttributes,
     PlanBenefits,
+    PlanDrugRaw,
     PlanFormulary,
     PlanNetworkTierRaw,
     PlanNPIRaw,
@@ -470,6 +471,13 @@ async def get_plan(request, plan_id, year=None, variant=None):
     )
     formulary_result = await session.execute(formulary_stmt)
     plan_data["formulary"] = [_row_to_dict(row) for row in _result_rows(formulary_result)]
+
+    drug_count_stmt = select(func.count(func.distinct(PlanDrugRaw.__table__.c.rxnorm_id))).where(
+        PlanDrugRaw.__table__.c.plan_id == plan_id
+    )
+    drug_count_result = await session.execute(drug_count_stmt)
+    plan_data["formulary_drug_count"] = int(_result_scalar(drug_count_result) or 0)
+    plan_data["formulary_has_drug_data"] = bool(plan_data["formulary_drug_count"])
 
     if not year:
         return response.json(plan_data, default=str)
