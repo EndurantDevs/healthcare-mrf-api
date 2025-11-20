@@ -12,7 +12,7 @@ except ImportError:
     uvloop = None  # noqa: F841
 
 from process.initial import main as initiate_mrf, finish_main as finish_mrf, init_file, startup as initial_startup, \
-    shutdown as shutdown_mrf, process_plan, process_json_index, process_provider, save_mrf_data
+    shutdown as shutdown_mrf, process_plan, process_json_index, process_provider, process_formulary, save_mrf_data
 from process.attributes import main as initiate_plan_attributes, save_attributes, process_state_attributes, \
     process_attributes, process_prices, process_benefits, startup as attr_startup, shutdown as attr_shutdown
 from process.npi import main as initiate_npi, process_npi_chunk, save_npi_data, startup as npi_startup, \
@@ -25,7 +25,7 @@ from process.redis_config import build_redis_settings
 
 
 class MRF:
-    functions = [init_file, save_mrf_data, process_plan, process_json_index, process_provider]
+    functions = [init_file, save_mrf_data, process_plan, process_json_index, process_provider, process_formulary]
     on_startup = initial_startup
     max_jobs = int(os.environ.get('HLTHPRT_MAX_MRF_JOBS')) if os.environ.get('HLTHPRT_MAX_MRF_JOBS') else 20
     queue_read_limit = 2*max_jobs
@@ -138,8 +138,9 @@ def mrf_end():
 
 
 @click.command(help="Run Plan Attributes Import from CMS.gov")
-def plan_attributes():
-    asyncio.run(initiate_plan_attributes())
+@click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
+def plan_attributes(test: bool):
+    asyncio.run(initiate_plan_attributes(test_mode=test))
 
 @click.command(help="Run NPPES Import with Weekly updates")
 @click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")

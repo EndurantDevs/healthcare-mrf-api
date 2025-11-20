@@ -202,6 +202,278 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+  /formulary/ids:
+    get:
+      summary: Search formularies by issuer, plan, year, or drug keyword
+      parameters:
+        - name: issuer_id
+          in: query
+          schema:
+            type: integer
+        - name: plan_id
+          in: query
+          schema:
+            type: string
+        - name: year
+          in: query
+          schema:
+            type: integer
+        - name: state
+          in: query
+          schema:
+            type: string
+            minLength: 2
+            maxLength: 2
+        - name: drug
+          in: query
+          schema:
+            type: string
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+      responses:
+        '200':
+          description: Paginated list of formularies
+          content:
+            application/json:
+              schema:
+                type: object
+  /formulary/id/{formulary_id}:
+    get:
+      summary: Retrieve formulary metadata and linked plan
+      parameters:
+        - name: formulary_id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Combination of plan identifier and year (e.g. PLAN123:2025)
+      responses:
+        '200':
+          description: Formulary detail payload
+          content:
+            application/json:
+              schema:
+                type: object
+        '404':
+          description: Formulary not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /formulary/id/{formulary_id}/drugs:
+    get:
+      summary: List drugs covered by a formulary
+      parameters:
+        - name: formulary_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: tier
+          in: query
+          schema:
+            type: string
+        - name: pharmacy_type
+          in: query
+          schema:
+            type: string
+        - name: authorization_required
+          in: query
+          schema:
+            type: boolean
+        - name: step_therapy
+          in: query
+          schema:
+            type: boolean
+        - name: quantity_limit
+          in: query
+          schema:
+            type: boolean
+        - name: sort
+          in: query
+          schema:
+            type: string
+            enum: [name, tier]
+        - name: order
+          in: query
+          schema:
+            type: string
+            enum: [asc, desc]
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+      responses:
+        '200':
+          description: Paginated list of formulary drugs
+          content:
+            application/json:
+              schema:
+                type: object
+        '404':
+          description: Formulary not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /formulary/id/{formulary_id}/drugs/{rxnorm_id}:
+    get:
+      summary: Retrieve formulary-specific drug information
+      parameters:
+        - name: formulary_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: rxnorm_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Drug detail within the formulary
+          content:
+            application/json:
+              schema:
+                type: object
+        '404':
+          description: Drug not present within the formulary
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /formulary/id/{formulary_id}/summary:
+    get:
+      summary: Retrieve aggregate metrics for a formulary
+      parameters:
+        - name: formulary_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Aggregate statistics for the formulary
+          content:
+            application/json:
+              schema:
+                type: object
+        '404':
+          description: Formulary not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /formulary/plan/{plan_id}/drug/{rxnorm_id}:
+    get:
+      summary: Determine if a plan formulary covers a specific drug
+      parameters:
+        - name: plan_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: rxnorm_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: year
+          in: query
+          schema:
+            type: integer
+          description: Optional business year; when omitted the most recent plan year is used
+      responses:
+        '200':
+          description: Coverage status and metadata
+          content:
+            application/json:
+              schema:
+                type: object
+        '404':
+          description: Plan or formulary not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /formulary/drugs/{rxnorm_id}:
+    get:
+      summary: List every formulary covering an RxNorm identifier
+      parameters:
+        - name: rxnorm_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: year
+          in: query
+          schema:
+            type: integer
+        - name: state
+          in: query
+          schema:
+            type: string
+            minLength: 2
+            maxLength: 2
+        - name: issuer_id
+          in: query
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Matching formularies
+          content:
+            application/json:
+              schema:
+                type: object
+        '404':
+          description: Drug not found in any formulary
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /formulary/statistics:
+    get:
+      summary: Retrieve high-level formulary statistics
+      parameters:
+        - name: year
+          in: query
+          schema:
+            type: integer
+        - name: state
+          in: query
+          schema:
+            type: string
+            minLength: 2
+            maxLength: 2
+        - name: issuer_id
+          in: query
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Formulary analytics snapshot
+          content:
+            application/json:
+              schema:
+                type: object
   /plan/price/{plan_id}:
     get:
       summary: Retrieve price rows for a plan
@@ -930,9 +1202,35 @@ components:
                 type: string
               network_checksum:
                 type: object
-                additionalProperties:
-                  type: string
+            additionalProperties:
+              type: string
             additionalProperties: true
+    PlanDrugRecord:
+      type: object
+      properties:
+        plan_id:
+          type: string
+        plan_id_type:
+          type: string
+        rxnorm_id:
+          type: string
+        drug_name:
+          type: string
+        drug_tier:
+          type: string
+        prior_authorization:
+          type: boolean
+          nullable: true
+        step_therapy:
+          type: boolean
+          nullable: true
+        quantity_limit:
+          type: boolean
+          nullable: true
+        last_updated_on:
+          type: string
+          format: date-time
+          nullable: true
     PlanSearchResponse:
       type: object
       properties:

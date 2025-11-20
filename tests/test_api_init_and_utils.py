@@ -47,6 +47,7 @@ def test_init_api_registers_group(monkeypatch):
     assert {bp.name for bp in app.registered.blueprints} == {
         "healthcheck",
         "plan",
+        "formulary",
         "import",
         "issuer",
         "npi",

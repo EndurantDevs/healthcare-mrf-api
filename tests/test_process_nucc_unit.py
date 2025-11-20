@@ -54,6 +54,7 @@ async def test_process_data_extracts_records(monkeypatch, nucc_module, tmp_path)
     monkeypatch.setattr(nucc_module, "download_it_and_save", fake_download_and_save)
     monkeypatch.setattr(nucc_module, "push_objects", fake_push)
     monkeypatch.setattr(nucc_module, "make_class", fake_make_class)
+    monkeypatch.setattr(nucc_module, "ensure_database", AsyncMock())
 
     ctx = {"import_date": "20260101"}
     await nucc_module.process_data(ctx)
@@ -80,6 +81,7 @@ async def test_startup_sets_context_and_creates_tables(monkeypatch, nucc_module)
     monkeypatch.setattr(nucc_module, "init_db", AsyncMock())
     monkeypatch.setattr(nucc_module.db, "create_table", AsyncMock(side_effect=lambda table, **kw: create_calls.append(table.name)))
     monkeypatch.setattr(nucc_module.db, "status", AsyncMock(side_effect=lambda stmt: status_calls.append(stmt)))
+    monkeypatch.setattr(nucc_module, "ensure_database", AsyncMock())
 
     ctx: dict[str, object] = {}
     await nucc_module.startup(ctx)
@@ -101,6 +103,7 @@ async def test_shutdown_rotates_tables(monkeypatch, nucc_module):
     status_calls = []
     monkeypatch.setattr(nucc_module.db, "status", AsyncMock(side_effect=lambda stmt: status_calls.append(stmt)))
     monkeypatch.setattr(nucc_module.db, "execute_ddl", AsyncMock())
+    monkeypatch.setattr(nucc_module, "ensure_database", AsyncMock())
 
     @asynccontextmanager
     async def fake_tx():

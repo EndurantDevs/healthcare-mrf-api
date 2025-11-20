@@ -19,12 +19,16 @@ import zipfile
 from aiofile import async_open
 from async_unzip.unzipper import unzip
 
+from sqlalchemy.exc import IntegrityError
+
 from process.ext.utils import (
     download_it_and_save,
     make_class,
     push_objects,
     print_time_info,
     return_checksum,
+    ensure_database,
+    get_import_schema,
 )
 from dateutil.parser import parse as parse_date
 from db.models import (
@@ -40,6 +44,54 @@ from api.for_human import plan_attributes_labels_to_key
 
 
 latin_pattern = re.compile(r"[^\x00-\x7f]")
+
+_TABLES_PREPARED = False
+_TABLES_LOCK = asyncio.Lock()
+
+
+async def _prepare_attribute_tables(ctx):
+    global _TABLES_PREPARED  # pylint: disable=global-statement
+    if _TABLES_PREPARED:
+        return
+
+    async with _TABLES_LOCK:
+        if _TABLES_PREPARED:
+            return
+
+        context = ctx.setdefault("context", {})
+        test_mode = bool(context.get("test_mode"))
+        await ensure_database(test_mode)
+
+        import_date = ctx["import_date"]
+        db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
+
+        await db.status("CREATE EXTENSION IF NOT EXISTS pg_trgm;")
+        await db.status("CREATE EXTENSION IF NOT EXISTS btree_gin;")
+
+        for cls in (
+            PlanAttributes,
+            PlanPrices,
+            PlanRatingAreas,
+            PlanBenefits,
+        ):
+            obj = make_class(cls, import_date, schema_override=db_schema)
+            await db.status(
+                f"DROP TABLE IF EXISTS {db_schema}.{obj.__main_table__}_{import_date};"
+            )
+            try:
+                await db.create_table(obj.__table__, checkfirst=True)
+            except IntegrityError as exc:  # pragma: no cover - rare race; ignore if table/type already exists
+                if "pg_type_typname_nsp_index" not in str(exc):
+                    raise
+            if hasattr(obj, "__my_index_elements__"):
+                await db.status(
+                    f"CREATE UNIQUE INDEX {obj.__tablename__}_idx_primary ON "
+                    f"{db_schema}.{obj.__tablename__} ({', '.join(obj.__my_index_elements__)});"
+                )
+
+        context["tables_prepared"] = True
+        _TABLES_PREPARED = True
+        print("Preparing done")
 
 
 async def _safe_unzip(zip_path: str, destination: str) -> None:
@@ -75,42 +127,19 @@ def _normalize_plan_ids(standard_id, full_id):
 
 async def startup(ctx):
     loop = asyncio.get_event_loop()
-    ctx["context"] = {}
+    ctx.setdefault("context", {})
     ctx["context"]["start"] = datetime.datetime.utcnow().replace(tzinfo=pytz.utc)
     ctx["context"]["run"] = 0
+    ctx["context"]["test_mode"] = bool(ctx["context"].get("test_mode", False))
     ctx["import_date"] = datetime.datetime.now().strftime("%Y%m%d")
     await init_db(db, loop)
-    import_date = ctx["import_date"]
-    db_schema = (
-        os.getenv("HLTHPRT_DB_SCHEMA") if os.getenv("HLTHPRT_DB_SCHEMA") else "mrf"
-    )
-
-    tables = {}  # for the future complex usage
-
-    for cls in (
-        PlanAttributes,
-        PlanPrices,
-        PlanRatingAreas,
-        PlanBenefits,
-    ):
-        tables[cls.__main_table__] = make_class(cls, import_date)
-        obj = tables[cls.__main_table__]
-        await db.status(
-            f"DROP TABLE IF EXISTS {db_schema}.{obj.__main_table__}_{import_date};"
-        )
-        await db.create_table(obj.__table__, checkfirst=True)
-        if hasattr(obj, "__my_index_elements__"):
-            await db.status(
-                f"CREATE UNIQUE INDEX {obj.__tablename__}_idx_primary ON "
-                f"{db_schema}.{obj.__tablename__} ({', '.join(obj.__my_index_elements__)});"
-            )
-
-    print("Preparing done")
 
 
 async def shutdown(ctx):
     import_date = ctx["import_date"]
-    db_schema = os.getenv("DB_SCHEMA") if os.getenv("DB_SCHEMA") else "mrf"
+    test_mode = bool(ctx.get("context", {}).get("test_mode"))
+    await ensure_database(test_mode)
+    db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
     tables = {}
 
     processing_classes_array = (
@@ -121,7 +150,7 @@ async def shutdown(ctx):
     )
 
     for cls in processing_classes_array:
-        tables[cls.__main_table__] = make_class(cls, import_date)
+        tables[cls.__main_table__] = make_class(cls, import_date, schema_override=db_schema)
         obj = tables[cls.__main_table__]
 
         if hasattr(cls, "__my_additional_indexes__") and cls.__my_additional_indexes__:
@@ -150,7 +179,7 @@ async def shutdown(ctx):
 
     async with db.transaction():
         for cls in processing_classes_array:
-            tables[cls.__main_table__] = make_class(cls, import_date)
+            tables[cls.__main_table__] = make_class(cls, import_date, schema_override=db_schema)
             obj = tables[cls.__main_table__]
 
             table = obj.__main_table__
@@ -197,14 +226,19 @@ async def shutdown(ctx):
 
 
 async def save_attributes(ctx, task):
+    if "context" in task:
+        ctx.setdefault("context", {}).update(task["context"])
+    await _prepare_attribute_tables(ctx)
     import_date = ctx["import_date"]
+    test_mode = bool(ctx.get("context", {}).get("test_mode"))
+    db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
     if ("type" in task) and task["type"] == "PlanPrices":
-        myplanattributes = make_class(PlanPrices, import_date)
+        myplanattributes = make_class(PlanPrices, import_date, schema_override=db_schema)
     else:
         if ("type" in task) and task["type"] == "PlanBenefits":
-            myplanattributes = make_class(PlanBenefits, import_date)
+            myplanattributes = make_class(PlanBenefits, import_date, schema_override=db_schema)
         else:
-            myplanattributes = make_class(PlanAttributes, import_date)
+            myplanattributes = make_class(PlanAttributes, import_date, schema_override=db_schema)
     await push_objects(task["attr_obj_list"], myplanattributes)
 
 
@@ -213,8 +247,13 @@ async def process_attributes(ctx, task):
 
     print("Downloading data from: ", task["url"])
 
+    if "context" in task:
+        ctx.setdefault("context", {}).update(task["context"])
+    await _prepare_attribute_tables(ctx)
     import_date = ctx["import_date"]
-    myplanattributes = make_class(PlanAttributes, import_date)
+    test_mode = bool(ctx.get("context", {}).get("test_mode"))
+    db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
+    myplanattributes = make_class(PlanAttributes, import_date, schema_override=db_schema)
 
     with tempfile.TemporaryDirectory() as tmpdirname:
         p = "attr.csv"
@@ -254,7 +293,11 @@ async def process_attributes(ctx, task):
                     # int(os.environ.get('HLTHPRT_SAVE_PER_PACK', 100)):
                     total_count += count
                     await redis.enqueue_job(
-                        "save_attributes", {"attr_obj_list": attr_obj_list}
+                        "save_attributes",
+                        {
+                            "attr_obj_list": attr_obj_list,
+                            "context": {"test_mode": test_mode},
+                        },
                     )
                     attr_obj_list.clear()
                     count = 0
@@ -269,8 +312,13 @@ async def process_benefits(ctx, task):
     redis = ctx["redis"]
     print("Downloading data from: ", task["url"])
 
+    if "context" in task:
+        ctx.setdefault("context", {}).update(task["context"])
+    await _prepare_attribute_tables(ctx)
     import_date = ctx["import_date"]
-    myplanbenefits = make_class(PlanBenefits, import_date)
+    test_mode = bool(ctx.get("context", {}).get("test_mode"))
+    db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
+    myplanbenefits = make_class(PlanBenefits, import_date, schema_override=db_schema)
 
     with tempfile.TemporaryDirectory() as tmpdirname:
         p = "benefits.csv"
@@ -349,7 +397,11 @@ async def process_benefits(ctx, task):
                     total_count += count
                     await redis.enqueue_job(
                         "save_attributes",
-                        {"type": "PlanBenefits", "attr_obj_list": attr_obj_list},
+                        {
+                            "type": "PlanBenefits",
+                            "attr_obj_list": attr_obj_list,
+                            "context": {"test_mode": test_mode},
+                        },
                     )
                     attr_obj_list.clear()
                     count = 0
@@ -363,7 +415,10 @@ async def process_benefits(ctx, task):
 async def process_rating_areas(ctx):
     print("Importing Rating Areas")
     import_date = ctx["import_date"]
-    myplanrating = make_class(PlanRatingAreas, import_date)
+    test_mode = bool(ctx.get("context", {}).get("test_mode"))
+    await ensure_database(test_mode)
+    db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
+    myplanrating = make_class(PlanRatingAreas, import_date, schema_override=db_schema)
     attr_obj_list = []
     async with async_open("data/rating_areas.csv", "r", encoding='utf-8-sig') as afp:
         async for row in AsyncDictReader(afp, delimiter=";"):
@@ -382,11 +437,16 @@ async def process_rating_areas(ctx):
 
 async def process_prices(ctx, task):
     redis = ctx["redis"]
+    if "context" in task:
+        ctx.setdefault("context", {}).update(task["context"])
+    await _prepare_attribute_tables(ctx)
     await process_rating_areas(ctx)
     print("Downloading data from: ", task["url"])
 
     import_date = ctx["import_date"]
-    myplanprices = make_class(PlanPrices, import_date)
+    test_mode = bool(ctx.get("context", {}).get("test_mode"))
+    db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
+    myplanprices = make_class(PlanPrices, import_date, schema_override=db_schema)
 
     with tempfile.TemporaryDirectory() as tmpdirname:
         p = "rate.csv"
@@ -490,7 +550,11 @@ async def process_prices(ctx, task):
                     total_count += count
                     await redis.enqueue_job(
                         "save_attributes",
-                        {"type": "PlanPrices", "attr_obj_list": attr_obj_list},
+                        {
+                            "type": "PlanPrices",
+                            "attr_obj_list": attr_obj_list,
+                            "context": {"test_mode": test_mode},
+                        },
                     )
                     attr_obj_list.clear()
                     count = 0
@@ -602,8 +666,13 @@ async def process_state_attributes(ctx, task):
 
     print("Downloading data from: ", task["url"])
 
+    if "context" in task:
+        ctx.setdefault("context", {}).update(task["context"])
+    await _prepare_attribute_tables(ctx)
     import_date = ctx["import_date"]
-    myplanattributes = make_class(PlanAttributes, import_date)
+    test_mode = bool(ctx.get("context", {}).get("test_mode"))
+    db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
+    myplanattributes = make_class(PlanAttributes, import_date, schema_override=db_schema)
 
     with tempfile.TemporaryDirectory() as tmpdirname:
         p = "attr.csv"
@@ -646,7 +715,11 @@ async def process_state_attributes(ctx, task):
                     # int(os.environ.get('HLTHPRT_SAVE_PER_PACK', 100)):
                     total_count += count
                     await redis.enqueue_job(
-                        "save_attributes", {"attr_obj_list": attr_obj_list}
+                        "save_attributes",
+                        {
+                            "attr_obj_list": attr_obj_list,
+                            "context": {"test_mode": test_mode},
+                        },
                     )
                     attr_obj_list.clear()
                     count = 0
@@ -657,7 +730,7 @@ async def process_state_attributes(ctx, task):
                 await push_objects(attr_obj_list, myplanattributes)
 
 
-async def main():
+async def main(test_mode: bool = False):
     redis = await create_pool(
         RedisSettings.from_dsn(os.environ.get("HLTHPRT_REDIS_ADDRESS")),
         job_serializer=msgpack.packb,
@@ -676,26 +749,46 @@ async def main():
     for file in state_attribute_files:
         print("Adding: ", file)
         await redis.enqueue_job(
-            "process_state_attributes", {"url": file["url"], "year": file["year"]}
+            "process_state_attributes",
+            {
+                "url": file["url"],
+                "year": file["year"],
+                "context": {"test_mode": test_mode},
+            },
         )
 
     print("Starting to process Plan Attribute files..")
     for file in attribute_files:
         print("Adding: ", file)
         await redis.enqueue_job(
-            "process_attributes", {"url": file["url"], "year": file["year"]}
+            "process_attributes",
+            {
+                "url": file["url"],
+                "year": file["year"],
+                "context": {"test_mode": test_mode},
+            },
         )
 
     print("Starting to process Plan Prices files..")
     for file in price_files:
         print("Adding: ", file)
         await redis.enqueue_job(
-            "process_prices", {"url": file["url"], "year": file["year"]}
+            "process_prices",
+            {
+                "url": file["url"],
+                "year": file["year"],
+                "context": {"test_mode": test_mode},
+            },
         )
 
     print("Starting to process Plan Benefits files..")
     for file in benefits_files:
         print("Adding: ", file)
         await redis.enqueue_job(
-            "process_benefits", {"url": file["url"], "year": file["year"]}
+            "process_benefits",
+            {
+                "url": file["url"],
+                "year": file["year"],
+                "context": {"test_mode": test_mode},
+            },
         )

@@ -321,6 +321,37 @@ class PlanNetworkTierRaw(Base, JSONOutputMixin):
     checksum_network = Column(Integer)
 
 
+class PlanDrugRaw(Base, JSONOutputMixin):
+    __tablename__ = 'plan_drug_raw'
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint('plan_id', 'rxnorm_id'),
+        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+    )
+    __my_index_elements__ = ['plan_id', 'rxnorm_id']
+    __my_additional_indexes__ = [
+        {
+            'index_elements': ('plan_id', 'drug_tier'),
+            'using': 'gin',
+            'name': 'plan_drug_tier_lookup',
+        },
+        {
+            'index_elements': ('rxnorm_id',),
+            'name': 'plan_drug_rxnorm_lookup',
+        },
+    ]
+
+    plan_id = Column(String(14), nullable=False)
+    plan_id_type = Column(String)
+    rxnorm_id = Column(String, nullable=False)
+    drug_name = Column(String)
+    drug_tier = Column(String)
+    prior_authorization = Column(Boolean)
+    step_therapy = Column(Boolean)
+    quantity_limit = Column(Boolean)
+    last_updated_on = Column(TIMESTAMP)
+
+
 class NPIData(Base, JSONOutputMixin):
     __tablename__ = 'npi'
     __main_table__ = __tablename__

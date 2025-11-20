@@ -171,6 +171,7 @@ async def test_save_npi_data_dispatch(monkeypatch, npi_module):
         push_calls.append((cls.__tablename__, rewrite, objects))
 
     monkeypatch.setattr(npi_module, "push_objects", fake_push)
+    monkeypatch.setattr(npi_module, "ensure_database", AsyncMock())
 
     ctx = {"import_date": "20251106"}
     task = {
@@ -202,6 +203,7 @@ async def test_process_data_no_remote_files(monkeypatch, npi_module):
 
     download_mock = AsyncMock(return_value="")
     monkeypatch.setattr(npi_module, "download_it", download_mock)
+    monkeypatch.setattr(npi_module, "ensure_database", AsyncMock())
 
     ctx = {"context": {}, "redis": SimpleNamespace(enqueue_job=AsyncMock()), "import_date": "20251107"}
 
@@ -218,6 +220,7 @@ async def test_startup_initializes_tables(monkeypatch, npi_module):
 
     my_init_mock = AsyncMock()
     monkeypatch.setattr(npi_module, "my_init_db", my_init_mock)
+    monkeypatch.setattr(npi_module, "ensure_database", AsyncMock())
 
     make_mock = _fake_make_class_factory("testschema")
     monkeypatch.setattr(npi_module, "make_class", make_mock)
@@ -243,6 +246,7 @@ async def test_shutdown_handles_rotation(monkeypatch, npi_module):
     monkeypatch.setenv("DB_SCHEMA", "testschema")
     monkeypatch.setattr(npi_module, "make_class", _fake_make_class_factory("testschema"))
     monkeypatch.setattr(npi_module, "print_time_info", lambda start: None)
+    monkeypatch.setattr(npi_module, "ensure_database", AsyncMock())
 
     scalar_mock = AsyncMock(return_value=6_000_000)
     status_mock = AsyncMock()

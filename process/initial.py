@@ -30,10 +30,13 @@ from process.ext.utils import (
     flush_error_log,
     return_checksum,
     my_init_db,
+    ensure_database,
+    get_import_schema,
 )
 from db.models import (
     PlanNPIRaw,
     PlanNetworkTierRaw,
+    PlanDrugRaw,
     ImportHistory,
     ImportLog,
     Issuer,
@@ -55,8 +58,10 @@ TEST_PLAN_TRANSPARENCY_ROWS = 25
 TEST_UNKNOWN_STATE_ROWS = 50
 TEST_PLAN_URLS = 2
 TEST_PROVIDER_URLS = 2
+TEST_FORMULARY_URLS = 2
 TEST_PLAN_RECORDS = 30
 TEST_PROVIDER_RECORDS = 60
+TEST_DRUG_RECORDS = 60
 TEST_MIN_PLAN_COUNT = 1
 
 
@@ -75,8 +80,8 @@ def _truthy(value, truthy=("yes", "y", "true")) -> bool:
     return bool(value)
 
 
-async def _prepare_import_tables(import_date: str) -> None:
-    db_schema = os.getenv("HLTHPRT_DB_SCHEMA") if os.getenv("HLTHPRT_DB_SCHEMA") else "mrf"
+async def _prepare_import_tables(import_date: str, test_mode: bool) -> None:
+    db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
 
     await db.create_table(ImportHistory.__table__, checkfirst=True)
     if hasattr(ImportHistory, "__my_index_elements__") and ImportHistory.__my_index_elements__:
@@ -90,8 +95,17 @@ async def _prepare_import_tables(import_date: str) -> None:
         except IntegrityError:
             pass
 
-    for cls in (Issuer, Plan, PlanFormulary, PlanTransparency, ImportLog, PlanNPIRaw, PlanNetworkTierRaw):
-        obj = make_class(cls, import_date)
+    for cls in (
+        Issuer,
+        Plan,
+        PlanFormulary,
+        PlanTransparency,
+        PlanDrugRaw,
+        ImportLog,
+        PlanNPIRaw,
+        PlanNetworkTierRaw,
+    ):
+        obj = make_class(cls, import_date, schema_override=db_schema)
         try:
             await db.status("DROP TABLE IF EXISTS " + f"{db_schema}.{obj.__tablename__};")
         except ProgrammingError:
@@ -128,10 +142,12 @@ async def process_plan(ctx, task):
     import_date = ctx["context"]["import_date"]
     test_mode = is_test_mode(ctx)
     plan_limit = TEST_PLAN_RECORDS if test_mode else None
+    await ensure_database(test_mode)
 
-    myplan = make_class(Plan, import_date)
-    myplanformulary = make_class(PlanFormulary, import_date)
-    myimportlog = make_class(ImportLog, import_date)
+    db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
+    myplan = make_class(Plan, import_date, schema_override=db_schema)
+    myplanformulary = make_class(PlanFormulary, import_date, schema_override=db_schema)
+    myimportlog = make_class(ImportLog, import_date, schema_override=db_schema)
 
     print("Starting Plan data download: ", task.get("url"))
     with tempfile.TemporaryDirectory() as tmpdirname:
@@ -199,6 +215,15 @@ async def process_plan(ctx, task):
                                     myimportlog,
                                 )
 
+                            network_entries = res.get("network", [])
+                            if isinstance(network_entries, dict):
+                                network_entries = [network_entries]
+                            formulary_entries = res.get("formulary", [])
+                            if isinstance(formulary_entries, dict):
+                                formulary_entries = [formulary_entries]
+                            if not isinstance(formulary_entries, list):
+                                formulary_entries = []
+
                             obj = {
                                 "plan_id": res["plan_id"],
                                 "plan_id_type": res["plan_id_type"],
@@ -210,7 +235,7 @@ async def process_plan(ctx, task):
                                 "marketing_url": res.get("marketing_url", ""),
                                 "formulary_url": res.get("formulary_url", ""),
                                 "plan_contact": res["plan_contact"],
-                                "network": [(k["network_tier"]) for k in res["network"]],
+                                "network": [(k["network_tier"]) for k in network_entries if isinstance(k, dict)],
                                 "benefits": [json.dumps(x) for x in res.get("benefits", [])],
                                 "last_updated_on": datetime.datetime.combine(
                                     parse_date(res["last_updated_on"], fuzzy=True), datetime.datetime.min.time()
@@ -240,8 +265,8 @@ async def process_plan(ctx, task):
                     for year in res["years"]:
                         if stop_processing:
                             break
-                        if "formulary" in res and res["formulary"]:
-                            for formulary in res["formulary"]:
+                        if formulary_entries:
+                            for formulary in formulary_entries:
                                 if (
                                     isinstance(formulary, dict)
                                     and ("cost_sharing" in formulary)
@@ -391,11 +416,13 @@ async def process_provider(ctx, task):
     import_date = ctx["context"]["import_date"]
     test_mode = is_test_mode(ctx)
     provider_limit = TEST_PROVIDER_RECORDS if test_mode else None
+    await ensure_database(test_mode)
 
     current_year = datetime.datetime.now().year
-    myimportlog = make_class(ImportLog, import_date)
-    myplan_npi = make_class(PlanNPIRaw, import_date)
-    myplan_networktier = make_class(PlanNetworkTierRaw, import_date)
+    db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
+    myimportlog = make_class(ImportLog, import_date, schema_override=db_schema)
+    myplan_npi = make_class(PlanNPIRaw, import_date, schema_override=db_schema)
+    myplan_networktier = make_class(PlanNetworkTierRaw, import_date, schema_override=db_schema)
 
     print("Starting Provider file data download: ", task.get("url"))
     with tempfile.TemporaryDirectory() as tmpdirname:
@@ -627,29 +654,177 @@ async def process_provider(ctx, task):
     return 1
 
 
+def _parse_optional_bool(value):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "yes", "y", "1"}:
+            return True
+        if lowered in {"false", "no", "n", "0"}:
+            return False
+    return bool(value)
+
+
+async def process_formulary(ctx, task):
+    """
+    Download and store formulary (drugs.json) data for an issuer.
+    """
+    if "context" in task:
+        ctx["context"] = task["context"]
+    import_date = ctx["context"]["import_date"]
+    test_mode = is_test_mode(ctx)
+    drug_limit = TEST_DRUG_RECORDS if test_mode else None
+    await ensure_database(test_mode)
+
+    db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
+    myimportlog = make_class(ImportLog, import_date, schema_override=db_schema)
+    myplan_drug = make_class(PlanDrugRaw, import_date, schema_override=db_schema)
+
+    print("Starting Formulary file data download: ", task.get("url"))
+    with tempfile.TemporaryDirectory() as tmpdirname:
+        p = Path(task.get("url"))
+        tmp_filename = str(PurePath(str(tmpdirname), p.name))
+        try:
+            await download_it_and_save(
+                task.get("url"),
+                tmp_filename,
+                context={"issuer_array": task["issuer_array"], "source": "formulary"},
+                logger=myimportlog,
+            )
+        except Exception as exc:
+            logger.warning("Failed to download formulary data from %s: %s", task.get("url"), exc)
+            return
+
+        batch = []
+        processed = 0
+        try:
+            async with async_open(tmp_filename, "rb") as afp:
+                async for res in ijson.items(afp, "item", use_float=True):
+                    rxnorm_id = str(res.get("rxnorm_id", "")).strip()
+                    drug_name = str(res.get("drug_name", "")).strip()
+                    plans = res.get("plans") or []
+                    if not rxnorm_id or not drug_name or not isinstance(plans, list) or not plans:
+                        await log_error(
+                            "err",
+                            f"Missing required drug fields. rxnorm_id={rxnorm_id!r}",
+                            task.get("issuer_array"),
+                            task.get("url"),
+                            "formulary",
+                            "json",
+                            myimportlog,
+                        )
+                        continue
+
+                    for plan_entry in plans:
+                        plan_id = str(plan_entry.get("plan_id", "")).strip()
+                        plan_id_type = str(plan_entry.get("plan_id_type", "")).strip()
+                        if not plan_id or not plan_id_type:
+                            await log_error(
+                                "err",
+                                f"Plan entry missing identifiers for rxnorm_id={rxnorm_id}",
+                                task.get("issuer_array"),
+                                task.get("url"),
+                                "formulary",
+                                "json",
+                                myimportlog,
+                            )
+                            continue
+                        drug_tier = plan_entry.get("drug_tier")
+                        if isinstance(drug_tier, str):
+                            drug_tier = drug_tier.strip().upper()
+                        record = {
+                            "plan_id": plan_id,
+                            "plan_id_type": plan_id_type,
+                            "rxnorm_id": rxnorm_id,
+                            "drug_name": drug_name,
+                            "drug_tier": drug_tier,
+                            "prior_authorization": _parse_optional_bool(plan_entry.get("prior_authorization")),
+                            "step_therapy": _parse_optional_bool(plan_entry.get("step_therapy")),
+                            "quantity_limit": _parse_optional_bool(plan_entry.get("quantity_limit")),
+                            "last_updated_on": None,
+                        }
+                        if res.get("last_updated_on"):
+                            try:
+                                record["last_updated_on"] = datetime.datetime.combine(
+                                    parse_date(res["last_updated_on"], fuzzy=True),
+                                    datetime.datetime.min.time(),
+                                )
+                            except (ValueError, TypeError):
+                                record["last_updated_on"] = None
+                        batch.append(record)
+
+                    processed += 1
+                    if drug_limit and processed >= drug_limit:
+                        break
+                    if len(batch) > 10000:
+                        await push_objects(batch, myplan_drug)
+                        batch.clear()
+
+        except ijson.IncompleteJSONError as exc:
+            await log_error(
+                "err",
+                f"Incomplete JSON: can't read expected data. {exc}",
+                task.get("issuer_array"),
+                task.get("url"),
+                "formulary",
+                "json",
+                myimportlog,
+            )
+            return
+        except ijson.JSONError as exc:
+            await log_error(
+                "err",
+                f"JSON Parsing Error: {exc}",
+                task.get("issuer_array"),
+                task.get("url"),
+                "formulary",
+                "json",
+                myimportlog,
+            )
+            return
+
+        if batch:
+            await push_objects(batch, myplan_drug)
+
+    await flush_error_log(myimportlog)
+    return 1
+
+
 async def save_mrf_data(ctx, task):
     if "context" in task:
         ctx["context"] = task["context"]
     import_date = ctx["context"]["import_date"]
-
+    test_mode = bool(ctx.get("context", {}).get("test_mode"))
+    await ensure_database(test_mode)
+    db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
     x = []
     print("Got task for saving MRF data")
     for key in task:
         match key:
             case "plan_npi":
-                myplan_npi = make_class(PlanNPIRaw, import_date)
+                myplan_npi = make_class(PlanNPIRaw, import_date, schema_override=db_schema)
                 x.append(push_objects(task["plan_npi"], myplan_npi, rewrite=True))
             case "plan_networktier":
-                myplan_networktier = make_class(PlanNetworkTierRaw, import_date)
+                myplan_networktier = make_class(PlanNetworkTierRaw, import_date, schema_override=db_schema)
                 x.append(push_objects(task["plan_networktier"], myplan_networktier, rewrite=True))
+            case "plan_drugs":
+                myplan_drugs = make_class(PlanDrugRaw, import_date, schema_override=db_schema)
+                x.append(push_objects(task["plan_drugs"], myplan_drugs, rewrite=True))
             case "npi_other_id_list":
-                mynpidataotheridentifier = make_class(NPIDataOtherIdentifier, import_date)
+                mynpidataotheridentifier = make_class(
+                    NPIDataOtherIdentifier, import_date, schema_override=db_schema
+                )
                 x.append(push_objects(task["npi_other_id_list"], mynpidataotheridentifier, rewrite=True))
             case "npi_taxonomy_group_list":
-                mynpidatataxonomygroup = make_class(NPIDataTaxonomyGroup, import_date)
+                mynpidatataxonomygroup = make_class(
+                    NPIDataTaxonomyGroup, import_date, schema_override=db_schema
+                )
                 x.append(push_objects(task["npi_taxonomy_group_list"], mynpidatataxonomygroup, rewrite=True))
             case "npi_address_list":
-                mynpiaddress = make_class(NPIAddress, import_date)
+                mynpiaddress = make_class(NPIAddress, import_date, schema_override=db_schema)
                 x.append(push_objects(task["npi_address_list"], mynpiaddress, rewrite=True))
             case "context":
                 pass
@@ -675,8 +850,11 @@ async def process_json_index(ctx, task):
     if "context" in task:
         ctx["context"] = task["context"]
     import_date = ctx["context"]["import_date"]
+    test_mode = is_test_mode(ctx)
+    await ensure_database(test_mode)
+    db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
 
-    myimportlog = make_class(ImportLog, import_date)
+    myimportlog = make_class(ImportLog, import_date, schema_override=db_schema)
     with tempfile.TemporaryDirectory() as tmpdirname:
         p = Path(task.get("url"))
         tmp_filename = str(PurePath(str(tmpdirname), p.name))
@@ -686,11 +864,12 @@ async def process_json_index(ctx, task):
             context={"issuer_array": task["issuer_array"], "source": "json_index"},
             logger=myimportlog,
         )
-        test_mode = is_test_mode(ctx)
         plan_limit = TEST_PLAN_URLS if test_mode else None
         provider_limit = TEST_PROVIDER_URLS if test_mode else None
+        formulary_limit = TEST_FORMULARY_URLS if test_mode else None
         enqueued_plans = 0
         enqueued_providers = 0
+        enqueued_formularies = 0
 
         async with async_open(tmp_filename, "rb") as afp:
             try:
@@ -705,6 +884,40 @@ async def process_json_index(ctx, task):
                     enqueued_plans += 1
                     if plan_limit and enqueued_plans >= plan_limit:
                         break
+            except ijson.JSONError as exc:
+                await log_error(
+                    "err",
+                    f"JSON Parsing Error: {exc}",
+                    task.get("issuer_array"),
+                    task.get("url"),
+                    "json_index",
+                    "json",
+                    myimportlog,
+                )
+                return
+        async with async_open(tmp_filename, "rb") as afp:
+            try:
+                async for url in ijson.items(
+                    afp, "formulary_urls.item", use_float=True
+                ):
+                    print(f"Formulary URL: {url}")
+                    await redis.enqueue_job(
+                        "process_formulary", {"url": url, "issuer_array": issuer_array, "context": ctx["context"]}
+                    )
+                    enqueued_formularies += 1
+                    if formulary_limit and enqueued_formularies >= formulary_limit:
+                        break
+            except ijson.IncompleteJSONError as exc:
+                await log_error(
+                    "err",
+                    f"Incomplete JSON: can't read expected data. {exc}",
+                    task.get("issuer_array"),
+                    task.get("url"),
+                    "index",
+                    "json",
+                    myimportlog,
+                )
+                return
             except ijson.JSONError as exc:
                 await log_error(
                     "err",
@@ -987,6 +1200,7 @@ async def init_file(ctx, task=None):
     redis = ctx["redis"]
     ctx.setdefault("context", {})
     ctx["context"]["test_mode"] = test_mode
+    await ensure_database(test_mode)
 
     mrf_source = os.environ["HLTHPRT_CMSGOV_MRF_URL_PUF"]
     try:
@@ -1002,11 +1216,12 @@ async def init_file(ctx, task=None):
     print("Downloading data from: ", ", ".join(mrf_urls))
 
     import_date = ctx["context"]["import_date"]
-    await _prepare_import_tables(import_date)
+    await _prepare_import_tables(import_date, test_mode)
     ctx["context"]["run"] += 1
-    myissuer = make_class(Issuer, import_date)
-    myplan = make_class(Plan, import_date)
-    myplantransparency = make_class(PlanTransparency, import_date)
+    db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
+    myissuer = make_class(Issuer, import_date, schema_override=db_schema)
+    myplan = make_class(Plan, import_date, schema_override=db_schema)
+    myplantransparency = make_class(PlanTransparency, import_date, schema_override=db_schema)
 
     with tempfile.TemporaryDirectory() as tmpdirname:
         transparent_files = json.loads(os.environ["HLTHPRT_CMSGOV_PLAN_TRANSPARENCY_URL_PUF"])
@@ -1202,13 +1417,14 @@ async def shutdown(ctx, task):
         ctx["context"] = task["context"]
     import_date = ctx["context"]["import_date"]
     test_mode = is_test_mode(ctx)
-    myimportlog = make_class(ImportLog, import_date)
+    await ensure_database(test_mode)
+    db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
+    myimportlog = make_class(ImportLog, import_date, schema_override=db_schema)
     await flush_error_log(myimportlog)
-    db_schema = os.getenv("HLTHPRT_DB_SCHEMA") if os.getenv("HLTHPRT_DB_SCHEMA") else "mrf"
     await db.status("CREATE EXTENSION IF NOT EXISTS pg_trgm;")
     await db.status("CREATE EXTENSION IF NOT EXISTS btree_gin;")
 
-    test = make_class(Plan, import_date)
+    test = make_class(Plan, import_date, schema_override=db_schema)
     plans_count = await db.scalar(select(func.count(test.plan_id)))
     if test_mode:
         print(f"Test mode: imported {plans_count} plan rows (no minimum enforced).")
@@ -1219,8 +1435,17 @@ async def shutdown(ctx, task):
 
     tables = {}
     async with db.transaction():
-        for cls in (Issuer, Plan, PlanFormulary, PlanTransparency, ImportLog, PlanNPIRaw, PlanNetworkTierRaw):
-            tables[cls.__main_table__] = make_class(cls, import_date)
+        for cls in (
+            Issuer,
+            Plan,
+            PlanFormulary,
+            PlanTransparency,
+            PlanDrugRaw,
+            ImportLog,
+            PlanNPIRaw,
+            PlanNetworkTierRaw,
+        ):
+            tables[cls.__main_table__] = make_class(cls, import_date, schema_override=db_schema)
             obj = tables[cls.__main_table__]
             table = obj.__main_table__
             await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")

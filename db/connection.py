@@ -195,6 +195,8 @@ class Database:
     engine: Optional[Any] = None
     session_factory: Optional[Any] = None
     func: FuncProxy = field(init=False, repr=False)
+    _database_name: Optional[str] = field(init=False, default=None, repr=False)
+    _database_override: Optional[str] = field(init=False, default=None, repr=False)
 
     text = staticmethod(sa_text)
     metadata = Base.metadata
@@ -203,13 +205,21 @@ class Database:
         self.func = FuncProxy(self)
 
     async def connect(self) -> None:
-        if self.engine is not None:
-            return
-
         if _ASYNC_IMPORT_ERROR is not None:
             raise RuntimeError(
                 "SQLAlchemy async support requires SQLAlchemy >= 1.4"
             ) from _ASYNC_IMPORT_ERROR
+
+        requested_db = (
+            self._database_override
+            or os.getenv("HLTHPRT_DB_DATABASE_OVERRIDE")
+            or os.getenv("HLTHPRT_DB_DATABASE", "postgres")
+        )
+
+        if self.engine is not None:
+            if requested_db == self._database_name:
+                return
+            await self.disconnect()
 
         driver = os.getenv("HLTHPRT_DB_DRIVER", "postgresql+asyncpg")
         if driver == "asyncpg":
@@ -223,7 +233,7 @@ class Database:
             password=os.getenv("HLTHPRT_DB_PASSWORD", ""),
             host=os.getenv("HLTHPRT_DB_HOST", "127.0.0.1"),
             port=int(os.getenv("HLTHPRT_DB_PORT", "5432")),
-            database=os.getenv("HLTHPRT_DB_DATABASE", "postgres"),
+            database=requested_db,
         )
 
         pool_min = int(os.getenv("HLTHPRT_DB_POOL_MIN_SIZE", "1"))
@@ -242,6 +252,7 @@ class Database:
             expire_on_commit=False,
             autoflush=False,
         )
+        self._database_name = requested_db
 
     def select(self, *columns: Any):
         columns = _coerce_columns(columns)
@@ -313,6 +324,7 @@ class Database:
         await self.engine.dispose()
         self.engine = None
         self.session_factory = None
+        self._database_name = None
 
     async def execute_ddl(self, statement: str) -> None:
         if self.engine is None:

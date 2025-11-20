@@ -27,6 +27,7 @@ from process.ext.utils import (
     push_objects,
     print_time_info,
     my_init_db,
+    ensure_database,
 )
 
 from db.models import AddressArchive, NPIAddress, NPIData, NPIDataTaxonomyGroup, NPIDataOtherIdentifier, \
@@ -186,6 +187,7 @@ async def process_data(ctx, task=None):  # pragma: no cover
     if 'test_mode' in task:
         ctx['context']['test_mode'] = bool(task.get('test_mode'))
     test_mode = bool(ctx['context'].get('test_mode', False))
+    await ensure_database(test_mode)
 
     ctx['context']['run'] = ctx['context'].get('run', 0) + 1
 
@@ -449,6 +451,7 @@ async def startup(ctx):  # pragma: no cover
     ctx['context']['start'] = datetime.datetime.utcnow()
     ctx['context']['run'] = 0
     ctx['context']['test_mode'] = False
+    await ensure_database(False)
     ctx['import_date'] = datetime.datetime.now().strftime("%Y%m%d")
     import_date = ctx['import_date']
     db_schema = os.getenv('HLTHPRT_DB_SCHEMA') if os.getenv('HLTHPRT_DB_SCHEMA') else 'mrf'
@@ -498,10 +501,11 @@ async def startup(ctx):  # pragma: no cover
 
     print("Preparing done")
 
-async def refresh_do_business_as(target_table: str | None = None):
+async def refresh_do_business_as(target_table: str | None = None, test_mode: bool | None = None):
     """
     Populate the NPI.do_business_as array from other identifier entries (type code 3).
     """
+    await ensure_database(bool(test_mode))
     db_schema = os.getenv('HLTHPRT_DB_SCHEMA') if os.getenv('HLTHPRT_DB_SCHEMA') else 'mrf'
     table = target_table or NPIData.__tablename__
 
@@ -539,6 +543,7 @@ async def shutdown(ctx):  # pragma: no cover
     if not context.get('run'):
         print("No NPI jobs ran in this worker session; skipping shutdown validation.")
         return
+    await ensure_database(bool(context.get("test_mode")))
 
     db_schema = os.getenv('HLTHPRT_DB_SCHEMA') if os.getenv('HLTHPRT_DB_SCHEMA') else 'mrf'
     tables = {}
@@ -561,7 +566,10 @@ async def shutdown(ctx):  # pragma: no cover
                 print('Updating NPI do_business_as arrays from other identifiers...')
                 target_npi_cls = tables.get(NPIData.__main_table__)
                 target_table_name = target_npi_cls.__tablename__ if target_npi_cls else NPIData.__tablename__
-                await refresh_do_business_as(target_table=target_table_name)
+                await refresh_do_business_as(
+                    target_table=target_table_name,
+                    test_mode=bool(context.get("test_mode")),
+                )
             if cls is NPIAddress:
                 print("Updating NUCC Taxonomy for NPI Addresses...")
                 await db.status(f"""WITH x AS (
@@ -658,6 +666,8 @@ WHERE
 
 async def save_npi_data(ctx, task):
     import_date = ctx['import_date']
+    test_mode = bool(ctx.get("context", {}).get("test_mode"))
+    await ensure_database(test_mode)
     x = []
     for key in task:
         match key:

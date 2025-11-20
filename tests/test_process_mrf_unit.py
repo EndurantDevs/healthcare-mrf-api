@@ -1,5 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+import asyncio
 import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -38,8 +39,14 @@ async def test_mrf_main_enqueues_init_file_test_mode(monkeypatch):
 
 def test_mrf_worker_configuration():
     names = [fn.__name__ for fn in process_pkg.MRF.functions]
-    assert names[0] == "init_file"
-    assert names[-1] == "process_provider"
+    assert names == [
+        "init_file",
+        "save_mrf_data",
+        "process_plan",
+        "process_json_index",
+        "process_provider",
+        "process_formulary",
+    ]
     assert process_pkg.MRF.on_startup.__name__ == "startup"
 
 
@@ -56,6 +63,23 @@ def test_job_serializer_handles_exceptions():
     assert decoded["name"] == "RuntimeError"
     assert decoded["message"] == "boom"
 
+
+def test_plan_attributes_cli_accepts_test_flag(monkeypatch):
+    fake_initiate = AsyncMock()
+    monkeypatch.setattr(process_pkg, "initiate_plan_attributes", fake_initiate)
+
+    def fake_run(coro):
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+    monkeypatch.setattr(process_pkg.asyncio, "run", fake_run)
+
+    process_pkg.plan_attributes.callback(test=True)
+
+    fake_initiate.assert_called_once_with(test_mode=True)
 
 @pytest.mark.asyncio
 async def test_mrf_startup_sets_utc_time(monkeypatch):
@@ -93,6 +117,7 @@ async def test_refresh_do_business_as(monkeypatch):
     async def fake_status(sql):
         calls.append(sql)
 
+    monkeypatch.setattr(process_npi, "ensure_database", AsyncMock())
     monkeypatch.setattr(process_npi.db, "status", fake_status)
     monkeypatch.setattr(os, "getenv", lambda name, default=None: "mrf" if name in {"DB_SCHEMA", "HLTHPRT_DB_SCHEMA"} else default)
 
