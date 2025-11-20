@@ -10,8 +10,15 @@ from pathlib import PurePath
 from aiocsv import AsyncDictReader
 from aiofile import async_open
 
-from process.ext.utils import download_it, download_it_and_save, \
-    make_class, push_objects, print_time_info, return_checksum
+from process.ext.utils import (
+    download_it,
+    download_it_and_save,
+    make_class,
+    push_objects,
+    print_time_info,
+    return_checksum,
+    ensure_database,
+)
 
 from db.models import NUCCTaxonomy, db
 from db.connection import init_db
@@ -34,6 +41,7 @@ async def process_data(ctx, task=None):
     ctx.setdefault('context', {})
     test_mode = bool(task.get('test_mode', ctx['context'].get('test_mode', False)))
     ctx['context']['test_mode'] = test_mode
+    await ensure_database(test_mode)
     html_source = await download_it(
         os.environ['HLTHPRT_NUCC_DOWNLOAD_URL_DIR'] + os.environ['HLTHPRT_NUCC_DOWNLOAD_URL_FILE'])
 
@@ -97,6 +105,7 @@ async def startup(ctx):
     ctx['context']['test_mode'] = False
     ctx['import_date'] = datetime.datetime.utcnow().strftime("%Y%m%d")
     await init_db(db, loop)
+    await ensure_database(False)
     import_date = ctx['import_date']
     db_schema = os.getenv('HLTHPRT_DB_SCHEMA') if os.getenv('HLTHPRT_DB_SCHEMA') else 'mrf'
 
@@ -117,6 +126,7 @@ async def startup(ctx):
 
 async def shutdown(ctx):
     import_date = ctx['import_date']
+    await ensure_database(bool(ctx.get("context", {}).get("test_mode")))
     db_schema = os.getenv('HLTHPRT_DB_SCHEMA') if os.getenv('HLTHPRT_DB_SCHEMA') else 'mrf'
     tables = {}
     async with db.transaction():

@@ -31,6 +31,7 @@ timeout = aiohttp.ClientTimeout(total=60.0)
 SECONDS_PER_MEGABYTE = float(os.getenv("HLTHPRT_SECONDS_PER_MB", "2.0"))
 HEAD_TIMEOUT_SECONDS = float(os.getenv("HLTHPRT_HEAD_TIMEOUT_SECONDS", "20.0"))
 MIN_STREAM_TIMEOUT = float(os.getenv("HLTHPRT_MIN_STREAM_TIMEOUT", "120.0"))
+TEST_DATABASE_SUFFIX = os.getenv("HLTHPRT_TEST_DATABASE_SUFFIX")
 
 
 def _estimate_timeout_seconds(size_bytes: int | None, chunk_size: int | None) -> float | None:
@@ -186,9 +187,9 @@ async def download_it_and_save(url, filepath, chunk_size=None, context=None, log
             await copyfile(filepath, file_with_dir)
 
 
-def make_class(model_cls, table_suffix):
+def make_class(model_cls, table_suffix, schema_override=None):
     table_suffix = str(table_suffix)
-    cache_key = (model_cls, table_suffix)
+    cache_key = (model_cls, table_suffix, schema_override)
     if cache_key in _DYNAMIC_CLASS_CACHE:
         return _DYNAMIC_CLASS_CACHE[cache_key]
 
@@ -199,6 +200,8 @@ def make_class(model_cls, table_suffix):
         new_table = metadata.tables[new_table_name]
     else:
         new_table = model_cls.__table__.tometadata(metadata, name=new_table_name)
+        if schema_override is not None:
+            new_table.schema = schema_override
 
     mapper_args = dict(getattr(model_cls, "__mapper_args__", {}))
     mapper_args["concrete"] = True
@@ -320,6 +323,26 @@ class IterateList:
 async def my_init_db(db):
     loop = asyncio.get_event_loop()
     await init_db(db, loop)
+
+
+async def ensure_database(test_mode: bool) -> None:
+    """
+    Ensure the async engine points at the correct database for the current run.
+    Test runs append the configured suffix to the base database to avoid touching production data.
+    """
+    base_database = os.getenv("HLTHPRT_DB_DATABASE", "postgres")
+    target_database = base_database
+    if test_mode and TEST_DATABASE_SUFFIX:
+        target_database = f"{base_database}{TEST_DATABASE_SUFFIX}"
+    override = target_database if target_database != base_database else None
+    if getattr(db, "_database_override", None) != override:
+        db._database_override = override  # type: ignore[attr-defined]
+    await db.connect()
+
+
+def get_import_schema(env_var: str, default: str, test_mode: bool) -> str:
+    schema = os.getenv(env_var) or default
+    return schema
 
 
 def deduplicate_dicts(dict_list, key_fields):
