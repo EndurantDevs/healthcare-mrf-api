@@ -478,6 +478,7 @@ async def get_plan(request, plan_id, year=None, variant=None):
     drug_count_result = await session.execute(drug_count_stmt)
     plan_data["formulary_drug_count"] = int(_result_scalar(drug_count_result) or 0)
     plan_data["formulary_has_drug_data"] = bool(plan_data["formulary_drug_count"])
+    plan_data["formulary_uri"] = f"{plan_id}/{plan_data.get('year')}"
 
     if not year:
         return response.json(plan_data, default=str)
