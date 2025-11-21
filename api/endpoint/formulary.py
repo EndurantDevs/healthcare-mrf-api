@@ -14,6 +14,10 @@ from db.models import Issuer, Plan, PlanDrugRaw, PlanFormulary
 blueprint = Blueprint("formulary", url_prefix="/formulary", version=1)
 
 FORMULARY_ID_SEPARATOR = ":"
+
+
+def _encode_formulary_path(plan_id: str, year: int) -> str:
+    return f"{plan_id}/{year}"
 DEFAULT_PAGE_SIZE = 50
 MAX_PAGE_SIZE = 200
 
@@ -147,10 +151,13 @@ def _hydrate_formulary_row(row) -> Dict[str, Any]:
     last_updated = mapping.get("last_updated")
     if last_updated is not None:
         last_updated = last_updated.isoformat()
+    plan_id = mapping["plan_id"]
+    year = mapping["year"]
     return {
-        "formulary_id": _encode_formulary_id(mapping["plan_id"], mapping["year"]),
-        "plan_id": mapping["plan_id"],
-        "year": mapping["year"],
+        "formulary_id": _encode_formulary_id(plan_id, year),
+        "formulary_uri": _encode_formulary_path(plan_id, year),
+        "plan_id": plan_id,
+        "year": year,
         "marketing_name": mapping.get("marketing_name"),
         "state": mapping.get("state"),
         "issuer": {
@@ -326,6 +333,7 @@ async def get_formulary(request, formulary_id):
 
     payload = {
         "formulary_id": formulary_id,
+        "formulary_uri": _encode_formulary_path(plan_id, year),
         "plan": {
             "plan_id": detail_row.plan_id,
             "year": detail_row.year,
@@ -458,6 +466,7 @@ async def list_formulary_drugs(request, formulary_id):
     return response.json(
         {
             "formulary_id": formulary_id,
+            "formulary_uri": _encode_formulary_path(plan_id, year),
             "page": page,
             "page_size": page_size,
             "total": total,
@@ -519,6 +528,7 @@ async def get_formulary_drug(request, formulary_id, rxnorm_id):
 
     payload = {
         "formulary_id": formulary_id,
+        "formulary_uri": _encode_formulary_path(plan_id, year),
         "rxnorm_id": mapping["rxnorm_id"],
         "drug_name": mapping["drug_name"],
         "drug_tier": mapping["drug_tier"],
@@ -625,6 +635,7 @@ async def get_formulary_summary(request, formulary_id):
     return response.json(
         {
             "formulary_id": formulary_id,
+            "formulary_uri": _encode_formulary_path(plan_id, year),
             "total_drugs": int(total),
             "tiers": tier_counts,
             "authorization_requirements": auth_counts,
@@ -692,6 +703,7 @@ async def cross_formulary_drug(request, rxnorm_id):
         items.append(
             {
                 "formulary_id": _encode_formulary_id(mapping["plan_id"], mapping["year"]),
+                "formulary_uri": _encode_formulary_path(mapping["plan_id"], mapping["year"]),
                 "plan_id": mapping["plan_id"],
                 "year": mapping["year"],
                 "plan_marketing_name": mapping["marketing_name"],
@@ -902,6 +914,7 @@ async def check_plan_drug(request, plan_id, rxnorm_id):
     return response.json(
         {
             "formulary_id": _encode_formulary_id(plan_id, year),
+            "formulary_uri": _encode_formulary_path(plan_id, year),
             "plan_id": plan_id,
             "year": year,
             "rxnorm_id": rxnorm_id,

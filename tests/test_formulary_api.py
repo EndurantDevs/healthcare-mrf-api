@@ -80,6 +80,7 @@ async def test_list_formularies_returns_rows():
 
     assert data["total"] == 2
     assert data["items"][0]["formulary_id"] == "PLAN123:2025"
+    assert data["items"][0]["formulary_uri"] == "PLAN123/2025"
     assert data["items"][0]["issuer"]["issuer_name"] == "Issuer One"
 
 
@@ -112,6 +113,7 @@ async def test_get_formulary_returns_detail():
     data = json.loads(response.body)
 
     assert data["plan"]["plan_id"] == "PLAN123"
+    assert data["formulary_uri"] == "PLAN123/2025"
     assert data["drug_count"] == 42
     assert data["available_tiers"] == ["PREFERRED", "STANDARD"]
     assert data["available_pharmacy_types"] == ["MAIL_ORDER", "RETAIL"]
@@ -147,6 +149,7 @@ async def test_list_formulary_drugs_respects_filters():
     assert payload["total"] == 3
     assert payload["items"][0]["rxnorm_id"] == "12345"
     assert payload["available_pharmacy_types"] == ["MAIL_ORDER", "RETAIL"]
+    assert payload["formulary_uri"] == "PLAN123/2025"
 
 
 @pytest.mark.asyncio
@@ -213,6 +216,7 @@ async def test_cross_formulary_drug_returns_formularies():
 
     assert data["rxnorm_id"] == "12345"
     assert data["formularies"][0]["formulary_id"] == "PLAN123:2025"
+    assert data["formularies"][0]["formulary_uri"] == "PLAN123/2025"
 
 
 @pytest.mark.asyncio
@@ -264,6 +268,7 @@ async def test_check_plan_drug_without_year_uses_latest():
     assert data["covered"] is True
     assert data["year"] == 2026
     assert data["details"]["drug_tier"] == "PREFERRED"
+    assert data["formulary_uri"] == "PLAN123/2026"
 
 
 @pytest.mark.asyncio

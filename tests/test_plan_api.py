@@ -265,6 +265,7 @@ async def test_plan_get_plan_success():
     assert payload["formulary"][0]["drug_tier"] == "Tier 1"
     assert payload["formulary_drug_count"] == 1
     assert payload["formulary_has_drug_data"] is True
+    assert payload["formulary_uri"] == "P123/2024"
 
 
 @pytest.mark.asyncio
@@ -507,6 +508,7 @@ async def test_get_plan_with_variant(monkeypatch):
     assert payload["variant_benefits"]["benefit_name"]["in_network_tier1"] == "5, 10"
     assert payload["variant_benefits"]["benefit_name"]["human_attr_name"] == "Benefit Name"
     assert payload["formulary_has_drug_data"] is True
+    assert payload["formulary_uri"] == "P1/2024"
 
 
 @pytest.mark.asyncio
@@ -576,6 +578,7 @@ async def test_get_plan_normalizes_variant_identifiers():
     assert payload["variant_attributes"]["VariantAttr"]["attr_value"] == "X"
     assert payload["variant_benefits"]["VariantBenefit"]["in_network_tier1"] == "$10, 50%"
     assert payload["formulary_has_drug_data"] is False
+    assert payload["formulary_uri"] == "P1/2024"
 
 
 @pytest.mark.asyncio
@@ -621,6 +624,7 @@ async def test_get_plan_uses_fallback_variants_when_missing():
     assert payload["variant_attributes"]["FormularyId"]["attr_value"] == "PlanLevelValue"
     assert payload["variant_benefits"]["GeneralBenefit"]["in_network_tier1"] == "$15, 75%"
     assert payload["formulary_has_drug_data"] is False
+    assert payload["formulary_uri"] == "P2/2024"
 
 
 @pytest.mark.asyncio
@@ -693,6 +697,7 @@ async def test_plan_variants_unique_and_clean():
     payload = json.loads(response.body)
     assert payload["variants"] == ["P1-00", "P1-01", "P1-02"]
     assert payload["formulary_has_drug_data"] is False
+    assert payload["formulary_uri"] == "P1/2024"
 
 def test_result_rows_handles_typeerror():
     class BadAll:
