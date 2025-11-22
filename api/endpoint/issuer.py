@@ -2,15 +2,18 @@
 
 import sanic.exceptions
 from sanic import Blueprint, response
-from sqlalchemy import and_, select
+from sqlalchemy import and_, func, select
 
 from db.connection import db as sa_db
-from db.models import ImportLog, Issuer, Plan, PlanNetworkTierRaw
+from db.models import ImportLog, Issuer, Plan, PlanNetworkTierRaw, PlanDrugStats, PlanDrugTierStats
+from api.tier_utils import normalize_drug_tier_slug
 
 import_log_table = ImportLog.__table__
 issuer_table = Issuer.__table__
 plan_table = Plan.__table__
 plan_network_tier_table = PlanNetworkTierRaw.__table__
+plan_drug_stats_table = PlanDrugStats.__table__
+plan_drug_tier_table = PlanDrugTierStats.__table__
 
 
 blueprint = Blueprint("issuer", url_prefix="/issuer", version=1)
@@ -111,6 +114,72 @@ async def get_issuer_data(request, issuer_id):
 
     issuer_data["plans"] = plans
     issuer_data["plans_count"] = len(plans)
+
+    stats_stmt = (
+        select(
+            func.coalesce(func.sum(plan_drug_stats_table.c.total_drugs), 0).label("total_drugs"),
+            func.coalesce(func.sum(plan_drug_stats_table.c.auth_required), 0).label("auth_required"),
+            func.coalesce(func.sum(plan_drug_stats_table.c.auth_not_required), 0).label("auth_not_required"),
+            func.coalesce(func.sum(plan_drug_stats_table.c.step_required), 0).label("step_required"),
+            func.coalesce(func.sum(plan_drug_stats_table.c.step_not_required), 0).label("step_not_required"),
+            func.coalesce(func.sum(plan_drug_stats_table.c.quantity_limit), 0).label("quantity_limit"),
+            func.coalesce(func.sum(plan_drug_stats_table.c.quantity_no_limit), 0).label("quantity_no_limit"),
+        )
+        .select_from(
+            plan_drug_stats_table.join(
+                plan_table, plan_drug_stats_table.c.plan_id == plan_table.c.plan_id
+            )
+        )
+        .where(plan_table.c.issuer_id == issuer_id)
+    )
+    stats_result = await session.execute(stats_stmt)
+    stats_row = stats_result.first()
+    stats_map = getattr(stats_row, "_mapping", {}) if stats_row else {}
+    drug_summary = {
+        "total_drugs": int(stats_map.get("total_drugs") or 0),
+        "authorization": {
+            "required": int(stats_map.get("auth_required") or 0),
+            "not_required": int(stats_map.get("auth_not_required") or 0),
+        },
+        "step_therapy": {
+            "required": int(stats_map.get("step_required") or 0),
+            "not_required": int(stats_map.get("step_not_required") or 0),
+        },
+        "quantity_limits": {
+            "has_limit": int(stats_map.get("quantity_limit") or 0),
+            "no_limit": int(stats_map.get("quantity_no_limit") or 0),
+        },
+        "tiers": [],
+    }
+
+    tier_stmt = (
+        select(
+            plan_drug_tier_table.c.drug_tier,
+            func.coalesce(func.sum(plan_drug_tier_table.c.drug_count), 0).label("drug_count"),
+        )
+        .select_from(
+            plan_drug_tier_table.join(
+                plan_table, plan_drug_tier_table.c.plan_id == plan_table.c.plan_id
+            )
+        )
+        .where(plan_table.c.issuer_id == issuer_id)
+        .group_by(plan_drug_tier_table.c.drug_tier)
+    )
+    tier_rows = (await session.execute(tier_stmt)).all()
+    tiers = []
+    for row in tier_rows:
+        label = row[0] or "UNKNOWN"
+        tiers.append(
+            {
+                "tier_slug": normalize_drug_tier_slug(label),
+                "tier_label": label,
+                "drug_count": int(row[1] or 0),
+            }
+        )
+    tiers.sort(key=lambda entry: (-entry["drug_count"], entry["tier_slug"]))
+    drug_summary["tiers"] = tiers
+
+    issuer_data["drug_summary"] = drug_summary
 
     return response.json(issuer_data, default=str)
 

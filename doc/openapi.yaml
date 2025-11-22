@@ -168,6 +168,27 @@ paths:
           schema:
             type: integer
           description: Plan year to match
+        - name: state
+          in: query
+          schema:
+            type: string
+            maxLength: 2
+          description: Two-letter state filter (auto-derived from zip_code when omitted)
+        - name: issuer_id
+          in: query
+          schema:
+            type: integer
+          description: Restrict results to a specific issuer
+        - name: plan_id
+          in: query
+          schema:
+            type: string
+          description: Partial or full plan identifier search
+        - name: q
+          in: query
+          schema:
+            type: string
+          description: Case-insensitive substring match against plan marketing name
         - name: limit
           in: query
           schema:
@@ -188,7 +209,78 @@ paths:
           in: query
           schema:
             type: string
+            enum: [plan_id, marketing_name, state, year, deductible, moop]
           description: Field to order by (defaults to plan_id)
+        - name: has_adult_dental
+          in: query
+          schema:
+            type: boolean
+          description: Require adult dental coverage metadata
+        - name: has_child_dental
+          in: query
+          schema:
+            type: boolean
+          description: Require pediatric dental coverage metadata
+        - name: has_adult_vision
+          in: query
+          schema:
+            type: boolean
+          description: Require adult vision coverage metadata
+        - name: has_child_vision
+          in: query
+          schema:
+            type: boolean
+          description: Require pediatric vision coverage metadata
+        - name: telehealth_supported
+          in: query
+          schema:
+            type: boolean
+          description: Filter by plans that list telehealth/virtual visits in benefits
+        - name: is_hsa
+          in: query
+          schema:
+            type: boolean
+          description: Restrict to plans flagged as HSA-eligible
+        - name: is_dental_only
+          in: query
+          schema:
+            type: boolean
+          description: Restrict to dental-only plans
+        - name: is_catastrophic
+          in: query
+          schema:
+            type: boolean
+          description: Restrict to catastrophic metal level plans
+        - name: is_on_exchange
+          in: query
+          schema:
+            type: boolean
+          description: Filter by plans sold on the exchange marketplace
+        - name: is_off_exchange
+          in: query
+          schema:
+            type: boolean
+          description: Filter by plans sold off exchange
+        - name: deductible_min
+          in: query
+          schema:
+            type: number
+          description: Minimum in-network individual deductible
+        - name: deductible_max
+          in: query
+          schema:
+            type: number
+          description: Maximum in-network individual deductible
+        - name: moop_min
+          in: query
+          schema:
+            type: number
+          description: Minimum in-network individual maximum out-of-pocket
+        - name: moop_max
+          in: query
+          schema:
+            type: number
+          description: Maximum in-network individual maximum out-of-pocket
       responses:
         '200':
           description: Paginated plan search payload
@@ -245,7 +337,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
+                $ref: '#/components/schemas/FormularyListResponse'
   /formulary/id/{formulary_id}:
     get:
       summary: Retrieve formulary metadata and linked plan
@@ -262,7 +354,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
+                $ref: '#/components/schemas/FormularyDetail'
         '404':
           description: Formulary not found
           content:
@@ -325,7 +417,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
+                $ref: '#/components/schemas/FormularyDrugList'
         '404':
           description: Formulary not found
           content:
@@ -352,7 +444,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
+                $ref: '#/components/schemas/FormularyDrugDetail'
         '404':
           description: Drug not present within the formulary
           content:
@@ -374,7 +466,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
+                $ref: '#/components/schemas/FormularySummary'
         '404':
           description: Formulary not found
           content:
@@ -406,7 +498,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
+                $ref: '#/components/schemas/PlanDrugCoverage'
         '404':
           description: Plan or formulary not found
           content:
@@ -442,7 +534,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
+                $ref: '#/components/schemas/FormularyCrosswalk'
         '404':
           description: Drug not found in any formulary
           content:
@@ -473,7 +565,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
+                $ref: '#/components/schemas/FormularyStatistics'
   /plan/price/{plan_id}:
     get:
       summary: Retrieve price rows for a plan
@@ -768,6 +860,111 @@ paths:
                 $ref: '#/components/schemas/Error'
         '503':
           description: Underlying TIGER tables unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /geo/city:
+    get:
+      summary: List ZIP codes for a given city and optional state
+      parameters:
+        - name: city
+          in: query
+          required: true
+          schema:
+            type: string
+          description: City name to search (case insensitive)
+        - name: state
+          in: query
+          required: false
+          schema:
+            type: string
+            maxLength: 2
+          description: Optional 2-letter state abbreviation to narrow matches
+      responses:
+        '200':
+          description: Matching ZIP codes for the requested city/state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GeoCityResponse'
+        '404':
+          description: No ZIPs found for the requested filters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /geo/states:
+    get:
+      summary: Aggregated ZIP and city counts per state
+      parameters:
+        - name: sort
+          in: query
+          schema:
+            type: string
+            enum: [population, zip_count, state]
+          description: Field used to order the states (defaults to population)
+        - name: order
+          in: query
+          schema:
+            type: string
+            enum: [asc, desc]
+          description: Sort direction (defaults to desc)
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+          description: Optional maximum number of rows to return
+        - name: top_zip_limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 10
+          description: Number of top ZIP codes (by population) to include per state (default 5)
+      responses:
+        '200':
+          description: Aggregated state-level geo metrics
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GeoStateListResponse'
+        '400':
+          description: Invalid sort/order parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /geo/state/{state}/cities:
+    get:
+      summary: Top cities in a state by population (based on local geo data)
+      parameters:
+        - name: state
+          in: path
+          required: true
+          schema:
+            type: string
+            maxLength: 2
+          description: Two-letter state abbreviation
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+          description: Number of cities to include (defaults to 20, max 200)
+      responses:
+        '200':
+          description: Ordered list of cities with population/ZIP counts
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GeoStateCitiesResponse'
+        '404':
+          description: No city data found for the requested state
           content:
             application/json:
               schema:
@@ -1240,6 +1437,17 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/PlanSearchResult'
+        issuers:
+          type: array
+          items:
+            $ref: '#/components/schemas/PlanIssuerFacet'
+        applied_filters:
+          type: object
+          additionalProperties: true
+        warnings:
+          type: array
+          items:
+            $ref: '#/components/schemas/PlanSearchWarning'
     PlanSearchResult:
       type: object
       properties:
@@ -1252,16 +1460,84 @@ components:
               type: number
             max:
               type: number
+        has_adult_dental:
+          type: boolean
+          nullable: true
+        has_child_dental:
+          type: boolean
+          nullable: true
+        has_adult_vision:
+          type: boolean
+          nullable: true
+        has_child_vision:
+          type: boolean
+          nullable: true
+        telehealth_supported:
+          type: boolean
+          nullable: true
+        is_hsa:
+          type: boolean
+          nullable: true
+        is_dental_only:
+          type: boolean
+          nullable: true
+        is_catastrophic:
+          type: boolean
+          nullable: true
+        is_on_exchange:
+          type: boolean
+          nullable: true
+        is_off_exchange:
+          type: boolean
+          nullable: true
+        market_coverage:
+          type: string
+          nullable: true
+        deductible_inn_individual:
+          type: number
+          nullable: true
+        moop_inn_individual:
+          type: number
+          nullable: true
         attributes:
           type: object
           additionalProperties:
-            type: string
+            type: object
+            properties:
+              attr_value:
+                type: string
+                nullable: true
+              human_attr_name:
+                type: string
+                nullable: true
+            additionalProperties: true
         plan_benefits:
           type: object
           additionalProperties:
             type: object
             additionalProperties: true
       additionalProperties: true
+    PlanIssuerFacet:
+      type: object
+      properties:
+        issuer_id:
+          type: integer
+          nullable: true
+        issuer_name:
+          type: string
+          nullable: true
+        plan_count:
+          type: integer
+      additionalProperties: false
+    PlanSearchWarning:
+      type: object
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+      required: [code, message]
+      additionalProperties: false
     PlanPriceEntry:
       type: object
       properties:
@@ -1313,6 +1589,326 @@ components:
             type: object
             additionalProperties: true
       additionalProperties: true
+    TierDescriptor:
+      type: object
+      properties:
+        tier_slug:
+          type: string
+          enum: [tier_1, tier_2, tier_3, tier_4, tier_5, tier_6, generic, preferred_generic, non_preferred_generic, brand, preferred_brand, non_preferred_brand, specialty, preferred_specialty, non_preferred_specialty, other, unknown]
+        tier_label:
+          type: string
+      required: [tier_slug, tier_label]
+      additionalProperties: false
+    TierBreakdownEntry:
+      allOf:
+        - $ref: '#/components/schemas/TierDescriptor'
+        - type: object
+          properties:
+            drug_count:
+              type: integer
+          required: [drug_count]
+          additionalProperties: false
+    PharmacyBreakdownEntry:
+      type: object
+      properties:
+        pharmacy_type:
+          type: string
+        count:
+          type: integer
+      required: [pharmacy_type, count]
+      additionalProperties: false
+    FormularyRecord:
+      type: object
+      properties:
+        formulary_id:
+          type: string
+        formulary_uri:
+          type: string
+        plan_id:
+          type: string
+        year:
+          type: integer
+        marketing_name:
+          type: string
+        state:
+          type: string
+        issuer:
+          type: object
+          properties:
+            issuer_id:
+              type: integer
+            issuer_name:
+              type: string
+            issuer_marketing_name:
+              type: string
+          additionalProperties: false
+        drug_count:
+          type: integer
+        last_updated:
+          type: string
+          format: date-time
+          nullable: true
+      required: [formulary_id, formulary_uri, plan_id, year, marketing_name, state, issuer, drug_count]
+      additionalProperties: false
+    FormularyListResponse:
+      type: object
+      properties:
+        total:
+          type: integer
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/FormularyRecord'
+      required: [total, items]
+      additionalProperties: false
+    FormularyDetail:
+      allOf:
+        - $ref: '#/components/schemas/FormularyRecord'
+        - type: object
+          properties:
+            plan:
+              type: object
+              properties:
+                plan_id:
+                  type: string
+                year:
+                  type: integer
+                marketing_name:
+                  type: string
+                state:
+                  type: string
+                summary_url:
+                  type: string
+                  nullable: true
+                marketing_url:
+                  type: string
+                  nullable: true
+              additionalProperties: false
+            available_tiers:
+              type: array
+              items:
+                $ref: '#/components/schemas/TierDescriptor'
+            available_pharmacy_types:
+              type: array
+              items:
+                type: string
+          required: [plan, available_tiers, available_pharmacy_types]
+          additionalProperties: false
+    FormularyDrug:
+      type: object
+      properties:
+        rxnorm_id:
+          type: string
+        drug_name:
+          type: string
+        drug_tier:
+          type: string
+        drug_tier_slug:
+          type: string
+          enum: [tier_1, tier_2, tier_3, tier_4, tier_5, tier_6, generic, preferred_generic, non_preferred_generic, brand, preferred_brand, non_preferred_brand, specialty, preferred_specialty, non_preferred_specialty, other, unknown]
+        prior_authorization:
+          type: boolean
+          nullable: true
+        step_therapy:
+          type: boolean
+          nullable: true
+        quantity_limit:
+          type: boolean
+          nullable: true
+        last_updated:
+          type: string
+          format: date-time
+          nullable: true
+      required: [rxnorm_id, drug_name, drug_tier, drug_tier_slug]
+      additionalProperties: false
+    FormularyDrugList:
+      type: object
+      properties:
+        formulary_id:
+          type: string
+        formulary_uri:
+          type: string
+        page:
+          type: integer
+        page_size:
+          type: integer
+        total:
+          type: integer
+        available_pharmacy_types:
+          type: array
+          items:
+            type: string
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/FormularyDrug'
+      required: [formulary_id, formulary_uri, page, page_size, total, items]
+      additionalProperties: false
+    FormularyDrugDetail:
+      allOf:
+        - $ref: '#/components/schemas/FormularyDrug'
+        - type: object
+          properties:
+            available_pharmacy_types:
+              type: array
+              items:
+                type: string
+            linked_plans:
+              type: array
+              items:
+                type: object
+                properties:
+                  plan_id:
+                    type: string
+                  year:
+                    type: integer
+                required: [plan_id, year]
+                additionalProperties: false
+          required: [available_pharmacy_types, linked_plans]
+          additionalProperties: false
+    FormularySummary:
+      type: object
+      properties:
+        formulary_id:
+          type: string
+        formulary_uri:
+          type: string
+        total_drugs:
+          type: integer
+        tiers:
+          type: array
+          items:
+            $ref: '#/components/schemas/TierBreakdownEntry'
+        authorization_requirements:
+          type: object
+          properties:
+            required:
+              type: integer
+            not_required:
+              type: integer
+          additionalProperties: false
+        step_therapy:
+          type: object
+          properties:
+            required:
+              type: integer
+            not_required:
+              type: integer
+          additionalProperties: false
+        quantity_limits:
+          type: object
+          properties:
+            has_limit:
+              type: integer
+            no_limit:
+              type: integer
+          additionalProperties: false
+        pharmacy_types:
+          type: array
+          items:
+            $ref: '#/components/schemas/PharmacyBreakdownEntry'
+      required: [formulary_id, formulary_uri, total_drugs, tiers, authorization_requirements, step_therapy, quantity_limits, pharmacy_types]
+      additionalProperties: false
+    FormularyCrosswalk:
+      type: object
+      properties:
+        rxnorm_id:
+          type: string
+        formularies:
+          type: array
+          items:
+            type: object
+            properties:
+              formulary_id:
+                type: string
+              formulary_uri:
+                type: string
+              plan_id:
+                type: string
+              year:
+                type: integer
+              plan_marketing_name:
+                type: string
+              state:
+                type: string
+              issuer:
+                type: object
+                properties:
+                  issuer_id:
+                    type: integer
+                  issuer_name:
+                    type: string
+                additionalProperties: false
+              drug_tier:
+                type: string
+              drug_tier_slug:
+                type: string
+              prior_authorization:
+                type: boolean
+                nullable: true
+              step_therapy:
+                type: boolean
+                nullable: true
+              quantity_limit:
+                type: boolean
+                nullable: true
+            required: [formulary_id, formulary_uri, plan_id, year, plan_marketing_name, state, issuer, drug_tier, drug_tier_slug]
+            additionalProperties: false
+      required: [rxnorm_id, formularies]
+      additionalProperties: false
+    PlanDrugCoverage:
+      type: object
+      properties:
+        formulary_id:
+          type: string
+        formulary_uri:
+          type: string
+        plan_id:
+          type: string
+        year:
+          type: integer
+        rxnorm_id:
+          type: string
+        covered:
+          type: boolean
+        details:
+          $ref: '#/components/schemas/FormularyDrug'
+      required: [formulary_id, formulary_uri, plan_id, year, rxnorm_id, covered]
+      additionalProperties: false
+    FormularyStatistics:
+      type: object
+      properties:
+        total_formularies:
+          type: integer
+        total_drugs:
+          type: integer
+        top_issuers:
+          type: array
+          items:
+            type: object
+            properties:
+              issuer_id:
+                type: integer
+              issuer_name:
+                type: string
+              drug_count:
+                type: integer
+            required: [issuer_id, issuer_name, drug_count]
+            additionalProperties: false
+        tier_distribution:
+          type: array
+          items:
+            $ref: '#/components/schemas/TierBreakdownEntry'
+        authorization_distribution:
+          type: object
+          properties:
+            required:
+              type: integer
+            not_required:
+              type: integer
+          additionalProperties: false
+      required: [total_formularies, total_drugs, top_issuers, tier_distribution, authorization_distribution]
+      additionalProperties: false
     ImporterStats:
       type: object
       properties:
@@ -1372,6 +1968,43 @@ components:
               items:
                 type: object
                 additionalProperties: true
+            drug_summary:
+              $ref: '#/components/schemas/IssuerDrugSummary'
+    IssuerDrugSummary:
+      type: object
+      properties:
+        total_drugs:
+          type: integer
+        authorization:
+          type: object
+          properties:
+            required:
+              type: integer
+            not_required:
+              type: integer
+          additionalProperties: false
+        step_therapy:
+          type: object
+          properties:
+            required:
+              type: integer
+            not_required:
+              type: integer
+          additionalProperties: false
+        quantity_limits:
+          type: object
+          properties:
+            has_limit:
+              type: integer
+            no_limit:
+              type: integer
+          additionalProperties: false
+        tiers:
+          type: array
+          items:
+            $ref: '#/components/schemas/TierBreakdownEntry'
+      required: [total_drugs, authorization, step_therapy, quantity_limits, tiers]
+      additionalProperties: false
     GeoPingResponse:
       type: object
       properties:
@@ -1394,6 +2027,124 @@ components:
           type: number
         state:
           type: string
+        city:
+          type: string
+        state_name:
+          type: string
+        county_name:
+          type: string
+        timezone:
+          type: string
+      additionalProperties: false
+    GeoCityResponse:
+      type: object
+      properties:
+        normalized_city:
+          type: string
+        state:
+          type: string
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              zip_code:
+                type: string
+              state:
+                type: string
+              state_name:
+                type: string
+              city:
+                type: string
+              county_name:
+                type: string
+              lat:
+                type: number
+              long:
+                type: number
+              timezone:
+                type: string
+            additionalProperties: false
+      additionalProperties: false
+    GeoTopZip:
+      type: object
+      properties:
+        zip_code:
+          type: string
+        city:
+          type: string
+        population:
+          type: integer
+        lat:
+          type: number
+        long:
+          type: number
+      required: [zip_code, city, population]
+      additionalProperties: false
+    GeoStateSummary:
+      type: object
+      properties:
+        state:
+          type: string
+        state_name:
+          type: string
+          nullable: true
+        zip_count:
+          type: integer
+        city_count:
+          type: integer
+        population:
+          type: integer
+        avg_lat:
+          type: number
+          nullable: true
+        avg_long:
+          type: number
+          nullable: true
+        top_zips:
+          type: array
+          items:
+            $ref: '#/components/schemas/GeoTopZip'
+      required: [state, zip_count, city_count, population, top_zips]
+      additionalProperties: false
+    GeoStateListResponse:
+      type: object
+      properties:
+        generated:
+          type: string
+          format: date-time
+        states:
+          type: array
+          items:
+            $ref: '#/components/schemas/GeoStateSummary'
+      required: [states]
+      additionalProperties: false
+    GeoStateCitiesResponse:
+      type: object
+      properties:
+        state:
+          type: string
+        limit:
+          type: integer
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              city:
+                type: string
+              state:
+                type: string
+              zip_count:
+                type: integer
+              population:
+                type: integer
+              avg_lat:
+                type: number
+              avg_long:
+                type: number
+            additionalProperties: false
+      additionalProperties: false
     NuccTaxonomy:
       type: object
       properties:

@@ -130,6 +130,12 @@ class Plan(Base, JSONOutputMixin):
         {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['plan_id', 'year']
+    __my_additional_indexes__ = [
+        {'index_elements': ('state',), 'name': 'plan_lookup_by_state'},
+        {'index_elements': ('issuer_id',), 'name': 'plan_lookup_by_issuer'},
+        {'index_elements': ('year',), 'name': 'plan_lookup_by_year'},
+        {'index_elements': ('issuer_id', 'year'), 'name': 'plan_lookup_by_issuer_year'},
+    ]
     plan_id = Column(String(14), nullable=False)  # len == 14
     year = Column(Integer)
     issuer_id = Column(Integer)
@@ -154,9 +160,20 @@ class PlanAttributes(Base, JSONOutputMixin):
     )
     __my_index_elements__ = ['full_plan_id', 'year', 'attr_name']
     __my_additional_indexes__ = [
-        {'index_elements': ('full_plan_id gin_trgm_ops', 'year'),
+        {
+            'index_elements': ('full_plan_id gin_trgm_ops', 'year'),
             'using': 'gin',
-            'name': 'find_all_variants'}]
+            'name': 'find_all_variants',
+        },
+        {
+            'index_elements': ('plan_id', 'year', 'attr_name'),
+            'name': 'plan_attributes_plan_year_attr_idx',
+        },
+        {
+            'index_elements': ('plan_id', 'year'),
+            'name': 'plan_attributes_plan_year_idx',
+        },
+    ]
     plan_id = Column(String(14))
     full_plan_id = Column(String(17), nullable=False)
     year = Column(Integer)
@@ -171,6 +188,16 @@ class PlanBenefits(Base, JSONOutputMixin):
         {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
     )
     __my_index_elements__ = ['full_plan_id', 'year', 'benefit_name']
+    __my_additional_indexes__ = [
+        {
+            'index_elements': ('plan_id', 'year', 'benefit_name'),
+            'name': 'plan_benefits_plan_year_benefit_idx',
+        },
+        {
+            'index_elements': ('plan_id', 'year'),
+            'name': 'plan_benefits_plan_year_idx',
+        },
+    ]
     plan_id = Column(String(14), nullable=False)
     full_plan_id = Column(String(17), nullable=False)
     year = Column(Integer)
@@ -207,6 +234,33 @@ class PlanRatingAreas(Base, JSONOutputMixin):
     county = Column(String)
     zip3 = Column(String)
     market = Column(String)
+
+
+class GeoZipLookup(Base, JSONOutputMixin):
+    __tablename__ = 'geo_zip_lookup'
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint('zip_code'),
+        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+    )
+    __my_index_elements__ = ['zip_code']
+    __my_additional_indexes__ = [
+        {'index_elements': ('state',), 'name': 'geo_zip_lookup_state_idx'},
+        {'index_elements': ('city_lower', 'state'), 'name': 'geo_zip_lookup_city_state_idx'},
+        {'index_elements': ('city_lower',), 'name': 'geo_zip_lookup_city_idx'},
+    ]
+
+    zip_code = Column(String(5), nullable=False)
+    city = Column(String(128))
+    city_lower = Column(String(128))
+    state = Column(String(2))
+    state_name = Column(String(128))
+    county_name = Column(String(128))
+    county_code = Column(String(8))
+    latitude = Column(Float)
+    longitude = Column(Float)
+    timezone = Column(String(64))
+    population = Column(Integer)
 
 
 class PlanPrices(Base, JSONOutputMixin):
@@ -350,6 +404,38 @@ class PlanDrugRaw(Base, JSONOutputMixin):
     step_therapy = Column(Boolean)
     quantity_limit = Column(Boolean)
     last_updated_on = Column(TIMESTAMP)
+
+
+class PlanDrugStats(Base, JSONOutputMixin):
+    __tablename__ = 'plan_drug_stats'
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint('plan_id'),
+        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+    )
+    __my_index_elements__ = ['plan_id']
+    plan_id = Column(String(14), nullable=False)
+    total_drugs = Column(Integer, nullable=False, default=0)
+    auth_required = Column(Integer, nullable=False, default=0)
+    auth_not_required = Column(Integer, nullable=False, default=0)
+    step_required = Column(Integer, nullable=False, default=0)
+    step_not_required = Column(Integer, nullable=False, default=0)
+    quantity_limit = Column(Integer, nullable=False, default=0)
+    quantity_no_limit = Column(Integer, nullable=False, default=0)
+    last_updated_on = Column(TIMESTAMP)
+
+
+class PlanDrugTierStats(Base, JSONOutputMixin):
+    __tablename__ = 'plan_drug_tier_stats'
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint('plan_id', 'drug_tier'),
+        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+    )
+    __my_index_elements__ = ['plan_id', 'drug_tier']
+    plan_id = Column(String(14), nullable=False)
+    drug_tier = Column(String, nullable=False)
+    drug_count = Column(Integer, nullable=False, default=0)
 
 
 class NPIData(Base, JSONOutputMixin):

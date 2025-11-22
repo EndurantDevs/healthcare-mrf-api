@@ -29,6 +29,9 @@ class FakeResult:
     def scalar(self):
         return self._scalar_value
 
+    def all(self):
+        return list(self._rows)
+
 
 class FakeSession:
     def __init__(self, results):
@@ -74,12 +77,26 @@ async def test_get_issuer_data(monkeypatch):
             "network_tier_value": "PREFERRED",
         }
     )
+    stats_row = FakeRow(
+        {
+            "total_drugs": 10,
+            "auth_required": 4,
+            "auth_not_required": 6,
+            "step_required": 2,
+            "step_not_required": 8,
+            "quantity_limit": 3,
+            "quantity_no_limit": 7,
+        }
+    )
+    tier_rows = [("Tier 1", 6)]
 
     session = FakeSession(
         [
             FakeResult([issuer_row]),
             FakeResult(scalar_value=2),
             FakeResult([plan_row]),
+            FakeResult([stats_row]),
+            FakeResult(tier_rows),
         ]
     )
 
@@ -89,6 +106,9 @@ async def test_get_issuer_data(monkeypatch):
     payload = json.loads(response.body)
     assert payload["import_errors"] == 2
     assert payload["plans_count"] == 1
+    assert payload["drug_summary"]["total_drugs"] == 10
+    assert payload["drug_summary"]["quantity_limits"]["has_limit"] == 3
+    assert payload["drug_summary"]["tiers"][0]["tier_slug"] == "tier_1"
 
 
 @pytest.mark.asyncio

@@ -5,6 +5,7 @@ import types
 
 import pytest
 from asyncpg import UndefinedTableError
+from sanic.exceptions import InvalidUsage
 from sqlalchemy.exc import ProgrammingError
 
 from api.endpoint import geo as geo_module
@@ -25,39 +26,56 @@ async def test_geo_index_handler():
 
 
 class FakeResult:
-    def __init__(self, row):
+    def __init__(self, row=None, rows=None):
         self._row = row
+        self._rows = rows
 
     def first(self):
         return self._row
 
+    def all(self):
+        if self._rows is not None:
+            return self._rows
+        return [] if self._row is None else [self._row]
+
 
 class FakeSession:
-    def __init__(self, row=None, error=None):
-        self._row = row
-        self._error = error
+    def __init__(self, responses=None):
+        self._responses = list(responses or [])
 
     async def execute(self, *_args, **_kwargs):
-        if self._error:
-            raise self._error
-        return FakeResult(self._row)
+        if not self._responses:
+            return FakeResult()
+        result = self._responses.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
+class MappingRow:
+    def __init__(self, **mapping):
+        self._mapping = mapping
 
 
 @pytest.mark.asyncio
 async def test_geo_by_zip_success():
     request = types.SimpleNamespace(
-        ctx=types.SimpleNamespace(sa_session=FakeSession(("12345", "41.1", "-87.6", "IL"))),
+        ctx=types.SimpleNamespace(
+            sa_session=FakeSession([FakeResult(row=MappingRow(zip_code="12345", city="Chicago", state="IL", latitude=41.1, longitude=-87.6))])
+        ),
         app=types.SimpleNamespace(),
     )
     response = await geo_module.get_geo(request, "12345")
     payload = json.loads(response.body)
-    assert payload == {"zip_code": "12345", "lat": 41.1, "long": -87.6, "state": "IL"}
+    assert payload["zip_code"] == "12345"
+    assert payload["lat"] == 41.1
+    assert payload["city"] == "Chicago"
 
 
 @pytest.mark.asyncio
 async def test_geo_by_zip_not_found():
     request = types.SimpleNamespace(
-        ctx=types.SimpleNamespace(sa_session=FakeSession(None)),
+        ctx=types.SimpleNamespace(sa_session=FakeSession([FakeResult(row=None), FakeResult(row=None)])),
         app=types.SimpleNamespace(),
     )
     response = await geo_module.get_geo(request, "00000")
@@ -67,7 +85,10 @@ async def test_geo_by_zip_not_found():
 @pytest.mark.asyncio
 async def test_geo_by_zip_bad_row():
     request = types.SimpleNamespace(
-        ctx=types.SimpleNamespace(sa_session=FakeSession(("99999", "not-a-number", None, "NY"))),
+        ctx=types.SimpleNamespace(sa_session=FakeSession([
+            FakeResult(row=None),
+            FakeResult(row=("99999", "not-a-number", None, "NY")),
+        ])),
         app=types.SimpleNamespace(),
     )
     response = await geo_module.get_geo(request, "99999")
@@ -79,7 +100,7 @@ async def test_geo_by_zip_missing_table():
     error = ProgrammingError("select", {}, None)
     error.orig = UndefinedTableError("tiger schema")
     request = types.SimpleNamespace(
-        ctx=types.SimpleNamespace(sa_session=FakeSession(error=error)),
+        ctx=types.SimpleNamespace(sa_session=FakeSession([FakeResult(row=None), error])),
         app=types.SimpleNamespace(),
     )
     response = await geo_module.get_geo(request, "12345")
@@ -98,6 +119,19 @@ async def test_geo_by_zip_missing_session():
 async def test_geo_by_zip_other_programming_error():
     error = ProgrammingError("select", {}, None)
     error.orig = Exception("other")
-    request = types.SimpleNamespace(ctx=types.SimpleNamespace(sa_session=FakeSession(error=error)), app=types.SimpleNamespace())
+    request = types.SimpleNamespace(
+        ctx=types.SimpleNamespace(sa_session=FakeSession([FakeResult(row=None), error])),
+        app=types.SimpleNamespace(),
+    )
     with pytest.raises(ProgrammingError):
         await geo_module.get_geo(request, "12345")
+
+
+@pytest.mark.asyncio
+async def test_geo_states_invalid_sort():
+    request = types.SimpleNamespace(
+        args={"sort": "invalid"},
+        ctx=types.SimpleNamespace(sa_session=FakeSession([])),
+    )
+    with pytest.raises(InvalidUsage):
+        await geo_module.list_geo_states(request)

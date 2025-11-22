@@ -8,6 +8,7 @@ import types
 import pytest
 import sanic.exceptions
 
+import api.endpoint.plan as plan_module
 from api.endpoint.plan import (
     _fetch_network_entry,
     _get_session,
@@ -283,11 +284,13 @@ async def test_plan_find_plan_success():
         [
             FakeResult(scalar=1),
             FakeResult(rows=[plan_entry]),
-            FakeResult(rows=[{"plan_id": "P123", "attr_name": "Coverage", "attr_value": "Standard"}]),
+            FakeResult(rows=[{"plan_id": "P123", "year": 2024, "individual_rate": 100.0, "couple": 200.0}]),
+            FakeResult(rows=[{"plan_id": "P123", "year": 2024, "attr_name": "Coverage", "attr_value": "Standard"}]),
             FakeResult(
                 rows=[
                     {
                         "plan_id": "P123",
+                        "year": 2024,
                         "benefit_name": "Primary Care Visit",
                         "copay_inn_tier1": "No Charge",
                         "coins_inn_tier1": "No Charge",
@@ -306,7 +309,7 @@ async def test_plan_find_plan_success():
     assert payload["total"] == 1
     result = payload["results"][0]
     assert result["price_range"] == {"min": 100.0, "max": 200.0}
-    assert result["attributes"]["Coverage"] == "Standard"
+    assert result["attributes"]["Coverage"]["attr_value"] == "Standard"
     assert result["plan_benefits"]["Primary Care Visit"]["benefit_name"] == "Primary Care Visit"
     assert result["rate_expiration_date"] == "2025-06-04 00:00:00"
 
@@ -407,7 +410,12 @@ async def test_plan_get_autocomplete_with_state():
 
 
 @pytest.mark.asyncio
-async def test_plan_get_autocomplete_with_zip():
+async def test_plan_get_autocomplete_with_zip(monkeypatch):
+    async def fake_states(_session, zip_code):
+        assert zip_code == "02110"
+        return ["MA"]
+
+    monkeypatch.setattr(plan_module, "_states_for_zip", fake_states)
     request = make_request(
         [
             FakeResult(
@@ -433,17 +441,35 @@ async def test_find_a_plan_success():
     request = make_request(
         [
             FakeResult(rows=[(5,)], scalar=5),
-            FakeResult(rows=[{"plan_id": "P1", "min_rate": 10, "max_rate": 20}]),
-            FakeResult(rows=[{"plan_id": "P1", "attr_name": "FormularyId", "attr_value": "val"}]),
-            FakeResult(rows=[{"plan_id": "P1", "benefit_name": "benefit_name", "copay_inn_tier1": "10", "coins_inn_tier1": "20", "copay_inn_tier2": "Not Applicable", "coins_inn_tier2": None, "copay_outof_net": "30", "coins_outof_net": "40"}]),
+            FakeResult(
+                rows=[
+                    {
+                        "plan_id": "P1",
+                        "year": 2024,
+                        "has_adult_dental": True,
+                        "deductible_inn_individual": 500.0,
+                        "moop_inn_individual": 3000.0,
+                    }
+                ]
+            ),
+            FakeResult(rows=[{"plan_id": "P1", "year": 2024, "individual_rate": 10, "couple": 20}]),
+            FakeResult(rows=[{"plan_id": "P1", "year": 2024, "attr_name": "FormularyId", "attr_value": "val"}]),
+            FakeResult(rows=[{"plan_id": "P1", "year": 2024, "benefit_name": "benefit_name", "copay_inn_tier1": "10", "coins_inn_tier1": "20", "copay_inn_tier2": "Not Applicable", "coins_inn_tier2": None, "copay_outof_net": "30", "coins_outof_net": "40"}]),
+            FakeResult(rows=[{"issuer_id": 42, "issuer_name": "Issuer X", "plan_count": 1}]),
         ],
         args={"age": "30", "year": "2024", "order": "invalid"},
     )
     response = await find_a_plan(request)
     payload = json.loads(response.body)
     assert payload["total"] == 5
-    assert payload["results"][0]["attributes"]["FormularyId"] == "val"
+    assert payload["issuers"][0]["issuer_id"] == 42
+    assert payload["applied_filters"]["age"] == 30
+    assert payload["results"][0]["has_adult_dental"] is True
+    assert payload["results"][0]["deductible_inn_individual"] == 500.0
+    assert payload["results"][0]["attributes"]["FormularyId"]["attr_value"] == "val"
     assert payload["results"][0]["plan_benefits"]["benefit_name"]["copay_inn_tier1"] == "10"
+    assert payload["results"][0]["price_range"] == {"min": 10.0, "max": 20.0}
+    assert payload["warnings"] == []
 
 
 @pytest.mark.asyncio
@@ -457,7 +483,28 @@ async def test_find_a_plan_no_results():
     )
     response = await find_a_plan(request)
     payload = json.loads(response.body)
-    assert payload == {"total": 0, "results": []}
+    assert payload["total"] == 0
+    assert payload["results"] == []
+    assert payload["issuers"] == []
+    assert payload["warnings"] == []
+    assert payload["applied_filters"]["limit"] == 100
+
+
+@pytest.mark.asyncio
+async def test_find_a_plan_zip_warning():
+    request = make_request(
+        [
+            FakeResult(rows=[]),  # geo lookup
+            FakeResult(rows=[]),  # rating area
+            FakeResult(rows=[]),  # tiger fallback
+        ],
+        args={"zip_code": "99999"},
+    )
+    response = await find_a_plan(request)
+    payload = json.loads(response.body)
+    assert payload["total"] == 0
+    assert payload["warnings"][0]["code"] == "zip_not_found"
+    assert payload["applied_filters"]["zip_code"] == "99999"
 
 
 @pytest.mark.asyncio
@@ -738,7 +785,9 @@ async def test_find_a_plan_skips_missing_plan_id():
     )
     response = await find_a_plan(request)
     payload = json.loads(response.body)
-    assert payload == {"total": 0, "results": []}
+    assert payload["total"] == 0
+    assert payload["results"] == []
+    assert payload["issuers"] == []
 
 
 @pytest.mark.asyncio
@@ -787,7 +836,27 @@ async def test_find_a_plan_invalid_limit_page():
     )
     response = await find_a_plan(request)
     payload = json.loads(response.body)
-    assert payload == {"total": 0, "results": []}
+    assert payload["total"] == 0
+    assert payload["results"] == []
+    assert payload["applied_filters"]["limit"] == 100
+    assert payload["applied_filters"]["page"] == 1
+
+
+@pytest.mark.asyncio
+async def test_find_a_plan_reports_missing_benefit_metadata():
+    request = make_request(
+        [
+            FakeResult(rows=[], scalar=0),  # metadata lookup
+            FakeResult(rows=[(0,)]),  # count
+            FakeResult(rows=[]),  # data
+        ],
+        args={"has_adult_dental": "true"},
+    )
+    response = await find_a_plan(request)
+    payload = json.loads(response.body)
+    assert payload["total"] == 0
+    assert payload["warnings"][0]["code"] == "has_adult_dental_unsupported"
+    assert "has_adult_dental" not in payload["applied_filters"]
 
 
 def test_result_scalar_empty_iterable():
@@ -803,3 +872,8 @@ async def test_find_a_plan_invalid_age():
     request = make_request([], args={'age': 'not-a-number'})
     with pytest.raises(sanic.exceptions.BadRequest):
         await find_a_plan(request)
+def test_normalize_attribute_map_converts_scalars():
+    raw = {"PlanMarketingName": "Bronze ABC"}
+    normalized = plan_module._normalize_attribute_map(raw)
+    assert normalized["PlanMarketingName"]["attr_value"] == "Bronze ABC"
+    assert "human_attr_name" in normalized["PlanMarketingName"]
