@@ -55,6 +55,7 @@ COPY db/ /opt/db/
 COPY data/ /opt/data/
 COPY alembic/ /opt/alembic/
 COPY process/ /opt/process/
+COPY support/ /opt/support/
 COPY logging.yaml main.py alembic.ini /opt/
 
 EXPOSE 8080
