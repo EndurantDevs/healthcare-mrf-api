@@ -104,7 +104,7 @@ async def test_get_formulary_returns_detail():
                 ]
             ),
             FakeResult(rows=[{"drug_count": 42, "last_updated": None}]),
-            FakeResult(rows=[("PREFERRED",), ("STANDARD",)]),
+            FakeResult(rows=[("Tier 1",), ("Specialty",)]),
             FakeResult(rows=[("MAIL_ORDER",), ("RETAIL",)]),
         ]
     )
@@ -115,7 +115,7 @@ async def test_get_formulary_returns_detail():
     assert data["plan"]["plan_id"] == "PLAN123"
     assert data["formulary_uri"] == "PLAN123/2025"
     assert data["drug_count"] == 42
-    assert data["available_tiers"] == ["PREFERRED", "STANDARD"]
+    assert data["available_tiers"][0]["tier_slug"] == "tier_1"
     assert data["available_pharmacy_types"] == ["MAIL_ORDER", "RETAIL"]
 
 
@@ -130,7 +130,7 @@ async def test_list_formulary_drugs_respects_filters():
                     MappingRow(
                         rxnorm_id="12345",
                         drug_name="Example Drug",
-                        drug_tier="PREFERRED",
+                        drug_tier="Tier 1",
                         prior_authorization=True,
                         step_therapy=False,
                         quantity_limit=True,
@@ -148,6 +148,7 @@ async def test_list_formulary_drugs_respects_filters():
 
     assert payload["total"] == 3
     assert payload["items"][0]["rxnorm_id"] == "12345"
+    assert payload["items"][0]["drug_tier_slug"] == "tier_1"
     assert payload["available_pharmacy_types"] == ["MAIL_ORDER", "RETAIL"]
     assert payload["formulary_uri"] == "PLAN123/2025"
 
@@ -170,11 +171,20 @@ async def test_get_formulary_summary_returns_aggregates():
     request = make_request(
         [
             FakeResult(scalar=1),  # exists check
-            FakeResult(scalar=10),  # total drugs
-            FakeResult(rows=[("PREFERRED", 7), ("STANDARD", 3)]),
-            FakeResult(rows=[(True, 4), (False, 6)]),
-            FakeResult(rows=[(True, 2), (False, 8)]),
-            FakeResult(rows=[(True, 5), (False, 5)]),
+            FakeResult(
+                rows=[
+                    MappingRow(
+                        total_drugs=10,
+                        auth_required=4,
+                        auth_not_required=6,
+                        step_required=2,
+                        step_not_required=8,
+                        quantity_limit=5,
+                        quantity_no_limit=5,
+                    )
+                ]
+            ),
+            FakeResult(rows=[("Tier 1", 7), ("Tier 2", 3)]),
             FakeResult(rows=[("MAIL_ORDER", 2), ("RETAIL", 8)]),
         ]
     )
@@ -183,9 +193,9 @@ async def test_get_formulary_summary_returns_aggregates():
     data = json.loads(response.body)
 
     assert data["total_drugs"] == 10
-    assert data["tiers"]["PREFERRED"] == 7
+    assert data["tiers"][0]["tier_slug"] == "tier_1"
     assert data["authorization_requirements"]["required"] == 4
-    assert data["pharmacy_types"]["RETAIL"] == 8
+    assert data["pharmacy_types"][1]["pharmacy_type"] == "RETAIL"
 
 
 @pytest.mark.asyncio
@@ -201,7 +211,7 @@ async def test_cross_formulary_drug_returns_formularies():
                         state="CA",
                         issuer_id=1,
                         issuer_name="Issuer",
-                        drug_tier="PREFERRED",
+                        drug_tier="Tier 1",
                         prior_authorization=True,
                         step_therapy=False,
                         quantity_limit=False,
@@ -217,6 +227,7 @@ async def test_cross_formulary_drug_returns_formularies():
     assert data["rxnorm_id"] == "12345"
     assert data["formularies"][0]["formulary_id"] == "PLAN123:2025"
     assert data["formularies"][0]["formulary_uri"] == "PLAN123/2025"
+    assert data["formularies"][0]["drug_tier_slug"] == "tier_1"
 
 
 @pytest.mark.asyncio
@@ -224,9 +235,8 @@ async def test_formulary_statistics_returns_summary():
     request = make_request(
         [
             FakeResult(rows=[(1, "Issuer One", 100)]),
-            FakeResult(rows=[("PREFERRED", 60), ("STANDARD", 40)]),
-            FakeResult(rows=[(True, 30), (False, 70)]),
-            FakeResult(scalar=120),
+            FakeResult(rows=[("Tier 1", 60), ("Tier 2", 40)]),
+            FakeResult(rows=[MappingRow(total_drugs=120, auth_required=30, auth_not_required=70)]),
             FakeResult(scalar=5),
         ]
     )
@@ -237,6 +247,7 @@ async def test_formulary_statistics_returns_summary():
     assert data["total_formularies"] == 5
     assert data["total_drugs"] == 120
     assert data["top_issuers"][0]["drug_count"] == 100
+    assert data["tier_distribution"][0]["tier_slug"] == "tier_1"
 
 
 @pytest.mark.asyncio
@@ -251,7 +262,7 @@ async def test_check_plan_drug_without_year_uses_latest():
                         plan_id="PLAN123",
                         rxnorm_id="12345",
                         drug_name="Example Drug",
-                        drug_tier="PREFERRED",
+                        drug_tier="Tier 1",
                         prior_authorization=True,
                         step_therapy=False,
                         quantity_limit=True,
@@ -267,7 +278,8 @@ async def test_check_plan_drug_without_year_uses_latest():
 
     assert data["covered"] is True
     assert data["year"] == 2026
-    assert data["details"]["drug_tier"] == "PREFERRED"
+    assert data["details"]["drug_tier"] == "Tier 1"
+    assert data["details"]["drug_tier_slug"] == "tier_1"
     assert data["formulary_uri"] == "PLAN123/2026"
 
 

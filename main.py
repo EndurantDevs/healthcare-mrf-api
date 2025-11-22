@@ -94,5 +94,26 @@ cli.add_command(db_group, name="db")
 cli.add_command(arq.cli.cli, name="worker")
 
 
+@click.group()
+def manage():
+    """Utility commands for maintaining an existing deployment."""
+
+
+@manage.command("sync-structure")
+@click.option("--skip-columns", is_flag=True, default=False, help="Skip adding missing columns")
+@click.option("--skip-indexes", is_flag=True, default=False, help="Skip creating indexes")
+def sync_structure(skip_columns: bool, skip_indexes: bool):
+    """Ensure database tables, columns, and indexes match the SQLAlchemy models."""
+    from db.maintenance import render_sync_summary, sync_structure as _sync_structure  # lazy import
+
+    results = asyncio.run(
+        _sync_structure(add_columns=not skip_columns, add_indexes=not skip_indexes)
+    )
+    render_sync_summary(results)
+
+
+cli.add_command(manage, name="manage")
+
+
 if __name__ == '__main__':
     cli()
