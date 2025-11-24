@@ -88,7 +88,7 @@ async def test_get_issuer_data(monkeypatch):
             "quantity_no_limit": 7,
         }
     )
-    tier_rows = [("Tier 1", 6)]
+    tier_rows = [("Tier 1", 6), ("unknown tier", 1)]
 
     session = FakeSession(
         [
@@ -109,6 +109,7 @@ async def test_get_issuer_data(monkeypatch):
     assert payload["drug_summary"]["total_drugs"] == 10
     assert payload["drug_summary"]["quantity_limits"]["has_limit"] == 3
     assert payload["drug_summary"]["tiers"][0]["tier_slug"] == "tier_1"
+    assert payload["drug_summary"]["tiers"][1]["tier_slug"] == "other"
 
 
 @pytest.mark.asyncio
@@ -171,6 +172,74 @@ async def test_get_issuer_data_missing_session():
 
 def test_row_to_dict_plain_dict():
     assert _row_to_dict({"k": "v"}) == {"k": "v"}
+
+
+def test_row_to_dict_mapping_attribute():
+    class WithMapping:
+        def __init__(self):
+            self._mapping = {"a": 1}
+
+    assert _row_to_dict(WithMapping()) == {"a": 1}
+
+
+def test_row_to_dict_mapping_typeerror():
+    class BadMapping:
+        def __iter__(self):
+            raise TypeError
+
+    class WithBadMapping:
+        def __init__(self):
+            self._mapping = BadMapping()
+
+    # Falls through to dict() fallback which returns {}
+    assert _row_to_dict(WithBadMapping()) == {}
+
+
+def test_row_to_dict_keys_getitem():
+    class WithKeys:
+        def __init__(self):
+            self.values = {"b": 2}
+
+        def keys(self):
+            return self.values.keys()
+
+        def __getitem__(self, item):
+            return self.values[item]
+
+    assert _row_to_dict(WithKeys()) == {"b": 2}
+
+
+def test_row_to_dict_keys_typeerror():
+    class KeysRow:
+        def keys(self):
+            return ["k"]
+
+        def __getitem__(self, item):
+            raise TypeError
+
+    assert _row_to_dict(KeysRow()) == {}
+
+
+def test_row_to_dict_handles_bad_iterable():
+    class BadRow:
+        def __iter__(self):
+            raise TypeError
+
+    assert _row_to_dict(BadRow()) == {}
+
+
+def test_row_to_dict_dict_branch():
+    class WeirdDict(dict):
+        def __getattribute__(self, item):
+            if item == "keys":
+                raise AttributeError
+            return super().__getattribute__(item)
+
+        def __iter__(self):
+            for item in super().items():
+                yield item
+
+    assert _row_to_dict(WeirdDict(k=1)) == {"k": 1}
 
 
 @pytest.mark.asyncio
