@@ -1,29 +1,30 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-import os
-import datetime
-from pathlib import Path, PurePath
 import asyncio
-import aiohttp
-from aiohttp_socks import ProxyConnector
-
-import pytz
-
-from db.connection import init_db, db
-
-from aioshutil import copyfile
-from sqlalchemy import Index, and_, inspect
-import ssl
-from sqlalchemy.exc import SQLAlchemyError
-from asyncpg.exceptions import UniqueViolationError, InterfaceError, InvalidColumnReferenceError, CardinalityViolationError
-from aiofile import async_open
-from arq import Retry
-from fastcrc import crc32, crc16
-import humanize
-from random import choice
+import datetime
 import json
-from db.json_mixin import JSONOutputMixin
+import os
+import ssl
+from pathlib import Path, PurePath
+from random import choice
+
+import aiohttp
+import humanize
+import pytz
+from aiofile import async_open
+from aiohttp_socks import ProxyConnector
+from aioshutil import copyfile
+from arq import Retry
+from asyncpg.exceptions import (CardinalityViolationError, InterfaceError,
+                                InvalidColumnReferenceError,
+                                UniqueViolationError)
 from dateutil.parser import parse as parse_date
+from fastcrc import crc16, crc32
+from sqlalchemy import Index, and_, inspect
+from sqlalchemy.exc import SQLAlchemyError
+
+from db.connection import db, init_db
+from db.json_mixin import JSONOutputMixin
 
 HTTP_CHUNK_SIZE = 1024 * 1024
 headers = {'user-agent': 'Mozilla/5.0 (compatible; Healthporta Healthcare MRF API Importer/1.1; +https://github.com/EndurantDevs/healthcare-mrf-api)'}
@@ -459,6 +460,7 @@ async def push_objects(obj_list, cls, rewrite=False):
 
                 
 import logging
+
 from sqlalchemy import or_
 
 

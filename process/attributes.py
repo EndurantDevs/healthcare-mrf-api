@@ -1,47 +1,33 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-import os
-import sys
-import msgpack
 import asyncio
 import datetime
-import pytz
-import tempfile
-import json
 import glob
+import json
+import os
 import re
+import sys
+import tempfile
+import zipfile
+from pathlib import PurePath
+
+import msgpack
+import pytz
+from aiocsv import AsyncDictReader
+from aiofile import async_open
 from arq import create_pool
 from arq.connections import RedisSettings
-from pathlib import PurePath
-from aiocsv import AsyncDictReader
-import zipfile
-
-from aiofile import async_open
 from async_unzip.unzipper import unzip
-
+from dateutil.parser import parse as parse_date
 from sqlalchemy.exc import IntegrityError
 
-from process.ext.utils import (
-    download_it_and_save,
-    make_class,
-    push_objects,
-    print_time_info,
-    return_checksum,
-    ensure_database,
-    get_import_schema,
-)
-from dateutil.parser import parse as parse_date
-from db.models import (
-    PlanBenefits,
-    PlanAttributes,
-    PlanPrices,
-    PlanRatingAreas,
-    db,
-)
-from db.connection import init_db
-
 from api.for_human import plan_attributes_labels_to_key
-
+from db.connection import init_db
+from db.models import (PlanAttributes, PlanBenefits, PlanPrices,
+                       PlanRatingAreas, db)
+from process.ext.utils import (download_it_and_save, ensure_database,
+                               get_import_schema, make_class, print_time_info,
+                               push_objects, return_checksum)
 
 latin_pattern = re.compile(r"[^\x00-\x7f]")
 

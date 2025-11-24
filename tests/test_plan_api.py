@@ -7,6 +7,7 @@ import types
 
 import pytest
 import sanic.exceptions
+from sqlalchemy.exc import ProgrammingError
 
 import api.endpoint.plan as plan_module
 from api.endpoint.plan import (
@@ -387,6 +388,123 @@ def test_result_rows_and_scalar_helpers():
     assert _result_scalar(dict_result) == "v"
 
 
+def test_parse_bool_invalid():
+    with pytest.raises(sanic.exceptions.InvalidUsage):
+        plan_module._parse_bool("maybe", "flag")
+
+
+def test_parse_float_invalid():
+    with pytest.raises(sanic.exceptions.InvalidUsage):
+        plan_module._parse_float("bad", "number")
+
+
+def test_append_filter_skips_empty():
+    applied = {"existing": 1}
+    plan_module._append_filter(applied, "empty", "")
+    assert applied == {"existing": 1}
+    plan_module._append_filter(applied, "filled", 2)
+    assert applied["filled"] == 2
+
+
+def test_collect_price_bounds_merges():
+    class Result:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def all(self):
+            return self._rows
+
+    fake_rows = [
+        {"plan_id": "P1", "year": 2024, "individual_rate": 10, "couple": 20},
+        {"plan_id": "P1", "year": 2024, "individual_rate": 5, "couple": None},
+    ]
+    bounds = plan_module._collect_price_bounds(Result(fake_rows))
+    assert bounds[("P1", 2024)] == {"min": 5.0, "max": 20.0}
+
+
+def test_get_list_param_with_getlist():
+    class Args:
+        def getlist(self, name):
+            if name == "values":
+                return ["a, b", ["c", "d"]]
+            return []
+
+    values = plan_module._get_list_param(Args(), "values")
+    assert values == ["a", "b", "c", "d"]
+
+
+def test_summary_attributes_and_benefits_conversion():
+    attr_payload = json.dumps([{"attr_name": "Foo", "attr_value": "bar"}])
+    attrs = plan_module._summary_attributes_to_dict(attr_payload)
+    assert attrs["Foo"]["attr_value"] == "bar"
+
+    benefit_payload = json.dumps([{"benefit_name": "Primary", "copay_inn_tier1": "10"}])
+    benefits = plan_module._summary_benefits_to_dict(benefit_payload)
+    assert benefits["Primary"]["copay_inn_tier1"] == "10"
+
+
+@pytest.mark.asyncio
+async def test_states_for_zip_short_input():
+    assert await plan_module._states_for_zip(FakeSession([]), "12") == []
+
+
+class SequenceSession:
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self._idx = 0
+
+    async def execute(self, _stmt):
+        response = self._responses[self._idx]
+        self._idx += 1
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
+class SimpleResult:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def all(self):
+        return self._rows
+
+
+@pytest.mark.asyncio
+async def test_states_for_zip_geo_states(monkeypatch):
+    session = SequenceSession([SimpleResult([("CA",), ("",)] )])
+    assert await plan_module._states_for_zip(session, "90001") == ["CA"]
+
+
+@pytest.mark.asyncio
+async def test_states_for_zip_programming_error_fallback(monkeypatch):
+    class DummyUndefined(Exception):
+        pass
+
+    monkeypatch.setattr(plan_module, "UndefinedTableError", DummyUndefined)
+    exc = ProgrammingError("stmt", {}, DummyUndefined())
+    session = SequenceSession([
+        exc,
+        SimpleResult([]),  # rating area
+        SimpleResult([("TX",)])
+    ])
+    assert await plan_module._states_for_zip(session, "73301") == ["TX"]
+
+
+@pytest.mark.asyncio
+async def test_states_for_zip_programming_error_final_fallback(monkeypatch):
+    class DummyUndefined(Exception):
+        pass
+
+    monkeypatch.setattr(plan_module, "UndefinedTableError", DummyUndefined)
+    exc = ProgrammingError("stmt", {}, DummyUndefined())
+    session = SequenceSession([
+        exc,
+        SimpleResult([]),
+        ProgrammingError("stmt", {}, Exception()),
+    ])
+    assert await plan_module._states_for_zip(session, "90210") == []
+
+
 @pytest.mark.asyncio
 async def test_fetch_network_entry(monkeypatch):
     rows = [
@@ -703,6 +821,55 @@ async def test_get_price_plans_bulk_requires_ids():
     request = make_request([], json_data={})
     with pytest.raises(sanic.exceptions.BadRequest):
         await get_price_plans_bulk(request)
+
+
+@pytest.mark.asyncio
+async def test_get_price_plans_bulk_requires_json_object():
+    request = make_request([], json_data=[])
+    with pytest.raises(sanic.exceptions.BadRequest):
+        await get_price_plans_bulk(request)
+
+
+@pytest.mark.asyncio
+async def test_get_price_plans_bulk_plan_ids_type():
+    request = make_request([], json_data={"plan_ids": "not-list"})
+    with pytest.raises(sanic.exceptions.BadRequest):
+        await get_price_plans_bulk(request)
+
+
+@pytest.mark.asyncio
+async def test_get_price_plans_bulk_plan_ids_not_empty():
+    request = make_request([], json_data={"plan_ids": [None, "  "]})
+    with pytest.raises(sanic.exceptions.BadRequest):
+        await get_price_plans_bulk(request)
+
+
+@pytest.mark.asyncio
+async def test_get_price_plans_bulk_year_age_validation():
+    request = make_request([], json_data={"plan_ids": ["P1"], "year": "bad"})
+    with pytest.raises(sanic.exceptions.BadRequest):
+        await get_price_plans_bulk(request)
+
+    request = make_request([], json_data={"plan_ids": ["P1"], "age": "bad"})
+    with pytest.raises(sanic.exceptions.BadRequest):
+        await get_price_plans_bulk(request)
+
+
+@pytest.mark.asyncio
+async def test_get_price_plans_bulk_rating_area_trimmed():
+    request = make_request(
+        [
+            FakeResult(
+                rows=[
+                    {"plan_id": "P1", "year": 2024, "rate": 100},
+                ]
+            )
+        ],
+        json_data={"plan_ids": ["P1"], "rating_area": "  "},
+    )
+    response = await get_price_plans_bulk(request)
+    payload = json.loads(response.body)
+    assert payload["results"]["P1"][0]["rate"] == 100
 
 
 @pytest.mark.asyncio

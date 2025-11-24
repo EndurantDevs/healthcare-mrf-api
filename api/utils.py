@@ -1,7 +1,8 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-import geopandas as gpd
 from math import sqrt
+
+import geopandas as gpd
 from shapely import wkt
 
 

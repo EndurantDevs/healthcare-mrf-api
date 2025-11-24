@@ -1,8 +1,10 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import os
-from sqlalchemy import DateTime, Numeric, DATE, Column,\
-    String, Integer, Float, BigInteger, Boolean, ARRAY, JSON, TIMESTAMP, TEXT, SMALLINT, PrimaryKeyConstraint, text
+
+from sqlalchemy import (ARRAY, DATE, JSON, SMALLINT, TEXT, TIMESTAMP,
+                        BigInteger, Boolean, Column, DateTime, Float, Integer,
+                        Numeric, PrimaryKeyConstraint, String, text)
 from sqlalchemy.orm import declared_attr
 
 from db.connection import Base, db
@@ -436,6 +438,47 @@ class PlanDrugTierStats(Base, JSONOutputMixin):
     plan_id = Column(String(14), nullable=False)
     drug_tier = Column(String, nullable=False)
     drug_count = Column(Integer, nullable=False, default=0)
+
+
+class PlanSearchSummary(Base, JSONOutputMixin):
+    __tablename__ = 'plan_search_summary'
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint('plan_id', 'year'),
+        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+    )
+    __my_index_elements__ = ['plan_id', 'year']
+    __my_additional_indexes__ = [
+        {'index_elements': ('state', 'year'), 'name': 'plan_search_summary_state_year_idx'},
+        {'index_elements': ('issuer_id', 'year'), 'name': 'plan_search_summary_issuer_year_idx'},
+    ]
+
+    plan_id = Column(String(14), nullable=False)
+    year = Column(Integer, nullable=False)
+    state = Column(String(2))
+    issuer_id = Column(Integer)
+    marketing_name = Column(String)
+    market_coverage = Column(String)
+    is_on_exchange = Column(Boolean)
+    is_off_exchange = Column(Boolean)
+    is_hsa = Column(Boolean)
+    is_dental_only = Column(Boolean)
+    is_catastrophic = Column(Boolean)
+    has_adult_dental = Column(Boolean)
+    has_child_dental = Column(Boolean)
+    has_adult_vision = Column(Boolean)
+    has_child_vision = Column(Boolean)
+    telehealth_supported = Column(Boolean)
+    deductible_inn_individual = Column(Float)
+    moop_inn_individual = Column(Float)
+    premium_min = Column(Float)
+    premium_max = Column(Float)
+    plan_type = Column(String)
+    metal_level = Column(String)
+    csr_variation = Column(String)
+    attributes = Column(JSON)
+    plan_benefits = Column(JSON)
+    updated_at = Column(TIMESTAMP)
 
 
 class NPIData(Base, JSONOutputMixin):

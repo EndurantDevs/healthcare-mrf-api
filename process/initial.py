@@ -1510,10 +1510,11 @@ async def init_file(ctx, task=None):
             if max_urls and idx + 1 >= max_urls:
                 break
 
+        shutdown_job_id = f"shutdown_mrf_{ctx['context']['import_date']}"
         await redis.enqueue_job(
             "shutdown",
             {"context": ctx["context"], "test_mode": test_mode},
-            _job_id="shutdown_mrf",
+            _job_id=shutdown_job_id,
             _queue_name="arq:MRF_finish",
         )
         # break
@@ -1524,7 +1525,11 @@ async def startup(ctx):
     ctx["context"] = {}
     ctx["context"]["start"] = datetime.datetime.utcnow()
     ctx["context"]["run"] = 0
-    ctx["context"]["import_date"] = datetime.datetime.utcnow().strftime("%Y%m%d")
+    override_import_id = os.environ.get("HLTHPRT_IMPORT_ID_OVERRIDE")
+    if override_import_id:
+        ctx["context"]["import_date"] = override_import_id
+    else:
+        ctx["context"]["import_date"] = datetime.datetime.utcnow().strftime("%Y%m%d")
 
 
 async def shutdown(ctx, task):
