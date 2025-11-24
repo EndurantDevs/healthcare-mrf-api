@@ -5,7 +5,6 @@ from __future__ import annotations
 import re
 from typing import Optional
 
-
 _TIER_PATTERN = re.compile(r"[^a-z0-9\s]")
 
 TIER_SLUGS = (

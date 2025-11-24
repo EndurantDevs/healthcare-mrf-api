@@ -2,16 +2,15 @@
 
 from datetime import datetime
 
-from sanic import response
-from sanic import Blueprint
+from asyncpg import UndefinedTableError
+from sanic import Blueprint, response
 from sanic.exceptions import InvalidUsage
 from sqlalchemy import func, select
 from sqlalchemy.exc import ProgrammingError
 
-from asyncpg import UndefinedTableError
-
 from db.models import GeoZipLookup
-from db.tiger_models import ZipState, Zip_zcta5
+from db.tiger_models import Zip_zcta5, ZipState
+
 
 class TigerUnavailableError(RuntimeError):
     """Raised when the TIGER schema is unavailable."""

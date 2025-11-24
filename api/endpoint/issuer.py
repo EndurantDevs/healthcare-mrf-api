@@ -4,9 +4,10 @@ import sanic.exceptions
 from sanic import Blueprint, response
 from sqlalchemy import and_, func, select
 
-from db.connection import db as sa_db
-from db.models import ImportLog, Issuer, Plan, PlanNetworkTierRaw, PlanDrugStats, PlanDrugTierStats
 from api.tier_utils import normalize_drug_tier_slug
+from db.connection import db as sa_db
+from db.models import (ImportLog, Issuer, Plan, PlanDrugStats,
+                       PlanDrugTierStats, PlanNetworkTierRaw)
 
 import_log_table = ImportLog.__table__
 issuer_table = Issuer.__table__
