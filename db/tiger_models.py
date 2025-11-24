@@ -1,12 +1,13 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import os
-from sqlalchemy import DateTime, Numeric, DATE, Column,\
-    String, Integer, Float, BigInteger, Boolean, ARRAY, JSON, TIMESTAMP, TEXT, SMALLINT, PrimaryKeyConstraint
+
+from sqlalchemy import (ARRAY, DATE, JSON, SMALLINT, TEXT, TIMESTAMP,
+                        BigInteger, Boolean, Column, DateTime, Float, Integer,
+                        Numeric, PrimaryKeyConstraint, String)
 
 from db.connection import Base, db
 from db.json_mixin import JSONOutputMixin
-
 
 
 class ZipState(Base, JSONOutputMixin):

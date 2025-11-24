@@ -1,15 +1,15 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 from pathlib import Path
+
 import click
 from dotenv import load_dotenv
-from alembic.config import Config
-from alembic.command import upgrade
-from alembic.command import revision
-from alembic.command import history as show_history
+
 from alembic.command import current as show_current
 from alembic.command import downgrade as make_downgrade
-
+from alembic.command import history as show_history
+from alembic.command import revision, upgrade
+from alembic.config import Config
 
 BASE_DIR = (Path(__file__).parent / '..').absolute()
 ALEMBIC_INI = BASE_DIR / 'alembic.ini'

@@ -4,33 +4,22 @@
 import asyncio
 import json
 import logging
+import os
 import random
-from datetime import datetime
 import urllib.parse
-from typing import Any
-
+from datetime import datetime
 from textwrap import dedent
-
-from sqlalchemy import func, or_, select
-from sqlalchemy.sql import tuple_, text, literal_column
+from typing import Any, Optional
 
 import sanic.exceptions
 from sanic import Blueprint, response
+from sqlalchemy import func, or_, select
+from sqlalchemy.sql import literal_column, text, tuple_
 
+from db.models import (AddressArchive, Issuer, NPIAddress, NPIData,
+                       NPIDataOtherIdentifier, NPIDataTaxonomy,
+                       NPIDataTaxonomyGroup, NUCCTaxonomy, PlanNPIRaw, db)
 from process.ext.utils import download_it
-
-from db.models import (
-    db,
-    Issuer,
-    PlanNPIRaw,
-    NPIData,
-    NPIAddress,
-    AddressArchive,
-    NPIDataTaxonomy,
-    NPIDataTaxonomyGroup,
-    NPIDataOtherIdentifier,
-    NUCCTaxonomy,
-)
 
 blueprint = Blueprint("npi", url_prefix="/npi", version=1)
 logger = logging.getLogger(__name__)
@@ -92,6 +81,26 @@ def _taxonomy_group_subquery() -> str:
         ) AS q
         """
     ).strip()
+
+
+async def _fast_has_insurance_count(city: Optional[str], state: Optional[str]) -> int:
+    table = NPIAddress.__table__
+    conditions = [
+        table.c.type == "primary",
+        literal_column("NOT (plans_network_array @@ '0'::query_int)"),
+    ]
+    if city:
+        conditions.append(table.c.city_name == city)
+    if state:
+        conditions.append(table.c.state_name == state)
+
+    stmt = (
+        select(func.count(func.distinct(table.c.npi)))
+        .where(*conditions)
+    )
+    async with db.session() as session:
+        result = await session.execute(stmt)
+        return int(result.scalar() or 0)
 
 
 def _build_nearby_sql(taxonomy_conditions: str, extra_clause: str, ilike_clause: str) -> str:
@@ -367,6 +376,9 @@ async def get_all(request):
     city = request.args.get("city")
     state = request.args.get("state")
 
+    city = city.upper() if city else None
+    state = state.upper() if state else None
+
     codes = request.args.get("codes")
     if codes:
         codes = [x.strip() for x in codes.split(",")]
@@ -387,6 +399,24 @@ async def get_all(request):
         "state": state,
         "response_format": response_format,
     }
+
+    simple_filter_present = any(
+        filters.get(field)
+        for field in (
+            "classification",
+            "specialization",
+            "section",
+            "display_name",
+            "plan_network",
+            "name_like",
+            "codes",
+            "response_format",
+        )
+    )
+
+    if count_only and has_insurance and not simple_filter_present:
+        rows = await _fast_has_insurance_count(city, state)
+        return response.json({"rows": rows}, default=str)
 
     async def get_count(filters):
         classification = filters.get("classification")
@@ -623,6 +653,7 @@ async def get_near_npi(request):
         zip_codes.append(zip_c.strip().rjust(5, "0"))
     radius = int(request.args.get("radius", 10))
 
+    await _ensure_npi_geo_index()
     async with db.acquire() as conn:
         if (not (in_long and in_lat)) and zip_codes and zip_codes[0]:
             q = "select intptlat, intptlon from zcta5 where zcta5ce=:zip_code limit 1;"
@@ -1065,3 +1096,28 @@ async def _fetch_other_names(npi: int) -> list[dict[str, Any]]:
         payload.pop("npi", None)
         rows.append(payload)
     return rows
+_NPI_GEO_INDEX_READY = False
+
+
+async def _ensure_npi_geo_index():
+    global _NPI_GEO_INDEX_READY  # pylint: disable=global-statement
+    if _NPI_GEO_INDEX_READY:
+        return
+    schema = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    stmt = text(
+        f"""
+        CREATE INDEX IF NOT EXISTS npi_address_geo_idx
+            ON {schema}.npi_address
+         USING GIST (Geography(ST_MakePoint(long, lat)))
+         WHERE type IN ('primary','secondary');
+        """
+    )
+    status_fn = getattr(db, "status", None)
+    if status_fn is not None:
+        await status_fn(stmt)
+    else:  # used in tests with lightweight fake db
+        async with db.acquire() as conn:
+            executor = getattr(conn, "execute", None)
+            if executor is not None:
+                await executor(stmt)
+    _NPI_GEO_INDEX_READY = True

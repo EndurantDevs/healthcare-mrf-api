@@ -1,39 +1,32 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-import os
-import sys
 import asyncio
 import datetime
-import pytz
-import tempfile
-from dateutil.parser import parse as parse_date
 import glob
+import os
 import re
+import sys
+import tempfile
 import zipfile
-from arq import create_pool
 from pathlib import PurePath
+
+import pytz
 from aiocsv import AsyncDictReader
-from asyncpg import DuplicateTableError
-from sqlalchemy import select, func
-
 from aiofile import async_open
+from arq import create_pool
 from async_unzip.unzipper import unzip
+from asyncpg import DuplicateTableError
+from dateutil.parser import parse as parse_date
+from sqlalchemy import func, select
 
-from process.ext.utils import (
-    return_checksum,
-    download_it,
-    download_it_and_save,
-    make_class,
-    push_objects,
-    print_time_info,
-    my_init_db,
-    ensure_database,
-)
-
-from db.models import AddressArchive, NPIAddress, NPIData, NPIDataTaxonomyGroup, NPIDataOtherIdentifier, \
-    NPIDataTaxonomy, db
-from process.serialization import serialize_job, deserialize_job
+from db.models import (AddressArchive, NPIAddress, NPIData,
+                       NPIDataOtherIdentifier, NPIDataTaxonomy,
+                       NPIDataTaxonomyGroup, db)
+from process.ext.utils import (download_it, download_it_and_save,
+                               ensure_database, make_class, my_init_db,
+                               print_time_info, push_objects, return_checksum)
 from process.redis_config import build_redis_settings
+from process.serialization import deserialize_job, serialize_job
 
 latin_pattern= re.compile(r'[^\x00-\x7f]')
 

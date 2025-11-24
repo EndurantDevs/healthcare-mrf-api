@@ -40,6 +40,10 @@ class _QueryParamCollector(ast.NodeVisitor):
             if self._resolves_to_request_args(func.value):
                 if node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
                     self.params.add(node.args[0].value)
+        if isinstance(func, ast.Name) and func.id == "_get_list_param":
+            if node.args and self._resolves_to_request_args(node.args[0]):
+                if len(node.args) > 1 and isinstance(node.args[1], ast.Constant) and isinstance(node.args[1].value, str):
+                    self.params.add(node.args[1].value)
         self.generic_visit(node)
 
     @staticmethod

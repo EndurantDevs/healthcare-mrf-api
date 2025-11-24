@@ -24,12 +24,9 @@ from sqlalchemy.sql import Executable, Select
 from sqlalchemy.sql.dml import Delete, Insert, Update
 
 try:
-    from sqlalchemy.ext.asyncio import (
-        AsyncEngine,
-        AsyncSession,
-        async_sessionmaker,
-        create_async_engine,
-    )
+    from sqlalchemy.ext.asyncio import (AsyncEngine, AsyncSession,
+                                        async_sessionmaker,
+                                        create_async_engine)
 except ImportError as exc:  # pragma: no cover - triggered only before dependency upgrade
     AsyncEngine = AsyncSession = None  # type: ignore[assignment]
     async_sessionmaker = None  # type: ignore[assignment]

@@ -8,16 +8,9 @@ from sanic import Blueprint, response
 from sanic.exceptions import InvalidUsage, NotFound
 from sqlalchemy import and_, func, or_, select
 
-from db.models import (
-    Issuer,
-    Plan,
-    PlanDrugRaw,
-    PlanDrugStats,
-    PlanDrugTierStats,
-    PlanFormulary,
-)
 from api.tier_utils import normalize_drug_tier_slug
-
+from db.models import (Issuer, Plan, PlanDrugRaw, PlanDrugStats,
+                       PlanDrugTierStats, PlanFormulary)
 
 blueprint = Blueprint("formulary", url_prefix="/formulary", version=1)
 

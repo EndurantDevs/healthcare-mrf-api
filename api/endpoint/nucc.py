@@ -1,8 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-from sanic import response
-from sanic import Blueprint
-
+from sanic import Blueprint, response
 from sqlalchemy import select
 
 from db.models import NUCCTaxonomy

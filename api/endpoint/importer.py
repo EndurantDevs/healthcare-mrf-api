@@ -2,13 +2,10 @@
 # pylint: disable=not-callable
 
 import sanic.exceptions
-from sanic import response
-from sanic import Blueprint
-
-
+from sanic import Blueprint, response
 from sqlalchemy import distinct, func, select
 
-from db.models import db, Issuer, Plan, ImportLog, ImportHistory
+from db.models import ImportHistory, ImportLog, Issuer, Plan, db
 
 blueprint = Blueprint('import', url_prefix='/import', version=1)
 

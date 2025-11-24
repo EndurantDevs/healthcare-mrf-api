@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import os
+
 from arq.connections import RedisSettings
 
 

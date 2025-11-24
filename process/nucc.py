@@ -1,29 +1,23 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-import os
 import asyncio
 import datetime
-import tempfile
+import os
 import re
-from arq import create_pool
+import tempfile
 from pathlib import PurePath
+
 from aiocsv import AsyncDictReader
 from aiofile import async_open
+from arq import create_pool
 
-from process.ext.utils import (
-    download_it,
-    download_it_and_save,
-    make_class,
-    push_objects,
-    print_time_info,
-    return_checksum,
-    ensure_database,
-)
-
-from db.models import NUCCTaxonomy, db
 from db.connection import init_db
-from process.serialization import serialize_job, deserialize_job
+from db.models import NUCCTaxonomy, db
+from process.ext.utils import (download_it, download_it_and_save,
+                               ensure_database, make_class, print_time_info,
+                               push_objects, return_checksum)
 from process.redis_config import build_redis_settings
+from process.serialization import deserialize_job, serialize_job
 
 latin_pattern= re.compile(r'[^\x00-\x7f]')
 

@@ -2,8 +2,7 @@
 
 from datetime import datetime
 
-from sanic import response
-from sanic import Blueprint
+from sanic import Blueprint, response
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 
