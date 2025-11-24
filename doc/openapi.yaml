@@ -209,8 +209,18 @@ paths:
           in: query
           schema:
             type: string
-            enum: [plan_id, marketing_name, state, year, deductible, moop]
+            enum: [plan_id, marketing_name, state, year, deductible, moop, premium_min, premium_max]
           description: Field to order by (defaults to plan_id)
+        - name: premium_min
+          in: query
+          schema:
+            type: number
+          description: Minimum aggregated monthly premium allowed for the plan
+        - name: premium_max
+          in: query
+          schema:
+            type: number
+          description: Maximum aggregated monthly premium allowed for the plan
         - name: has_adult_dental
           in: query
           schema:
@@ -236,6 +246,33 @@ paths:
           schema:
             type: boolean
           description: Filter by plans that list telehealth/virtual visits in benefits
+        - name: plan_types
+          in: query
+          schema:
+            type: array
+            items:
+              type: string
+          style: form
+          explode: true
+          description: Repeatable or comma-separated list of plan types (HMO, PPO, etc.)
+        - name: metal_levels
+          in: query
+          schema:
+            type: array
+            items:
+              type: string
+          style: form
+          explode: true
+          description: Repeatable or comma-separated list of metal levels (e.g., Bronze, Silver)
+        - name: csr_variations
+          in: query
+          schema:
+            type: array
+            items:
+              type: string
+          style: form
+          explode: true
+          description: CSR variation identifiers to match
         - name: is_hsa
           in: query
           schema:
@@ -261,6 +298,15 @@ paths:
           schema:
             type: boolean
           description: Filter by plans sold off exchange
+        - name: issuer_ids
+          in: query
+          schema:
+            type: array
+            items:
+              type: integer
+          style: form
+          explode: true
+          description: Repeatable or comma-separated issuer IDs; may be combined with issuer_id
         - name: deductible_min
           in: query
           schema:
@@ -629,6 +675,40 @@ paths:
                   $ref: '#/components/schemas/PlanPriceEntry'
         '400':
           description: Invalid age or year supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /plan/price/bulk:
+    post:
+      summary: Retrieve price rows for multiple plans
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                plan_ids:
+                  type: array
+                  items:
+                    type: string
+                year:
+                  type: integer
+                age:
+                  type: integer
+                rating_area:
+                  type: string
+              required: [plan_ids]
+      responses:
+        '200':
+          description: Price rows keyed by plan_id
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlanPriceBulkResponse'
+        '400':
+          description: Invalid request payload
           content:
             application/json:
               schema:
@@ -1441,6 +1521,8 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/PlanIssuerFacet'
+        facets:
+          $ref: '#/components/schemas/PlanSearchFacets'
         applied_filters:
           type: object
           additionalProperties: true
@@ -1538,6 +1620,69 @@ components:
           type: string
       required: [code, message]
       additionalProperties: false
+    PlanSearchFacets:
+      type: object
+      properties:
+        plan_types:
+          type: array
+          items:
+            $ref: '#/components/schemas/PlanFacetValueCount'
+        metal_levels:
+          type: array
+          items:
+            $ref: '#/components/schemas/PlanFacetValueCount'
+        csr_variations:
+          type: array
+          items:
+            $ref: '#/components/schemas/PlanFacetValueCount'
+        boolean_filters:
+          $ref: '#/components/schemas/PlanBooleanFacetCounts'
+      additionalProperties: false
+    PlanFacetValueCount:
+      type: object
+      properties:
+        value:
+          type: string
+          nullable: true
+        count:
+          type: integer
+      required: [value, count]
+      additionalProperties: false
+    PlanBooleanFacetCounts:
+      type: object
+      properties:
+        has_adult_dental:
+          $ref: '#/components/schemas/BooleanFacetCounts'
+        has_child_dental:
+          $ref: '#/components/schemas/BooleanFacetCounts'
+        has_adult_vision:
+          $ref: '#/components/schemas/BooleanFacetCounts'
+        has_child_vision:
+          $ref: '#/components/schemas/BooleanFacetCounts'
+        telehealth_supported:
+          $ref: '#/components/schemas/BooleanFacetCounts'
+        is_hsa:
+          $ref: '#/components/schemas/BooleanFacetCounts'
+        is_dental_only:
+          $ref: '#/components/schemas/BooleanFacetCounts'
+        is_catastrophic:
+          $ref: '#/components/schemas/BooleanFacetCounts'
+        is_on_exchange:
+          $ref: '#/components/schemas/BooleanFacetCounts'
+        is_off_exchange:
+          $ref: '#/components/schemas/BooleanFacetCounts'
+      additionalProperties: false
+    BooleanFacetCounts:
+      type: object
+      properties:
+        true:
+          type: integer
+        false:
+          type: integer
+        null:
+          type: integer
+      required: [true, false, null]
+      additionalProperties: false
     PlanPriceEntry:
       type: object
       properties:
@@ -1550,6 +1695,21 @@ components:
         individual_rate:
           type: number
       additionalProperties: true
+    PlanPriceBulkResponse:
+      type: object
+      properties:
+        results:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              $ref: '#/components/schemas/PlanPriceEntry'
+        missing:
+          type: array
+          items:
+            type: string
+      required: [results, missing]
+      additionalProperties: false
     PlanDetail:
       type: object
       properties:

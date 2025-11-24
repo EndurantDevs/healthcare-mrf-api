@@ -4,55 +4,37 @@
 import asyncio
 import datetime
 import glob
+import json
 import logging
 import os
 import sys
 import tempfile
-import json
+import zipfile
 from pathlib import Path, PurePath
 
-from aiofile import async_open
-from arq import create_pool
-from asyncpg import DuplicateTableError
-from async_unzip.unzipper import unzip
-from dateutil.parser import parse as parse_date
 import ijson
 import pylightxl as xl
 from aiocsv import AsyncDictReader
-import zipfile
-
-from process.ext.utils import (
-    download_it_and_save,
-    make_class,
-    push_objects,
-    log_error,
-    print_time_info,
-    flush_error_log,
-    return_checksum,
-    my_init_db,
-    ensure_database,
-    get_import_schema,
-)
-from db.models import (
-    PlanNPIRaw,
-    PlanNetworkTierRaw,
-    PlanDrugRaw,
-    ImportHistory,
-    ImportLog,
-    Issuer,
-    Plan,
-    PlanFormulary,
-    PlanTransparency,
-    NPIDataOtherIdentifier,
-    NPIDataTaxonomyGroup,
-    NPIAddress,
-    db,
-)
-from sqlalchemy import func, select
+from aiofile import async_open
+from arq import create_pool
+from async_unzip.unzipper import unzip
+from asyncpg import DuplicateTableError
+from dateutil.parser import parse as parse_date
+from sqlalchemy import func, literal, or_, select
 from sqlalchemy.exc import IntegrityError, ProgrammingError
-from process.serialization import deserialize_job, serialize_job
-from process.redis_config import build_redis_settings
 
+from db.models import (ImportHistory, ImportLog, Issuer, NPIAddress,
+                       NPIDataOtherIdentifier, NPIDataTaxonomyGroup, Plan,
+                       PlanDrugRaw, PlanDrugStats, PlanDrugTierStats,
+                       PlanFormulary, PlanNetworkTierRaw, PlanNPIRaw,
+                       PlanTransparency, db)
+from process.ext.utils import (download_it_and_save, ensure_database,
+                               flush_error_log, get_import_schema, log_error,
+                               make_class, my_init_db, print_time_info,
+                               push_objects, return_checksum)
+from process.plan_summary import rebuild_plan_search_summary
+from process.redis_config import build_redis_settings
+from process.serialization import deserialize_job, serialize_job
 
 TEST_PLAN_TRANSPARENCY_ROWS = 25
 TEST_UNKNOWN_STATE_ROWS = 50
@@ -64,6 +46,7 @@ TEST_PROVIDER_RECORDS = 60
 TEST_DRUG_RECORDS = 60
 TEST_MIN_PLAN_COUNT = 1
 
+PLAN_ID_MAX_LENGTH = getattr(Plan.__table__.c.plan_id.type, "length", 14)
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +61,14 @@ def _truthy(value, truthy=("yes", "y", "true")) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in truthy
     return bool(value)
+
+
+def _clean_name_part(value):
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    return str(value).strip()
 
 
 async def _prepare_import_tables(import_date: str, test_mode: bool) -> None:
@@ -101,6 +92,8 @@ async def _prepare_import_tables(import_date: str, test_mode: bool) -> None:
         PlanFormulary,
         PlanTransparency,
         PlanDrugRaw,
+        PlanDrugStats,
+        PlanDrugTierStats,
         ImportLog,
         PlanNPIRaw,
         PlanNetworkTierRaw,
@@ -174,6 +167,21 @@ async def process_plan(ctx, task):
                 async for res in ijson.items(afp, "item", use_float=True):
                     if stop_processing:
                         break
+                    plan_id_raw = res.get("plan_id")
+                    plan_id_value = str(plan_id_raw).strip() if plan_id_raw is not None else ""
+                    if PLAN_ID_MAX_LENGTH and len(plan_id_value) > PLAN_ID_MAX_LENGTH:
+                        for year in res.get("years", []):
+                            await log_error(
+                                "err",
+                                f"Plan ID length exceeds {PLAN_ID_MAX_LENGTH} characters. "
+                                f"Plan ID: {plan_id_value}, year: {year}",
+                                task.get("issuer_array"),
+                                task.get("url"),
+                                "plans",
+                                "json",
+                                myimportlog,
+                            )
+                        continue
                     for year in res["years"]:
                         if stop_processing:
                             break
@@ -192,7 +200,7 @@ async def process_plan(ctx, task):
                                     await log_error(
                                         "err",
                                         f"Mandatory field `{k}` is not present or incorrect. Plan ID: "
-                                        f"{res['plan_id']}, year: {year}",
+                                        f"{plan_id_value or 'UNKNOWN'}, year: {year}",
                                         task.get("issuer_array"),
                                         task.get("url"),
                                         "plans",
@@ -200,14 +208,14 @@ async def process_plan(ctx, task):
                                         myimportlog,
                                     )
 
-                            if int(res["plan_id"][:5]) not in task.get("issuer_array"):
+                            if int(plan_id_value[:5]) not in task.get("issuer_array"):
                                 await log_error(
                                     "err",
                                     f"File describes the issuer that is not defined/allowed by the index "
                                     f"CMS PUF."
-                                    f"Issuer of Plan: {int(res['plan_id'][:5])}. Allowed issuer list: "
+                                    f"Issuer of Plan: {int(plan_id_value[:5])}. Allowed issuer list: "
                                     f"{', '.join([str(x) for x in task.get('issuer_array')])}"
-                                    f"Plan ID: {res['plan_id']}, year: {year}",
+                                    f"Plan ID: {plan_id_value}, year: {year}",
                                     task.get("issuer_array"),
                                     task.get("url"),
                                     "plans",
@@ -225,11 +233,11 @@ async def process_plan(ctx, task):
                                 formulary_entries = []
 
                             obj = {
-                                "plan_id": res["plan_id"],
+                                "plan_id": plan_id_value,
                                 "plan_id_type": res["plan_id_type"],
                                 "year": int(year),
-                                "issuer_id": int(res["plan_id"][:5]),
-                                "state": str(res["plan_id"][5:7]).upper(),
+                                "issuer_id": int(plan_id_value[:5]),
+                                "state": str(plan_id_value[5:7]).upper(),
                                 "marketing_name": res["marketing_name"],
                                 "summary_url": res["summary_url"],
                                 "marketing_url": res.get("marketing_url", ""),
@@ -240,7 +248,7 @@ async def process_plan(ctx, task):
                                 "last_updated_on": datetime.datetime.combine(
                                     parse_date(res["last_updated_on"], fuzzy=True), datetime.datetime.min.time()
                                 ),
-                                "checksum": return_checksum([res["plan_id"].lower(), year], crc=32),
+                                "checksum": return_checksum([plan_id_value.lower(), year], crc=32),
                             }
                             plan_obj.append(obj)
                             processed_plans += 1
@@ -281,7 +289,7 @@ async def process_plan(ctx, task):
                                                     f"sub-type is "
                                                     f"not present or "
                                                     f"incorrect. Plan ID: "
-                                                    f"{res['plan_id']}, year: {year}",
+                                                    f"{plan_id_value}, year: {year}",
                                                     task.get("issuer_array"),
                                                     task.get("url"),
                                                     "plans",
@@ -303,7 +311,7 @@ async def process_plan(ctx, task):
                                                         f"`cost_sharing`) "
                                                         f"sub-type is not present or "
                                                         f"incorrect. Plan ID: "
-                                                        f"{res['plan_id']}, year: {year}",
+                                                        f"{plan_id_value}, year: {year}",
                                                         task.get("issuer_array"),
                                                         task.get("url"),
                                                         "plans",
@@ -311,7 +319,7 @@ async def process_plan(ctx, task):
                                                         myimportlog,
                                                     )
                                             obj = {
-                                                "plan_id": res["plan_id"],
+                                                "plan_id": plan_id_value,
                                                 "year": int(year),
                                                 "drug_tier": formulary.get("drug_tier", ""),
                                                 "mail_order": bool(formulary.get("mail_order")),
@@ -350,7 +358,7 @@ async def process_plan(ctx, task):
                                     await log_error(
                                         "warn",
                                         f"Recommended field 'cost_sharing' is not present or incorrect. "
-                                        f"Plan ID: {res['plan_id']}, year: {year}",
+                                        f"Plan ID: {plan_id_value}, year: {year}",
                                         task.get("issuer_array"),
                                         task.get("url"),
                                         "plans",
@@ -361,7 +369,7 @@ async def process_plan(ctx, task):
                             await log_error(
                                 "err",
                                 f"Mandatory field 'formulary' is not present or incorrect. Plan ID: "
-                                f"{res['plan_id']}, year: {year}",
+                                f"{plan_id_value}, year: {year}",
                                 task.get("issuer_array"),
                                 task.get("url"),
                                 "plans",
@@ -543,7 +551,7 @@ async def process_provider(ctx, task):
                     if (
                         ("facility_name" in res)
                         and res.get("facility_name", None)
-                        and res.get("facility_name", "").strip()
+                        and str(res.get("facility_name", "")).strip()
                     ):
                         # for k in (
                         #         'facility_name', 'facility_type'):
@@ -571,7 +579,9 @@ async def process_provider(ctx, task):
                         obj["name_or_facility_name"] = ""
                         for k in ("prefix", "first", "middle", "last", "suffix"):
                             if (k in name) and (name.get(k, None)):
-                                obj["name_or_facility_name"] += f"{name.get(k, '').strip()} "
+                                cleaned = _clean_name_part(name.get(k))
+                                if cleaned:
+                                    obj["name_or_facility_name"] += f"{cleaned} "
                         obj["name_or_facility_name"] = obj["name_or_facility_name"].strip()
                         obj["specialty_or_facility_type"] = [str(x) for x in res.get("specialty", [])]
 
@@ -668,6 +678,111 @@ def _parse_optional_bool(value):
     return bool(value)
 
 
+def _chunked(values, chunk_size=500):
+    items = [value for value in set(values) if value]
+    for idx in range(0, len(items), chunk_size):
+        yield items[idx: idx + chunk_size]
+
+
+async def _refresh_plan_drug_statistics(plan_ids, import_date, db_schema):
+    plan_ids = [value for value in set(plan_ids) if value]
+    if not plan_ids:
+        return
+
+    plan_drug_cls = make_class(PlanDrugRaw, import_date, schema_override=db_schema)
+    stats_cls = make_class(PlanDrugStats, import_date, schema_override=db_schema)
+    tier_stats_cls = make_class(PlanDrugTierStats, import_date, schema_override=db_schema)
+
+    plan_drug_table = plan_drug_cls.__table__
+    stats_table = stats_cls.__table__
+    tier_table = tier_stats_cls.__table__
+    tier_label = func.coalesce(plan_drug_table.c.drug_tier, literal("UNKNOWN"))
+
+    for chunk in _chunked(plan_ids):
+        delete_stats_stmt = db.delete(stats_table).where(stats_table.c.plan_id.in_(chunk))
+        await delete_stats_stmt.status()
+        delete_tier_stmt = db.delete(tier_table).where(tier_table.c.plan_id.in_(chunk))
+        await delete_tier_stmt.status()
+
+        stats_select = (
+            select(
+                plan_drug_table.c.plan_id.label("plan_id"),
+                func.count().label("total_drugs"),
+                func.count().filter(plan_drug_table.c.prior_authorization.is_(True)).label("auth_required"),
+                func.count()
+                .filter(
+                    or_(
+                        plan_drug_table.c.prior_authorization.is_(False),
+                        plan_drug_table.c.prior_authorization.is_(None),
+                    )
+                )
+                .label("auth_not_required"),
+                func.count().filter(plan_drug_table.c.step_therapy.is_(True)).label("step_required"),
+                func.count()
+                .filter(
+                    or_(
+                        plan_drug_table.c.step_therapy.is_(False),
+                        plan_drug_table.c.step_therapy.is_(None),
+                    )
+                )
+                .label("step_not_required"),
+                func.count().filter(plan_drug_table.c.quantity_limit.is_(True)).label("quantity_limit"),
+                func.count()
+                .filter(
+                    or_(
+                        plan_drug_table.c.quantity_limit.is_(False),
+                        plan_drug_table.c.quantity_limit.is_(None),
+                    )
+                )
+                .label("quantity_no_limit"),
+                func.max(plan_drug_table.c.last_updated_on).label("last_updated_on"),
+            )
+            .where(plan_drug_table.c.plan_id.in_(chunk))
+            .group_by(plan_drug_table.c.plan_id)
+        )
+
+        stats_insert = (
+            db.insert(stats_table)
+            .from_select(
+                [
+                    "plan_id",
+                    "total_drugs",
+                    "auth_required",
+                    "auth_not_required",
+                    "step_required",
+                    "step_not_required",
+                    "quantity_limit",
+                    "quantity_no_limit",
+                    "last_updated_on",
+                ],
+                stats_select,
+            )
+        )
+        await stats_insert.status()
+
+        tier_select = (
+            select(
+                plan_drug_table.c.plan_id.label("plan_id"),
+                tier_label.label("drug_tier"),
+                func.count().label("drug_count"),
+            )
+            .where(plan_drug_table.c.plan_id.in_(chunk))
+            .group_by(plan_drug_table.c.plan_id, tier_label)
+        )
+        tier_insert = (
+            db.insert(tier_table)
+            .from_select(
+                [
+                    "plan_id",
+                    "drug_tier",
+                    "drug_count",
+                ],
+                tier_select,
+            )
+        )
+        await tier_insert.status()
+
+
 async def process_formulary(ctx, task):
     """
     Download and store formulary (drugs.json) data for an issuer.
@@ -682,6 +797,7 @@ async def process_formulary(ctx, task):
     db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
     myimportlog = make_class(ImportLog, import_date, schema_override=db_schema)
     myplan_drug = make_class(PlanDrugRaw, import_date, schema_override=db_schema)
+    touched_plan_ids = set()
 
     print("Starting Formulary file data download: ", task.get("url"))
     with tempfile.TemporaryDirectory() as tmpdirname:
@@ -755,6 +871,7 @@ async def process_formulary(ctx, task):
                             except (ValueError, TypeError):
                                 record["last_updated_on"] = None
                         batch.append(record)
+                        touched_plan_ids.add(plan_id)
 
                     processed += 1
                     if drug_limit and processed >= drug_limit:
@@ -789,6 +906,9 @@ async def process_formulary(ctx, task):
         if batch:
             await push_objects(batch, myplan_drug)
 
+    if touched_plan_ids:
+        await _refresh_plan_drug_statistics(touched_plan_ids, import_date, db_schema)
+
     await flush_error_log(myimportlog)
     return 1
 
@@ -812,7 +932,10 @@ async def save_mrf_data(ctx, task):
                 x.append(push_objects(task["plan_networktier"], myplan_networktier, rewrite=True))
             case "plan_drugs":
                 myplan_drugs = make_class(PlanDrugRaw, import_date, schema_override=db_schema)
-                x.append(push_objects(task["plan_drugs"], myplan_drugs, rewrite=True))
+                await push_objects(task["plan_drugs"], myplan_drugs, rewrite=True)
+                plan_ids = {entry.get("plan_id") for entry in task["plan_drugs"] if entry.get("plan_id")}
+                if plan_ids:
+                    await _refresh_plan_drug_statistics(plan_ids, import_date, db_schema)
             case "npi_other_id_list":
                 mynpidataotheridentifier = make_class(
                     NPIDataOtherIdentifier, import_date, schema_override=db_schema
@@ -1441,6 +1564,8 @@ async def shutdown(ctx, task):
             PlanFormulary,
             PlanTransparency,
             PlanDrugRaw,
+            PlanDrugStats,
+            PlanDrugTierStats,
             ImportLog,
             PlanNPIRaw,
             PlanNetworkTierRaw,
@@ -1473,6 +1598,8 @@ async def shutdown(ctx, task):
     )
     await upsert_history.status()
     print("Plans in DB: ", await db.scalar(select(func.count(Plan.plan_id))))  # pylint: disable=E1101
+    summary_rows = await rebuild_plan_search_summary(test_mode=test_mode)
+    print("Plan search summary rows: ", summary_rows)
     print_time_info(ctx["context"]["start"])
 
 

@@ -2,32 +2,23 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, List, Optional
 
 import sanic.exceptions
+from asyncpg import UndefinedTableError
 from sanic import Blueprint, response
 from sanic.exceptions import InvalidUsage
 from sqlalchemy import Float, and_, case, cast, func, or_, select
-from asyncpg import UndefinedTableError
 from sqlalchemy.exc import ProgrammingError
 
 from api.for_human import attributes_labels, benefits_labels
 from db.connection import db as sa_db
-from db.models import (
-    ImportLog,
-    Issuer,
-    Plan,
-    PlanAttributes,
-    PlanBenefits,
-    GeoZipLookup,
-    PlanDrugStats,
-    PlanFormulary,
-    PlanNetworkTierRaw,
-    PlanNPIRaw,
-    PlanPrices,
-    PlanRatingAreas,
-)
+from db.models import (GeoZipLookup, ImportLog, Issuer, Plan, PlanAttributes,
+                       PlanBenefits, PlanDrugStats, PlanFormulary,
+                       PlanNetworkTierRaw, PlanNPIRaw, PlanPrices,
+                       PlanRatingAreas, PlanSearchSummary)
 from db.tiger_models import ZipState
 
 plan_table = Plan.__table__
@@ -43,7 +34,21 @@ plan_rating_areas_table = PlanRatingAreas.__table__
 zip_state_table = ZipState.__table__
 import_log_table = ImportLog.__table__
 issuer_table = Issuer.__table__
+plan_search_summary_table = PlanSearchSummary.__table__
 
+
+SUMMARY_BOOLEAN_COLUMNS = {
+    "has_adult_dental": plan_search_summary_table.c.has_adult_dental,
+    "has_child_dental": plan_search_summary_table.c.has_child_dental,
+    "has_adult_vision": plan_search_summary_table.c.has_adult_vision,
+    "has_child_vision": plan_search_summary_table.c.has_child_vision,
+    "telehealth_supported": plan_search_summary_table.c.telehealth_supported,
+    "is_hsa": plan_search_summary_table.c.is_hsa,
+    "is_dental_only": plan_search_summary_table.c.is_dental_only,
+    "is_catastrophic": plan_search_summary_table.c.is_catastrophic,
+    "is_on_exchange": plan_search_summary_table.c.is_on_exchange,
+    "is_off_exchange": plan_search_summary_table.c.is_off_exchange,
+}
 
 PRICE_RATE_COLUMNS = (
     "individual_rate",
@@ -56,15 +61,6 @@ PRICE_RATE_COLUMNS = (
     "couple_and_two_dependents",
     "couple_and_three_or_more_dependents",
 )
-
-BOOLEAN_TRUE_VALUES = ("yes", "true", "1")
-ADULT_DENTAL_KEYWORDS = ("dental", "adult")
-CHILD_DENTAL_KEYWORDS = ("dental", "child")
-ADULT_VISION_KEYWORDS = (("vision", "adult"), ("eye", "adult"))
-CHILD_VISION_KEYWORDS = (("vision", "child"), ("eye", "child"))
-TELEHEALTH_KEYWORDS = (("telehealth",), ("telemedicine",), ("virtual", "visit"), ("virtual", "care"))
-EXCHANGE_ON_KEYWORDS = ("on exchange", "on/off exchange", "on and off", "on & off", "both")
-EXCHANGE_OFF_KEYWORDS = ("off exchange", "on/off exchange", "on and off", "on & off", "both")
 
 blueprint = Blueprint("plan", url_prefix="/plan", version=1)
 
@@ -147,176 +143,11 @@ def _result_scalar(result):
     return first
 
 
+
+
 def _plan_level_plan_id_column(table):
     return func.coalesce(table.c.plan_id, func.left(func.coalesce(table.c.full_plan_id, ""), 14))
 
-
-def _normalize_keyword_groups(keywords: Sequence[Sequence[str]] | Sequence[str]) -> List[tuple[str, ...]]:
-    if not keywords:
-        return []
-    first = keywords[0] if isinstance(keywords, Sequence) else keywords
-    if keywords and isinstance(keywords[0], (tuple, list)):
-        groups = keywords  # type: ignore[assignment]
-    else:
-        groups = (keywords,)  # type: ignore[assignment]
-    normalized: List[tuple[str, ...]] = []
-    for group in groups:  # type: ignore[arg-type]
-        values = tuple(word.strip().lower() for word in group if isinstance(word, str) and word.strip())
-        if values:
-            normalized.append(values)
-    return normalized
-
-
-def _keyword_condition(column, keywords: Sequence[Sequence[str]] | Sequence[str]):
-    groups = _normalize_keyword_groups(keywords)
-    if not groups:
-        return None
-    lowered = func.lower(func.coalesce(column, ""))
-    group_expressions = []
-    for group in groups:
-        terms = [lowered.like(f"%{token}%") for token in group]
-        if terms:
-            group_expressions.append(and_(*terms))
-    if not group_expressions:
-        return None
-    if len(group_expressions) == 1:
-        return group_expressions[0]
-    return or_(*group_expressions)
-
-
-def _text_matches_any(column, keywords: Iterable[str]):
-    comparisons = []
-    lowered = func.lower(func.coalesce(column, ""))
-    for keyword in keywords:
-        token = (keyword or "").strip().lower()
-        if not token:
-            continue
-        comparisons.append(lowered.like(f"%{token}%"))
-    if not comparisons:
-        return None
-    if len(comparisons) == 1:
-        return comparisons[0]
-    return or_(*comparisons)
-
-
-def _benefit_flag_case(keywords: Sequence[Sequence[str]] | Sequence[str]):
-    condition = _keyword_condition(plan_benefits_table.c.benefit_name, keywords)
-    if condition is None:
-        return func.bool_or(func.false())
-    covered = and_(plan_benefits_table.c.is_covered.is_(True), condition)
-    return func.bool_or(
-        case(
-            (covered, True),
-            else_=None,
-        )
-    )
-
-
-def _build_attribute_subquery(filtered_plans):
-    attr_plan_id = _plan_level_plan_id_column(plan_attributes_table)
-    market_text_expr = func.trim(_attribute_text_case("MarketCoverage"))
-    metal_level_expr = func.trim(_attribute_text_case("MetalLevel"))
-    on_condition = _text_matches_any(market_text_expr, EXCHANGE_ON_KEYWORDS)
-    off_condition = _text_matches_any(market_text_expr, EXCHANGE_OFF_KEYWORDS)
-    metal_level_lower = func.lower(func.coalesce(metal_level_expr, ""))
-    join_condition = and_(
-        attr_plan_id == filtered_plans.c.plan_id,
-        plan_attributes_table.c.year == filtered_plans.c.year,
-    )
-    return (
-        select(
-            filtered_plans.c.plan_id.label("plan_id"),
-            filtered_plans.c.year.label("year"),
-            market_text_expr.label("market_coverage"),
-            (case((on_condition, True), else_=False) if on_condition is not None else func.false()).label(
-                "is_on_exchange"
-            ),
-            (case((off_condition, True), else_=False) if off_condition is not None else func.false()).label(
-                "is_off_exchange"
-            ),
-            _attribute_boolean_case("IsHSAEligible").label("is_hsa"),
-            _attribute_boolean_case("DentalOnlyPlan").label("is_dental_only"),
-            (case((metal_level_lower.like("%catastrophic%"), True), else_=False)).label("is_catastrophic"),
-            _attribute_numeric_case("MEHBDedInnTier1Individual").label("deductible_inn_individual"),
-            _attribute_numeric_case("MEHBInnTier1IndividualMOOP").label("moop_inn_individual"),
-        )
-        .select_from(plan_attributes_table.join(filtered_plans, join_condition))
-        .group_by(filtered_plans.c.plan_id, filtered_plans.c.year)
-        .subquery()
-    )
-
-
-def _build_benefit_flag_subquery(filtered_plans):
-    benefit_plan_id = _plan_level_plan_id_column(plan_benefits_table)
-    join_condition = and_(
-        benefit_plan_id == filtered_plans.c.plan_id,
-        plan_benefits_table.c.year == filtered_plans.c.year,
-    )
-    return (
-        select(
-            filtered_plans.c.plan_id.label("plan_id"),
-            filtered_plans.c.year.label("year"),
-            _benefit_flag_case(ADULT_DENTAL_KEYWORDS).label("has_adult_dental"),
-            _benefit_flag_case(CHILD_DENTAL_KEYWORDS).label("has_child_dental"),
-            _benefit_flag_case(ADULT_VISION_KEYWORDS).label("has_adult_vision"),
-            _benefit_flag_case(CHILD_VISION_KEYWORDS).label("has_child_vision"),
-            _benefit_flag_case(TELEHEALTH_KEYWORDS).label("telehealth_supported"),
-        )
-        .select_from(plan_benefits_table.join(filtered_plans, join_condition))
-        .group_by(filtered_plans.c.plan_id, filtered_plans.c.year)
-        .subquery()
-    )
-
-
-def _attribute_text_case(attr_name, lower=False):
-    value = func.coalesce(plan_attributes_table.c.attr_value, "")
-    if lower:
-        value = func.lower(func.trim(value))
-    return func.max(
-        case(
-            (plan_attributes_table.c.attr_name == attr_name, value),
-            else_=None,
-        )
-    )
-
-
-def _attribute_boolean_case(attr_name, truthy_values=None, exact_match=None):
-    truthy_values = truthy_values or BOOLEAN_TRUE_VALUES
-    value = func.lower(func.trim(func.coalesce(plan_attributes_table.c.attr_value, "")))
-    condition = plan_attributes_table.c.attr_name == attr_name
-    if exact_match:
-        condition = and_(condition, value == exact_match)
-    else:
-        condition = and_(condition, value.in_(truthy_values))
-    return func.bool_or(
-        case(
-            (condition, True),
-            else_=None,
-        )
-    )
-
-
-def _attribute_numeric_case(attr_name):
-    raw_value = func.coalesce(plan_attributes_table.c.attr_value, "")
-    numeric_value = cast(
-        func.nullif(func.regexp_replace(raw_value, "[^0-9.]", "", "g"), ""),
-        Float,
-    )
-    return func.max(
-        case(
-            (plan_attributes_table.c.attr_name == attr_name, numeric_value),
-            else_=None,
-        )
-    )
-
-
-def _apply_bool_filter(filters, expression, value):
-    if value is None:
-        return
-    if value:
-        filters.append(expression.is_(True))
-    else:
-        filters.append(expression.is_(False))
 
 
 def _collect_price_bounds(result):
@@ -347,6 +178,79 @@ def _collect_price_bounds(result):
     return bounds
 
 
+def _default_boolean_facets():
+    return {name: {"true": 0, "false": 0, "null": 0} for name in SUMMARY_BOOLEAN_COLUMNS}
+
+
+def _empty_facets():
+    return {
+        "plan_types": [],
+        "metal_levels": [],
+        "csr_variations": [],
+        "boolean_filters": _default_boolean_facets(),
+    }
+
+
+async def _compute_facets(session, filtered_plans):
+    def _summary_join():
+        return filtered_plans.join(
+            plan_search_summary_table,
+            and_(
+                plan_search_summary_table.c.plan_id == filtered_plans.c.plan_id,
+                plan_search_summary_table.c.year == filtered_plans.c.year,
+            ),
+        )
+
+    async def _grouped_counts(column):
+        stmt = (
+            select(column.label("value"), func.count().label("count"))
+            .select_from(_summary_join())
+            .group_by(column)
+            .order_by(func.count().desc(), column)
+        )
+        result = await session.execute(stmt)
+        entries = []
+        for row in _result_rows(result):
+            row_dict = _row_to_dict(row)
+            value = row_dict.get("value")
+            if value in (None, ""):
+                continue
+            entries.append({"value": value, "count": int(row_dict.get("count") or 0)})
+        return entries
+
+    plan_type_facets = await _grouped_counts(plan_search_summary_table.c.plan_type)
+    metal_level_facets = await _grouped_counts(plan_search_summary_table.c.metal_level)
+    csr_facets = await _grouped_counts(plan_search_summary_table.c.csr_variation)
+
+    boolean_expressions = []
+    for name, column in SUMMARY_BOOLEAN_COLUMNS.items():
+        boolean_expressions.extend(
+            [
+                func.sum(case((column.is_(True), 1), else_=0)).label(f"{name}_true"),
+                func.sum(case((column.is_(False), 1), else_=0)).label(f"{name}_false"),
+                func.sum(case((column.is_(None), 1), else_=0)).label(f"{name}_null"),
+            ]
+        )
+    boolean_stmt = select(*boolean_expressions).select_from(_summary_join())
+    boolean_result = await session.execute(boolean_stmt)
+    boolean_rows = _result_rows(boolean_result)
+    boolean_row = _row_to_dict(boolean_rows[0]) if boolean_rows else {}
+    boolean_facets = _default_boolean_facets()
+    for name in SUMMARY_BOOLEAN_COLUMNS:
+        boolean_facets[name] = {
+            "true": int(boolean_row.get(f"{name}_true") or 0),
+            "false": int(boolean_row.get(f"{name}_false") or 0),
+            "null": int(boolean_row.get(f"{name}_null") or 0),
+        }
+
+    return {
+        "plan_types": plan_type_facets,
+        "metal_levels": metal_level_facets,
+        "csr_variations": csr_facets,
+        "boolean_filters": boolean_facets,
+    }
+
+
 def _normalize_attribute_map(attribute_map):
     cleaned = {}
     if not attribute_map:
@@ -363,6 +267,79 @@ def _normalize_attribute_map(attribute_map):
             entry["human_attr_name"] = attributes_labels[name]
         cleaned[name] = entry
     return cleaned
+
+
+def _get_list_param(args, name):
+    values = []
+    getlist = getattr(args, "getlist", None)
+    if callable(getlist):
+        raw_values = getlist(name)
+    else:
+        raw = args.get(name)
+        if raw is None:
+            raw_values = []
+        elif isinstance(raw, (list, tuple)):
+            raw_values = list(raw)
+        else:
+            raw_values = [raw]
+    for raw_value in raw_values:
+        if raw_value is None:
+            continue
+        if isinstance(raw_value, (list, tuple)):
+            tokens = raw_value
+        else:
+            tokens = str(raw_value).split(",")
+        for token in tokens:
+            cleaned = token.strip()
+            if cleaned:
+                values.append(cleaned)
+    return values
+
+
+def _summary_attributes_to_dict(payload):
+    if payload is None:
+        return {}
+    data = payload
+    if isinstance(payload, str):
+        try:
+            data = json.loads(payload)
+        except (TypeError, ValueError):
+            return {}
+    if not isinstance(data, list):
+        return {}
+    mapping = {}
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("attr_name")
+        if not name:
+            continue
+        mapping[name] = {"attr_value": entry.get("attr_value")}
+    return mapping
+
+
+def _summary_benefits_to_dict(payload):
+    if payload is None:
+        return {}
+    data = payload
+    if isinstance(payload, str):
+        try:
+            data = json.loads(payload)
+        except (TypeError, ValueError):
+            return {}
+    if not isinstance(data, list):
+        return {}
+    mapping = {}
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("benefit_name")
+        if not name:
+            continue
+        mapping[name] = dict(entry)
+        if name in benefits_labels:
+            mapping[name]["human_attr_name"] = benefits_labels[name]
+    return mapping
 
 
 async def _states_for_zip(session, zip_code: str) -> list[str]:
@@ -415,52 +392,6 @@ async def _states_for_zip(session, zip_code: str) -> list[str]:
     )
 
 
-async def _benefit_metadata_availability(
-    session,
-    specs: Sequence[tuple[str, Sequence[Sequence[str]] | Sequence[str]]],
-    states: Optional[Sequence[str]],
-    year: Optional[int],
-) -> Dict[str, bool]:
-    evaluated_specs = []
-    for key, keywords in specs:
-        condition = _keyword_condition(plan_benefits_table.c.benefit_name, keywords)
-        if condition is None:
-            continue
-        evaluated_specs.append((key, condition))
-
-    if not evaluated_specs:
-        return {}
-
-    join_condition = and_(
-        _plan_level_plan_id_column(plan_benefits_table) == plan_table.c.plan_id,
-        plan_benefits_table.c.year == plan_table.c.year,
-    )
-    select_columns = []
-    for key, condition in evaluated_specs:
-        covered = and_(plan_benefits_table.c.is_covered.is_(True), condition)
-        select_columns.append(
-            func.bool_or(
-                case(
-                    (covered, True),
-                    else_=None,
-                )
-            ).label(key)
-        )
-
-    stmt = select(*select_columns).select_from(plan_benefits_table.join(plan_table, join_condition))
-    if states:
-        stmt = stmt.where(plan_table.c.state.in_(list(states)))
-    if year is not None:
-        stmt = stmt.where(plan_table.c.year == year)
-
-    result = await session.execute(stmt)
-    row = result.first()
-    row_dict = _row_to_dict(row) if row else {}
-    availability = {}
-    for key, _ in evaluated_specs:
-        value = row_dict.get(key)
-        availability[key] = bool(value)
-    return availability
 
 
 @blueprint.get("/")
@@ -719,6 +650,11 @@ async def find_a_plan(request):
     deductible_max = _parse_float(args.get("deductible_max"), "deductible_max")
     moop_min = _parse_float(args.get("moop_min"), "moop_min")
     moop_max = _parse_float(args.get("moop_max"), "moop_max")
+    premium_min = _parse_float(args.get("premium_min"), "premium_min")
+    premium_max = _parse_float(args.get("premium_max"), "premium_max")
+    plan_types = [value.upper() for value in _get_list_param(args, "plan_types")]
+    metal_levels = _get_list_param(args, "metal_levels")
+    csr_variations = _get_list_param(args, "csr_variations")
 
     try:
         limit = int(limit_raw)
@@ -754,6 +690,13 @@ async def find_a_plan(request):
         except ValueError as exc:
             raise sanic.exceptions.BadRequest from exc
 
+    issuer_ids_param = []
+    for value in _get_list_param(args, "issuer_ids"):
+        try:
+            issuer_ids_param.append(int(value))
+        except ValueError as exc:
+            raise sanic.exceptions.BadRequest("issuer_ids must be integers") from exc
+
     if state and len(state) != 2:
         raise sanic.exceptions.BadRequest("state must be a 2-letter code")
 
@@ -761,8 +704,10 @@ async def find_a_plan(request):
 
     applied_filters: Dict[str, Any] = {}
     warnings: List[Dict[str, str]] = []
+    facets = _empty_facets()
 
     plan_filters = []
+    summary_filters = []
 
     if state:
         plan_filters.append(plan_table.c.state == state)
@@ -772,9 +717,17 @@ async def find_a_plan(request):
         plan_filters.append(plan_table.c.year == year)
         _append_filter(applied_filters, "year", year)
 
+    issuer_filters = []
     if issuer_id is not None:
-        plan_filters.append(plan_table.c.issuer_id == issuer_id)
-        _append_filter(applied_filters, "issuer_id", issuer_id)
+        issuer_filters.append(issuer_id)
+    issuer_filters.extend(issuer_ids_param)
+    issuer_filters = sorted(set(issuer_filters))
+    if issuer_filters:
+        plan_filters.append(plan_table.c.issuer_id.in_(issuer_filters))
+        if len(issuer_filters) == 1:
+            _append_filter(applied_filters, "issuer_id", issuer_filters[0])
+        else:
+            _append_filter(applied_filters, "issuer_ids", issuer_filters)
 
     if plan_id_filter:
         plan_filters.append(plan_table.c.plan_id.ilike(f"%{plan_id_filter}%"))
@@ -783,8 +736,6 @@ async def find_a_plan(request):
     if query_text:
         plan_filters.append(plan_table.c.marketing_name.ilike(f"%{query_text}%"))
         _append_filter(applied_filters, "q", query_text)
-
-    state_scope: Optional[List[str]] = [state] if state else None
 
     if zip_code:
         _append_filter(applied_filters, "zip_code", zip_code)
@@ -798,13 +749,13 @@ async def find_a_plan(request):
                     "total": 0,
                     "results": [],
                     "issuers": [],
+                    "facets": facets,
                     "applied_filters": applied_filters,
                     "warnings": warnings,
                 },
                 default=str,
             )
         plan_filters.append(plan_table.c.state.in_(zip_states))
-        state_scope = zip_states
 
     if rating_area:
         _append_filter(applied_filters, "rating_area", rating_area)
@@ -829,120 +780,73 @@ async def find_a_plan(request):
         price_subquery = select(plan_prices_table.c.plan_id).where(and_(*price_conditions))
         plan_filters.append(price_subquery.exists())
 
-    filtered_plan_stmt = select(plan_table.c.plan_id.label("plan_id"), plan_table.c.year.label("year"))
-    if plan_filters:
-        filtered_plan_stmt = filtered_plan_stmt.where(and_(*plan_filters))
-    filtered_plans = filtered_plan_stmt.cte("filtered_plans")
-
-    attrs_subq = _build_attribute_subquery(filtered_plans)
-    benefit_flags_subq = _build_benefit_flag_subquery(filtered_plans)
-
-    coverage_specs = [
-        ("has_adult_dental", ADULT_DENTAL_KEYWORDS),
-        ("has_child_dental", CHILD_DENTAL_KEYWORDS),
-        ("has_adult_vision", ADULT_VISION_KEYWORDS),
-        ("has_child_vision", CHILD_VISION_KEYWORDS),
-        ("telehealth_supported", TELEHEALTH_KEYWORDS),
-    ]
-    bool_filters_to_apply: Dict[str, bool] = {}
-    requested_specs = [
-        (key, keywords)
-        for key, keywords in coverage_specs
-        if bool_filter_inputs.get(key) is not None
-    ]
-    coverage_metadata = {}
-    if requested_specs:
-        coverage_metadata = await _benefit_metadata_availability(session, requested_specs, state_scope, year)
-    for key, _keywords in coverage_specs:
-        requested_value = bool_filter_inputs.get(key)
-        if requested_value is None:
-            continue
-        if not coverage_metadata.get(key):
-            warnings.append(
-                {
-                    "code": f"{key}_unsupported",
-                    "message": f"No coverage metadata available to evaluate '{key}' for the requested region/year.",
-                }
-            )
-            continue
-        bool_filters_to_apply[key] = requested_value
-        _append_filter(applied_filters, key, requested_value)
-
-    for key in ("is_hsa", "is_dental_only", "is_catastrophic", "is_on_exchange", "is_off_exchange"):
-        value = bool_filter_inputs.get(key)
+    for key, value in bool_filter_inputs.items():
         if value is None:
             continue
-        bool_filters_to_apply[key] = value
-        _append_filter(applied_filters, key, value)
-
-    plan_join = plan_table.join(
-        filtered_plans,
-        and_(
-            plan_table.c.plan_id == filtered_plans.c.plan_id,
-            plan_table.c.year == filtered_plans.c.year,
-        ),
-    )
-    from_clause = (
-        plan_join.outerjoin(
-            attrs_subq,
-            and_(plan_table.c.plan_id == attrs_subq.c.plan_id, plan_table.c.year == attrs_subq.c.year),
-        ).outerjoin(
-            benefit_flags_subq,
-            and_(plan_table.c.plan_id == benefit_flags_subq.c.plan_id, plan_table.c.year == benefit_flags_subq.c.year),
-        )
-    )
-
-    filters = []
-
-    column_map = {
-        "has_adult_dental": benefit_flags_subq.c.has_adult_dental,
-        "has_child_dental": benefit_flags_subq.c.has_child_dental,
-        "has_adult_vision": benefit_flags_subq.c.has_adult_vision,
-        "has_child_vision": benefit_flags_subq.c.has_child_vision,
-        "telehealth_supported": benefit_flags_subq.c.telehealth_supported,
-        "is_hsa": attrs_subq.c.is_hsa,
-        "is_dental_only": attrs_subq.c.is_dental_only,
-        "is_catastrophic": attrs_subq.c.is_catastrophic,
-        "is_on_exchange": attrs_subq.c.is_on_exchange,
-        "is_off_exchange": attrs_subq.c.is_off_exchange,
-    }
-
-    for key, value in bool_filters_to_apply.items():
-        column = column_map.get(key)
+        column = SUMMARY_BOOLEAN_COLUMNS.get(key)
         if column is None:
             continue
-        _apply_bool_filter(filters, column, value)
+        summary_filters.append(column.is_(True) if value else column.is_(False))
+        _append_filter(applied_filters, key, value)
 
     if deductible_min is not None:
-        filters.append(attrs_subq.c.deductible_inn_individual >= deductible_min)
+        summary_filters.append(plan_search_summary_table.c.deductible_inn_individual >= deductible_min)
         _append_filter(applied_filters, "deductible_min", deductible_min)
     if deductible_max is not None:
-        filters.append(attrs_subq.c.deductible_inn_individual <= deductible_max)
+        summary_filters.append(plan_search_summary_table.c.deductible_inn_individual <= deductible_max)
         _append_filter(applied_filters, "deductible_max", deductible_max)
     if moop_min is not None:
-        filters.append(attrs_subq.c.moop_inn_individual >= moop_min)
+        summary_filters.append(plan_search_summary_table.c.moop_inn_individual >= moop_min)
         _append_filter(applied_filters, "moop_min", moop_min)
     if moop_max is not None:
-        filters.append(attrs_subq.c.moop_inn_individual <= moop_max)
+        summary_filters.append(plan_search_summary_table.c.moop_inn_individual <= moop_max)
         _append_filter(applied_filters, "moop_max", moop_max)
+    if premium_min is not None:
+        summary_filters.append(plan_search_summary_table.c.premium_min >= premium_min)
+        _append_filter(applied_filters, "premium_min", premium_min)
+    if premium_max is not None:
+        summary_filters.append(plan_search_summary_table.c.premium_max <= premium_max)
+        _append_filter(applied_filters, "premium_max", premium_max)
+    if plan_types:
+        summary_filters.append(plan_search_summary_table.c.plan_type.in_(plan_types))
+        _append_filter(applied_filters, "plan_types", plan_types)
+    if metal_levels:
+        lowered_levels = [value.lower() for value in metal_levels]
+        summary_filters.append(func.lower(plan_search_summary_table.c.metal_level).in_(lowered_levels))
+        _append_filter(applied_filters, "metal_levels", metal_levels)
+    if csr_variations:
+        lowered_csr = [value.lower() for value in csr_variations]
+        summary_filters.append(func.lower(plan_search_summary_table.c.csr_variation).in_(lowered_csr))
+        _append_filter(applied_filters, "csr_variations", csr_variations)
 
-    final_condition = and_(*filters) if filters else None
+    join_condition = and_(
+        plan_table.c.plan_id == plan_search_summary_table.c.plan_id,
+        plan_table.c.year == plan_search_summary_table.c.year,
+    )
+    base_join = plan_table.join(plan_search_summary_table, join_condition)
 
-    count_subquery = select(plan_table.c.plan_id, plan_table.c.year).select_from(from_clause)
-    if final_condition is not None:
-        count_subquery = count_subquery.where(final_condition)
-    count_stmt = select(func.count()).select_from(count_subquery.distinct().subquery())
+    combined_filters = plan_filters + summary_filters
+    filtered_plan_stmt = select(plan_table.c.plan_id.label("plan_id"), plan_table.c.year.label("year")).select_from(
+        base_join
+    )
+    if combined_filters:
+        filtered_plan_stmt = filtered_plan_stmt.where(and_(*combined_filters))
+    filtered_plans = filtered_plan_stmt.distinct().cte("filtered_plans")
 
-    total_result = await session.execute(count_stmt)
+    total_result = await session.execute(select(func.count()).select_from(filtered_plans))
     total = _result_scalar(total_result) or 0
+    if total > 0:
+        facets = await _compute_facets(session, filtered_plans)
 
     order_map = {
         "plan_id": plan_table.c.plan_id,
         "marketing_name": plan_table.c.marketing_name,
         "state": plan_table.c.state,
         "year": plan_table.c.year,
-        "deductible": attrs_subq.c.deductible_inn_individual,
-        "moop": attrs_subq.c.moop_inn_individual,
+        "deductible": plan_search_summary_table.c.deductible_inn_individual,
+        "moop": plan_search_summary_table.c.moop_inn_individual,
+        "premium_min": plan_search_summary_table.c.premium_min,
+        "premium_max": plan_search_summary_table.c.premium_max,
     }
     order_column = order_map.get(order_by, plan_table.c.plan_id)
     order_expression = order_column.desc() if order == "desc" else order_column.asc()
@@ -950,24 +854,42 @@ async def find_a_plan(request):
 
     select_columns = [
         plan_table,
-        attrs_subq.c.market_coverage,
-        attrs_subq.c.is_on_exchange,
-        attrs_subq.c.is_off_exchange,
-        attrs_subq.c.is_hsa,
-        attrs_subq.c.is_dental_only,
-        attrs_subq.c.is_catastrophic,
-        attrs_subq.c.deductible_inn_individual,
-        attrs_subq.c.moop_inn_individual,
-        benefit_flags_subq.c.has_adult_dental,
-        benefit_flags_subq.c.has_child_dental,
-        benefit_flags_subq.c.has_adult_vision,
-        benefit_flags_subq.c.has_child_vision,
-        benefit_flags_subq.c.telehealth_supported,
+        plan_search_summary_table.c.market_coverage,
+        plan_search_summary_table.c.is_on_exchange,
+        plan_search_summary_table.c.is_off_exchange,
+        plan_search_summary_table.c.is_hsa,
+        plan_search_summary_table.c.is_dental_only,
+        plan_search_summary_table.c.is_catastrophic,
+        plan_search_summary_table.c.deductible_inn_individual,
+        plan_search_summary_table.c.moop_inn_individual,
+        plan_search_summary_table.c.has_adult_dental,
+        plan_search_summary_table.c.has_child_dental,
+        plan_search_summary_table.c.has_adult_vision,
+        plan_search_summary_table.c.has_child_vision,
+        plan_search_summary_table.c.telehealth_supported,
+        plan_search_summary_table.c.premium_min,
+        plan_search_summary_table.c.premium_max,
+        plan_search_summary_table.c.plan_type,
+        plan_search_summary_table.c.metal_level,
+        plan_search_summary_table.c.csr_variation,
+        plan_search_summary_table.c.attributes,
+        plan_search_summary_table.c.plan_benefits,
     ]
 
+    from_clause = (
+        plan_table.join(
+            filtered_plans,
+            and_(plan_table.c.plan_id == filtered_plans.c.plan_id, plan_table.c.year == filtered_plans.c.year),
+        ).join(
+            plan_search_summary_table,
+            and_(
+                plan_search_summary_table.c.plan_id == filtered_plans.c.plan_id,
+                plan_search_summary_table.c.year == filtered_plans.c.year,
+            ),
+        )
+    )
+
     data_stmt = select(*select_columns).select_from(from_clause)
-    if final_condition is not None:
-        data_stmt = data_stmt.where(final_condition)
     data_stmt = data_stmt.order_by(order_expression, *secondary_order).offset(offset).limit(limit)
     data_result = await session.execute(data_stmt)
     plans_rows = _result_rows(data_result)
@@ -982,11 +904,9 @@ async def find_a_plan(request):
         if not plan_id or plan_year is None:
             continue
         plan_key = (plan_id, plan_year)
-        entry = {
-            **row_dict,
+        entry = {key: value for key, value in row_dict.items() if key not in {"attributes", "plan_benefits"}}
+        entry.update({
             "price_range": {"min": None, "max": None},
-            "attributes": {},
-            "plan_benefits": {},
             "has_adult_dental": row_dict.get("has_adult_dental"),
             "has_child_dental": row_dict.get("has_child_dental"),
             "has_adult_vision": row_dict.get("has_adult_vision"),
@@ -1000,14 +920,28 @@ async def find_a_plan(request):
             "market_coverage": row_dict.get("market_coverage"),
             "deductible_inn_individual": row_dict.get("deductible_inn_individual"),
             "moop_inn_individual": row_dict.get("moop_inn_individual"),
-        }
+            "premium_min": row_dict.get("premium_min"),
+            "premium_max": row_dict.get("premium_max"),
+            "plan_type": row_dict.get("plan_type"),
+            "metal_level": row_dict.get("metal_level"),
+            "csr_variation": row_dict.get("csr_variation"),
+        })
+        entry["attributes"] = _normalize_attribute_map(_summary_attributes_to_dict(row_dict.get("attributes")))
+        entry["plan_benefits"] = _summary_benefits_to_dict(row_dict.get("plan_benefits"))
         results.append(entry)
         result_lookup[plan_key] = entry
         plan_keys.append(plan_key)
 
     if not results:
         return response.json(
-            {"total": int(total), "results": [], "issuers": [], "applied_filters": applied_filters, "warnings": warnings},
+            {
+                "total": int(total),
+                "results": [],
+                "issuers": [],
+                "facets": facets,
+                "applied_filters": applied_filters,
+                "warnings": warnings,
+            },
             default=str,
         )
 
@@ -1037,72 +971,24 @@ async def find_a_plan(request):
                 "min": price_info["min"],
                 "max": price_info["max"],
             }
-        entry["attributes"] = _normalize_attribute_map(entry.get("attributes"))
 
-    attribute_filters = []
-    benefit_filters = []
-    if plan_ids:
-        attribute_filters.append(
-            or_(
-                plan_attributes_table.c.plan_id.in_(plan_ids),
-                func.left(plan_attributes_table.c.full_plan_id, 14).in_(plan_ids),
-            )
+    issuer_join = (
+        plan_table.join(
+            filtered_plans,
+            and_(plan_table.c.plan_id == filtered_plans.c.plan_id, plan_table.c.year == filtered_plans.c.year),
+        ).join(
+            issuer_table,
+            issuer_table.c.issuer_id == plan_table.c.issuer_id,
+            isouter=True,
         )
-        benefit_filters.append(
-            or_(
-                plan_benefits_table.c.plan_id.in_(plan_ids),
-                func.left(plan_benefits_table.c.full_plan_id, 14).in_(plan_ids),
-            )
-        )
-    if plan_years:
-        attribute_filters.append(plan_attributes_table.c.year.in_(plan_years))
-        benefit_filters.append(plan_benefits_table.c.year.in_(plan_years))
-
-    if attribute_filters:
-        attr_stmt = select(plan_attributes_table).where(and_(*attribute_filters))
-        attr_result = await session.execute(attr_stmt)
-        for row in _result_rows(attr_result):
-            row_dict = _row_to_dict(row)
-            plan_id = row_dict.get("plan_id") or (row_dict.get("full_plan_id") or "")[:14]
-            plan_year = row_dict.get("year")
-            target = result_lookup.get((plan_id, plan_year))
-            if not target:
-                continue
-            attr_name = row_dict.get("attr_name")
-            if attr_name:
-                entry = {"attr_value": row_dict.get("attr_value")}
-                if attr_name in attributes_labels:
-                    entry["human_attr_name"] = attributes_labels[attr_name]
-                target["attributes"][attr_name] = entry
-
-    if benefit_filters:
-        benefits_stmt = select(plan_benefits_table).where(and_(*benefit_filters))
-        benefits_result = await session.execute(benefits_stmt)
-        for row in _result_rows(benefits_result):
-            row_dict = _row_to_dict(row)
-            plan_id = row_dict.get("plan_id") or (row_dict.get("full_plan_id") or "")[:14]
-            plan_year = row_dict.get("year")
-            target = result_lookup.get((plan_id, plan_year))
-            if not target:
-                continue
-            benefit_name = row_dict.get("benefit_name")
-            if benefit_name:
-                benefit_data = dict(row_dict)
-                benefit_data["benefit_name"] = benefit_name
-                target["plan_benefits"][benefit_name] = benefit_data
-
-    issuer_join = from_clause.join(
-        issuer_table, issuer_table.c.issuer_id == plan_table.c.issuer_id, isouter=True
     )
     issuer_stmt = select(
         plan_table.c.issuer_id.label("issuer_id"),
         func.max(issuer_table.c.issuer_name).label("issuer_name"),
-        func.count(func.distinct(plan_table.c.plan_id)).label("plan_count"),
+        func.count().label("plan_count"),
     ).select_from(issuer_join)
-    if final_condition is not None:
-        issuer_stmt = issuer_stmt.where(final_condition)
     issuer_stmt = issuer_stmt.group_by(plan_table.c.issuer_id).order_by(
-        func.count(func.distinct(plan_table.c.plan_id)).desc(), plan_table.c.issuer_id
+        func.count().desc(), plan_table.c.issuer_id
     )
     issuer_result = await session.execute(issuer_stmt)
     issuers = []
@@ -1121,12 +1007,12 @@ async def find_a_plan(request):
             "total": int(total),
             "results": results,
             "issuers": issuers,
+            "facets": facets,
             "applied_filters": applied_filters,
             "warnings": warnings,
         },
         default=str,
     )
-
 
 @blueprint.get("/price/<plan_id>", name="get_price_plan_by_plan_id")
 @blueprint.get("/price/<plan_id>/year", name="get_price_plan_by_plan_id_and_year")
@@ -1152,6 +1038,70 @@ async def get_price_plan(request, plan_id, year=None, variant=None):
     result = await session.execute(stmt)
     data = [_row_to_dict(row) for row in _result_rows(result)]
     return response.json(data, default=str)
+
+
+@blueprint.post("/price/bulk", name="get_price_plans_bulk")
+async def get_price_plans_bulk(request):
+    session = _get_session(request)
+    payload = request.json or {}
+    if not isinstance(payload, dict):
+        raise sanic.exceptions.BadRequest("Request body must be a JSON object")
+
+    raw_plan_ids = payload.get("plan_ids")
+    if not isinstance(raw_plan_ids, (list, tuple, set)):
+        raise sanic.exceptions.BadRequest("plan_ids must be an array of plan IDs")
+
+    plan_ids = []
+    for value in raw_plan_ids:
+        if value is None:
+            continue
+        plan_ids.append(str(value).strip())
+    plan_ids = [pid for pid in plan_ids if pid]
+    if not plan_ids:
+        raise sanic.exceptions.BadRequest("plan_ids cannot be empty")
+
+    year = payload.get("year")
+    if year is not None:
+        try:
+            year = int(year)
+        except (TypeError, ValueError) as exc:
+            raise sanic.exceptions.BadRequest("year must be numeric") from exc
+
+    age = payload.get("age")
+    if age is not None:
+        try:
+            age = int(age)
+        except (TypeError, ValueError) as exc:
+            raise sanic.exceptions.BadRequest("age must be numeric") from exc
+
+    rating_area = payload.get("rating_area")
+    if rating_area is not None:
+        rating_area = str(rating_area).strip()
+        if not rating_area:
+            rating_area = None
+
+    stmt = select(plan_prices_table).where(plan_prices_table.c.plan_id.in_(plan_ids))
+    if year is not None:
+        stmt = stmt.where(plan_prices_table.c.year == year)
+    if rating_area:
+        stmt = stmt.where(plan_prices_table.c.rating_area_id == rating_area)
+    if age is not None:
+        stmt = stmt.where(
+            and_(plan_prices_table.c.min_age <= age, plan_prices_table.c.max_age >= age)
+        )
+
+    result = await session.execute(stmt)
+    rows = [_row_to_dict(row) for row in _result_rows(result)]
+
+    data = {pid: [] for pid in plan_ids}
+    for row in rows:
+        pid = row.get("plan_id")
+        if pid in data:
+            data[pid].append(row)
+
+    missing = [pid for pid, entries in data.items() if not entries]
+
+    return response.json({"results": data, "missing": missing}, default=str)
 
 
 @blueprint.get("/id/<plan_id>", name="get_plan_by_plan_id")

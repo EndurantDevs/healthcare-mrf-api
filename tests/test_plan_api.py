@@ -23,6 +23,7 @@ from api.endpoint.plan import (
     get_networks_by_checksums,
     get_plan,
     get_price_plan,
+    get_price_plans_bulk,
     index_status,
 )
 
@@ -60,15 +61,30 @@ class FakeSession:
         return FakeResult()
 
 
-def make_request(results, args=None, app_config=None):
+def make_request(results, args=None, json_data=None, app_config=None):
     session = FakeSession(results)
     return types.SimpleNamespace(
         ctx=types.SimpleNamespace(sa_session=session),
         args=args or {},
+        json=json_data,
         app=types.SimpleNamespace(
             config=app_config or {"RELEASE": "dev", "ENVIRONMENT": "test"}
         ),
     )
+
+
+def make_facet_results(
+    plan_types=None,
+    metal_levels=None,
+    csr_variations=None,
+    boolean_counts=None,
+):
+    return [
+        FakeResult(rows=plan_types or []),
+        FakeResult(rows=metal_levels or []),
+        FakeResult(rows=csr_variations or []),
+        FakeResult(rows=[boolean_counts or {}]),
+    ]
 
 
 @pytest.mark.asyncio
@@ -282,31 +298,51 @@ async def test_plan_find_plan_success():
     }
     request = make_request(
         [
-            FakeResult(scalar=1),
-            FakeResult(rows=[plan_entry]),
-            FakeResult(rows=[{"plan_id": "P123", "year": 2024, "individual_rate": 100.0, "couple": 200.0}]),
-            FakeResult(rows=[{"plan_id": "P123", "year": 2024, "attr_name": "Coverage", "attr_value": "Standard"}]),
+            FakeResult(rows=[(1,)], scalar=1),
+            *make_facet_results(),
             FakeResult(
                 rows=[
                     {
-                        "plan_id": "P123",
-                        "year": 2024,
-                        "benefit_name": "Primary Care Visit",
-                        "copay_inn_tier1": "No Charge",
-                        "coins_inn_tier1": "No Charge",
-                        "copay_inn_tier2": "Not Applicable",
-                        "coins_inn_tier2": "Not Applicable",
-                        "copay_outof_net": "Not Applicable",
-                        "coins_outof_net": "Not Applicable",
+                        **plan_entry,
+                        "market_coverage": "On Exchange",
+                        "is_on_exchange": True,
+                        "is_off_exchange": False,
+                        "is_hsa": False,
+                        "is_dental_only": False,
+                        "is_catastrophic": False,
+                        "has_adult_dental": True,
+                        "has_child_dental": False,
+                        "has_adult_vision": False,
+                        "has_child_vision": False,
+                        "telehealth_supported": False,
+                        "deductible_inn_individual": 500.0,
+                        "moop_inn_individual": 3000.0,
+                        "attributes": [
+                            {"attr_name": "Coverage", "attr_value": "Standard"},
+                        ],
+                        "plan_benefits": [
+                            {
+                                "benefit_name": "Primary Care Visit",
+                                "copay_inn_tier1": "No Charge",
+                                "coins_inn_tier1": "No Charge",
+                                "copay_inn_tier2": "Not Applicable",
+                                "coins_inn_tier2": "Not Applicable",
+                                "copay_outof_net": "Not Applicable",
+                                "coins_outof_net": "Not Applicable",
+                            }
+                        ],
                     }
                 ]
             ),
+            FakeResult(rows=[{"plan_id": "P123", "year": 2024, "individual_rate": 100.0, "couple": 200.0}]),
+            FakeResult(rows=[{"issuer_id": 42, "issuer_name": "Issuer X", "plan_count": 1}]),
         ],
         args={"year": "2024", "age": "30", "rating_area": "A", "limit": "1", "page": "1"},
     )
     response = await find_a_plan(request)
     payload = json.loads(response.body)
     assert payload["total"] == 1
+    assert payload["facets"]["plan_types"] == []
     result = payload["results"][0]
     assert result["price_range"] == {"min": 100.0, "max": 200.0}
     assert result["attributes"]["Coverage"]["attr_value"] == "Standard"
@@ -441,20 +477,45 @@ async def test_find_a_plan_success():
     request = make_request(
         [
             FakeResult(rows=[(5,)], scalar=5),
+            *make_facet_results(),
             FakeResult(
                 rows=[
                     {
                         "plan_id": "P1",
                         "year": 2024,
+                        "issuer_id": 42,
+                        "state": "TX",
                         "has_adult_dental": True,
+                        "has_child_dental": False,
+                        "has_adult_vision": None,
+                        "has_child_vision": None,
+                        "telehealth_supported": None,
+                        "is_hsa": False,
+                        "is_dental_only": False,
+                        "is_catastrophic": False,
+                        "is_on_exchange": True,
+                        "is_off_exchange": False,
+                        "market_coverage": "On Exchange",
                         "deductible_inn_individual": 500.0,
                         "moop_inn_individual": 3000.0,
+                        "attributes": [
+                            {"attr_name": "FormularyId", "attr_value": "val"},
+                        ],
+                        "plan_benefits": [
+                            {
+                                "benefit_name": "benefit_name",
+                                "copay_inn_tier1": "10",
+                                "coins_inn_tier1": "20",
+                                "copay_inn_tier2": "Not Applicable",
+                                "coins_inn_tier2": None,
+                                "copay_outof_net": "30",
+                                "coins_outof_net": "40",
+                            }
+                        ],
                     }
                 ]
             ),
             FakeResult(rows=[{"plan_id": "P1", "year": 2024, "individual_rate": 10, "couple": 20}]),
-            FakeResult(rows=[{"plan_id": "P1", "year": 2024, "attr_name": "FormularyId", "attr_value": "val"}]),
-            FakeResult(rows=[{"plan_id": "P1", "year": 2024, "benefit_name": "benefit_name", "copay_inn_tier1": "10", "coins_inn_tier1": "20", "copay_inn_tier2": "Not Applicable", "coins_inn_tier2": None, "copay_outof_net": "30", "coins_outof_net": "40"}]),
             FakeResult(rows=[{"issuer_id": 42, "issuer_name": "Issuer X", "plan_count": 1}]),
         ],
         args={"age": "30", "year": "2024", "order": "invalid"},
@@ -462,6 +523,7 @@ async def test_find_a_plan_success():
     response = await find_a_plan(request)
     payload = json.loads(response.body)
     assert payload["total"] == 5
+    assert "facets" in payload
     assert payload["issuers"][0]["issuer_id"] == 42
     assert payload["applied_filters"]["age"] == 30
     assert payload["results"][0]["has_adult_dental"] is True
@@ -486,8 +548,105 @@ async def test_find_a_plan_no_results():
     assert payload["total"] == 0
     assert payload["results"] == []
     assert payload["issuers"] == []
+    assert payload["facets"]["plan_types"] == []
     assert payload["warnings"] == []
     assert payload["applied_filters"]["limit"] == 100
+    assert payload["facets"]["plan_types"] == []
+
+
+@pytest.mark.asyncio
+async def test_find_a_plan_with_new_filters():
+    plan_entry = {
+        "plan_id": "PX",
+        "year": 2024,
+        "issuer_id": 42,
+        "state": "TX",
+        "premium_min": 150.0,
+        "premium_max": 200.0,
+        "plan_type": "HMO",
+        "metal_level": "Bronze",
+        "csr_variation": "Standard",
+        "has_adult_dental": False,
+        "has_child_dental": False,
+        "has_adult_vision": False,
+        "has_child_vision": False,
+        "telehealth_supported": False,
+        "is_hsa": False,
+        "is_dental_only": False,
+        "is_catastrophic": False,
+        "is_on_exchange": True,
+        "is_off_exchange": False,
+        "market_coverage": "Individual",
+        "deductible_inn_individual": 500.0,
+        "moop_inn_individual": 3000.0,
+        "attributes": [],
+        "plan_benefits": [],
+    }
+    request = make_request(
+        [
+            FakeResult(rows=[(1,)], scalar=1),
+            *make_facet_results(),
+            FakeResult(rows=[plan_entry]),
+            FakeResult(rows=[{"plan_id": "PX", "year": 2024, "individual_rate": 150.0}]),
+            FakeResult(rows=[{"issuer_id": 42, "issuer_name": "Issuer", "plan_count": 1}]),
+        ],
+        args={
+            "plan_types": "HMO",
+            "metal_levels": "bronze",
+            "csr_variations": "standard",
+            "premium_min": "100",
+            "premium_max": "250",
+            "issuer_ids": "42",
+        },
+    )
+    response = await find_a_plan(request)
+    payload = json.loads(response.body)
+    assert payload["results"][0]["plan_type"] == "HMO"
+    assert payload["applied_filters"]["plan_types"] == ["HMO"]
+    assert payload["applied_filters"].get("issuer_ids") in (None, [42])
+    assert payload["applied_filters"]["issuer_id"] == 42
+
+
+@pytest.mark.asyncio
+async def test_find_a_plan_returns_facets():
+    facet_rows = make_facet_results(
+        plan_types=[{"value": "HMO", "count": 2}],
+        metal_levels=[{"value": "BRONZE", "count": 2}],
+        csr_variations=[{"value": "Standard", "count": 2}],
+        boolean_counts={
+            "has_adult_dental_true": 1,
+            "has_adult_dental_false": 1,
+            "is_hsa_true": 2,
+            "is_hsa_false": 0,
+        },
+    )
+    request = make_request(
+        [
+            FakeResult(rows=[(2,)], scalar=2),
+            *facet_rows,
+            FakeResult(
+                rows=[
+                    {
+                        "plan_id": "PFACET",
+                        "year": 2024,
+                        "issuer_id": 99,
+                        "state": "IL",
+                        "attributes": [],
+                        "plan_benefits": [],
+                    }
+                ]
+            ),
+            FakeResult(rows=[]),
+            FakeResult(rows=[{"issuer_id": 99, "issuer_name": "Issuer Facet", "plan_count": 2}]),
+        ],
+        args={},
+    )
+    response = await find_a_plan(request)
+    payload = json.loads(response.body)
+    assert payload["facets"]["plan_types"][0] == {"value": "HMO", "count": 2}
+    assert payload["facets"]["metal_levels"][0] == {"value": "BRONZE", "count": 2}
+    assert payload["facets"]["boolean_filters"]["has_adult_dental"]["true"] == 1
+    assert payload["facets"]["boolean_filters"]["is_hsa"]["true"] == 2
 
 
 @pytest.mark.asyncio
@@ -505,6 +664,7 @@ async def test_find_a_plan_zip_warning():
     assert payload["total"] == 0
     assert payload["warnings"][0]["code"] == "zip_not_found"
     assert payload["applied_filters"]["zip_code"] == "99999"
+    assert payload["facets"]["plan_types"] == []
 
 
 @pytest.mark.asyncio
@@ -516,6 +676,33 @@ async def test_get_price_plan_with_year():
     response = await get_price_plan(request, "P1", year="2024")
     payload = json.loads(response.body)
     assert payload == [{"plan_id": "P1"}]
+
+
+@pytest.mark.asyncio
+async def test_get_price_plans_bulk_success():
+    request = make_request(
+        [
+            FakeResult(
+                rows=[
+                    {"plan_id": "P1", "year": 2024, "rate": 100},
+                    {"plan_id": "P2", "year": 2024, "rate": 200},
+                ]
+            )
+        ],
+        json_data={"plan_ids": ["P1", "P2", "P3"], "year": 2024, "age": 30, "rating_area": "A"},
+    )
+    response = await get_price_plans_bulk(request)
+    payload = json.loads(response.body)
+    assert payload["results"]["P1"][0]["plan_id"] == "P1"
+    assert payload["results"]["P2"][0]["plan_id"] == "P2"
+    assert payload["missing"] == ["P3"]
+
+
+@pytest.mark.asyncio
+async def test_get_price_plans_bulk_requires_ids():
+    request = make_request([], json_data={})
+    with pytest.raises(sanic.exceptions.BadRequest):
+        await get_price_plans_bulk(request)
 
 
 @pytest.mark.asyncio
@@ -779,7 +966,7 @@ async def test_find_a_plan_skips_missing_plan_id():
     request = make_request(
         [
             FakeResult(rows=[(0,)]),
-            FakeResult(rows=[{"plan_id": None}]),
+            FakeResult(rows=[{"plan_id": None, "year": 2024, "attributes": [], "plan_benefits": []}]),
         ],
         args={},
     )
@@ -840,23 +1027,24 @@ async def test_find_a_plan_invalid_limit_page():
     assert payload["results"] == []
     assert payload["applied_filters"]["limit"] == 100
     assert payload["applied_filters"]["page"] == 1
+    assert "facets" in payload
 
 
 @pytest.mark.asyncio
-async def test_find_a_plan_reports_missing_benefit_metadata():
+async def test_find_a_plan_boolean_filter_without_metadata():
     request = make_request(
         [
-            FakeResult(rows=[], scalar=0),  # metadata lookup
-            FakeResult(rows=[(0,)]),  # count
-            FakeResult(rows=[]),  # data
+            FakeResult(rows=[(0,)]),
+            FakeResult(rows=[]),
         ],
         args={"has_adult_dental": "true"},
     )
     response = await find_a_plan(request)
     payload = json.loads(response.body)
     assert payload["total"] == 0
-    assert payload["warnings"][0]["code"] == "has_adult_dental_unsupported"
-    assert "has_adult_dental" not in payload["applied_filters"]
+    assert payload["warnings"] == []
+    assert payload["applied_filters"]["has_adult_dental"] is True
+    assert "facets" in payload
 
 
 def test_result_scalar_empty_iterable():
