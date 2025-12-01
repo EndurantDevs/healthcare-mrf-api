@@ -1471,21 +1471,34 @@ async def init_file(ctx, task=None):
                             count += 1
                             continue
 
-                        obj = {}
-                        obj["state"] = row[0].upper()
-                        obj["issuer_id"] = int(row[1])
-                        obj["issuer_marketing_name"] = ""
+                        obj = {
+                            "state": row[0].upper(),
+                            "issuer_id": int(row[1]),
+                            "issuer_marketing_name": "",
+                            "data_contact_email": (row[3] or "").strip() if row[3] else "",
+                        }
                         issuer_stmt = select(myplantransparency.issuer_name).where(
                             myplantransparency.issuer_id == obj["issuer_id"]
                         )
                         issuer_name = await db.scalar(issuer_stmt)
                         obj["issuer_name"] = issuer_name if issuer_name else "N/A"
-                        obj["data_contact_email"] = row[3]
                         for single_url in row_urls:
                             obj["mrf_url"] = single_url
                             obj_list.append(obj.copy())
                             url2issuer.setdefault(single_url, []).append(obj["issuer_id"])
                             url_list.add(single_url)
+                            existing_issuer = issuer_list.get(obj["issuer_id"])
+                            if existing_issuer:
+                                if not existing_issuer.get("mrf_url"):
+                                    existing_issuer["mrf_url"] = single_url
+                                if obj["data_contact_email"] and not existing_issuer.get("data_contact_email"):
+                                    existing_issuer["data_contact_email"] = obj["data_contact_email"]
+                                if obj["issuer_name"] and not existing_issuer.get("issuer_name"):
+                                    existing_issuer["issuer_name"] = obj["issuer_name"]
+                                if obj["issuer_marketing_name"] and not existing_issuer.get("issuer_marketing_name"):
+                                    existing_issuer["issuer_marketing_name"] = obj["issuer_marketing_name"]
+                            else:
+                                issuer_list[obj["issuer_id"]] = obj.copy()
                     count += 1
 
                 # obj_list mirrors legacy behaviour (kept for potential reuse), but inserts are handled via issuer_list.

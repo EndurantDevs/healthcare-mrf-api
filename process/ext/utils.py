@@ -17,7 +17,7 @@ from aioshutil import copyfile
 from arq import Retry
 from asyncpg.exceptions import (CardinalityViolationError, InterfaceError,
                                 InvalidColumnReferenceError,
-                                UniqueViolationError)
+                                UndefinedTableError, UniqueViolationError)
 from dateutil.parser import parse as parse_date
 from fastcrc import crc16, crc32
 from sqlalchemy import Index, and_, inspect
@@ -402,6 +402,9 @@ async def push_objects(obj_list, cls, rewrite=False):
         except ValueError as exc:
             print(f"INPUT arr: {obj_list}")
             print(exc)
+        except UndefinedTableError:
+            await db.create_table(cls.__table__, checkfirst=True)
+            return await push_objects(obj_list, cls, rewrite=rewrite)
         except (UniqueViolationError, NotImplementedError, InvalidColumnReferenceError, CardinalityViolationError, InterfaceError) as err:
             print(f"copy_records_to_table fallback due to {err}")
 
