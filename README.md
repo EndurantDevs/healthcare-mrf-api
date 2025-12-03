@@ -26,9 +26,9 @@ Some plan info (Put your Plan ID): ``http://127.0.0.1:8085/api/v1/plan/id/99999G
 
 ## Additional Info
 
-Please check [Healthcare Machine Readable Files Import Data]([https://pharmacy-near-me.com/healthcare-data/](https://www.healthporta.com/healthcare-data/)) Status Page. It shows the work of the Importer with status of Data from Healthcare Issuers (Insurance companies/agents).
+Please check [Healthcare Machine Readable Files Import Data](https://www.healthporta.com/healthcare-data/) Status Page. It shows the work of the Importer with status of Data from Healthcare Issuers (Insurance companies/agents).
 
-Project by [Pharmacy Near Me](https://pharmacy-near-me.com/) & [HealthPorta]([https://www.healthporta.com/](https://www.healthporta.com/about-us))
+Project by [Pharmacy Near Me](https://pharmacy-near-me.com/) & [HealthPorta](https://www.healthporta.com/about-us)
 
 For testing purposes the API works and getting heavily tested in [Drugs Discount Card](https://pharmacy-near-me.com/drug-discount-card/)
 
