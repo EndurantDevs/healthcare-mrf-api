@@ -503,6 +503,7 @@ async def get_all(request):
         has_insurance = filters.get("has_insurance")
         city = filters.get("city")
         state = filters.get("state")
+
         taxonomy_filters = []
         if classification:
             taxonomy_filters.append("classification = :classification")
@@ -533,22 +534,33 @@ async def get_all(request):
         taxonomy_conditions = " AND ".join(taxonomy_filters) if taxonomy_filters else "1=1"
         taxonomy_subquery = _taxonomy_codes_subquery(taxonomy_conditions)
 
-        query = text(
-            f"""
-            WITH sub_s AS (
-                SELECT b.npi AS npi_code
-                  FROM mrf.npi AS b
-                  JOIN (
-                      SELECT c.npi
-                        FROM mrf.npi_address AS c,
-                             {taxonomy_subquery}
-                       WHERE {' AND '.join(address_where)}
-                  ) AS addr ON b.npi = addr.npi
-                 {"WHERE " + name_clause if name_clause else ""}
+        if names_like:
+            query = text(
+                f"""
+                WITH sub_s AS (
+                    SELECT b.npi AS npi_code
+                      FROM mrf.npi AS b
+                      JOIN (
+                          SELECT c.npi
+                            FROM mrf.npi_address AS c,
+                                 {taxonomy_subquery}
+                           WHERE {' AND '.join(address_where)}
+                      ) AS addr ON b.npi = addr.npi
+                     {"WHERE " + name_clause if name_clause else ""}
+                )
+                SELECT COUNT(DISTINCT npi_code) FROM sub_s
+                """
             )
-            SELECT COUNT(DISTINCT npi_code) FROM sub_s
-            """
-        )
+        else:
+            query = text(
+                f"""
+                SELECT COUNT(DISTINCT c.npi)
+                  FROM mrf.npi_address AS c,
+                       {taxonomy_subquery}
+                 WHERE {' AND '.join(address_where)}
+                """
+            )
+
         query_params = {
             "classification": classification,
             "section": section,
@@ -563,9 +575,6 @@ async def get_all(request):
 
         async with db.acquire() as conn:
             rows = await conn.all(query, **query_params)
-
-        if response_format:
-            return dict(rows)
         return rows[0][0] if rows else 0
 
     async def get_results(start, limit, filters):
