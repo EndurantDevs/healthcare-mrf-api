@@ -434,7 +434,7 @@ async def pharmacists_per_pharmacy(request):
 async def get_all(request):
     count_only = float(request.args.get("count_only", 0))
     response_format = request.args.get("format", None)
-    name_like = request.args.get("name_like")
+    names_like = _extract_name_filters(request)
     start = float(request.args.get("start", 0))
     limit = float(request.args.get("limit", 0))
     classification = request.args.get("classification")
@@ -462,7 +462,7 @@ async def get_all(request):
         "section": section,
         "display_name": display_name,
         "plan_network": plan_network,
-        "name_like": name_like,
+        "names_like": names_like,
         "codes": codes,
         "has_insurance": has_insurance,
         "city": city,
@@ -498,12 +498,11 @@ async def get_all(request):
         section = filters.get("section")
         display_name = filters.get("display_name")
         plan_network = filters.get("plan_network")
-        name_like = filters.get("name_like")
+        names_like = filters.get("names_like") or []
         codes = filters.get("codes")
         has_insurance = filters.get("has_insurance")
         city = filters.get("city")
         state = filters.get("state")
-        response_format = filters.get("response_format")
         taxonomy_filters = []
         if classification:
             taxonomy_filters.append("classification = :classification")
@@ -516,80 +515,51 @@ async def get_all(request):
         if codes:
             taxonomy_filters.append("code = ANY(:codes)")
 
-        from_sources = ["mrf.npi_address"]
-        where_clauses = []
-        name_like_pattern = None
+        name_clause = ""
+        name_params: dict = {}
+        if names_like:
+            name_clause, name_params = _name_like_clauses("b", names_like)
 
+        address_where = ["c.taxonomy_array && q.int_codes", "c.type = 'primary'"]
         if plan_network:
-            where_clauses.append("plans_network_array && :plan_network_array")
-
-        if name_like:
-            if "mrf.npi AS d" not in from_sources:
-                from_sources.append("mrf.npi AS d")
-            name_like_pattern = f"%{name_like.lower()}%"
-            where_clauses.append("mrf.npi_address.npi = d.npi")
-            where_clauses.append(_name_like_clause("d"))
-
+            address_where.append("plans_network_array && :plan_network_array")
         if has_insurance:
-            where_clauses.append("NOT (plans_network_array @@ '0'::query_int)")
-
+            address_where.append("NOT (plans_network_array @@ '0'::query_int)")
         if city:
-            where_clauses.append("city_name = :city")
-
+            address_where.append("city_name = :city")
         if state:
-            where_clauses.append("state_name = :state")
+            address_where.append("state_name = :state")
 
         taxonomy_conditions = " AND ".join(taxonomy_filters) if taxonomy_filters else "1=1"
-        if response_format == "full_taxonomy":
-            where_clauses.append("taxonomy_array && ARRAY[int_code]")
-            subquery = _taxonomy_full_subquery(taxonomy_conditions)
-            if subquery not in from_sources:
-                from_sources.append(subquery)
-        elif response_format:
-            where_clauses.append("taxonomy_array && q.int_codes")
-            subquery = _taxonomy_group_subquery()
-            if subquery not in from_sources:
-                from_sources.append(subquery)
-        else:
-            where_clauses.append("taxonomy_array && q.int_codes")
-            subquery = _taxonomy_codes_subquery(taxonomy_conditions)
-            if subquery not in from_sources:
-                from_sources.append(subquery)
+        taxonomy_subquery = _taxonomy_codes_subquery(taxonomy_conditions)
 
-        from_clause = "FROM " + ",\n     ".join(from_sources)
-        where_clause = ""
-        if where_clauses:
-            where_clause = "WHERE " + " AND ".join(where_clauses)
-
-        if response_format == "full_taxonomy":
-            select_clause = "SELECT int_code, COUNT(DISTINCT mrf.npi_address.npi) AS count"
-            group_clause = "GROUP BY int_code"
-        elif response_format:
-            select_clause = "SELECT q.classification, COUNT(DISTINCT mrf.npi_address.npi) AS count"
-            group_clause = "GROUP BY q.classification"
-        else:
-            select_clause = "SELECT COUNT(DISTINCT mrf.npi_address.npi)"
-            group_clause = ""
-
-        parts = [select_clause, from_clause]
-        if where_clause:
-            parts.append(where_clause)
-        if group_clause:
-            parts.append(group_clause)
-        query_text = "\n".join(parts)
-
-        query = text(query_text)
+        query = text(
+            f"""
+            WITH sub_s AS (
+                SELECT b.npi AS npi_code
+                  FROM mrf.npi AS b
+                  JOIN (
+                      SELECT c.npi
+                        FROM mrf.npi_address AS c,
+                             {taxonomy_subquery}
+                       WHERE {' AND '.join(address_where)}
+                  ) AS addr ON b.npi = addr.npi
+                 {"WHERE " + name_clause if name_clause else ""}
+            )
+            SELECT COUNT(DISTINCT npi_code) FROM sub_s
+            """
+        )
         query_params = {
             "classification": classification,
             "section": section,
             "display_name": display_name,
             "plan_network_array": plan_network,
-            "name_like": name_like_pattern,
             "codes": codes,
             "city": city.upper() if city else None,
             "state": state.upper() if state else None,
             "specialization": specialization,
         }
+        query_params.update(name_params)
 
         async with db.acquire() as conn:
             rows = await conn.all(query, **query_params)
@@ -603,13 +573,16 @@ async def get_all(request):
         section = filters.get("section")
         display_name = filters.get("display_name")
         plan_network = filters.get("plan_network")
-        name_like = filters.get("name_like")
+        names_like = filters.get("names_like") or []
         specialization = filters.get("specialization")
+        city = filters.get("city")
+        state = filters.get("state")
+        has_insurance = filters.get("has_insurance")
         where = []
         main_where = ["b.npi=g.npi"]
         tables = ["mrf.npi_address"]
 
-        address_where = ["c.taxonomy_array && q.codes", "c.type = 'primary'"]
+        address_where = ["c.taxonomy_array && q.int_codes", "c.type = 'primary'"]
         if classification:
             where.append("classification = :classification")
         if specialization:
@@ -620,11 +593,17 @@ async def get_all(request):
             where.append("display_name = :display_name")
         if plan_network:
             address_where.append("plans_network_array && :plan_network_array")
-        if name_like:
-            tables.append("mrf.npi as d")
-            name_like = f"%{name_like.lower()}%"
-            main_where.append("mrf.npi_address.npi = d.npi")
-            main_where.append(_name_like_clause("d"))
+        if has_insurance:
+            address_where.append("NOT (plans_network_array @@ '0'::query_int)")
+        if city:
+            address_where.append("city_name = :city")
+        if state:
+            address_where.append("state_name = :state")
+        name_clause = ""
+        name_params = {}
+        if names_like:
+            name_clause, name_params = _name_like_clauses("b", names_like)
+            main_where.append(name_clause)
 
         taxonomy_filter = " and ".join(where) if where else "1=1"
         q = text(
@@ -632,7 +611,7 @@ async def get_all(request):
         WITH sub_s AS(select b.npi as npi_code, b.*, g.* from  mrf.npi as b, (select c.*
     from
          mrf.npi_address as c,
-         (select ARRAY_AGG(int_code) as codes from mrf.nucc_taxonomy where {taxonomy_filter}) as q
+         (select ARRAY_AGG(int_code) as int_codes from mrf.nucc_taxonomy where {taxonomy_filter}) as q
     where {' and '.join(address_where)}
     ORDER BY c.npi
     limit :limit offset :start) as g WHERE {' and '.join(main_where)}
@@ -653,8 +632,10 @@ async def get_all(request):
                 section=section,
                 display_name=display_name,
                 plan_network_array=plan_network,
-                name_like=name_like,
                 specialization=specialization,
+                city=city,
+                state=state,
+                **name_params,
             )
             for r in rows_iter:
                 obj = {"taxonomy_list": []}
@@ -691,6 +672,10 @@ async def get_all(request):
     if count_only:
         rows = await get_count(filters)
         return response.json({"rows": rows}, default=str)
+
+    # Treat limit <= 0 as "no cap" to avoid LIMIT 0 returning nothing.
+    if limit <= 0:
+        limit = 1_000_000
 
     total, rows = await asyncio.gather(
         get_count(filters),
