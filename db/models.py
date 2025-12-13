@@ -685,3 +685,214 @@ class NPIAddress(AddressPrototype):
     plans_network_array = Column(ARRAY(Integer), nullable=False, server_default="{0}")
 
     # NPI	Provider Secondary Practice Location Address- Address Line 1	Provider Secondary Practice Location Address-  Address Line 2	Provider Secondary Practice Location Address - City Name	Provider Secondary Practice Location Address - State Name	Provider Secondary Practice Location Address - Postal Code	Provider Secondary Practice Location Address - Country Code (If outside U.S.)	Provider Secondary Practice Location Address - Telephone Number	Provider Secondary Practice Location Address - Telephone Extension	Provider Practice Location Address - Fax Number
+
+
+class PTGFile(Base, JSONOutputMixin):
+    __tablename__ = 'ptg_file'
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint('file_id'),
+        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+    )
+    __my_index_elements__ = ['file_id']
+    __my_additional_indexes__ = [
+        {'index_elements': ('file_type',), 'name': 'ptg_file_type_idx'},
+        {'index_elements': ('url',), 'name': 'ptg_file_url_idx'},
+    ]
+
+    file_id = Column(BigInteger)
+    file_type = Column(String(64))
+    url = Column(String)
+    description = Column(String)
+    reporting_entity_name = Column(String)
+    reporting_entity_type = Column(String)
+    last_updated_on = Column(DATE)
+    version = Column(String(32))
+    plan_name = Column(String)
+    plan_id_type = Column(String(16))
+    plan_id = Column(String(32))
+    plan_market_type = Column(String(32))
+    issuer_name = Column(String)
+    plan_sponsor_name = Column(String)
+    from_index_url = Column(String)
+
+
+class PTGProviderGroup(Base, JSONOutputMixin):
+    __tablename__ = 'ptg_provider_group'
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint('provider_group_hash'),
+        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+    )
+    __my_index_elements__ = ['provider_group_hash']
+    __my_additional_indexes__ = [
+        {'index_elements': ('provider_group_ref',), 'name': 'ptg_provider_group_ref_idx'},
+        {'index_elements': ('tin_value',), 'name': 'ptg_provider_group_tin_idx'},
+    ]
+
+    provider_group_hash = Column(BigInteger)
+    provider_group_ref = Column(Integer)
+    file_id = Column(BigInteger)
+    network_names = Column(ARRAY(String))
+    tin_type = Column(String(8))
+    tin_value = Column(String(32))
+    tin_business_name = Column(String)
+    npi = Column(ARRAY(BigInteger))
+
+
+class PTGInNetworkItem(Base, JSONOutputMixin):
+    __tablename__ = 'ptg_in_network_item'
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint('item_hash'),
+        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+    )
+    __my_index_elements__ = ['item_hash']
+    __my_additional_indexes__ = [
+        {'index_elements': ('billing_code',), 'name': 'ptg_item_billing_code_idx'},
+        {'index_elements': ('billing_code_type',), 'name': 'ptg_item_code_type_idx'},
+    ]
+
+    item_hash = Column(BigInteger)
+    file_id = Column(BigInteger)
+    negotiation_arrangement = Column(String(32))
+    name = Column(String)
+    billing_code_type = Column(String(32))
+    billing_code_type_version = Column(String(32))
+    billing_code = Column(String(64))
+    description = Column(String)
+    severity_of_illness = Column(String)
+    plan_name = Column(String)
+    plan_id_type = Column(String(16))
+    plan_id = Column(String(32))
+    plan_market_type = Column(String(32))
+    issuer_name = Column(String)
+    plan_sponsor_name = Column(String)
+
+
+class PTGBillingCode(Base, JSONOutputMixin):
+    __tablename__ = 'ptg_billing_code'
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint('code_hash'),
+        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+    )
+    __my_index_elements__ = ['code_hash']
+    __my_additional_indexes__ = [{'index_elements': ('item_hash',), 'name': 'ptg_billing_code_item_idx'}]
+
+    code_hash = Column(BigInteger)
+    item_hash = Column(BigInteger)
+    code_role = Column(String(16))  # bundle | covered
+    billing_code_type = Column(String(32))
+    billing_code_type_version = Column(String(32))
+    billing_code = Column(String(64))
+    description = Column(String)
+
+
+class PTGNegotiatedRate(Base, JSONOutputMixin):
+    __tablename__ = 'ptg_negotiated_rate'
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint('rate_hash'),
+        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+    )
+    __my_index_elements__ = ['rate_hash']
+    __my_additional_indexes__ = [
+        {'index_elements': ('item_hash',), 'name': 'ptg_negotiated_item_idx'},
+        {'index_elements': ('provider_group_hash',), 'name': 'ptg_negotiated_group_idx'},
+    ]
+
+    rate_hash = Column(BigInteger)
+    item_hash = Column(BigInteger)
+    provider_group_ref = Column(Integer)
+    provider_group_hash = Column(BigInteger)
+
+
+class PTGNegotiatedPrice(Base, JSONOutputMixin):
+    __tablename__ = 'ptg_negotiated_price'
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint('price_hash'),
+        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+    )
+    __my_index_elements__ = ['price_hash']
+    __my_additional_indexes__ = [
+        {'index_elements': ('rate_hash',), 'name': 'ptg_price_rate_idx'},
+        {'index_elements': ('billing_class',), 'name': 'ptg_price_class_idx'},
+    ]
+
+    price_hash = Column(BigInteger)
+    rate_hash = Column(BigInteger)
+    negotiated_type = Column(String(32))
+    negotiated_rate = Column(Numeric)
+    expiration_date = Column(DATE)
+    service_code = Column(ARRAY(String))
+    billing_class = Column(String(32))
+    setting = Column(String(32))
+    billing_code_modifier = Column(ARRAY(String))
+    additional_information = Column(String)
+
+
+class PTGAllowedItem(Base, JSONOutputMixin):
+    __tablename__ = 'ptg_allowed_item'
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint('allowed_item_hash'),
+        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+    )
+    __my_index_elements__ = ['allowed_item_hash']
+    __my_additional_indexes__ = [{'index_elements': ('billing_code',), 'name': 'ptg_allowed_code_idx'}]
+
+    allowed_item_hash = Column(BigInteger)
+    file_id = Column(BigInteger)
+    name = Column(String)
+    billing_code_type = Column(String(32))
+    billing_code_type_version = Column(String(32))
+    billing_code = Column(String(64))
+    description = Column(String)
+    plan_name = Column(String)
+    plan_id_type = Column(String(16))
+    plan_id = Column(String(32))
+    plan_market_type = Column(String(32))
+    issuer_name = Column(String)
+    plan_sponsor_name = Column(String)
+
+
+class PTGAllowedPayment(Base, JSONOutputMixin):
+    __tablename__ = 'ptg_allowed_payment'
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint('payment_hash'),
+        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+    )
+    __my_index_elements__ = ['payment_hash']
+    __my_additional_indexes__ = [
+        {'index_elements': ('allowed_item_hash',), 'name': 'ptg_allowed_payment_item_idx'},
+        {'index_elements': ('tin_value',), 'name': 'ptg_allowed_payment_tin_idx'},
+    ]
+
+    payment_hash = Column(BigInteger)
+    allowed_item_hash = Column(BigInteger)
+    tin_type = Column(String(8))
+    tin_value = Column(String(32))
+    service_code = Column(ARRAY(String))
+    billing_class = Column(String(32))
+    setting = Column(String(32))
+    allowed_amount = Column(Numeric)
+    billing_code_modifier = Column(ARRAY(String))
+
+
+class PTGAllowedProviderPayment(Base, JSONOutputMixin):
+    __tablename__ = 'ptg_allowed_provider_payment'
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint('provider_payment_hash'),
+        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+    )
+    __my_index_elements__ = ['provider_payment_hash']
+    __my_additional_indexes__ = [{'index_elements': ('payment_hash',), 'name': 'ptg_allowed_provider_payment_idx'}]
+
+    provider_payment_hash = Column(BigInteger)
+    payment_hash = Column(BigInteger)
+    billed_charge = Column(Numeric)
+    npi = Column(ARRAY(BigInteger))

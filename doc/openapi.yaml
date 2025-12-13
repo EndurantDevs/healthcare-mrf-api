@@ -1110,10 +1110,14 @@ paths:
       parameters:
         - name: name_like
           in: query
-          required: true
+          required: false
           schema:
-            type: string
-          description: Case-insensitive fragment matched against pharmacy names
+            type: array
+            items:
+              type: string
+            style: form
+            explode: true
+          description: One or more case-insensitive fragments matched against pharmacy names (repeat name_like).
       responses:
         '200':
           description: Count payload
@@ -1135,17 +1139,33 @@ paths:
         - name: name_like
           in: query
           schema:
-            type: string
-          description: Case-insensitive fragment matched against pharmacy names
+            type: array
+            items:
+              type: string
+            style: form
+            explode: true
+          description: One or more case-insensitive fragments matched against pharmacy names (repeat name_like).
+        - name: detailed
+          in: query
+          schema:
+            type: boolean
+          description: Include detailed per-pharmacy rows when true (default false).
       responses:
         '200':
-          description: Array of pharmacist count buckets
+          description: Histogram plus optional per-pharmacy pharmacist counts
           content:
             application/json:
               schema:
-                type: array
-                items:
-                  $ref: '#/components/schemas/PharmacistBucket'
+                type: object
+                properties:
+                  histogram:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/PharmacistBucket'
+                  rows:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/PharmacyPharmacistCount'
   /npi/all:
     get:
       summary: Search NPI directory
@@ -1381,6 +1401,15 @@ components:
         pharmacist_group:
           type: string
         pharmacy_count:
+          type: integer
+    PharmacyPharmacistCount:
+      type: object
+      properties:
+        pharmacy_npi:
+          type: string
+        pharmacy_name:
+          type: string
+        pharmacist_count:
           type: integer
     HealthcheckResponse:
       type: object
