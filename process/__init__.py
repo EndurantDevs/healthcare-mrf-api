@@ -36,6 +36,7 @@ from process.nucc import main as initiate_nucc
 from process.nucc import process_data as process_nucc_data
 from process.nucc import shutdown as nucc_shutdown
 from process.nucc import startup as nucc_startup
+from process.ptg import main as initiate_ptg
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
 
@@ -163,6 +164,35 @@ def plan_attributes(test: bool):
 def npi(test: bool):
     asyncio.run(initiate_npi(test_mode=test))
 
+@click.command(help="Run Transparency in Coverage (PTG) Import")
+@click.option("--toc-url", multiple=True, help="URL of a table-of-contents file to seed jobs (repeatable).")
+@click.option("--toc-list", type=click.Path(exists=True), help="Path to file containing TOC URLs (newline or JSON list).")
+@click.option("--in-network-url", help="URL of a single in-network rates file.")
+@click.option("--allowed-url", help="URL of a single allowed-amounts file.")
+@click.option("--provider-ref-url", help="URL of a provider-reference file.")
+@click.option("--import-id", help="Override import id/date suffix for table names.")
+@click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
+def ptg(
+    toc_url: tuple[str, ...],
+    toc_list: str | None,
+    in_network_url: str | None,
+    allowed_url: str | None,
+    provider_ref_url: str | None,
+    import_id: str | None,
+    test: bool,
+):
+    asyncio.run(
+        initiate_ptg(
+            test_mode=test,
+            toc_urls=list(toc_url),
+            toc_list=toc_list,
+            in_network_url=in_network_url,
+            allowed_url=allowed_url,
+            provider_ref_url=provider_ref_url,
+            import_id=import_id,
+        )
+    )
+
 
 @click.command(help="Run NUCC Taxonomy Import")
 @click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
@@ -174,5 +204,6 @@ process_group.add_command(mrf)
 process_group_end.add_command(mrf_end, 'mrf')
 process_group.add_command(plan_attributes)
 process_group.add_command(npi)
+process_group.add_command(ptg)
 process_group.add_command(geo_lookup, name="geo")
 process_group.add_command(nucc)

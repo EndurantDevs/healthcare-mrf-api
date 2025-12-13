@@ -9,7 +9,7 @@ import random
 import urllib.parse
 from datetime import datetime
 from textwrap import dedent
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 import sanic.exceptions
 from sanic import Blueprint, response
@@ -162,6 +162,49 @@ def _name_like_clause(alias: str = "", param: str = "name_like") -> str:
     return f"({expr} LIKE {param_ref})"
 
 
+def _name_like_clauses(alias: str, names: Sequence[str], base_param: str = "name_like") -> tuple[str, dict]:
+    if not names:
+        return "", {}
+    clauses = []
+    params = {}
+    for idx, name in enumerate(names):
+        param = f"{base_param}_{idx}"
+        clauses.append(_name_like_clause(alias, param))
+        params[param] = f"%{name.lower()}%"
+    joined = " OR ".join(clauses)
+    return f"({joined})", params
+
+
+def _extract_name_filters(request) -> list[str]:
+    args = getattr(request, "args", {}) or {}
+    names: list[str] = []
+    if hasattr(args, "getlist"):
+        names.extend(args.getlist("name_like"))
+    elif hasattr(args, "getall"):
+        try:
+            names.extend(args.getall("name_like"))
+        except Exception:  # pragma: no cover - defensive
+            pass
+    else:
+        maybe = args.get("name_like")
+        if maybe:
+            names.append(maybe)
+    single = args.get("name_like")
+    if single:
+        names.append(single)
+    normalized = []
+    seen = set()
+    for name in names:
+        if not name:
+            continue
+        lower = str(name).lower()
+        if lower in seen:
+            continue
+        seen.add(lower)
+        normalized.append(lower)
+    return normalized
+
+
 async def _compute_npi_counts():
     async def get_npi_count():
         return await db.scalar(select(func.count(NPIData.npi)))
@@ -230,11 +273,11 @@ async def active_pharmacists(request):
 
 @blueprint.get("/pharmacists_in_pharmacies")
 async def pharmacists_in_pharmacies(request):
-    name_like = request.args.get("name_like", "").lower()
-    if not name_like:
+    names = _extract_name_filters(request)
+    if not names:
         return response.json({"count": 0})
 
-    name_clause = _name_like_clause("d")
+    name_clause, name_params = _name_like_clauses("d", names)
     sql = text(
         f"""
         WITH pharmacy_taxonomy AS (
@@ -262,7 +305,7 @@ async def pharmacists_in_pharmacies(request):
     )
 
     async with db.acquire() as conn:
-        result = await conn.first(sql, name_like=f"%{name_like}%")
+        result = await conn.first(sql, **name_params)
     return response.json({"count": result[0] if result else 0})
 
 
@@ -274,14 +317,18 @@ async def pharmacists_per_pharmacy(request):
     else:
         state = None
 
-    raw_name_like = request.args.get("name_like", "")
+    names = _extract_name_filters(request)
+    detailed = str(request.args.get("detailed", "")).lower() in ("1", "true", "yes")
     params = {}
 
     if state:
         params["state"] = state
 
-    if raw_name_like:
-        params["name_like"] = f"%{raw_name_like.lower()}%"
+    name_clause = ""
+    name_params: dict = {}
+    if names:
+        name_clause, name_params = _name_like_clauses("d", names)
+        params.update(name_params)
 
     base_conditions = [
         "ph.taxonomy_array && (SELECT codes FROM pharmacy_taxonomy)",
@@ -291,13 +338,12 @@ async def pharmacists_per_pharmacy(request):
     if state:
         base_conditions.append("ph.state_name = :state")
 
-    if raw_name_like:
-        base_conditions.append(_name_like_clause("d"))
+    if name_clause:
+        base_conditions.append(name_clause)
 
     where_clause = " AND ".join(base_conditions)
 
-    sql = text(
-        f"""
+    base_cte = f"""
         WITH pharmacy_taxonomy AS (
             SELECT ARRAY_AGG(int_code) AS codes
             FROM mrf.nucc_taxonomy
@@ -309,7 +355,9 @@ async def pharmacists_per_pharmacy(request):
             WHERE classification = 'Pharmacist'
         ),
         pharmacy_counts AS (
-            SELECT ph.npi AS pharmacy_npi, COUNT(DISTINCT phm.npi) AS pharmacist_count
+            SELECT ph.npi AS pharmacy_npi,
+                   COALESCE(d.provider_organization_name, d.provider_last_name) AS pharmacy_name,
+                   COUNT(DISTINCT phm.npi) AS pharmacist_count
             FROM mrf.npi_address ph
             JOIN mrf.npi_address phm ON ph.telephone_number = phm.telephone_number
                AND phm.type = 'primary'
@@ -317,8 +365,13 @@ async def pharmacists_per_pharmacy(request):
                AND ph.state_name = phm.state_name
             JOIN mrf.npi d ON ph.npi = d.npi
             WHERE {where_clause}
-            GROUP BY ph.npi
+            GROUP BY ph.npi, pharmacy_name
         )
+    """
+
+    histogram_sql = text(
+        base_cte
+        + """
         SELECT CASE
             WHEN pharmacist_count = 1 THEN '1'
             WHEN pharmacist_count = 2 THEN '2'
@@ -354,10 +407,27 @@ async def pharmacists_per_pharmacy(request):
     """
     )
 
+    detail_sql = text(
+        base_cte
+        + """
+        SELECT pharmacy_npi, pharmacy_name, pharmacist_count
+          FROM pharmacy_counts
+         ORDER BY pharmacist_count DESC, pharmacy_npi
+        """
+    )
+
     async with db.acquire() as conn:
-        result = await conn.all(sql, **params)
-    data = [{"pharmacist_group": row[0], "pharmacy_count": row[1]} for row in result]
-    return response.json(data)
+        histogram_rows = await conn.all(histogram_sql, **params)
+        detail_rows = await conn.all(detail_sql, **params) if detailed else []
+    histogram = [{"pharmacist_group": row[0], "pharmacy_count": row[1]} for row in histogram_rows]
+    detail = [
+        {"pharmacy_npi": row[0], "pharmacy_name": row[1], "pharmacist_count": row[2]}
+        for row in detail_rows
+    ]
+    payload = {"histogram": histogram}
+    if detailed:
+        payload["rows"] = detail
+    return response.json(payload)
 
 
 @blueprint.get("/all")
@@ -413,6 +483,10 @@ async def get_all(request):
             "response_format",
         )
     )
+
+    if count_only and not simple_filter_present and not has_insurance and not city and not state:
+        total_npi = await db.scalar(select(func.count(NPIData.npi)))
+        return response.json({"rows": total_npi}, default=str)
 
     if count_only and has_insurance and not simple_filter_present:
         rows = await _fast_has_insurance_count(city, state)
