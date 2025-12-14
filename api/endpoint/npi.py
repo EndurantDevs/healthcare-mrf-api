@@ -371,7 +371,7 @@ async def pharmacists_per_pharmacy(request):
               FROM mrf.npi_address AS a, pharmacist_taxonomy AS pc
              WHERE a.type = 'primary'
                AND a.taxonomy_array && pc.codes
-               {state_filter_phm}
+               {("AND a.state_name = :state" if state else "")}
         ),
         pharmacist_counts AS (
             SELECT phm.telephone_number,
@@ -789,21 +789,26 @@ async def get_near_npi(request):
     radius = int(request.args.get("radius", 10))
 
     await _ensure_npi_geo_index()
-    async with db.acquire() as conn:
-        if (not (in_long and in_lat)) and zip_codes and zip_codes[0]:
-            q = "select intptlat, intptlon from zcta5 where zcta5ce=:zip_code limit 1;"
-            for r in await conn.all(text(q), zip_code=zip_codes[0]):
-                in_long = float(r["intptlon"])
-                in_lat = float(r["intptlat"])
+    # If only zip was provided, resolve to coordinates first using a separate connection.
+    if (not (in_long and in_lat)) and zip_codes and zip_codes[0]:
+        q = "select intptlat, intptlon from zcta5 where zcta5ce=:zip_code limit 1;"
+        async with db.acquire() as conn_zip:
+            for r in await conn_zip.all(text(q), zip_code=zip_codes[0]):
+                try:
+                    in_long = float(r["intptlon"])
+                    in_lat = float(r["intptlat"])
+                except Exception:
+                    in_lat = float(r[0])
+                    in_long = float(r[1])
 
-        res = {}
-        extra_filters: list[str] = []
-        if exclude_npi:
-            extra_filters.append("a.npi <> :exclude_npi")
-        if plan_network:
-            extra_filters.append("a.plans_network_array && (:plan_network_array)")
+    res = {}
+    extra_filters: list[str] = []
+    if exclude_npi:
+        extra_filters.append("a.npi <> :exclude_npi")
+    if plan_network:
+        extra_filters.append("a.plans_network_array && (:plan_network_array)")
 
-        where: list[str] = []
+    where: list[str] = []
     if zip_codes:
         # Default to a reasonable search radius when zip is used; avoid huge fan-out.
         radius = 25
@@ -828,22 +833,23 @@ async def get_near_npi(request):
 
     nearby_sql = _build_nearby_sql(taxonomy_conditions, extra_clause, ilike_clause)
 
-    res_q = await conn.all(
-        text(nearby_sql),
-        in_long=in_long,
-        in_lat=in_lat,
-        classification=classification,
-        limit=limit,
-        radius=radius,
-        exclude_npi=exclude_npi,
-        section=section,
-        display_name=display_name,
-        name_like=name_like,
-        codes=codes,
-        zip_codes=zip_codes,
-        plan_network_array=plan_network,
-        # y_min=x_y[1], y_max=x_y[3], x_min=x_y[0], x_max=x_y[2]
-    )
+    async with db.acquire() as conn:
+        res_q = await conn.all(
+            text(nearby_sql),
+            in_long=in_long,
+            in_lat=in_lat,
+            classification=classification,
+            limit=limit,
+            radius=radius,
+            exclude_npi=exclude_npi,
+            section=section,
+            display_name=display_name,
+            name_like=name_like,
+            codes=codes,
+            zip_codes=zip_codes,
+            plan_network_array=plan_network,
+        )
+
     for r in res_q:
         obj = {"taxonomy_list": []}
         count = 1
