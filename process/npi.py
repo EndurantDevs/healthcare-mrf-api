@@ -14,6 +14,7 @@ import pytz
 from aiocsv import AsyncDictReader
 from aiofile import async_open
 from arq import create_pool
+from arq.connections import RedisSettings
 from async_unzip.unzipper import unzip
 from asyncpg import DuplicateTableError
 from dateutil.parser import parse as parse_date
@@ -689,4 +690,5 @@ async def main(test_mode: bool = False):  # pragma: no cover
     redis = await create_pool(build_redis_settings(),
                               job_serializer=serialize_job,
                               job_deserializer=deserialize_job)
-    await redis.enqueue_job('process_data', {'test_mode': test_mode}, _queue_name='arq:NPI')
+    payload = {'test_mode': bool(test_mode)}
+    await redis.enqueue_job('process_data', payload, _queue_name='arq:NPI')
