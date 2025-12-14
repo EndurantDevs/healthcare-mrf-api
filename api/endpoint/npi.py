@@ -324,27 +324,27 @@ async def pharmacists_per_pharmacy(request):
     if state:
         params["state"] = state
 
+    # Require at least one filter to avoid full self-join scans.
     name_clause = ""
     name_params: dict = {}
     if names:
         name_clause, name_params = _name_like_clauses("d", names)
         params.update(name_params)
 
-    base_conditions = [
-        "ph.taxonomy_array && (SELECT codes FROM pharmacy_taxonomy)",
-        "phm.taxonomy_array && (SELECT codes FROM pharmacist_taxonomy)",
-    ]
+    if not name_clause and not state:
+        raise sanic.exceptions.InvalidUsage("Provide name_like or state to scope pharmacists_per_pharmacy")
 
-    if state:
-        base_conditions.append("ph.state_name = :state")
-
-    if name_clause:
-        base_conditions.append(name_clause)
-
-    where_clause = " AND ".join(base_conditions)
+    state_filter_addr = "AND a.state_name = :state" if state else ""
+    state_filter_join = "AND ph.state_name = pc.state_name"
+    state_filter_phm = "AND a.state_name = :state" if state else ""
 
     base_cte = f"""
-        WITH pharmacy_taxonomy AS (
+        WITH target_npi AS (
+            SELECT npi
+              FROM mrf.npi AS d
+             WHERE {'1=1' if not name_clause else name_clause}
+        ),
+        pharmacy_taxonomy AS (
             SELECT ARRAY_AGG(int_code) AS codes
             FROM mrf.nucc_taxonomy
             WHERE classification = 'Pharmacy'
@@ -354,18 +354,39 @@ async def pharmacists_per_pharmacy(request):
             FROM mrf.nucc_taxonomy
             WHERE classification = 'Pharmacist'
         ),
+        pharmacy_subset AS (
+            SELECT a.npi, a.telephone_number, a.state_name
+              FROM mrf.npi_address AS a, pharmacy_taxonomy AS pc
+             WHERE a.npi IN (SELECT npi FROM target_npi)
+               AND a.type = 'primary'
+               AND a.taxonomy_array && pc.codes
+               AND a.telephone_number IS NOT NULL
+               {state_filter_addr}
+        ),
+        pharmacist_subset AS (
+            SELECT a.npi, a.telephone_number, a.state_name
+              FROM mrf.npi_address AS a, pharmacist_taxonomy AS pc
+             WHERE a.type = 'primary'
+               AND a.taxonomy_array && pc.codes
+               {state_filter_phm}
+        ),
+        pharmacist_counts AS (
+            SELECT phm.telephone_number,
+                   phm.state_name,
+                   COUNT(DISTINCT phm.npi) AS pharmacist_count
+              FROM pharmacist_subset AS phm
+             WHERE phm.telephone_number IN (SELECT telephone_number FROM pharmacy_subset)
+          GROUP BY phm.telephone_number, phm.state_name
+        ),
         pharmacy_counts AS (
             SELECT ph.npi AS pharmacy_npi,
                    COALESCE(d.provider_organization_name, d.provider_last_name) AS pharmacy_name,
-                   COUNT(DISTINCT phm.npi) AS pharmacist_count
-            FROM mrf.npi_address ph
-            JOIN mrf.npi_address phm ON ph.telephone_number = phm.telephone_number
-               AND phm.type = 'primary'
-               AND ph.type = 'primary'
-               AND ph.state_name = phm.state_name
-            JOIN mrf.npi d ON ph.npi = d.npi
-            WHERE {where_clause}
-            GROUP BY ph.npi, pharmacy_name
+                   COALESCE(pc.pharmacist_count, 0) AS pharmacist_count
+              FROM pharmacy_subset AS ph
+              JOIN mrf.npi AS d ON ph.npi = d.npi
+         LEFT JOIN pharmacist_counts AS pc
+                ON pc.telephone_number = ph.telephone_number
+               {state_filter_join}
         )
     """
 
@@ -373,6 +394,7 @@ async def pharmacists_per_pharmacy(request):
         base_cte
         + """
         SELECT CASE
+            WHEN pharmacist_count = 0 THEN '0'
             WHEN pharmacist_count = 1 THEN '1'
             WHEN pharmacist_count = 2 THEN '2'
             WHEN pharmacist_count = 3 THEN '3'
@@ -737,10 +759,10 @@ async def get_near_npi(request):
             extra_filters.append("a.plans_network_array && (:plan_network_array)")
 
         where: list[str] = []
-        if zip_codes:
-            # Add center of zip code radius by default when coordinates are missing.
-            radius = 1000
-            extra_filters.append("SUBSTRING(a.postal_code, 1, 5) = ANY (:zip_codes)")
+    if zip_codes:
+        # Default to a reasonable search radius when zip is used; avoid huge fan-out.
+        radius = 25
+        extra_filters.append("SUBSTRING(a.postal_code, 1, 5) = ANY (:zip_codes)")
         if classification:
             where.append("classification = :classification")
         if section:
