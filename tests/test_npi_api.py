@@ -5,6 +5,7 @@ import types
 from unittest.mock import AsyncMock
 
 import pytest
+import sanic.exceptions
 
 from api.endpoint import npi as npi_module
 from api.endpoint.npi import npi_index_status
@@ -157,3 +158,13 @@ async def test_fetch_other_names_deduplicates(monkeypatch):
             "other_provider_identifier_issuer": None,
         }
     ]
+
+
+def test_validate_section_filters_requires_classification_or_codes():
+    with pytest.raises(sanic.exceptions.InvalidUsage):
+        npi_module._validate_section_filters("Individual", None, None)
+
+
+def test_validate_section_filters_allows_with_codes_or_classification():
+    npi_module._validate_section_filters("Individual", "Clinic/Center", None)
+    npi_module._validate_section_filters("Individual", None, ["261Q00000X"])

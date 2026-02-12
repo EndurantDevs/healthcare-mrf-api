@@ -8,6 +8,7 @@ from sanic import Blueprint, response
 from sanic.exceptions import InvalidUsage, NotFound
 from sqlalchemy import and_, func, or_, select
 
+from api.endpoint.pagination import parse_pagination
 from api.tier_utils import normalize_drug_tier_slug
 from db.models import (Issuer, Plan, PlanDrugRaw, PlanDrugStats,
                        PlanDrugTierStats, PlanFormulary)
@@ -217,10 +218,18 @@ async def list_formularies(request):
     session = _get_session(request)
 
     args = request.args
-    page = max(1, _parse_positive_int(args.get("page"), "page") or 1)
-    raw_page_size = _parse_positive_int(args.get("page_size"), "page_size") or DEFAULT_PAGE_SIZE
-    page_size = min(max(1, raw_page_size), MAX_PAGE_SIZE)
-    offset = (page - 1) * page_size
+    pagination = parse_pagination(
+        args,
+        default_limit=DEFAULT_PAGE_SIZE,
+        max_limit=MAX_PAGE_SIZE,
+        default_page=1,
+        allow_offset=True,
+        allow_start=True,
+        allow_page_size=True,
+    )
+    page = pagination.page
+    page_size = pagination.limit
+    offset = pagination.offset
 
     plan_table = Plan.__table__
     issuer_table = Issuer.__table__
@@ -305,6 +314,8 @@ async def list_formularies(request):
             "items": items,
             "page": page,
             "page_size": page_size,
+            "limit": page_size,
+            "offset": offset,
             "total": total,
         }
     )
@@ -411,10 +422,18 @@ async def list_formulary_drugs(request, formulary_id):
         raise NotFound("Unknown formulary identifier")
 
     args = request.args
-    page = max(1, _parse_positive_int(args.get("page"), "page") or 1)
-    raw_page_size = _parse_positive_int(args.get("page_size"), "page_size") or DEFAULT_PAGE_SIZE
-    page_size = min(max(1, raw_page_size), MAX_PAGE_SIZE)
-    offset = (page - 1) * page_size
+    pagination = parse_pagination(
+        args,
+        default_limit=DEFAULT_PAGE_SIZE,
+        max_limit=MAX_PAGE_SIZE,
+        default_page=1,
+        allow_offset=True,
+        allow_start=True,
+        allow_page_size=True,
+    )
+    page = pagination.page
+    page_size = pagination.limit
+    offset = pagination.offset
 
     tier_filter = args.get("tier")
     pharmacy_filter = args.get("pharmacy_type")
@@ -517,6 +536,8 @@ async def list_formulary_drugs(request, formulary_id):
             "formulary_uri": _encode_formulary_path(plan_id, year),
             "page": page,
             "page_size": page_size,
+            "limit": page_size,
+            "offset": offset,
             "total": total,
             "available_pharmacy_types": pharmacy_types,
             "items": items,

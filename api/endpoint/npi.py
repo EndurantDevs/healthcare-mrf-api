@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import random
+import math
 import urllib.parse
 from datetime import datetime
 from textwrap import dedent
@@ -16,6 +17,7 @@ from sanic import Blueprint, response
 from sqlalchemy import func, or_, select
 from sqlalchemy.sql import literal_column, text, tuple_
 
+from api.endpoint.pagination import parse_pagination
 from db.models import (AddressArchive, Issuer, NPIAddress, NPIData,
                        NPIDataOtherIdentifier, NPIDataTaxonomy,
                        NPIDataTaxonomyGroup, NUCCTaxonomy, PlanNPIRaw, db)
@@ -28,6 +30,14 @@ NAME_LIKE_TEMPLATE = (
     "LOWER("
     "COALESCE({alias}provider_first_name,'') || ' ' || "
     "COALESCE({alias}provider_last_name,'') || ' ' || "
+    "COALESCE({alias}provider_organization_name,'') || ' ' || "
+    "COALESCE({alias}provider_other_organization_name,'') || ' ' || "
+    "COALESCE({alias}do_business_as_text,'')"
+    ")"
+)
+
+ORGANIZATION_LIKE_TEMPLATE = (
+    "LOWER("
     "COALESCE({alias}provider_organization_name,'') || ' ' || "
     "COALESCE({alias}provider_other_organization_name,'') || ' ' || "
     "COALESCE({alias}do_business_as_text,'')"
@@ -165,14 +175,90 @@ def _name_like_clause(alias: str = "", param: str = "name_like") -> str:
 def _name_like_clauses(alias: str, names: Sequence[str], base_param: str = "name_like") -> tuple[str, dict]:
     if not names:
         return "", {}
+    prefix = alias
+    if prefix and not prefix.endswith("."):
+        prefix = f"{prefix}."
+    expr = NAME_LIKE_TEMPLATE.format(alias=prefix)
     clauses = []
     params = {}
     for idx, name in enumerate(names):
-        param = f"{base_param}_{idx}"
-        clauses.append(_name_like_clause(alias, param))
-        params[param] = f"%{name.lower()}%"
+        param_like = f"{base_param}_{idx}"
+        param_fuzzy = f"{base_param}_{idx}_fuzzy"
+        clauses.append(
+            f"(({expr} LIKE :{param_like}) OR ({expr} % :{param_fuzzy}))"
+        )
+        params[param_like] = f"%{name.lower()}%"
+        params[param_fuzzy] = name.lower()
     joined = " OR ".join(clauses)
     return f"({joined})", params
+
+
+def _normalize_zip_code(raw: Optional[str], param_name: str) -> Optional[str]:
+    if raw is None:
+        return None
+    text_value = str(raw).strip()
+    if not text_value:
+        return None
+    digits = "".join(ch for ch in text_value if ch.isdigit())
+    if len(digits) < 5:
+        raise sanic.exceptions.InvalidUsage(
+            f"{param_name} must contain at least 5 digits"
+        )
+    return digits[:5]
+
+
+def _normalize_phone_digits(raw: Optional[str]) -> Optional[str]:
+    if raw is None:
+        return None
+    text_value = str(raw).strip()
+    if not text_value:
+        return None
+    digits = "".join(ch for ch in text_value if ch.isdigit())
+    if len(digits) < 7 or len(digits) > 15:
+        raise sanic.exceptions.InvalidUsage(
+            "phone must contain between 7 and 15 digits"
+        )
+    return digits
+
+
+def _build_npi_where_clause(
+    alias: str,
+    names_like: Sequence[str],
+    first_name: Optional[str],
+    last_name: Optional[str],
+    organization_name: Optional[str],
+    entity_type_code: Optional[int],
+) -> tuple[str, dict]:
+    prefix = alias
+    if prefix and not prefix.endswith("."):
+        prefix = f"{prefix}."
+
+    clauses: list[str] = []
+    params: dict[str, object] = {}
+
+    if names_like:
+        name_clause, name_params = _name_like_clauses(alias, names_like)
+        if name_clause:
+            clauses.append(name_clause)
+            params.update(name_params)
+
+    if first_name:
+        clauses.append(f"LOWER(COALESCE({prefix}provider_first_name, '')) LIKE :first_name")
+        params["first_name"] = f"%{first_name.lower()}%"
+    if last_name:
+        clauses.append(f"LOWER(COALESCE({prefix}provider_last_name, '')) LIKE :last_name")
+        params["last_name"] = f"%{last_name.lower()}%"
+    if organization_name:
+        org_expr = ORGANIZATION_LIKE_TEMPLATE.format(alias=prefix)
+        clauses.append(f"({org_expr} LIKE :organization_name)")
+        params["organization_name"] = f"%{organization_name.lower()}%"
+    if entity_type_code is not None:
+        clauses.append(f"{prefix}entity_type_code = :entity_type_code")
+        params["entity_type_code"] = entity_type_code
+
+    if not clauses:
+        return "", {}
+    return " AND ".join(clauses), params
 
 
 def _extract_name_filters(request) -> list[str]:
@@ -213,6 +299,14 @@ async def _compute_npi_counts():
         return await db.scalar(select(func.count(tuple_(NPIAddress.npi, NPIAddress.checksum, NPIAddress.type))))
 
     return await asyncio.gather(get_npi_count(), get_npi_address_count())
+
+
+def _validate_section_filters(section: Optional[str], classification: Optional[str], codes: Optional[list[str]]) -> None:
+    """Disallow section-only lookups; they fan out to all NUCC codes and are not meaningful."""
+    if section and not classification and not codes:
+        raise sanic.exceptions.InvalidUsage(
+            "section requires classification or codes"
+        )
 
 
 @blueprint.get("/")
@@ -457,17 +551,38 @@ async def pharmacists_per_pharmacy(request):
 
 @blueprint.get("/all")
 async def get_all(request):
-    count_only = float(request.args.get("count_only", 0))
-    response_format = request.args.get("format", None)
-    names_like = _extract_name_filters(request)
+    count_only = str(request.args.get("count_only", "0")).strip().lower() in {"1", "true", "yes", "on"}
+    response_format = request.args.get("format") or request.args.get("response_format")
+    if _extract_name_filters(request):
+        raise sanic.exceptions.InvalidUsage(
+            "name_like is no longer supported on /npi/all; use q"
+        )
     # Explicit access for route collectors / OpenAPI parity.
-    request.args.get("name_like")
-    start = float(request.args.get("start", 0))
-    limit = float(request.args.get("limit", 0))
+    request.args.get("q")
+    q_value = str(request.args.get("q") or "").strip().lower()
+    names_like = [q_value] if q_value else []
+    pagination = parse_pagination(
+        request.args,
+        default_limit=50,
+        max_limit=200,
+        default_page=1,
+        allow_offset=True,
+        allow_start=True,
+        allow_page_size=True,
+    )
+    start = pagination.offset
+    limit = pagination.limit
     classification = request.args.get("classification")
     specialization = request.args.get("specialization")
     section = request.args.get("section")
     display_name = request.args.get("display_name")
+    first_name = request.args.get("first_name")
+    last_name = request.args.get("last_name")
+    organization_name = request.args.get("organization_name")
+    phone = request.args.get("phone")
+    zip_code_raw = request.args.get("zip_code")
+    postal_code_raw = request.args.get("postal_code")
+    entity_type_code_raw = request.args.get("entity_type_code")
     plan_network = request.args.get("plan_network")
     has_insurance = request.args.get("has_insurance")
     city = request.args.get("city")
@@ -483,11 +598,39 @@ async def get_all(request):
     if plan_network:
         plan_network = [int(x) for x in plan_network.split(",")]
 
+    zip_code = _normalize_zip_code(zip_code_raw, "zip_code")
+    postal_code = _normalize_zip_code(postal_code_raw, "postal_code")
+    if zip_code and postal_code and zip_code != postal_code:
+        raise sanic.exceptions.InvalidUsage(
+            "zip_code and postal_code must match when both are provided"
+        )
+    zip_code = zip_code or postal_code
+
+    phone_digits = _normalize_phone_digits(phone)
+    entity_type_code: Optional[int] = None
+    if entity_type_code_raw not in (None, ""):
+        try:
+            entity_type_code = int(entity_type_code_raw)
+        except (TypeError, ValueError) as exc:
+            raise sanic.exceptions.InvalidUsage(
+                "entity_type_code must be either 1 (individual) or 2 (organization)"
+            ) from exc
+        if entity_type_code not in (1, 2):
+            raise sanic.exceptions.InvalidUsage(
+                "entity_type_code must be either 1 (individual) or 2 (organization)"
+            )
+
     filters = {
         "classification": classification,
         "specialization": specialization,
         "section": section,
         "display_name": display_name,
+        "first_name": first_name,
+        "last_name": last_name,
+        "organization_name": organization_name,
+        "phone_digits": phone_digits,
+        "zip_code": zip_code,
+        "entity_type_code": entity_type_code,
         "plan_network": plan_network,
         "names_like": names_like,
         "codes": codes,
@@ -497,9 +640,6 @@ async def get_all(request):
         "response_format": response_format,
     }
 
-    # Track name_like presence for filters and for OpenAPI parity.
-    filters["name_like"] = names_like
-
     simple_filter_present = any(
         filters.get(field)
         for field in (
@@ -507,8 +647,14 @@ async def get_all(request):
             "specialization",
             "section",
             "display_name",
+            "first_name",
+            "last_name",
+            "organization_name",
+            "phone_digits",
+            "zip_code",
+            "entity_type_code",
             "plan_network",
-            "name_like",
+            "names_like",
             "codes",
             "response_format",
         )
@@ -519,12 +665,18 @@ async def get_all(request):
         specialization = filters.get("specialization")
         section = filters.get("section")
         display_name = filters.get("display_name")
+        first_name = filters.get("first_name")
+        last_name = filters.get("last_name")
+        organization_name = filters.get("organization_name")
+        entity_type_code = filters.get("entity_type_code")
         plan_network = filters.get("plan_network")
         names_like = filters.get("names_like") or []
         codes = filters.get("codes")
         has_insurance = filters.get("has_insurance")
         city = filters.get("city")
         state = filters.get("state")
+        zip_code = filters.get("zip_code")
+        phone_digits = filters.get("phone_digits")
 
         taxonomy_filters = []
         if classification:
@@ -538,12 +690,19 @@ async def get_all(request):
         if codes:
             taxonomy_filters.append("code = ANY(:codes)")
 
-        name_clause = ""
-        name_params: dict = {}
-        if names_like:
-            name_clause, name_params = _name_like_clauses("b", names_like)
+        npi_where, npi_params = _build_npi_where_clause(
+            "b",
+            names_like,
+            first_name,
+            last_name,
+            organization_name,
+            entity_type_code,
+        )
 
-        address_where = ["c.taxonomy_array && q.int_codes", "c.type = 'primary'"]
+        use_taxonomy_filter = bool(taxonomy_filters)
+        address_where = ["c.type = 'primary'"]
+        if use_taxonomy_filter:
+            address_where.insert(0, "c.taxonomy_array && q.int_codes")
         if plan_network:
             address_where.append("plans_network_array && :plan_network_array")
         if has_insurance:
@@ -552,33 +711,34 @@ async def get_all(request):
             address_where.append("city_name = :city")
         if state:
             address_where.append("state_name = :state")
+        if zip_code:
+            address_where.append("LEFT(c.postal_code, 5) = :zip_code")
+        if phone_digits:
+            address_where.append(
+                "regexp_replace(COALESCE(c.telephone_number, ''), '[^0-9]', '', 'g') = :phone_digits"
+            )
+        if npi_where:
+            address_where.append(
+                f"EXISTS (SELECT 1 FROM mrf.npi AS b WHERE b.npi = c.npi AND {npi_where})"
+            )
 
         taxonomy_conditions = " AND ".join(taxonomy_filters) if taxonomy_filters else "1=1"
         taxonomy_subquery = _taxonomy_codes_subquery(taxonomy_conditions)
 
-        if names_like:
+        if use_taxonomy_filter:
             query = text(
                 f"""
-                WITH sub_s AS (
-                    SELECT b.npi AS npi_code
-                      FROM mrf.npi AS b
-                      JOIN (
-                          SELECT c.npi
-                            FROM mrf.npi_address AS c,
-                                 {taxonomy_subquery}
-                           WHERE {' AND '.join(address_where)}
-                      ) AS addr ON b.npi = addr.npi
-                     {"WHERE " + name_clause if name_clause else ""}
-                )
-                SELECT COUNT(DISTINCT npi_code) FROM sub_s
+                SELECT COUNT(DISTINCT c.npi)
+                  FROM mrf.npi_address AS c,
+                       {taxonomy_subquery}
+                 WHERE {' AND '.join(address_where)}
                 """
             )
         else:
             query = text(
                 f"""
                 SELECT COUNT(DISTINCT c.npi)
-                  FROM mrf.npi_address AS c,
-                       {taxonomy_subquery}
+                  FROM mrf.npi_address AS c
                  WHERE {' AND '.join(address_where)}
                 """
             )
@@ -591,9 +751,15 @@ async def get_all(request):
             "codes": codes,
             "city": city.upper() if city else None,
             "state": state.upper() if state else None,
+            "zip_code": zip_code,
+            "phone_digits": phone_digits,
             "specialization": specialization,
+            "first_name": first_name,
+            "last_name": last_name,
+            "organization_name": organization_name,
+            "entity_type_code": entity_type_code,
         }
-        query_params.update(name_params)
+        query_params.update(npi_params)
 
         async with db.acquire() as conn:
             rows = await conn.all(query, **query_params)
@@ -648,17 +814,21 @@ async def get_all(request):
         classification = filters.get("classification")
         section = filters.get("section")
         display_name = filters.get("display_name")
+        first_name = filters.get("first_name")
+        last_name = filters.get("last_name")
+        organization_name = filters.get("organization_name")
+        entity_type_code = filters.get("entity_type_code")
         plan_network = filters.get("plan_network")
         names_like = filters.get("names_like") or []
         specialization = filters.get("specialization")
         city = filters.get("city")
         state = filters.get("state")
         has_insurance = filters.get("has_insurance")
+        zip_code = filters.get("zip_code")
+        phone_digits = filters.get("phone_digits")
         where = []
         main_where = ["b.npi=g.npi"]
-        tables = ["mrf.npi_address"]
-
-        address_where = ["c.taxonomy_array && q.int_codes", "c.type = 'primary'"]
+        address_where = ["c.type = 'primary'"]
         if classification:
             where.append("classification = :classification")
         if specialization:
@@ -667,6 +837,9 @@ async def get_all(request):
             where.append("section = :section")
         if display_name:
             where.append("display_name = :display_name")
+        use_taxonomy_filter = bool(where)
+        if use_taxonomy_filter:
+            address_where.insert(0, "c.taxonomy_array && q.int_codes")
         if plan_network:
             address_where.append("plans_network_array && :plan_network_array")
         if has_insurance:
@@ -675,19 +848,37 @@ async def get_all(request):
             address_where.append("city_name = :city")
         if state:
             address_where.append("state_name = :state")
-        name_clause = ""
-        name_params = {}
-        if names_like:
-            name_clause, name_params = _name_like_clauses("b", names_like)
-            main_where.append(name_clause)
+        if zip_code:
+            address_where.append("LEFT(c.postal_code, 5) = :zip_code")
+        if phone_digits:
+            address_where.append(
+                "regexp_replace(COALESCE(c.telephone_number, ''), '[^0-9]', '', 'g') = :phone_digits"
+            )
+        npi_where, npi_params = _build_npi_where_clause(
+            "b",
+            names_like,
+            first_name,
+            last_name,
+            organization_name,
+            entity_type_code,
+        )
+        if npi_where:
+            address_where.append(
+                f"EXISTS (SELECT 1 FROM mrf.npi AS b WHERE b.npi = c.npi AND {npi_where})"
+            )
 
         taxonomy_filter = " and ".join(where) if where else "1=1"
+        address_source = (
+            "mrf.npi_address as c\n"
+            f"    CROSS JOIN (select ARRAY_AGG(int_code) as int_codes from mrf.nucc_taxonomy where {taxonomy_filter}) as q"
+            if use_taxonomy_filter
+            else "mrf.npi_address as c"
+        )
         q = text(
             f"""
         WITH sub_s AS(select b.npi as npi_code, b.*, g.* from  mrf.npi as b, (select c.*
     from
-         mrf.npi_address as c,
-         (select ARRAY_AGG(int_code) as int_codes from mrf.nucc_taxonomy where {taxonomy_filter}) as q
+         {address_source}
     where {' and '.join(address_where)}
     ORDER BY c.npi
     limit :limit offset :start) as g WHERE {' and '.join(main_where)}
@@ -711,7 +902,9 @@ async def get_all(request):
                 specialization=specialization,
                 city=city,
                 state=state,
-                **name_params,
+                zip_code=zip_code,
+                phone_digits=phone_digits,
+                **npi_params,
             )
             for r in rows_iter:
                 obj = {"taxonomy_list": []}
@@ -749,15 +942,20 @@ async def get_all(request):
         rows = await get_count(filters)
         return response.json({"rows": rows}, default=str)
 
-    # Treat limit <= 0 as "no cap" to avoid LIMIT 0 returning nothing.
-    if limit <= 0:
-        limit = 1_000_000
-
     total, rows = await asyncio.gather(
         get_count(filters),
         get_results(start, limit, filters),
     )
-    return response.json({"total": total, "rows": rows}, default=str)
+    return response.json(
+        {
+            "total": total,
+            "page": pagination.page,
+            "limit": pagination.limit,
+            "offset": pagination.offset,
+            "rows": rows,
+        },
+        default=str,
+    )
 
 
 @blueprint.get("/near/")
@@ -778,7 +976,12 @@ async def get_near_npi(request):
     classification = request.args.get("classification")
     section = request.args.get("section")
     display_name = request.args.get("display_name")
-    name_like = request.args.get("name_like")
+    request.args.get("q")
+    if _extract_name_filters(request):
+        raise sanic.exceptions.InvalidUsage(
+            "name_like is no longer supported on /npi/near/; use q"
+        )
+    name_query = str(request.args.get("q") or "").strip()
     exclude_npi = int(request.args.get("exclude_npi", 0))
     limit = int(request.args.get("limit", 5))
     zip_codes = []
@@ -788,12 +991,13 @@ async def get_near_npi(request):
         zip_codes.append(zip_c.strip().rjust(5, "0"))
     radius = int(request.args.get("radius", 10))
 
+    _validate_section_filters(section, classification, codes)
     await _ensure_npi_geo_index()
     # If only zip was provided, resolve to coordinates first using a separate connection.
     if (not (in_long and in_lat)) and zip_codes and zip_codes[0]:
-        q = "select intptlat, intptlon from zcta5 where zcta5ce=:zip_code limit 1;"
+        zip_sql = "select intptlat, intptlon from zcta5 where zcta5ce=:zip_code limit 1;"
         async with db.acquire() as conn_zip:
-            for r in await conn_zip.all(text(q), zip_code=zip_codes[0]):
+            for r in await conn_zip.all(text(zip_sql), zip_code=zip_codes[0]):
                 try:
                     in_long = float(r["intptlon"])
                     in_lat = float(r["intptlat"])
@@ -813,6 +1017,20 @@ async def get_near_npi(request):
         # Default to a reasonable search radius when zip is used; avoid huge fan-out.
         radius = 25
         extra_filters.append("SUBSTRING(a.postal_code, 1, 5) = ANY (:zip_codes)")
+
+    bbox_params: dict[str, float] = {}
+    if in_long is not None and in_lat is not None:
+        delta_lat = radius / 69.0  # approx miles per degree latitude
+        cos_lat = math.cos(math.radians(in_lat)) or 1e-6
+        delta_long = radius / (69.0 * cos_lat)
+        bbox_params = {
+            "min_lat": in_lat - delta_lat,
+            "max_lat": in_lat + delta_lat,
+            "min_long": in_long - delta_long,
+            "max_long": in_long + delta_long,
+        }
+        extra_filters.append("a.lat BETWEEN :min_lat AND :max_lat")
+        extra_filters.append("a.long BETWEEN :min_long AND :max_long")
     if classification:
         where.append("classification = :classification")
     if section:
@@ -822,9 +1040,10 @@ async def get_near_npi(request):
     if codes:
         where.append("code = ANY(:codes)")
     ilike_clause = ""
-    if name_like:
-        name_like = f"%{name_like}%"
-        ilike_clause = f"\n            AND {_name_like_clause('d')}"
+    q_like = None
+    if name_query:
+        q_like = f"%{name_query}%"
+        ilike_clause = f"\n            AND {_name_like_clause('d', 'q')}"
 
     taxonomy_conditions = " AND ".join(where) if where else "1=1"
     extra_clause = ""
@@ -844,10 +1063,11 @@ async def get_near_npi(request):
             exclude_npi=exclude_npi,
             section=section,
             display_name=display_name,
-            name_like=name_like,
+            q=q_like,
             codes=codes,
             zip_codes=zip_codes,
             plan_network_array=plan_network,
+            **bbox_params,
         )
 
     for r in res_q:

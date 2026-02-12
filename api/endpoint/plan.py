@@ -13,6 +13,7 @@ from sanic.exceptions import InvalidUsage
 from sqlalchemy import Float, and_, case, cast, func, or_, select
 from sqlalchemy.exc import ProgrammingError
 
+from api.endpoint.pagination import parse_bool_alias, parse_pagination
 from api.for_human import attributes_labels, benefits_labels
 from db.connection import db as sa_db
 from db.models import (GeoZipLookup, ImportLog, Issuer, Plan, PlanAttributes,
@@ -624,8 +625,6 @@ async def find_a_plan(request):
     rating_area = args.get("rating_area")
     zip_code = (args.get("zip_code") or "").strip()
     year_raw = args.get("year")
-    limit_raw = args.get("limit") or 100
-    page_raw = args.get("page") or 1
     order = (args.get("order") or "asc").lower()
     order_by = (args.get("order_by") or "plan_id").lower()
     issuer_id_raw = args.get("issuer_id")
@@ -656,18 +655,24 @@ async def find_a_plan(request):
     metal_levels = _get_list_param(args, "metal_levels")
     csr_variations = _get_list_param(args, "csr_variations")
 
-    try:
-        limit = int(limit_raw)
-    except (TypeError, ValueError):
-        limit = 100
-    limit = max(1, min(limit, 200))
-
-    try:
-        page = int(page_raw)
-    except (TypeError, ValueError):
-        page = 1
-    page = max(page, 1)
-    offset = (page - 1) * limit
+    pagination = parse_pagination(
+        args,
+        default_limit=100,
+        max_limit=200,
+        default_page=1,
+        allow_offset=True,
+        allow_start=True,
+        allow_page_size=True,
+    )
+    limit = pagination.limit
+    page = pagination.page
+    offset = pagination.offset
+    include_facets = parse_bool_alias(
+        args,
+        "include_facets",
+        "include_aggregations",
+        default=True,
+    )
 
     year = None
     if year_raw:
@@ -704,7 +709,7 @@ async def find_a_plan(request):
 
     applied_filters: Dict[str, Any] = {}
     warnings: List[Dict[str, str]] = []
-    facets = _empty_facets()
+    facets = _empty_facets() if include_facets else {}
 
     plan_filters = []
     summary_filters = []
@@ -747,6 +752,9 @@ async def find_a_plan(request):
             return response.json(
                 {
                     "total": 0,
+                    "page": page,
+                    "limit": limit,
+                    "offset": offset,
                     "results": [],
                     "issuers": [],
                     "facets": facets,
@@ -763,6 +771,8 @@ async def find_a_plan(request):
         _append_filter(applied_filters, "age", age)
     _append_filter(applied_filters, "limit", limit)
     _append_filter(applied_filters, "page", page)
+    _append_filter(applied_filters, "offset", offset)
+    _append_filter(applied_filters, "include_facets", include_facets)
     _append_filter(applied_filters, "order", order)
     _append_filter(applied_filters, "order_by", order_by)
 
@@ -835,8 +845,10 @@ async def find_a_plan(request):
 
     total_result = await session.execute(select(func.count()).select_from(filtered_plans))
     total = _result_scalar(total_result) or 0
-    if total > 0:
+    if include_facets and total > 0:
         facets = await _compute_facets(session, filtered_plans)
+    elif not include_facets:
+        facets = {}
 
     order_map = {
         "plan_id": plan_table.c.plan_id,
@@ -936,6 +948,9 @@ async def find_a_plan(request):
         return response.json(
             {
                 "total": int(total),
+                "page": page,
+                "limit": limit,
+                "offset": offset,
                 "results": [],
                 "issuers": [],
                 "facets": facets,
@@ -1005,6 +1020,9 @@ async def find_a_plan(request):
     return response.json(
         {
             "total": int(total),
+            "page": page,
+            "limit": limit,
+            "offset": offset,
             "results": results,
             "issuers": issuers,
             "facets": facets,

@@ -164,6 +164,54 @@ async def test_get_issuers_with_state():
 
 
 @pytest.mark.asyncio
+async def test_get_issuers_supports_state_query_text_and_pagination():
+    issuer_rows = [
+        FakeRow({"issuer_id": 1, "issuer_name": "Alpha Health", "issuer_marketing_name": "Alpha", "state": "NY"}),
+        FakeRow({"issuer_id": 2, "issuer_name": "Beta Health", "issuer_marketing_name": "Beta", "state": "NY"}),
+    ]
+    error_rows = [(1, 2), (2, 0)]
+    plan_rows = [(1, 5), (2, 3)]
+    session = FakeSession(
+        [FakeResult(issuer_rows), FakeResult(error_rows), FakeResult(plan_rows)]
+    )
+    request = types.SimpleNamespace(
+        args={"state": "ny", "q": "alpha", "page": "1", "limit": "1"},
+        ctx=types.SimpleNamespace(sa_session=session),
+    )
+    response = await get_issuers(request, None)
+    payload = json.loads(response.body)
+    assert len(payload) == 1
+    assert payload[0]["issuer_name"] == "Alpha Health"
+    assert payload[0]["plan_count"] == 5
+
+
+@pytest.mark.asyncio
+async def test_get_issuers_rejects_invalid_state_code():
+    request = types.SimpleNamespace(
+        args={"state": "new-york"},
+        ctx=types.SimpleNamespace(sa_session=FakeSession([FakeResult([])])),
+    )
+    with pytest.raises(sanic.exceptions.BadRequest):
+        await get_issuers(request, None)
+
+
+@pytest.mark.asyncio
+async def test_get_issuers_not_found_after_q_filter():
+    issuer_rows = [FakeRow({"issuer_id": 1, "issuer_name": "Alpha Health", "state": "NY"})]
+    error_rows = [(1, 0)]
+    plan_rows = [(1, 1)]
+    session = FakeSession(
+        [FakeResult(issuer_rows), FakeResult(error_rows), FakeResult(plan_rows)]
+    )
+    request = types.SimpleNamespace(
+        args={"q": "does-not-exist"},
+        ctx=types.SimpleNamespace(sa_session=session),
+    )
+    with pytest.raises(sanic.exceptions.NotFound):
+        await get_issuers(request, None)
+
+
+@pytest.mark.asyncio
 async def test_get_issuer_data_missing_session():
     request = types.SimpleNamespace(ctx=types.SimpleNamespace(sa_session=None))
     with pytest.raises(RuntimeError):

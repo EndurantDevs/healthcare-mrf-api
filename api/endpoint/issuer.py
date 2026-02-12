@@ -4,6 +4,7 @@ import sanic.exceptions
 from sanic import Blueprint, response
 from sqlalchemy import and_, func, select
 
+from api.endpoint.pagination import parse_pagination
 from api.tier_utils import normalize_drug_tier_slug
 from db.connection import db as sa_db
 from db.models import (ImportLog, Issuer, Plan, PlanDrugStats,
@@ -192,7 +193,26 @@ async def get_issuers(request, state=None):
     if session is None:
         raise RuntimeError("SQLAlchemy session not available on request context")
 
-    state_filter = state.upper() if state else None
+    requested_state = state or request.args.get("state")
+    state_filter = requested_state.upper() if requested_state else None
+    if state_filter and len(state_filter) != 2:
+        raise sanic.exceptions.BadRequest("state must be a 2-letter code")
+    query_text = str(request.args.get("q") or "").strip().lower()
+
+    pagination = None
+    if any(
+        request.args.get(name) not in (None, "", "null")
+        for name in ("page", "limit", "offset", "start", "page_size")
+    ):
+        pagination = parse_pagination(
+            request.args,
+            default_limit=50,
+            max_limit=200,
+            default_page=1,
+            allow_offset=True,
+            allow_start=True,
+            allow_page_size=True,
+        )
 
     issuer_stmt = select(issuer_table)
     if state_filter:
@@ -206,6 +226,16 @@ async def get_issuers(request, state=None):
 
     if not issuers:
         raise sanic.exceptions.NotFound
+
+    if query_text:
+        issuers = [
+            issuer
+            for issuer in issuers
+            if query_text in str(issuer.get("issuer_name") or "").lower()
+            or query_text in str(issuer.get("issuer_marketing_name") or "").lower()
+        ]
+        if not issuers:
+            raise sanic.exceptions.NotFound
 
     error_stmt = select(
         import_log_table.c.issuer_id,
@@ -239,5 +269,10 @@ async def get_issuers(request, state=None):
         issuer_id = issuer.get("issuer_id")
         issuer["import_errors"] = error_counts.get(issuer_id, 0)
         issuer["plan_count"] = plan_counts.get(issuer_id, 0)
+
+    if pagination is not None:
+        start = max(0, pagination.offset)
+        end = start + pagination.limit
+        issuers = issuers[start:end]
 
     return response.json(issuers, default=str)

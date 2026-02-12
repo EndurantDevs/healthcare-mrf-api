@@ -1188,13 +1188,8 @@ async def test_find_a_plan_invalid_limit_page():
         ],
         args={"limit": "bad", "page": "bad"},
     )
-    response = await find_a_plan(request)
-    payload = json.loads(response.body)
-    assert payload["total"] == 0
-    assert payload["results"] == []
-    assert payload["applied_filters"]["limit"] == 100
-    assert payload["applied_filters"]["page"] == 1
-    assert "facets" in payload
+    with pytest.raises(sanic.exceptions.BadRequest):
+        await find_a_plan(request)
 
 
 @pytest.mark.asyncio
@@ -1212,6 +1207,59 @@ async def test_find_a_plan_boolean_filter_without_metadata():
     assert payload["warnings"] == []
     assert payload["applied_filters"]["has_adult_dental"] is True
     assert "facets" in payload
+
+
+@pytest.mark.asyncio
+async def test_find_a_plan_include_facets_false_hides_facets_payload():
+    request = make_request(
+        [
+            FakeResult(rows=[(0,)]),
+            FakeResult(rows=[]),
+        ],
+        args={"include_facets": "false"},
+    )
+    response = await find_a_plan(request)
+    payload = json.loads(response.body)
+    assert payload["facets"] == {}
+    assert payload["applied_filters"]["include_facets"] is False
+
+
+@pytest.mark.asyncio
+async def test_find_a_plan_include_aggregations_alias_controls_facets():
+    request = make_request(
+        [
+            FakeResult(rows=[(0,)]),
+            FakeResult(rows=[]),
+        ],
+        args={"include_aggregations": "0"},
+    )
+    response = await find_a_plan(request)
+    payload = json.loads(response.body)
+    assert payload["facets"] == {}
+    assert payload["applied_filters"]["include_facets"] is False
+
+
+@pytest.mark.asyncio
+async def test_find_a_plan_rejects_conflicting_facet_aliases():
+    request = make_request([], args={"include_facets": "true", "include_aggregations": "false"})
+    with pytest.raises(sanic.exceptions.BadRequest):
+        await find_a_plan(request)
+
+
+@pytest.mark.asyncio
+async def test_find_a_plan_returns_pagination_metadata():
+    request = make_request(
+        [
+            FakeResult(rows=[(0,)]),
+            FakeResult(rows=[]),
+        ],
+        args={"page": "3", "limit": "20"},
+    )
+    response = await find_a_plan(request)
+    payload = json.loads(response.body)
+    assert payload["page"] == 3
+    assert payload["limit"] == 20
+    assert payload["offset"] == 40
 
 
 def test_result_scalar_empty_iterable():
