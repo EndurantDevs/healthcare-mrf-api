@@ -15,9 +15,10 @@ import types
 
 
 class FakeResult:
-    def __init__(self, row=None, rows=None):
+    def __init__(self, row=None, rows=None, scalar_value=None):
         self._row = row
         self._rows = rows
+        self._scalar_value = scalar_value
 
     def first(self):
         return self._row
@@ -26,6 +27,9 @@ class FakeResult:
         if self._rows is not None:
             return self._rows
         return [] if self._row is None else [self._row]
+
+    def scalar(self):
+        return self._scalar_value
 
 
 class FakeSession:
@@ -129,10 +133,21 @@ async def test_geo_states_summary_success():
     ]
     request = types.SimpleNamespace(
         args={"top_zip_limit": "1"},
-        ctx=types.SimpleNamespace(sa_session=FakeSession([FakeResult(rows=state_rows), FakeResult(rows=top_zip_rows)])),
+        ctx=types.SimpleNamespace(
+            sa_session=FakeSession(
+                [
+                    FakeResult(scalar_value=1),
+                    FakeResult(rows=state_rows),
+                    FakeResult(rows=top_zip_rows),
+                ]
+            )
+        ),
     )
     response = await list_geo_states(request)
     payload = json.loads(response.body)
+    assert payload["total_states"] == 1
+    assert payload["limit"] == 50
+    assert payload["offset"] == 0
     assert payload["states"][0]["state"] == "AK"
     assert payload["states"][0]["top_zips"][0]["zip_code"] == "99501"
 
@@ -145,11 +160,20 @@ async def test_geo_state_top_cities_success():
     ]
     request = types.SimpleNamespace(
         args={"limit": "2"},
-        ctx=types.SimpleNamespace(sa_session=FakeSession([FakeResult(rows=rows)])),
+        ctx=types.SimpleNamespace(
+            sa_session=FakeSession(
+                [
+                    FakeResult(scalar_value=2),
+                    FakeResult(rows=rows),
+                ]
+            )
+        ),
     )
     response = await get_top_cities_by_state(request, state="AK")
     payload = json.loads(response.body)
     assert payload["state"] == "AK"
+    assert payload["total"] == 2
+    assert payload["limit"] == 2
     assert len(payload["items"]) == 2
     assert payload["items"][0]["city"] == "Anchorage"
 
@@ -158,7 +182,14 @@ async def test_geo_state_top_cities_success():
 async def test_geo_state_top_cities_not_found():
     request = types.SimpleNamespace(
         args={},
-        ctx=types.SimpleNamespace(sa_session=FakeSession([FakeResult(rows=[])])),
+        ctx=types.SimpleNamespace(
+            sa_session=FakeSession(
+                [
+                    FakeResult(scalar_value=0),
+                    FakeResult(rows=[]),
+                ]
+            )
+        ),
     )
     response = await get_top_cities_by_state(request, state="ZZ")
     assert response.status == 404

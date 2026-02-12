@@ -605,10 +605,13 @@ WHERE
                     using = ""
                     if t := index.get('using'):
                         using = f"USING {t} "
+                    where_clause = ""
+                    if where := index.get('where'):
+                        where_clause = f" WHERE {where}"
                     create_index_sql = (
                         f"CREATE INDEX IF NOT EXISTS {obj.__tablename__}_idx_{index_name} "
                         f"ON {db_schema}.{obj.__tablename__}  {using}"
-                        f"({', '.join(index.get('index_elements'))});"
+                        f"({', '.join(index.get('index_elements'))}){where_clause};"
                     )
                     print(create_index_sql)
                     await db.status(create_index_sql)

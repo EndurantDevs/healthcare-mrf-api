@@ -103,7 +103,7 @@ async def test_get_all_returns_rows(monkeypatch):
         args={
             "limit": "1",
             "classification": "Test",
-            "name_like": "Doc",
+            "q": "Doc",
             "plan_network": "10,20",
             "has_insurance": "1",
             "city": "Chicago",
@@ -169,6 +169,41 @@ async def test_get_near_npi(monkeypatch):
     assert payload[0]["distance"] == 0.5
     assert payload[0]["taxonomy_list"]
     assert payload[0]["do_business_as"] == ['DBA']
+
+
+@pytest.mark.asyncio
+async def test_get_near_npi_with_lat_long_includes_bbox_params(monkeypatch):
+    captured = {}
+
+    class RecordingConnection:
+        async def all(self, _sql, **params):
+            captured.update(params)
+            return [_build_near_row(1112223334)]
+
+        async def first(self, *_args, **_kwargs):
+            return None
+
+    class FakeDB:
+        def acquire(self):
+            return FakeAcquire(RecordingConnection())
+
+    async def fake_ensure_index():
+        return None
+
+    monkeypatch.setattr(npi_module, "db", FakeDB())
+    monkeypatch.setattr(npi_module, "_ensure_npi_geo_index", fake_ensure_index)
+
+    request = types.SimpleNamespace(
+        args={"lat": "41.0", "long": "-87.0", "radius": "10", "limit": "1"},
+        app=types.SimpleNamespace(),
+    )
+    response = await npi_module.get_near_npi(request)
+    payload = json.loads(response.body)
+    assert len(payload) == 1
+    assert "min_lat" in captured
+    assert "max_lat" in captured
+    assert "min_long" in captured
+    assert "max_long" in captured
 
 
 @pytest.mark.asyncio
@@ -519,7 +554,7 @@ async def test_get_all_full_taxonomy(monkeypatch):
     )
     response = await npi_module.get_all(request)
     payload = json.loads(response.body)
-    assert payload["rows"] == 1234
+    assert payload["rows"] == {"1234": 7}
 
 
 @pytest.mark.asyncio
@@ -541,7 +576,7 @@ async def test_get_all_response_format_default(monkeypatch):
     )
     response = await npi_module.get_all(request)
     payload = json.loads(response.body)
-    assert payload["rows"] == "Pharmacist"
+    assert payload["rows"] == {"Pharmacist": 3}
 
 
 @pytest.mark.asyncio
@@ -561,7 +596,7 @@ async def test_get_near_npi_with_filters(monkeypatch):
             "lat": "41.0",
             "exclude_npi": "1234567890",
             "plan_network": "1,2",
-            "name_like": "Clinic",
+            "q": "Clinic",
             "classification": "Pharmacy",
             "section": "Sec",
             "display_name": "Name",
@@ -573,6 +608,16 @@ async def test_get_near_npi_with_filters(monkeypatch):
     response = await npi_module.get_near_npi(request)
     payload = json.loads(response.body)
     assert payload[0]["npi"] == 5556667778
+
+
+@pytest.mark.asyncio
+async def test_get_near_npi_rejects_name_like_legacy_alias():
+    request = types.SimpleNamespace(
+        args={"name_like": "Clinic", "zip_codes": "60601"},
+        app=types.SimpleNamespace(),
+    )
+    with pytest.raises(sanic.exceptions.InvalidUsage):
+        await npi_module.get_near_npi(request)
 
 
 @pytest.mark.asyncio
@@ -637,7 +682,7 @@ async def test_get_all_count_only_filters(monkeypatch):
         args={
             "count_only": "1",
             "plan_network": "1,2",
-            "name_like": "doc",
+            "q": "doc",
             "has_insurance": "1",
             "city": "Chicago",
             "state": "il",

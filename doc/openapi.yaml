@@ -1170,6 +1170,11 @@ paths:
     get:
       summary: Search NPI directory
       parameters:
+        - name: q
+          in: query
+          schema:
+            type: string
+          description: Preferred free-text provider name fragment
         - name: count_only
           in: query
           schema:
@@ -1181,11 +1186,12 @@ paths:
             type: string
             enum: [classification, full_taxonomy]
           description: Optional aggregation mode for `count_only`
-        - name: name_like
+        - name: response_format
           in: query
           schema:
             type: string
-          description: Case-insensitive fragment matched against provider names
+            enum: [classification, full_taxonomy]
+          description: Alias for `format`
         - name: start
           in: query
           schema:
@@ -1195,7 +1201,7 @@ paths:
           in: query
           schema:
             type: number
-          description: Maximum number of rows to return (default 0 = all)
+          description: Maximum number of rows to return (default 50)
         - name: classification
           in: query
           schema:
@@ -1234,6 +1240,42 @@ paths:
             type: string
             minLength: 2
             maxLength: 2
+        - name: zip_code
+          in: query
+          schema:
+            type: string
+          description: ZIP/postal filter (first 5 digits)
+        - name: postal_code
+          in: query
+          schema:
+            type: string
+          description: Alias for `zip_code` (first 5 digits)
+        - name: phone
+          in: query
+          schema:
+            type: string
+          description: Provider phone match (digits only comparison; formatting ignored)
+        - name: first_name
+          in: query
+          schema:
+            type: string
+          description: Case-insensitive fragment match for provider first name
+        - name: last_name
+          in: query
+          schema:
+            type: string
+          description: Case-insensitive fragment match for provider last name
+        - name: organization_name
+          in: query
+          schema:
+            type: string
+          description: Case-insensitive fragment match for organization/DBA name
+        - name: entity_type_code
+          in: query
+          schema:
+            type: integer
+            enum: [1, 2]
+          description: 1 = individual provider, 2 = organization
         - name: codes
           in: query
           schema:
@@ -1252,6 +1294,11 @@ paths:
     get:
       summary: Find NPIs near a point or ZIP centroid
       parameters:
+        - name: q
+          in: query
+          schema:
+            type: string
+          description: Preferred free-text provider name fragment
         - name: long
           in: query
           schema:
@@ -1284,11 +1331,6 @@ paths:
           in: query
           schema:
             type: string
-        - name: name_like
-          in: query
-          schema:
-            type: string
-          description: Case-insensitive fragment matched against provider names
         - name: exclude_npi
           in: query
           schema:

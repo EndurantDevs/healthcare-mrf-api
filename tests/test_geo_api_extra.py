@@ -26,9 +26,10 @@ async def test_geo_index_handler():
 
 
 class FakeResult:
-    def __init__(self, row=None, rows=None):
+    def __init__(self, row=None, rows=None, scalar_value=None):
         self._row = row
         self._rows = rows
+        self._scalar_value = scalar_value
 
     def first(self):
         return self._row
@@ -37,6 +38,9 @@ class FakeResult:
         if self._rows is not None:
             return self._rows
         return [] if self._row is None else [self._row]
+
+    def scalar(self):
+        return self._scalar_value
 
 
 class FakeSession:
@@ -264,10 +268,20 @@ async def test_geo_states_sorted_asc_with_limit_and_skip_missing_top_zip():
     ]
     request = types.SimpleNamespace(
         args={"order": "asc", "limit": "1", "top_zip_limit": "2"},
-        ctx=types.SimpleNamespace(sa_session=FakeSession([FakeResult(rows=state_rows), FakeResult(rows=top_zip_rows)])),
+        ctx=types.SimpleNamespace(
+            sa_session=FakeSession(
+                [
+                    FakeResult(scalar_value=1),
+                    FakeResult(rows=state_rows),
+                    FakeResult(rows=top_zip_rows),
+                ]
+            )
+        ),
     )
     response = await geo_module.list_geo_states(request)
     payload = json.loads(response.body)
+    assert payload["total_states"] == 1
+    assert payload["limit"] == 1
     assert payload["states"][0]["state"] == "TX"
     assert payload["states"][0]["top_zips"][0]["zip_code"] == "73301"
 

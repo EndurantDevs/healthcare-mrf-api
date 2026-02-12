@@ -490,12 +490,35 @@ class NPIData(Base, JSONOutputMixin):
     )
     __my_index_elements__ = ['npi']
     __my_additional_indexes__ = [
-        {'index_elements': (
-            'npi',
-            NAME_SEARCH_VECTOR_WITH_OP,
-            'entity_type_code'),
+        {
+            'index_elements': (NAME_SEARCH_VECTOR_WITH_OP,),
             'using': 'gin',
-            'name': 'partial_search_helper'}]
+            'name': 'name_search_trgm',
+        },
+        {
+            'index_elements': (
+                "LOWER(COALESCE(provider_organization_name,'') || ' ' || "
+                "COALESCE(provider_other_organization_name,'') || ' ' || "
+                "COALESCE(do_business_as_text,'')) gin_trgm_ops",
+            ),
+            'using': 'gin',
+            'name': 'organization_search_trgm',
+        },
+        {
+            'index_elements': ("LOWER(COALESCE(provider_first_name,'')) gin_trgm_ops",),
+            'using': 'gin',
+            'name': 'first_name_trgm',
+        },
+        {
+            'index_elements': ("LOWER(COALESCE(provider_last_name,'')) gin_trgm_ops",),
+            'using': 'gin',
+            'name': 'last_name_trgm',
+        },
+        {
+            'index_elements': ('entity_type_code',),
+            'name': 'entity_type_code',
+        },
+    ]
     npi = Column(Integer, primary_key=True)
     employer_identification_number = Column(String)
     entity_type_code = Column(Integer)
@@ -653,7 +676,14 @@ class NPIAddress(AddressPrototype):
 
     __my_additional_indexes__ = [
         {'index_elements': ('postal_code',)},
+        {'index_elements': ("LEFT(postal_code, 5)",), 'name': 'postal_code_5'},
         {'index_elements': ('city_name', 'state_name', 'country_code'), 'using': 'gin'},
+        {'index_elements': ('type', 'state_name', 'city_name'), 'name': 'type_state_city'},
+        {'index_elements': ('type', "LEFT(postal_code, 5)"), 'name': 'type_postal_code_5'},
+        {
+            'index_elements': ("regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g')",),
+            'name': 'telephone_digits',
+        },
         {'index_elements': (
             'taxonomy_array gin__int_ops',
             'plans_network_array gin__int_ops'),

@@ -8,6 +8,7 @@ from sanic.exceptions import InvalidUsage
 from sqlalchemy import func, select
 from sqlalchemy.exc import ProgrammingError
 
+from api.endpoint.pagination import parse_pagination
 from db.models import GeoZipLookup
 from db.tiger_models import Zip_zcta5, ZipState
 
@@ -215,11 +216,17 @@ async def list_geo_states(request):
     if order not in {"asc", "desc"}:
         raise InvalidUsage("order must be 'asc' or 'desc'")
 
-    limit_param = args.get("limit")
-    try:
-        limit = max(1, min(int(limit_param), 100)) if limit_param else None
-    except (TypeError, ValueError) as exc:
-        raise InvalidUsage("limit must be an integer") from exc
+    pagination = parse_pagination(
+        args,
+        default_limit=50,
+        max_limit=100,
+        default_page=1,
+        allow_offset=True,
+        allow_start=True,
+        allow_page_size=True,
+    )
+    limit = pagination.limit
+    offset = pagination.offset
 
     top_zip_param = args.get("top_zip_limit")
     try:
@@ -259,8 +266,13 @@ async def list_geo_states(request):
     else:
         state_stmt = state_stmt.order_by(order_column.asc())
 
-    if limit is not None:
-        state_stmt = state_stmt.limit(limit)
+    total_states_stmt = select(func.count()).select_from(
+        select(geo_zip_table.c.state).group_by(geo_zip_table.c.state).subquery()
+    )
+    total_states_result = await session.execute(total_states_stmt)
+    total_states = int(total_states_result.scalar() or 0)
+
+    state_stmt = state_stmt.offset(offset).limit(limit)
 
     population_expr = func.coalesce(geo_zip_table.c.population, 0)
     rank_expr = func.row_number().over(
@@ -331,6 +343,10 @@ async def list_geo_states(request):
     return response.json(
         {
             "generated": datetime.utcnow().isoformat(),
+            "total_states": total_states,
+            "page": pagination.page,
+            "limit": limit,
+            "offset": offset,
             "states": states_payload,
         }
     )
@@ -341,13 +357,31 @@ async def get_top_cities_by_state(request, state):
     state = state.strip().upper()
     if len(state) != 2:
         raise InvalidUsage("state must be 2-letter abbreviation")
-    limit_param = request.args.get("limit")
-    try:
-        limit = max(1, min(int(limit_param), 200)) if limit_param else 20
-    except (TypeError, ValueError) as exc:
-        raise InvalidUsage("limit must be an integer") from exc
+    pagination = parse_pagination(
+        request.args,
+        default_limit=20,
+        max_limit=200,
+        default_page=1,
+        allow_offset=True,
+        allow_start=True,
+        allow_page_size=True,
+    )
+    limit = pagination.limit
+    offset = pagination.offset
 
     session = _get_session(request)
+    total_stmt = (
+        select(func.count())
+        .select_from(
+            select(geo_zip_table.c.city)
+            .where(geo_zip_table.c.state == state)
+            .group_by(geo_zip_table.c.city, geo_zip_table.c.state)
+            .subquery()
+        )
+    )
+    total_result = await session.execute(total_stmt)
+    total = int(total_result.scalar() or 0)
+
     stmt = (
         select(
             geo_zip_table.c.city.label("city"),
@@ -363,6 +397,7 @@ async def get_top_cities_by_state(request, state):
             func.sum(func.coalesce(geo_zip_table.c.population, 0)).desc(),
             geo_zip_table.c.city.asc(),
         )
+        .offset(offset)
         .limit(limit)
     )
 
@@ -384,4 +419,13 @@ async def get_top_cities_by_state(request, state):
             }
         )
 
-    return response.json({"state": state, "limit": limit, "items": items})
+    return response.json(
+        {
+            "state": state,
+            "total": total,
+            "page": pagination.page,
+            "limit": limit,
+            "offset": offset,
+            "items": items,
+        }
+    )

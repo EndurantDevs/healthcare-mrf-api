@@ -79,6 +79,8 @@ async def test_list_formularies_returns_rows():
     data = json.loads(response.body)
 
     assert data["total"] == 2
+    assert data["limit"] == 10
+    assert data["offset"] == 0
     assert data["items"][0]["formulary_id"] == "PLAN123:2025"
     assert data["items"][0]["formulary_uri"] == "PLAN123/2025"
     assert data["items"][0]["issuer"]["issuer_name"] == "Issuer One"
@@ -147,6 +149,8 @@ async def test_list_formulary_drugs_respects_filters():
     payload = json.loads(response.body)
 
     assert payload["total"] == 3
+    assert payload["limit"] == 5
+    assert payload["offset"] == 0
     assert payload["items"][0]["rxnorm_id"] == "12345"
     assert payload["items"][0]["drug_tier_slug"] == "tier_1"
     assert payload["available_pharmacy_types"] == ["MAIL_ORDER", "RETAIL"]
@@ -293,3 +297,21 @@ async def test_check_plan_drug_not_covered():
 
     with pytest.raises(NotFound):
         await formulary.check_plan_drug(request, "UNKNOWN_PLAN", "12345")
+
+
+@pytest.mark.asyncio
+async def test_list_formularies_supports_offset_limit_window():
+    request = make_request(
+        [
+            FakeResult(scalar=100),
+            FakeResult(rows=[]),
+        ],
+        args={"offset": "40", "limit": "20"},
+    )
+
+    response = await formulary.list_formularies(request)
+    data = json.loads(response.body)
+    assert data["page"] == 3
+    assert data["page_size"] == 20
+    assert data["limit"] == 20
+    assert data["offset"] == 40
