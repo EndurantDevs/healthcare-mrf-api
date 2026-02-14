@@ -551,16 +551,20 @@ async def pharmacists_per_pharmacy(request):
 
 @blueprint.get("/all")
 async def get_all(request):
-    count_only = str(request.args.get("count_only", "0")).strip().lower() in {"1", "true", "yes", "on"}
+    count_only = str(request.args.get("count_only", "0")).strip() == "1"
     response_format = request.args.get("format") or request.args.get("response_format")
-    if _extract_name_filters(request):
-        raise sanic.exceptions.InvalidUsage(
-            "name_like is no longer supported on /npi/all; use q"
-        )
+    legacy_name_like = _extract_name_filters(request)
     # Explicit access for route collectors / OpenAPI parity.
     request.args.get("q")
+    request.args.get("start")
+    request.args.get("limit")
     q_value = str(request.args.get("q") or "").strip().lower()
-    names_like = [q_value] if q_value else []
+    names_like: list[str] = []
+    if q_value:
+        names_like.append(q_value)
+    for value in legacy_name_like:
+        if value not in names_like:
+            names_like.append(value)
     pagination = parse_pagination(
         request.args,
         default_limit=50,

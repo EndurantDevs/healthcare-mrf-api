@@ -198,6 +198,12 @@ async def get_issuers(request, state=None):
     if state_filter and len(state_filter) != 2:
         raise sanic.exceptions.BadRequest("state must be a 2-letter code")
     query_text = str(request.args.get("q") or "").strip().lower()
+    # Explicit access keeps route/query introspection in sync with OpenAPI.
+    request.args.get("page")
+    request.args.get("limit")
+    request.args.get("offset")
+    request.args.get("start")
+    request.args.get("page_size")
 
     pagination = None
     if any(

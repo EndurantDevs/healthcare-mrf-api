@@ -218,6 +218,9 @@ async def list_formularies(request):
     session = _get_session(request)
 
     args = request.args
+    # Explicit access keeps route/query introspection in sync with OpenAPI.
+    args.get("page")
+    args.get("page_size")
     pagination = parse_pagination(
         args,
         default_limit=DEFAULT_PAGE_SIZE,
@@ -363,7 +366,15 @@ async def get_formulary(request, formulary_id):
         .where(plan_drug_stats_table.c.plan_id == plan_id)
     )
     stats_result = await session.execute(drug_counts_stmt)
-    stats_row = stats_result.first() or {"drug_count": 0, "last_updated": None}
+    stats_row = stats_result.first()
+    stats_map = None
+    if stats_row is not None:
+        if isinstance(stats_row, dict):
+            stats_map = stats_row
+        else:
+            stats_map = getattr(stats_row, "_mapping", None)
+    if stats_map is None:
+        stats_map = {"drug_count": 0, "last_updated": None}
 
     tiers_stmt = (
         select(plan_drug_tier_stats_table.c.drug_tier)
@@ -385,7 +396,7 @@ async def get_formulary(request, formulary_id):
     )
     pharmacy_types = await _collect_distinct_strings(session, pharmacy_stmt)
 
-    last_updated = stats_row["last_updated"]
+    last_updated = stats_map.get("last_updated")
     if last_updated is not None:
         last_updated = last_updated.isoformat()
 
@@ -407,7 +418,7 @@ async def get_formulary(request, formulary_id):
         },
         "available_tiers": tiers,
         "available_pharmacy_types": pharmacy_types,
-        "drug_count": int(stats_row["drug_count"] or 0),
+        "drug_count": int(stats_map.get("drug_count") or 0),
         "last_updated": last_updated,
     }
 
@@ -422,6 +433,9 @@ async def list_formulary_drugs(request, formulary_id):
         raise NotFound("Unknown formulary identifier")
 
     args = request.args
+    # Explicit access keeps route/query introspection in sync with OpenAPI.
+    args.get("page")
+    args.get("page_size")
     pagination = parse_pagination(
         args,
         default_limit=DEFAULT_PAGE_SIZE,
