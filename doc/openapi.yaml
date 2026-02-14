@@ -626,6 +626,11 @@ paths:
           schema:
             type: integer
           description: Optional age filter; validated but not applied server-side
+        - name: year
+          in: query
+          schema:
+            type: integer
+          description: Optional business year filter
         - name: rating_area
           in: query
           schema:
@@ -660,6 +665,11 @@ paths:
           schema:
             type: integer
           description: Optional age filter; validated but not applied server-side
+        - name: year
+          in: query
+          schema:
+            type: integer
+          description: Optional business year filter
         - name: rating_area
           in: query
           schema:
@@ -851,6 +861,58 @@ paths:
   /issuer/:
     get:
       summary: List issuers across all states
+      parameters:
+        - name: state
+          in: query
+          required: false
+          schema:
+            type: string
+            minLength: 2
+            maxLength: 2
+          description: Optional two-letter state filter.
+        - name: q
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Case-insensitive issuer-name search fragment.
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+          description: Optional page number (enables paginated object response).
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+          description: Optional page size.
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+          description: Optional row offset.
+        - name: start
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+          description: Alias for offset.
+        - name: page_size
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+          description: Alias for limit.
       responses:
         '200':
           description: Array of issuer summaries
@@ -877,6 +939,57 @@ paths:
             type: string
             minLength: 2
             maxLength: 2
+        - name: state
+          in: query
+          required: false
+          schema:
+            type: string
+            minLength: 2
+            maxLength: 2
+          description: Optional state filter (path state takes precedence).
+        - name: q
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Case-insensitive issuer-name search fragment.
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+          description: Optional page number (enables paginated object response).
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+          description: Optional page size.
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+          description: Optional row offset.
+        - name: start
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+          description: Alias for offset.
+        - name: page_size
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+          description: Alias for limit.
       responses:
         '200':
           description: Array of issuer summaries for the state
@@ -1062,6 +1175,26 @@ paths:
   /nucc/all:
     get:
       summary: List NUCC taxonomy codes
+      parameters:
+        - name: q
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Free-text match across code and taxonomy fields.
+        - name: code
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Partial taxonomy-code filter.
+        - name: order
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [asc, desc]
+          description: Display-name sort direction.
       responses:
         '200':
           description: Array of NUCC taxonomy entries

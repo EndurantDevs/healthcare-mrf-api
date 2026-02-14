@@ -45,6 +45,17 @@ class MappingRow:
             raise AttributeError(item) from exc
 
 
+class IndexOnlyRow:
+    def __init__(self, values, **mapping):
+        self._values = tuple(values)
+        self._mapping = mapping
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self._values[key]
+        raise TypeError("tuple indices must be integers or slices, not str")
+
+
 def make_request(results, args=None):
     session = FakeSession(results)
     ctx = types.SimpleNamespace(sa_session=session)
@@ -119,6 +130,38 @@ async def test_get_formulary_returns_detail():
     assert data["drug_count"] == 42
     assert data["available_tiers"][0]["tier_slug"] == "tier_1"
     assert data["available_pharmacy_types"] == ["MAIL_ORDER", "RETAIL"]
+
+
+@pytest.mark.asyncio
+async def test_get_formulary_handles_index_only_stats_row():
+    request = make_request(
+        [
+            FakeResult(
+                rows=[
+                    MappingRow(
+                        plan_id="PLAN123",
+                        year=2025,
+                        marketing_name="Sample Plan",
+                        state="CA",
+                        summary_url="http://example.com/summary",
+                        marketing_url="http://example.com/marketing",
+                        issuer_id=99,
+                        issuer_name="Issuer One",
+                        issuer_marketing_name="Issuer Marketing",
+                    )
+                ]
+            ),
+            FakeResult(rows=[IndexOnlyRow((42, None), drug_count=42, last_updated=None)]),
+            FakeResult(rows=[("Tier 1",)]),
+            FakeResult(rows=[("RETAIL",)]),
+        ]
+    )
+
+    response = await formulary.get_formulary(request, "PLAN123:2025")
+    data = json.loads(response.body)
+
+    assert data["drug_count"] == 42
+    assert data["last_updated"] is None
 
 
 @pytest.mark.asyncio

@@ -86,6 +86,7 @@ class Attributes:
     on_shutdown = attr_shutdown
     max_jobs = 20
     queue_read_limit = 5
+    queue_name = "arq:Attributes"
     job_timeout = 3600
     redis_settings = build_redis_settings()
     job_serializer = serialize_job

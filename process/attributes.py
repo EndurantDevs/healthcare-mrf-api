@@ -11,12 +11,10 @@ import tempfile
 import zipfile
 from pathlib import PurePath
 
-import msgpack
 import pytz
 from aiocsv import AsyncDictReader
 from aiofile import async_open
 from arq import create_pool
-from arq.connections import RedisSettings
 from async_unzip.unzipper import unzip
 from dateutil.parser import parse as parse_date
 from sqlalchemy.exc import IntegrityError
@@ -28,11 +26,22 @@ from db.models import (PlanAttributes, PlanBenefits, PlanPrices,
 from process.ext.utils import (download_it_and_save, ensure_database,
                                get_import_schema, make_class, print_time_info,
                                push_objects, return_checksum)
+from process.redis_config import build_redis_settings
+from process.serialization import deserialize_job, serialize_job
 
 latin_pattern = re.compile(r"[^\x00-\x7f]")
+ATTRIBUTES_QUEUE_NAME = "arq:Attributes"
 
 _TABLES_PREPARED = False
 _TABLES_LOCK = asyncio.Lock()
+
+
+async def _table_exists(schema: str, table_name: str) -> bool:
+    exists = await db.scalar(
+        "SELECT to_regclass(:qualified_name) IS NOT NULL",
+        qualified_name=f"{schema}.{table_name}",
+    )
+    return bool(exists)
 
 
 async def _prepare_attribute_tables(ctx):
@@ -138,6 +147,11 @@ async def shutdown(ctx):
     for cls in processing_classes_array:
         tables[cls.__main_table__] = make_class(cls, import_date, schema_override=db_schema)
         obj = tables[cls.__main_table__]
+        table_name = f"{db_schema}.{obj.__tablename__}"
+
+        if not await _table_exists(db_schema, obj.__tablename__):
+            print(f"Skipping post-processing for missing table {table_name}")
+            continue
 
         if hasattr(cls, "__my_additional_indexes__") and cls.__my_additional_indexes__:
             for index in cls.__my_additional_indexes__:
@@ -160,13 +174,18 @@ async def shutdown(ctx):
                 print(create_index_sql)
                 await db.status(create_index_sql)
 
-        print(f"Post-Index VACUUM FULL ANALYZE {db_schema}.{obj.__tablename__};")
-        await db.execute_ddl(f"VACUUM FULL ANALYZE {db_schema}.{obj.__tablename__};")
+        print(f"Post-Index VACUUM FULL ANALYZE {table_name};")
+        await db.execute_ddl(f"VACUUM FULL ANALYZE {table_name};")
 
     async with db.transaction():
         for cls in processing_classes_array:
             tables[cls.__main_table__] = make_class(cls, import_date, schema_override=db_schema)
             obj = tables[cls.__main_table__]
+            table_name = f"{db_schema}.{obj.__tablename__}"
+
+            if not await _table_exists(db_schema, obj.__tablename__):
+                print(f"Skipping swap for missing table {table_name}")
+                continue
 
             table = obj.__main_table__
             await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
@@ -718,9 +737,10 @@ async def process_state_attributes(ctx, task):
 
 async def main(test_mode: bool = False):
     redis = await create_pool(
-        RedisSettings.from_dsn(os.environ.get("HLTHPRT_REDIS_ADDRESS")),
-        job_serializer=msgpack.packb,
-        job_deserializer=lambda b: msgpack.unpackb(b, raw=False),
+        build_redis_settings(),
+        job_serializer=serialize_job,
+        job_deserializer=deserialize_job,
+        default_queue_name=ATTRIBUTES_QUEUE_NAME,
     )
     attribute_files = json.loads(os.environ["HLTHPRT_CMSGOV_PLAN_ATTRIBUTES_URL_PUF"])
     state_attribute_files = json.loads(

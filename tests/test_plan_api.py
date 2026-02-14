@@ -788,12 +788,19 @@ async def test_find_a_plan_zip_warning():
 @pytest.mark.asyncio
 async def test_get_price_plan_with_year():
     request = make_request(
-        [FakeResult(rows=[{"plan_id": "P1"}])],
-        args={"age": "30"},
+        [
+            FakeResult(
+                rows=[
+                    {"plan_id": "P1", "year": 2024, "individual_rate": 100},
+                    {"plan_id": "P1", "year": 2025, "individual_rate": 200},
+                ]
+            )
+        ],
+        args={"age": "30", "year": "2024"},
     )
-    response = await get_price_plan(request, "P1", year="2024")
+    response = await get_price_plan(request, "P1")
     payload = json.loads(response.body)
-    assert payload == [{"plan_id": "P1"}]
+    assert payload == [{"plan_id": "P1", "year": 2024, "individual_rate": 100}]
 
 
 @pytest.mark.asyncio

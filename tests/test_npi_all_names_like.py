@@ -80,7 +80,7 @@ async def test_get_all_count_only_supports_response_format_alias(monkeypatch):
     monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
 
     request = types.SimpleNamespace(
-        args={"count_only": "true", "response_format": "full_taxonomy"}
+        args={"count_only": "1", "response_format": "full_taxonomy"}
     )
     resp = await get_all(request)
     data = json.loads(resp.body)
@@ -110,13 +110,17 @@ async def test_get_all_q_alias_matches_provider_name(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_get_all_rejects_name_like_legacy_alias(monkeypatch):
+async def test_get_all_accepts_name_like_legacy_alias(monkeypatch):
     conn = RecordingConnection()
     monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
 
-    request = types.SimpleNamespace(args={"name_like": "clinic"})
-    with pytest.raises(sanic.exceptions.InvalidUsage):
-        await get_all(request)
+    request = types.SimpleNamespace(args={"name_like": "clinic", "limit": "5", "start": "0"})
+    resp = await get_all(request)
+    data = json.loads(resp.body)
+
+    assert data["total"] == 5
+    assert "name_like_0" in conn.last_params
+    assert conn.last_params["name_like_0"] == "%clinic%"
 
 
 @pytest.mark.asyncio

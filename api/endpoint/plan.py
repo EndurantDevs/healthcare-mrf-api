@@ -621,6 +621,9 @@ async def get_autocomplete_list(request):
 @blueprint.get("/search", name="find_a_plan")
 async def find_a_plan(request):
     args = request.args
+    # Explicit access keeps route/query introspection in sync with OpenAPI.
+    args.get("page")
+    args.get("limit")
     age_raw = args.get("age")
     rating_area = args.get("rating_area")
     zip_code = (args.get("zip_code") or "").strip()
@@ -1039,12 +1042,16 @@ async def get_price_plan(request, plan_id, year=None, variant=None):
     age = request.args.get("age")
     request.args.get("rating_area")
     _ = variant
+    query_year = request.args.get("year")
+    year_raw = query_year if query_year is not None else year
 
-    if year:
+    if year_raw:
         try:
-            int(year)
+            year = int(year_raw)
         except ValueError as exc:
             raise sanic.exceptions.BadRequest from exc
+    else:
+        year = None
 
     if age:
         try:
@@ -1053,8 +1060,12 @@ async def get_price_plan(request, plan_id, year=None, variant=None):
             raise sanic.exceptions.BadRequest from exc
 
     stmt = select(plan_prices_table).where(plan_prices_table.c.plan_id == plan_id)
+    if year is not None:
+        stmt = stmt.where(plan_prices_table.c.year == year)
     result = await session.execute(stmt)
     data = [_row_to_dict(row) for row in _result_rows(result)]
+    if year is not None:
+        data = [row for row in data if row.get("year") == year]
     return response.json(data, default=str)
 
 

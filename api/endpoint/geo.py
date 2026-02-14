@@ -215,6 +215,8 @@ async def list_geo_states(request):
     order = (args.get("order") or "desc").lower()
     if order not in {"asc", "desc"}:
         raise InvalidUsage("order must be 'asc' or 'desc'")
+    # Explicit access keeps route/query introspection in sync with OpenAPI.
+    args.get("limit")
 
     pagination = parse_pagination(
         args,
@@ -357,6 +359,8 @@ async def get_top_cities_by_state(request, state):
     state = state.strip().upper()
     if len(state) != 2:
         raise InvalidUsage("state must be 2-letter abbreviation")
+    # Explicit access keeps route/query introspection in sync with OpenAPI.
+    request.args.get("limit")
     pagination = parse_pagination(
         request.args,
         default_limit=20,
