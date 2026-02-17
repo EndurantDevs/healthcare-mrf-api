@@ -152,6 +152,51 @@ def stop_mrf(burst: bool, import_id: str | None):
     _run_worker_command("process.MRF_finish", True, env)
 
 
+@stop.command("claims-pricing")
+@click.option("--burst/--no-burst", default=True, help="Match arq worker burst mode (defaults to burst).")
+@click.option("--import-id", help="Override the import_id/import_date passed to worker startup.")
+def stop_claims_pricing(burst: bool, import_id: str | None):
+    """Drain claims pricing chunk jobs and run the finalize queue."""
+    env = os.environ.copy()
+    if import_id:
+        env["HLTHPRT_IMPORT_ID_OVERRIDE"] = import_id
+    else:
+        env.pop("HLTHPRT_IMPORT_ID_OVERRIDE", None)
+
+    _run_worker_command("process.ClaimsPricing", burst, env)
+    _run_worker_command("process.ClaimsPricing_finish", True, env)
+
+
+@stop.command("claims-procedures")
+@click.option("--burst/--no-burst", default=True, help="Match arq worker burst mode (defaults to burst).")
+@click.option("--import-id", help="Override the import_id/import_date passed to worker startup.")
+def stop_claims_procedures(burst: bool, import_id: str | None):
+    """Drain procedures claims jobs and run the finalize queue."""
+    env = os.environ.copy()
+    if import_id:
+        env["HLTHPRT_IMPORT_ID_OVERRIDE"] = import_id
+    else:
+        env.pop("HLTHPRT_IMPORT_ID_OVERRIDE", None)
+
+    _run_worker_command("process.ClaimsProcedures", burst, env)
+    _run_worker_command("process.ClaimsProcedures_finish", True, env)
+
+
+@stop.command("drug-claims")
+@click.option("--burst/--no-burst", default=True, help="Match arq worker burst mode (defaults to burst).")
+@click.option("--import-id", help="Override the import_id/import_date passed to worker startup.")
+def stop_drug_claims(burst: bool, import_id: str | None):
+    """Drain drug claims jobs and run the finalize queue."""
+    env = os.environ.copy()
+    if import_id:
+        env["HLTHPRT_IMPORT_ID_OVERRIDE"] = import_id
+    else:
+        env.pop("HLTHPRT_IMPORT_ID_OVERRIDE", None)
+
+    _run_worker_command("process.DrugClaims", burst, env)
+    _run_worker_command("process.DrugClaims_finish", True, env)
+
+
 cli.add_command(stop, name="stop")
 cli.add_command(arq.cli.cli, name="worker")
 cli.add_command(manage, name="manage")

@@ -303,6 +303,7 @@ async def process_attributes(ctx, task):
                             "attr_obj_list": attr_obj_list,
                             "context": {"test_mode": test_mode},
                         },
+                        _queue_name=ATTRIBUTES_QUEUE_NAME,
                     )
                     attr_obj_list.clear()
                     count = 0
@@ -407,6 +408,7 @@ async def process_benefits(ctx, task):
                             "attr_obj_list": attr_obj_list,
                             "context": {"test_mode": test_mode},
                         },
+                        _queue_name=ATTRIBUTES_QUEUE_NAME,
                     )
                     attr_obj_list.clear()
                     count = 0
@@ -560,6 +562,7 @@ async def process_prices(ctx, task):
                             "attr_obj_list": attr_obj_list,
                             "context": {"test_mode": test_mode},
                         },
+                        _queue_name=ATTRIBUTES_QUEUE_NAME,
                     )
                     attr_obj_list.clear()
                     count = 0
@@ -725,6 +728,7 @@ async def process_state_attributes(ctx, task):
                             "attr_obj_list": attr_obj_list,
                             "context": {"test_mode": test_mode},
                         },
+                        _queue_name=ATTRIBUTES_QUEUE_NAME,
                     )
                     attr_obj_list.clear()
                     count = 0
@@ -761,6 +765,7 @@ async def main(test_mode: bool = False):
                 "year": file["year"],
                 "context": {"test_mode": test_mode},
             },
+            _queue_name=ATTRIBUTES_QUEUE_NAME,
         )
 
     print("Starting to process Plan Attribute files..")
@@ -773,6 +778,7 @@ async def main(test_mode: bool = False):
                 "year": file["year"],
                 "context": {"test_mode": test_mode},
             },
+            _queue_name=ATTRIBUTES_QUEUE_NAME,
         )
 
     print("Starting to process Plan Prices files..")
@@ -785,6 +791,7 @@ async def main(test_mode: bool = False):
                 "year": file["year"],
                 "context": {"test_mode": test_mode},
             },
+            _queue_name=ATTRIBUTES_QUEUE_NAME,
         )
 
     print("Starting to process Plan Benefits files..")
@@ -797,4 +804,5 @@ async def main(test_mode: bool = False):
                 "year": file["year"],
                 "context": {"test_mode": test_mode},
             },
+            _queue_name=ATTRIBUTES_QUEUE_NAME,
         )

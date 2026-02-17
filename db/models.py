@@ -672,13 +672,18 @@ class NPIAddress(AddressPrototype):
     __main_table__ = __tablename__
     __my_index_elements__ = ['npi', 'type', 'checksum']
     #__my_initial_indexes__ = [{'index_elements': ('npi', 'type'), 'unique': True, 'where': "type='primary'"}] #  or type='secondary'
-    __my_initial_indexes__ = [{'index_elements': ('checksum',), 'using': 'gin'}]
+    __my_initial_indexes__ = [{'index_elements': ('checksum',)}]
 
     __my_additional_indexes__ = [
         {'index_elements': ('postal_code',)},
         {'index_elements': ("LEFT(postal_code, 5)",), 'name': 'postal_code_5'},
         {'index_elements': ('city_name', 'state_name', 'country_code'), 'using': 'gin'},
         {'index_elements': ('type', 'state_name', 'city_name'), 'name': 'type_state_city'},
+        {
+            'index_elements': ('city_name', 'state_name', 'npi'),
+            'name': 'primary_city_state_npi',
+            'where': "type='primary'",
+        },
         {'index_elements': ('type', "LEFT(postal_code, 5)"), 'name': 'type_postal_code_5'},
         {
             'index_elements': ("regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g')",),
@@ -689,6 +694,30 @@ class NPIAddress(AddressPrototype):
             'plans_network_array gin__int_ops'),
             'using': 'gin',
             'name': 'taxonomy_plans_network'},
+        {'index_elements': (
+            'procedures_array gin__int_ops',
+        ),
+            'using': 'gin',
+            'name': 'procedures_array'},
+        {'index_elements': (
+            'medications_array gin__int_ops',
+        ),
+            'using': 'gin',
+            'name': 'medications_array'},
+        {'index_elements': (
+            'taxonomy_array gin__int_ops',
+            'plans_network_array gin__int_ops',
+            'procedures_array gin__int_ops',
+        ),
+            'using': 'gin',
+            'name': 'taxonomy_plans_procedures'},
+        {'index_elements': (
+            'taxonomy_array gin__int_ops',
+            'plans_network_array gin__int_ops',
+            'medications_array gin__int_ops',
+        ),
+            'using': 'gin',
+            'name': 'taxonomy_plans_medications'},
         {'index_elements': (
             'telephone_number',
             'taxonomy_array gin__int_ops',
@@ -705,14 +734,33 @@ class NPIAddress(AddressPrototype):
             'using': 'gin',
             'name': 'plans_network_taxonomy_phone'},
         {'index_elements': (
-        'Geography(ST_MakePoint(long, lat))', 'taxonomy_array gist__intbig_ops', 'plans_network_array gist__intbig_ops'),
+        'Geography(ST_MakePoint((long)::double precision, (lat)::double precision))', 'taxonomy_array gist__intbig_ops', 'plans_network_array gist__intbig_ops'),
             'using': 'gist',
-            'name': 'geo_index_with_taxonomy_and_plans','where': "type='primary' or type='secondary'"}]
+            'name': 'geo_index_with_taxonomy_and_plans','where': "type='primary' or type='secondary'"},
+        {'index_elements': (
+        'Geography(ST_MakePoint((long)::double precision, (lat)::double precision))', 'taxonomy_array gist__intbig_ops', 'plans_network_array gist__intbig_ops', 'procedures_array gist__intbig_ops'),
+            'using': 'gist',
+            'name': 'geo_index_with_taxonomy_plans_and_procedures','where': "type='primary' or type='secondary'"},
+        {'index_elements': (
+        'Geography(ST_MakePoint((long)::double precision, (lat)::double precision))', 'taxonomy_array gist__intbig_ops', 'plans_network_array gist__intbig_ops', 'medications_array gist__intbig_ops'),
+            'using': 'gist',
+            'name': 'geo_index_with_taxonomy_plans_and_medications','where': "type='primary' or type='secondary'"},
+        {'index_elements': (
+        'Geography(ST_MakePoint((long)::double precision, (lat)::double precision))', 'procedures_array gist__intbig_ops', 'plans_network_array gist__intbig_ops', 'taxonomy_array gist__intbig_ops',),
+            'using': 'gist',
+            'name': 'geo_index_with_taxonomy_plans_and_medications','where': "type='primary' or type='secondary'"},
+        {'index_elements': (
+        'Geography(ST_MakePoint((long)::double precision, (lat)::double precision))', 'medications_array gist__intbig_ops', 'plans_network_array gist__intbig_ops', 'taxonomy_array gist__intbig_ops',),
+            'using': 'gist',
+            'name': 'geo_index_with_taxonomy_plans_and_medications','where': "type='primary' or type='secondary'"},
+    ]
 
     npi = Column(Integer, primary_key=True)
     type = Column(String, primary_key=True)
     taxonomy_array = Column(ARRAY(Integer), nullable=False, server_default="{0}")
     plans_network_array = Column(ARRAY(Integer), nullable=False, server_default="{0}")
+    procedures_array = Column(ARRAY(Integer), nullable=False, server_default="{0}")
+    medications_array = Column(ARRAY(Integer), nullable=False, server_default="{0}")
 
     # NPI	Provider Secondary Practice Location Address- Address Line 1	Provider Secondary Practice Location Address-  Address Line 2	Provider Secondary Practice Location Address - City Name	Provider Secondary Practice Location Address - State Name	Provider Secondary Practice Location Address - Postal Code	Provider Secondary Practice Location Address - Country Code (If outside U.S.)	Provider Secondary Practice Location Address - Telephone Number	Provider Secondary Practice Location Address - Telephone Extension	Provider Practice Location Address - Fax Number
 
@@ -926,3 +974,405 @@ class PTGAllowedProviderPayment(Base, JSONOutputMixin):
     payment_hash = Column(BigInteger)
     billed_charge = Column(Numeric)
     npi = Column(ARRAY(BigInteger))
+
+
+class PricingProvider(Base, JSONOutputMixin):
+    __tablename__ = "pricing_provider"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("provider_key"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["provider_key"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("npi",), "name": "pricing_provider_npi_idx"},
+        {"index_elements": ("year",), "name": "pricing_provider_year_idx"},
+        {"index_elements": ("year", "npi"), "name": "pricing_provider_year_npi_idx"},
+        {"index_elements": ("state", "city"), "name": "pricing_provider_state_city_idx"},
+        {"index_elements": ("year", "state", "city"), "name": "pricing_provider_year_state_city_idx"},
+        {"index_elements": ("year", "state", "city", "provider_type"), "name": "pricing_provider_year_state_city_type_idx"},
+        {"index_elements": ("provider_type",), "name": "pricing_provider_type_idx"},
+        {"index_elements": ("year", "lower(provider_type)"), "name": "pricing_provider_year_provider_type_lower_idx"},
+        {"index_elements": ("year", "lower(provider_name)"), "name": "pricing_provider_year_provider_name_lower_idx"},
+        {"index_elements": ("year", "total_allowed_amount DESC"), "name": "pricing_provider_year_total_allowed_amount_desc_idx"},
+        {"index_elements": ("year", "total_services DESC"), "name": "pricing_provider_year_total_services_desc_idx"},
+    ]
+
+    provider_key = Column(BigInteger)
+    npi = Column(BigInteger, nullable=False)
+    year = Column(Integer, nullable=False)
+    provider_name = Column(String)
+    first_name = Column(String)
+    last_org_name = Column(String)
+    credentials = Column(String)
+    provider_type = Column(String)
+    city = Column(String)
+    state = Column(String(2))
+    zip5 = Column(String(5))
+    country = Column(String)
+    total_services = Column(Float)
+    total_distinct_hcpcs_codes = Column(Float)
+    total_allowed_amount = Column(Numeric(scale=2, precision=16, asdecimal=False, decimal_return_scale=None))
+    total_submitted_charges = Column(Float)
+    total_beneficiaries = Column(Float)
+
+
+class PricingProcedure(Base, JSONOutputMixin):
+    __tablename__ = "pricing_procedure"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("procedure_code"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["procedure_code"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("service_description",), "name": "pricing_procedure_service_description_idx"},
+        {"index_elements": ("reported_code",), "name": "pricing_procedure_reported_code_idx"},
+        {"index_elements": ("lower(service_description)",), "name": "pricing_procedure_service_description_lower_idx"},
+        {"index_elements": ("lower(reported_code)",), "name": "pricing_procedure_reported_code_lower_idx"},
+        {"index_elements": ("source_year", "lower(service_description)"), "name": "pricing_procedure_year_service_description_lower_idx"},
+    ]
+
+    procedure_code = Column(BigInteger)
+    service_description = Column(String)
+    reported_code = Column(String)
+    avg_submitted_charge = Column(Float)
+    avg_allowed_amount = Column(Float)
+    avg_payment_amount = Column(Float)
+    avg_standardized_amount = Column(Float)
+    total_allowed_amount = Column(Float)
+    total_services = Column(Float)
+    total_beneficiaries = Column(Float)
+    source_year = Column(Integer)
+
+
+class PricingProviderProcedure(Base, JSONOutputMixin):
+    __tablename__ = "pricing_provider_procedure"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("npi", "year", "procedure_code"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["npi", "year", "procedure_code"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("year", "procedure_code"), "name": "pricing_provider_proc_year_idx"},
+        {"index_elements": ("year", "procedure_code", "npi"), "name": "pricing_provider_proc_year_npi_idx"},
+        {"index_elements": ("reported_code",), "name": "pricing_provider_proc_reported_code_idx"},
+        {"index_elements": ("service_description",), "name": "pricing_provider_proc_service_description_idx"},
+        {"index_elements": ("year", "lower(reported_code)"), "name": "pricing_provider_proc_year_reported_code_lower_idx"},
+        {"index_elements": ("year", "lower(service_description)"), "name": "pricing_provider_proc_year_service_description_lower_idx"},
+        {"index_elements": ("year", "npi", "total_allowed_amount DESC"), "name": "pricing_provider_proc_year_npi_total_allowed_amount_desc_idx"},
+    ]
+
+    npi = Column(BigInteger, nullable=False)
+    year = Column(Integer, nullable=False)
+    procedure_code = Column(BigInteger, nullable=False)
+    service_description = Column(String)
+    reported_code = Column(String)
+    total_services = Column(Float)
+    total_beneficiary_day_services = Column(Float)
+    total_submitted_charges = Column(Float)
+    total_allowed_amount = Column(Numeric(scale=2, precision=16, asdecimal=False, decimal_return_scale=None))
+    total_beneficiaries = Column(Float)
+    ge65_total_services = Column(Float)
+    ge65_total_allowed_amount = Column(Float)
+    ge65_total_beneficiaries = Column(Float)
+
+
+class PricingProviderProcedureLocation(Base, JSONOutputMixin):
+    __tablename__ = "pricing_provider_procedure_location"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("location_key"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["location_key"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("npi", "year", "procedure_code"), "name": "pricing_provider_loc_lookup_idx"},
+        {"index_elements": ("state", "city"), "name": "pricing_provider_loc_state_city_idx"},
+        {"index_elements": ("year", "state", "city"), "name": "pricing_provider_loc_year_state_city_idx"},
+        {"index_elements": ("year", "zip5"), "name": "pricing_provider_loc_year_zip5_idx"},
+    ]
+
+    location_key = Column(BigInteger)
+    npi = Column(BigInteger, nullable=False)
+    year = Column(Integer, nullable=False)
+    procedure_code = Column(BigInteger, nullable=False)
+    place_of_service = Column(String(8))
+    city = Column(String)
+    state = Column(String(2))
+    zip5 = Column(String(5))
+    state_fips = Column(String(4))
+    country = Column(String)
+
+
+class PricingProviderProcedureCostProfile(Base, JSONOutputMixin):
+    __tablename__ = "pricing_provider_procedure_cost_profile"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "npi",
+            "year",
+            "procedure_code",
+            "geography_scope",
+            "geography_value",
+            "specialty_key",
+            "setting_key",
+        ),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = [
+        "npi",
+        "year",
+        "procedure_code",
+        "geography_scope",
+        "geography_value",
+        "specialty_key",
+        "setting_key",
+    ]
+    __my_additional_indexes__ = [
+        {"index_elements": ("year", "npi", "procedure_code"), "name": "pricing_provider_proc_cost_year_npi_proc_idx"},
+        {
+            "index_elements": ("year", "procedure_code", "geography_scope", "geography_value", "specialty_key", "setting_key"),
+            "name": "pricing_provider_proc_cost_lookup_idx",
+        },
+        {
+            "index_elements": (
+                "year",
+                "geography_scope",
+                "geography_value",
+                "specialty_key",
+                "setting_key",
+                "avg_submitted_charge",
+            ),
+            "name": "pricing_provider_proc_cost_geo_avg_idx",
+        },
+    ]
+
+    npi = Column(BigInteger, nullable=False)
+    year = Column(Integer, nullable=False)
+    procedure_code = Column(BigInteger, nullable=False)
+    geography_scope = Column(String(16), nullable=False)
+    geography_value = Column(String(128), nullable=False)
+    specialty_key = Column(String(128), nullable=False)
+    setting_key = Column(String(64), nullable=False)
+    claim_count = Column(Float)
+    total_submitted_charge = Column(Numeric(scale=2, precision=18, asdecimal=False, decimal_return_scale=None))
+    avg_submitted_charge = Column(Numeric(scale=4, precision=18, asdecimal=False, decimal_return_scale=None))
+    updated_at = Column(DateTime)
+
+
+class PricingProcedurePeerStats(Base, JSONOutputMixin):
+    __tablename__ = "pricing_procedure_peer_stats"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "procedure_code",
+            "year",
+            "geography_scope",
+            "geography_value",
+            "specialty_key",
+            "setting_key",
+        ),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = [
+        "procedure_code",
+        "year",
+        "geography_scope",
+        "geography_value",
+        "specialty_key",
+        "setting_key",
+    ]
+    __my_additional_indexes__ = [
+        {
+            "index_elements": ("year", "procedure_code", "geography_scope", "geography_value", "specialty_key", "setting_key"),
+            "name": "pricing_proc_peer_stats_lookup_idx",
+        },
+        {
+            "index_elements": ("year", "geography_scope", "geography_value", "specialty_key", "setting_key"),
+            "name": "pricing_proc_peer_stats_geo_idx",
+        },
+    ]
+
+    procedure_code = Column(BigInteger, nullable=False)
+    year = Column(Integer, nullable=False)
+    geography_scope = Column(String(16), nullable=False)
+    geography_value = Column(String(128), nullable=False)
+    specialty_key = Column(String(128), nullable=False)
+    setting_key = Column(String(64), nullable=False)
+    provider_count = Column(Integer)
+    min_claim_count = Column(Float)
+    max_claim_count = Column(Float)
+    p10 = Column(Numeric(scale=4, precision=18, asdecimal=False, decimal_return_scale=None))
+    p20 = Column(Numeric(scale=4, precision=18, asdecimal=False, decimal_return_scale=None))
+    p40 = Column(Numeric(scale=4, precision=18, asdecimal=False, decimal_return_scale=None))
+    p50 = Column(Numeric(scale=4, precision=18, asdecimal=False, decimal_return_scale=None))
+    p60 = Column(Numeric(scale=4, precision=18, asdecimal=False, decimal_return_scale=None))
+    p80 = Column(Numeric(scale=4, precision=18, asdecimal=False, decimal_return_scale=None))
+    p90 = Column(Numeric(scale=4, precision=18, asdecimal=False, decimal_return_scale=None))
+    updated_at = Column(DateTime)
+
+
+class PricingProcedureGeoBenchmark(Base, JSONOutputMixin):
+    __tablename__ = "pricing_procedure_geo_benchmark"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("procedure_code", "year", "geography_scope", "geography_value"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["procedure_code", "year", "geography_scope", "geography_value"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("year", "procedure_code", "geography_scope"), "name": "pricing_proc_geo_year_proc_scope_idx"},
+        {"index_elements": ("year", "geography_scope", "geography_value"), "name": "pricing_proc_geo_year_scope_value_idx"},
+    ]
+
+    procedure_code = Column(BigInteger, nullable=False)
+    year = Column(Integer, nullable=False)
+    geography_scope = Column(String(16), nullable=False)  # national | state
+    geography_value = Column(String(16), nullable=False)  # US or 2-char state
+    total_services = Column(Float)
+    avg_submitted_charge = Column(Float)
+    avg_payment_amount = Column(Float)
+    avg_standardized_amount = Column(Float)
+    updated_at = Column(DateTime)
+
+
+class PricingPrescription(Base, JSONOutputMixin):
+    __tablename__ = "pricing_prescription"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("rx_code_system", "rx_code"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["rx_code_system", "rx_code"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("rx_name",), "name": "pricing_prescription_name_idx"},
+        {"index_elements": ("generic_name",), "name": "pricing_prescription_generic_idx"},
+        {"index_elements": ("brand_name",), "name": "pricing_prescription_brand_idx"},
+        {"index_elements": ("source_year",), "name": "pricing_prescription_source_year_idx"},
+        {"index_elements": ("lower(rx_name)",), "name": "pricing_prescription_name_lower_idx"},
+        {"index_elements": ("lower(generic_name)",), "name": "pricing_prescription_generic_lower_idx"},
+        {"index_elements": ("lower(brand_name)",), "name": "pricing_prescription_brand_lower_idx"},
+        {"index_elements": ("source_year", "lower(rx_name)"), "name": "pricing_prescription_year_name_lower_idx"},
+    ]
+
+    rx_code_system = Column(String(32), nullable=False)
+    rx_code = Column(String(64), nullable=False)
+    rx_name = Column(String)
+    generic_name = Column(String)
+    brand_name = Column(String)
+    total_claims = Column(Float)
+    total_30day_fills = Column(Float)
+    total_day_supply = Column(Float)
+    total_drug_cost = Column(Numeric(scale=2, precision=16, asdecimal=False, decimal_return_scale=None))
+    total_benes = Column(Float)
+    source_year = Column(Integer)
+
+
+class PricingProviderPrescription(Base, JSONOutputMixin):
+    __tablename__ = "pricing_provider_prescription"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("npi", "year", "rx_code_system", "rx_code"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["npi", "year", "rx_code_system", "rx_code"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("year", "rx_code_system", "rx_code"), "name": "pricing_provider_rx_year_code_idx"},
+        {"index_elements": ("year", "rx_code_system", "rx_code", "npi"), "name": "pricing_provider_rx_year_code_npi_idx"},
+        {"index_elements": ("year", "state", "city"), "name": "pricing_provider_rx_year_state_city_idx"},
+        {"index_elements": ("year", "state", "city", "provider_type"), "name": "pricing_provider_rx_year_state_city_type_idx"},
+        {"index_elements": ("rx_name",), "name": "pricing_provider_rx_name_idx"},
+        {"index_elements": ("generic_name",), "name": "pricing_provider_rx_generic_idx"},
+        {"index_elements": ("brand_name",), "name": "pricing_provider_rx_brand_idx"},
+        {"index_elements": ("year", "lower(rx_name)"), "name": "pricing_provider_rx_year_name_lower_idx"},
+        {"index_elements": ("year", "lower(generic_name)"), "name": "pricing_provider_rx_year_generic_lower_idx"},
+        {"index_elements": ("year", "lower(brand_name)"), "name": "pricing_provider_rx_year_brand_lower_idx"},
+        {"index_elements": ("year", "npi", "total_drug_cost DESC"), "name": "pricing_provider_rx_year_npi_total_drug_cost_desc_idx"},
+        {"index_elements": ("year", "total_drug_cost DESC"), "name": "pricing_provider_rx_year_total_drug_cost_desc_idx"},
+    ]
+
+    npi = Column(BigInteger, nullable=False)
+    year = Column(Integer, nullable=False)
+    rx_code_system = Column(String(32), nullable=False)
+    rx_code = Column(String(64), nullable=False)
+    rx_name = Column(String)
+    generic_name = Column(String)
+    brand_name = Column(String)
+    provider_name = Column(String)
+    provider_type = Column(String)
+    city = Column(String)
+    state = Column(String(2))
+    zip5 = Column(String(5))
+    country = Column(String)
+    total_claims = Column(Float)
+    total_30day_fills = Column(Float)
+    total_day_supply = Column(Float)
+    total_drug_cost = Column(Numeric(scale=2, precision=16, asdecimal=False, decimal_return_scale=None))
+    total_benes = Column(Float)
+    ge65_total_claims = Column(Float)
+    ge65_total_30day_fills = Column(Float)
+    ge65_total_day_supply = Column(Float)
+    ge65_total_drug_cost = Column(Float)
+    ge65_total_benes = Column(Float)
+
+
+class CodeCatalog(Base, JSONOutputMixin):
+    __tablename__ = "code_catalog"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("code_system", "code"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["code_system", "code"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("code", "code_system"), "name": "code_catalog_code_system_idx"},
+        {"index_elements": ("code_checksum",), "name": "code_catalog_code_checksum_idx"},
+        {"index_elements": ("code_system", "display_name"), "name": "code_catalog_system_display_idx"},
+        {"index_elements": ("code_system", "lower(display_name)"), "name": "code_catalog_system_display_lower_idx"},
+        {"index_elements": ("lower(display_name)",), "name": "code_catalog_display_lower_idx"},
+        {"index_elements": ("lower(short_description)",), "name": "code_catalog_short_description_lower_idx"},
+        {"index_elements": ("source",), "name": "code_catalog_source_idx"},
+        {"index_elements": ("code_system", "source"), "name": "code_catalog_system_source_idx"},
+        {"index_elements": ("source", "code_system", "lower(display_name)"), "name": "code_catalog_source_system_display_lower_idx"},
+    ]
+
+    code_system = Column(String(32), nullable=False)
+    code = Column(String(128), nullable=False)
+    code_checksum = Column(Integer)
+    display_name = Column(String)
+    short_description = Column(String)
+    long_description = Column(TEXT)
+    is_active = Column(Boolean)
+    source = Column(String(128))
+    updated_at = Column(DateTime)
+
+
+class CodeCrosswalk(Base, JSONOutputMixin):
+    __tablename__ = "code_crosswalk"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("from_system", "from_code", "to_system", "to_code"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["from_system", "from_code", "to_system", "to_code"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("from_system", "from_code"), "name": "code_crosswalk_from_idx"},
+        {"index_elements": ("from_checksum",), "name": "code_crosswalk_from_checksum_idx"},
+        {"index_elements": ("to_system", "to_code"), "name": "code_crosswalk_to_idx"},
+        {"index_elements": ("to_checksum",), "name": "code_crosswalk_to_checksum_idx"},
+        {"index_elements": ("upper(from_system)", "upper(from_code)"), "name": "code_crosswalk_upper_from_idx"},
+        {"index_elements": ("upper(to_system)", "upper(to_code)"), "name": "code_crosswalk_upper_to_idx"},
+    ]
+
+    from_system = Column(String(32), nullable=False)
+    from_code = Column(String(128), nullable=False)
+    from_checksum = Column(Integer)
+    to_system = Column(String(32), nullable=False)
+    to_code = Column(String(128), nullable=False)
+    to_checksum = Column(Integer)
+    match_type = Column(String(32))
+    confidence = Column(Numeric(scale=4, precision=6, asdecimal=False, decimal_return_scale=None))
+    source = Column(String(128))
+    updated_at = Column(DateTime)

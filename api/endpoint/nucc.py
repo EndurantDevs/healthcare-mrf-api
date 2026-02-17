@@ -3,7 +3,7 @@
 from sanic import Blueprint, response
 from sqlalchemy import func, or_, select
 
-from api.endpoint.pagination import parse_pagination
+from api.endpoint.pagination import parse_bool_alias, parse_pagination
 from db.models import NUCCTaxonomy
 
 blueprint = Blueprint('nucc', url_prefix='/nucc', version=1)
@@ -27,27 +27,20 @@ async def all_of_nucc(request):
     args = request.args
     table = NUCCTaxonomy.__table__
 
-    pagination = parse_pagination(
-        args,
-        default_limit=50,
-        max_limit=200,
-        default_page=1,
-        allow_offset=True,
-        allow_start=True,
-        allow_page_size=True,
-    )
     q = str(args.get("q") or "").strip()
     code = str(args.get("code") or "").strip()
     order = str(args.get("order") or "asc").strip().lower()
     if order not in {"asc", "desc"}:
         order = "asc"
 
+    include_meta = parse_bool_alias(args, "include_meta", "paginate", default=False)
+    has_pagination_args = any(
+        args.get(name) not in (None, "", "null")
+        for name in ("limit", "offset", "page", "start", "page_size")
+    )
+
     filters = []
-    applied_filters = {
-        "limit": pagination.limit,
-        "page": pagination.page,
-        "offset": pagination.offset,
-    }
+    applied_filters = {}
     if code:
         filters.append(table.c.code.ilike(f"%{code}%"))
         applied_filters["code"] = code
@@ -77,19 +70,38 @@ async def all_of_nucc(request):
         stmt = stmt.order_by(table.c.display_name.desc(), table.c.code.desc())
     else:
         stmt = stmt.order_by(table.c.display_name.asc(), table.c.code.asc())
-    stmt = stmt.offset(pagination.offset).limit(pagination.limit)
+    pagination = None
+    if include_meta or has_pagination_args:
+        pagination = parse_pagination(
+            args,
+            default_limit=50,
+            max_limit=200,
+            default_page=1,
+            allow_offset=True,
+            allow_start=True,
+            allow_page_size=True,
+        )
+        stmt = stmt.offset(pagination.offset).limit(pagination.limit)
 
     result = await session.execute(stmt)
     rows = result.scalars().all()
     items = [row.to_json_dict() for row in rows]
 
-    return response.json(
-        {
-            "total": total,
-            "page": pagination.page,
-            "limit": pagination.limit,
-            "offset": pagination.offset,
-            "items": items,
-            "applied_filters": applied_filters,
-        }
-    )
+    if include_meta and pagination is not None:
+        return response.json(
+            {
+                "total": total,
+                "page": pagination.page,
+                "limit": pagination.limit,
+                "offset": pagination.offset,
+                "items": items,
+                "applied_filters": {
+                    "limit": pagination.limit,
+                    "page": pagination.page,
+                    "offset": pagination.offset,
+                    **applied_filters,
+                },
+            }
+        )
+
+    return response.json(items)

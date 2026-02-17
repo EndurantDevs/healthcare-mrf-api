@@ -31,11 +31,28 @@ from process.serialization import deserialize_job, serialize_job
 
 latin_pattern= re.compile(r'[^\x00-\x7f]')
 
-internal_tasks = set()
-
 TEST_NPI_MAX_FILES = 1
 TEST_NPI_ROWS = 1000
 TEST_NPI_OTHER_ROWS = 500
+TEST_NPI_SECONDARY_ROWS = 1000
+NPI_QUEUE_NAME = "arq:NPI"
+DEFAULT_NPI_MAX_PENDING_SAVE_TASKS = 4
+
+
+def _env_positive_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+        return value if value > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+async def _ensure_required_extensions() -> None:
+    for extension in ("pg_trgm", "intarray", "btree_gin"):
+        await db.status(f"CREATE EXTENSION IF NOT EXISTS {extension};")
 
 
 def is_test_mode(ctx: dict) -> bool:
@@ -165,12 +182,10 @@ async def process_npi_chunk(ctx, task):
         'npi_address_list': list(npi_address_list_dict.values()),
     }
     if task.get('direct'):
-        save_task = asyncio.create_task(save_npi_data(ctx, payload))
-        internal_tasks.add(save_task)
-        save_task.add_done_callback(internal_tasks.discard)
+        await save_npi_data(ctx, payload)
         print(f'Processing.. {len(npi_obj_list)} rows directly')
     else:
-        await redis.enqueue_job('save_npi_data', payload)
+        await redis.enqueue_job('save_npi_data', payload, _queue_name=NPI_QUEUE_NAME)
 
 
 
@@ -182,8 +197,7 @@ async def process_data(ctx, task=None):  # pragma: no cover
         ctx['context']['test_mode'] = bool(task.get('test_mode'))
     test_mode = bool(ctx['context'].get('test_mode', False))
     await ensure_database(test_mode)
-
-    ctx['context']['run'] = ctx['context'].get('run', 0) + 1
+    await _ensure_required_extensions()
 
     import_date = ctx['import_date']
     print(os.environ['HLTHPRT_NPPES_DOWNLOAD_URL_DIR'] + os.environ['HLTHPRT_NPPES_DOWNLOAD_URL_FILE'])
@@ -193,6 +207,17 @@ async def process_data(ctx, task=None):  # pragma: no cover
     # 110722_111322</a>
     count_files = 0
     sql_chunk_size = 299999
+    max_pending_save_tasks = _env_positive_int(
+        "HLTHPRT_NPI_MAX_PENDING_SAVE_TASKS",
+        DEFAULT_NPI_MAX_PENDING_SAVE_TASKS,
+    )
+
+    async def enqueue_or_flush(coros: list, coro) -> None:
+        coros.append(asyncio.create_task(coro))
+        if len(coros) >= max_pending_save_tasks:
+            await asyncio.gather(*coros)
+            coros.clear()
+
     file_limit = TEST_NPI_MAX_FILES if test_mode else None
     for file_idx, p in enumerate(re.findall(r'(NPPES_Data_Dissemination.*_V2.zip)', html_source)):
         if file_limit and file_idx >= file_limit:
@@ -330,7 +355,7 @@ async def process_data(ctx, task=None):  # pragma: no cover
                             'npi_csv_map_reverse': npi_csv_map_reverse,
                             'direct': True,
                         }
-                        coros.append(asyncio.create_task(process_npi_chunk(ctx, payload)))
+                        await enqueue_or_flush(coros, process_npi_chunk(ctx, payload))
                         row_list.clear()
                         count = 0
                     else:
@@ -344,12 +369,7 @@ async def process_data(ctx, task=None):  # pragma: no cover
                 'npi_csv_map_reverse': npi_csv_map_reverse,
                 'direct': True,
             }
-            coros.append(asyncio.create_task(process_npi_chunk(ctx, payload)))
-            # await asyncio.gather(*coros)
-            # while internal_tasks:
-            #     print(f"Tasks remaining: {len(internal_tasks)}")
-            #     await asyncio.sleep(2)
-            # coros.clear()
+            await enqueue_or_flush(coros, process_npi_chunk(ctx, payload))
             row_list.clear()
 
             npi_other_org_list_dict = {}
@@ -377,7 +397,7 @@ async def process_data(ctx, task=None):  # pragma: no cover
                         other_payload = {
                             'npi_other_id_list': list(npi_other_org_list_dict.copy().values())
                         }
-                        coros.append(asyncio.create_task(save_npi_data(ctx, other_payload)))
+                        await enqueue_or_flush(coros, save_npi_data(ctx, other_payload))
                         npi_other_org_list_dict.clear()
                         count = 0
                     else:
@@ -387,14 +407,13 @@ async def process_data(ctx, task=None):  # pragma: no cover
                         break
 
             other_payload = {'npi_other_id_list': list(npi_other_org_list_dict.copy().values())}
-            coros.append(asyncio.create_task(save_npi_data(ctx, other_payload)))
-            # await asyncio.gather(*coros)
-            # coros.clear()
+            await enqueue_or_flush(coros, save_npi_data(ctx, other_payload))
             npi_other_org_list_dict.clear()
 
 
             npi_address_list_dict = {}
             async with async_open(pl_file, 'r') as afp:
+                processed_secondary = 0
                 async for row in AsyncDictReader(afp, delimiter=","):
                     if not row['NPI'] and not row['Provider Secondary Practice Location Address- Address Line 1']:
                         continue
@@ -421,7 +440,10 @@ async def process_data(ctx, task=None):  # pragma: no cover
 
                     if count > current_sql_chunk_size:
                         print(f"Sending Secondary to DB: {count}")
-                        coros.append(asyncio.create_task(save_npi_data(ctx, {'npi_address_list': list(npi_address_list_dict.copy().values())})))
+                        await enqueue_or_flush(
+                            coros,
+                            save_npi_data(ctx, {'npi_address_list': list(npi_address_list_dict.copy().values())}),
+                        )
                         # await redis.enqueue_job('save_npi_data', {
                         #     'npi_address_list': list(npi_address_list_dict.values()),
                         # })
@@ -429,14 +451,24 @@ async def process_data(ctx, task=None):  # pragma: no cover
                         count = 0
                     else:
                         count += 1
+                    processed_secondary += 1
+                    if test_mode and processed_secondary >= TEST_NPI_SECONDARY_ROWS:
+                        print(f"Test mode: stopping secondary address scan at {processed_secondary} rows.")
+                        break
             # await redis.enqueue_job('save_npi_data', {
             #     'npi_address_list': list(npi_address_list_dict.values()),
             # })
-            coros.append(asyncio.create_task(save_npi_data(ctx, {'npi_address_list': list(npi_address_list_dict.copy().values())})))
+            await enqueue_or_flush(
+                coros,
+                save_npi_data(ctx, {'npi_address_list': list(npi_address_list_dict.copy().values())}),
+            )
             await asyncio.gather(*coros)
             npi_address_list_dict.clear()
 
             print(f"Processed: {count}")
+
+    # Mark this job as successfully completed; shutdown finalization depends on this.
+    ctx['context']['run'] = ctx['context'].get('run', 0) + 1
 
 
 async def startup(ctx):  # pragma: no cover
@@ -451,6 +483,8 @@ async def startup(ctx):  # pragma: no cover
     db_schema = os.getenv('HLTHPRT_DB_SCHEMA') if os.getenv('HLTHPRT_DB_SCHEMA') else 'mrf'
 
     tables = {}  # for the future complex usage
+
+    await _ensure_required_extensions()
 
     try:
         obj = AddressArchive
@@ -495,13 +529,25 @@ async def startup(ctx):  # pragma: no cover
 
     print("Preparing done")
 
-async def refresh_do_business_as(target_table: str | None = None, test_mode: bool | None = None):
+async def refresh_do_business_as(
+    target_table: str | None = None,
+    source_table: str | None = None,
+    test_mode: bool | None = None,
+):
     """
     Populate the NPI.do_business_as array from other identifier entries (type code 3).
     """
     await ensure_database(bool(test_mode))
     db_schema = os.getenv('HLTHPRT_DB_SCHEMA') if os.getenv('HLTHPRT_DB_SCHEMA') else 'mrf'
     table = target_table or NPIData.__tablename__
+    source = source_table or NPIDataOtherIdentifier.__tablename__
+
+    source_exists = await db.scalar(
+        f"SELECT to_regclass('{db_schema}.{source}');"
+    )
+    if not source_exists:
+        print(f"Skipping do_business_as refresh: source table {db_schema}.{source} does not exist.")
+        return
 
     reset_sql = (
         f"UPDATE {db_schema}.{table} "
@@ -515,7 +561,7 @@ async def refresh_do_business_as(target_table: str | None = None, test_mode: boo
                 npi,
                 ARRAY_AGG(DISTINCT other_provider_identifier ORDER BY other_provider_identifier) AS names,
                 STRING_AGG(DISTINCT other_provider_identifier, ' ' ORDER BY other_provider_identifier) AS search_text
-            FROM {db_schema}.npi_other_identifier
+            FROM {db_schema}.{source}
             WHERE other_provider_identifier_type_code = '3'
             GROUP BY npi
         )
@@ -542,6 +588,17 @@ async def shutdown(ctx):  # pragma: no cover
     db_schema = os.getenv('HLTHPRT_DB_SCHEMA') if os.getenv('HLTHPRT_DB_SCHEMA') else 'mrf'
     tables = {}
 
+    npi_address_stage_table = f"{NPIAddress.__tablename__}_{import_date}"
+    npi_address_stage_exists = await db.scalar(
+        f"SELECT to_regclass('{db_schema}.{npi_address_stage_table}');"
+    )
+    if not npi_address_stage_exists:
+        print(
+            f"Staging table {db_schema}.{npi_address_stage_table} is missing; "
+            "skipping NPI shutdown finalization."
+        )
+        return
+
     test = make_class(NPIAddress, import_date)
     npi_address_count = await db.scalar(select(func.count(test.npi)))  # pylint: disable=not-callable
     if context.get("test_mode"):
@@ -552,6 +609,23 @@ async def shutdown(ctx):  # pragma: no cover
             sys.exit(1)
 
     processing_classes_array = (NPIData, NPIDataTaxonomyGroup, NPIDataOtherIdentifier, NPIDataTaxonomy, NPIAddress,)
+
+    async def table_exists(table_name: str) -> bool:
+        exists = await db.scalar(f"SELECT to_regclass('{db_schema}.{table_name}');")
+        return bool(exists)
+
+    postgis_available: bool | None = None
+
+    async def has_postgis() -> bool:
+        nonlocal postgis_available
+        if postgis_available is None:
+            geography_type = await db.scalar("SELECT to_regtype('geography');")
+            st_makepoint = await db.scalar("SELECT to_regprocedure('st_makepoint(double precision, double precision)');")
+            postgis_available = bool(geography_type and st_makepoint)
+            if not postgis_available:
+                print("PostGIS is unavailable; geo GIST index creation will be skipped.")
+        return postgis_available
+
     async with db.transaction():
         for cls in processing_classes_array:
             tables[cls.__main_table__] = make_class(cls, import_date)
@@ -560,32 +634,46 @@ async def shutdown(ctx):  # pragma: no cover
                 print('Updating NPI do_business_as arrays from other identifiers...')
                 target_npi_cls = tables.get(NPIData.__main_table__)
                 target_table_name = target_npi_cls.__tablename__ if target_npi_cls else NPIData.__tablename__
+                source_table_name = obj.__tablename__
                 await refresh_do_business_as(
                     target_table=target_table_name,
+                    source_table=source_table_name,
                     test_mode=bool(context.get("test_mode")),
                 )
             if cls is NPIAddress:
-                print("Updating NUCC Taxonomy for NPI Addresses...")
-                await db.status(f"""WITH x AS (
+                npi_taxonomy_table = f"npi_taxonomy_{import_date}"
+                if await table_exists(npi_taxonomy_table) and await table_exists("nucc_taxonomy"):
+                    print("Updating NUCC Taxonomy for NPI Addresses...")
+                    await db.status(f"""WITH x AS (
     SELECT
         int_code, code as target_code
     FROM
         {db_schema}.nucc_taxonomy
     )
     UPDATE {db_schema}.{obj.__tablename__} as addr SET taxonomy_array=b.res FROM (
-    select npi, ARRAY_AGG(x.int_code) as res from {db_schema}.npi_taxonomy_{import_date}
+    select npi, ARRAY_AGG(x.int_code) as res from {db_schema}.{npi_taxonomy_table}
     INNER JOIN x ON healthcare_provider_taxonomy_code = x.target_code
     GROUP BY npi) as b WHERE addr.npi = b.npi;""")
+                else:
+                    print(
+                        f"Skipping NUCC taxonomy update: "
+                        f"required tables missing ({db_schema}.{npi_taxonomy_table} and/or {db_schema}.nucc_taxonomy)."
+                    )
 
-                print("Updating NPI Addresses Geo from Archive...")
-                await db.status(
-                    f"UPDATE {db_schema}.{obj.__tablename__} as a SET formatted_address = b.formatted_address, lat = b.lat, "
-                    f"long = b.long, "
-                    f"place_id = b.place_id FROM {db_schema}.address_archive as b WHERE a.checksum = b.checksum")
+                if await table_exists("address_archive"):
+                    print("Updating NPI Addresses Geo from Archive...")
+                    await db.status(
+                        f"UPDATE {db_schema}.{obj.__tablename__} as a SET formatted_address = b.formatted_address, "
+                        f"lat = b.lat, long = b.long, place_id = b.place_id "
+                        f"FROM {db_schema}.address_archive as b WHERE a.checksum = b.checksum"
+                    )
+                else:
+                    print(f"Skipping NPI geo update: source table {db_schema}.address_archive is missing.")
 
-                print("Updating NPI Plan-Network Array from Plans Import Data...")
-                await db.status(
-                    f"""UPDATE {db_schema}.{obj.__tablename__} as a
+                if await table_exists("plan_npi_raw"):
+                    print("Updating NPI Plan-Network Array from Plans Import Data...")
+                    await db.status(
+                        f"""UPDATE {db_schema}.{obj.__tablename__} as a
 SET
     plans_network_array = n_list
 FROM (
@@ -597,11 +685,66 @@ FROM (
 ) as b
 WHERE
     a.npi = b.npi;"""
-                )
+                    )
+                else:
+                    print(f"Skipping NPI plan-network update: source table {db_schema}.plan_npi_raw is missing.")
+
+                if await table_exists("pricing_provider_procedure"):
+                    print("Updating NPI procedures_array from pricing provider procedures...")
+                    await db.status(
+                        f"""UPDATE {db_schema}.{obj.__tablename__} AS a
+SET
+    procedures_array = b.codes
+FROM (
+    SELECT
+        npi,
+        ARRAY_AGG(DISTINCT procedure_code ORDER BY procedure_code) AS codes
+    FROM {db_schema}.pricing_provider_procedure
+    GROUP BY npi
+) AS b
+WHERE
+    a.npi = b.npi;"""
+                    )
+                else:
+                    print(
+                        f"Skipping NPI procedures_array update: source table "
+                        f"{db_schema}.pricing_provider_procedure is missing."
+                    )
+
+                if await table_exists("pricing_provider_prescription"):
+                    print("Updating NPI medications_array from pricing provider prescriptions...")
+                    await db.status(
+                        f"""UPDATE {db_schema}.{obj.__tablename__} AS a
+SET
+    medications_array = b.codes
+FROM (
+    SELECT
+        npi,
+        ARRAY_AGG(DISTINCT rx_code::INTEGER ORDER BY rx_code::INTEGER) AS codes
+    FROM {db_schema}.pricing_provider_prescription
+    WHERE
+        rx_code_system = 'HP_RX_CODE'
+        AND rx_code ~ '^-?[0-9]+$'
+    GROUP BY npi
+) AS b
+WHERE
+    a.npi = b.npi;"""
+                    )
+                else:
+                    print(
+                        f"Skipping NPI medications_array update: source table "
+                        f"{db_schema}.pricing_provider_prescription is missing."
+                    )
 
             if hasattr(cls, '__my_additional_indexes__') and cls.__my_additional_indexes__:
                 for index in cls.__my_additional_indexes__:
                     index_name = index.get('name', '_'.join(index.get('index_elements')))
+                    if index_name.startswith("geo_index_") and not await has_postgis():
+                        print(
+                            f"Skipping index {obj.__tablename__}_idx_{index_name}: "
+                            "requires PostGIS (geography + ST_MakePoint)."
+                        )
+                        continue
                     using = ""
                     if t := index.get('using'):
                         using = f"USING {t} "
@@ -686,7 +829,8 @@ async def save_npi_data(ctx, task):
                 x.append(push_objects(task['npi_address_list'], mynpiaddress, rewrite=True))
             case _:
                 print('Some wrong key passed')
-    await asyncio.gather(*x)
+    for coro in x:
+        await coro
 
 
 async def main(test_mode: bool = False):  # pragma: no cover
@@ -694,4 +838,4 @@ async def main(test_mode: bool = False):  # pragma: no cover
                               job_serializer=serialize_job,
                               job_deserializer=deserialize_job)
     payload = {'test_mode': bool(test_mode)}
-    await redis.enqueue_job('process_data', payload, _queue_name='arq:NPI')
+    await redis.enqueue_job('process_data', payload, _queue_name=NPI_QUEUE_NAME)

@@ -7,6 +7,17 @@ info:
     is versioned under `/api/v1` and served by a Sanic application.  All
     endpoints return JSON.  Unless noted otherwise, error responses use
     the `Error` schema.
+
+    Data sources used by this API include:
+    - CMS data portal: https://data.cms.gov/
+    - CMS Physician & Other Practitioners datasets (provider/provider+service/geography+service)
+    - CMS Part D Prescribers and Part D Spending by Drug datasets
+    - CMS NPPES provider files: https://download.cms.gov/nppes/NPI_Files.html
+    - NUCC provider taxonomy: https://www.nucc.org/index.php/code-sets-mainmenu-41/provider-taxonomy-mainmenu-40
+
+    Claims freshness policy:
+    - claims endpoints publish the most recent fully imported CMS year
+    - current freshest claims year is **2023**
 servers:
   - url: http://localhost:8085/api/v1
 paths:
@@ -1317,13 +1328,13 @@ paths:
           in: query
           schema:
             type: string
-            enum: [classification, full_taxonomy]
+            enum: [all, classification, full_taxonomy]
           description: Optional aggregation mode for `count_only`
         - name: response_format
           in: query
           schema:
             type: string
-            enum: [classification, full_taxonomy]
+            enum: [all, classification, full_taxonomy]
           description: Alias for `format`
         - name: start
           in: query
@@ -1414,6 +1425,34 @@ paths:
           schema:
             type: string
           description: Comma-separated NUCC taxonomy codes to match
+        - name: procedure_codes
+          in: query
+          schema:
+            type: string
+          description: Comma-separated procedure codes. Supports crosswalk to internal `HP_PROCEDURE_CODE`.
+        - name: procedure_code_system
+          in: query
+          schema:
+            type: string
+            enum: [HP_PROCEDURE_CODE, CPT, HCPCS]
+          description: Code system for `procedure_codes` (defaults to `HP_PROCEDURE_CODE`)
+        - name: medication_codes
+          in: query
+          schema:
+            type: string
+          description: Comma-separated medication/prescription codes. Supports crosswalk to internal `HP_RX_CODE`.
+        - name: medication_code_system
+          in: query
+          schema:
+            type: string
+            enum: [HP_RX_CODE, NDC, RXNORM]
+          description: Code system for `medication_codes` (defaults to `HP_RX_CODE`)
+        - name: year
+          in: query
+          schema:
+            type: integer
+            minimum: 2013
+          description: Optional data year used to validate procedure/medication evidence; defaults to max available year.
       responses:
         '200':
           description: Either a count or full search payload
@@ -1485,6 +1524,34 @@ paths:
           schema:
             type: integer
           description: Search radius in miles (defaults to 10, overridden to 1000 for ZIP lookups)
+        - name: procedure_codes
+          in: query
+          schema:
+            type: string
+          description: Comma-separated procedure codes. Supports crosswalk to internal `HP_PROCEDURE_CODE`.
+        - name: procedure_code_system
+          in: query
+          schema:
+            type: string
+            enum: [HP_PROCEDURE_CODE, CPT, HCPCS]
+          description: Code system for `procedure_codes` (defaults to `HP_PROCEDURE_CODE`)
+        - name: medication_codes
+          in: query
+          schema:
+            type: string
+          description: Comma-separated medication/prescription codes. Supports crosswalk to internal `HP_RX_CODE`.
+        - name: medication_code_system
+          in: query
+          schema:
+            type: string
+            enum: [HP_RX_CODE, NDC, RXNORM]
+          description: Code system for `medication_codes` (defaults to `HP_RX_CODE`)
+        - name: year
+          in: query
+          schema:
+            type: integer
+            minimum: 2013
+          description: Optional data year used to validate procedure/medication evidence; defaults to max available year.
       responses:
         '200':
           description: Array of nearby NPI entries
@@ -1555,6 +1622,1663 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+  /codes/:
+    get:
+      summary: List normalized code catalog entries
+      parameters:
+        - name: code_system
+          in: query
+          schema:
+            type: string
+        - name: q
+          in: query
+          schema:
+            type: string
+        - name: source
+          in: query
+          schema:
+            type: string
+        - name: order
+          in: query
+          schema:
+            type: string
+            enum: [asc, desc]
+        - name: order_by
+          in: query
+          schema:
+            type: string
+            enum: [code, code_system, display_name, code_checksum]
+      responses:
+        '200':
+          description: Paginated code catalog rows
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CodeListResponse'
+  /codes/{code_system}/{code}:
+    get:
+      summary: Retrieve one code catalog row
+      parameters:
+        - name: code_system
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: code
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Code details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CodeCatalogRecord'
+        '404':
+          description: Code not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /codes/{code_system}/{code}/related:
+    get:
+      summary: Retrieve related crosswalk mappings for a code
+      parameters:
+        - name: code_system
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: code
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Related forward/reverse mappings
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CodeRelatedResponse'
+  /pricing/providers:
+    get:
+      summary: List pricing providers from CMS claims imports
+      parameters:
+        - name: npi
+          in: query
+          schema:
+            type: integer
+        - name: year
+          in: query
+          schema:
+            type: integer
+        - name: min_claims
+          in: query
+          schema:
+            type: number
+        - name: min_total_cost
+          in: query
+          schema:
+            type: number
+        - name: q
+          in: query
+          schema:
+            type: string
+        - name: state
+          in: query
+          schema:
+            type: string
+        - name: city
+          in: query
+          schema:
+            type: string
+        - name: specialty
+          in: query
+          schema:
+            type: string
+        - name: include_legacy_fields
+          in: query
+          schema:
+            type: boolean
+        - name: order
+          in: query
+          schema:
+            type: string
+            enum: [asc, desc]
+        - name: order_by
+          in: query
+          schema:
+            type: string
+            enum:
+              [
+                npi,
+                provider_name,
+                total_services,
+                total_allowed_amount,
+                total_beneficiaries,
+                total_claims,
+                total_30day_fills,
+                total_day_supply,
+                total_drug_cost,
+                total_benes,
+              ]
+      responses:
+        '200':
+          description: Paginated pricing providers
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PricingProviderListResponse'
+  /pricing/physicians:
+    get:
+      summary: Alias for /pricing/providers
+      parameters:
+        - name: npi
+          in: query
+          schema:
+            type: integer
+        - name: year
+          in: query
+          schema:
+            type: integer
+        - name: min_claims
+          in: query
+          schema:
+            type: number
+        - name: min_total_cost
+          in: query
+          schema:
+            type: number
+        - name: q
+          in: query
+          schema:
+            type: string
+        - name: state
+          in: query
+          schema:
+            type: string
+        - name: city
+          in: query
+          schema:
+            type: string
+        - name: specialty
+          in: query
+          schema:
+            type: string
+        - name: include_legacy_fields
+          in: query
+          schema:
+            type: boolean
+        - name: order
+          in: query
+          schema:
+            type: string
+            enum: [asc, desc]
+        - name: order_by
+          in: query
+          schema:
+            type: string
+            enum:
+              [
+                npi,
+                provider_name,
+                total_services,
+                total_allowed_amount,
+                total_beneficiaries,
+                total_claims,
+                total_30day_fills,
+                total_day_supply,
+                total_drug_cost,
+                total_benes,
+              ]
+      responses:
+        '200':
+          description: Paginated pricing providers
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PricingProviderListResponse'
+  /pricing/providers/{npi}:
+    get:
+      summary: Retrieve one provider row and summary counters
+      parameters:
+        - name: npi
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: year
+          in: query
+          schema:
+            type: integer
+        - name: include_legacy_fields
+          in: query
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: Provider detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PricingProviderRecord'
+        '404':
+          description: Provider not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /pricing/physicians/{npi}:
+    get:
+      summary: Alias for /pricing/providers/{npi}
+      parameters:
+        - name: npi
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: year
+          in: query
+          schema:
+            type: integer
+        - name: include_legacy_fields
+          in: query
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: Provider detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PricingProviderRecord'
+  /pricing/providers/{npi}/score:
+    get:
+      summary: Retrieve Estimated Cost Level and Quality Proxy Score
+      parameters:
+        - name: npi
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: year
+          in: query
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Provider score payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PricingProviderScoreResponse'
+  /pricing/physicians/{npi}/score:
+    get:
+      summary: Alias for /pricing/providers/{npi}/score
+      parameters:
+        - name: npi
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: year
+          in: query
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Provider score payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PricingProviderScoreResponse'
+  /pricing/providers/{npi}/procedures:
+    get:
+      summary: List pricing procedures for a provider
+      parameters:
+        - name: npi
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: year
+          in: query
+          schema:
+            type: integer
+        - name: min_claims
+          in: query
+          schema:
+            type: number
+        - name: min_total_cost
+          in: query
+          schema:
+            type: number
+        - name: q
+          in: query
+          schema:
+            type: string
+        - name: service_name
+          in: query
+          schema:
+            type: string
+        - name: reported_code
+          in: query
+          schema:
+            type: string
+        - name: generic_name
+          in: query
+          schema:
+            type: string
+        - name: brand_name
+          in: query
+          schema:
+            type: string
+        - name: code
+          in: query
+          schema:
+            type: string
+        - name: include_legacy_fields
+          in: query
+          schema:
+            type: boolean
+        - name: order
+          in: query
+          schema:
+            type: string
+            enum: [asc, desc]
+        - name: order_by
+          in: query
+          schema:
+            type: string
+            enum:
+              [
+                procedure_code,
+                service_description,
+                reported_code,
+                total_services,
+                total_allowed_amount,
+                total_beneficiaries,
+                generic_name,
+                brand_name,
+                total_claims,
+                total_30day_fills,
+                total_day_supply,
+                total_drug_cost,
+                total_benes,
+              ]
+      responses:
+        '200':
+          description: Paginated procedures for provider
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PricingProviderProcedureListResponse'
+  /pricing/physicians/{npi}/services:
+    get:
+      summary: Alias for /pricing/providers/{npi}/procedures
+      parameters:
+        - name: npi
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: year
+          in: query
+          schema:
+            type: integer
+        - name: min_claims
+          in: query
+          schema:
+            type: number
+        - name: min_total_cost
+          in: query
+          schema:
+            type: number
+        - name: q
+          in: query
+          schema:
+            type: string
+        - name: service_name
+          in: query
+          schema:
+            type: string
+        - name: reported_code
+          in: query
+          schema:
+            type: string
+        - name: generic_name
+          in: query
+          schema:
+            type: string
+        - name: brand_name
+          in: query
+          schema:
+            type: string
+        - name: code
+          in: query
+          schema:
+            type: string
+        - name: include_legacy_fields
+          in: query
+          schema:
+            type: boolean
+        - name: order
+          in: query
+          schema:
+            type: string
+            enum: [asc, desc]
+        - name: order_by
+          in: query
+          schema:
+            type: string
+            enum:
+              [
+                procedure_code,
+                service_description,
+                reported_code,
+                total_services,
+                total_allowed_amount,
+                total_beneficiaries,
+                generic_name,
+                brand_name,
+                total_claims,
+                total_30day_fills,
+                total_day_supply,
+                total_drug_cost,
+                total_benes,
+              ]
+      responses:
+        '200':
+          description: Paginated procedures for provider
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PricingProviderProcedureListResponse'
+  /pricing/providers/{npi}/procedures/{procedure_code}:
+    get:
+      summary: Retrieve one provider procedure detail
+      parameters:
+        - name: npi
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: procedure_code
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Provider procedure detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PricingProviderProcedureDetail'
+        '404':
+          description: Procedure not found for provider
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /pricing/physicians/{npi}/services/{code_system}/{code}:
+    get:
+      summary: Provider service detail by explicit code system
+      parameters:
+        - name: npi
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: code_system
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: code
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Provider procedure detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PricingProviderProcedureDetail'
+  /pricing/providers/{npi}/procedures/{procedure_code}/estimated-cost-level:
+    get:
+      summary: Estimated Cost Level for provider+procedure using internal procedure code
+      parameters:
+        - name: npi
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: procedure_code
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Procedure Estimated Cost Level payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PricingProviderProcedureCostLevelResponse'
+        '404':
+          description: Provider procedure profile or peer group not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /pricing/providers/{npi}/procedures/{code_system}/{code}/estimated-cost-level:
+    get:
+      summary: Estimated Cost Level for provider+procedure using explicit code system
+      parameters:
+        - name: npi
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: code_system
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: code
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Procedure Estimated Cost Level payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PricingProviderProcedureCostLevelResponse'
+        '404':
+          description: Provider procedure profile or peer group not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /pricing/physicians/{npi}/services/{code_system}/{code}/estimated-cost-level:
+    get:
+      summary: Alias for /pricing/providers/{npi}/procedures/{code_system}/{code}/estimated-cost-level
+      parameters:
+        - name: npi
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: code_system
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: code
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Procedure Estimated Cost Level payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PricingProviderProcedureCostLevelResponse'
+        '404':
+          description: Provider procedure profile or peer group not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /pricing/providers/{npi}/procedures/{procedure_code}/locations:
+    get:
+      summary: List provider locations for a procedure
+      parameters:
+        - name: npi
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: procedure_code
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Paginated provider procedure locations
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PricingProviderProcedureLocationListResponse'
+  /pricing/physicians/{npi}/services/{code_system}/{code}/locations:
+    get:
+      summary: Alias for provider procedure locations using explicit code system
+      parameters:
+        - name: npi
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: code_system
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: code
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Paginated provider procedure locations
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PricingProviderProcedureLocationListResponse'
+  /pricing/procedures/{code_system}/{code}/providers:
+    get:
+      summary: List providers matching a code (with optional code expansion)
+      parameters:
+        - name: code_system
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: code
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: year
+          in: query
+          schema:
+            type: integer
+        - name: state
+          in: query
+          schema:
+            type: string
+        - name: city
+          in: query
+          schema:
+            type: string
+        - name: specialty
+          in: query
+          schema:
+            type: string
+        - name: q
+          in: query
+          schema:
+            type: string
+        - name: min_claims
+          in: query
+          schema:
+            type: number
+        - name: min_total_cost
+          in: query
+          schema:
+            type: number
+        - name: include_legacy_fields
+          in: query
+          schema:
+            type: boolean
+        - name: order
+          in: query
+          schema:
+            type: string
+            enum: [asc, desc]
+        - name: order_by
+          in: query
+          schema:
+            type: string
+            enum:
+              [
+                npi,
+                provider_name,
+                total_services,
+                total_submitted_charges,
+                total_allowed_amount,
+                total_beneficiaries,
+                matched_rows,
+                total_claims,
+                total_day_supply,
+                total_drug_cost,
+                total_benes,
+              ]
+      responses:
+        '200':
+          description: Paginated provider matches for the requested code
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PricingProcedureProviderListResponse'
+  /pricing/procedures/{code_system}/{code}/benchmarks:
+    get:
+      summary: Aggregate benchmark metrics for a requested code
+      parameters:
+        - name: code_system
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: code
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: year
+          in: query
+          schema:
+            type: integer
+        - name: state
+          in: query
+          schema:
+            type: string
+        - name: city
+          in: query
+          schema:
+            type: string
+        - name: include_legacy_fields
+          in: query
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: Benchmark payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PricingBenchmarkResponse'
+  /pricing/procedures/{code_system}/{code}/geo-benchmarks:
+    get:
+      summary: National/state weighted geo benchmarks for a requested procedure code
+      parameters:
+        - name: code_system
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: code
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: year
+          in: query
+          schema:
+            type: integer
+        - name: state
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Geo benchmark payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PricingProcedureGeoBenchmarkResponse'
+  /pricing/procedures/autocomplete:
+    get:
+      summary: Autocomplete procedure/service terms across CPT/HCPCS/internal codes
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: year
+          in: query
+          schema:
+            type: integer
+        - name: code_system
+          in: query
+          schema:
+            type: string
+        - name: dedupe_terms
+          in: query
+          schema:
+            type: boolean
+        - name: max_codes_per_term
+          in: query
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Procedure autocomplete results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PricingProcedureAutocompleteResponse'
+  /pricing/services/autocomplete:
+    get:
+      summary: Alias for /pricing/procedures/autocomplete
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: year
+          in: query
+          schema:
+            type: integer
+        - name: code_system
+          in: query
+          schema:
+            type: string
+        - name: dedupe_terms
+          in: query
+          schema:
+            type: boolean
+        - name: max_codes_per_term
+          in: query
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Procedure autocomplete results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PricingProcedureAutocompleteResponse'
+  /pricing/prescriptions/autocomplete:
+    get:
+      summary: Autocomplete prescription/drug terms
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: year
+          in: query
+          schema:
+            type: integer
+        - name: order
+          in: query
+          schema:
+            type: string
+            enum: [asc, desc]
+        - name: order_by
+          in: query
+          schema:
+            type: string
+            enum: [rx_code, rx_name, generic_name, brand_name, total_claims, total_drug_cost, total_benes]
+      responses:
+        '200':
+          description: Prescription autocomplete results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PricingPrescriptionAutocompleteResponse'
+  /pricing/drugs/autocomplete:
+    get:
+      summary: Alias for /pricing/prescriptions/autocomplete
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: year
+          in: query
+          schema:
+            type: integer
+        - name: order
+          in: query
+          schema:
+            type: string
+            enum: [asc, desc]
+        - name: order_by
+          in: query
+          schema:
+            type: string
+            enum: [rx_code, rx_name, generic_name, brand_name, total_claims, total_drug_cost, total_benes]
+      responses:
+        '200':
+          description: Prescription autocomplete results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PricingPrescriptionAutocompleteResponse'
+  /pricing/providers/by-procedure:
+    get:
+      summary: Find providers by procedure/service text or code
+      parameters:
+        - name: year
+          in: query
+          schema:
+            type: integer
+        - name: min_claims
+          in: query
+          schema:
+            type: number
+        - name: min_total_cost
+          in: query
+          schema:
+            type: number
+        - name: state
+          in: query
+          schema:
+            type: string
+        - name: city
+          in: query
+          schema:
+            type: string
+        - name: zip5
+          in: query
+          schema:
+            type: string
+        - name: specialty
+          in: query
+          schema:
+            type: string
+        - name: q
+          in: query
+          schema:
+            type: string
+        - name: code
+          in: query
+          schema:
+            type: string
+        - name: include_legacy_fields
+          in: query
+          schema:
+            type: boolean
+        - name: order
+          in: query
+          schema:
+            type: string
+            enum: [asc, desc]
+        - name: order_by
+          in: query
+          schema:
+            type: string
+            enum:
+              [
+                npi,
+                provider_name,
+                total_services,
+                total_submitted_charges,
+                total_allowed_amount,
+                total_beneficiaries,
+                matched_service_codes,
+                cost_index,
+              ]
+      responses:
+        '200':
+          description: Paginated provider matches by procedure
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PricingProcedureProviderListResponse'
+  /pricing/providers/by-service:
+    get:
+      summary: Alias for /pricing/providers/by-procedure
+      parameters:
+        - name: year
+          in: query
+          schema:
+            type: integer
+        - name: min_claims
+          in: query
+          schema:
+            type: number
+        - name: min_total_cost
+          in: query
+          schema:
+            type: number
+        - name: state
+          in: query
+          schema:
+            type: string
+        - name: city
+          in: query
+          schema:
+            type: string
+        - name: zip5
+          in: query
+          schema:
+            type: string
+        - name: specialty
+          in: query
+          schema:
+            type: string
+        - name: q
+          in: query
+          schema:
+            type: string
+        - name: code
+          in: query
+          schema:
+            type: string
+        - name: include_legacy_fields
+          in: query
+          schema:
+            type: boolean
+        - name: order
+          in: query
+          schema:
+            type: string
+            enum: [asc, desc]
+        - name: order_by
+          in: query
+          schema:
+            type: string
+            enum:
+              [
+                npi,
+                provider_name,
+                total_services,
+                total_submitted_charges,
+                total_allowed_amount,
+                total_beneficiaries,
+                matched_service_codes,
+                cost_index,
+              ]
+      responses:
+        '200':
+          description: Paginated provider matches by procedure
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PricingProcedureProviderListResponse'
+  /pricing/physicians/by-service:
+    get:
+      summary: Alias for /pricing/providers/by-procedure
+      parameters:
+        - name: year
+          in: query
+          schema:
+            type: integer
+        - name: min_claims
+          in: query
+          schema:
+            type: number
+        - name: min_total_cost
+          in: query
+          schema:
+            type: number
+        - name: state
+          in: query
+          schema:
+            type: string
+        - name: city
+          in: query
+          schema:
+            type: string
+        - name: zip5
+          in: query
+          schema:
+            type: string
+        - name: specialty
+          in: query
+          schema:
+            type: string
+        - name: q
+          in: query
+          schema:
+            type: string
+        - name: code
+          in: query
+          schema:
+            type: string
+        - name: include_legacy_fields
+          in: query
+          schema:
+            type: boolean
+        - name: order
+          in: query
+          schema:
+            type: string
+            enum: [asc, desc]
+        - name: order_by
+          in: query
+          schema:
+            type: string
+            enum:
+              [
+                npi,
+                provider_name,
+                total_services,
+                total_submitted_charges,
+                total_allowed_amount,
+                total_beneficiaries,
+                matched_service_codes,
+                cost_index,
+              ]
+      responses:
+        '200':
+          description: Paginated provider matches by procedure
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PricingProcedureProviderListResponse'
+  /pricing/providers/by-prescription:
+    get:
+      summary: Find providers by prescription/drug text or code
+      parameters:
+        - name: year
+          in: query
+          schema:
+            type: integer
+        - name: min_claims
+          in: query
+          schema:
+            type: number
+        - name: min_total_cost
+          in: query
+          schema:
+            type: number
+        - name: state
+          in: query
+          schema:
+            type: string
+        - name: city
+          in: query
+          schema:
+            type: string
+        - name: zip5
+          in: query
+          schema:
+            type: string
+        - name: specialty
+          in: query
+          schema:
+            type: string
+        - name: q
+          in: query
+          schema:
+            type: string
+        - name: code
+          in: query
+          schema:
+            type: string
+        - name: rx_code_system
+          in: query
+          schema:
+            type: string
+        - name: order
+          in: query
+          schema:
+            type: string
+            enum: [asc, desc]
+        - name: order_by
+          in: query
+          schema:
+            type: string
+            enum: [npi, provider_name, total_claims, total_drug_cost, total_benes, matched_prescription_codes]
+      responses:
+        '200':
+          description: Paginated provider matches by prescription
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PricingPrescriptionProviderListResponse'
+  /pricing/providers/by-drug:
+    get:
+      summary: Alias for /pricing/providers/by-prescription
+      parameters:
+        - name: year
+          in: query
+          schema:
+            type: integer
+        - name: min_claims
+          in: query
+          schema:
+            type: number
+        - name: min_total_cost
+          in: query
+          schema:
+            type: number
+        - name: state
+          in: query
+          schema:
+            type: string
+        - name: city
+          in: query
+          schema:
+            type: string
+        - name: zip5
+          in: query
+          schema:
+            type: string
+        - name: specialty
+          in: query
+          schema:
+            type: string
+        - name: q
+          in: query
+          schema:
+            type: string
+        - name: code
+          in: query
+          schema:
+            type: string
+        - name: rx_code_system
+          in: query
+          schema:
+            type: string
+        - name: order
+          in: query
+          schema:
+            type: string
+            enum: [asc, desc]
+        - name: order_by
+          in: query
+          schema:
+            type: string
+            enum: [npi, provider_name, total_claims, total_drug_cost, total_benes, matched_prescription_codes]
+      responses:
+        '200':
+          description: Paginated provider matches by prescription
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PricingPrescriptionProviderListResponse'
+  /pricing/physicians/by-prescription:
+    get:
+      summary: Alias for /pricing/providers/by-prescription
+      parameters:
+        - name: year
+          in: query
+          schema:
+            type: integer
+        - name: min_claims
+          in: query
+          schema:
+            type: number
+        - name: min_total_cost
+          in: query
+          schema:
+            type: number
+        - name: state
+          in: query
+          schema:
+            type: string
+        - name: city
+          in: query
+          schema:
+            type: string
+        - name: zip5
+          in: query
+          schema:
+            type: string
+        - name: specialty
+          in: query
+          schema:
+            type: string
+        - name: q
+          in: query
+          schema:
+            type: string
+        - name: code
+          in: query
+          schema:
+            type: string
+        - name: rx_code_system
+          in: query
+          schema:
+            type: string
+        - name: order
+          in: query
+          schema:
+            type: string
+            enum: [asc, desc]
+        - name: order_by
+          in: query
+          schema:
+            type: string
+            enum: [npi, provider_name, total_claims, total_drug_cost, total_benes, matched_prescription_codes]
+      responses:
+        '200':
+          description: Paginated provider matches by prescription
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PricingPrescriptionProviderListResponse'
+  /pricing/physicians/by-drug:
+    get:
+      summary: Alias for /pricing/providers/by-prescription
+      parameters:
+        - name: year
+          in: query
+          schema:
+            type: integer
+        - name: min_claims
+          in: query
+          schema:
+            type: number
+        - name: min_total_cost
+          in: query
+          schema:
+            type: number
+        - name: state
+          in: query
+          schema:
+            type: string
+        - name: city
+          in: query
+          schema:
+            type: string
+        - name: zip5
+          in: query
+          schema:
+            type: string
+        - name: specialty
+          in: query
+          schema:
+            type: string
+        - name: q
+          in: query
+          schema:
+            type: string
+        - name: code
+          in: query
+          schema:
+            type: string
+        - name: rx_code_system
+          in: query
+          schema:
+            type: string
+        - name: order
+          in: query
+          schema:
+            type: string
+            enum: [asc, desc]
+        - name: order_by
+          in: query
+          schema:
+            type: string
+            enum: [npi, provider_name, total_claims, total_drug_cost, total_benes, matched_prescription_codes]
+      responses:
+        '200':
+          description: Paginated provider matches by prescription
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PricingPrescriptionProviderListResponse'
+  /pricing/providers/{npi}/prescriptions:
+    get:
+      summary: List prescription metrics for a provider
+      parameters:
+        - name: npi
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: year
+          in: query
+          schema:
+            type: integer
+        - name: min_claims
+          in: query
+          schema:
+            type: number
+        - name: min_total_cost
+          in: query
+          schema:
+            type: number
+        - name: q
+          in: query
+          schema:
+            type: string
+        - name: rx_name
+          in: query
+          schema:
+            type: string
+        - name: generic_name
+          in: query
+          schema:
+            type: string
+        - name: brand_name
+          in: query
+          schema:
+            type: string
+        - name: code
+          in: query
+          schema:
+            type: string
+        - name: rx_code_system
+          in: query
+          schema:
+            type: string
+        - name: order
+          in: query
+          schema:
+            type: string
+            enum: [asc, desc]
+        - name: order_by
+          in: query
+          schema:
+            type: string
+            enum: [rx_code, rx_name, generic_name, brand_name, total_claims, total_drug_cost, total_benes]
+      responses:
+        '200':
+          description: Paginated provider prescriptions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PricingProviderPrescriptionListResponse'
+  /pricing/physicians/{npi}/prescriptions:
+    get:
+      summary: Alias for /pricing/providers/{npi}/prescriptions
+      parameters:
+        - name: npi
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: year
+          in: query
+          schema:
+            type: integer
+        - name: min_claims
+          in: query
+          schema:
+            type: number
+        - name: min_total_cost
+          in: query
+          schema:
+            type: number
+        - name: q
+          in: query
+          schema:
+            type: string
+        - name: rx_name
+          in: query
+          schema:
+            type: string
+        - name: generic_name
+          in: query
+          schema:
+            type: string
+        - name: brand_name
+          in: query
+          schema:
+            type: string
+        - name: code
+          in: query
+          schema:
+            type: string
+        - name: rx_code_system
+          in: query
+          schema:
+            type: string
+        - name: order
+          in: query
+          schema:
+            type: string
+            enum: [asc, desc]
+        - name: order_by
+          in: query
+          schema:
+            type: string
+            enum: [rx_code, rx_name, generic_name, brand_name, total_claims, total_drug_cost, total_benes]
+      responses:
+        '200':
+          description: Paginated provider prescriptions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PricingProviderPrescriptionListResponse'
+  /pricing/providers/{npi}/prescriptions/{rx_code_system}/{rx_code}:
+    get:
+      summary: Retrieve one provider prescription detail
+      parameters:
+        - name: npi
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: rx_code_system
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: rx_code
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Provider prescription detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PricingProviderPrescriptionRecord'
+  /pricing/physicians/{npi}/prescriptions/{rx_code_system}/{rx_code}:
+    get:
+      summary: Alias for /pricing/providers/{npi}/prescriptions/{rx_code_system}/{rx_code}
+      parameters:
+        - name: npi
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: rx_code_system
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: rx_code
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Provider prescription detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PricingProviderPrescriptionRecord'
+  /pricing/prescriptions/{rx_code_system}/{rx_code}/providers:
+    get:
+      summary: List providers that prescribe a given code
+      parameters:
+        - name: rx_code_system
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: rx_code
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: year
+          in: query
+          schema:
+            type: integer
+        - name: min_claims
+          in: query
+          schema:
+            type: number
+        - name: min_total_cost
+          in: query
+          schema:
+            type: number
+        - name: state
+          in: query
+          schema:
+            type: string
+        - name: city
+          in: query
+          schema:
+            type: string
+        - name: specialty
+          in: query
+          schema:
+            type: string
+        - name: q
+          in: query
+          schema:
+            type: string
+        - name: order
+          in: query
+          schema:
+            type: string
+            enum: [asc, desc]
+        - name: order_by
+          in: query
+          schema:
+            type: string
+            enum: [npi, provider_name, total_claims, total_drug_cost, total_benes, matched_rows]
+      responses:
+        '200':
+          description: Paginated provider matches for the requested prescription
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PricingPrescriptionProviderListResponse'
+  /pricing/prescriptions/{rx_code_system}/{rx_code}/benchmarks:
+    get:
+      summary: Aggregate benchmark metrics for a requested prescription code
+      parameters:
+        - name: rx_code_system
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: rx_code
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: year
+          in: query
+          schema:
+            type: integer
+        - name: state
+          in: query
+          schema:
+            type: string
+        - name: city
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Prescription benchmark payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PricingPrescriptionBenchmarkResponse'
 components:
   schemas:
     Error:
@@ -1586,6 +3310,1312 @@ components:
           type: string
         pharmacist_count:
           type: integer
+    PaginationMeta:
+      type: object
+      properties:
+        total:
+          type: integer
+        limit:
+          type: integer
+        offset:
+          type: integer
+        page:
+          type: integer
+    CodeIdentifier:
+      type: object
+      properties:
+        code_system:
+          type: string
+        code:
+          type: string
+      required: [code_system, code]
+    CodeResolutionEdge:
+      type: object
+      properties:
+        from_system:
+          type: string
+        from_code:
+          type: string
+        to_system:
+          type: string
+        to_code:
+          type: string
+        match_type:
+          type: string
+        confidence:
+          type: number
+        source:
+          type: string
+    CodeCatalogRecord:
+      type: object
+      properties:
+        code_system:
+          type: string
+        code:
+          type: string
+        code_checksum:
+          type: integer
+        display_name:
+          type: string
+        short_description:
+          type: string
+        long_description:
+          type: string
+        is_active:
+          type: boolean
+        source:
+          type: string
+        updated_at:
+          type: string
+          format: date-time
+      required: [code_system, code]
+    CodeCrosswalkRecord:
+      type: object
+      properties:
+        from_system:
+          type: string
+        from_code:
+          type: string
+        from_checksum:
+          type: integer
+        to_system:
+          type: string
+        to_code:
+          type: string
+        to_checksum:
+          type: integer
+        match_type:
+          type: string
+        confidence:
+          type: number
+        source:
+          type: string
+        updated_at:
+          type: string
+          format: date-time
+      required: [from_system, from_code, to_system, to_code]
+    CodeListResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/CodeCatalogRecord'
+        pagination:
+          $ref: '#/components/schemas/PaginationMeta'
+        query:
+          type: object
+          properties:
+            code_system:
+              type: string
+              nullable: true
+            q:
+              type: string
+              nullable: true
+            source:
+              type: string
+              nullable: true
+            order_by:
+              type: string
+            order:
+              type: string
+              enum: [asc, desc]
+    CodeRelatedResponse:
+      type: object
+      properties:
+        input_code:
+          $ref: '#/components/schemas/CodeIdentifier'
+        related:
+          type: object
+          properties:
+            forward:
+              type: array
+              items:
+                $ref: '#/components/schemas/CodeCrosswalkRecord'
+            reverse:
+              type: array
+              items:
+                $ref: '#/components/schemas/CodeCrosswalkRecord'
+          required: [forward, reverse]
+    PricingLegacyFieldAliases:
+      type: object
+      properties:
+        total_claims:
+          type: string
+        total_30day_fills:
+          type: string
+        total_day_supply:
+          type: string
+        total_benes:
+          type: string
+        total_drug_cost:
+          type: string
+    PricingServiceLegacyFieldAliases:
+      type: object
+      properties:
+        procedure_code:
+          type: string
+        service_description:
+          type: string
+        reported_code:
+          type: string
+        total_claims:
+          type: string
+        total_30day_fills:
+          type: string
+        total_day_supply:
+          type: string
+        total_benes:
+          type: string
+        total_drug_cost:
+          type: string
+    PricingProviderSummary:
+      type: object
+      properties:
+        service_count:
+          type: integer
+        location_count:
+          type: integer
+      required: [service_count, location_count]
+    PricingProviderRecord:
+      type: object
+      properties:
+        provider_key:
+          type: integer
+        npi:
+          type: integer
+        year:
+          type: integer
+        provider_name:
+          type: string
+        first_name:
+          type: string
+        last_org_name:
+          type: string
+        credentials:
+          type: string
+        provider_type:
+          type: string
+        city:
+          type: string
+        state:
+          type: string
+        zip5:
+          type: string
+        country:
+          type: string
+        total_services:
+          type: number
+        total_reported_service_codes:
+          type: number
+        total_submitted_charges:
+          type: number
+        total_beneficiaries:
+          type: number
+        total_allowed_amount:
+          type: number
+        total_distinct_hcpcs_codes:
+          type: number
+        total_claims:
+          type: number
+        total_30day_fills:
+          type: number
+        total_day_supply:
+          type: number
+        total_benes:
+          type: number
+        total_drug_cost:
+          type: number
+        year_used:
+          type: integer
+        year_source:
+          type: string
+        summary:
+          $ref: '#/components/schemas/PricingProviderSummary'
+        legacy_field_aliases:
+          $ref: '#/components/schemas/PricingLegacyFieldAliases'
+    PricingProviderProcedureRecord:
+      type: object
+      properties:
+        npi:
+          type: integer
+        year:
+          type: integer
+        procedure_code:
+          type: integer
+        service_code_system:
+          type: string
+        service_code:
+          type: string
+        service_name:
+          type: string
+        service_description:
+          type: string
+        reported_code:
+          type: string
+        reported_code_system:
+          type: string
+        total_services:
+          type: number
+        total_beneficiary_day_services:
+          type: number
+        total_submitted_charges:
+          type: number
+        total_allowed_amount:
+          type: number
+        total_beneficiaries:
+          type: number
+        ge65_total_services:
+          type: number
+        ge65_total_allowed_amount:
+          type: number
+        ge65_total_beneficiaries:
+          type: number
+        total_claims:
+          type: number
+        total_30day_fills:
+          type: number
+        total_day_supply:
+          type: number
+        total_drug_cost:
+          type: number
+        total_benes:
+          type: number
+        ge65_total_claims:
+          type: number
+        ge65_total_benes:
+          type: number
+        ge65_total_drug_cost:
+          type: number
+        legacy_field_aliases:
+          $ref: '#/components/schemas/PricingServiceLegacyFieldAliases'
+    PricingProviderProcedureLocationRecord:
+      type: object
+      properties:
+        location_key:
+          type: integer
+        npi:
+          type: integer
+        year:
+          type: integer
+        procedure_code:
+          type: integer
+        place_of_service:
+          type: string
+        city:
+          type: string
+        state:
+          type: string
+        zip5:
+          type: string
+        state_fips:
+          type: string
+        country:
+          type: string
+        service_code_system:
+          type: string
+        service_code:
+          type: string
+        service_name:
+          type: string
+        service_description:
+          type: string
+        reported_code:
+          type: string
+        reported_code_system:
+          type: string
+    PricingProcedureProviderRecord:
+      type: object
+      properties:
+        npi:
+          type: integer
+        provider_name:
+          type: string
+        provider_type:
+          type: string
+        city:
+          type: string
+        state:
+          type: string
+        zip5:
+          type: string
+        total_services:
+          type: number
+        total_submitted_charges:
+          type: number
+        total_allowed_amount:
+          type: number
+        total_beneficiaries:
+          type: number
+        cost_index:
+          oneOf:
+            - type: number
+            - type: string
+              enum: ['$', '$$', '$$$', '$$$$', '$$$$$']
+          description: |
+            Provider cost index for the matched service. Numeric legacy values may appear;
+            when peer benchmark data is available this is emitted as '$'..'$$$$$'.
+        estimated_cost_level:
+          type: string
+          enum: ['$', '$$', '$$$', '$$$$', '$$$$$']
+          nullable: true
+        avg_submitted_charge:
+          type: number
+        avg_allowed_amount:
+          type: number
+        matched_rows:
+          type: integer
+        matched_service_codes:
+          type: integer
+        total_claims:
+          type: number
+        total_day_supply:
+          type: number
+        total_drug_cost:
+          type: number
+        total_benes:
+          type: number
+        legacy_field_aliases:
+          $ref: '#/components/schemas/PricingLegacyFieldAliases'
+    PricingProviderPrescriptionRecord:
+      type: object
+      properties:
+        npi:
+          type: integer
+        year:
+          type: integer
+        rx_code_system:
+          type: string
+        rx_code:
+          type: string
+        rx_name:
+          type: string
+        generic_name:
+          type: string
+        brand_name:
+          type: string
+        provider_name:
+          type: string
+        provider_type:
+          type: string
+        city:
+          type: string
+        state:
+          type: string
+        zip5:
+          type: string
+        country:
+          type: string
+        total_claims:
+          type: number
+        total_30day_fills:
+          type: number
+        total_day_supply:
+          type: number
+        total_drug_cost:
+          type: number
+        total_benes:
+          type: number
+        ge65_total_claims:
+          type: number
+        ge65_total_30day_fills:
+          type: number
+        ge65_total_day_supply:
+          type: number
+        ge65_total_drug_cost:
+          type: number
+        ge65_total_benes:
+          type: number
+        prescription_code_system:
+          type: string
+        prescription_code:
+          type: string
+        prescription_name:
+          type: string
+        total_prescriptions:
+          type: number
+        total_beneficiaries:
+          type: number
+        total_allowed_amount:
+          type: number
+        ge65_total_prescriptions:
+          type: number
+        ge65_total_beneficiaries:
+          type: number
+        ge65_total_allowed_amount:
+          type: number
+        year_used:
+          type: integer
+        year_source:
+          type: string
+        input_code:
+          $ref: '#/components/schemas/CodeIdentifier'
+        resolved_codes:
+          type: array
+          items:
+            $ref: '#/components/schemas/CodeIdentifier'
+        matched_via:
+          type: array
+          items:
+            $ref: '#/components/schemas/CodeResolutionEdge'
+    PricingPrescriptionProviderRecord:
+      type: object
+      properties:
+        npi:
+          type: integer
+        provider_name:
+          type: string
+        provider_type:
+          type: string
+        city:
+          type: string
+        state:
+          type: string
+        zip5:
+          type: string
+        total_claims:
+          type: number
+        total_drug_cost:
+          type: number
+        total_benes:
+          type: number
+        total_prescriptions:
+          type: number
+        total_beneficiaries:
+          type: number
+        total_allowed_amount:
+          type: number
+        matched_rows:
+          type: integer
+        matched_prescription_codes:
+          type: integer
+    PricingProviderListResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/PricingProviderRecord'
+        pagination:
+          $ref: '#/components/schemas/PaginationMeta'
+        query:
+          type: object
+          properties:
+            year:
+              type: integer
+              nullable: true
+            year_used:
+              type: integer
+            year_source:
+              type: string
+            npi:
+              type: integer
+              nullable: true
+            state:
+              type: string
+              nullable: true
+            city:
+              type: string
+              nullable: true
+            specialty:
+              type: string
+              nullable: true
+            q:
+              type: string
+              nullable: true
+            min_claims:
+              type: number
+              nullable: true
+            min_total_cost:
+              type: number
+              nullable: true
+            include_legacy_fields:
+              type: boolean
+            order_by:
+              type: string
+            order:
+              type: string
+              enum: [asc, desc]
+    PricingProviderScoreResponse:
+      type: object
+      properties:
+        npi:
+          type: integer
+        year_used:
+          type: integer
+        year_source:
+          type: string
+        estimated_cost_level:
+          type: string
+          enum: ['$', '$$', '$$$', '$$$$', '$$$$$']
+        quality_proxy_score:
+          type: number
+        confidence:
+          type: string
+          enum: [low, medium, high]
+        components:
+          type: object
+          properties:
+            volume_score:
+              type: number
+            consistency_score:
+              type: number
+            efficiency_score:
+              type: number
+            access_score:
+              type: number
+            data_confidence_score:
+              type: number
+        peer_group:
+          type: object
+          properties:
+            year:
+              type: integer
+            state:
+              type: string
+              nullable: true
+            peer_count:
+              type: integer
+            cost_percentile:
+              type: number
+            volume_percentile:
+              type: number
+            bene_percentile:
+              type: number
+    PricingCostLevelThresholdAverage:
+      type: object
+      properties:
+        max_avg_submitted_charge:
+          type: number
+        min_avg_submitted_charge:
+          type: number
+    PricingCostLevelThresholdTotal:
+      type: object
+      properties:
+        max_total_allowed_amount:
+          type: number
+        min_total_allowed_amount:
+          type: number
+    PricingEstimatedCostLevelThresholdsAverage:
+      type: object
+      properties:
+        '$':
+          $ref: '#/components/schemas/PricingCostLevelThresholdAverage'
+        '$$':
+          $ref: '#/components/schemas/PricingCostLevelThresholdAverage'
+        '$$$':
+          $ref: '#/components/schemas/PricingCostLevelThresholdAverage'
+        '$$$$':
+          $ref: '#/components/schemas/PricingCostLevelThresholdAverage'
+        '$$$$$':
+          $ref: '#/components/schemas/PricingCostLevelThresholdAverage'
+    PricingEstimatedCostLevelThresholdsTotal:
+      type: object
+      properties:
+        '$':
+          $ref: '#/components/schemas/PricingCostLevelThresholdTotal'
+        '$$':
+          $ref: '#/components/schemas/PricingCostLevelThresholdTotal'
+        '$$$':
+          $ref: '#/components/schemas/PricingCostLevelThresholdTotal'
+        '$$$$':
+          $ref: '#/components/schemas/PricingCostLevelThresholdTotal'
+        '$$$$$':
+          $ref: '#/components/schemas/PricingCostLevelThresholdTotal'
+    PricingProviderProcedureCostLevelResponse:
+      type: object
+      properties:
+        npi:
+          type: integer
+        year_used:
+          type: integer
+        year_source:
+          type: string
+        estimated_cost_level:
+          type: string
+          enum: ['$', '$$', '$$$', '$$$$', '$$$$$']
+          nullable: true
+        confidence:
+          type: string
+          enum: [low, medium, high]
+        procedure:
+          type: object
+          properties:
+            code_system:
+              type: string
+            code:
+              type: string
+            name:
+              type: string
+            description:
+              type: string
+            reported_code:
+              type: string
+            reported_code_system:
+              type: string
+        provider:
+          type: object
+          properties:
+            procedure_code:
+              type: integer
+            claim_count:
+              type: number
+            avg_submitted_charge:
+              type: number
+            total_submitted_charge:
+              type: number
+            specialty_key:
+              type: string
+            setting_key:
+              type: string
+        peer_group:
+          type: object
+          properties:
+            provider_count:
+              type: integer
+            median_avg_submitted_charge:
+              type: number
+            typical_range:
+              type: object
+              properties:
+                p10:
+                  type: number
+                p90:
+                  type: number
+            estimated_cost_level_thresholds:
+              $ref: '#/components/schemas/PricingEstimatedCostLevelThresholdsAverage'
+            geography_scope:
+              type: string
+            geography_value:
+              type: string
+            specialty_key:
+              type: string
+            setting_key:
+              type: string
+            min_claim_count:
+              type: number
+            max_claim_count:
+              type: number
+        query:
+          type: object
+          properties:
+            state:
+              type: string
+              nullable: true
+            city:
+              type: string
+              nullable: true
+            zip5:
+              type: string
+              nullable: true
+            specialty:
+              type: string
+              nullable: true
+            setting:
+              type: string
+            input_code:
+              $ref: '#/components/schemas/CodeIdentifier'
+            resolved_codes:
+              type: array
+              items:
+                $ref: '#/components/schemas/CodeIdentifier'
+            matched_via:
+              type: array
+              items:
+                $ref: '#/components/schemas/CodeResolutionEdge'
+    PricingProviderProcedureListResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/PricingProviderProcedureRecord'
+        pagination:
+          $ref: '#/components/schemas/PaginationMeta'
+        query:
+          type: object
+          properties:
+            npi:
+              type: integer
+            year:
+              type: integer
+            year_used:
+              type: integer
+            year_source:
+              type: string
+            service_name:
+              type: string
+              nullable: true
+            reported_code:
+              type: string
+              nullable: true
+            q:
+              type: string
+              nullable: true
+            code:
+              type: string
+              nullable: true
+            min_claims:
+              type: number
+              nullable: true
+            min_total_cost:
+              type: number
+              nullable: true
+            include_legacy_fields:
+              type: boolean
+            order_by:
+              type: string
+            order:
+              type: string
+              enum: [asc, desc]
+            input_code:
+              $ref: '#/components/schemas/CodeIdentifier'
+            resolved_codes:
+              type: array
+              items:
+                $ref: '#/components/schemas/CodeIdentifier'
+            matched_via:
+              type: array
+              items:
+                $ref: '#/components/schemas/CodeResolutionEdge'
+    PricingProviderProcedureDetail:
+      allOf:
+        - $ref: '#/components/schemas/PricingProviderProcedureRecord'
+        - type: object
+          properties:
+            avg_submitted_charge:
+              type: number
+            avg_allowed_amount:
+              type: number
+            avg_payment_amount:
+              type: number
+            avg_standardized_amount:
+              type: number
+            market_total_services:
+              type: number
+            market_total_beneficiaries:
+              type: number
+            source_year:
+              type: integer
+            year_used:
+              type: integer
+            year_source:
+              type: string
+            input_code:
+              $ref: '#/components/schemas/CodeIdentifier'
+            resolved_codes:
+              type: array
+              items:
+                $ref: '#/components/schemas/CodeIdentifier'
+            matched_via:
+              type: array
+              items:
+                $ref: '#/components/schemas/CodeResolutionEdge'
+    PricingProviderProcedureLocationListResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/PricingProviderProcedureLocationRecord'
+        pagination:
+          $ref: '#/components/schemas/PaginationMeta'
+        query:
+          type: object
+          properties:
+            npi:
+              type: integer
+            year:
+              type: integer
+            year_used:
+              type: integer
+            year_source:
+              type: string
+            state:
+              type: string
+              nullable: true
+            city:
+              type: string
+              nullable: true
+            zip5:
+              type: string
+              nullable: true
+            include_legacy_fields:
+              type: boolean
+            order_by:
+              type: string
+            order:
+              type: string
+              enum: [asc, desc]
+            input_code:
+              $ref: '#/components/schemas/CodeIdentifier'
+            resolved_codes:
+              type: array
+              items:
+                $ref: '#/components/schemas/CodeIdentifier'
+            matched_via:
+              type: array
+              items:
+                $ref: '#/components/schemas/CodeResolutionEdge'
+    PricingProcedureProviderListResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/PricingProcedureProviderRecord'
+        pagination:
+          $ref: '#/components/schemas/PaginationMeta'
+        query:
+          type: object
+          properties:
+            year:
+              type: integer
+            year_used:
+              type: integer
+            year_source:
+              type: string
+            state:
+              type: string
+              nullable: true
+            city:
+              type: string
+              nullable: true
+            specialty:
+              type: string
+              nullable: true
+            q:
+              type: string
+              nullable: true
+            min_claims:
+              type: number
+              nullable: true
+            min_total_cost:
+              type: number
+              nullable: true
+            include_legacy_fields:
+              type: boolean
+            order_by:
+              type: string
+            order:
+              type: string
+              enum: [asc, desc]
+            input_code:
+              $ref: '#/components/schemas/CodeIdentifier'
+            resolved_codes:
+              type: array
+              items:
+                $ref: '#/components/schemas/CodeIdentifier'
+            matched_via:
+              type: array
+              items:
+                $ref: '#/components/schemas/CodeResolutionEdge'
+    PricingBenchmarkResponse:
+      type: object
+      properties:
+        query:
+          type: object
+          properties:
+            year:
+              type: integer
+            year_used:
+              type: integer
+            year_source:
+              type: string
+            state:
+              type: string
+              nullable: true
+            city:
+              type: string
+              nullable: true
+            include_legacy_fields:
+              type: boolean
+            input_code:
+              $ref: '#/components/schemas/CodeIdentifier'
+            resolved_codes:
+              type: array
+              items:
+                $ref: '#/components/schemas/CodeIdentifier'
+            matched_via:
+              type: array
+              items:
+                $ref: '#/components/schemas/CodeResolutionEdge'
+        benchmark:
+          type: object
+          properties:
+            matched_rows:
+              type: integer
+            provider_count:
+              type: integer
+            total_services:
+              type: number
+            total_submitted_charges:
+              type: number
+            total_allowed_amount:
+              type: number
+            avg_total_allowed_amount:
+              type: number
+            min_total_allowed_amount:
+              type: number
+            max_total_allowed_amount:
+              type: number
+            estimated_cost_level_thresholds:
+              $ref: '#/components/schemas/PricingEstimatedCostLevelThresholdsTotal'
+            total_claims:
+              type: number
+            total_day_supply:
+              type: number
+            total_drug_cost:
+              type: number
+            avg_total_drug_cost:
+              type: number
+            min_total_drug_cost:
+              type: number
+            max_total_drug_cost:
+              type: number
+    PricingProcedureGeoBenchmarkRecord:
+      type: object
+      properties:
+        geography_scope:
+          type: string
+        geography_value:
+          type: string
+        total_services:
+          type: number
+        avg_submitted_charge:
+          type: number
+        avg_payment_amount:
+          type: number
+        avg_standardized_amount:
+          type: number
+    PricingProcedureGeoBenchmarkResponse:
+      type: object
+      properties:
+        query:
+          type: object
+          properties:
+            year:
+              type: integer
+              nullable: true
+            year_used:
+              type: integer
+              nullable: true
+            year_source:
+              type: string
+            state:
+              type: string
+              nullable: true
+            data_status:
+              type: string
+            input_code:
+              $ref: '#/components/schemas/CodeIdentifier'
+            resolved_codes:
+              type: array
+              items:
+                $ref: '#/components/schemas/CodeIdentifier'
+            matched_via:
+              type: array
+              items:
+                $ref: '#/components/schemas/CodeResolutionEdge'
+        benchmarks:
+          type: object
+          properties:
+            national:
+              allOf:
+                - $ref: '#/components/schemas/PricingProcedureGeoBenchmarkRecord'
+              nullable: true
+            state:
+              allOf:
+                - $ref: '#/components/schemas/PricingProcedureGeoBenchmarkRecord'
+              nullable: true
+    PricingProcedureAutocompleteItem:
+      type: object
+      properties:
+        term:
+          type: string
+        code_systems:
+          type: array
+          items:
+            type: string
+        codes:
+          type: array
+          items:
+            $ref: '#/components/schemas/CodeIdentifier'
+        internal_codes:
+          type: array
+          items:
+            type: string
+        sources:
+          type: array
+          items:
+            type: string
+    PricingProcedureAutocompleteResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/PricingProcedureAutocompleteItem'
+        pagination:
+          $ref: '#/components/schemas/PaginationMeta'
+        query:
+          type: object
+          properties:
+            q:
+              type: string
+            year:
+              type: integer
+              nullable: true
+            year_source:
+              type: string
+            code_system:
+              type: string
+              nullable: true
+            dedupe_terms:
+              type: boolean
+            max_codes_per_term:
+              type: integer
+    PricingProviderPrescriptionListResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/PricingProviderPrescriptionRecord'
+        pagination:
+          $ref: '#/components/schemas/PaginationMeta'
+        query:
+          type: object
+          properties:
+            npi:
+              type: integer
+            year:
+              type: integer
+              nullable: true
+            year_used:
+              type: integer
+              nullable: true
+            year_source:
+              type: string
+            data_status:
+              type: string
+            rx_name:
+              type: string
+              nullable: true
+            generic_name:
+              type: string
+              nullable: true
+            brand_name:
+              type: string
+              nullable: true
+            q:
+              type: string
+              nullable: true
+            code:
+              type: string
+              nullable: true
+            min_claims:
+              type: number
+              nullable: true
+            min_total_cost:
+              type: number
+              nullable: true
+            order_by:
+              type: string
+            order:
+              type: string
+              enum: [asc, desc]
+            input_code:
+              $ref: '#/components/schemas/CodeIdentifier'
+            resolved_codes:
+              type: array
+              items:
+                $ref: '#/components/schemas/CodeIdentifier'
+            matched_via:
+              type: array
+              items:
+                $ref: '#/components/schemas/CodeResolutionEdge'
+    PricingPrescriptionProviderListResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/PricingPrescriptionProviderRecord'
+        pagination:
+          $ref: '#/components/schemas/PaginationMeta'
+        query:
+          type: object
+          properties:
+            year:
+              type: integer
+              nullable: true
+            year_used:
+              type: integer
+              nullable: true
+            year_source:
+              type: string
+            data_status:
+              type: string
+            state:
+              type: string
+              nullable: true
+            city:
+              type: string
+              nullable: true
+            specialty:
+              type: string
+              nullable: true
+            q:
+              type: string
+              nullable: true
+            code:
+              type: string
+              nullable: true
+            min_claims:
+              type: number
+              nullable: true
+            min_total_cost:
+              type: number
+              nullable: true
+            order_by:
+              type: string
+            order:
+              type: string
+              enum: [asc, desc]
+            input_code:
+              $ref: '#/components/schemas/CodeIdentifier'
+            resolved_codes:
+              type: array
+              items:
+                $ref: '#/components/schemas/CodeIdentifier'
+            matched_via:
+              type: array
+              items:
+                $ref: '#/components/schemas/CodeResolutionEdge'
+    PricingPrescriptionBenchmarkResponse:
+      type: object
+      properties:
+        query:
+          type: object
+          properties:
+            year:
+              type: integer
+              nullable: true
+            year_used:
+              type: integer
+              nullable: true
+            year_source:
+              type: string
+            state:
+              type: string
+              nullable: true
+            city:
+              type: string
+              nullable: true
+            data_status:
+              type: string
+            input_code:
+              $ref: '#/components/schemas/CodeIdentifier'
+            resolved_codes:
+              type: array
+              items:
+                $ref: '#/components/schemas/CodeIdentifier'
+            matched_via:
+              type: array
+              items:
+                $ref: '#/components/schemas/CodeResolutionEdge'
+        benchmark:
+          type: object
+          properties:
+            matched_rows:
+              type: integer
+            provider_count:
+              type: integer
+            total_prescriptions:
+              type: number
+            total_allowed_amount:
+              type: number
+            avg_total_allowed_amount:
+              type: number
+            min_total_allowed_amount:
+              type: number
+            max_total_allowed_amount:
+              type: number
+            estimated_cost_level_thresholds:
+              $ref: '#/components/schemas/PricingEstimatedCostLevelThresholdsTotal'
+    PricingPrescriptionAutocompleteItem:
+      type: object
+      properties:
+        rx_code_system:
+          type: string
+        rx_code:
+          type: string
+        prescription_code_system:
+          type: string
+        prescription_code:
+          type: string
+        rx_name:
+          type: string
+        generic_name:
+          type: string
+        brand_name:
+          type: string
+        ndc_code:
+          type: string
+          description: Preferred mapped NDC code when available.
+        rxnorm_id:
+          type: string
+          description: Preferred mapped RxNorm code when available.
+        preferred_prescription_code_system:
+          type: string
+          description: Preferred external code system (`NDC` first, then `RXNORM`, else internal fallback).
+        preferred_prescription_code:
+          type: string
+          description: Preferred code value chosen from mapped external codes or internal fallback.
+        prescription_name:
+          type: string
+        display_label:
+          type: string
+        total_claims:
+          type: number
+        total_drug_cost:
+          type: number
+        total_benes:
+          type: number
+        total_prescriptions:
+          type: number
+        total_allowed_amount:
+          type: number
+    PricingPrescriptionAutocompleteResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/PricingPrescriptionAutocompleteItem'
+        pagination:
+          $ref: '#/components/schemas/PaginationMeta'
+        query:
+          type: object
+          properties:
+            q:
+              type: string
+            year:
+              type: integer
+              nullable: true
+            year_used:
+              type: integer
+              nullable: true
+            year_source:
+              type: string
+            data_status:
+              type: string
+            order_by:
+              type: string
+            order:
+              type: string
+              enum: [asc, desc]
     HealthcheckResponse:
       type: object
       properties:

@@ -10,6 +10,7 @@ arq==0.26.3
 async_unzip>=0.5.5
 asyncpg>=0.29.0
 attrs==25.4.0
+Brotli
 coverage==7.11.0
 fastcrc
 frozenlist==1.8.0

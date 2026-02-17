@@ -49,6 +49,8 @@ TEST_MIN_PLAN_COUNT = 1
 PLAN_ID_MAX_LENGTH = getattr(Plan.__table__.c.plan_id.type, "length", 14)
 
 logger = logging.getLogger(__name__)
+MRF_QUEUE_NAME = "arq:MRF"
+MRF_FINISH_QUEUE_NAME = "arq:MRF_finish"
 
 
 def is_test_mode(ctx: dict) -> bool:
@@ -69,6 +71,44 @@ def _clean_name_part(value):
     if isinstance(value, str):
         return value.strip()
     return str(value).strip()
+
+
+def _extract_plan_years(plan_obj: dict) -> list[int]:
+    raw_years = plan_obj.get("years")
+    if raw_years is None:
+        raw_years = plan_obj.get("year")
+    if raw_years is None:
+        return []
+
+    if isinstance(raw_years, (list, tuple, set)):
+        candidates = list(raw_years)
+    else:
+        candidates = [raw_years]
+
+    years: list[int] = []
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        try:
+            if isinstance(candidate, int):
+                year_val = candidate
+            elif isinstance(candidate, float):
+                if not candidate.is_integer():
+                    continue
+                year_val = int(candidate)
+            else:
+                text = str(candidate).strip()
+                if not text:
+                    continue
+                if text.endswith(".0"):
+                    text = text[:-2]
+                year_val = int(text)
+        except (TypeError, ValueError):
+            continue
+        if 1900 <= year_val <= 2200 and year_val not in years:
+            years.append(year_val)
+
+    return years
 
 
 async def _prepare_import_tables(import_date: str, test_mode: bool) -> None:
@@ -167,10 +207,34 @@ async def process_plan(ctx, task):
                 async for res in ijson.items(afp, "item", use_float=True):
                     if stop_processing:
                         break
+                    if not isinstance(res, dict):
+                        await log_error(
+                            "err",
+                            f"Malformed plan entry type: {type(res).__name__}. Expected object.",
+                            task.get("issuer_array"),
+                            task.get("url"),
+                            "plans",
+                            "json",
+                            myimportlog,
+                        )
+                        continue
                     plan_id_raw = res.get("plan_id")
                     plan_id_value = str(plan_id_raw).strip() if plan_id_raw is not None else ""
+                    years = _extract_plan_years(res)
+                    if not years:
+                        await log_error(
+                            "err",
+                            f"Mandatory field `years` is not present or incorrect. Plan ID: "
+                            f"{plan_id_value or 'UNKNOWN'}",
+                            task.get("issuer_array"),
+                            task.get("url"),
+                            "plans",
+                            "json",
+                            myimportlog,
+                        )
+                        continue
                     if PLAN_ID_MAX_LENGTH and len(plan_id_value) > PLAN_ID_MAX_LENGTH:
-                        for year in res.get("years", []):
+                        for year in years:
                             await log_error(
                                 "err",
                                 f"Plan ID length exceeds {PLAN_ID_MAX_LENGTH} characters. "
@@ -182,7 +246,7 @@ async def process_plan(ctx, task):
                                 myimportlog,
                             )
                         continue
-                    for year in res["years"]:
+                    for year in years:
                         if stop_processing:
                             break
                         try:
@@ -270,7 +334,7 @@ async def process_plan(ctx, task):
                             )
 
                     count = 0
-                    for year in res["years"]:
+                    for year in years:
                         if stop_processing:
                             break
                         if formulary_entries:
@@ -1001,7 +1065,9 @@ async def process_json_index(ctx, task):
                 ):  # , 'formulary_urls', 'provider_urls'
                     print(f"Plan URL: {url}")
                     await redis.enqueue_job(
-                        "process_plan", {"url": url, "issuer_array": issuer_array, "context": ctx["context"]}
+                        "process_plan",
+                        {"url": url, "issuer_array": issuer_array, "context": ctx["context"]},
+                        _queue_name=MRF_QUEUE_NAME,
                     )
                     # break
                     enqueued_plans += 1
@@ -1025,7 +1091,9 @@ async def process_json_index(ctx, task):
                 ):
                     print(f"Formulary URL: {url}")
                     await redis.enqueue_job(
-                        "process_formulary", {"url": url, "issuer_array": issuer_array, "context": ctx["context"]}
+                        "process_formulary",
+                        {"url": url, "issuer_array": issuer_array, "context": ctx["context"]},
+                        _queue_name=MRF_QUEUE_NAME,
                     )
                     enqueued_formularies += 1
                     if formulary_limit and enqueued_formularies >= formulary_limit:
@@ -1060,7 +1128,9 @@ async def process_json_index(ctx, task):
                 ):  # , 'formulary_urls', 'provider_urls'
                     print(f"Provider URL: {url}")
                     await redis.enqueue_job(
-                        "process_provider", {"url": url, "issuer_array": issuer_array, "context": ctx["context"]}
+                        "process_provider",
+                        {"url": url, "issuer_array": issuer_array, "context": ctx["context"]},
+                        _queue_name=MRF_QUEUE_NAME,
                     )
                     # break
                     enqueued_providers += 1
@@ -1518,7 +1588,7 @@ async def init_file(ctx, task=None):
             await redis.enqueue_job(
                 "process_json_index",
                 {"url": url, "issuer_array": url2issuer[url], "context": ctx["context"]},
-                _queue_name="arq:MRF",
+                _queue_name=MRF_QUEUE_NAME,
             )
             if max_urls and idx + 1 >= max_urls:
                 break
@@ -1528,7 +1598,7 @@ async def init_file(ctx, task=None):
             "shutdown",
             {"context": ctx["context"], "test_mode": test_mode},
             _job_id=shutdown_job_id,
-            _queue_name="arq:MRF_finish",
+            _queue_name=MRF_FINISH_QUEUE_NAME,
         )
         # break
 
@@ -1628,9 +1698,9 @@ async def main(test_mode: bool = False):
     :return: A coroutine
     """
     redis = await create_pool(build_redis_settings(), job_serializer=serialize_job, job_deserializer=deserialize_job)
-    await redis.enqueue_job("init_file", {"test_mode": test_mode}, _queue_name="arq:MRF")
+    await redis.enqueue_job("init_file", {"test_mode": test_mode}, _queue_name=MRF_QUEUE_NAME)
 
 
 async def finish_main():
     redis = await create_pool(build_redis_settings(), job_serializer=serialize_job, job_deserializer=deserialize_job)
-    await redis.enqueue_job("shutdown", _queue_name="arq:MRF_finish")
+    await redis.enqueue_job("shutdown", _queue_name=MRF_FINISH_QUEUE_NAME)

@@ -23,6 +23,7 @@ latin_pattern= re.compile(r'[^\x00-\x7f]')
 
 TEST_NUCC_ROWS = 500
 TEST_NUCC_MAX_FILES = 1
+NUCC_QUEUE_NAME = "arq:NUCC"
 
 
 def is_test_mode(ctx: dict) -> bool:
@@ -147,4 +148,4 @@ async def main(test_mode: bool = False):
     redis = await create_pool(build_redis_settings(),
                               job_serializer=serialize_job,
                               job_deserializer=deserialize_job)
-    await redis.enqueue_job('process_data', {'test_mode': test_mode})
+    await redis.enqueue_job('process_data', {'test_mode': test_mode}, _queue_name=NUCC_QUEUE_NAME)

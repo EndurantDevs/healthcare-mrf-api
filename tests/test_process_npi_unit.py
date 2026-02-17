@@ -204,6 +204,7 @@ async def test_process_data_no_remote_files(monkeypatch, npi_module):
     download_mock = AsyncMock(return_value="")
     monkeypatch.setattr(npi_module, "download_it", download_mock)
     monkeypatch.setattr(npi_module, "ensure_database", AsyncMock())
+    monkeypatch.setattr(npi_module.db, "status", AsyncMock())
 
     ctx = {"context": {}, "redis": SimpleNamespace(enqueue_job=AsyncMock()), "import_date": "20251107"}
 
@@ -211,6 +212,24 @@ async def test_process_data_no_remote_files(monkeypatch, npi_module):
 
     assert ctx["context"]["run"] == 1
     download_mock.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_process_data_failure_does_not_mark_run(monkeypatch, npi_module):
+
+    monkeypatch.setenv("HLTHPRT_NPPES_DOWNLOAD_URL_DIR", "https://example.com/")
+    monkeypatch.setenv("HLTHPRT_NPPES_DOWNLOAD_URL_FILE", "feed.html")
+
+    monkeypatch.setattr(npi_module, "download_it", AsyncMock(side_effect=RuntimeError("boom")))
+    monkeypatch.setattr(npi_module, "ensure_database", AsyncMock())
+    monkeypatch.setattr(npi_module.db, "status", AsyncMock())
+
+    ctx = {"context": {}, "redis": SimpleNamespace(enqueue_job=AsyncMock()), "import_date": "20251107"}
+
+    with pytest.raises(RuntimeError):
+        await npi_module.process_data(ctx)
+
+    assert ctx["context"].get("run", 0) == 0
 
 
 @pytest.mark.asyncio
