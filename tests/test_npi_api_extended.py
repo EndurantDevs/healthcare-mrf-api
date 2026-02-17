@@ -621,6 +621,106 @@ async def test_get_near_npi_rejects_name_like_legacy_alias():
 
 
 @pytest.mark.asyncio
+async def test_get_near_npi_applies_procedure_and_medication_filters(monkeypatch):
+    captured = {}
+
+    class RecordingConnection:
+        async def all(self, sql, **params):
+            captured["sql"] = str(sql)
+            captured["params"] = dict(params)
+            return [_build_near_row(1112223334)]
+
+        async def first(self, *_args, **_kwargs):
+            return None
+
+    class FakeDB:
+        def acquire(self):
+            return FakeAcquire(RecordingConnection())
+
+    monkeypatch.setattr(npi_module, "db", FakeDB())
+    monkeypatch.setattr(
+        npi_module,
+        "_resolve_npi_filter_capabilities",
+        lambda: asyncio.sleep(0, result={
+            "npi_procedures_array_available": True,
+            "npi_medications_array_available": True,
+            "pricing_provider_procedure_available": False,
+            "pricing_provider_prescription_available": False,
+        }),
+    )
+
+    async def fake_ensure_index():
+        return None
+
+    monkeypatch.setattr(npi_module, "_ensure_npi_geo_index", fake_ensure_index)
+
+    request = types.SimpleNamespace(
+        args={
+            "long": "-87.0",
+            "lat": "41.0",
+            "procedure_codes": "1001,1002",
+            "procedure_code_system": "HP_PROCEDURE_CODE",
+            "medication_codes": "2001,2002",
+            "medication_code_system": "HP_RX_CODE",
+            "year": "2023",
+            "limit": "1",
+        },
+        app=types.SimpleNamespace(),
+    )
+    response = await npi_module.get_near_npi(request)
+    payload = json.loads(response.body)
+
+    assert len(payload) == 1
+    assert "a.procedures_array @> ARRAY[:procedure_code_0]::INTEGER[]" in captured["sql"]
+    assert "a.procedures_array @> ARRAY[:procedure_code_1]::INTEGER[]" in captured["sql"]
+    assert "a.medications_array @> ARRAY[:medication_code_0]::INTEGER[]" in captured["sql"]
+    assert "a.medications_array @> ARRAY[:medication_code_1]::INTEGER[]" in captured["sql"]
+    assert captured["params"]["procedure_code_0"] == 1001
+    assert captured["params"]["procedure_code_1"] == 1002
+    assert captured["params"]["medication_code_0"] == 2001
+    assert captured["params"]["medication_code_1"] == 2002
+    assert captured["params"]["filter_year"] == 2023
+
+
+@pytest.mark.asyncio
+async def test_get_near_npi_rejects_invalid_medication_code_system():
+    request = types.SimpleNamespace(
+        args={"lat": "41.0", "long": "-87.0", "medication_codes": "2001", "medication_code_system": "ATC"},
+        app=types.SimpleNamespace(),
+    )
+    with pytest.raises(sanic.exceptions.InvalidUsage):
+        await npi_module.get_near_npi(request)
+
+
+@pytest.mark.asyncio
+async def test_get_near_npi_does_not_crash_on_short_positional_rows(monkeypatch):
+    short_row = _build_near_row(1112223334)[:-3]
+    responses = [[short_row]]
+    fake_conn = FakeConnection(responses)
+
+    class FakeDB:
+        def acquire(self):
+            return FakeAcquire(fake_conn)
+
+    monkeypatch.setattr(npi_module, "db", FakeDB())
+
+    async def fake_ensure_index():
+        return None
+
+    monkeypatch.setattr(npi_module, "_ensure_npi_geo_index", fake_ensure_index)
+
+    request = types.SimpleNamespace(
+        args={"long": "-87.0", "lat": "41.0", "limit": "1"},
+        app=types.SimpleNamespace(),
+    )
+    response = await npi_module.get_near_npi(request)
+    payload = json.loads(response.body)
+    assert isinstance(payload, list)
+    assert len(payload) == 1
+    assert payload[0]["npi"] == 1112223334
+
+
+@pytest.mark.asyncio
 async def test_get_npi_uses_cached_address(monkeypatch):
     async def fake_build(_npi):
         return {
@@ -739,6 +839,31 @@ async def test_get_all_format_classification(monkeypatch):
     payload = json.loads(response.body)
     assert payload == {'rows': {'Spec': 7}}
     assert 'classification' in str(calls['sql'])
+
+
+@pytest.mark.asyncio
+async def test_get_all_format_all_returns_classification_map(monkeypatch):
+    calls = {}
+
+    class RecordingConnection:
+        async def all(self, sql, **params):
+            calls['sql'] = sql
+            calls['params'] = params
+            return [("Pharmacy", 12), ("Pharmacist", 33)]
+
+        async def first(self, *_args, **_kwargs):
+            return None
+
+    monkeypatch.setattr(npi_module.db, 'acquire', lambda: FakeAcquire(RecordingConnection()))
+    request = types.SimpleNamespace(
+        args={'count_only': '1', 'format': 'all', 'state': 'NE', 'has_insurance': '1'},
+        app=types.SimpleNamespace(),
+    )
+    response = await npi_module.get_all(request)
+    payload = json.loads(response.body)
+    assert payload == {'rows': {'Pharmacy': 12, 'Pharmacist': 33}}
+    assert 'GROUP BY q.classification' in str(calls['sql'])
+    assert calls['params']['state'] == 'NE'
 
 
 @pytest.mark.asyncio

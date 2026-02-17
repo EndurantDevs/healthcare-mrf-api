@@ -7,6 +7,7 @@ import logging
 import os
 import random
 import math
+import re
 import urllib.parse
 from datetime import datetime
 from textwrap import dedent
@@ -25,6 +26,26 @@ from process.ext.utils import download_it
 
 blueprint = Blueprint("npi", url_prefix="/npi", version=1)
 logger = logging.getLogger(__name__)
+ENABLE_TRGM_FUZZY_NAME_SEARCH = os.getenv("HLTHPRT_ENABLE_TRGM_FUZZY_NAME_SEARCH", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+INTERNAL_PROCEDURE_CODE_SYSTEM = "HP_PROCEDURE_CODE"
+INTERNAL_MEDICATION_CODE_SYSTEM = "HP_RX_CODE"
+PROCEDURE_ALLOWED_CODE_SYSTEMS = {
+    INTERNAL_PROCEDURE_CODE_SYSTEM,
+    "CPT",
+    "HCPCS",
+}
+MEDICATION_ALLOWED_CODE_SYSTEMS = {
+    INTERNAL_MEDICATION_CODE_SYSTEM,
+    "NDC",
+    "RXNORM",
+}
+CODE_TOKEN_PATTERN = re.compile(r"^[A-Z0-9._-]+$")
+INT_CODE_PATTERN = re.compile(r"^-?\d+$")
 
 NAME_LIKE_TEMPLATE = (
     "LOWER("
@@ -69,6 +90,23 @@ def _taxonomy_full_subquery(conditions: str) -> str:
             (
                 SELECT code,
                        int_code
+                  FROM mrf.nucc_taxonomy
+                 WHERE {conditions}
+            ) AS q
+            """
+        )
+        .strip()
+        .format(conditions=conditions)
+    )
+
+
+def _taxonomy_classification_subquery(conditions: str) -> str:
+    return (
+        dedent(
+            """
+            (
+                SELECT int_code,
+                       classification
                   FROM mrf.nucc_taxonomy
                  WHERE {conditions}
             ) AS q
@@ -183,12 +221,15 @@ def _name_like_clauses(alias: str, names: Sequence[str], base_param: str = "name
     params = {}
     for idx, name in enumerate(names):
         param_like = f"{base_param}_{idx}"
-        param_fuzzy = f"{base_param}_{idx}_fuzzy"
-        clauses.append(
-            f"(({expr} LIKE :{param_like}) OR ({expr} % :{param_fuzzy}))"
-        )
+        if ENABLE_TRGM_FUZZY_NAME_SEARCH:
+            param_fuzzy = f"{base_param}_{idx}_fuzzy"
+            clauses.append(
+                f"(({expr} LIKE :{param_like}) OR ({expr} % :{param_fuzzy}))"
+            )
+            params[param_fuzzy] = name.lower()
+        else:
+            clauses.append(f"({expr} LIKE :{param_like})")
         params[param_like] = f"%{name.lower()}%"
-        params[param_fuzzy] = name.lower()
     joined = " OR ".join(clauses)
     return f"({joined})", params
 
@@ -219,6 +260,179 @@ def _normalize_phone_digits(raw: Optional[str]) -> Optional[str]:
             "phone must contain between 7 and 15 digits"
         )
     return digits
+
+
+def _normalize_code_system(raw: Optional[str], param_name: str, allowed: set[str]) -> str:
+    value = str(raw or "").strip().upper()
+    if not value:
+        raise sanic.exceptions.InvalidUsage(f"{param_name} is required when codes are provided")
+    if value not in allowed:
+        allowed_values = ", ".join(sorted(allowed))
+        raise sanic.exceptions.InvalidUsage(
+            f"{param_name} must be one of: {allowed_values}"
+        )
+    return value
+
+
+def _parse_code_tokens(raw: Optional[str], param_name: str) -> list[str]:
+    if raw is None:
+        return []
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for item in str(raw).split(","):
+        token = item.strip().upper()
+        if not token:
+            continue
+        if not CODE_TOKEN_PATTERN.fullmatch(token):
+            raise sanic.exceptions.InvalidUsage(
+                f"{param_name} contains invalid code token: {item!r}"
+            )
+        if token in seen:
+            continue
+        seen.add(token)
+        tokens.append(token)
+    return tokens
+
+
+def _to_int_codes(values: Sequence[str], param_name: str) -> list[int]:
+    out: list[int] = []
+    seen: set[int] = set()
+    for value in values:
+        if not INT_CODE_PATTERN.fullmatch(str(value)):
+            raise sanic.exceptions.InvalidUsage(
+                f"{param_name} must contain numeric codes for internal matching"
+            )
+        parsed = int(value)
+        if parsed in seen:
+            continue
+        seen.add(parsed)
+        out.append(parsed)
+    return out
+
+
+def _parse_optional_year(raw: Optional[str], param_name: str = "year") -> Optional[int]:
+    if raw in (None, ""):
+        return None
+    try:
+        year = int(str(raw).strip())
+    except (TypeError, ValueError) as exc:
+        raise sanic.exceptions.InvalidUsage(f"{param_name} must be an integer >= 2013") from exc
+    if year < 2013:
+        raise sanic.exceptions.InvalidUsage(f"{param_name} must be >= 2013")
+    return year
+
+
+async def _table_exists(table_name: str) -> bool:
+    try:
+        async with db.acquire() as conn:
+            rows = await conn.all(
+                text("SELECT to_regclass(:table_name);"),
+                table_name=f"mrf.{table_name}",
+            )
+        return bool(rows and rows[0] and rows[0][0])
+    except Exception:  # pragma: no cover - defensive fallback for transient DB states
+        return False
+
+
+async def _resolve_npi_filter_capabilities() -> dict[str, bool]:
+    capabilities = {
+        "npi_procedures_array_available": False,
+        "npi_medications_array_available": False,
+        "pricing_provider_procedure_available": False,
+        "pricing_provider_prescription_available": False,
+    }
+
+    try:
+        async with db.acquire() as conn:
+            rows = await conn.all(
+                text(
+                    """
+                    SELECT column_name
+                      FROM information_schema.columns
+                     WHERE table_schema = 'mrf'
+                       AND table_name = 'npi_address'
+                       AND column_name IN ('procedures_array', 'medications_array')
+                    """
+                )
+            )
+        columns = {str(row[0]) for row in rows if row and row[0]}
+        capabilities["npi_procedures_array_available"] = "procedures_array" in columns
+        capabilities["npi_medications_array_available"] = "medications_array" in columns
+    except Exception:  # pragma: no cover - defensive fallback for transient DB states
+        capabilities["npi_procedures_array_available"] = False
+        capabilities["npi_medications_array_available"] = False
+
+    capabilities["pricing_provider_procedure_available"] = await _table_exists("pricing_provider_procedure")
+    capabilities["pricing_provider_prescription_available"] = await _table_exists("pricing_provider_prescription")
+    return capabilities
+
+
+async def _resolve_filter_year(
+    requested_year: Optional[int],
+    include_procedures: bool,
+    include_medications: bool,
+) -> tuple[Optional[int], str]:
+    if requested_year is not None:
+        return requested_year, "request"
+
+    env_raw = str(os.getenv("HLTHPRT_NPI_FILTER_DEFAULT_YEAR", "")).strip()
+    if env_raw:
+        return _parse_optional_year(env_raw, "HLTHPRT_NPI_FILTER_DEFAULT_YEAR"), "env"
+
+    sources: list[str] = []
+    if include_procedures and await _table_exists("pricing_provider_procedure"):
+        sources.append("SELECT MAX(year)::INTEGER AS y FROM mrf.pricing_provider_procedure")
+    if include_medications and await _table_exists("pricing_provider_prescription"):
+        sources.append("SELECT MAX(year)::INTEGER AS y FROM mrf.pricing_provider_prescription")
+    if not sources:
+        return None, "none"
+
+    sql = "SELECT MAX(y) FROM (" + " UNION ALL ".join(sources) + ") AS years;"
+    async with db.acquire() as conn:
+        rows = await conn.all(text(sql))
+    year = rows[0][0] if rows and rows[0] else None
+    return (int(year), "data") if year is not None else (None, "none")
+
+
+async def _resolve_internal_filter_codes(
+    codes: list[str],
+    input_system: str,
+    target_system: str,
+    param_name: str,
+) -> tuple[list[int], str]:
+    if not codes:
+        return [], "none"
+
+    if input_system == target_system:
+        return _to_int_codes(codes, param_name), "direct"
+
+    if not await _table_exists("code_crosswalk"):
+        return [], "none"
+
+    sql = text(
+        """
+        SELECT DISTINCT to_code
+          FROM mrf.code_crosswalk
+         WHERE UPPER(from_system) = :from_system
+           AND UPPER(from_code) = ANY(:input_codes)
+           AND UPPER(to_system) = :target_system
+        UNION
+        SELECT DISTINCT from_code
+          FROM mrf.code_crosswalk
+         WHERE UPPER(to_system) = :from_system
+           AND UPPER(to_code) = ANY(:input_codes)
+           AND UPPER(from_system) = :target_system
+        """
+    )
+    async with db.acquire() as conn:
+        rows = await conn.all(
+            sql,
+            from_system=input_system,
+            target_system=target_system,
+            input_codes=codes,
+        )
+    mapped = [str(row[0]) for row in rows if row and row[0] is not None]
+    return _to_int_codes(mapped, param_name), ("crosswalk" if mapped else "none")
 
 
 def _build_npi_where_clause(
@@ -553,6 +767,7 @@ async def pharmacists_per_pharmacy(request):
 async def get_all(request):
     count_only = str(request.args.get("count_only", "0")).strip() == "1"
     response_format = request.args.get("format") or request.args.get("response_format")
+    response_format = str(response_format).strip().lower() if response_format else None
     legacy_name_like = _extract_name_filters(request)
     # Explicit access for route collectors / OpenAPI parity.
     request.args.get("q")
@@ -591,6 +806,11 @@ async def get_all(request):
     has_insurance = request.args.get("has_insurance")
     city = request.args.get("city")
     state = request.args.get("state")
+    procedure_codes_raw = request.args.get("procedure_codes")
+    procedure_code_system_raw = request.args.get("procedure_code_system")
+    medication_codes_raw = request.args.get("medication_codes")
+    medication_code_system_raw = request.args.get("medication_code_system")
+    year_raw = request.args.get("year")
 
     city = city.upper() if city else None
     state = state.upper() if state else None
@@ -601,6 +821,75 @@ async def get_all(request):
 
     if plan_network:
         plan_network = [int(x) for x in plan_network.split(",")]
+
+    requested_procedure_codes = _parse_code_tokens(procedure_codes_raw, "procedure_codes")
+    requested_medication_codes = _parse_code_tokens(medication_codes_raw, "medication_codes")
+    requested_year = _parse_optional_year(year_raw, "year")
+
+    procedure_code_system = None
+    medication_code_system = None
+    if requested_procedure_codes:
+        procedure_code_system = _normalize_code_system(
+            procedure_code_system_raw or INTERNAL_PROCEDURE_CODE_SYSTEM,
+            "procedure_code_system",
+            PROCEDURE_ALLOWED_CODE_SYSTEMS,
+        )
+    elif procedure_code_system_raw:
+        _normalize_code_system(
+            procedure_code_system_raw,
+            "procedure_code_system",
+            PROCEDURE_ALLOWED_CODE_SYSTEMS,
+        )
+
+    if requested_medication_codes:
+        medication_code_system = _normalize_code_system(
+            medication_code_system_raw or INTERNAL_MEDICATION_CODE_SYSTEM,
+            "medication_code_system",
+            MEDICATION_ALLOWED_CODE_SYSTEMS,
+        )
+    elif medication_code_system_raw:
+        _normalize_code_system(
+            medication_code_system_raw,
+            "medication_code_system",
+            MEDICATION_ALLOWED_CODE_SYSTEMS,
+        )
+
+    if requested_procedure_codes or requested_medication_codes or requested_year is not None:
+        filter_year, filter_year_source = await _resolve_filter_year(
+            requested_year,
+            include_procedures=bool(requested_procedure_codes),
+            include_medications=bool(requested_medication_codes),
+        )
+    else:
+        filter_year, filter_year_source = None, "none"
+
+    procedure_internal_codes: list[int] = []
+    medication_internal_codes: list[int] = []
+    procedure_match_via = "none"
+    medication_match_via = "none"
+    if requested_procedure_codes:
+        procedure_internal_codes, procedure_match_via = await _resolve_internal_filter_codes(
+            requested_procedure_codes,
+            procedure_code_system or INTERNAL_PROCEDURE_CODE_SYSTEM,
+            INTERNAL_PROCEDURE_CODE_SYSTEM,
+            "procedure_codes",
+        )
+    if requested_medication_codes:
+        medication_internal_codes, medication_match_via = await _resolve_internal_filter_codes(
+            requested_medication_codes,
+            medication_code_system or INTERNAL_MEDICATION_CODE_SYSTEM,
+            INTERNAL_MEDICATION_CODE_SYSTEM,
+            "medication_codes",
+        )
+
+    filter_capabilities = {
+        "npi_procedures_array_available": True,
+        "npi_medications_array_available": True,
+        "pricing_provider_procedure_available": False,
+        "pricing_provider_prescription_available": False,
+    }
+    if requested_procedure_codes or requested_medication_codes:
+        filter_capabilities = await _resolve_npi_filter_capabilities()
 
     zip_code = _normalize_zip_code(zip_code_raw, "zip_code")
     postal_code = _normalize_zip_code(postal_code_raw, "postal_code")
@@ -642,6 +931,20 @@ async def get_all(request):
         "city": city,
         "state": state,
         "response_format": response_format,
+        "procedure_codes_input": requested_procedure_codes,
+        "procedure_code_system": procedure_code_system,
+        "procedure_internal_codes": procedure_internal_codes,
+        "procedure_match_via": procedure_match_via,
+        "medication_codes_input": requested_medication_codes,
+        "medication_code_system": medication_code_system,
+        "medication_internal_codes": medication_internal_codes,
+        "medication_match_via": medication_match_via,
+        "filter_year": filter_year,
+        "filter_year_source": filter_year_source,
+        "npi_procedures_array_available": filter_capabilities["npi_procedures_array_available"],
+        "npi_medications_array_available": filter_capabilities["npi_medications_array_available"],
+        "pricing_provider_procedure_available": filter_capabilities["pricing_provider_procedure_available"],
+        "pricing_provider_prescription_available": filter_capabilities["pricing_provider_prescription_available"],
     }
 
     simple_filter_present = any(
@@ -661,8 +964,67 @@ async def get_all(request):
             "names_like",
             "codes",
             "response_format",
+            "procedure_internal_codes",
+            "medication_internal_codes",
         )
     )
+
+    def _append_array_filters(address_where: list[str], local_filters: dict[str, Any]) -> dict[str, int]:
+        params: dict[str, int] = {}
+        filter_year = local_filters.get("filter_year")
+        procedure_internal_codes = local_filters.get("procedure_internal_codes") or []
+        medication_internal_codes = local_filters.get("medication_internal_codes") or []
+        procedures_array_available = bool(local_filters.get("npi_procedures_array_available", True))
+        medications_array_available = bool(local_filters.get("npi_medications_array_available", True))
+        procedure_table_available = bool(local_filters.get("pricing_provider_procedure_available", False))
+        medication_table_available = bool(local_filters.get("pricing_provider_prescription_available", False))
+
+        if filter_year is not None and (procedure_internal_codes or medication_internal_codes):
+            params["filter_year"] = int(filter_year)
+
+        for idx, code in enumerate(procedure_internal_codes):
+            param = f"procedure_code_{idx}"
+            params[param] = int(code)
+            array_clause = f"c.procedures_array @> ARRAY[:{param}]::INTEGER[]"
+            exists_clause = (
+                "EXISTS ("
+                "SELECT 1 FROM mrf.pricing_provider_procedure AS pp "
+                f"WHERE pp.npi = c.npi AND pp.procedure_code = :{param}"
+                + (" AND pp.year = :filter_year" if filter_year is not None else "")
+                + ")"
+            )
+            if procedures_array_available and procedure_table_available:
+                address_where.append(f"({array_clause} OR {exists_clause})")
+            elif procedures_array_available:
+                address_where.append(array_clause)
+            elif procedure_table_available:
+                address_where.append(exists_clause)
+            else:
+                address_where.append("1=0")
+
+        for idx, code in enumerate(medication_internal_codes):
+            param = f"medication_code_{idx}"
+            params[param] = int(code)
+            array_clause = f"c.medications_array @> ARRAY[:{param}]::INTEGER[]"
+            exists_clause = (
+                "EXISTS ("
+                "SELECT 1 FROM mrf.pricing_provider_prescription AS pr "
+                "WHERE pr.npi = c.npi "
+                "AND pr.rx_code_system = 'HP_RX_CODE' "
+                + ("AND pr.year = :filter_year " if filter_year is not None else "")
+                + f"AND CASE WHEN pr.rx_code ~ '^-?[0-9]+$' THEN pr.rx_code::INTEGER END = :{param} "
+                ")"
+            )
+            if medications_array_available and medication_table_available:
+                address_where.append(f"({array_clause} OR {exists_clause})")
+            elif medications_array_available:
+                address_where.append(array_clause)
+            elif medication_table_available:
+                address_where.append(exists_clause)
+            else:
+                address_where.append("1=0")
+
+        return params
 
     async def get_count(filters):
         classification = filters.get("classification")
@@ -721,15 +1083,41 @@ async def get_all(request):
             address_where.append(
                 "regexp_replace(COALESCE(c.telephone_number, ''), '[^0-9]', '', 'g') = :phone_digits"
             )
-        if npi_where:
-            address_where.append(
-                f"EXISTS (SELECT 1 FROM mrf.npi AS b WHERE b.npi = c.npi AND {npi_where})"
-            )
+        dynamic_code_params = _append_array_filters(address_where, filters)
 
         taxonomy_conditions = " AND ".join(taxonomy_filters) if taxonomy_filters else "1=1"
         taxonomy_subquery = _taxonomy_codes_subquery(taxonomy_conditions)
 
-        if use_taxonomy_filter:
+        if npi_where and use_taxonomy_filter:
+            query = text(
+                f"""
+                WITH filtered_npi AS (
+                    SELECT DISTINCT b.npi
+                      FROM mrf.npi AS b
+                     WHERE {npi_where}
+                )
+                SELECT COUNT(DISTINCT c.npi)
+                  FROM filtered_npi AS fn
+                  JOIN mrf.npi_address AS c ON c.npi = fn.npi
+                  CROSS JOIN {taxonomy_subquery}
+                 WHERE {' AND '.join(address_where)}
+                """
+            )
+        elif npi_where:
+            query = text(
+                f"""
+                WITH filtered_npi AS (
+                    SELECT DISTINCT b.npi
+                      FROM mrf.npi AS b
+                     WHERE {npi_where}
+                )
+                SELECT COUNT(DISTINCT c.npi)
+                  FROM filtered_npi AS fn
+                  JOIN mrf.npi_address AS c ON c.npi = fn.npi
+                 WHERE {' AND '.join(address_where)}
+                """
+            )
+        elif use_taxonomy_filter:
             query = text(
                 f"""
                 SELECT COUNT(DISTINCT c.npi)
@@ -762,7 +1150,9 @@ async def get_all(request):
             "last_name": last_name,
             "organization_name": organization_name,
             "entity_type_code": entity_type_code,
+            "filter_year": filters.get("filter_year"),
         }
+        query_params.update(dynamic_code_params)
         query_params.update(npi_params)
 
         async with db.acquire() as conn:
@@ -787,6 +1177,124 @@ async def get_all(request):
             rows = await conn.all(q)
         return {row[0]: row[1] for row in rows}
 
+    async def get_classification_count_map(filters) -> dict:
+        classification = filters.get("classification")
+        specialization = filters.get("specialization")
+        section = filters.get("section")
+        display_name = filters.get("display_name")
+        first_name = filters.get("first_name")
+        last_name = filters.get("last_name")
+        organization_name = filters.get("organization_name")
+        entity_type_code = filters.get("entity_type_code")
+        plan_network = filters.get("plan_network")
+        names_like = filters.get("names_like") or []
+        codes = filters.get("codes")
+        has_insurance = filters.get("has_insurance")
+        city = filters.get("city")
+        state = filters.get("state")
+        zip_code = filters.get("zip_code")
+        phone_digits = filters.get("phone_digits")
+
+        taxonomy_filters = []
+        if classification:
+            taxonomy_filters.append("classification = :classification")
+        if specialization:
+            taxonomy_filters.append("specialization = :specialization")
+        if section:
+            taxonomy_filters.append("section = :section")
+        if display_name:
+            taxonomy_filters.append("display_name = :display_name")
+        if codes:
+            taxonomy_filters.append("code = ANY(:codes)")
+
+        npi_where, npi_params = _build_npi_where_clause(
+            "b",
+            names_like,
+            first_name,
+            last_name,
+            organization_name,
+            entity_type_code,
+        )
+
+        address_where = ["c.type = 'primary'"]
+        if plan_network:
+            address_where.append("plans_network_array && :plan_network_array")
+        if has_insurance:
+            address_where.append("NOT (plans_network_array @@ '0'::query_int)")
+        if city:
+            address_where.append("city_name = :city")
+        if state:
+            address_where.append("state_name = :state")
+        if zip_code:
+            address_where.append("LEFT(c.postal_code, 5) = :zip_code")
+        if phone_digits:
+            address_where.append(
+                "regexp_replace(COALESCE(c.telephone_number, ''), '[^0-9]', '', 'g') = :phone_digits"
+            )
+        dynamic_code_params = _append_array_filters(address_where, filters)
+        if npi_where:
+            address_where.append(
+                f"EXISTS (SELECT 1 FROM mrf.npi AS b WHERE b.npi = c.npi AND {npi_where})"
+            )
+
+        taxonomy_conditions = " AND ".join(taxonomy_filters) if taxonomy_filters else "1=1"
+        taxonomy_subquery = _taxonomy_classification_subquery(taxonomy_conditions)
+        query = text(
+            f"""
+            WITH filtered_addresses AS (
+                SELECT DISTINCT c.npi, c.taxonomy_array
+                  FROM mrf.npi_address AS c
+                 WHERE {' AND '.join(address_where)}
+            )
+            SELECT q.classification AS key,
+                   COUNT(DISTINCT fa.npi) AS value
+              FROM filtered_addresses AS fa
+              JOIN {taxonomy_subquery}
+                ON fa.taxonomy_array && ARRAY[q.int_code]::INTEGER[]
+             GROUP BY q.classification
+            """
+        )
+        query_params = {
+            "classification": classification,
+            "section": section,
+            "display_name": display_name,
+            "plan_network_array": plan_network,
+            "codes": codes,
+            "city": city,
+            "state": state,
+            "zip_code": zip_code,
+            "phone_digits": phone_digits,
+            "specialization": specialization,
+            "first_name": first_name,
+            "last_name": last_name,
+            "organization_name": organization_name,
+            "entity_type_code": entity_type_code,
+            "filter_year": filters.get("filter_year"),
+        }
+        query_params.update(dynamic_code_params)
+        query_params.update(npi_params)
+        async with db.acquire() as conn:
+            rows = await conn.all(query, **query_params)
+        return {row[0]: row[1] for row in rows if row and row[0]}
+
+    procedure_filter_unresolved = bool(requested_procedure_codes) and not bool(procedure_internal_codes)
+    medication_filter_unresolved = bool(requested_medication_codes) and not bool(medication_internal_codes)
+    if procedure_filter_unresolved or medication_filter_unresolved:
+        if count_only and response_format in {"all", "full_taxonomy", "classification"}:
+            return response.json({"rows": {}}, default=str)
+        if count_only:
+            return response.json({"rows": 0}, default=str)
+        return response.json(
+            {
+                "total": 0,
+                "page": pagination.page,
+                "limit": pagination.limit,
+                "offset": pagination.offset,
+                "rows": [],
+            },
+            default=str,
+        )
+
     if count_only and not simple_filter_present and not has_insurance and not city and not state:
         try:
             total_npi = await db.scalar(select(func.count(NPIData.npi)))
@@ -799,6 +1307,10 @@ async def get_all(request):
     if count_only and has_insurance and not simple_filter_present:
         rows = await _fast_has_insurance_count(city, state)
         return response.json({"rows": rows}, default=str)
+
+    if count_only and response_format == "all":
+        mapping = await get_classification_count_map(filters)
+        return response.json({"rows": mapping}, default=str)
 
     if count_only and response_format in {"full_taxonomy", "classification"}:
         mapping = await get_formatted_count(response_format)
@@ -858,6 +1370,7 @@ async def get_all(request):
             address_where.append(
                 "regexp_replace(COALESCE(c.telephone_number, ''), '[^0-9]', '', 'g') = :phone_digits"
             )
+        dynamic_code_params = _append_array_filters(address_where, filters)
         npi_where, npi_params = _build_npi_where_clause(
             "b",
             names_like,
@@ -866,21 +1379,40 @@ async def get_all(request):
             organization_name,
             entity_type_code,
         )
-        if npi_where:
-            address_where.append(
-                f"EXISTS (SELECT 1 FROM mrf.npi AS b WHERE b.npi = c.npi AND {npi_where})"
-            )
 
         taxonomy_filter = " and ".join(where) if where else "1=1"
-        address_source = (
-            "mrf.npi_address as c\n"
-            f"    CROSS JOIN (select ARRAY_AGG(int_code) as int_codes from mrf.nucc_taxonomy where {taxonomy_filter}) as q"
-            if use_taxonomy_filter
-            else "mrf.npi_address as c"
-        )
+        cte_prefix = ""
+        if npi_where:
+            cte_prefix = f"""
+        filtered_npi AS (
+            SELECT DISTINCT b.npi
+              FROM mrf.npi AS b
+             WHERE {npi_where}
+        ),
+"""
+
+        if npi_where and use_taxonomy_filter:
+            address_source = (
+                "filtered_npi as fn\n"
+                "    JOIN mrf.npi_address as c ON c.npi = fn.npi\n"
+                f"    CROSS JOIN (select ARRAY_AGG(int_code) as int_codes from mrf.nucc_taxonomy where {taxonomy_filter}) as q"
+            )
+        elif npi_where:
+            address_source = (
+                "filtered_npi as fn\n"
+                "    JOIN mrf.npi_address as c ON c.npi = fn.npi"
+            )
+        elif use_taxonomy_filter:
+            address_source = (
+                "mrf.npi_address as c\n"
+                f"    CROSS JOIN (select ARRAY_AGG(int_code) as int_codes from mrf.nucc_taxonomy where {taxonomy_filter}) as q"
+            )
+        else:
+            address_source = "mrf.npi_address as c"
         q = text(
             f"""
-        WITH sub_s AS(select b.npi as npi_code, b.*, g.* from  mrf.npi as b, (select c.*
+        WITH {cte_prefix}
+        sub_s AS(select b.npi as npi_code, b.*, g.* from  mrf.npi as b, (select c.*
     from
          {address_source}
     where {' and '.join(address_where)}
@@ -909,33 +1441,88 @@ async def get_all(request):
                 zip_code=zip_code,
                 phone_digits=phone_digits,
                 **npi_params,
+                **dynamic_code_params,
             )
             for r in rows_iter:
+                # Prefer key-based extraction so schema drift in upstream tables
+                # (for example missing optional array columns) does not break
+                # positional offsets and crash /npi/all.
+                row_mapping = getattr(r, "_mapping", None)
+                if row_mapping is not None:
+                    npi_value = (
+                        row_mapping.get("npi_code")
+                        or row_mapping.get("npi")
+                        or row_mapping.get("npi_1")
+                        or row_mapping.get("npi_2")
+                    )
+                    if npi_value is None:
+                        continue
+
+                    obj = res.get(npi_value)
+                    if obj is None:
+                        obj = {"taxonomy_list": []}
+                        for c in NPIData.__table__.columns:
+                            if c.key in row_mapping:
+                                obj[c.key] = row_mapping.get(c.key)
+                        for c in NPIAddress.__table__.columns:
+                            if c.key in row_mapping:
+                                obj[c.key] = row_mapping.get(c.key)
+                        obj["do_business_as"] = obj.get("do_business_as") or []
+                        obj.setdefault("procedures_array", [])
+                        obj.setdefault("medications_array", [])
+
+                    taxonomy = {}
+                    for c in NPIDataTaxonomy.__table__.columns:
+                        if c.key in ("npi", "checksum"):
+                            continue
+                        if c.key in row_mapping:
+                            taxonomy[c.key] = row_mapping.get(c.key)
+                    if taxonomy:
+                        obj["taxonomy_list"].append(taxonomy)
+
+                    res[npi_value] = obj
+                    continue
+
+                # Fallback for positional row types.
+                row_len = len(r)
+                if row_len <= 1:
+                    continue
+
                 obj = {"taxonomy_list": []}
                 count = 0
                 for c in NPIData.__table__.columns:
                     count += 1
-                    value = r[count]
-                    obj[c.key] = value
+                    if count >= row_len:
+                        break
+                    obj[c.key] = r[count]
                 for c in NPIAddress.__table__.columns:
                     count += 1
+                    if count >= row_len:
+                        break
                     obj[c.key] = r[count]
 
-                do_business_as_value = obj.get("do_business_as") or []
+                npi_value = obj.get("npi")
+                if npi_value is None:
+                    continue
 
-                if obj["npi"] in res:
-                    obj = res[obj["npi"]]
+                if npi_value in res:
+                    obj = res[npi_value]
                 else:
-                    obj["do_business_as"] = do_business_as_value
+                    obj["do_business_as"] = obj.get("do_business_as") or []
+                    obj.setdefault("procedures_array", [])
+                    obj.setdefault("medications_array", [])
 
                 taxonomy = {}
                 for c in NPIDataTaxonomy.__table__.columns:
                     count += 1
+                    if count >= row_len:
+                        break
                     if c.key in ("npi", "checksum"):
                         continue
                     taxonomy[c.key] = r[count]
-                obj["taxonomy_list"].append(taxonomy)
-                res[obj["npi"]] = obj
+                if taxonomy:
+                    obj["taxonomy_list"].append(taxonomy)
+                res[npi_value] = obj
 
         res = list(res.values())
         for row in res:
@@ -950,14 +1537,28 @@ async def get_all(request):
         get_count(filters),
         get_results(start, limit, filters),
     )
+    payload: dict[str, Any] = {
+        "total": total,
+        "page": pagination.page,
+        "limit": pagination.limit,
+        "offset": pagination.offset,
+        "rows": rows,
+    }
+    if requested_procedure_codes or requested_medication_codes:
+        payload["query"] = {
+            "year": filter_year,
+            "year_source": filter_year_source,
+            "input_procedure_codes": requested_procedure_codes or None,
+            "procedure_code_system": procedure_code_system,
+            "resolved_procedure_codes": procedure_internal_codes,
+            "procedure_matched_via": procedure_match_via,
+            "input_medication_codes": requested_medication_codes or None,
+            "medication_code_system": medication_code_system,
+            "resolved_medication_codes": medication_internal_codes,
+            "medication_matched_via": medication_match_via,
+        }
     return response.json(
-        {
-            "total": total,
-            "page": pagination.page,
-            "limit": pagination.limit,
-            "offset": pagination.offset,
-            "rows": rows,
-        },
+        payload,
         default=str,
     )
 
@@ -980,6 +1581,11 @@ async def get_near_npi(request):
     classification = request.args.get("classification")
     section = request.args.get("section")
     display_name = request.args.get("display_name")
+    procedure_codes_raw = request.args.get("procedure_codes")
+    procedure_code_system_raw = request.args.get("procedure_code_system")
+    medication_codes_raw = request.args.get("medication_codes")
+    medication_code_system_raw = request.args.get("medication_code_system")
+    year_raw = request.args.get("year")
     request.args.get("q")
     if _extract_name_filters(request):
         raise sanic.exceptions.InvalidUsage(
@@ -994,6 +1600,77 @@ async def get_near_npi(request):
             continue
         zip_codes.append(zip_c.strip().rjust(5, "0"))
     radius = int(request.args.get("radius", 10))
+
+    requested_procedure_codes = _parse_code_tokens(procedure_codes_raw, "procedure_codes")
+    requested_medication_codes = _parse_code_tokens(medication_codes_raw, "medication_codes")
+    requested_year = _parse_optional_year(year_raw, "year")
+
+    procedure_code_system = None
+    medication_code_system = None
+    if requested_procedure_codes:
+        procedure_code_system = _normalize_code_system(
+            procedure_code_system_raw or INTERNAL_PROCEDURE_CODE_SYSTEM,
+            "procedure_code_system",
+            PROCEDURE_ALLOWED_CODE_SYSTEMS,
+        )
+    elif procedure_code_system_raw:
+        _normalize_code_system(
+            procedure_code_system_raw,
+            "procedure_code_system",
+            PROCEDURE_ALLOWED_CODE_SYSTEMS,
+        )
+    if requested_medication_codes:
+        medication_code_system = _normalize_code_system(
+            medication_code_system_raw or INTERNAL_MEDICATION_CODE_SYSTEM,
+            "medication_code_system",
+            MEDICATION_ALLOWED_CODE_SYSTEMS,
+        )
+    elif medication_code_system_raw:
+        _normalize_code_system(
+            medication_code_system_raw,
+            "medication_code_system",
+            MEDICATION_ALLOWED_CODE_SYSTEMS,
+        )
+
+    if requested_procedure_codes or requested_medication_codes or requested_year is not None:
+        filter_year, _filter_year_source = await _resolve_filter_year(
+            requested_year,
+            include_procedures=bool(requested_procedure_codes),
+            include_medications=bool(requested_medication_codes),
+        )
+    else:
+        filter_year = None
+
+    procedure_internal_codes: list[int] = []
+    medication_internal_codes: list[int] = []
+    if requested_procedure_codes:
+        procedure_internal_codes, _ = await _resolve_internal_filter_codes(
+            requested_procedure_codes,
+            procedure_code_system or INTERNAL_PROCEDURE_CODE_SYSTEM,
+            INTERNAL_PROCEDURE_CODE_SYSTEM,
+            "procedure_codes",
+        )
+    if requested_medication_codes:
+        medication_internal_codes, _ = await _resolve_internal_filter_codes(
+            requested_medication_codes,
+            medication_code_system or INTERNAL_MEDICATION_CODE_SYSTEM,
+            INTERNAL_MEDICATION_CODE_SYSTEM,
+            "medication_codes",
+        )
+
+    if (requested_procedure_codes and not procedure_internal_codes) or (
+        requested_medication_codes and not medication_internal_codes
+    ):
+        return response.json([], default=str)
+
+    filter_capabilities = {
+        "npi_procedures_array_available": True,
+        "npi_medications_array_available": True,
+        "pricing_provider_procedure_available": False,
+        "pricing_provider_prescription_available": False,
+    }
+    if requested_procedure_codes or requested_medication_codes:
+        filter_capabilities = await _resolve_npi_filter_capabilities()
 
     _validate_section_filters(section, classification, codes)
     await _ensure_npi_geo_index()
@@ -1015,6 +1692,56 @@ async def get_near_npi(request):
         extra_filters.append("a.npi <> :exclude_npi")
     if plan_network:
         extra_filters.append("a.plans_network_array && (:plan_network_array)")
+    dynamic_code_params: dict[str, int] = {}
+    if filter_year is not None and (procedure_internal_codes or medication_internal_codes):
+        dynamic_code_params["filter_year"] = int(filter_year)
+
+    procedures_array_available = bool(filter_capabilities.get("npi_procedures_array_available", True))
+    medications_array_available = bool(filter_capabilities.get("npi_medications_array_available", True))
+    procedure_table_available = bool(filter_capabilities.get("pricing_provider_procedure_available", False))
+    medication_table_available = bool(filter_capabilities.get("pricing_provider_prescription_available", False))
+
+    for idx, code in enumerate(procedure_internal_codes):
+        param = f"procedure_code_{idx}"
+        dynamic_code_params[param] = int(code)
+        array_clause = f"a.procedures_array @> ARRAY[:{param}]::INTEGER[]"
+        exists_clause = (
+            "EXISTS ("
+            "SELECT 1 FROM mrf.pricing_provider_procedure AS pp "
+            f"WHERE pp.npi = a.npi AND pp.procedure_code = :{param}"
+            + (" AND pp.year = :filter_year" if filter_year is not None else "")
+            + ")"
+        )
+        if procedures_array_available and procedure_table_available:
+            extra_filters.append(f"({array_clause} OR {exists_clause})")
+        elif procedures_array_available:
+            extra_filters.append(array_clause)
+        elif procedure_table_available:
+            extra_filters.append(exists_clause)
+        else:
+            extra_filters.append("1=0")
+
+    for idx, code in enumerate(medication_internal_codes):
+        param = f"medication_code_{idx}"
+        dynamic_code_params[param] = int(code)
+        array_clause = f"a.medications_array @> ARRAY[:{param}]::INTEGER[]"
+        exists_clause = (
+            "EXISTS ("
+            "SELECT 1 FROM mrf.pricing_provider_prescription AS pr "
+            "WHERE pr.npi = a.npi "
+            "AND pr.rx_code_system = 'HP_RX_CODE' "
+            + ("AND pr.year = :filter_year " if filter_year is not None else "")
+            + f"AND CASE WHEN pr.rx_code ~ '^-?[0-9]+$' THEN pr.rx_code::INTEGER END = :{param}"
+            ")"
+        )
+        if medications_array_available and medication_table_available:
+            extra_filters.append(f"({array_clause} OR {exists_clause})")
+        elif medications_array_available:
+            extra_filters.append(array_clause)
+        elif medication_table_available:
+            extra_filters.append(exists_clause)
+        else:
+            extra_filters.append("1=0")
 
     where: list[str] = []
     if zip_codes:
@@ -1071,35 +1798,89 @@ async def get_near_npi(request):
             codes=codes,
             zip_codes=zip_codes,
             plan_network_array=plan_network,
+            **dynamic_code_params,
             **bbox_params,
         )
 
     for r in res_q:
+        row_mapping = getattr(r, "_mapping", None)
+        if row_mapping is not None:
+            row_dict = dict(row_mapping)
+            npi_value = (
+                row_dict.get("npi_code")
+                or row_dict.get("npi")
+                or row_dict.get("npi_1")
+                or row_dict.get("npi_2")
+            )
+            if npi_value is None:
+                continue
+
+            npi_value = int(npi_value)
+            obj = res.get(npi_value, {"taxonomy_list": []})
+            if "distance" in row_dict and row_dict.get("distance") is not None:
+                obj["distance"] = row_dict.get("distance")
+
+            for c in NPIAddress.__table__.columns:
+                if c.key in row_dict:
+                    obj[c.key] = row_dict[c.key]
+            for c in NPIData.__table__.columns:
+                if c.key in ("npi", "checksum", "do_business_as_text"):
+                    continue
+                if c.key in row_dict:
+                    obj[c.key] = row_dict[c.key]
+
+            taxonomy = {}
+            for c in NPIDataTaxonomy.__table__.columns:
+                if c.key in ("npi", "checksum"):
+                    continue
+                if c.key in row_dict:
+                    taxonomy[c.key] = row_dict[c.key]
+            if taxonomy:
+                obj["taxonomy_list"].append(taxonomy)
+
+            res[npi_value] = obj
+            continue
+
+        # Fallback for positional row types. Keep this defensive to avoid crashes
+        # when result shape differs from model column expectations.
+        row_len = len(r)
+        if row_len <= 1:
+            continue
+
         obj = {"taxonomy_list": []}
         count = 1
         obj["distance"] = r[count]
-        temp = NPIAddress.__table__.columns
 
-        for c in temp:
+        for c in NPIAddress.__table__.columns:
             count += 1
+            if count >= row_len:
+                break
             obj[c.key] = r[count]
         for c in NPIData.__table__.columns:
             count += 1
+            if count >= row_len:
+                break
             if c.key in ("npi", "checksum", "do_business_as_text"):
                 continue
             obj[c.key] = r[count]
 
-        if obj["npi"] in res:
-            obj = res[obj["npi"]]
+        npi_value = obj.get("npi")
+        if npi_value is None:
+            continue
+        if npi_value in res:
+            obj = res[npi_value]
         taxonomy = {}
         for c in NPIDataTaxonomy.__table__.columns:
             count += 1
+            if count >= row_len:
+                break
             if c.key in ("npi", "checksum"):
                 continue
             taxonomy[c.key] = r[count]
-        obj["taxonomy_list"].append(taxonomy)
+        if taxonomy:
+            obj["taxonomy_list"].append(taxonomy)
 
-        res[obj["npi"]] = obj
+        res[npi_value] = obj
 
     res = list(res.values())
     return response.json(res, default=str)
@@ -1378,9 +2159,22 @@ async def _build_npi_details(npi: int) -> dict:
         taxonomy_table = NPIDataTaxonomy.__table__
         taxonomy_group_table = NPIDataTaxonomyGroup.__table__
         address_table = NPIAddress.__table__
+        filter_capabilities = await _resolve_npi_filter_capabilities()
+        procedures_array_available = bool(filter_capabilities.get("npi_procedures_array_available", True))
+        medications_array_available = bool(filter_capabilities.get("npi_medications_array_available", True))
+
+        address_columns = []
+        for column in address_table.columns:
+            if column.key == "procedures_array" and not procedures_array_available:
+                address_columns.append(literal_column("'{}'::INTEGER[]").label("procedures_array"))
+                continue
+            if column.key == "medications_array" and not medications_array_available:
+                address_columns.append(literal_column("'{}'::INTEGER[]").label("medications_array"))
+                continue
+            address_columns.append(column)
 
         address_subquery_base = (
-            select(address_table)
+            select(*address_columns)
             .where(
                 (address_table.c.npi == npi)
                 & or_(
