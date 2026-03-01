@@ -1,15 +1,21 @@
-FROM public.ecr.aws/docker/library/python:3.13-slim-bullseye
+FROM python:3.14-slim-trixie
 
 WORKDIR /wheels
 ADD ./requirements-dev.txt /wheels
 
 WORKDIR /opt
-RUN apt-get update && apt update && apt install -y gcc nginx git curl libaio1 parallel && apt autopurge && python3 -m venv venv && . venv/bin/activate && pip install --no-compile --upgrade pip && \
-	pip install --no-compile -r /wheels/requirements-dev.txt -f /wheels \
-        && rm -rf /wheels \
-        && rm -rf /root/.cache/pip/* && \
-        find . -name *.pyc -execdir rm -f {} \; \
-        && apt autoremove -y
+RUN apt-get update \
+    && if apt-cache show libaio1t64 >/dev/null 2>&1; then LIBAIO_PKG=libaio1t64; else LIBAIO_PKG=libaio1; fi \
+    && apt-get install -y --no-install-recommends gcc g++ pkg-config gdal-bin libgdal-dev nginx git curl parallel "${LIBAIO_PKG}" \
+    && python3 -m venv venv \
+    && . venv/bin/activate \
+    && pip install --no-compile --upgrade pip \
+    && pip install --no-compile -r /wheels/requirements-dev.txt -f /wheels \
+    && rm -rf /wheels \
+    && rm -rf /root/.cache/pip/* \
+    && find . -name '*.pyc' -delete \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
 
 ARG HLTHPRT_LOG_CFG=./logging.yaml
 ARG HLTHPRT_RELEASE="dev"
