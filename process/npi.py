@@ -3,6 +3,7 @@
 import asyncio
 import datetime
 import glob
+import hashlib
 import os
 import re
 import sys
@@ -37,6 +38,7 @@ TEST_NPI_OTHER_ROWS = 500
 TEST_NPI_SECONDARY_ROWS = 1000
 NPI_QUEUE_NAME = "arq:NPI"
 DEFAULT_NPI_MAX_PENDING_SAVE_TASKS = 4
+POSTGRES_IDENTIFIER_MAX_LENGTH = 63
 
 
 def _env_positive_int(name: str, default: int) -> int:
@@ -48,6 +50,15 @@ def _env_positive_int(name: str, default: int) -> int:
         return value if value > 0 else default
     except (TypeError, ValueError):
         return default
+
+
+def _archived_identifier(name: str, suffix: str = "_old") -> str:
+    candidate = f"{name}{suffix}"
+    if len(candidate) <= POSTGRES_IDENTIFIER_MAX_LENGTH:
+        return candidate
+    digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]
+    trim_to = max(1, POSTGRES_IDENTIFIER_MAX_LENGTH - len(suffix) - len(digest) - 1)
+    return f"{name[:trim_to]}_{digest}{suffix}"
 
 
 async def _ensure_required_extensions() -> None:
@@ -626,6 +637,14 @@ async def shutdown(ctx):  # pragma: no cover
                 print("PostGIS is unavailable; geo GIST index creation will be skipped.")
         return postgis_available
 
+    async def archive_index(index_name: str) -> str:
+        archived_name = _archived_identifier(index_name)
+        await db.status(f"DROP INDEX IF EXISTS {db_schema}.{archived_name};")
+        await db.status(
+            f"ALTER INDEX IF EXISTS {db_schema}.{index_name} RENAME TO {archived_name};"
+        )
+        return archived_name
+
     async with db.transaction():
         for cls in processing_classes_array:
             tables[cls.__main_table__] = make_class(cls, import_date)
@@ -778,9 +797,7 @@ WHERE
             await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{table} RENAME TO {table}_old;")
             await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{obj.__tablename__} RENAME TO {table};")
 
-            await db.status(f"ALTER INDEX IF EXISTS "
-                            f"{db_schema}.{table}_idx_primary RENAME TO "
-                            f"{table}_idx_primary_old;")
+            await archive_index(f"{table}_idx_primary")
 
             await db.status(f"ALTER INDEX IF EXISTS "
                             f"{db_schema}.{obj.__tablename__}_idx_primary RENAME TO "
@@ -794,9 +811,7 @@ WHERE
 
             for index in move_indexes:
                 index_name = index.get('name', '_'.join(index.get('index_elements')))
-                await db.status(f"ALTER INDEX IF EXISTS "
-                                f"{db_schema}.{table}_idx_{index_name} RENAME TO "
-                                f"{table}_idx_{index_name}_old;")
+                await archive_index(f"{table}_idx_{index_name}")
                 await db.status(f"ALTER INDEX IF EXISTS "
                                 f"{db_schema}.{obj.__tablename__}_idx_{index_name} RENAME TO "
                                 f"{table}_idx_{index_name};")
