@@ -1739,6 +1739,14 @@ paths:
           in: query
           schema:
             type: string
+        - name: benchmark_mode
+          in: query
+          schema:
+            type: string
+            enum: [national, state, zip]
+          description: |
+            Preferred benchmark perspective for quality relevance ordering.
+            If omitted, API uses the most local available mode for the selected year.
         - name: include_legacy_fields
           in: query
           schema:
@@ -1764,6 +1772,7 @@ paths:
                 total_day_supply,
                 total_drug_cost,
                 total_benes,
+                tier_relevance,
               ]
       responses:
         '200':
@@ -1808,6 +1817,14 @@ paths:
           in: query
           schema:
             type: string
+        - name: benchmark_mode
+          in: query
+          schema:
+            type: string
+            enum: [national, state, zip]
+          description: |
+            Preferred benchmark perspective for quality relevance ordering.
+            If omitted, API uses the most local available mode for the selected year.
         - name: include_legacy_fields
           in: query
           schema:
@@ -1833,6 +1850,7 @@ paths:
                 total_day_supply,
                 total_drug_cost,
                 total_benes,
+                tier_relevance,
               ]
       responses:
         '200':
@@ -1897,7 +1915,7 @@ paths:
                 $ref: '#/components/schemas/PricingProviderRecord'
   /pricing/providers/{npi}/score:
     get:
-      summary: Retrieve Estimated Cost Level and Quality Proxy Score
+      summary: Retrieve Provider Quality V2 score profile
       parameters:
         - name: npi
           in: path
@@ -1908,6 +1926,52 @@ paths:
           in: query
           schema:
             type: integer
+        - name: benchmark_mode
+          in: query
+          schema:
+            type: string
+            enum: [national, state, zip]
+          description: |
+            Benchmark perspective to read for this provider score. If omitted,
+            API auto-selects the most local available mode for the selected year.
+        - name: specialty
+          in: query
+          schema:
+            type: string
+          description: Optional specialty cohort override key.
+        - name: taxonomy_code
+          in: query
+          schema:
+            type: string
+          description: Optional taxonomy cohort override code.
+        - name: procedure_codes
+          in: query
+          schema:
+            type: string
+          description: Comma-separated procedure codes used for cohort override matching.
+        - name: procedure_code_system
+          in: query
+          schema:
+            type: string
+            enum: [HP_PROCEDURE_CODE, CPT, HCPCS]
+            default: HP_PROCEDURE_CODE
+          description: Procedure code system for procedure_codes override resolution.
+        - name: procedure_match_threshold
+          in: query
+          schema:
+            type: number
+            minimum: 0
+            maximum: 1
+            default: 0.3
+          description: Minimum overlap score for procedure bucket matching during cohort override.
+        - name: variants_scope
+          in: query
+          schema:
+            type: string
+            enum: [provider]
+          description: |
+            `provider` returns provider-scoped variant score cards in `variants_by_benchmark_mode`,
+            filtered to the doctor's taxonomy/procedure cohort context for each benchmark mode.
       responses:
         '200':
           description: Provider score payload
@@ -1928,6 +1992,52 @@ paths:
           in: query
           schema:
             type: integer
+        - name: benchmark_mode
+          in: query
+          schema:
+            type: string
+            enum: [national, state, zip]
+          description: |
+            Benchmark perspective to read for this provider score. If omitted,
+            API auto-selects the most local available mode for the selected year.
+        - name: specialty
+          in: query
+          schema:
+            type: string
+          description: Optional specialty cohort override key.
+        - name: taxonomy_code
+          in: query
+          schema:
+            type: string
+          description: Optional taxonomy cohort override code.
+        - name: procedure_codes
+          in: query
+          schema:
+            type: string
+          description: Comma-separated procedure codes used for cohort override matching.
+        - name: procedure_code_system
+          in: query
+          schema:
+            type: string
+            enum: [HP_PROCEDURE_CODE, CPT, HCPCS]
+            default: HP_PROCEDURE_CODE
+          description: Procedure code system for procedure_codes override resolution.
+        - name: procedure_match_threshold
+          in: query
+          schema:
+            type: number
+            minimum: 0
+            maximum: 1
+            default: 0.3
+          description: Minimum overlap score for procedure bucket matching during cohort override.
+        - name: variants_scope
+          in: query
+          schema:
+            type: string
+            enum: [provider]
+          description: |
+            `provider` returns provider-scoped variant score cards in `variants_by_benchmark_mode`,
+            filtered to the doctor's taxonomy/procedure cohort context for each benchmark mode.
       responses:
         '200':
           description: Provider score payload
@@ -2111,6 +2221,37 @@ paths:
           required: true
           schema:
             type: string
+        - name: year
+          in: query
+          schema:
+            type: integer
+        - name: state
+          in: query
+          schema:
+            type: string
+        - name: city
+          in: query
+          schema:
+            type: string
+        - name: zip5
+          in: query
+          schema:
+            type: string
+        - name: zip_radius_miles
+          in: query
+          schema:
+            type: number
+            minimum: 0
+          description: |
+            Optional ZIP-based fallback radius for peer-group lookup. Default is 30 miles.
+        - name: specialty
+          in: query
+          schema:
+            type: string
+        - name: setting
+          in: query
+          schema:
+            type: string
       responses:
         '200':
           description: Provider procedure detail
@@ -2143,6 +2284,37 @@ paths:
           required: true
           schema:
             type: string
+        - name: year
+          in: query
+          schema:
+            type: integer
+        - name: state
+          in: query
+          schema:
+            type: string
+        - name: city
+          in: query
+          schema:
+            type: string
+        - name: zip5
+          in: query
+          schema:
+            type: string
+        - name: zip_radius_miles
+          in: query
+          schema:
+            type: number
+            minimum: 0
+          description: |
+            Optional ZIP-based fallback radius for peer-group lookup. Default is 30 miles.
+        - name: specialty
+          in: query
+          schema:
+            type: string
+        - name: setting
+          in: query
+          schema:
+            type: string
       responses:
         '200':
           description: Provider procedure detail
@@ -2162,6 +2334,45 @@ paths:
         - name: procedure_code
           in: path
           required: true
+          schema:
+            type: string
+        - name: year
+          in: query
+          schema:
+            type: integer
+        - name: state
+          in: query
+          schema:
+            type: string
+        - name: city
+          in: query
+          schema:
+            type: string
+        - name: zip5
+          in: query
+          schema:
+            type: string
+        - name: zip_radius_miles
+          in: query
+          schema:
+            type: number
+            minimum: 0
+          description: |
+            Optional ZIP-based fallback radius for peer-group lookup. Default is 30 miles.
+        - name: cohort_strategy
+          in: query
+          schema:
+            type: string
+            enum: [precomputed, near_dynamic]
+          description: |
+            Cohort selection strategy. `precomputed` uses imported peer cohorts;
+            `near_dynamic` builds an on-the-fly ZIP-radius cohort from nearby providers.
+        - name: specialty
+          in: query
+          schema:
+            type: string
+        - name: setting
+          in: query
           schema:
             type: string
       responses:
@@ -2196,6 +2407,45 @@ paths:
           required: true
           schema:
             type: string
+        - name: year
+          in: query
+          schema:
+            type: integer
+        - name: state
+          in: query
+          schema:
+            type: string
+        - name: city
+          in: query
+          schema:
+            type: string
+        - name: zip5
+          in: query
+          schema:
+            type: string
+        - name: zip_radius_miles
+          in: query
+          schema:
+            type: number
+            minimum: 0
+          description: |
+            Optional ZIP-based fallback radius for peer-group lookup. Default is 30 miles.
+        - name: cohort_strategy
+          in: query
+          schema:
+            type: string
+            enum: [precomputed, near_dynamic]
+          description: |
+            Cohort selection strategy. `precomputed` uses imported peer cohorts;
+            `near_dynamic` builds an on-the-fly ZIP-radius cohort from nearby providers.
+        - name: specialty
+          in: query
+          schema:
+            type: string
+        - name: setting
+          in: query
+          schema:
+            type: string
       responses:
         '200':
           description: Procedure Estimated Cost Level payload
@@ -2226,6 +2476,45 @@ paths:
         - name: code
           in: path
           required: true
+          schema:
+            type: string
+        - name: year
+          in: query
+          schema:
+            type: integer
+        - name: state
+          in: query
+          schema:
+            type: string
+        - name: city
+          in: query
+          schema:
+            type: string
+        - name: zip5
+          in: query
+          schema:
+            type: string
+        - name: zip_radius_miles
+          in: query
+          schema:
+            type: number
+            minimum: 0
+          description: |
+            Optional ZIP-based fallback radius for peer-group lookup. Default is 30 miles.
+        - name: cohort_strategy
+          in: query
+          schema:
+            type: string
+            enum: [precomputed, near_dynamic]
+          description: |
+            Cohort selection strategy. `precomputed` uses imported peer cohorts;
+            `near_dynamic` builds an on-the-fly ZIP-radius cohort from nearby providers.
+        - name: specialty
+          in: query
+          schema:
+            type: string
+        - name: setting
+          in: query
           schema:
             type: string
       responses:
@@ -3639,6 +3928,15 @@ components:
           type: string
         zip5:
           type: string
+        distance_miles:
+          type: number
+          nullable: true
+        distance_bucket:
+          type: string
+          nullable: true
+        anchor_zip5:
+          type: string
+          nullable: true
         total_services:
           type: number
         total_submitted_charges:
@@ -3808,6 +4106,14 @@ components:
               type: integer
             year_source:
               type: string
+            benchmark_mode:
+              type: string
+              nullable: true
+              enum: [national, state, zip]
+            benchmark_mode_source:
+              type: string
+              nullable: true
+              enum: [request, data_priority, default]
             npi:
               type: integer
               nullable: true
@@ -3816,6 +4122,15 @@ components:
               nullable: true
             city:
               type: string
+              nullable: true
+            zip5:
+              type: string
+              nullable: true
+            zip_radius_miles:
+              type: number
+              nullable: true
+            zip_candidate_count:
+              type: integer
               nullable: true
             specialty:
               type: string
@@ -3845,43 +4160,349 @@ components:
           type: integer
         year_source:
           type: string
+        model_version:
+          type: string
+        benchmark_mode:
+          type: string
+          nullable: true
+          enum: [national, state, zip]
+          description: |
+            Benchmark perspective used for this score row. In `zip` mode, peer targets
+            can fallback to state or national cohorts when local ZIP peers are sparse.
+        tier:
+          type: string
+          nullable: true
+        borderline_status:
+          type: boolean
+          nullable: true
+        score_0_100:
+          type: number
+          nullable: true
         estimated_cost_level:
           type: string
+          nullable: true
           enum: ['$', '$$', '$$$', '$$$$', '$$$$$']
-        quality_proxy_score:
-          type: number
-        confidence:
-          type: string
-          enum: [low, medium, high]
-        components:
+        overall:
           type: object
           properties:
-            volume_score:
+            risk_ratio_point:
               type: number
-            consistency_score:
-              type: number
-            efficiency_score:
-              type: number
-            access_score:
-              type: number
-            data_confidence_score:
-              type: number
-        peer_group:
-          type: object
-          properties:
-            year:
-              type: integer
-            state:
-              type: string
               nullable: true
-            peer_count:
-              type: integer
-            cost_percentile:
+            ci_75:
+              type: object
+              properties:
+                low:
+                  type: number
+                  nullable: true
+                high:
+                  type: number
+                  nullable: true
+            ci_90:
+              type: object
+              properties:
+                low:
+                  type: number
+                  nullable: true
+                high:
+                  type: number
+                  nullable: true
+        domains:
+          type: object
+          properties:
+            appropriateness:
+              type: object
+              properties:
+                risk_ratio_point:
+                  type: number
+                  nullable: true
+                score_0_100:
+                  type: number
+                  nullable: true
+                evidence_n:
+                  type: number
+                  nullable: true
+                ci_75:
+                  type: object
+                  properties:
+                    low:
+                      type: number
+                      nullable: true
+                    high:
+                      type: number
+                      nullable: true
+                ci_90:
+                  type: object
+                  properties:
+                    low:
+                      type: number
+                      nullable: true
+                    high:
+                      type: number
+                      nullable: true
+            effectiveness:
+              type: object
+              properties:
+                risk_ratio_point:
+                  type: number
+                  nullable: true
+                score_0_100:
+                  type: number
+                  nullable: true
+                evidence_n:
+                  type: number
+                  nullable: true
+                ci_75:
+                  type: object
+                  properties:
+                    low:
+                      type: number
+                      nullable: true
+                    high:
+                      type: number
+                      nullable: true
+                ci_90:
+                  type: object
+                  properties:
+                    low:
+                      type: number
+                      nullable: true
+                    high:
+                      type: number
+                      nullable: true
+            cost:
+              type: object
+              properties:
+                risk_ratio_point:
+                  type: number
+                  nullable: true
+                score_0_100:
+                  type: number
+                  nullable: true
+                evidence_n:
+                  type: number
+                  nullable: true
+                ci_75:
+                  type: object
+                  properties:
+                    low:
+                      type: number
+                      nullable: true
+                    high:
+                      type: number
+                      nullable: true
+                ci_90:
+                  type: object
+                  properties:
+                    low:
+                      type: number
+                      nullable: true
+                    high:
+                      type: number
+                      nullable: true
+        curation_checks:
+          type: object
+          properties:
+            low_score_threshold_failed:
+              type: boolean
+            low_confidence_threshold_failed:
+              type: boolean
+            high_score_threshold_passed:
+              type: boolean
+            high_confidence_threshold_passed:
+              type: boolean
+        cohort_context:
+          $ref: '#/components/schemas/PricingProviderScoreCohortContext'
+          nullable: true
+        available_benchmark_modes:
+          type: array
+          description: Benchmark modes available for this provider/year, ordered by locality.
+          items:
+            type: string
+            enum: [national, state, zip]
+        scores_by_benchmark_mode:
+          type: object
+          description: Full score cards for all benchmark modes in one response.
+          properties:
+            zip:
+              $ref: '#/components/schemas/PricingProviderScoreModePayload'
+              nullable: true
+            state:
+              $ref: '#/components/schemas/PricingProviderScoreModePayload'
+              nullable: true
+            national:
+              $ref: '#/components/schemas/PricingProviderScoreModePayload'
+              nullable: true
+        variants_scope:
+          type: string
+          nullable: true
+          enum: [provider]
+        variants_by_benchmark_mode:
+          type: object
+          nullable: true
+          properties:
+            zip:
+              type: array
+              items:
+                $ref: '#/components/schemas/PricingProviderScoreVariant'
+            state:
+              type: array
+              items:
+                $ref: '#/components/schemas/PricingProviderScoreVariant'
+            national:
+              type: array
+              items:
+                $ref: '#/components/schemas/PricingProviderScoreVariant'
+    PricingProviderScoreCohortContext:
+      type: object
+      properties:
+        selected_geography:
+          type: string
+          nullable: true
+        selected_cohort_level:
+          type: string
+          nullable: true
+          enum: [L0, L1, L2, L3]
+        peer_count:
+          type: integer
+          nullable: true
+        specialty_key:
+          type: string
+          nullable: true
+        taxonomy_code:
+          type: string
+          nullable: true
+        procedure_bucket:
+          type: string
+          nullable: true
+        computed_live:
+          type: boolean
+        procedure_match_threshold:
+          type: number
+          nullable: true
+          minimum: 0
+          maximum: 1
+    PricingProviderScoreModePayload:
+      type: object
+      properties:
+        model_version:
+          type: string
+        benchmark_mode:
+          type: string
+          nullable: true
+          enum: [national, state, zip]
+        tier:
+          type: string
+          nullable: true
+        borderline_status:
+          type: boolean
+          nullable: true
+        score_0_100:
+          type: number
+          nullable: true
+        estimated_cost_level:
+          type: string
+          nullable: true
+          enum: ['$', '$$', '$$$', '$$$$', '$$$$$']
+        overall:
+          type: object
+          properties:
+            risk_ratio_point:
               type: number
-            volume_percentile:
+              nullable: true
+            ci_75:
+              type: object
+              properties:
+                low:
+                  type: number
+                  nullable: true
+                high:
+                  type: number
+                  nullable: true
+            ci_90:
+              type: object
+              properties:
+                low:
+                  type: number
+                  nullable: true
+                high:
+                  type: number
+                  nullable: true
+        domains:
+          type: object
+          additionalProperties: true
+        curation_checks:
+          type: object
+          properties:
+            low_score_threshold_failed:
+              type: boolean
+            low_confidence_threshold_failed:
+              type: boolean
+            high_score_threshold_passed:
+              type: boolean
+            high_confidence_threshold_passed:
+              type: boolean
+        cohort_context:
+          $ref: '#/components/schemas/PricingProviderScoreCohortContext'
+          nullable: true
+    PricingProviderScoreVariant:
+      type: object
+      properties:
+        benchmark_mode:
+          type: string
+          nullable: true
+          enum: [national, state, zip]
+        tier:
+          type: string
+          nullable: true
+        score_0_100:
+          type: number
+          nullable: true
+        strict_match:
+          type: boolean
+        procedure_match_ratio:
+          type: number
+          nullable: true
+        overall:
+          type: object
+          properties:
+            risk_ratio_point:
               type: number
-            bene_percentile:
-              type: number
+              nullable: true
+            ci_75:
+              type: object
+              properties:
+                low:
+                  type: number
+                  nullable: true
+                high:
+                  type: number
+                  nullable: true
+            ci_90:
+              type: object
+              properties:
+                low:
+                  type: number
+                  nullable: true
+                high:
+                  type: number
+                  nullable: true
+        domains:
+          type: object
+          additionalProperties: true
+        curation_checks:
+          type: object
+          properties:
+            low_score_threshold_failed:
+              type: boolean
+            low_confidence_threshold_failed:
+              type: boolean
+            high_score_threshold_passed:
+              type: boolean
+            high_confidence_threshold_passed:
+              type: boolean
+        cohort_context:
+          $ref: '#/components/schemas/PricingProviderScoreCohortContext'
+          nullable: true
     PricingCostLevelThresholdAverage:
       type: object
       properties:
@@ -3990,12 +4611,33 @@ components:
               type: string
             specialty_key:
               type: string
+            cohort_type:
+              type: string
+              enum: [national, state, state_city, zip, zip_radius, unknown]
+            specialty_scope:
+              type: string
+              enum: [specialty_specific, all_specialties]
             setting_key:
               type: string
             min_claim_count:
               type: number
             max_claim_count:
               type: number
+            anchor_zip5:
+              type: string
+              nullable: true
+            distance_miles:
+              type: number
+              nullable: true
+            distance_bucket:
+              type: string
+              nullable: true
+            selected_radius_miles:
+              type: number
+              nullable: true
+            cohort_strategy_used:
+              type: string
+              enum: [precomputed, near_dynamic]
         query:
           type: object
           properties:
@@ -4008,6 +4650,15 @@ components:
             zip5:
               type: string
               nullable: true
+            zip_radius_miles:
+              type: number
+              nullable: true
+            cohort_strategy:
+              type: string
+              enum: [precomputed, near_dynamic]
+            cohort_strategy_used:
+              type: string
+              enum: [precomputed, near_dynamic]
             specialty:
               type: string
               nullable: true

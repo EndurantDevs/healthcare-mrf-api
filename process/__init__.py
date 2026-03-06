@@ -47,6 +47,20 @@ from process.drug_claims import (drug_claims_finalize,
                                  drug_claims_start,
                                  finish_main as finish_drug_claims,
                                  main as initiate_drug_claims)
+from process.provider_quality import (finish_main as finish_provider_quality,
+                                      main as initiate_provider_quality,
+                                      provider_quality_finalize,
+                                      provider_quality_materialize_domain_shard,
+                                      provider_quality_materialize_lsh_shard,
+                                      provider_quality_materialize_measure_shard,
+                                      provider_quality_materialize_score_shard,
+                                      provider_quality_process_chunk,
+                                      provider_quality_start)
+from process.provider_enrichment import (main as initiate_provider_enrichment,
+                                         process_data as process_provider_enrichment_data,
+                                         save_provider_enrichment_data,
+                                         shutdown as provider_enrichment_shutdown,
+                                         startup as provider_enrichment_startup)
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
 
@@ -200,6 +214,84 @@ class DrugClaims_finish:  # pylint: disable=invalid-name
     job_deserializer = deserialize_job
 
 
+class ProviderQuality:
+    functions = [
+        provider_quality_start,
+        provider_quality_process_chunk,
+        provider_quality_materialize_lsh_shard,
+        provider_quality_materialize_measure_shard,
+        provider_quality_materialize_domain_shard,
+        provider_quality_materialize_score_shard,
+    ]
+    on_startup = db_startup
+    max_jobs = (
+        int(os.environ.get('HLTHPRT_MAX_PROVIDER_QUALITY_JOBS'))
+        if os.environ.get('HLTHPRT_MAX_PROVIDER_QUALITY_JOBS')
+        else int(os.environ.get('HLTHPRT_PROVIDER_QUALITY_SHARD_PARALLELISM', 8))
+    )
+    queue_read_limit = 2 * max_jobs
+    queue_name = 'arq:ProviderQuality'
+    job_timeout = 86400
+    max_tries = (
+        int(os.environ.get('HLTHPRT_PROVIDER_QUALITY_MATERIALIZE_SHARD_MAX_TRIES'))
+        if os.environ.get('HLTHPRT_PROVIDER_QUALITY_MATERIALIZE_SHARD_MAX_TRIES')
+        else 20
+    )
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
+class ProviderQuality_finish:  # pylint: disable=invalid-name
+    functions = [
+        provider_quality_finalize,
+        provider_quality_materialize_lsh_shard,
+        provider_quality_materialize_measure_shard,
+        provider_quality_materialize_domain_shard,
+        provider_quality_materialize_score_shard,
+    ]
+    on_startup = db_startup
+    max_jobs = int(os.environ.get('HLTHPRT_MAX_PROVIDER_QUALITY_FINISH_JOBS')) if os.environ.get('HLTHPRT_MAX_PROVIDER_QUALITY_FINISH_JOBS') else 5
+    queue_read_limit = 2 * max_jobs
+    queue_name = 'arq:ProviderQuality_finish'
+    job_timeout = 86400
+    max_tries = (
+        int(os.environ.get('HLTHPRT_PROVIDER_QUALITY_FINALIZE_MAX_TRIES'))
+        if os.environ.get('HLTHPRT_PROVIDER_QUALITY_FINALIZE_MAX_TRIES')
+        else 720
+    )
+    burst = True
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
+class ProviderEnrichment:
+    functions = [process_provider_enrichment_data, save_provider_enrichment_data]
+    on_startup = provider_enrichment_startup
+    on_shutdown = provider_enrichment_shutdown
+    max_jobs = int(os.environ.get('HLTHPRT_MAX_PROVIDER_ENRICHMENT_JOBS')) if os.environ.get('HLTHPRT_MAX_PROVIDER_ENRICHMENT_JOBS') else 20
+    queue_read_limit = 2 * max_jobs
+    queue_name = 'arq:ProviderEnrichment'
+    job_timeout = 86400
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
+class ProviderEnrichment_finish:  # pylint: disable=invalid-name
+    functions = [provider_enrichment_shutdown]
+    on_startup = db_startup
+    max_jobs = int(os.environ.get('HLTHPRT_MAX_PROVIDER_ENRICHMENT_FINISH_JOBS')) if os.environ.get('HLTHPRT_MAX_PROVIDER_ENRICHMENT_FINISH_JOBS') else 5
+    queue_read_limit = 2 * max_jobs
+    queue_name = 'arq:ProviderEnrichment_finish'
+    job_timeout = 86400
+    burst = True
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
 @click.group()
 def process_group():
     """
@@ -323,16 +415,48 @@ def drug_claims_end(import_id: str, run_id: str, test: bool, manifest_path: str 
     )
 
 
+@click.command(help="Run provider quality import (QPP + SVI + claims-derived quality model)")
+@click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
+@click.option("--import-id", help="Override import id/date suffix for table names.")
+def provider_quality(test: bool, import_id: str | None):
+    asyncio.run(initiate_provider_quality(test_mode=test, import_id=import_id))
+
+
+@click.command(help="Run provider enrichment import (PECOS + Medicare enrollment + NPPES gap check)")
+@click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
+def provider_enrichment(test: bool):
+    asyncio.run(initiate_provider_enrichment(test_mode=test))
+
+
+@click.command(help="Finish provider quality import for a queued run id")
+@click.option("--import-id", required=True, help="Import id/date suffix used for staging tables.")
+@click.option("--run-id", required=True, help="Run id emitted by `start provider-quality`.")
+@click.option("--test", is_flag=True, help="Use test DB suffix when finalizing.")
+@click.option("--manifest-path", help="Optional manifest path override.")
+def provider_quality_end(import_id: str, run_id: str, test: bool, manifest_path: str | None):
+    asyncio.run(
+        finish_provider_quality(
+            import_id=import_id,
+            run_id=run_id,
+            test_mode=test,
+            manifest_path=manifest_path,
+        )
+    )
+
+
 process_group.add_command(mrf)
 process_group_end.add_command(mrf_end, 'mrf')
 process_group_end.add_command(claims_pricing_end, 'claims-pricing')
 process_group_end.add_command(claims_pricing_end, 'claims-procedures')
 process_group_end.add_command(drug_claims_end, 'drug-claims')
+process_group_end.add_command(provider_quality_end, 'provider-quality')
 process_group.add_command(plan_attributes)
 process_group.add_command(npi)
 process_group.add_command(ptg)
 process_group.add_command(claims_pricing, name="claims-pricing")
 process_group.add_command(claims_procedures, name="claims-procedures")
 process_group.add_command(drug_claims, name="drug-claims")
+process_group.add_command(provider_quality, name="provider-quality")
+process_group.add_command(provider_enrichment, name="provider-enrichment")
 process_group.add_command(geo_lookup, name="geo")
 process_group.add_command(nucc)

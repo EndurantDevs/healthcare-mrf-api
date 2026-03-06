@@ -1131,21 +1131,34 @@ class PricingProviderProcedureCostProfile(Base, JSONOutputMixin):
         "setting_key",
     ]
     __my_additional_indexes__ = [
-        {"index_elements": ("year", "npi", "procedure_code"), "name": "pricing_provider_proc_cost_year_npi_proc_idx"},
+        {"index_elements": ("npi", "procedure_code", "year"), "name": "pricing_provider_proc_cost_npi_proc_year_idx"},
         {
-            "index_elements": ("year", "procedure_code", "geography_scope", "geography_value", "specialty_key", "setting_key"),
+            "index_elements": ("procedure_code", "setting_key", "specialty_key", "geography_scope", "geography_value", "year"),
             "name": "pricing_provider_proc_cost_lookup_idx",
         },
         {
             "index_elements": (
-                "year",
                 "geography_scope",
                 "geography_value",
                 "specialty_key",
                 "setting_key",
+                "year",
                 "avg_submitted_charge",
             ),
             "name": "pricing_provider_proc_cost_geo_avg_idx",
+        },
+        {
+            "index_elements": (
+                "procedure_code",
+                "setting_key",
+                "specialty_key",
+                "geography_value",
+                "year",
+                "claim_count",
+                "avg_submitted_charge",
+            ),
+            "name": "pricing_provider_proc_cost_zip_dynamic_idx",
+            "where": "geography_scope = 'zip5'",
         },
     ]
 
@@ -1186,11 +1199,11 @@ class PricingProcedurePeerStats(Base, JSONOutputMixin):
     ]
     __my_additional_indexes__ = [
         {
-            "index_elements": ("year", "procedure_code", "geography_scope", "geography_value", "specialty_key", "setting_key"),
+            "index_elements": ("procedure_code", "setting_key", "specialty_key", "geography_scope", "geography_value", "year"),
             "name": "pricing_proc_peer_stats_lookup_idx",
         },
         {
-            "index_elements": ("year", "geography_scope", "geography_value", "specialty_key", "setting_key"),
+            "index_elements": ("geography_scope", "geography_value", "setting_key", "specialty_key", "year", "procedure_code"),
             "name": "pricing_proc_peer_stats_geo_idx",
         },
     ]
@@ -1316,6 +1329,541 @@ class PricingProviderPrescription(Base, JSONOutputMixin):
     ge65_total_day_supply = Column(Float)
     ge65_total_drug_cost = Column(Float)
     ge65_total_benes = Column(Float)
+
+
+class PricingQppProvider(Base, JSONOutputMixin):
+    __tablename__ = "pricing_qpp_provider"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("npi", "year"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["npi", "year"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("year", "npi"), "name": "pricing_qpp_year_npi_idx"},
+        {"index_elements": ("year", "final_score DESC"), "name": "pricing_qpp_year_final_score_desc_idx"},
+        {"index_elements": ("year", "quality_score DESC"), "name": "pricing_qpp_year_quality_score_desc_idx"},
+        {"index_elements": ("year", "cost_score DESC"), "name": "pricing_qpp_year_cost_score_desc_idx"},
+    ]
+
+    npi = Column(BigInteger, nullable=False)
+    year = Column(Integer, nullable=False)
+    quality_score = Column(Float)
+    cost_score = Column(Float)
+    final_score = Column(Float)
+    raw_json_text = Column(TEXT)
+    source = Column(String(128))
+    updated_at = Column(DateTime)
+
+
+class PricingSviZcta(Base, JSONOutputMixin):
+    __tablename__ = "pricing_svi_zcta"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("zcta", "year"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["zcta", "year"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("year", "zcta"), "name": "pricing_svi_year_zcta_idx"},
+        {"index_elements": ("year", "svi_overall"), "name": "pricing_svi_year_overall_idx"},
+    ]
+
+    zcta = Column(String(5), nullable=False)
+    year = Column(Integer, nullable=False)
+    svi_overall = Column(Float)
+    svi_socioeconomic = Column(Float)
+    svi_household = Column(Float)
+    svi_minority = Column(Float)
+    svi_housing = Column(Float)
+    source = Column(String(128))
+    updated_at = Column(DateTime)
+
+
+class PricingProviderQualityFeature(Base, JSONOutputMixin):
+    __tablename__ = "pricing_provider_quality_feature"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("npi", "year"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["npi", "year"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("year",), "name": "pricing_quality_feature_year_idx"},
+        {"index_elements": ("year", "state"), "name": "pricing_quality_feature_year_state_idx"},
+        {"index_elements": ("year", "zip5"), "name": "pricing_quality_feature_year_zip5_idx"},
+        {"index_elements": ("year", "specialty_key"), "name": "pricing_quality_feature_year_specialty_idx"},
+        {"index_elements": ("year", "taxonomy_code"), "name": "pricing_quality_feature_year_taxonomy_code_idx"},
+        {"index_elements": ("year", "taxonomy_classification"), "name": "pricing_quality_feature_year_taxonomy_class_idx"},
+    ]
+
+    npi = Column(BigInteger, nullable=False)
+    year = Column(Integer, nullable=False)
+    zip5 = Column(String(5))
+    state = Column(String(2))
+    specialty_key = Column(String(128))
+    taxonomy_code = Column(String(32))
+    taxonomy_classification = Column(String)
+    procedure_count = Column(Integer)
+    updated_at = Column(DateTime)
+
+
+class PricingProviderQualityProcedureLSH(Base, JSONOutputMixin):
+    __tablename__ = "pricing_provider_quality_procedure_lsh"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("npi", "year", "band_no"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["npi", "year", "band_no"]
+    __my_additional_indexes__ = [
+        {
+            "index_elements": ("year", "band_no", "band_hash"),
+            "name": "pricing_quality_proc_lsh_year_band_hash_idx",
+        },
+        {"index_elements": ("year", "npi"), "name": "pricing_quality_proc_lsh_year_npi_idx"},
+    ]
+
+    npi = Column(BigInteger, nullable=False)
+    year = Column(Integer, nullable=False)
+    band_no = Column(Integer, nullable=False)
+    band_hash = Column(String(128))
+    updated_at = Column(DateTime)
+
+
+class PricingProviderQualityPeerTarget(Base, JSONOutputMixin):
+    __tablename__ = "pricing_provider_quality_peer_target"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "year",
+            "benchmark_mode",
+            "geography_scope",
+            "geography_value",
+            "cohort_level",
+            "specialty_key",
+            "taxonomy_code",
+            "procedure_bucket",
+        ),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = [
+        "year",
+        "benchmark_mode",
+        "geography_scope",
+        "geography_value",
+        "cohort_level",
+        "specialty_key",
+        "taxonomy_code",
+        "procedure_bucket",
+    ]
+    __my_additional_indexes__ = [
+        {
+            "index_elements": ("year", "benchmark_mode", "geography_scope", "geography_value", "cohort_level"),
+            "name": "pricing_quality_peer_target_year_mode_geo_cohort_idx",
+        },
+        {
+            "index_elements": ("year", "benchmark_mode", "cohort_level", "specialty_key", "taxonomy_code", "procedure_bucket"),
+            "name": "pricing_quality_peer_target_year_mode_cohort_target_idx",
+        },
+    ]
+
+    year = Column(Integer, nullable=False)
+    benchmark_mode = Column(String(32), nullable=False)
+    geography_scope = Column(String(16), nullable=False)
+    geography_value = Column(String(128), nullable=False)
+    cohort_level = Column(String(32), nullable=False)
+    specialty_key = Column(String(128), nullable=False)
+    taxonomy_code = Column(String(32), nullable=False)
+    procedure_bucket = Column(String(64), nullable=False)
+    peer_n = Column(Integer)
+    target_appropriateness = Column(Float)
+    target_effectiveness = Column(Float)
+    target_cost = Column(Float)
+    target_qpp_cost = Column(Float)
+    target_rx_appropriateness = Column(Float)
+    updated_at = Column(DateTime)
+
+
+class PricingProviderQualityMeasure(Base, JSONOutputMixin):
+    __tablename__ = "pricing_provider_quality_measure"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("npi", "year", "benchmark_mode", "measure_id", "domain"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["npi", "year", "benchmark_mode", "measure_id", "domain"]
+    __my_additional_indexes__ = [
+        {
+            "index_elements": ("year", "benchmark_mode", "domain", "measure_id"),
+            "name": "pricing_quality_measure_year_mode_domain_measure_idx",
+        },
+        {
+            "index_elements": ("year", "benchmark_mode", "npi", "domain"),
+            "name": "pricing_quality_measure_year_mode_npi_domain_idx",
+        },
+        {
+            "index_elements": ("year", "benchmark_mode", "peer_group", "domain"),
+            "name": "pricing_quality_measure_year_mode_peer_domain_idx",
+        },
+        {
+            "index_elements": ("year", "benchmark_mode", "domain", "risk_ratio"),
+            "name": "pricing_quality_measure_year_mode_domain_rr_idx",
+        },
+        {
+            "index_elements": (
+                "year",
+                "benchmark_mode",
+                "cohort_level",
+                "cohort_specialty_key",
+                "cohort_taxonomy_code",
+                "cohort_procedure_bucket",
+            ),
+            "name": "pricing_quality_measure_year_mode_cohort_idx",
+        },
+        {
+            "index_elements": (
+                "year",
+                "benchmark_mode",
+                "npi",
+                "cohort_level",
+                "cohort_specialty_key",
+                "cohort_taxonomy_code",
+                "cohort_procedure_bucket",
+            ),
+            "name": "pricing_quality_measure_year_mode_npi_cohort_idx",
+        },
+    ]
+
+    npi = Column(BigInteger, nullable=False)
+    year = Column(Integer, nullable=False)
+    benchmark_mode = Column(String(32), nullable=False)
+    measure_id = Column(String(128), nullable=False)
+    domain = Column(String(32), nullable=False)
+    observed = Column(Float)
+    target = Column(Float)
+    risk_ratio = Column(Float)
+    ci75_low = Column(Float)
+    ci75_high = Column(Float)
+    ci90_low = Column(Float)
+    ci90_high = Column(Float)
+    evidence_n = Column(Integer)
+    peer_group = Column(String(128))
+    cohort_level = Column(String(32))
+    cohort_specialty_key = Column(String(128))
+    cohort_taxonomy_code = Column(String(32))
+    cohort_procedure_bucket = Column(String(64))
+    cohort_peer_n = Column(Integer)
+    direction = Column(String(16))
+    source = Column(String(128))
+    updated_at = Column(DateTime)
+
+
+class PricingProviderQualityDomain(Base, JSONOutputMixin):
+    __tablename__ = "pricing_provider_quality_domain"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("npi", "year", "benchmark_mode", "domain"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["npi", "year", "benchmark_mode", "domain"]
+    __my_additional_indexes__ = [
+        {
+            "index_elements": ("year", "benchmark_mode", "domain", "score_0_100 DESC"),
+            "name": "pricing_quality_domain_year_mode_domain_score_desc_idx",
+        },
+        {
+            "index_elements": ("year", "benchmark_mode", "domain", "risk_ratio"),
+            "name": "pricing_quality_domain_year_mode_domain_rr_idx",
+        },
+    ]
+
+    npi = Column(BigInteger, nullable=False)
+    year = Column(Integer, nullable=False)
+    benchmark_mode = Column(String(32), nullable=False)
+    domain = Column(String(32), nullable=False)
+    risk_ratio = Column(Float)
+    score_0_100 = Column(Float)
+    ci75_low = Column(Float)
+    ci75_high = Column(Float)
+    ci90_low = Column(Float)
+    ci90_high = Column(Float)
+    evidence_n = Column(Integer)
+    measure_count = Column(Integer)
+    updated_at = Column(DateTime)
+
+
+class PricingProviderQualityScore(Base, JSONOutputMixin):
+    __tablename__ = "pricing_provider_quality_score"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("npi", "year", "benchmark_mode"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["npi", "year", "benchmark_mode"]
+    __my_additional_indexes__ = [
+        {
+            "index_elements": ("year", "benchmark_mode", "tier", "score_0_100 DESC"),
+            "name": "pricing_quality_score_year_mode_tier_score_desc_idx",
+        },
+        {
+            "index_elements": ("year", "benchmark_mode", "risk_ratio_point"),
+            "name": "pricing_quality_score_year_mode_rr_idx",
+        },
+        {
+            "index_elements": ("year", "benchmark_mode", "borderline_status"),
+            "name": "pricing_quality_score_year_mode_borderline_idx",
+        },
+        {"index_elements": ("run_id",), "name": "pricing_quality_score_run_id_idx"},
+        {"index_elements": ("year", "benchmark_mode", "model_version"), "name": "pricing_quality_score_year_benchmark_model_idx"},
+        {
+            "index_elements": (
+                "year",
+                "benchmark_mode",
+                "cohort_level",
+                "cohort_specialty_key",
+                "cohort_taxonomy_code",
+                "cohort_procedure_bucket",
+            ),
+            "name": "pricing_quality_score_year_mode_cohort_idx",
+        },
+    ]
+
+    npi = Column(BigInteger, nullable=False)
+    year = Column(Integer, nullable=False)
+    model_version = Column(String(32))
+    benchmark_mode = Column(String(32), nullable=False)
+    cohort_level = Column(String(32))
+    cohort_specialty_key = Column(String(128))
+    cohort_taxonomy_code = Column(String(32))
+    cohort_procedure_bucket = Column(String(64))
+    cohort_peer_n = Column(Integer)
+    risk_ratio_point = Column(Float)
+    ci75_low = Column(Float)
+    ci75_high = Column(Float)
+    ci90_low = Column(Float)
+    ci90_high = Column(Float)
+    score_0_100 = Column(Float)
+    tier = Column(String(32))
+    borderline_status = Column(Boolean)
+    low_score_threshold_failed = Column(Boolean)
+    low_confidence_threshold_failed = Column(Boolean)
+    high_score_threshold_passed = Column(Boolean)
+    high_confidence_threshold_passed = Column(Boolean)
+    estimated_cost_level = Column(String(5))
+    run_id = Column(String(64))
+    updated_at = Column(DateTime)
+
+
+class PricingQualityRun(Base, JSONOutputMixin):
+    __tablename__ = "pricing_quality_run"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("run_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["run_id"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("year", "status"), "name": "pricing_quality_run_year_status_idx"},
+        {"index_elements": ("created_at",), "name": "pricing_quality_run_created_at_idx"},
+        {"index_elements": ("updated_at",), "name": "pricing_quality_run_updated_at_idx"},
+    ]
+
+    run_id = Column(String(64), nullable=False)
+    import_id = Column(String(32))
+    year = Column(Integer)
+    qpp_source_version = Column(String(128))
+    svi_source_version = Column(String(128))
+    status = Column(String(32))
+    qpp_rows = Column(Integer)
+    svi_rows = Column(Integer)
+    measure_rows = Column(Integer)
+    domain_rows = Column(Integer)
+    score_rows = Column(Integer)
+    started_at = Column(DateTime)
+    finished_at = Column(DateTime)
+    created_at = Column(DateTime)
+    updated_at = Column(DateTime)
+
+
+class ProviderEnrollmentBase(Base, JSONOutputMixin):
+    __abstract__ = True
+
+    @declared_attr
+    def __table_args__(cls):
+        return (
+            PrimaryKeyConstraint("record_hash"),
+            {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        )
+
+    __my_index_elements__ = ["record_hash"]
+    __my_initial_indexes__ = []
+    __my_additional_indexes__ = [
+        {"index_elements": ("reporting_year", "npi"), "name": "year_npi"},
+        {"index_elements": ("state", "reporting_year"), "name": "state_year"},
+        {"index_elements": ("provider_type_code", "reporting_year"), "name": "provider_type_year"},
+        {"index_elements": ("ccn",), "name": "ccn"},
+        {"index_elements": ("enrollment_id",), "name": "enrollment_id"},
+    ]
+
+    record_hash = Column(Integer, nullable=False)
+    npi = Column(BigInteger, nullable=False)
+    reporting_period_start = Column(DATE)
+    reporting_period_end = Column(DATE)
+    reporting_year = Column(Integer)
+    enrollment_id = Column(String(64))
+    enrollment_state = Column(String(2))
+    provider_type_code = Column(String(32))
+    provider_type_text = Column(String)
+    multiple_npi_flag = Column(String(16))
+    ccn = Column(String(32))
+    associate_id = Column(String(64))
+    organization_name = Column(String)
+    doing_business_as_name = Column(String)
+    incorporation_date = Column(DATE)
+    incorporation_state = Column(String(2))
+    organization_type_structure = Column(String)
+    organization_other_type_text = Column(String)
+    proprietary_nonprofit = Column(String(64))
+    address_line_1 = Column(String)
+    address_line_2 = Column(String)
+    city = Column(String)
+    state = Column(String(2))
+    zip_code = Column(String(12))
+    source_dataset_title = Column(String(255))
+    source_distribution_title = Column(String(255))
+    source_url = Column(String)
+    source_modified = Column(DateTime)
+    source_temporal = Column(String(64))
+    imported_at = Column(DateTime)
+
+
+class ProviderEnrollmentFFS(ProviderEnrollmentBase):
+    __tablename__ = "provider_enrollment_ffs"
+    __main_table__ = __tablename__
+
+    pecos_asct_cntl_id = Column(String(64))
+    first_name = Column(String)
+    middle_name = Column(String)
+    last_name = Column(String)
+    org_name = Column(String)
+
+
+class ProviderEnrollmentHospital(ProviderEnrollmentBase):
+    __tablename__ = "provider_enrollment_hospital"
+    __main_table__ = __tablename__
+
+    practice_location_type = Column(String(128))
+    location_other_type_text = Column(String)
+    subgroup_general = Column(String(32))
+    subgroup_acute_care = Column(String(32))
+    subgroup_alcohol_drug = Column(String(32))
+    subgroup_childrens = Column(String(32))
+    subgroup_long_term = Column(String(32))
+    subgroup_psychiatric = Column(String(32))
+    subgroup_rehabilitation = Column(String(32))
+    subgroup_short_term = Column(String(32))
+    subgroup_swing_bed_approved = Column(String(32))
+    subgroup_psychiatric_unit = Column(String(32))
+    subgroup_rehabilitation_unit = Column(String(32))
+    subgroup_specialty_hospital = Column(String(32))
+    subgroup_other = Column(String(32))
+    subgroup_other_text = Column(String)
+    reh_conversion_flag = Column(String(32))
+    reh_conversion_date = Column(DATE)
+    cah_or_hospital_ccn = Column(String(32))
+
+
+class ProviderEnrollmentHomeHealthAgency(ProviderEnrollmentBase):
+    __tablename__ = "provider_enrollment_hha"
+    __main_table__ = __tablename__
+
+    practice_location_type = Column(String(128))
+    location_other_type_text = Column(String)
+
+
+class ProviderEnrollmentHospice(ProviderEnrollmentBase):
+    __tablename__ = "provider_enrollment_hospice"
+    __main_table__ = __tablename__
+
+
+class ProviderEnrollmentFQHC(ProviderEnrollmentBase):
+    __tablename__ = "provider_enrollment_fqhc"
+    __main_table__ = __tablename__
+
+    telephone_number = Column(String(32))
+
+
+class ProviderEnrollmentRHC(ProviderEnrollmentBase):
+    __tablename__ = "provider_enrollment_rhc"
+    __main_table__ = __tablename__
+
+    telephone_number = Column(String(32))
+
+
+class ProviderEnrollmentSNF(ProviderEnrollmentBase):
+    __tablename__ = "provider_enrollment_snf"
+    __main_table__ = __tablename__
+
+    nursing_home_provider_name = Column(String)
+    affiliation_entity_name = Column(String)
+    affiliation_entity_id = Column(String(64))
+
+
+class ProviderEnrichmentSummary(Base, JSONOutputMixin):
+    __tablename__ = "provider_enrichment_summary"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("npi"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["npi"]
+    __my_initial_indexes__ = [
+        {"index_elements": ("latest_reporting_year",)},
+        {"index_elements": ("status",)},
+    ]
+    __my_additional_indexes__ = [
+        {"index_elements": ("primary_state", "latest_reporting_year"), "name": "state_year"},
+        {"index_elements": ("has_any_enrollment", "latest_reporting_year"), "name": "has_any_year"},
+        {"index_elements": ("has_medicare_claims", "latest_reporting_year"), "name": "has_claims_year"},
+        {"index_elements": ("has_ffs_enrollment",), "name": "has_ffs"},
+        {"index_elements": ("has_hospital_enrollment",), "name": "has_hospital"},
+        {"index_elements": ("has_hha_enrollment",), "name": "has_hha"},
+        {"index_elements": ("has_hospice_enrollment",), "name": "has_hospice"},
+        {"index_elements": ("has_fqhc_enrollment",), "name": "has_fqhc"},
+        {"index_elements": ("has_rhc_enrollment",), "name": "has_rhc"},
+        {"index_elements": ("has_snf_enrollment",), "name": "has_snf"},
+        {"index_elements": ("dataset_keys",), "using": "gin", "name": "dataset_keys_gin"},
+        {"index_elements": ("states",), "using": "gin", "name": "states_gin"},
+        {"index_elements": ("provider_type_codes",), "using": "gin", "name": "provider_type_codes_gin"},
+    ]
+
+    npi = Column(BigInteger, nullable=False)
+    latest_reporting_year = Column(Integer)
+    has_any_enrollment = Column(Boolean)
+    has_ffs_enrollment = Column(Boolean)
+    has_hospital_enrollment = Column(Boolean)
+    has_hha_enrollment = Column(Boolean)
+    has_hospice_enrollment = Column(Boolean)
+    has_fqhc_enrollment = Column(Boolean)
+    has_rhc_enrollment = Column(Boolean)
+    has_snf_enrollment = Column(Boolean)
+    has_medicare_claims = Column(Boolean)
+    medicare_claim_year_min = Column(Integer)
+    medicare_claim_year_max = Column(Integer)
+    medicare_claim_rows = Column(Integer)
+    total_enrollment_rows = Column(Integer)
+    dataset_keys = Column(ARRAY(String), nullable=False, server_default=text("ARRAY[]::varchar[]"))
+    states = Column(ARRAY(String), nullable=False, server_default=text("ARRAY[]::varchar[]"))
+    provider_type_codes = Column(ARRAY(String), nullable=False, server_default=text("ARRAY[]::varchar[]"))
+    provider_type_texts = Column(ARRAY(String), nullable=False, server_default=text("ARRAY[]::varchar[]"))
+    primary_state = Column(String(2))
+    primary_provider_type_code = Column(String(32))
+    primary_provider_type_text = Column(String)
+    status = Column(String(32))
+    nppes_unmapped_field_count = Column(Integer)
+    nppes_medical_school_fields = Column(ARRAY(String), nullable=False, server_default=text("ARRAY[]::varchar[]"))
+    updated_at = Column(DateTime)
 
 
 class CodeCatalog(Base, JSONOutputMixin):

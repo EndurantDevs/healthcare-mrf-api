@@ -20,6 +20,15 @@ Define mandatory behavior for importer table swaps and rollback safety.
 - Storage planning must account for approximately 2x footprint for swapped datasets.
 - Performance investigations must treat `_old` presence as expected behavior, not data drift.
 
+## Index Rename Safety Rules
+
+- Index archive rename must be idempotent:
+  - drop existing archive index name before renaming current live index;
+  - then rename staged index to live index name.
+- Archive index names must be PostgreSQL-identifier-safe (63-char max).
+  - For long names, use deterministic truncated+hash archive naming to avoid collisions.
+- `ALTER INDEX ... RENAME TO ..._old` without target pre-drop is not allowed in finalize paths.
+
 ## NPI Import Reference
 
 Current NPI swap implementation follows this policy in `process/npi.py`:
@@ -27,6 +36,9 @@ Current NPI swap implementation follows this policy in `process/npi.py`:
 - rename live to `_old`
 - rename staged import table to live
 - rename indexes accordingly
+- archive index naming is truncation-safe and collision-tolerant
+
+Claims/drug finalize in `process/claims_pricing.py` and `process/drug_claims.py` follows the same guardrail.
 
 This is intentional rollback design, not temporary migration debris.
 

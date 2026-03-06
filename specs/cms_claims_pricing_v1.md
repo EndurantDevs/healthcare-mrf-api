@@ -16,7 +16,10 @@ Importer resolves direct CSV URLs from the CMS portal (`https://data.cms.gov/`) 
 2. Medicare Physician & Other Practitioners - by Provider and Service
 3. Medicare Physician & Other Practitioners - by Geography and Service
 
-Reporting years in scope for v1: `2021`, `2022`, `2023`.
+Reporting year window is env-controlled; current operational default is `2023` only:
+
+- `HLTHPRT_CLAIMS_MIN_YEAR=2023`
+- `HLTHPRT_CLAIMS_MAX_YEAR=2023`
 
 ## Import Process
 
@@ -32,10 +35,18 @@ Procedures-only alias:
 python main.py start claims-procedures
 ```
 
-Drug prescriptions import:
+Drug prescriptions import (separate pipeline):
 
 ```bash
 python main.py start drug-claims
+```
+
+Provider quality import (separate pipeline):
+
+```bash
+python main.py start provider-quality
+python main.py worker process.ProviderQuality --burst
+python main.py worker process.ProviderQuality_finish --burst
 ```
 
 Test mode:
@@ -54,11 +65,16 @@ Pipeline behavior:
 
 1. Resolve latest CSV sources from CMS catalog.
 2. Download source CSV files.
-3. Split downloaded CSV files into temporary chunks.
+3. Stream-split downloaded CSV files into temporary chunks.
 4. Enqueue chunk jobs to `arq:ClaimsPricing`.
 5. Load chunks into staging tables with dynamic import suffix.
-6. Finalize in `arq:ClaimsPricing_finish` and swap staged rows into canonical tables.
+6. Finalize in `arq:ClaimsPricing_finish` and swap staged rows into canonical tables (transactional rename).
 7. Keep deterministic sparse sampling in `--test` mode.
+
+Finalize safety notes:
+
+- Publish uses table rename (`live -> _old`, `stage -> live`) and index rename.
+- Index archive names are truncation-safe for Postgres 63-char limits and are pre-dropped before rename to avoid `_old` collisions.
 
 ### `--test` mode behavior
 
@@ -76,6 +92,8 @@ Pipeline behavior:
 
 ## Canonical Tables
 
+Primary procedure/service claims tables:
+
 - `pricing_provider`
 - `pricing_procedure`
 - `pricing_provider_procedure`
@@ -83,10 +101,28 @@ Pipeline behavior:
 - `pricing_provider_procedure_cost_profile`
 - `pricing_procedure_peer_stats`
 - `pricing_procedure_geo_benchmark`
-- `pricing_prescription`
-- `pricing_provider_prescription`
+
+Shared code tables (upserted, not replaced):
+
 - `code_catalog`
 - `code_crosswalk`
+
+Prescription tables are owned by `drug-claims`:
+
+- `pricing_prescription`
+- `pricing_provider_prescription`
+
+Provider quality tables are owned by `provider-quality`:
+
+- `pricing_qpp_provider`
+- `pricing_svi_zcta`
+- `pricing_provider_quality_feature`
+- `pricing_provider_quality_procedure_lsh`
+- `pricing_provider_quality_peer_target`
+- `pricing_provider_quality_measure`
+- `pricing_provider_quality_domain`
+- `pricing_provider_quality_score`
+- `pricing_quality_run`
 
 ## API Endpoints (v1)
 
@@ -142,6 +178,59 @@ Implemented filters and controls include:
 - location filters (`state`, `city`, `zip5`, `year`)
 - code expansion controls (`code`, `code_system`, `expand_codes`) on pricing procedure lookups
 
+`/pricing/providers/{npi}/score` and alias `/pricing/physicians/{npi}/score` support:
+
+- `year`
+- `benchmark_mode` (`national|state|zip`)
+- cohort override params:
+  - `specialty`
+  - `taxonomy_code`
+  - `procedure_codes` (CSV)
+  - `procedure_code_system` (`HP_PROCEDURE_CODE|CPT|HCPCS`)
+  - `procedure_match_threshold` (`0..1`, default `0.30`)
+
+Estimated cost level geography fallback order:
+
+1. `zip5` (if provided)
+2. `city + state` (if provided)
+3. `state` (if provided)
+4. national (`US`)
+
+If a narrower geography has no matching peer group, lookup falls back to broader scope.
+
+Provider quality cohort fallback order for score benchmarking:
+
+1. Geography fallback by mode:
+   - `zip`: `zip -> state -> national`
+   - `state`: `state -> national`
+   - `national`: `national`
+2. Cohort fallback inside selected geography:
+   - `L0`: `specialty + taxonomy + procedure_bucket`
+   - `L1`: `specialty + taxonomy`
+   - `L2`: `specialty`
+   - `L3`: `geo_only`
+
+## Provider Quality V2 Score Contract
+
+Scoring is Embold-aligned and risk-ratio based:
+
+- measure/domain/overall scores are normalized as risk ratios where `>1` means worse than peer target
+- uncertainty is explicitly carried via interval bands (`ci_75`, `ci_90`)
+- overall blend is `50% clinical + 50% cost`
+- tier checks use fixed threshold logic on point estimate plus confidence checks
+
+Score response includes:
+
+- `model_version`
+- `tier`, `borderline_status`, `score_0_100`
+- `overall` with `risk_ratio_point`, `ci_75`, `ci_90`
+- `domains`: `appropriateness`, `effectiveness`, `cost` (same shape + `evidence_n`)
+- `curation_checks`
+- `cohort_context` (selected geography/cohort, peer count, whether computed live)
+- compatibility helper `estimated_cost_level`
+
+Legacy heuristic-only score fields are not part of the active `/score` contract.
+
 Unsupported in v1:
 
 - write/edit operations
@@ -166,3 +255,9 @@ Recommended extension strategy:
 - keep current canonical tables as the read API contract
 - add source-specific staging/normalization pipelines
 - enrich canonical tables with source provenance and confidence metadata
+
+## Integration Notes
+
+- `claims-pricing` and `drug-claims` may run concurrently for chunk processing.
+- Do not run `ClaimsPricing_finish`, `DrugClaims_finish`, and `ProviderQuality_finish` in parallel.
+- `npi_address.procedures_array` and `npi_address.medications_array` are populated in NPI import finalization, not in claims/drug finalizers.

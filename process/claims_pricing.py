@@ -1988,6 +1988,127 @@ async def _materialize_cost_level_rows(classes: dict[str, type], schema: str) ->
     )
 
 
+async def _collect_cost_level_diagnostics(classes: dict[str, type], schema: str) -> dict[str, Any]:
+    provider_cost_profile_table = classes["PricingProviderProcedureCostProfile"].__tablename__
+    procedure_peer_table = classes["PricingProcedurePeerStats"].__tablename__
+
+    profile_scope_result = await db.all(
+        f"""
+        SELECT
+            geography_scope,
+            COUNT(*)::bigint AS rows,
+            COUNT(
+                DISTINCT (
+                    year,
+                    procedure_code,
+                    geography_scope,
+                    geography_value,
+                    specialty_key,
+                    setting_key
+                )
+            )::bigint AS unique_keys
+        FROM {schema}.{provider_cost_profile_table}
+        GROUP BY geography_scope
+        ORDER BY geography_scope;
+        """
+    )
+    peer_scope_result = await db.all(
+        f"""
+        SELECT
+            geography_scope,
+            COUNT(*)::bigint AS rows,
+            COUNT(
+                DISTINCT (
+                    year,
+                    procedure_code,
+                    geography_scope,
+                    geography_value,
+                    specialty_key,
+                    setting_key
+                )
+            )::bigint AS unique_keys
+        FROM {schema}.{procedure_peer_table}
+        GROUP BY geography_scope
+        ORDER BY geography_scope;
+        """
+    )
+    coverage_result = await db.all(
+        f"""
+        WITH profile_keys AS (
+            SELECT DISTINCT
+                year,
+                procedure_code,
+                geography_scope,
+                geography_value,
+                setting_key
+            FROM {schema}.{provider_cost_profile_table}
+        ),
+        peer_keys AS (
+            SELECT DISTINCT
+                year,
+                procedure_code,
+                geography_scope,
+                geography_value,
+                setting_key
+            FROM {schema}.{procedure_peer_table}
+        )
+        SELECT
+            p.geography_scope,
+            COUNT(*)::bigint AS profile_keys,
+            COUNT(k.procedure_code)::bigint AS peer_keys,
+            CASE
+                WHEN COUNT(*) = 0 THEN 0.0
+                ELSE ROUND((100.0 * COUNT(k.procedure_code)::numeric / COUNT(*)::numeric), 2)::float8
+            END AS coverage_pct
+        FROM profile_keys p
+        LEFT JOIN peer_keys k
+          ON k.year = p.year
+         AND k.procedure_code = p.procedure_code
+         AND k.geography_scope = p.geography_scope
+         AND k.geography_value = p.geography_value
+         AND k.setting_key = p.setting_key
+        GROUP BY p.geography_scope
+        ORDER BY p.geography_scope;
+        """
+    )
+
+    profile_scope = [dict(getattr(row, "_mapping", row)) for row in profile_scope_result]
+    peer_scope = [dict(getattr(row, "_mapping", row)) for row in peer_scope_result]
+    coverage = [dict(getattr(row, "_mapping", row)) for row in coverage_result]
+
+    print(
+        "[diagnostic] cost-level profile scope rows: "
+        + ", ".join(
+            f"{item.get('geography_scope')}={int(item.get('rows') or 0)}"
+            for item in profile_scope
+        ),
+        flush=True,
+    )
+    print(
+        "[diagnostic] cost-level peer scope rows: "
+        + ", ".join(
+            f"{item.get('geography_scope')}={int(item.get('rows') or 0)}"
+            for item in peer_scope
+        ),
+        flush=True,
+    )
+    print(
+        "[diagnostic] cost-level key coverage: "
+        + ", ".join(
+            f"{item.get('geography_scope')}={float(item.get('coverage_pct') or 0.0):.2f}%"
+            f" ({int(item.get('peer_keys') or 0)}/{int(item.get('profile_keys') or 0)})"
+            for item in coverage
+        ),
+        flush=True,
+    )
+
+    return {
+        "profile_scope_rows": profile_scope,
+        "peer_scope_rows": peer_scope,
+        "key_coverage": coverage,
+    }
+
+
 async def _publish_by_table_rename(classes: dict[str, type], schema: str) -> None:
     final_classes = (
         PricingProvider,
@@ -2301,6 +2422,9 @@ async def claims_pricing_finalize(ctx, task: dict[str, Any] | None = None) -> di
     t = _step_start("materialize cost-level profile and peer stats")
     await _materialize_cost_level_rows(classes, schema)
     _step_end("materialize cost-level profile and peer stats", t)
+    t = _step_start("verify cost-level coverage diagnostics")
+    cost_level_diagnostics = await _collect_cost_level_diagnostics(classes, schema)
+    _step_end("verify cost-level coverage diagnostics", t)
     if CLAIMS_DEFER_STAGE_INDEXES:
         t = _step_start("build staging indexes")
         await _build_staging_indexes(classes, schema)
@@ -2330,6 +2454,7 @@ async def claims_pricing_finalize(ctx, task: dict[str, Any] | None = None) -> di
         "run_id": run_id,
         "stage_suffix": stage_suffix,
         "schema": schema,
+        "cost_level_diagnostics": cost_level_diagnostics,
     }
 
 
