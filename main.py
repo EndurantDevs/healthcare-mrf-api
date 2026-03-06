@@ -197,6 +197,21 @@ def stop_drug_claims(burst: bool, import_id: str | None):
     _run_worker_command("process.DrugClaims_finish", True, env)
 
 
+@stop.command("provider-enrichment")
+@click.option("--burst/--no-burst", default=True, help="Match arq worker burst mode (defaults to burst).")
+@click.option("--import-id", help="Override the import_id/import_date passed to worker startup.")
+def stop_provider_enrichment(burst: bool, import_id: str | None):
+    """Drain provider enrichment jobs and trigger NPI-style shutdown publish."""
+    env = os.environ.copy()
+    if import_id:
+        env["HLTHPRT_IMPORT_ID_OVERRIDE"] = import_id
+    else:
+        env.pop("HLTHPRT_IMPORT_ID_OVERRIDE", None)
+
+    _run_worker_command("process.ProviderEnrichment", burst, env)
+    _run_worker_command("process.ProviderEnrichment_finish", True, env)
+
+
 cli.add_command(stop, name="stop")
 cli.add_command(arq.cli.cli, name="worker")
 cli.add_command(manage, name="manage")

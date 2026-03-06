@@ -40,7 +40,7 @@ Once you do the first import(the comand that you added to crontab) - the data wi
 
 Schema bootstrap note:
 
-- `claims-pricing` / `claims-procedures` and `drug-claims` automatically create required canonical tables and indexes (`checkfirst`) during import startup.
+- `claims-pricing` / `claims-procedures`, `drug-claims`, and `provider-quality` automatically create required canonical tables and indexes (`checkfirst`) during import startup.
 - Alembic migrations are optional for these import pipelines; imports are migration-independent for table creation.
 
 Queue procedures/services claims import:
@@ -57,11 +57,47 @@ Queue prescriptions (Part D) import:
 python main.py start drug-claims
 ```
 
+Queue provider quality import (QPP + SVI + claims-derived quality model):
+
+```shell
+python main.py start provider-quality
+```
+
+Provider quality source safety defaults:
+
+- `HLTHPRT_PROVIDER_QUALITY_FAIL_ON_SOURCE_ERROR=true` (default): abort run if QPP/SVI source download fails.
+- `HLTHPRT_PROVIDER_QUALITY_ALLOW_DEGRADED_TEST_ONLY=true` (default): allow empty-source degraded fallback only in `--test`.
+- `HLTHPRT_PROVIDER_QUALITY_BENCHMARK_MODE=national|state|zip` (default: `national`).
+- `HLTHPRT_PROVIDER_QUALITY_MIN_STATE_PEER_N=30` (minimum peers to keep state benchmark before national fallback).
+- ZIP-local mode settings:
+  - `HLTHPRT_PROVIDER_QUALITY_ZIP_MIN_PEER_N=30`
+  - `HLTHPRT_PROVIDER_QUALITY_ZIP_MAX_RADIUS_MILES=50`
+  - `HLTHPRT_PROVIDER_QUALITY_ZIP_RADIUS_STEP_MILES=10`
+- ZIP mode fallback chain: `zip -> state -> national`
+- Materialization fan-out by mode:
+  - `national` -> stores `national`
+  - `state` -> stores `state`, `national`
+  - `zip` -> stores `zip`, `state`, `national`
+- Sharded materialization (finalize acceleration):
+  - `HLTHPRT_PROVIDER_QUALITY_MATERIALIZE_SHARDED_ENABLED=false` (canary default; keeps legacy monolith path when false)
+  - `HLTHPRT_PROVIDER_QUALITY_MATERIALIZE_SHARD_QUEUE=arq:ProviderQuality_finish` (default; keeps finalize+shards on same worker queue)
+  - `HLTHPRT_PROVIDER_QUALITY_FINALIZE_MAX_TRIES=720` (avoid finalize retry exhaustion while shards are running)
+  - `HLTHPRT_PROVIDER_QUALITY_MATERIALIZE_SHARD_MAX_TRIES=20`
+  - `HLTHPRT_PROVIDER_QUALITY_LSH_SHARDS=8`
+  - `HLTHPRT_PROVIDER_QUALITY_MEASURE_SHARDS=8`
+  - `HLTHPRT_PROVIDER_QUALITY_DOMAIN_SHARDS=8`
+  - `HLTHPRT_PROVIDER_QUALITY_SCORE_SHARDS=8`
+  - `HLTHPRT_PROVIDER_QUALITY_SHARD_PARALLELISM=8`
+  - `HLTHPRT_PROVIDER_QUALITY_SHARD_WORK_MEM=64MB`
+  - `HLTHPRT_PROVIDER_QUALITY_SHARD_JIT=off`
+  - `HLTHPRT_PROVIDER_QUALITY_SHARD_MAX_PARALLEL_GATHER=0`
+
 Run reduced deterministic smoke import in test mode:
 
 ```shell
 python main.py start claims-pricing --test
 python main.py start drug-claims --test
+python main.py start provider-quality --test
 ```
 
 Run workers (burst mode) to process procedures chunks and finalize publish:
@@ -77,6 +113,25 @@ Run workers for drug claims:
 python main.py worker process.DrugClaims --burst
 python main.py worker process.DrugClaims_finish --burst
 ```
+
+Run workers for provider quality:
+
+```shell
+python main.py worker process.ProviderQuality --burst
+python main.py worker process.ProviderQuality_finish --burst
+```
+
+For sharded materialization, `ProviderQuality_finish` can now process shard jobs itself (same queue), which avoids finalize stalls if `ProviderQuality --burst` exits after chunk load.
+
+Finalize concurrency guardrail:
+
+- Do **not** run `ClaimsPricing_finish`, `DrugClaims_finish`, and `ProviderQuality_finish` in parallel.
+- `ClaimsPricing_finish` and `DrugClaims_finish` both touch shared `code_catalog`/`code_crosswalk`; `ProviderQuality_finish` should run in a separate finalize window.
+- `ProviderQuality_finish` also acquires a global finalize mutex key (`imports:finalize_mutex`) to avoid publish overlap.
+
+Provider ranking option:
+
+- `GET /api/v1/pricing/providers?order_by=tier_relevance` (or `/pricing/physicians`) ranks by quality tier (`high`, `acceptable`, `low`) and then by `score_0_100`.
 
 Drug code crosswalk enrichment (`HP_RX_CODE -> NDC/RXNORM`):
 
@@ -101,6 +156,7 @@ Manual finalize re-queue (if needed):
 ```shell
 python main.py finish claims-pricing --import-id 20260215 --run-id <run_id> --test
 python main.py finish drug-claims --import-id 20260215 --run-id <run_id> --test
+python main.py finish provider-quality --import-id 20260215 --run-id <run_id> --test
 ```
 
 Useful test-mode tuning for huge CMS files:
@@ -132,8 +188,8 @@ python main.py start claims-pricing
 
 Detailed v1 pricing scope and endpoint notes:
 
-- `doc/specs/cms_claims_pricing_v1.md`
-- `doc/specs/drug_claims_v1.md`
+- `specs/cms_claims_pricing_v1.md`
+- `specs/drug_claims_v1.md`
 - `specs/import_swap_backup_policy.md` (required `_old` table rollback policy)
 
 

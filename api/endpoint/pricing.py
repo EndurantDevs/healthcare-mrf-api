@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import math
 import os
 import re
 from typing import Any
@@ -9,11 +11,13 @@ from typing import Any
 import sanic.exceptions
 from sanic import Blueprint, response
 from sanic.exceptions import InvalidUsage
-from sqlalchemy import Float, String, and_, case, cast, func, or_, select
+from sqlalchemy import (Column, Float, Integer, MetaData, String, Table, and_, case, cast,
+                        func, or_, select, text)
 
 from api.endpoint.pagination import parse_pagination
 from db.models import (CodeCatalog, CodeCrosswalk, PricingProcedure,
                        PricingProcedureGeoBenchmark,
+                       GeoZipLookup,
                        PricingPrescription, PricingProvider,
                        PricingProviderPrescription,
                        PricingProviderProcedure,
@@ -35,15 +39,32 @@ prescription_table = PricingPrescription.__table__
 provider_prescription_table = PricingProviderPrescription.__table__
 code_catalog_table = CodeCatalog.__table__
 code_crosswalk_table = CodeCrosswalk.__table__
+geo_zip_table = GeoZipLookup.__table__
+
+QUALITY_SCORE_TABLE_NAME = "pricing_provider_quality_score"
+QUALITY_DOMAIN_TABLE_NAME = "pricing_provider_quality_domain"
+QUALITY_PEER_TARGET_TABLE_NAME = "pricing_provider_quality_peer_target"
+QUALITY_QPP_TABLE_NAME = "pricing_qpp_provider"
+QUALITY_SVI_TABLE_NAME = "pricing_svi_zcta"
 
 
 MAX_LIMIT = 200
 INTERNAL_CODE_SYSTEM = "HP_PROCEDURE_CODE"
 INTERNAL_RX_CODE_SYSTEM = "HP_RX_CODE"
+PROCEDURE_OVERRIDE_CODE_SYSTEMS = (INTERNAL_CODE_SYSTEM, "CPT", "HCPCS")
 RX_EXTERNAL_CODE_PRIORITY = ("NDC", "RXNORM")
 MAX_CODE_EXPANSION_HOPS = max(int(os.getenv("HLTHPRT_MAX_CODE_EXPANSION_HOPS", "4")), 1)
 INT_PATTERN = re.compile(r"^-?\d+$")
 FIVE_DIGIT_CODE_PATTERN = re.compile(r"^\d{5}$")
+PROCEDURE_MATCH_THRESHOLD_DEFAULT = 0.30
+SCORE_VARIANTS_SCOPE_PROVIDER = "provider"
+SCORE_VARIANTS_SCOPE_VALUES = (SCORE_VARIANTS_SCOPE_PROVIDER,)
+PROVIDER_QUALITY_MODEL_VERSION = str(os.getenv("HLTHPRT_PROVIDER_QUALITY_MODEL_VERSION", "v2")).strip() or "v2"
+PROVIDER_QUALITY_SHRINKAGE_ALPHA = max(float(os.getenv("HLTHPRT_PROVIDER_QUALITY_SHRINKAGE_ALPHA", "100.0")), 1.0)
+PROVIDER_QUALITY_DEFAULT_SVI = min(
+    max(float(os.getenv("HLTHPRT_PROVIDER_QUALITY_DEFAULT_SVI", "0.5")), 0.0),
+    1.0,
+)
 
 
 def _parse_pricing_default_year() -> int | None:
@@ -61,10 +82,52 @@ def _parse_pricing_default_year() -> int | None:
 
 PRICING_DEFAULT_YEAR = _parse_pricing_default_year()
 PRICING_SCHEMA = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
+quality_score_table = Table(
+    QUALITY_SCORE_TABLE_NAME,
+    MetaData(),
+    Column("npi", Integer),
+    Column("year", Integer),
+    Column("benchmark_mode", String),
+    Column("tier", String),
+    Column("score_0_100", Float),
+    schema=PRICING_SCHEMA,
+)
+QUALITY_BENCHMARK_MODE_ORDER = ("zip", "state", "national")
 PROCEDURE_COST_PROFILE_MIN_CLAIMS = max(int(os.getenv("HLTHPRT_COST_LEVEL_CONFIDENCE_LOW_LT", "11")), 1)
 PROCEDURE_COST_PROFILE_MEDIUM_CLAIMS = max(
     int(os.getenv("HLTHPRT_COST_LEVEL_CONFIDENCE_MEDIUM_LT", "51")),
     PROCEDURE_COST_PROFILE_MIN_CLAIMS + 1,
+)
+PROCEDURE_ZIP_FALLBACK_STEPS_MILES = (10.0, 20.0, 30.0)
+PROCEDURE_ZIP_MAX_RADIUS_MILES = max(
+    float(os.getenv("HLTHPRT_PRICING_PROCEDURE_ZIP_MAX_RADIUS_MILES", "50")),
+    max(PROCEDURE_ZIP_FALLBACK_STEPS_MILES),
+)
+PROCEDURE_COST_LEVEL_ZIP_RADIUS_DEFAULT_MILES = min(
+    max(float(os.getenv("HLTHPRT_PRICING_PROCEDURE_COST_ZIP_RADIUS_DEFAULT_MILES", "30")), 0.0),
+    PROCEDURE_ZIP_MAX_RADIUS_MILES,
+)
+PROCEDURE_SEARCH_ZIP_RADIUS_DEFAULT_MILES = min(
+    max(float(os.getenv("HLTHPRT_PRICING_PROCEDURE_SEARCH_ZIP_RADIUS_DEFAULT_MILES", "0")), 0.0),
+    PROCEDURE_ZIP_MAX_RADIUS_MILES,
+)
+PROCEDURE_COST_COHORT_STRATEGY_PRECOMPUTED = "precomputed"
+PROCEDURE_COST_COHORT_STRATEGY_NEAR_DYNAMIC = "near_dynamic"
+PROCEDURE_COST_COHORT_STRATEGY_VALUES = (
+    PROCEDURE_COST_COHORT_STRATEGY_PRECOMPUTED,
+    PROCEDURE_COST_COHORT_STRATEGY_NEAR_DYNAMIC,
+)
+PROCEDURE_COST_DYNAMIC_MIN_PEER_CLAIMS = max(
+    int(os.getenv("HLTHPRT_COST_LEVEL_MIN_PEER_CLAIMS", str(PROCEDURE_COST_PROFILE_MIN_CLAIMS))),
+    1,
+)
+PROCEDURE_COST_DYNAMIC_MIN_PEER_PROVIDERS = max(
+    int(os.getenv("HLTHPRT_COST_LEVEL_MIN_PEER_PROVIDERS", "10")),
+    2,
+)
+PROCEDURE_COST_DYNAMIC_IQR_FACTOR = max(
+    float(os.getenv("HLTHPRT_COST_LEVEL_OUTLIER_IQR_FACTOR", "1.5")),
+    0.0,
 )
 
 
@@ -311,6 +374,237 @@ def _parse_float(raw: Any, param: str, minimum: float | None = None) -> float | 
     return value
 
 
+def _normalize_zip5(raw: Any) -> str | None:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if len(digits) < 5:
+        return None
+    return digits[:5]
+
+
+def _parse_zip_radius_miles(raw: Any, *, param: str, default: float) -> float:
+    if raw in (None, "", "null"):
+        value = default
+    else:
+        try:
+            value = float(str(raw).strip())
+        except (TypeError, ValueError) as exc:
+            raise InvalidUsage(f"Parameter '{param}' must be numeric") from exc
+    if value < 0:
+        raise InvalidUsage(f"Parameter '{param}' must be >= 0")
+    return min(value, PROCEDURE_ZIP_MAX_RADIUS_MILES)
+
+
+def _distance_miles_expression(anchor_lat: float, anchor_long: float):
+    return (
+        69.0
+        * func.sqrt(
+            func.pow(geo_zip_table.c.latitude - anchor_lat, 2)
+            + func.pow(
+                (geo_zip_table.c.longitude - anchor_long)
+                * func.cos(func.radians((geo_zip_table.c.latitude + anchor_lat) / 2.0)),
+                2,
+            )
+        )
+    )
+
+
+def _distance_bucket(distance_miles: float | None) -> str | None:
+    if distance_miles is None:
+        return None
+    if distance_miles <= 0.001:
+        return "zip_exact"
+    for step in PROCEDURE_ZIP_FALLBACK_STEPS_MILES:
+        if distance_miles <= step + 1e-6:
+            return f"within_{int(step)}mi"
+    return f"within_{int(PROCEDURE_ZIP_MAX_RADIUS_MILES)}mi_plus"
+
+
+async def _lookup_zip_context(session, zip5: str | None) -> dict[str, Any] | None:
+    normalized_zip = _normalize_zip5(zip5)
+    if not normalized_zip:
+        return None
+    lookup_result = await session.execute(
+        select(
+            geo_zip_table.c.zip_code.label("zip5"),
+            geo_zip_table.c.state.label("state"),
+            geo_zip_table.c.city_lower.label("city_lower"),
+            geo_zip_table.c.latitude.label("latitude"),
+            geo_zip_table.c.longitude.label("longitude"),
+        )
+        .where(geo_zip_table.c.zip_code == normalized_zip)
+        .limit(1)
+    )
+    row = lookup_result.first()
+    if row is None:
+        return None
+    payload = _row_to_dict(row)
+    payload["zip5"] = _normalize_zip5(payload.get("zip5")) or normalized_zip
+    payload["state"] = str(payload.get("state") or "").strip().upper() or None
+    payload["city_lower"] = str(payload.get("city_lower") or "").strip().lower() or None
+    payload["latitude"] = _as_float(payload.get("latitude"))
+    payload["longitude"] = _as_float(payload.get("longitude"))
+    return payload
+
+
+async def _zip_radius_rows(
+    session,
+    *,
+    zip5: str | None,
+    radius_miles: float,
+    state_hint: str | None = None,
+    anchor_context: dict[str, Any] | None = None,
+    limit: int = 512,
+) -> list[dict[str, Any]]:
+    normalized_zip = _normalize_zip5(zip5)
+    if not normalized_zip:
+        return []
+
+    anchor = anchor_context
+    if anchor is not None:
+        anchor_zip = _normalize_zip5(anchor.get("zip5"))
+        if anchor_zip != normalized_zip:
+            anchor = None
+    if anchor is None:
+        anchor = await _lookup_zip_context(session, normalized_zip)
+    state_hint_normalized = str(state_hint or "").strip().upper() or None
+    if anchor is None:
+        return [
+            {
+                "zip5": normalized_zip,
+                "state": state_hint_normalized,
+                "city_lower": None,
+                "distance_miles": 0.0,
+                "is_anchor": True,
+            }
+        ]
+
+    anchor_lat = _as_float(anchor.get("latitude"))
+    anchor_long = _as_float(anchor.get("longitude"))
+    anchor_state = str(anchor.get("state") or "").strip().upper() or None
+    state_filter = state_hint_normalized or anchor_state
+    if anchor_lat is None or anchor_long is None:
+        return [
+            {
+                "zip5": normalized_zip,
+                "state": state_filter,
+                "city_lower": anchor.get("city_lower"),
+                "distance_miles": 0.0,
+                "is_anchor": True,
+            }
+        ]
+
+    distance_expr = _distance_miles_expression(anchor_lat, anchor_long).label("distance_miles")
+    filters = [
+        geo_zip_table.c.latitude.isnot(None),
+        geo_zip_table.c.longitude.isnot(None),
+        distance_expr <= max(radius_miles, 0.0),
+    ]
+    if state_filter:
+        filters.append(geo_zip_table.c.state == state_filter)
+
+    result = await session.execute(
+        select(
+            geo_zip_table.c.zip_code.label("zip5"),
+            geo_zip_table.c.state.label("state"),
+            geo_zip_table.c.city_lower.label("city_lower"),
+            distance_expr,
+        )
+        .where(and_(*filters))
+        .order_by(distance_expr.asc(), geo_zip_table.c.zip_code.asc())
+        .limit(limit)
+    )
+
+    seen: set[str] = set()
+    rows: list[dict[str, Any]] = []
+    for row in result:
+        payload = _row_to_dict(row)
+        candidate_zip = _normalize_zip5(payload.get("zip5"))
+        if candidate_zip is None or candidate_zip in seen:
+            continue
+        seen.add(candidate_zip)
+        distance_value = _as_float(payload.get("distance_miles"))
+        rows.append(
+            {
+                "zip5": candidate_zip,
+                "state": str(payload.get("state") or "").strip().upper() or None,
+                "city_lower": str(payload.get("city_lower") or "").strip().lower() or None,
+                "distance_miles": distance_value,
+                "is_anchor": candidate_zip == normalized_zip,
+            }
+        )
+
+    if normalized_zip not in seen:
+        rows.insert(
+            0,
+            {
+                "zip5": normalized_zip,
+                "state": state_filter,
+                "city_lower": anchor.get("city_lower"),
+                "distance_miles": 0.0,
+                "is_anchor": True,
+            },
+        )
+    return rows
+
+
+def _zip_ring_candidates(
+    zip_rows: list[dict[str, Any]],
+    *,
+    anchor_zip5: str | None,
+    radius_miles: float,
+) -> tuple[list[str], dict[str, dict[str, Any]]]:
+    if not zip_rows:
+        return [], {}
+
+    normalized_anchor = _normalize_zip5(anchor_zip5)
+    ordered_rows = sorted(
+        zip_rows,
+        key=lambda item: (_as_float(item.get("distance_miles")) or 0.0, str(item.get("zip5") or "")),
+    )
+
+    steps = [step for step in PROCEDURE_ZIP_FALLBACK_STEPS_MILES if step <= radius_miles + 1e-6]
+    if not steps and radius_miles > 0:
+        steps = [radius_miles]
+    elif steps and steps[-1] < radius_miles:
+        steps.append(radius_miles)
+
+    ordered_zips: list[str] = []
+    metadata: dict[str, dict[str, Any]] = {}
+    seen: set[str] = set()
+
+    if normalized_anchor:
+        seen.add(normalized_anchor)
+        ordered_zips.append(normalized_anchor)
+        metadata[normalized_anchor] = {
+            "distance_miles": 0.0,
+            "distance_bucket": "zip_exact",
+            "selected_radius_miles": 0.0,
+            "is_anchor": True,
+        }
+
+    for step in steps:
+        for row in ordered_rows:
+            candidate_zip = _normalize_zip5(row.get("zip5"))
+            if candidate_zip is None or candidate_zip in seen:
+                continue
+            distance_value = _as_float(row.get("distance_miles"))
+            if distance_value is None or distance_value > step + 1e-6:
+                continue
+            seen.add(candidate_zip)
+            ordered_zips.append(candidate_zip)
+            metadata[candidate_zip] = {
+                "distance_miles": distance_value,
+                "distance_bucket": _distance_bucket(distance_value),
+                "selected_radius_miles": float(step),
+                "is_anchor": bool(row.get("is_anchor")),
+            }
+
+    return ordered_zips, metadata
+
+
 def _as_float(value: Any) -> float | None:
     if value is None:
         return None
@@ -336,6 +630,14 @@ def _parse_bool(raw: Any, param: str, default: bool = False) -> bool:
 def _normalize_code_system(raw: Any) -> str:
     text = str(raw or INTERNAL_CODE_SYSTEM).strip().upper()
     return text or INTERNAL_CODE_SYSTEM
+
+
+def _parse_procedure_override_code_system(raw: Any, param_name: str = "procedure_code_system") -> str:
+    system = _normalize_code_system(raw or INTERNAL_CODE_SYSTEM)
+    if system not in PROCEDURE_OVERRIDE_CODE_SYSTEMS:
+        allowed = ", ".join(PROCEDURE_OVERRIDE_CODE_SYSTEMS)
+        raise InvalidUsage(f"Parameter '{param_name}' must be one of: {allowed}")
+    return system
 
 
 def _normalize_code(raw: Any, param: str = "code") -> str:
@@ -393,14 +695,221 @@ def _confidence_label_from_claim_count(claim_count: float | None) -> str:
     return "high"
 
 
+def _percentile_cont(values: list[float], percentile: float) -> float | None:
+    if not values:
+        return None
+    if len(values) == 1:
+        return float(values[0])
+    p = min(max(float(percentile), 0.0), 1.0)
+    rank = (len(values) - 1) * p
+    lower_idx = int(math.floor(rank))
+    upper_idx = int(math.ceil(rank))
+    if lower_idx == upper_idx:
+        return float(values[lower_idx])
+    fraction = rank - lower_idx
+    return float(values[lower_idx] + (values[upper_idx] - values[lower_idx]) * fraction)
+
+
+def _trim_charge_rows_log_iqr(
+    rows: list[dict[str, Any]],
+    *,
+    iqr_factor: float,
+) -> list[dict[str, Any]]:
+    if len(rows) < 4:
+        return rows
+    charge_logs = sorted(
+        math.log(max(_as_float(row.get("avg_submitted_charge")) or 0.0, 1e-9))
+        for row in rows
+        if (_as_float(row.get("avg_submitted_charge")) or 0.0) > 0
+    )
+    if len(charge_logs) < 4:
+        return rows
+    q1 = _percentile_cont(charge_logs, 0.25)
+    q3 = _percentile_cont(charge_logs, 0.75)
+    if q1 is None or q3 is None or q3 <= q1:
+        return rows
+    spread = q3 - q1
+    lower_bound = q1 - iqr_factor * spread
+    upper_bound = q3 + iqr_factor * spread
+
+    trimmed: list[dict[str, Any]] = []
+    for row in rows:
+        charge = _as_float(row.get("avg_submitted_charge"))
+        if charge is None or charge <= 0:
+            continue
+        charge_ln = math.log(max(charge, 1e-9))
+        if lower_bound <= charge_ln <= upper_bound:
+            trimmed.append(row)
+    return trimmed or rows
+
+
+async def _build_dynamic_zip_peer_stats(
+    session,
+    *,
+    year: int,
+    procedure_code: int,
+    setting_key: str,
+    specialty_candidates: list[str],
+    zip_candidates: list[str],
+    min_claims: int,
+    min_providers: int,
+    iqr_factor: float,
+) -> tuple[dict[str, Any], str] | None:
+    if not zip_candidates:
+        return None
+
+    for specialty_candidate in specialty_candidates:
+        filters = [
+            provider_procedure_cost_profile_table.c.year == year,
+            provider_procedure_cost_profile_table.c.procedure_code == procedure_code,
+            provider_procedure_cost_profile_table.c.setting_key == setting_key,
+            provider_procedure_cost_profile_table.c.geography_scope == "zip5",
+            provider_procedure_cost_profile_table.c.geography_value.in_(zip_candidates),
+            provider_procedure_cost_profile_table.c.claim_count >= min_claims,
+            provider_procedure_cost_profile_table.c.avg_submitted_charge > 0,
+        ]
+        if specialty_candidate != "__all__":
+            filters.append(provider_procedure_cost_profile_table.c.specialty_key == specialty_candidate)
+
+        candidate_result = await session.execute(
+            select(
+                provider_procedure_cost_profile_table.c.npi,
+                provider_procedure_cost_profile_table.c.claim_count,
+                provider_procedure_cost_profile_table.c.avg_submitted_charge,
+                provider_procedure_cost_profile_table.c.geography_value,
+            ).where(and_(*filters))
+        )
+        candidate_rows = [_row_to_dict(row) for row in candidate_result]
+        if len(candidate_rows) < min_providers:
+            continue
+
+        trimmed_rows = _trim_charge_rows_log_iqr(candidate_rows, iqr_factor=iqr_factor)
+        if len(trimmed_rows) < min_providers:
+            continue
+
+        charges = sorted(
+            float(_as_float(row.get("avg_submitted_charge")) or 0.0)
+            for row in trimmed_rows
+            if (_as_float(row.get("avg_submitted_charge")) or 0.0) > 0
+        )
+        if len(charges) < min_providers:
+            continue
+        claim_counts = [float(_as_float(row.get("claim_count")) or 0.0) for row in trimmed_rows]
+
+        peer_payload = {
+            "provider_count": len(trimmed_rows),
+            "min_claim_count": min(claim_counts) if claim_counts else None,
+            "max_claim_count": max(claim_counts) if claim_counts else None,
+            "p10": _percentile_cont(charges, 0.10),
+            "p20": _percentile_cont(charges, 0.20),
+            "p40": _percentile_cont(charges, 0.40),
+            "p50": _percentile_cont(charges, 0.50),
+            "p60": _percentile_cont(charges, 0.60),
+            "p80": _percentile_cont(charges, 0.80),
+            "p90": _percentile_cont(charges, 0.90),
+            "specialty_key": specialty_candidate,
+        }
+        return peer_payload, specialty_candidate
+    return None
+
+
 def _parse_setting_key(raw: Any) -> str:
     value = str(raw or "all").strip().lower()
     return value or "all"
 
 
+def _parse_procedure_cost_cohort_strategy(raw: Any) -> str:
+    value = str(raw or "").strip().lower()
+    if not value:
+        return PROCEDURE_COST_COHORT_STRATEGY_PRECOMPUTED
+    if value in {"default", "static"}:
+        return PROCEDURE_COST_COHORT_STRATEGY_PRECOMPUTED
+    if value not in PROCEDURE_COST_COHORT_STRATEGY_VALUES:
+        allowed = ", ".join(PROCEDURE_COST_COHORT_STRATEGY_VALUES)
+        raise InvalidUsage(f"Parameter 'cohort_strategy' must be one of: {allowed}")
+    return value
+
+
 def _parse_specialty_key(raw: Any) -> str | None:
     text = str(raw or "").strip().lower()
     return text or None
+
+
+def _cohort_type_from_scope(scope: str | None) -> str:
+    scope_key = str(scope or "").strip().lower()
+    if scope_key == "zip5":
+        return "zip"
+    if scope_key in {"zip_radius", "state_city", "state", "national"}:
+        return scope_key
+    return scope_key or "unknown"
+
+
+def _specialty_scope_label(specialty_key: str | None) -> str:
+    key = str(specialty_key or "").strip().lower()
+    if key == "__all__":
+        return "all_specialties"
+    return "specialty_specific"
+
+
+def _parse_score_variants_scope(raw: Any, param_name: str = "variants_scope") -> str | None:
+    text = str(raw or "").strip().lower()
+    if not text:
+        return None
+    if text not in SCORE_VARIANTS_SCOPE_VALUES:
+        allowed = ", ".join(SCORE_VARIANTS_SCOPE_VALUES)
+        raise InvalidUsage(f"Parameter '{param_name}' must be one of: {allowed}")
+    return text
+
+
+def _validate_removed_variants_param(raw: Any, param_name: str = "variants") -> None:
+    text = str(raw or "").strip().lower()
+    if not text:
+        return
+    raise InvalidUsage(
+        f"Parameter '{param_name}' is no longer supported; use 'variants_scope=provider'."
+    )
+
+
+def _parse_probability_clamped(raw: Any, param: str, default: float) -> float:
+    if raw in (None, "", "null"):
+        value = default
+    else:
+        try:
+            value = float(str(raw).strip())
+        except (TypeError, ValueError) as exc:
+            raise InvalidUsage(f"Parameter '{param}' must be numeric") from exc
+    return min(1.0, max(0.0, value))
+
+
+def _extract_query_values(args, key: str) -> list[Any]:
+    if hasattr(args, "getlist"):
+        values = list(args.getlist(key))
+        if values:
+            return values
+    raw = args.get(key)
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple, set)):
+        return list(raw)
+    return [raw]
+
+
+def _parse_code_list_query_param(args, key: str) -> list[str]:
+    values = _extract_query_values(args, key)
+    parsed: list[str] = []
+    for raw_value in values:
+        for token in str(raw_value or "").split(","):
+            normalized = str(token).strip().upper()
+            if normalized:
+                parsed.append(normalized)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for token in parsed:
+        if token in seen:
+            continue
+        seen.add(token)
+        deduped.append(token)
+    return deduped
 
 
 def _geography_candidates(
@@ -412,7 +921,7 @@ def _geography_candidates(
     candidates: list[tuple[str, str]] = []
     state = str(state_raw or "").strip().upper()
     city = str(city_raw or "").strip().lower()
-    zip5 = str(zip5_raw or "").strip()
+    zip5 = _normalize_zip5(zip5_raw) or ""
 
     if zip5:
         candidates.append(("zip5", zip5))
@@ -692,6 +1201,1212 @@ async def _resolve_year(session, table, requested_year: int | None) -> tuple[int
 async def _table_exists(session, table_name: str) -> bool:
     result = await session.execute(select(func.to_regclass(f"{PRICING_SCHEMA}.{table_name}")))
     return bool(result.scalar())
+
+
+def _as_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    text_value = str(value).strip().lower()
+    if text_value in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text_value in {"0", "false", "no", "n", "off"}:
+        return False
+    return None
+
+
+def _ci_payload(low: Any, high: Any) -> dict[str, float | None]:
+    return {
+        "low": _as_float(low),
+        "high": _as_float(high),
+    }
+
+
+async def _resolve_quality_year(session, requested_year: int | None) -> tuple[int, str]:
+    if requested_year is not None:
+        return requested_year, "request"
+    if PRICING_DEFAULT_YEAR is not None:
+        return PRICING_DEFAULT_YEAR, "env"
+    result = await session.execute(
+        text(f"SELECT MAX(year) FROM {PRICING_SCHEMA}.{QUALITY_SCORE_TABLE_NAME}")
+    )
+    year = result.scalar()
+    if year is None:
+        raise sanic.exceptions.NotFound("No provider quality score data available")
+    return int(year), "data_max"
+
+
+def _parse_benchmark_mode(raw_value: Any, param_name: str = "benchmark_mode") -> str | None:
+    if raw_value is None:
+        return None
+    value = str(raw_value).strip().lower()
+    if not value:
+        return None
+    if value not in QUALITY_BENCHMARK_MODE_ORDER:
+        allowed = ", ".join(QUALITY_BENCHMARK_MODE_ORDER)
+        raise InvalidUsage(f"Parameter '{param_name}' must be one of: {allowed}")
+    return value
+
+
+async def _resolve_quality_benchmark_mode(
+    session,
+    year: int,
+    requested_mode: str | None,
+) -> tuple[str, str]:
+    if requested_mode in QUALITY_BENCHMARK_MODE_ORDER:
+        return requested_mode, "request"
+    result = await session.execute(
+        text(
+            f"""
+            SELECT benchmark_mode
+            FROM {PRICING_SCHEMA}.{QUALITY_SCORE_TABLE_NAME}
+            WHERE year = :year
+            GROUP BY benchmark_mode
+            ORDER BY CASE benchmark_mode
+                WHEN 'zip' THEN 0
+                WHEN 'state' THEN 1
+                WHEN 'national' THEN 2
+                ELSE 3
+            END ASC
+            LIMIT 1
+            """
+        ),
+        {"year": year},
+    )
+    mode = str(result.scalar() or "").strip().lower()
+    if mode in QUALITY_BENCHMARK_MODE_ORDER:
+        return mode, "data_priority"
+    return "national", "default"
+
+
+def _empty_domain_payload() -> dict[str, Any]:
+    return {
+        "risk_ratio_point": None,
+        "score_0_100": None,
+        "evidence_n": None,
+        "ci_75": {"low": None, "high": None},
+        "ci_90": {"low": None, "high": None},
+    }
+
+
+def _empty_domains_payload() -> dict[str, dict[str, Any]]:
+    return {
+        "appropriateness": _empty_domain_payload(),
+        "effectiveness": _empty_domain_payload(),
+        "cost": _empty_domain_payload(),
+    }
+
+
+def _build_quality_mode_payload(
+    score_data: dict[str, Any],
+    domains_payload: dict[str, Any],
+    cohort_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = {
+        "model_version": str(score_data.get("model_version") or "v2"),
+        "benchmark_mode": score_data.get("benchmark_mode"),
+        "tier": score_data.get("tier"),
+        "borderline_status": _as_bool(score_data.get("borderline_status")),
+        "score_0_100": _as_float(score_data.get("score_0_100")),
+        "estimated_cost_level": score_data.get("estimated_cost_level"),
+        "overall": {
+            "risk_ratio_point": _as_float(score_data.get("risk_ratio_point")),
+            "ci_75": _ci_payload(score_data.get("ci75_low"), score_data.get("ci75_high")),
+            "ci_90": _ci_payload(score_data.get("ci90_low"), score_data.get("ci90_high")),
+        },
+        "domains": domains_payload,
+        "curation_checks": {
+            "low_score_threshold_failed": bool(score_data.get("low_score_threshold_failed")),
+            "low_confidence_threshold_failed": bool(score_data.get("low_confidence_threshold_failed")),
+            "high_score_threshold_passed": bool(score_data.get("high_score_threshold_passed")),
+            "high_confidence_threshold_passed": bool(score_data.get("high_confidence_threshold_passed")),
+        },
+    }
+    if cohort_context is not None:
+        payload["cohort_context"] = cohort_context
+    return payload
+
+
+def _as_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _lowercase_keys(payload: dict[str, Any]) -> dict[str, Any]:
+    return {str(key).lower(): value for key, value in payload.items()}
+
+
+def _pick_first_from_lowered(payload_lower: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = payload_lower.get(key.lower())
+        if value is not None:
+            return value
+    return None
+
+
+def _normalize_cohort_level(raw: Any) -> str | None:
+    text = str(raw or "").strip().upper()
+    if not text:
+        return None
+    if text in {"L0", "L1", "L2", "L3"}:
+        return text
+    if text in {"0", "1", "2", "3"}:
+        return f"L{text}"
+    return None
+
+
+def _cohort_context_from_score_row(
+    score_data: dict[str, Any],
+    *,
+    computed_live: bool,
+    procedure_match_threshold: float | None = None,
+) -> dict[str, Any] | None:
+    context_raw = score_data.get("cohort_context")
+    context: dict[str, Any]
+    if isinstance(context_raw, dict):
+        context = dict(context_raw)
+    else:
+        context = {
+            "selected_geography": score_data.get("selected_geography"),
+            "selected_cohort_level": score_data.get("selected_cohort_level"),
+            "peer_count": score_data.get("peer_count"),
+            "specialty_key": score_data.get("specialty_key"),
+            "taxonomy_code": score_data.get("taxonomy_code"),
+            "procedure_bucket": score_data.get("procedure_bucket"),
+            "procedure_match_threshold": score_data.get("procedure_match_threshold"),
+        }
+        if not any(value is not None for value in context.values()):
+            return None
+
+    threshold_value = _as_float(context.get("procedure_match_threshold"))
+    if threshold_value is None and procedure_match_threshold is not None:
+        threshold_value = procedure_match_threshold
+    if threshold_value is not None:
+        context["procedure_match_threshold"] = min(1.0, max(0.0, float(threshold_value)))
+
+    context["selected_geography"] = context.get("selected_geography")
+    context["selected_cohort_level"] = _normalize_cohort_level(context.get("selected_cohort_level"))
+    context["peer_count"] = _as_int(context.get("peer_count"))
+    context["specialty_key"] = _parse_specialty_key(context.get("specialty_key"))
+    taxonomy_code = context.get("taxonomy_code")
+    context["taxonomy_code"] = str(taxonomy_code).strip().upper() if taxonomy_code not in (None, "") else None
+    procedure_bucket = context.get("procedure_bucket")
+    context["procedure_bucket"] = str(procedure_bucket).strip() if procedure_bucket not in (None, "") else None
+    context["computed_live"] = bool(computed_live)
+    return context
+
+
+def _parse_token_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+
+    token_source: list[Any] = []
+    if isinstance(value, (list, tuple, set)):
+        token_source = list(value)
+    elif isinstance(value, str):
+        raw_text = value.strip()
+        if not raw_text:
+            return []
+        parsed_json: Any = None
+        if raw_text.startswith("[") and raw_text.endswith("]"):
+            try:
+                parsed_json = json.loads(raw_text)
+            except json.JSONDecodeError:
+                parsed_json = None
+        if isinstance(parsed_json, list):
+            token_source = list(parsed_json)
+        else:
+            token_source = re.split(r"[,\s|;]+", raw_text)
+    else:
+        token_source = [value]
+
+    normalized_tokens: list[str] = []
+    for item in token_source:
+        token = str(item or "").strip().upper()
+        if not token:
+            continue
+        if INT_PATTERN.fullmatch(token):
+            normalized_tokens.append(str(int(token)))
+        else:
+            normalized_tokens.append(token)
+    return normalized_tokens
+
+
+def _normalize_peer_geography_scope(raw: Any) -> str | None:
+    text = str(raw or "").strip().lower()
+    if text in {"zip", "zip5", "zip_code", "zipcode", "postal", "postal_code", "zip_ring"}:
+        return "zip"
+    if text in {"state", "state_key", "region", "province"}:
+        return "state"
+    if text in {"national", "country", "us", "usa", "all"}:
+        return "national"
+    return text or None
+
+
+def _extract_peer_target_geography(payload_lower: dict[str, Any]) -> tuple[str | None, str | None, str | None]:
+    selected_geography = _pick_first_from_lowered(payload_lower, "selected_geography")
+    selected_geography_text = str(selected_geography or "").strip()
+    if selected_geography_text:
+        if ":" in selected_geography_text:
+            prefix, suffix = selected_geography_text.split(":", 1)
+            scope = _normalize_peer_geography_scope(prefix)
+            value = str(suffix or "").strip() or None
+            if scope == "national":
+                return "national", "US", "national"
+            if scope is not None:
+                return scope, value, selected_geography_text
+        selected_scope = _normalize_peer_geography_scope(selected_geography_text)
+        if selected_scope == "national":
+            return "national", "US", "national"
+
+    scope = _normalize_peer_geography_scope(
+        _pick_first_from_lowered(
+            payload_lower,
+            "geography_scope",
+            "geography_level",
+            "geography_type",
+            "geo_scope",
+            "scope",
+        )
+    )
+    value_raw = _pick_first_from_lowered(
+        payload_lower,
+        "geography_value",
+        "geography_key",
+        "geo_value",
+        "zip5",
+        "zipcode",
+        "zip",
+        "state_key",
+        "state",
+    )
+    value_text = str(value_raw or "").strip() or None
+
+    if scope is None and value_text is not None:
+        value_upper = value_text.upper()
+        if value_upper in {"US", "USA", "NATIONAL", "ALL", "*"}:
+            scope = "national"
+        elif len(value_upper) == 2 and value_upper.isalpha():
+            scope = "state"
+        elif len(value_upper) >= 5 and value_upper[:5].isdigit():
+            scope = "zip"
+
+    if scope == "national":
+        return "national", "US", "national"
+    if scope is None:
+        return None, value_text, selected_geography_text or None
+    return scope, value_text, selected_geography_text or (f"{scope}:{value_text}" if value_text else None)
+
+
+def _geography_priority_for_benchmark_mode(
+    benchmark_mode: str,
+    *,
+    state_key: str | None,
+    zip5: str | None,
+) -> list[tuple[str, str]]:
+    candidates: list[tuple[str, str]] = []
+    if benchmark_mode == "zip" and zip5:
+        candidates.append(("zip", zip5))
+    if benchmark_mode in {"zip", "state"} and state_key:
+        candidates.append(("state", state_key))
+    candidates.append(("national", "US"))
+
+    deduped: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for scope, value in candidates:
+        item = (scope, str(value).strip())
+        if item in seen:
+            continue
+        seen.add(item)
+        deduped.append(item)
+    return deduped
+
+
+def _row_matches_geography(
+    row_scope: str | None,
+    row_value: str | None,
+    target_scope: str,
+    target_value: str,
+) -> bool:
+    row_scope = _normalize_peer_geography_scope(row_scope)
+    row_value_text = str(row_value or "").strip().upper()
+    target_value_text = str(target_value or "").strip().upper()
+
+    if target_scope == "national":
+        if row_scope in {None, "national"}:
+            return True
+        return row_value_text in {"US", "USA", "NATIONAL", "ALL", "*"}
+
+    if row_scope != target_scope:
+        return False
+    if not target_value_text:
+        return True
+
+    if target_scope == "zip":
+        return row_value_text[:5] == target_value_text[:5]
+    if target_scope == "state":
+        return (
+            row_value_text == target_value_text
+            or row_value_text.startswith(f"{target_value_text}|")
+            or row_value_text.startswith(f"{target_value_text}:")
+        )
+    return row_value_text == target_value_text
+
+
+def _value_matches_or_generic(row_value: Any, requested_value: str | None, *, upper: bool) -> bool:
+    if requested_value is None:
+        return True
+    text = str(row_value or "").strip()
+    if not text:
+        return True
+    normalized = text.upper() if upper else text.lower()
+    generic_values = {"__all__", "all", "any", "*", "n/a", "na", "none", "null"}
+    if normalized.lower() in generic_values:
+        return True
+    request_normalized = requested_value.upper() if upper else requested_value.lower()
+    return normalized == request_normalized
+
+
+def _procedure_match_ratio(payload_lower: dict[str, Any], requested_procedure_codes: set[str]) -> tuple[float, str | None]:
+    bucket_raw = _pick_first_from_lowered(
+        payload_lower,
+        "procedure_bucket",
+        "procedure_codes",
+        "procedure_code_list",
+        "procedure_codes_csv",
+        "procedure_code_set",
+    )
+    bucket_tokens = set(_parse_token_list(bucket_raw))
+    bucket_display = str(bucket_raw).strip() if bucket_raw not in (None, "") else None
+    if not requested_procedure_codes:
+        return 1.0, bucket_display
+    if not bucket_tokens:
+        return 1.0, bucket_display
+    overlap = requested_procedure_codes.intersection(bucket_tokens)
+    ratio = len(overlap) / max(len(requested_procedure_codes), 1)
+    return ratio, bucket_display
+
+
+def _peer_count_from_row(payload_lower: dict[str, Any]) -> int:
+    peer_count = _pick_first_from_lowered(payload_lower, "peer_count", "peer_n", "peer_size", "n_peers")
+    return _as_int(peer_count) or 0
+
+
+def _cohort_level_rank(cohort_level: str | None) -> int:
+    normalized = _normalize_cohort_level(cohort_level) or "L3"
+    return int(normalized[-1])
+
+
+def _peer_target_sort_key(item: dict[str, Any]) -> tuple[int, int, float, float]:
+    return (
+        int(item["geography_rank"]),
+        int(item["cohort_rank"]),
+        -float(item["peer_count"]),
+        -float(item["procedure_match_ratio"]),
+    )
+
+
+def _get_cached_lowercase_payload(row: dict[str, Any]) -> dict[str, Any]:
+    cached = row.get("__payload_lower")
+    if isinstance(cached, dict):
+        return cached
+    source = row
+    nested_row_data = row.get("row_data")
+    if isinstance(nested_row_data, dict):
+        source = nested_row_data
+    payload_lower = _lowercase_keys(source)
+    row["__payload_lower"] = payload_lower
+    return payload_lower
+
+
+def _collect_peer_target_candidates(
+    rows: list[dict[str, Any]],
+    *,
+    benchmark_mode: str,
+    state_key: str | None,
+    zip5: str | None,
+    specialty_key: str | None,
+    taxonomy_code: str | None,
+    requested_procedure_codes: set[str],
+) -> list[dict[str, Any]]:
+    geography_priority = _geography_priority_for_benchmark_mode(
+        benchmark_mode,
+        state_key=state_key,
+        zip5=zip5,
+    )
+    candidates: list[dict[str, Any]] = []
+
+    for row in rows:
+        payload_lower = _get_cached_lowercase_payload(row)
+        row_mode = str(_pick_first_from_lowered(payload_lower, "benchmark_mode", "mode") or "").strip().lower()
+        if row_mode and row_mode in QUALITY_BENCHMARK_MODE_ORDER and row_mode != benchmark_mode:
+            continue
+
+        row_scope, row_value, row_geography_label = _extract_peer_target_geography(payload_lower)
+        geography_rank = None
+        matched_geography_scope = None
+        matched_geography_value = None
+        for index, (target_scope, target_value) in enumerate(geography_priority):
+            if _row_matches_geography(row_scope, row_value, target_scope, target_value):
+                geography_rank = index
+                matched_geography_scope = target_scope
+                matched_geography_value = target_value
+                break
+        if geography_rank is None:
+            continue
+
+        cohort_level = _normalize_cohort_level(
+            _pick_first_from_lowered(payload_lower, "cohort_level", "cohort_tier", "cohort", "level")
+        ) or "L3"
+        specialty_match = _value_matches_or_generic(
+            _pick_first_from_lowered(payload_lower, "specialty_key", "specialty"),
+            specialty_key,
+            upper=False,
+        )
+        taxonomy_match = _value_matches_or_generic(
+            _pick_first_from_lowered(payload_lower, "taxonomy_code", "taxonomy"),
+            taxonomy_code,
+            upper=True,
+        )
+        procedure_match_ratio, procedure_bucket = _procedure_match_ratio(payload_lower, requested_procedure_codes)
+
+        candidates.append(
+            {
+                "row": row,
+                "payload_lower": payload_lower,
+                "geography_rank": geography_rank,
+                "cohort_level": cohort_level,
+                "cohort_rank": _cohort_level_rank(cohort_level),
+                "specialty_match": specialty_match,
+                "taxonomy_match": taxonomy_match,
+                "procedure_match_ratio": procedure_match_ratio,
+                "strict_match": bool(specialty_match and taxonomy_match),
+                "procedure_bucket": procedure_bucket,
+                "peer_count": _peer_count_from_row(payload_lower),
+                "selected_geography": row_geography_label
+                or (
+                    "national"
+                    if matched_geography_scope == "national"
+                    else f"{matched_geography_scope}:{matched_geography_value}"
+                ),
+            }
+        )
+
+    return sorted(candidates, key=_peer_target_sort_key)
+
+
+def _variant_scope_inputs_from_mode_payload(
+    mode_payload: dict[str, Any] | None,
+    *,
+    fallback_specialty_key: str | None,
+    fallback_taxonomy_code: str | None,
+    fallback_procedure_codes: set[str],
+) -> tuple[str | None, str | None, set[str]]:
+    if not isinstance(mode_payload, dict):
+        return fallback_specialty_key, fallback_taxonomy_code, set(fallback_procedure_codes)
+    context = mode_payload.get("cohort_context")
+    if not isinstance(context, dict):
+        return fallback_specialty_key, fallback_taxonomy_code, set(fallback_procedure_codes)
+
+    specialty_key = _parse_specialty_key(context.get("specialty_key")) or fallback_specialty_key
+    taxonomy_raw = context.get("taxonomy_code")
+    taxonomy_code = (
+        str(taxonomy_raw).strip().upper()
+        if taxonomy_raw not in (None, "")
+        else fallback_taxonomy_code
+    )
+    procedure_bucket = context.get("procedure_bucket")
+    procedure_codes = set(_parse_token_list(procedure_bucket))
+    if not procedure_codes:
+        procedure_codes = set(fallback_procedure_codes)
+    return specialty_key, taxonomy_code, procedure_codes
+
+
+def _collect_provider_scope_variant_candidates(
+    candidates: list[dict[str, Any]],
+    *,
+    provider_specialty_key: str | None,
+    provider_taxonomy_code: str | None,
+    provider_procedure_codes: set[str],
+) -> list[dict[str, Any]]:
+    filtered: list[dict[str, Any]] = []
+    for candidate in candidates:
+        payload_lower = candidate.get("payload_lower")
+        if not isinstance(payload_lower, dict):
+            continue
+
+        row_specialty = _parse_specialty_key(
+            _pick_first_from_lowered(payload_lower, "specialty_key", "specialty")
+        )
+        row_taxonomy_raw = _pick_first_from_lowered(payload_lower, "taxonomy_code", "taxonomy")
+        row_taxonomy = str(row_taxonomy_raw).strip().upper() if row_taxonomy_raw not in (None, "") else None
+
+        if provider_specialty_key and row_specialty and row_specialty != provider_specialty_key:
+            continue
+        if provider_taxonomy_code and row_taxonomy != provider_taxonomy_code:
+            continue
+        if provider_procedure_codes and (_as_float(candidate.get("procedure_match_ratio")) or 0.0) <= 0.0:
+            continue
+        filtered.append(candidate)
+
+    if filtered:
+        return filtered
+    if candidates:
+        return [candidates[0]]
+    return []
+
+
+def _select_peer_target_candidate(
+    rows: list[dict[str, Any]],
+    *,
+    benchmark_mode: str,
+    state_key: str | None,
+    zip5: str | None,
+    specialty_key: str | None,
+    taxonomy_code: str | None,
+    requested_procedure_codes: set[str],
+    procedure_match_threshold: float,
+) -> dict[str, Any] | None:
+    candidates = _collect_peer_target_candidates(
+        rows,
+        benchmark_mode=benchmark_mode,
+        state_key=state_key,
+        zip5=zip5,
+        specialty_key=specialty_key,
+        taxonomy_code=taxonomy_code,
+        requested_procedure_codes=requested_procedure_codes,
+    )
+    if not candidates:
+        return None
+
+    strict_candidates = [
+        item
+        for item in candidates
+        if item["specialty_match"]
+        and item["taxonomy_match"]
+        and float(item["procedure_match_ratio"]) >= procedure_match_threshold
+    ]
+    if strict_candidates:
+        return strict_candidates[0]
+
+    return candidates[0]
+
+
+def _extract_peer_target_values(payload_lower: dict[str, Any]) -> dict[str, float | None]:
+    return {
+        "target_appropriateness": _as_float(
+            _pick_first_from_lowered(
+                payload_lower,
+                "target_appropriateness",
+                "appropriateness_target",
+                "target_utilization",
+                "target_utilization_adjusted",
+            )
+        ),
+        "target_rx_appropriateness": _as_float(
+            _pick_first_from_lowered(
+                payload_lower,
+                "target_rx_appropriateness",
+                "rx_appropriateness_target",
+                "target_rx_claim_rate",
+                "target_drug_appropriateness",
+            )
+        ),
+        "target_effectiveness": _as_float(
+            _pick_first_from_lowered(
+                payload_lower,
+                "target_effectiveness",
+                "effectiveness_target",
+                "target_qpp_quality",
+                "target_quality_score",
+            )
+        ),
+        "target_qpp_cost": _as_float(
+            _pick_first_from_lowered(
+                payload_lower,
+                "target_qpp_cost",
+                "qpp_cost_target",
+                "target_cost_score",
+            )
+        ),
+        "target_cost": _as_float(
+            _pick_first_from_lowered(
+                payload_lower,
+                "target_cost",
+                "cost_target",
+                "target_allowed_amount",
+                "target_cost_adjusted",
+            )
+        ),
+    }
+
+
+def _geometric_mean(values: list[float | None]) -> float:
+    if not values:
+        return 1.0
+    safe_values = [max(_as_float(value) or 1.0, 0.0001) for value in values]
+    return math.exp(sum(math.log(value) for value in safe_values) / len(safe_values))
+
+
+def _score_from_risk_ratio(risk_ratio: float | None) -> float:
+    rr = _as_float(risk_ratio) or 1.0
+    return round(min(100.0, max(0.0, 50.0 - 125.0 * (rr - 1.0))), 2)
+
+
+def _estimated_cost_level_from_risk_ratio(rr_cost: float | None) -> str:
+    value = _as_float(rr_cost) or 1.0
+    if value <= 0.80:
+        return "$"
+    if value <= 0.90:
+        return "$$"
+    if value <= 1.10:
+        return "$$$"
+    if value <= 1.25:
+        return "$$$$"
+    return "$$$$$"
+
+
+def _compute_live_measure(
+    *,
+    observed: float | None,
+    target: float | None,
+    evidence_n: float,
+    reverse_ratio: bool,
+) -> dict[str, float]:
+    observed_value = _as_float(observed)
+    target_value = _as_float(target)
+    evidence = max(_as_float(evidence_n) or 0.0, 1.0)
+    if reverse_ratio:
+        if observed_value is None or observed_value <= 0 or target_value is None or target_value <= 0:
+            rr_raw = 1.0
+        else:
+            rr_raw = target_value / observed_value
+    else:
+        if observed_value is None or observed_value <= 0 or target_value is None or target_value <= 0:
+            rr_raw = 1.0
+        else:
+            rr_raw = observed_value / target_value
+
+    shrink_weight = min(1.0, max(0.0, evidence / (evidence + PROVIDER_QUALITY_SHRINKAGE_ALPHA)))
+    stderr = max(0.0001, math.sqrt(1.0 / (evidence + 1.0)))
+    risk_ratio = 1.0 + (rr_raw - 1.0) * shrink_weight
+    return {
+        "risk_ratio": risk_ratio,
+        "ci75_low": max(0.01, risk_ratio - 1.15 * stderr),
+        "ci75_high": risk_ratio + 1.15 * stderr,
+        "ci90_low": max(0.01, risk_ratio - 1.64 * stderr),
+        "ci90_high": risk_ratio + 1.64 * stderr,
+        "evidence_n": evidence,
+    }
+
+
+def _aggregate_domain(measures: list[dict[str, float]]) -> dict[str, Any]:
+    if not measures:
+        return _empty_domain_payload()
+    risk_ratio = _geometric_mean([measure.get("risk_ratio") for measure in measures])
+    ci75_low = _geometric_mean([measure.get("ci75_low") for measure in measures])
+    ci75_high = _geometric_mean([measure.get("ci75_high") for measure in measures])
+    ci90_low = _geometric_mean([measure.get("ci90_low") for measure in measures])
+    ci90_high = _geometric_mean([measure.get("ci90_high") for measure in measures])
+    evidence_n = float(sum(_as_float(measure.get("evidence_n")) or 0.0 for measure in measures))
+    return {
+        "risk_ratio_point": risk_ratio,
+        "score_0_100": _score_from_risk_ratio(risk_ratio),
+        "evidence_n": evidence_n,
+        "ci_75": {"low": ci75_low, "high": ci75_high},
+        "ci_90": {"low": ci90_low, "high": ci90_high},
+    }
+
+
+async def _resolve_procedure_override_codes(
+    session,
+    procedure_codes: list[str],
+    procedure_code_system: str,
+) -> set[str]:
+    if not procedure_codes:
+        return set()
+
+    normalized_codes = [str(code or "").strip().upper() for code in procedure_codes if str(code or "").strip()]
+    if not normalized_codes:
+        return set()
+
+    if procedure_code_system == INTERNAL_CODE_SYSTEM:
+        internal_codes = {str(int(code)) for code in normalized_codes if INT_PATTERN.fullmatch(code)}
+        if internal_codes:
+            return internal_codes
+
+    resolved_codes: set[str] = set()
+    for code in normalized_codes:
+        try:
+            code_context = await _resolve_code_context(session, procedure_code_system, code, expand_codes=False)
+        except Exception:  # noqa: BLE001
+            continue
+        for internal_code in code_context.get("internal_codes", []):
+            resolved_codes.add(str(internal_code))
+    if resolved_codes:
+        return resolved_codes
+    return set(normalized_codes)
+
+
+async def _load_provider_quality_observed(session, *, npi: int, year: int) -> dict[str, Any] | None:
+    provider_result = await session.execute(
+        select(provider_table).where(and_(provider_table.c.npi == npi, provider_table.c.year == year))
+    )
+    provider_row = provider_result.first()
+    if provider_row is None:
+        return None
+    provider_payload = _row_to_dict(provider_row)
+
+    total_services = _as_float(provider_payload.get("total_services")) or 0.0
+    total_beneficiaries = _as_float(provider_payload.get("total_beneficiaries")) or 0.0
+    total_allowed_amount = _as_float(provider_payload.get("total_allowed_amount")) or 0.0
+    state_key = str(provider_payload.get("state") or "").strip().upper() or None
+    zip5 = str(provider_payload.get("zip5") or "").strip() or None
+
+    qpp_quality_score = None
+    qpp_cost_score = None
+    try:
+        qpp_result = await session.execute(
+            text(
+                f"""
+                SELECT quality_score, cost_score
+                FROM {PRICING_SCHEMA}.{QUALITY_QPP_TABLE_NAME}
+                WHERE npi = :npi AND year = :year
+                LIMIT 1
+                """
+            ),
+            {"npi": npi, "year": year},
+        )
+        qpp_row = qpp_result.first()
+        if qpp_row is not None:
+            qpp_payload = _row_to_dict(qpp_row)
+            qpp_quality_score = _as_float(qpp_payload.get("quality_score"))
+            qpp_cost_score = _as_float(qpp_payload.get("cost_score"))
+    except Exception:  # noqa: BLE001
+        qpp_quality_score = None
+        qpp_cost_score = None
+
+    total_rx_claims = 0.0
+    total_rx_beneficiaries = 0.0
+    try:
+        rx_result = await session.execute(
+            select(
+                func.coalesce(func.sum(provider_prescription_table.c.total_claims), 0.0).label("total_rx_claims"),
+                func.coalesce(func.sum(provider_prescription_table.c.total_benes), 0.0).label("total_rx_beneficiaries"),
+            ).where(
+                and_(
+                    provider_prescription_table.c.npi == npi,
+                    provider_prescription_table.c.year == year,
+                )
+            )
+        )
+        rx_row = rx_result.first()
+        if rx_row is not None:
+            rx_payload = _row_to_dict(rx_row)
+            total_rx_claims = _as_float(rx_payload.get("total_rx_claims")) or 0.0
+            total_rx_beneficiaries = _as_float(rx_payload.get("total_rx_beneficiaries")) or 0.0
+    except Exception:  # noqa: BLE001
+        total_rx_claims = 0.0
+        total_rx_beneficiaries = 0.0
+
+    svi_overall = PROVIDER_QUALITY_DEFAULT_SVI
+    if zip5:
+        try:
+            svi_result = await session.execute(
+                text(
+                    f"""
+                    SELECT svi_overall
+                    FROM {PRICING_SCHEMA}.{QUALITY_SVI_TABLE_NAME}
+                    WHERE zcta = :zcta AND year = :year
+                    LIMIT 1
+                    """
+                ),
+                {"zcta": zip5, "year": year},
+            )
+            svi_value = _as_float(svi_result.scalar())
+            if svi_value is not None:
+                svi_overall = min(1.0, max(0.0, svi_value))
+        except Exception:  # noqa: BLE001
+            svi_overall = PROVIDER_QUALITY_DEFAULT_SVI
+
+    utilization_rate = None
+    if total_beneficiaries > 0:
+        utilization_rate = total_services / total_beneficiaries
+    svi_adjustment = 1.0 + 0.2 * (svi_overall - 0.5)
+    if svi_adjustment == 0:
+        svi_adjustment = 1.0
+    utilization_adjusted = (utilization_rate / svi_adjustment) if utilization_rate is not None else None
+    cost_adjusted = total_allowed_amount / svi_adjustment
+    rx_claim_rate = (total_rx_claims / total_rx_beneficiaries) if total_rx_beneficiaries > 0 else None
+
+    return {
+        "npi": npi,
+        "year": year,
+        "state_key": state_key,
+        "zip5": zip5,
+        "total_services": total_services,
+        "total_beneficiaries": total_beneficiaries,
+        "total_allowed_amount": total_allowed_amount,
+        "total_rx_claims": total_rx_claims,
+        "total_rx_beneficiaries": total_rx_beneficiaries,
+        "utilization_adjusted": utilization_adjusted,
+        "cost_adjusted": cost_adjusted,
+        "qpp_quality_score": qpp_quality_score,
+        "qpp_cost_score": qpp_cost_score,
+        "rx_claim_rate": rx_claim_rate,
+    }
+
+
+async def _load_quality_peer_targets(
+    session,
+    *,
+    year: int,
+    benchmark_modes: list[str] | tuple[str, ...] | None = None,
+    state_key: str | None = None,
+    zip5: str | None = None,
+) -> list[dict[str, Any]]:
+    normalized_modes = [
+        mode
+        for mode in (benchmark_modes or QUALITY_BENCHMARK_MODE_ORDER)
+        if mode in QUALITY_BENCHMARK_MODE_ORDER
+    ]
+    if not normalized_modes:
+        normalized_modes = list(QUALITY_BENCHMARK_MODE_ORDER)
+
+    state_value = str(state_key or "").strip().upper() or None
+    zip_value = str(zip5 or "").strip()[:5] or None
+    state_enabled = state_value is not None and any(mode in {"zip", "state"} for mode in normalized_modes)
+    zip_enabled = zip_value is not None and any(mode == "zip" for mode in normalized_modes)
+
+    mode_placeholders = ", ".join(f":mode_{idx}" for idx, _ in enumerate(normalized_modes))
+    params: dict[str, Any] = {"year": year}
+    for idx, mode in enumerate(normalized_modes):
+        params[f"mode_{idx}"] = mode
+
+    params.update(
+        {
+            "state_key": state_value,
+            "zip5": zip_value,
+            "state_enabled": state_enabled,
+            "zip_enabled": zip_enabled,
+        }
+    )
+
+    select_sql = f"""
+        SELECT
+            year,
+            benchmark_mode,
+            geography_scope,
+            geography_value,
+            cohort_level,
+            specialty_key,
+            taxonomy_code,
+            procedure_bucket,
+            peer_n,
+            target_appropriateness,
+            target_cost,
+            target_effectiveness,
+            target_qpp_cost,
+            target_rx_appropriateness
+        FROM {PRICING_SCHEMA}.{QUALITY_PEER_TARGET_TABLE_NAME}
+        WHERE year = :year
+          AND benchmark_mode IN ({mode_placeholders})
+    """
+
+    # Fast path: run index-friendly scope-specific probes.
+    query_parts = [select_sql + "\n          AND geography_scope = 'national'"]
+    if state_enabled:
+        query_parts.append(
+            select_sql + "\n          AND geography_scope = 'state'\n          AND geography_value = :state_key"
+        )
+    if zip_enabled:
+        query_parts.append(
+            select_sql + "\n          AND geography_scope = 'zip'\n          AND geography_value = :zip5"
+        )
+    fast_query = "\n        UNION ALL\n".join(query_parts)
+
+    geography_clause = """
+          AND (
+                geography_scope IS NULL
+                OR geography_scope = 'national'
+                OR (
+                    :state_enabled
+                    AND geography_scope = 'state'
+                    AND geography_value = :state_key
+                )
+                OR (
+                    :zip_enabled
+                    AND geography_scope = 'zip'
+                    AND geography_value = :zip5
+                )
+          )
+    """
+
+    try:
+        result = await session.execute(text(fast_query), params)
+        rows = [_row_to_dict(row) for row in result]
+        if rows:
+            return rows
+        # Safety fallback for unexpected geography-key formats.
+        fallback_result = await session.execute(text(select_sql + geography_clause), params)
+        fallback_rows = [_row_to_dict(row) for row in fallback_result]
+        if fallback_rows:
+            return fallback_rows
+        fallback_result = await session.execute(text(select_sql), params)
+        return [_row_to_dict(row) for row in fallback_result]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _build_live_mode_payload_for_candidate(
+    *,
+    benchmark_mode: str,
+    observed_data: dict[str, Any],
+    specialty_key: str | None,
+    taxonomy_code: str | None,
+    procedure_match_threshold: float,
+    selected_candidate: dict[str, Any] | None,
+) -> dict[str, Any]:
+    target_values: dict[str, float | None] = {
+        "target_appropriateness": None,
+        "target_rx_appropriateness": None,
+        "target_effectiveness": None,
+        "target_qpp_cost": None,
+        "target_cost": None,
+    }
+    selected_specialty_key = specialty_key
+    selected_taxonomy_code = taxonomy_code
+    selected_procedure_bucket = None
+    selected_peer_count = None
+    selected_geography = None
+    selected_cohort_level = None
+    if selected_candidate is not None:
+        payload_lower = selected_candidate["payload_lower"]
+        target_values = _extract_peer_target_values(payload_lower)
+        selected_specialty_raw = _pick_first_from_lowered(payload_lower, "specialty_key", "specialty")
+        selected_taxonomy_raw = _pick_first_from_lowered(payload_lower, "taxonomy_code", "taxonomy")
+        selected_specialty_key = _parse_specialty_key(selected_specialty_raw) or specialty_key
+        if selected_taxonomy_raw not in (None, ""):
+            selected_taxonomy_code = str(selected_taxonomy_raw).strip().upper()
+        selected_procedure_bucket = selected_candidate.get("procedure_bucket")
+        selected_peer_count = _as_int(selected_candidate.get("peer_count"))
+        selected_geography = selected_candidate.get("selected_geography")
+        selected_cohort_level = selected_candidate.get("cohort_level")
+
+    evidence_n_claims = max(
+        _as_float(observed_data.get("total_services")) or 0.0,
+        _as_float(observed_data.get("total_beneficiaries")) or 0.0,
+        1.0,
+    )
+    evidence_n_rx = max(
+        _as_float(observed_data.get("total_rx_claims")) or 0.0,
+        _as_float(observed_data.get("total_rx_beneficiaries")) or 0.0,
+        1.0,
+    )
+
+    measures_by_domain = {
+        "appropriateness": [
+            _compute_live_measure(
+                observed=_as_float(observed_data.get("utilization_adjusted")),
+                target=target_values.get("target_appropriateness"),
+                evidence_n=evidence_n_claims,
+                reverse_ratio=False,
+            ),
+            _compute_live_measure(
+                observed=_as_float(observed_data.get("rx_claim_rate")),
+                target=target_values.get("target_rx_appropriateness"),
+                evidence_n=evidence_n_rx,
+                reverse_ratio=False,
+            ),
+        ],
+        "effectiveness": [
+            _compute_live_measure(
+                observed=_as_float(observed_data.get("qpp_quality_score")),
+                target=target_values.get("target_effectiveness"),
+                evidence_n=evidence_n_claims,
+                reverse_ratio=True,
+            ),
+        ],
+        "cost": [
+            _compute_live_measure(
+                observed=_as_float(observed_data.get("qpp_cost_score")),
+                target=target_values.get("target_qpp_cost"),
+                evidence_n=evidence_n_claims,
+                reverse_ratio=True,
+            ),
+            _compute_live_measure(
+                observed=_as_float(observed_data.get("cost_adjusted")),
+                target=target_values.get("target_cost"),
+                evidence_n=evidence_n_claims,
+                reverse_ratio=False,
+            ),
+        ],
+    }
+
+    domains_payload = _empty_domains_payload()
+    for domain, measures in measures_by_domain.items():
+        domains_payload[domain] = _aggregate_domain(measures)
+
+    rr_appropr = _as_float(domains_payload["appropriateness"]["risk_ratio_point"]) or 1.0
+    rr_effect = _as_float(domains_payload["effectiveness"]["risk_ratio_point"]) or 1.0
+    rr_cost = _as_float(domains_payload["cost"]["risk_ratio_point"]) or 1.0
+
+    ci75_appropr_low = _as_float(domains_payload["appropriateness"]["ci_75"]["low"]) or 1.0
+    ci75_effect_low = _as_float(domains_payload["effectiveness"]["ci_75"]["low"]) or 1.0
+    ci75_cost_low = _as_float(domains_payload["cost"]["ci_75"]["low"]) or 1.0
+    ci75_appropr_high = _as_float(domains_payload["appropriateness"]["ci_75"]["high"]) or 1.0
+    ci75_effect_high = _as_float(domains_payload["effectiveness"]["ci_75"]["high"]) or 1.0
+    ci75_cost_high = _as_float(domains_payload["cost"]["ci_75"]["high"]) or 1.0
+    ci90_appropr_low = _as_float(domains_payload["appropriateness"]["ci_90"]["low"]) or 1.0
+    ci90_effect_low = _as_float(domains_payload["effectiveness"]["ci_90"]["low"]) or 1.0
+    ci90_cost_low = _as_float(domains_payload["cost"]["ci_90"]["low"]) or 1.0
+    ci90_appropr_high = _as_float(domains_payload["appropriateness"]["ci_90"]["high"]) or 1.0
+    ci90_effect_high = _as_float(domains_payload["effectiveness"]["ci_90"]["high"]) or 1.0
+    ci90_cost_high = _as_float(domains_payload["cost"]["ci_90"]["high"]) or 1.0
+
+    rr_clinical = math.sqrt(max(rr_appropr, 0.0001) * max(rr_effect, 0.0001))
+    rr_overall = math.exp(
+        0.5 * math.log(max(rr_clinical, 0.0001))
+        + 0.5 * math.log(max(rr_cost, 0.0001))
+    )
+    ci75_low = math.exp(
+        0.5 * math.log(max(math.sqrt(max(ci75_appropr_low, 0.0001) * max(ci75_effect_low, 0.0001)), 0.0001))
+        + 0.5 * math.log(max(ci75_cost_low, 0.0001))
+    )
+    ci75_high = math.exp(
+        0.5 * math.log(max(math.sqrt(max(ci75_appropr_high, 0.0001) * max(ci75_effect_high, 0.0001)), 0.0001))
+        + 0.5 * math.log(max(ci75_cost_high, 0.0001))
+    )
+    ci90_low = math.exp(
+        0.5 * math.log(max(math.sqrt(max(ci90_appropr_low, 0.0001) * max(ci90_effect_low, 0.0001)), 0.0001))
+        + 0.5 * math.log(max(ci90_cost_low, 0.0001))
+    )
+    ci90_high = math.exp(
+        0.5 * math.log(max(math.sqrt(max(ci90_appropr_high, 0.0001) * max(ci90_effect_high, 0.0001)), 0.0001))
+        + 0.5 * math.log(max(ci90_cost_high, 0.0001))
+    )
+
+    low_score_check = rr_overall >= 1.12
+    low_confidence_check = ci90_low >= 1.08
+    high_score_check = rr_overall <= 0.88
+    high_confidence_check = ci75_high < 1.0
+    if low_score_check and low_confidence_check:
+        tier = "low"
+    elif high_score_check and high_confidence_check:
+        tier = "high"
+    else:
+        tier = "acceptable"
+    borderline_status = (int(low_score_check) + int(low_confidence_check)) == 1
+
+    score_data = {
+        "model_version": PROVIDER_QUALITY_MODEL_VERSION,
+        "benchmark_mode": benchmark_mode,
+        "tier": tier,
+        "borderline_status": borderline_status,
+        "score_0_100": _score_from_risk_ratio(rr_overall),
+        "estimated_cost_level": _estimated_cost_level_from_risk_ratio(rr_cost),
+        "risk_ratio_point": rr_overall,
+        "ci75_low": ci75_low,
+        "ci75_high": ci75_high,
+        "ci90_low": ci90_low,
+        "ci90_high": ci90_high,
+        "low_score_threshold_failed": low_score_check,
+        "low_confidence_threshold_failed": low_confidence_check,
+        "high_score_threshold_passed": high_score_check,
+        "high_confidence_threshold_passed": high_confidence_check,
+    }
+    cohort_context = {
+        "selected_geography": selected_geography,
+        "selected_cohort_level": selected_cohort_level,
+        "peer_count": selected_peer_count,
+        "specialty_key": selected_specialty_key,
+        "taxonomy_code": selected_taxonomy_code,
+        "procedure_bucket": selected_procedure_bucket,
+        "computed_live": True,
+        "procedure_match_threshold": procedure_match_threshold,
+    }
+    return _build_quality_mode_payload(score_data, domains_payload, cohort_context=cohort_context)
+
+
+def _build_live_mode_payload(
+    *,
+    benchmark_mode: str,
+    observed_data: dict[str, Any],
+    peer_target_rows: list[dict[str, Any]],
+    specialty_key: str | None,
+    taxonomy_code: str | None,
+    requested_procedure_codes: set[str],
+    procedure_match_threshold: float,
+) -> dict[str, Any]:
+    selected_candidate = _select_peer_target_candidate(
+        peer_target_rows,
+        benchmark_mode=benchmark_mode,
+        state_key=observed_data.get("state_key"),
+        zip5=observed_data.get("zip5"),
+        specialty_key=specialty_key,
+        taxonomy_code=taxonomy_code,
+        requested_procedure_codes=requested_procedure_codes,
+        procedure_match_threshold=procedure_match_threshold,
+    )
+    return _build_live_mode_payload_for_candidate(
+        benchmark_mode=benchmark_mode,
+        observed_data=observed_data,
+        specialty_key=specialty_key,
+        taxonomy_code=taxonomy_code,
+        procedure_match_threshold=procedure_match_threshold,
+        selected_candidate=selected_candidate,
+    )
+
+
+def _build_live_variant_payload(
+    *,
+    benchmark_mode: str,
+    observed_data: dict[str, Any],
+    specialty_key: str | None,
+    taxonomy_code: str | None,
+    procedure_match_threshold: float,
+    candidate: dict[str, Any],
+) -> dict[str, Any]:
+    mode_payload = _build_live_mode_payload_for_candidate(
+        benchmark_mode=benchmark_mode,
+        observed_data=observed_data,
+        specialty_key=specialty_key,
+        taxonomy_code=taxonomy_code,
+        procedure_match_threshold=procedure_match_threshold,
+        selected_candidate=candidate,
+    )
+    cohort_context = mode_payload.get("cohort_context") or {}
+    return {
+        "benchmark_mode": benchmark_mode,
+        "tier": mode_payload.get("tier"),
+        "score_0_100": mode_payload.get("score_0_100"),
+        "overall": mode_payload.get("overall"),
+        "domains": mode_payload.get("domains"),
+        "curation_checks": mode_payload.get("curation_checks"),
+        "cohort_context": cohort_context,
+        "strict_match": bool(candidate.get("specialty_match") and candidate.get("taxonomy_match")),
+        "procedure_match_ratio": _as_float(candidate.get("procedure_match_ratio")),
+    }
+
+
+def _live_mode_payload_is_available(payload: dict[str, Any] | None) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    context = payload.get("cohort_context")
+    if not isinstance(context, dict):
+        return False
+    if context.get("selected_geography") not in (None, ""):
+        return True
+    if context.get("selected_cohort_level") not in (None, ""):
+        return True
+    if _as_int(context.get("peer_count")) is not None:
+        return True
+    return False
 
 
 def _normalize_order(raw_order: Any):
@@ -1064,6 +2779,7 @@ async def list_pricing_providers(request):
     min_claims = _parse_float(args.get("min_claims"), "min_claims", minimum=0)
     min_total_cost = _parse_float(args.get("min_total_cost"), "min_total_cost", minimum=0)
     include_legacy_fields = _parse_bool(args.get("include_legacy_fields"), "include_legacy_fields", default=False)
+    benchmark_mode = _parse_benchmark_mode(args.get("benchmark_mode"), "benchmark_mode")
     q = str(args.get("q", "")).strip()
     state = str(args.get("state", "")).strip().upper()
     city = str(args.get("city", "")).strip().lower()
@@ -1098,26 +2814,59 @@ async def list_pricing_providers(request):
     count_result = await session.execute(select(func.count()).select_from(provider_table).where(where_clause))
     total = int(count_result.scalar() or 0)
 
-    query = select(provider_table).where(where_clause)
     order = _normalize_order(args.get("order"))
     order_by = str(args.get("order_by") or "total_allowed_amount")
-    query = _apply_ordering(
-        query,
-        order_by,
-        order,
-        {
-            "npi": provider_table.c.npi,
-            "provider_name": provider_table.c.provider_name,
-            "total_services": provider_table.c.total_services,
-            "total_allowed_amount": provider_table.c.total_allowed_amount,
-            "total_beneficiaries": provider_table.c.total_beneficiaries,
-            "total_claims": provider_table.c.total_services,
-            "total_30day_fills": provider_table.c.total_distinct_hcpcs_codes,
-            "total_day_supply": provider_table.c.total_submitted_charges,
-            "total_drug_cost": provider_table.c.total_allowed_amount,
-            "total_benes": provider_table.c.total_beneficiaries,
-        },
-    )
+    benchmark_mode_used = benchmark_mode
+    benchmark_mode_source = "request" if benchmark_mode else None
+    if order_by == "tier_relevance" and await _table_exists(session, QUALITY_SCORE_TABLE_NAME):
+        benchmark_mode_used, benchmark_mode_source = await _resolve_quality_benchmark_mode(
+            session,
+            year,
+            benchmark_mode,
+        )
+        provider_with_scores = provider_table.outerjoin(
+            quality_score_table,
+            and_(
+                quality_score_table.c.npi == provider_table.c.npi,
+                quality_score_table.c.year == provider_table.c.year,
+                quality_score_table.c.benchmark_mode == benchmark_mode_used,
+            ),
+        )
+        tier_rank = case(
+            (quality_score_table.c.tier == "high", 0),
+            (quality_score_table.c.tier == "acceptable", 1),
+            (quality_score_table.c.tier == "low", 2),
+            else_=3,
+        )
+        query = (
+            select(provider_table)
+            .select_from(provider_with_scores)
+            .where(where_clause)
+            .order_by(
+                tier_rank.asc(),
+                quality_score_table.c.score_0_100.desc(),
+                provider_table.c.total_allowed_amount.desc(),
+            )
+        )
+    else:
+        query = select(provider_table).where(where_clause)
+        query = _apply_ordering(
+            query,
+            order_by,
+            order,
+            {
+                "npi": provider_table.c.npi,
+                "provider_name": provider_table.c.provider_name,
+                "total_services": provider_table.c.total_services,
+                "total_allowed_amount": provider_table.c.total_allowed_amount,
+                "total_beneficiaries": provider_table.c.total_beneficiaries,
+                "total_claims": provider_table.c.total_services,
+                "total_30day_fills": provider_table.c.total_distinct_hcpcs_codes,
+                "total_day_supply": provider_table.c.total_submitted_charges,
+                "total_drug_cost": provider_table.c.total_allowed_amount,
+                "total_benes": provider_table.c.total_beneficiaries,
+            },
+        )
     query = query.limit(pagination.limit).offset(pagination.offset)
 
     result = await session.execute(query)
@@ -1136,6 +2885,8 @@ async def list_pricing_providers(request):
                 "year": year,
                 "year_used": year,
                 "year_source": year_source,
+                "benchmark_mode": benchmark_mode_used,
+                "benchmark_mode_source": benchmark_mode_source,
                 "npi": npi,
                 "state": state or None,
                 "city": city or None,
@@ -1201,112 +2952,270 @@ async def get_pricing_provider_score(request, npi: str):
 
     provider_npi = _parse_int(npi, "npi", minimum=1)
     year = _parse_int(args.get("year"), "year", minimum=2013)
+    benchmark_mode = _parse_benchmark_mode(args.get("benchmark_mode"), "benchmark_mode")
+    specialty_key = _parse_specialty_key(args.get("specialty"))
+    taxonomy_code_raw = str(args.get("taxonomy_code", "")).strip()
+    taxonomy_code = taxonomy_code_raw.upper() if taxonomy_code_raw else None
+    procedure_codes_raw = args.get("procedure_codes")
+    procedure_codes = _parse_code_list_query_param(args, "procedure_codes")
+    if not procedure_codes and procedure_codes_raw not in (None, ""):
+        procedure_codes = _parse_code_list_query_param({"procedure_codes": procedure_codes_raw}, "procedure_codes")
+    procedure_code_system = _parse_procedure_override_code_system(
+        args.get("procedure_code_system"),
+        "procedure_code_system",
+    )
+    procedure_match_threshold = _parse_probability_clamped(
+        args.get("procedure_match_threshold"),
+        "procedure_match_threshold",
+        PROCEDURE_MATCH_THRESHOLD_DEFAULT,
+    )
+    _validate_removed_variants_param(args.get("variants"), "variants")
+    variants_scope = _parse_score_variants_scope(args.get("variants_scope"), "variants_scope")
     if provider_npi is None:
         raise InvalidUsage("Path parameter 'npi' must be provided")
 
-    year, year_source = await _resolve_year(session, provider_table, year)
-    provider_result = await session.execute(
-        select(provider_table).where(
-            and_(provider_table.c.npi == provider_npi, provider_table.c.year == year)
+    override_requested = bool(specialty_key or taxonomy_code or procedure_codes or variants_scope is not None)
+    if override_requested:
+        year, year_source = await _resolve_year(session, provider_table, year)
+        observed_data = await _load_provider_quality_observed(session, npi=provider_npi, year=year)
+        if observed_data is None:
+            raise sanic.exceptions.NotFound("Provider quality score not found")
+
+        requested_procedure_codes = await _resolve_procedure_override_codes(
+            session,
+            procedure_codes,
+            procedure_code_system,
         )
-    )
-    provider_row = provider_result.first()
-    if provider_row is None:
-        raise sanic.exceptions.NotFound("Provider not found")
-    provider_data = _row_to_dict(provider_row)
-
-    peer_filters = [provider_table.c.year == year]
-    state = str(provider_data.get("state") or "").strip().upper()
-    if state:
-        peer_filters.append(func.upper(provider_table.c.state) == state)
-    peer_clause = and_(*peer_filters)
-
-    peer_count_result = await session.execute(
-        select(func.count()).select_from(provider_table).where(peer_clause)
-    )
-    peer_count = int(peer_count_result.scalar() or 0)
-    if peer_count == 0:
-        raise sanic.exceptions.NotFound("No peer group available for scoring")
-
-    total_allowed_amount = float(provider_data.get("total_allowed_amount") or 0.0)
-    total_services = float(provider_data.get("total_services") or 0.0)
-    total_beneficiaries = float(provider_data.get("total_beneficiaries") or 0.0)
-
-    cost_rank_result = await session.execute(
-        select(func.count()).select_from(provider_table).where(
-            and_(peer_clause, provider_table.c.total_allowed_amount <= total_allowed_amount)
+        modes_to_compute = [benchmark_mode] if benchmark_mode is not None else list(QUALITY_BENCHMARK_MODE_ORDER)
+        peer_target_rows = await _load_quality_peer_targets(
+            session,
+            year=year,
+            benchmark_modes=modes_to_compute,
+            state_key=observed_data.get("state_key"),
+            zip5=observed_data.get("zip5"),
         )
-    )
-    volume_rank_result = await session.execute(
-        select(func.count()).select_from(provider_table).where(
-            and_(peer_clause, provider_table.c.total_services <= total_services)
-        )
-    )
-    bene_rank_result = await session.execute(
-        select(func.count()).select_from(provider_table).where(
-            and_(peer_clause, provider_table.c.total_beneficiaries <= total_beneficiaries)
-        )
-    )
+        scores_by_benchmark_mode: dict[str, dict[str, Any] | None] = {
+            mode: None
+            for mode in QUALITY_BENCHMARK_MODE_ORDER
+        }
+        variants_by_benchmark_mode: dict[str, list[dict[str, Any]]] = {
+            mode: []
+            for mode in QUALITY_BENCHMARK_MODE_ORDER
+        }
+        for mode in modes_to_compute:
+            mode_payload = _build_live_mode_payload(
+                benchmark_mode=mode,
+                observed_data=observed_data,
+                peer_target_rows=peer_target_rows,
+                specialty_key=specialty_key,
+                taxonomy_code=taxonomy_code,
+                requested_procedure_codes=requested_procedure_codes,
+                procedure_match_threshold=procedure_match_threshold,
+            )
+            if _live_mode_payload_is_available(mode_payload):
+                scores_by_benchmark_mode[mode] = mode_payload
+            if variants_scope == SCORE_VARIANTS_SCOPE_PROVIDER:
+                provider_specialty_key, provider_taxonomy_code, provider_procedure_codes = _variant_scope_inputs_from_mode_payload(
+                    mode_payload,
+                    fallback_specialty_key=specialty_key,
+                    fallback_taxonomy_code=taxonomy_code,
+                    fallback_procedure_codes=requested_procedure_codes,
+                )
+                mode_candidates = _collect_peer_target_candidates(
+                    peer_target_rows,
+                    benchmark_mode=mode,
+                    state_key=observed_data.get("state_key"),
+                    zip5=observed_data.get("zip5"),
+                    specialty_key=provider_specialty_key,
+                    taxonomy_code=provider_taxonomy_code,
+                    requested_procedure_codes=provider_procedure_codes,
+                )
+                mode_candidates = _collect_provider_scope_variant_candidates(
+                    mode_candidates,
+                    provider_specialty_key=provider_specialty_key,
+                    provider_taxonomy_code=provider_taxonomy_code,
+                    provider_procedure_codes=provider_procedure_codes,
+                )
+                variants_by_benchmark_mode[mode] = [
+                    _build_live_variant_payload(
+                        benchmark_mode=mode,
+                        observed_data=observed_data,
+                        specialty_key=provider_specialty_key,
+                        taxonomy_code=provider_taxonomy_code,
+                        procedure_match_threshold=procedure_match_threshold,
+                        candidate=candidate,
+                    )
+                    for candidate in mode_candidates
+                ]
 
-    cost_rank = min(max(float(cost_rank_result.scalar() or 0) / peer_count, 0.0), 1.0)
-    volume_rank = min(max(float(volume_rank_result.scalar() or 0) / peer_count, 0.0), 1.0)
-    bene_rank = min(max(float(bene_rank_result.scalar() or 0) / peer_count, 0.0), 1.0)
+        available_modes = [mode for mode in QUALITY_BENCHMARK_MODE_ORDER if scores_by_benchmark_mode.get(mode)]
+        if benchmark_mode is not None:
+            selected_mode = benchmark_mode
+            selected_payload = scores_by_benchmark_mode.get(selected_mode)
+            if selected_payload is None:
+                raise sanic.exceptions.NotFound(
+                    f"Provider quality score not found for benchmark_mode='{selected_mode}'"
+                )
+        else:
+            if not available_modes:
+                raise sanic.exceptions.NotFound("Provider quality score not found")
+            selected_mode = available_modes[0]
+            selected_payload = scores_by_benchmark_mode[selected_mode]
+        assert selected_payload is not None
 
-    service_count_result = await session.execute(
-        select(func.count()).select_from(provider_procedure_table).where(
-            and_(provider_procedure_table.c.npi == provider_npi, provider_procedure_table.c.year == year)
-        )
-    )
-    location_count_result = await session.execute(
-        select(func.count(func.distinct(location_table.c.location_key))).select_from(location_table).where(
-            and_(location_table.c.npi == provider_npi, location_table.c.year == year)
-        )
-    )
-
-    service_count = int(service_count_result.scalar() or 0)
-    location_count = int(location_count_result.scalar() or 0)
-    consistency_score = min(service_count / 20.0, 1.0)
-    efficiency_score = min(max(1.0 - cost_rank, 0.0), 1.0)
-    access_score = min(location_count / 5.0, 1.0)
-    data_confidence_score = min(total_services / 1000.0, 1.0)
-
-    quality_proxy_score = round(
-        100.0
-        * (
-            0.30 * volume_rank
-            + 0.20 * consistency_score
-            + 0.20 * efficiency_score
-            + 0.15 * access_score
-            + 0.15 * data_confidence_score
-        ),
-        2,
-    )
-
-    return response.json(
-        {
+        response_payload = {
             "npi": provider_npi,
             "year_used": year,
             "year_source": year_source,
-            "estimated_cost_level": _cost_level_from_percentile(cost_rank),
-            "quality_proxy_score": quality_proxy_score,
-            "confidence": "medium",
-            "components": {
-                "volume_score": round(volume_rank, 4),
-                "consistency_score": round(consistency_score, 4),
-                "efficiency_score": round(efficiency_score, 4),
-                "access_score": round(access_score, 4),
-                "data_confidence_score": round(data_confidence_score, 4),
-            },
-            "peer_group": {
-                "year": year,
-                "state": state or None,
-                "peer_count": peer_count,
-                "cost_percentile": round(cost_rank, 4),
-                "volume_percentile": round(volume_rank, 4),
-                "bene_percentile": round(bene_rank, 4),
-            },
+            "model_version": selected_payload.get("model_version"),
+            "benchmark_mode": selected_payload.get("benchmark_mode"),
+            "tier": selected_payload.get("tier"),
+            "borderline_status": selected_payload.get("borderline_status"),
+            "score_0_100": selected_payload.get("score_0_100"),
+            "estimated_cost_level": selected_payload.get("estimated_cost_level"),
+            "overall": selected_payload.get("overall"),
+            "domains": selected_payload.get("domains"),
+            "curation_checks": selected_payload.get("curation_checks"),
+            "available_benchmark_modes": available_modes if benchmark_mode is None else [selected_mode],
+            "scores_by_benchmark_mode": scores_by_benchmark_mode,
         }
+        if variants_scope == SCORE_VARIANTS_SCOPE_PROVIDER:
+            response_payload["variants_scope"] = variants_scope
+            response_payload["variants_by_benchmark_mode"] = variants_by_benchmark_mode
+        if selected_payload.get("cohort_context") is not None:
+            response_payload["cohort_context"] = selected_payload.get("cohort_context")
+        return response.json(response_payload)
+
+    if not await _table_exists(session, QUALITY_SCORE_TABLE_NAME):
+        raise sanic.exceptions.NotFound("Provider quality score table not found")
+    if not await _table_exists(session, QUALITY_DOMAIN_TABLE_NAME):
+        raise sanic.exceptions.NotFound("Provider quality domain table not found")
+
+    year, year_source = await _resolve_quality_year(session, year)
+
+    score_query = text(
+        f"""
+        SELECT *
+        FROM {PRICING_SCHEMA}.{QUALITY_SCORE_TABLE_NAME}
+        WHERE npi = :npi AND year = :year
+        """
     )
+    score_result = await session.execute(score_query, {"npi": provider_npi, "year": year})
+    score_rows = [_row_to_dict(row) for row in score_result]
+    if not score_rows:
+        raise sanic.exceptions.NotFound("Provider quality score not found")
+
+    scores_by_mode_raw: dict[str, dict[str, Any]] = {}
+    for row in score_rows:
+        mode = str(row.get("benchmark_mode") or "").strip().lower()
+        if mode in QUALITY_BENCHMARK_MODE_ORDER and mode not in scores_by_mode_raw:
+            scores_by_mode_raw[mode] = row
+
+    if benchmark_mode is not None:
+        selected_mode = benchmark_mode
+        score_data = scores_by_mode_raw.get(selected_mode)
+        if score_data is None:
+            raise sanic.exceptions.NotFound(f"Provider quality score not found for benchmark_mode='{selected_mode}'")
+    else:
+        selected_mode = None
+        score_data = None
+        for mode in QUALITY_BENCHMARK_MODE_ORDER:
+            if mode in scores_by_mode_raw:
+                selected_mode = mode
+                score_data = scores_by_mode_raw[mode]
+                break
+        if score_data is None:
+            score_data = score_rows[0]
+            selected_mode = str(score_data.get("benchmark_mode") or "national")
+
+    selected_cohort_context = _cohort_context_from_score_row(
+        score_data,
+        computed_live=False,
+        procedure_match_threshold=procedure_match_threshold,
+    )
+    cohort_context_by_mode = {
+        mode: _cohort_context_from_score_row(
+            mode_score,
+            computed_live=False,
+            procedure_match_threshold=procedure_match_threshold,
+        )
+        for mode, mode_score in scores_by_mode_raw.items()
+    }
+
+    domains_by_mode: dict[str, dict[str, Any]] = {
+        mode: _empty_domains_payload()
+        for mode in QUALITY_BENCHMARK_MODE_ORDER
+    }
+    domain_query = text(
+        f"""
+        SELECT
+            benchmark_mode,
+            domain,
+            risk_ratio,
+            score_0_100,
+            ci75_low,
+            ci75_high,
+            ci90_low,
+            ci90_high,
+            evidence_n
+        FROM {PRICING_SCHEMA}.{QUALITY_DOMAIN_TABLE_NAME}
+        WHERE npi = :npi AND year = :year
+        """
+    )
+    domain_result = await session.execute(domain_query, {"npi": provider_npi, "year": year})
+    for row in domain_result:
+        row_data = _row_to_dict(row)
+        mode = str(row_data.get("benchmark_mode") or "").strip().lower()
+        if mode not in QUALITY_BENCHMARK_MODE_ORDER:
+            continue
+        domain_name = str(row_data.get("domain") or "").strip().lower()
+        if domain_name not in domains_by_mode[mode]:
+            continue
+        domains_by_mode[mode][domain_name] = {
+            "risk_ratio_point": _as_float(row_data.get("risk_ratio")),
+            "score_0_100": _as_float(row_data.get("score_0_100")),
+            "evidence_n": _as_float(row_data.get("evidence_n")),
+            "ci_75": _ci_payload(row_data.get("ci75_low"), row_data.get("ci75_high")),
+            "ci_90": _ci_payload(row_data.get("ci90_low"), row_data.get("ci90_high")),
+        }
+
+    selected_payload = _build_quality_mode_payload(
+        score_data,
+        domains_by_mode.get(selected_mode, _empty_domains_payload()),
+        cohort_context=selected_cohort_context,
+    )
+
+    scores_by_benchmark_mode: dict[str, dict[str, Any] | None] = {}
+    for mode in QUALITY_BENCHMARK_MODE_ORDER:
+        mode_score = scores_by_mode_raw.get(mode)
+        if mode_score is None:
+            scores_by_benchmark_mode[mode] = None
+            continue
+        scores_by_benchmark_mode[mode] = _build_quality_mode_payload(
+            mode_score,
+            domains_by_mode.get(mode, _empty_domains_payload()),
+            cohort_context=cohort_context_by_mode.get(mode),
+        )
+
+    response_payload = {
+        "npi": provider_npi,
+        "year_used": year,
+        "year_source": year_source,
+        "model_version": selected_payload.get("model_version"),
+        "benchmark_mode": selected_payload.get("benchmark_mode"),
+        "tier": selected_payload.get("tier"),
+        "borderline_status": selected_payload.get("borderline_status"),
+        "score_0_100": selected_payload.get("score_0_100"),
+        "estimated_cost_level": selected_payload.get("estimated_cost_level"),
+        "overall": selected_payload.get("overall"),
+        "domains": selected_payload.get("domains"),
+        "curation_checks": selected_payload.get("curation_checks"),
+        "available_benchmark_modes": [mode for mode in QUALITY_BENCHMARK_MODE_ORDER if scores_by_mode_raw.get(mode)],
+        "scores_by_benchmark_mode": scores_by_benchmark_mode,
+    }
+    if selected_payload.get("cohort_context") is not None:
+        response_payload["cohort_context"] = selected_payload.get("cohort_context")
+    return response.json(response_payload)
 
 
 @blueprint.get("/providers/<npi>/procedures", name="pricing.providers.procedures.list")
@@ -1539,9 +3448,20 @@ async def _provider_procedure_cost_level(
     year = _parse_int(args.get("year"), "year", minimum=2013)
     state = str(args.get("state", "")).strip().upper()
     city = str(args.get("city", "")).strip().lower()
-    zip5 = str(args.get("zip5", "")).strip()
+    zip5 = _normalize_zip5(args.get("zip5"))
+    zip_radius_miles = _parse_zip_radius_miles(
+        args.get("zip_radius_miles"),
+        param="zip_radius_miles",
+        default=PROCEDURE_COST_LEVEL_ZIP_RADIUS_DEFAULT_MILES,
+    )
+    cohort_strategy_requested = _parse_procedure_cost_cohort_strategy(args.get("cohort_strategy"))
     specialty_key = _parse_specialty_key(args.get("specialty"))
     setting_key = _parse_setting_key(args.get("setting"))
+    zip_context = await _lookup_zip_context(session, zip5)
+    if not state and zip_context is not None:
+        state = str(zip_context.get("state") or "").strip().upper()
+    if not city and zip_context is not None:
+        city = str(zip_context.get("city_lower") or "").strip().lower()
 
     year, year_source = await _resolve_year(session, provider_procedure_cost_profile_table, year)
     internal_codes, code_context = await _resolve_internal_codes_for_request(
@@ -1550,84 +3470,189 @@ async def _provider_procedure_cost_level(
         args,
         default_system=default_code_system,
     )
-    geography_candidates = _geography_candidates(state_raw=state, city_raw=city, zip5_raw=zip5)
+    profile_order = case(
+        (provider_procedure_cost_profile_table.c.geography_scope == "national", 0),
+        (provider_procedure_cost_profile_table.c.geography_scope == "state", 1),
+        (provider_procedure_cost_profile_table.c.geography_scope == "state_city", 2),
+        (provider_procedure_cost_profile_table.c.geography_scope == "zip5", 3),
+        else_=4,
+    )
+    base_profile_filters = [
+        provider_procedure_cost_profile_table.c.npi == provider_npi,
+        provider_procedure_cost_profile_table.c.year == year,
+        provider_procedure_cost_profile_table.c.procedure_code.in_(internal_codes),
+        provider_procedure_cost_profile_table.c.setting_key == setting_key,
+    ]
+    if specialty_key:
+        base_profile_filters.append(provider_procedure_cost_profile_table.c.specialty_key == specialty_key)
 
-    selected_profile: dict[str, Any] | None = None
-    selected_peer: dict[str, Any] | None = None
-    selected_scope: str | None = None
-    selected_value: str | None = None
-    selected_specialty: str | None = None
-    profile_found_without_peer = False
-
-    for geography_scope, geography_value in geography_candidates:
-        profile_filters = [
+    base_profile_result = await session.execute(
+        select(provider_procedure_cost_profile_table)
+        .where(and_(*base_profile_filters))
+        .order_by(
+            profile_order.asc(),
+            provider_procedure_cost_profile_table.c.claim_count.desc().nullslast(),
+            provider_procedure_cost_profile_table.c.avg_submitted_charge.desc().nullslast(),
+        )
+        .limit(1)
+    )
+    base_profile_row = base_profile_result.first()
+    if base_profile_row is None and specialty_key:
+        fallback_profile_filters = [
             provider_procedure_cost_profile_table.c.npi == provider_npi,
             provider_procedure_cost_profile_table.c.year == year,
             provider_procedure_cost_profile_table.c.procedure_code.in_(internal_codes),
-            provider_procedure_cost_profile_table.c.geography_scope == geography_scope,
-            provider_procedure_cost_profile_table.c.geography_value == geography_value,
             provider_procedure_cost_profile_table.c.setting_key == setting_key,
         ]
-        if specialty_key:
-            profile_filters.append(provider_procedure_cost_profile_table.c.specialty_key == specialty_key)
-
-        profile_result = await session.execute(
+        fallback_profile_result = await session.execute(
             select(provider_procedure_cost_profile_table)
-            .where(and_(*profile_filters))
+            .where(and_(*fallback_profile_filters))
             .order_by(
+                profile_order.asc(),
                 provider_procedure_cost_profile_table.c.claim_count.desc().nullslast(),
                 provider_procedure_cost_profile_table.c.avg_submitted_charge.desc().nullslast(),
             )
             .limit(1)
         )
-        profile_row = profile_result.first()
-        if profile_row is None:
-            continue
+        base_profile_row = fallback_profile_result.first()
 
-        profile_found_without_peer = True
-        profile_payload = _row_to_dict(profile_row)
-        provider_specialty = str(profile_payload.get("specialty_key") or "").strip().lower()
-
-        specialty_candidates: list[str] = []
-        if specialty_key:
-            specialty_candidates.append(specialty_key)
-        elif provider_specialty:
-            specialty_candidates.append(provider_specialty)
-        specialty_candidates.append("__all__")
-        specialty_candidates = list(dict.fromkeys(specialty_candidates))
-
-        for peer_specialty in specialty_candidates:
-            peer_result = await session.execute(
-                select(procedure_peer_stats_table)
-                .where(
-                    and_(
-                        procedure_peer_stats_table.c.procedure_code == profile_payload["procedure_code"],
-                        procedure_peer_stats_table.c.year == profile_payload["year"],
-                        procedure_peer_stats_table.c.geography_scope == geography_scope,
-                        procedure_peer_stats_table.c.geography_value == geography_value,
-                        procedure_peer_stats_table.c.specialty_key == peer_specialty,
-                        procedure_peer_stats_table.c.setting_key == setting_key,
-                    )
-                )
-                .limit(1)
-            )
-            peer_row = peer_result.first()
-            if peer_row is None:
-                continue
-            selected_profile = profile_payload
-            selected_peer = _row_to_dict(peer_row)
-            selected_scope = geography_scope
-            selected_value = geography_value
-            selected_specialty = peer_specialty
-            break
-
-        if selected_profile is not None:
-            break
-
-    if selected_profile is None:
-        if profile_found_without_peer:
-            raise sanic.exceptions.NotFound("Peer group is not available for this provider procedure in the requested region.")
+    if base_profile_row is None:
         raise sanic.exceptions.NotFound("Provider procedure cost profile not found.")
+
+    selected_profile = _row_to_dict(base_profile_row)
+    provider_specialty = str(selected_profile.get("specialty_key") or "").strip().lower()
+    procedure_internal_code = int(selected_profile["procedure_code"])
+
+    specialty_candidates: list[str] = []
+    if specialty_key:
+        specialty_candidates.append(specialty_key)
+    elif provider_specialty:
+        specialty_candidates.append(provider_specialty)
+    specialty_candidates.append("__all__")
+    specialty_candidates = list(dict.fromkeys(specialty_candidates))
+
+    zip_candidates: list[str] = []
+    zip_candidate_meta: dict[str, dict[str, Any]] = {}
+    if zip5:
+        zip_rows = await _zip_radius_rows(
+            session,
+            zip5=zip5,
+            radius_miles=zip_radius_miles,
+            state_hint=state or None,
+            anchor_context=zip_context,
+        )
+        zip_candidates, zip_candidate_meta = _zip_ring_candidates(
+            zip_rows,
+            anchor_zip5=zip5,
+            radius_miles=zip_radius_miles,
+        )
+        if not zip_candidates:
+            zip_candidates = [zip5]
+            zip_candidate_meta[zip5] = {
+                "distance_miles": 0.0,
+                "distance_bucket": "zip_exact",
+                "selected_radius_miles": 0.0,
+                "is_anchor": True,
+            }
+
+    geography_candidates: list[tuple[str, str]] = []
+    for candidate_zip in zip_candidates:
+        geography_candidates.append(("zip5", candidate_zip))
+    for item in _geography_candidates(state_raw=state, city_raw=city, zip5_raw=None):
+        geography_candidates.append(item)
+
+    seen_geographies: set[tuple[str, str]] = set()
+    ordered_geographies: list[tuple[str, str]] = []
+    for item in geography_candidates:
+        normalized_item = (str(item[0]).strip(), str(item[1]).strip())
+        if not normalized_item[0] or not normalized_item[1]:
+            continue
+        if normalized_item in seen_geographies:
+            continue
+        seen_geographies.add(normalized_item)
+        ordered_geographies.append(normalized_item)
+
+    selected_peer: dict[str, Any] | None = None
+    selected_scope: str | None = None
+    selected_value: str | None = None
+    selected_specialty: str | None = None
+    cohort_strategy_used = PROCEDURE_COST_COHORT_STRATEGY_PRECOMPUTED
+
+    if cohort_strategy_requested == PROCEDURE_COST_COHORT_STRATEGY_NEAR_DYNAMIC and zip_candidates:
+        dynamic_peer_result = await _build_dynamic_zip_peer_stats(
+            session,
+            year=year,
+            procedure_code=procedure_internal_code,
+            setting_key=setting_key,
+            specialty_candidates=specialty_candidates,
+            zip_candidates=zip_candidates,
+            min_claims=PROCEDURE_COST_DYNAMIC_MIN_PEER_CLAIMS,
+            min_providers=PROCEDURE_COST_DYNAMIC_MIN_PEER_PROVIDERS,
+            iqr_factor=PROCEDURE_COST_DYNAMIC_IQR_FACTOR,
+        )
+        if dynamic_peer_result is not None:
+            dynamic_peer_payload, dynamic_specialty = dynamic_peer_result
+            selected_peer = dynamic_peer_payload
+            selected_scope = "zip_radius"
+            selected_value = f"{zip5}|{int(round(zip_radius_miles))}mi"
+            selected_specialty = dynamic_specialty
+            cohort_strategy_used = PROCEDURE_COST_COHORT_STRATEGY_NEAR_DYNAMIC
+
+    if selected_peer is None:
+        geography_clauses = [
+            and_(
+                procedure_peer_stats_table.c.geography_scope == scope,
+                procedure_peer_stats_table.c.geography_value == value,
+            )
+            for scope, value in ordered_geographies
+        ]
+        if not geography_clauses:
+            geography_clauses = [
+                and_(
+                    procedure_peer_stats_table.c.geography_scope == "national",
+                    procedure_peer_stats_table.c.geography_value == "US",
+                )
+            ]
+
+        peer_result = await session.execute(
+            select(procedure_peer_stats_table).where(
+                and_(
+                    procedure_peer_stats_table.c.procedure_code == procedure_internal_code,
+                    procedure_peer_stats_table.c.year == year,
+                    procedure_peer_stats_table.c.setting_key == setting_key,
+                    procedure_peer_stats_table.c.specialty_key.in_(specialty_candidates),
+                    or_(*geography_clauses),
+                )
+            )
+        )
+        peer_rows = [_row_to_dict(row) for row in peer_result]
+        peer_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for row in peer_rows:
+            key = (
+                str(row.get("geography_scope") or "").strip(),
+                str(row.get("geography_value") or "").strip(),
+                str(row.get("specialty_key") or "").strip().lower(),
+            )
+            if not all(key):
+                continue
+            peer_by_key[key] = row
+
+        for geography_scope, geography_value in ordered_geographies:
+            for peer_specialty in specialty_candidates:
+                peer_key = (geography_scope, geography_value, peer_specialty)
+                peer_payload = peer_by_key.get(peer_key)
+                if peer_payload is None:
+                    continue
+                selected_peer = peer_payload
+                selected_scope = geography_scope
+                selected_value = geography_value
+                selected_specialty = peer_specialty
+                break
+            if selected_peer is not None:
+                break
+
+    if selected_peer is None:
+        raise sanic.exceptions.NotFound("Peer group is not available for this provider procedure in the requested region.")
 
     provider_avg = _as_float(selected_profile.get("avg_submitted_charge"))
     provider_claim_count = _as_float(selected_profile.get("claim_count"))
@@ -1646,7 +3671,6 @@ async def _provider_procedure_cost_level(
         peer_p60,
         peer_p80,
     )
-    procedure_internal_code = int(selected_profile["procedure_code"])
     procedure_code_text = str(procedure_internal_code)
     procedure_name = None
     reported_code = None
@@ -1693,6 +3717,8 @@ async def _provider_procedure_cost_level(
     if reported_code:
         reported_code_system = "CPT" if FIVE_DIGIT_CODE_PATTERN.fullmatch(reported_code) else "HCPCS"
 
+    selected_zip_meta = zip_candidate_meta.get(str(selected_value or "").strip()) if selected_scope == "zip5" else None
+
     return response.json(
         {
             "npi": provider_npi,
@@ -1733,14 +3759,24 @@ async def _provider_procedure_cost_level(
                 "geography_scope": selected_scope,
                 "geography_value": selected_value,
                 "specialty_key": selected_specialty,
+                "cohort_type": _cohort_type_from_scope(selected_scope),
+                "specialty_scope": _specialty_scope_label(selected_specialty),
                 "setting_key": setting_key,
                 "min_claim_count": _as_float(selected_peer.get("min_claim_count")),
                 "max_claim_count": _as_float(selected_peer.get("max_claim_count")),
+                "anchor_zip5": zip5,
+                "distance_miles": _as_float((selected_zip_meta or {}).get("distance_miles")),
+                "distance_bucket": (selected_zip_meta or {}).get("distance_bucket"),
+                "selected_radius_miles": _as_float((selected_zip_meta or {}).get("selected_radius_miles")),
+                "cohort_strategy_used": cohort_strategy_used,
             },
             "query": {
                 "state": state or None,
                 "city": city or None,
                 "zip5": zip5 or None,
+                "zip_radius_miles": zip_radius_miles if zip5 else None,
+                "cohort_strategy": cohort_strategy_requested,
+                "cohort_strategy_used": cohort_strategy_used,
                 "specialty": specialty_key,
                 "setting": setting_key,
                 "input_code": code_context["input_code"],
@@ -2607,7 +4643,12 @@ async def list_providers_by_procedure(request):
     min_total_cost = _parse_float(args.get("min_total_cost"), "min_total_cost", minimum=0)
     state = str(args.get("state", "")).strip().upper()
     city = str(args.get("city", "")).strip().lower()
-    zip5 = str(args.get("zip5", "")).strip()
+    zip5 = _normalize_zip5(args.get("zip5"))
+    zip_radius_miles = _parse_zip_radius_miles(
+        args.get("zip_radius_miles"),
+        param="zip_radius_miles",
+        default=PROCEDURE_SEARCH_ZIP_RADIUS_DEFAULT_MILES,
+    )
     specialty = str(args.get("specialty", "")).strip().lower()
     q = str(args.get("q", "")).strip().lower()
     code = str(args.get("code", "")).strip()
@@ -2626,6 +4667,33 @@ async def list_providers_by_procedure(request):
 
     year, year_source = await _resolve_year(session, provider_procedure_table, year)
     code_context = None
+    zip_distance_map: dict[str, dict[str, Any]] = {}
+    zip_filter_values: list[str] = []
+    if zip5 and zip_radius_miles > 0:
+        zip_rows = await _zip_radius_rows(
+            session,
+            zip5=zip5,
+            radius_miles=zip_radius_miles,
+            state_hint=state or None,
+        )
+        for row in sorted(
+            zip_rows,
+            key=lambda item: (_as_float(item.get("distance_miles")) or 0.0, str(item.get("zip5") or "")),
+        ):
+            candidate_zip = _normalize_zip5(row.get("zip5"))
+            if candidate_zip is None:
+                continue
+            if candidate_zip in zip_distance_map:
+                continue
+            distance_value = _as_float(row.get("distance_miles"))
+            zip_distance_map[candidate_zip] = {
+                "distance_miles": distance_value,
+                "distance_bucket": _distance_bucket(distance_value),
+            }
+            zip_filter_values.append(candidate_zip)
+        if zip5 not in zip_distance_map:
+            zip_distance_map[zip5] = {"distance_miles": 0.0, "distance_bucket": "zip_exact"}
+            zip_filter_values.insert(0, zip5)
 
     filters = [
         provider_procedure_table.c.year == year,
@@ -2634,9 +4702,11 @@ async def list_providers_by_procedure(request):
     ]
     if state:
         filters.append(func.upper(provider_table.c.state) == state)
-    if city:
+    if city and not (zip5 and zip_radius_miles > 0):
         filters.append(func.lower(provider_table.c.city).like(f"%{city}%"))
-    if zip5:
+    if zip_filter_values:
+        filters.append(provider_table.c.zip5.in_(zip_filter_values))
+    elif zip5:
         filters.append(provider_table.c.zip5 == zip5)
     if specialty:
         filters.append(func.lower(provider_table.c.provider_type).like(f"%{specialty}%"))
@@ -2720,6 +4790,19 @@ async def list_providers_by_procedure(request):
     query = query.limit(pagination.limit).offset(pagination.offset)
     result = await session.execute(query)
     items = [_normalize_provider_service_aggregate(_row_to_dict(row), include_legacy=include_legacy_fields) for row in result]
+    if zip5 and items:
+        for item in items:
+            item_zip = _normalize_zip5(item.get("zip5"))
+            if item_zip is None:
+                continue
+            distance_payload = zip_distance_map.get(item_zip)
+            if distance_payload is None:
+                if item_zip != zip5:
+                    continue
+                distance_payload = {"distance_miles": 0.0, "distance_bucket": "zip_exact"}
+            item["distance_miles"] = _as_float(distance_payload.get("distance_miles"))
+            item["distance_bucket"] = distance_payload.get("distance_bucket")
+            item["anchor_zip5"] = zip5
     if code and internal_codes and items:
         await _enrich_provider_service_cost_indices(
             session,
@@ -2740,6 +4823,8 @@ async def list_providers_by_procedure(request):
         "state": state or None,
         "city": city or None,
         "zip5": zip5 or None,
+        "zip_radius_miles": zip_radius_miles if zip5 else None,
+        "zip_candidate_count": len(zip_filter_values) if zip_filter_values else (1 if zip5 else None),
         "specialty": specialty or None,
         "min_claims": min_claims,
         "min_total_cost": min_total_cost,

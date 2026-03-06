@@ -11,6 +11,14 @@ Importer resolves latest CSV URLs from the CMS portal (`https://data.cms.gov/`) 
 1. Medicare Part D Prescribers by Provider and Drug
 2. Medicare Part D Spending by Drug
 
+Operational year policy:
+
+- Current default import window is `2023`:
+  - `HLTHPRT_DRUG_CLAIMS_MIN_YEAR=2023`
+  - `HLTHPRT_DRUG_CLAIMS_MAX_YEAR=2023`
+- Expanding to earlier years requires confirming all required distributions are present in `data.cms.gov/data.json`
+  (missing-year distributions fail source resolution).
+
 ## Commands
 
 Start:
@@ -35,8 +43,14 @@ python main.py finish drug-claims --import-id 20260216 --run-id <RUN_ID>
 
 - `pricing_provider_prescription`
 - `pricing_prescription`
-- `code_catalog`
-- `code_crosswalk`
+- `code_catalog` (shared)
+- `code_crosswalk` (shared)
+
+`code_catalog` / `code_crosswalk` behavior:
+
+- tables are ensured if missing during finalize;
+- rows are upserted (hard upsert) with duplicate-key-safe conflict handling;
+- drug finalize does not replace or drop existing procedure-oriented code rows.
 
 ## HP_RX_CODE External Crosswalk Enrichment
 
@@ -56,6 +70,12 @@ Confidence and volume controls:
 - `HLTHPRT_RX_CROSSWALK_CONFIDENCE_MIN` (default `0.85`)
 - `HLTHPRT_RX_CROSSWALK_MAX_NDC_PER_CODE` (default `5`)
 - `HLTHPRT_RX_CROSSWALK_MAX_RXNORM_PER_CODE` (default `5`)
+
+## Publish / Finalize
+
+- publish uses transactional rename swap (`live -> _old`, `stage -> live`) with index rename;
+- index archive rename is truncation-safe and idempotent for long Postgres identifiers;
+- run `DrugClaims_finish` separately from `ClaimsPricing_finish` to reduce shared code-table contention.
 
 ## API Endpoints
 

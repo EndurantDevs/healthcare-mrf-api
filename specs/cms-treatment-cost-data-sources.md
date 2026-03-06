@@ -79,6 +79,18 @@ Notes:
 - Current standard in this project: **2023** (freshest complete year currently used).
 - API docs should explicitly state the active claims year when returning claims-derived costs/ratings.
 
+## Currently Active Import Scope (Implemented)
+
+The current importer code actively ingests:
+
+1. Medicare Physician & Other Practitioners - by Provider
+2. Medicare Physician & Other Practitioners - by Provider and Service
+3. Medicare Physician & Other Practitioners - by Geography and Service
+4. Medicare Part D Prescribers - by Provider and Drug
+5. Medicare Part D Spending by Drug
+
+Other sources listed in this document are roadmap/reference inputs, not yet active import feeds.
+
 ## Data Catalog Root
 
 - CMS public catalog root: https://data.cms.gov/

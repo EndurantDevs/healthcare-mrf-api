@@ -21,7 +21,11 @@ from sqlalchemy.sql import literal_column, text, tuple_
 from api.endpoint.pagination import parse_pagination
 from db.models import (AddressArchive, Issuer, NPIAddress, NPIData,
                        NPIDataOtherIdentifier, NPIDataTaxonomy,
-                       NPIDataTaxonomyGroup, NUCCTaxonomy, PlanNPIRaw, db)
+                       NPIDataTaxonomyGroup, NUCCTaxonomy, PlanNPIRaw,
+                       ProviderEnrichmentSummary, ProviderEnrollmentFFS,
+                       ProviderEnrollmentFQHC, ProviderEnrollmentHomeHealthAgency,
+                       ProviderEnrollmentHospital, ProviderEnrollmentHospice,
+                       ProviderEnrollmentRHC, ProviderEnrollmentSNF, db)
 from process.ext.utils import download_it
 
 blueprint = Blueprint("npi", url_prefix="/npi", version=1)
@@ -365,6 +369,105 @@ async def _resolve_npi_filter_capabilities() -> dict[str, bool]:
     capabilities["pricing_provider_procedure_available"] = await _table_exists("pricing_provider_procedure")
     capabilities["pricing_provider_prescription_available"] = await _table_exists("pricing_provider_prescription")
     return capabilities
+
+
+async def _fetch_provider_enrichment_summary_map(npis: Sequence[int]) -> dict[int, dict[str, Any]]:
+    unique_npis = sorted({int(npi) for npi in npis if npi is not None})
+    if not unique_npis:
+        return {}
+    if not await _table_exists(ProviderEnrichmentSummary.__tablename__):
+        return {}
+
+    query = text(
+        f"""
+        SELECT
+            npi,
+            latest_reporting_year,
+            status,
+            has_any_enrollment,
+            has_medicare_claims,
+            has_ffs_enrollment,
+            has_hospital_enrollment,
+            has_hha_enrollment,
+            has_hospice_enrollment,
+            has_fqhc_enrollment,
+            has_rhc_enrollment,
+            has_snf_enrollment,
+            primary_state,
+            primary_provider_type_code,
+            total_enrollment_rows,
+            dataset_keys
+          FROM mrf.{ProviderEnrichmentSummary.__tablename__}
+         WHERE npi = ANY(:npis)
+        """
+    )
+    async with db.acquire() as conn:
+        rows = await conn.all(query, npis=unique_npis)
+
+    summary_map: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        npi_value = int(row[0])
+        summary_map[npi_value] = {
+            "latest_reporting_year": row[1],
+            "status": row[2],
+            "has_any_enrollment": bool(row[3]),
+            "has_medicare_claims": bool(row[4]),
+            "has_ffs_enrollment": bool(row[5]),
+            "has_hospital_enrollment": bool(row[6]),
+            "has_hha_enrollment": bool(row[7]),
+            "has_hospice_enrollment": bool(row[8]),
+            "has_fqhc_enrollment": bool(row[9]),
+            "has_rhc_enrollment": bool(row[10]),
+            "has_snf_enrollment": bool(row[11]),
+            "primary_state": row[12],
+            "primary_provider_type_code": row[13],
+            "total_enrollment_rows": row[14],
+            "dataset_keys": list(row[15] or []),
+        }
+    return summary_map
+
+
+async def _fetch_provider_enrichment_detail(npi: int) -> dict[str, Any]:
+    detail: dict[str, Any] = {
+        "summary": None,
+        "enrollments": {
+            "ffs_public": [],
+            "hospital": [],
+            "hha": [],
+            "hospice": [],
+            "fqhc": [],
+            "rhc": [],
+            "snf": [],
+        },
+    }
+
+    summary_map = await _fetch_provider_enrichment_summary_map([npi])
+    detail["summary"] = summary_map.get(int(npi))
+
+    table_model_pairs = (
+        ("ffs_public", ProviderEnrollmentFFS),
+        ("hospital", ProviderEnrollmentHospital),
+        ("hha", ProviderEnrollmentHomeHealthAgency),
+        ("hospice", ProviderEnrollmentHospice),
+        ("fqhc", ProviderEnrollmentFQHC),
+        ("rhc", ProviderEnrollmentRHC),
+        ("snf", ProviderEnrollmentSNF),
+    )
+
+    async with db.session() as session:
+        for key, model in table_model_pairs:
+            if not await _table_exists(model.__tablename__):
+                continue
+            stmt = (
+                select(model)
+                .where(model.npi == npi)
+                .order_by(model.reporting_year.desc().nullslast(), model.imported_at.desc().nullslast())
+                .limit(25)
+            )
+            result = await session.execute(stmt)
+            detail["enrollments"][key] = [row.to_json_dict() for row in result.scalars()]
+
+    return detail
 
 
 async def _resolve_filter_year(
@@ -1537,6 +1640,24 @@ async def get_all(request):
         get_count(filters),
         get_results(start, limit, filters),
     )
+    summary_map: dict[int, dict[str, Any]] = {}
+    try:
+        summary_map = await _fetch_provider_enrichment_summary_map(
+            [row.get("npi") for row in rows if isinstance(row, dict)]
+        )
+    except Exception as exc:  # pragma: no cover - defensive fallback for transient DB states
+        logger.debug("Provider enrichment summary fetch failed: %s", exc)
+    if summary_map:
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            npi_value = row.get("npi")
+            if npi_value is None:
+                continue
+            summary = summary_map.get(int(npi_value))
+            if summary:
+                row["provider_enrichment_summary"] = summary
+
     payload: dict[str, Any] = {
         "total": total,
         "page": pagination.page,
@@ -2149,6 +2270,23 @@ async def get_npi(request, npi):
             if entry.get("other_provider_identifier_type_code") == "3" and entry.get("other_provider_identifier")
         ]
         data["do_business_as"] = list(dict.fromkeys(candidates)) if candidates else []
+
+    try:
+        data["provider_enrichment"] = await _fetch_provider_enrichment_detail(npi)
+    except Exception as exc:  # pragma: no cover - defensive fallback for transient DB states
+        logger.debug("Provider enrichment detail fetch failed for npi=%s: %s", npi, exc)
+        data["provider_enrichment"] = {
+            "summary": None,
+            "enrollments": {
+                "ffs_public": [],
+                "hospital": [],
+                "hha": [],
+                "hospice": [],
+                "fqhc": [],
+                "rhc": [],
+                "snf": [],
+            },
+        }
 
     return response.json(data, default=str)
 
