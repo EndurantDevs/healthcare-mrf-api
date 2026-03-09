@@ -48,18 +48,26 @@ from process.serialization import deserialize_job, serialize_job
 
 TEST_PROVIDER_ENRICHMENT_ROWS = 1500
 TEST_PROVIDER_ENRICHMENT_MAX_SOURCES_PER_DATASET = 1
+DEFAULT_PROVIDER_ENRICHMENT_MAX_SOURCES_PER_DATASET = 1
 PROVIDER_ENRICHMENT_QUEUE_NAME = "arq:ProviderEnrichment"
 POSTGRES_IDENTIFIER_MAX_LENGTH = 63
 
 CATALOG_URL = os.getenv("HLTHPRT_PROVIDER_ENRICHMENT_CATALOG_URL", "https://data.cms.gov/data.json")
 SOURCE_DOWNLOAD_CHUNK_SIZE = 10 * 1024 * 1024
 DEFAULT_MAX_PENDING_SAVE_TASKS = 4
+DEFAULT_PROVIDER_ENRICHMENT_BATCH_SIZE = 5000
 CSV_PRIMARY_ENCODING = "utf-8-sig"
 CSV_FALLBACK_ENCODING = "cp1252"
 CSV_PROBE_CHUNK_SIZE = 1024 * 1024
 
 STRICT_SOURCE_PRESENCE = str(
     os.getenv("HLTHPRT_PROVIDER_ENRICHMENT_STRICT_SOURCE_PRESENCE", "1")
+).strip().lower() in {"1", "true", "yes", "on"}
+ENABLE_NPPES_GAP_CHECK = str(
+    os.getenv("HLTHPRT_PROVIDER_ENRICHMENT_ENABLE_NPPES_GAP_CHECK", "0")
+).strip().lower() in {"1", "true", "yes", "on"}
+INCLUDE_PROVIDER_ENRICHMENT_HISTORY = str(
+    os.getenv("HLTHPRT_PROVIDER_ENRICHMENT_INCLUDE_HISTORY", "0")
 ).strip().lower() in {"1", "true", "yes", "on"}
 
 
@@ -72,6 +80,19 @@ def _env_positive_int(name: str, default: int) -> int:
         return value if value > 0 else default
     except (TypeError, ValueError):
         return default
+
+
+def _env_optional_limit(name: str, default: int | None) -> int | None:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+    if value <= 0:
+        return None
+    return value
 
 
 def _archived_identifier(name: str, suffix: str = "_old") -> str:
@@ -156,6 +177,14 @@ def _safe_datetime(raw: Any) -> datetime.datetime | None:
         return parsed
     except (TypeError, ValueError, OverflowError):
         return None
+
+
+def _sql_varchar_array_literal(values: list[str]) -> str:
+    normalized = [str(v) for v in values if str(v).strip()]
+    if not normalized:
+        return "ARRAY[]::varchar[]"
+    escaped = ["'" + value.replace("'", "''") + "'" for value in normalized]
+    return f"ARRAY[{', '.join(escaped)}]::varchar[]"
 
 
 def _is_csv_distribution(obj: dict[str, Any]) -> bool:
@@ -417,14 +446,20 @@ async def _discover_sources(test_mode: bool) -> tuple[list[dict[str, Any]], list
                 f"Registered provider-enrichment dataset has no CSV distributions: {dataset_title}"
             )
 
-        limit = None
+        limit: int | None = None
         if test_mode:
-            limit = _env_positive_int(
+            limit = _env_optional_limit(
                 "HLTHPRT_PROVIDER_ENRICHMENT_TEST_MAX_SOURCES_PER_DATASET",
                 TEST_PROVIDER_ENRICHMENT_MAX_SOURCES_PER_DATASET,
             )
+        elif not INCLUDE_PROVIDER_ENRICHMENT_HISTORY:
+            limit = _env_optional_limit(
+                "HLTHPRT_PROVIDER_ENRICHMENT_MAX_SOURCES_PER_DATASET",
+                DEFAULT_PROVIDER_ENRICHMENT_MAX_SOURCES_PER_DATASET,
+            )
 
-        for dist in csv_distributions[:limit]:
+        distributions_to_use = csv_distributions if limit is None else csv_distributions[:limit]
+        for dist in distributions_to_use:
             url = str(dist.get("downloadURL") or "").strip()
             if not url or url in seen_urls:
                 continue
@@ -739,7 +774,19 @@ async def process_data(ctx, task=None):  # pragma: no cover
         },
     )
 
-    await _run_nppes_gap_check(ctx)
+    if ENABLE_NPPES_GAP_CHECK:
+        await _run_nppes_gap_check(ctx)
+    else:
+        ctx.setdefault("context", {}).setdefault("audit", {})["nppes_gap_report"] = {
+            "checked": False,
+            "skipped": True,
+            "reason": "disabled_by_config",
+            "source_zip": None,
+            "unmapped_fields": [],
+            "unmapped_field_count": 0,
+            "medical_school_headers": [],
+            "error": None,
+        }
 
     sources, unmapped = await _discover_sources(test_mode=test_mode)
     audit["unmapped_datasets"] = unmapped
@@ -749,7 +796,10 @@ async def process_data(ctx, task=None):  # pragma: no cover
 
     print(f"Provider enrichment discovery: sources={len(sources)} unmapped={len(unmapped)}")
 
-    batch_size = _env_positive_int("HLTHPRT_PROVIDER_ENRICHMENT_BATCH_SIZE", 1000)
+    batch_size = _env_positive_int(
+        "HLTHPRT_PROVIDER_ENRICHMENT_BATCH_SIZE",
+        DEFAULT_PROVIDER_ENRICHMENT_BATCH_SIZE,
+    )
     max_pending_save_tasks = _env_positive_int(
         "HLTHPRT_PROVIDER_ENRICHMENT_MAX_PENDING_SAVE_TASKS",
         DEFAULT_MAX_PENDING_SAVE_TASKS,
@@ -933,6 +983,8 @@ async def _materialize_summary(import_date: str, db_schema: str, nppes_report: d
 
     nppes_unmapped_count = int(nppes_report.get("unmapped_field_count") or 0)
     nppes_medical_school_fields = [str(v) for v in (nppes_report.get("medical_school_headers") or [])]
+    nppes_unmapped_count_sql = str(nppes_unmapped_count)
+    nppes_medical_school_fields_sql = _sql_varchar_array_literal(nppes_medical_school_fields)
 
     sql = f"""
         INSERT INTO {db_schema}.{summary_stage.__tablename__} (
@@ -1024,19 +1076,15 @@ async def _materialize_summary(import_date: str, db_schema: str, nppes_report: d
                 WHEN COALESCE(p.medicare_claim_rows, 0) > 0 THEN 'enriched'
                 ELSE 'enrollment_only'
             END::varchar AS status,
-            :nppes_unmapped_field_count::int AS nppes_unmapped_field_count,
-            :nppes_medical_school_fields::varchar[] AS nppes_medical_school_fields,
+            {nppes_unmapped_count_sql}::int AS nppes_unmapped_field_count,
+            {nppes_medical_school_fields_sql} AS nppes_medical_school_fields,
             now()::timestamp AS updated_at
           FROM agg AS a
           LEFT JOIN latest_provider AS lp ON lp.npi = a.npi
           LEFT JOIN pricing AS p ON p.npi = a.npi;
     """
 
-    await db.status(
-        sql,
-        nppes_unmapped_field_count=nppes_unmapped_count,
-        nppes_medical_school_fields=nppes_medical_school_fields,
-    )
+    await db.status(sql)
 
 
 async def shutdown(ctx):  # pragma: no cover
@@ -1137,7 +1185,9 @@ async def save_provider_enrichment_data(ctx, task):
             print(f"[warn] Unknown task key for provider enrichment save: {key}")
             continue
         target_cls = make_class(model_cls, import_date)
-        operations.append(push_objects(rows, target_cls, rewrite=True))
+        # Provider-enrichment datasets contain many repeated keys; direct upsert avoids
+        # COPY duplicate-key exceptions and expensive fallback loops.
+        operations.append(push_objects(rows, target_cls, rewrite=True, use_copy=False))
 
     for op in operations:
         await op
