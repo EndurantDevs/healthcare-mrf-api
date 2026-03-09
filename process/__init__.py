@@ -422,7 +422,7 @@ def provider_quality(test: bool, import_id: str | None):
     asyncio.run(initiate_provider_quality(test_mode=test, import_id=import_id))
 
 
-@click.command(help="Run provider enrichment import (PECOS + Medicare enrollment + NPPES gap check)")
+@click.command(help="Run provider enrichment import (PECOS + Medicare enrollment)")
 @click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
 def provider_enrichment(test: bool):
     asyncio.run(initiate_provider_enrichment(test_mode=test))

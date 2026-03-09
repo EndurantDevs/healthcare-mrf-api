@@ -61,6 +61,82 @@ async def test_discover_sources_returns_registered_and_unmapped(monkeypatch):
     assert "Unknown Provider Enrollments" in unmapped
 
 
+@pytest.mark.asyncio
+async def test_discover_sources_non_test_defaults_to_latest_only(monkeypatch):
+    catalog = {
+        "dataset": [
+            {
+                "title": "Hospital Enrollments",
+                "distribution": [
+                    {
+                        "downloadURL": "https://example.com/hospital-older.csv",
+                        "mediaType": "text/csv",
+                        "title": "Hospital Enrollments : 2026-01-01",
+                        "modified": "2026-01-15",
+                        "temporal": "2026-01-01/2026-01-31",
+                    },
+                    {
+                        "downloadURL": "https://example.com/hospital-latest.csv",
+                        "mediaType": "text/csv",
+                        "title": "Hospital Enrollments : 2026-02-01",
+                        "modified": "2026-02-15",
+                        "temporal": "2026-02-01/2026-02-28",
+                    },
+                ],
+            }
+        ]
+    }
+
+    monkeypatch.setattr(provider_enrichment, "STRICT_SOURCE_PRESENCE", False)
+    monkeypatch.setattr(provider_enrichment, "INCLUDE_PROVIDER_ENRICHMENT_HISTORY", False)
+    monkeypatch.setenv("HLTHPRT_PROVIDER_ENRICHMENT_MAX_SOURCES_PER_DATASET", "1")
+    monkeypatch.setattr(provider_enrichment, "download_it", AsyncMock(return_value=json.dumps(catalog)))
+
+    sources, _ = await provider_enrichment._discover_sources(test_mode=False)
+
+    assert len(sources) == 1
+    assert sources[0]["download_url"] == "https://example.com/hospital-latest.csv"
+
+
+@pytest.mark.asyncio
+async def test_discover_sources_history_mode_includes_multiple_distributions(monkeypatch):
+    catalog = {
+        "dataset": [
+            {
+                "title": "Hospital Enrollments",
+                "distribution": [
+                    {
+                        "downloadURL": "https://example.com/hospital-older.csv",
+                        "mediaType": "text/csv",
+                        "title": "Hospital Enrollments : 2026-01-01",
+                        "modified": "2026-01-15",
+                        "temporal": "2026-01-01/2026-01-31",
+                    },
+                    {
+                        "downloadURL": "https://example.com/hospital-latest.csv",
+                        "mediaType": "text/csv",
+                        "title": "Hospital Enrollments : 2026-02-01",
+                        "modified": "2026-02-15",
+                        "temporal": "2026-02-01/2026-02-28",
+                    },
+                ],
+            }
+        ]
+    }
+
+    monkeypatch.setattr(provider_enrichment, "STRICT_SOURCE_PRESENCE", False)
+    monkeypatch.setattr(provider_enrichment, "INCLUDE_PROVIDER_ENRICHMENT_HISTORY", True)
+    monkeypatch.setattr(provider_enrichment, "download_it", AsyncMock(return_value=json.dumps(catalog)))
+
+    sources, _ = await provider_enrichment._discover_sources(test_mode=False)
+
+    assert len(sources) == 2
+    assert {src["download_url"] for src in sources} == {
+        "https://example.com/hospital-latest.csv",
+        "https://example.com/hospital-older.csv",
+    }
+
+
 def test_validate_headers_fails_when_required_missing():
     spec = provider_enrichment.SPEC_BY_KEY["ffs_public"]
     headers = ["NPI", "PROVIDER_TYPE_CD", "PROVIDER_TYPE_DESC"]
@@ -134,8 +210,8 @@ def test_build_row_payload_maps_ffs_fields():
 async def test_save_provider_enrichment_data_dispatch(monkeypatch):
     push_calls = []
 
-    async def fake_push(rows, cls, rewrite=False):
-        push_calls.append((cls.__tablename__, rewrite, rows))
+    async def fake_push(rows, cls, rewrite=False, use_copy=True):
+        push_calls.append((cls.__tablename__, rewrite, use_copy, rows))
 
     monkeypatch.setattr(provider_enrichment, "ensure_database", AsyncMock())
     monkeypatch.setattr(provider_enrichment, "push_objects", fake_push)
@@ -156,6 +232,7 @@ async def test_save_provider_enrichment_data_dispatch(monkeypatch):
     assert len(push_calls) == 1
     assert push_calls[0][0] == "provider_enrollment_hospital_20260306"
     assert push_calls[0][1] is True
+    assert push_calls[0][2] is False
 
 
 @pytest.mark.asyncio
