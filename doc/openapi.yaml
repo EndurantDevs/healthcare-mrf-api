@@ -623,6 +623,128 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/FormularyStatistics'
+  /formulary/partd/import/status:
+    get:
+      summary: Retrieve latest Part D import run status
+      parameters:
+        - name: run_id
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Part D import status payload
+          content:
+            application/json:
+              schema:
+                type: object
+        '404':
+          description: No run data available
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /formulary/partd/snapshots:
+    get:
+      summary: List imported Part D monthly/quarterly snapshots
+      parameters:
+        - name: run_id
+          in: query
+          schema:
+            type: string
+        - name: source_type
+          in: query
+          schema:
+            type: string
+            enum: [monthly, quarterly]
+        - name: page
+          in: query
+          schema:
+            type: integer
+        - name: limit
+          in: query
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Snapshot list payload
+          content:
+            application/json:
+              schema:
+                type: object
+  /formulary/partd/pharmacies/{npi}/activity:
+    get:
+      summary: Return Medicare activity evidence for one pharmacy NPI
+      parameters:
+        - name: npi
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: as_of
+          in: query
+          schema:
+            type: string
+            format: date
+        - name: limit
+          in: query
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Pharmacy Medicare activity payload
+          content:
+            application/json:
+              schema:
+                type: object
+  /formulary/partd/pharmacies/{npi}/medications/{code_system}/{code}/costs:
+    get:
+      summary: Return medication cost rows for one pharmacy across plans
+      parameters:
+        - name: npi
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: code_system
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [rxnorm, rxcui, ndc]
+        - name: code
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: plan_ids
+          in: query
+          schema:
+            type: string
+        - name: year
+          in: query
+          schema:
+            type: integer
+        - name: month
+          in: query
+          schema:
+            type: string
+            format: date
+        - name: page
+          in: query
+          schema:
+            type: integer
+        - name: limit
+          in: query
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Pharmacy medication cost payload
+          content:
+            application/json:
+              schema:
+                type: object
   /plan/price/{plan_id}:
     get:
       summary: Retrieve price rows for a plan

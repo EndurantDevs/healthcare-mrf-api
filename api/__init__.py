@@ -12,6 +12,7 @@ from api.endpoint.npi import blueprint as v1_npi
 from api.endpoint.nucc import blueprint as v1_nucc
 from api.endpoint.plan import blueprint as v1_plan
 from api.endpoint.pricing import blueprint as v1_pricing
+from api.endpoint.partd_formulary import blueprint as v1_partd_formulary
 from db.connection import db
 
 
@@ -29,6 +30,7 @@ def init_api(api):
             v1_nucc,
             v1_geo,
             v1_pricing,
+            v1_partd_formulary,
         ],
         version_prefix="/api/v",
     )

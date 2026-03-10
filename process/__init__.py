@@ -61,6 +61,12 @@ from process.provider_enrichment import (main as initiate_provider_enrichment,
                                          save_provider_enrichment_data,
                                          shutdown as provider_enrichment_shutdown,
                                          startup as provider_enrichment_startup)
+from process.partd_formulary_network import (
+    finish_main as finish_partd_formulary_network,
+    main as initiate_partd_formulary_network,
+    partd_formulary_network_finalize,
+    partd_formulary_network_start,
+)
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
 
@@ -292,6 +298,31 @@ class ProviderEnrichment_finish:  # pylint: disable=invalid-name
     job_deserializer = deserialize_job
 
 
+class PartDFormularyNetwork:
+    functions = [partd_formulary_network_start]
+    on_startup = db_startup
+    max_jobs = int(os.environ.get("HLTHPRT_MAX_PARTD_JOBS")) if os.environ.get("HLTHPRT_MAX_PARTD_JOBS") else 4
+    queue_read_limit = 2 * max_jobs
+    queue_name = "arq:PartDFormularyNetwork"
+    job_timeout = 86400
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
+class PartDFormularyNetwork_finish:  # pylint: disable=invalid-name
+    functions = [partd_formulary_network_finalize]
+    on_startup = db_startup
+    max_jobs = int(os.environ.get("HLTHPRT_MAX_PARTD_FINISH_JOBS")) if os.environ.get("HLTHPRT_MAX_PARTD_FINISH_JOBS") else 4
+    queue_read_limit = 2 * max_jobs
+    queue_name = "arq:PartDFormularyNetwork_finish"
+    job_timeout = 3600
+    burst = True
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
 @click.group()
 def process_group():
     """
@@ -444,12 +475,36 @@ def provider_quality_end(import_id: str, run_id: str, test: bool, manifest_path:
     )
 
 
+@click.command(help="Run CMS Part D formulary + pharmacy network import (quarterly-first)")
+@click.option("--test", is_flag=True, help="Process a smaller subset for a quick smoke run.")
+@click.option("--import-id", help="Override import id/date suffix for table names.")
+def partd_formulary_network(test: bool, import_id: str | None):
+    asyncio.run(initiate_partd_formulary_network(test_mode=test, import_id=import_id))
+
+
+@click.command(help="Finish CMS Part D formulary + pharmacy network import for a queued run id")
+@click.option("--import-id", required=True, help="Import id/date suffix used for the run.")
+@click.option("--run-id", required=True, help="Run id emitted by `start partd-formulary-network`.")
+@click.option("--test", is_flag=True, help="Use test DB suffix when finalizing.")
+@click.option("--manifest-path", help="Unused; kept for command signature consistency.")
+def partd_formulary_network_end(import_id: str, run_id: str, test: bool, manifest_path: str | None):
+    asyncio.run(
+        finish_partd_formulary_network(
+            import_id=import_id,
+            run_id=run_id,
+            test_mode=test,
+            manifest_path=manifest_path,
+        )
+    )
+
+
 process_group.add_command(mrf)
 process_group_end.add_command(mrf_end, 'mrf')
 process_group_end.add_command(claims_pricing_end, 'claims-pricing')
 process_group_end.add_command(claims_pricing_end, 'claims-procedures')
 process_group_end.add_command(drug_claims_end, 'drug-claims')
 process_group_end.add_command(provider_quality_end, 'provider-quality')
+process_group_end.add_command(partd_formulary_network_end, "partd-formulary-network")
 process_group.add_command(plan_attributes)
 process_group.add_command(npi)
 process_group.add_command(ptg)
@@ -457,6 +512,7 @@ process_group.add_command(claims_pricing, name="claims-pricing")
 process_group.add_command(claims_procedures, name="claims-procedures")
 process_group.add_command(drug_claims, name="drug-claims")
 process_group.add_command(provider_quality, name="provider-quality")
+process_group.add_command(partd_formulary_network, name="partd-formulary-network")
 process_group.add_command(provider_enrichment, name="provider-enrichment")
 process_group.add_command(geo_lookup, name="geo")
 process_group.add_command(nucc)

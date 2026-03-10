@@ -85,6 +85,214 @@ class PlanFormulary(Base, JSONOutputMixin):
     coinsurance_opt = Column(String)
 
 
+class PartDImportRun(Base, JSONOutputMixin):
+    __tablename__ = "partd_import_run_v2"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("run_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["run_id"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("status",), "name": "partd_import_run_v2_status_idx"},
+        {"index_elements": ("started_at",), "name": "partd_import_run_v2_started_at_idx"},
+    ]
+
+    run_id = Column(String(64), nullable=False)
+    import_id = Column(String(32), nullable=False)
+    status = Column(String(32), nullable=False)
+    started_at = Column(TIMESTAMP)
+    finished_at = Column(TIMESTAMP)
+    source_summary = Column(JSON)
+    error_text = Column(TEXT)
+
+
+class PartDFormularySnapshot(Base, JSONOutputMixin):
+    __tablename__ = "partd_formulary_snapshot_v2"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("snapshot_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["snapshot_id"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("run_id",), "name": "partd_formulary_snapshot_v2_run_idx"},
+        {"index_elements": ("source_type", "release_date"), "name": "partd_formulary_snapshot_v2_source_release_idx"},
+    ]
+
+    snapshot_id = Column(String(128), nullable=False)
+    run_id = Column(String(64), nullable=False)
+    source_type = Column(String(16), nullable=False)
+    source_url = Column(TEXT, nullable=False)
+    artifact_name = Column(String(256))
+    release_date = Column(DATE)
+    cutoff_month = Column(DATE)
+    status = Column(String(32), nullable=False)
+    row_count_activity = Column(Integer, nullable=False, default=0)
+    row_count_pricing = Column(Integer, nullable=False, default=0)
+    imported_at = Column(TIMESTAMP)
+    metadata_json = Column(JSON)
+
+
+class PartDPharmacyActivity(Base, JSONOutputMixin):
+    __tablename__ = "partd_pharmacy_activity_v2"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("canonical_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["canonical_id"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("snapshot_id",), "name": "partd_pharm_act_v2_snapshot_idx"},
+        {"index_elements": ("npi", "effective_from", "effective_to"), "name": "partd_pharm_act_v2_npi_effective_idx"},
+        {"index_elements": ("npi", "medicare_active"), "name": "partd_pharm_act_v2_npi_active_idx"},
+        {"index_elements": ("year",), "name": "partd_pharm_act_v2_year_idx"},
+        {"index_elements": ("plan_ids",), "using": "gin", "name": "partd_pharm_act_v2_plan_ids_gin_idx"},
+        {
+            "index_elements": ("npi", "effective_from DESC", "effective_to"),
+            "where": "medicare_active IS TRUE",
+            "name": "partd_pharm_act_v2_npi_active_effective_idx",
+        },
+    ]
+
+    canonical_id = Column(String(64), nullable=False)
+    snapshot_id = Column(String(128), nullable=False)
+    npi = Column(BigInteger, nullable=False)
+    year = Column(Integer)
+    medicare_active = Column(Boolean, nullable=False, default=True)
+    pharmacy_name = Column(String(256))
+    address_line1 = Column(String(256))
+    address_line2 = Column(String(256))
+    city = Column(String(128))
+    state = Column(String(2))
+    zip_code = Column(String(16))
+    pharmacy_type = Column(String(64))
+    mail_order = Column(Boolean)
+    effective_from = Column(DATE, nullable=False)
+    effective_to = Column(DATE)
+    source_type = Column(String(16), nullable=False)
+    plan_ids = Column(ARRAY(String), nullable=False)
+    contract_ids = Column(ARRAY(String), nullable=False)
+    segment_ids = Column(ARRAY(String), nullable=False)
+
+
+class PartDMedicationCost(Base, JSONOutputMixin):
+    __tablename__ = "partd_medication_cost_v2"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("canonical_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["canonical_id"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("snapshot_id",), "name": "partd_med_cost_v2_snapshot_idx"},
+        {"index_elements": ("code_system", "code", "year", "effective_from"), "name": "partd_med_cost_v2_code_year_effective_idx"},
+        {"index_elements": ("rxnorm_id", "year"), "name": "partd_med_cost_v2_rxnorm_year_idx"},
+        {"index_elements": ("ndc11", "year"), "name": "partd_med_cost_v2_ndc11_year_idx"},
+        {"index_elements": ("plan_ids",), "using": "gin", "name": "partd_med_cost_v2_plan_ids_gin_idx"},
+        {
+            "index_elements": ("effective_from", "effective_to"),
+            "name": "partd_med_cost_v2_effective_idx",
+        },
+        {
+            "index_elements": ("rxnorm_id",),
+            "where": "rxnorm_id IS NOT NULL",
+            "name": "partd_med_cost_v2_rxnorm_idx",
+        },
+        {
+            "index_elements": ("ndc11",),
+            "where": "ndc11 IS NOT NULL",
+            "name": "partd_med_cost_v2_ndc11_idx",
+        },
+    ]
+
+    canonical_id = Column(String(64), nullable=False)
+    snapshot_id = Column(String(128), nullable=False)
+    year = Column(Integer)
+    code_system = Column(String(16), nullable=False)
+    code = Column(String(64), nullable=False)
+    normalized_code = Column(String(64))
+    rxnorm_id = Column(String(32))
+    ndc11 = Column(String(16))
+    days_supply = Column(Integer, nullable=False, default=0)
+    drug_name = Column(String(256))
+    tier = Column(String(64))
+    pharmacy_type = Column(String(64))
+    mail_order = Column(Boolean)
+    cost_type = Column(String(64), nullable=False)
+    cost_amount = Column(Float)
+    effective_from = Column(DATE, nullable=False)
+    effective_to = Column(DATE)
+    source_type = Column(String(16), nullable=False)
+    plan_ids = Column(ARRAY(String), nullable=False)
+    contract_ids = Column(ARRAY(String), nullable=False)
+    segment_ids = Column(ARRAY(String), nullable=False)
+
+
+class PartDPharmacyActivityStage(Base, JSONOutputMixin):
+    __tablename__ = "partd_pharmacy_activity_stage_v2"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_additional_indexes__ = [
+        {"index_elements": ("snapshot_id",), "name": "partd_pharm_act_stage_v2_snapshot_idx"},
+    ]
+    id = Column(BigInteger, autoincrement=True)
+    snapshot_id = Column(String(128), nullable=False)
+    npi = Column(BigInteger, nullable=False)
+    plan_id = Column(String(32), nullable=False)
+    contract_id = Column(String(32), nullable=False)
+    segment_id = Column(String(32), nullable=False)
+    year = Column(Integer)
+    medicare_active = Column(Boolean, nullable=False, default=True)
+    pharmacy_name = Column(String(256))
+    address_line1 = Column(String(256))
+    address_line2 = Column(String(256))
+    city = Column(String(128))
+    state = Column(String(2))
+    zip_code = Column(String(16))
+    pharmacy_type = Column(String(64))
+    mail_order = Column(Boolean)
+    effective_from = Column(DATE, nullable=False)
+    effective_to = Column(DATE)
+    source_type = Column(String(16), nullable=False)
+
+
+class PartDMedicationCostStage(Base, JSONOutputMixin):
+    __tablename__ = "partd_medication_cost_stage_v2"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_additional_indexes__ = [
+        {"index_elements": ("snapshot_id",), "name": "partd_med_cost_stage_v2_snapshot_idx"},
+    ]
+    id = Column(BigInteger, autoincrement=True)
+    snapshot_id = Column(String(128), nullable=False)
+    plan_id = Column(String(32), nullable=False)
+    contract_id = Column(String(32), nullable=False)
+    segment_id = Column(String(32), nullable=False)
+    year = Column(Integer)
+    code_system = Column(String(16), nullable=False)
+    code = Column(String(64), nullable=False)
+    normalized_code = Column(String(64))
+    rxnorm_id = Column(String(32))
+    ndc11 = Column(String(16))
+    days_supply = Column(Integer, nullable=False, default=0)
+    drug_name = Column(String(256))
+    tier = Column(String(64))
+    pharmacy_type = Column(String(64))
+    mail_order = Column(Boolean)
+    cost_type = Column(String(64), nullable=False)
+    cost_amount = Column(Float)
+    effective_from = Column(DATE, nullable=False)
+    effective_to = Column(DATE)
+    source_type = Column(String(16), nullable=False)
+
+
 class PlanIndividual(Base, JSONOutputMixin):
     __tablename__ = 'plan_individual'
     __main_table__ = __tablename__
