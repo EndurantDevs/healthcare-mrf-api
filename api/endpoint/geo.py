@@ -167,9 +167,14 @@ async def get_geo_by_city(request):
             geo_zip_table.c.latitude.label("latitude"),
             geo_zip_table.c.longitude.label("longitude"),
             geo_zip_table.c.timezone.label("timezone"),
+            geo_zip_table.c.population.label("population"),
         )
         .where(geo_zip_table.c.city_lower == city.strip().lower())
-        .order_by(geo_zip_table.c.state.asc(), geo_zip_table.c.zip_code.asc())
+        .order_by(
+            geo_zip_table.c.state.asc(),
+            geo_zip_table.c.population.desc().nullslast(),
+            geo_zip_table.c.zip_code.asc(),
+        )
         .limit(500)
     )
     if state:
@@ -189,6 +194,7 @@ async def get_geo_by_city(request):
                 "state_name": row.get("state_name"),
                 "city": row.get("city"),
                 "county_name": row.get("county_name"),
+                "population": row.get("population"),
                 "lat": row.get("latitude"),
                 "long": row.get("longitude"),
                 "timezone": row.get("timezone"),
