@@ -227,6 +227,21 @@ def stop_partd_formulary_network(burst: bool, import_id: str | None):
     _run_worker_command("process.PartDFormularyNetwork_finish", True, env)
 
 
+@stop.command("pharmacy-license")
+@click.option("--burst/--no-burst", default=True, help="Match arq worker burst mode (defaults to burst).")
+@click.option("--import-id", help="Override the import_id/import_date passed to worker startup.")
+def stop_pharmacy_license(burst: bool, import_id: str | None):
+    """Drain pharmacy-license jobs and run the finalize queue."""
+    env = os.environ.copy()
+    if import_id:
+        env["HLTHPRT_IMPORT_ID_OVERRIDE"] = import_id
+    else:
+        env.pop("HLTHPRT_IMPORT_ID_OVERRIDE", None)
+
+    _run_worker_command("process.PharmacyLicense", burst, env)
+    _run_worker_command("process.PharmacyLicense_finish", True, env)
+
+
 cli.add_command(stop, name="stop")
 cli.add_command(arq.cli.cli, name="worker")
 cli.add_command(manage, name="manage")

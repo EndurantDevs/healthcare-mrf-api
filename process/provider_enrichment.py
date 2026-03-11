@@ -24,7 +24,11 @@ from db.models import (
     NPIData,
     PricingProvider,
     ProviderEnrichmentSummary,
+    ProviderEnrollmentFFSAdditionalNPI,
+    ProviderEnrollmentFFSAddress,
     ProviderEnrollmentFFS,
+    ProviderEnrollmentFFSReassignment,
+    ProviderEnrollmentFFSSecondarySpecialty,
     ProviderEnrollmentFQHC,
     ProviderEnrollmentHomeHealthAgency,
     ProviderEnrollmentHospital,
@@ -56,6 +60,7 @@ CATALOG_URL = os.getenv("HLTHPRT_PROVIDER_ENRICHMENT_CATALOG_URL", "https://data
 SOURCE_DOWNLOAD_CHUNK_SIZE = 10 * 1024 * 1024
 DEFAULT_MAX_PENDING_SAVE_TASKS = 4
 DEFAULT_PROVIDER_ENRICHMENT_BATCH_SIZE = 5000
+FFS_LATEST_DESCRIPTION = "latest"
 CSV_PRIMARY_ENCODING = "utf-8-sig"
 CSV_FALLBACK_ENCODING = "cp1252"
 CSV_PROBE_CHUNK_SIZE = 1024 * 1024
@@ -193,6 +198,11 @@ def _is_csv_distribution(obj: dict[str, Any]) -> bool:
     return "csv" in media_type or "csv" in fmt
 
 
+def _looks_like_csv_download(url: str) -> bool:
+    normalized = str(url or "").strip().lower()
+    return normalized.endswith(".csv")
+
+
 def _extract_period_bounds(temporal: str | None) -> tuple[datetime.date | None, datetime.date | None]:
     text = str(temporal or "").strip()
     if not text or "/" not in text:
@@ -272,6 +282,10 @@ ENROLLMENT_DATASET_SPECS: tuple[dict[str, Any], ...] = (
         ),
         "model": ProviderEnrollmentFFS,
         "task_key": "ffs_rows",
+        "discovery": "ffs_resource_bundle",
+        "resource_name_patterns": (
+            "medicare ffs public provider enrollment",
+        ),
         "fields": COMMON_FIELDS
         + (
             _make_field("pecos_asct_cntl_id", ("PECOS_ASCT_CNTL_ID",)),
@@ -280,6 +294,61 @@ ENROLLMENT_DATASET_SPECS: tuple[dict[str, Any], ...] = (
             _make_field("last_name", ("LAST_NAME",)),
             _make_field("org_name", ("ORG_NAME",)),
         ),
+    },
+    {
+        "key": "ffs_additional_npi",
+        "label": "Medicare FFS Additional NPIs",
+        "model": ProviderEnrollmentFFSAdditionalNPI,
+        "task_key": "ffs_additional_npi_rows",
+        "discovery": "ffs_resource_bundle",
+        "resource_name_patterns": ("additional npis sub-file",),
+        "fields": (
+            _make_field("enrollment_id", ("ENRLMT_ID", "ENROLLMENT ID"), required=True),
+            _make_field("additional_npi", ("NPI",), required=True),
+        ),
+        "payload_builder": "ffs_additional_npi",
+    },
+    {
+        "key": "ffs_reassignment",
+        "label": "Medicare FFS Reassignment",
+        "model": ProviderEnrollmentFFSReassignment,
+        "task_key": "ffs_reassignment_rows",
+        "discovery": "ffs_resource_bundle",
+        "resource_name_patterns": ("reassignment sub-file",),
+        "fields": (
+            _make_field("reassigning_enrollment_id", ("REASGN_BNFT_ENRLMT_ID",), required=True),
+            _make_field("receiving_enrollment_id", ("RCV_BNFT_ENRLMT_ID",), required=True),
+        ),
+        "payload_builder": "ffs_reassignment",
+    },
+    {
+        "key": "ffs_address",
+        "label": "Medicare FFS Practice Locations",
+        "model": ProviderEnrollmentFFSAddress,
+        "task_key": "ffs_address_rows",
+        "discovery": "ffs_resource_bundle",
+        "resource_name_patterns": ("address sub-file",),
+        "fields": (
+            _make_field("enrollment_id", ("ENRLMT_ID", "ENROLLMENT ID"), required=True),
+            _make_field("city", ("CITY_NAME", "CITY")),
+            _make_field("state", ("STATE_CD", "STATE")),
+            _make_field("zip_code", ("ZIP_CD", "ZIP CODE"), required=True),
+        ),
+        "payload_builder": "ffs_address",
+    },
+    {
+        "key": "ffs_secondary_specialty",
+        "label": "Medicare FFS Secondary Specialties",
+        "model": ProviderEnrollmentFFSSecondarySpecialty,
+        "task_key": "ffs_secondary_specialty_rows",
+        "discovery": "ffs_resource_bundle",
+        "resource_name_patterns": ("secondary specialty sub-file",),
+        "fields": (
+            _make_field("enrollment_id", ("ENRLMT_ID", "ENROLLMENT ID"), required=True),
+            _make_field("provider_type_code", ("PROVIDER_TYPE_CD",), required=True),
+            _make_field("provider_type_text", ("PROVIDER_TYPE_DESC",)),
+        ),
+        "payload_builder": "ffs_secondary_specialty",
     },
     {
         "key": "hospital",
@@ -369,6 +438,8 @@ ENROLLMENT_DATASET_SPECS: tuple[dict[str, Any], ...] = (
 
 SPEC_BY_KEY = {spec["key"]: spec for spec in ENROLLMENT_DATASET_SPECS}
 TASK_KEY_TO_MODEL = {spec["task_key"]: spec["model"] for spec in ENROLLMENT_DATASET_SPECS}
+CATALOG_DISCOVERY_SPECS = tuple(spec for spec in ENROLLMENT_DATASET_SPECS if spec.get("discovery") != "ffs_resource_bundle")
+FFS_RESOURCE_BUNDLE_SPECS = tuple(spec for spec in ENROLLMENT_DATASET_SPECS if spec.get("discovery") == "ffs_resource_bundle")
 PROCESSING_CLASSES = tuple(spec["model"] for spec in ENROLLMENT_DATASET_SPECS) + (ProviderEnrichmentSummary,)
 
 
@@ -379,11 +450,28 @@ async def _table_exists(schema: str, table: str) -> bool:
 
 def _match_spec(title: str) -> dict[str, Any] | None:
     normalized = _normalize_title(title)
-    for spec in ENROLLMENT_DATASET_SPECS:
+    for spec in CATALOG_DISCOVERY_SPECS:
         for pattern in spec["title_patterns"]:
             if _normalize_title(pattern) == normalized:
                 return spec
     return None
+
+
+def _match_ffs_resource_spec(name: str) -> dict[str, Any] | None:
+    normalized = _normalize_title(name)
+    for spec in FFS_RESOURCE_BUNDLE_SPECS:
+        for pattern in spec.get("resource_name_patterns") or ():
+            if _normalize_title(pattern) in normalized:
+                return spec
+    return None
+
+
+def _is_ffs_bundle_dataset_title(title: str) -> bool:
+    normalized = _normalize_title(title)
+    for pattern in SPEC_BY_KEY["ffs_public"].get("title_patterns") or ():
+        if _normalize_title(pattern) == normalized:
+            return True
+    return False
 
 
 def _looks_like_provider_enrollment_title(title: str) -> bool:
@@ -427,11 +515,98 @@ async def _discover_sources(test_mode: bool) -> tuple[list[dict[str, Any]], list
     discovered: list[dict[str, Any]] = []
     seen_urls: set[str] = set()
 
+    async def _discover_ffs_resource_bundle() -> None:
+        ffs_dataset = None
+        for dataset in datasets:
+            if not isinstance(dataset, dict):
+                continue
+            if _is_ffs_bundle_dataset_title(str(dataset.get("title") or "")):
+                ffs_dataset = dataset
+                break
+
+        if ffs_dataset is None:
+            if STRICT_SOURCE_PRESENCE:
+                raise RuntimeError("No FFS provider-enrollment dataset found in CMS catalog.")
+            return
+
+        resources_api = None
+        latest_distribution = None
+        for distribution in ffs_dataset.get("distribution") or []:
+            if not isinstance(distribution, dict):
+                continue
+            if _normalize_title(distribution.get("description") or "") != FFS_LATEST_DESCRIPTION:
+                continue
+            resources_api = str(distribution.get("resourcesAPI") or "").strip()
+            latest_distribution = distribution
+            if resources_api:
+                break
+
+        if not resources_api:
+            if STRICT_SOURCE_PRESENCE:
+                raise RuntimeError("FFS provider-enrollment dataset is missing a latest resources API.")
+            return
+
+        resource_payload = await download_it(resources_api)
+        resources = (json.loads(resource_payload).get("data") or [])
+        bundle_hits: set[str] = set()
+        resource_modified = _safe_datetime(latest_distribution.get("modified")) if latest_distribution else None
+        resource_temporal = _safe_text(latest_distribution.get("temporal")) if latest_distribution else None
+        period_start, period_end = _extract_period_bounds(resource_temporal)
+
+        for resource in resources:
+            if not isinstance(resource, dict):
+                continue
+            resource_name = str(resource.get("name") or "").strip()
+            download_url = str(resource.get("downloadURL") or "").strip()
+            if not resource_name or not download_url:
+                continue
+            if "historical" in _normalize_title(resource_name):
+                continue
+            if not _looks_like_csv_download(download_url):
+                continue
+            spec = _match_ffs_resource_spec(resource_name)
+            if spec is None or download_url in seen_urls:
+                continue
+
+            reporting_year = _extract_year(
+                resource_name,
+                latest_distribution.get("title") if latest_distribution else None,
+                latest_distribution.get("modified") if latest_distribution else None,
+            ) or datetime.datetime.utcnow().year
+
+            discovered.append(
+                {
+                    "spec_key": spec["key"],
+                    "dataset_title": ffs_dataset.get("title"),
+                    "distribution_title": resource_name,
+                    "download_url": download_url,
+                    "source_modified": resource_modified,
+                    "source_temporal": resource_temporal,
+                    "reporting_period_start": period_start,
+                    "reporting_period_end": period_end,
+                    "reporting_year": reporting_year,
+                }
+            )
+            seen_urls.add(download_url)
+            bundle_hits.add(spec["key"])
+
+        if STRICT_SOURCE_PRESENCE:
+            missing = sorted(spec["key"] for spec in FFS_RESOURCE_BUNDLE_SPECS if spec["key"] not in bundle_hits)
+            if missing:
+                raise RuntimeError(
+                    "FFS provider-enrollment resource bundle is missing required CSV files: "
+                    + ", ".join(missing)
+                )
+
+    await _discover_ffs_resource_bundle()
+
     for dataset in datasets:
         if not isinstance(dataset, dict):
             continue
         dataset_title = str(dataset.get("title") or "")
         if not dataset_title:
+            continue
+        if _is_ffs_bundle_dataset_title(dataset_title):
             continue
 
         spec = _match_spec(dataset_title)
@@ -487,7 +662,7 @@ async def _discover_sources(test_mode: bool) -> tuple[list[dict[str, Any]], list
             )
 
     if STRICT_SOURCE_PRESENCE:
-        for spec in ENROLLMENT_DATASET_SPECS:
+        for spec in CATALOG_DISCOVERY_SPECS:
             if not any(src.get("spec_key") == spec["key"] for src in discovered):
                 raise RuntimeError(
                     f"No sources discovered for registered dataset '{spec['label']}' ({spec['key']})."
@@ -552,7 +727,21 @@ def _model_columns(cls: type) -> set[str]:
     return {column.name for column in cls.__table__.columns}
 
 
-def _build_row_payload(
+def _base_source_payload(source: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "reporting_period_start": source.get("reporting_period_start"),
+        "reporting_period_end": source.get("reporting_period_end"),
+        "reporting_year": source.get("reporting_year"),
+        "source_dataset_title": _safe_text(source.get("dataset_title")),
+        "source_distribution_title": _safe_text(source.get("distribution_title")),
+        "source_url": _safe_text(source.get("download_url")),
+        "source_modified": source.get("source_modified"),
+        "source_temporal": _safe_text(source.get("source_temporal")),
+        "imported_at": datetime.datetime.utcnow(),
+    }
+
+
+def _build_enrollment_row_payload(
     row: dict[str, Any],
     spec: dict[str, Any],
     source: dict[str, Any],
@@ -568,9 +757,7 @@ def _build_row_payload(
 
     payload: dict[str, Any] = {
         "npi": int(npi),
-        "reporting_period_start": source.get("reporting_period_start"),
-        "reporting_period_end": source.get("reporting_period_end"),
-        "reporting_year": source.get("reporting_year"),
+        **_base_source_payload(source),
         "enrollment_id": _safe_text(canonical.get("enrollment_id")),
         "enrollment_state": _safe_state(canonical.get("enrollment_state")),
         "provider_type_code": _safe_text(canonical.get("provider_type_code")),
@@ -590,12 +777,6 @@ def _build_row_payload(
         "city": _safe_text(canonical.get("city")),
         "state": _safe_state(canonical.get("state")),
         "zip_code": _safe_zip(canonical.get("zip_code")),
-        "source_dataset_title": _safe_text(source.get("dataset_title")),
-        "source_distribution_title": _safe_text(source.get("distribution_title")),
-        "source_url": _safe_text(source.get("download_url")),
-        "source_modified": source.get("source_modified"),
-        "source_temporal": _safe_text(source.get("source_temporal")),
-        "imported_at": datetime.datetime.utcnow(),
     }
 
     if "pecos_asct_cntl_id" in model_columns:
@@ -659,6 +840,147 @@ def _build_row_payload(
     return payload, None
 
 
+def _build_ffs_additional_npi_row_payload(
+    row: dict[str, Any],
+    spec: dict[str, Any],
+    source: dict[str, Any],
+    model_columns: set[str],
+) -> tuple[dict[str, Any] | None, str | None]:
+    enrollment_id = _safe_text(_resolve_header(row, ("ENRLMT_ID", "ENROLLMENT ID")))
+    additional_npi = _safe_int(_resolve_header(row, ("NPI",)))
+    if not enrollment_id:
+        return None, "missing_enrollment_id"
+    if not additional_npi:
+        return None, "missing_npi"
+
+    payload = {
+        **_base_source_payload(source),
+        "enrollment_id": enrollment_id,
+        "additional_npi": int(additional_npi),
+    }
+    payload = {key: value for key, value in payload.items() if key in model_columns}
+    payload["record_hash"] = return_checksum(
+        [spec["key"], payload.get("enrollment_id"), payload.get("additional_npi"), payload.get("reporting_year")]
+    )
+    return payload, None
+
+
+def _build_ffs_address_row_payload(
+    row: dict[str, Any],
+    spec: dict[str, Any],
+    source: dict[str, Any],
+    model_columns: set[str],
+) -> tuple[dict[str, Any] | None, str | None]:
+    enrollment_id = _safe_text(_resolve_header(row, ("ENRLMT_ID", "ENROLLMENT ID")))
+    if not enrollment_id:
+        return None, "missing_enrollment_id"
+
+    payload = {
+        **_base_source_payload(source),
+        "enrollment_id": enrollment_id,
+        "city": _safe_text(_resolve_header(row, ("CITY_NAME", "CITY"))),
+        "state": _safe_state(_resolve_header(row, ("STATE_CD", "STATE"))),
+        "zip_code": _safe_zip(_resolve_header(row, ("ZIP_CD", "ZIP CODE"))),
+    }
+    if not payload.get("zip_code"):
+        return None, "missing_zip_code"
+    payload = {key: value for key, value in payload.items() if key in model_columns}
+    payload["record_hash"] = return_checksum(
+        [
+            spec["key"],
+            payload.get("enrollment_id"),
+            payload.get("city"),
+            payload.get("state"),
+            payload.get("zip_code"),
+            payload.get("reporting_year"),
+        ]
+    )
+    return payload, None
+
+
+def _build_ffs_secondary_specialty_row_payload(
+    row: dict[str, Any],
+    spec: dict[str, Any],
+    source: dict[str, Any],
+    model_columns: set[str],
+) -> tuple[dict[str, Any] | None, str | None]:
+    enrollment_id = _safe_text(_resolve_header(row, ("ENRLMT_ID", "ENROLLMENT ID")))
+    provider_type_code = _safe_text(_resolve_header(row, ("PROVIDER_TYPE_CD",)))
+    if not enrollment_id:
+        return None, "missing_enrollment_id"
+    if not provider_type_code:
+        return None, "missing_provider_type_code"
+
+    payload = {
+        **_base_source_payload(source),
+        "enrollment_id": enrollment_id,
+        "provider_type_code": provider_type_code,
+        "provider_type_text": _safe_text(_resolve_header(row, ("PROVIDER_TYPE_DESC",))),
+    }
+    payload = {key: value for key, value in payload.items() if key in model_columns}
+    payload["record_hash"] = return_checksum(
+        [
+            spec["key"],
+            payload.get("enrollment_id"),
+            payload.get("provider_type_code"),
+            payload.get("provider_type_text"),
+            payload.get("reporting_year"),
+        ]
+    )
+    return payload, None
+
+
+def _build_ffs_reassignment_row_payload(
+    row: dict[str, Any],
+    spec: dict[str, Any],
+    source: dict[str, Any],
+    model_columns: set[str],
+) -> tuple[dict[str, Any] | None, str | None]:
+    reassigning_enrollment_id = _safe_text(_resolve_header(row, ("REASGN_BNFT_ENRLMT_ID",)))
+    receiving_enrollment_id = _safe_text(_resolve_header(row, ("RCV_BNFT_ENRLMT_ID",)))
+    if not reassigning_enrollment_id:
+        return None, "missing_reassigning_enrollment_id"
+    if not receiving_enrollment_id:
+        return None, "missing_receiving_enrollment_id"
+
+    payload = {
+        **_base_source_payload(source),
+        "reassigning_enrollment_id": reassigning_enrollment_id,
+        "receiving_enrollment_id": receiving_enrollment_id,
+    }
+    payload = {key: value for key, value in payload.items() if key in model_columns}
+    payload["record_hash"] = return_checksum(
+        [
+            spec["key"],
+            payload.get("reassigning_enrollment_id"),
+            payload.get("receiving_enrollment_id"),
+            payload.get("reporting_year"),
+        ]
+    )
+    return payload, None
+
+
+PAYLOAD_BUILDERS = {
+    "ffs_additional_npi": _build_ffs_additional_npi_row_payload,
+    "ffs_address": _build_ffs_address_row_payload,
+    "ffs_reassignment": _build_ffs_reassignment_row_payload,
+    "ffs_secondary_specialty": _build_ffs_secondary_specialty_row_payload,
+}
+
+
+def _build_row_payload(
+    row: dict[str, Any],
+    spec: dict[str, Any],
+    source: dict[str, Any],
+    model_columns: set[str],
+) -> tuple[dict[str, Any] | None, str | None]:
+    builder_name = _safe_text(spec.get("payload_builder"))
+    if builder_name:
+        builder = PAYLOAD_BUILDERS[builder_name]
+        return builder(row, spec, source, model_columns)
+    return _build_enrollment_row_payload(row, spec, source, model_columns)
+
+
 async def _download_source(url: str, target_path: str) -> None:
     await download_it_and_save(
         url,
@@ -666,6 +988,40 @@ async def _download_source(url: str, target_path: str) -> None:
         chunk_size=SOURCE_DOWNLOAD_CHUNK_SIZE,
         cache_dir="/tmp",
     )
+
+
+async def _prepare_staging_tables(import_date: str, db_schema: str) -> None:
+    tables = {}
+
+    for cls in PROCESSING_CLASSES:
+        tables[cls.__main_table__] = make_class(cls, import_date)
+        obj = tables[cls.__main_table__]
+        try:
+            await db.status(f"DROP TABLE IF EXISTS {db_schema}.{obj.__tablename__};")
+            await db.create_table(obj.__table__, checkfirst=True)
+            if hasattr(obj, "__my_index_elements__") and obj.__my_index_elements__:
+                await db.status(
+                    f"CREATE UNIQUE INDEX {obj.__tablename__}_idx_primary "
+                    f"ON {db_schema}.{obj.__tablename__} ({', '.join(obj.__my_index_elements__)});"
+                )
+
+            if hasattr(cls, "__my_initial_indexes__") and cls.__my_initial_indexes__:
+                for index in cls.__my_initial_indexes__:
+                    index_name = index.get("name", "_".join(index.get("index_elements")))
+                    using = f"USING {index.get('using')} " if index.get("using") else ""
+                    unique = " UNIQUE " if index.get("unique") else " "
+                    where = f" WHERE {index.get('where')} " if index.get("where") else ""
+                    create_index_sql = (
+                        f"CREATE{unique}INDEX IF NOT EXISTS {obj.__tablename__}_idx_{index_name} "
+                        f"ON {db_schema}.{obj.__tablename__} {using}"
+                        f"({', '.join(index.get('index_elements'))}){where};"
+                    )
+                    print(create_index_sql)
+                    await db.status(create_index_sql)
+        except DuplicateTableError:
+            continue
+
+    print(f"Preparing provider-enrichment staging tables done for schema={db_schema} import_date={import_date}")
 
 
 async def _run_nppes_gap_check(ctx: dict[str, Any]) -> dict[str, Any]:
@@ -763,6 +1119,8 @@ async def process_data(ctx, task=None):  # pragma: no cover
     test_mode = bool(ctx["context"].get("test_mode", False))
 
     await ensure_database(test_mode)
+    db_schema = os.getenv("HLTHPRT_DB_SCHEMA") if os.getenv("HLTHPRT_DB_SCHEMA") else "mrf"
+    await _prepare_staging_tables(ctx["import_date"], db_schema)
 
     audit = ctx["context"].setdefault(
         "audit",
@@ -903,38 +1261,7 @@ async def startup(ctx):  # pragma: no cover
 
     db_schema = os.getenv("HLTHPRT_DB_SCHEMA") if os.getenv("HLTHPRT_DB_SCHEMA") else "mrf"
     await db.status(f"CREATE SCHEMA IF NOT EXISTS {db_schema};")
-
-    tables = {}
-
-    for cls in PROCESSING_CLASSES:
-        tables[cls.__main_table__] = make_class(cls, import_date)
-        obj = tables[cls.__main_table__]
-        try:
-            await db.status(f"DROP TABLE IF EXISTS {db_schema}.{obj.__tablename__};")
-            await db.create_table(obj.__table__, checkfirst=True)
-            if hasattr(obj, "__my_index_elements__") and obj.__my_index_elements__:
-                await db.status(
-                    f"CREATE UNIQUE INDEX {obj.__tablename__}_idx_primary "
-                    f"ON {db_schema}.{obj.__tablename__} ({', '.join(obj.__my_index_elements__)});"
-                )
-
-            if hasattr(cls, "__my_initial_indexes__") and cls.__my_initial_indexes__:
-                for index in cls.__my_initial_indexes__:
-                    index_name = index.get("name", "_".join(index.get("index_elements")))
-                    using = f"USING {index.get('using')} " if index.get("using") else ""
-                    unique = " UNIQUE " if index.get("unique") else " "
-                    where = f" WHERE {index.get('where')} " if index.get("where") else ""
-                    create_index_sql = (
-                        f"CREATE{unique}INDEX IF NOT EXISTS {obj.__tablename__}_idx_{index_name} "
-                        f"ON {db_schema}.{obj.__tablename__} {using}"
-                        f"({', '.join(index.get('index_elements'))}){where};"
-                    )
-                    print(create_index_sql)
-                    await db.status(create_index_sql)
-        except DuplicateTableError:
-            continue
-
-    print("Preparing provider-enrichment staging tables done")
+    print(f"Provider-enrichment startup ready for schema={db_schema} import_date={import_date}")
 
 
 async def _materialize_summary(import_date: str, db_schema: str, nppes_report: dict[str, Any]) -> None:
@@ -945,9 +1272,16 @@ async def _materialize_summary(import_date: str, db_schema: str, nppes_report: d
 
     summary_stage = table_map[ProviderEnrichmentSummary.__main_table__]
     await db.status(f"TRUNCATE TABLE {db_schema}.{summary_stage.__tablename__};")
+    ffs_table = table_map[ProviderEnrollmentFFS.__main_table__].__tablename__
+    ffs_additional_npi_table = table_map[ProviderEnrollmentFFSAdditionalNPI.__main_table__].__tablename__
+    ffs_address_table = table_map[ProviderEnrollmentFFSAddress.__main_table__].__tablename__
+    ffs_secondary_specialty_table = table_map[ProviderEnrollmentFFSSecondarySpecialty.__main_table__].__tablename__
+    ffs_reassignment_table = table_map[ProviderEnrollmentFFSReassignment.__main_table__].__tablename__
 
     union_parts = []
     for spec in ENROLLMENT_DATASET_SPECS:
+        if spec["key"] in {"ffs_additional_npi", "ffs_reassignment", "ffs_address", "ffs_secondary_specialty"}:
+            continue
         table_name = table_map[spec["model"].__main_table__].__tablename__
         union_parts.append(
             f"""
@@ -1007,6 +1341,17 @@ async def _materialize_summary(import_date: str, db_schema: str, nppes_report: d
             states,
             provider_type_codes,
             provider_type_texts,
+            ffs_enrollment_ids,
+            ffs_pecos_asct_cntl_ids,
+            ffs_secondary_provider_type_codes,
+            ffs_secondary_provider_type_texts,
+            ffs_practice_zip_codes,
+            ffs_practice_cities,
+            ffs_practice_states,
+            ffs_related_npis,
+            ffs_related_npi_count,
+            ffs_reassignment_in_count,
+            ffs_reassignment_out_count,
             primary_state,
             primary_provider_type_code,
             primary_provider_type_text,
@@ -1046,6 +1391,69 @@ async def _materialize_summary(import_date: str, db_schema: str, nppes_report: d
               FROM enrollment_union
              ORDER BY npi, reporting_year DESC NULLS LAST
         ),
+        ffs_base AS (
+            SELECT
+                npi::bigint AS npi,
+                enrollment_id::varchar AS enrollment_id,
+                NULLIF(pecos_asct_cntl_id, '')::varchar AS pecos_asct_cntl_id
+              FROM {db_schema}.{ffs_table}
+             WHERE npi IS NOT NULL
+               AND enrollment_id IS NOT NULL
+        ),
+        ffs_rollup AS (
+            SELECT
+                npi,
+                ARRAY_REMOVE(ARRAY_AGG(DISTINCT enrollment_id), NULL)::varchar[] AS ffs_enrollment_ids,
+                ARRAY_REMOVE(ARRAY_AGG(DISTINCT pecos_asct_cntl_id), NULL)::varchar[] AS ffs_pecos_asct_cntl_ids
+              FROM ffs_base
+             GROUP BY npi
+        ),
+        ffs_secondary AS (
+            SELECT
+                f.npi,
+                ARRAY_REMOVE(ARRAY_AGG(DISTINCT s.provider_type_code), NULL)::varchar[] AS ffs_secondary_provider_type_codes,
+                ARRAY_REMOVE(ARRAY_AGG(DISTINCT s.provider_type_text), NULL)::varchar[] AS ffs_secondary_provider_type_texts
+              FROM {db_schema}.{ffs_secondary_specialty_table} AS s
+              JOIN ffs_base AS f ON f.enrollment_id = s.enrollment_id
+             GROUP BY f.npi
+        ),
+        ffs_locations AS (
+            SELECT
+                f.npi,
+                ARRAY_REMOVE(ARRAY_AGG(DISTINCT a.zip_code), NULL)::varchar[] AS ffs_practice_zip_codes,
+                ARRAY_REMOVE(ARRAY_AGG(DISTINCT a.city), NULL)::varchar[] AS ffs_practice_cities,
+                ARRAY_REMOVE(ARRAY_AGG(DISTINCT a.state), NULL)::varchar[] AS ffs_practice_states
+              FROM {db_schema}.{ffs_address_table} AS a
+              JOIN ffs_base AS f ON f.enrollment_id = a.enrollment_id
+             GROUP BY f.npi
+        ),
+        ffs_related AS (
+            SELECT
+                f.npi,
+                ARRAY_REMOVE(
+                    ARRAY_AGG(DISTINCT CASE WHEN a.additional_npi IS NOT NULL AND a.additional_npi <> f.npi THEN a.additional_npi END),
+                    NULL
+                )::bigint[] AS ffs_related_npis
+              FROM {db_schema}.{ffs_additional_npi_table} AS a
+              JOIN ffs_base AS f ON f.enrollment_id = a.enrollment_id
+             GROUP BY f.npi
+        ),
+        ffs_reassignment_out AS (
+            SELECT
+                f.npi,
+                COUNT(*)::int AS ffs_reassignment_out_count
+              FROM {db_schema}.{ffs_reassignment_table} AS r
+              JOIN ffs_base AS f ON f.enrollment_id = r.reassigning_enrollment_id
+             GROUP BY f.npi
+        ),
+        ffs_reassignment_in AS (
+            SELECT
+                f.npi,
+                COUNT(*)::int AS ffs_reassignment_in_count
+              FROM {db_schema}.{ffs_reassignment_table} AS r
+              JOIN ffs_base AS f ON f.enrollment_id = r.receiving_enrollment_id
+             GROUP BY f.npi
+        ),
         pricing AS (
             {pricing_cte}
         )
@@ -1069,6 +1477,17 @@ async def _materialize_summary(import_date: str, db_schema: str, nppes_report: d
             COALESCE(a.states, ARRAY[]::varchar[]) AS states,
             COALESCE(a.provider_type_codes, ARRAY[]::varchar[]) AS provider_type_codes,
             COALESCE(a.provider_type_texts, ARRAY[]::varchar[]) AS provider_type_texts,
+            COALESCE(fr.ffs_enrollment_ids, ARRAY[]::varchar[]) AS ffs_enrollment_ids,
+            COALESCE(fr.ffs_pecos_asct_cntl_ids, ARRAY[]::varchar[]) AS ffs_pecos_asct_cntl_ids,
+            COALESCE(fs.ffs_secondary_provider_type_codes, ARRAY[]::varchar[]) AS ffs_secondary_provider_type_codes,
+            COALESCE(fs.ffs_secondary_provider_type_texts, ARRAY[]::varchar[]) AS ffs_secondary_provider_type_texts,
+            COALESCE(fl.ffs_practice_zip_codes, ARRAY[]::varchar[]) AS ffs_practice_zip_codes,
+            COALESCE(fl.ffs_practice_cities, ARRAY[]::varchar[]) AS ffs_practice_cities,
+            COALESCE(fl.ffs_practice_states, ARRAY[]::varchar[]) AS ffs_practice_states,
+            COALESCE(frn.ffs_related_npis, ARRAY[]::bigint[]) AS ffs_related_npis,
+            COALESCE(CARDINALITY(frn.ffs_related_npis), 0)::int AS ffs_related_npi_count,
+            COALESCE(fri.ffs_reassignment_in_count, 0)::int AS ffs_reassignment_in_count,
+            COALESCE(fro.ffs_reassignment_out_count, 0)::int AS ffs_reassignment_out_count,
             lp.primary_state,
             lp.primary_provider_type_code,
             lp.primary_provider_type_text,
@@ -1081,6 +1500,12 @@ async def _materialize_summary(import_date: str, db_schema: str, nppes_report: d
             now()::timestamp AS updated_at
           FROM agg AS a
           LEFT JOIN latest_provider AS lp ON lp.npi = a.npi
+          LEFT JOIN ffs_rollup AS fr ON fr.npi = a.npi
+          LEFT JOIN ffs_secondary AS fs ON fs.npi = a.npi
+          LEFT JOIN ffs_locations AS fl ON fl.npi = a.npi
+          LEFT JOIN ffs_related AS frn ON frn.npi = a.npi
+          LEFT JOIN ffs_reassignment_in AS fri ON fri.npi = a.npi
+          LEFT JOIN ffs_reassignment_out AS fro ON fro.npi = a.npi
           LEFT JOIN pricing AS p ON p.npi = a.npi;
     """
 
@@ -1115,6 +1540,23 @@ async def shutdown(ctx):  # pragma: no cover
                 "cannot finalize provider-enrichment publish."
             )
 
+    required_nonempty_tables = (
+        ProviderEnrollmentFFS,
+        ProviderEnrollmentFFSAdditionalNPI,
+        ProviderEnrollmentFFSAddress,
+        ProviderEnrollmentFFSSecondarySpecialty,
+        ProviderEnrollmentFFSReassignment,
+    )
+    for cls in required_nonempty_tables:
+        stage_obj = tables[cls.__main_table__]
+        row_count = await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{stage_obj.__tablename__};")
+        print(f"Provider-enrichment staging rows: {stage_obj.__tablename__}={int(row_count or 0):,}")
+        if not row_count:
+            raise RuntimeError(
+                f"Required staging table {db_schema}.{stage_obj.__tablename__} is empty; "
+                "aborting provider-enrichment publish."
+            )
+
     await _materialize_summary(
         import_date,
         db_schema,
@@ -1137,11 +1579,11 @@ async def shutdown(ctx):  # pragma: no cover
                     print(create_index_sql)
                     await db.status(create_index_sql)
 
-    async def vacuum_table(obj):
-        print(f"Post-Index VACUUM FULL ANALYZE {db_schema}.{obj.__tablename__};")
-        await db.execute_ddl(f"VACUUM FULL ANALYZE {db_schema}.{obj.__tablename__};")
+    async def analyze_table(obj):
+        print(f"Post-Index ANALYZE {db_schema}.{obj.__tablename__};")
+        await db.execute_ddl(f"ANALYZE {db_schema}.{obj.__tablename__};")
 
-    await asyncio.gather(*(vacuum_table(tables[cls.__main_table__]) for cls in processing_classes))
+    await asyncio.gather(*(analyze_table(tables[cls.__main_table__]) for cls in processing_classes))
 
     async with db.transaction():
         for cls in processing_classes:

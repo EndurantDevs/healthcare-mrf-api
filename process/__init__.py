@@ -67,6 +67,12 @@ from process.partd_formulary_network import (
     partd_formulary_network_finalize,
     partd_formulary_network_start,
 )
+from process.pharmacy_license import (
+    finish_main as finish_pharmacy_license,
+    main as initiate_pharmacy_license,
+    pharmacy_license_finalize,
+    pharmacy_license_start,
+)
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
 
@@ -323,6 +329,31 @@ class PartDFormularyNetwork_finish:  # pylint: disable=invalid-name
     job_deserializer = deserialize_job
 
 
+class PharmacyLicense:
+    functions = [pharmacy_license_start]
+    on_startup = db_startup
+    max_jobs = int(os.environ.get("HLTHPRT_MAX_PHARM_LICENSE_JOBS")) if os.environ.get("HLTHPRT_MAX_PHARM_LICENSE_JOBS") else 4
+    queue_read_limit = 2 * max_jobs
+    queue_name = "arq:PharmacyLicense"
+    job_timeout = 86400
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
+class PharmacyLicense_finish:  # pylint: disable=invalid-name
+    functions = [pharmacy_license_finalize]
+    on_startup = db_startup
+    max_jobs = int(os.environ.get("HLTHPRT_MAX_PHARM_LICENSE_FINISH_JOBS")) if os.environ.get("HLTHPRT_MAX_PHARM_LICENSE_FINISH_JOBS") else 4
+    queue_read_limit = 2 * max_jobs
+    queue_name = "arq:PharmacyLicense_finish"
+    job_timeout = 3600
+    burst = True
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
 @click.group()
 def process_group():
     """
@@ -482,6 +513,13 @@ def partd_formulary_network(test: bool, import_id: str | None):
     asyncio.run(initiate_partd_formulary_network(test_mode=test, import_id=import_id))
 
 
+@click.command(help="Run state board pharmacy license import (NPI-first canonical)")
+@click.option("--test", is_flag=True, help="Process a smaller synthetic subset for a quick smoke run.")
+@click.option("--import-id", help="Override import id/date suffix for table names.")
+def pharmacy_license(test: bool, import_id: str | None):
+    asyncio.run(initiate_pharmacy_license(test_mode=test, import_id=import_id))
+
+
 @click.command(help="Finish CMS Part D formulary + pharmacy network import for a queued run id")
 @click.option("--import-id", required=True, help="Import id/date suffix used for the run.")
 @click.option("--run-id", required=True, help="Run id emitted by `start partd-formulary-network`.")
@@ -498,6 +536,22 @@ def partd_formulary_network_end(import_id: str, run_id: str, test: bool, manifes
     )
 
 
+@click.command(help="Finish pharmacy-license import for a queued run id")
+@click.option("--import-id", required=True, help="Import id/date suffix used for the run.")
+@click.option("--run-id", required=True, help="Run id emitted by `start pharmacy-license`.")
+@click.option("--test", is_flag=True, help="Use test DB suffix when finalizing.")
+@click.option("--manifest-path", help="Unused; kept for command signature consistency.")
+def pharmacy_license_end(import_id: str, run_id: str, test: bool, manifest_path: str | None):
+    asyncio.run(
+        finish_pharmacy_license(
+            import_id=import_id,
+            run_id=run_id,
+            test_mode=test,
+            manifest_path=manifest_path,
+        )
+    )
+
+
 process_group.add_command(mrf)
 process_group_end.add_command(mrf_end, 'mrf')
 process_group_end.add_command(claims_pricing_end, 'claims-pricing')
@@ -505,6 +559,7 @@ process_group_end.add_command(claims_pricing_end, 'claims-procedures')
 process_group_end.add_command(drug_claims_end, 'drug-claims')
 process_group_end.add_command(provider_quality_end, 'provider-quality')
 process_group_end.add_command(partd_formulary_network_end, "partd-formulary-network")
+process_group_end.add_command(pharmacy_license_end, "pharmacy-license")
 process_group.add_command(plan_attributes)
 process_group.add_command(npi)
 process_group.add_command(ptg)
@@ -513,6 +568,7 @@ process_group.add_command(claims_procedures, name="claims-procedures")
 process_group.add_command(drug_claims, name="drug-claims")
 process_group.add_command(provider_quality, name="provider-quality")
 process_group.add_command(partd_formulary_network, name="partd-formulary-network")
+process_group.add_command(pharmacy_license, name="pharmacy-license")
 process_group.add_command(provider_enrichment, name="provider-enrichment")
 process_group.add_command(geo_lookup, name="geo")
 process_group.add_command(nucc)

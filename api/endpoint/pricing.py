@@ -6,6 +6,7 @@ import json
 import math
 import os
 import re
+import time
 from typing import Any
 
 import sanic.exceptions
@@ -65,6 +66,26 @@ PROVIDER_QUALITY_DEFAULT_SVI = min(
     max(float(os.getenv("HLTHPRT_PROVIDER_QUALITY_DEFAULT_SVI", "0.5")), 0.0),
     1.0,
 )
+
+
+def _env_flag(*names: str, default: bool = False) -> bool:
+    for name in names:
+        raw = os.getenv(name)
+        if raw is None:
+            continue
+        text_value = str(raw).strip()
+        if not text_value:
+            continue
+        return text_value.lower() in {"1", "true", "yes", "on"}
+    return default
+
+
+ENABLE_PRICING_SCHEMA_CACHE = _env_flag(
+    "HLTHPRT_ENABLE_PRICING_SCHEMA_CACHE",
+    "HLTHPRT_ENABLE_SCHEMA_CACHE",
+)
+_PRICING_SCHEMA_CACHE_TTL_SECONDS = 300.0
+_PRICING_TABLE_EXISTS_CACHE: dict[str, tuple[float, bool]] = {}
 
 
 def _parse_pricing_default_year() -> int | None:
@@ -1199,8 +1220,19 @@ async def _resolve_year(session, table, requested_year: int | None) -> tuple[int
 
 
 async def _table_exists(session, table_name: str) -> bool:
-    result = await session.execute(select(func.to_regclass(f"{PRICING_SCHEMA}.{table_name}")))
-    return bool(result.scalar())
+    qualified_name = table_name if "." in table_name else f"{PRICING_SCHEMA}.{table_name}"
+    if ENABLE_PRICING_SCHEMA_CACHE:
+        cached = _PRICING_TABLE_EXISTS_CACHE.get(qualified_name)
+        if cached is not None:
+            cached_at, cached_value = cached
+            if (time.monotonic() - cached_at) <= _PRICING_SCHEMA_CACHE_TTL_SECONDS:
+                return bool(cached_value)
+            _PRICING_TABLE_EXISTS_CACHE.pop(qualified_name, None)
+    result = await session.execute(text("SELECT to_regclass(:name)"), {"name": qualified_name})
+    exists = bool(result.scalar())
+    if ENABLE_PRICING_SCHEMA_CACHE:
+        _PRICING_TABLE_EXISTS_CACHE[qualified_name] = (time.monotonic(), exists)
+    return exists
 
 
 def _as_bool(value: Any) -> bool | None:
