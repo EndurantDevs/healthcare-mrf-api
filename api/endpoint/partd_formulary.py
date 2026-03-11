@@ -12,7 +12,7 @@ from sqlalchemy import and_, func, or_, select, text
 
 from api.endpoint.pagination import parse_pagination
 from db.models import (CodeCrosswalk, PartDFormularySnapshot, PartDImportRun, PartDMedicationCost,
-                       PartDPharmacyActivity)
+                       PartDPharmacyActivity, PharmacyLicenseRecord)
 
 blueprint = Blueprint("partd_formulary", url_prefix="/formulary/partd", version=1)
 
@@ -96,6 +96,70 @@ def _bind_in_clause(prefix: str, values: list[str], params: dict[str, Any]) -> s
     if not placeholders:
         return "NULL"
     return ", ".join(placeholders)
+
+
+async def _table_exists(session, table) -> bool:
+    qualified = _qualified_table_name(table)
+    result = await session.execute(text("SELECT to_regclass(:name)"), {"name": qualified})
+    return bool(result.scalar())
+
+
+async def _fetch_state_license_summary(session, npi: int, as_of: datetime.date) -> dict[str, Any]:
+    table = PharmacyLicenseRecord.__table__
+    empty = {
+        "has_active_state_license": False,
+        "active_license_count": 0,
+        "active_states": [],
+        "disciplinary_flag_any": False,
+        "license_checked_at": None,
+    }
+    if not await _table_exists(session, table):
+        return empty
+
+    table_name = _qualified_table_name(table)
+    row = (
+        await session.execute(
+            text(
+                f"""
+                SELECT
+                    COUNT(*)::int AS total_count,
+                    COUNT(*) FILTER (
+                        WHERE license_status = 'active'
+                          AND (license_expiration_date IS NULL OR license_expiration_date >= :as_of)
+                    )::int AS active_count,
+                    ARRAY_REMOVE(
+                        ARRAY_AGG(
+                            DISTINCT CASE
+                                WHEN license_status = 'active'
+                                     AND (license_expiration_date IS NULL OR license_expiration_date >= :as_of)
+                                THEN state_code
+                                ELSE NULL
+                            END
+                        ),
+                        NULL
+                    ) AS active_states,
+                    BOOL_OR(COALESCE(disciplinary_flag, FALSE)) AS disciplinary_flag_any,
+                    MAX(last_verified_at) AS latest_verified_at
+                FROM {table_name}
+                WHERE npi = :npi;
+                """
+            ),
+            {"npi": npi, "as_of": as_of},
+        )
+    ).mappings().first()
+
+    if not row:
+        return empty
+
+    active_states = sorted({str(state).upper() for state in (row.get("active_states") or []) if state})
+    latest_verified = row.get("latest_verified_at")
+    return {
+        "has_active_state_license": bool(row.get("active_count") or 0),
+        "active_license_count": int(row.get("active_count") or 0),
+        "active_states": active_states,
+        "disciplinary_flag_any": bool(row.get("disciplinary_flag_any")),
+        "license_checked_at": latest_verified.isoformat() if latest_verified else None,
+    }
 
 
 @blueprint.get("/import/status")
@@ -224,6 +288,7 @@ async def get_pharmacy_partd_activity(request, npi):
     as_of = _parse_date_param(request.args.get("as_of"), "as_of") or datetime.date.today()
     limit = _parse_int_param(request.args.get("limit"), "limit") or 50
     limit = max(1, min(limit, MAX_PAGE_SIZE))
+    state_license_summary = await _fetch_state_license_summary(session, parsed_npi, as_of)
 
     activity_table = PartDPharmacyActivity.__table__
     activity_table_name = _qualified_table_name(activity_table)
@@ -268,6 +333,7 @@ async def get_pharmacy_partd_activity(request, npi):
                 "source_type": None,
                 "plan_ids": [],
                 "items": [],
+                "state_license_summary": state_license_summary,
             }
         )
 
@@ -306,6 +372,7 @@ async def get_pharmacy_partd_activity(request, npi):
             "source_type": source_type,
             "plan_ids": plan_ids,
             "items": items,
+            "state_license_summary": state_license_summary,
         }
     )
 

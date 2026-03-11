@@ -293,6 +293,236 @@ class PartDMedicationCostStage(Base, JSONOutputMixin):
     source_type = Column(String(16), nullable=False)
 
 
+class PharmacyLicenseImportRun(Base, JSONOutputMixin):
+    __tablename__ = "pharmacy_license_import_run_v1"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("run_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["run_id"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("status",), "name": "pharm_lic_import_run_v1_status_idx"},
+        {"index_elements": ("started_at",), "name": "pharm_lic_import_run_v1_started_idx"},
+    ]
+
+    run_id = Column(String(64), nullable=False)
+    import_id = Column(String(32), nullable=False)
+    status = Column(String(32), nullable=False)
+    started_at = Column(TIMESTAMP)
+    finished_at = Column(TIMESTAMP)
+    source_summary = Column(JSON)
+    error_text = Column(TEXT)
+
+
+class PharmacyLicenseSnapshot(Base, JSONOutputMixin):
+    __tablename__ = "pharmacy_license_snapshot_v1"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("snapshot_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["snapshot_id"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("run_id",), "name": "pharm_lic_snapshot_v1_run_idx"},
+        {"index_elements": ("state_code", "status"), "name": "pharm_lic_snapshot_v1_state_status_idx"},
+    ]
+
+    snapshot_id = Column(String(128), nullable=False)
+    run_id = Column(String(64), nullable=False)
+    state_code = Column(String(2), nullable=False)
+    state_name = Column(String(128), nullable=False)
+    board_url = Column(String)
+    source_url = Column(String)
+    status = Column(String(32), nullable=False)
+    row_count_parsed = Column(Integer, nullable=False, default=0)
+    row_count_matched = Column(Integer, nullable=False, default=0)
+    row_count_dropped = Column(Integer, nullable=False, default=0)
+    row_count_inserted = Column(Integer, nullable=False, default=0)
+    imported_at = Column(TIMESTAMP)
+    error_text = Column(TEXT)
+    metadata_json = Column(JSON)
+
+
+class PharmacyLicenseStateCoverage(Base, JSONOutputMixin):
+    __tablename__ = "pharmacy_license_state_coverage_v1"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("state_code"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["state_code"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("supported",), "name": "pharm_lic_state_cov_v1_supported_idx"},
+        {"index_elements": ("last_success_at",), "name": "pharm_lic_state_cov_v1_success_idx"},
+        {"index_elements": ("last_run_id",), "name": "pharm_lic_state_cov_v1_run_idx"},
+    ]
+
+    state_code = Column(String(2), nullable=False)
+    state_name = Column(String(128), nullable=False)
+    board_url = Column(String)
+    source_url = Column(String)
+    supported = Column(Boolean, nullable=False, default=False)
+    unsupported_reason = Column(String)
+    status = Column(String(32), nullable=False, default="unknown")
+    last_attempted_at = Column(TIMESTAMP)
+    last_success_at = Column(TIMESTAMP)
+    last_run_id = Column(String(64))
+    records_parsed = Column(Integer, nullable=False, default=0)
+    records_matched = Column(Integer, nullable=False, default=0)
+    records_dropped = Column(Integer, nullable=False, default=0)
+    records_inserted = Column(Integer, nullable=False, default=0)
+    updated_at = Column(TIMESTAMP)
+
+
+class PharmacyLicenseRecordStage(Base, JSONOutputMixin):
+    __tablename__ = "pharmacy_license_record_stage_v1"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_additional_indexes__ = [
+        {"index_elements": ("snapshot_id",), "name": "pharm_lic_stage_v1_snapshot_idx"},
+        {"index_elements": ("run_id",), "name": "pharm_lic_stage_v1_run_idx"},
+        {"index_elements": ("npi", "state_code"), "name": "pharm_lic_stage_v1_npi_state_idx"},
+    ]
+
+    id = Column(BigInteger, autoincrement=True)
+    snapshot_id = Column(String(128), nullable=False)
+    run_id = Column(String(64), nullable=False)
+    state_code = Column(String(2), nullable=False)
+    state_name = Column(String(128), nullable=False)
+    board_url = Column(String)
+    source_url = Column(String)
+    npi = Column(BigInteger, nullable=False)
+    license_number = Column(String(64), nullable=False)
+    license_type = Column(String(128))
+    license_status = Column(String(32), nullable=False)
+    source_status_raw = Column(String(256))
+    license_issue_date = Column(DATE)
+    license_effective_date = Column(DATE)
+    license_expiration_date = Column(DATE)
+    last_renewal_date = Column(DATE)
+    disciplinary_flag = Column(Boolean, nullable=False, default=False)
+    disciplinary_summary = Column(TEXT)
+    disciplinary_action_date = Column(DATE)
+    entity_name = Column(String)
+    dba_name = Column(String)
+    address_line1 = Column(String)
+    address_line2 = Column(String)
+    city = Column(String(128))
+    state = Column(String(2))
+    zip_code = Column(String(16))
+    phone_number = Column(String(32))
+    source_record_id = Column(String(128))
+    source_last_seen_at = Column(TIMESTAMP)
+    imported_at = Column(TIMESTAMP)
+
+
+class PharmacyLicenseRecord(Base, JSONOutputMixin):
+    __tablename__ = "pharmacy_license_record_v1"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("license_key"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["license_key"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("npi",), "name": "pharm_lic_record_v1_npi_idx"},
+        {"index_elements": ("state_code", "license_status"), "name": "pharm_lic_record_v1_state_status_idx"},
+        {"index_elements": ("license_expiration_date",), "name": "pharm_lic_record_v1_exp_idx"},
+        {"index_elements": ("last_snapshot_id",), "name": "pharm_lic_record_v1_snapshot_idx"},
+        {
+            "index_elements": ("npi", "license_expiration_date"),
+            "where": "license_status = 'active'",
+            "name": "pharm_lic_record_v1_npi_active_idx",
+        },
+    ]
+
+    license_key = Column(String(64), nullable=False)
+    record_signature = Column(String(64), nullable=False)
+    last_snapshot_id = Column(String(128), nullable=False)
+    npi = Column(BigInteger, nullable=False)
+    state_code = Column(String(2), nullable=False)
+    state_name = Column(String(128), nullable=False)
+    board_url = Column(String)
+    source_url = Column(String)
+    license_number = Column(String(64), nullable=False)
+    license_type = Column(String(128))
+    license_status = Column(String(32), nullable=False)
+    source_status_raw = Column(String(256))
+    license_issue_date = Column(DATE)
+    license_effective_date = Column(DATE)
+    license_expiration_date = Column(DATE)
+    last_renewal_date = Column(DATE)
+    disciplinary_flag = Column(Boolean, nullable=False, default=False)
+    disciplinary_summary = Column(TEXT)
+    disciplinary_action_date = Column(DATE)
+    entity_name = Column(String)
+    dba_name = Column(String)
+    address_line1 = Column(String)
+    address_line2 = Column(String)
+    city = Column(String(128))
+    state = Column(String(2))
+    zip_code = Column(String(16))
+    phone_number = Column(String(32))
+    source_record_id = Column(String(128))
+    first_seen_at = Column(TIMESTAMP)
+    last_seen_at = Column(TIMESTAMP)
+    last_verified_at = Column(TIMESTAMP)
+    updated_at = Column(TIMESTAMP)
+
+
+class PharmacyLicenseRecordHistory(Base, JSONOutputMixin):
+    __tablename__ = "pharmacy_license_record_history_v1"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("history_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_additional_indexes__ = [
+        {"index_elements": ("snapshot_id",), "name": "pharm_lic_hist_v1_snapshot_idx"},
+        {"index_elements": ("run_id",), "name": "pharm_lic_hist_v1_run_idx"},
+        {"index_elements": ("npi", "state_code"), "name": "pharm_lic_hist_v1_npi_state_idx"},
+        {"index_elements": ("license_key",), "name": "pharm_lic_hist_v1_license_key_idx"},
+        {"index_elements": ("record_signature",), "name": "pharm_lic_hist_v1_sig_idx"},
+    ]
+
+    history_id = Column(BigInteger, autoincrement=True)
+    snapshot_id = Column(String(128), nullable=False)
+    run_id = Column(String(64), nullable=False)
+    license_key = Column(String(64), nullable=False)
+    record_signature = Column(String(64), nullable=False)
+    npi = Column(BigInteger, nullable=False)
+    state_code = Column(String(2), nullable=False)
+    state_name = Column(String(128), nullable=False)
+    board_url = Column(String)
+    source_url = Column(String)
+    license_number = Column(String(64), nullable=False)
+    license_type = Column(String(128))
+    license_status = Column(String(32), nullable=False)
+    source_status_raw = Column(String(256))
+    license_issue_date = Column(DATE)
+    license_effective_date = Column(DATE)
+    license_expiration_date = Column(DATE)
+    last_renewal_date = Column(DATE)
+    disciplinary_flag = Column(Boolean, nullable=False, default=False)
+    disciplinary_summary = Column(TEXT)
+    disciplinary_action_date = Column(DATE)
+    entity_name = Column(String)
+    dba_name = Column(String)
+    address_line1 = Column(String)
+    address_line2 = Column(String)
+    city = Column(String(128))
+    state = Column(String(2))
+    zip_code = Column(String(16))
+    phone_number = Column(String(32))
+    source_record_id = Column(String(128))
+    source_last_seen_at = Column(TIMESTAMP)
+    imported_at = Column(TIMESTAMP)
+
+
 class PlanIndividual(Base, JSONOutputMixin):
     __tablename__ = 'plan_individual'
     __main_table__ = __tablename__
@@ -1907,7 +2137,7 @@ class ProviderEnrollmentBase(Base, JSONOutputMixin):
     __my_index_elements__ = ["record_hash"]
     __my_initial_indexes__ = []
     __my_additional_indexes__ = [
-        {"index_elements": ("reporting_year", "npi"), "name": "year_npi"},
+        {"index_elements": ("npi", "reporting_year"), "name": "npi_year"},
         {"index_elements": ("state", "reporting_year"), "name": "state_year"},
         {"index_elements": ("provider_type_code", "reporting_year"), "name": "provider_type_year"},
         {"index_elements": ("ccn",), "name": "ccn"},
@@ -1949,12 +2179,109 @@ class ProviderEnrollmentBase(Base, JSONOutputMixin):
 class ProviderEnrollmentFFS(ProviderEnrollmentBase):
     __tablename__ = "provider_enrollment_ffs"
     __main_table__ = __tablename__
+    __my_additional_indexes__ = ProviderEnrollmentBase.__my_additional_indexes__ + [
+        {"index_elements": ("pecos_asct_cntl_id",), "name": "pecos_asct_cntl_id"},
+    ]
 
     pecos_asct_cntl_id = Column(String(64))
     first_name = Column(String)
     middle_name = Column(String)
     last_name = Column(String)
     org_name = Column(String)
+
+
+class ProviderEnrollmentFFSLinkedBase(Base, JSONOutputMixin):
+    __abstract__ = True
+
+    @declared_attr
+    def __table_args__(cls):
+        return (
+            PrimaryKeyConstraint("record_hash"),
+            {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        )
+
+    __my_index_elements__ = ["record_hash"]
+    __my_initial_indexes__ = []
+    __my_additional_indexes__ = [
+        {"index_elements": ("enrollment_id",), "name": "enrollment_id"},
+        {"index_elements": ("reporting_year", "enrollment_id"), "name": "year_enrollment"},
+    ]
+
+    record_hash = Column(Integer, nullable=False)
+    enrollment_id = Column(String(64), nullable=False)
+    reporting_period_start = Column(DATE)
+    reporting_period_end = Column(DATE)
+    reporting_year = Column(Integer)
+    source_dataset_title = Column(String(255))
+    source_distribution_title = Column(String(255))
+    source_url = Column(String)
+    source_modified = Column(DateTime)
+    source_temporal = Column(String(64))
+    imported_at = Column(DateTime)
+
+
+class ProviderEnrollmentFFSAdditionalNPI(ProviderEnrollmentFFSLinkedBase):
+    __tablename__ = "provider_enrollment_ffs_additional_npi"
+    __main_table__ = __tablename__
+    __my_additional_indexes__ = ProviderEnrollmentFFSLinkedBase.__my_additional_indexes__ + [
+        {"index_elements": ("additional_npi",), "name": "additional_npi"},
+    ]
+
+    additional_npi = Column(BigInteger, nullable=False)
+
+
+class ProviderEnrollmentFFSAddress(ProviderEnrollmentFFSLinkedBase):
+    __tablename__ = "provider_enrollment_ffs_address"
+    __main_table__ = __tablename__
+    __my_additional_indexes__ = ProviderEnrollmentFFSLinkedBase.__my_additional_indexes__ + [
+        {"index_elements": ("state", "zip_code"), "name": "state_zip"},
+        {"index_elements": ("zip_code",), "name": "zip_code"},
+    ]
+
+    city = Column(String)
+    state = Column(String(2))
+    zip_code = Column(String(12))
+
+
+class ProviderEnrollmentFFSSecondarySpecialty(ProviderEnrollmentFFSLinkedBase):
+    __tablename__ = "provider_enrollment_ffs_secondary_specialty"
+    __main_table__ = __tablename__
+    __my_additional_indexes__ = ProviderEnrollmentFFSLinkedBase.__my_additional_indexes__ + [
+        {"index_elements": ("provider_type_code",), "name": "provider_type_code"},
+    ]
+
+    provider_type_code = Column(String(32), nullable=False)
+    provider_type_text = Column(String)
+
+
+class ProviderEnrollmentFFSReassignment(Base, JSONOutputMixin):
+    __tablename__ = "provider_enrollment_ffs_reassignment"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("record_hash"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["record_hash"]
+    __my_initial_indexes__ = []
+    __my_additional_indexes__ = [
+        {"index_elements": ("reassigning_enrollment_id",), "name": "reassigning_enrollment_id"},
+        {"index_elements": ("receiving_enrollment_id",), "name": "receiving_enrollment_id"},
+        {"index_elements": ("reporting_year", "reassigning_enrollment_id"), "name": "year_reassigning"},
+        {"index_elements": ("reporting_year", "receiving_enrollment_id"), "name": "year_receiving"},
+    ]
+
+    record_hash = Column(Integer, nullable=False)
+    reassigning_enrollment_id = Column(String(64), nullable=False)
+    receiving_enrollment_id = Column(String(64), nullable=False)
+    reporting_period_start = Column(DATE)
+    reporting_period_end = Column(DATE)
+    reporting_year = Column(Integer)
+    source_dataset_title = Column(String(255))
+    source_distribution_title = Column(String(255))
+    source_url = Column(String)
+    source_modified = Column(DateTime)
+    source_temporal = Column(String(64))
+    imported_at = Column(DateTime)
 
 
 class ProviderEnrollmentHospital(ProviderEnrollmentBase):
@@ -2065,6 +2392,17 @@ class ProviderEnrichmentSummary(Base, JSONOutputMixin):
     states = Column(ARRAY(String), nullable=False, server_default=text("ARRAY[]::varchar[]"))
     provider_type_codes = Column(ARRAY(String), nullable=False, server_default=text("ARRAY[]::varchar[]"))
     provider_type_texts = Column(ARRAY(String), nullable=False, server_default=text("ARRAY[]::varchar[]"))
+    ffs_enrollment_ids = Column(ARRAY(String), nullable=False, server_default=text("ARRAY[]::varchar[]"))
+    ffs_pecos_asct_cntl_ids = Column(ARRAY(String), nullable=False, server_default=text("ARRAY[]::varchar[]"))
+    ffs_secondary_provider_type_codes = Column(ARRAY(String), nullable=False, server_default=text("ARRAY[]::varchar[]"))
+    ffs_secondary_provider_type_texts = Column(ARRAY(String), nullable=False, server_default=text("ARRAY[]::varchar[]"))
+    ffs_practice_zip_codes = Column(ARRAY(String), nullable=False, server_default=text("ARRAY[]::varchar[]"))
+    ffs_practice_cities = Column(ARRAY(String), nullable=False, server_default=text("ARRAY[]::varchar[]"))
+    ffs_practice_states = Column(ARRAY(String), nullable=False, server_default=text("ARRAY[]::varchar[]"))
+    ffs_related_npis = Column(ARRAY(BigInteger), nullable=False, server_default=text("ARRAY[]::bigint[]"))
+    ffs_related_npi_count = Column(Integer)
+    ffs_reassignment_in_count = Column(Integer)
+    ffs_reassignment_out_count = Column(Integer)
     primary_state = Column(String(2))
     primary_provider_type_code = Column(String(32))
     primary_provider_type_text = Column(String)

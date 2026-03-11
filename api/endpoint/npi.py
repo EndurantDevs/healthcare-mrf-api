@@ -2,16 +2,18 @@
 # pylint: disable=not-callable
 
 import asyncio
+from collections import defaultdict
 import json
 import logging
 import os
 import random
 import math
 import re
+import time
 import urllib.parse
 from datetime import datetime
 from textwrap import dedent
-from typing import Any, Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 import sanic.exceptions
 from sanic import Blueprint, response
@@ -23,6 +25,10 @@ from db.models import (AddressArchive, Issuer, NPIAddress, NPIData,
                        NPIDataOtherIdentifier, NPIDataTaxonomy,
                        NPIDataTaxonomyGroup, NUCCTaxonomy, PlanNPIRaw,
                        ProviderEnrichmentSummary, ProviderEnrollmentFFS,
+                       ProviderEnrollmentFFSAdditionalNPI,
+                       ProviderEnrollmentFFSAddress,
+                       ProviderEnrollmentFFSReassignment,
+                       ProviderEnrollmentFFSSecondarySpecialty,
                        ProviderEnrollmentFQHC, ProviderEnrollmentHomeHealthAgency,
                        ProviderEnrollmentHospital, ProviderEnrollmentHospice,
                        ProviderEnrollmentRHC, ProviderEnrollmentSNF, db)
@@ -50,6 +56,30 @@ MEDICATION_ALLOWED_CODE_SYSTEMS = {
 }
 CODE_TOKEN_PATTERN = re.compile(r"^[A-Z0-9._-]+$")
 INT_CODE_PATTERN = re.compile(r"^-?\d+$")
+CHAIN_PECOS_PROVIDER_TYPE_CODES = {"12-C1"}
+
+
+def _env_flag(*names: str, default: bool = False) -> bool:
+    for name in names:
+        raw = os.getenv(name)
+        if raw is None:
+            continue
+        text_value = str(raw).strip()
+        if not text_value:
+            continue
+        return text_value.lower() in {"1", "true", "yes", "on"}
+    return default
+
+
+ENABLE_NPI_SCHEMA_CACHE = _env_flag(
+    "HLTHPRT_ENABLE_NPI_SCHEMA_CACHE",
+    "HLTHPRT_ENABLE_SCHEMA_CACHE",
+)
+_NPI_SCHEMA_CACHE_TTL_SECONDS = 300.0
+_TABLE_EXISTS_CACHE: dict[str, tuple[float, bool]] = {}
+_TABLE_COLUMNS_CACHE: dict[str, tuple[float, set[str]]] = {}
+_NPI_FILTER_CAPABILITIES_CACHE: Optional[tuple[float, str, dict[str, bool]]] = None
+_NPI_PRIMARY_TOTAL_CACHE: Optional[tuple[float, int]] = None
 
 NAME_LIKE_TEMPLATE = (
     "LOWER("
@@ -135,6 +165,318 @@ def _taxonomy_group_subquery() -> str:
     ).strip()
 
 
+def _request_session(request) -> Any:
+    return getattr(getattr(request, "ctx", None), "sa_session", None)
+
+
+def _model_table_columns(model: Any) -> set[str]:
+    table = getattr(model, "__table__", None)
+    if table is None:
+        return set()
+    return {str(column.key) for column in table.columns if getattr(column, "key", None)}
+
+
+def _schema_cache_key(table_name: str) -> str:
+    schema = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    return f"{schema}.{table_name}"
+
+
+def _cache_get(cache: dict[str, tuple[float, Any]], key: str) -> Any:
+    if not ENABLE_NPI_SCHEMA_CACHE:
+        return None
+    entry = cache.get(key)
+    if entry is None:
+        return None
+    cached_at, value = entry
+    if (time.monotonic() - cached_at) > _NPI_SCHEMA_CACHE_TTL_SECONDS:
+        cache.pop(key, None)
+        return None
+    return value
+
+
+def _cache_set(cache: dict[str, tuple[float, Any]], key: str, value: Any) -> Any:
+    if ENABLE_NPI_SCHEMA_CACHE:
+        cache[key] = (time.monotonic(), value)
+    return value
+
+
+def _filter_cache_get() -> Optional[dict[str, bool]]:
+    if not ENABLE_NPI_SCHEMA_CACHE:
+        return None
+    global _NPI_FILTER_CAPABILITIES_CACHE  # pylint: disable=global-statement
+    if _NPI_FILTER_CAPABILITIES_CACHE is None:
+        return None
+    cached_at, schema_key, value = _NPI_FILTER_CAPABILITIES_CACHE
+    if (time.monotonic() - cached_at) > _NPI_SCHEMA_CACHE_TTL_SECONDS:
+        _NPI_FILTER_CAPABILITIES_CACHE = None
+        return None
+    if schema_key != (os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"):
+        _NPI_FILTER_CAPABILITIES_CACHE = None
+        return None
+    return dict(value)
+
+
+def _filter_cache_set(value: dict[str, bool]) -> dict[str, bool]:
+    global _NPI_FILTER_CAPABILITIES_CACHE  # pylint: disable=global-statement
+    if ENABLE_NPI_SCHEMA_CACHE:
+        _NPI_FILTER_CAPABILITIES_CACHE = (
+            time.monotonic(),
+            os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            dict(value),
+        )
+    return value
+
+
+def _primary_total_cache_get() -> Optional[int]:
+    if not ENABLE_NPI_SCHEMA_CACHE:
+        return None
+    global _NPI_PRIMARY_TOTAL_CACHE  # pylint: disable=global-statement
+    if _NPI_PRIMARY_TOTAL_CACHE is None:
+        return None
+    cached_at, value = _NPI_PRIMARY_TOTAL_CACHE
+    if (time.monotonic() - cached_at) > _NPI_SCHEMA_CACHE_TTL_SECONDS:
+        _NPI_PRIMARY_TOTAL_CACHE = None
+        return None
+    return int(value)
+
+
+def _primary_total_cache_set(value: int) -> int:
+    global _NPI_PRIMARY_TOTAL_CACHE  # pylint: disable=global-statement
+    if ENABLE_NPI_SCHEMA_CACHE:
+        _NPI_PRIMARY_TOTAL_CACHE = (time.monotonic(), int(value))
+    return int(value)
+
+
+async def _execute_stmt(stmt: Any, *, session: Any = None, params: Optional[dict[str, Any]] = None):
+    if session is not None:
+        return await session.execute(stmt, params or {})
+    return await db.execute(stmt, **(params or {}))
+
+
+def _normalize_provider_enrichment_show_mode(raw_value: Any) -> str:
+    return "chain" if str(raw_value or "").strip().lower() == "chain" else "default"
+
+
+def _include_chain_provider_enrichment(raw_value: Any) -> bool:
+    return _normalize_provider_enrichment_show_mode(raw_value) == "chain"
+
+
+def _normalize_provider_enrichment_view(raw_value: Any) -> str:
+    value = str(raw_value or "").strip().lower()
+    if not value:
+        return "full"
+    if value in {"full", "summary"}:
+        return value
+    raise sanic.exceptions.InvalidUsage("view must be one of: full, summary")
+
+
+def _unique_non_empty(values: Sequence[Any]) -> list[Any]:
+    seen: set[Any] = set()
+    output: list[Any] = []
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                continue
+        if value in seen:
+            continue
+        seen.add(value)
+        output.append(value)
+    return output
+
+
+def _serialize_ffs_reassignment_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "reassigning_enrollment_id": row.get("reassigning_enrollment_id"),
+        "receiving_enrollment_id": row.get("receiving_enrollment_id"),
+        "counterparty_npi": int(row["counterparty_npi"]) if row.get("counterparty_npi") is not None else None,
+        "counterparty_provider_type_code": row.get("counterparty_provider_type_code"),
+        "counterparty_provider_type_text": row.get("counterparty_provider_type_text"),
+        "reporting_year": row.get("reporting_year"),
+    }
+
+
+def _is_chain_ffs_enrollment_payload(payload: dict[str, Any]) -> bool:
+    multiple_npi_flag = str(payload.get("multiple_npi_flag") or "").strip().upper()
+    provider_type_code = str(payload.get("provider_type_code") or "").strip().upper()
+    return multiple_npi_flag == "Y" or provider_type_code in CHAIN_PECOS_PROVIDER_TYPE_CODES
+
+
+def _partition_ffs_enrollment_payloads(
+    rows: Sequence[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    visible_rows: list[dict[str, Any]] = []
+    chain_rows: list[dict[str, Any]] = []
+    for row in rows:
+        if _is_chain_ffs_enrollment_payload(row):
+            chain_rows.append(row)
+        else:
+            visible_rows.append(row)
+    return visible_rows, chain_rows
+
+
+async def _fetch_ffs_summary_overrides(
+    visible_rows_by_npi: dict[int, list[dict[str, Any]]],
+    *,
+    session: Any = None,
+) -> dict[int, dict[str, Any]]:
+    overrides: dict[int, dict[str, Any]] = {}
+    enrollment_to_npi: dict[str, int] = {}
+    all_enrollment_ids: list[str] = []
+
+    for npi_value, rows in visible_rows_by_npi.items():
+        enrollment_ids = _unique_non_empty([row.get("enrollment_id") for row in rows])
+        pecos_ids = _unique_non_empty([row.get("pecos_asct_cntl_id") for row in rows])
+        overrides[npi_value] = {
+            "ffs_enrollment_ids": enrollment_ids,
+            "ffs_pecos_asct_cntl_ids": pecos_ids,
+            "ffs_secondary_provider_type_codes": [],
+            "ffs_secondary_provider_type_texts": [],
+            "ffs_practice_zip_codes": [],
+            "ffs_practice_cities": [],
+            "ffs_practice_states": [],
+            "ffs_related_npis": [],
+            "ffs_related_npi_count": 0,
+            "ffs_reassignment_in_count": 0,
+            "ffs_reassignment_out_count": 0,
+        }
+        for enrollment_id in enrollment_ids:
+            enrollment_to_npi[enrollment_id] = npi_value
+            all_enrollment_ids.append(enrollment_id)
+
+    all_enrollment_ids = _unique_non_empty(all_enrollment_ids)
+    if not all_enrollment_ids:
+        return overrides
+
+    if await _table_exists(ProviderEnrollmentFFSAdditionalNPI.__tablename__, session=session):
+        stmt = (
+            select(
+                ProviderEnrollmentFFSAdditionalNPI.enrollment_id,
+                ProviderEnrollmentFFSAdditionalNPI.additional_npi,
+            )
+            .where(ProviderEnrollmentFFSAdditionalNPI.enrollment_id.in_(all_enrollment_ids))
+            .order_by(
+                ProviderEnrollmentFFSAdditionalNPI.enrollment_id.asc(),
+                ProviderEnrollmentFFSAdditionalNPI.additional_npi.asc(),
+            )
+        )
+        result = await _execute_stmt(stmt, session=session)
+        related_by_npi: dict[int, list[int]] = defaultdict(list)
+        for enrollment_id, additional_npi in result.all():
+            if additional_npi is None:
+                continue
+            npi_value = enrollment_to_npi.get(str(enrollment_id))
+            if npi_value is None:
+                continue
+            related_by_npi[npi_value].append(int(additional_npi))
+        for npi_value, values in related_by_npi.items():
+            unique_values = _unique_non_empty(values)
+            overrides[npi_value]["ffs_related_npis"] = unique_values
+            overrides[npi_value]["ffs_related_npi_count"] = len(unique_values)
+
+    if await _table_exists(ProviderEnrollmentFFSAddress.__tablename__, session=session):
+        stmt = (
+            select(
+                ProviderEnrollmentFFSAddress.enrollment_id,
+                ProviderEnrollmentFFSAddress.zip_code,
+                ProviderEnrollmentFFSAddress.city,
+                ProviderEnrollmentFFSAddress.state,
+            )
+            .where(ProviderEnrollmentFFSAddress.enrollment_id.in_(all_enrollment_ids))
+            .order_by(
+                ProviderEnrollmentFFSAddress.enrollment_id.asc(),
+                ProviderEnrollmentFFSAddress.state.asc().nullslast(),
+                ProviderEnrollmentFFSAddress.city.asc().nullslast(),
+                ProviderEnrollmentFFSAddress.zip_code.asc().nullslast(),
+            )
+        )
+        result = await _execute_stmt(stmt, session=session)
+        zip_codes_by_npi: dict[int, list[str]] = defaultdict(list)
+        cities_by_npi: dict[int, list[str]] = defaultdict(list)
+        states_by_npi: dict[int, list[str]] = defaultdict(list)
+        for enrollment_id, zip_code, city, state in result.all():
+            npi_value = enrollment_to_npi.get(str(enrollment_id))
+            if npi_value is None:
+                continue
+            if zip_code:
+                zip_codes_by_npi[npi_value].append(str(zip_code))
+            if city:
+                cities_by_npi[npi_value].append(str(city))
+            if state:
+                states_by_npi[npi_value].append(str(state))
+        for npi_value in overrides:
+            overrides[npi_value]["ffs_practice_zip_codes"] = _unique_non_empty(zip_codes_by_npi.get(npi_value, []))
+            overrides[npi_value]["ffs_practice_cities"] = _unique_non_empty(cities_by_npi.get(npi_value, []))
+            overrides[npi_value]["ffs_practice_states"] = _unique_non_empty(states_by_npi.get(npi_value, []))
+
+    if await _table_exists(ProviderEnrollmentFFSSecondarySpecialty.__tablename__, session=session):
+        stmt = (
+            select(
+                ProviderEnrollmentFFSSecondarySpecialty.enrollment_id,
+                ProviderEnrollmentFFSSecondarySpecialty.provider_type_code,
+                ProviderEnrollmentFFSSecondarySpecialty.provider_type_text,
+            )
+            .where(ProviderEnrollmentFFSSecondarySpecialty.enrollment_id.in_(all_enrollment_ids))
+            .order_by(
+                ProviderEnrollmentFFSSecondarySpecialty.enrollment_id.asc(),
+                ProviderEnrollmentFFSSecondarySpecialty.provider_type_code.asc(),
+            )
+        )
+        result = await _execute_stmt(stmt, session=session)
+        codes_by_npi: dict[int, list[str]] = defaultdict(list)
+        texts_by_npi: dict[int, list[str]] = defaultdict(list)
+        for enrollment_id, provider_type_code, provider_type_text in result.all():
+            npi_value = enrollment_to_npi.get(str(enrollment_id))
+            if npi_value is None:
+                continue
+            if provider_type_code:
+                codes_by_npi[npi_value].append(str(provider_type_code))
+            if provider_type_text:
+                texts_by_npi[npi_value].append(str(provider_type_text))
+        for npi_value in overrides:
+            overrides[npi_value]["ffs_secondary_provider_type_codes"] = _unique_non_empty(
+                codes_by_npi.get(npi_value, [])
+            )
+            overrides[npi_value]["ffs_secondary_provider_type_texts"] = _unique_non_empty(
+                texts_by_npi.get(npi_value, [])
+            )
+
+    if await _table_exists(ProviderEnrollmentFFSReassignment.__tablename__, session=session):
+        stmt = (
+            select(
+                ProviderEnrollmentFFSReassignment.reassigning_enrollment_id,
+                func.count().label("row_count"),
+            )
+            .where(ProviderEnrollmentFFSReassignment.reassigning_enrollment_id.in_(all_enrollment_ids))
+            .group_by(ProviderEnrollmentFFSReassignment.reassigning_enrollment_id)
+        )
+        result = await _execute_stmt(stmt, session=session)
+        for enrollment_id, row_count in result.all():
+            npi_value = enrollment_to_npi.get(str(enrollment_id))
+            if npi_value is None:
+                continue
+            overrides[npi_value]["ffs_reassignment_out_count"] += int(row_count or 0)
+
+        stmt = (
+            select(
+                ProviderEnrollmentFFSReassignment.receiving_enrollment_id,
+                func.count().label("row_count"),
+            )
+            .where(ProviderEnrollmentFFSReassignment.receiving_enrollment_id.in_(all_enrollment_ids))
+            .group_by(ProviderEnrollmentFFSReassignment.receiving_enrollment_id)
+        )
+        result = await _execute_stmt(stmt, session=session)
+        for enrollment_id, row_count in result.all():
+            npi_value = enrollment_to_npi.get(str(enrollment_id))
+            if npi_value is None:
+                continue
+            overrides[npi_value]["ffs_reassignment_in_count"] += int(row_count or 0)
+
+    return overrides
+
+
 async def _fast_has_insurance_count(city: Optional[str], state: Optional[str]) -> int:
     table = NPIAddress.__table__
     conditions = [
@@ -155,7 +497,43 @@ async def _fast_has_insurance_count(city: Optional[str], state: Optional[str]) -
         return int(result.scalar() or 0)
 
 
-def _build_nearby_sql(taxonomy_conditions: str, extra_clause: str, ilike_clause: str) -> str:
+async def _fast_primary_npi_count() -> int:
+    cached = _primary_total_cache_get()
+    if cached is not None:
+        return cached
+    stmt = select(func.count()).select_from(NPIAddress.__table__).where(NPIAddress.type == "primary")
+    scalar_fn = getattr(db, "scalar", None)
+    if scalar_fn is not None:
+        try:
+            value = await scalar_fn(stmt)
+            return _primary_total_cache_set(int(value or 0))
+        except Exception:  # pragma: no cover - fallback for lightweight test doubles
+            pass
+    async with db.acquire() as conn:
+        rows = await conn.all(stmt)
+    value = rows[0][0] if rows else 0
+    return _primary_total_cache_set(int(value or 0))
+
+
+def _build_nearby_sql(
+    taxonomy_conditions: str,
+    extra_clause: str,
+    ilike_clause: str,
+    *,
+    use_taxonomy_filter: bool,
+) -> str:
+    taxonomy_from = ""
+    taxonomy_where = ""
+    if use_taxonomy_filter:
+        taxonomy_from = (
+            ",\n"
+            "                              (\n"
+            "                                  SELECT ARRAY_AGG(int_code) AS codes\n"
+            "                                    FROM mrf.nucc_taxonomy\n"
+            f"                                   WHERE {taxonomy_conditions}\n"
+            "                              ) AS g"
+        )
+        taxonomy_where = "\n                          AND a.taxonomy_array && g.codes"
     return dedent(
         """
         WITH sub_s AS (
@@ -175,18 +553,13 @@ def _build_nearby_sql(taxonomy_conditions: str, extra_clause: str, ilike_clause:
                                2
                            ) AS distance,
                            a.*
-                         FROM mrf.npi_address AS a,
-                              (
-                                  SELECT ARRAY_AGG(int_code) AS codes
-                                    FROM mrf.nucc_taxonomy
-                                   WHERE {taxonomy_conditions}
-                              ) AS g
+                         FROM mrf.npi_address AS a{taxonomy_from}
                         WHERE ST_DWithin(
                                 Geography(ST_MakePoint(long, lat)),
                                 Geography(ST_MakePoint(:in_long, :in_lat)),
                                 :radius * 1609.34
                              )
-                          AND a.taxonomy_array && g.codes
+                          {taxonomy_where}
                           AND (a.type = 'primary' OR a.type = 'secondary')
                           {extra_clause}
                      ORDER BY distance ASC
@@ -199,7 +572,8 @@ def _build_nearby_sql(taxonomy_conditions: str, extra_clause: str, ilike_clause:
           JOIN mrf.npi_taxonomy AS t ON sub_s.npi_code = t.npi;
         """
     ).format(
-        taxonomy_conditions=taxonomy_conditions,
+        taxonomy_from=taxonomy_from,
+        taxonomy_where=taxonomy_where,
         extra_clause=extra_clause,
         ilike_clause=ilike_clause,
     )
@@ -326,29 +700,38 @@ def _parse_optional_year(raw: Optional[str], param_name: str = "year") -> Option
     return year
 
 
-async def _table_exists(table_name: str) -> bool:
+async def _table_exists(table_name: str, *, session: Any = None) -> bool:
+    cache_key = _schema_cache_key(table_name)
+    cached = _cache_get(_TABLE_EXISTS_CACHE, cache_key)
+    if cached is not None:
+        return bool(cached)
     try:
-        async with db.acquire() as conn:
-            rows = await conn.all(
-                text("SELECT to_regclass(:table_name);"),
-                table_name=f"mrf.{table_name}",
-            )
-        return bool(rows and rows[0] and rows[0][0])
+        result = await _execute_stmt(
+            text("SELECT to_regclass(:table_name);"),
+            session=session,
+            params={"table_name": cache_key},
+        )
+        rows = result.all()
+        return bool(_cache_set(_TABLE_EXISTS_CACHE, cache_key, bool(rows and rows[0] and rows[0][0])))
     except Exception:  # pragma: no cover - defensive fallback for transient DB states
         return False
 
 
-async def _resolve_npi_filter_capabilities() -> dict[str, bool]:
+async def _resolve_npi_filter_capabilities(*, session: Any = None) -> dict[str, bool]:
+    cached = _filter_cache_get()
+    if cached is not None:
+        return cached
+    model_columns = _model_table_columns(NPIAddress)
     capabilities = {
-        "npi_procedures_array_available": False,
-        "npi_medications_array_available": False,
+        "npi_procedures_array_available": "procedures_array" in model_columns,
+        "npi_medications_array_available": "medications_array" in model_columns,
         "pricing_provider_procedure_available": False,
         "pricing_provider_prescription_available": False,
     }
 
-    try:
-        async with db.acquire() as conn:
-            rows = await conn.all(
+    if ENABLE_NPI_SCHEMA_CACHE:
+        try:
+            result = await _execute_stmt(
                 text(
                     """
                     SELECT column_name
@@ -357,52 +740,116 @@ async def _resolve_npi_filter_capabilities() -> dict[str, bool]:
                        AND table_name = 'npi_address'
                        AND column_name IN ('procedures_array', 'medications_array')
                     """
-                )
+                ),
+                session=session,
             )
-        columns = {str(row[0]) for row in rows if row and row[0]}
-        capabilities["npi_procedures_array_available"] = "procedures_array" in columns
-        capabilities["npi_medications_array_available"] = "medications_array" in columns
+            rows = result.all()
+            columns = {str(row[0]) for row in rows if row and row[0]}
+            capabilities["npi_procedures_array_available"] = "procedures_array" in columns
+            capabilities["npi_medications_array_available"] = "medications_array" in columns
+        except Exception:  # pragma: no cover - defensive fallback for transient DB states
+            capabilities["npi_procedures_array_available"] = "procedures_array" in model_columns
+            capabilities["npi_medications_array_available"] = "medications_array" in model_columns
+
+    capabilities["pricing_provider_procedure_available"] = await _table_exists(
+        "pricing_provider_procedure",
+        session=session,
+    )
+    capabilities["pricing_provider_prescription_available"] = await _table_exists(
+        "pricing_provider_prescription",
+        session=session,
+    )
+    return _filter_cache_set(capabilities)
+
+
+async def _table_columns(table_name: str, *, session: Any = None) -> set[str]:
+    cache_key = _schema_cache_key(table_name)
+    cached = _cache_get(_TABLE_COLUMNS_CACHE, cache_key)
+    if cached is not None:
+        return set(cached)
+    try:
+        result = await _execute_stmt(
+            text(
+                """
+                SELECT column_name
+                  FROM information_schema.columns
+                 WHERE table_schema = 'mrf'
+                   AND table_name = :table_name
+                """
+            ),
+            session=session,
+            params={"table_name": table_name},
+        )
+        rows = result.all()
+        return set(_cache_set(_TABLE_COLUMNS_CACHE, cache_key, {str(row[0]) for row in rows if row and row[0]}))
     except Exception:  # pragma: no cover - defensive fallback for transient DB states
-        capabilities["npi_procedures_array_available"] = False
-        capabilities["npi_medications_array_available"] = False
-
-    capabilities["pricing_provider_procedure_available"] = await _table_exists("pricing_provider_procedure")
-    capabilities["pricing_provider_prescription_available"] = await _table_exists("pricing_provider_prescription")
-    return capabilities
+        return set()
 
 
-async def _fetch_provider_enrichment_summary_map(npis: Sequence[int]) -> dict[int, dict[str, Any]]:
+async def _fetch_provider_enrichment_summary_map(
+    npis: Sequence[int],
+    *,
+    include_chain: bool = False,
+    session: Any = None,
+) -> dict[int, dict[str, Any]]:
     unique_npis = sorted({int(npi) for npi in npis if npi is not None})
     if not unique_npis:
         return {}
-    if not await _table_exists(ProviderEnrichmentSummary.__tablename__):
+    if not await _table_exists(ProviderEnrichmentSummary.__tablename__, session=session):
         return {}
 
-    query = text(
-        f"""
-        SELECT
-            npi,
-            latest_reporting_year,
-            status,
-            has_any_enrollment,
-            has_medicare_claims,
-            has_ffs_enrollment,
-            has_hospital_enrollment,
-            has_hha_enrollment,
-            has_hospice_enrollment,
-            has_fqhc_enrollment,
-            has_rhc_enrollment,
-            has_snf_enrollment,
-            primary_state,
-            primary_provider_type_code,
-            total_enrollment_rows,
-            dataset_keys
-          FROM mrf.{ProviderEnrichmentSummary.__tablename__}
-         WHERE npi = ANY(:npis)
-        """
-    )
-    async with db.acquire() as conn:
-        rows = await conn.all(query, npis=unique_npis)
+    requested_columns = [
+        "npi",
+        "latest_reporting_year",
+        "status",
+        "has_any_enrollment",
+        "has_medicare_claims",
+        "has_ffs_enrollment",
+        "has_hospital_enrollment",
+        "has_hha_enrollment",
+        "has_hospice_enrollment",
+        "has_fqhc_enrollment",
+        "has_rhc_enrollment",
+        "has_snf_enrollment",
+        "primary_state",
+        "primary_provider_type_code",
+        "total_enrollment_rows",
+        "dataset_keys",
+        "ffs_enrollment_ids",
+        "ffs_pecos_asct_cntl_ids",
+        "ffs_secondary_provider_type_codes",
+        "ffs_secondary_provider_type_texts",
+        "ffs_practice_zip_codes",
+        "ffs_practice_cities",
+        "ffs_practice_states",
+        "ffs_related_npis",
+        "ffs_related_npi_count",
+        "ffs_reassignment_in_count",
+        "ffs_reassignment_out_count",
+    ]
+    model_columns = _model_table_columns(ProviderEnrichmentSummary)
+
+    async def _run_summary_query(available_columns: set[str]):
+        select_columns = [
+            column_name if column_name in available_columns else f"NULL AS {column_name}"
+            for column_name in requested_columns
+        ]
+        query = text(
+            f"""
+            SELECT
+                {', '.join(select_columns)}
+              FROM mrf.{ProviderEnrichmentSummary.__tablename__}
+             WHERE npi = ANY(:npis)
+            """
+        )
+        result = await _execute_stmt(query, session=session, params={"npis": unique_npis})
+        return result.all()
+
+    try:
+        rows = await _run_summary_query(model_columns)
+    except Exception:
+        available_columns = await _table_columns(ProviderEnrichmentSummary.__tablename__, session=session)
+        rows = await _run_summary_query(available_columns)
 
     summary_map: dict[int, dict[str, Any]] = {}
     for row in rows:
@@ -423,11 +870,145 @@ async def _fetch_provider_enrichment_summary_map(npis: Sequence[int]) -> dict[in
             "primary_provider_type_code": row[13],
             "total_enrollment_rows": row[14],
             "dataset_keys": list(row[15] or []),
+            "ffs_enrollment_ids": list(row[16] or []),
+            "ffs_pecos_asct_cntl_ids": list(row[17] or []),
+            "ffs_secondary_provider_type_codes": list(row[18] or []),
+            "ffs_secondary_provider_type_texts": list(row[19] or []),
+            "ffs_practice_zip_codes": list(row[20] or []),
+            "ffs_practice_cities": list(row[21] or []),
+            "ffs_practice_states": list(row[22] or []),
+            "ffs_related_npis": [int(value) for value in (row[23] or []) if value is not None],
+            "ffs_related_npi_count": int(row[24] or 0),
+            "ffs_reassignment_in_count": int(row[25] or 0),
+            "ffs_reassignment_out_count": int(row[26] or 0),
+            "ffs_chain_hidden": False,
+            "ffs_chain_enrollment_count": 0,
+            "ffs_chain_enrollment_ids": [],
         }
+
+    if not summary_map or not await _table_exists(ProviderEnrollmentFFS.__tablename__, session=session):
+        return summary_map
+
+    stmt = (
+        select(
+            ProviderEnrollmentFFS.npi,
+            ProviderEnrollmentFFS.enrollment_id,
+            ProviderEnrollmentFFS.pecos_asct_cntl_id,
+            ProviderEnrollmentFFS.provider_type_code,
+            ProviderEnrollmentFFS.provider_type_text,
+            ProviderEnrollmentFFS.multiple_npi_flag,
+        )
+        .where(ProviderEnrollmentFFS.npi.in_(unique_npis))
+        .order_by(
+            ProviderEnrollmentFFS.npi.asc(),
+            ProviderEnrollmentFFS.reporting_year.desc().nullslast(),
+            ProviderEnrollmentFFS.enrollment_id.asc(),
+        )
+    )
+    result = await _execute_stmt(stmt, session=session)
+
+    ffs_rows_by_npi: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for row in result.all():
+        npi_value, enrollment_id, pecos_asct_cntl_id, provider_type_code, provider_type_text, multiple_npi_flag = row
+        ffs_rows_by_npi[int(npi_value)].append(
+            {
+                "enrollment_id": enrollment_id,
+                "pecos_asct_cntl_id": pecos_asct_cntl_id,
+                "provider_type_code": provider_type_code,
+                "provider_type_text": provider_type_text,
+                "multiple_npi_flag": multiple_npi_flag,
+            }
+        )
+
+    visible_rows_by_npi: dict[int, list[dict[str, Any]]] = {}
+    for npi_value, summary in summary_map.items():
+        visible_rows, chain_rows = _partition_ffs_enrollment_payloads(ffs_rows_by_npi.get(npi_value, []))
+        summary["ffs_chain_hidden"] = bool(chain_rows) and not include_chain
+        summary["ffs_chain_enrollment_count"] = len(chain_rows)
+        summary["ffs_chain_enrollment_ids"] = _unique_non_empty([row.get("enrollment_id") for row in chain_rows])
+        if chain_rows and not include_chain:
+            visible_rows_by_npi[npi_value] = visible_rows
+
+    if not visible_rows_by_npi:
+        return summary_map
+
+    overrides = await _fetch_ffs_summary_overrides(visible_rows_by_npi, session=session)
+    for npi_value, visible_rows in visible_rows_by_npi.items():
+        summary = summary_map.get(npi_value)
+        if summary is None:
+            continue
+        override = overrides.get(npi_value)
+        if override is None:
+            override = {
+                "ffs_enrollment_ids": _unique_non_empty([row.get("enrollment_id") for row in visible_rows]),
+                "ffs_pecos_asct_cntl_ids": _unique_non_empty([row.get("pecos_asct_cntl_id") for row in visible_rows]),
+                "ffs_secondary_provider_type_codes": [],
+                "ffs_secondary_provider_type_texts": [],
+                "ffs_practice_zip_codes": [],
+                "ffs_practice_cities": [],
+                "ffs_practice_states": [],
+                "ffs_related_npis": [],
+                "ffs_related_npi_count": 0,
+                "ffs_reassignment_in_count": 0,
+                "ffs_reassignment_out_count": 0,
+            }
+
+        summary["ffs_enrollment_ids"] = override["ffs_enrollment_ids"]
+        summary["ffs_pecos_asct_cntl_ids"] = override["ffs_pecos_asct_cntl_ids"]
+        summary["ffs_secondary_provider_type_codes"] = override["ffs_secondary_provider_type_codes"]
+        summary["ffs_secondary_provider_type_texts"] = override["ffs_secondary_provider_type_texts"]
+        summary["ffs_practice_zip_codes"] = override["ffs_practice_zip_codes"]
+        summary["ffs_practice_cities"] = override["ffs_practice_cities"]
+        summary["ffs_practice_states"] = override["ffs_practice_states"]
+        summary["ffs_related_npis"] = override["ffs_related_npis"]
+        summary["ffs_related_npi_count"] = override["ffs_related_npi_count"]
+        summary["ffs_reassignment_in_count"] = override["ffs_reassignment_in_count"]
+        summary["ffs_reassignment_out_count"] = override["ffs_reassignment_out_count"]
     return summary_map
 
 
-async def _fetch_provider_enrichment_detail(npi: int) -> dict[str, Any]:
+def _provider_enrichment_visibility(summary: Optional[dict[str, Any]], *, include_chain: bool) -> dict[str, Any]:
+    summary = summary or {}
+    chain_ids = list(summary.get("ffs_chain_enrollment_ids") or [])
+    chain_count = int(summary.get("ffs_chain_enrollment_count") or len(chain_ids))
+    return {
+        "show_mode": "chain" if include_chain else "default",
+        "chain_hidden": bool(chain_count) and not include_chain,
+        "chain_enrollment_count": chain_count,
+        "chain_enrollment_ids": chain_ids,
+    }
+
+
+def _public_provider_enrichment_summary(summary: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    if not isinstance(summary, dict):
+        return summary
+    public_summary = dict(summary)
+    public_summary.pop("ffs_chain_hidden", None)
+    public_summary.pop("ffs_chain_enrollment_count", None)
+    public_summary.pop("ffs_chain_enrollment_ids", None)
+    return public_summary
+
+
+async def _fetch_provider_enrichment_summary_detail(
+    npi: int,
+    *,
+    include_chain: bool = False,
+    session: Any = None,
+) -> dict[str, Any]:
+    summary_map = await _fetch_provider_enrichment_summary_map([npi], include_chain=include_chain, session=session)
+    summary = summary_map.get(int(npi))
+    return {
+        "summary": _public_provider_enrichment_summary(summary),
+        "ffs_visibility": _provider_enrichment_visibility(summary, include_chain=include_chain),
+    }
+
+
+async def _fetch_provider_enrichment_detail(
+    npi: int,
+    *,
+    include_chain: bool = False,
+    session: Any = None,
+) -> dict[str, Any]:
     detail: dict[str, Any] = {
         "summary": None,
         "enrollments": {
@@ -439,10 +1020,25 @@ async def _fetch_provider_enrichment_detail(npi: int) -> dict[str, Any]:
             "rhc": [],
             "snf": [],
         },
+        "ffs_subfiles": {
+            "additional_npis": [],
+            "practice_locations": [],
+            "secondary_specialties": [],
+            "reassignments_out": [],
+            "reassignments_in": [],
+        },
+        "ffs_visibility": {
+            "show_mode": "chain" if include_chain else "default",
+            "chain_hidden": False,
+            "chain_enrollment_count": 0,
+            "chain_enrollment_ids": [],
+        },
     }
 
-    summary_map = await _fetch_provider_enrichment_summary_map([npi])
-    detail["summary"] = summary_map.get(int(npi))
+    summary_map = await _fetch_provider_enrichment_summary_map([npi], include_chain=include_chain, session=session)
+    summary = summary_map.get(int(npi))
+    detail["summary"] = _public_provider_enrichment_summary(summary)
+    detail["ffs_visibility"] = _provider_enrichment_visibility(summary, include_chain=include_chain)
 
     table_model_pairs = (
         ("ffs_public", ProviderEnrollmentFFS),
@@ -453,19 +1049,202 @@ async def _fetch_provider_enrichment_detail(npi: int) -> dict[str, Any]:
         ("rhc", ProviderEnrollmentRHC),
         ("snf", ProviderEnrollmentSNF),
     )
+    enrollment_flag_map = {
+        "ffs_public": "has_ffs_enrollment",
+        "hospital": "has_hospital_enrollment",
+        "hha": "has_hha_enrollment",
+        "hospice": "has_hospice_enrollment",
+        "fqhc": "has_fqhc_enrollment",
+        "rhc": "has_rhc_enrollment",
+        "snf": "has_snf_enrollment",
+    }
 
-    async with db.session() as session:
-        for key, model in table_model_pairs:
-            if not await _table_exists(model.__tablename__):
-                continue
-            stmt = (
-                select(model)
-                .where(model.npi == npi)
-                .order_by(model.reporting_year.desc().nullslast(), model.imported_at.desc().nullslast())
-                .limit(25)
+    for key, model in table_model_pairs:
+        if summary and not summary.get(enrollment_flag_map[key], False):
+            continue
+        if not await _table_exists(model.__tablename__, session=session):
+            continue
+        stmt = (
+            select(model)
+            .where(model.npi == npi)
+            .order_by(model.reporting_year.desc().nullslast(), model.imported_at.desc().nullslast())
+            .limit(25)
+        )
+        result = await _execute_stmt(stmt, session=session)
+        rows = [row.to_json_dict() for row in result.scalars()]
+        if key == "ffs_public":
+            visible_rows, chain_rows = _partition_ffs_enrollment_payloads(rows)
+            detail["ffs_visibility"] = {
+                "show_mode": "chain" if include_chain else "default",
+                "chain_hidden": bool(chain_rows) and not include_chain,
+                "chain_enrollment_count": len(chain_rows),
+                "chain_enrollment_ids": _unique_non_empty([row.get("enrollment_id") for row in chain_rows]),
+            }
+            detail["enrollments"][key] = rows if include_chain else visible_rows
+        else:
+            detail["enrollments"][key] = rows
+
+    if not await _table_exists(ProviderEnrollmentFFS.__tablename__, session=session):
+        return detail
+
+    ffs_rows = detail["enrollments"]["ffs_public"]
+    enrollment_ids = [
+        str(row.get("enrollment_id"))
+        for row in ffs_rows
+        if row.get("enrollment_id")
+    ]
+    if not enrollment_ids:
+        return detail
+
+    if await _table_exists(ProviderEnrollmentFFSAdditionalNPI.__tablename__, session=session):
+        stmt = (
+            select(ProviderEnrollmentFFSAdditionalNPI)
+            .where(ProviderEnrollmentFFSAdditionalNPI.enrollment_id.in_(enrollment_ids))
+            .order_by(
+                ProviderEnrollmentFFSAdditionalNPI.reporting_year.desc().nullslast(),
+                ProviderEnrollmentFFSAdditionalNPI.additional_npi.asc(),
             )
-            result = await session.execute(stmt)
-            detail["enrollments"][key] = [row.to_json_dict() for row in result.scalars()]
+            .limit(200)
+        )
+        result = await _execute_stmt(stmt, session=session)
+        detail["ffs_subfiles"]["additional_npis"] = [row.to_json_dict() for row in result.scalars()]
+
+    if await _table_exists(ProviderEnrollmentFFSAddress.__tablename__, session=session):
+        stmt = (
+            select(ProviderEnrollmentFFSAddress)
+            .where(ProviderEnrollmentFFSAddress.enrollment_id.in_(enrollment_ids))
+            .order_by(
+                ProviderEnrollmentFFSAddress.reporting_year.desc().nullslast(),
+                ProviderEnrollmentFFSAddress.state.asc().nullslast(),
+                ProviderEnrollmentFFSAddress.city.asc().nullslast(),
+                ProviderEnrollmentFFSAddress.zip_code.asc().nullslast(),
+            )
+            .limit(200)
+        )
+        result = await _execute_stmt(stmt, session=session)
+        detail["ffs_subfiles"]["practice_locations"] = [row.to_json_dict() for row in result.scalars()]
+
+    if await _table_exists(ProviderEnrollmentFFSSecondarySpecialty.__tablename__, session=session):
+        stmt = (
+            select(ProviderEnrollmentFFSSecondarySpecialty)
+            .where(ProviderEnrollmentFFSSecondarySpecialty.enrollment_id.in_(enrollment_ids))
+            .order_by(
+                ProviderEnrollmentFFSSecondarySpecialty.reporting_year.desc().nullslast(),
+                ProviderEnrollmentFFSSecondarySpecialty.provider_type_code.asc(),
+            )
+            .limit(200)
+        )
+        result = await _execute_stmt(stmt, session=session)
+        detail["ffs_subfiles"]["secondary_specialties"] = [row.to_json_dict() for row in result.scalars()]
+
+    if await _table_exists(ProviderEnrollmentFFSReassignment.__tablename__, session=session):
+        out_rows = await _execute_stmt(
+            text(
+                f"""
+                WITH matched AS (
+                    SELECT
+                        r.reassigning_enrollment_id,
+                        r.receiving_enrollment_id,
+                        r.reporting_year
+                      FROM mrf.{ProviderEnrollmentFFSReassignment.__tablename__} AS r
+                     WHERE r.reassigning_enrollment_id = ANY(:enrollment_ids)
+                     ORDER BY r.reporting_year DESC NULLS LAST, r.receiving_enrollment_id
+                     LIMIT 200
+                ),
+                needed AS (
+                    SELECT DISTINCT receiving_enrollment_id AS enrollment_id
+                      FROM matched
+                     WHERE receiving_enrollment_id IS NOT NULL
+                ),
+                ffs_latest AS (
+                    SELECT DISTINCT ON (f.enrollment_id)
+                        f.enrollment_id,
+                        f.npi,
+                        f.provider_type_code,
+                        f.provider_type_text
+                      FROM mrf.{ProviderEnrollmentFFS.__tablename__} AS f
+                      JOIN needed AS n
+                        ON n.enrollment_id = f.enrollment_id
+                     ORDER BY
+                        f.enrollment_id,
+                        f.reporting_year DESC NULLS LAST,
+                        f.imported_at DESC NULLS LAST,
+                        f.record_hash DESC
+                )
+                SELECT
+                    m.reassigning_enrollment_id,
+                    m.receiving_enrollment_id,
+                    dst.npi AS counterparty_npi,
+                    dst.provider_type_code AS counterparty_provider_type_code,
+                    dst.provider_type_text AS counterparty_provider_type_text,
+                    m.reporting_year
+                  FROM matched AS m
+                  LEFT JOIN ffs_latest AS dst
+                    ON dst.enrollment_id = m.receiving_enrollment_id
+                 ORDER BY m.reporting_year DESC NULLS LAST, m.receiving_enrollment_id
+                """
+            ),
+            session=session,
+            params={"enrollment_ids": enrollment_ids},
+        )
+        detail["ffs_subfiles"]["reassignments_out"] = [
+            _serialize_ffs_reassignment_row(row)
+            for row in out_rows.mappings().all()
+        ]
+
+        in_rows = await _execute_stmt(
+            text(
+                f"""
+                WITH matched AS (
+                    SELECT
+                        r.reassigning_enrollment_id,
+                        r.receiving_enrollment_id,
+                        r.reporting_year
+                      FROM mrf.{ProviderEnrollmentFFSReassignment.__tablename__} AS r
+                     WHERE r.receiving_enrollment_id = ANY(:enrollment_ids)
+                     ORDER BY r.reporting_year DESC NULLS LAST, r.reassigning_enrollment_id
+                     LIMIT 200
+                ),
+                needed AS (
+                    SELECT DISTINCT reassigning_enrollment_id AS enrollment_id
+                      FROM matched
+                     WHERE reassigning_enrollment_id IS NOT NULL
+                ),
+                ffs_latest AS (
+                    SELECT DISTINCT ON (f.enrollment_id)
+                        f.enrollment_id,
+                        f.npi,
+                        f.provider_type_code,
+                        f.provider_type_text
+                      FROM mrf.{ProviderEnrollmentFFS.__tablename__} AS f
+                      JOIN needed AS n
+                        ON n.enrollment_id = f.enrollment_id
+                     ORDER BY
+                        f.enrollment_id,
+                        f.reporting_year DESC NULLS LAST,
+                        f.imported_at DESC NULLS LAST,
+                        f.record_hash DESC
+                )
+                SELECT
+                    m.reassigning_enrollment_id,
+                    m.receiving_enrollment_id,
+                    src.npi AS counterparty_npi,
+                    src.provider_type_code AS counterparty_provider_type_code,
+                    src.provider_type_text AS counterparty_provider_type_text,
+                    m.reporting_year
+                  FROM matched AS m
+                  LEFT JOIN ffs_latest AS src
+                    ON src.enrollment_id = m.reassigning_enrollment_id
+                 ORDER BY m.reporting_year DESC NULLS LAST, m.reassigning_enrollment_id
+                """
+            ),
+            session=session,
+            params={"enrollment_ids": enrollment_ids},
+        )
+        detail["ffs_subfiles"]["reassignments_in"] = [
+            _serialize_ffs_reassignment_row(row)
+            for row in in_rows.mappings().all()
+        ]
 
     return detail
 
@@ -474,6 +1253,8 @@ async def _resolve_filter_year(
     requested_year: Optional[int],
     include_procedures: bool,
     include_medications: bool,
+    *,
+    session: Any = None,
 ) -> tuple[Optional[int], str]:
     if requested_year is not None:
         return requested_year, "request"
@@ -483,16 +1264,16 @@ async def _resolve_filter_year(
         return _parse_optional_year(env_raw, "HLTHPRT_NPI_FILTER_DEFAULT_YEAR"), "env"
 
     sources: list[str] = []
-    if include_procedures and await _table_exists("pricing_provider_procedure"):
+    if include_procedures and await _table_exists("pricing_provider_procedure", session=session):
         sources.append("SELECT MAX(year)::INTEGER AS y FROM mrf.pricing_provider_procedure")
-    if include_medications and await _table_exists("pricing_provider_prescription"):
+    if include_medications and await _table_exists("pricing_provider_prescription", session=session):
         sources.append("SELECT MAX(year)::INTEGER AS y FROM mrf.pricing_provider_prescription")
     if not sources:
         return None, "none"
 
     sql = "SELECT MAX(y) FROM (" + " UNION ALL ".join(sources) + ") AS years;"
-    async with db.acquire() as conn:
-        rows = await conn.all(text(sql))
+    result = await _execute_stmt(text(sql), session=session)
+    rows = result.all()
     year = rows[0][0] if rows and rows[0] else None
     return (int(year), "data") if year is not None else (None, "none")
 
@@ -502,6 +1283,8 @@ async def _resolve_internal_filter_codes(
     input_system: str,
     target_system: str,
     param_name: str,
+    *,
+    session: Any = None,
 ) -> tuple[list[int], str]:
     if not codes:
         return [], "none"
@@ -509,7 +1292,7 @@ async def _resolve_internal_filter_codes(
     if input_system == target_system:
         return _to_int_codes(codes, param_name), "direct"
 
-    if not await _table_exists("code_crosswalk"):
+    if not await _table_exists("code_crosswalk", session=session):
         return [], "none"
 
     sql = text(
@@ -522,18 +1305,21 @@ async def _resolve_internal_filter_codes(
         UNION
         SELECT DISTINCT from_code
           FROM mrf.code_crosswalk
-         WHERE UPPER(to_system) = :from_system
+        WHERE UPPER(to_system) = :from_system
            AND UPPER(to_code) = ANY(:input_codes)
            AND UPPER(from_system) = :target_system
         """
     )
-    async with db.acquire() as conn:
-        rows = await conn.all(
-            sql,
-            from_system=input_system,
-            target_system=target_system,
-            input_codes=codes,
-        )
+    result = await _execute_stmt(
+        sql,
+        session=session,
+        params={
+            "from_system": input_system,
+            "target_system": target_system,
+            "input_codes": codes,
+        },
+    )
+    rows = result.all()
     mapped = [str(row[0]) for row in rows if row and row[0] is not None]
     return _to_int_codes(mapped, param_name), ("crosswalk" if mapped else "none")
 
@@ -869,8 +1655,10 @@ async def pharmacists_per_pharmacy(request):
 @blueprint.get("/all")
 async def get_all(request):
     count_only = str(request.args.get("count_only", "0")).strip() == "1"
+    include_chain_enrichment = _include_chain_provider_enrichment(request.args.get("show"))
     response_format = request.args.get("format") or request.args.get("response_format")
     response_format = str(response_format).strip().lower() if response_format else None
+    request_session = _request_session(request)
     legacy_name_like = _extract_name_filters(request)
     # Explicit access for route collectors / OpenAPI parity.
     request.args.get("q")
@@ -958,11 +1746,19 @@ async def get_all(request):
         )
 
     if requested_procedure_codes or requested_medication_codes or requested_year is not None:
-        filter_year, filter_year_source = await _resolve_filter_year(
-            requested_year,
-            include_procedures=bool(requested_procedure_codes),
-            include_medications=bool(requested_medication_codes),
-        )
+        if request_session is not None:
+            filter_year, filter_year_source = await _resolve_filter_year(
+                requested_year,
+                include_procedures=bool(requested_procedure_codes),
+                include_medications=bool(requested_medication_codes),
+                session=request_session,
+            )
+        else:
+            filter_year, filter_year_source = await _resolve_filter_year(
+                requested_year,
+                include_procedures=bool(requested_procedure_codes),
+                include_medications=bool(requested_medication_codes),
+            )
     else:
         filter_year, filter_year_source = None, "none"
 
@@ -971,19 +1767,37 @@ async def get_all(request):
     procedure_match_via = "none"
     medication_match_via = "none"
     if requested_procedure_codes:
-        procedure_internal_codes, procedure_match_via = await _resolve_internal_filter_codes(
-            requested_procedure_codes,
-            procedure_code_system or INTERNAL_PROCEDURE_CODE_SYSTEM,
-            INTERNAL_PROCEDURE_CODE_SYSTEM,
-            "procedure_codes",
-        )
+        if request_session is not None:
+            procedure_internal_codes, procedure_match_via = await _resolve_internal_filter_codes(
+                requested_procedure_codes,
+                procedure_code_system or INTERNAL_PROCEDURE_CODE_SYSTEM,
+                INTERNAL_PROCEDURE_CODE_SYSTEM,
+                "procedure_codes",
+                session=request_session,
+            )
+        else:
+            procedure_internal_codes, procedure_match_via = await _resolve_internal_filter_codes(
+                requested_procedure_codes,
+                procedure_code_system or INTERNAL_PROCEDURE_CODE_SYSTEM,
+                INTERNAL_PROCEDURE_CODE_SYSTEM,
+                "procedure_codes",
+            )
     if requested_medication_codes:
-        medication_internal_codes, medication_match_via = await _resolve_internal_filter_codes(
-            requested_medication_codes,
-            medication_code_system or INTERNAL_MEDICATION_CODE_SYSTEM,
-            INTERNAL_MEDICATION_CODE_SYSTEM,
-            "medication_codes",
-        )
+        if request_session is not None:
+            medication_internal_codes, medication_match_via = await _resolve_internal_filter_codes(
+                requested_medication_codes,
+                medication_code_system or INTERNAL_MEDICATION_CODE_SYSTEM,
+                INTERNAL_MEDICATION_CODE_SYSTEM,
+                "medication_codes",
+                session=request_session,
+            )
+        else:
+            medication_internal_codes, medication_match_via = await _resolve_internal_filter_codes(
+                requested_medication_codes,
+                medication_code_system or INTERNAL_MEDICATION_CODE_SYSTEM,
+                INTERNAL_MEDICATION_CODE_SYSTEM,
+                "medication_codes",
+            )
 
     filter_capabilities = {
         "npi_procedures_array_available": True,
@@ -992,7 +1806,10 @@ async def get_all(request):
         "pricing_provider_prescription_available": False,
     }
     if requested_procedure_codes or requested_medication_codes:
-        filter_capabilities = await _resolve_npi_filter_capabilities()
+        if request_session is not None:
+            filter_capabilities = await _resolve_npi_filter_capabilities(session=request_session)
+        else:
+            filter_capabilities = await _resolve_npi_filter_capabilities()
 
     zip_code = _normalize_zip_code(zip_code_raw, "zip_code")
     postal_code = _normalize_zip_code(postal_code_raw, "postal_code")
@@ -1399,13 +2216,7 @@ async def get_all(request):
         )
 
     if count_only and not simple_filter_present and not has_insurance and not city and not state:
-        try:
-            total_npi = await db.scalar(select(func.count(NPIData.npi)))
-        except AttributeError:
-            async with db.acquire() as conn:
-                rows = await conn.all(select(func.count(NPIData.npi)))
-                total_npi = rows[0][0] if rows else 0
-        return response.json({"rows": total_npi}, default=str)
+        return response.json({"rows": await _fast_primary_npi_count()}, default=str)
 
     if count_only and has_insurance and not simple_filter_present:
         rows = await _fast_has_insurance_count(city, state)
@@ -1636,14 +2447,22 @@ async def get_all(request):
         rows = await get_count(filters)
         return response.json({"rows": rows}, default=str)
 
-    total, rows = await asyncio.gather(
-        get_count(filters),
-        get_results(start, limit, filters),
-    )
+    if not simple_filter_present and not has_insurance and not city and not state:
+        total, rows = await asyncio.gather(
+            _fast_primary_npi_count(),
+            get_results(start, limit, filters),
+        )
+    else:
+        total, rows = await asyncio.gather(
+            get_count(filters),
+            get_results(start, limit, filters),
+        )
     summary_map: dict[int, dict[str, Any]] = {}
     try:
         summary_map = await _fetch_provider_enrichment_summary_map(
-            [row.get("npi") for row in rows if isinstance(row, dict)]
+            [row.get("npi") for row in rows if isinstance(row, dict)],
+            include_chain=include_chain_enrichment,
+            session=request_session,
         )
     except Exception as exc:  # pragma: no cover - defensive fallback for transient DB states
         logger.debug("Provider enrichment summary fetch failed: %s", exc)
@@ -1686,6 +2505,7 @@ async def get_all(request):
 
 @blueprint.get("/near/")
 async def get_near_npi(request):
+    request_session = _request_session(request)
     in_long, in_lat = None, None
     if request.args.get("long"):
         in_long = float(request.args.get("long"))
@@ -1754,30 +2574,56 @@ async def get_near_npi(request):
         )
 
     if requested_procedure_codes or requested_medication_codes or requested_year is not None:
-        filter_year, _filter_year_source = await _resolve_filter_year(
-            requested_year,
-            include_procedures=bool(requested_procedure_codes),
-            include_medications=bool(requested_medication_codes),
-        )
+        if request_session is not None:
+            filter_year, _filter_year_source = await _resolve_filter_year(
+                requested_year,
+                include_procedures=bool(requested_procedure_codes),
+                include_medications=bool(requested_medication_codes),
+                session=request_session,
+            )
+        else:
+            filter_year, _filter_year_source = await _resolve_filter_year(
+                requested_year,
+                include_procedures=bool(requested_procedure_codes),
+                include_medications=bool(requested_medication_codes),
+            )
     else:
         filter_year = None
 
     procedure_internal_codes: list[int] = []
     medication_internal_codes: list[int] = []
     if requested_procedure_codes:
-        procedure_internal_codes, _ = await _resolve_internal_filter_codes(
-            requested_procedure_codes,
-            procedure_code_system or INTERNAL_PROCEDURE_CODE_SYSTEM,
-            INTERNAL_PROCEDURE_CODE_SYSTEM,
-            "procedure_codes",
-        )
+        if request_session is not None:
+            procedure_internal_codes, _ = await _resolve_internal_filter_codes(
+                requested_procedure_codes,
+                procedure_code_system or INTERNAL_PROCEDURE_CODE_SYSTEM,
+                INTERNAL_PROCEDURE_CODE_SYSTEM,
+                "procedure_codes",
+                session=request_session,
+            )
+        else:
+            procedure_internal_codes, _ = await _resolve_internal_filter_codes(
+                requested_procedure_codes,
+                procedure_code_system or INTERNAL_PROCEDURE_CODE_SYSTEM,
+                INTERNAL_PROCEDURE_CODE_SYSTEM,
+                "procedure_codes",
+            )
     if requested_medication_codes:
-        medication_internal_codes, _ = await _resolve_internal_filter_codes(
-            requested_medication_codes,
-            medication_code_system or INTERNAL_MEDICATION_CODE_SYSTEM,
-            INTERNAL_MEDICATION_CODE_SYSTEM,
-            "medication_codes",
-        )
+        if request_session is not None:
+            medication_internal_codes, _ = await _resolve_internal_filter_codes(
+                requested_medication_codes,
+                medication_code_system or INTERNAL_MEDICATION_CODE_SYSTEM,
+                INTERNAL_MEDICATION_CODE_SYSTEM,
+                "medication_codes",
+                session=request_session,
+            )
+        else:
+            medication_internal_codes, _ = await _resolve_internal_filter_codes(
+                requested_medication_codes,
+                medication_code_system or INTERNAL_MEDICATION_CODE_SYSTEM,
+                INTERNAL_MEDICATION_CODE_SYSTEM,
+                "medication_codes",
+            )
 
     if (requested_procedure_codes and not procedure_internal_codes) or (
         requested_medication_codes and not medication_internal_codes
@@ -1791,7 +2637,10 @@ async def get_near_npi(request):
         "pricing_provider_prescription_available": False,
     }
     if requested_procedure_codes or requested_medication_codes:
-        filter_capabilities = await _resolve_npi_filter_capabilities()
+        if request_session is not None:
+            filter_capabilities = await _resolve_npi_filter_capabilities(session=request_session)
+        else:
+            filter_capabilities = await _resolve_npi_filter_capabilities()
 
     _validate_section_filters(section, classification, codes)
     await _ensure_npi_geo_index()
@@ -1902,7 +2751,12 @@ async def get_near_npi(request):
     if extra_filters:
         extra_clause = "\n          AND " + "\n          AND ".join(extra_filters)
 
-    nearby_sql = _build_nearby_sql(taxonomy_conditions, extra_clause, ilike_clause)
+    nearby_sql = _build_nearby_sql(
+        taxonomy_conditions,
+        extra_clause,
+        ilike_clause,
+        use_taxonomy_filter=bool(where),
+    )
 
     async with db.acquire() as conn:
         res_q = await conn.all(
@@ -2061,6 +2915,9 @@ async def get_plans_by_npi(_request, npi):
 @blueprint.get("/id/<npi>")
 async def get_npi(request, npi):
     force_address_update = request.args.get("force_address_update", 0)
+    include_chain_enrichment = _include_chain_provider_enrichment(request.args.get("show"))
+    provider_enrichment_view = _normalize_provider_enrichment_view(request.args.get("view"))
+    request_session = _request_session(request)
 
     async def update_addr_coordinates(checksum, long, lat, formatted_address, place_id):
         await (
@@ -2242,7 +3099,10 @@ async def get_npi(request, npi):
 
     npi = int(npi)
 
-    data = await _build_npi_details(npi)
+    if request_session is not None:
+        data = await _build_npi_details(npi, session=request_session)
+    else:
+        data = await _build_npi_details(npi)
 
     if not data:
         raise sanic.exceptions.NotFound
@@ -2257,7 +3117,37 @@ async def get_npi(request, npi):
     else:
         data["address_list"] = []
 
-    other_names = await _fetch_other_names(npi)
+    other_names_task = asyncio.create_task(_fetch_other_names(npi))
+    if provider_enrichment_view == "summary":
+        provider_enrichment_task = asyncio.create_task(
+            _fetch_provider_enrichment_summary_detail(
+                npi,
+                include_chain=include_chain_enrichment,
+            )
+        )
+    else:
+        provider_enrichment_task = asyncio.create_task(
+            _fetch_provider_enrichment_detail(
+                npi,
+                include_chain=include_chain_enrichment,
+            )
+        )
+
+    provider_enrichment_payload: Optional[dict[str, Any]] = None
+    try:
+        other_names, provider_enrichment_payload = await asyncio.gather(
+            other_names_task,
+            provider_enrichment_task,
+        )
+    except Exception as exc:  # pragma: no cover - defensive fallback for transient DB states
+        logger.debug("Provider enrichment detail fetch failed for npi=%s: %s", npi, exc)
+        if not other_names_task.done():
+            other_names_task.cancel()
+        try:
+            other_names = await _fetch_other_names(npi)
+        except Exception:  # pragma: no cover - defensive fallback
+            other_names = []
+        provider_enrichment_payload = None
     data["other_name_list"] = other_names
 
     existing_dba = [name for name in (data.get("do_business_as") or []) if name]
@@ -2271,13 +3161,14 @@ async def get_npi(request, npi):
         ]
         data["do_business_as"] = list(dict.fromkeys(candidates)) if candidates else []
 
-    try:
-        data["provider_enrichment"] = await _fetch_provider_enrichment_detail(npi)
-    except Exception as exc:  # pragma: no cover - defensive fallback for transient DB states
-        logger.debug("Provider enrichment detail fetch failed for npi=%s: %s", npi, exc)
+    if provider_enrichment_payload is not None:
+        data["provider_enrichment"] = provider_enrichment_payload
+    else:
         data["provider_enrichment"] = {
             "summary": None,
-            "enrollments": {
+        }
+        if provider_enrichment_view == "full":
+            data["provider_enrichment"]["enrollments"] = {
                 "ffs_public": [],
                 "hospital": [],
                 "hha": [],
@@ -2285,102 +3176,109 @@ async def get_npi(request, npi):
                 "fqhc": [],
                 "rhc": [],
                 "snf": [],
-            },
-        }
+            }
+        else:
+            data["provider_enrichment"]["ffs_visibility"] = {
+                "show_mode": "chain" if include_chain_enrichment else "default",
+                "chain_hidden": False,
+                "chain_enrollment_count": 0,
+                "chain_enrollment_ids": [],
+            }
 
     return response.json(data, default=str)
 
 
-async def _build_npi_details(npi: int) -> dict:
-    async with db.acquire():
-        npi_data_table = NPIData.__table__
-        taxonomy_table = NPIDataTaxonomy.__table__
-        taxonomy_group_table = NPIDataTaxonomyGroup.__table__
-        address_table = NPIAddress.__table__
-        filter_capabilities = await _resolve_npi_filter_capabilities()
-        procedures_array_available = bool(filter_capabilities.get("npi_procedures_array_available", True))
-        medications_array_available = bool(filter_capabilities.get("npi_medications_array_available", True))
+async def _build_npi_details(npi: int, *, session: Any = None) -> dict:
+    npi_data_table = NPIData.__table__
+    taxonomy_table = NPIDataTaxonomy.__table__
+    taxonomy_group_table = NPIDataTaxonomyGroup.__table__
+    address_table = NPIAddress.__table__
+    filter_capabilities = await _resolve_npi_filter_capabilities(session=session)
+    procedures_array_available = bool(filter_capabilities.get("npi_procedures_array_available", True))
+    medications_array_available = bool(filter_capabilities.get("npi_medications_array_available", True))
 
-        address_columns = []
-        for column in address_table.columns:
-            if column.key == "procedures_array" and not procedures_array_available:
-                address_columns.append(literal_column("'{}'::INTEGER[]").label("procedures_array"))
-                continue
-            if column.key == "medications_array" and not medications_array_available:
-                address_columns.append(literal_column("'{}'::INTEGER[]").label("medications_array"))
-                continue
-            address_columns.append(column)
+    address_columns = []
+    for column in address_table.columns:
+        if column.key == "procedures_array" and not procedures_array_available:
+            address_columns.append(literal_column("'{}'::INTEGER[]").label("procedures_array"))
+            continue
+        if column.key == "medications_array" and not medications_array_available:
+            address_columns.append(literal_column("'{}'::INTEGER[]").label("medications_array"))
+            continue
+        address_columns.append(column)
 
-        address_subquery_base = (
-            select(*address_columns)
-            .where(
-                (address_table.c.npi == npi)
-                & or_(
-                    address_table.c.type == "primary",
-                    address_table.c.type == "secondary",
-                )
+    address_subquery_base = (
+        select(*address_columns)
+        .where(
+            (address_table.c.npi == npi)
+            & or_(
+                address_table.c.type == "primary",
+                address_table.c.type == "secondary",
             )
-            .order_by(address_table.c.type)
         )
-        try:
-            address_subquery = address_subquery_base.alias("address_list")
-        except NameError:
-            # Some tests swap in lightweight stand-ins lacking SQLAlchemy helpers.
-            # Fall back to the base query so coverage exercises downstream handling.
-            address_subquery = address_subquery_base
+        .order_by(address_table.c.type)
+    )
+    try:
+        address_subquery = address_subquery_base.alias("address_list")
+    except NameError:
+        address_subquery = address_subquery_base
 
-        select_columns = [
-            npi_data_table,
-            func.json_agg(literal_column(f'distinct "{NPIDataTaxonomy.__tablename__}"')),
-            func.json_agg(literal_column(f'distinct "{NPIDataTaxonomyGroup.__tablename__}"')),
-        ]
-        join_clause = npi_data_table.outerjoin(taxonomy_table, npi_data_table.c.npi == taxonomy_table.c.npi).outerjoin(
-            taxonomy_group_table,
-            npi_data_table.c.npi == taxonomy_group_table.c.npi,
-        )
-        if hasattr(address_subquery, "c"):
-            join_clause = join_clause.outerjoin(address_subquery, npi_data_table.c.npi == address_subquery.c.npi)
-            select_columns.append(func.json_agg(literal_column('distinct "address_list"')))
-        else:
-            select_columns.append(literal_column("NULL::json"))
-        query = (
-            db.select(*select_columns)
-            .select_from(join_clause)
-            .where(npi_data_table.c.npi == npi)
-            .group_by(npi_data_table.c.npi)
-        )
+    select_columns = [
+        npi_data_table,
+        func.json_agg(literal_column(f'distinct "{NPIDataTaxonomy.__tablename__}"')),
+        func.json_agg(literal_column(f'distinct "{NPIDataTaxonomyGroup.__tablename__}"')),
+    ]
+    join_clause = npi_data_table.outerjoin(taxonomy_table, npi_data_table.c.npi == taxonomy_table.c.npi).outerjoin(
+        taxonomy_group_table,
+        npi_data_table.c.npi == taxonomy_group_table.c.npi,
+    )
+    if hasattr(address_subquery, "c"):
+        join_clause = join_clause.outerjoin(address_subquery, npi_data_table.c.npi == address_subquery.c.npi)
+        select_columns.append(func.json_agg(literal_column('distinct "address_list"')))
+    else:
+        select_columns.append(literal_column("NULL::json"))
+    query = (
+        db.select(*select_columns)
+        .select_from(join_clause)
+        .where(npi_data_table.c.npi == npi)
+        .group_by(npi_data_table.c.npi)
+    )
 
+    if session is not None:
+        result = await session.execute(query._stmt)
+        rows = result.all()
+    else:
         rows = await query.all()
-        if not rows:
-            return {}
-        result_row = rows[0]
-        obj: dict[str, Any] = {
-            "taxonomy_list": [],
-            "taxonomy_group_list": [],
-            "address_list": [],
-        }
-        idx = 0
-        for column in NPIData.__table__.columns:
-            value = result_row[idx]
-            idx += 1
-            if column.key == "do_business_as_text":
-                continue
-            obj[column.key] = value
-
-        if result_row[idx]:
-            obj["taxonomy_list"].extend([entry for entry in result_row[idx] if entry])
+    if not rows:
+        return {}
+    result_row = rows[0]
+    obj: dict[str, Any] = {
+        "taxonomy_list": [],
+        "taxonomy_group_list": [],
+        "address_list": [],
+    }
+    idx = 0
+    for column in NPIData.__table__.columns:
+        value = result_row[idx]
         idx += 1
-        if result_row[idx]:
-            obj["taxonomy_group_list"].extend([entry for entry in result_row[idx] if entry])
-        idx += 1
-        if idx < len(result_row) and result_row[idx]:
-            obj["address_list"] = result_row[idx]
-        obj["do_business_as"] = obj.get("do_business_as") or []
-        return obj
+        if column.key == "do_business_as_text":
+            continue
+        obj[column.key] = value
+
+    if result_row[idx]:
+        obj["taxonomy_list"].extend([entry for entry in result_row[idx] if entry])
+    idx += 1
+    if result_row[idx]:
+        obj["taxonomy_group_list"].extend([entry for entry in result_row[idx] if entry])
+    idx += 1
+    if idx < len(result_row) and result_row[idx]:
+        obj["address_list"] = result_row[idx]
+    obj["do_business_as"] = obj.get("do_business_as") or []
+    return obj
 
 
-async def _fetch_other_names(npi: int) -> list[dict[str, Any]]:
-    result = await db.execute(select(NPIDataOtherIdentifier).where(NPIDataOtherIdentifier.npi == npi))
+async def _fetch_other_names(npi: int, *, session: Any = None) -> list[dict[str, Any]]:
+    result = await _execute_stmt(select(NPIDataOtherIdentifier).where(NPIDataOtherIdentifier.npi == npi), session=session)
     rows: list[dict[str, Any]] = []
     seen_checksums: set[int] = set()
     for row in result.scalars():
