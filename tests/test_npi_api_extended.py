@@ -63,6 +63,69 @@ async def test_get_all_count_only(monkeypatch):
     assert json.loads(response.body) == {"rows": 5}
 
 
+@pytest.mark.asyncio
+async def test_fast_has_insurance_count_global_uses_count_star_and_cache(monkeypatch):
+    class FakeResult:
+        def scalar(self):
+            return 42
+
+    calls = []
+
+    class FakeSession:
+        async def execute(self, stmt):
+            calls.append(str(stmt))
+            return FakeResult()
+
+    class FakeSessionContext:
+        async def __aenter__(self):
+            return FakeSession()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(npi_module, "db", types.SimpleNamespace(session=lambda: FakeSessionContext()))
+    monkeypatch.setattr(npi_module, "ENABLE_NPI_SCHEMA_CACHE", True)
+    monkeypatch.setattr(npi_module, "_NPI_HAS_INSURANCE_TOTAL_CACHE", {})
+
+    first = await npi_module._fast_has_insurance_count(None, None)
+    second = await npi_module._fast_has_insurance_count(None, None)
+
+    assert first == 42
+    assert second == 42
+    assert len(calls) == 1
+    assert "count(*)" in calls[0].lower()
+
+
+@pytest.mark.asyncio
+async def test_fast_has_insurance_count_city_uses_distinct(monkeypatch):
+    class FakeResult:
+        def scalar(self):
+            return 7
+
+    calls = []
+
+    class FakeSession:
+        async def execute(self, stmt):
+            calls.append(str(stmt))
+            return FakeResult()
+
+    class FakeSessionContext:
+        async def __aenter__(self):
+            return FakeSession()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(npi_module, "db", types.SimpleNamespace(session=lambda: FakeSessionContext()))
+    monkeypatch.setattr(npi_module, "ENABLE_NPI_SCHEMA_CACHE", True)
+    monkeypatch.setattr(npi_module, "_NPI_HAS_INSURANCE_TOTAL_CACHE", {})
+
+    value = await npi_module._fast_has_insurance_count("MIAMI", None)
+    assert value == 7
+    assert len(calls) == 1
+    assert "count(distinct" in calls[0].lower()
+
+
 def _build_result_row(npi_value: int) -> list:
     row = [npi_value]
     for column in NPIData.__table__.columns:
