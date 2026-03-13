@@ -1122,6 +1122,11 @@ class NPIAddress(AddressPrototype):
             'name': 'primary_city_state_npi',
             'where': "type='primary'",
         },
+        {
+            'index_elements': ('npi',),
+            'name': 'primary_with_insurance_npi',
+            'where': "type='primary' AND NOT (plans_network_array @@ '0'::query_int)",
+        },
         {'index_elements': ('type', "LEFT(postal_code, 5)"), 'name': 'type_postal_code_5'},
         {
             'index_elements': ("regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g')",),

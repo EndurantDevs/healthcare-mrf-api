@@ -57,6 +57,14 @@ MEDICATION_ALLOWED_CODE_SYSTEMS = {
 CODE_TOKEN_PATTERN = re.compile(r"^[A-Z0-9._-]+$")
 INT_CODE_PATTERN = re.compile(r"^-?\d+$")
 CHAIN_PECOS_PROVIDER_TYPE_CODES = {"12-C1"}
+FACILITY_ENROLLMENT_MODELS: dict[str, Any] = {
+    "hospital": ProviderEnrollmentHospital,
+    "hha": ProviderEnrollmentHomeHealthAgency,
+    "hospice": ProviderEnrollmentHospice,
+    "fqhc": ProviderEnrollmentFQHC,
+    "rhc": ProviderEnrollmentRHC,
+    "snf": ProviderEnrollmentSNF,
+}
 
 
 def _env_flag(*names: str, default: bool = False) -> bool:
@@ -71,6 +79,99 @@ def _env_flag(*names: str, default: bool = False) -> bool:
     return default
 
 
+def _parse_bounded_int(
+    raw_value: Any,
+    *,
+    param_name: str,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    if raw_value in (None, "", "null"):
+        return default
+    try:
+        parsed = int(str(raw_value).strip())
+    except ValueError as exc:
+        raise sanic.exceptions.InvalidUsage(f"Parameter '{param_name}' must be an integer") from exc
+    if parsed < minimum or parsed > maximum:
+        raise sanic.exceptions.InvalidUsage(
+            f"Parameter '{param_name}' must be between {minimum} and {maximum}"
+        )
+    return parsed
+
+
+def _parse_optional_bounded_int(
+    raw_value: Any,
+    *,
+    param_name: str,
+    minimum: int,
+    maximum: int,
+) -> Optional[int]:
+    if raw_value in (None, "", "null"):
+        return None
+    try:
+        parsed = int(str(raw_value).strip())
+    except ValueError as exc:
+        raise sanic.exceptions.InvalidUsage(f"Parameter '{param_name}' must be an integer") from exc
+    if parsed < minimum or parsed > maximum:
+        raise sanic.exceptions.InvalidUsage(
+            f"Parameter '{param_name}' must be between {minimum} and {maximum}"
+        )
+    return parsed
+
+
+def _parse_bool_arg(raw_value: Any, *, default: bool) -> bool:
+    if raw_value in (None, "", "null"):
+        return default
+    return str(raw_value).strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def _normalize_text_filter(raw_value: Any, *, param_name: str, max_length: int = 128) -> Optional[str]:
+    if raw_value in (None, "", "null"):
+        return None
+    text_value = str(raw_value).strip()
+    if not text_value:
+        return None
+    if len(text_value) > max_length:
+        raise sanic.exceptions.InvalidUsage(f"Parameter '{param_name}' is too long (max {max_length} chars)")
+    return text_value
+
+
+def _normalize_state_filter(raw_value: Any) -> Optional[str]:
+    state_value = _normalize_text_filter(raw_value, param_name="state", max_length=2)
+    if state_value is None:
+        return None
+    normalized = state_value.upper()
+    if not re.fullmatch(r"[A-Z]{2}", normalized):
+        raise sanic.exceptions.InvalidUsage("Parameter 'state' must be a 2-letter code")
+    return normalized
+
+
+def _normalize_ccn_filter(raw_value: Any) -> Optional[str]:
+    ccn_value = _normalize_text_filter(raw_value, param_name="ccn", max_length=32)
+    if ccn_value is None:
+        return None
+    normalized = re.sub(r"\s+", "", ccn_value.upper())
+    if not re.fullmatch(r"[A-Z0-9-]+", normalized):
+        raise sanic.exceptions.InvalidUsage("Parameter 'ccn' must be alphanumeric")
+    return normalized
+
+
+def _provider_display_name_from_mapping(mapping: Mapping[str, Any]) -> str:
+    entity_code = str(mapping.get("entity_type_code") or "").strip()
+    first_name = str(mapping.get("provider_first_name") or "").strip()
+    last_name = str(mapping.get("provider_last_name") or "").strip()
+    organization_name = str(mapping.get("provider_organization_name") or "").strip()
+    if entity_code == "1":
+        personal = " ".join(part for part in [first_name, last_name] if part).strip()
+        if personal:
+            return personal
+    if organization_name:
+        return organization_name
+    fallback = " ".join(part for part in [first_name, last_name] if part).strip()
+    return fallback or "Unknown"
+
+
 ENABLE_NPI_SCHEMA_CACHE = _env_flag(
     "HLTHPRT_ENABLE_NPI_SCHEMA_CACHE",
     "HLTHPRT_ENABLE_SCHEMA_CACHE",
@@ -80,6 +181,7 @@ _TABLE_EXISTS_CACHE: dict[str, tuple[float, bool]] = {}
 _TABLE_COLUMNS_CACHE: dict[str, tuple[float, set[str]]] = {}
 _NPI_FILTER_CAPABILITIES_CACHE: Optional[tuple[float, str, dict[str, bool]]] = None
 _NPI_PRIMARY_TOTAL_CACHE: Optional[tuple[float, int]] = None
+_NPI_HAS_INSURANCE_TOTAL_CACHE: dict[str, tuple[float, int]] = {}
 
 NAME_LIKE_TEMPLATE = (
     "LOWER("
@@ -245,6 +347,29 @@ def _primary_total_cache_set(value: int) -> int:
     if ENABLE_NPI_SCHEMA_CACHE:
         _NPI_PRIMARY_TOTAL_CACHE = (time.monotonic(), int(value))
     return int(value)
+
+
+def _has_insurance_total_cache_key(city: Optional[str], state: Optional[str]) -> str:
+    city_key = (city or "").strip().upper()
+    state_key = (state or "").strip().upper()
+    return f"{city_key}|{state_key}"
+
+
+def _has_insurance_total_cache_get(city: Optional[str], state: Optional[str]) -> Optional[int]:
+    cached = _cache_get(_NPI_HAS_INSURANCE_TOTAL_CACHE, _has_insurance_total_cache_key(city, state))
+    if cached is None:
+        return None
+    return int(cached)
+
+
+def _has_insurance_total_cache_set(city: Optional[str], state: Optional[str], value: int) -> int:
+    return int(
+        _cache_set(
+            _NPI_HAS_INSURANCE_TOTAL_CACHE,
+            _has_insurance_total_cache_key(city, state),
+            int(value),
+        )
+    )
 
 
 async def _execute_stmt(stmt: Any, *, session: Any = None, params: Optional[dict[str, Any]] = None):
@@ -478,6 +603,10 @@ async def _fetch_ffs_summary_overrides(
 
 
 async def _fast_has_insurance_count(city: Optional[str], state: Optional[str]) -> int:
+    cached = _has_insurance_total_cache_get(city, state)
+    if cached is not None:
+        return cached
+
     table = NPIAddress.__table__
     conditions = [
         table.c.type == "primary",
@@ -488,13 +617,15 @@ async def _fast_has_insurance_count(city: Optional[str], state: Optional[str]) -
     if state:
         conditions.append(table.c.state_name == state)
 
-    stmt = (
-        select(func.count(func.distinct(table.c.npi)))
-        .where(*conditions)
-    )
+    # For global has_insurance count, primary rows are one-per-NPI in our import shape.
+    # COUNT(*) avoids DISTINCT sorting over >1M values and significantly reduces latency.
+    if city is None and state is None:
+        stmt = select(func.count()).select_from(table).where(*conditions)
+    else:
+        stmt = select(func.count(func.distinct(table.c.npi))).where(*conditions)
     async with db.session() as session:
         result = await session.execute(stmt)
-        return int(result.scalar() or 0)
+        return _has_insurance_total_cache_set(city, state, int(result.scalar() or 0))
 
 
 async def _fast_primary_npi_count() -> int:
@@ -2501,6 +2632,335 @@ async def get_all(request):
         payload,
         default=str,
     )
+
+
+@blueprint.get("/facilities/providers")
+async def get_facility_connected_providers(request):
+    request_session = _request_session(request)
+    facility_type_raw = _normalize_text_filter(request.args.get("facility_type"), param_name="facility_type", max_length=32)
+    facility_type = (facility_type_raw or "hospital").lower()
+    enrollment_model = FACILITY_ENROLLMENT_MODELS.get(facility_type)
+    if enrollment_model is None:
+        allowed = ", ".join(sorted(FACILITY_ENROLLMENT_MODELS.keys()))
+        raise sanic.exceptions.InvalidUsage(f"Parameter 'facility_type' must be one of: {allowed}")
+
+    ccn = _normalize_ccn_filter(request.args.get("ccn"))
+    organization_name = _normalize_text_filter(
+        request.args.get("organization_name"),
+        param_name="organization_name",
+        max_length=256,
+    )
+    city = _normalize_text_filter(request.args.get("city"), param_name="city", max_length=128)
+    state = _normalize_state_filter(request.args.get("state"))
+    reporting_year = _parse_optional_bounded_int(
+        request.args.get("reporting_year"),
+        param_name="reporting_year",
+        minimum=1990,
+        maximum=3000,
+    )
+    limit = _parse_bounded_int(request.args.get("limit"), param_name="limit", default=50, minimum=1, maximum=200)
+    offset = _parse_bounded_int(request.args.get("offset"), param_name="offset", default=0, minimum=0, maximum=1_000_000)
+    stats_limit = _parse_bounded_int(
+        request.args.get("stats_limit"),
+        param_name="stats_limit",
+        default=100,
+        minimum=1,
+        maximum=500,
+    )
+    include_specialty_stats = _parse_bool_arg(request.args.get("include_specialty_stats"), default=True)
+
+    if ccn is None and organization_name is None:
+        raise sanic.exceptions.InvalidUsage("At least one facility locator is required: ccn or organization_name")
+
+    table_name = enrollment_model.__tablename__
+    if not await _table_exists(table_name, session=request_session):
+        payload: dict[str, Any] = {
+            "query": {
+                "facility_type": facility_type,
+                "ccn": ccn,
+                "organization_name": organization_name,
+                "city": city,
+                "state": state,
+                "reporting_year": reporting_year,
+                "limit": limit,
+                "offset": offset,
+            },
+            "total_providers": 0,
+            "matched_facilities": [],
+            "providers": [],
+        }
+        if include_specialty_stats:
+            payload["specialty_stats"] = []
+        return response.json(payload, default=str)
+
+    model_columns = _model_table_columns(enrollment_model)
+    has_cah_ccn = "cah_or_hospital_ccn" in model_columns
+    has_practice_location_type = "practice_location_type" in model_columns
+    facility_ccn_expr = (
+        "COALESCE(NULLIF(BTRIM(h.cah_or_hospital_ccn), ''), NULLIF(BTRIM(h.ccn), ''))"
+        if has_cah_ccn
+        else "NULLIF(BTRIM(h.ccn), '')"
+    )
+    practice_location_expr = (
+        "h.practice_location_type AS practice_location_type"
+        if has_practice_location_type
+        else "NULL::varchar AS practice_location_type"
+    )
+
+    where_clauses = ["1=1"]
+    params: dict[str, Any] = {}
+    if ccn:
+        where_clauses.append(f"UPPER(REPLACE({facility_ccn_expr}, ' ', '')) = :ccn")
+        params["ccn"] = ccn
+    if organization_name:
+        where_clauses.append(
+            "LOWER(COALESCE(h.organization_name, '') || ' ' || COALESCE(h.doing_business_as_name, '')) "
+            "LIKE :organization_name"
+        )
+        params["organization_name"] = f"%{organization_name.lower()}%"
+    if city:
+        where_clauses.append("UPPER(COALESCE(h.city, '')) = :city")
+        params["city"] = city.upper()
+    if state:
+        where_clauses.append("UPPER(COALESCE(h.state, '')) = :state")
+        params["state"] = state
+    if reporting_year is not None:
+        where_clauses.append("h.reporting_year = :reporting_year")
+        params["reporting_year"] = reporting_year
+    where_sql = " AND ".join(where_clauses)
+
+    total_sql = text(
+        f"""
+        SELECT COUNT(DISTINCT h.npi) AS total_providers
+          FROM mrf.{table_name} h
+         WHERE {where_sql}
+        """
+    )
+
+    facilities_sql = text(
+        f"""
+        SELECT
+            x.facility_ccn,
+            x.organization_name,
+            x.doing_business_as_name,
+            x.city,
+            x.state,
+            COUNT(DISTINCT x.npi) AS provider_count
+          FROM (
+                SELECT
+                    h.npi,
+                    {facility_ccn_expr} AS facility_ccn,
+                    h.organization_name,
+                    h.doing_business_as_name,
+                    h.city,
+                    h.state
+                  FROM mrf.{table_name} h
+                 WHERE {where_sql}
+          ) AS x
+         GROUP BY x.facility_ccn, x.organization_name, x.doing_business_as_name, x.city, x.state
+         ORDER BY provider_count DESC, x.organization_name ASC NULLS LAST, x.facility_ccn ASC NULLS LAST
+         LIMIT 25
+        """
+    )
+
+    providers_sql = text(
+        f"""
+        WITH filtered AS (
+            SELECT h.*
+              FROM mrf.{table_name} h
+             WHERE {where_sql}
+        ),
+        latest AS (
+            SELECT DISTINCT ON (h.npi)
+                h.npi,
+                h.reporting_year,
+                {facility_ccn_expr} AS facility_ccn,
+                h.organization_name,
+                h.doing_business_as_name,
+                h.city AS facility_city,
+                h.state AS facility_state,
+                h.zip_code AS facility_zip_code,
+                h.provider_type_code AS enrollment_provider_type_code,
+                h.provider_type_text AS enrollment_provider_type_text,
+                {practice_location_expr}
+              FROM filtered h
+             ORDER BY h.npi, h.reporting_year DESC NULLS LAST, h.imported_at DESC NULLS LAST
+        ),
+        taxonomy_choice AS (
+            SELECT DISTINCT ON (t.npi)
+                t.npi,
+                t.healthcare_provider_taxonomy_code AS taxonomy_code
+              FROM mrf.{NPIDataTaxonomy.__tablename__} t
+             WHERE t.npi IN (SELECT npi FROM latest)
+             ORDER BY
+                t.npi,
+                CASE WHEN UPPER(COALESCE(t.healthcare_provider_primary_taxonomy_switch, '')) = 'Y' THEN 0 ELSE 1 END,
+                t.checksum
+        )
+        SELECT
+            l.npi,
+            l.reporting_year,
+            l.facility_ccn,
+            l.organization_name,
+            l.doing_business_as_name,
+            l.facility_city,
+            l.facility_state,
+            l.facility_zip_code,
+            l.enrollment_provider_type_code,
+            l.enrollment_provider_type_text,
+            l.practice_location_type,
+            d.entity_type_code,
+            d.provider_first_name,
+            d.provider_last_name,
+            d.provider_organization_name,
+            d.city_name AS provider_city,
+            d.state_name AS provider_state,
+            tc.taxonomy_code,
+            nt.display_name AS specialty_display_name,
+            nt.classification AS specialty_classification,
+            nt.section AS specialty_section
+          FROM latest l
+          LEFT JOIN mrf.{NPIData.__tablename__} d
+            ON d.npi = l.npi
+          LEFT JOIN taxonomy_choice tc
+            ON tc.npi = l.npi
+          LEFT JOIN mrf.{NUCCTaxonomy.__tablename__} nt
+            ON nt.code = tc.taxonomy_code
+         ORDER BY l.reporting_year DESC NULLS LAST, l.npi
+         LIMIT :limit OFFSET :offset
+        """
+    )
+
+    specialty_sql = text(
+        f"""
+        WITH filtered AS (
+            SELECT h.npi
+              FROM mrf.{table_name} h
+             WHERE {where_sql}
+             GROUP BY h.npi
+        ),
+        taxonomy_choice AS (
+            SELECT DISTINCT ON (t.npi)
+                t.npi,
+                t.healthcare_provider_taxonomy_code AS taxonomy_code
+              FROM mrf.{NPIDataTaxonomy.__tablename__} t
+             WHERE t.npi IN (SELECT npi FROM filtered)
+             ORDER BY
+                t.npi,
+                CASE WHEN UPPER(COALESCE(t.healthcare_provider_primary_taxonomy_switch, '')) = 'Y' THEN 0 ELSE 1 END,
+                t.checksum
+        )
+        SELECT
+            COALESCE(nt.display_name, 'Unknown') AS specialty,
+            COALESCE(nt.classification, 'Unknown') AS classification,
+            COUNT(*) AS provider_count
+          FROM filtered f
+          LEFT JOIN taxonomy_choice tc
+            ON tc.npi = f.npi
+          LEFT JOIN mrf.{NUCCTaxonomy.__tablename__} nt
+            ON nt.code = tc.taxonomy_code
+         GROUP BY specialty, classification
+         ORDER BY provider_count DESC, specialty ASC
+         LIMIT :stats_limit
+        """
+    )
+
+    execute_params = dict(params)
+    execute_params["limit"] = limit
+    execute_params["offset"] = offset
+    execute_params["stats_limit"] = stats_limit
+
+    if request_session is not None:
+        session = request_session
+        total_result = await session.execute(total_sql, params)
+        facility_result = await session.execute(facilities_sql, params)
+        providers_result = await session.execute(providers_sql, execute_params)
+        specialty_result = (
+            await session.execute(specialty_sql, execute_params) if include_specialty_stats else None
+        )
+    else:
+        async with db.session() as session:
+            total_result = await session.execute(total_sql, params)
+            facility_result = await session.execute(facilities_sql, params)
+            providers_result = await session.execute(providers_sql, execute_params)
+            specialty_result = (
+                await session.execute(specialty_sql, execute_params) if include_specialty_stats else None
+            )
+
+    total_row = total_result.first()
+    total_providers = int((total_row._mapping.get("total_providers") if total_row else 0) or 0)
+
+    matched_facilities = [
+        {
+            "ccn": row._mapping.get("facility_ccn"),
+            "organization_name": row._mapping.get("organization_name"),
+            "doing_business_as_name": row._mapping.get("doing_business_as_name"),
+            "city": row._mapping.get("city"),
+            "state": row._mapping.get("state"),
+            "provider_count": int(row._mapping.get("provider_count") or 0),
+        }
+        for row in facility_result.all()
+    ]
+
+    providers = []
+    for row in providers_result.all():
+        mapping = row._mapping
+        providers.append(
+            {
+                "npi": int(mapping.get("npi")) if mapping.get("npi") is not None else None,
+                "provider_name": _provider_display_name_from_mapping(mapping),
+                "entity_type_code": mapping.get("entity_type_code"),
+                "provider_city": mapping.get("provider_city"),
+                "provider_state": mapping.get("provider_state"),
+                "taxonomy_code": mapping.get("taxonomy_code"),
+                "specialty": mapping.get("specialty_display_name") or "Unknown",
+                "specialty_classification": mapping.get("specialty_classification"),
+                "specialty_section": mapping.get("specialty_section"),
+                "facility": {
+                    "facility_type": facility_type,
+                    "ccn": mapping.get("facility_ccn"),
+                    "organization_name": mapping.get("organization_name"),
+                    "doing_business_as_name": mapping.get("doing_business_as_name"),
+                    "city": mapping.get("facility_city"),
+                    "state": mapping.get("facility_state"),
+                    "zip_code": mapping.get("facility_zip_code"),
+                    "reporting_year": mapping.get("reporting_year"),
+                    "practice_location_type": mapping.get("practice_location_type"),
+                    "provider_type_code": mapping.get("enrollment_provider_type_code"),
+                    "provider_type_text": mapping.get("enrollment_provider_type_text"),
+                },
+            }
+        )
+
+    payload: dict[str, Any] = {
+        "query": {
+            "facility_type": facility_type,
+            "ccn": ccn,
+            "organization_name": organization_name,
+            "city": city,
+            "state": state,
+            "reporting_year": reporting_year,
+            "limit": limit,
+            "offset": offset,
+            "include_specialty_stats": include_specialty_stats,
+            "stats_limit": stats_limit,
+        },
+        "total_providers": total_providers,
+        "matched_facilities": matched_facilities,
+        "providers": providers,
+    }
+
+    if include_specialty_stats and specialty_result is not None:
+        payload["specialty_stats"] = [
+            {
+                "specialty": row._mapping.get("specialty"),
+                "classification": row._mapping.get("classification"),
+                "provider_count": int(row._mapping.get("provider_count") or 0),
+            }
+            for row in specialty_result.all()
+        ]
+
+    return response.json(payload, default=str)
 
 
 @blueprint.get("/near/")
