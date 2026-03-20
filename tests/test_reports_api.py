@@ -311,6 +311,62 @@ async def test_get_pharmacy_state_stats_returns_payload(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_query_pharmacy_state_stats_normalizes_and_zero_fills_states(monkeypatch):
+    monkeypatch.setattr(reports, "_table_exists", AsyncMock(return_value=False))
+
+    class Session:
+        async def execute(self, stmt):
+            assert "WITH pharmacy_taxonomy AS" in stmt.text
+            return _FakeMappingsResult(
+                [
+                    {
+                        "state": "California",
+                        "nppes_pharmacies": 10,
+                        "nppes_pharmacists": 20,
+                        "active_pharmacists": 15,
+                        "active_pharmacies": 7,
+                        "aca_pharmacies": 8,
+                    },
+                    {
+                        "state": "CA",
+                        "nppes_pharmacies": 3,
+                        "nppes_pharmacists": 4,
+                        "active_pharmacists": 2,
+                        "active_pharmacies": 1,
+                        "aca_pharmacies": 1,
+                    },
+                    {
+                        "state": "District of Columbia",
+                        "nppes_pharmacies": 5,
+                        "nppes_pharmacists": 6,
+                        "active_pharmacists": 4,
+                        "active_pharmacies": 3,
+                        "aca_pharmacies": 2,
+                    },
+                    {
+                        "state": "DOHA",
+                        "nppes_pharmacies": 999,
+                        "nppes_pharmacists": 999,
+                        "active_pharmacists": 999,
+                        "active_pharmacies": 999,
+                        "aca_pharmacies": 999,
+                    },
+                ]
+            )
+
+    rows, has_helper = await reports._query_pharmacy_state_stats(Session())
+    by_state = {row["state"]: row for row in rows}
+
+    assert has_helper is False
+    assert len(rows) == 51
+    assert by_state["CA"]["nppes_pharmacies"] == 13
+    assert by_state["CA"]["nppes_pharmacists"] == 24
+    assert by_state["DC"]["active_pharmacies"] == 3
+    assert by_state["NY"]["nppes_pharmacies"] == 0
+    assert "DOHA" not in by_state
+
+
+@pytest.mark.asyncio
 async def test_query_chain_summary_uses_helper_table_when_available(monkeypatch):
     monkeypatch.setattr(reports, "_table_exists", AsyncMock(return_value=True))
 
@@ -468,7 +524,8 @@ async def test_query_pharmacy_state_stats_uses_helper_table(monkeypatch):
 
     assert has_helper is True
     assert "FROM mrf.npi_phone_staffing" in captured["sql"]
-    assert rows[0]["state"] == "CA"
+    by_state = {row["state"]: row for row in rows}
+    assert by_state["CA"]["state"] == "CA"
 
 
 @pytest.mark.asyncio
@@ -493,5 +550,6 @@ async def test_query_pharmacy_state_stats_coerces_numeric_fields(monkeypatch):
 
     rows, has_helper = await reports._query_pharmacy_state_stats(Session())
     assert has_helper is True
-    assert rows[0]["state"] == "CA"
-    assert rows[0]["aca_pharmacies"] == 7
+    by_state = {row["state"]: row for row in rows}
+    assert by_state["CA"]["state"] == "CA"
+    assert by_state["CA"]["aca_pharmacies"] == 7
