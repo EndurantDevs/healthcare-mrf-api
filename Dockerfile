@@ -7,7 +7,7 @@ ADD ./requirements-dev.txt /wheels
 WORKDIR /opt
 RUN apt-get update \
     && if apt-cache show libaio1t64 >/dev/null 2>&1; then LIBAIO_PKG=libaio1t64; else LIBAIO_PKG=libaio1; fi \
-    && apt-get install -y --no-install-recommends gcc g++ pkg-config gdal-bin libgdal-dev nginx git curl parallel "${LIBAIO_PKG}" \
+    && apt-get install -y --no-install-recommends gcc g++ pkg-config libgdal-dev nginx git curl parallel "${LIBAIO_PKG}" \
     && python3 -m venv venv \
     && . venv/bin/activate \
     && pip install --no-compile --upgrade pip \

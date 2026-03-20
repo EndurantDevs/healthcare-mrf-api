@@ -703,6 +703,67 @@ class GeoZipLookup(Base, JSONOutputMixin):
     population = Column(Integer)
 
 
+class GeoZipCensusProfile(Base, JSONOutputMixin):
+    __tablename__ = "geo_zip_census_profile"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("zip_code"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["zip_code"]
+
+    zip_code = Column(String(5), nullable=False)
+    total_population = Column(Integer)
+    median_household_income = Column(Integer)
+    bachelors_degree_or_higher_pct = Column(Float)
+    employment_rate_pct = Column(Float)
+    total_housing_units = Column(Integer)
+    without_health_insurance_pct = Column(Float)
+    total_employer_establishments = Column(Integer)
+    business_employment = Column(Integer)
+    business_payroll_annual_k = Column(Integer)
+    total_households = Column(Integer)
+    hispanic_or_latino = Column(Integer)
+    hispanic_or_latino_pct = Column(Float)
+    poverty_rate_pct = Column(Float)
+    median_age = Column(Float)
+    unemployment_rate_pct = Column(Float)
+    labor_force_participation_pct = Column(Float)
+    vacancy_rate_pct = Column(Float)
+    median_home_value = Column(Integer)
+    median_gross_rent = Column(Integer)
+    commute_mean_minutes = Column(Float)
+    commute_mode_drove_alone_pct = Column(Float)
+    commute_mode_carpool_pct = Column(Float)
+    commute_mode_public_transit_pct = Column(Float)
+    commute_mode_walked_pct = Column(Float)
+    commute_mode_worked_from_home_pct = Column(Float)
+    broadband_access_pct = Column(Float)
+    race_white_alone = Column(Integer)
+    race_black_or_african_american_alone = Column(Integer)
+    race_american_indian_and_alaska_native_alone = Column(Integer)
+    race_asian_alone = Column(Integer)
+    race_native_hawaiian_and_other_pacific_islander_alone = Column(Integer)
+    race_some_other_race_alone = Column(Integer)
+    race_two_or_more_races = Column(Integer)
+    race_white_alone_pct = Column(Float)
+    race_black_or_african_american_alone_pct = Column(Float)
+    race_american_indian_and_alaska_native_alone_pct = Column(Float)
+    race_asian_alone_pct = Column(Float)
+    race_native_hawaiian_and_other_pacific_islander_alone_pct = Column(Float)
+    race_some_other_race_alone_pct = Column(Float)
+    race_two_or_more_races_pct = Column(Float)
+    acs_white_alone_pct = Column(Float)
+    acs_black_or_african_american_alone_pct = Column(Float)
+    acs_american_indian_and_alaska_native_alone_pct = Column(Float)
+    acs_asian_alone_pct = Column(Float)
+    acs_native_hawaiian_and_other_pacific_islander_alone_pct = Column(Float)
+    acs_some_other_race_alone_pct = Column(Float)
+    acs_two_or_more_races_pct = Column(Float)
+    acs_hispanic_or_latino_pct = Column(Float)
+    updated_at = Column(DateTime)
+
+
 class PlanPrices(Base, JSONOutputMixin):
     __tablename__ = 'plan_prices'
     __main_table__ = __tablename__
@@ -805,7 +866,7 @@ class PlanNetworkTierRaw(Base, JSONOutputMixin):
     __my_index_elements__ = ['plan_id', 'checksum_network']
     __my_additional_indexes__ = [
         {'index_elements': ('issuer_id', 'network_tier', 'year'), 'using': 'gin'},
-        {'index_elements': ('checksum_network'), 'using': 'gin'}, ]
+        {'index_elements': ('checksum_network',), 'using': 'gin'}, ]
 
 
     plan_id = Column(String(14))
@@ -1206,6 +1267,21 @@ class NPIAddress(AddressPrototype):
     medications_array = Column(ARRAY(Integer), nullable=False, server_default="{0}")
 
     # NPI	Provider Secondary Practice Location Address- Address Line 1	Provider Secondary Practice Location Address-  Address Line 2	Provider Secondary Practice Location Address - City Name	Provider Secondary Practice Location Address - State Name	Provider Secondary Practice Location Address - Postal Code	Provider Secondary Practice Location Address - Country Code (If outside U.S.)	Provider Secondary Practice Location Address - Telephone Number	Provider Secondary Practice Location Address - Telephone Extension	Provider Practice Location Address - Fax Number
+
+
+class NPIPhoneStaffing(Base, JSONOutputMixin):
+    __tablename__ = 'npi_phone_staffing'
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint('state_name', 'telephone_number'),
+        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+    )
+    __my_index_elements__ = ['state_name', 'telephone_number']
+
+    state_name = Column(String, primary_key=True)
+    telephone_number = Column(String, primary_key=True)
+    pharmacist_count = Column(Integer, nullable=False, server_default="0")
+    updated_at = Column(TIMESTAMP)
 
 
 class PTGFile(Base, JSONOutputMixin):
@@ -1819,6 +1895,32 @@ class PricingSviZcta(Base, JSONOutputMixin):
     svi_household = Column(Float)
     svi_minority = Column(Float)
     svi_housing = Column(Float)
+    source = Column(String(128))
+    updated_at = Column(DateTime)
+
+
+class PricingPlacesZcta(Base, JSONOutputMixin):
+    __tablename__ = "pricing_places_zcta"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("zcta", "year", "measure_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["zcta", "year", "measure_id"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("year", "zcta"), "name": "pricing_places_year_zcta_idx"},
+        {"index_elements": ("year", "measure_id"), "name": "pricing_places_year_measure_idx"},
+        {"index_elements": ("zcta", "measure_id", "year"), "name": "pricing_places_zcta_measure_year_idx"},
+    ]
+
+    zcta = Column(String(5), nullable=False)
+    year = Column(Integer, nullable=False)
+    measure_id = Column(String(64), nullable=False)
+    measure_name = Column(String(256))
+    data_value = Column(Float)
+    low_ci = Column(Float)
+    high_ci = Column(Float)
+    data_value_type = Column(String(128))
     source = Column(String(128))
     updated_at = Column(DateTime)
 

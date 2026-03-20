@@ -31,6 +31,16 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HealthcheckResponse'
+  /coverage/statistics:
+    get:
+      summary: Curated cross-domain coverage statistics for site-facing dashboards
+      responses:
+        '200':
+          description: Flat metrics payload across marketplace, provider, procedure, pharmacy, and formulary datasets
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CoverageStatistics'
   /plan/:
     get:
       summary: Platform plan import status
@@ -661,7 +671,7 @@ paths:
           in: query
           schema:
             type: integer
-        - name: limit
+        - name: page_size
           in: query
           schema:
             type: integer
@@ -734,13 +744,269 @@ paths:
           in: query
           schema:
             type: integer
-        - name: limit
+        - name: page_size
           in: query
           schema:
             type: integer
       responses:
         '200':
           description: Pharmacy medication cost payload
+          content:
+            application/json:
+              schema:
+                type: object
+  /pharmacy-license/import/status:
+    get:
+      summary: Retrieve latest pharmacy-license import run status
+      parameters:
+        - name: run_id
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Pharmacy-license import status payload
+          content:
+            application/json:
+              schema:
+                type: object
+        '404':
+          description: No pharmacy-license run data available
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /pharmacy-license/coverage:
+    get:
+      summary: Retrieve state coverage for pharmacy-license ingestion support
+      responses:
+        '200':
+          description: State-level pharmacy-license coverage summary
+          content:
+            application/json:
+              schema:
+                type: object
+  /pharmacy-license/pharmacies/{npi}:
+    get:
+      summary: Retrieve pharmacy-license profile for an NPI
+      parameters:
+        - name: npi
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: as_of
+          in: query
+          schema:
+            type: string
+            format: date
+        - name: include_history
+          in: query
+          schema:
+            type: boolean
+        - name: history_limit
+          in: query
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Pharmacy-license profile payload
+          content:
+            application/json:
+              schema:
+                type: object
+  /reports/pharmacies/markets:
+    get:
+      summary: List pharmacy market summaries from NPPES plus Part D plus state-license overlays
+      parameters:
+        - name: state
+          in: query
+          schema:
+            type: string
+            minLength: 2
+            maxLength: 2
+        - name: city
+          in: query
+          schema:
+            type: string
+        - name: county
+          in: query
+          schema:
+            type: string
+        - name: zip
+          in: query
+          schema:
+            type: string
+            pattern: '^[0-9]{5}$'
+        - name: scope
+          in: query
+          schema:
+            type: string
+            enum: [state, city, county, zip]
+        - name: sort
+          in: query
+          schema:
+            type: string
+            enum: [pharmacy_count, pharmacies_per_100k, access_score, active_medicare_share, license_coverage_share]
+        - name: order
+          in: query
+          schema:
+            type: string
+            enum: [asc, desc]
+        - name: as_of
+          in: query
+          schema:
+            type: string
+            format: date
+        - name: include_staffing
+          in: query
+          schema:
+            type: boolean
+        - name: chain
+          in: query
+          schema:
+            type: string
+        - name: page
+          in: query
+          schema:
+            type: integer
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+        - name: limit
+          in: query
+          schema:
+            type: integer
+        - name: offset
+          in: query
+          schema:
+            type: integer
+        - name: start
+          in: query
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Pharmacy market summaries
+          content:
+            application/json:
+              schema:
+                type: object
+  /reports/pharmacies/markets/{market_id}:
+    get:
+      summary: Get one pharmacy market summary by market_id
+      parameters:
+        - name: market_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: as_of
+          in: query
+          schema:
+            type: string
+            format: date
+        - name: include_staffing
+          in: query
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: Pharmacy market summary
+          content:
+            application/json:
+              schema:
+                type: object
+  /reports/pharmacies/rankings/access:
+    get:
+      summary: List ranked pharmacy markets by access score
+      parameters:
+        - name: state
+          in: query
+          schema:
+            type: string
+            minLength: 2
+            maxLength: 2
+        - name: city
+          in: query
+          schema:
+            type: string
+        - name: county
+          in: query
+          schema:
+            type: string
+        - name: zip
+          in: query
+          schema:
+            type: string
+            pattern: '^[0-9]{5}$'
+        - name: scope
+          in: query
+          schema:
+            type: string
+            enum: [state, city, county, zip]
+        - name: as_of
+          in: query
+          schema:
+            type: string
+            format: date
+        - name: include_staffing
+          in: query
+          schema:
+            type: boolean
+        - name: chain
+          in: query
+          schema:
+            type: string
+        - name: page
+          in: query
+          schema:
+            type: integer
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+        - name: limit
+          in: query
+          schema:
+            type: integer
+        - name: offset
+          in: query
+          schema:
+            type: integer
+        - name: start
+          in: query
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Ranked pharmacy market summaries
+          content:
+            application/json:
+              schema:
+                type: object
+  /reports/pharmacies/{npi}/market-context:
+    get:
+      summary: Return market context summary for one pharmacy NPI
+      parameters:
+        - name: npi
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: as_of
+          in: query
+          schema:
+            type: string
+            format: date
+        - name: include_staffing
+          in: query
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: Pharmacy market context payload
           content:
             application/json:
               schema:
@@ -1190,6 +1456,41 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+  /geo/zip/{zip_code}/places:
+    get:
+      summary: Return CDC PLACES ZCTA measures for a ZIP code
+      parameters:
+        - name: zip_code
+          in: path
+          required: true
+          schema:
+            type: string
+          description: 5-digit ZIP code mapped to ZCTA keys
+        - name: year
+          in: query
+          required: false
+          schema:
+            type: integer
+          description: Optional PLACES year. Defaults to latest available year for the ZIP.
+        - name: measure_id
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Optional PLACES measure identifier filter (for example CSMOKING).
+      responses:
+        '200':
+          description: CDC PLACES measures available for the ZIP/ZCTA and year
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GeoZipPlacesResponse'
+        '404':
+          description: No PLACES data found for the ZIP/filters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /geo/city:
     get:
       summary: List ZIP codes for a given city and optional state
@@ -1458,6 +1759,11 @@ paths:
             type: string
             enum: [all, classification, full_taxonomy]
           description: Alias for `format`
+        - name: show
+          in: query
+          schema:
+            type: string
+          description: Optional output view selector (for example `chain`)
         - name: start
           in: query
           schema:
@@ -1683,6 +1989,60 @@ paths:
                 type: array
                 items:
                   $ref: '#/components/schemas/NpiNearResult'
+  /npi/facilities/providers:
+    get:
+      summary: Find providers connected to a facility enrollment entity
+      parameters:
+        - name: facility_type
+          in: query
+          schema:
+            type: string
+            enum: [hospital, hha, hospice, fqhc, rhc, snf]
+        - name: ccn
+          in: query
+          schema:
+            type: string
+        - name: organization_name
+          in: query
+          schema:
+            type: string
+        - name: city
+          in: query
+          schema:
+            type: string
+        - name: state
+          in: query
+          schema:
+            type: string
+            minLength: 2
+            maxLength: 2
+        - name: reporting_year
+          in: query
+          schema:
+            type: integer
+        - name: limit
+          in: query
+          schema:
+            type: integer
+        - name: offset
+          in: query
+          schema:
+            type: integer
+        - name: stats_limit
+          in: query
+          schema:
+            type: integer
+        - name: include_specialty_stats
+          in: query
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: Facility-connected provider payload
+          content:
+            application/json:
+              schema:
+                type: object
   /npi/id/{npi}/full_taxonomy:
     get:
       summary: Retrieve taxonomy list for an NPI
@@ -1731,6 +2091,16 @@ paths:
           schema:
             type: integer
           description: When non-zero, forces address geocoding refresh
+        - name: show
+          in: query
+          schema:
+            type: string
+          description: Optional output view selector (for example `chain`)
+        - name: view
+          in: query
+          schema:
+            type: string
+          description: Alias for `show`
       responses:
         '200':
           description: NPI detail payload
@@ -1825,6 +2195,16 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/CodeRelatedResponse'
+  /pricing/statistics:
+    get:
+      summary: Retrieve pricing/procedure coverage statistics
+      responses:
+        '200':
+          description: Pricing statistics payload
+          content:
+            application/json:
+              schema:
+                type: object
   /pricing/providers:
     get:
       summary: List pricing providers from CMS claims imports
@@ -2094,6 +2474,12 @@ paths:
           description: |
             `provider` returns provider-scoped variant score cards in `variants_by_benchmark_mode`,
             filtered to the doctor's taxonomy/procedure cohort context for each benchmark mode.
+        - name: variants
+          in: query
+          schema:
+            type: string
+          deprecated: true
+          description: Deprecated. Use `variants_scope=provider`.
       responses:
         '200':
           description: Provider score payload
@@ -2160,6 +2546,12 @@ paths:
           description: |
             `provider` returns provider-scoped variant score cards in `variants_by_benchmark_mode`,
             filtered to the doctor's taxonomy/procedure cohort context for each benchmark mode.
+        - name: variants
+          in: query
+          schema:
+            type: string
+          deprecated: true
+          description: Deprecated. Use `variants_scope=provider`.
       responses:
         '200':
           description: Provider score payload
@@ -2343,37 +2735,6 @@ paths:
           required: true
           schema:
             type: string
-        - name: year
-          in: query
-          schema:
-            type: integer
-        - name: state
-          in: query
-          schema:
-            type: string
-        - name: city
-          in: query
-          schema:
-            type: string
-        - name: zip5
-          in: query
-          schema:
-            type: string
-        - name: zip_radius_miles
-          in: query
-          schema:
-            type: number
-            minimum: 0
-          description: |
-            Optional ZIP-based fallback radius for peer-group lookup. Default is 30 miles.
-        - name: specialty
-          in: query
-          schema:
-            type: string
-        - name: setting
-          in: query
-          schema:
-            type: string
       responses:
         '200':
           description: Provider procedure detail
@@ -2406,37 +2767,6 @@ paths:
           required: true
           schema:
             type: string
-        - name: year
-          in: query
-          schema:
-            type: integer
-        - name: state
-          in: query
-          schema:
-            type: string
-        - name: city
-          in: query
-          schema:
-            type: string
-        - name: zip5
-          in: query
-          schema:
-            type: string
-        - name: zip_radius_miles
-          in: query
-          schema:
-            type: number
-            minimum: 0
-          description: |
-            Optional ZIP-based fallback radius for peer-group lookup. Default is 30 miles.
-        - name: specialty
-          in: query
-          schema:
-            type: string
-        - name: setting
-          in: query
-          schema:
-            type: string
       responses:
         '200':
           description: Provider procedure detail
@@ -2456,45 +2786,6 @@ paths:
         - name: procedure_code
           in: path
           required: true
-          schema:
-            type: string
-        - name: year
-          in: query
-          schema:
-            type: integer
-        - name: state
-          in: query
-          schema:
-            type: string
-        - name: city
-          in: query
-          schema:
-            type: string
-        - name: zip5
-          in: query
-          schema:
-            type: string
-        - name: zip_radius_miles
-          in: query
-          schema:
-            type: number
-            minimum: 0
-          description: |
-            Optional ZIP-based fallback radius for peer-group lookup. Default is 30 miles.
-        - name: cohort_strategy
-          in: query
-          schema:
-            type: string
-            enum: [precomputed, near_dynamic]
-          description: |
-            Cohort selection strategy. `precomputed` uses imported peer cohorts;
-            `near_dynamic` builds an on-the-fly ZIP-radius cohort from nearby providers.
-        - name: specialty
-          in: query
-          schema:
-            type: string
-        - name: setting
-          in: query
           schema:
             type: string
       responses:
@@ -2529,45 +2820,6 @@ paths:
           required: true
           schema:
             type: string
-        - name: year
-          in: query
-          schema:
-            type: integer
-        - name: state
-          in: query
-          schema:
-            type: string
-        - name: city
-          in: query
-          schema:
-            type: string
-        - name: zip5
-          in: query
-          schema:
-            type: string
-        - name: zip_radius_miles
-          in: query
-          schema:
-            type: number
-            minimum: 0
-          description: |
-            Optional ZIP-based fallback radius for peer-group lookup. Default is 30 miles.
-        - name: cohort_strategy
-          in: query
-          schema:
-            type: string
-            enum: [precomputed, near_dynamic]
-          description: |
-            Cohort selection strategy. `precomputed` uses imported peer cohorts;
-            `near_dynamic` builds an on-the-fly ZIP-radius cohort from nearby providers.
-        - name: specialty
-          in: query
-          schema:
-            type: string
-        - name: setting
-          in: query
-          schema:
-            type: string
       responses:
         '200':
           description: Procedure Estimated Cost Level payload
@@ -2598,45 +2850,6 @@ paths:
         - name: code
           in: path
           required: true
-          schema:
-            type: string
-        - name: year
-          in: query
-          schema:
-            type: integer
-        - name: state
-          in: query
-          schema:
-            type: string
-        - name: city
-          in: query
-          schema:
-            type: string
-        - name: zip5
-          in: query
-          schema:
-            type: string
-        - name: zip_radius_miles
-          in: query
-          schema:
-            type: number
-            minimum: 0
-          description: |
-            Optional ZIP-based fallback radius for peer-group lookup. Default is 30 miles.
-        - name: cohort_strategy
-          in: query
-          schema:
-            type: string
-            enum: [precomputed, near_dynamic]
-          description: |
-            Cohort selection strategy. `precomputed` uses imported peer cohorts;
-            `near_dynamic` builds an on-the-fly ZIP-radius cohort from nearby providers.
-        - name: specialty
-          in: query
-          schema:
-            type: string
-        - name: setting
-          in: query
           schema:
             type: string
       responses:
@@ -2993,6 +3206,13 @@ paths:
           in: query
           schema:
             type: string
+        - name: zip_radius_miles
+          in: query
+          schema:
+            type: number
+            minimum: 0
+          description: |
+            Optional ZIP-based search radius (miles). Applies when `zip5` is provided.
         - name: specialty
           in: query
           schema:
@@ -3064,6 +3284,13 @@ paths:
           in: query
           schema:
             type: string
+        - name: zip_radius_miles
+          in: query
+          schema:
+            type: number
+            minimum: 0
+          description: |
+            Optional ZIP-based search radius (miles). Applies when `zip5` is provided.
         - name: specialty
           in: query
           schema:
@@ -3135,6 +3362,13 @@ paths:
           in: query
           schema:
             type: string
+        - name: zip_radius_miles
+          in: query
+          schema:
+            type: number
+            minimum: 0
+          description: |
+            Optional ZIP-based search radius (miles). Applies when `zip5` is provided.
         - name: specialty
           in: query
           schema:
@@ -6076,6 +6310,57 @@ components:
           additionalProperties: false
       required: [total_formularies, total_drugs, top_issuers, tier_distribution, authorization_distribution]
       additionalProperties: false
+    CoverageStatistics:
+      type: object
+      properties:
+        snapshot_date:
+          type: string
+          format: date-time
+        marketplace_plans:
+          type: integer
+        marketplace_issuers:
+          type: integer
+        provider_coverage_profiles:
+          type: integer
+        medicare_clinicians:
+          type: integer
+        hospitals_with_medicare_enrollment:
+          type: integer
+        providers_with_procedure_history:
+          type: integer
+        procedure_codes_tracked:
+          type: integer
+        zip_codes_with_procedure_coverage:
+          type: integer
+        active_medicare_pharmacies:
+          type: integer
+        formularies_tracked:
+          type: integer
+        drug_coverage_rows:
+          type: integer
+        providers_with_quality_scores:
+          type: integer
+        providers_with_prescription_history:
+          type: integer
+        prescription_codes_tracked:
+          type: integer
+      required:
+        - snapshot_date
+        - marketplace_plans
+        - marketplace_issuers
+        - provider_coverage_profiles
+        - medicare_clinicians
+        - hospitals_with_medicare_enrollment
+        - providers_with_procedure_history
+        - procedure_codes_tracked
+        - zip_codes_with_procedure_coverage
+        - active_medicare_pharmacies
+        - formularies_tracked
+        - drug_coverage_rows
+        - providers_with_quality_scores
+        - providers_with_prescription_history
+        - prescription_codes_tracked
+      additionalProperties: false
     ImporterStats:
       type: object
       properties:
@@ -6202,6 +6487,228 @@ components:
           type: string
         timezone:
           type: string
+        census_profile:
+          oneOf:
+            - $ref: '#/components/schemas/GeoZipCensusProfile'
+            - type: 'null'
+      additionalProperties: false
+    GeoZipCensusProfile:
+      type: object
+      properties:
+        total_population:
+          type: integer
+          nullable: true
+        median_household_income:
+          type: integer
+          nullable: true
+        bachelors_degree_or_higher_pct:
+          type: number
+          nullable: true
+        employment_rate_pct:
+          type: number
+          nullable: true
+        total_housing_units:
+          type: integer
+          nullable: true
+        without_health_insurance_pct:
+          type: number
+          nullable: true
+        total_employer_establishments:
+          type: integer
+          nullable: true
+        business_employment:
+          type: integer
+          nullable: true
+        business_payroll_annual_k:
+          type: integer
+          nullable: true
+        total_households:
+          type: integer
+          nullable: true
+        hispanic_or_latino:
+          type: integer
+          nullable: true
+        hispanic_or_latino_pct:
+          type: number
+          nullable: true
+        poverty_rate_pct:
+          type: number
+          nullable: true
+        median_age:
+          type: number
+          nullable: true
+        unemployment_rate_pct:
+          type: number
+          nullable: true
+        labor_force_participation_pct:
+          type: number
+          nullable: true
+        vacancy_rate_pct:
+          type: number
+          nullable: true
+        median_home_value:
+          type: integer
+          nullable: true
+        median_gross_rent:
+          type: integer
+          nullable: true
+        commute_mean_minutes:
+          type: number
+          nullable: true
+        commute_mode_drove_alone_pct:
+          type: number
+          nullable: true
+        commute_mode_carpool_pct:
+          type: number
+          nullable: true
+        commute_mode_public_transit_pct:
+          type: number
+          nullable: true
+        commute_mode_walked_pct:
+          type: number
+          nullable: true
+        commute_mode_worked_from_home_pct:
+          type: number
+          nullable: true
+        broadband_access_pct:
+          type: number
+          nullable: true
+        race_white_alone:
+          type: integer
+          nullable: true
+        race_black_or_african_american_alone:
+          type: integer
+          nullable: true
+        race_american_indian_and_alaska_native_alone:
+          type: integer
+          nullable: true
+        race_asian_alone:
+          type: integer
+          nullable: true
+        race_native_hawaiian_and_other_pacific_islander_alone:
+          type: integer
+          nullable: true
+        race_some_other_race_alone:
+          type: integer
+          nullable: true
+        race_two_or_more_races:
+          type: integer
+          nullable: true
+        race_white_alone_pct:
+          type: number
+          nullable: true
+        race_black_or_african_american_alone_pct:
+          type: number
+          nullable: true
+        race_american_indian_and_alaska_native_alone_pct:
+          type: number
+          nullable: true
+        race_asian_alone_pct:
+          type: number
+          nullable: true
+        race_native_hawaiian_and_other_pacific_islander_alone_pct:
+          type: number
+          nullable: true
+        race_some_other_race_alone_pct:
+          type: number
+          nullable: true
+        race_two_or_more_races_pct:
+          type: number
+          nullable: true
+        acs_white_alone_pct:
+          type: number
+          nullable: true
+        acs_black_or_african_american_alone_pct:
+          type: number
+          nullable: true
+        acs_american_indian_and_alaska_native_alone_pct:
+          type: number
+          nullable: true
+        acs_asian_alone_pct:
+          type: number
+          nullable: true
+        acs_native_hawaiian_and_other_pacific_islander_alone_pct:
+          type: number
+          nullable: true
+        acs_some_other_race_alone_pct:
+          type: number
+          nullable: true
+        acs_two_or_more_races_pct:
+          type: number
+          nullable: true
+        acs_hispanic_or_latino_pct:
+          type: number
+          nullable: true
+        svi_overall:
+          type: number
+          nullable: true
+        svi_socioeconomic:
+          type: number
+          nullable: true
+        svi_household:
+          type: number
+          nullable: true
+        svi_minority:
+          type: number
+          nullable: true
+        svi_housing:
+          type: number
+          nullable: true
+        provider_count:
+          type: integer
+          nullable: true
+        provider_density_per_1000:
+          type: number
+          nullable: true
+      additionalProperties: false
+    GeoZipPlaceMetric:
+      type: object
+      properties:
+        measure_id:
+          type: string
+        measure_name:
+          type: string
+          nullable: true
+        data_value:
+          type: number
+          nullable: true
+        low_ci:
+          type: number
+          nullable: true
+        high_ci:
+          type: number
+          nullable: true
+        data_value_type:
+          type: string
+          nullable: true
+        source:
+          type: string
+          nullable: true
+        updated_at:
+          type: string
+          format: date-time
+          nullable: true
+      required:
+        - measure_id
+      additionalProperties: false
+    GeoZipPlacesResponse:
+      type: object
+      properties:
+        zip_code:
+          type: string
+        zcta:
+          type: string
+        year:
+          type: integer
+        measures:
+          type: array
+          items:
+            $ref: '#/components/schemas/GeoZipPlaceMetric'
+      required:
+        - zip_code
+        - zcta
+        - year
+        - measures
       additionalProperties: false
     GeoCityResponse:
       type: object

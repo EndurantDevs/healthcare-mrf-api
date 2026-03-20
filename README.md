@@ -39,6 +39,7 @@ This repository resolves and processes data from public source websites, includi
 - [CMS Medicare Fee-for-Service Public Provider Enrollment](https://data.cms.gov/provider-characteristics/medicare-provider-supplier-enrollment/medicare-fee-for-service-public-provider-enrollment)
 - [CMS Quality Payment Program](https://www.cms.gov/Medicare/Quality-Payment-Program/Quality-Payment-Program.html)
 - [CDC / ATSDR Social Vulnerability Index](https://www.atsdr.cdc.gov/place-health/php/svi/index.html)
+- [CDC PLACES ZCTA Data](https://chronicdata.cdc.gov/500-Cities-Places/PLACES-Local-Data-for-Better-Health-ZCTA-Data-2025/qnzd-25i4/about_data)
 - [NUCC Provider Taxonomy](https://www.nucc.org/index.php/21-provider-taxonomy)
 - [FDA BeSafeRx state board directory](https://www.fda.gov/drugs/besaferx-your-source-online-pharmacy-information/locate-state-licensed-online-pharmacy)
 - state pharmacy board websites discovered from FDA BeSafeRx
@@ -61,6 +62,7 @@ Each importer is a separate operational pipeline. Together, they build the canon
 | `claims-procedures` | `python main.py start claims-procedures` | CMS Medicare physician claims | alias of `claims-pricing` |
 | `drug-claims` | `python main.py start drug-claims` | CMS Medicare Part D claims | provider-drug and prescription claims aggregates |
 | `provider-quality` | `python main.py start provider-quality` | CMS QPP, CDC SVI, Medicare claims | provider quality measures, domain scores, peer targets, and rankings |
+| `places-zcta` | `python main.py start places-zcta` | CDC PLACES | ZIP/ZCTA health indicator measures |
 | `provider-enrichment` | `python main.py start provider-enrichment` | CMS Medicare FFS public provider enrollment | PECOS-based provider enrollment and relationship enrichment |
 | `partd-formulary-network` | `python main.py start partd-formulary-network` | CMS Part D public files | formulary coverage, pharmacy activity, and pharmacy network data |
 | `pharmacy-license` | `python main.py start pharmacy-license` | FDA/state board sources | normalized pharmacy license and board-status data |
@@ -88,6 +90,7 @@ Per-import documentation:
 - [Claims pricing import](./docs/imports/claims-pricing.md)
 - [Drug claims import](./docs/imports/drug-claims.md)
 - [Provider quality import](./docs/imports/provider-quality.md)
+- [PLACES ZCTA import](./docs/imports/places-zcta.md)
 - [Provider enrichment import](./docs/imports/provider-enrichment.md)
 - [Part D formulary and pharmacy network import](./docs/imports/partd-formulary-network.md)
 - [Pharmacy license import](./docs/imports/pharmacy-license.md)

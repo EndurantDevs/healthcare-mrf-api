@@ -1,17 +1,59 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import json
+import sys
 import types
+from importlib.util import module_from_spec, spec_from_file_location
+from pathlib import Path
 
 import pytest
 
-from api.endpoint.geo import (
-    get_geo as get_geo_zip,
-    get_geo_by_city,
-    get_top_cities_by_state,
-    list_geo_states,
-)
-import types
+ROOT_PATH = Path(__file__).resolve().parents[1]
+API_PATH = ROOT_PATH / "api"
+ENDPOINT_PATH = API_PATH / "endpoint"
+
+
+def _restore_module(name, previous):
+    if previous is None:
+        sys.modules.pop(name, None)
+    else:
+        sys.modules[name] = previous
+
+
+def _load_geo_module():
+    old_api = sys.modules.get("api")
+    old_api_endpoint = sys.modules.get("api.endpoint")
+    old_api_endpoint_pagination = sys.modules.get("api.endpoint.pagination")
+
+    try:
+        api_pkg = types.ModuleType("api")
+        api_pkg.__path__ = [str(API_PATH)]
+        endpoint_pkg = types.ModuleType("api.endpoint")
+        endpoint_pkg.__path__ = [str(ENDPOINT_PATH)]
+        sys.modules["api"] = api_pkg
+        sys.modules["api.endpoint"] = endpoint_pkg
+
+        pagination_spec = spec_from_file_location("api.endpoint.pagination", ENDPOINT_PATH / "pagination.py")
+        pagination_module = module_from_spec(pagination_spec)
+        sys.modules["api.endpoint.pagination"] = pagination_module
+        pagination_spec.loader.exec_module(pagination_module)
+
+        module_spec = spec_from_file_location("api.endpoint.geo_unit_primary", ENDPOINT_PATH / "geo.py")
+        module = module_from_spec(module_spec)
+        module_spec.loader.exec_module(module)
+        return module
+    finally:
+        _restore_module("api", old_api)
+        _restore_module("api.endpoint", old_api_endpoint)
+        _restore_module("api.endpoint.pagination", old_api_endpoint_pagination)
+
+
+geo_module = _load_geo_module()
+
+get_geo_zip = geo_module.get_geo
+get_geo_by_city = geo_module.get_geo_by_city
+get_top_cities_by_state = geo_module.get_top_cities_by_state
+list_geo_states = geo_module.list_geo_states
 
 
 class FakeResult:
@@ -53,7 +95,9 @@ class MappingRow:
 @pytest.mark.asyncio
 async def test_geo_zip_not_found():
     request = types.SimpleNamespace(
-        ctx=types.SimpleNamespace(sa_session=FakeSession([FakeResult(row=None), FakeResult(row=None)]))
+        ctx=types.SimpleNamespace(
+            sa_session=FakeSession([FakeResult(row=None), FakeResult(row=None), FakeResult(row=None)])
+        )
     )
     response = await get_geo_zip(request, "99999")
     payload = json.loads(response.body)
@@ -62,9 +106,9 @@ async def test_geo_zip_not_found():
 
 @pytest.mark.asyncio
 async def test_geo_zip_success():
-    row = ("12345", "43.12", "-89.45", "WI")
     request = types.SimpleNamespace(
         ctx=types.SimpleNamespace(sa_session=FakeSession([
+            FakeResult(row=None),
             FakeResult(row=MappingRow(zip_code="12345", city="Test City", state="WI", latitude=43.12, longitude=-89.45, state_name="Wisconsin", county_name="Dane", timezone="America/Chicago"))
         ]))
     )
@@ -79,6 +123,7 @@ async def test_geo_zip_success():
         "state_name": "Wisconsin",
         "county_name": "Dane",
         "timezone": "America/Chicago",
+        "census_profile": None,
     }
 
 

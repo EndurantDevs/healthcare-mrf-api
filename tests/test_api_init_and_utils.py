@@ -45,6 +45,8 @@ def test_init_api_registers_group(monkeypatch):
     assert app.registered is not None
     assert hasattr(app.registered, "blueprints")
     assert {bp.name for bp in app.registered.blueprints} == {
+        "coverage",
+        "codes",
         "healthcheck",
         "plan",
         "formulary",
@@ -53,6 +55,10 @@ def test_init_api_registers_group(monkeypatch):
         "npi",
         "nucc",
         "geo",
+        "pricing",
+        "partd_formulary",
+        "pharmacy_license",
+        "reports",
     }
 
 

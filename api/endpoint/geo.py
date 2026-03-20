@@ -9,7 +9,13 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import ProgrammingError
 
 from api.endpoint.pagination import parse_pagination
-from db.models import GeoZipLookup
+from db.models import (
+    GeoZipCensusProfile,
+    GeoZipLookup,
+    NPIAddress,
+    PricingPlacesZcta,
+    PricingSviZcta,
+)
 from db.tiger_models import Zip_zcta5, ZipState
 
 
@@ -18,9 +24,71 @@ class TigerUnavailableError(RuntimeError):
 
 
 geo_zip_table = GeoZipLookup.__table__
+geo_census_table = GeoZipCensusProfile.__table__
+npi_address_table = NPIAddress.__table__
+pricing_places_zcta_table = PricingPlacesZcta.__table__
+svi_zcta_table = PricingSviZcta.__table__
 zip_state_table = ZipState.__table__
 zip_zcta5_table = Zip_zcta5.__table__
 blueprint = Blueprint('geo', url_prefix='/geo', version=1)
+
+CENSUS_PROFILE_FIELDS = (
+    "total_population",
+    "median_household_income",
+    "bachelors_degree_or_higher_pct",
+    "employment_rate_pct",
+    "total_housing_units",
+    "without_health_insurance_pct",
+    "total_employer_establishments",
+    "business_employment",
+    "business_payroll_annual_k",
+    "total_households",
+    "hispanic_or_latino",
+    "hispanic_or_latino_pct",
+    "poverty_rate_pct",
+    "median_age",
+    "unemployment_rate_pct",
+    "labor_force_participation_pct",
+    "vacancy_rate_pct",
+    "median_home_value",
+    "median_gross_rent",
+    "commute_mean_minutes",
+    "commute_mode_drove_alone_pct",
+    "commute_mode_carpool_pct",
+    "commute_mode_public_transit_pct",
+    "commute_mode_walked_pct",
+    "commute_mode_worked_from_home_pct",
+    "broadband_access_pct",
+    "race_white_alone",
+    "race_black_or_african_american_alone",
+    "race_american_indian_and_alaska_native_alone",
+    "race_asian_alone",
+    "race_native_hawaiian_and_other_pacific_islander_alone",
+    "race_some_other_race_alone",
+    "race_two_or_more_races",
+    "race_white_alone_pct",
+    "race_black_or_african_american_alone_pct",
+    "race_american_indian_and_alaska_native_alone_pct",
+    "race_asian_alone_pct",
+    "race_native_hawaiian_and_other_pacific_islander_alone_pct",
+    "race_some_other_race_alone_pct",
+    "race_two_or_more_races_pct",
+    "acs_white_alone_pct",
+    "acs_black_or_african_american_alone_pct",
+    "acs_american_indian_and_alaska_native_alone_pct",
+    "acs_asian_alone_pct",
+    "acs_native_hawaiian_and_other_pacific_islander_alone_pct",
+    "acs_some_other_race_alone_pct",
+    "acs_two_or_more_races_pct",
+    "acs_hispanic_or_latino_pct",
+    "svi_overall",
+    "svi_socioeconomic",
+    "svi_household",
+    "svi_minority",
+    "svi_housing",
+    "provider_count",
+    "provider_density_per_1000",
+)
 
 
 def _get_session(request):
@@ -57,6 +125,185 @@ def _serialize_geo_row(row_mapping):
         "county_name": row_mapping.get("county_name"),
         "timezone": row_mapping.get("timezone"),
     }
+
+
+def _serialize_census_row(row_mapping):
+    if row_mapping is None:
+        return None
+    return {field: row_mapping.get(field) for field in CENSUS_PROFILE_FIELDS}
+
+
+def _serialize_places_row(row_mapping):
+    if row_mapping is None:
+        return None
+    updated_at = row_mapping.get("updated_at")
+    if isinstance(updated_at, datetime):
+        updated_at = updated_at.isoformat()
+    return {
+        "measure_id": row_mapping.get("measure_id"),
+        "measure_name": row_mapping.get("measure_name"),
+        "data_value": row_mapping.get("data_value"),
+        "low_ci": row_mapping.get("low_ci"),
+        "high_ci": row_mapping.get("high_ci"),
+        "data_value_type": row_mapping.get("data_value_type"),
+        "source": row_mapping.get("source"),
+        "updated_at": updated_at,
+    }
+
+
+def _density_per_1000(count_value, population):
+    if count_value is None:
+        return None
+    if population in (None, 0):
+        return None
+    try:
+        return (float(count_value) / float(population)) * 1000.0
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+async def _lookup_svi_profile(session, zip_code):
+    stmt = (
+        select(
+            svi_zcta_table.c.svi_overall,
+            svi_zcta_table.c.svi_socioeconomic,
+            svi_zcta_table.c.svi_household,
+            svi_zcta_table.c.svi_minority,
+            svi_zcta_table.c.svi_housing,
+        )
+        .where(svi_zcta_table.c.zcta == zip_code)
+        .order_by(svi_zcta_table.c.year.desc())
+        .limit(1)
+    )
+    try:
+        result = await session.execute(stmt)
+    except ProgrammingError as exc:
+        if isinstance(getattr(exc, "orig", None), UndefinedTableError):
+            return None
+        raise
+    row = _row_mapping(result.first())
+    if row is None:
+        return None
+    return {
+        "svi_overall": row.get("svi_overall"),
+        "svi_socioeconomic": row.get("svi_socioeconomic"),
+        "svi_household": row.get("svi_household"),
+        "svi_minority": row.get("svi_minority"),
+        "svi_housing": row.get("svi_housing"),
+    }
+
+
+async def _lookup_provider_count(session, zip_code):
+    stmt = (
+        select(func.count(func.distinct(npi_address_table.c.npi)))
+        .where(
+            npi_address_table.c.type == "primary",
+            func.left(func.coalesce(npi_address_table.c.postal_code, ""), 5) == zip_code,
+        )
+    )
+    try:
+        result = await session.execute(stmt)
+    except ProgrammingError as exc:
+        if isinstance(getattr(exc, "orig", None), UndefinedTableError):
+            return None
+        raise
+    return result.scalar()
+
+
+async def _lookup_census_profile(session, zip_code):
+    stmt = (
+        select(
+            geo_census_table.c.total_population,
+            geo_census_table.c.median_household_income,
+            geo_census_table.c.bachelors_degree_or_higher_pct,
+            geo_census_table.c.employment_rate_pct,
+            geo_census_table.c.total_housing_units,
+            geo_census_table.c.without_health_insurance_pct,
+            geo_census_table.c.total_employer_establishments,
+            geo_census_table.c.business_employment,
+            geo_census_table.c.business_payroll_annual_k,
+            geo_census_table.c.total_households,
+            geo_census_table.c.hispanic_or_latino,
+            geo_census_table.c.hispanic_or_latino_pct,
+            geo_census_table.c.poverty_rate_pct,
+            geo_census_table.c.median_age,
+            geo_census_table.c.unemployment_rate_pct,
+            geo_census_table.c.labor_force_participation_pct,
+            geo_census_table.c.vacancy_rate_pct,
+            geo_census_table.c.median_home_value,
+            geo_census_table.c.median_gross_rent,
+            geo_census_table.c.commute_mean_minutes,
+            geo_census_table.c.commute_mode_drove_alone_pct,
+            geo_census_table.c.commute_mode_carpool_pct,
+            geo_census_table.c.commute_mode_public_transit_pct,
+            geo_census_table.c.commute_mode_walked_pct,
+            geo_census_table.c.commute_mode_worked_from_home_pct,
+            geo_census_table.c.broadband_access_pct,
+            geo_census_table.c.race_white_alone,
+            geo_census_table.c.race_black_or_african_american_alone,
+            geo_census_table.c.race_american_indian_and_alaska_native_alone,
+            geo_census_table.c.race_asian_alone,
+            geo_census_table.c.race_native_hawaiian_and_other_pacific_islander_alone,
+            geo_census_table.c.race_some_other_race_alone,
+            geo_census_table.c.race_two_or_more_races,
+            geo_census_table.c.race_white_alone_pct,
+            geo_census_table.c.race_black_or_african_american_alone_pct,
+            geo_census_table.c.race_american_indian_and_alaska_native_alone_pct,
+            geo_census_table.c.race_asian_alone_pct,
+            geo_census_table.c.race_native_hawaiian_and_other_pacific_islander_alone_pct,
+            geo_census_table.c.race_some_other_race_alone_pct,
+            geo_census_table.c.race_two_or_more_races_pct,
+            geo_census_table.c.acs_white_alone_pct,
+            geo_census_table.c.acs_black_or_african_american_alone_pct,
+            geo_census_table.c.acs_american_indian_and_alaska_native_alone_pct,
+            geo_census_table.c.acs_asian_alone_pct,
+            geo_census_table.c.acs_native_hawaiian_and_other_pacific_islander_alone_pct,
+            geo_census_table.c.acs_some_other_race_alone_pct,
+            geo_census_table.c.acs_two_or_more_races_pct,
+            geo_census_table.c.acs_hispanic_or_latino_pct,
+        )
+        .where(geo_census_table.c.zip_code == zip_code)
+    )
+    try:
+        result = await session.execute(stmt)
+    except ProgrammingError as exc:
+        if isinstance(getattr(exc, "orig", None), UndefinedTableError):
+            return None
+        raise
+    profile = _serialize_census_row(_row_mapping(result.first()))
+    if profile is None:
+        return None
+
+    svi_profile = await _lookup_svi_profile(session, zip_code)
+    if svi_profile:
+        profile.update(svi_profile)
+
+    total_population = profile.get("total_population")
+    provider_count = await _lookup_provider_count(session, zip_code)
+    profile.update(
+        {
+            "provider_count": provider_count,
+            "provider_density_per_1000": _density_per_1000(provider_count, total_population),
+        }
+    )
+    return profile
+
+
+async def _resolve_places_year(session, zip_code, requested_year):
+    if requested_year is not None:
+        return requested_year
+
+    stmt = (
+        select(func.max(pricing_places_zcta_table.c.year))
+        .where(pricing_places_zcta_table.c.zcta == zip_code)
+    )
+    try:
+        result = await session.execute(stmt)
+    except ProgrammingError as exc:
+        if isinstance(getattr(exc, "orig", None), UndefinedTableError):
+            return None
+        raise
+    return result.scalar()
 
 
 async def _lookup_zip_from_tiger(session, zip_code):
@@ -116,6 +363,7 @@ async def get_geo_status(request):
 async def get_geo(request, zip_code):
     zip_code = zip_code.strip().rjust(5, '0')
     session = _get_session(request)
+    census_profile = await _lookup_census_profile(session, zip_code)
 
     local_stmt = (
         select(
@@ -138,6 +386,7 @@ async def get_geo(request, zip_code):
             payload["lat"] = local_row.get("latitude")
         if payload.get("long") is None:
             payload["long"] = local_row.get("longitude")
+        payload["census_profile"] = census_profile
         return response.json(payload)
 
     try:
@@ -146,6 +395,7 @@ async def get_geo(request, zip_code):
         return response.json({"error": "tiger schema not available"}, status=503)
     if payload is None:
         return response.json({'error': 'Not found'}, status=404)
+    payload["census_profile"] = census_profile
     return response.json(payload)
 
 
@@ -206,6 +456,69 @@ async def get_geo_by_city(request):
             "normalized_city": rows[0].get("city"),
             "state": state or None,
             "items": items,
+        }
+    )
+
+
+@blueprint.get('/zip/<zip_code>/places', name='get_places_by_zip')
+async def get_places_by_zip(request, zip_code):
+    zip_code = zip_code.strip().rjust(5, '0')
+    args = request.args
+    year = args.get("year")
+    measure_id = (args.get("measure_id") or "").strip() or None
+    session = _get_session(request)
+
+    if year is not None:
+        try:
+            year = int(year)
+        except (TypeError, ValueError) as exc:
+            raise InvalidUsage("year must be an integer") from exc
+
+    target_year = await _resolve_places_year(session, zip_code, year)
+    if target_year is None:
+        return response.json({"error": "Not found"}, status=404)
+
+    stmt = (
+        select(
+            pricing_places_zcta_table.c.measure_id,
+            pricing_places_zcta_table.c.measure_name,
+            pricing_places_zcta_table.c.data_value,
+            pricing_places_zcta_table.c.low_ci,
+            pricing_places_zcta_table.c.high_ci,
+            pricing_places_zcta_table.c.data_value_type,
+            pricing_places_zcta_table.c.source,
+            pricing_places_zcta_table.c.updated_at,
+        )
+        .where(
+            pricing_places_zcta_table.c.zcta == zip_code,
+            pricing_places_zcta_table.c.year == target_year,
+        )
+        .order_by(pricing_places_zcta_table.c.measure_id.asc())
+    )
+    if measure_id:
+        stmt = stmt.where(pricing_places_zcta_table.c.measure_id == measure_id)
+
+    try:
+        result = await session.execute(stmt)
+    except ProgrammingError as exc:
+        if isinstance(getattr(exc, "orig", None), UndefinedTableError):
+            return response.json({"error": "Not found"}, status=404)
+        raise
+
+    metrics = []
+    for row in result.all():
+        payload_row = _serialize_places_row(_row_mapping(row))
+        if payload_row:
+            metrics.append(payload_row)
+    if not metrics:
+        return response.json({"error": "Not found"}, status=404)
+
+    return response.json(
+        {
+            "zip_code": zip_code,
+            "zcta": zip_code,
+            "year": int(target_year),
+            "measures": metrics,
         }
     )
 
