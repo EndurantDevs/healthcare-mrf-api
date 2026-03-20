@@ -59,6 +59,67 @@ _CHAIN_RULES: list[tuple[str, tuple[str, ...]]] = [
     ("Giant Eagle", ("giant eagle",)),
 ]
 
+_US_STATE_DIMENSION: list[tuple[str, str]] = [
+    ("AL", "Alabama"),
+    ("AK", "Alaska"),
+    ("AZ", "Arizona"),
+    ("AR", "Arkansas"),
+    ("CA", "California"),
+    ("CO", "Colorado"),
+    ("CT", "Connecticut"),
+    ("DE", "Delaware"),
+    ("DC", "District of Columbia"),
+    ("FL", "Florida"),
+    ("GA", "Georgia"),
+    ("HI", "Hawaii"),
+    ("ID", "Idaho"),
+    ("IL", "Illinois"),
+    ("IN", "Indiana"),
+    ("IA", "Iowa"),
+    ("KS", "Kansas"),
+    ("KY", "Kentucky"),
+    ("LA", "Louisiana"),
+    ("ME", "Maine"),
+    ("MD", "Maryland"),
+    ("MA", "Massachusetts"),
+    ("MI", "Michigan"),
+    ("MN", "Minnesota"),
+    ("MS", "Mississippi"),
+    ("MO", "Missouri"),
+    ("MT", "Montana"),
+    ("NE", "Nebraska"),
+    ("NV", "Nevada"),
+    ("NH", "New Hampshire"),
+    ("NJ", "New Jersey"),
+    ("NM", "New Mexico"),
+    ("NY", "New York"),
+    ("NC", "North Carolina"),
+    ("ND", "North Dakota"),
+    ("OH", "Ohio"),
+    ("OK", "Oklahoma"),
+    ("OR", "Oregon"),
+    ("PA", "Pennsylvania"),
+    ("RI", "Rhode Island"),
+    ("SC", "South Carolina"),
+    ("SD", "South Dakota"),
+    ("TN", "Tennessee"),
+    ("TX", "Texas"),
+    ("UT", "Utah"),
+    ("VT", "Vermont"),
+    ("VA", "Virginia"),
+    ("WA", "Washington"),
+    ("WV", "West Virginia"),
+    ("WI", "Wisconsin"),
+    ("WY", "Wyoming"),
+]
+_US_STATE_CODES = {code for code, _ in _US_STATE_DIMENSION}
+_US_STATE_NORMALIZATION = {
+    **{code: code for code, _ in _US_STATE_DIMENSION},
+    **{name.upper(): code for code, name in _US_STATE_DIMENSION},
+    "D.C.": "DC",
+    "WASHINGTON DC": "DC",
+}
+
 
 def _get_session(request):
     session = getattr(request.ctx, "sa_session", None)
@@ -368,6 +429,39 @@ def _ensure_json_dict(value: Any) -> dict[str, Any]:
     return {}
 
 
+def _normalize_us_state_code(value: Any) -> str | None:
+    text_value = str(value or "").strip().upper()
+    if not text_value:
+        return None
+    text_value = re.sub(r"\s+", " ", text_value)
+    return _US_STATE_NORMALIZATION.get(text_value)
+
+
+def _canonicalize_pharmacy_state_stats_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    aggregated = {
+        code: {
+            "state": code,
+            "nppes_pharmacies": 0,
+            "nppes_pharmacists": 0,
+            "active_pharmacists": 0,
+            "active_pharmacies": 0,
+            "aca_pharmacies": 0,
+        }
+        for code, _ in _US_STATE_DIMENSION
+    }
+    for row in rows:
+        state_code = _normalize_us_state_code(row.get("state"))
+        if state_code not in _US_STATE_CODES:
+            continue
+        state_payload = aggregated[state_code]
+        state_payload["nppes_pharmacies"] += _coerce_int(row.get("nppes_pharmacies"))
+        state_payload["nppes_pharmacists"] += _coerce_int(row.get("nppes_pharmacists"))
+        state_payload["active_pharmacists"] += _coerce_int(row.get("active_pharmacists"))
+        state_payload["active_pharmacies"] += _coerce_int(row.get("active_pharmacies"))
+        state_payload["aca_pharmacies"] += _coerce_int(row.get("aca_pharmacies"))
+    return [aggregated[code] for code, _ in _US_STATE_DIMENSION]
+
+
 def _is_match_all_name_filters(names: Sequence[str]) -> bool:
     normalized = [str(name or "").strip() for name in names if str(name or "").strip()]
     if not normalized:
@@ -622,6 +716,33 @@ staffing_by_phone AS (
         telephone_number,
         pharmacist_count
     FROM {staffing_table}
+    WHERE state_name IS NOT NULL
+      AND state_name <> ''
+      AND telephone_number IS NOT NULL
+      AND telephone_number <> ''
+)"""
+        pharmacist_taxonomy_cte = ""
+        pharmacist_counts_cte = """
+pharmacist_counts AS (
+    SELECT
+        COALESCE(NULLIF(state_name, ''), 'NA') AS state,
+        SUM(COALESCE(pharmacist_count, 0))::int AS nppes_pharmacists
+    FROM staffing_by_phone
+    GROUP BY 1
+),
+active_pharmacist_counts AS (
+    SELECT
+        p.state_name AS state,
+        SUM(COALESCE(s.pharmacist_count, 0))::int AS active_pharmacists
+    FROM (
+        SELECT DISTINCT state_name, telephone_number
+        FROM pharmacy_base
+        WHERE telephone_number <> ''
+    ) AS p
+    JOIN staffing_by_phone AS s
+      ON s.state_name = p.state_name
+     AND s.telephone_number = p.telephone_number
+    GROUP BY p.state_name
 )"""
     else:
         staffing_cte = f"""
@@ -633,6 +754,7 @@ staffing_by_phone AS (
     FROM {schema}.npi_address AS a
     CROSS JOIN pharmacist_taxonomy AS pt
     WHERE a.type = 'primary'
+      AND (a.country_code IS NULL OR UPPER(a.country_code) IN ('US', 'USA'))
       AND a.state_name IS NOT NULL
       AND a.state_name <> ''
       AND a.telephone_number IS NOT NULL
@@ -640,35 +762,13 @@ staffing_by_phone AS (
       AND a.taxonomy_array && pt.codes
     GROUP BY a.state_name, REGEXP_REPLACE(a.telephone_number, '[^0-9]', '', 'g')
 )"""
-
-    return f"""
-WITH pharmacy_taxonomy AS (
-    SELECT ARRAY_AGG(int_code) AS codes
-    FROM {schema}.nucc_taxonomy
-    WHERE classification = 'Pharmacy'
-),
+        pharmacist_taxonomy_cte = """
 pharmacist_taxonomy AS (
     SELECT ARRAY_AGG(int_code) AS codes
     FROM {schema}.nucc_taxonomy
     WHERE classification = 'Pharmacist'
-),
-{staffing_cte},
-pharmacy_base AS (
-    SELECT DISTINCT ON (a.npi)
-        a.npi::bigint AS npi,
-        COALESCE(NULLIF(a.state_name, ''), 'NA') AS state_name,
-        REGEXP_REPLACE(COALESCE(a.telephone_number, ''), '[^0-9]', '', 'g') AS telephone_number,
-        CASE
-            WHEN a.plans_network_array IS NULL THEN FALSE
-            WHEN a.plans_network_array @@ '0'::query_int THEN FALSE
-            ELSE TRUE
-        END AS has_insurance
-    FROM {schema}.npi_address AS a
-    CROSS JOIN pharmacy_taxonomy AS pt
-    WHERE a.type = 'primary'
-      AND a.taxonomy_array && pt.codes
-    ORDER BY a.npi, (a.telephone_number IS NOT NULL) DESC, a.checksum ASC
-),
+),""".format(schema=schema)
+        pharmacist_counts_cte = """
 pharmacist_base AS (
     SELECT DISTINCT ON (a.npi)
         a.npi::bigint AS npi,
@@ -677,20 +777,9 @@ pharmacist_base AS (
     FROM {schema}.npi_address AS a
     CROSS JOIN pharmacist_taxonomy AS pt
     WHERE a.type = 'primary'
+      AND (a.country_code IS NULL OR UPPER(a.country_code) IN ('US', 'USA'))
       AND a.taxonomy_array && pt.codes
     ORDER BY a.npi, (a.telephone_number IS NOT NULL) DESC, a.checksum ASC
-),
-pharmacy_counts AS (
-    SELECT
-        p.state_name AS state,
-        COUNT(*)::int AS nppes_pharmacies,
-        COUNT(*) FILTER (WHERE p.has_insurance)::int AS aca_pharmacies,
-        COUNT(*) FILTER (WHERE COALESCE(s.pharmacist_count, 0) > 0)::int AS active_pharmacies
-    FROM pharmacy_base AS p
-    LEFT JOIN staffing_by_phone AS s
-      ON s.state_name = p.state_name
-     AND s.telephone_number = p.telephone_number
-    GROUP BY p.state_name
 ),
 pharmacist_counts AS (
     SELECT
@@ -711,7 +800,46 @@ active_pharmacist_counts AS (
           AND ph.telephone_number = phm.telephone_number
     )
     GROUP BY phm.state_name
+)""".format(schema=schema)
+
+    return f"""
+WITH pharmacy_taxonomy AS (
+    SELECT ARRAY_AGG(int_code) AS codes
+    FROM {schema}.nucc_taxonomy
+    WHERE classification = 'Pharmacy'
 ),
+{pharmacist_taxonomy_cte}
+{staffing_cte},
+pharmacy_base AS (
+    SELECT DISTINCT ON (a.npi)
+        a.npi::bigint AS npi,
+        COALESCE(NULLIF(a.state_name, ''), 'NA') AS state_name,
+        REGEXP_REPLACE(COALESCE(a.telephone_number, ''), '[^0-9]', '', 'g') AS telephone_number,
+        CASE
+            WHEN a.plans_network_array IS NULL THEN FALSE
+            WHEN a.plans_network_array @@ '0'::query_int THEN FALSE
+            ELSE TRUE
+        END AS has_insurance
+    FROM {schema}.npi_address AS a
+    CROSS JOIN pharmacy_taxonomy AS pt
+    WHERE a.type = 'primary'
+      AND (a.country_code IS NULL OR UPPER(a.country_code) IN ('US', 'USA'))
+      AND a.taxonomy_array && pt.codes
+    ORDER BY a.npi, (a.telephone_number IS NOT NULL) DESC, a.checksum ASC
+),
+pharmacy_counts AS (
+    SELECT
+        p.state_name AS state,
+        COUNT(*)::int AS nppes_pharmacies,
+        COUNT(*) FILTER (WHERE p.has_insurance)::int AS aca_pharmacies,
+        COUNT(*) FILTER (WHERE COALESCE(s.pharmacist_count, 0) > 0)::int AS active_pharmacies
+    FROM pharmacy_base AS p
+    LEFT JOIN staffing_by_phone AS s
+      ON s.state_name = p.state_name
+     AND s.telephone_number = p.telephone_number
+    GROUP BY p.state_name
+),
+{pharmacist_counts_cte},
 all_states AS (
     SELECT state FROM pharmacy_counts
     UNION
@@ -747,6 +875,7 @@ def _pharmacy_state_stats_methodology(*, staffing_helper_available: bool) -> dic
             "Active pharmacists require a state-and-phone match to at least one pharmacy primary address.",
             "Active pharmacies require at least one matched pharmacist on the same state and phone number.",
             "ACA pharmacy count means the primary NPI address carries a non-zero plans_network_array.",
+            "Output is normalized to US states plus District of Columbia (51 rows); unknown labels are excluded.",
         ],
         "staffing_helper_available": staffing_helper_available,
         "staffing_mode": "helper_table" if staffing_helper_available else "live_fallback_query",
@@ -768,7 +897,7 @@ async def _query_pharmacy_state_stats(session) -> tuple[list[dict[str, Any]], bo
                 "aca_pharmacies": _coerce_int(row.get("aca_pharmacies")),
             }
         )
-    return rows, has_staffing_helper
+    return _canonicalize_pharmacy_state_stats_rows(rows), has_staffing_helper
 
 
 def _build_pharmacy_state_stats_payload(
