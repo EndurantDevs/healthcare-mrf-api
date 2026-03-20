@@ -246,6 +246,40 @@ async def test_geo_by_zip_missing_census_column_falls_back_to_geo():
 
 
 @pytest.mark.asyncio
+async def test_geo_by_zip_census_runtime_error_falls_back_to_geo(monkeypatch):
+    async def _raise_runtime(*_args, **_kwargs):
+        raise RuntimeError("statement timeout")
+
+    monkeypatch.setattr(geo_module, "_lookup_census_profile", _raise_runtime)
+    request = types.SimpleNamespace(
+        ctx=types.SimpleNamespace(
+            sa_session=FakeSession(
+                [
+                    FakeResult(
+                        row=MappingRow(
+                            zip_code="07666",
+                            city="Teaneck",
+                            state="NJ",
+                            latitude=40.89,
+                            longitude=-74.01,
+                            state_name="New Jersey",
+                            county_name="Bergen",
+                            timezone="America/New_York",
+                        )
+                    )
+                ]
+            )
+        ),
+        app=types.SimpleNamespace(),
+    )
+    response = await geo_module.get_geo(request, "07666")
+    payload = json.loads(response.body)
+    assert response.status == 200
+    assert payload["zip_code"] == "07666"
+    assert payload["census_profile"] is None
+
+
+@pytest.mark.asyncio
 async def test_geo_by_zip_other_programming_error():
     error = ProgrammingError("select", {}, None)
     error.orig = Exception("other")
@@ -255,6 +289,23 @@ async def test_geo_by_zip_other_programming_error():
     )
     with pytest.raises(ProgrammingError):
         await geo_module.get_geo(request, "12345")
+
+
+@pytest.mark.asyncio
+async def test_lookup_provider_count_query_avoids_coalesce():
+    class CaptureSession:
+        def __init__(self):
+            self.last_stmt = None
+
+        async def execute(self, stmt, *_args, **_kwargs):
+            self.last_stmt = stmt
+            return FakeResult(scalar_value=42)
+
+    session = CaptureSession()
+    value = await geo_module._lookup_provider_count(session, "60654")
+    assert value == 42
+    compiled = str(session.last_stmt).lower()
+    assert "coalesce" not in compiled
 
 
 @pytest.mark.asyncio
