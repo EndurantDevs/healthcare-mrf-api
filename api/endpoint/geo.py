@@ -166,6 +166,12 @@ def _density_per_1000(count_value, population):
         return None
 
 
+def _log_geo_warning(request, message, *args):
+    logger = getattr(getattr(request, "app", None), "logger", None)
+    if logger is not None and hasattr(logger, "warning"):
+        logger.warning(message, *args)
+
+
 async def _lookup_svi_profile(session, zip_code):
     stmt = (
         select(
@@ -202,7 +208,7 @@ async def _lookup_provider_count(session, zip_code):
         select(func.count(func.distinct(npi_address_table.c.npi)))
         .where(
             npi_address_table.c.type == "primary",
-            func.left(func.coalesce(npi_address_table.c.postal_code, ""), 5) == zip_code,
+            func.left(npi_address_table.c.postal_code, 5) == zip_code,
         )
     )
     try:
@@ -367,7 +373,11 @@ async def get_geo_status(request):
 async def get_geo(request, zip_code):
     zip_code = zip_code.strip().rjust(5, '0')
     session = _get_session(request)
-    census_profile = await _lookup_census_profile(session, zip_code)
+    try:
+        census_profile = await _lookup_census_profile(session, zip_code)
+    except Exception as exc:  # pragma: no cover - defensive production guardrail
+        _log_geo_warning(request, "geo census enrichment failed for zip %s: %s", zip_code, exc)
+        census_profile = None
 
     local_stmt = (
         select(
