@@ -7,7 +7,7 @@ from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 
 import pytest
-from asyncpg import UndefinedTableError
+from asyncpg import UndefinedColumnError, UndefinedTableError
 from sanic.exceptions import InvalidUsage
 from sqlalchemy.exc import ProgrammingError
 
@@ -183,6 +183,39 @@ async def test_geo_by_zip_missing_session():
 async def test_geo_by_zip_missing_census_table_falls_back_to_geo():
     error = ProgrammingError("select", {}, None)
     error.orig = UndefinedTableError("census table")
+    request = types.SimpleNamespace(
+        ctx=types.SimpleNamespace(
+            sa_session=FakeSession(
+                [
+                    error,
+                    FakeResult(
+                        row=MappingRow(
+                            zip_code="60654",
+                            city="Chicago",
+                            state="IL",
+                            latitude=41.9,
+                            longitude=-87.6,
+                            state_name="Illinois",
+                            county_name="Cook",
+                            timezone="America/Chicago",
+                        )
+                    ),
+                ]
+            )
+        ),
+        app=types.SimpleNamespace(),
+    )
+    response = await geo_module.get_geo(request, "60654")
+    payload = json.loads(response.body)
+    assert response.status == 200
+    assert payload["zip_code"] == "60654"
+    assert payload["census_profile"] is None
+
+
+@pytest.mark.asyncio
+async def test_geo_by_zip_missing_census_column_falls_back_to_geo():
+    error = ProgrammingError("select", {}, None)
+    error.orig = UndefinedColumnError("missing census column")
     request = types.SimpleNamespace(
         ctx=types.SimpleNamespace(
             sa_session=FakeSession(

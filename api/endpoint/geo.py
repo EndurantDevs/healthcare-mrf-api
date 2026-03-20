@@ -2,7 +2,7 @@
 
 from datetime import datetime
 
-from asyncpg import UndefinedTableError
+from asyncpg import UndefinedColumnError, UndefinedTableError
 from sanic import Blueprint, response
 from sanic.exceptions import InvalidUsage
 from sqlalchemy import func, select
@@ -98,6 +98,10 @@ def _get_session(request):
     return session
 
 
+def _is_optional_schema_error(exc):
+    return isinstance(getattr(exc, "orig", None), (UndefinedTableError, UndefinedColumnError))
+
+
 def _row_mapping(row):
     if row is None:
         return None
@@ -178,7 +182,7 @@ async def _lookup_svi_profile(session, zip_code):
     try:
         result = await session.execute(stmt)
     except ProgrammingError as exc:
-        if isinstance(getattr(exc, "orig", None), UndefinedTableError):
+        if _is_optional_schema_error(exc):
             return None
         raise
     row = _row_mapping(result.first())
@@ -204,7 +208,7 @@ async def _lookup_provider_count(session, zip_code):
     try:
         result = await session.execute(stmt)
     except ProgrammingError as exc:
-        if isinstance(getattr(exc, "orig", None), UndefinedTableError):
+        if _is_optional_schema_error(exc):
             return None
         raise
     return result.scalar()
@@ -267,7 +271,7 @@ async def _lookup_census_profile(session, zip_code):
     try:
         result = await session.execute(stmt)
     except ProgrammingError as exc:
-        if isinstance(getattr(exc, "orig", None), UndefinedTableError):
+        if _is_optional_schema_error(exc):
             return None
         raise
     profile = _serialize_census_row(_row_mapping(result.first()))
@@ -300,7 +304,7 @@ async def _resolve_places_year(session, zip_code, requested_year):
     try:
         result = await session.execute(stmt)
     except ProgrammingError as exc:
-        if isinstance(getattr(exc, "orig", None), UndefinedTableError):
+        if _is_optional_schema_error(exc):
             return None
         raise
     return result.scalar()
@@ -326,7 +330,7 @@ async def _lookup_zip_from_tiger(session, zip_code):
     try:
         result = await session.execute(stmt)
     except ProgrammingError as exc:
-        if isinstance(getattr(exc, "orig", None), UndefinedTableError):
+        if _is_optional_schema_error(exc):
             raise TigerUnavailableError() from exc
         raise
 
@@ -378,8 +382,13 @@ async def get_geo(request, zip_code):
         )
         .where(geo_zip_table.c.zip_code == zip_code)
     )
-    local_result = await session.execute(local_stmt)
-    local_row = _row_mapping(local_result.first())
+    try:
+        local_result = await session.execute(local_stmt)
+        local_row = _row_mapping(local_result.first())
+    except ProgrammingError as exc:
+        if not _is_optional_schema_error(exc):
+            raise
+        local_row = None
     if local_row:
         payload = _serialize_geo_row(local_row)
         if payload.get("lat") is None:
