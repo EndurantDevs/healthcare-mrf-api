@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from importlib import import_module
 from typing import Any, Dict, Iterable, List, Tuple
 
@@ -38,9 +39,12 @@ def _sync_structure(sync_conn, results: Dict[str, List[str]], add_columns: bool,
     metadata = Base.metadata
     inspector = inspect(sync_conn)
     model_map = _model_by_table_fullname()
+    managed_schemas = set(_managed_schemas())
 
     for table in metadata.sorted_tables:
         schema = table.schema
+        if not _should_manage_table_schema(schema, managed_schemas):
+            continue
         table_name = table.name
         fullname = table.fullname
 
@@ -128,7 +132,7 @@ def _ensure_indexes(sync_conn, inspector, table, model, results: Dict[str, List[
 
 def _iter_index_specs(model) -> Iterable[Dict[str, Any]]:
     specs: List[Dict[str, Any]] = []
-    primary_elements = getattr(model, "__my_index_elements__", None)
+    primary_elements = _normalize_index_columns(getattr(model, "__my_index_elements__", None))
     if primary_elements:
         specs.append(
             {
@@ -139,10 +143,13 @@ def _iter_index_specs(model) -> Iterable[Dict[str, Any]]:
             }
         )
     for extra in getattr(model, "__my_additional_indexes__", []) or []:
+        columns = _normalize_index_columns(extra.get("index_elements", ()))
+        if not columns:
+            continue
         specs.append(
             {
-                "name": extra.get("name") or f"{model.__tablename__}_{'_'.join(extra.get('index_elements', []))}_idx",
-                "columns": extra.get("index_elements", ()),
+                "name": extra.get("name") or f"{model.__tablename__}_{'_'.join(columns)}_idx",
+                "columns": columns,
                 "unique": extra.get("unique", False),
                 "using": extra.get("using"),
                 "where": extra.get("where"),
@@ -152,13 +159,44 @@ def _iter_index_specs(model) -> Iterable[Dict[str, Any]]:
 
 
 def _build_index_sql(name: str, schema_prefix: str, table_name: str, spec: Dict[str, Any]) -> str:
-    columns = spec.get("columns") or ()
+    columns = _normalize_index_columns(spec.get("columns") or ())
     column_clause = ", ".join(columns)
     using_clause = f" USING {spec['using']}" if spec.get("using") else ""
     unique_clause = "UNIQUE " if spec.get("unique") else ""
     where_clause = f" WHERE {spec['where']}" if spec.get("where") else ""
     qualified_table = f'{schema_prefix}"{table_name}"'
     return f"CREATE {unique_clause}INDEX IF NOT EXISTS {name} ON {qualified_table}{using_clause} ({column_clause}){where_clause};"
+
+
+def _normalize_index_columns(columns: Any) -> Tuple[str, ...]:
+    if columns is None:
+        return ()
+    if isinstance(columns, str):
+        text_value = columns.strip()
+        return (text_value,) if text_value else ()
+    if isinstance(columns, (tuple, list)):
+        return tuple(str(item).strip() for item in columns if str(item).strip())
+    try:
+        return tuple(str(item).strip() for item in columns if str(item).strip())
+    except TypeError:
+        text_value = str(columns).strip()
+        return (text_value,) if text_value else ()
+
+
+def _managed_schemas() -> Tuple[str, ...]:
+    configured = str(os.getenv("HLTHPRT_MANAGED_SCHEMAS") or "").strip()
+    if configured:
+        schemas = tuple(part.strip() for part in configured.split(",") if part.strip())
+        if schemas:
+            return schemas
+    default_schema = str(os.getenv("HLTHPRT_DB_SCHEMA") or "mrf").strip() or "mrf"
+    return (default_schema,)
+
+
+def _should_manage_table_schema(schema: str | None, managed_schemas: set[str]) -> bool:
+    if schema is None:
+        return "public" in managed_schemas
+    return schema in managed_schemas
 
 
 def render_sync_summary(results: Dict[str, List[str]]) -> None:

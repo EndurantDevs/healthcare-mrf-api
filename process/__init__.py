@@ -19,6 +19,7 @@ from process.attributes import (process_attributes, process_benefits,
 from process.attributes import shutdown as attr_shutdown
 from process.attributes import startup as attr_startup
 from process.ext.utils import db_startup
+from process.geo_census_import import geo_census_lookup
 from process.geo_import import geo_lookup
 from process.initial import finish_main as finish_mrf
 from process.initial import init_file
@@ -73,6 +74,10 @@ from process.pharmacy_license import (
     pharmacy_license_finalize,
     pharmacy_license_start,
 )
+from process.places_zcta import main as initiate_places_zcta
+from process.places_zcta import process_data as process_places_zcta_data
+from process.places_zcta import shutdown as places_zcta_shutdown
+from process.places_zcta import startup as places_zcta_startup
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
 
@@ -354,6 +359,32 @@ class PharmacyLicense_finish:  # pylint: disable=invalid-name
     job_deserializer = deserialize_job
 
 
+class PlacesZcta:
+    functions = [process_places_zcta_data]
+    on_startup = places_zcta_startup
+    on_shutdown = places_zcta_shutdown
+    max_jobs = int(os.environ.get("HLTHPRT_MAX_PLACES_ZCTA_JOBS")) if os.environ.get("HLTHPRT_MAX_PLACES_ZCTA_JOBS") else 4
+    queue_read_limit = 2 * max_jobs
+    queue_name = "arq:PlacesZcta"
+    job_timeout = 86400
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
+class PlacesZcta_finish:  # pylint: disable=invalid-name
+    functions = [places_zcta_shutdown]
+    on_startup = db_startup
+    max_jobs = int(os.environ.get("HLTHPRT_MAX_PLACES_ZCTA_FINISH_JOBS")) if os.environ.get("HLTHPRT_MAX_PLACES_ZCTA_FINISH_JOBS") else 4
+    queue_read_limit = 2 * max_jobs
+    queue_name = "arq:PlacesZcta_finish"
+    job_timeout = 3600
+    burst = True
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
 @click.group()
 def process_group():
     """
@@ -520,6 +551,12 @@ def pharmacy_license(test: bool, import_id: str | None):
     asyncio.run(initiate_pharmacy_license(test_mode=test, import_id=import_id))
 
 
+@click.command(help="Run CDC PLACES ZCTA import (latest year only)")
+@click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
+def places_zcta(test: bool):
+    asyncio.run(initiate_places_zcta(test_mode=test))
+
+
 @click.command(help="Finish CMS Part D formulary + pharmacy network import for a queued run id")
 @click.option("--import-id", required=True, help="Import id/date suffix used for the run.")
 @click.option("--run-id", required=True, help="Run id emitted by `start partd-formulary-network`.")
@@ -569,6 +606,8 @@ process_group.add_command(drug_claims, name="drug-claims")
 process_group.add_command(provider_quality, name="provider-quality")
 process_group.add_command(partd_formulary_network, name="partd-formulary-network")
 process_group.add_command(pharmacy_license, name="pharmacy-license")
+process_group.add_command(places_zcta, name="places-zcta")
 process_group.add_command(provider_enrichment, name="provider-enrichment")
 process_group.add_command(geo_lookup, name="geo")
+process_group.add_command(geo_census_lookup, name="geo-census")
 process_group.add_command(nucc)

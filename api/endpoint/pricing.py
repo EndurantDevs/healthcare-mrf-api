@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import os
@@ -18,7 +19,7 @@ from sqlalchemy import (Column, Float, Integer, MetaData, String, Table, and_, c
 from api.endpoint.pagination import parse_pagination
 from db.models import (CodeCatalog, CodeCrosswalk, PricingProcedure,
                        PricingProcedureGeoBenchmark,
-                       GeoZipLookup,
+                       GeoZipLookup, NPIData, ProviderEnrichmentSummary,
                        PricingPrescription, PricingProvider,
                        PricingProviderPrescription,
                        PricingProviderProcedure,
@@ -41,6 +42,8 @@ provider_prescription_table = PricingProviderPrescription.__table__
 code_catalog_table = CodeCatalog.__table__
 code_crosswalk_table = CodeCrosswalk.__table__
 geo_zip_table = GeoZipLookup.__table__
+provider_enrichment_summary_table = ProviderEnrichmentSummary.__table__
+npi_data_table = NPIData.__table__
 
 QUALITY_SCORE_TABLE_NAME = "pricing_provider_quality_score"
 QUALITY_DOMAIN_TABLE_NAME = "pricing_provider_quality_domain"
@@ -2797,6 +2800,49 @@ def _apply_prescription_code_preferences(
         )
         item["preferred_prescription_code_system"] = preferred_system
         item["preferred_prescription_code"] = preferred_code
+
+
+@blueprint.get("/statistics", name="pricing.statistics")
+async def pricing_statistics(request):
+    session = _get_session(request)
+
+    medicare_individuals_stmt = (
+        select(func.count())
+        .select_from(
+            provider_enrichment_summary_table.join(
+                npi_data_table, npi_data_table.c.npi == provider_enrichment_summary_table.c.npi
+            )
+        )
+        .where(
+            provider_enrichment_summary_table.c.has_medicare_claims.is_(True),
+            npi_data_table.c.entity_type_code == 1,
+        )
+    )
+    providers_with_procedures_stmt = select(func.count(func.distinct(provider_procedure_table.c.npi)))
+    procedure_codes_stmt = select(func.count(func.distinct(provider_procedure_table.c.procedure_code)))
+    procedure_zip_codes_stmt = select(func.count(func.distinct(location_table.c.zip5))).where(
+        location_table.c.zip5.is_not(None),
+        func.length(func.trim(location_table.c.zip5)) > 0,
+    )
+
+    medicare_individuals_result, providers_with_procedures_result, procedure_codes_result, procedure_zip_codes_result = await asyncio.gather(
+        session.execute(medicare_individuals_stmt),
+        session.execute(providers_with_procedures_stmt),
+        session.execute(procedure_codes_stmt),
+        session.execute(procedure_zip_codes_stmt),
+    )
+
+    medicare_individuals = medicare_individuals_result.scalar()
+    providers_with_procedures = providers_with_procedures_result.scalar()
+    procedure_codes = procedure_codes_result.scalar()
+    procedure_zip_codes = procedure_zip_codes_result.scalar()
+
+    return response.json({
+        "medicare_individual_providers": int(medicare_individuals or 0),
+        "providers_with_procedure_history": int(providers_with_procedures or 0),
+        "procedure_codes_tracked": int(procedure_codes or 0),
+        "procedure_zip_codes": int(procedure_zip_codes or 0),
+    })
 
 
 @blueprint.get("/providers", name="pricing.providers.list")

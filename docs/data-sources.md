@@ -26,6 +26,16 @@ Used for:
 - marketplace plan and issuer metadata
 - rate and benefits-oriented plan imports
 
+### U.S. Census Data API
+Website: <https://api.census.gov/data.html>
+
+Used for:
+
+- ZIP/ZCTA-level Census profile metrics used by geo ZIP enrichment
+- ACS 5-year socioeconomic/labor/housing/commute/broadband metrics
+- Decennial population and race/ethnicity counts used for ZIP race shares
+- ZIP-level County Business Patterns establishment/employment/payroll metrics
+
 ### State-based Exchange Public Use Files
 Website: <https://www.cms.gov/marketplace/resources/data/state-based-public-use-files>
 
@@ -71,6 +81,14 @@ Website: <https://www.atsdr.cdc.gov/place-health/php/svi/index.html>
 Used for:
 
 - ZIP/ZCTA-level socioeconomic adjustment in provider quality imports
+
+### CDC PLACES Local Data for Better Health (ZCTA)
+Website: <https://chronicdata.cdc.gov/500-Cities-Places/PLACES-Local-Data-for-Better-Health-ZCTA-Data-2025/qnzd-25i4/about_data>
+
+Used for:
+
+- ZIP/ZCTA-level public health indicator metrics
+- long-form PLACES measure rows consumed by geo ZIP PLACES endpoints
 
 ### National Uniform Claim Committee (NUCC)
 Website: <https://www.nucc.org/index.php/21-provider-taxonomy>

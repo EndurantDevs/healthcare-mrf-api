@@ -23,7 +23,7 @@ from sqlalchemy import func, select
 
 from db.models import (AddressArchive, NPIAddress, NPIData,
                        NPIDataOtherIdentifier, NPIDataTaxonomy,
-                       NPIDataTaxonomyGroup, db)
+                       NPIDataTaxonomyGroup, NPIPhoneStaffing, db)
 from process.ext.utils import (download_it, download_it_and_save,
                                ensure_database, make_class, my_init_db,
                                print_time_info, push_objects, return_checksum)
@@ -507,7 +507,7 @@ async def startup(ctx):  # pragma: no cover
     except DuplicateTableError:
         pass
 
-    for cls in (NPIData, NPIDataTaxonomyGroup, NPIDataOtherIdentifier, NPIDataTaxonomy, NPIAddress):
+    for cls in (NPIData, NPIDataTaxonomyGroup, NPIDataOtherIdentifier, NPIDataTaxonomy, NPIAddress, NPIPhoneStaffing):
         tables[cls.__main_table__] = make_class(cls, import_date)
         obj = tables[cls.__main_table__]
         await db.status(f"DROP TABLE IF EXISTS {db_schema}.{obj.__main_table__}_{import_date};")
@@ -586,6 +586,52 @@ async def refresh_do_business_as(
     await db.status(update_sql)
 
 
+async def rebuild_phone_staffing_table(
+    *,
+    target_table: str,
+    address_table: str,
+    schema: str,
+) -> None:
+    if not await db.scalar(f"SELECT to_regclass('{schema}.nucc_taxonomy');"):
+        print(
+            f"Skipping phone staffing materialization for {schema}.{target_table}: "
+            f"{schema}.nucc_taxonomy is missing."
+        )
+        return
+
+    print(f"Materializing phone staffing table {schema}.{target_table} from {schema}.{address_table}...")
+    await db.status(f"TRUNCATE TABLE {schema}.{target_table};")
+    await db.status(
+        f"""
+        INSERT INTO {schema}.{target_table} (
+            state_name,
+            telephone_number,
+            pharmacist_count,
+            updated_at
+        )
+        WITH pharmacist_taxonomy AS (
+            SELECT ARRAY_AGG(int_code) AS codes
+            FROM {schema}.nucc_taxonomy
+            WHERE classification = 'Pharmacist'
+        )
+        SELECT
+            a.state_name,
+            REGEXP_REPLACE(a.telephone_number, '[^0-9]', '', 'g') AS telephone_number,
+            COUNT(DISTINCT a.npi)::int AS pharmacist_count,
+            now()::timestamp AS updated_at
+        FROM {schema}.{address_table} AS a
+        CROSS JOIN pharmacist_taxonomy AS pt
+        WHERE a.type = 'primary'
+          AND a.state_name IS NOT NULL
+          AND a.state_name <> ''
+          AND a.telephone_number IS NOT NULL
+          AND a.telephone_number <> ''
+          AND a.taxonomy_array && pt.codes
+        GROUP BY a.state_name, REGEXP_REPLACE(a.telephone_number, '[^0-9]', '', 'g');
+        """
+    )
+
+
 
 
 async def shutdown(ctx):  # pragma: no cover
@@ -619,7 +665,14 @@ async def shutdown(ctx):  # pragma: no cover
             print(f"Failed Import: Address number:{npi_address_count}")
             sys.exit(1)
 
-    processing_classes_array = (NPIData, NPIDataTaxonomyGroup, NPIDataOtherIdentifier, NPIDataTaxonomy, NPIAddress,)
+    processing_classes_array = (
+        NPIData,
+        NPIDataTaxonomyGroup,
+        NPIDataOtherIdentifier,
+        NPIDataTaxonomy,
+        NPIAddress,
+        NPIPhoneStaffing,
+    )
 
     async def table_exists(table_name: str) -> bool:
         exists = await db.scalar(f"SELECT to_regclass('{db_schema}.{table_name}');")
@@ -753,6 +806,20 @@ WHERE
                     print(
                         f"Skipping NPI medications_array update: source table "
                         f"{db_schema}.pricing_provider_prescription is missing."
+                    )
+
+            if cls is NPIPhoneStaffing:
+                address_stage = tables.get(NPIAddress.__main_table__)
+                if address_stage is None:
+                    print(
+                        f"Skipping phone staffing materialization: "
+                        f"staging table for {NPIAddress.__tablename__} is unavailable."
+                    )
+                else:
+                    await rebuild_phone_staffing_table(
+                        target_table=obj.__tablename__,
+                        address_table=address_stage.__tablename__,
+                        schema=db_schema,
                     )
 
             if hasattr(cls, '__my_additional_indexes__') and cls.__my_additional_indexes__:

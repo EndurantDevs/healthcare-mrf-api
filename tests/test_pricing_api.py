@@ -29,6 +29,7 @@ list_prescription_providers = pricing_module.list_prescription_providers
 list_provider_procedure_locations = pricing_module.list_provider_procedure_locations
 list_provider_procedures = pricing_module.list_provider_procedures
 list_provider_prescriptions = pricing_module.list_provider_prescriptions
+pricing_statistics = pricing_module.pricing_statistics
 
 
 class FakeResult:
@@ -1903,3 +1904,23 @@ async def test_get_procedure_geo_benchmarks_success():
     assert payload["benchmarks"]["national"]["total_services"] == 1000.0
     assert payload["benchmarks"]["state"]["geography_value"] == "MD"
     assert payload["benchmarks"]["state"]["avg_submitted_charge"] == 460.0
+
+
+@pytest.mark.asyncio
+async def test_pricing_statistics_success():
+    request = make_request([
+        FakeResult(scalar=321000),
+        FakeResult(scalar=845000),
+        FakeResult(scalar=6123),
+        FakeResult(scalar=27890),
+    ])
+
+    response = await pricing_statistics(request)
+    payload = json.loads(response.body)
+
+    assert payload == {
+        "medicare_individual_providers": 321000,
+        "providers_with_procedure_history": 845000,
+        "procedure_codes_tracked": 6123,
+        "procedure_zip_codes": 27890,
+    }

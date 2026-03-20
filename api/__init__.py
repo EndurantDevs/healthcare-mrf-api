@@ -3,6 +3,7 @@
 from sanic.blueprints import Blueprint
 
 from api.endpoint.formulary import blueprint as v1_formulary
+from api.endpoint.coverage import blueprint as v1_coverage
 from api.endpoint.codes import blueprint as v1_codes
 from api.endpoint.geo import blueprint as v1_geo
 from api.endpoint.healthcheck import blueprint as v1_healthcheck
@@ -14,6 +15,7 @@ from api.endpoint.plan import blueprint as v1_plan
 from api.endpoint.pricing import blueprint as v1_pricing
 from api.endpoint.partd_formulary import blueprint as v1_partd_formulary
 from api.endpoint.pharmacy_license import blueprint as v1_pharmacy_license
+from api.endpoint.reports import blueprint as v1_reports
 from db.connection import db
 
 
@@ -22,6 +24,7 @@ def init_api(api):
     api_bluenprint = Blueprint.group(
         [
             v1_healthcheck,
+            v1_coverage,
             v1_plan,
             v1_formulary,
             v1_codes,
@@ -33,6 +36,7 @@ def init_api(api):
             v1_pricing,
             v1_partd_formulary,
             v1_pharmacy_license,
+            v1_reports,
         ],
         version_prefix="/api/v",
     )

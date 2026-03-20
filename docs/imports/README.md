@@ -12,6 +12,8 @@ This repository has multiple import pipelines. Each command below is a separate 
 | NPI | `python main.py start npi` | `process.NPI_finish` worker | NPPES provider directory import |
 | NUCC | `python main.py start nucc` | shutdown publish in worker | NUCC taxonomy import |
 | Geo | `python main.py start geo` | none | ZIP/city/state lookup support load |
+| Geo Census | `python main.py start geo-census` | none | Census ZIP/ZCTA profile metrics for local geo enrichment |
+| PLACES ZCTA | `python main.py start places-zcta` | `process.PlacesZcta`, `process.PlacesZcta_finish` | CDC PLACES ZIP/ZCTA health indicator metrics |
 | Claims pricing | `python main.py start claims-pricing` | `process.ClaimsPricing_finish` worker or `finish claims-pricing` | Medicare physician procedure and cost imports |
 | Claims procedures | `python main.py start claims-procedures` | same as claims pricing | Alias for claims pricing |
 | Drug claims | `python main.py start drug-claims` | `process.DrugClaims_finish` worker or `finish drug-claims` | Medicare Part D provider-drug imports |
@@ -27,6 +29,8 @@ This repository has multiple import pipelines. Each command below is a separate 
 - [NPI import](./npi.md)
 - [NUCC import](./nucc.md)
 - [Geo lookup import](./geo.md)
+- [Geo Census ZIP profile import](./geo-census.md)
+- [PLACES ZCTA import](./places-zcta.md)
 - [Claims pricing import](./claims-pricing.md)
 - [Drug claims import](./drug-claims.md)
 - [Provider quality import](./provider-quality.md)
