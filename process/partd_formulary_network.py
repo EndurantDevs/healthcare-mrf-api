@@ -237,6 +237,69 @@ def _row_index(row: dict[str, Any]) -> dict[str, Any]:
     return indexed
 
 
+def _extract_dispensing_fee_fields(values: dict[str, Any]) -> dict[str, float | None]:
+    field_candidates = {
+        "dispensing_fee_brand_30": (
+            "branddispensingfee30dayssupply",
+            "branddispensingfee30day",
+            "branddispensingfee30",
+            "brandfee30dayssupply",
+        ),
+        "dispensing_fee_brand_60": (
+            "branddispensingfee60dayssupply",
+            "branddispensingfee60day",
+            "branddispensingfee60",
+            "brandfee60dayssupply",
+        ),
+        "dispensing_fee_brand_90": (
+            "branddispensingfee90dayssupply",
+            "branddispensingfee90day",
+            "branddispensingfee90",
+            "brandfee90dayssupply",
+        ),
+        "dispensing_fee_generic_30": (
+            "genericdispensingfee30dayssupply",
+            "genericdispensingfee30day",
+            "genericdispensingfee30",
+            "genericfee30dayssupply",
+        ),
+        "dispensing_fee_generic_60": (
+            "genericdispensingfee60dayssupply",
+            "genericdispensingfee60day",
+            "genericdispensingfee60",
+            "genericfee60dayssupply",
+        ),
+        "dispensing_fee_generic_90": (
+            "genericdispensingfee90dayssupply",
+            "genericdispensingfee90day",
+            "genericdispensingfee90",
+            "genericfee90dayssupply",
+        ),
+        "dispensing_fee_selected_drug_30": (
+            "selecteddrugdispensingfee30dayssupply",
+            "selecteddrugdispensingfee30day",
+            "selecteddrugdispensingfee30",
+            "selecteddrugsdispensingfee30dayssupply",
+        ),
+        "dispensing_fee_selected_drug_60": (
+            "selecteddrugdispensingfee60dayssupply",
+            "selecteddrugdispensingfee60day",
+            "selecteddrugdispensingfee60",
+            "selecteddrugsdispensingfee60dayssupply",
+        ),
+        "dispensing_fee_selected_drug_90": (
+            "selecteddrugdispensingfee90dayssupply",
+            "selecteddrugdispensingfee90day",
+            "selecteddrugdispensingfee90",
+            "selecteddrugsdispensingfee90dayssupply",
+        ),
+    }
+    extracted: dict[str, float | None] = {}
+    for target_key, candidates in field_candidates.items():
+        extracted[target_key] = _to_float(_row_value(values, *candidates))
+    return extracted
+
+
 def _match_cost_fields(row: dict[str, Any]) -> list[tuple[str, float]]:
     entries: list[tuple[str, float]] = []
     seen: set[str] = set()
@@ -244,7 +307,7 @@ def _match_cost_fields(row: dict[str, Any]) -> list[tuple[str, float]]:
         key = _normalize_key(raw_key)
         if not key:
             continue
-        if not any(token in key for token in ("copay", "coinsurance", "cost", "price", "amount")):
+        if not any(token in key for token in ("copay", "coinsurance", "cost", "price", "amount", "fee")):
             continue
         amount = _to_float(raw_value)
         if amount is None:
@@ -254,7 +317,7 @@ def _match_cost_fields(row: dict[str, Any]) -> list[tuple[str, float]]:
             continue
         entries.append((cost_type, amount))
         seen.add(cost_type)
-        if len(entries) >= 5:
+        if len(entries) >= 32:
             break
     return entries
 
@@ -398,6 +461,56 @@ async def _ensure_indexes(obj: type, schema: str, *, include_additional: bool = 
         await db.status(stmt)
 
 
+def _column_type_sql(column: Any) -> str:
+    assert db.engine is not None
+    return column.type.compile(dialect=db.engine.dialect)
+
+
+def _column_default_sql(column: Any) -> str | None:
+    server_default = getattr(column, "server_default", None)
+    if server_default is not None and getattr(server_default, "arg", None) is not None:
+        return str(server_default.arg)
+    default = getattr(column, "default", None)
+    if default is not None and getattr(default, "arg", None) is not None:
+        raw_default = default.arg
+        if callable(raw_default):
+            return None
+        if isinstance(raw_default, str):
+            escaped = raw_default.replace("'", "''")
+            return f"'{escaped}'"
+        if isinstance(raw_default, bool):
+            return "TRUE" if raw_default else "FALSE"
+        return str(raw_default)
+    return None
+
+
+async def _ensure_columns(obj: type, schema: str) -> None:
+    table = obj.__table__
+    existing = await db.all(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = :schema
+          AND table_name = :table_name
+        """,
+        schema=schema,
+        table_name=table.name,
+    )
+    existing_columns = {row[0] for row in existing}
+    for column in table.columns:
+        if column.name in existing_columns:
+            continue
+        column_sql = f'"{column.name}" {_column_type_sql(column)}'
+        default_sql = _column_default_sql(column)
+        if default_sql is not None:
+            column_sql += f" DEFAULT {default_sql}"
+        if not column.nullable and default_sql is not None:
+            column_sql += " NOT NULL"
+        await db.status(
+            f'ALTER TABLE {schema}.{table.name} ADD COLUMN IF NOT EXISTS {column_sql};'
+        )
+
+
 async def _drop_additional_indexes(obj: type, schema: str) -> None:
     for index_data in _iter_additional_indexes(obj):
         elements = index_data.get("index_elements")
@@ -419,6 +532,7 @@ async def _ensure_tables() -> str:
         PartDMedicationCostStage,
     ):
         await db.create_table(cls.__table__, checkfirst=True)
+        await _ensure_columns(cls, schema)
         include_additional = True
         if PARTD_DEFER_ADDITIONAL_INDEXES and cls in (PartDPharmacyActivity, PartDMedicationCost):
             include_additional = False
@@ -484,6 +598,15 @@ async def _materialize_activity_snapshot(schema: str, snapshot_id: str) -> None:
             zip_code,
             pharmacy_type,
             mail_order,
+            dispensing_fee_brand_30,
+            dispensing_fee_brand_60,
+            dispensing_fee_brand_90,
+            dispensing_fee_generic_30,
+            dispensing_fee_generic_60,
+            dispensing_fee_generic_90,
+            dispensing_fee_selected_drug_30,
+            dispensing_fee_selected_drug_60,
+            dispensing_fee_selected_drug_90,
             effective_from,
             effective_to,
             source_type,
@@ -505,6 +628,15 @@ async def _materialize_activity_snapshot(schema: str, snapshot_id: str) -> None:
                 zip_code,
                 pharmacy_type,
                 mail_order,
+                dispensing_fee_brand_30,
+                dispensing_fee_brand_60,
+                dispensing_fee_brand_90,
+                dispensing_fee_generic_30,
+                dispensing_fee_generic_60,
+                dispensing_fee_generic_90,
+                dispensing_fee_selected_drug_30,
+                dispensing_fee_selected_drug_60,
+                dispensing_fee_selected_drug_90,
                 effective_from,
                 effective_to,
                 source_type,
@@ -528,6 +660,15 @@ async def _materialize_activity_snapshot(schema: str, snapshot_id: str) -> None:
                 zip_code,
                 pharmacy_type,
                 mail_order,
+                dispensing_fee_brand_30,
+                dispensing_fee_brand_60,
+                dispensing_fee_brand_90,
+                dispensing_fee_generic_30,
+                dispensing_fee_generic_60,
+                dispensing_fee_generic_90,
+                dispensing_fee_selected_drug_30,
+                dispensing_fee_selected_drug_60,
+                dispensing_fee_selected_drug_90,
                 effective_from,
                 effective_to,
                 source_type,
@@ -550,6 +691,15 @@ async def _materialize_activity_snapshot(schema: str, snapshot_id: str) -> None:
                 zip_code,
                 pharmacy_type,
                 mail_order,
+                dispensing_fee_brand_30,
+                dispensing_fee_brand_60,
+                dispensing_fee_brand_90,
+                dispensing_fee_generic_30,
+                dispensing_fee_generic_60,
+                dispensing_fee_generic_90,
+                dispensing_fee_selected_drug_30,
+                dispensing_fee_selected_drug_60,
+                dispensing_fee_selected_drug_90,
                 effective_from,
                 effective_to,
                 source_type,
@@ -570,6 +720,15 @@ async def _materialize_activity_snapshot(schema: str, snapshot_id: str) -> None:
                 zip_code,
                 pharmacy_type,
                 mail_order,
+                dispensing_fee_brand_30,
+                dispensing_fee_brand_60,
+                dispensing_fee_brand_90,
+                dispensing_fee_generic_30,
+                dispensing_fee_generic_60,
+                dispensing_fee_generic_90,
+                dispensing_fee_selected_drug_30,
+                dispensing_fee_selected_drug_60,
+                dispensing_fee_selected_drug_90,
                 effective_from,
                 effective_to,
                 source_type
@@ -589,6 +748,15 @@ async def _materialize_activity_snapshot(schema: str, snapshot_id: str) -> None:
                     zip_code,
                     pharmacy_type,
                     mail_order,
+                    dispensing_fee_brand_30,
+                    dispensing_fee_brand_60,
+                    dispensing_fee_brand_90,
+                    dispensing_fee_generic_30,
+                    dispensing_fee_generic_60,
+                    dispensing_fee_generic_90,
+                    dispensing_fee_selected_drug_30,
+                    dispensing_fee_selected_drug_60,
+                    dispensing_fee_selected_drug_90,
                     effective_from,
                     effective_to,
                     source_type
@@ -606,6 +774,15 @@ async def _materialize_activity_snapshot(schema: str, snapshot_id: str) -> None:
             zip_code,
             pharmacy_type,
             mail_order,
+            dispensing_fee_brand_30,
+            dispensing_fee_brand_60,
+            dispensing_fee_brand_90,
+            dispensing_fee_generic_30,
+            dispensing_fee_generic_60,
+            dispensing_fee_generic_90,
+            dispensing_fee_selected_drug_30,
+            dispensing_fee_selected_drug_60,
+            dispensing_fee_selected_drug_90,
             effective_from,
             effective_to,
             source_type,
@@ -805,6 +982,8 @@ def _entry_kind(name: str) -> str:
         return "plan_info"
     if "basic drugs formulary file" in lower:
         return "formulary_map"
+    if "pharmacy network file" in lower:
+        return "activity"
     if "pharmacy networks file" in lower:
         return "activity"
     if "pricing file" in lower:
@@ -920,6 +1099,7 @@ def _activity_row_from_source(
     npi = _to_npi(_row_value(values, "npi", "pharmacynpi", "pharmacynumber", "pharmacyid", "providernpi"))
     if npi is None:
         return None
+    dispensing_fees = _extract_dispensing_fee_fields(values)
 
     contract_id, _plan_component, segment_id, plan_id = _extract_plan_fields(values)
 
@@ -974,6 +1154,15 @@ def _activity_row_from_source(
         "zip_code": _row_value(values, "pharmacyzipcode", "zip", "zipcode", "postalcode"),
         "pharmacy_type": pharmacy_type,
         "mail_order": mail_flag if mail_flag is not None else _to_bool(_row_value(values, "mailorder", "ismailorder", "mailorderflag")),
+        "dispensing_fee_brand_30": dispensing_fees["dispensing_fee_brand_30"],
+        "dispensing_fee_brand_60": dispensing_fees["dispensing_fee_brand_60"],
+        "dispensing_fee_brand_90": dispensing_fees["dispensing_fee_brand_90"],
+        "dispensing_fee_generic_30": dispensing_fees["dispensing_fee_generic_30"],
+        "dispensing_fee_generic_60": dispensing_fees["dispensing_fee_generic_60"],
+        "dispensing_fee_generic_90": dispensing_fees["dispensing_fee_generic_90"],
+        "dispensing_fee_selected_drug_30": dispensing_fees["dispensing_fee_selected_drug_30"],
+        "dispensing_fee_selected_drug_60": dispensing_fees["dispensing_fee_selected_drug_60"],
+        "dispensing_fee_selected_drug_90": dispensing_fees["dispensing_fee_selected_drug_90"],
         "effective_from": effective_from,
         "effective_to": effective_to,
         "source_type": source_type,

@@ -684,7 +684,7 @@ paths:
                 type: object
   /formulary/partd/pharmacies/{npi}/activity:
     get:
-      summary: Return Medicare activity evidence for one pharmacy NPI
+      summary: Return Medicare activity evidence for one pharmacy NPI (including quarterly dispensing fee fields)
       parameters:
         - name: npi
           in: path
@@ -707,6 +707,85 @@ paths:
             application/json:
               schema:
                 type: object
+                properties:
+                  npi:
+                    type: integer
+                  as_of:
+                    type: string
+                    format: date
+                  medicare_active:
+                    type: boolean
+                  source_type:
+                    type: string
+                    nullable: true
+                  plan_ids:
+                    type: array
+                    items:
+                      type: string
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        snapshot_id:
+                          type: string
+                        plan_id:
+                          type: string
+                        contract_id:
+                          type: string
+                        segment_id:
+                          type: string
+                        year:
+                          type: integer
+                        medicare_active:
+                          type: boolean
+                        pharmacy_name:
+                          type: string
+                          nullable: true
+                        pharmacy_type:
+                          type: string
+                          nullable: true
+                        mail_order:
+                          type: boolean
+                          nullable: true
+                        dispensing_fee_brand_30:
+                          type: number
+                          nullable: true
+                        dispensing_fee_brand_60:
+                          type: number
+                          nullable: true
+                        dispensing_fee_brand_90:
+                          type: number
+                          nullable: true
+                        dispensing_fee_generic_30:
+                          type: number
+                          nullable: true
+                        dispensing_fee_generic_60:
+                          type: number
+                          nullable: true
+                        dispensing_fee_generic_90:
+                          type: number
+                          nullable: true
+                        dispensing_fee_selected_drug_30:
+                          type: number
+                          nullable: true
+                        dispensing_fee_selected_drug_60:
+                          type: number
+                          nullable: true
+                        dispensing_fee_selected_drug_90:
+                          type: number
+                          nullable: true
+                        effective_from:
+                          type: string
+                          format: date
+                          nullable: true
+                        effective_to:
+                          type: string
+                          format: date
+                          nullable: true
+                        source_type:
+                          type: string
+                          nullable: true
   /formulary/partd/pharmacies/{npi}/medications/{code_system}/{code}/costs:
     get:
       summary: Return medication cost rows for one pharmacy across plans
