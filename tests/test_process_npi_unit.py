@@ -232,6 +232,15 @@ async def test_process_data_failure_does_not_mark_run(monkeypatch, npi_module):
     assert ctx["context"].get("run", 0) == 0
 
 
+def test_nppes_listing_regex_is_v2_only(npi_module):
+    html = """
+    <a href="NPPES_Data_Dissemination_March_2026.zip">legacy</a>
+    <a href="NPPES_Data_Dissemination_20260301_20260331_V2.zip">current</a>
+    """
+    matches = npi_module.re.findall(r'(NPPES_Data_Dissemination.*_V2.zip)', html)
+    assert matches == ["NPPES_Data_Dissemination_20260301_20260331_V2.zip"]
+
+
 @pytest.mark.asyncio
 async def test_startup_initializes_tables(monkeypatch, npi_module):
 
