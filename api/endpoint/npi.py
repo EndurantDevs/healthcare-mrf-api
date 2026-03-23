@@ -182,6 +182,12 @@ _TABLE_COLUMNS_CACHE: dict[str, tuple[float, set[str]]] = {}
 _NPI_FILTER_CAPABILITIES_CACHE: Optional[tuple[float, str, dict[str, bool]]] = None
 _NPI_PRIMARY_TOTAL_CACHE: Optional[tuple[float, int]] = None
 _NPI_HAS_INSURANCE_TOTAL_CACHE: dict[str, tuple[float, int]] = {}
+_NPI_ALL_TOTAL_TIMEOUT_SECONDS = float(os.getenv("HLTHPRT_NPI_ALL_TOTAL_TIMEOUT_SECONDS", "3.0"))
+_TAXONOMY_CODES_CACHE_TTL_SECONDS = 600.0
+_CLASSIFICATION_TAXONOMY_CODES_CACHE: dict[str, tuple[float, list[str]]] = {}
+_CLASSIFICATION_NPI_CACHE_TTL_SECONDS = 600.0
+_CLASSIFICATION_NPI_CACHE: dict[str, tuple[float, list[int]]] = {}
+_CLASSIFICATION_CACHE_MAX_KEYS = max(1, int(os.getenv("HLTHPRT_CLASSIFICATION_CACHE_MAX_KEYS", "4")))
 
 NAME_LIKE_TEMPLATE = (
     "LOWER("
@@ -251,6 +257,100 @@ def _taxonomy_classification_subquery(conditions: str) -> str:
         .strip()
         .format(conditions=conditions)
     )
+
+
+async def _get_taxonomy_codes_for_classification(classification: str, *, session=None) -> list[str]:
+    key = str(classification or "").strip().lower()
+    if not key:
+        return []
+    now = time.time()
+    cached = _CLASSIFICATION_TAXONOMY_CODES_CACHE.get(key)
+    if cached and (now - cached[0]) < _TAXONOMY_CODES_CACHE_TTL_SECONDS:
+        return list(cached[1])
+
+    query = select(NUCCTaxonomy.code).where(NUCCTaxonomy.classification == classification)
+    if session is not None:
+        rows = await session.execute(query)
+        values = [row[0] for row in rows if row and row[0]]
+    else:
+        async with db.acquire() as conn:
+            rows = await conn.all(query)
+        values = [row[0] for row in rows if row and row[0]]
+    _set_limited_classification_cache(
+        _CLASSIFICATION_TAXONOMY_CODES_CACHE,
+        key,
+        values,
+        now,
+    )
+    return list(values)
+
+
+async def _get_classification_npi_list(classification: str, *, session=None) -> list[int]:
+    key = str(classification or "").strip().lower()
+    if not key:
+        return []
+    now = time.time()
+    cached = _CLASSIFICATION_NPI_CACHE.get(key)
+    if cached and (now - cached[0]) < _CLASSIFICATION_NPI_CACHE_TTL_SECONDS:
+        return list(cached[1])
+
+    taxonomy_codes = await _get_taxonomy_codes_for_classification(classification, session=session)
+    if not taxonomy_codes:
+        return []
+
+    query = text(
+        """
+        SELECT DISTINCT t.npi
+          FROM mrf.npi_taxonomy AS t
+         WHERE t.healthcare_provider_taxonomy_code = ANY(:taxonomy_codes)
+         ORDER BY t.npi
+        """
+    )
+    if session is not None:
+        result = await session.execute(query, {"taxonomy_codes": taxonomy_codes})
+        rows = result.all()
+    else:
+        async with db.acquire() as conn:
+            rows = await conn.all(query, taxonomy_codes=taxonomy_codes)
+
+    npi_list: list[int] = []
+    for row in rows:
+        mapping = getattr(row, "_mapping", None)
+        if mapping is not None:
+            npi_value = mapping.get("npi")
+        else:
+            npi_value = row[0] if row else None
+        if npi_value is None:
+            continue
+        try:
+            npi_list.append(int(npi_value))
+        except (TypeError, ValueError):
+            continue
+
+    _set_limited_classification_cache(
+        _CLASSIFICATION_NPI_CACHE,
+        key,
+        npi_list,
+        now,
+    )
+    return list(npi_list)
+
+
+def _set_limited_classification_cache(
+    cache: dict[str, tuple[float, Any]],
+    key: str,
+    value: Any,
+    now: float,
+) -> None:
+    cache[key] = (now, value)
+    while len(cache) > _CLASSIFICATION_CACHE_MAX_KEYS:
+        oldest_key = min(cache.items(), key=lambda item: item[1][0])[0]
+        if oldest_key == key and len(cache) > 1:
+            oldest_key = min(
+                ((candidate_key, candidate_value) for candidate_key, candidate_value in cache.items() if candidate_key != key),
+                key=lambda item: item[1][0],
+            )[0]
+        cache.pop(oldest_key, None)
 
 
 def _taxonomy_group_subquery() -> str:
@@ -1795,7 +1895,16 @@ async def get_all(request):
     request.args.get("q")
     request.args.get("start")
     request.args.get("limit")
+    request.args.get("include_total")
+    request.args.get("view")
     q_value = str(request.args.get("q") or "").strip().lower()
+    include_total = _parse_bool_arg(request.args.get("include_total"), default=True)
+    view_mode = str(request.args.get("view") or "").strip().lower()
+    classification = request.args.get("classification")
+    sitemap_limit_mode = (
+        view_mode == "sitemap"
+        and str(classification or "").strip().lower() == "pharmacy"
+    )
     names_like: list[str] = []
     if q_value:
         names_like.append(q_value)
@@ -1805,7 +1914,7 @@ async def get_all(request):
     pagination = parse_pagination(
         request.args,
         default_limit=50,
-        max_limit=200,
+        max_limit=20000 if sitemap_limit_mode else 200,
         default_page=1,
         allow_offset=True,
         allow_start=True,
@@ -1813,7 +1922,6 @@ async def get_all(request):
     )
     start = pagination.offset
     limit = pagination.limit
-    classification = request.args.get("classification")
     specialization = request.args.get("specialization")
     section = request.args.get("section")
     display_name = request.args.get("display_name")
@@ -2361,6 +2469,58 @@ async def get_all(request):
         mapping = await get_formatted_count(response_format)
         return response.json({"rows": mapping}, default=str)
 
+    async def get_sitemap_results(start_offset: int, page_limit: int, classification_value: str) -> list[dict[str, Any]]:
+        classification_npis = await _get_classification_npi_list(
+            classification_value,
+            session=request_session,
+        )
+        if not classification_npis:
+            return []
+        page_npis = classification_npis[start_offset:start_offset + page_limit]
+        if not page_npis:
+            return []
+        query = text(
+            """
+            SELECT
+                b.npi,
+                b.provider_organization_name,
+                b.provider_other_organization_name,
+                b.last_update_date,
+                c.date_added,
+                c.postal_code,
+                c.formatted_address
+            FROM mrf.npi AS b
+            JOIN mrf.npi_address AS c ON c.npi = b.npi AND c.type = 'primary'
+            WHERE b.npi = ANY(:page_npis)
+            ORDER BY b.npi
+            """
+        )
+        async with db.acquire() as conn:
+            rows_iter = await conn.all(
+                query,
+                page_npis=page_npis,
+            )
+        rows: list[dict[str, Any]] = []
+        for row in rows_iter:
+            mapping = getattr(row, "_mapping", None)
+            if mapping is None:
+                continue
+            rows.append(
+                {
+                    "npi": mapping.get("npi"),
+                    "provider_organization_name": mapping.get("provider_organization_name"),
+                    "provider_other_organization_name": mapping.get("provider_other_organization_name"),
+                    "last_update_date": mapping.get("last_update_date"),
+                    "date_added": mapping.get("date_added"),
+                    "postal_code": mapping.get("postal_code"),
+                    "formatted_address": mapping.get("formatted_address"),
+                    "do_business_as": [],
+                    "procedures_array": [],
+                    "medications_array": [],
+                }
+            )
+        return rows
+
     async def get_formatted_count(response_format: str) -> dict:
         """
         Return mapping for special count formats (full_taxonomy/classification).
@@ -2578,16 +2738,77 @@ async def get_all(request):
         rows = await get_count(filters)
         return response.json({"rows": rows}, default=str)
 
-    if not simple_filter_present and not has_insurance and not city and not state:
-        total, rows = await asyncio.gather(
-            _fast_primary_npi_count(),
-            get_results(start, limit, filters),
+    async def _count_with_timeout() -> Optional[int]:
+        if not include_total:
+            return None
+        if not simple_filter_present and not has_insurance and not city and not state:
+            return await _fast_primary_npi_count()
+        try:
+            return await asyncio.wait_for(
+                get_count(filters),
+                timeout=max(0.1, _NPI_ALL_TOTAL_TIMEOUT_SECONDS),
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "NPI /all total count timed out; offset=%s limit=%s",
+                pagination.offset,
+                pagination.limit,
+            )
+            return None
+        except Exception as exc:  # pragma: no cover - defensive degradation
+            logger.warning(
+                "NPI /all total count failed (%s); offset=%s limit=%s",
+                exc,
+                pagination.offset,
+                pagination.limit,
+            )
+            return None
+
+    use_sitemap_fast_path = (
+        view_mode == "sitemap"
+        and not count_only
+        and str(classification or "").strip().lower() == "pharmacy"
+        and not any(
+            [
+                specialization,
+                section,
+                display_name,
+                first_name,
+                last_name,
+                organization_name,
+                phone_digits,
+                zip_code,
+                entity_type_code,
+                plan_network,
+                names_like,
+                codes,
+                response_format,
+                procedure_internal_codes,
+                medication_internal_codes,
+            ]
         )
+        and not has_insurance
+        and not city
+        and not state
+    )
+
+    if use_sitemap_fast_path:
+        rows = await get_sitemap_results(start, limit, "Pharmacy")
+        raw_total = None if not include_total else await _count_with_timeout()
     else:
-        total, rows = await asyncio.gather(
-            get_count(filters),
+        raw_total, rows = await asyncio.gather(
+            _count_with_timeout(),
             get_results(start, limit, filters),
         )
+    if include_total and raw_total is not None:
+        total = int(raw_total)
+        total_source = "computed"
+    elif include_total:
+        total = pagination.offset + len(rows)
+        total_source = "estimated_timeout_floor"
+    else:
+        total = pagination.offset + len(rows)
+        total_source = "estimated_page_floor"
     summary_map: dict[int, dict[str, Any]] = {}
     try:
         summary_map = await _fetch_provider_enrichment_summary_map(
@@ -2614,6 +2835,7 @@ async def get_all(request):
         "limit": pagination.limit,
         "offset": pagination.offset,
         "rows": rows,
+        "total_source": total_source,
     }
     if requested_procedure_codes or requested_medication_codes:
         payload["query"] = {
@@ -3103,7 +3325,6 @@ async def get_near_npi(request):
             filter_capabilities = await _resolve_npi_filter_capabilities()
 
     _validate_section_filters(section, classification, codes)
-    await _ensure_npi_geo_index()
     # If only zip was provided, resolve to coordinates first using a separate connection.
     if (not (in_long and in_lat)) and zip_codes and zip_codes[0]:
         zip_sql = "select intptlat, intptlon from zcta5 where zcta5ce=:zip_code limit 1;"
@@ -3751,28 +3972,3 @@ async def _fetch_other_names(npi: int, *, session: Any = None) -> list[dict[str,
         payload.pop("npi", None)
         rows.append(payload)
     return rows
-_NPI_GEO_INDEX_READY = False
-
-
-async def _ensure_npi_geo_index():
-    global _NPI_GEO_INDEX_READY  # pylint: disable=global-statement
-    if _NPI_GEO_INDEX_READY:
-        return
-    schema = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
-    stmt = text(
-        f"""
-        CREATE INDEX IF NOT EXISTS npi_address_geo_idx
-            ON {schema}.npi_address
-         USING GIST (Geography(ST_MakePoint(long, lat)))
-         WHERE type IN ('primary','secondary');
-        """
-    )
-    status_fn = getattr(db, "status", None)
-    if status_fn is not None:
-        await status_fn(stmt)
-    else:  # used in tests with lightweight fake db
-        async with db.acquire() as conn:
-            executor = getattr(conn, "execute", None)
-            if executor is not None:
-                await executor(stmt)
-    _NPI_GEO_INDEX_READY = True

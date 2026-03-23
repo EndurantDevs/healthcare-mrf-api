@@ -172,6 +172,13 @@ def _log_geo_warning(request, message, *args):
         logger.warning(message, *args)
 
 
+async def _rollback_session(session):
+    try:
+        await session.rollback()
+    except Exception:  # pragma: no cover - defensive
+        pass
+
+
 async def _lookup_svi_profile(session, zip_code):
     stmt = (
         select(
@@ -377,6 +384,7 @@ async def get_geo(request, zip_code):
         census_profile = await _lookup_census_profile(session, zip_code)
     except Exception as exc:  # pragma: no cover - defensive production guardrail
         _log_geo_warning(request, "geo census enrichment failed for zip %s: %s", zip_code, exc)
+        await _rollback_session(session)
         census_profile = None
 
     local_stmt = (

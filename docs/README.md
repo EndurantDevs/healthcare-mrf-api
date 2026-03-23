@@ -31,6 +31,7 @@ Operational conventions across the repo:
 For lower-level implementation notes, see [`../specs/`](../specs/).
 Useful starting points:
 
+- [`../specs/data_source_registry.md`](../specs/data_source_registry.md)
 - [`../specs/cms_claims_pricing_v1.md`](../specs/cms_claims_pricing_v1.md)
 - [`../specs/drug_claims_v1.md`](../specs/drug_claims_v1.md)
 - [`../specs/import_swap_backup_policy.md`](../specs/import_swap_backup_policy.md)
