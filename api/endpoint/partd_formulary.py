@@ -299,8 +299,8 @@ async def get_pharmacy_partd_activity(request, npi):
                 SELECT
                     a.snapshot_id,
                     p.plan_id,
-                    p.contract_id,
-                    p.segment_id,
+                    NULLIF(split_part(p.plan_id, '-', 1), '') AS contract_id,
+                    NULLIF(split_part(p.plan_id, '-', 3), '') AS segment_id,
                     a.year,
                     a.medicare_active,
                     a.pharmacy_name,
@@ -319,8 +319,8 @@ async def get_pharmacy_partd_activity(request, npi):
                     a.effective_to,
                     a.source_type
                 FROM {activity_table_name} a
-                CROSS JOIN LATERAL unnest(a.plan_ids, a.contract_ids, a.segment_ids)
-                    AS p(plan_id, contract_id, segment_id)
+                CROSS JOIN LATERAL unnest(a.plan_ids)
+                    AS p(plan_id)
                 WHERE a.npi = :npi
                   AND a.effective_from <= :as_of
                   AND (a.effective_to IS NULL OR a.effective_to >= :as_of)
@@ -539,8 +539,8 @@ async def get_pharmacy_medication_costs(request, npi, code_system, code):
                 f"""
                 SELECT COUNT(*) AS total
                 FROM {cost_table_name} c
-                CROSS JOIN LATERAL unnest(c.plan_ids, c.contract_ids, c.segment_ids)
-                    AS p(plan_id, contract_id, segment_id)
+                CROSS JOIN LATERAL unnest(c.plan_ids)
+                    AS p(plan_id)
                 WHERE {' AND '.join(where_parts)};
                 """
             ),
@@ -559,8 +559,8 @@ async def get_pharmacy_medication_costs(request, npi, code_system, code):
                     c.snapshot_id,
                     c.plan_ids,
                     p.plan_id,
-                    p.contract_id,
-                    p.segment_id,
+                    NULLIF(split_part(p.plan_id, '-', 1), '') AS contract_id,
+                    NULLIF(split_part(p.plan_id, '-', 3), '') AS segment_id,
                     c.year,
                     c.code_system,
                     c.code,
@@ -578,8 +578,8 @@ async def get_pharmacy_medication_costs(request, npi, code_system, code):
                     c.effective_to,
                     c.source_type
                 FROM {cost_table_name} c
-                CROSS JOIN LATERAL unnest(c.plan_ids, c.contract_ids, c.segment_ids)
-                    AS p(plan_id, contract_id, segment_id)
+                CROSS JOIN LATERAL unnest(c.plan_ids)
+                    AS p(plan_id)
                 WHERE {' AND '.join(where_parts)}
                 ORDER BY p.plan_id ASC, c.cost_type ASC, c.effective_from DESC NULLS LAST
                 OFFSET :offset

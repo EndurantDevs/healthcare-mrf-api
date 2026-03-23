@@ -16,6 +16,7 @@ from api.endpoint.pricing import blueprint as v1_pricing
 from api.endpoint.partd_formulary import blueprint as v1_partd_formulary
 from api.endpoint.pharmacy_license import blueprint as v1_pharmacy_license
 from api.endpoint.reports import blueprint as v1_reports
+from api.endpoint.site_intelligence import blueprint as v1_site_intelligence
 from db.connection import db
 
 
@@ -37,6 +38,7 @@ def init_api(api):
             v1_partd_formulary,
             v1_pharmacy_license,
             v1_reports,
+            v1_site_intelligence,
         ],
         version_prefix="/api/v",
     )

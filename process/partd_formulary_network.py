@@ -65,6 +65,10 @@ PARTD_TEST_MAX_ROWS_PER_FILE = max(
     int(os.getenv("HLTHPRT_PARTD_TEST_MAX_ROWS_PER_FILE", "5000")),
     100,
 )
+PARTD_CHUNK_STALL_SECONDS = max(
+    int(os.getenv("HLTHPRT_PARTD_CHUNK_STALL_SECONDS", "900")),
+    60,
+)
 
 _DATE_PATTERN = re.compile(r"(20\d{2})(\d{2})(\d{2})")
 _NON_DIGIT = re.compile(r"[^0-9]+")
@@ -511,6 +515,14 @@ async def _ensure_columns(obj: type, schema: str) -> None:
         )
 
 
+async def _drop_columns(obj: type, schema: str, columns: tuple[str, ...]) -> None:
+    table = obj.__table__
+    for column_name in columns:
+        await db.status(
+            f'ALTER TABLE {schema}.{table.name} DROP COLUMN IF EXISTS "{column_name}";'
+        )
+
+
 async def _drop_additional_indexes(obj: type, schema: str) -> None:
     for index_data in _iter_additional_indexes(obj):
         elements = index_data.get("index_elements")
@@ -537,6 +549,12 @@ async def _ensure_tables() -> str:
         if PARTD_DEFER_ADDITIONAL_INDEXES and cls in (PartDPharmacyActivity, PartDMedicationCost):
             include_additional = False
         await _ensure_indexes(cls, schema, include_additional=include_additional)
+
+    # Drop redundant v2 columns to keep schema lean and avoid write amplification.
+    await _drop_columns(PartDPharmacyActivity, schema, ("contract_ids", "segment_ids"))
+    await _drop_columns(PartDMedicationCost, schema, ("contract_ids", "segment_ids"))
+    await _drop_columns(PartDPharmacyActivityStage, schema, ("plan_id", "contract_id", "segment_id"))
+    await _drop_columns(PartDMedicationCostStage, schema, ("contract_id", "segment_id"))
     return schema
 
 
@@ -560,6 +578,101 @@ async def _analyze_partd_tables(schema: str) -> None:
 def _snapshot_id(artifact: SourceArtifact) -> str:
     digest = hashlib.sha1(f"{artifact.source_type}|{artifact.url}".encode("utf-8")).hexdigest()[:12]
     return f"{artifact.source_type}:{artifact.release_date.strftime('%Y%m%d')}:{digest}"
+
+
+def _state_key(run_id: str, snapshot_id: str, suffix: str) -> str:
+    return f"partd:{run_id}:{snapshot_id}:{suffix}"
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    if value is None:
+        return default
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+async def _init_activity_chunk_state(redis, run_id: str, snapshot_id: str, total_chunks: int) -> None:
+    total_key = _state_key(run_id, snapshot_id, "activity_total")
+    done_key = _state_key(run_id, snapshot_id, "activity_done")
+    rows_key = _state_key(run_id, snapshot_id, "activity_rows")
+    await redis.delete(total_key, done_key, rows_key)
+    await redis.set(total_key, str(max(total_chunks, 0)))
+    await redis.expire(total_key, 172800)
+    await redis.sadd(done_key, "__init__")
+    await redis.srem(done_key, "__init__")
+    await redis.expire(done_key, 172800)
+    await redis.set(rows_key, "0")
+    await redis.expire(rows_key, 172800)
+
+
+async def _mark_activity_chunk_done(
+    redis,
+    run_id: str,
+    snapshot_id: str,
+    chunk_id: str,
+    accepted_rows: int,
+) -> None:
+    done_key = _state_key(run_id, snapshot_id, "activity_done")
+    rows_key = _state_key(run_id, snapshot_id, "activity_rows")
+    await redis.sadd(done_key, chunk_id)
+    await redis.expire(done_key, 172800)
+    if accepted_rows > 0:
+        await redis.incrby(rows_key, int(accepted_rows))
+    await redis.expire(rows_key, 172800)
+
+
+async def _get_activity_chunk_progress(redis, run_id: str, snapshot_id: str) -> tuple[int, int, int]:
+    total_key = _state_key(run_id, snapshot_id, "activity_total")
+    done_key = _state_key(run_id, snapshot_id, "activity_done")
+    rows_key = _state_key(run_id, snapshot_id, "activity_rows")
+    total = _safe_int(await redis.get(total_key), 0)
+    done = _safe_int(await redis.scard(done_key), 0)
+    rows = _safe_int(await redis.get(rows_key), 0)
+    return total, done, rows
+
+
+async def _activity_done_chunk_ids(redis, run_id: str, snapshot_id: str) -> set[str]:
+    done_key = _state_key(run_id, snapshot_id, "activity_done")
+    raw_members = await redis.smembers(done_key)
+    values: set[str] = set()
+    for raw in raw_members or []:
+        if isinstance(raw, bytes):
+            values.add(raw.decode("utf-8"))
+        else:
+            values.add(str(raw))
+    return values
+
+
+async def _wait_for_activity_chunks(redis, run_id: str, snapshot_id: str, total_chunks: int) -> tuple[int, set[str]]:
+    if total_chunks <= 0:
+        return 0, set()
+    last_done = -1
+    last_progress_at = datetime.datetime.utcnow()
+    while True:
+        total, done, rows = await _get_activity_chunk_progress(redis, run_id, snapshot_id)
+        if done >= max(total, total_chunks):
+            return rows, await _activity_done_chunk_ids(redis, run_id, snapshot_id)
+        if done > last_done:
+            last_done = done
+            last_progress_at = datetime.datetime.utcnow()
+        stall_seconds = (datetime.datetime.utcnow() - last_progress_at).total_seconds()
+        if stall_seconds >= PARTD_CHUNK_STALL_SECONDS:
+            print(
+                f"[partd] activity chunk progress stalled snapshot={snapshot_id} "
+                f"done={done}/{max(total, total_chunks)} stall_seconds={int(stall_seconds)}; "
+                f"falling back to local processing for remaining chunks",
+                flush=True,
+            )
+            return rows, await _activity_done_chunk_ids(redis, run_id, snapshot_id)
+        print(
+            f"[partd] waiting activity chunks snapshot={snapshot_id} done={done}/{max(total, total_chunks)}",
+            flush=True,
+        )
+        await asyncio.sleep(2)
 
 
 async def _truncate_stage_tables(schema: str) -> None:
@@ -610,9 +723,7 @@ async def _materialize_activity_snapshot(schema: str, snapshot_id: str) -> None:
             effective_from,
             effective_to,
             source_type,
-            plan_ids,
-            contract_ids,
-            segment_ids
+            plan_ids
         )
         WITH base AS (
             SELECT
@@ -640,9 +751,7 @@ async def _materialize_activity_snapshot(schema: str, snapshot_id: str) -> None:
                 effective_from,
                 effective_to,
                 source_type,
-                plan_id,
-                contract_id,
-                segment_id
+                unnest(plan_ids) AS plan_id
             FROM {stage_table}
             WHERE snapshot_id = :snapshot_id
         ),
@@ -672,9 +781,7 @@ async def _materialize_activity_snapshot(schema: str, snapshot_id: str) -> None:
                 effective_from,
                 effective_to,
                 source_type,
-                plan_id,
-                contract_id,
-                segment_id
+                plan_id
             FROM base
         ),
         grouped AS (
@@ -703,9 +810,7 @@ async def _materialize_activity_snapshot(schema: str, snapshot_id: str) -> None:
                 effective_from,
                 effective_to,
                 source_type,
-                array_agg(plan_id ORDER BY plan_id) AS plan_ids,
-                array_agg(contract_id ORDER BY plan_id) AS contract_ids,
-                array_agg(segment_id ORDER BY plan_id) AS segment_ids
+                array_agg(plan_id ORDER BY plan_id) AS plan_ids
             FROM dedup
             GROUP BY
                 snapshot_id,
@@ -786,9 +891,7 @@ async def _materialize_activity_snapshot(schema: str, snapshot_id: str) -> None:
             effective_from,
             effective_to,
             source_type,
-            plan_ids,
-            contract_ids,
-            segment_ids
+            plan_ids
         FROM grouped;
         """,
         snapshot_id=snapshot_id,
@@ -827,9 +930,7 @@ async def _materialize_pricing_snapshot(schema: str, snapshot_id: str) -> None:
             effective_from,
             effective_to,
             source_type,
-            plan_ids,
-            contract_ids,
-            segment_ids
+            plan_ids
         )
         WITH base AS (
             SELECT
@@ -850,9 +951,7 @@ async def _materialize_pricing_snapshot(schema: str, snapshot_id: str) -> None:
                 effective_from,
                 effective_to,
                 source_type,
-                plan_id,
-                contract_id,
-                segment_id
+                plan_id
             FROM {stage_table}
             WHERE snapshot_id = :snapshot_id
         ),
@@ -875,9 +974,7 @@ async def _materialize_pricing_snapshot(schema: str, snapshot_id: str) -> None:
                 effective_from,
                 effective_to,
                 source_type,
-                plan_id,
-                contract_id,
-                segment_id
+                plan_id
             FROM base
         ),
         grouped AS (
@@ -899,9 +996,7 @@ async def _materialize_pricing_snapshot(schema: str, snapshot_id: str) -> None:
                 effective_from,
                 effective_to,
                 source_type,
-                array_agg(plan_id ORDER BY plan_id) AS plan_ids,
-                array_agg(contract_id ORDER BY plan_id) AS contract_ids,
-                array_agg(segment_id ORDER BY plan_id) AS segment_ids
+                array_agg(plan_id ORDER BY plan_id) AS plan_ids
             FROM dedup
             GROUP BY
                 snapshot_id,
@@ -961,9 +1056,7 @@ async def _materialize_pricing_snapshot(schema: str, snapshot_id: str) -> None:
             effective_from,
             effective_to,
             source_type,
-            plan_ids,
-            contract_ids,
-            segment_ids
+            plan_ids
         FROM grouped;
         """,
         snapshot_id=snapshot_id,
@@ -1101,7 +1194,7 @@ def _activity_row_from_source(
         return None
     dispensing_fees = _extract_dispensing_fee_fields(values)
 
-    contract_id, _plan_component, segment_id, plan_id = _extract_plan_fields(values)
+    _contract_id, _plan_component, _segment_id, plan_id = _extract_plan_fields(values)
 
     year = _to_int(_row_value(values, "year", "contractyear", "planyear"))
     retail_flag = _to_bool(_row_value(values, "pharmacyretail", "retail", "isretail"))
@@ -1142,8 +1235,6 @@ def _activity_row_from_source(
         "snapshot_id": snapshot_id,
         "npi": npi,
         "plan_id": plan_id[:32],
-        "contract_id": contract_id[:32],
-        "segment_id": segment_id[:32],
         "year": year or effective_from.year,
         "medicare_active": bool(active),
         "pharmacy_name": _row_value(values, "pharmacyname", "name", "providername"),
@@ -1227,8 +1318,6 @@ def _pricing_rows_from_source(
             {
                 "snapshot_id": snapshot_id,
                 "plan_id": plan_id[:32],
-                "contract_id": contract_id[:32],
-                "segment_id": segment_id[:32],
                 "year": year or effective_from.year,
                 "code_system": code_system,
                 "code": code[:64],
@@ -1254,11 +1343,86 @@ async def _flush_batches(
     activity_batch: list[dict[str, Any]],
     pricing_batch: list[dict[str, Any]],
 ) -> None:
+    def _activity_stage_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        # Chunk-level pre-aggregation to reduce stage footprint before COPY.
+        grouped: dict[tuple[Any, ...], dict[str, Any]] = {}
+        for row in rows:
+            plan_id = str(row.get("plan_id") or "").strip()
+            if not plan_id:
+                continue
+            key = (
+                row.get("snapshot_id"),
+                row.get("npi"),
+                row.get("year"),
+                row.get("medicare_active"),
+                row.get("pharmacy_name"),
+                row.get("address_line1"),
+                row.get("address_line2"),
+                row.get("city"),
+                row.get("state"),
+                row.get("zip_code"),
+                row.get("pharmacy_type"),
+                row.get("mail_order"),
+                row.get("dispensing_fee_brand_30"),
+                row.get("dispensing_fee_brand_60"),
+                row.get("dispensing_fee_brand_90"),
+                row.get("dispensing_fee_generic_30"),
+                row.get("dispensing_fee_generic_60"),
+                row.get("dispensing_fee_generic_90"),
+                row.get("dispensing_fee_selected_drug_30"),
+                row.get("dispensing_fee_selected_drug_60"),
+                row.get("dispensing_fee_selected_drug_90"),
+                row.get("effective_from"),
+                row.get("effective_to"),
+                row.get("source_type"),
+            )
+            entry = grouped.get(key)
+            if entry is None:
+                entry = {
+                    "snapshot_id": row.get("snapshot_id"),
+                    "npi": row.get("npi"),
+                    "year": row.get("year"),
+                    "medicare_active": row.get("medicare_active"),
+                    "pharmacy_name": row.get("pharmacy_name"),
+                    "address_line1": row.get("address_line1"),
+                    "address_line2": row.get("address_line2"),
+                    "city": row.get("city"),
+                    "state": row.get("state"),
+                    "zip_code": row.get("zip_code"),
+                    "pharmacy_type": row.get("pharmacy_type"),
+                    "mail_order": row.get("mail_order"),
+                    "dispensing_fee_brand_30": row.get("dispensing_fee_brand_30"),
+                    "dispensing_fee_brand_60": row.get("dispensing_fee_brand_60"),
+                    "dispensing_fee_brand_90": row.get("dispensing_fee_brand_90"),
+                    "dispensing_fee_generic_30": row.get("dispensing_fee_generic_30"),
+                    "dispensing_fee_generic_60": row.get("dispensing_fee_generic_60"),
+                    "dispensing_fee_generic_90": row.get("dispensing_fee_generic_90"),
+                    "dispensing_fee_selected_drug_30": row.get("dispensing_fee_selected_drug_30"),
+                    "dispensing_fee_selected_drug_60": row.get("dispensing_fee_selected_drug_60"),
+                    "dispensing_fee_selected_drug_90": row.get("dispensing_fee_selected_drug_90"),
+                    "effective_from": row.get("effective_from"),
+                    "effective_to": row.get("effective_to"),
+                    "source_type": row.get("source_type"),
+                    "_plans": set(),
+                }
+                grouped[key] = entry
+            entry["_plans"].add(plan_id[:32])
+
+        aggregated: list[dict[str, Any]] = []
+        for entry in grouped.values():
+            plans = sorted(entry.pop("_plans"))
+            if not plans:
+                continue
+            entry["plan_ids"] = plans
+            aggregated.append(entry)
+        return aggregated
+
     tasks: list[Any] = []
     if activity_batch:
-        activity_rows = list(activity_batch)
+        activity_rows = _activity_stage_rows(list(activity_batch))
         activity_batch.clear()
-        tasks.append(push_objects(activity_rows, PartDPharmacyActivityStage, rewrite=False, use_copy=True))
+        if activity_rows:
+            tasks.append(push_objects(activity_rows, PartDPharmacyActivityStage, rewrite=False, use_copy=True))
     if pricing_batch:
         pricing_rows = list(pricing_batch)
         pricing_batch.clear()
@@ -1267,12 +1431,49 @@ async def _flush_batches(
         await asyncio.gather(*tasks)
 
 
+async def _process_activity_file(
+    file_path: Path,
+    *,
+    snapshot_id: str,
+    source_type: str,
+    default_date: datetime.date,
+    test_mode: bool,
+) -> int:
+    activity_count = 0
+    processed_rows = 0
+    activity_batch: list[dict[str, Any]] = []
+    pricing_batch: list[dict[str, Any]] = []
+    delimiter = _detect_delimiter(file_path)
+    with file_path.open("r", encoding="utf-8", errors="replace") as handle:
+        reader = csv.DictReader(handle, delimiter=delimiter)
+        for row in reader:
+            activity_row = _activity_row_from_source(
+                row,
+                snapshot_id=snapshot_id,
+                source_type=source_type,
+                default_date=default_date,
+            )
+            if activity_row is None:
+                continue
+            activity_batch.append(activity_row)
+            activity_count += 1
+            processed_rows += 1
+            if len(activity_batch) >= PARTD_BATCH_SIZE:
+                await _flush_batches(activity_batch, pricing_batch)
+            if test_mode and processed_rows >= PARTD_TEST_MAX_ROWS_PER_FILE:
+                break
+    await _flush_batches(activity_batch, pricing_batch)
+    return activity_count
+
+
 async def _import_artifact(
     artifact: SourceArtifact,
     snapshot_id: str,
     *,
     schema: str,
     test_mode: bool,
+    redis=None,
+    run_id: str = "",
 ) -> tuple[int, int]:
     Path(PARTD_WORKDIR).mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="partd_", dir=PARTD_WORKDIR) as tmpdir:
@@ -1304,29 +1505,59 @@ async def _import_artifact(
         if artifact.source_type == "quarterly" and not pricing_members and unknown_members:
             pricing_members = unknown_members[:3]
 
-        processed_rows = 0
-        for file_path, _logical_name in activity_members:
-            delimiter = _detect_delimiter(file_path)
-            with file_path.open("r", encoding="utf-8", errors="replace") as handle:
-                reader = csv.DictReader(handle, delimiter=delimiter)
-                for row in reader:
-                    activity_row = _activity_row_from_source(
-                        row,
-                        snapshot_id=snapshot_id,
-                        source_type=artifact.source_type,
-                        default_date=artifact.cutoff_month,
-                    )
-                    if activity_row is None:
-                        continue
-                    activity_batch.append(activity_row)
-                    activity_count += 1
-                    processed_rows += 1
-                    if len(activity_batch) >= PARTD_BATCH_SIZE:
-                        await _flush_batches(activity_batch, pricing_batch)
-                    if test_mode and processed_rows >= PARTD_TEST_MAX_ROWS_PER_FILE:
-                        break
-            if test_mode and processed_rows >= PARTD_TEST_MAX_ROWS_PER_FILE:
-                break
+        max_partd_jobs = max(int(os.getenv("HLTHPRT_MAX_PARTD_JOBS", "4")), 1)
+        if redis is not None and run_id and activity_members and max_partd_jobs > 1:
+            await _init_activity_chunk_state(redis, run_id, snapshot_id, len(activity_members))
+            snapshot_hash = hashlib.sha1(snapshot_id.encode("utf-8")).hexdigest()[:10]
+            chunk_defs: list[tuple[str, Path]] = []
+            for idx, (file_path, _logical_name) in enumerate(activity_members):
+                chunk_id = f"{snapshot_id}:{idx}"
+                chunk_defs.append((chunk_id, file_path))
+                await redis.enqueue_job(
+                    "partd_formulary_network_process_chunk",
+                    {
+                        "run_id": run_id,
+                        "snapshot_id": snapshot_id,
+                        "chunk_id": chunk_id,
+                        "chunk_path": str(file_path),
+                        "source_type": artifact.source_type,
+                        "cutoff_month": artifact.cutoff_month.isoformat(),
+                        "test_mode": bool(test_mode),
+                    },
+                    _queue_name=PARTD_QUEUE_NAME,
+                    _job_id=f"partd_activity_{run_id}_{snapshot_hash}_{idx}",
+                )
+            activity_count, done_chunk_ids = await _wait_for_activity_chunks(
+                redis,
+                run_id,
+                snapshot_id,
+                len(activity_members),
+            )
+            for chunk_id, file_path in chunk_defs:
+                if chunk_id in done_chunk_ids:
+                    continue
+                accepted = await _process_activity_file(
+                    file_path,
+                    snapshot_id=snapshot_id,
+                    source_type=artifact.source_type,
+                    default_date=artifact.cutoff_month,
+                    test_mode=test_mode,
+                )
+                activity_count += accepted
+                await _mark_activity_chunk_done(redis, run_id, snapshot_id, chunk_id, accepted)
+        else:
+            processed_rows = 0
+            for file_path, _logical_name in activity_members:
+                activity_count += await _process_activity_file(
+                    file_path,
+                    snapshot_id=snapshot_id,
+                    source_type=artifact.source_type,
+                    default_date=artifact.cutoff_month,
+                    test_mode=test_mode,
+                )
+                processed_rows += 1
+                if test_mode and processed_rows >= PARTD_TEST_MAX_ROWS_PER_FILE:
+                    break
 
         processed_rows = 0
         for file_path, _logical_name in pricing_members:
@@ -1360,6 +1591,37 @@ async def _import_artifact(
         return activity_count, pricing_count
 
 
+async def partd_formulary_network_process_chunk(ctx, task=None):  # pragma: no cover
+    task = task or {}
+    run_id = str(task.get("run_id") or "")
+    snapshot_id = str(task.get("snapshot_id") or "")
+    chunk_id = str(task.get("chunk_id") or "")
+    chunk_path = str(task.get("chunk_path") or "")
+    source_type = str(task.get("source_type") or "")
+    cutoff_month = _parse_date(task.get("cutoff_month")) or datetime.date.today().replace(day=1)
+    test_mode = bool(task.get("test_mode"))
+
+    if not snapshot_id or not chunk_id or not chunk_path or not source_type:
+        raise RuntimeError("Part D activity chunk payload missing required fields")
+    path = Path(chunk_path)
+    if not path.exists():
+        raise RuntimeError(f"Part D activity chunk file does not exist: {chunk_path}")
+
+    accepted = await _process_activity_file(
+        path,
+        snapshot_id=snapshot_id,
+        source_type=source_type,
+        default_date=cutoff_month,
+        test_mode=test_mode,
+    )
+
+    redis = ctx.get("redis")
+    if redis is not None and run_id:
+        await _mark_activity_chunk_done(redis, run_id, snapshot_id, chunk_id, accepted)
+
+    return {"ok": True, "chunk_id": chunk_id, "accepted_rows": accepted}
+
+
 async def _upsert_run(payload: dict[str, Any]) -> None:
     await push_objects([payload], PartDImportRun, rewrite=True, use_copy=False)
 
@@ -1373,6 +1635,7 @@ async def partd_formulary_network_start(ctx, task=None):  # pragma: no cover
     run_id = _normalize_run_id(task.get("run_id"))
     import_id = _normalize_import_id(task.get("import_id"))
     test_mode = bool(task.get("test_mode"))
+    redis = ctx.get("redis")
 
     schema = await _ensure_tables()
     await _truncate_stage_tables(schema)
@@ -1448,6 +1711,8 @@ async def partd_formulary_network_start(ctx, task=None):  # pragma: no cover
                 snapshot_id,
                 schema=schema,
                 test_mode=test_mode,
+                redis=redis,
+                run_id=run_id,
             )
             activity_total += activity_count
             pricing_total += pricing_count

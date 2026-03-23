@@ -66,6 +66,7 @@ from process.partd_formulary_network import (
     finish_main as finish_partd_formulary_network,
     main as initiate_partd_formulary_network,
     partd_formulary_network_finalize,
+    partd_formulary_network_process_chunk,
     partd_formulary_network_start,
 )
 from process.pharmacy_license import (
@@ -78,6 +79,30 @@ from process.places_zcta import main as initiate_places_zcta
 from process.places_zcta import process_data as process_places_zcta_data
 from process.places_zcta import shutdown as places_zcta_shutdown
 from process.places_zcta import startup as places_zcta_startup
+from process.lodes import main as initiate_lodes
+from process.lodes import process_data as process_lodes_data
+from process.lodes import shutdown as lodes_shutdown
+from process.lodes import startup as lodes_startup
+from process.medicare_enrollment import main as initiate_medicare_enrollment
+from process.medicare_enrollment import process_data as process_medicare_enrollment_data
+from process.medicare_enrollment import shutdown as medicare_enrollment_shutdown
+from process.medicare_enrollment import startup as medicare_enrollment_startup
+from process.cms_doctors import main as initiate_cms_doctors
+from process.cms_doctors import process_data as process_cms_doctors_data
+from process.cms_doctors import shutdown as cms_doctors_shutdown
+from process.cms_doctors import startup as cms_doctors_startup
+from process.facility_anchors import main as initiate_facility_anchors
+from process.facility_anchors import process_data as process_facility_anchors_data
+from process.facility_anchors import shutdown as facility_anchors_shutdown
+from process.facility_anchors import startup as facility_anchors_startup
+from process.pharmacy_economics import main as initiate_pharmacy_economics
+from process.pharmacy_economics import process_data as process_pharmacy_economics_data
+from process.pharmacy_economics import shutdown as pharmacy_economics_shutdown
+from process.pharmacy_economics import startup as pharmacy_economics_startup
+from process.entity_address_unified import main as initiate_entity_address_unified
+from process.entity_address_unified import process_data as process_entity_address_unified_data
+from process.entity_address_unified import shutdown as entity_address_unified_shutdown
+from process.entity_address_unified import startup as entity_address_unified_startup
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
 
@@ -310,7 +335,7 @@ class ProviderEnrichment_finish:  # pylint: disable=invalid-name
 
 
 class PartDFormularyNetwork:
-    functions = [partd_formulary_network_start]
+    functions = [partd_formulary_network_start, partd_formulary_network_process_chunk]
     on_startup = db_startup
     max_jobs = int(os.environ.get("HLTHPRT_MAX_PARTD_JOBS")) if os.environ.get("HLTHPRT_MAX_PARTD_JOBS") else 4
     queue_read_limit = 2 * max_jobs
@@ -378,6 +403,162 @@ class PlacesZcta_finish:  # pylint: disable=invalid-name
     max_jobs = int(os.environ.get("HLTHPRT_MAX_PLACES_ZCTA_FINISH_JOBS")) if os.environ.get("HLTHPRT_MAX_PLACES_ZCTA_FINISH_JOBS") else 4
     queue_read_limit = 2 * max_jobs
     queue_name = "arq:PlacesZcta_finish"
+    job_timeout = 3600
+    burst = True
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
+class LODES:
+    functions = [process_lodes_data]
+    on_startup = lodes_startup
+    on_shutdown = lodes_shutdown
+    max_jobs = 4
+    queue_read_limit = 8
+    queue_name = "arq:LODES"
+    job_timeout = 86400
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
+class LODES_finish:  # pylint: disable=invalid-name
+    functions = [lodes_shutdown]
+    on_startup = db_startup
+    max_jobs = 4
+    queue_read_limit = 8
+    queue_name = "arq:LODES_finish"
+    job_timeout = 3600
+    burst = True
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
+class MedicareEnrollment:
+    functions = [process_medicare_enrollment_data]
+    on_startup = medicare_enrollment_startup
+    on_shutdown = medicare_enrollment_shutdown
+    max_jobs = 4
+    queue_read_limit = 8
+    queue_name = "arq:MedicareEnrollment"
+    job_timeout = 86400
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
+class MedicareEnrollment_finish:  # pylint: disable=invalid-name
+    functions = [medicare_enrollment_shutdown]
+    on_startup = db_startup
+    max_jobs = 4
+    queue_read_limit = 8
+    queue_name = "arq:MedicareEnrollment_finish"
+    job_timeout = 3600
+    burst = True
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
+class CMSDoctors:
+    functions = [process_cms_doctors_data]
+    on_startup = cms_doctors_startup
+    on_shutdown = cms_doctors_shutdown
+    max_jobs = 4
+    queue_read_limit = 8
+    queue_name = "arq:CMSDoctors"
+    job_timeout = 86400
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
+class CMSDoctors_finish:  # pylint: disable=invalid-name
+    functions = [cms_doctors_shutdown]
+    on_startup = db_startup
+    max_jobs = 4
+    queue_read_limit = 8
+    queue_name = "arq:CMSDoctors_finish"
+    job_timeout = 3600
+    burst = True
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
+class FacilityAnchors:
+    functions = [process_facility_anchors_data]
+    on_startup = facility_anchors_startup
+    on_shutdown = facility_anchors_shutdown
+    max_jobs = 4
+    queue_read_limit = 8
+    queue_name = "arq:FacilityAnchors"
+    job_timeout = 86400
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
+class FacilityAnchors_finish:  # pylint: disable=invalid-name
+    functions = [facility_anchors_shutdown]
+    on_startup = db_startup
+    max_jobs = 4
+    queue_read_limit = 8
+    queue_name = "arq:FacilityAnchors_finish"
+    job_timeout = 3600
+    burst = True
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
+class PharmacyEconomics:
+    functions = [process_pharmacy_economics_data]
+    on_startup = pharmacy_economics_startup
+    on_shutdown = pharmacy_economics_shutdown
+    max_jobs = 4
+    queue_read_limit = 8
+    queue_name = "arq:PharmacyEconomics"
+    job_timeout = 86400
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
+class PharmacyEconomics_finish:  # pylint: disable=invalid-name
+    functions = [pharmacy_economics_shutdown]
+    on_startup = db_startup
+    max_jobs = 4
+    queue_read_limit = 8
+    queue_name = "arq:PharmacyEconomics_finish"
+    job_timeout = 3600
+    burst = True
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
+class EntityAddressUnified:
+    functions = [process_entity_address_unified_data]
+    on_startup = entity_address_unified_startup
+    on_shutdown = entity_address_unified_shutdown
+    max_jobs = 1
+    queue_read_limit = 2
+    queue_name = "arq:EntityAddressUnified"
+    job_timeout = 86400
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
+class EntityAddressUnified_finish:  # pylint: disable=invalid-name
+    functions = [entity_address_unified_shutdown]
+    on_startup = db_startup
+    max_jobs = 1
+    queue_read_limit = 2
+    queue_name = "arq:EntityAddressUnified_finish"
     job_timeout = 3600
     burst = True
     redis_settings = build_redis_settings()
@@ -557,6 +738,42 @@ def places_zcta(test: bool):
     asyncio.run(initiate_places_zcta(test_mode=test))
 
 
+@click.command(help="Run LEHD/LODES workplace aggregate import")
+@click.option("--test", is_flag=True, help="Process a small subset of states for a quick smoke run.")
+def lodes(test: bool):
+    asyncio.run(initiate_lodes(test_mode=test))
+
+
+@click.command(help="Run CMS Medicare Enrollment Dashboard import")
+@click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
+def medicare_enrollment(test: bool):
+    asyncio.run(initiate_medicare_enrollment(test_mode=test))
+
+
+@click.command(help="Run CMS Doctors and Clinicians import")
+@click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
+def cms_doctors(test: bool):
+    asyncio.run(initiate_cms_doctors(test_mode=test))
+
+
+@click.command(help="Run Facility Anchors import (HRSA FQHCs + CMS Hospitals)")
+@click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
+def facility_anchors(test: bool):
+    asyncio.run(initiate_facility_anchors(test_mode=test))
+
+
+@click.command(help="Run Pharmacy Economics import (SDUD + NADAC + FUL margins)")
+@click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
+def pharmacy_economics(test: bool):
+    asyncio.run(initiate_pharmacy_economics(test_mode=test))
+
+
+@click.command(help="Run unified entity-address materialization import")
+@click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
+def entity_address_unified(test: bool):
+    asyncio.run(initiate_entity_address_unified(test_mode=test))
+
+
 @click.command(help="Finish CMS Part D formulary + pharmacy network import for a queued run id")
 @click.option("--import-id", required=True, help="Import id/date suffix used for the run.")
 @click.option("--run-id", required=True, help="Run id emitted by `start partd-formulary-network`.")
@@ -608,6 +825,12 @@ process_group.add_command(partd_formulary_network, name="partd-formulary-network
 process_group.add_command(pharmacy_license, name="pharmacy-license")
 process_group.add_command(places_zcta, name="places-zcta")
 process_group.add_command(provider_enrichment, name="provider-enrichment")
+process_group.add_command(lodes, name="lodes")
+process_group.add_command(medicare_enrollment, name="medicare-enrollment")
+process_group.add_command(cms_doctors, name="cms-doctors")
+process_group.add_command(facility_anchors, name="facility-anchors")
+process_group.add_command(pharmacy_economics, name="pharmacy-economics")
+process_group.add_command(entity_address_unified, name="entity-address-unified")
 process_group.add_command(geo_lookup, name="geo")
 process_group.add_command(geo_census_lookup, name="geo-census")
 process_group.add_command(nucc)

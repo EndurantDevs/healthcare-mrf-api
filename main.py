@@ -35,10 +35,24 @@ asyncio.set_event_loop(asyncio.new_event_loop())
 api = Sanic('mrf-api', env_prefix="HLTHPRT_")
 init_api(api)
 
+
+def _default_api_workers() -> int:
+    raw = os.getenv("HLTHPRT_API_WORKERS", "1")
+    try:
+        return max(int(raw), 1)
+    except (TypeError, ValueError):
+        return 1
+
+
 @click.command(help="Run sanic server")
 @click.option('--host', help='Setup host ip to listen up, default to 0.0.0.0', default='0.0.0.0')
 @click.option('--port', help='Setup port to attach, default to 8080', type=int, default=8080)
-@click.option('--workers', help='Setup workers to run, default to 1', type=int, default=2)
+@click.option(
+    '--workers',
+    help='Setup workers to run, default from HLTHPRT_API_WORKERS or 1',
+    type=int,
+    default=_default_api_workers(),
+)
 @click.option('--debug', help='Enable or disable debugging', is_flag=True)
 @click.option('--accesslog', help='Enable or disable access log', is_flag=True)
 def start(host, port, workers, debug, accesslog):

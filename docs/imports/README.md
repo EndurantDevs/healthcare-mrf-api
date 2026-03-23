@@ -1,6 +1,7 @@
 # Import Processes
 
 This repository has multiple import pipelines. Each command below is a separate operational unit with its own source family and tables.
+For the canonical source website registry, see [../data-sources.md](../data-sources.md).
 
 ## Imports at a Glance
 
@@ -21,6 +22,12 @@ This repository has multiple import pipelines. Each command below is a separate 
 | Provider enrichment | `python main.py start provider-enrichment` | `process.ProviderEnrichment` or `process.ProviderEnrichment_finish` | PECOS / Medicare enrollment sidecar import |
 | Part D formulary network | `python main.py start partd-formulary-network` | `process.PartDFormularyNetwork_finish` worker or `finish partd-formulary-network` | Medicare Part D pharmacy activity and medication cost data |
 | Pharmacy license | `python main.py start pharmacy-license` | `process.PharmacyLicense_finish` worker or `finish pharmacy-license` | State pharmacy board license normalization (direct connectors + machine-readable discovery) |
+| LODES workplace demand | `python main.py start lodes` | shutdown publish in worker | LEHD workplace demand by ZCTA with tract-to-ZIP crosswalk validation |
+| Medicare enrollment | `python main.py start medicare-enrollment` | shutdown publish in worker | county-canonical Medicare enrollment with ZIP allocation |
+| CMS doctors | `python main.py start cms-doctors` | shutdown publish in worker | Medicare doctors and clinicians practice-location coverage |
+| Facility anchors | `python main.py start facility-anchors` | shutdown publish in worker | HRSA FQHC and CMS hospital anchor coverage |
+| Pharmacy economics | `python main.py start pharmacy-economics` | shutdown publish in worker | SDUD + NADAC + FUL state/NDC economics reference |
+| Entity address unified | `python main.py start entity-address-unified` | shutdown publish in worker | unified address/entity materialization from imported provider/facility sources |
 
 ## Per-import Documentation
 - [MRF import](./mrf.md)
@@ -37,6 +44,12 @@ This repository has multiple import pipelines. Each command below is a separate 
 - [Provider enrichment import](./provider-enrichment.md)
 - [Part D formulary and pharmacy network import](./partd-formulary-network.md)
 - [Pharmacy license import](./pharmacy-license.md)
+- [LODES workplace demand import](./lodes.md)
+- [Medicare enrollment import](./medicare-enrollment.md)
+- [CMS doctors import](./cms-doctors.md)
+- [Facility anchors import](./facility-anchors.md)
+- [Pharmacy economics import](./pharmacy-economics.md)
+- [Entity address unified import](./entity-address-unified.md)
 
 ## Shared Operational Rules
 - Use `--test` where supported before large imports.

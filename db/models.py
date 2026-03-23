@@ -181,8 +181,6 @@ class PartDPharmacyActivity(Base, JSONOutputMixin):
     effective_to = Column(DATE)
     source_type = Column(String(16), nullable=False)
     plan_ids = Column(ARRAY(String), nullable=False)
-    contract_ids = Column(ARRAY(String), nullable=False)
-    segment_ids = Column(ARRAY(String), nullable=False)
 
 
 class PartDMedicationCost(Base, JSONOutputMixin):
@@ -234,8 +232,6 @@ class PartDMedicationCost(Base, JSONOutputMixin):
     effective_to = Column(DATE)
     source_type = Column(String(16), nullable=False)
     plan_ids = Column(ARRAY(String), nullable=False)
-    contract_ids = Column(ARRAY(String), nullable=False)
-    segment_ids = Column(ARRAY(String), nullable=False)
 
 
 class PartDPharmacyActivityStage(Base, JSONOutputMixin):
@@ -251,9 +247,7 @@ class PartDPharmacyActivityStage(Base, JSONOutputMixin):
     id = Column(BigInteger, autoincrement=True)
     snapshot_id = Column(String(128), nullable=False)
     npi = Column(BigInteger, nullable=False)
-    plan_id = Column(String(32), nullable=False)
-    contract_id = Column(String(32), nullable=False)
-    segment_id = Column(String(32), nullable=False)
+    plan_ids = Column(ARRAY(String), nullable=False)
     year = Column(Integer)
     medicare_active = Column(Boolean, nullable=False, default=True)
     pharmacy_name = Column(String(256))
@@ -291,8 +285,6 @@ class PartDMedicationCostStage(Base, JSONOutputMixin):
     id = Column(BigInteger, autoincrement=True)
     snapshot_id = Column(String(128), nullable=False)
     plan_id = Column(String(32), nullable=False)
-    contract_id = Column(String(32), nullable=False)
-    segment_id = Column(String(32), nullable=False)
     year = Column(Integer)
     code_system = Column(String(16), nullable=False)
     code = Column(String(64), nullable=False)
@@ -1192,89 +1184,66 @@ class NPIAddress(AddressPrototype):
     __my_initial_indexes__ = [{'index_elements': ('checksum',)}]
 
     __my_additional_indexes__ = [
-        {'index_elements': ('postal_code',)},
-        {'index_elements': ("LEFT(postal_code, 5)",), 'name': 'postal_code_5'},
-        {'index_elements': ('city_name', 'state_name', 'country_code'), 'using': 'gin'},
-        {'index_elements': ('type', 'state_name', 'city_name'), 'name': 'type_state_city'},
+        {'index_elements': ('type', 'npi'), 'name': 'type_npi'},
         {
-            'index_elements': ('city_name', 'state_name', 'npi'),
-            'name': 'primary_city_state_npi',
+            'index_elements': ('state_name', 'city_name', 'npi'),
+            'name': 'primary_state_city_npi',
+            'where': "type='primary'",
+        },
+        {
+            'index_elements': ("LEFT(postal_code, 5)", 'npi'),
+            'name': 'primary_postal_code_5_npi',
+            'where': "type='primary'",
+        },
+        {
+            'index_elements': (
+                "regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g')",
+                'npi',
+            ),
+            'name': 'primary_phone_digits_npi',
             'where': "type='primary'",
         },
         {
             'index_elements': ('npi',),
-            'name': 'primary_with_insurance_npi',
+            'name': 'primary_with_coverage_npi',
             'where': "type='primary' AND NOT (plans_network_array @@ '0'::query_int)",
         },
-        {'index_elements': ('type', "LEFT(postal_code, 5)"), 'name': 'type_postal_code_5'},
         {
-            'index_elements': ("regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g')",),
-            'name': 'telephone_digits',
+            'index_elements': ('taxonomy_array gin__int_ops',),
+            'using': 'gin',
+            'name': 'taxonomy_array',
         },
-        {'index_elements': (
-            'taxonomy_array gin__int_ops',
-            'plans_network_array gin__int_ops'),
+        {
+            'index_elements': ('plans_network_array gin__int_ops',),
             'using': 'gin',
-            'name': 'taxonomy_plans_network'},
-        {'index_elements': (
-            'procedures_array gin__int_ops',
-        ),
+            'name': 'plans_network_array',
+        },
+        {
+            'index_elements': ('procedures_array gin__int_ops',),
             'using': 'gin',
-            'name': 'procedures_array'},
-        {'index_elements': (
-            'medications_array gin__int_ops',
-        ),
+            'name': 'procedures_array',
+        },
+        {
+            'index_elements': ('medications_array gin__int_ops',),
             'using': 'gin',
-            'name': 'medications_array'},
-        {'index_elements': (
-            'taxonomy_array gin__int_ops',
-            'plans_network_array gin__int_ops',
-            'procedures_array gin__int_ops',
-        ),
-            'using': 'gin',
-            'name': 'taxonomy_plans_procedures'},
-        {'index_elements': (
+            'name': 'medications_array',
+        },
+        {
+            'index_elements': (
             'taxonomy_array gin__int_ops',
             'plans_network_array gin__int_ops',
-            'medications_array gin__int_ops',
         ),
             'using': 'gin',
-            'name': 'taxonomy_plans_medications'},
-        {'index_elements': (
-            'telephone_number',
-            'taxonomy_array gin__int_ops',
-            'type',
-            'npi'
+            'name': 'taxonomy_plans_network',
+        },
+        {
+            'index_elements': (
+                'Geography(ST_MakePoint((long)::double precision, (lat)::double precision))',
             ),
-            'using': 'gin',
-            'name': 'phone_taxonomy_type_npi'},
-        {'index_elements': (
-            'taxonomy_array gin__int_ops',
-            'telephone_number',
-            'plans_network_array gin__int_ops',
-        ),
-            'using': 'gin',
-            'name': 'plans_network_taxonomy_phone'},
-        {'index_elements': (
-        'Geography(ST_MakePoint((long)::double precision, (lat)::double precision))', 'taxonomy_array gist__intbig_ops', 'plans_network_array gist__intbig_ops'),
             'using': 'gist',
-            'name': 'geo_index_with_taxonomy_and_plans','where': "type='primary' or type='secondary'"},
-        {'index_elements': (
-        'Geography(ST_MakePoint((long)::double precision, (lat)::double precision))', 'taxonomy_array gist__intbig_ops', 'plans_network_array gist__intbig_ops', 'procedures_array gist__intbig_ops'),
-            'using': 'gist',
-            'name': 'geo_index_with_taxonomy_plans_and_procedures','where': "type='primary' or type='secondary'"},
-        {'index_elements': (
-        'Geography(ST_MakePoint((long)::double precision, (lat)::double precision))', 'taxonomy_array gist__intbig_ops', 'plans_network_array gist__intbig_ops', 'medications_array gist__intbig_ops'),
-            'using': 'gist',
-            'name': 'geo_index_with_taxonomy_plans_and_medications','where': "type='primary' or type='secondary'"},
-        {'index_elements': (
-        'Geography(ST_MakePoint((long)::double precision, (lat)::double precision))', 'procedures_array gist__intbig_ops', 'plans_network_array gist__intbig_ops', 'taxonomy_array gist__intbig_ops',),
-            'using': 'gist',
-            'name': 'geo_index_with_taxonomy_plans_and_medications','where': "type='primary' or type='secondary'"},
-        {'index_elements': (
-        'Geography(ST_MakePoint((long)::double precision, (lat)::double precision))', 'medications_array gist__intbig_ops', 'plans_network_array gist__intbig_ops', 'taxonomy_array gist__intbig_ops',),
-            'using': 'gist',
-            'name': 'geo_index_with_taxonomy_plans_and_medications','where': "type='primary' or type='secondary'"},
+            'name': 'geo_idx',
+            'where': "type='primary' OR type='secondary'",
+        },
     ]
 
     npi = Column(Integer, primary_key=True)
@@ -2594,4 +2563,209 @@ class CodeCrosswalk(Base, JSONOutputMixin):
     match_type = Column(String(32))
     confidence = Column(Numeric(scale=4, precision=6, asdecimal=False, decimal_return_scale=None))
     source = Column(String(128))
+    updated_at = Column(DateTime)
+
+
+class LODESWorkplaceAggregate(Base, JSONOutputMixin):
+    __tablename__ = "lodes_workplace_aggregate"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("zcta_code", "year"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["zcta_code", "year"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("year", "zcta_code"), "name": "lodes_year_zcta_idx"},
+    ]
+
+    zcta_code = Column(String(5), nullable=False)
+    total_workers = Column(Integer, nullable=False, default=0)
+    year = Column(Integer, nullable=False)
+    updated_at = Column(DateTime)
+
+
+class MedicareEnrollmentCountyStats(Base, JSONOutputMixin):
+    __tablename__ = "medicare_enrollment_county_stats"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("county_fips", "year"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["county_fips", "year"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("year", "county_fips"), "name": "medicare_county_year_fips_idx"},
+    ]
+
+    county_fips = Column(String(5), nullable=False)
+    year = Column(Integer, nullable=False)
+    part_d_beneficiaries = Column(Integer, nullable=False, default=0)
+    total_beneficiaries = Column(Integer, nullable=False, default=0)
+    updated_at = Column(DateTime)
+
+
+class MedicareEnrollmentStats(Base, JSONOutputMixin):
+    __tablename__ = "medicare_enrollment_stats"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("zcta_code", "year"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["zcta_code", "year"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("year", "zcta_code"), "name": "medicare_zip_year_zcta_idx"},
+    ]
+
+    zcta_code = Column(String(5), nullable=False)
+    year = Column(Integer, nullable=False)
+    part_d_beneficiaries = Column(Integer, nullable=False, default=0)
+    total_beneficiaries = Column(Integer, nullable=False, default=0)
+    updated_at = Column(DateTime)
+
+
+class DoctorClinicianAddress(Base, JSONOutputMixin):
+    __tablename__ = "doctor_clinician_address"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("npi", "address_checksum"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["npi", "address_checksum"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("zip_code", "provider_type"), "name": "zip_provider_type"},
+        {"index_elements": ("zip_code",), "name": "zip"},
+        {"index_elements": ("state", "city"), "name": "state_city"},
+        {"index_elements": ("provider_type",), "name": "provider_type"},
+    ]
+
+    npi = Column(BigInteger, nullable=False)
+    address_checksum = Column(Integer, nullable=False)
+    address_line1 = Column(String(256))
+    address_line2 = Column(String(256))
+    city = Column(String(128))
+    state = Column(String(2))
+    zip_code = Column(String(16))
+    provider_type = Column(String(128))
+    latitude = Column(Float)
+    longitude = Column(Float)
+    updated_at = Column(DateTime)
+
+
+class FacilityAnchor(Base, JSONOutputMixin):
+    __tablename__ = "facility_anchor"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["id"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("facility_type", "latitude", "longitude"), "name": "type_geo"},
+        {"index_elements": ("state", "zip_code", "facility_type"), "name": "state_zip_type"},
+    ]
+
+    id = Column(String(128), nullable=False)
+    name = Column(String(256), nullable=False)
+    facility_type = Column(String(64), nullable=False)
+    address_line1 = Column(String(256))
+    city = Column(String(128))
+    state = Column(String(2))
+    zip_code = Column(String(16))
+    latitude = Column(Float)
+    longitude = Column(Float)
+    source_dataset = Column(String(64), nullable=False)
+    updated_at = Column(DateTime)
+
+
+class EntityAddressUnified(Base, JSONOutputMixin):
+    __tablename__ = "entity_address_unified"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("entity_type", "entity_id", "type", "checksum"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["entity_type", "entity_id", "type", "checksum"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("npi",), "name": "npi"},
+        {"index_elements": ("inferred_npi",), "name": "inferred_npi"},
+        {"index_elements": ("coalesce(npi, inferred_npi)",), "name": "coalesced_npi"},
+        {"index_elements": ("entity_type", "coalesce(npi, inferred_npi)"), "name": "entity_type_coalesced_npi"},
+        {"index_elements": ("type", "state_name", "city_name"), "name": "type_state_city"},
+        {"index_elements": ("LEFT(postal_code, 5)",), "name": "postal_code_5"},
+        {"index_elements": ("address_sources",), "using": "gin", "name": "address_sources"},
+        {
+            "index_elements": ("taxonomy_array gin__int_ops", "plans_network_array gin__int_ops"),
+            "using": "gin",
+            "name": "taxonomy_plans_network",
+        },
+        {"index_elements": ("procedures_array gin__int_ops",), "using": "gin", "name": "procedures_array"},
+        {"index_elements": ("medications_array gin__int_ops",), "using": "gin", "name": "medications_array"},
+        {
+            "index_elements": ("Geography(ST_MakePoint((long)::double precision, (lat)::double precision))",),
+            "using": "gist",
+            "name": "geo_idx",
+            "where": "type='primary' OR type='secondary' OR type='practice' OR type='site'",
+        },
+    ]
+
+    entity_type = Column(String(64), nullable=False)
+    entity_id = Column(String(128), nullable=False)
+    npi = Column(BigInteger)
+    inferred_npi = Column(BigInteger)
+    inference_confidence = Column(Float)
+    inference_method = Column(String(64))
+    entity_name = Column(String(256))
+    entity_subtype = Column(String(64))
+    source_count = Column(Integer, nullable=False, server_default="0")
+    multi_source_confirmed = Column(Boolean, nullable=False, server_default="false")
+    address_sources = Column(ARRAY(String), nullable=False, server_default=text("'{}'::varchar[]"))
+    source_record_ids = Column(ARRAY(String), nullable=False, server_default=text("'{}'::varchar[]"))
+
+    checksum = Column(Integer, nullable=False)
+    type = Column(String(32), nullable=False)
+    taxonomy_array = Column(ARRAY(Integer), nullable=False, server_default="{0}")
+    plans_network_array = Column(ARRAY(Integer), nullable=False, server_default="{0}")
+    procedures_array = Column(ARRAY(Integer), nullable=False, server_default="{0}")
+    medications_array = Column(ARRAY(Integer), nullable=False, server_default="{0}")
+
+    first_line = Column(String)
+    second_line = Column(String)
+    city_name = Column(String)
+    state_name = Column(String)
+    postal_code = Column(String)
+    country_code = Column(String)
+    telephone_number = Column(String)
+    fax_number = Column(String)
+    formatted_address = Column(String)
+    lat = Column(Numeric(scale=8, precision=11, asdecimal=False, decimal_return_scale=None))
+    long = Column(Numeric(scale=8, precision=11, asdecimal=False, decimal_return_scale=None))
+    date_added = Column(DATE)
+    place_id = Column(String)
+    updated_at = Column(DateTime)
+
+
+class PharmacyEconomicsSummary(Base, JSONOutputMixin):
+    __tablename__ = "pharmacy_economics_summary"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("state", "ndc11"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["state", "ndc11"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("state", "sdud_volume DESC"), "name": "state_sdud_volume_desc"},
+        {
+            "index_elements": ("state", "estimated_gross_margin"),
+            "name": "state_margin",
+            "where": "estimated_gross_margin IS NOT NULL",
+        },
+    ]
+
+    state = Column(String(2), nullable=False)
+    ndc11 = Column(String(16), nullable=False)
+    drug_name = Column(String(256))
+    sdud_volume = Column(Integer, nullable=False, default=0)
+    nadac_per_unit = Column(Float)
+    ful_per_unit = Column(Float)
+    medicaid_dispensing_fee = Column(Float)
+    estimated_gross_margin = Column(Float)
     updated_at = Column(DateTime)

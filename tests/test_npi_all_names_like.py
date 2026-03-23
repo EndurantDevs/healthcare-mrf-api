@@ -44,6 +44,66 @@ class FakeAcquire:
 
 
 @pytest.mark.asyncio
+async def test_get_all_include_total_false_skips_count_query(monkeypatch):
+    conn = RecordingConnection()
+    monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
+
+    request = types.SimpleNamespace(
+        args={
+            "classification": "Pharmacy",
+            "limit": "5",
+            "start": "10",
+            "include_total": "0",
+        }
+    )
+    resp = await get_all(request)
+    data = json.loads(resp.body)
+
+    assert conn.calls == 1
+    assert data["total"] == 10
+    assert data["total_source"] == "estimated_page_floor"
+
+
+@pytest.mark.asyncio
+async def test_get_all_sitemap_mode_allows_20000_limit(monkeypatch):
+    class SitemapConnection:
+        def __init__(self):
+            self.calls = 0
+            self.last_params = None
+
+        async def all(self, _sql, **params):
+            self.calls += 1
+            self.last_params = params
+            return []
+
+    conn = SitemapConnection()
+    monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
+    async def fake_npi_list(*_args, **_kwargs):
+        return list(range(1_000_000_000, 1_000_030_000))
+    monkeypatch.setattr(
+        npi_module,
+        "_get_classification_npi_list",
+        fake_npi_list,
+    )
+
+    request = types.SimpleNamespace(
+        args={
+            "classification": "Pharmacy",
+            "view": "sitemap",
+            "limit": "20000",
+            "start": "0",
+            "include_total": "0",
+        }
+    )
+    resp = await get_all(request)
+    data = json.loads(resp.body)
+
+    assert data["limit"] == 20000
+    assert conn.calls == 1
+    assert len(conn.last_params["page_npis"]) == 20000
+
+
+@pytest.mark.asyncio
 async def test_get_all_q_filter(monkeypatch):
     conn = RecordingConnection()
     monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))

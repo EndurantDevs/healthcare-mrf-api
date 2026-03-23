@@ -45,6 +45,15 @@ def _parse_geo_point(value):
     return lat, lon
 
 
+def _normalize_county_code(value):
+    if value in (None, ""):
+        return None
+    digits = "".join(ch for ch in str(value).strip() if ch.isdigit())
+    if not digits:
+        return None
+    return digits[-5:].rjust(5, "0")
+
+
 async def _flush_rows(rows: List[Dict]):
     if not rows:
         return
@@ -85,7 +94,7 @@ async def load_geo_lookup(source_file: Path | None = None):
             state = (row.get("Official USPS State Code") or "").strip().upper()
             state_name = (row.get("Official State Name") or "").strip()
             county_name = (row.get("Primary Official County Name") or "").strip()
-            county_code = (row.get("Primary Official County Code") or "").strip()
+            county_code = _normalize_county_code(row.get("Primary Official County Code"))
             timezone = (row.get("Timezone") or "").strip()
             population = _parse_population(row.get("Population"))
             lat, lon = _parse_geo_point(row.get("Geo Point"))

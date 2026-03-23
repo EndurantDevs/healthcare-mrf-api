@@ -5,6 +5,10 @@ Last updated: 2026-02-17
 This document keeps the canonical CMS source list used by `healthcare-mrf-api` for treatment-cost
 planning features (provider procedures, drug claims, pricing context, and supporting code systems).
 
+For the full cross-import source registry (beyond treatment-cost scope), see:
+- `specs/data_source_registry.md`
+- `docs/data-sources.md`
+
 ## Primary Claims Sources (core for cost/rating logic)
 
 - Medicare Physician & Other Practitioners - by Provider and Service  
