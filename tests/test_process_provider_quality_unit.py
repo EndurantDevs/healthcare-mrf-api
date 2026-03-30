@@ -229,6 +229,37 @@ async def test_process_chunk_passes_test_mode_to_loader(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_load_qpp_rows_parses_real_cms_field_names(monkeypatch, tmp_path):
+    csv_path = tmp_path / "qpp_real_headers.csv"
+    csv_path.write_text(
+        (
+            "Clinician_NPI,Performance_Year,Quality_category_score,"
+            "Cost_category_score,final_MIPS_score\n"
+            "1234567890,2024,91.5,82.0,88.25\n"
+        ),
+        encoding="utf-8",
+    )
+
+    captured: list[dict[str, object]] = []
+
+    async def _capture_push(rows, _cls, **_kwargs):
+        captured.extend(rows)
+
+    monkeypatch.setattr(provider_quality, "_push_objects_with_retry", _capture_push)
+
+    fake_cls = type("QppStage", (), {"__tablename__": "pricing_qpp_provider_stage"})
+    await provider_quality._load_qpp_rows(str(csv_path), fake_cls, 2024, test_mode=False)
+
+    assert len(captured) == 1
+    row = captured[0]
+    assert row["npi"] == 1234567890
+    assert row["year"] == 2024
+    assert row["quality_score"] == 91.5
+    assert row["cost_score"] == 82.0
+    assert row["final_score"] == 88.25
+
+
+@pytest.mark.asyncio
 async def test_materialize_query_contains_state_benchmark_and_extra_measures(monkeypatch):
     statements: list[str] = []
 
@@ -285,7 +316,12 @@ async def test_materialize_cohort_query_contains_lsh_and_fallback_rules(monkeypa
     await provider_quality._materialize_quality_rows_cohort(classes, "mrf", "run_test")
 
     materialize_sql = "\n".join(statements)
-    assert "taxonomy_ranked AS (" in materialize_sql
+    assert "taxonomy_choice AS (" in materialize_sql
+    assert "provider_enrichment_choice AS (" in materialize_sql
+    assert "doctor_address_choice AS (" in materialize_sql
+    assert "unified_address_choice AS (" in materialize_sql
+    assert "npi_address_choice AS (" in materialize_sql
+    assert "FROM mrf.doctor_clinician_address" not in materialize_sql
     assert "signatures AS (" in materialize_sql
     assert "bands AS (" in materialize_sql
     assert "cohort_expanded AS (" in materialize_sql
@@ -296,6 +332,8 @@ async def test_materialize_cohort_query_contains_lsh_and_fallback_rules(monkeypa
     assert "COALESCE(c.procedure_bucket, 'bucket:none')::varchar AS procedure_bucket" in materialize_sql
     assert "COALESCE(c.specialty, 'unknown')::varchar AS specialty" in materialize_sql
     assert "COALESCE(c.taxonomy, 'unknown')::varchar AS taxonomy" in materialize_sql
+    assert "ON cm.npi = b.npi" in materialize_sql
+    assert "ON cm.npi = c.npi" in materialize_sql
     assert "WHEN bm.benchmark_mode = 'zip'" in materialize_sql
     assert "({peer_scope_expr} = 'zip'" not in materialize_sql
     assert "CASE WHEN c.threshold_met THEN 0 ELSE 1 END" in materialize_sql

@@ -297,6 +297,18 @@ async def test_get_pricing_provider_score_success():
                         "specialty_key": "__all__",
                         "taxonomy_code": None,
                         "procedure_bucket": "__all__",
+                        "score_method": "direct",
+                        "confidence_0_100": 91.0,
+                        "confidence_band": "high",
+                        "cost_source": "direct",
+                        "data_coverage_0_100": 87.0,
+                        "provider_class": "clinician",
+                        "location_source": "doctor_clinician_address",
+                        "has_claims": True,
+                        "has_qpp": True,
+                        "has_rx": False,
+                        "has_enrollment": True,
+                        "has_medicare_claims": True,
                     },
                     {
                         "npi": 1003000126,
@@ -388,6 +400,14 @@ async def test_get_pricing_provider_score_success():
     assert payload["borderline_status"] is False
     assert payload["score_0_100"] == 72.4
     assert payload["estimated_cost_level"] == "$$"
+    assert payload["score_method"] == "direct"
+    assert payload["confidence_0_100"] == 91.0
+    assert payload["confidence_band"] == "high"
+    assert payload["cost_source"] == "direct"
+    assert payload["provider_class"] == "clinician"
+    assert payload["evidence_profile"]["has_claims"] is True
+    assert payload["evidence_profile"]["has_qpp"] is True
+    assert payload["evidence_profile"]["location_source"] == "doctor_clinician_address"
     assert payload["overall"]["risk_ratio_point"] == 0.91
     assert payload["overall"]["ci_75"]["low"] == 0.86
     assert payload["domains"]["appropriateness"]["risk_ratio_point"] == 0.93
@@ -547,6 +567,10 @@ async def test_get_pricing_provider_score_live_override_path():
     assert payload["cohort_context"]["specialty_key"] == "cardiology"
     assert payload["cohort_context"]["taxonomy_code"] == "207RC0000X"
     assert payload["cohort_context"]["procedure_match_threshold"] == 0.3
+    assert payload["score_method"] == "direct"
+    assert payload["confidence_band"] == "high"
+    assert payload["cost_source"] == "direct"
+    assert payload["evidence_profile"]["has_claims"] is True
 
 
 @pytest.mark.asyncio
@@ -659,6 +683,137 @@ async def test_get_pricing_provider_score_live_override_all_modes_when_benchmark
     assert payload["scores_by_benchmark_mode"]["state"] is not None
     assert payload["scores_by_benchmark_mode"]["national"] is not None
     assert payload["cohort_context"]["computed_live"] is True
+
+
+@pytest.mark.asyncio
+async def test_get_pricing_provider_score_estimated_fallback(monkeypatch):
+    async def _fake_profile(_session, *, npi, year):
+        assert npi == 1003000126
+        assert year == 2023
+        return {
+            "npi": npi,
+            "specialty_key": "cardiology",
+            "taxonomy_code": "207RC0000X",
+            "zip5": "20850",
+            "state_key": "MD",
+            "provider_class": "clinician",
+            "location_source": "doctor_clinician_address",
+            "has_enrollment": True,
+            "has_medicare_claims": False,
+        }
+
+    async def _fake_estimated_modes(_session, **_kwargs):
+        return {
+            "zip": pricing_module._build_quality_mode_payload(
+                {
+                    "model_version": "v2",
+                    "benchmark_mode": "zip",
+                    "tier": "acceptable",
+                    "borderline_status": False,
+                    "score_0_100": 57.4,
+                    "estimated_cost_level": "$$$",
+                    "score_method": "estimated",
+                    "confidence_0_100": 43.0,
+                    "confidence_band": "low",
+                    "cost_source": "peer_estimated",
+                    "data_coverage_0_100": 46.0,
+                    "provider_class": "clinician",
+                    "location_source": "doctor_clinician_address",
+                    "has_claims": False,
+                    "has_qpp": False,
+                    "has_rx": False,
+                    "has_enrollment": True,
+                    "has_medicare_claims": False,
+                    "risk_ratio_point": 0.94,
+                    "ci75_low": 0.88,
+                    "ci75_high": 1.01,
+                    "ci90_low": 0.84,
+                    "ci90_high": 1.05,
+                    "low_score_threshold_failed": False,
+                    "low_confidence_threshold_failed": False,
+                    "high_score_threshold_passed": False,
+                    "high_confidence_threshold_passed": False,
+                },
+                pricing_module._empty_domains_payload(),
+                cohort_context={
+                    "selected_geography": "zip:20850",
+                    "selected_cohort_level": None,
+                    "peer_count": 84,
+                    "specialty_key": "cardiology",
+                    "taxonomy_code": "207RC0000X",
+                    "procedure_bucket": None,
+                    "computed_live": False,
+                    "procedure_match_threshold": None,
+                },
+            ),
+            "state": None,
+            "national": None,
+        }
+
+    monkeypatch.setattr(pricing_module, "_load_provider_quality_profile", _fake_profile)
+    monkeypatch.setattr(pricing_module, "_load_estimated_quality_modes", _fake_estimated_modes)
+
+    request = make_request(
+        [
+            FakeResult(scalar="mrf.pricing_provider_quality_score"),
+            FakeResult(scalar="mrf.pricing_provider_quality_domain"),
+            FakeResult(rows=[]),
+        ],
+        args={"year": "2023"},
+    )
+
+    response = await get_pricing_provider_score(request, "1003000126")
+    payload = json.loads(response.body)
+    assert payload["benchmark_mode"] == "zip"
+    assert payload["score_method"] == "estimated"
+    assert payload["confidence_band"] == "low"
+    assert payload["cost_source"] == "peer_estimated"
+    assert payload["available_benchmark_modes"] == ["zip"]
+    assert payload["cohort_context"]["selected_geography"] == "zip:20850"
+    assert payload["evidence_profile"]["has_claims"] is False
+    assert payload["evidence_profile"]["has_enrollment"] is True
+
+
+@pytest.mark.asyncio
+async def test_get_pricing_provider_score_unavailable_when_profile_is_insufficient(monkeypatch):
+    async def _fake_profile(_session, *, npi, year):
+        assert npi == 1003000126
+        assert year == 2023
+        return {
+            "npi": npi,
+            "specialty_key": None,
+            "taxonomy_code": None,
+            "zip5": None,
+            "state_key": None,
+            "provider_class": "unknown",
+            "location_source": "unknown",
+            "has_enrollment": False,
+            "has_medicare_claims": False,
+        }
+
+    async def _unexpected_estimated_modes(_session, **_kwargs):
+        raise AssertionError("estimated cohort lookup should not run for insufficient profiles")
+
+    monkeypatch.setattr(pricing_module, "_load_provider_quality_profile", _fake_profile)
+    monkeypatch.setattr(pricing_module, "_load_estimated_quality_modes", _unexpected_estimated_modes)
+
+    request = make_request(
+        [
+            FakeResult(scalar="mrf.pricing_provider_quality_score"),
+            FakeResult(scalar="mrf.pricing_provider_quality_domain"),
+            FakeResult(rows=[]),
+        ],
+        args={"year": "2023"},
+    )
+
+    response = await get_pricing_provider_score(request, "1003000126")
+    payload = json.loads(response.body)
+    assert payload["score_method"] == "unavailable"
+    assert payload["tier"] is None
+    assert payload["score_0_100"] is None
+    assert "missing_specialty_or_taxonomy" in payload["unavailable_reasons"]
+    assert "missing_geography" in payload["unavailable_reasons"]
+    assert payload["available_benchmark_modes"] == []
 
 
 @pytest.mark.asyncio
