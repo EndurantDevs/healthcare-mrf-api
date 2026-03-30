@@ -19,7 +19,9 @@ from sqlalchemy import (Column, Float, Integer, MetaData, String, Table, and_, c
 from api.endpoint.pagination import parse_pagination
 from db.models import (CodeCatalog, CodeCrosswalk, PricingProcedure,
                        PricingProcedureGeoBenchmark,
-                       GeoZipLookup, NPIData, ProviderEnrichmentSummary,
+                       DoctorClinicianAddress, EntityAddressUnified,
+                       GeoZipLookup, NPIAddress, NPIData, NPIDataTaxonomy,
+                       NUCCTaxonomy, ProviderEnrichmentSummary,
                        PricingPrescription, PricingProvider,
                        PricingProviderPrescription,
                        PricingProviderProcedure,
@@ -47,6 +49,7 @@ npi_data_table = NPIData.__table__
 
 QUALITY_SCORE_TABLE_NAME = "pricing_provider_quality_score"
 QUALITY_DOMAIN_TABLE_NAME = "pricing_provider_quality_domain"
+QUALITY_FEATURE_TABLE_NAME = "pricing_provider_quality_feature"
 QUALITY_PEER_TARGET_TABLE_NAME = "pricing_provider_quality_peer_target"
 QUALITY_QPP_TABLE_NAME = "pricing_qpp_provider"
 QUALITY_SVI_TABLE_NAME = "pricing_svi_zcta"
@@ -83,12 +86,92 @@ def _env_flag(*names: str, default: bool = False) -> bool:
     return default
 
 
+_US_STATE_NAME_TO_CODE = {
+    "ALABAMA": "AL",
+    "ALASKA": "AK",
+    "ARIZONA": "AZ",
+    "ARKANSAS": "AR",
+    "CALIFORNIA": "CA",
+    "COLORADO": "CO",
+    "CONNECTICUT": "CT",
+    "DELAWARE": "DE",
+    "DISTRICT OF COLUMBIA": "DC",
+    "FLORIDA": "FL",
+    "GEORGIA": "GA",
+    "HAWAII": "HI",
+    "IDAHO": "ID",
+    "ILLINOIS": "IL",
+    "INDIANA": "IN",
+    "IOWA": "IA",
+    "KANSAS": "KS",
+    "KENTUCKY": "KY",
+    "LOUISIANA": "LA",
+    "MAINE": "ME",
+    "MARYLAND": "MD",
+    "MASSACHUSETTS": "MA",
+    "MICHIGAN": "MI",
+    "MINNESOTA": "MN",
+    "MISSISSIPPI": "MS",
+    "MISSOURI": "MO",
+    "MONTANA": "MT",
+    "NEBRASKA": "NE",
+    "NEVADA": "NV",
+    "NEW HAMPSHIRE": "NH",
+    "NEW JERSEY": "NJ",
+    "NEW MEXICO": "NM",
+    "NEW YORK": "NY",
+    "NORTH CAROLINA": "NC",
+    "NORTH DAKOTA": "ND",
+    "OHIO": "OH",
+    "OKLAHOMA": "OK",
+    "OREGON": "OR",
+    "PENNSYLVANIA": "PA",
+    "RHODE ISLAND": "RI",
+    "SOUTH CAROLINA": "SC",
+    "SOUTH DAKOTA": "SD",
+    "TENNESSEE": "TN",
+    "TEXAS": "TX",
+    "UTAH": "UT",
+    "VERMONT": "VT",
+    "VIRGINIA": "VA",
+    "WASHINGTON": "WA",
+    "WEST VIRGINIA": "WV",
+    "WISCONSIN": "WI",
+    "WYOMING": "WY",
+    "PUERTO RICO": "PR",
+    "GUAM": "GU",
+    "AMERICAN SAMOA": "AS",
+    "NORTHERN MARIANA ISLANDS": "MP",
+    "COMMONWEALTH OF THE NORTHERN MARIANA ISLANDS": "MP",
+    "US VIRGIN ISLANDS": "VI",
+    "U.S. VIRGIN ISLANDS": "VI",
+    "VIRGIN ISLANDS": "VI",
+}
+
+
+def _state_code_sql(expr: str) -> str:
+    normalized = f"UPPER(NULLIF(BTRIM(COALESCE({expr}, '')), ''))"
+    mapping_cases = "\n".join(
+        f"            WHEN {normalized} = '{name}' THEN '{code}'"
+        for name, code in _US_STATE_NAME_TO_CODE.items()
+    )
+    return f"""
+        CASE
+            WHEN {normalized} IS NULL THEN NULL
+            WHEN LENGTH({normalized}) = 2 THEN {normalized}
+{mapping_cases}
+            ELSE NULL
+        END
+    """
+
+
 ENABLE_PRICING_SCHEMA_CACHE = _env_flag(
     "HLTHPRT_ENABLE_PRICING_SCHEMA_CACHE",
     "HLTHPRT_ENABLE_SCHEMA_CACHE",
 )
 _PRICING_SCHEMA_CACHE_TTL_SECONDS = 300.0
 _PRICING_TABLE_EXISTS_CACHE: dict[str, tuple[float, bool]] = {}
+_PRICING_TABLE_COLUMNS_CACHE: dict[str, tuple[float, tuple[str, ...]]] = {}
 
 
 def _parse_pricing_default_year() -> int | None:
@@ -1238,6 +1321,33 @@ async def _table_exists(session, table_name: str) -> bool:
     return exists
 
 
+async def _table_columns(session, table_name: str) -> set[str]:
+    qualified_name = table_name if "." in table_name else f"{PRICING_SCHEMA}.{table_name}"
+    schema_name, simple_name = qualified_name.split(".", 1)
+    if ENABLE_PRICING_SCHEMA_CACHE:
+        cached = _PRICING_TABLE_COLUMNS_CACHE.get(qualified_name)
+        if cached is not None:
+            cached_at, cached_columns = cached
+            if (time.monotonic() - cached_at) <= _PRICING_SCHEMA_CACHE_TTL_SECONDS:
+                return set(cached_columns)
+            _PRICING_TABLE_COLUMNS_CACHE.pop(qualified_name, None)
+    result = await session.execute(
+        text(
+            """
+            SELECT column_name
+              FROM information_schema.columns
+             WHERE table_schema = :schema_name
+               AND table_name = :table_name
+            """
+        ),
+        {"schema_name": schema_name, "table_name": simple_name},
+    )
+    columns = tuple(str(row[0]).strip() for row in result.fetchall() if row and row[0])
+    if ENABLE_PRICING_SCHEMA_CACHE:
+        _PRICING_TABLE_COLUMNS_CACHE[qualified_name] = (time.monotonic(), columns)
+    return set(columns)
+
+
 def _as_bool(value: Any) -> bool | None:
     if value is None:
         return None
@@ -1338,6 +1448,7 @@ def _build_quality_mode_payload(
     domains_payload: dict[str, Any],
     cohort_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    evidence_profile = _build_quality_evidence_profile(score_data, cohort_context)
     payload = {
         "model_version": str(score_data.get("model_version") or "v2"),
         "benchmark_mode": score_data.get("benchmark_mode"),
@@ -1345,6 +1456,14 @@ def _build_quality_mode_payload(
         "borderline_status": _as_bool(score_data.get("borderline_status")),
         "score_0_100": _as_float(score_data.get("score_0_100")),
         "estimated_cost_level": score_data.get("estimated_cost_level"),
+        "score_method": score_data.get("score_method"),
+        "confidence_0_100": _as_float(score_data.get("confidence_0_100")),
+        "confidence_band": score_data.get("confidence_band"),
+        "cost_source": score_data.get("cost_source"),
+        "data_coverage_0_100": _as_float(score_data.get("data_coverage_0_100")),
+        "provider_class": _normalize_provider_class(score_data.get("provider_class")),
+        "evidence_profile": evidence_profile,
+        "unavailable_reasons": list(score_data.get("unavailable_reasons") or []),
         "overall": {
             "risk_ratio_point": _as_float(score_data.get("risk_ratio_point")),
             "ci_75": _ci_payload(score_data.get("ci75_low"), score_data.get("ci75_high")),
@@ -1406,13 +1525,30 @@ def _cohort_context_from_score_row(
     if isinstance(context_raw, dict):
         context = dict(context_raw)
     else:
+        selected_scope = _normalize_peer_geography_scope(
+            score_data.get("cohort_geography_scope")
+            or score_data.get("cohort_geo_scope")
+        )
+        selected_value = (
+            score_data.get("cohort_geography_value")
+            or score_data.get("cohort_geo_value")
+        )
         context = {
-            "selected_geography": score_data.get("selected_geography"),
-            "selected_cohort_level": score_data.get("selected_cohort_level"),
-            "peer_count": score_data.get("peer_count"),
-            "specialty_key": score_data.get("specialty_key"),
-            "taxonomy_code": score_data.get("taxonomy_code"),
-            "procedure_bucket": score_data.get("procedure_bucket"),
+            "selected_geography": score_data.get("selected_geography")
+            or _selected_geography_label(selected_scope, selected_value),
+            "selected_cohort_level": score_data.get("selected_cohort_level")
+            or score_data.get("cohort_level")
+            or score_data.get("cohort_tier"),
+            "peer_count": score_data.get("peer_count")
+            or score_data.get("cohort_peer_n"),
+            "specialty_key": score_data.get("specialty_key")
+            or score_data.get("cohort_specialty_key")
+            or score_data.get("cohort_specialty"),
+            "taxonomy_code": score_data.get("taxonomy_code")
+            or score_data.get("cohort_taxonomy_code")
+            or score_data.get("cohort_taxonomy"),
+            "procedure_bucket": score_data.get("procedure_bucket")
+            or score_data.get("cohort_procedure_bucket"),
             "procedure_match_threshold": score_data.get("procedure_match_threshold"),
         }
         if not any(value is not None for value in context.values()):
@@ -1434,6 +1570,177 @@ def _cohort_context_from_score_row(
     context["procedure_bucket"] = str(procedure_bucket).strip() if procedure_bucket not in (None, "") else None
     context["computed_live"] = bool(computed_live)
     return context
+
+
+def _normalize_provider_class(raw: Any) -> str | None:
+    text = str(raw or "").strip().lower()
+    return text or None
+
+
+def _selected_geography_label(scope: str | None, value: Any) -> str | None:
+    normalized_scope = _normalize_peer_geography_scope(scope)
+    value_text = str(value or "").strip()
+    if normalized_scope == "national":
+        return "national"
+    if normalized_scope in {"zip", "state"} and value_text:
+        return f"{normalized_scope}:{value_text}"
+    return value_text or None
+
+
+def _build_quality_evidence_profile(
+    score_data: dict[str, Any],
+    cohort_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    context = cohort_context if isinstance(cohort_context, dict) else None
+    location_source = str(score_data.get("location_source") or "").strip() or None
+    cohort_level = _normalize_cohort_level(
+        _coalesce_value(
+            context.get("selected_cohort_level") if context else None,
+            score_data.get("cohort_level"),
+            score_data.get("cohort_tier"),
+        )
+    )
+    cohort_size = _as_int(
+        _coalesce_value(
+            context.get("peer_count") if context else None,
+            score_data.get("cohort_peer_n"),
+            score_data.get("peer_count"),
+        )
+    )
+    return {
+        "has_claims": bool(_as_bool(score_data.get("has_claims"))),
+        "has_qpp": bool(_as_bool(score_data.get("has_qpp"))),
+        "has_rx": bool(_as_bool(score_data.get("has_rx"))),
+        "has_enrollment": bool(_as_bool(score_data.get("has_enrollment"))),
+        "has_medicare_claims": bool(_as_bool(score_data.get("has_medicare_claims"))),
+        "location_source": location_source,
+        "cohort_level": cohort_level,
+        "cohort_size": cohort_size,
+    }
+
+
+def _tier_from_quality_summary(
+    *,
+    risk_ratio_point: float | None,
+    ci75_high: float | None,
+    ci90_low: float | None,
+    confidence_0_100: float | None = None,
+) -> str | None:
+    rr_value = _as_float(risk_ratio_point)
+    ci75_high_value = _as_float(ci75_high)
+    ci90_low_value = _as_float(ci90_low)
+    confidence_value = _as_float(confidence_0_100) or 0.0
+    if rr_value is None:
+        return None
+    if confidence_value >= 55.0:
+        if rr_value >= 1.12 and (ci90_low_value or 0.0) >= 1.08:
+            return "low"
+        if rr_value <= 0.88 and ci75_high_value is not None and ci75_high_value < 1.0:
+            return "high"
+    return "acceptable"
+
+
+def _estimated_data_coverage_score(profile: dict[str, Any]) -> float:
+    score = 10.0
+    if profile.get("taxonomy_code"):
+        score += 15.0
+    if profile.get("specialty_key"):
+        score += 10.0
+    if profile.get("zip5"):
+        score += 10.0
+    if profile.get("state_key"):
+        score += 5.0
+    if _normalize_provider_class(profile.get("provider_class")) not in {None, "unknown"}:
+        score += 10.0
+    if profile.get("has_enrollment"):
+        score += 5.0
+    if profile.get("has_medicare_claims"):
+        score += 5.0
+    if str(profile.get("location_source") or "").strip() not in {"", "unknown"}:
+        score += 5.0
+    return round(min(score, 60.0), 2)
+
+
+def _estimated_confidence_score(profile: dict[str, Any], peer_count: int) -> float:
+    confidence = 15.0
+    if profile.get("taxonomy_code"):
+        confidence += 12.0
+    if profile.get("specialty_key"):
+        confidence += 6.0
+    if profile.get("zip5"):
+        confidence += 8.0
+    elif profile.get("state_key"):
+        confidence += 5.0
+    if _normalize_provider_class(profile.get("provider_class")) not in {None, "unknown"}:
+        confidence += 4.0
+    if str(profile.get("location_source") or "").strip() not in {"", "unknown"}:
+        confidence += 4.0
+    if peer_count >= 100:
+        confidence += 5.0
+    elif peer_count >= 30:
+        confidence += 3.0
+    return round(min(confidence, 54.0), 2)
+
+
+def _build_provider_quality_response_payload(
+    *,
+    provider_npi: int,
+    year_used: int,
+    year_source: str,
+    selected_payload: dict[str, Any],
+    selected_mode: str,
+    scores_by_benchmark_mode: dict[str, dict[str, Any] | None],
+    benchmark_mode: str | None,
+    restrict_available_to_selected: bool = False,
+    variants_scope: str | None = None,
+    variants_by_benchmark_mode: dict[str, list[dict[str, Any]]] | None = None,
+) -> dict[str, Any]:
+    available_modes = [
+        mode
+        for mode in QUALITY_BENCHMARK_MODE_ORDER
+        if scores_by_benchmark_mode.get(mode) is not None
+    ]
+    response_payload = {
+        "npi": provider_npi,
+        "year_used": year_used,
+        "year_source": year_source,
+        "model_version": selected_payload.get("model_version"),
+        "benchmark_mode": selected_mode,
+        "tier": selected_payload.get("tier"),
+        "borderline_status": selected_payload.get("borderline_status"),
+        "score_0_100": selected_payload.get("score_0_100"),
+        "estimated_cost_level": selected_payload.get("estimated_cost_level"),
+        "score_method": selected_payload.get("score_method"),
+        "confidence_0_100": selected_payload.get("confidence_0_100"),
+        "confidence_band": selected_payload.get("confidence_band"),
+        "cost_source": selected_payload.get("cost_source"),
+        "data_coverage_0_100": selected_payload.get("data_coverage_0_100"),
+        "provider_class": selected_payload.get("provider_class"),
+        "evidence_profile": selected_payload.get("evidence_profile"),
+        "unavailable_reasons": selected_payload.get("unavailable_reasons"),
+        "overall": selected_payload.get("overall"),
+        "domains": selected_payload.get("domains"),
+        "curation_checks": selected_payload.get("curation_checks"),
+        "available_benchmark_modes": (
+            available_modes
+            if (
+                benchmark_mode is None
+                or selected_payload.get("score_method") == "unavailable"
+                or not restrict_available_to_selected
+            )
+            else [selected_mode]
+        ),
+        "scores_by_benchmark_mode": scores_by_benchmark_mode,
+    }
+    if selected_payload.get("cohort_context") is not None:
+        response_payload["cohort_context"] = selected_payload.get("cohort_context")
+    if variants_scope == SCORE_VARIANTS_SCOPE_PROVIDER:
+        response_payload["variants_scope"] = variants_scope
+        response_payload["variants_by_benchmark_mode"] = variants_by_benchmark_mode or {
+            mode: []
+            for mode in QUALITY_BENCHMARK_MODE_ORDER
+        }
+    return response_payload
 
 
 def _parse_token_list(value: Any) -> list[str]:
@@ -1958,6 +2265,520 @@ def _aggregate_domain(measures: list[dict[str, float]]) -> dict[str, Any]:
     }
 
 
+async def _load_provider_quality_profile(
+    session,
+    *,
+    npi: int,
+    year: int | None,
+) -> dict[str, Any] | None:
+    provider_year_filter = "AND p.year = :year" if year is not None else ""
+    claims_state_expr = _state_code_sql("p.state")
+    doctor_state_expr = _state_code_sql("d.state")
+    unified_state_expr = _state_code_sql("e.state_name")
+    npi_state_expr = _state_code_sql("a.state_name")
+    taxonomy_table_exists = await _table_exists(session, NPIDataTaxonomy.__tablename__)
+    nucc_table_exists = await _table_exists(session, NUCCTaxonomy.__tablename__)
+    provider_enrichment_exists = await _table_exists(session, ProviderEnrichmentSummary.__tablename__)
+    doctor_clinician_exists = await _table_exists(session, DoctorClinicianAddress.__tablename__)
+    unified_address_exists = await _table_exists(session, EntityAddressUnified.__tablename__)
+    npi_address_exists = await _table_exists(session, NPIAddress.__tablename__)
+    unified_address_columns = (
+        await _table_columns(session, EntityAddressUnified.__tablename__)
+        if unified_address_exists
+        else set()
+    )
+    nucc_columns = (
+        await _table_columns(session, NUCCTaxonomy.__tablename__)
+        if nucc_table_exists
+        else set()
+    )
+    unified_confirmed_order_sql = (
+        "CASE WHEN COALESCE(e.multi_source_confirmed, FALSE) THEN 0 ELSE 1 END,"
+        if "multi_source_confirmed" in unified_address_columns
+        else ""
+    )
+    unified_source_count_order_sql = (
+        "COALESCE(e.source_count, 0) DESC,"
+        if "source_count" in unified_address_columns
+        else ""
+    )
+    unified_checksum_order_sql = "e.checksum" if "checksum" in unified_address_columns else "COALESCE(e.entity_id, 0)"
+    provider_enrichment_cte = (
+        f"""
+            provider_enrichment_choice AS (
+                SELECT
+                    pe.npi::bigint AS npi,
+                    COALESCE(pe.has_any_enrollment, FALSE)::boolean AS has_any_enrollment,
+                    COALESCE(pe.has_hospital_enrollment, FALSE)::boolean AS has_hospital_enrollment,
+                    COALESCE(pe.has_hha_enrollment, FALSE)::boolean AS has_hha_enrollment,
+                    COALESCE(pe.has_hospice_enrollment, FALSE)::boolean AS has_hospice_enrollment,
+                    COALESCE(pe.has_fqhc_enrollment, FALSE)::boolean AS has_fqhc_enrollment,
+                    COALESCE(pe.has_rhc_enrollment, FALSE)::boolean AS has_rhc_enrollment,
+                    COALESCE(pe.has_snf_enrollment, FALSE)::boolean AS has_snf_enrollment,
+                    COALESCE(pe.has_medicare_claims, FALSE)::boolean AS has_medicare_claims
+                FROM {PRICING_SCHEMA}.{ProviderEnrichmentSummary.__tablename__} pe
+                WHERE pe.npi = :npi
+                LIMIT 1
+            ),
+        """
+        if provider_enrichment_exists
+        else """
+            provider_enrichment_choice AS (
+                SELECT
+                    NULL::bigint AS npi,
+                    FALSE::boolean AS has_any_enrollment,
+                    FALSE::boolean AS has_hospital_enrollment,
+                    FALSE::boolean AS has_hha_enrollment,
+                    FALSE::boolean AS has_hospice_enrollment,
+                    FALSE::boolean AS has_fqhc_enrollment,
+                    FALSE::boolean AS has_rhc_enrollment,
+                    FALSE::boolean AS has_snf_enrollment,
+                    FALSE::boolean AS has_medicare_claims
+                WHERE FALSE
+            ),
+        """
+    )
+    taxonomy_cte = (
+        f"""
+            taxonomy_choice AS (
+                SELECT
+                    UPPER(NULLIF(BTRIM(COALESCE(t.healthcare_provider_taxonomy_code, '')), ''))::varchar AS taxonomy_code
+                FROM {PRICING_SCHEMA}.{NPIDataTaxonomy.__tablename__} t
+                WHERE t.npi = :npi
+                  AND NULLIF(BTRIM(COALESCE(t.healthcare_provider_taxonomy_code, '')), '') IS NOT NULL
+                ORDER BY
+                    CASE
+                        WHEN UPPER(COALESCE(t.healthcare_provider_primary_taxonomy_switch, '')) = 'Y' THEN 0
+                        ELSE 1
+                    END,
+                    t.checksum
+                LIMIT 1
+            ),
+        """
+        if taxonomy_table_exists
+        else """
+            taxonomy_choice AS (
+                SELECT NULL::varchar AS taxonomy_code
+                WHERE FALSE
+            ),
+        """
+    )
+    doctor_address_cte = (
+        f"""
+            doctor_address_choice AS (
+                SELECT
+                    ({doctor_state_expr})::varchar AS state_key,
+                    NULLIF(LEFT(REGEXP_REPLACE(COALESCE(d.zip_code, ''), '[^0-9]', '', 'g'), 5), '')::varchar AS zip5
+                FROM {PRICING_SCHEMA}.{DoctorClinicianAddress.__tablename__} d
+                WHERE d.npi = :npi
+                  AND (
+                        NULLIF(BTRIM(COALESCE(d.state, '')), '') IS NOT NULL
+                     OR NULLIF(BTRIM(COALESCE(d.zip_code, '')), '') IS NOT NULL
+                  )
+                ORDER BY
+                    CASE
+                        WHEN NULLIF(LEFT(REGEXP_REPLACE(COALESCE(d.zip_code, ''), '[^0-9]', '', 'g'), 5), '') IS NOT NULL
+                         AND NULLIF(BTRIM(COALESCE(d.state, '')), '') IS NOT NULL
+                        THEN 0
+                        ELSE 1
+                    END,
+                    d.address_checksum
+                LIMIT 1
+            ),
+        """
+        if doctor_clinician_exists
+        else """
+            doctor_address_choice AS (
+                SELECT NULL::varchar AS state_key, NULL::varchar AS zip5
+                WHERE FALSE
+            ),
+        """
+    )
+    unified_address_cte = (
+        f"""
+            unified_address_choice AS (
+                SELECT
+                    ({unified_state_expr})::varchar AS state_key,
+                    NULLIF(LEFT(REGEXP_REPLACE(COALESCE(e.postal_code, ''), '[^0-9]', '', 'g'), 5), '')::varchar AS zip5
+                FROM {PRICING_SCHEMA}.{EntityAddressUnified.__tablename__} e
+                WHERE COALESCE(e.npi, e.inferred_npi) = :npi
+                  AND e.type IN ('practice', 'primary', 'secondary', 'site')
+                  AND (
+                        NULLIF(BTRIM(COALESCE(e.state_name, '')), '') IS NOT NULL
+                     OR NULLIF(BTRIM(COALESCE(e.postal_code, '')), '') IS NOT NULL
+                  )
+                ORDER BY
+                    {unified_confirmed_order_sql}
+                    {unified_source_count_order_sql}
+                    CASE e.type
+                        WHEN 'practice' THEN 0
+                        WHEN 'primary' THEN 1
+                        WHEN 'secondary' THEN 2
+                        ELSE 3
+                    END,
+                    {unified_checksum_order_sql}
+                LIMIT 1
+            ),
+        """
+        if unified_address_exists
+        else """
+            unified_address_choice AS (
+                SELECT NULL::varchar AS state_key, NULL::varchar AS zip5
+                WHERE FALSE
+            ),
+        """
+    )
+    npi_address_cte = (
+        f"""
+            npi_address_choice AS (
+                SELECT
+                    ({npi_state_expr})::varchar AS state_key,
+                    NULLIF(LEFT(REGEXP_REPLACE(COALESCE(a.postal_code, ''), '[^0-9]', '', 'g'), 5), '')::varchar AS zip5
+                FROM {PRICING_SCHEMA}.{NPIAddress.__tablename__} a
+                WHERE a.npi = :npi
+                  AND a.type IN ('practice', 'primary', 'secondary')
+                  AND (
+                        NULLIF(BTRIM(COALESCE(a.state_name, '')), '') IS NOT NULL
+                     OR NULLIF(BTRIM(COALESCE(a.postal_code, '')), '') IS NOT NULL
+                  )
+                ORDER BY
+                    CASE a.type
+                        WHEN 'practice' THEN 0
+                        WHEN 'primary' THEN 1
+                        WHEN 'secondary' THEN 2
+                        ELSE 3
+                    END,
+                    a.checksum
+                LIMIT 1
+            ),
+        """
+        if npi_address_exists
+        else """
+            npi_address_choice AS (
+                SELECT NULL::varchar AS state_key, NULL::varchar AS zip5
+                WHERE FALSE
+            ),
+        """
+    )
+    nucc_cte = (
+        f"""
+            taxonomy_classification_choice AS (
+                SELECT
+                    LOWER(NULLIF(BTRIM(COALESCE(nt.classification, '')), ''))::varchar AS taxonomy_classification
+                FROM {PRICING_SCHEMA}.{NUCCTaxonomy.__tablename__} nt
+                JOIN taxonomy_choice tc
+                  ON UPPER(BTRIM(COALESCE(nt.code, ''))) = tc.taxonomy_code
+                LIMIT 1
+            ),
+        """
+        if nucc_table_exists and "classification" in nucc_columns
+        else """
+            taxonomy_classification_choice AS (
+                SELECT NULL::varchar AS taxonomy_classification
+                WHERE FALSE
+            ),
+        """
+    )
+    result = await session.execute(
+        text(
+            f"""
+            WITH provider_choice AS (
+                SELECT
+                    LOWER(NULLIF(BTRIM(COALESCE(p.provider_type, '')), ''))::varchar AS specialty_key,
+                    ({claims_state_expr})::varchar AS claims_state,
+                    NULLIF(BTRIM(COALESCE(p.zip5, '')), '')::varchar AS claims_zip5
+                FROM {PRICING_SCHEMA}.{PricingProvider.__tablename__} p
+                WHERE p.npi = :npi
+                  {provider_year_filter}
+                ORDER BY p.year DESC
+                LIMIT 1
+            ),
+            {taxonomy_cte}
+            {provider_enrichment_cte}
+            {nucc_cte}
+            {doctor_address_cte}
+            {unified_address_cte}
+            {npi_address_cte}
+            SELECT
+                nd.npi,
+                pc.specialty_key,
+                tc.taxonomy_code,
+                tcc.taxonomy_classification,
+                COALESCE(da.zip5, ua.zip5, na.zip5, pc.claims_zip5)::varchar AS zip5,
+                COALESCE(da.state_key, ua.state_key, na.state_key, pc.claims_state)::varchar AS state_key,
+                CASE
+                    WHEN COALESCE(nd.entity_type_code, 0) = 1 THEN 'clinician'
+                    WHEN COALESCE(pe.has_hospital_enrollment, FALSE)
+                      OR COALESCE(pe.has_hha_enrollment, FALSE)
+                      OR COALESCE(pe.has_hospice_enrollment, FALSE)
+                      OR COALESCE(pe.has_fqhc_enrollment, FALSE)
+                      OR COALESCE(pe.has_rhc_enrollment, FALSE)
+                      OR COALESCE(pe.has_snf_enrollment, FALSE)
+                    THEN 'facility'
+                    WHEN COALESCE(nd.entity_type_code, 0) = 2 THEN 'organization'
+                    ELSE 'unknown'
+                END::varchar AS provider_class,
+                CASE
+                    WHEN da.zip5 IS NOT NULL OR da.state_key IS NOT NULL THEN 'doctor_clinician_address'
+                    WHEN ua.zip5 IS NOT NULL OR ua.state_key IS NOT NULL THEN 'entity_address_unified'
+                    WHEN na.zip5 IS NOT NULL OR na.state_key IS NOT NULL THEN 'npi_address'
+                    WHEN pc.claims_zip5 IS NOT NULL OR pc.claims_state IS NOT NULL THEN 'claims_pricing'
+                    ELSE 'unknown'
+                END::varchar AS location_source,
+                COALESCE(pe.has_any_enrollment, FALSE)::boolean AS has_enrollment,
+                COALESCE(pe.has_medicare_claims, FALSE)::boolean AS has_medicare_claims
+            FROM {PRICING_SCHEMA}.{NPIData.__tablename__} nd
+            LEFT JOIN provider_choice pc ON TRUE
+            LEFT JOIN taxonomy_choice tc ON TRUE
+            LEFT JOIN taxonomy_classification_choice tcc ON TRUE
+            LEFT JOIN provider_enrichment_choice pe ON TRUE
+            LEFT JOIN doctor_address_choice da ON TRUE
+            LEFT JOIN unified_address_choice ua ON TRUE
+            LEFT JOIN npi_address_choice na ON TRUE
+            WHERE nd.npi = :npi
+            LIMIT 1
+            """
+        ),
+        {"npi": npi, "year": year},
+    )
+    row = result.first()
+    if row is None:
+        return None
+    row_data = _row_to_dict(row)
+    specialty_key = _parse_specialty_key(row_data.get("specialty_key"))
+    taxonomy_code = str(row_data.get("taxonomy_code") or "").strip().upper() or None
+    return {
+        "npi": npi,
+        "specialty_key": specialty_key,
+        "taxonomy_code": taxonomy_code,
+        "taxonomy_classification": str(row_data.get("taxonomy_classification") or "").strip().lower() or None,
+        "zip5": str(row_data.get("zip5") or "").strip()[:5] or None,
+        "state_key": str(row_data.get("state_key") or "").strip().upper() or None,
+        "provider_class": _normalize_provider_class(row_data.get("provider_class")) or "unknown",
+        "location_source": str(row_data.get("location_source") or "").strip() or "unknown",
+        "has_enrollment": bool(_as_bool(row_data.get("has_enrollment"))),
+        "has_medicare_claims": bool(_as_bool(row_data.get("has_medicare_claims"))),
+    }
+
+
+def _provider_quality_unavailable_reasons(
+    profile: dict[str, Any] | None,
+    *,
+    benchmark_mode: str | None = None,
+) -> list[str]:
+    if profile is None:
+        return ["provider_profile_not_found"]
+
+    reasons: list[str] = []
+    if not profile.get("specialty_key") and not profile.get("taxonomy_code"):
+        reasons.append("missing_specialty_or_taxonomy")
+    if not profile.get("state_key") and not profile.get("zip5"):
+        reasons.append("missing_geography")
+    if benchmark_mode == "zip" and not profile.get("zip5"):
+        reasons.append("missing_zip5_for_zip_benchmark")
+    if benchmark_mode == "state" and not profile.get("state_key"):
+        reasons.append("missing_state_for_state_benchmark")
+    return reasons
+
+
+def _estimated_benchmark_modes_for_profile(
+    profile: dict[str, Any],
+    *,
+    benchmark_mode: str | None = None,
+) -> list[str]:
+    if benchmark_mode is not None:
+        if benchmark_mode == "zip":
+            return ["zip"] if profile.get("zip5") else []
+        if benchmark_mode == "state":
+            return ["state"] if profile.get("state_key") else []
+        return ["national"]
+
+    modes: list[str] = []
+    if profile.get("zip5"):
+        modes.append("zip")
+    if profile.get("state_key"):
+        modes.append("state")
+    modes.append("national")
+    return modes
+
+
+async def _load_estimated_quality_modes(
+    session,
+    *,
+    profile: dict[str, Any],
+    year: int,
+    benchmark_mode: str | None = None,
+    taxonomy_code_override: str | None = None,
+    specialty_key_override: str | None = None,
+) -> dict[str, dict[str, Any] | None]:
+    scores_by_benchmark_mode: dict[str, dict[str, Any] | None] = {
+        mode: None
+        for mode in QUALITY_BENCHMARK_MODE_ORDER
+    }
+
+    candidate_modes = _estimated_benchmark_modes_for_profile(profile, benchmark_mode=benchmark_mode)
+    if not candidate_modes:
+        return scores_by_benchmark_mode
+
+    taxonomy_code = str(taxonomy_code_override or profile.get("taxonomy_code") or "").strip().upper() or None
+    specialty_key = _parse_specialty_key(specialty_key_override or profile.get("specialty_key"))
+    provider_class = _normalize_provider_class(profile.get("provider_class"))
+
+    for mode in candidate_modes:
+        score_filters = [
+            "s.year = :year",
+            "s.benchmark_mode = :benchmark_mode",
+            "COALESCE(LOWER(BTRIM(COALESCE(s.score_method, 'direct'))), 'direct') <> 'unavailable'",
+        ]
+        feature_filters: list[str] = []
+        params: dict[str, Any] = {"year": year, "benchmark_mode": mode}
+        if provider_class not in {None, "unknown"}:
+            feature_filters.append("COALESCE(LOWER(BTRIM(COALESCE(f.provider_class, ''))), 'unknown') = :provider_class")
+            params["provider_class"] = provider_class
+        if taxonomy_code:
+            feature_filters.append("UPPER(BTRIM(COALESCE(f.taxonomy_code, ''))) = :taxonomy_code")
+            params["taxonomy_code"] = taxonomy_code
+        elif specialty_key:
+            feature_filters.append("LOWER(BTRIM(COALESCE(f.specialty_key, ''))) = :specialty_key")
+            params["specialty_key"] = specialty_key
+        else:
+            continue
+        if mode == "zip":
+            feature_filters.append("f.zip5 = :zip5")
+            params["zip5"] = profile.get("zip5")
+        elif mode == "state":
+            feature_filters.append("UPPER(BTRIM(COALESCE(f.state, ''))) = :state_key")
+            params["state_key"] = profile.get("state_key")
+
+        where_sql = " AND ".join(score_filters + feature_filters)
+        score_result = await session.execute(
+            text(
+                f"""
+                SELECT
+                    COUNT(*)::int AS peer_count,
+                    percentile_cont(0.5) WITHIN GROUP (ORDER BY s.risk_ratio_point) AS risk_ratio_point,
+                    percentile_cont(0.5) WITHIN GROUP (ORDER BY s.ci75_low) AS ci75_low,
+                    percentile_cont(0.5) WITHIN GROUP (ORDER BY s.ci75_high) AS ci75_high,
+                    percentile_cont(0.5) WITHIN GROUP (ORDER BY s.ci90_low) AS ci90_low,
+                    percentile_cont(0.5) WITHIN GROUP (ORDER BY s.ci90_high) AS ci90_high,
+                    percentile_cont(0.5) WITHIN GROUP (ORDER BY s.score_0_100) AS score_0_100
+                FROM {PRICING_SCHEMA}.{QUALITY_SCORE_TABLE_NAME} s
+                JOIN {PRICING_SCHEMA}.{QUALITY_FEATURE_TABLE_NAME} f
+                  ON f.npi = s.npi
+                 AND f.year = s.year
+                WHERE {where_sql}
+                """
+            ),
+            params,
+        )
+        score_row = score_result.first()
+        if score_row is None:
+            continue
+        score_data_raw = _row_to_dict(score_row)
+        peer_count = _as_int(score_data_raw.get("peer_count")) or 0
+        if peer_count <= 0:
+            continue
+
+        domains_payload = _empty_domains_payload()
+        domain_result = await session.execute(
+            text(
+                f"""
+                SELECT
+                    d.domain,
+                    COUNT(*)::int AS peer_count,
+                    percentile_cont(0.5) WITHIN GROUP (ORDER BY d.risk_ratio) AS risk_ratio,
+                    percentile_cont(0.5) WITHIN GROUP (ORDER BY d.score_0_100) AS score_0_100,
+                    percentile_cont(0.5) WITHIN GROUP (ORDER BY d.ci75_low) AS ci75_low,
+                    percentile_cont(0.5) WITHIN GROUP (ORDER BY d.ci75_high) AS ci75_high,
+                    percentile_cont(0.5) WITHIN GROUP (ORDER BY d.ci90_low) AS ci90_low,
+                    percentile_cont(0.5) WITHIN GROUP (ORDER BY d.ci90_high) AS ci90_high
+                FROM {PRICING_SCHEMA}.{QUALITY_DOMAIN_TABLE_NAME} d
+                JOIN {PRICING_SCHEMA}.{QUALITY_FEATURE_TABLE_NAME} f
+                  ON f.npi = d.npi
+                 AND f.year = d.year
+                WHERE d.year = :year
+                  AND d.benchmark_mode = :benchmark_mode
+                  AND {' AND '.join(feature_filters)}
+                GROUP BY d.domain
+                """
+            ),
+            params,
+        )
+        for domain_row in domain_result:
+            domain_data = _row_to_dict(domain_row)
+            domain_name = str(domain_data.get("domain") or "").strip().lower()
+            if domain_name not in domains_payload:
+                continue
+            domains_payload[domain_name] = {
+                "risk_ratio_point": _as_float(domain_data.get("risk_ratio")),
+                "score_0_100": _as_float(domain_data.get("score_0_100")),
+                "evidence_n": float(_as_int(domain_data.get("peer_count")) or peer_count),
+                "ci_75": _ci_payload(domain_data.get("ci75_low"), domain_data.get("ci75_high")),
+                "ci_90": _ci_payload(domain_data.get("ci90_low"), domain_data.get("ci90_high")),
+            }
+
+        rr_cost = _as_float(domains_payload["cost"].get("risk_ratio_point"))
+        confidence_0_100 = _estimated_confidence_score(profile, peer_count)
+        score_row_payload = {
+            "model_version": PROVIDER_QUALITY_MODEL_VERSION,
+            "benchmark_mode": mode,
+            "tier": _tier_from_quality_summary(
+                risk_ratio_point=_as_float(score_data_raw.get("risk_ratio_point")),
+                ci75_high=_as_float(score_data_raw.get("ci75_high")),
+                ci90_low=_as_float(score_data_raw.get("ci90_low")),
+                confidence_0_100=confidence_0_100,
+            ),
+            "borderline_status": False,
+            "score_0_100": _as_float(score_data_raw.get("score_0_100"))
+            or _score_from_risk_ratio(_as_float(score_data_raw.get("risk_ratio_point"))),
+            "estimated_cost_level": _estimated_cost_level_from_risk_ratio(rr_cost),
+            "score_method": "estimated",
+            "confidence_0_100": confidence_0_100,
+            "confidence_band": "low",
+            "cost_source": "peer_estimated",
+            "data_coverage_0_100": _estimated_data_coverage_score(profile),
+            "provider_class": profile.get("provider_class"),
+            "location_source": profile.get("location_source"),
+            "has_claims": False,
+            "has_qpp": False,
+            "has_rx": False,
+            "has_enrollment": profile.get("has_enrollment"),
+            "has_medicare_claims": profile.get("has_medicare_claims"),
+            "risk_ratio_point": _as_float(score_data_raw.get("risk_ratio_point")),
+            "ci75_low": _as_float(score_data_raw.get("ci75_low")),
+            "ci75_high": _as_float(score_data_raw.get("ci75_high")),
+            "ci90_low": _as_float(score_data_raw.get("ci90_low")),
+            "ci90_high": _as_float(score_data_raw.get("ci90_high")),
+            "low_score_threshold_failed": (_as_float(score_data_raw.get("risk_ratio_point")) or 0.0) >= 1.12,
+            "low_confidence_threshold_failed": (_as_float(score_data_raw.get("ci90_low")) or 0.0) >= 1.08,
+            "high_score_threshold_passed": (_as_float(score_data_raw.get("risk_ratio_point")) or 1.0) <= 0.88,
+            "high_confidence_threshold_passed": (
+                _as_float(score_data_raw.get("ci75_high")) is not None
+                and (_as_float(score_data_raw.get("ci75_high")) or 0.0) < 1.0
+            ),
+        }
+        cohort_context = {
+            "selected_geography": _selected_geography_label(
+                "national" if mode == "national" else mode,
+                "US" if mode == "national" else (profile.get("zip5") if mode == "zip" else profile.get("state_key")),
+            ),
+            "selected_cohort_level": None,
+            "peer_count": peer_count,
+            "specialty_key": specialty_key,
+            "taxonomy_code": taxonomy_code,
+            "procedure_bucket": None,
+            "computed_live": False,
+            "procedure_match_threshold": None,
+        }
+        scores_by_benchmark_mode[mode] = _build_quality_mode_payload(
+            score_row_payload,
+            domains_payload,
+            cohort_context=cohort_context,
+        )
+
+    return scores_by_benchmark_mode
+
+
 async def _resolve_procedure_override_codes(
     session,
     procedure_codes: list[str],
@@ -2337,6 +3158,50 @@ def _build_live_mode_payload_for_candidate(
     else:
         tier = "acceptable"
     borderline_status = (int(low_score_check) + int(low_confidence_check)) == 1
+    has_claims = (
+        (_as_float(observed_data.get("total_services")) or 0.0) > 0
+        or (_as_float(observed_data.get("total_beneficiaries")) or 0.0) > 0
+    )
+    has_qpp = (
+        _as_float(observed_data.get("qpp_quality_score")) is not None
+        or _as_float(observed_data.get("qpp_cost_score")) is not None
+    )
+    has_rx = (_as_float(observed_data.get("total_rx_claims")) or 0.0) > 0
+    data_coverage_0_100 = min(
+        100.0,
+        (
+            (40.0 if has_claims else 0.0)
+            + (25.0 if has_qpp else 0.0)
+            + (15.0 if has_rx else 0.0)
+            + (10.0 if selected_peer_count and selected_peer_count >= 30 else 0.0)
+            + (10.0 if observed_data.get("zip5") or observed_data.get("state_key") else 0.0)
+        ),
+    )
+    confidence_0_100 = min(
+        100.0,
+        (
+            (35.0 if has_claims else 0.0)
+            + (20.0 if has_qpp else 0.0)
+            + (10.0 if has_rx else 0.0)
+            + (10.0 if selected_peer_count and selected_peer_count >= 100 else 5.0 if selected_peer_count and selected_peer_count >= 30 else 0.0)
+            + (5.0 if observed_data.get("zip5") else 0.0)
+            + (5.0 if observed_data.get("state_key") else 0.0)
+        ),
+    )
+    if has_claims and has_qpp:
+        score_method = "direct"
+    elif has_claims or has_qpp or has_rx:
+        score_method = "mixed"
+    else:
+        score_method = "unavailable"
+    if confidence_0_100 >= 80.0:
+        confidence_band = "high"
+    elif confidence_0_100 >= 55.0:
+        confidence_band = "medium"
+    elif confidence_0_100 > 0.0:
+        confidence_band = "low"
+    else:
+        confidence_band = "none"
 
     score_data = {
         "model_version": PROVIDER_QUALITY_MODEL_VERSION,
@@ -2354,6 +3219,18 @@ def _build_live_mode_payload_for_candidate(
         "low_confidence_threshold_failed": low_confidence_check,
         "high_score_threshold_passed": high_score_check,
         "high_confidence_threshold_passed": high_confidence_check,
+        "score_method": score_method,
+        "cost_source": "direct" if has_claims else "peer_estimated",
+        "confidence_0_100": confidence_0_100,
+        "confidence_band": confidence_band,
+        "data_coverage_0_100": data_coverage_0_100,
+        "provider_class": observed_data.get("provider_class"),
+        "location_source": observed_data.get("location_source"),
+        "has_claims": has_claims,
+        "has_qpp": has_qpp,
+        "has_rx": has_rx,
+        "has_enrollment": observed_data.get("has_enrollment"),
+        "has_medicare_claims": observed_data.get("has_medicare_claims"),
     }
     cohort_context = {
         "selected_geography": selected_geography,
@@ -3052,12 +3929,148 @@ async def get_pricing_provider_score(request, npi: str):
     if provider_npi is None:
         raise InvalidUsage("Path parameter 'npi' must be provided")
 
+    async def _fallback_response(
+        *,
+        year_used: int,
+        year_source_value: str,
+    ):
+        profile = await _load_provider_quality_profile(session, npi=provider_npi, year=year_used)
+        reasons = _provider_quality_unavailable_reasons(profile, benchmark_mode=benchmark_mode)
+        scores_by_benchmark_mode: dict[str, dict[str, Any] | None] = {
+            mode: None
+            for mode in QUALITY_BENCHMARK_MODE_ORDER
+        }
+        if not reasons and profile is not None:
+            try:
+                scores_by_benchmark_mode = await _load_estimated_quality_modes(
+                    session,
+                    profile=profile,
+                    year=year_used,
+                    benchmark_mode=benchmark_mode,
+                    taxonomy_code_override=taxonomy_code,
+                    specialty_key_override=specialty_key,
+                )
+            except Exception:  # noqa: BLE001
+                scores_by_benchmark_mode = {
+                    mode: None
+                    for mode in QUALITY_BENCHMARK_MODE_ORDER
+                }
+            available_modes = [
+                mode
+                for mode in QUALITY_BENCHMARK_MODE_ORDER
+                if scores_by_benchmark_mode.get(mode) is not None
+            ]
+            if benchmark_mode is not None:
+                selected_payload = scores_by_benchmark_mode.get(benchmark_mode)
+                if selected_payload is not None:
+                    return response.json(
+                        _build_provider_quality_response_payload(
+                            provider_npi=provider_npi,
+                            year_used=year_used,
+                            year_source=year_source_value,
+                            selected_payload=selected_payload,
+                            selected_mode=benchmark_mode,
+                            scores_by_benchmark_mode=scores_by_benchmark_mode,
+                            benchmark_mode=benchmark_mode,
+                            restrict_available_to_selected=True,
+                        )
+                    )
+                reasons.append(f"benchmark_mode_{benchmark_mode}_estimate_unavailable")
+            elif available_modes:
+                selected_mode = available_modes[0]
+                selected_payload = scores_by_benchmark_mode[selected_mode]
+                assert selected_payload is not None
+                return response.json(
+                    _build_provider_quality_response_payload(
+                        provider_npi=provider_npi,
+                        year_used=year_used,
+                        year_source=year_source_value,
+                        selected_payload=selected_payload,
+                        selected_mode=selected_mode,
+                        scores_by_benchmark_mode=scores_by_benchmark_mode,
+                        benchmark_mode=None,
+                    )
+                )
+            else:
+                reasons.append("no_matching_peer_cohort")
+
+        selected_mode = benchmark_mode or ("zip" if profile and profile.get("zip5") else "state" if profile and profile.get("state_key") else "national")
+        selected_geography = None
+        if profile is not None:
+            if selected_mode == "zip" and profile.get("zip5"):
+                selected_geography = _selected_geography_label("zip", profile.get("zip5"))
+            elif selected_mode in {"zip", "state"} and profile.get("state_key"):
+                selected_geography = _selected_geography_label("state", profile.get("state_key"))
+            elif profile.get("state_key"):
+                selected_geography = _selected_geography_label("state", profile.get("state_key"))
+            elif profile.get("zip5"):
+                selected_geography = _selected_geography_label("zip", profile.get("zip5"))
+        selected_payload = _build_quality_mode_payload(
+            {
+                "model_version": PROVIDER_QUALITY_MODEL_VERSION,
+                "benchmark_mode": selected_mode,
+                "tier": None,
+                "borderline_status": None,
+                "score_0_100": None,
+                "estimated_cost_level": None,
+                "score_method": "unavailable",
+                "confidence_0_100": 0.0,
+                "confidence_band": "none",
+                "cost_source": "unavailable",
+                "data_coverage_0_100": _estimated_data_coverage_score(profile or {}) if profile else None,
+                "provider_class": (profile or {}).get("provider_class"),
+                "location_source": (profile or {}).get("location_source"),
+                "has_claims": False,
+                "has_qpp": False,
+                "has_rx": False,
+                "has_enrollment": (profile or {}).get("has_enrollment"),
+                "has_medicare_claims": (profile or {}).get("has_medicare_claims"),
+                "risk_ratio_point": None,
+                "ci75_low": None,
+                "ci75_high": None,
+                "ci90_low": None,
+                "ci90_high": None,
+                "low_score_threshold_failed": False,
+                "low_confidence_threshold_failed": False,
+                "high_score_threshold_passed": False,
+                "high_confidence_threshold_passed": False,
+                "unavailable_reasons": reasons,
+            },
+            _empty_domains_payload(),
+            cohort_context=(
+                {
+                    "selected_geography": selected_geography,
+                    "selected_cohort_level": None,
+                    "peer_count": None,
+                    "specialty_key": specialty_key or (profile or {}).get("specialty_key"),
+                    "taxonomy_code": taxonomy_code or (profile or {}).get("taxonomy_code"),
+                    "procedure_bucket": None,
+                    "computed_live": False,
+                    "procedure_match_threshold": None,
+                }
+                if profile is not None
+                else None
+            ),
+        )
+        return response.json(
+            _build_provider_quality_response_payload(
+                provider_npi=provider_npi,
+                year_used=year_used,
+                year_source=year_source_value,
+                selected_payload=selected_payload,
+                selected_mode=selected_mode,
+                scores_by_benchmark_mode=scores_by_benchmark_mode,
+                benchmark_mode=benchmark_mode,
+                restrict_available_to_selected=True,
+            )
+        )
+
     override_requested = bool(specialty_key or taxonomy_code or procedure_codes or variants_scope is not None)
     if override_requested:
         year, year_source = await _resolve_year(session, provider_table, year)
         observed_data = await _load_provider_quality_observed(session, npi=provider_npi, year=year)
         if observed_data is None:
-            raise sanic.exceptions.NotFound("Provider quality score not found")
+            return await _fallback_response(year_used=year, year_source_value=year_source)
 
         requested_procedure_codes = await _resolve_procedure_override_codes(
             session,
@@ -3131,38 +4144,28 @@ async def get_pricing_provider_score(request, npi: str):
             selected_mode = benchmark_mode
             selected_payload = scores_by_benchmark_mode.get(selected_mode)
             if selected_payload is None:
-                raise sanic.exceptions.NotFound(
-                    f"Provider quality score not found for benchmark_mode='{selected_mode}'"
-                )
+                return await _fallback_response(year_used=year, year_source_value=year_source)
         else:
             if not available_modes:
-                raise sanic.exceptions.NotFound("Provider quality score not found")
+                return await _fallback_response(year_used=year, year_source_value=year_source)
             selected_mode = available_modes[0]
             selected_payload = scores_by_benchmark_mode[selected_mode]
         assert selected_payload is not None
 
-        response_payload = {
-            "npi": provider_npi,
-            "year_used": year,
-            "year_source": year_source,
-            "model_version": selected_payload.get("model_version"),
-            "benchmark_mode": selected_payload.get("benchmark_mode"),
-            "tier": selected_payload.get("tier"),
-            "borderline_status": selected_payload.get("borderline_status"),
-            "score_0_100": selected_payload.get("score_0_100"),
-            "estimated_cost_level": selected_payload.get("estimated_cost_level"),
-            "overall": selected_payload.get("overall"),
-            "domains": selected_payload.get("domains"),
-            "curation_checks": selected_payload.get("curation_checks"),
-            "available_benchmark_modes": available_modes if benchmark_mode is None else [selected_mode],
-            "scores_by_benchmark_mode": scores_by_benchmark_mode,
-        }
-        if variants_scope == SCORE_VARIANTS_SCOPE_PROVIDER:
-            response_payload["variants_scope"] = variants_scope
-            response_payload["variants_by_benchmark_mode"] = variants_by_benchmark_mode
-        if selected_payload.get("cohort_context") is not None:
-            response_payload["cohort_context"] = selected_payload.get("cohort_context")
-        return response.json(response_payload)
+        return response.json(
+            _build_provider_quality_response_payload(
+                provider_npi=provider_npi,
+                year_used=year,
+                year_source=year_source,
+                selected_payload=selected_payload,
+                selected_mode=selected_mode,
+                scores_by_benchmark_mode=scores_by_benchmark_mode,
+                benchmark_mode=benchmark_mode,
+                restrict_available_to_selected=benchmark_mode is not None,
+                variants_scope=variants_scope,
+                variants_by_benchmark_mode=variants_by_benchmark_mode,
+            )
+        )
 
     if not await _table_exists(session, QUALITY_SCORE_TABLE_NAME):
         raise sanic.exceptions.NotFound("Provider quality score table not found")
@@ -3181,7 +4184,7 @@ async def get_pricing_provider_score(request, npi: str):
     score_result = await session.execute(score_query, {"npi": provider_npi, "year": year})
     score_rows = [_row_to_dict(row) for row in score_result]
     if not score_rows:
-        raise sanic.exceptions.NotFound("Provider quality score not found")
+        return await _fallback_response(year_used=year, year_source_value=year_source)
 
     scores_by_mode_raw: dict[str, dict[str, Any]] = {}
     for row in score_rows:
@@ -3275,25 +4278,17 @@ async def get_pricing_provider_score(request, npi: str):
             cohort_context=cohort_context_by_mode.get(mode),
         )
 
-    response_payload = {
-        "npi": provider_npi,
-        "year_used": year,
-        "year_source": year_source,
-        "model_version": selected_payload.get("model_version"),
-        "benchmark_mode": selected_payload.get("benchmark_mode"),
-        "tier": selected_payload.get("tier"),
-        "borderline_status": selected_payload.get("borderline_status"),
-        "score_0_100": selected_payload.get("score_0_100"),
-        "estimated_cost_level": selected_payload.get("estimated_cost_level"),
-        "overall": selected_payload.get("overall"),
-        "domains": selected_payload.get("domains"),
-        "curation_checks": selected_payload.get("curation_checks"),
-        "available_benchmark_modes": [mode for mode in QUALITY_BENCHMARK_MODE_ORDER if scores_by_mode_raw.get(mode)],
-        "scores_by_benchmark_mode": scores_by_benchmark_mode,
-    }
-    if selected_payload.get("cohort_context") is not None:
-        response_payload["cohort_context"] = selected_payload.get("cohort_context")
-    return response.json(response_payload)
+    return response.json(
+        _build_provider_quality_response_payload(
+            provider_npi=provider_npi,
+            year_used=year,
+            year_source=year_source,
+            selected_payload=selected_payload,
+            selected_mode=selected_mode,
+            scores_by_benchmark_mode=scores_by_benchmark_mode,
+            benchmark_mode=benchmark_mode,
+        )
+    )
 
 
 @blueprint.get("/providers/<npi>/procedures", name="pricing.providers.procedures.list")

@@ -28,7 +28,11 @@ from arq import Retry, create_pool
 import db.models as db_models
 from db.connection import db
 from db.models import (
+    DoctorClinicianAddress,
+    EntityAddressUnified,
     GeoZipLookup,
+    NPIAddress,
+    NPIData,
     NPIDataTaxonomy,
     NUCCTaxonomy,
     PricingProvider,
@@ -40,6 +44,7 @@ from db.models import (
     PricingQppProvider,
     PricingQualityRun,
     PricingSviZcta,
+    ProviderEnrichmentSummary,
 )
 from process.ext.utils import (
     download_it_and_save,
@@ -907,6 +912,20 @@ async def _table_exists(schema: str, table: str) -> bool:
     return result is not None
 
 
+async def _table_columns(schema: str, table: str) -> set[str]:
+    rows = await db.all(
+        """
+        SELECT column_name
+          FROM information_schema.columns
+         WHERE table_schema = :schema
+           AND table_name = :table
+        """,
+        schema=schema,
+        table=table,
+    )
+    return {str(getattr(row, "column_name", "") or "").strip() for row in rows if getattr(row, "column_name", None)}
+
+
 async def _download_csv_head(url: str, path: str, max_bytes: int) -> None:
     client = await get_http_client()
     downloaded = 0
@@ -1164,6 +1183,121 @@ def _pick_first(row: dict[str, Any], *keys: str) -> Any:
     return None
 
 
+def _pick_first_ci(row: dict[str, Any], *keys: str) -> Any:
+    lowered = {str(key).strip().lower(): value for key, value in row.items()}
+    for key in keys:
+        value = lowered.get(str(key).strip().lower())
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _provider_class_case_sql(entity_type_expr: str, enrichment_alias: str) -> str:
+    return f"""
+        CASE
+            WHEN {entity_type_expr} = 1 THEN 'clinician'
+            WHEN COALESCE({enrichment_alias}.has_hospital_enrollment, FALSE)
+              OR COALESCE({enrichment_alias}.has_hha_enrollment, FALSE)
+              OR COALESCE({enrichment_alias}.has_hospice_enrollment, FALSE)
+              OR COALESCE({enrichment_alias}.has_fqhc_enrollment, FALSE)
+              OR COALESCE({enrichment_alias}.has_rhc_enrollment, FALSE)
+              OR COALESCE({enrichment_alias}.has_snf_enrollment, FALSE)
+            THEN 'facility'
+            WHEN {entity_type_expr} = 2 THEN 'organization'
+            ELSE 'unknown'
+        END::varchar
+    """
+
+
+def _extract_qpp_score(row: dict[str, Any], *keys: str) -> float | None:
+    value = _pick_first_ci(row, *keys)
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if cleaned.endswith("%"):
+            cleaned = cleaned[:-1]
+        value = cleaned
+    return _to_float(value)
+
+
+_US_STATE_NAME_TO_CODE = {
+    "ALABAMA": "AL",
+    "ALASKA": "AK",
+    "ARIZONA": "AZ",
+    "ARKANSAS": "AR",
+    "CALIFORNIA": "CA",
+    "COLORADO": "CO",
+    "CONNECTICUT": "CT",
+    "DELAWARE": "DE",
+    "DISTRICT OF COLUMBIA": "DC",
+    "FLORIDA": "FL",
+    "GEORGIA": "GA",
+    "HAWAII": "HI",
+    "IDAHO": "ID",
+    "ILLINOIS": "IL",
+    "INDIANA": "IN",
+    "IOWA": "IA",
+    "KANSAS": "KS",
+    "KENTUCKY": "KY",
+    "LOUISIANA": "LA",
+    "MAINE": "ME",
+    "MARYLAND": "MD",
+    "MASSACHUSETTS": "MA",
+    "MICHIGAN": "MI",
+    "MINNESOTA": "MN",
+    "MISSISSIPPI": "MS",
+    "MISSOURI": "MO",
+    "MONTANA": "MT",
+    "NEBRASKA": "NE",
+    "NEVADA": "NV",
+    "NEW HAMPSHIRE": "NH",
+    "NEW JERSEY": "NJ",
+    "NEW MEXICO": "NM",
+    "NEW YORK": "NY",
+    "NORTH CAROLINA": "NC",
+    "NORTH DAKOTA": "ND",
+    "OHIO": "OH",
+    "OKLAHOMA": "OK",
+    "OREGON": "OR",
+    "PENNSYLVANIA": "PA",
+    "RHODE ISLAND": "RI",
+    "SOUTH CAROLINA": "SC",
+    "SOUTH DAKOTA": "SD",
+    "TENNESSEE": "TN",
+    "TEXAS": "TX",
+    "UTAH": "UT",
+    "VERMONT": "VT",
+    "VIRGINIA": "VA",
+    "WASHINGTON": "WA",
+    "WEST VIRGINIA": "WV",
+    "WISCONSIN": "WI",
+    "WYOMING": "WY",
+    "PUERTO RICO": "PR",
+    "GUAM": "GU",
+    "AMERICAN SAMOA": "AS",
+    "NORTHERN MARIANA ISLANDS": "MP",
+    "COMMONWEALTH OF THE NORTHERN MARIANA ISLANDS": "MP",
+    "US VIRGIN ISLANDS": "VI",
+    "U.S. VIRGIN ISLANDS": "VI",
+    "VIRGIN ISLANDS": "VI",
+}
+
+
+def _state_code_sql(expr: str) -> str:
+    normalized = f"UPPER(NULLIF(BTRIM(COALESCE({expr}, '')), ''))"
+    mapping_cases = "\n".join(
+        f"            WHEN {normalized} = '{name}' THEN '{code}'"
+        for name, code in _US_STATE_NAME_TO_CODE.items()
+    )
+    return f"""
+        CASE
+            WHEN {normalized} IS NULL THEN NULL
+            WHEN LENGTH({normalized}) = 2 THEN {normalized}
+{mapping_cases}
+            ELSE NULL
+        END
+    """
+
+
 async def _load_qpp_rows(path: str, qpp_cls: type, reporting_year: int, test_mode: bool) -> None:
     rows: list[dict[str, Any]] = []
     accepted = 0
@@ -1180,15 +1314,63 @@ async def _load_qpp_rows(path: str, qpp_cls: type, reporting_year: int, test_mod
                 _print_row_progress("qpp_provider", row_number, accepted, progress_start)
                 progress_last = now
 
-            npi = _to_npi(_pick_first(row, "npi", "NPI", "clinician_npi", "Clinician NPI"))
+            npi = _to_npi(
+                _pick_first_ci(
+                    row,
+                    "npi",
+                    "clinician_npi",
+                    "clinician npi",
+                    "organization_npi",
+                    "group_practice_npi",
+                )
+            )
             if npi is None:
                 continue
-            year = _to_int(_pick_first(row, "year", "Year", "performance_year", "Performance Year"))
+            year = _to_int(
+                _pick_first_ci(
+                    row,
+                    "year",
+                    "performance_year",
+                    "performance year",
+                    "reporting_year",
+                    "reporting year",
+                )
+            )
             year = max(year or reporting_year, 2013)
 
-            quality_score = _to_float(_pick_first(row, "quality_score", "Quality Score", "quality", "quality_percent"))
-            cost_score = _to_float(_pick_first(row, "cost_score", "Cost Score", "cost", "cost_percent"))
-            final_score = _to_float(_pick_first(row, "final_score", "Final Score", "final", "final_percent"))
+            quality_score = _extract_qpp_score(
+                row,
+                "quality_score",
+                "quality score",
+                "quality",
+                "quality_percent",
+                "quality_category_score",
+                "quality category score",
+                "quality_performance_category_score",
+                "quality performance category score",
+            )
+            cost_score = _extract_qpp_score(
+                row,
+                "cost_score",
+                "cost score",
+                "cost",
+                "cost_percent",
+                "cost_category_score",
+                "cost category score",
+                "cost_performance_category_score",
+                "cost performance category score",
+            )
+            final_score = _extract_qpp_score(
+                row,
+                "final_score",
+                "final score",
+                "final",
+                "final_percent",
+                "final_mips_score",
+                "final mips score",
+                "finalscore",
+                "final score performance year",
+            )
 
             rows.append(
                 {
@@ -1326,6 +1508,23 @@ async def _build_cohort_materialization_context(classes: dict[str, type], schema
     peer_target_table = classes["PricingProviderQualityPeerTarget"].__tablename__
     rx_table = PricingProviderPrescription.__tablename__
     rx_table_exists = await _table_exists(schema, rx_table)
+    npi_table_exists = await _table_exists(schema, NPIData.__tablename__)
+    taxonomy_table_exists = await _table_exists(schema, NPIDataTaxonomy.__tablename__)
+    nucc_table_exists = await _table_exists(schema, NUCCTaxonomy.__tablename__)
+    provider_enrichment_exists = await _table_exists(schema, ProviderEnrichmentSummary.__tablename__)
+    doctor_clinician_exists = await _table_exists(schema, DoctorClinicianAddress.__tablename__)
+    unified_address_exists = await _table_exists(schema, EntityAddressUnified.__tablename__)
+    npi_address_exists = await _table_exists(schema, NPIAddress.__tablename__)
+    unified_address_columns = (
+        await _table_columns(schema, EntityAddressUnified.__tablename__)
+        if unified_address_exists
+        else set()
+    )
+    nucc_columns = (
+        await _table_columns(schema, NUCCTaxonomy.__tablename__)
+        if nucc_table_exists
+        else set()
+    )
 
     feature_columns = _model_columns(classes.get("PricingProviderQualityFeature"))
     lsh_columns = _model_columns(classes.get("PricingProviderQualityProcedureLSH"))
@@ -1379,6 +1578,12 @@ async def _build_cohort_materialization_context(classes: dict[str, type], schema
         (
             ("npi", "f.npi"),
             ("year", "f.year"),
+            ("zip5", "f.zip5"),
+            ("state", "f.state"),
+            ("provider_class", "f.provider_class"),
+            ("location_source", "f.location_source"),
+            ("has_enrollment", "f.has_enrollment"),
+            ("has_medicare_claims", "f.has_medicare_claims"),
             ("specialty", "f.specialty"),
             ("specialty_key", "f.specialty"),
             ("taxonomy", "f.taxonomy"),
@@ -1447,6 +1652,12 @@ async def _build_cohort_materialization_context(classes: dict[str, type], schema
     feature_taxonomy_col = _first_existing_column(feature_columns, "taxonomy", "taxonomy_code")
     feature_classification_col = _first_existing_column(feature_columns, "classification")
     feature_procedure_bucket_col = _first_existing_column(feature_columns, "procedure_bucket")
+    feature_state_col = _first_existing_column(feature_columns, "state")
+    feature_zip_col = _first_existing_column(feature_columns, "zip5")
+    feature_provider_class_col = _first_existing_column(feature_columns, "provider_class")
+    feature_location_source_col = _first_existing_column(feature_columns, "location_source")
+    feature_has_enrollment_col = _first_existing_column(feature_columns, "has_enrollment")
+    feature_has_medicare_claims_col = _first_existing_column(feature_columns, "has_medicare_claims")
 
     feature_specialty_expr = (
         f"COALESCE(NULLIF(LOWER(BTRIM(COALESCE(f.{feature_specialty_col}, ''))), ''), 'unknown')"
@@ -1468,10 +1679,40 @@ async def _build_cohort_materialization_context(classes: dict[str, type], schema
         if feature_procedure_bucket_col
         else "'bucket:none'::varchar"
     )
+    feature_state_expr = (
+        f"COALESCE(NULLIF(UPPER(BTRIM(COALESCE(f.{feature_state_col}, ''))), ''), p.state_key)"
+        if feature_state_col
+        else "p.state_key"
+    )
+    feature_zip_expr = (
+        f"COALESCE(NULLIF(BTRIM(COALESCE(f.{feature_zip_col}, '')), ''), p.zip5)"
+        if feature_zip_col
+        else "p.zip5"
+    )
+    feature_provider_class_expr = (
+        f"COALESCE(NULLIF(LOWER(BTRIM(COALESCE(f.{feature_provider_class_col}, ''))), ''), 'unknown')"
+        if feature_provider_class_col
+        else "'unknown'::varchar"
+    )
+    feature_location_source_expr = (
+        f"COALESCE(NULLIF(BTRIM(COALESCE(f.{feature_location_source_col}, '')), ''), 'claims_pricing')"
+        if feature_location_source_col
+        else "'claims_pricing'::varchar"
+    )
+    feature_has_enrollment_expr = (
+        f"COALESCE(f.{feature_has_enrollment_col}, FALSE)"
+        if feature_has_enrollment_col
+        else "FALSE"
+    )
+    feature_has_medicare_claims_expr = (
+        f"COALESCE(f.{feature_has_medicare_claims_col}, FALSE)"
+        if feature_has_medicare_claims_col
+        else "FALSE"
+    )
 
     peer_scope_expr = f"t.{peer_target_geo_scope_col}"
     peer_benchmark_mode_expr = (
-        f"t.{peer_target_benchmark_mode_col}"
+        f"LOWER(COALESCE(t.{peer_target_benchmark_mode_col}, 'national'))"
         if peer_target_benchmark_mode_col
         else "bm.benchmark_mode"
     )
@@ -1637,6 +1878,18 @@ async def _build_cohort_materialization_context(classes: dict[str, type], schema
         "high_score_threshold_passed",
         "high_confidence_threshold_passed",
         "estimated_cost_level",
+        "score_method",
+        "cost_source",
+        "confidence_0_100",
+        "confidence_band",
+        "data_coverage_0_100",
+        "provider_class",
+        "location_source",
+        "has_claims",
+        "has_qpp",
+        "has_rx",
+        "has_enrollment",
+        "has_medicare_claims",
         "run_id",
         "updated_at",
     ]
@@ -1651,9 +1904,7 @@ async def _build_cohort_materialization_context(classes: dict[str, type], schema
         "c.ci90_low::float8",
         "c.ci90_high::float8",
         "ROUND((LEAST(100.0, GREATEST(0.0, 50.0 - 125.0 * (c.rr_overall - 1.0))))::numeric, 2)::float8 AS score_0_100",
-        "CASE WHEN c.low_score_check AND c.low_confidence_check THEN 'low' "
-        "WHEN (c.low_score_check::int + c.low_confidence_check::int) = 1 THEN 'acceptable' "
-        "WHEN c.high_score_check AND c.high_confidence_check THEN 'high' ELSE 'acceptable' END::varchar AS tier",
+        "c.final_tier::varchar AS tier",
         "((c.low_score_check::int + c.low_confidence_check::int) = 1)::boolean AS borderline_status",
         "c.low_score_check",
         "c.low_confidence_check",
@@ -1661,6 +1912,18 @@ async def _build_cohort_materialization_context(classes: dict[str, type], schema
         "c.high_confidence_check",
         "CASE WHEN c.rr_cost <= 0.80 THEN '$' WHEN c.rr_cost <= 0.90 THEN '$$' "
         "WHEN c.rr_cost <= 1.10 THEN '$$$' WHEN c.rr_cost <= 1.25 THEN '$$$$' ELSE '$$$$$' END::varchar AS estimated_cost_level",
+        "c.score_method",
+        "c.cost_source",
+        "c.confidence_0_100",
+        "c.confidence_band",
+        "c.data_coverage_0_100",
+        "c.provider_class",
+        "c.location_source",
+        "c.has_claims",
+        "c.has_qpp",
+        "c.has_rx",
+        "c.has_enrollment",
+        "c.has_medicare_claims",
         "CAST(:run_id AS varchar) AS run_id",
         "NOW() AS updated_at",
     ]
@@ -1734,6 +1997,12 @@ async def _build_cohort_materialization_context(classes: dict[str, type], schema
         "feature_taxonomy_expr": feature_taxonomy_expr,
         "feature_classification_expr": feature_classification_expr,
         "feature_procedure_bucket_expr": feature_procedure_bucket_expr,
+        "feature_state_expr": feature_state_expr,
+        "feature_zip_expr": feature_zip_expr,
+        "feature_provider_class_expr": feature_provider_class_expr,
+        "feature_location_source_expr": feature_location_source_expr,
+        "feature_has_enrollment_expr": feature_has_enrollment_expr,
+        "feature_has_medicare_claims_expr": feature_has_medicare_claims_expr,
         "peer_scope_expr": peer_scope_expr,
         "peer_benchmark_mode_expr": peer_benchmark_mode_expr,
         "peer_geo_value_expr": peer_geo_value_expr,
@@ -1750,6 +2019,17 @@ async def _build_cohort_materialization_context(classes: dict[str, type], schema
         "benchmark_mode_values": benchmark_mode_values,
         "measure_meta_sources": measure_meta_sources,
         "score_optional_pairs": score_optional_pairs,
+        "npi_table_exists": npi_table_exists,
+        "taxonomy_table_exists": taxonomy_table_exists,
+        "nucc_table_exists": nucc_table_exists,
+        "provider_enrichment_exists": provider_enrichment_exists,
+        "doctor_clinician_exists": doctor_clinician_exists,
+        "unified_address_exists": unified_address_exists,
+        "npi_address_exists": npi_address_exists,
+        "unified_address_has_multi_source_confirmed": "multi_source_confirmed" in unified_address_columns,
+        "unified_address_has_source_count": "source_count" in unified_address_columns,
+        "unified_address_has_checksum": "checksum" in unified_address_columns,
+        "nucc_has_classification": "classification" in nucc_columns,
     }
 
 
@@ -1758,19 +2038,48 @@ def _cohort_sql_phase_1_build_features(ctx: dict[str, Any]) -> str:
     feature_table = ctx["feature_table"]
     feature_insert_cols_sql = ctx["feature_insert_cols_sql"]
     feature_select_cols_sql = ctx["feature_select_cols_sql"]
-    return f"""
-        INSERT INTO {schema}.{feature_table}
-        (
-            {feature_insert_cols_sql}
-        )
-        WITH provider_base AS (
+    provider_class_expr = _provider_class_case_sql("COALESCE(nd.entity_type_code, 0)", "pe")
+    claims_state_expr = _state_code_sql("p.state")
+    doctor_state_expr = _state_code_sql("d.state")
+    unified_state_expr = _state_code_sql("e.state_name")
+    npi_state_expr = _state_code_sql("a.state_name")
+    unified_confirmed_order_sql = (
+        "CASE WHEN COALESCE(e.multi_source_confirmed, FALSE) THEN 0 ELSE 1 END,"
+        if ctx["unified_address_has_multi_source_confirmed"]
+        else ""
+    )
+    unified_source_count_order_sql = (
+        "COALESCE(e.source_count, 0) DESC,"
+        if ctx["unified_address_has_source_count"]
+        else ""
+    )
+    unified_checksum_order_sql = "e.checksum" if ctx["unified_address_has_checksum"] else "COALESCE(e.entity_id, 0)"
+    classification_select_sql = (
+        "COALESCE(NULLIF(LOWER(BTRIM(COALESCE(nt.classification, ''))), ''), 'unknown')::varchar"
+        if ctx["nucc_table_exists"] and ctx["nucc_has_classification"]
+        else "'unknown'::varchar"
+    )
+    npi_base_cte = (
+        f"""
+        npi_base AS (
             SELECT
-                p.npi,
-                p.year,
-                p.provider_type
-            FROM {schema}.{PricingProvider.__tablename__} p
-            WHERE p.year BETWEEN {PROVIDER_QUALITY_MIN_YEAR} AND {PROVIDER_QUALITY_MAX_YEAR}
+                n.npi::bigint AS npi,
+                n.entity_type_code
+            FROM {schema}.{NPIData.__tablename__} n
         ),
+        """
+        if ctx["npi_table_exists"]
+        else """
+        npi_base AS (
+            SELECT
+                NULL::bigint AS npi,
+                NULL::int AS entity_type_code
+            WHERE FALSE
+        ),
+        """
+    )
+    taxonomy_cte = (
+        f"""
         taxonomy_ranked AS (
             SELECT
                 t.npi::bigint AS npi,
@@ -1794,6 +2103,180 @@ def _cohort_sql_phase_1_build_features(ctx: dict[str, Any]) -> str:
             FROM taxonomy_ranked tr
             WHERE tr.rn = 1
         ),
+        """
+        if ctx["taxonomy_table_exists"]
+        else """
+        taxonomy_choice AS (
+            SELECT
+                NULL::bigint AS npi,
+                NULL::varchar AS taxonomy
+            WHERE FALSE
+        ),
+        """
+    )
+    provider_enrichment_cte = (
+        f"""
+        provider_enrichment_choice AS (
+            SELECT
+                pe.npi::bigint AS npi,
+                COALESCE(pe.has_any_enrollment, FALSE)::boolean AS has_any_enrollment,
+                COALESCE(pe.has_hospital_enrollment, FALSE)::boolean AS has_hospital_enrollment,
+                COALESCE(pe.has_hha_enrollment, FALSE)::boolean AS has_hha_enrollment,
+                COALESCE(pe.has_hospice_enrollment, FALSE)::boolean AS has_hospice_enrollment,
+                COALESCE(pe.has_fqhc_enrollment, FALSE)::boolean AS has_fqhc_enrollment,
+                COALESCE(pe.has_rhc_enrollment, FALSE)::boolean AS has_rhc_enrollment,
+                COALESCE(pe.has_snf_enrollment, FALSE)::boolean AS has_snf_enrollment,
+                COALESCE(pe.has_medicare_claims, FALSE)::boolean AS has_medicare_claims
+            FROM {schema}.{ProviderEnrichmentSummary.__tablename__} pe
+        ),
+        """
+        if ctx["provider_enrichment_exists"]
+        else """
+        provider_enrichment_choice AS (
+            SELECT
+                NULL::bigint AS npi,
+                FALSE::boolean AS has_any_enrollment,
+                FALSE::boolean AS has_hospital_enrollment,
+                FALSE::boolean AS has_hha_enrollment,
+                FALSE::boolean AS has_hospice_enrollment,
+                FALSE::boolean AS has_fqhc_enrollment,
+                FALSE::boolean AS has_rhc_enrollment,
+                FALSE::boolean AS has_snf_enrollment,
+                FALSE::boolean AS has_medicare_claims
+            WHERE FALSE
+        ),
+        """
+    )
+    doctor_address_cte = (
+        f"""
+        doctor_address_choice AS (
+            SELECT DISTINCT ON (d.npi)
+                d.npi::bigint AS npi,
+                ({doctor_state_expr})::varchar AS state_key,
+                NULLIF(LEFT(REGEXP_REPLACE(COALESCE(d.zip_code, ''), '[^0-9]', '', 'g'), 5), '')::varchar AS zip5
+            FROM {schema}.{DoctorClinicianAddress.__tablename__} d
+            WHERE NULLIF(BTRIM(COALESCE(d.state, '')), '') IS NOT NULL
+               OR NULLIF(BTRIM(COALESCE(d.zip_code, '')), '') IS NOT NULL
+            ORDER BY
+                d.npi,
+                CASE
+                    WHEN NULLIF(LEFT(REGEXP_REPLACE(COALESCE(d.zip_code, ''), '[^0-9]', '', 'g'), 5), '') IS NOT NULL
+                     AND NULLIF(BTRIM(COALESCE(d.state, '')), '') IS NOT NULL THEN 0
+                    ELSE 1
+                END,
+                d.address_checksum
+        ),
+        """
+        if ctx["doctor_clinician_exists"]
+        else """
+        doctor_address_choice AS (
+            SELECT
+                NULL::bigint AS npi,
+                NULL::varchar AS state_key,
+                NULL::varchar AS zip5
+            WHERE FALSE
+        ),
+        """
+    )
+    unified_address_cte = (
+        f"""
+        unified_address_choice AS (
+            SELECT DISTINCT ON (COALESCE(e.npi, e.inferred_npi))
+                COALESCE(e.npi, e.inferred_npi)::bigint AS npi,
+                ({unified_state_expr})::varchar AS state_key,
+                NULLIF(LEFT(REGEXP_REPLACE(COALESCE(e.postal_code, ''), '[^0-9]', '', 'g'), 5), '')::varchar AS zip5
+            FROM {schema}.{EntityAddressUnified.__tablename__} e
+            WHERE COALESCE(e.npi, e.inferred_npi) IS NOT NULL
+              AND e.type IN ('practice', 'primary', 'secondary', 'site')
+              AND (
+                    NULLIF(BTRIM(COALESCE(e.state_name, '')), '') IS NOT NULL
+                 OR NULLIF(BTRIM(COALESCE(e.postal_code, '')), '') IS NOT NULL
+              )
+            ORDER BY
+                COALESCE(e.npi, e.inferred_npi),
+                {unified_confirmed_order_sql}
+                {unified_source_count_order_sql}
+                CASE e.type
+                    WHEN 'practice' THEN 0
+                    WHEN 'primary' THEN 1
+                    WHEN 'secondary' THEN 2
+                    ELSE 3
+                END,
+                {unified_checksum_order_sql}
+        ),
+        """
+        if ctx["unified_address_exists"]
+        else """
+        unified_address_choice AS (
+            SELECT
+                NULL::bigint AS npi,
+                NULL::varchar AS state_key,
+                NULL::varchar AS zip5
+            WHERE FALSE
+        ),
+        """
+    )
+    npi_address_cte = (
+        f"""
+        npi_address_choice AS (
+            SELECT DISTINCT ON (a.npi)
+                a.npi::bigint AS npi,
+                ({npi_state_expr})::varchar AS state_key,
+                NULLIF(LEFT(REGEXP_REPLACE(COALESCE(a.postal_code, ''), '[^0-9]', '', 'g'), 5), '')::varchar AS zip5
+            FROM {schema}.{NPIAddress.__tablename__} a
+            WHERE a.type IN ('primary', 'practice', 'secondary')
+              AND (
+                    NULLIF(BTRIM(COALESCE(a.state_name, '')), '') IS NOT NULL
+                 OR NULLIF(BTRIM(COALESCE(a.postal_code, '')), '') IS NOT NULL
+              )
+            ORDER BY
+                a.npi,
+                CASE a.type
+                    WHEN 'practice' THEN 0
+                    WHEN 'primary' THEN 1
+                    WHEN 'secondary' THEN 2
+                    ELSE 3
+                END,
+                a.checksum
+        ),
+        """
+        if ctx["npi_address_exists"]
+        else """
+        npi_address_choice AS (
+            SELECT
+                NULL::bigint AS npi,
+                NULL::varchar AS state_key,
+                NULL::varchar AS zip5
+            WHERE FALSE
+        ),
+        """
+    )
+    nucc_join = (
+        f"""
+            LEFT JOIN {schema}.{NUCCTaxonomy.__tablename__} nt
+              ON LOWER(BTRIM(COALESCE(nt.code, ''))) = tc.taxonomy
+        """
+        if ctx["nucc_table_exists"]
+        else ""
+    )
+    return f"""
+        INSERT INTO {schema}.{feature_table}
+        (
+            {feature_insert_cols_sql}
+        )
+        WITH provider_base AS (
+            SELECT
+                p.npi,
+                p.year,
+                p.provider_type,
+                NULLIF(BTRIM(COALESCE(p.zip5, '')), '')::varchar AS claims_zip5,
+                ({claims_state_expr})::varchar AS claims_state
+            FROM {schema}.{PricingProvider.__tablename__} p
+            WHERE p.year BETWEEN {PROVIDER_QUALITY_MIN_YEAR} AND {PROVIDER_QUALITY_MAX_YEAR}
+        ),
+        {npi_base_cte}
+        {taxonomy_cte}
+        {provider_enrichment_cte}
         procedure_counts AS (
             SELECT
                 pp.npi,
@@ -1803,25 +2286,49 @@ def _cohort_sql_phase_1_build_features(ctx: dict[str, Any]) -> str:
             WHERE pp.year BETWEEN {PROVIDER_QUALITY_MIN_YEAR} AND {PROVIDER_QUALITY_MAX_YEAR}
             GROUP BY pp.npi, pp.year
         ),
+        {doctor_address_cte}
+        {unified_address_cte}
+        {npi_address_cte}
         features_src AS (
             SELECT
                 p.npi,
                 p.year,
+                COALESCE(da.zip5, ua.zip5, na.zip5, p.claims_zip5)::varchar AS zip5,
+                COALESCE(da.state_key, ua.state_key, na.state_key, p.claims_state)::varchar AS state,
+                {provider_class_expr} AS provider_class,
+                CASE
+                    WHEN da.npi IS NOT NULL THEN 'doctor_clinician_address'
+                    WHEN ua.npi IS NOT NULL THEN 'entity_address_unified'
+                    WHEN na.npi IS NOT NULL THEN 'npi_address'
+                    WHEN p.claims_zip5 IS NOT NULL OR p.claims_state IS NOT NULL THEN 'claims_pricing'
+                    ELSE 'unknown'
+                END::varchar AS location_source,
+                COALESCE(pe.has_any_enrollment, FALSE) AS has_enrollment,
+                COALESCE(pe.has_medicare_claims, FALSE) AS has_medicare_claims,
                 COALESCE(NULLIF(LOWER(BTRIM(COALESCE(p.provider_type, ''))), ''), 'unknown')::varchar AS specialty,
                 COALESCE(tc.taxonomy, 'unknown')::varchar AS taxonomy,
-                COALESCE(NULLIF(LOWER(BTRIM(COALESCE(nt.classification, ''))), ''), 'unknown')::varchar AS classification,
+                {classification_select_sql} AS classification,
                 COALESCE(pc.procedure_count, 0)::int AS procedure_count,
                 'bucket:none'::varchar AS procedure_bucket,
                 'provider_quality'::varchar AS source,
                 NOW() AS updated_at
             FROM provider_base p
+            LEFT JOIN npi_base nd
+              ON nd.npi = p.npi
+            LEFT JOIN provider_enrichment_choice pe
+              ON pe.npi = p.npi
             LEFT JOIN taxonomy_choice tc
               ON tc.npi = p.npi
-            LEFT JOIN {schema}.{NUCCTaxonomy.__tablename__} nt
-              ON LOWER(BTRIM(COALESCE(nt.code, ''))) = tc.taxonomy
+            {nucc_join}
             LEFT JOIN procedure_counts pc
               ON pc.npi = p.npi
              AND pc.year = p.year
+            LEFT JOIN doctor_address_choice da
+              ON da.npi = p.npi
+            LEFT JOIN unified_address_choice ua
+              ON ua.npi = p.npi
+            LEFT JOIN npi_address_choice na
+              ON na.npi = p.npi
         )
         SELECT
             {feature_select_cols_sql}
@@ -2000,6 +2507,12 @@ def _cohort_sql_phase_4_build_peer_targets(ctx: dict[str, Any]) -> str:
         provider_featured AS (
             SELECT
                 p.*,
+                {ctx["feature_zip_expr"]} AS resolved_zip5,
+                {ctx["feature_state_expr"]} AS resolved_state_key,
+                {ctx["feature_provider_class_expr"]} AS provider_class,
+                {ctx["feature_location_source_expr"]} AS location_source,
+                {ctx["feature_has_enrollment_expr"]} AS has_enrollment,
+                {ctx["feature_has_medicare_claims_expr"]} AS has_medicare_claims,
                 {ctx["feature_specialty_expr"]} AS specialty,
                 {ctx["feature_taxonomy_expr"]} AS taxonomy,
                 {ctx["feature_classification_expr"]} AS classification,
@@ -2022,8 +2535,8 @@ def _cohort_sql_phase_4_build_peer_targets(ctx: dict[str, Any]) -> str:
                 bm.benchmark_mode,
                 gs.geography_scope,
                 CASE
-                    WHEN gs.geography_scope = 'zip' THEN p.zip5
-                    WHEN gs.geography_scope = 'state' THEN p.state_key
+                    WHEN gs.geography_scope = 'zip' THEN p.resolved_zip5
+                    WHEN gs.geography_scope = 'state' THEN p.resolved_state_key
                     ELSE 'US'
                 END::varchar AS geography_value,
                 lv.cohort_level,
@@ -2059,8 +2572,8 @@ def _cohort_sql_phase_4_build_peer_targets(ctx: dict[str, Any]) -> str:
             )
             AND (
                 gs.geography_scope = 'national'
-                OR (gs.geography_scope = 'state' AND p.state_key IS NOT NULL)
-                OR (gs.geography_scope = 'zip' AND p.zip5 IS NOT NULL)
+                OR (gs.geography_scope = 'state' AND p.resolved_state_key IS NOT NULL)
+                OR (gs.geography_scope = 'zip' AND p.resolved_zip5 IS NOT NULL)
             )
         ),
         peer_target_src AS (
@@ -2170,6 +2683,12 @@ def _cohort_sql_phase_5_build_measure_shard(ctx: dict[str, Any]) -> str:
         provider_featured AS (
             SELECT
                 p.*,
+                {ctx["feature_zip_expr"]} AS resolved_zip5,
+                {ctx["feature_state_expr"]} AS resolved_state_key,
+                {ctx["feature_provider_class_expr"]} AS provider_class,
+                {ctx["feature_location_source_expr"]} AS location_source,
+                {ctx["feature_has_enrollment_expr"]} AS has_enrollment,
+                {ctx["feature_has_medicare_claims_expr"]} AS has_medicare_claims,
                 {ctx["feature_specialty_expr"]} AS specialty,
                 {ctx["feature_taxonomy_expr"]} AS taxonomy,
                 {ctx["feature_classification_expr"]} AS classification,
@@ -2238,12 +2757,12 @@ def _cohort_sql_phase_5_build_measure_shard(ctx: dict[str, Any]) -> str:
               ON t.{ctx["peer_target_year_col"]} = p.year
              AND {ctx["peer_benchmark_mode_expr"]} = bm.benchmark_mode
              AND (
-                    ({ctx["peer_scope_expr"]} = 'zip' AND bm.benchmark_mode = 'zip' AND p.zip5 IS NOT NULL AND {ctx["peer_geo_value_expr"]} = p.zip5)
+                    ({ctx["peer_scope_expr"]} = 'zip' AND bm.benchmark_mode = 'zip' AND p.resolved_zip5 IS NOT NULL AND {ctx["peer_geo_value_expr"]} = p.resolved_zip5)
                     OR (
                         {ctx["peer_scope_expr"]} = 'state'
                         AND bm.benchmark_mode IN ('zip', 'state')
-                        AND p.state_key IS NOT NULL
-                        AND UPPER({ctx["peer_geo_value_expr"]}) = p.state_key
+                        AND p.resolved_state_key IS NOT NULL
+                        AND UPPER({ctx["peer_geo_value_expr"]}) = p.resolved_state_key
                     )
                     OR ({ctx["peer_scope_expr"]} = 'national' AND bm.benchmark_mode IN ('zip', 'state', 'national'))
                 )
@@ -2528,7 +3047,8 @@ def _cohort_sql_phase_6_build_domain_shard(ctx: dict[str, Any]) -> str:
 def _cohort_sql_phase_7_build_score_shard(ctx: dict[str, Any]) -> str:
     schema = ctx["schema"]
     cohort_meta_cte = ""
-    cohort_meta_join = ""
+    cohort_meta_join_scored = ""
+    cohort_meta_join_final = ""
     if ctx["score_optional_pairs"] and ctx["measure_meta_sources"]:
         cohort_meta_cte = (
             ",\n        cohort_meta AS (\n"
@@ -2546,7 +3066,13 @@ def _cohort_sql_phase_7_build_score_shard(ctx: dict[str, Any]) -> str:
             "            GROUP BY m.npi, m.year, m.benchmark_mode\n"
             "        )\n"
         )
-        cohort_meta_join = (
+        cohort_meta_join_scored = (
+            "\n        LEFT JOIN cohort_meta cm\n"
+            "          ON cm.npi = b.npi\n"
+            "         AND cm.year = b.year\n"
+            "         AND cm.benchmark_mode = b.benchmark_mode"
+        )
+        cohort_meta_join_final = (
             "\n        LEFT JOIN cohort_meta cm\n"
             "          ON cm.npi = c.npi\n"
             "         AND cm.year = c.year\n"
@@ -2615,14 +3141,120 @@ def _cohort_sql_phase_7_build_score_shard(ctx: dict[str, Any]) -> str:
                 ) AS ci90_high
             FROM domain_pivot p
         ),
-        checks AS (
+        score_meta AS (
+            SELECT
+                m.npi,
+                m.year,
+                m.benchmark_mode,
+                BOOL_OR(m.measure_id = 'appropriateness_utilization' AND COALESCE(m.observed, 0.0) > 0)::boolean AS has_claims,
+                BOOL_OR(m.measure_id = 'effectiveness_qpp_quality' AND COALESCE(m.observed, 0.0) > 0)::boolean AS has_qpp,
+                BOOL_OR(m.measure_id = 'appropriateness_drug_proxy' AND COALESCE(m.observed, 0.0) > 0)::boolean AS has_rx
+            FROM {schema}.{ctx["measure_table"]} m
+            WHERE m.year = :year
+              AND {_npi_shard_predicate("m.npi")}
+            GROUP BY m.npi, m.year, m.benchmark_mode
+        ),
+        feature_meta AS (
+            SELECT
+                f.npi,
+                f.year,
+                COALESCE(NULLIF(LOWER(BTRIM(COALESCE(f.provider_class, ''))), ''), 'unknown')::varchar AS provider_class,
+                COALESCE(NULLIF(BTRIM(COALESCE(f.location_source, '')), ''), 'claims_pricing')::varchar AS location_source,
+                COALESCE(f.has_enrollment, FALSE)::boolean AS has_enrollment,
+                COALESCE(f.has_medicare_claims, FALSE)::boolean AS has_medicare_claims
+            FROM {schema}.{ctx["feature_table"]} f
+            WHERE f.year = :year
+              AND {_npi_shard_predicate("f.npi")}
+        ),
+        scored AS (
             SELECT
                 b.*,
+                COALESCE(sm.has_claims, FALSE)::boolean AS has_claims,
+                COALESCE(sm.has_qpp, FALSE)::boolean AS has_qpp,
+                COALESCE(sm.has_rx, FALSE)::boolean AS has_rx,
+                COALESCE(fm.provider_class, 'unknown')::varchar AS provider_class,
+                COALESCE(fm.location_source, 'claims_pricing')::varchar AS location_source,
+                COALESCE(fm.has_enrollment, FALSE)::boolean AS has_enrollment,
+                COALESCE(fm.has_medicare_claims, FALSE)::boolean AS has_medicare_claims,
+                COALESCE(cm.selected_peer_n, 0)::float8 AS selected_peer_n,
                 (b.rr_overall >= 1.12)::boolean AS low_score_check,
                 (b.ci90_low >= 1.08)::boolean AS low_confidence_check,
                 (b.rr_overall <= 0.88)::boolean AS high_score_check,
-                (b.ci75_high < 1.0)::boolean AS high_confidence_check
+                (b.ci75_high < 1.0)::boolean AS high_confidence_check,
+                LEAST(
+                    100.0,
+                    (
+                        CASE WHEN COALESCE(sm.has_claims, FALSE) THEN 40.0 ELSE 0.0 END
+                        + CASE WHEN COALESCE(sm.has_qpp, FALSE) THEN 25.0 ELSE 0.0 END
+                        + CASE WHEN COALESCE(sm.has_rx, FALSE) THEN 15.0 ELSE 0.0 END
+                        + CASE WHEN COALESCE(fm.has_enrollment, FALSE) THEN 10.0 ELSE 0.0 END
+                        + CASE
+                            WHEN COALESCE(fm.location_source, 'claims_pricing') NOT IN ('claims_pricing', 'unknown', '')
+                            THEN 10.0
+                            ELSE 5.0
+                          END
+                    )
+                )::float8 AS data_coverage_0_100,
+                LEAST(
+                    100.0,
+                    (
+                        CASE WHEN COALESCE(sm.has_claims, FALSE) THEN 35.0 ELSE 0.0 END
+                        + CASE WHEN COALESCE(sm.has_qpp, FALSE) THEN 20.0 ELSE 0.0 END
+                        + CASE WHEN COALESCE(sm.has_rx, FALSE) THEN 10.0 ELSE 0.0 END
+                        + CASE WHEN COALESCE(fm.has_enrollment, FALSE) THEN 10.0 ELSE 0.0 END
+                        + CASE WHEN COALESCE(fm.has_medicare_claims, FALSE) THEN 5.0 ELSE 0.0 END
+                        + CASE
+                            WHEN COALESCE(cm.selected_peer_n, 0) >= 100 THEN 10.0
+                            WHEN COALESCE(cm.selected_peer_n, 0) >= 30 THEN 5.0
+                            ELSE 0.0
+                          END
+                        + CASE
+                            WHEN COALESCE(fm.location_source, 'claims_pricing') NOT IN ('claims_pricing', 'unknown', '')
+                            THEN 10.0
+                            ELSE 0.0
+                          END
+                    )
+                )::float8 AS confidence_0_100
             FROM blended b
+            LEFT JOIN score_meta sm
+              ON sm.npi = b.npi
+             AND sm.year = b.year
+             AND sm.benchmark_mode = b.benchmark_mode
+            LEFT JOIN feature_meta fm
+              ON fm.npi = b.npi
+             AND fm.year = b.year{cohort_meta_join_scored}
+        ),
+        finalized AS (
+            SELECT
+                s.*,
+                CASE
+                    WHEN s.has_claims AND s.has_qpp THEN 'direct'
+                    WHEN s.has_claims OR s.has_qpp OR s.has_rx THEN 'mixed'
+                    ELSE 'unavailable'
+                END::varchar AS score_method,
+                CASE
+                    WHEN s.has_claims THEN 'direct'
+                    WHEN COALESCE(s.selected_peer_n, 0) > 0 THEN 'peer_estimated'
+                    ELSE 'unavailable'
+                END::varchar AS cost_source,
+                CASE
+                    WHEN s.confidence_0_100 >= 80 THEN 'high'
+                    WHEN s.confidence_0_100 >= 55 THEN 'medium'
+                    WHEN s.confidence_0_100 > 0 THEN 'low'
+                    ELSE 'none'
+                END::varchar AS confidence_band,
+                CASE
+                    WHEN s.confidence_0_100 < 55
+                     AND (
+                            (s.low_score_check AND s.low_confidence_check)
+                         OR (s.high_score_check AND s.high_confidence_check)
+                         )
+                    THEN 'acceptable'
+                    WHEN s.low_score_check AND s.low_confidence_check THEN 'low'
+                    WHEN s.high_score_check AND s.high_confidence_check THEN 'high'
+                    ELSE 'acceptable'
+                END::varchar AS final_tier
+            FROM scored s
         )
         INSERT INTO {schema}.{ctx["score_table"]}
         (
@@ -2630,1227 +3262,45 @@ def _cohort_sql_phase_7_build_score_shard(ctx: dict[str, Any]) -> str:
         )
         SELECT
             {ctx["score_select_cols_sql"]}
-        FROM checks c{cohort_meta_join};
+        FROM finalized c{cohort_meta_join_final};
     """
 
 
 async def _materialize_quality_rows_cohort(classes: dict[str, type], schema: str, run_id: str) -> None:
-    qpp_table = classes["PricingQppProvider"].__tablename__
-    svi_table = classes["PricingSviZcta"].__tablename__
-    measure_table = classes["PricingProviderQualityMeasure"].__tablename__
-    domain_table = classes["PricingProviderQualityDomain"].__tablename__
-    score_table = classes["PricingProviderQualityScore"].__tablename__
-    feature_table = classes["PricingProviderQualityFeature"].__tablename__
-    lsh_table = classes["PricingProviderQualityProcedureLSH"].__tablename__
-    peer_target_table = classes["PricingProviderQualityPeerTarget"].__tablename__
-    rx_table = PricingProviderPrescription.__tablename__
-    rx_table_exists = await _table_exists(schema, rx_table)
+    ctx = await _build_cohort_materialization_context(classes, schema)
 
-    feature_columns = _model_columns(classes.get("PricingProviderQualityFeature"))
-    lsh_columns = _model_columns(classes.get("PricingProviderQualityProcedureLSH"))
-    peer_target_columns = _model_columns(classes.get("PricingProviderQualityPeerTarget"))
-    measure_columns = _model_columns(classes.get("PricingProviderQualityMeasure"))
-    score_columns = _model_columns(classes.get("PricingProviderQualityScore"))
+    await db.status(f"TRUNCATE TABLE {schema}.{ctx['feature_table']};")
+    await db.status(f"TRUNCATE TABLE {schema}.{ctx['lsh_table']};")
+    await db.status(f"TRUNCATE TABLE {schema}.{ctx['peer_target_table']};")
+    await db.status(f"TRUNCATE TABLE {schema}.{ctx['measure_table']};")
+    await db.status(f"TRUNCATE TABLE {schema}.{ctx['domain_table']};")
+    await db.status(f"TRUNCATE TABLE {schema}.{ctx['score_table']};")
 
-    feature_npi_col = _first_existing_column(feature_columns, "npi")
-    feature_year_col = _first_existing_column(feature_columns, "year")
-    if not feature_npi_col or not feature_year_col:
-        raise RuntimeError("cohort feature model must expose npi/year columns")
+    await db.status(_cohort_sql_phase_1_build_features(ctx))
 
-    lsh_npi_col = _first_existing_column(lsh_columns, "npi")
-    lsh_year_col = _first_existing_column(lsh_columns, "year")
-    lsh_band_no_col = _first_existing_column(lsh_columns, "band_no", "band_index")
-    lsh_band_hash_col = _first_existing_column(lsh_columns, "band_hash", "hash_value")
-    if not lsh_npi_col or not lsh_year_col or not lsh_band_no_col or not lsh_band_hash_col:
-        raise RuntimeError("cohort LSH model must expose npi/year/band_no/band_hash columns")
-
-    peer_target_year_col = _first_existing_column(peer_target_columns, "year")
-    peer_target_benchmark_mode_col = _first_existing_column(peer_target_columns, "benchmark_mode")
-    peer_target_geo_scope_col = _first_existing_column(peer_target_columns, "geography_scope", "geo_scope")
-    peer_target_geo_value_col = _first_existing_column(peer_target_columns, "geography_value", "geo_value")
-    peer_target_cohort_level_col = _first_existing_column(peer_target_columns, "cohort_level", "cohort_tier")
-    peer_target_peer_n_col = _first_existing_column(peer_target_columns, "peer_n", "peer_count", "provider_count")
-    peer_target_specialty_col = _first_existing_column(peer_target_columns, "specialty", "specialty_key")
-    peer_target_taxonomy_col = _first_existing_column(peer_target_columns, "taxonomy", "taxonomy_code")
-    peer_target_classification_col = _first_existing_column(peer_target_columns, "classification")
-    peer_target_procedure_bucket_col = _first_existing_column(peer_target_columns, "procedure_bucket")
-    peer_target_appropr_col = _first_existing_column(peer_target_columns, "target_appropriateness")
-    peer_target_cost_col = _first_existing_column(peer_target_columns, "target_cost")
-    peer_target_effect_col = _first_existing_column(peer_target_columns, "target_effectiveness")
-    peer_target_qpp_cost_col = _first_existing_column(peer_target_columns, "target_qpp_cost")
-    peer_target_rx_appropr_col = _first_existing_column(peer_target_columns, "target_rx_appropriateness")
-    if (
-        not peer_target_year_col
-        or not peer_target_geo_scope_col
-        or not peer_target_geo_value_col
-        or not peer_target_cohort_level_col
-        or not peer_target_peer_n_col
-        or not peer_target_appropr_col
-        or not peer_target_cost_col
-        or not peer_target_effect_col
-        or not peer_target_qpp_cost_col
-        or not peer_target_rx_appropr_col
-    ):
-        raise RuntimeError("cohort peer-target model is missing required columns")
-
-    feature_insert_pairs = _optional_column_pairs(
-        feature_columns,
-        (
-            ("npi", "f.npi"),
-            ("year", "f.year"),
-            ("specialty", "f.specialty"),
-            ("specialty_key", "f.specialty"),
-            ("taxonomy", "f.taxonomy"),
-            ("taxonomy_code", "f.taxonomy"),
-            ("classification", "f.classification"),
-            ("procedure_count", "f.procedure_count"),
-            ("procedure_bucket", "f.procedure_bucket"),
-            ("source", "f.source"),
-            ("updated_at", "f.updated_at"),
-        ),
-    )
-    lsh_insert_pairs = _optional_column_pairs(
-        lsh_columns,
-        (
-            ("npi", "s.npi"),
-            ("year", "s.year"),
-            ("band_no", "s.band_no"),
-            ("band_index", "s.band_no"),
-            ("band_hash", "s.band_hash"),
-            ("hash_value", "s.band_hash"),
-            ("rows_in_band", "s.rows_in_band"),
-            ("source", "s.source"),
-            ("updated_at", "s.updated_at"),
-        ),
-    )
-    peer_target_insert_pairs = _optional_column_pairs(
-        peer_target_columns,
-        (
-            ("year", "t.year"),
-            ("benchmark_mode", "t.benchmark_mode"),
-            ("geography_scope", "t.geography_scope"),
-            ("geo_scope", "t.geography_scope"),
-            ("geography_value", "t.geography_value"),
-            ("geo_value", "t.geography_value"),
-            ("cohort_level", "t.cohort_level"),
-            ("cohort_tier", "t.cohort_level"),
-            ("specialty", "t.specialty"),
-            ("specialty_key", "t.specialty"),
-            ("taxonomy", "t.taxonomy"),
-            ("taxonomy_code", "t.taxonomy"),
-            ("classification", "t.classification"),
-            ("procedure_bucket", "t.procedure_bucket"),
-            ("peer_n", "t.peer_n"),
-            ("peer_count", "t.peer_n"),
-            ("provider_count", "t.peer_n"),
-            ("target_appropriateness", "t.target_appropriateness"),
-            ("target_cost", "t.target_cost"),
-            ("target_effectiveness", "t.target_effectiveness"),
-            ("target_qpp_cost", "t.target_qpp_cost"),
-            ("target_rx_appropriateness", "t.target_rx_appropriateness"),
-            ("source", "t.source"),
-            ("updated_at", "t.updated_at"),
-        ),
-    )
-    if not feature_insert_pairs or not lsh_insert_pairs or not peer_target_insert_pairs:
-        raise RuntimeError("cohort models do not expose insertable columns")
-
-    feature_insert_cols_sql = ",\n            ".join(column for column, _ in feature_insert_pairs)
-    feature_select_cols_sql = ",\n            ".join(expr for _, expr in feature_insert_pairs)
-    lsh_insert_cols_sql = ",\n            ".join(column for column, _ in lsh_insert_pairs)
-    lsh_select_cols_sql = ",\n            ".join(expr for _, expr in lsh_insert_pairs)
-    peer_target_insert_cols_sql = ",\n            ".join(column for column, _ in peer_target_insert_pairs)
-    peer_target_select_cols_sql = ",\n            ".join(expr for _, expr in peer_target_insert_pairs)
-
-    feature_specialty_col = _first_existing_column(feature_columns, "specialty", "specialty_key")
-    feature_taxonomy_col = _first_existing_column(feature_columns, "taxonomy", "taxonomy_code")
-    feature_classification_col = _first_existing_column(feature_columns, "classification")
-    feature_procedure_bucket_col = _first_existing_column(feature_columns, "procedure_bucket")
-
-    feature_specialty_expr = (
-        f"COALESCE(NULLIF(LOWER(BTRIM(COALESCE(f.{feature_specialty_col}, ''))), ''), 'unknown')"
-        if feature_specialty_col
-        else "COALESCE(NULLIF(LOWER(BTRIM(COALESCE(p.provider_type, ''))), ''), 'unknown')"
-    )
-    feature_taxonomy_expr = (
-        f"COALESCE(NULLIF(LOWER(BTRIM(COALESCE(f.{feature_taxonomy_col}, ''))), ''), 'unknown')"
-        if feature_taxonomy_col
-        else "'unknown'::varchar"
-    )
-    feature_classification_expr = (
-        f"COALESCE(NULLIF(LOWER(BTRIM(COALESCE(f.{feature_classification_col}, ''))), ''), 'unknown')"
-        if feature_classification_col
-        else "'unknown'::varchar"
-    )
-    feature_procedure_bucket_expr = (
-        f"COALESCE(NULLIF(BTRIM(COALESCE(f.{feature_procedure_bucket_col}, '')), ''), 'bucket:none')"
-        if feature_procedure_bucket_col
-        else "'bucket:none'::varchar"
-    )
-
-    peer_scope_expr = f"LOWER(COALESCE(t.{peer_target_geo_scope_col}, 'national'))"
-    peer_benchmark_mode_expr = (
-        f"LOWER(COALESCE(t.{peer_target_benchmark_mode_col}, 'national'))"
-        if peer_target_benchmark_mode_col
-        else "bm.benchmark_mode"
-    )
-    peer_geo_value_expr = f"NULLIF(BTRIM(COALESCE(t.{peer_target_geo_value_col}, '')), '')"
-    peer_cohort_level_expr = f"UPPER(COALESCE(t.{peer_target_cohort_level_col}, 'L3'))"
-    peer_peer_n_expr = f"COALESCE(t.{peer_target_peer_n_col}, 0)"
-    peer_specialty_expr = (
-        f"COALESCE(NULLIF(LOWER(BTRIM(COALESCE(t.{peer_target_specialty_col}, ''))), ''), 'unknown')"
-        if peer_target_specialty_col
-        else "'unknown'::varchar"
-    )
-    peer_taxonomy_expr = (
-        f"COALESCE(NULLIF(LOWER(BTRIM(COALESCE(t.{peer_target_taxonomy_col}, ''))), ''), 'unknown')"
-        if peer_target_taxonomy_col
-        else "'unknown'::varchar"
-    )
-    peer_classification_expr = (
-        f"COALESCE(NULLIF(LOWER(BTRIM(COALESCE(t.{peer_target_classification_col}, ''))), ''), 'unknown')"
-        if peer_target_classification_col
-        else "'unknown'::varchar"
-    )
-    peer_procedure_bucket_expr = (
-        f"COALESCE(NULLIF(BTRIM(COALESCE(t.{peer_target_procedure_bucket_col}, '')), ''), 'bucket:none')"
-        if peer_target_procedure_bucket_col
-        else "'bucket:none'::varchar"
-    )
-    peer_specialty_match = f"{peer_specialty_expr} = COALESCE(p.specialty, 'unknown')"
-    peer_taxonomy_match = f"{peer_taxonomy_expr} = COALESCE(p.taxonomy, 'unknown')"
-    peer_procedure_bucket_match = f"{peer_procedure_bucket_expr} = COALESCE(p.procedure_bucket, 'bucket:none')"
-
-    measure_optional_pairs = _optional_column_pairs(
-        measure_columns,
-        (
-            ("cohort_level", "s.selected_cohort_level"),
-            ("cohort_tier", "s.selected_cohort_level"),
-            ("cohort_geography_scope", "s.selected_geography_scope"),
-            ("cohort_geo_scope", "s.selected_geography_scope"),
-            ("cohort_geography_value", "s.selected_geography_value"),
-            ("cohort_geo_value", "s.selected_geography_value"),
-            ("cohort_specialty", "s.selected_specialty"),
-            ("cohort_specialty_key", "s.selected_specialty"),
-            ("cohort_taxonomy", "s.selected_taxonomy"),
-            ("cohort_taxonomy_code", "s.selected_taxonomy"),
-            ("cohort_classification", "s.selected_classification"),
-            ("cohort_procedure_bucket", "s.selected_procedure_bucket"),
-            ("cohort_peer_n", "ROUND(s.selected_peer_n)::int"),
-        ),
-    )
-    measure_insert_columns = [
-        "npi",
-        "year",
-        "benchmark_mode",
-        "measure_id",
-        "domain",
-        "observed",
-        "target",
-        "risk_ratio",
-        "ci75_low",
-        "ci75_high",
-        "ci90_low",
-        "ci90_high",
-        "evidence_n",
-        "peer_group",
-        "direction",
-        "source",
-        "updated_at",
-    ]
-    measure_select_columns = [
-        "s.npi",
-        "s.year",
-        "s.benchmark_mode",
-        "s.measure_id",
-        "s.domain",
-        "s.observed_value",
-        "s.target_value",
-        "(1.0 + (s.rr_raw - 1.0) * s.shrink_weight)::float8 AS risk_ratio",
-        "GREATEST(0.01, (1.0 + (s.rr_raw - 1.0) * s.shrink_weight) - 1.15 * s.stderr)::float8 AS ci75_low",
-        "((1.0 + (s.rr_raw - 1.0) * s.shrink_weight) + 1.15 * s.stderr)::float8 AS ci75_high",
-        "GREATEST(0.01, (1.0 + (s.rr_raw - 1.0) * s.shrink_weight) - 1.64 * s.stderr)::float8 AS ci90_low",
-        "((1.0 + (s.rr_raw - 1.0) * s.shrink_weight) + 1.64 * s.stderr)::float8 AS ci90_high",
-        "ROUND(s.evidence_n)::int",
-        "s.peer_group",
-        "s.direction",
-        "s.source",
-        "NOW() AS updated_at",
-    ]
-    measure_insert_columns.extend(column for column, _ in measure_optional_pairs)
-    measure_select_columns.extend(expr for _, expr in measure_optional_pairs)
-    measure_insert_cols_sql = ",\n            ".join(measure_insert_columns)
-    measure_select_cols_sql = ",\n            ".join(measure_select_columns)
-
-    measure_meta_sources = {
-        "selected_cohort_level": _first_existing_column(measure_columns, "cohort_level", "cohort_tier"),
-        "selected_geography_scope": _first_existing_column(measure_columns, "cohort_geography_scope", "cohort_geo_scope"),
-        "selected_geography_value": _first_existing_column(measure_columns, "cohort_geography_value", "cohort_geo_value"),
-        "selected_specialty": _first_existing_column(measure_columns, "cohort_specialty", "cohort_specialty_key"),
-        "selected_taxonomy": _first_existing_column(measure_columns, "cohort_taxonomy", "cohort_taxonomy_code"),
-        "selected_classification": _first_existing_column(measure_columns, "cohort_classification"),
-        "selected_procedure_bucket": _first_existing_column(measure_columns, "cohort_procedure_bucket"),
-        "selected_peer_n": _first_existing_column(measure_columns, "cohort_peer_n"),
-    }
-    measure_meta_sources = {alias: column for alias, column in measure_meta_sources.items() if column}
-
-    score_optional_mapping: list[tuple[str, str]] = []
-    if "selected_cohort_level" in measure_meta_sources:
-        score_optional_mapping.extend(
-            (
-                ("cohort_level", "cm.selected_cohort_level"),
-                ("cohort_tier", "cm.selected_cohort_level"),
-            )
-        )
-    if "selected_geography_scope" in measure_meta_sources:
-        score_optional_mapping.extend(
-            (
-                ("cohort_geography_scope", "cm.selected_geography_scope"),
-                ("cohort_geo_scope", "cm.selected_geography_scope"),
-            )
-        )
-    if "selected_geography_value" in measure_meta_sources:
-        score_optional_mapping.extend(
-            (
-                ("cohort_geography_value", "cm.selected_geography_value"),
-                ("cohort_geo_value", "cm.selected_geography_value"),
-            )
-        )
-    if "selected_specialty" in measure_meta_sources:
-        score_optional_mapping.extend(
-            (
-                ("cohort_specialty", "cm.selected_specialty"),
-                ("cohort_specialty_key", "cm.selected_specialty"),
-            )
-        )
-    if "selected_taxonomy" in measure_meta_sources:
-        score_optional_mapping.extend(
-            (
-                ("cohort_taxonomy", "cm.selected_taxonomy"),
-                ("cohort_taxonomy_code", "cm.selected_taxonomy"),
-            )
-        )
-    if "selected_classification" in measure_meta_sources:
-        score_optional_mapping.append(("cohort_classification", "cm.selected_classification"))
-    if "selected_procedure_bucket" in measure_meta_sources:
-        score_optional_mapping.append(("cohort_procedure_bucket", "cm.selected_procedure_bucket"))
-    if "selected_peer_n" in measure_meta_sources:
-        score_optional_mapping.append(("cohort_peer_n", "ROUND(cm.selected_peer_n)::int"))
-    score_optional_pairs = _optional_column_pairs(score_columns, tuple(score_optional_mapping))
-
-    score_insert_columns = [
-        "npi",
-        "year",
-        "model_version",
-        "benchmark_mode",
-        "risk_ratio_point",
-        "ci75_low",
-        "ci75_high",
-        "ci90_low",
-        "ci90_high",
-        "score_0_100",
-        "tier",
-        "borderline_status",
-        "low_score_threshold_failed",
-        "low_confidence_threshold_failed",
-        "high_score_threshold_passed",
-        "high_confidence_threshold_passed",
-        "estimated_cost_level",
-        "run_id",
-        "updated_at",
-    ]
-    score_select_columns = [
-        "c.npi",
-        "c.year",
-        f"'{PROVIDER_QUALITY_MODEL_VERSION}'::varchar AS model_version",
-        "c.benchmark_mode::varchar AS benchmark_mode",
-        "c.rr_overall::float8 AS risk_ratio_point",
-        "c.ci75_low::float8",
-        "c.ci75_high::float8",
-        "c.ci90_low::float8",
-        "c.ci90_high::float8",
-        "ROUND((LEAST(100.0, GREATEST(0.0, 50.0 - 125.0 * (c.rr_overall - 1.0))))::numeric, 2)::float8 AS score_0_100",
-        "CASE WHEN c.low_score_check AND c.low_confidence_check THEN 'low' "
-        "WHEN (c.low_score_check::int + c.low_confidence_check::int) = 1 THEN 'acceptable' "
-        "WHEN c.high_score_check AND c.high_confidence_check THEN 'high' ELSE 'acceptable' END::varchar AS tier",
-        "((c.low_score_check::int + c.low_confidence_check::int) = 1)::boolean AS borderline_status",
-        "c.low_score_check",
-        "c.low_confidence_check",
-        "c.high_score_check",
-        "c.high_confidence_check",
-        "CASE WHEN c.rr_cost <= 0.80 THEN '$' WHEN c.rr_cost <= 0.90 THEN '$$' "
-        "WHEN c.rr_cost <= 1.10 THEN '$$$' WHEN c.rr_cost <= 1.25 THEN '$$$$' ELSE '$$$$$' END::varchar AS estimated_cost_level",
-        "CAST(:run_id AS varchar) AS run_id",
-        "NOW() AS updated_at",
-    ]
-    score_insert_columns.extend(column for column, _ in score_optional_pairs)
-    score_select_columns.extend(expr for _, expr in score_optional_pairs)
-    score_insert_cols_sql = ",\n            ".join(score_insert_columns)
-    score_select_cols_sql = ",\n            ".join(score_select_columns)
-
-    benchmark_modes = _benchmark_modes_for_materialization(PROVIDER_QUALITY_BENCHMARK_MODE)
-    benchmark_mode_values = ",\n                ".join(f"('{mode}'::varchar)" for mode in benchmark_modes)
-
-    if rx_table_exists:
-        provider_rx_cte = f"""
-        provider_rx AS (
-            SELECT
-                r.npi,
-                r.year,
-                COALESCE(SUM(COALESCE(r.total_claims, 0.0)), 0.0)::float8 AS total_rx_claims,
-                COALESCE(SUM(COALESCE(r.total_benes, 0.0)), 0.0)::float8 AS total_rx_beneficiaries
-            FROM {schema}.{rx_table} r
-            WHERE r.year BETWEEN {PROVIDER_QUALITY_MIN_YEAR} AND {PROVIDER_QUALITY_MAX_YEAR}
-            GROUP BY r.npi, r.year
-        ),
-        """
-    else:
-        provider_rx_cte = """
-        provider_rx AS (
-            SELECT
-                NULL::bigint AS npi,
-                NULL::int AS year,
-                0.0::float8 AS total_rx_claims,
-                0.0::float8 AS total_rx_beneficiaries
-            WHERE FALSE
-        ),
-        """
-
-    await db.status(f"TRUNCATE TABLE {schema}.{feature_table};")
-    await db.status(f"TRUNCATE TABLE {schema}.{lsh_table};")
-    await db.status(f"TRUNCATE TABLE {schema}.{peer_target_table};")
-    await db.status(f"TRUNCATE TABLE {schema}.{measure_table};")
-    await db.status(f"TRUNCATE TABLE {schema}.{domain_table};")
-    await db.status(f"TRUNCATE TABLE {schema}.{score_table};")
-
-    await db.status(
-        f"""
-        INSERT INTO {schema}.{feature_table}
-        (
-            {feature_insert_cols_sql}
-        )
-        WITH provider_base AS (
-            SELECT
-                p.npi,
-                p.year,
-                p.provider_type
-            FROM {schema}.{PricingProvider.__tablename__} p
-            WHERE p.year BETWEEN {PROVIDER_QUALITY_MIN_YEAR} AND {PROVIDER_QUALITY_MAX_YEAR}
-        ),
-        taxonomy_ranked AS (
-            SELECT
-                t.npi::bigint AS npi,
-                NULLIF(BTRIM(COALESCE(t.healthcare_provider_taxonomy_code, '')), '')::varchar AS taxonomy_code,
-                ROW_NUMBER() OVER (
-                    PARTITION BY t.npi
-                    ORDER BY
-                        CASE
-                            WHEN UPPER(COALESCE(t.healthcare_provider_primary_taxonomy_switch, '')) = 'Y' THEN 0
-                            ELSE 1
-                        END,
-                        t.checksum
-                ) AS rn
-            FROM {schema}.{NPIDataTaxonomy.__tablename__} t
-            WHERE NULLIF(BTRIM(COALESCE(t.healthcare_provider_taxonomy_code, '')), '') IS NOT NULL
-        ),
-        taxonomy_choice AS (
-            SELECT
-                tr.npi,
-                LOWER(BTRIM(tr.taxonomy_code))::varchar AS taxonomy
-            FROM taxonomy_ranked tr
-            WHERE tr.rn = 1
-        ),
-        procedure_counts AS (
-            SELECT
-                pp.npi,
-                pp.year,
-                COUNT(DISTINCT pp.procedure_code)::int AS procedure_count
-            FROM {schema}.{PricingProviderProcedure.__tablename__} pp
-            WHERE pp.year BETWEEN {PROVIDER_QUALITY_MIN_YEAR} AND {PROVIDER_QUALITY_MAX_YEAR}
-            GROUP BY pp.npi, pp.year
-        ),
-        features_src AS (
-            SELECT
-                p.npi,
-                p.year,
-                COALESCE(NULLIF(LOWER(BTRIM(COALESCE(p.provider_type, ''))), ''), 'unknown')::varchar AS specialty,
-                COALESCE(tc.taxonomy, 'unknown')::varchar AS taxonomy,
-                COALESCE(NULLIF(LOWER(BTRIM(COALESCE(nt.classification, ''))), ''), 'unknown')::varchar AS classification,
-                COALESCE(pc.procedure_count, 0)::int AS procedure_count,
-                'bucket:none'::varchar AS procedure_bucket,
-                'provider_quality'::varchar AS source,
-                NOW() AS updated_at
-            FROM provider_base p
-            LEFT JOIN taxonomy_choice tc
-              ON tc.npi = p.npi
-            LEFT JOIN {schema}.{NUCCTaxonomy.__tablename__} nt
-              ON LOWER(BTRIM(COALESCE(nt.code, ''))) = tc.taxonomy
-            LEFT JOIN procedure_counts pc
-              ON pc.npi = p.npi
-             AND pc.year = p.year
-        )
-        SELECT
-            {feature_select_cols_sql}
-        FROM features_src f;
-        """
-    )
-
-    await db.status(
-        f"""
-        INSERT INTO {schema}.{lsh_table}
-        (
-            {lsh_insert_cols_sql}
-        )
-        WITH provider_proc AS (
-            SELECT DISTINCT
-                pp.npi,
-                pp.year,
-                pp.procedure_code::varchar AS procedure_key
-            FROM {schema}.{PricingProviderProcedure.__tablename__} pp
-            WHERE pp.year BETWEEN {PROVIDER_QUALITY_MIN_YEAR} AND {PROVIDER_QUALITY_MAX_YEAR}
-        ),
-        perms AS (
-            SELECT generate_series(0, {PROVIDER_QUALITY_MINHASH_NUM_PERM} - 1) AS perm_no
-        ),
-        signatures AS (
-            SELECT
-                p.npi,
-                p.year,
-                perm.perm_no,
-                MIN(ABS(hashtextextended(p.procedure_key, perm.perm_no::bigint)))::bigint AS min_hash
-            FROM provider_proc p
-            CROSS JOIN perms perm
-            GROUP BY p.npi, p.year, perm.perm_no
-        ),
-        bands AS (
-            SELECT
-                s.npi,
-                s.year,
-                FLOOR(s.perm_no / {PROVIDER_QUALITY_MINHASH_ROWS_PER_BAND})::int AS band_no,
-                STRING_AGG(
-                    LPAD(TO_HEX((s.min_hash % 4294967295)::bigint), 8, '0'),
-                    '|' ORDER BY s.perm_no
-                )::varchar AS band_signature,
-                COUNT(*)::int AS rows_in_band
-            FROM signatures s
-            GROUP BY s.npi, s.year, FLOOR(s.perm_no / {PROVIDER_QUALITY_MINHASH_ROWS_PER_BAND})
-        ),
-        lsh_src AS (
-            SELECT
-                b.npi,
-                b.year,
-                b.band_no,
-                MD5(b.band_signature)::varchar AS band_hash,
-                b.rows_in_band,
-                'provider_quality'::varchar AS source,
-                NOW() AS updated_at
-            FROM bands b
-            WHERE b.band_no < {PROVIDER_QUALITY_MINHASH_BANDS}
-        )
-        SELECT
-            {lsh_select_cols_sql}
-        FROM lsh_src s;
-        """
-    )
-
-    if feature_procedure_bucket_col:
+    for year in PROVIDER_QUALITY_YEAR_WINDOW:
         await db.status(
-            f"""
-            WITH bucket_source AS (
-                SELECT
-                    l.{lsh_npi_col} AS npi,
-                    l.{lsh_year_col} AS year,
-                    COALESCE(
-                        CASE
-                            WHEN COUNT(*) FILTER (WHERE l.{lsh_band_no_col} < {PROVIDER_QUALITY_PROCEDURE_MATCH_BANDS})
-                                 >= {PROVIDER_QUALITY_PROCEDURE_MATCH_BANDS}
-                            THEN MD5(
-                                STRING_AGG(
-                                    l.{lsh_band_hash_col},
-                                    '|' ORDER BY l.{lsh_band_no_col}
-                                ) FILTER (WHERE l.{lsh_band_no_col} < {PROVIDER_QUALITY_PROCEDURE_MATCH_BANDS})
-                            )::varchar
-                            ELSE NULL
-                        END,
-                        MAX(CASE WHEN l.{lsh_band_no_col} = 0 THEN l.{lsh_band_hash_col} END),
-                        'bucket:none'
-                    )::varchar AS procedure_bucket
-                FROM {schema}.{lsh_table} l
-                GROUP BY l.{lsh_npi_col}, l.{lsh_year_col}
-            )
-            UPDATE {schema}.{feature_table} f
-            SET {feature_procedure_bucket_col} = b.procedure_bucket
-            FROM bucket_source b
-            WHERE f.{feature_npi_col} = b.npi
-              AND f.{feature_year_col} = b.year;
-            """
+            _cohort_sql_phase_2_build_lsh_shard(ctx),
+            year=year,
+            shard_id=0,
+            shard_count=1,
         )
 
-    await db.status(
-        f"""
-        INSERT INTO {schema}.{peer_target_table}
-        (
-            {peer_target_insert_cols_sql}
-        )
-        WITH provider_base AS (
-            SELECT
-                p.npi,
-                p.year,
-                p.provider_type,
-                NULLIF(BTRIM(COALESCE(p.zip5, '')), '')::varchar AS zip5,
-                UPPER(NULLIF(BTRIM(COALESCE(p.state, '')), ''))::varchar AS state_key,
-                COALESCE(p.total_services, 0.0)::float8 AS total_services,
-                COALESCE(p.total_beneficiaries, 0.0)::float8 AS total_beneficiaries,
-                COALESCE(p.total_allowed_amount, 0.0)::float8 AS total_allowed_amount,
-                CASE
-                    WHEN COALESCE(p.total_beneficiaries, 0.0) > 0
-                    THEN COALESCE(p.total_services, 0.0)::float8 / NULLIF(COALESCE(p.total_beneficiaries, 0.0), 0.0)
-                    ELSE NULL
-                END AS utilization_rate
-            FROM {schema}.{PricingProvider.__tablename__} p
-            WHERE p.year BETWEEN {PROVIDER_QUALITY_MIN_YEAR} AND {PROVIDER_QUALITY_MAX_YEAR}
-        ),
-        {provider_rx_cte}
-        provider_plus AS (
-            SELECT
-                b.*,
-                q.quality_score AS qpp_quality_score,
-                q.cost_score AS qpp_cost_score,
-                COALESCE(rx.total_rx_claims, 0.0)::float8 AS total_rx_claims,
-                COALESCE(rx.total_rx_beneficiaries, 0.0)::float8 AS total_rx_beneficiaries,
-                COALESCE(s.svi_overall, {PROVIDER_QUALITY_DEFAULT_SVI}) AS svi_overall,
-                COALESCE(
-                    b.utilization_rate / NULLIF(1.0 + 0.2 * (COALESCE(s.svi_overall, {PROVIDER_QUALITY_DEFAULT_SVI}) - 0.5), 0.0),
-                    b.utilization_rate
-                ) AS utilization_adjusted,
-                COALESCE(
-                    b.total_allowed_amount / NULLIF(1.0 + 0.2 * (COALESCE(s.svi_overall, {PROVIDER_QUALITY_DEFAULT_SVI}) - 0.5), 0.0),
-                    b.total_allowed_amount
-                ) AS cost_adjusted,
-                CASE
-                    WHEN COALESCE(rx.total_rx_beneficiaries, 0.0) > 0
-                    THEN COALESCE(rx.total_rx_claims, 0.0)::float8 / NULLIF(COALESCE(rx.total_rx_beneficiaries, 0.0), 0.0)
-                    ELSE NULL
-                END AS rx_claim_rate
-            FROM provider_base b
-            LEFT JOIN {schema}.{qpp_table} q
-              ON q.npi = b.npi
-             AND q.year = b.year
-            LEFT JOIN provider_rx rx
-              ON rx.npi = b.npi
-             AND rx.year = b.year
-            LEFT JOIN {schema}.{svi_table} s
-              ON s.zcta = b.zip5
-             AND s.year = b.year
-        ),
-        provider_featured AS (
-            SELECT
-                p.*,
-                {feature_specialty_expr} AS specialty,
-                {feature_taxonomy_expr} AS taxonomy,
-                {feature_classification_expr} AS classification,
-                {feature_procedure_bucket_expr} AS procedure_bucket
-            FROM provider_plus p
-            LEFT JOIN {schema}.{feature_table} f
-              ON f.{feature_npi_col} = p.npi
-             AND f.{feature_year_col} = p.year
-        ),
-        benchmark_modes AS (
-            SELECT v.benchmark_mode
-            FROM (
-                VALUES
-                {benchmark_mode_values}
-            ) AS v(benchmark_mode)
-        ),
-        cohort_expanded AS (
-            SELECT
-                p.year,
-                bm.benchmark_mode,
-                gs.geography_scope,
-                CASE
-                    WHEN gs.geography_scope = 'zip' THEN p.zip5
-                    WHEN gs.geography_scope = 'state' THEN p.state_key
-                    ELSE 'US'
-                END::varchar AS geography_value,
-                lv.cohort_level,
-                CASE
-                    WHEN lv.cohort_level IN ('L0', 'L1', 'L2') THEN p.specialty
-                    ELSE NULL
-                END::varchar AS specialty,
-                CASE
-                    WHEN lv.cohort_level IN ('L0', 'L1') THEN p.taxonomy
-                    ELSE NULL
-                END::varchar AS taxonomy,
-                CASE
-                    WHEN lv.cohort_level IN ('L0', 'L1') THEN p.classification
-                    ELSE NULL
-                END::varchar AS classification,
-                CASE
-                    WHEN lv.cohort_level = 'L0' THEN p.procedure_bucket
-                    ELSE NULL
-                END::varchar AS procedure_bucket,
-                p.utilization_adjusted,
-                p.cost_adjusted,
-                p.qpp_quality_score,
-                p.qpp_cost_score,
-                p.rx_claim_rate
-            FROM provider_featured p
-            CROSS JOIN benchmark_modes bm
-            CROSS JOIN (VALUES ('national'), ('state'), ('zip')) AS gs(geography_scope)
-            CROSS JOIN (VALUES ('L0'), ('L1'), ('L2'), ('L3')) AS lv(cohort_level)
-            WHERE (
-                (bm.benchmark_mode = 'zip' AND gs.geography_scope IN ('zip', 'state', 'national'))
-                OR (bm.benchmark_mode = 'state' AND gs.geography_scope IN ('state', 'national'))
-                OR (bm.benchmark_mode = 'national' AND gs.geography_scope = 'national')
-            )
-            AND (
-                gs.geography_scope = 'national'
-                OR (gs.geography_scope = 'state' AND p.state_key IS NOT NULL)
-                OR (gs.geography_scope = 'zip' AND p.zip5 IS NOT NULL)
-            )
-        ),
-        peer_target_src AS (
-            SELECT
-                c.year,
-                c.benchmark_mode,
-                c.geography_scope,
-                c.geography_value,
-                c.cohort_level,
-                COALESCE(c.specialty, 'unknown')::varchar AS specialty,
-                COALESCE(c.taxonomy, 'unknown')::varchar AS taxonomy,
-                CASE
-                    WHEN c.cohort_level IN ('L0', 'L1') THEN MAX(c.classification)
-                    ELSE NULL
-                END::varchar AS classification,
-                COALESCE(c.procedure_bucket, 'bucket:none')::varchar AS procedure_bucket,
-                COUNT(*)::int AS peer_n,
-                AVG(NULLIF(c.utilization_adjusted, 0.0)) AS target_appropriateness,
-                AVG(NULLIF(c.cost_adjusted, 0.0)) AS target_cost,
-                AVG(NULLIF(c.qpp_quality_score, 0.0)) AS target_effectiveness,
-                AVG(NULLIF(c.qpp_cost_score, 0.0)) AS target_qpp_cost,
-                AVG(NULLIF(c.rx_claim_rate, 0.0)) AS target_rx_appropriateness,
-                'provider_quality'::varchar AS source,
-                NOW() AS updated_at
-            FROM cohort_expanded c
-            GROUP BY
-                c.year,
-                c.benchmark_mode,
-                c.geography_scope,
-                c.geography_value,
-                c.cohort_level,
-                COALESCE(c.specialty, 'unknown')::varchar,
-                COALESCE(c.taxonomy, 'unknown')::varchar,
-                COALESCE(c.procedure_bucket, 'bucket:none')::varchar
-        )
-        SELECT
-            {peer_target_select_cols_sql}
-        FROM peer_target_src t;
-        """
-    )
+    phase_3_sql = _cohort_sql_phase_3_update_procedure_bucket(ctx)
+    if phase_3_sql:
+        await db.status(phase_3_sql)
 
-    await db.status(
-        f"""
-        INSERT INTO {schema}.{measure_table}
-        (
-            {measure_insert_cols_sql}
-        )
-        WITH provider_base AS (
-            SELECT
-                p.npi,
-                p.year,
-                p.provider_type,
-                NULLIF(BTRIM(COALESCE(p.zip5, '')), '')::varchar AS zip5,
-                UPPER(NULLIF(BTRIM(COALESCE(p.state, '')), ''))::varchar AS state_key,
-                COALESCE(p.total_services, 0.0)::float8 AS total_services,
-                COALESCE(p.total_beneficiaries, 0.0)::float8 AS total_beneficiaries,
-                COALESCE(p.total_allowed_amount, 0.0)::float8 AS total_allowed_amount,
-                CASE
-                    WHEN COALESCE(p.total_beneficiaries, 0.0) > 0
-                    THEN COALESCE(p.total_services, 0.0)::float8 / NULLIF(COALESCE(p.total_beneficiaries, 0.0), 0.0)
-                    ELSE NULL
-                END AS utilization_rate
-            FROM {schema}.{PricingProvider.__tablename__} p
-            WHERE p.year BETWEEN {PROVIDER_QUALITY_MIN_YEAR} AND {PROVIDER_QUALITY_MAX_YEAR}
-        ),
-        {provider_rx_cte}
-        provider_plus AS (
-            SELECT
-                b.*,
-                q.quality_score AS qpp_quality_score,
-                q.cost_score AS qpp_cost_score,
-                COALESCE(rx.total_rx_claims, 0.0)::float8 AS total_rx_claims,
-                COALESCE(rx.total_rx_beneficiaries, 0.0)::float8 AS total_rx_beneficiaries,
-                COALESCE(s.svi_overall, {PROVIDER_QUALITY_DEFAULT_SVI}) AS svi_overall,
-                COALESCE(
-                    b.utilization_rate / NULLIF(1.0 + 0.2 * (COALESCE(s.svi_overall, {PROVIDER_QUALITY_DEFAULT_SVI}) - 0.5), 0.0),
-                    b.utilization_rate
-                ) AS utilization_adjusted,
-                COALESCE(
-                    b.total_allowed_amount / NULLIF(1.0 + 0.2 * (COALESCE(s.svi_overall, {PROVIDER_QUALITY_DEFAULT_SVI}) - 0.5), 0.0),
-                    b.total_allowed_amount
-                ) AS cost_adjusted,
-                CASE
-                    WHEN COALESCE(rx.total_rx_beneficiaries, 0.0) > 0
-                    THEN COALESCE(rx.total_rx_claims, 0.0)::float8 / NULLIF(COALESCE(rx.total_rx_beneficiaries, 0.0), 0.0)
-                    ELSE NULL
-                END AS rx_claim_rate
-            FROM provider_base b
-            LEFT JOIN {schema}.{qpp_table} q
-              ON q.npi = b.npi
-             AND q.year = b.year
-            LEFT JOIN provider_rx rx
-              ON rx.npi = b.npi
-             AND rx.year = b.year
-            LEFT JOIN {schema}.{svi_table} s
-              ON s.zcta = b.zip5
-             AND s.year = b.year
-        ),
-        provider_featured AS (
-            SELECT
-                p.*,
-                {feature_specialty_expr} AS specialty,
-                {feature_taxonomy_expr} AS taxonomy,
-                {feature_classification_expr} AS classification,
-                {feature_procedure_bucket_expr} AS procedure_bucket
-            FROM provider_plus p
-            LEFT JOIN {schema}.{feature_table} f
-              ON f.{feature_npi_col} = p.npi
-             AND f.{feature_year_col} = p.year
-        ),
-        benchmark_modes AS (
-            SELECT v.benchmark_mode
-            FROM (
-                VALUES
-                {benchmark_mode_values}
-            ) AS v(benchmark_mode)
-        ),
-        target_candidates AS (
-            SELECT
-                p.npi,
-                p.year,
-                bm.benchmark_mode,
-                ({peer_scope_expr})::varchar AS selected_geography_scope,
-                ({peer_geo_value_expr})::varchar AS selected_geography_value,
-                ({peer_cohort_level_expr})::varchar AS selected_cohort_level,
-                ({peer_specialty_expr})::varchar AS selected_specialty,
-                ({peer_taxonomy_expr})::varchar AS selected_taxonomy,
-                ({peer_classification_expr})::varchar AS selected_classification,
-                ({peer_procedure_bucket_expr})::varchar AS selected_procedure_bucket,
-                ({peer_peer_n_expr})::float8 AS selected_peer_n,
-                t.{peer_target_appropr_col}::float8 AS target_appropriateness,
-                t.{peer_target_cost_col}::float8 AS target_cost,
-                t.{peer_target_effect_col}::float8 AS target_effectiveness,
-                t.{peer_target_qpp_cost_col}::float8 AS target_qpp_cost,
-                t.{peer_target_rx_appropr_col}::float8 AS target_rx_appropriateness,
-                CASE
-                    WHEN bm.benchmark_mode = 'zip' THEN
-                        CASE
-                            WHEN {peer_scope_expr} = 'zip' THEN 1
-                            WHEN {peer_scope_expr} = 'state' THEN 2
-                            WHEN {peer_scope_expr} = 'national' THEN 3
-                            ELSE 9
-                        END
-                    WHEN bm.benchmark_mode = 'state' THEN
-                        CASE
-                            WHEN {peer_scope_expr} = 'state' THEN 1
-                            WHEN {peer_scope_expr} = 'national' THEN 2
-                            ELSE 9
-                        END
-                    ELSE
-                        CASE WHEN {peer_scope_expr} = 'national' THEN 1 ELSE 9 END
-                END AS geography_rank,
-                CASE
-                    WHEN {peer_cohort_level_expr} = 'L0' THEN 1
-                    WHEN {peer_cohort_level_expr} = 'L1' THEN 2
-                    WHEN {peer_cohort_level_expr} = 'L2' THEN 3
-                    ELSE 4
-                END AS level_rank,
-                CASE
-                    WHEN {peer_scope_expr} = 'zip' THEN ({peer_peer_n_expr}) >= {PROVIDER_QUALITY_ZIP_MIN_PEER_N}
-                    WHEN {peer_scope_expr} = 'state' THEN ({peer_peer_n_expr}) >= {PROVIDER_QUALITY_MIN_STATE_PEER_N}
-                    ELSE ({peer_peer_n_expr}) >= {PROVIDER_QUALITY_NATIONAL_MIN_PEER_N}
-                END AS threshold_met
-            FROM provider_featured p
-            CROSS JOIN benchmark_modes bm
-            JOIN {schema}.{peer_target_table} t
-              ON t.{peer_target_year_col} = p.year
-             AND {peer_benchmark_mode_expr} = bm.benchmark_mode
-             AND (
-                    ({peer_scope_expr} = 'zip' AND bm.benchmark_mode = 'zip' AND p.zip5 IS NOT NULL AND {peer_geo_value_expr} = p.zip5)
-                    OR (
-                        {peer_scope_expr} = 'state'
-                        AND bm.benchmark_mode IN ('zip', 'state')
-                        AND p.state_key IS NOT NULL
-                        AND UPPER({peer_geo_value_expr}) = p.state_key
-                    )
-                    OR ({peer_scope_expr} = 'national' AND bm.benchmark_mode IN ('zip', 'state', 'national'))
-                )
-             AND (
-                    ({peer_cohort_level_expr} = 'L0' AND {peer_specialty_match} AND {peer_taxonomy_match} AND {peer_procedure_bucket_match})
-                    OR ({peer_cohort_level_expr} = 'L1' AND {peer_specialty_match} AND {peer_taxonomy_match})
-                    OR ({peer_cohort_level_expr} = 'L2' AND {peer_specialty_match})
-                    OR ({peer_cohort_level_expr} = 'L3')
-                )
-        ),
-        target_selected AS (
-            SELECT DISTINCT ON (c.npi, c.year, c.benchmark_mode)
-                c.npi,
-                c.year,
-                c.benchmark_mode,
-                c.selected_geography_scope,
-                c.selected_geography_value,
-                c.selected_cohort_level,
-                c.selected_specialty,
-                c.selected_taxonomy,
-                c.selected_classification,
-                c.selected_procedure_bucket,
-                c.selected_peer_n,
-                c.target_appropriateness,
-                c.target_cost,
-                c.target_effectiveness,
-                c.target_qpp_cost,
-                c.target_rx_appropriateness
-            FROM target_candidates c
-            WHERE c.geography_rank < 9
-            ORDER BY
-                c.npi,
-                c.year,
-                c.benchmark_mode,
-                CASE WHEN c.threshold_met THEN 0 ELSE 1 END,
-                c.geography_rank,
-                c.level_rank,
-                c.selected_peer_n DESC,
-                c.selected_geography_scope,
-                c.selected_geography_value,
-                c.selected_cohort_level
-        ),
-        measure_inputs AS (
-            SELECT
-                p.npi,
-                p.year,
-                ts.benchmark_mode,
-                p.total_services,
-                p.total_beneficiaries,
-                p.utilization_adjusted,
-                p.cost_adjusted,
-                p.qpp_quality_score,
-                p.qpp_cost_score,
-                p.rx_claim_rate,
-                ts.target_appropriateness,
-                ts.target_cost,
-                ts.target_effectiveness,
-                ts.target_qpp_cost,
-                ts.target_rx_appropriateness,
-                ts.selected_cohort_level,
-                ts.selected_geography_scope,
-                ts.selected_geography_value,
-                ts.selected_specialty,
-                ts.selected_taxonomy,
-                ts.selected_classification,
-                ts.selected_procedure_bucket,
-                ts.selected_peer_n,
-                (
-                    'cohort:'
-                    || ts.selected_geography_scope
-                    || ':'
-                    || COALESCE(ts.selected_geography_value, 'US')
-                    || ':'
-                    || ts.selected_cohort_level
-                )::varchar AS peer_group,
-                GREATEST(COALESCE(p.total_services, 0.0), COALESCE(p.total_beneficiaries, 0.0), 1.0) AS evidence_n_claims,
-                GREATEST(COALESCE(p.total_rx_claims, 0.0), COALESCE(p.total_rx_beneficiaries, 0.0), 1.0) AS evidence_n_rx
-            FROM provider_featured p
-            JOIN target_selected ts
-              ON ts.npi = p.npi
-             AND ts.year = p.year
-        ),
-        expanded AS (
-            SELECT
-                npi,
-                year,
-                benchmark_mode,
-                'appropriateness_utilization'::varchar AS measure_id,
-                'appropriateness'::varchar AS domain,
-                utilization_adjusted::float8 AS observed_value,
-                target_appropriateness::float8 AS target_value,
-                CASE
-                    WHEN target_appropriateness IS NULL OR target_appropriateness <= 0 THEN 1.0
-                    WHEN utilization_adjusted IS NULL OR utilization_adjusted <= 0 THEN 1.0
-                    ELSE utilization_adjusted / target_appropriateness
-                END AS rr_raw,
-                evidence_n_claims AS evidence_n,
-                peer_group,
-                'higher_worse'::varchar AS direction,
-                'claims_pricing'::varchar AS source,
-                selected_cohort_level,
-                selected_geography_scope,
-                selected_geography_value,
-                selected_specialty,
-                selected_taxonomy,
-                selected_classification,
-                selected_procedure_bucket,
-                selected_peer_n
-            FROM measure_inputs
-            UNION ALL
-            SELECT
-                npi,
-                year,
-                benchmark_mode,
-                'appropriateness_drug_proxy'::varchar AS measure_id,
-                'appropriateness'::varchar AS domain,
-                rx_claim_rate::float8 AS observed_value,
-                target_rx_appropriateness::float8 AS target_value,
-                CASE
-                    WHEN target_rx_appropriateness IS NULL OR target_rx_appropriateness <= 0 THEN 1.0
-                    WHEN rx_claim_rate IS NULL OR rx_claim_rate <= 0 THEN 1.0
-                    ELSE rx_claim_rate / target_rx_appropriateness
-                END AS rr_raw,
-                evidence_n_rx AS evidence_n,
-                peer_group,
-                'higher_worse'::varchar AS direction,
-                'drug_claims'::varchar AS source,
-                selected_cohort_level,
-                selected_geography_scope,
-                selected_geography_value,
-                selected_specialty,
-                selected_taxonomy,
-                selected_classification,
-                selected_procedure_bucket,
-                selected_peer_n
-            FROM measure_inputs
-            UNION ALL
-            SELECT
-                npi,
-                year,
-                benchmark_mode,
-                'effectiveness_qpp_quality'::varchar AS measure_id,
-                'effectiveness'::varchar AS domain,
-                qpp_quality_score::float8 AS observed_value,
-                target_effectiveness::float8 AS target_value,
-                CASE
-                    WHEN qpp_quality_score IS NULL OR qpp_quality_score <= 0 THEN 1.0
-                    WHEN target_effectiveness IS NULL OR target_effectiveness <= 0 THEN 1.0
-                    ELSE target_effectiveness / qpp_quality_score
-                END AS rr_raw,
-                evidence_n_claims AS evidence_n,
-                peer_group,
-                'lower_worse'::varchar AS direction,
-                'qpp'::varchar AS source,
-                selected_cohort_level,
-                selected_geography_scope,
-                selected_geography_value,
-                selected_specialty,
-                selected_taxonomy,
-                selected_classification,
-                selected_procedure_bucket,
-                selected_peer_n
-            FROM measure_inputs
-            UNION ALL
-            SELECT
-                npi,
-                year,
-                benchmark_mode,
-                'cost_qpp_component'::varchar AS measure_id,
-                'cost'::varchar AS domain,
-                qpp_cost_score::float8 AS observed_value,
-                target_qpp_cost::float8 AS target_value,
-                CASE
-                    WHEN qpp_cost_score IS NULL OR qpp_cost_score <= 0 THEN 1.0
-                    WHEN target_qpp_cost IS NULL OR target_qpp_cost <= 0 THEN 1.0
-                    ELSE target_qpp_cost / qpp_cost_score
-                END AS rr_raw,
-                evidence_n_claims AS evidence_n,
-                peer_group,
-                'lower_worse'::varchar AS direction,
-                'qpp'::varchar AS source,
-                selected_cohort_level,
-                selected_geography_scope,
-                selected_geography_value,
-                selected_specialty,
-                selected_taxonomy,
-                selected_classification,
-                selected_procedure_bucket,
-                selected_peer_n
-            FROM measure_inputs
-            UNION ALL
-            SELECT
-                npi,
-                year,
-                benchmark_mode,
-                'cost_allowed_amount'::varchar AS measure_id,
-                'cost'::varchar AS domain,
-                cost_adjusted::float8 AS observed_value,
-                target_cost::float8 AS target_value,
-                CASE
-                    WHEN target_cost IS NULL OR target_cost <= 0 THEN 1.0
-                    WHEN cost_adjusted IS NULL OR cost_adjusted <= 0 THEN 1.0
-                    ELSE cost_adjusted / target_cost
-                END AS rr_raw,
-                evidence_n_claims AS evidence_n,
-                peer_group,
-                'higher_worse'::varchar AS direction,
-                'claims_pricing'::varchar AS source,
-                selected_cohort_level,
-                selected_geography_scope,
-                selected_geography_value,
-                selected_specialty,
-                selected_taxonomy,
-                selected_classification,
-                selected_procedure_bucket,
-                selected_peer_n
-            FROM measure_inputs
-        ),
-        shrunk AS (
-            SELECT
-                e.*,
-                LEAST(1.0, GREATEST(0.0, e.evidence_n / NULLIF(e.evidence_n + {PROVIDER_QUALITY_SHRINKAGE_ALPHA}, 0.0))) AS shrink_weight,
-                GREATEST(0.0001, SQRT(1.0 / NULLIF(e.evidence_n + 1.0, 0.0))) AS stderr
-            FROM expanded e
-        )
-        SELECT
-            {measure_select_cols_sql}
-        FROM shrunk s;
-        """
-    )
+    await db.status(_cohort_sql_phase_4_build_peer_targets(ctx))
 
-    await db.status(
-        f"""
-        INSERT INTO {schema}.{domain_table}
-        (
-            npi,
-            year,
-            benchmark_mode,
-            domain,
-            risk_ratio,
-            score_0_100,
-            ci75_low,
-            ci75_high,
-            ci90_low,
-            ci90_high,
-            evidence_n,
-            measure_count,
-            updated_at
+    for year in PROVIDER_QUALITY_YEAR_WINDOW:
+        shard_params = {"year": year, "shard_id": 0, "shard_count": 1}
+        await db.status(_cohort_sql_phase_5_build_measure_shard(ctx), **shard_params)
+        await db.status(_cohort_sql_phase_6_build_domain_shard(ctx), **shard_params)
+        await db.status(
+            _cohort_sql_phase_7_build_score_shard(ctx),
+            run_id=run_id,
+            **shard_params,
         )
-        SELECT
-            m.npi,
-            m.year,
-            m.benchmark_mode,
-            m.domain,
-            EXP(AVG(LN(GREATEST(m.risk_ratio, 0.0001))))::float8 AS risk_ratio,
-            ROUND((LEAST(100.0, GREATEST(0.0, 50.0 - 125.0 * (EXP(AVG(LN(GREATEST(m.risk_ratio, 0.0001)))) - 1.0))))::numeric, 2)::float8 AS score_0_100,
-            EXP(AVG(LN(GREATEST(m.ci75_low, 0.0001))))::float8 AS ci75_low,
-            EXP(AVG(LN(GREATEST(m.ci75_high, 0.0001))))::float8 AS ci75_high,
-            EXP(AVG(LN(GREATEST(m.ci90_low, 0.0001))))::float8 AS ci90_low,
-            EXP(AVG(LN(GREATEST(m.ci90_high, 0.0001))))::float8 AS ci90_high,
-            SUM(COALESCE(m.evidence_n, 0))::int AS evidence_n,
-            COUNT(*)::int AS measure_count,
-            NOW() AS updated_at
-        FROM {schema}.{measure_table} m
-        GROUP BY m.npi, m.year, m.benchmark_mode, m.domain;
-        """
-    )
-
-    cohort_meta_cte = ""
-    cohort_meta_join = ""
-    if score_optional_pairs and measure_meta_sources:
-        cohort_meta_cte = (
-            ",\n        cohort_meta AS (\n"
-            "            SELECT\n"
-            "                m.npi,\n"
-            "                m.year,\n"
-            "                m.benchmark_mode,\n"
-            + ",\n".join(
-                f"                MAX(m.{column_name}) AS {alias}"
-                for alias, column_name in measure_meta_sources.items()
-            )
-            + f"\n            FROM {schema}.{measure_table} m\n"
-            "            GROUP BY m.npi, m.year, m.benchmark_mode\n"
-            "        )\n"
-        )
-        cohort_meta_join = (
-            "\n        LEFT JOIN cohort_meta cm\n"
-            "          ON cm.npi = c.npi\n"
-            "         AND cm.year = c.year\n"
-            "         AND cm.benchmark_mode = c.benchmark_mode"
-        )
-
-    await db.status(
-        f"""
-        INSERT INTO {schema}.{score_table}
-        (
-            {score_insert_cols_sql}
-        )
-        WITH domain_pivot AS (
-            SELECT
-                d.npi,
-                d.year,
-                d.benchmark_mode,
-                MAX(CASE WHEN d.domain = 'appropriateness' THEN d.risk_ratio END) AS rr_appropr,
-                MAX(CASE WHEN d.domain = 'effectiveness' THEN d.risk_ratio END) AS rr_effect,
-                MAX(CASE WHEN d.domain = 'cost' THEN d.risk_ratio END) AS rr_cost,
-                MAX(CASE WHEN d.domain = 'appropriateness' THEN d.ci75_low END) AS ci75_appropr_low,
-                MAX(CASE WHEN d.domain = 'effectiveness' THEN d.ci75_low END) AS ci75_effect_low,
-                MAX(CASE WHEN d.domain = 'cost' THEN d.ci75_low END) AS ci75_cost_low,
-                MAX(CASE WHEN d.domain = 'appropriateness' THEN d.ci75_high END) AS ci75_appropr_high,
-                MAX(CASE WHEN d.domain = 'effectiveness' THEN d.ci75_high END) AS ci75_effect_high,
-                MAX(CASE WHEN d.domain = 'cost' THEN d.ci75_high END) AS ci75_cost_high,
-                MAX(CASE WHEN d.domain = 'appropriateness' THEN d.ci90_low END) AS ci90_appropr_low,
-                MAX(CASE WHEN d.domain = 'effectiveness' THEN d.ci90_low END) AS ci90_effect_low,
-                MAX(CASE WHEN d.domain = 'cost' THEN d.ci90_low END) AS ci90_cost_low,
-                MAX(CASE WHEN d.domain = 'appropriateness' THEN d.ci90_high END) AS ci90_appropr_high,
-                MAX(CASE WHEN d.domain = 'effectiveness' THEN d.ci90_high END) AS ci90_effect_high,
-                MAX(CASE WHEN d.domain = 'cost' THEN d.ci90_high END) AS ci90_cost_high
-            FROM {schema}.{domain_table} d
-            GROUP BY d.npi, d.year, d.benchmark_mode
-        ){cohort_meta_cte},
-        blended AS (
-            SELECT
-                p.npi,
-                p.year,
-                p.benchmark_mode,
-                COALESCE(p.rr_appropr, 1.0) AS rr_appropr,
-                COALESCE(p.rr_effect, 1.0) AS rr_effect,
-                COALESCE(p.rr_cost, 1.0) AS rr_cost,
-                SQRT(COALESCE(p.rr_appropr, 1.0) * COALESCE(p.rr_effect, 1.0)) AS rr_clinical,
-                EXP(
-                    0.5 * LN(GREATEST(SQRT(COALESCE(p.rr_appropr, 1.0) * COALESCE(p.rr_effect, 1.0)), 0.0001))
-                    + 0.5 * LN(GREATEST(COALESCE(p.rr_cost, 1.0), 0.0001))
-                ) AS rr_overall,
-                EXP(
-                    0.5 * LN(GREATEST(SQRT(COALESCE(p.ci75_appropr_low, 1.0) * COALESCE(p.ci75_effect_low, 1.0)), 0.0001))
-                    + 0.5 * LN(GREATEST(COALESCE(p.ci75_cost_low, 1.0), 0.0001))
-                ) AS ci75_low,
-                EXP(
-                    0.5 * LN(GREATEST(SQRT(COALESCE(p.ci75_appropr_high, 1.0) * COALESCE(p.ci75_effect_high, 1.0)), 0.0001))
-                    + 0.5 * LN(GREATEST(COALESCE(p.ci75_cost_high, 1.0), 0.0001))
-                ) AS ci75_high,
-                EXP(
-                    0.5 * LN(GREATEST(SQRT(COALESCE(p.ci90_appropr_low, 1.0) * COALESCE(p.ci90_effect_low, 1.0)), 0.0001))
-                    + 0.5 * LN(GREATEST(COALESCE(p.ci90_cost_low, 1.0), 0.0001))
-                ) AS ci90_low,
-                EXP(
-                    0.5 * LN(GREATEST(SQRT(COALESCE(p.ci90_appropr_high, 1.0) * COALESCE(p.ci90_effect_high, 1.0)), 0.0001))
-                    + 0.5 * LN(GREATEST(COALESCE(p.ci90_cost_high, 1.0), 0.0001))
-                ) AS ci90_high
-            FROM domain_pivot p
-        ),
-        checks AS (
-            SELECT
-                b.*,
-                (b.rr_overall >= 1.12)::boolean AS low_score_check,
-                (b.ci90_low >= 1.08)::boolean AS low_confidence_check,
-                (b.rr_overall <= 0.88)::boolean AS high_score_check,
-                (b.ci75_high < 1.0)::boolean AS high_confidence_check
-            FROM blended b
-        )
-        SELECT
-            {score_select_cols_sql}
-        FROM checks c{cohort_meta_join};
-        """,
-        run_id=run_id,
-    )
-
-
 async def _materialize_quality_rows(classes: dict[str, type], schema: str, run_id: str) -> None:
     if PROVIDER_QUALITY_COHORT_ENABLED and _cohort_models_present(classes):
         await _materialize_quality_rows_cohort(classes, schema, run_id)
@@ -4772,25 +4222,51 @@ async def _run_materialize_shard_job(
         classes = _staging_classes(stage_suffix, schema)
         cohort_context = await _build_cohort_materialization_context(classes, schema)
         target_table = str(cohort_context[target_table_key])
-        rows_before = await _count_shard_rows(
-            schema,
-            target_table,
-            year=year,
-            shard_id=shard_id,
-            shard_count=shard_count,
-        )
+        rows_before: int | None = None
+        try:
+            rows_before = await _count_shard_rows(
+                schema,
+                target_table,
+                year=year,
+                shard_id=shard_id,
+                shard_count=shard_count,
+            )
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            logger.warning(
+                "provider quality materialize shard pre-count failed run_id=%s phase=%s year=%s shard_id=%s/%s table=%s error=%s",
+                run_id,
+                phase,
+                year,
+                shard_id,
+                shard_count,
+                target_table,
+                exc,
+            )
         sql = sql_builder(cohort_context)
         params: dict[str, Any] = {"year": year, "shard_id": shard_id, "shard_count": shard_count}
         if include_run_id:
             params["run_id"] = run_id
         await _execute_shard_sql(sql, **params)
-        rows_after = await _count_shard_rows(
-            schema,
-            target_table,
-            year=year,
-            shard_id=shard_id,
-            shard_count=shard_count,
-        )
+        rows_after: int | None = None
+        try:
+            rows_after = await _count_shard_rows(
+                schema,
+                target_table,
+                year=year,
+                shard_id=shard_id,
+                shard_count=shard_count,
+            )
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            logger.warning(
+                "provider quality materialize shard post-count failed run_id=%s phase=%s year=%s shard_id=%s/%s table=%s error=%s",
+                run_id,
+                phase,
+                year,
+                shard_id,
+                shard_count,
+                target_table,
+                exc,
+            )
         duration_sec = max(time.monotonic() - started_at, 0.0)
         rows_deleted = rows_before
         rows_inserted = rows_after

@@ -144,6 +144,8 @@ class PartDPharmacyActivity(Base, JSONOutputMixin):
     __my_index_elements__ = ["canonical_id"]
     __my_additional_indexes__ = [
         {"index_elements": ("snapshot_id",), "name": "partd_pharm_act_v2_snapshot_idx"},
+        {"index_elements": ("zip_code",), "name": "partd_pharm_act_v2_zip_idx"},
+        {"index_elements": ("zip_code", "medicare_active", "npi"), "name": "partd_pharm_act_v2_zip_active_npi_idx"},
         {"index_elements": ("npi", "effective_from", "effective_to"), "name": "partd_pharm_act_v2_npi_effective_idx"},
         {"index_elements": ("npi", "medicare_active"), "name": "partd_pharm_act_v2_npi_active_idx"},
         {"index_elements": ("year",), "name": "partd_pharm_act_v2_year_idx"},
@@ -698,6 +700,7 @@ class GeoZipLookup(Base, JSONOutputMixin):
         {'index_elements': ('state',), 'name': 'geo_zip_lookup_state_idx'},
         {'index_elements': ('city_lower', 'state'), 'name': 'geo_zip_lookup_city_state_idx'},
         {'index_elements': ('city_lower',), 'name': 'geo_zip_lookup_city_idx'},
+        {'index_elements': ('latitude', 'longitude'), 'name': 'geo_zip_lookup_lat_lng_idx'},
     ]
 
     zip_code = Column(String(5), nullable=False)
@@ -1189,6 +1192,11 @@ class NPIAddress(AddressPrototype):
             'index_elements': ('state_name', 'city_name', 'npi'),
             'name': 'primary_state_city_npi',
             'where': "type='primary'",
+        },
+        {
+            'index_elements': ('lat', 'long', 'npi'),
+            'name': 'primary_lat_long_npi',
+            'where': "type='primary' AND lat IS NOT NULL AND long IS NOT NULL",
         },
         {
             'index_elements': ("LEFT(postal_code, 5)", 'npi'),
@@ -1924,6 +1932,7 @@ class PricingProviderQualityFeature(Base, JSONOutputMixin):
         {"index_elements": ("year",), "name": "pricing_quality_feature_year_idx"},
         {"index_elements": ("year", "state"), "name": "pricing_quality_feature_year_state_idx"},
         {"index_elements": ("year", "zip5"), "name": "pricing_quality_feature_year_zip5_idx"},
+        {"index_elements": ("year", "provider_class"), "name": "pricing_quality_feature_year_provider_class_idx"},
         {"index_elements": ("year", "specialty_key"), "name": "pricing_quality_feature_year_specialty_idx"},
         {"index_elements": ("year", "taxonomy_code"), "name": "pricing_quality_feature_year_taxonomy_code_idx"},
         {"index_elements": ("year", "taxonomy_classification"), "name": "pricing_quality_feature_year_taxonomy_class_idx"},
@@ -1933,6 +1942,10 @@ class PricingProviderQualityFeature(Base, JSONOutputMixin):
     year = Column(Integer, nullable=False)
     zip5 = Column(String(5))
     state = Column(String(2))
+    provider_class = Column(String(32))
+    location_source = Column(String(64))
+    has_enrollment = Column(Boolean)
+    has_medicare_claims = Column(Boolean)
     specialty_key = Column(String(128))
     taxonomy_code = Column(String(32))
     taxonomy_classification = Column(String)
@@ -2159,6 +2172,10 @@ class PricingProviderQualityScore(Base, JSONOutputMixin):
             ),
             "name": "pricing_quality_score_year_mode_cohort_idx",
         },
+        {
+            "index_elements": ("year", "benchmark_mode", "score_method", "confidence_band"),
+            "name": "pricing_quality_score_year_mode_method_conf_idx",
+        },
     ]
 
     npi = Column(BigInteger, nullable=False)
@@ -2170,6 +2187,8 @@ class PricingProviderQualityScore(Base, JSONOutputMixin):
     cohort_taxonomy_code = Column(String(32))
     cohort_procedure_bucket = Column(String(64))
     cohort_peer_n = Column(Integer)
+    cohort_geography_scope = Column(String(16))
+    cohort_geography_value = Column(String(128))
     risk_ratio_point = Column(Float)
     ci75_low = Column(Float)
     ci75_high = Column(Float)
@@ -2183,6 +2202,18 @@ class PricingProviderQualityScore(Base, JSONOutputMixin):
     high_score_threshold_passed = Column(Boolean)
     high_confidence_threshold_passed = Column(Boolean)
     estimated_cost_level = Column(String(5))
+    score_method = Column(String(32))
+    cost_source = Column(String(32))
+    confidence_0_100 = Column(Float)
+    confidence_band = Column(String(16))
+    data_coverage_0_100 = Column(Float)
+    provider_class = Column(String(32))
+    location_source = Column(String(64))
+    has_claims = Column(Boolean)
+    has_qpp = Column(Boolean)
+    has_rx = Column(Boolean)
+    has_enrollment = Column(Boolean)
+    has_medicare_claims = Column(Boolean)
     run_id = Column(String(64))
     updated_at = Column(DateTime)
 
