@@ -11,6 +11,7 @@ import sys
 import tempfile
 import zipfile
 from pathlib import Path, PurePath
+from urllib.parse import urlparse
 
 import ijson
 import pylightxl as xl
@@ -24,7 +25,8 @@ from sqlalchemy import func, literal, or_, select
 from sqlalchemy.exc import IntegrityError, ProgrammingError
 
 from db.models import (ImportHistory, ImportLog, Issuer, NPIAddress,
-                       NPIDataOtherIdentifier, NPIDataTaxonomyGroup, Plan,
+                       NPIDataOtherIdentifier, NPIDataTaxonomyGroup, MRFAddress,
+                       MRFAddressEvidence, Plan, PlanBenefitsMarketplace,
                        PlanDrugRaw, PlanDrugStats, PlanDrugTierStats,
                        PlanFormulary, PlanNetworkTierRaw, PlanNPIRaw,
                        PlanTransparency, db)
@@ -111,6 +113,349 @@ def _extract_plan_years(plan_obj: dict) -> list[int]:
     return years
 
 
+def _normalize_upper(value):
+    cleaned = _clean_name_part(value)
+    return cleaned.upper() if cleaned else None
+
+
+def _coerce_text(value):
+    cleaned = _clean_name_part(value)
+    return cleaned or None
+
+
+def _parse_timestamp(value):
+    if not value:
+        return None
+    return datetime.datetime.combine(parse_date(value, fuzzy=True), datetime.datetime.min.time())
+
+
+def _create_index_sql(table_name: str, index: dict, db_schema: str) -> str:
+    index_name = index.get("name", "_".join(index.get("index_elements")))
+    using = f"USING {index.get('using')} " if index.get("using") else ""
+    unique = "UNIQUE " if index.get("unique") else ""
+    where = f" WHERE {index.get('where')}" if index.get("where") else ""
+    return (
+        f"CREATE {unique}INDEX IF NOT EXISTS {table_name}_idx_{index_name} "
+        f"ON {db_schema}.{table_name} {using}({', '.join(index.get('index_elements'))}){where};"
+    )
+
+
+async def _create_named_indexes(stage_cls, db_schema: str) -> None:
+    for attr_name in ("__my_initial_indexes__", "__my_additional_indexes__"):
+        for index in getattr(stage_cls, attr_name, []) or []:
+            await db.status(_create_index_sql(stage_cls.__tablename__, index, db_schema))
+
+
+def _benefit_label_from_key(key):
+    cleaned = _coerce_text(key) or "unknown"
+    return cleaned.replace("_", " ").replace("-", " ").strip().title()
+
+
+def _serialize_jsonable(value):
+    try:
+        return json.loads(json.dumps(value))
+    except (TypeError, ValueError):
+        return {"value": str(value)}
+
+
+def _issuer_display_name(issuer_id, issuer_name=None, issuer_marketing_name=None, issuer_url=None):
+    for candidate in (issuer_name, issuer_marketing_name):
+        value = _coerce_text(candidate)
+        if value and value.upper() != "N/A":
+            return value
+
+    host = urlparse(_coerce_text(issuer_url) or "").hostname
+    if host:
+        return host.lower()
+
+    return str(issuer_id)
+
+
+def _normalize_benefit_value(value):
+    if isinstance(value, bool):
+        return ("true" if value else "false", value, None, None)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return (str(value), None, float(value), None)
+    if isinstance(value, str):
+        cleaned = value.strip()
+        return (cleaned or None, None, None, None)
+    if value is None:
+        return (None, None, None, None)
+    return (json.dumps(value, sort_keys=True), None, None, _serialize_jsonable(value))
+
+
+def _iter_marketplace_benefit_entries(item, position):
+    if isinstance(item, dict):
+        named_key = _coerce_text(item.get("benefit_name") or item.get("name") or item.get("key"))
+        has_value_field = "value" in item
+        extra_keys = {
+            key for key in item.keys()
+            if key not in {"benefit_name", "name", "key", "label", "display_name", "value"}
+        }
+        if named_key and has_value_field and not extra_keys:
+            yield {
+                "benefit_name": named_key,
+                "benefit_label": _coerce_text(item.get("label") or item.get("display_name")) or _benefit_label_from_key(named_key),
+                "benefit_value": item.get("value"),
+                "benefit_position": position,
+                "benefit_item_json": _serialize_jsonable(item),
+            }
+            return
+        for key, value in item.items():
+            yield {
+                "benefit_name": str(key).strip(),
+                "benefit_label": _benefit_label_from_key(key),
+                "benefit_value": value,
+                "benefit_position": position,
+                "benefit_item_json": _serialize_jsonable(item),
+            }
+        return
+
+    yield {
+        "benefit_name": f"benefit_{position}",
+        "benefit_label": f"Benefit {position + 1}",
+        "benefit_value": item,
+        "benefit_position": position,
+        "benefit_item_json": _serialize_jsonable(item),
+    }
+
+
+def _normalize_marketplace_benefits(plan_id, year, issuer_id, benefits, last_updated_on):
+    if isinstance(benefits, dict):
+        benefits = [benefits]
+    if not isinstance(benefits, list):
+        return []
+
+    rows = []
+    for position, item in enumerate(benefits):
+        for entry in _iter_marketplace_benefit_entries(item, position):
+            benefit_value_text, benefit_value_bool, benefit_value_number, benefit_value_json = _normalize_benefit_value(
+                entry["benefit_value"]
+            )
+            checksum = return_checksum(
+                [
+                    plan_id,
+                    year,
+                    entry["benefit_position"],
+                    entry["benefit_name"],
+                    json.dumps(entry["benefit_item_json"], sort_keys=True),
+                ]
+            )
+            rows.append(
+                {
+                    "plan_id": plan_id,
+                    "year": int(year),
+                    "issuer_id": issuer_id,
+                    "benefit_position": entry["benefit_position"],
+                    "benefit_name": entry["benefit_name"],
+                    "benefit_label": entry["benefit_label"],
+                    "benefit_value_text": benefit_value_text,
+                    "benefit_value_bool": benefit_value_bool,
+                    "benefit_value_number": benefit_value_number,
+                    "benefit_value_json": benefit_value_json,
+                    "benefit_item_json": entry["benefit_item_json"],
+                    "last_updated_on": last_updated_on,
+                    "checksum": checksum,
+                }
+            )
+    return rows
+
+
+def _normalize_marketplace_address_entry(address):
+    if not isinstance(address, dict):
+        return None
+
+    first_line = _coerce_text(address.get("address") or address.get("address1") or address.get("line1"))
+    city_name = _normalize_upper(address.get("city"))
+    state_name = _normalize_upper(address.get("state"))
+    postal_code = _coerce_text(address.get("zip") or address.get("postal_code"))
+    if not first_line or not city_name or not state_name or not postal_code:
+        return None
+
+    second_line = _coerce_text(
+        address.get("address_2") or address.get("address2") or address.get("line2")
+    )
+    country_code = _normalize_upper(address.get("country") or address.get("country_code"))
+    telephone_number = _coerce_text(address.get("phone") or address.get("telephone"))
+    checksum = return_checksum(
+        [
+            first_line or "",
+            second_line or "",
+            city_name or "",
+            state_name or "",
+            postal_code or "",
+            country_code or "",
+        ]
+    )
+    return {
+        "checksum": checksum,
+        "first_line": first_line,
+        "second_line": second_line,
+        "city_name": city_name,
+        "state_name": state_name,
+        "postal_code": postal_code,
+        "country_code": country_code,
+        "telephone_number": telephone_number,
+        "formatted_address": ", ".join(
+            [
+                part
+                for part in (
+                    " ".join(part for part in (first_line, second_line) if part).strip(),
+                    " ".join(part for part in (city_name, state_name, postal_code) if part).strip(),
+                )
+                if part
+            ]
+        ),
+    }
+def _build_mrf_address_rows(res, network_tiers, import_id, source_url, last_updated_on, issuer_lookup=None):
+    addresses = res.get("addresses", []) or []
+    if not isinstance(addresses, list):
+        return [], []
+
+    issuer_lookup = issuer_lookup or {}
+    npi = int(res["npi"])
+    address_type = "practice"
+    address_rows = {}
+    evidence_rows = {}
+    try:
+        import_date_value = datetime.datetime.strptime(str(import_id)[:8], "%Y%m%d").date()
+    except (TypeError, ValueError):
+        import_date_value = None
+
+    for address in addresses:
+        normalized = _normalize_marketplace_address_entry(address)
+        if not normalized:
+            continue
+        address_key = (npi, address_type, normalized["checksum"])
+        address_record_id_values = []
+        issuer_ids = []
+        issuer_names = []
+        import_ids = []
+        import_dates = []
+        sources = []
+        source_urls = []
+        for network in network_tiers.values():
+            issuer_id = network["issuer_id"]
+            issuer_name = issuer_lookup.get(issuer_id) or str(issuer_id)
+            source_record_id = ":".join(
+                [
+                    str(npi),
+                    address_type,
+                    str(normalized["checksum"]),
+                    str(network["checksum_network"]),
+                ]
+            )
+            evidence_checksum = return_checksum(
+                [
+                    npi,
+                    address_type,
+                    normalized["checksum"],
+                    network["issuer_id"],
+                    network["year"],
+                    network["checksum_network"],
+                    import_id,
+                    source_url,
+                    source_record_id,
+                ]
+            )
+            evidence_rows[evidence_checksum] = {
+                "evidence_checksum": evidence_checksum,
+                "npi": npi,
+                "type": address_type,
+                "checksum": normalized["checksum"],
+                "issuer_id": issuer_id,
+                "issuer_name": issuer_name,
+                "year": network["year"],
+                "checksum_network": network["checksum_network"],
+                "network_tier": network["network_tier"],
+                "import_id": str(import_id),
+                "import_date": import_date_value,
+                "address_source": "marketplace_provider",
+                "source_table": "plan_npi_raw",
+                "source_url": source_url,
+                "source_record_id": source_record_id,
+                "first_line": normalized["first_line"],
+                "second_line": normalized["second_line"],
+                "city_name": normalized["city_name"],
+                "state_name": normalized["state_name"],
+                "postal_code": normalized["postal_code"],
+                "country_code": normalized["country_code"],
+                "telephone_number": normalized["telephone_number"],
+                "observed_at": last_updated_on,
+            }
+            address_record_id_values.append(source_record_id)
+            issuer_ids.append(issuer_id)
+            issuer_names.append(issuer_name)
+            import_ids.append(str(import_id))
+            if import_date_value:
+                import_dates.append(import_date_value)
+            sources.append("marketplace_provider")
+            if source_url:
+                source_urls.append(str(source_url))
+
+        address_rows[address_key] = {
+            "npi": npi,
+            "type": address_type,
+            "checksum": normalized["checksum"],
+            "first_line": normalized["first_line"],
+            "second_line": normalized["second_line"],
+            "city_name": normalized["city_name"],
+            "state_name": normalized["state_name"],
+            "postal_code": normalized["postal_code"],
+            "country_code": normalized["country_code"],
+            "telephone_number": normalized["telephone_number"],
+            "formatted_address": normalized["formatted_address"],
+            "date_added": last_updated_on.date() if last_updated_on else None,
+            "source_count": len(set(address_record_id_values)),
+            "address_sources": sorted(set(sources)),
+            "source_record_ids": sorted(set(address_record_id_values)),
+            "source_import_ids": sorted(set(import_ids)),
+            "source_import_dates": sorted(set(import_dates)),
+            "source_issuer_ids": sorted(set(issuer_ids)),
+            "source_issuer_names": sorted(set(issuer_names)),
+            "source_urls": sorted(set(source_urls)),
+        }
+
+    return list(address_rows.values()), list(evidence_rows.values())
+
+
+async def _refresh_mrf_address_summary(import_date: str, db_schema: str) -> None:
+    address_cls = make_class(MRFAddress, import_date, schema_override=db_schema)
+    evidence_cls = make_class(MRFAddressEvidence, import_date, schema_override=db_schema)
+    await db.status(
+        f"""
+        UPDATE {db_schema}.{address_cls.__tablename__} AS a
+           SET address_sources = COALESCE(src.address_sources, ARRAY[]::varchar[]),
+               source_record_ids = COALESCE(src.source_record_ids, ARRAY[]::varchar[]),
+               source_import_ids = COALESCE(src.source_import_ids, ARRAY[]::varchar[]),
+               source_import_dates = COALESCE(src.source_import_dates, ARRAY[]::date[]),
+               source_issuer_ids = COALESCE(src.source_issuer_ids, ARRAY[]::integer[]),
+               source_issuer_names = COALESCE(src.source_issuer_names, ARRAY[]::varchar[]),
+               source_urls = COALESCE(src.source_urls, ARRAY[]::varchar[]),
+               source_count = COALESCE(src.source_count, 0)
+          FROM (
+                SELECT
+                    npi,
+                    type,
+                    checksum,
+                    ARRAY_REMOVE(ARRAY_AGG(DISTINCT address_source ORDER BY address_source), NULL)::varchar[] AS address_sources,
+                    ARRAY_REMOVE(ARRAY_AGG(DISTINCT source_record_id ORDER BY source_record_id), NULL)::varchar[] AS source_record_ids,
+                    ARRAY_REMOVE(ARRAY_AGG(DISTINCT import_id ORDER BY import_id), NULL)::varchar[] AS source_import_ids,
+                    ARRAY_REMOVE(ARRAY_AGG(DISTINCT import_date ORDER BY import_date), NULL)::date[] AS source_import_dates,
+                    ARRAY_REMOVE(ARRAY_AGG(DISTINCT issuer_id ORDER BY issuer_id), NULL)::integer[] AS source_issuer_ids,
+                    ARRAY_REMOVE(ARRAY_AGG(DISTINCT issuer_name ORDER BY issuer_name), NULL)::varchar[] AS source_issuer_names,
+                    ARRAY_REMOVE(ARRAY_AGG(DISTINCT source_url ORDER BY source_url), NULL)::varchar[] AS source_urls,
+                    COUNT(DISTINCT evidence_checksum)::int AS source_count
+                FROM {db_schema}.{evidence_cls.__tablename__}
+                GROUP BY npi, type, checksum
+          ) AS src
+         WHERE a.npi = src.npi
+           AND a.type = src.type
+           AND a.checksum = src.checksum;
+        """
+    )
+
+
 async def _prepare_import_tables(import_date: str, test_mode: bool) -> None:
     db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
 
@@ -130,6 +475,7 @@ async def _prepare_import_tables(import_date: str, test_mode: bool) -> None:
         Issuer,
         Plan,
         PlanFormulary,
+        PlanBenefitsMarketplace,
         PlanTransparency,
         PlanDrugRaw,
         PlanDrugStats,
@@ -137,6 +483,8 @@ async def _prepare_import_tables(import_date: str, test_mode: bool) -> None:
         ImportLog,
         PlanNPIRaw,
         PlanNetworkTierRaw,
+        MRFAddress,
+        MRFAddressEvidence,
     ):
         obj = make_class(cls, import_date, schema_override=db_schema)
         try:
@@ -157,6 +505,8 @@ async def _prepare_import_tables(import_date: str, test_mode: bool) -> None:
                 )
             except IntegrityError:
                 pass
+        if cls in {PlanBenefitsMarketplace, MRFAddress, MRFAddressEvidence}:
+            await _create_named_indexes(obj, db_schema)
 
     print("Preparing done")
 
@@ -180,6 +530,7 @@ async def process_plan(ctx, task):
     db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
     myplan = make_class(Plan, import_date, schema_override=db_schema)
     myplanformulary = make_class(PlanFormulary, import_date, schema_override=db_schema)
+    myplanbenefitsmarketplace = make_class(PlanBenefitsMarketplace, import_date, schema_override=db_schema)
     myimportlog = make_class(ImportLog, import_date, schema_override=db_schema)
 
     print("Starting Plan data download: ", task.get("url"))
@@ -200,6 +551,7 @@ async def process_plan(ctx, task):
         async with async_open(tmp_filename, "rb") as afp:
             plan_obj = []
             planformulary_obj = []
+            planbenefitsmarketplace_obj = []
             count = 0
             processed_plans = 0
             stop_processing = False
@@ -295,6 +647,12 @@ async def process_plan(ctx, task):
                                 formulary_entries = [formulary_entries]
                             if not isinstance(formulary_entries, list):
                                 formulary_entries = []
+                            benefits_entries = res.get("benefits", [])
+                            if isinstance(benefits_entries, dict):
+                                benefits_entries = [benefits_entries]
+                            if not isinstance(benefits_entries, list):
+                                benefits_entries = []
+                            last_updated_on = _parse_timestamp(res["last_updated_on"])
 
                             obj = {
                                 "plan_id": plan_id_value,
@@ -308,20 +666,31 @@ async def process_plan(ctx, task):
                                 "formulary_url": res.get("formulary_url", ""),
                                 "plan_contact": res["plan_contact"],
                                 "network": [(k["network_tier"]) for k in network_entries if isinstance(k, dict)],
-                                "benefits": [json.dumps(x) for x in res.get("benefits", [])],
-                                "last_updated_on": datetime.datetime.combine(
-                                    parse_date(res["last_updated_on"], fuzzy=True), datetime.datetime.min.time()
-                                ),
+                                "benefits": [json.dumps(x) for x in benefits_entries],
+                                "last_updated_on": last_updated_on,
                                 "checksum": return_checksum([plan_id_value.lower(), year], crc=32),
                             }
                             plan_obj.append(obj)
+                            planbenefitsmarketplace_obj.extend(
+                                _normalize_marketplace_benefits(
+                                    plan_id_value,
+                                    year,
+                                    int(plan_id_value[:5]),
+                                    benefits_entries,
+                                    last_updated_on,
+                                )
+                            )
                             processed_plans += 1
                             if plan_limit and processed_plans >= plan_limit:
                                 stop_processing = True
                                 break
                             if count > int(os.environ.get("HLTHPRT_SAVE_PER_PACK", 50)):
-                                await push_objects(plan_obj, myplan)
+                                await asyncio.gather(
+                                    push_objects(plan_obj, myplan),
+                                    push_objects(planbenefitsmarketplace_obj, myplanbenefitsmarketplace),
+                                )
                                 plan_obj.clear()
+                                planbenefitsmarketplace_obj.clear()
                                 count = 0
                             else:
                                 count += 1
@@ -443,7 +812,11 @@ async def process_plan(ctx, task):
                     if stop_processing:
                         break
 
-                await asyncio.gather(push_objects(plan_obj, myplan), push_objects(planformulary_obj, myplanformulary))
+                await asyncio.gather(
+                    push_objects(plan_obj, myplan),
+                    push_objects(planformulary_obj, myplanformulary),
+                    push_objects(planbenefitsmarketplace_obj, myplanbenefitsmarketplace),
+                )
             except ijson.IncompleteJSONError as exc:
                 await log_error(
                     "err",
@@ -493,8 +866,28 @@ async def process_provider(ctx, task):
     current_year = datetime.datetime.now().year
     db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
     myimportlog = make_class(ImportLog, import_date, schema_override=db_schema)
+    myissuer = make_class(Issuer, import_date, schema_override=db_schema)
     myplan_npi = make_class(PlanNPIRaw, import_date, schema_override=db_schema)
     myplan_networktier = make_class(PlanNetworkTierRaw, import_date, schema_override=db_schema)
+    mymrfaddress = make_class(MRFAddress, import_date, schema_override=db_schema)
+    mymrfaddressevidence = make_class(MRFAddressEvidence, import_date, schema_override=db_schema)
+    issuer_lookup = {}
+    if task.get("issuer_array"):
+        issuer_rows = await (
+            db.select(myissuer.issuer_id, myissuer.issuer_name, myissuer.issuer_marketing_name, myissuer.mrf_url)
+            .where(myissuer.issuer_id.in_(task["issuer_array"]))
+            .all()
+        )
+        issuer_lookup = {
+            int(row.issuer_id): _issuer_display_name(
+                row.issuer_id,
+                issuer_name=row.issuer_name,
+                issuer_marketing_name=row.issuer_marketing_name,
+                issuer_url=row.mrf_url,
+            )
+            for row in issuer_rows
+            if row.issuer_id is not None
+        }
 
     print("Starting Provider file data download: ", task.get("url"))
     with tempfile.TemporaryDirectory() as tmpdirname:
@@ -513,6 +906,8 @@ async def process_provider(ctx, task):
         async with async_open(tmp_filename, "rb") as afp:
             plan_npi_obj_dict = {}
             plan_network_year = {}
+            mrf_address_obj_dict = {}
+            mrf_address_evidence_dict = {}
             count = 0
             processed_providers = 0
             try:
@@ -588,6 +983,7 @@ async def process_provider(ctx, task):
                     addresses = res.get("addresses", [])
                     if not addresses:
                         addresses = []
+                    last_updated_on = _parse_timestamp(res["last_updated_on"])
 
                     obj = {
                         "npi": int(res["npi"]),
@@ -607,9 +1003,7 @@ async def process_provider(ctx, task):
                         "accepting": res.get("accepting", None),
                         "gender": res.get("gender", None),
                         "languages": [str(x) for x in languages],
-                        "last_updated_on": datetime.datetime.combine(
-                            parse_date(res["last_updated_on"], fuzzy=True), datetime.datetime.min.time()
-                        ),
+                        "last_updated_on": last_updated_on,
                     }
 
                     if (
@@ -654,7 +1048,7 @@ async def process_provider(ctx, task):
                         obj["checksum_network"] = x["checksum_network"]
                         obj["issuer_id"] = x["issuer_id"]
                         obj["year"] = x["year"]
-                        plan_npi_obj_dict["_".join([str(obj["npi"]), str(x["checksum_network"])])] = obj
+                        plan_npi_obj_dict["_".join([str(obj["npi"]), str(x["checksum_network"])])] = obj.copy()
 
                         # if count > 10 * int(os.environ.get('HLTHPRT_SAVE_PER_PACK', 50)):
                         #     await push_objects(list(plan_npi_obj_dict.values()), myplan_npi)
@@ -668,39 +1062,52 @@ async def process_provider(ctx, task):
                         #     #     # print('plan: ', plan)
                         #     #     print('WTF>', obj)
                         #     #     pass
+                    address_rows, evidence_rows = _build_mrf_address_rows(
+                        res,
+                        my_network_tiers,
+                        import_date,
+                        task.get("url"),
+                        last_updated_on,
+                        issuer_lookup=issuer_lookup,
+                    )
+                    for address_row in address_rows:
+                        mrf_address_obj_dict[
+                            "_".join(
+                                [
+                                    str(address_row["npi"]),
+                                    str(address_row["checksum"]),
+                                    address_row["type"],
+                                ]
+                            )
+                        ] = address_row
+                    for evidence_row in evidence_rows:
+                        mrf_address_evidence_dict[str(evidence_row["evidence_checksum"])] = evidence_row
+
+                    processed_providers += 1
                     count += 1
                     if count > 10000:
-                        # await redis.enqueue_job('save_mrf_data',
-                        #                         {
-                        #                             'plan_npi': list(plan_npi_obj_dict.values()),
-                        #                             'plan_networktier': list(plan_network_year.values()),
-                        #                             'context': ctx['context']
-                        #                         },
-                        #                         _defer_by=datetime.timedelta(minutes=-100)
-                        #                         )
                         await asyncio.gather(
                             push_objects(list(plan_npi_obj_dict.values()), myplan_npi),
                             push_objects(list(plan_network_year.values()), myplan_networktier),
+                            push_objects(list(mrf_address_obj_dict.values()), mymrfaddress, rewrite=True),
+                            push_objects(list(mrf_address_evidence_dict.values()), mymrfaddressevidence),
                         )
                         count = 0
                         plan_npi_obj_dict.clear()
                         plan_network_year.clear()
+                        mrf_address_obj_dict.clear()
+                        mrf_address_evidence_dict.clear()
 
-                # await redis.enqueue_job('save_mrf_data',
-                #                         {
-                #                             'plan_npi': list(plan_npi_obj_dict.values()),
-                #                             'plan_networktier': list(plan_network_year.values()),
-                #                             'context': ctx['context']
-                #                         },
-                #                                 _defer_by=datetime.timedelta(minutes=-100)
-                #                         )
                 await asyncio.gather(
                     push_objects(list(plan_npi_obj_dict.values()), myplan_npi),
                     push_objects(list(plan_network_year.values()), myplan_networktier),
+                    push_objects(list(mrf_address_obj_dict.values()), mymrfaddress, rewrite=True),
+                    push_objects(list(mrf_address_evidence_dict.values()), mymrfaddressevidence),
                 )
                 plan_npi_obj_dict.clear()
                 plan_network_year.clear()
-                processed_providers += 1
+                mrf_address_obj_dict.clear()
+                mrf_address_evidence_dict.clear()
 
             except ijson.IncompleteJSONError as exc:
                 await log_error(
@@ -845,6 +1252,16 @@ async def _refresh_plan_drug_statistics(plan_ids, import_date, db_schema):
             )
         )
         await tier_insert.status()
+
+
+async def _plan_summary_dependencies_ready(db_schema: str) -> tuple[bool, list[str]]:
+    missing = []
+    for table_name in ("plan_attributes", "plan_benefits", "plan_prices"):
+        qualified_name = f"{db_schema}.{table_name}"
+        exists = await db.scalar("SELECT to_regclass(:qualified_name)", qualified_name=qualified_name)
+        if not exists:
+            missing.append(table_name)
+    return (len(missing) == 0, missing)
 
 
 async def process_formulary(ctx, task):
@@ -1000,6 +1417,17 @@ async def save_mrf_data(ctx, task):
                 plan_ids = {entry.get("plan_id") for entry in task["plan_drugs"] if entry.get("plan_id")}
                 if plan_ids:
                     await _refresh_plan_drug_statistics(plan_ids, import_date, db_schema)
+            case "plan_benefits_marketplace":
+                myplanbenefitsmarketplace = make_class(
+                    PlanBenefitsMarketplace, import_date, schema_override=db_schema
+                )
+                x.append(push_objects(task["plan_benefits_marketplace"], myplanbenefitsmarketplace))
+            case "mrf_address":
+                mymrfaddress = make_class(MRFAddress, import_date, schema_override=db_schema)
+                x.append(push_objects(task["mrf_address"], mymrfaddress, rewrite=True))
+            case "mrf_address_evidence":
+                mymrfaddressevidence = make_class(MRFAddressEvidence, import_date, schema_override=db_schema)
+                x.append(push_objects(task["mrf_address_evidence"], mymrfaddressevidence))
             case "npi_other_id_list":
                 mynpidataotheridentifier = make_class(
                     NPIDataOtherIdentifier, import_date, schema_override=db_schema
@@ -1644,12 +2072,15 @@ async def shutdown(ctx, task):
             print(f"Failed Import: Plans number:{plans_count}")
             sys.exit(1)
 
+    await _refresh_mrf_address_summary(import_date, db_schema)
+
     tables = {}
     async with db.transaction():
         for cls in (
             Issuer,
             Plan,
             PlanFormulary,
+            PlanBenefitsMarketplace,
             PlanTransparency,
             PlanDrugRaw,
             PlanDrugStats,
@@ -1657,6 +2088,8 @@ async def shutdown(ctx, task):
             ImportLog,
             PlanNPIRaw,
             PlanNetworkTierRaw,
+            MRFAddress,
+            MRFAddressEvidence,
         ):
             tables[cls.__main_table__] = make_class(cls, import_date, schema_override=db_schema)
             obj = tables[cls.__main_table__]
@@ -1675,6 +2108,25 @@ async def shutdown(ctx, task):
                 f"{table}_idx_primary;"
             )
 
+            if cls in {PlanBenefitsMarketplace, MRFAddress, MRFAddressEvidence}:
+                move_indexes = []
+                if hasattr(cls, "__my_initial_indexes__") and cls.__my_initial_indexes__:
+                    move_indexes += list(cls.__my_initial_indexes__)
+                if hasattr(cls, "__my_additional_indexes__") and cls.__my_additional_indexes__:
+                    move_indexes += list(cls.__my_additional_indexes__)
+                for index in move_indexes:
+                    index_name = index.get("name", "_".join(index.get("index_elements")))
+                    await db.status(
+                        f"ALTER INDEX IF EXISTS "
+                        f"{db_schema}.{table}_idx_{index_name} RENAME TO "
+                        f"{table}_idx_{index_name}_old;"
+                    )
+                    await db.status(
+                        f"ALTER INDEX IF EXISTS "
+                        f"{db_schema}.{obj.__tablename__}_idx_{index_name} RENAME TO "
+                        f"{table}_idx_{index_name};"
+                    )
+
     upsert_history = (
         db.insert(ImportHistory)
         .values(import_id=import_date, when=db.func.now())
@@ -1686,7 +2138,18 @@ async def shutdown(ctx, task):
     )
     await upsert_history.status()
     print("Plans in DB: ", await db.scalar(select(func.count(Plan.plan_id))))  # pylint: disable=E1101
-    summary_rows = await rebuild_plan_search_summary(test_mode=test_mode)
+    if test_mode:
+        summary_ready, missing_summary_tables = await _plan_summary_dependencies_ready(db_schema)
+        if not summary_ready:
+            print(
+                "Skipping plan search summary rebuild in test mode; missing tables: "
+                + ", ".join(missing_summary_tables)
+            )
+            summary_rows = 0
+        else:
+            summary_rows = await rebuild_plan_search_summary(test_mode=test_mode)
+    else:
+        summary_rows = await rebuild_plan_search_summary(test_mode=test_mode)
     print("Plan search summary rows: ", summary_rows)
     print_time_info(ctx["context"]["start"])
 
@@ -1701,6 +2164,18 @@ async def main(test_mode: bool = False):
     await redis.enqueue_job("init_file", {"test_mode": test_mode}, _queue_name=MRF_QUEUE_NAME)
 
 
-async def finish_main():
+async def finish_main(test_mode: bool = False, import_id: str | None = None):
     redis = await create_pool(build_redis_settings(), job_serializer=serialize_job, job_deserializer=deserialize_job)
-    await redis.enqueue_job("shutdown", _queue_name=MRF_FINISH_QUEUE_NAME)
+    resolved_import_id = import_id or os.environ.get("HLTHPRT_IMPORT_ID_OVERRIDE") or datetime.datetime.utcnow().strftime(
+        "%Y%m%d"
+    )
+    context = {
+        "import_date": resolved_import_id,
+        "test_mode": bool(test_mode),
+    }
+    await redis.enqueue_job(
+        "shutdown",
+        {"context": context, "test_mode": bool(test_mode)},
+        _queue_name=MRF_FINISH_QUEUE_NAME,
+        _job_id=f"shutdown_mrf_{resolved_import_id}",
+    )

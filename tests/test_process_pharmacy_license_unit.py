@@ -183,6 +183,145 @@ def test_normalize_stage_row_uses_npi_resolver_when_npi_missing():
     assert payload["npi"] == 1518379601
 
 
+def test_normalize_stage_row_uses_other_identifier_resolver_when_npi_missing():
+    resolver = pharmacy_license.StateNpiResolver(state_code="MA")
+    resolver.by_other_identifier = {"MAPH00123": 1518379602}
+    source = pharmacy_license.StateSource(state_code="MA", state_name="Massachusetts", board_url="https://example.com")
+    row = {
+        "License Number": "MA-PH-00123",
+        "License Type": "Pharmacy",
+        "License Status": "Active",
+        "Entity Name": "Sample Pharmacy",
+        "City": "Boston",
+        "State": "MA",
+        "Zip": "02108",
+    }
+
+    payload, reason = pharmacy_license._normalize_stage_row(
+        row,
+        run_id="run_1",
+        snapshot_id="snap_1",
+        state_source=source,
+        source_url="https://example.com/results",
+        imported_at=datetime.datetime(2026, 3, 10, 0, 0, 0),
+        npi_resolver=resolver,
+    )
+
+    assert reason is None
+    assert payload is not None
+    assert payload["npi"] == 1518379602
+    assert resolver.stats == {"other_identifier": 1}
+
+
+def test_normalize_stage_row_uses_other_identifier_digits_resolver_when_needed():
+    resolver = pharmacy_license.StateNpiResolver(state_code="MA")
+    resolver.by_other_identifier_digits = {"1200345": 1518379603}
+    source = pharmacy_license.StateSource(state_code="MA", state_name="Massachusetts", board_url="https://example.com")
+    row = {
+        "License Number": "12-00345",
+        "License Type": "Pharmacy",
+        "License Status": "Active",
+        "Entity Name": "Digits Pharmacy",
+        "City": "Boston",
+        "State": "MA",
+        "Zip": "02109",
+    }
+
+    payload, reason = pharmacy_license._normalize_stage_row(
+        row,
+        run_id="run_1",
+        snapshot_id="snap_1",
+        state_source=source,
+        source_url="https://example.com/results",
+        imported_at=datetime.datetime(2026, 3, 10, 0, 0, 0),
+        npi_resolver=resolver,
+    )
+
+    assert reason is None
+    assert payload is not None
+    assert payload["npi"] == 1518379603
+    assert resolver.stats == {"other_identifier_digits": 1}
+
+
+def test_state_npi_resolver_name_fallback_requires_partd_quality_gate():
+    resolver = pharmacy_license.StateNpiResolver(state_code="NJ")
+    resolver.by_name_zip = {("samplepharmacy", "07001"): 1518379604}
+
+    blocked = resolver.resolve(
+        license_number=None,
+        entity_name="Sample Pharmacy",
+        dba_name=None,
+        city="Newark",
+        zip_code="07001",
+    )
+    assert blocked is None
+
+    resolver.partd_name_fallback_enabled = True
+    allowed = resolver.resolve(
+        license_number=None,
+        entity_name="Sample Pharmacy",
+        dba_name=None,
+        city="Newark",
+        zip_code="07001",
+    )
+    assert allowed == 1518379604
+    assert resolver.stats["name_zip"] == 1
+
+
+def test_state_npi_resolver_uses_registry_name_city_before_partd_fallback():
+    resolver = pharmacy_license.StateNpiResolver(state_code="NJ")
+    resolver.by_registry_name_city = {("acmepharmacy", "newark"): 1518379605}
+    resolver.by_name_city = {("acmepharmacy", "newark"): 1518379999}
+    resolver.partd_name_fallback_enabled = True
+
+    mapped = resolver.resolve(
+        license_number=None,
+        entity_name="Acme Pharmacy",
+        dba_name=None,
+        city="Newark",
+        zip_code=None,
+    )
+
+    assert mapped == 1518379605
+    assert resolver.stats == {"registry_name_city": 1}
+
+
+def test_name_candidates_for_match_handles_dba_and_department_suffix():
+    keys = pharmacy_license._name_candidates_for_match(
+        "ACME MARKETS, INC., D/B/A ACME PHARMACY DEPT. 1054",
+        None,
+    )
+
+    assert "acmemarketsincdbaacmepharmacydept1054" in keys
+    assert "acmepharmacy" in keys
+
+
+def test_license_like_identifier_issuer_filters_non_license_values():
+    assert pharmacy_license._is_license_like_identifier_issuer("STATE LICENSE") is True
+    assert pharmacy_license._is_license_like_identifier_issuer("Medical License") is True
+    assert pharmacy_license._is_license_like_identifier_issuer("AETNA") is False
+    assert pharmacy_license._is_license_like_identifier_issuer(None) is False
+
+
+def test_partd_quality_gate_requires_rows_name_and_location():
+    assert (
+        pharmacy_license._partd_name_fallback_quality_ok(total_rows=10, named_rows=10, city_rows=10, zip_rows=10)
+        is False
+    )
+    assert (
+        pharmacy_license._partd_name_fallback_quality_ok(total_rows=50, named_rows=0, city_rows=50, zip_rows=50)
+        is False
+    )
+    assert (
+        pharmacy_license._partd_name_fallback_quality_ok(total_rows=50, named_rows=10, city_rows=0, zip_rows=0)
+        is False
+    )
+    assert (
+        pharmacy_license._partd_name_fallback_quality_ok(total_rows=50, named_rows=10, city_rows=5, zip_rows=0)
+        is True
+    )
+
+
 def test_create_aspnet_adapter_spec_for_supported_state():
     source = pharmacy_license.StateSource(
         state_code="NJ",

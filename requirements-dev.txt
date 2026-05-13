@@ -6,7 +6,7 @@ aiohttp-socks>=0.11.0
 aioshutil
 aiosignal>=1.4.0
 alembic>=1.18.4
-arq>=0.26.3
+arq>=0.28.0
 async-unzip>=0.5.5
 asyncpg>=0.29.0
 attrs>=25.4.0
@@ -24,6 +24,7 @@ jellyfish>=1.2.1
 Jinja2
 msgpack
 numpy>=2.3.4
+orjson>=3.11.8
 pandas>=2.3.3
 pluggy>=1.6.0
 propcache>=0.4.1

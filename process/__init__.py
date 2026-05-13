@@ -586,8 +586,10 @@ def mrf(test: bool):
     asyncio.run(initiate_mrf(test_mode=test))
 
 @click.command(help="Finish CMSGOV MRF Import")
-def mrf_end():
-    asyncio.run(finish_mrf())
+@click.option("--test", is_flag=True, help="Finalize the test-schema import.")
+@click.option("--import-id", help="Override the import_id/import_date used during finalize.")
+def mrf_end(test: bool, import_id: str | None):
+    asyncio.run(finish_mrf(test_mode=test, import_id=import_id))
 
 
 @click.command(help="Run Plan Attributes Import from CMS.gov")
@@ -607,6 +609,36 @@ def npi(test: bool):
 @click.option("--allowed-url", help="URL of a single allowed-amounts file.")
 @click.option("--provider-ref-url", help="URL of a provider-reference file.")
 @click.option("--import-id", help="Override import id/date suffix for table names.")
+@click.option("--import-month", help="Snapshot month for PTG2 imports (YYYY-MM-DD or YYYY-MM).")
+@click.option("--max-files", type=int, help="Maximum discovered rate files to process.")
+@click.option("--max-items", type=int, help="Maximum top-level rate items to parse per file.")
+@click.option("--plan-id", multiple=True, help="Only process TOC structures containing this plan id (repeatable).")
+@click.option(
+    "--plan-name-contains",
+    multiple=True,
+    help="Only process TOC structures whose plan/sponsor/issuer text contains this value (repeatable).",
+)
+@click.option("--plan-market-type", multiple=True, help="Only process TOC structures with this market type.")
+@click.option(
+    "--file-url-contains",
+    multiple=True,
+    help="Only process discovered rate files whose URL or description contains this value (repeatable).",
+)
+@click.option(
+    "--reuse-raw-artifacts/--no-reuse-raw-artifacts",
+    default=True,
+    help="Reuse retained PTG2 raw artifacts when server metadata or hashes prove they are unchanged.",
+)
+@click.option(
+    "--keep-partial-artifacts/--cleanup-partial-artifacts",
+    default=None,
+    help="Keep partial PTG2 raw downloads on failure for resume/debug runs (env: HLTHPRT_PTG2_KEEP_PARTIAL_ARTIFACTS).",
+)
+@click.option(
+    "--keep-artifacts-on-failure",
+    is_flag=True,
+    help="Alias for --keep-partial-artifacts to explicitly retain failed-download artifacts for reruns.",
+)
 @click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
 def ptg(
     toc_url: tuple[str, ...],
@@ -615,8 +647,20 @@ def ptg(
     allowed_url: str | None,
     provider_ref_url: str | None,
     import_id: str | None,
-    test: bool,
+    import_month: str | None = None,
+    max_files: int | None = None,
+    max_items: int | None = None,
+    plan_id: tuple[str, ...] = (),
+    plan_name_contains: tuple[str, ...] = (),
+    plan_market_type: tuple[str, ...] = (),
+    file_url_contains: tuple[str, ...] = (),
+    reuse_raw_artifacts: bool = True,
+    keep_partial_artifacts: bool | None = None,
+    keep_artifacts_on_failure: bool = False,
+    test: bool = False,
 ):
+    if keep_artifacts_on_failure:
+        keep_partial_artifacts = True
     asyncio.run(
         initiate_ptg(
             test_mode=test,
@@ -626,6 +670,15 @@ def ptg(
             allowed_url=allowed_url,
             provider_ref_url=provider_ref_url,
             import_id=import_id,
+            import_month=import_month,
+            max_files=max_files,
+            max_items=max_items,
+            plan_ids=list(plan_id),
+            plan_name_contains=list(plan_name_contains),
+            plan_market_types=list(plan_market_type),
+            file_url_contains=list(file_url_contains),
+            reuse_raw_artifacts=reuse_raw_artifacts,
+            keep_partial_artifacts=keep_partial_artifacts,
         )
     )
 
