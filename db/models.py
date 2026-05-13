@@ -672,6 +672,44 @@ class PlanBenefits(Base, JSONOutputMixin):
     is_excl_from_oon_mo = Column(Boolean)
 
 
+class PlanBenefitsMarketplace(Base, JSONOutputMixin):
+    __tablename__ = "plan_benefits_marketplace"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("plan_id", "year", "checksum"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["plan_id", "year", "checksum"]
+    __my_additional_indexes__ = [
+        {
+            "index_elements": ("plan_id", "year", "benefit_name"),
+            "name": "plan_year_benefit",
+        },
+        {
+            "index_elements": ("issuer_id", "year", "benefit_name"),
+            "name": "issuer_year_benefit",
+        },
+        {
+            "index_elements": ("benefit_name",),
+            "name": "benefit_name",
+        },
+    ]
+
+    plan_id = Column(String(14), nullable=False)
+    year = Column(Integer, nullable=False)
+    issuer_id = Column(Integer)
+    benefit_position = Column(Integer, nullable=False, server_default="0")
+    benefit_name = Column(String, nullable=False)
+    benefit_label = Column(String)
+    benefit_value_text = Column(String)
+    benefit_value_bool = Column(Boolean)
+    benefit_value_number = Column(Float)
+    benefit_value_json = Column(JSON)
+    benefit_item_json = Column(JSON)
+    last_updated_on = Column(TIMESTAMP)
+    checksum = Column(Integer, nullable=False)
+
+
 class PlanRatingAreas(Base, JSONOutputMixin):
     __tablename__ = 'plan_rating_areas'
     __main_table__ = __tablename__
@@ -1264,6 +1302,112 @@ class NPIAddress(AddressPrototype):
     # NPI	Provider Secondary Practice Location Address- Address Line 1	Provider Secondary Practice Location Address-  Address Line 2	Provider Secondary Practice Location Address - City Name	Provider Secondary Practice Location Address - State Name	Provider Secondary Practice Location Address - Postal Code	Provider Secondary Practice Location Address - Country Code (If outside U.S.)	Provider Secondary Practice Location Address - Telephone Number	Provider Secondary Practice Location Address - Telephone Extension	Provider Practice Location Address - Fax Number
 
 
+class MRFAddress(AddressPrototype):
+    __tablename__ = "mrf_address"
+    __main_table__ = __tablename__
+    __my_index_elements__ = ["npi", "type", "checksum"]
+    __my_initial_indexes__ = [{"index_elements": ("checksum",)}]
+    __my_additional_indexes__ = [
+        {"index_elements": ("type", "npi"), "name": "type_npi"},
+        {
+            "index_elements": ("state_name", "city_name", "npi"),
+            "name": "practice_state_city_npi",
+            "where": "type='practice'",
+        },
+        {
+            "index_elements": ("LEFT(postal_code, 5)", "npi"),
+            "name": "practice_postal_code_5_npi",
+            "where": "type='practice'",
+        },
+        {
+            "index_elements": (
+                "regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g')",
+                "npi",
+            ),
+            "name": "practice_phone_digits_npi",
+            "where": "type='practice'",
+        },
+        {
+            "index_elements": ("address_sources",),
+            "using": "gin",
+            "name": "address_sources",
+        },
+        {
+            "index_elements": ("source_issuer_ids",),
+            "using": "gin",
+            "name": "source_issuer_ids",
+        },
+        {
+            "index_elements": ("source_issuer_names",),
+            "using": "gin",
+            "name": "source_issuer_names",
+        },
+    ]
+
+    npi = Column(Integer, primary_key=True)
+    type = Column(String, primary_key=True)
+    source_count = Column(Integer, nullable=False, server_default="0")
+    address_sources = Column(ARRAY(String), nullable=False, server_default=text("'{}'::varchar[]"))
+    source_record_ids = Column(ARRAY(String), nullable=False, server_default=text("'{}'::varchar[]"))
+    source_import_ids = Column(ARRAY(String), nullable=False, server_default=text("'{}'::varchar[]"))
+    source_import_dates = Column(ARRAY(DATE), nullable=False, server_default=text("'{}'::date[]"))
+    source_issuer_ids = Column(ARRAY(Integer), nullable=False, server_default=text("'{}'::integer[]"))
+    source_issuer_names = Column(ARRAY(String), nullable=False, server_default=text("'{}'::varchar[]"))
+    source_urls = Column(ARRAY(String), nullable=False, server_default=text("'{}'::varchar[]"))
+
+
+class MRFAddressEvidence(Base, JSONOutputMixin):
+    __tablename__ = "mrf_address_evidence"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("evidence_checksum"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["evidence_checksum"]
+    __my_additional_indexes__ = [
+        {
+            "index_elements": ("npi", "type", "checksum"),
+            "name": "npi_type_checksum",
+        },
+        {
+            "index_elements": ("issuer_id", "year"),
+            "name": "issuer_year",
+        },
+        {
+            "index_elements": ("import_id",),
+            "name": "import_id",
+        },
+        {
+            "index_elements": ("checksum",),
+            "name": "checksum",
+        },
+    ]
+
+    evidence_checksum = Column(Integer, nullable=False)
+    npi = Column(Integer, nullable=False)
+    type = Column(String, nullable=False)
+    checksum = Column(Integer, nullable=False)
+    issuer_id = Column(Integer)
+    issuer_name = Column(String)
+    year = Column(Integer)
+    checksum_network = Column(Integer)
+    network_tier = Column(String)
+    import_id = Column(String, nullable=False)
+    import_date = Column(DATE)
+    address_source = Column(String, nullable=False, server_default="marketplace_provider")
+    source_table = Column(String, nullable=False, server_default="plan_npi_raw")
+    source_url = Column(String)
+    source_record_id = Column(String, nullable=False)
+    first_line = Column(String)
+    second_line = Column(String)
+    city_name = Column(String)
+    state_name = Column(String)
+    postal_code = Column(String)
+    country_code = Column(String)
+    telephone_number = Column(String)
+    observed_at = Column(TIMESTAMP)
+
+
 class NPIPhoneStaffing(Base, JSONOutputMixin):
     __tablename__ = 'npi_phone_staffing'
     __main_table__ = __tablename__
@@ -1488,6 +1632,911 @@ class PTGAllowedProviderPayment(Base, JSONOutputMixin):
     payment_hash = Column(BigInteger)
     billed_charge = Column(Numeric)
     npi = Column(ARRAY(BigInteger))
+
+
+class PTG2ImportRun(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_import_run"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("import_run_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["import_run_id"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("status",), "name": "ptg2_import_run_status_idx"},
+        {"index_elements": ("import_month",), "name": "ptg2_import_run_month_idx"},
+    ]
+
+    import_run_id = Column(String(96))
+    import_month = Column(DATE)
+    status = Column(String(32))
+    started_at = Column(DateTime)
+    finished_at = Column(DateTime)
+    heartbeat_at = Column(DateTime)
+    options = Column(JSON)
+    report = Column(JSON)
+    error = Column(TEXT)
+
+
+class PTG2Snapshot(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_snapshot"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("snapshot_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["snapshot_id"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("status",), "name": "ptg2_snapshot_status_idx"},
+        {"index_elements": ("import_month",), "name": "ptg2_snapshot_month_idx"},
+    ]
+
+    snapshot_id = Column(String(96))
+    import_run_id = Column(String(96))
+    import_month = Column(DATE)
+    status = Column(String(32))
+    created_at = Column(DateTime)
+    validated_at = Column(DateTime)
+    published_at = Column(DateTime)
+    previous_snapshot_id = Column(String(96))
+    manifest = Column(JSON)
+
+
+class PTG2CurrentSnapshot(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_current_snapshot"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("slot"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["slot"]
+
+    slot = Column(String(32))
+    snapshot_id = Column(String(96))
+    previous_snapshot_id = Column(String(96))
+    updated_at = Column(DateTime)
+
+
+class PTG2SourceCatalog(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_source_catalog"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("source_catalog_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["source_catalog_id"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("canonical_url",), "name": "ptg2_source_catalog_url_idx"},
+        {"index_elements": ("source_type",), "name": "ptg2_source_catalog_type_idx"},
+        {"index_elements": ("plan_id",), "name": "ptg2_source_catalog_plan_idx"},
+    ]
+
+    source_catalog_id = Column(String(96))
+    import_run_id = Column(String(96))
+    source_type = Column(String(64))
+    domain = Column(String(64))
+    original_url = Column(String)
+    canonical_url = Column(String)
+    from_index_url = Column(String)
+    description = Column(String)
+    reporting_entity_name = Column(String)
+    reporting_entity_type = Column(String)
+    plan_name = Column(String)
+    plan_id_type = Column(String(32))
+    plan_id = Column(String(64))
+    plan_market_type = Column(String(32))
+    issuer_name = Column(String)
+    plan_sponsor_name = Column(String)
+    payload = Column(JSON)
+    created_at = Column(DateTime)
+
+
+class PTG2SourceIdentity(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_source_identity"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("source_identity_hash"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["source_identity_hash"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("hash_prefix",), "name": "ptg2_source_identity_prefix_idx"},
+        {"index_elements": ("canonical_url",), "name": "ptg2_source_identity_url_idx"},
+    ]
+
+    source_identity_hash = Column(String(64))
+    hash_prefix = Column(String(16))
+    source_type = Column(String(64))
+    canonical_url = Column(String)
+    original_url = Column(String)
+    payload = Column(JSON)
+    created_at = Column(DateTime)
+
+
+class PTG2SourceFileVersion(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_source_file_version"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("source_file_version_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["source_file_version_id"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("source_identity_hash",), "name": "ptg2_source_file_identity_idx"},
+        {"index_elements": ("raw_sha256",), "name": "ptg2_source_file_raw_sha_idx"},
+        {"index_elements": ("etag",), "name": "ptg2_source_file_etag_idx"},
+    ]
+
+    source_file_version_id = Column(String(96))
+    source_identity_hash = Column(String(64))
+    content_hash = Column(String(64))
+    raw_storage_uri = Column(String)
+    raw_sha256 = Column(String(64))
+    logical_sha256 = Column(String(64))
+    content_length = Column(BigInteger)
+    etag = Column(String)
+    last_modified = Column(String)
+    reuse_policy = Column(String(64))
+    verification_mode = Column(String(64))
+    reused_from_source_file_version_id = Column(String(96))
+    verified_at = Column(DateTime)
+    created_at = Column(DateTime)
+    payload = Column(JSON)
+
+
+class PTG2ContentIdentity(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_content_identity"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("content_hash"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["content_hash"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("hash_prefix",), "name": "ptg2_content_identity_prefix_idx"},
+        {"index_elements": ("domain",), "name": "ptg2_content_identity_domain_idx"},
+    ]
+
+    content_hash = Column(String(64))
+    hash_prefix = Column(String(16))
+    domain = Column(String(64))
+    logical_sha256 = Column(String(64))
+    canonical_payload = Column(JSON)
+    created_at = Column(DateTime)
+
+
+class PTG2ImportJob(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_import_job"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("import_job_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["import_job_id"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("import_run_id",), "name": "ptg2_import_job_run_idx"},
+        {"index_elements": ("status",), "name": "ptg2_import_job_status_idx"},
+        {"index_elements": ("source_type",), "name": "ptg2_import_job_type_idx"},
+    ]
+
+    import_job_id = Column(String(96))
+    import_run_id = Column(String(96))
+    source_catalog_id = Column(String(96))
+    source_type = Column(String(64))
+    status = Column(String(32))
+    attempts = Column(Integer)
+    lease_owner = Column(String)
+    lease_expires_at = Column(DateTime)
+    heartbeat_at = Column(DateTime)
+    error = Column(TEXT)
+    payload = Column(JSON)
+    created_at = Column(DateTime)
+    updated_at = Column(DateTime)
+
+
+class PTG2ArtifactManifest(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_artifact_manifest"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("artifact_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["artifact_id"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("artifact_kind",), "name": "ptg2_artifact_kind_idx"},
+        {"index_elements": ("snapshot_id",), "name": "ptg2_artifact_snapshot_idx"},
+        {"index_elements": ("sha256",), "name": "ptg2_artifact_sha_idx"},
+    ]
+
+    artifact_id = Column(String(96))
+    snapshot_id = Column(String(96))
+    import_run_id = Column(String(96))
+    artifact_kind = Column(String(64))
+    storage_uri = Column(String)
+    sha256 = Column(String(64))
+    byte_count = Column(BigInteger)
+    payload = Column(JSON)
+    created_at = Column(DateTime)
+
+
+class PTG2Plan(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_plan"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("plan_hash"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["plan_hash"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("hash_prefix",), "name": "ptg2_plan_prefix_idx"},
+        {"index_elements": ("plan_id",), "name": "ptg2_plan_id_idx"},
+        {"index_elements": ("plan_name",), "name": "ptg2_plan_name_idx"},
+    ]
+
+    plan_hash = Column(String(64))
+    hash_prefix = Column(String(16))
+    plan_id = Column(String(64))
+    plan_id_type = Column(String(32))
+    plan_name = Column(String)
+    plan_market_type = Column(String(32))
+    issuer_name = Column(String)
+    plan_sponsor_name = Column(String)
+    canonical_payload = Column(JSON)
+    created_at = Column(DateTime)
+
+
+class PTG2PlanAlias(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_plan_alias"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("alias_hash"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["alias_hash"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("plan_hash",), "name": "ptg2_plan_alias_plan_idx"},
+        {"index_elements": ("alias_type", "alias_value"), "name": "ptg2_plan_alias_value_idx"},
+    ]
+
+    alias_hash = Column(String(64))
+    plan_hash = Column(String(64))
+    alias_type = Column(String(32))
+    alias_value = Column(String)
+    created_at = Column(DateTime)
+
+
+class PTG2PlanMonth(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_plan_month"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("plan_month_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["plan_month_id"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("snapshot_id",), "name": "ptg2_plan_month_snapshot_idx"},
+        {"index_elements": ("plan_hash", "import_month"), "name": "ptg2_plan_month_plan_idx"},
+    ]
+
+    plan_month_id = Column(String(96))
+    snapshot_id = Column(String(96))
+    plan_hash = Column(String(64))
+    import_month = Column(DATE)
+    created_at = Column(DateTime)
+
+
+class PTG2PlanRateSet(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_plan_rate_set"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("plan_rate_set_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["plan_rate_set_id"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("plan_month_id",), "name": "ptg2_plan_rate_set_month_idx"},
+        {"index_elements": ("rate_set_hash",), "name": "ptg2_plan_rate_set_rate_idx"},
+    ]
+
+    plan_rate_set_id = Column(String(96))
+    plan_month_id = Column(String(96))
+    rate_set_hash = Column(String(64))
+    domain = Column(String(64))
+    created_at = Column(DateTime)
+
+
+class PTG2RateSetContext(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_rate_set_context"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("context_hash"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["context_hash"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("hash_prefix",), "name": "ptg2_rate_context_prefix_idx"},
+        {"index_elements": ("domain",), "name": "ptg2_rate_context_domain_idx"},
+    ]
+
+    context_hash = Column(String(64))
+    hash_prefix = Column(String(16))
+    domain = Column(String(64))
+    canonical_payload = Column(JSON)
+    created_at = Column(DateTime)
+
+
+class PTG2RateSet(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_rate_set"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("rate_set_hash"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["rate_set_hash"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("hash_prefix",), "name": "ptg2_rate_set_prefix_idx"},
+        {"index_elements": ("context_hash",), "name": "ptg2_rate_set_context_idx"},
+    ]
+
+    rate_set_hash = Column(String(64))
+    hash_prefix = Column(String(16))
+    context_hash = Column(String(64))
+    chunk_hashes = Column(ARRAY(String))
+    canonical_payload = Column(JSON)
+    created_at = Column(DateTime)
+
+
+class PTG2FactChunk(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_fact_chunk"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("fact_chunk_hash"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["fact_chunk_hash"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("hash_prefix",), "name": "ptg2_fact_chunk_prefix_idx"},
+        {"index_elements": ("context_hash", "domain", "procedure_hash"), "name": "ptg2_fact_chunk_lookup_idx"},
+        {"index_elements": ("provider_bucket",), "name": "ptg2_fact_chunk_bucket_idx"},
+    ]
+
+    fact_chunk_hash = Column(String(64))
+    hash_prefix = Column(String(16))
+    context_hash = Column(String(64))
+    domain = Column(String(64))
+    procedure_hash = Column(String(64))
+    provider_bucket = Column(String(32))
+    rate_pack_hashes = Column(ARRAY(String))
+    canonical_payload = Column(JSON)
+    created_at = Column(DateTime)
+
+
+class PTG2RatePack(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_rate_pack"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("rate_pack_hash"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["rate_pack_hash"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("hash_prefix",), "name": "ptg2_rate_pack_prefix_idx"},
+        {"index_elements": ("context_hash",), "name": "ptg2_rate_pack_context_idx"},
+        {"index_elements": ("procedure_hash",), "name": "ptg2_rate_pack_procedure_idx"},
+        {"index_elements": ("provider_set_hash",), "name": "ptg2_rate_pack_provider_idx"},
+    ]
+
+    rate_pack_hash = Column(String(64))
+    hash_prefix = Column(String(16))
+    context_hash = Column(String(64))
+    domain = Column(String(64))
+    procedure_hash = Column(String(64))
+    provider_set_hash = Column(String(64))
+    price_set_hash = Column(String(64))
+    source_trace_set_hash = Column(String(64))
+    canonical_payload = Column(JSON)
+    created_at = Column(DateTime)
+
+
+class PTG2ProviderGroup(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_provider_group"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("provider_group_hash"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["provider_group_hash"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("hash_prefix",), "name": "ptg2_provider_group_prefix_idx"},
+        {"index_elements": ("tin_value",), "name": "ptg2_provider_group_tin_idx"},
+        {"index_elements": ("provider_count",), "name": "ptg2_provider_group_count_idx"},
+    ]
+
+    provider_group_hash = Column(BigInteger)
+    hash_prefix = Column(String(16))
+    provider_count = Column(Integer)
+    npi = Column(ARRAY(BigInteger))
+    tin_type = Column(String(16))
+    tin_value = Column(String(64))
+    tin_business_name = Column(String)
+    canonical_payload = Column(JSON)
+    created_at = Column(DateTime)
+
+
+class PTG2ProviderSet(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_provider_set"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("provider_set_hash"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["provider_set_hash"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("hash_prefix",), "name": "ptg2_provider_set_prefix_idx"},
+        {"index_elements": ("provider_count",), "name": "ptg2_provider_set_count_idx"},
+    ]
+
+    provider_set_hash = Column(String(64))
+    hash_prefix = Column(String(16))
+    provider_count = Column(Integer)
+    npi = Column(ARRAY(BigInteger))
+    provider_group_hashes = Column(ARRAY(BigInteger))
+    tin_type = Column(String(16))
+    tin_value = Column(String(64))
+    canonical_payload = Column(JSON)
+    created_at = Column(DateTime)
+
+
+class PTG2ProviderSetMember(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_provider_set_member"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("provider_set_hash", "npi"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["provider_set_hash", "npi"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("npi",), "name": "ptg2_provider_set_member_npi_idx"},
+    ]
+
+    provider_set_hash = Column(String(64))
+    npi = Column(BigInteger)
+    ordinal = Column(Integer)
+
+
+class PTG2ProviderGroupMember(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_provider_group_member"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("provider_group_hash", "npi"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["provider_group_hash", "npi"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("npi", "provider_group_hash"), "name": "ptg2_provider_group_member_npi_idx"},
+    ]
+
+    provider_group_hash = Column(BigInteger)
+    npi = Column(BigInteger)
+    ordinal = Column(Integer)
+
+
+class PTG2ProviderSetComponent(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_provider_set_component"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("provider_set_hash", "provider_group_hash"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["provider_set_hash", "provider_group_hash"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("provider_group_hash", "provider_set_hash"), "name": "ptg2_provider_set_component_group_idx"},
+    ]
+
+    provider_set_hash = Column(String(64))
+    provider_group_hash = Column(BigInteger)
+    ordinal = Column(Integer)
+
+
+class PTG2ProviderLocation(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_provider_location"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("location_hash"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["location_hash"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("npi",), "name": "ptg2_provider_location_npi_idx"},
+        {"index_elements": ("zip5", "npi"), "name": "ptg2_provider_location_zip_npi_idx"},
+        {"index_elements": ("state", "city_norm", "npi"), "name": "ptg2_provider_location_state_city_npi_idx"},
+    ]
+
+    location_hash = Column(String(64))
+    npi = Column(BigInteger)
+    state = Column(String(64))
+    city = Column(String)
+    city_norm = Column(String)
+    zip5 = Column(String(5))
+    lat = Column(Float)
+    lon = Column(Float)
+    location_source = Column(String(64))
+    confidence_code = Column(String(64))
+    address_payload = Column(JSON)
+    created_at = Column(DateTime)
+
+
+class PTG2ServingRateCompact(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_serving_rate_compact"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("serving_rate_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["serving_rate_id"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("snapshot_id", "plan_id", "billing_code"), "name": "ptg2_serving_rate_compact_billing_idx"},
+        {"index_elements": ("snapshot_id", "plan_id", "reported_code"), "name": "ptg2_serving_rate_compact_reported_idx"},
+        {"index_elements": ("snapshot_id", "plan_id", "procedure_code"), "name": "ptg2_serving_rate_compact_hp_idx"},
+        {
+            "index_elements": (
+                "snapshot_id",
+                "plan_id",
+                "billing_code",
+                "provider_count DESC",
+                "serving_rate_id",
+            ),
+            "name": "ptg2_serving_rate_compact_billing_order_idx",
+        },
+        {
+            "index_elements": (
+                "snapshot_id",
+                "plan_id",
+                "reported_code",
+                "provider_count DESC",
+                "serving_rate_id",
+            ),
+            "name": "ptg2_serving_rate_compact_reported_order_idx",
+        },
+        {"index_elements": ("provider_set_hash",), "name": "ptg2_serving_rate_compact_provider_idx"},
+        {"index_elements": ("price_set_hash",), "name": "ptg2_serving_rate_compact_price_idx"},
+    ]
+
+    serving_rate_id = Column(String(64))
+    snapshot_id = Column(String(96))
+    plan_id = Column(String(64))
+    plan_month_id = Column(String(96))
+    procedure_hash = Column(String(64))
+    procedure_code = Column(BigInteger)
+    reported_code_system = Column(String(64))
+    reported_code = Column(String(64))
+    billing_code = Column(String(64))
+    billing_code_type = Column(String(64))
+    rate_pack_hash = Column(String(64))
+    provider_set_hash = Column(String(64))
+    provider_count = Column(Integer)
+    price_set_hash = Column(String(64))
+    source_trace_set_hash = Column(String(64))
+    confidence_code = Column(String(64))
+    created_at = Column(DateTime)
+
+
+class PTG2ServingRate(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_serving_rate"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("serving_rate_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["serving_rate_id"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("snapshot_id", "plan_id", "billing_code"), "name": "ptg2_serving_rate_lookup_idx"},
+        {"index_elements": ("snapshot_id", "plan_id", "procedure_code"), "name": "ptg2_serving_rate_hp_lookup_idx"},
+        {
+            "index_elements": (
+                "snapshot_id",
+                "plan_id",
+                "billing_code",
+                "provider_count DESC",
+                "provider_set_count DESC",
+                "serving_rate_id",
+            ),
+            "name": "ptg2_serving_rate_lookup_order_idx",
+        },
+        {
+            "index_elements": (
+                "snapshot_id",
+                "plan_id",
+                "procedure_code",
+                "provider_count DESC",
+                "provider_set_count DESC",
+                "serving_rate_id",
+            ),
+            "name": "ptg2_serving_rate_hp_lookup_order_idx",
+        },
+        {"index_elements": ("snapshot_id", "plan_id"), "name": "ptg2_serving_rate_plan_idx"},
+        {"index_elements": ("snapshot_id", "billing_code"), "name": "ptg2_serving_rate_code_idx"},
+        {"index_elements": ("snapshot_id", "reported_code_system", "reported_code"), "name": "ptg2_serving_rate_reported_code_idx"},
+        {
+            "index_elements": (
+                "snapshot_id",
+                "plan_id",
+                "reported_code_system",
+                "reported_code",
+                "provider_count DESC",
+                "provider_set_count DESC",
+                "serving_rate_id",
+            ),
+            "name": "ptg2_serving_rate_reported_order_idx",
+        },
+        {"index_elements": ("provider_set_hash",), "name": "ptg2_serving_rate_provider_idx"},
+    ]
+
+    serving_rate_id = Column(String(64))
+    snapshot_id = Column(String(96))
+    plan_id = Column(String(64))
+    plan_name = Column(String)
+    plan_id_type = Column(String(32))
+    plan_market_type = Column(String(32))
+    issuer_name = Column(String)
+    plan_sponsor_name = Column(String)
+    procedure_code = Column(BigInteger)
+    reported_code_system = Column(String(64))
+    reported_code = Column(String(64))
+    billing_code = Column(String(64))
+    billing_code_type = Column(String(64))
+    procedure_name = Column(String)
+    procedure_description = Column(String)
+    procedure_display_name = Column(String)
+    rate_pack_hash = Column(String(64))
+    provider_set_hash = Column(String(64))
+    provider_set_hashes = Column(ARRAY(String))
+    provider_count = Column(Integer)
+    provider_set_count = Column(Integer)
+    price_set_hash = Column(String(64))
+    source_trace_set_hash = Column(String(64))
+    confidence_code = Column(String(64))
+    prices = Column(JSON)
+    source_trace = Column(JSON)
+    confidence = Column(JSON)
+    created_at = Column(DateTime)
+
+
+class PTG2LocationSet(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_location_set"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("location_set_hash"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["location_set_hash"]
+    __my_additional_indexes__ = [{"index_elements": ("hash_prefix",), "name": "ptg2_location_set_prefix_idx"}]
+
+    location_set_hash = Column(String(64))
+    hash_prefix = Column(String(16))
+    location_count = Column(Integer)
+    canonical_payload = Column(JSON)
+    created_at = Column(DateTime)
+
+
+class PTG2LocationSetMember(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_location_set_member"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("location_set_hash", "location_ordinal"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["location_set_hash", "location_ordinal"]
+
+    location_set_hash = Column(String(64))
+    location_ordinal = Column(Integer)
+    npi = Column(BigInteger)
+    address_payload = Column(JSON)
+
+
+class PTG2Procedure(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_procedure"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("procedure_hash"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["procedure_hash"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("hash_prefix",), "name": "ptg2_procedure_prefix_idx"},
+        {"index_elements": ("billing_code_type", "billing_code"), "name": "ptg2_procedure_code_idx"},
+    ]
+
+    procedure_hash = Column(String(64))
+    hash_prefix = Column(String(16))
+    billing_code_type = Column(String(64))
+    billing_code_type_version = Column(String(64))
+    billing_code = Column(String(64))
+    name = Column(String)
+    description = Column(String)
+    canonical_payload = Column(JSON)
+    created_at = Column(DateTime)
+
+
+class PTG2RelatedCodeSet(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_related_code_set"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("related_code_set_hash"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["related_code_set_hash"]
+    __my_additional_indexes__ = [{"index_elements": ("hash_prefix",), "name": "ptg2_related_code_set_prefix_idx"}]
+
+    related_code_set_hash = Column(String(64))
+    hash_prefix = Column(String(16))
+    bundled_codes = Column(JSON)
+    covered_codes = Column(JSON)
+    canonical_payload = Column(JSON)
+    created_at = Column(DateTime)
+
+
+class PTG2PriceAtom(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_price_atom"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("price_atom_hash"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["price_atom_hash"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("hash_prefix",), "name": "ptg2_price_atom_prefix_idx"},
+        {"index_elements": ("billing_class",), "name": "ptg2_price_atom_class_idx"},
+    ]
+
+    price_atom_hash = Column(String(64))
+    hash_prefix = Column(String(16))
+    negotiated_type = Column(String(64))
+    negotiated_rate = Column(String(64))
+    expiration_date = Column(DATE)
+    service_code = Column(ARRAY(String))
+    billing_class = Column(String(32))
+    setting = Column(String(32))
+    billing_code_modifier = Column(ARRAY(String))
+    additional_information = Column(String)
+    canonical_payload = Column(JSON)
+    created_at = Column(DateTime)
+
+
+class PTG2PriceSet(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_price_set"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("price_set_hash"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["price_set_hash"]
+    __my_additional_indexes__ = [{"index_elements": ("hash_prefix",), "name": "ptg2_price_set_prefix_idx"}]
+
+    price_set_hash = Column(String(64))
+    hash_prefix = Column(String(16))
+    price_atom_hashes = Column(ARRAY(String))
+    negotiated_type = Column(String(64))
+    negotiated_rate = Column(Numeric(asdecimal=False))
+    expiration_date = Column(DATE)
+    service_code = Column(ARRAY(String))
+    billing_class = Column(String(32))
+    setting = Column(String(32))
+    billing_code_modifier = Column(ARRAY(String))
+    additional_information = Column(String)
+    canonical_payload = Column(JSON)
+    created_at = Column(DateTime)
+
+
+class PTG2SourceTrace(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_source_trace"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("source_trace_hash"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["source_trace_hash"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("hash_prefix",), "name": "ptg2_source_trace_prefix_idx"},
+        {"index_elements": ("source_file_version_id",), "name": "ptg2_source_trace_file_idx"},
+    ]
+
+    source_trace_hash = Column(String(64))
+    hash_prefix = Column(String(16))
+    source_file_version_id = Column(String(96))
+    original_url = Column(String)
+    canonical_url = Column(String)
+    json_pointer = Column(String)
+    line_number = Column(Integer)
+    canonical_payload = Column(JSON)
+    created_at = Column(DateTime)
+
+
+class PTG2SourceTraceSet(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_source_trace_set"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("source_trace_set_hash"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["source_trace_set_hash"]
+    __my_additional_indexes__ = [{"index_elements": ("hash_prefix",), "name": "ptg2_source_trace_set_prefix_idx"}]
+
+    source_trace_set_hash = Column(String(64))
+    hash_prefix = Column(String(16))
+    source_trace_hashes = Column(ARRAY(String))
+    canonical_payload = Column(JSON)
+    created_at = Column(DateTime)
+
+
+class PTG2Confidence(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_confidence"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("confidence_hash"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["confidence_hash"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("entity_type", "entity_hash"), "name": "ptg2_confidence_entity_idx"},
+        {"index_elements": ("confidence_code",), "name": "ptg2_confidence_code_idx"},
+    ]
+
+    confidence_hash = Column(String(64))
+    entity_type = Column(String(64))
+    entity_hash = Column(String(64))
+    confidence_code = Column(String(64))
+    confidence_label = Column(String)
+    confidence_score = Column(Float)
+    acceptance_statement = Column(TEXT)
+    payload = Column(JSON)
+    created_at = Column(DateTime)
+
+
+class PTG2Capability(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_capability"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("capability_hash"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["capability_hash"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("npi",), "name": "ptg2_capability_npi_idx"},
+        {"index_elements": ("procedure_hash",), "name": "ptg2_capability_procedure_idx"},
+    ]
+
+    capability_hash = Column(String(64))
+    npi = Column(BigInteger)
+    procedure_hash = Column(String(64))
+    capability_family = Column(String(64))
+    capability_score = Column(Float)
+    evidence = Column(JSON)
+    created_at = Column(DateTime)
+
+
+class PTG2GCCandidate(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_gc_candidate"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("gc_candidate_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["gc_candidate_id"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("artifact_kind",), "name": "ptg2_gc_candidate_kind_idx"},
+        {"index_elements": ("status",), "name": "ptg2_gc_candidate_status_idx"},
+    ]
+
+    gc_candidate_id = Column(String(96))
+    artifact_kind = Column(String(64))
+    storage_uri = Column(String)
+    reason = Column(String)
+    status = Column(String(32))
+    checksum_verified_at = Column(DateTime)
+    deleted_at = Column(DateTime)
+    created_at = Column(DateTime)
+    payload = Column(JSON)
 
 
 class PricingProvider(Base, JSONOutputMixin):

@@ -1322,6 +1322,33 @@ async def test_list_providers_by_procedure_with_q():
 
 
 @pytest.mark.asyncio
+async def test_list_providers_by_procedure_routes_plan_filter_to_ptg2(monkeypatch):
+    async def fake_search(_session, args, pagination):
+        return {
+            "items": [{"npi": 1234567890, "tic_prices": [{"negotiated_rate": "450.00"}]}],
+            "pagination": {
+                "total": 1,
+                "limit": pagination.limit,
+                "offset": pagination.offset,
+                "page": pagination.page,
+            },
+            "query": {"source": "ptg2", "plan_id": args["plan_id"]},
+        }
+
+    monkeypatch.setattr(pricing_module, "search_current_ptg2_index", fake_search)
+    request = make_request(
+        [FakeResult(scalar=1)],
+        args={"plan_id": "010854205", "code": "70551", "limit": "10"},
+    )
+
+    response = await list_providers_by_procedure(request)
+    payload = json.loads(response.body)
+
+    assert payload["items"][0]["tic_prices"][0]["negotiated_rate"] == "450.00"
+    assert payload["query"]["source"] == "ptg2"
+
+
+@pytest.mark.asyncio
 async def test_list_providers_by_procedure_cost_index_requires_code():
     request = make_request(
         [],

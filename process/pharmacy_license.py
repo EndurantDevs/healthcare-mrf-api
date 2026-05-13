@@ -23,7 +23,7 @@ import aiohttp
 from arq import create_pool
 
 from db.connection import db
-from db.models import (PartDPharmacyActivity, NPIDataTaxonomy,
+from db.models import (NPIAddress, NPIData, PartDPharmacyActivity, NPIDataOtherIdentifier, NPIDataTaxonomy,
                        PharmacyLicenseImportRun, PharmacyLicenseRecord,
                        PharmacyLicenseRecordHistory, PharmacyLicenseRecordStage,
                        PharmacyLicenseSnapshot,
@@ -85,9 +85,22 @@ PHARM_LICENSE_HTTP_USER_AGENT = os.getenv(
         "Chrome/122.0.0.0 Safari/537.36"
     ),
 )
+PHARM_LICENSE_PARTD_MIN_ROWS_FOR_FALLBACK = max(
+    int(os.getenv("HLTHPRT_PHARM_LICENSE_PARTD_MIN_ROWS_FOR_FALLBACK", "25")),
+    1,
+)
+PHARM_LICENSE_REGISTRY_TAXONOMY_PREFIX = os.getenv(
+    "HLTHPRT_PHARM_LICENSE_REGISTRY_TAXONOMY_PREFIX",
+    "3336",
+).strip() or "3336"
 
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
 _NON_DIGIT = re.compile(r"[^0-9]+")
+_DBA_SPLIT_PATTERN = re.compile(r"\b(?:d/?b/?a|doing business as)\b", re.IGNORECASE)
+_DEPARTMENT_SUFFIX_PATTERN = re.compile(
+    r"\b(?:dept|department|store|location|unit)\.?\s*#?\s*[a-z0-9\-]+\b",
+    re.IGNORECASE,
+)
 _DATE_PATTERN = re.compile(r"\b(20\d{2})[-/]?(\d{2})[-/]?(\d{2})\b")
 _HREF_PATTERN = re.compile(r"<a[^>]+href=\"([^\"]+)\"[^>]*>([^<]+)</a>", re.IGNORECASE)
 _FILE_LINK_PATTERN = re.compile(
@@ -281,6 +294,15 @@ _DISCIPLINARY_HINTS = (
     "cease",
     "consent order",
 )
+_LICENSE_LIKE_ISSUER_TOKENS = (
+    "license",
+    "medical license",
+    "state license",
+    "pharmacy license",
+    "registration",
+    "permit",
+    "dea",
+)
 
 _STATE_NAME_TO_CODE = {
     "alabama": "AL",
@@ -457,9 +479,14 @@ class AspNetStateAdapterSpec:
 class StateNpiResolver:
     state_code: str
     by_license: dict[str, int] = field(default_factory=dict)
+    by_other_identifier: dict[str, int] = field(default_factory=dict)
+    by_other_identifier_digits: dict[str, int] = field(default_factory=dict)
+    by_registry_name_city: dict[tuple[str, str], int] = field(default_factory=dict)
     by_name_zip: dict[tuple[str, str], int] = field(default_factory=dict)
     by_name_city: dict[tuple[str, str], int] = field(default_factory=dict)
     by_name: dict[str, int] = field(default_factory=dict)
+    partd_name_fallback_enabled: bool = False
+    partd_quality: dict[str, int | bool] = field(default_factory=dict)
     stats: dict[str, int] = field(default_factory=dict)
 
     def _hit(self, method: str, npi: int) -> int:
@@ -480,15 +507,28 @@ class StateNpiResolver:
             mapped = self.by_license.get(normalized_license)
             if mapped:
                 return self._hit("license", mapped)
+            mapped = self.by_other_identifier.get(normalized_license)
+            if mapped:
+                return self._hit("other_identifier", mapped)
+
+        normalized_license_digits = _normalize_digits_for_match(license_number)
+        if normalized_license_digits:
+            mapped = self.by_other_identifier_digits.get(normalized_license_digits)
+            if mapped:
+                return self._hit("other_identifier_digits", mapped)
 
         normalized_city = _normalize_city_for_match(city)
+        name_candidates = _name_candidates_for_match(entity_name, dba_name)
+        if normalized_city:
+            for name_key in name_candidates:
+                mapped = self.by_registry_name_city.get((name_key, normalized_city))
+                if mapped:
+                    return self._hit("registry_name_city", mapped)
+
+        if not self.partd_name_fallback_enabled:
+            return None
+
         normalized_zip = _normalize_zip_for_match(zip_code)
-        name_candidates = [
-            _normalize_name_for_match(entity_name),
-            _normalize_name_for_match(dba_name),
-            _normalize_name_for_match(entity_name, loose=True),
-            _normalize_name_for_match(dba_name, loose=True),
-        ]
         for name_key in name_candidates:
             if not name_key:
                 continue
@@ -621,6 +661,11 @@ def _normalize_zip_for_match(value: Any) -> str | None:
     return None
 
 
+def _normalize_digits_for_match(value: Any) -> str | None:
+    digits = _NON_DIGIT.sub("", str(value or ""))
+    return digits or None
+
+
 def _normalize_city_for_match(value: Any) -> str | None:
     text = _safe_text(value)
     if not text:
@@ -641,12 +686,73 @@ def _normalize_name_for_match(value: Any, *, loose: bool = False) -> str | None:
     return normalized_text or None
 
 
+def _iter_name_variants_for_match(value: Any) -> list[str]:
+    text = _safe_text(value)
+    if not text:
+        return []
+    variants: list[str] = [text]
+    split_parts = _DBA_SPLIT_PATTERN.split(text)
+    if len(split_parts) > 1:
+        for part in split_parts:
+            candidate = " ".join(part.split())
+            if candidate:
+                variants.append(candidate)
+    for candidate in list(variants):
+        stripped = _DEPARTMENT_SUFFIX_PATTERN.sub(" ", candidate)
+        compacted = " ".join(stripped.split()).strip(" ,;:-")
+        if compacted:
+            variants.append(compacted)
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in variants:
+        normalized = " ".join(item.split())
+        if not normalized:
+            continue
+        dedupe_key = normalized.lower()
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        deduped.append(normalized)
+    return deduped
+
+
+def _name_candidates_for_match(entity_name: Any, dba_name: Any) -> list[str]:
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for value in (entity_name, dba_name):
+        for variant in _iter_name_variants_for_match(value):
+            for loose in (False, True):
+                key = _normalize_name_for_match(variant, loose=loose)
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                candidates.append(key)
+    return candidates
+
+
 def _unique_mapping(raw_map: dict[Any, set[int]]) -> dict[Any, int]:
     resolved: dict[Any, int] = {}
     for key, values in raw_map.items():
         if len(values) == 1:
             resolved[key] = next(iter(values))
     return resolved
+
+
+def _is_license_like_identifier_issuer(value: Any) -> bool:
+    text = _safe_text(value)
+    if not text:
+        return False
+    issuer = text.lower()
+    return any(token in issuer for token in _LICENSE_LIKE_ISSUER_TOKENS)
+
+
+def _partd_name_fallback_quality_ok(*, total_rows: int, named_rows: int, city_rows: int, zip_rows: int) -> bool:
+    if total_rows < PHARM_LICENSE_PARTD_MIN_ROWS_FOR_FALLBACK:
+        return False
+    if named_rows <= 0:
+        return False
+    return city_rows > 0 or zip_rows > 0
 
 
 def _to_date(value: Any) -> datetime.date | None:
@@ -1009,6 +1115,77 @@ async def _build_state_npi_resolver(state_code: str) -> StateNpiResolver | None:
         resolver.by_license = _unique_mapping(by_license)
         loaded = loaded or bool(resolver.by_license)
 
+    npi_other_identifier_schema = await _find_table_schema(NPIDataOtherIdentifier.__tablename__, preferred_schema)
+    if npi_other_identifier_schema:
+        rows = await db.all(
+            f"""
+            SELECT npi, other_provider_identifier, other_provider_identifier_issuer
+            FROM {npi_other_identifier_schema}.{NPIDataOtherIdentifier.__tablename__}
+            WHERE other_provider_identifier IS NOT NULL
+              AND other_provider_identifier_state IS NOT NULL
+              AND upper(other_provider_identifier_state) = :state_code
+            """,
+            state_code=normalized_state,
+        )
+        by_other_identifier: dict[str, set[int]] = {}
+        by_other_identifier_digits: dict[str, set[int]] = {}
+        for row in rows:
+            if not row:
+                continue
+            npi = _to_npi(row[0])
+            if npi is None:
+                continue
+            if not _is_license_like_identifier_issuer(row[2]):
+                continue
+            identifier_key = _normalize_license_for_match(row[1])
+            if identifier_key:
+                by_other_identifier.setdefault(identifier_key, set()).add(npi)
+            identifier_digits_key = _normalize_digits_for_match(row[1])
+            if identifier_digits_key:
+                by_other_identifier_digits.setdefault(identifier_digits_key, set()).add(npi)
+        resolver.by_other_identifier = _unique_mapping(by_other_identifier)
+        resolver.by_other_identifier_digits = _unique_mapping(by_other_identifier_digits)
+        loaded = loaded or bool(resolver.by_other_identifier or resolver.by_other_identifier_digits)
+
+    npi_data_schema = await _find_table_schema(NPIData.__tablename__, preferred_schema)
+    npi_address_schema = await _find_table_schema(NPIAddress.__tablename__, preferred_schema)
+    if npi_data_schema and npi_address_schema and npi_taxonomy_schema:
+        rows = await db.all(
+            f"""
+            SELECT DISTINCT a.npi, a.city_name, n.provider_organization_name,
+                            n.provider_other_organization_name, n.do_business_as_text
+            FROM {npi_address_schema}.{NPIAddress.__tablename__} a
+            JOIN {npi_data_schema}.{NPIData.__tablename__} n
+              ON n.npi = a.npi
+            JOIN {npi_taxonomy_schema}.{NPIDataTaxonomy.__tablename__} t
+              ON t.npi = a.npi
+            WHERE a.state_name IS NOT NULL
+              AND upper(a.state_name) = :state_code
+              AND a.city_name IS NOT NULL
+              AND t.healthcare_provider_taxonomy_code IS NOT NULL
+              AND t.healthcare_provider_taxonomy_code LIKE :taxonomy_like
+              AND n.entity_type_code = 2
+            """,
+            state_code=normalized_state,
+            taxonomy_like=f"{PHARM_LICENSE_REGISTRY_TAXONOMY_PREFIX}%",
+        )
+        by_registry_name_city: dict[tuple[str, str], set[int]] = {}
+        for row in rows:
+            if not row:
+                continue
+            npi = _to_npi(row[0])
+            if npi is None:
+                continue
+            city_key = _normalize_city_for_match(row[1])
+            if not city_key:
+                continue
+            name_keys = _name_candidates_for_match(row[2], row[3])
+            name_keys.extend(_name_candidates_for_match(row[4], None))
+            for name_key in name_keys:
+                by_registry_name_city.setdefault((name_key, city_key), set()).add(npi)
+        resolver.by_registry_name_city = _unique_mapping(by_registry_name_city)
+        loaded = loaded or bool(resolver.by_registry_name_city)
+
     partd_schema = await _find_table_schema(PartDPharmacyActivity.__tablename__, preferred_schema)
     if partd_schema:
         rows = await db.all(
@@ -1024,18 +1201,25 @@ async def _build_state_npi_resolver(state_code: str) -> StateNpiResolver | None:
         by_name_zip: dict[tuple[str, str], set[int]] = {}
         by_name_city: dict[tuple[str, str], set[int]] = {}
         by_name: dict[str, set[int]] = {}
+        named_rows = 0
+        city_rows = 0
+        zip_rows = 0
         for row in rows:
             if not row:
                 continue
             npi = _to_npi(row[0])
             if npi is None:
                 continue
-            name_values = [
-                _normalize_name_for_match(row[1]),
-                _normalize_name_for_match(row[1], loose=True),
-            ]
+            name_values = _name_candidates_for_match(row[1], None)
+            has_name = any(name_values)
+            if has_name:
+                named_rows += 1
             city_key = _normalize_city_for_match(row[2])
+            if city_key:
+                city_rows += 1
             zip_key = _normalize_zip_for_match(row[3])
+            if zip_key:
+                zip_rows += 1
             for name_key in name_values:
                 if not name_key:
                     continue
@@ -1044,10 +1228,27 @@ async def _build_state_npi_resolver(state_code: str) -> StateNpiResolver | None:
                     by_name_city.setdefault((name_key, city_key), set()).add(npi)
                 if zip_key:
                     by_name_zip.setdefault((name_key, zip_key), set()).add(npi)
-        resolver.by_name = _unique_mapping(by_name)
-        resolver.by_name_city = _unique_mapping(by_name_city)
-        resolver.by_name_zip = _unique_mapping(by_name_zip)
-        loaded = loaded or bool(resolver.by_name or resolver.by_name_city or resolver.by_name_zip)
+        quality_ok = _partd_name_fallback_quality_ok(
+            total_rows=len(rows),
+            named_rows=named_rows,
+            city_rows=city_rows,
+            zip_rows=zip_rows,
+        )
+        resolver.partd_quality = {
+            "rows": len(rows),
+            "named_rows": named_rows,
+            "city_rows": city_rows,
+            "zip_rows": zip_rows,
+            "quality_ok": quality_ok,
+        }
+        if quality_ok:
+            resolver.by_name = _unique_mapping(by_name)
+            resolver.by_name_city = _unique_mapping(by_name_city)
+            resolver.by_name_zip = _unique_mapping(by_name_zip)
+            resolver.partd_name_fallback_enabled = bool(
+                resolver.by_name or resolver.by_name_city or resolver.by_name_zip
+            )
+            loaded = loaded or resolver.partd_name_fallback_enabled
 
     if not loaded:
         return None
@@ -2206,10 +2407,16 @@ async def _import_state_source(
         if npi_resolver:
             metadata["npi_resolver"] = {
                 "license_keys": len(npi_resolver.by_license),
+                "other_identifier_keys": len(npi_resolver.by_other_identifier),
+                "other_identifier_digits_keys": len(npi_resolver.by_other_identifier_digits),
+                "registry_name_city_keys": len(npi_resolver.by_registry_name_city),
                 "name_zip_keys": len(npi_resolver.by_name_zip),
                 "name_city_keys": len(npi_resolver.by_name_city),
                 "name_keys": len(npi_resolver.by_name),
+                "partd_name_fallback_enabled": npi_resolver.partd_name_fallback_enabled,
             }
+            if npi_resolver.partd_quality:
+                metadata["npi_resolver"]["partd_quality"] = npi_resolver.partd_quality
 
     row_count_parsed = 0
     row_count_matched = 0

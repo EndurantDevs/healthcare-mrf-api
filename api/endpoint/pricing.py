@@ -17,6 +17,7 @@ from sqlalchemy import (Column, Float, Integer, MetaData, String, Table, and_, c
                         func, or_, select, text)
 
 from api.endpoint.pagination import parse_pagination
+from api.ptg2_serving import normalize_ptg2_mode, search_current_ptg2_index
 from db.models import (CodeCatalog, CodeCrosswalk, PricingProcedure,
                        PricingProcedureGeoBenchmark,
                        DoctorClinicianAddress, EntityAddressUnified,
@@ -5729,9 +5730,61 @@ async def list_providers_by_procedure(request):
     order_by = str(args.get("order_by") or "total_allowed_amount")
     include_legacy_fields = _parse_bool(args.get("include_legacy_fields"), "include_legacy_fields", default=False)
     internal_codes: list[int] = []
+    plan_id = str(args.get("plan_id", "")).strip()
+    plan_external_id = str(args.get("plan_external_id", "")).strip()
+    snapshot_id = str(args.get("snapshot_id", "")).strip()
+    mode = str(args.get("mode", "")).strip()
 
     if not q and not code:
         raise InvalidUsage("Provide at least one of 'q' or 'code'")
+    if mode:
+        try:
+            normalize_ptg2_mode(mode)
+        except ValueError as exc:
+            raise InvalidUsage(str(exc)) from exc
+    if plan_id or plan_external_id or snapshot_id:
+        ptg2_payload = await search_current_ptg2_index(
+            session,
+            {
+                "plan_id": plan_id or None,
+                "plan_external_id": plan_external_id or None,
+                "snapshot_id": snapshot_id or None,
+                "mode": mode or None,
+                "code": code or None,
+                "code_system": args.get("code_system") or None,
+                "q": q or None,
+                "state": state or None,
+                "city": city or None,
+                "zip5": zip5 or None,
+            },
+            pagination,
+        )
+        if ptg2_payload is None:
+            return response.json(
+                {
+                    "items": [],
+                    "pagination": {
+                        "total": 0,
+                        "limit": pagination.limit,
+                        "offset": pagination.offset,
+                        "page": pagination.page,
+                    },
+                    "query": {
+                        "plan_id": plan_id or None,
+                        "plan_external_id": plan_external_id or None,
+                        "snapshot_id": snapshot_id or None,
+                        "mode": mode or "product_search",
+                        "code": code or None,
+                        "q": q or None,
+                        "state": state or None,
+                        "city": city or None,
+                        "zip5": zip5 or None,
+                        "source": "ptg2",
+                        "status": "snapshot_not_loaded",
+                    },
+                }
+            )
+        return response.json(ptg2_payload)
     if order_by == "cost_index":
         if not code:
             raise InvalidUsage("Parameter 'order_by=cost_index' requires 'code'")

@@ -7,7 +7,7 @@ aioshutil==1.2
 aiosignal==1.4.0
 alembic==1.9.1
 anyio==3.6.2
-arq==0.26.3
+arq==0.28.0
 async-unzip>=0.5.5
 asyncpg>=0.29.0
 attrs==25.4.0
@@ -37,6 +37,7 @@ multidict==6.0.4
 numpy==2.3.4
 packaging==22.0
 pandas==2.3.3
+orjson==3.11.8
 pluggy==1.6.0
 propcache==0.4.1
 pyaml==21.10.1
