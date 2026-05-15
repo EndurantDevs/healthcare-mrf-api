@@ -43,6 +43,7 @@ from process.claims_pricing import (claims_pricing_finalize,
                                     claims_pricing_start,
                                     finish_main as finish_claims_pricing,
                                     main as initiate_claims_pricing)
+from process.code_sets import main as initiate_code_sets
 from process.drug_claims import (drug_claims_finalize,
                                  drug_claims_process_chunk,
                                  drug_claims_start,
@@ -609,6 +610,7 @@ def npi(test: bool):
 @click.option("--allowed-url", help="URL of a single allowed-amounts file.")
 @click.option("--provider-ref-url", help="URL of a provider-reference file.")
 @click.option("--import-id", help="Override import id/date suffix for table names.")
+@click.option("--source-key", help="Stable PTG2 payer/source key for independent current/previous publishing.")
 @click.option("--import-month", help="Snapshot month for PTG2 imports (YYYY-MM-DD or YYYY-MM).")
 @click.option("--max-files", type=int, help="Maximum discovered rate files to process.")
 @click.option("--max-items", type=int, help="Maximum top-level rate items to parse per file.")
@@ -647,6 +649,7 @@ def ptg(
     allowed_url: str | None,
     provider_ref_url: str | None,
     import_id: str | None,
+    source_key: str | None,
     import_month: str | None = None,
     max_files: int | None = None,
     max_items: int | None = None,
@@ -670,6 +673,7 @@ def ptg(
             allowed_url=allowed_url,
             provider_ref_url=provider_ref_url,
             import_id=import_id,
+            source_key=source_key,
             import_month=import_month,
             max_files=max_files,
             max_items=max_items,
@@ -687,6 +691,12 @@ def ptg(
 @click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
 def nucc(test: bool):
     asyncio.run(initiate_nucc(test_mode=test))
+
+
+@click.command(help="Run CMS official RC/POS code-set import")
+@click.option("--test", is_flag=True, help="Import a small official-code sample for a quick smoke run.")
+def code_sets(test: bool):
+    asyncio.run(initiate_code_sets(test_mode=test))
 
 
 @click.command(help="Run CMS claims pricing import")
@@ -887,3 +897,4 @@ process_group.add_command(entity_address_unified, name="entity-address-unified")
 process_group.add_command(geo_lookup, name="geo")
 process_group.add_command(geo_census_lookup, name="geo-census")
 process_group.add_command(nucc)
+process_group.add_command(code_sets, name="code-sets")

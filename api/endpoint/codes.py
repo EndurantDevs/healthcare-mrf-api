@@ -20,6 +20,14 @@ code_catalog_table = CodeCatalog.__table__
 code_crosswalk_table = CodeCrosswalk.__table__
 
 MAX_LIMIT = 200
+CODE_SYSTEM_ALIASES = {
+    "CLM_REV_CNTR_CD": "RC",
+    "PLACE_OF_SERVICE": "POS",
+    "REVENUE_CENTER": "RC",
+    "REVENUE_CODE": "RC",
+    "REV_CNTR": "RC",
+    "SERVICE_CODE": "POS",
+}
 
 
 def _get_session(request):
@@ -55,13 +63,28 @@ def _normalize_order(raw_order: Any):
     return order
 
 
+def _normalize_code_system(raw_system: Any) -> str:
+    system = str(raw_system or "").strip().upper()
+    return CODE_SYSTEM_ALIASES.get(system, system)
+
+
+def _canonical_code_for_system(code_system: str, raw_code: Any) -> str:
+    code = str(raw_code or "").strip().upper()
+    digits = "".join(ch for ch in code if ch.isdigit())
+    if code_system == "RC" and digits:
+        return digits.zfill(4)
+    if code_system == "POS" and digits:
+        return digits.zfill(2)
+    return code
+
+
 @blueprint.get("/")
 async def list_codes(request):
     session = _get_session(request)
     args = request.args
     pagination = parse_pagination(args, default_limit=25, max_limit=MAX_LIMIT)
 
-    code_system = str(args.get("code_system", "")).strip().upper()
+    code_system = _normalize_code_system(args.get("code_system"))
     q = str(args.get("q", "")).strip().lower()
     source = str(args.get("source", "")).strip().lower()
     order = _normalize_order(args.get("order"))
@@ -132,8 +155,8 @@ async def list_codes(request):
 @blueprint.get("/<code_system>/<code>")
 async def get_code(request, code_system: str, code: str):
     session = _get_session(request)
-    normalized_system = str(code_system).strip().upper()
-    normalized_code = str(code).strip().upper()
+    normalized_system = _normalize_code_system(code_system)
+    normalized_code = _canonical_code_for_system(normalized_system, code)
     if not normalized_system or not normalized_code:
         raise InvalidUsage("Path parameters 'code_system' and 'code' are required")
 
@@ -153,8 +176,8 @@ async def get_code(request, code_system: str, code: str):
 @blueprint.get("/<code_system>/<code>/related")
 async def get_related_codes(request, code_system: str, code: str):
     session = _get_session(request)
-    normalized_system = str(code_system).strip().upper()
-    normalized_code = str(code).strip().upper()
+    normalized_system = _normalize_code_system(code_system)
+    normalized_code = _canonical_code_for_system(normalized_system, code)
     if not normalized_system or not normalized_code:
         raise InvalidUsage("Path parameters 'code_system' and 'code' are required")
 

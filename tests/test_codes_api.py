@@ -68,6 +68,23 @@ async def test_list_codes_success():
 
 
 @pytest.mark.asyncio
+async def test_list_codes_normalizes_code_system_alias():
+    request = make_request(
+        [
+            FakeResult(scalar=1),
+            FakeResult(rows=[{"code_system": "POS", "code": "23", "display_name": "Emergency Room - Hospital"}]),
+        ],
+        args={"code_system": "place_of_service", "limit": "10"},
+    )
+
+    response = await list_codes(request)
+    payload = json.loads(response.body)
+
+    assert payload["query"]["code_system"] == "POS"
+    assert payload["items"][0]["code_system"] == "POS"
+
+
+@pytest.mark.asyncio
 async def test_list_codes_serializes_datetime_fields():
     request = make_request(
         [
@@ -99,6 +116,32 @@ async def test_get_code_success():
     payload = json.loads(response.body)
     assert payload["code_system"] == "HCPCS"
     assert payload["code"] == "99213"
+
+
+@pytest.mark.asyncio
+async def test_get_code_canonicalizes_revenue_code():
+    request = make_request(
+        [FakeResult(rows=[{"code_system": "RC", "code": "0450", "display_name": "Emergency Room"}])]
+    )
+
+    response = await get_code(request, "revenue_code", "450")
+    payload = json.loads(response.body)
+
+    assert payload["code_system"] == "RC"
+    assert payload["code"] == "0450"
+
+
+@pytest.mark.asyncio
+async def test_get_code_canonicalizes_place_of_service_alias():
+    request = make_request(
+        [FakeResult(rows=[{"code_system": "POS", "code": "23", "display_name": "Emergency Room - Hospital"}])]
+    )
+
+    response = await get_code(request, "place_of_service", "23")
+    payload = json.loads(response.body)
+
+    assert payload["code_system"] == "POS"
+    assert payload["code"] == "23"
 
 
 @pytest.mark.asyncio

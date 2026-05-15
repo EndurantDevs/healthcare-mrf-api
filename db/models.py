@@ -1226,6 +1226,7 @@ class NPIAddress(AddressPrototype):
 
     __my_additional_indexes__ = [
         {'index_elements': ('type', 'npi'), 'name': 'type_npi'},
+        {'index_elements': ('type', 'state_name', 'city_name', 'npi'), 'name': 'type_state_city_npi'},
         {
             'index_elements': ('state_name', 'city_name', 'npi'),
             'name': 'primary_state_city_npi',
@@ -1697,6 +1698,51 @@ class PTG2CurrentSnapshot(Base, JSONOutputMixin):
     updated_at = Column(DateTime)
 
 
+class PTG2CurrentSourceSnapshot(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_current_source_snapshot"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("source_key"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["source_key"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("snapshot_id",), "name": "ptg2_current_source_snapshot_idx"},
+        {"index_elements": ("import_month",), "name": "ptg2_current_source_month_idx"},
+    ]
+
+    source_key = Column(String(96))
+    snapshot_id = Column(String(96))
+    previous_snapshot_id = Column(String(96))
+    import_month = Column(DATE)
+    updated_at = Column(DateTime)
+
+
+class PTG2CurrentPlanSource(Base, JSONOutputMixin):
+    __tablename__ = "ptg2_current_plan_source"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("plan_source_key"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["plan_source_key"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("plan_id",), "name": "ptg2_current_plan_source_plan_idx"},
+        {"index_elements": ("plan_id", "plan_market_type", "import_month"), "name": "ptg2_current_plan_source_lookup_idx"},
+        {"index_elements": ("source_key",), "name": "ptg2_current_plan_source_source_idx"},
+        {"index_elements": ("snapshot_id",), "name": "ptg2_current_plan_source_snapshot_idx"},
+    ]
+
+    plan_source_key = Column(String(96))
+    plan_id = Column(String(64))
+    plan_market_type = Column(String(32))
+    import_month = Column(DATE)
+    source_key = Column(String(96))
+    snapshot_id = Column(String(96))
+    previous_snapshot_id = Column(String(96))
+    updated_at = Column(DateTime)
+
+
 class PTG2SourceCatalog(Base, JSONOutputMixin):
     __tablename__ = "ptg2_source_catalog"
     __main_table__ = __tablename__
@@ -2074,6 +2120,7 @@ class PTG2ProviderSet(Base, JSONOutputMixin):
     __my_additional_indexes__ = [
         {"index_elements": ("hash_prefix",), "name": "ptg2_provider_set_prefix_idx"},
         {"index_elements": ("provider_count",), "name": "ptg2_provider_set_count_idx"},
+        {"index_elements": ("provider_group_hashes",), "using": "gin", "name": "ptg2_provider_set_group_hashes_gin_idx"},
     ]
 
     provider_set_hash = Column(String(64))
@@ -2197,6 +2244,16 @@ class PTG2ServingRateCompact(Base, JSONOutputMixin):
                 "serving_rate_id",
             ),
             "name": "ptg2_serving_rate_compact_reported_order_idx",
+        },
+        {
+            "index_elements": (
+                "snapshot_id",
+                "plan_id",
+                "procedure_code",
+                "provider_count DESC",
+                "serving_rate_id",
+            ),
+            "name": "ptg2_serving_rate_compact_hp_order_idx",
         },
         {"index_elements": ("provider_set_hash",), "name": "ptg2_serving_rate_compact_provider_idx"},
         {"index_elements": ("price_set_hash",), "name": "ptg2_serving_rate_compact_price_idx"},

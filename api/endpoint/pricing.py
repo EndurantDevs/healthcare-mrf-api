@@ -17,7 +17,7 @@ from sqlalchemy import (Column, Float, Integer, MetaData, String, Table, and_, c
                         func, or_, select, text)
 
 from api.endpoint.pagination import parse_pagination
-from api.ptg2_serving import normalize_ptg2_mode, search_current_ptg2_index
+from api.ptg2_serving import normalize_ptg2_mode, search_current_ptg2_index, search_ptg2_provider_procedures
 from db.models import (CodeCatalog, CodeCrosswalk, PricingProcedure,
                        PricingProcedureGeoBenchmark,
                        DoctorClinicianAddress, EntityAddressUnified,
@@ -4311,6 +4311,64 @@ async def list_provider_procedures(request, npi: str):
     reported_code = str(args.get("reported_code", args.get("brand_name", ""))).strip().lower()
     code = str(args.get("code", "")).strip()
     include_legacy_fields = _parse_bool(args.get("include_legacy_fields"), "include_legacy_fields", default=False)
+    plan_id = str(args.get("plan_id", "")).strip()
+    plan_external_id = str(args.get("plan_external_id", "")).strip()
+    plan_market_type = str(args.get("plan_market_type", "")).strip().lower()
+    source_key = str(args.get("source_key", "")).strip().lower()
+    snapshot_id = str(args.get("snapshot_id", "")).strip()
+    mode = str(args.get("mode", "")).strip()
+
+    if mode:
+        try:
+            normalize_ptg2_mode(mode)
+        except ValueError as exc:
+            raise InvalidUsage(str(exc)) from exc
+    if plan_id or plan_external_id or snapshot_id:
+        ptg2_payload = await search_ptg2_provider_procedures(
+            session,
+            provider_npi,
+            {
+                "plan_id": plan_id or None,
+                "plan_external_id": plan_external_id or None,
+                "plan_market_type": plan_market_type or None,
+                "source_key": source_key or None,
+                "snapshot_id": snapshot_id or None,
+                "mode": mode or None,
+                "code": code or reported_code or None,
+                "code_system": args.get("code_system") or None,
+                "q": q or service_name or None,
+                "include_sources": args.get("include_sources") or None,
+                "include_details": args.get("include_details") or None,
+                "include_debug": args.get("include_debug") or None,
+            },
+            pagination,
+        )
+        if ptg2_payload is None:
+            return response.json(
+                {
+                    "items": [],
+                    "pagination": {
+                        "total": 0,
+                        "limit": pagination.limit,
+                        "offset": pagination.offset,
+                        "page": pagination.page,
+                    },
+                    "query": {
+                        "npi": provider_npi,
+                        "plan_id": plan_id or None,
+                        "plan_external_id": plan_external_id or None,
+                        "plan_market_type": plan_market_type or None,
+                        "source_key": source_key or None,
+                        "snapshot_id": snapshot_id or None,
+                        "mode": mode or "product_search",
+                        "code": code or reported_code or None,
+                        "q": q or service_name or None,
+                        "source": "ptg2",
+                        "status": "snapshot_not_loaded",
+                    },
+                }
+            )
+        return response.json(ptg2_payload)
 
     year, year_source = await _resolve_year(session, provider_procedure_table, year)
     code_context = None
@@ -5732,8 +5790,11 @@ async def list_providers_by_procedure(request):
     internal_codes: list[int] = []
     plan_id = str(args.get("plan_id", "")).strip()
     plan_external_id = str(args.get("plan_external_id", "")).strip()
+    plan_market_type = str(args.get("plan_market_type", "")).strip().lower()
+    source_key = str(args.get("source_key", "")).strip().lower()
     snapshot_id = str(args.get("snapshot_id", "")).strip()
     mode = str(args.get("mode", "")).strip()
+    npi = _parse_int(args.get("npi"), "npi", minimum=1)
 
     if not q and not code:
         raise InvalidUsage("Provide at least one of 'q' or 'code'")
@@ -5748,14 +5809,27 @@ async def list_providers_by_procedure(request):
             {
                 "plan_id": plan_id or None,
                 "plan_external_id": plan_external_id or None,
+                "plan_market_type": plan_market_type or None,
+                "source_key": source_key or None,
                 "snapshot_id": snapshot_id or None,
                 "mode": mode or None,
                 "code": code or None,
                 "code_system": args.get("code_system") or None,
                 "q": q or None,
+                "specialty": specialty or None,
+                "taxonomy_code": args.get("taxonomy_code") or None,
+                "taxonomy_classification": args.get("taxonomy_classification") or None,
+                "taxonomy_specialization": args.get("taxonomy_specialization") or None,
+                "taxonomy_section": args.get("taxonomy_section") or None,
                 "state": state or None,
                 "city": city or None,
                 "zip5": zip5 or None,
+                "include_providers": args.get("include_providers") or None,
+                "include_code_details": args.get("include_code_details") or None,
+                "include_sources": args.get("include_sources") or None,
+                "include_details": args.get("include_details") or None,
+                "include_debug": args.get("include_debug") or None,
+                "npi": npi,
             },
             pagination,
         )
@@ -5772,13 +5846,21 @@ async def list_providers_by_procedure(request):
                     "query": {
                         "plan_id": plan_id or None,
                         "plan_external_id": plan_external_id or None,
+                        "plan_market_type": plan_market_type or None,
+                        "source_key": source_key or None,
                         "snapshot_id": snapshot_id or None,
                         "mode": mode or "product_search",
                         "code": code or None,
                         "q": q or None,
+                        "specialty": specialty or None,
+                        "taxonomy_code": args.get("taxonomy_code") or None,
+                        "taxonomy_classification": args.get("taxonomy_classification") or None,
+                        "taxonomy_specialization": args.get("taxonomy_specialization") or None,
+                        "taxonomy_section": args.get("taxonomy_section") or None,
                         "state": state or None,
                         "city": city or None,
                         "zip5": zip5 or None,
+                        "npi": npi,
                         "source": "ptg2",
                         "status": "snapshot_not_loaded",
                     },
