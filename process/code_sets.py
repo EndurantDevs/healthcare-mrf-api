@@ -20,6 +20,7 @@ DEFAULT_POS_URL = "https://www.cms.gov/medicare/coding-billing/place-of-service-
 DEFAULT_RC_URL = "https://bluebutton.cms.gov/fhir/CodeSystem/CLM-REV-CNTR-CD/"
 SOURCE_POS = "cms_place_of_service_code_set"
 SOURCE_RC = "cms_bluebutton_revenue_center_code"
+SOURCE_MODIFIER = "cms_hcpcs_modifier_reference"
 
 
 @dataclass(frozen=True)
@@ -152,6 +153,64 @@ def parse_revenue_code_rows(source_html: str) -> list[CodeSetRow]:
     return rows
 
 
+def modifier_code_rows() -> list[CodeSetRow]:
+    modifier_rows = [
+        (
+            "26",
+            "Professional component",
+            "Certain procedures combine a physician or professional component and a technical component. "
+            "Modifier 26 identifies the professional component.",
+        ),
+        (
+            "95",
+            "Synchronous telemedicine service",
+            "Synchronous telemedicine service rendered via real-time interactive audio and video.",
+        ),
+        (
+            "GQ",
+            "Asynchronous telecommunications system",
+            "Service furnished via an asynchronous telecommunications system.",
+        ),
+        (
+            "NU",
+            "New equipment",
+            "Durable medical equipment modifier indicating new equipment.",
+        ),
+        (
+            "QW",
+            "CLIA waived test",
+            "Clinical Laboratory Improvement Amendments waived test.",
+        ),
+        (
+            "RR",
+            "Rental",
+            "Durable medical equipment modifier indicating rental.",
+        ),
+        (
+            "TC",
+            "Technical component",
+            "Certain procedures combine a physician or professional component and a technical component. "
+            "Modifier TC identifies the technical component.",
+        ),
+        (
+            "UE",
+            "Used durable medical equipment",
+            "Durable medical equipment modifier indicating used equipment.",
+        ),
+    ]
+    return [
+        CodeSetRow(
+            code_system="MODIFIER",
+            code=code,
+            display_name=display_name,
+            short_description=display_name,
+            long_description=long_description,
+            source=SOURCE_MODIFIER,
+        )
+        for code, display_name, long_description in modifier_rows
+    ]
+
+
 async def _ensure_code_catalog(schema: str) -> None:
     await db.create_table(CodeCatalog.__table__, checkfirst=True)
     await db.status(
@@ -224,6 +283,7 @@ async def import_code_sets(test_mode: bool = False) -> dict[str, Any]:
     if test_mode:
         pos_rows = [row for row in pos_rows if row.code in {"21", "22", "23"}] or pos_rows[:10]
         rc_rows = [row for row in rc_rows if row.code in {"0450", "0981"}] or rc_rows[:10]
+    modifier_rows = modifier_code_rows()
     if not pos_rows:
         raise RuntimeError(f"CMS POS source produced no code rows: {pos_url}")
     if not rc_rows:
@@ -231,15 +291,18 @@ async def import_code_sets(test_mode: bool = False) -> dict[str, Any]:
 
     pos_count = await _upsert_code_rows(schema, pos_rows)
     rc_count = await _upsert_code_rows(schema, rc_rows)
+    modifier_count = await _upsert_code_rows(schema, modifier_rows)
     result = {
         "pos_rows": pos_count,
         "rc_rows": rc_count,
+        "modifier_rows": modifier_count,
         "pos_url": pos_url,
         "rc_url": rc_url,
     }
     print(
         "Code set import done: "
-        f"POS={pos_count:,} RC={rc_count:,} at {datetime.datetime.utcnow().isoformat()}Z"
+        f"POS={pos_count:,} RC={rc_count:,} MODIFIER={modifier_count:,} "
+        f"at {datetime.datetime.utcnow().isoformat()}Z"
     )
     return result
 

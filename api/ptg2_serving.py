@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import tempfile
@@ -48,6 +49,10 @@ CODE_SYSTEM_ALIASES = {
     "REVENUE_CODE": "RC",
     "REV_CNTR": "RC",
     "SERVICE_CODE": "POS",
+    "BILLING_CODE_MODIFIER": "MODIFIER",
+    "CPT_MODIFIER": "MODIFIER",
+    "HCPCS_MODIFIER": "MODIFIER",
+    "MOD": "MODIFIER",
 }
 
 
@@ -114,6 +119,15 @@ def _request_bool(value: Any, default: bool = False) -> bool:
     return default
 
 
+def _optional_float(value: Any) -> float | None:
+    if value in (None, "", "null"):
+        return None
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
 def _include_ptg2_details(args: dict[str, Any]) -> bool:
     return _request_bool(args.get("include_details")) or _request_bool(args.get("include_debug"))
 
@@ -178,6 +192,20 @@ def _catalog_detail(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _missing_modifier_detail(modifier_code: Any) -> dict[str, Any] | None:
+    modifier_key = _catalog_key("MODIFIER", modifier_code)
+    if not modifier_key:
+        return None
+    _, normalized_code = modifier_key
+    return {
+        "code_system": "MODIFIER",
+        "code": normalized_code,
+        "display_name": f"Modifier {normalized_code}",
+        "short_description": None,
+        "catalog_status": "missing",
+    }
+
+
 async def _enrich_ptg2_code_details(session, payload: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
     if not _request_bool(args.get("include_code_details")):
         return payload
@@ -196,6 +224,10 @@ async def _enrich_ptg2_code_details(session, payload: dict[str, Any], args: dict
                 service_key = _catalog_key("POS", service_code)
                 if service_key:
                     lookup_keys.add(service_key)
+            for modifier_code in price.get("billing_code_modifier") or []:
+                modifier_key = _catalog_key("MODIFIER", modifier_code)
+                if modifier_key:
+                    lookup_keys.add(modifier_key)
 
     if not lookup_keys:
         return payload
@@ -238,9 +270,19 @@ async def _enrich_ptg2_code_details(session, payload: dict[str, Any], args: dict
                     service_details.append(detail)
             if service_details:
                 price_payload["service_code_details"] = service_details
+            modifier_details = []
+            for modifier_code in price_payload.get("billing_code_modifier") or []:
+                detail = detail_map.get(_catalog_key("MODIFIER", modifier_code))
+                if not detail:
+                    detail = _missing_modifier_detail(modifier_code)
+                if detail:
+                    modifier_details.append(detail)
+            if modifier_details:
+                price_payload["billing_code_modifier_details"] = modifier_details
             enriched_prices.append(price_payload)
         item["prices"] = enriched_prices
         item["tic_prices"] = enriched_prices
+        item["price_summary"] = _summarize_price_payload(enriched_prices)
 
     enriched = dict(payload)
     enriched["items"] = items
@@ -468,18 +510,118 @@ def _coerce_numeric_rate(value: Any) -> Any:
     return value
 
 
+def _canonical_price_row(row: dict[str, Any]) -> dict[str, Any]:
+    normalized_row = dict(row)
+    normalized_row["negotiated_rate"] = _coerce_numeric_rate(normalized_row.get("negotiated_rate"))
+    if "service_code" in normalized_row:
+        normalized_row["service_code"] = sorted(
+            {_canonical_catalog_code("POS", code) for code in _normalize_string_list(normalized_row.get("service_code"))}
+        )
+    if "billing_code_modifier" in normalized_row:
+        normalized_row["billing_code_modifier"] = sorted(
+            {modifier.upper() for modifier in _normalize_string_list(normalized_row.get("billing_code_modifier"))}
+        )
+    return normalized_row
+
+
+def _price_row_key(row: dict[str, Any]) -> str:
+    return json.dumps(row, sort_keys=True, separators=(",", ":"), default=str)
+
+
 def _normalize_price_payload(prices: Any) -> list[dict[str, Any]]:
     payload = _coerce_json_payload(prices, [])
     normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
     if not isinstance(payload, list):
         return normalized
     for row in payload:
         if not isinstance(row, dict):
             continue
-        normalized_row = dict(row)
-        normalized_row["negotiated_rate"] = _coerce_numeric_rate(normalized_row.get("negotiated_rate"))
+        normalized_row = _canonical_price_row(row)
+        key = _price_row_key(normalized_row)
+        if key in seen:
+            continue
+        seen.add(key)
         normalized.append(normalized_row)
     return normalized
+
+
+def _normalize_string_list(value: Any) -> list[str]:
+    if value in (None, "", "null"):
+        return []
+    if isinstance(value, str):
+        payload = _coerce_json_payload(value, value)
+        if isinstance(payload, list):
+            value = payload
+        else:
+            return [value]
+    if not isinstance(value, (list, tuple, set)):
+        return [str(value)]
+    return [str(item) for item in value if item not in (None, "", "null")]
+
+
+def _price_component(modifiers: list[str]) -> str:
+    normalized = {modifier.upper() for modifier in modifiers}
+    if not normalized:
+        return "global"
+    if normalized == {"26"}:
+        return "professional"
+    if normalized == {"TC"}:
+        return "technical"
+    return "modifier"
+
+
+def _summarize_price_payload(prices: Any) -> list[dict[str, Any]]:
+    normalized_prices = _normalize_price_payload(prices)
+    grouped: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for price in normalized_prices:
+        modifiers = sorted({modifier.upper() for modifier in _normalize_string_list(price.get("billing_code_modifier"))})
+        service_codes = sorted({_canonical_catalog_code("POS", code) for code in _normalize_string_list(price.get("service_code"))})
+        rate = _coerce_numeric_rate(price.get("negotiated_rate"))
+        key = (
+            _price_component(modifiers),
+            tuple(modifiers),
+            rate,
+            price.get("negotiated_type"),
+            price.get("billing_class"),
+            price.get("setting"),
+        )
+        summary = grouped.setdefault(
+            key,
+            {
+                "component": key[0],
+                "modifier": list(modifiers),
+                "rate": rate,
+                "negotiated_type": price.get("negotiated_type"),
+                "billing_class": price.get("billing_class"),
+                "setting": price.get("setting"),
+                "service_code": [],
+                "raw_price_count": 0,
+            },
+        )
+        summary["raw_price_count"] += 1
+        summary["service_code"] = sorted(set(summary["service_code"]) | set(service_codes))
+
+    component_order = {"global": 0, "professional": 1, "technical": 2, "modifier": 3}
+    return sorted(
+        grouped.values(),
+        key=lambda item: (
+            component_order.get(str(item.get("component")), 99),
+            str(item.get("billing_class") or ""),
+            str(item.get("setting") or ""),
+            str(item.get("modifier") or ""),
+            float(item.get("rate")) if isinstance(item.get("rate"), (int, float)) else 0.0,
+        ),
+    )
+
+
+def _price_response_fields(prices: Any) -> dict[str, list[dict[str, Any]]]:
+    normalized = _normalize_price_payload(prices)
+    return {
+        "prices": normalized,
+        "tic_prices": normalized,
+        "price_summary": _summarize_price_payload(normalized),
+    }
 
 
 async def _serving_table_available(session, table_name: str) -> bool:
@@ -675,6 +817,10 @@ async def _search_compact_serving_table(
     zip_text = _normalize_zip5(args.get("zip5"))
     state_text = str(args.get("state") or "").strip().upper()
     city_text = str(args.get("city") or "").strip().lower()
+    geo_lat = _optional_float(args.get("lat"))
+    geo_long = _optional_float(args.get("long"))
+    geo_radius_miles = _optional_float(args.get("radius_miles"))
+    coordinate_filter_requested = geo_lat is not None and geo_long is not None and geo_radius_miles is not None
     specialty_text = str(args.get("specialty") or "").strip().lower()
     taxonomy_code = _normalize_taxonomy_code(args.get("taxonomy_code"))
     taxonomy_classification = str(args.get("taxonomy_classification") or "").strip()
@@ -695,6 +841,20 @@ async def _search_compact_serving_table(
         geo_filters.append("pl.city_norm LIKE :city_like")
         params["city_like"] = f"%{city_text}%"
         params["city_exact"] = city_text.upper()
+    if coordinate_filter_requested:
+        radius_miles = max(float(geo_radius_miles or 0.0), 0.0)
+        cos_lat = abs(math.cos(math.radians(float(geo_lat)))) or 1e-6
+        params.update(
+            {
+                "geo_lat": float(geo_lat),
+                "geo_long": float(geo_long),
+                "geo_radius_miles": radius_miles,
+                "geo_min_lat": float(geo_lat) - radius_miles / 69.0,
+                "geo_max_lat": float(geo_lat) + radius_miles / 69.0,
+                "geo_min_long": float(geo_long) - radius_miles / (69.0 * cos_lat),
+                "geo_max_long": float(geo_long) + radius_miles / (69.0 * cos_lat),
+            }
+        )
     taxonomy_filters: list[str] = []
     if taxonomy_code:
         taxonomy_filters.append("nt.healthcare_provider_taxonomy_code = :taxonomy_code")
@@ -781,7 +941,34 @@ async def _search_compact_serving_table(
             JOIN {schema}.ptg2_provider_set_component psc ON psc.provider_set_hash = r.provider_set_hash
             JOIN {schema}.ptg2_provider_group_member pgm ON pgm.provider_group_hash = psc.provider_group_hash
         """
-    provider_filter_requested = bool(provider_npi or geo_filters or taxonomy_filters)
+    coordinate_sql = ""
+    if coordinate_filter_requested:
+        coordinate_sql = """
+                addr_alias.lat IS NOT NULL
+            AND addr_alias.long IS NOT NULL
+            AND addr_alias.lat::float8 BETWEEN :geo_min_lat AND :geo_max_lat
+            AND addr_alias.long::float8 BETWEEN :geo_min_long AND :geo_max_long
+            AND (
+                69.0 * sqrt(
+                    power(addr_alias.lat::float8 - :geo_lat, 2)
+                  + power(
+                        (addr_alias.long::float8 - :geo_long)
+                        * cos(radians((addr_alias.lat::float8 + :geo_lat) / 2.0)),
+                        2
+                    )
+                )
+            ) <= :geo_radius_miles
+        """
+    coordinate_geography_sql = ""
+    if coordinate_filter_requested:
+        coordinate_geography_sql = """
+            ST_DWithin(
+                Geography(ST_MakePoint(addr_alias.long::float8, addr_alias.lat::float8)),
+                Geography(ST_MakePoint(:geo_long, :geo_lat)),
+                :geo_radius_miles * 1609.34
+            )
+        """
+    provider_filter_requested = bool(provider_npi or geo_filters or coordinate_filter_requested or taxonomy_filters)
     provider_filter_sql = ""
     if provider_filter_requested:
         provider_geo_sql = " AND ".join(
@@ -790,6 +977,7 @@ async def _search_compact_serving_table(
                 "LEFT(COALESCE(addr_filter.postal_code, ''), 5) = :zip5" if zip_text else "",
                 "addr_filter.state_name = :state" if state_text else "",
                 "addr_filter.city_name = :city_exact" if city_text else "",
+                coordinate_sql.replace("addr_alias", "addr_filter") if coordinate_filter_requested else "",
             )
             if filter_sql
         )
@@ -853,7 +1041,7 @@ async def _search_compact_serving_table(
                      LIMIT 1
                 ) addr_match ON TRUE
             """
-            if geo_filters
+            if geo_filters or coordinate_filter_requested
             else ""
         )
         provider_taxonomy_match_sql = (
@@ -893,6 +1081,7 @@ async def _search_compact_serving_table(
                 "LEFT(COALESCE(addr.postal_code, ''), 5) = :zip5" if zip_text else "",
                 "addr.state_name = :state" if state_text else "",
                 "addr.city_name = :city_exact" if city_text else "",
+                coordinate_sql.replace("addr_alias", "addr") if coordinate_filter_requested else "",
             )
             if filter_sql
         )
@@ -903,7 +1092,7 @@ async def _search_compact_serving_table(
               ON addr.npi = pgm.npi
              AND addr.type IN ('primary', 'secondary')
             """
-            if geo_filters
+            if geo_filters or coordinate_filter_requested
             else f"""
             LEFT JOIN {schema}.npi_address addr
               ON addr.npi = pgm.npi
@@ -925,6 +1114,307 @@ async def _search_compact_serving_table(
             """
         else:
             taxonomy_join_sql = ""
+        if coordinate_filter_requested and use_snapshot_provider_tables and not q_text:
+            geo_member_filters = [
+                "addr.type IN ('primary', 'secondary')",
+                coordinate_geography_sql.replace("addr_alias", "addr"),
+            ]
+            if zip_text:
+                geo_member_filters.append("LEFT(COALESCE(addr.postal_code, ''), 5) = :zip5")
+            if state_text:
+                geo_member_filters.append("addr.state_name = :state")
+            if city_text:
+                geo_member_filters.append("addr.city_name = :city_exact")
+            geo_member_taxonomy_join_sql = ""
+            if taxonomy_code:
+                geo_member_filters.append(
+                    f"""
+                    addr.taxonomy_array && ARRAY[
+                        (SELECT int_code FROM {schema}.nucc_taxonomy WHERE code = :taxonomy_code)
+                    ]::integer[]
+                    """
+                )
+            if taxonomy_classification or taxonomy_specialization or taxonomy_section or specialty_text:
+                geo_member_taxonomy_join_sql = f"""
+                    JOIN {schema}.npi_taxonomy nt_geo ON nt_geo.npi = addr.npi
+                    JOIN {schema}.nucc_taxonomy nucc_geo
+                      ON nucc_geo.code = nt_geo.healthcare_provider_taxonomy_code
+                """
+                if taxonomy_classification:
+                    geo_member_filters.append("nucc_geo.classification = :taxonomy_classification")
+                if taxonomy_specialization:
+                    geo_member_filters.append("nucc_geo.specialization = :taxonomy_specialization")
+                if taxonomy_section:
+                    geo_member_filters.append("nucc_geo.section = :taxonomy_section")
+                if specialty_text:
+                    geo_member_filters.append(
+                        """
+                        (
+                            LOWER(COALESCE(nucc_geo.display_name, '')) LIKE :specialty_like
+                         OR LOWER(COALESCE(nucc_geo.classification, '')) LIKE :specialty_like
+                         OR LOWER(COALESCE(nucc_geo.specialization, '')) LIKE :specialty_like
+                         OR LOWER(COALESCE(nucc_geo.section, '')) LIKE :specialty_like
+                        )
+                        """
+                    )
+            if provider_npi is not None:
+                geo_member_filters.append("addr.npi = :provider_npi")
+            geo_member_where_sql = "\n              AND ".join(geo_member_filters)
+            coordinate_row_result = await session.execute(
+                text(
+                    f"""
+                    WITH geo_members AS MATERIALIZED (
+                        SELECT DISTINCT
+                            addr.npi,
+                            addr.type,
+                            addr.checksum,
+                            addr.first_line,
+                            addr.second_line,
+                            addr.city_name,
+                            addr.state_name,
+                            addr.postal_code,
+                            addr.country_code,
+                            addr.lat,
+                            addr.long,
+                            LEFT(COALESCE(addr.postal_code, ''), 5) AS zip5,
+                            pgm_geo.provider_group_hash
+                          FROM {schema}.npi_address addr
+                          {geo_member_taxonomy_join_sql}
+                          JOIN {provider_group_member_table} pgm_geo
+                            ON pgm_geo.npi = addr.npi
+                         WHERE {geo_member_where_sql}
+                    ),
+                    rate_candidates AS MATERIALIZED (
+                        SELECT
+                            r.serving_rate_id,
+                            r.provider_set_hash,
+                            r.procedure_hash,
+                            r.procedure_code,
+                            r.reported_code_system,
+                            r.reported_code,
+                            r.billing_code,
+                            r.billing_code_type,
+                            r.price_set_hash,
+                            r.rate_pack_hash,
+                            r.source_trace_set_hash
+                          FROM {table_name} r
+                         WHERE {where_sql}
+                    ),
+                    candidate_set_groups AS MATERIALIZED (
+                        SELECT DISTINCT
+                            ps.provider_set_hash,
+                            group_ref.provider_group_hash::bigint AS provider_group_hash
+                          FROM rate_candidates r
+                          JOIN {provider_set_table} ps
+                            ON ps.provider_set_hash = r.provider_set_hash
+                          JOIN LATERAL unnest(
+                                COALESCE(ps.provider_group_hashes, ARRAY[]::bigint[])
+                          ) AS group_ref(provider_group_hash) ON TRUE
+                    ),
+                    top_providers AS MATERIALIZED (
+                        SELECT
+                            gm.npi,
+                            gm.type,
+                            gm.checksum,
+                            gm.first_line,
+                            gm.second_line,
+                            gm.city_name,
+                            gm.state_name,
+                            gm.postal_code,
+                            gm.country_code,
+                            gm.lat,
+                            gm.long,
+                            gm.zip5,
+                            COUNT(DISTINCT r.serving_rate_id)::int AS rate_count
+                        FROM geo_members gm
+                        JOIN candidate_set_groups csg
+                          ON csg.provider_group_hash = gm.provider_group_hash
+                        JOIN rate_candidates r
+                          ON r.provider_set_hash = csg.provider_set_hash
+                        GROUP BY
+                            gm.npi,
+                            gm.type,
+                            gm.checksum,
+                            gm.first_line,
+                            gm.second_line,
+                            gm.city_name,
+                            gm.state_name,
+                            gm.postal_code,
+                            gm.country_code,
+                            gm.lat,
+                            gm.long,
+                            gm.zip5
+                        ORDER BY rate_count DESC, gm.npi
+                        LIMIT :limit OFFSET :offset
+                    )
+                    SELECT
+                        tp.npi,
+                        CONCAT('npi_address:', tp.npi, ':', tp.type, ':', tp.checksum) AS location_hash,
+                        tp.state_name AS state,
+                        tp.city_name AS city,
+                        tp.zip5,
+                        'npi_address' AS location_source,
+                        'npi_address' AS location_confidence_code,
+                        json_build_object(
+                            'first_line', tp.first_line,
+                            'second_line', tp.second_line,
+                            'city', tp.city_name,
+                            'state', tp.state_name,
+                            'postal_code', tp.postal_code,
+                            'country_code', tp.country_code,
+                            'lat', tp.lat,
+                            'long', tp.long
+                        )::text AS address_payload,
+                        array_agg(DISTINCT nt.healthcare_provider_taxonomy_code ORDER BY nt.healthcare_provider_taxonomy_code)
+                            FILTER (WHERE nt.healthcare_provider_taxonomy_code IS NOT NULL) AS taxonomy_codes,
+                        array_agg(DISTINCT nucc.display_name ORDER BY nucc.display_name)
+                            FILTER (WHERE nucc.display_name IS NOT NULL) AS specialties,
+                        COALESCE(
+                            NULLIF(BTRIM(n.provider_organization_name), ''),
+                            NULLIF(BTRIM(CONCAT_WS(' ', n.provider_first_name, n.provider_middle_name, n.provider_last_name)), ''),
+                            'TiC provider'
+                        ) AS provider_name,
+                        r.procedure_code,
+                        r.reported_code_system,
+                        r.reported_code,
+                        r.billing_code,
+                        r.billing_code_type,
+                        COALESCE(proc.name, proc.description, r.billing_code) AS procedure_display_name,
+                        proc.name AS procedure_name,
+                        proc.description AS procedure_description,
+                        array_agg(DISTINCT r.provider_set_hash ORDER BY r.provider_set_hash) AS provider_set_hashes,
+                        tp.rate_count,
+                        COALESCE(jsonb_agg(DISTINCT price_item.price_item) FILTER (WHERE price_item.price_item IS NOT NULL), '[]'::jsonb) AS prices,
+                        COALESCE(jsonb_agg(DISTINCT trace_item.trace_item) FILTER (WHERE trace_item.trace_item IS NOT NULL), '[]'::jsonb) AS source_trace
+                    FROM top_providers tp
+                    JOIN geo_members gm
+                      ON gm.npi = tp.npi
+                     AND gm.checksum = tp.checksum
+                    JOIN candidate_set_groups csg
+                      ON csg.provider_group_hash = gm.provider_group_hash
+                    JOIN rate_candidates r
+                      ON r.provider_set_hash = csg.provider_set_hash
+                    {procedure_join_sql}
+                    LEFT JOIN {schema}.npi n ON n.npi = tp.npi
+                    LEFT JOIN {schema}.npi_taxonomy nt ON nt.npi = tp.npi
+                    LEFT JOIN {schema}.nucc_taxonomy nucc
+                      ON nucc.code = nt.healthcare_provider_taxonomy_code
+                    {price_join_sql}
+                    LEFT JOIN LATERAL jsonb_array_elements({compact_price_jsonb}) AS price_item(price_item) ON TRUE
+                    LEFT JOIN {schema}.ptg2_source_trace_set sts ON sts.source_trace_set_hash = r.source_trace_set_hash
+                    LEFT JOIN LATERAL unnest(COALESCE(sts.source_trace_hashes, ARRAY[]::varchar[])) AS sth(source_trace_hash) ON TRUE
+                    LEFT JOIN {schema}.ptg2_source_trace st ON st.source_trace_hash = sth.source_trace_hash
+                    LEFT JOIN LATERAL (
+                        SELECT CASE WHEN st.source_trace_hash IS NULL THEN NULL ELSE jsonb_build_object(
+                            'url', st.original_url,
+                            'canonical_url', st.canonical_url,
+                            'statement', 'Published negotiated rate from Transparency in Coverage source file.'
+                        ) END AS trace_item
+                    ) trace_item ON TRUE
+                    GROUP BY
+                        tp.npi,
+                        tp.type,
+                        tp.checksum,
+                        tp.first_line,
+                        tp.second_line,
+                        tp.city_name,
+                        tp.state_name,
+                        tp.postal_code,
+                        tp.country_code,
+                        tp.lat,
+                        tp.long,
+                        tp.zip5,
+                        tp.rate_count,
+                        provider_name,
+                        r.procedure_code,
+                        r.reported_code_system,
+                        r.reported_code,
+                        r.billing_code,
+                        r.billing_code_type,
+                        proc.name,
+                        proc.description
+                    ORDER BY tp.rate_count DESC, provider_name, tp.npi
+                    """
+                ),
+                params,
+            )
+            items = []
+            for row in coordinate_row_result:
+                data = _row_mapping(row)
+                confidence = {
+                    "network": "tic_rate_npi_tin",
+                    "location": data.get("location_confidence_code") or "nppes_practice_location",
+                }
+                items.append(
+                    {
+                        "npi": data.get("npi"),
+                        "provider_name": data.get("provider_name"),
+                        "location_hash": data.get("location_hash"),
+                        "state": data.get("state"),
+                        "city": data.get("city"),
+                        "zip5": data.get("zip5"),
+                        "location_source": data.get("location_source"),
+                        "address": _coerce_json_payload(data.get("address_payload"), {}),
+                        "taxonomy_codes": data.get("taxonomy_codes") or [],
+                        "specialties": data.get("specialties") or [],
+                        "provider_set_hashes": data.get("provider_set_hashes") or [],
+                        "provider_count": 1,
+                        "rate_count": data.get("rate_count") or 0,
+                        "procedure_code": data.get("procedure_code") if data.get("procedure_code") is not None else data.get("reported_code"),
+                        "hp_procedure_code": data.get("procedure_code"),
+                        "procedure_name": data.get("procedure_display_name") or data.get("procedure_name"),
+                        "procedure_description": data.get("procedure_description"),
+                        "service_code": data.get("billing_code"),
+                        "service_code_system": data.get("billing_code_type") or data.get("reported_code_system") or "CPT",
+                        "reported_code": data.get("reported_code") or data.get("billing_code"),
+                        "reported_code_system": data.get("reported_code_system") or data.get("billing_code_type"),
+                        "billing_code": data.get("billing_code"),
+                        "billing_code_type": data.get("billing_code_type"),
+                        **_price_response_fields(data.get("prices")),
+                        "source_trace": _coerce_json_payload(data.get("source_trace"), []),
+                        "confidence": confidence,
+                    }
+                )
+            if not items:
+                return None
+            total = int(pagination.offset) + len(items)
+            return {
+                "items": items,
+                "pagination": {
+                    "total": total,
+                    "limit": pagination.limit,
+                    "offset": pagination.offset,
+                    "page": (pagination.offset // pagination.limit) + 1 if pagination.limit else 1,
+                },
+                "query": {
+                    "plan_id": args.get("plan_id"),
+                    "plan_external_id": args.get("plan_external_id"),
+                    "plan_market_type": args.get("plan_market_type") or None,
+                    "source_key": args.get("source_key") or None,
+                    "snapshot_id": snapshot_id,
+                    "mode": mode_value,
+                    "code": args.get("code") or None,
+                    "code_system": args.get("code_system") or None,
+                    "q": args.get("q") or None,
+                    "state": state_text or None,
+                    "city": city_text or None,
+                    "zip5": zip_text,
+                    "lat": geo_lat,
+                    "long": geo_long,
+                    "radius_miles": geo_radius_miles,
+                    "specialty": specialty_text or None,
+                    "taxonomy_code": taxonomy_code,
+                    "taxonomy_classification": taxonomy_classification or None,
+                    "taxonomy_specialization": taxonomy_specialization or None,
+                    "taxonomy_section": taxonomy_section or None,
+                    "npi": provider_npi,
+                    "include_providers": expand_providers,
+                    "source": "ptg2_db_compact",
+                    "serving_table": table_name,
+                    "result_granularity": "provider",
+                    "procedure_consolidation": "HP_PROCEDURE_CODE",
+                },
+            }
         total = None
         if not _env_bool(PTG2_FAST_COMPACT_COUNTS_ENV, True):
             count_result = await session.execute(
@@ -1065,8 +1555,7 @@ async def _search_compact_serving_table(
                     "reported_code_system": data.get("reported_code_system") or data.get("billing_code_type"),
                     "billing_code": data.get("billing_code"),
                     "billing_code_type": data.get("billing_code_type"),
-                    "prices": _normalize_price_payload(data.get("prices")),
-                    "tic_prices": _normalize_price_payload(data.get("prices")),
+                    **_price_response_fields(data.get("prices")),
                     "source_trace": _coerce_json_payload(data.get("source_trace"), []),
                     "confidence": confidence,
                 }
@@ -1158,8 +1647,7 @@ async def _search_compact_serving_table(
                     "reported_code_system": data.get("reported_code_system") or data.get("billing_code_type"),
                     "billing_code": data.get("billing_code"),
                     "billing_code_type": data.get("billing_code_type"),
-                    "prices": prices,
-                    "tic_prices": prices,
+                    **_price_response_fields(prices),
                     "price_set_hash": data.get("price_set_hash"),
                     "rate_pack_hash": data.get("rate_pack_hash"),
                     "source_trace": _coerce_json_payload(data.get("source_trace"), []),
@@ -1191,6 +1679,9 @@ async def _search_compact_serving_table(
             "state": state_text or None,
             "city": city_text or None,
             "zip5": zip_text,
+            "lat": geo_lat if coordinate_filter_requested else None,
+            "long": geo_long if coordinate_filter_requested else None,
+            "radius_miles": geo_radius_miles if coordinate_filter_requested else None,
             "specialty": specialty_text or None,
             "taxonomy_code": taxonomy_code,
             "taxonomy_classification": taxonomy_classification or None,
@@ -1375,8 +1866,7 @@ async def search_ptg2_serving_table(
             "reported_code_system": reported_system,
             "billing_code": data.get("billing_code"),
             "billing_code_type": data.get("billing_code_type"),
-            "prices": prices,
-            "tic_prices": prices,
+            **_price_response_fields(prices),
             "price_set_hash": data.get("price_set_hash"),
             "rate_pack_hash": data.get("rate_pack_hash"),
             "source_trace": source_trace,
@@ -1606,8 +2096,7 @@ async def search_ptg2_provider_procedures(session, npi: int, args: dict[str, Any
                 "reported_code_system": reported_system,
                 "billing_code": data.get("billing_code"),
                 "billing_code_type": data.get("billing_code_type"),
-                "prices": prices,
-                "tic_prices": prices,
+                **_price_response_fields(prices),
                 "price_set_hash": data.get("price_set_hash"),
             }
         )

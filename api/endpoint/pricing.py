@@ -5781,6 +5781,26 @@ async def list_providers_by_procedure(request):
         param="zip_radius_miles",
         default=PROCEDURE_SEARCH_ZIP_RADIUS_DEFAULT_MILES,
     )
+    latitude = _parse_float(args.get("lat"), "lat")
+    longitude = _parse_float(args.get("long"), "long")
+    coordinate_radius_raw = args.get("radius_miles")
+    coordinate_radius_param = "radius_miles"
+    if coordinate_radius_raw in (None, "", "null") and args.get("radius") not in (None, "", "null"):
+        coordinate_radius_raw = args.get("radius")
+        coordinate_radius_param = "radius"
+    coordinate_radius_miles = _parse_zip_radius_miles(
+        coordinate_radius_raw,
+        param=coordinate_radius_param,
+        default=10.0,
+    )
+    if (latitude is None) ^ (longitude is None):
+        raise InvalidUsage("Parameters 'lat' and 'long' must be provided together")
+    if latitude is not None and not -90 <= latitude <= 90:
+        raise InvalidUsage("Parameter 'lat' must be between -90 and 90")
+    if longitude is not None and not -180 <= longitude <= 180:
+        raise InvalidUsage("Parameter 'long' must be between -180 and 180")
+    if latitude is None and coordinate_radius_raw not in (None, "", "null"):
+        raise InvalidUsage("Parameter 'radius_miles' requires 'lat' and 'long'")
     specialty = str(args.get("specialty", "")).strip().lower()
     q = str(args.get("q", "")).strip().lower()
     code = str(args.get("code", "")).strip()
@@ -5824,6 +5844,9 @@ async def list_providers_by_procedure(request):
                 "state": state or None,
                 "city": city or None,
                 "zip5": zip5 or None,
+                "lat": latitude,
+                "long": longitude,
+                "radius_miles": coordinate_radius_miles if latitude is not None else None,
                 "include_providers": args.get("include_providers") or None,
                 "include_code_details": args.get("include_code_details") or None,
                 "include_sources": args.get("include_sources") or None,
