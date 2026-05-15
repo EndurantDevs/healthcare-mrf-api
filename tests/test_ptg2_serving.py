@@ -70,7 +70,14 @@ def _db_serving_session():
                         "provider_set_count": 1,
                         "price_set_hash": "price-set-1",
                         "rate_pack_hash": "pack-1",
-                        "prices": [{"negotiated_type": "negotiated", "negotiated_rate": 450, "service_code": ["23"]}],
+                        "prices": [
+                            {
+                                "negotiated_type": "negotiated",
+                                "negotiated_rate": 450,
+                                "service_code": ["23"],
+                                "billing_code_modifier": ["TC", "ZZ"],
+                            }
+                        ],
                         "source_trace": [{"url": "https://example.test/rates.json.gz"}],
                         "confidence": {"network": "tic_rate_npi_tin"},
                     }
@@ -144,6 +151,82 @@ def test_db_serving_code_filter_accepts_signed_hp_procedure_codes():
 
     assert filters == ["procedure_code = :procedure_code"]
     assert params["procedure_code"] == -1201887592
+
+
+def test_price_summary_groups_component_rates_and_counts_raw_prices():
+    prices = [
+        {
+            "billing_class": "professional",
+            "setting": "inpatient",
+            "service_code": ["21", "22"],
+            "billing_code_modifier": ["26"],
+            "negotiated_rate": "83.09",
+            "negotiated_type": "negotiated",
+        },
+        {
+            "billing_class": "professional",
+            "setting": "inpatient",
+            "service_code": ["22", "21"],
+            "billing_code_modifier": ["26"],
+            "negotiated_rate": 83.09,
+            "negotiated_type": "negotiated",
+        },
+        {
+            "billing_class": "professional",
+            "setting": "inpatient",
+            "service_code": ["21"],
+            "billing_code_modifier": ["TC"],
+            "negotiated_rate": 158.58,
+            "negotiated_type": "negotiated",
+        },
+        {
+            "billing_class": "professional",
+            "setting": "inpatient",
+            "service_code": ["21"],
+            "billing_code_modifier": [],
+            "negotiated_rate": 241.67,
+            "negotiated_type": "negotiated",
+        },
+    ]
+
+    normalized = ptg2_serving._normalize_price_payload(prices)
+    summary = ptg2_serving._summarize_price_payload(prices)
+
+    assert len(normalized) == 3
+    assert normalized[0]["service_code"] == ["21", "22"]
+    assert normalized[0]["billing_code_modifier"] == ["26"]
+    assert summary == [
+        {
+            "component": "global",
+            "modifier": [],
+            "rate": 241.67,
+            "negotiated_type": "negotiated",
+            "billing_class": "professional",
+            "setting": "inpatient",
+            "service_code": ["21"],
+            "raw_price_count": 1,
+        },
+        {
+            "component": "professional",
+            "modifier": ["26"],
+            "rate": 83.09,
+            "negotiated_type": "negotiated",
+            "billing_class": "professional",
+            "setting": "inpatient",
+            "service_code": ["21", "22"],
+            "raw_price_count": 1,
+        },
+        {
+            "component": "technical",
+            "modifier": ["TC"],
+            "rate": 158.58,
+            "negotiated_type": "negotiated",
+            "billing_class": "professional",
+            "setting": "inpatient",
+            "service_code": ["21"],
+            "raw_price_count": 1,
+        },
+    ]
 
 
 @pytest.mark.asyncio
@@ -241,6 +324,12 @@ async def test_search_current_ptg2_index_can_include_code_details():
                     "display_name": "Emergency Room - Hospital",
                     "short_description": "Emergency Room - Hospital",
                 },
+                {
+                    "code_system": "MODIFIER",
+                    "code": "TC",
+                    "display_name": "Technical component",
+                    "short_description": "Technical component",
+                },
             ]
         )
     )
@@ -255,6 +344,15 @@ async def test_search_current_ptg2_index_can_include_code_details():
     assert item["billing_code_detail"]["display_name"] == "MRI brain without contrast"
     assert item["tic_prices"][0]["service_code_details"][0]["code_system"] == "POS"
     assert item["tic_prices"][0]["service_code_details"][0]["display_name"] == "Emergency Room - Hospital"
+    assert item["tic_prices"][0]["billing_code_modifier_details"][0]["code_system"] == "MODIFIER"
+    assert item["tic_prices"][0]["billing_code_modifier_details"][0]["display_name"] == "Technical component"
+    assert item["tic_prices"][0]["billing_code_modifier_details"][1] == {
+        "code_system": "MODIFIER",
+        "code": "ZZ",
+        "display_name": "Modifier ZZ",
+        "short_description": None,
+        "catalog_status": "missing",
+    }
     assert "source_trace" not in item
 
 
@@ -347,6 +445,40 @@ async def test_compact_serving_geo_search_allows_missing_specialty():
     assert "LEFT(COALESCE(addr_filter.postal_code, ''), 5) = :zip5" in sql
     assert "npi_taxonomy" not in sql
     assert "specialty_like" not in params
+
+
+@pytest.mark.asyncio
+async def test_compact_serving_coordinate_search_filters_npi_addresses():
+    session = FakeSession([FakeResult(rows=[])])
+
+    payload = await ptg2_serving._search_compact_serving_table(
+        session,
+        "mrf.ptg2_serving_rate_compact_token",
+        ptg2_serving.PTG2ServingTables(),
+        "snap-token",
+        {
+            "plan_id": "010854205",
+            "code": "70551",
+            "lat": 29.7604,
+            "long": -95.3698,
+            "radius_miles": 10.0,
+        },
+        FakePagination(),
+        ["snapshot_id = :snapshot_id", "plan_id = :plan_id"],
+        {"snapshot_id": "snap-token", "plan_id": "010854205", "limit": 25, "offset": 0},
+        ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
+    )
+
+    assert payload is None
+    sql = str(session.calls[0][0][0])
+    params = session.calls[0][0][1]
+    assert "FROM mrf.npi_address addr_filter" in sql
+    assert "addr_filter.lat::float8 BETWEEN :geo_min_lat AND :geo_max_lat" in sql
+    assert "addr_filter.long::float8 BETWEEN :geo_min_long AND :geo_max_long" in sql
+    assert ") <= :geo_radius_miles" in sql
+    assert params["geo_lat"] == 29.7604
+    assert params["geo_long"] == -95.3698
+    assert params["geo_radius_miles"] == 10.0
 
 
 @pytest.mark.asyncio

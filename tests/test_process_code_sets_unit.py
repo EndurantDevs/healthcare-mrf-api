@@ -43,6 +43,21 @@ def test_parse_revenue_code_rows():
     assert by_code["0981"].source == code_sets.SOURCE_RC
 
 
+def test_modifier_code_rows_include_professional_and_technical_components():
+    rows = code_sets.modifier_code_rows()
+
+    by_code = {row.code: row for row in rows}
+    assert by_code["26"].display_name == "Professional component"
+    assert by_code["TC"].display_name == "Technical component"
+    assert by_code["NU"].display_name == "New equipment"
+    assert by_code["RR"].display_name == "Rental"
+    assert by_code["QW"].display_name == "CLIA waived test"
+    assert by_code["95"].display_name == "Synchronous telemedicine service"
+    assert by_code["GQ"].display_name == "Asynchronous telecommunications system"
+    assert by_code["UE"].display_name == "Used durable medical equipment"
+    assert by_code["TC"].source == code_sets.SOURCE_MODIFIER
+
+
 @pytest.mark.asyncio
 async def test_upsert_code_rows_uses_code_catalog(monkeypatch):
     calls = []

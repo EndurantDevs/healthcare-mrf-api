@@ -1350,6 +1350,9 @@ async def test_list_providers_by_procedure_routes_plan_filter_to_ptg2(monkeypatc
             "include_providers": "true",
             "include_code_details": "true",
             "include_sources": "true",
+            "lat": "29.7604",
+            "long": "-95.3698",
+            "radius_miles": "10",
         },
     )
 
@@ -1364,6 +1367,9 @@ async def test_list_providers_by_procedure_routes_plan_filter_to_ptg2(monkeypatc
     assert seen_args["include_code_details"] == "true"
     assert seen_args["include_sources"] == "true"
     assert seen_args["include_details"] is None
+    assert seen_args["lat"] == 29.7604
+    assert seen_args["long"] == -95.3698
+    assert seen_args["radius_miles"] == 10.0
 
 
 @pytest.mark.asyncio
