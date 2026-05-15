@@ -22,17 +22,62 @@ class FakeResult:
 class FakeSession:
     def __init__(self, results):
         self._results = list(results)
+        self.calls = []
+        self.rollback_count = 0
 
     async def execute(self, *_args, **_kwargs):
+        self.calls.append((_args, _kwargs))
         value = self._results.pop(0) if self._results else None
+        if isinstance(value, Exception):
+            raise value
         if isinstance(value, FakeResult):
             return value
         return FakeResult(value)
+
+    async def rollback(self):
+        self.rollback_count += 1
 
 
 class FakePagination:
     limit = 25
     offset = 0
+
+
+def _db_serving_session():
+    return FakeSession(
+        [
+            None,
+            "snap-db",
+            {"table": "mrf.ptg2_serving_rate"},
+            "mrf.ptg2_serving_rate",
+            1,
+            FakeResult(
+                rows=[
+                    {
+                        "serving_rate_id": "rate-1",
+                        "snapshot_id": "snap-db",
+                        "plan_id": "010854205",
+                        "plan_name": "Heartland",
+                        "procedure_code": 123456,
+                        "reported_code_system": "CPT",
+                        "reported_code": "70551",
+                        "billing_code": "70551",
+                        "billing_code_type": "CPT",
+                        "procedure_display_name": "MRI brain",
+                        "provider_set_hash": "provider-set-1",
+                        "provider_set_hashes": ["provider-set-a"],
+                        "provider_count": 123,
+                        "provider_set_count": 1,
+                        "price_set_hash": "price-set-1",
+                        "rate_pack_hash": "pack-1",
+                        "prices": [{"negotiated_type": "negotiated", "negotiated_rate": 450, "service_code": ["23"]}],
+                        "source_trace": [{"url": "https://example.test/rates.json.gz"}],
+                        "confidence": {"network": "tic_rate_npi_tin"},
+                    }
+                ]
+            ),
+        ]
+    )
 
 
 def _fixture_payload():
@@ -117,39 +162,7 @@ async def test_load_current_ptg2_index_reads_snapshot_artifact(tmp_path):
 
 @pytest.mark.asyncio
 async def test_search_current_ptg2_index_reads_db_serving_table():
-    session = FakeSession(
-        [
-            "snap-db",
-            "mrf.ptg2_serving_rate",
-            "mrf.ptg2_serving_rate",
-            1,
-            FakeResult(
-                rows=[
-                    {
-                        "serving_rate_id": "rate-1",
-                        "snapshot_id": "snap-db",
-                        "plan_id": "010854205",
-                        "plan_name": "Heartland",
-                        "procedure_code": 123456,
-                        "reported_code_system": "CPT",
-                        "reported_code": "70551",
-                        "billing_code": "70551",
-                        "billing_code_type": "CPT",
-                        "procedure_display_name": "MRI brain",
-                        "provider_set_hash": "provider-set-1",
-                        "provider_set_hashes": ["provider-set-a"],
-                        "provider_count": 123,
-                        "provider_set_count": 1,
-                        "price_set_hash": "price-set-1",
-                        "rate_pack_hash": "pack-1",
-                        "prices": [{"negotiated_type": "negotiated", "negotiated_rate": 450}],
-                        "source_trace": [{"url": "https://example.test/rates.json.gz"}],
-                        "confidence": {"network": "tic_rate_npi_tin"},
-                    }
-                ]
-            ),
-        ]
-    )
+    session = _db_serving_session()
 
     payload = await ptg2_serving.search_current_ptg2_index(
         session,
@@ -157,14 +170,273 @@ async def test_search_current_ptg2_index_reads_db_serving_table():
         FakePagination(),
     )
 
-    assert payload["query"]["source"] == "ptg2_db"
-    assert payload["query"]["procedure_consolidation"] == "HP_PROCEDURE_CODE"
+    assert "source" not in payload["query"]
+    assert "serving_table" not in payload["query"]
+    assert "procedure_consolidation" not in payload["query"]
     item = payload["items"][0]
     assert item["procedure_code"] == 123456
     assert item["service_code"] == "70551"
     assert item["reported_code_system"] == "CPT"
     assert item["tic_prices"][0]["negotiated_rate"] == 450
     assert item["provider_count"] == 123
+    assert "source_trace" not in item
+    assert "confidence" not in item
+    assert "price_set_hash" not in item
+    assert "provider_set_hash" not in item
+
+
+@pytest.mark.asyncio
+async def test_search_current_ptg2_index_can_include_sources_without_debug_fields():
+    session = _db_serving_session()
+
+    payload = await ptg2_serving.search_current_ptg2_index(
+        session,
+        {"plan_id": "010854205", "code": "70551", "include_sources": "true"},
+        FakePagination(),
+    )
+
+    assert payload["query"]["source"] == "ptg2_db"
+    assert payload["query"]["serving_table"] == "mrf.ptg2_serving_rate"
+    assert "procedure_consolidation" not in payload["query"]
+    item = payload["items"][0]
+    assert item["source_trace"][0]["url"] == "https://example.test/rates.json.gz"
+    assert "confidence" not in item
+    assert "price_set_hash" not in item
+
+
+@pytest.mark.asyncio
+async def test_search_current_ptg2_index_can_include_full_details():
+    session = _db_serving_session()
+
+    payload = await ptg2_serving.search_current_ptg2_index(
+        session,
+        {"plan_id": "010854205", "code": "70551", "include_details": "true"},
+        FakePagination(),
+    )
+
+    assert payload["query"]["source"] == "ptg2_db"
+    assert payload["query"]["procedure_consolidation"] == "HP_PROCEDURE_CODE"
+    item = payload["items"][0]
+    assert item["source_trace"][0]["url"] == "https://example.test/rates.json.gz"
+    assert item["confidence"]["network"] == "tic_rate_npi_tin"
+    assert item["price_set_hash"] == "price-set-1"
+    assert item["provider_set_hash"] == "provider-set-1"
+
+
+@pytest.mark.asyncio
+async def test_search_current_ptg2_index_can_include_code_details():
+    session = _db_serving_session()
+    session._results.append(
+        FakeResult(
+            rows=[
+                {
+                    "code_system": "CPT",
+                    "code": "70551",
+                    "display_name": "MRI brain without contrast",
+                    "short_description": "MRI brain without contrast",
+                },
+                {
+                    "code_system": "POS",
+                    "code": "23",
+                    "display_name": "Emergency Room - Hospital",
+                    "short_description": "Emergency Room - Hospital",
+                },
+            ]
+        )
+    )
+
+    payload = await ptg2_serving.search_current_ptg2_index(
+        session,
+        {"plan_id": "010854205", "code": "70551", "include_code_details": "true"},
+        FakePagination(),
+    )
+
+    item = payload["items"][0]
+    assert item["billing_code_detail"]["display_name"] == "MRI brain without contrast"
+    assert item["tic_prices"][0]["service_code_details"][0]["code_system"] == "POS"
+    assert item["tic_prices"][0]["service_code_details"][0]["display_name"] == "Emergency Room - Hospital"
+    assert "source_trace" not in item
+
+
+@pytest.mark.asyncio
+async def test_current_ptg2_snapshot_routes_by_plan_source_pointer():
+    session = FakeSession(["snap-source"])
+
+    snapshot_id = await ptg2_serving.resolve_current_ptg2_snapshot_id(
+        session,
+        {"plan_id": "010854205", "plan_market_type": "group", "source_key": "heartland_dental"},
+    )
+
+    assert snapshot_id == "snap-source"
+    sql = str(session.calls[0][0][0])
+    params = session.calls[0][0][1]
+    assert "ptg2_current_plan_source" in sql
+    assert "JOIN mrf.ptg2_snapshot" in sql
+    assert "cps.plan_market_type = :plan_market_type" in sql
+    assert "cps.source_key = :source_key" in sql
+    assert "s.status = 'published'" in sql
+    assert "serving_index" in sql
+    assert params["source_key"] == "heartland_dental"
+
+
+@pytest.mark.asyncio
+async def test_current_ptg2_snapshot_rolls_back_missing_source_pointer_before_fallback():
+    session = FakeSession([RuntimeError("missing source pointer"), "snap-global"])
+
+    snapshot_id = await ptg2_serving.resolve_current_ptg2_snapshot_id(
+        session,
+        {"plan_id": "010854205", "plan_market_type": "group"},
+    )
+
+    assert snapshot_id == "snap-global"
+    assert session.rollback_count == 1
+    assert len(session.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_compact_serving_uses_snapshot_price_and_procedure_tables():
+    session = FakeSession([FakeResult(rows=[])])
+    tables = ptg2_serving.PTG2ServingTables(
+        serving_table="mrf.ptg2_serving_rate_compact_token",
+        price_table="mrf.ptg2_price_set_token",
+        procedure_table="mrf.ptg2_procedure_token",
+    )
+
+    payload = await ptg2_serving._search_compact_serving_table(
+        session,
+        "mrf.ptg2_serving_rate_compact_token",
+        tables,
+        "snap-token",
+        {"plan_id": "010854205", "code": "70551"},
+        FakePagination(),
+        ["snapshot_id = :snapshot_id", "plan_id = :plan_id"],
+        {"snapshot_id": "snap-token", "plan_id": "010854205", "limit": 25, "offset": 0},
+        ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
+    )
+
+    assert payload is None
+    sql = str(session.calls[0][0][0])
+    assert "FROM mrf.ptg2_price_set_token ps" in sql
+    assert "FROM mrf.ptg2_procedure_token proc" in sql
+
+
+@pytest.mark.asyncio
+async def test_compact_serving_geo_search_allows_missing_specialty():
+    session = FakeSession([FakeResult(rows=[])])
+
+    payload = await ptg2_serving._search_compact_serving_table(
+        session,
+        "mrf.ptg2_serving_rate_compact_token",
+        ptg2_serving.PTG2ServingTables(),
+        "snap-token",
+        {"plan_id": "010854205", "code": "70551", "zip5": "60601"},
+        FakePagination(),
+        ["snapshot_id = :snapshot_id", "plan_id = :plan_id"],
+        {"snapshot_id": "snap-token", "plan_id": "010854205", "limit": 25, "offset": 0},
+        ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
+    )
+
+    assert payload is None
+    sql = str(session.calls[0][0][0])
+    params = session.calls[0][0][1]
+    assert "EXISTS (" in sql
+    assert "provider_filter_npi" in sql
+    assert "JOIN LATERAL (" in sql
+    assert "FROM mrf.npi_address addr_filter" in sql
+    assert "addr_filter.npi = provider_filter_npi.npi" in sql
+    assert "LEFT(COALESCE(addr_filter.postal_code, ''), 5) = :zip5" in sql
+    assert "npi_taxonomy" not in sql
+    assert "specialty_like" not in params
+
+
+@pytest.mark.asyncio
+async def test_compact_serving_include_providers_expands_without_geo_filter():
+    session = FakeSession(
+        [
+            FakeResult(
+                rows=[
+                    {
+                        "npi": 1234567890,
+                        "location_hash": "loc-1",
+                        "state": "IL",
+                        "city": "Peoria",
+                        "zip5": "61636",
+                        "location_source": "nppes",
+                        "location_confidence_code": "nppes_practice_location",
+                        "address_payload": {"line1": "1 Main St"},
+                        "taxonomy_codes": [],
+                        "specialties": [],
+                        "provider_name": "Example Provider",
+                        "procedure_code": None,
+                        "reported_code_system": "RC",
+                        "reported_code": "450",
+                        "billing_code": "450",
+                        "billing_code_type": "RC",
+                        "procedure_display_name": "Emergency Room",
+                        "procedure_name": "Emergency Room",
+                        "procedure_description": "Emergency Room",
+                        "provider_set_hashes": ["provider-set-1"],
+                        "rate_count": 1,
+                        "prices": [{"negotiated_type": "percentage", "negotiated_rate": 60}],
+                        "source_trace": [],
+                    }
+                ]
+            )
+        ]
+    )
+
+    payload = await ptg2_serving._search_compact_serving_table(
+        session,
+        "mrf.ptg2_serving_rate_compact_token",
+        ptg2_serving.PTG2ServingTables(),
+        "snap-token",
+        {"plan_id": "010854205", "code": "450", "include_providers": "true"},
+        FakePagination(),
+        ["snapshot_id = :snapshot_id", "plan_id = :plan_id"],
+        {"snapshot_id": "snap-token", "plan_id": "010854205", "limit": 25, "offset": 0},
+        ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
+    )
+
+    assert payload["query"]["result_granularity"] == "provider"
+    assert payload["query"]["include_providers"] is True
+    item = payload["items"][0]
+    assert item["npi"] == 1234567890
+    assert item["provider_name"] == "Example Provider"
+    assert item["state"] == "IL"
+    assert item["tic_prices"][0]["negotiated_rate"] == 60
+    sql = str(session.calls[0][0][0])
+    assert "LEFT JOIN mrf.npi_address addr" in sql
+    assert "addr.npi = pgm.npi" in sql
+    assert "LEFT(COALESCE(addr.postal_code, ''), 5) = :zip5" not in sql
+
+
+@pytest.mark.asyncio
+async def test_compact_serving_specialty_search_joins_nucc_without_geo():
+    session = FakeSession([FakeResult(rows=[])])
+
+    payload = await ptg2_serving._search_compact_serving_table(
+        session,
+        "mrf.ptg2_serving_rate_compact_token",
+        ptg2_serving.PTG2ServingTables(),
+        "snap-token",
+        {"plan_id": "010854205", "code": "70551", "specialty": "dentist"},
+        FakePagination(),
+        ["snapshot_id = :snapshot_id", "plan_id = :plan_id"],
+        {"snapshot_id": "snap-token", "plan_id": "010854205", "limit": 25, "offset": 0},
+        ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
+    )
+
+    assert payload is None
+    sql = str(session.calls[0][0][0])
+    params = session.calls[0][0][1]
+    assert "EXISTS (" in sql
+    assert "provider_filter_npi" in sql
+    assert "FROM mrf.npi_taxonomy nt_filter" in sql
+    assert "JOIN mrf.nucc_taxonomy nucc_filter" in sql
+    assert "FROM mrf.ptg2_provider_set_component psc_filter" in sql
+    assert "pgm_filter.provider_group_hash = psc_filter.provider_group_hash" in sql
+    assert "WHERE nt_filter.npi = provider_filter_npi.npi" in sql
+    assert params["specialty_like"] == "%dentist%"
 
 
 def test_warm_cache_benchmark_fixture_p95_gate():

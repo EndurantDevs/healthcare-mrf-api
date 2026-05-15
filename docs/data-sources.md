@@ -10,6 +10,8 @@ Most importers resolve current files/distributions at runtime (from catalog APIs
 | Source website | Dataset families used in this repo | Importers using it | Main outputs |
 | --- | --- | --- | --- |
 | <https://data.cms.gov/> | Medicare physician claims, Medicare Part D prescriber/spending, Part D formulary/pharmacy files, Medicare enrollment dashboard data APIs, provider-enrollment datasets | `claims-pricing`, `claims-procedures`, `drug-claims`, `partd-formulary-network`, `medicare-enrollment`, `provider-enrichment` | procedure pricing, prescription claims, pharmacy activity/formulary coverage, Medicare enrollment stats, PECOS sidecar enrichment |
+| <https://www.cms.gov/medicare/coding-billing/place-of-service-codes/code-sets> | CMS Place of Service code set | `code-sets` | `POS` rows in `code_catalog` for PTG service-code display |
+| <https://bluebutton.cms.gov/fhir/CodeSystem/CLM-REV-CNTR-CD/> | CMS Blue Button Claim Revenue Center CodeSystem | `code-sets` | `RC` rows in `code_catalog` for revenue-code display |
 | <https://data.cms.gov/provider-data/> | Provider Data Catalog distributions (Doctors & Clinicians, Hospital General Information) | `cms-doctors`, `facility-anchors` | clinician-practice location rows, hospital anchor rows |
 | <https://www.cms.gov/marketplace/resources/data/public-use-files> | Federally facilitated marketplace PUF families (plans, issuers, rates, transparency metadata) | `mrf`, `plan-attributes` | marketplace plan/issuer/formulary/network/rates datasets |
 | <https://www.cms.gov/marketplace/resources/data/state-based-public-use-files> | State-based exchange plan/rate/attribute files | `mrf`, `plan-attributes` | state-exchange plan and pricing coverage where configured |

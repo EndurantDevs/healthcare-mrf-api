@@ -61,6 +61,7 @@ Each importer is a separate operational pipeline. Together, they build the canon
 | `mrf` | `python main.py start mrf` | CMS marketplace public use files | issuer, plan, formulary, network, and MRF-linked marketplace data |
 | `plan-attributes` | `python main.py start plan-attributes` | CMS marketplace plan attributes files | plan metadata, prices, benefits, and rating-area data |
 | `ptg` | `python main.py start ptg` | Transparency in Coverage machine-readable files | TiC table-of-contents and rate-file ingestion |
+| `code-sets` | `python main.py start code-sets` | CMS POS + CMS Blue Button RC code pages | readable Revenue Center and Place of Service labels in `code_catalog` |
 | `npi` | `python main.py start npi` | NPPES | provider identity, addresses, taxonomies, and directory search data |
 | `nucc` | `python main.py start nucc` | NUCC | provider taxonomy lookup tables |
 | `geo` | `python main.py start geo` | repository support files | ZIP/city/state/coordinate lookup tables |
@@ -114,6 +115,7 @@ Run from repo root in an activated virtualenv.
 | Import | Command |
 | --- | --- |
 | `ptg` | `python main.py start ptg [--test]` |
+| `code-sets` | `python main.py start code-sets [--test]` |
 | `geo` | `python main.py start geo [--file /path/to/geo_city_public.csv]` |
 | `geo-census` | `python main.py start geo-census [--test]` |
 
@@ -135,6 +137,7 @@ Per-import documentation:
 - [MRF import](./docs/imports/mrf.md)
 - [Plan attributes import](./docs/imports/plan-attributes.md)
 - [PTG import](./docs/imports/ptg.md)
+- [RC/POS code sets import](./docs/imports/code-sets.md)
 - [NPI import](./docs/imports/npi.md)
 - [NUCC import](./docs/imports/nucc.md)
 - [Geo import](./docs/imports/geo.md)

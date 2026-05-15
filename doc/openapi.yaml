@@ -2332,6 +2332,26 @@ paths:
           in: query
           schema:
             type: boolean
+        - name: include_providers
+          in: query
+          schema:
+            type: boolean
+          description: For PTG2 plan-rate results, expand provider-set rows to concrete NPI/provider rows.
+        - name: include_code_details
+          in: query
+          schema:
+            type: boolean
+          description: For PTG2 plan-rate results, include readable RC billing-code and POS service-code details from the code catalog.
+        - name: include_sources
+          in: query
+          schema:
+            type: boolean
+          description: For PTG2 plan-rate results, include source/provenance metadata.
+        - name: include_details
+          in: query
+          schema:
+            type: boolean
+          description: For PTG2 plan-rate results, include full diagnostic details.
         - name: order
           in: query
           schema:
@@ -3296,6 +3316,27 @@ paths:
           in: query
           schema:
             type: string
+          description: Optional specialty text filter. For PTG2 plan-rate results this matches NUCC display name, classification, specialization, or section.
+        - name: taxonomy_code
+          in: query
+          schema:
+            type: string
+          description: Optional exact NUCC taxonomy code filter for PTG2 plan-rate provider results.
+        - name: taxonomy_classification
+          in: query
+          schema:
+            type: string
+          description: Optional exact NUCC classification filter for PTG2 plan-rate provider results.
+        - name: taxonomy_specialization
+          in: query
+          schema:
+            type: string
+          description: Optional exact NUCC specialization filter for PTG2 plan-rate provider results.
+        - name: taxonomy_section
+          in: query
+          schema:
+            type: string
+          description: Optional exact NUCC section filter for PTG2 plan-rate provider results.
         - name: q
           in: query
           schema:
@@ -3304,6 +3345,41 @@ paths:
           in: query
           schema:
             type: string
+        - name: code_system
+          in: query
+          schema:
+            type: string
+          description: Optional source code system such as CPT or HCPCS.
+        - name: plan_id
+          in: query
+          schema:
+            type: string
+          description: Routes the request to the current PTG2 source snapshot for this plan when present.
+        - name: plan_external_id
+          in: query
+          schema:
+            type: string
+          description: Alias for plan_id when resolving a PTG2 source snapshot.
+        - name: plan_market_type
+          in: query
+          schema:
+            type: string
+          description: Optional PTG2 plan market type, for example group.
+        - name: source_key
+          in: query
+          schema:
+            type: string
+          description: Optional PTG2 source key for explicit source-scoped table selection.
+        - name: snapshot_id
+          in: query
+          schema:
+            type: string
+          description: Optional explicit PTG2 snapshot id override.
+        - name: mode
+          in: query
+          schema:
+            type: string
+            enum: [product_search, exact_source]
         - name: include_legacy_fields
           in: query
           schema:

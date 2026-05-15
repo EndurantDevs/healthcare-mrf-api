@@ -7,11 +7,14 @@ import io
 import json
 import os
 import subprocess
+import time
+from types import SimpleNamespace
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from aiohttp import web
 
 
 process_pkg = importlib.import_module("process")
@@ -394,6 +397,133 @@ def test_ptg2_artifact_reuse_by_strong_etag_and_length(tmp_path):
     assert mode == "strong_etag_length"
 
 
+def test_ptg2_range_download_assembles_artifact(monkeypatch, tmp_path):
+    payload = (b"0123456789abcdef" * 1024 * 1024)[:3 * 1024 * 1024]
+    requests = []
+
+    async def handle(request):
+        if request.method == "HEAD":
+            return web.Response(
+                headers={
+                    "Content-Length": str(len(payload)),
+                    "ETag": '"range-test"',
+                    "Accept-Ranges": "bytes",
+                }
+            )
+        range_header = request.headers.get("Range")
+        requests.append(range_header)
+        if range_header:
+            start_text, end_text = range_header.removeprefix("bytes=").split("-", 1)
+            start = int(start_text)
+            end = int(end_text)
+            chunk = payload[start : end + 1]
+            return web.Response(
+                status=206,
+                body=chunk,
+                headers={
+                    "Content-Length": str(len(chunk)),
+                    "Content-Range": f"bytes {start}-{end}/{len(payload)}",
+                    "ETag": '"range-test"',
+                },
+            )
+        return web.Response(body=payload, headers={"Content-Length": str(len(payload))})
+
+    async def run_download():
+        app = web.Application()
+        app.router.add_route("*", "/artifact.bin", handle)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        sockets = site._server.sockets
+        assert sockets
+        port = sockets[0].getsockname()[1]
+        try:
+            return await process_ptg.download_raw_artifact(
+                f"http://127.0.0.1:{port}/artifact.bin",
+                store=process_ptg.PTG2ArtifactStore(tmp_path),
+            )
+        finally:
+            await runner.cleanup()
+
+    monkeypatch.setenv(process_ptg.PTG2_RANGE_DOWNLOADS_ENV, "true")
+    monkeypatch.setenv(process_ptg.PTG2_RANGE_DOWNLOAD_MIN_BYTES_ENV, "1")
+    monkeypatch.setenv(process_ptg.PTG2_RANGE_DOWNLOAD_CHUNK_BYTES_ENV, str(1024 * 1024))
+    monkeypatch.setenv(process_ptg.PTG2_RANGE_DOWNLOAD_TASKS_ENV, "2")
+
+    artifact = asyncio.run(run_download())
+
+    assert Path(artifact.raw_path).read_bytes() == payload
+    assert any(request == "bytes=0-0" for request in requests)
+    assert sum(1 for request in requests if request and request != "bytes=0-0") >= 2
+    assert not list((tmp_path / "partial-retained").glob("*.ranges.json"))
+
+
+def test_ptg2_range_download_retries_short_chunk(monkeypatch, tmp_path):
+    payload = (b"0123456789abcdef" * 1024 * 1024)[:3 * 1024 * 1024]
+    attempts_by_range = {}
+
+    async def handle(request):
+        if request.method == "HEAD":
+            return web.Response(
+                headers={
+                    "Content-Length": str(len(payload)),
+                    "ETag": '"range-retry-test"',
+                    "Accept-Ranges": "bytes",
+                }
+            )
+        range_header = request.headers.get("Range")
+        if not range_header:
+            return web.Response(body=payload, headers={"Content-Length": str(len(payload))})
+        start_text, end_text = range_header.removeprefix("bytes=").split("-", 1)
+        start = int(start_text)
+        end = int(end_text)
+        attempts_by_range[range_header] = attempts_by_range.get(range_header, 0) + 1
+        chunk = payload[start : end + 1]
+        if range_header == "bytes=1048576-2097151" and attempts_by_range[range_header] == 1:
+            chunk = chunk[: len(chunk) // 2]
+        return web.Response(
+            status=206,
+            body=chunk,
+            headers={
+                "Content-Length": str(len(chunk)),
+                "Content-Range": f"bytes {start}-{end}/{len(payload)}",
+                "ETag": '"range-retry-test"',
+            },
+        )
+
+    async def run_download():
+        app = web.Application()
+        app.router.add_route("*", "/artifact.bin", handle)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        sockets = site._server.sockets
+        assert sockets
+        port = sockets[0].getsockname()[1]
+        try:
+            return await process_ptg.download_raw_artifact(
+                f"http://127.0.0.1:{port}/artifact.bin",
+                store=process_ptg.PTG2ArtifactStore(tmp_path),
+            )
+        finally:
+            await runner.cleanup()
+
+    monkeypatch.setenv(process_ptg.PTG2_RANGE_DOWNLOADS_ENV, "true")
+    monkeypatch.setenv(process_ptg.PTG2_RANGE_DOWNLOAD_MIN_BYTES_ENV, "1")
+    monkeypatch.setenv(process_ptg.PTG2_RANGE_DOWNLOAD_CHUNK_BYTES_ENV, str(1024 * 1024))
+    monkeypatch.setenv(process_ptg.PTG2_RANGE_DOWNLOAD_TASKS_ENV, "2")
+    monkeypatch.setenv(process_ptg.PTG2_DOWNLOAD_RETRIES_ENV, "2")
+    monkeypatch.setenv(process_ptg.PTG2_DOWNLOAD_RETRY_DELAY_SECONDS_ENV, "0")
+
+    artifact = asyncio.run(run_download())
+
+    assert Path(artifact.raw_path).read_bytes() == payload
+    assert attempts_by_range["bytes=1048576-2097151"] == 2
+    assert not list((tmp_path / "partial-retained").glob("*.ranges.json"))
+
+
 def test_ptg2_packing_helpers_are_order_insensitive_for_sets():
     provider_a = process_ptg.build_provider_set([3, 1, 2, 2], tin_type="ein", tin_value="123")
     provider_b = process_ptg.build_provider_set([2, 3, 1], tin_type="ein", tin_value="123")
@@ -550,13 +680,14 @@ def test_ptg2_compact_rows_can_schedule_async_writes(monkeypatch):
 
     monkeypatch.setenv(process_ptg.PTG2_ASYNC_WRITE_TASKS_ENV, "2")
     monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push)
-    state = process_ptg._compact_state(batch_rows=1)
+    async def run_writes():
+        state = process_ptg._compact_state(batch_rows=1)
+        await process_ptg._schedule_compact_write(state, [{"a": 1}], FakeClass)
+        assert state["pending_writes"]
+        await process_ptg._drain_compact_writes(state)
+        assert not state["pending_writes"]
 
-    asyncio.run(process_ptg._schedule_compact_write(state, [{"a": 1}], FakeClass))
-    assert state["pending_writes"]
-    asyncio.run(process_ptg._drain_compact_writes(state))
-
-    assert not state["pending_writes"]
+    asyncio.run(run_writes())
     assert pushed == [(FakeClass, [{"a": 1}])]
 
 
@@ -873,6 +1004,25 @@ def test_ptg2_ensure_tables_fails_fast_on_create_error(monkeypatch):
         asyncio.run(process_ptg.ensure_ptg2_tables())
 
 
+def test_ptg2_ensure_indexes_skips_duplicate_primary_unique_index(monkeypatch):
+    statements = []
+
+    async def fake_status(statement):
+        statements.append(statement)
+
+    model = SimpleNamespace(
+        __tablename__="example_ptg_table",
+        __my_index_elements__=["id"],
+        __my_additional_indexes__=[],
+        __table__=SimpleNamespace(primary_key=[SimpleNamespace(name="id")]),
+    )
+    monkeypatch.setattr(process_ptg.db, "status", fake_status)
+
+    asyncio.run(process_ptg._ensure_indexes(model, "mrf"))
+
+    assert not any("example_ptg_table_idx_primary" in statement for statement in statements)
+
+
 def test_ptg2_in_network_download_failure_returns_failed_result(monkeypatch, tmp_path):
     async def fake_materialize(*_args, **_kwargs):
         raise RuntimeError("download failed")
@@ -895,11 +1045,112 @@ def test_ptg2_in_network_download_failure_returns_failed_result(monkeypatch, tmp
     assert "download failed" in result.error
 
 
+def test_ptg2_in_network_serving_only_zero_rows_returns_skipped_result(monkeypatch, tmp_path):
+    artifact = tmp_path / "rates.json.gz"
+    artifact.write_bytes(b"{}")
+    raw_artifact = process_ptg.PTG2RawArtifact(
+        original_url="https://example.test/rates.json.gz",
+        canonical_url="https://example.test/rates.json.gz",
+        raw_path=str(artifact),
+        raw_storage_uri=str(artifact),
+        raw_sha256="raw",
+        byte_count=2,
+        head=None,
+    )
+    logical_artifact = process_ptg.PTG2LogicalArtifact(
+        logical_path=str(artifact),
+        logical_sha256="logical",
+        byte_count=2,
+    )
+
+    async def fake_materialize(*_args, **_kwargs):
+        return raw_artifact, logical_artifact
+
+    async def fake_source_version(**_kwargs):
+        return None
+
+    async def fake_parse(*_args, **_kwargs):
+        return {
+            "serving_only": True,
+            "rust_compact_serving": True,
+            "rust_records": 0,
+            "serving_rates": 0,
+        }
+
+    monkeypatch.setenv(process_ptg.PTG2_SERVING_ONLY_IMPORT_ENV, "true")
+    monkeypatch.setattr(process_ptg, "ptg2_temp_parent", lambda: tmp_path)
+    monkeypatch.setattr(process_ptg, "materialize_json_source", fake_materialize)
+    monkeypatch.setattr(process_ptg, "_extract_metadata_fields", AsyncMock(return_value={}))
+    monkeypatch.setattr(process_ptg, "_push_ptg2_objects", AsyncMock())
+    monkeypatch.setattr(process_ptg, "_record_source_version", fake_source_version)
+    monkeypatch.setattr(process_ptg, "_parse_in_network_file_serving_only", fake_parse)
+
+    result = asyncio.run(
+        process_ptg._process_in_network_file(
+            {"type": "in_network", "url": "https://example.test/rates.json.gz"},
+            {"PTGFile": SimpleNamespace(__name__="PTGFile"), "ImportLog": "log"},
+            {},
+            False,
+            compact_import=True,
+        )
+    )
+
+    assert result.success is True
+    assert result.skipped is True
+    assert result.error is None
+    assert result.summary["serving_rates"] == 0
+    assert result.summary["skipped_reason"] == "parsed zero serving rates"
+
+
+def test_ptg2_downloaded_jobs_are_prefetched_concurrently(monkeypatch):
+    started = []
+
+    def fake_download(job, **_kwargs):
+        started.append(job["url"])
+        if "slow" in job["url"]:
+            time.sleep(0.05)
+        return process_ptg.PTG2DownloadedJob(job=job)
+
+    async def collect():
+        results = []
+        async for downloaded in process_ptg._iter_downloaded_ptg_jobs(
+            [
+                {"type": "in_network", "url": "https://example.test/slow.json.gz"},
+                {"type": "in_network", "url": "https://example.test/fast.json.gz"},
+            ],
+            reuse_raw_artifacts=True,
+            max_bytes=None,
+            keep_partial_artifacts=None,
+        ):
+            results.append(downloaded.job["url"])
+        return results
+
+    monkeypatch.setenv(process_ptg.PTG2_DOWNLOAD_TASKS_ENV, "2")
+    monkeypatch.setattr(process_ptg, "_download_ptg_job_artifact_sync", fake_download)
+
+    yielded = asyncio.run(collect())
+
+    assert started[:2] == [
+        "https://example.test/slow.json.gz",
+        "https://example.test/fast.json.gz",
+    ]
+    assert yielded[0] == "https://example.test/fast.json.gz"
+    assert yielded[1] == "https://example.test/slow.json.gz"
+
+
 def test_ptg2_main_marks_failed_when_all_discovered_jobs_fail(monkeypatch):
     pushed = []
 
     async def fake_push(rows, cls, **_kwargs):
         pushed.extend((getattr(cls, "__name__", str(cls)), row) for row in rows)
+
+    async def fake_downloaded_jobs(jobs, **_kwargs):
+        for job in jobs:
+            yield process_ptg.PTG2DownloadedJob(
+                job=job,
+                raw_artifact=object(),
+                logical_artifact=SimpleNamespace(logical_path="/tmp/rates.json.gz"),
+            )
 
     async def fake_process(*_args, **_kwargs):
         return process_ptg.PTG2FileProcessResult(
@@ -913,6 +1164,7 @@ def test_ptg2_main_marks_failed_when_all_discovered_jobs_fail(monkeypatch):
     monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
     monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push)
     monkeypatch.setattr(process_ptg, "_prepare_ptg_tables", AsyncMock(return_value={"ImportLog": "log"}))
+    monkeypatch.setattr(process_ptg, "_iter_downloaded_ptg_jobs", fake_downloaded_jobs)
     monkeypatch.setattr(process_ptg, "_process_in_network_file", fake_process)
     monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
     monkeypatch.setattr(process_ptg, "build_ptg2_snapshot_index_artifact", AsyncMock())
@@ -937,6 +1189,108 @@ def test_ptg2_main_marks_failed_when_all_discovered_jobs_fail(monkeypatch):
     assert "download failed" in import_run_rows[-1]["report"]["failed_files"][0]["error"]
     assert snapshot_rows[-1]["status"] == process_ptg.PTG2_STATUS_FAILED
     assert current_rows == []
+
+
+def test_ptg2_main_blocks_partial_publish_by_default(monkeypatch):
+    pushed = []
+
+    async def fake_push(rows, cls, **_kwargs):
+        pushed.extend((getattr(cls, "__name__", str(cls)), row) for row in rows)
+
+    async def fake_downloaded_jobs(jobs, **_kwargs):
+        for job in jobs:
+            yield process_ptg.PTG2DownloadedJob(
+                job=job,
+                raw_artifact=object(),
+                logical_artifact=SimpleNamespace(logical_path="/tmp/rates.json.gz"),
+            )
+
+    async def fake_in_network(*_args, **_kwargs):
+        return process_ptg.PTG2FileProcessResult(
+            "in_network",
+            "https://example.test/rates.json.gz",
+            False,
+            error="download failed",
+        )
+
+    async def fake_allowed(*_args, **_kwargs):
+        return process_ptg.PTG2FileProcessResult(
+            "allowed_amounts",
+            "https://example.test/allowed.json.gz",
+            True,
+            file_id=123,
+        )
+
+    monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
+    monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
+    monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push)
+    monkeypatch.setattr(process_ptg, "_prepare_ptg_tables", AsyncMock(return_value={"ImportLog": "log"}))
+    monkeypatch.setattr(process_ptg, "_iter_downloaded_ptg_jobs", fake_downloaded_jobs)
+    monkeypatch.setattr(process_ptg, "_process_in_network_file", fake_in_network)
+    monkeypatch.setattr(process_ptg, "_process_allowed_amounts_file", fake_allowed)
+    monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
+    monkeypatch.setattr(process_ptg, "build_ptg2_snapshot_index_artifact", AsyncMock())
+    monkeypatch.delenv("HLTHPRT_PTG2_ALLOW_PARTIAL_IMPORT", raising=False)
+    monkeypatch.setenv(process_ptg.PTG2_COMPACT_IMPORT_ENV, "false")
+
+    with pytest.raises(RuntimeError, match="failed 1 of 2 attempted"):
+        asyncio.run(
+            process_ptg.main(
+                in_network_url="https://example.test/rates.json.gz",
+                allowed_url="https://example.test/allowed.json.gz",
+                import_month="2026-04",
+                import_id="partial_state_machine_test",
+            )
+        )
+
+    import_run_rows = [row for cls_name, row in pushed if cls_name == "PTG2ImportRun"]
+    current_rows = [row for cls_name, row in pushed if cls_name == "PTG2CurrentSnapshot"]
+
+    assert import_run_rows[-1]["status"] == process_ptg.PTG2_STATUS_FAILED
+    assert import_run_rows[-1]["report"]["files_processed"] == 1
+    assert import_run_rows[-1]["report"]["files_failed"] == 1
+    assert current_rows == []
+
+
+def test_ptg2_main_marks_failed_when_toc_download_fails(monkeypatch):
+    pushed = []
+
+    async def fake_push(rows, cls, **_kwargs):
+        pushed.extend((getattr(cls, "__name__", str(cls)), row) for row in rows)
+
+    async def fake_toc(*_args, **_kwargs):
+        raise RuntimeError("409 public access denied")
+
+    publish_mock = AsyncMock()
+
+    monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
+    monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
+    monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push)
+    monkeypatch.setattr(process_ptg, "_prepare_ptg_tables", AsyncMock(return_value={"ImportLog": "log"}))
+    monkeypatch.setattr(process_ptg, "_process_table_of_contents", fake_toc)
+    monkeypatch.setattr(process_ptg, "_publish_rust_compact_snapshot_tables", publish_mock)
+    monkeypatch.setenv(process_ptg.PTG2_COMPACT_IMPORT_ENV, "false")
+    monkeypatch.delenv("HLTHPRT_PTG2_ALLOW_PARTIAL_IMPORT", raising=False)
+
+    with pytest.raises(RuntimeError, match="table-of-contents"):
+        asyncio.run(
+            process_ptg.main(
+                toc_urls=["https://example.test/index.json"],
+                import_month="2026-04",
+                import_id="toc_failure_state_machine_test",
+            )
+        )
+
+    import_run_rows = [row for cls_name, row in pushed if cls_name == "PTG2ImportRun"]
+    snapshot_rows = [row for cls_name, row in pushed if cls_name == "PTG2Snapshot"]
+    current_rows = [row for cls_name, row in pushed if cls_name == "PTG2CurrentSnapshot"]
+
+    assert import_run_rows[-1]["status"] == process_ptg.PTG2_STATUS_FAILED
+    assert import_run_rows[-1]["report"]["jobs_discovered"] == 0
+    assert import_run_rows[-1]["report"]["toc_failures"][0]["error"] == "409 public access denied"
+    assert snapshot_rows[-1]["status"] == process_ptg.PTG2_STATUS_FAILED
+    assert current_rows == []
+    publish_mock.assert_not_awaited()
 
 
 def test_ptg2_snapshot_artifact_builder_writes_serving_index(monkeypatch, tmp_path):
@@ -1060,6 +1414,7 @@ def test_ptg_cli_passes_plan_filters(monkeypatch):
         allowed_url=None,
         provider_ref_url=None,
         import_id="ptg_smoke",
+        source_key="heartland_dental",
         import_month="2026-04-01",
         max_files=1,
         max_items=2,
@@ -1080,6 +1435,7 @@ def test_ptg_cli_passes_plan_filters(monkeypatch):
         allowed_url=None,
         provider_ref_url=None,
         import_id="ptg_smoke",
+        source_key="heartland_dental",
         import_month="2026-04-01",
         max_files=1,
         max_items=2,
@@ -1119,38 +1475,6 @@ def test_ptg2_rust_scanner_emits_top_level_object_bytes(tmp_path):
     ]
     assert json.loads(rows[0][1])["provider_group_id"] == 1
     assert json.loads(rows[-1][1])["billing_code"] == "70551"
-
-
-def test_ptg2_rust_scanner_splits_large_in_network_objects(tmp_path, monkeypatch):
-    if process_ptg._ptg2_rust_scanner_binary() is None:
-        pytest.skip("PTG2 Rust scanner binary is not built")
-    artifact = tmp_path / "rates.json.gz"
-    payload = {
-        "provider_references": [],
-        "in_network": [
-            {
-                "billing_code_type": "CPT",
-                "billing_code": "99213",
-                "name": "Office visit",
-                "negotiated_rates": [
-                    {"provider_references": [index], "negotiated_prices": [{"negotiated_rate": index}]}
-                    for index in range(5)
-                ],
-            }
-        ],
-    }
-    with gzip.open(artifact, "wb") as fp:
-        fp.write(json.dumps(payload).encode("utf-8"))
-    monkeypatch.setenv(process_ptg.PTG2_RUST_SPLIT_IN_NETWORK_ENV, "true")
-    monkeypatch.setenv("HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES", "2")
-
-    rows = list(process_ptg._iter_top_level_object_bytes_rust(artifact, {"provider_references", "in_network"}))
-    in_network_rows = [json.loads(raw) for name, raw in rows if name == "in_network"]
-
-    assert [len(row["negotiated_rates"]) for row in in_network_rows] == [2, 2, 1]
-    assert {row["billing_code"] for row in in_network_rows} == {"99213"}
-    assert in_network_rows[0]["negotiated_rates"][0]["provider_references"] == [0]
-    assert in_network_rows[-1]["negotiated_rates"][0]["provider_references"] == [4]
 
 
 def test_ptg2_rust_compact_serving_mode_emits_copy_oriented_rows(tmp_path):
@@ -1267,7 +1591,7 @@ def test_ptg2_rust_compact_serving_mode_can_write_copy_file(tmp_path):
         "HLTHPRT_PTG2_COMPACT_PLAN_MONTH_ID": "plan-month",
         "HLTHPRT_PTG2_COMPACT_SOURCE_TRACE_SET_HASH": "source-trace",
         "HLTHPRT_PTG2_COMPACT_SERVING_COPY_PATH": str(copy_path),
-        "HLTHPRT_PTG2_RUST_SPLIT_IN_NETWORK": "true",
+        "HLTHPRT_PTG2_RUST_WORKERS": "1",
     }
     completed = subprocess.run(
         [str(binary), "--compact-serving", str(artifact)],
@@ -1288,3 +1612,543 @@ def test_ptg2_rust_compact_serving_mode_can_write_copy_file(tmp_path):
 
     assert b"serving_rate_compact" not in completed.stdout
     assert b"compact_copy_file" in completed.stdout
+
+
+def test_ptg2_rust_compact_serving_copy_files_support_inline_provider_groups(tmp_path):
+    binary = process_ptg._ptg2_rust_scanner_binary()
+    if binary is None:
+        pytest.skip("PTG2 Rust scanner binary is not built")
+    artifact = tmp_path / "rates.json.gz"
+    serving_copy = tmp_path / "serving.copy"
+    member_copy = tmp_path / "provider_group_member.copy"
+    payload = {
+        "in_network": [
+            {
+                "billing_code_type": "CPT",
+                "billing_code": "99213",
+                "negotiated_rates": [
+                    {
+                        "provider_groups": [
+                            {"npi": [1234567890], "tin": {"type": "ein", "value": "12-3456789"}}
+                        ],
+                        "negotiated_prices": [{"negotiated_type": "negotiated", "negotiated_rate": 100}],
+                    },
+                    {
+                        "provider_groups": [
+                            {"npi": [1234567890], "tin": {"type": "ein", "value": "12-3456789"}}
+                        ],
+                        "negotiated_prices": [{"negotiated_type": "negotiated", "negotiated_rate": 125}],
+                    },
+                ],
+            }
+        ],
+    }
+    with gzip.open(artifact, "wb") as fp:
+        fp.write(json.dumps(payload).encode("utf-8"))
+
+    env = {
+        **os.environ,
+        "HLTHPRT_PTG2_COMPACT_SNAPSHOT_ID": "snapshot",
+        "HLTHPRT_PTG2_COMPACT_PLAN_ID": "plan",
+        "HLTHPRT_PTG2_COMPACT_PLAN_MONTH_ID": "plan-month",
+        "HLTHPRT_PTG2_COMPACT_SOURCE_TRACE_SET_HASH": "source-trace",
+        "HLTHPRT_PTG2_COMPACT_SERVING_COPY_PATH": str(serving_copy),
+        "HLTHPRT_PTG2_PROVIDER_GROUP_MEMBER_COPY_PATH": str(member_copy),
+        "HLTHPRT_PTG2_RUST_WORKERS": "2",
+    }
+    completed = subprocess.run(
+        [str(binary), "--compact-serving", str(artifact)],
+        check=True,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    assert serving_copy.exists()
+    assert len(serving_copy.read_text().splitlines()) == 2
+    assert member_copy.exists()
+    member_lines = member_copy.read_text().splitlines()
+    assert len(member_lines) == 1
+    assert b"compact_copy_file" in completed.stdout
+    assert b"provider_group_member_copy_file" in completed.stdout
+
+
+def test_ptg2_rust_compact_serving_parallel_workers_write_shards(tmp_path):
+    binary = process_ptg._ptg2_rust_scanner_binary()
+    if binary is None:
+        pytest.skip("PTG2 Rust scanner binary is not built")
+    artifact = tmp_path / "rates.json.gz"
+    copy_path = tmp_path / "compact.copy"
+    payload = {
+        "provider_references": [
+            {
+                "provider_group_id": 7,
+                "provider_groups": [{"npi": [1234567890], "tin": {"type": "ein", "value": "12-3456789"}}],
+            }
+        ],
+        "in_network": [
+            {
+                "billing_code_type": "CPT",
+                "billing_code": "99213",
+                "negotiated_rates": [
+                    {
+                        "provider_references": [7],
+                        "negotiated_prices": [{"negotiated_type": "negotiated", "negotiated_rate": 100}],
+                    }
+                ],
+            },
+            {
+                "billing_code_type": "CPT",
+                "billing_code": "99213",
+                "negotiated_rates": [
+                    {
+                        "provider_references": [7],
+                        "negotiated_prices": [{"negotiated_type": "negotiated", "negotiated_rate": 100}],
+                    }
+                ],
+            },
+        ],
+    }
+    with gzip.open(artifact, "wb") as fp:
+        fp.write(json.dumps(payload).encode("utf-8"))
+
+    env = {
+        **os.environ,
+        "HLTHPRT_PTG2_COMPACT_SNAPSHOT_ID": "snapshot",
+        "HLTHPRT_PTG2_COMPACT_PLAN_ID": "plan",
+        "HLTHPRT_PTG2_COMPACT_PLAN_MONTH_ID": "plan-month",
+        "HLTHPRT_PTG2_COMPACT_SOURCE_TRACE_SET_HASH": "source-trace",
+        "HLTHPRT_PTG2_COMPACT_SERVING_COPY_PATH": str(copy_path),
+        "HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES": "1",
+        "HLTHPRT_PTG2_RUST_WORKERS": "2",
+        "HLTHPRT_PTG2_RUST_WORK_QUEUE": "2",
+        "HLTHPRT_PTG2_COMPACT_SERVING_COPY_ROTATE_BYTES": "1",
+    }
+    completed = subprocess.run(
+        [str(binary), "--compact-serving", str(artifact)],
+        check=True,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    assert not copy_path.exists()
+    shard_paths = sorted(tmp_path.glob("compact.copy.worker*"))
+    assert shard_paths
+    copy_lines = [
+        line
+        for shard_path in shard_paths
+        for line in shard_path.read_text().splitlines()
+    ]
+    assert len(copy_lines) == 1
+    assert copy_lines[0].split("\t")[8] == "99213"
+    assert b"serving_rate_compact" not in completed.stdout
+    assert b"compact_copy_file" in completed.stdout
+    assert b"dedupe_summary" in completed.stdout
+    assert b"PTG2_DEDUPE_SUMMARY" in completed.stderr
+
+    frames = []
+    stream = io.BytesIO(completed.stdout)
+    while True:
+        header = stream.readline()
+        if not header:
+            break
+        name, size = header.rstrip(b"\n").split(b"\t", 1)
+        payload_bytes = stream.read(int(size))
+        assert stream.read(1) == b"\n"
+        frames.append((name.decode("utf-8"), json.loads(payload_bytes)))
+    dedupe_summary = [row for kind, row in frames if kind == "dedupe_summary"][0]
+    rotated_copy_events = [
+        row
+        for kind, row in frames
+        if kind == "compact_copy_file" and row.get("final") is False
+    ]
+    assert rotated_copy_events
+    assert all(str(row["path"]).endswith(".ready") for row in rotated_copy_events)
+    assert dedupe_summary["negotiated_rates"] == 2
+    assert dedupe_summary["serving_rate_attempted"] == 2
+    assert dedupe_summary["serving_rate_unique"] == 1
+    assert dedupe_summary["serving_rate_duplicate"] == 1
+    assert dedupe_summary["serving_rate_reduction_pct"] == 50.0
+
+
+def test_ptg2_rust_compact_uses_bounded_event_queue_default(monkeypatch, tmp_path):
+    captured_env = {}
+
+    class FakeProcess:
+        stdout = io.BytesIO()
+        stderr = None
+
+        def poll(self):
+            return 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    def fake_popen(_args, stdout, stderr, env):
+        captured_env.update(env)
+        return FakeProcess()
+
+    monkeypatch.delenv(process_ptg.PTG2_RUST_EVENT_QUEUE_ENV, raising=False)
+    monkeypatch.setattr(process_ptg, "_ptg2_rust_scanner_binary", lambda: tmp_path / "ptg2_scanner")
+    monkeypatch.setattr(process_ptg.subprocess, "Popen", fake_popen)
+
+    list(
+        process_ptg._iter_compact_serving_records_rust(
+            tmp_path / "rates.json.gz",
+            snapshot_id="snap",
+            plan_id="plan",
+            plan_month_id="month",
+            source_trace_set_hash="trace",
+            compact_copy_path=tmp_path / "serving.copy",
+            price_set_copy_path=tmp_path / "price_set.copy",
+        )
+    )
+
+    assert captured_env[process_ptg.PTG2_RUST_EVENT_QUEUE_ENV] == "32"
+
+
+def test_ptg2_compact_finalize_defers_provider_locations_by_default(monkeypatch):
+    status_calls = []
+    scalar_values = iter([3, 1, 2])
+
+    async def fake_status(statement, **_params):
+        status_calls.append(statement)
+
+    async def fake_scalar(_statement, **_params):
+        return next(scalar_values)
+
+    async def fail_provider_locations(_snapshot_id):
+        raise AssertionError("provider locations should be deferred by default")
+
+    monkeypatch.delenv(process_ptg.PTG2_DEFER_PROVIDER_LOCATIONS_ENV, raising=False)
+    monkeypatch.setattr(process_ptg.db, "status", fake_status)
+    monkeypatch.setattr(process_ptg.db, "scalar", fake_scalar)
+    monkeypatch.setattr(process_ptg, "_build_ptg2_provider_locations", fail_provider_locations)
+
+    result = asyncio.run(process_ptg.build_ptg2_compact_serving_index("snap", "run"))
+
+    assert result["rate_count"] == 3
+    assert any("ANALYZE mrf.ptg2_serving_rate_compact" in statement for statement in status_calls)
+
+
+def test_ptg2_rust_snapshot_publish_dedupes_dictionary_stages_before_index(monkeypatch):
+    status_calls = []
+
+    async def fake_status(statement, **_params):
+        status_calls.append(statement)
+
+    async def fake_all(statement, **_params):
+        if "COUNT(DISTINCT plan_id)" in statement:
+            return [{"plans": 1}]
+        if "COUNT(DISTINCT COALESCE" in statement:
+            return [{"procedures": 2}]
+        return []
+
+    async def fake_table_exists(_schema, _table):
+        return True
+
+    monkeypatch.setattr(process_ptg.db, "status", fake_status)
+    monkeypatch.setattr(process_ptg.db, "all", fake_all)
+    monkeypatch.setattr(process_ptg, "_table_exists", fake_table_exists)
+    monkeypatch.setattr(process_ptg, "_table_has_rows", AsyncMock(return_value=True))
+    async def fake_estimated_rows(_schema, table_name):
+        if table_name.startswith("ptg2_serving_rate_compact_"):
+            return 987
+        return 123
+
+    estimate_mock = AsyncMock(side_effect=fake_estimated_rows)
+    monkeypatch.setattr(process_ptg, "_estimated_table_rows", estimate_mock)
+    monkeypatch.setenv("HLTHPRT_PTG2_PUBLISH_DEDUPE_BUCKETS", "2")
+
+    result = asyncio.run(
+        process_ptg._publish_rust_compact_snapshot_tables(
+            {
+                "serving_rate_compact": "ptg2_rust_stage_serving_rate_compact_abc",
+                "price_set": "ptg2_rust_stage_price_set_abc",
+                "procedure": "ptg2_rust_stage_procedure_abc",
+                "provider_set": "ptg2_rust_stage_provider_set_abc",
+                "provider_group_member": "ptg2_rust_stage_provider_group_member_abc",
+            },
+            snapshot_id="ptg2:202604:snap",
+            import_run_id="ptg2:run",
+            source_key="heartland_dental",
+        )
+    )
+
+    joined = "\n".join(status_calls)
+    assert result["storage"] == "db_compact_snapshot"
+    assert result["source_key"] == "heartland_dental"
+    assert result["table"].startswith("mrf.ptg2_serving_rate_compact_")
+    assert result["price_table"].startswith("mrf.ptg2_price_set_")
+    assert result["rate_count"] == 987
+    assert result["serving_rates"] == 987
+    assert result["row_count"] == 987
+    assert "RENAME TO" in joined
+    assert "INSERT INTO" in joined
+    assert "SELECT DISTINCT ON" in joined
+    assert "ptg2_price_set (" not in joined
+    assert "ptg2_rust_stage_serving_rate_compact_abc" in joined
+    assert "ptg2_rust_stage_price_set_abc" in joined
+    assert "PTG2_PUBLISH_STAGE_INDEX_START" not in joined
+    assert "CREATE INDEX IF NOT EXISTS" in joined
+    assert '"price_set_hash" >= :bucket_start' in joined
+    assert '"procedure_hash" >= :bucket_start' in joined
+    serving_estimate_calls = [
+        call for call in estimate_mock.await_args_list
+        if call.args[1].startswith("ptg2_serving_rate_compact_")
+    ]
+    assert len(serving_estimate_calls) == 1
+
+
+def test_ptg2_serving_stage_table_for_copy_uses_worker_lane():
+    stage_tables = {
+        "serving_rate_compact": "stage_w0000",
+        process_ptg._serving_stage_lane_key(1): "stage_w0001",
+        process_ptg._serving_stage_lane_key(7): "stage_w0007",
+    }
+
+    assert (
+        process_ptg._serving_stage_table_for_copy(
+            stage_tables,
+            Path("/tmp/ptg2.copy.worker0001.part000002.ready"),
+        )
+        == "stage_w0001"
+    )
+    assert (
+        process_ptg._serving_stage_table_for_copy(
+            stage_tables,
+            Path("/tmp/ptg2.copy.worker0000.part000002.ready"),
+        )
+        == "stage_w0000"
+    )
+    assert (
+        process_ptg._serving_stage_table_for_copy(
+            stage_tables,
+            Path("/tmp/ptg2.copy.worker0009.part000002.ready"),
+        )
+        == "stage_w0000"
+    )
+
+
+def test_ptg2_rust_snapshot_publish_inherits_serving_stage_lanes(monkeypatch):
+    status_calls = []
+
+    async def fake_status(statement, **_params):
+        status_calls.append(statement)
+
+    async def fake_all(statement, **_params):
+        if "COUNT(DISTINCT plan_hash)" in statement:
+            return [{"plans": 1}]
+        return []
+
+    async def fake_table_exists(_schema, _table):
+        return True
+
+    async def fake_table_has_rows(_schema, table):
+        return table != "stage_empty_base"
+
+    async def fake_estimated_rows(_schema, table_name):
+        if table_name.endswith("_p00"):
+            return 100
+        if table_name.endswith("_p01"):
+            return 200
+        return 0
+
+    monkeypatch.setattr(process_ptg.db, "status", fake_status)
+    monkeypatch.setattr(process_ptg.db, "all", fake_all)
+    monkeypatch.setattr(process_ptg, "_table_exists", fake_table_exists)
+    monkeypatch.setattr(process_ptg, "_table_has_rows", fake_table_has_rows)
+    monkeypatch.setattr(process_ptg, "_estimated_table_rows", fake_estimated_rows)
+
+    result = asyncio.run(
+        process_ptg._publish_rust_compact_snapshot_tables(
+            {
+                "serving_rate_compact": "stage_empty_base",
+                process_ptg._serving_stage_lane_key(1): "stage_worker_0001",
+                process_ptg._serving_stage_lane_key(2): "stage_worker_0002",
+            },
+            snapshot_id="ptg2:202604:snap",
+            import_run_id="ptg2:run",
+            source_key="heartland_dental",
+        )
+    )
+
+    joined = "\n".join(status_calls)
+    assert result["storage"] == "db_compact_snapshot"
+    assert result["rate_count"] == 300
+    assert result["table"].startswith("mrf.ptg2_serving_rate_compact_")
+    assert "INHERIT" in joined
+    assert "stage_worker_0001" in joined
+    assert "stage_worker_0002" in joined
+    assert "INSERT INTO" not in joined
+    assert "_p00" in joined
+    assert "_p01" in joined
+
+
+def test_ptg2_source_scoped_report_uses_published_serving_rate_count(monkeypatch):
+    pushed = []
+
+    async def fake_push(rows, cls, **_kwargs):
+        pushed.extend((getattr(cls, "__name__", str(cls)), row) for row in rows)
+
+    async def fake_downloaded_jobs(jobs, **_kwargs):
+        for job in jobs:
+            yield process_ptg.PTG2DownloadedJob(
+                job=job,
+                raw_artifact=object(),
+                logical_artifact=SimpleNamespace(logical_path="/tmp/rates.json.gz"),
+            )
+
+    async def fake_process(*_args, **_kwargs):
+        return process_ptg.PTG2FileProcessResult(
+            "in_network",
+            "https://example.test/rates.json.gz",
+            True,
+            summary={"serving_rates": 111, "rust_compact_serving": True},
+        )
+
+    async def fake_publish(*_args, **_kwargs):
+        return {
+            "storage": "db_compact_snapshot",
+            "table": "mrf.ptg2_serving_rate_compact_exact",
+            "rate_count": 987,
+            "serving_rates": 987,
+        }
+
+    monkeypatch.setenv(process_ptg.PTG2_COMPACT_IMPORT_ENV, "true")
+    monkeypatch.setenv(process_ptg.PTG2_COMPACT_SERVING_TABLE_ENV, "true")
+    monkeypatch.setenv(process_ptg.PTG2_RUST_COMPACT_SERVING_ENV, "true")
+    monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
+    monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
+    monkeypatch.setattr(process_ptg.db, "status", AsyncMock())
+    monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push)
+    monkeypatch.setattr(process_ptg, "_prepare_ptg_tables", AsyncMock(return_value={"ImportLog": "log"}))
+    monkeypatch.setattr(process_ptg, "_create_rust_copy_stage_tables", AsyncMock(return_value={"serving_rate_compact": "stage"}))
+    monkeypatch.setattr(process_ptg, "_iter_downloaded_ptg_jobs", fake_downloaded_jobs)
+    monkeypatch.setattr(process_ptg, "_process_in_network_file", fake_process)
+    monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
+    monkeypatch.setattr(process_ptg, "_publish_rust_compact_snapshot_tables", fake_publish)
+    monkeypatch.setattr(process_ptg, "_current_source_snapshot_id", AsyncMock(return_value=None))
+    monkeypatch.setattr(process_ptg, "_publish_ptg2_source_pointers", AsyncMock())
+    monkeypatch.setattr(process_ptg, "_cleanup_old_ptg2_source_tables", AsyncMock())
+
+    asyncio.run(
+        process_ptg.main(
+            in_network_url="https://example.test/rates.json.gz",
+            import_month="2026-04",
+            import_id="source_report_count",
+            source_key="heartland_dental",
+        )
+    )
+
+    import_run_rows = [row for cls_name, row in pushed if cls_name == "PTG2ImportRun"]
+    snapshot_rows = [row for cls_name, row in pushed if cls_name == "PTG2Snapshot"]
+    final_report = import_run_rows[-1]["report"]
+    assert final_report["serving_rates"] == 987
+    assert final_report["rate_count"] == 987
+    assert final_report["serving_index"]["serving_rates"] == 987
+    assert final_report["successful_files"][0]["summary"]["serving_rates"] == 111
+    assert snapshot_rows[-1]["manifest"]["serving_rates"] == 987
+
+
+def test_ptg2_test_mode_does_not_enter_source_scoped_rust_publish(monkeypatch):
+    pushed = []
+
+    async def fake_push(rows, cls, **_kwargs):
+        pushed.extend((getattr(cls, "__name__", str(cls)), row) for row in rows)
+
+    async def fake_downloaded_jobs(jobs, **_kwargs):
+        for job in jobs:
+            yield process_ptg.PTG2DownloadedJob(
+                job=job,
+                raw_artifact=object(),
+                logical_artifact=SimpleNamespace(logical_path="/tmp/rates.json.gz"),
+            )
+
+    async def fake_process(*_args, **kwargs):
+        assert kwargs.get("rust_stage_tables") is None
+        return process_ptg.PTG2FileProcessResult(
+            "in_network",
+            "https://example.test/rates.json.gz",
+            True,
+            summary={"serving_rates": 111, "rust_compact_serving": False},
+        )
+
+    create_stage_mock = AsyncMock(return_value={"serving_rate_compact": "stage"})
+    publish_mock = AsyncMock()
+
+    monkeypatch.setenv(process_ptg.PTG2_COMPACT_IMPORT_ENV, "true")
+    monkeypatch.setenv(process_ptg.PTG2_COMPACT_SERVING_TABLE_ENV, "true")
+    monkeypatch.setenv(process_ptg.PTG2_RUST_COMPACT_SERVING_ENV, "true")
+    monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
+    monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
+    monkeypatch.setattr(process_ptg, "prepare_ptg2_compact_bulk_load", AsyncMock())
+    monkeypatch.setattr(process_ptg.db, "status", AsyncMock())
+    monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push)
+    monkeypatch.setattr(process_ptg, "_prepare_ptg_tables", AsyncMock(return_value={"ImportLog": "log"}))
+    monkeypatch.setattr(process_ptg, "_create_rust_copy_stage_tables", create_stage_mock)
+    monkeypatch.setattr(process_ptg, "_iter_downloaded_ptg_jobs", fake_downloaded_jobs)
+    monkeypatch.setattr(process_ptg, "_process_in_network_file", fake_process)
+    monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
+    monkeypatch.setattr(process_ptg, "_publish_rust_compact_snapshot_tables", publish_mock)
+    monkeypatch.setattr(
+        process_ptg,
+        "build_ptg2_compact_serving_index",
+        AsyncMock(return_value={"storage": "db_compact", "rate_count": 222, "serving_rates": 222}),
+    )
+
+    asyncio.run(
+        process_ptg.main(
+            in_network_url="https://example.test/rates.json.gz",
+            import_month="2026-04",
+            import_id="test_mode_rust_env",
+            source_key="heartland_dental",
+            test_mode=True,
+        )
+    )
+
+    create_stage_mock.assert_not_awaited()
+    publish_mock.assert_not_awaited()
+    import_run_rows = [row for cls_name, row in pushed if cls_name == "PTG2ImportRun"]
+    assert import_run_rows[-1]["options"]["source_scoped_compact"] is False
+    assert import_run_rows[-1]["report"]["serving_rates"] == 222
+
+
+def test_ptg2_compact_finalize_builds_provider_locations_after_analyze_when_enabled(monkeypatch):
+    calls = []
+    scalar_values = iter([3, 1, 2])
+
+    async def fake_status(statement, **_params):
+        if "ANALYZE mrf.ptg2_serving_rate_compact" in statement:
+            calls.append("analyze_compact")
+
+    async def fake_scalar(_statement, **_params):
+        return next(scalar_values)
+
+    async def fake_provider_locations(snapshot_id):
+        calls.append(f"provider_locations:{snapshot_id}")
+
+    monkeypatch.setenv(process_ptg.PTG2_DEFER_PROVIDER_LOCATIONS_ENV, "false")
+    monkeypatch.setattr(process_ptg.db, "status", fake_status)
+    monkeypatch.setattr(process_ptg.db, "scalar", fake_scalar)
+    monkeypatch.setattr(process_ptg, "_build_ptg2_provider_locations", fake_provider_locations)
+
+    result = asyncio.run(process_ptg.build_ptg2_compact_serving_index("snap", "run"))
+
+    assert result["rate_count"] == 3
+    assert calls.index("analyze_compact") < calls.index("provider_locations:snap")
+
+
+def test_ptg2_rust_scanner_enables_rust_compact_serving_by_default(monkeypatch):
+    monkeypatch.setenv(process_ptg.PTG2_RUST_SCANNER_ENV, "true")
+    monkeypatch.delenv(process_ptg.PTG2_RUST_COMPACT_SERVING_ENV, raising=False)
+
+    assert process_ptg._use_rust_compact_serving() is True
+
+
+def test_ptg2_rust_compact_serving_can_be_disabled_when_scanner_enabled(monkeypatch):
+    monkeypatch.setenv(process_ptg.PTG2_RUST_SCANNER_ENV, "true")
+    monkeypatch.setenv(process_ptg.PTG2_RUST_COMPACT_SERVING_ENV, "false")
+
+    assert process_ptg._use_rust_compact_serving() is False

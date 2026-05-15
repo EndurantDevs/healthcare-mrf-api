@@ -7,9 +7,11 @@ import hashlib
 import io
 import json
 import logging
+import math
 import os
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -32,6 +34,7 @@ import codecs
 import concurrent.futures
 import multiprocessing
 import pickle
+import queue
 import re
 
 try:
@@ -55,7 +58,9 @@ from db.models import (
     PTG2Capability,
     PTG2Confidence,
     PTG2ContentIdentity,
+    PTG2CurrentPlanSource,
     PTG2CurrentSnapshot,
+    PTG2CurrentSourceSnapshot,
     PTG2FactChunk,
     PTG2GCCandidate,
     PTG2ImportJob,
@@ -105,6 +110,37 @@ from process.ext.utils import (
 
 logger = logging.getLogger(__name__)
 
+_SCREEN_QUEUE: queue.SimpleQueue[tuple[str, str] | None] = queue.SimpleQueue()
+_SCREEN_WRITER_STARTED = False
+_SCREEN_WRITER_LOCK = threading.Lock()
+
+
+def _screen_writer() -> None:
+    while True:
+        item = _SCREEN_QUEUE.get()
+        if item is None:
+            return
+        stream_name, line = item
+        stream = sys.stderr if stream_name == "stderr" else sys.stdout
+        print(line, file=stream, flush=True)
+
+
+def _ensure_screen_writer() -> None:
+    global _SCREEN_WRITER_STARTED
+    if _SCREEN_WRITER_STARTED:
+        return
+    with _SCREEN_WRITER_LOCK:
+        if _SCREEN_WRITER_STARTED:
+            return
+        thread = threading.Thread(target=_screen_writer, name="ptg2-screen-writer", daemon=True)
+        thread.start()
+        _SCREEN_WRITER_STARTED = True
+
+
+def _emit_screen_line(line: str, *, stderr: bool = False) -> None:
+    _ensure_screen_writer()
+    _SCREEN_QUEUE.put(("stderr" if stderr else "stdout", line))
+
 TEST_TOC_FILES = 2
 TEST_TOC_JOBS = 2
 TEST_PROVIDER_GROUPS = 50
@@ -120,6 +156,14 @@ PTG2_BILLING_BATCH_ROWS_ENV = "HLTHPRT_PTG2_BILLING_BATCH_ROWS"
 PTG2_RATE_BATCH_ROWS_ENV = "HLTHPRT_PTG2_RATE_BATCH_ROWS"
 PTG2_PRICE_BATCH_ROWS_ENV = "HLTHPRT_PTG2_PRICE_BATCH_ROWS"
 PTG2_PROGRESS_INTERVAL_SECONDS_ENV = "HLTHPRT_PTG2_PROGRESS_INTERVAL_SECONDS"
+PTG2_DOWNLOAD_PROGRESS_BYTES_ENV = "HLTHPRT_PTG2_DOWNLOAD_PROGRESS_BYTES"
+PTG2_DOWNLOAD_TASKS_ENV = "HLTHPRT_PTG2_DOWNLOAD_TASKS"
+PTG2_RANGE_DOWNLOADS_ENV = "HLTHPRT_PTG2_RANGE_DOWNLOADS"
+PTG2_RANGE_DOWNLOAD_TASKS_ENV = "HLTHPRT_PTG2_RANGE_DOWNLOAD_TASKS"
+PTG2_RANGE_DOWNLOAD_CHUNK_BYTES_ENV = "HLTHPRT_PTG2_RANGE_DOWNLOAD_CHUNK_BYTES"
+PTG2_RANGE_DOWNLOAD_MIN_BYTES_ENV = "HLTHPRT_PTG2_RANGE_DOWNLOAD_MIN_BYTES"
+PTG2_DOWNLOAD_RETRIES_ENV = "HLTHPRT_PTG2_DOWNLOAD_RETRIES"
+PTG2_DOWNLOAD_RETRY_DELAY_SECONDS_ENV = "HLTHPRT_PTG2_DOWNLOAD_RETRY_DELAY_SECONDS"
 PTG2_COMPACT_IMPORT_ENV = "HLTHPRT_PTG2_COMPACT_IMPORT"
 PTG2_COMPACT_BATCH_ROWS_ENV = "HLTHPRT_PTG2_COMPACT_BATCH_ROWS"
 PTG2_PROVIDER_SET_INLINE_NPI_LIMIT_ENV = "HLTHPRT_PTG2_PROVIDER_SET_INLINE_NPI_LIMIT"
@@ -142,6 +186,7 @@ PTG2_COMPACT_BULK_DROP_INDEXES_ENV = "HLTHPRT_PTG2_COMPACT_BULK_DROP_INDEXES"
 PTG2_SKIP_BULK_INDEX_ENSURE_ENV = "HLTHPRT_PTG2_SKIP_BULK_INDEX_ENSURE"
 PTG2_SKIP_COMPACT_FINALIZE_ENV = "HLTHPRT_PTG2_SKIP_COMPACT_FINALIZE"
 PTG2_SKIP_COMPACT_SERVING_INDEX_ENSURE_ENV = "HLTHPRT_PTG2_SKIP_COMPACT_SERVING_INDEX_ENSURE"
+PTG2_INDEX_TASKS_ENV = "HLTHPRT_PTG2_INDEX_TASKS"
 PTG2_FAST_FINAL_REBUILD_ENV = "HLTHPRT_PTG2_FAST_FINAL_REBUILD"
 PTG2_DEFER_PROVIDER_LOCATIONS_ENV = "HLTHPRT_PTG2_DEFER_PROVIDER_LOCATIONS"
 PTG2_STAGE_INDEXES_ENV = "HLTHPRT_PTG2_STAGE_INDEXES"
@@ -170,9 +215,29 @@ PTG2_WORKER_RESULT_FILES_ENV = "HLTHPRT_PTG2_WORKER_RESULT_FILES"
 PTG2_RUST_SCANNER_ENV = "HLTHPRT_PTG2_RUST_SCANNER"
 PTG2_RUST_SCANNER_BIN_ENV = "HLTHPRT_PTG2_RUST_SCANNER_BIN"
 PTG2_RUST_COMPACT_SERVING_ENV = "HLTHPRT_PTG2_RUST_COMPACT_SERVING"
-PTG2_RUST_SPLIT_IN_NETWORK_ENV = "HLTHPRT_PTG2_RUST_SPLIT_IN_NETWORK"
-PTG2_RUST_COPY_UNLOGGED_STAGE_ENV = "HLTHPRT_PTG2_RUST_COPY_UNLOGGED_STAGE"
 PTG2_HASH_MODE_ENV = "HLTHPRT_PTG2_HASH_MODE"
+PTG2_COMPACT_COPY_TASKS_ENV = "HLTHPRT_PTG2_COMPACT_COPY_TASKS"
+PTG2_COMPACT_COPY_KIND_TASKS_ENV = "HLTHPRT_PTG2_COMPACT_COPY_KIND_TASKS"
+PTG2_COMPACT_SERVING_COPY_TASKS_ENV = "HLTHPRT_PTG2_COMPACT_SERVING_COPY_TASKS"
+PTG2_RUST_WORKERS_ENV = "HLTHPRT_PTG2_RUST_WORKERS"
+PTG2_RUST_WORK_QUEUE_ENV = "HLTHPRT_PTG2_RUST_WORK_QUEUE"
+PTG2_RUST_SPLIT_NEGOTIATED_RATES_ENV = "HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES"
+PTG2_RUST_EVENT_QUEUE_ENV = "HLTHPRT_PTG2_RUST_EVENT_QUEUE"
+PTG2_PUBLISH_DEDUPE_BUCKETS_ENV = "HLTHPRT_PTG2_PUBLISH_DEDUPE_BUCKETS"
+
+PTG2_DEFAULT_COMPACT_COPY_TASKS = 4
+PTG2_DEFAULT_COMPACT_COPY_KIND_TASKS = 1
+PTG2_DEFAULT_COMPACT_SERVING_COPY_TASKS = 1
+PTG2_DEFAULT_RUST_WORKERS = 8
+PTG2_DEFAULT_RUST_WORK_QUEUE = 16
+PTG2_DEFAULT_RUST_EVENT_QUEUE = 32
+PTG2_DEFAULT_RUST_SPLIT_NEGOTIATED_RATES = 1024
+PTG2_DEFAULT_DOWNLOAD_TASKS = 4
+PTG2_DEFAULT_RANGE_DOWNLOAD_TASKS = 4
+PTG2_DEFAULT_RANGE_DOWNLOAD_CHUNK_BYTES = 128 * 1024 * 1024
+PTG2_DEFAULT_RANGE_DOWNLOAD_MIN_BYTES = 512 * 1024 * 1024
+PTG2_DEFAULT_PUBLISH_DEDUPE_BUCKETS = 256
+PTG2_DEFAULT_INDEX_TASKS = 4
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -195,14 +260,25 @@ def _env_int(name: str, default: int) -> int:
 def _use_stage_serving_as_final() -> bool:
     return _env_bool(
         PTG2_STAGE_SERVING_AS_FINAL_ENV,
-        _env_bool(PTG2_SERVING_ONLY_IMPORT_ENV, False),
+        _use_serving_only_import(),
     )
+
+
+def _use_serving_only_import() -> bool:
+    return _env_bool(PTG2_SERVING_ONLY_IMPORT_ENV, True)
 
 
 def _use_compact_serving_table() -> bool:
     return _env_bool(
         PTG2_COMPACT_SERVING_TABLE_ENV,
-        _env_bool(PTG2_SERVING_ONLY_IMPORT_ENV, False),
+        _use_serving_only_import(),
+    )
+
+
+def _use_rust_compact_serving() -> bool:
+    return _env_bool(
+        PTG2_RUST_COMPACT_SERVING_ENV,
+        _env_bool(PTG2_RUST_SCANNER_ENV, True),
     )
 
 
@@ -294,6 +370,8 @@ PTG2_MODEL_CLASSES = (
     PTG2ImportRun,
     PTG2Snapshot,
     PTG2CurrentSnapshot,
+    PTG2CurrentSourceSnapshot,
+    PTG2CurrentPlanSource,
     PTG2SourceCatalog,
     PTG2SourceIdentity,
     PTG2SourceFileVersion,
@@ -509,10 +587,96 @@ class PTG2FileProcessResult:
     success: bool
     file_id: int | None = None
     error: str | None = None
+    summary: dict[str, Any] | None = None
+    skipped: bool = False
+
+
+@dataclass(frozen=True)
+class PTG2DownloadedJob:
+    job: dict[str, Any]
+    raw_artifact: PTG2RawArtifact | None = None
+    logical_artifact: PTG2LogicalArtifact | None = None
+    error: str | None = None
 
 
 def _utcnow() -> datetime.datetime:
     return datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+
+
+def _download_progress_interval_bytes() -> int:
+    return max(_env_int(PTG2_DOWNLOAD_PROGRESS_BYTES_ENV, 64 * 1024 * 1024), 1024 * 1024)
+
+
+def _range_download_chunk_bytes() -> int:
+    return max(
+        _env_int(PTG2_RANGE_DOWNLOAD_CHUNK_BYTES_ENV, PTG2_DEFAULT_RANGE_DOWNLOAD_CHUNK_BYTES),
+        1024 * 1024,
+    )
+
+
+def _range_download_tasks() -> int:
+    return max(_env_int(PTG2_RANGE_DOWNLOAD_TASKS_ENV, PTG2_DEFAULT_RANGE_DOWNLOAD_TASKS), 1)
+
+
+def _range_download_min_bytes() -> int:
+    return max(
+        _env_int(PTG2_RANGE_DOWNLOAD_MIN_BYTES_ENV, PTG2_DEFAULT_RANGE_DOWNLOAD_MIN_BYTES),
+        1,
+    )
+
+
+def _download_retry_count() -> int:
+    return max(_env_int(PTG2_DOWNLOAD_RETRIES_ENV, 4), 0)
+
+
+def _download_retry_delay_seconds() -> float:
+    raw = os.getenv(PTG2_DOWNLOAD_RETRY_DELAY_SECONDS_ENV)
+    if raw is None:
+        return 2.0
+    try:
+        return max(float(str(raw).strip()), 0.0)
+    except ValueError:
+        return 2.0
+
+
+def _format_eta_seconds(seconds: float | None) -> str:
+    if seconds is None or seconds < 0 or not math.isfinite(seconds):
+        return "unknown"
+    return f"{seconds:.0f}"
+
+
+def _emit_download_progress(
+    *,
+    url: str,
+    bytes_read: int,
+    total_bytes: int | None,
+    started_at: float,
+    done: bool,
+) -> None:
+    elapsed = max(time.monotonic() - started_at, 0.0)
+    mib_s = (bytes_read / (1024 * 1024)) / elapsed if elapsed > 0 else 0.0
+    if total_bytes and total_bytes > 0:
+        percent = min((bytes_read / total_bytes) * 100, 100.0)
+        eta = ((total_bytes - bytes_read) / (1024 * 1024)) / mib_s if mib_s > 0 and total_bytes > bytes_read else 0.0
+        total_text = str(total_bytes)
+        eta_text = _format_eta_seconds(eta)
+    else:
+        percent = 0.0
+        total_text = "unknown"
+        eta_text = "unknown"
+    line = (
+        "PTG2_DOWNLOAD_PROGRESS"
+        f"\turl={url}"
+        f"\tbytes={bytes_read}"
+        f"\ttotal_bytes={total_text}"
+        f"\tpercent={percent:.2f}"
+        f"\tmib_s={mib_s:.2f}"
+        f"\telapsed_seconds={elapsed:.0f}"
+        f"\teta_seconds={eta_text}"
+        f"\tdone={'true' if done else 'false'}"
+    )
+    _emit_screen_line(line, stderr=True)
+    logger.info(line)
 
 
 def sha256_bytes(value: bytes) -> str:
@@ -1060,6 +1224,54 @@ def sha256_file(path: str | Path, chunk_size: int = 1024 * 1024) -> tuple[str, i
     return digest.hexdigest(), total
 
 
+def _hash_existing_file_into(path: str | Path, digest, chunk_size: int = 1024 * 1024) -> int:
+    total = 0
+    with open(path, "rb") as fp:
+        for chunk in iter(lambda: fp.read(chunk_size), b""):
+            digest.update(chunk)
+            total += len(chunk)
+    return total
+
+
+def _range_sidecar_path(partial_path: Path) -> Path:
+    return partial_path.with_name(f"{partial_path.name}.ranges.json")
+
+
+def _load_completed_ranges(sidecar_path: Path, *, total_bytes: int, etag: str | None) -> set[tuple[int, int]]:
+    if not sidecar_path.exists():
+        return set()
+    try:
+        payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    except Exception:
+        return set()
+    if int(payload.get("total_bytes") or 0) != total_bytes:
+        return set()
+    if (payload.get("etag") or None) != (etag or None):
+        return set()
+    completed = set()
+    for item in payload.get("completed") or []:
+        try:
+            start = int(item[0])
+            end = int(item[1])
+        except Exception:
+            continue
+        if 0 <= start <= end < total_bytes:
+            completed.add((start, end))
+    return completed
+
+
+def _write_completed_ranges(sidecar_path: Path, *, total_bytes: int, etag: str | None, completed: set[tuple[int, int]]) -> None:
+    payload = {
+        "total_bytes": total_bytes,
+        "etag": etag,
+        "completed": [[start, end] for start, end in sorted(completed)],
+        "updated_at": _utcnow().isoformat(),
+    }
+    tmp_path = sidecar_path.with_suffix(sidecar_path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    os.replace(tmp_path, sidecar_path)
+
+
 class PTG2ArtifactStore:
     def __init__(self, root: str | Path | None = None):
         self.root = Path(root) if root else resolve_ptg2_artifact_dir()
@@ -1070,6 +1282,13 @@ class PTG2ArtifactStore:
 
     def artifact_path(self, digest: str, kind: str = PTG2_ARTIFACT_RAW, suffix: str = "") -> Path:
         return content_addressed_path(self.root, digest, kind=kind, suffix=suffix)
+
+    def partial_path(self, canonical_url: str, suffix: str = "") -> Path:
+        digest = semantic_hash(canonical_url, domain="ptg2_partial_raw")
+        clean_suffix = suffix if suffix.startswith(".") or not suffix else f".{suffix}"
+        path = self.root / "partial-retained" / f"{digest}{clean_suffix}.partial"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
 
     def storage_uri(self, path: str | Path) -> str:
         return Path(path).resolve().as_uri()
@@ -1181,6 +1400,147 @@ async def fetch_head_metadata(url: str, timeout_seconds: int = 30) -> PTG2HeadMe
         return PTG2HeadMetadata(url=url, supports_head=False)
 
 
+async def _probe_http_range_support(url: str) -> tuple[bool, int | None, str | None, str | None]:
+    timeout = aiohttp.ClientTimeout(total=60, connect=30, sock_read=30)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, allow_redirects=True, headers={"Range": "bytes=0-0"}) as response:
+                if response.status != 206:
+                    return False, None, None, None
+                content_range = response.headers.get("Content-Range") or ""
+                match = re.match(r"bytes\s+0-0/(\d+)$", content_range.strip())
+                if not match:
+                    return False, None, None, None
+                await response.content.read()
+                return True, int(match.group(1)), response.headers.get("ETag"), str(response.url)
+    except Exception:
+        return False, None, None, None
+
+
+async def _download_raw_artifact_ranges(
+    *,
+    url: str,
+    partial_path: Path,
+    total_bytes: int,
+    etag: str | None,
+    max_bytes: int | None,
+    started_at: float,
+) -> bool:
+    if max_bytes is not None and total_bytes > max_bytes:
+        raise RuntimeError(f"PTG2 max-bytes guard exceeded for {url}")
+    chunk_size = _range_download_chunk_bytes()
+    ranges = [
+        (start, min(start + chunk_size - 1, total_bytes - 1))
+        for start in range(0, total_bytes, chunk_size)
+    ]
+    sidecar_path = _range_sidecar_path(partial_path)
+    completed = _load_completed_ranges(sidecar_path, total_bytes=total_bytes, etag=etag)
+    if partial_path.exists() and partial_path.stat().st_size > total_bytes:
+        partial_path.unlink(missing_ok=True)
+        sidecar_path.unlink(missing_ok=True)
+        completed = set()
+    partial_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(partial_path, "ab") as fp:
+        fp.truncate(total_bytes)
+    completed_bytes = sum(end - start + 1 for start, end in completed)
+    next_progress_bytes = _download_progress_interval_bytes()
+    while completed_bytes >= next_progress_bytes:
+        next_progress_bytes += _download_progress_interval_bytes()
+    lock = asyncio.Lock()
+    timeout = aiohttp.ClientTimeout(total=None, connect=60, sock_read=600)
+    pending_ranges = [item for item in ranges if item not in completed]
+
+    async def fetch_range(session: aiohttp.ClientSession, item: tuple[int, int]) -> None:
+        nonlocal completed_bytes, next_progress_bytes
+        start, end = item
+        headers = {"Range": f"bytes={start}-{end}"}
+        if etag:
+            headers["If-Match"] = etag
+        expected_length = end - start + 1
+        received = 0
+        counted = 0
+        completed_ok = False
+        try:
+            async with session.get(url, allow_redirects=True, headers=headers) as response:
+                if response.status != 206:
+                    raise RuntimeError(f"Range download not supported for {url}: status {response.status}")
+                offset = start
+                fd = os.open(partial_path, os.O_WRONLY)
+                try:
+                    async for chunk in response.content.iter_chunked(1024 * 1024):
+                        if not chunk:
+                            continue
+                        os.pwrite(fd, chunk, offset)
+                        offset += len(chunk)
+                        received += len(chunk)
+                        async with lock:
+                            completed_bytes += len(chunk)
+                            counted += len(chunk)
+                            if completed_bytes >= next_progress_bytes:
+                                _emit_download_progress(
+                                    url=url,
+                                    bytes_read=min(completed_bytes, total_bytes),
+                                    total_bytes=total_bytes,
+                                    started_at=started_at,
+                                    done=False,
+                                )
+                                interval = _download_progress_interval_bytes()
+                                while completed_bytes >= next_progress_bytes:
+                                    next_progress_bytes += interval
+                finally:
+                    os.close(fd)
+                if received != expected_length:
+                    raise RuntimeError(
+                        f"Range download for {url} returned {received} bytes, expected {expected_length}"
+                    )
+                completed_ok = True
+                async with lock:
+                    completed.add(item)
+                    _write_completed_ranges(sidecar_path, total_bytes=total_bytes, etag=etag, completed=completed)
+        finally:
+            if not completed_ok and counted:
+                async with lock:
+                    completed_bytes = max(0, completed_bytes - counted)
+                    while next_progress_bytes > _download_progress_interval_bytes() and (
+                        completed_bytes < next_progress_bytes - _download_progress_interval_bytes()
+                    ):
+                        next_progress_bytes -= _download_progress_interval_bytes()
+
+    semaphore = asyncio.Semaphore(_range_download_tasks())
+
+    async def bounded_fetch(session: aiohttp.ClientSession, item: tuple[int, int]) -> None:
+        async with semaphore:
+            retries = _download_retry_count()
+            for attempt in range(retries + 1):
+                try:
+                    await fetch_range(session, item)
+                    return
+                except Exception as exc:
+                    if attempt >= retries:
+                        raise
+                    delay = _download_retry_delay_seconds() * (2 ** attempt)
+                    message = (
+                        f"PTG2_DOWNLOAD_RETRY url={url} range={item[0]}-{item[1]} "
+                        f"attempt={attempt + 1} next_attempt={attempt + 2} delay_seconds={delay:.2f} error={exc}"
+                    )
+                    _emit_screen_line(message, stderr=True)
+                    logger.debug(message)
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        await asyncio.gather(*(bounded_fetch(session, item) for item in pending_ranges))
+    sidecar_path.unlink(missing_ok=True)
+    _emit_download_progress(
+        url=url,
+        bytes_read=total_bytes,
+        total_bytes=total_bytes,
+        started_at=started_at,
+        done=False,
+    )
+    return True
+
+
 async def download_raw_artifact(
     url: str,
     store: PTG2ArtifactStore | None = None,
@@ -1192,6 +1552,9 @@ async def download_raw_artifact(
     keep_partials = _env_bool(PTG2_KEEP_PARTIAL_ENV, True) if keep_partial_artifacts is None else keep_partial_artifacts
     canonical_url = canonicalize_url(url)
     head = await fetch_head_metadata(url)
+    progress_started_at = time.monotonic()
+    progress_interval_bytes = _download_progress_interval_bytes()
+    next_progress_bytes = progress_interval_bytes
     if reuse_raw_artifacts:
         candidate, mode = choose_reusable_raw_artifact(store.find_candidates(canonical_url), head, store=store)
         if candidate is not None and mode is not None:
@@ -1211,6 +1574,13 @@ async def download_raw_artifact(
                     }
                 )
             else:
+                _emit_download_progress(
+                    url=url,
+                    bytes_read=byte_count,
+                    total_bytes=head.content_length if head and head.content_length else byte_count,
+                    started_at=progress_started_at,
+                    done=True,
+                )
                 return PTG2RawArtifact(
                     original_url=url,
                     canonical_url=canonical_url,
@@ -1224,12 +1594,21 @@ async def download_raw_artifact(
                     reused_from_source_file_version_id=candidate.get("source_file_version_id"),
                 )
 
-    tmp_path = store.tmp_dir / f"ptg2-{os.getpid()}-{datetime.datetime.utcnow().timestamp()}.part"
+    partial_path = store.partial_path(canonical_url, suffix=_safe_url_suffix(url))
+    tmp_path = partial_path if keep_partials else store.tmp_dir / f"ptg2-{os.getpid()}-{datetime.datetime.utcnow().timestamp()}.part"
     digest = hashlib.sha256()
     byte_count = 0
+    _emit_download_progress(
+        url=url,
+        bytes_read=0,
+        total_bytes=head.content_length if head and head.content_length else None,
+        started_at=progress_started_at,
+        done=False,
+    )
     try:
         if str(url).startswith("file://") or (not str(url).lower().startswith(("http://", "https://")) and Path(url).exists()):
             source_path = Path(urlsplit(url).path if str(url).startswith("file://") else url)
+            total_bytes = source_path.stat().st_size if source_path.exists() else None
             with open(source_path, "rb") as src, open(tmp_path, "wb") as dst:
                 for chunk in iter(lambda: src.read(1024 * 1024), b""):
                     byte_count += len(chunk)
@@ -1237,18 +1616,110 @@ async def download_raw_artifact(
                         raise RuntimeError(f"PTG2 max-bytes guard exceeded for {url}")
                     digest.update(chunk)
                     dst.write(chunk)
+                    if byte_count >= next_progress_bytes:
+                        _emit_download_progress(
+                            url=url,
+                            bytes_read=byte_count,
+                            total_bytes=total_bytes,
+                            started_at=progress_started_at,
+                            done=False,
+                        )
+                        while byte_count >= next_progress_bytes:
+                            next_progress_bytes += progress_interval_bytes
         else:
             timeout = aiohttp.ClientTimeout(total=None, connect=60, sock_read=600)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url, allow_redirects=True) as response:
-                    response.raise_for_status()
-                    with open(tmp_path, "wb") as dst:
-                        async for chunk in response.content.iter_chunked(1024 * 1024):
-                            byte_count += len(chunk)
-                            if max_bytes is not None and byte_count > max_bytes:
-                                raise RuntimeError(f"PTG2 max-bytes guard exceeded for {url}")
-                            digest.update(chunk)
-                            dst.write(chunk)
+            used_range_download = False
+            range_total = head.content_length if head and head.content_length else None
+            if (
+                _env_bool(PTG2_RANGE_DOWNLOADS_ENV, True)
+                and range_total
+                and range_total >= _range_download_min_bytes()
+            ):
+                range_supported, probed_total, probed_etag, _range_url = await _probe_http_range_support(url)
+                if range_supported and probed_total:
+                    await _download_raw_artifact_ranges(
+                        url=url,
+                        partial_path=partial_path,
+                        total_bytes=probed_total,
+                        etag=probed_etag or (head.etag if head else None),
+                        max_bytes=max_bytes,
+                        started_at=progress_started_at,
+                    )
+                    byte_count = _hash_existing_file_into(partial_path, digest)
+                    used_range_download = True
+            if not used_range_download:
+                resume_from = partial_path.stat().st_size if partial_path.exists() else 0
+                if head.content_length and resume_from == head.content_length:
+                    byte_count = _hash_existing_file_into(partial_path, digest)
+                elif head.content_length and resume_from > head.content_length:
+                    partial_path.unlink(missing_ok=True)
+                    resume_from = 0
+                if byte_count == 0 and resume_from > 0:
+                    byte_count = _hash_existing_file_into(partial_path, digest)
+                    while byte_count >= next_progress_bytes:
+                        next_progress_bytes += progress_interval_bytes
+            if not used_range_download and not (head.content_length and byte_count == head.content_length):
+                retries = _download_retry_count()
+                attempt = 0
+                while not (head.content_length and byte_count == head.content_length):
+                    try:
+                        async with aiohttp.ClientSession(timeout=timeout) as session:
+                            resume_from = partial_path.stat().st_size if partial_path.exists() else 0
+                            if resume_from != byte_count:
+                                digest = hashlib.sha256()
+                                byte_count = _hash_existing_file_into(partial_path, digest) if resume_from > 0 else 0
+                            headers = {"Range": f"bytes={resume_from}-"} if resume_from > 0 and byte_count == resume_from else None
+                            async with session.get(url, allow_redirects=True, headers=headers) as response:
+                                response.raise_for_status()
+                                length = response.headers.get("Content-Length")
+                                if resume_from > 0 and response.status != 206:
+                                    digest = hashlib.sha256()
+                                    byte_count = 0
+                                    resume_from = 0
+                                    while next_progress_bytes > progress_interval_bytes:
+                                        next_progress_bytes -= progress_interval_bytes
+                                response_total = (
+                                    head.content_length
+                                    if head and head.content_length
+                                    else (resume_from + int(length) if length and length.isdigit() else None)
+                                )
+                                mode = "ab" if resume_from > 0 and response.status == 206 else "wb"
+                                with open(tmp_path, mode) as dst:
+                                    async for chunk in response.content.iter_chunked(1024 * 1024):
+                                        byte_count += len(chunk)
+                                        if max_bytes is not None and byte_count > max_bytes:
+                                            raise RuntimeError(f"PTG2 max-bytes guard exceeded for {url}")
+                                        digest.update(chunk)
+                                        dst.write(chunk)
+                                        if byte_count >= next_progress_bytes:
+                                            _emit_download_progress(
+                                                url=url,
+                                                bytes_read=byte_count,
+                                                total_bytes=response_total,
+                                                started_at=progress_started_at,
+                                                done=False,
+                                            )
+                                            while byte_count >= next_progress_bytes:
+                                                next_progress_bytes += progress_interval_bytes
+                        if head.content_length and byte_count != head.content_length:
+                            raise RuntimeError(
+                                f"Download for {url} ended at {byte_count} bytes, expected {head.content_length}"
+                            )
+                        break
+                    except Exception as exc:
+                        if attempt >= retries:
+                            raise
+                        delay = _download_retry_delay_seconds() * (2 ** attempt)
+                        message = (
+                            f"PTG2_DOWNLOAD_RETRY url={url} bytes={byte_count} "
+                            f"attempt={attempt + 1} next_attempt={attempt + 2} "
+                            f"delay_seconds={delay:.2f} error={exc}"
+                        )
+                        _emit_screen_line(message, stderr=True)
+                        logger.debug(message)
+                        attempt += 1
+                        if delay > 0:
+                            await asyncio.sleep(delay)
         raw_sha = digest.hexdigest()
         final_path = store.artifact_path(raw_sha, kind=PTG2_ARTIFACT_RAW, suffix=_safe_url_suffix(url))
         final_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1259,6 +1730,13 @@ async def download_raw_artifact(
         actual_sha, actual_size = sha256_file(final_path)
         if actual_sha != raw_sha:
             raise RuntimeError(f"Checksum verification failed for {final_path}")
+        _emit_download_progress(
+            url=url,
+            bytes_read=actual_size,
+            total_bytes=head.content_length if head and head.content_length else actual_size,
+            started_at=progress_started_at,
+            done=True,
+        )
         raw_uri = store.storage_uri(final_path)
         manifest_payload = {
             "artifact_kind": PTG2_ARTIFACT_RAW,
@@ -1287,11 +1765,7 @@ async def download_raw_artifact(
         )
     except BaseException as exc:
         if tmp_path.exists() and keep_partials:
-            partial_dir = store.root / "partial-retained"
-            partial_dir.mkdir(parents=True, exist_ok=True)
-            partial_path = partial_dir / f"{tmp_path.name}.partial"
             try:
-                os.replace(tmp_path, partial_path)
                 store.record_manifest(
                     {
                         "artifact_kind": "partial_raw",
@@ -1454,6 +1928,93 @@ async def materialize_json_source(
     return raw_artifact, logical_artifact
 
 
+async def _download_ptg_job_artifact(
+    job: dict[str, Any],
+    *,
+    reuse_raw_artifacts: bool,
+    max_bytes: int | None,
+    keep_partial_artifacts: bool | None,
+) -> PTG2DownloadedJob:
+    try:
+        with tempfile.TemporaryDirectory(dir=ptg2_temp_parent()) as tmpdir:
+            raw_artifact, logical_artifact = await materialize_json_source(
+                job["url"],
+                tmpdir,
+                reuse_raw_artifacts=reuse_raw_artifacts,
+                max_bytes=max_bytes,
+                materialize_logical=False,
+                keep_partial_artifacts=keep_partial_artifacts,
+            )
+        return PTG2DownloadedJob(job=job, raw_artifact=raw_artifact, logical_artifact=logical_artifact)
+    except Exception as exc:
+        return PTG2DownloadedJob(job=job, error=str(exc))
+
+
+def _download_ptg_job_artifact_sync(
+    job: dict[str, Any],
+    *,
+    reuse_raw_artifacts: bool,
+    max_bytes: int | None,
+    keep_partial_artifacts: bool | None,
+) -> PTG2DownloadedJob:
+    return asyncio.run(
+        _download_ptg_job_artifact(
+            job,
+            reuse_raw_artifacts=reuse_raw_artifacts,
+            max_bytes=max_bytes,
+            keep_partial_artifacts=keep_partial_artifacts,
+        )
+    )
+
+
+async def _iter_downloaded_ptg_jobs(
+    jobs: list[dict[str, Any]],
+    *,
+    reuse_raw_artifacts: bool,
+    max_bytes: int | None,
+    keep_partial_artifacts: bool | None,
+):
+    download_tasks = max(_env_int(PTG2_DOWNLOAD_TASKS_ENV, PTG2_DEFAULT_DOWNLOAD_TASKS), 1)
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=download_tasks,
+        thread_name_prefix="ptg2-download",
+    )
+    pending: set[asyncio.Future[PTG2DownloadedJob]] = set()
+    job_iter = iter(jobs)
+
+    def schedule_more() -> None:
+        while len(pending) < download_tasks:
+            try:
+                job = next(job_iter)
+            except StopIteration:
+                return
+            pending.add(
+                asyncio.wrap_future(
+                    executor.submit(
+                        _download_ptg_job_artifact_sync,
+                        job,
+                        reuse_raw_artifacts=reuse_raw_artifacts,
+                        max_bytes=max_bytes,
+                        keep_partial_artifacts=keep_partial_artifacts,
+                    )
+                )
+            )
+
+    schedule_more()
+    try:
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            schedule_more()
+            for task in done:
+                yield task.result()
+    finally:
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
 def _quote_ident(value: str) -> str:
     return '"' + str(value).replace('"', '""') + '"'
 
@@ -1467,6 +2028,10 @@ def _ptg2_conflict_targets(cls) -> list[str]:
     if hasattr(cls, "__my_index_elements__") and cls.__my_index_elements__:
         return [str(element) for element in cls.__my_index_elements__]
     return [key.name for key in cls.__table__.primary_key]
+
+
+def _primary_key_column_names(obj) -> list[str]:
+    return [str(key.name) for key in obj.__table__.primary_key]
 
 
 def _ptg2_json_columns(cls) -> set[str]:
@@ -1770,12 +2335,6 @@ async def _copy_compact_serving_rate_file(copy_path: Path, *, target_table: str 
     await _copy_compact_serving_rate_source(copy_path.open("rb"), target_table=target_table)
 
 
-async def _copy_compact_serving_rate_bytes(payload: bytes, *, target_table: str = "ptg2_serving_rate_compact") -> None:
-    if not payload:
-        return
-    await _copy_compact_serving_rate_source(io.BytesIO(payload), target_table=target_table)
-
-
 async def _copy_compact_serving_rate_source(source, *, target_table: str = "ptg2_serving_rate_compact") -> None:
     schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     columns = [
@@ -2006,38 +2565,93 @@ _RUST_COPY_TABLE_SPECS = {
 }
 
 
+PTG2_SERVING_STAGE_LANE_PREFIX = "serving_rate_compact_lane_"
+
+
 def _rust_copy_stage_table_name(kind: str, token: str) -> str:
     safe_kind = re.sub(r"[^a-z0-9_]+", "_", kind.lower()).strip("_")
     safe_token = re.sub(r"[^a-z0-9_]+", "_", token.lower()).strip("_")
     return f"ptg2_rust_stage_{safe_kind}_{safe_token}"[:63]
 
 
-async def _create_rust_copy_stage_tables(token: str) -> dict[str, str]:
+def _serving_stage_lane_key(lane: int) -> str:
+    return f"{PTG2_SERVING_STAGE_LANE_PREFIX}{lane:04d}"
+
+
+def _serving_stage_tables(stage_tables: dict[str, str]) -> list[str]:
+    tables: list[str] = []
+    base_table = stage_tables.get("serving_rate_compact")
+    if base_table:
+        tables.append(base_table)
+    for key in sorted(stage_tables):
+        if key.startswith(PTG2_SERVING_STAGE_LANE_PREFIX):
+            table = stage_tables.get(key)
+            if table:
+                tables.append(table)
+    return tables
+
+
+def _serving_stage_table_for_copy(stage_tables: dict[str, str], copy_file: Path) -> str:
+    match = re.search(r"\.worker(\d+)(?:\.|$)", copy_file.name)
+    if match:
+        lane_table = stage_tables.get(_serving_stage_lane_key(int(match.group(1))))
+        if lane_table:
+            return lane_table
+    return stage_tables.get("serving_rate_compact", "ptg2_serving_rate_compact")
+
+
+async def _create_one_rust_copy_stage_table(
+    *,
+    schema_name: str,
+    storage_mode: str,
+    stage_table: str,
+    target_table: str,
+) -> None:
+    await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(stage_table)};")
+    await db.status(
+        f"""
+        CREATE {storage_mode}TABLE {_quote_ident(schema_name)}.{_quote_ident(stage_table)}
+        (LIKE {_quote_ident(schema_name)}.{_quote_ident(target_table)} INCLUDING DEFAULTS);
+        """
+    )
+    if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True):
+        try:
+            await db.status(f"ALTER TABLE {_quote_ident(schema_name)}.{_quote_ident(stage_table)} SET UNLOGGED;")
+        except Exception as exc:
+            logger.debug("Skipping PTG2 Rust stage unlogged ensure for %s: %s", stage_table, exc)
+    try:
+        await db.status(
+            f"ALTER TABLE {_quote_ident(schema_name)}.{_quote_ident(stage_table)} "
+            "SET (autovacuum_enabled = false, toast.autovacuum_enabled = false);"
+        )
+    except Exception as exc:
+        logger.debug("Skipping PTG2 Rust stage autovacuum disable for %s: %s", stage_table, exc)
+
+
+async def _create_rust_copy_stage_tables(token: str, *, serving_lanes: int = 1) -> dict[str, str]:
     schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
     stage_tables: dict[str, str] = {}
     for kind, (target_table, _columns, _conflict_targets) in _RUST_COPY_TABLE_SPECS.items():
         stage_table = _rust_copy_stage_table_name(kind, token)
         stage_tables[kind] = stage_table
-        await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(stage_table)};")
-        await db.status(
-            f"""
-            CREATE {storage_mode}TABLE {_quote_ident(schema_name)}.{_quote_ident(stage_table)}
-            (LIKE {_quote_ident(schema_name)}.{_quote_ident(target_table)} INCLUDING DEFAULTS);
-            """
+        await _create_one_rust_copy_stage_table(
+            schema_name=schema_name,
+            storage_mode=storage_mode,
+            stage_table=stage_table,
+            target_table=target_table,
         )
-        if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True):
-            try:
-                await db.status(f"ALTER TABLE {_quote_ident(schema_name)}.{_quote_ident(stage_table)} SET UNLOGGED;")
-            except Exception as exc:
-                logger.debug("Skipping PTG2 Rust stage unlogged ensure for %s: %s", stage_table, exc)
-        try:
-            await db.status(
-                f"ALTER TABLE {_quote_ident(schema_name)}.{_quote_ident(stage_table)} "
-                "SET (autovacuum_enabled = false, toast.autovacuum_enabled = false);"
-            )
-        except Exception as exc:
-            logger.debug("Skipping PTG2 Rust stage autovacuum disable for %s: %s", stage_table, exc)
+        if kind == "serving_rate_compact":
+            for lane in range(1, max(serving_lanes, 1)):
+                lane_key = _serving_stage_lane_key(lane)
+                lane_table = _rust_copy_stage_table_name(f"serving_rate_compact_w{lane:04d}", token)
+                stage_tables[lane_key] = lane_table
+                await _create_one_rust_copy_stage_table(
+                    schema_name=schema_name,
+                    storage_mode=storage_mode,
+                    stage_table=lane_table,
+                    target_table=target_table,
+                )
     return stage_tables
 
 
@@ -2046,11 +2660,16 @@ async def _merge_rust_copy_stage_tables(stage_tables: dict[str, str], *, drop: b
     merge_order = ("procedure", "price_set", "provider_group_member", "provider_set", "serving_rate_compact")
     fast_rebuild = _env_bool(PTG2_FAST_FINAL_REBUILD_ENV, False)
     for kind in merge_order:
-        stage_table = stage_tables.get(kind)
-        if not stage_table:
+        stage_table_names = (
+            _serving_stage_tables(stage_tables)
+            if kind == "serving_rate_compact"
+            else [stage_tables[kind]] if stage_tables.get(kind) else []
+        )
+        if not stage_table_names:
             continue
         target_table, columns, conflict_targets = _RUST_COPY_TABLE_SPECS[kind]
-        if fast_rebuild and kind != "procedure":
+        if fast_rebuild and kind != "procedure" and len(stage_table_names) == 1:
+            stage_table = stage_table_names[0]
             await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(target_table)};")
             await db.status(
                 f"""
@@ -2066,25 +2685,717 @@ async def _merge_rust_copy_stage_tables(stage_tables: dict[str, str], *, drop: b
             kind == "serving_rate_compact" and _env_bool(PTG2_COMPACT_BULK_DROP_INDEXES_ENV, True)
         ):
             conflict_sql = f"ON CONFLICT ({quoted_conflict}) DO NOTHING"
+        for stage_table in stage_table_names:
+            await db.status(
+                f"""
+                INSERT INTO {_quote_ident(schema_name)}.{_quote_ident(target_table)} ({quoted_columns})
+                SELECT {quoted_columns}
+                FROM {_quote_ident(schema_name)}.{_quote_ident(stage_table)}
+                {conflict_sql};
+                """
+            )
+            if drop:
+                await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(stage_table)};")
+
+
+async def _table_exists(schema_name: str, table_name: str) -> bool:
+    rows = await db.all(
+        """
+        SELECT EXISTS (
+            SELECT 1
+              FROM information_schema.tables
+             WHERE table_schema = :schema_name
+               AND table_name = :table_name
+        ) AS table_exists
+        """,
+        schema_name=schema_name,
+        table_name=table_name,
+    )
+    if not rows:
+        return False
+    row = rows[0]
+    return bool(row.get("table_exists") if isinstance(row, dict) else getattr(row, "table_exists", False))
+
+
+async def _table_has_rows(schema_name: str, table_name: str) -> bool:
+    rows = await db.all(
+        f"""
+        SELECT EXISTS (
+            SELECT 1
+              FROM {_quote_ident(schema_name)}.{_quote_ident(table_name)}
+             LIMIT 1
+        ) AS has_rows
+        """
+    )
+    if not rows:
+        return False
+    row = rows[0]
+    return bool(row.get("has_rows") if isinstance(row, dict) else getattr(row, "has_rows", False))
+
+
+async def _estimated_table_rows(schema_name: str, table_name: str) -> int:
+    rows = await db.all(
+        """
+        SELECT GREATEST(c.reltuples, 0)::bigint AS row_estimate
+          FROM pg_class c
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = :schema_name
+           AND c.relname = :table_name
+         LIMIT 1
+        """,
+        schema_name=schema_name,
+        table_name=table_name,
+    )
+    if not rows:
+        return 0
+    row = rows[0]
+    return int(row.get("row_estimate") if isinstance(row, dict) else getattr(row, "row_estimate", 0) or 0)
+
+
+async def _exact_table_rows(schema_name: str, table_name: str) -> int:
+    return int(
+        await db.scalar(
+            f"SELECT COUNT(*) FROM {_quote_ident(schema_name)}.{_quote_ident(table_name)}"
+        )
+        or 0
+    )
+
+
+_PTG2_COMPACT_MODEL_BY_KIND = {
+    "serving_rate_compact": PTG2ServingRateCompact,
+    "procedure": PTG2Procedure,
+    "price_set": PTG2PriceSet,
+    "provider_set": PTG2ProviderSet,
+    "provider_group_member": PTG2ProviderGroupMember,
+}
+
+
+def _ptg2_model_snapshot_index_role(model: type, index_name: str) -> str:
+    table_prefix = f"{getattr(model, '__tablename__', '')}_"
+    if index_name.startswith(table_prefix):
+        return index_name[len(table_prefix):]
+    return index_name
+
+
+def _ptg2_index_timestamp() -> str:
+    return datetime.datetime.now().isoformat(timespec="seconds")
+
+
+def _ptg2_model_index_statements_for_table(model: type, schema_name: str, table_name: str) -> list[tuple[str, str]]:
+    statements: list[tuple[str, str]] = []
+    primary_elements = tuple(str(element) for element in (getattr(model, "__my_index_elements__", None) or ()))
+    if primary_elements:
+        primary_name = getattr(model, "__primary_index_name__", None) or f"{model.__tablename__}_idx_primary"
+        role = _ptg2_model_snapshot_index_role(model, primary_name)
+        statements.append((
+            role,
+            f"CREATE UNIQUE INDEX IF NOT EXISTS {_quote_ident(_ptg2_snapshot_index_name(table_name, role))} "
+            f"ON {_quote_ident(schema_name)}.{_quote_ident(table_name)} ({', '.join(primary_elements)});",
+        ))
+    for index in getattr(model, "__my_additional_indexes__", []) or ():
+        elements = tuple(str(element) for element in (index.get("index_elements") or ()))
+        if not elements:
+            continue
+        name = index.get("name") or f"{model.__tablename__}_{'_'.join(elements)}_idx"
+        role = _ptg2_model_snapshot_index_role(model, str(name))
+        using = index.get("using")
+        where = index.get("where")
+        include_elements = tuple(str(element) for element in (index.get("include") or ()))
+        statement = (
+            f"CREATE INDEX IF NOT EXISTS {_quote_ident(_ptg2_snapshot_index_name(table_name, role))} "
+            f"ON {_quote_ident(schema_name)}.{_quote_ident(table_name)}"
+        )
+        if using:
+            statement += f" USING {using}"
+        statement += f" ({', '.join(elements)})"
+        if include_elements:
+            statement += f" INCLUDE ({', '.join(include_elements)})"
+        if where:
+            statement += f" WHERE {where}"
+        statement += ";"
+        statements.append((role, statement))
+    return statements
+
+
+async def _run_ptg2_index_statement(
+    *,
+    schema_name: str,
+    table_name: str,
+    role: str,
+    statement: str,
+    semaphore: asyncio.Semaphore,
+) -> None:
+    async with semaphore:
+        label = f"{schema_name}.{table_name}.{role}"
+        started_at = time.monotonic()
+        start_message = f"PTG2_INDEX_START time={_ptg2_index_timestamp()} index={label}"
+        _emit_screen_line(start_message)
+        logger.info(start_message)
+        try:
+            await db.status(statement)
+        except Exception as exc:
+            elapsed = time.monotonic() - started_at
+            fail_message = (
+                f"PTG2_INDEX_FAILED time={_ptg2_index_timestamp()} index={label} "
+                f"elapsed_seconds={elapsed:.2f} error={exc}"
+            )
+            _emit_screen_line(fail_message, stderr=True)
+            logger.exception(fail_message)
+            raise
+        elapsed = time.monotonic() - started_at
+        done_message = f"PTG2_INDEX_DONE time={_ptg2_index_timestamp()} index={label} elapsed_seconds={elapsed:.2f}"
+        _emit_screen_line(done_message)
+        logger.info(done_message)
+
+
+async def _index_snapshot_compact_table_entries(schema_name: str, table_entries: list[tuple[str, str]]) -> float:
+    index_specs: list[tuple[str, str, str]] = []
+    for kind, table_name in table_entries:
+        model = _PTG2_COMPACT_MODEL_BY_KIND.get(kind)
+        if model is None or not table_name:
+            continue
+        for role, statement in _ptg2_model_index_statements_for_table(model, schema_name, table_name):
+            index_specs.append((table_name, role, statement))
+    if not index_specs:
+        return 0.0
+    task_count = max(1, _env_int(PTG2_INDEX_TASKS_ENV, PTG2_DEFAULT_INDEX_TASKS))
+    task_count = min(task_count, len(index_specs))
+    batch_message = (
+        f"PTG2_INDEX_BATCH_START time={_ptg2_index_timestamp()} "
+        f"schema={schema_name} indexes={len(index_specs)} tasks={task_count}"
+    )
+    _emit_screen_line(batch_message)
+    logger.info(batch_message)
+    started_at = time.monotonic()
+    semaphore = asyncio.Semaphore(task_count)
+    await asyncio.gather(
+        *(
+            _run_ptg2_index_statement(
+                schema_name=schema_name,
+                table_name=table_name,
+                role=role,
+                statement=statement,
+                semaphore=semaphore,
+            )
+            for table_name, role, statement in index_specs
+        )
+    )
+    elapsed = time.monotonic() - started_at
+    done_message = (
+        f"PTG2_INDEX_BATCH_DONE time={_ptg2_index_timestamp()} "
+        f"schema={schema_name} indexes={len(index_specs)} tasks={task_count} elapsed_seconds={elapsed:.2f}"
+    )
+    _emit_screen_line(done_message)
+    logger.info(done_message)
+    return elapsed
+
+
+async def _index_snapshot_compact_tables(schema_name: str, table_names: dict[str, str]) -> float:
+    return await _index_snapshot_compact_table_entries(schema_name, list(table_names.items()))
+
+
+def _ptg2_publish_timestamp() -> str:
+    return datetime.datetime.now().isoformat(timespec="seconds")
+
+
+def _ptg2_hash_prefix_buckets(count: int) -> list[str]:
+    count = 16 if count <= 16 else 256
+    width = 2 if count > 16 else 1
+    return [format(index, f"0{width}x") for index in range(count)]
+
+
+def _ptg2_hash_prefix_bucket_end(bucket: str) -> str:
+    next_value = int(bucket, 16) + 1
+    max_value = 16 ** len(bucket)
+    if next_value >= max_value:
+        return "g"
+    return format(next_value, f"0{len(bucket)}x")
+
+
+async def _publish_deduped_rust_dictionary_table(
+    *,
+    schema_name: str,
+    kind: str,
+    stage_table: str,
+    final_table: str,
+) -> float:
+    _target_table, columns, conflict_targets = _RUST_COPY_TABLE_SPECS[kind]
+    quoted_columns = ", ".join(_quote_ident(column) for column in columns)
+    quoted_conflict = ", ".join(_quote_ident(column) for column in conflict_targets)
+    storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
+    start_message = (
+        f"PTG2_PUBLISH_TABLE_START time={_ptg2_publish_timestamp()} "
+        f"kind={kind} stage={schema_name}.{stage_table} final={schema_name}.{final_table}"
+    )
+    _emit_screen_line(start_message)
+    logger.info(start_message)
+    started_at = time.monotonic()
+    await db.status(
+        f"""
+        CREATE {storage_mode}TABLE {_quote_ident(schema_name)}.{_quote_ident(final_table)}
+        (LIKE {_quote_ident(schema_name)}.{_quote_ident(_target_table)} INCLUDING DEFAULTS);
+        """
+    )
+    if "hash_prefix" in columns:
+        bucket_count = max(
+            1,
+            _env_int(PTG2_PUBLISH_DEDUPE_BUCKETS_ENV, PTG2_DEFAULT_PUBLISH_DEDUPE_BUCKETS),
+        )
+        bucket_column = conflict_targets[0] if len(conflict_targets) == 1 else "hash_prefix"
+        stage_index_name = _ptg2_snapshot_index_name(stage_table, f"publish_{bucket_column}_idx")
+        index_started = time.monotonic()
+        index_start_message = (
+            f"PTG2_PUBLISH_STAGE_INDEX_START time={_ptg2_publish_timestamp()} "
+            f"kind={kind} stage={schema_name}.{stage_table} column={bucket_column} index={stage_index_name}"
+        )
+        _emit_screen_line(index_start_message)
+        logger.info(index_start_message)
         await db.status(
             f"""
-            INSERT INTO {_quote_ident(schema_name)}.{_quote_ident(target_table)} ({quoted_columns})
-            SELECT {quoted_columns}
-            FROM {_quote_ident(schema_name)}.{_quote_ident(stage_table)}
-            {conflict_sql};
+            CREATE INDEX IF NOT EXISTS {_quote_ident(stage_index_name)}
+            ON {_quote_ident(schema_name)}.{_quote_ident(stage_table)} ({_quote_ident(bucket_column)});
             """
         )
-        if drop:
-            await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(stage_table)};")
+        await db.status(f"ANALYZE {_quote_ident(schema_name)}.{_quote_ident(stage_table)};")
+        index_done_message = (
+            f"PTG2_PUBLISH_STAGE_INDEX_DONE time={_ptg2_publish_timestamp()} "
+            f"kind={kind} stage={schema_name}.{stage_table} column={bucket_column} "
+            f"elapsed_seconds={time.monotonic() - index_started:.2f}"
+        )
+        _emit_screen_line(index_done_message)
+        logger.info(index_done_message)
+        buckets = _ptg2_hash_prefix_buckets(bucket_count)
+        for bucket in buckets:
+            bucket_started = time.monotonic()
+            bucket_message = (
+                f"PTG2_PUBLISH_DEDUPE_BUCKET_START time={_ptg2_publish_timestamp()} "
+                f"kind={kind} bucket={bucket} buckets={len(buckets)} column={bucket_column}"
+            )
+            _emit_screen_line(bucket_message)
+            logger.info(bucket_message)
+            await db.status(
+                f"""
+                INSERT INTO {_quote_ident(schema_name)}.{_quote_ident(final_table)} ({quoted_columns})
+                SELECT DISTINCT ON ({quoted_conflict}) {quoted_columns}
+                FROM {_quote_ident(schema_name)}.{_quote_ident(stage_table)}
+                WHERE {_quote_ident(bucket_column)} >= :bucket_start
+                  AND {_quote_ident(bucket_column)} < :bucket_end
+                ORDER BY {quoted_conflict};
+                """,
+                bucket_start=bucket,
+                bucket_end=_ptg2_hash_prefix_bucket_end(bucket),
+            )
+            bucket_done = (
+                f"PTG2_PUBLISH_DEDUPE_BUCKET_DONE time={_ptg2_publish_timestamp()} "
+                f"kind={kind} bucket={bucket} elapsed_seconds={time.monotonic() - bucket_started:.2f}"
+            )
+            _emit_screen_line(bucket_done)
+            logger.info(bucket_done)
+    else:
+        await db.status(
+            f"""
+            INSERT INTO {_quote_ident(schema_name)}.{_quote_ident(final_table)} ({quoted_columns})
+            SELECT DISTINCT ON ({quoted_conflict}) {quoted_columns}
+            FROM {_quote_ident(schema_name)}.{_quote_ident(stage_table)}
+            ORDER BY {quoted_conflict};
+            """
+        )
+    await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(stage_table)};")
+    done_message = (
+        f"PTG2_PUBLISH_TABLE_DONE time={_ptg2_publish_timestamp()} "
+        f"kind={kind} elapsed_seconds={time.monotonic() - started_at:.2f}"
+    )
+    _emit_screen_line(done_message)
+    logger.info(done_message)
+    return time.monotonic() - started_at
 
 
-async def _count_compact_serving_rate_rows(snapshot_id: str, plan_id: str | None = None) -> int:
+def _ptg2_serving_child_table_name(parent_table: str, index: int) -> str:
+    suffix = f"_p{index:02d}"
+    return f"{parent_table[:63 - len(suffix)]}{suffix}"[:63]
+
+
+async def _publish_rust_serving_stage_tables(
+    *,
+    schema_name: str,
+    stage_tables: dict[str, str],
+    final_table: str,
+) -> list[str]:
+    storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
+    existing_stage_tables: list[str] = []
+    empty_stage_tables: list[str] = []
+    for stage_table in _serving_stage_tables(stage_tables):
+        if not await _table_exists(schema_name, stage_table):
+            continue
+        if await _table_has_rows(schema_name, stage_table):
+            existing_stage_tables.append(stage_table)
+        else:
+            empty_stage_tables.append(stage_table)
+
+    for stage_table in empty_stage_tables:
+        await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(stage_table)};")
+
+    if not existing_stage_tables:
+        return []
+
+    await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(final_table)} CASCADE;")
+
+    if len(existing_stage_tables) == 1:
+        await db.status(
+            f"""
+            ALTER TABLE {_quote_ident(schema_name)}.{_quote_ident(existing_stage_tables[0])}
+            RENAME TO {_quote_ident(final_table)};
+            """
+        )
+        return [final_table]
+
+    await db.status(
+        f"""
+        CREATE {storage_mode}TABLE {_quote_ident(schema_name)}.{_quote_ident(final_table)}
+        (LIKE {_quote_ident(schema_name)}.ptg2_serving_rate_compact INCLUDING DEFAULTS);
+        """
+    )
+    try:
+        await db.status(
+            f"ALTER TABLE {_quote_ident(schema_name)}.{_quote_ident(final_table)} "
+            "SET (autovacuum_enabled = false, toast.autovacuum_enabled = false);"
+        )
+    except Exception as exc:
+        logger.debug("Skipping PTG2 serving parent autovacuum disable for %s: %s", final_table, exc)
+
+    child_tables: list[str] = []
+    for index, stage_table in enumerate(existing_stage_tables):
+        child_table = _ptg2_serving_child_table_name(final_table, index)
+        await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(child_table)};")
+        await db.status(
+            f"""
+            ALTER TABLE {_quote_ident(schema_name)}.{_quote_ident(stage_table)}
+            RENAME TO {_quote_ident(child_table)};
+            """
+        )
+        await db.status(
+            f"""
+            ALTER TABLE {_quote_ident(schema_name)}.{_quote_ident(child_table)}
+            INHERIT {_quote_ident(schema_name)}.{_quote_ident(final_table)};
+            """
+        )
+        child_tables.append(child_table)
+    return child_tables
+
+
+async def _publish_rust_compact_snapshot_tables(
+    stage_tables: dict[str, str],
+    *,
+    snapshot_id: str,
+    import_run_id: str,
+    source_key: str,
+) -> dict[str, Any]:
+    del import_run_id
+    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    rename_order = ("procedure", "price_set", "provider_set", "provider_group_member", "serving_rate_compact")
+    table_names = {
+        kind: _ptg2_snapshot_table_name(kind, source_key, snapshot_id)
+        for kind in rename_order
+        if stage_tables.get(kind)
+    }
+    serving_index_tables: list[str] = []
+    publish_started = time.monotonic()
+    dictionary_publish_seconds = 0.0
+    serving_publish_seconds = 0.0
+    index_seconds = 0.0
+    analyze_started = 0.0
+    analyze_seconds = 0.0
+    # Serving rows are already unique by scanner-side serving_rate_id de-dupe.
+    # Dictionary stages can receive duplicate keys from different source files,
+    # so publish them through bounded de-dupe before model indexes are created.
+    for kind in rename_order:
+        stage_table = stage_tables.get(kind)
+        final_table = table_names.get(kind)
+        if not stage_table or not final_table:
+            continue
+        if kind != "serving_rate_compact" and not await _table_exists(schema_name, stage_table):
+            continue
+        if kind == "serving_rate_compact":
+            serving_publish_started = time.monotonic()
+            serving_index_tables = await _publish_rust_serving_stage_tables(
+                schema_name=schema_name,
+                stage_tables=stage_tables,
+                final_table=final_table,
+            )
+            serving_publish_seconds += time.monotonic() - serving_publish_started
+        else:
+            await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(final_table)};")
+            dictionary_publish_seconds += await _publish_deduped_rust_dictionary_table(
+                schema_name=schema_name,
+                kind=kind,
+                stage_table=stage_table,
+                final_table=final_table,
+            )
+
+    serving_table = table_names.get("serving_rate_compact")
+    if not serving_table or not await _table_exists(schema_name, serving_table):
+        raise RuntimeError("PTG2 Rust compact snapshot publish produced no serving table")
+    if not await _table_has_rows(schema_name, serving_table):
+        raise RuntimeError("PTG2 Rust compact snapshot publish produced an empty serving table")
+
+    if serving_index_tables and serving_index_tables != [serving_table]:
+        dictionary_index_tables = {key: value for key, value in table_names.items() if key != "serving_rate_compact"}
+        index_seconds += await _index_snapshot_compact_tables(schema_name, dictionary_index_tables)
+        index_seconds += await _index_snapshot_compact_table_entries(
+            schema_name,
+            [("serving_rate_compact", child_table) for child_table in serving_index_tables],
+        )
+    else:
+        index_seconds += await _index_snapshot_compact_tables(schema_name, table_names)
+    analyze_started = time.monotonic()
+    for table_name in table_names.values():
+        await db.status(f"ANALYZE {_quote_ident(schema_name)}.{_quote_ident(table_name)};")
+    for child_table in serving_index_tables:
+        if child_table != serving_table:
+            await db.status(f"ANALYZE {_quote_ident(schema_name)}.{_quote_ident(child_table)};")
+    analyze_seconds = time.monotonic() - analyze_started
+
+    plan_rows = await db.all(
+        f"""
+        SELECT COUNT(DISTINCT plan_hash) AS plans
+          FROM {_quote_ident(schema_name)}.ptg2_plan_month
+         WHERE snapshot_id = :snapshot_id
+        """,
+        snapshot_id=snapshot_id,
+    )
+    plan_count = int((plan_rows[0].get("plans") if isinstance(plan_rows[0], dict) else getattr(plan_rows[0], "plans", 0)) or 0) if plan_rows else 0
+    procedure_count = (
+        await _estimated_table_rows(schema_name, table_names["procedure"])
+        if table_names.get("procedure")
+        else 0
+    )
+    if serving_index_tables and serving_index_tables != [serving_table]:
+        rate_count = 0
+        for table_name in serving_index_tables:
+            rate_count += await _estimated_table_rows(schema_name, table_name)
+    else:
+        rate_count = await _estimated_table_rows(schema_name, serving_table)
+    return {
+        "type": "db_compact",
+        "storage": "db_compact_snapshot",
+        "snapshot_scoped": True,
+        "source_key": source_key,
+        "snapshot_id": snapshot_id,
+        "table": f"{schema_name}.{serving_table}",
+        "price_table": f"{schema_name}.{table_names['price_set']}" if table_names.get("price_set") else None,
+        "procedure_table": f"{schema_name}.{table_names['procedure']}" if table_names.get("procedure") else None,
+        "provider_set_table": f"{schema_name}.{table_names['provider_set']}" if table_names.get("provider_set") else None,
+        "provider_group_member_table": (
+            f"{schema_name}.{table_names['provider_group_member']}"
+            if table_names.get("provider_group_member")
+            else None
+        ),
+        "rate_count": rate_count,
+        "serving_rates": rate_count,
+        "row_count": rate_count,
+        "row_count_estimate": rate_count,
+        "plans": plan_count,
+        "procedures": procedure_count,
+        "timings": {
+            "publish_seconds": time.monotonic() - publish_started,
+            "dictionary_publish_seconds": dictionary_publish_seconds,
+            "serving_publish_seconds": serving_publish_seconds,
+            "index_seconds": index_seconds,
+            "analyze_seconds": analyze_seconds,
+        },
+    }
+
+
+def _ptg2_plan_source_key(plan_id: str, plan_market_type: str | None, import_month: datetime.date) -> str:
+    return semantic_hash(
+        {
+            "plan_id": plan_id,
+            "plan_market_type": plan_market_type or "",
+            "import_month": import_month.isoformat(),
+        },
+        domain="ptg2_current_plan_source",
+    )[:32]
+
+
+async def _current_source_snapshot_id(source_key: str) -> str | None:
+    row = await (
+        db.select(PTG2CurrentSourceSnapshot.__table__.c.snapshot_id)
+        .where(PTG2CurrentSourceSnapshot.__table__.c.source_key == source_key)
+        .first()
+    )
+    if row is None:
+        return None
+    return str(row[0]) if row[0] else None
+
+
+async def _source_plan_rows(
+    *,
+    snapshot_id: str,
+    source_key: str,
+    import_month: datetime.date,
+    previous_snapshot_id: str | None,
+    updated_at: datetime.datetime,
+    serving_index: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    rows = await db.all(
+        f"""
+        SELECT DISTINCT p.plan_id, COALESCE(p.plan_market_type, '') AS plan_market_type
+          FROM {_quote_ident(schema_name)}.ptg2_plan_month pm
+          JOIN {_quote_ident(schema_name)}.ptg2_plan p ON p.plan_hash = pm.plan_hash
+         WHERE pm.snapshot_id = :snapshot_id
+           AND p.plan_id IS NOT NULL
+           AND p.plan_id <> ''
+        """,
+        snapshot_id=snapshot_id,
+    )
+    if not rows and serving_index and serving_index.get("table"):
+        table_value = str(serving_index["table"])
+        table_name = table_value.split(".", 1)[1] if "." in table_value else table_value
+        if await _table_exists(schema_name, table_name):
+            rows = await db.all(
+                f"""
+                SELECT DISTINCT plan_id, '' AS plan_market_type
+                  FROM {_quote_ident(schema_name)}.{_quote_ident(table_name)}
+                 WHERE snapshot_id = :snapshot_id
+                   AND plan_id IS NOT NULL
+                   AND plan_id <> ''
+                """,
+                snapshot_id=snapshot_id,
+            )
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        data = row if isinstance(row, dict) else row._mapping
+        plan_id = str(data.get("plan_id") or "").strip()
+        if not plan_id:
+            continue
+        plan_market_type = str(data.get("plan_market_type") or "").strip().lower()
+        result.append(
+            {
+                "plan_source_key": _ptg2_plan_source_key(plan_id, plan_market_type, import_month),
+                "plan_id": plan_id,
+                "plan_market_type": plan_market_type,
+                "import_month": import_month,
+                "source_key": source_key,
+                "snapshot_id": snapshot_id,
+                "previous_snapshot_id": previous_snapshot_id,
+                "updated_at": updated_at,
+            }
+        )
+    return result
+
+
+async def _publish_ptg2_source_pointers(
+    *,
+    source_key: str,
+    snapshot_id: str,
+    previous_snapshot_id: str | None,
+    import_month: datetime.date,
+    updated_at: datetime.datetime,
+    serving_index: dict[str, Any] | None,
+) -> None:
+    await _push_ptg2_objects(
+        [
+            {
+                "source_key": source_key,
+                "snapshot_id": snapshot_id,
+                "previous_snapshot_id": previous_snapshot_id,
+                "import_month": import_month,
+                "updated_at": updated_at,
+            }
+        ],
+        PTG2CurrentSourceSnapshot,
+        rewrite=True,
+    )
+    plan_rows = await _source_plan_rows(
+        snapshot_id=snapshot_id,
+        source_key=source_key,
+        import_month=import_month,
+        previous_snapshot_id=previous_snapshot_id,
+        updated_at=updated_at,
+        serving_index=serving_index,
+    )
+    if plan_rows:
+        await _push_ptg2_objects(plan_rows, PTG2CurrentPlanSource, rewrite=True)
+
+
+def _snapshot_manifest_table_names(serving_index: dict[str, Any] | None) -> list[str]:
+    if not serving_index or serving_index.get("storage") != "db_compact_snapshot":
+        return []
+    table_values = [
+        serving_index.get("table"),
+        serving_index.get("price_table"),
+        serving_index.get("procedure_table"),
+        serving_index.get("provider_set_table"),
+        serving_index.get("provider_group_member_table"),
+    ]
+    allowed_prefixes = (
+        "ptg2_serving_rate_compact_",
+        "ptg2_price_set_",
+        "ptg2_procedure_",
+        "ptg2_provider_set_",
+        "ptg2_provider_group_member_",
+    )
+    result: list[str] = []
+    for value in table_values:
+        if not value:
+            continue
+        table_name = str(value).split(".", 1)[1] if "." in str(value) else str(value)
+        if table_name.startswith(allowed_prefixes) and re.fullmatch(r"[a-z0-9_]{1,63}", table_name):
+            result.append(table_name)
+    return _dedupe_preserve(result)
+
+
+async def _drop_ptg2_snapshot_table_names(table_names: list[str]) -> None:
+    if not table_names:
+        return
+    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    for table_name in table_names:
+        await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(table_name)};")
+
+
+async def _drop_ptg2_snapshot_tables_for_manifest(serving_index: dict[str, Any] | None) -> None:
+    await _drop_ptg2_snapshot_table_names(_snapshot_manifest_table_names(serving_index))
+
+
+async def _cleanup_old_ptg2_source_tables(source_key: str, keep_snapshot_ids: set[str]) -> None:
+    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    rows = await db.all(
+        f"""
+        SELECT snapshot_id, manifest
+          FROM {_quote_ident(schema_name)}.ptg2_snapshot
+         WHERE manifest->'serving_index'->>'source_key' = :source_key
+           AND manifest->'serving_index'->>'storage' = 'db_compact_snapshot'
+        """,
+        source_key=source_key,
+    )
+    table_names: list[str] = []
+    for row in rows:
+        data = row if isinstance(row, dict) else row._mapping
+        if str(data.get("snapshot_id") or "") in keep_snapshot_ids:
+            continue
+        manifest = data.get("manifest") or {}
+        if isinstance(manifest, str):
+            try:
+                manifest = json.loads(manifest)
+            except json.JSONDecodeError:
+                manifest = {}
+        table_names.extend(_snapshot_manifest_table_names((manifest or {}).get("serving_index")))
+    await _drop_ptg2_snapshot_table_names(_dedupe_preserve(table_names))
+
+
+async def _count_compact_serving_rate_rows(
+    snapshot_id: str,
+    plan_id: str | None = None,
+    *,
+    table_name: str = "ptg2_serving_rate_compact",
+) -> int:
     schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     plan_filter = "AND plan_id = :plan_id" if plan_id is not None else ""
     rows = await db.all(
         f"""
         SELECT COUNT(*) AS row_count
-          FROM {schema_name}.ptg2_serving_rate_compact
+          FROM {_quote_ident(schema_name)}.{_quote_ident(table_name)}
          WHERE snapshot_id = :snapshot_id
          {plan_filter}
         """,
@@ -3626,8 +4937,6 @@ async def build_ptg2_compact_serving_index(snapshot_id: str, import_run_id: str)
             await db.status(statement)
         except Exception as exc:
             logger.warning("Failed to ensure compact serving index %s: %s", index_name, exc)
-    if _env_bool(PTG2_DEFER_PROVIDER_LOCATIONS_ENV, True):
-        await _build_ptg2_provider_locations(snapshot_id)
     try:
         await db.status(f"ALTER TABLE {compact_table} RESET (autovacuum_enabled, toast.autovacuum_enabled);")
         await db.status(f"ALTER TABLE {schema}.ptg2_provider_set_component RESET (autovacuum_enabled);")
@@ -3642,6 +4951,8 @@ async def build_ptg2_compact_serving_index(snapshot_id: str, import_run_id: str)
         await db.status(f"ANALYZE {schema}.ptg2_price_set;")
     except Exception as exc:
         logger.debug("Skipping PTG2 compact ANALYZE: %s", exc)
+    if not _env_bool(PTG2_DEFER_PROVIDER_LOCATIONS_ENV, True):
+        await _build_ptg2_provider_locations(snapshot_id)
     count_params = {"snapshot_id": snapshot_id}
     rate_count = int(
         await db.scalar(
@@ -3753,6 +5064,37 @@ def _normalize_import_id(import_id: str | None) -> str:
         suffix = hash_prefix(semantic_hash(normalized, domain="import_id"), 8)
         normalized = f"{normalized[:25]}_{suffix}"
     return normalized
+
+
+def _normalize_source_key(source_key: str | None) -> str | None:
+    if not source_key:
+        return None
+    normalized = "".join(ch if ch.isalnum() else "_" for ch in str(source_key).strip().lower()).strip("_")
+    if not normalized:
+        return None
+    if len(normalized) > 48:
+        suffix = hash_prefix(semantic_hash(normalized, domain="ptg2_source_key"), 10)
+        normalized = f"{normalized[:37]}_{suffix}"
+    return normalized
+
+
+def _ptg2_snapshot_table_token(source_key: str, snapshot_id: str) -> str:
+    return hash_prefix(
+        semantic_hash({"source_key": source_key, "snapshot_id": snapshot_id}, domain="ptg2_snapshot_tables"),
+        16,
+    )
+
+
+def _ptg2_snapshot_table_name(kind: str, source_key: str, snapshot_id: str) -> str:
+    safe_kind = re.sub(r"[^a-z0-9_]+", "_", kind.lower()).strip("_")
+    return f"ptg2_{safe_kind}_{_ptg2_snapshot_table_token(source_key, snapshot_id)}"[:63]
+
+
+def _ptg2_snapshot_index_name(table_name: str, role: str) -> str:
+    suffix = hash_prefix(semantic_hash({"table": table_name, "role": role}, domain="ptg2_snapshot_index"), 10)
+    base = re.sub(r"[^a-z0-9_]+", "_", f"{table_name}_{role}").strip("_")
+    max_base = max(1, 62 - len(suffix))
+    return f"{base[:max_base]}_{suffix}"[:63]
 
 
 def _make_checksum(*values: Any) -> int:
@@ -4337,7 +5679,7 @@ def _maybe_log_artifact_progress(
         f"elapsed={_format_duration(elapsed)}, compressed_eta={_format_duration(compressed_eta)}"
         f"{item_parts}"
     )
-    print(message, flush=True)
+    _emit_screen_line(message)
     logger.info(message)
     state["last_log"] = now
 
@@ -4491,11 +5833,15 @@ async def _ensure_indexes(obj, db_schema: str) -> None:
         logger.info("Skipping PTG2 compact serving index ensure before bulk load")
         return
     if hasattr(obj, "__my_index_elements__") and obj.__my_index_elements__:
-        cols = ", ".join(obj.__my_index_elements__)
-        await db.status(
-            "CREATE UNIQUE INDEX IF NOT EXISTS "
-            + f"{obj.__tablename__}_idx_primary ON {db_schema}.{obj.__tablename__} ({cols});"
-        )
+        index_elements = [str(element) for element in obj.__my_index_elements__]
+        if index_elements == _primary_key_column_names(obj):
+            logger.debug("Skipping duplicate primary unique index ensure for %s", obj.__tablename__)
+        else:
+            cols = ", ".join(index_elements)
+            await db.status(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                + f"{obj.__tablename__}_idx_primary ON {db_schema}.{obj.__tablename__} ({cols});"
+            )
     if hasattr(obj, "__my_additional_indexes__") and obj.__my_additional_indexes__:
         for idx in obj.__my_additional_indexes__:
             elements = idx.get("index_elements")
@@ -4504,11 +5850,14 @@ async def _ensure_indexes(obj, db_schema: str) -> None:
             name = idx.get("name") or f"{obj.__tablename__}_{'_'.join(elements)}_idx"
             using = idx.get("using")
             where = idx.get("where")
+            include_elements = idx.get("include") or ()
             cols = ", ".join(elements)
             statement = f"CREATE INDEX IF NOT EXISTS {name} ON {db_schema}.{obj.__tablename__}"
             if using:
                 statement += f" USING {using}"
             statement += f" ({cols})"
+            if include_elements:
+                statement += f" INCLUDE ({', '.join(include_elements)})"
             if where:
                 statement += f" WHERE {where}"
             statement += ";"
@@ -5208,10 +6557,7 @@ def _iter_top_level_object_bytes_rust(
             "PTG2 Rust scanner is enabled but no scanner binary was found; "
             "build it with `cargo build --release --manifest-path support/ptg2_scanner/Cargo.toml`"
         )
-    command = [str(binary)]
-    if _env_bool(PTG2_RUST_SPLIT_IN_NETWORK_ENV, False) and "in_network" in array_names:
-        command.append("--split-in-network")
-    command.extend([str(path), *sorted(array_names)])
+    command = [str(binary), str(path), *sorted(array_names)]
     process = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
@@ -5231,7 +6577,7 @@ def _iter_top_level_object_bytes_rust(
                 if len(stderr_tail) > 20:
                     del stderr_tail[:-20]
                 if line.startswith("PTG2_SCANNER_PROGRESS\t"):
-                    print(line, flush=True)
+                    _emit_screen_line(line)
                     logger.info(line)
                 else:
                     logger.warning("PTG2 Rust scanner stderr: %s", line)
@@ -5287,7 +6633,6 @@ def _iter_compact_serving_records_rust(
     source_trace_set_hash: str,
     confidence_code: str = PTG2_CONFIDENCE_TIC_RATE_NPI_TIN,
     compact_copy_path: str | Path | None = None,
-    compact_copy_stdout: bool = False,
     procedure_copy_path: str | Path | None = None,
     price_set_copy_path: str | Path | None = None,
     provider_set_copy_path: str | Path | None = None,
@@ -5307,8 +6652,6 @@ def _iter_compact_serving_records_rust(
         "HLTHPRT_PTG2_COMPACT_SOURCE_TRACE_SET_HASH": source_trace_set_hash,
         "HLTHPRT_PTG2_COMPACT_CONFIDENCE_CODE": confidence_code,
     }
-    if compact_copy_stdout:
-        env["HLTHPRT_PTG2_COMPACT_SERVING_COPY_STDOUT"] = "true"
     if compact_copy_path is not None:
         env["HLTHPRT_PTG2_COMPACT_SERVING_COPY_PATH"] = str(compact_copy_path)
     if procedure_copy_path is not None:
@@ -5319,6 +6662,10 @@ def _iter_compact_serving_records_rust(
         env["HLTHPRT_PTG2_PROVIDER_SET_COPY_PATH"] = str(provider_set_copy_path)
     if provider_group_member_copy_path is not None:
         env["HLTHPRT_PTG2_PROVIDER_GROUP_MEMBER_COPY_PATH"] = str(provider_group_member_copy_path)
+    env.setdefault(PTG2_RUST_WORKERS_ENV, str(PTG2_DEFAULT_RUST_WORKERS))
+    env.setdefault(PTG2_RUST_WORK_QUEUE_ENV, str(PTG2_DEFAULT_RUST_WORK_QUEUE))
+    env.setdefault(PTG2_RUST_EVENT_QUEUE_ENV, str(PTG2_DEFAULT_RUST_EVENT_QUEUE))
+    env.setdefault(PTG2_RUST_SPLIT_NEGOTIATED_RATES_ENV, str(PTG2_DEFAULT_RUST_SPLIT_NEGOTIATED_RATES))
     process = subprocess.Popen(
         [str(binary), "--compact-serving", str(path)],
         stdout=subprocess.PIPE,
@@ -5338,8 +6685,12 @@ def _iter_compact_serving_records_rust(
                 stderr_tail.append(line)
                 if len(stderr_tail) > 20:
                     del stderr_tail[:-20]
-                if line.startswith("PTG2_SCANNER_PROGRESS\t"):
-                    print(line, flush=True)
+                if (
+                    line.startswith("PTG2_SCANNER_PROGRESS\t")
+                    or line.startswith("PTG2_DEDUPE_SUMMARY\t")
+                    or line.startswith("PTG2_SCANNER_WORKER_FAILED\t")
+                ):
+                    _emit_screen_line(line)
                     logger.info(line)
                 else:
                     logger.warning("PTG2 Rust compact scanner stderr: %s", line)
@@ -5368,10 +6719,7 @@ def _iter_compact_serving_records_rust(
             if trailer not in {b"", b"\n"}:
                 raise RuntimeError("Invalid PTG2 Rust compact scanner frame trailer")
             record_kind = name_bytes.decode("utf-8")
-            if record_kind == "compact_copy_data":
-                yield record_kind, payload
-            else:
-                yield record_kind, _json_loads(payload)
+            yield record_kind, _json_loads(payload)
     finally:
         if process.poll() is None:
             terminated_by_consumer = True
@@ -5388,6 +6736,69 @@ def _iter_compact_serving_records_rust(
                 f"PTG2 Rust compact scanner failed with exit code {return_code}: "
                 f"{chr(10).join(stderr_tail)[-1000:]}"
             )
+
+
+async def _aiter_compact_serving_records_rust(
+    path: str | Path,
+    *,
+    snapshot_id: str,
+    plan_id: str,
+    plan_month_id: str,
+    source_trace_set_hash: str,
+    confidence_code: str = PTG2_CONFIDENCE_TIC_RATE_NPI_TIN,
+    compact_copy_path: str | Path | None = None,
+    procedure_copy_path: str | Path | None = None,
+    price_set_copy_path: str | Path | None = None,
+    provider_set_copy_path: str | Path | None = None,
+    provider_group_member_copy_path: str | Path | None = None,
+):
+    iterator = _iter_compact_serving_records_rust(
+        path,
+        snapshot_id=snapshot_id,
+        plan_id=plan_id,
+        plan_month_id=plan_month_id,
+        source_trace_set_hash=source_trace_set_hash,
+        confidence_code=confidence_code,
+        compact_copy_path=compact_copy_path,
+        procedure_copy_path=procedure_copy_path,
+        price_set_copy_path=price_set_copy_path,
+        provider_set_copy_path=provider_set_copy_path,
+        provider_group_member_copy_path=provider_group_member_copy_path,
+    )
+    event_queue: queue.Queue[Any] = queue.Queue(
+        maxsize=max(_env_int(PTG2_RUST_EVENT_QUEUE_ENV, PTG2_DEFAULT_RUST_EVENT_QUEUE), 1)
+    )
+    sentinel = object()
+
+    def read_records() -> None:
+        try:
+            for item in iterator:
+                event_queue.put(item)
+        except BaseException as exc:
+            event_queue.put(exc)
+        finally:
+            event_queue.put(sentinel)
+
+    reader_thread = threading.Thread(
+        target=read_records,
+        name="ptg2-rust-compact-stdout",
+        daemon=True,
+    )
+    reader_thread.start()
+    try:
+        while True:
+            item = await asyncio.to_thread(event_queue.get)
+            if item is sentinel:
+                break
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+    finally:
+        if reader_thread.is_alive():
+            close = getattr(iterator, "close", None)
+            if close is not None:
+                await asyncio.to_thread(close)
+            reader_thread.join(timeout=5)
 
 
 def _skip_json_ws(buffer: str, pos: int) -> int:
@@ -6466,6 +7877,7 @@ async def _parse_in_network_file_serving_only(
     snapshot_id: str,
     import_month: datetime.date,
     max_items: int | None = None,
+    rust_stage_tables: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     plan_fields = _derive_plan_fields(meta, plan_info)
     plan_row, alias_rows, plan_month_row = _ptg2_plan_rows(plan_fields, snapshot_id, import_month)
@@ -6596,7 +8008,7 @@ async def _parse_in_network_file_serving_only(
 
     if (
         compact_serving
-        and _env_bool(PTG2_RUST_COMPACT_SERVING_ENV, False)
+        and _use_rust_compact_serving()
         and max_items is None
         and not test_mode
     ):
@@ -6608,59 +8020,159 @@ async def _parse_in_network_file_serving_only(
         }
         rust_batch_limit = max(_env_int(PTG2_COMPACT_BATCH_ROWS_ENV, 5000), 1)
         rust_records = 0
+        rust_dedupe_summary: dict[str, Any] = {}
         rust_item_count: set[str] = set()
-        compact_copy_stdout = _env_bool("HLTHPRT_PTG2_COMPACT_COPY_STDOUT", False)
-        compact_copy_path: Path | None = None
-        if not compact_copy_stdout:
-            compact_copy_fd, compact_copy_name = tempfile.mkstemp(prefix="ptg2_compact_serving_", suffix=".copy")
-            os.close(compact_copy_fd)
-            compact_copy_path = Path(compact_copy_name)
+        copy_tmp_dir = ptg2_temp_parent()
+        compact_copy_fd, compact_copy_name = tempfile.mkstemp(
+            prefix="ptg2_compact_serving_",
+            suffix=".copy",
+            dir=copy_tmp_dir,
+        )
+        os.close(compact_copy_fd)
+        compact_copy_path = Path(compact_copy_name)
         dictionary_copy_paths: dict[str, Path] = {}
-        if not compact_copy_stdout:
-            for dictionary_kind in ("procedure", "price_set", "provider_set", "provider_group_member"):
-                fd, name = tempfile.mkstemp(prefix=f"ptg2_{dictionary_kind}_", suffix=".copy")
-                os.close(fd)
-                dictionary_copy_paths[dictionary_kind] = Path(name)
+        for dictionary_kind in ("procedure", "price_set", "provider_set", "provider_group_member"):
+            fd, name = tempfile.mkstemp(
+                prefix=f"ptg2_{dictionary_kind}_",
+                suffix=".copy",
+                dir=copy_tmp_dir,
+            )
+            os.close(fd)
+            dictionary_copy_paths[dictionary_kind] = Path(name)
         compact_copy_rows = 0
+        procedure_copy_rows = 0
         compact_copy_completed = False
         compact_copy_tasks: set[asyncio.Task] = set()
-        compact_copy_task_limit = max(_env_int("HLTHPRT_PTG2_COMPACT_COPY_TASKS", 1), 1)
+        compact_copy_task_limit = max(
+            _env_int(PTG2_COMPACT_COPY_TASKS_ENV, PTG2_DEFAULT_COMPACT_COPY_TASKS),
+            1,
+        )
+        compact_copy_kind_task_limit = max(
+            _env_int(PTG2_COMPACT_COPY_KIND_TASKS_ENV, PTG2_DEFAULT_COMPACT_COPY_KIND_TASKS),
+            1,
+        )
+        compact_serving_copy_task_limit = max(
+            _env_int(
+                PTG2_COMPACT_SERVING_COPY_TASKS_ENV,
+                PTG2_DEFAULT_COMPACT_SERVING_COPY_TASKS,
+            ),
+            1,
+        )
         compact_copy_semaphore = asyncio.Semaphore(compact_copy_task_limit)
-        stage_tables: dict[str, str] = {}
+        compact_copy_kind_semaphores: dict[str, asyncio.Semaphore] = {
+            "procedure": asyncio.Semaphore(compact_copy_kind_task_limit),
+            "price_set": asyncio.Semaphore(compact_copy_kind_task_limit),
+            "provider_set": asyncio.Semaphore(compact_copy_kind_task_limit),
+            "provider_group_member": asyncio.Semaphore(compact_copy_kind_task_limit),
+        }
+        compact_serving_copy_semaphores: dict[str, asyncio.Semaphore] = {}
+        stage_tables: dict[str, str] = dict(rust_stage_tables or {})
+        owns_stage_tables = rust_stage_tables is None
         stage_completed = False
-        if _env_bool(PTG2_RUST_COPY_UNLOGGED_STAGE_ENV, True) and not compact_copy_stdout:
+        if owns_stage_tables:
             stage_token = hashlib.md5(f"{snapshot_id}:{os.getpid()}:{time.time_ns()}".encode("utf-8")).hexdigest()[:12]
-            stage_tables = await _create_rust_copy_stage_tables(stage_token)
+            stage_tables = await _create_rust_copy_stage_tables(
+                stage_token,
+                serving_lanes=max(_env_int(PTG2_RUST_WORKERS_ENV, PTG2_DEFAULT_RUST_WORKERS), 1),
+            )
+
+        def emit_copy_status(
+            status: str,
+            *,
+            kind: str,
+            copy_file: Path,
+            rows: int,
+            target_table: str | None = None,
+            started_at: float | None = None,
+        ) -> None:
+            elapsed = "" if started_at is None else f"\telapsed_seconds={time.monotonic() - started_at:.2f}"
+            try:
+                bytes_text = str(copy_file.stat().st_size)
+            except FileNotFoundError:
+                bytes_text = "0"
+            target_text = "" if not target_table else f"\ttarget_table={target_table}"
+            line = (
+                f"PTG2_COPY_SHARD_{status}"
+                f"\tkind={kind}"
+                f"\tpath={copy_file}"
+                f"{target_text}"
+                f"\trows={rows}"
+                f"\tbytes={bytes_text}"
+                f"{elapsed}"
+            )
+            _emit_screen_line(line)
+            logger.info(line)
 
         async def copy_ready_compact_file(copy_row: dict[str, Any]) -> None:
+            nonlocal compact_copy_rows
             raw_copy_path = str(copy_row.get("path") or "").strip()
             if not raw_copy_path:
                 return
+            copied_rows = int(copy_row.get("row_count") or 0)
             copy_file = Path(raw_copy_path)
+            target_table = _serving_stage_table_for_copy(stage_tables, copy_file)
             async with compact_copy_semaphore:
-                await _copy_compact_serving_rate_file(
-                    copy_file,
-                    target_table=stage_tables.get("serving_rate_compact", "ptg2_serving_rate_compact"),
-                )
+                async with compact_serving_copy_semaphores.setdefault(
+                    target_table,
+                    asyncio.Semaphore(compact_serving_copy_task_limit),
+                ):
+                    started_at = time.monotonic()
+                    emit_copy_status(
+                        "START",
+                        kind="serving_rate_compact",
+                        copy_file=copy_file,
+                        rows=copied_rows,
+                        target_table=target_table,
+                    )
+                    await _copy_compact_serving_rate_file(
+                        copy_file,
+                        target_table=target_table,
+                    )
+                    emit_copy_status(
+                        "DONE",
+                        kind="serving_rate_compact",
+                        copy_file=copy_file,
+                        rows=copied_rows,
+                        target_table=target_table,
+                        started_at=started_at,
+                    )
+            compact_copy_rows += copied_rows
             try:
                 copy_file.unlink(missing_ok=True)
             except Exception:
                 logger.debug("Failed to remove PTG2 compact copy chunk %s", copy_file, exc_info=True)
 
-        async def copy_ready_compact_bytes(payload: bytes) -> None:
-            async with compact_copy_semaphore:
-                await _copy_compact_serving_rate_bytes(
-                    payload,
-                    target_table=stage_tables.get("serving_rate_compact", "ptg2_serving_rate_compact"),
-                )
-
         async def copy_ready_dictionary_file(kind: str, copy_row: dict[str, Any]) -> None:
+            nonlocal procedure_copy_rows
             raw_copy_path = str(copy_row.get("path") or "").strip()
             if not raw_copy_path:
                 return
+            copied_rows = int(copy_row.get("row_count") or 0)
             copy_file = Path(raw_copy_path)
             async with compact_copy_semaphore:
-                await _copy_ptg2_dictionary_file(copy_file, kind, target_table=stage_tables.get(kind))
+                async with compact_copy_kind_semaphores.setdefault(
+                    kind,
+                    asyncio.Semaphore(compact_copy_kind_task_limit),
+                ):
+                    started_at = time.monotonic()
+                    emit_copy_status(
+                        "START",
+                        kind=kind,
+                        copy_file=copy_file,
+                        rows=copied_rows,
+                        target_table=stage_tables.get(kind),
+                    )
+                    await _copy_ptg2_dictionary_file(copy_file, kind, target_table=stage_tables.get(kind))
+                    emit_copy_status(
+                        "DONE",
+                        kind=kind,
+                        copy_file=copy_file,
+                        rows=copied_rows,
+                        target_table=stage_tables.get(kind),
+                        started_at=started_at,
+                    )
+            if kind == "procedure":
+                procedure_copy_rows += copied_rows
             try:
                 copy_file.unlink(missing_ok=True)
             except Exception:
@@ -6686,19 +8198,21 @@ async def _parse_in_network_file_serving_only(
             for task in done:
                 task.result()
         try:
-            for record_kind, record_row in _iter_compact_serving_records_rust(
+            async for record_kind, record_row in _aiter_compact_serving_records_rust(
                 file_path,
                 snapshot_id=snapshot_id,
                 plan_id=str(plan_fields.get("plan_id") or ""),
                 plan_month_id=str(plan_month_row["plan_month_id"]),
                 source_trace_set_hash=source_trace_set_hash,
                 compact_copy_path=compact_copy_path,
-                compact_copy_stdout=compact_copy_stdout,
                 procedure_copy_path=dictionary_copy_paths.get("procedure"),
                 price_set_copy_path=dictionary_copy_paths.get("price_set"),
                 provider_set_copy_path=dictionary_copy_paths.get("provider_set"),
                 provider_group_member_copy_path=dictionary_copy_paths.get("provider_group_member"),
             ):
+                if record_kind == "dedupe_summary":
+                    rust_dedupe_summary = dict(record_row or {})
+                    continue
                 rust_records += 1
                 if record_kind == "price_set":
                     rust_batches["price_set_rows"].append(record_row)
@@ -6707,9 +8221,6 @@ async def _parse_in_network_file_serving_only(
                     await wait_for_some_copy_tasks()
                 elif record_kind == "compact_copy_file":
                     compact_copy_tasks.add(asyncio.create_task(copy_ready_compact_file(record_row)))
-                    await wait_for_some_copy_tasks()
-                elif record_kind == "compact_copy_data":
-                    compact_copy_tasks.add(asyncio.create_task(copy_ready_compact_bytes(record_row)))
                     await wait_for_some_copy_tasks()
                 elif record_kind == "serving_rate_compact":
                     rust_batches["serving_rate_compact_rows"].append(record_row)
@@ -6750,25 +8261,29 @@ async def _parse_in_network_file_serving_only(
             await _drain_compact_writes(state)
             await wait_for_some_copy_tasks(force=True)
             if compact_copy_path is not None and compact_copy_path.exists() and compact_copy_path.stat().st_size > 0:
-                await _copy_compact_serving_rate_file(
-                    compact_copy_path,
-                    target_table=stage_tables.get("serving_rate_compact", "ptg2_serving_rate_compact"),
-                )
+                await copy_ready_compact_file({"path": str(compact_copy_path), "row_count": 0})
                 compact_copy_completed = True
             for dictionary_kind, dictionary_path in dictionary_copy_paths.items():
                 if dictionary_path.exists() and dictionary_path.stat().st_size > 0:
-                    await _copy_ptg2_dictionary_file(
-                        dictionary_path,
-                        dictionary_kind,
-                        target_table=stage_tables.get(dictionary_kind),
-                    )
-            if stage_tables:
+                    await copy_ready_dictionary_file(dictionary_kind, {"path": str(dictionary_path), "row_count": 0})
+            if stage_tables and owns_stage_tables:
                 await _merge_rust_copy_stage_tables(stage_tables, drop=True)
                 stage_completed = True
-            serving_rows = await _count_compact_serving_rate_rows(
-                snapshot_id,
-                str(plan_fields.get("plan_id") or ""),
-            )
+            elif stage_tables:
+                stage_completed = True
+            if rust_stage_tables and compact_copy_rows:
+                serving_rows = compact_copy_rows
+            elif rust_stage_tables:
+                serving_rows = await _estimated_table_rows(
+                    os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+                    stage_tables.get("serving_rate_compact", "ptg2_serving_rate_compact"),
+                )
+            else:
+                serving_rows = await _count_compact_serving_rate_rows(
+                    snapshot_id,
+                    str(plan_fields.get("plan_id") or ""),
+                    table_name=stage_tables.get("serving_rate_compact", "ptg2_serving_rate_compact"),
+                )
             compact_copy_completed = True
         finally:
             for task in compact_copy_tasks:
@@ -6784,7 +8299,7 @@ async def _parse_in_network_file_serving_only(
                         dictionary_path.unlink(missing_ok=True)
                     except Exception:
                         logger.debug("Failed to remove PTG2 dictionary copy file %s", dictionary_path, exc_info=True)
-                if stage_tables and not stage_completed:
+                if stage_tables and owns_stage_tables and not stage_completed:
                     schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
                     for stage_table in stage_tables.values():
                         try:
@@ -6793,14 +8308,14 @@ async def _parse_in_network_file_serving_only(
                             )
                         except Exception:
                             logger.debug("Failed to drop PTG2 Rust stage table %s", stage_table, exc_info=True)
-        item_count = len(rust_item_count)
+        item_count = len(rust_item_count) or procedure_copy_rows
         logger.info(
             "PTG2 Rust compact serving emitted %s dictionary records, %s copy rows for %s procedure hashes",
             rust_records,
             compact_copy_rows,
             item_count,
         )
-        if slim_serving_rows and _env_bool(PTG2_STAGE_PRICE_SETS_ENV, True):
+        if slim_serving_rows and _env_bool(PTG2_STAGE_PRICE_SETS_ENV, True) and not rust_stage_tables:
             await _merge_staged_price_sets(snapshot_id)
         if not _env_bool(PTG2_DEFER_PROVIDER_LOCATIONS_ENV, True):
             await _build_ptg2_provider_locations(snapshot_id)
@@ -6815,7 +8330,9 @@ async def _parse_in_network_file_serving_only(
             "rust_compact_serving": True,
             "rust_records": rust_records,
         }
-        print(f"PTG2 serving-only import summary: {summary}", flush=True)
+        if rust_dedupe_summary:
+            summary["dedupe"] = rust_dedupe_summary
+        _emit_screen_line(f"PTG2 serving-only import summary: {summary}")
         logger.info("PTG2 serving-only import summary: %s", summary)
         return summary
 
@@ -7047,7 +8564,7 @@ async def _parse_in_network_file_serving_only(
         await _merge_staged_serving_rates(snapshot_id)
     if slim_serving_rows and _env_bool(PTG2_STAGE_PRICE_SETS_ENV, True):
         await _merge_staged_price_sets(snapshot_id)
-    if compact_serving:
+    if compact_serving and not _env_bool(PTG2_DEFER_PROVIDER_LOCATIONS_ENV, True):
         await _build_ptg2_provider_locations(snapshot_id)
     await flush_error_log(import_log_cls)
     summary = {
@@ -7061,7 +8578,7 @@ async def _parse_in_network_file_serving_only(
     if hasattr(provider_map, "stats"):
         summary.update(provider_map.stats())
     summary.update(provider_combo_stats)
-    print(f"PTG2 serving-only import summary: {summary}", flush=True)
+    _emit_screen_line(f"PTG2 serving-only import summary: {summary}")
     logger.info("PTG2 serving-only import summary: %s", summary)
     return summary
 
@@ -7952,7 +9469,7 @@ async def _parse_in_network_file_compact(
     if hasattr(provider_map, "stats"):
         summary.update(provider_map.stats())
     summary.update(provider_combo_stats)
-    print(f"PTG2 compact import summary: {summary}", flush=True)
+    _emit_screen_line(f"PTG2 compact import summary: {summary}")
     logger.info("PTG2 compact import summary: %s", summary)
     return summary
 
@@ -8077,6 +9594,7 @@ async def _process_table_of_contents(
     reuse_raw_artifacts: bool = True,
     max_bytes: int | None = None,
     keep_partial_artifacts: bool | None = None,
+    raise_on_error: bool = False,
 ) -> list[dict[str, Any]]:
     file_cls = classes["PTGFile"]
     import_log_cls = classes["ImportLog"]
@@ -8095,6 +9613,8 @@ async def _process_table_of_contents(
             )
         except Exception as exc:
             logger.warning("Failed to download table-of-contents from %s: %s", toc_url, exc)
+            if raise_on_error:
+                raise RuntimeError(f"Failed to download table-of-contents from {toc_url}: {exc}") from exc
             return []
         toc_content = load_json_artifact(logical_artifact.logical_path)
         if import_run_id:
@@ -8260,7 +9780,7 @@ async def _process_provider_reference_file(
         "version": provider_content.get("version"),
     }
     file_row = _build_file_row(url, "provider-reference", meta, None, None, None)
-    await push_objects([file_row], file_cls, rewrite=True)
+    await _push_ptg2_objects([file_row], file_cls, rewrite=True)
 
     provider_groups = provider_content.get("provider_groups") or []
     rows: list[dict[str, Any]] = []
@@ -8314,6 +9834,9 @@ async def _process_in_network_file(
     compact_import: bool = False,
     snapshot_id: str | None = None,
     import_month: datetime.date | None = None,
+    rust_stage_tables: dict[str, str] | None = None,
+    raw_artifact: PTG2RawArtifact | None = None,
+    logical_artifact: PTG2LogicalArtifact | None = None,
 ) -> PTG2FileProcessResult:
     url = job["url"]
     description = job.get("description")
@@ -8325,22 +9848,23 @@ async def _process_in_network_file(
     import_log_cls = classes["ImportLog"]
 
     with tempfile.TemporaryDirectory(dir=ptg2_temp_parent()) as tmpdir:
-        try:
-            raw_artifact, logical_artifact = await materialize_json_source(
-                url,
-                tmpdir,
-                reuse_raw_artifacts=reuse_raw_artifacts,
-                max_bytes=max_bytes,
-                materialize_logical=False,
-                keep_partial_artifacts=keep_partial_artifacts,
-            )
-        except Exception as exc:
-            logger.warning("Failed to download in-network file from %s: %s", url, exc)
-            return PTG2FileProcessResult("in_network", url, False, error=str(exc))
+        if raw_artifact is None or logical_artifact is None:
+            try:
+                raw_artifact, logical_artifact = await materialize_json_source(
+                    url,
+                    tmpdir,
+                    reuse_raw_artifacts=reuse_raw_artifacts,
+                    max_bytes=max_bytes,
+                    materialize_logical=False,
+                    keep_partial_artifacts=keep_partial_artifacts,
+                )
+            except Exception as exc:
+                logger.warning("Failed to download in-network file from %s: %s", url, exc)
+                return PTG2FileProcessResult("in_network", url, False, error=str(exc))
         extracted = logical_artifact.logical_path
         meta = provided_meta or await _extract_metadata_fields(extracted)
         file_row = _build_file_row(url, "in-network", meta, plan_info, description, from_index_url)
-        await push_objects([file_row], file_cls, rewrite=True)
+        await _push_ptg2_objects([file_row], file_cls, rewrite=True)
         source_version = await _record_source_version(
             source_type="in-network",
             domain=PTG2_DOMAIN_IN_NETWORK,
@@ -8353,9 +9877,10 @@ async def _process_in_network_file(
             provider_cache = PTG2InMemoryProviderReferenceCache(provider_ref_cache)
         else:
             provider_cache = PTG2ProviderReferenceCache(Path(tmpdir) / "provider_refs.sqlite", provider_ref_cache)
+        parse_summary: dict[str, Any] | None = None
         try:
-            if compact_import and _env_bool(PTG2_SERVING_ONLY_IMPORT_ENV, False):
-                await _parse_in_network_file_serving_only(
+            if compact_import and _use_serving_only_import():
+                parse_summary = await _parse_in_network_file_serving_only(
                     extracted,
                     file_row["file_id"],
                     meta,
@@ -8368,9 +9893,10 @@ async def _process_in_network_file(
                     snapshot_id or "ptg2:unknown",
                     import_month or normalize_import_month(None),
                     max_items=max_items,
+                    rust_stage_tables=rust_stage_tables,
                 )
             elif compact_import:
-                await _parse_in_network_file_compact(
+                parse_summary = await _parse_in_network_file_compact(
                     extracted,
                     file_row["file_id"],
                     meta,
@@ -8385,13 +9911,29 @@ async def _process_in_network_file(
                     max_items=max_items,
                 )
             else:
-                await _parse_in_network_file_single_pass(
+                parse_summary = await _parse_in_network_file_single_pass(
                     extracted, file_row["file_id"], meta, plan_info, provider_cache, classes, test_mode, import_log_cls, url,
                     max_items=max_items,
                 )
         finally:
             provider_cache.close()
-    return PTG2FileProcessResult("in_network", url, True, file_id=file_row["file_id"])
+    if (
+        compact_import
+        and _use_serving_only_import()
+        and not test_mode
+        and int((parse_summary or {}).get("serving_rates") or 0) <= 0
+    ):
+        no_data_summary = dict(parse_summary or {})
+        no_data_summary["skipped_reason"] = "parsed zero serving rates"
+        return PTG2FileProcessResult(
+            "in_network",
+            url,
+            True,
+            file_id=file_row["file_id"],
+            summary=no_data_summary,
+            skipped=True,
+        )
+    return PTG2FileProcessResult("in_network", url, True, file_id=file_row["file_id"], summary=parse_summary)
 
 
 async def _process_allowed_amounts_file(
@@ -8403,6 +9945,8 @@ async def _process_allowed_amounts_file(
     max_items: int | None = None,
     import_run_id: str | None = None,
     keep_partial_artifacts: bool | None = None,
+    raw_artifact: PTG2RawArtifact | None = None,
+    logical_artifact: PTG2LogicalArtifact | None = None,
 ) -> PTG2FileProcessResult:
     url = job["url"]
     description = job.get("description")
@@ -8414,22 +9958,23 @@ async def _process_allowed_amounts_file(
     import_log_cls = classes["ImportLog"]
 
     with tempfile.TemporaryDirectory(dir=ptg2_temp_parent()) as tmpdir:
-        try:
-            raw_artifact, logical_artifact = await materialize_json_source(
-                url,
-                tmpdir,
-                reuse_raw_artifacts=reuse_raw_artifacts,
-                max_bytes=max_bytes,
-                materialize_logical=False,
-                keep_partial_artifacts=keep_partial_artifacts,
-            )
-        except Exception as exc:
-            logger.warning("Failed to download allowed-amounts file from %s: %s", url, exc)
-            return PTG2FileProcessResult("allowed_amounts", url, False, error=str(exc))
+        if raw_artifact is None or logical_artifact is None:
+            try:
+                raw_artifact, logical_artifact = await materialize_json_source(
+                    url,
+                    tmpdir,
+                    reuse_raw_artifacts=reuse_raw_artifacts,
+                    max_bytes=max_bytes,
+                    materialize_logical=False,
+                    keep_partial_artifacts=keep_partial_artifacts,
+                )
+            except Exception as exc:
+                logger.warning("Failed to download allowed-amounts file from %s: %s", url, exc)
+                return PTG2FileProcessResult("allowed_amounts", url, False, error=str(exc))
         extracted = logical_artifact.logical_path
         meta = provided_meta or await _extract_metadata_fields(extracted)
         file_row = _build_file_row(url, "allowed-amounts", meta, plan_info, description, from_index_url)
-        await push_objects([file_row], file_cls, rewrite=True)
+        await _push_ptg2_objects([file_row], file_cls, rewrite=True)
         await _record_source_version(
             source_type="allowed-amounts",
             domain=PTG2_DOMAIN_ALLOWED_AMOUNT,
@@ -8504,6 +10049,7 @@ async def main(
     allowed_url: str | None = None,
     provider_ref_url: str | None = None,
     import_id: str | None = None,
+    source_key: str | None = None,
     import_month: str | datetime.date | None = None,
     max_files: int | None = None,
     max_items: int | None = None,
@@ -8517,8 +10063,10 @@ async def main(
     """
     PTG2 entry point for the Transparency in Coverage importer.
     """
+    import_started_monotonic = time.monotonic()
     import_month_value = normalize_import_month(import_month)
     import_id_val = _normalize_import_id(import_id or import_month_value.strftime("%Y%m%d"))
+    source_key_val = _normalize_source_key(source_key or os.getenv("HLTHPRT_PTG2_SOURCE_KEY"))
     import_run_id = f"ptg2:{import_id_val}"
     snapshot_id = f"ptg2:{import_month_value.strftime('%Y%m')}:{hash_prefix(semantic_hash(import_run_id), 12)}"
     max_bytes = None
@@ -8532,7 +10080,18 @@ async def main(
     await ensure_database(test_mode)
     await ensure_ptg2_tables()
     compact_import = _env_bool(PTG2_COMPACT_IMPORT_ENV, not test_mode)
-    if compact_import and _use_compact_serving_table():
+    source_scoped_compact = (
+        compact_import
+        and not test_mode
+        and _use_compact_serving_table()
+        and _use_rust_compact_serving()
+    )
+    if source_scoped_compact and source_key_val is None:
+        if test_mode:
+            source_key_val = _normalize_source_key(import_id_val)
+        else:
+            raise ValueError("PTG2 Rust compact serving imports require --source-key or HLTHPRT_PTG2_SOURCE_KEY")
+    if compact_import and _use_compact_serving_table() and not source_scoped_compact:
         await prepare_ptg2_compact_bulk_load()
     now = _utcnow()
     options_payload = {
@@ -8541,6 +10100,7 @@ async def main(
         "in_network_url": in_network_url,
         "allowed_url": allowed_url,
         "provider_ref_url": provider_ref_url,
+        "source_key": source_key_val,
         "plan_ids": plan_ids or [],
         "plan_name_contains": plan_name_contains or [],
         "plan_market_types": plan_market_types or [],
@@ -8553,7 +10113,8 @@ async def main(
         "compact_import": compact_import,
         "async_write_tasks": max(_env_int(PTG2_ASYNC_WRITE_TASKS_ENV, 1), 1),
         "fast_provider_union": _env_bool(PTG2_FAST_PROVIDER_UNION_ENV, False),
-        "serving_only_import": _env_bool(PTG2_SERVING_ONLY_IMPORT_ENV, False),
+        "serving_only_import": _use_serving_only_import(),
+        "source_scoped_compact": source_scoped_compact,
         "stage_serving_as_final": _use_stage_serving_as_final(),
         "test_mode": test_mode,
     }
@@ -8592,14 +10153,23 @@ async def main(
         rewrite=True,
     )
     failure_report: dict[str, Any] = {"snapshot_id": snapshot_id, "legacy_table_suffix": import_id_val}
+    rust_snapshot_stage_tables: dict[str, str] = {}
+    current_pointer_published = False
     try:
         if compact_import:
             schema = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
             await db.status(f"DELETE FROM {schema}.ptg2_serving_rate WHERE snapshot_id = :snapshot_id", snapshot_id=snapshot_id)
+        if source_scoped_compact:
+            assert source_key_val is not None
+            rust_snapshot_stage_tables = await _create_rust_copy_stage_tables(
+                _ptg2_snapshot_table_token(source_key_val, snapshot_id),
+                serving_lanes=max(_env_int(PTG2_RUST_WORKERS_ENV, PTG2_DEFAULT_RUST_WORKERS), 1),
+            )
         classes = await _prepare_ptg_tables(import_id_val, test_mode)
 
         provider_ref_cache: dict[int, list[dict[str, Any]]] = {}
         jobs: list[dict[str, Any]] = []
+        data_started_monotonic = time.monotonic()
 
         toc_candidates: list[str] = []
         if toc_urls:
@@ -8608,21 +10178,27 @@ async def main(
             toc_candidates.extend(_load_toc_urls_from_file(toc_list))
         toc_candidates = _dedupe_preserve([u.strip() for u in toc_candidates if u.strip()])
 
+        toc_failures: list[dict[str, Any]] = []
         for idx, toc_url in enumerate(toc_candidates):
             if test_mode and idx >= TEST_TOC_FILES:
                 break
-            toc_jobs = await _process_table_of_contents(
-                toc_url,
-                classes,
-                test_mode,
-                plan_ids=plan_ids,
-                plan_name_contains=plan_name_contains,
-                plan_market_types=plan_market_types,
-                import_run_id=import_run_id,
-                reuse_raw_artifacts=reuse_raw_artifacts,
-                max_bytes=max_bytes,
-                keep_partial_artifacts=keep_partial_artifacts,
-            )
+            try:
+                toc_jobs = await _process_table_of_contents(
+                    toc_url,
+                    classes,
+                    test_mode,
+                    plan_ids=plan_ids,
+                    plan_name_contains=plan_name_contains,
+                    plan_market_types=plan_market_types,
+                    import_run_id=import_run_id,
+                    reuse_raw_artifacts=reuse_raw_artifacts,
+                    max_bytes=max_bytes,
+                    keep_partial_artifacts=keep_partial_artifacts,
+                    raise_on_error=True,
+                )
+            except Exception as exc:
+                toc_failures.append({"url": toc_url, "error": str(exc)})
+                continue
             jobs.extend(toc_jobs)
 
         if provider_ref_url:
@@ -8643,51 +10219,114 @@ async def main(
         if allowed_url:
             jobs.append({"type": "allowed_amounts", "url": allowed_url})
         jobs = _filter_jobs_by_url_contains(jobs, file_url_contains)
+        if toc_failures and not _env_bool("HLTHPRT_PTG2_ALLOW_PARTIAL_IMPORT", False):
+            failure_report = {
+                "toc_urls": toc_candidates,
+                "toc_failures": toc_failures,
+                "jobs_discovered": len(jobs),
+                "files_attempted": 0,
+                "files_processed": 0,
+                "files_failed": 0,
+                "snapshot_id": snapshot_id,
+                "legacy_table_suffix": import_id_val,
+            }
+            raise RuntimeError(
+                f"PTG2 import failed {len(toc_failures)} table-of-contents file(s); "
+                "set HLTHPRT_PTG2_ALLOW_PARTIAL_IMPORT=true to continue with other discovered jobs"
+            )
+        if toc_candidates and not jobs and not in_network_url and not allowed_url:
+            failure_report = {
+                "toc_urls": toc_candidates,
+                "toc_failures": toc_failures,
+                "jobs_discovered": 0,
+                "files_attempted": 0,
+                "files_processed": 0,
+                "files_failed": 0,
+                "snapshot_id": snapshot_id,
+                "legacy_table_suffix": import_id_val,
+            }
+            raise RuntimeError("PTG2 import processed table-of-contents input but discovered zero rate files")
 
         seen_jobs: set[tuple[str, str]] = set()
-        processed_files = 0
-        attempted_files = 0
-        failed_files: list[dict[str, Any]] = []
+        selected_jobs: list[dict[str, Any]] = []
         for job in jobs:
             job_key = (job.get("type"), job.get("url"))
             if job_key in seen_jobs:
                 continue
             seen_jobs.add(job_key)
-            if max_files is not None and attempted_files >= max_files:
+            if max_files is not None and len(selected_jobs) >= max_files:
                 break
+            if job.get("type") in {"in_network", "allowed_amounts"}:
+                selected_jobs.append(job)
+        processed_files = 0
+        attempted_files = len(selected_jobs)
+        failed_files: list[dict[str, Any]] = []
+        skipped_files: list[dict[str, Any]] = []
+        successful_files: list[dict[str, Any]] = []
+        async for downloaded in _iter_downloaded_ptg_jobs(
+            selected_jobs,
+            reuse_raw_artifacts=reuse_raw_artifacts,
+            max_bytes=max_bytes,
+            keep_partial_artifacts=keep_partial_artifacts,
+        ):
+            job = downloaded.job
             result: PTG2FileProcessResult | None = None
+            if downloaded.error:
+                logger.warning("Failed to download %s file from %s: %s", job.get("type"), job.get("url"), downloaded.error)
+                result = PTG2FileProcessResult(
+                    str(job.get("type") or "unknown"),
+                    str(job.get("url") or ""),
+                    False,
+                    error=downloaded.error,
+                )
+            elif downloaded.raw_artifact is None or downloaded.logical_artifact is None:
+                result = PTG2FileProcessResult(
+                    str(job.get("type") or "unknown"),
+                    str(job.get("url") or ""),
+                    False,
+                    error="download did not produce an artifact",
+                )
             if job.get("type") == "in_network":
-                attempted_files += 1
-                result = await _process_in_network_file(
-                    job,
-                    classes,
-                    provider_ref_cache,
-                    test_mode,
-                    reuse_raw_artifacts=reuse_raw_artifacts,
-                    max_bytes=max_bytes,
-                    max_items=max_items,
-                    import_run_id=import_run_id,
-                    keep_partial_artifacts=keep_partial_artifacts,
-                    compact_import=compact_import,
-                    snapshot_id=snapshot_id,
-                    import_month=import_month_value,
-                )
+                if result is None:
+                    result = await _process_in_network_file(
+                        job,
+                        classes,
+                        provider_ref_cache,
+                        test_mode,
+                        reuse_raw_artifacts=reuse_raw_artifacts,
+                        max_bytes=max_bytes,
+                        max_items=max_items,
+                        import_run_id=import_run_id,
+                        keep_partial_artifacts=keep_partial_artifacts,
+                        compact_import=compact_import,
+                        snapshot_id=snapshot_id,
+                        import_month=import_month_value,
+                        rust_stage_tables=rust_snapshot_stage_tables if source_scoped_compact else None,
+                        raw_artifact=downloaded.raw_artifact,
+                        logical_artifact=downloaded.logical_artifact,
+                    )
             elif job.get("type") == "allowed_amounts":
-                attempted_files += 1
-                result = await _process_allowed_amounts_file(
-                    job,
-                    classes,
-                    test_mode,
-                    reuse_raw_artifacts=reuse_raw_artifacts,
-                    max_bytes=max_bytes,
-                    max_items=max_items,
-                    import_run_id=import_run_id,
-                    keep_partial_artifacts=keep_partial_artifacts,
-                )
+                if result is None:
+                    result = await _process_allowed_amounts_file(
+                        job,
+                        classes,
+                        test_mode,
+                        reuse_raw_artifacts=reuse_raw_artifacts,
+                        max_bytes=max_bytes,
+                        max_items=max_items,
+                        import_run_id=import_run_id,
+                        keep_partial_artifacts=keep_partial_artifacts,
+                        raw_artifact=downloaded.raw_artifact,
+                        logical_artifact=downloaded.logical_artifact,
+                    )
             if result is None:
                 continue
             if result.success:
-                processed_files += 1
+                if result.skipped:
+                    skipped_files.append(asdict(result))
+                else:
+                    processed_files += 1
+                    successful_files.append(asdict(result))
             else:
                 failed_files.append(asdict(result))
 
@@ -8696,7 +10335,11 @@ async def main(
             "files_attempted": attempted_files,
             "files_processed": processed_files,
             "files_failed": len(failed_files),
+            "files_skipped": len(skipped_files),
+            "successful_files": successful_files,
+            "skipped_files": skipped_files,
             "failed_files": failed_files,
+            "toc_failures": toc_failures,
             "snapshot_id": snapshot_id,
             "legacy_table_suffix": import_id_val,
         }
@@ -8704,9 +10347,25 @@ async def main(
             raise RuntimeError(
                 f"PTG2 import discovered {len(jobs)} job(s) but processed zero files successfully"
             )
+        if failed_files and not _env_bool("HLTHPRT_PTG2_ALLOW_PARTIAL_IMPORT", False):
+            raise RuntimeError(
+                f"PTG2 import failed {len(failed_files)} of {attempted_files} attempted file(s); "
+                "set HLTHPRT_PTG2_ALLOW_PARTIAL_IMPORT=true to publish a partial snapshot"
+            )
 
         await flush_error_log(classes["ImportLog"])
-        if compact_import and _use_compact_serving_table():
+        data_seconds = time.monotonic() - data_started_monotonic
+        publish_started_monotonic = time.monotonic()
+        if source_scoped_compact and rust_snapshot_stage_tables:
+            assert source_key_val is not None
+            serving_index = await _publish_rust_compact_snapshot_tables(
+                rust_snapshot_stage_tables,
+                snapshot_id=snapshot_id,
+                import_run_id=import_run_id,
+                source_key=source_key_val,
+            )
+            rust_snapshot_stage_tables = {}
+        elif compact_import and _use_compact_serving_table():
             serving_index = await build_ptg2_compact_serving_index(snapshot_id, import_run_id)
         elif compact_import and _use_stage_serving_as_final():
             serving_index = await build_ptg2_stage_serving_index(snapshot_id, import_run_id)
@@ -8718,8 +10377,10 @@ async def main(
             )
         if compact_import and serving_index is None:
             serving_index = await build_ptg2_db_serving_index(snapshot_id, import_run_id)
+        publish_seconds = time.monotonic() - publish_started_monotonic
         finished = _utcnow()
         previous_snapshot_id = None
+        global_previous_snapshot_id = None
         try:
             row = await (
                 db.select(PTG2CurrentSnapshot.__table__.c.snapshot_id)
@@ -8727,10 +10388,31 @@ async def main(
                 .first()
             )
             if row is not None:
-                previous_snapshot_id = row[0]
+                global_previous_snapshot_id = row[0]
         except Exception as exc:
             logger.debug("No PTG2 current snapshot found before publish: %s", exc)
-        report_payload = {**failure_report, "serving_index": serving_index}
+        if source_scoped_compact and source_key_val:
+            previous_snapshot_id = await _current_source_snapshot_id(source_key_val)
+        else:
+            previous_snapshot_id = global_previous_snapshot_id
+        serving_timings = serving_index.get("timings", {}) if isinstance(serving_index, dict) else {}
+        timing_payload = {
+            "total_seconds": time.monotonic() - import_started_monotonic,
+            "data_seconds": data_seconds,
+            "publish_seconds": publish_seconds,
+        }
+        if isinstance(serving_timings, dict):
+            for key, value in serving_timings.items():
+                try:
+                    timing_payload[key] = float(value)
+                except (TypeError, ValueError):
+                    continue
+        report_payload = {**failure_report, "serving_index": serving_index, "timings": timing_payload}
+        if isinstance(serving_index, dict):
+            authoritative_rate_count = serving_index.get("serving_rates", serving_index.get("rate_count"))
+            if authoritative_rate_count is not None:
+                report_payload["serving_rates"] = int(authoritative_rate_count)
+                report_payload["rate_count"] = int(authoritative_rate_count)
         await _push_ptg2_objects(
             [
                 {
@@ -8748,18 +10430,33 @@ async def main(
             PTG2Snapshot,
             rewrite=True,
         )
+        if source_scoped_compact and source_key_val:
+            await _publish_ptg2_source_pointers(
+                source_key=source_key_val,
+                snapshot_id=snapshot_id,
+                previous_snapshot_id=previous_snapshot_id,
+                import_month=import_month_value,
+                updated_at=finished,
+                serving_index=serving_index,
+            )
         await _push_ptg2_objects(
             [
                 {
                     "slot": "current",
                     "snapshot_id": snapshot_id,
-                    "previous_snapshot_id": previous_snapshot_id,
+                    "previous_snapshot_id": global_previous_snapshot_id,
                     "updated_at": finished,
                 }
             ],
             PTG2CurrentSnapshot,
             rewrite=True,
         )
+        current_pointer_published = True
+        if source_scoped_compact and source_key_val:
+            keep_snapshot_ids = {snapshot_id}
+            if previous_snapshot_id:
+                keep_snapshot_ids.add(previous_snapshot_id)
+            await _cleanup_old_ptg2_source_tables(source_key_val, keep_snapshot_ids)
         await _push_ptg2_objects(
             [
                 {
@@ -8777,7 +10474,44 @@ async def main(
             PTG2ImportRun,
             rewrite=True,
         )
+        done_line = (
+            "PTG2_IMPORT_DONE"
+            f"\timport_run_id={import_run_id}"
+            f"\tsnapshot_id={snapshot_id}"
+            f"\tstatus={PTG2_STATUS_VALIDATED}"
+            f"\tfiles_processed={processed_files}"
+            f"\tfiles_failed={len(failed_files)}"
+            f"\tserving_rates={report_payload.get('serving_rates', 'unknown')}"
+            f"\ttotal_seconds={timing_payload['total_seconds']:.2f}"
+            f"\tdata_seconds={timing_payload['data_seconds']:.2f}"
+            f"\tpublish_seconds={timing_payload['publish_seconds']:.2f}"
+            f"\tindex_seconds={float(timing_payload.get('index_seconds', 0.0)):.2f}"
+            f"\tanalyze_seconds={float(timing_payload.get('analyze_seconds', 0.0)):.2f}"
+        )
+        _emit_screen_line(done_line)
+        logger.info(done_line)
     except Exception as exc:
+        if source_scoped_compact and not current_pointer_published:
+            serving_index = failure_report.get("serving_index")
+            try:
+                await _drop_ptg2_snapshot_tables_for_manifest(serving_index if isinstance(serving_index, dict) else None)
+                if source_key_val:
+                    await _drop_ptg2_snapshot_table_names(
+                        [
+                            _ptg2_snapshot_table_name(kind, source_key_val, snapshot_id)
+                            for kind in (
+                                "serving_rate_compact",
+                                "procedure",
+                                "price_set",
+                                "provider_set",
+                                "provider_group_member",
+                            )
+                        ]
+                    )
+                if rust_snapshot_stage_tables:
+                    await _drop_ptg2_snapshot_table_names(list(rust_snapshot_stage_tables.values()))
+            except Exception:
+                logger.debug("Failed to clean PTG2 source-scoped tables for failed import", exc_info=True)
         await _mark_ptg2_import_failed(
             import_run_id,
             snapshot_id,

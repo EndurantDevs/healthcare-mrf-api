@@ -1323,7 +1323,10 @@ async def test_list_providers_by_procedure_with_q():
 
 @pytest.mark.asyncio
 async def test_list_providers_by_procedure_routes_plan_filter_to_ptg2(monkeypatch):
+    seen_args = {}
+
     async def fake_search(_session, args, pagination):
+        seen_args.update(args)
         return {
             "items": [{"npi": 1234567890, "tic_prices": [{"negotiated_rate": "450.00"}]}],
             "pagination": {
@@ -1338,7 +1341,16 @@ async def test_list_providers_by_procedure_routes_plan_filter_to_ptg2(monkeypatc
     monkeypatch.setattr(pricing_module, "search_current_ptg2_index", fake_search)
     request = make_request(
         [FakeResult(scalar=1)],
-        args={"plan_id": "010854205", "code": "70551", "limit": "10"},
+        args={
+            "plan_id": "010854205",
+            "plan_market_type": "group",
+            "source_key": "heartland_dental",
+            "code": "70551",
+            "limit": "10",
+            "include_providers": "true",
+            "include_code_details": "true",
+            "include_sources": "true",
+        },
     )
 
     response = await list_providers_by_procedure(request)
@@ -1346,6 +1358,12 @@ async def test_list_providers_by_procedure_routes_plan_filter_to_ptg2(monkeypatc
 
     assert payload["items"][0]["tic_prices"][0]["negotiated_rate"] == "450.00"
     assert payload["query"]["source"] == "ptg2"
+    assert seen_args["plan_market_type"] == "group"
+    assert seen_args["source_key"] == "heartland_dental"
+    assert seen_args["include_providers"] == "true"
+    assert seen_args["include_code_details"] == "true"
+    assert seen_args["include_sources"] == "true"
+    assert seen_args["include_details"] is None
 
 
 @pytest.mark.asyncio
