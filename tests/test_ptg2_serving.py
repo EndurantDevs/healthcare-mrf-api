@@ -392,6 +392,143 @@ async def test_current_ptg2_snapshot_rolls_back_missing_source_pointer_before_fa
 
 
 @pytest.mark.asyncio
+async def test_ptg2_provider_procedures_uses_compact_snapshot_without_market_column():
+    session = FakeSession(
+        [
+            "snap-token",
+            {
+                "table": "mrf.ptg2_serving_rate_compact_token",
+                "price_table": "mrf.ptg2_price_set_token",
+                "procedure_table": "mrf.ptg2_procedure_token",
+                "provider_set_table": "mrf.ptg2_provider_set_token",
+                "provider_group_member_table": "mrf.ptg2_provider_group_member_token",
+            },
+            "mrf.ptg2_serving_rate_compact_token",
+            "mrf.ptg2_provider_set_token_group_hashes_gin_idx",
+            1,
+            FakeResult(
+                rows=[
+                    {
+                        "serving_rate_id": "rate-1",
+                        "snapshot_id": "snap-token",
+                        "plan_id": "010854205",
+                        "plan_name": None,
+                        "plan_id_type": None,
+                        "plan_market_type": None,
+                        "issuer_name": None,
+                        "plan_sponsor_name": None,
+                        "procedure_code": None,
+                        "reported_code_system": "CPT",
+                        "reported_code": "99213",
+                        "billing_code": "99213",
+                        "billing_code_type": "CPT",
+                        "procedure_name": "Office visit",
+                        "procedure_description": "Established office visit",
+                        "provider_set_hash": "provider-set-1",
+                        "provider_count": 2,
+                        "provider_set_count": None,
+                        "price_set_hash": "price-set-1",
+                        "prices": [{"negotiated_type": "negotiated", "negotiated_rate": 101.42}],
+                    }
+                ]
+            ),
+        ]
+    )
+
+    payload = await ptg2_serving.search_ptg2_provider_procedures(
+        session,
+        1083311500,
+        {
+            "plan_id": "010854205",
+            "plan_market_type": "group",
+            "source_key": "heartland_dental",
+            "code": "99213",
+            "code_system": "CPT",
+        },
+        FakePagination(),
+    )
+
+    assert payload["items"][0]["npi"] == 1083311500
+    assert payload["items"][0]["reported_code"] == "99213"
+    assert payload["items"][0]["tic_prices"][0]["negotiated_rate"] == 101.42
+    count_sql = str(session.calls[4][0][0])
+    row_sql = str(session.calls[5][0][0])
+    assert "r.plan_market_type" not in count_sql
+    assert "r.plan_market_type" not in row_sql
+    assert "NULL::varchar AS plan_market_type" in row_sql
+    assert "r.provider_set_count" not in row_sql
+    assert "NULL::integer AS provider_set_count" in row_sql
+    assert session.calls[4][0][1]["plan_id"] == "010854205"
+
+
+@pytest.mark.asyncio
+async def test_ptg2_provider_procedures_returns_no_match_after_snapshot_resolves():
+    session = FakeSession(
+        [
+            "snap-token",
+            {
+                "table": "mrf.ptg2_serving_rate_compact_token",
+                "price_table": "mrf.ptg2_price_set_token",
+                "procedure_table": "mrf.ptg2_procedure_token",
+                "provider_set_table": "mrf.ptg2_provider_set_token",
+                "provider_group_member_table": "mrf.ptg2_provider_group_member_token",
+            },
+            "mrf.ptg2_serving_rate_compact_token",
+            "mrf.ptg2_provider_set_token_group_hashes_gin_idx",
+            0,
+        ]
+    )
+
+    payload = await ptg2_serving.search_ptg2_provider_procedures(
+        session,
+        1083311500,
+        {"plan_id": "010854205", "code": "99213", "code_system": "CPT", "include_details": "true"},
+        FakePagination(),
+    )
+
+    assert payload["items"] == []
+    assert payload["pagination"]["total"] == 0
+    assert payload["query"]["snapshot_id"] == "snap-token"
+    assert payload["query"]["status"] == "no_match"
+    assert payload["query"]["source"] == "ptg2_db"
+
+
+@pytest.mark.asyncio
+async def test_ptg2_provider_procedures_accepts_hashed_provider_gin_index_name():
+    session = FakeSession(
+        [
+            "snap-token",
+            {
+                "table": "mrf.ptg2_serving_rate_compact_token",
+                "price_table": "mrf.ptg2_price_set_token",
+                "procedure_table": "mrf.ptg2_procedure_token",
+                "provider_set_table": "mrf.ptg2_provider_set_token",
+                "provider_group_member_table": "mrf.ptg2_provider_group_member_token",
+            },
+            "mrf.ptg2_serving_rate_compact_token",
+            None,
+            True,
+            0,
+        ]
+    )
+
+    payload = await ptg2_serving.search_ptg2_provider_procedures(
+        session,
+        1083311500,
+        {"plan_id": "010854205", "code": "99213", "code_system": "CPT"},
+        FakePagination(),
+    )
+
+    gin_sql = str(session.calls[4][0][0])
+    assert "pg_index" in gin_sql
+    assert "index_am.amname = 'gin'" in gin_sql
+    assert session.calls[4][0][1]["table_name"] == "mrf.ptg2_provider_set_token"
+    assert session.calls[4][0][1]["column_name"] == "provider_group_hashes"
+    assert payload["query"]["provider_reverse_index"] is True
+    assert payload["query"]["status"] == "no_match"
+
+
+@pytest.mark.asyncio
 async def test_compact_serving_uses_snapshot_price_and_procedure_tables():
     session = FakeSession([FakeResult(rows=[])])
     tables = ptg2_serving.PTG2ServingTables(

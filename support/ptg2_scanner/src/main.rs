@@ -705,7 +705,10 @@ fn send_worker_job<W: Write>(
             Err(TrySendError::Disconnected(returned_job)) => {
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
-                    format!("compact worker queue closed while sending {}", returned_job.name()),
+                    format!(
+                        "compact worker queue closed while sending {}",
+                        returned_job.name()
+                    ),
                 ));
             }
         }
@@ -1807,7 +1810,7 @@ fn process_compact_rate_lites<W: Write>(
         }
     }
 
-    let mut parsed_rates: Vec<(String, Value, i64, i64)> = Vec::new();
+    let mut parsed_rates: Vec<(String, Value, i64, Vec<i64>, i64)> = Vec::new();
     for rate in rates {
         let provider_entry = if !rate.provider_groups.is_empty() {
             let provider_ref = json!({"provider_groups": rate.provider_groups});
@@ -1830,22 +1833,50 @@ fn process_compact_rate_lites<W: Write>(
             price_set_hash,
             price_payload,
             provider_entry.entry_hash,
+            provider_entry.provider_group_hashes,
             provider_entry.provider_count,
         ));
     }
 
-    let mut grouped: BTreeMap<String, (String, Value, HashSet<i64>, i64)> = BTreeMap::new();
-    for (price_set_hash, price_payload, provider_entry_hash, provider_count) in parsed_rates {
-        let group = grouped
-            .entry(price_set_hash.clone())
-            .or_insert_with(|| (price_set_hash, price_payload, HashSet::new(), 0));
+    let mut grouped: BTreeMap<String, (String, Value, HashSet<i64>, HashSet<i64>, i64)> =
+        BTreeMap::new();
+    for (
+        price_set_hash,
+        price_payload,
+        provider_entry_hash,
+        provider_group_hashes,
+        provider_count,
+    ) in parsed_rates
+    {
+        let group = grouped.entry(price_set_hash.clone()).or_insert_with(|| {
+            (
+                price_set_hash,
+                price_payload,
+                HashSet::new(),
+                HashSet::new(),
+                0,
+            )
+        });
         if group.2.insert(provider_entry_hash) {
-            group.3 += provider_count;
+            for provider_group_hash in provider_group_hashes {
+                group.3.insert(provider_group_hash);
+            }
+            group.4 += provider_count;
         }
     }
 
-    for (_key, (price_set_hash, price_payload, provider_hashes, provider_count)) in grouped {
-        let mut sorted_provider_hashes: Vec<i64> = provider_hashes.into_iter().collect();
+    for (
+        _key,
+        (
+            price_set_hash,
+            price_payload,
+            _provider_entry_hashes,
+            provider_group_hashes,
+            provider_count,
+        ),
+    ) in grouped
+    {
+        let mut sorted_provider_hashes: Vec<i64> = provider_group_hashes.into_iter().collect();
         sorted_provider_hashes.sort_unstable();
         let provider_set_hash = semantic_hash(
             "provider_set",
@@ -2050,7 +2081,7 @@ fn process_compact_rate_lites_worker<W: Write>(
         }
     }
 
-    let parsed_rates: Vec<(String, Value, i64, i64)> = rates
+    let parsed_rates: Vec<(String, Value, i64, Vec<i64>, i64)> = rates
         .iter()
         .filter_map(|rate| {
             let provider_entry = provider_set_from_ref_keys(provider_map, &rate.provider_refs)?;
@@ -2059,23 +2090,51 @@ fn process_compact_rate_lites_worker<W: Write>(
                 price_set_hash,
                 price_payload,
                 provider_entry.entry_hash,
+                provider_entry.provider_group_hashes,
                 provider_entry.provider_count,
             ))
         })
         .collect();
 
-    let mut grouped: BTreeMap<String, (String, Value, HashSet<i64>, i64)> = BTreeMap::new();
-    for (price_set_hash, price_payload, provider_entry_hash, provider_count) in parsed_rates {
-        let group = grouped
-            .entry(price_set_hash.clone())
-            .or_insert_with(|| (price_set_hash, price_payload, HashSet::new(), 0));
+    let mut grouped: BTreeMap<String, (String, Value, HashSet<i64>, HashSet<i64>, i64)> =
+        BTreeMap::new();
+    for (
+        price_set_hash,
+        price_payload,
+        provider_entry_hash,
+        provider_group_hashes,
+        provider_count,
+    ) in parsed_rates
+    {
+        let group = grouped.entry(price_set_hash.clone()).or_insert_with(|| {
+            (
+                price_set_hash,
+                price_payload,
+                HashSet::new(),
+                HashSet::new(),
+                0,
+            )
+        });
         if group.2.insert(provider_entry_hash) {
-            group.3 += provider_count;
+            for provider_group_hash in provider_group_hashes {
+                group.3.insert(provider_group_hash);
+            }
+            group.4 += provider_count;
         }
     }
 
-    for (_key, (price_set_hash, price_payload, provider_hashes, provider_count)) in grouped {
-        let mut sorted_provider_hashes: Vec<i64> = provider_hashes.into_iter().collect();
+    for (
+        _key,
+        (
+            price_set_hash,
+            price_payload,
+            _provider_entry_hashes,
+            provider_group_hashes,
+            provider_count,
+        ),
+    ) in grouped
+    {
+        let mut sorted_provider_hashes: Vec<i64> = provider_group_hashes.into_iter().collect();
         sorted_provider_hashes.sort_unstable();
         let provider_set_hash = semantic_hash(
             "provider_set",
@@ -2676,12 +2735,7 @@ fn scan_compact_struson_parallel(
                 drop(rx);
 
                 for refs in provider_ref_jobs.drain(..) {
-                    send_worker_job(
-                        &tx,
-                        &event_rx,
-                        &mut writer,
-                        WorkerJob::ProviderRefs(refs),
-                    )?;
+                    send_worker_job(&tx, &event_rx, &mut writer, WorkerJob::ProviderRefs(refs))?;
                 }
 
                 while json_reader.has_next().map_err(to_io_error)? {
@@ -2855,7 +2909,10 @@ fn scan_compact_struson(path: &Path) -> io::Result<()> {
         "HLTHPRT_PTG2_RUST_WORK_QUEUE",
         DEFAULT_COMPACT_RUST_WORK_QUEUE,
     );
-    if rust_worker_count > 1 && copy_paths.has_file_paths() && compact_parallel_has_provider_references(path)? {
+    if rust_worker_count > 1
+        && copy_paths.has_file_paths()
+        && compact_parallel_has_provider_references(path)?
+    {
         return scan_compact_struson_parallel(
             path,
             CompactContext {

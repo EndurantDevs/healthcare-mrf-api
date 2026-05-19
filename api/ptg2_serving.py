@@ -646,6 +646,36 @@ async def _index_available(session, index_name: str) -> bool:
         return False
 
 
+async def _gin_index_available_for_column(session, table_name: str, column_name: str) -> bool:
+    try:
+        result = await session.execute(
+            text(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                      FROM pg_index ix
+                      JOIN pg_class table_class ON table_class.oid = ix.indrelid
+                      JOIN pg_namespace table_schema ON table_schema.oid = table_class.relnamespace
+                      JOIN pg_class index_class ON index_class.oid = ix.indexrelid
+                      JOIN pg_am index_am ON index_am.oid = index_class.relam
+                      JOIN pg_attribute attr
+                        ON attr.attrelid = table_class.oid
+                       AND attr.attnum = ANY(ix.indkey)
+                     WHERE table_class.oid = to_regclass(:table_name)
+                       AND attr.attname = :column_name
+                       AND index_am.amname = 'gin'
+                       AND ix.indisvalid
+                       AND ix.indisready
+                )
+                """
+            ),
+            {"table_name": table_name, "column_name": column_name},
+        )
+        return bool(result.scalar())
+    except Exception:
+        return False
+
+
 def _serving_table_name() -> str:
     configured = str(os.getenv(PTG2_SERVING_TABLE_ENV) or "ptg2_serving_rate").strip()
     if "." in configured:
@@ -1917,7 +1947,10 @@ async def search_ptg2_provider_procedures(session, npi: int, args: dict[str, Any
     procedure_table = serving_tables.procedure_table or f"{schema}.ptg2_procedure"
     price_set_table = serving_tables.price_table or f"{schema}.ptg2_price_set"
     provider_group_hashes_index = f"{provider_set_table}_group_hashes_gin_idx"
-    has_reverse_provider_index = await _index_available(session, provider_group_hashes_index)
+    has_reverse_provider_index = (
+        await _index_available(session, provider_group_hashes_index)
+        or await _gin_index_available_for_column(session, provider_set_table, "provider_group_hashes")
+    )
 
     params: dict[str, Any] = {
         "snapshot_id": snapshot_id,
@@ -1962,9 +1995,6 @@ async def search_ptg2_provider_procedures(session, npi: int, args: dict[str, Any
     if requested_plan:
         filters.append("r.plan_id = :plan_id")
         params["plan_id"] = requested_plan
-    if market_type:
-        filters.append("r.plan_market_type = :plan_market_type")
-        params["plan_market_type"] = market_type
 
     _append_code_filter(filters, params, code=code_value, code_system=args.get("code_system"))
     q_filter = ""
@@ -2013,7 +2043,47 @@ async def search_ptg2_provider_procedures(session, npi: int, args: dict[str, Any
     )
     total = int(count_result.scalar() or 0)
     if total <= 0:
-        return None
+        return _shape_ptg2_response(
+            {
+                "items": [],
+                "pagination": {
+                    "total": 0,
+                    "limit": pagination.limit,
+                    "offset": pagination.offset,
+                    "page": (pagination.offset // pagination.limit) + 1 if pagination.limit else 1,
+                },
+                "query": {
+                    "npi": npi,
+                    "plan_id": args.get("plan_id") or None,
+                    "plan_external_id": args.get("plan_external_id") or None,
+                    "plan_market_type": market_type or None,
+                    "source_key": args.get("source_key") or None,
+                    "snapshot_id": snapshot_id,
+                    "mode": normalize_ptg2_mode(args.get("mode")),
+                    "code": code_value or None,
+                    "code_system": args.get("code_system") or None,
+                    "q": q_text or None,
+                    "source": "ptg2_db",
+                    "serving_table": table_name,
+                    "provider_reverse_index": has_reverse_provider_index,
+                    "status": "no_match",
+                },
+            },
+            args,
+        )
+
+    matched_rate_procedure_join = ""
+    matched_rate_q_filter = ""
+    if q_filter:
+        matched_rate_procedure_join = f"""
+                  JOIN LATERAL (
+                        SELECT proc.*
+                          FROM {procedure_table} proc
+                         WHERE proc.procedure_hash = r.procedure_hash
+                         LIMIT 1
+                  ) proc ON TRUE
+        """
+        matched_rate_q_filter = q_filter
 
     row_result = await session.execute(
         text(
@@ -2028,16 +2098,39 @@ async def search_ptg2_provider_procedures(session, npi: int, args: dict[str, Any
                   FROM provider_groups pg
                   JOIN {provider_set_table} ps
                     ON ps.provider_group_hashes @> ARRAY[pg.provider_group_hash]::bigint[]
+            ),
+            matched_rates AS MATERIALIZED (
+                SELECT
+                    r.serving_rate_id,
+                    r.snapshot_id,
+                    r.plan_id,
+                    r.procedure_code,
+                    r.reported_code_system,
+                    r.reported_code,
+                    r.billing_code,
+                    r.billing_code_type,
+                    r.procedure_hash,
+                    r.provider_set_hash,
+                    r.provider_count,
+                    r.price_set_hash
+                  FROM provider_sets provider_set_match
+                  JOIN {table_name} r
+                    ON r.provider_set_hash = provider_set_match.provider_set_hash
+                  {matched_rate_procedure_join}
+                 WHERE {where_sql}
+                 {matched_rate_q_filter}
+                 ORDER BY r.reported_code_system, r.reported_code, r.provider_count DESC NULLS LAST, r.serving_rate_id
+                 LIMIT :limit OFFSET :offset
             )
             SELECT
                 r.serving_rate_id,
                 r.snapshot_id,
                 r.plan_id,
-                r.plan_name,
-                r.plan_id_type,
-                r.plan_market_type,
-                r.issuer_name,
-                r.plan_sponsor_name,
+                NULL::varchar AS plan_name,
+                NULL::varchar AS plan_id_type,
+                NULL::varchar AS plan_market_type,
+                NULL::varchar AS issuer_name,
+                NULL::varchar AS plan_sponsor_name,
                 r.procedure_code,
                 r.reported_code_system,
                 r.reported_code,
@@ -2047,12 +2140,10 @@ async def search_ptg2_provider_procedures(session, npi: int, args: dict[str, Any
                 proc.description AS procedure_description,
                 r.provider_set_hash,
                 r.provider_count,
-                r.provider_set_count,
+                NULL::integer AS provider_set_count,
                 r.price_set_hash,
                 COALESCE({compact_price_json}, CAST('[]' AS json)) AS prices
-              FROM provider_sets provider_set_match
-              JOIN {table_name} r
-                ON r.provider_set_hash = provider_set_match.provider_set_hash
+              FROM matched_rates r
               JOIN LATERAL (
                     SELECT proc.*
                       FROM {procedure_table} proc
@@ -2065,10 +2156,7 @@ async def search_ptg2_provider_procedures(session, npi: int, args: dict[str, Any
                      WHERE ps.price_set_hash = r.price_set_hash
                      LIMIT 1
               ) ps ON TRUE
-             WHERE {where_sql}
-             {q_filter}
              ORDER BY r.reported_code_system, r.reported_code, r.provider_count DESC NULLS LAST, r.serving_rate_id
-             LIMIT :limit OFFSET :offset
             """
         ),
         params,
