@@ -838,6 +838,36 @@ def canonicalize_url(url: str) -> str:
     return urlunsplit((scheme, netloc, parsed.path or "/", query, ""))
 
 
+def normalize_tic_source_url(url: str) -> str:
+    """Normalize known payer TOC download URLs that point at stale wrappers."""
+    raw_url = str(url or "").strip()
+    parsed = urlsplit(raw_url)
+    if parsed.netloc.lower() == "www.asrhealthbenefits.com":
+        path = parsed.path.rstrip("/")
+        if path.lower() == "/home/umbraco/surface/mrfdownload/index":
+            query = {key.lower(): value for key, value in parse_qsl(parsed.query, keep_blank_values=True)}
+            group_number = query.get("g") or query.get("groupnumber")
+            file_id = query.get("i") or query.get("fileid")
+            file_type = query.get("t") or query.get("filetype")
+            if group_number and file_id and file_type:
+                return urlunsplit(
+                    (
+                        parsed.scheme or "https",
+                        parsed.netloc,
+                        "/umbraco/surface/mrfdownload",
+                        urlencode(
+                            {
+                                "groupNumber": group_number,
+                                "fileType": file_type,
+                                "fileId": file_id,
+                            }
+                        ),
+                        "",
+                    )
+                )
+    return raw_url
+
+
 def normalize_import_month(value: str | datetime.date | None) -> datetime.date:
     if value is None:
         today = datetime.date.today()
@@ -899,6 +929,7 @@ def parse_toc_catalog_entries(
         for file_entry in structure.get("in_network_files") or []:
             location = file_entry.get("location")
             if location:
+                location = normalize_tic_source_url(location)
                 entries.append(
                     PTG2SourceCatalogEntry(
                         source_type="in-network",
@@ -914,12 +945,13 @@ def parse_toc_catalog_entries(
                 )
         allowed_amount_file = structure.get("allowed_amount_file") or {}
         if allowed_amount_file.get("location"):
+            location = normalize_tic_source_url(allowed_amount_file["location"])
             entries.append(
                 PTG2SourceCatalogEntry(
                     source_type="allowed-amounts",
                     domain=PTG2_DOMAIN_ALLOWED_AMOUNT,
-                    original_url=allowed_amount_file["location"],
-                    canonical_url=canonicalize_url(allowed_amount_file["location"]),
+                    original_url=location,
+                    canonical_url=canonicalize_url(location),
                     from_index_url=toc_url,
                     description=allowed_amount_file.get("description"),
                     reporting_entity_name=toc_meta["reporting_entity_name"],
@@ -942,6 +974,7 @@ def parse_toc_catalog_entries(
                     continue
                 location = drug_entry.get("location")
                 if location:
+                    location = normalize_tic_source_url(location)
                     entries.append(
                         PTG2SourceCatalogEntry(
                             source_type="payer-drug",
@@ -7626,11 +7659,11 @@ def _serving_only_rows_for_payload(
         "acceptance_statement": ptg2_confidence_statement(PTG2_CONFIDENCE_TIC_RATE_NPI_TIN),
     }
     for price_key, item_group in item_price_groups.items():
+        provider_group_hashes = sorted({int(value) for value in item_group["provider_group_hashes"]})
         provider_set_hash = _serving_only_hash_int_sets(
             "serving_provider_set",
-            item_group["provider_entry_hashes"],
+            provider_group_hashes,
         )
-        provider_group_hashes = sorted({int(value) for value in item_group["provider_entry_hashes"]})
         provider_count = int(item_group["provider_count"] or 0)
         provider_set_rows.append(
             {
@@ -7691,7 +7724,7 @@ def _serving_only_rows_for_payload(
         )
         if not compact_serving:
             provider_set_component_rows.extend(
-                _provider_set_component_rows(provider_set_hash, item_group["provider_entry_hashes"])
+                _provider_set_component_rows(provider_set_hash, provider_group_hashes)
             )
         provider_group_member_rows.extend(item_group["provider_group_member_rows"])
         if compact_serving and plan_month_id:
@@ -9694,6 +9727,7 @@ async def _process_table_of_contents(
             location = entry.get("location")
             if not location:
                 continue
+            location = normalize_tic_source_url(location)
             meta = dict(toc_meta)
             file_row = _build_file_row(location, "in-network", meta, plans, entry.get("description"), toc_url)
             if file_row["file_id"] not in seen_files:
@@ -9715,6 +9749,7 @@ async def _process_table_of_contents(
         if allowed_amount_file:
             location = allowed_amount_file.get("location")
             if location:
+                location = normalize_tic_source_url(location)
                 meta = dict(toc_meta)
                 file_row = _build_file_row(
                     location, "allowed-amounts", meta, plans, allowed_amount_file.get("description"), toc_url

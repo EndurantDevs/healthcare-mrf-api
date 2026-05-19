@@ -370,6 +370,101 @@ def test_ptg2_toc_parser_handles_uhc_sponsor_typo_and_duplicate_signed_urls():
     assert in_network_entries[0].plan_info[0]["plan_sponsor_name"] == "Heartland Co"
 
 
+def test_ptg2_toc_parser_normalizes_asr_download_links():
+    toc = {
+        "reporting_entity_name": "ASR Health Benefits",
+        "reporting_entity_type": "Third Party Administrator",
+        "reporting_structure": [
+            {
+                "reporting_plans": [
+                    {
+                        "plan_name": "ASR Health Benefits - ASR1",
+                        "plan_id": "823166837",
+                        "plan_market_type": "group",
+                    }
+                ],
+                "in_network_files": [
+                    {
+                        "location": (
+                            "https://www.asrhealthbenefits.com/home/umbraco/surface/"
+                            "mrfdownload/index?g=1208&i=595&t=InNetwork"
+                        )
+                    }
+                ],
+            }
+        ],
+    }
+
+    entries = process_ptg.parse_toc_catalog_entries(toc, "https://payer.test/toc.json")
+    in_network_entries = [entry for entry in entries if entry.source_type == "in-network"]
+
+    assert len(in_network_entries) == 1
+    assert in_network_entries[0].original_url == (
+        "https://www.asrhealthbenefits.com/umbraco/surface/mrfdownload"
+        "?groupNumber=1208&fileType=InNetwork&fileId=595"
+    )
+    assert in_network_entries[0].canonical_url == (
+        "https://www.asrhealthbenefits.com/umbraco/surface/mrfdownload"
+        "?fileId=595&fileType=InNetwork&groupNumber=1208"
+    )
+
+
+def test_ptg2_toc_jobs_normalize_asr_download_links(monkeypatch):
+    toc = {
+        "reporting_entity_name": "ASR Health Benefits",
+        "reporting_entity_type": "Third Party Administrator",
+        "reporting_structure": [
+            {
+                "reporting_plans": [
+                    {
+                        "plan_name": "ASR Health Benefits - ASR1",
+                        "plan_id": "823166837",
+                        "plan_market_type": "group",
+                    }
+                ],
+                "in_network_files": [
+                    {
+                        "location": (
+                            "https://www.asrhealthbenefits.com/home/umbraco/surface/"
+                            "mrfdownload/index?g=1208&i=596&t=InNetwork"
+                        ),
+                    },
+                ],
+            },
+        ],
+    }
+    pushed_file_rows = []
+
+    async def fake_materialize(*_args, **_kwargs):
+        artifact = SimpleNamespace(logical_path="/tmp/asr-index.json")
+        return artifact, artifact
+
+    async def fake_push_objects(rows, _cls, **_kwargs):
+        pushed_file_rows.extend(rows)
+
+    monkeypatch.setattr(process_ptg, "materialize_json_source", fake_materialize)
+    monkeypatch.setattr(process_ptg, "load_json_artifact", lambda _path: toc)
+    monkeypatch.setattr(process_ptg, "push_objects", fake_push_objects)
+    monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
+
+    jobs = asyncio.run(
+        process_ptg._process_table_of_contents(
+            "https://www.asrhealthbenefits.com/umbraco/surface/mrfdownload?fileType=TableOfContents&groupNumber=1208",
+            {"PTGFile": object, "ImportLog": object},
+            test_mode=False,
+            plan_ids=["823166837"],
+            plan_market_types=["group"],
+        )
+    )
+
+    expected_url = (
+        "https://www.asrhealthbenefits.com/umbraco/surface/mrfdownload"
+        "?groupNumber=1208&fileType=InNetwork&fileId=596"
+    )
+    assert jobs[0]["url"] == expected_url
+    assert any(row["url"] == expected_url and row["file_type"] == "in-network" for row in pushed_file_rows)
+
+
 def test_ptg2_artifact_reuse_by_strong_etag_and_length(tmp_path):
     raw_path = tmp_path / "raw.json"
     raw_path.write_text('{"ok": true}', encoding="utf-8")
@@ -861,6 +956,54 @@ def test_ptg2_fast_provider_union_carries_count_without_npi_materialization(monk
     assert provider_set_row["provider_count"] == 4
     assert provider_set_row["npi"] is None
     assert provider_set_row["canonical_payload"]["provider_count_mode"] == "summed_provider_groups"
+
+
+def test_ptg2_serving_only_provider_set_uses_real_provider_group_hashes():
+    provider_ref = {
+        "provider_group_id": 7,
+        "provider_groups": [
+            {"tin": {"type": "ein", "value": "12-3456789"}, "npi": [1111111111, 2222222222]},
+            {"tin": {"type": "ein", "value": "98-7654321"}, "npi": [3333333333]},
+        ],
+    }
+    provider_entry, _row = process_ptg._build_provider_set_entry(
+        file_id=1,
+        provider_group_ref=provider_ref["provider_group_id"],
+        provider_groups=provider_ref["provider_groups"],
+        network_names=[],
+    )
+    assert provider_entry is not None
+    expected_group_hashes = sorted(provider_entry["provider_group_hashes"])
+    synthetic_entry_hash = int(provider_entry["__hash__"])
+    assert synthetic_entry_hash not in expected_group_hashes
+
+    result = process_ptg._serving_only_rows_for_payload(
+        {
+            "billing_code_type": "CPT",
+            "billing_code": "99213",
+            "negotiated_rates": [
+                {
+                    "provider_references": [7],
+                    "negotiated_prices": [{"negotiated_type": "negotiated", "negotiated_rate": 100}],
+                }
+            ],
+        },
+        provider_map={7: [provider_entry]},
+        plan_fields={"plan_id": "plan", "plan_market_type": "group"},
+        snapshot_id="snapshot",
+        plan_month_id="snapshot-month",
+        source_trace_payload=[],
+        compact_serving=True,
+        source_trace_set_hash="source-trace",
+        include_price_set_rows=True,
+    )
+
+    provider_set = result["provider_set_rows"][0]
+    assert provider_set["canonical_payload"]["provider_group_hashes"] == expected_group_hashes
+    assert provider_set["provider_set_hash"] == process_ptg._serving_only_hash_int_sets(
+        "serving_provider_set",
+        expected_group_hashes,
+    )
 
 
 def test_ptg2_single_pass_in_network_parser_uses_provider_cache(tmp_path, monkeypatch):
@@ -1770,6 +1913,83 @@ def test_ptg2_rust_compact_serving_parallel_workers_write_shards(tmp_path):
     assert dedupe_summary["serving_rate_unique"] == 1
     assert dedupe_summary["serving_rate_duplicate"] == 1
     assert dedupe_summary["serving_rate_reduction_pct"] == 50.0
+
+
+def test_ptg2_rust_compact_provider_sets_use_real_group_hashes(tmp_path):
+    binary = process_ptg._ptg2_rust_scanner_binary()
+    if binary is None:
+        pytest.skip("PTG2 Rust scanner binary is not built")
+    artifact = tmp_path / "rates.json.gz"
+    serving_copy = tmp_path / "serving.copy"
+    provider_set_copy = tmp_path / "provider_set.copy"
+    member_copy = tmp_path / "provider_group_member.copy"
+    payload = {
+        "provider_references": [
+            {
+                "provider_group_id": 7,
+                "provider_groups": [
+                    {"npi": [1111111111, 2222222222], "tin": {"type": "ein", "value": "12-3456789"}},
+                    {"npi": [3333333333], "tin": {"type": "ein", "value": "98-7654321"}},
+                ],
+            }
+        ],
+        "in_network": [
+            {
+                "billing_code_type": "CPT",
+                "billing_code": "99213",
+                "negotiated_rates": [
+                    {
+                        "provider_references": [7],
+                        "negotiated_prices": [{"negotiated_type": "negotiated", "negotiated_rate": 100}],
+                    }
+                ],
+            }
+        ],
+    }
+    with gzip.open(artifact, "wb") as fp:
+        fp.write(json.dumps(payload).encode("utf-8"))
+
+    env = {
+        **os.environ,
+        "HLTHPRT_PTG2_COMPACT_SNAPSHOT_ID": "snapshot",
+        "HLTHPRT_PTG2_COMPACT_PLAN_ID": "plan",
+        "HLTHPRT_PTG2_COMPACT_PLAN_MONTH_ID": "plan-month",
+        "HLTHPRT_PTG2_COMPACT_SOURCE_TRACE_SET_HASH": "source-trace",
+        "HLTHPRT_PTG2_COMPACT_SERVING_COPY_PATH": str(serving_copy),
+        "HLTHPRT_PTG2_PROVIDER_SET_COPY_PATH": str(provider_set_copy),
+        "HLTHPRT_PTG2_PROVIDER_GROUP_MEMBER_COPY_PATH": str(member_copy),
+        "HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES": "1",
+        "HLTHPRT_PTG2_RUST_WORKERS": "2",
+        "HLTHPRT_PTG2_RUST_WORK_QUEUE": "2",
+    }
+    subprocess.run(
+        [str(binary), "--compact-serving", str(artifact)],
+        check=True,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    provider_set_lines = [
+        line
+        for shard_path in sorted(tmp_path.glob("provider_set.copy*"))
+        for line in shard_path.read_text().splitlines()
+    ]
+    assert len(provider_set_lines) == 1
+    provider_set_fields = provider_set_lines[0].split("\t")
+    provider_set_group_hashes = {
+        int(value)
+        for value in provider_set_fields[4].strip("{}").split(",")
+        if value
+    }
+    member_group_hashes = {
+        int(line.split("\t")[0])
+        for shard_path in sorted(tmp_path.glob("provider_group_member.copy*"))
+        for line in shard_path.read_text().splitlines()
+    }
+
+    assert len(member_group_hashes) == 2
+    assert provider_set_group_hashes == member_group_hashes
 
 
 def test_ptg2_rust_compact_uses_bounded_event_queue_default(monkeypatch, tmp_path):
