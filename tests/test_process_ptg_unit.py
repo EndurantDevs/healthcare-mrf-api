@@ -57,6 +57,49 @@ def test_ptg2_filter_jobs_by_url_contains_keeps_matching_rate_file():
     assert result == [jobs[1]]
 
 
+def test_ptg2_dedupe_jobs_uses_canonical_url_and_merges_plans():
+    jobs = [
+        {
+            "type": "in_network",
+            "url": "HTTPS://Example.COM:443/path/rates.json.gz?sig=one&b=2&a=1",
+            "plan_info": [{"plan_id": "A"}],
+            "description": "first",
+        },
+        {
+            "type": "in_network",
+            "url": "https://example.com/path/rates.json.gz?a=1&b=2&Signature=two",
+            "plan_info": [{"plan_id": "B"}],
+            "description": "second",
+        },
+        {
+            "type": "allowed_amounts",
+            "url": "https://example.com/path/rates.json.gz?a=1&b=2&Signature=two",
+            "plan_info": [{"plan_id": "C"}],
+        },
+    ]
+
+    deduped, duplicate_count = process_ptg._dedupe_ptg_jobs(jobs)
+
+    assert duplicate_count == 1
+    assert len(deduped) == 2
+    assert deduped[0]["url"] == jobs[0]["url"]
+    assert deduped[0]["plan_info"] == [{"plan_id": "A"}, {"plan_id": "B"}]
+    assert deduped[1]["type"] == "allowed_amounts"
+
+
+def test_ptg2_stage_copy_dedupe_defaults_avoid_huge_edge_tables(monkeypatch):
+    monkeypatch.delenv("HLTHPRT_PTG2_STAGE_COPY_DEDUPE", raising=False)
+
+    assert process_ptg._ptg2_stage_copy_dedupe_enabled("price_code_set") is True
+    assert process_ptg._ptg2_stage_copy_dedupe_enabled("provider_set") is True
+    assert process_ptg._ptg2_stage_copy_dedupe_enabled("provider_group_member") is True
+    assert process_ptg._ptg2_stage_copy_dedupe_enabled("price_set_entry") is False
+    assert process_ptg._ptg2_stage_copy_dedupe_enabled("provider_entry_component") is False
+
+    monkeypatch.setenv("HLTHPRT_PTG2_STAGE_COPY_DEDUPE", "1")
+    assert process_ptg._ptg2_stage_copy_dedupe_enabled("provider_entry_component") is True
+
+
 def test_ptg2_fast_object_iterator_yields_selected_top_level_arrays():
     payload = (
         b'{"version":"1.0","provider_references":[{"provider_group_id":7,'
@@ -999,7 +1042,6 @@ def test_ptg2_serving_only_provider_set_uses_real_provider_group_hashes():
     )
 
     provider_set = result["provider_set_rows"][0]
-    assert provider_set["canonical_payload"]["provider_group_hashes"] == expected_group_hashes
     assert provider_set["provider_set_hash"] == process_ptg._serving_only_hash_int_sets(
         "serving_provider_set",
         expected_group_hashes,
@@ -1687,7 +1729,7 @@ def test_ptg2_rust_compact_serving_mode_emits_copy_oriented_rows(tmp_path):
 
     kinds = [kind for kind, _row in frames]
     assert "procedure" in kinds
-    assert "price_set" in kinds
+    assert "price_set" not in kinds
     assert "provider_set" in kinds
     assert "serving_rate_compact" in kinds
     compact_row = [row for kind, row in frames if kind == "serving_rate_compact"][0]
@@ -1913,6 +1955,127 @@ def test_ptg2_rust_compact_serving_parallel_workers_write_shards(tmp_path):
     assert dedupe_summary["serving_rate_unique"] == 1
     assert dedupe_summary["serving_rate_duplicate"] == 1
     assert dedupe_summary["serving_rate_reduction_pct"] == 50.0
+    assert dedupe_summary["price_atom_attempted"] == 1
+    assert dedupe_summary["price_atom_unique"] == 1
+    assert dedupe_summary["price_atom_duplicate"] == 0
+    assert dedupe_summary["price_set_entry_attempted"] == 0
+    assert dedupe_summary["price_set_entry_unique"] == 0
+    assert dedupe_summary["price_set_entry_duplicate"] == 0
+    assert dedupe_summary["provider_set_entry_attempted"] == 0
+    assert dedupe_summary["provider_set_entry_unique"] == 0
+    assert dedupe_summary["provider_set_entry_duplicate"] == 0
+    assert dedupe_summary["provider_entry_component_attempted"] == 0
+    assert dedupe_summary["provider_entry_component_unique"] == 0
+    assert dedupe_summary["provider_entry_component_duplicate"] == 0
+
+
+def test_ptg2_rust_compact_price_sets_emit_normalized_membership(tmp_path):
+    binary = process_ptg._ptg2_rust_scanner_binary()
+    if binary is None:
+        pytest.skip("PTG2 Rust scanner binary is not built")
+    artifact = tmp_path / "rates.json.gz"
+    serving_copy = tmp_path / "serving.copy"
+    price_code_set_copy = tmp_path / "price_code_set.copy"
+    price_atom_copy = tmp_path / "price_atom.copy"
+    price_set_entry_copy = tmp_path / "price_set_entry.copy"
+    payload = {
+        "provider_references": [
+            {
+                "provider_group_id": 7,
+                "provider_groups": [{"npi": [1234567890], "tin": {"type": "ein", "value": "12-3456789"}}],
+            }
+        ],
+        "in_network": [
+            {
+                "billing_code_type": "CPT",
+                "billing_code": "99213",
+                "negotiated_rates": [
+                    {
+                        "provider_references": [7],
+                        "negotiated_prices": [
+                            {
+                                "negotiated_type": "negotiated",
+                                "negotiated_rate": 100,
+                                "service_code": [" 11 ", "11"],
+                                "billing_code_modifier": ["tc", " TC "],
+                            },
+                            {
+                                "negotiated_type": "derived",
+                                "negotiated_rate": "125.50",
+                                "service_code": ["22"],
+                                "billing_code_modifier": ["26"],
+                            },
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+    with gzip.open(artifact, "wb") as fp:
+        fp.write(json.dumps(payload).encode("utf-8"))
+
+    env = {
+        **os.environ,
+        "HLTHPRT_PTG2_COMPACT_SNAPSHOT_ID": "snapshot",
+        "HLTHPRT_PTG2_COMPACT_PLAN_ID": "plan",
+        "HLTHPRT_PTG2_COMPACT_PLAN_MONTH_ID": "plan-month",
+        "HLTHPRT_PTG2_COMPACT_SOURCE_TRACE_SET_HASH": "source-trace",
+        "HLTHPRT_PTG2_COMPACT_SERVING_COPY_PATH": str(serving_copy),
+        "HLTHPRT_PTG2_PRICE_CODE_SET_COPY_PATH": str(price_code_set_copy),
+        "HLTHPRT_PTG2_PRICE_ATOM_COPY_PATH": str(price_atom_copy),
+        "HLTHPRT_PTG2_PRICE_SET_ENTRY_COPY_PATH": str(price_set_entry_copy),
+        "HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES": "1",
+        "HLTHPRT_PTG2_RUST_WORKERS": "2",
+        "HLTHPRT_PTG2_RUST_WORK_QUEUE": "2",
+    }
+    completed = subprocess.run(
+        [str(binary), "--compact-serving", str(artifact)],
+        check=True,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    price_atom_lines = [
+        line
+        for shard_path in sorted(tmp_path.glob("price_atom.copy*"))
+        for line in shard_path.read_text().splitlines()
+    ]
+    price_code_set_lines = [
+        line
+        for shard_path in sorted(tmp_path.glob("price_code_set.copy*"))
+        for line in shard_path.read_text().splitlines()
+    ]
+    price_set_entry_lines = [
+        line
+        for shard_path in sorted(tmp_path.glob("price_set_entry.copy*"))
+        for line in shard_path.read_text().splitlines()
+    ]
+    assert not list(tmp_path.glob("price_set.copy*"))
+    assert len(price_atom_lines) == 2
+    assert len(price_code_set_lines) == 4
+    assert len(price_set_entry_lines) == 2
+    atom_fields = [line.split("\t") for line in price_atom_lines]
+    assert all(len(fields) == 9 for fields in atom_fields)
+    assert all(fields[4] != "\\N" and fields[7] != "\\N" for fields in atom_fields)
+    code_set_payloads = {line.split("\t", 1)[1] for line in price_code_set_lines}
+    assert '{"11"}' in code_set_payloads
+    assert '{"TC"}' in code_set_payloads
+
+    frames = []
+    stream = io.BytesIO(completed.stdout)
+    while True:
+        header = stream.readline()
+        if not header:
+            break
+        name, size = header.rstrip(b"\n").split(b"\t", 1)
+        payload_bytes = stream.read(int(size))
+        assert stream.read(1) == b"\n"
+        frames.append((name.decode("utf-8"), json.loads(payload_bytes)))
+    dedupe_summary = [row for kind, row in frames if kind == "dedupe_summary"][0]
+    assert dedupe_summary["price_atom_unique"] == 2
+    assert dedupe_summary["price_set_unique"] == 1
+    assert dedupe_summary["price_set_entry_unique"] == 2
 
 
 def test_ptg2_rust_compact_provider_sets_use_real_group_hashes(tmp_path):
@@ -1922,6 +2085,8 @@ def test_ptg2_rust_compact_provider_sets_use_real_group_hashes(tmp_path):
     artifact = tmp_path / "rates.json.gz"
     serving_copy = tmp_path / "serving.copy"
     provider_set_copy = tmp_path / "provider_set.copy"
+    provider_set_entry_copy = tmp_path / "provider_set_entry.copy"
+    provider_entry_component_copy = tmp_path / "provider_entry_component.copy"
     member_copy = tmp_path / "provider_group_member.copy"
     payload = {
         "provider_references": [
@@ -1957,6 +2122,8 @@ def test_ptg2_rust_compact_provider_sets_use_real_group_hashes(tmp_path):
         "HLTHPRT_PTG2_COMPACT_SOURCE_TRACE_SET_HASH": "source-trace",
         "HLTHPRT_PTG2_COMPACT_SERVING_COPY_PATH": str(serving_copy),
         "HLTHPRT_PTG2_PROVIDER_SET_COPY_PATH": str(provider_set_copy),
+        "HLTHPRT_PTG2_PROVIDER_SET_ENTRY_COPY_PATH": str(provider_set_entry_copy),
+        "HLTHPRT_PTG2_PROVIDER_ENTRY_COMPONENT_COPY_PATH": str(provider_entry_component_copy),
         "HLTHPRT_PTG2_PROVIDER_GROUP_MEMBER_COPY_PATH": str(member_copy),
         "HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES": "1",
         "HLTHPRT_PTG2_RUST_WORKERS": "2",
@@ -1977,10 +2144,24 @@ def test_ptg2_rust_compact_provider_sets_use_real_group_hashes(tmp_path):
     ]
     assert len(provider_set_lines) == 1
     provider_set_fields = provider_set_lines[0].split("\t")
-    provider_set_group_hashes = {
-        int(value)
-        for value in provider_set_fields[4].strip("{}").split(",")
-        if value
+    assert len(provider_set_fields) == 2
+    assert int(provider_set_fields[1]) == 3
+    provider_set_entry_lines = [
+        line
+        for shard_path in sorted(tmp_path.glob("provider_set_entry.copy*"))
+        for line in shard_path.read_text().splitlines()
+    ]
+    provider_entry_component_lines = [
+        line
+        for shard_path in sorted(tmp_path.glob("provider_entry_component.copy*"))
+        for line in shard_path.read_text().splitlines()
+    ]
+    assert len(provider_set_entry_lines) == 1
+    provider_entry_hash = int(provider_set_entry_lines[0].split("\t")[1])
+    component_group_hashes = {
+        int(fields[1])
+        for fields in (line.split("\t") for line in provider_entry_component_lines)
+        if int(fields[0]) == provider_entry_hash
     }
     member_group_hashes = {
         int(line.split("\t")[0])
@@ -1989,7 +2170,7 @@ def test_ptg2_rust_compact_provider_sets_use_real_group_hashes(tmp_path):
     }
 
     assert len(member_group_hashes) == 2
-    assert provider_set_group_hashes == member_group_hashes
+    assert component_group_hashes == member_group_hashes
 
 
 def test_ptg2_rust_compact_uses_bounded_event_queue_default(monkeypatch, tmp_path):
@@ -2021,7 +2202,6 @@ def test_ptg2_rust_compact_uses_bounded_event_queue_default(monkeypatch, tmp_pat
             plan_month_id="month",
             source_trace_set_hash="trace",
             compact_copy_path=tmp_path / "serving.copy",
-            price_set_copy_path=tmp_path / "price_set.copy",
         )
     )
 
@@ -2059,7 +2239,7 @@ def test_ptg2_rust_snapshot_publish_dedupes_dictionary_stages_before_index(monke
         status_calls.append(statement)
 
     async def fake_all(statement, **_params):
-        if "COUNT(DISTINCT plan_id)" in statement:
+        if "COUNT(DISTINCT plan_hash)" in statement:
             return [{"plans": 1}]
         if "COUNT(DISTINCT COALESCE" in statement:
             return [{"procedures": 2}]
@@ -2085,9 +2265,14 @@ def test_ptg2_rust_snapshot_publish_dedupes_dictionary_stages_before_index(monke
         process_ptg._publish_rust_compact_snapshot_tables(
             {
                 "serving_rate_compact": "ptg2_rust_stage_serving_rate_compact_abc",
+                "price_code_set": "ptg2_rust_stage_price_code_set_abc",
+                "price_atom": "ptg2_rust_stage_price_atom_abc",
                 "price_set": "ptg2_rust_stage_price_set_abc",
+                "price_set_entry": "ptg2_rust_stage_price_set_entry_abc",
                 "procedure": "ptg2_rust_stage_procedure_abc",
                 "provider_set": "ptg2_rust_stage_provider_set_abc",
+                "provider_set_entry": "ptg2_rust_stage_provider_set_entry_abc",
+                "provider_entry_component": "ptg2_rust_stage_provider_entry_component_abc",
                 "provider_group_member": "ptg2_rust_stage_provider_group_member_abc",
             },
             snapshot_id="ptg2:202604:snap",
@@ -2100,20 +2285,30 @@ def test_ptg2_rust_snapshot_publish_dedupes_dictionary_stages_before_index(monke
     assert result["storage"] == "db_compact_snapshot"
     assert result["source_key"] == "heartland_dental"
     assert result["table"].startswith("mrf.ptg2_serving_rate_compact_")
-    assert result["price_table"].startswith("mrf.ptg2_price_set_")
+    assert result["price_code_set_table"].startswith("mrf.ptg2_price_code_set_")
+    assert result["price_atom_table"].startswith("mrf.ptg2_price_atom_")
+    assert "price_table" not in result
+    assert result["price_set_entry_table"].startswith("mrf.ptg2_price_set_entry_")
+    assert result["provider_set_entry_table"].startswith("mrf.ptg2_provider_set_entry_")
+    assert result["provider_entry_component_table"].startswith("mrf.ptg2_provider_entry_component_")
     assert result["rate_count"] == 987
     assert result["serving_rates"] == 987
     assert result["row_count"] == 987
     assert "RENAME TO" in joined
-    assert "INSERT INTO" in joined
-    assert "SELECT DISTINCT ON" in joined
+    assert "INSERT INTO" not in joined
+    assert "SELECT DISTINCT ON" not in joined
     assert "ptg2_price_set (" not in joined
     assert "ptg2_rust_stage_serving_rate_compact_abc" in joined
-    assert "ptg2_rust_stage_price_set_abc" in joined
+    assert "ptg2_rust_stage_price_code_set_abc" in joined
+    assert "ptg2_rust_stage_price_atom_abc" in joined
+    assert "ptg2_rust_stage_price_set_entry_abc" in joined
+    assert "ptg2_rust_stage_provider_set_entry_abc" in joined
+    assert "ptg2_rust_stage_provider_entry_component_abc" in joined
+    assert "provider_group_hashes" not in "\n".join(
+        statement for statement in status_calls if "CREATE INDEX" in statement and "ptg2_provider_set_" in statement
+    )
     assert "PTG2_PUBLISH_STAGE_INDEX_START" not in joined
     assert "CREATE INDEX IF NOT EXISTS" in joined
-    assert '"price_set_hash" >= :bucket_start' in joined
-    assert '"procedure_hash" >= :bucket_start' in joined
     serving_estimate_calls = [
         call for call in estimate_mock.await_args_list
         if call.args[1].startswith("ptg2_serving_rate_compact_")

@@ -43,6 +43,21 @@ class FakePagination:
     offset = 0
 
 
+def _compact_tables(**overrides):
+    values = {
+        "serving_table": "mrf.ptg2_serving_rate_compact_token",
+        "price_code_set_table": "mrf.ptg2_price_code_set_token",
+        "price_atom_table": "mrf.ptg2_price_atom_token",
+        "price_set_entry_table": "mrf.ptg2_price_set_entry_token",
+        "procedure_table": "mrf.ptg2_procedure_token",
+        "provider_set_entry_table": "mrf.ptg2_provider_set_entry_token",
+        "provider_entry_component_table": "mrf.ptg2_provider_entry_component_token",
+        "provider_group_member_table": "mrf.ptg2_provider_group_member_token",
+    }
+    values.update(overrides)
+    return ptg2_serving.PTG2ServingTables(**values)
+
+
 def _db_serving_session():
     return FakeSession(
         [
@@ -398,13 +413,16 @@ async def test_ptg2_provider_procedures_uses_compact_snapshot_without_market_col
             "snap-token",
             {
                 "table": "mrf.ptg2_serving_rate_compact_token",
-                "price_table": "mrf.ptg2_price_set_token",
+                "price_code_set_table": "mrf.ptg2_price_code_set_token",
+                "price_atom_table": "mrf.ptg2_price_atom_token",
+                "price_set_entry_table": "mrf.ptg2_price_set_entry_token",
                 "procedure_table": "mrf.ptg2_procedure_token",
                 "provider_set_table": "mrf.ptg2_provider_set_token",
+                "provider_set_entry_table": "mrf.ptg2_provider_set_entry_token",
+                "provider_entry_component_table": "mrf.ptg2_provider_entry_component_token",
                 "provider_group_member_table": "mrf.ptg2_provider_group_member_token",
             },
             "mrf.ptg2_serving_rate_compact_token",
-            "mrf.ptg2_provider_set_token_group_hashes_gin_idx",
             1,
             FakeResult(
                 rows=[
@@ -451,14 +469,18 @@ async def test_ptg2_provider_procedures_uses_compact_snapshot_without_market_col
     assert payload["items"][0]["npi"] == 1083311500
     assert payload["items"][0]["reported_code"] == "99213"
     assert payload["items"][0]["tic_prices"][0]["negotiated_rate"] == 101.42
-    count_sql = str(session.calls[4][0][0])
-    row_sql = str(session.calls[5][0][0])
+    count_sql = str(session.calls[3][0][0])
+    row_sql = str(session.calls[4][0][0])
     assert "r.plan_market_type" not in count_sql
     assert "r.plan_market_type" not in row_sql
+    assert "mrf.ptg2_provider_set_entry_token" in count_sql
+    assert "mrf.ptg2_provider_entry_component_token" in row_sql
+    assert "provider_group_hashes @>" not in count_sql
+    assert "provider_group_hashes @>" not in row_sql
     assert "NULL::varchar AS plan_market_type" in row_sql
     assert "r.provider_set_count" not in row_sql
     assert "NULL::integer AS provider_set_count" in row_sql
-    assert session.calls[4][0][1]["plan_id"] == "010854205"
+    assert session.calls[3][0][1]["plan_id"] == "010854205"
 
 
 @pytest.mark.asyncio
@@ -468,13 +490,16 @@ async def test_ptg2_provider_procedures_returns_no_match_after_snapshot_resolves
             "snap-token",
             {
                 "table": "mrf.ptg2_serving_rate_compact_token",
-                "price_table": "mrf.ptg2_price_set_token",
+                "price_code_set_table": "mrf.ptg2_price_code_set_token",
+                "price_atom_table": "mrf.ptg2_price_atom_token",
+                "price_set_entry_table": "mrf.ptg2_price_set_entry_token",
                 "procedure_table": "mrf.ptg2_procedure_token",
                 "provider_set_table": "mrf.ptg2_provider_set_token",
+                "provider_set_entry_table": "mrf.ptg2_provider_set_entry_token",
+                "provider_entry_component_table": "mrf.ptg2_provider_entry_component_token",
                 "provider_group_member_table": "mrf.ptg2_provider_group_member_token",
             },
             "mrf.ptg2_serving_rate_compact_token",
-            "mrf.ptg2_provider_set_token_group_hashes_gin_idx",
             0,
         ]
     )
@@ -494,21 +519,20 @@ async def test_ptg2_provider_procedures_returns_no_match_after_snapshot_resolves
 
 
 @pytest.mark.asyncio
-async def test_ptg2_provider_procedures_accepts_hashed_provider_gin_index_name():
+async def test_ptg2_provider_procedures_requires_normalized_provider_membership():
     session = FakeSession(
         [
             "snap-token",
             {
                 "table": "mrf.ptg2_serving_rate_compact_token",
-                "price_table": "mrf.ptg2_price_set_token",
+                "price_code_set_table": "mrf.ptg2_price_code_set_token",
+                "price_atom_table": "mrf.ptg2_price_atom_token",
+                "price_set_entry_table": "mrf.ptg2_price_set_entry_token",
                 "procedure_table": "mrf.ptg2_procedure_token",
                 "provider_set_table": "mrf.ptg2_provider_set_token",
                 "provider_group_member_table": "mrf.ptg2_provider_group_member_token",
             },
             "mrf.ptg2_serving_rate_compact_token",
-            None,
-            True,
-            0,
         ]
     )
 
@@ -519,21 +543,43 @@ async def test_ptg2_provider_procedures_accepts_hashed_provider_gin_index_name()
         FakePagination(),
     )
 
-    gin_sql = str(session.calls[4][0][0])
-    assert "pg_index" in gin_sql
-    assert "index_am.amname = 'gin'" in gin_sql
-    assert session.calls[4][0][1]["table_name"] == "mrf.ptg2_provider_set_token"
-    assert session.calls[4][0][1]["column_name"] == "provider_group_hashes"
-    assert payload["query"]["provider_reverse_index"] is True
-    assert payload["query"]["status"] == "no_match"
+    assert payload is None
 
 
 @pytest.mark.asyncio
 async def test_compact_serving_uses_snapshot_price_and_procedure_tables():
     session = FakeSession([FakeResult(rows=[])])
+    tables = _compact_tables()
+
+    payload = await ptg2_serving._search_compact_serving_table(
+        session,
+        "mrf.ptg2_serving_rate_compact_token",
+        tables,
+        "snap-token",
+        {"plan_id": "010854205", "code": "70551"},
+        FakePagination(),
+        ["snapshot_id = :snapshot_id", "plan_id = :plan_id"],
+        {"snapshot_id": "snap-token", "plan_id": "010854205", "limit": 25, "offset": 0},
+        ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
+    )
+
+    assert payload is None
+    sql = str(session.calls[0][0][0])
+    assert "ptg2_price_set_token" not in sql
+    assert "FROM mrf.ptg2_price_set_entry_token pse" in sql
+    assert "JOIN mrf.ptg2_price_atom_token pa" in sql
+    assert "LEFT JOIN mrf.ptg2_price_code_set_token service_set" in sql
+    assert "LEFT JOIN mrf.ptg2_price_code_set_token modifier_set" in sql
+    assert "pse.price_set_hash = r.price_set_hash" in sql
+    assert "ps.canonical_payload" not in sql
+    assert "FROM mrf.ptg2_procedure_token proc" in sql
+
+
+@pytest.mark.asyncio
+async def test_compact_serving_requires_normalized_price_tables():
+    session = FakeSession([FakeResult(rows=[])])
     tables = ptg2_serving.PTG2ServingTables(
         serving_table="mrf.ptg2_serving_rate_compact_token",
-        price_table="mrf.ptg2_price_set_token",
         procedure_table="mrf.ptg2_procedure_token",
     )
 
@@ -550,9 +596,7 @@ async def test_compact_serving_uses_snapshot_price_and_procedure_tables():
     )
 
     assert payload is None
-    sql = str(session.calls[0][0][0])
-    assert "FROM mrf.ptg2_price_set_token ps" in sql
-    assert "FROM mrf.ptg2_procedure_token proc" in sql
+    assert session.calls == []
 
 
 @pytest.mark.asyncio
@@ -562,7 +606,7 @@ async def test_compact_serving_geo_search_allows_missing_specialty():
     payload = await ptg2_serving._search_compact_serving_table(
         session,
         "mrf.ptg2_serving_rate_compact_token",
-        ptg2_serving.PTG2ServingTables(),
+        _compact_tables(),
         "snap-token",
         {"plan_id": "010854205", "code": "70551", "zip5": "60601"},
         FakePagination(),
@@ -591,7 +635,7 @@ async def test_compact_serving_coordinate_search_filters_npi_addresses():
     payload = await ptg2_serving._search_compact_serving_table(
         session,
         "mrf.ptg2_serving_rate_compact_token",
-        ptg2_serving.PTG2ServingTables(),
+        _compact_tables(),
         "snap-token",
         {
             "plan_id": "010854205",
@@ -657,7 +701,7 @@ async def test_compact_serving_include_providers_expands_without_geo_filter():
     payload = await ptg2_serving._search_compact_serving_table(
         session,
         "mrf.ptg2_serving_rate_compact_token",
-        ptg2_serving.PTG2ServingTables(),
+        _compact_tables(),
         "snap-token",
         {"plan_id": "010854205", "code": "450", "include_providers": "true"},
         FakePagination(),
@@ -680,13 +724,38 @@ async def test_compact_serving_include_providers_expands_without_geo_filter():
 
 
 @pytest.mark.asyncio
+async def test_compact_serving_source_scoped_provider_expansion_uses_entry_tables():
+    session = FakeSession([FakeResult(rows=[])])
+    tables = _compact_tables()
+
+    payload = await ptg2_serving._search_compact_serving_table(
+        session,
+        "mrf.ptg2_serving_rate_compact_token",
+        tables,
+        "snap-token",
+        {"plan_id": "010854205", "code": "450", "include_providers": "true"},
+        FakePagination(),
+        ["snapshot_id = :snapshot_id", "plan_id = :plan_id"],
+        {"snapshot_id": "snap-token", "plan_id": "010854205", "limit": 25, "offset": 0},
+        ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
+    )
+
+    assert payload is None
+    sql = str(session.calls[0][0][0])
+    assert "JOIN mrf.ptg2_provider_set_entry_token pse ON pse.provider_set_hash = r.provider_set_hash" in sql
+    assert "JOIN mrf.ptg2_provider_entry_component_token pec ON pec.provider_entry_hash = pse.provider_entry_hash" in sql
+    assert "JOIN mrf.ptg2_provider_group_member_token pgm ON pgm.provider_group_hash = pec.provider_group_hash" in sql
+    assert "provider_group_hashes" not in sql
+
+
+@pytest.mark.asyncio
 async def test_compact_serving_specialty_search_joins_nucc_without_geo():
     session = FakeSession([FakeResult(rows=[])])
 
     payload = await ptg2_serving._search_compact_serving_table(
         session,
         "mrf.ptg2_serving_rate_compact_token",
-        ptg2_serving.PTG2ServingTables(),
+        _compact_tables(),
         "snap-token",
         {"plan_id": "010854205", "code": "70551", "specialty": "dentist"},
         FakePagination(),
@@ -702,10 +771,40 @@ async def test_compact_serving_specialty_search_joins_nucc_without_geo():
     assert "provider_filter_npi" in sql
     assert "FROM mrf.npi_taxonomy nt_filter" in sql
     assert "JOIN mrf.nucc_taxonomy nucc_filter" in sql
-    assert "FROM mrf.ptg2_provider_set_component psc_filter" in sql
-    assert "pgm_filter.provider_group_hash = psc_filter.provider_group_hash" in sql
+    assert "FROM mrf.ptg2_provider_set_entry_token pse_filter" in sql
+    assert "JOIN mrf.ptg2_provider_entry_component_token pec_filter" in sql
+    assert "pgm_filter.provider_group_hash = pec_filter.provider_group_hash" in sql
     assert "WHERE nt_filter.npi = provider_filter_npi.npi" in sql
     assert params["specialty_like"] == "%dentist%"
+
+
+@pytest.mark.asyncio
+async def test_compact_serving_source_scoped_geo_taxonomy_filter_uses_entry_tables():
+    session = FakeSession([FakeResult(rows=[])])
+    tables = _compact_tables()
+
+    payload = await ptg2_serving._search_compact_serving_table(
+        session,
+        "mrf.ptg2_serving_rate_compact_token",
+        tables,
+        "snap-token",
+        {"plan_id": "010854205", "code": "70551", "zip5": "60601", "specialty": "dentist"},
+        FakePagination(),
+        ["snapshot_id = :snapshot_id", "plan_id = :plan_id"],
+        {"snapshot_id": "snap-token", "plan_id": "010854205", "limit": 25, "offset": 0},
+        ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
+    )
+
+    assert payload is None
+    sql = str(session.calls[0][0][0])
+    assert "FROM LATERAL (" in sql
+    assert "FROM mrf.ptg2_provider_set_entry_token pse_filter" in sql
+    assert "JOIN mrf.ptg2_provider_entry_component_token pec_filter" in sql
+    assert "JOIN mrf.ptg2_provider_group_member_token pgm_filter" in sql
+    assert "pse_filter.provider_set_hash = r.provider_set_hash" in sql
+    assert "FROM mrf.npi_address addr_filter" in sql
+    assert "FROM mrf.npi_taxonomy nt_filter" in sql
+    assert "provider_group_hashes" not in sql
 
 
 def test_warm_cache_benchmark_fixture_p95_gate():

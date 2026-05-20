@@ -72,13 +72,17 @@ from db.models import (
     PTG2PlanMonth,
     PTG2PlanRateSet,
     PTG2PriceAtom,
+    PTG2PriceCodeSet,
     PTG2PriceSet,
+    PTG2PriceSetEntry,
     PTG2Procedure,
     PTG2ProviderGroup,
     PTG2ProviderGroupMember,
+    PTG2ProviderEntryComponent,
     PTG2ProviderLocation,
     PTG2ProviderSet,
     PTG2ProviderSetComponent,
+    PTG2ProviderSetEntry,
     PTG2ProviderSetMember,
     PTG2RatePack,
     PTG2RateSet,
@@ -219,25 +223,43 @@ PTG2_HASH_MODE_ENV = "HLTHPRT_PTG2_HASH_MODE"
 PTG2_COMPACT_COPY_TASKS_ENV = "HLTHPRT_PTG2_COMPACT_COPY_TASKS"
 PTG2_COMPACT_COPY_KIND_TASKS_ENV = "HLTHPRT_PTG2_COMPACT_COPY_KIND_TASKS"
 PTG2_COMPACT_SERVING_COPY_TASKS_ENV = "HLTHPRT_PTG2_COMPACT_SERVING_COPY_TASKS"
+PTG2_STAGE_COPY_DEDUPE_ENV = "HLTHPRT_PTG2_STAGE_COPY_DEDUPE"
 PTG2_RUST_WORKERS_ENV = "HLTHPRT_PTG2_RUST_WORKERS"
 PTG2_RUST_WORK_QUEUE_ENV = "HLTHPRT_PTG2_RUST_WORK_QUEUE"
 PTG2_RUST_SPLIT_NEGOTIATED_RATES_ENV = "HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES"
 PTG2_RUST_EVENT_QUEUE_ENV = "HLTHPRT_PTG2_RUST_EVENT_QUEUE"
 PTG2_PUBLISH_DEDUPE_BUCKETS_ENV = "HLTHPRT_PTG2_PUBLISH_DEDUPE_BUCKETS"
 
-PTG2_DEFAULT_COMPACT_COPY_TASKS = 4
+PTG2_DEFAULT_COMPACT_COPY_TASKS = 2
 PTG2_DEFAULT_COMPACT_COPY_KIND_TASKS = 1
 PTG2_DEFAULT_COMPACT_SERVING_COPY_TASKS = 1
 PTG2_DEFAULT_RUST_WORKERS = 8
 PTG2_DEFAULT_RUST_WORK_QUEUE = 16
 PTG2_DEFAULT_RUST_EVENT_QUEUE = 32
-PTG2_DEFAULT_RUST_SPLIT_NEGOTIATED_RATES = 1024
+PTG2_DEFAULT_RUST_SPLIT_NEGOTIATED_RATES = 4096
 PTG2_DEFAULT_DOWNLOAD_TASKS = 4
 PTG2_DEFAULT_RANGE_DOWNLOAD_TASKS = 4
 PTG2_DEFAULT_RANGE_DOWNLOAD_CHUNK_BYTES = 128 * 1024 * 1024
 PTG2_DEFAULT_RANGE_DOWNLOAD_MIN_BYTES = 512 * 1024 * 1024
 PTG2_DEFAULT_PUBLISH_DEDUPE_BUCKETS = 256
 PTG2_DEFAULT_INDEX_TASKS = 4
+
+PTG2_STAGE_COPY_DEDUPE_DEFAULT_KINDS = frozenset(
+    {
+        "procedure",
+        "price_code_set",
+        "price_atom",
+        "provider_set",
+        "provider_group_member",
+        "provider_set_entry",
+    }
+)
+
+
+def _ptg2_stage_copy_dedupe_enabled(kind: str) -> bool:
+    if kind in PTG2_STAGE_COPY_DEDUPE_DEFAULT_KINDS:
+        return True
+    return _env_bool(PTG2_STAGE_COPY_DEDUPE_ENV, False)
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -390,6 +412,8 @@ PTG2_MODEL_CLASSES = (
     PTG2ProviderGroupMember,
     PTG2ProviderSet,
     PTG2ProviderSetComponent,
+    PTG2ProviderSetEntry,
+    PTG2ProviderEntryComponent,
     PTG2ProviderSetMember,
     PTG2ProviderLocation,
     PTG2ServingRateCompact,
@@ -398,8 +422,10 @@ PTG2_MODEL_CLASSES = (
     PTG2LocationSetMember,
     PTG2Procedure,
     PTG2RelatedCodeSet,
+    PTG2PriceCodeSet,
     PTG2PriceAtom,
     PTG2PriceSet,
+    PTG2PriceSetEntry,
     PTG2SourceTrace,
     PTG2SourceTraceSet,
     PTG2Confidence,
@@ -1057,9 +1083,7 @@ def build_source_trace_set(source_trace_hashes: list[str] | tuple[str, ...]) -> 
     source_trace_set_hash = semantic_hash(payload, domain="source_trace_set")
     return {
         "source_trace_set_hash": source_trace_set_hash,
-        "hash_prefix": hash_prefix(source_trace_set_hash),
         "source_trace_hashes": list(normalized_hashes),
-        "canonical_payload": _canonicalize_for_json(payload),
     }
 
 
@@ -2201,18 +2225,12 @@ async def _copy_stage_price_set_rows(rows: list[dict[str, Any]], snapshot_id: st
     columns = [
         "snapshot_id",
         "price_set_hash",
-        "hash_prefix",
-        "price_atom_hashes",
-        "canonical_payload",
         "created_at",
     ]
     records = [
         (
             snapshot_id,
             row.get("price_set_hash"),
-            row.get("hash_prefix"),
-            row.get("price_atom_hashes") or [],
-            json.dumps(row.get("canonical_payload"), default=_json_default),
             row.get("created_at"),
         )
         for row in rows
@@ -2416,54 +2434,53 @@ async def _copy_ptg2_dictionary_file(copy_path: Path, kind: str, *, target_table
     specs = {
         "procedure": (
             "ptg2_procedure",
-            [
-                "procedure_hash",
-                "hash_prefix",
-                "billing_code_type",
-                "billing_code_type_version",
-                "billing_code",
-                "name",
-                "description",
-                "canonical_payload",
-            ],
+            ["procedure_hash", "billing_code_type", "billing_code_type_version", "billing_code", "name", "description"],
             ["procedure_hash"],
         ),
-        "price_set": (
-            "ptg2_price_set",
+        "price_code_set": (
+            "ptg2_price_code_set",
+            ["code_set_hash", "codes"],
+            ["code_set_hash"],
+        ),
+        "price_atom": (
+            "ptg2_price_atom",
             [
-                "price_set_hash",
-                "hash_prefix",
-                "price_atom_hashes",
+                "price_atom_hash",
                 "negotiated_type",
                 "negotiated_rate",
                 "expiration_date",
-                "service_code",
+                "service_code_set_hash",
                 "billing_class",
                 "setting",
-                "billing_code_modifier",
+                "billing_code_modifier_set_hash",
                 "additional_information",
-                "canonical_payload",
             ],
-            ["price_set_hash"],
+            ["price_atom_hash"],
+        ),
+        "price_set_entry": (
+            "ptg2_price_set_entry",
+            ["price_set_hash", "price_atom_hash"],
+            ["price_set_hash", "price_atom_hash"],
         ),
         "provider_set": (
             "ptg2_provider_set",
-            [
-                "provider_set_hash",
-                "hash_prefix",
-                "provider_count",
-                "npi",
-                "provider_group_hashes",
-                "tin_type",
-                "tin_value",
-                "canonical_payload",
-            ],
+            ["provider_set_hash", "provider_count"],
             ["provider_set_hash"],
         ),
         "provider_group_member": (
             "ptg2_provider_group_member",
-            ["provider_group_hash", "npi", "ordinal"],
             ["provider_group_hash", "npi"],
+            ["provider_group_hash", "npi"],
+        ),
+        "provider_set_entry": (
+            "ptg2_provider_set_entry",
+            ["provider_set_hash", "provider_entry_hash"],
+            ["provider_set_hash", "provider_entry_hash"],
+        ),
+        "provider_entry_component": (
+            "ptg2_provider_entry_component",
+            ["provider_entry_hash", "provider_group_hash"],
+            ["provider_entry_hash", "provider_group_hash"],
         ),
     }
     if kind not in specs:
@@ -2471,22 +2488,54 @@ async def _copy_ptg2_dictionary_file(copy_path: Path, kind: str, *, target_table
     table_name, columns, conflict_targets = specs[kind]
     schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     if target_table is not None:
+        dedupe_stage_copy = _ptg2_stage_copy_dedupe_enabled(kind)
         async with db.acquire() as conn:
             raw_conn = conn.raw_connection
             driver_conn = getattr(raw_conn, "driver_connection", raw_conn)
             copy_to_table = getattr(driver_conn, "copy_to_table", None)
             if copy_to_table is None:
                 raise NotImplementedError("Active database driver does not expose copy_to_table")
+            if not dedupe_stage_copy:
+                with copy_path.open("rb") as source:
+                    await copy_to_table(
+                        target_table,
+                        source=source,
+                        columns=columns,
+                        format="text",
+                        delimiter="\t",
+                        null="\\N",
+                        schema_name=schema_name,
+                    )
+                return
+
+            temp_table = f"ptg2_stage_{table_name}_{os.getpid()}_{time.time_ns()}"
+            quoted_columns = ", ".join(_quote_ident(column) for column in columns)
+            quoted_conflict = ", ".join(_quote_ident(column) for column in conflict_targets)
+            select_columns = _ptg2_dictionary_select_columns(kind, columns)
+            await conn.status(
+                f"""
+                CREATE TEMP TABLE {_quote_ident(temp_table)}
+                (LIKE {_quote_ident(schema_name)}.{_quote_ident(target_table)} INCLUDING DEFAULTS)
+                ON COMMIT DROP;
+                """
+            )
             with copy_path.open("rb") as source:
                 await copy_to_table(
-                    target_table,
+                    temp_table,
                     source=source,
-                    schema_name=schema_name,
                     columns=columns,
                     format="text",
                     delimiter="\t",
                     null="\\N",
                 )
+            await conn.status(
+                f"""
+                INSERT INTO {_quote_ident(schema_name)}.{_quote_ident(target_table)} ({quoted_columns})
+                SELECT {select_columns}
+                FROM {_quote_ident(temp_table)}
+                ON CONFLICT ({quoted_conflict}) DO NOTHING;
+                """
+            )
         return
     temp_table = f"ptg2_stage_{table_name}_{os.getpid()}_{time.time_ns()}"
     quoted_temp = _quote_ident(temp_table)
@@ -2511,10 +2560,11 @@ async def _copy_ptg2_dictionary_file(copy_path: Path, kind: str, *, target_table
                 delimiter="\t",
                 null="\\N",
             )
+        select_columns = _ptg2_dictionary_select_columns(kind, columns)
         await conn.status(
             f"""
             INSERT INTO {quoted_target} ({quoted_columns})
-            SELECT {quoted_columns}
+            SELECT {select_columns}
             FROM {quoted_temp}
             ON CONFLICT ({quoted_conflict}) DO NOTHING;
             """
@@ -2546,56 +2596,90 @@ _RUST_COPY_TABLE_SPECS = {
     ),
     "procedure": (
         "ptg2_procedure",
-        [
-            "procedure_hash",
-            "hash_prefix",
-            "billing_code_type",
-            "billing_code_type_version",
-            "billing_code",
-            "name",
-            "description",
-            "canonical_payload",
-        ],
+        ["procedure_hash", "billing_code_type", "billing_code_type_version", "billing_code", "name", "description"],
         ["procedure_hash"],
     ),
-    "price_set": (
-        "ptg2_price_set",
+    "price_code_set": (
+        "ptg2_price_code_set",
+        ["code_set_hash", "codes"],
+        ["code_set_hash"],
+    ),
+    "price_atom": (
+        "ptg2_price_atom",
         [
-            "price_set_hash",
-            "hash_prefix",
-            "price_atom_hashes",
+            "price_atom_hash",
             "negotiated_type",
             "negotiated_rate",
             "expiration_date",
-            "service_code",
+            "service_code_set_hash",
             "billing_class",
             "setting",
-            "billing_code_modifier",
+            "billing_code_modifier_set_hash",
             "additional_information",
-            "canonical_payload",
         ],
-        ["price_set_hash"],
+        ["price_atom_hash"],
+    ),
+    "price_set_entry": (
+        "ptg2_price_set_entry",
+        ["price_set_hash", "price_atom_hash"],
+        ["price_set_hash", "price_atom_hash"],
     ),
     "provider_set": (
         "ptg2_provider_set",
-        [
-            "provider_set_hash",
-            "hash_prefix",
-            "provider_count",
-            "npi",
-            "provider_group_hashes",
-            "tin_type",
-            "tin_value",
-            "canonical_payload",
-        ],
+        ["provider_set_hash", "provider_count"],
         ["provider_set_hash"],
     ),
     "provider_group_member": (
         "ptg2_provider_group_member",
-        ["provider_group_hash", "npi", "ordinal"],
+        ["provider_group_hash", "npi"],
         ["provider_group_hash", "npi"],
     ),
+    "provider_set_entry": (
+        "ptg2_provider_set_entry",
+        ["provider_set_hash", "provider_entry_hash"],
+        ["provider_set_hash", "provider_entry_hash"],
+    ),
+    "provider_entry_component": (
+        "ptg2_provider_entry_component",
+        ["provider_entry_hash", "provider_group_hash"],
+        ["provider_entry_hash", "provider_group_hash"],
+    ),
 }
+
+
+_PTG2_PRICE_ATOM_COMPACT_NULL_COLUMNS = {
+    "canonical_payload",
+}
+
+
+_PTG2_PRICE_SET_COMPACT_NULL_COLUMNS = {
+    "price_atom_hashes",
+    "canonical_payload",
+}
+
+
+_PTG2_PROVIDER_SET_COMPACT_NULL_COLUMNS = {
+    "npi",
+    "provider_group_hashes",
+    "tin_type",
+    "tin_value",
+    "canonical_payload",
+}
+
+
+def _ptg2_dictionary_select_columns(kind: str, columns: list[str]) -> str:
+    selected: list[str] = []
+    for column in columns:
+        quoted = _quote_ident(column)
+        if kind == "price_atom" and column in _PTG2_PRICE_ATOM_COMPACT_NULL_COLUMNS:
+            selected.append(f"NULL AS {quoted}")
+        elif kind == "price_set" and column in _PTG2_PRICE_SET_COMPACT_NULL_COLUMNS:
+            selected.append(f"NULL AS {quoted}")
+        elif kind == "provider_set" and column in _PTG2_PROVIDER_SET_COMPACT_NULL_COLUMNS:
+            selected.append(f"NULL AS {quoted}")
+        else:
+            selected.append(quoted)
+    return ", ".join(selected)
 
 
 PTG2_SERVING_STAGE_LANE_PREFIX = "serving_rate_compact_lane_"
@@ -2635,10 +2719,13 @@ def _serving_stage_table_for_copy(stage_tables: dict[str, str], copy_file: Path)
 
 async def _create_one_rust_copy_stage_table(
     *,
+    kind: str,
     schema_name: str,
     storage_mode: str,
     stage_table: str,
     target_table: str,
+    columns: list[str],
+    conflict_targets: list[str] | None = None,
 ) -> None:
     await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(stage_table)};")
     await db.status(
@@ -2647,6 +2734,24 @@ async def _create_one_rust_copy_stage_table(
         (LIKE {_quote_ident(schema_name)}.{_quote_ident(target_table)} INCLUDING DEFAULTS);
         """
     )
+    existing_columns = await db.all(
+        """
+        SELECT column_name
+          FROM information_schema.columns
+         WHERE table_schema = :schema_name
+           AND table_name = :stage_table
+        """,
+        schema_name=schema_name,
+        stage_table=stage_table,
+    )
+    keep_columns = set(columns) | {"created_at"}
+    for row in existing_columns:
+        column_name = row.get("column_name") if isinstance(row, dict) else getattr(row, "column_name", None)
+        if column_name and column_name not in keep_columns:
+            await db.status(
+                f"ALTER TABLE {_quote_ident(schema_name)}.{_quote_ident(stage_table)} "
+                f"DROP COLUMN IF EXISTS {_quote_ident(column_name)};"
+            )
     if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True):
         try:
             await db.status(f"ALTER TABLE {_quote_ident(schema_name)}.{_quote_ident(stage_table)} SET UNLOGGED;")
@@ -2659,20 +2764,32 @@ async def _create_one_rust_copy_stage_table(
         )
     except Exception as exc:
         logger.debug("Skipping PTG2 Rust stage autovacuum disable for %s: %s", stage_table, exc)
+    if conflict_targets and _ptg2_stage_copy_dedupe_enabled(kind):
+        dedupe_index_name = _ptg2_snapshot_index_name(stage_table, "copy_dedupe_idx")
+        await db.status(
+            f"""
+            CREATE UNIQUE INDEX IF NOT EXISTS {_quote_ident(dedupe_index_name)}
+            ON {_quote_ident(schema_name)}.{_quote_ident(stage_table)}
+            ({", ".join(_quote_ident(column) for column in conflict_targets)});
+            """
+        )
 
 
 async def _create_rust_copy_stage_tables(token: str, *, serving_lanes: int = 1) -> dict[str, str]:
     schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
     stage_tables: dict[str, str] = {}
-    for kind, (target_table, _columns, _conflict_targets) in _RUST_COPY_TABLE_SPECS.items():
+    for kind, (target_table, columns, conflict_targets) in _RUST_COPY_TABLE_SPECS.items():
         stage_table = _rust_copy_stage_table_name(kind, token)
         stage_tables[kind] = stage_table
         await _create_one_rust_copy_stage_table(
+            kind=kind,
             schema_name=schema_name,
             storage_mode=storage_mode,
             stage_table=stage_table,
             target_table=target_table,
+            columns=columns,
+            conflict_targets=conflict_targets if kind != "serving_rate_compact" else None,
         )
         if kind == "serving_rate_compact":
             for lane in range(1, max(serving_lanes, 1)):
@@ -2680,17 +2797,30 @@ async def _create_rust_copy_stage_tables(token: str, *, serving_lanes: int = 1) 
                 lane_table = _rust_copy_stage_table_name(f"serving_rate_compact_w{lane:04d}", token)
                 stage_tables[lane_key] = lane_table
                 await _create_one_rust_copy_stage_table(
+                    kind=lane_key,
                     schema_name=schema_name,
                     storage_mode=storage_mode,
                     stage_table=lane_table,
                     target_table=target_table,
+                    columns=columns,
+                    conflict_targets=None,
                 )
     return stage_tables
 
 
 async def _merge_rust_copy_stage_tables(stage_tables: dict[str, str], *, drop: bool = True) -> None:
     schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
-    merge_order = ("procedure", "price_set", "provider_group_member", "provider_set", "serving_rate_compact")
+    merge_order = (
+        "procedure",
+        "price_code_set",
+        "price_atom",
+        "price_set_entry",
+        "provider_entry_component",
+        "provider_group_member",
+        "provider_set",
+        "provider_set_entry",
+        "serving_rate_compact",
+    )
     fast_rebuild = _env_bool(PTG2_FAST_FINAL_REBUILD_ENV, False)
     for kind in merge_order:
         stage_table_names = (
@@ -2712,6 +2842,7 @@ async def _merge_rust_copy_stage_tables(stage_tables: dict[str, str], *, drop: b
             )
             continue
         quoted_columns = ", ".join(_quote_ident(column) for column in columns)
+        select_columns = _ptg2_dictionary_select_columns(kind, columns)
         quoted_conflict = ", ".join(_quote_ident(column) for column in conflict_targets)
         conflict_sql = ""
         if not fast_rebuild and not (
@@ -2722,7 +2853,7 @@ async def _merge_rust_copy_stage_tables(stage_tables: dict[str, str], *, drop: b
             await db.status(
                 f"""
                 INSERT INTO {_quote_ident(schema_name)}.{_quote_ident(target_table)} ({quoted_columns})
-                SELECT {quoted_columns}
+                SELECT {select_columns}
                 FROM {_quote_ident(schema_name)}.{_quote_ident(stage_table)}
                 {conflict_sql};
                 """
@@ -2797,8 +2928,12 @@ async def _exact_table_rows(schema_name: str, table_name: str) -> int:
 _PTG2_COMPACT_MODEL_BY_KIND = {
     "serving_rate_compact": PTG2ServingRateCompact,
     "procedure": PTG2Procedure,
-    "price_set": PTG2PriceSet,
+    "price_code_set": PTG2PriceCodeSet,
+    "price_atom": PTG2PriceAtom,
+    "price_set_entry": PTG2PriceSetEntry,
     "provider_set": PTG2ProviderSet,
+    "provider_set_entry": PTG2ProviderSetEntry,
+    "provider_entry_component": PTG2ProviderEntryComponent,
     "provider_group_member": PTG2ProviderGroupMember,
 }
 
@@ -2954,6 +3089,7 @@ async def _publish_deduped_rust_dictionary_table(
 ) -> float:
     _target_table, columns, conflict_targets = _RUST_COPY_TABLE_SPECS[kind]
     quoted_columns = ", ".join(_quote_ident(column) for column in columns)
+    select_columns = _ptg2_dictionary_select_columns(kind, columns)
     quoted_conflict = ", ".join(_quote_ident(column) for column in conflict_targets)
     storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
     start_message = (
@@ -3009,7 +3145,7 @@ async def _publish_deduped_rust_dictionary_table(
             await db.status(
                 f"""
                 INSERT INTO {_quote_ident(schema_name)}.{_quote_ident(final_table)} ({quoted_columns})
-                SELECT DISTINCT ON ({quoted_conflict}) {quoted_columns}
+                SELECT DISTINCT ON ({quoted_conflict}) {select_columns}
                 FROM {_quote_ident(schema_name)}.{_quote_ident(stage_table)}
                 WHERE {_quote_ident(bucket_column)} >= :bucket_start
                   AND {_quote_ident(bucket_column)} < :bucket_end
@@ -3028,7 +3164,7 @@ async def _publish_deduped_rust_dictionary_table(
         await db.status(
             f"""
             INSERT INTO {_quote_ident(schema_name)}.{_quote_ident(final_table)} ({quoted_columns})
-            SELECT DISTINCT ON ({quoted_conflict}) {quoted_columns}
+            SELECT DISTINCT ON ({quoted_conflict}) {select_columns}
             FROM {_quote_ident(schema_name)}.{_quote_ident(stage_table)}
             ORDER BY {quoted_conflict};
             """
@@ -3037,6 +3173,39 @@ async def _publish_deduped_rust_dictionary_table(
     done_message = (
         f"PTG2_PUBLISH_TABLE_DONE time={_ptg2_publish_timestamp()} "
         f"kind={kind} elapsed_seconds={time.monotonic() - started_at:.2f}"
+    )
+    _emit_screen_line(done_message)
+    logger.info(done_message)
+    return time.monotonic() - started_at
+
+
+async def _publish_renamed_rust_dictionary_table(
+    *,
+    schema_name: str,
+    kind: str,
+    stage_table: str,
+    final_table: str,
+) -> float:
+    start_message = (
+        f"PTG2_PUBLISH_TABLE_START time={_ptg2_publish_timestamp()} "
+        f"kind={kind} stage={schema_name}.{stage_table} final={schema_name}.{final_table} mode=rename"
+    )
+    _emit_screen_line(start_message)
+    logger.info(start_message)
+    started_at = time.monotonic()
+    await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(final_table)} CASCADE;")
+    await db.status(
+        f"""
+        ALTER TABLE {_quote_ident(schema_name)}.{_quote_ident(stage_table)}
+        RENAME TO {_quote_ident(final_table)};
+        """
+    )
+    await db.status(
+        f"DROP INDEX IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(_ptg2_snapshot_index_name(stage_table, 'copy_dedupe_idx'))};"
+    )
+    done_message = (
+        f"PTG2_PUBLISH_TABLE_DONE time={_ptg2_publish_timestamp()} "
+        f"kind={kind} mode=rename elapsed_seconds={time.monotonic() - started_at:.2f}"
     )
     _emit_screen_line(done_message)
     logger.info(done_message)
@@ -3125,7 +3294,17 @@ async def _publish_rust_compact_snapshot_tables(
 ) -> dict[str, Any]:
     del import_run_id
     schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
-    rename_order = ("procedure", "price_set", "provider_set", "provider_group_member", "serving_rate_compact")
+    rename_order = (
+        "procedure",
+        "price_code_set",
+        "price_atom",
+        "price_set_entry",
+        "provider_set",
+        "provider_set_entry",
+        "provider_entry_component",
+        "provider_group_member",
+        "serving_rate_compact",
+    )
     table_names = {
         kind: _ptg2_snapshot_table_name(kind, source_key, snapshot_id)
         for kind in rename_order
@@ -3138,9 +3317,8 @@ async def _publish_rust_compact_snapshot_tables(
     index_seconds = 0.0
     analyze_started = 0.0
     analyze_seconds = 0.0
-    # Serving rows are already unique by scanner-side serving_rate_id de-dupe.
-    # Dictionary stages can receive duplicate keys from different source files,
-    # so publish them through bounded de-dupe before model indexes are created.
+    # Source-scoped compact stages are scanner-deduped. Publish dictionary
+    # stages by rename and let unique-index creation validate correctness.
     for kind in rename_order:
         stage_table = stage_tables.get(kind)
         final_table = table_names.get(kind)
@@ -3157,8 +3335,7 @@ async def _publish_rust_compact_snapshot_tables(
             )
             serving_publish_seconds += time.monotonic() - serving_publish_started
         else:
-            await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(final_table)};")
-            dictionary_publish_seconds += await _publish_deduped_rust_dictionary_table(
+            dictionary_publish_seconds += await _publish_renamed_rust_dictionary_table(
                 schema_name=schema_name,
                 kind=kind,
                 stage_table=stage_table,
@@ -3215,9 +3392,29 @@ async def _publish_rust_compact_snapshot_tables(
         "source_key": source_key,
         "snapshot_id": snapshot_id,
         "table": f"{schema_name}.{serving_table}",
-        "price_table": f"{schema_name}.{table_names['price_set']}" if table_names.get("price_set") else None,
+        "price_code_set_table": (
+            f"{schema_name}.{table_names['price_code_set']}"
+            if table_names.get("price_code_set")
+            else None
+        ),
+        "price_atom_table": f"{schema_name}.{table_names['price_atom']}" if table_names.get("price_atom") else None,
+        "price_set_entry_table": (
+            f"{schema_name}.{table_names['price_set_entry']}"
+            if table_names.get("price_set_entry")
+            else None
+        ),
         "procedure_table": f"{schema_name}.{table_names['procedure']}" if table_names.get("procedure") else None,
         "provider_set_table": f"{schema_name}.{table_names['provider_set']}" if table_names.get("provider_set") else None,
+        "provider_set_entry_table": (
+            f"{schema_name}.{table_names['provider_set_entry']}"
+            if table_names.get("provider_set_entry")
+            else None
+        ),
+        "provider_entry_component_table": (
+            f"{schema_name}.{table_names['provider_entry_component']}"
+            if table_names.get("provider_entry_component")
+            else None
+        ),
         "provider_group_member_table": (
             f"{schema_name}.{table_names['provider_group_member']}"
             if table_names.get("provider_group_member")
@@ -3357,16 +3554,25 @@ def _snapshot_manifest_table_names(serving_index: dict[str, Any] | None) -> list
         return []
     table_values = [
         serving_index.get("table"),
+        serving_index.get("price_code_set_table"),
+        serving_index.get("price_atom_table"),
         serving_index.get("price_table"),
+        serving_index.get("price_set_entry_table"),
         serving_index.get("procedure_table"),
         serving_index.get("provider_set_table"),
+        serving_index.get("provider_set_entry_table"),
+        serving_index.get("provider_entry_component_table"),
         serving_index.get("provider_group_member_table"),
     ]
     allowed_prefixes = (
         "ptg2_serving_rate_compact_",
+        "ptg2_price_atom_",
         "ptg2_price_set_",
+        "ptg2_price_set_entry_",
         "ptg2_procedure_",
         "ptg2_provider_set_",
+        "ptg2_provider_set_entry_",
+        "ptg2_provider_entry_component_",
         "ptg2_provider_group_member_",
     )
     result: list[str] = []
@@ -3455,16 +3661,10 @@ async def _merge_staged_price_sets(snapshot_id: str) -> None:
         f"""
         INSERT INTO {schema_name}.ptg2_price_set (
             price_set_hash,
-            hash_prefix,
-            price_atom_hashes,
-            canonical_payload,
             created_at
         )
         SELECT DISTINCT ON (price_set_hash)
             price_set_hash,
-            hash_prefix,
-            COALESCE(price_atom_hashes, ARRAY[]::varchar[]),
-            canonical_payload,
             created_at
         FROM {schema_name}.ptg2_price_set_stage
         WHERE snapshot_id = :snapshot_id
@@ -4957,10 +5157,6 @@ async def build_ptg2_compact_serving_index(snapshot_id: str, import_run_id: str)
             f"CREATE INDEX IF NOT EXISTS ptg2_provider_group_member_npi_idx ON {schema}.ptg2_provider_group_member (npi, provider_group_hash)",
         ),
         (
-            "ptg2_price_set_prefix_idx",
-            f"CREATE INDEX IF NOT EXISTS ptg2_price_set_prefix_idx ON {schema}.ptg2_price_set (hash_prefix)",
-        ),
-        (
             "ptg2_price_set_pkey",
             f"CREATE UNIQUE INDEX IF NOT EXISTS ptg2_price_set_pkey ON {schema}.ptg2_price_set (price_set_hash)",
         ),
@@ -5049,7 +5245,6 @@ async def prepare_ptg2_compact_bulk_load() -> None:
         f"DROP INDEX IF EXISTS {schema}.ptg2_provider_set_component_idx_primary",
         f"DROP INDEX IF EXISTS {schema}.ptg2_provider_group_member_npi_idx",
         f"DROP INDEX IF EXISTS {schema}.ptg2_provider_group_member_idx_primary",
-        f"DROP INDEX IF EXISTS {schema}.ptg2_price_set_prefix_idx",
         f"DROP INDEX IF EXISTS {schema}.ptg2_price_set_idx_primary",
     ]
     if fast_rebuild:
@@ -5480,27 +5675,14 @@ def _ptg2_procedure_row(in_item: dict[str, Any]) -> dict[str, Any]:
         "billing_code": _normalize_code_component(in_item.get("billing_code")),
         "negotiation_arrangement": _normalize_code_component(in_item.get("negotiation_arrangement")),
     }
-    source_payload = {
-        "name": in_item.get("name"),
-        "description": in_item.get("description"),
-        "bundled_codes": in_item.get("bundled_codes") or [],
-        "covered_services": in_item.get("covered_services") or [],
-    }
     procedure_hash = semantic_hash(identity_payload, domain="procedure")
     return {
         "procedure_hash": procedure_hash,
-        "hash_prefix": hash_prefix(procedure_hash),
         "billing_code_type": in_item.get("billing_code_type"),
         "billing_code_type_version": in_item.get("billing_code_type_version"),
         "billing_code": in_item.get("billing_code"),
         "name": in_item.get("name"),
         "description": in_item.get("description"),
-        "canonical_payload": _canonicalize_for_json(
-            {
-                "identity": identity_payload,
-                "source": source_payload,
-            }
-        ),
         "created_at": _utcnow(),
     }
 
@@ -5519,10 +5701,8 @@ def _ptg2_price_atom_row(negotiated_price: dict[str, Any]) -> dict[str, Any]:
         additional_information=negotiated_price.get("additional_information"),
     )
     built = build_price_atom(payload)
-    canonical = built["canonical_payload"]
     return {
         "price_atom_hash": built["price_atom_hash"],
-        "hash_prefix": built["hash_prefix"],
         "negotiated_type": negotiated_price.get("negotiated_type"),
         "negotiated_rate": normalize_money(rate_value) if rate_value is not None else None,
         "expiration_date": _coerce_date(negotiated_price.get("expiration_date")),
@@ -5531,7 +5711,6 @@ def _ptg2_price_atom_row(negotiated_price: dict[str, Any]) -> dict[str, Any]:
         "setting": negotiated_price.get("setting"),
         "billing_code_modifier": _as_list(negotiated_price.get("billing_code_modifier")),
         "additional_information": negotiated_price.get("additional_information"),
-        "canonical_payload": canonical,
         "created_at": _utcnow(),
     }
 
@@ -5547,13 +5726,11 @@ def _ptg2_source_trace_rows(source_version: PTG2SourceVersion | None, source_url
     source_trace_hash = semantic_hash(payload, domain="source_trace")
     source_trace_row = {
         "source_trace_hash": source_trace_hash,
-        "hash_prefix": hash_prefix(source_trace_hash),
         "source_file_version_id": payload["source_file_version_id"],
         "original_url": payload["original_url"],
         "canonical_url": payload["canonical_url"],
         "json_pointer": payload["json_pointer"],
         "line_number": None,
-        "canonical_payload": _canonicalize_for_json(payload),
         "created_at": _utcnow(),
     }
     source_trace_set = build_source_trace_set([source_trace_hash])
@@ -5844,6 +6021,52 @@ def _filter_jobs_by_url_contains(jobs: list[dict[str, Any]], filters: list[str] 
     return filtered
 
 
+def _ptg_job_identity(job: dict[str, Any]) -> tuple[str, str]:
+    job_type = str(job.get("type") or "").strip()
+    url = normalize_tic_source_url(str(job.get("url") or ""))
+    return job_type, canonicalize_url(url)
+
+
+def _plan_identity(plan: dict[str, Any]) -> str:
+    return canonical_json_dumps(_canonicalize_for_json(plan))
+
+
+def _merge_ptg_job(existing: dict[str, Any], incoming: dict[str, Any]) -> None:
+    existing_plans = list(existing.get("plan_info") or [])
+    seen_plans = {_plan_identity(plan) for plan in existing_plans if isinstance(plan, dict)}
+    for plan in incoming.get("plan_info") or []:
+        if not isinstance(plan, dict):
+            continue
+        plan_key = _plan_identity(plan)
+        if plan_key in seen_plans:
+            continue
+        seen_plans.add(plan_key)
+        existing_plans.append(plan)
+    if existing_plans:
+        existing["plan_info"] = existing_plans
+    if not existing.get("description") and incoming.get("description"):
+        existing["description"] = incoming.get("description")
+    if not existing.get("from_index_url") and incoming.get("from_index_url"):
+        existing["from_index_url"] = incoming.get("from_index_url")
+    if not existing.get("meta") and incoming.get("meta"):
+        existing["meta"] = incoming.get("meta")
+
+
+def _dedupe_ptg_jobs(jobs: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    deduped: dict[tuple[str, str], dict[str, Any]] = {}
+    duplicate_count = 0
+    for job in jobs:
+        identity = _ptg_job_identity(job)
+        normalized_job = dict(job)
+        normalized_job["url"] = normalize_tic_source_url(str(job.get("url") or ""))
+        if identity in deduped:
+            duplicate_count += 1
+            _merge_ptg_job(deduped[identity], normalized_job)
+            continue
+        deduped[identity] = normalized_job
+    return list(deduped.values()), duplicate_count
+
+
 async def _ensure_indexes(obj, db_schema: str) -> None:
     if _env_bool(
         PTG2_SKIP_BULK_INDEX_ENSURE_ENV,
@@ -5917,34 +6140,62 @@ async def _ensure_ptg2_serving_rate_columns(db_schema: str) -> None:
 
 
 async def _ensure_ptg2_provider_set_columns(db_schema: str) -> None:
-    try:
-        await db.status(
-            f"ALTER TABLE {db_schema}.ptg2_provider_set "
-            "ADD COLUMN IF NOT EXISTS provider_group_hashes bigint[];"
-        )
-    except Exception as exc:
-        logger.debug("Skipping ptg2_provider_set provider_group_hashes ensure: %s", exc)
+    for column_name in ("hash_prefix", "npi", "provider_group_hashes", "tin_type", "tin_value", "canonical_payload"):
+        try:
+            await db.status(f"ALTER TABLE {db_schema}.ptg2_provider_set DROP COLUMN IF EXISTS {column_name};")
+        except Exception as exc:
+            logger.debug("Skipping ptg2_provider_set column %s drop: %s", column_name, exc)
 
 
 async def _ensure_ptg2_price_set_columns(db_schema: str) -> None:
+    for column_name in (
+        "hash_prefix",
+        "price_atom_hashes",
+        "negotiated_type",
+        "negotiated_rate",
+        "expiration_date",
+        "service_code",
+        "billing_class",
+        "setting",
+        "billing_code_modifier",
+        "additional_information",
+        "canonical_payload",
+    ):
+        try:
+            await db.status(f"ALTER TABLE {db_schema}.ptg2_price_set DROP COLUMN IF EXISTS {column_name};")
+        except Exception as exc:
+            logger.debug("Skipping ptg2_price_set column %s drop: %s", column_name, exc)
+
+
+async def _ensure_ptg2_price_atom_columns(db_schema: str) -> None:
     column_specs = {
-        "negotiated_type": "varchar(64)",
-        "negotiated_rate": "numeric",
-        "expiration_date": "date",
-        "service_code": "varchar[]",
-        "billing_class": "varchar(32)",
-        "setting": "varchar(32)",
-        "billing_code_modifier": "varchar[]",
-        "additional_information": "varchar",
+        "service_code_set_hash": "varchar(64)",
+        "billing_code_modifier_set_hash": "varchar(64)",
     }
     for column_name, column_type in column_specs.items():
         try:
             await db.status(
-                f"ALTER TABLE {db_schema}.ptg2_price_set "
+                f"ALTER TABLE {db_schema}.ptg2_price_atom "
                 f"ADD COLUMN IF NOT EXISTS {column_name} {column_type};"
             )
         except Exception as exc:
-            logger.debug("Skipping ptg2_price_set column %s ensure: %s", column_name, exc)
+            logger.debug("Skipping ptg2_price_atom column %s ensure: %s", column_name, exc)
+    await _drop_ptg2_columns(
+        db_schema,
+        "ptg2_price_atom",
+        ("hash_prefix", "canonical_payload", "service_code", "billing_code_modifier"),
+    )
+
+
+async def _drop_ptg2_columns(db_schema: str, table_name: str, column_names: tuple[str, ...]) -> None:
+    for column_name in column_names:
+        try:
+            await db.status(
+                f"ALTER TABLE {_quote_ident(db_schema)}.{_quote_ident(table_name)} "
+                f"DROP COLUMN IF EXISTS {_quote_ident(column_name)};"
+            )
+        except Exception as exc:
+            logger.debug("Skipping %s column %s drop: %s", table_name, column_name, exc)
 
 
 async def _ensure_ptg2_price_set_stage_table(db_schema: str) -> None:
@@ -5954,13 +6205,11 @@ async def _ensure_ptg2_price_set_stage_table(db_schema: str) -> None:
         CREATE {storage_mode}TABLE IF NOT EXISTS {db_schema}.ptg2_price_set_stage (
             snapshot_id varchar(96) NOT NULL,
             price_set_hash varchar(64) NOT NULL,
-            hash_prefix varchar(16),
-            price_atom_hashes varchar[],
-            canonical_payload json,
             created_at timestamp
         );
         """
     )
+    await _drop_ptg2_columns(db_schema, "ptg2_price_set_stage", ("hash_prefix", "price_atom_hashes", "canonical_payload"))
     if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True):
         try:
             await db.status(f"ALTER TABLE {db_schema}.ptg2_price_set_stage SET UNLOGGED;")
@@ -6094,6 +6343,26 @@ async def ensure_ptg2_tables() -> None:
             await _ensure_ptg2_price_set_columns(db_schema)
         if cls is PTG2ProviderSet:
             await _ensure_ptg2_provider_set_columns(db_schema)
+        if cls is PTG2ProviderSetMember:
+            await _drop_ptg2_columns(db_schema, "ptg2_provider_set_member", ("ordinal",))
+        if cls is PTG2Procedure:
+            await _drop_ptg2_columns(db_schema, "ptg2_procedure", ("hash_prefix", "canonical_payload"))
+        if cls is PTG2PriceAtom:
+            await _ensure_ptg2_price_atom_columns(db_schema)
+        if cls is PTG2PriceSetEntry:
+            await _drop_ptg2_columns(db_schema, "ptg2_price_set_entry", ("ordinal",))
+        if cls is PTG2ProviderGroupMember:
+            await _drop_ptg2_columns(db_schema, "ptg2_provider_group_member", ("ordinal",))
+        if cls is PTG2ProviderSetComponent:
+            await _drop_ptg2_columns(db_schema, "ptg2_provider_set_component", ("ordinal",))
+        if cls is PTG2ProviderSetEntry:
+            await _drop_ptg2_columns(db_schema, "ptg2_provider_set_entry", ("ordinal",))
+        if cls is PTG2ProviderEntryComponent:
+            await _drop_ptg2_columns(db_schema, "ptg2_provider_entry_component", ("ordinal",))
+        if cls is PTG2SourceTrace:
+            await _drop_ptg2_columns(db_schema, "ptg2_source_trace", ("hash_prefix", "canonical_payload"))
+        if cls is PTG2SourceTraceSet:
+            await _drop_ptg2_columns(db_schema, "ptg2_source_trace_set", ("hash_prefix", "canonical_payload"))
         await _ensure_indexes(cls, db_schema)
     await _ensure_ptg2_price_set_stage_table(db_schema)
     await _ensure_ptg2_serving_rate_stage_table(db_schema)
@@ -6667,9 +6936,13 @@ def _iter_compact_serving_records_rust(
     confidence_code: str = PTG2_CONFIDENCE_TIC_RATE_NPI_TIN,
     compact_copy_path: str | Path | None = None,
     procedure_copy_path: str | Path | None = None,
-    price_set_copy_path: str | Path | None = None,
+    price_code_set_copy_path: str | Path | None = None,
+    price_atom_copy_path: str | Path | None = None,
+    price_set_entry_copy_path: str | Path | None = None,
     provider_set_copy_path: str | Path | None = None,
     provider_group_member_copy_path: str | Path | None = None,
+    provider_set_entry_copy_path: str | Path | None = None,
+    provider_entry_component_copy_path: str | Path | None = None,
 ):
     binary = _ptg2_rust_scanner_binary()
     if binary is None:
@@ -6689,12 +6962,20 @@ def _iter_compact_serving_records_rust(
         env["HLTHPRT_PTG2_COMPACT_SERVING_COPY_PATH"] = str(compact_copy_path)
     if procedure_copy_path is not None:
         env["HLTHPRT_PTG2_PROCEDURE_COPY_PATH"] = str(procedure_copy_path)
-    if price_set_copy_path is not None:
-        env["HLTHPRT_PTG2_PRICE_SET_COPY_PATH"] = str(price_set_copy_path)
+    if price_code_set_copy_path is not None:
+        env["HLTHPRT_PTG2_PRICE_CODE_SET_COPY_PATH"] = str(price_code_set_copy_path)
+    if price_atom_copy_path is not None:
+        env["HLTHPRT_PTG2_PRICE_ATOM_COPY_PATH"] = str(price_atom_copy_path)
+    if price_set_entry_copy_path is not None:
+        env["HLTHPRT_PTG2_PRICE_SET_ENTRY_COPY_PATH"] = str(price_set_entry_copy_path)
     if provider_set_copy_path is not None:
         env["HLTHPRT_PTG2_PROVIDER_SET_COPY_PATH"] = str(provider_set_copy_path)
     if provider_group_member_copy_path is not None:
         env["HLTHPRT_PTG2_PROVIDER_GROUP_MEMBER_COPY_PATH"] = str(provider_group_member_copy_path)
+    if provider_set_entry_copy_path is not None:
+        env["HLTHPRT_PTG2_PROVIDER_SET_ENTRY_COPY_PATH"] = str(provider_set_entry_copy_path)
+    if provider_entry_component_copy_path is not None:
+        env["HLTHPRT_PTG2_PROVIDER_ENTRY_COMPONENT_COPY_PATH"] = str(provider_entry_component_copy_path)
     env.setdefault(PTG2_RUST_WORKERS_ENV, str(PTG2_DEFAULT_RUST_WORKERS))
     env.setdefault(PTG2_RUST_WORK_QUEUE_ENV, str(PTG2_DEFAULT_RUST_WORK_QUEUE))
     env.setdefault(PTG2_RUST_EVENT_QUEUE_ENV, str(PTG2_DEFAULT_RUST_EVENT_QUEUE))
@@ -6781,9 +7062,13 @@ async def _aiter_compact_serving_records_rust(
     confidence_code: str = PTG2_CONFIDENCE_TIC_RATE_NPI_TIN,
     compact_copy_path: str | Path | None = None,
     procedure_copy_path: str | Path | None = None,
-    price_set_copy_path: str | Path | None = None,
+    price_code_set_copy_path: str | Path | None = None,
+    price_atom_copy_path: str | Path | None = None,
+    price_set_entry_copy_path: str | Path | None = None,
     provider_set_copy_path: str | Path | None = None,
     provider_group_member_copy_path: str | Path | None = None,
+    provider_set_entry_copy_path: str | Path | None = None,
+    provider_entry_component_copy_path: str | Path | None = None,
 ):
     iterator = _iter_compact_serving_records_rust(
         path,
@@ -6794,9 +7079,13 @@ async def _aiter_compact_serving_records_rust(
         confidence_code=confidence_code,
         compact_copy_path=compact_copy_path,
         procedure_copy_path=procedure_copy_path,
-        price_set_copy_path=price_set_copy_path,
+        price_code_set_copy_path=price_code_set_copy_path,
+        price_atom_copy_path=price_atom_copy_path,
+        price_set_entry_copy_path=price_set_entry_copy_path,
         provider_set_copy_path=provider_set_copy_path,
         provider_group_member_copy_path=provider_group_member_copy_path,
+        provider_set_entry_copy_path=provider_set_entry_copy_path,
+        provider_entry_component_copy_path=provider_entry_component_copy_path,
     )
     event_queue: queue.Queue[Any] = queue.Queue(
         maxsize=max(_env_int(PTG2_RUST_EVENT_QUEUE_ENV, PTG2_DEFAULT_RUST_EVENT_QUEUE), 1)
@@ -7240,15 +7529,15 @@ def _provider_group_member_rows(provider_entry: dict[str, Any]) -> list[dict[str
     if provider_group_hash is None:
         return []
     rows = []
-    for ordinal, npi in enumerate(_normalized_npi_list(provider_entry.get("npi")), start=1):
-        rows.append({"provider_group_hash": int(provider_group_hash), "npi": int(npi), "ordinal": ordinal})
+    for npi in _normalized_npi_list(provider_entry.get("npi")):
+        rows.append({"provider_group_hash": int(provider_group_hash), "npi": int(npi)})
     return rows
 
 
 def _provider_set_component_rows(provider_set_hash: str, provider_group_hashes: list[int] | set[int]) -> list[dict[str, Any]]:
     return [
-        {"provider_set_hash": provider_set_hash, "provider_group_hash": int(group_hash), "ordinal": ordinal}
-        for ordinal, group_hash in enumerate(sorted({int(value) for value in provider_group_hashes}), start=1)
+        {"provider_set_hash": provider_set_hash, "provider_group_hash": int(group_hash)}
+        for group_hash in sorted({int(value) for value in provider_group_hashes})
     ]
 
 
@@ -7668,33 +7957,11 @@ def _serving_only_rows_for_payload(
         provider_set_rows.append(
             {
                 "provider_set_hash": provider_set_hash,
-                "hash_prefix": hash_prefix(provider_set_hash),
                 "provider_count": provider_count,
-                "npi": None,
-                "tin_type": None,
-                "tin_value": None,
-                "canonical_payload": _canonicalize_for_json(
-                    {
-                        "provider_group_hashes": provider_group_hashes,
-                        "provider_group_count": len(provider_group_hashes),
-                        "provider_count": provider_count,
-                        "npi_inline": False,
-                    }
-                ),
                 "created_at": _utcnow(),
             }
         )
         price_set_hash = _serving_only_hash_price_key(price_key)
-        if slim_serving_rows:
-            price_set_rows.append(
-                {
-                    "price_set_hash": price_set_hash,
-                    "hash_prefix": hash_prefix(price_set_hash),
-                    "price_atom_hashes": [],
-                    "canonical_payload": item_group["prices"],
-                    "created_at": _utcnow(),
-                }
-            )
         rate_pack_hash = _serving_only_hash_text(
             "serving_rate_pack",
             snapshot_id,
@@ -8049,6 +8316,8 @@ async def _parse_in_network_file_serving_only(
             "price_set_rows": [],
             "serving_rate_compact_rows": [],
             "provider_set_rows": [],
+            "provider_set_component_rows": [],
+            "provider_group_member_rows": [],
             "procedure_rows": [],
         }
         rust_batch_limit = max(_env_int(PTG2_COMPACT_BATCH_ROWS_ENV, 5000), 1)
@@ -8064,7 +8333,17 @@ async def _parse_in_network_file_serving_only(
         os.close(compact_copy_fd)
         compact_copy_path = Path(compact_copy_name)
         dictionary_copy_paths: dict[str, Path] = {}
-        for dictionary_kind in ("procedure", "price_set", "provider_set", "provider_group_member"):
+        dictionary_kinds = (
+            "procedure",
+            "price_code_set",
+            "price_atom",
+            "price_set_entry",
+            "provider_set",
+            "provider_set_entry",
+            "provider_entry_component",
+            "provider_group_member",
+        )
+        for dictionary_kind in dictionary_kinds:
             fd, name = tempfile.mkstemp(
                 prefix=f"ptg2_{dictionary_kind}_",
                 suffix=".copy",
@@ -8093,10 +8372,8 @@ async def _parse_in_network_file_serving_only(
         )
         compact_copy_semaphore = asyncio.Semaphore(compact_copy_task_limit)
         compact_copy_kind_semaphores: dict[str, asyncio.Semaphore] = {
-            "procedure": asyncio.Semaphore(compact_copy_kind_task_limit),
-            "price_set": asyncio.Semaphore(compact_copy_kind_task_limit),
-            "provider_set": asyncio.Semaphore(compact_copy_kind_task_limit),
-            "provider_group_member": asyncio.Semaphore(compact_copy_kind_task_limit),
+            kind: asyncio.Semaphore(compact_copy_kind_task_limit)
+            for kind in dictionary_kinds
         }
         compact_serving_copy_semaphores: dict[str, asyncio.Semaphore] = {}
         stage_tables: dict[str, str] = dict(rust_stage_tables or {})
@@ -8239,18 +8516,26 @@ async def _parse_in_network_file_serving_only(
                 source_trace_set_hash=source_trace_set_hash,
                 compact_copy_path=compact_copy_path,
                 procedure_copy_path=dictionary_copy_paths.get("procedure"),
-                price_set_copy_path=dictionary_copy_paths.get("price_set"),
+                price_code_set_copy_path=dictionary_copy_paths.get("price_code_set"),
+                price_atom_copy_path=dictionary_copy_paths.get("price_atom"),
+                price_set_entry_copy_path=dictionary_copy_paths.get("price_set_entry"),
                 provider_set_copy_path=dictionary_copy_paths.get("provider_set"),
                 provider_group_member_copy_path=dictionary_copy_paths.get("provider_group_member"),
+                provider_set_entry_copy_path=dictionary_copy_paths.get("provider_set_entry"),
+                provider_entry_component_copy_path=dictionary_copy_paths.get("provider_entry_component"),
             ):
                 if record_kind == "dedupe_summary":
                     rust_dedupe_summary = dict(record_row or {})
                     continue
                 rust_records += 1
-                if record_kind == "price_set":
-                    rust_batches["price_set_rows"].append(record_row)
-                elif record_kind == "price_set_copy_file":
-                    compact_copy_tasks.add(asyncio.create_task(copy_ready_dictionary_file("price_set", record_row)))
+                if record_kind == "price_atom_copy_file":
+                    compact_copy_tasks.add(asyncio.create_task(copy_ready_dictionary_file("price_atom", record_row)))
+                    await wait_for_some_copy_tasks()
+                elif record_kind == "price_code_set_copy_file":
+                    compact_copy_tasks.add(asyncio.create_task(copy_ready_dictionary_file("price_code_set", record_row)))
+                    await wait_for_some_copy_tasks()
+                elif record_kind == "price_set_entry_copy_file":
+                    compact_copy_tasks.add(asyncio.create_task(copy_ready_dictionary_file("price_set_entry", record_row)))
                     await wait_for_some_copy_tasks()
                 elif record_kind == "compact_copy_file":
                     compact_copy_tasks.add(asyncio.create_task(copy_ready_compact_file(record_row)))
@@ -8263,6 +8548,26 @@ async def _parse_in_network_file_serving_only(
                     rust_batches["provider_set_rows"].append(record_row)
                 elif record_kind == "provider_set_copy_file":
                     compact_copy_tasks.add(asyncio.create_task(copy_ready_dictionary_file("provider_set", record_row)))
+                    await wait_for_some_copy_tasks()
+                elif record_kind == "provider_set_entry":
+                    rust_batches.setdefault("provider_set_component_rows", []).append(
+                        {
+                            "provider_set_hash": record_row.get("provider_set_hash"),
+                            "provider_group_hash": record_row.get("provider_entry_hash"),
+                        }
+                    )
+                elif record_kind == "provider_set_entry_copy_file":
+                    compact_copy_tasks.add(asyncio.create_task(copy_ready_dictionary_file("provider_set_entry", record_row)))
+                    await wait_for_some_copy_tasks()
+                elif record_kind == "provider_entry_component":
+                    rust_batches.setdefault("provider_group_member_rows", []).append(
+                        {
+                            "provider_group_hash": record_row.get("provider_entry_hash"),
+                            "npi": record_row.get("npi"),
+                        }
+                    )
+                elif record_kind == "provider_entry_component_copy_file":
+                    compact_copy_tasks.add(asyncio.create_task(copy_ready_dictionary_file("provider_entry_component", record_row)))
                     await wait_for_some_copy_tasks()
                 elif record_kind == "provider_group_member_copy_file":
                     compact_copy_tasks.add(asyncio.create_task(copy_ready_dictionary_file("provider_group_member", record_row)))
@@ -8280,6 +8585,8 @@ async def _parse_in_network_file_serving_only(
                         compact_rows=rust_batches["serving_rate_compact_rows"],
                         provider_set_rows=rust_batches["provider_set_rows"],
                         procedure_rows=rust_batches["procedure_rows"],
+                        component_rows=rust_batches["provider_set_component_rows"],
+                        member_rows=rust_batches["provider_group_member_rows"],
                     )
                     for rows in rust_batches.values():
                         rows.clear()
@@ -8289,6 +8596,8 @@ async def _parse_in_network_file_serving_only(
                     compact_rows=rust_batches["serving_rate_compact_rows"],
                     provider_set_rows=rust_batches["provider_set_rows"],
                     procedure_rows=rust_batches["procedure_rows"],
+                    component_rows=rust_batches["provider_set_component_rows"],
+                    member_rows=rust_batches["provider_group_member_rows"],
                 )
             await _flush_compact_rows(state, force=True)
             await _drain_compact_writes(state)
@@ -10254,11 +10563,22 @@ async def main(
         if allowed_url:
             jobs.append({"type": "allowed_amounts", "url": allowed_url})
         jobs = _filter_jobs_by_url_contains(jobs, file_url_contains)
+        jobs_discovered_before_dedupe = len(jobs)
+        jobs, duplicate_jobs_skipped = _dedupe_ptg_jobs(jobs)
+        if duplicate_jobs_skipped:
+            _emit_screen_line(
+                "PTG2_JOB_DEDUPE"
+                f"\traw_jobs={jobs_discovered_before_dedupe}"
+                f"\tunique_jobs={len(jobs)}"
+                f"\tduplicates_skipped={duplicate_jobs_skipped}"
+            )
         if toc_failures and not _env_bool("HLTHPRT_PTG2_ALLOW_PARTIAL_IMPORT", False):
             failure_report = {
                 "toc_urls": toc_candidates,
                 "toc_failures": toc_failures,
-                "jobs_discovered": len(jobs),
+                "jobs_discovered": jobs_discovered_before_dedupe,
+                "jobs_unique": len(jobs),
+                "duplicate_jobs_skipped": duplicate_jobs_skipped,
                 "files_attempted": 0,
                 "files_processed": 0,
                 "files_failed": 0,
@@ -10285,7 +10605,7 @@ async def main(
         seen_jobs: set[tuple[str, str]] = set()
         selected_jobs: list[dict[str, Any]] = []
         for job in jobs:
-            job_key = (job.get("type"), job.get("url"))
+            job_key = _ptg_job_identity(job)
             if job_key in seen_jobs:
                 continue
             seen_jobs.add(job_key)
@@ -10366,7 +10686,9 @@ async def main(
                 failed_files.append(asdict(result))
 
         failure_report = {
-            "jobs_discovered": len(jobs),
+            "jobs_discovered": jobs_discovered_before_dedupe,
+            "jobs_unique": len(jobs),
+            "duplicate_jobs_skipped": duplicate_jobs_skipped,
             "files_attempted": attempted_files,
             "files_processed": processed_files,
             "files_failed": len(failed_files),
@@ -10539,6 +10861,8 @@ async def main(
                                 "procedure",
                                 "price_set",
                                 "provider_set",
+                                "provider_set_entry",
+                                "provider_entry_component",
                                 "provider_group_member",
                             )
                         ]
