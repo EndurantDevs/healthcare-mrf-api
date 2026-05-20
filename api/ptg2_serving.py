@@ -82,9 +82,13 @@ class PTG2ServingIndex:
 @dataclass(frozen=True)
 class PTG2ServingTables:
     serving_table: str | None = None
-    price_table: str | None = None
+    price_code_set_table: str | None = None
+    price_atom_table: str | None = None
+    price_set_entry_table: str | None = None
     procedure_table: str | None = None
     provider_set_table: str | None = None
+    provider_set_entry_table: str | None = None
+    provider_entry_component_table: str | None = None
     provider_group_member_table: str | None = None
 
 
@@ -293,32 +297,101 @@ def clear_ptg2_index_cache() -> None:
     _PTG2_INDEX_CACHE.clear()
 
 
-def _typed_price_json_sql(alias: str = "ps", *, json_type: str = "json") -> str:
+def _empty_price_array_sql(*, json_type: str = "json") -> str:
+    is_jsonb = json_type == "jsonb"
+    return "'[]'::jsonb" if is_jsonb else "CAST('[]' AS json)"
+
+
+def _scalar_price_json_sql(alias: str = "ps", *, json_type: str = "json") -> str:
     is_jsonb = json_type == "jsonb"
     build_array = "jsonb_build_array" if is_jsonb else "json_build_array"
     build_object = "jsonb_build_object" if is_jsonb else "json_build_object"
-    empty_array = "'[]'::jsonb" if is_jsonb else "CAST('[]' AS json)"
-    canonical_payload = f"{alias}.canonical_payload::jsonb" if is_jsonb else f"{alias}.canonical_payload"
+    empty_array = _empty_price_array_sql(json_type=json_type)
     to_json_func = "to_jsonb" if is_jsonb else "to_json"
+    return f"""
+        CASE
+            WHEN {alias}.negotiated_rate IS NULL THEN {empty_array}
+            ELSE {build_array}(
+                {build_object}(
+                    'negotiated_type', {alias}.negotiated_type,
+                    'negotiated_rate', {alias}.negotiated_rate,
+                    'expiration_date', {alias}.expiration_date,
+                    'service_code', COALESCE({to_json_func}({alias}.service_code), {empty_array}),
+                    'billing_class', {alias}.billing_class,
+                    'setting', {alias}.setting,
+                    'billing_code_modifier', COALESCE({to_json_func}({alias}.billing_code_modifier), {empty_array}),
+                    'additional_information', {alias}.additional_information
+                )
+            )
+        END
+    """
+
+
+def _typed_price_json_sql(alias: str = "ps", *, json_type: str = "json") -> str:
+    is_jsonb = json_type == "jsonb"
+    canonical_payload = f"{alias}.canonical_payload::jsonb" if is_jsonb else f"{alias}.canonical_payload"
     return f"""
         COALESCE(
             {canonical_payload},
-            CASE
-                WHEN {alias}.negotiated_rate IS NULL THEN {empty_array}
-                ELSE {build_array}(
-                    {build_object}(
-                        'negotiated_type', {alias}.negotiated_type,
-                        'negotiated_rate', {alias}.negotiated_rate,
-                        'expiration_date', {alias}.expiration_date,
-                        'service_code', COALESCE({to_json_func}({alias}.service_code), {empty_array}),
-                        'billing_class', {alias}.billing_class,
-                        'setting', {alias}.setting,
-                        'billing_code_modifier', COALESCE({to_json_func}({alias}.billing_code_modifier), {empty_array}),
-                        'additional_information', {alias}.additional_information
-                    )
-                )
-            END
+            {_scalar_price_json_sql(alias, json_type=json_type)}
         )
+    """
+
+
+def _normalized_price_json_sql(
+    alias: str = "ps",
+    *,
+    payload_alias: str = "price_payload",
+    json_type: str = "json",
+) -> str:
+    del alias
+    payload = f"{payload_alias}.prices" if json_type == "jsonb" else f"{payload_alias}.prices::json"
+    return f"COALESCE({payload}, {_empty_price_array_sql(json_type=json_type)})"
+
+
+def _price_atom_payload_sql(alias: str = "pa", *, service_alias: str = "service_set", modifier_alias: str = "modifier_set") -> str:
+    return f"""
+        jsonb_build_object(
+            'negotiated_type', {alias}.negotiated_type,
+            'negotiated_rate',
+                CASE
+                    WHEN {alias}.negotiated_rate ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                    THEN {alias}.negotiated_rate::numeric
+                    ELSE NULL
+                END,
+            'expiration_date', {alias}.expiration_date,
+            'service_code', COALESCE(to_jsonb({service_alias}.codes), '[]'::jsonb),
+            'billing_class', {alias}.billing_class,
+            'setting', {alias}.setting,
+            'billing_code_modifier', COALESCE(to_jsonb({modifier_alias}.codes), '[]'::jsonb),
+            'additional_information', {alias}.additional_information
+        )
+    """
+
+
+def _normalized_price_join_sql(
+    serving_tables: PTG2ServingTables,
+    *,
+    rate_alias: str = "r",
+    payload_alias: str = "price_payload",
+) -> str:
+    if not (serving_tables.price_atom_table and serving_tables.price_set_entry_table and serving_tables.price_code_set_table):
+        return ""
+    return f"""
+        LEFT JOIN LATERAL (
+            SELECT jsonb_agg(
+                {_price_atom_payload_sql("pa")}
+                ORDER BY pse.price_atom_hash
+            ) AS prices
+              FROM {serving_tables.price_set_entry_table} pse
+              JOIN {serving_tables.price_atom_table} pa
+                ON pa.price_atom_hash = pse.price_atom_hash
+              LEFT JOIN {serving_tables.price_code_set_table} service_set
+                ON service_set.code_set_hash = pa.service_code_set_hash
+              LEFT JOIN {serving_tables.price_code_set_table} modifier_set
+                ON modifier_set.code_set_hash = pa.billing_code_modifier_set_hash
+             WHERE pse.price_set_hash = {rate_alias}.price_set_hash
+        ) {payload_alias} ON TRUE
     """
 
 
@@ -739,9 +812,13 @@ async def snapshot_serving_tables(session, snapshot_id: str) -> PTG2ServingTable
         return PTG2ServingTables()
     return PTG2ServingTables(
         serving_table=_safe_table_name(value.get("table")),
-        price_table=_safe_table_name(value.get("price_table")) or f"{PTG2_SCHEMA}.ptg2_price_set",
+        price_code_set_table=_safe_table_name(value.get("price_code_set_table")),
+        price_atom_table=_safe_table_name(value.get("price_atom_table")),
+        price_set_entry_table=_safe_table_name(value.get("price_set_entry_table")),
         procedure_table=_safe_table_name(value.get("procedure_table")) or f"{PTG2_SCHEMA}.ptg2_procedure",
         provider_set_table=_safe_table_name(value.get("provider_set_table")),
+        provider_set_entry_table=_safe_table_name(value.get("provider_set_entry_table")),
+        provider_entry_component_table=_safe_table_name(value.get("provider_entry_component_table")),
         provider_group_member_table=_safe_table_name(value.get("provider_group_member_table")),
     )
 
@@ -924,10 +1001,21 @@ async def _search_compact_serving_table(
     where_sql = " AND ".join(_qualify_compact_filters(filters))
     schema = PTG2_SCHEMA
     procedure_table = serving_tables.procedure_table or f"{schema}.ptg2_procedure"
-    price_set_table = serving_tables.price_table or f"{schema}.ptg2_price_set"
-    provider_set_table = serving_tables.provider_set_table or f"{schema}.ptg2_provider_set"
+    use_normalized_price_tables = bool(
+        serving_tables.price_atom_table
+        and serving_tables.price_set_entry_table
+        and serving_tables.price_code_set_table
+    )
+    provider_set_entry_table = serving_tables.provider_set_entry_table
+    provider_entry_component_table = serving_tables.provider_entry_component_table
     provider_group_member_table = serving_tables.provider_group_member_table or f"{schema}.ptg2_provider_group_member"
-    use_snapshot_provider_tables = bool(serving_tables.provider_set_table and serving_tables.provider_group_member_table)
+    use_provider_entry_tables = bool(
+        provider_set_entry_table
+        and provider_entry_component_table
+        and serving_tables.provider_group_member_table
+    )
+    if not use_normalized_price_tables or not use_provider_entry_tables:
+        return None
     procedure_join_sql = (
         f"""
         JOIN LATERAL (
@@ -941,36 +1029,13 @@ async def _search_compact_serving_table(
         else f"JOIN {procedure_table} proc ON proc.procedure_hash = r.procedure_hash"
     )
     price_join_sql = f"""
-        LEFT JOIN LATERAL (
-            SELECT ps.*
-              FROM {price_set_table} ps
-             WHERE ps.price_set_hash = r.price_set_hash
-             LIMIT 1
-        ) ps ON TRUE
+        {_normalized_price_join_sql(serving_tables)}
     """
-    if use_snapshot_provider_tables:
-        provider_join_sql = f"""
-            JOIN LATERAL (
-                SELECT provider_set.*
-                  FROM {provider_set_table} provider_set
-                 WHERE provider_set.provider_set_hash = r.provider_set_hash
-                 LIMIT 1
-            ) provider_set ON TRUE
-            JOIN LATERAL jsonb_array_elements_text(
-                COALESCE(
-                    to_jsonb(provider_set.provider_group_hashes),
-                    provider_set.canonical_payload::jsonb->'provider_group_hashes',
-                    '[]'::jsonb
-                )
-            ) AS provider_group_ref(provider_group_hash) ON TRUE
-            JOIN {provider_group_member_table} pgm
-              ON pgm.provider_group_hash = provider_group_ref.provider_group_hash::bigint
-        """
-    else:
-        provider_join_sql = f"""
-            JOIN {schema}.ptg2_provider_set_component psc ON psc.provider_set_hash = r.provider_set_hash
-            JOIN {schema}.ptg2_provider_group_member pgm ON pgm.provider_group_hash = psc.provider_group_hash
-        """
+    provider_join_sql = f"""
+        JOIN {provider_set_entry_table} pse ON pse.provider_set_hash = r.provider_set_hash
+        JOIN {provider_entry_component_table} pec ON pec.provider_entry_hash = pse.provider_entry_hash
+        JOIN {provider_group_member_table} pgm ON pgm.provider_group_hash = pec.provider_group_hash
+    """
     coordinate_sql = ""
     if coordinate_filter_requested:
         coordinate_sql = """
@@ -1029,37 +1094,20 @@ async def _search_compact_serving_table(
             )
             if filter_sql
         )
-        if use_snapshot_provider_tables:
-            provider_npi_where_sql = "WHERE pgm_filter.npi = :provider_npi" if provider_npi else ""
-            provider_npi_join_sql = f"""
-                JOIN LATERAL (
-                    SELECT pgm_filter.npi
-                      FROM jsonb_array_elements_text(
-                            COALESCE(
-                                to_jsonb(provider_filter_set.provider_group_hashes),
-                                provider_filter_set.canonical_payload::jsonb->'provider_group_hashes',
-                                '[]'::jsonb
-                            )
-                      ) AS provider_group_filter_ref(provider_group_hash)
-                      JOIN {provider_group_member_table} pgm_filter
-                        ON pgm_filter.provider_group_hash = provider_group_filter_ref.provider_group_hash::bigint
-                     {provider_npi_where_sql}
-                     OFFSET 0
-                ) provider_filter_npi ON TRUE
-            """
-        else:
-            provider_npi_where_sql = "AND pgm_filter.npi = :provider_npi" if provider_npi else ""
-            provider_npi_join_sql = f"""
-                JOIN LATERAL (
-                    SELECT pgm_filter.npi
-                      FROM {schema}.ptg2_provider_set_component psc_filter
-                      JOIN {schema}.ptg2_provider_group_member pgm_filter
-                        ON pgm_filter.provider_group_hash = psc_filter.provider_group_hash
-                     WHERE psc_filter.provider_set_hash = provider_filter_set.provider_set_hash
-                       {provider_npi_where_sql}
-                     OFFSET 0
-                ) provider_filter_npi ON TRUE
-            """
+        provider_npi_where_sql = "AND pgm_filter.npi = :provider_npi" if provider_npi else ""
+        provider_npi_join_sql = f"""
+            FROM LATERAL (
+                SELECT pgm_filter.npi
+                  FROM {provider_set_entry_table} pse_filter
+                  JOIN {provider_entry_component_table} pec_filter
+                    ON pec_filter.provider_entry_hash = pse_filter.provider_entry_hash
+                  JOIN {provider_group_member_table} pgm_filter
+                    ON pgm_filter.provider_group_hash = pec_filter.provider_group_hash
+                 WHERE pse_filter.provider_set_hash = r.provider_set_hash
+                   {provider_npi_where_sql}
+                 OFFSET 0
+            ) provider_filter_npi
+        """
         provider_geo_match_sql = (
             f"""
                 JOIN LATERAL (
@@ -1092,16 +1140,14 @@ async def _search_compact_serving_table(
         provider_filter_sql = f"""
           AND EXISTS (
                 SELECT 1
-                  FROM {provider_set_table} provider_filter_set
                   {provider_npi_join_sql}
                   {provider_geo_match_sql}
                   {provider_taxonomy_match_sql}
-                 WHERE provider_filter_set.provider_set_hash = r.provider_set_hash
                  LIMIT 1
           )
         """
-    compact_price_jsonb = _typed_price_json_sql("ps", json_type="jsonb")
-    compact_price_json = _typed_price_json_sql("ps", json_type="json")
+    compact_price_jsonb = _normalized_price_json_sql(json_type="jsonb")
+    compact_price_json = _normalized_price_json_sql(json_type="json")
     has_provider_filters = expand_providers
     if has_provider_filters:
         geo_sql = " AND ".join(geo_filters)
@@ -1144,7 +1190,17 @@ async def _search_compact_serving_table(
             """
         else:
             taxonomy_join_sql = ""
-        if coordinate_filter_requested and use_snapshot_provider_tables and not q_text:
+        candidate_set_groups_sql = f"""
+                    SELECT DISTINCT
+                        pse.provider_set_hash,
+                        pec.provider_group_hash
+                      FROM rate_candidates r
+                      JOIN {provider_set_entry_table} pse
+                        ON pse.provider_set_hash = r.provider_set_hash
+                      JOIN {provider_entry_component_table} pec
+                        ON pec.provider_entry_hash = pse.provider_entry_hash
+        """
+        if coordinate_filter_requested and not q_text:
             geo_member_filters = [
                 "addr.type IN ('primary', 'secondary')",
                 coordinate_geography_sql.replace("addr_alias", "addr"),
@@ -1231,15 +1287,7 @@ async def _search_compact_serving_table(
                          WHERE {where_sql}
                     ),
                     candidate_set_groups AS MATERIALIZED (
-                        SELECT DISTINCT
-                            ps.provider_set_hash,
-                            group_ref.provider_group_hash::bigint AS provider_group_hash
-                          FROM rate_candidates r
-                          JOIN {provider_set_table} ps
-                            ON ps.provider_set_hash = r.provider_set_hash
-                          JOIN LATERAL unnest(
-                                COALESCE(ps.provider_group_hashes, ARRAY[]::bigint[])
-                          ) AS group_ref(provider_group_hash) ON TRUE
+{candidate_set_groups_sql}
                     ),
                     top_providers AS MATERIALIZED (
                         SELECT
@@ -1755,7 +1803,7 @@ async def search_ptg2_serving_table(
     where_sql = " AND ".join(filters)
     serving_tables = serving_tables or PTG2ServingTables()
     preferred_table = serving_tables.serving_table
-    price_set_table = serving_tables.price_table or f"{PTG2_SCHEMA}.ptg2_price_set"
+    price_set_table = f"{PTG2_SCHEMA}.ptg2_price_set"
     source_trace_set_table = f"{PTG2_SCHEMA}.ptg2_source_trace_set"
     source_trace_table = f"{PTG2_SCHEMA}.ptg2_source_trace"
     total = 0
@@ -1942,15 +1990,23 @@ async def search_ptg2_provider_procedures(session, npi: int, args: dict[str, Any
         return None
 
     schema = PTG2_SCHEMA
-    provider_set_table = serving_tables.provider_set_table or f"{schema}.ptg2_provider_set"
+    provider_set_entry_table = serving_tables.provider_set_entry_table
+    provider_entry_component_table = serving_tables.provider_entry_component_table
     provider_group_member_table = serving_tables.provider_group_member_table or f"{schema}.ptg2_provider_group_member"
     procedure_table = serving_tables.procedure_table or f"{schema}.ptg2_procedure"
-    price_set_table = serving_tables.price_table or f"{schema}.ptg2_price_set"
-    provider_group_hashes_index = f"{provider_set_table}_group_hashes_gin_idx"
-    has_reverse_provider_index = (
-        await _index_available(session, provider_group_hashes_index)
-        or await _gin_index_available_for_column(session, provider_set_table, "provider_group_hashes")
+    use_normalized_price_tables = bool(
+        serving_tables.price_atom_table
+        and serving_tables.price_set_entry_table
+        and serving_tables.price_code_set_table
     )
+    use_provider_entry_tables = bool(
+        provider_set_entry_table
+        and provider_entry_component_table
+        and serving_tables.provider_group_member_table
+    )
+    if not use_normalized_price_tables or not use_provider_entry_tables:
+        return None
+    has_reverse_provider_index = True
 
     params: dict[str, Any] = {
         "snapshot_id": snapshot_id,
@@ -2009,7 +2065,18 @@ async def search_ptg2_provider_procedures(session, npi: int, args: dict[str, Any
         """
         params["q_like"] = f"%{q_text}%"
     where_sql = " AND ".join(_qualify_compact_filters(filters))
-    compact_price_json = _typed_price_json_sql("ps", json_type="json")
+    compact_price_json = _normalized_price_json_sql(json_type="json")
+    normalized_price_join_sql = _normalized_price_join_sql(serving_tables)
+    provider_sets_sql = f"""
+        provider_sets AS MATERIALIZED (
+            SELECT DISTINCT pse.provider_set_hash
+              FROM provider_groups pg
+              JOIN {provider_entry_component_table} pec
+                ON pec.provider_group_hash = pg.provider_group_hash
+              JOIN {provider_set_entry_table} pse
+                ON pse.provider_entry_hash = pec.provider_entry_hash
+        )
+    """
 
     count_result = await session.execute(
         text(
@@ -2019,12 +2086,7 @@ async def search_ptg2_provider_procedures(session, npi: int, args: dict[str, Any
                   FROM {provider_group_member_table}
                  WHERE npi = :provider_npi
             ),
-            provider_sets AS MATERIALIZED (
-                SELECT DISTINCT ps.provider_set_hash
-                  FROM provider_groups pg
-                  JOIN {provider_set_table} ps
-                    ON ps.provider_group_hashes @> ARRAY[pg.provider_group_hash]::bigint[]
-            )
+            {provider_sets_sql}
             SELECT COUNT(*)
               FROM provider_sets provider_set_match
               JOIN {table_name} r
@@ -2093,12 +2155,7 @@ async def search_ptg2_provider_procedures(session, npi: int, args: dict[str, Any
                   FROM {provider_group_member_table}
                  WHERE npi = :provider_npi
             ),
-            provider_sets AS MATERIALIZED (
-                SELECT DISTINCT ps.provider_set_hash
-                  FROM provider_groups pg
-                  JOIN {provider_set_table} ps
-                    ON ps.provider_group_hashes @> ARRAY[pg.provider_group_hash]::bigint[]
-            ),
+            {provider_sets_sql},
             matched_rates AS MATERIALIZED (
                 SELECT
                     r.serving_rate_id,
@@ -2150,12 +2207,7 @@ async def search_ptg2_provider_procedures(session, npi: int, args: dict[str, Any
                      WHERE proc.procedure_hash = r.procedure_hash
                      LIMIT 1
               ) proc ON TRUE
-              LEFT JOIN LATERAL (
-                    SELECT ps.*
-                      FROM {price_set_table} ps
-                     WHERE ps.price_set_hash = r.price_set_hash
-                     LIMIT 1
-              ) ps ON TRUE
+              {normalized_price_join_sql}
              ORDER BY r.reported_code_system, r.reported_code, r.provider_count DESC NULLS LAST, r.serving_rate_id
             """
         ),
