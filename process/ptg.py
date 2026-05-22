@@ -3480,7 +3480,7 @@ async def build_ptg2_compact_snapshot_index_artifact(
                             'negotiated_type', pa.negotiated_type,
                             'negotiated_rate',
                                 CASE
-                                    WHEN pa.negotiated_rate ~ '^-?[0-9]+(\.[0-9]+)?$'
+                                    WHEN pa.negotiated_rate ~ '^-?[0-9]+(\\.[0-9]+)?$'
                                         THEN (pa.negotiated_rate)::numeric
                                     ELSE NULL
                                 END,
@@ -3851,7 +3851,7 @@ async def build_ptg2_db_serving_index(snapshot_id: str, import_run_id: str) -> d
                             'negotiated_type', pa.negotiated_type,
                             'negotiated_rate',
                                 CASE
-                                    WHEN pa.negotiated_rate ~ '^-?[0-9]+(\.[0-9]+)?$'
+                                    WHEN pa.negotiated_rate ~ '^-?[0-9]+(\\.[0-9]+)?$'
                                         THEN (pa.negotiated_rate)::numeric
                                     ELSE NULL
                                 END,
