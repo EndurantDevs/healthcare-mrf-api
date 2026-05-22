@@ -23,6 +23,7 @@ ptg_artifacts = importlib.import_module("process.ptg_parts.artifacts")
 ptg_artifact_streams = importlib.import_module("process.ptg_parts.artifact_streams")
 ptg_canonical = importlib.import_module("process.ptg_parts.canonical")
 ptg_compact_indexes = importlib.import_module("process.ptg_parts.compact_indexes")
+ptg_copy_load = importlib.import_module("process.ptg_parts.copy_load")
 ptg_db_tables = importlib.import_module("process.ptg_parts.db_tables")
 ptg_domain = importlib.import_module("process.ptg_parts.domain")
 ptg_json_streams = importlib.import_module("process.ptg_parts.json_streams")
@@ -115,6 +116,23 @@ def test_compact_index_split_keeps_facade_helpers_stable():
     assert process_ptg._run_ptg2_index_statement is ptg_compact_indexes._run_ptg2_index_statement
     assert process_ptg._index_snapshot_compact_table_entries is ptg_compact_indexes._index_snapshot_compact_table_entries
     assert process_ptg._index_snapshot_compact_tables is ptg_compact_indexes._index_snapshot_compact_tables
+
+
+def test_copy_load_split_keeps_facade_helpers_stable():
+    assert process_ptg._json_default is ptg_copy_load._json_default
+    assert process_ptg._ptg2_conflict_targets is ptg_copy_load._ptg2_conflict_targets
+    assert process_ptg._primary_key_column_names is ptg_copy_load._primary_key_column_names
+    assert process_ptg._ptg2_json_columns is ptg_copy_load._ptg2_json_columns
+    assert process_ptg._ptg2_copy_record is ptg_copy_load._ptg2_copy_record
+    assert process_ptg._copy_upsert_ptg2_objects is ptg_copy_load._copy_upsert_ptg2_objects
+    assert process_ptg._copy_insert_ptg2_objects is ptg_copy_load._copy_insert_ptg2_objects
+    assert process_ptg._copy_ignore_ptg2_objects is ptg_copy_load._copy_ignore_ptg2_objects
+    assert process_ptg._copy_stage_price_set_rows is ptg_copy_load._copy_stage_price_set_rows
+    assert process_ptg._copy_stage_serving_rate_rows is ptg_copy_load._copy_stage_serving_rate_rows
+    assert process_ptg._copy_compact_serving_rate_rows is ptg_copy_load._copy_compact_serving_rate_rows
+    assert process_ptg._copy_compact_serving_rate_file is ptg_copy_load._copy_compact_serving_rate_file
+    assert process_ptg._copy_compact_serving_rate_source is ptg_copy_load._copy_compact_serving_rate_source
+    assert process_ptg._copy_ptg2_dictionary_file is ptg_copy_load._copy_ptg2_dictionary_file
 
 
 def test_snapshot_table_split_keeps_facade_helpers_stable():
