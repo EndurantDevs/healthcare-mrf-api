@@ -19,6 +19,7 @@ from aiohttp import web
 
 process_pkg = importlib.import_module("process")
 process_ptg = importlib.import_module("process.ptg")
+ptg_canonical = importlib.import_module("process.ptg_parts.canonical")
 ptg_domain = importlib.import_module("process.ptg_parts.domain")
 ptg_screen = importlib.import_module("process.ptg_parts.screen")
 
@@ -35,6 +36,14 @@ def test_screen_writer_ignores_closed_capture_stream(monkeypatch):
     monkeypatch.setattr(ptg_screen.sys, "stdout", _ClosedStream())
 
     ptg_screen._write_screen_line("stdout", "progress")
+
+
+def test_canonical_split_keeps_facade_helpers_stable():
+    assert process_ptg.normalize_money is ptg_canonical.normalize_money
+    assert process_ptg.normalize_date is ptg_canonical.normalize_date
+    assert process_ptg.semantic_hash is ptg_canonical.semantic_hash
+    assert process_ptg.canonicalize_url is ptg_canonical.canonicalize_url
+    assert process_ptg.normalize_import_month is ptg_canonical.normalize_import_month
 
 
 def test_filter_reporting_plans_matches_group_plan_id():
