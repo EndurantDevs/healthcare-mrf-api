@@ -373,6 +373,19 @@ from process.ptg_parts.source_pointers import (
     _ptg2_plan_source_key,
     _source_plan_rows,
 )
+from process.ptg_parts.source_jobs import (
+    _dedupe_preserve,
+    _dedupe_ptg_jobs,
+    _dedupe_rows_by,
+    _filter_jobs_by_url_contains,
+    _filter_reporting_plans,
+    _load_toc_urls_from_file,
+    _merge_ptg_job,
+    _normalize_filter_values,
+    _plan_identity,
+    _plan_matches_filters,
+    _ptg_job_identity,
+)
 from process.ptg_parts.values import (
     _catalog_entry_id,
     _source_identity_hash,
@@ -3299,12 +3312,6 @@ async def prepare_ptg2_compact_bulk_load() -> None:
             logger.debug("Skipping compact bulk-load prep statement %s: %s", statement, exc)
 
 
-def _normalize_filter_values(values: list[str] | None) -> list[str]:
-    if not values:
-        return []
-    return [str(value).strip().lower() for value in values if str(value).strip()]
-
-
 def _normalize_import_id(import_id: str | None) -> str:
     if not import_id:
         return datetime.date.today().strftime("%Y%m%d")
@@ -3805,170 +3812,6 @@ def _maybe_log_artifact_progress(
     _emit_screen_line(message)
     logger.info(message)
     state["last_log"] = now
-
-
-def _dedupe_preserve(seq: list[str]) -> list[str]:
-    seen = set()
-    out = []
-    for item in seq:
-        if item in seen:
-            continue
-        seen.add(item)
-        out.append(item)
-    return out
-
-
-def _dedupe_rows_by(rows: list[dict[str, Any]], key: str) -> list[dict[str, Any]]:
-    if len(rows) < 2:
-        return rows
-    seen: dict[Any, dict[str, Any]] = {}
-    missing: list[dict[str, Any]] = []
-    for row in rows:
-        value = row.get(key)
-        if value is None:
-            missing.append(row)
-        else:
-            seen[value] = row
-    return list(seen.values()) + missing
-
-
-def _plan_matches_filters(
-    plan: dict[str, Any],
-    plan_ids: list[str] | None = None,
-    plan_name_contains: list[str] | None = None,
-    plan_market_types: list[str] | None = None,
-) -> bool:
-    normalized_ids = _normalize_filter_values(plan_ids)
-    normalized_name_terms = _normalize_filter_values(plan_name_contains)
-    normalized_market_types = _normalize_filter_values(plan_market_types)
-
-    if normalized_ids and str(plan.get("plan_id") or "").strip().lower() not in normalized_ids:
-        return False
-
-    if normalized_market_types and str(plan.get("plan_market_type") or "").strip().lower() not in normalized_market_types:
-        return False
-
-    if normalized_name_terms:
-        searchable = " ".join(
-            str(plan.get(key) or "")
-            for key in ("plan_name", "plan_sponsor_name", "plan_sponser_name", "issuer_name", "reporting_entity_name")
-        ).lower()
-        if not any(term in searchable for term in normalized_name_terms):
-            return False
-
-    return True
-
-
-def _filter_reporting_plans(
-    plans: list[dict[str, Any]],
-    plan_ids: list[str] | None = None,
-    plan_name_contains: list[str] | None = None,
-    plan_market_types: list[str] | None = None,
-) -> list[dict[str, Any]]:
-    if not any((plan_ids, plan_name_contains, plan_market_types)):
-        return plans
-    return [
-        plan
-        for plan in plans
-        if _plan_matches_filters(plan, plan_ids, plan_name_contains, plan_market_types)
-    ]
-
-
-def _load_toc_urls_from_file(path: str) -> list[str]:
-    urls: list[str] = []
-    try:
-        text = Path(path).read_text(encoding="utf-8")
-    except OSError:
-        return urls
-    text_strip = text.strip()
-    if not text_strip:
-        return urls
-    if text_strip.startswith("["):
-        try:
-            data = json.loads(text_strip)
-            if isinstance(data, list):
-                for entry in data:
-                    if isinstance(entry, str) and entry.strip():
-                        urls.append(entry.strip())
-            elif isinstance(data, dict):
-                for entry in data.values():
-                    if isinstance(entry, str) and entry.strip():
-                        urls.append(entry.strip())
-                    elif isinstance(entry, list):
-                        urls.extend([str(v).strip() for v in entry if str(v).strip()])
-        except json.JSONDecodeError:
-            pass
-    else:
-        for line in text.splitlines():
-            line = line.strip()
-            if line:
-                urls.append(line)
-    return _dedupe_preserve(urls)
-
-
-def _filter_jobs_by_url_contains(jobs: list[dict[str, Any]], filters: list[str] | None) -> list[dict[str, Any]]:
-    needles = [str(value).strip().lower() for value in filters or [] if str(value).strip()]
-    if not needles:
-        return jobs
-    filtered: list[dict[str, Any]] = []
-    for job in jobs:
-        haystack = " ".join(
-            str(value or "")
-            for value in (
-                job.get("url"),
-                job.get("description"),
-                job.get("from_index_url"),
-            )
-        ).lower()
-        if any(needle in haystack for needle in needles):
-            filtered.append(job)
-    return filtered
-
-
-def _ptg_job_identity(job: dict[str, Any]) -> tuple[str, str]:
-    job_type = str(job.get("type") or "").strip()
-    url = normalize_tic_source_url(str(job.get("url") or ""))
-    return job_type, canonicalize_url(url)
-
-
-def _plan_identity(plan: dict[str, Any]) -> str:
-    return canonical_json_dumps(_canonicalize_for_json(plan))
-
-
-def _merge_ptg_job(existing: dict[str, Any], incoming: dict[str, Any]) -> None:
-    existing_plans = list(existing.get("plan_info") or [])
-    seen_plans = {_plan_identity(plan) for plan in existing_plans if isinstance(plan, dict)}
-    for plan in incoming.get("plan_info") or []:
-        if not isinstance(plan, dict):
-            continue
-        plan_key = _plan_identity(plan)
-        if plan_key in seen_plans:
-            continue
-        seen_plans.add(plan_key)
-        existing_plans.append(plan)
-    if existing_plans:
-        existing["plan_info"] = existing_plans
-    if not existing.get("description") and incoming.get("description"):
-        existing["description"] = incoming.get("description")
-    if not existing.get("from_index_url") and incoming.get("from_index_url"):
-        existing["from_index_url"] = incoming.get("from_index_url")
-    if not existing.get("meta") and incoming.get("meta"):
-        existing["meta"] = incoming.get("meta")
-
-
-def _dedupe_ptg_jobs(jobs: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
-    deduped: dict[tuple[str, str], dict[str, Any]] = {}
-    duplicate_count = 0
-    for job in jobs:
-        identity = _ptg_job_identity(job)
-        normalized_job = dict(job)
-        normalized_job["url"] = normalize_tic_source_url(str(job.get("url") or ""))
-        if identity in deduped:
-            duplicate_count += 1
-            _merge_ptg_job(deduped[identity], normalized_job)
-            continue
-        deduped[identity] = normalized_job
-    return list(deduped.values()), duplicate_count
 
 
 async def _ensure_indexes(obj, db_schema: str) -> None:
