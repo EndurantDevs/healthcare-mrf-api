@@ -5,6 +5,7 @@ import json
 import pytest
 
 from api import ptg2_serving
+from api import ptg2_response
 
 
 class FakeResult:
@@ -41,6 +42,16 @@ class FakeSession:
 class FakePagination:
     limit = 25
     offset = 0
+
+
+def test_ptg2_response_split_keeps_serving_facade_helpers_stable():
+    assert ptg2_serving._shape_ptg2_response is ptg2_response._shape_ptg2_response
+    assert ptg2_serving._catalog_key is ptg2_response._catalog_key
+    assert ptg2_serving._canonical_catalog_code is ptg2_response._canonical_catalog_code
+    assert ptg2_serving._coerce_json_payload is ptg2_response._coerce_json_payload
+    assert ptg2_serving._normalize_price_payload is ptg2_response._normalize_price_payload
+    assert ptg2_serving._summarize_price_payload is ptg2_response._summarize_price_payload
+    assert ptg2_serving._price_response_fields is ptg2_response._price_response_fields
 
 
 def _compact_tables(**overrides):
