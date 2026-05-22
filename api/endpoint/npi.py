@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-# pylint: disable=not-callable
+# pylint: disable=not-callable,too-many-lines
 
 import asyncio
 from collections import defaultdict
