@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 provider_quality = importlib.import_module("process.provider_quality")
+provider_quality_normalize = importlib.import_module("process.provider_quality_parts.normalize")
 provider_quality_state = importlib.import_module("process.provider_quality_parts.state")
 
 
@@ -103,6 +104,14 @@ def test_state_split_keeps_facade_helpers_stable():
     assert provider_quality._safe_int("bad", 7) == 7
 
 
+def test_normalize_split_keeps_facade_helpers_stable():
+    assert provider_quality._to_float is provider_quality_normalize._to_float
+    assert provider_quality._to_int is provider_quality_normalize._to_int
+    assert provider_quality._to_npi is provider_quality_normalize._to_npi
+    assert provider_quality._normalize_zcta is provider_quality_normalize._normalize_zcta
+    assert provider_quality._pick_first_ci is provider_quality_normalize._pick_first_ci
+
+
 def test_archived_identifier_truncates_long_name():
     long_name = "x" * 100
     archived = provider_quality._archived_identifier(long_name)
@@ -153,6 +162,22 @@ def test_normalize_zcta_handles_cdc_shapes():
     assert provider_quality._normalize_zcta("ZCTA5 01001") == "01001"
     assert provider_quality._normalize_zcta("501001") == "01001"
     assert provider_quality._normalize_zcta(None) is None
+
+
+def test_numeric_and_npi_normalizers_handle_csv_shapes():
+    assert provider_quality._to_float("1,234.5") == 1234.5
+    assert provider_quality._to_float("*") is None
+    assert provider_quality._to_int("1,234.9") == 1234
+    assert provider_quality._to_int("NA") is None
+    assert provider_quality._to_npi("1,234,567,890.0") == 1234567890
+    assert provider_quality._to_npi("0") is None
+    assert provider_quality._to_npi("abc") is None
+
+
+def test_pick_first_helpers_preserve_case_sensitive_and_ci_semantics():
+    row = {"NPI": "", " npi ": "123", "score": 0}
+    assert provider_quality._pick_first(row, "npi", "score") == 0
+    assert provider_quality._pick_first_ci(row, "npi") == "123"
 
 
 @pytest.mark.asyncio

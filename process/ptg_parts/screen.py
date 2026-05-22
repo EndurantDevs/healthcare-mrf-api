@@ -18,8 +18,18 @@ def _screen_writer() -> None:
         if item is None:
             return
         stream_name, line = item
-        stream = sys.stderr if stream_name == "stderr" else sys.stdout
+        _write_screen_line(stream_name, line)
+
+
+def _write_screen_line(stream_name: str, line: str) -> None:
+    stream = sys.stderr if stream_name == "stderr" else sys.stdout
+    try:
         print(line, file=stream, flush=True)
+    except (BrokenPipeError, OSError, ValueError):
+        # Pytest and process shutdown can close captured streams while the
+        # daemon writer is draining queued progress lines. Progress output is
+        # best effort and must not surface as an unhandled thread exception.
+        return
 
 
 def _ensure_screen_writer() -> None:
