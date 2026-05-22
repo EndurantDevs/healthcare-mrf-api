@@ -106,6 +106,15 @@ def test_archived_identifier_short_name():
 def test_state_split_keeps_facade_helpers_stable():
     assert provider_quality._state_key is provider_quality_state._state_key
     assert provider_quality._safe_int is provider_quality_state._safe_int
+    assert provider_quality._init_run_state is provider_quality_state._init_run_state
+    assert provider_quality._increment_total_chunks is provider_quality_state._increment_total_chunks
+    assert provider_quality._mark_chunk_done is provider_quality_state._mark_chunk_done
+    assert provider_quality._mark_chunk_done_with_retry is provider_quality_state._mark_chunk_done_with_retry
+    assert provider_quality._get_run_progress is provider_quality_state._get_run_progress
+    assert provider_quality._claim_finalize_lock is provider_quality_state._claim_finalize_lock
+    assert provider_quality._claim_global_finalize_lock is provider_quality_state._claim_global_finalize_lock
+    assert provider_quality._release_global_finalize_lock is provider_quality_state._release_global_finalize_lock
+    assert provider_quality._log_materialize_phase_summary is provider_quality_state._log_materialize_phase_summary
     assert provider_quality._safe_int(b"42") == 42
     assert provider_quality._safe_int("bad", 7) == 7
 

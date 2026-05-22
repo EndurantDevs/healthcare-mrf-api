@@ -9,7 +9,6 @@ import datetime
 import json
 import logging
 import shutil
-import statistics
 import sys
 import time
 from pathlib import Path
@@ -78,13 +77,8 @@ from process.provider_quality_parts.config import (
     PROVIDER_QUALITY_FINALIZE_MAX_TRIES,
     PROVIDER_QUALITY_FINISH_QUEUE_NAME,
     PROVIDER_QUALITY_FINISH_RETRY_SECONDS,
-    PROVIDER_QUALITY_GLOBAL_FINALIZE_LOCK_KEY,
-    PROVIDER_QUALITY_GLOBAL_FINALIZE_LOCK_TTL_SECONDS,
     PROVIDER_QUALITY_KEEP_WORKDIR,
     PROVIDER_QUALITY_LSH_SHARDS,
-    PROVIDER_QUALITY_MARK_DONE_RETRIES,
-    PROVIDER_QUALITY_MARK_DONE_RETRY_BASE_SECONDS,
-    PROVIDER_QUALITY_MARK_DONE_RETRY_MAX_SECONDS,
     PROVIDER_QUALITY_MATERIALIZE_SHARD_MAX_TRIES,
     PROVIDER_QUALITY_MATERIALIZE_SHARD_QUEUE_NAME,
     PROVIDER_QUALITY_MATERIALIZE_SHARDED_ENABLED,
@@ -177,10 +171,18 @@ from process.provider_quality_parts.sql_helpers import (
     _state_code_sql,
 )
 from process.provider_quality_parts.state import (
+    _claim_finalize_lock,
+    _claim_global_finalize_lock,
     _decode_redis_str,
     _get_materialize_phase,
     _get_materialize_phase_elapsed_seconds,
     _get_materialize_progress,
+    _get_run_progress,
+    _increment_total_chunks,
+    _init_run_state,
+    _log_materialize_phase_summary,
+    _mark_chunk_done,
+    _mark_chunk_done_with_retry,
     _mark_materialize_done,
     _mark_materialize_failed,
     _mat_done_key,
@@ -189,6 +191,7 @@ from process.provider_quality_parts.state import (
     _mat_phase_key,
     _mat_total_key,
     _record_materialize_phase_duration,
+    _release_global_finalize_lock,
     _reset_materialize_state,
     _safe_int,
     _set_materialize_phase,
@@ -217,141 +220,6 @@ def _should_fail_on_source_error(test_mode: bool) -> bool:
     if test_mode and PROVIDER_QUALITY_ALLOW_DEGRADED_TEST_ONLY:
         return False
     return PROVIDER_QUALITY_FAIL_ON_SOURCE_ERROR
-
-
-async def _log_materialize_phase_summary(redis, run_id: str, phase: str, *, total: int, done: int, failed: int) -> None:
-    key = _mat_phase_duration_key(run_id, phase)
-    raw_values = await redis.lrange(key, 0, -1)
-    durations: list[float] = []
-    for raw in raw_values:
-        try:
-            durations.append(float(_decode_redis_str(raw)))
-        except (TypeError, ValueError):
-            continue
-
-    if durations:
-        logger.info(
-            "provider quality materialize phase complete run_id=%s phase=%s total=%s done=%s failed=%s shard_sec_min=%.3f shard_sec_median=%.3f shard_sec_max=%.3f",
-            run_id,
-            phase,
-            total,
-            done,
-            failed,
-            min(durations),
-            statistics.median(durations),
-            max(durations),
-        )
-        return
-
-    logger.info(
-        "provider quality materialize phase complete run_id=%s phase=%s total=%s done=%s failed=%s",
-        run_id,
-        phase,
-        total,
-        done,
-        failed,
-    )
-
-
-async def _init_run_state(redis, run_id: str, total_chunks: int) -> None:
-    total_key = _state_key(run_id, "total_chunks")
-    done_key = _state_key(run_id, "done_chunks")
-    lock_key = _state_key(run_id, "finalize_lock")
-    finalized_key = _state_key(run_id, "finalized")
-    duration_keys = [_mat_phase_duration_key(run_id, phase) for phase in MAT_PHASE_SEQUENCE]
-
-    await redis.delete(
-        total_key,
-        done_key,
-        lock_key,
-        finalized_key,
-        _mat_phase_key(run_id),
-        _mat_total_key(run_id),
-        _mat_done_key(run_id),
-        _mat_failed_key(run_id),
-        *duration_keys,
-    )
-    await redis.set(total_key, str(total_chunks))
-    await redis.expire(total_key, PROVIDER_QUALITY_REDIS_TTL_SECONDS)
-    await redis.sadd(done_key, "__init__")
-    await redis.srem(done_key, "__init__")
-    await redis.expire(done_key, PROVIDER_QUALITY_REDIS_TTL_SECONDS)
-
-
-async def _increment_total_chunks(redis, run_id: str, delta: int) -> None:
-    if delta <= 0:
-        return
-    total_key = _state_key(run_id, "total_chunks")
-    await redis.incrby(total_key, int(delta))
-    await redis.expire(total_key, PROVIDER_QUALITY_REDIS_TTL_SECONDS)
-
-
-async def _mark_chunk_done(redis, run_id: str, chunk_id: str) -> None:
-    done_key = _state_key(run_id, "done_chunks")
-    await redis.sadd(done_key, chunk_id)
-    await redis.expire(done_key, PROVIDER_QUALITY_REDIS_TTL_SECONDS)
-
-
-async def _mark_chunk_done_with_retry(redis, run_id: str, chunk_id: str) -> None:
-    last_exc: Exception | None = None
-    for attempt in range(1, PROVIDER_QUALITY_MARK_DONE_RETRIES + 1):
-        try:
-            await _mark_chunk_done(redis, run_id, chunk_id)
-            return
-        except Exception as exc:  # pylint: disable=broad-exception-caught
-            last_exc = exc
-            if attempt >= PROVIDER_QUALITY_MARK_DONE_RETRIES:
-                break
-            delay = min(
-                PROVIDER_QUALITY_MARK_DONE_RETRY_BASE_SECONDS * (2 ** (attempt - 1)),
-                PROVIDER_QUALITY_MARK_DONE_RETRY_MAX_SECONDS,
-            )
-            logger.warning(
-                "Retrying mark_chunk_done for run_id=%s chunk_id=%s after error (%s/%s): %r",
-                run_id,
-                chunk_id,
-                attempt,
-                PROVIDER_QUALITY_MARK_DONE_RETRIES,
-                exc,
-            )
-            await asyncio.sleep(delay)
-    if last_exc is not None:
-        raise last_exc
-
-
-async def _get_run_progress(redis, run_id: str, expected_default: int) -> tuple[int, int]:
-    total_key = _state_key(run_id, "total_chunks")
-    done_key = _state_key(run_id, "done_chunks")
-    total_chunks = _safe_int(await redis.get(total_key), expected_default)
-    done_chunks = _safe_int(await redis.scard(done_key), 0)
-    return total_chunks, done_chunks
-
-
-async def _claim_finalize_lock(redis, run_id: str) -> bool:
-    lock_key = _state_key(run_id, "finalize_lock")
-    lock_set = await redis.set(lock_key, run_id, ex=PROVIDER_QUALITY_REDIS_TTL_SECONDS, nx=True)
-    if lock_set:
-        return True
-    return bool(await redis.get(lock_key))
-
-
-async def _claim_global_finalize_lock(redis, run_id: str) -> bool:
-    lock_set = await redis.set(
-        PROVIDER_QUALITY_GLOBAL_FINALIZE_LOCK_KEY,
-        run_id,
-        ex=PROVIDER_QUALITY_GLOBAL_FINALIZE_LOCK_TTL_SECONDS,
-        nx=True,
-    )
-    if lock_set:
-        return True
-    current_owner = _decode_redis_str(await redis.get(PROVIDER_QUALITY_GLOBAL_FINALIZE_LOCK_KEY))
-    return current_owner == run_id
-
-
-async def _release_global_finalize_lock(redis, run_id: str) -> None:
-    current_owner = _decode_redis_str(await redis.get(PROVIDER_QUALITY_GLOBAL_FINALIZE_LOCK_KEY))
-    if current_owner == run_id:
-        await redis.delete(PROVIDER_QUALITY_GLOBAL_FINALIZE_LOCK_KEY)
 
 
 async def _prepare_tables(stage_suffix: str, test_mode: bool) -> tuple[dict[str, type], str]:
