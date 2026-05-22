@@ -19,6 +19,7 @@ from aiohttp import web
 
 process_pkg = importlib.import_module("process")
 process_ptg = importlib.import_module("process.ptg")
+ptg_artifacts = importlib.import_module("process.ptg_parts.artifacts")
 ptg_canonical = importlib.import_module("process.ptg_parts.canonical")
 ptg_domain = importlib.import_module("process.ptg_parts.domain")
 ptg_row_helpers = importlib.import_module("process.ptg_parts.row_helpers")
@@ -62,6 +63,14 @@ def test_row_helper_split_keeps_facade_helpers_stable():
     assert process_ptg._normalized_npi_list is ptg_row_helpers._normalized_npi_list
     assert process_ptg._provider_group_identity_hash is ptg_row_helpers._provider_group_identity_hash
     assert process_ptg._normalize_code_component is ptg_row_helpers._normalize_code_component
+
+
+def test_artifact_split_keeps_facade_helpers_stable():
+    assert process_ptg.PTG2ArtifactStore is ptg_artifacts.PTG2ArtifactStore
+    assert process_ptg.sha256_file is ptg_artifacts.sha256_file
+    assert process_ptg.choose_reusable_raw_artifact is ptg_artifacts.choose_reusable_raw_artifact
+    assert process_ptg.content_addressed_path is ptg_artifacts.content_addressed_path
+    assert process_ptg.ptg2_temp_parent is ptg_artifacts.ptg2_temp_parent
 
 
 def test_filter_reporting_plans_matches_group_plan_id():
