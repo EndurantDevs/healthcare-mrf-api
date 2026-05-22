@@ -22,6 +22,7 @@ process_ptg = importlib.import_module("process.ptg")
 ptg_artifacts = importlib.import_module("process.ptg_parts.artifacts")
 ptg_artifact_streams = importlib.import_module("process.ptg_parts.artifact_streams")
 ptg_canonical = importlib.import_module("process.ptg_parts.canonical")
+ptg_db_tables = importlib.import_module("process.ptg_parts.db_tables")
 ptg_domain = importlib.import_module("process.ptg_parts.domain")
 ptg_json_streams = importlib.import_module("process.ptg_parts.json_streams")
 ptg_row_helpers = importlib.import_module("process.ptg_parts.row_helpers")
@@ -29,6 +30,7 @@ ptg_rust_scanner = importlib.import_module("process.ptg_parts.rust_scanner")
 ptg_screen = importlib.import_module("process.ptg_parts.screen")
 ptg_serving_rows = importlib.import_module("process.ptg_parts.serving_rows")
 ptg_serving_only = importlib.import_module("process.ptg_parts.serving_only")
+ptg_snapshot_tables = importlib.import_module("process.ptg_parts.snapshot_tables")
 ptg_values = importlib.import_module("process.ptg_parts.values")
 
 
@@ -83,6 +85,21 @@ def test_artifact_stream_split_keeps_facade_helpers_stable():
     assert process_ptg.logical_artifact_identity is ptg_artifact_streams.logical_artifact_identity
     assert process_ptg.stream_logical_artifact is ptg_artifact_streams.stream_logical_artifact
     assert process_ptg.load_json_artifact is ptg_artifact_streams.load_json_artifact
+
+
+def test_db_table_split_keeps_facade_helpers_stable():
+    assert process_ptg._quote_ident is ptg_db_tables._quote_ident
+    assert process_ptg._table_exists is ptg_db_tables._table_exists
+    assert process_ptg._table_has_rows is ptg_db_tables._table_has_rows
+    assert process_ptg._estimated_table_rows is ptg_db_tables._estimated_table_rows
+    assert process_ptg._exact_table_rows is ptg_db_tables._exact_table_rows
+
+
+def test_snapshot_table_split_keeps_facade_helpers_stable():
+    assert process_ptg._normalize_source_key is ptg_snapshot_tables._normalize_source_key
+    assert process_ptg._ptg2_snapshot_table_token is ptg_snapshot_tables._ptg2_snapshot_table_token
+    assert process_ptg._ptg2_snapshot_table_name is ptg_snapshot_tables._ptg2_snapshot_table_name
+    assert process_ptg._ptg2_snapshot_index_name is ptg_snapshot_tables._ptg2_snapshot_index_name
 
 
 def test_rust_scanner_split_keeps_facade_helpers_stable():

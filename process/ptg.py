@@ -264,6 +264,13 @@ from process.ptg_parts.domain import (
     normalize_ptg2_search_mode,
     ptg2_confidence_statement,
 )
+from process.ptg_parts.db_tables import (
+    _estimated_table_rows,
+    _exact_table_rows,
+    _quote_ident,
+    _table_exists,
+    _table_has_rows,
+)
 from process.ptg_parts.json_streams import (
     _iter_top_level_object_bytes,
     _iter_top_level_objects,
@@ -322,6 +329,12 @@ from process.ptg_parts.serving_only import (
     _serving_only_price_payload_and_key,
     _serving_only_worker_process_chunk_to_files as _serving_only_worker_process_chunk_to_files_impl,
     _worker_payload_size,
+)
+from process.ptg_parts.snapshot_tables import (
+    _normalize_source_key,
+    _ptg2_snapshot_index_name,
+    _ptg2_snapshot_table_name,
+    _ptg2_snapshot_table_token,
 )
 from process.ptg_parts.values import (
     _catalog_entry_id,
@@ -1075,10 +1088,6 @@ async def _iter_downloaded_ptg_jobs(
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
         executor.shutdown(wait=False, cancel_futures=True)
-
-
-def _quote_ident(value: str) -> str:
-    return '"' + str(value).replace('"', '""') + '"'
 
 
 def _ptg2_conflict_targets(cls) -> list[str]:
@@ -1845,69 +1854,6 @@ async def _merge_rust_copy_stage_tables(stage_tables: dict[str, str], *, drop: b
             )
             if drop:
                 await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(stage_table)};")
-
-
-async def _table_exists(schema_name: str, table_name: str) -> bool:
-    rows = await db.all(
-        """
-        SELECT EXISTS (
-            SELECT 1
-              FROM information_schema.tables
-             WHERE table_schema = :schema_name
-               AND table_name = :table_name
-        ) AS table_exists
-        """,
-        schema_name=schema_name,
-        table_name=table_name,
-    )
-    if not rows:
-        return False
-    row = rows[0]
-    return bool(row.get("table_exists") if isinstance(row, dict) else getattr(row, "table_exists", False))
-
-
-async def _table_has_rows(schema_name: str, table_name: str) -> bool:
-    rows = await db.all(
-        f"""
-        SELECT EXISTS (
-            SELECT 1
-              FROM {_quote_ident(schema_name)}.{_quote_ident(table_name)}
-             LIMIT 1
-        ) AS has_rows
-        """
-    )
-    if not rows:
-        return False
-    row = rows[0]
-    return bool(row.get("has_rows") if isinstance(row, dict) else getattr(row, "has_rows", False))
-
-
-async def _estimated_table_rows(schema_name: str, table_name: str) -> int:
-    rows = await db.all(
-        """
-        SELECT GREATEST(c.reltuples, 0)::bigint AS row_estimate
-          FROM pg_class c
-          JOIN pg_namespace n ON n.oid = c.relnamespace
-         WHERE n.nspname = :schema_name
-           AND c.relname = :table_name
-         LIMIT 1
-        """,
-        schema_name=schema_name,
-        table_name=table_name,
-    )
-    if not rows:
-        return 0
-    row = rows[0]
-    return int(row.get("row_estimate") if isinstance(row, dict) else getattr(row, "row_estimate", 0) or 0)
-
-
-async def _exact_table_rows(schema_name: str, table_name: str) -> int:
-    return int(
-        await db.scalar(
-            f"SELECT COUNT(*) FROM {_quote_ident(schema_name)}.{_quote_ident(table_name)}"
-        )
-        or 0
-    )
 
 
 _PTG2_COMPACT_MODEL_BY_KIND = {
@@ -4288,37 +4234,6 @@ def _normalize_import_id(import_id: str | None) -> str:
         suffix = hash_prefix(semantic_hash(normalized, domain="import_id"), 8)
         normalized = f"{normalized[:25]}_{suffix}"
     return normalized
-
-
-def _normalize_source_key(source_key: str | None) -> str | None:
-    if not source_key:
-        return None
-    normalized = "".join(ch if ch.isalnum() else "_" for ch in str(source_key).strip().lower()).strip("_")
-    if not normalized:
-        return None
-    if len(normalized) > 48:
-        suffix = hash_prefix(semantic_hash(normalized, domain="ptg2_source_key"), 10)
-        normalized = f"{normalized[:37]}_{suffix}"
-    return normalized
-
-
-def _ptg2_snapshot_table_token(source_key: str, snapshot_id: str) -> str:
-    return hash_prefix(
-        semantic_hash({"source_key": source_key, "snapshot_id": snapshot_id}, domain="ptg2_snapshot_tables"),
-        16,
-    )
-
-
-def _ptg2_snapshot_table_name(kind: str, source_key: str, snapshot_id: str) -> str:
-    safe_kind = re.sub(r"[^a-z0-9_]+", "_", kind.lower()).strip("_")
-    return f"ptg2_{safe_kind}_{_ptg2_snapshot_table_token(source_key, snapshot_id)}"[:63]
-
-
-def _ptg2_snapshot_index_name(table_name: str, role: str) -> str:
-    suffix = hash_prefix(semantic_hash({"table": table_name, "role": role}, domain="ptg2_snapshot_index"), 10)
-    base = re.sub(r"[^a-z0-9_]+", "_", f"{table_name}_{role}").strip("_")
-    max_base = max(1, 62 - len(suffix))
-    return f"{base[:max_base]}_{suffix}"[:63]
 
 
 def _ptg2_provider_group_rows(
