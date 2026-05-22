@@ -288,6 +288,18 @@ from process.ptg_parts.provider_cache import (
     _provider_combo_cache_key,
     _provider_combo_cache_put,
 )
+from process.ptg_parts.row_helpers import (
+    _as_int_list,
+    _as_list,
+    _coerce_date,
+    _make_checksum,
+    _normalize_code_component,
+    _normalize_tin_type,
+    _normalize_tin_value,
+    _normalized_npi_list,
+    _provider_group_hash_prefix,
+    _provider_group_identity_hash,
+)
 from process.ptg_parts.screen import _emit_screen_line
 from process.ptg_parts.values import (
     _catalog_entry_id,
@@ -4695,78 +4707,6 @@ def _ptg2_snapshot_index_name(table_name: str, role: str) -> str:
     return f"{base[:max_base]}_{suffix}"[:63]
 
 
-def _make_checksum(*values: Any) -> int:
-    digest = hashlib.sha256(canonical_json_dumps(list(values)).encode("utf-8")).digest()
-    return int.from_bytes(digest[:8], byteorder="big", signed=False) & ((1 << 63) - 1)
-
-
-def _coerce_date(value: Any) -> datetime.date | None:
-    if value is None:
-        return None
-    if isinstance(value, datetime.date) and not isinstance(value, datetime.datetime):
-        return value
-    text = str(value).strip()
-    if not text:
-        return None
-    if len(text) >= 10 and text[4] == "-" and text[7] == "-":
-        try:
-            return datetime.date.fromisoformat(text[:10])
-        except ValueError:
-            pass
-    try:
-        parsed = parse_date(text)
-    except (ValueError, TypeError):
-        return None
-    if isinstance(parsed, datetime.datetime):
-        return parsed.date()
-    return parsed
-
-
-def _as_list(value: Any) -> list:
-    if value is None:
-        return []
-    if isinstance(value, list):
-        return value
-    return [value]
-
-
-def _as_int_list(value: Any) -> list[int]:
-    result: list[int] = []
-    for item in _as_list(value):
-        try:
-            result.append(int(str(item).strip()))
-        except (TypeError, ValueError):
-            continue
-    return result
-
-
-def _normalized_npi_list(value: Any) -> list[int]:
-    return sorted(set(_as_int_list(value)))
-
-
-def _normalize_tin_type(value: Any) -> str:
-    return str(value or "").strip().lower()
-
-
-def _normalize_tin_value(value: Any) -> str:
-    text = str(value or "").strip().upper()
-    return "".join(ch for ch in text if ch.isalnum())
-
-
-def _provider_group_identity_hash(tin_info: dict[str, Any] | None, npi_list: Any) -> int:
-    tin_info = tin_info or {}
-    return _make_checksum(
-        "provider_group",
-        _normalize_tin_type(tin_info.get("type")),
-        _normalize_tin_value(tin_info.get("value")),
-        _normalized_npi_list(npi_list),
-    )
-
-
-def _provider_group_hash_prefix(provider_group_hash: int) -> str:
-    return f"{int(provider_group_hash):016x}"[:16]
-
-
 def _ptg2_provider_group_rows(
     *,
     provider_groups: list[dict[str, Any]],
@@ -5029,13 +4969,6 @@ def _ptg2_provider_set_row(provider_entry: dict[str, Any]) -> dict[str, Any]:
         "canonical_payload": _canonicalize_for_json(canonical_payload),
         "created_at": _utcnow(),
     }
-
-
-def _normalize_code_component(value: Any) -> str | None:
-    if value is None:
-        return None
-    text = str(value).strip()
-    return text.upper() if text else None
 
 
 def _ptg2_procedure_row(in_item: dict[str, Any]) -> dict[str, Any]:
