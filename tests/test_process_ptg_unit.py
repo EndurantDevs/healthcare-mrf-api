@@ -19,6 +19,7 @@ from aiohttp import web
 
 process_pkg = importlib.import_module("process")
 process_ptg = importlib.import_module("process.ptg")
+ptg_domain = importlib.import_module("process.ptg_parts.domain")
 
 
 def test_filter_reporting_plans_matches_group_plan_id():
@@ -295,6 +296,13 @@ def test_ptg2_modes_and_confidence_wording_are_explicit():
     with pytest.raises(ValueError):
         process_ptg.normalize_ptg2_search_mode("loose")
     assert "Published negotiated rate" in process_ptg.ptg2_confidence_statement("tic_rate_npi_tin")
+
+
+def test_ptg2_domain_split_keeps_facade_symbols_stable():
+    assert process_ptg.PTG2PriceAtomEvent is ptg_domain.PTG2PriceAtomEvent
+    assert process_ptg.PTG2RawArtifact is ptg_domain.PTG2RawArtifact
+    assert process_ptg.normalize_ptg2_search_mode is ptg_domain.normalize_ptg2_search_mode
+    assert process_ptg.ptg2_confidence_statement is ptg_domain.ptg2_confidence_statement
 
 
 def test_ptg2_runtime_checksum_uses_bigint_hash_space():

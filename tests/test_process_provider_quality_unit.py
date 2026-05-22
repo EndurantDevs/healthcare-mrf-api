@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 provider_quality = importlib.import_module("process.provider_quality")
+provider_quality_state = importlib.import_module("process.provider_quality_parts.state")
 
 
 class _FakeRedis:
@@ -93,6 +94,13 @@ class _FakeRedis:
 
 def test_archived_identifier_short_name():
     assert provider_quality._archived_identifier("quality_idx") == "quality_idx_old"
+
+
+def test_state_split_keeps_facade_helpers_stable():
+    assert provider_quality._state_key is provider_quality_state._state_key
+    assert provider_quality._safe_int is provider_quality_state._safe_int
+    assert provider_quality._safe_int(b"42") == 42
+    assert provider_quality._safe_int("bad", 7) == 7
 
 
 def test_archived_identifier_truncates_long_name():
