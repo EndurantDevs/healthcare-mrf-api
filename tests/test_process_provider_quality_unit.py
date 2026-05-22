@@ -5,6 +5,7 @@ import pytest
 
 provider_quality = importlib.import_module("process.provider_quality")
 provider_quality_cohort_sql = importlib.import_module("process.provider_quality_parts.cohort_sql")
+provider_quality_execution_helpers = importlib.import_module("process.provider_quality_parts.execution_helpers")
 provider_quality_lifecycle = importlib.import_module("process.provider_quality_parts.lifecycle")
 provider_quality_model_helpers = importlib.import_module("process.provider_quality_parts.model_helpers")
 provider_quality_normalize = importlib.import_module("process.provider_quality_parts.normalize")
@@ -166,6 +167,17 @@ def test_table_helper_split_keeps_facade_helpers_stable():
     assert provider_quality._build_staging_indexes is provider_quality_table_helpers._build_staging_indexes
     assert provider_quality._table_exists is provider_quality_table_helpers._table_exists
     assert provider_quality._table_columns is provider_quality_table_helpers._table_columns
+
+
+def test_execution_helper_split_keeps_facade_helpers_stable():
+    assert provider_quality._print_row_progress is provider_quality_execution_helpers._print_row_progress
+    assert provider_quality._step_start is provider_quality_execution_helpers._step_start
+    assert provider_quality._step_end is provider_quality_execution_helpers._step_end
+    assert provider_quality._is_deadlock_error is provider_quality_execution_helpers._is_deadlock_error
+    assert provider_quality._execute_shard_sql is provider_quality_execution_helpers._execute_shard_sql
+    assert provider_quality._count_shard_rows is provider_quality_execution_helpers._count_shard_rows
+    assert provider_quality._push_objects_with_retry is provider_quality_execution_helpers._push_objects_with_retry
+    assert provider_quality._row_allowed_for_test is provider_quality_execution_helpers._row_allowed_for_test
 
 
 def test_provider_quality_sql_helpers_build_expected_fragments():
