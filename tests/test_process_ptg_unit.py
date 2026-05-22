@@ -33,6 +33,7 @@ ptg_domain = importlib.import_module("process.ptg_parts.domain")
 ptg_import_rows = importlib.import_module("process.ptg_parts.import_rows")
 ptg_json_streams = importlib.import_module("process.ptg_parts.json_streams")
 ptg_progress = importlib.import_module("process.ptg_parts.progress")
+ptg_provider_references = importlib.import_module("process.ptg_parts.provider_references")
 ptg_row_helpers = importlib.import_module("process.ptg_parts.row_helpers")
 ptg_rust_publish = importlib.import_module("process.ptg_parts.rust_publish")
 ptg_rust_scanner = importlib.import_module("process.ptg_parts.rust_scanner")
@@ -248,6 +249,11 @@ def test_source_file_split_keeps_facade_helpers_stable():
 
 def test_source_version_split_keeps_facade_helpers_stable():
     assert process_ptg._record_source_version is ptg_source_versions._record_source_version
+
+
+def test_provider_reference_split_keeps_facade_helpers_stable():
+    assert process_ptg._load_provider_references_from_file is ptg_provider_references._load_provider_references_from_file
+    assert process_ptg._process_provider_reference_file is ptg_provider_references._process_provider_reference_file
 
 
 def test_table_setup_split_keeps_facade_helpers_stable():

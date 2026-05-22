@@ -319,6 +319,10 @@ from process.ptg_parts.provider_cache import (
     _provider_combo_cache_key,
     _provider_combo_cache_put,
 )
+from process.ptg_parts.provider_references import (
+    _load_provider_references_from_file,
+    _process_provider_reference_file,
+)
 from process.ptg_parts.progress import (
     _artifact_progress_position,
     _format_duration,
@@ -1329,50 +1333,6 @@ async def _parse_in_network_file_serving_only(
     return summary
 
 
-async def _load_provider_references_from_file(
-    file_path: str,
-    file_id: int,
-    provider_cls,
-    provider_map,
-    test_mode: bool,
-    log_cls,
-    source_url: str,
-) -> None:
-    rows: list[dict[str, Any]] = []
-    seen_hashes: set[int] = set()
-    provider_ref_batch_rows = max(_env_int(PTG2_PROVIDER_REF_BATCH_ROWS_ENV, 5000), 1)
-    with open_json_artifact_stream(file_path) as afp:
-        ref_count = 0
-        for ref in ijson.items(afp, "provider_references.item"):
-            ref_count += 1
-            provider_group_id = _normalize_provider_ref(ref.get("provider_group_id"))
-            network_names = ref.get("network_name") or ref.get("network_names") or []
-            provider_entry, provider_row = _build_provider_set_entry(
-                file_id=file_id,
-                provider_group_ref=provider_group_id,
-                provider_groups=ref.get("provider_groups", []),
-                network_names=network_names,
-            )
-            if provider_entry is None or provider_row is None:
-                continue
-            provider_hash = provider_entry["__hash__"]
-            if provider_hash not in seen_hashes:
-                seen_hashes.add(provider_hash)
-                rows.append(provider_row)
-            if len(rows) >= provider_ref_batch_rows:
-                await push_objects(_dedupe_rows_by(rows, "provider_group_hash"), provider_cls)
-                rows = []
-            _provider_cache_put(provider_map, provider_group_id, [provider_entry])
-            if test_mode and ref_count >= TEST_PROVIDER_GROUPS:
-                break
-    if isinstance(provider_map, PTG2ProviderReferenceCache):
-        provider_map.commit()
-    if rows:
-        await push_objects(_dedupe_rows_by(rows, "provider_group_hash"), provider_cls)
-    await flush_error_log(log_cls)
-    return None
-
-
 async def _parse_in_network_items(
     file_path: str,
     file_id: int,
@@ -2378,86 +2338,6 @@ async def _process_table_of_contents(
         await push_objects(file_rows, file_cls, rewrite=True)
     await flush_error_log(import_log_cls)
     return jobs
-
-
-async def _process_provider_reference_file(
-    url: str,
-    classes: dict[str, type],
-    test_mode: bool,
-    reuse_raw_artifacts: bool = True,
-    max_bytes: int | None = None,
-    import_run_id: str | None = None,
-    keep_partial_artifacts: bool | None = None,
-) -> dict[int, list[dict[str, Any]]]:
-    provider_cls = classes["PTGProviderGroup"]
-    file_cls = classes["PTGFile"]
-    import_log_cls = classes["ImportLog"]
-    provider_map: dict[int, list[dict[str, Any]]] = {}
-
-    with tempfile.TemporaryDirectory(dir=ptg2_temp_parent()) as tmpdir:
-        try:
-            raw_artifact, logical_artifact = await materialize_json_source(
-                url,
-                tmpdir,
-                reuse_raw_artifacts=reuse_raw_artifacts,
-                max_bytes=max_bytes,
-                keep_partial_artifacts=keep_partial_artifacts,
-            )
-        except Exception as exc:
-            logger.warning("Failed to download provider-reference from %s: %s", url, exc)
-            return provider_map
-        provider_content = load_json_artifact(logical_artifact.logical_path)
-        await _record_source_version(
-            source_type="provider-reference",
-            domain="provider_reference",
-            raw_artifact=raw_artifact,
-            logical_artifact=logical_artifact,
-            import_run_id=import_run_id,
-        )
-
-    meta = {
-        "version": provider_content.get("version"),
-    }
-    file_row = _build_file_row(url, "provider-reference", meta, None, None, None)
-    await _push_ptg2_objects([file_row], file_cls, rewrite=True)
-
-    provider_groups = provider_content.get("provider_groups") or []
-    rows: list[dict[str, Any]] = []
-    for idx, group in enumerate(provider_groups):
-        tin_info = group.get("tin") or {}
-        npi_list = group.get("npi") or []
-        normalized_npi = _normalized_npi_list(npi_list)
-        provider_group_ref = _normalize_provider_ref(
-            group.get("provider_group_id") or group.get("provider_group_ref") or (idx + 1)
-        )
-        provider_hash = _provider_group_identity_hash(tin_info, normalized_npi)
-        rows.append(
-            {
-                "provider_group_hash": provider_hash,
-                "provider_group_ref": provider_group_ref,
-                "file_id": file_row["file_id"],
-                "network_names": group.get("network_name") or group.get("network_names") or [],
-                "tin_type": tin_info.get("type"),
-                "tin_value": tin_info.get("value"),
-                "tin_business_name": tin_info.get("business_name"),
-                "npi": normalized_npi,
-            }
-        )
-        provider_map.setdefault(provider_group_ref, []).append(
-            {
-                **group,
-                "network_name": group.get("network_name") or [],
-                "__hash__": provider_hash,
-                "provider_group_id": provider_group_ref,
-            }
-        )
-        if test_mode and len(rows) >= TEST_PROVIDER_GROUPS:
-            break
-
-    if rows:
-        await push_objects(_dedupe_rows_by(rows, "provider_group_hash"), provider_cls)
-    await flush_error_log(import_log_cls)
-    return provider_map
 
 
 async def _process_in_network_file(
