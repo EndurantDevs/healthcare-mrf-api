@@ -9,6 +9,7 @@ provider_quality_execution_helpers = importlib.import_module("process.provider_q
 provider_quality_lifecycle = importlib.import_module("process.provider_quality_parts.lifecycle")
 provider_quality_model_helpers = importlib.import_module("process.provider_quality_parts.model_helpers")
 provider_quality_normalize = importlib.import_module("process.provider_quality_parts.normalize")
+provider_quality_publish_helpers = importlib.import_module("process.provider_quality_parts.publish_helpers")
 provider_quality_sql_helpers = importlib.import_module("process.provider_quality_parts.sql_helpers")
 provider_quality_state = importlib.import_module("process.provider_quality_parts.state")
 provider_quality_table_helpers = importlib.import_module("process.provider_quality_parts.table_helpers")
@@ -176,6 +177,11 @@ def test_table_helper_split_keeps_facade_helpers_stable():
     assert provider_quality._build_staging_indexes is provider_quality_table_helpers._build_staging_indexes
     assert provider_quality._table_exists is provider_quality_table_helpers._table_exists
     assert provider_quality._table_columns is provider_quality_table_helpers._table_columns
+
+
+def test_publish_helper_split_keeps_facade_helpers_stable():
+    assert provider_quality._publish_by_table_rename is provider_quality_publish_helpers._publish_by_table_rename
+    assert provider_quality._insert_run_metadata is provider_quality_publish_helpers._insert_run_metadata
 
 
 def test_execution_helper_split_keeps_facade_helpers_stable():
