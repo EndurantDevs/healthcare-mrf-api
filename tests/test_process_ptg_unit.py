@@ -20,6 +20,21 @@ from aiohttp import web
 process_pkg = importlib.import_module("process")
 process_ptg = importlib.import_module("process.ptg")
 ptg_domain = importlib.import_module("process.ptg_parts.domain")
+ptg_screen = importlib.import_module("process.ptg_parts.screen")
+
+
+class _ClosedStream:
+    def write(self, _value):
+        raise OSError("closed")
+
+    def flush(self):
+        raise OSError("closed")
+
+
+def test_screen_writer_ignores_closed_capture_stream(monkeypatch):
+    monkeypatch.setattr(ptg_screen.sys, "stdout", _ClosedStream())
+
+    ptg_screen._write_screen_line("stdout", "progress")
 
 
 def test_filter_reporting_plans_matches_group_plan_id():
