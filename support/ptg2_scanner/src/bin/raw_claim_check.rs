@@ -128,7 +128,10 @@ fn read_targets(path: &Path) -> io::Result<Vec<TargetRow>> {
     let text = std::fs::read_to_string(path)?;
     let mut lines = text.lines();
     let header = lines.next().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "target CSV is missing a header")
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "target CSV is missing a header",
+        )
     })?;
     let columns: Vec<&str> = header.split(',').collect();
     let find = |name: &str| -> io::Result<usize> {
@@ -157,7 +160,10 @@ fn read_targets(path: &Path) -> io::Result<Vec<TargetRow>> {
             .get(npi_idx)
             .and_then(|value| value.parse::<i64>().ok())
             .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, format!("invalid NPI row: {line}"))
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("invalid NPI row: {line}"),
+                )
             })?;
         targets.push(TargetRow {
             npi,
@@ -201,10 +207,7 @@ fn mark_provider_reference(
     evidence: &mut HashMap<TargetKey, Evidence>,
     target_keys_by_npi: &HashMap<i64, Vec<TargetKey>>,
 ) {
-    let Some(provider_group_id) = provider_ref
-        .get("provider_group_id")
-        .and_then(value_i64)
-    else {
+    let Some(provider_group_id) = provider_ref.get("provider_group_id").and_then(value_i64) else {
         return;
     };
     let mut matched_npis = BTreeSet::new();
@@ -324,7 +327,8 @@ fn scan_matching_rate<R: Read>(
             item.inline_provider_groups += 1;
         }
         item.files.insert(path_label.to_string());
-        item.service_codes_seen.extend(service_codes.iter().cloned());
+        item.service_codes_seen
+            .extend(service_codes.iter().cloned());
         item.rates_seen.extend(rates.iter().cloned());
         if let Some(pos) = &key.pos {
             if service_codes.contains(pos) {
@@ -363,7 +367,8 @@ fn scan_in_network<R: Read>(
                 }
                 "billing_code_type" => {
                     let value: Value = json_reader.deserialize_next().map_err(to_io_error)?;
-                    billing_code_type = normalize_code_system(&value_string(&value).unwrap_or_default());
+                    billing_code_type =
+                        normalize_code_system(&value_string(&value).unwrap_or_default());
                 }
                 "negotiated_rates" => {
                     if matched_targets.is_empty() {
@@ -502,7 +507,8 @@ fn write_report<W: Write>(
                     .collect::<Vec<_>>()
                     .join("|")
             };
-            let join_string = |values: &BTreeSet<String>| values.iter().cloned().collect::<Vec<_>>().join("|");
+            let join_string =
+                |values: &BTreeSet<String>| values.iter().cloned().collect::<Vec<_>>().join("|");
             writeln!(
                 writer,
                 "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
@@ -550,7 +556,10 @@ fn main() -> io::Result<()> {
     let mut target_keys_by_npi: HashMap<i64, Vec<TargetKey>> = HashMap::new();
     for keys in target_keys_by_code.values() {
         for key in keys {
-            target_keys_by_npi.entry(key.npi).or_default().push(key.clone());
+            target_keys_by_npi
+                .entry(key.npi)
+                .or_default()
+                .push(key.clone());
         }
     }
     let mut provider_ref_npis: HashMap<i64, Vec<i64>> = HashMap::new();
