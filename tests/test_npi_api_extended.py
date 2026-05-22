@@ -250,11 +250,7 @@ async def test_get_near_npi_with_lat_long_includes_bbox_params(monkeypatch):
         def acquire(self):
             return FakeAcquire(RecordingConnection())
 
-    async def fake_ensure_index():
-        return None
-
     monkeypatch.setattr(npi_module, "db", FakeDB())
-    monkeypatch.setattr(npi_module, "_ensure_npi_geo_index", fake_ensure_index)
 
     request = types.SimpleNamespace(
         args={"lat": "41.0", "long": "-87.0", "radius": "10", "limit": "1"},
@@ -712,11 +708,6 @@ async def test_get_near_npi_applies_procedure_and_medication_filters(monkeypatch
         }),
     )
 
-    async def fake_ensure_index():
-        return None
-
-    monkeypatch.setattr(npi_module, "_ensure_npi_geo_index", fake_ensure_index)
-
     request = types.SimpleNamespace(
         args={
             "long": "-87.0",
@@ -766,11 +757,6 @@ async def test_get_near_npi_does_not_crash_on_short_positional_rows(monkeypatch)
             return FakeAcquire(fake_conn)
 
     monkeypatch.setattr(npi_module, "db", FakeDB())
-
-    async def fake_ensure_index():
-        return None
-
-    monkeypatch.setattr(npi_module, "_ensure_npi_geo_index", fake_ensure_index)
 
     request = types.SimpleNamespace(
         args={"long": "-87.0", "lat": "41.0", "limit": "1"},

@@ -59,6 +59,7 @@ def test_init_api_registers_group(monkeypatch):
         "partd_formulary",
         "pharmacy_license",
         "reports",
+        "site_intelligence",
     }
 
 
