@@ -6,6 +6,7 @@ import pytest
 
 from api import ptg2_serving
 from api import ptg2_response
+from api import ptg2_price_sql
 
 
 class FakeResult:
@@ -52,6 +53,15 @@ def test_ptg2_response_split_keeps_serving_facade_helpers_stable():
     assert ptg2_serving._normalize_price_payload is ptg2_response._normalize_price_payload
     assert ptg2_serving._summarize_price_payload is ptg2_response._summarize_price_payload
     assert ptg2_serving._price_response_fields is ptg2_response._price_response_fields
+
+
+def test_ptg2_price_sql_split_keeps_serving_facade_helpers_stable():
+    assert ptg2_serving._empty_price_array_sql is ptg2_price_sql._empty_price_array_sql
+    assert ptg2_serving._scalar_price_json_sql is ptg2_price_sql._scalar_price_json_sql
+    assert ptg2_serving._typed_price_json_sql is ptg2_price_sql._typed_price_json_sql
+    assert ptg2_serving._normalized_price_json_sql is ptg2_price_sql._normalized_price_json_sql
+    assert ptg2_serving._price_atom_payload_sql is ptg2_price_sql._price_atom_payload_sql
+    assert ptg2_serving._normalized_price_join_sql is ptg2_price_sql._normalized_price_join_sql
 
 
 def _compact_tables(**overrides):
