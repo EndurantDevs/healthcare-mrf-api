@@ -43,3 +43,48 @@ pub fn env_bool(name: &str, default_value: bool) -> bool {
         Err(_) => default_value,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scoped_env<T>(name: &str, value: Option<&str>, callback: impl FnOnce() -> T) -> T {
+        let previous = env::var(name).ok();
+        match value {
+            Some(value) => env::set_var(name, value),
+            None => env::remove_var(name),
+        }
+        let result = callback();
+        match previous {
+            Some(value) => env::set_var(name, value),
+            None => env::remove_var(name),
+        }
+        result
+    }
+
+    #[test]
+    fn env_usize_uses_positive_integer_or_default() {
+        scoped_env("PTG2_SCANNER_TEST_USIZE", Some("12"), || {
+            assert_eq!(env_usize("PTG2_SCANNER_TEST_USIZE", 4), 12);
+        });
+        scoped_env("PTG2_SCANNER_TEST_USIZE", Some("0"), || {
+            assert_eq!(env_usize("PTG2_SCANNER_TEST_USIZE", 4), 4);
+        });
+        scoped_env("PTG2_SCANNER_TEST_USIZE", Some("nope"), || {
+            assert_eq!(env_usize("PTG2_SCANNER_TEST_USIZE", 4), 4);
+        });
+    }
+
+    #[test]
+    fn env_bool_accepts_common_true_false_tokens() {
+        scoped_env("PTG2_SCANNER_TEST_BOOL", Some("yes"), || {
+            assert!(env_bool("PTG2_SCANNER_TEST_BOOL", false));
+        });
+        scoped_env("PTG2_SCANNER_TEST_BOOL", Some("off"), || {
+            assert!(!env_bool("PTG2_SCANNER_TEST_BOOL", true));
+        });
+        scoped_env("PTG2_SCANNER_TEST_BOOL", Some("unknown"), || {
+            assert!(env_bool("PTG2_SCANNER_TEST_BOOL", true));
+        });
+    }
+}
