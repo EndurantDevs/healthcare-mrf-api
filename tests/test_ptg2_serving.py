@@ -7,6 +7,7 @@ import pytest
 from api import ptg2_serving
 from api import ptg2_response
 from api import ptg2_price_sql
+from api import ptg2_code_filters
 
 
 class FakeResult:
@@ -62,6 +63,18 @@ def test_ptg2_price_sql_split_keeps_serving_facade_helpers_stable():
     assert ptg2_serving._normalized_price_json_sql is ptg2_price_sql._normalized_price_json_sql
     assert ptg2_serving._price_atom_payload_sql is ptg2_price_sql._price_atom_payload_sql
     assert ptg2_serving._normalized_price_join_sql is ptg2_price_sql._normalized_price_join_sql
+
+
+def test_ptg2_code_filter_split_keeps_serving_facade_helpers_stable():
+    assert ptg2_serving._normalize_code is ptg2_code_filters._normalize_code
+    assert ptg2_serving._normalize_code_system is ptg2_code_filters._normalize_code_system
+    assert ptg2_serving._append_code_filter is ptg2_code_filters._append_code_filter
+    assert ptg2_serving._append_resolved_code_filter is ptg2_code_filters._append_resolved_code_filter
+    assert ptg2_serving._ptg2_code_query_fields is ptg2_code_filters._ptg2_code_query_fields
+    assert ptg2_serving._qualify_compact_filters is ptg2_code_filters._qualify_compact_filters
+    assert ptg2_serving._normalize_taxonomy_code is ptg2_code_filters._normalize_taxonomy_code
+    assert ptg2_serving._normalize_npi is ptg2_code_filters._normalize_npi
+    assert ptg2_serving._inferred_provider_taxonomy_sql is ptg2_code_filters._inferred_provider_taxonomy_sql
 
 
 def _compact_tables(**overrides):
