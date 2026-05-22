@@ -22,6 +22,7 @@ process_ptg = importlib.import_module("process.ptg")
 ptg_artifacts = importlib.import_module("process.ptg_parts.artifacts")
 ptg_artifact_streams = importlib.import_module("process.ptg_parts.artifact_streams")
 ptg_canonical = importlib.import_module("process.ptg_parts.canonical")
+ptg_compact_bulk = importlib.import_module("process.ptg_parts.compact_bulk")
 ptg_compact_indexes = importlib.import_module("process.ptg_parts.compact_indexes")
 ptg_compact_state = importlib.import_module("process.ptg_parts.compact_state")
 ptg_compact_writes = importlib.import_module("process.ptg_parts.compact_writes")
@@ -142,6 +143,11 @@ def test_compact_state_split_keeps_facade_helpers_stable():
     assert process_ptg._compact_add_unique is ptg_compact_state._compact_add_unique
     assert process_ptg._ptg2_price_atom_payload is ptg_compact_state._ptg2_price_atom_payload
     assert process_ptg._ptg2_source_trace_payload is ptg_compact_state._ptg2_source_trace_payload
+
+
+def test_compact_bulk_split_keeps_facade_helpers_stable():
+    assert process_ptg.prepare_ptg2_compact_bulk_load is ptg_compact_bulk.prepare_ptg2_compact_bulk_load
+    assert process_ptg._flush_in_network_rows is ptg_compact_bulk._flush_in_network_rows
 
 
 def test_compact_write_split_keeps_facade_helpers_stable():
