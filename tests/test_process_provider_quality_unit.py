@@ -6,6 +6,7 @@ import pytest
 provider_quality = importlib.import_module("process.provider_quality")
 provider_quality_lifecycle = importlib.import_module("process.provider_quality_parts.lifecycle")
 provider_quality_normalize = importlib.import_module("process.provider_quality_parts.normalize")
+provider_quality_sql_helpers = importlib.import_module("process.provider_quality_parts.sql_helpers")
 provider_quality_state = importlib.import_module("process.provider_quality_parts.state")
 
 
@@ -118,6 +119,22 @@ def test_lifecycle_split_keeps_facade_helpers_stable():
     assert provider_quality._format_duration_compact is provider_quality_lifecycle._format_duration_compact
     assert provider_quality._archived_identifier is provider_quality_lifecycle._archived_identifier
     assert provider_quality._npi_shard_predicate is provider_quality_lifecycle._npi_shard_predicate
+
+
+def test_sql_helper_split_keeps_facade_helpers_stable():
+    assert provider_quality._provider_class_case_sql is provider_quality_sql_helpers._provider_class_case_sql
+    assert provider_quality._state_code_sql is provider_quality_sql_helpers._state_code_sql
+
+
+def test_provider_quality_sql_helpers_build_expected_fragments():
+    provider_class_sql = provider_quality._provider_class_case_sql("nd.entity_type_code", "pe")
+    state_sql = provider_quality._state_code_sql("addr.state_name")
+
+    assert "WHEN nd.entity_type_code = 1 THEN 'clinician'" in provider_class_sql
+    assert "pe.has_hospital_enrollment" in provider_class_sql
+    assert "WHEN nd.entity_type_code = 2 THEN 'organization'" in provider_class_sql
+    assert "UPPER(NULLIF(BTRIM(COALESCE(addr.state_name, '')), ''))" in state_sql
+    assert "WHEN UPPER(NULLIF(BTRIM(COALESCE(addr.state_name, '')), '')) = 'MASSACHUSETTS' THEN 'MA'" in state_sql
 
 
 def test_archived_identifier_truncates_long_name():

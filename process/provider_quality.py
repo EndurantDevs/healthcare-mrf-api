@@ -8,13 +8,10 @@ import csv
 import datetime
 import json
 import logging
-import math
-import os
 import shutil
 import statistics
 import sys
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -148,6 +145,10 @@ from process.provider_quality_parts.normalize import (
     _to_float,
     _to_int,
     _to_npi,
+)
+from process.provider_quality_parts.sql_helpers import (
+    _provider_class_case_sql,
+    _state_code_sql,
 )
 from process.provider_quality_parts.state import (
     _decode_redis_str,
@@ -789,23 +790,6 @@ async def _split_source_into_chunks(
     return chunks
 
 
-def _provider_class_case_sql(entity_type_expr: str, enrichment_alias: str) -> str:
-    return f"""
-        CASE
-            WHEN {entity_type_expr} = 1 THEN 'clinician'
-            WHEN COALESCE({enrichment_alias}.has_hospital_enrollment, FALSE)
-              OR COALESCE({enrichment_alias}.has_hha_enrollment, FALSE)
-              OR COALESCE({enrichment_alias}.has_hospice_enrollment, FALSE)
-              OR COALESCE({enrichment_alias}.has_fqhc_enrollment, FALSE)
-              OR COALESCE({enrichment_alias}.has_rhc_enrollment, FALSE)
-              OR COALESCE({enrichment_alias}.has_snf_enrollment, FALSE)
-            THEN 'facility'
-            WHEN {entity_type_expr} = 2 THEN 'organization'
-            ELSE 'unknown'
-        END::varchar
-    """
-
-
 def _extract_qpp_score(row: dict[str, Any], *keys: str) -> float | None:
     value = _pick_first_ci(row, *keys)
     if isinstance(value, str):
@@ -814,85 +798,6 @@ def _extract_qpp_score(row: dict[str, Any], *keys: str) -> float | None:
             cleaned = cleaned[:-1]
         value = cleaned
     return _to_float(value)
-
-
-_US_STATE_NAME_TO_CODE = {
-    "ALABAMA": "AL",
-    "ALASKA": "AK",
-    "ARIZONA": "AZ",
-    "ARKANSAS": "AR",
-    "CALIFORNIA": "CA",
-    "COLORADO": "CO",
-    "CONNECTICUT": "CT",
-    "DELAWARE": "DE",
-    "DISTRICT OF COLUMBIA": "DC",
-    "FLORIDA": "FL",
-    "GEORGIA": "GA",
-    "HAWAII": "HI",
-    "IDAHO": "ID",
-    "ILLINOIS": "IL",
-    "INDIANA": "IN",
-    "IOWA": "IA",
-    "KANSAS": "KS",
-    "KENTUCKY": "KY",
-    "LOUISIANA": "LA",
-    "MAINE": "ME",
-    "MARYLAND": "MD",
-    "MASSACHUSETTS": "MA",
-    "MICHIGAN": "MI",
-    "MINNESOTA": "MN",
-    "MISSISSIPPI": "MS",
-    "MISSOURI": "MO",
-    "MONTANA": "MT",
-    "NEBRASKA": "NE",
-    "NEVADA": "NV",
-    "NEW HAMPSHIRE": "NH",
-    "NEW JERSEY": "NJ",
-    "NEW MEXICO": "NM",
-    "NEW YORK": "NY",
-    "NORTH CAROLINA": "NC",
-    "NORTH DAKOTA": "ND",
-    "OHIO": "OH",
-    "OKLAHOMA": "OK",
-    "OREGON": "OR",
-    "PENNSYLVANIA": "PA",
-    "RHODE ISLAND": "RI",
-    "SOUTH CAROLINA": "SC",
-    "SOUTH DAKOTA": "SD",
-    "TENNESSEE": "TN",
-    "TEXAS": "TX",
-    "UTAH": "UT",
-    "VERMONT": "VT",
-    "VIRGINIA": "VA",
-    "WASHINGTON": "WA",
-    "WEST VIRGINIA": "WV",
-    "WISCONSIN": "WI",
-    "WYOMING": "WY",
-    "PUERTO RICO": "PR",
-    "GUAM": "GU",
-    "AMERICAN SAMOA": "AS",
-    "NORTHERN MARIANA ISLANDS": "MP",
-    "COMMONWEALTH OF THE NORTHERN MARIANA ISLANDS": "MP",
-    "US VIRGIN ISLANDS": "VI",
-    "U.S. VIRGIN ISLANDS": "VI",
-    "VIRGIN ISLANDS": "VI",
-}
-
-
-def _state_code_sql(expr: str) -> str:
-    normalized = f"UPPER(NULLIF(BTRIM(COALESCE({expr}, '')), ''))"
-    mapping_cases = "\n".join(
-        f"            WHEN {normalized} = '{name}' THEN '{code}'"
-        for name, code in _US_STATE_NAME_TO_CODE.items()
-    )
-    return f"""
-        CASE
-            WHEN {normalized} IS NULL THEN NULL
-            WHEN LENGTH({normalized}) = 2 THEN {normalized}
-{mapping_cases}
-            ELSE NULL
-        END
-    """
 
 
 async def _load_qpp_rows(path: str, qpp_cls: type, reporting_year: int, test_mode: bool) -> None:
