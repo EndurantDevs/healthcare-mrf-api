@@ -27,6 +27,7 @@ ptg_json_streams = importlib.import_module("process.ptg_parts.json_streams")
 ptg_row_helpers = importlib.import_module("process.ptg_parts.row_helpers")
 ptg_rust_scanner = importlib.import_module("process.ptg_parts.rust_scanner")
 ptg_screen = importlib.import_module("process.ptg_parts.screen")
+ptg_serving_only = importlib.import_module("process.ptg_parts.serving_only")
 ptg_values = importlib.import_module("process.ptg_parts.values")
 
 
@@ -96,6 +97,18 @@ def test_json_stream_split_keeps_facade_helpers_stable():
     assert process_ptg._iter_top_level_object_bytes is ptg_json_streams._iter_top_level_object_bytes
     assert process_ptg._iter_top_level_objects_jsondecoder is ptg_json_streams._iter_top_level_objects_jsondecoder
     assert process_ptg._iter_top_level_objects_fast is ptg_json_streams._iter_top_level_objects_fast
+
+
+def test_serving_only_split_keeps_facade_helpers_stable():
+    assert process_ptg._serving_only_price_payload is ptg_serving_only._serving_only_price_payload
+    assert process_ptg._normalize_serving_price_payload is ptg_serving_only._normalize_serving_price_payload
+    assert process_ptg._serving_only_hash_int_sets is ptg_serving_only._serving_only_hash_int_sets
+    assert process_ptg._serving_only_hash_price_key is ptg_serving_only._serving_only_hash_price_key
+    assert process_ptg._serving_only_hash_text is ptg_serving_only._serving_only_hash_text
+    assert process_ptg._serving_only_merge_worker_result is ptg_serving_only._serving_only_merge_worker_result
+    assert process_ptg._worker_payload_size is ptg_serving_only._worker_payload_size
+    assert process_ptg._iter_worker_result_rows is ptg_serving_only._iter_worker_result_rows
+    assert process_ptg._ptg2_worker_capacity_wait_needed is ptg_serving_only._ptg2_worker_capacity_wait_needed
 
 
 def test_filter_reporting_plans_matches_group_plan_id():
