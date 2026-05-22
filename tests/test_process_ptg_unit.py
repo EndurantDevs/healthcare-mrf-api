@@ -35,6 +35,7 @@ ptg_serving_rows = importlib.import_module("process.ptg_parts.serving_rows")
 ptg_serving_only = importlib.import_module("process.ptg_parts.serving_only")
 ptg_snapshot_cleanup = importlib.import_module("process.ptg_parts.snapshot_cleanup")
 ptg_snapshot_tables = importlib.import_module("process.ptg_parts.snapshot_tables")
+ptg_source_jobs = importlib.import_module("process.ptg_parts.source_jobs")
 ptg_source_pointers = importlib.import_module("process.ptg_parts.source_pointers")
 ptg_values = importlib.import_module("process.ptg_parts.values")
 
@@ -127,6 +128,20 @@ def test_source_pointer_split_keeps_facade_helpers_stable():
     assert process_ptg._ptg2_plan_source_key is ptg_source_pointers._ptg2_plan_source_key
     assert process_ptg._current_source_snapshot_id is ptg_source_pointers._current_source_snapshot_id
     assert process_ptg._source_plan_rows is ptg_source_pointers._source_plan_rows
+
+
+def test_source_job_split_keeps_facade_helpers_stable():
+    assert process_ptg._normalize_filter_values is ptg_source_jobs._normalize_filter_values
+    assert process_ptg._dedupe_preserve is ptg_source_jobs._dedupe_preserve
+    assert process_ptg._dedupe_rows_by is ptg_source_jobs._dedupe_rows_by
+    assert process_ptg._plan_matches_filters is ptg_source_jobs._plan_matches_filters
+    assert process_ptg._filter_reporting_plans is ptg_source_jobs._filter_reporting_plans
+    assert process_ptg._load_toc_urls_from_file is ptg_source_jobs._load_toc_urls_from_file
+    assert process_ptg._filter_jobs_by_url_contains is ptg_source_jobs._filter_jobs_by_url_contains
+    assert process_ptg._ptg_job_identity is ptg_source_jobs._ptg_job_identity
+    assert process_ptg._plan_identity is ptg_source_jobs._plan_identity
+    assert process_ptg._merge_ptg_job is ptg_source_jobs._merge_ptg_job
+    assert process_ptg._dedupe_ptg_jobs is ptg_source_jobs._dedupe_ptg_jobs
 
 
 def test_snapshot_cleanup_split_keeps_facade_helpers_stable():
