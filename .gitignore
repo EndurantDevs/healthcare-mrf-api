@@ -140,3 +140,18 @@ cython_debug/
 
 # PyCharm
 .idea/
+
+# Local virtual environments (any name)
+venv*/
+.venv*/
+restore/venv/
+
+# Rust build artifacts
+support/ptg2_scanner/target/
+
+# PostgreSQL upgrade logs
+pg_upgrade_*.log
+
+# macOS metadata
+.DS_Store
+**/.DS_Store
