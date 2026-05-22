@@ -4,6 +4,10 @@ use ptg2_scanner::config::{
     DEFAULT_COMPACT_RUST_WORKERS, DEFAULT_COMPACT_RUST_WORK_QUEUE, DEFAULT_PROGRESS_BYTES,
     DEFAULT_PROGRESS_OBJECTS, DEFAULT_SPLIT_NEGOTIATED_RATES, READ_BUF_SIZE,
 };
+use ptg2_scanner::copy_format::{
+    emit_compact_copy_row, pg_text_array_field, pg_text_copy_field, write_copy_fields,
+    CompactCopyRow,
+};
 use ptg2_scanner::dedupe::{dedupe_summary_payload, emit_dedupe_summary, SharedDedupe};
 use ptg2_scanner::hashing::{
     canonical_json, checksum_i64_list, finish_hash_hex, hash_i64_list, hash_string_list, hash_text,
@@ -813,20 +817,6 @@ fn emit_raw_record<W: Write>(writer: &mut W, kind: &str, payload: &[u8]) -> io::
     writer.write_all(payload)?;
     writer.write_all(b"\n")?;
     Ok(())
-}
-
-struct CompactCopyRow<'a> {
-    serving_rate_id: &'a str,
-    snapshot_id: &'a str,
-    plan_id: &'a str,
-    procedure_hash: &'a str,
-    procedure_code: Option<i64>,
-    reported_code_system: Option<&'a str>,
-    reported_code: Option<&'a str>,
-    provider_set_hash: &'a str,
-    provider_count: i64,
-    price_set_hash: &'a str,
-    source_trace_set_hash: &'a str,
 }
 
 struct CompactCopySink {
@@ -1747,106 +1737,6 @@ impl DictionaryCopySinks {
         sink.row_count += rows_written;
         Ok(())
     }
-}
-
-fn pg_text_copy_field(value: Option<&str>) -> String {
-    match value {
-        None => "\\N".to_string(),
-        Some(text) => {
-            let mut out = String::with_capacity(text.len());
-            for ch in text.chars() {
-                match ch {
-                    '\\' => out.push_str("\\\\"),
-                    '\t' => out.push_str("\\t"),
-                    '\n' => out.push_str("\\n"),
-                    '\r' => out.push_str("\\r"),
-                    _ => out.push(ch),
-                }
-            }
-            out
-        }
-    }
-}
-
-fn pg_text_array_field(values: &[String]) -> String {
-    if values.is_empty() {
-        return "{}".to_string();
-    }
-    let body = values
-        .iter()
-        .map(|value| {
-            let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
-            format!("\"{}\"", escaped)
-        })
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("{{{}}}", body)
-}
-
-fn write_copy_fields<W: Write>(writer: &mut W, fields: &[String]) -> io::Result<()> {
-    writer.write_all(fields.join("\t").as_bytes())?;
-    writer.write_all(b"\n")?;
-    Ok(())
-}
-
-fn write_copy_text_field<W: Write>(writer: &mut W, value: Option<&str>) -> io::Result<()> {
-    let Some(text) = value else {
-        writer.write_all(b"\\N")?;
-        return Ok(());
-    };
-    let mut start = 0usize;
-    for (idx, byte) in text.bytes().enumerate() {
-        let escaped = match byte {
-            b'\\' => Some(b"\\\\".as_slice()),
-            b'\t' => Some(b"\\t".as_slice()),
-            b'\n' => Some(b"\\n".as_slice()),
-            b'\r' => Some(b"\\r".as_slice()),
-            _ => None,
-        };
-        if let Some(replacement) = escaped {
-            if start < idx {
-                writer.write_all(&text.as_bytes()[start..idx])?;
-            }
-            writer.write_all(replacement)?;
-            start = idx + 1;
-        }
-    }
-    if start < text.len() {
-        writer.write_all(&text.as_bytes()[start..])?;
-    }
-    Ok(())
-}
-
-fn write_copy_text_fields<W: Write>(writer: &mut W, fields: &[Option<&str>]) -> io::Result<()> {
-    for (index, field) in fields.iter().enumerate() {
-        if index > 0 {
-            writer.write_all(b"\t")?;
-        }
-        write_copy_text_field(writer, *field)?;
-    }
-    writer.write_all(b"\n")?;
-    Ok(())
-}
-
-fn emit_compact_copy_row<W: Write>(writer: &mut W, row: &CompactCopyRow<'_>) -> io::Result<()> {
-    let procedure_code_text = row.procedure_code.map(|value| value.to_string());
-    let provider_count_text = row.provider_count.to_string();
-    write_copy_text_fields(
-        writer,
-        &[
-            Some(row.serving_rate_id),
-            Some(row.snapshot_id),
-            Some(row.plan_id),
-            Some(row.procedure_hash),
-            procedure_code_text.as_deref(),
-            row.reported_code_system,
-            row.reported_code,
-            Some(row.provider_set_hash),
-            Some(&provider_count_text),
-            Some(row.price_set_hash),
-            Some(row.source_trace_set_hash),
-        ],
-    )
 }
 
 type ParsedCompactRate = (PriceSetLite, i64, Vec<i64>, i64);
