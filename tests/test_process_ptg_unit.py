@@ -23,6 +23,7 @@ ptg_artifacts = importlib.import_module("process.ptg_parts.artifacts")
 ptg_artifact_streams = importlib.import_module("process.ptg_parts.artifact_streams")
 ptg_canonical = importlib.import_module("process.ptg_parts.canonical")
 ptg_domain = importlib.import_module("process.ptg_parts.domain")
+ptg_json_streams = importlib.import_module("process.ptg_parts.json_streams")
 ptg_row_helpers = importlib.import_module("process.ptg_parts.row_helpers")
 ptg_rust_scanner = importlib.import_module("process.ptg_parts.rust_scanner")
 ptg_screen = importlib.import_module("process.ptg_parts.screen")
@@ -87,6 +88,14 @@ def test_rust_scanner_split_keeps_facade_helpers_stable():
     assert process_ptg._iter_top_level_object_bytes_rust is ptg_rust_scanner._iter_top_level_object_bytes_rust
     assert process_ptg._iter_compact_serving_records_rust is ptg_rust_scanner._iter_compact_serving_records_rust
     assert process_ptg._aiter_compact_serving_records_rust is ptg_rust_scanner._aiter_compact_serving_records_rust
+
+
+def test_json_stream_split_keeps_facade_helpers_stable():
+    assert process_ptg._json_loads is ptg_json_streams._json_loads
+    assert process_ptg._iter_top_level_objects is ptg_json_streams._iter_top_level_objects
+    assert process_ptg._iter_top_level_object_bytes is ptg_json_streams._iter_top_level_object_bytes
+    assert process_ptg._iter_top_level_objects_jsondecoder is ptg_json_streams._iter_top_level_objects_jsondecoder
+    assert process_ptg._iter_top_level_objects_fast is ptg_json_streams._iter_top_level_objects_fast
 
 
 def test_filter_reporting_plans_matches_group_plan_id():
