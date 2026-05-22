@@ -9,6 +9,8 @@ import os
 import re
 import tempfile
 import time
+from collections import OrderedDict
+from copy import deepcopy
 from decimal import Decimal, InvalidOperation
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,14 +25,21 @@ PTG2_MODE_EXACT_SOURCE = "exact_source"
 PTG2_MODE_PRODUCT_SEARCH = "product_search"
 PTG2_SCHEMA = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
 PTG2_INDEX_CACHE_TTL_SECONDS = max(float(os.getenv("HLTHPRT_PTG2_INDEX_CACHE_TTL_SECONDS", "300")), 0.0)
+PTG2_RESPONSE_CACHE_TTL_SECONDS = max(float(os.getenv("HLTHPRT_PTG2_RESPONSE_CACHE_TTL_SECONDS", "300")), 0.0)
+PTG2_RESPONSE_CACHE_MAX_KEYS = max(int(os.getenv("HLTHPRT_PTG2_RESPONSE_CACHE_MAX_KEYS", "512")), 0)
 PTG2_WARM_P95_MAX_MS = max(float(os.getenv("HLTHPRT_PTG2_WARM_P95_MAX_MS", "50")), 1.0)
 PTG2_JSON_FALLBACK_ENV = "HLTHPRT_PTG2_ENABLE_JSON_FALLBACK"
 PTG2_SERVING_TABLE_ENV = "HLTHPRT_PTG2_SERVING_TABLE"
 PTG2_FAST_COMPACT_COUNTS_ENV = "HLTHPRT_PTG2_FAST_COMPACT_COUNTS"
 INTERNAL_PROCEDURE_CODE_SYSTEM = "HP_PROCEDURE_CODE"
+EXTERNAL_PROCEDURE_CODE_SYSTEMS = {"CPT", "HCPCS"}
+PROCEDURE_CODE_SYSTEMS = {*EXTERNAL_PROCEDURE_CODE_SYSTEMS, INTERNAL_PROCEDURE_CODE_SYSTEM}
+PTG2_CODE_EXPANSION_HOPS = 2
 NUMERIC_PATTERN = re.compile(r"^-?\d+(\.\d+)?$")
 
 _PTG2_INDEX_CACHE: dict[str, tuple[float, "PTG2ServingIndex"]] = {}
+_PTG2_RESPONSE_CACHE: OrderedDict[str, tuple[float, dict[str, Any] | None]] = OrderedDict()
+_CACHE_MISS = object()
 PTG2_ITEM_SOURCE_FIELDS = {"source_trace"}
 PTG2_ITEM_DIAGNOSTIC_FIELDS = {
     "confidence",
@@ -78,6 +87,79 @@ class PTG2ServingIndex:
             rates=dict(payload.get("rates") or {}),
             source_uri=source_uri,
         )
+
+
+@dataclass(frozen=True)
+class InferredProviderTaxonomyRule:
+    ranges: tuple[tuple[int, int], ...]
+    taxonomy_codes: tuple[str, ...]
+    display_terms: tuple[str, ...]
+
+    def matches(self, code_value: int) -> bool:
+        return any(start <= code_value <= end for start, end in self.ranges)
+
+
+INFERRED_PROVIDER_TAXONOMY_RULES = (
+    InferredProviderTaxonomyRule(
+        ranges=((77261, 77799),),
+        taxonomy_codes=("2085R0001X",),
+        display_terms=("radiation oncology",),
+    ),
+    InferredProviderTaxonomyRule(
+        ranges=((70000, 77260), (77800, 79999)),
+        taxonomy_codes=(
+            "2085B0100X",
+            "2085D0003X",
+            "2085N0700X",
+            "2085N0904X",
+            "2085P0229X",
+            "2085R0202X",
+            "2085R0204X",
+            "2085U0001X",
+        ),
+        display_terms=(
+            "diagnostic radiology",
+            "neuroradiology",
+            "body imaging",
+            "nuclear radiology",
+            "pediatric radiology",
+            "interventional radiology",
+            "diagnostic ultrasound",
+            "diagnostic neuroimaging",
+            "breast imaging",
+        ),
+    ),
+    InferredProviderTaxonomyRule(
+        ranges=((100, 1999), (99100, 99140)),
+        taxonomy_codes=("207L00000X", "367500000X", "367H00000X"),
+        display_terms=("anesthesiology", "nurse anesthetist", "anesthesiologist assistant"),
+    ),
+    InferredProviderTaxonomyRule(
+        ranges=((80000, 87999),),
+        taxonomy_codes=("291U00000X",),
+        display_terms=("clinical medical laboratory", "pathology", "pathologist", "laboratory medicine"),
+    ),
+    InferredProviderTaxonomyRule(
+        ranges=((97000, 97799),),
+        taxonomy_codes=("225100000X", "225200000X", "225X00000X", "224Z00000X"),
+        display_terms=("physical therapist", "physical therapy", "occupational therapist", "rehabilitation"),
+    ),
+    InferredProviderTaxonomyRule(
+        ranges=((65091, 68899), (92002, 92499)),
+        taxonomy_codes=("207W00000X", "152W00000X"),
+        display_terms=("ophthalmology", "ophthalmologist", "optometrist", "vision therapy"),
+    ),
+    InferredProviderTaxonomyRule(
+        ranges=((43200, 45399),),
+        taxonomy_codes=("207RG0100X", "208C00000X"),
+        display_terms=("gastroenterology", "colon & rectal", "colon and rectal", "endoscopy"),
+    ),
+    InferredProviderTaxonomyRule(
+        ranges=((99281, 99285),),
+        taxonomy_codes=("207P00000X", "2080P0204X"),
+        display_terms=("emergency medicine", "pediatric emergency medicine"),
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -307,6 +389,46 @@ async def _enrich_ptg2_code_details(session, payload: dict[str, Any], args: dict
 
 def clear_ptg2_index_cache() -> None:
     _PTG2_INDEX_CACHE.clear()
+    _PTG2_RESPONSE_CACHE.clear()
+
+
+def _ptg2_response_cache_key(snapshot_id: str, args: dict[str, Any], pagination: Any) -> str:
+    normalized_args = {
+        str(key): value
+        for key, value in args.items()
+        if value not in (None, "", [], {})
+    }
+    payload = {
+        "snapshot_id": snapshot_id,
+        "limit": int(getattr(pagination, "limit", 25) or 25),
+        "offset": int(getattr(pagination, "offset", 0) or 0),
+        "args": normalized_args,
+    }
+    return json.dumps(payload, sort_keys=True, default=str, separators=(",", ":"))
+
+
+def _ptg2_response_cache_get(cache_key: str) -> dict[str, Any] | None | object:
+    if PTG2_RESPONSE_CACHE_TTL_SECONDS <= 0 or PTG2_RESPONSE_CACHE_MAX_KEYS <= 0:
+        return _CACHE_MISS
+    entry = _PTG2_RESPONSE_CACHE.get(cache_key)
+    if entry is None:
+        return _CACHE_MISS
+    cached_at, payload = entry
+    if (time.monotonic() - cached_at) > PTG2_RESPONSE_CACHE_TTL_SECONDS:
+        _PTG2_RESPONSE_CACHE.pop(cache_key, None)
+        return _CACHE_MISS
+    _PTG2_RESPONSE_CACHE.move_to_end(cache_key)
+    return deepcopy(payload)
+
+
+def _ptg2_response_cache_set(cache_key: str, payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    if PTG2_RESPONSE_CACHE_TTL_SECONDS <= 0 or PTG2_RESPONSE_CACHE_MAX_KEYS <= 0:
+        return payload
+    _PTG2_RESPONSE_CACHE[cache_key] = (time.monotonic(), deepcopy(payload))
+    _PTG2_RESPONSE_CACHE.move_to_end(cache_key)
+    while len(_PTG2_RESPONSE_CACHE) > PTG2_RESPONSE_CACHE_MAX_KEYS:
+        _PTG2_RESPONSE_CACHE.popitem(last=False)
+    return payload
 
 
 def _empty_price_array_sql(*, json_type: str = "json") -> str:
@@ -958,6 +1080,221 @@ def _append_code_filter(filters: list[str], params: dict[str, Any], *, code: Any
     filters.append("(" + " OR ".join(code_clauses) + ")")
 
 
+def _is_external_procedure_code_text(value: str) -> bool:
+    return bool(re.fullmatch(r"[A-Z0-9]{5}", value))
+
+
+def _ptg2_equivalent_external_pairs(system: str, code: str) -> set[tuple[str, str]]:
+    if system not in EXTERNAL_PROCEDURE_CODE_SYSTEMS or not _is_external_procedure_code_text(code):
+        return set()
+    return {(candidate_system, code) for candidate_system in EXTERNAL_PROCEDURE_CODE_SYSTEMS}
+
+
+def _ptg2_code_context(
+    *,
+    input_system: str | None,
+    input_code: str,
+    resolved_pairs: set[tuple[str, str]],
+    internal_codes: set[int],
+    matched_via: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    return {
+        "input_code": {"code_system": input_system, "code": input_code},
+        "resolved_codes": [
+            {"code_system": system, "code": code}
+            for system, code in sorted(resolved_pairs, key=lambda item: (item[0], item[1]))
+        ],
+        "internal_codes": sorted(internal_codes),
+        "matched_via": matched_via or [],
+        "code_match_mode": "equivalent_procedure_codes",
+    }
+
+
+async def _query_ptg2_code_crosswalk_edges(session, pairs: set[tuple[str, str]]) -> list[dict[str, Any]]:
+    if not pairs:
+        return []
+    clauses = []
+    params: dict[str, Any] = {}
+    for idx, (system, code) in enumerate(sorted(pairs)):
+        params[f"system_{idx}"] = system
+        params[f"code_{idx}"] = code
+        clauses.append(
+            f"""
+            (
+                UPPER(from_system) = :system_{idx}
+            AND UPPER(from_code) = :code_{idx}
+            )
+            """
+        )
+        clauses.append(
+            f"""
+            (
+                UPPER(to_system) = :system_{idx}
+            AND UPPER(to_code) = :code_{idx}
+            )
+            """
+        )
+    try:
+        result = await session.execute(
+            text(
+                f"""
+                SELECT from_system, from_code, to_system, to_code, match_type, confidence, source
+                  FROM {PTG2_SCHEMA}.code_crosswalk
+                 WHERE {" OR ".join(clauses)}
+                """
+            ),
+            params,
+        )
+    except Exception:
+        return []
+    return [_row_mapping(row) for row in result]
+
+
+async def _resolve_ptg2_code_search_context(
+    session,
+    *,
+    code: Any,
+    code_system: Any,
+) -> dict[str, Any] | None:
+    requested_code = _normalize_code(code)
+    if not requested_code:
+        return None
+    requested_system = _normalize_code_system(code_system)
+    if requested_system not in PROCEDURE_CODE_SYSTEMS:
+        return None
+    if requested_system == INTERNAL_PROCEDURE_CODE_SYSTEM and not _is_signed_int_text(requested_code):
+        return _ptg2_code_context(
+            input_system=requested_system,
+            input_code=requested_code,
+            resolved_pairs={(requested_system, requested_code)},
+            internal_codes=set(),
+        )
+
+    resolved_pairs: set[tuple[str, str]] = {(requested_system, requested_code)}
+    internal_codes: set[int] = set()
+    matched_via: list[dict[str, Any]] = []
+    seen_edges: set[tuple[str, str, str, str]] = set()
+    if requested_system == INTERNAL_PROCEDURE_CODE_SYSTEM:
+        internal_codes.add(int(requested_code))
+    else:
+        resolved_pairs.update(_ptg2_equivalent_external_pairs(requested_system, requested_code))
+
+    frontier = set(resolved_pairs)
+    for _ in range(PTG2_CODE_EXPANSION_HOPS):
+        edges = await _query_ptg2_code_crosswalk_edges(session, frontier)
+        next_frontier: set[tuple[str, str]] = set()
+        for edge in edges:
+            from_pair = (
+                _normalize_code_system(edge.get("from_system")) or "",
+                _normalize_code(edge.get("from_code")),
+            )
+            to_pair = (
+                _normalize_code_system(edge.get("to_system")) or "",
+                _normalize_code(edge.get("to_code")),
+            )
+            if from_pair[0] not in PROCEDURE_CODE_SYSTEMS or to_pair[0] not in PROCEDURE_CODE_SYSTEMS:
+                continue
+            edge_key = (*from_pair, *to_pair)
+            if edge_key not in seen_edges:
+                seen_edges.add(edge_key)
+                matched_via.append(
+                    {
+                        "from_system": from_pair[0],
+                        "from_code": from_pair[1],
+                        "to_system": to_pair[0],
+                        "to_code": to_pair[1],
+                        "match_type": edge.get("match_type"),
+                        "confidence": edge.get("confidence"),
+                        "source": edge.get("source"),
+                    }
+                )
+            for pair in (from_pair, to_pair):
+                candidate_pairs = {pair}
+                candidate_pairs.update(_ptg2_equivalent_external_pairs(pair[0], pair[1]))
+                for candidate_pair in candidate_pairs:
+                    if candidate_pair[0] == INTERNAL_PROCEDURE_CODE_SYSTEM and _is_signed_int_text(candidate_pair[1]):
+                        internal_codes.add(int(candidate_pair[1]))
+                    if candidate_pair not in resolved_pairs:
+                        resolved_pairs.add(candidate_pair)
+                        next_frontier.add(candidate_pair)
+        if not next_frontier:
+            break
+        frontier = next_frontier
+
+    return _ptg2_code_context(
+        input_system=requested_system,
+        input_code=requested_code,
+        resolved_pairs=resolved_pairs,
+        internal_codes=internal_codes,
+        matched_via=matched_via,
+    )
+
+
+def _append_resolved_code_filter(
+    filters: list[str],
+    params: dict[str, Any],
+    *,
+    code: Any,
+    code_system: Any,
+    code_context: dict[str, Any] | None = None,
+) -> None:
+    requested_code = _normalize_code(code)
+    if not requested_code:
+        return
+    requested_system = _normalize_code_system(code_system)
+    if code_context is None:
+        _append_code_filter(filters, params, code=code, code_system=code_system)
+        return
+
+    clauses: list[str] = []
+    external_codes_by_value: dict[str, list[str]] = {}
+    for resolved_code in code_context.get("resolved_codes") or []:
+        system = str(resolved_code.get("code_system") or "").strip().upper()
+        resolved_value = str(resolved_code.get("code") or "").strip().upper()
+        if system == INTERNAL_PROCEDURE_CODE_SYSTEM:
+            continue
+        external_codes_by_value.setdefault(resolved_value, []).append(system)
+    for idx, (resolved_value, systems) in enumerate(sorted(external_codes_by_value.items())):
+        params[f"reported_code_{idx}"] = resolved_value
+        system_placeholders = []
+        for system_idx, system in enumerate(sorted(set(systems))):
+            key = f"reported_code_system_{idx}_{system_idx}"
+            params[key] = system
+            system_placeholders.append(f":{key}")
+        clauses.append(
+            f"""
+            (
+                reported_code = :reported_code_{idx}
+            AND reported_code_system IN ({", ".join(system_placeholders)})
+            )
+            """
+        )
+    internal_codes = [int(value) for value in code_context.get("internal_codes") or []]
+    if internal_codes:
+        internal_placeholders = []
+        for idx, internal_code in enumerate(internal_codes):
+            key = f"procedure_code_{idx}"
+            params[key] = internal_code
+            internal_placeholders.append(f":{key}")
+        clauses.append("procedure_code IN (" + ", ".join(internal_placeholders) + ")")
+    if not clauses and requested_system == INTERNAL_PROCEDURE_CODE_SYSTEM:
+        filters.append("FALSE")
+        return
+    if clauses:
+        filters.append("(" + " OR ".join(clauses) + ")")
+
+
+def _ptg2_code_query_fields(code_context: dict[str, Any] | None, args: dict[str, Any]) -> dict[str, Any]:
+    if not code_context or not _include_ptg2_details(args):
+        return {}
+    return {
+        "input_code": code_context.get("input_code"),
+        "resolved_codes": code_context.get("resolved_codes") or [],
+        "matched_via": code_context.get("matched_via") or [],
+        "code_match_mode": code_context.get("code_match_mode"),
+    }
+
+
 def _qualify_compact_filters(filters: list[str]) -> list[str]:
     qualified = []
     replacements = {
@@ -990,6 +1327,30 @@ def _normalize_npi(value: Any) -> int | None:
         return None
     parsed = int(text_value)
     return parsed if parsed > 0 else None
+
+
+def _inferred_provider_taxonomy_sql(args: dict[str, Any], *, nt_alias: str, nucc_alias: str) -> str:
+    requested_system = _normalize_code_system(args.get("code_system"))
+    requested_code = _normalize_code(args.get("code"))
+    if requested_system != "CPT" or not requested_code or not requested_code.isdigit():
+        return ""
+    code_value = int(requested_code)
+    matching_rule = next((rule for rule in INFERRED_PROVIDER_TAXONOMY_RULES if rule.matches(code_value)), None)
+    if matching_rule:
+        code_sql = ",\n                    ".join(f"'{code}'" for code in matching_rule.taxonomy_codes)
+        display_sql = "\n".join(
+            f"             OR LOWER(COALESCE({nucc_alias}.display_name, '')) LIKE '%{term}%'"
+            for term in matching_rule.display_terms
+        )
+        return f"""
+            (
+                {nt_alias}.healthcare_provider_taxonomy_code IN (
+                    {code_sql}
+                )
+{display_sql}
+            )
+        """
+    return ""
 
 
 async def _search_compact_serving_table(
@@ -1070,6 +1431,17 @@ async def _search_compact_serving_table(
             """
         )
         params["specialty_like"] = f"%{specialty_text}%"
+    inferred_taxonomy_sql = ""
+    inferred_provider_taxonomy_sql = ""
+    if not taxonomy_filters and provider_npi is None:
+        inferred_taxonomy_sql = _inferred_provider_taxonomy_sql(args, nt_alias="nt", nucc_alias="nucc")
+        inferred_provider_taxonomy_sql = _inferred_provider_taxonomy_sql(
+            args,
+            nt_alias="nt_filter",
+            nucc_alias="nucc_filter",
+        )
+        if inferred_taxonomy_sql:
+            taxonomy_filters.append(inferred_taxonomy_sql)
     q_filter = ""
     if q_text:
         q_filter = """
@@ -1183,6 +1555,7 @@ async def _search_compact_serving_table(
                  OR LOWER(COALESCE(nucc_filter.section, '')) LIKE :specialty_like
                 )
                 """ if specialty_text else "",
+                inferred_provider_taxonomy_sql,
             )
             if filter_sql
         )
@@ -1256,7 +1629,6 @@ async def _search_compact_serving_table(
     has_provider_filters = expand_providers
     if has_provider_filters:
         params["candidate_rate_limit"] = max(int(getattr(pagination, "limit", 25) or 25) * 8, 64)
-        geo_sql = " AND ".join(geo_filters)
         expansion_geo_sql = " AND ".join(
             filter_sql
             for filter_sql in (
@@ -2422,11 +2794,21 @@ async def search_ptg2_serving_table(
     if requested_plan:
         filters.append("plan_id = :plan_id")
         params["plan_id"] = requested_plan
-    _append_code_filter(filters, params, code=args.get("code"), code_system=args.get("code_system"))
+    code_context = await _resolve_ptg2_code_search_context(
+        session,
+        code=args.get("code"),
+        code_system=args.get("code_system"),
+    )
+    _append_resolved_code_filter(
+        filters,
+        params,
+        code=args.get("code"),
+        code_system=args.get("code_system"),
+        code_context=code_context,
+    )
     if q_text:
         params["q_like"] = f"%{q_text}%"
 
-    where_sql = " AND ".join(filters)
     serving_tables = serving_tables or PTG2ServingTables()
     preferred_table = serving_tables.serving_table
     price_set_table = f"{PTG2_SCHEMA}.ptg2_price_set"
@@ -2451,6 +2833,10 @@ async def search_ptg2_serving_table(
                 mode_value,
             )
             if compact_payload is not None:
+                compact_payload["query"] = {
+                    **dict(compact_payload.get("query") or {}),
+                    **_ptg2_code_query_fields(code_context, args),
+                }
                 return compact_payload
             continue
         noncompact_filters = list(filters)
@@ -2600,6 +2986,7 @@ async def search_ptg2_serving_table(
             "source": "ptg2_db_stage" if table_name.endswith(".ptg2_serving_rate_stage") else "ptg2_db",
             "serving_table": table_name,
             "procedure_consolidation": "HP_PROCEDURE_CODE",
+            **_ptg2_code_query_fields(code_context, args),
         },
     }
 
@@ -2680,7 +3067,18 @@ async def search_ptg2_provider_procedures(session, npi: int, args: dict[str, Any
         filters.append("r.plan_id = :plan_id")
         params["plan_id"] = requested_plan
 
-    _append_code_filter(filters, params, code=code_value, code_system=args.get("code_system"))
+    code_context = await _resolve_ptg2_code_search_context(
+        session,
+        code=code_value,
+        code_system=args.get("code_system"),
+    )
+    _append_resolved_code_filter(
+        filters,
+        params,
+        code=code_value,
+        code_system=args.get("code_system"),
+        code_context=code_context,
+    )
     q_filter = ""
     if q_text:
         q_filter = """
@@ -2774,6 +3172,7 @@ async def search_ptg2_provider_procedures(session, npi: int, args: dict[str, Any
                         "serving_table": table_name,
                         "provider_reverse_index": has_reverse_provider_index,
                         "status": "no_match",
+                        **_ptg2_code_query_fields(code_context, args),
                     },
                 },
                 args,
@@ -2924,6 +3323,7 @@ async def search_ptg2_provider_procedures(session, npi: int, args: dict[str, Any
                     "serving_table": table_name,
                     "provider_reverse_index": has_reverse_provider_index,
                     "status": "no_match",
+                    **_ptg2_code_query_fields(code_context, args),
                 },
             },
             args,
@@ -2953,6 +3353,7 @@ async def search_ptg2_provider_procedures(session, npi: int, args: dict[str, Any
                 "source": "ptg2_db",
                 "serving_table": table_name,
                 "provider_reverse_index": has_reverse_provider_index,
+                **_ptg2_code_query_fields(code_context, args),
             },
         },
         args,
@@ -3046,6 +3447,10 @@ async def search_current_ptg2_index(session, args: dict[str, Any], pagination) -
     snapshot_id = await resolve_current_ptg2_snapshot_id(session, args)
     if not snapshot_id:
         return None
+    cache_key = _ptg2_response_cache_key(snapshot_id, args, pagination)
+    cached_payload = _ptg2_response_cache_get(cache_key)
+    if cached_payload is not _CACHE_MISS:
+        return cached_payload  # type: ignore[return-value]
     serving_tables = await snapshot_serving_tables(session, snapshot_id)
     db_payload = await search_ptg2_serving_table(
         session,
@@ -3056,7 +3461,7 @@ async def search_current_ptg2_index(session, args: dict[str, Any], pagination) -
     )
     if db_payload is not None:
         db_payload = await _enrich_ptg2_code_details(session, db_payload, args)
-        return _shape_ptg2_response(db_payload, args)
+        return _ptg2_response_cache_set(cache_key, _shape_ptg2_response(db_payload, args))
     if not _env_bool(PTG2_JSON_FALLBACK_ENV, False):
         return None
 
@@ -3077,7 +3482,7 @@ async def search_current_ptg2_index(session, args: dict[str, Any], pagination) -
         mode=args.get("mode"),
     )
     json_payload = await _enrich_ptg2_code_details(session, json_payload, args)
-    return _shape_ptg2_response(json_payload, args)
+    return _ptg2_response_cache_set(cache_key, _shape_ptg2_response(json_payload, args))
 
 
 def warm_cache_benchmark(index: PTG2ServingIndex, request_count: int = 200) -> dict[str, Any]:

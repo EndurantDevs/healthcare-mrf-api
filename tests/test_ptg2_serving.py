@@ -169,6 +169,102 @@ def test_db_serving_code_filter_accepts_signed_hp_procedure_codes():
     assert params["procedure_code"] == -1201887592
 
 
+@pytest.mark.asyncio
+async def test_ptg2_code_context_bridges_cpt_and_hcpcs_same_code():
+    context = await ptg2_serving._resolve_ptg2_code_search_context(
+        FakeSession([FakeResult(rows=[])]),
+        code="70551",
+        code_system="CPT",
+    )
+
+    assert context["input_code"] == {"code_system": "CPT", "code": "70551"}
+    assert {"code_system": "CPT", "code": "70551"} in context["resolved_codes"]
+    assert {"code_system": "HCPCS", "code": "70551"} in context["resolved_codes"]
+    assert context["internal_codes"] == []
+
+
+@pytest.mark.asyncio
+async def test_ptg2_code_context_expands_internal_code_crosswalk():
+    context = await ptg2_serving._resolve_ptg2_code_search_context(
+        FakeSession(
+            [
+                FakeResult(
+                    rows=[
+                        {
+                            "from_system": "CPT",
+                            "from_code": "70551",
+                            "to_system": "HP_PROCEDURE_CODE",
+                            "to_code": "123456",
+                            "match_type": "exact",
+                            "confidence": 1.0,
+                            "source": "test",
+                        }
+                    ]
+                ),
+                FakeResult(rows=[]),
+            ]
+        ),
+        code="70551",
+        code_system="CPT",
+    )
+
+    assert {"code_system": "CPT", "code": "70551"} in context["resolved_codes"]
+    assert {"code_system": "HCPCS", "code": "70551"} in context["resolved_codes"]
+    assert {"code_system": "HP_PROCEDURE_CODE", "code": "123456"} in context["resolved_codes"]
+    assert context["internal_codes"] == [123456]
+    assert context["matched_via"][0]["source"] == "test"
+
+
+@pytest.mark.asyncio
+async def test_ptg2_code_context_keeps_non_procedure_system_exact():
+    context = await ptg2_serving._resolve_ptg2_code_search_context(
+        FakeSession([]),
+        code="0450",
+        code_system="RC",
+    )
+    filters = []
+    params = {}
+
+    ptg2_serving._append_resolved_code_filter(
+        filters,
+        params,
+        code="0450",
+        code_system="RC",
+        code_context=context,
+    )
+
+    assert context is None
+    assert "reported_code_system = :reported_code_system" in filters[0]
+    assert params["reported_code_system"] == "RC"
+    assert params["reported_code"] == "0450"
+
+
+@pytest.mark.asyncio
+async def test_ptg2_serving_table_uses_equivalent_cpt_hcpcs_filter_for_compact_search():
+    session = FakeSession(
+        [
+            FakeResult(rows=[]),
+            "mrf.ptg2_serving_rate_compact_token",
+            FakeResult(rows=[]),
+        ]
+    )
+
+    await ptg2_serving.search_ptg2_serving_table(
+        session,
+        "snap-token",
+        {"plan_id": "010854205", "code": "70551", "code_system": "CPT"},
+        FakePagination(),
+        serving_tables=_compact_tables(),
+    )
+
+    sql = str(session.calls[2][0][0])
+    params = session.calls[2][0][1]
+    assert "r.reported_code = :reported_code_0" in sql
+    assert "r.reported_code_system IN (:reported_code_system_0_0, :reported_code_system_0_1)" in sql
+    assert set(params[key] for key in ("reported_code_system_0_0", "reported_code_system_0_1")) == {"CPT", "HCPCS"}
+    assert params["reported_code_0"] == "70551"
+
+
 def test_price_summary_groups_component_rates_and_counts_raw_prices():
     prices = [
         {
@@ -373,6 +469,83 @@ async def test_search_current_ptg2_index_can_include_code_details():
 
 
 @pytest.mark.asyncio
+async def test_search_current_ptg2_index_caches_shaped_positive_responses(monkeypatch):
+    calls = {"snapshot": 0, "search": 0}
+
+    async def fake_resolve(_session, _args):
+        return "snap-cache"
+
+    async def fake_snapshot(_session, _snapshot_id):
+        calls["snapshot"] += 1
+        return ptg2_serving.PTG2ServingTables(serving_table="mrf.ptg2_serving_rate")
+
+    async def fake_search(_session, _snapshot_id, _args, _pagination, *, serving_tables):
+        del serving_tables
+        calls["search"] += 1
+        return {
+            "items": [
+                {
+                    "reported_code": "70551",
+                    "source_trace": [{"url": "https://example.test/rates.json.gz"}],
+                    "provider_set_hash": "provider-set-1",
+                }
+            ],
+            "query": {"snapshot_id": _snapshot_id, "source": "ptg2_db", "serving_table": "mrf.ptg2_serving_rate"},
+            "pagination": {"total": 1},
+        }
+
+    ptg2_serving.clear_ptg2_index_cache()
+    monkeypatch.setattr(ptg2_serving, "resolve_current_ptg2_snapshot_id", fake_resolve)
+    monkeypatch.setattr(ptg2_serving, "snapshot_serving_tables", fake_snapshot)
+    monkeypatch.setattr(ptg2_serving, "search_ptg2_serving_table", fake_search)
+
+    payload = await ptg2_serving.search_current_ptg2_index(
+        FakeSession([]),
+        {"plan_id": "010854205", "code": "70551"},
+        FakePagination(),
+    )
+    payload["items"][0]["reported_code"] = "mutated"
+    cached_payload = await ptg2_serving.search_current_ptg2_index(
+        FakeSession([]),
+        {"plan_id": "010854205", "code": "70551"},
+        FakePagination(),
+    )
+
+    assert calls == {"snapshot": 1, "search": 1}
+    assert cached_payload["items"][0]["reported_code"] == "70551"
+    assert "source_trace" not in cached_payload["items"][0]
+    assert "provider_set_hash" not in cached_payload["items"][0]
+    assert "source" not in cached_payload["query"]
+
+
+@pytest.mark.asyncio
+async def test_search_current_ptg2_index_does_not_negative_cache_missing_payload(monkeypatch):
+    calls = {"snapshot": 0, "search": 0}
+
+    async def fake_resolve(_session, _args):
+        return "snap-cache-miss"
+
+    async def fake_snapshot(_session, _snapshot_id):
+        calls["snapshot"] += 1
+        return ptg2_serving.PTG2ServingTables(serving_table="mrf.ptg2_serving_rate")
+
+    async def fake_search(_session, _snapshot_id, _args, _pagination, *, serving_tables):
+        del serving_tables
+        calls["search"] += 1
+        return None
+
+    ptg2_serving.clear_ptg2_index_cache()
+    monkeypatch.delenv(ptg2_serving.PTG2_JSON_FALLBACK_ENV, raising=False)
+    monkeypatch.setattr(ptg2_serving, "resolve_current_ptg2_snapshot_id", fake_resolve)
+    monkeypatch.setattr(ptg2_serving, "snapshot_serving_tables", fake_snapshot)
+    monkeypatch.setattr(ptg2_serving, "search_ptg2_serving_table", fake_search)
+
+    assert await ptg2_serving.search_current_ptg2_index(FakeSession([]), {"plan_id": "010854205"}, FakePagination()) is None
+    assert await ptg2_serving.search_current_ptg2_index(FakeSession([]), {"plan_id": "010854205"}, FakePagination()) is None
+    assert calls == {"snapshot": 2, "search": 2}
+
+
+@pytest.mark.asyncio
 async def test_current_ptg2_snapshot_routes_by_plan_source_pointer():
     session = FakeSession(["snap-source"])
 
@@ -425,6 +598,7 @@ async def test_ptg2_provider_procedures_uses_compact_snapshot_without_market_col
                 "provider_group_member_table": "mrf.ptg2_provider_group_member_token",
             },
             "mrf.ptg2_serving_rate_compact_token",
+            FakeResult(rows=[]),
             FakeResult(
                 rows=[
                     {
@@ -470,7 +644,8 @@ async def test_ptg2_provider_procedures_uses_compact_snapshot_without_market_col
     assert payload["items"][0]["npi"] == 1083311500
     assert payload["items"][0]["reported_code"] == "99213"
     assert payload["items"][0]["tic_prices"][0]["negotiated_rate"] == 101.42
-    row_sql = str(session.calls[3][0][0])
+    row_call = next(call for call in session.calls if "provider_sets AS MATERIALIZED" in str(call[0][0]))
+    row_sql = str(row_call[0][0])
     assert "r.plan_market_type" not in row_sql
     assert "mrf.ptg2_provider_set_component_token" in row_sql
     assert "mrf.ptg2_provider_entry_component_token" not in row_sql
@@ -478,7 +653,7 @@ async def test_ptg2_provider_procedures_uses_compact_snapshot_without_market_col
     assert "NULL::varchar AS plan_market_type" in row_sql
     assert "r.provider_set_count" not in row_sql
     assert "NULL::integer AS provider_set_count" in row_sql
-    assert session.calls[3][0][1]["plan_id"] == "010854205"
+    assert row_call[0][1]["plan_id"] == "010854205"
 
 
 @pytest.mark.asyncio
@@ -496,6 +671,7 @@ async def test_ptg2_provider_procedures_filters_prices_by_pos_modifier_and_rate(
                 "provider_group_member_table": "mrf.ptg2_provider_group_member_token",
             },
             "mrf.ptg2_serving_rate_compact_token",
+            FakeResult(rows=[]),
             FakeResult(
                 rows=[
                     {
@@ -558,8 +734,9 @@ async def test_ptg2_provider_procedures_filters_prices_by_pos_modifier_and_rate(
         "negotiated_rate": 516.08,
         "rate_tolerance": 0.01,
     }
-    row_sql = str(session.calls[3][0][0])
-    params = session.calls[3][0][1]
+    row_call = next(call for call in session.calls if "provider_sets AS MATERIALIZED" in str(call[0][0]))
+    row_sql = str(row_call[0][0])
+    params = row_call[0][1]
     assert "price_payload.prices IS NOT NULL" in row_sql
     assert "CAST(:price_service_codes AS varchar[])" in row_sql
     assert "CAST(:price_modifier_codes AS varchar[])" in row_sql
@@ -587,6 +764,7 @@ async def test_ptg2_provider_procedures_returns_no_match_after_snapshot_resolves
                 "provider_group_member_table": "mrf.ptg2_provider_group_member_token",
             },
             "mrf.ptg2_serving_rate_compact_token",
+            FakeResult(rows=[]),
             0,
         ]
     )
@@ -969,6 +1147,108 @@ async def test_compact_serving_include_providers_with_geo_uses_npi_scoped_locati
     assert params["city_exact"] == "HOUSTON"
     assert params["provider_match_limit"] >= 64
     assert params["location_rate_candidate_limit"] >= 4096
+
+
+@pytest.mark.asyncio
+async def test_compact_serving_infers_radiology_taxonomy_for_radiology_cpt_geo_lookup():
+    session = FakeSession(
+        [
+            FakeResult(
+                rows=[
+                    {
+                        "npi": 1234567890,
+                        "location_hash": "npi_address:1234567890:primary:addr-1",
+                        "state": "MA",
+                        "city": "BOSTON",
+                        "zip5": "02118",
+                        "location_source": "npi_address",
+                        "location_confidence_code": "npi_address",
+                        "address_payload": {"city": "BOSTON", "state": "MA", "postal_code": "02118"},
+                        "taxonomy_codes": ["2085R0202X"],
+                        "specialties": ["Diagnostic Radiology Physician"],
+                        "provider_name": "Radiology Provider",
+                        "procedure_code": None,
+                        "reported_code_system": "CPT",
+                        "reported_code": "70551",
+                        "billing_code": "70551",
+                        "billing_code_type": "CPT",
+                        "procedure_display_name": "MRI brain",
+                        "procedure_name": "MRI brain",
+                        "procedure_description": "MRI brain",
+                        "provider_set_hashes": ["provider-set-1"],
+                        "rate_count": 1,
+                        "prices": [{"negotiated_type": "derived", "negotiated_rate": 86.48}],
+                        "source_trace": [],
+                    }
+                ]
+            )
+        ]
+    )
+    tables = _compact_tables(provider_group_location_table="mrf.ptg2_provider_group_location_token")
+
+    payload = await ptg2_serving._search_compact_serving_table(
+        session,
+        "mrf.ptg2_serving_rate_compact_token",
+        tables,
+        "snap-token",
+        {
+            "plan_id": "823166837",
+            "code": "70551",
+            "code_system": "CPT",
+            "city": "Boston",
+            "state": "MA",
+            "include_providers": "true",
+        },
+        FakePagination(),
+        ["snapshot_id = :snapshot_id", "plan_id = :plan_id"],
+        {"snapshot_id": "snap-token", "plan_id": "823166837", "limit": 25, "offset": 0},
+        ptg2_serving.PTG2_MODE_EXACT_SOURCE,
+    )
+
+    assert payload["items"][0]["specialties"] == ["Diagnostic Radiology Physician"]
+    sql = str(session.calls[0][0][0])
+    assert "nt.healthcare_provider_taxonomy_code IN" in sql
+    assert "'2085R0202X'" in sql
+    assert "LOWER(COALESCE(nucc.display_name, '')) LIKE '%diagnostic radiology%'" in sql
+    assert "'2085R0001X'" not in sql
+
+
+@pytest.mark.parametrize(
+    ("code", "expected_code", "expected_term"),
+    [
+        ("00100", "207L00000X", "anesthesiology"),
+        ("80053", "291U00000X", "clinical medical laboratory"),
+        ("97140", "225100000X", "physical therapist"),
+        ("66984", "207W00000X", "ophthalmology"),
+        ("45378", "207RG0100X", "gastroenterology"),
+        ("99285", "207P00000X", "emergency medicine"),
+        ("77301", "2085R0001X", "radiation oncology"),
+    ],
+)
+def test_inferred_provider_taxonomy_sql_for_high_confidence_cpt_families(
+    code: str,
+    expected_code: str,
+    expected_term: str,
+):
+    sql = ptg2_serving._inferred_provider_taxonomy_sql(
+        {"code": code, "code_system": "CPT"},
+        nt_alias="nt",
+        nucc_alias="nucc",
+    )
+
+    assert expected_code in sql
+    assert f"%{expected_term}%" in sql
+
+
+@pytest.mark.parametrize("code", ["99213", "99203", "93000"])
+def test_inferred_provider_taxonomy_sql_ignores_mixed_use_cpt_families(code: str):
+    sql = ptg2_serving._inferred_provider_taxonomy_sql(
+        {"code": code, "code_system": "CPT"},
+        nt_alias="nt",
+        nucc_alias="nucc",
+    )
+
+    assert sql == ""
 
 
 def test_warm_cache_benchmark_fixture_p95_gate():
