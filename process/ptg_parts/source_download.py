@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import datetime
 import hashlib
 import logging
 import math
 import os
 import re
+import sys
+import tempfile
 import time
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -25,21 +28,31 @@ from process.ptg_parts.artifacts import (
     _safe_url_suffix,
     _write_completed_ranges,
     choose_reusable_raw_artifact,
+    ptg2_temp_parent,
     sha256_file,
 )
 from process.ptg_parts.canonical import canonicalize_url
 from process.ptg_parts.config import (
+    PTG2_DEFAULT_DOWNLOAD_TASKS,
+    PTG2_DOWNLOAD_TASKS_ENV,
     PTG2_KEEP_PARTIAL_ENV,
     PTG2_RANGE_DOWNLOADS_ENV,
     _download_progress_interval_bytes,
     _download_retry_count,
     _download_retry_delay_seconds,
     _env_bool,
+    _env_int,
     _range_download_chunk_bytes,
     _range_download_min_bytes,
     _range_download_tasks,
 )
-from process.ptg_parts.domain import PTG2_ARTIFACT_RAW, PTG2HeadMetadata, PTG2LogicalArtifact, PTG2RawArtifact
+from process.ptg_parts.domain import (
+    PTG2_ARTIFACT_RAW,
+    PTG2DownloadedJob,
+    PTG2HeadMetadata,
+    PTG2LogicalArtifact,
+    PTG2RawArtifact,
+)
 from process.ptg_parts.screen import _emit_screen_line
 
 logger = logging.getLogger(__name__)
@@ -528,3 +541,100 @@ async def materialize_json_source(
         )
     )
     return raw_artifact, logical_artifact
+
+def _materialize_json_source_from_facade():
+    ptg_module = sys.modules.get("process.ptg")
+    return getattr(ptg_module, "materialize_json_source", materialize_json_source)
+
+
+def _download_ptg_job_artifact_sync_from_facade(job: dict[str, object], **kwargs) -> PTG2DownloadedJob:
+    ptg_module = sys.modules.get("process.ptg")
+    downloader = getattr(ptg_module, "_download_ptg_job_artifact_sync", _download_ptg_job_artifact_sync)
+    return downloader(job, **kwargs)
+
+
+async def _download_ptg_job_artifact(
+    job: dict[str, Any],
+    *,
+    reuse_raw_artifacts: bool,
+    max_bytes: int | None,
+    keep_partial_artifacts: bool | None,
+) -> PTG2DownloadedJob:
+    try:
+        with tempfile.TemporaryDirectory(dir=ptg2_temp_parent()) as tmpdir:
+            raw_artifact, logical_artifact = await _materialize_json_source_from_facade()(
+                job["url"],
+                tmpdir,
+                reuse_raw_artifacts=reuse_raw_artifacts,
+                max_bytes=max_bytes,
+                materialize_logical=False,
+                keep_partial_artifacts=keep_partial_artifacts,
+            )
+        return PTG2DownloadedJob(job=job, raw_artifact=raw_artifact, logical_artifact=logical_artifact)
+    except Exception as exc:
+        return PTG2DownloadedJob(job=job, error=str(exc))
+
+
+def _download_ptg_job_artifact_sync(
+    job: dict[str, Any],
+    *,
+    reuse_raw_artifacts: bool,
+    max_bytes: int | None,
+    keep_partial_artifacts: bool | None,
+) -> PTG2DownloadedJob:
+    return asyncio.run(
+        _download_ptg_job_artifact(
+            job,
+            reuse_raw_artifacts=reuse_raw_artifacts,
+            max_bytes=max_bytes,
+            keep_partial_artifacts=keep_partial_artifacts,
+        )
+    )
+
+
+async def _iter_downloaded_ptg_jobs(
+    jobs: list[dict[str, Any]],
+    *,
+    reuse_raw_artifacts: bool,
+    max_bytes: int | None,
+    keep_partial_artifacts: bool | None,
+):
+    download_tasks = max(_env_int(PTG2_DOWNLOAD_TASKS_ENV, PTG2_DEFAULT_DOWNLOAD_TASKS), 1)
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=download_tasks,
+        thread_name_prefix="ptg2-download",
+    )
+    pending: set[asyncio.Future[PTG2DownloadedJob]] = set()
+    job_iter = iter(jobs)
+
+    def schedule_more() -> None:
+        while len(pending) < download_tasks:
+            try:
+                job = next(job_iter)
+            except StopIteration:
+                return
+            pending.add(
+                asyncio.wrap_future(
+                    executor.submit(
+                        _download_ptg_job_artifact_sync_from_facade,
+                        job,
+                        reuse_raw_artifacts=reuse_raw_artifacts,
+                        max_bytes=max_bytes,
+                        keep_partial_artifacts=keep_partial_artifacts,
+                    )
+                )
+            )
+
+    schedule_more()
+    try:
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            schedule_more()
+            for task in done:
+                yield task.result()
+    finally:
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        executor.shutdown(wait=False, cancel_futures=True)
