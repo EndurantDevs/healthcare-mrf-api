@@ -306,6 +306,7 @@ def test_json_stream_split_keeps_facade_helpers_stable():
 
 
 def test_serving_only_split_keeps_facade_helpers_stable():
+    assert process_ptg._serving_only_rows_for_payload is ptg_serving_only._serving_only_rows_for_payload
     assert process_ptg._serving_only_price_payload is ptg_serving_only._serving_only_price_payload
     assert process_ptg._normalize_serving_price_payload is ptg_serving_only._normalize_serving_price_payload
     assert process_ptg._serving_only_hash_int_sets is ptg_serving_only._serving_only_hash_int_sets
