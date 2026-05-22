@@ -23,6 +23,7 @@ ptg_artifacts = importlib.import_module("process.ptg_parts.artifacts")
 ptg_artifact_streams = importlib.import_module("process.ptg_parts.artifact_streams")
 ptg_canonical = importlib.import_module("process.ptg_parts.canonical")
 ptg_compact_indexes = importlib.import_module("process.ptg_parts.compact_indexes")
+ptg_compact_state = importlib.import_module("process.ptg_parts.compact_state")
 ptg_copy_load = importlib.import_module("process.ptg_parts.copy_load")
 ptg_db_tables = importlib.import_module("process.ptg_parts.db_tables")
 ptg_domain = importlib.import_module("process.ptg_parts.domain")
@@ -128,6 +129,14 @@ def test_compact_index_split_keeps_facade_helpers_stable():
     assert process_ptg._run_ptg2_index_statement is ptg_compact_indexes._run_ptg2_index_statement
     assert process_ptg._index_snapshot_compact_table_entries is ptg_compact_indexes._index_snapshot_compact_table_entries
     assert process_ptg._index_snapshot_compact_tables is ptg_compact_indexes._index_snapshot_compact_tables
+
+
+def test_compact_state_split_keeps_facade_helpers_stable():
+    assert process_ptg._compact_state is ptg_compact_state._compact_state
+    assert process_ptg._compact_streaming_dedupe_tables is ptg_compact_state._compact_streaming_dedupe_tables
+    assert process_ptg._compact_add_unique is ptg_compact_state._compact_add_unique
+    assert process_ptg._ptg2_price_atom_payload is ptg_compact_state._ptg2_price_atom_payload
+    assert process_ptg._ptg2_source_trace_payload is ptg_compact_state._ptg2_source_trace_payload
 
 
 def test_copy_load_split_keeps_facade_helpers_stable():
