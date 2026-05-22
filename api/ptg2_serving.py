@@ -12,7 +12,6 @@ import time
 from collections import OrderedDict
 from copy import deepcopy
 from decimal import Decimal
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlsplit
@@ -76,6 +75,7 @@ from api.ptg2_price_sql import (
     _scalar_price_json_sql,
     _typed_price_json_sql,
 )
+from api.ptg2_types import PTG2ServingIndex, PTG2ServingTables
 
 PTG2_ARTIFACT_KIND_SNAPSHOT_INDEX = "snapshot_index"
 PTG2_MODE_EXACT_SOURCE = "exact_source"
@@ -92,44 +92,6 @@ PTG2_FAST_COMPACT_COUNTS_ENV = "HLTHPRT_PTG2_FAST_COMPACT_COUNTS"
 _PTG2_INDEX_CACHE: dict[str, tuple[float, "PTG2ServingIndex"]] = {}
 _PTG2_RESPONSE_CACHE: OrderedDict[str, tuple[float, dict[str, Any] | None]] = OrderedDict()
 _CACHE_MISS = object()
-
-
-@dataclass(frozen=True)
-class PTG2ServingIndex:
-    snapshot_id: str
-    version: int
-    plans: dict[str, Any]
-    procedures: dict[str, Any]
-    providers: dict[str, Any]
-    rates: dict[str, Any]
-    source_uri: str | None = None
-
-    @classmethod
-    def from_payload(cls, payload: dict[str, Any], source_uri: str | None = None) -> "PTG2ServingIndex":
-        return cls(
-            snapshot_id=str(payload.get("snapshot_id") or ""),
-            version=int(payload.get("version") or 1),
-            plans=dict(payload.get("plans") or {}),
-            procedures=dict(payload.get("procedures") or {}),
-            providers={str(k): v for k, v in dict(payload.get("providers") or {}).items()},
-            rates=dict(payload.get("rates") or {}),
-            source_uri=source_uri,
-        )
-
-
-@dataclass(frozen=True)
-class PTG2ServingTables:
-    serving_table: str | None = None
-    price_code_set_table: str | None = None
-    price_atom_table: str | None = None
-    price_set_entry_table: str | None = None
-    procedure_table: str | None = None
-    provider_set_table: str | None = None
-    provider_set_component_table: str | None = None
-    provider_set_entry_table: str | None = None
-    provider_entry_component_table: str | None = None
-    provider_group_member_table: str | None = None
-    provider_group_location_table: str | None = None
 
 
 def normalize_ptg2_mode(value: str | None) -> str:
