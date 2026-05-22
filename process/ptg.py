@@ -210,9 +210,15 @@ from process.ptg_parts.config import (
     TEST_PROVIDER_GROUPS,
     TEST_TOC_FILES,
     TEST_TOC_JOBS,
+    _download_progress_interval_bytes,
+    _download_retry_count,
+    _download_retry_delay_seconds,
     _env_bool,
     _env_int,
     _ptg2_stage_copy_dedupe_enabled,
+    _range_download_chunk_bytes,
+    _range_download_min_bytes,
+    _range_download_tasks,
     _stream_buffer_bytes,
     _use_compact_serving_table,
     _use_rust_compact_serving,
@@ -543,42 +549,6 @@ class PTG2DownloadedJob:
 
 def _utcnow() -> datetime.datetime:
     return datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
-
-
-def _download_progress_interval_bytes() -> int:
-    return max(_env_int(PTG2_DOWNLOAD_PROGRESS_BYTES_ENV, 64 * 1024 * 1024), 1024 * 1024)
-
-
-def _range_download_chunk_bytes() -> int:
-    return max(
-        _env_int(PTG2_RANGE_DOWNLOAD_CHUNK_BYTES_ENV, PTG2_DEFAULT_RANGE_DOWNLOAD_CHUNK_BYTES),
-        1024 * 1024,
-    )
-
-
-def _range_download_tasks() -> int:
-    return max(_env_int(PTG2_RANGE_DOWNLOAD_TASKS_ENV, PTG2_DEFAULT_RANGE_DOWNLOAD_TASKS), 1)
-
-
-def _range_download_min_bytes() -> int:
-    return max(
-        _env_int(PTG2_RANGE_DOWNLOAD_MIN_BYTES_ENV, PTG2_DEFAULT_RANGE_DOWNLOAD_MIN_BYTES),
-        1,
-    )
-
-
-def _download_retry_count() -> int:
-    return max(_env_int(PTG2_DOWNLOAD_RETRIES_ENV, 4), 0)
-
-
-def _download_retry_delay_seconds() -> float:
-    raw = os.getenv(PTG2_DOWNLOAD_RETRY_DELAY_SECONDS_ENV)
-    if raw is None:
-        return 2.0
-    try:
-        return max(float(str(raw).strip()), 0.0)
-    except ValueError:
-        return 2.0
 
 
 def _format_eta_seconds(seconds: float | None) -> str:

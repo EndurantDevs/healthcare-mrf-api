@@ -170,3 +170,39 @@ def _use_rust_compact_serving() -> bool:
 
 def _stream_buffer_bytes() -> int:
     return max(_env_int(PTG2_STREAM_BUFFER_BYTES_ENV, 4 * 1024 * 1024), 64 * 1024)
+
+
+def _download_progress_interval_bytes() -> int:
+    return max(_env_int(PTG2_DOWNLOAD_PROGRESS_BYTES_ENV, 64 * 1024 * 1024), 1024 * 1024)
+
+
+def _range_download_chunk_bytes() -> int:
+    return max(
+        _env_int(PTG2_RANGE_DOWNLOAD_CHUNK_BYTES_ENV, PTG2_DEFAULT_RANGE_DOWNLOAD_CHUNK_BYTES),
+        1024 * 1024,
+    )
+
+
+def _range_download_tasks() -> int:
+    return max(_env_int(PTG2_RANGE_DOWNLOAD_TASKS_ENV, PTG2_DEFAULT_RANGE_DOWNLOAD_TASKS), 1)
+
+
+def _range_download_min_bytes() -> int:
+    return max(
+        _env_int(PTG2_RANGE_DOWNLOAD_MIN_BYTES_ENV, PTG2_DEFAULT_RANGE_DOWNLOAD_MIN_BYTES),
+        1,
+    )
+
+
+def _download_retry_count() -> int:
+    return max(_env_int(PTG2_DOWNLOAD_RETRIES_ENV, 4), 0)
+
+
+def _download_retry_delay_seconds() -> float:
+    raw = os.getenv(PTG2_DOWNLOAD_RETRY_DELAY_SECONDS_ENV)
+    if raw is None:
+        return 2.0
+    try:
+        return max(float(str(raw).strip()), 0.0)
+    except ValueError:
+        return 2.0
