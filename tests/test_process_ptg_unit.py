@@ -27,6 +27,7 @@ ptg_db_tables = importlib.import_module("process.ptg_parts.db_tables")
 ptg_domain = importlib.import_module("process.ptg_parts.domain")
 ptg_json_streams = importlib.import_module("process.ptg_parts.json_streams")
 ptg_row_helpers = importlib.import_module("process.ptg_parts.row_helpers")
+ptg_rust_publish = importlib.import_module("process.ptg_parts.rust_publish")
 ptg_rust_scanner = importlib.import_module("process.ptg_parts.rust_scanner")
 ptg_rust_stage = importlib.import_module("process.ptg_parts.rust_stage")
 ptg_screen = importlib.import_module("process.ptg_parts.screen")
@@ -133,6 +134,14 @@ def test_snapshot_cleanup_split_keeps_facade_helpers_stable():
     assert process_ptg._drop_ptg2_snapshot_table_names is ptg_snapshot_cleanup._drop_ptg2_snapshot_table_names
     assert process_ptg._drop_ptg2_snapshot_tables_for_manifest is ptg_snapshot_cleanup._drop_ptg2_snapshot_tables_for_manifest
     assert process_ptg._cleanup_old_ptg2_source_tables is ptg_snapshot_cleanup._cleanup_old_ptg2_source_tables
+
+
+def test_rust_publish_split_keeps_facade_helpers_stable():
+    assert process_ptg._ptg2_publish_timestamp is ptg_rust_publish._ptg2_publish_timestamp
+    assert process_ptg._publish_renamed_rust_dictionary_table is ptg_rust_publish._publish_renamed_rust_dictionary_table
+    assert process_ptg._ptg2_serving_child_table_name is ptg_rust_publish._ptg2_serving_child_table_name
+    assert process_ptg._publish_rust_serving_stage_tables is ptg_rust_publish._publish_rust_serving_stage_tables
+    assert process_ptg._publish_rust_compact_snapshot_tables is ptg_rust_publish._publish_rust_compact_snapshot_tables
 
 
 def test_rust_scanner_split_keeps_facade_helpers_stable():
@@ -2508,15 +2517,15 @@ def test_ptg2_rust_snapshot_publish_renames_dictionary_stages_before_index(monke
 
     monkeypatch.setattr(process_ptg.db, "status", fake_status)
     monkeypatch.setattr(process_ptg.db, "all", fake_all)
-    monkeypatch.setattr(process_ptg, "_table_exists", fake_table_exists)
-    monkeypatch.setattr(process_ptg, "_table_has_rows", AsyncMock(return_value=True))
+    monkeypatch.setattr(ptg_rust_publish, "_table_exists", fake_table_exists)
+    monkeypatch.setattr(ptg_rust_publish, "_table_has_rows", AsyncMock(return_value=True))
     async def fake_estimated_rows(_schema, _table_name):
         return 123
 
     estimate_mock = AsyncMock(side_effect=fake_estimated_rows)
     exact_mock = AsyncMock(return_value=987)
-    monkeypatch.setattr(process_ptg, "_estimated_table_rows", estimate_mock)
-    monkeypatch.setattr(process_ptg, "_exact_table_rows", exact_mock)
+    monkeypatch.setattr(ptg_rust_publish, "_estimated_table_rows", estimate_mock)
+    monkeypatch.setattr(ptg_rust_publish, "_exact_table_rows", exact_mock)
 
     result = asyncio.run(
         process_ptg._publish_rust_compact_snapshot_tables(
@@ -2633,10 +2642,10 @@ def test_ptg2_rust_snapshot_publish_inherits_serving_stage_lanes(monkeypatch):
 
     monkeypatch.setattr(process_ptg.db, "status", fake_status)
     monkeypatch.setattr(process_ptg.db, "all", fake_all)
-    monkeypatch.setattr(process_ptg, "_table_exists", fake_table_exists)
-    monkeypatch.setattr(process_ptg, "_table_has_rows", fake_table_has_rows)
-    monkeypatch.setattr(process_ptg, "_estimated_table_rows", fake_estimated_rows)
-    monkeypatch.setattr(process_ptg, "_exact_table_rows", fake_exact_rows)
+    monkeypatch.setattr(ptg_rust_publish, "_table_exists", fake_table_exists)
+    monkeypatch.setattr(ptg_rust_publish, "_table_has_rows", fake_table_has_rows)
+    monkeypatch.setattr(ptg_rust_publish, "_estimated_table_rows", fake_estimated_rows)
+    monkeypatch.setattr(ptg_rust_publish, "_exact_table_rows", fake_exact_rows)
 
     result = asyncio.run(
         process_ptg._publish_rust_compact_snapshot_tables(
