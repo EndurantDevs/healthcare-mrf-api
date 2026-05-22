@@ -12,6 +12,7 @@ from api import ptg2_types
 from api import ptg2_index_cache
 from api import ptg2_tables
 from api import ptg2_serving_utils
+from api import ptg2_code_details
 
 
 class FakeResult:
@@ -114,6 +115,10 @@ def test_ptg2_serving_utils_split_keeps_serving_facade_helpers_stable():
     assert ptg2_serving._provider_payload is ptg2_serving_utils._provider_payload
     assert ptg2_serving._row_mapping is ptg2_serving_utils._row_mapping
     assert ptg2_serving._price_filter_clauses is ptg2_serving_utils._price_filter_clauses
+
+
+def test_ptg2_code_details_split_keeps_serving_facade_helper_stable():
+    assert ptg2_serving._enrich_ptg2_code_details is ptg2_code_details._enrich_ptg2_code_details
 
 
 def _compact_tables(**overrides):
