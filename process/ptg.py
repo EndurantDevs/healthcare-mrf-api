@@ -410,6 +410,7 @@ from process.ptg_parts.snapshot_cleanup import (
 from process.ptg_parts.source_pointers import (
     _current_source_snapshot_id,
     _ptg2_plan_source_key,
+    _publish_ptg2_source_pointers,
     _source_plan_rows,
 )
 from process.ptg_parts.snapshot_artifacts import (
@@ -566,40 +567,6 @@ async def _iter_downloaded_ptg_jobs(
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
         executor.shutdown(wait=False, cancel_futures=True)
-
-
-async def _publish_ptg2_source_pointers(
-    *,
-    source_key: str,
-    snapshot_id: str,
-    previous_snapshot_id: str | None,
-    import_month: datetime.date,
-    updated_at: datetime.datetime,
-    serving_index: dict[str, Any] | None,
-) -> None:
-    await _push_ptg2_objects(
-        [
-            {
-                "source_key": source_key,
-                "snapshot_id": snapshot_id,
-                "previous_snapshot_id": previous_snapshot_id,
-                "import_month": import_month,
-                "updated_at": updated_at,
-            }
-        ],
-        PTG2CurrentSourceSnapshot,
-        rewrite=True,
-    )
-    plan_rows = await _source_plan_rows(
-        snapshot_id=snapshot_id,
-        source_key=source_key,
-        import_month=import_month,
-        previous_snapshot_id=previous_snapshot_id,
-        updated_at=updated_at,
-        serving_index=serving_index,
-    )
-    if plan_rows:
-        await _push_ptg2_objects(plan_rows, PTG2CurrentPlanSource, rewrite=True)
 
 
 async def _push_ptg2_objects(rows: list[dict[str, Any]], cls, rewrite: bool = True) -> None:

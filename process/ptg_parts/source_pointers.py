@@ -5,10 +5,11 @@ from __future__ import annotations
 
 import datetime
 import os
+import sys
 from typing import Any
 
 from db.connection import db
-from db.models import PTG2CurrentSourceSnapshot
+from db.models import PTG2CurrentPlanSource, PTG2CurrentSourceSnapshot
 from process.ptg_parts.canonical import semantic_hash
 from process.ptg_parts.db_tables import _quote_ident, _table_exists
 
@@ -33,6 +34,13 @@ async def _current_source_snapshot_id(source_key: str) -> str | None:
     if row is None:
         return None
     return str(row[0]) if row[0] else None
+
+
+async def _push_ptg2_objects_from_facade(rows: list[dict[str, Any]], cls, *, rewrite: bool = True) -> None:
+    ptg_module = sys.modules.get("process.ptg")
+    if ptg_module is None:
+        raise RuntimeError("process.ptg facade is not loaded")
+    await ptg_module._push_ptg2_objects(rows, cls, rewrite=rewrite)
 
 
 async def _source_plan_rows(
@@ -90,3 +98,37 @@ async def _source_plan_rows(
             }
         )
     return result
+
+
+async def _publish_ptg2_source_pointers(
+    *,
+    source_key: str,
+    snapshot_id: str,
+    previous_snapshot_id: str | None,
+    import_month: datetime.date,
+    updated_at: datetime.datetime,
+    serving_index: dict[str, Any] | None,
+) -> None:
+    await _push_ptg2_objects_from_facade(
+        [
+            {
+                "source_key": source_key,
+                "snapshot_id": snapshot_id,
+                "previous_snapshot_id": previous_snapshot_id,
+                "import_month": import_month,
+                "updated_at": updated_at,
+            }
+        ],
+        PTG2CurrentSourceSnapshot,
+        rewrite=True,
+    )
+    plan_rows = await _source_plan_rows(
+        snapshot_id=snapshot_id,
+        source_key=source_key,
+        import_month=import_month,
+        previous_snapshot_id=previous_snapshot_id,
+        updated_at=updated_at,
+        serving_index=serving_index,
+    )
+    if plan_rows:
+        await _push_ptg2_objects_from_facade(plan_rows, PTG2CurrentPlanSource, rewrite=True)
