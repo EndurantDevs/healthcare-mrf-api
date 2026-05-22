@@ -14,6 +14,11 @@ use ptg2_scanner::hashing::{
     make_checksum, semantic_hash, update_hash_optional_str, update_hash_string_list,
 };
 use ptg2_scanner::input::open_reader;
+use ptg2_scanner::normalize::{
+    canonical_text_list, int_list, normalize_code, normalize_string, normalize_tin_type,
+    normalize_tin_value, normalized_money_from_reader, normalized_scalar_from_reader,
+    normalized_string_list_from_reader,
+};
 use ptg2_scanner::progress::emit_progress;
 use serde_json::{json, Map, Value};
 use std::any::Any;
@@ -31,7 +36,7 @@ use std::sync::{
 };
 use std::thread;
 use std::time::Instant;
-use struson::reader::{JsonReader, JsonStreamReader, ValueType};
+use struson::reader::{JsonReader, JsonStreamReader};
 use xxhash_rust::xxh3::Xxh3;
 
 fn to_io_error(error: impl Display) -> io::Error {
@@ -474,170 +479,6 @@ fn log_worker_failure(worker_id: usize, failure_type: &str, message: &str) {
     eprintln!(
         "PTG2_SCANNER_WORKER_FAILED\tworker_id={worker_id}\ttype={failure_type}\terror={message}"
     );
-}
-
-fn normalize_string(value: Option<&Value>) -> Option<String> {
-    match value {
-        Some(Value::String(text)) => {
-            let trimmed = text.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
-        }
-        Some(Value::Number(number)) => Some(number.to_string()),
-        Some(Value::Bool(value)) => Some(value.to_string()),
-        _ => None,
-    }
-}
-
-fn normalize_code(value: Option<&Value>) -> Option<String> {
-    normalize_string(value).map(|value| value.to_uppercase())
-}
-
-fn normalize_tin_type(value: Option<&Value>) -> String {
-    normalize_string(value)
-        .unwrap_or_default()
-        .trim()
-        .to_lowercase()
-}
-
-fn normalize_tin_value(value: Option<&Value>) -> String {
-    normalize_string(value)
-        .unwrap_or_default()
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .collect::<String>()
-        .to_uppercase()
-}
-
-fn int_list(value: Option<&Value>) -> Vec<i64> {
-    let mut out = Vec::new();
-    match value {
-        Some(Value::Array(items)) => {
-            for item in items {
-                if let Some(text) = normalize_string(Some(item)) {
-                    if let Ok(number) = text.trim().parse::<i64>() {
-                        out.push(number);
-                    }
-                }
-            }
-        }
-        Some(item) => {
-            if let Some(text) = normalize_string(Some(item)) {
-                if let Ok(number) = text.trim().parse::<i64>() {
-                    out.push(number);
-                }
-            }
-        }
-        None => {}
-    }
-    out.sort_unstable();
-    out.dedup();
-    out
-}
-
-fn normalize_money_text(mut text: String) -> Option<String> {
-    if text.contains('.') {
-        while text.ends_with('0') {
-            text.pop();
-        }
-        if text.ends_with('.') {
-            text.pop();
-        }
-    }
-    if text.is_empty() {
-        None
-    } else {
-        Some(text)
-    }
-}
-
-fn normalized_scalar_from_reader<R: Read>(
-    json_reader: &mut JsonStreamReader<R>,
-) -> io::Result<Option<String>> {
-    match json_reader.peek().map_err(to_io_error)? {
-        ValueType::String => {
-            let text = json_reader.next_string().map_err(to_io_error)?;
-            let trimmed = text.trim();
-            if trimmed.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(trimmed.to_string()))
-            }
-        }
-        ValueType::Number => {
-            let text = json_reader.next_number_as_string().map_err(to_io_error)?;
-            if text.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(text))
-            }
-        }
-        ValueType::Boolean => Ok(Some(
-            json_reader.next_bool().map_err(to_io_error)?.to_string(),
-        )),
-        ValueType::Null => {
-            json_reader.next_null().map_err(to_io_error)?;
-            Ok(None)
-        }
-        ValueType::Array | ValueType::Object => {
-            json_reader.skip_value().map_err(to_io_error)?;
-            Ok(None)
-        }
-    }
-}
-
-fn normalized_money_from_reader<R: Read>(
-    json_reader: &mut JsonStreamReader<R>,
-) -> io::Result<Option<String>> {
-    Ok(normalized_scalar_from_reader(json_reader)?.and_then(normalize_money_text))
-}
-
-fn normalized_string_list_from_reader<R: Read>(
-    json_reader: &mut JsonStreamReader<R>,
-) -> io::Result<Vec<String>> {
-    let mut out = Vec::new();
-    match json_reader.peek().map_err(to_io_error)? {
-        ValueType::Array => {
-            json_reader.begin_array().map_err(to_io_error)?;
-            while json_reader.has_next().map_err(to_io_error)? {
-                if let Some(text) = normalized_scalar_from_reader(json_reader)? {
-                    out.push(text);
-                }
-            }
-            json_reader.end_array().map_err(to_io_error)?;
-        }
-        ValueType::Object => {
-            json_reader.skip_value().map_err(to_io_error)?;
-        }
-        _ => {
-            if let Some(text) = normalized_scalar_from_reader(json_reader)? {
-                out.push(text);
-            }
-        }
-    }
-    Ok(out)
-}
-
-fn canonical_text_list(values: Vec<String>, uppercase: bool) -> Vec<String> {
-    let mut out: Vec<String> = values
-        .into_iter()
-        .filter_map(|value| {
-            let trimmed = value.trim();
-            if trimmed.is_empty() {
-                None
-            } else if uppercase {
-                Some(trimmed.to_uppercase())
-            } else {
-                Some(trimmed.to_string())
-            }
-        })
-        .collect();
-    out.sort_unstable();
-    out.dedup();
-    out
 }
 
 fn provider_group_hash(tin: &Value, npi: &[i64]) -> i64 {
