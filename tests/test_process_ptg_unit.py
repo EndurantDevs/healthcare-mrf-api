@@ -27,6 +27,7 @@ ptg_domain = importlib.import_module("process.ptg_parts.domain")
 ptg_json_streams = importlib.import_module("process.ptg_parts.json_streams")
 ptg_row_helpers = importlib.import_module("process.ptg_parts.row_helpers")
 ptg_rust_scanner = importlib.import_module("process.ptg_parts.rust_scanner")
+ptg_rust_stage = importlib.import_module("process.ptg_parts.rust_stage")
 ptg_screen = importlib.import_module("process.ptg_parts.screen")
 ptg_serving_rows = importlib.import_module("process.ptg_parts.serving_rows")
 ptg_serving_only = importlib.import_module("process.ptg_parts.serving_only")
@@ -107,6 +108,18 @@ def test_rust_scanner_split_keeps_facade_helpers_stable():
     assert process_ptg._iter_top_level_object_bytes_rust is ptg_rust_scanner._iter_top_level_object_bytes_rust
     assert process_ptg._iter_compact_serving_records_rust is ptg_rust_scanner._iter_compact_serving_records_rust
     assert process_ptg._aiter_compact_serving_records_rust is ptg_rust_scanner._aiter_compact_serving_records_rust
+
+
+def test_rust_stage_split_keeps_facade_helpers_stable():
+    assert process_ptg.PTG2_SERVING_STAGE_LANE_PREFIX == ptg_rust_stage.PTG2_SERVING_STAGE_LANE_PREFIX
+    assert process_ptg._RUST_COPY_TABLE_SPECS is ptg_rust_stage._RUST_COPY_TABLE_SPECS
+    assert process_ptg._ptg2_dictionary_select_columns is ptg_rust_stage._ptg2_dictionary_select_columns
+    assert process_ptg._rust_copy_stage_table_name is ptg_rust_stage._rust_copy_stage_table_name
+    assert process_ptg._serving_stage_lane_key is ptg_rust_stage._serving_stage_lane_key
+    assert process_ptg._serving_stage_tables is ptg_rust_stage._serving_stage_tables
+    assert process_ptg._serving_stage_table_for_copy is ptg_rust_stage._serving_stage_table_for_copy
+    assert process_ptg._create_rust_copy_stage_tables is ptg_rust_stage._create_rust_copy_stage_tables
+    assert process_ptg._merge_rust_copy_stage_tables is ptg_rust_stage._merge_rust_copy_stage_tables
 
 
 def test_json_stream_split_keeps_facade_helpers_stable():
