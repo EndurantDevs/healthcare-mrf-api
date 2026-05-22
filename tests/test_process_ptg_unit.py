@@ -26,6 +26,7 @@ ptg_compact_indexes = importlib.import_module("process.ptg_parts.compact_indexes
 ptg_copy_load = importlib.import_module("process.ptg_parts.copy_load")
 ptg_db_tables = importlib.import_module("process.ptg_parts.db_tables")
 ptg_domain = importlib.import_module("process.ptg_parts.domain")
+ptg_import_rows = importlib.import_module("process.ptg_parts.import_rows")
 ptg_json_streams = importlib.import_module("process.ptg_parts.json_streams")
 ptg_progress = importlib.import_module("process.ptg_parts.progress")
 ptg_row_helpers = importlib.import_module("process.ptg_parts.row_helpers")
@@ -142,6 +143,21 @@ def test_copy_load_split_keeps_facade_helpers_stable():
     assert process_ptg._copy_compact_serving_rate_file is ptg_copy_load._copy_compact_serving_rate_file
     assert process_ptg._copy_compact_serving_rate_source is ptg_copy_load._copy_compact_serving_rate_source
     assert process_ptg._copy_ptg2_dictionary_file is ptg_copy_load._copy_ptg2_dictionary_file
+
+
+def test_import_row_split_keeps_facade_helpers_stable():
+    assert process_ptg._normalize_import_id is ptg_import_rows._normalize_import_id
+    assert process_ptg._ptg2_provider_group_rows is ptg_import_rows._ptg2_provider_group_rows
+    assert process_ptg._build_provider_set_entry is ptg_import_rows._build_provider_set_entry
+    assert process_ptg._combine_provider_set_entries is ptg_import_rows._combine_provider_set_entries
+    assert process_ptg._fast_provider_entry_from_parts is ptg_import_rows._fast_provider_entry_from_parts
+    assert process_ptg._fast_provider_entry_from_provider_refs is ptg_import_rows._fast_provider_entry_from_provider_refs
+    assert process_ptg._ptg2_provider_set_row is ptg_import_rows._ptg2_provider_set_row
+    assert process_ptg._ptg2_procedure_row is ptg_import_rows._ptg2_procedure_row
+    assert process_ptg._ptg2_price_atom_row is ptg_import_rows._ptg2_price_atom_row
+    assert process_ptg._ptg2_source_trace_rows is ptg_import_rows._ptg2_source_trace_rows
+    assert process_ptg._ptg2_context_row is ptg_import_rows._ptg2_context_row
+    assert process_ptg._ptg2_plan_rows is ptg_import_rows._ptg2_plan_rows
 
 
 def test_snapshot_table_split_keeps_facade_helpers_stable():
