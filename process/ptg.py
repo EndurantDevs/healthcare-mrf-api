@@ -435,9 +435,12 @@ from process.ptg_parts.source_jobs import (
     parse_toc_catalog_entries,
 )
 from process.ptg_parts.source_download import (
+    _download_ptg_job_artifact,
+    _download_ptg_job_artifact_sync,
     _download_raw_artifact_ranges,
     _emit_download_progress,
     _format_eta_seconds,
+    _iter_downloaded_ptg_jobs,
     _probe_http_range_support,
     download_raw_artifact,
     fetch_head_metadata,
@@ -480,93 +483,6 @@ from process.ptg_parts.values import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-async def _download_ptg_job_artifact(
-    job: dict[str, Any],
-    *,
-    reuse_raw_artifacts: bool,
-    max_bytes: int | None,
-    keep_partial_artifacts: bool | None,
-) -> PTG2DownloadedJob:
-    try:
-        with tempfile.TemporaryDirectory(dir=ptg2_temp_parent()) as tmpdir:
-            raw_artifact, logical_artifact = await materialize_json_source(
-                job["url"],
-                tmpdir,
-                reuse_raw_artifacts=reuse_raw_artifacts,
-                max_bytes=max_bytes,
-                materialize_logical=False,
-                keep_partial_artifacts=keep_partial_artifacts,
-            )
-        return PTG2DownloadedJob(job=job, raw_artifact=raw_artifact, logical_artifact=logical_artifact)
-    except Exception as exc:
-        return PTG2DownloadedJob(job=job, error=str(exc))
-
-
-def _download_ptg_job_artifact_sync(
-    job: dict[str, Any],
-    *,
-    reuse_raw_artifacts: bool,
-    max_bytes: int | None,
-    keep_partial_artifacts: bool | None,
-) -> PTG2DownloadedJob:
-    return asyncio.run(
-        _download_ptg_job_artifact(
-            job,
-            reuse_raw_artifacts=reuse_raw_artifacts,
-            max_bytes=max_bytes,
-            keep_partial_artifacts=keep_partial_artifacts,
-        )
-    )
-
-
-async def _iter_downloaded_ptg_jobs(
-    jobs: list[dict[str, Any]],
-    *,
-    reuse_raw_artifacts: bool,
-    max_bytes: int | None,
-    keep_partial_artifacts: bool | None,
-):
-    download_tasks = max(_env_int(PTG2_DOWNLOAD_TASKS_ENV, PTG2_DEFAULT_DOWNLOAD_TASKS), 1)
-    executor = concurrent.futures.ThreadPoolExecutor(
-        max_workers=download_tasks,
-        thread_name_prefix="ptg2-download",
-    )
-    pending: set[asyncio.Future[PTG2DownloadedJob]] = set()
-    job_iter = iter(jobs)
-
-    def schedule_more() -> None:
-        while len(pending) < download_tasks:
-            try:
-                job = next(job_iter)
-            except StopIteration:
-                return
-            pending.add(
-                asyncio.wrap_future(
-                    executor.submit(
-                        _download_ptg_job_artifact_sync,
-                        job,
-                        reuse_raw_artifacts=reuse_raw_artifacts,
-                        max_bytes=max_bytes,
-                        keep_partial_artifacts=keep_partial_artifacts,
-                    )
-                )
-            )
-
-    schedule_more()
-    try:
-        while pending:
-            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-            schedule_more()
-            for task in done:
-                yield task.result()
-    finally:
-        for task in pending:
-            task.cancel()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-        executor.shutdown(wait=False, cancel_futures=True)
 
 
 async def _push_ptg2_objects(rows: list[dict[str, Any]], cls, rewrite: bool = True) -> None:

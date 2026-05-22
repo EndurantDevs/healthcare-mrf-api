@@ -226,6 +226,9 @@ def test_source_download_split_keeps_facade_helpers_stable():
     assert process_ptg.fetch_head_metadata is ptg_source_download.fetch_head_metadata
     assert process_ptg._probe_http_range_support is ptg_source_download._probe_http_range_support
     assert process_ptg._download_raw_artifact_ranges is ptg_source_download._download_raw_artifact_ranges
+    assert process_ptg._download_ptg_job_artifact is ptg_source_download._download_ptg_job_artifact
+    assert process_ptg._download_ptg_job_artifact_sync is ptg_source_download._download_ptg_job_artifact_sync
+    assert process_ptg._iter_downloaded_ptg_jobs is ptg_source_download._iter_downloaded_ptg_jobs
     assert process_ptg.download_raw_artifact is ptg_source_download.download_raw_artifact
     assert process_ptg.materialize_json_source is ptg_source_download.materialize_json_source
 
