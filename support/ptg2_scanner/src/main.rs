@@ -19,6 +19,7 @@ use ptg2_scanner::normalize::{
     normalize_tin_value, normalized_money_from_reader, normalized_scalar_from_reader,
     normalized_string_list_from_reader,
 };
+use ptg2_scanner::output::{emit_json_record, emit_object};
 use ptg2_scanner::progress::emit_progress;
 use serde_json::{json, Map, Value};
 use std::any::Any;
@@ -41,16 +42,6 @@ use xxhash_rust::xxh3::Xxh3;
 
 fn to_io_error(error: impl Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
-}
-
-fn emit_object<W: Write>(writer: &mut W, name: &str, payload: &[u8]) -> io::Result<()> {
-    writer.write_all(name.as_bytes())?;
-    writer.write_all(b"\t")?;
-    writer.write_all(payload.len().to_string().as_bytes())?;
-    writer.write_all(b"\n")?;
-    writer.write_all(payload)?;
-    writer.write_all(b"\n")?;
-    Ok(())
 }
 
 fn scan(path: &Path, requested: &[String]) -> io::Result<()> {
@@ -643,21 +634,6 @@ fn price_lite_set(
         atoms,
         price_atom_hashes: unique_hashes,
     })
-}
-
-fn emit_json_record<W: Write>(writer: &mut W, kind: &str, row: &Value) -> io::Result<()> {
-    let payload = serde_json::to_vec(row)?;
-    emit_raw_record(writer, kind, &payload)
-}
-
-fn emit_raw_record<W: Write>(writer: &mut W, kind: &str, payload: &[u8]) -> io::Result<()> {
-    writer.write_all(kind.as_bytes())?;
-    writer.write_all(b"\t")?;
-    writer.write_all(payload.len().to_string().as_bytes())?;
-    writer.write_all(b"\n")?;
-    writer.write_all(payload)?;
-    writer.write_all(b"\n")?;
-    Ok(())
 }
 
 struct CompactCopySink {
