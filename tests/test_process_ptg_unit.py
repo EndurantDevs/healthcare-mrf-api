@@ -45,6 +45,7 @@ ptg_source_download = importlib.import_module("process.ptg_parts.source_download
 ptg_source_files = importlib.import_module("process.ptg_parts.source_files")
 ptg_source_jobs = importlib.import_module("process.ptg_parts.source_jobs")
 ptg_source_pointers = importlib.import_module("process.ptg_parts.source_pointers")
+ptg_source_versions = importlib.import_module("process.ptg_parts.source_versions")
 ptg_table_setup = importlib.import_module("process.ptg_parts.table_setup")
 ptg_values = importlib.import_module("process.ptg_parts.values")
 
@@ -217,6 +218,10 @@ def test_source_file_split_keeps_facade_helpers_stable():
     assert process_ptg._extract_metadata_fields is ptg_source_files._extract_metadata_fields
     assert process_ptg._derive_plan_fields is ptg_source_files._derive_plan_fields
     assert process_ptg._build_file_row is ptg_source_files._build_file_row
+
+
+def test_source_version_split_keeps_facade_helpers_stable():
+    assert process_ptg._record_source_version is ptg_source_versions._record_source_version
 
 
 def test_table_setup_split_keeps_facade_helpers_stable():
