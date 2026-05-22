@@ -60,3 +60,51 @@ pub fn open_reader(
         )))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::{write::GzEncoder, Compression};
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_path(suffix: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("ptg2_scanner_input_test_{nanos}_{suffix}"))
+    }
+
+    #[test]
+    fn open_reader_reads_plain_files_and_counts_bytes() {
+        let path = temp_path("plain.json");
+        std::fs::write(&path, b"{\"ok\":true}").expect("write plain test file");
+        let bytes_read = Arc::new(AtomicU64::new(0));
+        let mut reader = open_reader(&path, Arc::clone(&bytes_read)).expect("open plain reader");
+        let mut text = String::new();
+        reader.read_to_string(&mut text).expect("read plain file");
+        assert_eq!(text, "{\"ok\":true}");
+        assert_eq!(bytes_read.load(Ordering::Relaxed), 11);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn open_reader_decompresses_gzip_files_and_counts_compressed_bytes() {
+        let path = temp_path("compressed.json.gz");
+        let file = File::create(&path).expect("create gzip test file");
+        let mut encoder = GzEncoder::new(file, Compression::default());
+        encoder
+            .write_all(b"{\"ok\":true}")
+            .expect("write gzip payload");
+        encoder.finish().expect("finish gzip payload");
+
+        let bytes_read = Arc::new(AtomicU64::new(0));
+        let mut reader = open_reader(&path, Arc::clone(&bytes_read)).expect("open gzip reader");
+        let mut text = String::new();
+        reader.read_to_string(&mut text).expect("read gzip file");
+        assert_eq!(text, "{\"ok\":true}");
+        assert!(bytes_read.load(Ordering::Relaxed) > 0);
+        std::fs::remove_file(path).ok();
+    }
+}

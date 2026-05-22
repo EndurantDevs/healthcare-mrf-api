@@ -1279,9 +1279,23 @@ fn emit_raw_record<W: Write>(writer: &mut W, kind: &str, payload: &[u8]) -> io::
     writer.write_all(b"\t")?;
     writer.write_all(payload.len().to_string().as_bytes())?;
     writer.write_all(b"\n")?;
-    writer.write_all(&payload)?;
+    writer.write_all(payload)?;
     writer.write_all(b"\n")?;
     Ok(())
+}
+
+struct CompactCopyRow<'a> {
+    serving_rate_id: &'a str,
+    snapshot_id: &'a str,
+    plan_id: &'a str,
+    procedure_hash: &'a str,
+    procedure_code: Option<i64>,
+    reported_code_system: Option<&'a str>,
+    reported_code: Option<&'a str>,
+    provider_set_hash: &'a str,
+    provider_count: i64,
+    price_set_hash: &'a str,
+    source_trace_set_hash: &'a str,
 }
 
 struct CompactCopySink {
@@ -1326,37 +1340,11 @@ impl CompactCopySink {
         ))
     }
 
-    fn write_row(
-        &mut self,
-        serving_rate_id: &str,
-        snapshot_id: &str,
-        plan_id: &str,
-        procedure_hash: &str,
-        procedure_code: Option<i64>,
-        reported_code_system: Option<&str>,
-        reported_code: Option<&str>,
-        provider_set_hash: &str,
-        provider_count: i64,
-        price_set_hash: &str,
-        source_trace_set_hash: &str,
-    ) -> io::Result<()> {
+    fn write_row(&mut self, row: &CompactCopyRow<'_>) -> io::Result<()> {
         let writer = self.writer.as_mut().ok_or_else(|| {
             io::Error::new(io::ErrorKind::BrokenPipe, "compact copy writer is closed")
         })?;
-        emit_compact_copy_row(
-            writer,
-            serving_rate_id,
-            snapshot_id,
-            plan_id,
-            procedure_hash,
-            procedure_code,
-            reported_code_system,
-            reported_code,
-            provider_set_hash,
-            provider_count,
-            price_set_hash,
-            source_trace_set_hash,
-        )?;
+        emit_compact_copy_row(writer, row)?;
         self.row_count += 1;
         Ok(())
     }
@@ -2309,64 +2297,106 @@ fn write_copy_text_fields<W: Write>(writer: &mut W, fields: &[Option<&str>]) -> 
     Ok(())
 }
 
-fn emit_compact_copy_row<W: Write>(
-    writer: &mut W,
-    serving_rate_id: &str,
-    snapshot_id: &str,
-    plan_id: &str,
-    procedure_hash: &str,
-    procedure_code: Option<i64>,
-    reported_code_system: Option<&str>,
-    reported_code: Option<&str>,
-    provider_set_hash: &str,
-    provider_count: i64,
-    price_set_hash: &str,
-    source_trace_set_hash: &str,
-) -> io::Result<()> {
-    let procedure_code_text = procedure_code.map(|value| value.to_string());
-    let provider_count_text = provider_count.to_string();
+fn emit_compact_copy_row<W: Write>(writer: &mut W, row: &CompactCopyRow<'_>) -> io::Result<()> {
+    let procedure_code_text = row.procedure_code.map(|value| value.to_string());
+    let provider_count_text = row.provider_count.to_string();
     write_copy_text_fields(
         writer,
         &[
-            Some(serving_rate_id),
-            Some(snapshot_id),
-            Some(plan_id),
-            Some(procedure_hash),
+            Some(row.serving_rate_id),
+            Some(row.snapshot_id),
+            Some(row.plan_id),
+            Some(row.procedure_hash),
             procedure_code_text.as_deref(),
-            reported_code_system,
-            reported_code,
-            Some(provider_set_hash),
+            row.reported_code_system,
+            row.reported_code,
+            Some(row.provider_set_hash),
             Some(&provider_count_text),
-            Some(price_set_hash),
-            Some(source_trace_set_hash),
+            Some(row.price_set_hash),
+            Some(row.source_trace_set_hash),
         ],
     )
 }
 
+type ParsedCompactRate = (PriceSetLite, i64, Vec<i64>, i64);
+type ProviderEntryComponents = BTreeMap<i64, Vec<i64>>;
+
+struct GroupedPriceSet {
+    price_set: PriceSetLite,
+    provider_entry_hashes: HashSet<i64>,
+    provider_group_hashes: HashSet<i64>,
+    provider_count: i64,
+    provider_entry_components: ProviderEntryComponents,
+}
+
+impl
+    From<(
+        PriceSetLite,
+        HashSet<i64>,
+        HashSet<i64>,
+        i64,
+        ProviderEntryComponents,
+    )> for GroupedPriceSet
+{
+    fn from(
+        value: (
+            PriceSetLite,
+            HashSet<i64>,
+            HashSet<i64>,
+            i64,
+            ProviderEntryComponents,
+        ),
+    ) -> Self {
+        Self {
+            price_set: value.0,
+            provider_entry_hashes: value.1,
+            provider_group_hashes: value.2,
+            provider_count: value.3,
+            provider_entry_components: value.4,
+        }
+    }
+}
+
+struct LocalCompactOutputs<'a, W: Write> {
+    writer: &'a mut W,
+    compact_copy_writer: &'a mut Option<CompactCopySink>,
+    dictionary_copy_sinks: &'a mut DictionaryCopySinks,
+}
+
+struct LocalCompactDedupe<'a> {
+    price_code_sets: &'a mut HashSet<String>,
+    price_atoms: &'a mut HashSet<String>,
+    price_sets: &'a mut HashSet<String>,
+    price_set_entries: &'a mut HashSet<(String, String)>,
+    provider_sets: &'a mut HashSet<String>,
+    provider_set_components: &'a mut HashSet<(String, i64)>,
+    provider_set_entries: &'a mut HashSet<(String, i64)>,
+    provider_entry_components: &'a mut HashSet<(i64, i64)>,
+    procedures: &'a mut HashSet<String>,
+    provider_group_members: &'a mut HashSet<(i64, i64)>,
+}
+
+struct CompactRateBatch<'a> {
+    provider_map: &'a HashMap<String, ProviderEntry>,
+    price_code_set_hash_cache: &'a mut PriceCodeSetHashCache,
+    rates: &'a [RateLite],
+    procedure_value: &'a Value,
+    context: &'a CompactContext,
+}
+
 fn process_compact_rate_lites<W: Write>(
-    writer: &mut W,
-    compact_copy_writer: &mut Option<CompactCopySink>,
-    dictionary_copy_sinks: &mut DictionaryCopySinks,
-    provider_map: &HashMap<String, ProviderEntry>,
-    emitted_price_code_sets: &mut HashSet<String>,
-    emitted_price_atoms: &mut HashSet<String>,
-    emitted_price_sets: &mut HashSet<String>,
-    emitted_price_set_entries: &mut HashSet<(String, String)>,
-    emitted_provider_sets: &mut HashSet<String>,
-    emitted_provider_set_components: &mut HashSet<(String, i64)>,
-    emitted_provider_set_entries: &mut HashSet<(String, i64)>,
-    emitted_provider_entry_components: &mut HashSet<(i64, i64)>,
-    emitted_procedures: &mut HashSet<String>,
-    emitted_provider_group_members: &mut HashSet<(i64, i64)>,
-    price_code_set_hash_cache: &mut PriceCodeSetHashCache,
-    rates: &[RateLite],
-    procedure_value: &Value,
-    snapshot_id: &str,
-    plan_id: &str,
-    plan_month_id: &str,
-    source_trace_set_hash: &str,
-    confidence_code: &str,
+    outputs: &mut LocalCompactOutputs<'_, W>,
+    dedupe: &mut LocalCompactDedupe<'_>,
+    batch: &mut CompactRateBatch<'_>,
 ) -> io::Result<()> {
+    let writer = &mut outputs.writer;
+    let compact_copy_writer = &mut outputs.compact_copy_writer;
+    let dictionary_copy_sinks = &mut outputs.dictionary_copy_sinks;
+    let provider_map = batch.provider_map;
+    let price_code_set_hash_cache = &mut batch.price_code_set_hash_cache;
+    let rates = batch.rates;
+    let procedure_value = batch.procedure_value;
+    let context = batch.context;
     if rates.is_empty() {
         return Ok(());
     }
@@ -2383,35 +2413,35 @@ fn process_compact_rate_lites<W: Write>(
         "description": procedure_value.get("description").cloned().unwrap_or(Value::Null),
     });
     let procedure_hash = semantic_hash("procedure", procedure_payload.clone());
-    if emitted_procedures.insert(procedure_hash.clone()) {
-        if !dictionary_copy_sinks.write_procedure(
+    if dedupe.procedures.insert(procedure_hash.clone())
+        && !dictionary_copy_sinks.write_procedure(
             &procedure_hash,
             procedure_value,
             &procedure_payload,
-        )? {
-            emit_json_record(
-                writer,
-                "procedure",
-                &json!({
-                    "procedure_hash": procedure_hash,
-                    "hash_prefix": &procedure_hash[..procedure_hash.len().min(16)],
-                    "billing_code_type": procedure_value.get("billing_code_type").cloned().unwrap_or(Value::Null),
-                    "billing_code_type_version": procedure_value.get("billing_code_type_version").cloned().unwrap_or(Value::Null),
-                    "billing_code": procedure_value.get("billing_code").cloned().unwrap_or(Value::Null),
-                    "name": procedure_value.get("name").cloned().unwrap_or(Value::Null),
-                    "description": procedure_value.get("description").cloned().unwrap_or(Value::Null),
-                    "canonical_payload": procedure_payload,
-                }),
-            )?;
-        }
+        )?
+    {
+        emit_json_record(
+            writer,
+            "procedure",
+            &json!({
+                "procedure_hash": procedure_hash,
+                "hash_prefix": &procedure_hash[..procedure_hash.len().min(16)],
+                "billing_code_type": procedure_value.get("billing_code_type").cloned().unwrap_or(Value::Null),
+                "billing_code_type_version": procedure_value.get("billing_code_type_version").cloned().unwrap_or(Value::Null),
+                "billing_code": procedure_value.get("billing_code").cloned().unwrap_or(Value::Null),
+                "name": procedure_value.get("name").cloned().unwrap_or(Value::Null),
+                "description": procedure_value.get("description").cloned().unwrap_or(Value::Null),
+                "canonical_payload": procedure_payload,
+            }),
+        )?;
     }
 
-    let mut parsed_rates: Vec<(PriceSetLite, i64, Vec<i64>, i64)> = Vec::new();
+    let mut parsed_rates: Vec<ParsedCompactRate> = Vec::new();
     for rate in rates {
         let provider_entry = if !rate.provider_groups.is_empty() {
             let provider_ref = json!({"provider_groups": rate.provider_groups});
             dictionary_copy_sinks
-                .write_provider_group_members(&provider_ref, emitted_provider_group_members)?;
+                .write_provider_group_members(&provider_ref, dedupe.provider_group_members)?;
             match build_provider_entry(&provider_ref) {
                 Some(entry) => entry,
                 None => continue,
@@ -2435,48 +2465,33 @@ fn process_compact_rate_lites<W: Write>(
 
     let group_negotiated_rate_chunks =
         env_bool("HLTHPRT_PTG2_RUST_GROUP_NEGOTIATED_RATE_CHUNKS", false);
-    let grouped: Vec<(
-        PriceSetLite,
-        HashSet<i64>,
-        HashSet<i64>,
-        i64,
-        BTreeMap<i64, Vec<i64>>,
-    )> = if group_negotiated_rate_chunks {
-        let mut by_price_set: BTreeMap<
-            String,
-            (
-                PriceSetLite,
-                HashSet<i64>,
-                HashSet<i64>,
-                i64,
-                BTreeMap<i64, Vec<i64>>,
-            ),
-        > = BTreeMap::new();
+    let grouped: Vec<GroupedPriceSet> = if group_negotiated_rate_chunks {
+        let mut by_price_set: BTreeMap<String, GroupedPriceSet> = BTreeMap::new();
         for (price_set, provider_entry_hash, provider_group_hashes, provider_count) in parsed_rates
         {
             let group = by_price_set
                 .entry(price_set.price_set_hash.clone())
-                .or_insert_with(|| {
-                    (
-                        price_set,
-                        HashSet::new(),
-                        HashSet::new(),
-                        0,
-                        BTreeMap::new(),
-                    )
+                .or_insert_with(|| GroupedPriceSet {
+                    price_set,
+                    provider_entry_hashes: HashSet::new(),
+                    provider_group_hashes: HashSet::new(),
+                    provider_count: 0,
+                    provider_entry_components: BTreeMap::new(),
                 });
-            if group.1.insert(provider_entry_hash) {
+            if group.provider_entry_hashes.insert(provider_entry_hash) {
                 let mut sorted_components = provider_group_hashes;
                 sorted_components.sort_unstable();
                 sorted_components.dedup();
                 for provider_group_hash in &sorted_components {
-                    group.2.insert(*provider_group_hash);
+                    group.provider_group_hashes.insert(*provider_group_hash);
                 }
-                group.3 += provider_count;
-                group.4.insert(provider_entry_hash, sorted_components);
+                group.provider_count += provider_count;
+                group
+                    .provider_entry_components
+                    .insert(provider_entry_hash, sorted_components);
             } else {
                 for provider_group_hash in provider_group_hashes {
-                    group.2.insert(provider_group_hash);
+                    group.provider_group_hashes.insert(provider_group_hash);
                 }
             }
         }
@@ -2496,67 +2511,64 @@ fn process_compact_rate_lites<W: Write>(
                         .collect::<HashSet<_>>();
                     let mut provider_entry_components = BTreeMap::new();
                     provider_entry_components.insert(provider_entry_hash, provider_group_hashes);
-                    (
+                    GroupedPriceSet {
                         price_set,
                         provider_entry_hashes,
-                        provider_group_hashes_set,
+                        provider_group_hashes: provider_group_hashes_set,
                         provider_count,
                         provider_entry_components,
-                    )
+                    }
                 },
             )
             .collect()
     };
 
-    for (
-        price_set,
-        _provider_entry_hashes,
-        provider_group_hashes,
-        provider_count,
-        provider_entry_components,
-    ) in grouped
-    {
+    for group in grouped {
         let mut sorted_provider_entry_hashes: Vec<i64> =
-            _provider_entry_hashes.into_iter().collect();
+            group.provider_entry_hashes.into_iter().collect();
         sorted_provider_entry_hashes.sort_unstable();
-        let mut sorted_provider_hashes: Vec<i64> = provider_group_hashes.into_iter().collect();
+        let mut sorted_provider_hashes: Vec<i64> =
+            group.provider_group_hashes.into_iter().collect();
         sorted_provider_hashes.sort_unstable();
         let provider_set_hash = hash_i64_list("provider_set", &sorted_provider_entry_hashes);
         let rate_pack_hash = hash_text(
             "serving_rate_pack",
             &[
-                snapshot_id.to_string(),
+                context.snapshot_id.clone(),
                 procedure_hash.clone(),
                 provider_set_hash.clone(),
-                price_set.price_set_hash.clone(),
+                group.price_set.price_set_hash.clone(),
             ],
         );
         let serving_rate_id = hash_text(
             "serving_rate_id",
             &[
-                snapshot_id.to_string(),
-                plan_id.to_string(),
+                context.snapshot_id.clone(),
+                context.plan_id.clone(),
                 billing_code.clone(),
                 rate_pack_hash.clone(),
             ],
         );
-        let price_set_hash = price_set.price_set_hash.clone();
-        if emitted_price_sets.insert(price_set.price_set_hash.clone()) {
+        let price_set_hash = group.price_set.price_set_hash.clone();
+        if dedupe
+            .price_sets
+            .insert(group.price_set.price_set_hash.clone())
+        {
             dictionary_copy_sinks.write_price_atoms(
-                &price_set.atoms,
-                emitted_price_code_sets,
-                emitted_price_atoms,
+                &group.price_set.atoms,
+                dedupe.price_code_sets,
+                dedupe.price_atoms,
             )?;
             dictionary_copy_sinks.write_price_set_entries(
-                &price_set.price_set_hash,
-                &price_set.price_atom_hashes,
-                emitted_price_set_entries,
+                &group.price_set.price_set_hash,
+                &group.price_set.price_atom_hashes,
+                dedupe.price_set_entries,
             )?;
         }
-        if emitted_provider_sets.insert(provider_set_hash.clone()) {
+        if dedupe.provider_sets.insert(provider_set_hash.clone()) {
             if !dictionary_copy_sinks.write_provider_set(
                 &provider_set_hash,
-                provider_count,
+                group.provider_count,
                 &sorted_provider_hashes,
             )? {
                 emit_json_record(
@@ -2565,14 +2577,14 @@ fn process_compact_rate_lites<W: Write>(
                     &json!({
                         "provider_set_hash": provider_set_hash,
                         "hash_prefix": &provider_set_hash[..provider_set_hash.len().min(16)],
-                        "provider_count": provider_count,
+                        "provider_count": group.provider_count,
                         "npi": Value::Null,
                         "tin_type": "set",
                         "tin_value": Value::Null,
                         "canonical_payload": {
                             "provider_group_hashes": sorted_provider_hashes,
                             "provider_group_count": sorted_provider_hashes.len(),
-                            "provider_count": provider_count,
+                            "provider_count": group.provider_count,
                             "provider_count_mode": "summed_provider_groups",
                             "npi_inline": false,
                             "tin_type": "set",
@@ -2584,48 +2596,49 @@ fn process_compact_rate_lites<W: Write>(
             dictionary_copy_sinks.write_provider_set_entries(
                 &provider_set_hash,
                 &sorted_provider_entry_hashes,
-                emitted_provider_set_entries,
+                dedupe.provider_set_entries,
             )?;
             dictionary_copy_sinks.write_provider_set_components(
                 &provider_set_hash,
                 &sorted_provider_hashes,
-                emitted_provider_set_components,
+                dedupe.provider_set_components,
             )?;
             for provider_entry_hash in &sorted_provider_entry_hashes {
-                let components = provider_entry_components
+                let components = group
+                    .provider_entry_components
                     .get(provider_entry_hash)
                     .map(Vec::as_slice)
                     .unwrap_or(&[]);
                 dictionary_copy_sinks.write_provider_entry_components(
                     *provider_entry_hash,
                     components,
-                    emitted_provider_entry_components,
+                    dedupe.provider_entry_components,
                 )?;
             }
         }
         if let Some(copy_writer) = compact_copy_writer.as_mut() {
-            copy_writer.write_row(
-                &serving_rate_id,
-                snapshot_id,
-                plan_id,
-                &procedure_hash,
-                None,
-                reported_code_system.as_deref(),
-                reported_code.as_deref(),
-                &provider_set_hash,
-                provider_count,
-                &price_set_hash,
-                source_trace_set_hash,
-            )?;
+            copy_writer.write_row(&CompactCopyRow {
+                serving_rate_id: &serving_rate_id,
+                snapshot_id: &context.snapshot_id,
+                plan_id: &context.plan_id,
+                procedure_hash: &procedure_hash,
+                procedure_code: None,
+                reported_code_system: reported_code_system.as_deref(),
+                reported_code: reported_code.as_deref(),
+                provider_set_hash: &provider_set_hash,
+                provider_count: group.provider_count,
+                price_set_hash: &price_set_hash,
+                source_trace_set_hash: &context.source_trace_set_hash,
+            })?;
         } else {
             emit_json_record(
                 writer,
                 "serving_rate_compact",
                 &json!({
                     "serving_rate_id": serving_rate_id,
-                    "snapshot_id": snapshot_id,
-                    "plan_id": plan_id,
-                    "plan_month_id": plan_month_id,
+                    "snapshot_id": context.snapshot_id.clone(),
+                    "plan_id": context.plan_id.clone(),
+                    "plan_month_id": context.plan_month_id.clone(),
                     "procedure_hash": procedure_hash,
                     "procedure_code": Value::Null,
                     "reported_code_system": reported_code_system,
@@ -2634,10 +2647,10 @@ fn process_compact_rate_lites<W: Write>(
                     "billing_code_type": billing_code_type,
                     "rate_pack_hash": rate_pack_hash,
                     "provider_set_hash": provider_set_hash,
-                    "provider_count": provider_count,
+                    "provider_count": group.provider_count,
                     "price_set_hash": price_set_hash,
-                    "source_trace_set_hash": source_trace_set_hash,
-                    "confidence_code": confidence_code,
+                    "source_trace_set_hash": context.source_trace_set_hash.clone(),
+                    "confidence_code": context.confidence_code.clone(),
                 }),
             )?;
         }
@@ -2682,17 +2695,28 @@ fn process_provider_refs_worker(
     Ok(())
 }
 
+struct SharedCompactState<'a, W: Write> {
+    writer: &'a mut W,
+    compact_copy_writer: &'a mut Option<CompactCopySink>,
+    dictionary_copy_sinks: &'a mut DictionaryCopySinks,
+    provider_map: &'a HashMap<String, ProviderEntry>,
+    dedupe: &'a SharedDedupe,
+    price_code_set_hash_cache: &'a mut PriceCodeSetHashCache,
+    context: &'a CompactContext,
+}
+
 fn process_compact_rate_lites_worker<W: Write>(
-    writer: &mut W,
-    compact_copy_writer: &mut Option<CompactCopySink>,
-    dictionary_copy_sinks: &mut DictionaryCopySinks,
-    provider_map: &HashMap<String, ProviderEntry>,
-    dedupe: &SharedDedupe,
-    price_code_set_hash_cache: &mut PriceCodeSetHashCache,
+    state: &mut SharedCompactState<'_, W>,
     rates: &[RateLite],
     procedure_value: &Value,
-    context: &CompactContext,
 ) -> io::Result<()> {
+    let writer = &mut state.writer;
+    let compact_copy_writer = &mut state.compact_copy_writer;
+    let dictionary_copy_sinks = &mut state.dictionary_copy_sinks;
+    let provider_map = state.provider_map;
+    let dedupe = state.dedupe;
+    let price_code_set_hash_cache = &mut state.price_code_set_hash_cache;
+    let context = state.context;
     if rates.is_empty() {
         return Ok(());
     }
@@ -2709,30 +2733,30 @@ fn process_compact_rate_lites_worker<W: Write>(
         "description": procedure_value.get("description").cloned().unwrap_or(Value::Null),
     });
     let procedure_hash = semantic_hash("procedure", procedure_payload.clone());
-    if dedupe.insert_procedure(&procedure_hash) {
-        if !dictionary_copy_sinks.write_procedure(
+    if dedupe.insert_procedure(&procedure_hash)
+        && !dictionary_copy_sinks.write_procedure(
             &procedure_hash,
             procedure_value,
             &procedure_payload,
-        )? {
-            emit_json_record(
-                writer,
-                "procedure",
-                &json!({
-                    "procedure_hash": procedure_hash,
-                    "hash_prefix": &procedure_hash[..procedure_hash.len().min(16)],
-                    "billing_code_type": procedure_value.get("billing_code_type").cloned().unwrap_or(Value::Null),
-                    "billing_code_type_version": procedure_value.get("billing_code_type_version").cloned().unwrap_or(Value::Null),
-                    "billing_code": procedure_value.get("billing_code").cloned().unwrap_or(Value::Null),
-                    "name": procedure_value.get("name").cloned().unwrap_or(Value::Null),
-                    "description": procedure_value.get("description").cloned().unwrap_or(Value::Null),
-                    "canonical_payload": procedure_payload,
-                }),
-            )?;
-        }
+        )?
+    {
+        emit_json_record(
+            writer,
+            "procedure",
+            &json!({
+                "procedure_hash": procedure_hash,
+                "hash_prefix": &procedure_hash[..procedure_hash.len().min(16)],
+                "billing_code_type": procedure_value.get("billing_code_type").cloned().unwrap_or(Value::Null),
+                "billing_code_type_version": procedure_value.get("billing_code_type_version").cloned().unwrap_or(Value::Null),
+                "billing_code": procedure_value.get("billing_code").cloned().unwrap_or(Value::Null),
+                "name": procedure_value.get("name").cloned().unwrap_or(Value::Null),
+                "description": procedure_value.get("description").cloned().unwrap_or(Value::Null),
+                "canonical_payload": procedure_payload,
+            }),
+        )?;
     }
 
-    let parsed_rates: Vec<(PriceSetLite, i64, Vec<i64>, i64)> = rates
+    let parsed_rates: Vec<ParsedCompactRate> = rates
         .iter()
         .filter_map(|rate| {
             let provider_entry = provider_set_from_ref_keys(provider_map, &rate.provider_refs)?;
@@ -2748,48 +2772,33 @@ fn process_compact_rate_lites_worker<W: Write>(
 
     let group_negotiated_rate_chunks =
         env_bool("HLTHPRT_PTG2_RUST_GROUP_NEGOTIATED_RATE_CHUNKS", false);
-    let grouped: Vec<(
-        PriceSetLite,
-        HashSet<i64>,
-        HashSet<i64>,
-        i64,
-        BTreeMap<i64, Vec<i64>>,
-    )> = if group_negotiated_rate_chunks {
-        let mut by_price_set: BTreeMap<
-            String,
-            (
-                PriceSetLite,
-                HashSet<i64>,
-                HashSet<i64>,
-                i64,
-                BTreeMap<i64, Vec<i64>>,
-            ),
-        > = BTreeMap::new();
+    let grouped: Vec<GroupedPriceSet> = if group_negotiated_rate_chunks {
+        let mut by_price_set: BTreeMap<String, GroupedPriceSet> = BTreeMap::new();
         for (price_set, provider_entry_hash, provider_group_hashes, provider_count) in parsed_rates
         {
             let group = by_price_set
                 .entry(price_set.price_set_hash.clone())
-                .or_insert_with(|| {
-                    (
-                        price_set,
-                        HashSet::new(),
-                        HashSet::new(),
-                        0,
-                        BTreeMap::new(),
-                    )
+                .or_insert_with(|| GroupedPriceSet {
+                    price_set,
+                    provider_entry_hashes: HashSet::new(),
+                    provider_group_hashes: HashSet::new(),
+                    provider_count: 0,
+                    provider_entry_components: BTreeMap::new(),
                 });
-            if group.1.insert(provider_entry_hash) {
+            if group.provider_entry_hashes.insert(provider_entry_hash) {
                 let mut sorted_components = provider_group_hashes;
                 sorted_components.sort_unstable();
                 sorted_components.dedup();
                 for provider_group_hash in &sorted_components {
-                    group.2.insert(*provider_group_hash);
+                    group.provider_group_hashes.insert(*provider_group_hash);
                 }
-                group.3 += provider_count;
-                group.4.insert(provider_entry_hash, sorted_components);
+                group.provider_count += provider_count;
+                group
+                    .provider_entry_components
+                    .insert(provider_entry_hash, sorted_components);
             } else {
                 for provider_group_hash in provider_group_hashes {
-                    group.2.insert(provider_group_hash);
+                    group.provider_group_hashes.insert(provider_group_hash);
                 }
             }
         }
@@ -2809,30 +2818,24 @@ fn process_compact_rate_lites_worker<W: Write>(
                         .collect::<HashSet<_>>();
                     let mut provider_entry_components = BTreeMap::new();
                     provider_entry_components.insert(provider_entry_hash, provider_group_hashes);
-                    (
+                    GroupedPriceSet {
                         price_set,
                         provider_entry_hashes,
-                        provider_group_hashes_set,
+                        provider_group_hashes: provider_group_hashes_set,
                         provider_count,
                         provider_entry_components,
-                    )
+                    }
                 },
             )
             .collect()
     };
 
-    for (
-        price_set,
-        _provider_entry_hashes,
-        provider_group_hashes,
-        provider_count,
-        provider_entry_components,
-    ) in grouped
-    {
+    for group in grouped {
         let mut sorted_provider_entry_hashes: Vec<i64> =
-            _provider_entry_hashes.into_iter().collect();
+            group.provider_entry_hashes.into_iter().collect();
         sorted_provider_entry_hashes.sort_unstable();
-        let mut sorted_provider_hashes: Vec<i64> = provider_group_hashes.into_iter().collect();
+        let mut sorted_provider_hashes: Vec<i64> =
+            group.provider_group_hashes.into_iter().collect();
         sorted_provider_hashes.sort_unstable();
         let provider_set_hash = hash_i64_list("provider_set", &sorted_provider_entry_hashes);
         let rate_pack_hash = hash_text(
@@ -2841,7 +2844,7 @@ fn process_compact_rate_lites_worker<W: Write>(
                 context.snapshot_id.clone(),
                 procedure_hash.clone(),
                 provider_set_hash.clone(),
-                price_set.price_set_hash.clone(),
+                group.price_set.price_set_hash.clone(),
             ],
         );
         let serving_rate_id = hash_text(
@@ -2853,19 +2856,19 @@ fn process_compact_rate_lites_worker<W: Write>(
                 rate_pack_hash.clone(),
             ],
         );
-        let price_set_hash = price_set.price_set_hash.clone();
-        if dedupe.insert_price_set(&price_set.price_set_hash) {
-            dictionary_copy_sinks.write_price_atoms_shared(&price_set.atoms, dedupe)?;
+        let price_set_hash = group.price_set.price_set_hash.clone();
+        if dedupe.insert_price_set(&group.price_set.price_set_hash) {
+            dictionary_copy_sinks.write_price_atoms_shared(&group.price_set.atoms, dedupe)?;
             dictionary_copy_sinks.write_price_set_entries_shared(
-                &price_set.price_set_hash,
-                &price_set.price_atom_hashes,
+                &group.price_set.price_set_hash,
+                &group.price_set.price_atom_hashes,
                 dedupe,
             )?;
         }
         if dedupe.insert_provider_set(&provider_set_hash) {
             if !dictionary_copy_sinks.write_provider_set(
                 &provider_set_hash,
-                provider_count,
+                group.provider_count,
                 &sorted_provider_hashes,
             )? {
                 emit_json_record(
@@ -2874,14 +2877,14 @@ fn process_compact_rate_lites_worker<W: Write>(
                     &json!({
                         "provider_set_hash": provider_set_hash,
                         "hash_prefix": &provider_set_hash[..provider_set_hash.len().min(16)],
-                        "provider_count": provider_count,
+                        "provider_count": group.provider_count,
                         "npi": Value::Null,
                         "tin_type": "set",
                         "tin_value": Value::Null,
                         "canonical_payload": {
                             "provider_group_hashes": sorted_provider_hashes,
                             "provider_group_count": sorted_provider_hashes.len(),
-                            "provider_count": provider_count,
+                            "provider_count": group.provider_count,
                             "provider_count_mode": "summed_provider_groups",
                             "npi_inline": false,
                             "tin_type": "set",
@@ -2901,7 +2904,8 @@ fn process_compact_rate_lites_worker<W: Write>(
                 dedupe,
             )?;
             for provider_entry_hash in &sorted_provider_entry_hashes {
-                let components = provider_entry_components
+                let components = group
+                    .provider_entry_components
                     .get(provider_entry_hash)
                     .map(Vec::as_slice)
                     .unwrap_or(&[]);
@@ -2914,19 +2918,19 @@ fn process_compact_rate_lites_worker<W: Write>(
         }
         if dedupe.insert_serving_rate(&serving_rate_id) {
             if let Some(copy_writer) = compact_copy_writer.as_mut() {
-                copy_writer.write_row(
-                    &serving_rate_id,
-                    &context.snapshot_id,
-                    &context.plan_id,
-                    &procedure_hash,
-                    None,
-                    reported_code_system.as_deref(),
-                    reported_code.as_deref(),
-                    &provider_set_hash,
-                    provider_count,
-                    &price_set_hash,
-                    &context.source_trace_set_hash,
-                )?;
+                copy_writer.write_row(&CompactCopyRow {
+                    serving_rate_id: &serving_rate_id,
+                    snapshot_id: &context.snapshot_id,
+                    plan_id: &context.plan_id,
+                    procedure_hash: &procedure_hash,
+                    procedure_code: None,
+                    reported_code_system: reported_code_system.as_deref(),
+                    reported_code: reported_code.as_deref(),
+                    provider_set_hash: &provider_set_hash,
+                    provider_count: group.provider_count,
+                    price_set_hash: &price_set_hash,
+                    source_trace_set_hash: &context.source_trace_set_hash,
+                })?;
             } else {
                 emit_json_record(
                     writer,
@@ -2944,7 +2948,7 @@ fn process_compact_rate_lites_worker<W: Write>(
                         "billing_code_type": billing_code_type,
                         "rate_pack_hash": rate_pack_hash,
                         "provider_set_hash": provider_set_hash,
-                        "provider_count": provider_count,
+                        "provider_count": group.provider_count,
                         "price_set_hash": price_set_hash,
                         "source_trace_set_hash": context.source_trace_set_hash.clone(),
                         "confidence_code": context.confidence_code.clone(),
@@ -3086,32 +3090,23 @@ fn read_price_lite_struson<R: Read>(
     }))
 }
 
+struct InNetworkStreamState<'a, W: Write> {
+    writer: &'a mut W,
+    compact_copy_writer: &'a mut Option<CompactCopySink>,
+    dictionary_copy_sinks: &'a mut DictionaryCopySinks,
+    provider_map: &'a HashMap<String, ProviderEntry>,
+    dedupe: LocalCompactDedupe<'a>,
+    price_code_set_hash_cache: &'a mut PriceCodeSetHashCache,
+    context: CompactContext,
+    chunk_size: usize,
+}
+
 fn process_in_network_struson<R: Read, W: Write>(
     json_reader: &mut JsonStreamReader<R>,
-    writer: &mut W,
-    compact_copy_writer: &mut Option<CompactCopySink>,
-    dictionary_copy_sinks: &mut DictionaryCopySinks,
-    provider_map: &HashMap<String, ProviderEntry>,
-    emitted_price_code_sets: &mut HashSet<String>,
-    emitted_price_atoms: &mut HashSet<String>,
-    emitted_price_sets: &mut HashSet<String>,
-    emitted_price_set_entries: &mut HashSet<(String, String)>,
-    emitted_provider_sets: &mut HashSet<String>,
-    emitted_provider_set_components: &mut HashSet<(String, i64)>,
-    emitted_provider_set_entries: &mut HashSet<(String, i64)>,
-    emitted_provider_entry_components: &mut HashSet<(i64, i64)>,
-    emitted_procedures: &mut HashSet<String>,
-    emitted_provider_group_members: &mut HashSet<(i64, i64)>,
-    price_code_set_hash_cache: &mut PriceCodeSetHashCache,
-    snapshot_id: &str,
-    plan_id: &str,
-    plan_month_id: &str,
-    source_trace_set_hash: &str,
-    confidence_code: &str,
-    chunk_size: usize,
+    state: &mut InNetworkStreamState<'_, W>,
 ) -> io::Result<u64> {
     let mut procedure = Map::new();
-    let mut rate_chunk: Vec<RateLite> = Vec::with_capacity(chunk_size);
+    let mut rate_chunk: Vec<RateLite> = Vec::with_capacity(state.chunk_size);
     let mut rate_count = 0u64;
     json_reader.begin_object().map_err(to_io_error)?;
     while json_reader.has_next().map_err(to_io_error)? {
@@ -3131,31 +3126,24 @@ fn process_in_network_struson<R: Read, W: Write>(
                     rate_count += 1;
                     if let Some(rate) = read_rate_lite_struson(json_reader)? {
                         rate_chunk.push(rate);
-                        if rate_chunk.len() >= chunk_size {
+                        if rate_chunk.len() >= state.chunk_size {
                             let procedure_value = Value::Object(procedure.clone());
+                            let mut outputs = LocalCompactOutputs {
+                                writer: state.writer,
+                                compact_copy_writer: state.compact_copy_writer,
+                                dictionary_copy_sinks: state.dictionary_copy_sinks,
+                            };
+                            let mut batch = CompactRateBatch {
+                                provider_map: state.provider_map,
+                                price_code_set_hash_cache: state.price_code_set_hash_cache,
+                                rates: &rate_chunk,
+                                procedure_value: &procedure_value,
+                                context: &state.context,
+                            };
                             process_compact_rate_lites(
-                                writer,
-                                compact_copy_writer,
-                                dictionary_copy_sinks,
-                                provider_map,
-                                emitted_price_code_sets,
-                                emitted_price_atoms,
-                                emitted_price_sets,
-                                emitted_price_set_entries,
-                                emitted_provider_sets,
-                                emitted_provider_set_components,
-                                emitted_provider_set_entries,
-                                emitted_provider_entry_components,
-                                emitted_procedures,
-                                emitted_provider_group_members,
-                                price_code_set_hash_cache,
-                                &rate_chunk,
-                                &procedure_value,
-                                snapshot_id,
-                                plan_id,
-                                plan_month_id,
-                                source_trace_set_hash,
-                                confidence_code,
+                                &mut outputs,
+                                &mut state.dedupe,
+                                &mut batch,
                             )?;
                             rate_chunk.clear();
                         }
@@ -3171,30 +3159,19 @@ fn process_in_network_struson<R: Read, W: Write>(
     json_reader.end_object().map_err(to_io_error)?;
     if !rate_chunk.is_empty() {
         let procedure_value = Value::Object(procedure);
-        process_compact_rate_lites(
-            writer,
-            compact_copy_writer,
-            dictionary_copy_sinks,
-            provider_map,
-            emitted_price_code_sets,
-            emitted_price_atoms,
-            emitted_price_sets,
-            emitted_price_set_entries,
-            emitted_provider_sets,
-            emitted_provider_set_components,
-            emitted_provider_set_entries,
-            emitted_provider_entry_components,
-            emitted_procedures,
-            emitted_provider_group_members,
-            price_code_set_hash_cache,
-            &rate_chunk,
-            &procedure_value,
-            snapshot_id,
-            plan_id,
-            plan_month_id,
-            source_trace_set_hash,
-            confidence_code,
-        )?;
+        let mut outputs = LocalCompactOutputs {
+            writer: state.writer,
+            compact_copy_writer: state.compact_copy_writer,
+            dictionary_copy_sinks: state.dictionary_copy_sinks,
+        };
+        let mut batch = CompactRateBatch {
+            provider_map: state.provider_map,
+            price_code_set_hash_cache: state.price_code_set_hash_cache,
+            rates: &rate_chunk,
+            procedure_value: &procedure_value,
+            context: &state.context,
+        };
+        process_compact_rate_lites(&mut outputs, &mut state.dedupe, &mut batch)?;
     }
     Ok(rate_count)
 }
@@ -3280,49 +3257,53 @@ fn finish_worker_outputs(
     Ok(events)
 }
 
-fn compact_worker_loop(
-    worker_id: usize,
-    rx: Receiver<WorkerJob>,
+struct CompactWorkerConfig {
     event_tx: Sender<CopyFileEvent>,
     provider_map: Arc<HashMap<String, ProviderEntry>>,
     dedupe: Arc<SharedDedupe>,
     copy_paths: CopyPathConfig,
     rotate_bytes: u64,
     context: CompactContext,
+}
+
+fn compact_worker_loop(
+    worker_id: usize,
+    rx: Receiver<WorkerJob>,
+    config: CompactWorkerConfig,
 ) -> io::Result<Vec<CopyFileEvent>> {
-    let worker_paths = copy_paths.for_worker(worker_id);
+    let worker_paths = config.copy_paths.for_worker(worker_id);
     let mut compact_copy_writer = worker_paths
         .compact
         .as_ref()
-        .map(|path| CompactCopySink::new_file(path.clone(), rotate_bytes))
+        .map(|path| CompactCopySink::new_file(path.clone(), config.rotate_bytes))
         .transpose()?;
-    let mut dictionary_copy_sinks = DictionaryCopySinks::from_paths(&worker_paths, rotate_bytes)?;
+    let mut dictionary_copy_sinks =
+        DictionaryCopySinks::from_paths(&worker_paths, config.rotate_bytes)?;
     let mut sink = io::sink();
     let mut price_code_set_hash_cache: PriceCodeSetHashCache = HashMap::new();
 
     for job in rx.iter() {
         match job {
             WorkerJob::ProviderRefs(refs) => {
-                process_provider_refs_worker(&refs, &mut dictionary_copy_sinks, &dedupe)?;
+                process_provider_refs_worker(&refs, &mut dictionary_copy_sinks, &config.dedupe)?;
             }
             WorkerJob::Rates { procedure, rates } => {
                 let procedure_value = Value::Object(procedure);
-                process_compact_rate_lites_worker(
-                    &mut sink,
-                    &mut compact_copy_writer,
-                    &mut dictionary_copy_sinks,
-                    &provider_map,
-                    &dedupe,
-                    &mut price_code_set_hash_cache,
-                    &rates,
-                    &procedure_value,
-                    &context,
-                )?;
+                let mut state = SharedCompactState {
+                    writer: &mut sink,
+                    compact_copy_writer: &mut compact_copy_writer,
+                    dictionary_copy_sinks: &mut dictionary_copy_sinks,
+                    provider_map: &config.provider_map,
+                    dedupe: &config.dedupe,
+                    price_code_set_hash_cache: &mut price_code_set_hash_cache,
+                    context: &config.context,
+                };
+                process_compact_rate_lites_worker(&mut state, &rates, &procedure_value)?;
             }
         }
         if let Some(copy_writer) = compact_copy_writer.as_mut() {
             if let Some(event) = copy_writer.maybe_rotate_silent()? {
-                event_tx.send(event).map_err(|err| {
+                config.event_tx.send(event).map_err(|err| {
                     io::Error::new(
                         io::ErrorKind::BrokenPipe,
                         format!("compact copy event queue closed: {err}"),
@@ -3331,7 +3312,7 @@ fn compact_worker_loop(
             }
         }
         for event in dictionary_copy_sinks.maybe_rotate_silent()? {
-            event_tx.send(event).map_err(|err| {
+            config.event_tx.send(event).map_err(|err| {
                 io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     format!("dictionary copy event queue closed: {err}"),
@@ -3432,12 +3413,14 @@ fn scan_compact_struson_parallel(
                                 compact_worker_loop(
                                     worker_id,
                                     worker_rx,
-                                    worker_event_tx,
-                                    worker_provider_map,
-                                    worker_dedupe,
-                                    worker_copy_paths,
-                                    compact_copy_rotate_bytes,
-                                    worker_context,
+                                    CompactWorkerConfig {
+                                        event_tx: worker_event_tx,
+                                        provider_map: worker_provider_map,
+                                        dedupe: worker_dedupe,
+                                        copy_paths: worker_copy_paths,
+                                        rotate_bytes: compact_copy_rotate_bytes,
+                                        context: worker_context,
+                                    },
                                 )
                             }));
                             match result {
@@ -3449,10 +3432,9 @@ fn scan_compact_struson_parallel(
                                 Err(payload) => {
                                     let message = panic_payload_message(payload.as_ref());
                                     log_worker_failure(worker_id, "panic", &message);
-                                    Err(io::Error::new(
-                                        io::ErrorKind::Other,
-                                        format!("compact worker {worker_id} panicked: {message}"),
-                                    ))
+                                    Err(io::Error::other(format!(
+                                        "compact worker {worker_id} panicked: {message}"
+                                    )))
                                 }
                             }
                         }),
@@ -3538,10 +3520,9 @@ fn scan_compact_struson_parallel(
                             let message = panic_payload_message(payload.as_ref());
                             emit_worker_failure(&mut writer, worker_id, "panic", &message)?;
                             if worker_error.is_none() {
-                                worker_error = Some(io::Error::new(
-                                    io::ErrorKind::Other,
-                                    format!("compact worker {worker_id} panicked: {message}"),
-                                ));
+                                worker_error = Some(io::Error::other(format!(
+                                    "compact worker {worker_id} panicked: {message}"
+                                )));
                             }
                         }
                     }
@@ -3719,30 +3700,35 @@ fn scan_compact_struson(path: &Path) -> io::Result<()> {
             "in_network" => {
                 json_reader.begin_array().map_err(to_io_error)?;
                 while json_reader.has_next().map_err(to_io_error)? {
-                    let rate_count = process_in_network_struson(
-                        &mut json_reader,
-                        &mut writer,
-                        &mut compact_copy_writer,
-                        &mut dictionary_copy_sinks,
-                        &provider_map,
-                        &mut emitted_price_code_sets,
-                        &mut emitted_price_atoms,
-                        &mut emitted_price_sets,
-                        &mut emitted_price_set_entries,
-                        &mut emitted_provider_sets,
-                        &mut emitted_provider_set_components,
-                        &mut emitted_provider_set_entries,
-                        &mut emitted_provider_entry_components,
-                        &mut emitted_procedures,
-                        &mut emitted_provider_group_members,
-                        &mut price_code_set_hash_cache,
-                        &snapshot_id,
-                        &plan_id,
-                        &plan_month_id,
-                        &source_trace_set_hash,
-                        &confidence_code,
-                        negotiated_rate_chunk_size,
-                    )?;
+                    let mut stream_state = InNetworkStreamState {
+                        writer: &mut writer,
+                        compact_copy_writer: &mut compact_copy_writer,
+                        dictionary_copy_sinks: &mut dictionary_copy_sinks,
+                        provider_map: &provider_map,
+                        dedupe: LocalCompactDedupe {
+                            price_code_sets: &mut emitted_price_code_sets,
+                            price_atoms: &mut emitted_price_atoms,
+                            price_sets: &mut emitted_price_sets,
+                            price_set_entries: &mut emitted_price_set_entries,
+                            provider_sets: &mut emitted_provider_sets,
+                            provider_set_components: &mut emitted_provider_set_components,
+                            provider_set_entries: &mut emitted_provider_set_entries,
+                            provider_entry_components: &mut emitted_provider_entry_components,
+                            procedures: &mut emitted_procedures,
+                            provider_group_members: &mut emitted_provider_group_members,
+                        },
+                        price_code_set_hash_cache: &mut price_code_set_hash_cache,
+                        context: CompactContext {
+                            snapshot_id: snapshot_id.clone(),
+                            plan_id: plan_id.clone(),
+                            plan_month_id: plan_month_id.clone(),
+                            source_trace_set_hash: source_trace_set_hash.clone(),
+                            confidence_code: confidence_code.clone(),
+                        },
+                        chunk_size: negotiated_rate_chunk_size,
+                    };
+                    let rate_count =
+                        process_in_network_struson(&mut json_reader, &mut stream_state)?;
                     *object_counts.entry("in_network".to_string()).or_insert(0) += 1;
                     *object_counts
                         .entry("negotiated_rates".to_string())
