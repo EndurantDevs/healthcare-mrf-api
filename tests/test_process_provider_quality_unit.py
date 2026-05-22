@@ -10,6 +10,7 @@ provider_quality_model_helpers = importlib.import_module("process.provider_quali
 provider_quality_normalize = importlib.import_module("process.provider_quality_parts.normalize")
 provider_quality_sql_helpers = importlib.import_module("process.provider_quality_parts.sql_helpers")
 provider_quality_state = importlib.import_module("process.provider_quality_parts.state")
+provider_quality_table_helpers = importlib.import_module("process.provider_quality_parts.table_helpers")
 
 
 class _FakeRedis:
@@ -158,6 +159,13 @@ def test_model_helper_split_keeps_facade_helpers_stable():
     assert provider_quality._staging_classes is provider_quality_model_helpers._staging_classes
     assert provider_quality._chunk_job_id is provider_quality_model_helpers._chunk_job_id
     assert provider_quality._build_stage_suffix is provider_quality_model_helpers._build_stage_suffix
+
+
+def test_table_helper_split_keeps_facade_helpers_stable():
+    assert provider_quality._ensure_indexes is provider_quality_table_helpers._ensure_indexes
+    assert provider_quality._build_staging_indexes is provider_quality_table_helpers._build_staging_indexes
+    assert provider_quality._table_exists is provider_quality_table_helpers._table_exists
+    assert provider_quality._table_columns is provider_quality_table_helpers._table_columns
 
 
 def test_provider_quality_sql_helpers_build_expected_fragments():
