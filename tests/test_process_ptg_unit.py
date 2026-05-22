@@ -24,6 +24,7 @@ ptg_artifact_streams = importlib.import_module("process.ptg_parts.artifact_strea
 ptg_canonical = importlib.import_module("process.ptg_parts.canonical")
 ptg_domain = importlib.import_module("process.ptg_parts.domain")
 ptg_row_helpers = importlib.import_module("process.ptg_parts.row_helpers")
+ptg_rust_scanner = importlib.import_module("process.ptg_parts.rust_scanner")
 ptg_screen = importlib.import_module("process.ptg_parts.screen")
 ptg_values = importlib.import_module("process.ptg_parts.values")
 
@@ -79,6 +80,13 @@ def test_artifact_stream_split_keeps_facade_helpers_stable():
     assert process_ptg.logical_artifact_identity is ptg_artifact_streams.logical_artifact_identity
     assert process_ptg.stream_logical_artifact is ptg_artifact_streams.stream_logical_artifact
     assert process_ptg.load_json_artifact is ptg_artifact_streams.load_json_artifact
+
+
+def test_rust_scanner_split_keeps_facade_helpers_stable():
+    assert process_ptg._ptg2_rust_scanner_binary is ptg_rust_scanner._ptg2_rust_scanner_binary
+    assert process_ptg._iter_top_level_object_bytes_rust is ptg_rust_scanner._iter_top_level_object_bytes_rust
+    assert process_ptg._iter_compact_serving_records_rust is ptg_rust_scanner._iter_compact_serving_records_rust
+    assert process_ptg._aiter_compact_serving_records_rust is ptg_rust_scanner._aiter_compact_serving_records_rust
 
 
 def test_filter_reporting_plans_matches_group_plan_id():
@@ -2317,8 +2325,8 @@ def test_ptg2_rust_compact_uses_bounded_event_queue_default(monkeypatch, tmp_pat
         return FakeProcess()
 
     monkeypatch.delenv(process_ptg.PTG2_RUST_EVENT_QUEUE_ENV, raising=False)
-    monkeypatch.setattr(process_ptg, "_ptg2_rust_scanner_binary", lambda: tmp_path / "ptg2_scanner")
-    monkeypatch.setattr(process_ptg.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(ptg_rust_scanner, "_ptg2_rust_scanner_binary", lambda: tmp_path / "ptg2_scanner")
+    monkeypatch.setattr(ptg_rust_scanner.subprocess, "Popen", fake_popen)
 
     list(
         process_ptg._iter_compact_serving_records_rust(
