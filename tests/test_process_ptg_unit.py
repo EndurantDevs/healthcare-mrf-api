@@ -22,6 +22,7 @@ process_ptg = importlib.import_module("process.ptg")
 ptg_canonical = importlib.import_module("process.ptg_parts.canonical")
 ptg_domain = importlib.import_module("process.ptg_parts.domain")
 ptg_screen = importlib.import_module("process.ptg_parts.screen")
+ptg_values = importlib.import_module("process.ptg_parts.values")
 
 
 class _ClosedStream:
@@ -44,6 +45,14 @@ def test_canonical_split_keeps_facade_helpers_stable():
     assert process_ptg.semantic_hash is ptg_canonical.semantic_hash
     assert process_ptg.canonicalize_url is ptg_canonical.canonicalize_url
     assert process_ptg.normalize_import_month is ptg_canonical.normalize_import_month
+
+
+def test_values_split_keeps_facade_helpers_stable():
+    assert process_ptg.build_provider_set is ptg_values.build_provider_set
+    assert process_ptg.build_price_set is ptg_values.build_price_set
+    assert process_ptg.build_fact_chunk is ptg_values.build_fact_chunk
+    assert process_ptg.build_rate_set is ptg_values.build_rate_set
+    assert process_ptg.provider_hash_bucket is ptg_values.provider_hash_bucket
 
 
 def test_filter_reporting_plans_matches_group_plan_id():
