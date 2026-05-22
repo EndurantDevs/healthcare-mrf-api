@@ -24,6 +24,7 @@ ptg_artifact_streams = importlib.import_module("process.ptg_parts.artifact_strea
 ptg_canonical = importlib.import_module("process.ptg_parts.canonical")
 ptg_compact_indexes = importlib.import_module("process.ptg_parts.compact_indexes")
 ptg_compact_state = importlib.import_module("process.ptg_parts.compact_state")
+ptg_compact_writes = importlib.import_module("process.ptg_parts.compact_writes")
 ptg_copy_load = importlib.import_module("process.ptg_parts.copy_load")
 ptg_db_tables = importlib.import_module("process.ptg_parts.db_tables")
 ptg_domain = importlib.import_module("process.ptg_parts.domain")
@@ -141,6 +142,14 @@ def test_compact_state_split_keeps_facade_helpers_stable():
     assert process_ptg._compact_add_unique is ptg_compact_state._compact_add_unique
     assert process_ptg._ptg2_price_atom_payload is ptg_compact_state._ptg2_price_atom_payload
     assert process_ptg._ptg2_source_trace_payload is ptg_compact_state._ptg2_source_trace_payload
+
+
+def test_compact_write_split_keeps_facade_helpers_stable():
+    assert process_ptg._existing_price_set_hashes is ptg_compact_writes._existing_price_set_hashes
+    assert process_ptg._flush_compact_rows is ptg_compact_writes._flush_compact_rows
+    assert process_ptg._schedule_compact_write is ptg_compact_writes._schedule_compact_write
+    assert process_ptg._drain_compact_writes is ptg_compact_writes._drain_compact_writes
+    assert process_ptg._flush_compact_rate_pack_groups is ptg_compact_writes._flush_compact_rate_pack_groups
 
 
 def test_copy_load_split_keeps_facade_helpers_stable():
