@@ -1,0 +1,99 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+"""PTG source-file metadata and file-row helpers."""
+
+from __future__ import annotations
+
+import os
+from typing import Any
+
+import ijson
+
+from process.ptg_parts.artifact_streams import open_json_artifact_stream, stream_logical_artifact
+from process.ptg_parts.row_helpers import _coerce_date, _make_checksum
+from process.ptg_parts.source_jobs import _normalize_plan_payload
+
+
+def _maybe_unzip(path: str) -> str:
+    logical = stream_logical_artifact(path, output_dir=os.path.dirname(path))
+    if logical.logical_path != path:
+        return logical.logical_path
+    return path
+
+
+async def _extract_metadata_fields(file_path: str) -> dict[str, Any]:
+    """
+    Extract top-level metadata without loading the full file.
+    """
+    fields = {
+        "reporting_entity_name",
+        "reporting_entity_type",
+        "last_updated_on",
+        "version",
+        "plan_name",
+        "plan_id",
+        "plan_id_type",
+        "plan_market_type",
+        "plan_sponsor_name",
+        "issuer_name",
+    }
+    meta: dict[str, Any] = {}
+    with open_json_artifact_stream(file_path) as afp:
+        for prefix, event, value in ijson.parse(afp):
+            if event in ("string", "number") and prefix in fields:
+                meta[prefix] = value
+                if len(meta) == len(fields):
+                    break
+    return meta
+
+
+def _derive_plan_fields(meta: dict[str, Any], plan_info: list[dict[str, Any]] | None) -> dict[str, Any]:
+    if any(meta.get(k) for k in ("plan_name", "plan_id", "plan_market_type", "plan_sponsor_name", "issuer_name")):
+        return {
+            "plan_name": meta.get("plan_name"),
+            "plan_id_type": meta.get("plan_id_type"),
+            "plan_id": meta.get("plan_id"),
+            "plan_market_type": meta.get("plan_market_type"),
+            "issuer_name": meta.get("issuer_name"),
+            "plan_sponsor_name": meta.get("plan_sponsor_name"),
+        }
+    if plan_info:
+        if len(plan_info) == 1:
+            single = _normalize_plan_payload(plan_info[0])
+            return {
+                "plan_name": single.get("plan_name"),
+                "plan_id_type": single.get("plan_id_type"),
+                "plan_id": single.get("plan_id"),
+                "plan_market_type": single.get("plan_market_type"),
+                "issuer_name": single.get("issuer_name"),
+                "plan_sponsor_name": single.get("plan_sponsor_name"),
+            }
+    return {}
+
+
+def _build_file_row(
+    url: str,
+    file_type: str,
+    meta: dict[str, Any],
+    plan_info: list[dict[str, Any]] | None,
+    description: str | None,
+    from_index_url: str | None,
+) -> dict[str, Any]:
+    plan_fields = _derive_plan_fields(meta, plan_info)
+    file_id = _make_checksum(url, file_type, plan_fields.get("plan_id") or plan_fields.get("plan_name") or "")
+    return {
+        "file_id": file_id,
+        "file_type": file_type,
+        "url": url,
+        "description": description,
+        "reporting_entity_name": meta.get("reporting_entity_name"),
+        "reporting_entity_type": meta.get("reporting_entity_type"),
+        "last_updated_on": _coerce_date(meta.get("last_updated_on")),
+        "version": meta.get("version"),
+        "plan_name": plan_fields.get("plan_name"),
+        "plan_id_type": plan_fields.get("plan_id_type"),
+        "plan_id": plan_fields.get("plan_id"),
+        "plan_market_type": plan_fields.get("plan_market_type"),
+        "issuer_name": plan_fields.get("issuer_name"),
+        "plan_sponsor_name": plan_fields.get("plan_sponsor_name"),
+        "from_index_url": from_index_url,
+    }
