@@ -35,6 +35,7 @@ ptg_rust_publish = importlib.import_module("process.ptg_parts.rust_publish")
 ptg_rust_scanner = importlib.import_module("process.ptg_parts.rust_scanner")
 ptg_rust_stage = importlib.import_module("process.ptg_parts.rust_stage")
 ptg_screen = importlib.import_module("process.ptg_parts.screen")
+ptg_serving_maintenance = importlib.import_module("process.ptg_parts.serving_maintenance")
 ptg_serving_rows = importlib.import_module("process.ptg_parts.serving_rows")
 ptg_serving_only = importlib.import_module("process.ptg_parts.serving_only")
 ptg_snapshot_cleanup = importlib.import_module("process.ptg_parts.snapshot_cleanup")
@@ -291,6 +292,14 @@ def test_serving_row_split_keeps_facade_helpers_stable():
     assert process_ptg._ptg2_compact_serving_rate_row is ptg_serving_rows._ptg2_compact_serving_rate_row
     assert process_ptg._provider_group_member_rows is ptg_serving_rows._provider_group_member_rows
     assert process_ptg._provider_set_component_rows is ptg_serving_rows._provider_set_component_rows
+
+
+def test_serving_maintenance_split_keeps_facade_helpers_stable():
+    assert process_ptg._count_compact_serving_rate_rows is ptg_serving_maintenance._count_compact_serving_rate_rows
+    assert process_ptg._copy_simple_rows is ptg_serving_maintenance._copy_simple_rows
+    assert process_ptg._merge_staged_price_sets is ptg_serving_maintenance._merge_staged_price_sets
+    assert process_ptg._merge_staged_serving_rates is ptg_serving_maintenance._merge_staged_serving_rates
+    assert process_ptg._build_ptg2_provider_locations is ptg_serving_maintenance._build_ptg2_provider_locations
 
 
 def test_filter_reporting_plans_matches_group_plan_id():
