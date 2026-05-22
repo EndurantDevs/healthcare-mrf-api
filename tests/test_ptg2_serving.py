@@ -9,6 +9,7 @@ from api import ptg2_response
 from api import ptg2_price_sql
 from api import ptg2_code_filters
 from api import ptg2_types
+from api import ptg2_index_cache
 
 
 class FakeResult:
@@ -81,6 +82,16 @@ def test_ptg2_code_filter_split_keeps_serving_facade_helpers_stable():
 def test_ptg2_type_split_keeps_serving_facade_classes_stable():
     assert ptg2_serving.PTG2ServingIndex is ptg2_types.PTG2ServingIndex
     assert ptg2_serving.PTG2ServingTables is ptg2_types.PTG2ServingTables
+
+
+def test_ptg2_index_cache_split_keeps_serving_facade_helpers_stable():
+    assert ptg2_serving.clear_ptg2_index_cache is ptg2_index_cache.clear_ptg2_index_cache
+    assert ptg2_serving._ptg2_response_cache_key is ptg2_index_cache._ptg2_response_cache_key
+    assert ptg2_serving._ptg2_response_cache_get is ptg2_index_cache._ptg2_response_cache_get
+    assert ptg2_serving._ptg2_response_cache_set is ptg2_index_cache._ptg2_response_cache_set
+    assert ptg2_serving._artifact_root is ptg2_index_cache._artifact_root
+    assert ptg2_serving._path_from_uri is ptg2_index_cache._path_from_uri
+    assert ptg2_serving.load_ptg2_index_from_path is ptg2_index_cache.load_ptg2_index_from_path
 
 
 def _compact_tables(**overrides):
