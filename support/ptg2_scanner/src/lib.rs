@@ -6,4 +6,5 @@ pub mod dedupe;
 pub mod hashing;
 pub mod input;
 pub mod normalize;
+pub mod output;
 pub mod progress;
