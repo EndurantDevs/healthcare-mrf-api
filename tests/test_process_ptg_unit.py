@@ -19,6 +19,7 @@ from aiohttp import web
 
 process_pkg = importlib.import_module("process")
 process_ptg = importlib.import_module("process.ptg")
+ptg_allowed_amounts = importlib.import_module("process.ptg_parts.allowed_amounts")
 ptg_artifacts = importlib.import_module("process.ptg_parts.artifacts")
 ptg_artifact_streams = importlib.import_module("process.ptg_parts.artifact_streams")
 ptg_canonical = importlib.import_module("process.ptg_parts.canonical")
@@ -111,6 +112,11 @@ def test_artifact_stream_split_keeps_facade_helpers_stable():
     assert process_ptg.logical_artifact_identity is ptg_artifact_streams.logical_artifact_identity
     assert process_ptg.stream_logical_artifact is ptg_artifact_streams.stream_logical_artifact
     assert process_ptg.load_json_artifact is ptg_artifact_streams.load_json_artifact
+
+
+def test_allowed_amount_split_keeps_facade_helpers_stable():
+    assert process_ptg._parse_allowed_amounts is ptg_allowed_amounts._parse_allowed_amounts
+    assert process_ptg._process_allowed_amounts_file is ptg_allowed_amounts._process_allowed_amounts_file
 
 
 def test_db_table_split_keeps_facade_helpers_stable():
