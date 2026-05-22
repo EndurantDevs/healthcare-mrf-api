@@ -32,6 +32,7 @@ ptg_rust_stage = importlib.import_module("process.ptg_parts.rust_stage")
 ptg_screen = importlib.import_module("process.ptg_parts.screen")
 ptg_serving_rows = importlib.import_module("process.ptg_parts.serving_rows")
 ptg_serving_only = importlib.import_module("process.ptg_parts.serving_only")
+ptg_snapshot_cleanup = importlib.import_module("process.ptg_parts.snapshot_cleanup")
 ptg_snapshot_tables = importlib.import_module("process.ptg_parts.snapshot_tables")
 ptg_source_pointers = importlib.import_module("process.ptg_parts.source_pointers")
 ptg_values = importlib.import_module("process.ptg_parts.values")
@@ -125,6 +126,13 @@ def test_source_pointer_split_keeps_facade_helpers_stable():
     assert process_ptg._ptg2_plan_source_key is ptg_source_pointers._ptg2_plan_source_key
     assert process_ptg._current_source_snapshot_id is ptg_source_pointers._current_source_snapshot_id
     assert process_ptg._source_plan_rows is ptg_source_pointers._source_plan_rows
+
+
+def test_snapshot_cleanup_split_keeps_facade_helpers_stable():
+    assert process_ptg._snapshot_manifest_table_names is ptg_snapshot_cleanup._snapshot_manifest_table_names
+    assert process_ptg._drop_ptg2_snapshot_table_names is ptg_snapshot_cleanup._drop_ptg2_snapshot_table_names
+    assert process_ptg._drop_ptg2_snapshot_tables_for_manifest is ptg_snapshot_cleanup._drop_ptg2_snapshot_tables_for_manifest
+    assert process_ptg._cleanup_old_ptg2_source_tables is ptg_snapshot_cleanup._cleanup_old_ptg2_source_tables
 
 
 def test_rust_scanner_split_keeps_facade_helpers_stable():
@@ -2696,6 +2704,29 @@ def test_ptg2_source_plan_rows_falls_back_to_serving_index_table(monkeypatch):
         }
     ]
     assert len(calls) == 2
+
+
+def test_ptg2_snapshot_manifest_table_names_allowlists_location_and_rejects_unsafe_names():
+    names = process_ptg._snapshot_manifest_table_names(
+        {
+            "storage": "db_compact_snapshot",
+            "table": "mrf.ptg2_serving_rate_compact_abc123",
+            "provider_group_location_table": "mrf.ptg2_provider_group_location_abc123",
+            "provider_group_member_table": "mrf.ptg2_provider_group_member_abc123",
+            "provider_set_table": "mrf.ptg2_provider_set_abc123",
+            "provider_set_entry_table": "mrf.ptg2_provider_set_abc123",
+            "price_atom_table": "mrf.ptg2_price_atom_bad-name",
+            "procedure_table": "mrf.not_a_snapshot_table",
+            "price_set_entry_table": "mrf.ptg2_price_set_entry_abc123;drop",
+        }
+    )
+
+    assert names == [
+        "ptg2_serving_rate_compact_abc123",
+        "ptg2_provider_set_abc123",
+        "ptg2_provider_group_member_abc123",
+        "ptg2_provider_group_location_abc123",
+    ]
 
 
 def test_ptg2_source_scoped_report_uses_published_serving_rate_count(monkeypatch):
