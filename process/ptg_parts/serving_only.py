@@ -5,8 +5,9 @@ from __future__ import annotations
 
 import hashlib
 import pickle
+import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from process.ptg_parts.canonical import canonical_json_dumps, money_number, normalize_money
 from process.ptg_parts.row_helpers import _as_list, _coerce_date
@@ -160,6 +161,50 @@ def _serving_only_merge_worker_result(
                 continue
             key_seen.add(dedupe_id)
             out.append(row)
+
+
+def _serving_only_worker_process_chunk_to_files(
+    payloads_or_raw: list[dict[str, Any] | bytes | bytearray],
+    worker_process: Callable[[dict[str, Any] | bytes | bytearray], dict[str, list[dict[str, Any]]]],
+) -> dict[str, Any]:
+    temp_dir = Path(tempfile.mkdtemp(prefix="ptg2_worker_result_"))
+    handles: dict[str, Any] = {}
+    paths: dict[str, str] = {}
+    counts: dict[str, int] = {}
+    seen: dict[str, set[Any]] = {key: set() for key in _SERVING_ONLY_WORKER_KEY_FIELDS}
+    try:
+        for payload_or_raw in payloads_or_raw:
+            result = worker_process(payload_or_raw)
+            for key, id_field in _SERVING_ONLY_WORKER_KEY_FIELDS.items():
+                rows = result.get(key) or []
+                if not rows:
+                    continue
+                handle = handles.get(key)
+                if handle is None:
+                    path = temp_dir / f"{key}.pickle"
+                    handle = path.open("wb")
+                    handles[key] = handle
+                    paths[key] = str(path)
+                key_seen = seen[key]
+                for row in rows:
+                    if isinstance(id_field, tuple):
+                        dedupe_id = tuple(row.get(part) for part in id_field)
+                    else:
+                        dedupe_id = row.get(id_field)
+                    if dedupe_id in key_seen:
+                        continue
+                    key_seen.add(dedupe_id)
+                    pickle.dump(row, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                    counts[key] = counts.get(key, 0) + 1
+    finally:
+        for handle in handles.values():
+            handle.close()
+    return {
+        "__worker_result_files__": True,
+        "temp_dir": str(temp_dir),
+        "paths": paths,
+        "counts": counts,
+    }
 
 
 def _worker_payload_size(payload_or_raw: dict[str, Any] | bytes | bytearray) -> int:

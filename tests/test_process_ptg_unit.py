@@ -1028,6 +1028,37 @@ def test_ptg2_serving_only_worker_chunk_dedupes_rows(monkeypatch):
     assert [row["procedure_hash"] for row in merged["procedure_rows"]] == ["p1", "p2"]
 
 
+def test_ptg2_serving_only_worker_chunk_to_files_dedupes_and_iterates(monkeypatch):
+    rows_a = {
+        "serving_rows": [{"serving_rate_id": "r1"}],
+        "provider_set_component_rows": [{"provider_set_hash": "ps1", "provider_group_hash": 10}],
+    }
+    rows_b = {
+        "serving_rows": [{"serving_rate_id": "r1"}, {"serving_rate_id": "r2"}],
+        "provider_set_component_rows": [
+            {"provider_set_hash": "ps1", "provider_group_hash": 10},
+            {"provider_set_hash": "ps1", "provider_group_hash": 11},
+        ],
+    }
+    it = iter([rows_a, rows_b])
+    monkeypatch.setattr(process_ptg, "_serving_only_worker_process", lambda _payload: next(it))
+
+    result = process_ptg._serving_only_worker_process_chunk_to_files([b"a", b"b"])
+    temp_dir = Path(result["temp_dir"])
+    try:
+        assert result["__worker_result_files__"] is True
+        assert result["counts"]["serving_rows"] == 2
+        assert result["counts"]["provider_set_component_rows"] == 2
+        serving_rows = list(process_ptg._iter_worker_result_rows(result["paths"]["serving_rows"]))
+        component_rows = list(process_ptg._iter_worker_result_rows(result["paths"]["provider_set_component_rows"]))
+        assert [row["serving_rate_id"] for row in serving_rows] == ["r1", "r2"]
+        assert [row["provider_group_hash"] for row in component_rows] == [10, 11]
+    finally:
+        for path in result.get("paths", {}).values():
+            Path(path).unlink(missing_ok=True)
+        temp_dir.rmdir()
+
+
 def test_ptg2_provider_reference_cache_round_trips_numeric_and_string_refs(tmp_path):
     cache = process_ptg.PTG2ProviderReferenceCache(tmp_path / "provider_refs.sqlite")
     try:
