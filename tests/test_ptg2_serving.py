@@ -14,6 +14,7 @@ from api import ptg2_tables
 from api import ptg2_serving_utils
 from api import ptg2_code_details
 from api import ptg2_code_context
+from api import ptg2_snapshot
 
 
 class FakeResult:
@@ -101,6 +102,14 @@ def test_ptg2_index_cache_split_keeps_serving_facade_helpers_stable():
     assert ptg2_serving._artifact_root is ptg2_index_cache._artifact_root
     assert ptg2_serving._path_from_uri is ptg2_index_cache._path_from_uri
     assert ptg2_serving.load_ptg2_index_from_path is ptg2_index_cache.load_ptg2_index_from_path
+
+
+def test_ptg2_snapshot_split_keeps_serving_facade_helpers_stable():
+    assert ptg2_serving.current_snapshot_id is ptg2_snapshot.current_snapshot_id
+    assert ptg2_serving.current_source_snapshot_id_for_plan is ptg2_snapshot.current_source_snapshot_id_for_plan
+    assert ptg2_serving.resolve_current_ptg2_snapshot_id is ptg2_snapshot.resolve_current_ptg2_snapshot_id
+    assert ptg2_serving.snapshot_artifact_uri is ptg2_snapshot.snapshot_artifact_uri
+    assert ptg2_serving.load_current_ptg2_index is ptg2_snapshot.load_current_ptg2_index
 
 
 def test_ptg2_table_split_keeps_serving_facade_helpers_stable():
