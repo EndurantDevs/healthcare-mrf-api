@@ -46,7 +46,6 @@ from process.ext.utils import (
     get_http_client,
     get_import_schema,
     make_class,
-    push_objects,
 )
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
@@ -71,8 +70,6 @@ from process.provider_quality_parts.config import (
     PROVIDER_QUALITY_BENCHMARK_ORDER,
     PROVIDER_QUALITY_CHUNK_TARGET_BYTES,
     PROVIDER_QUALITY_COHORT_ENABLED,
-    PROVIDER_QUALITY_DB_DEADLOCK_BASE_DELAY_SECONDS,
-    PROVIDER_QUALITY_DB_DEADLOCK_RETRIES,
     PROVIDER_QUALITY_DEFAULT_SVI,
     PROVIDER_QUALITY_DEFER_STAGE_INDEXES,
     PROVIDER_QUALITY_DOMAIN_SHARDS,
@@ -105,10 +102,7 @@ from process.provider_quality_parts.config import (
     PROVIDER_QUALITY_QUEUE_NAME,
     PROVIDER_QUALITY_REDIS_TTL_SECONDS,
     PROVIDER_QUALITY_SCORE_SHARDS,
-    PROVIDER_QUALITY_SHARD_JIT,
-    PROVIDER_QUALITY_SHARD_MAX_PARALLEL_GATHER,
     PROVIDER_QUALITY_SHARD_PARALLELISM,
-    PROVIDER_QUALITY_SHARD_WORK_MEM,
     PROVIDER_QUALITY_SHRINKAGE_ALPHA,
     PROVIDER_QUALITY_TEST_QPP_ROWS,
     PROVIDER_QUALITY_TEST_SVI_ROWS,
@@ -132,6 +126,16 @@ from process.provider_quality_parts.cohort_sql import (
     _cohort_sql_phase_5_build_measure_shard,
     _cohort_sql_phase_6_build_domain_shard,
     _cohort_sql_phase_7_build_score_shard,
+)
+from process.provider_quality_parts.execution_helpers import (
+    _count_shard_rows,
+    _execute_shard_sql,
+    _is_deadlock_error,
+    _print_row_progress,
+    _push_objects_with_retry,
+    _row_allowed_for_test,
+    _step_end,
+    _step_start,
 )
 from process.provider_quality_parts.lifecycle import (
     _archived_identifier,
@@ -348,90 +352,6 @@ async def _release_global_finalize_lock(redis, run_id: str) -> None:
     current_owner = _decode_redis_str(await redis.get(PROVIDER_QUALITY_GLOBAL_FINALIZE_LOCK_KEY))
     if current_owner == run_id:
         await redis.delete(PROVIDER_QUALITY_GLOBAL_FINALIZE_LOCK_KEY)
-
-
-def _print_row_progress(stage: str, parsed: int, accepted: int, start_time: float, final: bool = False) -> None:
-    elapsed = max(time.monotonic() - start_time, 0.001)
-    rate = parsed / elapsed
-    line = f"\r[rows:{stage}] parsed={parsed:,} accepted={accepted:,} rate={rate:,.0f} rows/s"
-    print(line, end="\n" if final else "", flush=True)
-
-
-def _step_start(label: str) -> float:
-    start = time.monotonic()
-    print(f"[step] START {label}", flush=True)
-    return start
-
-
-def _step_end(label: str, started_at: float) -> None:
-    elapsed = max(time.monotonic() - started_at, 0.001)
-    print(f"[step] DONE  {label} in {elapsed:.1f}s", flush=True)
-
-
-def _is_deadlock_error(exc: BaseException) -> bool:
-    return "deadlock detected" in str(exc).lower()
-
-
-async def _execute_shard_sql(sql: str, **params: Any) -> None:
-    async with db.transaction():
-        await db.status(f"SET LOCAL work_mem = '{PROVIDER_QUALITY_SHARD_WORK_MEM}';")
-        await db.status(f"SET LOCAL jit = {PROVIDER_QUALITY_SHARD_JIT};")
-        await db.status(
-            f"SET LOCAL max_parallel_workers_per_gather = {PROVIDER_QUALITY_SHARD_MAX_PARALLEL_GATHER};"
-        )
-        await db.status(sql, **params)
-
-
-async def _count_shard_rows(schema: str, table_name: str, *, year: int, shard_id: int, shard_count: int) -> int:
-    stmt = db.text(
-        f"""
-        SELECT COUNT(*)::bigint AS row_count
-        FROM {schema}.{table_name} t
-        WHERE t.year = :year
-          AND {_npi_shard_predicate("t.npi")}
-        """
-    )
-    async with db.session() as session:
-        result = await session.execute(
-            stmt,
-            {
-                "year": year,
-                "shard_id": shard_id,
-                "shard_count": shard_count,
-            },
-        )
-        return int(result.scalar() or 0)
-
-
-async def _push_objects_with_retry(
-    rows: list[dict[str, Any]],
-    cls: type,
-    *,
-    rewrite: bool = False,
-    use_copy: bool = True,
-) -> None:
-    if not rows:
-        return
-    for attempt in range(1, PROVIDER_QUALITY_DB_DEADLOCK_RETRIES + 1):
-        try:
-            await push_objects(rows, cls, rewrite=rewrite, use_copy=use_copy)
-            return
-        except Exception as exc:  # pylint: disable=broad-exception-caught
-            if not _is_deadlock_error(exc) or attempt >= PROVIDER_QUALITY_DB_DEADLOCK_RETRIES:
-                raise
-            delay = PROVIDER_QUALITY_DB_DEADLOCK_BASE_DELAY_SECONDS * (2 ** (attempt - 1))
-            logger.warning(
-                "Deadlock while inserting into %s (attempt %s/%s), retrying in %.2fs",
-                cls.__tablename__,
-                attempt,
-                PROVIDER_QUALITY_DB_DEADLOCK_RETRIES,
-                delay,
-            )
-            await asyncio.sleep(delay)
-
-
-def _row_allowed_for_test(row_number: int) -> bool:
-    return row_number % 11 == 0
 
 
 async def _prepare_tables(stage_suffix: str, test_mode: bool) -> tuple[dict[str, type], str]:
