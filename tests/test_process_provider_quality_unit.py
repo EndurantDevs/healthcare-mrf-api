@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 provider_quality = importlib.import_module("process.provider_quality")
+provider_quality_cohort_context = importlib.import_module("process.provider_quality_parts.cohort_context")
 provider_quality_cohort_sql = importlib.import_module("process.provider_quality_parts.cohort_sql")
 provider_quality_execution_helpers = importlib.import_module("process.provider_quality_parts.execution_helpers")
 provider_quality_lifecycle = importlib.import_module("process.provider_quality_parts.lifecycle")
@@ -157,6 +158,11 @@ def test_cohort_sql_split_keeps_facade_helpers_stable():
         is provider_quality_cohort_sql._cohort_sql_phase_6_build_domain_shard
     )
     assert provider_quality._cohort_sql_phase_7_build_score_shard is provider_quality_cohort_sql._cohort_sql_phase_7_build_score_shard
+
+
+def test_cohort_context_split_keeps_wrapper_available():
+    assert callable(provider_quality_cohort_context._build_cohort_materialization_context)
+    assert callable(provider_quality._build_cohort_materialization_context)
 
 
 def test_model_helper_split_keeps_facade_helpers_stable():
