@@ -40,6 +40,7 @@ ptg_serving_maintenance = importlib.import_module("process.ptg_parts.serving_mai
 ptg_serving_rows = importlib.import_module("process.ptg_parts.serving_rows")
 ptg_serving_only = importlib.import_module("process.ptg_parts.serving_only")
 ptg_snapshot_cleanup = importlib.import_module("process.ptg_parts.snapshot_cleanup")
+ptg_snapshot_artifacts = importlib.import_module("process.ptg_parts.snapshot_artifacts")
 ptg_snapshot_tables = importlib.import_module("process.ptg_parts.snapshot_tables")
 ptg_source_download = importlib.import_module("process.ptg_parts.source_download")
 ptg_source_files = importlib.import_module("process.ptg_parts.source_files")
@@ -243,6 +244,15 @@ def test_snapshot_cleanup_split_keeps_facade_helpers_stable():
     assert process_ptg._drop_ptg2_snapshot_table_names is ptg_snapshot_cleanup._drop_ptg2_snapshot_table_names
     assert process_ptg._drop_ptg2_snapshot_tables_for_manifest is ptg_snapshot_cleanup._drop_ptg2_snapshot_tables_for_manifest
     assert process_ptg._cleanup_old_ptg2_source_tables is ptg_snapshot_cleanup._cleanup_old_ptg2_source_tables
+
+
+def test_snapshot_artifact_split_keeps_facade_helpers_stable():
+    assert process_ptg._row_mapping is ptg_snapshot_artifacts._row_mapping
+    assert process_ptg.build_ptg2_snapshot_index_artifact is ptg_snapshot_artifacts.build_ptg2_snapshot_index_artifact
+    assert (
+        process_ptg.build_ptg2_compact_snapshot_index_artifact
+        is ptg_snapshot_artifacts.build_ptg2_compact_snapshot_index_artifact
+    )
 
 
 def test_rust_publish_split_keeps_facade_helpers_stable():
