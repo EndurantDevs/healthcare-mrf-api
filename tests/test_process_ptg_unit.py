@@ -2428,7 +2428,7 @@ def test_ptg2_compact_finalize_defers_provider_locations_by_default(monkeypatch)
     assert any("ANALYZE mrf.ptg2_serving_rate_compact" in statement for statement in status_calls)
 
 
-def test_ptg2_rust_snapshot_publish_dedupes_dictionary_stages_before_index(monkeypatch):
+def test_ptg2_rust_snapshot_publish_renames_dictionary_stages_before_index(monkeypatch):
     status_calls = []
 
     async def fake_status(statement, **_params):
@@ -2448,14 +2448,13 @@ def test_ptg2_rust_snapshot_publish_dedupes_dictionary_stages_before_index(monke
     monkeypatch.setattr(process_ptg.db, "all", fake_all)
     monkeypatch.setattr(process_ptg, "_table_exists", fake_table_exists)
     monkeypatch.setattr(process_ptg, "_table_has_rows", AsyncMock(return_value=True))
-    async def fake_estimated_rows(_schema, table_name):
-        if table_name.startswith("ptg2_serving_rate_compact_"):
-            return 987
+    async def fake_estimated_rows(_schema, _table_name):
         return 123
 
     estimate_mock = AsyncMock(side_effect=fake_estimated_rows)
+    exact_mock = AsyncMock(return_value=987)
     monkeypatch.setattr(process_ptg, "_estimated_table_rows", estimate_mock)
-    monkeypatch.setenv("HLTHPRT_PTG2_PUBLISH_DEDUPE_BUCKETS", "2")
+    monkeypatch.setattr(process_ptg, "_exact_table_rows", exact_mock)
 
     result = asyncio.run(
         process_ptg._publish_rust_compact_snapshot_tables(
@@ -2504,11 +2503,13 @@ def test_ptg2_rust_snapshot_publish_dedupes_dictionary_stages_before_index(monke
     )
     assert "PTG2_PUBLISH_STAGE_INDEX_START" not in joined
     assert "CREATE INDEX IF NOT EXISTS" in joined
+    exact_mock.assert_awaited_once()
+    assert exact_mock.await_args.args[1].startswith("ptg2_serving_rate_compact_")
     serving_estimate_calls = [
         call for call in estimate_mock.await_args_list
         if call.args[1].startswith("ptg2_serving_rate_compact_")
     ]
-    assert len(serving_estimate_calls) == 1
+    assert serving_estimate_calls == []
 
 
 def test_ptg2_serving_stage_table_for_copy_uses_worker_lane():
@@ -2558,7 +2559,10 @@ def test_ptg2_rust_snapshot_publish_inherits_serving_stage_lanes(monkeypatch):
     async def fake_table_has_rows(_schema, table):
         return table != "stage_empty_base"
 
-    async def fake_estimated_rows(_schema, table_name):
+    async def fake_estimated_rows(_schema, _table_name):
+        return 0
+
+    async def fake_exact_rows(_schema, table_name):
         if table_name.endswith("_p00"):
             return 100
         if table_name.endswith("_p01"):
@@ -2570,6 +2574,7 @@ def test_ptg2_rust_snapshot_publish_inherits_serving_stage_lanes(monkeypatch):
     monkeypatch.setattr(process_ptg, "_table_exists", fake_table_exists)
     monkeypatch.setattr(process_ptg, "_table_has_rows", fake_table_has_rows)
     monkeypatch.setattr(process_ptg, "_estimated_table_rows", fake_estimated_rows)
+    monkeypatch.setattr(process_ptg, "_exact_table_rows", fake_exact_rows)
 
     result = asyncio.run(
         process_ptg._publish_rust_compact_snapshot_tables(

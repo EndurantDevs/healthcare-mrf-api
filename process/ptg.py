@@ -140,7 +140,6 @@ from process.ptg_parts.config import (
     PTG2_DEFAULT_COMPACT_SERVING_COPY_TASKS,
     PTG2_DEFAULT_DOWNLOAD_TASKS,
     PTG2_DEFAULT_INDEX_TASKS,
-    PTG2_DEFAULT_PUBLISH_DEDUPE_BUCKETS,
     PTG2_DEFAULT_RANGE_DOWNLOAD_CHUNK_BYTES,
     PTG2_DEFAULT_RANGE_DOWNLOAD_MIN_BYTES,
     PTG2_DEFAULT_RANGE_DOWNLOAD_TASKS,
@@ -163,7 +162,6 @@ from process.ptg_parts.config import (
     PTG2_KEEP_PARTIAL_ENV,
     PTG2_KEEP_PRICE_SET_STAGE_ENV,
     PTG2_KEEP_SERVING_RATE_STAGE_ENV,
-    PTG2_PUBLISH_DEDUPE_BUCKETS_ENV,
     PTG2_PRICE_BATCH_ROWS_ENV,
     PTG2_PROGRESS_INTERVAL_SECONDS_ENV,
     PTG2_PROVIDER_BUCKET_COUNT_ENV,
@@ -2085,119 +2083,6 @@ def _ptg2_publish_timestamp() -> str:
     return datetime.datetime.now().isoformat(timespec="seconds")
 
 
-def _ptg2_hash_prefix_buckets(count: int) -> list[str]:
-    count = 16 if count <= 16 else 256
-    width = 2 if count > 16 else 1
-    return [format(index, f"0{width}x") for index in range(count)]
-
-
-def _ptg2_hash_prefix_bucket_end(bucket: str) -> str:
-    next_value = int(bucket, 16) + 1
-    max_value = 16 ** len(bucket)
-    if next_value >= max_value:
-        return "g"
-    return format(next_value, f"0{len(bucket)}x")
-
-
-async def _publish_deduped_rust_dictionary_table(
-    *,
-    schema_name: str,
-    kind: str,
-    stage_table: str,
-    final_table: str,
-) -> float:
-    _target_table, columns, conflict_targets = _RUST_COPY_TABLE_SPECS[kind]
-    quoted_columns = ", ".join(_quote_ident(column) for column in columns)
-    select_columns = _ptg2_dictionary_select_columns(kind, columns)
-    quoted_conflict = ", ".join(_quote_ident(column) for column in conflict_targets)
-    storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
-    start_message = (
-        f"PTG2_PUBLISH_TABLE_START time={_ptg2_publish_timestamp()} "
-        f"kind={kind} stage={schema_name}.{stage_table} final={schema_name}.{final_table}"
-    )
-    _emit_screen_line(start_message)
-    logger.info(start_message)
-    started_at = time.monotonic()
-    await db.status(
-        f"""
-        CREATE {storage_mode}TABLE {_quote_ident(schema_name)}.{_quote_ident(final_table)}
-        (LIKE {_quote_ident(schema_name)}.{_quote_ident(_target_table)} INCLUDING DEFAULTS);
-        """
-    )
-    if "hash_prefix" in columns:
-        bucket_count = max(
-            1,
-            _env_int(PTG2_PUBLISH_DEDUPE_BUCKETS_ENV, PTG2_DEFAULT_PUBLISH_DEDUPE_BUCKETS),
-        )
-        bucket_column = conflict_targets[0] if len(conflict_targets) == 1 else "hash_prefix"
-        stage_index_name = _ptg2_snapshot_index_name(stage_table, f"publish_{bucket_column}_idx")
-        index_started = time.monotonic()
-        index_start_message = (
-            f"PTG2_PUBLISH_STAGE_INDEX_START time={_ptg2_publish_timestamp()} "
-            f"kind={kind} stage={schema_name}.{stage_table} column={bucket_column} index={stage_index_name}"
-        )
-        _emit_screen_line(index_start_message)
-        logger.info(index_start_message)
-        await db.status(
-            f"""
-            CREATE INDEX IF NOT EXISTS {_quote_ident(stage_index_name)}
-            ON {_quote_ident(schema_name)}.{_quote_ident(stage_table)} ({_quote_ident(bucket_column)});
-            """
-        )
-        await db.status(f"ANALYZE {_quote_ident(schema_name)}.{_quote_ident(stage_table)};")
-        index_done_message = (
-            f"PTG2_PUBLISH_STAGE_INDEX_DONE time={_ptg2_publish_timestamp()} "
-            f"kind={kind} stage={schema_name}.{stage_table} column={bucket_column} "
-            f"elapsed_seconds={time.monotonic() - index_started:.2f}"
-        )
-        _emit_screen_line(index_done_message)
-        logger.info(index_done_message)
-        buckets = _ptg2_hash_prefix_buckets(bucket_count)
-        for bucket in buckets:
-            bucket_started = time.monotonic()
-            bucket_message = (
-                f"PTG2_PUBLISH_DEDUPE_BUCKET_START time={_ptg2_publish_timestamp()} "
-                f"kind={kind} bucket={bucket} buckets={len(buckets)} column={bucket_column}"
-            )
-            _emit_screen_line(bucket_message)
-            logger.info(bucket_message)
-            await db.status(
-                f"""
-                INSERT INTO {_quote_ident(schema_name)}.{_quote_ident(final_table)} ({quoted_columns})
-                SELECT DISTINCT ON ({quoted_conflict}) {select_columns}
-                FROM {_quote_ident(schema_name)}.{_quote_ident(stage_table)}
-                WHERE {_quote_ident(bucket_column)} >= :bucket_start
-                  AND {_quote_ident(bucket_column)} < :bucket_end
-                ORDER BY {quoted_conflict};
-                """,
-                bucket_start=bucket,
-                bucket_end=_ptg2_hash_prefix_bucket_end(bucket),
-            )
-            bucket_done = (
-                f"PTG2_PUBLISH_DEDUPE_BUCKET_DONE time={_ptg2_publish_timestamp()} "
-                f"kind={kind} bucket={bucket} elapsed_seconds={time.monotonic() - bucket_started:.2f}"
-            )
-            _emit_screen_line(bucket_done)
-            logger.info(bucket_done)
-    else:
-        await db.status(
-            f"""
-            INSERT INTO {_quote_ident(schema_name)}.{_quote_ident(final_table)} ({quoted_columns})
-            SELECT DISTINCT ON ({quoted_conflict}) {select_columns}
-            FROM {_quote_ident(schema_name)}.{_quote_ident(stage_table)}
-            ORDER BY {quoted_conflict};
-            """
-        )
-    await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(stage_table)};")
-    done_message = (
-        f"PTG2_PUBLISH_TABLE_DONE time={_ptg2_publish_timestamp()} "
-        f"kind={kind} elapsed_seconds={time.monotonic() - started_at:.2f}"
-    )
-    _emit_screen_line(done_message)
-    logger.info(done_message)
-    return time.monotonic() - started_at
-
-
 async def _publish_renamed_rust_dictionary_table(
     *,
     schema_name: str,
@@ -2337,6 +2222,9 @@ async def _publish_rust_compact_snapshot_tables(
     analyze_seconds = 0.0
     # Source-scoped compact stages are scanner-deduped. Publish dictionary
     # stages by rename and let unique-index creation validate correctness.
+    # Follow-ups: move remaining low-value serving-rate dedupe into Rust or gate
+    # it explicitly, make string dictionary dedupe exact in Rust, and only
+    # reintroduce a bucketed SQL fallback if direct rename proves unsafe.
     for kind in rename_order:
         stage_table = stage_tables.get(kind)
         final_table = table_names.get(kind)
@@ -2479,9 +2367,9 @@ async def _publish_rust_compact_snapshot_tables(
     if serving_index_tables and serving_index_tables != [serving_table]:
         rate_count = 0
         for table_name in serving_index_tables:
-            rate_count += await _estimated_table_rows(schema_name, table_name)
+            rate_count += await _exact_table_rows(schema_name, table_name)
     else:
-        rate_count = await _estimated_table_rows(schema_name, serving_table)
+        rate_count = await _exact_table_rows(schema_name, serving_table)
     return {
         "type": "db_compact",
         "storage": "db_compact_snapshot",
