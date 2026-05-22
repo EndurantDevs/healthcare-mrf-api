@@ -8,6 +8,7 @@ provider_quality_cohort_context = importlib.import_module("process.provider_qual
 provider_quality_cohort_sql = importlib.import_module("process.provider_quality_parts.cohort_sql")
 provider_quality_execution_helpers = importlib.import_module("process.provider_quality_parts.execution_helpers")
 provider_quality_lifecycle = importlib.import_module("process.provider_quality_parts.lifecycle")
+provider_quality_materialize_shards = importlib.import_module("process.provider_quality_parts.materialize_shards")
 provider_quality_model_helpers = importlib.import_module("process.provider_quality_parts.model_helpers")
 provider_quality_normalize = importlib.import_module("process.provider_quality_parts.normalize")
 provider_quality_publish_helpers = importlib.import_module("process.provider_quality_parts.publish_helpers")
@@ -188,6 +189,27 @@ def test_table_helper_split_keeps_facade_helpers_stable():
 def test_publish_helper_split_keeps_facade_helpers_stable():
     assert provider_quality._publish_by_table_rename is provider_quality_publish_helpers._publish_by_table_rename
     assert provider_quality._insert_run_metadata is provider_quality_publish_helpers._insert_run_metadata
+
+
+def test_materialize_shard_split_keeps_facade_handlers_stable():
+    assert provider_quality._materialize_shard_task_values is provider_quality_materialize_shards._materialize_shard_task_values
+    assert provider_quality._run_materialize_shard_job is provider_quality_materialize_shards._run_materialize_shard_job
+    assert (
+        provider_quality.provider_quality_materialize_lsh_shard
+        is provider_quality_materialize_shards.provider_quality_materialize_lsh_shard
+    )
+    assert (
+        provider_quality.provider_quality_materialize_measure_shard
+        is provider_quality_materialize_shards.provider_quality_materialize_measure_shard
+    )
+    assert (
+        provider_quality.provider_quality_materialize_domain_shard
+        is provider_quality_materialize_shards.provider_quality_materialize_domain_shard
+    )
+    assert (
+        provider_quality.provider_quality_materialize_score_shard
+        is provider_quality_materialize_shards.provider_quality_materialize_score_shard
+    )
 
 
 def test_execution_helper_split_keeps_facade_helpers_stable():
