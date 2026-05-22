@@ -382,9 +382,11 @@ from process.ptg_parts.source_jobs import (
     _load_toc_urls_from_file,
     _merge_ptg_job,
     _normalize_filter_values,
+    _normalize_plan_payload,
     _plan_identity,
     _plan_matches_filters,
     _ptg_job_identity,
+    parse_toc_catalog_entries,
 )
 from process.ptg_parts.values import (
     _catalog_entry_id,
@@ -495,117 +497,6 @@ def _emit_download_progress(
     )
     _emit_screen_line(line, stderr=True)
     logger.info(line)
-
-
-def _normalize_plan_payload(plan: dict[str, Any]) -> dict[str, Any]:
-    normalized = dict(plan or {})
-    if "plan_sponsor_name" not in normalized and normalized.get("plan_sponser_name"):
-        normalized["plan_sponsor_name"] = normalized.get("plan_sponser_name")
-    return normalized
-
-
-def parse_toc_catalog_entries(
-    toc_content: dict[str, Any],
-    toc_url: str,
-    plan_ids: list[str] | None = None,
-    plan_name_contains: list[str] | None = None,
-    plan_market_types: list[str] | None = None,
-) -> list[PTG2SourceCatalogEntry]:
-    toc_meta = {
-        "reporting_entity_name": toc_content.get("reporting_entity_name"),
-        "reporting_entity_type": toc_content.get("reporting_entity_type"),
-        "last_updated_on": toc_content.get("last_updated_on"),
-        "version": toc_content.get("version"),
-    }
-    entries = [
-        PTG2SourceCatalogEntry(
-            source_type="table-of-contents",
-            domain="catalog",
-            original_url=toc_url,
-            canonical_url=canonicalize_url(toc_url),
-            description=toc_content.get("description"),
-            reporting_entity_name=toc_meta["reporting_entity_name"],
-            reporting_entity_type=toc_meta["reporting_entity_type"],
-            plan_info=(),
-        )
-    ]
-    for structure in toc_content.get("reporting_structure", []) or []:
-        plans = [_normalize_plan_payload(plan) for plan in (structure.get("reporting_plans") or [])]
-        plans = _filter_reporting_plans(
-            plans,
-            plan_ids=plan_ids,
-            plan_name_contains=plan_name_contains,
-            plan_market_types=plan_market_types,
-        )
-        if not plans:
-            continue
-        plan_tuple = tuple(plans)
-        for file_entry in structure.get("in_network_files") or []:
-            location = file_entry.get("location")
-            if location:
-                location = normalize_tic_source_url(location)
-                entries.append(
-                    PTG2SourceCatalogEntry(
-                        source_type="in-network",
-                        domain=PTG2_DOMAIN_IN_NETWORK,
-                        original_url=location,
-                        canonical_url=canonicalize_url(location),
-                        from_index_url=toc_url,
-                        description=file_entry.get("description"),
-                        reporting_entity_name=toc_meta["reporting_entity_name"],
-                        reporting_entity_type=toc_meta["reporting_entity_type"],
-                        plan_info=plan_tuple,
-                    )
-                )
-        allowed_amount_file = structure.get("allowed_amount_file") or {}
-        if allowed_amount_file.get("location"):
-            location = normalize_tic_source_url(allowed_amount_file["location"])
-            entries.append(
-                PTG2SourceCatalogEntry(
-                    source_type="allowed-amounts",
-                    domain=PTG2_DOMAIN_ALLOWED_AMOUNT,
-                    original_url=location,
-                    canonical_url=canonicalize_url(location),
-                    from_index_url=toc_url,
-                    description=allowed_amount_file.get("description"),
-                    reporting_entity_name=toc_meta["reporting_entity_name"],
-                    reporting_entity_type=toc_meta["reporting_entity_type"],
-                    plan_info=plan_tuple,
-                )
-            )
-        for drug_key in (
-            "drug_file",
-            "drug_files",
-            "ndc_file",
-            "ndc_files",
-            "prescription_drug_file",
-            "prescription_drug_files",
-            "payer_specific_drug_files",
-        ):
-            drug_entries = _as_list(structure.get(drug_key))
-            for drug_entry in drug_entries:
-                if not isinstance(drug_entry, dict):
-                    continue
-                location = drug_entry.get("location")
-                if location:
-                    location = normalize_tic_source_url(location)
-                    entries.append(
-                        PTG2SourceCatalogEntry(
-                            source_type="payer-drug",
-                            domain=PTG2_DOMAIN_DRUG,
-                            original_url=location,
-                            canonical_url=canonicalize_url(location),
-                            from_index_url=toc_url,
-                            description=drug_entry.get("description"),
-                            reporting_entity_name=toc_meta["reporting_entity_name"],
-                            reporting_entity_type=toc_meta["reporting_entity_type"],
-                            plan_info=plan_tuple,
-                        )
-                    )
-    deduped: dict[tuple[str, str, str], PTG2SourceCatalogEntry] = {}
-    for entry in entries:
-        deduped[(entry.source_type, entry.domain, entry.canonical_url)] = entry
-    return list(deduped.values())
 
 
 async def fetch_head_metadata(url: str, timeout_seconds: int = 30) -> PTG2HeadMetadata:
