@@ -27,6 +27,7 @@ ptg_json_streams = importlib.import_module("process.ptg_parts.json_streams")
 ptg_row_helpers = importlib.import_module("process.ptg_parts.row_helpers")
 ptg_rust_scanner = importlib.import_module("process.ptg_parts.rust_scanner")
 ptg_screen = importlib.import_module("process.ptg_parts.screen")
+ptg_serving_rows = importlib.import_module("process.ptg_parts.serving_rows")
 ptg_serving_only = importlib.import_module("process.ptg_parts.serving_only")
 ptg_values = importlib.import_module("process.ptg_parts.values")
 
@@ -109,6 +110,14 @@ def test_serving_only_split_keeps_facade_helpers_stable():
     assert process_ptg._worker_payload_size is ptg_serving_only._worker_payload_size
     assert process_ptg._iter_worker_result_rows is ptg_serving_only._iter_worker_result_rows
     assert process_ptg._ptg2_worker_capacity_wait_needed is ptg_serving_only._ptg2_worker_capacity_wait_needed
+
+
+def test_serving_row_split_keeps_facade_helpers_stable():
+    assert process_ptg._ptg2_hp_procedure_code is ptg_serving_rows._ptg2_hp_procedure_code
+    assert process_ptg._ptg2_serving_rate_row is ptg_serving_rows._ptg2_serving_rate_row
+    assert process_ptg._ptg2_compact_serving_rate_row is ptg_serving_rows._ptg2_compact_serving_rate_row
+    assert process_ptg._provider_group_member_rows is ptg_serving_rows._provider_group_member_rows
+    assert process_ptg._provider_set_component_rows is ptg_serving_rows._provider_set_component_rows
 
 
 def test_filter_reporting_plans_matches_group_plan_id():
