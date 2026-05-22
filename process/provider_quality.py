@@ -190,6 +190,12 @@ from process.provider_quality_parts.state import (
     _set_materialize_phase,
     _state_key,
 )
+from process.provider_quality_parts.table_helpers import (
+    _build_staging_indexes,
+    _ensure_indexes,
+    _table_columns,
+    _table_exists,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -428,36 +434,6 @@ def _row_allowed_for_test(row_number: int) -> bool:
     return row_number % 11 == 0
 
 
-async def _ensure_indexes(obj: type, db_schema: str) -> None:
-    if hasattr(obj, "__my_index_elements__") and obj.__my_index_elements__:
-        cols = ", ".join(obj.__my_index_elements__)
-        await db.status(
-            "CREATE UNIQUE INDEX IF NOT EXISTS "
-            + f"{obj.__tablename__}_idx_primary ON {db_schema}.{obj.__tablename__} ({cols});"
-        )
-    if hasattr(obj, "__my_additional_indexes__") and obj.__my_additional_indexes__:
-        for idx in obj.__my_additional_indexes__:
-            elements = idx.get("index_elements")
-            if not elements:
-                continue
-            base_name = idx.get("name") or f"{obj.__tablename__}_{'_'.join(elements)}_idx"
-            if getattr(obj, "__main_table__", obj.__tablename__) != obj.__tablename__:
-                name = f"{obj.__tablename__}_{base_name}"
-            else:
-                name = base_name
-            using = idx.get("using")
-            where = idx.get("where")
-            cols = ", ".join(elements)
-            statement = f"CREATE INDEX IF NOT EXISTS {name} ON {db_schema}.{obj.__tablename__}"
-            if using:
-                statement += f" USING {using}"
-            statement += f" ({cols})"
-            if where:
-                statement += f" WHERE {where}"
-            statement += ";"
-            await db.status(statement)
-
-
 async def _prepare_tables(stage_suffix: str, test_mode: bool) -> tuple[dict[str, type], str]:
     db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
     await db.status(f"CREATE SCHEMA IF NOT EXISTS {db_schema};")
@@ -484,31 +460,6 @@ async def _prepare_tables(stage_suffix: str, test_mode: bool) -> tuple[dict[str,
         await db.create_table(cls.__table__, checkfirst=True)
 
     return dynamic, db_schema
-
-
-async def _build_staging_indexes(classes: dict[str, type], schema: str) -> None:
-    for model in classes.values():
-        await _ensure_indexes(model, schema)
-
-
-async def _table_exists(schema: str, table: str) -> bool:
-    table_ref = f"{schema}.{table}"
-    result = await db.scalar("SELECT to_regclass(:table_ref)", table_ref=table_ref)
-    return result is not None
-
-
-async def _table_columns(schema: str, table: str) -> set[str]:
-    rows = await db.all(
-        """
-        SELECT column_name
-          FROM information_schema.columns
-         WHERE table_schema = :schema
-           AND table_name = :table
-        """,
-        schema=schema,
-        table=table,
-    )
-    return {str(getattr(row, "column_name", "") or "").strip() for row in rows if getattr(row, "column_name", None)}
 
 
 async def _download_csv_head(url: str, path: str, max_bytes: int) -> None:
