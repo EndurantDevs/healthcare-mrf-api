@@ -1948,6 +1948,7 @@ async def get_all(request):
     codes = request.args.get("codes")
     if codes:
         codes = [x.strip() for x in codes.split(",")]
+    _validate_section_filters(section, classification, codes)
 
     if plan_network:
         plan_network = [int(x) for x in plan_network.split(",")]
