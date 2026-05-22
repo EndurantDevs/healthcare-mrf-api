@@ -21,7 +21,6 @@ import ijson
 import asyncio
 import concurrent.futures
 import multiprocessing
-import pickle
 import re
 
 from db.connection import db
@@ -316,6 +315,7 @@ from process.ptg_parts.serving_only import (
     _serving_only_merge_worker_result,
     _serving_only_price_payload,
     _serving_only_price_payload_and_key,
+    _serving_only_worker_process_chunk_to_files as _serving_only_worker_process_chunk_to_files_impl,
     _worker_payload_size,
 )
 from process.ptg_parts.values import (
@@ -6141,53 +6141,7 @@ def _serving_only_worker_process_chunk(
 def _serving_only_worker_process_chunk_to_files(
     payloads_or_raw: list[dict[str, Any] | bytes | bytearray],
 ) -> dict[str, Any]:
-    key_fields = {
-        "serving_rows": "serving_rate_id",
-        "serving_rate_compact_rows": "serving_rate_id",
-        "provider_set_rows": "provider_set_hash",
-        "price_set_rows": "price_set_hash",
-        "provider_set_component_rows": ("provider_set_hash", "provider_group_hash"),
-        "provider_group_member_rows": ("provider_group_hash", "npi"),
-        "procedure_rows": "procedure_hash",
-    }
-    temp_dir = Path(tempfile.mkdtemp(prefix="ptg2_worker_result_"))
-    handles: dict[str, Any] = {}
-    paths: dict[str, str] = {}
-    counts: dict[str, int] = {}
-    seen: dict[str, set[Any]] = {key: set() for key in key_fields}
-    try:
-        for payload_or_raw in payloads_or_raw:
-            result = _serving_only_worker_process(payload_or_raw)
-            for key, id_field in key_fields.items():
-                rows = result.get(key) or []
-                if not rows:
-                    continue
-                handle = handles.get(key)
-                if handle is None:
-                    path = temp_dir / f"{key}.pickle"
-                    handle = path.open("wb")
-                    handles[key] = handle
-                    paths[key] = str(path)
-                key_seen = seen[key]
-                for row in rows:
-                    if isinstance(id_field, tuple):
-                        dedupe_id = tuple(row.get(part) for part in id_field)
-                    else:
-                        dedupe_id = row.get(id_field)
-                    if dedupe_id in key_seen:
-                        continue
-                    key_seen.add(dedupe_id)
-                    pickle.dump(row, handle, protocol=pickle.HIGHEST_PROTOCOL)
-                    counts[key] = counts.get(key, 0) + 1
-    finally:
-        for handle in handles.values():
-            handle.close()
-    return {
-        "__worker_result_files__": True,
-        "temp_dir": str(temp_dir),
-        "paths": paths,
-        "counts": counts,
-    }
+    return _serving_only_worker_process_chunk_to_files_impl(payloads_or_raw, _serving_only_worker_process)
 
 
 async def _parse_in_network_file_serving_only(
