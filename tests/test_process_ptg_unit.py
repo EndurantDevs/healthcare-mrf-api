@@ -33,6 +33,7 @@ ptg_screen = importlib.import_module("process.ptg_parts.screen")
 ptg_serving_rows = importlib.import_module("process.ptg_parts.serving_rows")
 ptg_serving_only = importlib.import_module("process.ptg_parts.serving_only")
 ptg_snapshot_tables = importlib.import_module("process.ptg_parts.snapshot_tables")
+ptg_source_pointers = importlib.import_module("process.ptg_parts.source_pointers")
 ptg_values = importlib.import_module("process.ptg_parts.values")
 
 
@@ -118,6 +119,12 @@ def test_snapshot_table_split_keeps_facade_helpers_stable():
     assert process_ptg._ptg2_snapshot_table_token is ptg_snapshot_tables._ptg2_snapshot_table_token
     assert process_ptg._ptg2_snapshot_table_name is ptg_snapshot_tables._ptg2_snapshot_table_name
     assert process_ptg._ptg2_snapshot_index_name is ptg_snapshot_tables._ptg2_snapshot_index_name
+
+
+def test_source_pointer_split_keeps_facade_helpers_stable():
+    assert process_ptg._ptg2_plan_source_key is ptg_source_pointers._ptg2_plan_source_key
+    assert process_ptg._current_source_snapshot_id is ptg_source_pointers._current_source_snapshot_id
+    assert process_ptg._source_plan_rows is ptg_source_pointers._source_plan_rows
 
 
 def test_rust_scanner_split_keeps_facade_helpers_stable():
@@ -2646,6 +2653,49 @@ def test_ptg2_rust_snapshot_publish_inherits_serving_stage_lanes(monkeypatch):
     assert "INSERT INTO" not in joined
     assert "_p00" in joined
     assert "_p01" in joined
+
+
+def test_ptg2_source_plan_rows_falls_back_to_serving_index_table(monkeypatch):
+    calls = []
+
+    async def fake_all(statement, **_params):
+        calls.append(statement)
+        if "FROM \"mrf\".\"ptg2_serving_rate_compact_exact\"" in statement:
+            return [{"plan_id": "010854205", "plan_market_type": ""}]
+        return []
+
+    monkeypatch.setattr(ptg_source_pointers.db, "all", fake_all)
+    monkeypatch.setattr(ptg_source_pointers, "_table_exists", AsyncMock(return_value=True))
+    updated_at = process_ptg._utcnow()
+
+    rows = asyncio.run(
+        process_ptg._source_plan_rows(
+            snapshot_id="snap",
+            source_key="heartland_dental",
+            import_month=process_ptg.normalize_import_month("2026-04"),
+            previous_snapshot_id="prev",
+            updated_at=updated_at,
+            serving_index={"table": "mrf.ptg2_serving_rate_compact_exact"},
+        )
+    )
+
+    assert rows == [
+        {
+            "plan_source_key": process_ptg._ptg2_plan_source_key(
+                "010854205",
+                "",
+                process_ptg.normalize_import_month("2026-04"),
+            ),
+            "plan_id": "010854205",
+            "plan_market_type": "",
+            "import_month": process_ptg.normalize_import_month("2026-04"),
+            "source_key": "heartland_dental",
+            "snapshot_id": "snap",
+            "previous_snapshot_id": "prev",
+            "updated_at": updated_at,
+        }
+    ]
+    assert len(calls) == 2
 
 
 def test_ptg2_source_scoped_report_uses_published_serving_rate_count(monkeypatch):
