@@ -129,8 +129,13 @@ Public documentation for this repository is organized under [`docs/`](./docs/REA
 Recommended reading order:
 
 - [Documentation index](./docs/README.md)
+- [Architecture overview](./docs/architecture.md)
 - [Data sources](./docs/data-sources.md)
 - [Import processes](./docs/imports/README.md)
+
+Engineering specs and design notes: see [`specs/`](./specs/). Start with
+[`specs/base_arch_prompt.md`](./specs/base_arch_prompt.md) and
+[`specs/data_source_registry.md`](./specs/data_source_registry.md).
 
 Per-import documentation:
 
@@ -154,8 +159,6 @@ Per-import documentation:
 - [Provider enrichment import](./docs/imports/provider-enrichment.md)
 - [Part D formulary and pharmacy network import](./docs/imports/partd-formulary-network.md)
 - [Pharmacy license import](./docs/imports/pharmacy-license.md)
-
-Low-level technical specifications and design notes remain in [`specs/`](./specs/).
 
 ## Local Development
 
