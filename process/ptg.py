@@ -190,6 +190,8 @@ PTG2_COMPACT_BULK_DROP_INDEXES_ENV = "HLTHPRT_PTG2_COMPACT_BULK_DROP_INDEXES"
 PTG2_SKIP_BULK_INDEX_ENSURE_ENV = "HLTHPRT_PTG2_SKIP_BULK_INDEX_ENSURE"
 PTG2_SKIP_COMPACT_FINALIZE_ENV = "HLTHPRT_PTG2_SKIP_COMPACT_FINALIZE"
 PTG2_SKIP_COMPACT_SERVING_INDEX_ENSURE_ENV = "HLTHPRT_PTG2_SKIP_COMPACT_SERVING_INDEX_ENSURE"
+PTG2_COMPACT_SERVING_INDEX_MODE_ENV = "HLTHPRT_PTG2_COMPACT_SERVING_INDEX_MODE"
+PTG2_COMPACT_DICTIONARY_INDEX_MODE_ENV = "HLTHPRT_PTG2_COMPACT_DICTIONARY_INDEX_MODE"
 PTG2_INDEX_TASKS_ENV = "HLTHPRT_PTG2_INDEX_TASKS"
 PTG2_FAST_FINAL_REBUILD_ENV = "HLTHPRT_PTG2_FAST_FINAL_REBUILD"
 PTG2_DEFER_PROVIDER_LOCATIONS_ENV = "HLTHPRT_PTG2_DEFER_PROVIDER_LOCATIONS"
@@ -249,7 +251,9 @@ PTG2_STAGE_COPY_DEDUPE_DEFAULT_KINDS = frozenset(
         "procedure",
         "price_code_set",
         "price_atom",
+        "price_set_entry",
         "provider_set",
+        "provider_set_component",
         "provider_group_member",
         "provider_set_entry",
     }
@@ -2332,19 +2336,14 @@ async def _copy_compact_serving_rate_rows(rows: list[dict[str, Any]], snapshot_i
         "serving_rate_id",
         "snapshot_id",
         "plan_id",
-        "plan_month_id",
         "procedure_hash",
         "procedure_code",
         "reported_code_system",
         "reported_code",
-        "billing_code",
-        "billing_code_type",
-        "rate_pack_hash",
         "provider_set_hash",
         "provider_count",
         "price_set_hash",
         "source_trace_set_hash",
-        "confidence_code",
         "created_at",
     ]
     records = [
@@ -2352,19 +2351,14 @@ async def _copy_compact_serving_rate_rows(rows: list[dict[str, Any]], snapshot_i
             row.get("serving_rate_id"),
             snapshot_id,
             row.get("plan_id"),
-            row.get("plan_month_id"),
             row.get("procedure_hash"),
             row.get("procedure_code"),
             row.get("reported_code_system"),
             row.get("reported_code"),
-            row.get("billing_code"),
-            row.get("billing_code_type"),
-            row.get("rate_pack_hash"),
             row.get("provider_set_hash"),
             row.get("provider_count"),
             row.get("price_set_hash"),
             row.get("source_trace_set_hash"),
-            row.get("confidence_code"),
             row.get("created_at"),
         )
         for row in rows
@@ -2392,19 +2386,14 @@ async def _copy_compact_serving_rate_source(source, *, target_table: str = "ptg2
         "serving_rate_id",
         "snapshot_id",
         "plan_id",
-        "plan_month_id",
         "procedure_hash",
         "procedure_code",
         "reported_code_system",
         "reported_code",
-        "billing_code",
-        "billing_code_type",
-        "rate_pack_hash",
         "provider_set_hash",
         "provider_count",
         "price_set_hash",
         "source_trace_set_hash",
-        "confidence_code",
     ]
     async with db.acquire() as conn:
         raw_conn = conn.raw_connection
@@ -2471,6 +2460,11 @@ async def _copy_ptg2_dictionary_file(copy_path: Path, kind: str, *, target_table
             "ptg2_provider_group_member",
             ["provider_group_hash", "npi"],
             ["provider_group_hash", "npi"],
+        ),
+        "provider_set_component": (
+            "ptg2_provider_set_component",
+            ["provider_set_hash", "provider_group_hash"],
+            ["provider_set_hash", "provider_group_hash"],
         ),
         "provider_set_entry": (
             "ptg2_provider_set_entry",
@@ -2578,19 +2572,14 @@ _RUST_COPY_TABLE_SPECS = {
             "serving_rate_id",
             "snapshot_id",
             "plan_id",
-            "plan_month_id",
             "procedure_hash",
             "procedure_code",
             "reported_code_system",
             "reported_code",
-            "billing_code",
-            "billing_code_type",
-            "rate_pack_hash",
             "provider_set_hash",
             "provider_count",
             "price_set_hash",
             "source_trace_set_hash",
-            "confidence_code",
         ],
         ["serving_rate_id"],
     ),
@@ -2634,15 +2623,10 @@ _RUST_COPY_TABLE_SPECS = {
         ["provider_group_hash", "npi"],
         ["provider_group_hash", "npi"],
     ),
-    "provider_set_entry": (
-        "ptg2_provider_set_entry",
-        ["provider_set_hash", "provider_entry_hash"],
-        ["provider_set_hash", "provider_entry_hash"],
-    ),
-    "provider_entry_component": (
-        "ptg2_provider_entry_component",
-        ["provider_entry_hash", "provider_group_hash"],
-        ["provider_entry_hash", "provider_group_hash"],
+    "provider_set_component": (
+        "ptg2_provider_set_component",
+        ["provider_set_hash", "provider_group_hash"],
+        ["provider_set_hash", "provider_group_hash"],
     ),
 }
 
@@ -2932,6 +2916,7 @@ _PTG2_COMPACT_MODEL_BY_KIND = {
     "price_atom": PTG2PriceAtom,
     "price_set_entry": PTG2PriceSetEntry,
     "provider_set": PTG2ProviderSet,
+    "provider_set_component": PTG2ProviderSetComponent,
     "provider_set_entry": PTG2ProviderSetEntry,
     "provider_entry_component": PTG2ProviderEntryComponent,
     "provider_group_member": PTG2ProviderGroupMember,
@@ -2949,7 +2934,34 @@ def _ptg2_index_timestamp() -> str:
     return datetime.datetime.now().isoformat(timespec="seconds")
 
 
+def _ptg2_compact_serving_index_mode() -> str:
+    mode = str(os.getenv(PTG2_COMPACT_SERVING_INDEX_MODE_ENV) or "reported").strip().lower()
+    return mode if mode in {"reported", "full", "none"} else "reported"
+
+
+def _ptg2_compact_dictionary_index_mode() -> str:
+    mode = str(os.getenv(PTG2_COMPACT_DICTIONARY_INDEX_MODE_ENV) or "serving").strip().lower()
+    return mode if mode in {"serving", "full"} else "serving"
+
+
+def _ptg2_compact_serving_reported_index_statement(schema_name: str, table_name: str) -> tuple[str, str]:
+    role = "reported_system_order_idx"
+    return (
+        role,
+        f"CREATE INDEX IF NOT EXISTS {_quote_ident(_ptg2_snapshot_index_name(table_name, role))} "
+        f"ON {_quote_ident(schema_name)}.{_quote_ident(table_name)} "
+        "(snapshot_id, plan_id, reported_code_system, reported_code, provider_count DESC, serving_rate_id);",
+    )
+
+
 def _ptg2_model_index_statements_for_table(model: type, schema_name: str, table_name: str) -> list[tuple[str, str]]:
+    if model is PTG2ServingRateCompact:
+        mode = _ptg2_compact_serving_index_mode()
+        if mode == "none":
+            return []
+        if mode == "reported":
+            return [_ptg2_compact_serving_reported_index_statement(schema_name, table_name)]
+
     statements: list[tuple[str, str]] = []
     primary_elements = tuple(str(element) for element in (getattr(model, "__my_index_elements__", None) or ()))
     if primary_elements:
@@ -2960,7 +2972,11 @@ def _ptg2_model_index_statements_for_table(model: type, schema_name: str, table_
             f"CREATE UNIQUE INDEX IF NOT EXISTS {_quote_ident(_ptg2_snapshot_index_name(table_name, role))} "
             f"ON {_quote_ident(schema_name)}.{_quote_ident(table_name)} ({', '.join(primary_elements)});",
         ))
-    for index in getattr(model, "__my_additional_indexes__", []) or ():
+    additional_indexes = list(getattr(model, "__my_additional_indexes__", []) or ())
+    if _ptg2_compact_dictionary_index_mode() == "serving":
+        if model in {PTG2Procedure, PTG2PriceAtom, PTG2PriceSetEntry, PTG2ProviderSet}:
+            additional_indexes = []
+    for index in additional_indexes:
         elements = tuple(str(element) for element in (index.get("index_elements") or ()))
         if not elements:
             continue
@@ -3300,8 +3316,7 @@ async def _publish_rust_compact_snapshot_tables(
         "price_atom",
         "price_set_entry",
         "provider_set",
-        "provider_set_entry",
-        "provider_entry_component",
+        "provider_set_component",
         "provider_group_member",
         "serving_rate_compact",
     )
@@ -3357,9 +3372,88 @@ async def _publish_rust_compact_snapshot_tables(
         )
     else:
         index_seconds += await _index_snapshot_compact_tables(schema_name, table_names)
+
+    provider_group_location_table = None
+    if table_names.get("provider_group_member"):
+        provider_group_location_table = _ptg2_snapshot_table_name("provider_group_location", source_key, snapshot_id)
+        await db.status(
+            f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(provider_group_location_table)};"
+        )
+        await db.status(
+            f"""
+            CREATE UNLOGGED TABLE {_quote_ident(schema_name)}.{_quote_ident(provider_group_location_table)} AS
+            SELECT DISTINCT
+                   pgm.provider_group_hash,
+                   pgm.npi,
+                   LEFT(COALESCE(addr.postal_code, ''), 5)::varchar(5) AS zip5,
+                   addr.state_name::varchar AS state_name,
+                   addr.city_name::varchar AS city_name,
+                   addr.lat,
+                   addr.long,
+                   addr.type::varchar AS address_type,
+                   addr.checksum::varchar AS address_checksum,
+                   addr.first_line::varchar AS first_line,
+                   addr.second_line::varchar AS second_line,
+                   addr.postal_code::varchar AS postal_code,
+                   addr.country_code::varchar AS country_code
+              FROM {_quote_ident(schema_name)}.{_quote_ident(table_names['provider_group_member'])} pgm
+              JOIN {_quote_ident(schema_name)}.npi_address addr
+                ON addr.npi = pgm.npi
+             WHERE addr.type IN ('primary', 'secondary')
+               AND (
+                    NULLIF(LEFT(COALESCE(addr.postal_code, ''), 5), '') IS NOT NULL
+                 OR NULLIF(addr.state_name, '') IS NOT NULL
+                 OR NULLIF(addr.city_name, '') IS NOT NULL
+                 OR (addr.lat IS NOT NULL AND addr.long IS NOT NULL)
+               );
+            """
+        )
+        location_indexes = [
+            (
+                "group_zip_idx",
+                "(provider_group_hash, zip5, npi)",
+            ),
+            (
+                "zip_group_idx",
+                "(zip5, provider_group_hash, npi)",
+            ),
+            (
+                "state_city_group_idx",
+                "(state_name, city_name, provider_group_hash, npi)",
+            ),
+            (
+                "state_city_npi_group_idx",
+                "(state_name, city_name, npi, provider_group_hash)",
+            ),
+            (
+                "npi_group_idx",
+                "(npi, provider_group_hash)",
+            ),
+            (
+                "group_npi_idx",
+                "(provider_group_hash, npi)",
+            ),
+            (
+                "lat_long_group_idx",
+                "(lat, long, provider_group_hash, npi) WHERE lat IS NOT NULL AND long IS NOT NULL",
+            ),
+        ]
+        for role, columns_sql in location_indexes:
+            await db.status(
+                f"CREATE INDEX IF NOT EXISTS {_quote_ident(_ptg2_snapshot_index_name(provider_group_location_table, role))} "
+                f"ON {_quote_ident(schema_name)}.{_quote_ident(provider_group_location_table)} {columns_sql};"
+            )
+        await db.status(
+            f"CREATE INDEX IF NOT EXISTS {_quote_ident(_ptg2_snapshot_index_name(provider_group_location_table, 'geo_gist_idx'))} "
+            f"ON {_quote_ident(schema_name)}.{_quote_ident(provider_group_location_table)} "
+            "USING gist (geography(st_makepoint(long::float8, lat::float8))) "
+            "WHERE lat IS NOT NULL AND long IS NOT NULL;"
+        )
     analyze_started = time.monotonic()
     for table_name in table_names.values():
         await db.status(f"ANALYZE {_quote_ident(schema_name)}.{_quote_ident(table_name)};")
+    if provider_group_location_table:
+        await db.status(f"ANALYZE {_quote_ident(schema_name)}.{_quote_ident(provider_group_location_table)};")
     for child_table in serving_index_tables:
         if child_table != serving_table:
             await db.status(f"ANALYZE {_quote_ident(schema_name)}.{_quote_ident(child_table)};")
@@ -3405,6 +3499,11 @@ async def _publish_rust_compact_snapshot_tables(
         ),
         "procedure_table": f"{schema_name}.{table_names['procedure']}" if table_names.get("procedure") else None,
         "provider_set_table": f"{schema_name}.{table_names['provider_set']}" if table_names.get("provider_set") else None,
+        "provider_set_component_table": (
+            f"{schema_name}.{table_names['provider_set_component']}"
+            if table_names.get("provider_set_component")
+            else None
+        ),
         "provider_set_entry_table": (
             f"{schema_name}.{table_names['provider_set_entry']}"
             if table_names.get("provider_set_entry")
@@ -3418,6 +3517,11 @@ async def _publish_rust_compact_snapshot_tables(
         "provider_group_member_table": (
             f"{schema_name}.{table_names['provider_group_member']}"
             if table_names.get("provider_group_member")
+            else None
+        ),
+        "provider_group_location_table": (
+            f"{schema_name}.{provider_group_location_table}"
+            if provider_group_location_table
             else None
         ),
         "rate_count": rate_count,
@@ -3563,6 +3667,7 @@ def _snapshot_manifest_table_names(serving_index: dict[str, Any] | None) -> list
         serving_index.get("provider_set_entry_table"),
         serving_index.get("provider_entry_component_table"),
         serving_index.get("provider_group_member_table"),
+        serving_index.get("provider_group_location_table"),
     ]
     allowed_prefixes = (
         "ptg2_serving_rate_compact_",
@@ -6941,6 +7046,7 @@ def _iter_compact_serving_records_rust(
     price_set_entry_copy_path: str | Path | None = None,
     provider_set_copy_path: str | Path | None = None,
     provider_group_member_copy_path: str | Path | None = None,
+    provider_set_component_copy_path: str | Path | None = None,
     provider_set_entry_copy_path: str | Path | None = None,
     provider_entry_component_copy_path: str | Path | None = None,
 ):
@@ -6972,6 +7078,8 @@ def _iter_compact_serving_records_rust(
         env["HLTHPRT_PTG2_PROVIDER_SET_COPY_PATH"] = str(provider_set_copy_path)
     if provider_group_member_copy_path is not None:
         env["HLTHPRT_PTG2_PROVIDER_GROUP_MEMBER_COPY_PATH"] = str(provider_group_member_copy_path)
+    if provider_set_component_copy_path is not None:
+        env["HLTHPRT_PTG2_PROVIDER_SET_COMPONENT_COPY_PATH"] = str(provider_set_component_copy_path)
     if provider_set_entry_copy_path is not None:
         env["HLTHPRT_PTG2_PROVIDER_SET_ENTRY_COPY_PATH"] = str(provider_set_entry_copy_path)
     if provider_entry_component_copy_path is not None:
@@ -7067,6 +7175,7 @@ async def _aiter_compact_serving_records_rust(
     price_set_entry_copy_path: str | Path | None = None,
     provider_set_copy_path: str | Path | None = None,
     provider_group_member_copy_path: str | Path | None = None,
+    provider_set_component_copy_path: str | Path | None = None,
     provider_set_entry_copy_path: str | Path | None = None,
     provider_entry_component_copy_path: str | Path | None = None,
 ):
@@ -7084,6 +7193,7 @@ async def _aiter_compact_serving_records_rust(
         price_set_entry_copy_path=price_set_entry_copy_path,
         provider_set_copy_path=provider_set_copy_path,
         provider_group_member_copy_path=provider_group_member_copy_path,
+        provider_set_component_copy_path=provider_set_component_copy_path,
         provider_set_entry_copy_path=provider_set_entry_copy_path,
         provider_entry_component_copy_path=provider_entry_component_copy_path,
     )
@@ -8339,8 +8449,7 @@ async def _parse_in_network_file_serving_only(
             "price_atom",
             "price_set_entry",
             "provider_set",
-            "provider_set_entry",
-            "provider_entry_component",
+            "provider_set_component",
             "provider_group_member",
         )
         for dictionary_kind in dictionary_kinds:
@@ -8521,8 +8630,7 @@ async def _parse_in_network_file_serving_only(
                 price_set_entry_copy_path=dictionary_copy_paths.get("price_set_entry"),
                 provider_set_copy_path=dictionary_copy_paths.get("provider_set"),
                 provider_group_member_copy_path=dictionary_copy_paths.get("provider_group_member"),
-                provider_set_entry_copy_path=dictionary_copy_paths.get("provider_set_entry"),
-                provider_entry_component_copy_path=dictionary_copy_paths.get("provider_entry_component"),
+                provider_set_component_copy_path=dictionary_copy_paths.get("provider_set_component"),
             ):
                 if record_kind == "dedupe_summary":
                     rust_dedupe_summary = dict(record_row or {})
@@ -8548,6 +8656,11 @@ async def _parse_in_network_file_serving_only(
                     rust_batches["provider_set_rows"].append(record_row)
                 elif record_kind == "provider_set_copy_file":
                     compact_copy_tasks.add(asyncio.create_task(copy_ready_dictionary_file("provider_set", record_row)))
+                    await wait_for_some_copy_tasks()
+                elif record_kind == "provider_set_component":
+                    rust_batches.setdefault("provider_set_component_rows", []).append(record_row)
+                elif record_kind == "provider_set_component_copy_file":
+                    compact_copy_tasks.add(asyncio.create_task(copy_ready_dictionary_file("provider_set_component", record_row)))
                     await wait_for_some_copy_tasks()
                 elif record_kind == "provider_set_entry":
                     rust_batches.setdefault("provider_set_component_rows", []).append(
@@ -10618,6 +10731,8 @@ async def main(
         failed_files: list[dict[str, Any]] = []
         skipped_files: list[dict[str, Any]] = []
         successful_files: list[dict[str, Any]] = []
+        seen_raw_artifact_hashes: set[str] = set()
+        duplicate_raw_files_skipped = 0
         async for downloaded in _iter_downloaded_ptg_jobs(
             selected_jobs,
             reuse_raw_artifacts=reuse_raw_artifacts,
@@ -10641,6 +10756,28 @@ async def main(
                     False,
                     error="download did not produce an artifact",
                 )
+            elif downloaded.raw_artifact.raw_sha256 in seen_raw_artifact_hashes:
+                duplicate_raw_files_skipped += 1
+                _emit_screen_line(
+                    "PTG2_RAW_JOB_DEDUPE"
+                    f"\ttype={job.get('type')}"
+                    f"\turl={job.get('url')}"
+                    f"\traw_sha256={downloaded.raw_artifact.raw_sha256}"
+                    "\treason=duplicate_raw_artifact"
+                )
+                result = PTG2FileProcessResult(
+                    str(job.get("type") or "unknown"),
+                    str(job.get("url") or ""),
+                    True,
+                    summary={
+                        "raw_sha256": downloaded.raw_artifact.raw_sha256,
+                        "raw_storage_uri": downloaded.raw_artifact.raw_storage_uri,
+                        "reason": "duplicate_raw_artifact",
+                    },
+                    skipped=True,
+                )
+            elif downloaded.raw_artifact.raw_sha256:
+                seen_raw_artifact_hashes.add(downloaded.raw_artifact.raw_sha256)
             if job.get("type") == "in_network":
                 if result is None:
                     result = await _process_in_network_file(
@@ -10689,6 +10826,7 @@ async def main(
             "jobs_discovered": jobs_discovered_before_dedupe,
             "jobs_unique": len(jobs),
             "duplicate_jobs_skipped": duplicate_jobs_skipped,
+            "duplicate_raw_files_skipped": duplicate_raw_files_skipped,
             "files_attempted": attempted_files,
             "files_processed": processed_files,
             "files_failed": len(failed_files),
@@ -10861,6 +10999,7 @@ async def main(
                                 "procedure",
                                 "price_set",
                                 "provider_set",
+                                "provider_set_component",
                                 "provider_set_entry",
                                 "provider_entry_component",
                                 "provider_group_member",
