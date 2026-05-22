@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 provider_quality = importlib.import_module("process.provider_quality")
+provider_quality_cohort_sql = importlib.import_module("process.provider_quality_parts.cohort_sql")
 provider_quality_lifecycle = importlib.import_module("process.provider_quality_parts.lifecycle")
 provider_quality_normalize = importlib.import_module("process.provider_quality_parts.normalize")
 provider_quality_sql_helpers = importlib.import_module("process.provider_quality_parts.sql_helpers")
@@ -124,6 +125,25 @@ def test_lifecycle_split_keeps_facade_helpers_stable():
 def test_sql_helper_split_keeps_facade_helpers_stable():
     assert provider_quality._provider_class_case_sql is provider_quality_sql_helpers._provider_class_case_sql
     assert provider_quality._state_code_sql is provider_quality_sql_helpers._state_code_sql
+
+
+def test_cohort_sql_split_keeps_facade_helpers_stable():
+    assert provider_quality._cohort_sql_phase_1_build_features is provider_quality_cohort_sql._cohort_sql_phase_1_build_features
+    assert provider_quality._cohort_sql_phase_2_build_lsh_shard is provider_quality_cohort_sql._cohort_sql_phase_2_build_lsh_shard
+    assert (
+        provider_quality._cohort_sql_phase_3_update_procedure_bucket
+        is provider_quality_cohort_sql._cohort_sql_phase_3_update_procedure_bucket
+    )
+    assert provider_quality._cohort_sql_phase_4_build_peer_targets is provider_quality_cohort_sql._cohort_sql_phase_4_build_peer_targets
+    assert (
+        provider_quality._cohort_sql_phase_5_build_measure_shard
+        is provider_quality_cohort_sql._cohort_sql_phase_5_build_measure_shard
+    )
+    assert (
+        provider_quality._cohort_sql_phase_6_build_domain_shard
+        is provider_quality_cohort_sql._cohort_sql_phase_6_build_domain_shard
+    )
+    assert provider_quality._cohort_sql_phase_7_build_score_shard is provider_quality_cohort_sql._cohort_sql_phase_7_build_score_shard
 
 
 def test_provider_quality_sql_helpers_build_expected_fragments():
