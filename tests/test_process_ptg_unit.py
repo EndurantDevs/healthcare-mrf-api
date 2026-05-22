@@ -21,6 +21,7 @@ process_pkg = importlib.import_module("process")
 process_ptg = importlib.import_module("process.ptg")
 ptg_canonical = importlib.import_module("process.ptg_parts.canonical")
 ptg_domain = importlib.import_module("process.ptg_parts.domain")
+ptg_row_helpers = importlib.import_module("process.ptg_parts.row_helpers")
 ptg_screen = importlib.import_module("process.ptg_parts.screen")
 ptg_values = importlib.import_module("process.ptg_parts.values")
 
@@ -53,6 +54,14 @@ def test_values_split_keeps_facade_helpers_stable():
     assert process_ptg.build_fact_chunk is ptg_values.build_fact_chunk
     assert process_ptg.build_rate_set is ptg_values.build_rate_set
     assert process_ptg.provider_hash_bucket is ptg_values.provider_hash_bucket
+
+
+def test_row_helper_split_keeps_facade_helpers_stable():
+    assert process_ptg._make_checksum is ptg_row_helpers._make_checksum
+    assert process_ptg._as_int_list is ptg_row_helpers._as_int_list
+    assert process_ptg._normalized_npi_list is ptg_row_helpers._normalized_npi_list
+    assert process_ptg._provider_group_identity_hash is ptg_row_helpers._provider_group_identity_hash
+    assert process_ptg._normalize_code_component is ptg_row_helpers._normalize_code_component
 
 
 def test_filter_reporting_plans_matches_group_plan_id():
