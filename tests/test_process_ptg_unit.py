@@ -39,6 +39,7 @@ ptg_serving_only = importlib.import_module("process.ptg_parts.serving_only")
 ptg_snapshot_cleanup = importlib.import_module("process.ptg_parts.snapshot_cleanup")
 ptg_snapshot_tables = importlib.import_module("process.ptg_parts.snapshot_tables")
 ptg_source_download = importlib.import_module("process.ptg_parts.source_download")
+ptg_source_files = importlib.import_module("process.ptg_parts.source_files")
 ptg_source_jobs = importlib.import_module("process.ptg_parts.source_jobs")
 ptg_source_pointers = importlib.import_module("process.ptg_parts.source_pointers")
 ptg_table_setup = importlib.import_module("process.ptg_parts.table_setup")
@@ -198,6 +199,13 @@ def test_source_download_split_keeps_facade_helpers_stable():
     assert process_ptg._download_raw_artifact_ranges is ptg_source_download._download_raw_artifact_ranges
     assert process_ptg.download_raw_artifact is ptg_source_download.download_raw_artifact
     assert process_ptg.materialize_json_source is ptg_source_download.materialize_json_source
+
+
+def test_source_file_split_keeps_facade_helpers_stable():
+    assert process_ptg._maybe_unzip is ptg_source_files._maybe_unzip
+    assert process_ptg._extract_metadata_fields is ptg_source_files._extract_metadata_fields
+    assert process_ptg._derive_plan_fields is ptg_source_files._derive_plan_fields
+    assert process_ptg._build_file_row is ptg_source_files._build_file_row
 
 
 def test_table_setup_split_keeps_facade_helpers_stable():
