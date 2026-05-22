@@ -1,5 +1,11 @@
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
-use flate2::read::MultiGzDecoder;
+use ptg2_scanner::config::{
+    env_bool, env_usize, progress_interval, split_interval, DEFAULT_COMPACT_COPY_ROTATE_BYTES,
+    DEFAULT_COMPACT_RUST_WORKERS, DEFAULT_COMPACT_RUST_WORK_QUEUE, DEFAULT_PROGRESS_BYTES,
+    DEFAULT_PROGRESS_OBJECTS, DEFAULT_SPLIT_NEGOTIATED_RATES, READ_BUF_SIZE,
+};
+use ptg2_scanner::input::open_reader;
+use ptg2_scanner::progress::emit_progress;
 use serde_json::{json, Map, Value};
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -7,7 +13,7 @@ use std::env;
 use std::fmt::Display;
 use std::fs::File;
 use std::fs::OpenOptions;
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 use std::sync::{
@@ -19,65 +25,8 @@ use std::time::Instant;
 use struson::reader::{JsonReader, JsonStreamReader, ValueType};
 use xxhash_rust::xxh3::Xxh3;
 
-const READ_BUF_SIZE: usize = 8 * 1024 * 1024;
-const DEFAULT_PROGRESS_BYTES: u64 = 256 * 1024 * 1024;
-const DEFAULT_PROGRESS_OBJECTS: u64 = 2_000_000;
-const DEFAULT_SPLIT_NEGOTIATED_RATES: usize = 4096;
-const DEFAULT_COMPACT_RUST_WORKERS: usize = 8;
-const DEFAULT_COMPACT_RUST_WORK_QUEUE: usize = 16;
-const DEFAULT_COMPACT_COPY_ROTATE_BYTES: u64 = 128 * 1024 * 1024;
-
 fn to_io_error(error: impl Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
-}
-
-struct CountingReader<R: Read> {
-    inner: R,
-    bytes_read: Arc<AtomicU64>,
-}
-
-impl<R: Read> CountingReader<R> {
-    fn new(inner: R, bytes_read: Arc<AtomicU64>) -> Self {
-        Self { inner, bytes_read }
-    }
-}
-
-impl<R: Read> Read for CountingReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let read = self.inner.read(buf)?;
-        if read > 0 {
-            self.bytes_read.fetch_add(read as u64, Ordering::Relaxed);
-        }
-        Ok(read)
-    }
-}
-
-fn is_gzip(path: &Path) -> io::Result<bool> {
-    if path
-        .extension()
-        .and_then(|value| value.to_str())
-        .map(|value| value.eq_ignore_ascii_case("gz"))
-        .unwrap_or(false)
-    {
-        return Ok(true);
-    }
-    let mut fp = File::open(path)?;
-    let mut header = [0u8; 2];
-    let read = fp.read(&mut header)?;
-    Ok(read == 2 && header == [0x1f, 0x8b])
-}
-
-fn open_reader(path: &Path, compressed_bytes_read: Arc<AtomicU64>) -> io::Result<Box<dyn Read>> {
-    let fp = File::open(path)?;
-    if is_gzip(path)? {
-        let compressed_reader = CountingReader::new(BufReader::new(fp), compressed_bytes_read);
-        Ok(Box::new(MultiGzDecoder::new(compressed_reader)))
-    } else {
-        Ok(Box::new(CountingReader::new(
-            BufReader::new(fp),
-            compressed_bytes_read,
-        )))
-    }
 }
 
 fn emit_object<W: Write>(writer: &mut W, name: &str, payload: &[u8]) -> io::Result<()> {
@@ -88,90 +37,6 @@ fn emit_object<W: Write>(writer: &mut W, name: &str, payload: &[u8]) -> io::Resu
     writer.write_all(payload)?;
     writer.write_all(b"\n")?;
     Ok(())
-}
-
-fn split_interval(name: &str, default_value: usize) -> usize {
-    env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(default_value)
-}
-
-fn progress_interval(name: &str, default_value: u64) -> u64 {
-    env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(default_value)
-}
-
-fn env_usize(name: &str, default_value: usize) -> usize {
-    env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(default_value)
-}
-
-fn env_bool(name: &str, default_value: bool) -> bool {
-    match env::var(name) {
-        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => true,
-            "0" | "false" | "no" | "off" => false,
-            _ => default_value,
-        },
-        Err(_) => default_value,
-    }
-}
-
-fn emit_progress(
-    path: &Path,
-    total_bytes: u64,
-    compressed_bytes_read: &Arc<AtomicU64>,
-    object_counts: &HashMap<String, u64>,
-    started_at: Instant,
-    done: bool,
-) {
-    let bytes_read = compressed_bytes_read
-        .load(Ordering::Relaxed)
-        .min(total_bytes);
-    let percent = if total_bytes > 0 {
-        (bytes_read as f64 / total_bytes as f64) * 100.0
-    } else {
-        0.0
-    };
-    let total_objects: u64 = object_counts.values().sum();
-    let elapsed_seconds = started_at.elapsed().as_secs_f64();
-    let compressed_mib_s = if elapsed_seconds > 0.0 {
-        (bytes_read as f64 / (1024.0 * 1024.0)) / elapsed_seconds
-    } else {
-        0.0
-    };
-    let eta_seconds = if compressed_mib_s > 0.0 && total_bytes > bytes_read {
-        Some(((total_bytes - bytes_read) as f64 / (1024.0 * 1024.0)) / compressed_mib_s)
-    } else {
-        None
-    };
-    let counts = object_counts
-        .iter()
-        .map(|(name, count)| format!("{}={}", name, count))
-        .collect::<Vec<_>>()
-        .join("\t");
-    eprintln!(
-        "PTG2_SCANNER_PROGRESS\tpath={}\tcompressed_bytes={}\ttotal_bytes={}\tpercent={:.2}\tcompressed_mib_s={:.2}\telapsed_seconds={:.0}\teta_seconds={}\tobjects={}\t{}\tdone={}",
-        path.display(),
-        bytes_read,
-        total_bytes,
-        percent,
-        compressed_mib_s,
-        elapsed_seconds,
-        eta_seconds
-            .map(|value| format!("{:.0}", value))
-            .unwrap_or_else(|| "unknown".to_string()),
-        total_objects,
-        counts,
-        if done { "true" } else { "false" },
-    );
 }
 
 fn scan(path: &Path, requested: &[String]) -> io::Result<()> {
@@ -680,7 +545,10 @@ impl SharedDedupe {
     ) -> bool {
         let inserted = self
             .provider_set_component
-            .insert(provider_set_component_key(provider_set_hash, provider_group_hash));
+            .insert(provider_set_component_key(
+                provider_set_hash,
+                provider_group_hash,
+            ));
         self.provider_set_component_counter.record(inserted);
         inserted
     }
