@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-# pylint: disable=broad-exception-caught,too-many-branches,too-many-locals,too-many-statements
+# pylint: disable=broad-exception-caught,too-many-branches,too-many-locals,too-many-statements,too-many-lines
 
 import datetime
 import gzip

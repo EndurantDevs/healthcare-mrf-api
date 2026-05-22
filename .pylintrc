@@ -21,7 +21,6 @@ disable=
     too-many-branches,
     too-many-statements,
     too-many-locals,
-    too-many-lines,
     line-too-long,
     duplicate-code,
     assignment-from-no-return,
@@ -36,3 +35,4 @@ output-format = text
 
 [FORMAT]
 max-line-length = 120
+max-module-lines = 2000

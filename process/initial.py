@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-# pylint: disable=too-many-branches,too-many-locals,too-many-statements,too-many-nested-blocks,broad-exception-caught,too-many-return-statements,not-callable
+# pylint: disable=too-many-branches,too-many-locals,too-many-statements,too-many-nested-blocks,broad-exception-caught,too-many-return-statements,not-callable,too-many-lines
 
 import asyncio
 import datetime
