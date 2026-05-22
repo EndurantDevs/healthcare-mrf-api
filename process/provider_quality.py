@@ -6,12 +6,10 @@ from __future__ import annotations
 import asyncio
 import csv
 import datetime
-import hashlib
 import json
 import logging
 import math
 import os
-import secrets
 import shutil
 import statistics
 import sys
@@ -73,7 +71,6 @@ from process.provider_quality_parts.config import (
     MAT_PHASE_DONE,
     MAT_PHASE_SEQUENCE,
     MAX_NPI,
-    POSTGRES_IDENTIFIER_MAX_LENGTH,
     PROVIDER_QUALITY_ALLOW_DEGRADED_TEST_ONLY,
     PROVIDER_QUALITY_BENCHMARK_MODE,
     PROVIDER_QUALITY_BENCHMARK_ORDER,
@@ -120,7 +117,6 @@ from process.provider_quality_parts.config import (
     PROVIDER_QUALITY_SHRINKAGE_ALPHA,
     PROVIDER_QUALITY_TEST_QPP_ROWS,
     PROVIDER_QUALITY_TEST_SVI_ROWS,
-    PROVIDER_QUALITY_WORKDIR,
     PROVIDER_QUALITY_YEAR_WINDOW,
     PROVIDER_QUALITY_ZIP_MAX_RADIUS_MILES,
     PROVIDER_QUALITY_ZIP_MAX_RING,
@@ -132,6 +128,18 @@ from process.provider_quality_parts.config import (
     TEST_MAX_DOWNLOAD_BYTES,
     _benchmark_modes_for_materialization,
     _env_bool,
+)
+from process.provider_quality_parts.lifecycle import (
+    _archived_identifier,
+    _format_duration_compact,
+    _manifest_path,
+    _materialize_shard_job_id,
+    _normalize_import_id,
+    _normalize_run_id,
+    _npi_shard_predicate,
+    _read_manifest,
+    _run_dir,
+    _write_manifest,
 )
 from process.provider_quality_parts.normalize import (
     _normalize_zcta,
@@ -181,38 +189,10 @@ PricingProviderQualityProcedureLSH = _resolve_optional_model("PricingProviderQua
 PricingProviderQualityPeerTarget = _resolve_optional_model("PricingProviderQualityPeerTarget")
 
 
-def _normalize_run_id(run_id: str | None) -> str:
-    if run_id:
-        normalized = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in str(run_id))
-        normalized = normalized.strip("_")
-        if normalized:
-            return normalized
-    token = secrets.token_hex(4)
-    return f"{datetime.datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{token}"
-
-
-def _normalize_import_id(import_id: str | None) -> str:
-    if not import_id:
-        return datetime.date.today().strftime("%Y%m%d")
-    normalized = "".join(ch if ch.isalnum() else "_" for ch in str(import_id))
-    return normalized or datetime.date.today().strftime("%Y%m%d")
-
-
 def _should_fail_on_source_error(test_mode: bool) -> bool:
     if test_mode and PROVIDER_QUALITY_ALLOW_DEGRADED_TEST_ONLY:
         return False
     return PROVIDER_QUALITY_FAIL_ON_SOURCE_ERROR
-
-
-def _format_duration_compact(total_seconds: float) -> str:
-    seconds = max(int(total_seconds), 0)
-    hours, remainder = divmod(seconds, 3600)
-    minutes, secs = divmod(remainder, 60)
-    if hours > 0:
-        return f"{hours}h{minutes:02d}m{secs:02d}s"
-    if minutes > 0:
-        return f"{minutes}m{secs:02d}s"
-    return f"{secs}s"
 
 
 async def _log_materialize_phase_summary(redis, run_id: str, phase: str, *, total: int, done: int, failed: int) -> None:
@@ -278,42 +258,6 @@ def _materialize_reporting_years(manifest: dict[str, Any]) -> tuple[int, ...]:
     if bounded:
         return tuple(bounded)
     return (PROVIDER_QUALITY_MAX_YEAR,)
-
-
-def _materialize_shard_job_id(run_id: str, phase: str, year: int, shard_id: int) -> str:
-    return f"provider_quality_materialize_{phase}_{run_id}_{year}_{shard_id}"
-
-
-def _npi_shard_predicate(expr: str) -> str:
-    return f"MOD(({expr})::bigint, :shard_count) = :shard_id"
-
-
-def _archived_identifier(name: str, suffix: str = "_old") -> str:
-    candidate = f"{name}{suffix}"
-    if len(candidate) <= POSTGRES_IDENTIFIER_MAX_LENGTH:
-        return candidate
-    digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]
-    trim_to = max(1, POSTGRES_IDENTIFIER_MAX_LENGTH - len(suffix) - len(digest) - 1)
-    return f"{name[:trim_to]}_{digest}{suffix}"
-
-
-def _run_dir(import_id: str, run_id: str) -> Path:
-    return Path(PROVIDER_QUALITY_WORKDIR) / import_id / run_id
-
-
-def _manifest_path(work_dir: Path) -> Path:
-    return work_dir / "manifest.json"
-
-
-def _read_manifest(path: str) -> dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as handle:
-        return json.load(handle)
-
-
-def _write_manifest(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=True, indent=2, sort_keys=True)
 
 
 def _cohort_model_classes() -> tuple[type, ...]:

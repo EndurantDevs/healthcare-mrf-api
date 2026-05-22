@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 provider_quality = importlib.import_module("process.provider_quality")
+provider_quality_lifecycle = importlib.import_module("process.provider_quality_parts.lifecycle")
 provider_quality_normalize = importlib.import_module("process.provider_quality_parts.normalize")
 provider_quality_state = importlib.import_module("process.provider_quality_parts.state")
 
@@ -112,11 +113,32 @@ def test_normalize_split_keeps_facade_helpers_stable():
     assert provider_quality._pick_first_ci is provider_quality_normalize._pick_first_ci
 
 
+def test_lifecycle_split_keeps_facade_helpers_stable():
+    assert provider_quality._normalize_import_id is provider_quality_lifecycle._normalize_import_id
+    assert provider_quality._format_duration_compact is provider_quality_lifecycle._format_duration_compact
+    assert provider_quality._archived_identifier is provider_quality_lifecycle._archived_identifier
+    assert provider_quality._npi_shard_predicate is provider_quality_lifecycle._npi_shard_predicate
+
+
 def test_archived_identifier_truncates_long_name():
     long_name = "x" * 100
     archived = provider_quality._archived_identifier(long_name)
     assert len(archived) <= 63
     assert archived.endswith("_old")
+
+
+def test_lifecycle_helpers_normalize_ids_and_manifest(tmp_path):
+    assert provider_quality._normalize_import_id("2026/05") == "2026_05"
+    assert provider_quality._normalize_run_id(" run:1 ") == "run_1"
+    assert provider_quality._format_duration_compact(3661) == "1h01m01s"
+    assert provider_quality._materialize_shard_job_id("run", "score", 2026, 3) == (
+        "provider_quality_materialize_score_run_2026_3"
+    )
+    assert provider_quality._npi_shard_predicate("t.npi") == "MOD((t.npi)::bigint, :shard_count) = :shard_id"
+
+    manifest_path = provider_quality._manifest_path(tmp_path)
+    provider_quality._write_manifest(manifest_path, {"b": 2, "a": 1})
+    assert provider_quality._read_manifest(str(manifest_path)) == {"a": 1, "b": 2}
 
 
 def test_resolve_sources_empty_templates(monkeypatch):
