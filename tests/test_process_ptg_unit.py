@@ -22,6 +22,7 @@ process_ptg = importlib.import_module("process.ptg")
 ptg_artifacts = importlib.import_module("process.ptg_parts.artifacts")
 ptg_artifact_streams = importlib.import_module("process.ptg_parts.artifact_streams")
 ptg_canonical = importlib.import_module("process.ptg_parts.canonical")
+ptg_compact_indexes = importlib.import_module("process.ptg_parts.compact_indexes")
 ptg_db_tables = importlib.import_module("process.ptg_parts.db_tables")
 ptg_domain = importlib.import_module("process.ptg_parts.domain")
 ptg_json_streams = importlib.import_module("process.ptg_parts.json_streams")
@@ -94,6 +95,22 @@ def test_db_table_split_keeps_facade_helpers_stable():
     assert process_ptg._table_has_rows is ptg_db_tables._table_has_rows
     assert process_ptg._estimated_table_rows is ptg_db_tables._estimated_table_rows
     assert process_ptg._exact_table_rows is ptg_db_tables._exact_table_rows
+
+
+def test_compact_index_split_keeps_facade_helpers_stable():
+    assert process_ptg._PTG2_COMPACT_MODEL_BY_KIND is ptg_compact_indexes._PTG2_COMPACT_MODEL_BY_KIND
+    assert process_ptg._ptg2_model_snapshot_index_role is ptg_compact_indexes._ptg2_model_snapshot_index_role
+    assert process_ptg._ptg2_index_timestamp is ptg_compact_indexes._ptg2_index_timestamp
+    assert process_ptg._ptg2_compact_serving_index_mode is ptg_compact_indexes._ptg2_compact_serving_index_mode
+    assert process_ptg._ptg2_compact_dictionary_index_mode is ptg_compact_indexes._ptg2_compact_dictionary_index_mode
+    assert (
+        process_ptg._ptg2_compact_serving_reported_index_statement
+        is ptg_compact_indexes._ptg2_compact_serving_reported_index_statement
+    )
+    assert process_ptg._ptg2_model_index_statements_for_table is ptg_compact_indexes._ptg2_model_index_statements_for_table
+    assert process_ptg._run_ptg2_index_statement is ptg_compact_indexes._run_ptg2_index_statement
+    assert process_ptg._index_snapshot_compact_table_entries is ptg_compact_indexes._index_snapshot_compact_table_entries
+    assert process_ptg._index_snapshot_compact_tables is ptg_compact_indexes._index_snapshot_compact_tables
 
 
 def test_snapshot_table_split_keeps_facade_helpers_stable():
