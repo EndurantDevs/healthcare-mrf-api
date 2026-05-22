@@ -41,6 +41,7 @@ ptg_snapshot_tables = importlib.import_module("process.ptg_parts.snapshot_tables
 ptg_source_download = importlib.import_module("process.ptg_parts.source_download")
 ptg_source_jobs = importlib.import_module("process.ptg_parts.source_jobs")
 ptg_source_pointers = importlib.import_module("process.ptg_parts.source_pointers")
+ptg_table_setup = importlib.import_module("process.ptg_parts.table_setup")
 ptg_values = importlib.import_module("process.ptg_parts.values")
 
 
@@ -197,6 +198,20 @@ def test_source_download_split_keeps_facade_helpers_stable():
     assert process_ptg._download_raw_artifact_ranges is ptg_source_download._download_raw_artifact_ranges
     assert process_ptg.download_raw_artifact is ptg_source_download.download_raw_artifact
     assert process_ptg.materialize_json_source is ptg_source_download.materialize_json_source
+
+
+def test_table_setup_split_keeps_facade_helpers_stable():
+    assert process_ptg.PTG2_MODEL_CLASSES is ptg_table_setup.PTG2_MODEL_CLASSES
+    assert process_ptg._ensure_indexes is ptg_table_setup._ensure_indexes
+    assert process_ptg._ensure_ptg2_serving_rate_columns is ptg_table_setup._ensure_ptg2_serving_rate_columns
+    assert process_ptg._ensure_ptg2_provider_set_columns is ptg_table_setup._ensure_ptg2_provider_set_columns
+    assert process_ptg._ensure_ptg2_price_set_columns is ptg_table_setup._ensure_ptg2_price_set_columns
+    assert process_ptg._ensure_ptg2_price_atom_columns is ptg_table_setup._ensure_ptg2_price_atom_columns
+    assert process_ptg._drop_ptg2_columns is ptg_table_setup._drop_ptg2_columns
+    assert process_ptg._ensure_ptg2_price_set_stage_table is ptg_table_setup._ensure_ptg2_price_set_stage_table
+    assert process_ptg._ensure_ptg2_serving_rate_stage_table is ptg_table_setup._ensure_ptg2_serving_rate_stage_table
+    assert process_ptg.ensure_ptg2_tables is ptg_table_setup.ensure_ptg2_tables
+    assert process_ptg._prepare_ptg_tables is ptg_table_setup._prepare_ptg_tables
 
 
 def test_snapshot_cleanup_split_keeps_facade_helpers_stable():
