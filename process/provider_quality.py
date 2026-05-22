@@ -20,7 +20,6 @@ from aiofile import async_open
 from aiocsv import AsyncDictReader
 from arq import Retry, create_pool
 
-import db.models as db_models
 from db.connection import db
 from db.models import (
     DoctorClinicianAddress,
@@ -48,7 +47,6 @@ from process.ext.utils import (
     get_import_schema,
     make_class,
     push_objects,
-    return_checksum,
 )
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
@@ -147,6 +145,21 @@ from process.provider_quality_parts.lifecycle import (
     _run_dir,
     _write_manifest,
 )
+from process.provider_quality_parts.model_helpers import (
+    PricingProviderQualityFeature,
+    PricingProviderQualityPeerTarget,
+    PricingProviderQualityProcedureLSH,
+    _build_stage_suffix,
+    _chunk_job_id,
+    _cohort_model_classes,
+    _cohort_models_present,
+    _first_existing_column,
+    _materialize_reporting_years,
+    _model_columns,
+    _optional_column_pairs,
+    _resolve_optional_model,
+    _staging_classes,
+)
 from process.provider_quality_parts.normalize import (
     _normalize_zcta,
     _pick_first,
@@ -190,15 +203,6 @@ while True:
         _csv_limit = _csv_limit // 10
 
 
-def _resolve_optional_model(name: str) -> type | None:
-    return getattr(db_models, name, None)
-
-
-PricingProviderQualityFeature = _resolve_optional_model("PricingProviderQualityFeature")
-PricingProviderQualityProcedureLSH = _resolve_optional_model("PricingProviderQualityProcedureLSH")
-PricingProviderQualityPeerTarget = _resolve_optional_model("PricingProviderQualityPeerTarget")
-
-
 def _should_fail_on_source_error(test_mode: bool) -> bool:
     if test_mode and PROVIDER_QUALITY_ALLOW_DEGRADED_TEST_ONLY:
         return False
@@ -237,97 +241,6 @@ async def _log_materialize_phase_summary(redis, run_id: str, phase: str, *, tota
         done,
         failed,
     )
-
-
-def _materialize_reporting_years(manifest: dict[str, Any]) -> tuple[int, ...]:
-    years: set[int] = set()
-    sources = manifest.get("sources")
-    if isinstance(sources, dict):
-        for dataset_sources in sources.values():
-            if not isinstance(dataset_sources, list):
-                continue
-            for source in dataset_sources:
-                if not isinstance(source, dict):
-                    continue
-                year = _safe_int(source.get("reporting_year"), 0)
-                if year > 0:
-                    years.add(year)
-
-    manifest_year = _safe_int(manifest.get("year"), 0)
-    if manifest_year > 0:
-        years.add(manifest_year)
-
-    if not years:
-        years.update(PROVIDER_QUALITY_YEAR_WINDOW)
-
-    bounded = sorted(
-        year
-        for year in years
-        if PROVIDER_QUALITY_MIN_YEAR <= year <= PROVIDER_QUALITY_MAX_YEAR
-    )
-    if bounded:
-        return tuple(bounded)
-    return (PROVIDER_QUALITY_MAX_YEAR,)
-
-
-def _cohort_model_classes() -> tuple[type, ...]:
-    classes: list[type] = []
-    for cls in (
-        PricingProviderQualityFeature,
-        PricingProviderQualityProcedureLSH,
-        PricingProviderQualityPeerTarget,
-    ):
-        if cls is not None:
-            classes.append(cls)
-    return tuple(classes)
-
-
-def _cohort_models_present(classes: dict[str, type]) -> bool:
-    return all(name in classes for name in COHORT_MODEL_CLASS_NAMES)
-
-
-def _model_columns(model: type | None) -> set[str]:
-    if model is None or not hasattr(model, "__table__"):
-        return set()
-    return {column.name for column in model.__table__.columns}
-
-
-def _first_existing_column(columns: set[str], *candidates: str) -> str | None:
-    for candidate in candidates:
-        if candidate in columns:
-            return candidate
-    return None
-
-
-def _optional_column_pairs(
-    available_columns: set[str],
-    mapping: tuple[tuple[str, str], ...],
-) -> list[tuple[str, str]]:
-    used: set[str] = set()
-    pairs: list[tuple[str, str]] = []
-    for column_name, sql_expr in mapping:
-        if column_name in available_columns and column_name not in used:
-            pairs.append((column_name, sql_expr))
-            used.add(column_name)
-    return pairs
-
-
-def _staging_classes(stage_suffix: str, schema: str) -> dict[str, type]:
-    return {
-        cls.__name__: make_class(cls, stage_suffix, schema_override=schema)
-        for cls in (
-            PricingQppProvider,
-            PricingSviZcta,
-            PricingProviderQualityMeasure,
-            PricingProviderQualityDomain,
-            PricingProviderQualityScore,
-            *_cohort_model_classes(),
-        )
-    }
-
-
-def _chunk_job_id(run_id: str, dataset_key: str, source_index: int, reporting_year: int, chunk_index: int) -> str:
-    return f"provider_quality_chunk_{run_id}_{dataset_key}_{reporting_year}_{source_index}_{chunk_index}"
 
 
 async def _init_run_state(redis, run_id: str, total_chunks: int) -> None:
@@ -509,12 +422,6 @@ async def _push_objects_with_retry(
                 delay,
             )
             await asyncio.sleep(delay)
-
-
-def _build_stage_suffix(import_id: str, run_id: str) -> str:
-    base = "".join(ch if ch.isalnum() else "_" for ch in import_id).strip("_")[:12] or "import"
-    checksum = return_checksum([import_id, run_id]) & 0xFFFFFFFF
-    return f"{base}_{checksum:08x}"
 
 
 def _row_allowed_for_test(row_number: int) -> bool:

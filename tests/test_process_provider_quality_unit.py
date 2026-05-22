@@ -6,6 +6,7 @@ import pytest
 provider_quality = importlib.import_module("process.provider_quality")
 provider_quality_cohort_sql = importlib.import_module("process.provider_quality_parts.cohort_sql")
 provider_quality_lifecycle = importlib.import_module("process.provider_quality_parts.lifecycle")
+provider_quality_model_helpers = importlib.import_module("process.provider_quality_parts.model_helpers")
 provider_quality_normalize = importlib.import_module("process.provider_quality_parts.normalize")
 provider_quality_sql_helpers = importlib.import_module("process.provider_quality_parts.sql_helpers")
 provider_quality_state = importlib.import_module("process.provider_quality_parts.state")
@@ -144,6 +145,19 @@ def test_cohort_sql_split_keeps_facade_helpers_stable():
         is provider_quality_cohort_sql._cohort_sql_phase_6_build_domain_shard
     )
     assert provider_quality._cohort_sql_phase_7_build_score_shard is provider_quality_cohort_sql._cohort_sql_phase_7_build_score_shard
+
+
+def test_model_helper_split_keeps_facade_helpers_stable():
+    assert provider_quality._resolve_optional_model is provider_quality_model_helpers._resolve_optional_model
+    assert provider_quality._materialize_reporting_years is provider_quality_model_helpers._materialize_reporting_years
+    assert provider_quality._cohort_model_classes is provider_quality_model_helpers._cohort_model_classes
+    assert provider_quality._cohort_models_present is provider_quality_model_helpers._cohort_models_present
+    assert provider_quality._model_columns is provider_quality_model_helpers._model_columns
+    assert provider_quality._first_existing_column is provider_quality_model_helpers._first_existing_column
+    assert provider_quality._optional_column_pairs is provider_quality_model_helpers._optional_column_pairs
+    assert provider_quality._staging_classes is provider_quality_model_helpers._staging_classes
+    assert provider_quality._chunk_job_id is provider_quality_model_helpers._chunk_job_id
+    assert provider_quality._build_stage_suffix is provider_quality_model_helpers._build_stage_suffix
 
 
 def test_provider_quality_sql_helpers_build_expected_fragments():
