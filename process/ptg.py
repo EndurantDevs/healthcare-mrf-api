@@ -11,7 +11,6 @@ import math
 import os
 import sqlite3
 import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -220,39 +219,10 @@ from process.ptg_parts.config import (
     _use_serving_only_import,
     _use_stage_serving_as_final,
 )
+from process.ptg_parts.screen import _emit_screen_line
 
 logger = logging.getLogger(__name__)
 
-_SCREEN_QUEUE: queue.SimpleQueue[tuple[str, str] | None] = queue.SimpleQueue()
-_SCREEN_WRITER_STARTED = False
-_SCREEN_WRITER_LOCK = threading.Lock()
-
-
-def _screen_writer() -> None:
-    while True:
-        item = _SCREEN_QUEUE.get()
-        if item is None:
-            return
-        stream_name, line = item
-        stream = sys.stderr if stream_name == "stderr" else sys.stdout
-        print(line, file=stream, flush=True)
-
-
-def _ensure_screen_writer() -> None:
-    global _SCREEN_WRITER_STARTED
-    if _SCREEN_WRITER_STARTED:
-        return
-    with _SCREEN_WRITER_LOCK:
-        if _SCREEN_WRITER_STARTED:
-            return
-        thread = threading.Thread(target=_screen_writer, name="ptg2-screen-writer", daemon=True)
-        thread.start()
-        _SCREEN_WRITER_STARTED = True
-
-
-def _emit_screen_line(line: str, *, stderr: bool = False) -> None:
-    _ensure_screen_writer()
-    _SCREEN_QUEUE.put(("stderr" if stderr else "stdout", line))
 
 def _json_loads(value: str | bytes | bytearray) -> Any:
     if orjson is not None and _env_bool(PTG2_FAST_JSON_LOADS_ENV, True):
