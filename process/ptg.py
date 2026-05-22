@@ -1131,7 +1131,7 @@ async def _copy_upsert_ptg2_objects(rows: list[dict[str, Any]], cls) -> None:
     update_columns = [column for column in columns if column not in set(conflict_targets)]
     if update_columns:
         conflict_sql = (
-            f"DO UPDATE SET "
+            "DO UPDATE SET "
             + ", ".join(f"{_quote_ident(column)} = EXCLUDED.{_quote_ident(column)}" for column in update_columns)
         )
     else:
@@ -7018,7 +7018,6 @@ async def _parse_in_network_file_serving_only(
     serving_rows = 0
     progress_state: dict[str, Any] = {}
     provider_combo_cache_limit = max(_env_int(PTG2_PROVIDER_COMBO_CACHE_REFS_ENV, 32768), 0)
-    provider_combo_cache: OrderedDict[tuple[str, ...], dict[str, Any]] = OrderedDict()
     provider_combo_stats = {
         "provider_combo_cache_gets": 0,
         "provider_combo_cache_hits": 0,
