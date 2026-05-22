@@ -27,6 +27,7 @@ ptg_copy_load = importlib.import_module("process.ptg_parts.copy_load")
 ptg_db_tables = importlib.import_module("process.ptg_parts.db_tables")
 ptg_domain = importlib.import_module("process.ptg_parts.domain")
 ptg_json_streams = importlib.import_module("process.ptg_parts.json_streams")
+ptg_progress = importlib.import_module("process.ptg_parts.progress")
 ptg_row_helpers = importlib.import_module("process.ptg_parts.row_helpers")
 ptg_rust_publish = importlib.import_module("process.ptg_parts.rust_publish")
 ptg_rust_scanner = importlib.import_module("process.ptg_parts.rust_scanner")
@@ -78,6 +79,13 @@ def test_row_helper_split_keeps_facade_helpers_stable():
     assert process_ptg._normalized_npi_list is ptg_row_helpers._normalized_npi_list
     assert process_ptg._provider_group_identity_hash is ptg_row_helpers._provider_group_identity_hash
     assert process_ptg._normalize_code_component is ptg_row_helpers._normalize_code_component
+
+
+def test_progress_split_keeps_facade_helpers_stable():
+    assert process_ptg._utcnow is ptg_progress._utcnow
+    assert process_ptg._artifact_progress_position is ptg_progress._artifact_progress_position
+    assert process_ptg._format_duration is ptg_progress._format_duration
+    assert process_ptg._maybe_log_artifact_progress is ptg_progress._maybe_log_artifact_progress
 
 
 def test_artifact_split_keeps_facade_helpers_stable():
