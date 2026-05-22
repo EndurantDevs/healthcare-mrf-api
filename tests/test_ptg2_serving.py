@@ -8,6 +8,7 @@ from api import ptg2_serving
 from api import ptg2_response
 from api import ptg2_price_sql
 from api import ptg2_code_filters
+from api import ptg2_types
 
 
 class FakeResult:
@@ -75,6 +76,11 @@ def test_ptg2_code_filter_split_keeps_serving_facade_helpers_stable():
     assert ptg2_serving._normalize_taxonomy_code is ptg2_code_filters._normalize_taxonomy_code
     assert ptg2_serving._normalize_npi is ptg2_code_filters._normalize_npi
     assert ptg2_serving._inferred_provider_taxonomy_sql is ptg2_code_filters._inferred_provider_taxonomy_sql
+
+
+def test_ptg2_type_split_keeps_serving_facade_classes_stable():
+    assert ptg2_serving.PTG2ServingIndex is ptg2_types.PTG2ServingIndex
+    assert ptg2_serving.PTG2ServingTables is ptg2_types.PTG2ServingTables
 
 
 def _compact_tables(**overrides):
