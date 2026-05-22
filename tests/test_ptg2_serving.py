@@ -50,6 +50,7 @@ def _compact_tables(**overrides):
         "price_atom_table": "mrf.ptg2_price_atom_token",
         "price_set_entry_table": "mrf.ptg2_price_set_entry_token",
         "procedure_table": "mrf.ptg2_procedure_token",
+        "provider_set_component_table": "mrf.ptg2_provider_set_component_token",
         "provider_set_entry_table": "mrf.ptg2_provider_set_entry_token",
         "provider_entry_component_table": "mrf.ptg2_provider_entry_component_token",
         "provider_group_member_table": "mrf.ptg2_provider_group_member_token",
@@ -418,12 +419,12 @@ async def test_ptg2_provider_procedures_uses_compact_snapshot_without_market_col
                 "price_set_entry_table": "mrf.ptg2_price_set_entry_token",
                 "procedure_table": "mrf.ptg2_procedure_token",
                 "provider_set_table": "mrf.ptg2_provider_set_token",
+                "provider_set_component_table": "mrf.ptg2_provider_set_component_token",
                 "provider_set_entry_table": "mrf.ptg2_provider_set_entry_token",
                 "provider_entry_component_table": "mrf.ptg2_provider_entry_component_token",
                 "provider_group_member_table": "mrf.ptg2_provider_group_member_token",
             },
             "mrf.ptg2_serving_rate_compact_token",
-            1,
             FakeResult(
                 rows=[
                     {
@@ -469,18 +470,103 @@ async def test_ptg2_provider_procedures_uses_compact_snapshot_without_market_col
     assert payload["items"][0]["npi"] == 1083311500
     assert payload["items"][0]["reported_code"] == "99213"
     assert payload["items"][0]["tic_prices"][0]["negotiated_rate"] == 101.42
-    count_sql = str(session.calls[3][0][0])
-    row_sql = str(session.calls[4][0][0])
-    assert "r.plan_market_type" not in count_sql
+    row_sql = str(session.calls[3][0][0])
     assert "r.plan_market_type" not in row_sql
-    assert "mrf.ptg2_provider_set_entry_token" in count_sql
-    assert "mrf.ptg2_provider_entry_component_token" in row_sql
-    assert "provider_group_hashes @>" not in count_sql
+    assert "mrf.ptg2_provider_set_component_token" in row_sql
+    assert "mrf.ptg2_provider_entry_component_token" not in row_sql
     assert "provider_group_hashes @>" not in row_sql
     assert "NULL::varchar AS plan_market_type" in row_sql
     assert "r.provider_set_count" not in row_sql
     assert "NULL::integer AS provider_set_count" in row_sql
     assert session.calls[3][0][1]["plan_id"] == "010854205"
+
+
+@pytest.mark.asyncio
+async def test_ptg2_provider_procedures_filters_prices_by_pos_modifier_and_rate():
+    session = FakeSession(
+        [
+            "snap-token",
+            {
+                "table": "mrf.ptg2_serving_rate_compact_token",
+                "price_code_set_table": "mrf.ptg2_price_code_set_token",
+                "price_atom_table": "mrf.ptg2_price_atom_token",
+                "price_set_entry_table": "mrf.ptg2_price_set_entry_token",
+                "procedure_table": "mrf.ptg2_procedure_token",
+                "provider_set_component_table": "mrf.ptg2_provider_set_component_token",
+                "provider_group_member_table": "mrf.ptg2_provider_group_member_token",
+            },
+            "mrf.ptg2_serving_rate_compact_token",
+            FakeResult(
+                rows=[
+                    {
+                        "serving_rate_id": "rate-1",
+                        "snapshot_id": "snap-token",
+                        "plan_id": "010854205",
+                        "plan_name": None,
+                        "plan_id_type": None,
+                        "plan_market_type": None,
+                        "issuer_name": None,
+                        "plan_sponsor_name": None,
+                        "procedure_code": None,
+                        "reported_code_system": "CPT",
+                        "reported_code": "93458",
+                        "billing_code": "93458",
+                        "billing_code_type": "CPT",
+                        "procedure_name": "Cath placement",
+                        "procedure_description": "Cath placement",
+                        "provider_set_hash": "provider-set-1",
+                        "provider_count": 3,
+                        "provider_set_count": None,
+                        "price_set_hash": "price-set-1",
+                        "prices": [
+                            {
+                                "negotiated_type": "fee schedule",
+                                "negotiated_rate": 516.08,
+                                "service_code": ["21"],
+                                "billing_code_modifier": ["26"],
+                            }
+                        ],
+                    }
+                ]
+            ),
+        ]
+    )
+
+    payload = await ptg2_serving.search_ptg2_provider_procedures(
+        session,
+        1235189762,
+        {
+            "plan_id": "010854205",
+            "code": "93458",
+            "code_system": "CPT",
+            "pos": "21",
+            "modifier": "26",
+            "rate": "516.08",
+            "include_details": "true",
+        },
+        FakePagination(),
+    )
+
+    item = payload["items"][0]
+    assert item["tic_prices"][0]["negotiated_rate"] == 516.08
+    assert item["tic_prices"][0]["service_code"] == ["21"]
+    assert item["tic_prices"][0]["billing_code_modifier"] == ["26"]
+    assert payload["query"]["price_filter"] == {
+        "service_code": ["21"],
+        "pos": "21",
+        "billing_code_modifier": ["26"],
+        "negotiated_rate": 516.08,
+        "rate_tolerance": 0.01,
+    }
+    row_sql = str(session.calls[3][0][0])
+    params = session.calls[3][0][1]
+    assert "price_payload.prices IS NOT NULL" in row_sql
+    assert "CAST(:price_service_codes AS varchar[])" in row_sql
+    assert "CAST(:price_modifier_codes AS varchar[])" in row_sql
+    assert "ABS(pa.negotiated_rate::numeric - :price_negotiated_rate)" in row_sql
+    assert params["price_service_codes"] == ["21"]
+    assert params["price_modifier_codes"] == ["26"]
+    assert str(params["price_negotiated_rate"]) == "516.08"
 
 
 @pytest.mark.asyncio
@@ -495,6 +581,7 @@ async def test_ptg2_provider_procedures_returns_no_match_after_snapshot_resolves
                 "price_set_entry_table": "mrf.ptg2_price_set_entry_token",
                 "procedure_table": "mrf.ptg2_procedure_token",
                 "provider_set_table": "mrf.ptg2_provider_set_token",
+                "provider_set_component_table": "mrf.ptg2_provider_set_component_token",
                 "provider_set_entry_table": "mrf.ptg2_provider_set_entry_token",
                 "provider_entry_component_table": "mrf.ptg2_provider_entry_component_token",
                 "provider_group_member_table": "mrf.ptg2_provider_group_member_token",
@@ -618,11 +705,10 @@ async def test_compact_serving_geo_search_allows_missing_specialty():
     assert payload is None
     sql = str(session.calls[0][0][0])
     params = session.calls[0][0][1]
-    assert "EXISTS (" in sql
-    assert "provider_filter_npi" in sql
-    assert "JOIN LATERAL (" in sql
-    assert "FROM mrf.npi_address addr_filter" in sql
-    assert "addr_filter.npi = provider_filter_npi.npi" in sql
+    assert "provider_filtered_rates AS MATERIALIZED" in sql
+    assert "JOIN mrf.npi_address addr_filter" in sql
+    assert "addr_filter.npi = pgm_filter.npi" in sql
+    assert "psc_filter.provider_set_hash = r.provider_set_hash" in sql
     assert "LEFT(COALESCE(addr_filter.postal_code, ''), 5) = :zip5" in sql
     assert "npi_taxonomy" not in sql
     assert "specialty_like" not in params
@@ -653,7 +739,7 @@ async def test_compact_serving_coordinate_search_filters_npi_addresses():
     assert payload is None
     sql = str(session.calls[0][0][0])
     params = session.calls[0][0][1]
-    assert "FROM mrf.npi_address addr_filter" in sql
+    assert "JOIN mrf.npi_address addr_filter" in sql
     assert "addr_filter.lat::float8 BETWEEN :geo_min_lat AND :geo_max_lat" in sql
     assert "addr_filter.long::float8 BETWEEN :geo_min_long AND :geo_max_long" in sql
     assert ") <= :geo_radius_miles" in sql
@@ -718,13 +804,14 @@ async def test_compact_serving_include_providers_expands_without_geo_filter():
     assert item["state"] == "IL"
     assert item["tic_prices"][0]["negotiated_rate"] == 60
     sql = str(session.calls[0][0][0])
-    assert "LEFT JOIN mrf.npi_address addr" in sql
-    assert "addr.npi = pgm.npi" in sql
+    assert "LEFT JOIN LATERAL (" in sql
+    assert "FROM mrf.npi_address addr" in sql
+    assert "addr.npi = sp.npi" in sql
     assert "LEFT(COALESCE(addr.postal_code, ''), 5) = :zip5" not in sql
 
 
 @pytest.mark.asyncio
-async def test_compact_serving_source_scoped_provider_expansion_uses_entry_tables():
+async def test_compact_serving_source_scoped_provider_expansion_uses_direct_component_table():
     session = FakeSession([FakeResult(rows=[])])
     tables = _compact_tables()
 
@@ -742,9 +829,11 @@ async def test_compact_serving_source_scoped_provider_expansion_uses_entry_table
 
     assert payload is None
     sql = str(session.calls[0][0][0])
-    assert "JOIN mrf.ptg2_provider_set_entry_token pse ON pse.provider_set_hash = r.provider_set_hash" in sql
-    assert "JOIN mrf.ptg2_provider_entry_component_token pec ON pec.provider_entry_hash = pse.provider_entry_hash" in sql
-    assert "JOIN mrf.ptg2_provider_group_member_token pgm ON pgm.provider_group_hash = pec.provider_group_hash" in sql
+    assert "JOIN mrf.ptg2_provider_set_component_token psc" in sql
+    assert "ON psc.provider_set_hash = r.provider_set_hash" in sql
+    assert "JOIN mrf.ptg2_provider_group_member_token pgm" in sql
+    assert "ON pgm.provider_group_hash = psc.provider_group_hash" in sql
+    assert "ptg2_provider_entry_component_token" not in sql
     assert "provider_group_hashes" not in sql
 
 
@@ -767,19 +856,20 @@ async def test_compact_serving_specialty_search_joins_nucc_without_geo():
     assert payload is None
     sql = str(session.calls[0][0][0])
     params = session.calls[0][0][1]
-    assert "EXISTS (" in sql
-    assert "provider_filter_npi" in sql
-    assert "FROM mrf.npi_taxonomy nt_filter" in sql
+    assert "provider_filtered_rates AS MATERIALIZED" in sql
+    assert "JOIN mrf.npi_taxonomy nt_filter" in sql
     assert "JOIN mrf.nucc_taxonomy nucc_filter" in sql
-    assert "FROM mrf.ptg2_provider_set_entry_token pse_filter" in sql
-    assert "JOIN mrf.ptg2_provider_entry_component_token pec_filter" in sql
-    assert "pgm_filter.provider_group_hash = pec_filter.provider_group_hash" in sql
-    assert "WHERE nt_filter.npi = provider_filter_npi.npi" in sql
+    assert "JOIN mrf.ptg2_provider_group_member_token pgm_filter" in sql
+    assert "FROM mrf.ptg2_provider_set_component_token psc_filter" in sql
+    assert "pgm_filter.provider_group_hash = psc_filter.provider_group_hash" in sql
+    assert "psc_filter.provider_set_hash = r.provider_set_hash" in sql
+    assert "ptg2_provider_entry_component_token" not in sql
+    assert "nt_filter.npi = pgm_filter.npi" in sql
     assert params["specialty_like"] == "%dentist%"
 
 
 @pytest.mark.asyncio
-async def test_compact_serving_source_scoped_geo_taxonomy_filter_uses_entry_tables():
+async def test_compact_serving_source_scoped_geo_taxonomy_filter_uses_direct_component_table():
     session = FakeSession([FakeResult(rows=[])])
     tables = _compact_tables()
 
@@ -797,14 +887,88 @@ async def test_compact_serving_source_scoped_geo_taxonomy_filter_uses_entry_tabl
 
     assert payload is None
     sql = str(session.calls[0][0][0])
-    assert "FROM LATERAL (" in sql
-    assert "FROM mrf.ptg2_provider_set_entry_token pse_filter" in sql
-    assert "JOIN mrf.ptg2_provider_entry_component_token pec_filter" in sql
+    assert "provider_filtered_rates AS MATERIALIZED" in sql
+    assert "FROM mrf.ptg2_provider_set_component_token psc_filter" in sql
     assert "JOIN mrf.ptg2_provider_group_member_token pgm_filter" in sql
-    assert "pse_filter.provider_set_hash = r.provider_set_hash" in sql
-    assert "FROM mrf.npi_address addr_filter" in sql
-    assert "FROM mrf.npi_taxonomy nt_filter" in sql
+    assert "psc_filter.provider_set_hash = r.provider_set_hash" in sql
+    assert "ptg2_provider_entry_component_token" not in sql
+    assert "JOIN mrf.npi_address addr_filter" in sql
+    assert "JOIN mrf.npi_taxonomy nt_filter" in sql
     assert "provider_group_hashes" not in sql
+
+
+@pytest.mark.asyncio
+async def test_compact_serving_include_providers_with_geo_uses_npi_scoped_location_lookup():
+    session = FakeSession(
+        [
+            FakeResult(
+                rows=[
+                    {
+                        "npi": 1234567890,
+                        "location_hash": "npi_address:1234567890:primary:addr-1",
+                        "state": "TX",
+                        "city": "HOUSTON",
+                        "zip5": "77030",
+                        "location_source": "npi_address",
+                        "location_confidence_code": "npi_address",
+                        "address_payload": {"city": "HOUSTON", "state": "TX", "postal_code": "77030"},
+                        "taxonomy_codes": ["207Q00000X"],
+                        "specialties": ["Family Medicine Physician"],
+                        "provider_name": "Example Provider",
+                        "procedure_code": None,
+                        "reported_code_system": "CPT",
+                        "reported_code": "99213",
+                        "billing_code": "99213",
+                        "billing_code_type": "CPT",
+                        "procedure_display_name": "Office visit",
+                        "procedure_name": "Office visit",
+                        "procedure_description": "Office visit",
+                        "provider_set_hashes": ["provider-set-1"],
+                        "rate_count": 1,
+                        "prices": [{"negotiated_type": "derived", "negotiated_rate": 86.48}],
+                        "source_trace": [],
+                    }
+                ]
+            )
+        ]
+    )
+    tables = _compact_tables(provider_group_location_table="mrf.ptg2_provider_group_location_token")
+
+    payload = await ptg2_serving._search_compact_serving_table(
+        session,
+        "mrf.ptg2_serving_rate_compact_token",
+        tables,
+        "snap-token",
+        {
+            "plan_id": "010854205",
+            "code": "99213",
+            "city": "Houston",
+            "state": "TX",
+            "specialty": "family",
+            "include_providers": "true",
+        },
+        FakePagination(),
+        ["snapshot_id = :snapshot_id", "plan_id = :plan_id"],
+        {"snapshot_id": "snap-token", "plan_id": "010854205", "limit": 25, "offset": 0},
+        ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
+    )
+
+    assert payload["query"]["result_granularity"] == "provider"
+    assert payload["items"][0]["location_source"] == "npi_address"
+    assert payload["items"][0]["specialties"] == ["Family Medicine Physician"]
+    sql = str(session.calls[0][0][0])
+    params = session.calls[0][0][1]
+    assert "WITH rate_candidates AS MATERIALIZED" in sql
+    assert "JOIN LATERAL (" in sql
+    assert "JOIN mrf.ptg2_provider_group_location_token loc" in sql
+    assert "loc.npi" in sql
+    assert "AND EXISTS (" in sql
+    assert "OFFSET 0" in sql
+    assert "FROM mrf.npi_address addr" not in sql
+    assert "JOIN mrf.npi_address addr_filter" not in sql
+    assert params["city_exact"] == "HOUSTON"
+    assert params["provider_match_limit"] >= 64
+    assert params["location_rate_candidate_limit"] >= 4096
 
 
 def test_warm_cache_benchmark_fixture_p95_gate():

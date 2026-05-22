@@ -416,6 +416,7 @@ struct CopyPathConfig {
     price_atom: Option<String>,
     price_set_entry: Option<String>,
     provider_set: Option<String>,
+    provider_set_component: Option<String>,
     provider_set_entry: Option<String>,
     provider_entry_component: Option<String>,
     provider_group_member: Option<String>,
@@ -430,6 +431,7 @@ impl CopyPathConfig {
             price_atom: env_path("HLTHPRT_PTG2_PRICE_ATOM_COPY_PATH"),
             price_set_entry: env_path("HLTHPRT_PTG2_PRICE_SET_ENTRY_COPY_PATH"),
             provider_set: env_path("HLTHPRT_PTG2_PROVIDER_SET_COPY_PATH"),
+            provider_set_component: env_path("HLTHPRT_PTG2_PROVIDER_SET_COMPONENT_COPY_PATH"),
             provider_set_entry: env_path("HLTHPRT_PTG2_PROVIDER_SET_ENTRY_COPY_PATH"),
             provider_entry_component: env_path("HLTHPRT_PTG2_PROVIDER_ENTRY_COMPONENT_COPY_PATH"),
             provider_group_member: env_path("HLTHPRT_PTG2_PROVIDER_GROUP_MEMBER_COPY_PATH"),
@@ -443,6 +445,7 @@ impl CopyPathConfig {
             || self.price_atom.is_some()
             || self.price_set_entry.is_some()
             || self.provider_set.is_some()
+            || self.provider_set_component.is_some()
             || self.provider_set_entry.is_some()
             || self.provider_entry_component.is_some()
             || self.provider_group_member.is_some()
@@ -470,6 +473,10 @@ impl CopyPathConfig {
                 .map(|path| format!("{path}{suffix}")),
             provider_set: self
                 .provider_set
+                .as_ref()
+                .map(|path| format!("{path}{suffix}")),
+            provider_set_component: self
+                .provider_set_component
                 .as_ref()
                 .map(|path| format!("{path}{suffix}")),
             provider_set_entry: self
@@ -573,6 +580,7 @@ struct SharedDedupe {
     price_set: ShardedDedupe64,
     price_set_entry: Option<ShardedDedupe128>,
     provider_set: ShardedDedupe64,
+    provider_set_component: ShardedDedupe128,
     provider_set_entry: ShardedDedupe128,
     provider_entry_component: Option<ShardedDedupe128>,
     provider_group_member: ShardedDedupe128,
@@ -583,6 +591,7 @@ struct SharedDedupe {
     price_set_counter: DedupeCounter,
     price_set_entry_counter: DedupeCounter,
     provider_set_counter: DedupeCounter,
+    provider_set_component_counter: DedupeCounter,
     provider_set_entry_counter: DedupeCounter,
     provider_entry_component_counter: DedupeCounter,
     provider_group_member_counter: DedupeCounter,
@@ -602,6 +611,7 @@ impl SharedDedupe {
             price_set_entry: dedupe_high_cardinality_entries
                 .then(|| ShardedDedupe128::new(shard_count)),
             provider_set: ShardedDedupe64::new(shard_count),
+            provider_set_component: ShardedDedupe128::new(shard_count),
             provider_set_entry: ShardedDedupe128::new(shard_count),
             provider_entry_component: dedupe_high_cardinality_entries
                 .then(|| ShardedDedupe128::new(shard_count)),
@@ -613,6 +623,7 @@ impl SharedDedupe {
             price_set_counter: DedupeCounter::new(),
             price_set_entry_counter: DedupeCounter::new(),
             provider_set_counter: DedupeCounter::new(),
+            provider_set_component_counter: DedupeCounter::new(),
             provider_set_entry_counter: DedupeCounter::new(),
             provider_entry_component_counter: DedupeCounter::new(),
             provider_group_member_counter: DedupeCounter::new(),
@@ -659,6 +670,18 @@ impl SharedDedupe {
     fn insert_provider_set(&self, key: &str) -> bool {
         let inserted = self.provider_set.insert_hash_text(key);
         self.provider_set_counter.record(inserted);
+        inserted
+    }
+
+    fn insert_provider_set_component(
+        &self,
+        provider_set_hash: &str,
+        provider_group_hash: i64,
+    ) -> bool {
+        let inserted = self
+            .provider_set_component
+            .insert(provider_set_component_key(provider_set_hash, provider_group_hash));
+        self.provider_set_component_counter.record(inserted);
         inserted
     }
 
@@ -818,6 +841,10 @@ fn provider_group_member_key(group_hash: i64, npi: i64) -> u128 {
 
 fn provider_set_entry_key(provider_set_hash: &str, provider_entry_hash: i64) -> u128 {
     ((hash_text_key(provider_set_hash) as u128) << 64) | (provider_entry_hash as u64 as u128)
+}
+
+fn provider_set_component_key(provider_set_hash: &str, provider_group_hash: i64) -> u128 {
+    ((hash_text_key(provider_set_hash) as u128) << 64) | (provider_group_hash as u64 as u128)
 }
 
 fn price_set_entry_key(price_set_hash: &str, price_atom_hash: &str) -> u128 {
@@ -1436,19 +1463,14 @@ impl CompactCopySink {
         serving_rate_id: &str,
         snapshot_id: &str,
         plan_id: &str,
-        plan_month_id: &str,
         procedure_hash: &str,
         procedure_code: Option<i64>,
         reported_code_system: Option<&str>,
         reported_code: Option<&str>,
-        billing_code: &str,
-        billing_code_type: &str,
-        rate_pack_hash: &str,
         provider_set_hash: &str,
         provider_count: i64,
         price_set_hash: &str,
         source_trace_set_hash: &str,
-        confidence_code: &str,
     ) -> io::Result<()> {
         let writer = self.writer.as_mut().ok_or_else(|| {
             io::Error::new(io::ErrorKind::BrokenPipe, "compact copy writer is closed")
@@ -1458,19 +1480,14 @@ impl CompactCopySink {
             serving_rate_id,
             snapshot_id,
             plan_id,
-            plan_month_id,
             procedure_hash,
             procedure_code,
             reported_code_system,
             reported_code,
-            billing_code,
-            billing_code_type,
-            rate_pack_hash,
             provider_set_hash,
             provider_count,
             price_set_hash,
             source_trace_set_hash,
-            confidence_code,
         )?;
         self.row_count += 1;
         Ok(())
@@ -1560,6 +1577,7 @@ struct DictionaryCopySinks {
     price_atom: Option<CompactCopySink>,
     price_set_entry: Option<CompactCopySink>,
     provider_set: Option<CompactCopySink>,
+    provider_set_component: Option<CompactCopySink>,
     provider_set_entry: Option<CompactCopySink>,
     provider_entry_component: Option<CompactCopySink>,
     provider_group_member: Option<CompactCopySink>,
@@ -1592,6 +1610,11 @@ impl DictionaryCopySinks {
                 "HLTHPRT_PTG2_PROVIDER_SET_COPY_PATH",
                 rotate_bytes,
                 "provider_set_copy_file",
+            )?,
+            provider_set_component: Self::sink_from_env(
+                "HLTHPRT_PTG2_PROVIDER_SET_COMPONENT_COPY_PATH",
+                rotate_bytes,
+                "provider_set_component_copy_file",
             )?,
             provider_set_entry: Self::sink_from_env(
                 "HLTHPRT_PTG2_PROVIDER_SET_ENTRY_COPY_PATH",
@@ -1650,6 +1673,14 @@ impl DictionaryCopySinks {
                     path.clone(),
                     rotate_bytes,
                     "provider_set_copy_file",
+                )?),
+                None => None,
+            },
+            provider_set_component: match &paths.provider_set_component {
+                Some(path) => Some(CompactCopySink::new_named_file(
+                    path.clone(),
+                    rotate_bytes,
+                    "provider_set_component_copy_file",
                 )?),
                 None => None,
             },
@@ -1720,6 +1751,11 @@ impl DictionaryCopySinks {
                 events.push(event);
             }
         }
+        if let Some(sink) = self.provider_set_component.as_mut() {
+            if let Some(event) = sink.maybe_rotate_silent()? {
+                events.push(event);
+            }
+        }
         if let Some(sink) = self.provider_set_entry.as_mut() {
             if let Some(event) = sink.maybe_rotate_silent()? {
                 events.push(event);
@@ -1752,6 +1788,9 @@ impl DictionaryCopySinks {
             sink.finish(writer)?;
         }
         if let Some(sink) = self.provider_set.take() {
+            sink.finish(writer)?;
+        }
+        if let Some(sink) = self.provider_set_component.take() {
             sink.finish(writer)?;
         }
         if let Some(sink) = self.provider_set_entry.take() {
@@ -1789,6 +1828,11 @@ impl DictionaryCopySinks {
             }
         }
         if let Some(sink) = self.provider_set.take() {
+            if let Some(event) = sink.finish_silent()? {
+                events.push(event);
+            }
+        }
+        if let Some(sink) = self.provider_set_component.take() {
             if let Some(event) = sink.finish_silent()? {
                 events.push(event);
             }
@@ -2069,6 +2113,70 @@ impl DictionaryCopySinks {
         Ok(())
     }
 
+    fn write_provider_set_components(
+        &mut self,
+        provider_set_hash: &str,
+        provider_group_hashes: &[i64],
+        emitted_components: &mut HashSet<(String, i64)>,
+    ) -> io::Result<()> {
+        let Some(sink) = self.provider_set_component.as_mut() else {
+            return Ok(());
+        };
+        let writer = sink.writer.as_mut().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "provider set component copy writer is closed",
+            )
+        })?;
+        let mut rows_written = 0u64;
+        for provider_group_hash in provider_group_hashes {
+            if !emitted_components.insert((provider_set_hash.to_string(), *provider_group_hash)) {
+                continue;
+            }
+            let group_hash_text = provider_group_hash.to_string();
+            let fields = [
+                pg_text_copy_field(Some(provider_set_hash)),
+                pg_text_copy_field(Some(&group_hash_text)),
+            ];
+            write_copy_fields(writer, &fields)?;
+            rows_written += 1;
+        }
+        sink.row_count += rows_written;
+        Ok(())
+    }
+
+    fn write_provider_set_components_shared(
+        &mut self,
+        provider_set_hash: &str,
+        provider_group_hashes: &[i64],
+        dedupe: &SharedDedupe,
+    ) -> io::Result<()> {
+        let Some(sink) = self.provider_set_component.as_mut() else {
+            return Ok(());
+        };
+        let writer = sink.writer.as_mut().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "provider set component copy writer is closed",
+            )
+        })?;
+        let mut rows_written = 0u64;
+        for provider_group_hash in provider_group_hashes {
+            if !dedupe.insert_provider_set_component(provider_set_hash, *provider_group_hash) {
+                continue;
+            }
+            let group_hash_text = provider_group_hash.to_string();
+            let fields = [
+                pg_text_copy_field(Some(provider_set_hash)),
+                pg_text_copy_field(Some(&group_hash_text)),
+            ];
+            write_copy_fields(writer, &fields)?;
+            rows_written += 1;
+        }
+        sink.row_count += rows_written;
+        Ok(())
+    }
+
     fn write_provider_set_entries_shared(
         &mut self,
         provider_set_hash: &str,
@@ -2338,19 +2446,14 @@ fn emit_compact_copy_row<W: Write>(
     serving_rate_id: &str,
     snapshot_id: &str,
     plan_id: &str,
-    plan_month_id: &str,
     procedure_hash: &str,
     procedure_code: Option<i64>,
     reported_code_system: Option<&str>,
     reported_code: Option<&str>,
-    billing_code: &str,
-    billing_code_type: &str,
-    rate_pack_hash: &str,
     provider_set_hash: &str,
     provider_count: i64,
     price_set_hash: &str,
     source_trace_set_hash: &str,
-    confidence_code: &str,
 ) -> io::Result<()> {
     let procedure_code_text = procedure_code.map(|value| value.to_string());
     let provider_count_text = provider_count.to_string();
@@ -2360,19 +2463,14 @@ fn emit_compact_copy_row<W: Write>(
             Some(serving_rate_id),
             Some(snapshot_id),
             Some(plan_id),
-            Some(plan_month_id),
             Some(procedure_hash),
             procedure_code_text.as_deref(),
             reported_code_system,
             reported_code,
-            Some(billing_code),
-            Some(billing_code_type),
-            Some(rate_pack_hash),
             Some(provider_set_hash),
             Some(&provider_count_text),
             Some(price_set_hash),
             Some(source_trace_set_hash),
-            Some(confidence_code),
         ],
     )
 }
@@ -2387,6 +2485,7 @@ fn process_compact_rate_lites<W: Write>(
     emitted_price_sets: &mut HashSet<String>,
     emitted_price_set_entries: &mut HashSet<(String, String)>,
     emitted_provider_sets: &mut HashSet<String>,
+    emitted_provider_set_components: &mut HashSet<(String, i64)>,
     emitted_provider_set_entries: &mut HashSet<(String, i64)>,
     emitted_provider_entry_components: &mut HashSet<(i64, i64)>,
     emitted_procedures: &mut HashSet<String>,
@@ -2619,6 +2718,11 @@ fn process_compact_rate_lites<W: Write>(
                 &sorted_provider_entry_hashes,
                 emitted_provider_set_entries,
             )?;
+            dictionary_copy_sinks.write_provider_set_components(
+                &provider_set_hash,
+                &sorted_provider_hashes,
+                emitted_provider_set_components,
+            )?;
             for provider_entry_hash in &sorted_provider_entry_hashes {
                 let components = provider_entry_components
                     .get(provider_entry_hash)
@@ -2636,19 +2740,14 @@ fn process_compact_rate_lites<W: Write>(
                 &serving_rate_id,
                 snapshot_id,
                 plan_id,
-                plan_month_id,
                 &procedure_hash,
                 None,
                 reported_code_system.as_deref(),
                 reported_code.as_deref(),
-                &billing_code,
-                &billing_code_type,
-                &rate_pack_hash,
                 &provider_set_hash,
                 provider_count,
                 &price_set_hash,
                 source_trace_set_hash,
-                confidence_code,
             )?;
         } else {
             emit_json_record(
@@ -2928,6 +3027,11 @@ fn process_compact_rate_lites_worker<W: Write>(
                 &sorted_provider_entry_hashes,
                 dedupe,
             )?;
+            dictionary_copy_sinks.write_provider_set_components_shared(
+                &provider_set_hash,
+                &sorted_provider_hashes,
+                dedupe,
+            )?;
             for provider_entry_hash in &sorted_provider_entry_hashes {
                 let components = provider_entry_components
                     .get(provider_entry_hash)
@@ -2946,19 +3050,14 @@ fn process_compact_rate_lites_worker<W: Write>(
                     &serving_rate_id,
                     &context.snapshot_id,
                     &context.plan_id,
-                    &context.plan_month_id,
                     &procedure_hash,
                     None,
                     reported_code_system.as_deref(),
                     reported_code.as_deref(),
-                    &billing_code,
-                    &billing_code_type,
-                    &rate_pack_hash,
                     &provider_set_hash,
                     provider_count,
                     &price_set_hash,
                     &context.source_trace_set_hash,
-                    &context.confidence_code,
                 )?;
             } else {
                 emit_json_record(
@@ -3130,6 +3229,7 @@ fn process_in_network_struson<R: Read, W: Write>(
     emitted_price_sets: &mut HashSet<String>,
     emitted_price_set_entries: &mut HashSet<(String, String)>,
     emitted_provider_sets: &mut HashSet<String>,
+    emitted_provider_set_components: &mut HashSet<(String, i64)>,
     emitted_provider_set_entries: &mut HashSet<(String, i64)>,
     emitted_provider_entry_components: &mut HashSet<(i64, i64)>,
     emitted_procedures: &mut HashSet<String>,
@@ -3175,6 +3275,7 @@ fn process_in_network_struson<R: Read, W: Write>(
                                 emitted_price_sets,
                                 emitted_price_set_entries,
                                 emitted_provider_sets,
+                                emitted_provider_set_components,
                                 emitted_provider_set_entries,
                                 emitted_provider_entry_components,
                                 emitted_procedures,
@@ -3212,6 +3313,7 @@ fn process_in_network_struson<R: Read, W: Write>(
             emitted_price_sets,
             emitted_price_set_entries,
             emitted_provider_sets,
+            emitted_provider_set_components,
             emitted_provider_set_entries,
             emitted_provider_entry_components,
             emitted_procedures,
@@ -3710,6 +3812,7 @@ fn scan_compact_struson(path: &Path) -> io::Result<()> {
     let mut emitted_price_sets: HashSet<String> = HashSet::new();
     let mut emitted_price_set_entries: HashSet<(String, String)> = HashSet::new();
     let mut emitted_provider_sets: HashSet<String> = HashSet::new();
+    let mut emitted_provider_set_components: HashSet<(String, i64)> = HashSet::new();
     let mut emitted_provider_set_entries: HashSet<(String, i64)> = HashSet::new();
     let mut emitted_provider_entry_components: HashSet<(i64, i64)> = HashSet::new();
     let mut emitted_procedures: HashSet<String> = HashSet::new();
@@ -3759,6 +3862,7 @@ fn scan_compact_struson(path: &Path) -> io::Result<()> {
                         &mut emitted_price_sets,
                         &mut emitted_price_set_entries,
                         &mut emitted_provider_sets,
+                        &mut emitted_provider_set_components,
                         &mut emitted_provider_set_entries,
                         &mut emitted_provider_entry_components,
                         &mut emitted_procedures,

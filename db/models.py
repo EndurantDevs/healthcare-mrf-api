@@ -2245,19 +2245,8 @@ class PTG2ServingRateCompact(Base, JSONOutputMixin):
     )
     __my_index_elements__ = ["serving_rate_id"]
     __my_additional_indexes__ = [
-        {"index_elements": ("snapshot_id", "plan_id", "billing_code"), "name": "ptg2_serving_rate_compact_billing_idx"},
         {"index_elements": ("snapshot_id", "plan_id", "reported_code"), "name": "ptg2_serving_rate_compact_reported_idx"},
         {"index_elements": ("snapshot_id", "plan_id", "procedure_code"), "name": "ptg2_serving_rate_compact_hp_idx"},
-        {
-            "index_elements": (
-                "snapshot_id",
-                "plan_id",
-                "billing_code",
-                "provider_count DESC",
-                "serving_rate_id",
-            ),
-            "name": "ptg2_serving_rate_compact_billing_order_idx",
-        },
         {
             "index_elements": (
                 "snapshot_id",
@@ -2285,19 +2274,14 @@ class PTG2ServingRateCompact(Base, JSONOutputMixin):
     serving_rate_id = Column(String(64))
     snapshot_id = Column(String(96))
     plan_id = Column(String(64))
-    plan_month_id = Column(String(96))
     procedure_hash = Column(String(64))
     procedure_code = Column(BigInteger)
     reported_code_system = Column(String(64))
     reported_code = Column(String(64))
-    billing_code = Column(String(64))
-    billing_code_type = Column(String(64))
-    rate_pack_hash = Column(String(64))
     provider_set_hash = Column(String(64))
     provider_count = Column(Integer)
     price_set_hash = Column(String(64))
     source_trace_set_hash = Column(String(64))
-    confidence_code = Column(String(64))
     created_at = Column(DateTime)
 
 
