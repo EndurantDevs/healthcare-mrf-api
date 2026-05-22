@@ -13,6 +13,7 @@ from api import ptg2_index_cache
 from api import ptg2_tables
 from api import ptg2_serving_utils
 from api import ptg2_code_details
+from api import ptg2_code_context
 
 
 class FakeResult:
@@ -80,6 +81,11 @@ def test_ptg2_code_filter_split_keeps_serving_facade_helpers_stable():
     assert ptg2_serving._normalize_taxonomy_code is ptg2_code_filters._normalize_taxonomy_code
     assert ptg2_serving._normalize_npi is ptg2_code_filters._normalize_npi
     assert ptg2_serving._inferred_provider_taxonomy_sql is ptg2_code_filters._inferred_provider_taxonomy_sql
+
+
+def test_ptg2_code_context_split_keeps_serving_facade_helpers_stable():
+    assert ptg2_serving._query_ptg2_code_crosswalk_edges is ptg2_code_context._query_ptg2_code_crosswalk_edges
+    assert ptg2_serving._resolve_ptg2_code_search_context is ptg2_code_context._resolve_ptg2_code_search_context
 
 
 def test_ptg2_type_split_keeps_serving_facade_classes_stable():
