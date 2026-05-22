@@ -136,6 +136,8 @@ def test_source_job_split_keeps_facade_helpers_stable():
     assert process_ptg._dedupe_rows_by is ptg_source_jobs._dedupe_rows_by
     assert process_ptg._plan_matches_filters is ptg_source_jobs._plan_matches_filters
     assert process_ptg._filter_reporting_plans is ptg_source_jobs._filter_reporting_plans
+    assert process_ptg._normalize_plan_payload is ptg_source_jobs._normalize_plan_payload
+    assert process_ptg.parse_toc_catalog_entries is ptg_source_jobs.parse_toc_catalog_entries
     assert process_ptg._load_toc_urls_from_file is ptg_source_jobs._load_toc_urls_from_file
     assert process_ptg._filter_jobs_by_url_contains is ptg_source_jobs._filter_jobs_by_url_contains
     assert process_ptg._ptg_job_identity is ptg_source_jobs._ptg_job_identity
