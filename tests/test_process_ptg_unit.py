@@ -35,6 +35,7 @@ ptg_rust_publish = importlib.import_module("process.ptg_parts.rust_publish")
 ptg_rust_scanner = importlib.import_module("process.ptg_parts.rust_scanner")
 ptg_rust_stage = importlib.import_module("process.ptg_parts.rust_stage")
 ptg_screen = importlib.import_module("process.ptg_parts.screen")
+ptg_serving_index = importlib.import_module("process.ptg_parts.serving_index")
 ptg_serving_maintenance = importlib.import_module("process.ptg_parts.serving_maintenance")
 ptg_serving_rows = importlib.import_module("process.ptg_parts.serving_rows")
 ptg_serving_only = importlib.import_module("process.ptg_parts.serving_only")
@@ -300,6 +301,14 @@ def test_serving_maintenance_split_keeps_facade_helpers_stable():
     assert process_ptg._merge_staged_price_sets is ptg_serving_maintenance._merge_staged_price_sets
     assert process_ptg._merge_staged_serving_rates is ptg_serving_maintenance._merge_staged_serving_rates
     assert process_ptg._build_ptg2_provider_locations is ptg_serving_maintenance._build_ptg2_provider_locations
+
+
+def test_serving_index_split_keeps_facade_helpers_stable():
+    assert process_ptg._ptg2_table_available is ptg_serving_index._ptg2_table_available
+    assert process_ptg.build_ptg2_db_serving_index is ptg_serving_index.build_ptg2_db_serving_index
+    assert process_ptg.finalize_ptg2_incremental_serving_index is ptg_serving_index.finalize_ptg2_incremental_serving_index
+    assert process_ptg.build_ptg2_stage_serving_index is ptg_serving_index.build_ptg2_stage_serving_index
+    assert process_ptg.build_ptg2_compact_serving_index is ptg_serving_index.build_ptg2_compact_serving_index
 
 
 def test_filter_reporting_plans_matches_group_plan_id():
