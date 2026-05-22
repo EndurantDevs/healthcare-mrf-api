@@ -1396,7 +1396,7 @@ def test_ptg2_main_marks_failed_when_all_discovered_jobs_fail(monkeypatch):
         for job in jobs:
             yield process_ptg.PTG2DownloadedJob(
                 job=job,
-                raw_artifact=object(),
+                raw_artifact=SimpleNamespace(raw_sha256=str(job.get("url") or "")),
                 logical_artifact=SimpleNamespace(logical_path="/tmp/rates.json.gz"),
             )
 
@@ -1449,7 +1449,7 @@ def test_ptg2_main_blocks_partial_publish_by_default(monkeypatch):
         for job in jobs:
             yield process_ptg.PTG2DownloadedJob(
                 job=job,
-                raw_artifact=object(),
+                raw_artifact=SimpleNamespace(raw_sha256=str(job.get("url") or "")),
                 logical_artifact=SimpleNamespace(logical_path="/tmp/rates.json.gz"),
             )
 
@@ -1990,7 +1990,9 @@ def test_ptg2_rust_compact_serving_parallel_workers_write_shards(tmp_path):
         for line in shard_path.read_text().splitlines()
     ]
     assert len(copy_lines) == 1
-    assert copy_lines[0].split("\t")[8] == "99213"
+    fields = copy_lines[0].split("\t")
+    assert fields[6] == "99213"
+    assert fields[8] == "1"
     assert b"serving_rate_compact" not in completed.stdout
     assert b"compact_copy_file" in completed.stdout
     assert b"dedupe_summary" in completed.stdout
@@ -2467,7 +2469,7 @@ def test_ptg2_source_scoped_report_uses_published_serving_rate_count(monkeypatch
         for job in jobs:
             yield process_ptg.PTG2DownloadedJob(
                 job=job,
-                raw_artifact=object(),
+                raw_artifact=SimpleNamespace(raw_sha256=str(job.get("url") or "")),
                 logical_artifact=SimpleNamespace(logical_path="/tmp/rates.json.gz"),
             )
 
@@ -2533,7 +2535,7 @@ def test_ptg2_test_mode_does_not_enter_source_scoped_rust_publish(monkeypatch):
         for job in jobs:
             yield process_ptg.PTG2DownloadedJob(
                 job=job,
-                raw_artifact=object(),
+                raw_artifact=SimpleNamespace(raw_sha256=str(job.get("url") or "")),
                 logical_artifact=SimpleNamespace(logical_path="/tmp/rates.json.gz"),
             )
 

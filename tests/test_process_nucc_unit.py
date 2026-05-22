@@ -136,7 +136,11 @@ async def test_main_enqueues_job(monkeypatch, nucc_module):
 
     await nucc_module.main()
 
-    fake_pool.enqueue_job.assert_awaited_once_with("process_data", {"test_mode": False})
+    fake_pool.enqueue_job.assert_awaited_once_with(
+        "process_data",
+        {"test_mode": False},
+        _queue_name="arq:NUCC",
+    )
 
 
 @pytest.mark.asyncio
@@ -148,4 +152,8 @@ async def test_main_enqueues_job_test_mode(monkeypatch, nucc_module):
 
     await nucc_module.main(test_mode=True)
 
-    fake_pool.enqueue_job.assert_awaited_once_with("process_data", {"test_mode": True})
+    fake_pool.enqueue_job.assert_awaited_once_with(
+        "process_data",
+        {"test_mode": True},
+        _queue_name="arq:NUCC",
+    )

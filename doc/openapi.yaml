@@ -1065,6 +1065,38 @@ paths:
             application/json:
               schema:
                 type: object
+  /reports/pharmacies/chains/summary:
+    get:
+      summary: Summarize pharmacy chain coverage by name filter
+      parameters:
+        - name: name_like
+          in: query
+          required: true
+          schema:
+            type: string
+          description: One or more pharmacy chain name fragments to match
+        - name: include_states
+          in: query
+          schema:
+            type: boolean
+          description: Include state-level chain counts
+      responses:
+        '200':
+          description: Pharmacy chain summary payload
+          content:
+            application/json:
+              schema:
+                type: object
+  /reports/pharmacies/state-stats:
+    get:
+      summary: Summarize pharmacy coverage by state
+      responses:
+        '200':
+          description: State-level pharmacy summary payload
+          content:
+            application/json:
+              schema:
+                type: object
   /reports/pharmacies/{npi}/market-context:
     get:
       summary: Return market context summary for one pharmacy NPI
@@ -1086,6 +1118,38 @@ paths:
       responses:
         '200':
           description: Pharmacy market context payload
+          content:
+            application/json:
+              schema:
+                type: object
+  /site-intelligence/score:
+    get:
+      summary: Score pharmacy site viability by coordinates
+      parameters:
+        - name: lat
+          in: query
+          required: true
+          schema:
+            type: number
+            format: double
+        - name: lng
+          in: query
+          required: true
+          schema:
+            type: number
+            format: double
+        - name: radius_miles
+          in: query
+          schema:
+            type: number
+            format: double
+        - name: target_scripts_per_day
+          in: query
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Site viability score payload
           content:
             application/json:
               schema:
@@ -1843,6 +1907,16 @@ paths:
           schema:
             type: string
           description: Optional output view selector (for example `chain`)
+        - name: view
+          in: query
+          schema:
+            type: string
+          description: Alias for `show`
+        - name: include_total
+          in: query
+          schema:
+            type: boolean
+          description: Include total-count metadata when supported
         - name: start
           in: query
           schema:
@@ -2332,26 +2406,6 @@ paths:
           in: query
           schema:
             type: boolean
-        - name: include_providers
-          in: query
-          schema:
-            type: boolean
-          description: For PTG2 plan-rate results, expand provider-set rows to concrete NPI/provider rows.
-        - name: include_code_details
-          in: query
-          schema:
-            type: boolean
-          description: For PTG2 plan-rate results, include readable RC billing-code and POS service-code details from the code catalog.
-        - name: include_sources
-          in: query
-          schema:
-            type: boolean
-          description: For PTG2 plan-rate results, include source/provenance metadata.
-        - name: include_details
-          in: query
-          schema:
-            type: boolean
-          description: For PTG2 plan-rate results, include full diagnostic details.
         - name: order
           in: query
           schema:
@@ -2703,6 +2757,86 @@ paths:
           in: query
           schema:
             type: string
+        - name: code_system
+          in: query
+          schema:
+            type: string
+        - name: plan_id
+          in: query
+          schema:
+            type: string
+        - name: plan_external_id
+          in: query
+          schema:
+            type: string
+        - name: plan_market_type
+          in: query
+          schema:
+            type: string
+        - name: source_key
+          in: query
+          schema:
+            type: string
+        - name: snapshot_id
+          in: query
+          schema:
+            type: string
+        - name: mode
+          in: query
+          schema:
+            type: string
+        - name: service_code
+          in: query
+          schema:
+            type: string
+        - name: place_of_service
+          in: query
+          schema:
+            type: string
+        - name: pos
+          in: query
+          schema:
+            type: string
+        - name: modifier
+          in: query
+          schema:
+            type: string
+        - name: modifiers
+          in: query
+          schema:
+            type: string
+        - name: billing_code_modifier
+          in: query
+          schema:
+            type: string
+        - name: rate
+          in: query
+          schema:
+            type: number
+        - name: negotiated_rate
+          in: query
+          schema:
+            type: number
+        - name: rate_tolerance
+          in: query
+          schema:
+            type: number
+        - name: negotiated_rate_tolerance
+          in: query
+          schema:
+            type: number
+        - name: include_sources
+          in: query
+          schema:
+            type: boolean
+        - name: include_details
+          in: query
+          schema:
+            type: boolean
+        - name: include_debug
+          in: query
+          schema:
+            type: boolean
         - name: include_legacy_fields
           in: query
           schema:
@@ -2784,6 +2918,86 @@ paths:
           in: query
           schema:
             type: string
+        - name: code_system
+          in: query
+          schema:
+            type: string
+        - name: plan_id
+          in: query
+          schema:
+            type: string
+        - name: plan_external_id
+          in: query
+          schema:
+            type: string
+        - name: plan_market_type
+          in: query
+          schema:
+            type: string
+        - name: source_key
+          in: query
+          schema:
+            type: string
+        - name: snapshot_id
+          in: query
+          schema:
+            type: string
+        - name: mode
+          in: query
+          schema:
+            type: string
+        - name: service_code
+          in: query
+          schema:
+            type: string
+        - name: place_of_service
+          in: query
+          schema:
+            type: string
+        - name: pos
+          in: query
+          schema:
+            type: string
+        - name: modifier
+          in: query
+          schema:
+            type: string
+        - name: modifiers
+          in: query
+          schema:
+            type: string
+        - name: billing_code_modifier
+          in: query
+          schema:
+            type: string
+        - name: rate
+          in: query
+          schema:
+            type: number
+        - name: negotiated_rate
+          in: query
+          schema:
+            type: number
+        - name: rate_tolerance
+          in: query
+          schema:
+            type: number
+        - name: negotiated_rate_tolerance
+          in: query
+          schema:
+            type: number
+        - name: include_sources
+          in: query
+          schema:
+            type: boolean
+        - name: include_details
+          in: query
+          schema:
+            type: boolean
+        - name: include_debug
+          in: query
+          schema:
+            type: boolean
         - name: include_legacy_fields
           in: query
           schema:
@@ -3380,6 +3594,86 @@ paths:
           schema:
             type: string
             enum: [product_search, exact_source]
+        - name: npi
+          in: query
+          schema:
+            type: integer
+        - name: lat
+          in: query
+          schema:
+            type: number
+        - name: long
+          in: query
+          schema:
+            type: number
+        - name: radius
+          in: query
+          schema:
+            type: number
+        - name: radius_miles
+          in: query
+          schema:
+            type: number
+        - name: service_code
+          in: query
+          schema:
+            type: string
+        - name: place_of_service
+          in: query
+          schema:
+            type: string
+        - name: pos
+          in: query
+          schema:
+            type: string
+        - name: modifier
+          in: query
+          schema:
+            type: string
+        - name: modifiers
+          in: query
+          schema:
+            type: string
+        - name: billing_code_modifier
+          in: query
+          schema:
+            type: string
+        - name: rate
+          in: query
+          schema:
+            type: number
+        - name: negotiated_rate
+          in: query
+          schema:
+            type: number
+        - name: rate_tolerance
+          in: query
+          schema:
+            type: number
+        - name: negotiated_rate_tolerance
+          in: query
+          schema:
+            type: number
+        - name: include_providers
+          in: query
+          schema:
+            type: boolean
+        - name: include_code_details
+          in: query
+          schema:
+            type: boolean
+        - name: include_sources
+          in: query
+          schema:
+            type: boolean
+        - name: include_details
+          in: query
+          schema:
+            type: boolean
+        - name: include_debug
+          in: query
+          schema:
+            type: boolean
         - name: include_legacy_fields
           in: query
           schema:
@@ -3458,6 +3752,130 @@ paths:
           in: query
           schema:
             type: string
+        - name: code_system
+          in: query
+          schema:
+            type: string
+        - name: plan_id
+          in: query
+          schema:
+            type: string
+        - name: plan_external_id
+          in: query
+          schema:
+            type: string
+        - name: plan_market_type
+          in: query
+          schema:
+            type: string
+        - name: source_key
+          in: query
+          schema:
+            type: string
+        - name: snapshot_id
+          in: query
+          schema:
+            type: string
+        - name: mode
+          in: query
+          schema:
+            type: string
+        - name: taxonomy_code
+          in: query
+          schema:
+            type: string
+        - name: taxonomy_classification
+          in: query
+          schema:
+            type: string
+        - name: taxonomy_specialization
+          in: query
+          schema:
+            type: string
+        - name: taxonomy_section
+          in: query
+          schema:
+            type: string
+        - name: npi
+          in: query
+          schema:
+            type: integer
+        - name: lat
+          in: query
+          schema:
+            type: number
+        - name: long
+          in: query
+          schema:
+            type: number
+        - name: radius
+          in: query
+          schema:
+            type: number
+        - name: radius_miles
+          in: query
+          schema:
+            type: number
+        - name: service_code
+          in: query
+          schema:
+            type: string
+        - name: place_of_service
+          in: query
+          schema:
+            type: string
+        - name: pos
+          in: query
+          schema:
+            type: string
+        - name: modifier
+          in: query
+          schema:
+            type: string
+        - name: modifiers
+          in: query
+          schema:
+            type: string
+        - name: billing_code_modifier
+          in: query
+          schema:
+            type: string
+        - name: rate
+          in: query
+          schema:
+            type: number
+        - name: negotiated_rate
+          in: query
+          schema:
+            type: number
+        - name: rate_tolerance
+          in: query
+          schema:
+            type: number
+        - name: negotiated_rate_tolerance
+          in: query
+          schema:
+            type: number
+        - name: include_providers
+          in: query
+          schema:
+            type: boolean
+        - name: include_code_details
+          in: query
+          schema:
+            type: boolean
+        - name: include_sources
+          in: query
+          schema:
+            type: boolean
+        - name: include_details
+          in: query
+          schema:
+            type: boolean
+        - name: include_debug
+          in: query
+          schema:
+            type: boolean
         - name: include_legacy_fields
           in: query
           schema:
@@ -3536,6 +3954,130 @@ paths:
           in: query
           schema:
             type: string
+        - name: code_system
+          in: query
+          schema:
+            type: string
+        - name: plan_id
+          in: query
+          schema:
+            type: string
+        - name: plan_external_id
+          in: query
+          schema:
+            type: string
+        - name: plan_market_type
+          in: query
+          schema:
+            type: string
+        - name: source_key
+          in: query
+          schema:
+            type: string
+        - name: snapshot_id
+          in: query
+          schema:
+            type: string
+        - name: mode
+          in: query
+          schema:
+            type: string
+        - name: taxonomy_code
+          in: query
+          schema:
+            type: string
+        - name: taxonomy_classification
+          in: query
+          schema:
+            type: string
+        - name: taxonomy_specialization
+          in: query
+          schema:
+            type: string
+        - name: taxonomy_section
+          in: query
+          schema:
+            type: string
+        - name: npi
+          in: query
+          schema:
+            type: integer
+        - name: lat
+          in: query
+          schema:
+            type: number
+        - name: long
+          in: query
+          schema:
+            type: number
+        - name: radius
+          in: query
+          schema:
+            type: number
+        - name: radius_miles
+          in: query
+          schema:
+            type: number
+        - name: service_code
+          in: query
+          schema:
+            type: string
+        - name: place_of_service
+          in: query
+          schema:
+            type: string
+        - name: pos
+          in: query
+          schema:
+            type: string
+        - name: modifier
+          in: query
+          schema:
+            type: string
+        - name: modifiers
+          in: query
+          schema:
+            type: string
+        - name: billing_code_modifier
+          in: query
+          schema:
+            type: string
+        - name: rate
+          in: query
+          schema:
+            type: number
+        - name: negotiated_rate
+          in: query
+          schema:
+            type: number
+        - name: rate_tolerance
+          in: query
+          schema:
+            type: number
+        - name: negotiated_rate_tolerance
+          in: query
+          schema:
+            type: number
+        - name: include_providers
+          in: query
+          schema:
+            type: boolean
+        - name: include_code_details
+          in: query
+          schema:
+            type: boolean
+        - name: include_sources
+          in: query
+          schema:
+            type: boolean
+        - name: include_details
+          in: query
+          schema:
+            type: boolean
+        - name: include_debug
+          in: query
+          schema:
+            type: boolean
         - name: include_legacy_fields
           in: query
           schema:
