@@ -201,6 +201,7 @@ def test_source_pointer_split_keeps_facade_helpers_stable():
     assert process_ptg._ptg2_plan_source_key is ptg_source_pointers._ptg2_plan_source_key
     assert process_ptg._current_source_snapshot_id is ptg_source_pointers._current_source_snapshot_id
     assert process_ptg._source_plan_rows is ptg_source_pointers._source_plan_rows
+    assert process_ptg._publish_ptg2_source_pointers is ptg_source_pointers._publish_ptg2_source_pointers
 
 
 def test_source_job_split_keeps_facade_helpers_stable():
