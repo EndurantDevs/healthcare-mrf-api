@@ -36,6 +36,7 @@ ptg_serving_rows = importlib.import_module("process.ptg_parts.serving_rows")
 ptg_serving_only = importlib.import_module("process.ptg_parts.serving_only")
 ptg_snapshot_cleanup = importlib.import_module("process.ptg_parts.snapshot_cleanup")
 ptg_snapshot_tables = importlib.import_module("process.ptg_parts.snapshot_tables")
+ptg_source_download = importlib.import_module("process.ptg_parts.source_download")
 ptg_source_jobs = importlib.import_module("process.ptg_parts.source_jobs")
 ptg_source_pointers = importlib.import_module("process.ptg_parts.source_pointers")
 ptg_values = importlib.import_module("process.ptg_parts.values")
@@ -162,6 +163,16 @@ def test_source_job_split_keeps_facade_helpers_stable():
     assert process_ptg._plan_identity is ptg_source_jobs._plan_identity
     assert process_ptg._merge_ptg_job is ptg_source_jobs._merge_ptg_job
     assert process_ptg._dedupe_ptg_jobs is ptg_source_jobs._dedupe_ptg_jobs
+
+
+def test_source_download_split_keeps_facade_helpers_stable():
+    assert process_ptg._format_eta_seconds is ptg_source_download._format_eta_seconds
+    assert process_ptg._emit_download_progress is ptg_source_download._emit_download_progress
+    assert process_ptg.fetch_head_metadata is ptg_source_download.fetch_head_metadata
+    assert process_ptg._probe_http_range_support is ptg_source_download._probe_http_range_support
+    assert process_ptg._download_raw_artifact_ranges is ptg_source_download._download_raw_artifact_ranges
+    assert process_ptg.download_raw_artifact is ptg_source_download.download_raw_artifact
+    assert process_ptg.materialize_json_source is ptg_source_download.materialize_json_source
 
 
 def test_snapshot_cleanup_split_keeps_facade_helpers_stable():
