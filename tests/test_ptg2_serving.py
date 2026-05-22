@@ -10,6 +10,7 @@ from api import ptg2_price_sql
 from api import ptg2_code_filters
 from api import ptg2_types
 from api import ptg2_index_cache
+from api import ptg2_tables
 
 
 class FakeResult:
@@ -92,6 +93,19 @@ def test_ptg2_index_cache_split_keeps_serving_facade_helpers_stable():
     assert ptg2_serving._artifact_root is ptg2_index_cache._artifact_root
     assert ptg2_serving._path_from_uri is ptg2_index_cache._path_from_uri
     assert ptg2_serving.load_ptg2_index_from_path is ptg2_index_cache.load_ptg2_index_from_path
+
+
+def test_ptg2_table_split_keeps_serving_facade_helpers_stable():
+    assert ptg2_serving._serving_table_available is ptg2_tables._serving_table_available
+    assert ptg2_serving._index_available is ptg2_tables._index_available
+    assert ptg2_serving._gin_index_available_for_column is ptg2_tables._gin_index_available_for_column
+    assert ptg2_serving._serving_table_name is ptg2_tables._serving_table_name
+    assert ptg2_serving._safe_table_name is ptg2_tables._safe_table_name
+    assert ptg2_serving._serving_table_candidates is ptg2_tables._serving_table_candidates
+    assert ptg2_serving.snapshot_serving_table is ptg2_tables.snapshot_serving_table
+    assert ptg2_serving.snapshot_serving_tables is ptg2_tables.snapshot_serving_tables
+    assert ptg2_serving._ordered_serving_table_candidates is ptg2_tables._ordered_serving_table_candidates
+    assert ptg2_serving._is_compact_serving_table is ptg2_tables._is_compact_serving_table
 
 
 def _compact_tables(**overrides):
