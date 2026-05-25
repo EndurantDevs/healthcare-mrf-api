@@ -43,6 +43,7 @@ from process.claims_pricing import (claims_pricing_finalize,
                                     claims_pricing_start,
                                     finish_main as finish_claims_pricing,
                                     main as initiate_claims_pricing)
+from process.clinical_reference import main as initiate_clinical_reference
 from process.code_sets import main as initiate_code_sets
 from process.drug_claims import (drug_claims_finalize,
                                  drug_claims_process_chunk,
@@ -699,6 +700,24 @@ def code_sets(test: bool):
     asyncio.run(initiate_code_sets(test_mode=test))
 
 
+@click.command(help="Run clinical condition/treatment reference import")
+@click.option("--test", is_flag=True, help="Import a small official-code sample for a quick smoke run.")
+@click.option("--import-id", help="Override import id/date suffix for table names.")
+@click.option("--sources", help="Comma-separated sources: icd10cm,mesh,rxnorm,snomed,medrt.")
+@click.option("--artifact-root", help="Directory for retained terminology source artifacts.")
+@click.option("--force-download", is_flag=True, help="Redownload source artifacts even when retained files exist.")
+def clinical_reference(test: bool, import_id: str | None, sources: str | None, artifact_root: str | None, force_download: bool):
+    asyncio.run(
+        initiate_clinical_reference(
+            test_mode=test,
+            import_id=import_id,
+            sources=sources,
+            artifact_root=artifact_root,
+            force_download=force_download,
+        )
+    )
+
+
 @click.command(help="Run CMS claims pricing import")
 @click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
 @click.option("--import-id", help="Override import id/date suffix for table names.")
@@ -898,3 +917,4 @@ process_group.add_command(geo_lookup, name="geo")
 process_group.add_command(geo_census_lookup, name="geo-census")
 process_group.add_command(nucc)
 process_group.add_command(code_sets, name="code-sets")
+process_group.add_command(clinical_reference, name="clinical-reference")

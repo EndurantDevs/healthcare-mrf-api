@@ -14,6 +14,7 @@ It is intended for readers on GitHub who need to understand:
 - [Architecture overview](./architecture.md): one-screen system flow
 - [Data sources](./data-sources.md): source websites and how the project uses them
 - [Import index](./imports/README.md): every import command in one place
+- [Clinical reference DevOps](./devops/clinical-reference.md): stage/swap runbook and attribution rule
 
 ## Import Architecture
 Most imports follow one of two patterns:

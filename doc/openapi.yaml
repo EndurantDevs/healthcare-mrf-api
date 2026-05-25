@@ -4621,6 +4621,293 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/PricingPrescriptionBenchmarkResponse'
+  /clinical/concepts:
+    get:
+      summary: Search clinical terminology concepts
+      parameters:
+        - name: system
+          in: query
+          schema:
+            type: string
+        - name: code_system
+          in: query
+          schema:
+            type: string
+        - name: code_type
+          in: query
+          schema:
+            type: string
+        - name: q
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Paged clinical concepts
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClinicalConceptListResponse'
+  /clinical/concepts/{system}/{code}:
+    get:
+      summary: Get clinical concept with synonyms and relationships
+      parameters:
+        - name: system
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: code
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Clinical concept detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClinicalConcept'
+        '404':
+          description: Concept not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /clinical/relationships:
+    get:
+      summary: Search clinical terminology relationships
+      parameters:
+        - name: from_system
+          in: query
+          schema:
+            type: string
+        - name: from_code
+          in: query
+          schema:
+            type: string
+        - name: to_system
+          in: query
+          schema:
+            type: string
+        - name: to_code
+          in: query
+          schema:
+            type: string
+        - name: relationship
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Paged relationship rows
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClinicalRelationshipListResponse'
+  /clinical/conditions:
+    get:
+      summary: List condition concepts
+      responses:
+        '200':
+          description: Paged condition concepts
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClinicalConceptListResponse'
+  /clinical/conditions/{system}/{code}:
+    get:
+      summary: Get condition concept
+      parameters:
+        - name: system
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: code
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Condition concept
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClinicalConcept'
+        '404':
+          description: Condition not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /clinical/treatments:
+    get:
+      summary: List treatment concepts
+      responses:
+        '200':
+          description: Paged treatment concepts
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClinicalConceptListResponse'
+  /clinical/treatments/{system}/{code}:
+    get:
+      summary: Get treatment concept
+      parameters:
+        - name: system
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: code
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Treatment concept
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClinicalConcept'
+        '404':
+          description: Treatment not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /clinical/clinical-areas:
+    get:
+      summary: List clinical areas
+      parameters:
+        - name: q
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Paged clinical areas
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClinicalAreaListResponse'
+  /clinical/clinical-areas/{clinical_area_id}:
+    get:
+      summary: Get clinical area metadata and mapping counts
+      parameters:
+        - name: clinical_area_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Clinical area detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClinicalAreaDetail'
+        '404':
+          description: Clinical area not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /clinical/clinical-areas/{clinical_area_id}/conditions:
+    get:
+      summary: List condition concepts assigned to a clinical area
+      parameters:
+        - name: clinical_area_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: system
+          in: query
+          schema:
+            type: string
+        - name: code_system
+          in: query
+          schema:
+            type: string
+        - name: q
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Paged clinical area condition concepts
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClinicalConceptListResponse'
+        '404':
+          description: Clinical area not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /clinical/clinical-areas/{clinical_area_id}/treatments:
+    get:
+      summary: List treatment or drug concepts assigned to a clinical area
+      parameters:
+        - name: clinical_area_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: system
+          in: query
+          schema:
+            type: string
+        - name: code_system
+          in: query
+          schema:
+            type: string
+        - name: q
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Paged clinical area treatment and drug concepts
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClinicalConceptListResponse'
+        '404':
+          description: Clinical area not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /clinical/crosswalk:
+    get:
+      summary: Search clinical code crosswalks
+      parameters:
+        - name: from_system
+          in: query
+          schema:
+            type: string
+        - name: to_system
+          in: query
+          schema:
+            type: string
+        - name: code
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Paged clinical crosswalk rows
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClinicalCrosswalkListResponse'
 components:
   schemas:
     Error:
@@ -4663,6 +4950,181 @@ components:
           type: integer
         page:
           type: integer
+    ClinicalConcept:
+      type: object
+      properties:
+        code_system:
+          type: string
+        code:
+          type: string
+        code_type:
+          type: string
+          nullable: true
+        display_name:
+          type: string
+          nullable: true
+        short_description:
+          type: string
+          nullable: true
+        long_description:
+          type: string
+          nullable: true
+        is_active:
+          type: boolean
+          nullable: true
+        source:
+          type: string
+          nullable: true
+        source_release:
+          type: string
+          nullable: true
+        source_attribution:
+          type: string
+          nullable: true
+        synonyms:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClinicalSynonym'
+        relationships:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClinicalRelationship'
+      additionalProperties: true
+    ClinicalSynonym:
+      type: object
+      properties:
+        code_system:
+          type: string
+        code:
+          type: string
+        synonym:
+          type: string
+        term_type:
+          type: string
+          nullable: true
+        language:
+          type: string
+          nullable: true
+        source:
+          type: string
+          nullable: true
+        source_attribution:
+          type: string
+          nullable: true
+      additionalProperties: true
+    ClinicalRelationship:
+      type: object
+      properties:
+        from_system:
+          type: string
+        from_code:
+          type: string
+        relationship:
+          type: string
+        to_system:
+          type: string
+        to_code:
+          type: string
+        source:
+          type: string
+          nullable: true
+        source_attribution:
+          type: string
+          nullable: true
+      additionalProperties: true
+    ClinicalCrosswalk:
+      type: object
+      properties:
+        from_system:
+          type: string
+        from_code:
+          type: string
+        to_system:
+          type: string
+        to_code:
+          type: string
+        match_type:
+          type: string
+          nullable: true
+        source:
+          type: string
+          nullable: true
+      additionalProperties: true
+    ClinicalArea:
+      type: object
+      properties:
+        clinical_area_id:
+          type: string
+        display_name:
+          type: string
+        description:
+          type: string
+          nullable: true
+        anchor_system:
+          type: string
+          nullable: true
+        anchor_code:
+          type: string
+          nullable: true
+        source:
+          type: string
+          nullable: true
+        condition_count:
+          type: integer
+        treatment_count:
+          type: integer
+      additionalProperties: true
+    ClinicalAreaDetail:
+      allOf:
+        - $ref: '#/components/schemas/ClinicalArea'
+    ClinicalConceptListResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClinicalConcept'
+        pagination:
+          $ref: '#/components/schemas/PaginationMeta'
+        query:
+          type: object
+          additionalProperties: true
+    ClinicalRelationshipListResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClinicalRelationship'
+        pagination:
+          $ref: '#/components/schemas/PaginationMeta'
+        query:
+          type: object
+          additionalProperties: true
+    ClinicalCrosswalkListResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClinicalCrosswalk'
+        pagination:
+          $ref: '#/components/schemas/PaginationMeta'
+        query:
+          type: object
+          additionalProperties: true
+    ClinicalAreaListResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClinicalArea'
+        pagination:
+          $ref: '#/components/schemas/PaginationMeta'
+        query:
+          type: object
+          additionalProperties: true
     CodeIdentifier:
       type: object
       properties:

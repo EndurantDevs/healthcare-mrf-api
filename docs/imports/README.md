@@ -11,6 +11,7 @@ For the canonical source website registry, see [../data-sources.md](../data-sour
 | Plan attributes | `python main.py start plan-attributes` | `process.Attributes` worker | Marketplace plan attributes, prices, benefits, and rating areas |
 | PTG | `python main.py start ptg` | no separate finish command | Transparency in Coverage table-of-contents and file ingestion |
 | RC/POS code sets | `python main.py start code-sets` | none | official Revenue Center and CMS Place of Service labels in `code_catalog` |
+| Clinical reference | `python main.py start clinical-reference` | none | official-code condition, treatment, clinical-area, and crosswalk reference tables |
 | NPI | `python main.py start npi` | `process.NPI_finish` worker | NPPES provider directory import |
 | NUCC | `python main.py start nucc` | shutdown publish in worker | NUCC taxonomy import |
 | Geo | `python main.py start geo` | none | ZIP/city/state lookup support load |
@@ -35,6 +36,7 @@ For the canonical source website registry, see [../data-sources.md](../data-sour
 - [Plan attributes import](./plan-attributes.md)
 - [PTG import](./ptg.md)
 - [RC/POS code sets import](./code-sets.md)
+- [Clinical reference import](./clinical-reference.md)
 - [NPI import](./npi.md)
 - [NUCC import](./nucc.md)
 - [Geo lookup import](./geo.md)

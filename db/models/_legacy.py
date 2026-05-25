@@ -3634,6 +3634,169 @@ class CodeCrosswalk(Base, JSONOutputMixin):
     updated_at = Column(DateTime)
 
 
+class ClinicalCodeCatalog(Base, JSONOutputMixin):
+    __tablename__ = "clinical_code_catalog"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("code_system", "code"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["code_system", "code"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("code_system", "lower(display_name)"), "name": "clinical_code_system_display_lower_idx"},
+        {"index_elements": ("code_type", "code_system"), "name": "clinical_code_type_system_idx"},
+        {"index_elements": ("source",), "name": "clinical_code_source_idx"},
+    ]
+
+    code_system = Column(String(32), nullable=False)
+    code = Column(String(128), nullable=False)
+    code_type = Column(String(32), nullable=False)
+    display_name = Column(String, nullable=False)
+    short_description = Column(String)
+    long_description = Column(TEXT)
+    synonyms = Column(ARRAY(String), nullable=False, server_default=text("ARRAY[]::varchar[]"))
+    is_active = Column(Boolean, nullable=False, server_default=text("TRUE"))
+    source = Column(String(128), nullable=False)
+    source_release = Column(String(64))
+    source_attribution = Column(TEXT)
+    updated_at = Column(DateTime)
+
+
+class ClinicalCodeCrosswalk(Base, JSONOutputMixin):
+    __tablename__ = "clinical_code_crosswalk"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("from_system", "from_code", "to_system", "to_code"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["from_system", "from_code", "to_system", "to_code"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("from_system", "from_code"), "name": "clinical_crosswalk_from_idx"},
+        {"index_elements": ("to_system", "to_code"), "name": "clinical_crosswalk_to_idx"},
+        {"index_elements": ("match_type",), "name": "clinical_crosswalk_match_type_idx"},
+    ]
+
+    from_system = Column(String(32), nullable=False)
+    from_code = Column(String(128), nullable=False)
+    to_system = Column(String(32), nullable=False)
+    to_code = Column(String(128), nullable=False)
+    match_type = Column(String(32), nullable=False)
+    confidence = Column(Numeric(scale=4, precision=6, asdecimal=False, decimal_return_scale=None))
+    source = Column(String(128), nullable=False)
+    source_attribution = Column(TEXT)
+    updated_at = Column(DateTime)
+
+
+class ClinicalCodeSynonym(Base, JSONOutputMixin):
+    __tablename__ = "clinical_code_synonym"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("code_system", "code", "synonym", "term_type"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["code_system", "code", "synonym", "term_type"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("code_system", "code"), "name": "clinical_synonym_code_idx"},
+        {"index_elements": ("lower(synonym)",), "name": "clinical_synonym_lower_idx"},
+        {"index_elements": ("source",), "name": "clinical_synonym_source_idx"},
+    ]
+
+    code_system = Column(String(32), nullable=False)
+    code = Column(String(128), nullable=False)
+    synonym = Column(String, nullable=False)
+    term_type = Column(String(64), nullable=False)
+    language = Column(String(16))
+    source = Column(String(128), nullable=False)
+    source_attribution = Column(TEXT)
+    updated_at = Column(DateTime)
+
+
+class ClinicalCodeRelationship(Base, JSONOutputMixin):
+    __tablename__ = "clinical_code_relationship"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("from_system", "from_code", "relationship", "to_system", "to_code"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["from_system", "from_code", "relationship", "to_system", "to_code"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("from_system", "from_code"), "name": "clinical_relationship_from_idx"},
+        {"index_elements": ("to_system", "to_code"), "name": "clinical_relationship_to_idx"},
+        {"index_elements": ("relationship",), "name": "clinical_relationship_type_idx"},
+        {"index_elements": ("source",), "name": "clinical_relationship_source_idx"},
+    ]
+
+    from_system = Column(String(32), nullable=False)
+    from_code = Column(String(128), nullable=False)
+    relationship = Column(String(64), nullable=False)
+    to_system = Column(String(32), nullable=False)
+    to_code = Column(String(128), nullable=False)
+    source = Column(String(128), nullable=False)
+    source_attribution = Column(TEXT)
+    updated_at = Column(DateTime)
+
+
+class ClinicalArea(Base, JSONOutputMixin):
+    __tablename__ = "clinical_area"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("clinical_area_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["clinical_area_id"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("lower(display_name)",), "name": "clinical_area_display_lower_idx"},
+        {"index_elements": ("source",), "name": "clinical_area_source_idx"},
+    ]
+
+    clinical_area_id = Column(String(128), nullable=False)
+    display_name = Column(String, nullable=False)
+    description = Column(TEXT)
+    anchor_system = Column(String(32))
+    anchor_code = Column(String(128))
+    source = Column(String(128), nullable=False)
+    source_attribution = Column(TEXT)
+    updated_at = Column(DateTime)
+
+
+class ClinicalAreaCondition(Base, JSONOutputMixin):
+    __tablename__ = "clinical_area_condition"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("clinical_area_id", "condition_system", "condition_code"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["clinical_area_id", "condition_system", "condition_code"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("condition_system", "condition_code"), "name": "clinical_area_condition_code_idx"},
+    ]
+
+    clinical_area_id = Column(String(128), nullable=False)
+    condition_system = Column(String(32), nullable=False)
+    condition_code = Column(String(128), nullable=False)
+    source = Column(String(128), nullable=False)
+    updated_at = Column(DateTime)
+
+
+class ClinicalAreaTreatment(Base, JSONOutputMixin):
+    __tablename__ = "clinical_area_treatment"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("clinical_area_id", "treatment_system", "treatment_code"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["clinical_area_id", "treatment_system", "treatment_code"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("treatment_system", "treatment_code"), "name": "clinical_area_treatment_code_idx"},
+    ]
+
+    clinical_area_id = Column(String(128), nullable=False)
+    treatment_system = Column(String(32), nullable=False)
+    treatment_code = Column(String(128), nullable=False)
+    source = Column(String(128), nullable=False)
+    updated_at = Column(DateTime)
+
+
 class LODESWorkplaceAggregate(Base, JSONOutputMixin):
     __tablename__ = "lodes_workplace_aggregate"
     __main_table__ = __tablename__
