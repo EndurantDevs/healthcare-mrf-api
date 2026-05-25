@@ -447,10 +447,19 @@ def test_ptg2_compact_serving_index_defaults_to_reported_lookup(monkeypatch):
         "ptg2_serving_rate_compact_abc_p00",
     )
 
-    assert len(statements) == 1
-    role, statement = statements[0]
-    assert role == "reported_system_order_idx"
-    assert "(snapshot_id, plan_id, reported_code_system, reported_code, provider_count DESC, serving_rate_id)" in statement
+    assert len(statements) == 2
+    statements_by_role = dict(statements)
+    assert "reported_system_order_idx" in statements_by_role
+    assert (
+        "(snapshot_id, plan_id, reported_code_system, reported_code, provider_count DESC, serving_rate_id)"
+        in statements_by_role["reported_system_order_idx"]
+    )
+    assert "procedure_order_idx" in statements_by_role
+    assert (
+        "(snapshot_id, plan_id, procedure_code, provider_count DESC, serving_rate_id)"
+        in statements_by_role["procedure_order_idx"]
+    )
+    assert "WHERE procedure_code IS NOT NULL" in statements_by_role["procedure_order_idx"]
 
 
 def test_ptg2_compact_serving_index_full_mode_keeps_model_indexes(monkeypatch):

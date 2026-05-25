@@ -1301,9 +1301,18 @@ async def test_compact_serving_infers_radiology_taxonomy_for_radiology_cpt_geo_l
     assert payload["items"][0]["specialties"] == ["Diagnostic Radiology Physician"]
     sql = str(session.calls[0][0][0])
     assert "nt.healthcare_provider_taxonomy_code IN" in sql
-    assert "'2085R0202X'" in sql
-    assert "LOWER(COALESCE(nucc.display_name, '')) LIKE '%diagnostic radiology%'" in sql
-    assert "'2085R0001X'" not in sql
+    assert "inferred_taxonomy_code_" in sql
+    params = session.calls[0][0][1]
+    assert "2085R0202X" in {
+        value for key, value in params.items() if key.startswith("inferred_taxonomy_code_")
+    }
+    assert "2084D0003X" in {
+        value for key, value in params.items() if key.startswith("inferred_taxonomy_code_")
+    }
+    assert "JOIN mrf.nucc_taxonomy nucc\n                            ON nucc.code" not in sql
+    assert "2085R0001X" not in {
+        value for key, value in params.items() if key.startswith("inferred_taxonomy_code_")
+    }
 
 
 @pytest.mark.parametrize(

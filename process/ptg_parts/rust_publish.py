@@ -270,6 +270,10 @@ async def _publish_rust_compact_snapshot_tables(
                 "(state_name, city_name, npi, provider_group_hash)",
             ),
             (
+                "group_state_city_npi_addr_idx",
+                "(provider_group_hash, state_name, city_name, npi, address_checksum)",
+            ),
+            (
                 "npi_group_idx",
                 "(npi, provider_group_hash)",
             ),
@@ -382,4 +386,3 @@ async def _publish_rust_compact_snapshot_tables(
             "analyze_seconds": analyze_seconds,
         },
     }
-
