@@ -12,6 +12,7 @@ Most importers resolve current files/distributions at runtime (from catalog APIs
 | <https://data.cms.gov/> | Medicare physician claims, Medicare Part D prescriber/spending, Part D formulary/pharmacy files, Medicare enrollment dashboard data APIs, provider-enrollment datasets | `claims-pricing`, `claims-procedures`, `drug-claims`, `partd-formulary-network`, `medicare-enrollment`, `provider-enrichment` | procedure pricing, prescription claims, pharmacy activity/formulary coverage, Medicare enrollment stats, PECOS sidecar enrichment |
 | <https://www.cms.gov/medicare/coding-billing/place-of-service-codes/code-sets> | CMS Place of Service code set | `code-sets` | `POS` rows in `code_catalog` for PTG service-code display |
 | <https://bluebutton.cms.gov/fhir/CodeSystem/CLM-REV-CNTR-CD/> | CMS Blue Button Claim Revenue Center CodeSystem | `code-sets` | `RC` rows in `code_catalog` for revenue-code display |
+| CDC ICD-10-CM, NLM MeSH, NLM RxNorm, NLM/UMLS SNOMED CT US, RxClass MED-RT | Official condition, drug, synonym, crosswalk, relationship, and MeSH-root clinical-area terminology | `clinical-reference` | `clinical_code_catalog`, `clinical_code_synonym`, `clinical_code_crosswalk`, `clinical_code_relationship`, `clinical_area*` reference tables |
 | <https://data.cms.gov/provider-data/> | Provider Data Catalog distributions (Doctors & Clinicians, Hospital General Information) | `cms-doctors`, `facility-anchors` | clinician-practice location rows, hospital anchor rows |
 | <https://www.cms.gov/marketplace/resources/data/public-use-files> | Federally facilitated marketplace PUF families (plans, issuers, rates, transparency metadata) | `mrf`, `plan-attributes` | marketplace plan/issuer/formulary/network/rates datasets |
 | <https://www.cms.gov/marketplace/resources/data/state-based-public-use-files> | State-based exchange plan/rate/attribute files | `mrf`, `plan-attributes` | state-exchange plan and pricing coverage where configured |
@@ -52,3 +53,5 @@ Other states use discovery-driven machine-readable extraction via FDA BeSafeRx l
 - External websites are import-time dependencies; the API serves local PostgreSQL tables at request time.
 - Some imports can optionally use local override files/URLs via `HLTHPRT_*` environment variables.
 - Dataset freshness is determined by each importer’s latest successful publish/swap cycle.
+- Clinical areas are public MeSH tree-root buckets plus RxClass/MED-RT drug-to-condition area links. CPT/HCPCS-to-area mappings are not generated without an official licensed mapping source.
+- NLM-derived data must carry the NLM attribution statement documented in [imports/clinical-reference.md](./imports/clinical-reference.md).
