@@ -71,14 +71,26 @@ def _ptg2_compact_dictionary_index_mode() -> str:
     return mode if mode in {"serving", "full"} else "serving"
 
 
+def _ptg2_compact_serving_lookup_index_statements(schema_name: str, table_name: str) -> list[tuple[str, str]]:
+    return [
+        (
+            "reported_system_order_idx",
+            f"CREATE INDEX IF NOT EXISTS {_quote_ident(_ptg2_snapshot_index_name(table_name, 'reported_system_order_idx'))} "
+            f"ON {_quote_ident(schema_name)}.{_quote_ident(table_name)} "
+            "(snapshot_id, plan_id, reported_code_system, reported_code, provider_count DESC, serving_rate_id);",
+        ),
+        (
+            "procedure_order_idx",
+            f"CREATE INDEX IF NOT EXISTS {_quote_ident(_ptg2_snapshot_index_name(table_name, 'procedure_order_idx'))} "
+            f"ON {_quote_ident(schema_name)}.{_quote_ident(table_name)} "
+            "(snapshot_id, plan_id, procedure_code, provider_count DESC, serving_rate_id) "
+            "WHERE procedure_code IS NOT NULL;",
+        ),
+    ]
+
+
 def _ptg2_compact_serving_reported_index_statement(schema_name: str, table_name: str) -> tuple[str, str]:
-    role = "reported_system_order_idx"
-    return (
-        role,
-        f"CREATE INDEX IF NOT EXISTS {_quote_ident(_ptg2_snapshot_index_name(table_name, role))} "
-        f"ON {_quote_ident(schema_name)}.{_quote_ident(table_name)} "
-        "(snapshot_id, plan_id, reported_code_system, reported_code, provider_count DESC, serving_rate_id);",
-    )
+    return _ptg2_compact_serving_lookup_index_statements(schema_name, table_name)[0]
 
 
 def _ptg2_model_index_statements_for_table(model: type, schema_name: str, table_name: str) -> list[tuple[str, str]]:
@@ -87,7 +99,7 @@ def _ptg2_model_index_statements_for_table(model: type, schema_name: str, table_
         if mode == "none":
             return []
         if mode == "reported":
-            return [_ptg2_compact_serving_reported_index_statement(schema_name, table_name)]
+            return _ptg2_compact_serving_lookup_index_statements(schema_name, table_name)
 
     statements: list[tuple[str, str]] = []
     primary_elements = tuple(str(element) for element in (getattr(model, "__my_index_elements__", None) or ()))
@@ -203,4 +215,3 @@ async def _index_snapshot_compact_table_entries(schema_name: str, table_entries:
 
 async def _index_snapshot_compact_tables(schema_name: str, table_names: dict[str, str]) -> float:
     return await _index_snapshot_compact_table_entries(schema_name, list(table_names.items()))
-

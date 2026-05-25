@@ -123,6 +123,37 @@ def normalize_ptg2_mode(value: str | None) -> str:
     return mode
 
 
+def _inferred_provider_taxonomy_rule(args: dict[str, Any]) -> InferredProviderTaxonomyRule | None:
+    requested_system = _normalize_code_system(args.get("code_system"))
+    requested_code = _normalize_code(args.get("code"))
+    if requested_system != "CPT" or not requested_code or not requested_code.isdigit():
+        return None
+    code_value = int(requested_code)
+    return next((rule for rule in INFERRED_PROVIDER_TAXONOMY_RULES if rule.matches(code_value)), None)
+
+
+def _inferred_provider_taxonomy_code_sql(
+    args: dict[str, Any],
+    *,
+    nt_alias: str,
+    schema: str,
+    params: dict[str, Any],
+    param_prefix: str,
+) -> str:
+    rule = _inferred_provider_taxonomy_rule(args)
+    if rule is None:
+        return ""
+    code_placeholders = []
+    for idx, taxonomy_code in enumerate(rule.taxonomy_codes):
+        key = f"{param_prefix}_code_{idx}"
+        params[key] = taxonomy_code
+        code_placeholders.append(f":{key}")
+    clauses = []
+    if code_placeholders:
+        clauses.append(f"{nt_alias}.healthcare_provider_taxonomy_code IN ({', '.join(code_placeholders)})")
+    return "(" + " OR ".join(clauses) + ")" if clauses else ""
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
     if raw is None:
@@ -208,17 +239,27 @@ async def _search_compact_serving_table(
             """
         )
         params["specialty_like"] = f"%{specialty_text}%"
+    schema = PTG2_SCHEMA
     inferred_taxonomy_sql = ""
     inferred_provider_taxonomy_sql = ""
     if not taxonomy_filters and provider_npi is None:
-        inferred_taxonomy_sql = _inferred_provider_taxonomy_sql(args, nt_alias="nt", nucc_alias="nucc")
-        inferred_provider_taxonomy_sql = _inferred_provider_taxonomy_sql(
+        inferred_taxonomy_sql = _inferred_provider_taxonomy_code_sql(
+            args,
+            nt_alias="nt",
+            schema=schema,
+            params=params,
+            param_prefix="inferred_taxonomy",
+        )
+        inferred_provider_taxonomy_sql = _inferred_provider_taxonomy_code_sql(
             args,
             nt_alias="nt_filter",
-            nucc_alias="nucc_filter",
+            schema=schema,
+            params=params,
+            param_prefix="inferred_provider_taxonomy",
         )
         if inferred_taxonomy_sql:
             taxonomy_filters.append(inferred_taxonomy_sql)
+    inferred_taxonomy_filter_only = bool(inferred_taxonomy_sql) and taxonomy_filters == [inferred_taxonomy_sql]
     q_filter = ""
     if q_text:
         q_filter = """
@@ -231,7 +272,6 @@ async def _search_compact_serving_table(
         """
         params["q_like"] = f"%{q_text}%"
     where_sql = " AND ".join(_qualify_compact_filters(filters))
-    schema = PTG2_SCHEMA
     procedure_table = serving_tables.procedure_table or f"{schema}.ptg2_procedure"
     use_normalized_price_tables = bool(
         serving_tables.price_atom_table
@@ -382,8 +422,7 @@ async def _search_compact_serving_table(
                 JOIN LATERAL (
                     SELECT 1
                       FROM {schema}.npi_taxonomy nt_filter
-                      JOIN {schema}.nucc_taxonomy nucc_filter
-                        ON nucc_filter.code = nt_filter.healthcare_provider_taxonomy_code
+                      {"JOIN " + schema + ".nucc_taxonomy nucc_filter ON nucc_filter.code = nt_filter.healthcare_provider_taxonomy_code" if not inferred_taxonomy_filter_only else ""}
                      WHERE nt_filter.npi = provider_filter_npi.npi
                        AND {provider_taxonomy_sql}
                      LIMIT 1
@@ -615,11 +654,11 @@ async def _search_compact_serving_table(
             }
         if use_direct_provider_tables and provider_group_location_table and (geo_filters or coordinate_filter_requested) and not q_text:
             params["location_rate_candidate_limit"] = max(
-                int(getattr(pagination, "limit", 25) or 25) * 512,
-                4096,
+                int(getattr(pagination, "limit", 25) or 25) * 320,
+                2560,
             )
             params["provider_match_limit"] = max(
-                int(getattr(pagination, "offset", 0) or 0) + int(getattr(pagination, "limit", 25) or 25) * 16,
+                int(getattr(pagination, "offset", 0) or 0) + int(getattr(pagination, "limit", 25) or 25) * 10,
                 64,
             )
             location_filter_sql = " AND ".join(
@@ -638,17 +677,28 @@ async def _search_compact_serving_table(
                 ARRAY[]::varchar[] AS specialties,
             """
             if taxonomy_filters:
-                location_taxonomy_where_sql = f"""
-                    AND EXISTS (
-                        SELECT 1
-                          FROM {schema}.npi_taxonomy nt
-                          JOIN {schema}.nucc_taxonomy nucc
-                            ON nucc.code = nt.healthcare_provider_taxonomy_code
-                         WHERE nt.npi = loc.npi
-                           AND {taxonomy_sql}
-                         LIMIT 1
-                    )
-                """
+                if inferred_taxonomy_filter_only:
+                    location_taxonomy_where_sql = f"""
+                        AND EXISTS (
+                            SELECT 1
+                              FROM {schema}.npi_taxonomy nt
+                             WHERE nt.npi = loc.npi
+                               AND {taxonomy_sql}
+                             LIMIT 1
+                        )
+                    """
+                else:
+                    location_taxonomy_where_sql = f"""
+                        AND EXISTS (
+                            SELECT 1
+                              FROM {schema}.npi_taxonomy nt
+                              JOIN {schema}.nucc_taxonomy nucc
+                                ON nucc.code = nt.healthcare_provider_taxonomy_code
+                             WHERE nt.npi = loc.npi
+                               AND {taxonomy_sql}
+                             LIMIT 1
+                        )
+                    """
                 location_taxonomy_select_sql = """
                     array_agg(DISTINCT nt.healthcare_provider_taxonomy_code ORDER BY nt.healthcare_provider_taxonomy_code)
                         FILTER (WHERE nt.healthcare_provider_taxonomy_code IS NOT NULL) AS taxonomy_codes,
