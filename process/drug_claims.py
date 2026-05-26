@@ -1228,11 +1228,10 @@ async def _materialize_prescription_and_code_rows(classes: dict[str, type], sche
     await db.status(
         f"""
         INSERT INTO {schema}.{code_catalog_table}
-            (code_system, code, code_checksum, display_name, short_description, long_description, is_active, source, updated_at)
+            (code_system, code, display_name, short_description, long_description, is_active, source, updated_at)
         SELECT
             rx_code_system,
             rx_code,
-            hashtext(UPPER(rx_code_system) || '|' || UPPER(rx_code)),
             COALESCE(rx_name, generic_name, brand_name, rx_code),
             generic_name,
             NULL,
@@ -1242,7 +1241,6 @@ async def _materialize_prescription_and_code_rows(classes: dict[str, type], sche
         FROM {schema}.{prescription_table}
         ON CONFLICT (code_system, code) DO UPDATE
         SET
-            code_checksum = excluded.code_checksum,
             display_name = excluded.display_name,
             short_description = excluded.short_description,
             is_active = excluded.is_active,
@@ -1257,10 +1255,8 @@ async def _materialize_prescription_and_code_rows(classes: dict[str, type], sche
             (
                 from_system,
                 from_code,
-                from_checksum,
                 to_system,
                 to_code,
-                to_checksum,
                 match_type,
                 confidence,
                 source,
@@ -1269,10 +1265,8 @@ async def _materialize_prescription_and_code_rows(classes: dict[str, type], sche
         SELECT
             rx_code_system,
             rx_code,
-            hashtext(UPPER(rx_code_system) || '|' || UPPER(rx_code)),
             rx_code_system,
             rx_code,
-            hashtext(UPPER(rx_code_system) || '|' || UPPER(rx_code)),
             'exact',
             1.0,
             'cms_partd_provider_drug',
@@ -1280,8 +1274,6 @@ async def _materialize_prescription_and_code_rows(classes: dict[str, type], sche
         FROM {schema}.{prescription_table}
         ON CONFLICT (from_system, from_code, to_system, to_code) DO UPDATE
         SET
-            from_checksum = excluded.from_checksum,
-            to_checksum = excluded.to_checksum,
             match_type = excluded.match_type,
             confidence = excluded.confidence,
             source = excluded.source,
@@ -1660,11 +1652,10 @@ async def _enrich_rx_crosswalk_from_snapshot(
                     rx_code ASC
             )
             INSERT INTO {schema}.{code_catalog_table}
-                (code_system, code, code_checksum, display_name, short_description, long_description, is_active, source, updated_at)
+                (code_system, code, display_name, short_description, long_description, is_active, source, updated_at)
             SELECT
                 to_system,
                 to_code,
-                hashtext(UPPER(to_system) || '|' || UPPER(to_code)),
                 COALESCE(NULLIF(BTRIM(display_name), ''), to_code),
                 NULLIF(BTRIM(COALESCE(generic_name, brand_name)), ''),
                 NULL,
@@ -1674,7 +1665,6 @@ async def _enrich_rx_crosswalk_from_snapshot(
             FROM dedup_catalog
             ON CONFLICT (code_system, code) DO UPDATE
             SET
-                code_checksum = excluded.code_checksum,
                 display_name = excluded.display_name,
                 short_description = excluded.short_description,
                 is_active = excluded.is_active,
@@ -1708,10 +1698,8 @@ async def _enrich_rx_crosswalk_from_snapshot(
                 (
                     from_system,
                     from_code,
-                    from_checksum,
                     to_system,
                     to_code,
-                    to_checksum,
                     match_type,
                     confidence,
                     source,
@@ -1720,10 +1708,8 @@ async def _enrich_rx_crosswalk_from_snapshot(
             SELECT
                 edges.from_system,
                 edges.from_code,
-                hashtext(UPPER(edges.from_system) || '|' || UPPER(edges.from_code)),
                 edges.to_system,
                 edges.to_code,
-                hashtext(UPPER(edges.to_system) || '|' || UPPER(edges.to_code)),
                 edges.match_type,
                 edges.confidence,
                 'drug_api_snapshot',
@@ -1731,8 +1717,6 @@ async def _enrich_rx_crosswalk_from_snapshot(
             FROM edges
             ON CONFLICT (from_system, from_code, to_system, to_code) DO UPDATE
             SET
-                from_checksum = excluded.from_checksum,
-                to_checksum = excluded.to_checksum,
                 match_type = excluded.match_type,
                 confidence = excluded.confidence,
                 source = excluded.source,
@@ -1877,15 +1861,10 @@ async def _upsert_external_code_and_edges(
     await db.status(
         f"""
         INSERT INTO {schema}.{code_catalog_table}
-            (code_system, code, code_checksum, display_name, short_description, long_description, is_active, source, updated_at)
+            (code_system, code, display_name, short_description, long_description, is_active, source, updated_at)
         VALUES (
             CAST(:code_system AS varchar),
             CAST(:code AS varchar),
-            hashtext(
-                UPPER(CAST(:code_system AS varchar))
-                || '|'
-                || UPPER(CAST(:code AS varchar))
-            ),
             :display_name,
             NULL,
             NULL,
@@ -1895,7 +1874,6 @@ async def _upsert_external_code_and_edges(
         )
         ON CONFLICT (code_system, code) DO UPDATE
         SET
-            code_checksum = excluded.code_checksum,
             display_name = excluded.display_name,
             is_active = excluded.is_active,
             source = excluded.source,
@@ -1913,10 +1891,8 @@ async def _upsert_external_code_and_edges(
             (
                 from_system,
                 from_code,
-                from_checksum,
                 to_system,
                 to_code,
-                to_checksum,
                 match_type,
                 confidence,
                 source,
@@ -1925,18 +1901,8 @@ async def _upsert_external_code_and_edges(
         VALUES (
             CAST(:from_system AS varchar),
             CAST(:from_code AS varchar),
-            hashtext(
-                UPPER(CAST(:from_system AS varchar))
-                || '|'
-                || UPPER(CAST(:from_code AS varchar))
-            ),
             CAST(:to_system AS varchar),
             CAST(:to_code AS varchar),
-            hashtext(
-                UPPER(CAST(:to_system AS varchar))
-                || '|'
-                || UPPER(CAST(:to_code AS varchar))
-            ),
             :match_type,
             :confidence,
             :source,
@@ -1944,8 +1910,6 @@ async def _upsert_external_code_and_edges(
         )
         ON CONFLICT (from_system, from_code, to_system, to_code) DO UPDATE
         SET
-            from_checksum = excluded.from_checksum,
-            to_checksum = excluded.to_checksum,
             match_type = excluded.match_type,
             confidence = excluded.confidence,
             source = excluded.source,
@@ -1966,10 +1930,8 @@ async def _upsert_external_code_and_edges(
             (
                 from_system,
                 from_code,
-                from_checksum,
                 to_system,
                 to_code,
-                to_checksum,
                 match_type,
                 confidence,
                 source,
@@ -1978,18 +1940,8 @@ async def _upsert_external_code_and_edges(
         VALUES (
             CAST(:from_system AS varchar),
             CAST(:from_code AS varchar),
-            hashtext(
-                UPPER(CAST(:from_system AS varchar))
-                || '|'
-                || UPPER(CAST(:from_code AS varchar))
-            ),
             CAST(:to_system AS varchar),
             CAST(:to_code AS varchar),
-            hashtext(
-                UPPER(CAST(:to_system AS varchar))
-                || '|'
-                || UPPER(CAST(:to_code AS varchar))
-            ),
             :match_type,
             :confidence,
             :source,
@@ -1997,8 +1949,6 @@ async def _upsert_external_code_and_edges(
         )
         ON CONFLICT (from_system, from_code, to_system, to_code) DO UPDATE
         SET
-            from_checksum = excluded.from_checksum,
-            to_checksum = excluded.to_checksum,
             match_type = excluded.match_type,
             confidence = excluded.confidence,
             source = excluded.source,

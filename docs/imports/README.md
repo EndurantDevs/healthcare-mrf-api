@@ -18,7 +18,6 @@ For the canonical source website registry, see [../data-sources.md](../data-sour
 | Geo Census | `python main.py start geo-census` | none | Census ZIP/ZCTA profile metrics for local geo enrichment |
 | PLACES ZCTA | `python main.py start places-zcta` | `process.PlacesZcta`, `process.PlacesZcta_finish` | CDC PLACES ZIP/ZCTA health indicator metrics |
 | Claims pricing | `python main.py start claims-pricing` | `process.ClaimsPricing_finish` worker or `finish claims-pricing` | Medicare physician procedure and cost imports |
-| Claims procedures | `python main.py start claims-procedures` | same as claims pricing | Alias for claims pricing |
 | Drug claims | `python main.py start drug-claims` | `process.DrugClaims_finish` worker or `finish drug-claims` | Medicare Part D provider-drug imports |
 | Provider quality | `python main.py start provider-quality` | `process.ProviderQuality_finish` worker or `finish provider-quality` | Quality scoring inputs and provider benchmarks |
 | Provider enrichment | `python main.py start provider-enrichment` | `process.ProviderEnrichment` or `process.ProviderEnrichment_finish` | PECOS / Medicare enrollment sidecar import |
@@ -57,6 +56,8 @@ For the canonical source website registry, see [../data-sources.md](../data-sour
 
 ## Shared Operational Rules
 - Use `--test` where supported before large imports.
-- Some imports publish by table swap; `_old` tables are expected rollback assets.
+- Publish style is importer-specific: direct load, validated direct replace, `_old` swap rollback, or snapshot pointer update.
+- Keep `_old` tables only for importers whose runbook documents them as rollback assets.
+- `claims-procedures` remains a CLI compatibility alias for `claims-pricing`, but `claims-pricing` is the canonical command.
 - Avoid running `ClaimsPricing_finish` and `DrugClaims_finish` at the same time.
 - Run `ProviderQuality_finish` in its own finalize window as well.

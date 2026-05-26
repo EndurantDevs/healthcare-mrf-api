@@ -8,6 +8,8 @@ import re
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from api.code_systems import canonical_catalog_code, normalize_code_system
+
 NUMERIC_PATTERN = re.compile(r"^-?\d+(\.\d+)?$")
 
 PTG2_ITEM_SOURCE_FIELDS = {"source_trace"}
@@ -22,20 +24,6 @@ PTG2_ITEM_DIAGNOSTIC_FIELDS = {
 }
 PTG2_QUERY_SOURCE_FIELDS = {"source", "serving_table"}
 PTG2_QUERY_DIAGNOSTIC_FIELDS = {"procedure_consolidation", "result_granularity"}
-CODE_SYSTEM_ALIASES = {
-    "CLM_REV_CNTR_CD": "RC",
-    "PLACE_OF_SERVICE": "POS",
-    "REVENUE_CENTER": "RC",
-    "REVENUE_CODE": "RC",
-    "REV_CNTR": "RC",
-    "SERVICE_CODE": "POS",
-    "BILLING_CODE_MODIFIER": "MODIFIER",
-    "CPT_MODIFIER": "MODIFIER",
-    "HCPCS_MODIFIER": "MODIFIER",
-    "MOD": "MODIFIER",
-}
-
-
 def _request_bool(value: Any, default: bool = False) -> bool:
     if value is None:
         return default
@@ -104,18 +92,11 @@ def _shape_ptg2_response(payload: dict[str, Any], args: dict[str, Any]) -> dict[
 
 
 def _normalize_catalog_code_system(raw_system: Any) -> str:
-    system = str(raw_system or "").strip().upper()
-    return CODE_SYSTEM_ALIASES.get(system, system)
+    return normalize_code_system(raw_system)
 
 
 def _canonical_catalog_code(code_system: str, raw_code: Any) -> str:
-    code = str(raw_code or "").strip().upper()
-    digits = "".join(ch for ch in code if ch.isdigit())
-    if code_system == "RC" and digits:
-        return digits.zfill(4)
-    if code_system == "POS" and digits:
-        return digits.zfill(2)
-    return code
+    return canonical_catalog_code(code_system, raw_code)
 
 
 def _catalog_key(code_system: Any, code: Any) -> tuple[str, str] | None:

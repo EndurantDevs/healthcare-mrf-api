@@ -37,8 +37,10 @@ class FakeResult:
 class FakeSession:
     def __init__(self, results=None):
         self._results = list(results or [])
+        self.calls = []
 
     async def execute(self, *_args, **_kwargs):
+        self.calls.append((_args, _kwargs))
         if self._results:
             return self._results.pop(0)
         return FakeResult([], 0)
@@ -82,6 +84,25 @@ async def test_list_codes_normalizes_code_system_alias():
 
     assert payload["query"]["code_system"] == "POS"
     assert payload["items"][0]["code_system"] == "POS"
+
+
+@pytest.mark.asyncio
+async def test_list_codes_searches_code_synonyms_without_changing_response_shape():
+    request = make_request(
+        [
+            FakeResult(scalar=1),
+            FakeResult(rows=[{"code_system": "CDT", "code": "D0120", "display_name": "Periodic oral evaluation"}]),
+        ],
+        args={"q": "oral evaluation", "limit": "10"},
+    )
+
+    response = await list_codes(request)
+    payload = json.loads(response.body)
+    query_sql = "\n".join(str(call[0][0]) for call in request.ctx.sa_session.calls)
+
+    assert payload["items"][0]["code_system"] == "CDT"
+    assert "code_synonym" in query_sql
+    assert "synonym" not in payload["items"][0]
 
 
 @pytest.mark.asyncio

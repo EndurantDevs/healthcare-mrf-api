@@ -224,10 +224,6 @@ async def _ensure_code_catalog(schema: str) -> None:
             ALTER COLUMN source TYPE VARCHAR(128);
         """
     )
-    await db.status(
-        f"ALTER TABLE {schema}.{CodeCatalog.__tablename__} ADD COLUMN IF NOT EXISTS code_checksum INTEGER;"
-    )
-
 
 async def _upsert_code_rows(schema: str, rows: list[CodeSetRow]) -> int:
     seen: set[tuple[str, str]] = set()
@@ -240,13 +236,11 @@ async def _upsert_code_rows(schema: str, rows: list[CodeSetRow]) -> int:
         await db.status(
             f"""
             INSERT INTO {schema}.{CodeCatalog.__tablename__}
-                (code_system, code, code_checksum, display_name, short_description, long_description, is_active, source, updated_at)
+                (code_system, code, display_name, short_description, long_description, is_active, source, updated_at)
             VALUES
-                (:code_system, :code, hashtext(UPPER(:checksum_system) || '|' || UPPER(:checksum_code)),
-                 :display_name, :short_description, :long_description, TRUE, :source, NOW())
+                (:code_system, :code, :display_name, :short_description, :long_description, TRUE, :source, NOW())
             ON CONFLICT (code_system, code) DO UPDATE
             SET
-                code_checksum = excluded.code_checksum,
                 display_name = excluded.display_name,
                 short_description = excluded.short_description,
                 long_description = excluded.long_description,
@@ -256,8 +250,6 @@ async def _upsert_code_rows(schema: str, rows: list[CodeSetRow]) -> int:
             """,
             code_system=row.code_system,
             code=row.code,
-            checksum_system=row.code_system,
-            checksum_code=row.code,
             display_name=row.display_name,
             short_description=row.short_description,
             long_description=row.long_description,

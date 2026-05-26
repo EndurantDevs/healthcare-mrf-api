@@ -9,29 +9,19 @@ from typing import Any
 import sanic.exceptions
 from sanic import Blueprint, response
 from sanic.exceptions import InvalidUsage
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, exists, func, or_, select
 
+from api.code_systems import canonical_catalog_code, normalize_code_system
 from api.endpoint.pagination import parse_pagination
-from db.models import CodeCatalog, CodeCrosswalk
+from db.models import CodeCatalog, CodeCrosswalk, CodeSynonym
 
 blueprint = Blueprint("codes", url_prefix="/codes", version=1)
 
 code_catalog_table = CodeCatalog.__table__
 code_crosswalk_table = CodeCrosswalk.__table__
+code_synonym_table = CodeSynonym.__table__
 
 MAX_LIMIT = 200
-CODE_SYSTEM_ALIASES = {
-    "CLM_REV_CNTR_CD": "RC",
-    "PLACE_OF_SERVICE": "POS",
-    "REVENUE_CENTER": "RC",
-    "REVENUE_CODE": "RC",
-    "REV_CNTR": "RC",
-    "SERVICE_CODE": "POS",
-    "BILLING_CODE_MODIFIER": "MODIFIER",
-    "CPT_MODIFIER": "MODIFIER",
-    "HCPCS_MODIFIER": "MODIFIER",
-    "MOD": "MODIFIER",
-}
 
 
 def _get_session(request):
@@ -68,18 +58,11 @@ def _normalize_order(raw_order: Any):
 
 
 def _normalize_code_system(raw_system: Any) -> str:
-    system = str(raw_system or "").strip().upper()
-    return CODE_SYSTEM_ALIASES.get(system, system)
+    return normalize_code_system(raw_system)
 
 
 def _canonical_code_for_system(code_system: str, raw_code: Any) -> str:
-    code = str(raw_code or "").strip().upper()
-    digits = "".join(ch for ch in code if ch.isdigit())
-    if code_system == "RC" and digits:
-        return digits.zfill(4)
-    if code_system == "POS" and digits:
-        return digits.zfill(2)
-    return code
+    return canonical_catalog_code(code_system, raw_code)
 
 
 @blueprint.get("/")
@@ -106,6 +89,16 @@ async def list_codes(request):
                 func.lower(code_catalog_table.c.code).like(q_like),
                 func.lower(code_catalog_table.c.display_name).like(q_like),
                 func.lower(code_catalog_table.c.short_description).like(q_like),
+                exists(
+                    select(1).where(
+                        and_(
+                            func.upper(code_synonym_table.c.code_system)
+                            == func.upper(code_catalog_table.c.code_system),
+                            func.upper(code_synonym_table.c.code) == func.upper(code_catalog_table.c.code),
+                            func.lower(code_synonym_table.c.synonym).like(q_like),
+                        )
+                    )
+                ),
             )
         )
 
@@ -124,7 +117,6 @@ async def list_codes(request):
         "code": code_catalog_table.c.code,
         "code_system": code_catalog_table.c.code_system,
         "display_name": code_catalog_table.c.display_name,
-        "code_checksum": code_catalog_table.c.code_checksum,
     }
     order_column = order_fields.get(order_by)
     if order_column is None:

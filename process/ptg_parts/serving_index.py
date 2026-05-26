@@ -7,6 +7,7 @@ import sys
 from typing import Any
 
 from db.connection import db
+from db.models import CodeCatalog, CodeSynonym
 from process.ptg_parts.config import (
     PTG2_DEFER_PROVIDER_LOCATIONS_ENV,
     PTG2_SERVING_ROW_LIMIT_ENV,
@@ -22,6 +23,11 @@ from process.ptg_parts.serving_maintenance import _build_ptg2_provider_locations
 
 
 logger = logging.getLogger(__name__)
+
+PTG2_SOURCE_OBSERVED_PROCEDURE_SOURCE = "ptg2_source_observed_procedure"
+PTG2_SOURCE_OBSERVED_PROCEDURE_ATTRIBUTION = (
+    "Source-observed label from payer pricing data; not an AMA CPT or ADA CDT reference import."
+)
 
 
 async def _build_provider_locations_from_facade(snapshot_id: str) -> None:
@@ -39,6 +45,133 @@ async def _ptg2_table_available(schema: str, table_name: str) -> bool:
     return bool(value)
 
 
+async def _materialize_ptg2_source_observed_terms(snapshot_id: str, schema: str) -> None:
+    await db.create_table(CodeCatalog.__table__, checkfirst=True)
+    await db.create_table(CodeSynonym.__table__, checkfirst=True)
+    await db.status(
+        f"ALTER TABLE {schema}.{CodeCatalog.__tablename__} ADD COLUMN IF NOT EXISTS source_attribution TEXT;"
+    )
+    await db.status(
+        f"ALTER TABLE {schema}.{CodeSynonym.__tablename__} ADD COLUMN IF NOT EXISTS source_attribution TEXT;"
+    )
+    await db.status(
+        f"""
+        WITH snapshot_procedure AS (
+            SELECT DISTINCT
+                NULLIF(UPPER(BTRIM(proc.billing_code_type)), '') AS code_system,
+                NULLIF(UPPER(BTRIM(proc.billing_code)), '') AS code,
+                NULLIF(BTRIM(proc.name), '') AS procedure_name,
+                NULLIF(BTRIM(proc.description), '') AS procedure_description
+            FROM {schema}.ptg2_plan_month pm
+            JOIN {schema}.ptg2_plan_rate_set prs ON prs.plan_month_id = pm.plan_month_id
+            JOIN {schema}.ptg2_rate_set rs ON rs.rate_set_hash = prs.rate_set_hash
+            JOIN LATERAL unnest(rs.chunk_hashes) AS chunk_ref(fact_chunk_hash) ON true
+            JOIN {schema}.ptg2_fact_chunk fc ON fc.fact_chunk_hash = chunk_ref.fact_chunk_hash
+            JOIN {schema}.ptg2_procedure proc ON proc.procedure_hash = fc.procedure_hash
+            WHERE pm.snapshot_id = :snapshot_id
+        ),
+        src AS (
+            SELECT
+                code_system,
+                code,
+                procedure_name,
+                procedure_description,
+                COALESCE(procedure_name, procedure_description, code) AS display_name
+            FROM snapshot_procedure
+            WHERE code_system IN ('CPT', 'HCPCS', 'CDT')
+              AND code IS NOT NULL
+        )
+        INSERT INTO {schema}.{CodeCatalog.__tablename__}
+            (
+                code_system,
+                code,
+                display_name,
+                short_description,
+                long_description,
+                is_active,
+                source,
+                source_attribution,
+                updated_at
+            )
+        SELECT
+            code_system,
+            code,
+            display_name,
+            COALESCE(procedure_name, procedure_description),
+            procedure_description,
+            TRUE,
+            :source,
+            :source_attribution,
+            NOW()
+        FROM src
+        ON CONFLICT (code_system, code) DO UPDATE
+        SET
+            display_name = EXCLUDED.display_name,
+            short_description = EXCLUDED.short_description,
+            long_description = EXCLUDED.long_description,
+            is_active = EXCLUDED.is_active,
+            source = EXCLUDED.source,
+            source_attribution = EXCLUDED.source_attribution,
+            updated_at = EXCLUDED.updated_at;
+        """,
+        snapshot_id=snapshot_id,
+        source=PTG2_SOURCE_OBSERVED_PROCEDURE_SOURCE,
+        source_attribution=PTG2_SOURCE_OBSERVED_PROCEDURE_ATTRIBUTION,
+    )
+    await db.status(
+        f"""
+        WITH snapshot_procedure AS (
+            SELECT DISTINCT
+                NULLIF(UPPER(BTRIM(proc.billing_code_type)), '') AS code_system,
+                NULLIF(UPPER(BTRIM(proc.billing_code)), '') AS code,
+                NULLIF(BTRIM(proc.name), '') AS procedure_name,
+                NULLIF(BTRIM(proc.description), '') AS procedure_description
+            FROM {schema}.ptg2_plan_month pm
+            JOIN {schema}.ptg2_plan_rate_set prs ON prs.plan_month_id = pm.plan_month_id
+            JOIN {schema}.ptg2_rate_set rs ON rs.rate_set_hash = prs.rate_set_hash
+            JOIN LATERAL unnest(rs.chunk_hashes) AS chunk_ref(fact_chunk_hash) ON true
+            JOIN {schema}.ptg2_fact_chunk fc ON fc.fact_chunk_hash = chunk_ref.fact_chunk_hash
+            JOIN {schema}.ptg2_procedure proc ON proc.procedure_hash = fc.procedure_hash
+            WHERE pm.snapshot_id = :snapshot_id
+        ),
+        terms AS (
+            SELECT code_system, code, procedure_name AS synonym, 'source_name' AS term_type
+            FROM snapshot_procedure
+            WHERE code_system IN ('CPT', 'HCPCS', 'CDT')
+              AND code IS NOT NULL
+              AND procedure_name IS NOT NULL
+            UNION
+            SELECT code_system, code, procedure_description AS synonym, 'source_description' AS term_type
+            FROM snapshot_procedure
+            WHERE code_system IN ('CPT', 'HCPCS', 'CDT')
+              AND code IS NOT NULL
+              AND procedure_description IS NOT NULL
+        )
+        INSERT INTO {schema}.{CodeSynonym.__tablename__}
+            (code_system, code, synonym, term_type, language, source, source_attribution, updated_at)
+        SELECT
+            code_system,
+            code,
+            synonym,
+            term_type,
+            'en',
+            :source,
+            :source_attribution,
+            NOW()
+        FROM terms
+        ON CONFLICT (code_system, code, synonym, term_type) DO UPDATE
+        SET
+            language = EXCLUDED.language,
+            source = EXCLUDED.source,
+            source_attribution = EXCLUDED.source_attribution,
+            updated_at = EXCLUDED.updated_at;
+        """,
+        snapshot_id=snapshot_id,
+        source=PTG2_SOURCE_OBSERVED_PROCEDURE_SOURCE,
+        source_attribution=PTG2_SOURCE_OBSERVED_PROCEDURE_ATTRIBUTION,
+    )
+
+
 async def build_ptg2_db_serving_index(snapshot_id: str, import_run_id: str) -> dict[str, Any] | None:
     """Materialize the compact PTG2 serving view into Postgres, without local JSON artifacts."""
     del import_run_id  # The serving table is tied to snapshot_id; import run remains on the snapshot record.
@@ -50,6 +183,8 @@ async def build_ptg2_db_serving_index(snapshot_id: str, import_run_id: str) -> d
             limit_clause = f" LIMIT {max(int(raw_limit), 1)}"
         except ValueError:
             logger.warning("Ignoring invalid %s=%s", PTG2_SERVING_ROW_LIMIT_ENV, raw_limit)
+
+    await _materialize_ptg2_source_observed_terms(snapshot_id, schema)
 
     has_code_crosswalk = await _ptg2_table_available(schema, "code_crosswalk")
     has_pricing_procedure = await _ptg2_table_available(schema, "pricing_procedure")

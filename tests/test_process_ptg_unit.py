@@ -2009,13 +2009,19 @@ def test_ptg2_db_serving_index_builder_materializes_table(monkeypatch, tmp_path)
         statuses.append((sql, params))
         return 1
 
+    async def fake_create_table(*_args, **_kwargs):
+        return None
+
     monkeypatch.setenv("HLTHPRT_PTG2_ARTIFACT_DIR", str(tmp_path))
     monkeypatch.setattr(process_ptg.db, "scalar", fake_scalar)
     monkeypatch.setattr(process_ptg.db, "status", fake_status)
+    monkeypatch.setattr(process_ptg.db, "create_table", fake_create_table)
 
     result = asyncio.run(process_ptg.build_ptg2_db_serving_index("snap-compact", "run-compact"))
 
     insert_sql = next(sql for sql, _params in statuses if "INSERT INTO mrf.ptg2_serving_rate" in sql)
+    source_observed_catalog_sql = next(sql for sql, _params in statuses if "INSERT INTO mrf.code_catalog" in sql)
+    source_observed_synonym_sql = next(sql for sql, _params in statuses if "INSERT INTO mrf.code_synonym" in sql)
     assert result["storage"] == "db"
     assert result["table"] == "mrf.ptg2_serving_rate"
     assert result["provider_granularity"] == "provider_set"
@@ -2023,6 +2029,9 @@ def test_ptg2_db_serving_index_builder_materializes_table(monkeypatch, tmp_path)
     assert "code_crosswalk" in insert_sql
     assert "pricing_procedure" in insert_sql
     assert "code_catalog" in insert_sql
+    assert "code_system IN ('CPT', 'HCPCS', 'CDT')" in source_observed_catalog_sql
+    assert "source_attribution" in source_observed_catalog_sql
+    assert "source_description" in source_observed_synonym_sql
     assert "snapshot_index" not in [part.name for part in tmp_path.iterdir()]
 
 

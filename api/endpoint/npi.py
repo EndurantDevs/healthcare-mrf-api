@@ -20,6 +20,11 @@ from sanic import Blueprint, response
 from sqlalchemy import func, or_, select
 from sqlalchemy.sql import literal_column, text, tuple_
 
+from api.code_systems import (
+    EXTERNAL_PROCEDURE_CODE_SYSTEMS,
+    INTERNAL_PROCEDURE_CODE_SYSTEM,
+    INTERNAL_RX_CODE_SYSTEM,
+)
 from api.endpoint.pagination import parse_pagination
 from db.models import (AddressArchive, Issuer, NPIAddress, NPIData,
                        NPIDataOtherIdentifier, NPIDataTaxonomy,
@@ -42,12 +47,10 @@ ENABLE_TRGM_FUZZY_NAME_SEARCH = os.getenv("HLTHPRT_ENABLE_TRGM_FUZZY_NAME_SEARCH
     "yes",
     "on",
 }
-INTERNAL_PROCEDURE_CODE_SYSTEM = "HP_PROCEDURE_CODE"
-INTERNAL_MEDICATION_CODE_SYSTEM = "HP_RX_CODE"
+INTERNAL_MEDICATION_CODE_SYSTEM = INTERNAL_RX_CODE_SYSTEM
 PROCEDURE_ALLOWED_CODE_SYSTEMS = {
     INTERNAL_PROCEDURE_CODE_SYSTEM,
-    "CPT",
-    "HCPCS",
+    *EXTERNAL_PROCEDURE_CODE_SYSTEMS,
 }
 MEDICATION_ALLOWED_CODE_SYSTEMS = {
     INTERNAL_MEDICATION_CODE_SYSTEM,

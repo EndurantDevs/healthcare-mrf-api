@@ -7,11 +7,9 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from api.code_systems import EXTERNAL_PROCEDURE_CODE_SYSTEMS, INTERNAL_PROCEDURE_CODE_SYSTEM, PROCEDURE_CODE_SYSTEMS
 from api.ptg2_response import _include_ptg2_details
 
-INTERNAL_PROCEDURE_CODE_SYSTEM = "HP_PROCEDURE_CODE"
-EXTERNAL_PROCEDURE_CODE_SYSTEMS = {"CPT", "HCPCS"}
-PROCEDURE_CODE_SYSTEMS = {*EXTERNAL_PROCEDURE_CODE_SYSTEMS, INTERNAL_PROCEDURE_CODE_SYSTEM}
 PTG2_CODE_EXPANSION_HOPS = 2
 
 
@@ -225,7 +223,13 @@ def _is_external_procedure_code_text(value: str) -> bool:
 def _ptg2_equivalent_external_pairs(system: str, code: str) -> set[tuple[str, str]]:
     if system not in EXTERNAL_PROCEDURE_CODE_SYSTEMS or not _is_external_procedure_code_text(code):
         return set()
-    return {(candidate_system, code) for candidate_system in EXTERNAL_PROCEDURE_CODE_SYSTEMS}
+    if re.fullmatch(r"\d{5}", code):
+        systems = {"CPT", "HCPCS"}
+    elif re.fullmatch(r"D\d{4}", code):
+        systems = {"CDT", "HCPCS"}
+    else:
+        systems = {system}
+    return {(candidate_system, code) for candidate_system in systems}
 
 
 def _ptg2_code_context(

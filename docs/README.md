@@ -14,20 +14,21 @@ It is intended for readers on GitHub who need to understand:
 - [Architecture overview](./architecture.md): one-screen system flow
 - [Data sources](./data-sources.md): source websites and how the project uses them
 - [Import index](./imports/README.md): every import command in one place
-- [Clinical reference DevOps](./devops/clinical-reference.md): stage/swap runbook and attribution rule
+- [Clinical reference DevOps](./devops/clinical-reference.md): direct-replace runbook and attribution rule
 
 ## Import Architecture
-Most imports follow one of two patterns:
+Imports follow one of three publish patterns. Check the per-import runbook before cleanup or rollback work:
 
 1. Direct load into canonical tables
-2. Staging tables plus publish/swap to live tables with `_old` rollback backups
+2. Validated staging followed by direct replacement of live tables
+3. Staging tables plus publish/swap to live tables with `_old` rollback backups, or snapshot-pointer publish for PTG
 
 Operational conventions across the repo:
 
 - imports are queue-driven through ARQ
 - `--test` mode is available for smoke runs on most imports
-- live tables are often published by rename/swap instead of in-place mutation
-- `_old` tables are intentional rollback assets, not cleanup debris
+- live tables are not mutated in place during large loads
+- `_old` tables are intentional only for importers whose runbook says they keep rollback backups
 
 ## Technical Specs
 For lower-level implementation notes, see [`../specs/`](../specs/).

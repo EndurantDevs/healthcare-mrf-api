@@ -17,6 +17,7 @@ from sanic.exceptions import InvalidUsage
 from sqlalchemy import (Column, Float, Integer, MetaData, String, Table, and_, case, cast,
                         func, or_, select, text)
 
+from api.code_systems import INTERNAL_PROCEDURE_CODE_SYSTEM, INTERNAL_RX_CODE_SYSTEM
 from api.endpoint.pagination import parse_pagination
 from api.ptg2_serving import normalize_ptg2_mode, search_current_ptg2_index, search_ptg2_provider_procedures
 from db.models import (CodeCatalog, CodeCrosswalk, PricingProcedure,
@@ -58,13 +59,13 @@ QUALITY_SVI_TABLE_NAME = "pricing_svi_zcta"
 
 
 MAX_LIMIT = 200
-INTERNAL_CODE_SYSTEM = "HP_PROCEDURE_CODE"
-INTERNAL_RX_CODE_SYSTEM = "HP_RX_CODE"
-PROCEDURE_OVERRIDE_CODE_SYSTEMS = (INTERNAL_CODE_SYSTEM, "CPT", "HCPCS")
+INTERNAL_CODE_SYSTEM = INTERNAL_PROCEDURE_CODE_SYSTEM
+PROCEDURE_OVERRIDE_CODE_SYSTEMS = (INTERNAL_CODE_SYSTEM, "CPT", "HCPCS", "CDT")
 RX_EXTERNAL_CODE_PRIORITY = ("NDC", "RXNORM")
 MAX_CODE_EXPANSION_HOPS = max(int(os.getenv("HLTHPRT_MAX_CODE_EXPANSION_HOPS", "4")), 1)
 INT_PATTERN = re.compile(r"^-?\d+$")
 FIVE_DIGIT_CODE_PATTERN = re.compile(r"^\d{5}$")
+DENTAL_CODE_PATTERN = re.compile(r"^D\d{4}$")
 PROCEDURE_MATCH_THRESHOLD_DEFAULT = 0.30
 SCORE_VARIANTS_SCOPE_PROVIDER = "provider"
 SCORE_VARIANTS_SCOPE_VALUES = (SCORE_VARIANTS_SCOPE_PROVIDER,)
@@ -74,6 +75,17 @@ PROVIDER_QUALITY_DEFAULT_SVI = min(
     max(float(os.getenv("HLTHPRT_PROVIDER_QUALITY_DEFAULT_SVI", "0.5")), 0.0),
     1.0,
 )
+
+
+def _reported_procedure_code_system(code: Any) -> str | None:
+    code_text = str(code or "").strip().upper()
+    if not code_text:
+        return None
+    if FIVE_DIGIT_CODE_PATTERN.fullmatch(code_text):
+        return "CPT"
+    if DENTAL_CODE_PATTERN.fullmatch(code_text):
+        return "CDT"
+    return "HCPCS"
 
 
 def _env_flag(*names: str, default: bool = False) -> bool:
@@ -276,11 +288,7 @@ def _normalize_service_payload(payload: dict[str, Any]) -> dict[str, Any]:
         payload.get("brand_name"),
     )
     reported_code = _coalesce_value(payload.get("reported_code"), payload.get("brand_name"))
-    reported_code_system = None
-    if reported_code:
-        code_text = str(reported_code).strip().upper()
-        if code_text:
-            reported_code_system = "CPT" if FIVE_DIGIT_CODE_PATTERN.fullmatch(code_text) else "HCPCS"
+    reported_code_system = _reported_procedure_code_system(reported_code)
     payload["service_code_system"] = INTERNAL_CODE_SYSTEM
     payload["service_code"] = str(procedure_code) if procedure_code is not None else None
     payload["service_name"] = service_name
@@ -4854,9 +4862,7 @@ async def _provider_procedure_cost_level(
             catalog_payload = _row_to_dict(catalog_row)
             procedure_name = catalog_payload.get("display_name") or catalog_payload.get("short_description")
 
-    reported_code_system = None
-    if reported_code:
-        reported_code_system = "CPT" if FIVE_DIGIT_CODE_PATTERN.fullmatch(reported_code) else "HCPCS"
+    reported_code_system = _reported_procedure_code_system(reported_code)
 
     selected_zip_meta = zip_candidate_meta.get(str(selected_value or "").strip()) if selected_scope == "zip5" else None
 
@@ -5461,7 +5467,7 @@ async def autocomplete_procedures(request):
     q_prefix = f"{q}%"
 
     filters = [
-        func.upper(code_catalog_table.c.code_system).in_(("CPT", "HCPCS", INTERNAL_CODE_SYSTEM)),
+        func.upper(code_catalog_table.c.code_system).in_(("CPT", "HCPCS", "CDT", INTERNAL_CODE_SYSTEM)),
         func.lower(func.coalesce(code_catalog_table.c.source, "")) == "cms_physician_provider_service",
         or_(
             display_lower.like(q_like),
@@ -5489,7 +5495,7 @@ async def autocomplete_procedures(request):
                     code_catalog_table.c.code.in_(internal_codes_for_year),
                 ),
                 and_(
-                    func.upper(code_catalog_table.c.code_system).in_(("CPT", "HCPCS")),
+                    func.upper(code_catalog_table.c.code_system).in_(("CPT", "HCPCS", "CDT")),
                     func.upper(code_catalog_table.c.code).in_(external_codes_for_year),
                 ),
             )

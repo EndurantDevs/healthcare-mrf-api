@@ -3584,7 +3584,6 @@ class CodeCatalog(Base, JSONOutputMixin):
     __my_index_elements__ = ["code_system", "code"]
     __my_additional_indexes__ = [
         {"index_elements": ("code", "code_system"), "name": "code_catalog_code_system_idx"},
-        {"index_elements": ("code_checksum",), "name": "code_catalog_code_checksum_idx"},
         {"index_elements": ("code_system", "display_name"), "name": "code_catalog_system_display_idx"},
         {"index_elements": ("code_system", "lower(display_name)"), "name": "code_catalog_system_display_lower_idx"},
         {"index_elements": ("code_type", "code_system"), "name": "code_catalog_code_type_system_idx"},
@@ -3597,12 +3596,10 @@ class CodeCatalog(Base, JSONOutputMixin):
 
     code_system = Column(String(32), nullable=False)
     code = Column(String(128), nullable=False)
-    code_checksum = Column(Integer)
     code_type = Column(String(32))
     display_name = Column(String)
     short_description = Column(String)
     long_description = Column(TEXT)
-    synonyms = Column(ARRAY(String), nullable=False, server_default=text("ARRAY[]::varchar[]"))
     is_active = Column(Boolean)
     source = Column(String(128))
     source_release = Column(String(64))
@@ -3620,19 +3617,15 @@ class CodeCrosswalk(Base, JSONOutputMixin):
     __my_index_elements__ = ["from_system", "from_code", "to_system", "to_code"]
     __my_additional_indexes__ = [
         {"index_elements": ("from_system", "from_code"), "name": "code_crosswalk_from_idx"},
-        {"index_elements": ("from_checksum",), "name": "code_crosswalk_from_checksum_idx"},
         {"index_elements": ("to_system", "to_code"), "name": "code_crosswalk_to_idx"},
-        {"index_elements": ("to_checksum",), "name": "code_crosswalk_to_checksum_idx"},
         {"index_elements": ("upper(from_system)", "upper(from_code)"), "name": "code_crosswalk_upper_from_idx"},
         {"index_elements": ("upper(to_system)", "upper(to_code)"), "name": "code_crosswalk_upper_to_idx"},
     ]
 
     from_system = Column(String(32), nullable=False)
     from_code = Column(String(128), nullable=False)
-    from_checksum = Column(Integer)
     to_system = Column(String(32), nullable=False)
     to_code = Column(String(128), nullable=False)
-    to_checksum = Column(Integer)
     match_type = Column(String(32))
     confidence = Column(Numeric(scale=4, precision=6, asdecimal=False, decimal_return_scale=None))
     source = Column(String(128))

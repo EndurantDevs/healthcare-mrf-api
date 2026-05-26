@@ -9,10 +9,10 @@ Most importers resolve current files/distributions at runtime (from catalog APIs
 
 | Source website | Dataset families used in this repo | Importers using it | Main outputs |
 | --- | --- | --- | --- |
-| <https://data.cms.gov/> | Medicare physician claims, Medicare Part D prescriber/spending, Part D formulary/pharmacy files, Medicare enrollment dashboard data APIs, provider-enrollment datasets | `claims-pricing`, `claims-procedures`, `drug-claims`, `partd-formulary-network`, `medicare-enrollment`, `provider-enrichment` | procedure pricing, prescription claims, pharmacy activity/formulary coverage, Medicare enrollment stats, PECOS sidecar enrichment |
+| <https://data.cms.gov/> | Medicare physician claims, Medicare Part D prescriber/spending, Part D formulary/pharmacy files, Medicare enrollment dashboard data APIs, provider-enrollment datasets | `claims-pricing`, `drug-claims`, `partd-formulary-network`, `medicare-enrollment`, `provider-enrichment` | procedure pricing, prescription claims, pharmacy activity/formulary coverage, Medicare enrollment stats, PECOS sidecar enrichment |
 | <https://www.cms.gov/medicare/coding-billing/place-of-service-codes/code-sets> | CMS Place of Service code set | `code-sets` | `POS` rows in `code_catalog` for PTG service-code display |
 | <https://bluebutton.cms.gov/fhir/CodeSystem/CLM-REV-CNTR-CD/> | CMS Blue Button Claim Revenue Center CodeSystem | `code-sets` | `RC` rows in `code_catalog` for revenue-code display |
-| CDC ICD-10-CM, NLM MeSH, NLM RxNorm, NLM/UMLS SNOMED CT US, RxClass MED-RT | Official condition, drug, synonym, crosswalk, relationship, and MeSH-root clinical-area terminology | `clinical-reference` | unified `code_catalog`, `code_synonym`, `code_crosswalk`, `code_relationship`, and `clinical_area*` reference tables |
+| CDC ICD-10-CM, NLM MeSH, NLM RxNorm, NLM/UMLS SNOMED CT US, RxClass MED-RT | Official condition, drug, synonym, crosswalk, relationship, and MeSH-root clinical-area terminology | `clinical-reference` | unified `code_catalog`, `code_synonym`, `code_crosswalk`, `code_relationship`, and `clinical_area*` reference tables, with synonyms stored only in `code_synonym` |
 | <https://data.cms.gov/provider-data/> | Provider Data Catalog distributions (Doctors & Clinicians, Hospital General Information) | `cms-doctors`, `facility-anchors` | clinician-practice location rows, hospital anchor rows |
 | <https://www.cms.gov/marketplace/resources/data/public-use-files> | Federally facilitated marketplace PUF families (plans, issuers, rates, transparency metadata) | `mrf`, `plan-attributes` | marketplace plan/issuer/formulary/network/rates datasets |
 | <https://www.cms.gov/marketplace/resources/data/state-based-public-use-files> | State-based exchange plan/rate/attribute files | `mrf`, `plan-attributes` | state-exchange plan and pricing coverage where configured |
@@ -52,6 +52,7 @@ Other states use discovery-driven machine-readable extraction via FDA BeSafeRx l
 
 - External websites are import-time dependencies; the API serves local PostgreSQL tables at request time.
 - Some imports can optionally use local override files/URLs via `HLTHPRT_*` environment variables.
-- Dataset freshness is determined by each importer’s latest successful publish/swap cycle.
-- Clinical areas are public MeSH tree-root buckets plus RxClass/MED-RT drug-to-condition area links. CPT/HCPCS-to-area mappings are not generated without an official licensed mapping source.
+- Dataset freshness is determined by each importer’s latest successful publish cycle.
+- Clinical areas are public MeSH tree-root buckets plus RxClass/MED-RT drug-to-condition area links. CPT/HCPCS/CDT-to-area mappings are not generated without an official licensed mapping source.
+- CPT/CDT codes and labels may appear when observed in claims, PTG, or MRF source data. They are recorded as source-observed text, not as an official AMA CPT or ADA CDT dictionary import; HCPCS Level I does not bypass CPT licensing.
 - NLM-derived data must carry the NLM attribution statement documented in [imports/clinical-reference.md](./imports/clinical-reference.md).

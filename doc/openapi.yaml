@@ -23,6 +23,7 @@ servers:
 paths:
   /healthcheck/:
     get:
+      operationId: getHealthcheck
       summary: Health check and release metadata
       responses:
         '200':
@@ -33,6 +34,7 @@ paths:
                 $ref: '#/components/schemas/HealthcheckResponse'
   /coverage/statistics:
     get:
+      operationId: getCoverageStatistics
       summary: Curated cross-domain coverage statistics for site-facing dashboards
       responses:
         '200':
@@ -43,6 +45,7 @@ paths:
                 $ref: '#/components/schemas/CoverageStatistics'
   /plan/:
     get:
+      operationId: getPlan
       summary: Platform plan import status
       responses:
         '200':
@@ -53,6 +56,7 @@ paths:
                 $ref: '#/components/schemas/PlanIndexStatus'
   /plan/all:
     get:
+      operationId: getPlanAll
       summary: List all plans
       responses:
         '200':
@@ -65,6 +69,7 @@ paths:
                   $ref: '#/components/schemas/PlanRecord'
   /plan/all/variants:
     get:
+      operationId: getPlanAllVariants
       summary: List plan variants with optional pagination
       parameters:
         - name: limit
@@ -90,6 +95,7 @@ paths:
                   $ref: '#/components/schemas/PlanVariantSummary'
   /plan/network/id/{checksum}:
     get:
+      operationId: getPlanNetworkIdChecksum
       summary: Fetch network details by checksum
       parameters:
         - name: checksum
@@ -112,6 +118,7 @@ paths:
                 $ref: '#/components/schemas/Error'
   /plan/network/multiple/{checksums}:
     get:
+      operationId: getPlanNetworkMultipleChecksums
       summary: Fetch multiple network entries
       parameters:
         - name: checksums
@@ -137,6 +144,7 @@ paths:
                 $ref: '#/components/schemas/Error'
   /plan/network/autocomplete:
     get:
+      operationId: getPlanNetworkAutocomplete
       summary: Autocomplete plans by marketing name or plan ID
       parameters:
         - name: query
@@ -166,6 +174,7 @@ paths:
                 $ref: '#/components/schemas/PlanAutocompleteResponse'
   /plan/search:
     get:
+      operationId: getPlanSearch
       summary: Search plans with optional demographic filters
       parameters:
         - name: age
@@ -363,6 +372,7 @@ paths:
                 $ref: '#/components/schemas/Error'
   /formulary/ids:
     get:
+      operationId: getFormularyIds
       summary: Search formularies by issuer, plan, year, or drug keyword
       parameters:
         - name: issuer_id
@@ -407,6 +417,7 @@ paths:
                 $ref: '#/components/schemas/FormularyListResponse'
   /formulary/id/{formulary_id}:
     get:
+      operationId: getFormularyIdFormularyId
       summary: Retrieve formulary metadata and linked plan
       parameters:
         - name: formulary_id
@@ -430,6 +441,7 @@ paths:
                 $ref: '#/components/schemas/Error'
   /formulary/id/{formulary_id}/drugs:
     get:
+      operationId: getFormularyIdFormularyIdDrugs
       summary: List drugs covered by a formulary
       parameters:
         - name: formulary_id
@@ -493,6 +505,7 @@ paths:
                 $ref: '#/components/schemas/Error'
   /formulary/id/{formulary_id}/drugs/{rxnorm_id}:
     get:
+      operationId: getFormularyIdFormularyIdDrugsRxnormId
       summary: Retrieve formulary-specific drug information
       parameters:
         - name: formulary_id
@@ -520,6 +533,7 @@ paths:
                 $ref: '#/components/schemas/Error'
   /formulary/id/{formulary_id}/summary:
     get:
+      operationId: getFormularyIdFormularyIdSummary
       summary: Retrieve aggregate metrics for a formulary
       parameters:
         - name: formulary_id
@@ -542,6 +556,7 @@ paths:
                 $ref: '#/components/schemas/Error'
   /formulary/plan/{plan_id}/drug/{rxnorm_id}:
     get:
+      operationId: getFormularyPlanPlanIdDrugRxnormId
       summary: Determine if a plan formulary covers a specific drug
       parameters:
         - name: plan_id
@@ -574,6 +589,7 @@ paths:
                 $ref: '#/components/schemas/Error'
   /formulary/drugs/{rxnorm_id}:
     get:
+      operationId: getFormularyDrugsRxnormId
       summary: List every formulary covering an RxNorm identifier
       parameters:
         - name: rxnorm_id
@@ -610,6 +626,7 @@ paths:
                 $ref: '#/components/schemas/Error'
   /formulary/statistics:
     get:
+      operationId: getFormularyStatistics
       summary: Retrieve high-level formulary statistics
       parameters:
         - name: year
@@ -635,6 +652,7 @@ paths:
                 $ref: '#/components/schemas/FormularyStatistics'
   /formulary/partd/import/status:
     get:
+      operationId: getFormularyPartdImportStatus
       summary: Retrieve latest Part D import run status
       parameters:
         - name: run_id
@@ -656,6 +674,7 @@ paths:
                 $ref: '#/components/schemas/Error'
   /formulary/partd/snapshots:
     get:
+      operationId: getFormularyPartdSnapshots
       summary: List imported Part D monthly/quarterly snapshots
       parameters:
         - name: run_id
@@ -684,6 +703,7 @@ paths:
                 type: object
   /formulary/partd/pharmacies/{npi}/activity:
     get:
+      operationId: getFormularyPartdPharmaciesNpiActivity
       summary: Return Medicare activity evidence for one pharmacy NPI (including quarterly dispensing fee fields)
       parameters:
         - name: npi
@@ -788,6 +808,7 @@ paths:
                           nullable: true
   /formulary/partd/pharmacies/{npi}/medications/{code_system}/{code}/costs:
     get:
+      operationId: getFormularyPartdPharmaciesNpiMedicationsCodeSystemCodeCosts
       summary: Return medication cost rows for one pharmacy across plans
       parameters:
         - name: npi
@@ -836,6 +857,7 @@ paths:
                 type: object
   /pharmacy-license/import/status:
     get:
+      operationId: getPharmacyLicenseImportStatus
       summary: Retrieve latest pharmacy-license import run status
       parameters:
         - name: run_id
@@ -857,6 +879,7 @@ paths:
                 $ref: '#/components/schemas/Error'
   /pharmacy-license/coverage:
     get:
+      operationId: getPharmacyLicenseCoverage
       summary: Retrieve state coverage for pharmacy-license ingestion support
       responses:
         '200':
@@ -867,6 +890,7 @@ paths:
                 type: object
   /pharmacy-license/pharmacies/{npi}:
     get:
+      operationId: getPharmacyLicensePharmaciesNpi
       summary: Retrieve pharmacy-license profile for an NPI
       parameters:
         - name: npi
@@ -896,6 +920,7 @@ paths:
                 type: object
   /reports/pharmacies/markets:
     get:
+      operationId: getReportsPharmaciesMarkets
       summary: List pharmacy market summaries from NPPES plus Part D plus state-license overlays
       parameters:
         - name: state
@@ -974,6 +999,7 @@ paths:
                 type: object
   /reports/pharmacies/markets/{market_id}:
     get:
+      operationId: getReportsPharmaciesMarketsMarketId
       summary: Get one pharmacy market summary by market_id
       parameters:
         - name: market_id
@@ -999,6 +1025,7 @@ paths:
                 type: object
   /reports/pharmacies/rankings/access:
     get:
+      operationId: getReportsPharmaciesRankingsAccess
       summary: List ranked pharmacy markets by access score
       parameters:
         - name: state
@@ -1067,6 +1094,7 @@ paths:
                 type: object
   /reports/pharmacies/chains/summary:
     get:
+      operationId: getReportsPharmaciesChainsSummary
       summary: Summarize pharmacy chain coverage by name filter
       parameters:
         - name: name_like
@@ -1089,6 +1117,7 @@ paths:
                 type: object
   /reports/pharmacies/state-stats:
     get:
+      operationId: getReportsPharmaciesStateStats
       summary: Summarize pharmacy coverage by state
       responses:
         '200':
@@ -1099,6 +1128,7 @@ paths:
                 type: object
   /reports/pharmacies/{npi}/market-context:
     get:
+      operationId: getReportsPharmaciesNpiMarketContext
       summary: Return market context summary for one pharmacy NPI
       parameters:
         - name: npi
@@ -1124,6 +1154,7 @@ paths:
                 type: object
   /site-intelligence/score:
     get:
+      operationId: getSiteIntelligenceScore
       summary: Score pharmacy site viability by coordinates
       parameters:
         - name: lat
@@ -1156,6 +1187,7 @@ paths:
                 type: object
   /plan/price/{plan_id}:
     get:
+      operationId: getPlanPricePlanId
       summary: Retrieve price rows for a plan
       parameters:
         - name: plan_id
@@ -1195,6 +1227,7 @@ paths:
                 $ref: '#/components/schemas/Error'
   /plan/price/{plan_id}/year:
     get:
+      operationId: getPlanPricePlanIdYear
       summary: Retrieve price rows for a plan and year
       parameters:
         - name: plan_id
@@ -1233,6 +1266,7 @@ paths:
                 $ref: '#/components/schemas/Error'
   /plan/price/bulk:
     post:
+      operationId: postPlanPriceBulk
       summary: Retrieve price rows for multiple plans
       requestBody:
         required: true
@@ -1267,6 +1301,7 @@ paths:
                 $ref: '#/components/schemas/Error'
   /plan/id/{plan_id}:
     get:
+      operationId: getPlanIdPlanId
       summary: Retrieve plan metadata
       parameters:
         - name: plan_id
@@ -1289,6 +1324,7 @@ paths:
                 $ref: '#/components/schemas/Error'
   /plan/id/{plan_id}/{year}:
     get:
+      operationId: getPlanIdPlanIdYear
       summary: Retrieve plan metadata for a specific year
       parameters:
         - name: plan_id
@@ -1316,6 +1352,7 @@ paths:
                 $ref: '#/components/schemas/Error'
   /plan/id/{plan_id}/{year}/{variant}:
     get:
+      operationId: getPlanIdPlanIdYearVariant
       summary: Retrieve a specific plan variant
       parameters:
         - name: plan_id
@@ -1348,6 +1385,7 @@ paths:
                 $ref: '#/components/schemas/Error'
   /import/:
     get:
+      operationId: getImport
       summary: Summarize last import statistics
       responses:
         '200':
@@ -1358,6 +1396,7 @@ paths:
                 $ref: '#/components/schemas/ImporterStats'
   /import/issuer/{issuer_id}:
     get:
+      operationId: getImportIssuerIssuerId
       summary: Fetch import information for a specific issuer
       parameters:
         - name: issuer_id
@@ -1380,6 +1419,7 @@ paths:
                 $ref: '#/components/schemas/Error'
   /issuer/id/{issuer_id}:
     get:
+      operationId: getIssuerIdIssuerId
       summary: Retrieve issuer details and plans
       parameters:
         - name: issuer_id
@@ -1402,6 +1442,7 @@ paths:
                 $ref: '#/components/schemas/Error'
   /issuer/:
     get:
+      operationId: getIssuer
       summary: List issuers across all states
       parameters:
         - name: state
@@ -1472,6 +1513,7 @@ paths:
                 $ref: '#/components/schemas/Error'
   /issuer/state/{state}:
     get:
+      operationId: getIssuerStateState
       summary: List issuers for a specific state
       parameters:
         - name: state
@@ -1549,6 +1591,7 @@ paths:
                 $ref: '#/components/schemas/Error'
   /geo/get:
     get:
+      operationId: getGeoGet
       summary: Echo geo metadata for quick status checks
       parameters:
         - name: zip_code
@@ -1572,6 +1615,7 @@ paths:
                 $ref: '#/components/schemas/GeoPingResponse'
   /geo/zip/{zip_code}:
     get:
+      operationId: getGeoZipZipCode
       summary: Look up ZIP centroid and state
       parameters:
         - name: zip_code
@@ -1601,6 +1645,7 @@ paths:
                 $ref: '#/components/schemas/Error'
   /geo/zip/{zip_code}/places:
     get:
+      operationId: getGeoZipZipCodePlaces
       summary: Return CDC PLACES ZCTA measures for a ZIP code
       parameters:
         - name: zip_code
@@ -1636,6 +1681,7 @@ paths:
                 $ref: '#/components/schemas/Error'
   /geo/city:
     get:
+      operationId: getGeoCity
       summary: List ZIP codes for a given city and optional state
       parameters:
         - name: city
@@ -1666,6 +1712,7 @@ paths:
                 $ref: '#/components/schemas/Error'
   /geo/states:
     get:
+      operationId: getGeoStates
       summary: Aggregated ZIP and city counts per state
       parameters:
         - name: sort
@@ -1709,6 +1756,7 @@ paths:
                 $ref: '#/components/schemas/Error'
   /geo/state/{state}/cities:
     get:
+      operationId: getGeoStateStateCities
       summary: Top cities in a state by population (based on local geo data)
       parameters:
         - name: state
@@ -1741,6 +1789,7 @@ paths:
                 $ref: '#/components/schemas/Error'
   /nucc/:
     get:
+      operationId: getNucc
       summary: NUCC endpoint heartbeat
       responses:
         '200':
@@ -1751,6 +1800,7 @@ paths:
                 type: object
   /nucc/all:
     get:
+      operationId: getNuccAll
       summary: List NUCC taxonomy codes
       parameters:
         - name: q
@@ -1783,6 +1833,7 @@ paths:
                   $ref: '#/components/schemas/NuccTaxonomy'
   /npi/:
     get:
+      operationId: getNpi
       summary: NPI index status metadata
       responses:
         '200':
@@ -1793,6 +1844,7 @@ paths:
                 $ref: '#/components/schemas/NpiIndexStatus'
   /npi/active_pharmacists:
     get:
+      operationId: getNpiActivePharmacists
       summary: Count pharmacists colocated with pharmacies using shared phone numbers
       parameters:
         - name: state
@@ -1816,6 +1868,7 @@ paths:
                 $ref: '#/components/schemas/CountResponse'
   /npi/pharmacists_in_pharmacies:
     get:
+      operationId: getNpiPharmacistsInPharmacies
       summary: Count pharmacists colocated with pharmacies filtered by pharmacy name
       parameters:
         - name: name_like
@@ -1837,6 +1890,7 @@ paths:
                 $ref: '#/components/schemas/CountResponse'
   /npi/pharmacists_per_pharmacy:
     get:
+      operationId: getNpiPharmacistsPerPharmacy
       summary: Histogram of pharmacist counts per pharmacy
       parameters:
         - name: state
@@ -1878,6 +1932,7 @@ paths:
                       $ref: '#/components/schemas/PharmacyPharmacistCount'
   /npi/all:
     get:
+      operationId: getNpiAll
       summary: Search NPI directory
       parameters:
         - name: q
@@ -2045,6 +2100,7 @@ paths:
                   - $ref: '#/components/schemas/NpiSearchResponse'
   /npi/near/:
     get:
+      operationId: getNpiNear
       summary: Find NPIs near a point or ZIP centroid
       parameters:
         - name: q
@@ -2144,6 +2200,7 @@ paths:
                   $ref: '#/components/schemas/NpiNearResult'
   /npi/facilities/providers:
     get:
+      operationId: getNpiFacilitiesProviders
       summary: Find providers connected to a facility enrollment entity
       parameters:
         - name: facility_type
@@ -2198,6 +2255,7 @@ paths:
                 type: object
   /npi/id/{npi}/full_taxonomy:
     get:
+      operationId: getNpiIdNpiFullTaxonomy
       summary: Retrieve taxonomy list for an NPI
       parameters:
         - name: npi
@@ -2216,6 +2274,7 @@ paths:
                   $ref: '#/components/schemas/NpiTaxonomyWithNucc'
   /npi/plans_by_npi/{npi}:
     get:
+      operationId: getNpiPlansByNpiNpi
       summary: Retrieve plan associations for an NPI
       parameters:
         - name: npi
@@ -2232,6 +2291,7 @@ paths:
                 $ref: '#/components/schemas/NpiPlansResponse'
   /npi/id/{npi}:
     get:
+      operationId: getNpiIdNpi
       summary: Retrieve a detailed NPI profile
       parameters:
         - name: npi
@@ -2269,6 +2329,7 @@ paths:
                 $ref: '#/components/schemas/Error'
   /codes/:
     get:
+      operationId: getCodes
       summary: List normalized code catalog entries
       parameters:
         - name: code_system
@@ -2292,7 +2353,7 @@ paths:
           in: query
           schema:
             type: string
-            enum: [code, code_system, display_name, code_checksum]
+            enum: [code, code_system, display_name]
       responses:
         '200':
           description: Paginated code catalog rows
@@ -2302,6 +2363,7 @@ paths:
                 $ref: '#/components/schemas/CodeListResponse'
   /codes/{code_system}/{code}:
     get:
+      operationId: getCodesCodeSystemCode
       summary: Retrieve one code catalog row
       parameters:
         - name: code_system
@@ -2329,6 +2391,7 @@ paths:
                 $ref: '#/components/schemas/Error'
   /codes/{code_system}/{code}/related:
     get:
+      operationId: getCodesCodeSystemCodeRelated
       summary: Retrieve related crosswalk mappings for a code
       parameters:
         - name: code_system
@@ -2350,6 +2413,7 @@ paths:
                 $ref: '#/components/schemas/CodeRelatedResponse'
   /pricing/statistics:
     get:
+      operationId: getPricingStatistics
       summary: Retrieve pricing/procedure coverage statistics
       responses:
         '200':
@@ -2360,85 +2424,8 @@ paths:
                 type: object
   /pricing/providers:
     get:
+      operationId: getPricingProviders
       summary: List pricing providers from CMS claims imports
-      parameters:
-        - name: npi
-          in: query
-          schema:
-            type: integer
-        - name: year
-          in: query
-          schema:
-            type: integer
-        - name: min_claims
-          in: query
-          schema:
-            type: number
-        - name: min_total_cost
-          in: query
-          schema:
-            type: number
-        - name: q
-          in: query
-          schema:
-            type: string
-        - name: state
-          in: query
-          schema:
-            type: string
-        - name: city
-          in: query
-          schema:
-            type: string
-        - name: specialty
-          in: query
-          schema:
-            type: string
-        - name: benchmark_mode
-          in: query
-          schema:
-            type: string
-            enum: [national, state, zip]
-          description: |
-            Preferred benchmark perspective for quality relevance ordering.
-            If omitted, API uses the most local available mode for the selected year.
-        - name: include_legacy_fields
-          in: query
-          schema:
-            type: boolean
-        - name: order
-          in: query
-          schema:
-            type: string
-            enum: [asc, desc]
-        - name: order_by
-          in: query
-          schema:
-            type: string
-            enum:
-              [
-                npi,
-                provider_name,
-                total_services,
-                total_allowed_amount,
-                total_beneficiaries,
-                total_claims,
-                total_30day_fills,
-                total_day_supply,
-                total_drug_cost,
-                total_benes,
-                tier_relevance,
-              ]
-      responses:
-        '200':
-          description: Paginated pricing providers
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/PricingProviderListResponse'
-  /pricing/physicians:
-    get:
-      summary: Alias for /pricing/providers
       parameters:
         - name: npi
           in: query
@@ -2516,6 +2503,7 @@ paths:
                 $ref: '#/components/schemas/PricingProviderListResponse'
   /pricing/providers/{npi}:
     get:
+      operationId: getPricingProvidersNpi
       summary: Retrieve one provider row and summary counters
       parameters:
         - name: npi
@@ -2544,105 +2532,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-  /pricing/physicians/{npi}:
-    get:
-      summary: Alias for /pricing/providers/{npi}
-      parameters:
-        - name: npi
-          in: path
-          required: true
-          schema:
-            type: integer
-        - name: year
-          in: query
-          schema:
-            type: integer
-        - name: include_legacy_fields
-          in: query
-          schema:
-            type: boolean
-      responses:
-        '200':
-          description: Provider detail
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/PricingProviderRecord'
   /pricing/providers/{npi}/score:
     get:
+      operationId: getPricingProvidersNpiScore
       summary: Retrieve Provider Quality V2 score profile
-      parameters:
-        - name: npi
-          in: path
-          required: true
-          schema:
-            type: integer
-        - name: year
-          in: query
-          schema:
-            type: integer
-        - name: benchmark_mode
-          in: query
-          schema:
-            type: string
-            enum: [national, state, zip]
-          description: |
-            Benchmark perspective to read for this provider score. If omitted,
-            API auto-selects the most local available mode for the selected year.
-        - name: specialty
-          in: query
-          schema:
-            type: string
-          description: Optional specialty cohort override key.
-        - name: taxonomy_code
-          in: query
-          schema:
-            type: string
-          description: Optional taxonomy cohort override code.
-        - name: procedure_codes
-          in: query
-          schema:
-            type: string
-          description: Comma-separated procedure codes used for cohort override matching.
-        - name: procedure_code_system
-          in: query
-          schema:
-            type: string
-            enum: [HP_PROCEDURE_CODE, CPT, HCPCS]
-            default: HP_PROCEDURE_CODE
-          description: Procedure code system for procedure_codes override resolution.
-        - name: procedure_match_threshold
-          in: query
-          schema:
-            type: number
-            minimum: 0
-            maximum: 1
-            default: 0.3
-          description: Minimum overlap score for procedure bucket matching during cohort override.
-        - name: variants_scope
-          in: query
-          schema:
-            type: string
-            enum: [provider]
-          description: |
-            `provider` returns provider-scoped variant score cards in `variants_by_benchmark_mode`,
-            filtered to the doctor's taxonomy/procedure cohort context for each benchmark mode.
-        - name: variants
-          in: query
-          schema:
-            type: string
-          deprecated: true
-          description: Deprecated. Use `variants_scope=provider`.
-      responses:
-        '200':
-          description: Provider score payload
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/PricingProviderScoreResponse'
-  /pricing/physicians/{npi}/score:
-    get:
-      summary: Alias for /pricing/providers/{npi}/score
       parameters:
         - name: npi
           in: path
@@ -2714,168 +2607,8 @@ paths:
                 $ref: '#/components/schemas/PricingProviderScoreResponse'
   /pricing/providers/{npi}/procedures:
     get:
+      operationId: getPricingProvidersNpiProcedures
       summary: List pricing procedures for a provider
-      parameters:
-        - name: npi
-          in: path
-          required: true
-          schema:
-            type: integer
-        - name: year
-          in: query
-          schema:
-            type: integer
-        - name: min_claims
-          in: query
-          schema:
-            type: number
-        - name: min_total_cost
-          in: query
-          schema:
-            type: number
-        - name: q
-          in: query
-          schema:
-            type: string
-        - name: service_name
-          in: query
-          schema:
-            type: string
-        - name: reported_code
-          in: query
-          schema:
-            type: string
-        - name: generic_name
-          in: query
-          schema:
-            type: string
-        - name: brand_name
-          in: query
-          schema:
-            type: string
-        - name: code
-          in: query
-          schema:
-            type: string
-        - name: code_system
-          in: query
-          schema:
-            type: string
-        - name: plan_id
-          in: query
-          schema:
-            type: string
-        - name: plan_external_id
-          in: query
-          schema:
-            type: string
-        - name: plan_market_type
-          in: query
-          schema:
-            type: string
-        - name: source_key
-          in: query
-          schema:
-            type: string
-        - name: snapshot_id
-          in: query
-          schema:
-            type: string
-        - name: mode
-          in: query
-          schema:
-            type: string
-        - name: service_code
-          in: query
-          schema:
-            type: string
-        - name: place_of_service
-          in: query
-          schema:
-            type: string
-        - name: pos
-          in: query
-          schema:
-            type: string
-        - name: modifier
-          in: query
-          schema:
-            type: string
-        - name: modifiers
-          in: query
-          schema:
-            type: string
-        - name: billing_code_modifier
-          in: query
-          schema:
-            type: string
-        - name: rate
-          in: query
-          schema:
-            type: number
-        - name: negotiated_rate
-          in: query
-          schema:
-            type: number
-        - name: rate_tolerance
-          in: query
-          schema:
-            type: number
-        - name: negotiated_rate_tolerance
-          in: query
-          schema:
-            type: number
-        - name: include_sources
-          in: query
-          schema:
-            type: boolean
-        - name: include_details
-          in: query
-          schema:
-            type: boolean
-        - name: include_debug
-          in: query
-          schema:
-            type: boolean
-        - name: include_legacy_fields
-          in: query
-          schema:
-            type: boolean
-        - name: order
-          in: query
-          schema:
-            type: string
-            enum: [asc, desc]
-        - name: order_by
-          in: query
-          schema:
-            type: string
-            enum:
-              [
-                procedure_code,
-                service_description,
-                reported_code,
-                total_services,
-                total_allowed_amount,
-                total_beneficiaries,
-                generic_name,
-                brand_name,
-                total_claims,
-                total_30day_fills,
-                total_day_supply,
-                total_drug_cost,
-                total_benes,
-              ]
-      responses:
-        '200':
-          description: Paginated procedures for provider
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/PricingProviderProcedureListResponse'
-  /pricing/physicians/{npi}/services:
-    get:
-      summary: Alias for /pricing/providers/{npi}/procedures
       parameters:
         - name: npi
           in: path
@@ -3036,6 +2769,7 @@ paths:
                 $ref: '#/components/schemas/PricingProviderProcedureListResponse'
   /pricing/providers/{npi}/procedures/{procedure_code}:
     get:
+      operationId: getPricingProvidersNpiProceduresProcedureCode
       summary: Retrieve one provider procedure detail
       parameters:
         - name: npi
@@ -3061,34 +2795,9 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-  /pricing/physicians/{npi}/services/{code_system}/{code}:
-    get:
-      summary: Provider service detail by explicit code system
-      parameters:
-        - name: npi
-          in: path
-          required: true
-          schema:
-            type: integer
-        - name: code_system
-          in: path
-          required: true
-          schema:
-            type: string
-        - name: code
-          in: path
-          required: true
-          schema:
-            type: string
-      responses:
-        '200':
-          description: Provider procedure detail
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/PricingProviderProcedureDetail'
   /pricing/providers/{npi}/procedures/{procedure_code}/estimated-cost-level:
     get:
+      operationId: getPricingProvidersNpiProceduresProcedureCodeEstimatedCostLevel
       summary: Estimated Cost Level for provider+procedure using internal procedure code
       parameters:
         - name: npi
@@ -3116,39 +2825,8 @@ paths:
                 $ref: '#/components/schemas/Error'
   /pricing/providers/{npi}/procedures/{code_system}/{code}/estimated-cost-level:
     get:
+      operationId: getPricingProvidersNpiProceduresCodeSystemCodeEstimatedCostLevel
       summary: Estimated Cost Level for provider+procedure using explicit code system
-      parameters:
-        - name: npi
-          in: path
-          required: true
-          schema:
-            type: integer
-        - name: code_system
-          in: path
-          required: true
-          schema:
-            type: string
-        - name: code
-          in: path
-          required: true
-          schema:
-            type: string
-      responses:
-        '200':
-          description: Procedure Estimated Cost Level payload
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/PricingProviderProcedureCostLevelResponse'
-        '404':
-          description: Provider procedure profile or peer group not found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-  /pricing/physicians/{npi}/services/{code_system}/{code}/estimated-cost-level:
-    get:
-      summary: Alias for /pricing/providers/{npi}/procedures/{code_system}/{code}/estimated-cost-level
       parameters:
         - name: npi
           in: path
@@ -3180,6 +2858,7 @@ paths:
                 $ref: '#/components/schemas/Error'
   /pricing/providers/{npi}/procedures/{procedure_code}/locations:
     get:
+      operationId: getPricingProvidersNpiProceduresProcedureCodeLocations
       summary: List provider locations for a procedure
       parameters:
         - name: npi
@@ -3199,34 +2878,9 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/PricingProviderProcedureLocationListResponse'
-  /pricing/physicians/{npi}/services/{code_system}/{code}/locations:
-    get:
-      summary: Alias for provider procedure locations using explicit code system
-      parameters:
-        - name: npi
-          in: path
-          required: true
-          schema:
-            type: integer
-        - name: code_system
-          in: path
-          required: true
-          schema:
-            type: string
-        - name: code
-          in: path
-          required: true
-          schema:
-            type: string
-      responses:
-        '200':
-          description: Paginated provider procedure locations
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/PricingProviderProcedureLocationListResponse'
   /pricing/procedures/{code_system}/{code}/providers:
     get:
+      operationId: getPricingProceduresCodeSystemCodeProviders
       summary: List providers matching a code (with optional code expansion)
       parameters:
         - name: code_system
@@ -3303,6 +2957,7 @@ paths:
                 $ref: '#/components/schemas/PricingProcedureProviderListResponse'
   /pricing/procedures/{code_system}/{code}/benchmarks:
     get:
+      operationId: getPricingProceduresCodeSystemCodeBenchmarks
       summary: Aggregate benchmark metrics for a requested code
       parameters:
         - name: code_system
@@ -3340,6 +2995,7 @@ paths:
                 $ref: '#/components/schemas/PricingBenchmarkResponse'
   /pricing/procedures/{code_system}/{code}/geo-benchmarks:
     get:
+      operationId: getPricingProceduresCodeSystemCodeGeoBenchmarks
       summary: National/state weighted geo benchmarks for a requested procedure code
       parameters:
         - name: code_system
@@ -3369,39 +3025,8 @@ paths:
                 $ref: '#/components/schemas/PricingProcedureGeoBenchmarkResponse'
   /pricing/procedures/autocomplete:
     get:
+      operationId: getPricingProceduresAutocomplete
       summary: Autocomplete procedure/service terms across CPT/HCPCS/internal codes
-      parameters:
-        - name: q
-          in: query
-          required: true
-          schema:
-            type: string
-        - name: year
-          in: query
-          schema:
-            type: integer
-        - name: code_system
-          in: query
-          schema:
-            type: string
-        - name: dedupe_terms
-          in: query
-          schema:
-            type: boolean
-        - name: max_codes_per_term
-          in: query
-          schema:
-            type: integer
-      responses:
-        '200':
-          description: Procedure autocomplete results
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/PricingProcedureAutocompleteResponse'
-  /pricing/services/autocomplete:
-    get:
-      summary: Alias for /pricing/procedures/autocomplete
       parameters:
         - name: q
           in: query
@@ -3433,37 +3058,8 @@ paths:
                 $ref: '#/components/schemas/PricingProcedureAutocompleteResponse'
   /pricing/prescriptions/autocomplete:
     get:
+      operationId: getPricingPrescriptionsAutocomplete
       summary: Autocomplete prescription/drug terms
-      parameters:
-        - name: q
-          in: query
-          required: true
-          schema:
-            type: string
-        - name: year
-          in: query
-          schema:
-            type: integer
-        - name: order
-          in: query
-          schema:
-            type: string
-            enum: [asc, desc]
-        - name: order_by
-          in: query
-          schema:
-            type: string
-            enum: [rx_code, rx_name, generic_name, brand_name, total_claims, total_drug_cost, total_benes]
-      responses:
-        '200':
-          description: Prescription autocomplete results
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/PricingPrescriptionAutocompleteResponse'
-  /pricing/drugs/autocomplete:
-    get:
-      summary: Alias for /pricing/prescriptions/autocomplete
       parameters:
         - name: q
           in: query
@@ -3493,6 +3089,7 @@ paths:
                 $ref: '#/components/schemas/PricingPrescriptionAutocompleteResponse'
   /pricing/providers/by-procedure:
     get:
+      operationId: getPricingProvidersByProcedure
       summary: Find providers by procedure/service text or code
       parameters:
         - name: year
@@ -3705,596 +3302,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/PricingProcedureProviderListResponse'
-  /pricing/providers/by-service:
-    get:
-      summary: Alias for /pricing/providers/by-procedure
-      parameters:
-        - name: year
-          in: query
-          schema:
-            type: integer
-        - name: min_claims
-          in: query
-          schema:
-            type: number
-        - name: min_total_cost
-          in: query
-          schema:
-            type: number
-        - name: state
-          in: query
-          schema:
-            type: string
-        - name: city
-          in: query
-          schema:
-            type: string
-        - name: zip5
-          in: query
-          schema:
-            type: string
-        - name: zip_radius_miles
-          in: query
-          schema:
-            type: number
-            minimum: 0
-          description: |
-            Optional ZIP-based search radius (miles). Applies when `zip5` is provided.
-        - name: specialty
-          in: query
-          schema:
-            type: string
-        - name: q
-          in: query
-          schema:
-            type: string
-        - name: code
-          in: query
-          schema:
-            type: string
-        - name: code_system
-          in: query
-          schema:
-            type: string
-        - name: plan_id
-          in: query
-          schema:
-            type: string
-        - name: plan_external_id
-          in: query
-          schema:
-            type: string
-        - name: plan_market_type
-          in: query
-          schema:
-            type: string
-        - name: source_key
-          in: query
-          schema:
-            type: string
-        - name: snapshot_id
-          in: query
-          schema:
-            type: string
-        - name: mode
-          in: query
-          schema:
-            type: string
-        - name: taxonomy_code
-          in: query
-          schema:
-            type: string
-        - name: taxonomy_classification
-          in: query
-          schema:
-            type: string
-        - name: taxonomy_specialization
-          in: query
-          schema:
-            type: string
-        - name: taxonomy_section
-          in: query
-          schema:
-            type: string
-        - name: npi
-          in: query
-          schema:
-            type: integer
-        - name: lat
-          in: query
-          schema:
-            type: number
-        - name: long
-          in: query
-          schema:
-            type: number
-        - name: radius
-          in: query
-          schema:
-            type: number
-        - name: radius_miles
-          in: query
-          schema:
-            type: number
-        - name: service_code
-          in: query
-          schema:
-            type: string
-        - name: place_of_service
-          in: query
-          schema:
-            type: string
-        - name: pos
-          in: query
-          schema:
-            type: string
-        - name: modifier
-          in: query
-          schema:
-            type: string
-        - name: modifiers
-          in: query
-          schema:
-            type: string
-        - name: billing_code_modifier
-          in: query
-          schema:
-            type: string
-        - name: rate
-          in: query
-          schema:
-            type: number
-        - name: negotiated_rate
-          in: query
-          schema:
-            type: number
-        - name: rate_tolerance
-          in: query
-          schema:
-            type: number
-        - name: negotiated_rate_tolerance
-          in: query
-          schema:
-            type: number
-        - name: include_providers
-          in: query
-          schema:
-            type: boolean
-        - name: include_code_details
-          in: query
-          schema:
-            type: boolean
-        - name: include_sources
-          in: query
-          schema:
-            type: boolean
-        - name: include_details
-          in: query
-          schema:
-            type: boolean
-        - name: include_debug
-          in: query
-          schema:
-            type: boolean
-        - name: include_legacy_fields
-          in: query
-          schema:
-            type: boolean
-        - name: order
-          in: query
-          schema:
-            type: string
-            enum: [asc, desc]
-        - name: order_by
-          in: query
-          schema:
-            type: string
-            enum:
-              [
-                npi,
-                provider_name,
-                total_services,
-                total_submitted_charges,
-                total_allowed_amount,
-                total_beneficiaries,
-                matched_service_codes,
-                cost_index,
-              ]
-      responses:
-        '200':
-          description: Paginated provider matches by procedure
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/PricingProcedureProviderListResponse'
-  /pricing/physicians/by-service:
-    get:
-      summary: Alias for /pricing/providers/by-procedure
-      parameters:
-        - name: year
-          in: query
-          schema:
-            type: integer
-        - name: min_claims
-          in: query
-          schema:
-            type: number
-        - name: min_total_cost
-          in: query
-          schema:
-            type: number
-        - name: state
-          in: query
-          schema:
-            type: string
-        - name: city
-          in: query
-          schema:
-            type: string
-        - name: zip5
-          in: query
-          schema:
-            type: string
-        - name: zip_radius_miles
-          in: query
-          schema:
-            type: number
-            minimum: 0
-          description: |
-            Optional ZIP-based search radius (miles). Applies when `zip5` is provided.
-        - name: specialty
-          in: query
-          schema:
-            type: string
-        - name: q
-          in: query
-          schema:
-            type: string
-        - name: code
-          in: query
-          schema:
-            type: string
-        - name: code_system
-          in: query
-          schema:
-            type: string
-        - name: plan_id
-          in: query
-          schema:
-            type: string
-        - name: plan_external_id
-          in: query
-          schema:
-            type: string
-        - name: plan_market_type
-          in: query
-          schema:
-            type: string
-        - name: source_key
-          in: query
-          schema:
-            type: string
-        - name: snapshot_id
-          in: query
-          schema:
-            type: string
-        - name: mode
-          in: query
-          schema:
-            type: string
-        - name: taxonomy_code
-          in: query
-          schema:
-            type: string
-        - name: taxonomy_classification
-          in: query
-          schema:
-            type: string
-        - name: taxonomy_specialization
-          in: query
-          schema:
-            type: string
-        - name: taxonomy_section
-          in: query
-          schema:
-            type: string
-        - name: npi
-          in: query
-          schema:
-            type: integer
-        - name: lat
-          in: query
-          schema:
-            type: number
-        - name: long
-          in: query
-          schema:
-            type: number
-        - name: radius
-          in: query
-          schema:
-            type: number
-        - name: radius_miles
-          in: query
-          schema:
-            type: number
-        - name: service_code
-          in: query
-          schema:
-            type: string
-        - name: place_of_service
-          in: query
-          schema:
-            type: string
-        - name: pos
-          in: query
-          schema:
-            type: string
-        - name: modifier
-          in: query
-          schema:
-            type: string
-        - name: modifiers
-          in: query
-          schema:
-            type: string
-        - name: billing_code_modifier
-          in: query
-          schema:
-            type: string
-        - name: rate
-          in: query
-          schema:
-            type: number
-        - name: negotiated_rate
-          in: query
-          schema:
-            type: number
-        - name: rate_tolerance
-          in: query
-          schema:
-            type: number
-        - name: negotiated_rate_tolerance
-          in: query
-          schema:
-            type: number
-        - name: include_providers
-          in: query
-          schema:
-            type: boolean
-        - name: include_code_details
-          in: query
-          schema:
-            type: boolean
-        - name: include_sources
-          in: query
-          schema:
-            type: boolean
-        - name: include_details
-          in: query
-          schema:
-            type: boolean
-        - name: include_debug
-          in: query
-          schema:
-            type: boolean
-        - name: include_legacy_fields
-          in: query
-          schema:
-            type: boolean
-        - name: order
-          in: query
-          schema:
-            type: string
-            enum: [asc, desc]
-        - name: order_by
-          in: query
-          schema:
-            type: string
-            enum:
-              [
-                npi,
-                provider_name,
-                total_services,
-                total_submitted_charges,
-                total_allowed_amount,
-                total_beneficiaries,
-                matched_service_codes,
-                cost_index,
-              ]
-      responses:
-        '200':
-          description: Paginated provider matches by procedure
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/PricingProcedureProviderListResponse'
   /pricing/providers/by-prescription:
     get:
+      operationId: getPricingProvidersByPrescription
       summary: Find providers by prescription/drug text or code
-      parameters:
-        - name: year
-          in: query
-          schema:
-            type: integer
-        - name: min_claims
-          in: query
-          schema:
-            type: number
-        - name: min_total_cost
-          in: query
-          schema:
-            type: number
-        - name: state
-          in: query
-          schema:
-            type: string
-        - name: city
-          in: query
-          schema:
-            type: string
-        - name: zip5
-          in: query
-          schema:
-            type: string
-        - name: specialty
-          in: query
-          schema:
-            type: string
-        - name: q
-          in: query
-          schema:
-            type: string
-        - name: code
-          in: query
-          schema:
-            type: string
-        - name: rx_code_system
-          in: query
-          schema:
-            type: string
-        - name: order
-          in: query
-          schema:
-            type: string
-            enum: [asc, desc]
-        - name: order_by
-          in: query
-          schema:
-            type: string
-            enum: [npi, provider_name, total_claims, total_drug_cost, total_benes, matched_prescription_codes]
-      responses:
-        '200':
-          description: Paginated provider matches by prescription
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/PricingPrescriptionProviderListResponse'
-  /pricing/providers/by-drug:
-    get:
-      summary: Alias for /pricing/providers/by-prescription
-      parameters:
-        - name: year
-          in: query
-          schema:
-            type: integer
-        - name: min_claims
-          in: query
-          schema:
-            type: number
-        - name: min_total_cost
-          in: query
-          schema:
-            type: number
-        - name: state
-          in: query
-          schema:
-            type: string
-        - name: city
-          in: query
-          schema:
-            type: string
-        - name: zip5
-          in: query
-          schema:
-            type: string
-        - name: specialty
-          in: query
-          schema:
-            type: string
-        - name: q
-          in: query
-          schema:
-            type: string
-        - name: code
-          in: query
-          schema:
-            type: string
-        - name: rx_code_system
-          in: query
-          schema:
-            type: string
-        - name: order
-          in: query
-          schema:
-            type: string
-            enum: [asc, desc]
-        - name: order_by
-          in: query
-          schema:
-            type: string
-            enum: [npi, provider_name, total_claims, total_drug_cost, total_benes, matched_prescription_codes]
-      responses:
-        '200':
-          description: Paginated provider matches by prescription
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/PricingPrescriptionProviderListResponse'
-  /pricing/physicians/by-prescription:
-    get:
-      summary: Alias for /pricing/providers/by-prescription
-      parameters:
-        - name: year
-          in: query
-          schema:
-            type: integer
-        - name: min_claims
-          in: query
-          schema:
-            type: number
-        - name: min_total_cost
-          in: query
-          schema:
-            type: number
-        - name: state
-          in: query
-          schema:
-            type: string
-        - name: city
-          in: query
-          schema:
-            type: string
-        - name: zip5
-          in: query
-          schema:
-            type: string
-        - name: specialty
-          in: query
-          schema:
-            type: string
-        - name: q
-          in: query
-          schema:
-            type: string
-        - name: code
-          in: query
-          schema:
-            type: string
-        - name: rx_code_system
-          in: query
-          schema:
-            type: string
-        - name: order
-          in: query
-          schema:
-            type: string
-            enum: [asc, desc]
-        - name: order_by
-          in: query
-          schema:
-            type: string
-            enum: [npi, provider_name, total_claims, total_drug_cost, total_benes, matched_prescription_codes]
-      responses:
-        '200':
-          description: Paginated provider matches by prescription
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/PricingPrescriptionProviderListResponse'
-  /pricing/physicians/by-drug:
-    get:
-      summary: Alias for /pricing/providers/by-prescription
       parameters:
         - name: year
           in: query
@@ -4355,69 +3366,8 @@ paths:
                 $ref: '#/components/schemas/PricingPrescriptionProviderListResponse'
   /pricing/providers/{npi}/prescriptions:
     get:
+      operationId: getPricingProvidersNpiPrescriptions
       summary: List prescription metrics for a provider
-      parameters:
-        - name: npi
-          in: path
-          required: true
-          schema:
-            type: integer
-        - name: year
-          in: query
-          schema:
-            type: integer
-        - name: min_claims
-          in: query
-          schema:
-            type: number
-        - name: min_total_cost
-          in: query
-          schema:
-            type: number
-        - name: q
-          in: query
-          schema:
-            type: string
-        - name: rx_name
-          in: query
-          schema:
-            type: string
-        - name: generic_name
-          in: query
-          schema:
-            type: string
-        - name: brand_name
-          in: query
-          schema:
-            type: string
-        - name: code
-          in: query
-          schema:
-            type: string
-        - name: rx_code_system
-          in: query
-          schema:
-            type: string
-        - name: order
-          in: query
-          schema:
-            type: string
-            enum: [asc, desc]
-        - name: order_by
-          in: query
-          schema:
-            type: string
-            enum: [rx_code, rx_name, generic_name, brand_name, total_claims, total_drug_cost, total_benes]
-      responses:
-        '200':
-          description: Paginated provider prescriptions
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/PricingProviderPrescriptionListResponse'
-  /pricing/physicians/{npi}/prescriptions:
-    get:
-      summary: Alias for /pricing/providers/{npi}/prescriptions
       parameters:
         - name: npi
           in: path
@@ -4479,33 +3429,8 @@ paths:
                 $ref: '#/components/schemas/PricingProviderPrescriptionListResponse'
   /pricing/providers/{npi}/prescriptions/{rx_code_system}/{rx_code}:
     get:
+      operationId: getPricingProvidersNpiPrescriptionsRxCodeSystemRxCode
       summary: Retrieve one provider prescription detail
-      parameters:
-        - name: npi
-          in: path
-          required: true
-          schema:
-            type: integer
-        - name: rx_code_system
-          in: path
-          required: true
-          schema:
-            type: string
-        - name: rx_code
-          in: path
-          required: true
-          schema:
-            type: string
-      responses:
-        '200':
-          description: Provider prescription detail
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/PricingProviderPrescriptionRecord'
-  /pricing/physicians/{npi}/prescriptions/{rx_code_system}/{rx_code}:
-    get:
-      summary: Alias for /pricing/providers/{npi}/prescriptions/{rx_code_system}/{rx_code}
       parameters:
         - name: npi
           in: path
@@ -4531,6 +3456,7 @@ paths:
                 $ref: '#/components/schemas/PricingProviderPrescriptionRecord'
   /pricing/prescriptions/{rx_code_system}/{rx_code}/providers:
     get:
+      operationId: getPricingPrescriptionsRxCodeSystemRxCodeProviders
       summary: List providers that prescribe a given code
       parameters:
         - name: rx_code_system
@@ -4590,6 +3516,7 @@ paths:
                 $ref: '#/components/schemas/PricingPrescriptionProviderListResponse'
   /pricing/prescriptions/{rx_code_system}/{rx_code}/benchmarks:
     get:
+      operationId: getPricingPrescriptionsRxCodeSystemRxCodeBenchmarks
       summary: Aggregate benchmark metrics for a requested prescription code
       parameters:
         - name: rx_code_system
@@ -4623,6 +3550,7 @@ paths:
                 $ref: '#/components/schemas/PricingPrescriptionBenchmarkResponse'
   /clinical/concepts:
     get:
+      operationId: getClinicalConcepts
       summary: Search clinical terminology concepts
       parameters:
         - name: system
@@ -4650,6 +3578,7 @@ paths:
                 $ref: '#/components/schemas/ClinicalConceptListResponse'
   /clinical/concepts/{system}/{code}:
     get:
+      operationId: getClinicalConceptsSystemCode
       summary: Get clinical concept with synonyms and relationships
       parameters:
         - name: system
@@ -4677,6 +3606,7 @@ paths:
                 $ref: '#/components/schemas/Error'
   /clinical/relationships:
     get:
+      operationId: getClinicalRelationships
       summary: Search clinical terminology relationships
       parameters:
         - name: from_system
@@ -4708,6 +3638,7 @@ paths:
                 $ref: '#/components/schemas/ClinicalRelationshipListResponse'
   /clinical/conditions:
     get:
+      operationId: getClinicalConditions
       summary: List condition concepts
       responses:
         '200':
@@ -4718,6 +3649,7 @@ paths:
                 $ref: '#/components/schemas/ClinicalConceptListResponse'
   /clinical/conditions/{system}/{code}:
     get:
+      operationId: getClinicalConditionsSystemCode
       summary: Get condition concept
       parameters:
         - name: system
@@ -4745,6 +3677,7 @@ paths:
                 $ref: '#/components/schemas/Error'
   /clinical/treatments:
     get:
+      operationId: getClinicalTreatments
       summary: List treatment concepts
       responses:
         '200':
@@ -4755,6 +3688,7 @@ paths:
                 $ref: '#/components/schemas/ClinicalConceptListResponse'
   /clinical/treatments/{system}/{code}:
     get:
+      operationId: getClinicalTreatmentsSystemCode
       summary: Get treatment concept
       parameters:
         - name: system
@@ -4782,6 +3716,7 @@ paths:
                 $ref: '#/components/schemas/Error'
   /clinical/clinical-areas:
     get:
+      operationId: getClinicalClinicalAreas
       summary: List clinical areas
       parameters:
         - name: q
@@ -4797,6 +3732,7 @@ paths:
                 $ref: '#/components/schemas/ClinicalAreaListResponse'
   /clinical/clinical-areas/{clinical_area_id}:
     get:
+      operationId: getClinicalClinicalAreasClinicalAreaId
       summary: Get clinical area metadata and mapping counts
       parameters:
         - name: clinical_area_id
@@ -4819,6 +3755,7 @@ paths:
                 $ref: '#/components/schemas/Error'
   /clinical/clinical-areas/{clinical_area_id}/conditions:
     get:
+      operationId: getClinicalClinicalAreasClinicalAreaIdConditions
       summary: List condition concepts assigned to a clinical area
       parameters:
         - name: clinical_area_id
@@ -4853,6 +3790,7 @@ paths:
                 $ref: '#/components/schemas/Error'
   /clinical/clinical-areas/{clinical_area_id}/treatments:
     get:
+      operationId: getClinicalClinicalAreasClinicalAreaIdTreatments
       summary: List treatment or drug concepts assigned to a clinical area
       parameters:
         - name: clinical_area_id
@@ -4887,6 +3825,7 @@ paths:
                 $ref: '#/components/schemas/Error'
   /clinical/crosswalk:
     get:
+      operationId: getClinicalCrosswalk
       summary: Search clinical code crosswalks
       parameters:
         - name: from_system
@@ -5165,8 +4104,6 @@ components:
           type: string
         code:
           type: string
-        code_checksum:
-          type: integer
         display_name:
           type: string
         short_description:
@@ -5188,14 +4125,10 @@ components:
           type: string
         from_code:
           type: string
-        from_checksum:
-          type: integer
         to_system:
           type: string
         to_code:
           type: string
-        to_checksum:
-          type: integer
         match_type:
           type: string
         confidence:
