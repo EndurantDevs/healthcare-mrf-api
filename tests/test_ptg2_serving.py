@@ -273,6 +273,22 @@ async def test_ptg2_code_context_bridges_cpt_and_hcpcs_same_code():
     assert context["input_code"] == {"code_system": "CPT", "code": "70551"}
     assert {"code_system": "CPT", "code": "70551"} in context["resolved_codes"]
     assert {"code_system": "HCPCS", "code": "70551"} in context["resolved_codes"]
+    assert {"code_system": "CDT", "code": "70551"} not in context["resolved_codes"]
+    assert context["internal_codes"] == []
+
+
+@pytest.mark.asyncio
+async def test_ptg2_code_context_bridges_cdt_and_hcpcs_dental_code():
+    context = await ptg2_serving._resolve_ptg2_code_search_context(
+        FakeSession([FakeResult(rows=[])]),
+        code="D0120",
+        code_system="CDT",
+    )
+
+    assert context["input_code"] == {"code_system": "CDT", "code": "D0120"}
+    assert {"code_system": "CDT", "code": "D0120"} in context["resolved_codes"]
+    assert {"code_system": "HCPCS", "code": "D0120"} in context["resolved_codes"]
+    assert {"code_system": "CPT", "code": "D0120"} not in context["resolved_codes"]
     assert context["internal_codes"] == []
 
 
@@ -356,6 +372,32 @@ async def test_ptg2_serving_table_uses_equivalent_cpt_hcpcs_filter_for_compact_s
     assert "r.reported_code_system IN (:reported_code_system_0_0, :reported_code_system_0_1)" in sql
     assert set(params[key] for key in ("reported_code_system_0_0", "reported_code_system_0_1")) == {"CPT", "HCPCS"}
     assert params["reported_code_0"] == "70551"
+
+
+@pytest.mark.asyncio
+async def test_ptg2_serving_table_uses_equivalent_cdt_hcpcs_filter_for_compact_search():
+    session = FakeSession(
+        [
+            FakeResult(rows=[]),
+            "mrf.ptg2_serving_rate_compact_token",
+            FakeResult(rows=[]),
+        ]
+    )
+
+    await ptg2_serving.search_ptg2_serving_table(
+        session,
+        "snap-token",
+        {"plan_id": "010854205", "code": "D0120", "code_system": "CDT"},
+        FakePagination(),
+        serving_tables=_compact_tables(),
+    )
+
+    sql = str(session.calls[2][0][0])
+    params = session.calls[2][0][1]
+    assert "r.reported_code = :reported_code_0" in sql
+    assert "r.reported_code_system IN (:reported_code_system_0_0, :reported_code_system_0_1)" in sql
+    assert set(params[key] for key in ("reported_code_system_0_0", "reported_code_system_0_1")) == {"CDT", "HCPCS"}
+    assert params["reported_code_0"] == "D0120"
 
 
 def test_price_summary_groups_component_rates_and_counts_raw_prices():
@@ -1230,8 +1272,10 @@ async def test_compact_serving_include_providers_with_geo_uses_npi_scoped_locati
     sql = str(session.calls[0][0][0])
     params = session.calls[0][0][1]
     assert "WITH rate_candidates AS MATERIALIZED" in sql
+    assert "filtered_locations AS MATERIALIZED" in sql
     assert "JOIN LATERAL (" in sql
-    assert "JOIN mrf.ptg2_provider_group_location_token loc" in sql
+    assert "FROM mrf.ptg2_provider_group_location_token loc" in sql
+    assert "JOIN filtered_locations loc" in sql
     assert "loc.npi" in sql
     assert "AND EXISTS (" in sql
     assert "OFFSET 0" in sql
