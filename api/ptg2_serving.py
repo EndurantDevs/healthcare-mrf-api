@@ -56,7 +56,6 @@ from api.ptg2_snapshot import (
     snapshot_artifact_uri,
 )
 from api.ptg2_response import (
-    CODE_SYSTEM_ALIASES,
     PTG2_ITEM_DIAGNOSTIC_FIELDS,
     PTG2_ITEM_SOURCE_FIELDS,
     PTG2_QUERY_DIAGNOSTIC_FIELDS,
@@ -126,7 +125,7 @@ def normalize_ptg2_mode(value: str | None) -> str:
 def _inferred_provider_taxonomy_rule(args: dict[str, Any]) -> InferredProviderTaxonomyRule | None:
     requested_system = _normalize_code_system(args.get("code_system"))
     requested_code = _normalize_code(args.get("code"))
-    if requested_system != "CPT" or not requested_code or not requested_code.isdigit():
+    if requested_system not in EXTERNAL_PROCEDURE_CODE_SYSTEMS or not requested_code or not requested_code.isdigit():
         return None
     code_value = int(requested_code)
     return next((rule for rule in INFERRED_PROVIDER_TAXONOMY_RULES if rule.matches(code_value)), None)
@@ -677,7 +676,29 @@ async def _search_compact_serving_table(
                 ARRAY[]::varchar[] AS specialties,
             """
             if taxonomy_filters:
-                if inferred_taxonomy_filter_only:
+                if taxonomy_code and not (
+                    taxonomy_classification
+                    or taxonomy_specialization
+                    or taxonomy_section
+                    or specialty_text
+                    or inferred_taxonomy_filter_only
+                ):
+                    location_taxonomy_where_sql = f"""
+                        AND CASE
+                            WHEN loc.taxonomy_array IS NOT NULL THEN
+                                loc.taxonomy_array && ARRAY[
+                                    (SELECT int_code FROM {schema}.nucc_taxonomy WHERE code = :taxonomy_code)
+                                ]::integer[]
+                            ELSE EXISTS (
+                                SELECT 1
+                                  FROM {schema}.npi_taxonomy nt
+                                 WHERE nt.npi = loc.npi
+                                   AND nt.healthcare_provider_taxonomy_code = :taxonomy_code
+                                 LIMIT 1
+                            )
+                        END
+                    """
+                elif inferred_taxonomy_filter_only:
                     location_taxonomy_where_sql = f"""
                         AND EXISTS (
                             SELECT 1
@@ -705,6 +726,28 @@ async def _search_compact_serving_table(
                     array_agg(DISTINCT nucc.display_name ORDER BY nucc.display_name)
                         FILTER (WHERE nucc.display_name IS NOT NULL) AS specialties,
                 """
+            filtered_location_cte_sql = f"""
+                    filtered_locations AS MATERIALIZED (
+                        SELECT
+                            loc.provider_group_hash,
+                            loc.npi,
+                            loc.zip5,
+                            loc.state_name,
+                            loc.city_name,
+                            loc.lat,
+                            loc.long,
+                            loc.address_type,
+                            loc.address_checksum,
+                            loc.first_line,
+                            loc.second_line,
+                            loc.postal_code,
+                            loc.country_code
+                          FROM {provider_group_location_table} loc
+                         WHERE {location_filter_sql}
+                           AND loc.npi IS NOT NULL
+                           {location_taxonomy_where_sql}
+                    ),
+            """
             location_row_result = await session.execute(
                 text(
                     f"""
@@ -715,6 +758,7 @@ async def _search_compact_serving_table(
                          ORDER BY r.provider_count DESC NULLS LAST, r.serving_rate_id
                          LIMIT :location_rate_candidate_limit
                     ),
+                    {filtered_location_cte_sql}
                     candidate_matches AS MATERIALIZED (
                         SELECT
                             provider_match.npi,
@@ -762,12 +806,9 @@ async def _search_compact_serving_table(
                                      WHERE psc.provider_set_hash = r.provider_set_hash
                                      OFFSET 0
                                 ) psc
-                                JOIN {provider_group_location_table} loc
+                                JOIN filtered_locations loc
                                   ON loc.provider_group_hash = psc.provider_group_hash
-                               WHERE {location_filter_sql}
-                                 AND loc.npi IS NOT NULL
                                  {"AND loc.npi = :provider_npi" if provider_npi is not None else ""}
-                                 {location_taxonomy_where_sql}
                                ORDER BY loc.npi, address_rank, loc.address_checksum
                                LIMIT :provider_match_limit
                           ) provider_match ON TRUE

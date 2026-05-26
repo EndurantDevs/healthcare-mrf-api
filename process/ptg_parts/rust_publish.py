@@ -234,6 +234,7 @@ async def _publish_rust_compact_snapshot_tables(
                    addr.city_name::varchar AS city_name,
                    addr.lat,
                    addr.long,
+                   addr.taxonomy_array,
                    addr.type::varchar AS address_type,
                    addr.checksum::varchar AS address_checksum,
                    addr.first_line::varchar AS first_line,
@@ -284,6 +285,10 @@ async def _publish_rust_compact_snapshot_tables(
             (
                 "lat_long_group_idx",
                 "(lat, long, provider_group_hash, npi) WHERE lat IS NOT NULL AND long IS NOT NULL",
+            ),
+            (
+                "taxonomy_array_gin_idx",
+                "USING gin (taxonomy_array gin__int_ops)",
             ),
         ]
         for role, columns_sql in location_indexes:
