@@ -3587,6 +3587,7 @@ class CodeCatalog(Base, JSONOutputMixin):
         {"index_elements": ("code_checksum",), "name": "code_catalog_code_checksum_idx"},
         {"index_elements": ("code_system", "display_name"), "name": "code_catalog_system_display_idx"},
         {"index_elements": ("code_system", "lower(display_name)"), "name": "code_catalog_system_display_lower_idx"},
+        {"index_elements": ("code_type", "code_system"), "name": "code_catalog_code_type_system_idx"},
         {"index_elements": ("lower(display_name)",), "name": "code_catalog_display_lower_idx"},
         {"index_elements": ("lower(short_description)",), "name": "code_catalog_short_description_lower_idx"},
         {"index_elements": ("source",), "name": "code_catalog_source_idx"},
@@ -3597,11 +3598,15 @@ class CodeCatalog(Base, JSONOutputMixin):
     code_system = Column(String(32), nullable=False)
     code = Column(String(128), nullable=False)
     code_checksum = Column(Integer)
+    code_type = Column(String(32))
     display_name = Column(String)
     short_description = Column(String)
     long_description = Column(TEXT)
+    synonyms = Column(ARRAY(String), nullable=False, server_default=text("ARRAY[]::varchar[]"))
     is_active = Column(Boolean)
     source = Column(String(128))
+    source_release = Column(String(64))
+    source_attribution = Column(TEXT)
     updated_at = Column(DateTime)
 
 
@@ -3631,64 +3636,12 @@ class CodeCrosswalk(Base, JSONOutputMixin):
     match_type = Column(String(32))
     confidence = Column(Numeric(scale=4, precision=6, asdecimal=False, decimal_return_scale=None))
     source = Column(String(128))
-    updated_at = Column(DateTime)
-
-
-class ClinicalCodeCatalog(Base, JSONOutputMixin):
-    __tablename__ = "clinical_code_catalog"
-    __main_table__ = __tablename__
-    __table_args__ = (
-        PrimaryKeyConstraint("code_system", "code"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
-    )
-    __my_index_elements__ = ["code_system", "code"]
-    __my_additional_indexes__ = [
-        {"index_elements": ("code_system", "lower(display_name)"), "name": "clinical_code_system_display_lower_idx"},
-        {"index_elements": ("code_type", "code_system"), "name": "clinical_code_type_system_idx"},
-        {"index_elements": ("source",), "name": "clinical_code_source_idx"},
-    ]
-
-    code_system = Column(String(32), nullable=False)
-    code = Column(String(128), nullable=False)
-    code_type = Column(String(32), nullable=False)
-    display_name = Column(String, nullable=False)
-    short_description = Column(String)
-    long_description = Column(TEXT)
-    synonyms = Column(ARRAY(String), nullable=False, server_default=text("ARRAY[]::varchar[]"))
-    is_active = Column(Boolean, nullable=False, server_default=text("TRUE"))
-    source = Column(String(128), nullable=False)
-    source_release = Column(String(64))
     source_attribution = Column(TEXT)
     updated_at = Column(DateTime)
 
 
-class ClinicalCodeCrosswalk(Base, JSONOutputMixin):
-    __tablename__ = "clinical_code_crosswalk"
-    __main_table__ = __tablename__
-    __table_args__ = (
-        PrimaryKeyConstraint("from_system", "from_code", "to_system", "to_code"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
-    )
-    __my_index_elements__ = ["from_system", "from_code", "to_system", "to_code"]
-    __my_additional_indexes__ = [
-        {"index_elements": ("from_system", "from_code"), "name": "clinical_crosswalk_from_idx"},
-        {"index_elements": ("to_system", "to_code"), "name": "clinical_crosswalk_to_idx"},
-        {"index_elements": ("match_type",), "name": "clinical_crosswalk_match_type_idx"},
-    ]
-
-    from_system = Column(String(32), nullable=False)
-    from_code = Column(String(128), nullable=False)
-    to_system = Column(String(32), nullable=False)
-    to_code = Column(String(128), nullable=False)
-    match_type = Column(String(32), nullable=False)
-    confidence = Column(Numeric(scale=4, precision=6, asdecimal=False, decimal_return_scale=None))
-    source = Column(String(128), nullable=False)
-    source_attribution = Column(TEXT)
-    updated_at = Column(DateTime)
-
-
-class ClinicalCodeSynonym(Base, JSONOutputMixin):
-    __tablename__ = "clinical_code_synonym"
+class CodeSynonym(Base, JSONOutputMixin):
+    __tablename__ = "code_synonym"
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint("code_system", "code", "synonym", "term_type"),
@@ -3696,9 +3649,9 @@ class ClinicalCodeSynonym(Base, JSONOutputMixin):
     )
     __my_index_elements__ = ["code_system", "code", "synonym", "term_type"]
     __my_additional_indexes__ = [
-        {"index_elements": ("code_system", "code"), "name": "clinical_synonym_code_idx"},
-        {"index_elements": ("lower(synonym)",), "name": "clinical_synonym_lower_idx"},
-        {"index_elements": ("source",), "name": "clinical_synonym_source_idx"},
+        {"index_elements": ("code_system", "code"), "name": "code_synonym_code_idx"},
+        {"index_elements": ("lower(synonym)",), "name": "code_synonym_lower_idx"},
+        {"index_elements": ("source",), "name": "code_synonym_source_idx"},
     ]
 
     code_system = Column(String(32), nullable=False)
@@ -3711,8 +3664,8 @@ class ClinicalCodeSynonym(Base, JSONOutputMixin):
     updated_at = Column(DateTime)
 
 
-class ClinicalCodeRelationship(Base, JSONOutputMixin):
-    __tablename__ = "clinical_code_relationship"
+class CodeRelationship(Base, JSONOutputMixin):
+    __tablename__ = "code_relationship"
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint("from_system", "from_code", "relationship", "to_system", "to_code"),
@@ -3720,10 +3673,10 @@ class ClinicalCodeRelationship(Base, JSONOutputMixin):
     )
     __my_index_elements__ = ["from_system", "from_code", "relationship", "to_system", "to_code"]
     __my_additional_indexes__ = [
-        {"index_elements": ("from_system", "from_code"), "name": "clinical_relationship_from_idx"},
-        {"index_elements": ("to_system", "to_code"), "name": "clinical_relationship_to_idx"},
-        {"index_elements": ("relationship",), "name": "clinical_relationship_type_idx"},
-        {"index_elements": ("source",), "name": "clinical_relationship_source_idx"},
+        {"index_elements": ("from_system", "from_code"), "name": "code_relationship_from_idx"},
+        {"index_elements": ("to_system", "to_code"), "name": "code_relationship_to_idx"},
+        {"index_elements": ("relationship",), "name": "code_relationship_type_idx"},
+        {"index_elements": ("source",), "name": "code_relationship_source_idx"},
     ]
 
     from_system = Column(String(32), nullable=False)

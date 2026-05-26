@@ -6,7 +6,7 @@
 python main.py start clinical-reference --test --import-id smoke
 ```
 
-This publishes tiny `mrf.clinical_*` tables and keeps previous live tables as `_old`.
+This publishes tiny `mrf.clinical_*` tables after validation. The importer does not keep `_old` rollback tables.
 
 ## Full Run
 
@@ -15,7 +15,7 @@ export HLTHPRT_UMLS_API_KEY=...
 python main.py start clinical-reference --import-id 20260525
 ```
 
-The importer downloads or reuses retained terminology artifacts, creates stage tables, bulk loads rows, builds indexes, validates minimum row counts, then swaps stage tables into live names in one publish step.
+The importer downloads or reuses retained terminology artifacts, creates stage tables, bulk loads rows, builds indexes, validates minimum row counts, then replaces live tables in one publish step.
 
 Default artifact root:
 

@@ -16,18 +16,18 @@ from db.models import (
     ClinicalArea,
     ClinicalAreaCondition,
     ClinicalAreaTreatment,
-    ClinicalCodeCatalog,
-    ClinicalCodeCrosswalk,
-    ClinicalCodeRelationship,
-    ClinicalCodeSynonym,
+    CodeCatalog,
+    CodeCrosswalk,
+    CodeRelationship,
+    CodeSynonym,
 )
 
 blueprint = Blueprint("clinical", url_prefix="/clinical", version=1)
 
-code_table = ClinicalCodeCatalog.__table__
-crosswalk_table = ClinicalCodeCrosswalk.__table__
-synonym_table = ClinicalCodeSynonym.__table__
-relationship_table = ClinicalCodeRelationship.__table__
+code_table = CodeCatalog.__table__
+crosswalk_table = CodeCrosswalk.__table__
+synonym_table = CodeSynonym.__table__
+relationship_table = CodeRelationship.__table__
 area_table = ClinicalArea.__table__
 area_condition_table = ClinicalAreaCondition.__table__
 area_treatment_table = ClinicalAreaTreatment.__table__
@@ -518,11 +518,17 @@ async def list_crosswalk(request):
     from_system = _normalize_system(args.get("from_system"))
     to_system = _normalize_system(args.get("to_system"))
     code = _normalize_code(args.get("code"))
+    from_code = _normalize_code(args.get("from_code"))
+    to_code = _normalize_code(args.get("to_code"))
     filters = []
     if from_system:
         filters.append(func.upper(crosswalk_table.c.from_system) == from_system)
+    if from_code:
+        filters.append(func.upper(crosswalk_table.c.from_code) == from_code)
     if to_system:
         filters.append(func.upper(crosswalk_table.c.to_system) == to_system)
+    if to_code:
+        filters.append(func.upper(crosswalk_table.c.to_code) == to_code)
     if code:
         filters.append(or_(func.upper(crosswalk_table.c.from_code) == code, func.upper(crosswalk_table.c.to_code) == code))
     where_clause = and_(*filters) if filters else None
@@ -542,6 +548,12 @@ async def list_crosswalk(request):
                 "offset": pagination.offset,
                 "page": pagination.page,
             },
-            "query": {"from_system": from_system or None, "to_system": to_system or None, "code": code or None},
+            "query": {
+                "from_system": from_system or None,
+                "from_code": from_code or None,
+                "to_system": to_system or None,
+                "to_code": to_code or None,
+                "code": code or None,
+            },
         }
     )

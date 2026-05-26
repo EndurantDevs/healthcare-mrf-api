@@ -41,12 +41,12 @@ CPT/HCPCS procedure-to-clinical-area mappings are intentionally not imported by 
 
 ## Tables
 
-The importer stages new tables, builds indexes, validates row counts, and swaps only after validation succeeds:
+The importer stages terminology rows, source-scopes its unified-table merge, builds indexes, validates row counts, and replaces clinical-area live tables only after validation succeeds. It does not keep `_old` rollback tables.
 
-- `mrf.clinical_code_catalog`
-- `mrf.clinical_code_crosswalk`
-- `mrf.clinical_code_synonym`
-- `mrf.clinical_code_relationship`
+- `mrf.code_catalog`
+- `mrf.code_crosswalk`
+- `mrf.code_synonym`
+- `mrf.code_relationship`
 - `mrf.clinical_area`
 - `mrf.clinical_area_condition`
 - `mrf.clinical_area_treatment`

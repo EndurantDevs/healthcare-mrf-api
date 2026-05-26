@@ -4893,7 +4893,15 @@ paths:
           in: query
           schema:
             type: string
+        - name: from_code
+          in: query
+          schema:
+            type: string
         - name: to_system
+          in: query
+          schema:
+            type: string
+        - name: to_code
           in: query
           schema:
             type: string
