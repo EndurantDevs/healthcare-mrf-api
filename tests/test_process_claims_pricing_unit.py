@@ -26,6 +26,8 @@ _normalize_state = claims_pricing._normalize_state
 _normalize_zip5 = claims_pricing._normalize_zip5
 _normalize_state_fips = claims_pricing._normalize_state_fips
 _normalize_service_code = claims_pricing._normalize_service_code
+_provider_key = claims_pricing._provider_key
+_location_key = claims_pricing._location_key
 _env_bool = claims_pricing._env_bool
 _select_csv_distribution = claims_pricing._select_csv_distribution
 _download_sources = claims_pricing._download_sources
@@ -141,6 +143,25 @@ def test_normalize_service_code_filters_invalid_and_recovers_embedded_code():
     assert _normalize_service_code("ESTABLISHED PATIENT OFFICE OR OTHER OUTPATIENT VISIT") is None
     assert _normalize_service_code("Y") is None
     assert _normalize_service_code(None) is None
+
+
+def test_location_key_uses_bigint_safe_hash_and_includes_pos():
+    key = _location_key(1003000126, 2023, 12345, "Boston", "MA", "02118", key_extra="11")
+    changed_pos = _location_key(1003000126, 2023, 12345, "Boston", "MA", "02118", key_extra="22")
+
+    assert isinstance(key, int)
+    assert -(2**63) <= key < 2**63
+    assert key == _location_key(1003000126, 2023, 12345, "Boston", "MA", "02118", key_extra="11")
+    assert key != changed_pos
+
+
+def test_provider_key_uses_bigint_safe_hash():
+    key = _provider_key(1003000126, 2023)
+
+    assert isinstance(key, int)
+    assert -(2**63) <= key < 2**63
+    assert key == _provider_key(1003000126, 2023)
+    assert key != _provider_key(1003000126, 2022)
 
 
 def test_env_bool_parsing(monkeypatch):

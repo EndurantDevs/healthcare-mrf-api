@@ -128,7 +128,6 @@ COST_LEVEL_OUTLIER_IQR_FACTOR = max(float(os.getenv("HLTHPRT_COST_LEVEL_OUTLIER_
 MAX_NPI = 9_999_999_999
 SERVICE_CODE_PATTERN = re.compile(r"^[A-Z0-9]{5}$")
 SERVICE_CODE_EXTRACT_PATTERN = re.compile(r"\b([A-Z0-9]{5})\b")
-POSTGRES_IDENTIFIER_MAX_LENGTH = 63
 
 
 @dataclass(frozen=True)
@@ -158,15 +157,6 @@ def _normalize_run_id(run_id: str | None) -> str:
 
 def _state_key(run_id: str, suffix: str) -> str:
     return f"claims_pricing:{run_id}:{suffix}"
-
-
-def _archived_identifier(name: str, suffix: str = "_old") -> str:
-    candidate = f"{name}{suffix}"
-    if len(candidate) <= POSTGRES_IDENTIFIER_MAX_LENGTH:
-        return candidate
-    digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]
-    trim_to = max(1, POSTGRES_IDENTIFIER_MAX_LENGTH - len(suffix) - len(digest) - 1)
-    return f"{name[:trim_to]}_{digest}{suffix}"
 
 
 def _run_dir(import_id: str, run_id: str) -> Path:
@@ -595,7 +585,13 @@ def _procedure_code_from_service(code_system: str, code: str) -> int:
 
 
 def _provider_key(npi: int, year: int) -> int:
-    return return_checksum([npi, year])
+    return _signed_hash64([npi, year])
+
+
+def _signed_hash64(values: list[Any]) -> int:
+    payload = "|".join(str(value) for value in values).encode("utf-8")
+    unsigned_value = int.from_bytes(hashlib.blake2b(payload, digest_size=8).digest(), "big", signed=False)
+    return unsigned_value - (1 << 63)
 
 
 def _location_key(
@@ -607,7 +603,7 @@ def _location_key(
     zip5: str | None,
     key_extra: str | None = None,
 ) -> int:
-    return return_checksum([npi, year, procedure_code, city or "", state or "", zip5 or "", key_extra or ""])
+    return _signed_hash64([npi, year, procedure_code, city or "", state or "", zip5 or "", key_extra or ""])
 
 
 def _row_allowed_for_test(row_number: int) -> bool:
@@ -668,21 +664,6 @@ async def _prepare_tables(stage_suffix: str, test_mode: bool) -> tuple[dict[str,
         if not CLAIMS_DEFER_STAGE_INDEXES:
             await _ensure_indexes(obj, db_schema)
 
-    # Ensure destination tables exist before swap.
-    # Do not build indexes on live tables here: legacy live schemas can differ
-    # from current models, and pre-swap index DDL can fail. Finalization
-    # renames fully-indexed staging tables into live names.
-    for cls in (
-        PricingProvider,
-        PricingProcedure,
-        PricingProviderProcedure,
-        PricingProviderProcedureLocation,
-        PricingProviderProcedureCostProfile,
-        PricingProcedurePeerStats,
-        PricingProcedureGeoBenchmark,
-    ):
-        await db.create_table(cls.__table__, checkfirst=True)
-
     return dynamic, db_schema
 
 
@@ -702,57 +683,6 @@ async def _build_staging_indexes(classes: dict[str, type], schema: str) -> None:
 async def _ensure_live_code_tables(schema: str) -> None:
     await db.create_table(CodeCatalog.__table__, checkfirst=True)
     await db.create_table(CodeCrosswalk.__table__, checkfirst=True)
-    # Normalize legacy table definitions created before current model widths.
-    await db.status(
-        f"""
-        ALTER TABLE {schema}.{CodeCatalog.__tablename__}
-            ALTER COLUMN code_system TYPE VARCHAR(32),
-            ALTER COLUMN code TYPE VARCHAR(128),
-            ALTER COLUMN display_name TYPE TEXT,
-            ALTER COLUMN short_description TYPE TEXT,
-            ALTER COLUMN long_description TYPE TEXT,
-            ALTER COLUMN source TYPE VARCHAR(128);
-        """
-    )
-    await db.status(
-        f"ALTER TABLE {schema}.{CodeCatalog.__tablename__} ADD COLUMN IF NOT EXISTS code_checksum INTEGER;"
-    )
-    await db.status(
-        f"ALTER TABLE {schema}.{CodeCatalog.__tablename__} DROP COLUMN IF EXISTS effective_year;"
-    )
-    await db.status(
-        f"""
-        UPDATE {schema}.{CodeCatalog.__tablename__}
-        SET code_checksum = hashtext(UPPER(COALESCE(code_system, '')) || '|' || UPPER(COALESCE(code, '')))
-        WHERE code_checksum IS NULL;
-        """
-    )
-    await db.status(
-        f"""
-        ALTER TABLE {schema}.{CodeCrosswalk.__tablename__}
-            ALTER COLUMN from_system TYPE VARCHAR(32),
-            ALTER COLUMN from_code TYPE VARCHAR(128),
-            ALTER COLUMN to_system TYPE VARCHAR(32),
-            ALTER COLUMN to_code TYPE VARCHAR(128),
-            ALTER COLUMN match_type TYPE VARCHAR(32),
-            ALTER COLUMN source TYPE VARCHAR(128);
-        """
-    )
-    await db.status(
-        f"ALTER TABLE {schema}.{CodeCrosswalk.__tablename__} ADD COLUMN IF NOT EXISTS from_checksum INTEGER;"
-    )
-    await db.status(
-        f"ALTER TABLE {schema}.{CodeCrosswalk.__tablename__} ADD COLUMN IF NOT EXISTS to_checksum INTEGER;"
-    )
-    await db.status(
-        f"""
-        UPDATE {schema}.{CodeCrosswalk.__tablename__}
-        SET
-            from_checksum = hashtext(UPPER(COALESCE(from_system, '')) || '|' || UPPER(COALESCE(from_code, ''))),
-            to_checksum = hashtext(UPPER(COALESCE(to_system, '')) || '|' || UPPER(COALESCE(to_code, '')))
-        WHERE from_checksum IS NULL OR to_checksum IS NULL;
-        """
-    )
     await _ensure_indexes(CodeCatalog, schema)
     await _ensure_indexes(CodeCrosswalk, schema)
 
@@ -2121,23 +2051,13 @@ async def _publish_by_table_rename(classes: dict[str, type], schema: str) -> Non
         PricingProcedureGeoBenchmark,
     )
 
-    async def archive_index(index_name: str) -> str:
-        archived_name = _archived_identifier(index_name)
-        await db.status(f"DROP INDEX IF EXISTS {schema}.{archived_name};")
-        await db.status(
-            f"ALTER INDEX IF EXISTS {schema}.{index_name} RENAME TO {archived_name};"
-        )
-        return archived_name
-
     async with db.transaction():
         for cls in final_classes:
             obj = classes[cls.__name__]
             table = cls.__main_table__
-            await db.status(f"DROP TABLE IF EXISTS {schema}.{table}_old;")
-            await db.status(f"ALTER TABLE IF EXISTS {schema}.{table} RENAME TO {table}_old;")
+            await db.status(f"DROP TABLE IF EXISTS {schema}.{table};")
             await db.status(f"ALTER TABLE IF EXISTS {schema}.{obj.__tablename__} RENAME TO {table};")
 
-            await archive_index(f"{table}_idx_primary")
             await db.status(
                 f"ALTER INDEX IF EXISTS {schema}.{obj.__tablename__}_idx_primary RENAME TO {table}_idx_primary;"
             )
@@ -2153,7 +2073,6 @@ async def _publish_by_table_rename(classes: dict[str, type], schema: str) -> Non
                 if not elements:
                     continue
                 base_name = index.get("name") or f"{table}_{'_'.join(elements)}_idx"
-                await archive_index(base_name)
                 await db.status(
                     f"ALTER INDEX IF EXISTS {schema}.{obj.__tablename__}_{base_name} RENAME TO {base_name};"
                 )

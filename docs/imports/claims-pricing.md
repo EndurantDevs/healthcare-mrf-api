@@ -47,9 +47,8 @@ python main.py start claims-pricing --test
 ## Notes
 - This is the main Medicare procedures/services pricing import.
 - It resolves current CMS distributions from the CMS data catalog rather than depending on one fixed CSV.
-- Publish uses swap/rename semantics with `_old` rollback backups.
+- Publish validates stage tables, drops the current live tables, and renames staged tables into the live names. It does not keep `_old` rollback tables.
 - Do not run `ClaimsPricing_finish` in parallel with `DrugClaims_finish`.
 
 ## Related Specs
 - [`../../specs/cms_claims_pricing_v1.md`](../../specs/cms_claims_pricing_v1.md)
-- [`../../specs/import_swap_backup_policy.md`](../../specs/import_swap_backup_policy.md)

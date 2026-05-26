@@ -129,7 +129,6 @@ DRUG_CLAIMS_MIN_YEAR = max(int(os.getenv("HLTHPRT_DRUG_CLAIMS_MIN_YEAR", "2023")
 DRUG_CLAIMS_MAX_YEAR = max(int(os.getenv("HLTHPRT_DRUG_CLAIMS_MAX_YEAR", "2023")), DRUG_CLAIMS_MIN_YEAR)
 DRUG_CLAIMS_YEAR_WINDOW = tuple(range(DRUG_CLAIMS_MIN_YEAR, DRUG_CLAIMS_MAX_YEAR + 1))
 MAX_NPI = 9_999_999_999
-POSTGRES_IDENTIFIER_MAX_LENGTH = 63
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _ALNUM_NORMALIZER_RE = re.compile(r"[^A-Z0-9]+")
@@ -144,15 +143,6 @@ def _sanitize_identifier(value: str | None, fallback: str, field_name: str) -> s
         return text
     logger.warning("Invalid %s=%r; using %r", field_name, value, fallback)
     return fallback
-
-
-def _archived_identifier(name: str, suffix: str = "_old") -> str:
-    candidate = f"{name}{suffix}"
-    if len(candidate) <= POSTGRES_IDENTIFIER_MAX_LENGTH:
-        return candidate
-    digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]
-    trim_to = max(1, POSTGRES_IDENTIFIER_MAX_LENGTH - len(suffix) - len(digest) - 1)
-    return f"{name[:trim_to]}_{digest}{suffix}"
 
 
 RX_CROSSWALK_SOURCE = str(os.getenv("HLTHPRT_RX_CROSSWALK_SOURCE", "hybrid")).strip().lower() or "hybrid"
@@ -688,15 +678,6 @@ async def _prepare_tables(stage_suffix: str, test_mode: bool) -> tuple[dict[str,
         if not DRUG_CLAIMS_DEFER_STAGE_INDEXES:
             await _ensure_indexes(obj, db_schema)
 
-    for cls in (
-        PricingPrescription,
-        PricingProviderPrescription,
-    ):
-        # Ensure destination tables exist before swap.
-        # Indexes are built on staging tables and moved during finalization.
-        # Avoid pre-swap index DDL on live legacy tables.
-        await db.create_table(cls.__table__, checkfirst=True)
-
     return dynamic, db_schema
 
 
@@ -711,57 +692,6 @@ async def _build_staging_indexes(classes: dict[str, type], schema: str) -> None:
 async def _ensure_live_code_tables(schema: str) -> None:
     await db.create_table(CodeCatalog.__table__, checkfirst=True)
     await db.create_table(CodeCrosswalk.__table__, checkfirst=True)
-    # Normalize legacy table definitions created before current model widths.
-    await db.status(
-        f"""
-        ALTER TABLE {schema}.{CodeCatalog.__tablename__}
-            ALTER COLUMN code_system TYPE VARCHAR(32),
-            ALTER COLUMN code TYPE VARCHAR(128),
-            ALTER COLUMN display_name TYPE TEXT,
-            ALTER COLUMN short_description TYPE TEXT,
-            ALTER COLUMN long_description TYPE TEXT,
-            ALTER COLUMN source TYPE VARCHAR(128);
-        """
-    )
-    await db.status(
-        f"ALTER TABLE {schema}.{CodeCatalog.__tablename__} ADD COLUMN IF NOT EXISTS code_checksum INTEGER;"
-    )
-    await db.status(
-        f"ALTER TABLE {schema}.{CodeCatalog.__tablename__} DROP COLUMN IF EXISTS effective_year;"
-    )
-    await db.status(
-        f"""
-        UPDATE {schema}.{CodeCatalog.__tablename__}
-        SET code_checksum = hashtext(UPPER(COALESCE(code_system, '')) || '|' || UPPER(COALESCE(code, '')))
-        WHERE code_checksum IS NULL;
-        """
-    )
-    await db.status(
-        f"""
-        ALTER TABLE {schema}.{CodeCrosswalk.__tablename__}
-            ALTER COLUMN from_system TYPE VARCHAR(32),
-            ALTER COLUMN from_code TYPE VARCHAR(128),
-            ALTER COLUMN to_system TYPE VARCHAR(32),
-            ALTER COLUMN to_code TYPE VARCHAR(128),
-            ALTER COLUMN match_type TYPE VARCHAR(32),
-            ALTER COLUMN source TYPE VARCHAR(128);
-        """
-    )
-    await db.status(
-        f"ALTER TABLE {schema}.{CodeCrosswalk.__tablename__} ADD COLUMN IF NOT EXISTS from_checksum INTEGER;"
-    )
-    await db.status(
-        f"ALTER TABLE {schema}.{CodeCrosswalk.__tablename__} ADD COLUMN IF NOT EXISTS to_checksum INTEGER;"
-    )
-    await db.status(
-        f"""
-        UPDATE {schema}.{CodeCrosswalk.__tablename__}
-        SET
-            from_checksum = hashtext(UPPER(COALESCE(from_system, '')) || '|' || UPPER(COALESCE(from_code, ''))),
-            to_checksum = hashtext(UPPER(COALESCE(to_system, '')) || '|' || UPPER(COALESCE(to_code, '')))
-        WHERE from_checksum IS NULL OR to_checksum IS NULL;
-        """
-    )
     await _ensure_indexes(CodeCatalog, schema)
     await _ensure_indexes(CodeCrosswalk, schema)
 
@@ -2185,23 +2115,13 @@ async def _publish_by_table_rename(classes: dict[str, type], schema: str) -> Non
         PricingProviderPrescription,
     )
 
-    async def archive_index(index_name: str) -> str:
-        archived_name = _archived_identifier(index_name)
-        await db.status(f"DROP INDEX IF EXISTS {schema}.{archived_name};")
-        await db.status(
-            f"ALTER INDEX IF EXISTS {schema}.{index_name} RENAME TO {archived_name};"
-        )
-        return archived_name
-
     async with db.transaction():
         for cls in final_classes:
             obj = classes[cls.__name__]
             table = cls.__main_table__
-            await db.status(f"DROP TABLE IF EXISTS {schema}.{table}_old;")
-            await db.status(f"ALTER TABLE IF EXISTS {schema}.{table} RENAME TO {table}_old;")
+            await db.status(f"DROP TABLE IF EXISTS {schema}.{table};")
             await db.status(f"ALTER TABLE IF EXISTS {schema}.{obj.__tablename__} RENAME TO {table};")
 
-            await archive_index(f"{table}_idx_primary")
             await db.status(
                 f"ALTER INDEX IF EXISTS {schema}.{obj.__tablename__}_idx_primary RENAME TO {table}_idx_primary;"
             )
@@ -2217,7 +2137,6 @@ async def _publish_by_table_rename(classes: dict[str, type], schema: str) -> Non
                 if not elements:
                     continue
                 base_name = index.get("name") or f"{table}_{'_'.join(elements)}_idx"
-                await archive_index(base_name)
                 await db.status(
                     f"ALTER INDEX IF EXISTS {schema}.{obj.__tablename__}_{base_name} RENAME TO {base_name};"
                 )
