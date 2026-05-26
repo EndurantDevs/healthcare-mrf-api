@@ -25,10 +25,10 @@ from db.models import (
     ClinicalArea,
     ClinicalAreaCondition,
     ClinicalAreaTreatment,
-    ClinicalCodeCatalog,
-    ClinicalCodeCrosswalk,
-    ClinicalCodeRelationship,
-    ClinicalCodeSynonym,
+    CodeCatalog,
+    CodeCrosswalk,
+    CodeRelationship,
+    CodeSynonym,
     db,
 )
 from process.ext.utils import ensure_database, make_class, push_objects
@@ -50,8 +50,16 @@ UMLS_DOWNLOAD_URL = "https://uts-ws.nlm.nih.gov/download"
 RXCLASS_BY_RXCUI_URL = "https://rxnav.nlm.nih.gov/REST/rxclass/class/byRxcui.json"
 
 DEFAULT_ARTIFACT_ROOT = Path("/Volumes/Data/data/artifacts/terminology")
-POSTGRES_IDENTIFIER_MAX_LENGTH = 63
 DEFAULT_BATCH_SIZE = 5000
+CLINICAL_REFERENCE_SOURCES = (
+    "cdc_icd10cm",
+    "nlm_mesh_descriptor",
+    "nlm_mesh_supplemental",
+    "nlm_rxnorm",
+    "nlm_snomedct_us",
+    "nlm_snomedct_icd10cm_map",
+    "rxclass_medrt",
+)
 
 SNOMED_FSN_TYPE_ID = "900000000000003001"
 SNOMED_SYNONYM_TYPE_ID = "900000000000013009"
@@ -77,15 +85,6 @@ def _normalize_import_id(raw: str | None) -> str:
         if cleaned:
             return cleaned[:32]
     return _now().strftime("%Y%m%d")
-
-
-def _archived_identifier(name: str, suffix: str = "_old") -> str:
-    candidate = f"{name}{suffix}"
-    if len(candidate) <= POSTGRES_IDENTIFIER_MAX_LENGTH:
-        return candidate
-    digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]
-    trim_to = max(1, POSTGRES_IDENTIFIER_MAX_LENGTH - len(suffix) - len(digest) - 1)
-    return f"{name[:trim_to]}_{digest}{suffix}"
 
 
 def _stage_index_name(stage_table: str, index_name: str) -> str:
@@ -648,6 +647,21 @@ async def _ensure_schema_exists(schema: str) -> None:
     await db.status(f"CREATE SCHEMA IF NOT EXISTS {schema};")
 
 
+async def _ensure_unified_code_tables(schema: str) -> None:
+    await db.create_table(CodeCatalog.__table__, checkfirst=True)
+    await db.create_table(CodeCrosswalk.__table__, checkfirst=True)
+    await db.create_table(CodeSynonym.__table__, checkfirst=True)
+    await db.create_table(CodeRelationship.__table__, checkfirst=True)
+    await _create_stage_indexes(CodeCatalog, schema)
+    await _create_stage_indexes(CodeCrosswalk, schema)
+    await _create_stage_indexes(CodeSynonym, schema)
+    await _create_stage_indexes(CodeRelationship, schema)
+
+
+def _source_sql_list() -> str:
+    return ", ".join(f"'{source}'" for source in CLINICAL_REFERENCE_SOURCES)
+
+
 async def _create_stage_indexes(stage_cls, schema: str) -> None:
     if getattr(stage_cls, "__my_index_elements__", None):
         await db.status(
@@ -668,23 +682,101 @@ async def _create_stage_indexes(stage_cls, schema: str) -> None:
 
 async def _publish_table(model_cls, stage_cls, schema: str) -> None:
     table = model_cls.__main_table__
-    await db.status(f"DROP TABLE IF EXISTS {schema}.{table}_old;")
-    await db.status(f"ALTER TABLE IF EXISTS {schema}.{table} RENAME TO {table}_old;")
+    await db.status(f"DROP TABLE IF EXISTS {schema}.{table};")
     await db.status(f"ALTER TABLE IF EXISTS {schema}.{stage_cls.__tablename__} RENAME TO {table};")
-    archived = _archived_identifier(f"{table}_idx_primary")
-    await db.status(f"DROP INDEX IF EXISTS {schema}.{archived};")
-    await db.status(f"ALTER INDEX IF EXISTS {schema}.{table}_idx_primary RENAME TO {archived};")
     await db.status(f"ALTER INDEX IF EXISTS {schema}.{stage_cls.__tablename__}_idx_primary RENAME TO {table}_idx_primary;")
     for index in getattr(stage_cls, "__my_additional_indexes__", []) or []:
         index_name = index.get("name", "_".join(index.get("index_elements")))
         old_live_name = f"{table}_idx_{index_name}"
-        archived_live_name = _archived_identifier(old_live_name)
-        await db.status(f"DROP INDEX IF EXISTS {schema}.{archived_live_name};")
-        await db.status(f"ALTER INDEX IF EXISTS {schema}.{old_live_name} RENAME TO {archived_live_name};")
         await db.status(
             f"ALTER INDEX IF EXISTS {schema}.{_stage_index_name(stage_cls.__tablename__, index_name)} "
             f"RENAME TO {old_live_name};"
         )
+
+
+async def _merge_code_catalog_stage(stage_cls, schema: str) -> None:
+    sources = _source_sql_list()
+    await db.status(f"DELETE FROM {schema}.{CodeCatalog.__tablename__} WHERE source IN ({sources});")
+    await db.status(
+        f"""
+        INSERT INTO {schema}.{CodeCatalog.__tablename__}
+            (code_system, code, code_checksum, code_type, display_name, short_description, long_description,
+             synonyms, is_active, source, source_release, source_attribution, updated_at)
+        SELECT code_system,
+               code,
+               hashtext(code_system || '|' || code),
+               code_type,
+               display_name,
+               short_description,
+               long_description,
+               COALESCE(synonyms, ARRAY[]::varchar[]),
+               is_active,
+               source,
+               source_release,
+               source_attribution,
+               updated_at
+          FROM {schema}.{stage_cls.__tablename__}
+        ON CONFLICT (code_system, code) DO UPDATE SET
+            code_checksum = EXCLUDED.code_checksum,
+            code_type = EXCLUDED.code_type,
+            display_name = EXCLUDED.display_name,
+            short_description = EXCLUDED.short_description,
+            long_description = EXCLUDED.long_description,
+            synonyms = EXCLUDED.synonyms,
+            is_active = EXCLUDED.is_active,
+            source = EXCLUDED.source,
+            source_release = EXCLUDED.source_release,
+            source_attribution = EXCLUDED.source_attribution,
+            updated_at = EXCLUDED.updated_at;
+        """
+    )
+
+
+async def _merge_code_crosswalk_stage(stage_cls, schema: str) -> None:
+    sources = _source_sql_list()
+    await db.status(f"DELETE FROM {schema}.{CodeCrosswalk.__tablename__} WHERE source IN ({sources});")
+    await db.status(
+        f"""
+        INSERT INTO {schema}.{CodeCrosswalk.__tablename__}
+            (from_system, from_code, from_checksum, to_system, to_code, to_checksum,
+             match_type, confidence, source, source_attribution, updated_at)
+        SELECT from_system,
+               from_code,
+               hashtext(from_system || '|' || from_code),
+               to_system,
+               to_code,
+               hashtext(to_system || '|' || to_code),
+               match_type,
+               confidence,
+               source,
+               source_attribution,
+               updated_at
+          FROM {schema}.{stage_cls.__tablename__}
+        ON CONFLICT (from_system, from_code, to_system, to_code) DO UPDATE SET
+            from_checksum = EXCLUDED.from_checksum,
+            to_checksum = EXCLUDED.to_checksum,
+            match_type = EXCLUDED.match_type,
+            confidence = EXCLUDED.confidence,
+            source = EXCLUDED.source,
+            source_attribution = EXCLUDED.source_attribution,
+            updated_at = EXCLUDED.updated_at;
+        """
+    )
+
+
+async def _merge_replace_source_table(model_cls, stage_cls, schema: str) -> None:
+    sources = _source_sql_list()
+    columns = [column.name for column in model_cls.__table__.columns]
+    column_list = ", ".join(columns)
+    await db.status(f"DELETE FROM {schema}.{model_cls.__tablename__} WHERE source IN ({sources});")
+    await db.status(
+        f"""
+        INSERT INTO {schema}.{model_cls.__tablename__} ({column_list})
+        SELECT {column_list}
+          FROM {schema}.{stage_cls.__tablename__}
+        ON CONFLICT DO NOTHING;
+        """
+    )
 
 
 async def _push(stage_cls, rows: list[dict[str, Any]]) -> int:
@@ -715,16 +807,20 @@ async def import_clinical_reference(
     umls_key = os.getenv("HLTHPRT_UMLS_API_KEY") or os.getenv("UMLS_API_KEY")
     source_test_limit = int(os.getenv("HLTHPRT_CLINICAL_REFERENCE_TEST_LIMIT", "250")) if test_mode else None
     await _ensure_schema_exists(schema)
+    await _ensure_unified_code_tables(schema)
 
-    models = [
-        ClinicalCodeCatalog,
-        ClinicalCodeCrosswalk,
-        ClinicalCodeSynonym,
-        ClinicalCodeRelationship,
+    shared_models = [
+        CodeCatalog,
+        CodeCrosswalk,
+        CodeSynonym,
+        CodeRelationship,
+    ]
+    area_models = [
         ClinicalArea,
         ClinicalAreaCondition,
         ClinicalAreaTreatment,
     ]
+    models = shared_models + area_models
     stages = {model: make_class(model, import_suffix) for model in models}
     for stage_cls in stages.values():
         await db.status(f"DROP TABLE IF EXISTS {schema}.{stage_cls.__tablename__};")
@@ -791,10 +887,10 @@ async def import_clinical_reference(
         for row in relationship_rows
     }
 
-    await _push(stages[ClinicalCodeCatalog], list(deduped_concepts.values()))
-    await _push(stages[ClinicalCodeSynonym], list(deduped_synonyms.values()))
-    await _push(stages[ClinicalCodeCrosswalk], list(deduped_crosswalks.values()))
-    await _push(stages[ClinicalCodeRelationship], list(deduped_relationships.values()))
+    await _push(stages[CodeCatalog], list(deduped_concepts.values()))
+    await _push(stages[CodeSynonym], list(deduped_synonyms.values()))
+    await _push(stages[CodeCrosswalk], list(deduped_crosswalks.values()))
+    await _push(stages[CodeRelationship], list(deduped_relationships.values()))
 
     area_rows, area_condition_rows, area_treatment_rows = _build_clinical_area_rows(
         deduped_concepts,
@@ -807,14 +903,20 @@ async def import_clinical_reference(
     for stage_cls in stages.values():
         await _create_stage_indexes(stage_cls, schema)
 
-    concept_count = int(await db.scalar(f"SELECT COUNT(*) FROM {schema}.{stages[ClinicalCodeCatalog].__tablename__};") or 0)
+    concept_count = int(await db.scalar(f"SELECT COUNT(*) FROM {schema}.{stages[CodeCatalog].__tablename__};") or 0)
     min_rows = int(os.getenv("HLTHPRT_CLINICAL_REFERENCE_MIN_ROWS", "1" if test_mode else "1000"))
     if concept_count < min_rows:
         raise RuntimeError(f"Clinical reference stage has {concept_count} code rows, below minimum {min_rows}.")
 
     async with db.transaction():
-        for model in models:
+        await _merge_code_catalog_stage(stages[CodeCatalog], schema)
+        await _merge_code_crosswalk_stage(stages[CodeCrosswalk], schema)
+        await _merge_replace_source_table(CodeSynonym, stages[CodeSynonym], schema)
+        await _merge_replace_source_table(CodeRelationship, stages[CodeRelationship], schema)
+        for model in area_models:
             await _publish_table(model, stages[model], schema)
+        for model in shared_models:
+            await db.status(f"DROP TABLE IF EXISTS {schema}.{stages[model].__tablename__};")
 
     result = {
         "import_id": import_suffix,
