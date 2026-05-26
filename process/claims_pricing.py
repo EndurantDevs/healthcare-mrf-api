@@ -85,6 +85,9 @@ DOWNLOAD_RETRIES = max(int(os.getenv("HLTHPRT_CLAIMS_DOWNLOAD_RETRIES", "3")), 1
 CLAIMS_USE_PROXY = os.getenv("HLTHPRT_CLAIMS_USE_PROXY", "false").strip().lower() in {"1", "true", "yes", "on"}
 ROW_PROGRESS_INTERVAL_SECONDS = max(float(os.getenv("HLTHPRT_CLAIMS_ROW_PROGRESS_SECONDS", "2")), 0.5)
 INTERNAL_CODE_SYSTEM = "HP_PROCEDURE_CODE"
+SOURCE_OBSERVED_PROCEDURE_ATTRIBUTION = (
+    "Source-observed label from claims/pricing data; not an AMA CPT or ADA CDT reference import."
+)
 # Default to the latest stable CMS year for faster imports; can be widened via env.
 CLAIMS_MIN_YEAR = max(int(os.getenv("HLTHPRT_CLAIMS_MIN_YEAR", "2023")), 2013)
 CLAIMS_MAX_YEAR = max(int(os.getenv("HLTHPRT_CLAIMS_MAX_YEAR", "2023")), CLAIMS_MIN_YEAR)
@@ -577,6 +580,8 @@ def _normalize_service_code(raw_code: str | None) -> str | None:
 def _detect_code_system(code: str | None) -> str:
     if code and re.fullmatch(r"\d{5}", code):
         return "CPT"
+    if code and re.fullmatch(r"D\d{4}", code):
+        return "CDT"
     return "HCPCS"
 
 
@@ -683,6 +688,12 @@ async def _build_staging_indexes(classes: dict[str, type], schema: str) -> None:
 async def _ensure_live_code_tables(schema: str) -> None:
     await db.create_table(CodeCatalog.__table__, checkfirst=True)
     await db.create_table(CodeCrosswalk.__table__, checkfirst=True)
+    await db.status(
+        f"ALTER TABLE {schema}.{CodeCatalog.__tablename__} ADD COLUMN IF NOT EXISTS source_attribution TEXT;"
+    )
+    await db.status(
+        f"ALTER TABLE {schema}.{CodeCrosswalk.__tablename__} ADD COLUMN IF NOT EXISTS source_attribution TEXT;"
+    )
     await _ensure_indexes(CodeCatalog, schema)
     await _ensure_indexes(CodeCrosswalk, schema)
 
@@ -1410,34 +1421,49 @@ async def _materialize_code_and_crosswalk_rows(classes: dict[str, type], schema:
                 procedure_code,
                 UPPER(BTRIM(reported_code)) AS service_code,
                 NULLIF(BTRIM(service_description), '') AS service_desc,
-                CASE WHEN UPPER(BTRIM(reported_code)) ~ '^[0-9]{{5}}$' THEN 'CPT' ELSE 'HCPCS' END AS primary_system
+                CASE
+                    WHEN UPPER(BTRIM(reported_code)) ~ '^[0-9]{{5}}$' THEN 'CPT'
+                    WHEN UPPER(BTRIM(reported_code)) ~ '^D[0-9]{{4}}$' THEN 'CDT'
+                    ELSE 'HCPCS'
+                END AS primary_system
             FROM {schema}.{procedure_table}
             WHERE COALESCE(BTRIM(reported_code), '') <> ''
               AND UPPER(BTRIM(reported_code)) ~ '^[A-Z0-9]{{5}}$'
               AND UPPER(BTRIM(reported_code)) ~ '[0-9]'
         )
         INSERT INTO {schema}.{code_catalog_table}
-            (code_system, code, code_checksum, display_name, short_description, long_description, is_active, source, updated_at)
+            (
+                code_system,
+                code,
+                display_name,
+                short_description,
+                long_description,
+                is_active,
+                source,
+                source_attribution,
+                updated_at
+            )
         SELECT
             src.primary_system,
             src.service_code,
-            hashtext(UPPER(src.primary_system) || '|' || UPPER(src.service_code)),
             COALESCE(src.service_desc, src.service_code),
             src.service_desc,
             NULL,
             TRUE,
             'cms_physician_provider_service',
+            :source_attribution,
             NOW()
         FROM src
         ON CONFLICT (code_system, code) DO UPDATE
         SET
-            code_checksum = excluded.code_checksum,
             display_name = excluded.display_name,
             short_description = excluded.short_description,
             is_active = excluded.is_active,
             source = excluded.source,
+            source_attribution = excluded.source_attribution,
             updated_at = excluded.updated_at;
-        """
+        """,
+        source_attribution=SOURCE_OBSERVED_PROCEDURE_ATTRIBUTION,
     )
 
     await db.status(
@@ -1453,27 +1479,38 @@ async def _materialize_code_and_crosswalk_rows(classes: dict[str, type], schema:
               AND UPPER(BTRIM(reported_code)) ~ '[0-9]'
         )
         INSERT INTO {schema}.{code_catalog_table}
-            (code_system, code, code_checksum, display_name, short_description, long_description, is_active, source, updated_at)
+            (
+                code_system,
+                code,
+                display_name,
+                short_description,
+                long_description,
+                is_active,
+                source,
+                source_attribution,
+                updated_at
+            )
         SELECT
             '{INTERNAL_CODE_SYSTEM}',
             src.procedure_code::text,
-            hashtext('{INTERNAL_CODE_SYSTEM}' || '|' || src.procedure_code::text),
             COALESCE(src.service_desc, src.service_code),
             src.service_desc,
             NULL,
             TRUE,
             'cms_physician_provider_service',
+            :source_attribution,
             NOW()
         FROM src
         ON CONFLICT (code_system, code) DO UPDATE
         SET
-            code_checksum = excluded.code_checksum,
             display_name = excluded.display_name,
             short_description = excluded.short_description,
             is_active = excluded.is_active,
             source = excluded.source,
+            source_attribution = excluded.source_attribution,
             updated_at = excluded.updated_at;
-        """
+        """,
+        source_attribution=SOURCE_OBSERVED_PROCEDURE_ATTRIBUTION,
     )
 
     await db.status(
@@ -1485,30 +1522,44 @@ async def _materialize_code_and_crosswalk_rows(classes: dict[str, type], schema:
                 NULLIF(BTRIM(service_description), '') AS service_desc
             FROM {schema}.{procedure_table}
             WHERE COALESCE(BTRIM(reported_code), '') <> ''
-              AND UPPER(BTRIM(reported_code)) ~ '^[0-9]{{5}}$'
+              AND (
+                    UPPER(BTRIM(reported_code)) ~ '^[0-9]{{5}}$'
+                 OR UPPER(BTRIM(reported_code)) ~ '^D[0-9]{{4}}$'
+              )
         )
         INSERT INTO {schema}.{code_catalog_table}
-            (code_system, code, code_checksum, display_name, short_description, long_description, is_active, source, updated_at)
+            (
+                code_system,
+                code,
+                display_name,
+                short_description,
+                long_description,
+                is_active,
+                source,
+                source_attribution,
+                updated_at
+            )
         SELECT
             'HCPCS',
             src.service_code,
-            hashtext('HCPCS' || '|' || src.service_code),
             COALESCE(src.service_desc, src.service_code),
             src.service_desc,
             NULL,
             TRUE,
             'cms_physician_provider_service',
+            :source_attribution,
             NOW()
         FROM src
         ON CONFLICT (code_system, code) DO UPDATE
         SET
-            code_checksum = excluded.code_checksum,
             display_name = excluded.display_name,
             short_description = excluded.short_description,
             is_active = excluded.is_active,
             source = excluded.source,
+            source_attribution = excluded.source_attribution,
             updated_at = excluded.updated_at;
-        """
+        """,
+        source_attribution=SOURCE_OBSERVED_PROCEDURE_ATTRIBUTION,
     )
 
     await db.status(
@@ -1517,7 +1568,11 @@ async def _materialize_code_and_crosswalk_rows(classes: dict[str, type], schema:
             SELECT
                 procedure_code,
                 UPPER(BTRIM(reported_code)) AS service_code,
-                CASE WHEN UPPER(BTRIM(reported_code)) ~ '^[0-9]{{5}}$' THEN 'CPT' ELSE 'HCPCS' END AS primary_system
+                CASE
+                    WHEN UPPER(BTRIM(reported_code)) ~ '^[0-9]{{5}}$' THEN 'CPT'
+                    WHEN UPPER(BTRIM(reported_code)) ~ '^D[0-9]{{4}}$' THEN 'CDT'
+                    ELSE 'HCPCS'
+                END AS primary_system
             FROM {schema}.{procedure_table}
             WHERE COALESCE(BTRIM(reported_code), '') <> ''
               AND UPPER(BTRIM(reported_code)) ~ '^[A-Z0-9]{{5}}$'
@@ -1539,20 +1594,20 @@ async def _materialize_code_and_crosswalk_rows(classes: dict[str, type], schema:
             FROM src
             UNION ALL
             SELECT
-                'CPT' AS from_system,
+                src.primary_system AS from_system,
                 src.service_code AS from_code,
                 'HCPCS' AS to_system,
                 src.service_code AS to_code
             FROM src
-            WHERE src.primary_system = 'CPT'
+            WHERE src.primary_system IN ('CPT', 'CDT')
             UNION ALL
             SELECT
                 'HCPCS' AS from_system,
                 src.service_code AS from_code,
-                'CPT' AS to_system,
+                src.primary_system AS to_system,
                 src.service_code AS to_code
             FROM src
-            WHERE src.primary_system = 'CPT'
+            WHERE src.primary_system IN ('CPT', 'CDT')
             UNION ALL
             SELECT
                 'HCPCS' AS from_system,
@@ -1560,7 +1615,7 @@ async def _materialize_code_and_crosswalk_rows(classes: dict[str, type], schema:
                 '{INTERNAL_CODE_SYSTEM}' AS to_system,
                 src.procedure_code::text AS to_code
             FROM src
-            WHERE src.primary_system = 'CPT'
+            WHERE src.primary_system IN ('CPT', 'CDT')
             UNION ALL
             SELECT
                 '{INTERNAL_CODE_SYSTEM}' AS from_system,
@@ -1568,42 +1623,40 @@ async def _materialize_code_and_crosswalk_rows(classes: dict[str, type], schema:
                 'HCPCS' AS to_system,
                 src.service_code AS to_code
             FROM src
-            WHERE src.primary_system = 'CPT'
+            WHERE src.primary_system IN ('CPT', 'CDT')
         )
         INSERT INTO {schema}.{code_crosswalk_table}
             (
                 from_system,
                 from_code,
-                from_checksum,
                 to_system,
                 to_code,
-                to_checksum,
                 match_type,
                 confidence,
                 source,
+                source_attribution,
                 updated_at
             )
         SELECT
             edges.from_system,
             edges.from_code,
-            hashtext(UPPER(edges.from_system) || '|' || UPPER(edges.from_code)),
             edges.to_system,
             edges.to_code,
-            hashtext(UPPER(edges.to_system) || '|' || UPPER(edges.to_code)),
             'exact',
             1.0,
             'cms_physician_provider_service',
+            :source_attribution,
             NOW()
         FROM edges
         ON CONFLICT (from_system, from_code, to_system, to_code) DO UPDATE
         SET
-            from_checksum = excluded.from_checksum,
-            to_checksum = excluded.to_checksum,
             match_type = excluded.match_type,
             confidence = excluded.confidence,
             source = excluded.source,
+            source_attribution = excluded.source_attribution,
             updated_at = excluded.updated_at;
-        """
+        """,
+        source_attribution=SOURCE_OBSERVED_PROCEDURE_ATTRIBUTION,
     )
 
 

@@ -46,6 +46,7 @@ def test_init_api_registers_group(monkeypatch):
     assert hasattr(app.registered, "blueprints")
     assert {bp.name for bp in app.registered.blueprints} == {
         "coverage",
+        "clinical",
         "codes",
         "healthcheck",
         "plan",

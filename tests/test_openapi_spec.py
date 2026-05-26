@@ -7,6 +7,24 @@ from pathlib import Path
 HTTP_METHODS = {"get", "post", "put", "delete", "patch", "options", "head"}
 ENDPOINT_DIR = Path("api/endpoint")
 OPENAPI_PATH = Path("doc/openapi.yaml")
+HIDDEN_RUNTIME_ALIASES = {
+    ("get", "/pricing/physicians"),
+    ("get", "/pricing/physicians/{npi}"),
+    ("get", "/pricing/physicians/{npi}/score"),
+    ("get", "/pricing/physicians/{npi}/services"),
+    ("get", "/pricing/physicians/{npi}/services/{code_system}/{code}"),
+    ("get", "/pricing/physicians/{npi}/services/{code_system}/{code}/estimated-cost-level"),
+    ("get", "/pricing/physicians/{npi}/services/{code_system}/{code}/locations"),
+    ("get", "/pricing/services/autocomplete"),
+    ("get", "/pricing/drugs/autocomplete"),
+    ("get", "/pricing/providers/by-service"),
+    ("get", "/pricing/physicians/by-service"),
+    ("get", "/pricing/providers/by-drug"),
+    ("get", "/pricing/physicians/by-prescription"),
+    ("get", "/pricing/physicians/by-drug"),
+    ("get", "/pricing/physicians/{npi}/prescriptions"),
+    ("get", "/pricing/physicians/{npi}/prescriptions/{rx_code_system}/{rx_code}"),
+}
 
 
 def _combine_paths(prefix: str, route_path: str) -> str:
@@ -219,7 +237,7 @@ def test_openapi_routes_match_code():
 
     # Normalise spec keys to align with code keys
     spec_keys = set(spec_routes.keys())
-    code_keys = set(code_routes.keys())
+    code_keys = set(code_routes.keys()) - HIDDEN_RUNTIME_ALIASES
 
     missing_in_spec = sorted(code_keys - spec_keys)
     extra_in_spec = sorted(spec_keys - code_keys)
@@ -238,3 +256,13 @@ def test_openapi_routes_match_code():
             f"Query parameters mismatch for {key}: code={sorted(code_info['query_params'])}, "
             f"spec={sorted(spec_info['query_params'])}"
         )
+
+
+def test_openapi_operation_ids_are_present_and_unique():
+    text = OPENAPI_PATH.read_text()
+    operation_ids = re.findall(r"^\s+operationId:\s+([A-Za-z0-9_]+)\s*$", text, flags=re.MULTILINE)
+    spec_routes = {(method, path) for (method, path), _info in _collect_spec_routes().items() if method}
+
+    assert len(operation_ids) == len(spec_routes)
+    assert len(operation_ids) == len(set(operation_ids))
+    assert not (HIDDEN_RUNTIME_ALIASES & spec_routes)

@@ -1,6 +1,6 @@
 # Clinical Reference Import
 
-`clinical-reference` builds local terminology lookup, synonym, crosswalk, and relationship tables for Ribbon-replacement APIs.
+`clinical-reference` builds local terminology lookup, synonym, crosswalk, and relationship tables for Ribbon-replacement APIs. `mrf.code_synonym` is the only synonym storage; `mrf.code_catalog` stores one row per canonical code without duplicate synonym arrays or checksum columns.
 
 ## Command
 
@@ -37,15 +37,17 @@ Clinical areas are derived from official MeSH tree roots, not from a proprietary
 - Direct MeSH descendants are mapped from their tree numbers.
 - RxNorm drugs are mapped into disease areas through RxClass/MED-RT `may_treat` relationships to MeSH conditions.
 
-CPT/HCPCS procedure-to-clinical-area mappings are intentionally not imported by default because a complete official AMA/CMS mapping is not available in the public source set.
+CPT/HCPCS/CDT procedure-to-clinical-area mappings are intentionally not imported by default because a complete official licensed mapping is not available in the public source set.
+
+The platform may store CPT, CDT, and HCPCS procedure codes and source-provided labels observed in claims, PTG, or MRF files. Those rows are marked as source-observed text and are not an AMA CPT, ADA CDT, or UMLS CPT/CDT reference import. Do not load official CPT/CDT descriptors, synonyms, or licensed reference dictionaries into `code_catalog` unless the deployment has explicit AMA/ADA licensing and the importer is updated to record that licensed source.
 
 ## Tables
 
 The importer stages terminology rows, source-scopes its unified-table merge, builds indexes, validates row counts, and replaces clinical-area live tables only after validation succeeds. It does not keep `_old` rollback tables.
 
 - `mrf.code_catalog`
-- `mrf.code_crosswalk`
 - `mrf.code_synonym`
+- `mrf.code_crosswalk`
 - `mrf.code_relationship`
 - `mrf.clinical_area`
 - `mrf.clinical_area_condition`

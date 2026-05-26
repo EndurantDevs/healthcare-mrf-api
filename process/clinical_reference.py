@@ -176,7 +176,6 @@ def _concept_row(
     *,
     attribution: str | None = None,
     long_description: str | None = None,
-    synonyms: list[str] | None = None,
 ) -> dict[str, Any]:
     return {
         "code_system": system,
@@ -185,7 +184,6 @@ def _concept_row(
         "display_name": display,
         "short_description": display,
         "long_description": long_description,
-        "synonyms": synonyms or [],
         "is_active": True,
         "source": source,
         "source_release": release,
@@ -700,16 +698,14 @@ async def _merge_code_catalog_stage(stage_cls, schema: str) -> None:
     await db.status(
         f"""
         INSERT INTO {schema}.{CodeCatalog.__tablename__}
-            (code_system, code, code_checksum, code_type, display_name, short_description, long_description,
-             synonyms, is_active, source, source_release, source_attribution, updated_at)
+            (code_system, code, code_type, display_name, short_description, long_description,
+             is_active, source, source_release, source_attribution, updated_at)
         SELECT code_system,
                code,
-               hashtext(code_system || '|' || code),
                code_type,
                display_name,
                short_description,
                long_description,
-               COALESCE(synonyms, ARRAY[]::varchar[]),
                is_active,
                source,
                source_release,
@@ -717,12 +713,10 @@ async def _merge_code_catalog_stage(stage_cls, schema: str) -> None:
                updated_at
           FROM {schema}.{stage_cls.__tablename__}
         ON CONFLICT (code_system, code) DO UPDATE SET
-            code_checksum = EXCLUDED.code_checksum,
             code_type = EXCLUDED.code_type,
             display_name = EXCLUDED.display_name,
             short_description = EXCLUDED.short_description,
             long_description = EXCLUDED.long_description,
-            synonyms = EXCLUDED.synonyms,
             is_active = EXCLUDED.is_active,
             source = EXCLUDED.source,
             source_release = EXCLUDED.source_release,
@@ -738,14 +732,11 @@ async def _merge_code_crosswalk_stage(stage_cls, schema: str) -> None:
     await db.status(
         f"""
         INSERT INTO {schema}.{CodeCrosswalk.__tablename__}
-            (from_system, from_code, from_checksum, to_system, to_code, to_checksum,
-             match_type, confidence, source, source_attribution, updated_at)
+            (from_system, from_code, to_system, to_code, match_type, confidence, source, source_attribution, updated_at)
         SELECT from_system,
                from_code,
-               hashtext(from_system || '|' || from_code),
                to_system,
                to_code,
-               hashtext(to_system || '|' || to_code),
                match_type,
                confidence,
                source,
@@ -753,8 +744,6 @@ async def _merge_code_crosswalk_stage(stage_cls, schema: str) -> None:
                updated_at
           FROM {schema}.{stage_cls.__tablename__}
         ON CONFLICT (from_system, from_code, to_system, to_code) DO UPDATE SET
-            from_checksum = EXCLUDED.from_checksum,
-            to_checksum = EXCLUDED.to_checksum,
             match_type = EXCLUDED.match_type,
             confidence = EXCLUDED.confidence,
             source = EXCLUDED.source,

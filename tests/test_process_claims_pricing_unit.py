@@ -26,6 +26,7 @@ _normalize_state = claims_pricing._normalize_state
 _normalize_zip5 = claims_pricing._normalize_zip5
 _normalize_state_fips = claims_pricing._normalize_state_fips
 _normalize_service_code = claims_pricing._normalize_service_code
+_detect_code_system = claims_pricing._detect_code_system
 _provider_key = claims_pricing._provider_key
 _location_key = claims_pricing._location_key
 _env_bool = claims_pricing._env_bool
@@ -143,6 +144,35 @@ def test_normalize_service_code_filters_invalid_and_recovers_embedded_code():
     assert _normalize_service_code("ESTABLISHED PATIENT OFFICE OR OTHER OUTPATIENT VISIT") is None
     assert _normalize_service_code("Y") is None
     assert _normalize_service_code(None) is None
+
+
+def test_detect_code_system_distinguishes_cpt_cdt_and_hcpcs():
+    assert _detect_code_system("99213") == "CPT"
+    assert _detect_code_system("D0120") == "CDT"
+    assert _detect_code_system("J1030") == "HCPCS"
+
+
+@pytest.mark.asyncio
+async def test_materialize_code_rows_marks_source_observed_cdt(monkeypatch):
+    calls = []
+
+    async def fake_status(sql, **params):
+        calls.append((sql, params))
+        return 1
+
+    monkeypatch.setattr(claims_pricing.db, "status", fake_status)
+
+    classes = {"PricingProcedure": SimpleNamespace(__tablename__="pricing_procedure_stage")}
+    await claims_pricing._materialize_code_and_crosswalk_rows(classes, "mrf")
+
+    sql_text = "\n".join(sql for sql, _params in calls)
+    assert "THEN 'CDT'" in sql_text
+    assert "source_attribution" in sql_text
+    assert "WHERE src.primary_system IN ('CPT', 'CDT')" in sql_text
+    assert all(
+        params.get("source_attribution") == claims_pricing.SOURCE_OBSERVED_PROCEDURE_ATTRIBUTION
+        for _sql, params in calls
+    )
 
 
 def test_location_key_uses_bigint_safe_hash_and_includes_pos():

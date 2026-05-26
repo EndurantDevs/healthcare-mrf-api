@@ -11,6 +11,7 @@ import sanic.exceptions
 from sanic import Blueprint, response
 from sqlalchemy import and_, func, or_, select
 
+from api.code_systems import PROCEDURE_CODE_SYSTEMS, normalize_code, normalize_code_system
 from api.endpoint.pagination import parse_pagination
 from db.models import (
     ClinicalArea,
@@ -33,14 +34,6 @@ area_condition_table = ClinicalAreaCondition.__table__
 area_treatment_table = ClinicalAreaTreatment.__table__
 
 MAX_LIMIT = 200
-SYSTEM_ALIASES = {
-    "ICD-10-CM": "ICD10CM",
-    "ICD10": "ICD10CM",
-    "ICD10CM_COMPACT": "ICD10CM_COMPACT",
-    "RXCUI": "RXNORM",
-    "SNOMED": "SNOMEDCT_US",
-    "SNOMEDCT": "SNOMEDCT_US",
-}
 
 
 def _session(request):
@@ -51,12 +44,11 @@ def _session(request):
 
 
 def _normalize_system(raw: Any) -> str:
-    system = str(raw or "").strip().upper()
-    return SYSTEM_ALIASES.get(system, system)
+    return normalize_code_system(raw)
 
 
 def _normalize_code(raw: Any) -> str:
-    return str(raw or "").strip().upper()
+    return normalize_code(raw)
 
 
 def _decode_path_value(raw: Any) -> str:
@@ -341,22 +333,39 @@ async def get_concept(request, system: str, code: str):
 
 async def _get_code(request, code_type: str, system: str, code: str):
     session = _session(request)
+    requested_system = _normalize_system(system)
+    requested_code = _normalize_code(code)
     resolved_system, resolved_code = await _resolve_code(
         session,
-        _normalize_system(system),
-        _normalize_code(code),
+        requested_system,
+        requested_code,
         code_type=code_type,
     )
-    result = await session.execute(
-        select(code_table).where(
-            and_(
-                code_table.c.code_type == code_type,
-                code_table.c.code_system == resolved_system,
-                code_table.c.code == resolved_code,
-            )
-        )
-    )
+    filters = [
+        code_table.c.code_system == resolved_system,
+        code_table.c.code == resolved_code,
+    ]
+    if code_type == "treatment" and resolved_system in PROCEDURE_CODE_SYSTEMS:
+        filters.append(or_(code_table.c.code_type == code_type, code_table.c.code_type.is_(None)))
+    else:
+        filters.append(code_table.c.code_type == code_type)
+    result = await session.execute(select(code_table).where(and_(*filters)).limit(1))
     row = result.first()
+
+    if not row and code_type == "treatment" and requested_system in PROCEDURE_CODE_SYSTEMS:
+        result = await session.execute(
+            select(code_table)
+            .where(
+                and_(
+                    code_table.c.code_system == requested_system,
+                    code_table.c.code == requested_code,
+                    or_(code_table.c.code_type == code_type, code_table.c.code_type.is_(None)),
+                )
+            )
+            .limit(1)
+        )
+        row = result.first()
+
     if not row:
         raise sanic.exceptions.NotFound
     return response.json(_json_safe_row(_row_to_dict(row)))
