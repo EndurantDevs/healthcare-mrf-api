@@ -13,6 +13,7 @@ from db.models import (
     PTGAllowedPayment,
     PTGAllowedProviderPayment,
     PTGBillingCode,
+    PTGProviderGroup,
     PTG2ArtifactManifest,
     PTG2Capability,
     PTG2Confidence,

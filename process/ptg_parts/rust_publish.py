@@ -36,6 +36,27 @@ def _ptg2_publish_timestamp() -> str:
     return datetime.datetime.now().isoformat(timespec="seconds")
 
 
+async def _create_optional_provider_geo_index(
+    *,
+    schema_name: str,
+    provider_group_location_table: str,
+) -> None:
+    try:
+        await db.status(
+            f"CREATE INDEX IF NOT EXISTS {_quote_ident(_ptg2_snapshot_index_name(provider_group_location_table, 'geo_gist_idx'))} "
+            f"ON {_quote_ident(schema_name)}.{_quote_ident(provider_group_location_table)} "
+            "USING gist (geography(st_makepoint(long::float8, lat::float8))) "
+            "WHERE lat IS NOT NULL AND long IS NOT NULL;"
+        )
+    except Exception as exc:  # pragma: no cover - exact driver exception varies by environment.
+        logger.warning(
+            "Skipping optional PTG2 provider geo GiST index for %s.%s: %s",
+            schema_name,
+            provider_group_location_table,
+            exc,
+        )
+
+
 async def _publish_renamed_rust_dictionary_table(
     *,
     schema_name: str,
@@ -296,11 +317,9 @@ async def _publish_rust_compact_snapshot_tables(
                 f"CREATE INDEX IF NOT EXISTS {_quote_ident(_ptg2_snapshot_index_name(provider_group_location_table, role))} "
                 f"ON {_quote_ident(schema_name)}.{_quote_ident(provider_group_location_table)} {columns_sql};"
             )
-        await db.status(
-            f"CREATE INDEX IF NOT EXISTS {_quote_ident(_ptg2_snapshot_index_name(provider_group_location_table, 'geo_gist_idx'))} "
-            f"ON {_quote_ident(schema_name)}.{_quote_ident(provider_group_location_table)} "
-            "USING gist (geography(st_makepoint(long::float8, lat::float8))) "
-            "WHERE lat IS NOT NULL AND long IS NOT NULL;"
+        await _create_optional_provider_geo_index(
+            schema_name=schema_name,
+            provider_group_location_table=provider_group_location_table,
         )
     analyze_started = time.monotonic()
     for table_name in table_names.values():

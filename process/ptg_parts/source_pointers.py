@@ -68,12 +68,14 @@ async def _source_plan_rows(
         table_value = str(serving_index["table"])
         table_name = table_value.split(".", 1)[1] if "." in table_value else table_value
         if await _table_exists(schema_name, table_name):
+            snapshot_filter = "" if serving_index.get("storage") == "v3_manifest_snapshot" else "WHERE snapshot_id = :snapshot_id"
+            plan_filter = "WHERE" if not snapshot_filter else "AND"
             rows = await db.all(
                 f"""
                 SELECT DISTINCT plan_id, '' AS plan_market_type
                   FROM {_quote_ident(schema_name)}.{_quote_ident(table_name)}
-                 WHERE snapshot_id = :snapshot_id
-                   AND plan_id IS NOT NULL
+                 {snapshot_filter}
+                 {plan_filter} plan_id IS NOT NULL
                    AND plan_id <> ''
                 """,
                 snapshot_id=snapshot_id,

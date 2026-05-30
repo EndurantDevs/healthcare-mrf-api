@@ -8,3 +8,4 @@ pub mod input;
 pub mod normalize;
 pub mod output;
 pub mod progress;
+pub mod v3;

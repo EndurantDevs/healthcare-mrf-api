@@ -35,6 +35,7 @@ class PTG2ServingTables:
     serving_table: str | None = None
     price_code_set_table: str | None = None
     price_atom_table: str | None = None
+    code_count_table: str | None = None
     price_set_entry_table: str | None = None
     procedure_table: str | None = None
     provider_set_table: str | None = None
@@ -43,3 +44,14 @@ class PTG2ServingTables:
     provider_entry_component_table: str | None = None
     provider_group_member_table: str | None = None
     provider_group_location_table: str | None = None
+    storage: str | None = None
+    type: str | None = None
+    snapshot_scoped: bool = False
+    source_key: str | None = None
+    artifact_uri: str | None = None
+    artifacts: dict[str, Any] | None = None
+
+    @property
+    def is_manifest_backed_snapshot(self) -> bool:
+        storage = (self.storage or "").strip().lower()
+        return storage == "v3_manifest_snapshot"

@@ -158,6 +158,14 @@ def _iter_compact_serving_records_rust(
     provider_set_component_copy_path: str | Path | None = None,
     provider_set_entry_copy_path: str | Path | None = None,
     provider_entry_component_copy_path: str | Path | None = None,
+    v3_serving_copy_path: str | Path | None = None,
+    v3_provider_forward_sidecar_path: str | Path | None = None,
+    v3_provider_inverted_sidecar_path: str | Path | None = None,
+    v3_provider_npi_sidecar_path: str | Path | None = None,
+    v3_price_forward_sidecar_path: str | Path | None = None,
+    v3_price_atom_copy_path: str | Path | None = None,
+    v3_provider_group_member_copy_path: str | Path | None = None,
+    v3_only: bool | None = None,
 ):
     binary = _ptg2_rust_scanner_binary()
     if binary is None:
@@ -193,6 +201,22 @@ def _iter_compact_serving_records_rust(
         env["HLTHPRT_PTG2_PROVIDER_SET_ENTRY_COPY_PATH"] = str(provider_set_entry_copy_path)
     if provider_entry_component_copy_path is not None:
         env["HLTHPRT_PTG2_PROVIDER_ENTRY_COMPONENT_COPY_PATH"] = str(provider_entry_component_copy_path)
+    if v3_serving_copy_path is not None:
+        env["HLTHPRT_PTG2_V3_SERVING_COPY_PATH"] = str(v3_serving_copy_path)
+    if v3_provider_forward_sidecar_path is not None:
+        env["HLTHPRT_PTG2_V3_PROVIDER_FORWARD_SIDECAR_PATH"] = str(v3_provider_forward_sidecar_path)
+    if v3_provider_inverted_sidecar_path is not None:
+        env["HLTHPRT_PTG2_V3_PROVIDER_INVERTED_SIDECAR_PATH"] = str(v3_provider_inverted_sidecar_path)
+    if v3_provider_npi_sidecar_path is not None:
+        env["HLTHPRT_PTG2_V3_PROVIDER_NPI_SIDECAR_PATH"] = str(v3_provider_npi_sidecar_path)
+    if v3_price_forward_sidecar_path is not None:
+        env["HLTHPRT_PTG2_V3_PRICE_FORWARD_SIDECAR_PATH"] = str(v3_price_forward_sidecar_path)
+    if v3_price_atom_copy_path is not None:
+        env["HLTHPRT_PTG2_V3_PRICE_ATOM_COPY_PATH"] = str(v3_price_atom_copy_path)
+    if v3_provider_group_member_copy_path is not None:
+        env["HLTHPRT_PTG2_V3_PROVIDER_GROUP_MEMBER_COPY_PATH"] = str(v3_provider_group_member_copy_path)
+    if v3_only is not None:
+        env["HLTHPRT_PTG2_V3_ONLY"] = "true" if v3_only else "false"
     env.setdefault(PTG2_RUST_WORKERS_ENV, str(PTG2_DEFAULT_RUST_WORKERS))
     env.setdefault(PTG2_RUST_WORK_QUEUE_ENV, str(PTG2_DEFAULT_RUST_WORK_QUEUE))
     env.setdefault(PTG2_RUST_EVENT_QUEUE_ENV, str(PTG2_DEFAULT_RUST_EVENT_QUEUE))
@@ -284,6 +308,14 @@ async def _aiter_compact_serving_records_rust(
     provider_set_component_copy_path: str | Path | None = None,
     provider_set_entry_copy_path: str | Path | None = None,
     provider_entry_component_copy_path: str | Path | None = None,
+    v3_serving_copy_path: str | Path | None = None,
+    v3_provider_forward_sidecar_path: str | Path | None = None,
+    v3_provider_inverted_sidecar_path: str | Path | None = None,
+    v3_provider_npi_sidecar_path: str | Path | None = None,
+    v3_price_forward_sidecar_path: str | Path | None = None,
+    v3_price_atom_copy_path: str | Path | None = None,
+    v3_provider_group_member_copy_path: str | Path | None = None,
+    v3_only: bool | None = None,
 ):
     iterator = _iter_compact_serving_records_rust(
         path,
@@ -302,6 +334,14 @@ async def _aiter_compact_serving_records_rust(
         provider_set_component_copy_path=provider_set_component_copy_path,
         provider_set_entry_copy_path=provider_set_entry_copy_path,
         provider_entry_component_copy_path=provider_entry_component_copy_path,
+        v3_serving_copy_path=v3_serving_copy_path,
+        v3_provider_forward_sidecar_path=v3_provider_forward_sidecar_path,
+        v3_provider_inverted_sidecar_path=v3_provider_inverted_sidecar_path,
+        v3_provider_npi_sidecar_path=v3_provider_npi_sidecar_path,
+        v3_price_forward_sidecar_path=v3_price_forward_sidecar_path,
+        v3_price_atom_copy_path=v3_price_atom_copy_path,
+        v3_provider_group_member_copy_path=v3_provider_group_member_copy_path,
+        v3_only=v3_only,
     )
     event_queue: queue.Queue[Any] = queue.Queue(
         maxsize=max(_env_int(PTG2_RUST_EVENT_QUEUE_ENV, PTG2_DEFAULT_RUST_EVENT_QUEUE), 1)

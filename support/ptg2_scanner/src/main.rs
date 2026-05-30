@@ -5,8 +5,8 @@ use ptg2_scanner::config::{
     DEFAULT_PROGRESS_OBJECTS, DEFAULT_SPLIT_NEGOTIATED_RATES, READ_BUF_SIZE,
 };
 use ptg2_scanner::copy_format::{
-    emit_compact_copy_row, pg_text_array_field, pg_text_copy_field, write_copy_fields,
-    CompactCopyRow,
+    emit_compact_copy_row, emit_v3_serving_copy_row, pg_text_array_field, pg_text_copy_field,
+    write_copy_fields, CompactCopyRow, V3ServingCopyRow,
 };
 use ptg2_scanner::dedupe::{dedupe_summary_payload, emit_dedupe_summary, SharedDedupe};
 use ptg2_scanner::hashing::{
@@ -21,6 +21,11 @@ use ptg2_scanner::normalize::{
 };
 use ptg2_scanner::output::{emit_json_record, emit_object};
 use ptg2_scanner::progress::emit_progress;
+use ptg2_scanner::v3::{
+    normalized_sidecar_entries, price_set_global_id_from_atom_ids, procedure_global_id,
+    provider_set_global_id_from_entry_hashes, write_dense_member_sidecar, write_global_sidecar,
+    GlobalId128, SidecarEntry,
+};
 use serde_json::{json, Map, Value};
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -33,7 +38,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::thread;
 use std::time::Instant;
@@ -233,6 +238,7 @@ struct ProviderEntry {
     entry_hash: i64,
     provider_count: i64,
     provider_group_hashes: Vec<i64>,
+    npi: Vec<i64>,
 }
 
 #[derive(Clone, Debug)]
@@ -281,6 +287,13 @@ type PriceCodeSetHashCache = HashMap<Vec<String>, String>;
 #[derive(Clone)]
 struct CopyPathConfig {
     compact: Option<String>,
+    v3_serving: Option<String>,
+    v3_provider_forward_sidecar: Option<String>,
+    v3_provider_inverted_sidecar: Option<String>,
+    v3_provider_npi_sidecar: Option<String>,
+    v3_price_forward_sidecar: Option<String>,
+    v3_price_atom: Option<String>,
+    v3_provider_group_member: Option<String>,
     procedure: Option<String>,
     price_code_set: Option<String>,
     price_atom: Option<String>,
@@ -290,12 +303,22 @@ struct CopyPathConfig {
     provider_set_entry: Option<String>,
     provider_entry_component: Option<String>,
     provider_group_member: Option<String>,
+    v3_only: bool,
 }
 
 impl CopyPathConfig {
     fn from_env() -> Self {
         Self {
             compact: env_path("HLTHPRT_PTG2_COMPACT_SERVING_COPY_PATH"),
+            v3_serving: env_path("HLTHPRT_PTG2_V3_SERVING_COPY_PATH"),
+            v3_provider_forward_sidecar: env_path("HLTHPRT_PTG2_V3_PROVIDER_FORWARD_SIDECAR_PATH"),
+            v3_provider_inverted_sidecar: env_path(
+                "HLTHPRT_PTG2_V3_PROVIDER_INVERTED_SIDECAR_PATH",
+            ),
+            v3_provider_npi_sidecar: env_path("HLTHPRT_PTG2_V3_PROVIDER_NPI_SIDECAR_PATH"),
+            v3_price_forward_sidecar: env_path("HLTHPRT_PTG2_V3_PRICE_FORWARD_SIDECAR_PATH"),
+            v3_price_atom: env_path("HLTHPRT_PTG2_V3_PRICE_ATOM_COPY_PATH"),
+            v3_provider_group_member: env_path("HLTHPRT_PTG2_V3_PROVIDER_GROUP_MEMBER_COPY_PATH"),
             procedure: env_path("HLTHPRT_PTG2_PROCEDURE_COPY_PATH"),
             price_code_set: env_path("HLTHPRT_PTG2_PRICE_CODE_SET_COPY_PATH"),
             price_atom: env_path("HLTHPRT_PTG2_PRICE_ATOM_COPY_PATH"),
@@ -305,11 +328,16 @@ impl CopyPathConfig {
             provider_set_entry: env_path("HLTHPRT_PTG2_PROVIDER_SET_ENTRY_COPY_PATH"),
             provider_entry_component: env_path("HLTHPRT_PTG2_PROVIDER_ENTRY_COMPONENT_COPY_PATH"),
             provider_group_member: env_path("HLTHPRT_PTG2_PROVIDER_GROUP_MEMBER_COPY_PATH"),
+            v3_only: env_bool("HLTHPRT_PTG2_V3_ONLY", false),
         }
     }
 
     fn has_file_paths(&self) -> bool {
         self.compact.is_some()
+            || self.v3_serving.is_some()
+            || self.has_v3_sidecar_paths()
+            || self.v3_price_atom.is_some()
+            || self.v3_provider_group_member.is_some()
             || self.procedure.is_some()
             || self.price_code_set.is_some()
             || self.price_atom.is_some()
@@ -321,10 +349,33 @@ impl CopyPathConfig {
             || self.provider_group_member.is_some()
     }
 
+    fn has_v3_sidecar_paths(&self) -> bool {
+        self.v3_provider_forward_sidecar.is_some()
+            || self.v3_provider_inverted_sidecar.is_some()
+            || self.v3_provider_npi_sidecar.is_some()
+            || self.v3_price_forward_sidecar.is_some()
+    }
+
     fn for_worker(&self, worker_id: usize) -> Self {
         let suffix = format!(".worker{:04}", worker_id);
         Self {
             compact: self.compact.as_ref().map(|path| format!("{path}{suffix}")),
+            v3_serving: self
+                .v3_serving
+                .as_ref()
+                .map(|path| format!("{path}{suffix}")),
+            v3_provider_forward_sidecar: self.v3_provider_forward_sidecar.clone(),
+            v3_provider_inverted_sidecar: self.v3_provider_inverted_sidecar.clone(),
+            v3_provider_npi_sidecar: self.v3_provider_npi_sidecar.clone(),
+            v3_price_forward_sidecar: self.v3_price_forward_sidecar.clone(),
+            v3_price_atom: self
+                .v3_price_atom
+                .as_ref()
+                .map(|path| format!("{path}{suffix}")),
+            v3_provider_group_member: self
+                .v3_provider_group_member
+                .as_ref()
+                .map(|path| format!("{path}{suffix}")),
             procedure: self
                 .procedure
                 .as_ref()
@@ -361,6 +412,7 @@ impl CopyPathConfig {
                 .provider_group_member
                 .as_ref()
                 .map(|path| format!("{path}{suffix}")),
+            v3_only: self.v3_only,
         }
     }
 }
@@ -485,6 +537,7 @@ fn build_provider_entry(provider_ref: &Value) -> Option<ProviderEntry> {
     let groups = provider_ref.get("provider_groups")?.as_array()?;
     let mut group_payloads: Vec<Value> = Vec::new();
     let mut group_hashes: Vec<i64> = Vec::new();
+    let mut provider_npis: Vec<i64> = Vec::new();
     let mut provider_count = 0i64;
     for group in groups {
         let tin = group.get("tin").unwrap_or(&Value::Null);
@@ -492,6 +545,7 @@ fn build_provider_entry(provider_ref: &Value) -> Option<ProviderEntry> {
         let group_hash = provider_group_hash(tin, &npi);
         provider_count += npi.len() as i64;
         group_hashes.push(group_hash);
+        provider_npis.extend(npi.iter().copied());
         group_payloads.push(json!({
             "provider_group_hash": group_hash,
             "tin_type": normalize_tin_type(tin.get("type")),
@@ -505,6 +559,8 @@ fn build_provider_entry(provider_ref: &Value) -> Option<ProviderEntry> {
     group_payloads.sort_by_key(canonical_json);
     group_hashes.sort_unstable();
     group_hashes.dedup();
+    provider_npis.sort_unstable();
+    provider_npis.dedup();
     let entry_hash = if group_payloads.len() == 1 {
         group_payloads[0]
             .get("provider_group_hash")
@@ -517,6 +573,7 @@ fn build_provider_entry(provider_ref: &Value) -> Option<ProviderEntry> {
         entry_hash,
         provider_count,
         provider_group_hashes: group_hashes,
+        npi: provider_npis,
     })
 }
 
@@ -530,6 +587,7 @@ fn provider_set_from_ref_keys(
 ) -> Option<ProviderEntry> {
     let mut entry_hashes: HashSet<i64> = HashSet::new();
     let mut group_hashes: HashSet<i64> = HashSet::new();
+    let mut provider_npis: HashSet<i64> = HashSet::new();
     let mut provider_count = 0i64;
     for key in refs {
         let entry = provider_map.get(key)?;
@@ -537,6 +595,9 @@ fn provider_set_from_ref_keys(
             provider_count += entry.provider_count;
             for group_hash in &entry.provider_group_hashes {
                 group_hashes.insert(*group_hash);
+            }
+            for npi in &entry.npi {
+                provider_npis.insert(*npi);
             }
         }
     }
@@ -547,6 +608,8 @@ fn provider_set_from_ref_keys(
     sorted_entry_hashes.sort_unstable();
     let mut sorted_group_hashes: Vec<i64> = group_hashes.into_iter().collect();
     sorted_group_hashes.sort_unstable();
+    let mut sorted_provider_npis: Vec<i64> = provider_npis.into_iter().collect();
+    sorted_provider_npis.sort_unstable();
     let entry_hash = if sorted_entry_hashes.len() == 1 {
         sorted_entry_hashes[0]
     } else {
@@ -556,6 +619,7 @@ fn provider_set_from_ref_keys(
         entry_hash,
         provider_count,
         provider_group_hashes: sorted_group_hashes,
+        npi: sorted_provider_npis,
     })
 }
 
@@ -636,6 +700,220 @@ fn price_lite_set(
     })
 }
 
+fn price_atom_global_id(atom: &PriceAtomLite) -> GlobalId128 {
+    GlobalId128::from_price_atom_parts(
+        atom.negotiated_type.as_deref(),
+        Some(&atom.negotiated_rate),
+        atom.expiration_date.as_deref(),
+        &atom.service_code,
+        atom.billing_class.as_deref(),
+        atom.setting.as_deref(),
+        &atom.billing_code_modifier,
+        atom.additional_information.as_deref(),
+    )
+}
+
+fn price_set_global_id(price_set: &PriceSetLite) -> GlobalId128 {
+    let atom_ids: Vec<GlobalId128> = price_set.atoms.iter().map(price_atom_global_id).collect();
+    price_set_global_id_from_atom_ids(&atom_ids)
+}
+
+fn provider_group_global_id_from_hash(provider_group_hash: i64) -> GlobalId128 {
+    let hash_text = provider_group_hash.to_string();
+    GlobalId128::from_parts("provider_group_v3", &[&hash_text])
+}
+
+fn npi_member_id(npi: i64) -> GlobalId128 {
+    let mut out = [0u8; 16];
+    out[8..16].copy_from_slice(&(npi as u64).to_be_bytes());
+    GlobalId128(out)
+}
+
+struct V3ServingIdentityHex {
+    serving_content_hash_128: String,
+    procedure_global_id_128: String,
+    provider_set_global_id_128: String,
+    price_set_global_id_128: String,
+}
+
+fn v3_serving_identity_hex(
+    plan_id: &str,
+    procedure_payload: &Value,
+    sorted_provider_entry_hashes: &[i64],
+    price_set: &PriceSetLite,
+) -> V3ServingIdentityHex {
+    let procedure_global_id = procedure_global_id(procedure_payload);
+    let provider_set_global_id =
+        provider_set_global_id_from_entry_hashes(sorted_provider_entry_hashes);
+    let price_set_global_id = price_set_global_id(price_set);
+    let serving_content_hash = GlobalId128::serving_content(
+        plan_id,
+        procedure_global_id,
+        provider_set_global_id,
+        price_set_global_id,
+    );
+
+    V3ServingIdentityHex {
+        serving_content_hash_128: serving_content_hash.to_hex(),
+        procedure_global_id_128: procedure_global_id.to_hex(),
+        provider_set_global_id_128: provider_set_global_id.to_hex(),
+        price_set_global_id_128: price_set_global_id.to_hex(),
+    }
+}
+
+#[derive(Default)]
+struct V3SidecarCollector {
+    provider_forward: BTreeMap<GlobalId128, Vec<GlobalId128>>,
+    provider_inverted: BTreeMap<GlobalId128, Vec<GlobalId128>>,
+    provider_npi: BTreeMap<GlobalId128, Vec<GlobalId128>>,
+    price_forward: BTreeMap<GlobalId128, Vec<GlobalId128>>,
+}
+
+impl V3SidecarCollector {
+    fn record_provider_set(
+        &mut self,
+        provider_set_global_id: GlobalId128,
+        provider_group_hashes: &[i64],
+        provider_npis: &[i64],
+    ) {
+        let mut provider_group_ids: Vec<GlobalId128> = provider_group_hashes
+            .iter()
+            .map(|hash| provider_group_global_id_from_hash(*hash))
+            .collect();
+        provider_group_ids.sort_unstable();
+        provider_group_ids.dedup();
+        self.provider_forward
+            .entry(provider_set_global_id)
+            .or_default()
+            .extend(provider_group_ids.iter().copied());
+        for provider_group_id in provider_group_ids {
+            self.provider_inverted
+                .entry(provider_group_id)
+                .or_default()
+                .push(provider_set_global_id);
+        }
+        let provider_npi_ids = provider_npis
+            .iter()
+            .copied()
+            .filter(|npi| *npi > 0)
+            .map(npi_member_id)
+            .collect::<Vec<_>>();
+        self.provider_npi
+            .entry(provider_set_global_id)
+            .or_default()
+            .extend(provider_npi_ids);
+    }
+
+    fn record_price_set(&mut self, price_set: &PriceSetLite) {
+        let price_set_global_id = price_set_global_id(price_set);
+        let price_atom_ids = price_set
+            .atoms
+            .iter()
+            .map(price_atom_global_id)
+            .collect::<Vec<_>>();
+        self.price_forward
+            .entry(price_set_global_id)
+            .or_default()
+            .extend(price_atom_ids);
+    }
+
+    fn provider_forward_entries(&self) -> Vec<SidecarEntry> {
+        normalized_sidecar_entries(self.provider_forward.clone())
+    }
+
+    fn provider_inverted_entries(&self) -> Vec<SidecarEntry> {
+        normalized_sidecar_entries(self.provider_inverted.clone())
+    }
+
+    fn provider_npi_entries(&self) -> Vec<SidecarEntry> {
+        normalized_sidecar_entries(self.provider_npi.clone())
+    }
+
+    fn price_forward_entries(&self) -> Vec<SidecarEntry> {
+        normalized_sidecar_entries(self.price_forward.clone())
+    }
+}
+
+fn emit_v3_sidecar_file<W: Write>(
+    writer: &mut W,
+    record_kind: &str,
+    path: &str,
+    entries: &[SidecarEntry],
+    dense_members: bool,
+) -> io::Result<()> {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)?;
+    let mut sidecar_writer = BufWriter::new(file);
+    if dense_members {
+        write_dense_member_sidecar(&mut sidecar_writer, entries)?;
+    } else {
+        write_global_sidecar(&mut sidecar_writer, entries)?;
+    }
+    sidecar_writer.flush()?;
+    let bytes = sidecar_writer.get_ref().metadata()?.len();
+    drop(sidecar_writer);
+    emit_copy_file_event(
+        writer,
+        &CopyFileEvent {
+            record_kind: record_kind.to_string(),
+            path: path.to_string(),
+            bytes,
+            row_count: entries.len() as u64,
+            final_file: true,
+        },
+    )
+}
+
+fn emit_configured_v3_sidecars<W: Write>(
+    writer: &mut W,
+    paths: &CopyPathConfig,
+    collector: Option<&V3SidecarCollector>,
+) -> io::Result<()> {
+    let Some(collector) = collector else {
+        return Ok(());
+    };
+    if let Some(path) = paths.v3_provider_forward_sidecar.as_deref() {
+        emit_v3_sidecar_file(
+            writer,
+            "v3_provider_forward_sidecar_file",
+            path,
+            &collector.provider_forward_entries(),
+            true,
+        )?;
+    }
+    if let Some(path) = paths.v3_provider_inverted_sidecar.as_deref() {
+        emit_v3_sidecar_file(
+            writer,
+            "v3_provider_inverted_sidecar_file",
+            path,
+            &collector.provider_inverted_entries(),
+            true,
+        )?;
+    }
+    if let Some(path) = paths.v3_provider_npi_sidecar.as_deref() {
+        emit_v3_sidecar_file(
+            writer,
+            "v3_provider_npi_sidecar_file",
+            path,
+            &collector.provider_npi_entries(),
+            true,
+        )?;
+    }
+    if let Some(path) = paths.v3_price_forward_sidecar.as_deref() {
+        emit_v3_sidecar_file(
+            writer,
+            "v3_price_forward_sidecar_file",
+            path,
+            &collector.price_forward_entries(),
+            false,
+        )?;
+    }
+    Ok(())
+}
+
 struct CompactCopySink {
     base_path: Option<String>,
     record_kind: String,
@@ -683,6 +961,18 @@ impl CompactCopySink {
             io::Error::new(io::ErrorKind::BrokenPipe, "compact copy writer is closed")
         })?;
         emit_compact_copy_row(writer, row)?;
+        self.row_count += 1;
+        Ok(())
+    }
+
+    fn write_v3_serving_row(&mut self, row: &V3ServingCopyRow<'_>) -> io::Result<()> {
+        let writer = self.writer.as_mut().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "v3 serving copy writer is closed",
+            )
+        })?;
+        emit_v3_serving_copy_row(writer, row)?;
         self.row_count += 1;
         Ok(())
     }
@@ -766,6 +1056,8 @@ impl CompactCopySink {
 }
 
 struct DictionaryCopySinks {
+    v3_price_atom: Option<CompactCopySink>,
+    v3_provider_group_member: Option<CompactCopySink>,
     procedure: Option<CompactCopySink>,
     price_code_set: Option<CompactCopySink>,
     price_atom: Option<CompactCopySink>,
@@ -780,6 +1072,16 @@ struct DictionaryCopySinks {
 impl DictionaryCopySinks {
     fn from_env(rotate_bytes: u64) -> io::Result<Self> {
         Ok(Self {
+            v3_price_atom: Self::sink_from_env(
+                "HLTHPRT_PTG2_V3_PRICE_ATOM_COPY_PATH",
+                rotate_bytes,
+                "v3_price_atom_copy_file",
+            )?,
+            v3_provider_group_member: Self::sink_from_env(
+                "HLTHPRT_PTG2_V3_PROVIDER_GROUP_MEMBER_COPY_PATH",
+                rotate_bytes,
+                "v3_provider_group_member_copy_file",
+            )?,
             procedure: Self::sink_from_env(
                 "HLTHPRT_PTG2_PROCEDURE_COPY_PATH",
                 rotate_bytes,
@@ -830,6 +1132,22 @@ impl DictionaryCopySinks {
 
     fn from_paths(paths: &CopyPathConfig, rotate_bytes: u64) -> io::Result<Self> {
         Ok(Self {
+            v3_price_atom: match &paths.v3_price_atom {
+                Some(path) => Some(CompactCopySink::new_named_file(
+                    path.clone(),
+                    rotate_bytes,
+                    "v3_price_atom_copy_file",
+                )?),
+                None => None,
+            },
+            v3_provider_group_member: match &paths.v3_provider_group_member {
+                Some(path) => Some(CompactCopySink::new_named_file(
+                    path.clone(),
+                    rotate_bytes,
+                    "v3_provider_group_member_copy_file",
+                )?),
+                None => None,
+            },
             procedure: match &paths.procedure {
                 Some(path) => Some(CompactCopySink::new_named_file(
                     path.clone(),
@@ -854,13 +1172,14 @@ impl DictionaryCopySinks {
                 )?),
                 None => None,
             },
-            price_set_entry: match &paths.price_set_entry {
-                Some(path) => Some(CompactCopySink::new_named_file(
+            price_set_entry: match (&paths.price_set_entry, paths.v3_only) {
+                (_, true) => None,
+                (Some(path), false) => Some(CompactCopySink::new_named_file(
                     path.clone(),
                     rotate_bytes,
                     "price_set_entry_copy_file",
                 )?),
-                None => None,
+                (None, false) => None,
             },
             provider_set: match &paths.provider_set {
                 Some(path) => Some(CompactCopySink::new_named_file(
@@ -870,13 +1189,14 @@ impl DictionaryCopySinks {
                 )?),
                 None => None,
             },
-            provider_set_component: match &paths.provider_set_component {
-                Some(path) => Some(CompactCopySink::new_named_file(
+            provider_set_component: match (&paths.provider_set_component, paths.v3_only) {
+                (_, true) => None,
+                (Some(path), false) => Some(CompactCopySink::new_named_file(
                     path.clone(),
                     rotate_bytes,
                     "provider_set_component_copy_file",
                 )?),
-                None => None,
+                (None, false) => None,
             },
             provider_set_entry: match &paths.provider_set_entry {
                 Some(path) => Some(CompactCopySink::new_named_file(
@@ -920,6 +1240,16 @@ impl DictionaryCopySinks {
 
     fn maybe_rotate_silent(&mut self) -> io::Result<Vec<CopyFileEvent>> {
         let mut events = Vec::new();
+        if let Some(sink) = self.v3_price_atom.as_mut() {
+            if let Some(event) = sink.maybe_rotate_silent()? {
+                events.push(event);
+            }
+        }
+        if let Some(sink) = self.v3_provider_group_member.as_mut() {
+            if let Some(event) = sink.maybe_rotate_silent()? {
+                events.push(event);
+            }
+        }
         if let Some(sink) = self.procedure.as_mut() {
             if let Some(event) = sink.maybe_rotate_silent()? {
                 events.push(event);
@@ -969,6 +1299,12 @@ impl DictionaryCopySinks {
     }
 
     fn finish<W: Write>(mut self, writer: &mut W) -> io::Result<()> {
+        if let Some(sink) = self.v3_price_atom.take() {
+            sink.finish(writer)?;
+        }
+        if let Some(sink) = self.v3_provider_group_member.take() {
+            sink.finish(writer)?;
+        }
         if let Some(sink) = self.procedure.take() {
             sink.finish(writer)?;
         }
@@ -1001,6 +1337,16 @@ impl DictionaryCopySinks {
 
     fn finish_silent(mut self) -> io::Result<Vec<CopyFileEvent>> {
         let mut events = Vec::new();
+        if let Some(sink) = self.v3_price_atom.take() {
+            if let Some(event) = sink.finish_silent()? {
+                events.push(event);
+            }
+        }
+        if let Some(sink) = self.v3_provider_group_member.take() {
+            if let Some(event) = sink.finish_silent()? {
+                events.push(event);
+            }
+        }
         if let Some(sink) = self.procedure.take() {
             if let Some(event) = sink.finish_silent()? {
                 events.push(event);
@@ -1104,6 +1450,33 @@ impl DictionaryCopySinks {
         Ok(true)
     }
 
+    fn write_v3_price_atom(&mut self, atom: &PriceAtomLite) -> io::Result<bool> {
+        let Some(sink) = self.v3_price_atom.as_mut() else {
+            return Ok(false);
+        };
+        let price_atom_global_id = price_atom_global_id(atom).to_hex();
+        let fields = [
+            pg_text_copy_field(Some(&price_atom_global_id)),
+            pg_text_copy_field(atom.negotiated_type.as_deref()),
+            pg_text_copy_field(Some(&atom.negotiated_rate)),
+            pg_text_copy_field(atom.expiration_date.as_deref()),
+            pg_text_array_field(&atom.service_code),
+            pg_text_copy_field(atom.billing_class.as_deref()),
+            pg_text_copy_field(atom.setting.as_deref()),
+            pg_text_array_field(&atom.billing_code_modifier),
+            pg_text_copy_field(atom.additional_information.as_deref()),
+        ];
+        let writer = sink.writer.as_mut().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "v3 price atom copy writer is closed",
+            )
+        })?;
+        write_copy_fields(writer, &fields)?;
+        sink.row_count += 1;
+        Ok(true)
+    }
+
     fn write_price_code_set(&mut self, code_set_hash: &str, codes: &[String]) -> io::Result<()> {
         let Some(sink) = self.price_code_set.as_mut() else {
             return Ok(());
@@ -1167,6 +1540,7 @@ impl DictionaryCopySinks {
             if emitted_price_atoms.insert(atom.price_atom_hash.clone()) {
                 self.write_price_code_sets_for_atom(atom, emitted_price_code_sets)?;
                 self.write_price_atom(atom)?;
+                self.write_v3_price_atom(atom)?;
             }
         }
         Ok(())
@@ -1181,6 +1555,7 @@ impl DictionaryCopySinks {
             if dedupe.insert_price_atom(&atom.price_atom_hash) {
                 self.write_price_code_sets_for_atom_shared(atom, dedupe)?;
                 self.write_price_atom(atom)?;
+                self.write_v3_price_atom(atom)?;
             }
         }
         Ok(())
@@ -1474,41 +1849,61 @@ impl DictionaryCopySinks {
         provider_ref: &Value,
         emitted_members: &mut HashSet<(i64, i64)>,
     ) -> io::Result<()> {
-        let Some(sink) = self.provider_group_member.as_mut() else {
-            return Ok(());
-        };
         let Some(groups) = provider_ref
             .get("provider_groups")
             .and_then(Value::as_array)
         else {
             return Ok(());
         };
-        let writer = sink.writer.as_mut().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "provider group member copy writer is closed",
-            )
-        })?;
         let mut rows_written = 0u64;
+        let mut v3_rows_written = 0u64;
         for group in groups {
             let tin = group.get("tin").unwrap_or(&Value::Null);
             let npi = int_list(group.get("npi"));
             let group_hash = provider_group_hash(tin, &npi);
+            let provider_group_global_id = provider_group_global_id_from_hash(group_hash).to_hex();
             for npi_value in &npi {
                 if !emitted_members.insert((group_hash, *npi_value)) {
                     continue;
                 }
-                let group_hash_text = group_hash.to_string();
                 let npi_text = npi_value.to_string();
-                let fields = [
-                    pg_text_copy_field(Some(&group_hash_text)),
-                    pg_text_copy_field(Some(&npi_text)),
-                ];
-                write_copy_fields(writer, &fields)?;
-                rows_written += 1;
+                if let Some(sink) = self.provider_group_member.as_mut() {
+                    let writer = sink.writer.as_mut().ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "provider group member copy writer is closed",
+                        )
+                    })?;
+                    let group_hash_text = group_hash.to_string();
+                    let fields = [
+                        pg_text_copy_field(Some(&group_hash_text)),
+                        pg_text_copy_field(Some(&npi_text)),
+                    ];
+                    write_copy_fields(writer, &fields)?;
+                    rows_written += 1;
+                }
+                if let Some(sink) = self.v3_provider_group_member.as_mut() {
+                    let writer = sink.writer.as_mut().ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "v3 provider group member copy writer is closed",
+                        )
+                    })?;
+                    let fields = [
+                        pg_text_copy_field(Some(&provider_group_global_id)),
+                        pg_text_copy_field(Some(&npi_text)),
+                    ];
+                    write_copy_fields(writer, &fields)?;
+                    v3_rows_written += 1;
+                }
             }
         }
-        sink.row_count += rows_written;
+        if let Some(sink) = self.provider_group_member.as_mut() {
+            sink.row_count += rows_written;
+        }
+        if let Some(sink) = self.v3_provider_group_member.as_mut() {
+            sink.row_count += v3_rows_written;
+        }
         Ok(())
     }
 
@@ -1517,52 +1912,73 @@ impl DictionaryCopySinks {
         provider_ref: &Value,
         dedupe: &SharedDedupe,
     ) -> io::Result<()> {
-        let Some(sink) = self.provider_group_member.as_mut() else {
-            return Ok(());
-        };
         let Some(groups) = provider_ref
             .get("provider_groups")
             .and_then(Value::as_array)
         else {
             return Ok(());
         };
-        let writer = sink.writer.as_mut().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "provider group member copy writer is closed",
-            )
-        })?;
         let mut rows_written = 0u64;
+        let mut v3_rows_written = 0u64;
         for group in groups {
             let tin = group.get("tin").unwrap_or(&Value::Null);
             let npi = int_list(group.get("npi"));
             let group_hash = provider_group_hash(tin, &npi);
+            let provider_group_global_id = provider_group_global_id_from_hash(group_hash).to_hex();
             for npi_value in &npi {
                 if !dedupe.insert_provider_group_member(group_hash, *npi_value) {
                     continue;
                 }
-                let group_hash_text = group_hash.to_string();
                 let npi_text = npi_value.to_string();
-                let fields = [
-                    pg_text_copy_field(Some(&group_hash_text)),
-                    pg_text_copy_field(Some(&npi_text)),
-                ];
-                write_copy_fields(writer, &fields)?;
-                rows_written += 1;
+                if let Some(sink) = self.provider_group_member.as_mut() {
+                    let writer = sink.writer.as_mut().ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "provider group member copy writer is closed",
+                        )
+                    })?;
+                    let group_hash_text = group_hash.to_string();
+                    let fields = [
+                        pg_text_copy_field(Some(&group_hash_text)),
+                        pg_text_copy_field(Some(&npi_text)),
+                    ];
+                    write_copy_fields(writer, &fields)?;
+                    rows_written += 1;
+                }
+                if let Some(sink) = self.v3_provider_group_member.as_mut() {
+                    let writer = sink.writer.as_mut().ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "v3 provider group member copy writer is closed",
+                        )
+                    })?;
+                    let fields = [
+                        pg_text_copy_field(Some(&provider_group_global_id)),
+                        pg_text_copy_field(Some(&npi_text)),
+                    ];
+                    write_copy_fields(writer, &fields)?;
+                    v3_rows_written += 1;
+                }
             }
         }
-        sink.row_count += rows_written;
+        if let Some(sink) = self.provider_group_member.as_mut() {
+            sink.row_count += rows_written;
+        }
+        if let Some(sink) = self.v3_provider_group_member.as_mut() {
+            sink.row_count += v3_rows_written;
+        }
         Ok(())
     }
 }
 
-type ParsedCompactRate = (PriceSetLite, i64, Vec<i64>, i64);
+type ParsedCompactRate = (PriceSetLite, i64, Vec<i64>, Vec<i64>, i64);
 type ProviderEntryComponents = BTreeMap<i64, Vec<i64>>;
 
 struct GroupedPriceSet {
     price_set: PriceSetLite,
     provider_entry_hashes: HashSet<i64>,
     provider_group_hashes: HashSet<i64>,
+    provider_npis: HashSet<i64>,
     provider_count: i64,
     provider_entry_components: ProviderEntryComponents,
 }
@@ -1570,6 +1986,7 @@ struct GroupedPriceSet {
 impl
     From<(
         PriceSetLite,
+        HashSet<i64>,
         HashSet<i64>,
         HashSet<i64>,
         i64,
@@ -1581,6 +1998,7 @@ impl
             PriceSetLite,
             HashSet<i64>,
             HashSet<i64>,
+            HashSet<i64>,
             i64,
             ProviderEntryComponents,
         ),
@@ -1589,8 +2007,9 @@ impl
             price_set: value.0,
             provider_entry_hashes: value.1,
             provider_group_hashes: value.2,
-            provider_count: value.3,
-            provider_entry_components: value.4,
+            provider_npis: value.3,
+            provider_count: value.4,
+            provider_entry_components: value.5,
         }
     }
 }
@@ -1598,7 +2017,10 @@ impl
 struct LocalCompactOutputs<'a, W: Write> {
     writer: &'a mut W,
     compact_copy_writer: &'a mut Option<CompactCopySink>,
+    v3_serving_copy_writer: &'a mut Option<CompactCopySink>,
     dictionary_copy_sinks: &'a mut DictionaryCopySinks,
+    v3_sidecars: Option<&'a mut V3SidecarCollector>,
+    suppress_v2_serving_output: bool,
 }
 
 struct LocalCompactDedupe<'a> {
@@ -1629,6 +2051,7 @@ fn process_compact_rate_lites<W: Write>(
 ) -> io::Result<()> {
     let writer = &mut outputs.writer;
     let compact_copy_writer = &mut outputs.compact_copy_writer;
+    let v3_serving_copy_writer = &mut outputs.v3_serving_copy_writer;
     let dictionary_copy_sinks = &mut outputs.dictionary_copy_sinks;
     let provider_map = batch.provider_map;
     let price_code_set_hash_cache = &mut batch.price_code_set_hash_cache;
@@ -1669,7 +2092,7 @@ fn process_compact_rate_lites<W: Write>(
                 "billing_code": procedure_value.get("billing_code").cloned().unwrap_or(Value::Null),
                 "name": procedure_value.get("name").cloned().unwrap_or(Value::Null),
                 "description": procedure_value.get("description").cloned().unwrap_or(Value::Null),
-                "canonical_payload": procedure_payload,
+                "canonical_payload": procedure_payload.clone(),
             }),
         )?;
     }
@@ -1697,6 +2120,7 @@ fn process_compact_rate_lites<W: Write>(
             price_set,
             provider_entry.entry_hash,
             provider_entry.provider_group_hashes,
+            provider_entry.npi,
             provider_entry.provider_count,
         ));
     }
@@ -1705,7 +2129,7 @@ fn process_compact_rate_lites<W: Write>(
         env_bool("HLTHPRT_PTG2_RUST_GROUP_NEGOTIATED_RATE_CHUNKS", false);
     let grouped: Vec<GroupedPriceSet> = if group_negotiated_rate_chunks {
         let mut by_price_set: BTreeMap<String, GroupedPriceSet> = BTreeMap::new();
-        for (price_set, provider_entry_hash, provider_group_hashes, provider_count) in parsed_rates
+        for (price_set, provider_entry_hash, provider_group_hashes, provider_npis, provider_count) in parsed_rates
         {
             let group = by_price_set
                 .entry(price_set.price_set_hash.clone())
@@ -1713,6 +2137,7 @@ fn process_compact_rate_lites<W: Write>(
                     price_set,
                     provider_entry_hashes: HashSet::new(),
                     provider_group_hashes: HashSet::new(),
+                    provider_npis: HashSet::new(),
                     provider_count: 0,
                     provider_entry_components: BTreeMap::new(),
                 });
@@ -1723,6 +2148,11 @@ fn process_compact_rate_lites<W: Write>(
                 for provider_group_hash in &sorted_components {
                     group.provider_group_hashes.insert(*provider_group_hash);
                 }
+                for npi in provider_npis {
+                    if npi > 0 {
+                        group.provider_npis.insert(npi);
+                    }
+                }
                 group.provider_count += provider_count;
                 group
                     .provider_entry_components
@@ -1731,6 +2161,11 @@ fn process_compact_rate_lites<W: Write>(
                 for provider_group_hash in provider_group_hashes {
                     group.provider_group_hashes.insert(provider_group_hash);
                 }
+                for npi in provider_npis {
+                    if npi > 0 {
+                        group.provider_npis.insert(npi);
+                    }
+                }
             }
         }
         by_price_set.into_values().collect()
@@ -1738,7 +2173,7 @@ fn process_compact_rate_lites<W: Write>(
         parsed_rates
             .into_iter()
             .map(
-                |(price_set, provider_entry_hash, mut provider_group_hashes, provider_count)| {
+                |(price_set, provider_entry_hash, mut provider_group_hashes, provider_npis, provider_count)| {
                     provider_group_hashes.sort_unstable();
                     provider_group_hashes.dedup();
                     let mut provider_entry_hashes = HashSet::new();
@@ -1747,12 +2182,17 @@ fn process_compact_rate_lites<W: Write>(
                         .iter()
                         .copied()
                         .collect::<HashSet<_>>();
+                    let provider_npis = provider_npis
+                        .into_iter()
+                        .filter(|npi| *npi > 0)
+                        .collect::<HashSet<_>>();
                     let mut provider_entry_components = BTreeMap::new();
                     provider_entry_components.insert(provider_entry_hash, provider_group_hashes);
                     GroupedPriceSet {
                         price_set,
                         provider_entry_hashes,
                         provider_group_hashes: provider_group_hashes_set,
+                        provider_npis,
                         provider_count,
                         provider_entry_components,
                     }
@@ -1768,6 +2208,8 @@ fn process_compact_rate_lites<W: Write>(
         let mut sorted_provider_hashes: Vec<i64> =
             group.provider_group_hashes.into_iter().collect();
         sorted_provider_hashes.sort_unstable();
+        let mut sorted_provider_npis: Vec<i64> = group.provider_npis.into_iter().collect();
+        sorted_provider_npis.sort_unstable();
         let provider_set_hash = hash_i64_list("provider_set", &sorted_provider_entry_hashes);
         let rate_pack_hash = hash_text(
             "serving_rate_pack",
@@ -1788,10 +2230,21 @@ fn process_compact_rate_lites<W: Write>(
             ],
         );
         let price_set_hash = group.price_set.price_set_hash.clone();
+        let v3_identity = v3_serving_copy_writer.as_ref().map(|_| {
+            v3_serving_identity_hex(
+                &context.plan_id,
+                &procedure_payload,
+                &sorted_provider_entry_hashes,
+                &group.price_set,
+            )
+        });
         if dedupe
             .price_sets
             .insert(group.price_set.price_set_hash.clone())
         {
+            if let Some(sidecars) = outputs.v3_sidecars.as_deref_mut() {
+                sidecars.record_price_set(&group.price_set);
+            }
             dictionary_copy_sinks.write_price_atoms(
                 &group.price_set.atoms,
                 dedupe.price_code_sets,
@@ -1804,6 +2257,15 @@ fn process_compact_rate_lites<W: Write>(
             )?;
         }
         if dedupe.provider_sets.insert(provider_set_hash.clone()) {
+            if let Some(sidecars) = outputs.v3_sidecars.as_deref_mut() {
+                let provider_set_global_id =
+                    provider_set_global_id_from_entry_hashes(&sorted_provider_entry_hashes);
+                sidecars.record_provider_set(
+                    provider_set_global_id,
+                    &sorted_provider_hashes,
+                    &sorted_provider_npis,
+                );
+            }
             if !dictionary_copy_sinks.write_provider_set(
                 &provider_set_hash,
                 group.provider_count,
@@ -1854,7 +2316,10 @@ fn process_compact_rate_lites<W: Write>(
                 )?;
             }
         }
-        if let Some(copy_writer) = compact_copy_writer.as_mut() {
+        if outputs.suppress_v2_serving_output {
+            // V3-only imports keep source-scoped v2 publish rollback-safe, but
+            // do not stream high-cardinality v2 serving rows that will be dropped.
+        } else if let Some(copy_writer) = compact_copy_writer.as_mut() {
             copy_writer.write_row(&CompactCopyRow {
                 serving_rate_id: &serving_rate_id,
                 snapshot_id: &context.snapshot_id,
@@ -1879,8 +2344,8 @@ fn process_compact_rate_lites<W: Write>(
                     "plan_month_id": context.plan_month_id.clone(),
                     "procedure_hash": procedure_hash,
                     "procedure_code": Value::Null,
-                    "reported_code_system": reported_code_system,
-                    "reported_code": reported_code,
+                    "reported_code_system": reported_code_system.clone(),
+                    "reported_code": reported_code.clone(),
                     "billing_code": billing_code,
                     "billing_code_type": billing_code_type,
                     "rate_pack_hash": rate_pack_hash,
@@ -1891,6 +2356,21 @@ fn process_compact_rate_lites<W: Write>(
                     "confidence_code": context.confidence_code.clone(),
                 }),
             )?;
+        }
+        if let (Some(copy_writer), Some(identity)) =
+            (v3_serving_copy_writer.as_mut(), v3_identity.as_ref())
+        {
+            copy_writer.write_v3_serving_row(&V3ServingCopyRow {
+                serving_content_hash_128: &identity.serving_content_hash_128,
+                plan_id: &context.plan_id,
+                reported_code_system: reported_code_system.as_deref(),
+                reported_code: reported_code.as_deref(),
+                procedure_global_id_128: &identity.procedure_global_id_128,
+                provider_set_global_id_128: &identity.provider_set_global_id_128,
+                provider_count: group.provider_count,
+                price_set_global_id_128: &identity.price_set_global_id_128,
+                source_trace_set_hash: &context.source_trace_set_hash,
+            })?;
         }
     }
     Ok(())
@@ -1936,7 +2416,10 @@ fn process_provider_refs_worker(
 struct SharedCompactState<'a, W: Write> {
     writer: &'a mut W,
     compact_copy_writer: &'a mut Option<CompactCopySink>,
+    v3_serving_copy_writer: &'a mut Option<CompactCopySink>,
     dictionary_copy_sinks: &'a mut DictionaryCopySinks,
+    v3_sidecars: Option<Arc<Mutex<V3SidecarCollector>>>,
+    suppress_v2_serving_output: bool,
     provider_map: &'a HashMap<String, ProviderEntry>,
     dedupe: &'a SharedDedupe,
     price_code_set_hash_cache: &'a mut PriceCodeSetHashCache,
@@ -1950,7 +2433,9 @@ fn process_compact_rate_lites_worker<W: Write>(
 ) -> io::Result<()> {
     let writer = &mut state.writer;
     let compact_copy_writer = &mut state.compact_copy_writer;
+    let v3_serving_copy_writer = &mut state.v3_serving_copy_writer;
     let dictionary_copy_sinks = &mut state.dictionary_copy_sinks;
+    let v3_sidecars = state.v3_sidecars.as_ref();
     let provider_map = state.provider_map;
     let dedupe = state.dedupe;
     let price_code_set_hash_cache = &mut state.price_code_set_hash_cache;
@@ -1989,7 +2474,7 @@ fn process_compact_rate_lites_worker<W: Write>(
                 "billing_code": procedure_value.get("billing_code").cloned().unwrap_or(Value::Null),
                 "name": procedure_value.get("name").cloned().unwrap_or(Value::Null),
                 "description": procedure_value.get("description").cloned().unwrap_or(Value::Null),
-                "canonical_payload": procedure_payload,
+                "canonical_payload": procedure_payload.clone(),
             }),
         )?;
     }
@@ -2003,6 +2488,7 @@ fn process_compact_rate_lites_worker<W: Write>(
                 price_set,
                 provider_entry.entry_hash,
                 provider_entry.provider_group_hashes,
+                provider_entry.npi,
                 provider_entry.provider_count,
             ))
         })
@@ -2012,7 +2498,7 @@ fn process_compact_rate_lites_worker<W: Write>(
         env_bool("HLTHPRT_PTG2_RUST_GROUP_NEGOTIATED_RATE_CHUNKS", false);
     let grouped: Vec<GroupedPriceSet> = if group_negotiated_rate_chunks {
         let mut by_price_set: BTreeMap<String, GroupedPriceSet> = BTreeMap::new();
-        for (price_set, provider_entry_hash, provider_group_hashes, provider_count) in parsed_rates
+        for (price_set, provider_entry_hash, provider_group_hashes, provider_npis, provider_count) in parsed_rates
         {
             let group = by_price_set
                 .entry(price_set.price_set_hash.clone())
@@ -2020,6 +2506,7 @@ fn process_compact_rate_lites_worker<W: Write>(
                     price_set,
                     provider_entry_hashes: HashSet::new(),
                     provider_group_hashes: HashSet::new(),
+                    provider_npis: HashSet::new(),
                     provider_count: 0,
                     provider_entry_components: BTreeMap::new(),
                 });
@@ -2030,6 +2517,11 @@ fn process_compact_rate_lites_worker<W: Write>(
                 for provider_group_hash in &sorted_components {
                     group.provider_group_hashes.insert(*provider_group_hash);
                 }
+                for npi in provider_npis {
+                    if npi > 0 {
+                        group.provider_npis.insert(npi);
+                    }
+                }
                 group.provider_count += provider_count;
                 group
                     .provider_entry_components
@@ -2038,6 +2530,11 @@ fn process_compact_rate_lites_worker<W: Write>(
                 for provider_group_hash in provider_group_hashes {
                     group.provider_group_hashes.insert(provider_group_hash);
                 }
+                for npi in provider_npis {
+                    if npi > 0 {
+                        group.provider_npis.insert(npi);
+                    }
+                }
             }
         }
         by_price_set.into_values().collect()
@@ -2045,7 +2542,7 @@ fn process_compact_rate_lites_worker<W: Write>(
         parsed_rates
             .into_iter()
             .map(
-                |(price_set, provider_entry_hash, mut provider_group_hashes, provider_count)| {
+                |(price_set, provider_entry_hash, mut provider_group_hashes, provider_npis, provider_count)| {
                     provider_group_hashes.sort_unstable();
                     provider_group_hashes.dedup();
                     let mut provider_entry_hashes = HashSet::new();
@@ -2054,12 +2551,17 @@ fn process_compact_rate_lites_worker<W: Write>(
                         .iter()
                         .copied()
                         .collect::<HashSet<_>>();
+                    let provider_npis = provider_npis
+                        .into_iter()
+                        .filter(|npi| *npi > 0)
+                        .collect::<HashSet<_>>();
                     let mut provider_entry_components = BTreeMap::new();
                     provider_entry_components.insert(provider_entry_hash, provider_group_hashes);
                     GroupedPriceSet {
                         price_set,
                         provider_entry_hashes,
                         provider_group_hashes: provider_group_hashes_set,
+                        provider_npis,
                         provider_count,
                         provider_entry_components,
                     }
@@ -2075,6 +2577,8 @@ fn process_compact_rate_lites_worker<W: Write>(
         let mut sorted_provider_hashes: Vec<i64> =
             group.provider_group_hashes.into_iter().collect();
         sorted_provider_hashes.sort_unstable();
+        let mut sorted_provider_npis: Vec<i64> = group.provider_npis.into_iter().collect();
+        sorted_provider_npis.sort_unstable();
         let provider_set_hash = hash_i64_list("provider_set", &sorted_provider_entry_hashes);
         let rate_pack_hash = hash_text(
             "serving_rate_pack",
@@ -2095,7 +2599,18 @@ fn process_compact_rate_lites_worker<W: Write>(
             ],
         );
         let price_set_hash = group.price_set.price_set_hash.clone();
+        let v3_identity = v3_serving_copy_writer.as_ref().map(|_| {
+            v3_serving_identity_hex(
+                &context.plan_id,
+                &procedure_payload,
+                &sorted_provider_entry_hashes,
+                &group.price_set,
+            )
+        });
         if dedupe.insert_price_set(&group.price_set.price_set_hash) {
+            if let Some(sidecars) = v3_sidecars {
+                sidecars.lock().unwrap().record_price_set(&group.price_set);
+            }
             dictionary_copy_sinks.write_price_atoms_shared(&group.price_set.atoms, dedupe)?;
             dictionary_copy_sinks.write_price_set_entries_shared(
                 &group.price_set.price_set_hash,
@@ -2104,6 +2619,18 @@ fn process_compact_rate_lites_worker<W: Write>(
             )?;
         }
         if dedupe.insert_provider_set(&provider_set_hash) {
+            if let Some(sidecars) = v3_sidecars {
+                let provider_set_global_id =
+                    provider_set_global_id_from_entry_hashes(&sorted_provider_entry_hashes);
+                sidecars
+                    .lock()
+                    .unwrap()
+                    .record_provider_set(
+                        provider_set_global_id,
+                        &sorted_provider_hashes,
+                        &sorted_provider_npis,
+                    );
+            }
             if !dictionary_copy_sinks.write_provider_set(
                 &provider_set_hash,
                 group.provider_count,
@@ -2155,7 +2682,10 @@ fn process_compact_rate_lites_worker<W: Write>(
             }
         }
         if dedupe.insert_serving_rate(&serving_rate_id) {
-            if let Some(copy_writer) = compact_copy_writer.as_mut() {
+            if state.suppress_v2_serving_output {
+                // See LocalCompactOutputs: v3-only mode avoids emitting v2
+                // serving rows over either COPY files or JSON stdout.
+            } else if let Some(copy_writer) = compact_copy_writer.as_mut() {
                 copy_writer.write_row(&CompactCopyRow {
                     serving_rate_id: &serving_rate_id,
                     snapshot_id: &context.snapshot_id,
@@ -2180,8 +2710,8 @@ fn process_compact_rate_lites_worker<W: Write>(
                         "plan_month_id": context.plan_month_id.clone(),
                         "procedure_hash": procedure_hash,
                         "procedure_code": Value::Null,
-                        "reported_code_system": reported_code_system,
-                        "reported_code": reported_code,
+                        "reported_code_system": reported_code_system.clone(),
+                        "reported_code": reported_code.clone(),
                         "billing_code": billing_code,
                         "billing_code_type": billing_code_type,
                         "rate_pack_hash": rate_pack_hash,
@@ -2192,6 +2722,21 @@ fn process_compact_rate_lites_worker<W: Write>(
                         "confidence_code": context.confidence_code.clone(),
                     }),
                 )?;
+            }
+            if let (Some(copy_writer), Some(identity)) =
+                (v3_serving_copy_writer.as_mut(), v3_identity.as_ref())
+            {
+                copy_writer.write_v3_serving_row(&V3ServingCopyRow {
+                    serving_content_hash_128: &identity.serving_content_hash_128,
+                    plan_id: &context.plan_id,
+                    reported_code_system: reported_code_system.as_deref(),
+                    reported_code: reported_code.as_deref(),
+                    procedure_global_id_128: &identity.procedure_global_id_128,
+                    provider_set_global_id_128: &identity.provider_set_global_id_128,
+                    provider_count: group.provider_count,
+                    price_set_global_id_128: &identity.price_set_global_id_128,
+                    source_trace_set_hash: &context.source_trace_set_hash,
+                })?;
             }
         }
     }
@@ -2331,7 +2876,10 @@ fn read_price_lite_struson<R: Read>(
 struct InNetworkStreamState<'a, W: Write> {
     writer: &'a mut W,
     compact_copy_writer: &'a mut Option<CompactCopySink>,
+    v3_serving_copy_writer: &'a mut Option<CompactCopySink>,
     dictionary_copy_sinks: &'a mut DictionaryCopySinks,
+    v3_sidecars: Option<&'a mut V3SidecarCollector>,
+    suppress_v2_serving_output: bool,
     provider_map: &'a HashMap<String, ProviderEntry>,
     dedupe: LocalCompactDedupe<'a>,
     price_code_set_hash_cache: &'a mut PriceCodeSetHashCache,
@@ -2369,7 +2917,10 @@ fn process_in_network_struson<R: Read, W: Write>(
                             let mut outputs = LocalCompactOutputs {
                                 writer: state.writer,
                                 compact_copy_writer: state.compact_copy_writer,
+                                v3_serving_copy_writer: state.v3_serving_copy_writer,
                                 dictionary_copy_sinks: state.dictionary_copy_sinks,
+                                v3_sidecars: state.v3_sidecars.as_deref_mut(),
+                                suppress_v2_serving_output: state.suppress_v2_serving_output,
                             };
                             let mut batch = CompactRateBatch {
                                 provider_map: state.provider_map,
@@ -2400,7 +2951,10 @@ fn process_in_network_struson<R: Read, W: Write>(
         let mut outputs = LocalCompactOutputs {
             writer: state.writer,
             compact_copy_writer: state.compact_copy_writer,
+            v3_serving_copy_writer: state.v3_serving_copy_writer,
             dictionary_copy_sinks: state.dictionary_copy_sinks,
+            v3_sidecars: state.v3_sidecars.as_deref_mut(),
+            suppress_v2_serving_output: state.suppress_v2_serving_output,
         };
         let mut batch = CompactRateBatch {
             provider_map: state.provider_map,
@@ -2483,10 +3037,16 @@ fn enqueue_in_network_struson<R: Read>(
 
 fn finish_worker_outputs(
     compact_copy_writer: Option<CompactCopySink>,
+    v3_serving_copy_writer: Option<CompactCopySink>,
     dictionary_copy_sinks: DictionaryCopySinks,
 ) -> io::Result<Vec<CopyFileEvent>> {
     let mut events = Vec::new();
     if let Some(copy_writer) = compact_copy_writer {
+        if let Some(event) = copy_writer.finish_silent()? {
+            events.push(event);
+        }
+    }
+    if let Some(copy_writer) = v3_serving_copy_writer {
         if let Some(event) = copy_writer.finish_silent()? {
             events.push(event);
         }
@@ -2499,6 +3059,7 @@ struct CompactWorkerConfig {
     event_tx: Sender<CopyFileEvent>,
     provider_map: Arc<HashMap<String, ProviderEntry>>,
     dedupe: Arc<SharedDedupe>,
+    v3_sidecars: Option<Arc<Mutex<V3SidecarCollector>>>,
     copy_paths: CopyPathConfig,
     rotate_bytes: u64,
     context: CompactContext,
@@ -2515,6 +3076,17 @@ fn compact_worker_loop(
         .as_ref()
         .map(|path| CompactCopySink::new_file(path.clone(), config.rotate_bytes))
         .transpose()?;
+    let mut v3_serving_copy_writer = worker_paths
+        .v3_serving
+        .as_ref()
+        .map(|path| {
+            CompactCopySink::new_named_file(
+                path.clone(),
+                config.rotate_bytes,
+                "v3_serving_copy_file",
+            )
+        })
+        .transpose()?;
     let mut dictionary_copy_sinks =
         DictionaryCopySinks::from_paths(&worker_paths, config.rotate_bytes)?;
     let mut sink = io::sink();
@@ -2530,7 +3102,10 @@ fn compact_worker_loop(
                 let mut state = SharedCompactState {
                     writer: &mut sink,
                     compact_copy_writer: &mut compact_copy_writer,
+                    v3_serving_copy_writer: &mut v3_serving_copy_writer,
                     dictionary_copy_sinks: &mut dictionary_copy_sinks,
+                    v3_sidecars: config.v3_sidecars.clone(),
+                    suppress_v2_serving_output: config.copy_paths.v3_only,
                     provider_map: &config.provider_map,
                     dedupe: &config.dedupe,
                     price_code_set_hash_cache: &mut price_code_set_hash_cache,
@@ -2549,6 +3124,16 @@ fn compact_worker_loop(
                 })?;
             }
         }
+        if let Some(copy_writer) = v3_serving_copy_writer.as_mut() {
+            if let Some(event) = copy_writer.maybe_rotate_silent()? {
+                config.event_tx.send(event).map_err(|err| {
+                    io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        format!("v3 serving copy event queue closed: {err}"),
+                    )
+                })?;
+            }
+        }
         for event in dictionary_copy_sinks.maybe_rotate_silent()? {
             config.event_tx.send(event).map_err(|err| {
                 io::Error::new(
@@ -2559,7 +3144,11 @@ fn compact_worker_loop(
         }
     }
 
-    finish_worker_outputs(compact_copy_writer, dictionary_copy_sinks)
+    finish_worker_outputs(
+        compact_copy_writer,
+        v3_serving_copy_writer,
+        dictionary_copy_sinks,
+    )
 }
 
 fn scan_compact_struson_parallel(
@@ -2595,6 +3184,9 @@ fn scan_compact_struson_parallel(
     );
     let bounded_queue_size = queue_size.max(worker_count).max(1);
     let dedupe = Arc::new(SharedDedupe::new(worker_count));
+    let v3_sidecars = copy_paths
+        .has_v3_sidecar_paths()
+        .then(|| Arc::new(Mutex::new(V3SidecarCollector::default())));
     let event_queue_size = env_usize(
         "HLTHPRT_PTG2_RUST_EVENT_QUEUE",
         (bounded_queue_size * 2).max(worker_count),
@@ -2642,6 +3234,7 @@ fn scan_compact_struson_parallel(
                     let worker_event_tx = event_tx.clone();
                     let worker_provider_map = Arc::clone(&provider_map);
                     let worker_dedupe = Arc::clone(&dedupe);
+                    let worker_v3_sidecars = v3_sidecars.as_ref().map(Arc::clone);
                     let worker_copy_paths = copy_paths.clone();
                     let worker_context = context.clone();
                     handles.push((
@@ -2655,6 +3248,7 @@ fn scan_compact_struson_parallel(
                                         event_tx: worker_event_tx,
                                         provider_map: worker_provider_map,
                                         dedupe: worker_dedupe,
+                                        v3_sidecars: worker_v3_sidecars,
                                         copy_paths: worker_copy_paths,
                                         rotate_bytes: compact_copy_rotate_bytes,
                                         context: worker_context,
@@ -2773,6 +3367,10 @@ fn scan_compact_struson_parallel(
                 for event in copy_file_events {
                     emit_copy_file_event(&mut writer, &event)?;
                 }
+                if let Some(sidecars) = v3_sidecars.as_ref() {
+                    let sidecars = sidecars.lock().unwrap();
+                    emit_configured_v3_sidecars(&mut writer, &copy_paths, Some(&sidecars))?;
+                }
                 emit_json_record(
                     &mut writer,
                     "dedupe_summary",
@@ -2880,7 +3478,19 @@ fn scan_compact_struson(path: &Path) -> io::Result<()> {
         )?),
         None => None,
     };
-    let mut dictionary_copy_sinks = DictionaryCopySinks::from_env(compact_copy_rotate_bytes)?;
+    let mut v3_serving_copy_writer: Option<CompactCopySink> = match copy_paths.v3_serving.as_ref() {
+        Some(copy_path) => Some(CompactCopySink::new_named_file(
+            copy_path.clone(),
+            compact_copy_rotate_bytes,
+            "v3_serving_copy_file",
+        )?),
+        None => None,
+    };
+    let mut dictionary_copy_sinks =
+        DictionaryCopySinks::from_paths(&copy_paths, compact_copy_rotate_bytes)?;
+    let mut v3_sidecars = copy_paths
+        .has_v3_sidecar_paths()
+        .then(V3SidecarCollector::default);
     let progress_bytes_interval = progress_interval(
         "HLTHPRT_PTG2_SCANNER_PROGRESS_BYTES",
         DEFAULT_PROGRESS_BYTES,
@@ -2941,7 +3551,10 @@ fn scan_compact_struson(path: &Path) -> io::Result<()> {
                     let mut stream_state = InNetworkStreamState {
                         writer: &mut writer,
                         compact_copy_writer: &mut compact_copy_writer,
+                        v3_serving_copy_writer: &mut v3_serving_copy_writer,
                         dictionary_copy_sinks: &mut dictionary_copy_sinks,
+                        v3_sidecars: v3_sidecars.as_mut(),
+                        suppress_v2_serving_output: copy_paths.v3_only,
                         provider_map: &provider_map,
                         dedupe: LocalCompactDedupe {
                             price_code_sets: &mut emitted_price_code_sets,
@@ -3013,7 +3626,11 @@ fn scan_compact_struson(path: &Path) -> io::Result<()> {
     if let Some(copy_writer) = compact_copy_writer.take() {
         copy_writer.finish(&mut writer)?;
     }
+    if let Some(copy_writer) = v3_serving_copy_writer.take() {
+        copy_writer.finish(&mut writer)?;
+    }
     dictionary_copy_sinks.finish(&mut writer)?;
+    emit_configured_v3_sidecars(&mut writer, &copy_paths, v3_sidecars.as_ref())?;
     writer.flush()?;
     emit_progress(
         path,
@@ -3028,6 +3645,71 @@ fn scan_compact_struson(path: &Path) -> io::Result<()> {
 
 fn scan_compact(path: &Path) -> io::Result<()> {
     scan_compact_struson(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ptg2_scanner::v3::GLOBAL_ID_BYTES;
+
+    #[test]
+    fn v3_only_disables_high_cardinality_v2_dictionary_sinks() {
+        let provider_set_entry_path = std::env::temp_dir().join(format!(
+            "ptg2-provider-set-entry-{}.copy",
+            std::process::id()
+        ));
+        let paths = CopyPathConfig {
+            compact: None,
+            v3_serving: None,
+            v3_provider_forward_sidecar: None,
+            v3_provider_inverted_sidecar: None,
+            v3_provider_npi_sidecar: None,
+            v3_price_forward_sidecar: None,
+            v3_price_atom: None,
+            v3_provider_group_member: None,
+            procedure: None,
+            price_code_set: None,
+            price_atom: None,
+            price_set_entry: Some("unused-price-set-entry.copy".to_string()),
+            provider_set: None,
+            provider_set_component: Some("unused-provider-set-component.copy".to_string()),
+            provider_set_entry: Some(provider_set_entry_path.to_string_lossy().to_string()),
+            provider_entry_component: None,
+            provider_group_member: None,
+            v3_only: true,
+        };
+
+        let sinks = DictionaryCopySinks::from_paths(&paths, 0).unwrap();
+
+        assert!(sinks.price_set_entry.is_none());
+        assert!(sinks.provider_set_component.is_none());
+        assert!(sinks.provider_set_entry.is_some());
+        drop(sinks);
+        let _ = std::fs::remove_file(provider_set_entry_path);
+    }
+
+    #[test]
+    fn v3_sidecar_collector_sorts_and_merges_members() {
+        let provider_set_id = GlobalId128([5; GLOBAL_ID_BYTES]);
+        let mut collector = V3SidecarCollector::default();
+
+        collector.record_provider_set(provider_set_id, &[20, 10, 20], &[1003002106, 1003007311]);
+
+        let entries = collector.provider_forward_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].owner, provider_set_id);
+        assert_eq!(entries[0].members.len(), 2);
+        assert!(entries[0].members[0] < entries[0].members[1]);
+        let inverted = collector.provider_inverted_entries();
+        assert_eq!(inverted.len(), 2);
+        assert!(inverted
+            .iter()
+            .all(|entry| entry.members == vec![provider_set_id]));
+        let provider_npi = collector.provider_npi_entries();
+        assert_eq!(provider_npi.len(), 1);
+        assert_eq!(provider_npi[0].owner, provider_set_id);
+        assert_eq!(provider_npi[0].members.len(), 2);
+    }
 }
 
 fn main() -> io::Result<()> {
