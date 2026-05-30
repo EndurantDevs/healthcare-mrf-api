@@ -654,6 +654,30 @@ async def test_search_current_ptg2_index_caches_shaped_positive_responses(monkey
 
 
 @pytest.mark.asyncio
+async def test_search_current_ptg2_index_ignores_non_v3_serving_storage(monkeypatch):
+    async def fake_resolve(_session, _args):
+        return "legacy-snap"
+
+    async def fake_snapshot(_session, _snapshot_id):
+        return ptg2_serving.PTG2ServingTables(
+            storage="db_compact_snapshot",
+            serving_table="mrf.ptg2_serving_rate_compact_legacy",
+        )
+
+    ptg2_serving.clear_ptg2_index_cache()
+    monkeypatch.setattr(ptg2_serving, "resolve_current_ptg2_snapshot_id", fake_resolve)
+    monkeypatch.setattr(ptg2_serving, "snapshot_serving_tables", fake_snapshot)
+
+    payload = await ptg2_serving.search_current_ptg2_index(
+        FakeSession([]),
+        {"plan_id": "010854205", "code": "70551"},
+        FakePagination(),
+    )
+
+    assert payload is None
+
+
+@pytest.mark.asyncio
 async def test_search_current_ptg2_index_does_not_negative_cache_missing_payload(monkeypatch):
     calls = {"snapshot": 0, "search": 0}
 

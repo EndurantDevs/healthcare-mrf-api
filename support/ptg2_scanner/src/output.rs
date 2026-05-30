@@ -38,7 +38,12 @@ mod tests {
     fn json_records_are_framed_as_compact_json() {
         let mut buffer = Vec::new();
 
-        emit_json_record(&mut buffer, "compact_copy_file", &json!({"row_count": 2, "final": true})).unwrap();
+        emit_json_record(
+            &mut buffer,
+            "compact_copy_file",
+            &json!({"row_count": 2, "final": true}),
+        )
+        .unwrap();
 
         let text = String::from_utf8(buffer).unwrap();
         assert!(text.starts_with("compact_copy_file\t"));

@@ -111,7 +111,7 @@ async def snapshot_serving_tables(session, snapshot_id: str) -> PTG2ServingTable
     result = await session.execute(
         text(
             f"""
-            SELECT manifest->'serving_index'
+            SELECT manifest
               FROM {PTG2_SCHEMA}.ptg2_snapshot
              WHERE snapshot_id = :snapshot_id
              LIMIT 1
@@ -129,18 +129,40 @@ async def snapshot_serving_tables(session, snapshot_id: str) -> PTG2ServingTable
             return PTG2ServingTables()
     if not isinstance(value, dict):
         return PTG2ServingTables()
+    manifest = value
+    serving_index = manifest.get("serving_index")
+    if isinstance(serving_index, str):
+        try:
+            serving_index = json.loads(serving_index)
+        except json.JSONDecodeError:
+            serving_index = None
+    if not isinstance(serving_index, dict):
+        serving_index = manifest
+    artifact_uri = (
+        serving_index.get("artifact_uri")
+        or serving_index.get("storage_uri")
+        or manifest.get("artifact_uri")
+        or manifest.get("storage_uri")
+    )
     return PTG2ServingTables(
-        serving_table=_safe_table_name(value.get("table")),
-        price_code_set_table=_safe_table_name(value.get("price_code_set_table")),
-        price_atom_table=_safe_table_name(value.get("price_atom_table")),
-        price_set_entry_table=_safe_table_name(value.get("price_set_entry_table")),
-        procedure_table=_safe_table_name(value.get("procedure_table")) or f"{PTG2_SCHEMA}.ptg2_procedure",
-        provider_set_table=_safe_table_name(value.get("provider_set_table")),
-        provider_set_component_table=_safe_table_name(value.get("provider_set_component_table")),
-        provider_set_entry_table=_safe_table_name(value.get("provider_set_entry_table")),
-        provider_entry_component_table=_safe_table_name(value.get("provider_entry_component_table")),
-        provider_group_member_table=_safe_table_name(value.get("provider_group_member_table")),
-        provider_group_location_table=_safe_table_name(value.get("provider_group_location_table")),
+        storage=str(serving_index.get("storage") or "").strip() or None,
+        type=str(serving_index.get("type") or "").strip() or None,
+        snapshot_scoped=bool(serving_index.get("snapshot_scoped")),
+        source_key=str(serving_index.get("source_key") or "").strip() or None,
+        artifact_uri=str(artifact_uri or "").strip() or None,
+        artifacts=dict(serving_index.get("artifacts") or {}) if isinstance(serving_index.get("artifacts"), dict) else None,
+        serving_table=_safe_table_name(serving_index.get("table")),
+        price_code_set_table=_safe_table_name(serving_index.get("price_code_set_table")),
+        price_atom_table=_safe_table_name(serving_index.get("price_atom_table")),
+        code_count_table=_safe_table_name(serving_index.get("code_count_table")),
+        price_set_entry_table=_safe_table_name(serving_index.get("price_set_entry_table")),
+        procedure_table=_safe_table_name(serving_index.get("procedure_table")) or f"{PTG2_SCHEMA}.ptg2_procedure",
+        provider_set_table=_safe_table_name(serving_index.get("provider_set_table")),
+        provider_set_component_table=_safe_table_name(serving_index.get("provider_set_component_table")),
+        provider_set_entry_table=_safe_table_name(serving_index.get("provider_set_entry_table")),
+        provider_entry_component_table=_safe_table_name(serving_index.get("provider_entry_component_table")),
+        provider_group_member_table=_safe_table_name(serving_index.get("provider_group_member_table")),
+        provider_group_location_table=_safe_table_name(serving_index.get("provider_group_location_table")),
     )
 
 

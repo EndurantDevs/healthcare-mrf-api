@@ -14,6 +14,18 @@ pub struct CompactCopyRow<'a> {
     pub source_trace_set_hash: &'a str,
 }
 
+pub struct V3ServingCopyRow<'a> {
+    pub serving_content_hash_128: &'a str,
+    pub plan_id: &'a str,
+    pub reported_code_system: Option<&'a str>,
+    pub reported_code: Option<&'a str>,
+    pub procedure_global_id_128: &'a str,
+    pub provider_set_global_id_128: &'a str,
+    pub provider_count: i64,
+    pub price_set_global_id_128: &'a str,
+    pub source_trace_set_hash: &'a str,
+}
+
 pub fn pg_text_copy_field(value: Option<&str>) -> String {
     match value {
         None => "\\N".to_string(),
@@ -114,9 +126,33 @@ pub fn emit_compact_copy_row<W: Write>(writer: &mut W, row: &CompactCopyRow<'_>)
     )
 }
 
+pub fn emit_v3_serving_copy_row<W: Write>(
+    writer: &mut W,
+    row: &V3ServingCopyRow<'_>,
+) -> io::Result<()> {
+    let provider_count_text = row.provider_count.to_string();
+    write_copy_text_fields(
+        writer,
+        &[
+            Some(row.serving_content_hash_128),
+            Some(row.plan_id),
+            row.reported_code_system,
+            row.reported_code,
+            Some(row.procedure_global_id_128),
+            Some(row.provider_set_global_id_128),
+            Some(&provider_count_text),
+            Some(row.price_set_global_id_128),
+            Some(row.source_trace_set_hash),
+        ],
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{emit_compact_copy_row, pg_text_array_field, pg_text_copy_field, CompactCopyRow};
+    use super::{
+        emit_compact_copy_row, emit_v3_serving_copy_row, pg_text_array_field, pg_text_copy_field,
+        CompactCopyRow, V3ServingCopyRow,
+    };
 
     #[test]
     fn text_copy_fields_escape_postgres_copy_control_chars() {
@@ -157,6 +193,29 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "rate\\t1\tsnap\tplan\tproc\t\\N\tRC\t0450\tprovider\t2\tprice\tsource\n"
+        );
+    }
+
+    #[test]
+    fn v3_serving_copy_rows_include_nullable_reported_code_fields() {
+        let row = V3ServingCopyRow {
+            serving_content_hash_128: "serving",
+            plan_id: "plan\t1",
+            reported_code_system: Some("CPT"),
+            reported_code: None,
+            procedure_global_id_128: "procedure",
+            provider_set_global_id_128: "provider",
+            provider_count: 12,
+            price_set_global_id_128: "price",
+            source_trace_set_hash: "source\ntrace",
+        };
+        let mut out = Vec::new();
+
+        emit_v3_serving_copy_row(&mut out, &row).unwrap();
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "serving\tplan\\t1\tCPT\t\\N\tprocedure\tprovider\t12\tprice\tsource\\ntrace\n"
         );
     }
 }
