@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 from typing import Any
+from uuid import UUID
 
 from api.ptg2_response import (
     _coerce_numeric_rate,
@@ -33,6 +34,25 @@ def _row_mapping(row: Any) -> dict[str, Any]:
     if isinstance(row, dict):
         return dict(row)
     return dict(row)
+
+
+def _uuid_to_hex(value: Any) -> str:
+    if value in (None, ""):
+        return ""
+    if isinstance(value, UUID):
+        return value.hex
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        raw = bytes(value)
+        return raw.hex() if len(raw) == 16 else raw.hex()
+    text_value = str(value).strip().lower()
+    if not text_value:
+        return ""
+    if "-" in text_value:
+        try:
+            return UUID(text_value).hex
+        except ValueError:
+            return text_value.replace("-", "")
+    return text_value
 
 
 def _price_filter_clauses(

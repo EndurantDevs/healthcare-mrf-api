@@ -2997,7 +2997,8 @@ def test_ptg2_v3_snapshot_publish_direct_renames_and_indexes(monkeypatch):
 
     joined = "\n".join(status_calls)
     assert result["storage"] == "v3_manifest_snapshot"
-    assert result["type"] == "ptg2_v3_serving"
+    assert result["type"] == "ptg2_serving"
+    assert result["id_storage"] == "hex"
     assert result["rate_count"] == 321
     assert result["serving_rates"] == 321
     assert result["table"].startswith("mrf.ptg2_v3_serving_")
@@ -3010,6 +3011,26 @@ def test_ptg2_v3_snapshot_publish_direct_renames_and_indexes(monkeypatch):
     assert "SELECT DISTINCT ON (price_atom_global_id_128)" in joined
     assert "SELECT DISTINCT ON (provider_group_global_id_128, npi)" in joined
     assert "CREATE UNIQUE INDEX" in joined
+
+
+def test_ptg2_manifest_stage_uses_uuid_ids_when_enabled(monkeypatch):
+    status_calls = []
+
+    async def fake_status(statement, **_params):
+        status_calls.append(statement)
+
+    monkeypatch.setenv("HLTHPRT_PTG2_BINARY_IDS", "true")
+    monkeypatch.setattr(ptg_v3_publish.db, "status", fake_status)
+
+    asyncio.run(process_ptg._create_ptg2_v3_serving_stage_table("abc"))
+
+    joined = "\n".join(status_calls)
+    assert "serving_content_hash_128 uuid NOT NULL" in joined
+    assert "procedure_global_id_128 uuid NOT NULL" in joined
+    assert "provider_set_global_id_128 uuid NOT NULL" in joined
+    assert "price_set_global_id_128 uuid NOT NULL" in joined
+    assert "price_atom_global_id_128 uuid NOT NULL" in joined
+    assert "provider_group_global_id_128 uuid NOT NULL" in joined
 
 
 def test_ptg2_source_plan_rows_falls_back_to_serving_index_table(monkeypatch):
@@ -3192,7 +3213,7 @@ def test_ptg2_test_mode_uses_v3_source_scoped_import(monkeypatch):
             "in_network",
             "https://example.test/rates.json.gz",
             True,
-            summary={"serving_rates": 111, "rust_compact_serving": True, "v3": {"serving_rows": 111}},
+            summary={"serving_rates": 111, "rust_compact_serving": True, "manifest": {"serving_rows": 111}},
         )
 
     create_stage_mock = AsyncMock(return_value="v3_stage")
@@ -3226,7 +3247,7 @@ def test_ptg2_test_mode_uses_v3_source_scoped_import(monkeypatch):
     publish_mock.assert_awaited_once()
     import_run_rows = [row for cls_name, row in pushed if cls_name == "PTG2ImportRun"]
     assert import_run_rows[-1]["options"]["source_scoped_compact"] is True
-    assert import_run_rows[-1]["options"]["v3_only"] is True
+    assert import_run_rows[-1]["options"]["serving_storage"] == "manifest_snapshot"
     assert import_run_rows[-1]["report"]["serving_rates"] == 222
 
 
@@ -3249,7 +3270,7 @@ def test_ptg2_ignores_legacy_v2_import_flags(monkeypatch):
             "in_network",
             "https://example.test/rates.json.gz",
             True,
-            summary={"serving_rates": 111, "rust_compact_serving": True, "v3": {"serving_rows": 111}},
+            summary={"serving_rates": 111, "rust_compact_serving": True, "manifest": {"serving_rows": 111}},
         )
 
     create_stage_mock = AsyncMock(return_value="v3_stage")
@@ -3284,71 +3305,6 @@ def test_ptg2_ignores_legacy_v2_import_flags(monkeypatch):
 
     create_stage_mock.assert_awaited_once()
     publish_mock.assert_awaited_once()
-
-
-def test_ptg2_v3_import_false_uses_temporary_v2_compact_fallback(monkeypatch):
-    pushed = []
-
-    async def fake_push(rows, cls, **_kwargs):
-        pushed.extend((getattr(cls, "__name__", str(cls)), row) for row in rows)
-
-    async def fake_downloaded_jobs(jobs, **_kwargs):
-        for job in jobs:
-            yield process_ptg.PTG2DownloadedJob(
-                job=job,
-                raw_artifact=SimpleNamespace(raw_sha256=str(job.get("url") or "")),
-                logical_artifact=SimpleNamespace(logical_path="/tmp/rates.json.gz"),
-            )
-
-    async def fake_process(*_args, **kwargs):
-        assert kwargs.get("ptg2_v3_stage_table") is None
-        assert kwargs.get("rust_stage_tables") == {"serving_rate_compact": "rust_stage_serving"}
-        return process_ptg.PTG2FileProcessResult(
-            "in_network",
-            "https://example.test/rates.json.gz",
-            True,
-            summary={"serving_rates": 111, "rust_compact_serving": True},
-        )
-
-    create_v2_stage_mock = AsyncMock(return_value={"serving_rate_compact": "rust_stage_serving"})
-    create_v3_stage_mock = AsyncMock(return_value="v3_stage")
-    publish_v2_mock = AsyncMock(return_value={"storage": "db_compact_snapshot", "rate_count": 222, "serving_rates": 222})
-    publish_v3_mock = AsyncMock(return_value={"storage": "v3_manifest_snapshot", "rate_count": 333, "serving_rates": 333})
-
-    monkeypatch.setenv("HLTHPRT_PTG2_V3_IMPORT", "false")
-    monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
-    monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
-    monkeypatch.setattr(process_ptg.db, "status", AsyncMock())
-    monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push)
-    monkeypatch.setattr(process_ptg, "_prepare_ptg_tables", AsyncMock(return_value={"ImportLog": "log"}))
-    monkeypatch.setattr(process_ptg, "_create_rust_copy_stage_tables", create_v2_stage_mock)
-    monkeypatch.setattr(process_ptg, "_create_ptg2_v3_serving_stage_table", create_v3_stage_mock)
-    monkeypatch.setattr(process_ptg, "_iter_downloaded_ptg_jobs", fake_downloaded_jobs)
-    monkeypatch.setattr(process_ptg, "_process_in_network_file", fake_process)
-    monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
-    monkeypatch.setattr(process_ptg, "_publish_rust_compact_snapshot_tables", publish_v2_mock)
-    monkeypatch.setattr(process_ptg, "_publish_ptg2_v3_serving_snapshot", publish_v3_mock)
-    monkeypatch.setattr(process_ptg, "_current_source_snapshot_id", AsyncMock(return_value=None))
-    monkeypatch.setattr(process_ptg, "_publish_ptg2_source_pointers", AsyncMock())
-    monkeypatch.setattr(process_ptg, "_cleanup_old_ptg2_source_tables", AsyncMock())
-
-    asyncio.run(
-        process_ptg.main(
-            in_network_url="https://example.test/rates.json.gz",
-            import_month="2026-04",
-            import_id="temporary_v2_fallback",
-            source_key="heartland_dental",
-            test_mode=True,
-        )
-    )
-
-    create_v2_stage_mock.assert_awaited_once()
-    create_v3_stage_mock.assert_not_awaited()
-    publish_v2_mock.assert_awaited_once()
-    publish_v3_mock.assert_not_awaited()
-    import_run_rows = [row for cls_name, row in pushed if cls_name == "PTG2ImportRun"]
-    assert import_run_rows[-1]["options"]["v3_only"] is False
-    assert import_run_rows[-1]["report"]["serving_rates"] == 222
 
 
 def test_ptg2_compact_finalize_builds_provider_locations_after_analyze_when_enabled(monkeypatch):

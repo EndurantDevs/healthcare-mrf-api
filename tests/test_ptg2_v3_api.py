@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+from uuid import UUID
 
 import pytest
 
@@ -328,9 +329,14 @@ async def test_ptg2_v3_manifest_snapshot_expands_provider_and_price_sidecars(tmp
 
 @pytest.mark.asyncio
 async def test_ptg2_v3_db_snapshot_serves_exact_plan_code_lookup():
+    serving_hash = "00000000000000000000000000000001"
+    procedure_id = "00000000000000000000000000000002"
+    provider_set_id = "00000000000000000000000000000003"
+    price_set_id = "00000000000000000000000000000004"
     tables = ptg2_serving.PTG2ServingTables(
         storage="v3_manifest_snapshot",
         serving_table="mrf.ptg2_v3_serving_snap_v3",
+        id_storage="uuid",
     )
     session = FakeSession(
         [
@@ -339,14 +345,14 @@ async def test_ptg2_v3_db_snapshot_serves_exact_plan_code_lookup():
             FakeResult(
                 rows=[
                     {
-                        "serving_content_hash_128": "serving-hash",
+                        "serving_content_hash_128": UUID(serving_hash),
                         "plan_id": "010854205",
                         "reported_code_system": "CPT",
                         "reported_code": "70551",
-                        "procedure_global_id_128": "procedure-hash",
-                        "provider_set_global_id_128": "provider-set-hash",
+                        "procedure_global_id_128": UUID(procedure_id),
+                        "provider_set_global_id_128": UUID(provider_set_id),
                         "provider_count": 42,
-                        "price_set_global_id_128": "price-set-hash",
+                        "price_set_global_id_128": UUID(price_set_id),
                         "source_trace_set_hash": "trace-set-hash",
                     }
                 ]
@@ -368,14 +374,14 @@ async def test_ptg2_v3_db_snapshot_serves_exact_plan_code_lookup():
     )
 
     assert payload["pagination"]["total"] == 1
-    assert payload["query"]["source"] == "ptg2_v3_db"
+    assert payload["query"]["source"] == "ptg2_db"
     assert payload["query"]["serving_table"] == "mrf.ptg2_v3_serving_snap_v3"
     item = payload["items"][0]
     assert item["reported_code"] == "70551"
     assert item["service_code"] == "70551"
     assert item["provider_count"] == 42
-    assert item["provider_set_hash"] == "provider-set-hash"
-    assert item["price_set_hash"] == "price-set-hash"
+    assert item["provider_set_hash"] == provider_set_id
+    assert item["price_set_hash"] == price_set_id
 
 
 @pytest.mark.asyncio
@@ -453,7 +459,7 @@ async def test_ptg2_v3_db_snapshot_expands_provider_npi_sidecar(tmp_path):
         serving_tables=tables,
     )
 
-    assert payload["query"]["source"] == "ptg2_v3_db"
+    assert payload["query"]["source"] == "ptg2_db"
     assert payload["query"]["result_granularity"] == "provider"
     assert payload["items"][0]["npi"] == 1234567890
     assert payload["items"][0]["provider_name"] == "TiC provider"
@@ -522,25 +528,26 @@ async def test_ptg2_v3_provider_procedures_uses_inverted_provider_sidecar(tmp_pa
                 "table": "mrf.ptg2_v3_serving_snap_v3",
                 "price_atom_table": "mrf.ptg2_v3_price_atom_snap_v3",
                 "provider_group_member_table": "mrf.ptg2_v3_provider_group_member_snap_v3",
+                "id_storage": "uuid",
                 "artifacts": {
                     "provider_inverted": provider_inverted,
                     "price_forward": price_forward,
                 },
             },
             True,
-            FakeResult(rows=[{"provider_group_global_id_128": provider_group_id}]),
+            FakeResult(rows=[{"provider_group_global_id_128": UUID(provider_group_id)}]),
             FakeResult(rows=[]),
             FakeResult(
                 rows=[
                     {
-                        "serving_content_hash_128": "serving-hash",
+                        "serving_content_hash_128": UUID("00000000000000000000000000000015"),
                         "plan_id": "010854205",
                         "reported_code_system": "CPT",
                         "reported_code": "70551",
-                        "procedure_global_id_128": "procedure-hash",
-                        "provider_set_global_id_128": provider_set_id,
+                        "procedure_global_id_128": UUID("00000000000000000000000000000016"),
+                        "provider_set_global_id_128": UUID(provider_set_id),
                         "provider_count": 1,
-                        "price_set_global_id_128": price_set_id,
+                        "price_set_global_id_128": UUID(price_set_id),
                         "source_trace_set_hash": "trace-set-hash",
                     }
                 ]
@@ -548,7 +555,7 @@ async def test_ptg2_v3_provider_procedures_uses_inverted_provider_sidecar(tmp_pa
             FakeResult(
                 rows=[
                     {
-                        "price_atom_global_id_128": price_atom_id,
+                        "price_atom_global_id_128": UUID(price_atom_id),
                         "negotiated_type": "negotiated",
                         "negotiated_rate": "451.25",
                         "expiration_date": None,
@@ -575,7 +582,7 @@ async def test_ptg2_v3_provider_procedures_uses_inverted_provider_sidecar(tmp_pa
         FakePagination(),
     )
 
-    assert payload["query"]["source"] == "ptg2_v3_db"
+    assert payload["query"]["source"] == "ptg2_db"
     assert payload["query"]["provider_reverse_index"] is True
     assert payload["items"][0]["npi"] == 1234567890
     assert payload["items"][0]["provider_set_hash"] == provider_set_id

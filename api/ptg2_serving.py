@@ -109,6 +109,7 @@ from api.ptg2_serving_utils import (
     _price_filter_clauses,
     _provider_payload,
     _row_mapping,
+    _uuid_to_hex,
 )
 
 PTG2_MODE_EXACT_SOURCE = "exact_source"
@@ -161,6 +162,18 @@ def _inferred_provider_taxonomy_code_sql(
 
 def _ptg2_v3_storage_enabled(serving_tables: PTG2ServingTables) -> bool:
     return (serving_tables.storage or "").strip().lower() == "v3_manifest_snapshot"
+
+
+def _ptg2_v3_id_array_cast(serving_tables: PTG2ServingTables) -> str:
+    return "uuid[]" if serving_tables.uses_uuid_ids else "char(32)[]"
+
+
+def _ptg2_v3_id(value: Any) -> str:
+    return _uuid_to_hex(value)
+
+
+def _ptg2_v3_ids(values: list[Any] | tuple[Any, ...]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(hex_value for value in values if (hex_value := _ptg2_v3_id(value))))
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -1681,6 +1694,7 @@ def _ptg2_v3_artifact_entry(serving_tables: PTG2ServingTables, name: str) -> dic
 
 
 def _ptg2_v3_sidecar_members(serving_tables: PTG2ServingTables, name: str, owner_id: str) -> tuple[str, ...]:
+    owner_id = _ptg2_v3_id(owner_id)
     if not owner_id:
         return ()
     members: set[str] = set()
@@ -1702,7 +1716,7 @@ def _ptg2_v3_sidecar_members_many(
     name: str,
     owner_ids: list[str] | tuple[str, ...],
 ) -> dict[str, tuple[str, ...]]:
-    owner_id_list = list(dict.fromkeys(owner_id for owner_id in owner_ids if owner_id))
+    owner_id_list = list(_ptg2_v3_ids(tuple(owner_ids)))
     result_sets: dict[str, set[str]] = {owner_id: set() for owner_id in owner_id_list}
     for entry in _ptg2_v3_artifact_entries(serving_tables, name):
         path = str(entry.get("path") or "").strip()
@@ -1720,7 +1734,11 @@ def _ptg2_v3_sidecar_members_many(
         if missing:
             members_by_owner = lookup_global_sidecar_members_many(Path(path), missing, metadata=entry)
             for owner_id in missing:
-                members = tuple(member.hex() for member in members_by_owner.get(bytes.fromhex(owner_id), ()))
+                try:
+                    owner_bytes = bytes.fromhex(owner_id)
+                except ValueError:
+                    owner_bytes = b""
+                members = tuple(member.hex() for member in members_by_owner.get(owner_bytes, ()))
                 _PTG2_V3_SIDECAR_CACHE[(path, sha, owner_id)] = members
                 result_sets[owner_id].update(members)
     return {owner_id: tuple(sorted(members)) for owner_id, members in result_sets.items()}
@@ -1749,7 +1767,7 @@ def _ptg2_v3_provider_npis_for_provider_sets(
     serving_tables: PTG2ServingTables,
     provider_set_global_ids: list[str] | tuple[str, ...],
 ) -> dict[str, tuple[int, ...]]:
-    provider_set_ids = tuple(dict.fromkeys(str(value or "") for value in provider_set_global_ids if value))
+    provider_set_ids = _ptg2_v3_ids(tuple(provider_set_global_ids))
     members_by_set = _ptg2_v3_sidecar_members_many(serving_tables, "provider_npi", provider_set_ids)
     result: dict[str, tuple[int, ...]] = {}
     for provider_set_id in provider_set_ids:
@@ -1826,15 +1844,16 @@ async def _ptg2_v3_prices_for_price_set(
     price_set_global_id: str,
 ) -> list[dict[str, Any]]:
     price_atom_table = _safe_table_name(serving_tables.price_atom_table)
+    price_set_global_id = _ptg2_v3_id(price_set_global_id)
     if not price_atom_table or not price_set_global_id:
         return []
     price_members = _ptg2_v3_sidecar_members(serving_tables, "price_forward", price_set_global_id)
     if not price_members:
         return []
     atom_ids = list(price_members)
-    stmt = (
-        text(
-            f"""
+    atom_array_cast = _ptg2_v3_id_array_cast(serving_tables)
+    stmt = text(
+        f"""
             SELECT
                 price_atom_global_id_128,
                 negotiated_type,
@@ -1846,13 +1865,11 @@ async def _ptg2_v3_prices_for_price_set(
                 billing_code_modifier,
                 additional_information
             FROM {price_atom_table}
-            WHERE price_atom_global_id_128 IN :atom_ids
+            WHERE price_atom_global_id_128 = ANY(CAST(:atom_ids AS {atom_array_cast}))
             """
-        )
-        .bindparams(bindparam("atom_ids", expanding=True))
     )
     result = await session.execute(stmt, {"atom_ids": atom_ids})
-    rows_by_id = {_row_mapping(row).get("price_atom_global_id_128"): _row_mapping(row) for row in result}
+    rows_by_id = {_ptg2_v3_id(_row_mapping(row).get("price_atom_global_id_128")): _row_mapping(row) for row in result}
     prices: list[dict[str, Any]] = []
     for atom_id in atom_ids:
         row = rows_by_id.get(atom_id)
@@ -1879,16 +1896,16 @@ async def _ptg2_v3_prices_for_price_sets(
     price_set_global_ids: list[str] | tuple[str, ...],
 ) -> dict[str, list[dict[str, Any]]]:
     price_atom_table = _safe_table_name(serving_tables.price_atom_table)
-    price_set_ids = tuple(dict.fromkeys(str(value or "") for value in price_set_global_ids if value))
+    price_set_ids = _ptg2_v3_ids(tuple(price_set_global_ids))
     if not price_atom_table or not price_set_ids:
         return {price_set_id: [] for price_set_id in price_set_ids}
     members_by_price_set = _ptg2_v3_sidecar_members_many(serving_tables, "price_forward", price_set_ids)
     atom_ids = tuple(dict.fromkeys(atom_id for atoms in members_by_price_set.values() for atom_id in atoms))
     if not atom_ids:
         return {price_set_id: [] for price_set_id in price_set_ids}
-    stmt = (
-        text(
-            f"""
+    atom_array_cast = _ptg2_v3_id_array_cast(serving_tables)
+    stmt = text(
+        f"""
             SELECT
                 price_atom_global_id_128,
                 negotiated_type,
@@ -1900,13 +1917,11 @@ async def _ptg2_v3_prices_for_price_sets(
                 billing_code_modifier,
                 additional_information
             FROM {price_atom_table}
-            WHERE price_atom_global_id_128 IN :atom_ids
+            WHERE price_atom_global_id_128 = ANY(CAST(:atom_ids AS {atom_array_cast}))
             """
-        )
-        .bindparams(bindparam("atom_ids", expanding=True))
     )
     result = await session.execute(stmt, {"atom_ids": atom_ids})
-    rows_by_id = {_row_mapping(row).get("price_atom_global_id_128"): _row_mapping(row) for row in result}
+    rows_by_id = {_ptg2_v3_id(_row_mapping(row).get("price_atom_global_id_128")): _row_mapping(row) for row in result}
     prices_by_set: dict[str, list[dict[str, Any]]] = {}
     for price_set_id in price_set_ids:
         prices: list[dict[str, Any]] = []
@@ -2003,6 +2018,8 @@ async def _ptg2_v3_location_provider_matches(
     session,
     serving_tables: PTG2ServingTables,
     args: dict[str, Any],
+    *,
+    candidate_limit: int | None = None,
 ) -> tuple[set[str], dict[str, list[dict[str, Any]]]] | None:
     provider_group_member_table = _safe_table_name(serving_tables.provider_group_member_table)
     if not provider_group_member_table or not _ptg2_v3_artifact_entry(serving_tables, "provider_inverted"):
@@ -2018,7 +2035,10 @@ async def _ptg2_v3_location_provider_matches(
         return None
 
     filters = ["addr.npi IS NOT NULL"]
-    params: dict[str, Any] = {"limit": _ptg2_v3_location_match_limit()}
+    configured_limit = _ptg2_v3_location_match_limit()
+    if candidate_limit is not None:
+        configured_limit = min(configured_limit, max(int(candidate_limit), 1))
+    params: dict[str, Any] = {"limit": configured_limit}
     if state_value:
         filters.append("addr.state_name = :state_value")
         params["state_value"] = state_value
@@ -2050,9 +2070,32 @@ async def _ptg2_v3_location_provider_matches(
         if has_npi_data
         else "'TiC provider'"
     )
-    result = await session.execute(
-        text(
-            f"""
+
+    async def _query_location_provider_rows(address_types: tuple[str, ...]) -> list[dict[str, Any]]:
+        address_filters = [*filters]
+        address_params = {**params, "address_types": list(address_types)}
+        result = await session.execute(
+            text(
+                f"""
+            WITH location_npis AS MATERIALIZED (
+                SELECT DISTINCT ON (addr.npi)
+                    addr.npi,
+                    addr.type,
+                    addr.checksum,
+                    addr.state_name,
+                    addr.city_name,
+                    addr.postal_code,
+                    addr.country_code,
+                    addr.lat,
+                    addr.long,
+                    addr.first_line,
+                    addr.second_line
+                FROM {npi_address_table} addr
+                WHERE {" AND ".join(address_filters)}
+                  AND addr.type = ANY(CAST(:address_types AS varchar[]))
+                ORDER BY addr.npi, (addr.type = 'primary') DESC, addr.type, addr.checksum
+                LIMIT :limit
+            )
             SELECT DISTINCT ON (pgm.provider_group_global_id_128, addr.npi)
                 pgm.provider_group_global_id_128,
                 addr.npi,
@@ -2075,22 +2118,28 @@ async def _ptg2_v3_location_provider_matches(
                 ARRAY[]::varchar[] AS taxonomy_codes,
                 ARRAY[]::varchar[] AS specialties,
                 {provider_name_sql} AS provider_name
-            FROM {npi_address_table} addr
+            FROM location_npis addr
             JOIN {provider_group_member_table} pgm ON pgm.npi = addr.npi
             {provider_join}
-            WHERE {" AND ".join(filters)}
-              AND addr.type IN ('primary', 'secondary')
             ORDER BY pgm.provider_group_global_id_128, addr.npi, (addr.type = 'primary') DESC, addr.type, addr.checksum
             LIMIT :limit
             """
-        ),
-        params,
-    )
-    rows = [_row_mapping(row) for row in result]
+            ),
+            address_params,
+        )
+        return [_row_mapping(row) for row in result]
+
+    # Primary addresses map to the existing (type, state, city, npi) and
+    # (type, zip5) indexes. The broad primary+secondary form forces a large
+    # sort in dense cities, so use primary practice locations for the hot path
+    # and fall back to secondary only when primary has no candidates.
+    rows = await _query_location_provider_rows(("primary",) if provider_npi is None else ("primary", "secondary"))
+    if not rows and provider_npi is None:
+        rows = await _query_location_provider_rows(("secondary",))
     if not rows:
         return set(), {}
     group_ids = tuple(
-        sorted({str(row.get("provider_group_global_id_128") or "") for row in rows if row.get("provider_group_global_id_128")})
+        sorted({_ptg2_v3_id(row.get("provider_group_global_id_128")) for row in rows if row.get("provider_group_global_id_128")})
     )
     if not group_ids:
         return set(), {}
@@ -2099,7 +2148,7 @@ async def _ptg2_v3_location_provider_matches(
     providers_by_set: dict[str, list[dict[str, Any]]] = {}
     seen_provider_rows: dict[str, set[int]] = {}
     for row in rows:
-        group_id = str(row.get("provider_group_global_id_128") or "")
+        group_id = _ptg2_v3_id(row.get("provider_group_global_id_128"))
         npi = row.get("npi")
         if not group_id or npi is None:
             continue
@@ -2134,6 +2183,7 @@ async def _ptg2_v3_provider_rows_for_provider_set(
     *,
     limit: int,
 ) -> list[dict[str, Any]] | None:
+    provider_set_global_id = _ptg2_v3_id(provider_set_global_id)
     if not provider_set_global_id:
         return None
     provider_npis = _ptg2_v3_provider_npis_for_provider_set(serving_tables, provider_set_global_id)
@@ -2147,11 +2197,12 @@ async def _ptg2_v3_provider_rows_for_provider_set(
     if not provider_groups:
         return None
     group_ids = list(provider_groups)
+    group_array_cast = _ptg2_v3_id_array_cast(serving_tables)
     npi_stmt = text(
         f"""
         SELECT DISTINCT pgm.npi
         FROM {provider_group_member_table} pgm
-        WHERE pgm.provider_group_global_id_128 = ANY(CAST(:group_ids AS char(32)[]))
+        WHERE pgm.provider_group_global_id_128 = ANY(CAST(:group_ids AS {group_array_cast}))
           AND pgm.npi > 0
         ORDER BY pgm.npi
         LIMIT :limit
@@ -2169,7 +2220,7 @@ async def _ptg2_v3_provider_rows_for_provider_sets(
     *,
     limit_per_set: int,
 ) -> dict[str, list[dict[str, Any]]] | None:
-    provider_set_ids = tuple(dict.fromkeys(str(value or "") for value in provider_set_global_ids if value))
+    provider_set_ids = _ptg2_v3_ids(tuple(provider_set_global_ids))
     if not provider_set_ids:
         return {}
 
@@ -2183,23 +2234,21 @@ async def _ptg2_v3_provider_rows_for_provider_sets(
         group_ids = tuple(dict.fromkeys(group_id for group_ids in groups_by_set.values() for group_id in group_ids))
         if not group_ids:
             return None
-        npi_stmt = (
-            text(
-                f"""
+        group_array_cast = _ptg2_v3_id_array_cast(serving_tables)
+        npi_stmt = text(
+            f"""
                 SELECT DISTINCT pgm.provider_group_global_id_128, pgm.npi
                 FROM {provider_group_member_table} pgm
-                WHERE pgm.provider_group_global_id_128 IN :group_ids
+                WHERE pgm.provider_group_global_id_128 = ANY(CAST(:group_ids AS {group_array_cast}))
                   AND pgm.npi > 0
                 ORDER BY pgm.provider_group_global_id_128, pgm.npi
                 """
-            )
-            .bindparams(bindparam("group_ids", expanding=True))
         )
         npi_result = await session.execute(npi_stmt, {"group_ids": group_ids})
         npis_by_group: dict[str, set[int]] = {}
         for row in npi_result:
             data = _row_mapping(row)
-            group_id = str(data.get("provider_group_global_id_128") or "")
+            group_id = _ptg2_v3_id(data.get("provider_group_global_id_128"))
             npi = data.get("npi")
             if group_id and npi is not None:
                 npis_by_group.setdefault(group_id, set()).add(int(npi))
@@ -2253,7 +2302,7 @@ async def _ptg2_v3_provider_sets_for_npi(
         {"provider_npi": npi},
     )
     group_ids = [
-        str(_row_mapping(row).get("provider_group_global_id_128") or "")
+        _ptg2_v3_id(_row_mapping(row).get("provider_group_global_id_128"))
         for row in group_result
         if _row_mapping(row).get("provider_group_global_id_128")
     ]
@@ -2309,7 +2358,7 @@ async def _ptg2_v3_procedure_details_for_rows(
     }
 
 
-async def _search_ptg2_v3_db_serving_table(
+async def _search_ptg2_manifest_db_serving_table(
     session,
     snapshot_id: str,
     args: dict[str, Any],
@@ -2360,7 +2409,12 @@ async def _search_ptg2_v3_db_serving_table(
         params["reported_code_system"] = requested_system
     location_providers_by_set: dict[str, list[dict[str, Any]]] = {}
     if location_filter_requested:
-        location_matches = await _ptg2_v3_location_provider_matches(session, serving_tables, args)
+        location_matches = await _ptg2_v3_location_provider_matches(
+            session,
+            serving_tables,
+            args,
+            candidate_limit=max(int(pagination.limit) * 4, 200),
+        )
         if location_matches is None:
             return None
         provider_set_ids, location_providers_by_set = location_matches
@@ -2386,7 +2440,7 @@ async def _search_ptg2_v3_db_serving_table(
                     "city": args.get("city") or None,
                     "zip5": args.get("zip5") or None,
                     "npi": args.get("npi") or None,
-                    "source": "ptg2_v3_db",
+                    "source": "ptg2_db",
                     "serving_table": table_name,
                     "include_providers": expand_providers,
                     "result_granularity": "provider" if expand_providers else "provider_set",
@@ -2394,9 +2448,10 @@ async def _search_ptg2_v3_db_serving_table(
                     "status": "no_match",
                 },
             }
-        filters.append("provider_set_global_id_128 = ANY(CAST(:provider_set_ids AS char(32)[]))")
+        filters.append(f"provider_set_global_id_128 = ANY(CAST(:provider_set_ids AS {_ptg2_v3_id_array_cast(serving_tables)}))")
         params["provider_set_ids"] = sorted(provider_set_ids)
     where_sql = " AND ".join(filters)
+    total: int | None = None
     code_count_table = _safe_table_name(serving_tables.code_count_table)
     if code_count_table and requested_system and not location_filter_requested:
         count_result = await session.execute(
@@ -2415,11 +2470,14 @@ async def _search_ptg2_v3_db_serving_table(
                 "reported_code_system": requested_system or None,
             },
         )
-    else:
+        total = int(count_result.scalar() or 0)
+        if total <= 0:
+            return None
+    elif not location_filter_requested:
         count_result = await session.execute(text(f"SELECT COUNT(*) FROM {table_name} WHERE {where_sql}"), params)
-    total = int(count_result.scalar() or 0)
-    if total <= 0:
-        return None
+        total = int(count_result.scalar() or 0)
+        if total <= 0:
+            return None
 
     row_result = await session.execute(
         text(
@@ -2444,17 +2502,19 @@ async def _search_ptg2_v3_db_serving_table(
     )
     items: list[dict[str, Any]] = []
     row_data = [_row_mapping(row) for row in row_result]
+    if not row_data:
+        return None
     prices_by_price_set = await _ptg2_v3_prices_for_price_sets(
         session,
         serving_tables,
-        [str(data.get("price_set_global_id_128") or "") for data in row_data],
+        [_ptg2_v3_id(data.get("price_set_global_id_128")) for data in row_data],
     )
     providers_by_set: dict[str, list[dict[str, Any]]] = {}
     if expand_providers:
         if location_filter_requested:
             providers_by_set = location_providers_by_set
         else:
-            provider_set_ids = [str(data.get("provider_set_global_id_128") or "") for data in row_data]
+            provider_set_ids = [_ptg2_v3_id(data.get("provider_set_global_id_128")) for data in row_data]
             provider_rows_by_set = await _ptg2_v3_provider_rows_for_provider_sets(
                 session,
                 serving_tables,
@@ -2470,8 +2530,10 @@ async def _search_ptg2_v3_db_serving_table(
             break
         reported_code = data.get("reported_code")
         reported_system = data.get("reported_code_system")
-        provider_set_hash = data.get("provider_set_global_id_128")
-        prices = prices_by_price_set.get(str(data.get("price_set_global_id_128") or ""), [])
+        provider_set_hash = _ptg2_v3_id(data.get("provider_set_global_id_128"))
+        price_set_hash = _ptg2_v3_id(data.get("price_set_global_id_128"))
+        rate_pack_hash = _ptg2_v3_id(data.get("serving_content_hash_128"))
+        prices = prices_by_price_set.get(price_set_hash, [])
         procedure_detail = procedure_details.get(_catalog_key(reported_system, reported_code) or ("", ""), {})
         base_item = {
                 "provider_ordinal": provider_set_hash,
@@ -2491,8 +2553,8 @@ async def _search_ptg2_v3_db_serving_table(
                 "billing_code": reported_code,
                 "billing_code_type": reported_system,
                 **_price_response_fields(prices),
-                "price_set_hash": data.get("price_set_global_id_128"),
-                "rate_pack_hash": data.get("serving_content_hash_128"),
+                "price_set_hash": price_set_hash,
+                "rate_pack_hash": rate_pack_hash,
                 "source_trace": [],
                 "confidence": {"network": "tic_rate_npi_tin", "location": "nppes_practice_location"},
             }
@@ -2502,7 +2564,7 @@ async def _search_ptg2_v3_db_serving_table(
         remaining = max(int(pagination.limit) - len(items), 0)
         if remaining <= 0:
             break
-        for provider in providers_by_set.get(str(data.get("provider_set_global_id_128") or ""), [])[:remaining]:
+        for provider in providers_by_set.get(_ptg2_v3_id(data.get("provider_set_global_id_128")), [])[:remaining]:
             item = dict(base_item)
             item.update(
                 {
@@ -2526,7 +2588,7 @@ async def _search_ptg2_v3_db_serving_table(
     return {
         "items": items,
         "pagination": {
-            "total": total,
+            "total": total if total is not None else int(pagination.offset) + len(items),
             "limit": pagination.limit,
             "offset": pagination.offset,
             "page": (pagination.offset // pagination.limit) + 1 if pagination.limit else 1,
@@ -2544,7 +2606,7 @@ async def _search_ptg2_v3_db_serving_table(
                 "city": args.get("city") or None,
                 "zip5": args.get("zip5") or None,
                 "npi": args.get("npi") or None,
-                "source": "ptg2_v3_db",
+                "source": "ptg2_db",
                 "serving_table": table_name,
                 "include_providers": expand_providers,
             "result_granularity": "provider" if expand_providers else "provider_set",
@@ -2565,7 +2627,7 @@ async def search_ptg2_serving_table(
     serving_tables = serving_tables or PTG2ServingTables()
     if _ptg2_v3_storage_enabled(serving_tables):
         if serving_tables.serving_table:
-            return await _search_ptg2_v3_db_serving_table(
+            return await _search_ptg2_manifest_db_serving_table(
                 session,
                 snapshot_id,
                 args,
@@ -2870,7 +2932,7 @@ async def _search_ptg2_v3_provider_procedures(
                     "code": args.get("code") or args.get("reported_code") or None,
                     "code_system": args.get("code_system") or None,
                     "q": args.get("q") or args.get("service_name") or None,
-                    "source": "ptg2_v3_db",
+                    "source": "ptg2_db",
                     "serving_table": table_name,
                     "provider_reverse_index": True,
                     "status": "no_match",
@@ -2884,7 +2946,7 @@ async def _search_ptg2_v3_provider_procedures(
     q_text = str(args.get("q") or args.get("service_name") or "").strip().lower()
     market_type = str(args.get("plan_market_type") or "").strip().lower()
     params: dict[str, Any] = {
-        "provider_set_ids": list(provider_set_ids),
+        "provider_set_ids": list(_ptg2_v3_ids(tuple(provider_set_ids))),
         "limit": int(pagination.limit),
         "offset": int(pagination.offset),
     }
@@ -2893,7 +2955,7 @@ async def _search_ptg2_v3_provider_procedures(
         code=code_value,
         code_system=args.get("code_system"),
     )
-    filters = ["provider_set_global_id_128 IN :provider_set_ids"]
+    filters = [f"provider_set_global_id_128 = ANY(CAST(:provider_set_ids AS {_ptg2_v3_id_array_cast(serving_tables)}))"]
     if requested_plan:
         filters.append("plan_id = :plan_id")
         params["plan_id"] = requested_plan
@@ -2926,9 +2988,8 @@ async def _search_ptg2_v3_provider_procedures(
         limit_sql = "LIMIT :limit"
         offset_sql = "OFFSET :offset"
     where_sql = " AND ".join(filters)
-    row_stmt = (
-        text(
-            f"""
+    row_stmt = text(
+        f"""
             SELECT
                 serving_content_hash_128,
                 plan_id,
@@ -2944,15 +3005,13 @@ async def _search_ptg2_v3_provider_procedures(
             ORDER BY reported_code_system, reported_code, provider_count DESC NULLS LAST, serving_content_hash_128
             {limit_sql} {offset_sql}
             """
-        )
-        .bindparams(bindparam("provider_set_ids", expanding=True))
     )
     row_result = await session.execute(row_stmt, params)
     row_data = [_row_mapping(row) for row in row_result]
     prices_by_price_set = await _ptg2_v3_prices_for_price_sets(
         session,
         serving_tables,
-        [str(data.get("price_set_global_id_128") or "") for data in row_data],
+        [_ptg2_v3_id(data.get("price_set_global_id_128")) for data in row_data],
     )
     procedure_details = await _ptg2_v3_procedure_details_for_rows(session, row_data)
 
@@ -2960,7 +3019,7 @@ async def _search_ptg2_v3_provider_procedures(
     skipped_for_offset = 0
     for data in row_data:
         prices = _ptg2_v3_filter_prices(
-            prices_by_price_set.get(str(data.get("price_set_global_id_128") or ""), []),
+            prices_by_price_set.get(_ptg2_v3_id(data.get("price_set_global_id_128")), []),
             args,
         )
         if has_price_filter and not prices:
@@ -2973,12 +3032,15 @@ async def _search_ptg2_v3_provider_procedures(
         reported_code = data.get("reported_code")
         reported_system = data.get("reported_code_system")
         procedure_detail = procedure_details.get(_catalog_key(reported_system, reported_code) or ("", ""), {})
+        provider_set_hash = _ptg2_v3_id(data.get("provider_set_global_id_128"))
+        price_set_hash = _ptg2_v3_id(data.get("price_set_global_id_128"))
+        rate_pack_hash = _ptg2_v3_id(data.get("serving_content_hash_128"))
         items.append(
             {
                 "npi": npi,
-                "provider_set_hash": data.get("provider_set_global_id_128"),
+                "provider_set_hash": provider_set_hash,
                 "provider_count": data.get("provider_count") or 0,
-                "provider_set_count": 1 if data.get("provider_set_global_id_128") else 0,
+                "provider_set_count": 1 if provider_set_hash else 0,
                 "procedure_code": reported_code,
                 "hp_procedure_code": reported_code,
                 "procedure_name": procedure_detail.get("procedure_name"),
@@ -2990,8 +3052,8 @@ async def _search_ptg2_v3_provider_procedures(
                 "billing_code": reported_code,
                 "billing_code_type": reported_system,
                 **_price_response_fields(prices),
-                "price_set_hash": data.get("price_set_global_id_128"),
-                "rate_pack_hash": data.get("serving_content_hash_128"),
+                "price_set_hash": price_set_hash,
+                "rate_pack_hash": rate_pack_hash,
                 "confidence": {"network": "tic_rate_npi_tin", "location": "nppes_practice_location"},
             }
         )
@@ -3020,7 +3082,7 @@ async def _search_ptg2_v3_provider_procedures(
                 "code_system": args.get("code_system") or None,
                 "q": q_text or None,
                 "price_filter": price_filter_query or None,
-                "source": "ptg2_v3_db",
+                "source": "ptg2_db",
                 "serving_table": table_name,
                 "provider_reverse_index": True,
                 "status": None if items else "no_match",

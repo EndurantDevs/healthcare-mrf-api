@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""PTG2 v3 source-scoped serving stage and publish helpers."""
+"""PTG2 source-scoped manifest-backed serving stage and publish helpers."""
 
 from __future__ import annotations
 
@@ -9,11 +9,10 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from db.connection import db
-from process.ptg_parts.config import PTG2_UNLOGGED_STAGE_ENV, _env_bool
+from process.ptg_parts.config import PTG2_BINARY_IDS_ENV, PTG2_UNLOGGED_STAGE_ENV, _env_bool
 from process.ptg_parts.db_tables import _exact_table_rows, _quote_ident, _table_exists, _table_has_rows
 from process.ptg_parts.snapshot_tables import _ptg2_snapshot_index_name, _ptg2_snapshot_table_name
 
-PTG2_V3_IMPORT_ENV = "HLTHPRT_PTG2_V3_IMPORT"
 PTG2_V3_SERVING_COPY_ENV = "HLTHPRT_PTG2_V3_SERVING_COPY_PATH"
 PTG2_V3_SERVING_COLUMNS = [
     "serving_content_hash_128",
@@ -43,8 +42,12 @@ PTG2_V3_PROVIDER_GROUP_MEMBER_COLUMNS = [
 ]
 
 
-def _use_ptg2_v3_import() -> bool:
-    return _env_bool(PTG2_V3_IMPORT_ENV, True)
+def _ptg2_id_storage() -> str:
+    return "uuid" if _env_bool(PTG2_BINARY_IDS_ENV, False) else "hex"
+
+
+def _ptg2_id_sql_type() -> str:
+    return "uuid" if _ptg2_id_storage() == "uuid" else "char(32)"
 
 
 def _ptg2_v3_stage_table_name(token: str) -> str:
@@ -65,18 +68,19 @@ async def _create_ptg2_v3_serving_stage_table(token: str) -> str:
     schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     stage_table = _ptg2_v3_stage_table_name(token)
     storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
+    id_type = _ptg2_id_sql_type()
     await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(stage_table)};")
     await db.status(
         f"""
         CREATE {storage_mode}TABLE {_quote_ident(schema_name)}.{_quote_ident(stage_table)} (
-            serving_content_hash_128 char(32) NOT NULL,
+            serving_content_hash_128 {id_type} NOT NULL,
             plan_id varchar(64) NOT NULL,
-            procedure_global_id_128 char(32) NOT NULL,
+            procedure_global_id_128 {id_type} NOT NULL,
             reported_code_system varchar(64),
             reported_code varchar(64),
-            provider_set_global_id_128 char(32) NOT NULL,
+            provider_set_global_id_128 {id_type} NOT NULL,
             provider_count integer,
-            price_set_global_id_128 char(32) NOT NULL,
+            price_set_global_id_128 {id_type} NOT NULL,
             source_trace_set_hash varchar(64)
         );
         """
@@ -97,11 +101,12 @@ async def _create_ptg2_v3_price_atom_stage_table(serving_stage_table: str) -> st
     schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     stage_table = _ptg2_v3_support_stage_table(serving_stage_table, "price_atom")
     storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
+    id_type = _ptg2_id_sql_type()
     await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(stage_table)};")
     await db.status(
         f"""
         CREATE {storage_mode}TABLE {_quote_ident(schema_name)}.{_quote_ident(stage_table)} (
-            price_atom_global_id_128 char(32) NOT NULL,
+            price_atom_global_id_128 {id_type} NOT NULL,
             negotiated_type varchar(64),
             negotiated_rate varchar(64),
             expiration_date varchar(32),
@@ -120,11 +125,12 @@ async def _create_ptg2_v3_provider_group_member_stage_table(serving_stage_table:
     schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     stage_table = _ptg2_v3_support_stage_table(serving_stage_table, "provider_group_member")
     storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
+    id_type = _ptg2_id_sql_type()
     await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(stage_table)};")
     await db.status(
         f"""
         CREATE {storage_mode}TABLE {_quote_ident(schema_name)}.{_quote_ident(stage_table)} (
-            provider_group_global_id_128 char(32) NOT NULL,
+            provider_group_global_id_128 {id_type} NOT NULL,
             npi bigint NOT NULL
         );
         """
@@ -176,9 +182,9 @@ async def _publish_ptg2_v3_serving_snapshot(
 ) -> dict[str, Any]:
     schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     if not await _table_exists(schema_name, stage_table):
-        raise RuntimeError(f"PTG2 v3 stage table does not exist: {schema_name}.{stage_table}")
+        raise RuntimeError(f"PTG2 serving stage table does not exist: {schema_name}.{stage_table}")
     if not await _table_has_rows(schema_name, stage_table):
-        raise RuntimeError(f"PTG2 v3 stage table is empty: {schema_name}.{stage_table}")
+        raise RuntimeError(f"PTG2 serving stage table is empty: {schema_name}.{stage_table}")
 
     final_table = _ptg2_snapshot_table_name("v3_serving", source_key, snapshot_id)
     price_atom_stage = _ptg2_v3_support_stage_table(stage_table, "price_atom")
@@ -363,7 +369,8 @@ async def _publish_ptg2_v3_serving_snapshot(
     artifact_manifest = _ptg2_v3_artifacts_manifest(artifacts=artifacts, sidecar_artifacts=sidecar_artifacts)
     return {
         "storage": "v3_manifest_snapshot",
-        "type": "ptg2_v3_serving",
+        "type": "ptg2_serving",
+        "id_storage": _ptg2_id_storage(),
         "snapshot_scoped": True,
         "source_key": source_key,
         "table": f"{schema_name}.{final_table}",

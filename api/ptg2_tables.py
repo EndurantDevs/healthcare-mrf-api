@@ -151,6 +151,7 @@ async def snapshot_serving_tables(session, snapshot_id: str) -> PTG2ServingTable
         source_key=str(serving_index.get("source_key") or "").strip() or None,
         artifact_uri=str(artifact_uri or "").strip() or None,
         artifacts=dict(serving_index.get("artifacts") or {}) if isinstance(serving_index.get("artifacts"), dict) else None,
+        id_storage=str(serving_index.get("id_storage") or "hex").strip().lower() or "hex",
         serving_table=_safe_table_name(serving_index.get("table")),
         price_code_set_table=_safe_table_name(serving_index.get("price_code_set_table")),
         price_atom_table=_safe_table_name(serving_index.get("price_atom_table")),

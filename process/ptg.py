@@ -373,7 +373,6 @@ from process.ptg_parts.ptg2_v3_publish import (
     _create_ptg2_v3_serving_stage_table,
     _publish_ptg2_v3_serving_snapshot,
     _ptg2_v3_support_stage_table,
-    _use_ptg2_v3_import,
 )
 from process.ptg_parts.ptg2_v3_artifacts import PTG2_V3_DENSE_MEMBERSHIP_FORMAT, PTG2_V3_MEMBERSHIP_FORMAT
 from process.ptg_parts.serving_rows import (
@@ -602,8 +601,8 @@ async def _parse_in_network_file_serving_only(
     plan_row, alias_rows, plan_month_row = _ptg2_plan_rows(plan_fields, snapshot_id, import_month)
     context_row = _ptg2_context_row(plan_fields, import_month, source_version)
     source_trace_row, _source_trace_set_row = _ptg2_source_trace_rows(source_version, source_url)
-    v3_only_import = bool(ptg2_v3_stage_table and _use_ptg2_v3_import())
-    compact_serving = True if v3_only_import else _use_compact_serving_table()
+    manifest_serving_import = bool(ptg2_v3_stage_table)
+    compact_serving = True if manifest_serving_import else _use_compact_serving_table()
     slim_serving_rows = compact_serving or _env_bool(PTG2_SLIM_SERVING_ROWS_ENV, False)
     await _push_ptg2_objects([plan_row], PTG2Plan, rewrite=True)
     if alias_rows:
@@ -727,9 +726,9 @@ async def _parse_in_network_file_serving_only(
 
     if (
         compact_serving
-        and (v3_only_import or _use_rust_compact_serving())
-        and max_items is None
-        and (not test_mode or _env_bool(PTG2_SOURCE_SCOPED_TEST_ENV, False))
+        and (manifest_serving_import or _use_rust_compact_serving())
+        and (manifest_serving_import or max_items is None)
+        and (manifest_serving_import or not test_mode or _env_bool(PTG2_SOURCE_SCOPED_TEST_ENV, False))
     ):
         rust_batches = {
             "price_set_rows": [],
@@ -745,7 +744,7 @@ async def _parse_in_network_file_serving_only(
         rust_item_count: set[str] = set()
         copy_tmp_dir = ptg2_temp_parent()
         compact_copy_path: Path | None = None
-        if not v3_only_import:
+        if not manifest_serving_import:
             compact_copy_fd, compact_copy_name = tempfile.mkstemp(
                 prefix="ptg2_compact_serving_",
                 suffix=".copy",
@@ -769,7 +768,7 @@ async def _parse_in_network_file_serving_only(
             "provider_set_component",
             "provider_group_member",
         )
-        if not v3_only_import:
+        if not manifest_serving_import:
             for dictionary_kind in dictionary_kinds:
                 fd, name = tempfile.mkstemp(
                     prefix=f"ptg2_{dictionary_kind}_",
@@ -803,8 +802,8 @@ async def _parse_in_network_file_serving_only(
             for kind in dictionary_kinds
         }
         compact_serving_copy_semaphores: dict[str, asyncio.Semaphore] = {}
-        stage_tables: dict[str, str] = {} if v3_only_import else dict(rust_stage_tables or {})
-        owns_stage_tables = (rust_stage_tables is None) and not v3_only_import
+        stage_tables: dict[str, str] = {} if manifest_serving_import else dict(rust_stage_tables or {})
+        owns_stage_tables = (rust_stage_tables is None) and not manifest_serving_import
         stage_completed = False
         if owns_stage_tables:
             stage_token = hashlib.md5(f"{snapshot_id}:{os.getpid()}:{time.time_ns()}".encode("utf-8")).hexdigest()[:12]
@@ -981,7 +980,7 @@ async def _parse_in_network_file_serving_only(
             try:
                 copy_file.unlink(missing_ok=True)
             except Exception:
-                logger.debug("Failed to remove PTG2 v3 serving copy chunk %s", copy_file, exc_info=True)
+                logger.debug("Failed to remove PTG2 serving copy chunk %s", copy_file, exc_info=True)
 
         async def copy_ready_v3_dictionary_file(kind: str, copy_row: dict[str, Any]) -> None:
             if not v3_stage_table:
@@ -1020,7 +1019,7 @@ async def _parse_in_network_file_serving_only(
             try:
                 copy_file.unlink(missing_ok=True)
             except Exception:
-                logger.debug("Failed to remove PTG2 v3 %s copy chunk %s", kind, copy_file, exc_info=True)
+                logger.debug("Failed to remove PTG2 %s copy chunk %s", kind, copy_file, exc_info=True)
 
         async def wait_for_some_copy_tasks(force: bool = False) -> None:
             nonlocal compact_copy_tasks
@@ -1063,7 +1062,7 @@ async def _parse_in_network_file_serving_only(
                 v3_price_forward_sidecar_path=v3_sidecar_paths.get("price_forward"),
                 v3_price_atom_copy_path=v3_price_atom_copy_path,
                 v3_provider_group_member_copy_path=v3_provider_group_member_copy_path,
-                v3_only=v3_only_import,
+                v3_only=manifest_serving_import,
             ):
                 if record_kind == "dedupe_summary":
                     rust_dedupe_summary = dict(record_row or {})
@@ -1183,7 +1182,7 @@ async def _parse_in_network_file_serving_only(
                 stage_completed = True
             elif stage_tables:
                 stage_completed = True
-            if v3_only_import:
+            if manifest_serving_import:
                 serving_rows = v3_copy_rows
             elif rust_stage_tables and compact_copy_rows:
                 serving_rows = compact_copy_rows
@@ -1203,7 +1202,7 @@ async def _parse_in_network_file_serving_only(
                     os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
                     v3_stage_table,
                 )
-                if v3_only_import:
+                if manifest_serving_import:
                     serving_rows = v3_copy_rows
             compact_copy_completed = True
         finally:
@@ -1242,7 +1241,7 @@ async def _parse_in_network_file_serving_only(
             compact_copy_rows,
             item_count,
         )
-        if slim_serving_rows and _env_bool(PTG2_STAGE_PRICE_SETS_ENV, True) and not rust_stage_tables and not v3_only_import:
+        if slim_serving_rows and _env_bool(PTG2_STAGE_PRICE_SETS_ENV, True) and not rust_stage_tables and not manifest_serving_import:
             await _merge_staged_price_sets(snapshot_id)
         if not _env_bool(PTG2_DEFER_PROVIDER_LOCATIONS_ENV, True):
             await _build_ptg2_provider_locations(snapshot_id)
@@ -1260,7 +1259,7 @@ async def _parse_in_network_file_serving_only(
         if rust_dedupe_summary:
             summary["dedupe"] = rust_dedupe_summary
         if v3_stage_table:
-            v3_artifacts = {}
+            manifest_artifacts = {}
             for artifact_kind, artifact_path in v3_sidecar_paths.items():
                 if artifact_path.exists() and artifact_path.stat().st_size > 0:
                     digest, byte_count = sha256_file(artifact_path)
@@ -1268,16 +1267,16 @@ async def _parse_in_network_file_serving_only(
                     with artifact_path.open("rb") as artifact_fp:
                         if artifact_fp.read(8) == b"PTG2V3DS":
                             record_format = PTG2_V3_DENSE_MEMBERSHIP_FORMAT
-                    v3_artifacts[artifact_kind] = {
+                    manifest_artifacts[artifact_kind] = {
                         "name": artifact_kind,
                         "path": str(artifact_path),
                         "record_format": record_format,
                         "sha256": digest,
                         "byte_count": byte_count,
                     }
-            summary["v3"] = {
+            summary["manifest"] = {
                 "serving_rows": v3_copy_rows,
-                "sidecars": v3_artifacts,
+                "sidecars": manifest_artifacts,
             }
         _emit_screen_line(f"PTG2 serving-only import summary: {summary}")
         logger.info("PTG2 serving-only import summary: %s", summary)
@@ -2746,12 +2745,12 @@ async def main(
     await ensure_ptg2_tables()
     compact_import = True
     source_scoped_compact = True
-    use_ptg2_v3_import = _use_ptg2_v3_import()
+    use_manifest_serving_import = True
     if source_key_val is None:
         if test_mode:
             source_key_val = _normalize_source_key(import_id_val)
         else:
-            raise ValueError("PTG v3 imports require --source-key or HLTHPRT_PTG2_SOURCE_KEY")
+            raise ValueError("PTG imports require --source-key or HLTHPRT_PTG2_SOURCE_KEY")
     now = _utcnow()
     options_payload = {
         "toc_urls": toc_urls or [],
@@ -2775,7 +2774,7 @@ async def main(
         "serving_only_import": _use_serving_only_import(),
         "source_scoped_compact": source_scoped_compact,
         "stage_serving_as_final": False,
-        "v3_only": use_ptg2_v3_import,
+        "serving_storage": "manifest_snapshot",
         "test_mode": test_mode,
     }
     await _push_ptg2_objects(
@@ -2819,7 +2818,7 @@ async def main(
     try:
         assert source_key_val is not None
         stage_token = _ptg2_snapshot_table_token(source_key_val, snapshot_id)
-        if use_ptg2_v3_import:
+        if use_manifest_serving_import:
             ptg2_v3_stage_table = await _create_ptg2_v3_serving_stage_table(stage_token)
         else:
             rust_snapshot_stage_tables = await _create_rust_copy_stage_tables(
@@ -2929,7 +2928,7 @@ async def main(
             if max_files is not None and len(selected_jobs) >= max_files:
                 break
             if job.get("type") == "allowed_amounts":
-                raise RuntimeError("PTG imports are v3-only and no longer support allowed-amounts files")
+                raise RuntimeError("PTG imports no longer support allowed-amounts files")
             if job.get("type") == "in_network":
                 selected_jobs.append(job)
         processed_files = 0
@@ -3009,7 +3008,7 @@ async def main(
                     "allowed_amounts",
                     str(job.get("url") or ""),
                     False,
-                    error="PTG imports are v3-only and no longer support allowed-amounts files",
+                    error="PTG imports no longer support allowed-amounts files",
                 )
             if result is None:
                 continue
@@ -3051,31 +3050,31 @@ async def main(
         await flush_error_log(classes["ImportLog"])
         data_seconds = time.monotonic() - data_started_monotonic
         publish_started_monotonic = time.monotonic()
-        v3_artifacts: dict[str, Any] = {"sidecars": []}
+        manifest_artifacts: dict[str, Any] = {"sidecars": []}
         for file_summary in successful_files:
             summary_payload = file_summary.get("summary") if isinstance(file_summary, dict) else None
             if not isinstance(summary_payload, dict):
                 continue
-            sidecars = ((summary_payload.get("v3") or {}).get("sidecars") or {})
+            sidecars = ((summary_payload.get("manifest") or {}).get("sidecars") or {})
             if isinstance(sidecars, dict):
                 for sidecar in sidecars.values():
                     if isinstance(sidecar, dict):
-                        v3_artifacts["sidecars"].append(dict(sidecar))
+                        manifest_artifacts["sidecars"].append(dict(sidecar))
             elif isinstance(sidecars, list):
                 for sidecar in sidecars:
                     if isinstance(sidecar, dict):
-                        v3_artifacts["sidecars"].append(dict(sidecar))
-        if not v3_artifacts["sidecars"]:
-            v3_artifacts = {}
+                        manifest_artifacts["sidecars"].append(dict(sidecar))
+        if not manifest_artifacts["sidecars"]:
+            manifest_artifacts = {}
         assert source_key_val is not None
-        if use_ptg2_v3_import:
+        if use_manifest_serving_import:
             if not ptg2_v3_stage_table:
-                raise RuntimeError("PTG v3 import did not create a v3 serving stage table")
+                raise RuntimeError("PTG import did not create a manifest-backed serving stage table")
             serving_index = await _publish_ptg2_v3_serving_snapshot(
                 ptg2_v3_stage_table,
                 snapshot_id=snapshot_id,
                 source_key=source_key_val,
-                artifacts=v3_artifacts,
+                artifacts=manifest_artifacts,
             )
             ptg2_v3_stage_table = None
         else:
