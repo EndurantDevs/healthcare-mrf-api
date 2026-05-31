@@ -68,7 +68,7 @@ async def _source_plan_rows(
         table_value = str(serving_index["table"])
         table_name = table_value.split(".", 1)[1] if "." in table_value else table_value
         if await _table_exists(schema_name, table_name):
-            snapshot_filter = "" if serving_index.get("storage") == "v3_manifest_snapshot" else "WHERE snapshot_id = :snapshot_id"
+            snapshot_filter = "" if serving_index.get("storage") == "manifest_snapshot" else "WHERE snapshot_id = :snapshot_id"
             plan_filter = "WHERE" if not snapshot_filter else "AND"
             rows = await db.all(
                 f"""

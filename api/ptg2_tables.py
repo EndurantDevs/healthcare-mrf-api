@@ -13,7 +13,6 @@ from sqlalchemy import text
 from api.ptg2_types import PTG2ServingTables
 
 PTG2_SCHEMA = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
-PTG2_SERVING_TABLE_ENV = "HLTHPRT_PTG2_SERVING_TABLE"
 
 
 async def _serving_table_available(session, table_name: str) -> bool:
@@ -68,13 +67,6 @@ async def _gin_index_available_for_column(session, table_name: str, column_name:
         return False
 
 
-def _serving_table_name() -> str:
-    configured = str(os.getenv(PTG2_SERVING_TABLE_ENV) or "ptg2_serving_rate").strip()
-    if "." in configured:
-        return configured
-    return f"{PTG2_SCHEMA}.{configured}"
-
-
 def _safe_table_name(value: Any, *, default_schema: str = PTG2_SCHEMA) -> str | None:
     if not value:
         return None
@@ -91,20 +83,6 @@ def _safe_table_name(value: Any, *, default_schema: str = PTG2_SCHEMA) -> str | 
     if not ident_re.fullmatch(schema_name) or not ident_re.fullmatch(table_name):
         return None
     return f"{schema_name}.{table_name}"
-
-
-def _serving_table_candidates() -> list[str]:
-    primary = _safe_table_name(_serving_table_name()) or f"{PTG2_SCHEMA}.ptg2_serving_rate"
-    stage = f"{PTG2_SCHEMA}.ptg2_serving_rate_stage"
-    candidates = [primary]
-    if stage not in candidates:
-        candidates.append(stage)
-    return candidates
-
-
-async def snapshot_serving_table(session, snapshot_id: str) -> str | None:
-    tables = await snapshot_serving_tables(session, snapshot_id)
-    return tables.serving_table
 
 
 async def snapshot_serving_tables(session, snapshot_id: str) -> PTG2ServingTables:
@@ -153,31 +131,7 @@ async def snapshot_serving_tables(session, snapshot_id: str) -> PTG2ServingTable
         artifacts=dict(serving_index.get("artifacts") or {}) if isinstance(serving_index.get("artifacts"), dict) else None,
         id_storage=str(serving_index.get("id_storage") or "hex").strip().lower() or "hex",
         serving_table=_safe_table_name(serving_index.get("table")),
-        price_code_set_table=_safe_table_name(serving_index.get("price_code_set_table")),
         price_atom_table=_safe_table_name(serving_index.get("price_atom_table")),
         code_count_table=_safe_table_name(serving_index.get("code_count_table")),
-        price_set_entry_table=_safe_table_name(serving_index.get("price_set_entry_table")),
-        procedure_table=_safe_table_name(serving_index.get("procedure_table")) or f"{PTG2_SCHEMA}.ptg2_procedure",
-        provider_set_table=_safe_table_name(serving_index.get("provider_set_table")),
-        provider_set_component_table=_safe_table_name(serving_index.get("provider_set_component_table")),
-        provider_set_entry_table=_safe_table_name(serving_index.get("provider_set_entry_table")),
-        provider_entry_component_table=_safe_table_name(serving_index.get("provider_entry_component_table")),
         provider_group_member_table=_safe_table_name(serving_index.get("provider_group_member_table")),
-        provider_group_location_table=_safe_table_name(serving_index.get("provider_group_location_table")),
     )
-
-
-def _ordered_serving_table_candidates(preferred_table: str | None = None) -> list[str]:
-    candidates: list[str] = []
-    if preferred_table:
-        safe_preferred = _safe_table_name(preferred_table)
-        if safe_preferred:
-            candidates.append(safe_preferred)
-    for candidate in _serving_table_candidates():
-        if candidate not in candidates:
-            candidates.append(candidate)
-    return candidates
-
-
-def _is_compact_serving_table(table_name: str) -> bool:
-    return table_name.rsplit(".", 1)[-1].startswith("ptg2_serving_rate_compact")

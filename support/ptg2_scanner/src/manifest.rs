@@ -1,7 +1,7 @@
-//! PTG2 v3 identity and sidecar primitives.
+//! PTG2 manifest identity and sidecar primitives.
 //!
 //! The active v2 scanner writes text hash keys directly into PostgreSQL COPY
-//! rows. V3 keeps stable global content identities, then maps them to
+//! rows. Manifest keeps stable global content identities, then maps them to
 //! deterministic snapshot-local dense ids for the hot serving tables.
 
 use crate::hashing::{canonical_json, update_hash_optional_str, update_hash_string_list};
@@ -47,7 +47,7 @@ impl GlobalId128 {
         additional_information: Option<&str>,
     ) -> Self {
         let mut hasher = Xxh3::new();
-        hasher.update(b"price_atom_v3");
+        hasher.update(b"price_atom_manifest");
         update_hash_optional_str(&mut hasher, negotiated_type);
         update_hash_optional_str(&mut hasher, negotiated_rate);
         update_hash_optional_str(&mut hasher, expiration_date);
@@ -66,7 +66,7 @@ impl GlobalId128 {
         price_set_global_id: GlobalId128,
     ) -> Self {
         let mut hasher = Xxh3::new();
-        hasher.update(b"serving_content_v3");
+        hasher.update(b"serving_content_manifest");
         hasher.update(b"\x1fplan:");
         hasher.update(&(plan_id.len() as u64).to_le_bytes());
         hasher.update(plan_id.as_bytes());
@@ -89,7 +89,7 @@ impl GlobalId128 {
 }
 
 pub fn procedure_global_id(procedure_payload: &Value) -> GlobalId128 {
-    GlobalId128::from_domain_payload("procedure_v3", procedure_payload)
+    GlobalId128::from_domain_payload("procedure_manifest", procedure_payload)
 }
 
 pub fn provider_set_global_id_from_entry_hashes(provider_entry_hashes: &[i64]) -> GlobalId128 {
@@ -98,7 +98,7 @@ pub fn provider_set_global_id_from_entry_hashes(provider_entry_hashes: &[i64]) -
     sorted_entry_hashes.dedup();
 
     let mut hasher = Xxh3::new();
-    hasher.update(b"provider_set_v3");
+    hasher.update(b"provider_set_manifest");
     for provider_entry_hash in sorted_entry_hashes {
         hasher.update(b"\x1f");
         hasher.update(&provider_entry_hash.to_le_bytes());
@@ -112,7 +112,7 @@ pub fn price_set_global_id_from_atom_ids(price_atom_ids: &[GlobalId128]) -> Glob
     sorted_atom_ids.dedup();
 
     let mut hasher = Xxh3::new();
-    hasher.update(b"price_set_v3");
+    hasher.update(b"price_set_manifest");
     for price_atom_id in sorted_atom_ids {
         hasher.update(b"\x1f");
         hasher.update(&price_atom_id.0);
@@ -189,7 +189,7 @@ where
 }
 
 pub fn write_global_sidecar<W: Write>(writer: &mut W, entries: &[SidecarEntry]) -> io::Result<()> {
-    writer.write_all(b"PTG2V3SC")?;
+    writer.write_all(b"PTG2MNSC")?;
     writer.write_all(&1u32.to_le_bytes())?;
     writer.write_all(&(entries.len() as u64).to_le_bytes())?;
     let mut offset: u64 = 0;
@@ -222,7 +222,7 @@ pub fn write_dense_member_sidecar<W: Write>(writer: &mut W, entries: &[SidecarEn
         .map(|(index, member_id)| (member_id, index as u32))
         .collect();
 
-    writer.write_all(b"PTG2V3DS")?;
+    writer.write_all(b"PTG2MNDS")?;
     writer.write_all(&1u32.to_le_bytes())?;
     writer.write_all(&(entries.len() as u64).to_le_bytes())?;
     writer.write_all(&(member_ids.len() as u64).to_le_bytes())?;
@@ -347,7 +347,7 @@ mod tests {
 
         write_global_sidecar(&mut out, &entries).unwrap();
 
-        assert_eq!(&out[0..8], b"PTG2V3SC");
+        assert_eq!(&out[0..8], b"PTG2MNSC");
         assert_eq!(u32::from_le_bytes(out[8..12].try_into().unwrap()), 1);
         assert_eq!(u64::from_le_bytes(out[12..20].try_into().unwrap()), 1);
         assert_eq!(&out[20..36], &[7; GLOBAL_ID_BYTES]);
@@ -369,7 +369,7 @@ mod tests {
 
         write_dense_member_sidecar(&mut out, &entries).unwrap();
 
-        assert_eq!(&out[0..8], b"PTG2V3DS");
+        assert_eq!(&out[0..8], b"PTG2MNDS");
         assert_eq!(u32::from_le_bytes(out[8..12].try_into().unwrap()), 1);
         assert_eq!(u64::from_le_bytes(out[12..20].try_into().unwrap()), 2);
         assert_eq!(u64::from_le_bytes(out[20..28].try_into().unwrap()), 2);

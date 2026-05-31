@@ -348,36 +348,17 @@ from process.ptg_parts.rust_scanner import (
     _ptg2_rust_scanner_binary,
 )
 from process.ptg_parts.screen import _emit_screen_line
-from process.ptg_parts.rust_publish import (
-    _ptg2_publish_timestamp,
-    _ptg2_serving_child_table_name,
-    _publish_renamed_rust_dictionary_table,
-    _publish_rust_compact_snapshot_tables,
-    _publish_rust_serving_stage_tables,
+from process.ptg_parts.ptg2_manifest_publish import (
+    _copy_ptg2_manifest_price_atom_file,
+    _copy_ptg2_manifest_provider_group_member_file,
+    _copy_ptg2_manifest_serving_file,
+    _create_ptg2_manifest_serving_stage_table,
+    _publish_ptg2_manifest_serving_snapshot,
+    _ptg2_manifest_support_stage_table,
 )
-from process.ptg_parts.rust_stage import (
-    PTG2_SERVING_STAGE_LANE_PREFIX,
-    _RUST_COPY_TABLE_SPECS,
-    _create_rust_copy_stage_tables,
-    _merge_rust_copy_stage_tables,
-    _ptg2_dictionary_select_columns,
-    _rust_copy_stage_table_name,
-    _serving_stage_lane_key,
-    _serving_stage_table_for_copy,
-    _serving_stage_tables,
-)
-from process.ptg_parts.ptg2_v3_publish import (
-    _copy_ptg2_v3_price_atom_file,
-    _copy_ptg2_v3_provider_group_member_file,
-    _copy_ptg2_v3_serving_file,
-    _create_ptg2_v3_serving_stage_table,
-    _publish_ptg2_v3_serving_snapshot,
-    _ptg2_v3_support_stage_table,
-)
-from process.ptg_parts.ptg2_v3_artifacts import PTG2_V3_DENSE_MEMBERSHIP_FORMAT, PTG2_V3_MEMBERSHIP_FORMAT
+from process.ptg_parts.ptg2_manifest_artifacts import PTG2_MANIFEST_DENSE_MEMBERSHIP_FORMAT, PTG2_MANIFEST_MEMBERSHIP_FORMAT
 from process.ptg_parts.serving_rows import (
     _provider_group_member_rows,
-    _provider_set_component_rows,
     _ptg2_compact_serving_rate_row,
     _ptg2_hp_procedure_code,
     _ptg2_serving_rate_row,
@@ -386,7 +367,6 @@ from process.ptg_parts.serving_maintenance import (
     _build_ptg2_provider_locations,
     _copy_simple_rows,
     _count_compact_serving_rate_rows,
-    _merge_staged_price_sets,
     _merge_staged_serving_rates,
 )
 from process.ptg_parts.serving_index import (
@@ -595,935 +575,207 @@ async def _parse_in_network_file_serving_only(
     import_month: datetime.date,
     max_items: int | None = None,
     rust_stage_tables: dict[str, str] | None = None,
-    ptg2_v3_stage_table: str | None = None,
+    ptg2_manifest_stage_table: str | None = None,
 ) -> dict[str, Any]:
+    if not ptg2_manifest_stage_table:
+        raise RuntimeError("PTG imports require manifest serving stage tables")
+    if rust_stage_tables:
+        raise RuntimeError("Legacy PTG Rust stage tables are no longer supported")
+    if max_items is not None:
+        logger.info("Ignoring max_items=%s for manifest-backed Rust PTG import", max_items)
+
     plan_fields = _derive_plan_fields(meta, plan_info)
     plan_row, alias_rows, plan_month_row = _ptg2_plan_rows(plan_fields, snapshot_id, import_month)
-    context_row = _ptg2_context_row(plan_fields, import_month, source_version)
-    source_trace_row, _source_trace_set_row = _ptg2_source_trace_rows(source_version, source_url)
-    manifest_serving_import = bool(ptg2_v3_stage_table)
-    compact_serving = True if manifest_serving_import else _use_compact_serving_table()
-    slim_serving_rows = compact_serving or _env_bool(PTG2_SLIM_SERVING_ROWS_ENV, False)
+    _source_trace_row, _source_trace_set_row = _ptg2_source_trace_rows(source_version, source_url)
+    source_trace_set_hash = _source_trace_set_row["source_trace_set_hash"]
+
     await _push_ptg2_objects([plan_row], PTG2Plan, rewrite=True)
     if alias_rows:
         await _push_ptg2_objects(alias_rows, PTG2PlanAlias, rewrite=True)
     await _push_ptg2_objects([plan_month_row], PTG2PlanMonth, rewrite=True)
-    await _push_ptg2_objects([context_row], PTG2RateSetContext, rewrite=True)
-    if slim_serving_rows or compact_serving:
-        await _push_ptg2_objects([source_trace_row], PTG2SourceTrace, rewrite=True)
-        await _push_ptg2_objects([_source_trace_set_row], PTG2SourceTraceSet, rewrite=True)
 
-    state = _compact_state()
-    state["snapshot_id"] = snapshot_id
-    state["plan_fields"] = plan_fields
-    source_trace_payload = _ptg2_source_trace_payload(source_trace_row)
-    source_trace_set_hash = _source_trace_set_row["source_trace_set_hash"]
-    provider_ref_count = 0
-    item_count = 0
-    serving_rows = 0
-    progress_state: dict[str, Any] = {}
-    provider_combo_cache_limit = max(_env_int(PTG2_PROVIDER_COMBO_CACHE_REFS_ENV, 32768), 0)
-    provider_combo_stats = {
-        "provider_combo_cache_gets": 0,
-        "provider_combo_cache_hits": 0,
-        "provider_combo_cache_misses": 0,
-        "provider_combo_cache_size": 0,
-        "provider_combo_cache_limit": provider_combo_cache_limit,
+    copy_tmp_dir = ptg2_temp_parent()
+    manifest_stage_table = ptg2_manifest_stage_table
+    manifest_copy_rows = 0
+    rust_records = 0
+    rust_dedupe_summary: dict[str, Any] = {}
+    procedure_hashes: set[str] = set()
+    compact_copy_tasks: set[asyncio.Task] = set()
+    compact_copy_task_limit = max(_env_int(PTG2_COMPACT_COPY_TASKS_ENV, PTG2_DEFAULT_COMPACT_COPY_TASKS), 1)
+    compact_copy_semaphore = asyncio.Semaphore(compact_copy_task_limit)
+    copy_completed = False
+
+    def _new_copy_path(prefix: str) -> Path:
+        fd, name = tempfile.mkstemp(prefix=prefix, suffix=".copy", dir=copy_tmp_dir)
+        os.close(fd)
+        return Path(name)
+
+    manifest_serving_copy_path = _new_copy_path("ptg2_manifest_serving_")
+    manifest_price_atom_copy_path = _new_copy_path("ptg2_manifest_price_atom_")
+    manifest_provider_group_member_copy_path = _new_copy_path("ptg2_manifest_provider_group_member_")
+    manifest_artifact_dir = resolve_ptg2_artifact_dir() / "serving" / _ptg2_snapshot_table_token(
+        str(plan_fields.get("plan_id") or "plan"),
+        snapshot_id,
+    )
+    manifest_artifact_dir.mkdir(parents=True, exist_ok=True)
+    manifest_file_token = hashlib.sha256(str(Path(file_path).resolve()).encode("utf-8")).hexdigest()[:16]
+    manifest_sidecar_paths = {
+        "provider_forward": manifest_artifact_dir / f"provider_forward_{manifest_file_token}.ptg2sc",
+        "provider_inverted": manifest_artifact_dir / f"provider_inverted_{manifest_file_token}.ptg2sc",
+        "provider_npi": manifest_artifact_dir / f"provider_npi_{manifest_file_token}.ptg2sc",
+        "price_forward": manifest_artifact_dir / f"price_forward_{manifest_file_token}.ptg2sc",
     }
-    serving_workers = max(_env_int(PTG2_SERVING_WORKERS_ENV, 1), 1)
-    worker_chunk_items = max(_env_int(PTG2_WORKER_CHUNK_ITEMS_ENV, 128), 1)
-    worker_chunk_bytes = max(_env_int(PTG2_WORKER_CHUNK_BYTES_ENV, 16 * 1024 * 1024), 1024 * 1024)
-    worker_max_pending_batches = max(
-        _env_int(PTG2_WORKER_MAX_PENDING_BATCHES_ENV, min(serving_workers, 2)),
-        1,
-    )
-    worker_max_pending_bytes = max(
-        _env_int(PTG2_WORKER_MAX_PENDING_BYTES_ENV, worker_chunk_bytes * worker_max_pending_batches),
-        worker_chunk_bytes,
-    )
-    worker_result_files = _env_bool(PTG2_WORKER_RESULT_FILES_ENV, True)
 
-    async def add_serving_result_parts(
-        *,
-        price_set_rows=(),
-        result_rows=(),
-        compact_rows=(),
-        provider_set_rows=(),
-        procedure_rows=(),
-        component_rows=(),
-        member_rows=(),
-    ) -> None:
-        nonlocal serving_rows
-        if price_set_rows and _env_bool(PTG2_SKIP_EXISTING_PRICE_SETS_ENV, compact_serving):
-            if state.get("existing_price_set_hashes") is None:
-                state["existing_price_set_hashes"] = await _existing_price_set_hashes()
-            existing_price_set_hashes = state["existing_price_set_hashes"]
+    def emit_copy_status(status: str, *, kind: str, copy_file: Path, rows: int, target_table: str | None, started_at: float | None = None) -> None:
+        payload: dict[str, Any] = {
+            "event": f"PTG2_COPY_SHARD_{status}",
+            "kind": kind,
+            "path": str(copy_file),
+            "rows": rows,
+            "target_table": target_table,
+        }
+        if started_at is not None:
+            payload["elapsed_seconds"] = round(time.monotonic() - started_at, 3)
+        _emit_screen_line(json.dumps(payload, sort_keys=True))
+
+    async def copy_ready_manifest_serving_file(copy_row: dict[str, Any]) -> None:
+        nonlocal manifest_copy_rows
+        raw_copy_path = str(copy_row.get("path") or "").strip()
+        if not raw_copy_path:
+            return
+        copied_rows = int(copy_row.get("row_count") or 0)
+        copy_file = Path(raw_copy_path)
+        async with compact_copy_semaphore:
+            started_at = time.monotonic()
+            emit_copy_status("START", kind="manifest_serving", copy_file=copy_file, rows=copied_rows, target_table=manifest_stage_table)
+            await _copy_ptg2_manifest_serving_file(copy_file, target_table=manifest_stage_table)
+            emit_copy_status("DONE", kind="manifest_serving", copy_file=copy_file, rows=copied_rows, target_table=manifest_stage_table, started_at=started_at)
+        manifest_copy_rows += copied_rows
+        copy_file.unlink(missing_ok=True)
+
+    async def copy_ready_manifest_dictionary_file(kind: str, copy_row: dict[str, Any]) -> None:
+        raw_copy_path = str(copy_row.get("path") or "").strip()
+        if not raw_copy_path:
+            return
+        copy_file = Path(raw_copy_path)
+        copied_rows = int(copy_row.get("row_count") or 0)
+        if kind == "price_atom":
+            target_table = _ptg2_manifest_support_stage_table(manifest_stage_table, "price_atom")
+            copy_func = _copy_ptg2_manifest_price_atom_file
+        elif kind == "provider_group_member":
+            target_table = _ptg2_manifest_support_stage_table(manifest_stage_table, "provider_group_member")
+            copy_func = _copy_ptg2_manifest_provider_group_member_file
         else:
-            existing_price_set_hashes = None
-        for price_set_row in price_set_rows:
-            price_set_hash = str(price_set_row.get("price_set_hash") or "")
-            if existing_price_set_hashes is not None and price_set_hash in existing_price_set_hashes:
+            return
+        async with compact_copy_semaphore:
+            started_at = time.monotonic()
+            emit_copy_status("START", kind=f"manifest_{kind}", copy_file=copy_file, rows=copied_rows, target_table=target_table)
+            await copy_func(copy_file, target_table=target_table)
+            emit_copy_status("DONE", kind=f"manifest_{kind}", copy_file=copy_file, rows=copied_rows, target_table=target_table, started_at=started_at)
+        copy_file.unlink(missing_ok=True)
+
+    async def wait_for_some_copy_tasks(force: bool = False) -> None:
+        nonlocal compact_copy_tasks
+        if not compact_copy_tasks:
+            return
+        if force:
+            done, compact_copy_tasks = await asyncio.wait(compact_copy_tasks, return_when=asyncio.ALL_COMPLETED)
+            compact_copy_tasks = set()
+        elif len(compact_copy_tasks) < compact_copy_task_limit * 2:
+            return
+        else:
+            done, compact_copy_tasks = await asyncio.wait(compact_copy_tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            task.result()
+
+    try:
+        async for record_kind, record_row in _aiter_compact_serving_records_rust(
+            file_path,
+            snapshot_id=snapshot_id,
+            plan_id=str(plan_fields.get("plan_id") or ""),
+            plan_month_id=str(plan_month_row["plan_month_id"]),
+            source_trace_set_hash=source_trace_set_hash,
+            manifest_serving_copy_path=manifest_serving_copy_path,
+            manifest_provider_forward_sidecar_path=manifest_sidecar_paths.get("provider_forward"),
+            manifest_provider_inverted_sidecar_path=manifest_sidecar_paths.get("provider_inverted"),
+            manifest_provider_npi_sidecar_path=manifest_sidecar_paths.get("provider_npi"),
+            manifest_price_forward_sidecar_path=manifest_sidecar_paths.get("price_forward"),
+            manifest_price_atom_copy_path=manifest_price_atom_copy_path,
+            manifest_provider_group_member_copy_path=manifest_provider_group_member_copy_path,
+            manifest_only=True,
+        ):
+            if record_kind == "dedupe_summary":
+                rust_dedupe_summary = dict(record_row or {})
                 continue
-            if _compact_add_unique(state, "price_set", "price_set_hash", price_set_row):
-                if existing_price_set_hashes is not None and price_set_hash:
-                    existing_price_set_hashes.add(price_set_hash)
-        for provider_set_row in provider_set_rows:
-            _compact_add_unique(state, "provider_set", "provider_set_hash", provider_set_row)
-        for procedure_row in procedure_rows:
-            _compact_add_unique(state, "procedure", "procedure_hash", procedure_row)
-        for component_row in component_rows:
-            _compact_add_unique(state, "provider_set_component", ("provider_set_hash", "provider_group_hash"), component_row)
-        for member_row in member_rows:
-            _compact_add_unique(state, "provider_group_member", ("provider_group_hash", "npi"), member_row)
-        for compact_row in compact_rows:
-            if _compact_add_unique(state, "serving_rate_compact", "serving_rate_id", compact_row):
-                serving_rows += 1
-        if compact_serving:
-            await _flush_compact_rows(state)
-            return
-        for serving_row in result_rows:
-            if _compact_add_unique(state, "serving_rate", "serving_rate_id", serving_row):
-                serving_rows += 1
-        await _flush_compact_rows(state)
-
-    async def add_serving_result(result: list[dict[str, Any]] | dict[str, Any]) -> None:
-        if isinstance(result, dict) and result.get("__worker_result_files__"):
-            temp_dir = Path(result["temp_dir"])
-            paths = result.get("paths") or {}
-            try:
-                await add_serving_result_parts(
-                    price_set_rows=_iter_worker_result_rows(paths["price_set_rows"]) if "price_set_rows" in paths else (),
-                    result_rows=_iter_worker_result_rows(paths["serving_rows"]) if "serving_rows" in paths else (),
-                    compact_rows=_iter_worker_result_rows(paths["serving_rate_compact_rows"]) if "serving_rate_compact_rows" in paths else (),
-                    provider_set_rows=_iter_worker_result_rows(paths["provider_set_rows"]) if "provider_set_rows" in paths else (),
-                    procedure_rows=_iter_worker_result_rows(paths["procedure_rows"]) if "procedure_rows" in paths else (),
-                    component_rows=_iter_worker_result_rows(paths["provider_set_component_rows"]) if "provider_set_component_rows" in paths else (),
-                    member_rows=_iter_worker_result_rows(paths["provider_group_member_rows"]) if "provider_group_member_rows" in paths else (),
-                )
-            finally:
-                for path in paths.values():
-                    try:
-                        Path(path).unlink(missing_ok=True)
-                    except Exception:
-                        logger.debug("Failed to remove PTG2 worker result file %s", path, exc_info=True)
-                try:
-                    temp_dir.rmdir()
-                except Exception:
-                    logger.debug("Failed to remove PTG2 worker result dir %s", temp_dir, exc_info=True)
-            return
-        if isinstance(result, dict):
-            await add_serving_result_parts(
-                price_set_rows=result.get("price_set_rows") or [],
-                result_rows=result.get("serving_rows") or [],
-                compact_rows=result.get("serving_rate_compact_rows") or [],
-                provider_set_rows=result.get("provider_set_rows") or [],
-                procedure_rows=result.get("procedure_rows") or [],
-                component_rows=result.get("provider_set_component_rows") or [],
-                member_rows=result.get("provider_group_member_rows") or [],
-            )
-            return
-        await add_serving_result_parts(result_rows=result)
-
-    if (
-        compact_serving
-        and (manifest_serving_import or _use_rust_compact_serving())
-        and (manifest_serving_import or max_items is None)
-        and (manifest_serving_import or not test_mode or _env_bool(PTG2_SOURCE_SCOPED_TEST_ENV, False))
-    ):
-        rust_batches = {
-            "price_set_rows": [],
-            "serving_rate_compact_rows": [],
-            "provider_set_rows": [],
-            "provider_set_component_rows": [],
-            "provider_group_member_rows": [],
-            "procedure_rows": [],
-        }
-        rust_batch_limit = max(_env_int(PTG2_COMPACT_BATCH_ROWS_ENV, 5000), 1)
-        rust_records = 0
-        rust_dedupe_summary: dict[str, Any] = {}
-        rust_item_count: set[str] = set()
-        copy_tmp_dir = ptg2_temp_parent()
-        compact_copy_path: Path | None = None
-        if not manifest_serving_import:
-            compact_copy_fd, compact_copy_name = tempfile.mkstemp(
-                prefix="ptg2_compact_serving_",
-                suffix=".copy",
-                dir=copy_tmp_dir,
-            )
-            os.close(compact_copy_fd)
-            compact_copy_path = Path(compact_copy_name)
-        v3_serving_copy_path: Path | None = None
-        v3_stage_table: str | None = None
-        v3_price_atom_copy_path: Path | None = None
-        v3_provider_group_member_copy_path: Path | None = None
-        v3_copy_rows = 0
-        v3_sidecar_paths: dict[str, Path] = {}
-        dictionary_copy_paths: dict[str, Path] = {}
-        dictionary_kinds = (
-            "procedure",
-            "price_code_set",
-            "price_atom",
-            "price_set_entry",
-            "provider_set",
-            "provider_set_component",
-            "provider_group_member",
-        )
-        if not manifest_serving_import:
-            for dictionary_kind in dictionary_kinds:
-                fd, name = tempfile.mkstemp(
-                    prefix=f"ptg2_{dictionary_kind}_",
-                    suffix=".copy",
-                    dir=copy_tmp_dir,
-                )
-                os.close(fd)
-                dictionary_copy_paths[dictionary_kind] = Path(name)
-        compact_copy_rows = 0
-        procedure_copy_rows = 0
-        compact_copy_completed = False
-        compact_copy_tasks: set[asyncio.Task] = set()
-        compact_copy_task_limit = max(
-            _env_int(PTG2_COMPACT_COPY_TASKS_ENV, PTG2_DEFAULT_COMPACT_COPY_TASKS),
-            1,
-        )
-        compact_copy_kind_task_limit = max(
-            _env_int(PTG2_COMPACT_COPY_KIND_TASKS_ENV, PTG2_DEFAULT_COMPACT_COPY_KIND_TASKS),
-            1,
-        )
-        compact_serving_copy_task_limit = max(
-            _env_int(
-                PTG2_COMPACT_SERVING_COPY_TASKS_ENV,
-                PTG2_DEFAULT_COMPACT_SERVING_COPY_TASKS,
-            ),
-            1,
-        )
-        compact_copy_semaphore = asyncio.Semaphore(compact_copy_task_limit)
-        compact_copy_kind_semaphores: dict[str, asyncio.Semaphore] = {
-            kind: asyncio.Semaphore(compact_copy_kind_task_limit)
-            for kind in dictionary_kinds
-        }
-        compact_serving_copy_semaphores: dict[str, asyncio.Semaphore] = {}
-        stage_tables: dict[str, str] = {} if manifest_serving_import else dict(rust_stage_tables or {})
-        owns_stage_tables = (rust_stage_tables is None) and not manifest_serving_import
-        stage_completed = False
-        if owns_stage_tables:
-            stage_token = hashlib.md5(f"{snapshot_id}:{os.getpid()}:{time.time_ns()}".encode("utf-8")).hexdigest()[:12]
-            stage_tables = await _create_rust_copy_stage_tables(
-                stage_token,
-                serving_lanes=max(_env_int(PTG2_RUST_WORKERS_ENV, PTG2_DEFAULT_RUST_WORKERS), 1),
-            )
-        if ptg2_v3_stage_table:
-            v3_fd, v3_name = tempfile.mkstemp(
-                prefix="ptg2_v3_serving_",
-                suffix=".copy",
-                dir=copy_tmp_dir,
-            )
-            os.close(v3_fd)
-            v3_serving_copy_path = Path(v3_name)
-            v3_stage_table = ptg2_v3_stage_table
-            v3_price_atom_fd, v3_price_atom_name = tempfile.mkstemp(
-                prefix="ptg2_v3_price_atom_",
-                suffix=".copy",
-                dir=copy_tmp_dir,
-            )
-            os.close(v3_price_atom_fd)
-            v3_price_atom_copy_path = Path(v3_price_atom_name)
-            v3_pgm_fd, v3_pgm_name = tempfile.mkstemp(
-                prefix="ptg2_v3_provider_group_member_",
-                suffix=".copy",
-                dir=copy_tmp_dir,
-            )
-            os.close(v3_pgm_fd)
-            v3_provider_group_member_copy_path = Path(v3_pgm_name)
-            v3_artifact_dir = resolve_ptg2_artifact_dir() / "v3" / _ptg2_snapshot_table_token(
-                str(plan_fields.get("plan_id") or "plan"),
-                snapshot_id,
-            )
-            v3_artifact_dir.mkdir(parents=True, exist_ok=True)
-            v3_file_token = hashlib.sha256(str(Path(file_path).resolve()).encode("utf-8")).hexdigest()[:16]
-            v3_sidecar_paths = {
-                "provider_forward": v3_artifact_dir / f"provider_forward_{v3_file_token}.ptg2v3sc",
-                "provider_inverted": v3_artifact_dir / f"provider_inverted_{v3_file_token}.ptg2v3sc",
-                "provider_npi": v3_artifact_dir / f"provider_npi_{v3_file_token}.ptg2v3sc",
-                "price_forward": v3_artifact_dir / f"price_forward_{v3_file_token}.ptg2v3sc",
-            }
-
-        def emit_copy_status(
-            status: str,
-            *,
-            kind: str,
-            copy_file: Path,
-            rows: int,
-            target_table: str | None = None,
-            started_at: float | None = None,
-        ) -> None:
-            elapsed = "" if started_at is None else f"\telapsed_seconds={time.monotonic() - started_at:.2f}"
-            try:
-                bytes_text = str(copy_file.stat().st_size)
-            except FileNotFoundError:
-                bytes_text = "0"
-            target_text = "" if not target_table else f"\ttarget_table={target_table}"
-            line = (
-                f"PTG2_COPY_SHARD_{status}"
-                f"\tkind={kind}"
-                f"\tpath={copy_file}"
-                f"{target_text}"
-                f"\trows={rows}"
-                f"\tbytes={bytes_text}"
-                f"{elapsed}"
-            )
-            _emit_screen_line(line)
-            logger.info(line)
-
-        async def copy_ready_compact_file(copy_row: dict[str, Any]) -> None:
-            nonlocal compact_copy_rows
-            raw_copy_path = str(copy_row.get("path") or "").strip()
-            if not raw_copy_path:
-                return
-            copied_rows = int(copy_row.get("row_count") or 0)
-            copy_file = Path(raw_copy_path)
-            target_table = _serving_stage_table_for_copy(stage_tables, copy_file)
-            async with compact_copy_semaphore:
-                async with compact_serving_copy_semaphores.setdefault(
-                    target_table,
-                    asyncio.Semaphore(compact_serving_copy_task_limit),
-                ):
-                    started_at = time.monotonic()
-                    emit_copy_status(
-                        "START",
-                        kind="serving_rate_compact",
-                        copy_file=copy_file,
-                        rows=copied_rows,
-                        target_table=target_table,
-                    )
-                    await _copy_compact_serving_rate_file(
-                        copy_file,
-                        target_table=target_table,
-                    )
-                    emit_copy_status(
-                        "DONE",
-                        kind="serving_rate_compact",
-                        copy_file=copy_file,
-                        rows=copied_rows,
-                        target_table=target_table,
-                        started_at=started_at,
-                    )
-            compact_copy_rows += copied_rows
-            try:
-                copy_file.unlink(missing_ok=True)
-            except Exception:
-                logger.debug("Failed to remove PTG2 compact copy chunk %s", copy_file, exc_info=True)
-
-        async def copy_ready_dictionary_file(kind: str, copy_row: dict[str, Any]) -> None:
-            nonlocal procedure_copy_rows
-            raw_copy_path = str(copy_row.get("path") or "").strip()
-            if not raw_copy_path:
-                return
-            copied_rows = int(copy_row.get("row_count") or 0)
-            copy_file = Path(raw_copy_path)
-            async with compact_copy_semaphore:
-                async with compact_copy_kind_semaphores.setdefault(
-                    kind,
-                    asyncio.Semaphore(compact_copy_kind_task_limit),
-                ):
-                    started_at = time.monotonic()
-                    emit_copy_status(
-                        "START",
-                        kind=kind,
-                        copy_file=copy_file,
-                        rows=copied_rows,
-                        target_table=stage_tables.get(kind),
-                    )
-                    await _copy_ptg2_dictionary_file(copy_file, kind, target_table=stage_tables.get(kind))
-                    emit_copy_status(
-                        "DONE",
-                        kind=kind,
-                        copy_file=copy_file,
-                        rows=copied_rows,
-                        target_table=stage_tables.get(kind),
-                        started_at=started_at,
-                    )
-            if kind == "procedure":
-                procedure_copy_rows += copied_rows
-            try:
-                copy_file.unlink(missing_ok=True)
-            except Exception:
-                logger.debug("Failed to remove PTG2 %s copy chunk %s", kind, copy_file, exc_info=True)
-
-        async def copy_ready_v3_serving_file(copy_row: dict[str, Any]) -> None:
-            nonlocal v3_copy_rows
-            if not v3_stage_table:
-                return
-            raw_copy_path = str(copy_row.get("path") or "").strip()
-            if not raw_copy_path:
-                return
-            copied_rows = int(copy_row.get("row_count") or 0)
-            copy_file = Path(raw_copy_path)
-            async with compact_copy_semaphore:
-                started_at = time.monotonic()
-                emit_copy_status(
-                    "START",
-                    kind="v3_serving",
-                    copy_file=copy_file,
-                    rows=copied_rows,
-                    target_table=v3_stage_table,
-                )
-                await _copy_ptg2_v3_serving_file(copy_file, target_table=v3_stage_table)
-                emit_copy_status(
-                    "DONE",
-                    kind="v3_serving",
-                    copy_file=copy_file,
-                    rows=copied_rows,
-                    target_table=v3_stage_table,
-                    started_at=started_at,
-                )
-            v3_copy_rows += copied_rows
-            try:
-                copy_file.unlink(missing_ok=True)
-            except Exception:
-                logger.debug("Failed to remove PTG2 serving copy chunk %s", copy_file, exc_info=True)
-
-        async def copy_ready_v3_dictionary_file(kind: str, copy_row: dict[str, Any]) -> None:
-            if not v3_stage_table:
-                return
-            raw_copy_path = str(copy_row.get("path") or "").strip()
-            if not raw_copy_path:
-                return
-            copied_rows = int(copy_row.get("row_count") or 0)
-            copy_file = Path(raw_copy_path)
-            if kind == "price_atom":
-                target_table = _ptg2_v3_support_stage_table(v3_stage_table, "price_atom")
-                copy_func = _copy_ptg2_v3_price_atom_file
-            elif kind == "provider_group_member":
-                target_table = _ptg2_v3_support_stage_table(v3_stage_table, "provider_group_member")
-                copy_func = _copy_ptg2_v3_provider_group_member_file
-            else:
-                return
-            async with compact_copy_semaphore:
-                started_at = time.monotonic()
-                emit_copy_status(
-                    "START",
-                    kind=f"v3_{kind}",
-                    copy_file=copy_file,
-                    rows=copied_rows,
-                    target_table=target_table,
-                )
-                await copy_func(copy_file, target_table=target_table)
-                emit_copy_status(
-                    "DONE",
-                    kind=f"v3_{kind}",
-                    copy_file=copy_file,
-                    rows=copied_rows,
-                    target_table=target_table,
-                    started_at=started_at,
-                )
-            try:
-                copy_file.unlink(missing_ok=True)
-            except Exception:
-                logger.debug("Failed to remove PTG2 %s copy chunk %s", kind, copy_file, exc_info=True)
-
-        async def wait_for_some_copy_tasks(force: bool = False) -> None:
-            nonlocal compact_copy_tasks
-            if not compact_copy_tasks:
-                return
-            if force:
-                done, compact_copy_tasks = await asyncio.wait(
-                    compact_copy_tasks,
-                    return_when=asyncio.ALL_COMPLETED,
-                )
-                compact_copy_tasks = set()
-            elif len(compact_copy_tasks) < compact_copy_task_limit * 2:
-                return
-            else:
-                done, compact_copy_tasks = await asyncio.wait(
-                    compact_copy_tasks,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-            for task in done:
-                task.result()
-        try:
-            async for record_kind, record_row in _aiter_compact_serving_records_rust(
-                file_path,
-                snapshot_id=snapshot_id,
-                plan_id=str(plan_fields.get("plan_id") or ""),
-                plan_month_id=str(plan_month_row["plan_month_id"]),
-                source_trace_set_hash=source_trace_set_hash,
-                compact_copy_path=compact_copy_path,
-                procedure_copy_path=dictionary_copy_paths.get("procedure"),
-                price_code_set_copy_path=dictionary_copy_paths.get("price_code_set"),
-                price_atom_copy_path=dictionary_copy_paths.get("price_atom"),
-                price_set_entry_copy_path=dictionary_copy_paths.get("price_set_entry"),
-                provider_set_copy_path=dictionary_copy_paths.get("provider_set"),
-                provider_group_member_copy_path=dictionary_copy_paths.get("provider_group_member"),
-                provider_set_component_copy_path=dictionary_copy_paths.get("provider_set_component"),
-                v3_serving_copy_path=v3_serving_copy_path,
-                v3_provider_forward_sidecar_path=v3_sidecar_paths.get("provider_forward"),
-                v3_provider_inverted_sidecar_path=v3_sidecar_paths.get("provider_inverted"),
-                v3_provider_npi_sidecar_path=v3_sidecar_paths.get("provider_npi"),
-                v3_price_forward_sidecar_path=v3_sidecar_paths.get("price_forward"),
-                v3_price_atom_copy_path=v3_price_atom_copy_path,
-                v3_provider_group_member_copy_path=v3_provider_group_member_copy_path,
-                v3_only=manifest_serving_import,
+            rust_records += 1
+            if record_kind == "manifest_serving_copy_file":
+                compact_copy_tasks.add(asyncio.create_task(copy_ready_manifest_serving_file(record_row)))
+                await wait_for_some_copy_tasks()
+            elif record_kind == "manifest_price_atom_copy_file":
+                compact_copy_tasks.add(asyncio.create_task(copy_ready_manifest_dictionary_file("price_atom", record_row)))
+                await wait_for_some_copy_tasks()
+            elif record_kind == "manifest_provider_group_member_copy_file":
+                compact_copy_tasks.add(asyncio.create_task(copy_ready_manifest_dictionary_file("provider_group_member", record_row)))
+                await wait_for_some_copy_tasks()
+            elif record_kind in {"procedure", "serving_rate_compact"} and record_row.get("procedure_hash"):
+                procedure_hashes.add(str(record_row.get("procedure_hash")))
+        await wait_for_some_copy_tasks(force=True)
+        for copy_path, copy_func in (
+            (manifest_serving_copy_path, copy_ready_manifest_serving_file),
+            (manifest_price_atom_copy_path, lambda row: copy_ready_manifest_dictionary_file("price_atom", row)),
+            (manifest_provider_group_member_copy_path, lambda row: copy_ready_manifest_dictionary_file("provider_group_member", row)),
+        ):
+            if copy_path.exists() and copy_path.stat().st_size > 0:
+                await copy_func({"path": str(copy_path), "row_count": 0})
+        if manifest_copy_rows == 0:
+            manifest_copy_rows = await _estimated_table_rows(os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", manifest_stage_table)
+        copy_completed = True
+    finally:
+        for task in compact_copy_tasks:
+            task.cancel()
+        if copy_completed or not _env_bool(PTG2_KEEP_PARTIAL_ENV, False):
+            for copy_path in (
+                manifest_serving_copy_path,
+                manifest_price_atom_copy_path,
+                manifest_provider_group_member_copy_path,
             ):
-                if record_kind == "dedupe_summary":
-                    rust_dedupe_summary = dict(record_row or {})
-                    continue
-                rust_records += 1
-                if record_kind == "price_atom_copy_file":
-                    compact_copy_tasks.add(asyncio.create_task(copy_ready_dictionary_file("price_atom", record_row)))
-                    await wait_for_some_copy_tasks()
-                elif record_kind == "price_code_set_copy_file":
-                    compact_copy_tasks.add(asyncio.create_task(copy_ready_dictionary_file("price_code_set", record_row)))
-                    await wait_for_some_copy_tasks()
-                elif record_kind == "price_set_entry_copy_file":
-                    compact_copy_tasks.add(asyncio.create_task(copy_ready_dictionary_file("price_set_entry", record_row)))
-                    await wait_for_some_copy_tasks()
-                elif record_kind == "compact_copy_file":
-                    compact_copy_tasks.add(asyncio.create_task(copy_ready_compact_file(record_row)))
-                    await wait_for_some_copy_tasks()
-                elif record_kind == "v3_serving_copy_file":
-                    compact_copy_tasks.add(asyncio.create_task(copy_ready_v3_serving_file(record_row)))
-                    await wait_for_some_copy_tasks()
-                elif record_kind == "v3_price_atom_copy_file":
-                    compact_copy_tasks.add(asyncio.create_task(copy_ready_v3_dictionary_file("price_atom", record_row)))
-                    await wait_for_some_copy_tasks()
-                elif record_kind == "v3_provider_group_member_copy_file":
-                    compact_copy_tasks.add(
-                        asyncio.create_task(copy_ready_v3_dictionary_file("provider_group_member", record_row))
-                    )
-                    await wait_for_some_copy_tasks()
-                elif record_kind == "serving_rate_compact":
-                    rust_batches["serving_rate_compact_rows"].append(record_row)
-                    if record_row.get("procedure_hash"):
-                        rust_item_count.add(str(record_row.get("procedure_hash")))
-                elif record_kind == "provider_set":
-                    rust_batches["provider_set_rows"].append(record_row)
-                elif record_kind == "provider_set_copy_file":
-                    compact_copy_tasks.add(asyncio.create_task(copy_ready_dictionary_file("provider_set", record_row)))
-                    await wait_for_some_copy_tasks()
-                elif record_kind == "provider_set_component":
-                    rust_batches.setdefault("provider_set_component_rows", []).append(record_row)
-                elif record_kind == "provider_set_component_copy_file":
-                    compact_copy_tasks.add(asyncio.create_task(copy_ready_dictionary_file("provider_set_component", record_row)))
-                    await wait_for_some_copy_tasks()
-                elif record_kind == "provider_set_entry":
-                    rust_batches.setdefault("provider_set_component_rows", []).append(
-                        {
-                            "provider_set_hash": record_row.get("provider_set_hash"),
-                            "provider_group_hash": record_row.get("provider_entry_hash"),
-                        }
-                    )
-                elif record_kind == "provider_set_entry_copy_file":
-                    compact_copy_tasks.add(asyncio.create_task(copy_ready_dictionary_file("provider_set_entry", record_row)))
-                    await wait_for_some_copy_tasks()
-                elif record_kind == "provider_entry_component":
-                    rust_batches.setdefault("provider_group_member_rows", []).append(
-                        {
-                            "provider_group_hash": record_row.get("provider_entry_hash"),
-                            "npi": record_row.get("npi"),
-                        }
-                    )
-                elif record_kind == "provider_entry_component_copy_file":
-                    compact_copy_tasks.add(asyncio.create_task(copy_ready_dictionary_file("provider_entry_component", record_row)))
-                    await wait_for_some_copy_tasks()
-                elif record_kind == "provider_group_member_copy_file":
-                    compact_copy_tasks.add(asyncio.create_task(copy_ready_dictionary_file("provider_group_member", record_row)))
-                    await wait_for_some_copy_tasks()
-                elif record_kind == "procedure":
-                    rust_batches["procedure_rows"].append(record_row)
-                    if record_row.get("procedure_hash"):
-                        rust_item_count.add(str(record_row.get("procedure_hash")))
-                elif record_kind == "procedure_copy_file":
-                    compact_copy_tasks.add(asyncio.create_task(copy_ready_dictionary_file("procedure", record_row)))
-                    await wait_for_some_copy_tasks()
-                if sum(len(rows) for rows in rust_batches.values()) >= rust_batch_limit:
-                    await add_serving_result_parts(
-                        price_set_rows=rust_batches["price_set_rows"],
-                        compact_rows=rust_batches["serving_rate_compact_rows"],
-                        provider_set_rows=rust_batches["provider_set_rows"],
-                        procedure_rows=rust_batches["procedure_rows"],
-                        component_rows=rust_batches["provider_set_component_rows"],
-                        member_rows=rust_batches["provider_group_member_rows"],
-                    )
-                    for rows in rust_batches.values():
-                        rows.clear()
-            if any(rust_batches.values()):
-                await add_serving_result_parts(
-                    price_set_rows=rust_batches["price_set_rows"],
-                    compact_rows=rust_batches["serving_rate_compact_rows"],
-                    provider_set_rows=rust_batches["provider_set_rows"],
-                    procedure_rows=rust_batches["procedure_rows"],
-                    component_rows=rust_batches["provider_set_component_rows"],
-                    member_rows=rust_batches["provider_group_member_rows"],
-                )
-            await _flush_compact_rows(state, force=True)
-            await _drain_compact_writes(state)
-            await wait_for_some_copy_tasks(force=True)
-            if compact_copy_path is not None and compact_copy_path.exists() and compact_copy_path.stat().st_size > 0:
-                await copy_ready_compact_file({"path": str(compact_copy_path), "row_count": 0})
-                compact_copy_completed = True
-            if v3_serving_copy_path is not None and v3_serving_copy_path.exists() and v3_serving_copy_path.stat().st_size > 0:
-                await copy_ready_v3_serving_file({"path": str(v3_serving_copy_path), "row_count": 0})
-            if v3_price_atom_copy_path is not None and v3_price_atom_copy_path.exists() and v3_price_atom_copy_path.stat().st_size > 0:
-                await copy_ready_v3_dictionary_file("price_atom", {"path": str(v3_price_atom_copy_path), "row_count": 0})
-            if (
-                v3_provider_group_member_copy_path is not None
-                and v3_provider_group_member_copy_path.exists()
-                and v3_provider_group_member_copy_path.stat().st_size > 0
-            ):
-                await copy_ready_v3_dictionary_file(
-                    "provider_group_member",
-                    {"path": str(v3_provider_group_member_copy_path), "row_count": 0},
-                )
-            for dictionary_kind, dictionary_path in dictionary_copy_paths.items():
-                if dictionary_path.exists() and dictionary_path.stat().st_size > 0:
-                    await copy_ready_dictionary_file(dictionary_kind, {"path": str(dictionary_path), "row_count": 0})
-            if stage_tables and owns_stage_tables:
-                await _merge_rust_copy_stage_tables(stage_tables, drop=True)
-                stage_completed = True
-            elif stage_tables:
-                stage_completed = True
-            if manifest_serving_import:
-                serving_rows = v3_copy_rows
-            elif rust_stage_tables and compact_copy_rows:
-                serving_rows = compact_copy_rows
-            elif rust_stage_tables:
-                serving_rows = await _estimated_table_rows(
-                    os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
-                    stage_tables.get("serving_rate_compact", "ptg2_serving_rate_compact"),
-                )
-            else:
-                serving_rows = await _count_compact_serving_rate_rows(
-                    snapshot_id,
-                    str(plan_fields.get("plan_id") or ""),
-                    table_name=stage_tables.get("serving_rate_compact", "ptg2_serving_rate_compact"),
-                )
-            if v3_stage_table and v3_copy_rows == 0:
-                v3_copy_rows = await _estimated_table_rows(
-                    os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
-                    v3_stage_table,
-                )
-                if manifest_serving_import:
-                    serving_rows = v3_copy_rows
-            compact_copy_completed = True
-        finally:
-            for task in compact_copy_tasks:
-                task.cancel()
-            if compact_copy_completed or not _env_bool(PTG2_KEEP_PARTIAL_ENV, False):
                 try:
-                    if compact_copy_path is not None:
-                        compact_copy_path.unlink(missing_ok=True)
-                    if v3_serving_copy_path is not None:
-                        v3_serving_copy_path.unlink(missing_ok=True)
-                    if v3_price_atom_copy_path is not None:
-                        v3_price_atom_copy_path.unlink(missing_ok=True)
-                    if v3_provider_group_member_copy_path is not None:
-                        v3_provider_group_member_copy_path.unlink(missing_ok=True)
+                    copy_path.unlink(missing_ok=True)
                 except Exception:
-                    logger.debug("Failed to remove PTG2 compact copy file %s", compact_copy_path, exc_info=True)
-                for dictionary_path in dictionary_copy_paths.values():
-                    try:
-                        dictionary_path.unlink(missing_ok=True)
-                    except Exception:
-                        logger.debug("Failed to remove PTG2 dictionary copy file %s", dictionary_path, exc_info=True)
-                if stage_tables and owns_stage_tables and not stage_completed:
-                    schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
-                    for stage_table in stage_tables.values():
-                        try:
-                            await db.status(
-                                f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(stage_table)};"
-                            )
-                        except Exception:
-                            logger.debug("Failed to drop PTG2 Rust stage table %s", stage_table, exc_info=True)
-        item_count = len(rust_item_count) or procedure_copy_rows
-        logger.info(
-            "PTG2 Rust compact serving emitted %s dictionary records, %s copy rows for %s procedure hashes",
-            rust_records,
-            compact_copy_rows,
-            item_count,
-        )
-        if slim_serving_rows and _env_bool(PTG2_STAGE_PRICE_SETS_ENV, True) and not rust_stage_tables and not manifest_serving_import:
-            await _merge_staged_price_sets(snapshot_id)
-        if not _env_bool(PTG2_DEFER_PROVIDER_LOCATIONS_ENV, True):
-            await _build_ptg2_provider_locations(snapshot_id)
-        await flush_error_log(import_log_cls)
-        summary = {
-            "provider_refs": provider_ref_count,
-            "in_network_items": item_count,
-            "serving_rates": serving_rows,
-            "serving_only": True,
-            "serving_workers": 0,
-            "worker_chunk_items": 0,
-            "rust_compact_serving": True,
-            "rust_records": rust_records,
-        }
-        if rust_dedupe_summary:
-            summary["dedupe"] = rust_dedupe_summary
-        if v3_stage_table:
-            manifest_artifacts = {}
-            for artifact_kind, artifact_path in v3_sidecar_paths.items():
-                if artifact_path.exists() and artifact_path.stat().st_size > 0:
-                    digest, byte_count = sha256_file(artifact_path)
-                    record_format = PTG2_V3_MEMBERSHIP_FORMAT
-                    with artifact_path.open("rb") as artifact_fp:
-                        if artifact_fp.read(8) == b"PTG2V3DS":
-                            record_format = PTG2_V3_DENSE_MEMBERSHIP_FORMAT
-                    manifest_artifacts[artifact_kind] = {
-                        "name": artifact_kind,
-                        "path": str(artifact_path),
-                        "record_format": record_format,
-                        "sha256": digest,
-                        "byte_count": byte_count,
-                    }
-            summary["manifest"] = {
-                "serving_rows": v3_copy_rows,
-                "sidecars": manifest_artifacts,
-            }
-        _emit_screen_line(f"PTG2 serving-only import summary: {summary}")
-        logger.info("PTG2 serving-only import summary: %s", summary)
-        return summary
+                    logger.debug("Failed to remove PTG2 manifest copy file %s", copy_path, exc_info=True)
 
-    with open_json_artifact_stream(file_path) as afp:
-        def progress_callback() -> None:
-            _maybe_log_artifact_progress(
-                file_path,
-                afp,
-                progress_state,
-                "serving-only in-network import",
-                ref_count=provider_ref_count,
-                item_count=item_count,
-            )
-
-        if serving_workers > 1 and _env_bool(PTG2_FAST_OBJECT_ITERATOR_ENV, True):
-            global _PTG2_WORKER_PROVIDER_MAP, _PTG2_WORKER_PLAN_FIELDS, _PTG2_WORKER_SNAPSHOT_ID, _PTG2_WORKER_PLAN_MONTH_ID, _PTG2_WORKER_SOURCE_TRACE
-            global _PTG2_WORKER_SOURCE_TRACE_SET_HASH, _PTG2_WORKER_SLIM_SERVING_ROWS, _PTG2_WORKER_COMPACT_SERVING
-            pool: concurrent.futures.ProcessPoolExecutor | None = None
-            pending: set[concurrent.futures.Future] = set()
-            pending_input_bytes_by_future: dict[concurrent.futures.Future, int] = {}
-            pending_input_bytes = 0
-            pending_batches: list[dict[str, Any] | bytes | bytearray] = []
-            pending_batch_bytes = 0
-            mp_context = multiprocessing.get_context("fork")
-
-            async def _drain_completed_worker_results(done: set[concurrent.futures.Future]) -> None:
-                nonlocal pending_input_bytes
-                for future in done:
-                    pending_input_bytes -= pending_input_bytes_by_future.pop(future, 0)
-                    await add_serving_result(future.result())
-
-            async def _wait_for_worker_capacity(next_batch_bytes: int) -> None:
-                nonlocal pending
-                while pending and _ptg2_worker_capacity_wait_needed(
-                    pending_count=len(pending),
-                    pending_input_bytes=pending_input_bytes,
-                    next_batch_bytes=next_batch_bytes,
-                    max_pending_batches=worker_max_pending_batches,
-                    max_pending_bytes=worker_max_pending_bytes,
-                ):
-                    done, pending = concurrent.futures.wait(
-                        pending,
-                        return_when=concurrent.futures.FIRST_COMPLETED,
-                    )
-                    await _drain_completed_worker_results(done)
-
-            async def _flush_pending_batches(force: bool = False) -> None:
-                nonlocal pending_batches, pending_batch_bytes, pending_input_bytes
-                if not pending_batches:
-                    return
-                if not force and len(pending_batches) < worker_chunk_items and pending_batch_bytes < worker_chunk_bytes:
-                    return
-                assert pool is not None
-                batch = pending_batches
-                batch_bytes = pending_batch_bytes
-                pending_batches = []
-                pending_batch_bytes = 0
-                await _wait_for_worker_capacity(batch_bytes)
-                worker_fn = (
-                    _serving_only_worker_process_chunk_to_files
-                    if worker_result_files
-                    else _serving_only_worker_process_chunk
-                )
-                future = pool.submit(worker_fn, batch)
-                pending.add(future)
-                pending_input_bytes_by_future[future] = batch_bytes
-                pending_input_bytes += batch_bytes
-
-            try:
-                item_prefixes = {
-                    "provider_reference": "provider_references.item",
-                    "in_network": "in_network.item",
-                }
-                if _env_bool(PTG2_RUST_SCANNER_ENV, False):
-                    object_iterator = (
-                        (
-                            "provider_reference" if array_name == "provider_references" else "in_network",
-                            _json_loads(raw_object) if array_name == "provider_references" else raw_object,
-                        )
-                        for array_name, raw_object in _iter_top_level_object_bytes_rust(
-                            file_path,
-                            {"provider_references", "in_network"},
-                        )
-                    )
-                elif _env_bool(PTG2_JSON_DECODER_ITERATOR_ENV, True):
-                    raw_object_names = {"in_network"} if _env_bool(PTG2_RAW_WORKER_OBJECTS_ENV, True) else set()
-                    object_iterator = _iter_top_level_objects_jsondecoder(
-                        afp,
-                        item_prefixes,
-                        progress_callback=progress_callback,
-                        raw_object_names=raw_object_names,
-                    )
-                else:
-                    object_iterator = (
-                        (
-                            "provider_reference" if array_name == "provider_references" else "in_network",
-                            _json_loads(raw_object) if array_name == "provider_references" else raw_object,
-                        )
-                        for array_name, raw_object in _iter_top_level_object_bytes(
-                            afp,
-                            {"provider_references", "in_network"},
-                            progress_callback=progress_callback,
-                        )
-                    )
-                for object_name, payload in object_iterator:
-                    if object_name == "provider_reference":
-                        provider_ref_count += 1
-                        if test_mode and provider_ref_count > TEST_PROVIDER_GROUPS:
-                            continue
-                        provider_group_id = _normalize_provider_ref(payload.get("provider_group_id"))
-                        provider_entry, _provider_row = _build_provider_set_entry(
-                            file_id=file_id,
-                            provider_group_ref=provider_group_id,
-                            provider_groups=payload.get("provider_groups", []),
-                            network_names=payload.get("network_name") or payload.get("network_names") or [],
-                        )
-                        if provider_entry is not None:
-                            _provider_cache_put(provider_map, provider_group_id, [provider_entry])
-                            for member_row in _provider_group_member_rows(provider_entry):
-                                _compact_add_unique(state, "provider_group_member", ("provider_group_hash", "npi"), member_row)
-                            await _flush_compact_rows(state)
-                        continue
-                    if object_name != "in_network":
-                        continue
-                    if pool is None:
-                        _PTG2_WORKER_PROVIDER_MAP = provider_map
-                        _PTG2_WORKER_PLAN_FIELDS = plan_fields
-                        _PTG2_WORKER_SNAPSHOT_ID = snapshot_id
-                        _PTG2_WORKER_PLAN_MONTH_ID = plan_month_row["plan_month_id"]
-                        _PTG2_WORKER_SOURCE_TRACE = source_trace_payload
-                        _PTG2_WORKER_SOURCE_TRACE_SET_HASH = source_trace_set_hash
-                        _PTG2_WORKER_SLIM_SERVING_ROWS = slim_serving_rows
-                        _PTG2_WORKER_COMPACT_SERVING = compact_serving
-                        pool = concurrent.futures.ProcessPoolExecutor(
-                            max_workers=serving_workers,
-                            mp_context=mp_context,
-                        )
-                    item_count += 1
-                    payload_size = _worker_payload_size(payload)
-                    if pending_batches and pending_batch_bytes + payload_size > worker_chunk_bytes:
-                        await _flush_pending_batches(force=True)
-                    pending_batches.append(payload)
-                    pending_batch_bytes += payload_size
-                    await _flush_pending_batches()
-                    if max_items is not None and item_count >= max_items:
-                        break
-                    if test_mode and item_count >= TEST_IN_NETWORK_ITEMS:
-                        break
-                await _flush_pending_batches(force=True)
-                while pending:
-                    done, pending = concurrent.futures.wait(
-                        pending,
-                        return_when=concurrent.futures.FIRST_COMPLETED,
-                    )
-                    await _drain_completed_worker_results(done)
-            finally:
-                if pool is not None:
-                    pool.shutdown(wait=True, cancel_futures=True)
-        else:
-            if _env_bool(PTG2_RUST_SCANNER_ENV, False):
-                object_iterator = (
-                    (
-                        "provider_reference" if array_name == "provider_references" else "in_network",
-                        _json_loads(raw_object),
-                    )
-                    for array_name, raw_object in _iter_top_level_object_bytes_rust(
-                        file_path,
-                        {"provider_references", "in_network"},
-                    )
-                )
-            else:
-                iterator_fn = (
-                    _iter_top_level_objects_fast
-                    if _env_bool(PTG2_FAST_OBJECT_ITERATOR_ENV, True)
-                    else _iter_top_level_objects
-                )
-                object_iterator = iterator_fn(
-                    afp,
-                    {
-                        "provider_reference": "provider_references.item",
-                        "in_network": "in_network.item",
-                    },
-                    use_float=True,
-                    progress_callback=progress_callback,
-                )
-            for object_name, payload in object_iterator:
-                if object_name == "provider_reference":
-                    provider_ref_count += 1
-                    if test_mode and provider_ref_count > TEST_PROVIDER_GROUPS:
-                        continue
-                    provider_group_id = _normalize_provider_ref(payload.get("provider_group_id"))
-                    provider_entry, _provider_row = _build_provider_set_entry(
-                        file_id=file_id,
-                        provider_group_ref=provider_group_id,
-                        provider_groups=payload.get("provider_groups", []),
-                        network_names=payload.get("network_name") or payload.get("network_names") or [],
-                    )
-                    if provider_entry is not None:
-                        _provider_cache_put(provider_map, provider_group_id, [provider_entry])
-                        for member_row in _provider_group_member_rows(provider_entry):
-                            _compact_add_unique(state, "provider_group_member", ("provider_group_hash", "npi"), member_row)
-                        await _flush_compact_rows(state)
-                    continue
-
-                if object_name != "in_network":
-                    continue
-                item_count += 1
-                result = _serving_only_rows_for_payload(
-                    payload,
-                    provider_map=provider_map,
-                    plan_fields=plan_fields,
-                    snapshot_id=snapshot_id,
-                    plan_month_id=plan_month_row["plan_month_id"],
-                    source_trace_payload=source_trace_payload,
-                    slim_serving_rows=slim_serving_rows,
-                    compact_serving=compact_serving,
-                    source_trace_set_hash=source_trace_set_hash,
-                    include_price_set_rows=True,
-                )
-                await add_serving_result(result)
-                if max_items is not None and item_count >= max_items:
-                    break
-                if test_mode and item_count >= TEST_IN_NETWORK_ITEMS:
-                    break
-
-    await _flush_compact_rows(state, force=True)
-    await _drain_compact_writes(state)
-    if _env_bool(PTG2_STAGE_SERVING_RATES_ENV, True) and not _use_stage_serving_as_final() and not compact_serving:
-        await _merge_staged_serving_rates(snapshot_id)
-    if slim_serving_rows and _env_bool(PTG2_STAGE_PRICE_SETS_ENV, True):
-        await _merge_staged_price_sets(snapshot_id)
-    if compact_serving and not _env_bool(PTG2_DEFER_PROVIDER_LOCATIONS_ENV, True):
-        await _build_ptg2_provider_locations(snapshot_id)
     await flush_error_log(import_log_cls)
+    manifest_artifacts = {}
+    for artifact_kind, artifact_path in manifest_sidecar_paths.items():
+        if artifact_path.exists() and artifact_path.stat().st_size > 0:
+            digest, byte_count = sha256_file(artifact_path)
+            record_format = PTG2_MANIFEST_MEMBERSHIP_FORMAT
+            with artifact_path.open("rb") as artifact_fp:
+                if artifact_fp.read(8) == b"PTG2MNDS":
+                    record_format = PTG2_MANIFEST_DENSE_MEMBERSHIP_FORMAT
+            manifest_artifacts[artifact_kind] = {
+                "name": artifact_kind,
+                "path": str(artifact_path),
+                "record_format": record_format,
+                "sha256": digest,
+                "byte_count": byte_count,
+            }
     summary = {
-        "provider_refs": provider_ref_count,
-        "in_network_items": item_count,
-        "serving_rates": serving_rows,
+        "provider_refs": 0,
+        "in_network_items": len(procedure_hashes),
+        "serving_rates": manifest_copy_rows,
         "serving_only": True,
-        "serving_workers": serving_workers,
-        "worker_chunk_items": worker_chunk_items,
+        "serving_workers": 0,
+        "worker_chunk_items": 0,
+        "rust_manifest_serving": True,
+        "rust_records": rust_records,
+        "manifest": {
+            "serving_rows": manifest_copy_rows,
+            "sidecars": manifest_artifacts,
+        },
     }
-    if hasattr(provider_map, "stats"):
-        summary.update(provider_map.stats())
-    summary.update(provider_combo_stats)
+    if rust_dedupe_summary:
+        summary["dedupe"] = rust_dedupe_summary
     _emit_screen_line(f"PTG2 serving-only import summary: {summary}")
     logger.info("PTG2 serving-only import summary: %s", summary)
     return summary
@@ -2550,7 +1802,7 @@ async def _process_in_network_file(
     snapshot_id: str | None = None,
     import_month: datetime.date | None = None,
     rust_stage_tables: dict[str, str] | None = None,
-    ptg2_v3_stage_table: str | None = None,
+    ptg2_manifest_stage_table: str | None = None,
     raw_artifact: PTG2RawArtifact | None = None,
     logical_artifact: PTG2LogicalArtifact | None = None,
 ) -> PTG2FileProcessResult:
@@ -2595,7 +1847,7 @@ async def _process_in_network_file(
             provider_cache = PTG2ProviderReferenceCache(Path(tmpdir) / "provider_refs.sqlite", provider_ref_cache)
         parse_summary: dict[str, Any] | None = None
         try:
-            if compact_import and _use_serving_only_import():
+            if compact_import:
                 parse_summary = await _parse_in_network_file_serving_only(
                     extracted,
                     file_row["file_id"],
@@ -2610,22 +1862,7 @@ async def _process_in_network_file(
                     import_month or normalize_import_month(None),
                     max_items=max_items,
                     rust_stage_tables=rust_stage_tables,
-                    ptg2_v3_stage_table=ptg2_v3_stage_table,
-                )
-            elif compact_import:
-                parse_summary = await _parse_in_network_file_compact(
-                    extracted,
-                    file_row["file_id"],
-                    meta,
-                    plan_info,
-                    provider_cache,
-                    test_mode,
-                    import_log_cls,
-                    url,
-                    source_version,
-                    snapshot_id or "ptg2:unknown",
-                    import_month or normalize_import_month(None),
-                    max_items=max_items,
+                    ptg2_manifest_stage_table=ptg2_manifest_stage_table,
                 )
             else:
                 parse_summary = await _parse_in_network_file_single_pass(
@@ -2745,7 +1982,6 @@ async def main(
     await ensure_ptg2_tables()
     compact_import = True
     source_scoped_compact = True
-    use_manifest_serving_import = True
     if source_key_val is None:
         if test_mode:
             source_key_val = _normalize_source_key(import_id_val)
@@ -2812,19 +2048,12 @@ async def main(
         rewrite=True,
     )
     failure_report: dict[str, Any] = {"snapshot_id": snapshot_id, "legacy_table_suffix": import_id_val}
-    rust_snapshot_stage_tables: dict[str, str] = {}
-    ptg2_v3_stage_table: str | None = None
+    ptg2_manifest_stage_table: str | None = None
     current_pointer_published = False
     try:
         assert source_key_val is not None
         stage_token = _ptg2_snapshot_table_token(source_key_val, snapshot_id)
-        if use_manifest_serving_import:
-            ptg2_v3_stage_table = await _create_ptg2_v3_serving_stage_table(stage_token)
-        else:
-            rust_snapshot_stage_tables = await _create_rust_copy_stage_tables(
-                stage_token,
-                serving_lanes=max(_env_int(PTG2_RUST_WORKERS_ENV, PTG2_DEFAULT_RUST_WORKERS), 1),
-            )
+        ptg2_manifest_stage_table = await _create_ptg2_manifest_serving_stage_table(stage_token)
         classes = await _prepare_ptg_tables(import_id_val, test_mode)
 
         provider_ref_cache: dict[int, list[dict[str, Any]]] = {}
@@ -2998,8 +2227,8 @@ async def main(
                         compact_import=compact_import,
                         snapshot_id=snapshot_id,
                         import_month=import_month_value,
-                        rust_stage_tables=rust_snapshot_stage_tables if source_scoped_compact else None,
-                        ptg2_v3_stage_table=ptg2_v3_stage_table,
+                        rust_stage_tables=None,
+                        ptg2_manifest_stage_table=ptg2_manifest_stage_table,
                         raw_artifact=downloaded.raw_artifact,
                         logical_artifact=downloaded.logical_artifact,
                     )
@@ -3067,24 +2296,15 @@ async def main(
         if not manifest_artifacts["sidecars"]:
             manifest_artifacts = {}
         assert source_key_val is not None
-        if use_manifest_serving_import:
-            if not ptg2_v3_stage_table:
-                raise RuntimeError("PTG import did not create a manifest-backed serving stage table")
-            serving_index = await _publish_ptg2_v3_serving_snapshot(
-                ptg2_v3_stage_table,
-                snapshot_id=snapshot_id,
-                source_key=source_key_val,
-                artifacts=manifest_artifacts,
-            )
-            ptg2_v3_stage_table = None
-        else:
-            serving_index = await _publish_rust_compact_snapshot_tables(
-                rust_snapshot_stage_tables,
-                snapshot_id=snapshot_id,
-                import_run_id=import_run_id,
-                source_key=source_key_val,
-            )
-            rust_snapshot_stage_tables = {}
+        if not ptg2_manifest_stage_table:
+            raise RuntimeError("PTG import did not create a manifest-backed serving stage table")
+        serving_index = await _publish_ptg2_manifest_serving_snapshot(
+            ptg2_manifest_stage_table,
+            snapshot_id=snapshot_id,
+            source_key=source_key_val,
+            artifacts=manifest_artifacts,
+        )
+        ptg2_manifest_stage_table = None
         publish_seconds = time.monotonic() - publish_started_monotonic
         finished = _utcnow()
         previous_snapshot_id = None
@@ -3203,30 +2423,12 @@ async def main(
             serving_index = failure_report.get("serving_index")
             try:
                 await _drop_ptg2_snapshot_tables_for_manifest(serving_index if isinstance(serving_index, dict) else None)
-                if source_key_val:
+                if ptg2_manifest_stage_table:
                     await _drop_ptg2_snapshot_table_names(
                         [
-                            _ptg2_snapshot_table_name(kind, source_key_val, snapshot_id)
-                            for kind in (
-                                "serving_rate_compact",
-                                "procedure",
-                                "price_set",
-                                "provider_set",
-                                "provider_set_component",
-                                "provider_set_entry",
-                                "provider_entry_component",
-                                "provider_group_member",
-                            )
-                        ]
-                    )
-                if rust_snapshot_stage_tables:
-                    await _drop_ptg2_snapshot_table_names(list(rust_snapshot_stage_tables.values()))
-                if ptg2_v3_stage_table:
-                    await _drop_ptg2_snapshot_table_names(
-                        [
-                            ptg2_v3_stage_table,
-                            _ptg2_v3_support_stage_table(ptg2_v3_stage_table, "price_atom"),
-                            _ptg2_v3_support_stage_table(ptg2_v3_stage_table, "provider_group_member"),
+                            ptg2_manifest_stage_table,
+                            _ptg2_manifest_support_stage_table(ptg2_manifest_stage_table, "price_atom"),
+                            _ptg2_manifest_support_stage_table(ptg2_manifest_stage_table, "provider_group_member"),
                         ]
                     )
             except Exception:

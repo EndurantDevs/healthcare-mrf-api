@@ -5,13 +5,13 @@ import hashlib
 
 import pytest
 
-from process.ptg_parts.ptg2_v3_artifacts import (
-    PTG2_V3_DENSE_MEMBERSHIP_FORMAT,
-    PTG2_V3_DENSE_MEMBERSHIP_MAGIC,
-    PTG2_V3_MEMBERSHIP_INDEX_RECORD_SIZE,
-    PTG2_V3_MEMBERSHIP_MAGIC,
-    PTG2_V3_MAPPING_RECORD_SIZE,
-    PTG2V3ArtifactError,
+from process.ptg_parts.ptg2_manifest_artifacts import (
+    PTG2_MANIFEST_DENSE_MEMBERSHIP_FORMAT,
+    PTG2_MANIFEST_DENSE_MEMBERSHIP_MAGIC,
+    PTG2_MANIFEST_MEMBERSHIP_INDEX_RECORD_SIZE,
+    PTG2_MANIFEST_MEMBERSHIP_MAGIC,
+    PTG2_MANIFEST_MAPPING_RECORD_SIZE,
+    PTG2ManifestArtifactError,
     build_dense_id_mapping,
     read_global_membership_sidecar,
     read_global_sidecar_entries,
@@ -28,7 +28,7 @@ GLOBAL_B = bytes.fromhex("0000000000000000000000000000000b")
 GLOBAL_C = bytes.fromhex("0000000000000000000000000000000c")
 
 
-def test_ptg2_v3_dense_id_mapping_is_sorted_and_deduped():
+def test_ptg2_manifest_dense_id_mapping_is_sorted_and_deduped():
     mapping = build_dense_id_mapping([GLOBAL_B.hex(), GLOBAL_A, GLOBAL_B, GLOBAL_C])
 
     assert mapping == {
@@ -38,7 +38,7 @@ def test_ptg2_v3_dense_id_mapping_is_sorted_and_deduped():
     }
 
 
-def test_ptg2_v3_mapping_roundtrip_validates_manifest_sidecar(tmp_path):
+def test_ptg2_manifest_mapping_roundtrip_validates_manifest_sidecar(tmp_path):
     manifest = write_global_local_id_mapping(
         tmp_path,
         "provider_sets",
@@ -51,7 +51,7 @@ def test_ptg2_v3_mapping_roundtrip_validates_manifest_sidecar(tmp_path):
     assert manifest["global_id_count"] == 2
     assert manifest["record_count"] == 4
     sidecar = manifest["sidecars"][0]
-    assert sidecar["byte_count"] == 4 * PTG2_V3_MAPPING_RECORD_SIZE
+    assert sidecar["byte_count"] == 4 * PTG2_MANIFEST_MAPPING_RECORD_SIZE
     assert len(sidecar["sha256"]) == 64
 
     mapping = read_global_local_id_mapping(tmp_path / "provider_sets.manifest.json")
@@ -62,7 +62,7 @@ def test_ptg2_v3_mapping_roundtrip_validates_manifest_sidecar(tmp_path):
     }
 
 
-def test_ptg2_v3_mapping_writes_deterministic_order(tmp_path):
+def test_ptg2_manifest_mapping_writes_deterministic_order(tmp_path):
     left = tmp_path / "left"
     right = tmp_path / "right"
     write_global_local_id_mapping(
@@ -90,18 +90,18 @@ def test_ptg2_v3_mapping_writes_deterministic_order(tmp_path):
     ).read_text(encoding="utf-8")
 
 
-def test_ptg2_v3_mapping_read_rejects_checksum_failure(tmp_path):
+def test_ptg2_manifest_mapping_read_rejects_checksum_failure(tmp_path):
     write_global_local_id_mapping(tmp_path, "provider_sets", {GLOBAL_A: [1]})
     sidecar_path = tmp_path / "provider_sets.global_local_ids.bin"
     payload = bytearray(sidecar_path.read_bytes())
     payload[-1] ^= 0x01
     sidecar_path.write_bytes(payload)
 
-    with pytest.raises(PTG2V3ArtifactError, match="checksum mismatch"):
+    with pytest.raises(PTG2ManifestArtifactError, match="checksum mismatch"):
         read_global_local_id_mapping(tmp_path / "provider_sets.manifest.json")
 
 
-def test_ptg2_v3_membership_sidecar_roundtrip_uses_rust_layout(tmp_path):
+def test_ptg2_manifest_membership_sidecar_roundtrip_uses_rust_layout(tmp_path):
     manifest = write_global_membership_sidecar(
         tmp_path,
         "provider_set_members",
@@ -114,9 +114,9 @@ def test_ptg2_v3_membership_sidecar_roundtrip_uses_rust_layout(tmp_path):
     sidecar = manifest["sidecars"][0]
     assert manifest["owner_count"] == 2
     assert manifest["member_count"] == 3
-    assert sidecar["byte_count"] == 8 + 4 + 8 + 2 * PTG2_V3_MEMBERSHIP_INDEX_RECORD_SIZE + 3 * 16
+    assert sidecar["byte_count"] == 8 + 4 + 8 + 2 * PTG2_MANIFEST_MEMBERSHIP_INDEX_RECORD_SIZE + 3 * 16
     raw = (tmp_path / "provider_set_members.global_membership.bin").read_bytes()
-    assert raw[:8] == PTG2_V3_MEMBERSHIP_MAGIC
+    assert raw[:8] == PTG2_MANIFEST_MEMBERSHIP_MAGIC
 
     mapping = read_global_membership_sidecar(tmp_path / "provider_set_members.manifest.json")
     entries = read_global_sidecar_entries(tmp_path / "provider_set_members.global_membership.bin", metadata=sidecar)
@@ -129,10 +129,10 @@ def test_ptg2_v3_membership_sidecar_roundtrip_uses_rust_layout(tmp_path):
     assert entries[0].members == (GLOBAL_B,)
 
 
-def test_ptg2_v3_dense_membership_sidecar_roundtrip_and_lookup(tmp_path):
-    sidecar_path = tmp_path / "provider_forward.ptg2v3sc"
+def test_ptg2_manifest_dense_membership_sidecar_roundtrip_and_lookup(tmp_path):
+    sidecar_path = tmp_path / "provider_forward.ptg2sc"
     payload = bytearray()
-    payload.extend(struct.pack("<8sIQQ", PTG2_V3_DENSE_MEMBERSHIP_MAGIC, 1, 2, 2))
+    payload.extend(struct.pack("<8sIQQ", PTG2_MANIFEST_DENSE_MEMBERSHIP_MAGIC, 1, 2, 2))
     payload.extend(struct.pack("<16sQI", GLOBAL_A, 0, 2))
     payload.extend(struct.pack("<16sQI", GLOBAL_B, 2, 1))
     payload.extend(GLOBAL_B)
@@ -140,7 +140,7 @@ def test_ptg2_v3_dense_membership_sidecar_roundtrip_and_lookup(tmp_path):
     payload.extend(struct.pack("<III", 0, 1, 1))
     sidecar_path.write_bytes(payload)
     metadata = {
-        "record_format": PTG2_V3_DENSE_MEMBERSHIP_FORMAT,
+        "record_format": PTG2_MANIFEST_DENSE_MEMBERSHIP_FORMAT,
         "byte_count": len(payload),
         "sha256": hashlib.sha256(payload).hexdigest(),
         "owner_count": 2,
@@ -157,7 +157,7 @@ def test_ptg2_v3_dense_membership_sidecar_roundtrip_and_lookup(tmp_path):
     assert members == (GLOBAL_B, GLOBAL_C)
 
 
-def test_ptg2_v3_membership_sidecar_writes_deterministic_order(tmp_path):
+def test_ptg2_manifest_membership_sidecar_writes_deterministic_order(tmp_path):
     left = tmp_path / "left"
     right = tmp_path / "right"
     write_global_membership_sidecar(left, "provider_sets", {GLOBAL_B: [GLOBAL_C, GLOBAL_A], GLOBAL_A: [GLOBAL_B]})
@@ -171,27 +171,27 @@ def test_ptg2_v3_membership_sidecar_writes_deterministic_order(tmp_path):
     ).read_text(encoding="utf-8")
 
 
-def test_ptg2_v3_membership_sidecar_read_rejects_checksum_failure(tmp_path):
+def test_ptg2_manifest_membership_sidecar_read_rejects_checksum_failure(tmp_path):
     write_global_membership_sidecar(tmp_path, "provider_sets", {GLOBAL_A: [GLOBAL_B]})
     sidecar_path = tmp_path / "provider_sets.global_membership.bin"
     payload = bytearray(sidecar_path.read_bytes())
     payload[-1] ^= 0x01
     sidecar_path.write_bytes(payload)
 
-    with pytest.raises(PTG2V3ArtifactError, match="checksum mismatch"):
+    with pytest.raises(PTG2ManifestArtifactError, match="checksum mismatch"):
         read_global_membership_sidecar(tmp_path / "provider_sets.manifest.json")
 
 
-def test_ptg2_v3_membership_sidecar_read_rejects_byte_count_failure(tmp_path):
+def test_ptg2_manifest_membership_sidecar_read_rejects_byte_count_failure(tmp_path):
     manifest = write_global_membership_sidecar(tmp_path, "provider_sets", {GLOBAL_A: [GLOBAL_B]})
     sidecar = dict(manifest["sidecars"][0])
     sidecar["byte_count"] += 1
 
-    with pytest.raises(PTG2V3ArtifactError, match="byte_count mismatch"):
+    with pytest.raises(PTG2ManifestArtifactError, match="byte_count mismatch"):
         read_global_sidecar_entries(tmp_path / "provider_sets.global_membership.bin", metadata=sidecar)
 
 
-def test_ptg2_v3_membership_lookup_infers_format_when_metadata_omits_it(tmp_path):
+def test_ptg2_manifest_membership_lookup_infers_format_when_metadata_omits_it(tmp_path):
     manifest = write_global_membership_sidecar(tmp_path, "provider_sets", {GLOBAL_A: [GLOBAL_B], GLOBAL_B: [GLOBAL_C]})
     sidecar = dict(manifest["sidecars"][0])
     sidecar.pop("record_format")

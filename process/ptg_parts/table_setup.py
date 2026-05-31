@@ -91,34 +91,6 @@ PTG2_MODEL_CLASSES = (
     PTG2Plan,
     PTG2PlanAlias,
     PTG2PlanMonth,
-    PTG2PlanRateSet,
-    PTG2RateSetContext,
-    PTG2RateSet,
-    PTG2FactChunk,
-    PTG2RatePack,
-    PTG2ProviderGroup,
-    PTG2ProviderGroupMember,
-    PTG2ProviderSet,
-    PTG2ProviderSetComponent,
-    PTG2ProviderSetEntry,
-    PTG2ProviderEntryComponent,
-    PTG2ProviderSetMember,
-    PTG2ProviderLocation,
-    PTG2ServingRateCompact,
-    PTG2ServingRate,
-    PTG2LocationSet,
-    PTG2LocationSetMember,
-    PTG2Procedure,
-    PTG2RelatedCodeSet,
-    PTG2PriceCodeSet,
-    PTG2PriceAtom,
-    PTG2PriceSet,
-    PTG2PriceSetEntry,
-    PTG2SourceTrace,
-    PTG2SourceTraceSet,
-    PTG2Confidence,
-    PTG2Capability,
-    PTG2GCCandidate,
 )
 
 
@@ -419,8 +391,6 @@ async def ensure_ptg2_tables() -> None:
         if cls is PTG2SourceTraceSet:
             await _drop_ptg2_columns(db_schema, "ptg2_source_trace_set", ("hash_prefix", "canonical_payload"))
         await _ensure_indexes(cls, db_schema)
-    await _ensure_ptg2_price_set_stage_table(db_schema)
-    await _ensure_ptg2_serving_rate_stage_table(db_schema)
 
 
 async def _prepare_ptg_tables(import_id: str, test_mode: bool) -> dict[str, type]:

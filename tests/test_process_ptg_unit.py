@@ -38,8 +38,8 @@ ptg_row_helpers = importlib.import_module("process.ptg_parts.row_helpers")
 ptg_rust_publish = importlib.import_module("process.ptg_parts.rust_publish")
 ptg_rust_scanner = importlib.import_module("process.ptg_parts.rust_scanner")
 ptg_rust_stage = importlib.import_module("process.ptg_parts.rust_stage")
-ptg_v3_publish = importlib.import_module("process.ptg_parts.ptg2_v3_publish")
-ptg_v3_cleanup = importlib.import_module("process.ptg_parts.ptg2_v3_cleanup")
+ptg_manifest_publish = importlib.import_module("process.ptg_parts.ptg2_manifest_publish")
+ptg_manifest_cleanup = importlib.import_module("process.ptg_parts.ptg2_manifest_cleanup")
 ptg_screen = importlib.import_module("process.ptg_parts.screen")
 ptg_serving_index = importlib.import_module("process.ptg_parts.serving_index")
 ptg_serving_maintenance = importlib.import_module("process.ptg_parts.serving_maintenance")
@@ -317,13 +317,13 @@ def test_rust_publish_skips_optional_provider_geo_index_when_postgis_is_missing(
     assert any("geo_gist_idx" in statement for statement in status_calls)
 
 
-def test_ptg2_v3_cleanup_plan_selects_legacy_snapshot_tables(monkeypatch):
+def test_ptg2_manifest_cleanup_plan_selects_legacy_snapshot_tables(monkeypatch):
     async def fake_all(statement, **_params):
         if "FROM pg_class" in statement:
             return [
                 {"table_name": "ptg2_serving_rate_compact_abc123def4567890"},
                 {"table_name": "ptg2_provider_set_component_abc123def4567890"},
-                {"table_name": "ptg2_v3_serving_abc123def4567890"},
+                {"table_name": "ptg2_manifest_serving_abc123def4567890"},
                 {"table_name": "ptg2_plan"},
             ]
         if "FROM \"mrf\".ptg2_snapshot" in statement:
@@ -338,9 +338,9 @@ def test_ptg2_v3_cleanup_plan_selects_legacy_snapshot_tables(monkeypatch):
             return [{"plan_source_key": "legacy-plan"}]
         return []
 
-    monkeypatch.setattr(ptg_v3_cleanup.db, "all", fake_all)
+    monkeypatch.setattr(ptg_manifest_cleanup.db, "all", fake_all)
 
-    plan = asyncio.run(ptg_v3_cleanup.build_ptg2_v3_cleanup_plan(schema_name="mrf"))
+    plan = asyncio.run(ptg_manifest_cleanup.build_ptg2_manifest_cleanup_plan(schema_name="mrf"))
 
     assert plan.tables == (
         "ptg2_serving_rate_compact_abc123def4567890",
@@ -1891,7 +1891,7 @@ def test_ptg2_main_marks_failed_when_all_discovered_jobs_fail(monkeypatch):
     monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
     monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push)
     monkeypatch.setattr(process_ptg, "_prepare_ptg_tables", AsyncMock(return_value={"ImportLog": "log"}))
-    monkeypatch.setattr(process_ptg, "_create_ptg2_v3_serving_stage_table", AsyncMock(return_value="v3_stage"))
+    monkeypatch.setattr(process_ptg, "_create_ptg2_manifest_serving_stage_table", AsyncMock(return_value="manifest_stage"))
     monkeypatch.setattr(process_ptg, "_iter_downloaded_ptg_jobs", fake_downloaded_jobs)
     monkeypatch.setattr(process_ptg, "_process_in_network_file", fake_process)
     monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
@@ -1954,7 +1954,7 @@ def test_ptg2_main_blocks_partial_publish_by_default(monkeypatch):
     monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
     monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push)
     monkeypatch.setattr(process_ptg, "_prepare_ptg_tables", AsyncMock(return_value={"ImportLog": "log"}))
-    monkeypatch.setattr(process_ptg, "_create_ptg2_v3_serving_stage_table", AsyncMock(return_value="v3_stage"))
+    monkeypatch.setattr(process_ptg, "_create_ptg2_manifest_serving_stage_table", AsyncMock(return_value="manifest_stage"))
     monkeypatch.setattr(process_ptg, "_iter_downloaded_ptg_jobs", fake_downloaded_jobs)
     monkeypatch.setattr(process_ptg, "_process_in_network_file", fake_in_network)
     monkeypatch.setattr(process_ptg, "_process_allowed_amounts_file", fake_allowed)
@@ -1997,7 +1997,7 @@ def test_ptg2_main_marks_failed_when_toc_download_fails(monkeypatch):
     monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
     monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push)
     monkeypatch.setattr(process_ptg, "_prepare_ptg_tables", AsyncMock(return_value={"ImportLog": "log"}))
-    monkeypatch.setattr(process_ptg, "_create_ptg2_v3_serving_stage_table", AsyncMock(return_value="v3_stage"))
+    monkeypatch.setattr(process_ptg, "_create_ptg2_manifest_serving_stage_table", AsyncMock(return_value="manifest_stage"))
     monkeypatch.setattr(process_ptg, "_process_table_of_contents", fake_toc)
     monkeypatch.setattr(process_ptg, "_publish_rust_compact_snapshot_tables", publish_mock)
     monkeypatch.setenv(process_ptg.PTG2_COMPACT_IMPORT_ENV, "false")
@@ -2754,20 +2754,20 @@ def test_ptg2_rust_compact_uses_bounded_event_queue_default(monkeypatch, tmp_pat
             plan_month_id="month",
             source_trace_set_hash="trace",
             compact_copy_path=tmp_path / "serving.copy",
-            v3_provider_forward_sidecar_path=tmp_path / "provider_forward.ptg2v3sc",
-            v3_provider_inverted_sidecar_path=tmp_path / "provider_inverted.ptg2v3sc",
-            v3_provider_npi_sidecar_path=tmp_path / "provider_npi.ptg2v3sc",
-            v3_price_forward_sidecar_path=tmp_path / "price_forward.ptg2v3sc",
-            v3_only=True,
+            manifest_provider_forward_sidecar_path=tmp_path / "provider_forward.ptg2sc",
+            manifest_provider_inverted_sidecar_path=tmp_path / "provider_inverted.ptg2sc",
+            manifest_provider_npi_sidecar_path=tmp_path / "provider_npi.ptg2sc",
+            manifest_price_forward_sidecar_path=tmp_path / "price_forward.ptg2sc",
+            manifest_only=True,
         )
     )
 
     assert captured_env[process_ptg.PTG2_RUST_EVENT_QUEUE_ENV] == "32"
-    assert captured_env["HLTHPRT_PTG2_V3_PROVIDER_FORWARD_SIDECAR_PATH"].endswith("provider_forward.ptg2v3sc")
-    assert captured_env["HLTHPRT_PTG2_V3_PROVIDER_INVERTED_SIDECAR_PATH"].endswith("provider_inverted.ptg2v3sc")
-    assert captured_env["HLTHPRT_PTG2_V3_PROVIDER_NPI_SIDECAR_PATH"].endswith("provider_npi.ptg2v3sc")
-    assert captured_env["HLTHPRT_PTG2_V3_PRICE_FORWARD_SIDECAR_PATH"].endswith("price_forward.ptg2v3sc")
-    assert captured_env["HLTHPRT_PTG2_V3_ONLY"] == "true"
+    assert captured_env["HLTHPRT_PTG2_MANIFEST_PROVIDER_FORWARD_SIDECAR_PATH"].endswith("provider_forward.ptg2sc")
+    assert captured_env["HLTHPRT_PTG2_MANIFEST_PROVIDER_INVERTED_SIDECAR_PATH"].endswith("provider_inverted.ptg2sc")
+    assert captured_env["HLTHPRT_PTG2_MANIFEST_PROVIDER_NPI_SIDECAR_PATH"].endswith("provider_npi.ptg2sc")
+    assert captured_env["HLTHPRT_PTG2_MANIFEST_PRICE_FORWARD_SIDECAR_PATH"].endswith("price_forward.ptg2sc")
+    assert captured_env["HLTHPRT_PTG2_MANIFEST_ONLY"] == "true"
 
 
 def test_ptg2_compact_finalize_defers_provider_locations_by_default(monkeypatch):
@@ -2967,20 +2967,20 @@ def test_ptg2_rust_snapshot_publish_inherits_serving_stage_lanes(monkeypatch):
     assert "_p01" in joined
 
 
-def test_ptg2_v3_snapshot_publish_direct_renames_and_indexes(monkeypatch):
+def test_ptg2_manifest_snapshot_publish_direct_renames_and_indexes(monkeypatch):
     status_calls = []
 
     async def fake_status(statement, **_params):
         status_calls.append(statement)
 
-    monkeypatch.setattr(ptg_v3_publish.db, "status", fake_status)
-    monkeypatch.setattr(ptg_v3_publish, "_table_exists", AsyncMock(return_value=True))
-    monkeypatch.setattr(ptg_v3_publish, "_table_has_rows", AsyncMock(return_value=True))
-    monkeypatch.setattr(ptg_v3_publish, "_exact_table_rows", AsyncMock(return_value=321))
+    monkeypatch.setattr(ptg_manifest_publish.db, "status", fake_status)
+    monkeypatch.setattr(ptg_manifest_publish, "_table_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(ptg_manifest_publish, "_table_has_rows", AsyncMock(return_value=True))
+    monkeypatch.setattr(ptg_manifest_publish, "_exact_table_rows", AsyncMock(return_value=321))
 
     result = asyncio.run(
-        process_ptg._publish_ptg2_v3_serving_snapshot(
-            "ptg2_v3_stage_serving_abc",
+        process_ptg._publish_ptg2_manifest_serving_snapshot(
+            "ptg2_manifest_stage_serving_abc",
             snapshot_id="ptg2:202604:snap",
             source_key="heartland_dental",
             artifacts={"manifest_uri": "file:///tmp/snapshot.manifest.json"},
@@ -2996,12 +2996,12 @@ def test_ptg2_v3_snapshot_publish_direct_renames_and_indexes(monkeypatch):
     )
 
     joined = "\n".join(status_calls)
-    assert result["storage"] == "v3_manifest_snapshot"
+    assert result["storage"] == "manifest_snapshot"
     assert result["type"] == "ptg2_serving"
     assert result["id_storage"] == "hex"
     assert result["rate_count"] == 321
     assert result["serving_rates"] == 321
-    assert result["table"].startswith("mrf.ptg2_v3_serving_")
+    assert result["table"].startswith("mrf.ptg2_serving_")
     assert result["artifacts"]["manifest_uri"] == "file:///tmp/snapshot.manifest.json"
     assert result["artifacts"]["sidecars"][0]["name"] == "provider_set_members"
     assert "RENAME TO" in joined
@@ -3020,9 +3020,9 @@ def test_ptg2_manifest_stage_uses_uuid_ids_when_enabled(monkeypatch):
         status_calls.append(statement)
 
     monkeypatch.setenv("HLTHPRT_PTG2_BINARY_IDS", "true")
-    monkeypatch.setattr(ptg_v3_publish.db, "status", fake_status)
+    monkeypatch.setattr(ptg_manifest_publish.db, "status", fake_status)
 
-    asyncio.run(process_ptg._create_ptg2_v3_serving_stage_table("abc"))
+    asyncio.run(process_ptg._create_ptg2_manifest_serving_stage_table("abc"))
 
     joined = "\n".join(status_calls)
     assert "serving_content_hash_128 uuid NOT NULL" in joined
@@ -3076,12 +3076,12 @@ def test_ptg2_source_plan_rows_falls_back_to_serving_index_table(monkeypatch):
     assert len(calls) == 2
 
 
-def test_ptg2_source_plan_rows_uses_v3_table_without_snapshot_column(monkeypatch):
+def test_ptg2_source_plan_rows_uses_manifest_table_without_snapshot_column(monkeypatch):
     calls = []
 
     async def fake_all(statement, **_params):
         calls.append(statement)
-        if "FROM \"mrf\".\"ptg2_v3_serving_exact\"" in statement:
+        if "FROM \"mrf\".\"ptg2_manifest_serving_exact\"" in statement:
             assert "snapshot_id" not in statement
             return [{"plan_id": "010854205", "plan_market_type": ""}]
         return []
@@ -3097,7 +3097,7 @@ def test_ptg2_source_plan_rows_uses_v3_table_without_snapshot_column(monkeypatch
             import_month=process_ptg.normalize_import_month("2026-04"),
             previous_snapshot_id="prev",
             updated_at=updated_at,
-            serving_index={"storage": "v3_manifest_snapshot", "table": "mrf.ptg2_v3_serving_exact"},
+            serving_index={"storage": "manifest_snapshot", "table": "mrf.ptg2_manifest_serving_exact"},
         )
     )
 
@@ -3152,9 +3152,9 @@ def test_ptg2_source_scoped_report_uses_published_serving_rate_count(monkeypatch
 
     async def fake_publish(*_args, **_kwargs):
         return {
-            "storage": "v3_manifest_snapshot",
-            "type": "ptg2_v3_serving",
-            "table": "mrf.ptg2_v3_serving_exact",
+            "storage": "manifest_snapshot",
+            "type": "ptg2_manifest_serving",
+            "table": "mrf.ptg2_manifest_serving_exact",
             "rate_count": 987,
             "serving_rates": 987,
         }
@@ -3164,11 +3164,11 @@ def test_ptg2_source_scoped_report_uses_published_serving_rate_count(monkeypatch
     monkeypatch.setattr(process_ptg.db, "status", AsyncMock())
     monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push)
     monkeypatch.setattr(process_ptg, "_prepare_ptg_tables", AsyncMock(return_value={"ImportLog": "log"}))
-    monkeypatch.setattr(process_ptg, "_create_ptg2_v3_serving_stage_table", AsyncMock(return_value="v3_stage"))
+    monkeypatch.setattr(process_ptg, "_create_ptg2_manifest_serving_stage_table", AsyncMock(return_value="manifest_stage"))
     monkeypatch.setattr(process_ptg, "_iter_downloaded_ptg_jobs", fake_downloaded_jobs)
     monkeypatch.setattr(process_ptg, "_process_in_network_file", fake_process)
     monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
-    monkeypatch.setattr(process_ptg, "_publish_ptg2_v3_serving_snapshot", fake_publish)
+    monkeypatch.setattr(process_ptg, "_publish_ptg2_manifest_serving_snapshot", fake_publish)
     monkeypatch.setattr(process_ptg, "_current_source_snapshot_id", AsyncMock(return_value=None))
     monkeypatch.setattr(process_ptg, "_publish_ptg2_source_pointers", AsyncMock())
     monkeypatch.setattr(process_ptg, "_cleanup_old_ptg2_source_tables", AsyncMock())
@@ -3192,7 +3192,7 @@ def test_ptg2_source_scoped_report_uses_published_serving_rate_count(monkeypatch
     assert snapshot_rows[-1]["manifest"]["serving_rates"] == 987
 
 
-def test_ptg2_test_mode_uses_v3_source_scoped_import(monkeypatch):
+def test_ptg2_test_mode_uses_manifest_source_scoped_import(monkeypatch):
     pushed = []
 
     async def fake_push(rows, cls, **_kwargs):
@@ -3207,8 +3207,8 @@ def test_ptg2_test_mode_uses_v3_source_scoped_import(monkeypatch):
             )
 
     async def fake_process(*_args, **kwargs):
-        assert kwargs.get("rust_stage_tables") == {}
-        assert kwargs.get("ptg2_v3_stage_table") == "v3_stage"
+        assert kwargs.get("rust_stage_tables") is None
+        assert kwargs.get("ptg2_manifest_stage_table") == "manifest_stage"
         return process_ptg.PTG2FileProcessResult(
             "in_network",
             "https://example.test/rates.json.gz",
@@ -3216,19 +3216,19 @@ def test_ptg2_test_mode_uses_v3_source_scoped_import(monkeypatch):
             summary={"serving_rates": 111, "rust_compact_serving": True, "manifest": {"serving_rows": 111}},
         )
 
-    create_stage_mock = AsyncMock(return_value="v3_stage")
-    publish_mock = AsyncMock(return_value={"storage": "v3_manifest_snapshot", "rate_count": 222, "serving_rates": 222})
+    create_stage_mock = AsyncMock(return_value="manifest_stage")
+    publish_mock = AsyncMock(return_value={"storage": "manifest_snapshot", "rate_count": 222, "serving_rates": 222})
 
     monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
     monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
     monkeypatch.setattr(process_ptg.db, "status", AsyncMock())
     monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push)
     monkeypatch.setattr(process_ptg, "_prepare_ptg_tables", AsyncMock(return_value={"ImportLog": "log"}))
-    monkeypatch.setattr(process_ptg, "_create_ptg2_v3_serving_stage_table", create_stage_mock)
+    monkeypatch.setattr(process_ptg, "_create_ptg2_manifest_serving_stage_table", create_stage_mock)
     monkeypatch.setattr(process_ptg, "_iter_downloaded_ptg_jobs", fake_downloaded_jobs)
     monkeypatch.setattr(process_ptg, "_process_in_network_file", fake_process)
     monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
-    monkeypatch.setattr(process_ptg, "_publish_ptg2_v3_serving_snapshot", publish_mock)
+    monkeypatch.setattr(process_ptg, "_publish_ptg2_manifest_serving_snapshot", publish_mock)
     monkeypatch.setattr(process_ptg, "_current_source_snapshot_id", AsyncMock(return_value=None))
     monkeypatch.setattr(process_ptg, "_publish_ptg2_source_pointers", AsyncMock())
     monkeypatch.setattr(process_ptg, "_cleanup_old_ptg2_source_tables", AsyncMock())
@@ -3264,8 +3264,8 @@ def test_ptg2_ignores_legacy_v2_import_flags(monkeypatch):
             )
 
     async def fake_process(*_args, **kwargs):
-        assert kwargs.get("rust_stage_tables") == {}
-        assert kwargs.get("ptg2_v3_stage_table") == "v3_stage"
+        assert kwargs.get("rust_stage_tables") is None
+        assert kwargs.get("ptg2_manifest_stage_table") == "manifest_stage"
         return process_ptg.PTG2FileProcessResult(
             "in_network",
             "https://example.test/rates.json.gz",
@@ -3273,8 +3273,8 @@ def test_ptg2_ignores_legacy_v2_import_flags(monkeypatch):
             summary={"serving_rates": 111, "rust_compact_serving": True, "manifest": {"serving_rows": 111}},
         )
 
-    create_stage_mock = AsyncMock(return_value="v3_stage")
-    publish_mock = AsyncMock(return_value={"storage": "v3_manifest_snapshot", "rate_count": 111, "serving_rates": 111})
+    create_stage_mock = AsyncMock(return_value="manifest_stage")
+    publish_mock = AsyncMock(return_value={"storage": "manifest_snapshot", "rate_count": 111, "serving_rates": 111})
 
     monkeypatch.setenv(process_ptg.PTG2_COMPACT_IMPORT_ENV, "false")
     monkeypatch.setenv(process_ptg.PTG2_COMPACT_SERVING_TABLE_ENV, "false")
@@ -3284,11 +3284,11 @@ def test_ptg2_ignores_legacy_v2_import_flags(monkeypatch):
     monkeypatch.setattr(process_ptg.db, "status", AsyncMock())
     monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push)
     monkeypatch.setattr(process_ptg, "_prepare_ptg_tables", AsyncMock(return_value={"ImportLog": "log"}))
-    monkeypatch.setattr(process_ptg, "_create_ptg2_v3_serving_stage_table", create_stage_mock)
+    monkeypatch.setattr(process_ptg, "_create_ptg2_manifest_serving_stage_table", create_stage_mock)
     monkeypatch.setattr(process_ptg, "_iter_downloaded_ptg_jobs", fake_downloaded_jobs)
     monkeypatch.setattr(process_ptg, "_process_in_network_file", fake_process)
     monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
-    monkeypatch.setattr(process_ptg, "_publish_ptg2_v3_serving_snapshot", publish_mock)
+    monkeypatch.setattr(process_ptg, "_publish_ptg2_manifest_serving_snapshot", publish_mock)
     monkeypatch.setattr(process_ptg, "_current_source_snapshot_id", AsyncMock(return_value=None))
     monkeypatch.setattr(process_ptg, "_publish_ptg2_source_pointers", AsyncMock())
     monkeypatch.setattr(process_ptg, "_cleanup_old_ptg2_source_tables", AsyncMock())

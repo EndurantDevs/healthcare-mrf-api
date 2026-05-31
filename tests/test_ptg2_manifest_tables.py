@@ -30,7 +30,7 @@ class FakeSession:
 
 
 @pytest.mark.asyncio
-async def test_snapshot_serving_tables_keeps_v2_compact_table_resolution():
+async def test_snapshot_serving_tables_rejects_non_manifest_storage():
     session = FakeSession(
         [
             {
@@ -61,20 +61,19 @@ async def test_snapshot_serving_tables_keeps_v2_compact_table_resolution():
     assert tables.price_atom_table == "mrf.ptg2_price_atom_token"
     assert tables.provider_group_member_table == "mrf.ptg2_provider_group_member_token"
     assert tables.is_manifest_backed_snapshot is False
-    assert ptg2_tables._ordered_serving_table_candidates(tables.serving_table)[0] == tables.serving_table
 
 
 @pytest.mark.asyncio
-async def test_snapshot_serving_tables_represents_v3_manifest_snapshot_without_v2_table():
+async def test_snapshot_serving_tables_represents_manifest_snapshot_without_v2_table():
     session = FakeSession(
         [
             {
                 "serving_index": {
                     "type": "snapshot_index",
-                    "storage": "v3_manifest_snapshot",
+                    "storage": "manifest_snapshot",
                     "snapshot_scoped": True,
                     "source_key": "heartland_dental",
-                    "artifact_uri": "file:///tmp/ptg2/snapshot_index/snap-v3.json",
+                    "artifact_uri": "file:///tmp/ptg2/snapshot_index/snap-manifest.json",
                     "table": "ptg2_serving_rate; DROP TABLE ptg2_snapshot",
                     "provider_group_member_table": "mrf.ptg2_provider_group_member; DROP",
                 }
@@ -82,34 +81,34 @@ async def test_snapshot_serving_tables_represents_v3_manifest_snapshot_without_v
         ]
     )
 
-    tables = await ptg2_tables.snapshot_serving_tables(session, "snap-v3")
+    tables = await ptg2_tables.snapshot_serving_tables(session, "snap-manifest")
 
-    assert tables.storage == "v3_manifest_snapshot"
+    assert tables.storage == "manifest_snapshot"
     assert tables.type == "snapshot_index"
     assert tables.snapshot_scoped is True
     assert tables.source_key == "heartland_dental"
-    assert tables.artifact_uri == "file:///tmp/ptg2/snapshot_index/snap-v3.json"
+    assert tables.artifact_uri == "file:///tmp/ptg2/snapshot_index/snap-manifest.json"
     assert tables.serving_table is None
     assert tables.provider_group_member_table is None
     assert tables.is_manifest_backed_snapshot is True
 
 
 @pytest.mark.asyncio
-async def test_snapshot_serving_table_does_not_resolve_manifest_snapshot_to_v2_table():
+async def test_snapshot_serving_tables_does_not_resolve_manifest_snapshot_to_fallback_table():
     session = FakeSession(
         [
             {
                 "serving_index": {
-                    "storage": "v3_manifest_snapshot",
-                    "artifact_uri": "file:///tmp/ptg2/snapshot_index/snap-v3.json",
+                    "storage": "manifest_snapshot",
+                    "artifact_uri": "file:///tmp/ptg2/snapshot_index/snap-manifest.json",
                 }
             }
         ]
     )
 
-    table_name = await ptg2_tables.snapshot_serving_table(session, "snap-v3")
+    tables = await ptg2_tables.snapshot_serving_tables(session, "snap-manifest")
 
-    assert table_name is None
+    assert tables.serving_table is None
 
 
 @pytest.mark.asyncio
@@ -119,18 +118,18 @@ async def test_snapshot_serving_tables_accepts_json_string_manifest():
             json.dumps(
                 {
                     "serving_index": {
-                        "storage": "v3_manifest_snapshot",
-                        "storage_uri": "s3://healthporta/ptg2/snap-v3.json",
+                        "storage": "manifest_snapshot",
+                        "storage_uri": "s3://healthporta/ptg2/snap-manifest.json",
                     }
                 }
             )
         ]
     )
 
-    tables = await ptg2_tables.snapshot_serving_tables(session, "snap-v3")
+    tables = await ptg2_tables.snapshot_serving_tables(session, "snap-manifest")
 
-    assert tables.storage == "v3_manifest_snapshot"
-    assert tables.artifact_uri == "s3://healthporta/ptg2/snap-v3.json"
+    assert tables.storage == "manifest_snapshot"
+    assert tables.artifact_uri == "s3://healthporta/ptg2/snap-manifest.json"
     assert tables.serving_table is None
     assert tables.is_manifest_backed_snapshot is True
 

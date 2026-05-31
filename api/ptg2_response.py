@@ -12,18 +12,39 @@ from api.code_systems import canonical_catalog_code, normalize_code_system
 
 NUMERIC_PATTERN = re.compile(r"^-?\d+(\.\d+)?$")
 
-PTG2_ITEM_SOURCE_FIELDS = {"source_trace"}
-PTG2_ITEM_DIAGNOSTIC_FIELDS = {
-    "confidence",
+PTG2_ITEM_SOURCE_FIELDS = {
+    "source_trace",
     "location_source",
+}
+PTG2_ITEM_DIAGNOSTIC_FIELDS = {
+    "billing_code",
+    "billing_code_type",
+    "confidence",
+    "hp_procedure_code",
+    "location_confidence_code",
+    "location_hash",
     "price_set_hash",
     "provider_ordinal",
     "provider_set_hash",
     "provider_set_hashes",
     "rate_pack_hash",
+    "service_code",
+    "service_code_system",
+    "tic_prices",
 }
-PTG2_QUERY_SOURCE_FIELDS = {"source", "serving_table"}
-PTG2_QUERY_DIAGNOSTIC_FIELDS = {"procedure_consolidation", "result_granularity"}
+PTG2_QUERY_SOURCE_FIELDS = {
+    "source",
+    "source_key",
+    "serving_table",
+}
+PTG2_QUERY_DIAGNOSTIC_FIELDS = {
+    "mode",
+    "price_filter",
+    "procedure_consolidation",
+    "provider_reverse_index",
+    "result_granularity",
+    "snapshot_id",
+}
 def _request_bool(value: Any, default: bool = False) -> bool:
     if value is None:
         return default

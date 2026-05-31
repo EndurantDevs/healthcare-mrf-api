@@ -10,9 +10,9 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 from urllib.parse import unquote, urlsplit
 
-from process.ptg_parts.ptg2_v3_artifacts import (
-    PTG2_V3_MEMBERSHIP_FORMAT,
-    PTG2V3ArtifactError,
+from process.ptg_parts.ptg2_manifest_artifacts import (
+    PTG2_MANIFEST_MEMBERSHIP_FORMAT,
+    PTG2ManifestArtifactError,
     read_global_sidecar_entries,
     read_manifest,
 )
@@ -22,20 +22,20 @@ from api.ptg2_response import _coerce_json_payload, _price_response_fields, _req
 from api.ptg2_serving_utils import _normalize_zip5
 from api.ptg2_types import PTG2ServingTables
 
-PTG2_V3_SNAPSHOT_ARTIFACT_TYPES = {
-    "ptg2_v3_snapshot",
-    "ptg2_v3_manifest_snapshot",
+PTG2_MANIFEST_SNAPSHOT_ARTIFACT_TYPES = {
+    "ptg2_manifest_snapshot",
+    "ptg2_manifest_snapshot",
     "snapshot_index",
 }
-PTG2_V3_SERVING_ROW_KINDS = {"skinny_serving_rows", "serving_rows"}
-PTG2_V3_PRICE_SET_KINDS = {"price_sets", "prices"}
-PTG2_V3_PROVIDER_KINDS = {"providers", "provider_entries"}
-PTG2_V3_PRICE_ATOM_KINDS = {"price_atoms", "price_entries"}
-PTG2_V3_PROVIDER_SET_MEMBER_KINDS = {"provider_set_members", "provider_set_membership", "provider_members"}
-PTG2_V3_PRICE_SET_MEMBER_KINDS = {"price_set_members", "price_set_membership", "price_members"}
-PTG2_V3_SOURCE_TRACE_KINDS = {"source_trace_sets", "source_traces"}
-PTG2_V3_MANIFEST_ROW_LIMIT_ENV = "HLTHPRT_PTG2_V3_MANIFEST_ROW_LIMIT"
-PTG2_V3_MANIFEST_BYTE_LIMIT_ENV = "HLTHPRT_PTG2_V3_MANIFEST_BYTE_LIMIT"
+PTG2_MANIFEST_SERVING_ROW_KINDS = {"skinny_serving_rows", "serving_rows"}
+PTG2_MANIFEST_PRICE_SET_KINDS = {"price_sets", "prices"}
+PTG2_MANIFEST_PROVIDER_KINDS = {"providers", "provider_entries"}
+PTG2_MANIFEST_PRICE_ATOM_KINDS = {"price_atoms", "price_entries"}
+PTG2_MANIFEST_PROVIDER_SET_MEMBER_KINDS = {"provider_set_members", "provider_set_membership", "provider_members"}
+PTG2_MANIFEST_PRICE_SET_MEMBER_KINDS = {"price_set_members", "price_set_membership", "price_members"}
+PTG2_MANIFEST_SOURCE_TRACE_KINDS = {"source_trace_sets", "source_traces"}
+PTG2_MANIFEST_ROW_LIMIT_ENV = "HLTHPRT_PTG2_MANIFEST_ROW_LIMIT"
+PTG2_MANIFEST_BYTE_LIMIT_ENV = "HLTHPRT_PTG2_MANIFEST_BYTE_LIMIT"
 
 
 def _env_int(name: str, default: int) -> int:
@@ -49,7 +49,7 @@ def _env_int(name: str, default: int) -> int:
 
 
 @dataclass(frozen=True)
-class PTG2V3Snapshot:
+class PTG2ManifestSnapshot:
     snapshot_id: str
     source_uri: str
     manifest: dict[str, Any]
@@ -68,17 +68,17 @@ def _path_from_local_uri(uri: str) -> Path:
     if uri.startswith("file://"):
         return Path(unquote(urlsplit(uri).path))
     if "://" in uri:
-        raise PTG2V3ArtifactError("PTG2 serving artifacts currently require local file paths")
+        raise PTG2ManifestArtifactError("PTG2 serving artifacts currently require local file paths")
     return Path(uri)
 
 
 def _sidecar_path(manifest_path: Path, sidecar: Mapping[str, Any]) -> Path:
     raw_path = sidecar.get("path")
     if not isinstance(raw_path, str) or not raw_path:
-        raise PTG2V3ArtifactError("PTG2 sidecar is missing a relative path")
+        raise PTG2ManifestArtifactError("PTG2 sidecar is missing a relative path")
     path = Path(raw_path)
     if path.is_absolute() or ".." in path.parts:
-        raise PTG2V3ArtifactError("PTG2 sidecar paths must stay under the manifest directory")
+        raise PTG2ManifestArtifactError("PTG2 sidecar paths must stay under the manifest directory")
     return manifest_path.parent / path
 
 
@@ -96,7 +96,7 @@ def _membership_sidecars(manifest: Mapping[str, Any], kinds: set[str]) -> list[M
         for sidecar in manifest.get("sidecars") or []
         if isinstance(sidecar, Mapping)
         and str(sidecar.get("kind") or "") in kinds
-        and sidecar.get("record_format") == PTG2_V3_MEMBERSHIP_FORMAT
+        and sidecar.get("record_format") == PTG2_MANIFEST_MEMBERSHIP_FORMAT
     ]
 
 
@@ -114,19 +114,19 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
                 continue
             payload = json.loads(text_value)
             if not isinstance(payload, dict):
-                raise PTG2V3ArtifactError("PTG2 serving row sidecar entries must be JSON objects")
+                raise PTG2ManifestArtifactError("PTG2 serving row sidecar entries must be JSON objects")
             rows.append(payload)
     return rows
 
 
 def _load_rows(manifest_path: Path, manifest: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
     rows: list[dict[str, Any]] = []
-    row_limit = max(_env_int(PTG2_V3_MANIFEST_ROW_LIMIT_ENV, 250_000), 1)
-    byte_limit = max(_env_int(PTG2_V3_MANIFEST_BYTE_LIMIT_ENV, 256 * 1024 * 1024), 1)
+    row_limit = max(_env_int(PTG2_MANIFEST_ROW_LIMIT_ENV, 250_000), 1)
+    byte_limit = max(_env_int(PTG2_MANIFEST_BYTE_LIMIT_ENV, 256 * 1024 * 1024), 1)
 
     def guard_rows() -> None:
         if len(rows) > row_limit:
-            raise PTG2V3ArtifactError(
+            raise PTG2ManifestArtifactError(
                 "PTG2 manifest row payload is too large for in-process serving; use the DB-backed PTG2 path"
             )
 
@@ -134,14 +134,14 @@ def _load_rows(manifest_path: Path, manifest: Mapping[str, Any]) -> tuple[dict[s
     if isinstance(inline_rows, list):
         rows.extend(dict(row) for row in inline_rows if isinstance(row, Mapping))
         guard_rows()
-    for sidecar in _sidecars(manifest, PTG2_V3_SERVING_ROW_KINDS):
+    for sidecar in _sidecars(manifest, PTG2_MANIFEST_SERVING_ROW_KINDS):
         sidecar_path = _sidecar_path(manifest_path, sidecar)
         try:
             sidecar_bytes = int(sidecar.get("byte_count") or sidecar_path.stat().st_size)
         except (OSError, TypeError, ValueError):
             sidecar_bytes = 0
         if sidecar_bytes > byte_limit:
-            raise PTG2V3ArtifactError(
+            raise PTG2ManifestArtifactError(
                 "PTG2 manifest row sidecar is too large for in-process serving; use the DB-backed PTG2 path"
             )
         sidecar_format = str(sidecar.get("format") or "").strip().lower()
@@ -155,7 +155,7 @@ def _load_rows(manifest_path: Path, manifest: Mapping[str, Any]) -> tuple[dict[s
         elif isinstance(payload, dict) and isinstance(payload.get("rows"), list):
             rows.extend(dict(row) for row in payload["rows"] if isinstance(row, Mapping))
         else:
-            raise PTG2V3ArtifactError("PTG2 serving row sidecar must contain rows")
+            raise PTG2ManifestArtifactError("PTG2 serving row sidecar must contain rows")
         guard_rows()
     return tuple(rows)
 
@@ -174,7 +174,7 @@ def _load_mapping_sidecars(
     for sidecar in _sidecars(manifest, kinds):
         payload = _read_json(_sidecar_path(manifest_path, sidecar))
         if not isinstance(payload, Mapping):
-            raise PTG2V3ArtifactError("PTG2 mapping sidecars must be JSON objects")
+            raise PTG2ManifestArtifactError("PTG2 mapping sidecars must be JSON objects")
         mapping.update({str(mapping_key): value for mapping_key, value in payload.items()})
     return mapping
 
@@ -198,44 +198,44 @@ def _load_membership_sidecars(
     return mapping
 
 
-def load_ptg2_v3_snapshot(path_or_uri: str | Path) -> PTG2V3Snapshot:
+def load_ptg2_manifest_snapshot(path_or_uri: str | Path) -> PTG2ManifestSnapshot:
     manifest_uri = str(path_or_uri)
     manifest_path = _path_from_local_uri(manifest_uri)
     manifest = read_manifest(manifest_path, validate_sidecars=True)
     artifact_type = str(manifest.get("artifact_type") or manifest.get("type") or "").strip()
-    if artifact_type and artifact_type not in PTG2_V3_SNAPSHOT_ARTIFACT_TYPES:
-        raise PTG2V3ArtifactError(f"unsupported PTG2 snapshot artifact type: {artifact_type!r}")
+    if artifact_type and artifact_type not in PTG2_MANIFEST_SNAPSHOT_ARTIFACT_TYPES:
+        raise PTG2ManifestArtifactError(f"unsupported PTG2 snapshot artifact type: {artifact_type!r}")
     snapshot_id = str(manifest.get("snapshot_id") or "").strip()
     if not snapshot_id:
-        raise PTG2V3ArtifactError("PTG2 snapshot manifest is missing snapshot_id")
+        raise PTG2ManifestArtifactError("PTG2 snapshot manifest is missing snapshot_id")
     plans = {str(key): value for key, value in dict(manifest.get("plans") or {}).items()}
     procedures = {str(key): value for key, value in dict(manifest.get("procedures") or {}).items()}
-    return PTG2V3Snapshot(
+    return PTG2ManifestSnapshot(
         snapshot_id=snapshot_id,
         source_uri=manifest_path.resolve().as_uri(),
         manifest=manifest,
         plans=plans,
         procedures=procedures,
         rows=_load_rows(manifest_path, manifest),
-        providers=_load_mapping_sidecars(manifest_path, manifest, PTG2_V3_PROVIDER_KINDS, ("providers", "provider_entries")),
-        price_sets=_load_mapping_sidecars(manifest_path, manifest, PTG2_V3_PRICE_SET_KINDS, ("price_sets", "prices")),
-        price_atoms=_load_mapping_sidecars(manifest_path, manifest, PTG2_V3_PRICE_ATOM_KINDS, ("price_atoms", "price_entries")),
+        providers=_load_mapping_sidecars(manifest_path, manifest, PTG2_MANIFEST_PROVIDER_KINDS, ("providers", "provider_entries")),
+        price_sets=_load_mapping_sidecars(manifest_path, manifest, PTG2_MANIFEST_PRICE_SET_KINDS, ("price_sets", "prices")),
+        price_atoms=_load_mapping_sidecars(manifest_path, manifest, PTG2_MANIFEST_PRICE_ATOM_KINDS, ("price_atoms", "price_entries")),
         provider_set_members=_load_membership_sidecars(
             manifest_path,
             manifest,
-            PTG2_V3_PROVIDER_SET_MEMBER_KINDS,
+            PTG2_MANIFEST_PROVIDER_SET_MEMBER_KINDS,
             ("provider_set_members", "provider_set_membership", "provider_members"),
         ),
         price_set_members=_load_membership_sidecars(
             manifest_path,
             manifest,
-            PTG2_V3_PRICE_SET_MEMBER_KINDS,
+            PTG2_MANIFEST_PRICE_SET_MEMBER_KINDS,
             ("price_set_members", "price_set_membership", "price_members"),
         ),
         source_trace_sets=_load_mapping_sidecars(
             manifest_path,
             manifest,
-            PTG2_V3_SOURCE_TRACE_KINDS,
+            PTG2_MANIFEST_SOURCE_TRACE_KINDS,
             ("source_trace_sets", "source_traces"),
         ),
     )
@@ -262,7 +262,7 @@ def _has_unsupported_provider_or_geo_request(args: Mapping[str, Any]) -> bool:
     return False
 
 
-def _procedure_lookup(snapshot: PTG2V3Snapshot, row: Mapping[str, Any]) -> Mapping[str, Any]:
+def _procedure_lookup(snapshot: PTG2ManifestSnapshot, row: Mapping[str, Any]) -> Mapping[str, Any]:
     reported_code = str(row.get("reported_code") or row.get("billing_code") or "").strip()
     reported_system = str(row.get("reported_code_system") or row.get("billing_code_type") or "").strip()
     for key in (
@@ -279,7 +279,7 @@ def _mapping_or_empty(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
 
-def _prices(snapshot: PTG2V3Snapshot, row: Mapping[str, Any]) -> Any:
+def _prices(snapshot: PTG2ManifestSnapshot, row: Mapping[str, Any]) -> Any:
     inline_prices = row.get("prices")
     if inline_prices is not None:
         return inline_prices
@@ -318,14 +318,14 @@ def _price_set_id(row: Mapping[str, Any]) -> str:
     return ""
 
 
-def _provider_payload(snapshot: PTG2V3Snapshot, provider_id: str) -> Mapping[str, Any] | None:
+def _provider_payload(snapshot: PTG2ManifestSnapshot, provider_id: str) -> Mapping[str, Any] | None:
     provider = snapshot.providers.get(provider_id)
     if isinstance(provider, Mapping):
         return provider
     return None
 
 
-def _provider_items(snapshot: PTG2V3Snapshot, row: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...] | None:
+def _provider_items(snapshot: PTG2ManifestSnapshot, row: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...] | None:
     provider_set_id = _provider_set_id(row)
     if not provider_set_id:
         return None
@@ -341,7 +341,7 @@ def _provider_items(snapshot: PTG2V3Snapshot, row: Mapping[str, Any]) -> tuple[M
     return tuple(providers)
 
 
-def _source_trace(snapshot: PTG2V3Snapshot, row: Mapping[str, Any]) -> Any:
+def _source_trace(snapshot: PTG2ManifestSnapshot, row: Mapping[str, Any]) -> Any:
     inline_trace = row.get("source_trace")
     if inline_trace is not None:
         return inline_trace
@@ -365,8 +365,8 @@ def _matches_exact_request(row: Mapping[str, Any], requested_plan: str, requeste
     return row_system == code_system
 
 
-def search_ptg2_v3_snapshot(
-    snapshot: PTG2V3Snapshot,
+def search_ptg2_manifest_snapshot(
+    snapshot: PTG2ManifestSnapshot,
     args: Mapping[str, Any],
     pagination: Any,
     *,
@@ -498,7 +498,7 @@ def search_ptg2_v3_snapshot(
     }
 
 
-async def search_ptg2_v3_serving_snapshot(
+async def search_ptg2_manifest_serving_snapshot(
     snapshot_id: str,
     args: Mapping[str, Any],
     pagination: Any,
@@ -508,7 +508,7 @@ async def search_ptg2_v3_serving_snapshot(
 ) -> dict[str, Any] | None:
     if not serving_tables.artifact_uri:
         return None
-    snapshot = load_ptg2_v3_snapshot(serving_tables.artifact_uri)
+    snapshot = load_ptg2_manifest_snapshot(serving_tables.artifact_uri)
     if snapshot.snapshot_id != snapshot_id:
         return None
-    return search_ptg2_v3_snapshot(snapshot, args, pagination, mode_value=mode_value)
+    return search_ptg2_manifest_snapshot(snapshot, args, pagination, mode_value=mode_value)
