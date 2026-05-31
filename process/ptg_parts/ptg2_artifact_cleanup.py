@@ -61,7 +61,7 @@ def _resolve_existing_root(root: str | Path | None = None) -> Path:
         base = Path(artifact_root).expanduser()
     else:
         base = Path(os.getenv("TMPDIR") or "/tmp") / "healthporta_ptg2"
-    sidecar_root = base / "v3"
+    sidecar_root = base / "serving"
     return sidecar_root.resolve()
 
 
@@ -162,7 +162,7 @@ def _print_plan(plan: PTG2ArtifactCleanupPlan, *, max_dirs: int = 20) -> None:
 async def _amain() -> None:
     parser = argparse.ArgumentParser(description="Report or clean unreferenced PTG2 sidecar artifacts.")
     parser.add_argument("--schema", default=os.getenv("HLTHPRT_DB_SCHEMA") or "mrf")
-    parser.add_argument("--root", default=None, help="Sidecar root to scan. Defaults to HLTHPRT_PTG2_ARTIFACT_DIR/v3.")
+    parser.add_argument("--root", default=None, help="Sidecar root to scan. Defaults to HLTHPRT_PTG2_ARTIFACT_DIR/manifest.")
     parser.add_argument("--execute", action="store_true", help="Delete unreferenced files. Default is dry-run.")
     parser.add_argument("--max-dirs", type=int, default=20, help="Maximum unreferenced directories to print.")
     args = parser.parse_args()

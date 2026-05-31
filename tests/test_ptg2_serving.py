@@ -654,7 +654,7 @@ async def test_search_current_ptg2_index_caches_shaped_positive_responses(monkey
 
 
 @pytest.mark.asyncio
-async def test_search_current_ptg2_index_ignores_non_v3_serving_storage(monkeypatch):
+async def test_search_current_ptg2_index_ignores_non_manifest_serving_storage(monkeypatch):
     async def fake_resolve(_session, _args):
         return "legacy-snap"
 

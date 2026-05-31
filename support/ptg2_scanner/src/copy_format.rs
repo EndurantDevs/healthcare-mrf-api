@@ -14,7 +14,7 @@ pub struct CompactCopyRow<'a> {
     pub source_trace_set_hash: &'a str,
 }
 
-pub struct V3ServingCopyRow<'a> {
+pub struct ManifestServingCopyRow<'a> {
     pub serving_content_hash_128: &'a str,
     pub plan_id: &'a str,
     pub reported_code_system: Option<&'a str>,
@@ -126,9 +126,9 @@ pub fn emit_compact_copy_row<W: Write>(writer: &mut W, row: &CompactCopyRow<'_>)
     )
 }
 
-pub fn emit_v3_serving_copy_row<W: Write>(
+pub fn emit_manifest_serving_copy_row<W: Write>(
     writer: &mut W,
-    row: &V3ServingCopyRow<'_>,
+    row: &ManifestServingCopyRow<'_>,
 ) -> io::Result<()> {
     let provider_count_text = row.provider_count.to_string();
     write_copy_text_fields(
@@ -150,8 +150,8 @@ pub fn emit_v3_serving_copy_row<W: Write>(
 #[cfg(test)]
 mod tests {
     use super::{
-        emit_compact_copy_row, emit_v3_serving_copy_row, pg_text_array_field, pg_text_copy_field,
-        CompactCopyRow, V3ServingCopyRow,
+        emit_compact_copy_row, emit_manifest_serving_copy_row, pg_text_array_field, pg_text_copy_field,
+        CompactCopyRow, ManifestServingCopyRow,
     };
 
     #[test]
@@ -197,8 +197,8 @@ mod tests {
     }
 
     #[test]
-    fn v3_serving_copy_rows_include_nullable_reported_code_fields() {
-        let row = V3ServingCopyRow {
+    fn manifest_serving_copy_rows_include_nullable_reported_code_fields() {
+        let row = ManifestServingCopyRow {
             serving_content_hash_128: "serving",
             plan_id: "plan\t1",
             reported_code_system: Some("CPT"),
@@ -211,7 +211,7 @@ mod tests {
         };
         let mut out = Vec::new();
 
-        emit_v3_serving_copy_row(&mut out, &row).unwrap();
+        emit_manifest_serving_copy_row(&mut out, &row).unwrap();
 
         assert_eq!(
             String::from_utf8(out).unwrap(),

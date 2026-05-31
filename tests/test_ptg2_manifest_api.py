@@ -7,8 +7,8 @@ from uuid import UUID
 import pytest
 
 from api import ptg2_serving
-from api.ptg2_v3_artifacts import PTG2V3ArtifactError, load_ptg2_v3_snapshot
-from process.ptg_parts.ptg2_v3_artifacts import write_global_membership_sidecar
+from api.ptg2_manifest_artifacts import PTG2ManifestArtifactError, load_ptg2_manifest_snapshot
+from process.ptg_parts.ptg2_manifest_artifacts import write_global_membership_sidecar
 
 
 class FakeResult:
@@ -61,7 +61,7 @@ def _write_membership_sidecar(tmp_path, name, kind, mapping):
     return sidecar
 
 
-def _write_v3_snapshot(tmp_path):
+def _write_manifest_snapshot(tmp_path):
     rows_sidecar = _write_sidecar(
         tmp_path / "serving_rows.jsonl",
         [
@@ -104,8 +104,8 @@ def _write_v3_snapshot(tmp_path):
     )
     manifest = {
         "version": 3,
-        "artifact_type": "ptg2_v3_snapshot",
-        "snapshot_id": "snap-v3",
+        "artifact_type": "ptg2_manifest_snapshot",
+        "snapshot_id": "snap-manifest",
         "plans": {
             "010854205": {
                 "plan_id": "010854205",
@@ -131,7 +131,7 @@ def _write_v3_snapshot(tmp_path):
     return manifest_path
 
 
-def _write_v3_snapshot_with_binary_sidecars(tmp_path):
+def _write_manifest_snapshot_with_binary_sidecars(tmp_path):
     provider_set_id = bytes.fromhex("0000000000000000000000000000000a")
     provider_id = bytes.fromhex("0000000000000000000000000000000b")
     price_set_id = bytes.fromhex("0000000000000000000000000000000c")
@@ -166,8 +166,8 @@ def _write_v3_snapshot_with_binary_sidecars(tmp_path):
     )
     manifest = {
         "version": 3,
-        "artifact_type": "ptg2_v3_snapshot",
-        "snapshot_id": "snap-v3-sidecars",
+        "artifact_type": "ptg2_manifest_snapshot",
+        "snapshot_id": "snap-manifest-sidecars",
         "plans": {"010854205": {"plan_name": "Heartland"}},
         "procedures": {"CPT:70551": {"name": "MRI brain without contrast"}},
         "providers": {
@@ -197,18 +197,18 @@ def _write_v3_snapshot_with_binary_sidecars(tmp_path):
     return manifest_path
 
 
-def test_ptg2_v3_reader_loads_manifest_backed_snapshot_sidecars(tmp_path):
-    manifest_path = _write_v3_snapshot(tmp_path)
+def test_ptg2_manifest_reader_loads_manifest_backed_snapshot_sidecars(tmp_path):
+    manifest_path = _write_manifest_snapshot(tmp_path)
 
-    snapshot = load_ptg2_v3_snapshot(manifest_path)
+    snapshot = load_ptg2_manifest_snapshot(manifest_path)
 
-    assert snapshot.snapshot_id == "snap-v3"
+    assert snapshot.snapshot_id == "snap-manifest"
     assert snapshot.rows[0]["serving_rate_id"] == "rate-1"
     assert snapshot.price_sets["price-set-1"][0]["negotiated_rate"] == 450
     assert snapshot.source_trace_sets["trace-set-1"][0]["url"] == "https://example.test/rates.json.gz"
 
 
-def test_ptg2_v3_reader_rejects_oversized_manifest_rows(tmp_path, monkeypatch):
+def test_ptg2_manifest_reader_rejects_oversized_manifest_rows(tmp_path, monkeypatch):
     rows_sidecar = _write_sidecar(
         tmp_path / "serving_rows.jsonl",
         [{"plan_id": "010854205"}, {"plan_id": "010854206"}],
@@ -216,28 +216,28 @@ def test_ptg2_v3_reader_rejects_oversized_manifest_rows(tmp_path, monkeypatch):
     )
     manifest = {
         "version": 3,
-        "artifact_type": "ptg2_v3_snapshot",
-        "snapshot_id": "snap-v3",
+        "artifact_type": "ptg2_manifest_snapshot",
+        "snapshot_id": "snap-manifest",
         "sidecars": [{"kind": "skinny_serving_rows", "format": "jsonl", **rows_sidecar}],
     }
     manifest_path = tmp_path / "snapshot.manifest.json"
     manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
-    monkeypatch.setenv("HLTHPRT_PTG2_V3_MANIFEST_ROW_LIMIT", "1")
+    monkeypatch.setenv("HLTHPRT_PTG2_MANIFEST_ROW_LIMIT", "1")
 
-    with pytest.raises(PTG2V3ArtifactError, match="too large"):
-        load_ptg2_v3_snapshot(manifest_path)
+    with pytest.raises(PTG2ManifestArtifactError, match="too large"):
+        load_ptg2_manifest_snapshot(manifest_path)
 
 
 @pytest.mark.asyncio
-async def test_search_current_ptg2_index_routes_manifest_snapshot_to_v3_exact_lookup(tmp_path):
-    manifest_path = _write_v3_snapshot(tmp_path)
+async def test_search_current_ptg2_index_routes_manifest_snapshot_to_manifest_exact_lookup(tmp_path):
+    manifest_path = _write_manifest_snapshot(tmp_path)
     ptg2_serving.clear_ptg2_index_cache()
     session = FakeSession(
         [
             {
                 "serving_index": {
                     "type": "snapshot_index",
-                    "storage": "v3_manifest_snapshot",
+                    "storage": "manifest_snapshot",
                     "snapshot_scoped": True,
                     "artifact_uri": manifest_path.resolve().as_uri(),
                 }
@@ -248,7 +248,7 @@ async def test_search_current_ptg2_index_routes_manifest_snapshot_to_v3_exact_lo
     payload = await ptg2_serving.search_current_ptg2_index(
         session,
         {
-            "snapshot_id": "snap-v3",
+            "snapshot_id": "snap-manifest",
             "plan_id": "010854205",
             "code": "70551",
             "code_system": "CPT",
@@ -264,27 +264,28 @@ async def test_search_current_ptg2_index_routes_manifest_snapshot_to_v3_exact_lo
     assert payload["pagination"]["total"] == 1
     item = payload["items"][0]
     assert item["procedure_code"] == 123456
-    assert item["service_code"] == "70551"
     assert item["reported_code_system"] == "CPT"
-    assert item["tic_prices"][0]["negotiated_rate"] == 450
+    assert item["prices"][0]["negotiated_rate"] == 450
     assert item["provider_count"] == 123
     assert "source_trace" not in item
     assert "confidence" not in item
     assert "price_set_hash" not in item
     assert "provider_set_hash" not in item
+    assert "service_code" not in item
+    assert "tic_prices" not in item
 
 
 @pytest.mark.asyncio
-async def test_ptg2_v3_manifest_snapshot_returns_none_for_provider_expansion(tmp_path):
-    manifest_path = _write_v3_snapshot(tmp_path)
+async def test_ptg2_manifest_snapshot_returns_none_for_provider_expansion(tmp_path):
+    manifest_path = _write_manifest_snapshot(tmp_path)
     tables = ptg2_serving.PTG2ServingTables(
-        storage="v3_manifest_snapshot",
+        storage="manifest_snapshot",
         artifact_uri=manifest_path.resolve().as_uri(),
     )
 
     payload = await ptg2_serving.search_ptg2_serving_table(
         FakeSession([]),
-        "snap-v3",
+        "snap-manifest",
         {
             "plan_id": "010854205",
             "code": "70551",
@@ -299,16 +300,16 @@ async def test_ptg2_v3_manifest_snapshot_returns_none_for_provider_expansion(tmp
 
 
 @pytest.mark.asyncio
-async def test_ptg2_v3_manifest_snapshot_expands_provider_and_price_sidecars(tmp_path):
-    manifest_path = _write_v3_snapshot_with_binary_sidecars(tmp_path)
+async def test_ptg2_manifest_snapshot_expands_provider_and_price_sidecars(tmp_path):
+    manifest_path = _write_manifest_snapshot_with_binary_sidecars(tmp_path)
     tables = ptg2_serving.PTG2ServingTables(
-        storage="v3_manifest_snapshot",
+        storage="manifest_snapshot",
         artifact_uri=manifest_path.resolve().as_uri(),
     )
 
     payload = await ptg2_serving.search_ptg2_serving_table(
         FakeSession([]),
-        "snap-v3-sidecars",
+        "snap-manifest-sidecars",
         {
             "plan_id": "010854205",
             "code": "70551",
@@ -320,22 +321,22 @@ async def test_ptg2_v3_manifest_snapshot_expands_provider_and_price_sidecars(tmp
     )
 
     assert payload["pagination"]["total"] == 1
-    assert payload["query"]["result_granularity"] == "provider"
+    assert "result_granularity" not in payload["query"]
     item = payload["items"][0]
     assert item["npi"] == 1234567890
     assert item["provider_name"] == "Example Imaging"
-    assert item["tic_prices"][0]["negotiated_rate"] == 451
+    assert item["prices"][0]["negotiated_rate"] == 451
 
 
 @pytest.mark.asyncio
-async def test_ptg2_v3_db_snapshot_serves_exact_plan_code_lookup():
+async def test_ptg2_manifest_db_snapshot_serves_exact_plan_code_lookup():
     serving_hash = "00000000000000000000000000000001"
     procedure_id = "00000000000000000000000000000002"
     provider_set_id = "00000000000000000000000000000003"
     price_set_id = "00000000000000000000000000000004"
     tables = ptg2_serving.PTG2ServingTables(
-        storage="v3_manifest_snapshot",
-        serving_table="mrf.ptg2_v3_serving_snap_v3",
+        storage="manifest_snapshot",
+        serving_table="mrf.ptg2_manifest_serving_snap_manifest",
         id_storage="uuid",
     )
     session = FakeSession(
@@ -362,7 +363,7 @@ async def test_ptg2_v3_db_snapshot_serves_exact_plan_code_lookup():
 
     payload = await ptg2_serving.search_ptg2_serving_table(
         session,
-        "snap-v3",
+        "snap-manifest",
         {
             "plan_id": "010854205",
             "code": "70551",
@@ -374,26 +375,26 @@ async def test_ptg2_v3_db_snapshot_serves_exact_plan_code_lookup():
     )
 
     assert payload["pagination"]["total"] == 1
-    assert payload["query"]["source"] == "ptg2_db"
-    assert payload["query"]["serving_table"] == "mrf.ptg2_v3_serving_snap_v3"
+    assert "source" not in payload["query"]
+    assert "serving_table" not in payload["query"]
     item = payload["items"][0]
     assert item["reported_code"] == "70551"
-    assert item["service_code"] == "70551"
     assert item["provider_count"] == 42
-    assert item["provider_set_hash"] == provider_set_id
-    assert item["price_set_hash"] == price_set_id
+    assert "service_code" not in item
+    assert "provider_set_hash" not in item
+    assert "price_set_hash" not in item
 
 
 @pytest.mark.asyncio
-async def test_ptg2_v3_db_snapshot_defers_provider_expansion():
+async def test_ptg2_manifest_db_snapshot_defers_provider_expansion():
     tables = ptg2_serving.PTG2ServingTables(
-        storage="v3_manifest_snapshot",
-        serving_table="mrf.ptg2_v3_serving_snap_v3",
+        storage="manifest_snapshot",
+        serving_table="mrf.ptg2_manifest_serving_snap_manifest",
     )
 
     payload = await ptg2_serving.search_ptg2_serving_table(
         FakeSession([True]),
-        "snap-v3",
+        "snap-manifest",
         {
             "plan_id": "010854205",
             "code": "70551",
@@ -408,7 +409,7 @@ async def test_ptg2_v3_db_snapshot_defers_provider_expansion():
 
 
 @pytest.mark.asyncio
-async def test_ptg2_v3_db_snapshot_expands_provider_npi_sidecar(tmp_path):
+async def test_ptg2_manifest_db_snapshot_expands_provider_npi_sidecar(tmp_path):
     provider_set_id = "0000000000000000000000000000000a"
     npi_member = bytes.fromhex("0000000000000000") + (1234567890).to_bytes(8, "big")
     provider_npi_sidecar = _write_membership_sidecar(
@@ -419,8 +420,8 @@ async def test_ptg2_v3_db_snapshot_expands_provider_npi_sidecar(tmp_path):
     )
     provider_npi_sidecar["path"] = str(tmp_path / provider_npi_sidecar["path"])
     tables = ptg2_serving.PTG2ServingTables(
-        storage="v3_manifest_snapshot",
-        serving_table="mrf.ptg2_v3_serving_snap_v3",
+        storage="manifest_snapshot",
+        serving_table="mrf.ptg2_manifest_serving_snap_manifest",
         artifacts={"provider_npi": provider_npi_sidecar},
     )
     session = FakeSession(
@@ -448,7 +449,7 @@ async def test_ptg2_v3_db_snapshot_expands_provider_npi_sidecar(tmp_path):
 
     payload = await ptg2_serving.search_ptg2_serving_table(
         session,
-        "snap-v3",
+        "snap-manifest",
         {
             "plan_id": "010854205",
             "code": "70551",
@@ -459,13 +460,13 @@ async def test_ptg2_v3_db_snapshot_expands_provider_npi_sidecar(tmp_path):
         serving_tables=tables,
     )
 
-    assert payload["query"]["source"] == "ptg2_db"
-    assert payload["query"]["result_granularity"] == "provider"
+    assert "source" not in payload["query"]
+    assert "result_granularity" not in payload["query"]
     assert payload["items"][0]["npi"] == 1234567890
     assert payload["items"][0]["provider_name"] == "TiC provider"
 
 
-def test_ptg2_v3_sidecar_lookup_merges_multiple_artifacts(tmp_path):
+def test_ptg2_manifest_sidecar_lookup_merges_multiple_artifacts(tmp_path):
     provider_set_id = "0000000000000000000000000000000a"
     npi_member_1 = bytes.fromhex("0000000000000000") + (1234567890).to_bytes(8, "big")
     npi_member_2 = bytes.fromhex("0000000000000000") + (1234567891).to_bytes(8, "big")
@@ -486,20 +487,20 @@ def test_ptg2_v3_sidecar_lookup_merges_multiple_artifacts(tmp_path):
     sidecar_2["name"] = "provider_npi"
     sidecar_2["path"] = str(tmp_path / sidecar_2["path"])
     tables = ptg2_serving.PTG2ServingTables(
-        storage="v3_manifest_snapshot",
-        serving_table="mrf.ptg2_v3_serving_snap_v3",
+        storage="manifest_snapshot",
+        serving_table="mrf.ptg2_manifest_serving_snap_manifest",
         artifacts={"sidecars": [sidecar_1, sidecar_2]},
     )
 
-    members = ptg2_serving._ptg2_v3_sidecar_members(tables, "provider_npi", provider_set_id)
-    members_many = ptg2_serving._ptg2_v3_sidecar_members_many(tables, "provider_npi", [provider_set_id])
+    members = ptg2_serving._ptg2_manifest_sidecar_members(tables, "provider_npi", provider_set_id)
+    members_many = ptg2_serving._ptg2_manifest_sidecar_members_many(tables, "provider_npi", [provider_set_id])
 
     assert members == (npi_member_1.hex(), npi_member_2.hex())
     assert members_many[provider_set_id] == (npi_member_1.hex(), npi_member_2.hex())
 
 
 @pytest.mark.asyncio
-async def test_ptg2_v3_provider_procedures_uses_inverted_provider_sidecar(tmp_path):
+async def test_ptg2_manifest_provider_procedures_uses_inverted_provider_sidecar(tmp_path):
     provider_group_id = "00000000000000000000000000000011"
     provider_set_id = "00000000000000000000000000000012"
     price_set_id = "00000000000000000000000000000013"
@@ -522,12 +523,12 @@ async def test_ptg2_v3_provider_procedures_uses_inverted_provider_sidecar(tmp_pa
     price_forward["path"] = str(tmp_path / price_forward["path"])
     session = FakeSession(
         [
-            "snap-v3",
+            "snap-manifest",
             {
-                "storage": "v3_manifest_snapshot",
-                "table": "mrf.ptg2_v3_serving_snap_v3",
-                "price_atom_table": "mrf.ptg2_v3_price_atom_snap_v3",
-                "provider_group_member_table": "mrf.ptg2_v3_provider_group_member_snap_v3",
+                "storage": "manifest_snapshot",
+                "table": "mrf.ptg2_manifest_serving_snap_manifest",
+                "price_atom_table": "mrf.ptg2_manifest_price_atom_snap_manifest",
+                "provider_group_member_table": "mrf.ptg2_manifest_provider_group_member_snap_manifest",
                 "id_storage": "uuid",
                 "artifacts": {
                     "provider_inverted": provider_inverted,

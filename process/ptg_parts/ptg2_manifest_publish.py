@@ -13,8 +13,8 @@ from process.ptg_parts.config import PTG2_BINARY_IDS_ENV, PTG2_UNLOGGED_STAGE_EN
 from process.ptg_parts.db_tables import _exact_table_rows, _quote_ident, _table_exists, _table_has_rows
 from process.ptg_parts.snapshot_tables import _ptg2_snapshot_index_name, _ptg2_snapshot_table_name
 
-PTG2_V3_SERVING_COPY_ENV = "HLTHPRT_PTG2_V3_SERVING_COPY_PATH"
-PTG2_V3_SERVING_COLUMNS = [
+PTG2_MANIFEST_SERVING_COPY_ENV = "HLTHPRT_PTG2_MANIFEST_SERVING_COPY_PATH"
+PTG2_MANIFEST_SERVING_COLUMNS = [
     "serving_content_hash_128",
     "plan_id",
     "reported_code_system",
@@ -25,7 +25,7 @@ PTG2_V3_SERVING_COLUMNS = [
     "price_set_global_id_128",
     "source_trace_set_hash",
 ]
-PTG2_V3_PRICE_ATOM_COLUMNS = [
+PTG2_MANIFEST_PRICE_ATOM_COLUMNS = [
     "price_atom_global_id_128",
     "negotiated_type",
     "negotiated_rate",
@@ -36,7 +36,7 @@ PTG2_V3_PRICE_ATOM_COLUMNS = [
     "billing_code_modifier",
     "additional_information",
 ]
-PTG2_V3_PROVIDER_GROUP_MEMBER_COLUMNS = [
+PTG2_MANIFEST_PROVIDER_GROUP_MEMBER_COLUMNS = [
     "provider_group_global_id_128",
     "npi",
 ]
@@ -50,23 +50,23 @@ def _ptg2_id_sql_type() -> str:
     return "uuid" if _ptg2_id_storage() == "uuid" else "char(32)"
 
 
-def _ptg2_v3_stage_table_name(token: str) -> str:
+def _ptg2_manifest_stage_table_name(token: str) -> str:
     safe_token = "".join(ch if ch.isalnum() else "_" for ch in token.lower()).strip("_")
-    return f"ptg2_v3_stage_serving_{safe_token}"[:63]
+    return f"ptg2_manifest_stage_serving_{safe_token}"[:63]
 
 
-def _ptg2_v3_stage_suffix(serving_stage_table: str) -> str:
-    prefix = "ptg2_v3_stage_serving_"
+def _ptg2_manifest_stage_suffix(serving_stage_table: str) -> str:
+    prefix = "ptg2_manifest_stage_serving_"
     return serving_stage_table[len(prefix):] if serving_stage_table.startswith(prefix) else serving_stage_table
 
 
-def _ptg2_v3_support_stage_table(serving_stage_table: str, kind: str) -> str:
-    return f"ptg2_v3_stage_{kind}_{_ptg2_v3_stage_suffix(serving_stage_table)}"[:63]
+def _ptg2_manifest_support_stage_table(serving_stage_table: str, kind: str) -> str:
+    return f"ptg2_manifest_stage_{kind}_{_ptg2_manifest_stage_suffix(serving_stage_table)}"[:63]
 
 
-async def _create_ptg2_v3_serving_stage_table(token: str) -> str:
+async def _create_ptg2_manifest_serving_stage_table(token: str) -> str:
     schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
-    stage_table = _ptg2_v3_stage_table_name(token)
+    stage_table = _ptg2_manifest_stage_table_name(token)
     storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
     id_type = _ptg2_id_sql_type()
     await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(stage_table)};")
@@ -92,14 +92,14 @@ async def _create_ptg2_v3_serving_stage_table(token: str) -> str:
         )
     except Exception:
         pass
-    await _create_ptg2_v3_price_atom_stage_table(stage_table)
-    await _create_ptg2_v3_provider_group_member_stage_table(stage_table)
+    await _create_ptg2_manifest_price_atom_stage_table(stage_table)
+    await _create_ptg2_manifest_provider_group_member_stage_table(stage_table)
     return stage_table
 
 
-async def _create_ptg2_v3_price_atom_stage_table(serving_stage_table: str) -> str:
+async def _create_ptg2_manifest_price_atom_stage_table(serving_stage_table: str) -> str:
     schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
-    stage_table = _ptg2_v3_support_stage_table(serving_stage_table, "price_atom")
+    stage_table = _ptg2_manifest_support_stage_table(serving_stage_table, "price_atom")
     storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
     id_type = _ptg2_id_sql_type()
     await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(stage_table)};")
@@ -121,9 +121,9 @@ async def _create_ptg2_v3_price_atom_stage_table(serving_stage_table: str) -> st
     return stage_table
 
 
-async def _create_ptg2_v3_provider_group_member_stage_table(serving_stage_table: str) -> str:
+async def _create_ptg2_manifest_provider_group_member_stage_table(serving_stage_table: str) -> str:
     schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
-    stage_table = _ptg2_v3_support_stage_table(serving_stage_table, "provider_group_member")
+    stage_table = _ptg2_manifest_support_stage_table(serving_stage_table, "provider_group_member")
     storage_mode = "UNLOGGED " if _env_bool(PTG2_UNLOGGED_STAGE_ENV, True) else ""
     id_type = _ptg2_id_sql_type()
     await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(stage_table)};")
@@ -138,19 +138,19 @@ async def _create_ptg2_v3_provider_group_member_stage_table(serving_stage_table:
     return stage_table
 
 
-async def _copy_ptg2_v3_serving_file(copy_path: Path, *, target_table: str) -> None:
-    await _copy_ptg2_v3_file(copy_path, target_table=target_table, columns=PTG2_V3_SERVING_COLUMNS)
+async def _copy_ptg2_manifest_serving_file(copy_path: Path, *, target_table: str) -> None:
+    await _copy_ptg2_manifest_file(copy_path, target_table=target_table, columns=PTG2_MANIFEST_SERVING_COLUMNS)
 
 
-async def _copy_ptg2_v3_price_atom_file(copy_path: Path, *, target_table: str) -> None:
-    await _copy_ptg2_v3_file(copy_path, target_table=target_table, columns=PTG2_V3_PRICE_ATOM_COLUMNS)
+async def _copy_ptg2_manifest_price_atom_file(copy_path: Path, *, target_table: str) -> None:
+    await _copy_ptg2_manifest_file(copy_path, target_table=target_table, columns=PTG2_MANIFEST_PRICE_ATOM_COLUMNS)
 
 
-async def _copy_ptg2_v3_provider_group_member_file(copy_path: Path, *, target_table: str) -> None:
-    await _copy_ptg2_v3_file(copy_path, target_table=target_table, columns=PTG2_V3_PROVIDER_GROUP_MEMBER_COLUMNS)
+async def _copy_ptg2_manifest_provider_group_member_file(copy_path: Path, *, target_table: str) -> None:
+    await _copy_ptg2_manifest_file(copy_path, target_table=target_table, columns=PTG2_MANIFEST_PROVIDER_GROUP_MEMBER_COLUMNS)
 
 
-async def _copy_ptg2_v3_file(copy_path: Path, *, target_table: str, columns: list[str]) -> None:
+async def _copy_ptg2_manifest_file(copy_path: Path, *, target_table: str, columns: list[str]) -> None:
     if not copy_path.exists() or copy_path.stat().st_size <= 0:
         return
     schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
@@ -172,7 +172,7 @@ async def _copy_ptg2_v3_file(copy_path: Path, *, target_table: str, columns: lis
             )
 
 
-async def _publish_ptg2_v3_serving_snapshot(
+async def _publish_ptg2_manifest_serving_snapshot(
     stage_table: str,
     *,
     snapshot_id: str,
@@ -186,12 +186,12 @@ async def _publish_ptg2_v3_serving_snapshot(
     if not await _table_has_rows(schema_name, stage_table):
         raise RuntimeError(f"PTG2 serving stage table is empty: {schema_name}.{stage_table}")
 
-    final_table = _ptg2_snapshot_table_name("v3_serving", source_key, snapshot_id)
-    price_atom_stage = _ptg2_v3_support_stage_table(stage_table, "price_atom")
-    provider_group_member_stage = _ptg2_v3_support_stage_table(stage_table, "provider_group_member")
-    price_atom_table = _ptg2_snapshot_table_name("v3_price_atom", source_key, snapshot_id)
-    provider_group_member_table = _ptg2_snapshot_table_name("v3_provider_group_member", source_key, snapshot_id)
-    code_count_table = _ptg2_snapshot_table_name("v3_code_count", source_key, snapshot_id)
+    final_table = _ptg2_snapshot_table_name("serving", source_key, snapshot_id)
+    price_atom_stage = _ptg2_manifest_support_stage_table(stage_table, "price_atom")
+    provider_group_member_stage = _ptg2_manifest_support_stage_table(stage_table, "provider_group_member")
+    price_atom_table = _ptg2_snapshot_table_name("price_atom", source_key, snapshot_id)
+    provider_group_member_table = _ptg2_snapshot_table_name("provider_group_member", source_key, snapshot_id)
+    code_count_table = _ptg2_snapshot_table_name("code_count", source_key, snapshot_id)
     started_at = time.monotonic()
     await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(final_table)} CASCADE;")
     await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(price_atom_table)} CASCADE;")
@@ -262,7 +262,7 @@ async def _publish_ptg2_v3_serving_snapshot(
         """
     )
     # The unique index is a publish-time correctness guard. Once it builds, the
-    # immutable snapshot has proven there are no duplicate v3 serving identities;
+    # immutable snapshot has proven there are no duplicate manifest serving identities;
     # retaining the 128-bit-only btree adds several GB and is not on the API hot path.
     await db.status(f"DROP INDEX {_quote_ident(schema_name)}.{_quote_ident(unique_index)};")
     if await _table_exists(schema_name, price_atom_table):
@@ -366,9 +366,9 @@ async def _publish_ptg2_v3_serving_snapshot(
         await db.status(f"ANALYZE {_quote_ident(schema_name)}.{_quote_ident(provider_group_member_table)};")
     row_count = await _exact_table_rows(schema_name, final_table)
     elapsed_seconds = time.monotonic() - started_at
-    artifact_manifest = _ptg2_v3_artifacts_manifest(artifacts=artifacts, sidecar_artifacts=sidecar_artifacts)
+    artifact_manifest = _ptg2_manifest_artifacts_manifest(artifacts=artifacts, sidecar_artifacts=sidecar_artifacts)
     return {
-        "storage": "v3_manifest_snapshot",
+        "storage": "manifest_snapshot",
         "type": "ptg2_serving",
         "id_storage": _ptg2_id_storage(),
         "snapshot_scoped": True,
@@ -385,7 +385,7 @@ async def _publish_ptg2_v3_serving_snapshot(
     }
 
 
-def _ptg2_v3_artifacts_manifest(
+def _ptg2_manifest_artifacts_manifest(
     *,
     artifacts: Mapping[str, Any] | None = None,
     sidecar_artifacts: Mapping[str, Any] | None = None,
