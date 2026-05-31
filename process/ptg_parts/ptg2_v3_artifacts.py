@@ -1,7 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Small PTG2 v3 artifact primitives.
+"""Small PTG2 artifact primitives.
 
-PTG2 v3 keeps globally stable 128-bit content ids separate from dense ids that
+PTG2 keeps globally stable 128-bit content ids separate from dense ids that
 are only meaningful inside a snapshot.  This module intentionally handles only
 the reusable file-level primitive for that relationship:
 
@@ -19,6 +19,7 @@ import json
 import mmap
 import os
 import struct
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -46,15 +47,17 @@ _MEMBERSHIP_INDEX_RECORD = struct.Struct("<16sQI")
 _DENSE_MEMBER_RECORD = struct.Struct("<I")
 _UINT32_MAX = 2**32 - 1
 _PTG2_V3_MEMBERSHIP_FORMATS = {PTG2_V3_MEMBERSHIP_FORMAT, PTG2_V3_DENSE_MEMBERSHIP_FORMAT}
+_SIDE_CAR_MMAP_LOCK = threading.Lock()
+_SIDE_CAR_MMAP_CACHE: dict[str, tuple[Any, mmap.mmap, int, int]] = {}
 
 
 class PTG2V3ArtifactError(ValueError):
-    """Raised when a PTG2 v3 artifact is malformed or fails validation."""
+    """Raised when a PTG2 artifact is malformed or fails validation."""
 
 
 @dataclass(frozen=True)
 class PTG2V3SidecarEntry:
-    """One owner entry from a Rust PTG2 v3 global sidecar."""
+    """One owner entry from a Rust PTG2 global sidecar."""
 
     owner: bytes
     members: tuple[bytes, ...]
@@ -64,6 +67,43 @@ def _validate_membership_record_format(metadata: Mapping[str, Any]) -> None:
     record_format = metadata.get("record_format")
     if record_format is not None and record_format not in _PTG2_V3_MEMBERSHIP_FORMATS:
         raise PTG2V3ArtifactError("global membership sidecar has an unexpected record format")
+
+
+def _sidecar_mmap_cache_enabled() -> bool:
+    raw = os.getenv("HLTHPRT_PTG2_V3_SIDECAR_MMAP_CACHE", "true").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _cached_sidecar_mmap(path: Path, *, metadata: Mapping[str, Any] | None = None) -> mmap.mmap:
+    sidecar_path = path.resolve()
+    stat_result = sidecar_path.stat()
+    if metadata is not None:
+        expected_byte_count = metadata.get("byte_count")
+        if not isinstance(expected_byte_count, int) or expected_byte_count < 0:
+            raise PTG2V3ArtifactError("PTG2 sidecar is missing a non-negative byte count")
+        if stat_result.st_size != expected_byte_count:
+            raise PTG2V3ArtifactError(
+                f"PTG2 sidecar byte_count mismatch for {sidecar_path.name}: "
+                f"expected {expected_byte_count}, got {stat_result.st_size}"
+            )
+    cache_key = str(sidecar_path)
+    with _SIDE_CAR_MMAP_LOCK:
+        cached = _SIDE_CAR_MMAP_CACHE.get(cache_key)
+        if cached is not None:
+            _fp, payload, cached_size, cached_mtime_ns = cached
+            if cached_size == stat_result.st_size and cached_mtime_ns == stat_result.st_mtime_ns:
+                return payload
+            payload.close()
+            _fp.close()
+            _SIDE_CAR_MMAP_CACHE.pop(cache_key, None)
+        fp = open(sidecar_path, "rb")
+        try:
+            payload = mmap.mmap(fp.fileno(), 0, access=mmap.ACCESS_READ)
+        except Exception:
+            fp.close()
+            raise
+        _SIDE_CAR_MMAP_CACHE[cache_key] = (fp, payload, stat_result.st_size, stat_result.st_mtime_ns)
+        return payload
 
 
 def _sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> tuple[str, int]:
@@ -146,7 +186,7 @@ def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
 
 
 def write_manifest(path: str | Path, manifest: Mapping[str, Any]) -> dict[str, Any]:
-    """Write a deterministic PTG2 v3 manifest JSON file and return it as a dict."""
+    """Write a deterministic PTG2 manifest JSON file and return it as a dict."""
 
     manifest_path = Path(path)
     payload = dict(manifest)
@@ -155,7 +195,7 @@ def write_manifest(path: str | Path, manifest: Mapping[str, Any]) -> dict[str, A
 
 
 def read_manifest(path: str | Path, *, validate_sidecars: bool = True) -> dict[str, Any]:
-    """Read a PTG2 v3 manifest JSON file.
+    """Read a PTG2 manifest JSON file.
 
     When ``validate_sidecars`` is true, every sidecar listed in the manifest is
     checked against its recorded ``sha256`` and ``byte_count`` before the
@@ -166,7 +206,7 @@ def read_manifest(path: str | Path, *, validate_sidecars: bool = True) -> dict[s
     with open(manifest_path, "r", encoding="utf-8") as fp:
         payload = json.load(fp)
     if not isinstance(payload, dict):
-        raise PTG2V3ArtifactError("PTG2 v3 manifest must be a JSON object")
+        raise PTG2V3ArtifactError("PTG2 manifest must be a JSON object")
     if validate_sidecars:
         _validate_sidecars(manifest_path.parent, payload)
     return payload
@@ -232,9 +272,9 @@ def read_global_local_id_mapping(manifest_path: str | Path) -> dict[bytes, tuple
 
     manifest = read_manifest(manifest_path, validate_sidecars=True)
     if manifest.get("version") != PTG2_V3_MANIFEST_VERSION:
-        raise PTG2V3ArtifactError(f"unsupported PTG2 v3 manifest version: {manifest.get('version')!r}")
+        raise PTG2V3ArtifactError(f"unsupported PTG2 manifest version: {manifest.get('version')!r}")
     if manifest.get("artifact_type") != PTG2_V3_MAPPING_ARTIFACT_TYPE:
-        raise PTG2V3ArtifactError(f"unsupported PTG2 v3 artifact type: {manifest.get('artifact_type')!r}")
+        raise PTG2V3ArtifactError(f"unsupported PTG2 artifact type: {manifest.get('artifact_type')!r}")
 
     sidecar = _mapping_sidecar(manifest)
     if int(sidecar.get("record_size") or 0) != PTG2_V3_MAPPING_RECORD_SIZE:
@@ -326,9 +366,9 @@ def read_global_membership_sidecar(manifest_path: str | Path) -> dict[bytes, tup
 
     manifest = read_manifest(manifest_path, validate_sidecars=True)
     if manifest.get("version") != PTG2_V3_MANIFEST_VERSION:
-        raise PTG2V3ArtifactError(f"unsupported PTG2 v3 manifest version: {manifest.get('version')!r}")
+        raise PTG2V3ArtifactError(f"unsupported PTG2 manifest version: {manifest.get('version')!r}")
     if manifest.get("artifact_type") != PTG2_V3_MEMBERSHIP_ARTIFACT_TYPE:
-        raise PTG2V3ArtifactError(f"unsupported PTG2 v3 artifact type: {manifest.get('artifact_type')!r}")
+        raise PTG2V3ArtifactError(f"unsupported PTG2 artifact type: {manifest.get('artifact_type')!r}")
     sidecar = _membership_sidecar(manifest)
     if sidecar.get("record_format") != PTG2_V3_MEMBERSHIP_FORMAT:
         raise PTG2V3ArtifactError("global membership sidecar has an unexpected record format")
@@ -342,7 +382,7 @@ def read_global_sidecar_entries(
     *,
     metadata: Mapping[str, Any] | None = None,
 ) -> tuple[PTG2V3SidecarEntry, ...]:
-    """Read a Rust PTG2 v3 ``write_global_sidecar`` binary file.
+    """Read a Rust PTG2 ``write_global_sidecar`` binary file.
 
     ``metadata`` may be a manifest sidecar entry; when supplied, checksum,
     byte-count, entry-count, member-count, and record-format values are
@@ -411,7 +451,7 @@ def lookup_global_sidecar_members(
     *,
     metadata: Mapping[str, Any] | None = None,
 ) -> tuple[bytes, ...]:
-    """Return one owner's members from a Rust PTG2 v3 global sidecar.
+    """Return one owner's members from a Rust PTG2 global sidecar.
 
     This is the hot API lookup primitive.  It validates cheap structural
     metadata and binary-searches the owner index instead of materializing the
@@ -424,11 +464,11 @@ def lookup_global_sidecar_members(
         _validate_membership_record_format(metadata)
         expected_byte_count = metadata.get("byte_count")
         if not isinstance(expected_byte_count, int) or expected_byte_count < 0:
-            raise PTG2V3ArtifactError("PTG2 v3 sidecar is missing a non-negative byte count")
+            raise PTG2V3ArtifactError("PTG2 sidecar is missing a non-negative byte count")
         actual_byte_count = sidecar_path.stat().st_size
         if actual_byte_count != expected_byte_count:
             raise PTG2V3ArtifactError(
-                f"PTG2 v3 sidecar byte_count mismatch for {sidecar_path.name}: "
+                f"PTG2 sidecar byte_count mismatch for {sidecar_path.name}: "
                 f"expected {expected_byte_count}, got {actual_byte_count}"
             )
     with open(sidecar_path, "rb") as fp:
@@ -532,15 +572,22 @@ def lookup_global_sidecar_members_many(
     sidecar_path = Path(path)
     if metadata is not None:
         _validate_membership_record_format(metadata)
-        expected_byte_count = metadata.get("byte_count")
-        if not isinstance(expected_byte_count, int) or expected_byte_count < 0:
-            raise PTG2V3ArtifactError("PTG2 v3 sidecar is missing a non-negative byte count")
-        actual_byte_count = sidecar_path.stat().st_size
-        if actual_byte_count != expected_byte_count:
-            raise PTG2V3ArtifactError(
-                f"PTG2 v3 sidecar byte_count mismatch for {sidecar_path.name}: "
-                f"expected {expected_byte_count}, got {actual_byte_count}"
-            )
+    if _sidecar_mmap_cache_enabled():
+        payload = _cached_sidecar_mmap(sidecar_path, metadata=metadata)
+        if len(payload) < _MEMBERSHIP_HEADER.size:
+            raise PTG2V3ArtifactError("global membership sidecar is missing its header")
+        magic = bytes(payload[:8])
+        if magic == PTG2_V3_DENSE_MEMBERSHIP_MAGIC:
+            return {
+                owner_id: _lookup_dense_sidecar_members(payload, owner_id, metadata=metadata)
+                for owner_id in owner_ids
+            }
+        if magic != PTG2_V3_MEMBERSHIP_MAGIC:
+            raise PTG2V3ArtifactError("global membership sidecar has an invalid magic header")
+        return {
+            owner_id: _lookup_standard_sidecar_members(payload, owner_id, metadata=metadata)
+            for owner_id in owner_ids
+        }
     with open(sidecar_path, "rb") as fp:
         with mmap.mmap(fp.fileno(), 0, access=mmap.ACCESS_READ) as payload:
             if len(payload) < _MEMBERSHIP_HEADER.size:
@@ -679,30 +726,30 @@ def _mapping_sidecar(manifest: Mapping[str, Any]) -> Mapping[str, Any]:
     for sidecar in manifest.get("sidecars") or []:
         if isinstance(sidecar, dict) and sidecar.get("kind") == "global_local_id_pairs":
             return sidecar
-    raise PTG2V3ArtifactError("PTG2 v3 manifest does not include a global/local id sidecar")
+    raise PTG2V3ArtifactError("PTG2 manifest does not include a global/local id sidecar")
 
 
 def _membership_sidecar(manifest: Mapping[str, Any]) -> Mapping[str, Any]:
     for sidecar in manifest.get("sidecars") or []:
         if isinstance(sidecar, dict) and sidecar.get("kind") == "global_membership":
             return sidecar
-    raise PTG2V3ArtifactError("PTG2 v3 manifest does not include a global membership sidecar")
+    raise PTG2V3ArtifactError("PTG2 manifest does not include a global membership sidecar")
 
 
 def _sidecar_path(manifest_dir: Path, sidecar: Mapping[str, Any]) -> Path:
     raw_path = sidecar.get("path")
     if not isinstance(raw_path, str) or not raw_path:
-        raise PTG2V3ArtifactError("PTG2 v3 sidecar is missing a relative path")
+        raise PTG2V3ArtifactError("PTG2 sidecar is missing a relative path")
     path = Path(raw_path)
     if path.is_absolute() or ".." in path.parts:
-        raise PTG2V3ArtifactError("PTG2 v3 sidecar paths must stay under the manifest directory")
+        raise PTG2V3ArtifactError("PTG2 sidecar paths must stay under the manifest directory")
     return manifest_dir / path
 
 
 def _validate_sidecars(manifest_dir: Path, manifest: Mapping[str, Any]) -> None:
     for sidecar in manifest.get("sidecars") or []:
         if not isinstance(sidecar, dict):
-            raise PTG2V3ArtifactError("PTG2 v3 sidecar entries must be JSON objects")
+            raise PTG2V3ArtifactError("PTG2 sidecar entries must be JSON objects")
         _validate_sidecar_metadata(_sidecar_path(manifest_dir, sidecar), sidecar)
 
 
@@ -710,14 +757,14 @@ def _validate_sidecar_metadata(sidecar_path: Path, sidecar: Mapping[str, Any]) -
     expected_sha = sidecar.get("sha256")
     expected_byte_count = sidecar.get("byte_count")
     if not isinstance(expected_sha, str) or len(expected_sha) != 64:
-        raise PTG2V3ArtifactError("PTG2 v3 sidecar is missing a SHA-256 checksum")
+        raise PTG2V3ArtifactError("PTG2 sidecar is missing a SHA-256 checksum")
     if not isinstance(expected_byte_count, int) or expected_byte_count < 0:
-        raise PTG2V3ArtifactError("PTG2 v3 sidecar is missing a non-negative byte count")
+        raise PTG2V3ArtifactError("PTG2 sidecar is missing a non-negative byte count")
     actual_sha, actual_byte_count = _sha256_file(sidecar_path)
     if actual_byte_count != expected_byte_count:
         raise PTG2V3ArtifactError(
-            f"PTG2 v3 sidecar byte_count mismatch for {sidecar_path.name}: "
+            f"PTG2 sidecar byte_count mismatch for {sidecar_path.name}: "
             f"expected {expected_byte_count}, got {actual_byte_count}"
         )
     if actual_sha != expected_sha:
-        raise PTG2V3ArtifactError(f"PTG2 v3 sidecar checksum mismatch for {sidecar_path.name}")
+        raise PTG2V3ArtifactError(f"PTG2 sidecar checksum mismatch for {sidecar_path.name}")

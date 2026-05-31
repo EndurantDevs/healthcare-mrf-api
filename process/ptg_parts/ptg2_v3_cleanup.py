@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Local PTG2 v3-only cleanup helpers.
+"""Local PTG2 legacy cleanup helpers.
 
 The cleanup intentionally targets snapshot-scoped legacy PTG tables and metadata.
 It does not remove raw payer downloads.
@@ -175,7 +175,7 @@ def _print_plan(plan: PTG2V3CleanupPlan) -> None:
 
 
 async def _amain() -> None:
-    parser = argparse.ArgumentParser(description="Clean local PTG2 v1/v2 data after v3 cutover.")
+    parser = argparse.ArgumentParser(description="Clean local legacy PTG2 data after the manifest-backed serving cutover.")
     parser.add_argument("--schema", default=os.getenv("HLTHPRT_DB_SCHEMA") or "mrf")
     parser.add_argument("--execute", action="store_true", help="Apply the cleanup. Default is dry-run.")
     args = parser.parse_args()

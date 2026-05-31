@@ -50,8 +50,13 @@ class PTG2ServingTables:
     source_key: str | None = None
     artifact_uri: str | None = None
     artifacts: dict[str, Any] | None = None
+    id_storage: str = "hex"
 
     @property
     def is_manifest_backed_snapshot(self) -> bool:
         storage = (self.storage or "").strip().lower()
         return storage == "v3_manifest_snapshot"
+
+    @property
+    def uses_uuid_ids(self) -> bool:
+        return (self.id_storage or "").strip().lower() == "uuid"

@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""PTG2 v3 manifest-backed snapshot reader and bounded serving search."""
+"""PTG2 manifest-backed snapshot reader and bounded serving search."""
 
 from __future__ import annotations
 
@@ -68,17 +68,17 @@ def _path_from_local_uri(uri: str) -> Path:
     if uri.startswith("file://"):
         return Path(unquote(urlsplit(uri).path))
     if "://" in uri:
-        raise PTG2V3ArtifactError("PTG2 v3 serving artifacts currently require local file paths")
+        raise PTG2V3ArtifactError("PTG2 serving artifacts currently require local file paths")
     return Path(uri)
 
 
 def _sidecar_path(manifest_path: Path, sidecar: Mapping[str, Any]) -> Path:
     raw_path = sidecar.get("path")
     if not isinstance(raw_path, str) or not raw_path:
-        raise PTG2V3ArtifactError("PTG2 v3 sidecar is missing a relative path")
+        raise PTG2V3ArtifactError("PTG2 sidecar is missing a relative path")
     path = Path(raw_path)
     if path.is_absolute() or ".." in path.parts:
-        raise PTG2V3ArtifactError("PTG2 v3 sidecar paths must stay under the manifest directory")
+        raise PTG2V3ArtifactError("PTG2 sidecar paths must stay under the manifest directory")
     return manifest_path.parent / path
 
 
@@ -114,7 +114,7 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
                 continue
             payload = json.loads(text_value)
             if not isinstance(payload, dict):
-                raise PTG2V3ArtifactError("PTG2 v3 serving row sidecar entries must be JSON objects")
+                raise PTG2V3ArtifactError("PTG2 serving row sidecar entries must be JSON objects")
             rows.append(payload)
     return rows
 
@@ -127,7 +127,7 @@ def _load_rows(manifest_path: Path, manifest: Mapping[str, Any]) -> tuple[dict[s
     def guard_rows() -> None:
         if len(rows) > row_limit:
             raise PTG2V3ArtifactError(
-                "PTG2 v3 manifest row payload is too large for in-process serving; use the DB-backed v3 path"
+                "PTG2 manifest row payload is too large for in-process serving; use the DB-backed PTG2 path"
             )
 
     inline_rows = manifest.get("rows") or manifest.get("serving_rows")
@@ -142,7 +142,7 @@ def _load_rows(manifest_path: Path, manifest: Mapping[str, Any]) -> tuple[dict[s
             sidecar_bytes = 0
         if sidecar_bytes > byte_limit:
             raise PTG2V3ArtifactError(
-                "PTG2 v3 manifest row sidecar is too large for in-process serving; use the DB-backed v3 path"
+                "PTG2 manifest row sidecar is too large for in-process serving; use the DB-backed PTG2 path"
             )
         sidecar_format = str(sidecar.get("format") or "").strip().lower()
         if sidecar_format == "jsonl" or sidecar_path.suffix == ".jsonl":
@@ -155,7 +155,7 @@ def _load_rows(manifest_path: Path, manifest: Mapping[str, Any]) -> tuple[dict[s
         elif isinstance(payload, dict) and isinstance(payload.get("rows"), list):
             rows.extend(dict(row) for row in payload["rows"] if isinstance(row, Mapping))
         else:
-            raise PTG2V3ArtifactError("PTG2 v3 serving row sidecar must contain rows")
+            raise PTG2V3ArtifactError("PTG2 serving row sidecar must contain rows")
         guard_rows()
     return tuple(rows)
 
@@ -174,7 +174,7 @@ def _load_mapping_sidecars(
     for sidecar in _sidecars(manifest, kinds):
         payload = _read_json(_sidecar_path(manifest_path, sidecar))
         if not isinstance(payload, Mapping):
-            raise PTG2V3ArtifactError("PTG2 v3 mapping sidecars must be JSON objects")
+            raise PTG2V3ArtifactError("PTG2 mapping sidecars must be JSON objects")
         mapping.update({str(mapping_key): value for mapping_key, value in payload.items()})
     return mapping
 
@@ -204,10 +204,10 @@ def load_ptg2_v3_snapshot(path_or_uri: str | Path) -> PTG2V3Snapshot:
     manifest = read_manifest(manifest_path, validate_sidecars=True)
     artifact_type = str(manifest.get("artifact_type") or manifest.get("type") or "").strip()
     if artifact_type and artifact_type not in PTG2_V3_SNAPSHOT_ARTIFACT_TYPES:
-        raise PTG2V3ArtifactError(f"unsupported PTG2 v3 snapshot artifact type: {artifact_type!r}")
+        raise PTG2V3ArtifactError(f"unsupported PTG2 snapshot artifact type: {artifact_type!r}")
     snapshot_id = str(manifest.get("snapshot_id") or "").strip()
     if not snapshot_id:
-        raise PTG2V3ArtifactError("PTG2 v3 snapshot manifest is missing snapshot_id")
+        raise PTG2V3ArtifactError("PTG2 snapshot manifest is missing snapshot_id")
     plans = {str(key): value for key, value in dict(manifest.get("plans") or {}).items()}
     procedures = {str(key): value for key, value in dict(manifest.get("procedures") or {}).items()}
     return PTG2V3Snapshot(
@@ -489,7 +489,7 @@ def search_ptg2_v3_snapshot(
             "state": None,
             "city": None,
             "zip5": None,
-            "source": "ptg2_v3_artifact",
+            "source": "ptg2_artifact",
             "serving_table": None,
             "include_providers": expand_providers,
             "result_granularity": "provider" if expand_providers else "provider_set",
