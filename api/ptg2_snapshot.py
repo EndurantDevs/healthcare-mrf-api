@@ -19,16 +19,43 @@ from api.ptg2_index_cache import (
 from api.ptg2_types import PTG2ServingIndex
 
 PTG2_SCHEMA = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
+_PTG2_SNAPSHOT_RESOLVE_CACHE: dict[tuple[object, ...], tuple[float, str | None]] = {}
+
+
+def _snapshot_cache_enabled(session) -> bool:
+    return hasattr(session, "sync_session")
+
+
+def _snapshot_cache_get(key: tuple[object, ...]) -> str | None | object:
+    cached = _PTG2_SNAPSHOT_RESOLVE_CACHE.get(key)
+    if cached is None:
+        return None
+    cached_at, value = cached
+    if PTG2_INDEX_CACHE_TTL_SECONDS == 0 or (time.monotonic() - cached_at) <= PTG2_INDEX_CACHE_TTL_SECONDS:
+        return value
+    _PTG2_SNAPSHOT_RESOLVE_CACHE.pop(key, None)
+    return None
+
+
+def _snapshot_cache_set(key: tuple[object, ...], value: str | None) -> str | None:
+    _PTG2_SNAPSHOT_RESOLVE_CACHE[key] = (time.monotonic(), value)
+    return value
 
 
 async def current_snapshot_id(session, requested_snapshot_id: str | None = None) -> str | None:
     if requested_snapshot_id:
         return str(requested_snapshot_id)
+    cache_key = ("current",)
+    if _snapshot_cache_enabled(session):
+        cached = _snapshot_cache_get(cache_key)
+        if cached is not None:
+            return cached  # type: ignore[return-value]
     result = await session.execute(
         text(f"SELECT snapshot_id FROM {PTG2_SCHEMA}.ptg2_current_snapshot WHERE slot = 'current'")
     )
     value = result.scalar()
-    return str(value) if value else None
+    value = str(value) if value else None
+    return _snapshot_cache_set(cache_key, value) if _snapshot_cache_enabled(session) else value
 
 
 async def current_source_snapshot_id_for_plan(session, args: dict[str, object]) -> str | None:
@@ -37,6 +64,11 @@ async def current_source_snapshot_id_for_plan(session, args: dict[str, object]) 
         return None
     market_type = str(args.get("plan_market_type") or "").strip().lower()
     source_key = str(args.get("source_key") or "").strip().lower()
+    cache_key = ("source_plan", requested_plan, market_type, source_key)
+    if _snapshot_cache_enabled(session):
+        cached = _snapshot_cache_get(cache_key)
+        if cached is not None:
+            return cached  # type: ignore[return-value]
     params: dict[str, object] = {"plan_id": requested_plan}
     market_sql = ""
     if market_type:
@@ -71,9 +103,10 @@ async def current_source_snapshot_id_for_plan(session, args: dict[str, object]) 
                 await rollback()
             except Exception:
                 pass
-        return None
+        return _snapshot_cache_set(cache_key, None) if _snapshot_cache_enabled(session) else None
     value = result.scalar()
-    return str(value) if value else None
+    value = str(value) if value else None
+    return _snapshot_cache_set(cache_key, value) if _snapshot_cache_enabled(session) else value
 
 
 async def resolve_current_ptg2_snapshot_id(session, args: dict[str, object]) -> str | None:

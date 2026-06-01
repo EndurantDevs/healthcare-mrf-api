@@ -462,6 +462,7 @@ def lookup_global_sidecar_members(
     owner: bytes | bytearray | memoryview | str,
     *,
     metadata: Mapping[str, Any] | None = None,
+    max_members: int | None = None,
 ) -> tuple[bytes, ...]:
     """Return one owner's members from a Rust PTG2 global sidecar.
 
@@ -490,7 +491,7 @@ def lookup_global_sidecar_members(
                 raise PTG2ManifestArtifactError("global membership sidecar is missing its header")
             magic = bytes(payload[:8])
             if _is_dense_membership_magic(magic):
-                return _lookup_dense_sidecar_members(payload, owner_id, metadata=metadata)
+                return _lookup_dense_sidecar_members(payload, owner_id, metadata=metadata, max_members=max_members)
             if not _is_standard_membership_magic(magic):
                 raise PTG2ManifestArtifactError("global membership sidecar has an invalid magic header")
             magic, version, entry_count = _MEMBERSHIP_HEADER.unpack_from(payload, 0)
@@ -523,6 +524,8 @@ def lookup_global_sidecar_members(
                 end = start + member_count * 16
                 if end > len(payload):
                     raise PTG2ManifestArtifactError("global membership sidecar member block is truncated")
+                if max_members is not None:
+                    end = min(end, start + max(max_members, 0) * 16)
                 return tuple(bytes(payload[pos : pos + 16]) for pos in range(start, end, 16))
             return ()
 
@@ -532,6 +535,7 @@ def _lookup_standard_sidecar_members(
     owner_id: bytes,
     *,
     metadata: Mapping[str, Any] | None = None,
+    max_members: int | None = None,
 ) -> tuple[bytes, ...]:
     header_size = _MEMBERSHIP_HEADER.size
     magic, version, entry_count = _MEMBERSHIP_HEADER.unpack_from(payload, 0)
@@ -566,6 +570,8 @@ def _lookup_standard_sidecar_members(
         end = start + member_count * 16
         if end > len(payload):
             raise PTG2ManifestArtifactError("global membership sidecar member block is truncated")
+        if max_members is not None:
+            end = min(end, start + max(max_members, 0) * 16)
         return tuple(bytes(payload[pos : pos + 16]) for pos in range(start, end, 16))
     return ()
 
@@ -575,6 +581,7 @@ def lookup_global_sidecar_members_many(
     owners: Iterable[bytes | bytearray | memoryview | str],
     *,
     metadata: Mapping[str, Any] | None = None,
+    max_members: int | None = None,
 ) -> dict[bytes, tuple[bytes, ...]]:
     """Return multiple owner memberships while opening and mapping the sidecar once."""
 
@@ -591,13 +598,13 @@ def lookup_global_sidecar_members_many(
         magic = bytes(payload[:8])
         if _is_dense_membership_magic(magic):
             return {
-                owner_id: _lookup_dense_sidecar_members(payload, owner_id, metadata=metadata)
+                owner_id: _lookup_dense_sidecar_members(payload, owner_id, metadata=metadata, max_members=max_members)
                 for owner_id in owner_ids
             }
         if not _is_standard_membership_magic(magic):
             raise PTG2ManifestArtifactError("global membership sidecar has an invalid magic header")
         return {
-            owner_id: _lookup_standard_sidecar_members(payload, owner_id, metadata=metadata)
+            owner_id: _lookup_standard_sidecar_members(payload, owner_id, metadata=metadata, max_members=max_members)
             for owner_id in owner_ids
         }
     with open(sidecar_path, "rb") as fp:
@@ -607,13 +614,13 @@ def lookup_global_sidecar_members_many(
             magic = bytes(payload[:8])
             if _is_dense_membership_magic(magic):
                 return {
-                    owner_id: _lookup_dense_sidecar_members(payload, owner_id, metadata=metadata)
+                    owner_id: _lookup_dense_sidecar_members(payload, owner_id, metadata=metadata, max_members=max_members)
                     for owner_id in owner_ids
                 }
             if not _is_standard_membership_magic(magic):
                 raise PTG2ManifestArtifactError("global membership sidecar has an invalid magic header")
             return {
-                owner_id: _lookup_standard_sidecar_members(payload, owner_id, metadata=metadata)
+                owner_id: _lookup_standard_sidecar_members(payload, owner_id, metadata=metadata, max_members=max_members)
                 for owner_id in owner_ids
             }
 
@@ -685,6 +692,7 @@ def _lookup_dense_sidecar_members(
     owner_id: bytes,
     *,
     metadata: Mapping[str, Any] | None = None,
+    max_members: int | None = None,
 ) -> tuple[bytes, ...]:
     if len(payload) < _DENSE_MEMBERSHIP_HEADER.size:
         raise PTG2ManifestArtifactError("dense global membership sidecar is missing its header")
@@ -723,6 +731,8 @@ def _lookup_dense_sidecar_members(
         end = start + member_count * _DENSE_MEMBER_RECORD.size
         if end > len(payload):
             raise PTG2ManifestArtifactError("dense global membership sidecar member block is truncated")
+        if max_members is not None:
+            end = min(end, start + max(max_members, 0) * _DENSE_MEMBER_RECORD.size)
         members: list[bytes] = []
         for pos in range(start, end, _DENSE_MEMBER_RECORD.size):
             local_id = _DENSE_MEMBER_RECORD.unpack_from(payload, pos)[0]

@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from typing import Any
 
 from sqlalchemy import text
@@ -13,15 +14,32 @@ from sqlalchemy import text
 from api.ptg2_types import PTG2ServingTables
 
 PTG2_SCHEMA = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
+_PTG2_TABLE_CACHE_TTL_SECONDS = max(float(os.getenv("HLTHPRT_PTG2_TABLE_CACHE_TTL_SECONDS", "300")), 0.0)
+_PTG2_TABLE_AVAILABLE_CACHE: dict[str, tuple[float, bool]] = {}
+_PTG2_SNAPSHOT_TABLES_CACHE: dict[str, tuple[float, PTG2ServingTables]] = {}
+
+
+def _metadata_cache_enabled(session: Any) -> bool:
+    return hasattr(session, "sync_session")
 
 
 async def _serving_table_available(session, table_name: str) -> bool:
+    cache_enabled = _metadata_cache_enabled(session)
+    if cache_enabled:
+        cached = _PTG2_TABLE_AVAILABLE_CACHE.get(table_name)
+        if cached is not None:
+            cached_at, value = cached
+            if _PTG2_TABLE_CACHE_TTL_SECONDS == 0 or (time.monotonic() - cached_at) <= _PTG2_TABLE_CACHE_TTL_SECONDS:
+                return value
     try:
         result = await session.execute(
             text("SELECT to_regclass(:table_name)"),
             {"table_name": table_name},
         )
-        return bool(result.scalar())
+        value = bool(result.scalar())
+        if cache_enabled:
+            _PTG2_TABLE_AVAILABLE_CACHE[table_name] = (time.monotonic(), value)
+        return value
     except Exception:
         return False
 
@@ -86,6 +104,19 @@ def _safe_table_name(value: Any, *, default_schema: str = PTG2_SCHEMA) -> str | 
 
 
 async def snapshot_serving_tables(session, snapshot_id: str) -> PTG2ServingTables:
+    cache_enabled = _metadata_cache_enabled(session)
+    if cache_enabled:
+        cached = _PTG2_SNAPSHOT_TABLES_CACHE.get(snapshot_id)
+        if cached is not None:
+            cached_at, tables = cached
+            if _PTG2_TABLE_CACHE_TTL_SECONDS == 0 or (time.monotonic() - cached_at) <= _PTG2_TABLE_CACHE_TTL_SECONDS:
+                return tables
+
+    def _cache(value: PTG2ServingTables) -> PTG2ServingTables:
+        if cache_enabled:
+            _PTG2_SNAPSHOT_TABLES_CACHE[snapshot_id] = (time.monotonic(), value)
+        return value
+
     result = await session.execute(
         text(
             f"""
@@ -99,14 +130,14 @@ async def snapshot_serving_tables(session, snapshot_id: str) -> PTG2ServingTable
     )
     value = result.scalar()
     if not value:
-        return PTG2ServingTables()
+        return _cache(PTG2ServingTables())
     if isinstance(value, str):
         try:
             value = json.loads(value)
         except json.JSONDecodeError:
-            return PTG2ServingTables()
+            return _cache(PTG2ServingTables())
     if not isinstance(value, dict):
-        return PTG2ServingTables()
+        return _cache(PTG2ServingTables())
     manifest = value
     serving_index = manifest.get("serving_index")
     if isinstance(serving_index, str):
@@ -122,7 +153,7 @@ async def snapshot_serving_tables(session, snapshot_id: str) -> PTG2ServingTable
         or manifest.get("artifact_uri")
         or manifest.get("storage_uri")
     )
-    return PTG2ServingTables(
+    return _cache(PTG2ServingTables(
         storage=str(serving_index.get("storage") or "").strip() or None,
         type=str(serving_index.get("type") or "").strip() or None,
         snapshot_scoped=bool(serving_index.get("snapshot_scoped")),
@@ -134,4 +165,4 @@ async def snapshot_serving_tables(session, snapshot_id: str) -> PTG2ServingTable
         price_atom_table=_safe_table_name(serving_index.get("price_atom_table")),
         code_count_table=_safe_table_name(serving_index.get("code_count_table")),
         provider_group_member_table=_safe_table_name(serving_index.get("provider_group_member_table")),
-    )
+    ))

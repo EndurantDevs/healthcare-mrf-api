@@ -243,7 +243,13 @@ def _ptg2_manifest_artifact_entry(serving_tables: PTG2ServingTables, name: str) 
     return entries[0] if entries else None
 
 
-def _ptg2_manifest_sidecar_members(serving_tables: PTG2ServingTables, name: str, owner_id: str) -> tuple[str, ...]:
+def _ptg2_manifest_sidecar_members(
+    serving_tables: PTG2ServingTables,
+    name: str,
+    owner_id: str,
+    *,
+    max_members: int | None = None,
+) -> tuple[str, ...]:
     owner_id = _ptg2_manifest_id(owner_id)
     if not owner_id:
         return ()
@@ -252,10 +258,19 @@ def _ptg2_manifest_sidecar_members(serving_tables: PTG2ServingTables, name: str,
         path = str(entry.get("path") or "").strip()
         if not path:
             continue
-        cache_key = (path, str(entry.get("sha256") or ""), owner_id)
+        cache_owner_id = owner_id if max_members is None else f"{owner_id}:{max_members}"
+        cache_key = (path, str(entry.get("sha256") or ""), cache_owner_id)
         cached = _PTG2_MANIFEST_SIDECAR_CACHE.get(cache_key)
         if cached is None:
-            cached = tuple(member.hex() for member in lookup_global_sidecar_members(Path(path), owner_id, metadata=entry))
+            cached = tuple(
+                member.hex()
+                for member in lookup_global_sidecar_members(
+                    Path(path),
+                    owner_id,
+                    metadata=entry,
+                    max_members=max_members,
+                )
+            )
             _PTG2_MANIFEST_SIDECAR_CACHE[cache_key] = cached
         members.update(cached)
     return tuple(sorted(members))
@@ -265,6 +280,8 @@ def _ptg2_manifest_sidecar_members_many(
     serving_tables: PTG2ServingTables,
     name: str,
     owner_ids: list[str] | tuple[str, ...],
+    *,
+    max_members: int | None = None,
 ) -> dict[str, tuple[str, ...]]:
     owner_id_list = list(_ptg2_manifest_ids(tuple(owner_ids)))
     result_sets: dict[str, set[str]] = {owner_id: set() for owner_id in owner_id_list}
@@ -275,21 +292,28 @@ def _ptg2_manifest_sidecar_members_many(
         sha = str(entry.get("sha256") or "")
         missing: list[str] = []
         for owner_id in owner_id_list:
-            cache_key = (path, sha, owner_id)
+            cache_owner_id = owner_id if max_members is None else f"{owner_id}:{max_members}"
+            cache_key = (path, sha, cache_owner_id)
             cached = _PTG2_MANIFEST_SIDECAR_CACHE.get(cache_key)
             if cached is None:
                 missing.append(owner_id)
             else:
                 result_sets[owner_id].update(cached)
         if missing:
-            members_by_owner = lookup_global_sidecar_members_many(Path(path), missing, metadata=entry)
+            members_by_owner = lookup_global_sidecar_members_many(
+                Path(path),
+                missing,
+                metadata=entry,
+                max_members=max_members,
+            )
             for owner_id in missing:
                 try:
                     owner_bytes = bytes.fromhex(owner_id)
                 except ValueError:
                     owner_bytes = b""
                 members = tuple(member.hex() for member in members_by_owner.get(owner_bytes, ()))
-                _PTG2_MANIFEST_SIDECAR_CACHE[(path, sha, owner_id)] = members
+                cache_owner_id = owner_id if max_members is None else f"{owner_id}:{max_members}"
+                _PTG2_MANIFEST_SIDECAR_CACHE[(path, sha, cache_owner_id)] = members
                 result_sets[owner_id].update(members)
     return {owner_id: tuple(sorted(members)) for owner_id, members in result_sets.items()}
 
@@ -316,9 +340,16 @@ def _ptg2_manifest_provider_npis_for_provider_set(
 def _ptg2_manifest_provider_npis_for_provider_sets(
     serving_tables: PTG2ServingTables,
     provider_set_global_ids: list[str] | tuple[str, ...],
+    *,
+    limit_per_set: int | None = None,
 ) -> dict[str, tuple[int, ...]]:
     provider_set_ids = _ptg2_manifest_ids(tuple(provider_set_global_ids))
-    members_by_set = _ptg2_manifest_sidecar_members_many(serving_tables, "provider_npi", provider_set_ids)
+    members_by_set = _ptg2_manifest_sidecar_members_many(
+        serving_tables,
+        "provider_npi",
+        provider_set_ids,
+        max_members=limit_per_set,
+    )
     result: dict[str, tuple[int, ...]] = {}
     for provider_set_id in provider_set_ids:
         npis: list[int] = []
@@ -332,7 +363,8 @@ def _ptg2_manifest_provider_npis_for_provider_sets(
             npi = int.from_bytes(raw[8:16], "big", signed=False)
             if npi > 0:
                 npis.append(npi)
-        result[provider_set_id] = tuple(sorted(set(npis)))
+        sorted_npis = tuple(sorted(set(npis)))
+        result[provider_set_id] = sorted_npis[:limit_per_set] if limit_per_set is not None else sorted_npis
     return result
 
 
@@ -627,7 +659,7 @@ async def _ptg2_manifest_location_provider_matches(
         result = await session.execute(
             text(
                 f"""
-            WITH location_npis AS MATERIALIZED (
+            WITH location_npis AS (
                 SELECT DISTINCT ON (addr.npi)
                     addr.npi,
                     addr.type,
@@ -774,7 +806,11 @@ async def _ptg2_manifest_provider_rows_for_provider_sets(
     if not provider_set_ids:
         return {}
 
-    npis_by_set = _ptg2_manifest_provider_npis_for_provider_sets(serving_tables, provider_set_ids)
+    npis_by_set = _ptg2_manifest_provider_npis_for_provider_sets(
+        serving_tables,
+        provider_set_ids,
+        limit_per_set=max(int(limit_per_set), 1),
+    )
     missing_provider_set_ids = [provider_set_id for provider_set_id in provider_set_ids if not npis_by_set.get(provider_set_id)]
     if missing_provider_set_ids:
         provider_group_member_table = _safe_table_name(serving_tables.provider_group_member_table)
@@ -963,7 +999,7 @@ async def _search_ptg2_manifest_db_serving_table(
             session,
             serving_tables,
             args,
-            candidate_limit=max(int(pagination.limit) * 4, 200),
+            candidate_limit=max(int(pagination.limit), 1),
         )
         if location_matches is None:
             return None

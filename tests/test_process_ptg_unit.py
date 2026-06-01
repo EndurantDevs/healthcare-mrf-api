@@ -2973,6 +2973,7 @@ def test_ptg2_manifest_snapshot_publish_direct_renames_and_indexes(monkeypatch):
     async def fake_status(statement, **_params):
         status_calls.append(statement)
 
+    monkeypatch.setenv("HLTHPRT_PTG2_PUBLISH_DB_DEDUPE_FALLBACK", "false")
     monkeypatch.setattr(ptg_manifest_publish.db, "status", fake_status)
     monkeypatch.setattr(ptg_manifest_publish, "_table_exists", AsyncMock(return_value=True))
     monkeypatch.setattr(ptg_manifest_publish, "_table_has_rows", AsyncMock(return_value=True))
@@ -2998,7 +2999,7 @@ def test_ptg2_manifest_snapshot_publish_direct_renames_and_indexes(monkeypatch):
     joined = "\n".join(status_calls)
     assert result["storage"] == "manifest_snapshot"
     assert result["type"] == "ptg2_serving"
-    assert result["id_storage"] == "hex"
+    assert result["id_storage"] == "uuid"
     assert result["rate_count"] == 321
     assert result["serving_rates"] == 321
     assert result["table"].startswith("mrf.ptg2_serving_")
@@ -3007,10 +3008,91 @@ def test_ptg2_manifest_snapshot_publish_direct_renames_and_indexes(monkeypatch):
     assert "RENAME TO" in joined
     assert "snapshot_id" not in joined
     assert "plan_id, reported_code_system, reported_code" in joined
+    assert "SELECT DISTINCT ON (serving_content_hash_128)" not in joined
+    assert "SELECT DISTINCT ON (price_atom_global_id_128)" not in joined
+    assert "SELECT DISTINCT ON (provider_group_global_id_128, npi)" not in joined
+    assert "CREATE UNIQUE INDEX" in joined
+
+
+def test_ptg2_manifest_snapshot_publish_can_fallback_to_db_dedupe(monkeypatch):
+    status_calls = []
+
+    async def fake_status(statement, **_params):
+        status_calls.append(statement)
+
+    monkeypatch.setattr(ptg_manifest_publish.db, "status", fake_status)
+    monkeypatch.setattr(ptg_manifest_publish, "_table_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(ptg_manifest_publish, "_table_has_rows", AsyncMock(return_value=True))
+    monkeypatch.setattr(ptg_manifest_publish, "_exact_table_rows", AsyncMock(return_value=321))
+
+    asyncio.run(
+        process_ptg._publish_ptg2_manifest_serving_snapshot(
+            "ptg2_manifest_stage_serving_abc",
+            snapshot_id="ptg2:202604:snap",
+            source_key="heartland_dental",
+        )
+    )
+
+    joined = "\n".join(status_calls)
     assert "SELECT DISTINCT ON (serving_content_hash_128)" in joined
     assert "SELECT DISTINCT ON (price_atom_global_id_128)" in joined
     assert "SELECT DISTINCT ON (provider_group_global_id_128, npi)" in joined
-    assert "CREATE UNIQUE INDEX" in joined
+
+
+def test_ptg2_manifest_precopy_merge_copies_merged_files(monkeypatch, tmp_path):
+    merge_calls = []
+    copy_calls = []
+
+    async def fake_merge(kind, output_path, input_paths):
+        merge_calls.append((kind, output_path, tuple(input_paths)))
+        output_path.write_text(f"{kind}\n", encoding="utf-8")
+        return {
+            "kind": kind,
+            "input_files": len(input_paths),
+            "input_rows": 2,
+            "output_rows": 1,
+            "dropped_rows": 1,
+        }
+
+    async def fake_copy(copy_path, *, target_table):
+        copy_calls.append((copy_path.read_text(encoding="utf-8").strip(), target_table))
+
+    source_files = {}
+    for kind in ("manifest_serving", "price_atom", "provider_group_member"):
+        source_path = tmp_path / f"{kind}.copy"
+        source_path.write_text("row\n", encoding="utf-8")
+        source_files[kind] = source_path
+
+    monkeypatch.setattr(process_ptg, "_run_ptg2_manifest_copy_merge", fake_merge)
+    monkeypatch.setattr(process_ptg, "_copy_ptg2_manifest_serving_file", fake_copy)
+    monkeypatch.setattr(process_ptg, "_copy_ptg2_manifest_price_atom_file", fake_copy)
+    monkeypatch.setattr(process_ptg, "_copy_ptg2_manifest_provider_group_member_file", fake_copy)
+
+    metrics = asyncio.run(
+        process_ptg._merge_and_copy_ptg2_manifest_files(
+            successful_files=[
+                {
+                    "summary": {
+                        "manifest": {
+                            "copy_files": {
+                                kind: [{"path": str(path), "row_count": 1}]
+                                for kind, path in source_files.items()
+                            }
+                        }
+                    }
+                }
+            ],
+            manifest_stage_table="ptg2_manifest_stage_serving_abc",
+        )
+    )
+
+    assert metrics["enabled"] is True
+    assert metrics["serving_rows"] == 1
+    assert [call[0] for call in merge_calls] == ["manifest_serving", "price_atom", "provider_group_member"]
+    assert ("manifest_serving", "ptg2_manifest_stage_serving_abc") in copy_calls
+    assert ("price_atom", "ptg2_manifest_stage_price_atom_abc") in copy_calls
+    assert ("provider_group_member", "ptg2_manifest_stage_provider_group_member_abc") in copy_calls
+    assert all(not path.exists() for path in source_files.values())
 
 
 def test_ptg2_manifest_stage_uses_uuid_ids_when_enabled(monkeypatch):

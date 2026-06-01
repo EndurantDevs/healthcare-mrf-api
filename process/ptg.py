@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import subprocess
 import tempfile
 import time
 from collections import OrderedDict
@@ -170,6 +171,7 @@ from process.ptg_parts.config import (
     PTG2_ITEM_BATCH_ROWS_ENV,
     PTG2_JSON_DECODER_ITERATOR_ENV,
     PTG2_KEEP_PARTIAL_ENV,
+    PTG2_MANIFEST_PRECOPY_MERGE_ENV,
     PTG2_KEEP_PRICE_SET_STAGE_ENV,
     PTG2_KEEP_SERVING_RATE_STAGE_ENV,
     PTG2_PRICE_BATCH_ROWS_ENV,
@@ -346,6 +348,24 @@ from process.ptg_parts.rust_scanner import (
     _iter_compact_serving_records_rust,
     _iter_top_level_object_bytes_rust,
     _ptg2_rust_scanner_binary,
+)
+from process.ptg_parts.rust_stage import (
+    PTG2_SERVING_STAGE_LANE_PREFIX,
+    _RUST_COPY_TABLE_SPECS,
+    _create_rust_copy_stage_tables,
+    _merge_rust_copy_stage_tables,
+    _ptg2_dictionary_select_columns,
+    _rust_copy_stage_table_name,
+    _serving_stage_lane_key,
+    _serving_stage_table_for_copy,
+    _serving_stage_tables,
+)
+from process.ptg_parts.rust_publish import (
+    _ptg2_publish_timestamp,
+    _ptg2_serving_child_table_name,
+    _publish_renamed_rust_dictionary_table,
+    _publish_rust_compact_snapshot_tables,
+    _publish_rust_serving_stage_tables,
 )
 from process.ptg_parts.screen import _emit_screen_line
 from process.ptg_parts.ptg2_manifest_publish import (
@@ -561,6 +581,157 @@ def _serving_only_worker_process_chunk_to_files(
     return _serving_only_worker_process_chunk_to_files_impl(payloads_or_raw, _serving_only_worker_process)
 
 
+def _ptg2_copy_file_row_count(path: Path) -> int:
+    if not path.exists() or path.stat().st_size <= 0:
+        return 0
+    with path.open("rb") as fp:
+        return sum(1 for _line in fp)
+
+
+def _run_ptg2_manifest_copy_merge_sync(kind: str, output_path: Path, input_paths: list[Path]) -> dict[str, Any]:
+    binary = _ptg2_rust_scanner_binary()
+    if binary is None:
+        raise RuntimeError(
+            "PTG2 manifest pre-COPY merge requires the Rust scanner binary; "
+            "build it with `cargo build --release --manifest-path support/ptg2_scanner/Cargo.toml`"
+        )
+    existing_paths = [path for path in input_paths if path.exists() and path.stat().st_size > 0]
+    if not existing_paths:
+        output_path.touch()
+        return {"kind": kind, "input_files": 0, "input_rows": 0, "output_rows": 0, "dropped_rows": 0}
+    process = subprocess.run(
+        [
+            str(binary),
+            "--merge-manifest-copy",
+            kind,
+            str(output_path),
+            *[str(path) for path in existing_paths],
+        ],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=False,
+    )
+    if process.returncode != 0:
+        stderr = process.stderr.decode("utf-8", errors="replace")
+        raise RuntimeError(f"PTG2 manifest pre-COPY merge failed for {kind}: {stderr[-1000:]}")
+    try:
+        header, rest = process.stdout.split(b"\n", 1)
+        record_kind, length_bytes = header.split(b"\t", 1)
+        payload_len = int(length_bytes)
+        payload = rest[:payload_len]
+        if record_kind == b"manifest_copy_merge_summary":
+            return json.loads(payload.decode("utf-8"))
+    except Exception:
+        pass
+    output_rows = _ptg2_copy_file_row_count(output_path)
+    input_rows = sum(_ptg2_copy_file_row_count(path) for path in existing_paths)
+    return {
+        "kind": kind,
+        "input_files": len(existing_paths),
+        "input_rows": input_rows,
+        "output_rows": output_rows,
+        "dropped_rows": max(input_rows - output_rows, 0),
+    }
+
+
+async def _run_ptg2_manifest_copy_merge(kind: str, output_path: Path, input_paths: list[Path]) -> dict[str, Any]:
+    return await asyncio.to_thread(_run_ptg2_manifest_copy_merge_sync, kind, output_path, input_paths)
+
+
+async def _merge_and_copy_ptg2_manifest_files(
+    *,
+    successful_files: list[dict[str, Any]],
+    manifest_stage_table: str,
+) -> dict[str, Any]:
+    copy_files_by_kind: dict[str, list[Path]] = {
+        "manifest_serving": [],
+        "price_atom": [],
+        "provider_group_member": [],
+    }
+    emitted_rows_by_kind: dict[str, int] = {kind: 0 for kind in copy_files_by_kind}
+    for file_summary in successful_files:
+        summary_payload = file_summary.get("summary") if isinstance(file_summary, dict) else None
+        manifest_payload = summary_payload.get("manifest") if isinstance(summary_payload, dict) else None
+        copy_files = manifest_payload.get("copy_files") if isinstance(manifest_payload, dict) else None
+        if not isinstance(copy_files, dict):
+            continue
+        for kind in copy_files_by_kind:
+            entries = copy_files.get(kind) or []
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                raw_path = str(entry.get("path") or "").strip()
+                if not raw_path:
+                    continue
+                copy_files_by_kind[kind].append(Path(raw_path))
+                try:
+                    emitted_rows_by_kind[kind] += int(entry.get("row_count") or 0)
+                except (TypeError, ValueError):
+                    pass
+    if not any(copy_files_by_kind.values()):
+        return {"enabled": False, "reason": "no_deferred_copy_files"}
+
+    def _new_merge_path(prefix: str) -> Path:
+        fd, name = tempfile.mkstemp(prefix=prefix, suffix=".copy", dir=ptg2_temp_parent())
+        os.close(fd)
+        path = Path(name)
+        path.unlink(missing_ok=True)
+        return path
+
+    merged_serving = _new_merge_path("ptg2_manifest_serving_merged_")
+    merged_price_atom = _new_merge_path("ptg2_manifest_price_atom_merged_")
+    merged_provider_group_member = _new_merge_path("ptg2_manifest_provider_group_member_merged_")
+    merge_metrics: dict[str, Any] = {"enabled": True, "kinds": {}, "emitted_rows": emitted_rows_by_kind}
+    try:
+        serving_metrics = await _run_ptg2_manifest_copy_merge(
+            "manifest_serving",
+            merged_serving,
+            copy_files_by_kind["manifest_serving"],
+        )
+        price_atom_metrics = await _run_ptg2_manifest_copy_merge(
+            "price_atom",
+            merged_price_atom,
+            copy_files_by_kind["price_atom"],
+        )
+        provider_group_member_metrics = await _run_ptg2_manifest_copy_merge(
+            "provider_group_member",
+            merged_provider_group_member,
+            copy_files_by_kind["provider_group_member"],
+        )
+        price_atom_table = _ptg2_manifest_support_stage_table(manifest_stage_table, "price_atom")
+        provider_group_member_table = _ptg2_manifest_support_stage_table(manifest_stage_table, "provider_group_member")
+        await _copy_ptg2_manifest_serving_file(merged_serving, target_table=manifest_stage_table)
+        await _copy_ptg2_manifest_price_atom_file(merged_price_atom, target_table=price_atom_table)
+        await _copy_ptg2_manifest_provider_group_member_file(
+            merged_provider_group_member,
+            target_table=provider_group_member_table,
+        )
+        merge_metrics["kinds"] = {
+            "manifest_serving": serving_metrics,
+            "price_atom": price_atom_metrics,
+            "provider_group_member": provider_group_member_metrics,
+        }
+        merge_metrics["serving_rows"] = int(serving_metrics.get("output_rows") or 0)
+        _emit_screen_line(f"PTG2_MANIFEST_PRECOPY_MERGE\t{json.dumps(merge_metrics, sort_keys=True)}")
+        return merge_metrics
+    finally:
+        for path in (
+            merged_serving,
+            merged_price_atom,
+            merged_provider_group_member,
+            *copy_files_by_kind["manifest_serving"],
+            *copy_files_by_kind["price_atom"],
+            *copy_files_by_kind["provider_group_member"],
+        ):
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                logger.debug("Failed to remove PTG2 manifest merge file %s", path, exc_info=True)
+
+
 async def _parse_in_network_file_serving_only(
     file_path: str,
     file_id: int,
@@ -600,6 +771,12 @@ async def _parse_in_network_file_serving_only(
     rust_records = 0
     rust_dedupe_summary: dict[str, Any] = {}
     procedure_hashes: set[str] = set()
+    defer_manifest_copy = _env_bool(PTG2_MANIFEST_PRECOPY_MERGE_ENV, True)
+    deferred_copy_files: dict[str, list[dict[str, Any]]] = {
+        "manifest_serving": [],
+        "price_atom": [],
+        "provider_group_member": [],
+    }
     compact_copy_tasks: set[asyncio.Task] = set()
     compact_copy_task_limit = max(_env_int(PTG2_COMPACT_COPY_TASKS_ENV, PTG2_DEFAULT_COMPACT_COPY_TASKS), 1)
     compact_copy_semaphore = asyncio.Semaphore(compact_copy_task_limit)
@@ -645,6 +822,12 @@ async def _parse_in_network_file_serving_only(
             return
         copied_rows = int(copy_row.get("row_count") or 0)
         copy_file = Path(raw_copy_path)
+        if defer_manifest_copy:
+            if copied_rows <= 0:
+                copied_rows = _ptg2_copy_file_row_count(copy_file)
+            manifest_copy_rows += copied_rows
+            deferred_copy_files["manifest_serving"].append({"path": str(copy_file), "row_count": copied_rows})
+            return
         async with compact_copy_semaphore:
             started_at = time.monotonic()
             emit_copy_status("START", kind="manifest_serving", copy_file=copy_file, rows=copied_rows, target_table=manifest_stage_table)
@@ -659,6 +842,8 @@ async def _parse_in_network_file_serving_only(
             return
         copy_file = Path(raw_copy_path)
         copied_rows = int(copy_row.get("row_count") or 0)
+        if copied_rows <= 0:
+            copied_rows = _ptg2_copy_file_row_count(copy_file)
         if kind == "price_atom":
             target_table = _ptg2_manifest_support_stage_table(manifest_stage_table, "price_atom")
             copy_func = _copy_ptg2_manifest_price_atom_file
@@ -666,6 +851,9 @@ async def _parse_in_network_file_serving_only(
             target_table = _ptg2_manifest_support_stage_table(manifest_stage_table, "provider_group_member")
             copy_func = _copy_ptg2_manifest_provider_group_member_file
         else:
+            return
+        if defer_manifest_copy:
+            deferred_copy_files[kind].append({"path": str(copy_file), "row_count": copied_rows})
             return
         async with compact_copy_semaphore:
             started_at = time.monotonic()
@@ -727,22 +915,29 @@ async def _parse_in_network_file_serving_only(
         ):
             if copy_path.exists() and copy_path.stat().st_size > 0:
                 await copy_func({"path": str(copy_path), "row_count": 0})
-        if manifest_copy_rows == 0:
+        if manifest_copy_rows == 0 and not defer_manifest_copy:
             manifest_copy_rows = await _estimated_table_rows(os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", manifest_stage_table)
         copy_completed = True
     finally:
         for task in compact_copy_tasks:
             task.cancel()
-        if copy_completed or not _env_bool(PTG2_KEEP_PARTIAL_ENV, False):
+        if (copy_completed and not defer_manifest_copy) or not _env_bool(PTG2_KEEP_PARTIAL_ENV, False):
             for copy_path in (
                 manifest_serving_copy_path,
                 manifest_price_atom_copy_path,
                 manifest_provider_group_member_copy_path,
             ):
                 try:
-                    copy_path.unlink(missing_ok=True)
+                    if not defer_manifest_copy or not copy_path.exists() or copy_path.stat().st_size == 0:
+                        copy_path.unlink(missing_ok=True)
                 except Exception:
                     logger.debug("Failed to remove PTG2 manifest copy file %s", copy_path, exc_info=True)
+                for worker_copy_path in copy_path.parent.glob(f"{copy_path.name}.worker*"):
+                    try:
+                        if worker_copy_path.exists() and worker_copy_path.stat().st_size == 0:
+                            worker_copy_path.unlink(missing_ok=True)
+                    except Exception:
+                        logger.debug("Failed to remove empty PTG2 manifest worker copy file %s", worker_copy_path, exc_info=True)
 
     await flush_error_log(import_log_cls)
     manifest_artifacts = {}
@@ -772,6 +967,8 @@ async def _parse_in_network_file_serving_only(
         "manifest": {
             "serving_rows": manifest_copy_rows,
             "sidecars": manifest_artifacts,
+            "copy_files": deferred_copy_files if defer_manifest_copy else {},
+            "precopy_merge_deferred": defer_manifest_copy,
         },
     }
     if rust_dedupe_summary:
@@ -2279,6 +2476,17 @@ async def main(
         await flush_error_log(classes["ImportLog"])
         data_seconds = time.monotonic() - data_started_monotonic
         publish_started_monotonic = time.monotonic()
+        manifest_merge_metrics: dict[str, Any] = {"enabled": False}
+        if _env_bool(PTG2_MANIFEST_PRECOPY_MERGE_ENV, True):
+            manifest_merge_metrics = await _merge_and_copy_ptg2_manifest_files(
+                successful_files=successful_files,
+                manifest_stage_table=ptg2_manifest_stage_table,
+            )
+            for file_summary in successful_files:
+                summary_payload = file_summary.get("summary") if isinstance(file_summary, dict) else None
+                manifest_payload = summary_payload.get("manifest") if isinstance(summary_payload, dict) else None
+                if isinstance(manifest_payload, dict):
+                    manifest_payload.pop("copy_files", None)
         manifest_artifacts: dict[str, Any] = {"sidecars": []}
         for file_summary in successful_files:
             summary_payload = file_summary.get("summary") if isinstance(file_summary, dict) else None
@@ -2303,6 +2511,7 @@ async def main(
             snapshot_id=snapshot_id,
             source_key=source_key_val,
             artifacts=manifest_artifacts,
+            db_dedupe_fallback=not bool(manifest_merge_metrics.get("enabled")),
         )
         ptg2_manifest_stage_table = None
         publish_seconds = time.monotonic() - publish_started_monotonic
@@ -2335,7 +2544,12 @@ async def main(
                     timing_payload[key] = float(value)
                 except (TypeError, ValueError):
                     continue
-        report_payload = {**failure_report, "serving_index": serving_index, "timings": timing_payload}
+        report_payload = {
+            **failure_report,
+            "serving_index": serving_index,
+            "timings": timing_payload,
+            "manifest_precopy_merge": manifest_merge_metrics,
+        }
         if isinstance(serving_index, dict):
             authoritative_rate_count = serving_index.get("serving_rates", serving_index.get("rate_count"))
             if authoritative_rate_count is not None:
