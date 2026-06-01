@@ -14,6 +14,11 @@ use ptg2_scanner::hashing::{
     make_checksum, semantic_hash, update_hash_optional_str, update_hash_string_list,
 };
 use ptg2_scanner::input::open_reader;
+use ptg2_scanner::manifest::{
+    normalized_sidecar_entries, price_set_global_id_from_atom_ids, procedure_global_id,
+    provider_set_global_id_from_entry_hashes, write_dense_member_sidecar, write_global_sidecar,
+    GlobalId128, SidecarEntry, GLOBAL_ID_BYTES,
+};
 use ptg2_scanner::normalize::{
     canonical_text_list, int_list, normalize_code, normalize_string, normalize_tin_type,
     normalize_tin_value, normalized_money_from_reader, normalized_scalar_from_reader,
@@ -21,21 +26,17 @@ use ptg2_scanner::normalize::{
 };
 use ptg2_scanner::output::{emit_json_record, emit_object};
 use ptg2_scanner::progress::emit_progress;
-use ptg2_scanner::manifest::{
-    normalized_sidecar_entries, price_set_global_id_from_atom_ids, procedure_global_id,
-    provider_set_global_id_from_entry_hashes, write_dense_member_sidecar, write_global_sidecar,
-    GlobalId128, SidecarEntry,
-};
 use serde_json::{json, Map, Value};
 use std::any::Any;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::env;
 use std::fmt::Display;
 use std::fs::File;
 use std::fs::OpenOptions;
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::panic::{self, AssertUnwindSafe};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, Mutex,
@@ -311,14 +312,22 @@ impl CopyPathConfig {
         Self {
             compact: env_path("HLTHPRT_PTG2_COMPACT_SERVING_COPY_PATH"),
             manifest_serving: env_path("HLTHPRT_PTG2_MANIFEST_SERVING_COPY_PATH"),
-            manifest_provider_forward_sidecar: env_path("HLTHPRT_PTG2_MANIFEST_PROVIDER_FORWARD_SIDECAR_PATH"),
+            manifest_provider_forward_sidecar: env_path(
+                "HLTHPRT_PTG2_MANIFEST_PROVIDER_FORWARD_SIDECAR_PATH",
+            ),
             manifest_provider_inverted_sidecar: env_path(
                 "HLTHPRT_PTG2_MANIFEST_PROVIDER_INVERTED_SIDECAR_PATH",
             ),
-            manifest_provider_npi_sidecar: env_path("HLTHPRT_PTG2_MANIFEST_PROVIDER_NPI_SIDECAR_PATH"),
-            manifest_price_forward_sidecar: env_path("HLTHPRT_PTG2_MANIFEST_PRICE_FORWARD_SIDECAR_PATH"),
+            manifest_provider_npi_sidecar: env_path(
+                "HLTHPRT_PTG2_MANIFEST_PROVIDER_NPI_SIDECAR_PATH",
+            ),
+            manifest_price_forward_sidecar: env_path(
+                "HLTHPRT_PTG2_MANIFEST_PRICE_FORWARD_SIDECAR_PATH",
+            ),
             manifest_price_atom: env_path("HLTHPRT_PTG2_MANIFEST_PRICE_ATOM_COPY_PATH"),
-            manifest_provider_group_member: env_path("HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_MEMBER_COPY_PATH"),
+            manifest_provider_group_member: env_path(
+                "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_MEMBER_COPY_PATH",
+            ),
             procedure: env_path("HLTHPRT_PTG2_PROCEDURE_COPY_PATH"),
             price_code_set: env_path("HLTHPRT_PTG2_PRICE_CODE_SET_COPY_PATH"),
             price_atom: env_path("HLTHPRT_PTG2_PRICE_ATOM_COPY_PATH"),
@@ -761,36 +770,289 @@ fn manifest_serving_identity_hex(
     }
 }
 
-#[derive(Default)]
+struct ManifestPairSpool {
+    path: PathBuf,
+    writer: BufWriter<File>,
+    row_count: u64,
+}
+
+impl ManifestPairSpool {
+    fn new(kind: &str) -> io::Result<Self> {
+        let base_dir = env::var_os("HLTHPRT_PTG2_MANIFEST_SPILL_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(env::temp_dir);
+        std::fs::create_dir_all(&base_dir)?;
+        let process_id = std::process::id();
+        for attempt in 0..1000u32 {
+            let path = base_dir.join(format!(
+                "ptg2_manifest_{kind}_{process_id}_{:?}_{attempt}.pairs",
+                thread::current().id()
+            ));
+            match OpenOptions::new().create_new(true).write(true).open(&path) {
+                Ok(file) => {
+                    return Ok(Self {
+                        path,
+                        writer: BufWriter::new(file),
+                        row_count: 0,
+                    });
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "unable to allocate PTG2 manifest spill file",
+        ))
+    }
+
+    fn push(&mut self, owner: GlobalId128, member: GlobalId128) -> io::Result<()> {
+        self.writer.write_all(&owner.0)?;
+        self.writer.write_all(&member.0)?;
+        self.row_count = self.row_count.saturating_add(1);
+        Ok(())
+    }
+
+    fn entries(&mut self) -> io::Result<Vec<SidecarEntry>> {
+        self.writer.flush()?;
+        let file = File::open(&self.path)?;
+        let mut reader = BufReader::new(file);
+        let mut pairs = Vec::with_capacity(self.row_count.min(usize::MAX as u64) as usize);
+        let mut buffer = [0u8; GLOBAL_ID_BYTES * 2];
+        loop {
+            match reader.read_exact(&mut buffer) {
+                Ok(()) => {
+                    let mut owner = [0u8; GLOBAL_ID_BYTES];
+                    owner.copy_from_slice(&buffer[..GLOBAL_ID_BYTES]);
+                    let mut member = [0u8; GLOBAL_ID_BYTES];
+                    member.copy_from_slice(&buffer[GLOBAL_ID_BYTES..]);
+                    pairs.push((GlobalId128(owner), vec![GlobalId128(member)]));
+                }
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(normalized_sidecar_entries(pairs))
+    }
+
+    fn write_standard_sidecar(&mut self, path: &str) -> io::Result<(u64, u64)> {
+        let pairs = self.sorted_unique_pairs()?;
+        let entry_count = count_pair_owners(&pairs);
+        let member_count = pairs.len() as u64;
+
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(path)?;
+        let mut writer = BufWriter::new(file);
+        writer.write_all(b"PTG2MNSC")?;
+        writer.write_all(&1u32.to_le_bytes())?;
+        writer.write_all(&entry_count.to_le_bytes())?;
+
+        let mut offset = 0u64;
+        let mut index = 0usize;
+        while index < pairs.len() {
+            let owner = &pairs[index][..GLOBAL_ID_BYTES];
+            let start = index;
+            index += 1;
+            while index < pairs.len() && &pairs[index][..GLOBAL_ID_BYTES] == owner {
+                index += 1;
+            }
+            let count = (index - start) as u32;
+            writer.write_all(owner)?;
+            writer.write_all(&offset.to_le_bytes())?;
+            writer.write_all(&count.to_le_bytes())?;
+            offset = offset.saturating_add(u64::from(count));
+        }
+        for pair in &pairs {
+            writer.write_all(&pair[GLOBAL_ID_BYTES..])?;
+        }
+        writer.flush()?;
+        Ok((entry_count, member_count))
+    }
+
+    fn write_dense_sidecar(&mut self, path: &str) -> io::Result<(u64, u64)> {
+        let pairs = self.sorted_unique_pairs()?;
+        let entry_count = count_pair_owners(&pairs);
+        let member_count = pairs.len() as u64;
+        let mut member_ids: Vec<[u8; GLOBAL_ID_BYTES]> = pairs
+            .iter()
+            .map(|pair| {
+                let mut member = [0u8; GLOBAL_ID_BYTES];
+                member.copy_from_slice(&pair[GLOBAL_ID_BYTES..]);
+                member
+            })
+            .collect();
+        member_ids.sort_unstable();
+        member_ids.dedup();
+
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(path)?;
+        let mut writer = BufWriter::new(file);
+        writer.write_all(b"PTG2MNDS")?;
+        writer.write_all(&1u32.to_le_bytes())?;
+        writer.write_all(&entry_count.to_le_bytes())?;
+        writer.write_all(&(member_ids.len() as u64).to_le_bytes())?;
+
+        let mut offset = 0u64;
+        let mut index = 0usize;
+        while index < pairs.len() {
+            let owner = &pairs[index][..GLOBAL_ID_BYTES];
+            let start = index;
+            index += 1;
+            while index < pairs.len() && &pairs[index][..GLOBAL_ID_BYTES] == owner {
+                index += 1;
+            }
+            let count = (index - start) as u32;
+            writer.write_all(owner)?;
+            writer.write_all(&offset.to_le_bytes())?;
+            writer.write_all(&count.to_le_bytes())?;
+            offset = offset.saturating_add(u64::from(count));
+        }
+        for member_id in &member_ids {
+            writer.write_all(member_id)?;
+        }
+        for pair in &pairs {
+            let mut member = [0u8; GLOBAL_ID_BYTES];
+            member.copy_from_slice(&pair[GLOBAL_ID_BYTES..]);
+            let local_id = member_ids.binary_search(&member).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "dense sidecar member is missing from local dictionary",
+                )
+            })? as u32;
+            writer.write_all(&local_id.to_le_bytes())?;
+        }
+        writer.flush()?;
+        Ok((entry_count, member_count))
+    }
+
+    fn sorted_unique_pairs(&mut self) -> io::Result<Vec<[u8; GLOBAL_ID_BYTES * 2]>> {
+        self.writer.flush()?;
+        let file = File::open(&self.path)?;
+        let mut reader = BufReader::new(file);
+        let mut pairs: Vec<[u8; GLOBAL_ID_BYTES * 2]> =
+            Vec::with_capacity(self.row_count.min(usize::MAX as u64) as usize);
+        loop {
+            let mut pair = [0u8; GLOBAL_ID_BYTES * 2];
+            match reader.read_exact(&mut pair) {
+                Ok(()) => pairs.push(pair),
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(error) => return Err(error),
+            }
+        }
+        pairs.sort_unstable();
+        pairs.dedup();
+        Ok(pairs)
+    }
+}
+
+fn count_pair_owners(pairs: &[[u8; GLOBAL_ID_BYTES * 2]]) -> u64 {
+    let mut entry_count = 0u64;
+    let mut previous_owner: Option<[u8; GLOBAL_ID_BYTES]> = None;
+    for pair in pairs {
+        let mut owner = [0u8; GLOBAL_ID_BYTES];
+        owner.copy_from_slice(&pair[..GLOBAL_ID_BYTES]);
+        if previous_owner != Some(owner) {
+            entry_count = entry_count.saturating_add(1);
+            previous_owner = Some(owner);
+        }
+    }
+    entry_count
+}
+
+impl Drop for ManifestPairSpool {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+struct ManifestSidecarSpools {
+    provider_forward: ManifestPairSpool,
+    provider_inverted: ManifestPairSpool,
+    provider_npi: ManifestPairSpool,
+    price_forward: ManifestPairSpool,
+}
+
+impl ManifestSidecarSpools {
+    fn new() -> io::Result<Self> {
+        Ok(Self {
+            provider_forward: ManifestPairSpool::new("provider_forward")?,
+            provider_inverted: ManifestPairSpool::new("provider_inverted")?,
+            provider_npi: ManifestPairSpool::new("provider_npi")?,
+            price_forward: ManifestPairSpool::new("price_forward")?,
+        })
+    }
+}
+
 struct ManifestSidecarCollector {
     provider_forward: BTreeMap<GlobalId128, Vec<GlobalId128>>,
     provider_inverted: BTreeMap<GlobalId128, Vec<GlobalId128>>,
     provider_npi: BTreeMap<GlobalId128, Vec<GlobalId128>>,
     price_forward: BTreeMap<GlobalId128, Vec<GlobalId128>>,
+    spools: Option<ManifestSidecarSpools>,
+}
+
+impl Default for ManifestSidecarCollector {
+    fn default() -> Self {
+        Self {
+            provider_forward: BTreeMap::new(),
+            provider_inverted: BTreeMap::new(),
+            provider_npi: BTreeMap::new(),
+            price_forward: BTreeMap::new(),
+            spools: None,
+        }
+    }
 }
 
 impl ManifestSidecarCollector {
+    fn for_import() -> io::Result<Self> {
+        if env_bool("HLTHPRT_PTG2_MANIFEST_SIDECAR_SPILL", true) {
+            Ok(Self {
+                spools: Some(ManifestSidecarSpools::new()?),
+                ..Self::default()
+            })
+        } else {
+            Ok(Self::default())
+        }
+    }
+
     fn record_provider_set(
         &mut self,
         provider_set_global_id: GlobalId128,
         provider_group_hashes: &[i64],
         provider_npis: &[i64],
-    ) {
+    ) -> io::Result<()> {
         let mut provider_group_ids: Vec<GlobalId128> = provider_group_hashes
             .iter()
             .map(|hash| provider_group_global_id_from_hash(*hash))
             .collect();
         provider_group_ids.sort_unstable();
         provider_group_ids.dedup();
-        self.provider_forward
-            .entry(provider_set_global_id)
-            .or_default()
-            .extend(provider_group_ids.iter().copied());
-        for provider_group_id in provider_group_ids {
-            self.provider_inverted
-                .entry(provider_group_id)
+        if let Some(spools) = self.spools.as_mut() {
+            for provider_group_id in provider_group_ids.iter().copied() {
+                spools
+                    .provider_forward
+                    .push(provider_set_global_id, provider_group_id)?;
+                spools
+                    .provider_inverted
+                    .push(provider_group_id, provider_set_global_id)?;
+            }
+        } else {
+            self.provider_forward
+                .entry(provider_set_global_id)
                 .or_default()
-                .push(provider_set_global_id);
+                .extend(provider_group_ids.iter().copied());
+            for provider_group_id in provider_group_ids {
+                self.provider_inverted
+                    .entry(provider_group_id)
+                    .or_default()
+                    .push(provider_set_global_id);
+            }
         }
         let provider_npi_ids = provider_npis
             .iter()
@@ -798,39 +1060,93 @@ impl ManifestSidecarCollector {
             .filter(|npi| *npi > 0)
             .map(npi_member_id)
             .collect::<Vec<_>>();
-        self.provider_npi
-            .entry(provider_set_global_id)
-            .or_default()
-            .extend(provider_npi_ids);
+        if let Some(spools) = self.spools.as_mut() {
+            for provider_npi_id in provider_npi_ids {
+                spools
+                    .provider_npi
+                    .push(provider_set_global_id, provider_npi_id)?;
+            }
+        } else {
+            self.provider_npi
+                .entry(provider_set_global_id)
+                .or_default()
+                .extend(provider_npi_ids);
+        }
+        Ok(())
     }
 
-    fn record_price_set(&mut self, price_set: &PriceSetLite) {
+    fn record_price_set(&mut self, price_set: &PriceSetLite) -> io::Result<()> {
         let price_set_global_id = price_set_global_id(price_set);
         let price_atom_ids = price_set
             .atoms
             .iter()
             .map(price_atom_global_id)
             .collect::<Vec<_>>();
-        self.price_forward
-            .entry(price_set_global_id)
-            .or_default()
-            .extend(price_atom_ids);
+        if let Some(spools) = self.spools.as_mut() {
+            for price_atom_id in price_atom_ids {
+                spools
+                    .price_forward
+                    .push(price_set_global_id, price_atom_id)?;
+            }
+        } else {
+            self.price_forward
+                .entry(price_set_global_id)
+                .or_default()
+                .extend(price_atom_ids);
+        }
+        Ok(())
     }
 
-    fn provider_forward_entries(&self) -> Vec<SidecarEntry> {
-        normalized_sidecar_entries(self.provider_forward.clone())
+    fn provider_forward_entries(&mut self) -> io::Result<Vec<SidecarEntry>> {
+        if let Some(spools) = self.spools.as_mut() {
+            return spools.provider_forward.entries();
+        }
+        Ok(normalized_sidecar_entries(self.provider_forward.clone()))
     }
 
-    fn provider_inverted_entries(&self) -> Vec<SidecarEntry> {
-        normalized_sidecar_entries(self.provider_inverted.clone())
+    fn provider_inverted_entries(&mut self) -> io::Result<Vec<SidecarEntry>> {
+        if let Some(spools) = self.spools.as_mut() {
+            return spools.provider_inverted.entries();
+        }
+        Ok(normalized_sidecar_entries(self.provider_inverted.clone()))
     }
 
-    fn provider_npi_entries(&self) -> Vec<SidecarEntry> {
-        normalized_sidecar_entries(self.provider_npi.clone())
+    fn provider_npi_entries(&mut self) -> io::Result<Vec<SidecarEntry>> {
+        if let Some(spools) = self.spools.as_mut() {
+            return spools.provider_npi.entries();
+        }
+        Ok(normalized_sidecar_entries(self.provider_npi.clone()))
     }
 
-    fn price_forward_entries(&self) -> Vec<SidecarEntry> {
-        normalized_sidecar_entries(self.price_forward.clone())
+    fn price_forward_entries(&mut self) -> io::Result<Vec<SidecarEntry>> {
+        if let Some(spools) = self.spools.as_mut() {
+            return spools.price_forward.entries();
+        }
+        Ok(normalized_sidecar_entries(self.price_forward.clone()))
+    }
+
+    fn write_spooled_standard_sidecar(
+        &mut self,
+        sidecar_name: &str,
+        path: &str,
+        dense_members: bool,
+    ) -> io::Result<Option<(u64, u64)>> {
+        let Some(spools) = self.spools.as_mut() else {
+            return Ok(None);
+        };
+        let spool = match sidecar_name {
+            "provider_forward" => &mut spools.provider_forward,
+            "provider_inverted" => &mut spools.provider_inverted,
+            "provider_npi" => &mut spools.provider_npi,
+            "price_forward" => &mut spools.price_forward,
+            _ => return Ok(None),
+        };
+        let metrics = if dense_members {
+            spool.write_dense_sidecar(path)?
+        } else {
+            spool.write_standard_sidecar(path)?
+        };
+        Ok(Some(metrics))
     }
 }
 
@@ -867,49 +1183,112 @@ fn emit_manifest_sidecar_file<W: Write>(
     )
 }
 
+fn emit_manifest_sidecar_path<W: Write>(
+    writer: &mut W,
+    record_kind: &str,
+    path: &str,
+    entry_count: u64,
+) -> io::Result<()> {
+    let bytes = std::fs::metadata(path)?.len();
+    emit_copy_file_event(
+        writer,
+        &CopyFileEvent {
+            record_kind: record_kind.to_string(),
+            path: path.to_string(),
+            bytes,
+            row_count: entry_count,
+            final_file: true,
+        },
+    )
+}
+
 fn emit_configured_manifest_sidecars<W: Write>(
     writer: &mut W,
     paths: &CopyPathConfig,
-    collector: Option<&ManifestSidecarCollector>,
+    collector: Option<&mut ManifestSidecarCollector>,
 ) -> io::Result<()> {
     let Some(collector) = collector else {
         return Ok(());
     };
     if let Some(path) = paths.manifest_provider_forward_sidecar.as_deref() {
-        emit_manifest_sidecar_file(
-            writer,
-            "manifest_provider_forward_sidecar_file",
-            path,
-            &collector.provider_forward_entries(),
-            true,
-        )?;
+        if let Some((entry_count, _member_count)) =
+            collector.write_spooled_standard_sidecar("provider_forward", path, true)?
+        {
+            emit_manifest_sidecar_path(
+                writer,
+                "manifest_provider_forward_sidecar_file",
+                path,
+                entry_count,
+            )?;
+        } else {
+            emit_manifest_sidecar_file(
+                writer,
+                "manifest_provider_forward_sidecar_file",
+                path,
+                &collector.provider_forward_entries()?,
+                true,
+            )?;
+        }
     }
     if let Some(path) = paths.manifest_provider_inverted_sidecar.as_deref() {
-        emit_manifest_sidecar_file(
-            writer,
-            "manifest_provider_inverted_sidecar_file",
-            path,
-            &collector.provider_inverted_entries(),
-            true,
-        )?;
+        if let Some((entry_count, _member_count)) =
+            collector.write_spooled_standard_sidecar("provider_inverted", path, true)?
+        {
+            emit_manifest_sidecar_path(
+                writer,
+                "manifest_provider_inverted_sidecar_file",
+                path,
+                entry_count,
+            )?;
+        } else {
+            emit_manifest_sidecar_file(
+                writer,
+                "manifest_provider_inverted_sidecar_file",
+                path,
+                &collector.provider_inverted_entries()?,
+                true,
+            )?;
+        }
     }
     if let Some(path) = paths.manifest_provider_npi_sidecar.as_deref() {
-        emit_manifest_sidecar_file(
-            writer,
-            "manifest_provider_npi_sidecar_file",
-            path,
-            &collector.provider_npi_entries(),
-            true,
-        )?;
+        if let Some((entry_count, _member_count)) =
+            collector.write_spooled_standard_sidecar("provider_npi", path, true)?
+        {
+            emit_manifest_sidecar_path(
+                writer,
+                "manifest_provider_npi_sidecar_file",
+                path,
+                entry_count,
+            )?;
+        } else {
+            emit_manifest_sidecar_file(
+                writer,
+                "manifest_provider_npi_sidecar_file",
+                path,
+                &collector.provider_npi_entries()?,
+                true,
+            )?;
+        }
     }
     if let Some(path) = paths.manifest_price_forward_sidecar.as_deref() {
-        emit_manifest_sidecar_file(
-            writer,
-            "manifest_price_forward_sidecar_file",
-            path,
-            &collector.price_forward_entries(),
-            false,
-        )?;
+        if let Some((entry_count, _member_count)) =
+            collector.write_spooled_standard_sidecar("price_forward", path, false)?
+        {
+            emit_manifest_sidecar_path(
+                writer,
+                "manifest_price_forward_sidecar_file",
+                path,
+                entry_count,
+            )?;
+        } else {
+            emit_manifest_sidecar_file(
+                writer,
+                "manifest_price_forward_sidecar_file",
+                path,
+                &collector.price_forward_entries()?,
+                false,
+            )?;
+        }
     }
     Ok(())
 }
@@ -2056,7 +2435,13 @@ fn process_compact_rate_lites<W: Write>(
         env_bool("HLTHPRT_PTG2_RUST_GROUP_NEGOTIATED_RATE_CHUNKS", false);
     let grouped: Vec<GroupedPriceSet> = if group_negotiated_rate_chunks {
         let mut by_price_set: BTreeMap<String, GroupedPriceSet> = BTreeMap::new();
-        for (price_set, provider_entry_hash, provider_group_hashes, provider_npis, provider_count) in parsed_rates
+        for (
+            price_set,
+            provider_entry_hash,
+            provider_group_hashes,
+            provider_npis,
+            provider_count,
+        ) in parsed_rates
         {
             let group = by_price_set
                 .entry(price_set.price_set_hash.clone())
@@ -2100,7 +2485,13 @@ fn process_compact_rate_lites<W: Write>(
         parsed_rates
             .into_iter()
             .map(
-                |(price_set, provider_entry_hash, mut provider_group_hashes, provider_npis, provider_count)| {
+                |(
+                    price_set,
+                    provider_entry_hash,
+                    mut provider_group_hashes,
+                    provider_npis,
+                    provider_count,
+                )| {
                     provider_group_hashes.sort_unstable();
                     provider_group_hashes.dedup();
                     let mut provider_entry_hashes = HashSet::new();
@@ -2170,7 +2561,7 @@ fn process_compact_rate_lites<W: Write>(
             .insert(group.price_set.price_set_hash.clone())
         {
             if let Some(sidecars) = outputs.manifest_sidecars.as_deref_mut() {
-                sidecars.record_price_set(&group.price_set);
+                sidecars.record_price_set(&group.price_set)?;
             }
             dictionary_copy_sinks.write_price_atoms(
                 &group.price_set.atoms,
@@ -2191,7 +2582,7 @@ fn process_compact_rate_lites<W: Write>(
                     provider_set_global_id,
                     &sorted_provider_hashes,
                     &sorted_provider_npis,
-                );
+                )?;
             }
             if !dictionary_copy_sinks.write_provider_set(
                 &provider_set_hash,
@@ -2284,9 +2675,10 @@ fn process_compact_rate_lites<W: Write>(
                 }),
             )?;
         }
-        if let (Some(copy_writer), Some(identity)) =
-            (manifest_serving_copy_writer.as_mut(), manifest_identity.as_ref())
-        {
+        if let (Some(copy_writer), Some(identity)) = (
+            manifest_serving_copy_writer.as_mut(),
+            manifest_identity.as_ref(),
+        ) {
             copy_writer.write_manifest_serving_row(&ManifestServingCopyRow {
                 serving_content_hash_128: &identity.serving_content_hash_128,
                 plan_id: &context.plan_id,
@@ -2425,7 +2817,13 @@ fn process_compact_rate_lites_worker<W: Write>(
         env_bool("HLTHPRT_PTG2_RUST_GROUP_NEGOTIATED_RATE_CHUNKS", false);
     let grouped: Vec<GroupedPriceSet> = if group_negotiated_rate_chunks {
         let mut by_price_set: BTreeMap<String, GroupedPriceSet> = BTreeMap::new();
-        for (price_set, provider_entry_hash, provider_group_hashes, provider_npis, provider_count) in parsed_rates
+        for (
+            price_set,
+            provider_entry_hash,
+            provider_group_hashes,
+            provider_npis,
+            provider_count,
+        ) in parsed_rates
         {
             let group = by_price_set
                 .entry(price_set.price_set_hash.clone())
@@ -2469,7 +2867,13 @@ fn process_compact_rate_lites_worker<W: Write>(
         parsed_rates
             .into_iter()
             .map(
-                |(price_set, provider_entry_hash, mut provider_group_hashes, provider_npis, provider_count)| {
+                |(
+                    price_set,
+                    provider_entry_hash,
+                    mut provider_group_hashes,
+                    provider_npis,
+                    provider_count,
+                )| {
                     provider_group_hashes.sort_unstable();
                     provider_group_hashes.dedup();
                     let mut provider_entry_hashes = HashSet::new();
@@ -2536,7 +2940,10 @@ fn process_compact_rate_lites_worker<W: Write>(
         });
         if dedupe.insert_price_set(&group.price_set.price_set_hash) {
             if let Some(sidecars) = manifest_sidecars {
-                sidecars.lock().unwrap().record_price_set(&group.price_set);
+                sidecars
+                    .lock()
+                    .unwrap()
+                    .record_price_set(&group.price_set)?;
             }
             dictionary_copy_sinks.write_price_atoms_shared(&group.price_set.atoms, dedupe)?;
             dictionary_copy_sinks.write_price_set_entries_shared(
@@ -2549,14 +2956,11 @@ fn process_compact_rate_lites_worker<W: Write>(
             if let Some(sidecars) = manifest_sidecars {
                 let provider_set_global_id =
                     provider_set_global_id_from_entry_hashes(&sorted_provider_entry_hashes);
-                sidecars
-                    .lock()
-                    .unwrap()
-                    .record_provider_set(
-                        provider_set_global_id,
-                        &sorted_provider_hashes,
-                        &sorted_provider_npis,
-                    );
+                sidecars.lock().unwrap().record_provider_set(
+                    provider_set_global_id,
+                    &sorted_provider_hashes,
+                    &sorted_provider_npis,
+                )?;
             }
             if !dictionary_copy_sinks.write_provider_set(
                 &provider_set_hash,
@@ -2650,9 +3054,10 @@ fn process_compact_rate_lites_worker<W: Write>(
                     }),
                 )?;
             }
-            if let (Some(copy_writer), Some(identity)) =
-                (manifest_serving_copy_writer.as_mut(), manifest_identity.as_ref())
-            {
+            if let (Some(copy_writer), Some(identity)) = (
+                manifest_serving_copy_writer.as_mut(),
+                manifest_identity.as_ref(),
+            ) {
                 copy_writer.write_manifest_serving_row(&ManifestServingCopyRow {
                     serving_content_hash_128: &identity.serving_content_hash_128,
                     plan_id: &context.plan_id,
@@ -3111,9 +3516,13 @@ fn scan_compact_struson_parallel(
     );
     let bounded_queue_size = queue_size.max(worker_count).max(1);
     let dedupe = Arc::new(SharedDedupe::new(worker_count));
-    let manifest_sidecars = copy_paths
-        .has_manifest_sidecar_paths()
-        .then(|| Arc::new(Mutex::new(ManifestSidecarCollector::default())));
+    let manifest_sidecars = if copy_paths.has_manifest_sidecar_paths() {
+        Some(Arc::new(
+            Mutex::new(ManifestSidecarCollector::for_import()?),
+        ))
+    } else {
+        None
+    };
     let event_queue_size = env_usize(
         "HLTHPRT_PTG2_RUST_EVENT_QUEUE",
         (bounded_queue_size * 2).max(worker_count),
@@ -3295,8 +3704,12 @@ fn scan_compact_struson_parallel(
                     emit_copy_file_event(&mut writer, &event)?;
                 }
                 if let Some(sidecars) = manifest_sidecars.as_ref() {
-                    let sidecars = sidecars.lock().unwrap();
-                    emit_configured_manifest_sidecars(&mut writer, &copy_paths, Some(&sidecars))?;
+                    let mut sidecars = sidecars.lock().unwrap();
+                    emit_configured_manifest_sidecars(
+                        &mut writer,
+                        &copy_paths,
+                        Some(&mut sidecars),
+                    )?;
                 }
                 emit_json_record(
                     &mut writer,
@@ -3405,19 +3818,22 @@ fn scan_compact_struson(path: &Path) -> io::Result<()> {
         )?),
         None => None,
     };
-    let mut manifest_serving_copy_writer: Option<CompactCopySink> = match copy_paths.manifest_serving.as_ref() {
-        Some(copy_path) => Some(CompactCopySink::new_named_file(
-            copy_path.clone(),
-            compact_copy_rotate_bytes,
-            "manifest_serving_copy_file",
-        )?),
-        None => None,
-    };
+    let mut manifest_serving_copy_writer: Option<CompactCopySink> =
+        match copy_paths.manifest_serving.as_ref() {
+            Some(copy_path) => Some(CompactCopySink::new_named_file(
+                copy_path.clone(),
+                compact_copy_rotate_bytes,
+                "manifest_serving_copy_file",
+            )?),
+            None => None,
+        };
     let mut dictionary_copy_sinks =
         DictionaryCopySinks::from_paths(&copy_paths, compact_copy_rotate_bytes)?;
-    let mut manifest_sidecars = copy_paths
-        .has_manifest_sidecar_paths()
-        .then(ManifestSidecarCollector::default);
+    let mut manifest_sidecars = if copy_paths.has_manifest_sidecar_paths() {
+        Some(ManifestSidecarCollector::for_import()?)
+    } else {
+        None
+    };
     let progress_bytes_interval = progress_interval(
         "HLTHPRT_PTG2_SCANNER_PROGRESS_BYTES",
         DEFAULT_PROGRESS_BYTES,
@@ -3557,7 +3973,7 @@ fn scan_compact_struson(path: &Path) -> io::Result<()> {
         copy_writer.finish(&mut writer)?;
     }
     dictionary_copy_sinks.finish(&mut writer)?;
-    emit_configured_manifest_sidecars(&mut writer, &copy_paths, manifest_sidecars.as_ref())?;
+    emit_configured_manifest_sidecars(&mut writer, &copy_paths, manifest_sidecars.as_mut())?;
     writer.flush()?;
     emit_progress(
         path,
@@ -3572,6 +3988,241 @@ fn scan_compact_struson(path: &Path) -> io::Result<()> {
 
 fn scan_compact(path: &Path) -> io::Result<()> {
     scan_compact_struson(path)
+}
+
+fn manifest_copy_key(kind: &str, line: &[u8]) -> Vec<u8> {
+    match kind {
+        "provider_group_member" => {
+            let mut tabs_seen = 0;
+            for (index, byte) in line.iter().enumerate() {
+                if *byte == b'\t' {
+                    tabs_seen += 1;
+                    if tabs_seen == 2 {
+                        return line[..index].to_vec();
+                    }
+                }
+            }
+            line.strip_suffix(b"\n").unwrap_or(line).to_vec()
+        }
+        _ => {
+            let end = line
+                .iter()
+                .position(|byte| *byte == b'\t' || *byte == b'\n')
+                .unwrap_or(line.len());
+            line[..end].to_vec()
+        }
+    }
+}
+
+fn manifest_serving_trace_is_null(line: &[u8]) -> bool {
+    let mut column = 0usize;
+    let mut start = 0usize;
+    for (index, byte) in line.iter().enumerate() {
+        if *byte == b'\t' || *byte == b'\n' {
+            if column == 8 {
+                return &line[start..index] == b"\\N";
+            }
+            column += 1;
+            start = index + 1;
+        }
+    }
+    column <= 8
+}
+
+fn manifest_prefer_row(kind: &str, current: Vec<u8>, candidate: Vec<u8>) -> Vec<u8> {
+    if kind == "manifest_serving"
+        && manifest_serving_trace_is_null(&current)
+        && !manifest_serving_trace_is_null(&candidate)
+    {
+        return candidate;
+    }
+    current
+}
+
+struct ManifestChunkRow {
+    key: Vec<u8>,
+    line: Vec<u8>,
+}
+
+fn manifest_sort_chunk(
+    kind: &str,
+    rows: Vec<Vec<u8>>,
+    chunk_index: usize,
+    temp_dir: &Path,
+) -> io::Result<PathBuf> {
+    let mut keyed_rows: Vec<ManifestChunkRow> = rows
+        .into_iter()
+        .map(|line| ManifestChunkRow {
+            key: manifest_copy_key(kind, &line),
+            line,
+        })
+        .collect();
+    keyed_rows.sort_unstable_by(|left, right| {
+        left.key
+            .cmp(&right.key)
+            .then_with(|| left.line.cmp(&right.line))
+    });
+    let path = temp_dir.join(format!(
+        "ptg2_manifest_merge_{}_{}_{}.chunk",
+        kind,
+        std::process::id(),
+        chunk_index
+    ));
+    let mut writer = BufWriter::new(File::create(&path)?);
+    for row in keyed_rows {
+        writer.write_all(&row.line)?;
+    }
+    writer.flush()?;
+    Ok(path)
+}
+
+#[derive(Eq)]
+struct ManifestMergeItem {
+    key: Vec<u8>,
+    line: Vec<u8>,
+    reader_index: usize,
+}
+
+impl Ord for ManifestMergeItem {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        other
+            .key
+            .cmp(&self.key)
+            .then_with(|| other.line.cmp(&self.line))
+            .then_with(|| other.reader_index.cmp(&self.reader_index))
+    }
+}
+
+impl PartialOrd for ManifestMergeItem {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for ManifestMergeItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key && self.line == other.line && self.reader_index == other.reader_index
+    }
+}
+
+fn manifest_merge_read_next(
+    kind: &str,
+    reader_index: usize,
+    readers: &mut [BufReader<File>],
+    heap: &mut BinaryHeap<ManifestMergeItem>,
+) -> io::Result<()> {
+    let mut line = Vec::new();
+    let bytes = readers[reader_index].read_until(b'\n', &mut line)?;
+    if bytes > 0 {
+        heap.push(ManifestMergeItem {
+            key: manifest_copy_key(kind, &line),
+            line,
+            reader_index,
+        });
+    }
+    Ok(())
+}
+
+fn merge_manifest_copy_files(
+    kind: &str,
+    output_path: &Path,
+    input_paths: &[String],
+) -> io::Result<()> {
+    let temp_dir = env::var_os("HLTHPRT_PTG2_MANIFEST_MERGE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(env::temp_dir);
+    std::fs::create_dir_all(&temp_dir)?;
+    let chunk_max_bytes =
+        env_usize("HLTHPRT_PTG2_MANIFEST_MERGE_CHUNK_BYTES", 512 * 1024 * 1024).max(1024 * 1024);
+    let mut chunk_paths = Vec::new();
+    let mut chunk_rows: Vec<Vec<u8>> = Vec::new();
+    let mut chunk_bytes = 0usize;
+    let mut input_rows = 0u64;
+    for raw_path in input_paths {
+        let file = match File::open(raw_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let mut reader = BufReader::new(file);
+        loop {
+            let mut line = Vec::new();
+            let bytes = reader.read_until(b'\n', &mut line)?;
+            if bytes == 0 {
+                break;
+            }
+            chunk_bytes = chunk_bytes.saturating_add(bytes);
+            input_rows = input_rows.saturating_add(1);
+            chunk_rows.push(line);
+            if chunk_bytes >= chunk_max_bytes {
+                let rows = std::mem::take(&mut chunk_rows);
+                chunk_paths.push(manifest_sort_chunk(
+                    kind,
+                    rows,
+                    chunk_paths.len(),
+                    &temp_dir,
+                )?);
+                chunk_bytes = 0;
+            }
+        }
+    }
+    if !chunk_rows.is_empty() {
+        let rows = std::mem::take(&mut chunk_rows);
+        chunk_paths.push(manifest_sort_chunk(
+            kind,
+            rows,
+            chunk_paths.len(),
+            &temp_dir,
+        )?);
+    }
+    let mut output = BufWriter::new(File::create(output_path)?);
+    let mut output_rows = 0u64;
+    if !chunk_paths.is_empty() {
+        let mut readers = Vec::with_capacity(chunk_paths.len());
+        for chunk_path in &chunk_paths {
+            readers.push(BufReader::new(File::open(chunk_path)?));
+        }
+        let mut heap = BinaryHeap::new();
+        for reader_index in 0..readers.len() {
+            manifest_merge_read_next(kind, reader_index, &mut readers, &mut heap)?;
+        }
+        let mut current_key: Option<Vec<u8>> = None;
+        let mut selected_line: Option<Vec<u8>> = None;
+        while let Some(item) = heap.pop() {
+            if current_key.as_ref() != Some(&item.key) {
+                if let Some(line) = selected_line.take() {
+                    output.write_all(&line)?;
+                    output_rows = output_rows.saturating_add(1);
+                }
+                current_key = Some(item.key.clone());
+                selected_line = Some(item.line);
+            } else if let Some(line) = selected_line.take() {
+                selected_line = Some(manifest_prefer_row(kind, line, item.line));
+            }
+            manifest_merge_read_next(kind, item.reader_index, &mut readers, &mut heap)?;
+        }
+        if let Some(line) = selected_line.take() {
+            output.write_all(&line)?;
+            output_rows = output_rows.saturating_add(1);
+        }
+    }
+    output.flush()?;
+    for chunk_path in &chunk_paths {
+        let _ = std::fs::remove_file(chunk_path);
+    }
+    emit_json_record(
+        &mut io::stdout().lock(),
+        "manifest_copy_merge_summary",
+        &json!({
+            "kind": kind,
+            "input_files": input_paths.len(),
+            "input_rows": input_rows,
+            "output_rows": output_rows,
+            "dropped_rows": input_rows.saturating_sub(output_rows),
+            "output_path": output_path.display().to_string(),
+        }),
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3620,22 +4271,75 @@ mod tests {
         let provider_set_id = GlobalId128([5; GLOBAL_ID_BYTES]);
         let mut collector = ManifestSidecarCollector::default();
 
-        collector.record_provider_set(provider_set_id, &[20, 10, 20], &[1003002106, 1003007311]);
+        collector
+            .record_provider_set(provider_set_id, &[20, 10, 20], &[1003002106, 1003007311])
+            .unwrap();
 
-        let entries = collector.provider_forward_entries();
+        let entries = collector.provider_forward_entries().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].owner, provider_set_id);
         assert_eq!(entries[0].members.len(), 2);
         assert!(entries[0].members[0] < entries[0].members[1]);
-        let inverted = collector.provider_inverted_entries();
+        let inverted = collector.provider_inverted_entries().unwrap();
         assert_eq!(inverted.len(), 2);
         assert!(inverted
             .iter()
             .all(|entry| entry.members == vec![provider_set_id]));
-        let provider_npi = collector.provider_npi_entries();
+        let provider_npi = collector.provider_npi_entries().unwrap();
         assert_eq!(provider_npi.len(), 1);
         assert_eq!(provider_npi[0].owner, provider_set_id);
         assert_eq!(provider_npi[0].members.len(), 2);
+    }
+
+    #[test]
+    fn manifest_sidecar_collector_can_spill_members_before_sidecar_write() {
+        let provider_set_id = GlobalId128([5; GLOBAL_ID_BYTES]);
+        let mut collector = ManifestSidecarCollector {
+            spools: Some(ManifestSidecarSpools::new().unwrap()),
+            ..ManifestSidecarCollector::default()
+        };
+
+        collector
+            .record_provider_set(provider_set_id, &[20, 10, 20], &[1003002106, 1003007311])
+            .unwrap();
+
+        assert!(collector.provider_forward.is_empty());
+        assert!(collector.provider_inverted.is_empty());
+        assert!(collector.provider_npi.is_empty());
+        let entries = collector.provider_forward_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].owner, provider_set_id);
+        assert_eq!(entries[0].members.len(), 2);
+        let inverted = collector.provider_inverted_entries().unwrap();
+        assert_eq!(inverted.len(), 2);
+        assert!(inverted
+            .iter()
+            .all(|entry| entry.members == vec![provider_set_id]));
+    }
+
+    #[test]
+    fn manifest_copy_merge_dedupes_by_kind_key() {
+        let base = std::env::temp_dir().join(format!("ptg2-merge-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&base);
+        let input_a = base.join("a.copy");
+        let input_b = base.join("b.copy");
+        let output = base.join("out.copy");
+        std::fs::write(&input_a, b"b\t2\nmanifest\t1\t2\t3\t4\t5\t6\t7\t\\N\n").unwrap();
+        std::fs::write(&input_b, b"a\t1\nmanifest\t1\t2\t3\t4\t5\t6\t7\ttrace\n").unwrap();
+
+        merge_manifest_copy_files(
+            "manifest_serving",
+            &output,
+            &[
+                input_a.to_string_lossy().to_string(),
+                input_b.to_string_lossy().to_string(),
+            ],
+        )
+        .unwrap();
+
+        let merged = std::fs::read_to_string(&output).unwrap();
+        assert_eq!(merged, "a\t1\nb\t2\nmanifest\t1\t2\t3\t4\t5\t6\t7\ttrace\n");
+        let _ = std::fs::remove_dir_all(base);
     }
 }
 
@@ -3655,6 +4359,31 @@ fn main() -> io::Result<()> {
             )
         })?;
         return scan_compact(Path::new(&compact_path));
+    }
+    if first_arg == "--merge-manifest-copy" {
+        let kind = args.next().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "usage: ptg2_scanner --merge-manifest-copy <kind> <output_path> <input_path>...",
+            )
+        })?;
+        if !matches!(
+            kind.as_str(),
+            "manifest_serving" | "price_atom" | "provider_group_member"
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "manifest copy merge kind must be manifest_serving, price_atom, or provider_group_member",
+            ));
+        }
+        let output_path = args.next().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "usage: ptg2_scanner --merge-manifest-copy <kind> <output_path> <input_path>...",
+            )
+        })?;
+        let input_paths: Vec<String> = args.collect();
+        return merge_manifest_copy_files(&kind, Path::new(&output_path), &input_paths);
     }
     let arrays: Vec<String> = args.collect();
     if arrays.is_empty() {

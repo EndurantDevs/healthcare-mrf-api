@@ -257,8 +257,7 @@ def _price_component(modifiers: list[str]) -> str:
     return "modifier"
 
 
-def _summarize_price_payload(prices: Any) -> list[dict[str, Any]]:
-    normalized_prices = _normalize_price_payload(prices)
+def _summarize_normalized_price_payload(normalized_prices: list[dict[str, Any]]) -> list[dict[str, Any]]:
     grouped: dict[tuple[Any, ...], dict[str, Any]] = {}
     for price in normalized_prices:
         modifiers = sorted({modifier.upper() for modifier in _normalize_string_list(price.get("billing_code_modifier"))})
@@ -301,10 +300,14 @@ def _summarize_price_payload(prices: Any) -> list[dict[str, Any]]:
     )
 
 
+def _summarize_price_payload(prices: Any) -> list[dict[str, Any]]:
+    return _summarize_normalized_price_payload(_normalize_price_payload(prices))
+
+
 def _price_response_fields(prices: Any) -> dict[str, list[dict[str, Any]]]:
     normalized = _normalize_price_payload(prices)
     return {
         "prices": normalized,
         "tic_prices": normalized,
-        "price_summary": _summarize_price_payload(normalized),
+        "price_summary": _summarize_normalized_price_payload(normalized),
     }
