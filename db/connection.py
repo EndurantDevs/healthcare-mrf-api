@@ -313,6 +313,10 @@ class Database:
             await self.connect()
         assert self.engine is not None
         async with self.engine.begin() as connection:
+            if table.schema:
+                preparer = connection.dialect.identifier_preparer
+                schema_name = preparer.quote_schema(table.schema)
+                await connection.exec_driver_sql(f"CREATE SCHEMA IF NOT EXISTS {schema_name}")
             await connection.run_sync(table.create, **kwargs)
 
     async def disconnect(self) -> None:

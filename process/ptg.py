@@ -331,6 +331,11 @@ from process.ptg_parts.progress import (
     _maybe_log_artifact_progress,
     _utcnow,
 )
+from process.ptg_parts.live_progress import (
+    reset_live_progress_context,
+    set_live_progress_context,
+    write_live_progress,
+)
 from process.ptg_parts.row_helpers import (
     _as_int_list,
     _as_list,
@@ -379,6 +384,7 @@ from process.ptg_parts.ptg2_manifest_publish import (
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2_MANIFEST_DENSE_MEMBERSHIP_FORMAT, PTG2_MANIFEST_MEMBERSHIP_FORMAT
 from process.ptg_parts.serving_rows import (
     _provider_group_member_rows,
+    _provider_set_component_rows,
     _ptg2_compact_serving_rate_row,
     _ptg2_hp_procedure_code,
     _ptg2_serving_rate_row,
@@ -387,6 +393,7 @@ from process.ptg_parts.serving_maintenance import (
     _build_ptg2_provider_locations,
     _copy_simple_rows,
     _count_compact_serving_rate_rows,
+    _merge_staged_price_sets,
     _merge_staged_serving_rates,
 )
 from process.ptg_parts.serving_index import (
@@ -2157,6 +2164,7 @@ async def main(
     file_url_contains: list[str] | None = None,
     reuse_raw_artifacts: bool = True,
     keep_partial_artifacts: bool | None = None,
+    control_run_id: str | None = None,
 ) -> None:
     """
     PTG2 entry point for the Transparency in Coverage importer.
@@ -2167,6 +2175,13 @@ async def main(
     source_key_val = _normalize_source_key(source_key or os.getenv("HLTHPRT_PTG2_SOURCE_KEY"))
     import_run_id = f"ptg2:{import_id_val}"
     snapshot_id = f"ptg2:{import_month_value.strftime('%Y%m')}:{hash_prefix(semantic_hash(import_run_id), 12)}"
+    live_run_id = str(control_run_id or "").strip()
+    live_token = set_live_progress_context(
+        run_id=live_run_id,
+        source_key=source_key_val,
+        snapshot_id=snapshot_id,
+        import_run_id=import_run_id,
+    )
     max_bytes = None
     if test_mode:
         raw_max_bytes = os.getenv("HLTHPRT_PTG2_TEST_MAX_BYTES")
@@ -2175,6 +2190,7 @@ async def main(
                 max_bytes = int(raw_max_bytes)
             except ValueError:
                 logger.warning("Ignoring invalid HLTHPRT_PTG2_TEST_MAX_BYTES=%s", raw_max_bytes)
+    write_live_progress(phase="initializing", pct=1, message="initializing PTG import")
     await ensure_database(test_mode)
     await ensure_ptg2_tables()
     compact_import = True
@@ -2249,6 +2265,7 @@ async def main(
     current_pointer_published = False
     try:
         assert source_key_val is not None
+        write_live_progress(phase="planning", pct=3, message="planning PTG files")
         stage_token = _ptg2_snapshot_table_token(source_key_val, snapshot_id)
         ptg2_manifest_stage_table = await _create_ptg2_manifest_serving_stage_table(stage_token)
         classes = await _prepare_ptg_tables(import_id_val, test_mode)
@@ -2359,6 +2376,14 @@ async def main(
                 selected_jobs.append(job)
         processed_files = 0
         attempted_files = len(selected_jobs)
+        write_live_progress(
+            phase="download",
+            unit="files",
+            done=0,
+            total=attempted_files,
+            pct=5 if attempted_files else 20,
+            message=f"downloading {attempted_files} PTG file(s)",
+        )
         failed_files: list[dict[str, Any]] = []
         skipped_files: list[dict[str, Any]] = []
         successful_files: list[dict[str, Any]] = []
@@ -2444,6 +2469,15 @@ async def main(
                 else:
                     processed_files += 1
                     successful_files.append(asdict(result))
+                    if attempted_files:
+                        write_live_progress(
+                            phase="processing files",
+                            unit="files",
+                            done=processed_files,
+                            total=attempted_files,
+                            pct=min(90.0, 20.0 + (processed_files / attempted_files) * 70.0),
+                            message=f"processed {processed_files} of {attempted_files} PTG file(s)",
+                        )
             else:
                 failed_files.append(asdict(result))
 
@@ -2476,6 +2510,7 @@ async def main(
         await flush_error_log(classes["ImportLog"])
         data_seconds = time.monotonic() - data_started_monotonic
         publish_started_monotonic = time.monotonic()
+        write_live_progress(phase="publishing", pct=92, message="publishing PTG snapshot")
         manifest_merge_metrics: dict[str, Any] = {"enabled": False}
         if _env_bool(PTG2_MANIFEST_PRECOPY_MERGE_ENV, True):
             manifest_merge_metrics = await _merge_and_copy_ptg2_manifest_files(
@@ -2632,7 +2667,24 @@ async def main(
         )
         _emit_screen_line(done_line)
         logger.info(done_line)
+        write_live_progress(
+            status="succeeded",
+            phase="succeeded",
+            unit="files",
+            done=processed_files,
+            total=attempted_files,
+            pct=100,
+            eta_seconds=0,
+            message="PTG import succeeded",
+        )
     except Exception as exc:
+        write_live_progress(
+            status="failed",
+            phase="failed",
+            pct=100,
+            eta_seconds=0,
+            message=f"PTG import failed: {exc}",
+        )
         if source_scoped_compact and not current_pointer_published:
             serving_index = failure_report.get("serving_index")
             try:
@@ -2657,6 +2709,8 @@ async def main(
             options=options_payload,
         )
         raise
+    finally:
+        reset_live_progress_context(live_token)
 
 
 __all__ = [

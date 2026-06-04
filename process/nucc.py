@@ -13,9 +13,12 @@ from arq import create_pool
 
 from db.connection import init_db
 from db.models import NUCCTaxonomy, db
+from process.control_cancel import raise_if_cancelled
+from process.control_lifecycle import mark_control_run
 from process.ext.utils import (download_it, download_it_and_save,
                                ensure_database, make_class, print_time_info,
                                push_objects, return_checksum)
+from process.live_progress import enqueue_live_progress
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
 
@@ -32,17 +35,43 @@ def is_test_mode(ctx: dict) -> bool:
 
 async def process_data(ctx, task=None):
     task = task or {}
+    await raise_if_cancelled(ctx, task)
     import_date = ctx['import_date']
     ctx.setdefault('context', {})
-    test_mode = bool(task.get('test_mode', ctx['context'].get('test_mode', False)))
-    ctx['context']['test_mode'] = test_mode
+    context = ctx['context']
+    run_id = str(context.get("control_run_id") or ctx.get("control_run_id") or "").strip()
+    test_mode = bool(task.get('test_mode', context.get('test_mode', False)))
+    context['test_mode'] = test_mode
     await ensure_database(test_mode)
     html_source = await download_it(
         os.environ['HLTHPRT_NUCC_DOWNLOAD_URL_DIR'] + os.environ['HLTHPRT_NUCC_DOWNLOAD_URL_FILE'])
 
-    for file_index, p in enumerate(re.findall(r'\"(.*?nucc_taxonomy.*?\.csv)\"', html_source)):
-        if test_mode and file_index >= TEST_NUCC_MAX_FILES:
-            break
+    source_files = re.findall(r'\"(.*?nucc_taxonomy.*?\.csv)\"', html_source)
+    selected_files = source_files[:TEST_NUCC_MAX_FILES] if test_mode else source_files
+    if run_id:
+        enqueue_live_progress(
+            run_id=run_id,
+            importer="nucc",
+            status="running",
+            phase="nucc sources discovered",
+            unit="files",
+            done=0,
+            total=len(selected_files),
+            message=f"{len(selected_files)} source files discovered",
+        )
+    for file_index, p in enumerate(selected_files):
+        if run_id:
+            enqueue_live_progress(
+                run_id=run_id,
+                importer="nucc",
+                status="running",
+                phase="nucc downloading source",
+                unit="files",
+                done=file_index,
+                total=len(selected_files),
+                message=f"downloading file {file_index + 1}/{len(selected_files)}",
+                label=p,
+            )
         with tempfile.TemporaryDirectory() as tmpdirname:
             print(f"Found: {p}")
             file_name = p.split('/')[-1]
@@ -73,6 +102,19 @@ async def process_data(ctx, task=None):
                         break
                     if not count % 100_000:
                         print(f"Processed: {count}")
+                        await raise_if_cancelled(ctx, task)
+                    if run_id and count and count % (100 if test_mode else 100_000) == 0:
+                        enqueue_live_progress(
+                            run_id=run_id,
+                            importer="nucc",
+                            status="running",
+                            phase="nucc parsing rows",
+                            unit="rows",
+                            done=count,
+                            total=TEST_NUCC_ROWS if test_mode else None,
+                            message=f"parsed {count} rows",
+                            label=p,
+                        )
                     obj = {}
                     for key, mapped_key in csv_map.items():
                         t = row[key]
@@ -83,12 +125,28 @@ async def process_data(ctx, task=None):
                     obj['int_code'] = return_checksum([obj['code'],], crc=32)
                     row_list.append(obj)
                     if count % 9999 == 0:
+                        await raise_if_cancelled(ctx, task)
                         await push_objects(row_list, nucc_taxonomy_cls)
                         row_list.clear()
 
 
+            await raise_if_cancelled(ctx, task)
             await push_objects(row_list, nucc_taxonomy_cls)
             print(f"Processed: {count}")
+            context["run"] = context.get("run", 0) + 1
+            context["rows"] = count
+            if run_id:
+                enqueue_live_progress(
+                    run_id=run_id,
+                    importer="nucc",
+                    status="running",
+                    phase="nucc source processed",
+                    unit="files",
+                    done=file_index + 1,
+                    total=len(selected_files),
+                    message=f"processed file {file_index + 1}/{len(selected_files)}",
+                    label=p,
+                )
         return 1
 
 
@@ -121,14 +179,19 @@ async def startup(ctx):
 
 async def shutdown(ctx):
     import_date = ctx['import_date']
-    await ensure_database(bool(ctx.get("context", {}).get("test_mode")))
+    context = ctx.get("context") or {}
+    run_id = str(context.get("control_run_id") or ctx.get("control_run_id") or "").strip()
+    await ensure_database(bool(context.get("test_mode")))
     db_schema = os.getenv('HLTHPRT_DB_SCHEMA') if os.getenv('HLTHPRT_DB_SCHEMA') else 'mrf'
     tables = {}
+    stage_rows = 0
     async with db.transaction():
         for cls in (NUCCTaxonomy, ):
             tables[cls.__main_table__] = make_class(cls, import_date)
             obj = tables[cls.__main_table__]
             table = obj.__main_table__
+            if run_id:
+                stage_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{obj.__tablename__};") or 0)
             await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
             await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{table} RENAME TO {table}_old;")
             await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{obj.__tablename__} RENAME TO {table};")
@@ -141,6 +204,21 @@ async def shutdown(ctx):
                             f"{db_schema}.{obj.__tablename__}_idx_primary RENAME TO "
                             f"{table}_idx_primary;")
 
+    await mark_control_run(
+        run_id,
+        status="succeeded",
+        phase_detail="nucc published",
+        progress_message="succeeded",
+        progress={
+            "unit": "rows",
+            "done": stage_rows,
+            "total": stage_rows,
+            "pct": 100,
+            "message": "succeeded",
+            "phase": "nucc published",
+        },
+        metrics={"rows": stage_rows},
+    )
     print_time_info(ctx['context']['start'])
 
 

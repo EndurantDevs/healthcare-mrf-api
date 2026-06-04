@@ -14,10 +14,12 @@ except ImportError:
 
 from process.attributes import main as initiate_plan_attributes
 from process.attributes import (process_attributes, process_benefits,
+                                plan_attributes_control_start,
                                 process_prices, process_state_attributes,
                                 save_attributes)
 from process.attributes import shutdown as attr_shutdown
 from process.attributes import startup as attr_startup
+from process.control_lifecycle import control_single_job_start
 from process.ext.utils import db_startup
 from process.geo_census_import import geo_census_lookup
 from process.geo_import import geo_lookup
@@ -38,6 +40,7 @@ from process.nucc import process_data as process_nucc_data
 from process.nucc import shutdown as nucc_shutdown
 from process.nucc import startup as nucc_startup
 from process.ptg import main as initiate_ptg
+from process.ptg_control import ptg_control_start
 from process.claims_pricing import (claims_pricing_finalize,
                                     claims_pricing_process_chunk,
                                     claims_pricing_start,
@@ -122,6 +125,19 @@ class MRF:
     job_deserializer = deserialize_job
 
 
+class PTG:  # pylint: disable=too-few-public-methods
+    functions = [ptg_control_start]
+    on_startup = db_startup
+    max_jobs = int(os.environ.get("HLTHPRT_MAX_PTG_JOBS")) if os.environ.get("HLTHPRT_MAX_PTG_JOBS") else 1
+    queue_read_limit = max_jobs
+    job_timeout = int(os.environ.get("HLTHPRT_PTG_JOB_TIMEOUT")) if os.environ.get("HLTHPRT_PTG_JOB_TIMEOUT") else 172800
+    burst = True
+    queue_name = "arq:PTG"
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
 class MRF_start:  # pylint: disable=invalid-name
     functions = [init_file]
     on_startup = initial_startup
@@ -149,7 +165,15 @@ class MRF_finish:  # pylint: disable=invalid-name
 
 
 class Attributes:
-    functions = [process_attributes, process_state_attributes, process_prices, process_benefits, save_attributes]
+    functions = [
+        process_attributes,
+        process_state_attributes,
+        process_prices,
+        process_benefits,
+        save_attributes,
+        control_single_job_start,
+        plan_attributes_control_start,
+    ]
     on_startup = attr_startup
     on_shutdown = attr_shutdown
     max_jobs = 20
@@ -161,8 +185,60 @@ class Attributes:
     job_deserializer = deserialize_job
 
 
+class CodeSets:
+    functions = [control_single_job_start]
+    on_startup = db_startup
+    max_jobs = 1
+    queue_read_limit = 2
+    queue_name = "arq:CodeSets"
+    job_timeout = 3600
+    burst = True
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
+class ClinicalReference:
+    functions = [control_single_job_start]
+    on_startup = db_startup
+    max_jobs = 1
+    queue_read_limit = 2
+    queue_name = "arq:ClinicalReference"
+    job_timeout = 86400
+    burst = True
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
+class Geo:
+    functions = [control_single_job_start]
+    on_startup = db_startup
+    max_jobs = 1
+    queue_read_limit = 2
+    queue_name = "arq:Geo"
+    job_timeout = 3600
+    burst = True
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
+class GeoCensus:
+    functions = [control_single_job_start]
+    on_startup = db_startup
+    max_jobs = 1
+    queue_read_limit = 2
+    queue_name = "arq:GeoCensus"
+    job_timeout = 3600
+    burst = True
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
 class NPI:
-    functions = [process_npi_data, save_npi_data, process_npi_chunk]
+    functions = [process_npi_data, save_npi_data, process_npi_chunk, control_single_job_start]
     on_startup = npi_startup
     on_shutdown = npi_shutdown
     max_jobs = 20
@@ -188,7 +264,7 @@ class NPI_finish:  # pylint: disable=invalid-name
 
 
 class NUCC:
-    functions = [process_nucc_data]
+    functions = [process_nucc_data, control_single_job_start]
     on_startup = nucc_startup
     on_shutdown = nucc_shutdown
     max_jobs = 20
@@ -311,7 +387,7 @@ class ProviderQuality_finish:  # pylint: disable=invalid-name
 
 
 class ProviderEnrichment:
-    functions = [process_provider_enrichment_data, save_provider_enrichment_data]
+    functions = [process_provider_enrichment_data, save_provider_enrichment_data, control_single_job_start]
     on_startup = provider_enrichment_startup
     on_shutdown = provider_enrichment_shutdown
     max_jobs = int(os.environ.get('HLTHPRT_MAX_PROVIDER_ENRICHMENT_JOBS')) if os.environ.get('HLTHPRT_MAX_PROVIDER_ENRICHMENT_JOBS') else 20
@@ -387,7 +463,7 @@ class PharmacyLicense_finish:  # pylint: disable=invalid-name
 
 
 class PlacesZcta:
-    functions = [process_places_zcta_data]
+    functions = [process_places_zcta_data, control_single_job_start]
     on_startup = places_zcta_startup
     on_shutdown = places_zcta_shutdown
     max_jobs = int(os.environ.get("HLTHPRT_MAX_PLACES_ZCTA_JOBS")) if os.environ.get("HLTHPRT_MAX_PLACES_ZCTA_JOBS") else 4
@@ -413,7 +489,7 @@ class PlacesZcta_finish:  # pylint: disable=invalid-name
 
 
 class LODES:
-    functions = [process_lodes_data]
+    functions = [process_lodes_data, control_single_job_start]
     on_startup = lodes_startup
     on_shutdown = lodes_shutdown
     max_jobs = 4
@@ -439,7 +515,7 @@ class LODES_finish:  # pylint: disable=invalid-name
 
 
 class MedicareEnrollment:
-    functions = [process_medicare_enrollment_data]
+    functions = [process_medicare_enrollment_data, control_single_job_start]
     on_startup = medicare_enrollment_startup
     on_shutdown = medicare_enrollment_shutdown
     max_jobs = 4
@@ -465,7 +541,7 @@ class MedicareEnrollment_finish:  # pylint: disable=invalid-name
 
 
 class CMSDoctors:
-    functions = [process_cms_doctors_data]
+    functions = [process_cms_doctors_data, control_single_job_start]
     on_startup = cms_doctors_startup
     on_shutdown = cms_doctors_shutdown
     max_jobs = 4
@@ -491,7 +567,7 @@ class CMSDoctors_finish:  # pylint: disable=invalid-name
 
 
 class FacilityAnchors:
-    functions = [process_facility_anchors_data]
+    functions = [process_facility_anchors_data, control_single_job_start]
     on_startup = facility_anchors_startup
     on_shutdown = facility_anchors_shutdown
     max_jobs = 4
@@ -517,7 +593,7 @@ class FacilityAnchors_finish:  # pylint: disable=invalid-name
 
 
 class PharmacyEconomics:
-    functions = [process_pharmacy_economics_data]
+    functions = [process_pharmacy_economics_data, control_single_job_start]
     on_startup = pharmacy_economics_startup
     on_shutdown = pharmacy_economics_shutdown
     max_jobs = 4
@@ -543,7 +619,7 @@ class PharmacyEconomics_finish:  # pylint: disable=invalid-name
 
 
 class EntityAddressUnified:
-    functions = [process_entity_address_unified_data]
+    functions = [process_entity_address_unified_data, control_single_job_start]
     on_startup = entity_address_unified_startup
     on_shutdown = entity_address_unified_shutdown
     max_jobs = 1

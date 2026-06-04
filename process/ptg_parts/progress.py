@@ -14,6 +14,7 @@ from process.ptg_parts.config import (
     PTG2_PROGRESS_INTERVAL_SECONDS_ENV,
     _env_int,
 )
+from process.ptg_parts.live_progress import write_live_progress
 from process.ptg_parts.screen import _emit_screen_line
 
 logger = logging.getLogger(__name__)
@@ -104,4 +105,19 @@ def _maybe_log_artifact_progress(
     )
     _emit_screen_line(message)
     logger.info(message)
+    live_pct = item_pct if item_count > 0 and expected_items > 0 else compressed_pct
+    live_eta = item_eta if item_count > 0 and expected_items > 0 else compressed_eta
+    write_live_progress(
+        phase=label,
+        unit="items" if item_count > 0 else "compressed_bytes",
+        done=item_count if item_count > 0 else position,
+        total=expected_items if item_count > 0 and expected_items > 0 else total,
+        pct=live_pct,
+        eta_seconds=live_eta,
+        message=message[:512],
+        ref_count=ref_count,
+        item_count=item_count,
+        compressed_read_bytes=position,
+        compressed_total_bytes=total,
+    )
     state["last_log"] = now

@@ -33,9 +33,17 @@ class PTG2ServingIndex:
 @dataclass(frozen=True)
 class PTG2ServingTables:
     serving_table: str | None = None
+    price_code_set_table: str | None = None
     price_atom_table: str | None = None
+    price_set_entry_table: str | None = None
+    procedure_table: str | None = None
     code_count_table: str | None = None
+    provider_set_table: str | None = None
+    provider_set_component_table: str | None = None
+    provider_set_entry_table: str | None = None
+    provider_entry_component_table: str | None = None
     provider_group_member_table: str | None = None
+    provider_group_location_table: str | None = None
     storage: str | None = None
     type: str | None = None
     snapshot_scoped: bool = False

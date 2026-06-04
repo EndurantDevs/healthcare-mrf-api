@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import asyncpg
+import redis
 
 from db.connection import init_db
 from db.models import (
@@ -31,7 +32,9 @@ from db.models import (
     CodeSynonym,
     db,
 )
+from process.control_cancel import ImportCancelledError
 from process.ext.utils import ensure_database, make_class, push_objects
+from process.redis_config import build_redis_settings
 
 NLM_ATTRIBUTION = (
     "This product uses publicly available data from the U.S. National Library of Medicine (NLM), "
@@ -99,10 +102,39 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _download_url(url: str, path: Path, *, api_key: str | None = None, force: bool = False) -> Path:
+def _cancel_requested(run_id: str | None) -> bool:
+    if not run_id:
+        return False
+    try:
+        settings = build_redis_settings()
+        dsn = os.getenv("HLTHPRT_REDIS_ADDRESS")
+        if dsn:
+            client = redis.Redis.from_url(dsn, socket_connect_timeout=2, socket_timeout=2)
+        else:
+            client = redis.Redis(
+                host=settings.host,
+                port=settings.port,
+                password=settings.password,
+                db=settings.database,
+                socket_connect_timeout=2,
+                socket_timeout=2,
+            )
+        value = client.get(f"cancel:{run_id}")
+        return value in {b"1", "1", 1, True}
+    except Exception:
+        return False
+
+
+def _raise_if_cancelled(run_id: str | None) -> None:
+    if _cancel_requested(run_id):
+        raise ImportCancelledError(f"import run {run_id} was cancelled")
+
+
+def _download_url(url: str, path: Path, *, api_key: str | None = None, force: bool = False, run_id: str | None = None) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() and path.stat().st_size > 0 and not force:
         return path
+    _raise_if_cancelled(run_id)
     tmp = path.with_suffix(path.suffix + ".tmp")
     request_url = url
     if api_key:
@@ -110,10 +142,12 @@ def _download_url(url: str, path: Path, *, api_key: str | None = None, force: bo
     request = urllib.request.Request(request_url, headers={"User-Agent": "HealthPorta terminology importer"})
     with urllib.request.urlopen(request, timeout=3600) as response, tmp.open("wb") as out:
         while True:
+            _raise_if_cancelled(run_id)
             chunk = response.read(1024 * 1024)
             if not chunk:
                 break
             out.write(chunk)
+    _raise_if_cancelled(run_id)
     tmp.replace(path)
     manifest = {
         "source_url": url,
@@ -549,14 +583,15 @@ async def _load_product_rxcuis(test_limit: int | None = None) -> list[str]:
         or "postgres"
     )
     if rx_database:
-        connection = await asyncpg.connect(
-            host=os.getenv("HLTHPRT_RX_DB_HOST") or os.getenv("HLTHPRT_DRUG_DB_HOST") or os.getenv("HLTHPRT_DB_HOST") or "127.0.0.1",
-            port=int(os.getenv("HLTHPRT_RX_DB_PORT") or os.getenv("HLTHPRT_DRUG_DB_PORT") or os.getenv("HLTHPRT_DB_PORT") or "5432"),
-            user=os.getenv("HLTHPRT_RX_DB_USER") or os.getenv("HLTHPRT_DRUG_DB_USER") or os.getenv("HLTHPRT_DB_USER") or "postgres",
-            password=os.getenv("HLTHPRT_RX_DB_PASSWORD") or os.getenv("HLTHPRT_DRUG_DB_PASSWORD") or os.getenv("HLTHPRT_DB_PASSWORD") or "",
-            database=rx_database,
-        )
+        connection = None
         try:
+            connection = await asyncpg.connect(
+                host=os.getenv("HLTHPRT_RX_DB_HOST") or os.getenv("HLTHPRT_DRUG_DB_HOST") or os.getenv("HLTHPRT_DB_HOST") or "127.0.0.1",
+                port=int(os.getenv("HLTHPRT_RX_DB_PORT") or os.getenv("HLTHPRT_DRUG_DB_PORT") or os.getenv("HLTHPRT_DB_PORT") or "5432"),
+                user=os.getenv("HLTHPRT_RX_DB_USER") or os.getenv("HLTHPRT_DRUG_DB_USER") or os.getenv("HLTHPRT_DB_USER") or "postgres",
+                password=os.getenv("HLTHPRT_RX_DB_PASSWORD") or os.getenv("HLTHPRT_DRUG_DB_PASSWORD") or os.getenv("HLTHPRT_DB_PASSWORD") or "",
+                database=rx_database,
+            )
             rows = await connection.fetch(
                 f"""
                 SELECT DISTINCT unnest(rxnorm_ids) AS rxcui
@@ -566,8 +601,12 @@ async def _load_product_rxcuis(test_limit: int | None = None) -> list[str]:
             )
             values = [str(row["rxcui"]) for row in rows if row["rxcui"]]
             return values[:test_limit] if test_limit else values
+        except Exception as exc:
+            print(f"MED-RT source skipped: {rx_schema}.product unavailable in {rx_database} ({exc})")
+            return []
         finally:
-            await connection.close()
+            if connection is not None:
+                await connection.close()
     try:
         rows = await db.all(
             """
@@ -787,6 +826,7 @@ async def import_clinical_reference(
     sources: str | None = None,
     artifact_root: str | None = None,
     force_download: bool = False,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
     await ensure_database(test_mode)
     schema = _schema()
@@ -822,22 +862,24 @@ async def import_clinical_reference(
     source_counts: dict[str, int] = {}
 
     if "icd10cm" in selected:
-        icd_path = _download_url(os.getenv("HLTHPRT_ICD10CM_URL", CDC_ICD10CM_URL), root / "icd10cm" / "icd10cm-CodeDescriptions-2026.zip", force=force_download)
+        icd_path = _download_url(os.getenv("HLTHPRT_ICD10CM_URL", CDC_ICD10CM_URL), root / "icd10cm" / "icd10cm-CodeDescriptions-2026.zip", force=force_download, run_id=run_id)
         rows, synonyms, crosswalks = _parse_icd10cm(icd_path, source_test_limit)
         concept_rows.extend(rows); synonym_rows.extend(synonyms); crosswalk_rows.extend(crosswalks)
         source_counts["icd10cm"] = len(rows)
 
     if "mesh" in selected:
-        desc_path = _download_url(os.getenv("HLTHPRT_MESH_DESC_URL", MESH_DESC_URL), root / "mesh" / "desc2026.gz", force=force_download)
-        supp_path = _download_url(os.getenv("HLTHPRT_MESH_SUPP_URL", MESH_SUPP_URL), root / "mesh" / "supp2026.gz", force=force_download)
+        desc_path = _download_url(os.getenv("HLTHPRT_MESH_DESC_URL", MESH_DESC_URL), root / "mesh" / "desc2026.gz", force=force_download, run_id=run_id)
+        supp_path = _download_url(os.getenv("HLTHPRT_MESH_SUPP_URL", MESH_SUPP_URL), root / "mesh" / "supp2026.gz", force=force_download, run_id=run_id)
         for path, source in ((desc_path, "nlm_mesh_descriptor"), (supp_path, "nlm_mesh_supplemental")):
+            _raise_if_cancelled(run_id)
             rows, synonyms, relationships = _parse_mesh_file(path, source, source_test_limit)
             concept_rows.extend(rows); synonym_rows.extend(synonyms); relationship_rows.extend(relationships)
             source_counts[source] = len(rows)
 
     if "rxnorm" in selected:
+        _raise_if_cancelled(run_id)
         release = _release_current("rxnorm-full-monthly-release")
-        rx_path = _download_url(release["downloadUrl"], root / "rxnorm" / release["fileName"], api_key=umls_key, force=force_download)
+        rx_path = _download_url(release["downloadUrl"], root / "rxnorm" / release["fileName"], api_key=umls_key, force=force_download, run_id=run_id)
         rows, synonyms, relationships = _parse_rxnorm(rx_path, source_test_limit)
         for row in rows:
             row["source_release"] = release.get("releaseVersion")
@@ -845,10 +887,11 @@ async def import_clinical_reference(
         source_counts["rxnorm"] = len(rows)
 
     if "snomed" in selected:
+        _raise_if_cancelled(run_id)
         if not umls_key:
             raise RuntimeError("SNOMED import requires HLTHPRT_UMLS_API_KEY or UMLS_API_KEY.")
         release = _release_current("snomed-ct-us-edition")
-        snomed_path = _download_url(release["downloadUrl"], root / "snomedct_us" / release["fileName"], api_key=umls_key, force=force_download)
+        snomed_path = _download_url(release["downloadUrl"], root / "snomedct_us" / release["fileName"], api_key=umls_key, force=force_download, run_id=run_id)
         rows, synonyms, relationships = _parse_snomed(snomed_path, source_test_limit)
         for row in rows:
             row["source_release"] = release.get("releaseVersion")
@@ -856,7 +899,7 @@ async def import_clinical_reference(
         source_counts["snomed"] = len(rows)
         try:
             map_release = _release_current("snomed-ct-to-icd-10-cm-mapping-resources")
-            map_path = _download_url(map_release["downloadUrl"], root / "snomedct_icd10cm" / map_release["fileName"], api_key=umls_key, force=force_download)
+            map_path = _download_url(map_release["downloadUrl"], root / "snomedct_icd10cm" / map_release["fileName"], api_key=umls_key, force=force_download, run_id=run_id)
             map_rows = _parse_snomed_icd_map(map_path, source_test_limit)
             crosswalk_rows.extend(map_rows)
             source_counts["snomed_icd10cm_map"] = len(map_rows)
@@ -864,6 +907,7 @@ async def import_clinical_reference(
             print(f"SNOMED ICD-10-CM map skipped: {exc}")
 
     if "medrt" in selected:
+        _raise_if_cancelled(run_id)
         rows, synonyms, relationships = await _load_medrt_from_rxclass(test_mode)
         concept_rows.extend(rows); synonym_rows.extend(synonyms); relationship_rows.extend(relationships)
         source_counts["medrt"] = len(rows)
@@ -931,6 +975,7 @@ async def main(
     sources: str | None = None,
     artifact_root: str | None = None,
     force_download: bool = False,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
     await init_db(db)
     try:
@@ -940,6 +985,7 @@ async def main(
             sources=sources,
             artifact_root=artifact_root,
             force_download=force_download,
+            run_id=run_id,
         )
     finally:
         await db.disconnect()

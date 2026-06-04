@@ -49,6 +49,8 @@ from process.ext.utils import (
 )
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
+from process.control_lifecycle import mark_control_run
+from process.live_progress import enqueue_live_progress
 
 logger = logging.getLogger(__name__)
 
@@ -2145,6 +2147,12 @@ async def claims_pricing_start(ctx, task: dict[str, Any] | None = None) -> dict[
         "claims-pricing enqueue+split "
         f"(test_mode={test_mode}, import_id={import_id_val}, run_id={run_id}, stage={stage_suffix})"
     )
+    await mark_control_run(
+        run_id,
+        status="running",
+        phase_detail="claims-pricing split running",
+        progress_message="splitting source files",
+    )
     await ensure_database(test_mode)
 
     t = _step_start("prepare staging tables")
@@ -2281,6 +2289,21 @@ async def claims_pricing_start(ctx, task: dict[str, Any] | None = None) -> dict[
         f"(test_mode={test_mode}, import_id={import_id_val}, run_id={run_id}, stage={stage_suffix})",
         total_start,
     )
+    await mark_control_run(
+        run_id,
+        status="running",
+        phase_detail="claims-pricing chunks queued",
+        progress_message="chunks queued",
+        metrics={"total_chunks": len(chunks), "stage_suffix": stage_suffix},
+        progress={
+            "unit": "chunks",
+            "total": len(chunks),
+            "done": 0,
+            "pct": 0,
+            "message": "chunks queued",
+            "phase": "claims-pricing chunks queued",
+        },
+    )
     return {
         "ok": True,
         "queued": True,
@@ -2337,6 +2360,17 @@ async def claims_pricing_process_chunk(ctx, task: dict[str, Any] | None = None) 
     redis = ctx.get("redis")
     if redis is not None and run_id:
         await _mark_chunk_done_with_retry(redis, run_id, chunk_id)
+        total_chunks, done_chunks = await _get_run_progress(redis, run_id, 0)
+        enqueue_live_progress(
+            run_id=run_id,
+            importer="claims-pricing",
+            status="running",
+            phase="claims-pricing chunks running",
+            unit="chunks",
+            done=done_chunks,
+            total=total_chunks,
+            message=f"processed {done_chunks}/{total_chunks} chunks",
+        )
 
     return {
         "ok": True,
@@ -2376,6 +2410,16 @@ async def claims_pricing_finalize(ctx, task: dict[str, Any] | None = None) -> di
 
         total_chunks, done_chunks = await _get_run_progress(redis, run_id, expected_chunks)
         if done_chunks < total_chunks:
+            enqueue_live_progress(
+                run_id=run_id,
+                importer="claims-pricing",
+                status="running",
+                phase="claims-pricing chunks running",
+                unit="chunks",
+                done=done_chunks,
+                total=total_chunks,
+                message=f"waiting for chunks {done_chunks}/{total_chunks}",
+            )
             print(
                 f"[finalize] waiting for chunks: done={done_chunks}/{total_chunks} run_id={run_id}",
                 flush=True,
@@ -2384,6 +2428,20 @@ async def claims_pricing_finalize(ctx, task: dict[str, Any] | None = None) -> di
 
         if not await _claim_finalize_lock(redis, run_id):
             raise Retry(defer=CLAIMS_FINISH_RETRY_SECONDS)
+        await mark_control_run(
+            run_id,
+            status="finalizing",
+            phase_detail="claims-pricing finalizing",
+            progress_message="finalizing",
+            progress={
+                "unit": "chunks",
+                "total": total_chunks,
+                "done": done_chunks,
+                "pct": 99,
+                "message": "finalizing",
+                "phase": "claims-pricing finalizing",
+            },
+        )
 
     classes = _staging_classes(stage_suffix, schema)
     t = _step_start("ensure live code tables")
@@ -2420,6 +2478,13 @@ async def claims_pricing_finalize(ctx, task: dict[str, Any] | None = None) -> di
         test_mode,
         import_id_val,
         run_id,
+    )
+    await mark_control_run(
+        run_id,
+        status="succeeded",
+        phase_detail="claims-pricing finalized",
+        progress_message="succeeded",
+        metrics={"stage_suffix": stage_suffix, "schema": schema},
     )
     return {
         "ok": True,

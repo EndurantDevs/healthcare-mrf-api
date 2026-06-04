@@ -16,6 +16,7 @@ from aiocsv import AsyncDictReader
 from arq import create_pool
 
 from db.models import PricingPlacesZcta, db
+from process.control_cancel import raise_if_cancelled
 from process.ext.utils import (download_it_and_save, ensure_database, make_class,
                                my_init_db, print_time_info, push_objects)
 from process.redis_config import build_redis_settings
@@ -162,6 +163,7 @@ async def _flush_places_rows(
 
 async def process_data(ctx, task=None):  # pragma: no cover
     task = task or {}
+    await raise_if_cancelled(ctx, task)
     ctx.setdefault("context", {})
 
     if "test_mode" in task:
@@ -205,11 +207,13 @@ async def process_data(ctx, task=None):  # pragma: no cover
                 row_buffer[key] = record
 
                 if len(row_buffer) >= batch_size:
+                    await raise_if_cancelled(ctx, task)
                     accepted_rows += await _flush_places_rows(row_buffer, target_cls)
 
                 if test_mode and matched_rows >= test_row_limit:
                     break
 
+        await raise_if_cancelled(ctx, task)
         accepted_rows += await _flush_places_rows(row_buffer, target_cls)
 
     if accepted_rows <= 0:

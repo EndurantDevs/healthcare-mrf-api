@@ -32,6 +32,8 @@ from db.models import (NPIAddress, NPIData, PartDPharmacyActivity, NPIDataOtherI
 from process.ext.utils import db_startup, download_it, ensure_database, push_objects
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
+from process.control_lifecycle import mark_control_run
+from process.live_progress import enqueue_live_progress
 
 FDA_STATE_BOARD_URL = (
     "https://www.fda.gov/drugs/besaferx-your-source-online-pharmacy-information/"
@@ -2988,6 +2990,12 @@ async def pharmacy_license_start(ctx, task=None):  # pragma: no cover
     run_id = _normalize_run_id(task.get("run_id"))
     import_id = _normalize_import_id(task.get("import_id"))
     test_mode = bool(task.get("test_mode"))
+    await mark_control_run(
+        run_id,
+        status="running",
+        phase_detail="pharmacy-license running",
+        progress_message="running",
+    )
     await ensure_database(test_mode)
 
     schema = await _ensure_tables()
@@ -3015,6 +3023,16 @@ async def pharmacy_license_start(ctx, task=None):  # pragma: no cover
             raise RuntimeError("No state board sources discovered from FDA page")
         if test_mode:
             state_sources = state_sources[:PHARM_LICENSE_TEST_MAX_STATES]
+        enqueue_live_progress(
+            run_id=run_id,
+            importer="pharmacy-license",
+            status="running",
+            phase="pharmacy-license states resolved",
+            unit="states",
+            done=0,
+            total=len(state_sources),
+            message=f"resolved {len(state_sources)} state board source(s)",
+        )
 
         await _upsert_run(
             {
@@ -3055,8 +3073,18 @@ async def pharmacy_license_start(ctx, task=None):  # pragma: no cover
             connector=connector,
             headers={"User-Agent": PHARM_LICENSE_HTTP_USER_AGENT},
         ) as session:
-            for source in state_sources:
+            for state_index, source in enumerate(state_sources, start=1):
                 snapshot_id = _hash_snapshot_id(run_id, source.state_code, source.board_url)
+                enqueue_live_progress(
+                    run_id=run_id,
+                    importer="pharmacy-license",
+                    status="running",
+                    phase="pharmacy-license state importing",
+                    unit="states",
+                    done=state_index - 1,
+                    total=len(state_sources),
+                    message=f"importing {source.state_code} ({state_index}/{len(state_sources)})",
+                )
                 await _upsert_snapshot(
                     {
                         "snapshot_id": snapshot_id,
@@ -3137,6 +3165,19 @@ async def pharmacy_license_start(ctx, task=None):  # pragma: no cover
                         summary_totals["supported_states"] += 1
                     else:
                         summary_totals["unsupported_states"] += 1
+                    enqueue_live_progress(
+                        run_id=run_id,
+                        importer="pharmacy-license",
+                        status="running",
+                        phase="pharmacy-license state imported",
+                        unit="states",
+                        done=state_index,
+                        total=len(state_sources),
+                        message=(
+                            f"imported {state_index}/{len(state_sources)} state(s); "
+                            f"inserted_rows={summary_totals['inserted_rows']}"
+                        ),
+                    )
 
                 except Exception as exc:  # pylint: disable=broad-exception-caught
                     await _upsert_snapshot(
@@ -3177,8 +3218,29 @@ async def pharmacy_license_start(ctx, task=None):  # pragma: no cover
                         }
                     )
                     summary_totals["unsupported_states"] += 1
+                    enqueue_live_progress(
+                        run_id=run_id,
+                        importer="pharmacy-license",
+                        status="running",
+                        phase="pharmacy-license state failed",
+                        unit="states",
+                        done=state_index,
+                        total=len(state_sources),
+                        message=f"failed {source.state_code}; continuing",
+                    )
 
         if PHARM_LICENSE_DEFER_ADDITIONAL_INDEXES:
+            enqueue_live_progress(
+                run_id=run_id,
+                importer="pharmacy-license",
+                status="running",
+                phase="pharmacy-license finalizing indexes",
+                unit="states",
+                done=len(state_sources),
+                total=len(state_sources),
+                pct=95,
+                message="finalizing indexes",
+            )
             await _ensure_secondary_indexes(schema)
             await _analyze_tables(schema)
         await _truncate_stage_table(schema)
@@ -3203,6 +3265,13 @@ async def pharmacy_license_start(ctx, task=None):  # pragma: no cover
             f"inserted={summary_totals['inserted_rows']}",
             flush=True,
         )
+        await mark_control_run(
+            run_id,
+            status="succeeded",
+            phase_detail="pharmacy-license completed",
+            progress_message="succeeded",
+            metrics=summary_totals,
+        )
     except Exception as exc:  # pylint: disable=broad-exception-caught
         await _truncate_stage_table(schema)
         if PHARM_LICENSE_DEFER_ADDITIONAL_INDEXES and PHARM_LICENSE_DROP_ADDITIONAL_INDEXES_BEFORE_IMPORT:
@@ -3221,6 +3290,13 @@ async def pharmacy_license_start(ctx, task=None):  # pragma: no cover
                 "source_summary": {"test_mode": test_mode},
                 "error_text": str(exc),
             }
+        )
+        await mark_control_run(
+            run_id,
+            status="failed",
+            phase_detail="pharmacy-license failed",
+            progress_message="failed",
+            error={"code": "import_failed", "message": str(exc)},
         )
         raise
 

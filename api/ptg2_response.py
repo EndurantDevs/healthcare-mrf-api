@@ -14,7 +14,6 @@ NUMERIC_PATTERN = re.compile(r"^-?\d+(\.\d+)?$")
 
 PTG2_ITEM_SOURCE_FIELDS = {
     "source_trace",
-    "location_source",
 }
 PTG2_ITEM_DIAGNOSTIC_FIELDS = {
     "billing_code",
@@ -28,9 +27,6 @@ PTG2_ITEM_DIAGNOSTIC_FIELDS = {
     "provider_set_hash",
     "provider_set_hashes",
     "rate_pack_hash",
-    "service_code",
-    "service_code_system",
-    "tic_prices",
 }
 PTG2_QUERY_SOURCE_FIELDS = {
     "source",
@@ -42,7 +38,6 @@ PTG2_QUERY_DIAGNOSTIC_FIELDS = {
     "price_filter",
     "procedure_consolidation",
     "provider_reverse_index",
-    "result_granularity",
     "snapshot_id",
 }
 def _request_bool(value: Any, default: bool = False) -> bool:

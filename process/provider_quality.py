@@ -48,6 +48,8 @@ from process.ext.utils import (
 )
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
+from process.control_lifecycle import mark_control_run
+from process.live_progress import enqueue_live_progress
 from process.provider_quality_parts.config import (
     COHORT_MODEL_CLASS_NAMES,
     DATASET_BY_KEY,
@@ -1474,6 +1476,17 @@ async def _wait_for_materialize_phase_completion(redis, run_id: str, phase: str)
             f"elapsed={elapsed_text}"
         )
     if done < total:
+        enqueue_live_progress(
+            run_id=run_id,
+            importer="provider-quality",
+            status="finalizing",
+            phase=f"provider-quality materialize {phase}",
+            unit="shards",
+            done=done,
+            total=total,
+            eta_seconds=eta_sec if shards_per_sec > 0.0 else None,
+            message=f"materializing {phase} {done}/{total} shards",
+        )
         print(
             f"[finalize] materialize progress phase={phase} done={done}/{total} "
             f"pending={pending} failed={failed} pct={progress_pct:.1f}% "
@@ -1616,6 +1629,12 @@ async def provider_quality_start(ctx, task: dict[str, Any] | None = None, **_kwa
     total_start = _step_start(
         "provider-quality enqueue+split "
         f"(test_mode={test_mode}, import_id={import_id_val}, run_id={run_id}, stage={stage_suffix})"
+    )
+    await mark_control_run(
+        run_id,
+        status="running",
+        phase_detail="provider-quality split running",
+        progress_message="splitting source files",
     )
 
     await ensure_database(test_mode)
@@ -1760,6 +1779,21 @@ async def provider_quality_start(ctx, task: dict[str, Any] | None = None, **_kwa
         f"(test_mode={test_mode}, import_id={import_id_val}, run_id={run_id}, stage={stage_suffix})",
         total_start,
     )
+    await mark_control_run(
+        run_id,
+        status="running",
+        phase_detail="provider-quality chunks queued",
+        progress_message="chunks queued",
+        metrics={"total_chunks": len(chunks), "stage_suffix": stage_suffix},
+        progress={
+            "unit": "chunks",
+            "total": len(chunks),
+            "done": 0,
+            "pct": 0,
+            "message": "chunks queued",
+            "phase": "provider-quality chunks queued",
+        },
+    )
 
     return {
         "ok": True,
@@ -1803,6 +1837,17 @@ async def provider_quality_process_chunk(ctx, task: dict[str, Any] | None = None
     redis = ctx.get("redis")
     if redis is not None and run_id:
         await _mark_chunk_done_with_retry(redis, run_id, chunk_id)
+        total_chunks, done_chunks = await _get_run_progress(redis, run_id, 0)
+        enqueue_live_progress(
+            run_id=run_id,
+            importer="provider-quality",
+            status="running",
+            phase="provider-quality chunks running",
+            unit="chunks",
+            done=done_chunks,
+            total=total_chunks,
+            message=f"processed {done_chunks}/{total_chunks} chunks",
+        )
 
     return {
         "ok": True,
@@ -1843,6 +1888,16 @@ async def provider_quality_finalize(ctx, task: dict[str, Any] | None = None, **_
 
         total_chunks, done_chunks = await _get_run_progress(redis, run_id, expected_chunks)
         if done_chunks < total_chunks:
+            enqueue_live_progress(
+                run_id=run_id,
+                importer="provider-quality",
+                status="running",
+                phase="provider-quality chunks running",
+                unit="chunks",
+                done=done_chunks,
+                total=total_chunks,
+                message=f"waiting for chunks {done_chunks}/{total_chunks}",
+            )
             print(
                 f"[finalize] waiting for chunks: done={done_chunks}/{total_chunks} run_id={run_id}",
                 flush=True,
@@ -1854,6 +1909,20 @@ async def provider_quality_finalize(ctx, task: dict[str, Any] | None = None, **_
         if not await _claim_global_finalize_lock(redis, run_id):
             raise Retry(defer=PROVIDER_QUALITY_FINISH_RETRY_SECONDS)
         global_lock_acquired = True
+        await mark_control_run(
+            run_id,
+            status="finalizing",
+            phase_detail="provider-quality finalizing",
+            progress_message="finalizing",
+            progress={
+                "unit": "chunks",
+                "total": total_chunks,
+                "done": done_chunks,
+                "pct": 99,
+                "message": "finalizing",
+                "phase": "provider-quality finalizing",
+            },
+        )
 
     try:
         classes = _staging_classes(stage_suffix, schema)
@@ -1911,6 +1980,13 @@ async def provider_quality_finalize(ctx, task: dict[str, Any] | None = None, **_
         test_mode,
         import_id_val,
         run_id,
+    )
+    await mark_control_run(
+        run_id,
+        status="succeeded",
+        phase_detail="provider-quality finalized",
+        progress_message="succeeded",
+        metrics={"stage_suffix": stage_suffix, "schema": schema},
     )
 
     return {

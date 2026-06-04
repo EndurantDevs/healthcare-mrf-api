@@ -15,6 +15,7 @@ from sqlalchemy import and_, select
 
 from db.models import (GeoZipLookup, MedicareEnrollmentCountyStats,
                        MedicareEnrollmentStats, db)
+from process.control_lifecycle import mark_control_run
 from process.ext.utils import (ensure_database, make_class, my_init_db,
                                print_time_info, push_objects)
 from process.redis_config import build_redis_settings
@@ -198,7 +199,11 @@ def _allocate_by_weights(total: int, zip_weights: list[tuple[str, int]]) -> dict
     return base_alloc
 
 
-async def _load_county_zip_weights() -> dict[str, list[tuple[str, int]]]:
+async def _geo_zip_lookup_exists(db_schema: str) -> bool:
+    return bool(await db.scalar("SELECT to_regclass(:qualified_name) IS NOT NULL;", qualified_name=f"{db_schema}.geo_zip_lookup"))
+
+
+async def _load_county_zip_weight_rows():
     stmt = (
         select(GeoZipLookup.county_code, GeoZipLookup.zip_code, GeoZipLookup.population)
         .where(
@@ -208,7 +213,28 @@ async def _load_county_zip_weights() -> dict[str, list[tuple[str, int]]]:
             )
         )
     )
-    rows = await db.all(stmt)
+    return await db.all(stmt)
+
+
+async def _load_county_zip_weights(*, test_mode: bool = False) -> dict[str, list[tuple[str, int]]]:
+    db_schema = os.getenv("HLTHPRT_DB_SCHEMA") if os.getenv("HLTHPRT_DB_SCHEMA") else "mrf"
+    if await _geo_zip_lookup_exists(db_schema):
+        rows = await _load_county_zip_weight_rows()
+    elif test_mode:
+        previous_override = getattr(db, "_database_override", None)
+        db._database_override = None  # type: ignore[attr-defined]
+        try:
+            await db.connect()
+            if not await _geo_zip_lookup_exists(db_schema):
+                logger.info("Medicare Enrollment test mode: %s.geo_zip_lookup is unavailable; ZIP allocation will be empty.", db_schema)
+                rows = []
+            else:
+                rows = await _load_county_zip_weight_rows()
+        finally:
+            db._database_override = previous_override  # type: ignore[attr-defined]
+            await db.connect()
+    else:
+        raise RuntimeError(f"Medicare Enrollment requires {db_schema}.geo_zip_lookup for ZIP allocation.")
     mapping: dict[str, dict[str, int]] = defaultdict(dict)
     for row in rows:
         county_code = _normalize_fips(getattr(row, "county_code", None))
@@ -362,7 +388,7 @@ async def process_data(ctx, task=None):
     for idx in range(0, len(county_rows), batch_size):
         await push_objects(county_rows[idx: idx + batch_size], county_stage_cls)
 
-    county_zip_weights = await _load_county_zip_weights()
+    county_zip_weights = await _load_county_zip_weights(test_mode=test_mode)
     zip_agg: dict[tuple[str, int], dict[str, int]] = defaultdict(
         lambda: {"total_beneficiaries": 0, "part_d_beneficiaries": 0}
     )
@@ -445,6 +471,7 @@ async def startup(ctx):
 async def shutdown(ctx):
     import_date = ctx.get("import_date")
     context = ctx.get("context") or {}
+    run_id = str(context.get("control_run_id") or ctx.get("control_run_id") or "").strip()
 
     if not context.get("run"):
         logger.info("No Medicare Enrollment jobs ran; skipping shutdown.")
@@ -506,6 +533,18 @@ async def shutdown(ctx):
         unmatched_ratio,
     )
     print_time_info(context.get("start"))
+    await mark_control_run(
+        run_id,
+        status="succeeded",
+        phase_detail="medicare-enrollment published",
+        progress_message="succeeded",
+        metrics={
+            "county_rows": county_stage_rows,
+            "zip_rows": zip_stage_rows,
+            "unmatched_counties": unmatched_counties,
+            "unmatched_ratio": unmatched_ratio,
+        },
+    )
 
 
 async def main(test_mode: bool = False):

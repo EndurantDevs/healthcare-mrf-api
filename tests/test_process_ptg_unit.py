@@ -19,6 +19,7 @@ from aiohttp import web
 
 process_pkg = importlib.import_module("process")
 process_ptg = importlib.import_module("process.ptg")
+live_progress = importlib.import_module("process.live_progress")
 ptg_allowed_amounts = importlib.import_module("process.ptg_parts.allowed_amounts")
 ptg_artifacts = importlib.import_module("process.ptg_parts.artifacts")
 ptg_artifact_streams = importlib.import_module("process.ptg_parts.artifact_streams")
@@ -32,6 +33,7 @@ ptg_db_tables = importlib.import_module("process.ptg_parts.db_tables")
 ptg_domain = importlib.import_module("process.ptg_parts.domain")
 ptg_import_rows = importlib.import_module("process.ptg_parts.import_rows")
 ptg_json_streams = importlib.import_module("process.ptg_parts.json_streams")
+ptg_live_progress = importlib.import_module("process.ptg_parts.live_progress")
 ptg_progress = importlib.import_module("process.ptg_parts.progress")
 ptg_provider_references = importlib.import_module("process.ptg_parts.provider_references")
 ptg_row_helpers = importlib.import_module("process.ptg_parts.row_helpers")
@@ -98,8 +100,68 @@ def test_row_helper_split_keeps_facade_helpers_stable():
 def test_progress_split_keeps_facade_helpers_stable():
     assert process_ptg._utcnow is ptg_progress._utcnow
     assert process_ptg._artifact_progress_position is ptg_progress._artifact_progress_position
+
+
+def test_ptg_live_progress_uses_redis_ttl_and_enqueues_status_event(monkeypatch):
+    writes = []
+    events = []
+
+    class FakeRedis:
+        def setex(self, key, ttl, value):
+            writes.append((key, ttl, value))
+
+    monkeypatch.setattr(live_progress, "_redis", lambda: FakeRedis())
+    monkeypatch.setattr(live_progress, "enqueue_status_event", events.append)
+    token = ptg_live_progress.set_live_progress_context(run_id="run_ptg", snapshot_id="snap_1")
+    try:
+        ptg_live_progress.write_live_progress(phase="download", pct=12.5, eta_seconds=60, message="downloading")
+    finally:
+        ptg_live_progress.reset_live_progress_context(token)
+
+    assert writes[0][0] == "import:progress:run_ptg"
+    assert writes[0][1] == ptg_live_progress.PTG_LIVE_PROGRESS_TTL_SECONDS
+    assert events[0]["run_id"] == "run_ptg"
+    assert events[0]["phase_detail"] == "download"
+    assert events[0]["progress"]["pct"] == 12.5
+    assert events[0]["estimate"]["eta_seconds"] == 60
     assert process_ptg._format_duration is ptg_progress._format_duration
     assert process_ptg._maybe_log_artifact_progress is ptg_progress._maybe_log_artifact_progress
+
+
+def test_live_progress_preserves_earliest_started_at(monkeypatch):
+    writes = []
+    previous = {
+        "run_id": "run_any",
+        "importer": "npi",
+        "status": "running",
+        "started_at": "2026-06-03T12:00:00Z",
+        "updated_at": "2026-06-03T12:01:00Z",
+    }
+
+    class FakeRedis:
+        def get(self, key):
+            assert key == "import:progress:run_any"
+            return json.dumps(previous).encode("utf-8")
+
+        def setex(self, key, ttl, value):
+            writes.append((key, ttl, value))
+
+    monkeypatch.setattr(live_progress, "_redis", lambda: FakeRedis())
+    monkeypatch.setattr(live_progress, "enqueue_status_event", lambda _event: None)
+
+    live_progress.write_live_progress(
+        run_id="run_any",
+        importer="npi",
+        status="running",
+        started_at="2026-06-03T12:05:00Z",
+        unit="records",
+        done=5,
+        total=10,
+        message="parsing",
+    )
+
+    payload = json.loads(writes[0][2])
+    assert payload["started_at"] == previous["started_at"]
 
 
 def test_artifact_split_keeps_facade_helpers_stable():
@@ -1712,8 +1774,8 @@ def test_ptg2_ensure_tables_uses_existing_db_create_table(monkeypatch):
     assert "ptg2_import_run" in created
     assert "ptg2_current_snapshot" in created
     assert "ptg2_source_file_version" in created
-    assert "ptg2_provider_group" in created
-    assert "ptg2_rate_pack" in created
+    expected = {cls.__table__.name for cls in process_ptg.PTG2_MODEL_CLASSES}
+    assert expected.issubset(set(created))
 
 
 def test_ptg2_ensure_tables_fails_fast_on_create_error(monkeypatch):

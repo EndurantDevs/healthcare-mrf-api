@@ -34,6 +34,8 @@ from process.ext.utils import (download_it_and_save, ensure_database,
                                push_objects, return_checksum)
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
+from process.control_lifecycle import mark_control_run
+from process.live_progress import enqueue_live_progress
 
 logger = logging.getLogger(__name__)
 
@@ -2106,6 +2108,12 @@ async def drug_claims_start(ctx, task: dict[str, Any] | None = None) -> dict[str
         "drug-claims enqueue+split "
         f"(test_mode={test_mode}, import_id={import_id_val}, run_id={run_id}, stage={stage_suffix})"
     )
+    await mark_control_run(
+        run_id,
+        status="running",
+        phase_detail="drug-claims split running",
+        progress_message="splitting source files",
+    )
     await ensure_database(test_mode)
 
     t = _step_start("prepare staging tables")
@@ -2242,6 +2250,21 @@ async def drug_claims_start(ctx, task: dict[str, Any] | None = None) -> dict[str
         f"(test_mode={test_mode}, import_id={import_id_val}, run_id={run_id}, stage={stage_suffix})",
         total_start,
     )
+    await mark_control_run(
+        run_id,
+        status="running",
+        phase_detail="drug-claims chunks queued",
+        progress_message="chunks queued",
+        metrics={"total_chunks": len(chunks), "stage_suffix": stage_suffix},
+        progress={
+            "unit": "chunks",
+            "total": len(chunks),
+            "done": 0,
+            "pct": 0,
+            "message": "chunks queued",
+            "phase": "drug-claims chunks queued",
+        },
+    )
     return {
         "ok": True,
         "queued": True,
@@ -2293,6 +2316,17 @@ async def drug_claims_process_chunk(ctx, task: dict[str, Any] | None = None) -> 
     redis = ctx.get("redis")
     if redis is not None and run_id:
         await _mark_chunk_done_with_retry(redis, run_id, chunk_id)
+        total_chunks, done_chunks = await _get_run_progress(redis, run_id, 0)
+        enqueue_live_progress(
+            run_id=run_id,
+            importer="drug-claims",
+            status="running",
+            phase="drug-claims chunks running",
+            unit="chunks",
+            done=done_chunks,
+            total=total_chunks,
+            message=f"processed {done_chunks}/{total_chunks} chunks",
+        )
 
     return {
         "ok": True,
@@ -2332,6 +2366,16 @@ async def drug_claims_finalize(ctx, task: dict[str, Any] | None = None) -> dict[
 
         total_chunks, done_chunks = await _get_run_progress(redis, run_id, expected_chunks)
         if done_chunks < total_chunks:
+            enqueue_live_progress(
+                run_id=run_id,
+                importer="drug-claims",
+                status="running",
+                phase="drug-claims chunks running",
+                unit="chunks",
+                done=done_chunks,
+                total=total_chunks,
+                message=f"waiting for chunks {done_chunks}/{total_chunks}",
+            )
             print(
                 f"[finalize] waiting for chunks: done={done_chunks}/{total_chunks} run_id={run_id}",
                 flush=True,
@@ -2340,6 +2384,20 @@ async def drug_claims_finalize(ctx, task: dict[str, Any] | None = None) -> dict[
 
         if not await _claim_finalize_lock(redis, run_id):
             raise Retry(defer=DRUG_CLAIMS_FINISH_RETRY_SECONDS)
+        await mark_control_run(
+            run_id,
+            status="finalizing",
+            phase_detail="drug-claims finalizing",
+            progress_message="finalizing",
+            progress={
+                "unit": "chunks",
+                "total": total_chunks,
+                "done": done_chunks,
+                "pct": 99,
+                "message": "finalizing",
+                "phase": "drug-claims finalizing",
+            },
+        )
 
     classes = _staging_classes(stage_suffix, schema)
     t = _step_start("ensure live code tables")
@@ -2372,6 +2430,13 @@ async def drug_claims_finalize(ctx, task: dict[str, Any] | None = None) -> dict[
         test_mode,
         import_id_val,
         run_id,
+    )
+    await mark_control_run(
+        run_id,
+        status="succeeded",
+        phase_detail="drug-claims finalized",
+        progress_message="succeeded",
+        metrics={"stage_suffix": stage_suffix, "schema": schema},
     )
     return {
         "ok": True,
