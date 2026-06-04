@@ -82,6 +82,36 @@ def _fake_make_class_factory(schema: str = "mrf"):
     return _factory
 
 
+def test_index_requires_postgis_matches_geo_idx_and_expressions(npi_module):
+    assert npi_module._index_requires_postgis(
+        {
+            "name": "geo_idx",
+            "index_elements": ("Geography(ST_MakePoint(long, lat))",),
+        }
+    )
+    assert npi_module._index_requires_postgis({"name": "pricing_proc_peer_stats_geo_idx"})
+    assert not npi_module._index_requires_postgis({"name": "taxonomy_array", "index_elements": ("taxonomy_array",)})
+
+
+@pytest.mark.asyncio
+async def test_rebuild_phone_staffing_skips_missing_target(monkeypatch, npi_module):
+    status_mock = AsyncMock()
+
+    async def fake_scalar(_sql):
+        return None
+
+    monkeypatch.setattr(npi_module.db, "scalar", fake_scalar)
+    monkeypatch.setattr(npi_module.db, "status", status_mock)
+
+    await npi_module.rebuild_phone_staffing_table(
+        target_table="npi_phone_staffing_20260603",
+        address_table="npi_address_20260603",
+        schema="mrf",
+    )
+
+    status_mock.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_process_npi_chunk_enqueues_basic_payload(monkeypatch, npi_module):
 

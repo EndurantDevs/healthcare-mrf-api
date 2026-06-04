@@ -53,6 +53,7 @@ from process.ptg_parts.domain import (
     PTG2LogicalArtifact,
     PTG2RawArtifact,
 )
+from process.ptg_parts.live_progress import write_live_progress
 from process.ptg_parts.screen import _emit_screen_line
 
 logger = logging.getLogger(__name__)
@@ -96,6 +97,25 @@ def _emit_download_progress(
     )
     _emit_screen_line(line, stderr=True)
     logger.info(line)
+    write_live_progress(
+        phase="download",
+        unit="bytes",
+        done=bytes_read,
+        total=total_bytes,
+        pct=percent,
+        rate={"mib_s": mib_s},
+        eta_seconds=eta if total_bytes and total_bytes > 0 else None,
+        message=f"downloading {_safe_download_label(url)}",
+        label=url,
+    )
+
+
+def _safe_download_label(url: str) -> str:
+    parsed = urlsplit(str(url))
+    if parsed.scheme and parsed.netloc:
+        tail = parsed.path.rsplit("/", 1)[-1]
+        return f"{parsed.netloc}/{tail}" if tail else parsed.netloc
+    return str(url)[:128]
 
 
 async def fetch_head_metadata(url: str, timeout_seconds: int = 30) -> PTG2HeadMetadata:

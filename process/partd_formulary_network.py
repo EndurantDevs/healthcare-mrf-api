@@ -30,6 +30,8 @@ from db.models import (PartDFormularySnapshot, PartDImportRun, PartDMedicationCo
 from process.ext.utils import db_startup, download_it, download_it_and_save, push_objects
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
+from process.control_lifecycle import mark_control_run
+from process.live_progress import enqueue_live_progress
 
 # CMS rows can exceed Python's default field limit.
 _csv_limit = sys.maxsize
@@ -148,6 +150,11 @@ def _parse_date(value: Any) -> datetime.date | None:
     text = str(value).strip()
     if not text:
         return None
+    if re.fullmatch(r"20\d{2}-\d{2}", text):
+        try:
+            return datetime.date.fromisoformat(f"{text}-01")
+        except ValueError:
+            pass
     for candidate in (text, text.split("T", 1)[0], text.split(" ", 1)[0]):
         try:
             return datetime.date.fromisoformat(candidate)
@@ -427,9 +434,57 @@ def _resolve_artifacts(catalog: dict[str, Any], test_mode: bool) -> list[SourceA
     return artifacts
 
 
+def _explicit_artifacts(task: dict[str, Any]) -> list[SourceArtifact]:
+    raw_items = task.get("artifacts")
+    if raw_items is None:
+        raw_items = task.get("source_urls")
+    if isinstance(raw_items, str):
+        raw_items = [item.strip() for item in raw_items.split(",") if item.strip()]
+    if not isinstance(raw_items, list):
+        return []
+
+    today = datetime.date.today()
+    artifacts: list[SourceArtifact] = []
+    for index, item in enumerate(raw_items):
+        if isinstance(item, str):
+            url = item.strip()
+            metadata: dict[str, Any] = {}
+        elif isinstance(item, dict):
+            metadata = dict(item)
+            url = str(metadata.get("url") or metadata.get("source_url") or metadata.get("file") or "").strip()
+        else:
+            continue
+        if not url:
+            continue
+        release_date = _parse_date(metadata.get("release_date")) or today
+        cutoff_month = _parse_date(metadata.get("cutoff_month")) or _month_floor(release_date)
+        source_type = str(metadata.get("source_type") or ("quarterly" if index == 0 else "monthly")).strip() or "quarterly"
+        artifacts.append(
+            SourceArtifact(
+                source_type=source_type,
+                url=url,
+                artifact_name=str(metadata.get("artifact_name") or _artifact_name(url)),
+                release_date=release_date,
+                cutoff_month=cutoff_month,
+            )
+        )
+    return artifacts
+
+
 async def _fetch_catalog() -> dict[str, Any]:
     raw = await download_it(CATALOG_URL, local_timeout=180)
     return json.loads(raw)
+
+
+async def _stage_artifact_file(url: str, zip_path: str) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme in {"", "file"}:
+        source_path = Path(parsed.path if parsed.scheme == "file" else url).expanduser()
+        if not source_path.exists():
+            raise FileNotFoundError(f"Part D source artifact does not exist: {source_path}")
+        await asyncio.to_thread(shutil.copyfile, source_path, zip_path)
+        return
+    await download_it_and_save(url, zip_path)
 
 
 def _iter_additional_indexes(obj: type) -> list[dict[str, Any]]:
@@ -1479,7 +1534,7 @@ async def _import_artifact(
     Path(PARTD_WORKDIR).mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="partd_", dir=PARTD_WORKDIR) as tmpdir:
         zip_path = str(Path(tmpdir) / artifact.artifact_name)
-        await download_it_and_save(artifact.url, zip_path)
+        await _stage_artifact_file(artifact.url, zip_path)
 
         extraction_root = Path(tmpdir) / "expanded"
         extraction_root.mkdir(parents=True, exist_ok=True)
@@ -1637,10 +1692,16 @@ async def partd_formulary_network_start(ctx, task=None):  # pragma: no cover
     import_id = _normalize_import_id(task.get("import_id"))
     test_mode = bool(task.get("test_mode"))
     redis = ctx.get("redis")
+    await mark_control_run(
+        run_id,
+        status="running",
+        phase_detail="partd-formulary-network running",
+        progress_message="running",
+    )
 
     schema = await _ensure_tables()
     await _truncate_stage_tables(schema)
-    if PARTD_DEFER_ADDITIONAL_INDEXES and PARTD_DROP_ADDITIONAL_INDEXES_BEFORE_IMPORT:
+    if not test_mode and PARTD_DEFER_ADDITIONAL_INDEXES and PARTD_DROP_ADDITIONAL_INDEXES_BEFORE_IMPORT:
         await _drop_partd_secondary_indexes(schema)
 
     now = datetime.datetime.utcnow()
@@ -1657,8 +1718,22 @@ async def partd_formulary_network_start(ctx, task=None):  # pragma: no cover
     )
 
     try:
-        catalog = await _fetch_catalog()
-        artifacts = _resolve_artifacts(catalog, test_mode=test_mode)
+        artifacts = _explicit_artifacts(task)
+        if artifacts:
+            catalog = {}
+        else:
+            catalog = await _fetch_catalog()
+            artifacts = _resolve_artifacts(catalog, test_mode=test_mode)
+        enqueue_live_progress(
+            run_id=run_id,
+            importer="partd-formulary-network",
+            status="running",
+            phase="partd artifacts resolved",
+            unit="artifacts",
+            done=0,
+            total=len(artifacts),
+            message=f"resolved {len(artifacts)} artifact(s)",
+        )
         await _upsert_run(
             {
                 "run_id": run_id,
@@ -1685,8 +1760,18 @@ async def partd_formulary_network_start(ctx, task=None):  # pragma: no cover
 
         activity_total = 0
         pricing_total = 0
-        for artifact in artifacts:
+        for artifact_index, artifact in enumerate(artifacts, start=1):
             snapshot_id = _snapshot_id(artifact)
+            enqueue_live_progress(
+                run_id=run_id,
+                importer="partd-formulary-network",
+                status="running",
+                phase="partd artifact importing",
+                unit="artifacts",
+                done=artifact_index - 1,
+                total=len(artifacts),
+                message=f"importing artifact {artifact_index}/{len(artifacts)}",
+            )
             await _upsert_snapshot(
                 {
                     "snapshot_id": snapshot_id,
@@ -1717,6 +1802,19 @@ async def partd_formulary_network_start(ctx, task=None):  # pragma: no cover
             )
             activity_total += activity_count
             pricing_total += pricing_count
+            enqueue_live_progress(
+                run_id=run_id,
+                importer="partd-formulary-network",
+                status="running",
+                phase="partd artifact imported",
+                unit="artifacts",
+                done=artifact_index,
+                total=len(artifacts),
+                message=(
+                    f"imported {artifact_index}/{len(artifacts)} artifact(s); "
+                    f"activity_rows={activity_total} pricing_rows={pricing_total}"
+                ),
+            )
             await _upsert_snapshot(
                 {
                     "snapshot_id": snapshot_id,
@@ -1739,11 +1837,23 @@ async def partd_formulary_network_start(ctx, task=None):  # pragma: no cover
                 }
             )
 
-        if PARTD_DEFER_ADDITIONAL_INDEXES:
+        if not test_mode and PARTD_DEFER_ADDITIONAL_INDEXES:
+            enqueue_live_progress(
+                run_id=run_id,
+                importer="partd-formulary-network",
+                status="running",
+                phase="partd finalizing indexes",
+                unit="artifacts",
+                done=len(artifacts),
+                total=len(artifacts),
+                pct=95,
+                message="finalizing indexes",
+            )
             await _ensure_partd_secondary_indexes(schema)
             await _analyze_partd_tables(schema)
         await _truncate_stage_tables(schema)
-        await _drop_legacy_partd_tables(schema)
+        if not test_mode:
+            await _drop_legacy_partd_tables(schema)
 
         await _upsert_run(
             {
@@ -1766,9 +1876,20 @@ async def partd_formulary_network_start(ctx, task=None):  # pragma: no cover
             f"activity_rows={activity_total} pricing_rows={pricing_total}",
             flush=True,
         )
+        await mark_control_run(
+            run_id,
+            status="succeeded",
+            phase_detail="partd-formulary-network completed",
+            progress_message="succeeded",
+            metrics={
+                "activity_rows": activity_total,
+                "pricing_rows": pricing_total,
+                "datasets": len(artifacts),
+            },
+        )
     except Exception as exc:  # pylint: disable=broad-exception-caught
         await _truncate_stage_tables(schema)
-        if PARTD_DEFER_ADDITIONAL_INDEXES and PARTD_DROP_ADDITIONAL_INDEXES_BEFORE_IMPORT:
+        if not test_mode and PARTD_DEFER_ADDITIONAL_INDEXES and PARTD_DROP_ADDITIONAL_INDEXES_BEFORE_IMPORT:
             try:
                 await _ensure_partd_secondary_indexes(schema)
                 await _analyze_partd_tables(schema)
@@ -1784,6 +1905,13 @@ async def partd_formulary_network_start(ctx, task=None):  # pragma: no cover
                 "source_summary": {"test_mode": test_mode},
                 "error_text": str(exc),
             }
+        )
+        await mark_control_run(
+            run_id,
+            status="failed",
+            phase_detail="partd-formulary-network failed",
+            progress_message="failed",
+            error={"code": "import_failed", "message": str(exc)},
         )
         raise
 

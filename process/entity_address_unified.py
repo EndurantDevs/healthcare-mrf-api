@@ -13,7 +13,9 @@ from typing import Iterable
 from arq import create_pool
 
 from db.models import EntityAddressUnified, db
+from process.control_lifecycle import mark_control_run
 from process.ext.utils import ensure_database, make_class, my_init_db, print_time_info
+from process.live_progress import enqueue_live_progress
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
 
@@ -1602,10 +1604,12 @@ def _inference_sql(
 async def process_data(ctx, task=None):
     task = task or {}
     ctx.setdefault("context", {})
+    context = ctx["context"]
+    run_id = str(context.get("control_run_id") or ctx.get("control_run_id") or "").strip()
 
     if "test_mode" in task:
-        ctx["context"]["test_mode"] = bool(task.get("test_mode"))
-    test_mode = bool(ctx["context"].get("test_mode", False))
+        context["test_mode"] = bool(task.get("test_mode"))
+    test_mode = bool(context.get("test_mode", False))
 
     await ensure_database(test_mode)
 
@@ -1651,6 +1655,17 @@ async def process_data(ctx, task=None):
     )
     if not source_selects:
         raise RuntimeError("No source tables are available for entity_address_unified materialization.")
+    if run_id:
+        enqueue_live_progress(
+            run_id=run_id,
+            importer="entity-address-unified",
+            status="running",
+            phase="entity-address-unified sources discovered",
+            unit="sources",
+            done=0,
+            total=len(source_selects),
+            message=f"{len(source_selects)} sources discovered",
+        )
 
     chunked_load = _env_bool("HLTHPRT_ENTITY_ADDRESS_UNIFIED_CHUNKED_LOAD", True)
     if chunked_load:
@@ -1679,10 +1694,26 @@ async def process_data(ctx, task=None):
         await db.status(_prepare_raw_stage_sql(db_schema, raw_table, unlogged=use_unlogged_raw))
 
         sem = asyncio.Semaphore(source_concurrency)
+        source_progress_lock = asyncio.Lock()
+        loaded_sources = 0
 
         async def _load_source(select_sql: str) -> None:
+            nonlocal loaded_sources
             async with sem:
                 await db.status(_insert_raw_from_source_sql(db_schema, raw_table, select_sql))
+            if run_id:
+                async with source_progress_lock:
+                    loaded_sources += 1
+                    enqueue_live_progress(
+                        run_id=run_id,
+                        importer="entity-address-unified",
+                        status="running",
+                        phase="entity-address-unified loading sources",
+                        unit="sources",
+                        done=loaded_sources,
+                        total=len(source_selects),
+                        message=f"loaded {loaded_sources}/{len(source_selects)} sources",
+                    )
 
         if source_concurrency > 1 and len(source_selects) > 1:
             await asyncio.gather(*(_load_source(select_sql) for select_sql in source_selects))
@@ -1695,8 +1726,22 @@ async def process_data(ctx, task=None):
             f"ON {db_schema}.{raw_table} (entity_type, entity_id, type, checksum);"
         )
         await db.status(f"TRUNCATE TABLE {db_schema}.{stage_table};")
+        if run_id:
+            enqueue_live_progress(
+                run_id=run_id,
+                importer="entity-address-unified",
+                status="running",
+                phase="entity-address-unified aggregating",
+                unit="shards",
+                done=0,
+                total=aggregate_shards,
+                message=f"aggregating {aggregate_shards} shards",
+            )
+        aggregate_progress_lock = asyncio.Lock()
+        aggregated_shards = 0
 
         async def _aggregate_shard(remainder: int) -> None:
+            nonlocal aggregated_shards
             await db.status(
                 _materialize_from_raw_sql(
                     db_schema,
@@ -1706,6 +1751,19 @@ async def process_data(ctx, task=None):
                     checksum_remainder=remainder,
                 )
             )
+            if run_id:
+                async with aggregate_progress_lock:
+                    aggregated_shards += 1
+                    enqueue_live_progress(
+                        run_id=run_id,
+                        importer="entity-address-unified",
+                        status="running",
+                        phase="entity-address-unified aggregating",
+                        unit="shards",
+                        done=aggregated_shards,
+                        total=aggregate_shards,
+                        message=f"aggregated {aggregated_shards}/{aggregate_shards} shards",
+                    )
 
         if aggregate_shards > 1:
             agg_sem = asyncio.Semaphore(aggregate_concurrency)
@@ -1720,8 +1778,30 @@ async def process_data(ctx, task=None):
 
         await db.status(f"DROP TABLE IF EXISTS {db_schema}.{raw_table};")
     else:
+        if run_id:
+            enqueue_live_progress(
+                run_id=run_id,
+                importer="entity-address-unified",
+                status="running",
+                phase="entity-address-unified materializing",
+                unit="sources",
+                done=0,
+                total=len(source_selects),
+                message="materializing sources",
+            )
         await db.status(f"TRUNCATE TABLE {db_schema}.{stage_table};")
         await db.status(_materialize_sql(db_schema, stage_table, source_selects))
+        if run_id:
+            enqueue_live_progress(
+                run_id=run_id,
+                importer="entity-address-unified",
+                status="running",
+                phase="entity-address-unified materialized",
+                unit="sources",
+                done=len(source_selects),
+                total=len(source_selects),
+                message="sources materialized",
+            )
 
     enable_inference = str(
         os.getenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENABLE_INFERENCE", "true")
@@ -1744,8 +1824,20 @@ async def process_data(ctx, task=None):
     await db.status(_apply_multi_source_evidence_sql(db_schema, stage_table))
 
     if not ctx["context"].get("stage_indexes_prepared"):
+        if run_id:
+            enqueue_live_progress(
+                run_id=run_id,
+                importer="entity-address-unified",
+                status="running",
+                phase="entity-address-unified indexing",
+                unit="run",
+                done=0,
+                total=1,
+                pct=90,
+                message="building indexes",
+            )
         await _create_stage_indexes(stage_cls, db_schema)
-        ctx["context"]["stage_indexes_prepared"] = True
+        context["stage_indexes_prepared"] = True
 
     staged_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{stage_table};") or 0)
     npi_rows = int(
@@ -1763,11 +1855,23 @@ async def process_data(ctx, task=None):
         or 0
     )
 
-    ctx["context"]["run"] = ctx["context"].get("run", 0) + 1
-    ctx["context"]["staged_rows"] = staged_rows
-    ctx["context"]["npi_rows"] = npi_rows
-    ctx["context"]["inferred_rows"] = inferred_rows
-    ctx["context"]["multi_source_rows"] = multi_source_rows
+    context["run"] = context.get("run", 0) + 1
+    context["staged_rows"] = staged_rows
+    context["npi_rows"] = npi_rows
+    context["inferred_rows"] = inferred_rows
+    context["multi_source_rows"] = multi_source_rows
+    if run_id:
+        enqueue_live_progress(
+            run_id=run_id,
+            importer="entity-address-unified",
+            status="running",
+            phase="entity-address-unified staged",
+            unit="rows",
+            done=staged_rows,
+            total=staged_rows,
+            pct=95,
+            message=f"staged {staged_rows} rows",
+        )
     logger.info(
         "EntityAddressUnified materialization done: rows=%d npi_rows=%d inferred_rows=%d multi_source_rows=%d",
         staged_rows,
@@ -1798,6 +1902,7 @@ async def startup(ctx):
 async def shutdown(ctx):
     import_date = ctx.get("import_date")
     context = ctx.get("context") or {}
+    run_id = str(context.get("control_run_id") or ctx.get("control_run_id") or "").strip()
 
     if not context.get("run"):
         logger.info("No EntityAddressUnified jobs ran; skipping shutdown.")
@@ -1850,6 +1955,26 @@ async def shutdown(ctx):
                 )
 
     logger.info("EntityAddressUnified publish complete: rows=%d", stage_rows)
+    await mark_control_run(
+        run_id,
+        status="succeeded",
+        phase_detail="entity-address-unified published",
+        progress_message="succeeded",
+        progress={
+            "unit": "rows",
+            "done": stage_rows,
+            "total": stage_rows,
+            "pct": 100,
+            "message": "succeeded",
+            "phase": "entity-address-unified published",
+        },
+        metrics={
+            "rows": stage_rows,
+            "npi_rows": int(context.get("npi_rows") or 0),
+            "inferred_rows": int(context.get("inferred_rows") or 0),
+            "multi_source_rows": int(context.get("multi_source_rows") or 0),
+        },
+    )
     print_time_info(context.get("start"))
 
 

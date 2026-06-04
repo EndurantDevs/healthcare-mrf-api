@@ -55,4 +55,5 @@ tzdata>=2025.2
 unicode-slugify
 unidecode>=1.4.0
 us
+watchfiles>=1.1.1
 yarl>=1.23.0

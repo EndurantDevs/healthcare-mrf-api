@@ -9,6 +9,7 @@ import re
 import sys
 import tempfile
 import zipfile
+from pathlib import Path
 from pathlib import PurePath
 
 import pytz
@@ -34,6 +35,22 @@ ATTRIBUTES_QUEUE_NAME = "arq:Attributes"
 
 _TABLES_PREPARED = False
 _TABLES_LOCK = asyncio.Lock()
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_TEST_FILE_LIMIT = 1
+DEFAULT_TEST_ROW_LIMIT = 500
+
+
+class _InlineAttributeRedis:
+    def __init__(self, ctx):
+        self.ctx = ctx
+        self.count = 0
+
+    async def enqueue_job(self, function_name, payload, **_kwargs):
+        if function_name != "save_attributes":
+            raise RuntimeError(f"Unsupported inline attributes job: {function_name}")
+        self.count += 1
+        await save_attributes(self.ctx, payload)
+        return type("InlineJob", (), {"job_id": f"inline_save_attributes_{self.count}"})()
 
 
 async def _table_exists(schema: str, table_name: str) -> bool:
@@ -107,6 +124,18 @@ def _parse_flag(value, truthy: tuple[str, ...], falsy: tuple[str, ...]) -> bool 
     if normalized in falsy:
         return False
     return None
+
+
+def _test_file_limit() -> int:
+    return max(1, int(os.environ.get("HLTHPRT_ATTRIBUTES_TEST_FILE_LIMIT", DEFAULT_TEST_FILE_LIMIT)))
+
+
+def _test_row_limit() -> int:
+    return max(1, int(os.environ.get("HLTHPRT_ATTRIBUTES_TEST_ROW_LIMIT", DEFAULT_TEST_ROW_LIMIT)))
+
+
+def _bounded_test_files(files, test_mode: bool):
+    return list(files)[: _test_file_limit()] if test_mode else list(files)
 
 
 def _normalize_plan_ids(standard_id, full_id):
@@ -259,6 +288,7 @@ async def process_attributes(ctx, task):
     test_mode = bool(ctx.get("context", {}).get("test_mode"))
     db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
     myplanattributes = make_class(PlanAttributes, import_date, schema_override=db_schema)
+    test_row_limit = _test_row_limit()
 
     with tempfile.TemporaryDirectory() as tmpdirname:
         p = "attr.csv"
@@ -309,6 +339,8 @@ async def process_attributes(ctx, task):
                     count = 0
                 else:
                     count += 1
+                if test_mode and count >= test_row_limit:
+                    break
 
             if attr_obj_list:
                 await push_objects(attr_obj_list, myplanattributes)
@@ -325,6 +357,7 @@ async def process_benefits(ctx, task):
     test_mode = bool(ctx.get("context", {}).get("test_mode"))
     db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
     myplanbenefits = make_class(PlanBenefits, import_date, schema_override=db_schema)
+    test_row_limit = _test_row_limit()
 
     with tempfile.TemporaryDirectory() as tmpdirname:
         p = "benefits.csv"
@@ -414,6 +447,8 @@ async def process_benefits(ctx, task):
                     count = 0
                 else:
                     count += 1
+                if test_mode and count >= test_row_limit:
+                    break
 
             if attr_obj_list:
                 await push_objects(attr_obj_list, myplanbenefits)
@@ -427,7 +462,10 @@ async def process_rating_areas(ctx):
     db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
     myplanrating = make_class(PlanRatingAreas, import_date, schema_override=db_schema)
     attr_obj_list = []
-    async with async_open("data/rating_areas.csv", "r", encoding='utf-8-sig') as afp:
+    rating_areas_path = _PROJECT_ROOT / "data" / "rating_areas.csv"
+    if not rating_areas_path.exists():
+        rating_areas_path = _PROJECT_ROOT / "restore" / "data" / "rating_areas.csv"
+    async with async_open(rating_areas_path, "r", encoding='utf-8-sig') as afp:
         async for row in AsyncDictReader(afp, delimiter=";"):
             obj = {
                 "state": row["STATE CODE"].upper(),
@@ -454,6 +492,7 @@ async def process_prices(ctx, task):
     test_mode = bool(ctx.get("context", {}).get("test_mode"))
     db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
     myplanprices = make_class(PlanPrices, import_date, schema_override=db_schema)
+    test_row_limit = _test_row_limit()
 
     with tempfile.TemporaryDirectory() as tmpdirname:
         p = "rate.csv"
@@ -568,6 +607,8 @@ async def process_prices(ctx, task):
                     count = 0
                 else:
                     count += 1
+                if test_mode and count >= test_row_limit:
+                    break
 
             if attr_obj_list:
                 await push_objects(attr_obj_list, myplanprices)
@@ -681,6 +722,7 @@ async def process_state_attributes(ctx, task):
     test_mode = bool(ctx.get("context", {}).get("test_mode"))
     db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
     myplanattributes = make_class(PlanAttributes, import_date, schema_override=db_schema)
+    test_row_limit = _test_row_limit()
 
     with tempfile.TemporaryDirectory() as tmpdirname:
         p = "attr.csv"
@@ -734,6 +776,8 @@ async def process_state_attributes(ctx, task):
                     count = 0
                 else:
                     count += 1
+                if test_mode and count >= test_row_limit:
+                    break
 
             if attr_obj_list:
                 await push_objects(attr_obj_list, myplanattributes)
@@ -746,14 +790,11 @@ async def main(test_mode: bool = False):
         job_deserializer=deserialize_job,
         default_queue_name=ATTRIBUTES_QUEUE_NAME,
     )
-    attribute_files = json.loads(os.environ["HLTHPRT_CMSGOV_PLAN_ATTRIBUTES_URL_PUF"])
-    state_attribute_files = json.loads(
-        os.environ["HLTHPRT_CMSGOV_STATE_PLAN_ATTRIBUTES_URL_PUF"]
-    )
-
-    price_files = json.loads(os.environ["HLTHPRT_CMSGOV_PRICE_PLAN_URL_PUF"])
-
-    benefits_files = json.loads(os.environ["HLTHPRT_CMSGOV_BENEFITS_URL_PUF"])
+    source_groups = _attribute_source_groups()
+    attribute_files = _bounded_test_files(source_groups["attributes"], test_mode)
+    state_attribute_files = _bounded_test_files(source_groups["state_attributes"], test_mode)
+    price_files = _bounded_test_files(source_groups["prices"], test_mode)
+    benefits_files = _bounded_test_files(source_groups["benefits"], test_mode)
 
     print("Starting to process STATE Plan Attribute files..")
     for file in state_attribute_files:
@@ -806,3 +847,57 @@ async def main(test_mode: bool = False):
             },
             _queue_name=ATTRIBUTES_QUEUE_NAME,
         )
+
+
+def _attribute_source_groups():
+    return {
+        "attributes": json.loads(os.environ["HLTHPRT_CMSGOV_PLAN_ATTRIBUTES_URL_PUF"]),
+        "state_attributes": json.loads(os.environ["HLTHPRT_CMSGOV_STATE_PLAN_ATTRIBUTES_URL_PUF"]),
+        "prices": json.loads(os.environ["HLTHPRT_CMSGOV_PRICE_PLAN_URL_PUF"]),
+        "benefits": json.loads(os.environ["HLTHPRT_CMSGOV_BENEFITS_URL_PUF"]),
+    }
+
+
+async def plan_attributes_control_start(ctx, task=None):
+    task = task or {}
+    ctx.setdefault("context", {})
+    ctx["context"]["test_mode"] = bool(task.get("test_mode", task.get("test", False)))
+    ctx["context"].setdefault("start", datetime.datetime.utcnow().replace(tzinfo=pytz.utc))
+    ctx["import_date"] = datetime.datetime.now().strftime("%Y%m%d")
+    ctx["redis"] = _InlineAttributeRedis(ctx)
+
+    source_groups = _attribute_source_groups()
+    state_attribute_files = _bounded_test_files(source_groups["state_attributes"], ctx["context"]["test_mode"])
+    attribute_files = _bounded_test_files(source_groups["attributes"], ctx["context"]["test_mode"])
+    price_files = _bounded_test_files(source_groups["prices"], ctx["context"]["test_mode"])
+    benefits_files = _bounded_test_files(source_groups["benefits"], ctx["context"]["test_mode"])
+    for file in state_attribute_files:
+        await process_state_attributes(
+            ctx,
+            {"url": file["url"], "year": file["year"], "context": {"test_mode": ctx["context"]["test_mode"]}},
+        )
+    for file in attribute_files:
+        await process_attributes(
+            ctx,
+            {"url": file["url"], "year": file["year"], "context": {"test_mode": ctx["context"]["test_mode"]}},
+        )
+    for file in price_files:
+        await process_prices(
+            ctx,
+            {"url": file["url"], "year": file["year"], "context": {"test_mode": ctx["context"]["test_mode"]}},
+        )
+    for file in benefits_files:
+        await process_benefits(
+            ctx,
+            {"url": file["url"], "year": file["year"], "context": {"test_mode": ctx["context"]["test_mode"]}},
+        )
+
+    await shutdown(ctx)
+    return {
+        "state_attribute_files": len(state_attribute_files),
+        "attribute_files": len(attribute_files),
+        "price_files": len(price_files),
+        "benefit_files": len(benefits_files),
+        "inline_save_jobs": ctx["redis"].count,
+        "test_mode": ctx["context"]["test_mode"],
+    }

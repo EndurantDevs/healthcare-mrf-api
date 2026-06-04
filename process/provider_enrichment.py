@@ -48,6 +48,8 @@ from process.ext.utils import (
     push_objects,
     return_checksum,
 )
+from process.control_lifecycle import mark_control_run
+from process.live_progress import enqueue_live_progress
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
 
@@ -1115,9 +1117,11 @@ async def _run_nppes_gap_check(ctx: dict[str, Any]) -> dict[str, Any]:
 async def process_data(ctx, task=None):  # pragma: no cover
     task = task or {}
     ctx.setdefault("context", {})
+    context = ctx["context"]
+    run_id = str(context.get("control_run_id") or ctx.get("control_run_id") or "").strip()
     if "test_mode" in task:
-        ctx["context"]["test_mode"] = bool(task.get("test_mode"))
-    test_mode = bool(ctx["context"].get("test_mode", False))
+        context["test_mode"] = bool(task.get("test_mode"))
+    test_mode = bool(context.get("test_mode", False))
 
     await ensure_database(test_mode)
     db_schema = os.getenv("HLTHPRT_DB_SCHEMA") if os.getenv("HLTHPRT_DB_SCHEMA") else "mrf"
@@ -1154,6 +1158,17 @@ async def process_data(ctx, task=None):  # pragma: no cover
         raise RuntimeError("No registered provider-enrichment sources were discovered from the CMS catalog.")
 
     print(f"Provider enrichment discovery: sources={len(sources)} unmapped={len(unmapped)}")
+    if run_id:
+        enqueue_live_progress(
+            run_id=run_id,
+            importer="provider-enrichment",
+            status="running",
+            phase="provider-enrichment sources discovered",
+            unit="sources",
+            done=0,
+            total=len(sources),
+            message=f"{len(sources)} sources discovered",
+        )
 
     batch_size = _env_positive_int(
         "HLTHPRT_PROVIDER_ENRICHMENT_BATCH_SIZE",
@@ -1183,6 +1198,18 @@ async def process_data(ctx, task=None):  # pragma: no cover
                 "Downloading provider-enrichment source "
                 f"[{source_idx + 1}/{len(sources)}] {spec_key} {source.get('distribution_title')}"
             )
+            if run_id:
+                enqueue_live_progress(
+                    run_id=run_id,
+                    importer="provider-enrichment",
+                    status="running",
+                    phase=f"provider-enrichment loading {spec_key}",
+                    unit="sources",
+                    done=source_idx,
+                    total=len(sources),
+                    message=f"loading {spec_key}",
+                    label=str(source.get("distribution_title") or spec_key),
+                )
             await _download_source(str(source["download_url"]), local_path)
 
             csv_encoding = _select_csv_encoding(local_path)
@@ -1244,8 +1271,20 @@ async def process_data(ctx, task=None):  # pragma: no cover
                 f"Provider-enrichment source done: spec={spec_key} processed={processed_rows:,} "
                 f"accepted={rows_accepted:,} dropped_missing_npi={rows_dropped_missing_npi:,}"
             )
+            if run_id:
+                enqueue_live_progress(
+                    run_id=run_id,
+                    importer="provider-enrichment",
+                    status="running",
+                    phase=f"provider-enrichment loaded {spec_key}",
+                    unit="sources",
+                    done=source_idx + 1,
+                    total=len(sources),
+                    message=f"loaded {spec_key}",
+                    label=str(source.get("distribution_title") or spec_key),
+                )
 
-    ctx["context"]["run"] = ctx["context"].get("run", 0) + 1
+    context["run"] = context.get("run", 0) + 1
 
 
 async def startup(ctx):  # pragma: no cover
@@ -1516,6 +1555,7 @@ async def _materialize_summary(import_date: str, db_schema: str, nppes_report: d
 async def shutdown(ctx):  # pragma: no cover
     import_date = ctx["import_date"]
     context = ctx.get("context") or {}
+    run_id = str(context.get("control_run_id") or ctx.get("control_run_id") or "").strip()
     if not context.get("run"):
         print("No provider-enrichment jobs ran in this worker session; skipping shutdown validation.")
         return
@@ -1548,11 +1588,13 @@ async def shutdown(ctx):  # pragma: no cover
         ProviderEnrollmentFFSSecondarySpecialty,
         ProviderEnrollmentFFSReassignment,
     )
+    stage_counts: dict[str, int] = {}
     for cls in required_nonempty_tables:
         stage_obj = tables[cls.__main_table__]
         row_count = await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{stage_obj.__tablename__};")
-        print(f"Provider-enrichment staging rows: {stage_obj.__tablename__}={int(row_count or 0):,}")
-        if not row_count:
+        stage_counts[cls.__main_table__] = int(row_count or 0)
+        print(f"Provider-enrichment staging rows: {stage_obj.__tablename__}={stage_counts[cls.__main_table__]:,}")
+        if not stage_counts[cls.__main_table__]:
             raise RuntimeError(
                 f"Required staging table {db_schema}.{stage_obj.__tablename__} is empty; "
                 "aborting provider-enrichment publish."
@@ -1563,6 +1605,8 @@ async def shutdown(ctx):  # pragma: no cover
         db_schema,
         context.get("audit", {}).get("nppes_gap_report", {}),
     )
+    summary_stage = tables[ProviderEnrichmentSummary.__main_table__]
+    summary_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{summary_stage.__tablename__};") or 0)
 
     async with db.transaction():
         for cls in processing_classes:
@@ -1613,6 +1657,27 @@ async def shutdown(ctx):  # pragma: no cover
                     f"RENAME TO {table}_idx_{index_name};"
                 )
 
+    await mark_control_run(
+        run_id,
+        status="succeeded",
+        phase_detail="provider-enrichment published",
+        progress_message="succeeded",
+        progress={
+            "unit": "tables",
+            "done": len(processing_classes),
+            "total": len(processing_classes),
+            "pct": 100,
+            "message": "succeeded",
+            "phase": "provider-enrichment published",
+        },
+        metrics={
+            "stage_rows": stage_counts,
+            "summary_rows": summary_rows,
+            "datasets": len(context.get("audit", {}).get("dataset_stats", {}) or {}),
+            "rows_accepted": int(context.get("audit", {}).get("rows_accepted") or 0),
+            "rows_dropped_missing_npi": int(context.get("audit", {}).get("rows_dropped_missing_npi") or 0),
+        },
+    )
     print_time_info(context.get("start"))
 
 

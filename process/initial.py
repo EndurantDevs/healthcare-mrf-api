@@ -34,6 +34,8 @@ from process.ext.utils import (download_it_and_save, ensure_database,
                                flush_error_log, get_import_schema, log_error,
                                make_class, my_init_db, print_time_info,
                                push_objects, return_checksum)
+from process.control_lifecycle import mark_control_run
+from process.live_progress import enqueue_live_progress
 from process.plan_summary import rebuild_plan_search_summary
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
@@ -1818,9 +1820,12 @@ async def init_file(ctx, task=None):
     """
     task = task or {}
     test_mode = bool(task.get("test_mode"))
+    run_id = str(task.get("run_id") or "").strip() or None
     redis = ctx["redis"]
     ctx.setdefault("context", {})
     ctx["context"]["test_mode"] = test_mode
+    if run_id:
+        ctx["context"]["control_run_id"] = run_id
     await ensure_database(test_mode)
 
     mrf_source = os.environ["HLTHPRT_CMSGOV_MRF_URL_PUF"]
@@ -1835,6 +1840,13 @@ async def init_file(ctx, task=None):
     if not mrf_urls:
         raise RuntimeError("HLTHPRT_CMSGOV_MRF_URL_PUF did not provide any usable URLs")
     print("Downloading data from: ", ", ".join(mrf_urls))
+    await mark_control_run(
+        run_id,
+        status="running",
+        phase_detail="mrf preparing import tables",
+        progress_message="preparing import tables",
+        progress={"unit": "phase", "total": 4, "done": 0, "pct": 0, "message": "preparing import tables"},
+    )
 
     import_date = ctx["context"]["import_date"]
     await _prepare_import_tables(import_date, test_mode)
@@ -2009,17 +2021,51 @@ async def init_file(ctx, task=None):
         await asyncio.gather(
             push_objects(list(issuer_list.values()), myissuer), push_objects(list(plan_list.values()), myplan)
         )
+        enqueue_live_progress(
+            run_id=run_id,
+            importer="mrf",
+            status="running",
+            phase="mrf issuer data staged",
+            unit="phase",
+            total=4,
+            done=2,
+            pct=50,
+            message=f"staged {len(issuer_list)} issuers and {len(plan_list)} plans",
+        )
 
         max_urls = TEST_PLAN_URLS if test_mode else None
+        selected_urls = sorted(url_list)[:max_urls] if max_urls else sorted(url_list)
+        await mark_control_run(
+            run_id,
+            status="running",
+            phase_detail="mrf index jobs enqueuing",
+            progress_message=f"enqueuing {len(selected_urls)} index job(s)",
+            metrics={"index_url_count": len(selected_urls), "issuer_count": len(issuer_list), "plan_count": len(plan_list)},
+            progress={
+                "unit": "index_jobs",
+                "total": len(selected_urls),
+                "done": 0,
+                "pct": 50,
+                "message": f"enqueuing {len(selected_urls)} index job(s)",
+            },
+        )
 
-        for idx, url in enumerate(sorted(url_list)):
+        for idx, url in enumerate(selected_urls):
             await redis.enqueue_job(
                 "process_json_index",
                 {"url": url, "issuer_array": url2issuer[url], "context": ctx["context"]},
                 _queue_name=MRF_QUEUE_NAME,
             )
-            if max_urls and idx + 1 >= max_urls:
-                break
+            enqueue_live_progress(
+                run_id=run_id,
+                importer="mrf",
+                status="running",
+                phase="mrf index jobs enqueued",
+                unit="index_jobs",
+                total=len(selected_urls),
+                done=idx + 1,
+                message=f"enqueued {idx + 1}/{len(selected_urls)} index job(s)",
+            )
 
         shutdown_job_id = f"shutdown_mrf_{ctx['context']['import_date']}"
         await redis.enqueue_job(
@@ -2054,8 +2100,16 @@ async def shutdown(ctx, task):
     """
     if "context" in task:
         ctx["context"] = task["context"]
+    run_id = str(ctx.get("context", {}).get("control_run_id") or "").strip() or None
     import_date = ctx["context"]["import_date"]
     test_mode = is_test_mode(ctx)
+    await mark_control_run(
+        run_id,
+        status="running",
+        phase_detail="mrf finalizing",
+        progress_message="finalizing",
+        progress={"unit": "phase", "total": 4, "done": 3, "pct": 90, "message": "finalizing"},
+    )
     await ensure_database(test_mode)
     db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
     myimportlog = make_class(ImportLog, import_date, schema_override=db_schema)
@@ -2152,6 +2206,14 @@ async def shutdown(ctx, task):
         summary_rows = await rebuild_plan_search_summary(test_mode=test_mode)
     print("Plan search summary rows: ", summary_rows)
     print_time_info(ctx["context"]["start"])
+    await mark_control_run(
+        run_id,
+        status="succeeded",
+        phase_detail="mrf import published",
+        progress_message="succeeded",
+        metrics={"plans_count": plans_count, "summary_rows": summary_rows},
+        progress={"unit": "phase", "total": 4, "done": 4, "pct": 100, "message": "succeeded", "phase": "mrf import published"},
+    )
 
 
 async def main(test_mode: bool = False):

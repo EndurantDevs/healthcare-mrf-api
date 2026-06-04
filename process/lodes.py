@@ -14,6 +14,7 @@ from collections import defaultdict
 from arq import create_pool
 
 from db.models import LODESWorkplaceAggregate, db
+from process.control_lifecycle import mark_control_run
 from process.ext.utils import (download_it_and_save, ensure_database,
                                make_class, my_init_db, print_time_info,
                                push_objects)
@@ -112,6 +113,12 @@ async def _ensure_schema_exists(db_schema: str) -> None:
             )
             return
         raise
+
+
+async def _table_exists(db_schema: str, table_name: str) -> bool:
+    db_schema = _validate_schema_name(db_schema)
+    qualified_name = f"{db_schema}.{table_name}"
+    return bool(await db.scalar("SELECT to_regclass(:qualified_name) IS NOT NULL;", qualified_name=qualified_name))
 
 
 async def _load_tract_to_zip_crosswalk(client) -> dict[str, str]:
@@ -320,7 +327,17 @@ async def process_data(ctx, task=None):
     await ensure_database(test_mode)
 
     import_date = ctx["import_date"]
+    db_schema = os.getenv("HLTHPRT_DB_SCHEMA") if os.getenv("HLTHPRT_DB_SCHEMA") else "mrf"
     stage_cls = make_class(LODESWorkplaceAggregate, import_date)
+    await _ensure_schema_exists(db_schema)
+    if not await _table_exists(db_schema, stage_cls.__tablename__):
+        await db.create_table(stage_cls.__table__, checkfirst=True)
+        if hasattr(stage_cls, "__my_index_elements__") and stage_cls.__my_index_elements__:
+            await db.status(
+                f"CREATE UNIQUE INDEX IF NOT EXISTS {stage_cls.__tablename__}_idx_primary "
+                f"ON {db_schema}.{stage_cls.__tablename__} "
+                f"({', '.join(stage_cls.__my_index_elements__)});"
+            )
     batch_size = int(os.getenv("HLTHPRT_LODES_BATCH_SIZE", str(DEFAULT_BATCH_SIZE)))
 
     import aiohttp
@@ -403,6 +420,7 @@ async def startup(ctx):
 async def shutdown(ctx):
     import_date = ctx.get("import_date")
     context = ctx.get("context") or {}
+    run_id = str(context.get("control_run_id") or ctx.get("control_run_id") or "").strip()
 
     if not context.get("run"):
         logger.info("No LODES jobs ran; skipping shutdown.")
@@ -412,6 +430,22 @@ async def shutdown(ctx):
 
     db_schema = os.getenv("HLTHPRT_DB_SCHEMA") if os.getenv("HLTHPRT_DB_SCHEMA") else "mrf"
     stage_cls = make_class(LODESWorkplaceAggregate, import_date)
+    if not await _table_exists(db_schema, stage_cls.__tablename__):
+        if context.get("test_mode"):
+            logger.info(
+                "LODES test mode: stage table %s.%s is missing; skipping publish.",
+                db_schema,
+                stage_cls.__tablename__,
+            )
+            await mark_control_run(
+                run_id,
+                status="succeeded",
+                phase_detail="lodes test mode no rows",
+                progress_message="succeeded",
+                metrics={"stage_rows": 0, "distinct_zctas": 0, "geo_match_ratio": 0.0},
+            )
+            return
+        raise RuntimeError(f"LODES stage table {db_schema}.{stage_cls.__tablename__} is missing; aborting publish.")
 
     stage_rows = int(await db.scalar(
         f"SELECT COUNT(*) FROM {db_schema}.{stage_cls.__tablename__};"
@@ -419,14 +453,20 @@ async def shutdown(ctx):
     distinct_zctas = int(await db.scalar(
         f"SELECT COUNT(DISTINCT zcta_code) FROM {db_schema}.{stage_cls.__tablename__};"
     ) or 0)
-    matched_zctas = int(await db.scalar(
-        f"""
-        SELECT COUNT(DISTINCT s.zcta_code)
-          FROM {db_schema}.{stage_cls.__tablename__} AS s
-          JOIN {db_schema}.geo_zip_lookup AS g
-            ON g.zip_code = s.zcta_code
-        """
-    ) or 0)
+    if await _table_exists(db_schema, "geo_zip_lookup"):
+        matched_zctas = int(await db.scalar(
+            f"""
+            SELECT COUNT(DISTINCT s.zcta_code)
+              FROM {db_schema}.{stage_cls.__tablename__} AS s
+              JOIN {db_schema}.geo_zip_lookup AS g
+                ON g.zip_code = s.zcta_code
+            """
+        ) or 0)
+    elif context.get("test_mode"):
+        matched_zctas = 0
+        logger.info("LODES test mode: %s.geo_zip_lookup is missing; skipping geo match validation.", db_schema)
+    else:
+        raise RuntimeError(f"LODES requires {db_schema}.geo_zip_lookup for publish validation.")
     geo_match_ratio = (matched_zctas / distinct_zctas) if distinct_zctas else 0.0
 
     if context.get("test_mode"):
@@ -477,6 +517,18 @@ async def shutdown(ctx):
         geo_match_ratio,
     )
     print_time_info(context.get("start"))
+    await mark_control_run(
+        run_id,
+        status="succeeded",
+        phase_detail="lodes published",
+        progress_message="succeeded",
+        metrics={
+            "stage_rows": stage_rows,
+            "distinct_zctas": distinct_zctas,
+            "matched_zctas": matched_zctas,
+            "geo_match_ratio": geo_match_ratio,
+        },
+    )
 
 
 async def main(test_mode: bool = False):

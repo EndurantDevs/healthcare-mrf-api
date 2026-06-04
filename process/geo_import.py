@@ -121,6 +121,12 @@ async def load_geo_lookup(source_file: Path | None = None):
     logger.info("Loaded %s geo zip rows from %s", processed, csv_path)
 
 
+async def main(test_mode: bool = False, file_path: Path | str | None = None) -> dict[str, object]:
+    source_file = Path(file_path) if file_path else None
+    await load_geo_lookup(source_file=source_file)
+    return {"test_mode": bool(test_mode), "source_file": str(source_file or DEFAULT_SOURCE)}
+
+
 @click.command(help="Load geo zip lookup data from support/zip CSV files.")
 @click.option(
     "--file",

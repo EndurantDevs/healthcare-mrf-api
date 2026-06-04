@@ -15,6 +15,7 @@ from arq import create_pool
 from sqlalchemy import and_, select
 
 from db.models import FacilityAnchor, GeoZipLookup, db
+from process.control_lifecycle import mark_control_run
 from process.ext.utils import (ensure_database, make_class, my_init_db,
                                print_time_info, push_objects)
 from process.redis_config import build_redis_settings
@@ -120,7 +121,11 @@ def _parse_lat_lng(row: dict) -> tuple[float | None, float | None]:
     return lat, lng
 
 
-async def _load_zip_centroids() -> dict[str, tuple[float, float]]:
+async def _geo_zip_lookup_exists(db_schema: str) -> bool:
+    return bool(await db.scalar("SELECT to_regclass(:qualified_name) IS NOT NULL;", qualified_name=f"{db_schema}.geo_zip_lookup"))
+
+
+async def _load_zip_centroid_rows():
     stmt = (
         select(GeoZipLookup.zip_code, GeoZipLookup.latitude, GeoZipLookup.longitude)
         .where(
@@ -131,7 +136,28 @@ async def _load_zip_centroids() -> dict[str, tuple[float, float]]:
             )
         )
     )
-    result = await db.all(stmt)
+    return await db.all(stmt)
+
+
+async def _load_zip_centroids(*, test_mode: bool = False) -> dict[str, tuple[float, float]]:
+    db_schema = os.getenv("HLTHPRT_DB_SCHEMA") if os.getenv("HLTHPRT_DB_SCHEMA") else "mrf"
+    if await _geo_zip_lookup_exists(db_schema):
+        result = await _load_zip_centroid_rows()
+    elif test_mode:
+        previous_override = getattr(db, "_database_override", None)
+        db._database_override = None  # type: ignore[attr-defined]
+        try:
+            await db.connect()
+            if await _geo_zip_lookup_exists(db_schema):
+                result = await _load_zip_centroid_rows()
+            else:
+                logger.info("Facility Anchors test mode: %s.geo_zip_lookup is unavailable; hospital coordinates may be empty.", db_schema)
+                result = []
+        finally:
+            db._database_override = previous_override  # type: ignore[attr-defined]
+            await db.connect()
+    else:
+        raise RuntimeError(f"Facility Anchors requires {db_schema}.geo_zip_lookup for ZIP centroid enrichment.")
     centroids: dict[str, tuple[float, float]] = {}
     for row in result:
         zip_code = _normalize_zip(getattr(row, "zip_code", None))
@@ -383,7 +409,7 @@ async def process_data(ctx, task=None):
     import aiohttp
     client = aiohttp.ClientSession()
     try:
-        zip_centroids = await _load_zip_centroids()
+        zip_centroids = await _load_zip_centroids(test_mode=test_mode)
         hrsa_count = await _fetch_and_parse_hrsa(client, stage_cls, batch_size, test_mode, test_limit)
         hosp_count, hosp_with_coords = await _fetch_and_parse_cms_hospitals(
             client,
@@ -429,6 +455,7 @@ async def startup(ctx):
 async def shutdown(ctx):
     import_date = ctx.get("import_date")
     context = ctx.get("context") or {}
+    run_id = str(context.get("control_run_id") or ctx.get("control_run_id") or "").strip()
 
     if not context.get("run"):
         logger.info("No Facility Anchors jobs ran; skipping shutdown.")
@@ -523,6 +550,18 @@ async def shutdown(ctx):
         hospital_coord_ratio,
     )
     print_time_info(context.get("start"))
+    await mark_control_run(
+        run_id,
+        status="succeeded",
+        phase_detail="facility-anchors published",
+        progress_message="succeeded",
+        metrics={
+            "rows": stage_rows,
+            "hospital_rows": hospital_rows,
+            "hospital_with_coords": hospital_with_coords,
+            "hospital_coord_ratio": hospital_coord_ratio,
+        },
+    )
 
 
 async def main(test_mode: bool = False):

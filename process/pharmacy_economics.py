@@ -14,6 +14,7 @@ import tempfile
 from arq import create_pool
 
 from db.models import PharmacyEconomicsSummary, db
+from process.control_lifecycle import mark_control_run
 from process.ext.utils import (ensure_database, make_class, my_init_db,
                                print_time_info, push_objects)
 from process.redis_config import build_redis_settings
@@ -48,6 +49,7 @@ STATE_DISPENSING_FEES: dict[str, float] = {
 
 DEFAULT_BATCH_SIZE = 5000
 DEFAULT_MIN_ROWS = 10
+DEFAULT_TEST_ROWS = 5000
 VALID_STATE_CODES = frozenset(STATE_DISPENSING_FEES.keys())
 
 
@@ -320,6 +322,7 @@ async def process_data(ctx, task=None):
     import_date = ctx["import_date"]
     stage_cls = make_class(PharmacyEconomicsSummary, import_date)
     batch_size = int(os.getenv("HLTHPRT_PHARMACY_ECON_BATCH_SIZE", str(DEFAULT_BATCH_SIZE)))
+    test_row_limit = int(os.getenv("HLTHPRT_PHARMACY_ECON_TEST_ROWS", str(DEFAULT_TEST_ROWS)))
 
     import aiohttp
     client = aiohttp.ClientSession()
@@ -369,6 +372,14 @@ async def process_data(ctx, task=None):
                 await push_objects(batch, stage_cls)
                 accepted_rows += len(batch)
                 batch.clear()
+                if test_mode and accepted_rows >= test_row_limit:
+                    break
+
+            if test_mode and accepted_rows + len(batch) >= test_row_limit:
+                break
+
+        if test_mode and accepted_rows + len(batch) >= test_row_limit:
+            break
 
     if batch:
         await push_objects(batch, stage_cls)
@@ -404,6 +415,7 @@ async def startup(ctx):
 async def shutdown(ctx):
     import_date = ctx.get("import_date")
     context = ctx.get("context") or {}
+    run_id = str(context.get("control_run_id") or ctx.get("control_run_id") or "").strip()
 
     if not context.get("run"):
         logger.info("No Pharmacy Economics jobs ran; skipping shutdown.")
@@ -461,6 +473,13 @@ async def shutdown(ctx):
 
     logger.info("Pharmacy Economics publish complete: %d rows", stage_rows)
     print_time_info(context.get("start"))
+    await mark_control_run(
+        run_id,
+        status="succeeded",
+        phase_detail="pharmacy-economics published",
+        progress_message="succeeded",
+        metrics={"rows": stage_rows},
+    )
 
 
 async def main(test_mode: bool = False):

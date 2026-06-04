@@ -10,6 +10,7 @@ from db.json_mixin import JSONOutputMixin
 __all__ = (
     "ImportHistory",
     "ImportLog",
+    "ImportRun",
     "PartDImportRun",
     "PartDFormularySnapshot",
 )
@@ -43,6 +44,53 @@ class ImportLog(Base, JSONOutputMixin):
     url = Column(String)
     source = Column(String)  # plans, index, providers, etc.
     level = Column(String)  # network, json, etc.
+
+
+class ImportRun(Base, JSONOutputMixin):
+    __tablename__ = "import_run"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("run_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["run_id"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("status", "heartbeat_at"), "name": "import_run_status_heartbeat_idx"},
+        {"index_elements": ("importer", "created_at"), "name": "import_run_importer_created_idx"},
+        {
+            "index_elements": ("idempotency_key",),
+            "name": "import_run_active_idempotency_idx",
+            "unique": True,
+            "where": "status IN ('queued', 'starting', 'running', 'finalizing', 'canceling')",
+        },
+        {"index_elements": ("schedule_id",), "name": "import_run_schedule_idx"},
+        {"index_elements": ("subscription_id",), "name": "import_run_subscription_idx"},
+        {"index_elements": ("source_file_import_id",), "name": "import_run_source_file_import_idx"},
+    ]
+
+    run_id = Column(String(64), nullable=False)
+    engine = Column(String(64), nullable=False, default="healthcare-mrf-api")
+    node_id = Column(String(64))
+    importer = Column(String(64), nullable=False)
+    family = Column(String(64))
+    status = Column(String(32), nullable=False)
+    phase_detail = Column(String(128))
+    params = Column(JSON)
+    idempotency_key = Column(String(160))
+    triggered_by = Column(String(32))
+    schedule_id = Column(String(64))
+    subscription_id = Column(String(64))
+    source_file_import_id = Column(String(64))
+    created_at = Column(TIMESTAMP)
+    started_at = Column(TIMESTAMP)
+    finished_at = Column(TIMESTAMP)
+    heartbeat_at = Column(TIMESTAMP)
+    progress = Column(JSON)
+    metrics = Column(JSON)
+    error = Column(JSON)
+    snapshot_id = Column(String(96))
+    import_id = Column(String(64))
+    retry_of_run_id = Column(String(64))
 
 
 class PartDImportRun(Base, JSONOutputMixin):

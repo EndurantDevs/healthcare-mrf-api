@@ -14,6 +14,7 @@ from sqlalchemy import text
 from api.ptg2_types import PTG2ServingTables
 
 PTG2_SCHEMA = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
+PTG2_SERVING_TABLE_ENV = "HLTHPRT_PTG2_SERVING_TABLE"
 _PTG2_TABLE_CACHE_TTL_SECONDS = max(float(os.getenv("HLTHPRT_PTG2_TABLE_CACHE_TTL_SECONDS", "300")), 0.0)
 _PTG2_TABLE_AVAILABLE_CACHE: dict[str, tuple[float, bool]] = {}
 _PTG2_SNAPSHOT_TABLES_CACHE: dict[str, tuple[float, PTG2ServingTables]] = {}
@@ -103,6 +104,42 @@ def _safe_table_name(value: Any, *, default_schema: str = PTG2_SCHEMA) -> str | 
     return f"{schema_name}.{table_name}"
 
 
+def _serving_table_name(snapshot_id: str | None = None) -> str:
+    configured = _safe_table_name(os.getenv(PTG2_SERVING_TABLE_ENV))
+    if configured:
+        return configured
+    if snapshot_id:
+        suffix = re.sub(r"[^A-Za-z0-9_]", "_", str(snapshot_id)).strip("_")[:48]
+        if suffix:
+            return f"{PTG2_SCHEMA}.ptg2_serving_rate_{suffix}"
+    return f"{PTG2_SCHEMA}.ptg2_serving_rate"
+
+
+def _serving_table_candidates(snapshot_id: str | None = None) -> list[str]:
+    candidates = [_serving_table_name(snapshot_id)]
+    if f"{PTG2_SCHEMA}.ptg2_serving_rate" not in candidates:
+        candidates.append(f"{PTG2_SCHEMA}.ptg2_serving_rate")
+    return candidates
+
+
+def _ordered_serving_table_candidates(snapshot_id: str | None = None) -> list[str]:
+    return _serving_table_candidates(snapshot_id)
+
+
+def _is_compact_serving_table(table_name: str | None) -> bool:
+    return "compact" in str(table_name or "").lower()
+
+
+async def snapshot_serving_table(session, snapshot_id: str) -> str | None:
+    tables = await snapshot_serving_tables(session, snapshot_id)
+    if tables.serving_table:
+        return tables.serving_table
+    for table_name in _ordered_serving_table_candidates(snapshot_id):
+        if await _serving_table_available(session, table_name):
+            return table_name
+    return None
+
+
 async def snapshot_serving_tables(session, snapshot_id: str) -> PTG2ServingTables:
     cache_enabled = _metadata_cache_enabled(session)
     if cache_enabled:
@@ -162,7 +199,15 @@ async def snapshot_serving_tables(session, snapshot_id: str) -> PTG2ServingTable
         artifacts=dict(serving_index.get("artifacts") or {}) if isinstance(serving_index.get("artifacts"), dict) else None,
         id_storage=str(serving_index.get("id_storage") or "hex").strip().lower() or "hex",
         serving_table=_safe_table_name(serving_index.get("table")),
+        price_code_set_table=_safe_table_name(serving_index.get("price_code_set_table")),
         price_atom_table=_safe_table_name(serving_index.get("price_atom_table")),
+        price_set_entry_table=_safe_table_name(serving_index.get("price_set_entry_table")),
+        procedure_table=_safe_table_name(serving_index.get("procedure_table")),
         code_count_table=_safe_table_name(serving_index.get("code_count_table")),
+        provider_set_table=_safe_table_name(serving_index.get("provider_set_table")),
+        provider_set_component_table=_safe_table_name(serving_index.get("provider_set_component_table")),
+        provider_set_entry_table=_safe_table_name(serving_index.get("provider_set_entry_table")),
+        provider_entry_component_table=_safe_table_name(serving_index.get("provider_entry_component_table")),
         provider_group_member_table=_safe_table_name(serving_index.get("provider_group_member_table")),
+        provider_group_location_table=_safe_table_name(serving_index.get("provider_group_location_table")),
     ))

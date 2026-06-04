@@ -4,6 +4,7 @@ import datetime
 import importlib
 import types
 import asyncio
+from pathlib import Path
 
 from sqlalchemy.dialects import postgresql
 
@@ -69,6 +70,44 @@ def test_match_cost_fields_includes_fee_token():
 
 def test_entry_kind_accepts_singular_pharmacy_network_file():
     assert module._entry_kind("2026_Q1/Pharmacy Network File.csv") == "activity"  # pylint: disable=protected-access
+
+
+def test_explicit_artifacts_accepts_source_urls_and_metadata():
+    artifacts = module._explicit_artifacts(  # pylint: disable=protected-access
+        {
+            "artifacts": [
+                {
+                    "url": "/tmp/partd-smoke.zip",
+                    "source_type": "monthly",
+                    "release_date": "2026-05-15",
+                    "cutoff_month": "2026-05",
+                }
+            ]
+        }
+    )
+
+    assert len(artifacts) == 1
+    assert artifacts[0].url == "/tmp/partd-smoke.zip"
+    assert artifacts[0].source_type == "monthly"
+    assert artifacts[0].release_date == datetime.date(2026, 5, 15)
+    assert artifacts[0].cutoff_month == datetime.date(2026, 5, 1)
+
+
+def test_stage_artifact_file_copies_local_path(tmp_path):
+    source = tmp_path / "source.zip"
+    target = tmp_path / "target.zip"
+    source.write_bytes(b"zip-bytes")
+
+    asyncio.run(module._stage_artifact_file(str(source), str(target)))  # pylint: disable=protected-access
+
+    assert target.read_bytes() == b"zip-bytes"
+
+
+def test_test_mode_skips_full_table_index_maintenance():
+    source = Path(module.__file__).read_text(encoding="utf-8")
+
+    assert "if not test_mode and PARTD_DEFER_ADDITIONAL_INDEXES" in source
+    assert "if not test_mode:\n            await _drop_legacy_partd_tables(schema)" in source
 
 
 def test_ensure_columns_adds_missing_columns(monkeypatch):

@@ -90,8 +90,15 @@ from api.ptg2_price_sql import (
     _typed_price_json_sql,
 )
 from api.ptg2_tables import (
+    _gin_index_available_for_column,
+    _index_available,
+    _is_compact_serving_table,
+    _ordered_serving_table_candidates,
     _safe_table_name,
+    _serving_table_candidates,
     _serving_table_available,
+    _serving_table_name,
+    snapshot_serving_table,
     snapshot_serving_tables,
 )
 from api.ptg2_types import PTG2ServingIndex, PTG2ServingTables
@@ -157,6 +164,21 @@ def _ptg2_manifest_storage_enabled(serving_tables: PTG2ServingTables) -> bool:
     return (serving_tables.storage or "").strip().lower() == "manifest_snapshot"
 
 
+def _shape_ptg2_manifest_response(payload: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
+    manifest_payload = dict(payload)
+    manifest_payload["query"] = {
+        key: value for key, value in dict(payload.get("query") or {}).items() if key != "result_granularity"
+    }
+    manifest_payload["items"] = []
+    for item in payload.get("items", []):
+        shaped_item = dict(item)
+        shaped_item.pop("service_code", None)
+        shaped_item.pop("service_code_system", None)
+        shaped_item.pop("tic_prices", None)
+        manifest_payload["items"].append(shaped_item)
+    return _shape_ptg2_response(manifest_payload, args)
+
+
 def _ptg2_manifest_id_array_cast(serving_tables: PTG2ServingTables) -> str:
     return "uuid[]" if serving_tables.uses_uuid_ids else "char(32)[]"
 
@@ -212,6 +234,88 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def search_ptg2_index(
+    index: PTG2ServingIndex,
+    *,
+    plan_id: str | None = None,
+    plan_external_id: str | None = None,
+    code: str | None = None,
+    state: str | None = None,
+    city: str | None = None,
+    zip5: str | None = None,
+    npi: int | str | None = None,
+) -> dict[str, Any]:
+    requested_plan = str(plan_id or plan_external_id or "").strip()
+    requested_code = str(code or "").strip()
+    requested_state = str(state or "").strip().upper()
+    requested_city = str(city or "").strip().upper()
+    requested_zip = _normalize_zip5(zip5)
+    requested_npi = _normalize_npi(npi)
+    plan_rates = dict(index.rates.get(requested_plan) or {}) if requested_plan else {}
+    rate_rows = list(plan_rates.get(requested_code) or []) if requested_code else []
+    items: list[dict[str, Any]] = []
+    for rate in rate_rows:
+        provider = _provider_payload(index, rate.get("provider_ordinal"))
+        if requested_state and str(provider.get("state") or "").upper() != requested_state:
+            continue
+        if requested_city and str(provider.get("city") or "").upper() != requested_city:
+            continue
+        if requested_zip and _normalize_zip5(provider.get("zip5")) != requested_zip:
+            continue
+        if requested_npi is not None and _normalize_npi(provider.get("npi")) != requested_npi:
+            continue
+        procedure = dict(index.procedures.get(requested_code) or {})
+        prices = _normalize_price_payload(rate.get("prices") or [])
+        item = {
+            **provider,
+            "procedure_code": procedure.get("procedure_code") or procedure.get("code") or requested_code,
+            "service_code": procedure.get("billing_code") or requested_code,
+            "reported_code": procedure.get("billing_code") or requested_code,
+            "reported_code_system": procedure.get("billing_code_type"),
+            "billing_code": procedure.get("billing_code") or requested_code,
+            "billing_code_type": procedure.get("billing_code_type"),
+            "procedure_name": procedure.get("name") or procedure.get("procedure_name"),
+            "procedure_description": procedure.get("description") or procedure.get("procedure_description"),
+            **_price_response_fields(prices),
+            "source_trace": _coerce_json_payload(rate.get("source_trace"), []),
+            "confidence": rate.get("confidence") or {"network": "tic_rate_npi_tin"},
+        }
+        items.append(item)
+    return _shape_ptg2_response(
+        {
+            "items": items,
+            "pagination": {"total": len(items), "limit": len(items), "offset": 0, "page": 1},
+            "query": {
+                "plan_id": requested_plan or None,
+                "plan_external_id": plan_external_id or None,
+                "code": requested_code or None,
+                "state": state or None,
+                "city": city or None,
+                "zip5": zip5 or None,
+                "npi": requested_npi,
+                "snapshot_id": index.snapshot_id,
+                "source": "ptg2",
+            },
+        },
+        {"include_sources": "true", "include_details": "true"},
+    )
+
+
+def warm_cache_benchmark(index: PTG2ServingIndex, request_count: int = 100) -> dict[str, Any]:
+    request_count = max(int(request_count or 1), 1)
+    plan_id = next(iter(index.rates.keys()), "")
+    code = next(iter(dict(index.rates.get(plan_id) or {}).keys()), "")
+    timings: list[float] = []
+    for _ in range(request_count):
+        started = time.perf_counter()
+        search_ptg2_index(index, plan_id=plan_id, code=code)
+        timings.append((time.perf_counter() - started) * 1000.0)
+    sorted_timings = sorted(timings)
+    p95_index = min(max(math.ceil(0.95 * len(sorted_timings)) - 1, 0), len(sorted_timings) - 1)
+    p95_ms = sorted_timings[p95_index]
+    return {"request_count": request_count, "p95_ms": p95_ms, "passed": p95_ms <= PTG2_WARM_P95_MAX_MS}
 
 
 def _ptg2_manifest_artifact_entries(serving_tables: PTG2ServingTables, name: str) -> list[dict[str, Any]]:
@@ -1005,7 +1109,7 @@ async def _search_ptg2_manifest_db_serving_table(
             return None
         provider_set_ids, location_providers_by_set = location_matches
         if not provider_set_ids:
-            return _shape_ptg2_response(
+            return _shape_ptg2_manifest_response(
                 {
                     "items": [],
                     "pagination": {
@@ -1030,7 +1134,6 @@ async def _search_ptg2_manifest_db_serving_table(
                         "source": "ptg2_db",
                         "serving_table": table_name,
                         "include_providers": expand_providers,
-                        "result_granularity": "provider" if expand_providers else "provider_set",
                         "procedure_consolidation": "REPORTED_CODE",
                         "status": "no_match",
                     },
@@ -1174,7 +1277,7 @@ async def _search_ptg2_manifest_db_serving_table(
             items.append(item)
     if not items:
         return None
-    return _shape_ptg2_response(
+    return _shape_ptg2_manifest_response(
         {
             "items": items,
             "pagination": {
@@ -1199,8 +1302,434 @@ async def _search_ptg2_manifest_db_serving_table(
                 "source": "ptg2_db",
                 "serving_table": table_name,
                 "include_providers": expand_providers,
+                "procedure_consolidation": "REPORTED_CODE",
+            },
+        },
+        args,
+    )
+
+
+def _compact_required_tables(serving_tables: PTG2ServingTables) -> bool:
+    return bool(
+        serving_tables.price_code_set_table
+        and serving_tables.price_atom_table
+        and serving_tables.price_set_entry_table
+        and serving_tables.procedure_table
+    )
+
+
+def _compact_price_payload_sql(serving_tables: PTG2ServingTables, params: dict[str, Any], args: dict[str, Any]) -> str:
+    price_filters, _price_filter_payload = _price_filter_clauses(args, params)
+    filter_sql = ""
+    if price_filters:
+        filter_sql = "WHERE " + " AND ".join(price_filters)
+    return f"""
+        SELECT jsonb_agg(pa.payload ORDER BY pa.negotiated_rate NULLS LAST) AS prices
+        FROM {serving_tables.price_set_entry_table} pse
+        JOIN {serving_tables.price_atom_table} pa
+          ON pa.price_atom_hash = pse.price_atom_hash
+        LEFT JOIN {serving_tables.price_code_set_table} service_set
+          ON service_set.price_code_set_hash = pa.service_code_set_hash
+        LEFT JOIN {serving_tables.price_code_set_table} modifier_set
+          ON modifier_set.price_code_set_hash = pa.modifier_code_set_hash
+        {filter_sql}
+          {"AND" if filter_sql else "WHERE"} pse.price_set_hash = r.price_set_hash
+    """
+
+
+def _compact_provider_filter_sql(serving_tables: PTG2ServingTables, args: dict[str, Any], params: dict[str, Any]) -> tuple[str, bool]:
+    has_geo = bool(args.get("zip5") or args.get("zip") or args.get("city") or args.get("state") or args.get("lat") or args.get("long") or args.get("radius_miles"))
+    specialty = str(args.get("specialty") or "").strip().lower()
+    inferred_sql = _inferred_provider_taxonomy_code_sql(
+        args,
+        nt_alias="nt",
+        schema=PTG2_SCHEMA,
+        params=params,
+        param_prefix="inferred_taxonomy",
+    )
+    has_provider_filter = has_geo or specialty or bool(inferred_sql)
+    if not has_provider_filter:
+        return "", False
+    if args.get("zip5") or args.get("zip"):
+        params["zip5"] = _normalize_zip5(args.get("zip5") or args.get("zip"))
+    if args.get("city"):
+        params["city_exact"] = str(args.get("city") or "").strip().upper()
+    if args.get("state"):
+        params["state_exact"] = str(args.get("state") or "").strip().upper()
+    if args.get("lat") and args.get("long"):
+        lat = float(args.get("lat"))
+        lon = float(args.get("long"))
+        radius = float(args.get("radius_miles") or 25.0)
+        params.update(
+            geo_lat=lat,
+            geo_long=lon,
+            geo_radius_miles=radius,
+            geo_min_lat=lat - radius / 69.0,
+            geo_max_lat=lat + radius / 69.0,
+            geo_min_long=lon - radius / 69.0,
+            geo_max_long=lon + radius / 69.0,
+        )
+    if specialty:
+        params["specialty_like"] = f"%{specialty}%"
+    if serving_tables.provider_group_location_table and has_geo:
+        params.setdefault("provider_match_limit", max(int(params.get("limit") or 25) * 8, 64))
+        params.setdefault("location_rate_candidate_limit", max(int(params.get("limit") or 25) * 200, 4096))
+        clauses = []
+        if params.get("zip5"):
+            clauses.append("LEFT(COALESCE(loc.zip5, loc.postal_code, ''), 5) = :zip5")
+        if params.get("city_exact"):
+            clauses.append("UPPER(COALESCE(loc.city, '')) = :city_exact")
+        if params.get("state_exact"):
+            clauses.append("UPPER(COALESCE(loc.state, '')) = :state_exact")
+        if params.get("geo_lat") is not None:
+            clauses.append("loc.lat::float8 BETWEEN :geo_min_lat AND :geo_max_lat")
+            clauses.append("loc.long::float8 BETWEEN :geo_min_long AND :geo_max_long")
+            clauses.append("(earth_distance(ll_to_earth(:geo_lat, :geo_long), ll_to_earth(loc.lat::float8, loc.long::float8)) / 1609.344) <= :geo_radius_miles")
+        if inferred_sql:
+            clauses.append(f"EXISTS (SELECT 1 FROM {PTG2_SCHEMA}.npi_taxonomy nt WHERE nt.npi = loc.npi AND {inferred_sql})")
+        if specialty:
+            clauses.append(
+                f"""EXISTS (
+                    SELECT 1
+                    FROM {PTG2_SCHEMA}.npi_taxonomy nt
+                    JOIN {PTG2_SCHEMA}.nucc_taxonomy nucc ON nucc.code = nt.healthcare_provider_taxonomy_code
+                    WHERE nt.npi = loc.npi
+                      AND LOWER(COALESCE(nucc.display_name, '')) LIKE :specialty_like
+                )"""
+            )
+        where = " AND ".join(clauses) or "TRUE"
+        return (
+            f"""
+            , filtered_locations AS MATERIALIZED (
+                SELECT loc.*
+                FROM {serving_tables.provider_group_location_table} loc
+                WHERE {where}
+                LIMIT :location_rate_candidate_limit
+            )
+            , provider_filtered_rates AS MATERIALIZED (
+                SELECT DISTINCT r.*
+                FROM rate_candidates r
+                JOIN {serving_tables.provider_set_component_table} psc_filter
+                  ON psc_filter.provider_set_hash = r.provider_set_hash
+                JOIN {serving_tables.provider_group_member_table} pgm_filter
+                  ON pgm_filter.provider_group_hash = psc_filter.provider_group_hash
+                JOIN filtered_locations loc ON loc.npi = pgm_filter.npi
+                WHERE loc.npi IS NOT NULL
+            )
+            """,
+            True,
+        )
+    clauses = []
+    joins = [
+        f"FROM {serving_tables.provider_set_component_table} psc_filter",
+        f"JOIN {serving_tables.provider_group_member_table} pgm_filter ON pgm_filter.provider_group_hash = psc_filter.provider_group_hash",
+    ]
+    if has_geo:
+        joins.append(f"JOIN {PTG2_SCHEMA}.npi_address addr_filter ON addr_filter.npi = pgm_filter.npi")
+        if params.get("zip5"):
+            clauses.append("LEFT(COALESCE(addr_filter.postal_code, ''), 5) = :zip5")
+        if params.get("city_exact"):
+            clauses.append("UPPER(COALESCE(addr_filter.city, '')) = :city_exact")
+        if params.get("state_exact"):
+            clauses.append("UPPER(COALESCE(addr_filter.state, '')) = :state_exact")
+        if params.get("geo_lat") is not None:
+            clauses.append("addr_filter.lat::float8 BETWEEN :geo_min_lat AND :geo_max_lat")
+            clauses.append("addr_filter.long::float8 BETWEEN :geo_min_long AND :geo_max_long")
+            clauses.append("(earth_distance(ll_to_earth(:geo_lat, :geo_long), ll_to_earth(addr_filter.lat::float8, addr_filter.long::float8)) / 1609.344) <= :geo_radius_miles")
+    if specialty or inferred_sql:
+        joins.append(f"JOIN {PTG2_SCHEMA}.npi_taxonomy nt_filter ON nt_filter.npi = pgm_filter.npi")
+    if specialty:
+        joins.append(f"JOIN {PTG2_SCHEMA}.nucc_taxonomy nucc_filter ON nucc_filter.code = nt_filter.healthcare_provider_taxonomy_code")
+        clauses.append("LOWER(COALESCE(nucc_filter.display_name, '')) LIKE :specialty_like")
+    if inferred_sql:
+        clauses.append(inferred_sql.replace("nt.", "nt_filter."))
+    where = " AND ".join(clauses) or "TRUE"
+    return (
+        f"""
+        , provider_filtered_rates AS MATERIALIZED (
+            SELECT DISTINCT r.*
+            FROM rate_candidates r
+            WHERE EXISTS (
+                SELECT 1
+                {' '.join(joins)}
+                WHERE psc_filter.provider_set_hash = r.provider_set_hash
+                  AND {where}
+            )
+        )
+        """,
+        True,
+    )
+
+
+def _compact_provider_expansion_sql(serving_tables: PTG2ServingTables, args: dict[str, Any], params: dict[str, Any]) -> str:
+    if not _request_bool(args.get("include_providers")):
+        return ""
+    params.setdefault("provider_match_limit", max(int(params.get("limit") or 25) * 8, 64))
+    if serving_tables.provider_group_location_table and (args.get("zip5") or args.get("zip") or args.get("city") or args.get("state") or args.get("lat") or args.get("long")):
+        return f"""
+        JOIN {serving_tables.provider_set_component_table} psc
+          ON psc.provider_set_hash = r.provider_set_hash
+        JOIN {serving_tables.provider_group_member_table} pgm
+          ON pgm.provider_group_hash = psc.provider_group_hash
+        JOIN LATERAL (
+            SELECT loc.*
+            FROM {serving_tables.provider_group_location_table} loc
+            WHERE loc.npi = pgm.npi
+              AND EXISTS (
+                  SELECT 1 FROM filtered_locations filtered
+                  WHERE filtered.npi = loc.npi
+              )
+            OFFSET 0
+            LIMIT 1
+        ) loc ON TRUE
+        """
+    return f"""
+        JOIN {serving_tables.provider_set_component_table} psc
+          ON psc.provider_set_hash = r.provider_set_hash
+        JOIN {serving_tables.provider_group_member_table} pgm
+          ON pgm.provider_group_hash = psc.provider_group_hash
+        LEFT JOIN LATERAL (
+            SELECT addr.*
+            FROM {PTG2_SCHEMA}.npi_address addr
+            WHERE addr.npi = sp.npi
+            ORDER BY addr.is_primary DESC NULLS LAST
+            LIMIT 1
+        ) addr ON TRUE
+    """
+
+
+def _compact_item_from_row(data: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
+    prices = _normalize_price_payload(data.get("prices") or [])
+    provider_set_hashes = _coerce_json_payload(data.get("provider_set_hashes"), [])
+    provider_set_hash = data.get("provider_set_hash") or (provider_set_hashes[0] if provider_set_hashes else None)
+    item = {
+        "npi": data.get("npi") or args.get("npi"),
+        "provider_ordinal": data.get("provider_ordinal") or data.get("npi") or provider_set_hash,
+        "provider_name": data.get("provider_name"),
+        "state": data.get("state"),
+        "city": data.get("city"),
+        "zip5": data.get("zip5"),
+        "location_hash": data.get("location_hash"),
+        "location_source": data.get("location_source"),
+        "location_confidence_code": data.get("location_confidence_code"),
+        "address": _coerce_json_payload(data.get("address_payload"), {}),
+        "taxonomy_codes": _coerce_json_payload(data.get("taxonomy_codes"), []),
+        "specialties": _coerce_json_payload(data.get("specialties"), []),
+        "procedure_code": data.get("procedure_code"),
+        "hp_procedure_code": data.get("procedure_code"),
+        "procedure_name": data.get("procedure_name") or data.get("procedure_display_name"),
+        "procedure_description": data.get("procedure_description"),
+        "service_code": data.get("billing_code") or data.get("reported_code"),
+        "service_code_system": data.get("billing_code_type") or data.get("reported_code_system"),
+        "reported_code": data.get("reported_code"),
+        "reported_code_system": data.get("reported_code_system"),
+        "billing_code": data.get("billing_code") or data.get("reported_code"),
+        "billing_code_type": data.get("billing_code_type") or data.get("reported_code_system"),
+        "provider_set_hash": provider_set_hash,
+        "provider_set_hashes": provider_set_hashes or ([provider_set_hash] if provider_set_hash else []),
+        "provider_count": data.get("provider_count"),
+        "provider_set_count": data.get("provider_set_count"),
+        "price_set_hash": data.get("price_set_hash"),
+        "rate_pack_hash": data.get("rate_pack_hash") or data.get("serving_rate_id"),
+        **_price_response_fields(prices),
+        "source_trace": _coerce_json_payload(data.get("source_trace"), []),
+        "confidence": data.get("confidence") or {"network": "tic_rate_npi_tin"},
+    }
+    return {key: value for key, value in item.items() if value is not None}
+
+
+async def _search_compact_serving_table(
+    session,
+    table_name: str,
+    serving_tables: PTG2ServingTables,
+    snapshot_id: str,
+    args: dict[str, Any],
+    pagination,
+    filters: list[str],
+    params: dict[str, Any],
+    mode_value: str,
+) -> dict[str, Any] | None:
+    if not _compact_required_tables(serving_tables):
+        return None
+    params = dict(params)
+    params.setdefault("limit", int(pagination.limit))
+    params.setdefault("offset", int(pagination.offset))
+    price_filter_params: dict[str, Any] = {}
+    price_filter_clauses, price_filter_query = _price_filter_clauses(args, price_filter_params)
+    params.update(price_filter_params)
+    provider_filter_sql, has_provider_filter = _compact_provider_filter_sql(serving_tables, args, params)
+    source_cte = "provider_filtered_rates" if has_provider_filter else "rate_candidates"
+    expand_providers = _request_bool(args.get("include_providers"))
+    provider_expansion_sql = _compact_provider_expansion_sql(serving_tables, args, params)
+    provider_select_sql = ""
+    if expand_providers and serving_tables.provider_group_location_table and provider_expansion_sql:
+        provider_select_sql = (
+            "loc.npi, loc.location_hash, loc.state, loc.city, loc.zip5, "
+            "loc.location_source, loc.location_confidence_code, loc.address_payload, "
+            "loc.taxonomy_codes, loc.specialties, loc.provider_name,"
+        )
+    elif expand_providers:
+        provider_select_sql = (
+            "pgm.npi, addr.location_hash, addr.state, addr.city, "
+            "LEFT(COALESCE(addr.postal_code, ''), 5) AS zip5, "
+            "'npi_address' AS location_source, 'npi_address' AS location_confidence_code, "
+            "to_jsonb(addr.*) AS address_payload, ARRAY[]::varchar[] AS taxonomy_codes, "
+            "ARRAY[]::varchar[] AS specialties, NULL::varchar AS provider_name,"
+        )
+    price_exists_sql = ""
+    if price_filter_clauses:
+        price_exists_sql = f"""
+        AND EXISTS (
+            SELECT 1
+            FROM {serving_tables.price_set_entry_table} pse_filter
+            JOIN {serving_tables.price_atom_table} pa
+              ON pa.price_atom_hash = pse_filter.price_atom_hash
+            LEFT JOIN {serving_tables.price_code_set_table} service_set
+              ON service_set.price_code_set_hash = pa.service_code_set_hash
+            LEFT JOIN {serving_tables.price_code_set_table} modifier_set
+              ON modifier_set.price_code_set_hash = pa.modifier_code_set_hash
+            WHERE pse_filter.price_set_hash = r.price_set_hash
+              AND {' AND '.join(price_filter_clauses)}
+        )
+        """
+    row_stmt = text(
+        f"""
+        WITH rate_candidates AS MATERIALIZED (
+            SELECT r.*
+            FROM {table_name} r
+            WHERE {' AND '.join(filters)}
+              {price_exists_sql}
+            ORDER BY r.reported_code_system, r.reported_code, r.provider_count DESC NULLS LAST
+            LIMIT :limit OFFSET :offset
+        )
+        {provider_filter_sql}
+        SELECT
+            {provider_select_sql}
+            r.serving_rate_id,
+            r.snapshot_id,
+            r.plan_id,
+            r.plan_name,
+            r.plan_id_type,
+            COALESCE(r.plan_market_type, NULL::varchar) AS plan_market_type,
+            r.issuer_name,
+            r.plan_sponsor_name,
+            r.procedure_code,
+            r.reported_code_system,
+            r.reported_code,
+            COALESCE(proc.billing_code, r.reported_code) AS billing_code,
+            COALESCE(proc.billing_code_type, r.reported_code_system) AS billing_code_type,
+            COALESCE(proc.display_name, proc.name) AS procedure_name,
+            proc.description AS procedure_description,
+            r.provider_set_hash,
+            r.provider_count,
+            COALESCE(r.provider_set_count, NULL::integer) AS provider_set_count,
+            r.price_set_hash,
+            price_payload.prices AS prices,
+            r.source_trace
+        FROM {source_cte} r
+        LEFT JOIN LATERAL (
+            SELECT *
+            FROM {serving_tables.procedure_table} proc
+            WHERE proc.procedure_code = r.procedure_code
+            LIMIT 1
+        ) proc ON TRUE
+        LEFT JOIN LATERAL (
+            {_compact_price_payload_sql(serving_tables, params, args)}
+        ) price_payload ON TRUE
+        {provider_expansion_sql}
+        WHERE TRUE
+          {"AND price_payload.prices IS NOT NULL" if price_filter_clauses else ""}
+        """
+    )
+    result = await session.execute(row_stmt, params)
+    rows = [_row_mapping(row) for row in result]
+    if not rows:
+        return None
+    items = [_compact_item_from_row(row, args) for row in rows]
+    return _shape_ptg2_response(
+        {
+            "items": items,
+            "pagination": {
+                "total": int(pagination.offset) + len(items),
+                "limit": pagination.limit,
+                "offset": pagination.offset,
+                "page": (pagination.offset // pagination.limit) + 1 if pagination.limit else 1,
+            },
+            "query": {
+                "plan_id": args.get("plan_id") or None,
+                "plan_external_id": args.get("plan_external_id") or None,
+                "plan_market_type": str(args.get("plan_market_type") or "").strip().lower() or None,
+                "source_key": args.get("source_key") or None,
+                "snapshot_id": snapshot_id,
+                "mode": mode_value,
+                "code": args.get("code") or args.get("reported_code") or None,
+                "code_system": args.get("code_system") or None,
+                "q": args.get("q") or args.get("service_name") or None,
+                "price_filter": price_filter_query or None,
+                "state": args.get("state") or None,
+                "city": args.get("city") or None,
+                "zip5": args.get("zip5") or args.get("zip") or None,
+                "source": "ptg2_db",
+                "serving_table": table_name,
+                "include_providers": expand_providers,
                 "result_granularity": "provider" if expand_providers else "provider_set",
                 "procedure_consolidation": "REPORTED_CODE",
+            },
+        },
+        args,
+    )
+
+
+async def _search_legacy_serving_table(
+    session,
+    table_name: str,
+    snapshot_id: str,
+    args: dict[str, Any],
+    pagination,
+    filters: list[str],
+    params: dict[str, Any],
+    mode_value: str,
+) -> dict[str, Any] | None:
+    count_result = await session.execute(text(f"SELECT COUNT(*) FROM {table_name} r WHERE {' AND '.join(filters)}"), params)
+    total = int(count_result.scalar() or 0)
+    if total <= 0:
+        return None
+    row_result = await session.execute(
+        text(
+            f"""
+            SELECT *
+            FROM {table_name} r
+            WHERE {' AND '.join(filters)}
+            ORDER BY r.provider_count DESC NULLS LAST, r.serving_rate_id
+            LIMIT :limit OFFSET :offset
+            """
+        ),
+        params,
+    )
+    items = [_compact_item_from_row(_row_mapping(row), args) for row in row_result]
+    if not items:
+        return None
+    return _shape_ptg2_response(
+        {
+            "items": items,
+            "pagination": {
+                "total": total,
+                "limit": pagination.limit,
+                "offset": pagination.offset,
+                "page": (pagination.offset // pagination.limit) + 1 if pagination.limit else 1,
+            },
+            "query": {
+                "plan_id": args.get("plan_id") or None,
+                "plan_external_id": args.get("plan_external_id") or None,
+                "plan_market_type": str(args.get("plan_market_type") or "").strip().lower() or None,
+                "source_key": args.get("source_key") or None,
+                "snapshot_id": snapshot_id,
+                "mode": mode_value,
+                "code": args.get("code") or args.get("reported_code") or None,
+                "code_system": args.get("code_system") or None,
+                "source": "ptg2_db",
+                "serving_table": table_name,
+                "procedure_consolidation": "HP_PROCEDURE_CODE",
             },
         },
         args,
@@ -1217,18 +1746,17 @@ async def search_ptg2_serving_table(
 ) -> dict[str, Any] | None:
     mode_value = normalize_ptg2_mode(args.get("mode"))
     serving_tables = serving_tables or PTG2ServingTables()
-    if not _ptg2_manifest_storage_enabled(serving_tables):
-        return None
-    if serving_tables.serving_table:
-        return await _search_ptg2_manifest_db_serving_table(
-            session,
-            snapshot_id,
-            args,
-            pagination,
-            serving_tables,
-            mode_value,
-        )
-    if serving_tables.is_manifest_backed_snapshot:
+    table_name = _safe_table_name(serving_tables.serving_table)
+    if _ptg2_manifest_storage_enabled(serving_tables):
+        if serving_tables.serving_table:
+            return await _search_ptg2_manifest_db_serving_table(
+                session,
+                snapshot_id,
+                args,
+                pagination,
+                serving_tables,
+                mode_value,
+            )
         payload = await search_ptg2_manifest_serving_snapshot(
             snapshot_id,
             args,
@@ -1236,7 +1764,55 @@ async def search_ptg2_serving_table(
             serving_tables=serving_tables,
             mode_value=mode_value,
         )
-        return _shape_ptg2_response(payload, args) if payload is not None else None
+        if payload is None:
+            return None
+        return _shape_ptg2_manifest_response(payload, args)
+    code_context = await _resolve_ptg2_code_search_context(
+        session,
+        code=args.get("code") or args.get("reported_code"),
+        code_system=args.get("code_system") or args.get("reported_code_system"),
+    )
+    if table_name and await _serving_table_available(session, table_name):
+        requested_plan = str(args.get("plan_id") or args.get("plan_external_id") or "").strip()
+        filters = ["snapshot_id = :snapshot_id"]
+        params: dict[str, Any] = {
+            "snapshot_id": snapshot_id,
+            "limit": int(pagination.limit),
+            "offset": int(pagination.offset),
+        }
+        if requested_plan:
+            filters.append("plan_id = :plan_id")
+            params["plan_id"] = requested_plan
+        _append_resolved_code_filter(
+            filters,
+            params,
+            code=args.get("code") or args.get("reported_code"),
+            code_system=args.get("code_system") or args.get("reported_code_system"),
+            code_context=code_context,
+        )
+        filters = _qualify_compact_filters(filters)
+        if _is_compact_serving_table(table_name) or _compact_required_tables(serving_tables):
+            return await _search_compact_serving_table(
+                session,
+                table_name,
+                serving_tables,
+                snapshot_id,
+                args,
+                pagination,
+                filters,
+                params,
+                mode_value,
+            )
+        return await _search_legacy_serving_table(
+            session,
+            table_name,
+            snapshot_id,
+            args,
+            pagination,
+            filters,
+            params,
+            mode_value,
+        )
     return None
 
 
@@ -1437,11 +2013,181 @@ async def _search_ptg2_manifest_provider_procedures(
     )
 
 
+async def _search_compact_provider_procedures(
+    session,
+    npi: int,
+    args: dict[str, Any],
+    pagination,
+    *,
+    snapshot_id: str,
+    serving_tables: PTG2ServingTables,
+) -> dict[str, Any] | None:
+    table_name = _safe_table_name(serving_tables.serving_table)
+    if not table_name or not await _serving_table_available(session, table_name):
+        return None
+    if not serving_tables.provider_set_component_table or not serving_tables.provider_group_member_table:
+        return None
+    params: dict[str, Any] = {
+        "npi": int(npi),
+        "snapshot_id": snapshot_id,
+        "limit": int(pagination.limit),
+        "offset": int(pagination.offset),
+    }
+    requested_plan = str(args.get("plan_id") or args.get("plan_external_id") or "").strip()
+    market_type = str(args.get("plan_market_type") or "").strip().lower()
+    filters = ["r.snapshot_id = :snapshot_id"]
+    if requested_plan:
+        filters.append("r.plan_id = :plan_id")
+        params["plan_id"] = requested_plan
+    code_context = await _resolve_ptg2_code_search_context(
+        session,
+        code=args.get("code") or args.get("reported_code"),
+        code_system=args.get("code_system") or args.get("reported_code_system"),
+    )
+    code_filters: list[str] = []
+    _append_resolved_code_filter(
+        code_filters,
+        params,
+        code=args.get("code") or args.get("reported_code"),
+        code_system=args.get("code_system") or args.get("reported_code_system"),
+        code_context=code_context,
+    )
+    filters.extend(_qualify_compact_filters(code_filters))
+    price_filter_params: dict[str, Any] = {}
+    price_filter_clauses, price_filter_query = _price_filter_clauses(args, price_filter_params)
+    params.update(price_filter_params)
+    price_exists_sql = ""
+    if price_filter_clauses and _compact_required_tables(serving_tables):
+        price_exists_sql = f"""
+          AND EXISTS (
+              SELECT 1
+              FROM {serving_tables.price_set_entry_table} pse_filter
+              JOIN {serving_tables.price_atom_table} pa
+                ON pa.price_atom_hash = pse_filter.price_atom_hash
+              LEFT JOIN {serving_tables.price_code_set_table} service_set
+                ON service_set.price_code_set_hash = pa.service_code_set_hash
+              LEFT JOIN {serving_tables.price_code_set_table} modifier_set
+                ON modifier_set.price_code_set_hash = pa.modifier_code_set_hash
+              WHERE pse_filter.price_set_hash = r.price_set_hash
+                AND {' AND '.join(price_filter_clauses)}
+          )
+        """
+    row_stmt = text(
+        f"""
+        WITH provider_sets AS MATERIALIZED (
+            SELECT DISTINCT psc.provider_set_hash
+            FROM {serving_tables.provider_set_component_table} psc
+            JOIN {serving_tables.provider_group_member_table} pgm
+              ON pgm.provider_group_hash = psc.provider_group_hash
+            WHERE pgm.npi = :npi
+        )
+        SELECT
+            r.serving_rate_id,
+            r.snapshot_id,
+            r.plan_id,
+            r.plan_name,
+            r.plan_id_type,
+            NULL::varchar AS plan_market_type,
+            r.issuer_name,
+            r.plan_sponsor_name,
+            r.procedure_code,
+            r.reported_code_system,
+            r.reported_code,
+            COALESCE(proc.billing_code, r.reported_code) AS billing_code,
+            COALESCE(proc.billing_code_type, r.reported_code_system) AS billing_code_type,
+            COALESCE(proc.display_name, proc.name) AS procedure_name,
+            proc.description AS procedure_description,
+            r.provider_set_hash,
+            r.provider_count,
+            NULL::integer AS provider_set_count,
+            r.price_set_hash,
+            price_payload.prices AS prices,
+            r.source_trace
+        FROM {table_name} r
+        JOIN provider_sets ps ON ps.provider_set_hash = r.provider_set_hash
+        LEFT JOIN {serving_tables.procedure_table or f'{PTG2_SCHEMA}.ptg2_procedure'} proc
+          ON proc.procedure_code = r.procedure_code
+        LEFT JOIN LATERAL (
+            {_compact_price_payload_sql(serving_tables, params, args) if _compact_required_tables(serving_tables) else 'SELECT r.prices AS prices'}
+        ) price_payload ON TRUE
+        WHERE {' AND '.join(filters)}
+          {price_exists_sql}
+          {"AND price_payload.prices IS NOT NULL" if price_filter_clauses else ""}
+        ORDER BY r.reported_code_system, r.reported_code, r.provider_count DESC NULLS LAST
+        LIMIT :limit OFFSET :offset
+        """
+    )
+    row_result = await session.execute(row_stmt, params)
+    rows = [_row_mapping(row) for row in row_result]
+    items = []
+    for row in rows:
+        item = _compact_item_from_row(row, args)
+        item["npi"] = int(npi)
+        items.append(item)
+    if not items:
+        return _shape_ptg2_response(
+            {
+                "items": [],
+                "pagination": {"total": 0, "limit": pagination.limit, "offset": pagination.offset, "page": (pagination.offset // pagination.limit) + 1 if pagination.limit else 1},
+                "query": {
+                    "npi": int(npi),
+                    "plan_id": requested_plan or None,
+                    "plan_external_id": args.get("plan_external_id") or None,
+                    "plan_market_type": market_type or None,
+                    "source_key": args.get("source_key") or None,
+                    "snapshot_id": snapshot_id,
+                    "mode": normalize_ptg2_mode(args.get("mode")),
+                    "code": args.get("code") or args.get("reported_code") or None,
+                    "code_system": args.get("code_system") or None,
+                    "price_filter": price_filter_query or None,
+                    "source": "ptg2_db",
+                    "serving_table": table_name,
+                    "provider_reverse_index": True,
+                    "status": "no_match",
+                },
+            },
+            args,
+        )
+    return _shape_ptg2_response(
+        {
+            "items": items,
+            "pagination": {"total": int(pagination.offset) + len(items), "limit": pagination.limit, "offset": pagination.offset, "page": (pagination.offset // pagination.limit) + 1 if pagination.limit else 1},
+            "query": {
+                "npi": int(npi),
+                "plan_id": requested_plan or None,
+                "plan_external_id": args.get("plan_external_id") or None,
+                "plan_market_type": market_type or None,
+                "source_key": args.get("source_key") or None,
+                "snapshot_id": snapshot_id,
+                "mode": normalize_ptg2_mode(args.get("mode")),
+                "code": args.get("code") or args.get("reported_code") or None,
+                "code_system": args.get("code_system") or None,
+                "price_filter": price_filter_query or None,
+                "source": "ptg2_db",
+                "serving_table": table_name,
+                "provider_reverse_index": True,
+                **_ptg2_code_query_fields(code_context, args),
+            },
+        },
+        args,
+    )
+
+
 async def search_ptg2_provider_procedures(session, npi: int, args: dict[str, Any], pagination) -> dict[str, Any] | None:
     snapshot_id = await resolve_current_ptg2_snapshot_id(session, args)
     if not snapshot_id:
         return None
     serving_tables = await snapshot_serving_tables(session, snapshot_id)
+    table_name = _safe_table_name(serving_tables.serving_table)
+    if table_name and (_is_compact_serving_table(table_name) or serving_tables.provider_set_component_table):
+        return await _search_compact_provider_procedures(
+            session,
+            npi,
+            args,
+            pagination,
+            snapshot_id=snapshot_id,
+            serving_tables=serving_tables,
+        )
     if not _ptg2_manifest_storage_enabled(serving_tables):
         return None
     return await _search_ptg2_manifest_provider_procedures(

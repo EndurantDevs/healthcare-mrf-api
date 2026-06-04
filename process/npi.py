@@ -24,9 +24,12 @@ from sqlalchemy import func, select
 from db.models import (AddressArchive, NPIAddress, NPIData,
                        NPIDataOtherIdentifier, NPIDataTaxonomy,
                        NPIDataTaxonomyGroup, NPIPhoneStaffing, db)
+from process.control_cancel import raise_if_cancelled
+from process.control_lifecycle import mark_control_run
 from process.ext.utils import (download_it, download_it_and_save,
                                ensure_database, make_class, my_init_db,
                                print_time_info, push_objects, return_checksum)
+from process.live_progress import enqueue_live_progress
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
 
@@ -59,6 +62,14 @@ def _archived_identifier(name: str, suffix: str = "_old") -> str:
     digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]
     trim_to = max(1, POSTGRES_IDENTIFIER_MAX_LENGTH - len(suffix) - len(digest) - 1)
     return f"{name[:trim_to]}_{digest}{suffix}"
+
+
+def _index_requires_postgis(index: dict) -> bool:
+    name = str(index.get("name") or "").lower()
+    if name.startswith("geo_index_") or name.endswith("_geo_idx") or name == "geo_idx":
+        return True
+    elements = " ".join(str(element).lower() for element in index.get("index_elements") or ())
+    return "st_makepoint" in elements or "geography" in elements
 
 
 async def _ensure_required_extensions() -> None:
@@ -203,10 +214,13 @@ async def process_npi_chunk(ctx, task):
 async def process_data(ctx, task=None):  # pragma: no cover
     # Track whether any work actually ran so shutdown can distinguish "no jobs" from a bad import
     task = task or {}
+    await raise_if_cancelled(ctx, task)
     ctx.setdefault('context', {})
+    context = ctx['context']
+    run_id = str(context.get("control_run_id") or ctx.get("control_run_id") or "").strip()
     if 'test_mode' in task:
-        ctx['context']['test_mode'] = bool(task.get('test_mode'))
-    test_mode = bool(ctx['context'].get('test_mode', False))
+        context['test_mode'] = bool(task.get('test_mode'))
+    test_mode = bool(context.get('test_mode', False))
     await ensure_database(test_mode)
     await _ensure_required_extensions()
 
@@ -230,14 +244,38 @@ async def process_data(ctx, task=None):  # pragma: no cover
             coros.clear()
 
     file_limit = TEST_NPI_MAX_FILES if test_mode else None
-    for file_idx, p in enumerate(re.findall(r'(NPPES_Data_Dissemination.*_V2.zip)', html_source)):
-        if file_limit and file_idx >= file_limit:
-            break
+    source_files = re.findall(r'(NPPES_Data_Dissemination.*_V2.zip)', html_source)
+    selected_files = source_files[:file_limit] if file_limit else source_files
+    if run_id:
+        enqueue_live_progress(
+            run_id=run_id,
+            importer="npi",
+            status="running",
+            phase="npi sources discovered",
+            unit="files",
+            done=0,
+            total=len(selected_files),
+            message=f"{len(selected_files)} source files discovered",
+        )
+    for file_idx, p in enumerate(selected_files):
+        await raise_if_cancelled(ctx, task)
         count_files = count_files + 1
         current_sql_chunk_size = sql_chunk_size
         if test_mode:
             current_sql_chunk_size = min(current_sql_chunk_size, TEST_NPI_ROWS)
         print(f"Round {count_files} for {p}")
+        if run_id:
+            enqueue_live_progress(
+                run_id=run_id,
+                importer="npi",
+                status="running",
+                phase="npi downloading source",
+                unit="files",
+                done=file_idx,
+                total=len(selected_files),
+                message=f"downloading file {file_idx + 1}/{len(selected_files)}",
+                label=p,
+            )
         with tempfile.TemporaryDirectory() as tmpdirname:
             print(f"Found: {p}")
             # await unzip('/users/nick/downloads/NPPES_Data_Dissemination_November_2022.zip', tmpdirname, __debug=True)
@@ -282,6 +320,7 @@ async def process_data(ctx, task=None):  # pragma: no cover
                     chunk_size = 1000
                     npi_column = getattr(table, 'npi')
                     for index in range(0, len(npi_list), chunk_size):
+                        await raise_if_cancelled(ctx, task)
                         chunk = npi_list[index:index + chunk_size]
                         delete_stmt = db.delete(table.__table__).where(npi_column.in_(chunk))
                         if cls is NPIAddress:
@@ -301,6 +340,7 @@ async def process_data(ctx, task=None):  # pragma: no cover
                 chunk_size = 10000
                 npi_column = getattr(table, 'npi')
                 for index in range(0, len(npi_list), chunk_size):
+                    await raise_if_cancelled(ctx, task)
                     chunk = npi_list[index:index + chunk_size]
                     delete_stmt = db.delete(table.__table__).where(npi_column.in_(chunk))
                     delete_stmt = delete_stmt.where(table.type == 'secondary')
@@ -318,6 +358,7 @@ async def process_data(ctx, task=None):  # pragma: no cover
                 chunk_size = 10000
                 npi_column = getattr(table, 'npi')
                 for index in range(0, len(npi_list), chunk_size):
+                    await raise_if_cancelled(ctx, task)
                     chunk = npi_list[index:index + chunk_size]
                     delete_stmt = db.delete(table.__table__).where(npi_column.in_(chunk))
                     await delete_stmt.status()
@@ -358,8 +399,21 @@ async def process_data(ctx, task=None):  # pragma: no cover
                         print(f"Processed: {count}")
                     row_list.append(row)
                     processed_rows += 1
+                    if run_id and processed_rows and processed_rows % (100 if test_mode else 100_000) == 0:
+                        enqueue_live_progress(
+                            run_id=run_id,
+                            importer="npi",
+                            status="running",
+                            phase="npi parsing primary rows",
+                            unit="rows",
+                            done=processed_rows,
+                            total=TEST_NPI_ROWS if test_mode else None,
+                            message=f"parsed {processed_rows} primary rows",
+                            label=p,
+                        )
                     if count > current_sql_chunk_size:
                         print(f"Sending to DB: {count}")
+                        await raise_if_cancelled(ctx, task)
                         payload = {
                             'row_list': row_list.copy(),
                             'npi_csv_map': npi_csv_map,
@@ -380,6 +434,7 @@ async def process_data(ctx, task=None):  # pragma: no cover
                 'npi_csv_map_reverse': npi_csv_map_reverse,
                 'direct': True,
             }
+            await raise_if_cancelled(ctx, task)
             await enqueue_or_flush(coros, process_npi_chunk(ctx, payload))
             row_list.clear()
 
@@ -405,6 +460,7 @@ async def process_data(ctx, task=None):  # pragma: no cover
 
                     if count > current_sql_chunk_size:
                         print(f"Sending to DB: {count}")
+                        await raise_if_cancelled(ctx, task)
                         other_payload = {
                             'npi_other_id_list': list(npi_other_org_list_dict.copy().values())
                         }
@@ -414,6 +470,18 @@ async def process_data(ctx, task=None):  # pragma: no cover
                     else:
                         count += 1
                     processed_other += 1
+                    if run_id and processed_other and processed_other % (100 if test_mode else 100_000) == 0:
+                        enqueue_live_progress(
+                            run_id=run_id,
+                            importer="npi",
+                            status="running",
+                            phase="npi parsing other identifiers",
+                            unit="rows",
+                            done=processed_other,
+                            total=TEST_NPI_OTHER_ROWS if test_mode else None,
+                            message=f"parsed {processed_other} other identifier rows",
+                            label=p,
+                        )
                     if test_mode and processed_other >= TEST_NPI_OTHER_ROWS:
                         break
 
@@ -451,6 +519,7 @@ async def process_data(ctx, task=None):  # pragma: no cover
 
                     if count > current_sql_chunk_size:
                         print(f"Sending Secondary to DB: {count}")
+                        await raise_if_cancelled(ctx, task)
                         await enqueue_or_flush(
                             coros,
                             save_npi_data(ctx, {'npi_address_list': list(npi_address_list_dict.copy().values())}),
@@ -463,6 +532,18 @@ async def process_data(ctx, task=None):  # pragma: no cover
                     else:
                         count += 1
                     processed_secondary += 1
+                    if run_id and processed_secondary and processed_secondary % (100 if test_mode else 100_000) == 0:
+                        enqueue_live_progress(
+                            run_id=run_id,
+                            importer="npi",
+                            status="running",
+                            phase="npi parsing secondary addresses",
+                            unit="rows",
+                            done=processed_secondary,
+                            total=TEST_NPI_SECONDARY_ROWS if test_mode else None,
+                            message=f"parsed {processed_secondary} secondary address rows",
+                            label=p,
+                        )
                     if test_mode and processed_secondary >= TEST_NPI_SECONDARY_ROWS:
                         print(f"Test mode: stopping secondary address scan at {processed_secondary} rows.")
                         break
@@ -473,13 +554,26 @@ async def process_data(ctx, task=None):  # pragma: no cover
                 coros,
                 save_npi_data(ctx, {'npi_address_list': list(npi_address_list_dict.copy().values())}),
             )
+            await raise_if_cancelled(ctx, task)
             await asyncio.gather(*coros)
             npi_address_list_dict.clear()
 
             print(f"Processed: {count}")
+            if run_id:
+                enqueue_live_progress(
+                    run_id=run_id,
+                    importer="npi",
+                    status="running",
+                    phase="npi source processed",
+                    unit="files",
+                    done=file_idx + 1,
+                    total=len(selected_files),
+                    message=f"processed file {file_idx + 1}/{len(selected_files)}",
+                    label=p,
+                )
 
     # Mark this job as successfully completed; shutdown finalization depends on this.
-    ctx['context']['run'] = ctx['context'].get('run', 0) + 1
+    context['run'] = context.get('run', 0) + 1
 
 
 async def startup(ctx):  # pragma: no cover
@@ -592,6 +686,18 @@ async def rebuild_phone_staffing_table(
     address_table: str,
     schema: str,
 ) -> None:
+    if not await db.scalar(f"SELECT to_regclass('{schema}.{target_table}');"):
+        print(
+            f"Skipping phone staffing materialization for {schema}.{target_table}: "
+            "target staging table is missing."
+        )
+        return
+    if not await db.scalar(f"SELECT to_regclass('{schema}.{address_table}');"):
+        print(
+            f"Skipping phone staffing materialization for {schema}.{target_table}: "
+            f"address staging table {schema}.{address_table} is missing."
+        )
+        return
     if not await db.scalar(f"SELECT to_regclass('{schema}.nucc_taxonomy');"):
         print(
             f"Skipping phone staffing materialization for {schema}.{target_table}: "
@@ -637,6 +743,7 @@ async def rebuild_phone_staffing_table(
 async def shutdown(ctx):  # pragma: no cover
     import_date = ctx['import_date']
     context = ctx.get('context') or {}
+    run_id = str(context.get("control_run_id") or ctx.get("control_run_id") or "").strip()
     if not context.get('run'):
         print("No NPI jobs ran in this worker session; skipping shutdown validation.")
         return
@@ -677,6 +784,14 @@ async def shutdown(ctx):  # pragma: no cover
     async def table_exists(table_name: str) -> bool:
         exists = await db.scalar(f"SELECT to_regclass('{db_schema}.{table_name}');")
         return bool(exists)
+
+    stage_counts: dict[str, int] = {}
+    for cls in processing_classes_array:
+        stage_obj = make_class(cls, import_date)
+        if await table_exists(stage_obj.__tablename__):
+            stage_counts[cls.__main_table__] = int(
+                await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{stage_obj.__tablename__};") or 0
+            )
 
     postgis_available: bool | None = None
 
@@ -825,7 +940,7 @@ WHERE
             if hasattr(cls, '__my_additional_indexes__') and cls.__my_additional_indexes__:
                 for index in cls.__my_additional_indexes__:
                     index_name = index.get('name', '_'.join(index.get('index_elements')))
-                    if index_name.startswith("geo_index_") and not await has_postgis():
+                    if _index_requires_postgis(index) and not await has_postgis():
                         print(
                             f"Skipping index {obj.__tablename__}_idx_{index_name}: "
                             "requires PostGIS (geography + ST_MakePoint)."
@@ -837,16 +952,25 @@ WHERE
                     where_clause = ""
                     if where := index.get('where'):
                         where_clause = f" WHERE {where}"
+                    index_elements = [
+                        str(element)
+                        .replace("Geography(ST_MakePoint", "public.Geography(public.ST_MakePoint")
+                        .replace("geography(st_makepoint", "public.geography(public.st_makepoint")
+                        for element in index.get('index_elements')
+                    ]
                     create_index_sql = (
                         f"CREATE INDEX IF NOT EXISTS {obj.__tablename__}_idx_{index_name} "
                         f"ON {db_schema}.{obj.__tablename__}  {using}"
-                        f"({', '.join(index.get('index_elements'))}){where_clause};"
+                        f"({', '.join(index_elements)}){where_clause};"
                     )
                     print(create_index_sql)
                     await db.status(create_index_sql)
 
     # Run VACUUM FULL ANALYZE in parallel for all tables
     async def vacuum_table(obj):
+        if not await table_exists(obj.__tablename__):
+            print(f"Skipping VACUUM FULL ANALYZE {db_schema}.{obj.__tablename__}: table is missing.")
+            return
         print(f"Post-Index VACUUM FULL ANALYZE {db_schema}.{obj.__tablename__};")
         await db.execute_ddl(f"VACUUM FULL ANALYZE {db_schema}.{obj.__tablename__};")
 
@@ -860,6 +984,9 @@ WHERE
         for cls in processing_classes_array:
             obj = tables[cls.__main_table__]
             table = obj.__main_table__
+            if not await table_exists(obj.__tablename__):
+                print(f"Skipping publish rotation for {db_schema}.{obj.__tablename__}: staging table is missing.")
+                continue
             await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
             await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{table} RENAME TO {table}_old;")
             await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{obj.__tablename__} RENAME TO {table};")
@@ -883,6 +1010,21 @@ WHERE
                                 f"{db_schema}.{obj.__tablename__}_idx_{index_name} RENAME TO "
                                 f"{table}_idx_{index_name};")
 
+    await mark_control_run(
+        run_id,
+        status="succeeded",
+        phase_detail="npi published",
+        progress_message="succeeded",
+        progress={
+            "unit": "rows",
+            "done": int(npi_address_count or 0),
+            "total": int(npi_address_count or 0),
+            "pct": 100,
+            "message": "succeeded",
+            "phase": "npi published",
+        },
+        metrics={"stage_rows": stage_counts, "npi_address_rows": int(npi_address_count or 0)},
+    )
     print_time_info(ctx['context']['start'])
 
 

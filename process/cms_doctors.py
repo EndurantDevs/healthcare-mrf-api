@@ -16,6 +16,8 @@ from pathlib import PurePath
 from arq import create_pool
 
 from db.models import DoctorClinicianAddress, db
+from process.control_cancel import raise_if_cancelled
+from process.control_lifecycle import mark_control_run
 from process.ext.utils import (ensure_database, make_class, my_init_db,
                                print_time_info, push_objects, return_checksum)
 from process.redis_config import build_redis_settings
@@ -142,6 +144,7 @@ async def _fetch_doctors_download_url(client) -> str:
 
 async def process_data(ctx, task=None):
     task = task or {}
+    await raise_if_cancelled(ctx, task)
     ctx.setdefault("context", {})
 
     if "test_mode" in task:
@@ -225,6 +228,7 @@ async def process_data(ctx, task=None):
                     })
 
                     if len(batch) >= batch_size:
+                        await raise_if_cancelled(ctx, task)
                         await push_objects(batch, stage_cls)
                         accepted_rows += len(batch)
                         batch.clear()
@@ -233,6 +237,7 @@ async def process_data(ctx, task=None):
                         break
 
                 if batch:
+                    await raise_if_cancelled(ctx, task)
                     await push_objects(batch, stage_cls)
                     accepted_rows += len(batch)
 
@@ -284,6 +289,7 @@ async def startup(ctx):
 async def shutdown(ctx):
     import_date = ctx.get("import_date")
     context = ctx.get("context") or {}
+    run_id = str(context.get("control_run_id") or ctx.get("control_run_id") or "").strip()
 
     if not context.get("run"):
         logger.info("No CMS Doctors jobs ran; skipping shutdown.")
@@ -341,6 +347,13 @@ async def shutdown(ctx):
 
     logger.info("CMS Doctors publish complete: %d rows", stage_rows)
     print_time_info(context.get("start"))
+    await mark_control_run(
+        run_id,
+        status="succeeded",
+        phase_detail="cms-doctors published",
+        progress_message="succeeded",
+        metrics={"rows": stage_rows},
+    )
 
 
 async def main(test_mode: bool = False):

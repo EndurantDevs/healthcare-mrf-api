@@ -54,6 +54,61 @@ async def test_plan_attributes_main_enqueues_test_context(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_plan_attributes_control_start_runs_inline_fanout(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(
+        process_attributes,
+        "_attribute_source_groups",
+        lambda: {
+            "state_attributes": [{"url": "https://example.com/state.csv.zip", "year": "2026"}],
+            "attributes": [{"url": "https://example.com/attr.csv.zip", "year": "2026"}],
+            "prices": [{"url": "https://example.com/price.csv.zip", "year": "2026"}],
+            "benefits": [{"url": "https://example.com/benefits.csv.zip", "year": "2026"}],
+        },
+    )
+
+    async def fake_process_state(_ctx, task):
+        calls.append(("state", task["context"]["test_mode"]))
+
+    async def fake_process_attributes(ctx, task):
+        calls.append(("attributes", task["context"]["test_mode"]))
+        await ctx["redis"].enqueue_job("save_attributes", {"attr_obj_list": [], "context": task["context"]})
+
+    async def fake_process_prices(_ctx, task):
+        calls.append(("prices", task["context"]["test_mode"]))
+
+    async def fake_process_benefits(_ctx, task):
+        calls.append(("benefits", task["context"]["test_mode"]))
+
+    async def fake_save(_ctx, _task):
+        calls.append(("save", True))
+
+    async def fake_shutdown(_ctx):
+        calls.append(("shutdown", True))
+
+    monkeypatch.setattr(process_attributes, "process_state_attributes", fake_process_state)
+    monkeypatch.setattr(process_attributes, "process_attributes", fake_process_attributes)
+    monkeypatch.setattr(process_attributes, "process_prices", fake_process_prices)
+    monkeypatch.setattr(process_attributes, "process_benefits", fake_process_benefits)
+    monkeypatch.setattr(process_attributes, "save_attributes", fake_save)
+    monkeypatch.setattr(process_attributes, "shutdown", fake_shutdown)
+
+    result = await process_attributes.plan_attributes_control_start({}, {"test_mode": True})
+
+    assert result["test_mode"] is True
+    assert result["inline_save_jobs"] == 1
+    assert calls == [
+        ("state", True),
+        ("attributes", True),
+        ("save", True),
+        ("prices", True),
+        ("benefits", True),
+        ("shutdown", True),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_shutdown_skips_missing_import_tables(monkeypatch):
     monkeypatch.setattr(process_attributes, "ensure_database", AsyncMock())
     monkeypatch.setattr(process_attributes, "get_import_schema", lambda *_args, **_kwargs: "mrf")
