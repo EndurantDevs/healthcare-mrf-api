@@ -11,6 +11,7 @@ Define component boundaries for a distributed import system where one central co
 New central service and database. It owns:
 
 - MRF source catalog.
+- Issuer, network, and TPA-hosted source classification.
 - Source seed review.
 - Discovered plans/files.
 - Schedules.
@@ -32,6 +33,7 @@ Execution and serving engine. Each instance owns:
 - Its own PTG artifact store.
 - Local base datasets.
 - Local PTG snapshots.
+- Local MRF source-discovery catalog tables for node-level discovery/probe runs.
 - Engine `/control/v1` API.
 
 Each node remains autonomous. Engine run truth lives locally in `import_run`; `import-control` mirrors it from async engine-pushed status events. Normal run/status reads use the central mirror and do not synchronously poll importer nodes; manual sync is an operator repair path.
@@ -66,6 +68,9 @@ Agent tools. Client-scoped tools route through `api-layer`; admin tools may call
 - One control node may coordinate many serving/import nodes.
 - Every serving node may have its own PostgreSQL, Redis, API port, worker pool, and artifact root.
 - Base imports are normally replicated to all serving nodes.
+- MRF source-discovery can run on any node and can sync discovered seeds to the central
+  `import-control` catalog; source URLs and platform resolver rules remain data-configured, not
+  hard-coded in engine code.
 - PTG imports are placed selectively by source file/content version.
 - `import-control` records where each source file/content version was imported.
 - `api-layer` uses the route index to select the serving node for PTG requests.

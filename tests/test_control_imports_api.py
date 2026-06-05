@@ -38,7 +38,12 @@ def test_importer_registry_exposes_ptg_and_finish_lifecycle():
     assert items["claims-pricing"]["lifecycle"] == "start_finish"
     assert items["claims-pricing"]["enqueue_adapter"] == "arq_single_job"
     assert items["ptg"]["enqueue_adapter"] == "arq_single_job"
+    assert items["mrf-source-discovery"]["family"] == "mrf"
+    assert items["mrf-source-discovery"]["enqueue_adapter"] == "arq_single_job"
+    assert items["mrf-source-discovery"]["schedulable"] is True
     assert items["code-sets"]["enqueue_adapter"] == "arq_single_job"
+    assert items["ms-drg"]["family"] == "reference"
+    assert items["ms-drg"]["enqueue_adapter"] == "arq_single_job"
     assert items["clinical-reference"]["enqueue_adapter"] == "arq_single_job"
     assert items["geo"]["enqueue_adapter"] == "arq_single_job"
     assert items["geo-census"]["enqueue_adapter"] == "arq_single_job"
@@ -48,6 +53,18 @@ def test_importer_registry_exposes_ptg_and_finish_lifecycle():
     assert items["npi"]["cancelable"] is True
     assert items["claims-pricing"]["cancelable"] is False
     assert any(param["name"] == "toc_url" and param["multiple"] for param in items["ptg"]["params_schema"])
+    assert any(param["name"] == "check_urls" and param["is_flag"] for param in items["mrf-source-discovery"]["params_schema"])
+    assert any(param["name"] == "concurrency" and param["type"] == "integer" for param in items["mrf-source-discovery"]["params_schema"])
+    assert any(param["name"] == "crawl_target_limit" and param["type"] == "integer" for param in items["mrf-source-discovery"]["params_schema"])
+    assert any(param["name"] == "source_entity_types" and param["type"] == "text" for param in items["mrf-source-discovery"]["params_schema"])
+    assert any(param["name"] == "source_payer_query" and param["type"] == "text" for param in items["mrf-source-discovery"]["params_schema"])
+    assert any(param["name"] == "probe_files" and param["is_flag"] for param in items["mrf-source-discovery"]["params_schema"])
+    assert any(param["name"] == "file_probe_limit" and param["type"] == "integer" for param in items["mrf-source-discovery"]["params_schema"])
+    assert any(param["name"] == "file_probe_types" and param["type"] == "text" for param in items["mrf-source-discovery"]["params_schema"])
+    assert any(param["name"] == "file_probe_entity_types" and param["type"] == "text" for param in items["mrf-source-discovery"]["params_schema"])
+    assert any(param["name"] == "file_probe_payer_query" and param["type"] == "text" for param in items["mrf-source-discovery"]["params_schema"])
+    assert any(param["name"] == "include_relationships" and param["type"] == "boolean" for param in items["ms-drg"]["params_schema"])
+    assert any(param["name"] == "relationship_page_limit" and param["type"] == "integer" for param in items["ms-drg"]["params_schema"])
 
 
 def test_normalize_run_accepts_plain_dict():
@@ -339,6 +356,40 @@ async def test_enqueue_import_start_wraps_kwargs_importers(monkeypatch):
     assert args[1]["target_function"] == "main"
     assert args[1]["call_style"] == "kwargs"
     assert args[1]["task"] == {"test_mode": True, "sources": "icd10cm", "import_id": "smoke_clinical"}
+
+
+@pytest.mark.asyncio
+async def test_enqueue_import_start_wraps_ms_drg_importer(monkeypatch):
+    calls = []
+
+    class FakeJob:
+        job_id = "job_ms_drg"
+
+    class FakeRedis:
+        async def enqueue_job(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            return FakeJob()
+
+    async def fake_create_pool(*_args, **_kwargs):
+        return FakeRedis()
+
+    monkeypatch.setattr("api.control_imports.create_pool", fake_create_pool)
+    row = {
+        "run_id": "run_ms_drg",
+        "importer": "ms-drg",
+        "params": {"test_mode": True, "include_relationships": True, "relationship_page_limit": 1},
+    }
+
+    result = await _enqueue_import_start(row)
+
+    assert result["status"] == "queued"
+    args, _kwargs = calls[0]
+    assert args[0] == "control_single_job_start"
+    assert args[1]["run_id"] == "run_ms_drg"
+    assert args[1]["target_module"] == "process.ms_drg"
+    assert args[1]["target_function"] == "main"
+    assert args[1]["call_style"] == "kwargs"
+    assert args[1]["task"] == {"test_mode": True, "include_relationships": True, "relationship_page_limit": 1}
 
 
 @pytest.mark.asyncio

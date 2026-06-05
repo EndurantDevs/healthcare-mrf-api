@@ -50,6 +50,7 @@ This repository resolves and processes data from public source websites, includi
 - [NUCC Provider Taxonomy](https://www.nucc.org/index.php/21-provider-taxonomy)
 - [FDA BeSafeRx state board directory](https://www.fda.gov/drugs/besaferx-your-source-online-pharmacy-information/locate-state-licensed-online-pharmacy)
 - state pharmacy board websites discovered from FDA BeSafeRx
+- MRF source registries and TPA-hosted TiC metadata indexes, documented in [docs/data-sources.md](./docs/data-sources.md)
 
 See the full source catalog in [docs/data-sources.md](./docs/data-sources.md).
 
@@ -62,7 +63,9 @@ Each importer is a separate operational pipeline. Together, they build the canon
 | `mrf` | `python main.py start mrf` | CMS marketplace public use files | issuer, plan, formulary, network, and MRF-linked marketplace data |
 | `plan-attributes` | `python main.py start plan-attributes` | CMS marketplace plan attributes files | plan metadata, prices, benefits, and rating-area data |
 | `ptg` | `python main.py start ptg` | Transparency in Coverage machine-readable files | TiC table-of-contents and rate-file ingestion |
+| `mrf-source-discovery` | `python main.py start mrf-source-discovery` | payer, network, and TPA-hosted TiC source registries | searchable MRF source, plan, and file metadata catalog for PTG targeting |
 | `code-sets` | `python main.py start code-sets` | CMS POS + CMS Blue Button RC code pages | readable Revenue Center and Place of Service labels in `code_catalog` |
+| `ms-drg` | `python main.py start ms-drg` | CMS MS-DRG definitions manual | MS-DRG labels and MS-DRG to ICD-10-CM/PCS grouping relationships |
 | `clinical-reference` | `python main.py start clinical-reference` | official condition/procedure code files | condition, treatment, clinical-area, and crosswalk tables for Ribbon-replacement APIs |
 | `npi` | `python main.py start npi` | NPPES | provider identity, addresses, taxonomies, and directory search data |
 | `nucc` | `python main.py start nucc` | NUCC | provider taxonomy lookup tables |
@@ -118,6 +121,7 @@ Run from repo root in an activated virtualenv.
 | --- | --- |
 | `ptg` | `python main.py start ptg [--test]` |
 | `code-sets` | `python main.py start code-sets [--test]` |
+| `ms-drg` | `python main.py start ms-drg [--test] [--relationship-page-limit N]` |
 | `clinical-reference` | `python main.py start clinical-reference [--test] [--import-id YYYYMMDD]` |
 | `geo` | `python main.py start geo [--file /path/to/geo_city_public.csv]` |
 | `geo-census` | `python main.py start geo-census [--test]` |
@@ -146,6 +150,7 @@ Per-import documentation:
 - [Plan attributes import](./docs/imports/plan-attributes.md)
 - [PTG import](./docs/imports/ptg.md)
 - [RC/POS code sets import](./docs/imports/code-sets.md)
+- [MS-DRG reference import](./docs/imports/ms-drg.md)
 - [Clinical reference import](./docs/imports/clinical-reference.md)
 - [NPI import](./docs/imports/npi.md)
 - [NUCC import](./docs/imports/nucc.md)

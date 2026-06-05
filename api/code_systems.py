@@ -6,7 +6,8 @@ from typing import Any
 
 INTERNAL_PROCEDURE_CODE_SYSTEM = "HP_PROCEDURE_CODE"
 INTERNAL_RX_CODE_SYSTEM = "HP_RX_CODE"
-EXTERNAL_PROCEDURE_CODE_SYSTEMS = {"CPT", "HCPCS", "CDT"}
+EQUIVALENT_PROCEDURE_CODE_SYSTEMS = {"CPT", "HCPCS", "CDT"}
+EXTERNAL_PROCEDURE_CODE_SYSTEMS = {*EQUIVALENT_PROCEDURE_CODE_SYSTEMS, "MS_DRG"}
 PROCEDURE_CODE_SYSTEMS = {*EXTERNAL_PROCEDURE_CODE_SYSTEMS, INTERNAL_PROCEDURE_CODE_SYSTEM}
 RX_CODE_SYSTEMS = {"NDC", "RXNORM", "RXCUI", INTERNAL_RX_CODE_SYSTEM}
 
@@ -23,6 +24,10 @@ CODE_SYSTEM_ALIASES = {
     "MOD": "MODIFIER",
     "ICD-10-CM": "ICD10CM",
     "ICD10": "ICD10CM",
+    "ICD-10-PCS": "ICD10PCS",
+    "MS-DRG": "MS_DRG",
+    "MSDRG": "MS_DRG",
+    "DRG": "MS_DRG",
     "RXCUI": "RXNORM",
     "SNOMED": "SNOMEDCT_US",
     "SNOMEDCT": "SNOMEDCT_US",
@@ -45,11 +50,15 @@ def canonical_catalog_code(code_system: str, raw_code: Any) -> str:
         return digits.zfill(4)
     if code_system == "POS" and digits:
         return digits.zfill(2)
+    if code_system == "MS_DRG" and digits:
+        return digits.zfill(3)
+    if code_system in {"ICD10CM", "ICD10PCS"}:
+        return code.replace(".", "")
     return code
 
 
 def equivalent_external_procedure_pairs(system: str, code: str) -> set[tuple[str, str]]:
-    if system not in EXTERNAL_PROCEDURE_CODE_SYSTEMS or len(code) != 5 or not code.isalnum():
+    if system not in EQUIVALENT_PROCEDURE_CODE_SYSTEMS or len(code) != 5 or not code.isalnum():
         return set()
     if code.isdigit():
         systems = {"CPT", "HCPCS"}

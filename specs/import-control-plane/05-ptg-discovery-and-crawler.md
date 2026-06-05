@@ -10,7 +10,9 @@ Populate and refresh the MRF coverage catalog so users can search sources/plans 
 - Client private source submission.
 - Third-party seed import for review.
 - Scheduled recrawl of active sources.
-- CMS master payer-index crawl once the exact source and format are confirmed.
+- MRF source discovery seed import from AccessMRF, Payerset docs, MRF Data Solutions, TPAFS,
+  BCBS roster, and the curated master list.
+- TPA-hosted source discovery for self-funded group plan MRFs.
 
 Third-party directories may be used as seed inputs only after provenance/license review. Official payer URLs and crawled TOCs are the durable truth.
 
@@ -26,7 +28,10 @@ Third-party directories may be used as seed inputs only after provenance/license
 8. Materialize coverage metrics.
 9. Record crawl run summary and source status.
 
-Crawler must never download in-network file bodies during discovery.
+Crawler must never download in-network or allowed-amount file bodies during discovery. Metadata
+discovery may fetch TOCs, HealthSparq/Sapphire platform metadata, UHC/Optum blob listings, Highmark
+script-derived index links, and small TPA `.txt` metadata indexes. Body files are probed with `HEAD`
+only to record size, ETag, and Last-Modified.
 
 ## Streaming Requirements
 
@@ -68,6 +73,8 @@ Weekly:
 - Import source seeds.
 - Dedupe seeds against existing sources.
 - Review new candidate sources.
+- Run TPA source crawl: `mrf-source-discovery --provider master-list --source-entity-types tpa --check-urls --crawl --concurrency 10`.
+- Run TPA body-file probe smoke: `mrf-source-discovery --probe-files --file-probe-entity-types tpa --file-probe-limit 100 --concurrency 10`.
 
 Monthly:
 
@@ -81,3 +88,5 @@ Monthly:
 - Admin can promote/reject a seed.
 - Re-crawl with unchanged ETag produces no duplicate plans/files.
 - Plan identity remains stable across source URL reorganization.
+- Admin can filter source-discovery by entity type or payer query, including TPA-only runs.
+- TPA metadata crawls produce searchable plan/file references without full body downloads.

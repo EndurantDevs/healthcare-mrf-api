@@ -50,6 +50,13 @@ _SINGLE_JOB_ADAPTERS: dict[str, dict[str, Any]] = {
         "target_module": "process.code_sets",
         "target_function": "main",
     },
+    "ms-drg": {
+        "queue": "arq:MSDRG",
+        "function": "control_single_job_start",
+        "payload": "control_wrapped_kwargs",
+        "target_module": "process.ms_drg",
+        "target_function": "main",
+    },
     "clinical-reference": {
         "queue": "arq:ClinicalReference",
         "function": "control_single_job_start",
@@ -77,6 +84,13 @@ _SINGLE_JOB_ADAPTERS: dict[str, dict[str, Any]] = {
         "payload": "control_wrapped",
         "target_module": "process.attributes",
         "target_function": "plan_attributes_control_start",
+    },
+    "mrf-source-discovery": {
+        "queue": "arq:MRFSourceDiscovery",
+        "function": "control_single_job_start",
+        "payload": "control_wrapped_kwargs",
+        "target_module": "process.mrf_source_discovery",
+        "target_function": "main",
     },
     "claims-pricing": {"queue": "arq:ClaimsPricing", "function": "claims_pricing_start", "payload": "run_import", "job_prefix": "claims_start"},
     "claims-procedures": {"queue": "arq:ClaimsPricing", "function": "claims_pricing_start", "payload": "run_import", "job_prefix": "claims_procedures_start"},
@@ -223,7 +237,7 @@ def importer_names() -> set[str]:
 
 
 def _importer_family(importer: str) -> str:
-    if importer in {"ptg", "mrf"}:
+    if importer in {"ptg", "mrf", "mrf-source-discovery"}:
         return "mrf"
     if importer in {"claims-pricing", "claims-procedures", "drug-claims"}:
         return "claims"
@@ -233,7 +247,7 @@ def _importer_family(importer: str) -> str:
         return "pharmacy"
     if importer in {"geo", "geo-census", "places-zcta", "lodes"}:
         return "geo"
-    if importer in {"code-sets", "clinical-reference", "plan-attributes"}:
+    if importer in {"code-sets", "ms-drg", "clinical-reference", "plan-attributes"}:
         return "reference"
     return "other"
 

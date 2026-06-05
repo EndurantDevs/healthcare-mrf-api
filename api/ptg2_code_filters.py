@@ -7,7 +7,14 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from api.code_systems import EXTERNAL_PROCEDURE_CODE_SYSTEMS, INTERNAL_PROCEDURE_CODE_SYSTEM, PROCEDURE_CODE_SYSTEMS
+from api.code_systems import (
+    EQUIVALENT_PROCEDURE_CODE_SYSTEMS,
+    EXTERNAL_PROCEDURE_CODE_SYSTEMS,
+    INTERNAL_PROCEDURE_CODE_SYSTEM,
+    PROCEDURE_CODE_SYSTEMS,
+    canonical_catalog_code,
+    normalize_code_system,
+)
 from api.ptg2_response import _include_ptg2_details
 
 PTG2_CODE_EXPANSION_HOPS = 2
@@ -176,8 +183,14 @@ def _normalize_code(value: Any) -> str:
 
 
 def _normalize_code_system(value: Any) -> str | None:
-    text = str(value or "").strip().upper()
+    text = normalize_code_system(value)
     return text or None
+
+
+def _normalize_code_for_system(value: Any, code_system: str | None) -> str:
+    if code_system:
+        return canonical_catalog_code(code_system, value)
+    return _normalize_code(value)
 
 
 def _is_signed_int_text(value: str) -> bool:
@@ -185,10 +198,10 @@ def _is_signed_int_text(value: str) -> bool:
 
 
 def _append_code_filter(filters: list[str], params: dict[str, Any], *, code: Any, code_system: Any) -> None:
-    requested_code = _normalize_code(code)
+    requested_system = _normalize_code_system(code_system)
+    requested_code = _normalize_code_for_system(code, requested_system)
     if not requested_code:
         return
-    requested_system = _normalize_code_system(code_system)
     params["reported_code"] = requested_code
     if requested_system == INTERNAL_PROCEDURE_CODE_SYSTEM:
         if _is_signed_int_text(requested_code):
@@ -221,7 +234,7 @@ def _is_external_procedure_code_text(value: str) -> bool:
 
 
 def _ptg2_equivalent_external_pairs(system: str, code: str) -> set[tuple[str, str]]:
-    if system not in EXTERNAL_PROCEDURE_CODE_SYSTEMS or not _is_external_procedure_code_text(code):
+    if system not in EQUIVALENT_PROCEDURE_CODE_SYSTEMS or not _is_external_procedure_code_text(code):
         return set()
     if re.fullmatch(r"\d{5}", code):
         systems = {"CPT", "HCPCS"}
@@ -260,10 +273,10 @@ def _append_resolved_code_filter(
     code_system: Any,
     code_context: dict[str, Any] | None = None,
 ) -> None:
-    requested_code = _normalize_code(code)
+    requested_system = _normalize_code_system(code_system)
+    requested_code = _normalize_code_for_system(code, requested_system)
     if not requested_code:
         return
-    requested_system = _normalize_code_system(code_system)
     if code_context is None:
         _append_code_filter(filters, params, code=code, code_system=code_system)
         return

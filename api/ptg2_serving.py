@@ -11,8 +11,8 @@ from typing import Any
 
 from sqlalchemy import bindparam, text
 
+from api.code_systems import EQUIVALENT_PROCEDURE_CODE_SYSTEMS, canonical_catalog_code
 from api.ptg2_code_filters import (
-    EXTERNAL_PROCEDURE_CODE_SYSTEMS,
     INFERRED_PROVIDER_TAXONOMY_RULES,
     INTERNAL_PROCEDURE_CODE_SYSTEM,
     PROCEDURE_CODE_SYSTEMS,
@@ -132,7 +132,7 @@ def normalize_ptg2_mode(value: str | None) -> str:
 def _inferred_provider_taxonomy_rule(args: dict[str, Any]) -> InferredProviderTaxonomyRule | None:
     requested_system = _normalize_code_system(args.get("code_system"))
     requested_code = _normalize_code(args.get("code"))
-    if requested_system not in EXTERNAL_PROCEDURE_CODE_SYSTEMS or not requested_code or not requested_code.isdigit():
+    if requested_system not in EQUIVALENT_PROCEDURE_CODE_SYSTEMS or not requested_code or not requested_code.isdigit():
         return None
     code_value = int(requested_code)
     return next((rule for rule in INFERRED_PROVIDER_TAXONOMY_RULES if rule.matches(code_value)), None)
@@ -199,15 +199,15 @@ def _append_manifest_reported_code_filter(
     code_system: Any,
     code_context: dict[str, Any] | None = None,
 ) -> None:
-    requested_code = _normalize_code(code)
+    requested_system = _normalize_code_system(code_system)
+    requested_code = canonical_catalog_code(requested_system, code) if requested_system else _normalize_code(code)
     if not requested_code:
         return
-    requested_system = _normalize_code_system(code_system)
     external_pairs: set[tuple[str, str]] = set()
     if code_context:
         for resolved_code in code_context.get("resolved_codes") or []:
             system = _normalize_code_system(resolved_code.get("code_system"))
-            value = _normalize_code(resolved_code.get("code"))
+            value = canonical_catalog_code(system, resolved_code.get("code")) if system else _normalize_code(resolved_code.get("code"))
             if system and value and system != INTERNAL_PROCEDURE_CODE_SYSTEM:
                 external_pairs.add((system, value))
     if not external_pairs and requested_system and requested_system != INTERNAL_PROCEDURE_CODE_SYSTEM:
@@ -1065,8 +1065,12 @@ async def _search_ptg2_manifest_db_serving_table(
     if not table_name or not await _serving_table_available(session, table_name):
         return None
     requested_plan = str(args.get("plan_id") or args.get("plan_external_id") or "").strip()
-    requested_code = str(args.get("code") or args.get("reported_code") or "").strip()
-    requested_system = str(args.get("code_system") or args.get("reported_code_system") or "").strip().upper()
+    requested_system = _normalize_code_system(args.get("code_system") or args.get("reported_code_system"))
+    requested_code = (
+        canonical_catalog_code(requested_system, args.get("code") or args.get("reported_code"))
+        if requested_system
+        else str(args.get("code") or args.get("reported_code") or "").strip()
+    )
     expand_providers = _request_bool(args.get("include_providers"))
     location_filter_requested = bool(
         args.get("state")

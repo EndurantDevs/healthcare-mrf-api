@@ -17,6 +17,7 @@ from process.ptg_parts.ptg2_manifest_artifacts import (
     read_manifest,
 )
 
+from api.code_systems import canonical_catalog_code
 from api.ptg2_code_filters import _normalize_code, _normalize_code_system
 from api.ptg2_response import _coerce_json_payload, _price_response_fields, _request_bool
 from api.ptg2_serving_utils import _normalize_zip5
@@ -357,11 +358,13 @@ def _matches_exact_request(row: Mapping[str, Any], requested_plan: str, requeste
     if plan_id != requested_plan:
         return False
     row_code = _normalize_code(row.get("reported_code") or row.get("billing_code"))
+    row_system = _normalize_code_system(row.get("reported_code_system") or row.get("billing_code_type"))
+    if row_system:
+        row_code = canonical_catalog_code(row_system, row_code)
     if row_code != requested_code:
         return False
     if not code_system:
         return True
-    row_system = _normalize_code_system(row.get("reported_code_system") or row.get("billing_code_type"))
     return row_system == code_system
 
 
@@ -375,8 +378,8 @@ def search_ptg2_manifest_snapshot(
     if _has_unsupported_provider_or_geo_request(args):
         return None
     requested_plan = str(args.get("plan_id") or args.get("plan_external_id") or "").strip()
-    requested_code = _normalize_code(args.get("code"))
     requested_system = _normalize_code_system(args.get("code_system"))
+    requested_code = canonical_catalog_code(requested_system, args.get("code")) if requested_system else _normalize_code(args.get("code"))
     if not requested_plan or not requested_code:
         return None
     if str(args.get("q") or "").strip():

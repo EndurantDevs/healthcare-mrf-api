@@ -5,6 +5,7 @@ This package is the implementation contract for the HealthPorta import control p
 The control plane has five goals:
 
 - Maintain a searchable MRF/PTG coverage catalog.
+- Include issuer, network, and TPA-hosted TiC sources in that catalog.
 - Let admins and entitled clients discover group plans and request imports.
 - Schedule and control all major import families.
 - Coalesce PTG execution by source file and share completed imports across clients.

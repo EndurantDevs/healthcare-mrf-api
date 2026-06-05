@@ -8,6 +8,7 @@ from typing import Any
 
 from sqlalchemy import text
 
+from api.code_systems import canonical_catalog_code
 from api.ptg2_code_filters import (
     INTERNAL_PROCEDURE_CODE_SYSTEM,
     PROCEDURE_CODE_SYSTEMS,
@@ -69,10 +70,12 @@ async def _resolve_ptg2_code_search_context(
     code: Any,
     code_system: Any,
 ) -> dict[str, Any] | None:
+    requested_system = _normalize_code_system(code_system)
     requested_code = _normalize_code(code)
+    if requested_system:
+        requested_code = canonical_catalog_code(requested_system, requested_code)
     if not requested_code:
         return None
-    requested_system = _normalize_code_system(code_system)
     if requested_system not in PROCEDURE_CODE_SYSTEMS:
         return None
     if requested_system == INTERNAL_PROCEDURE_CODE_SYSTEM and not _is_signed_int_text(requested_code):

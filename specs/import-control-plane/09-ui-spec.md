@@ -11,6 +11,8 @@ Define the `api-app` user experience for admins, clients, and public coverage.
 - Active runs table.
 - Status, importer, node, progress, duration, queue age, requester.
 - Actions: cancel, retry, view details.
+- `mrf-source-discovery` run details show provider list, source filters, probe filters, URL counts,
+  discovered plans/files, probe OK count, ETag/Last-Modified/size coverage, and crawl errors.
 
 ### Schedules
 
@@ -20,16 +22,26 @@ Define the `api-app` user experience for admins, clients, and public coverage.
 - Run now.
 - Last/next run.
 - Conflict/lock indicators.
+- Parameter editor for source-discovery:
+  - provider (`master-list`, `accessmrf`, `payerset`, `mrfdatasolutions`, `all`)
+  - source entity types (`tpa`, `network/tpa`, etc.)
+  - source payer query
+  - crawl/check/probe flags
+  - file probe entity types and payer query
+  - bounded limits and concurrency
 
 ### MRF Sources
 
 - Search/filter sources.
+- Entity-type filter with first-class TPA and network/TPA values.
 - Source detail with crawl history.
 - Add source.
 - Validate URL.
 - Crawl now.
 - Promote/reject seeds.
 - Mark duplicate/broken/disabled.
+- TPA source detail identifies the hosting style: platform TOC, metadata text index, carrier/EIN
+  redirect, or unresolved landing page.
 
 ### Group Plans
 
@@ -78,5 +90,6 @@ Public pages show coverage and freshness, not control actions.
 ## Acceptance Criteria
 
 - Admin can manage a source from seed to active crawl.
+- Admin can schedule and run a TPA-only source-discovery crawl and a TPA-only file-probe smoke.
 - Client can submit a source and track review/import status.
 - Public user can understand coverage without logging in.

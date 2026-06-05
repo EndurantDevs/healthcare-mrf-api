@@ -293,6 +293,33 @@ async def test_ptg2_code_context_bridges_cdt_and_hcpcs_dental_code():
 
 
 @pytest.mark.asyncio
+async def test_ptg2_code_context_keeps_ms_drg_exact():
+    context = await ptg2_serving._resolve_ptg2_code_search_context(
+        FakeSession([FakeResult(rows=[])]),
+        code="47",
+        code_system="DRG",
+    )
+
+    assert context["input_code"] == {"code_system": "MS_DRG", "code": "047"}
+    assert context["resolved_codes"] == [{"code_system": "MS_DRG", "code": "047"}]
+    assert context["internal_codes"] == []
+
+    filters = []
+    params = {}
+    ptg2_serving._append_resolved_code_filter(
+        filters,
+        params,
+        code="47",
+        code_system="DRG",
+        code_context=context,
+    )
+
+    assert "reported_code_system_0_0" in params
+    assert params["reported_code_system_0_0"] == "MS_DRG"
+    assert params["reported_code_0"] == "047"
+
+
+@pytest.mark.asyncio
 async def test_ptg2_code_context_expands_internal_code_crosswalk():
     context = await ptg2_serving._resolve_ptg2_code_search_context(
         FakeSession(

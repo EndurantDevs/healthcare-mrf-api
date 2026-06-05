@@ -1,0 +1,92 @@
+{
+  "default_providers": ["master-list", "accessmrf", "payerset", "mrfdatasolutions"],
+  "test_providers": ["master-list"],
+  "providers": {
+    "master-list": {
+      "parser": "master-list",
+      "path": "specs/mrf_payer_master_list.md"
+    },
+    "accessmrf": {
+      "parser": "accessmrf",
+      "url": "https://www.accessmrf.com/api/sources"
+    },
+    "payerset": {
+      "parser": "payerset",
+      "url": "https://docs.payerset.com/sitemap.md"
+    },
+    "mrfdatasolutions": {
+      "parser": "mrfdatasolutions",
+      "url": "https://www.mrfdatasolutions.com/payers",
+      "max_bytes": 5242880
+    },
+    "cms-guide": {
+      "parser": "reference",
+      "url": "https://github.com/CMSgov/price-transparency-guide",
+      "payer_name": "CMS price-transparency-guide",
+      "source_type": "schema_reference",
+      "access_model": "free",
+      "source_coverage": ["U"],
+      "confidence": 100,
+      "license_status": "public_schema",
+      "raw_payload": {"role": "schema_validation"}
+    },
+    "tpafs": {
+      "parser": "reference",
+      "url": "https://github.com/TPAFS/transparency-data",
+      "payer_name": "TPAFS transparency-data",
+      "source_type": "community_index",
+      "access_model": "free",
+      "source_coverage": ["U"],
+      "confidence": 60,
+      "license_status": "public_repository",
+      "raw_payload": {"role": "homepage_and_link_seed"}
+    },
+    "bcbs-roster": {
+      "parser": "reference",
+      "url": "https://www.bcbs.com/about-us/blue-cross-blue-shield-system/state-health-plan-companies",
+      "payer_name": "BCBS Association roster",
+      "source_type": "authoritative_roster",
+      "access_model": "free",
+      "source_coverage": ["U"],
+      "confidence": 95,
+      "license_status": "public_directory",
+      "raw_payload": {"role": "blue_licensee_expansion"}
+    }
+  },
+  "platform_resolvers": {
+    "aetna_health1": {
+      "type": "healthsparq_public_mrf",
+      "metadata_url_template": "https://mrf.healthsparq.com/{tenant}-egress.nophi.kyruushsq.com/prd/mrf/{insurerCode}/{brandCode}/latest_metadata.json",
+      "tenant_overrides": {
+        "MERITAIN_I": "aetnacvs"
+      },
+      "public_service_path": "/healthsparq/public/service",
+      "login_path": "/login",
+      "mrf_all_path": "/v2/mrf/all",
+      "max_bytes": 52428800
+    },
+    "healthsparq": {
+      "type": "healthsparq_public_mrf",
+      "metadata_url_template": "https://mrf.healthsparq.com/{tenant}-egress.nophi.kyruushsq.com/prd/mrf/{insurerCode}/{brandCode}/latest_metadata.json",
+      "public_service_path": "/healthsparq/public/service",
+      "login_path": "/login",
+      "mrf_all_path": "/v2/mrf/all",
+      "max_bytes": 52428800
+    },
+    "highmark_hmhs": {
+      "type": "highmark_hmhs_script",
+      "script_path": "/js/script.js",
+      "max_bytes": 1048576
+    },
+    "sapphire": {
+      "type": "sapphire_html_tocs",
+      "max_bytes": 5242880
+    },
+    "uhc_public_blobs": {
+      "type": "uhc_blob_listing",
+      "max_bytes": 67108864,
+      "path_templates": ["/api/v1/uhc/blobs/"],
+      "optum_path_templates": ["/api/v1/oh/blobs/", "/api/v1/orx/blobs/"]
+    }
+  }
+}

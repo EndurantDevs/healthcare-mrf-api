@@ -4,6 +4,9 @@
 
 - Stable plan identity excludes mutable URL/name fields.
 - Source file identity canonicalizes URLs.
+- MRF source-discovery parses curated master-list rows with TPA hints and multiple URLs.
+- MRF source-discovery skips non-http body placeholders.
+- HealthSparq tenant overrides resolve TPA brands such as Meritain.
 - Resolver groups subscriptions by source file/content version.
 - Quota accounting uses bytes/files/runtime/PTG slots.
 - RBAC allows/denies expected actions.
@@ -12,6 +15,7 @@
 ## Integration Tests
 
 - Engine control starts a test import and writes `import_run`.
+- Engine control exposes `mrf-source-discovery` and all source/probe filter params.
 - Auto-finalize watcher enqueues finish once.
 - Cancel flag is honored at chunk boundaries.
 - Import-control mirrors engine run state.
@@ -27,6 +31,8 @@
 - Broken source is marked, not deleted.
 - Large TOC path is streamed.
 - Plan rename preserves subscription identity.
+- TPA crawl parses metadata text indexes into body-file references without downloading bodies.
+- TPA body-file probe records size, ETag, and Last-Modified with `HEAD` only.
 
 ## Distributed Routing Tests
 
@@ -56,6 +62,15 @@
 8. Route index updates.
 9. api-layer routes PTG pricing call to assigned node.
 10. Dashboard shows run, placement, freshness, and coverage.
+
+## MRF Source Discovery Acceptance
+
+1. Run `mrf-source-discovery --provider master-list --source-entity-types tpa --check-urls --crawl --concurrency 10`.
+2. Verify `mrf_crawl_run.status = succeeded` and nonzero discovered source/file counts.
+3. Verify known TPA rows such as Collective, Aetna Signature, and Meritain have body-file references.
+4. Run `mrf-source-discovery --probe-files --file-probe-entity-types tpa --file-probe-limit 100 --concurrency 10`.
+5. Verify probe observations contain nonzero ETag, Last-Modified, and content-length coverage.
+6. Verify public/client coverage surfaces redact signed/private/raw URLs and expose only safe coverage metadata.
 
 ## Performance Acceptance
 
