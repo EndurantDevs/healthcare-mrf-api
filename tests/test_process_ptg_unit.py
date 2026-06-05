@@ -2191,7 +2191,7 @@ def test_ptg2_db_serving_index_builder_materializes_table(monkeypatch, tmp_path)
     assert "code_crosswalk" in insert_sql
     assert "pricing_procedure" in insert_sql
     assert "code_catalog" in insert_sql
-    assert "code_system IN ('CPT', 'HCPCS', 'CDT')" in source_observed_catalog_sql
+    assert "code_system IN ('CPT', 'HCPCS', 'CDT', 'MS_DRG')" in source_observed_catalog_sql
     assert "source_attribution" in source_observed_catalog_sql
     assert "source_description" in source_observed_synonym_sql
     assert "snapshot_index" not in [part.name for part in tmp_path.iterdir()]

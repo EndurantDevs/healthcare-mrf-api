@@ -7,6 +7,7 @@ import datetime
 import hashlib
 from typing import Any
 
+from api.code_systems import canonical_catalog_code, normalize_code_system
 from process.ext.utils import return_checksum
 from process.ptg_parts.domain import (
     PTG2_CONFIDENCE_NPPES_PRACTICE_LOCATION,
@@ -21,9 +22,11 @@ def _utcnow() -> datetime.datetime:
 
 
 def _ptg2_hp_procedure_code(code_system: Any, code: Any) -> int | None:
-    normalized_system = _normalize_code_component(code_system)
-    normalized_code = _normalize_code_component(code)
+    normalized_system = normalize_code_system(code_system)
+    normalized_code = canonical_catalog_code(normalized_system, code) if normalized_system else _normalize_code_component(code)
     if not normalized_system or not normalized_code:
+        return None
+    if normalized_system == "MS_DRG":
         return None
     return return_checksum([normalized_system, normalized_code])
 
@@ -44,7 +47,8 @@ def _ptg2_serving_rate_row(
     confidence_code: str | None = None,
 ) -> dict[str, Any]:
     plan_id = str(plan_fields.get("plan_id") or "")
-    billing_code = str(procedure_payload.get("billing_code") or "")
+    raw_billing_code = procedure_payload.get("billing_code")
+    billing_code = str(raw_billing_code or "")
     serving_rate_id = hashlib.md5(
         "|".join(
             [
@@ -56,6 +60,8 @@ def _ptg2_serving_rate_row(
         ).encode("utf-8")
     ).hexdigest()
     billing_code_type = procedure_payload.get("billing_code_type")
+    reported_code_system = normalize_code_system(billing_code_type)
+    reported_code = canonical_catalog_code(reported_code_system, raw_billing_code) if reported_code_system else _normalize_code_component(raw_billing_code)
     return {
         "serving_rate_id": serving_rate_id,
         "snapshot_id": snapshot_id,
@@ -65,9 +71,9 @@ def _ptg2_serving_rate_row(
         "plan_market_type": plan_fields.get("plan_market_type"),
         "issuer_name": plan_fields.get("issuer_name"),
         "plan_sponsor_name": plan_fields.get("plan_sponsor_name"),
-        "procedure_code": _ptg2_hp_procedure_code(billing_code_type, billing_code),
-        "reported_code_system": _normalize_code_component(billing_code_type),
-        "reported_code": _normalize_code_component(billing_code),
+        "procedure_code": _ptg2_hp_procedure_code(reported_code_system, reported_code),
+        "reported_code_system": reported_code_system,
+        "reported_code": reported_code,
         "billing_code": billing_code,
         "billing_code_type": billing_code_type,
         "procedure_name": procedure_payload.get("name"),

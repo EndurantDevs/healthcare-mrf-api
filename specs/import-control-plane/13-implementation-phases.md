@@ -43,6 +43,8 @@ Exit criteria:
 - Add seed import/review.
 - Add source validation.
 - Add discovery plan/file tables.
+- Add `mrf-source-discovery` importer and worker registration.
+- Add curated issuer/network/TPA source registry files.
 - Add internal search.
 
 Exit criteria:
@@ -55,11 +57,14 @@ Exit criteria:
 - Add ETag skips.
 - Add crawl checkpoints.
 - Add limited production crawl.
+- Add platform resolvers for HealthSparq/Aetna Health1, Sapphire, UHC/Optum, Highmark, and TPA metadata text indexes.
+- Add file `HEAD` probing for size, ETag, and Last-Modified.
 - Add coverage metric materialization.
 
 Exit criteria:
 
 - Limited crawl completes within configured bounds and re-run skips unchanged sources.
+- TPA-only crawl and probe smoke complete without full body downloads.
 
 ## P5: Subscriptions, Coalescing, Placement
 
@@ -89,6 +94,7 @@ Exit criteria:
 - Add admin dashboards.
 - Add client import pages.
 - Add public coverage pages.
+- Add admin schedule controls for source-discovery provider/source/probe filters.
 
 Exit criteria:
 

@@ -21,6 +21,7 @@ python main.py start clinical-reference --sources icd10cm,mesh,rxnorm,snomed,med
 The importer uses official coding systems as canonical keys and retains downloaded artifacts under `/Volumes/Data/data/artifacts/terminology` by default:
 
 - `ICD10CM`: CDC ICD-10-CM code descriptions for conditions.
+- `ICD10PCS` is not loaded by this importer. CMS MS-DRG-specific ICD-10-PCS rows are loaded by the separate `ms-drg` importer.
 - `MESH`: NLM MeSH descriptor and supplemental XML.
 - `RXNORM`: NLM RxNorm monthly release for drug concepts and aliases.
 - `SNOMEDCT_US`: NLM/UMLS SNOMED CT US Edition plus SNOMED-to-ICD-10-CM map.
@@ -40,6 +41,8 @@ Clinical areas are derived from official MeSH tree roots, not from a proprietary
 CPT/HCPCS/CDT procedure-to-clinical-area mappings are intentionally not imported by default because a complete official licensed mapping is not available in the public source set.
 
 The platform may store CPT, CDT, and HCPCS procedure codes and source-provided labels observed in claims, PTG, or MRF files. Those rows are marked as source-observed text and are not an AMA CPT, ADA CDT, or UMLS CPT/CDT reference import. Do not load official CPT/CDT descriptors, synonyms, or licensed reference dictionaries into `code_catalog` unless the deployment has explicit AMA/ADA licensing and the importer is updated to record that licensed source.
+
+MS-DRG to ICD-10-CM/PCS relationships are maintained by `ms-drg` as grouping relationships in `code_relationship`; they are not CPT/HCPCS equivalence crosswalks.
 
 ## Tables
 

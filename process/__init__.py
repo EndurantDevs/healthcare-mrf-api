@@ -48,6 +48,7 @@ from process.claims_pricing import (claims_pricing_finalize,
                                     main as initiate_claims_pricing)
 from process.clinical_reference import main as initiate_clinical_reference
 from process.code_sets import main as initiate_code_sets
+from process.ms_drg import main as initiate_ms_drg
 from process.drug_claims import (drug_claims_finalize,
                                  drug_claims_process_chunk,
                                  drug_claims_start,
@@ -92,6 +93,10 @@ from process.medicare_enrollment import main as initiate_medicare_enrollment
 from process.medicare_enrollment import process_data as process_medicare_enrollment_data
 from process.medicare_enrollment import shutdown as medicare_enrollment_shutdown
 from process.medicare_enrollment import startup as medicare_enrollment_startup
+from process.mrf_source_discovery import main as initiate_mrf_source_discovery
+from process.mrf_source_discovery import process_data as process_mrf_source_discovery_data
+from process.mrf_source_discovery import shutdown as mrf_source_discovery_shutdown
+from process.mrf_source_discovery import startup as mrf_source_discovery_startup
 from process.cms_doctors import main as initiate_cms_doctors
 from process.cms_doctors import process_data as process_cms_doctors_data
 from process.cms_doctors import shutdown as cms_doctors_shutdown
@@ -644,6 +649,19 @@ class EntityAddressUnified_finish:  # pylint: disable=invalid-name
     job_deserializer = deserialize_job
 
 
+class MRFSourceDiscovery:
+    functions = [process_mrf_source_discovery_data, control_single_job_start]
+    on_startup = mrf_source_discovery_startup
+    on_shutdown = mrf_source_discovery_shutdown
+    max_jobs = 1
+    queue_read_limit = 2
+    queue_name = "arq:MRFSourceDiscovery"
+    job_timeout = 86400
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
 @click.group()
 def process_group():
     """
@@ -774,6 +792,40 @@ def nucc(test: bool):
 @click.option("--test", is_flag=True, help="Import a small official-code sample for a quick smoke run.")
 def code_sets(test: bool):
     asyncio.run(initiate_code_sets(test_mode=test))
+
+
+@click.command(help="Run CMS MS-DRG reference import")
+@click.option("--test", is_flag=True, help="Import a small MS-DRG sample for a quick smoke run.")
+@click.option(
+    "--include-relationships/--skip-relationships",
+    default=True,
+    help="Load MS-DRG to ICD-10-CM/PCS relationship indexes.",
+)
+@click.option("--relationship-page-limit", type=int, help="Limit ICD-10 index pages for controlled partial runs.")
+@click.option("--concurrency", type=int, help="Maximum concurrent CMS manual index page downloads.")
+@click.option("--source-url", help="Override CMS MS-DRG landing page URL.")
+@click.option("--manual-toc-url", help="Override CMS MS-DRG definitions manual table-of-contents URL.")
+@click.option("--import-id", help="Override staging suffix/import id.")
+def ms_drg(
+    test: bool,
+    include_relationships: bool,
+    relationship_page_limit: int | None,
+    concurrency: int | None,
+    source_url: str | None,
+    manual_toc_url: str | None,
+    import_id: str | None,
+):
+    asyncio.run(
+        initiate_ms_drg(
+            test_mode=test,
+            include_relationships=include_relationships,
+            relationship_page_limit=relationship_page_limit,
+            concurrency=concurrency,
+            source_url=source_url,
+            manual_toc_url=manual_toc_url,
+            import_id=import_id,
+        )
+    )
 
 
 @click.command(help="Run clinical condition/treatment reference import")
@@ -932,6 +984,66 @@ def entity_address_unified(test: bool):
     asyncio.run(initiate_entity_address_unified(test_mode=test))
 
 
+@click.command(help="Run lightweight MRF payer/source discovery catalog import")
+@click.option("--provider", help="Provider list: all, master-list, accessmrf, payerset, mrfdatasolutions, cms-guide, tpafs, bcbs-roster.")
+@click.option("--limit", type=int, help="Maximum deduped source candidates to process.")
+@click.option("--source-entity-types", help="Comma-separated payer entity types to seed/check/crawl, for example tpa.")
+@click.option("--source-payer-query", help="Case-insensitive payer-name substring for seed/check/crawl.")
+@click.option("--dry-run", is_flag=True, help="Collect and dedupe candidates without writing catalog tables.")
+@click.option("--check-urls", is_flag=True, help="Run lightweight HEAD checks for discovered URLs.")
+@click.option("--crawl", is_flag=True, help="Fetch and parse TOC/index metadata only; never download full rate bodies.")
+@click.option("--probe-files", is_flag=True, help="Run HEAD probes for stored MRF body files and cache size/ETag/Last-Modified.")
+@click.option("--file-probe-limit", type=int, help="Maximum stored MRF body-file URLs to probe.")
+@click.option("--file-probe-types", help="Comma-separated file types to probe. Defaults to in-network,allowed-amounts.")
+@click.option("--file-probe-entity-types", help="Comma-separated payer entity types to probe, for example tpa or network/tpa.")
+@click.option("--file-probe-payer-query", help="Case-insensitive payer-name substring for file probes.")
+@click.option("--sync-import-control", is_flag=True, help="Push discovered source seeds to the configured import-control service.")
+@click.option("--max-toc-bytes", type=int, help="Maximum TOC/index response bytes to fetch during discovery.")
+@click.option("--concurrency", type=int, default=None, help="Maximum concurrent URL checks/TOC fetches. Defaults to 10.")
+@click.option("--crawl-target-limit", type=int, help="Maximum resolved TOC targets to crawl after platform expansion.")
+@click.option("--test", is_flag=True, help="Use the local curated master list sample and avoid external network checks.")
+def mrf_source_discovery_command(
+    provider: str | None,
+    limit: int | None,
+    source_entity_types: str | None,
+    source_payer_query: str | None,
+    dry_run: bool,
+    check_urls: bool,
+    crawl: bool,
+    probe_files: bool,
+    file_probe_limit: int | None,
+    file_probe_types: str | None,
+    file_probe_entity_types: str | None,
+    file_probe_payer_query: str | None,
+    sync_import_control: bool,
+    max_toc_bytes: int | None,
+    concurrency: int | None,
+    crawl_target_limit: int | None,
+    test: bool,
+):
+    asyncio.run(
+        initiate_mrf_source_discovery(
+            test_mode=test,
+            provider=provider,
+            limit=limit,
+            source_entity_types=source_entity_types,
+            source_payer_query=source_payer_query,
+            dry_run=dry_run,
+            check_urls=check_urls,
+            crawl=crawl,
+            probe_files=probe_files,
+            file_probe_limit=file_probe_limit or None,
+            file_probe_types=file_probe_types,
+            file_probe_entity_types=file_probe_entity_types,
+            file_probe_payer_query=file_probe_payer_query,
+            sync_import_control=sync_import_control,
+            max_toc_bytes=max_toc_bytes or None,
+            concurrency=concurrency or None,
+            crawl_target_limit=crawl_target_limit or None,
+        )
+    )
+
+
 @click.command(help="Finish CMS Part D formulary + pharmacy network import for a queued run id")
 @click.option("--import-id", required=True, help="Import id/date suffix used for the run.")
 @click.option("--run-id", required=True, help="Run id emitted by `start partd-formulary-network`.")
@@ -985,6 +1097,7 @@ process_group.add_command(places_zcta, name="places-zcta")
 process_group.add_command(provider_enrichment, name="provider-enrichment")
 process_group.add_command(lodes, name="lodes")
 process_group.add_command(medicare_enrollment, name="medicare-enrollment")
+process_group.add_command(mrf_source_discovery_command, name="mrf-source-discovery")
 process_group.add_command(cms_doctors, name="cms-doctors")
 process_group.add_command(facility_anchors, name="facility-anchors")
 process_group.add_command(pharmacy_economics, name="pharmacy-economics")
@@ -993,4 +1106,5 @@ process_group.add_command(geo_lookup, name="geo")
 process_group.add_command(geo_census_lookup, name="geo-census")
 process_group.add_command(nucc)
 process_group.add_command(code_sets, name="code-sets")
+process_group.add_command(ms_drg, name="ms-drg")
 process_group.add_command(clinical_reference, name="clinical-reference")

@@ -10,7 +10,9 @@ For the canonical source website registry, see [../data-sources.md](../data-sour
 | MRF | `python main.py start mrf` | `process.MRF`, `process.MRF_finish`, or `finish mrf` | Marketplace issuer, plan, network, formulary, and transparency ingestion |
 | Plan attributes | `python main.py start plan-attributes` | `process.Attributes` worker | Marketplace plan attributes, prices, benefits, and rating areas |
 | PTG | `python main.py start ptg` | no separate finish command | Transparency in Coverage table-of-contents and file ingestion |
+| MRF source discovery | `python main.py start mrf-source-discovery` | none | Lightweight payer and TPA-hosted MRF URL, source, plan, and file metadata catalog for PTG search/import targeting |
 | RC/POS code sets | `python main.py start code-sets` | none | official Revenue Center and CMS Place of Service labels in `code_catalog` |
+| MS-DRG reference | `python main.py start ms-drg` | none | CMS MS-DRG labels plus MS-DRG to ICD-10-CM/PCS grouping relationships |
 | Clinical reference | `python main.py start clinical-reference` | none | official-code condition, treatment, clinical-area, and crosswalk reference tables |
 | NPI | `python main.py start npi` | `process.NPI_finish` worker | NPPES provider directory import |
 | NUCC | `python main.py start nucc` | shutdown publish in worker | NUCC taxonomy import |
@@ -34,7 +36,9 @@ For the canonical source website registry, see [../data-sources.md](../data-sour
 - [MRF import](./mrf.md)
 - [Plan attributes import](./plan-attributes.md)
 - [PTG import](./ptg.md)
+- [MRF source discovery import](./mrf-source-discovery.md)
 - [RC/POS code sets import](./code-sets.md)
+- [MS-DRG reference import](./ms-drg.md)
 - [Clinical reference import](./clinical-reference.md)
 - [NPI import](./npi.md)
 - [NUCC import](./nucc.md)
@@ -58,6 +62,7 @@ For the canonical source website registry, see [../data-sources.md](../data-sour
 - Use `--test` where supported before large imports.
 - Publish style is importer-specific: direct load, validated direct replace, `_old` swap rollback, or snapshot pointer update.
 - Keep `_old` tables only for importers whose runbook documents them as rollback assets.
+- MRF source-discovery schedules, TPA smokes, and post-deploy checks are documented in [../devops/mrf-source-discovery.md](../devops/mrf-source-discovery.md).
 - `claims-procedures` remains a CLI compatibility alias for `claims-pricing`, but `claims-pricing` is the canonical command.
 - Avoid running `ClaimsPricing_finish` and `DrugClaims_finish` at the same time.
 - Run `ProviderQuality_finish` in its own finalize window as well.

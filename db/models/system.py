@@ -2,7 +2,7 @@
 
 import os
 
-from sqlalchemy import DATE, JSON, TEXT, TIMESTAMP, Column, DateTime, Integer, PrimaryKeyConstraint, String
+from sqlalchemy import DATE, JSON, TEXT, TIMESTAMP, BigInteger, Boolean, Column, DateTime, Integer, PrimaryKeyConstraint, String
 
 from db.connection import Base
 from db.json_mixin import JSONOutputMixin
@@ -11,6 +11,13 @@ __all__ = (
     "ImportHistory",
     "ImportLog",
     "ImportRun",
+    "MRFCrawlRun",
+    "MRFFile",
+    "MRFPayer",
+    "MRFPayerScorecard",
+    "MRFPlan",
+    "MRFSource",
+    "MRFUrlObservation",
     "PartDImportRun",
     "PartDFormularySnapshot",
 )
@@ -91,6 +98,238 @@ class ImportRun(Base, JSONOutputMixin):
     snapshot_id = Column(String(96))
     import_id = Column(String(64))
     retry_of_run_id = Column(String(64))
+
+
+class MRFPayer(Base, JSONOutputMixin):
+    __tablename__ = "mrf_payer"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("payer_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["payer_id"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("canonical_name",), "name": "mrf_payer_name_idx"},
+        {"index_elements": ("parent_group",), "name": "mrf_payer_parent_group_idx"},
+        {"index_elements": ("entity_type",), "name": "mrf_payer_entity_type_idx"},
+    ]
+
+    payer_id = Column(String(64), nullable=False)
+    canonical_name = Column(String(256), nullable=False)
+    aliases = Column(JSON)
+    parent_group = Column(String(128))
+    entity_type = Column(String(64))
+    states = Column(JSON)
+    eins = Column(JSON)
+    lifecycle = Column(String(32), nullable=False, default="active")
+    source_coverage = Column(JSON)
+    metadata_json = Column(JSON)
+    created_at = Column(TIMESTAMP)
+    updated_at = Column(TIMESTAMP)
+
+
+class MRFSource(Base, JSONOutputMixin):
+    __tablename__ = "mrf_source"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("source_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["source_id"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("payer_id",), "name": "mrf_source_payer_idx"},
+        {"index_elements": ("source_key",), "name": "mrf_source_key_idx", "unique": True},
+        {"index_elements": ("canonical_url",), "name": "mrf_source_canonical_url_idx"},
+        {"index_elements": ("status",), "name": "mrf_source_status_idx"},
+        {"index_elements": ("hosting_platform",), "name": "mrf_source_hosting_platform_idx"},
+        {"index_elements": ("seed_provider",), "name": "mrf_source_seed_provider_idx"},
+    ]
+
+    source_id = Column(String(64), nullable=False)
+    payer_id = Column(String(64))
+    source_key = Column(String(96), nullable=False)
+    display_name = Column(String(256), nullable=False)
+    source_type = Column(String(64))
+    hosting_platform = Column(String(64))
+    access_model = Column(String(32))
+    index_url = Column(TEXT)
+    human_url = Column(TEXT)
+    canonical_url = Column(TEXT)
+    domain = Column(String(256))
+    status = Column(String(32), nullable=False, default="needs_review")
+    schema_version = Column(String(32))
+    etag = Column(String(512))
+    last_modified = Column(String(256))
+    content_version = Column(String(128))
+    last_crawled_at = Column(TIMESTAMP)
+    latest_index_date = Column(String(32))
+    num_plans = Column(Integer)
+    num_files = Column(Integer)
+    num_indices = Column(Integer)
+    total_compressed_size = Column(BigInteger)
+    provenance_url = Column(TEXT)
+    seed_provider = Column(String(64))
+    confidence = Column(Integer)
+    license_status = Column(String(64))
+    review_status = Column(String(32))
+    metadata_json = Column(JSON)
+    created_at = Column(TIMESTAMP)
+    updated_at = Column(TIMESTAMP)
+
+
+class MRFPlan(Base, JSONOutputMixin):
+    __tablename__ = "mrf_plan"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("mrf_plan_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["mrf_plan_id"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("payer_id",), "name": "mrf_plan_payer_idx"},
+        {"index_elements": ("source_id",), "name": "mrf_plan_source_idx"},
+        {"index_elements": ("plan_id",), "name": "mrf_plan_plan_id_idx"},
+        {"index_elements": ("market_type",), "name": "mrf_plan_market_idx"},
+        {"index_elements": ("reporting_entity_name",), "name": "mrf_plan_reporting_entity_idx"},
+    ]
+
+    mrf_plan_id = Column(String(64), nullable=False)
+    payer_id = Column(String(64))
+    source_id = Column(String(64))
+    plan_id = Column(String(128))
+    plan_id_type = Column(String(64))
+    plan_name = Column(String(512))
+    market_type = Column(String(64))
+    reporting_entity_name = Column(String(512))
+    reporting_entity_type = Column(String(128))
+    metadata_json = Column(JSON)
+    first_seen_at = Column(TIMESTAMP)
+    last_seen_at = Column(TIMESTAMP)
+
+
+class MRFFile(Base, JSONOutputMixin):
+    __tablename__ = "mrf_file"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("mrf_file_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["mrf_file_id"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("payer_id",), "name": "mrf_file_payer_idx"},
+        {"index_elements": ("source_id",), "name": "mrf_file_source_idx"},
+        {"index_elements": ("file_type",), "name": "mrf_file_type_idx"},
+        {"index_elements": ("canonical_url",), "name": "mrf_file_canonical_url_idx"},
+        {"index_elements": ("last_seen_at",), "name": "mrf_file_last_seen_idx"},
+    ]
+
+    mrf_file_id = Column(String(64), nullable=False)
+    payer_id = Column(String(64))
+    source_id = Column(String(64))
+    file_type = Column(String(64), nullable=False)
+    url = Column(TEXT, nullable=False)
+    canonical_url = Column(TEXT)
+    from_index_url = Column(TEXT)
+    description = Column(TEXT)
+    network_name = Column(String(512))
+    plan_ids = Column(JSON)
+    plan_names = Column(JSON)
+    market_types = Column(JSON)
+    is_signed_url = Column(Boolean, nullable=False, default=False)
+    size_bytes = Column(BigInteger)
+    etag = Column(String(512))
+    last_modified = Column(String(256))
+    schema_version = Column(String(32))
+    metadata_json = Column(JSON)
+    first_seen_at = Column(TIMESTAMP)
+    last_seen_at = Column(TIMESTAMP)
+
+
+class MRFCrawlRun(Base, JSONOutputMixin):
+    __tablename__ = "mrf_crawl_run"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("crawl_run_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["crawl_run_id"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("run_id",), "name": "mrf_crawl_run_control_run_idx"},
+        {"index_elements": ("status",), "name": "mrf_crawl_run_status_idx"},
+        {"index_elements": ("started_at",), "name": "mrf_crawl_run_started_idx"},
+    ]
+
+    crawl_run_id = Column(String(64), nullable=False)
+    run_id = Column(String(64))
+    provider = Column(String(128))
+    mode = Column(String(64))
+    status = Column(String(32), nullable=False)
+    started_at = Column(TIMESTAMP)
+    finished_at = Column(TIMESTAMP)
+    params = Column(JSON)
+    sources_discovered = Column(Integer, nullable=False, default=0)
+    urls_checked = Column(Integer, nullable=False, default=0)
+    etag_skipped = Column(Integer, nullable=False, default=0)
+    plans_discovered = Column(Integer, nullable=False, default=0)
+    files_discovered = Column(Integer, nullable=False, default=0)
+    bytes_streamed = Column(BigInteger, nullable=False, default=0)
+    errors = Column(JSON)
+
+
+class MRFPayerScorecard(Base, JSONOutputMixin):
+    __tablename__ = "mrf_payer_scorecard"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("scorecard_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["scorecard_id"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("payer_id",), "name": "mrf_payer_scorecard_payer_idx"},
+        {"index_elements": ("source",), "name": "mrf_payer_scorecard_source_idx"},
+    ]
+
+    scorecard_id = Column(String(64), nullable=False)
+    payer_id = Column(String(64))
+    source = Column(String(64), nullable=False)
+    score = Column(String(32))
+    update_cadence = Column(String(64))
+    file_accessibility_pct = Column(Integer)
+    notes = Column(TEXT)
+    payload = Column(JSON)
+    observed_at = Column(TIMESTAMP)
+
+
+class MRFUrlObservation(Base, JSONOutputMixin):
+    __tablename__ = "mrf_url_observation"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("observation_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["observation_id"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("source_id",), "name": "mrf_url_observation_source_idx"},
+        {"index_elements": ("canonical_url",), "name": "mrf_url_observation_url_idx"},
+        {"index_elements": ("checked_at",), "name": "mrf_url_observation_checked_idx"},
+        {"index_elements": ("status",), "name": "mrf_url_observation_status_idx"},
+    ]
+
+    observation_id = Column(String(64), nullable=False)
+    source_id = Column(String(64))
+    url = Column(TEXT, nullable=False)
+    canonical_url = Column(TEXT)
+    url_type = Column(String(64))
+    status = Column(String(64), nullable=False)
+    http_status = Column(Integer)
+    etag = Column(String(512))
+    last_modified = Column(String(256))
+    content_length = Column(BigInteger)
+    content_type = Column(String(256))
+    final_url = Column(TEXT)
+    checked_at = Column(TIMESTAMP)
+    error = Column(TEXT)
+    metadata_json = Column(JSON)
 
 
 class PartDImportRun(Base, JSONOutputMixin):

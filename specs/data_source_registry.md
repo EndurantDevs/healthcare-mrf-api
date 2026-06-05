@@ -37,6 +37,7 @@ Changes to import source behavior must update `docs/data-sources.md` in the same
 - CMS Data Portal (`data.cms.gov`)
 - CMS Provider Data Catalog (`data.cms.gov/provider-data`)
 - CMS Marketplace Public Use Files (federal + state-based)
+- CMS MS-DRG Classifications and Software
 - NPPES
 - CMS Medicare FFS Provider Enrollment
 - CMS QPP
@@ -57,4 +58,3 @@ Changes to import source behavior must update `docs/data-sources.md` in the same
 For drug-only sources (OpenFDA, RxNorm, DailyMed context), see:
 
 - `../drug-api/docs/data-sources.md` (in the `drug-api` repository)
-
