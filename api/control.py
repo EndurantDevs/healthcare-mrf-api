@@ -19,6 +19,7 @@ from api.control_imports import (
     request_cancel,
     retry_import_run,
 )
+from api.control_workers import ensure_worker, worker_registry
 
 blueprint = Blueprint("control", url_prefix="/control/v1")
 
@@ -53,6 +54,19 @@ async def control_importers(request):
 async def control_node_health(request):
     _require_control_auth(request)
     return response.json(node_health(), default=str)
+
+
+@blueprint.get("/workers")
+async def control_workers(request):
+    _require_control_auth(request)
+    return response.json({"items": worker_registry(), "next_cursor": None}, default=str)
+
+
+@blueprint.post("/workers/ensure")
+async def control_ensure_worker(request):
+    _require_control_auth(request)
+    payload = request.json if isinstance(request.json, dict) else {}
+    return response.json(ensure_worker(payload), status=202, default=str)
 
 
 @blueprint.post("/ptg/parse-toc-preview")

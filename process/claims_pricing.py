@@ -54,6 +54,14 @@ from process.live_progress import enqueue_live_progress
 
 logger = logging.getLogger(__name__)
 
+
+def _safe_print(*args: Any, **kwargs: Any) -> None:
+    try:
+        print(*args, **kwargs)
+    except (BrokenPipeError, OSError, ValueError):
+        return
+
+
 # CMS CSV rows can exceed Python's default field limit (131072).
 _csv_limit = sys.maxsize
 while True:
@@ -289,18 +297,18 @@ def _print_row_progress(stage: str, parsed: int, accepted: int, start_time: floa
         f"\r[rows:{stage}] parsed={parsed:,} accepted={accepted:,} "
         f"rate={rate:,.0f} rows/s"
     )
-    print(line, end="\n" if final else "", flush=True)
+    _safe_print(line, end="\n" if final else "", flush=True)
 
 
 def _step_start(label: str) -> float:
     start = time.monotonic()
-    print(f"[step] START {label}", flush=True)
+    _safe_print(f"[step] START {label}", flush=True)
     return start
 
 
 def _step_end(label: str, started_at: float) -> None:
     elapsed = max(time.monotonic() - started_at, 0.001)
-    print(f"[step] DONE  {label} in {elapsed:.1f}s", flush=True)
+    _safe_print(f"[step] DONE  {label} in {elapsed:.1f}s", flush=True)
 
 
 async def _run_timed_step(label: str, coro) -> None:
@@ -817,7 +825,7 @@ async def _download_source_file(
     filename = f"{dataset_key}{year_suffix}.csv"
     path = str(Path(temp_dir) / filename)
     if test_mode:
-        print(
+        _safe_print(
             f"[test-mode] partial download for {dataset_key}: up to {TEST_MAX_DOWNLOAD_BYTES:,} bytes",
             flush=True,
         )
@@ -942,12 +950,12 @@ async def _split_provider_service_into_chunks(
         chunk_index += 1
 
     if not chunks:
-        print(
+        _safe_print(
             f"[warn] no chunks generated for provider_service (parsed={parsed_rows:,}, accepted={accepted_rows:,})",
             flush=True,
         )
     else:
-        print(
+        _safe_print(
             f"[split:provider_service] chunks={len(chunks)} parsed={parsed_rows:,} accepted={accepted_rows:,} "
             f"bucketed_by=npi buckets={bucket_count}",
             flush=True,
@@ -1036,9 +1044,9 @@ async def _split_source_into_chunks(
             )
 
     if not chunks:
-        print(f"[warn] no chunks generated for {dataset_key} (parsed={parsed_rows:,}, accepted={accepted_rows:,})")
+        _safe_print(f"[warn] no chunks generated for {dataset_key} (parsed={parsed_rows:,}, accepted={accepted_rows:,})")
     else:
-        print(
+        _safe_print(
             f"[split:{dataset_key}] chunks={len(chunks)} parsed={parsed_rows:,} accepted={accepted_rows:,}",
             flush=True,
         )
@@ -1130,12 +1138,12 @@ async def _load_provider_rows(path: str, provider_cls: type, year: int, test_mod
         await _push_objects_with_retry(rows, provider_cls)
     _print_row_progress("providers", row_number, accepted, progress_start, final=True)
     if accepted == 0:
-        print(
+        _safe_print(
             "[warn] providers stage accepted 0 rows; verify CSV columns include NPI values.",
             flush=True,
         )
     if skipped_invalid_state:
-        print(
+        _safe_print(
             f"[warn] providers stage skipped {skipped_invalid_state:,} rows due to invalid state values.",
             flush=True,
         )
@@ -1278,7 +1286,7 @@ async def _load_provider_service_rows(
             await _push_objects_with_retry(batch, provider_procedure_cls)
     _print_row_progress("provider_service", row_number, accepted, progress_start, final=True)
     if skipped_invalid_state:
-        print(
+        _safe_print(
             f"[warn] provider_service stage skipped {skipped_invalid_state:,} rows due to invalid state values.",
             flush=True,
         )
@@ -2062,7 +2070,7 @@ async def _collect_cost_level_diagnostics(classes: dict[str, type], schema: str)
     peer_scope = [dict(getattr(row, "_mapping", row)) for row in peer_scope_result]
     coverage = [dict(getattr(row, "_mapping", row)) for row in coverage_result]
 
-    print(
+    _safe_print(
         "[diagnostic] cost-level profile scope rows: "
         + ", ".join(
             f"{item.get('geography_scope')}={int(item.get('rows') or 0)}"
@@ -2070,7 +2078,7 @@ async def _collect_cost_level_diagnostics(classes: dict[str, type], schema: str)
         ),
         flush=True,
     )
-    print(
+    _safe_print(
         "[diagnostic] cost-level peer scope rows: "
         + ", ".join(
             f"{item.get('geography_scope')}={int(item.get('rows') or 0)}"
@@ -2078,7 +2086,7 @@ async def _collect_cost_level_diagnostics(classes: dict[str, type], schema: str)
         ),
         flush=True,
     )
-    print(
+    _safe_print(
         "[diagnostic] cost-level key coverage: "
         + ", ".join(
             f"{item.get('geography_scope')}={float(item.get('coverage_pct') or 0.0):.2f}%"
@@ -2420,7 +2428,7 @@ async def claims_pricing_finalize(ctx, task: dict[str, Any] | None = None) -> di
                 total=total_chunks,
                 message=f"waiting for chunks {done_chunks}/{total_chunks}",
             )
-            print(
+            _safe_print(
                 f"[finalize] waiting for chunks: done={done_chunks}/{total_chunks} run_id={run_id}",
                 flush=True,
             )
@@ -2511,7 +2519,7 @@ async def main(test_mode: bool = False, import_id: str | None = None) -> dict[st
         _job_id=f"claims_start_{run_id}",
     )
     stage_suffix = _build_stage_suffix(_normalize_import_id(import_id), run_id)
-    print(
+    _safe_print(
         f"Queued claims-pricing run: import_id={_normalize_import_id(import_id)} run_id={run_id} stage={stage_suffix} "
         f"test_mode={bool(test_mode)}",
         flush=True,
@@ -2548,7 +2556,7 @@ async def finish_main(
         _queue_name=CLAIMS_FINISH_QUEUE_NAME,
         _job_id=f"claims_finalize_{run_id}",
     )
-    print(
+    _safe_print(
         f"Queued claims-pricing finalize: import_id={_normalize_import_id(import_id)} run_id={run_id} stage={stage_suffix}",
         flush=True,
     )

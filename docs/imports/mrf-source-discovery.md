@@ -8,7 +8,6 @@ plan, and file rows without downloading full in-network or allowed-amount rate b
 
 ```bash
 python main.py start mrf-source-discovery --test
-python main.py start mrf-source-discovery --provider accessmrf --limit 25 --check-urls
 python main.py start mrf-source-discovery --provider all --limit 25 --check-urls --crawl --crawl-target-limit 5 --concurrency 10 --sync-import-control
 python main.py start mrf-source-discovery --provider master-list --source-entity-types tpa --check-urls --crawl --concurrency 10
 python main.py start mrf-source-discovery --probe-files --file-probe-limit 500 --concurrency 25
@@ -19,19 +18,29 @@ The importer is also exposed through `/control/v1/importers` as `mrf-source-disc
 `import-control` and `api-app` can schedule it, run it now, retry it, and show status/progress.
 The operational runbook is [MRF source discovery DevOps](../devops/mrf-source-discovery.md).
 
-Source URLs are configured in `specs/mrf_source_discovery_sources.json`, not in Python code.
-Set `HLTHPRT_MRF_DISCOVERY_SOURCE_CONFIG` to point at another JSON registry for deployment-specific
-source lists.
+Source URLs are curated in `specs/mrf_payer_master_list.md`, not in Python code. The JSON registry
+at `specs/mrf_source_discovery_sources.json` defines the master-list provider and reusable platform
+resolvers only. Set `HLTHPRT_MRF_DISCOVERY_SOURCE_CONFIG` to point at another resolver registry for
+deployment-specific behavior.
+Master-list rows without a URL, or rows marked unsupported/archived, are retained as research
+backlog but skipped by importer runs.
 
 Platform resolvers are also configured in that file. The importer currently resolves:
 
 - Aetna Health1 / HealthSparq public URLs into `mrf.healthsparq.com/.../latest_metadata.json`
   metadata maps, then stores direct referenced file URLs and plan metadata.
 - UHC/Optum public blob listing pages into direct monthly TOC/index JSON targets.
+- BCBS Massachusetts monthly issuer TOCs by generating current-month URLs for the two public issuer
+  suffixes exposed by the payer app bundle.
 - Highmark HMHS landing pages into the current-month state/licensee TOC/index JSON targets.
 - Sapphire MRF Hub pages into direct `/tocs/YYYYMM/*_index.json` targets from server-rendered HTML.
-- Simple compliance landing pages into linked metadata text indexes when they expose `.txt` metadata
-  files; those metadata files are parsed only for direct body-file URLs and never downloaded as bodies.
+- Cigna compliance landing pages into current `/static/mrf/*.json` lookup files, then into the
+  current signed federal and Colorado TOC/index JSON targets. The resolver carries a larger
+  per-target TOC byte cap because Cigna federal indexes can exceed the generic 25 MB default.
+- Simple compliance landing pages into linked TOC JSON files, metadata text indexes, and direct
+  body-file references when the HTML exposes them. Metadata text files are parsed only for direct
+  body-file URLs. ZIP, gzip, and plain JSON body references are stored as `mrf_file` rows and are
+  never downloaded during discovery.
 
 ## TPA Layer
 
@@ -47,8 +56,8 @@ Administrators, and Meritain. Meritain uses a configured HealthSparq tenant over
 
 Resolved TOC targets are stored as `mrf_file.file_type = table-of-contents` rows even when
 `--crawl-target-limit` limits how many target TOCs are parsed in a smoke run.
-When the same canonical source URL is discovered by multiple registries, candidates are still stored,
-but the crawler resolves/parses that source URL once per run and prefers curated master-list rows.
+When the same canonical source URL appears more than once in the master list, the crawler
+resolves/parses that source URL once per run and prefers the curated row.
 
 The importer remains Python/async because the slow path is external HTTP plus batched Postgres
 upserts, not CPU-bound body parsing. Rust remains appropriate for full PTG body import/parsing, where
@@ -56,7 +65,7 @@ large compressed rate files dominate runtime.
 
 ## Options
 
-- `--provider`: `all`, `master-list`, `accessmrf`, `payerset`, `mrfdatasolutions`, `cms-guide`, `tpafs`, or `bcbs-roster`.
+- `--provider`: `all` or `master-list`. Both use the curated master list.
 - `--limit`: cap deduped candidates for smoke/bounded runs.
 - `--source-entity-types`: comma-separated payer entity types to seed/check/crawl; `tpa` also matches `network/tpa`.
 - `--source-payer-query`: case-insensitive payer-name substring for seed/check/crawl.
@@ -71,31 +80,53 @@ large compressed rate files dominate runtime.
 - `--concurrency`: maximum concurrent URL checks/TOC fetches; defaults to 10.
 - `--crawl-target-limit`: cap resolved TOC targets after platform expansion; use it for smoke runs and omit it for full metadata recrawls.
 - `--sync-import-control`: push discovered source seeds to `import-control` when configured.
-- `--test`: use the curated master-list sample and skip external URL checks.
+- `--test`: use the configured test providers and skip external URL checks.
 
 Useful environment knobs for full crawls:
 
 - `HLTHPRT_MRF_DISCOVERY_HTTP_TIMEOUT`: total timeout for provider/TOC listing fetches; defaults to 300 seconds.
 - `HLTHPRT_MRF_DISCOVERY_READ_TIMEOUT`: socket read timeout for provider/TOC listing fetches; defaults to 120 seconds.
 - `HLTHPRT_MRF_DISCOVERY_WRITE_BATCH_SIZE`: parsed-row upsert batch size; defaults to 2000 rows.
+- `HLTHPRT_MRF_DISCOVERY_MAX_TOC_BYTES`: generic TOC/metadata fetch limit; defaults to 25 MB.
+  Resolver-specific caps in `specs/mrf_source_discovery_sources.json` can raise this for known
+  larger index files without changing the global default.
 
 ## Stored Data
 
 The importer writes local MRF catalog tables:
 
-- `mrf_payer`: canonical payer, aliases, parent group, entity type, states, EINs, source coverage.
+- `mrf_payer`: canonical payer, aliases, parent group, entity type, states, EINs, source tags.
 - `mrf_source`: source/index URL, hosting platform, access model, freshness, status, counts, provenance.
 - `mrf_plan`: observed plan IDs, names, market types, and reporting entity metadata from TOCs.
 - `mrf_file`: TOC child file URLs, file type, size/freshness metadata, plan links, network/file labels.
 - `mrf_url_observation`: URL check history for stale, broken, redirected, gated, and changed URLs.
 - `mrf_crawl_run`: discovery run summaries and errors.
-- `mrf_payer_scorecard`: optional public/licensed vendor scorecard enrichment.
+- `mrf_payer_scorecard`: optional scorecard enrichment.
+
+## Import-Control Sync
+
+When `--sync-import-control` is enabled, the importer promotes eligible free/non-vendor sources into
+the central import-control catalog and pushes discovered plan/file relationships through
+`/v1/ptg/discover/ingest-preview`.
+
+The sync builder prefers exact per-file `metadata_json.plan_info` captured during TOC parsing. For
+older rows or resolver paths that only populated `mrf_file.plan_ids`, `plan_names`, and
+`market_types`, it synthesizes import-control `plan_info` from those structured columns and uses
+`mrf_plan` as the plan-id-type/reporting-entity lookup.
+
+Some payer indexes attach thousands of plans to each file reference. Before posting to
+import-control, the importer splits large `plan_info` arrays into smaller preview slices while
+preserving the same file URL. This keeps HTTP payloads bounded and is equivalent because
+import-control upserts by stable plan and source-file identities.
 
 ## Safety Rules
 
 - Discovery never downloads full rate bodies.
 - File probing uses `HEAD` only and stores `size_bytes`, `etag`, and `last_modified` when the
   origin provides them. Each probe is also recorded as a `body_file_head` URL observation.
+- ZIP files are cataloged as compressed body-file references (`metadata_json.container_format =
+  "zip"`). Full PTG imports are responsible for streaming/decompressing ZIP members when a selected
+  plan/source is imported.
 - Full PTG import remains `python main.py start ptg` and should be launched from selected catalog IDs or explicit source URLs.
 - TOC crawl mode parses configured platform targets and direct `.json` TOC URLs. Unresolved HTML/app landing
   pages are marked `crawl_skipped` instead of being fetched as JSON.
@@ -107,9 +138,9 @@ The importer writes local MRF catalog tables:
 Recommended schedules:
 
 - Daily: `--check-urls --provider master-list`
-- Weekly: `--provider all --limit 500 --check-urls --concurrency 10 --sync-import-control`
+- Weekly: `--provider master-list --limit 500 --check-urls --concurrency 10 --sync-import-control`
 - Smoke: `--provider master-list --limit 15 --check-urls --crawl --crawl-target-limit 2 --concurrency 5`
-- Monthly: `--provider all --limit 500 --check-urls --crawl --concurrency 10 --sync-import-control`
+- Monthly: `--provider master-list --limit 500 --check-urls --crawl --concurrency 10 --sync-import-control`
 - TPA freshness smoke: `--probe-files --file-probe-entity-types tpa --file-probe-limit 100 --concurrency 10`
 
 Configure these in `import-control` so admins can change cadence, run now, disable, retry, and view

@@ -1,56 +1,10 @@
 {
-  "default_providers": ["master-list", "accessmrf", "payerset", "mrfdatasolutions"],
+  "default_providers": ["master-list"],
   "test_providers": ["master-list"],
   "providers": {
     "master-list": {
       "parser": "master-list",
       "path": "specs/mrf_payer_master_list.md"
-    },
-    "accessmrf": {
-      "parser": "accessmrf",
-      "url": "https://www.accessmrf.com/api/sources"
-    },
-    "payerset": {
-      "parser": "payerset",
-      "url": "https://docs.payerset.com/sitemap.md"
-    },
-    "mrfdatasolutions": {
-      "parser": "mrfdatasolutions",
-      "url": "https://www.mrfdatasolutions.com/payers",
-      "max_bytes": 5242880
-    },
-    "cms-guide": {
-      "parser": "reference",
-      "url": "https://github.com/CMSgov/price-transparency-guide",
-      "payer_name": "CMS price-transparency-guide",
-      "source_type": "schema_reference",
-      "access_model": "free",
-      "source_coverage": ["U"],
-      "confidence": 100,
-      "license_status": "public_schema",
-      "raw_payload": {"role": "schema_validation"}
-    },
-    "tpafs": {
-      "parser": "reference",
-      "url": "https://github.com/TPAFS/transparency-data",
-      "payer_name": "TPAFS transparency-data",
-      "source_type": "community_index",
-      "access_model": "free",
-      "source_coverage": ["U"],
-      "confidence": 60,
-      "license_status": "public_repository",
-      "raw_payload": {"role": "homepage_and_link_seed"}
-    },
-    "bcbs-roster": {
-      "parser": "reference",
-      "url": "https://www.bcbs.com/about-us/blue-cross-blue-shield-system/state-health-plan-companies",
-      "payer_name": "BCBS Association roster",
-      "source_type": "authoritative_roster",
-      "access_model": "free",
-      "source_coverage": ["U"],
-      "confidence": 95,
-      "license_status": "public_directory",
-      "raw_payload": {"role": "blue_licensee_expansion"}
     }
   },
   "platform_resolvers": {
@@ -87,6 +41,22 @@
       "max_bytes": 67108864,
       "path_templates": ["/api/v1/uhc/blobs/"],
       "optum_path_templates": ["/api/v1/oh/blobs/", "/api/v1/orx/blobs/"]
+    },
+    "bcbsma_monthly_tocs": {
+      "type": "bcbsma_monthly_tocs",
+      "base_url": "https://transparency-in-coverage.bluecrossma.com/",
+      "month_offsets": [0],
+      "toc_suffixes": [
+        "-01_Blue-Cross-and-Blue-Shield-of-Massachusetts-HMO-Blue-Inc_index.json",
+        "-01_Blue-Cross-and-Blue-Shield-of-Massachusetts-Inc_index.json"
+      ]
+    },
+    "cigna_static_mrf_lookup": {
+      "type": "cigna_static_mrf_lookup",
+      "max_bytes": 5242880,
+      "lookup_max_bytes": 2097152,
+      "toc_max_bytes": 104857600,
+      "lookup_paths": ["/static/mrf/latest.json", "/static/mrf/co/latest.json"]
     }
   }
 }

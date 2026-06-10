@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import click
+import redis
 from arq import create_pool
 from sqlalchemy import insert, select, text, update
 from sqlalchemy.exc import IntegrityError
@@ -226,6 +227,7 @@ def importer_registry() -> list[dict[str, Any]]:
                 "cancelable": name in _CANCELABLE_IMPORTERS,
                 "retryable": True,
                 "enqueue_adapter": "arq_single_job" if name in _SINGLE_JOB_ADAPTERS else "pending",
+                "queue": _SINGLE_JOB_ADAPTERS.get(name, {}).get("queue"),
                 "params_schema": _param_schema(command),
             }
         )
@@ -275,7 +277,59 @@ def node_health() -> dict[str, Any]:
             "enqueue_adapter_count": len(_SINGLE_JOB_ADAPTERS),
         },
         "disk": disk,
+        "queue_depth": _queue_depths(),
+        "workers": _worker_health(),
     }
+
+
+def _worker_health() -> dict[str, Any]:
+    try:
+        from api.control_workers import worker_registry  # pylint: disable=import-outside-toplevel
+
+        return {
+            item["queue"]: {
+                "worker_class": item["worker_class"],
+                "role": item["role"],
+                "running": item["running"],
+                "pid": item.get("pid"),
+            }
+            for item in worker_registry()
+        }
+    except Exception:  # pylint: disable=broad-exception-caught
+        return {}
+
+
+def _queue_depths() -> dict[str, int]:
+    queues = {
+        str(spec.get("queue"))
+        for spec in _SINGLE_JOB_ADAPTERS.values()
+        if str(spec.get("queue") or "").strip()
+    }
+    for importer in _FINISH_IMPORTERS:
+        queue = str(_SINGLE_JOB_ADAPTERS.get(importer, {}).get("queue") or "").strip()
+        if queue:
+            queues.add(f"{queue}_finish")
+    try:
+        client = _redis_client()
+        return {queue: int(client.zcard(queue) or 0) for queue in sorted(queues)}
+    except Exception:  # pylint: disable=broad-exception-caught
+        return {}
+
+
+def _redis_client() -> redis.Redis:
+    dsn = os.getenv("HLTHPRT_REDIS_ADDRESS")
+    if dsn:
+        return redis.Redis.from_url(dsn, socket_connect_timeout=1.0, socket_timeout=1.0)
+    settings = build_redis_settings()
+    return redis.Redis(
+        host=settings.host,
+        port=settings.port,
+        password=settings.password,
+        db=settings.database,
+        ssl=settings.ssl,
+        socket_connect_timeout=1.0,
+        socket_timeout=1.0,
+    )
 
 
 async def ensure_import_run_table() -> None:

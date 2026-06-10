@@ -217,6 +217,7 @@ from process.provider_quality_parts.state import (
 from process.provider_quality_parts.table_helpers import (
     _build_staging_indexes,
     _ensure_indexes,
+    _index_name_for_table,
     _table_columns,
     _table_exists,
 )
@@ -237,6 +238,90 @@ def _should_fail_on_source_error(test_mode: bool) -> bool:
     if test_mode and PROVIDER_QUALITY_ALLOW_DEGRADED_TEST_ONLY:
         return False
     return PROVIDER_QUALITY_FAIL_ON_SOURCE_ERROR
+
+
+async def _mark_provider_quality_finalize_failed(run_id: str, exc: BaseException) -> None:
+    if not run_id:
+        return
+    await mark_control_run(
+        run_id,
+        status="failed",
+        phase_detail="provider-quality finalization failed",
+        progress_message="failed",
+        error={
+            "code": "provider_quality_finalize_failed",
+            "message": str(exc),
+        },
+        progress={
+            "unit": "run",
+            "total": 1,
+            "done": 1,
+            "pct": 100,
+            "message": "failed",
+            "phase": "provider-quality finalization failed",
+        },
+    )
+
+
+async def _ensure_materialize_indexes(classes: dict[str, type], schema: str, *model_names: str) -> None:
+    for model_name in model_names:
+        model = classes.get(model_name)
+        if model is None:
+            continue
+        await _ensure_indexes(model, schema)
+        await db.status(f"ANALYZE {schema}.{model.__tablename__};")
+
+
+def _provider_quality_rx_agg_table(classes: dict[str, type]) -> str:
+    qpp_model = classes.get("PricingQppProvider")
+    qpp_table = str(getattr(qpp_model, "__tablename__", "") or "")
+    if qpp_table.startswith("pricing_qpp_provider_"):
+        return qpp_table.replace("pricing_qpp_provider_", "pricing_provider_quality_rx_agg_", 1)
+    return "pricing_provider_quality_rx_agg"
+
+
+async def _ensure_provider_quality_rx_agg_table(classes: dict[str, type], schema: str, years: tuple[int, ...]) -> None:
+    if not years:
+        return
+    if not await _table_exists(schema, PricingProviderPrescription.__tablename__):
+        return
+    table = _provider_quality_rx_agg_table(classes)
+    year_values = ", ".join(str(int(year)) for year in years)
+    await db.status(
+        f"""
+        CREATE TABLE IF NOT EXISTS {schema}.{table} (
+            npi BIGINT NOT NULL,
+            year INTEGER NOT NULL,
+            total_rx_claims DOUBLE PRECISION NOT NULL DEFAULT 0,
+            total_rx_beneficiaries DOUBLE PRECISION NOT NULL DEFAULT 0
+        );
+        """
+    )
+    existing_rows = await db.scalar(f"SELECT COUNT(*) FROM {schema}.{table};")
+    if _safe_int(existing_rows) > 0:
+        await db.status(f"ANALYZE {schema}.{table};")
+        return
+    await db.status(
+        f"""
+        INSERT INTO {schema}.{table} (
+            npi,
+            year,
+            total_rx_claims,
+            total_rx_beneficiaries
+        )
+        SELECT
+            r.npi,
+            r.year,
+            COALESCE(SUM(COALESCE(r.total_claims, 0.0)), 0.0)::float8 AS total_rx_claims,
+            COALESCE(SUM(COALESCE(r.total_benes, 0.0)), 0.0)::float8 AS total_rx_beneficiaries
+        FROM {schema}.{PricingProviderPrescription.__tablename__} r
+        WHERE r.year IN ({year_values})
+        GROUP BY r.npi, r.year;
+        """
+    )
+    index_name = _index_name_for_table(table, f"{table}_npi_year_idx")
+    await db.status(f"CREATE UNIQUE INDEX IF NOT EXISTS {index_name} ON {schema}.{table} (npi, year);")
+    await db.status(f"ANALYZE {schema}.{table};")
 
 
 async def _prepare_tables(stage_suffix: str, test_mode: bool) -> tuple[dict[str, type], str]:
@@ -1508,6 +1593,7 @@ async def _materialize_quality_rows_sharded(
     manifest: dict[str, Any],
 ) -> None:
     years = _materialize_reporting_years(manifest)
+    await _ensure_provider_quality_rx_agg_table(classes, schema, years)
     context = await _build_cohort_materialization_context(classes, schema)
     phase = await _get_materialize_phase(redis, run_id)
     if phase and phase not in MAT_PHASE_SEQUENCE:
@@ -1527,6 +1613,7 @@ async def _materialize_quality_rows_sharded(
         await db.status(f"TRUNCATE TABLE {schema}.{context['domain_table']};")
         await db.status(f"TRUNCATE TABLE {schema}.{context['score_table']};")
         await db.status(_cohort_sql_phase_1_build_features(context))
+        await _ensure_materialize_indexes(classes, schema, "PricingProviderQualityFeature")
         await _enqueue_materialize_phase_shards(
             redis,
             run_id=run_id,
@@ -1543,6 +1630,7 @@ async def _materialize_quality_rows_sharded(
     if phase == MAT_PHASE_2_BUILD_LSH_SHARDED:
         logger.info("provider quality materialize phase wait run_id=%s phase=%s", run_id, phase)
         await _wait_for_materialize_phase_completion(redis, run_id, phase)
+        await _ensure_materialize_indexes(classes, schema, "PricingProviderQualityProcedureLSH")
         await _set_materialize_phase(redis, run_id, MAT_PHASE_3_UPDATE_PROCEDURE_BUCKET, total=0)
         phase = MAT_PHASE_3_UPDATE_PROCEDURE_BUCKET
 
@@ -1558,7 +1646,7 @@ async def _materialize_quality_rows_sharded(
     if phase == MAT_PHASE_4_BUILD_PEER_TARGETS:
         logger.info("provider quality materialize phase start run_id=%s phase=%s", run_id, phase)
         await db.status(_cohort_sql_phase_4_build_peer_targets(context))
-        await db.status(f"ANALYZE {schema}.{context['peer_target_table']};")
+        await _ensure_materialize_indexes(classes, schema, "PricingProviderQualityPeerTarget")
         await _enqueue_materialize_phase_shards(
             redis,
             run_id=run_id,
@@ -1575,6 +1663,7 @@ async def _materialize_quality_rows_sharded(
     if phase == MAT_PHASE_5_BUILD_MEASURE_SHARDED:
         logger.info("provider quality materialize phase wait run_id=%s phase=%s", run_id, phase)
         await _wait_for_materialize_phase_completion(redis, run_id, phase)
+        await _ensure_materialize_indexes(classes, schema, "PricingProviderQualityMeasure")
         await _enqueue_materialize_phase_shards(
             redis,
             run_id=run_id,
@@ -1591,6 +1680,7 @@ async def _materialize_quality_rows_sharded(
     if phase == MAT_PHASE_6_BUILD_DOMAIN_SHARDED:
         logger.info("provider quality materialize phase wait run_id=%s phase=%s", run_id, phase)
         await _wait_for_materialize_phase_completion(redis, run_id, phase)
+        await _ensure_materialize_indexes(classes, schema, "PricingProviderQualityDomain")
         await _enqueue_materialize_phase_shards(
             redis,
             run_id=run_id,
@@ -1966,6 +2056,12 @@ async def provider_quality_finalize(ctx, task: dict[str, Any] | None = None, **_
         if redis is not None and run_id:
             await redis.set(_state_key(run_id, "finalized"), "1", ex=PROVIDER_QUALITY_REDIS_TTL_SECONDS)
             await redis.expire(_state_key(run_id, "finalized"), PROVIDER_QUALITY_REDIS_TTL_SECONDS)
+    except Retry:
+        raise
+    except Exception as exc:
+        logger.exception("provider quality finalize failed run_id=%s import_id=%s", run_id, import_id_val)
+        await _mark_provider_quality_finalize_failed(run_id, exc)
+        raise
     finally:
         if redis is not None and run_id and global_lock_acquired:
             await _release_global_finalize_lock(redis, run_id)

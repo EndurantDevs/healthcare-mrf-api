@@ -69,6 +69,28 @@ DEFAULT_BATCH_SIZE = 5000
 DEFAULT_MIN_ROWS = 5000
 DEFAULT_MIN_DISTINCT_ZCTAS = 5000
 DEFAULT_MIN_GEO_MATCH_RATIO = 0.85
+MIN_TRACT_CROSSWALK_ROWS = 50000
+
+
+async def _mark_lodes_publish_failed(run_id: str, exc: Exception) -> None:
+    if not run_id:
+        return
+    try:
+        await mark_control_run(
+            run_id,
+            status="failed",
+            phase_detail="lodes publish failed",
+            progress_message="failed",
+            error={"code": "lodes_publish_failed", "message": str(exc)},
+        )
+    except Exception:
+        logger.exception("Failed to mark LODES control run %s failed after publish error.", run_id)
+
+
+async def _abort_lodes_publish(run_id: str, message: str) -> None:
+    exc = RuntimeError(message)
+    await _mark_lodes_publish_failed(run_id, exc)
+    raise exc
 
 
 def _normalize_import_id(raw: str | None) -> str:
@@ -95,6 +117,24 @@ def _validate_schema_name(schema: str) -> str:
     if not all(ch.isalnum() or ch == "_" for ch in cleaned):
         raise ValueError(f"Invalid schema name: {schema!r}")
     return cleaned
+
+
+def _is_tract_geoid(value: str) -> bool:
+    cleaned = (value or "").strip()
+    return len(cleaned) == 11 and cleaned.isdigit()
+
+
+def _add_tract_zip_mapping(crosswalk: dict[str, str], tract: str, zip_code: str) -> bool:
+    tract = (tract or "").strip()
+    zip_code = (zip_code or "").strip()
+    if not _is_tract_geoid(tract) or len(zip_code) < 5:
+        return False
+    crosswalk[tract] = zip_code[:5]
+    return True
+
+
+def _is_usable_tract_crosswalk(crosswalk: dict[str, str]) -> bool:
+    return len(crosswalk) >= MIN_TRACT_CROSSWALK_ROWS
 
 
 async def _ensure_schema_exists(db_schema: str) -> None:
@@ -141,10 +181,16 @@ async def _load_tract_to_zip_crosswalk(client) -> dict[str, str]:
             for row in reader:
                 tract = row.get("TRACT") or row.get("tract") or ""
                 zip_code = row.get("ZIP") or row.get("zip") or ""
-                if tract and len(zip_code) >= 5:
-                    crosswalk[tract] = zip_code[:5]
-        logger.info("Loaded %d tract→zip mappings from file", len(crosswalk))
-        return crosswalk
+                _add_tract_zip_mapping(crosswalk, tract, zip_code)
+        if _is_usable_tract_crosswalk(crosswalk):
+            logger.info("Loaded %d tract→zip mappings from file", len(crosswalk))
+            return crosswalk
+        logger.warning(
+            "Local LODES crosswalk file produced only %d valid 11-digit tract mappings; "
+            "trying network fallbacks",
+            len(crosswalk),
+        )
+        crosswalk.clear()
 
     if hud_token:
         try:
@@ -155,10 +201,16 @@ async def _load_tract_to_zip_crosswalk(client) -> dict[str, str]:
                     for item in data.get("data", {}).get("results", data if isinstance(data, list) else []):
                         tract = str(item.get("geoid", ""))
                         zip_code = str(item.get("zip", ""))
-                        if tract and len(zip_code) >= 5:
-                            crosswalk[tract] = zip_code[:5]
-                    logger.info("Loaded %d tract→zip mappings from HUD API", len(crosswalk))
-                    return crosswalk
+                        _add_tract_zip_mapping(crosswalk, tract, zip_code)
+                    if _is_usable_tract_crosswalk(crosswalk):
+                        logger.info("Loaded %d tract→zip mappings from HUD API", len(crosswalk))
+                        return crosswalk
+                    logger.warning(
+                        "HUD crosswalk API produced only %d valid 11-digit tract mappings; "
+                        "trying Census fallback",
+                        len(crosswalk),
+                    )
+                    crosswalk.clear()
         except Exception as e:
             logger.warning("HUD crosswalk API failed (%s); trying Census fallback", e)
 
@@ -183,13 +235,17 @@ async def _load_tract_to_zip_crosswalk(client) -> dict[str, str]:
                     if prev is None or area > prev[0]:
                         best_by_tract[tract] = (area, zcta)
                 for tract, (_area, zcta) in best_by_tract.items():
-                    crosswalk[tract] = zcta
-                if crosswalk:
+                    _add_tract_zip_mapping(crosswalk, tract, zcta)
+                if _is_usable_tract_crosswalk(crosswalk):
                     logger.info(
                         "Loaded %d tract→zip mappings from Census tract/ZCTA relationship file",
                         len(crosswalk),
                     )
                     return crosswalk
+                logger.warning(
+                    "Census tract/ZCTA fallback produced only %d valid 11-digit tract mappings",
+                    len(crosswalk),
+                )
             else:
                 logger.warning(
                     "Census tract/ZCTA fallback fetch failed with HTTP %s",
@@ -445,7 +501,10 @@ async def shutdown(ctx):
                 metrics={"stage_rows": 0, "distinct_zctas": 0, "geo_match_ratio": 0.0},
             )
             return
-        raise RuntimeError(f"LODES stage table {db_schema}.{stage_cls.__tablename__} is missing; aborting publish.")
+        await _abort_lodes_publish(
+            run_id,
+            f"LODES stage table {db_schema}.{stage_cls.__tablename__} is missing; aborting publish.",
+        )
 
     stage_rows = int(await db.scalar(
         f"SELECT COUNT(*) FROM {db_schema}.{stage_cls.__tablename__};"
@@ -466,7 +525,7 @@ async def shutdown(ctx):
         matched_zctas = 0
         logger.info("LODES test mode: %s.geo_zip_lookup is missing; skipping geo match validation.", db_schema)
     else:
-        raise RuntimeError(f"LODES requires {db_schema}.geo_zip_lookup for publish validation.")
+        await _abort_lodes_publish(run_id, f"LODES requires {db_schema}.geo_zip_lookup for publish validation.")
     geo_match_ratio = (matched_zctas / distinct_zctas) if distinct_zctas else 0.0
 
     if context.get("test_mode"):
@@ -477,38 +536,45 @@ async def shutdown(ctx):
             geo_match_ratio,
         )
     elif stage_rows < DEFAULT_MIN_ROWS:
-        raise RuntimeError(
+        await _abort_lodes_publish(
+            run_id,
             f"LODES stage row count {stage_rows} is below minimum {DEFAULT_MIN_ROWS}; aborting publish."
         )
     elif distinct_zctas < DEFAULT_MIN_DISTINCT_ZCTAS:
-        raise RuntimeError(
+        await _abort_lodes_publish(
+            run_id,
             f"LODES distinct ZCTA count {distinct_zctas} is below minimum "
             f"{DEFAULT_MIN_DISTINCT_ZCTAS}; aborting publish."
         )
     elif geo_match_ratio < DEFAULT_MIN_GEO_MATCH_RATIO:
-        raise RuntimeError(
+        await _abort_lodes_publish(
+            run_id,
             f"LODES geo match ratio {geo_match_ratio:.3f} below minimum "
             f"{DEFAULT_MIN_GEO_MATCH_RATIO:.2f}; aborting publish."
         )
 
     # Atomic swap: staging → live
-    async with db.transaction():
-        table = LODESWorkplaceAggregate.__main_table__
-        await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
-        await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{table} RENAME TO {table}_old;")
-        await db.status(
-            f"ALTER TABLE IF EXISTS {db_schema}.{stage_cls.__tablename__} RENAME TO {table};"
-        )
+    try:
+        async with db.transaction():
+            table = LODESWorkplaceAggregate.__main_table__
+            await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
+            await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{table} RENAME TO {table}_old;")
+            await db.status(
+                f"ALTER TABLE IF EXISTS {db_schema}.{stage_cls.__tablename__} RENAME TO {table};"
+            )
 
-        archived = _archived_identifier(f"{table}_idx_primary")
-        await db.status(f"DROP INDEX IF EXISTS {db_schema}.{archived};")
-        await db.status(
-            f"ALTER INDEX IF EXISTS {db_schema}.{table}_idx_primary RENAME TO {archived};"
-        )
-        await db.status(
-            f"ALTER INDEX IF EXISTS {db_schema}.{stage_cls.__tablename__}_idx_primary "
-            f"RENAME TO {table}_idx_primary;"
-        )
+            archived = _archived_identifier(f"{table}_idx_primary")
+            await db.status(f"DROP INDEX IF EXISTS {db_schema}.{archived};")
+            await db.status(
+                f"ALTER INDEX IF EXISTS {db_schema}.{table}_idx_primary RENAME TO {archived};"
+            )
+            await db.status(
+                f"ALTER INDEX IF EXISTS {db_schema}.{stage_cls.__tablename__}_idx_primary "
+                f"RENAME TO {table}_idx_primary;"
+            )
+    except Exception as exc:
+        await _mark_lodes_publish_failed(run_id, exc)
+        raise
 
     logger.info(
         "LODES publish complete: rows=%d distinct_zctas=%d geo_match_ratio=%.3f",

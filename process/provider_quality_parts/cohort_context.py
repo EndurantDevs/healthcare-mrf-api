@@ -46,7 +46,9 @@ async def _build_cohort_materialization_context(
     lsh_table = classes["PricingProviderQualityProcedureLSH"].__tablename__
     peer_target_table = classes["PricingProviderQualityPeerTarget"].__tablename__
     rx_table = PricingProviderPrescription.__tablename__
+    rx_agg_table = qpp_table.replace("pricing_qpp_provider_", "pricing_provider_quality_rx_agg_", 1)
     rx_table_exists = await table_exists(schema, rx_table)
+    rx_agg_table_exists = await table_exists(schema, rx_agg_table)
     npi_table_exists = await table_exists(schema, NPIData.__tablename__)
     taxonomy_table_exists = await table_exists(schema, NPIDataTaxonomy.__tablename__)
     nucc_table_exists = await table_exists(schema, NUCCTaxonomy.__tablename__)
@@ -474,7 +476,21 @@ async def _build_cohort_materialization_context(
     benchmark_modes = _benchmark_modes_for_materialization(PROVIDER_QUALITY_BENCHMARK_MODE)
     benchmark_mode_values = ",\n                ".join(f"('{mode}'::varchar)" for mode in benchmark_modes)
 
-    if rx_table_exists:
+    if rx_agg_table_exists:
+        provider_rx_cte = f"""
+        provider_rx AS (
+            SELECT
+                r.npi,
+                r.year,
+                COALESCE(r.total_rx_claims, 0.0)::float8 AS total_rx_claims,
+                COALESCE(r.total_rx_beneficiaries, 0.0)::float8 AS total_rx_beneficiaries
+            FROM provider_base b
+            JOIN {schema}.{rx_agg_table} r
+              ON r.npi = b.npi
+             AND r.year = b.year
+        ),
+        """
+    elif rx_table_exists:
         provider_rx_cte = f"""
         provider_rx AS (
             SELECT
@@ -482,8 +498,10 @@ async def _build_cohort_materialization_context(
                 r.year,
                 COALESCE(SUM(COALESCE(r.total_claims, 0.0)), 0.0)::float8 AS total_rx_claims,
                 COALESCE(SUM(COALESCE(r.total_benes, 0.0)), 0.0)::float8 AS total_rx_beneficiaries
-            FROM {schema}.{rx_table} r
-            WHERE r.year BETWEEN {PROVIDER_QUALITY_MIN_YEAR} AND {PROVIDER_QUALITY_MAX_YEAR}
+            FROM provider_base b
+            JOIN {schema}.{rx_table} r
+              ON r.npi = b.npi
+             AND r.year = b.year
             GROUP BY r.npi, r.year
         ),
         """
@@ -509,6 +527,7 @@ async def _build_cohort_materialization_context(
         "feature_table": feature_table,
         "lsh_table": lsh_table,
         "peer_target_table": peer_target_table,
+        "rx_agg_table": rx_agg_table,
         "feature_npi_col": feature_npi_col,
         "feature_year_col": feature_year_col,
         "feature_procedure_bucket_col": feature_procedure_bucket_col,
@@ -570,4 +589,3 @@ async def _build_cohort_materialization_context(
         "unified_address_has_checksum": "checksum" in unified_address_columns,
         "nucc_has_classification": "classification" in nucc_columns,
     }
-
