@@ -8,13 +8,13 @@ Populate and refresh the MRF coverage catalog so users can search sources/plans 
 
 - Admin manual source entry.
 - Client private source submission.
-- Third-party seed import for review.
+- Curated master-list seed import for review.
 - Scheduled recrawl of active sources.
-- MRF source discovery seed import from AccessMRF, Payerset docs, MRF Data Solutions, TPAFS,
-  BCBS roster, and the curated master list.
+- MRF source discovery seed import from the curated master list.
 - TPA-hosted source discovery for self-funded group plan MRFs.
 
-Third-party directories may be used as seed inputs only after provenance/license review. Official payer URLs and crawled TOCs are the durable truth.
+External research may be used during manual master-list refreshes, but runtime imports read the
+curated master list. Official payer URLs and crawled TOCs are the durable truth.
 
 ## Crawl Flow
 

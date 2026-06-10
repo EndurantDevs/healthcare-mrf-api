@@ -60,6 +60,8 @@ RUN chmod a+x /usr/local/bin/start_api.sh /usr/local/bin/run_import.sh
 COPY api/ /opt/api/
 COPY db/ /opt/db/
 COPY data/ /opt/data/
+COPY restore/ /opt/restore/
+COPY specs/ /opt/specs/
 COPY alembic/ /opt/alembic/
 COPY process/ /opt/process/
 COPY support/ /opt/support/

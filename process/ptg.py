@@ -2370,9 +2370,7 @@ async def main(
             seen_jobs.add(job_key)
             if max_files is not None and len(selected_jobs) >= max_files:
                 break
-            if job.get("type") == "allowed_amounts":
-                raise RuntimeError("PTG imports no longer support allowed-amounts files")
-            if job.get("type") == "in_network":
+            if job.get("type") in {"in_network", "allowed_amounts"}:
                 selected_jobs.append(job)
         processed_files = 0
         attempted_files = len(selected_jobs)
@@ -2455,12 +2453,19 @@ async def main(
                         logical_artifact=downloaded.logical_artifact,
                     )
             elif job.get("type") == "allowed_amounts":
-                result = PTG2FileProcessResult(
-                    "allowed_amounts",
-                    str(job.get("url") or ""),
-                    False,
-                    error="PTG imports no longer support allowed-amounts files",
-                )
+                if result is None:
+                    result = await _process_allowed_amounts_file(
+                        job,
+                        classes,
+                        test_mode,
+                        reuse_raw_artifacts=reuse_raw_artifacts,
+                        max_bytes=max_bytes,
+                        max_items=max_items,
+                        import_run_id=import_run_id,
+                        keep_partial_artifacts=keep_partial_artifacts,
+                        raw_artifact=downloaded.raw_artifact,
+                        logical_artifact=downloaded.logical_artifact,
+                    )
             if result is None:
                 continue
             if result.success:
@@ -2512,7 +2517,11 @@ async def main(
         publish_started_monotonic = time.monotonic()
         write_live_progress(phase="publishing", pct=92, message="publishing PTG snapshot")
         manifest_merge_metrics: dict[str, Any] = {"enabled": False}
-        if _env_bool(PTG2_MANIFEST_PRECOPY_MERGE_ENV, True):
+        has_serving_files = any(
+            file_summary.get("source_type") == "in_network" and not file_summary.get("skipped")
+            for file_summary in successful_files
+        )
+        if has_serving_files and _env_bool(PTG2_MANIFEST_PRECOPY_MERGE_ENV, True):
             manifest_merge_metrics = await _merge_and_copy_ptg2_manifest_files(
                 successful_files=successful_files,
                 manifest_stage_table=ptg2_manifest_stage_table,
@@ -2539,16 +2548,34 @@ async def main(
         if not manifest_artifacts["sidecars"]:
             manifest_artifacts = {}
         assert source_key_val is not None
-        if not ptg2_manifest_stage_table:
-            raise RuntimeError("PTG import did not create a manifest-backed serving stage table")
-        serving_index = await _publish_ptg2_manifest_serving_snapshot(
-            ptg2_manifest_stage_table,
-            snapshot_id=snapshot_id,
-            source_key=source_key_val,
-            artifacts=manifest_artifacts,
-            db_dedupe_fallback=not bool(manifest_merge_metrics.get("enabled")),
-        )
-        ptg2_manifest_stage_table = None
+        if has_serving_files:
+            if not ptg2_manifest_stage_table:
+                raise RuntimeError("PTG import did not create a manifest-backed serving stage table")
+            serving_index = await _publish_ptg2_manifest_serving_snapshot(
+                ptg2_manifest_stage_table,
+                snapshot_id=snapshot_id,
+                source_key=source_key_val,
+                artifacts=manifest_artifacts,
+                db_dedupe_fallback=not bool(manifest_merge_metrics.get("enabled")),
+            )
+            ptg2_manifest_stage_table = None
+        else:
+            if ptg2_manifest_stage_table:
+                await _drop_ptg2_snapshot_table_names(
+                    [
+                        ptg2_manifest_stage_table,
+                        _ptg2_manifest_support_stage_table(ptg2_manifest_stage_table, "price_atom"),
+                        _ptg2_manifest_support_stage_table(ptg2_manifest_stage_table, "provider_group_member"),
+                    ]
+                )
+                ptg2_manifest_stage_table = None
+            serving_index = {
+                "type": "allowed_amounts_only",
+                "storage": "metadata_only",
+                "source_key": source_key_val,
+                "serving_rates": 0,
+                "rate_count": 0,
+            }
         publish_seconds = time.monotonic() - publish_started_monotonic
         finished = _utcnow()
         previous_snapshot_id = None
@@ -2607,7 +2634,7 @@ async def main(
             PTG2Snapshot,
             rewrite=True,
         )
-        if source_scoped_compact and source_key_val:
+        if has_serving_files and source_scoped_compact and source_key_val:
             await _publish_ptg2_source_pointers(
                 source_key=source_key_val,
                 snapshot_id=snapshot_id,
@@ -2616,20 +2643,21 @@ async def main(
                 updated_at=finished,
                 serving_index=serving_index,
             )
-        await _push_ptg2_objects(
-            [
-                {
-                    "slot": "current",
-                    "snapshot_id": snapshot_id,
-                    "previous_snapshot_id": global_previous_snapshot_id,
-                    "updated_at": finished,
-                }
-            ],
-            PTG2CurrentSnapshot,
-            rewrite=True,
-        )
-        current_pointer_published = True
-        if source_scoped_compact and source_key_val:
+        if has_serving_files:
+            await _push_ptg2_objects(
+                [
+                    {
+                        "slot": "current",
+                        "snapshot_id": snapshot_id,
+                        "previous_snapshot_id": global_previous_snapshot_id,
+                        "updated_at": finished,
+                    }
+                ],
+                PTG2CurrentSnapshot,
+                rewrite=True,
+            )
+            current_pointer_published = True
+        if has_serving_files and source_scoped_compact and source_key_val:
             keep_snapshot_ids = {snapshot_id}
             if previous_snapshot_id:
                 keep_snapshot_ids.add(previous_snapshot_id)

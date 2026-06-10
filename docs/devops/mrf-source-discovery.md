@@ -14,11 +14,12 @@ full in-network or allowed-amount rate bodies.
 
 The source registry is data-driven:
 
-- Static source/provider configuration: `specs/mrf_source_discovery_sources.json`
+- Resolver configuration: `specs/mrf_source_discovery_sources.json`
 - Curated payer/source roster: `specs/mrf_payer_master_list.md`
 - Design/spec notes: `specs/mrf_payer_source_registry.md`
 
-Do not put payer/TPA source URLs in Python code. Add or correct them in one of the registry files.
+Do not put payer/TPA source URLs in Python code or provider config. Add or correct them in the
+master list.
 
 ## Required Workers
 
@@ -41,10 +42,10 @@ Configure these in `import-control`, not hard-coded cron:
 | Cadence | Params | Purpose |
 | --- | --- | --- |
 | Daily | `--provider master-list --check-urls --concurrency 10` | catch broken/stale curated sources |
-| Weekly | `--provider all --limit 500 --check-urls --concurrency 10 --sync-import-control` | refresh seed universe and central control catalog |
+| Weekly | `--provider master-list --limit 500 --check-urls --concurrency 10 --sync-import-control` | refresh curated source universe and central control catalog |
 | Weekly TPA | `--provider master-list --source-entity-types tpa --check-urls --crawl --concurrency 10` | keep TPA-hosted metadata and file references current |
 | Weekly TPA probe | `--probe-files --file-probe-entity-types tpa --file-probe-limit 100 --concurrency 10` | sample TPA body-file freshness without full PTG import |
-| Monthly | `--provider all --limit 500 --check-urls --crawl --concurrency 10 --sync-import-control` | full metadata refresh within bounded source universe |
+| Monthly | `--provider master-list --limit 500 --check-urls --crawl --concurrency 10 --sync-import-control` | full metadata refresh within bounded source universe |
 
 Use `--crawl-target-limit` for production smoke/canary runs before unbounded monthly crawls.
 
@@ -57,6 +58,7 @@ Local dev uses `.env`; in the shared dev setup this points PostgreSQL at `127.0.
 ./venv314/bin/python main.py start mrf-source-discovery --probe-files --file-probe-entity-types tpa --file-probe-limit 100 --concurrency 10
 ./venv314/bin/python main.py start mrf-source-discovery --provider master-list --source-payer-query Meritain --crawl --concurrency 3
 ./venv314/bin/python main.py start mrf-source-discovery --probe-files --file-probe-payer-query Meritain --file-probe-limit 20 --concurrency 5
+./venv314/bin/python main.py start mrf-source-discovery --provider master-list --source-payer-query Cigna --crawl --concurrency 3
 ```
 
 Useful verification queries:
@@ -71,6 +73,7 @@ limit 10;
 select p.canonical_name, p.entity_type,
        count(distinct s.source_id) sources,
        count(distinct case when f.file_type = 'metadata-index' then f.mrf_file_id end) metadata_indexes,
+       count(distinct case when f.metadata_json->>'container_format' = 'zip' then f.mrf_file_id end) zip_files,
        count(distinct case when f.file_type in ('in-network', 'allowed-amounts') then f.mrf_file_id end) body_files,
        count(distinct case when f.file_type in ('in-network', 'allowed-amounts') and f.size_bytes is not null then f.mrf_file_id end) body_files_with_size
 from mrf.mrf_payer p
@@ -115,6 +118,14 @@ Validated against local PostgreSQL on `127.0.0.1:5440`:
 - TPA pages are heterogeneous: Sapphire pages expose TOCs, Collective exposes `.txt` metadata
   indexes, and other TPAs may point to carrier/EIN search pages. Add new resolver rules only when a
   pattern is generic enough to be reused.
+- Cigna uses HTML-discovered `/static/mrf/*.json` lookup files, not a direct TOC URL on the
+  compliance page. Keep those lookup paths in `specs/mrf_source_discovery_sources.json`.
+- BCBS Massachusetts uses deterministic current-month issuer TOC filenames on
+  `transparency-in-coverage.bluecrossma.com`; keep the suffixes in
+  `specs/mrf_source_discovery_sources.json`. If Python reports certificate-chain failures while
+  curl succeeds, treat it as an upstream TLS-chain issue rather than disabling verification.
+- Some payers publish body files as ZIPs containing JSON. Discovery records the ZIP URL and probes
+  headers only; full PTG import owns ZIP streaming/decompression.
 - Public/client surfaces must not show signed URLs, raw source payloads, internal node IDs, or
   private client-submitted source URLs.
 

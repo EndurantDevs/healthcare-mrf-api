@@ -23,7 +23,7 @@ Define the `api-app` user experience for admins, clients, and public coverage.
 - Last/next run.
 - Conflict/lock indicators.
 - Parameter editor for source-discovery:
-  - provider (`master-list`, `accessmrf`, `payerset`, `mrfdatasolutions`, `all`)
+  - provider (`master-list`, `all`)
   - source entity types (`tpa`, `network/tpa`, etc.)
   - source payer query
   - crawl/check/probe flags

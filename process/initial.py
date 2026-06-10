@@ -1812,7 +1812,7 @@ async def init_file(ctx, task=None):
     The init_file function is the first function called in this file.
     It downloads a zip file from the CMS website, unzips it, and then parses through each worksheet to create an
     object for each row of data.
-    The objects are then pushed into a database using GINO ORM.
+    The objects are then pushed into a database using SQLAlchemy async sessions.
 
     :param ctx: Pass information between functions
     :return: The following:

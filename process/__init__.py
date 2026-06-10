@@ -203,6 +203,19 @@ class CodeSets:
     job_deserializer = deserialize_job
 
 
+class MSDRG:
+    functions = [control_single_job_start]
+    on_startup = db_startup
+    max_jobs = 1
+    queue_read_limit = 2
+    queue_name = "arq:MSDRG"
+    job_timeout = 86400
+    burst = True
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
 class ClinicalReference:
     functions = [control_single_job_start]
     on_startup = db_startup
@@ -985,7 +998,7 @@ def entity_address_unified(test: bool):
 
 
 @click.command(help="Run lightweight MRF payer/source discovery catalog import")
-@click.option("--provider", help="Provider list: all, master-list, accessmrf, payerset, mrfdatasolutions, cms-guide, tpafs, bcbs-roster.")
+@click.option("--provider", help="Provider list: all or master-list.")
 @click.option("--limit", type=int, help="Maximum deduped source candidates to process.")
 @click.option("--source-entity-types", help="Comma-separated payer entity types to seed/check/crawl, for example tpa.")
 @click.option("--source-payer-query", help="Case-insensitive payer-name substring for seed/check/crawl.")

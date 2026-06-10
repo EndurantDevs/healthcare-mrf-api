@@ -3,15 +3,26 @@
 
 from __future__ import annotations
 
+import hashlib
+
 from db.connection import db
+
+
+def _index_name_for_table(table_name: str, base_name: str) -> str:
+    if len(base_name) <= 63:
+        return base_name
+    digest = hashlib.sha1(base_name.encode("utf-8")).hexdigest()[:10]
+    prefix = table_name[: 63 - len(digest) - 1].rstrip("_")
+    return f"{prefix}_{digest}"
 
 
 async def _ensure_indexes(obj: type, db_schema: str) -> None:
     if hasattr(obj, "__my_index_elements__") and obj.__my_index_elements__:
         cols = ", ".join(obj.__my_index_elements__)
+        name = _index_name_for_table(obj.__tablename__, f"{obj.__tablename__}_idx_primary")
         await db.status(
             "CREATE UNIQUE INDEX IF NOT EXISTS "
-            + f"{obj.__tablename__}_idx_primary ON {db_schema}.{obj.__tablename__} ({cols});"
+            + f"{name} ON {db_schema}.{obj.__tablename__} ({cols});"
         )
     if hasattr(obj, "__my_additional_indexes__") and obj.__my_additional_indexes__:
         for idx in obj.__my_additional_indexes__:
@@ -23,6 +34,7 @@ async def _ensure_indexes(obj: type, db_schema: str) -> None:
                 name = f"{obj.__tablename__}_{base_name}"
             else:
                 name = base_name
+            name = _index_name_for_table(obj.__tablename__, name)
             using = idx.get("using")
             where = idx.get("where")
             cols = ", ".join(elements)
