@@ -459,6 +459,7 @@ from process.ptg_parts.source_jobs import (
     parse_toc_catalog_entries,
 )
 from process.ptg_parts.source_download import (
+    PTG2_DEFAULT_MAX_BYTES,
     _download_ptg_job_artifact,
     _download_ptg_job_artifact_sync,
     _download_raw_artifact_ranges,
@@ -470,6 +471,7 @@ from process.ptg_parts.source_download import (
     fetch_head_metadata,
     materialize_json_source,
 )
+from process.url_security import fetch_max_bytes
 from process.ptg_parts.source_files import (
     _build_file_row,
     _derive_plan_fields,
@@ -2083,6 +2085,7 @@ async def _process_in_network_file(
     ):
         no_data_summary = dict(parse_summary or {})
         no_data_summary["skipped_reason"] = "parsed zero serving rates"
+        no_data_summary.update(_source_version_summary(source_version))
         return PTG2FileProcessResult(
             "in_network",
             url,
@@ -2091,7 +2094,9 @@ async def _process_in_network_file(
             summary=no_data_summary,
             skipped=True,
         )
-    return PTG2FileProcessResult("in_network", url, True, file_id=file_row["file_id"], summary=parse_summary)
+    summary_payload = dict(parse_summary or {})
+    summary_payload.update(_source_version_summary(source_version))
+    return PTG2FileProcessResult("in_network", url, True, file_id=file_row["file_id"], summary=summary_payload)
 
 
 async def _mark_ptg2_import_failed(
@@ -2146,6 +2151,52 @@ async def _mark_ptg2_import_failed(
         logger.error("Failed to mark PTG2 import %s as failed: %s", import_run_id, mark_exc)
 
 
+def _source_version_summary(source_version: PTG2SourceVersion | None) -> dict[str, Any]:
+    if source_version is None:
+        return {}
+    return {
+        "engine_source_identity_hash": source_version.source_identity_hash,
+        "engine_source_file_version_id": source_version.source_file_version_id,
+        "canonical_url": source_version.canonical_url,
+        "raw_sha256": source_version.raw_sha256,
+        "logical_sha256": source_version.logical_sha256,
+        "content_length": source_version.content_length,
+        "etag": source_version.etag,
+        "last_modified": source_version.last_modified,
+    }
+
+
+def _ptg2_source_file_versions_from_results(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    versions: list[dict[str, Any]] = []
+    seen: set[tuple[str | None, str | None]] = set()
+    for item in files:
+        summary = item.get("summary") if isinstance(item.get("summary"), dict) else {}
+        version_id = summary.get("engine_source_file_version_id") or summary.get("source_file_version_id")
+        identity_hash = summary.get("engine_source_identity_hash") or summary.get("source_identity_hash")
+        if not version_id and not identity_hash:
+            continue
+        key = (str(version_id) if version_id else None, str(identity_hash) if identity_hash else None)
+        if key in seen:
+            continue
+        seen.add(key)
+        versions.append(
+            {
+                "source_type": item.get("source_type"),
+                "url": item.get("url"),
+                "file_id": item.get("file_id"),
+                "engine_source_identity_hash": identity_hash,
+                "engine_source_file_version_id": version_id,
+                "canonical_url": summary.get("canonical_url") or item.get("url"),
+                "raw_sha256": summary.get("raw_sha256"),
+                "logical_sha256": summary.get("logical_sha256"),
+                "content_length": summary.get("content_length"),
+                "etag": summary.get("etag"),
+                "last_modified": summary.get("last_modified"),
+            }
+        )
+    return versions
+
+
 async def main(
     test_mode: bool = False,
     toc_urls: list[str] | None = None,
@@ -2165,7 +2216,7 @@ async def main(
     reuse_raw_artifacts: bool = True,
     keep_partial_artifacts: bool | None = None,
     control_run_id: str | None = None,
-) -> None:
+) -> dict[str, Any]:
     """
     PTG2 entry point for the Transparency in Coverage importer.
     """
@@ -2182,7 +2233,9 @@ async def main(
         snapshot_id=snapshot_id,
         import_run_id=import_run_id,
     )
-    max_bytes = None
+    # Enforce a streaming size cap on every caller-supplied URL (never None for
+    # control-triggered runs) so a malicious/huge target cannot OOM or fill the node.
+    max_bytes = fetch_max_bytes(PTG2_DEFAULT_MAX_BYTES)
     if test_mode:
         raw_max_bytes = os.getenv("HLTHPRT_PTG2_TEST_MAX_BYTES")
         if raw_max_bytes:
@@ -2705,6 +2758,24 @@ async def main(
             eta_seconds=0,
             message="PTG import succeeded",
         )
+        return {
+            "status": "succeeded",
+            "import_run_id": import_run_id,
+            "snapshot_id": snapshot_id,
+            "source_key": source_key_val,
+            "import_month": import_month_value.isoformat(),
+            "jobs_discovered": jobs_discovered_before_dedupe,
+            "jobs_unique": len(jobs),
+            "duplicate_jobs_skipped": duplicate_jobs_skipped,
+            "duplicate_raw_files_skipped": duplicate_raw_files_skipped,
+            "files_attempted": attempted_files,
+            "files_processed": processed_files,
+            "files_failed": len(failed_files),
+            "files_skipped": len(skipped_files),
+            "serving_rates": report_payload.get("serving_rates"),
+            "rate_count": report_payload.get("rate_count"),
+            "source_file_versions": _ptg2_source_file_versions_from_results(successful_files + skipped_files),
+        }
     except Exception as exc:
         write_live_progress(
             status="failed",

@@ -18,6 +18,7 @@ from arq import create_pool
 from db.models import DoctorClinicianAddress, db
 from process.control_cancel import raise_if_cancelled
 from process.control_lifecycle import mark_control_run
+from process.ext.address_canon import resolve_into_archive, source_enabled, stamp_address_keys
 from process.ext.utils import (ensure_database, make_class, my_init_db,
                                print_time_info, push_objects, return_checksum)
 from process.redis_config import build_redis_settings
@@ -29,6 +30,9 @@ CMS_DOCTORS_QUEUE_NAME = "arq:CMSDoctors"
 POSTGRES_IDENTIFIER_MAX_LENGTH = 63
 
 CMS_PROVIDER_DATA_JSON_URL = "https://data.cms.gov/provider-data/data.json"
+CMS_PROVIDER_METASTORE_DATASET_URL = (
+    "https://data.cms.gov/provider-data/api/1/metastore/schemas/dataset/items/{dataset_id}"
+)
 DEFAULT_DOCTORS_DATASET_ID = os.getenv("HLTHPRT_CMS_DOCTORS_DATASET_ID", "mj5m-pzi6").lower()
 DEFAULT_BATCH_SIZE = 10_000
 DEFAULT_MIN_ROWS = 10_000
@@ -104,8 +108,41 @@ async def _ensure_schema_exists(db_schema: str) -> None:
         raise
 
 
+def _distribution_urls(dataset: dict) -> list[str]:
+    urls: list[str] = []
+    for dist in dataset.get("distribution", []):
+        url = str(dist.get("downloadURL", "")).strip()
+        if url and (url.lower().endswith((".csv", ".zip")) or "dac_nationaldownloadablefile" in url.lower()):
+            urls.append(url)
+    return urls
+
+
+async def _first_reachable_url(client, urls: list[str]) -> str | None:
+    for url in urls:
+        try:
+            async with client.head(url, allow_redirects=True, timeout=60) as response:
+                if response.status < 400:
+                    return url
+                logger.warning("CMS Doctors source candidate returned HTTP %s: %s", response.status, url)
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            logger.warning("CMS Doctors source candidate probe failed: %s (%s)", url, exc)
+    return None
+
+
 async def _fetch_doctors_download_url(client) -> str:
+    metastore_url = CMS_PROVIDER_METASTORE_DATASET_URL.format(dataset_id=DEFAULT_DOCTORS_DATASET_ID)
+    try:
+        async with client.get(metastore_url, timeout=60) as response:
+            response.raise_for_status()
+            dataset = await response.json(content_type=None)
+        url = await _first_reachable_url(client, _distribution_urls(dataset))
+        if url:
+            return url
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        logger.warning("Could not resolve CMS Doctors metastore URL, falling back to catalog: %s", exc)
+
     async with client.get(CMS_PROVIDER_DATA_JSON_URL, timeout=60) as response:
+        response.raise_for_status()
         catalog = await response.json(content_type=None)
 
     selected_dataset = None
@@ -128,16 +165,10 @@ async def _fetch_doctors_download_url(client) -> str:
     if not selected_dataset:
         raise ValueError("Could not find CMS Doctors dataset in provider-data catalog.")
 
-    distributions = selected_dataset.get("distribution", [])
-    for dist in distributions:
-        url = str(dist.get("downloadURL", "")).strip()
-        if url.lower().endswith(".csv") or url.lower().endswith(".zip"):
-            return url
-
-    for dist in distributions:
-        candidate = str(dist.get("downloadURL", "")).strip()
-        if "dac_nationaldownloadablefile" in candidate.lower():
-            return candidate
+    candidates = _distribution_urls(selected_dataset)
+    url = await _first_reachable_url(client, candidates)
+    if url:
+        return url
 
     raise ValueError("Could not find CMS Doctors CSV/ZIP download URL in dataset.")
 
@@ -172,6 +203,7 @@ async def process_data(ctx, task=None):
             source_path = os.path.join(tmpdir, f"cms_doctors{source_ext}")
 
             async with client.get(url, timeout=600) as response:
+                response.raise_for_status()
                 with open(source_path, "wb") as fh:
                     async for chunk in response.content.iter_chunked(10 * 1024 * 1024):
                         fh.write(chunk)
@@ -183,7 +215,7 @@ async def process_data(ctx, task=None):
                 now = datetime.datetime.utcnow()
 
                 for row in reader:
-                    npi_str = row.get("NPI")
+                    npi_str = row.get("NPI") or row.get("npi")
                     if not npi_str:
                         continue
 
@@ -194,9 +226,9 @@ async def process_data(ctx, task=None):
 
                     addr1 = row.get("Line 1 Street Address") or row.get("adr_ln_1")
                     addr2 = row.get("Line 2 Street Address") or row.get("adr_ln_2")
-                    city = row.get("City") or row.get("City/Town")
-                    state = row.get("State")
-                    zip_code = str(row.get("Zip Code") or row.get("ZIP Code") or "")[:5]
+                    city = row.get("City") or row.get("City/Town") or row.get("citytown")
+                    state = row.get("State") or row.get("state")
+                    zip_code = str(row.get("Zip Code") or row.get("ZIP Code") or row.get("zip_code") or "")[:5]
                     provider_type = row.get("Primary specialty") or row.get("pri_spec")
 
                     if not addr1 or not zip_code or len(zip_code) < 5:
@@ -311,6 +343,41 @@ async def shutdown(ctx):
             f"CMS Doctors stage row count {stage_rows} below minimum {DEFAULT_MIN_ROWS}; aborting."
         )
 
+    address_stats = None
+    if source_enabled("cms_doctors"):
+        async def _cancel_check():
+            await raise_if_cancelled(ctx, {})
+
+        await stamp_address_keys(
+            stage_cls.__tablename__,
+            {
+                "first_line": "address_line1",
+                "second_line": "address_line2",
+                "city": "city",
+                "state": "state",
+                "zip": "zip_code",
+                "country": "'US'",
+            },
+            schema=db_schema,
+            cancel_check=_cancel_check,
+        )
+        address_stats = await resolve_into_archive(
+            stage_cls.__tablename__,
+            {
+                "first_line": "address_line1",
+                "second_line": "address_line2",
+                "city": "city",
+                "state": "state",
+                "zip": "zip_code",
+                "country": "'US'",
+            },
+            source_bit=2,
+            priority=1,
+            schema=db_schema,
+            cancel_check=_cancel_check,
+        )
+        logger.info("CMS Doctors canonical address resolve complete: %s", address_stats)
+
     async with db.transaction():
         table = DoctorClinicianAddress.__main_table__
         await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
@@ -352,7 +419,10 @@ async def shutdown(ctx):
         status="succeeded",
         phase_detail="cms-doctors published",
         progress_message="succeeded",
-        metrics={"rows": stage_rows},
+        metrics={
+            "rows": stage_rows,
+            **({"address_resolve": address_stats.__dict__} if address_stats else {}),
+        },
     )
 
 

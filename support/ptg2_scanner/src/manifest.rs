@@ -207,7 +207,10 @@ pub fn write_global_sidecar<W: Write>(writer: &mut W, entries: &[SidecarEntry]) 
     Ok(())
 }
 
-pub fn write_dense_member_sidecar<W: Write>(writer: &mut W, entries: &[SidecarEntry]) -> io::Result<()> {
+pub fn write_dense_member_sidecar<W: Write>(
+    writer: &mut W,
+    entries: &[SidecarEntry],
+) -> io::Result<()> {
     let mut member_ids: Vec<GlobalId128> = entries
         .iter()
         .flat_map(|entry| entry.members.iter().copied())
@@ -364,7 +367,10 @@ mod tests {
         let second_owner = GlobalId128([8; GLOBAL_ID_BYTES]);
         let low = GlobalId128([1; GLOBAL_ID_BYTES]);
         let high = GlobalId128([9; GLOBAL_ID_BYTES]);
-        let entries = normalized_sidecar_entries([(first_owner, vec![high, low]), (second_owner, vec![high])]);
+        let entries = normalized_sidecar_entries([
+            (first_owner, vec![high, low]),
+            (second_owner, vec![high]),
+        ]);
         let mut out = Vec::new();
 
         write_dense_member_sidecar(&mut out, &entries).unwrap();

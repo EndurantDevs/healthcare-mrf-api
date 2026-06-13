@@ -337,6 +337,7 @@ def test_import_control_seed_item_can_mark_auto_promoted_source():
 @pytest.mark.asyncio
 async def test_push_import_control_catalog_marks_successful_seed_promoted(monkeypatch):
     calls = []
+    source_upsert_count = 0
 
     class FakeResponse:
         def __init__(self, payload, status=200):
@@ -366,13 +367,21 @@ async def test_push_import_control_catalog_marks_successful_seed_promoted(monkey
             return False
 
         def post(self, url, json):
+            nonlocal source_upsert_count
             calls.append({"url": url, "json": json})
             if url.endswith("/v1/catalog/sources"):
+                source_upsert_count += 1
                 return FakeResponse({"source_id": "ic_source_1"})
             if url.endswith("/v1/ptg/discover/ingest-preview"):
                 return FakeResponse({"counts": {"plans": 2}})
             if url.endswith("/v1/catalog/seeds/import"):
                 return FakeResponse({"count": 1, "items": json.get("items") or []})
+            return FakeResponse({}, status=404)
+
+        def get(self, url):
+            calls.append({"url": url, "json": None})
+            if url.endswith("/v1/catalog/sources/ic_source_1"):
+                return FakeResponse({"source_id": "ic_source_1", "visibility": "internal", "status": "needs_review"})
             return FakeResponse({}, status=404)
 
     async def fake_snapshot(source_ids):
@@ -396,7 +405,7 @@ async def test_push_import_control_catalog_marks_successful_seed_promoted(monkey
     monkeypatch.setattr(discovery, "_import_control_snapshot_items", fake_snapshot)
     monkeypatch.setattr(discovery.aiohttp, "ClientSession", FakeSession)
 
-    sources_synced, plans_synced = await discovery._push_import_control_catalog(
+    sources_synced, plans_synced, errors = await discovery._push_import_control_catalog(
         [
             {
                 "source_id": "source_local",
@@ -413,17 +422,140 @@ async def test_push_import_control_catalog_marks_successful_seed_promoted(monkey
 
     assert sources_synced == 1
     assert plans_synced == 2
+    assert errors == []
     assert [call["url"] for call in calls] == [
         "http://import-control.test/v1/catalog/sources",
+        "http://import-control.test/v1/catalog/sources/ic_source_1",
         "http://import-control.test/v1/ptg/discover/ingest-preview",
         "http://import-control.test/v1/catalog/seeds/import",
+        "http://import-control.test/v1/catalog/sources",
     ]
-    seed_payload = calls[-1]["json"]
+    assert source_upsert_count == 2
+    assert calls[0]["json"]["visibility"] == "internal"
+    assert calls[0]["json"]["status"] == "needs_review"
+    assert calls[-1]["json"]["visibility"] == "public"
+    assert calls[-1]["json"]["status"] == "active"
+    assert calls[-1]["json"]["preserve_operator_state"] is False
+
+
+@pytest.mark.asyncio
+async def test_push_import_control_catalog_keeps_failed_source_internal_and_reports_error(monkeypatch):
+    calls = []
+    source_ids = iter(["ic_source_ok", "ic_source_fail"])
+
+    class FakeResponse:
+        def __init__(self, payload, status=200, text="error"):
+            self.payload = payload
+            self.status = status
+            self._text = text
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        async def json(self):
+            return self.payload
+
+        async def text(self):
+            return self._text
+
+    class FakeSession:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        def post(self, url, json):
+            calls.append({"url": url, "json": json})
+            if url.endswith("/v1/catalog/sources"):
+                if json.get("visibility") == "public":
+                    return FakeResponse({"source_id": "ic_source_ok"})
+                return FakeResponse({"source_id": next(source_ids)})
+            if url.endswith("/v1/ptg/discover/ingest-preview"):
+                if json["source_id"] == "ic_source_fail":
+                    return FakeResponse({}, status=500, text="ingest exploded")
+                return FakeResponse({"counts": {"plans": 2}})
+            if url.endswith("/v1/catalog/seeds/import"):
+                return FakeResponse({"count": 1, "items": json.get("items") or []})
+            return FakeResponse({}, status=404)
+
+        def get(self, url):
+            calls.append({"url": url, "json": None})
+            if url.endswith("/v1/catalog/sources/ic_source_ok"):
+                return FakeResponse({"source_id": "ic_source_ok", "visibility": "internal", "status": "needs_review"})
+            if url.endswith("/v1/catalog/sources/ic_source_fail"):
+                return FakeResponse({"source_id": "ic_source_fail", "visibility": "internal", "status": "needs_review"})
+            return FakeResponse({}, status=404)
+
+    async def fake_snapshot(source_ids_arg):
+        assert source_ids_arg == ["source_ok", "source_fail"]
+        item = {
+            "canonical_url": "https://example.com/rates.json.gz",
+            "domain": "in_network",
+            "reporting_entity_name": "Example Payer",
+            "plan_info": [{"plan_id": "123", "plan_market_type": "group"}],
+        }
+        return {"source_ok": [item], "source_fail": [item]}
+
+    monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_URL", "http://import-control.test")
+    monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_TOKEN", "secret")
+    monkeypatch.setattr(discovery, "_import_control_snapshot_items", fake_snapshot)
+    monkeypatch.setattr(discovery.aiohttp, "ClientSession", FakeSession)
+
+    sources_synced, plans_synced, errors = await discovery._push_import_control_catalog(
+        [
+            {
+                "source_id": "source_ok",
+                "index_url": "https://example.com/ok-index.json",
+                "human_url": "https://example.com/ok",
+                "display_name": "Example OK",
+                "source_key": "example-ok",
+                "seed_provider": "master-list",
+                "access_model": "free",
+                "source_type": "toc_json",
+            },
+            {
+                "source_id": "source_fail",
+                "index_url": "https://example.com/fail-index.json",
+                "human_url": "https://example.com/fail",
+                "display_name": "Example Fail",
+                "source_key": "example-fail",
+                "seed_provider": "master-list",
+                "access_model": "free",
+                "source_type": "toc_json",
+            },
+        ]
+    )
+
+    final_public_sources = [
+        call["json"]
+        for call in calls
+        if call["url"].endswith("/v1/catalog/sources")
+        and call["json"].get("visibility") == "public"
+    ]
+
+    assert sources_synced == 1
+    assert plans_synced == 2
+    assert len(errors) == 1
+    assert errors[0]["source_id"] == "source_fail"
+    assert errors[0]["import_control_source_id"] == "ic_source_fail"
+    assert "ingest exploded" in errors[0]["message"]
+    assert len(final_public_sources) == 1
+    assert final_public_sources[0]["source_key"] == "example-ok"
+    seed_calls = [call for call in calls if call["url"].endswith("/v1/catalog/seeds/import")]
+    assert len(seed_calls) == 1
+    seed_payload = seed_calls[0]["json"]
     assert seed_payload["seed_provider"] == "healthcare-mrf-api"
     [seed_item] = seed_payload["items"]
-    assert seed_item["seed_url"] == "https://example.com/index.json"
+    assert seed_item["seed_url"] == "https://example.com/ok-index.json"
     assert seed_item["review_status"] == "promoted"
-    assert seed_item["promoted_source_id"] == "ic_source_1"
+    assert seed_item["promoted_source_id"] == "ic_source_ok"
 
 
 def test_parse_sapphire_toc_links_extracts_unique_json_hrefs():

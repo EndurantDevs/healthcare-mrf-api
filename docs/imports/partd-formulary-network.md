@@ -18,6 +18,10 @@ python main.py worker process.PartDFormularyNetwork --burst
 python main.py worker process.PartDFormularyNetwork_finish --burst
 ```
 
+For full dev-server runs, set `HLTHPRT_MAX_PARTD_JOBS=8` so activity file
+chunks can use the available worker cores. Keep
+`HLTHPRT_MAX_PARTD_FINISH_JOBS=1` for finalization.
+
 ## Manual Finish
 ```bash
 python main.py finish partd-formulary-network --import-id <IMPORT_ID> --run-id <RUN_ID>

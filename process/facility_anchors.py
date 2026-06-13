@@ -16,6 +16,7 @@ from sqlalchemy import and_, select
 
 from db.models import FacilityAnchor, GeoZipLookup, db
 from process.control_lifecycle import mark_control_run
+from process.ext.address_canon import archive_table_name, resolve_into_archive, source_enabled, stamp_address_keys
 from process.ext.utils import (ensure_database, make_class, my_init_db,
                                print_time_info, push_objects)
 from process.redis_config import build_redis_settings
@@ -170,6 +171,67 @@ async def _load_zip_centroids(*, test_mode: bool = False) -> dict[str, tuple[flo
             continue
         centroids[zip_code] = (lat, lng)
     return centroids
+
+
+async def _table_has_column(db_schema: str, table_name: str, column_name: str) -> bool:
+    return bool(
+        await db.scalar(
+            f"""
+            SELECT EXISTS (
+                SELECT 1
+                  FROM information_schema.columns
+                 WHERE table_schema = '{db_schema}'
+                   AND table_name = '{table_name}'
+                   AND column_name = '{column_name}'
+            );
+            """
+        )
+    )
+
+
+async def _canonical_archive_table(db_schema: str) -> str | None:
+    requested = archive_table_name()
+    if await _table_has_column(db_schema, requested, "address_key"):
+        return requested
+    if requested == "address_archive_v2" and await _table_has_column(db_schema, "address_archive", "address_key"):
+        return "address_archive"
+    return None
+
+
+async def _refresh_archive_geocodes_from_facility_anchors(stage_table: str, db_schema: str) -> int:
+    archive_table = await _canonical_archive_table(db_schema)
+    if not archive_table:
+        logger.warning("Skipping facility-anchor archive geocode refresh: no canonical archive table is available.")
+        return 0
+
+    return int(
+        await db.status(
+            f"""
+            WITH facility_geocodes AS (
+                SELECT DISTINCT ON (address_key)
+                    address_key,
+                    latitude::numeric(11,8) AS lat,
+                    longitude::numeric(11,8) AS long
+                  FROM {db_schema}.{stage_table}
+                 WHERE address_key IS NOT NULL
+                   AND latitude IS NOT NULL
+                   AND longitude IS NOT NULL
+                 ORDER BY address_key, (facility_type = 'Hospital') DESC
+            )
+            UPDATE {db_schema}.{archive_table} AS archive
+               SET lat = facility_geocodes.lat,
+                   long = facility_geocodes.long,
+                   geocode_source = COALESCE(archive.geocode_source, 'facility_anchor'),
+                   geocode_quality = COALESCE(archive.geocode_quality, 'facility_anchor'),
+                   geocoded_at = COALESCE(archive.geocoded_at, now())
+              FROM facility_geocodes
+             WHERE archive.address_key = facility_geocodes.address_key
+               AND archive.lat IS NULL
+               AND archive.long IS NULL;
+            """
+        )
+        or 0
+    )
 
 
 async def _create_stage_indexes(stage_cls, db_schema: str) -> None:
@@ -508,6 +570,38 @@ async def shutdown(ctx):
             "aborting publish."
         )
 
+    address_stats = None
+    if source_enabled("facility_anchors"):
+        await stamp_address_keys(
+            stage_cls.__tablename__,
+            {
+                "first_line": "address_line1",
+                "second_line": "NULL",
+                "city": "city",
+                "state": "state",
+                "zip": "zip_code",
+                "country": "'US'",
+            },
+            schema=db_schema,
+        )
+        address_stats = await resolve_into_archive(
+            stage_cls.__tablename__,
+            {
+                "first_line": "address_line1",
+                "second_line": "NULL",
+                "city": "city",
+                "state": "state",
+                "zip": "zip_code",
+                "country": "'US'",
+            },
+            source_bit=8,
+            priority=4,
+            schema=db_schema,
+        )
+        logger.info("Facility Anchors canonical address resolve complete: %s", address_stats)
+        geocode_updates = await _refresh_archive_geocodes_from_facility_anchors(stage_cls.__tablename__, db_schema)
+        logger.info("Facility Anchors archive geocode refresh updated %d canonical rows.", geocode_updates)
+
     async with db.transaction():
         table = FacilityAnchor.__main_table__
         await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
@@ -560,6 +654,7 @@ async def shutdown(ctx):
             "hospital_rows": hospital_rows,
             "hospital_with_coords": hospital_with_coords,
             "hospital_coord_ratio": hospital_coord_ratio,
+            **({"address_resolve": address_stats.__dict__} if address_stats else {}),
         },
     )
 

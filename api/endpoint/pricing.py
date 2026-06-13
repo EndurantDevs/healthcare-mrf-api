@@ -2460,14 +2460,14 @@ async def _load_provider_quality_profile(
                     END,
                     a.checksum
                 LIMIT 1
-            ),
+            )
         """
         if npi_address_exists
         else """
             npi_address_choice AS (
                 SELECT NULL::varchar AS state_key, NULL::varchar AS zip5
                 WHERE FALSE
-            ),
+            )
         """
     )
     nucc_cte = (

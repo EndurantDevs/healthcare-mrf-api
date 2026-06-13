@@ -1,7 +1,15 @@
+FROM rust:1-slim-trixie AS ptg2-scanner-builder
+
+WORKDIR /build
+COPY support/ptg2_scanner/ /build/support/ptg2_scanner/
+COPY process/ext/address_pub28.py /build/process/ext/address_pub28.py
+RUN cargo build --release --manifest-path /build/support/ptg2_scanner/Cargo.toml
+
 FROM python:3.14-slim-trixie
 
 #
 WORKDIR /wheels
+ADD ./requirements.txt /wheels
 ADD ./requirements-dev.txt /wheels
 
 WORKDIR /opt
@@ -12,6 +20,12 @@ RUN apt-get update \
     && . venv/bin/activate \
     && pip install --no-compile --upgrade pip \
     && pip install --no-compile -r /wheels/requirements-dev.txt -f /wheels \
+    && install -d -o nobody -g root -m 700 \
+        /var/lib/nginx/body \
+        /var/lib/nginx/proxy \
+        /var/lib/nginx/fastcgi \
+        /var/lib/nginx/uwsgi \
+        /var/lib/nginx/scgi \
     && rm -rf /wheels \
     && rm -rf /root/.cache/pip/* \
     && find . -name '*.pyc' -delete \
@@ -51,6 +65,7 @@ ENV HLTHPRT_DB_SCHEMA=${HLTHPRT_DB_SCHEMA}
 
 ENV HLTHPRT_REDIS_ADDRESS=${HLTHPRT_REDIS_ADDRESS}
 ENV HLTHPRT_SAVE_PER_PACK=${HLTHPRT_SAVE_PER_PACK}
+ENV HLTHPRT_PTG2_RUST_SCANNER_BIN=/opt/support/ptg2_scanner/target/release/ptg2_scanner
 
 ADD service/nginx.conf /etc/nginx/nginx.conf
 ADD service/start_api.sh /usr/local/bin/start_api.sh
@@ -65,6 +80,9 @@ COPY specs/ /opt/specs/
 COPY alembic/ /opt/alembic/
 COPY process/ /opt/process/
 COPY support/ /opt/support/
+COPY --from=ptg2-scanner-builder \
+    /build/support/ptg2_scanner/target/release/ptg2_scanner \
+    /opt/support/ptg2_scanner/target/release/ptg2_scanner
 COPY logging.yaml main.py alembic.ini /opt/
 
 EXPOSE 8080

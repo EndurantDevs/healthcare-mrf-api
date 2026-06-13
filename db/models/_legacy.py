@@ -6,6 +6,7 @@ import os
 from sqlalchemy import (ARRAY, DATE, JSON, SMALLINT, TEXT, TIMESTAMP,
                         BigInteger, Boolean, Column, DateTime, Float, Integer,
                         Numeric, PrimaryKeyConstraint, String, text)
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import declared_attr
 
 from db.connection import Base, db
@@ -69,6 +70,7 @@ class PartDPharmacyActivity(Base, JSONOutputMixin):
     __my_additional_indexes__ = [
         {"index_elements": ("snapshot_id",), "name": "partd_pharm_act_v2_snapshot_idx"},
         {"index_elements": ("zip_code",), "name": "partd_pharm_act_v2_zip_idx"},
+        {"index_elements": ("address_key",), "name": "partd_pharm_act_v2_address_key_idx"},
         {"index_elements": ("zip_code", "medicare_active", "npi"), "name": "partd_pharm_act_v2_zip_active_npi_idx"},
         {"index_elements": ("npi", "effective_from", "effective_to"), "name": "partd_pharm_act_v2_npi_effective_idx"},
         {"index_elements": ("npi", "medicare_active"), "name": "partd_pharm_act_v2_npi_active_idx"},
@@ -107,6 +109,7 @@ class PartDPharmacyActivity(Base, JSONOutputMixin):
     effective_to = Column(DATE)
     source_type = Column(String(16), nullable=False)
     plan_ids = Column(ARRAY(String), nullable=False)
+    address_key = Column(PG_UUID(as_uuid=True))
 
 
 class PartDMedicationCost(Base, JSONOutputMixin):
@@ -169,6 +172,7 @@ class PartDPharmacyActivityStage(Base, JSONOutputMixin):
     )
     __my_additional_indexes__ = [
         {"index_elements": ("snapshot_id",), "name": "partd_pharm_act_stage_v2_snapshot_idx"},
+        {"index_elements": ("address_key",), "name": "partd_pharm_act_stage_v2_address_key_idx"},
     ]
     id = Column(BigInteger, autoincrement=True)
     snapshot_id = Column(String(128), nullable=False)
@@ -196,6 +200,7 @@ class PartDPharmacyActivityStage(Base, JSONOutputMixin):
     effective_from = Column(DATE, nullable=False)
     effective_to = Column(DATE)
     source_type = Column(String(16), nullable=False)
+    address_key = Column(PG_UUID(as_uuid=True))
 
 
 class PartDMedicationCostStage(Base, JSONOutputMixin):
@@ -322,6 +327,7 @@ class PharmacyLicenseRecordStage(Base, JSONOutputMixin):
         {"index_elements": ("snapshot_id",), "name": "pharm_lic_stage_v1_snapshot_idx"},
         {"index_elements": ("run_id",), "name": "pharm_lic_stage_v1_run_idx"},
         {"index_elements": ("npi", "state_code"), "name": "pharm_lic_stage_v1_npi_state_idx"},
+        {"index_elements": ("address_key",), "name": "pharm_lic_stage_v1_address_key_idx"},
     ]
 
     id = Column(BigInteger, autoincrement=True)
@@ -354,6 +360,7 @@ class PharmacyLicenseRecordStage(Base, JSONOutputMixin):
     source_record_id = Column(String(128))
     source_last_seen_at = Column(TIMESTAMP)
     imported_at = Column(TIMESTAMP)
+    address_key = Column(PG_UUID(as_uuid=True))
 
 
 class PharmacyLicenseRecord(Base, JSONOutputMixin):
@@ -369,6 +376,7 @@ class PharmacyLicenseRecord(Base, JSONOutputMixin):
         {"index_elements": ("state_code", "license_status"), "name": "pharm_lic_record_v1_state_status_idx"},
         {"index_elements": ("license_expiration_date",), "name": "pharm_lic_record_v1_exp_idx"},
         {"index_elements": ("last_snapshot_id",), "name": "pharm_lic_record_v1_snapshot_idx"},
+        {"index_elements": ("address_key",), "name": "pharm_lic_record_v1_address_key_idx"},
         {
             "index_elements": ("npi", "license_expiration_date"),
             "where": "license_status = 'active'",
@@ -408,6 +416,7 @@ class PharmacyLicenseRecord(Base, JSONOutputMixin):
     last_seen_at = Column(TIMESTAMP)
     last_verified_at = Column(TIMESTAMP)
     updated_at = Column(TIMESTAMP)
+    address_key = Column(PG_UUID(as_uuid=True))
 
 
 class PharmacyLicenseRecordHistory(Base, JSONOutputMixin):
@@ -423,6 +432,7 @@ class PharmacyLicenseRecordHistory(Base, JSONOutputMixin):
         {"index_elements": ("npi", "state_code"), "name": "pharm_lic_hist_v1_npi_state_idx"},
         {"index_elements": ("license_key",), "name": "pharm_lic_hist_v1_license_key_idx"},
         {"index_elements": ("record_signature",), "name": "pharm_lic_hist_v1_sig_idx"},
+        {"index_elements": ("address_key",), "name": "pharm_lic_hist_v1_address_key_idx"},
     ]
 
     history_id = Column(BigInteger, autoincrement=True)
@@ -457,6 +467,7 @@ class PharmacyLicenseRecordHistory(Base, JSONOutputMixin):
     source_record_id = Column(String(128))
     source_last_seen_at = Column(TIMESTAMP)
     imported_at = Column(TIMESTAMP)
+    address_key = Column(PG_UUID(as_uuid=True))
 
 
 class PlanIndividual(Base, JSONOutputMixin):
@@ -810,8 +821,8 @@ class PlanNPIRaw(Base, JSONOutputMixin):
         {'index_elements': ('issuer_id', 'network_tier', 'year'), 'using': 'gin'},]
 
 
-    npi = Column(Integer)
-    checksum_network = Column(Integer)
+    npi = Column(BigInteger)
+    checksum_network = Column(BigInteger)
     type =  Column(String)
     last_updated_on = Column(TIMESTAMP)
     network_tier = Column(String)
@@ -848,7 +859,7 @@ class PlanNetworkTierRaw(Base, JSONOutputMixin):
     network_tier = Column(String)
     issuer_id = Column(Integer)
     year = Column(Integer)
-    checksum_network = Column(Integer)
+    checksum_network = Column(BigInteger)
 
 
 class PlanDrugRaw(Base, JSONOutputMixin):
@@ -993,10 +1004,10 @@ class NPIData(Base, JSONOutputMixin):
             'name': 'entity_type_code',
         },
     ]
-    npi = Column(Integer, primary_key=True)
+    npi = Column(BigInteger, primary_key=True)
     employer_identification_number = Column(String)
     entity_type_code = Column(Integer)
-    replacement_npi = Column(Integer)
+    replacement_npi = Column(BigInteger)
     provider_organization_name = Column(String)
     provider_last_name = Column(String)
     provider_first_name = Column(String)
@@ -1038,7 +1049,7 @@ class NPIData(Base, JSONOutputMixin):
         server_default=text("ARRAY[]::varchar[]"),
         default=list,
     )
-    do_business_as_text = Column(String)
+    do_business_as_text = Column(String, nullable=False, server_default=text("''"), default="")
 
 
 class NPIDataTaxonomy(Base, JSONOutputMixin):
@@ -1051,7 +1062,7 @@ class NPIDataTaxonomy(Base, JSONOutputMixin):
     __my_index_elements__ = ['npi', 'checksum']
     __my_additional_indexes__ = [{'index_elements': ('healthcare_provider_taxonomy_code', 'npi',)}, ]
 
-    npi = Column(Integer)
+    npi = Column(BigInteger)
     checksum = Column(Integer)
     healthcare_provider_taxonomy_code = Column(String)
     provider_license_number = Column(String)
@@ -1067,7 +1078,7 @@ class NPIDataOtherIdentifier(Base, JSONOutputMixin):
     )
     __my_index_elements__ = ['npi', 'checksum']
 
-    npi = Column(Integer, primary_key=True)
+    npi = Column(BigInteger, primary_key=True)
     checksum = Column(Integer, primary_key=True)
     other_provider_identifier = Column(String)
     other_provider_identifier_type_code = Column(String)
@@ -1083,7 +1094,7 @@ class NPIDataTaxonomyGroup(Base, JSONOutputMixin):
     )
     __my_index_elements__ = ['npi', 'checksum']
 
-    npi = Column(Integer)
+    npi = Column(BigInteger)
     checksum = Column(Integer)
     healthcare_provider_taxonomy_group = Column(String)
 
@@ -1118,7 +1129,7 @@ class AddressPrototype(Base, JSONOutputMixin):
     def __table_args__(cls):
         return {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True}
 
-    checksum = Column(Integer, primary_key=True)
+    checksum = Column(BigInteger, primary_key=True, autoincrement=False)
     first_line = Column(String)
     second_line  = Column(String)
     city_name = Column(String)
@@ -1215,6 +1226,7 @@ class NPIAddress(AddressPrototype):
             'name': 'geo_idx',
             'where': "type='primary' OR type='secondary'",
         },
+        {'index_elements': ('address_key',), 'name': 'address_key'},
     ]
 
     npi = Column(Integer, primary_key=True)
@@ -1223,6 +1235,7 @@ class NPIAddress(AddressPrototype):
     plans_network_array = Column(ARRAY(Integer), nullable=False, server_default="{0}")
     procedures_array = Column(ARRAY(Integer), nullable=False, server_default="{0}")
     medications_array = Column(ARRAY(Integer), nullable=False, server_default="{0}")
+    address_key = Column(PG_UUID(as_uuid=True))
 
     # NPI	Provider Secondary Practice Location Address- Address Line 1	Provider Secondary Practice Location Address-  Address Line 2	Provider Secondary Practice Location Address - City Name	Provider Secondary Practice Location Address - State Name	Provider Secondary Practice Location Address - Postal Code	Provider Secondary Practice Location Address - Country Code (If outside U.S.)	Provider Secondary Practice Location Address - Telephone Number	Provider Secondary Practice Location Address - Telephone Extension	Provider Practice Location Address - Fax Number
 
@@ -1267,6 +1280,7 @@ class MRFAddress(AddressPrototype):
             "using": "gin",
             "name": "source_issuer_names",
         },
+        {"index_elements": ("address_key",), "name": "address_key"},
     ]
 
     npi = Column(Integer, primary_key=True)
@@ -1279,6 +1293,7 @@ class MRFAddress(AddressPrototype):
     source_issuer_ids = Column(ARRAY(Integer), nullable=False, server_default=text("'{}'::integer[]"))
     source_issuer_names = Column(ARRAY(String), nullable=False, server_default=text("'{}'::varchar[]"))
     source_urls = Column(ARRAY(String), nullable=False, server_default=text("'{}'::varchar[]"))
+    address_key = Column(PG_UUID(as_uuid=True))
 
 
 class MRFAddressEvidence(Base, JSONOutputMixin):
@@ -1306,16 +1321,20 @@ class MRFAddressEvidence(Base, JSONOutputMixin):
             "index_elements": ("checksum",),
             "name": "checksum",
         },
+        {
+            "index_elements": ("address_key",),
+            "name": "address_key",
+        },
     ]
 
-    evidence_checksum = Column(Integer, nullable=False)
-    npi = Column(Integer, nullable=False)
+    evidence_checksum = Column(BigInteger, nullable=False)
+    npi = Column(BigInteger, nullable=False)
     type = Column(String, nullable=False)
-    checksum = Column(Integer, nullable=False)
+    checksum = Column(BigInteger, nullable=False)
     issuer_id = Column(Integer)
     issuer_name = Column(String)
     year = Column(Integer)
-    checksum_network = Column(Integer)
+    checksum_network = Column(BigInteger)
     network_tier = Column(String)
     import_id = Column(String, nullable=False)
     import_date = Column(DATE)
@@ -1331,6 +1350,7 @@ class MRFAddressEvidence(Base, JSONOutputMixin):
     country_code = Column(String)
     telephone_number = Column(String)
     observed_at = Column(TIMESTAMP)
+    address_key = Column(PG_UUID(as_uuid=True))
 
 
 class NPIPhoneStaffing(Base, JSONOutputMixin):
@@ -3343,6 +3363,7 @@ class ProviderEnrollmentFFS(ProviderEnrollmentBase):
     __main_table__ = __tablename__
     __my_additional_indexes__ = ProviderEnrollmentBase.__my_additional_indexes__ + [
         {"index_elements": ("pecos_asct_cntl_id",), "name": "pecos_asct_cntl_id"},
+        {"index_elements": ("address_key",), "name": "address_key"},
     ]
 
     pecos_asct_cntl_id = Column(String(64))
@@ -3350,6 +3371,7 @@ class ProviderEnrollmentFFS(ProviderEnrollmentBase):
     middle_name = Column(String)
     last_name = Column(String)
     org_name = Column(String)
+    address_key = Column(PG_UUID(as_uuid=True))
 
 
 class ProviderEnrollmentFFSLinkedBase(Base, JSONOutputMixin):
@@ -3398,11 +3420,13 @@ class ProviderEnrollmentFFSAddress(ProviderEnrollmentFFSLinkedBase):
     __my_additional_indexes__ = ProviderEnrollmentFFSLinkedBase.__my_additional_indexes__ + [
         {"index_elements": ("state", "zip_code"), "name": "state_zip"},
         {"index_elements": ("zip_code",), "name": "zip_code"},
+        {"index_elements": ("address_key",), "name": "address_key"},
     ]
 
     city = Column(String)
     state = Column(String(2))
     zip_code = Column(String(12))
+    address_key = Column(PG_UUID(as_uuid=True))
 
 
 class ProviderEnrollmentFFSSecondarySpecialty(ProviderEnrollmentFFSLinkedBase):
@@ -3812,10 +3836,11 @@ class DoctorClinicianAddress(Base, JSONOutputMixin):
         {"index_elements": ("zip_code",), "name": "zip"},
         {"index_elements": ("state", "city"), "name": "state_city"},
         {"index_elements": ("provider_type",), "name": "provider_type"},
+        {"index_elements": ("address_key",), "name": "address_key"},
     ]
 
     npi = Column(BigInteger, nullable=False)
-    address_checksum = Column(Integer, nullable=False)
+    address_checksum = Column(BigInteger, nullable=False)
     address_line1 = Column(String(256))
     address_line2 = Column(String(256))
     city = Column(String(128))
@@ -3825,6 +3850,7 @@ class DoctorClinicianAddress(Base, JSONOutputMixin):
     latitude = Column(Float)
     longitude = Column(Float)
     updated_at = Column(DateTime)
+    address_key = Column(PG_UUID(as_uuid=True))
 
 
 class FacilityAnchor(Base, JSONOutputMixin):
@@ -3838,6 +3864,7 @@ class FacilityAnchor(Base, JSONOutputMixin):
     __my_additional_indexes__ = [
         {"index_elements": ("facility_type", "latitude", "longitude"), "name": "type_geo"},
         {"index_elements": ("state", "zip_code", "facility_type"), "name": "state_zip_type"},
+        {"index_elements": ("address_key",), "name": "address_key"},
     ]
 
     id = Column(String(128), nullable=False)
@@ -3851,6 +3878,7 @@ class FacilityAnchor(Base, JSONOutputMixin):
     longitude = Column(Float)
     source_dataset = Column(String(64), nullable=False)
     updated_at = Column(DateTime)
+    address_key = Column(PG_UUID(as_uuid=True))
 
 
 class EntityAddressUnified(Base, JSONOutputMixin):
@@ -3882,6 +3910,7 @@ class EntityAddressUnified(Base, JSONOutputMixin):
             "name": "geo_idx",
             "where": "type='primary' OR type='secondary' OR type='practice' OR type='site'",
         },
+        {"index_elements": ("address_key",), "name": "address_key"},
     ]
 
     entity_type = Column(String(64), nullable=False)
@@ -3897,7 +3926,7 @@ class EntityAddressUnified(Base, JSONOutputMixin):
     address_sources = Column(ARRAY(String), nullable=False, server_default=text("'{}'::varchar[]"))
     source_record_ids = Column(ARRAY(String), nullable=False, server_default=text("'{}'::varchar[]"))
 
-    checksum = Column(Integer, nullable=False)
+    checksum = Column(BigInteger, nullable=False)
     type = Column(String(32), nullable=False)
     taxonomy_array = Column(ARRAY(Integer), nullable=False, server_default="{0}")
     plans_network_array = Column(ARRAY(Integer), nullable=False, server_default="{0}")
@@ -3918,6 +3947,7 @@ class EntityAddressUnified(Base, JSONOutputMixin):
     date_added = Column(DATE)
     place_id = Column(String)
     updated_at = Column(DateTime)
+    address_key = Column(PG_UUID(as_uuid=True))
 
 
 class PharmacyEconomicsSummary(Base, JSONOutputMixin):
@@ -3946,3 +3976,34 @@ class PharmacyEconomicsSummary(Base, JSONOutputMixin):
     medicaid_dispensing_fee = Column(Float)
     estimated_gross_margin = Column(Float)
     updated_at = Column(DateTime)
+
+
+def _move_address_key_column_to_end(model) -> None:
+    table = getattr(model, "__table__", None)
+    if table is None or "address_key" not in table.c:
+        return
+    if list(table.c.keys())[-1] == "address_key":
+        return
+    column = table.c.address_key
+    table._columns.remove(column)
+    table.append_column(column)
+
+
+for _address_key_model in (
+    NPIAddress,
+    MRFAddress,
+    MRFAddressEvidence,
+    DoctorClinicianAddress,
+    ProviderEnrollmentFFS,
+    ProviderEnrollmentFFSAddress,
+    FacilityAnchor,
+    PharmacyLicenseRecordStage,
+    PharmacyLicenseRecord,
+    PharmacyLicenseRecordHistory,
+    PartDPharmacyActivity,
+    PartDPharmacyActivityStage,
+    EntityAddressUnified,
+):
+    _move_address_key_column_to_end(_address_key_model)
+
+del _address_key_model

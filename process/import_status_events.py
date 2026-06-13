@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import json
 import os
 import time
@@ -12,6 +13,28 @@ from typing import Any
 
 ENGINE_NAME = "healthcare-mrf-api"
 TERMINAL_STATUSES = {"succeeded", "failed", "canceled", "cancelled", "dead_letter"}
+_TIMESTAMP_KEYS = ("created_at", "started_at", "finished_at", "heartbeat_at")
+
+
+def isoformat_utc(value: Any) -> Any:
+    """Serialize a naive-UTC datetime (or ISO string) as timezone-aware UTC ISO-8601.
+
+    DB columns store naive UTC; consumers (the import-control brain and the UI)
+    need an explicit offset, so attach UTC at the serialization boundary.
+    """
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return value
+        try:
+            value = dt.datetime.fromisoformat(raw[:-1] + "+00:00" if raw.endswith("Z") else raw)
+        except ValueError:
+            return value
+    if isinstance(value, dt.datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=dt.UTC)
+        return value.astimezone(dt.UTC).isoformat()
+    return value
 
 _queue: asyncio.Queue[dict[str, Any]] | None = None
 _worker: asyncio.Task | None = None
@@ -64,11 +87,15 @@ async def flush_status_events(timeout_seconds: float = 2.0) -> None:
 
 
 def _event_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    return {
+    event = {
         "engine": ENGINE_NAME,
         "node_id": os.getenv("HLTHPRT_IMPORT_NODE_ID"),
         **payload,
     }
+    for key in _TIMESTAMP_KEYS:
+        if event.get(key) is not None:
+            event[key] = isoformat_utc(event[key])
+    return event
 
 
 def _ensure_queue(loop: asyncio.AbstractEventLoop) -> asyncio.Queue[dict[str, Any]]:

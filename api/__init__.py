@@ -3,6 +3,7 @@
 from sanic.blueprints import Blueprint
 
 from api.control import blueprint as control_blueprint
+from api.metrics import blueprint as metrics_blueprint
 from api.endpoint.formulary import blueprint as v1_formulary
 from api.endpoint.coverage import blueprint as v1_coverage
 from api.endpoint.codes import blueprint as v1_codes
@@ -25,6 +26,7 @@ from db.connection import db
 def init_api(api):
     db.init_app(api)
     api.blueprint(control_blueprint)
+    api.blueprint(metrics_blueprint)
     api_bluenprint = Blueprint.group(
         [
             v1_healthcheck,

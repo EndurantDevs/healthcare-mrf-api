@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import subprocess
 import sys
-import hashlib
-import json
 import ssl
 import urllib.error
 import urllib.parse
@@ -49,6 +49,7 @@ _START_WORKERS: tuple[WorkerSpec, ...] = (
     WorkerSpec("arq:FacilityAnchors", "process.FacilityAnchors", ("facility-anchors",)),
     WorkerSpec("arq:PharmacyEconomics", "process.PharmacyEconomics", ("pharmacy-economics",)),
     WorkerSpec("arq:EntityAddressUnified", "process.EntityAddressUnified", ("entity-address-unified",)),
+    WorkerSpec("arq:AddressArchive", "process.AddressArchive", ("address-archive-v2-migrate",)),
 )
 
 _FINISH_WORKERS: tuple[WorkerSpec, ...] = (
@@ -160,7 +161,7 @@ def _worker_state(spec: WorkerSpec, payload: dict[str, Any] | None = None) -> di
         return _kubernetes_worker_state(spec, payload)
 
     pid = _read_pid(_pid_path(spec))
-    running = _pid_running(pid) and _pid_matches_current_node(pid)
+    running = _pid_running(pid) and _pid_matches_spec(pid, spec)
     if pid and not running:
         _remove_stale_pid(spec)
     if not running:
@@ -323,6 +324,22 @@ def _worker_job_manifest(spec: WorkerSpec, payload: dict[str, Any], image: str) 
     run_id = str(payload.get("run_id") or "").strip()
     if run_id:
         labels["healthporta.com/run-id-hash"] = _label_hash(run_id)
+    job_spec: dict[str, Any] = {
+        "backoffLimit": int(os.getenv("HLTHPRT_WORKER_JOB_BACKOFF_LIMIT", "0")),
+        "ttlSecondsAfterFinished": int(os.getenv("HLTHPRT_WORKER_JOB_TTL_SECONDS", "86400")),
+        "template": {
+            "metadata": {"labels": labels},
+            "spec": pod_spec,
+        },
+    }
+    active_deadline_seconds = int(os.getenv("HLTHPRT_WORKER_JOB_ACTIVE_DEADLINE_SECONDS", "0") or "0")
+    if active_deadline_seconds > 0:
+        job_spec["activeDeadlineSeconds"] = active_deadline_seconds
+    replicas = _worker_start_replicas(spec)
+    if replicas > 1:
+        job_spec["parallelism"] = replicas
+        job_spec["completions"] = replicas
+
     return {
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -336,14 +353,7 @@ def _worker_job_manifest(spec: WorkerSpec, payload: dict[str, Any], image: str) 
                 "healthporta.com/run-id": run_id,
             },
         },
-        "spec": {
-            "backoffLimit": int(os.getenv("HLTHPRT_WORKER_JOB_BACKOFF_LIMIT", "0")),
-            "ttlSecondsAfterFinished": int(os.getenv("HLTHPRT_WORKER_JOB_TTL_SECONDS", "86400")),
-            "template": {
-                "metadata": {"labels": labels},
-                "spec": pod_spec,
-            },
-        },
+        "spec": job_spec,
     }
 
 
@@ -479,6 +489,20 @@ def _csv(raw: str) -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+def _worker_start_replicas(spec: WorkerSpec) -> int:
+    if spec.role != "start":
+        return 1
+    for item in _csv(os.getenv("HLTHPRT_WORKER_JOB_START_REPLICAS", "")):
+        name, separator, raw_count = item.partition("=")
+        if not separator or name.strip() not in {spec.worker_class, spec.queue}:
+            continue
+        try:
+            return max(1, int(raw_count.strip()))
+        except ValueError:
+            return 1
+    return 1
+
+
 def _read_pid(path: Path) -> int | None:
     try:
         raw = path.read_text(encoding="utf-8").strip()
@@ -502,6 +526,19 @@ def _pid_running(pid: int | None) -> bool:
     return True
 
 
+def _pid_matches_spec(pid: int | None, spec: WorkerSpec) -> bool:
+    if not pid:
+        return False
+    try:
+        output = subprocess.check_output(["ps", "eww", "-p", str(pid), "-o", "command="], text=True)
+    except Exception:  # pylint: disable=broad-exception-caught
+        try:
+            output = subprocess.check_output(["ps", "-p", str(pid), "-o", "command="], text=True)
+        except Exception:  # pylint: disable=broad-exception-caught
+            return True
+    return _process_matches_worker_spec(output, spec)
+
+
 def _pid_matches_current_node(pid: int | None) -> bool:
     if not pid:
         return False
@@ -523,19 +560,28 @@ def _find_running_pid(spec: WorkerSpec) -> int | None:
             output = subprocess.check_output(["ps", "-axo", "pid=,command="], text=True)
         except Exception:  # pylint: disable=broad-exception-caught
             return None
-    needle = f"main.py worker {spec.worker_class}"
     for line in output.splitlines():
         text = line.strip()
-        if needle not in text or " rg " in text:
+        if " rg " in text or not _process_matches_worker_spec(text, spec):
             continue
         raw_pid = text.split(None, 1)[0]
         try:
             pid = int(raw_pid)
         except ValueError:
             continue
-        if pid != os.getpid() and _matches_current_node(text):
+        if pid != os.getpid():
             return pid
     return None
+
+
+def _process_matches_worker_spec(process_text: str, spec: WorkerSpec) -> bool:
+    if not _matches_current_node(process_text):
+        return False
+    parts = process_text.split()
+    for index, part in enumerate(parts[:-2]):
+        if part.endswith("main.py") and parts[index + 1] == "worker" and parts[index + 2] == spec.worker_class:
+            return True
+    return False
 
 
 def _matches_current_node(process_text: str) -> bool:

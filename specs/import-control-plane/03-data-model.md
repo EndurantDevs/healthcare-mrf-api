@@ -46,6 +46,36 @@ Indexes:
 
 Legacy run/log tables remain readable during rollout.
 
+### PTG2 Engine Identity Tables
+
+The engine owns PTG2 content identities. The control plane must not derive these
+from its catalog hashes after the fact; it stores explicit nullable link columns
+populated from TOC preview metadata and terminal run metrics.
+
+- `ptg2_plan.plan_hash`: content identity for plan fields.
+- `ptg2_plan_month.plan_month_id`: `(snapshot_id, plan_hash, import_month)`.
+- `ptg2_source_catalog.source_catalog_id`: TOC catalog entry identity.
+- `ptg2_source_identity.source_identity_hash`: `(source_type, canonical_url)`.
+- `ptg2_source_file_version.source_file_version_id`: observed file version
+  identity based on source identity, content hashes, ETag, length, and
+  Last-Modified.
+- `ptg2_snapshot.snapshot_id`: published snapshot.
+- `ptg2_current_source_snapshot.source_key -> snapshot_id`: current snapshot
+  pointer for a source-scoped PTG import.
+- `ptg2_current_plan_source(plan_id, market_type, source_key, snapshot_id)`:
+  current source-scoped lookup for a plan.
+
+Engine `import_run.metrics` for PTG terminal runs should include:
+
+- `import_run_id`
+- `snapshot_id`
+- `source_key`
+- `import_month`
+- `files_attempted`, `files_processed`, `files_failed`, `files_skipped`
+- `serving_rates`, `rate_count`
+- `source_file_versions[]` with `canonical_url`,
+  `engine_source_identity_hash`, and `engine_source_file_version_id`
+
 ## Control Schema: `hp_import_control`
 
 ### `import_node`
@@ -152,6 +182,7 @@ Stable group plan identity.
 - `plan_name_current`
 - `issuer_name`
 - `sponsor_name`
+- `engine_plan_hash null`
 - `reporting_entity_type`
 - `states text[]`
 - `first_seen`
@@ -183,6 +214,9 @@ Stable file URL identity.
 - `source_file_id primary key`
 - `canonical_url unique`
 - `domain`
+- `content_version`
+- `engine_source_identity_hash null`
+- `engine_source_file_version_id null`
 - `content_length`
 - `last_modified`
 - `etag`
@@ -203,6 +237,7 @@ Plan-to-file mapping.
 - `source_id`
 - `content_version`
 - `file_domain`
+- `engine_source_catalog_id null`
 - `first_seen`
 - `last_seen`
 - primary key `(discovered_plan_id, source_file_id, content_version)`
@@ -253,6 +288,8 @@ Shared file-level execution unit.
 - `engine_run_id`
 - `snapshot_id`
 - `source_key`
+- `engine_source_identity_hash null`
+- `engine_source_file_version_id null`
 - `created_at`
 - `started_at`
 - `finished_at`

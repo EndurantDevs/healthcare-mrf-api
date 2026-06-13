@@ -133,6 +133,8 @@ async def test_process_data_test_mode_imports_nppes_zip(monkeypatch, tmp_path, n
     monkeypatch.setattr(npi_module, "unzip", fake_unzip)
     monkeypatch.setattr(npi_module, "ensure_database", AsyncMock())
     monkeypatch.setattr(npi_module, "_ensure_required_extensions", AsyncMock())
+    monkeypatch.setattr(npi_module, "_assert_nucc_ready", AsyncMock())
+    monkeypatch.setattr(npi_module, "_assert_nppes_canonical_ready", AsyncMock())
     monkeypatch.setattr(npi_module, "save_npi_data", fake_save)
 
     ctx = {

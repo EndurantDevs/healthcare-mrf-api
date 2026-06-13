@@ -38,6 +38,7 @@ from db.models import (
     ProviderEnrollmentSNF,
     db,
 )
+from process.ext.address_canon import resolve_into_archive, source_enabled, stamp_address_keys
 from process.ext.utils import (
     download_it,
     download_it_and_save,
@@ -1600,6 +1601,68 @@ async def shutdown(ctx):  # pragma: no cover
                 "aborting provider-enrichment publish."
             )
 
+    address_stats = {}
+    if source_enabled("provider_enrichment") or source_enabled("provider_enrollment_ffs"):
+        ffs_stage = tables[ProviderEnrollmentFFS.__main_table__]
+        ffs_address_stage = tables[ProviderEnrollmentFFSAddress.__main_table__]
+        await stamp_address_keys(
+            ffs_stage.__tablename__,
+            {
+                "first_line": "address_line_1",
+                "second_line": "address_line_2",
+                "city": "city",
+                "state": "state",
+                "zip": "zip_code",
+                "country": "'US'",
+            },
+            schema=db_schema,
+        )
+        address_stats["provider_enrollment_ffs"] = (
+            await resolve_into_archive(
+                ffs_stage.__tablename__,
+                {
+                    "first_line": "address_line_1",
+                    "second_line": "address_line_2",
+                    "city": "city",
+                    "state": "state",
+                    "zip": "zip_code",
+                    "country": "'US'",
+                },
+                source_bit=4,
+                priority=2,
+                schema=db_schema,
+            )
+        ).__dict__
+        await stamp_address_keys(
+            ffs_address_stage.__tablename__,
+            {
+                "first_line": "NULL",
+                "second_line": "NULL",
+                "city": "city",
+                "state": "state",
+                "zip": "zip_code",
+                "country": "'US'",
+            },
+            schema=db_schema,
+        )
+        address_stats["provider_enrollment_ffs_address"] = (
+            await resolve_into_archive(
+                ffs_address_stage.__tablename__,
+                {
+                    "first_line": "NULL",
+                    "second_line": "NULL",
+                    "city": "city",
+                    "state": "state",
+                    "zip": "zip_code",
+                    "country": "'US'",
+                },
+                source_bit=4,
+                priority=2,
+                schema=db_schema,
+            )
+        ).__dict__
+        print(f"Provider-enrichment canonical address resolve complete: {address_stats}")
+
     await _materialize_summary(
         import_date,
         db_schema,
@@ -1676,6 +1739,7 @@ async def shutdown(ctx):  # pragma: no cover
             "datasets": len(context.get("audit", {}).get("dataset_stats", {}) or {}),
             "rows_accepted": int(context.get("audit", {}).get("rows_accepted") or 0),
             "rows_dropped_missing_npi": int(context.get("audit", {}).get("rows_dropped_missing_npi") or 0),
+            **({"address_resolve": address_stats} if address_stats else {}),
         },
     )
     print_time_info(context.get("start"))

@@ -4,9 +4,11 @@
 import asyncio
 import datetime
 import glob
+import hashlib
 import json
 import logging
 import os
+import re
 import sys
 import tempfile
 import zipfile
@@ -18,10 +20,9 @@ import pylightxl as xl
 from aiocsv import AsyncDictReader
 from aiofile import async_open
 from arq import create_pool
-from async_unzip.unzipper import unzip
 from asyncpg import DuplicateTableError
 from dateutil.parser import parse as parse_date
-from sqlalchemy import func, literal, or_, select
+from sqlalchemy import func, literal, or_, select, text
 from sqlalchemy.exc import IntegrityError, ProgrammingError
 
 from db.models import (ImportHistory, ImportLog, Issuer, NPIAddress,
@@ -30,6 +31,14 @@ from db.models import (ImportHistory, ImportLog, Issuer, NPIAddress,
                        PlanDrugRaw, PlanDrugStats, PlanDrugTierStats,
                        PlanFormulary, PlanNetworkTierRaw, PlanNPIRaw,
                        PlanTransparency, db)
+from process.ext.address_canon import (
+    address_key_v1,
+    propagate_child_address_keys,
+    resolve_into_archive,
+    source_enabled,
+    stamp_address_keys,
+)
+from process.ext.archive import unzip
 from process.ext.utils import (download_it_and_save, ensure_database,
                                flush_error_log, get_import_schema, log_error,
                                make_class, my_init_db, print_time_info,
@@ -55,6 +64,17 @@ PLAN_ID_MAX_LENGTH = getattr(Plan.__table__.c.plan_id.type, "length", 14)
 logger = logging.getLogger(__name__)
 MRF_QUEUE_NAME = "arq:MRF"
 MRF_FINISH_QUEUE_NAME = "arq:MRF_finish"
+_POSTGRES_SETTING_RE = re.compile(r"^\d+(?:\.\d+)?\s*[A-Za-z]*$")
+_MRF_ADDRESS_SUMMARY_DEFERRED_INDEX_NAMES = {
+    "address_sources",
+    "source_issuer_ids",
+    "source_issuer_names",
+}
+
+
+def _mrf_url_job_id(kind: str, scope: str, url: str) -> str:
+    digest = hashlib.sha256(f"{kind}\0{scope}\0{url}".encode("utf-8")).hexdigest()[:32]
+    return f"mrf:{kind}:{scope}:{digest}"
 
 
 def is_test_mode(ctx: dict) -> bool:
@@ -67,6 +87,21 @@ def _truthy(value, truthy=("yes", "y", "true")) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in truthy
     return bool(value)
+
+
+def _transparency_zip_path(tmpdirname: str, file_idx: int, file: dict) -> str:
+    year = re.sub(r"[^0-9A-Za-z_]+", "_", str(file.get("year") or file_idx)).strip("_")
+    if not year:
+        year = str(file_idx)
+    return str(PurePath(str(tmpdirname), f"transparency_{file_idx}_{year}.zip"))
+
+
+def _postgres_setting_value(env_name: str, default: str) -> str:
+    value = os.environ.get(env_name, default)
+    value = str(value if value is not None else default).strip()
+    if not value or not _POSTGRES_SETTING_RE.fullmatch(value):
+        raise ValueError(f"{env_name} must be a PostgreSQL numeric setting, e.g. '512MB' or '60min'")
+    return value
 
 
 def _clean_name_part(value):
@@ -132,7 +167,7 @@ def _parse_timestamp(value):
 
 
 def _create_index_sql(table_name: str, index: dict, db_schema: str) -> str:
-    index_name = index.get("name", "_".join(index.get("index_elements")))
+    index_name = _index_name(index)
     using = f"USING {index.get('using')} " if index.get("using") else ""
     unique = "UNIQUE " if index.get("unique") else ""
     where = f" WHERE {index.get('where')}" if index.get("where") else ""
@@ -140,6 +175,26 @@ def _create_index_sql(table_name: str, index: dict, db_schema: str) -> str:
         f"CREATE {unique}INDEX IF NOT EXISTS {table_name}_idx_{index_name} "
         f"ON {db_schema}.{table_name} {using}({', '.join(index.get('index_elements'))}){where};"
     )
+
+
+def _index_name(index: dict) -> str:
+    return index.get("name", "_".join(index.get("index_elements")))
+
+
+def _drop_index_sql(table_name: str, index: dict, db_schema: str) -> str:
+    return f"DROP INDEX IF EXISTS {db_schema}.{table_name}_idx_{_index_name(index)};"
+
+
+def _mrf_address_summary_deferred_indexes(address_cls) -> list[dict]:
+    disabled_values = {"0", "false", "no", "off"}
+    raw = os.getenv("HLTHPRT_MRF_ADDRESS_SUMMARY_DEFER_SOURCE_INDEXES", "true").strip().lower()
+    if raw in disabled_values:
+        return []
+    return [
+        index
+        for index in getattr(address_cls, "__my_additional_indexes__", []) or []
+        if _index_name(index) in _MRF_ADDRESS_SUMMARY_DEFERRED_INDEX_NAMES
+    ]
 
 
 async def _create_named_indexes(stage_cls, db_schema: str) -> None:
@@ -328,6 +383,14 @@ def _build_mrf_address_rows(res, network_tiers, import_id, source_url, last_upda
         normalized = _normalize_marketplace_address_entry(address)
         if not normalized:
             continue
+        computed_address_key = address_key_v1(
+            normalized["first_line"],
+            normalized["second_line"],
+            normalized["city_name"],
+            normalized["state_name"],
+            normalized["postal_code"],
+            normalized["country_code"] or "US",
+        )
         address_key = (npi, address_type, normalized["checksum"])
         address_record_id_values = []
         issuer_ids = []
@@ -384,6 +447,7 @@ def _build_mrf_address_rows(res, network_tiers, import_id, source_url, last_upda
                 "country_code": normalized["country_code"],
                 "telephone_number": normalized["telephone_number"],
                 "observed_at": last_updated_on,
+                "address_key": computed_address_key,
             }
             address_record_id_values.append(source_record_id)
             issuer_ids.append(issuer_id)
@@ -408,6 +472,7 @@ def _build_mrf_address_rows(res, network_tiers, import_id, source_url, last_upda
             "telephone_number": normalized["telephone_number"],
             "formatted_address": normalized["formatted_address"],
             "date_added": last_updated_on.date() if last_updated_on else None,
+            "address_key": computed_address_key,
             "source_count": len(set(address_record_id_values)),
             "address_sources": sorted(set(sources)),
             "source_record_ids": sorted(set(address_record_id_values)),
@@ -424,8 +489,10 @@ def _build_mrf_address_rows(res, network_tiers, import_id, source_url, last_upda
 async def _refresh_mrf_address_summary(import_date: str, db_schema: str) -> None:
     address_cls = make_class(MRFAddress, import_date, schema_override=db_schema)
     evidence_cls = make_class(MRFAddressEvidence, import_date, schema_override=db_schema)
-    await db.status(
-        f"""
+    deferred_indexes = _mrf_address_summary_deferred_indexes(address_cls)
+    work_mem = _postgres_setting_value("HLTHPRT_MRF_ADDRESS_SUMMARY_WORK_MEM", "1GB")
+    statement_timeout = os.environ.get("HLTHPRT_MRF_ADDRESS_SUMMARY_STATEMENT_TIMEOUT")
+    update_sql = f"""
         UPDATE {db_schema}.{address_cls.__tablename__} AS a
            SET address_sources = COALESCE(src.address_sources, ARRAY[]::varchar[]),
                source_record_ids = COALESCE(src.source_record_ids, ARRAY[]::varchar[]),
@@ -455,7 +522,19 @@ async def _refresh_mrf_address_summary(import_date: str, db_schema: str) -> None
            AND a.type = src.type
            AND a.checksum = src.checksum;
         """
-    )
+    async with db.transaction() as session:
+        await session.execute(text(f"SET LOCAL work_mem = '{work_mem}';"))
+        if statement_timeout is not None:
+            timeout = _postgres_setting_value("HLTHPRT_MRF_ADDRESS_SUMMARY_STATEMENT_TIMEOUT", "0")
+            await session.execute(text(f"SET LOCAL statement_timeout = '{timeout}';"))
+        for index in deferred_indexes:
+            await session.execute(text(_drop_index_sql(address_cls.__tablename__, index, db_schema)))
+        await session.execute(text(f"ANALYZE {db_schema}.{evidence_cls.__tablename__};"))
+        await session.execute(text(update_sql))
+        for index in deferred_indexes:
+            await session.execute(text(_create_index_sql(address_cls.__tablename__, index, db_schema)))
+        if deferred_indexes:
+            await session.execute(text(f"ANALYZE {db_schema}.{address_cls.__tablename__};"))
 
 
 async def _prepare_import_tables(import_date: str, test_mode: bool) -> None:
@@ -873,23 +952,22 @@ async def process_provider(ctx, task):
     myplan_networktier = make_class(PlanNetworkTierRaw, import_date, schema_override=db_schema)
     mymrfaddress = make_class(MRFAddress, import_date, schema_override=db_schema)
     mymrfaddressevidence = make_class(MRFAddressEvidence, import_date, schema_override=db_schema)
-    issuer_lookup = {}
-    if task.get("issuer_array"):
-        issuer_rows = await (
-            db.select(myissuer.issuer_id, myissuer.issuer_name, myissuer.issuer_marketing_name, myissuer.mrf_url)
-            .where(myissuer.issuer_id.in_(task["issuer_array"]))
-            .all()
+    issuer_rows = await db.select(
+        myissuer.issuer_id,
+        myissuer.issuer_name,
+        myissuer.issuer_marketing_name,
+        myissuer.mrf_url,
+    ).all()
+    issuer_lookup = {
+        int(row.issuer_id): _issuer_display_name(
+            row.issuer_id,
+            issuer_name=row.issuer_name,
+            issuer_marketing_name=row.issuer_marketing_name,
+            issuer_url=row.mrf_url,
         )
-        issuer_lookup = {
-            int(row.issuer_id): _issuer_display_name(
-                row.issuer_id,
-                issuer_name=row.issuer_name,
-                issuer_marketing_name=row.issuer_marketing_name,
-                issuer_url=row.mrf_url,
-            )
-            for row in issuer_rows
-            if row.issuer_id is not None
-        }
+        for row in issuer_rows
+        if row.issuer_id is not None
+    }
 
     print("Starting Provider file data download: ", task.get("url"))
     with tempfile.TemporaryDirectory() as tmpdirname:
@@ -1171,12 +1249,18 @@ async def _refresh_plan_drug_statistics(plan_ids, import_date, db_schema):
     tier_table = tier_stats_cls.__table__
     tier_label = func.coalesce(plan_drug_table.c.drug_tier, literal("UNKNOWN"))
 
-    for chunk in _chunked(plan_ids):
-        delete_stats_stmt = db.delete(stats_table).where(stats_table.c.plan_id.in_(chunk))
-        await delete_stats_stmt.status()
-        delete_tier_stmt = db.delete(tier_table).where(tier_table.c.plan_id.in_(chunk))
-        await delete_tier_stmt.status()
+    stats_columns = [
+        "total_drugs",
+        "auth_required",
+        "auth_not_required",
+        "step_required",
+        "step_not_required",
+        "quantity_limit",
+        "quantity_no_limit",
+        "last_updated_on",
+    ]
 
+    for chunk in _chunked(plan_ids):
         stats_select = (
             select(
                 plan_drug_table.c.plan_id.label("plan_id"),
@@ -1231,6 +1315,13 @@ async def _refresh_plan_drug_statistics(plan_ids, import_date, db_schema):
                 stats_select,
             )
         )
+        stats_insert = stats_insert.on_conflict_do_update(
+            index_elements=[stats_table.c.plan_id],
+            set_={
+                column_name: getattr(stats_insert.excluded, column_name)
+                for column_name in stats_columns
+            },
+        )
         await stats_insert.status()
 
         tier_select = (
@@ -1252,6 +1343,10 @@ async def _refresh_plan_drug_statistics(plan_ids, import_date, db_schema):
                 ],
                 tier_select,
             )
+        )
+        tier_insert = tier_insert.on_conflict_do_update(
+            index_elements=[tier_table.c.plan_id, tier_table.c.drug_tier],
+            set_={"drug_count": tier_insert.excluded.drug_count},
         )
         await tier_insert.status()
 
@@ -1467,6 +1562,7 @@ async def process_json_index(ctx, task):
     if "context" in task:
         ctx["context"] = task["context"]
     import_date = ctx["context"]["import_date"]
+    job_scope = str(ctx["context"].get("control_run_id") or import_date)
     test_mode = is_test_mode(ctx)
     await ensure_database(test_mode)
     db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
@@ -1551,16 +1647,22 @@ async def process_json_index(ctx, task):
                 )
                 return
 
+        seen_provider_urls = set()
         async with async_open(tmp_filename, "rb") as afp:
             try:
                 async for url in ijson.items(
                     afp, "provider_urls.item", use_float=True
                 ):  # , 'formulary_urls', 'provider_urls'
+                    url = str(url).strip()
+                    if not url or url in seen_provider_urls:
+                        continue
+                    seen_provider_urls.add(url)
                     print(f"Provider URL: {url}")
                     await redis.enqueue_job(
                         "process_provider",
                         {"url": url, "issuer_array": issuer_array, "context": ctx["context"]},
                         _queue_name=MRF_QUEUE_NAME,
+                        _job_id=_mrf_url_job_id("provider", job_scope, url),
                     )
                     # break
                     enqueued_providers += 1
@@ -1861,8 +1963,7 @@ async def init_file(ctx, task=None):
         for file_idx, file in enumerate(transparent_files):
             if test_mode and file_idx >= 1:
                 break
-            p = "transp.xlsx"
-            tmp_filename = str(PurePath(str(tmpdirname), p + ".zip"))
+            tmp_filename = _transparency_zip_path(tmpdirname, file_idx, file)
             await download_it_and_save(file["url"], tmp_filename)
 
             try:
@@ -2127,6 +2228,47 @@ async def shutdown(ctx, task):
             sys.exit(1)
 
     await _refresh_mrf_address_summary(import_date, db_schema)
+    address_stats = None
+    if source_enabled("mrf"):
+        mrf_address_stage = make_class(MRFAddress, import_date, schema_override=db_schema)
+        mrf_evidence_stage = make_class(MRFAddressEvidence, import_date, schema_override=db_schema)
+        address_fields = {
+            "first_line": "first_line",
+            "second_line": "second_line",
+            "city": "city_name",
+            "state": "state_name",
+            "zip": "postal_code",
+            "country": "COALESCE(NULLIF(country_code, ''), 'US')",
+        }
+        repair_existing_address_keys = _truthy(
+            os.environ.get("HLTHPRT_ADDRESS_CANON_REPAIR_EXISTING"),
+            ("yes", "y", "true", "1"),
+        )
+        await stamp_address_keys(
+            mrf_address_stage.__tablename__,
+            address_fields,
+            schema=db_schema,
+            update_existing=repair_existing_address_keys,
+        )
+        await propagate_child_address_keys(
+            mrf_evidence_stage.__tablename__,
+            mrf_address_stage.__tablename__,
+            schema=db_schema,
+        )
+        await stamp_address_keys(
+            mrf_evidence_stage.__tablename__,
+            address_fields,
+            schema=db_schema,
+            update_existing=False,
+        )
+        address_stats = await resolve_into_archive(
+            mrf_address_stage.__tablename__,
+            address_fields,
+            source_bit=16,
+            priority=5,
+            schema=db_schema,
+        )
+        logger.info("MRF canonical address resolve complete: %s", address_stats)
 
     tables = {}
     async with db.transaction():
@@ -2205,13 +2347,21 @@ async def shutdown(ctx, task):
     else:
         summary_rows = await rebuild_plan_search_summary(test_mode=test_mode)
     print("Plan search summary rows: ", summary_rows)
-    print_time_info(ctx["context"]["start"])
+    start_time = ctx.get("context", {}).get("start")
+    if start_time:
+        print_time_info(start_time)
+    else:
+        logger.info("MRF finish context missing start time; skipping elapsed time output")
     await mark_control_run(
         run_id,
         status="succeeded",
         phase_detail="mrf import published",
         progress_message="succeeded",
-        metrics={"plans_count": plans_count, "summary_rows": summary_rows},
+        metrics={
+            "plans_count": plans_count,
+            "summary_rows": summary_rows,
+            **({"address_resolve": address_stats.__dict__} if address_stats else {}),
+        },
         progress={"unit": "phase", "total": 4, "done": 4, "pct": 100, "message": "succeeded", "phase": "mrf import published"},
     )
 

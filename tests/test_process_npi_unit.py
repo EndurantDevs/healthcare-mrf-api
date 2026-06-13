@@ -93,6 +93,69 @@ def test_index_requires_postgis_matches_geo_idx_and_expressions(npi_module):
     assert not npi_module._index_requires_postgis({"name": "taxonomy_array", "index_elements": ("taxonomy_array",)})
 
 
+def test_npi_requires_nucc_defaults_to_full_imports_only(monkeypatch, npi_module):
+    monkeypatch.delenv("HLTHPRT_NPI_REQUIRE_NUCC", raising=False)
+    monkeypatch.delenv("HLTHPRT_NPI_REQUIRE_NUCC_IN_TEST", raising=False)
+
+    assert npi_module._npi_requires_nucc({}) is True
+    assert npi_module._npi_requires_nucc({"test_mode": True}) is False
+
+    monkeypatch.setenv("HLTHPRT_NPI_REQUIRE_NUCC", "0")
+    assert npi_module._npi_requires_nucc({}) is False
+
+    monkeypatch.setenv("HLTHPRT_NPI_REQUIRE_NUCC_IN_TEST", "1")
+    assert npi_module._npi_requires_nucc({"test_mode": True}) is True
+
+
+@pytest.mark.asyncio
+async def test_assert_nucc_ready_rejects_missing_table(monkeypatch, npi_module):
+    async def fake_scalar(_sql):
+        return None
+
+    monkeypatch.setattr(npi_module.db, "scalar", fake_scalar)
+
+    with pytest.raises(npi_module.NPIPrerequisiteError, match="nucc_taxonomy"):
+        await npi_module._assert_nucc_ready("mrf")
+
+
+@pytest.mark.asyncio
+async def test_assert_nucc_ready_rejects_empty_or_unusable_taxonomy(monkeypatch, npi_module):
+    values = iter(["mrf.nucc_taxonomy", 883, 0])
+
+    async def fake_scalar(_sql):
+        return next(values)
+
+    monkeypatch.setattr(npi_module.db, "scalar", fake_scalar)
+
+    with pytest.raises(npi_module.NPIPrerequisiteError, match="pharmacist_rows=0"):
+        await npi_module._assert_nucc_ready("mrf")
+
+
+@pytest.mark.asyncio
+async def test_assert_nucc_ready_accepts_populated_taxonomy(monkeypatch, npi_module):
+    values = iter(["mrf.nucc_taxonomy", 883, 18])
+
+    async def fake_scalar(_sql):
+        return next(values)
+
+    monkeypatch.setattr(npi_module.db, "scalar", fake_scalar)
+
+    await npi_module._assert_nucc_ready("mrf")
+
+
+@pytest.mark.asyncio
+async def test_assert_nppes_canonical_ready_rejects_missing_sql_function(monkeypatch, npi_module):
+    monkeypatch.setenv("HLTHPRT_ADDRESS_CANON_SOURCES", "nppes")
+
+    async def fake_scalar(_sql):
+        return None
+
+    monkeypatch.setattr(npi_module.db, "scalar", fake_scalar)
+
+    with pytest.raises(npi_module.NPIPrerequisiteError, match="addr_key_v1"):
+        await npi_module._assert_nppes_canonical_ready("mrf")
+
+
 @pytest.mark.asyncio
 async def test_rebuild_phone_staffing_skips_missing_target(monkeypatch, npi_module):
     status_mock = AsyncMock()
@@ -113,7 +176,50 @@ async def test_rebuild_phone_staffing_skips_missing_target(monkeypatch, npi_modu
 
 
 @pytest.mark.asyncio
+async def test_rebuild_phone_staffing_rejects_missing_nucc(monkeypatch, npi_module):
+    values = iter(["mrf.npi_phone_staffing_20260603", "mrf.npi_address_20260603", None])
+
+    async def fake_scalar(_sql):
+        return next(values)
+
+    monkeypatch.setattr(npi_module.db, "scalar", fake_scalar)
+    monkeypatch.setattr(npi_module.db, "status", AsyncMock())
+
+    with pytest.raises(npi_module.NPIPrerequisiteError, match="nucc_taxonomy"):
+        await npi_module.rebuild_phone_staffing_table(
+            target_table="npi_phone_staffing_20260603",
+            address_table="npi_address_20260603",
+            schema="mrf",
+        )
+
+
+@pytest.mark.asyncio
+async def test_process_data_rejects_missing_nucc_before_download(monkeypatch, npi_module):
+    monkeypatch.setenv("HLTHPRT_NPPES_DOWNLOAD_URL_DIR", "https://example.com/")
+    monkeypatch.setenv("HLTHPRT_NPPES_DOWNLOAD_URL_FILE", "feed.html")
+    monkeypatch.delenv("HLTHPRT_ADDRESS_CANON_SOURCES", raising=False)
+
+    download_mock = AsyncMock()
+    monkeypatch.setattr(npi_module, "download_it", download_mock)
+    monkeypatch.setattr(npi_module, "ensure_database", AsyncMock())
+    monkeypatch.setattr(npi_module.db, "status", AsyncMock())
+
+    async def fake_scalar(_sql):
+        return None
+
+    monkeypatch.setattr(npi_module.db, "scalar", fake_scalar)
+
+    ctx = {"context": {}, "redis": SimpleNamespace(enqueue_job=AsyncMock()), "import_date": "20251107"}
+
+    with pytest.raises(npi_module.NPIPrerequisiteError, match="nucc_taxonomy"):
+        await npi_module.process_data(ctx)
+
+    download_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_process_npi_chunk_enqueues_basic_payload(monkeypatch, npi_module):
+    monkeypatch.delenv("HLTHPRT_ADDRESS_CANON_SOURCES", raising=False)
 
     fake_redis = SimpleNamespace(enqueue_job=AsyncMock())
     ctx = {"redis": fake_redis, "import_date": "20251104"}
@@ -130,6 +236,7 @@ async def test_process_npi_chunk_enqueues_basic_payload(monkeypatch, npi_module)
     task = {
         "npi_csv_map": npi_csv_map,
         "npi_csv_map_reverse": npi_csv_map_reverse,
+        "taxonomy_int_code_map": {"1223D0001X": 4101},
         "row_list": [row],
     }
 
@@ -145,7 +252,53 @@ async def test_process_npi_chunk_enqueues_basic_payload(monkeypatch, npi_module)
 
 
 @pytest.mark.asyncio
+async def test_process_npi_chunk_precomputes_address_key_when_enabled(monkeypatch, npi_module):
+    monkeypatch.setenv("HLTHPRT_ADDRESS_CANON_SOURCES", "nppes")
+
+    fake_redis = SimpleNamespace(enqueue_job=AsyncMock())
+    ctx = {"redis": fake_redis, "import_date": "20251104"}
+
+    npi_csv_map = {
+        "NPI": "npi",
+        "Entity Type Code": "entity_type_code",
+        "Provider Organization Name (Legal Business Name)": "provider_organization_name",
+    }
+    npi_csv_map_reverse = {value: key for key, value in npi_csv_map.items()}
+
+    row = _build_minimal_row("1215387113")
+
+    await npi_module.process_npi_chunk(
+        ctx,
+        {
+            "npi_csv_map": npi_csv_map,
+            "npi_csv_map_reverse": npi_csv_map_reverse,
+            "row_list": [row],
+        },
+    )
+
+    payload = fake_redis.enqueue_job.await_args.args[1]
+    address_by_type = {entry["type"]: entry for entry in payload["npi_address_list"]}
+    assert address_by_type["primary"]["address_key"] == npi_module.address_key_v1(
+        "123 Main St",
+        "",
+        "AUSTIN",
+        "TX",
+        "78701",
+        "US",
+    )
+    assert address_by_type["mail"]["address_key"] == npi_module.address_key_v1(
+        "PO Box 1",
+        "",
+        "AUSTIN",
+        "TX",
+        "78702",
+        "US",
+    )
+
+
+@pytest.mark.asyncio
 async def test_process_npi_chunk_populates_taxonomy_variants(monkeypatch, npi_module):
+    monkeypatch.delenv("HLTHPRT_ADDRESS_CANON_SOURCES", raising=False)
 
     fake_redis = SimpleNamespace(enqueue_job=AsyncMock())
     ctx = {"redis": fake_redis, "import_date": "20251105"}
@@ -173,6 +326,7 @@ async def test_process_npi_chunk_populates_taxonomy_variants(monkeypatch, npi_mo
     task = {
         "npi_csv_map": npi_csv_map,
         "npi_csv_map_reverse": npi_csv_map_reverse,
+        "taxonomy_int_code_map": {"1223D0001X": 4101},
         "row_list": [row],
     }
 
@@ -190,6 +344,10 @@ async def test_process_npi_chunk_populates_taxonomy_variants(monkeypatch, npi_mo
 
     taxonomy_group = payload["npi_taxonomy_group_list"][0]
     assert taxonomy_group["healthcare_provider_taxonomy_group"] == "Special Group"
+
+    address_by_type = {entry["type"]: entry for entry in payload["npi_address_list"]}
+    assert address_by_type["primary"]["taxonomy_array"] == [4101]
+    assert address_by_type["mail"]["taxonomy_array"] == [4101]
 
 
 @pytest.mark.asyncio
@@ -234,6 +392,10 @@ async def test_process_data_no_remote_files(monkeypatch, npi_module):
     download_mock = AsyncMock(return_value="")
     monkeypatch.setattr(npi_module, "download_it", download_mock)
     monkeypatch.setattr(npi_module, "ensure_database", AsyncMock())
+    monkeypatch.setattr(npi_module, "_ensure_required_extensions", AsyncMock())
+    monkeypatch.setattr(npi_module, "_assert_nucc_ready", AsyncMock())
+    monkeypatch.setattr(npi_module, "_assert_nppes_canonical_ready", AsyncMock())
+    monkeypatch.setattr(npi_module, "_load_nucc_taxonomy_int_code_map", AsyncMock(return_value={}))
     monkeypatch.setattr(npi_module.db, "status", AsyncMock())
 
     ctx = {"context": {}, "redis": SimpleNamespace(enqueue_job=AsyncMock()), "import_date": "20251107"}
@@ -252,6 +414,10 @@ async def test_process_data_failure_does_not_mark_run(monkeypatch, npi_module):
 
     monkeypatch.setattr(npi_module, "download_it", AsyncMock(side_effect=RuntimeError("boom")))
     monkeypatch.setattr(npi_module, "ensure_database", AsyncMock())
+    monkeypatch.setattr(npi_module, "_ensure_required_extensions", AsyncMock())
+    monkeypatch.setattr(npi_module, "_assert_nucc_ready", AsyncMock())
+    monkeypatch.setattr(npi_module, "_assert_nppes_canonical_ready", AsyncMock())
+    monkeypatch.setattr(npi_module, "_load_nucc_taxonomy_int_code_map", AsyncMock(return_value={}))
     monkeypatch.setattr(npi_module.db, "status", AsyncMock())
 
     ctx = {"context": {}, "redis": SimpleNamespace(enqueue_job=AsyncMock()), "import_date": "20251107"}
@@ -274,6 +440,7 @@ def test_nppes_listing_regex_is_v2_only(npi_module):
 @pytest.mark.asyncio
 async def test_startup_initializes_tables(monkeypatch, npi_module):
 
+    monkeypatch.delenv("HLTHPRT_IMPORT_ID_OVERRIDE", raising=False)
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "testschema")
 
     my_init_mock = AsyncMock()
@@ -299,9 +466,28 @@ async def test_startup_initializes_tables(monkeypatch, npi_module):
 
 
 @pytest.mark.asyncio
+async def test_startup_honors_import_id_override(monkeypatch, npi_module):
+
+    monkeypatch.setenv("HLTHPRT_IMPORT_ID_OVERRIDE", "addrcanon_npi_timing")
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "testschema")
+
+    monkeypatch.setattr(npi_module, "my_init_db", AsyncMock())
+    monkeypatch.setattr(npi_module, "ensure_database", AsyncMock())
+    monkeypatch.setattr(npi_module, "make_class", _fake_make_class_factory("testschema"))
+    monkeypatch.setattr(npi_module.db, "create_table", AsyncMock())
+    monkeypatch.setattr(npi_module.db, "status", AsyncMock())
+
+    ctx: dict[str, object] = {}
+    await npi_module.startup(ctx)
+
+    assert ctx["import_date"] == "addrcanon_npi_timing"
+
+
+@pytest.mark.asyncio
 async def test_shutdown_handles_rotation(monkeypatch, npi_module):
 
     monkeypatch.setenv("DB_SCHEMA", "testschema")
+    monkeypatch.setenv("HLTHPRT_ADDRESS_CANON_SOURCES", "nppes")
     monkeypatch.setattr(npi_module, "make_class", _fake_make_class_factory("testschema"))
     monkeypatch.setattr(npi_module, "print_time_info", lambda start: None)
     monkeypatch.setattr(npi_module, "ensure_database", AsyncMock())
@@ -331,17 +517,114 @@ async def test_shutdown_handles_rotation(monkeypatch, npi_module):
 
     monkeypatch.setattr(npi_module.db, "insert", lambda *args, **kwargs: DummyInsert())
     monkeypatch.setattr(npi_module.db, "func", SimpleNamespace(now=lambda: "NOW"))
+    stamp_address_keys = AsyncMock()
+    monkeypatch.setattr(npi_module, "stamp_address_keys", stamp_address_keys)
+    monkeypatch.setattr(
+        npi_module,
+        "resolve_into_archive",
+        AsyncMock(return_value=SimpleNamespace(staged=1, distinct_keys=1, inserted=1, elapsed_seconds=0.1)),
+    )
+    progress_events: list[dict[str, object]] = []
+    control_updates: list[tuple[str, dict[str, object]]] = []
+
+    monkeypatch.setattr(npi_module, "enqueue_live_progress", lambda **payload: progress_events.append(payload))
+
+    async def fake_mark_control_run(run_id, **kwargs):
+        control_updates.append((run_id, kwargs))
+
+    monkeypatch.setattr(npi_module, "mark_control_run", fake_mark_control_run)
 
     ctx = {
-        "context": {"run": 1, "start": datetime.datetime.utcnow()},
+        "context": {"run": 1, "start": datetime.datetime.utcnow(), "control_run_id": "npi-run-1"},
         "import_date": "20251108",
     }
 
     await npi_module.shutdown(ctx)
 
     scalar_mock.assert_awaited()
+    stamp_address_keys.assert_awaited()
+    assert stamp_address_keys.await_args.kwargs["update_existing"] is False
     assert execute_mock.await_count >= 1
     assert status_mock.await_count >= 1
+    assert control_updates[-1][0] == "npi-run-1"
+    metrics = control_updates[-1][1]["metrics"]
+    timings = metrics["npi_shutdown_phase_timings"]
+    assert any(item["phase"] == "canonical_address_resolve" for item in timings)
+    assert any(str(item["phase"]).startswith("vacuum_analyze:") for item in timings)
+    assert any(str(item["phase"]).startswith("publish_swap:") for item in timings)
+    assert all("elapsed_seconds" in item for item in timings)
+    assert any(event.get("phase") == "npi shutdown canonical_address_resolve" for event in progress_events)
+
+
+@pytest.mark.asyncio
+async def test_resolve_npi_address_archive_skips_sql_stamp_when_keys_loaded(monkeypatch, npi_module):
+    stamp_address_keys = AsyncMock()
+    resolve_into_archive = AsyncMock(return_value=SimpleNamespace(staged=10, distinct_keys=5))
+
+    monkeypatch.setattr(npi_module.db, "scalar", AsyncMock(return_value=0))
+    monkeypatch.setattr(npi_module, "stamp_address_keys", stamp_address_keys)
+    monkeypatch.setattr(npi_module, "resolve_into_archive", resolve_into_archive)
+
+    stats = await npi_module.resolve_npi_address_archive(
+        staging_table="npi_address_20260613",
+        field_map={"first_line": "first_line"},
+        schema="mrf",
+        cancel_check=AsyncMock(),
+    )
+
+    assert stats.staged == 10
+    stamp_address_keys.assert_not_awaited()
+    resolve_into_archive.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_resolve_npi_address_archive_uses_single_shard_for_small_missing_set(monkeypatch, npi_module):
+    stamp_address_keys = AsyncMock()
+    resolve_into_archive = AsyncMock(return_value=SimpleNamespace(staged=10, distinct_keys=5))
+
+    monkeypatch.setenv("HLTHPRT_ADDRESS_CANON_NPI_SHARDS", "24")
+    monkeypatch.setattr(npi_module.db, "scalar", AsyncMock(return_value=42))
+    monkeypatch.setattr(npi_module, "stamp_address_keys", stamp_address_keys)
+    monkeypatch.setattr(npi_module, "resolve_into_archive", resolve_into_archive)
+
+    await npi_module.resolve_npi_address_archive(
+        staging_table="npi_address_20260613",
+        field_map={"first_line": "first_line"},
+        schema="mrf",
+        cancel_check=AsyncMock(),
+    )
+
+    stamp_address_keys.assert_awaited_once()
+    assert stamp_address_keys.await_args.kwargs["shards"] == 1
+    assert stamp_address_keys.await_args.kwargs["update_existing"] is False
+    assert stamp_address_keys.await_args.kwargs["honor_env_override"] is False
+
+
+@pytest.mark.asyncio
+async def test_resolve_npi_address_archive_repairs_only_on_mismatch(monkeypatch, npi_module):
+    stamp_address_keys = AsyncMock(return_value=7)
+    resolve_into_archive = AsyncMock(
+        side_effect=[
+            RuntimeError(f"{npi_module.ADDRESS_KEY_MISMATCH_MESSAGE}: stale"),
+            SimpleNamespace(staged=10, distinct_keys=5),
+        ]
+    )
+
+    monkeypatch.setattr(npi_module.db, "scalar", AsyncMock(return_value=0))
+    monkeypatch.setattr(npi_module, "stamp_address_keys", stamp_address_keys)
+    monkeypatch.setattr(npi_module, "resolve_into_archive", resolve_into_archive)
+
+    stats = await npi_module.resolve_npi_address_archive(
+        staging_table="npi_address_20260613",
+        field_map={"first_line": "first_line"},
+        schema="mrf",
+        cancel_check=AsyncMock(),
+    )
+
+    assert stats.staged == 10
+    assert resolve_into_archive.await_count == 2
+    stamp_address_keys.assert_awaited_once()
+    assert stamp_address_keys.await_args.kwargs["update_existing"] is True
 
 
 @pytest.mark.asyncio

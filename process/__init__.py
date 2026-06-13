@@ -7,10 +7,15 @@ import click
 
 try:
     import uvloop
-
-    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 except ImportError:
     uvloop = None  # noqa: F841
+
+
+def _run(coro):
+    if uvloop is not None:
+        return uvloop.run(coro)
+    return asyncio.run(coro)
+
 
 from process.attributes import main as initiate_plan_attributes
 from process.attributes import (process_attributes, process_benefits,
@@ -113,6 +118,8 @@ from process.entity_address_unified import main as initiate_entity_address_unifi
 from process.entity_address_unified import process_data as process_entity_address_unified_data
 from process.entity_address_unified import shutdown as entity_address_unified_shutdown
 from process.entity_address_unified import startup as entity_address_unified_startup
+from process.address_archive_migration import main as initiate_address_archive_migration
+from process.address_archive_migration import process_data as process_address_archive_migration_data
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
 
@@ -121,8 +128,12 @@ class MRF:
     functions = [init_file, save_mrf_data, process_plan, process_json_index, process_provider, process_formulary]
     on_startup = initial_startup
     max_jobs = int(os.environ.get('HLTHPRT_MAX_MRF_JOBS')) if os.environ.get('HLTHPRT_MAX_MRF_JOBS') else 20
-    queue_read_limit = 2*max_jobs
-    job_timeout = 7200
+    queue_read_limit = (
+        int(os.environ.get("HLTHPRT_MRF_QUEUE_READ_LIMIT"))
+        if os.environ.get("HLTHPRT_MRF_QUEUE_READ_LIMIT")
+        else 2 * max_jobs
+    )
+    job_timeout = int(os.environ.get("HLTHPRT_MRF_JOB_TIMEOUT")) if os.environ.get("HLTHPRT_MRF_JOB_TIMEOUT") else 7200
     burst = True
     queue_name = 'arq:MRF'
     redis_settings = build_redis_settings()
@@ -159,8 +170,12 @@ class MRF_start:  # pylint: disable=invalid-name
 class MRF_finish:  # pylint: disable=invalid-name
     functions = [shutdown_mrf]
     on_startup = db_startup
-    max_jobs = 20
-    queue_read_limit = 10
+    max_jobs = (
+        int(os.environ.get("HLTHPRT_MAX_MRF_FINISH_JOBS"))
+        if os.environ.get("HLTHPRT_MAX_MRF_FINISH_JOBS")
+        else 1
+    )
+    queue_read_limit = max_jobs
     job_timeout = 14400
     burst = True
     queue_name = 'arq:MRF_finish'
@@ -259,8 +274,12 @@ class NPI:
     functions = [process_npi_data, save_npi_data, process_npi_chunk, control_single_job_start]
     on_startup = npi_startup
     on_shutdown = npi_shutdown
-    max_jobs = 20
-    queue_read_limit = 5
+    max_jobs = int(os.environ.get("HLTHPRT_MAX_NPI_JOBS")) if os.environ.get("HLTHPRT_MAX_NPI_JOBS") else 20
+    queue_read_limit = (
+        int(os.environ.get("HLTHPRT_NPI_QUEUE_READ_LIMIT"))
+        if os.environ.get("HLTHPRT_NPI_QUEUE_READ_LIMIT")
+        else 2 * max_jobs
+    )
     queue_name = 'arq:NPI'
     job_timeout = 86400
     redis_settings = build_redis_settings()
@@ -271,8 +290,12 @@ class NPI:
 class NPI_finish:  # pylint: disable=invalid-name
     functions = [npi_shutdown]
     on_startup = db_startup
-    max_jobs = 20
-    queue_read_limit = 10
+    max_jobs = (
+        int(os.environ.get("HLTHPRT_MAX_NPI_FINISH_JOBS"))
+        if os.environ.get("HLTHPRT_MAX_NPI_FINISH_JOBS")
+        else 1
+    )
+    queue_read_limit = max_jobs
     job_timeout = 3600
     burst = True
     queue_name = 'arq:NPI_finish'
@@ -662,6 +685,18 @@ class EntityAddressUnified_finish:  # pylint: disable=invalid-name
     job_deserializer = deserialize_job
 
 
+class AddressArchive:
+    functions = [process_address_archive_migration_data, control_single_job_start]
+    on_startup = db_startup
+    max_jobs = 1
+    queue_read_limit = 2
+    queue_name = "arq:AddressArchive"
+    job_timeout = 86400
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
 class MRFSourceDiscovery:
     functions = [process_mrf_source_discovery_data, control_single_job_start]
     on_startup = mrf_source_discovery_startup
@@ -692,24 +727,24 @@ def process_group_end():
 @click.command(help="Run CMSGOV MRF Import")
 @click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
 def mrf(test: bool):
-    asyncio.run(initiate_mrf(test_mode=test))
+    _run(initiate_mrf(test_mode=test))
 
 @click.command(help="Finish CMSGOV MRF Import")
 @click.option("--test", is_flag=True, help="Finalize the test-schema import.")
 @click.option("--import-id", help="Override the import_id/import_date used during finalize.")
 def mrf_end(test: bool, import_id: str | None):
-    asyncio.run(finish_mrf(test_mode=test, import_id=import_id))
+    _run(finish_mrf(test_mode=test, import_id=import_id))
 
 
 @click.command(help="Run Plan Attributes Import from CMS.gov")
 @click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
 def plan_attributes(test: bool):
-    asyncio.run(initiate_plan_attributes(test_mode=test))
+    _run(initiate_plan_attributes(test_mode=test))
 
 @click.command(help="Run NPPES Import with Weekly updates")
 @click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
 def npi(test: bool):
-    asyncio.run(initiate_npi(test_mode=test))
+    _run(initiate_npi(test_mode=test))
 
 @click.command(help="Run Transparency in Coverage (PTG) Import")
 @click.option("--toc-url", multiple=True, help="URL of a table-of-contents file to seed jobs (repeatable).")
@@ -772,7 +807,7 @@ def ptg(
 ):
     if keep_artifacts_on_failure:
         keep_partial_artifacts = True
-    asyncio.run(
+    _run(
         initiate_ptg(
             test_mode=test,
             toc_urls=list(toc_url),
@@ -798,13 +833,13 @@ def ptg(
 @click.command(help="Run NUCC Taxonomy Import")
 @click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
 def nucc(test: bool):
-    asyncio.run(initiate_nucc(test_mode=test))
+    _run(initiate_nucc(test_mode=test))
 
 
 @click.command(help="Run CMS official RC/POS code-set import")
 @click.option("--test", is_flag=True, help="Import a small official-code sample for a quick smoke run.")
 def code_sets(test: bool):
-    asyncio.run(initiate_code_sets(test_mode=test))
+    _run(initiate_code_sets(test_mode=test))
 
 
 @click.command(help="Run CMS MS-DRG reference import")
@@ -828,7 +863,7 @@ def ms_drg(
     manual_toc_url: str | None,
     import_id: str | None,
 ):
-    asyncio.run(
+    _run(
         initiate_ms_drg(
             test_mode=test,
             include_relationships=include_relationships,
@@ -848,7 +883,7 @@ def ms_drg(
 @click.option("--artifact-root", help="Directory for retained terminology source artifacts.")
 @click.option("--force-download", is_flag=True, help="Redownload source artifacts even when retained files exist.")
 def clinical_reference(test: bool, import_id: str | None, sources: str | None, artifact_root: str | None, force_download: bool):
-    asyncio.run(
+    _run(
         initiate_clinical_reference(
             test_mode=test,
             import_id=import_id,
@@ -863,14 +898,14 @@ def clinical_reference(test: bool, import_id: str | None, sources: str | None, a
 @click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
 @click.option("--import-id", help="Override import id/date suffix for table names.")
 def claims_pricing(test: bool, import_id: str | None):
-    asyncio.run(initiate_claims_pricing(test_mode=test, import_id=import_id))
+    _run(initiate_claims_pricing(test_mode=test, import_id=import_id))
 
 
 @click.command(help="Run CMS procedures claims import")
 @click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
 @click.option("--import-id", help="Override import id/date suffix for table names.")
 def claims_procedures(test: bool, import_id: str | None):
-    asyncio.run(initiate_claims_pricing(test_mode=test, import_id=import_id))
+    _run(initiate_claims_pricing(test_mode=test, import_id=import_id))
 
 
 @click.command(help="Finish CMS claims pricing import for a queued run id")
@@ -879,7 +914,7 @@ def claims_procedures(test: bool, import_id: str | None):
 @click.option("--test", is_flag=True, help="Use test DB suffix when finalizing.")
 @click.option("--manifest-path", help="Optional manifest path override.")
 def claims_pricing_end(import_id: str, run_id: str, test: bool, manifest_path: str | None):
-    asyncio.run(
+    _run(
         finish_claims_pricing(
             import_id=import_id,
             run_id=run_id,
@@ -893,7 +928,7 @@ def claims_pricing_end(import_id: str, run_id: str, test: bool, manifest_path: s
 @click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
 @click.option("--import-id", help="Override import id/date suffix for table names.")
 def drug_claims(test: bool, import_id: str | None):
-    asyncio.run(initiate_drug_claims(test_mode=test, import_id=import_id))
+    _run(initiate_drug_claims(test_mode=test, import_id=import_id))
 
 
 @click.command(help="Finish CMS Part D drug claims import for a queued run id")
@@ -902,7 +937,7 @@ def drug_claims(test: bool, import_id: str | None):
 @click.option("--test", is_flag=True, help="Use test DB suffix when finalizing.")
 @click.option("--manifest-path", help="Optional manifest path override.")
 def drug_claims_end(import_id: str, run_id: str, test: bool, manifest_path: str | None):
-    asyncio.run(
+    _run(
         finish_drug_claims(
             import_id=import_id,
             run_id=run_id,
@@ -916,13 +951,13 @@ def drug_claims_end(import_id: str, run_id: str, test: bool, manifest_path: str 
 @click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
 @click.option("--import-id", help="Override import id/date suffix for table names.")
 def provider_quality(test: bool, import_id: str | None):
-    asyncio.run(initiate_provider_quality(test_mode=test, import_id=import_id))
+    _run(initiate_provider_quality(test_mode=test, import_id=import_id))
 
 
 @click.command(help="Run provider enrichment import (PECOS + Medicare enrollment)")
 @click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
 def provider_enrichment(test: bool):
-    asyncio.run(initiate_provider_enrichment(test_mode=test))
+    _run(initiate_provider_enrichment(test_mode=test))
 
 
 @click.command(help="Finish provider quality import for a queued run id")
@@ -931,7 +966,7 @@ def provider_enrichment(test: bool):
 @click.option("--test", is_flag=True, help="Use test DB suffix when finalizing.")
 @click.option("--manifest-path", help="Optional manifest path override.")
 def provider_quality_end(import_id: str, run_id: str, test: bool, manifest_path: str | None):
-    asyncio.run(
+    _run(
         finish_provider_quality(
             import_id=import_id,
             run_id=run_id,
@@ -945,56 +980,89 @@ def provider_quality_end(import_id: str, run_id: str, test: bool, manifest_path:
 @click.option("--test", is_flag=True, help="Process a smaller subset for a quick smoke run.")
 @click.option("--import-id", help="Override import id/date suffix for table names.")
 def partd_formulary_network(test: bool, import_id: str | None):
-    asyncio.run(initiate_partd_formulary_network(test_mode=test, import_id=import_id))
+    _run(initiate_partd_formulary_network(test_mode=test, import_id=import_id))
 
 
 @click.command(help="Run state board pharmacy license import (NPI-first canonical)")
 @click.option("--test", is_flag=True, help="Process a smaller synthetic subset for a quick smoke run.")
 @click.option("--import-id", help="Override import id/date suffix for table names.")
 def pharmacy_license(test: bool, import_id: str | None):
-    asyncio.run(initiate_pharmacy_license(test_mode=test, import_id=import_id))
+    _run(initiate_pharmacy_license(test_mode=test, import_id=import_id))
 
 
 @click.command(help="Run CDC PLACES ZCTA import (latest year only)")
 @click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
 def places_zcta(test: bool):
-    asyncio.run(initiate_places_zcta(test_mode=test))
+    _run(initiate_places_zcta(test_mode=test))
 
 
 @click.command(help="Run LEHD/LODES workplace aggregate import")
 @click.option("--test", is_flag=True, help="Process a small subset of states for a quick smoke run.")
 def lodes(test: bool):
-    asyncio.run(initiate_lodes(test_mode=test))
+    _run(initiate_lodes(test_mode=test))
 
 
 @click.command(help="Run CMS Medicare Enrollment Dashboard import")
 @click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
 def medicare_enrollment(test: bool):
-    asyncio.run(initiate_medicare_enrollment(test_mode=test))
+    _run(initiate_medicare_enrollment(test_mode=test))
 
 
 @click.command(help="Run CMS Doctors and Clinicians import")
 @click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
 def cms_doctors(test: bool):
-    asyncio.run(initiate_cms_doctors(test_mode=test))
+    _run(initiate_cms_doctors(test_mode=test))
 
 
 @click.command(help="Run Facility Anchors import (HRSA FQHCs + CMS Hospitals)")
 @click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
 def facility_anchors(test: bool):
-    asyncio.run(initiate_facility_anchors(test_mode=test))
+    _run(initiate_facility_anchors(test_mode=test))
 
 
 @click.command(help="Run Pharmacy Economics import (SDUD + NADAC + FUL margins)")
 @click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
 def pharmacy_economics(test: bool):
-    asyncio.run(initiate_pharmacy_economics(test_mode=test))
+    _run(initiate_pharmacy_economics(test_mode=test))
 
 
 @click.command(help="Run unified entity-address materialization import")
 @click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
 def entity_address_unified(test: bool):
-    asyncio.run(initiate_entity_address_unified(test_mode=test))
+    _run(initiate_entity_address_unified(test_mode=test))
+
+
+@click.command(help="Run one-time legacy address archive to canonical v2 migration")
+@click.option("--dry-run", is_flag=True, help="Compute counts and verification queries without writing.")
+@click.option("--legacy-table", default="address_archive", show_default=True, help="Legacy archive table name.")
+@click.option("--archive-table", default="address_archive_v2", show_default=True, help="Canonical archive table name.")
+@click.option("--work-mem", default="512MB", show_default=True, help="PostgreSQL work_mem for the migration transaction.")
+@click.option("--timeout", default="30min", show_default=True, help="PostgreSQL statement_timeout for migration statements.")
+@click.option("--sample-limit", type=int, default=20, show_default=True, help="Sample rows retained in migration metrics.")
+@click.option("--enqueue", is_flag=True, help="Enqueue the migration on arq:AddressArchive instead of running inline.")
+@click.option("--test", is_flag=True, help="Pass test mode through the controlled importer payload.")
+def address_archive_v2_migrate(
+    dry_run: bool,
+    legacy_table: str,
+    archive_table: str,
+    work_mem: str,
+    timeout: str,
+    sample_limit: int,
+    enqueue: bool,
+    test: bool,
+):
+    _run(
+        initiate_address_archive_migration(
+            dry_run=dry_run,
+            legacy_table=legacy_table,
+            archive_table=archive_table,
+            work_mem=work_mem,
+            timeout=timeout,
+            sample_limit=sample_limit,
+            enqueue=enqueue,
+            test_mode=test,
+        )
+    )
 
 
 @click.command(help="Run lightweight MRF payer/source discovery catalog import")
@@ -1034,7 +1102,7 @@ def mrf_source_discovery_command(
     crawl_target_limit: int | None,
     test: bool,
 ):
-    asyncio.run(
+    _run(
         initiate_mrf_source_discovery(
             test_mode=test,
             provider=provider,
@@ -1063,7 +1131,7 @@ def mrf_source_discovery_command(
 @click.option("--test", is_flag=True, help="Use test DB suffix when finalizing.")
 @click.option("--manifest-path", help="Unused; kept for command signature consistency.")
 def partd_formulary_network_end(import_id: str, run_id: str, test: bool, manifest_path: str | None):
-    asyncio.run(
+    _run(
         finish_partd_formulary_network(
             import_id=import_id,
             run_id=run_id,
@@ -1079,7 +1147,7 @@ def partd_formulary_network_end(import_id: str, run_id: str, test: bool, manifes
 @click.option("--test", is_flag=True, help="Use test DB suffix when finalizing.")
 @click.option("--manifest-path", help="Unused; kept for command signature consistency.")
 def pharmacy_license_end(import_id: str, run_id: str, test: bool, manifest_path: str | None):
-    asyncio.run(
+    _run(
         finish_pharmacy_license(
             import_id=import_id,
             run_id=run_id,
@@ -1115,6 +1183,7 @@ process_group.add_command(cms_doctors, name="cms-doctors")
 process_group.add_command(facility_anchors, name="facility-anchors")
 process_group.add_command(pharmacy_economics, name="pharmacy-economics")
 process_group.add_command(entity_address_unified, name="entity-address-unified")
+process_group.add_command(address_archive_v2_migrate, name="address-archive-v2-migrate")
 process_group.add_command(geo_lookup, name="geo")
 process_group.add_command(geo_census_lookup, name="geo-census")
 process_group.add_command(nucc)

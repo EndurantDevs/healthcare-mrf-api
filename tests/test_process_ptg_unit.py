@@ -1157,6 +1157,7 @@ def test_ptg2_range_download_assembles_artifact(monkeypatch, tmp_path):
         finally:
             await runner.cleanup()
 
+    monkeypatch.setenv("HLTHPRT_FETCH_ALLOW_LOCAL", "true")
     monkeypatch.setenv(process_ptg.PTG2_RANGE_DOWNLOADS_ENV, "true")
     monkeypatch.setenv(process_ptg.PTG2_RANGE_DOWNLOAD_MIN_BYTES_ENV, "1")
     monkeypatch.setenv(process_ptg.PTG2_RANGE_DOWNLOAD_CHUNK_BYTES_ENV, str(1024 * 1024))
@@ -1221,6 +1222,7 @@ def test_ptg2_range_download_retries_short_chunk(monkeypatch, tmp_path):
         finally:
             await runner.cleanup()
 
+    monkeypatch.setenv("HLTHPRT_FETCH_ALLOW_LOCAL", "true")
     monkeypatch.setenv(process_ptg.PTG2_RANGE_DOWNLOADS_ENV, "true")
     monkeypatch.setenv(process_ptg.PTG2_RANGE_DOWNLOAD_MIN_BYTES_ENV, "1")
     monkeypatch.setenv(process_ptg.PTG2_RANGE_DOWNLOAD_CHUNK_BYTES_ENV, str(1024 * 1024))
@@ -3561,3 +3563,105 @@ def test_ptg2_rust_compact_serving_can_be_disabled_when_scanner_enabled(monkeypa
     monkeypatch.setenv(process_ptg.PTG2_RUST_COMPACT_SERVING_ENV, "false")
 
     assert process_ptg._use_rust_compact_serving() is False
+
+
+def test_download_raw_artifact_rejects_file_url(monkeypatch, tmp_path):
+    secret = tmp_path / "secret.txt"
+    secret.write_text("top-secret")
+    monkeypatch.delenv("HLTHPRT_FETCH_ALLOW_LOCAL", raising=False)
+
+    with pytest.raises(ValueError, match="http"):
+        asyncio.run(
+            process_ptg.download_raw_artifact(
+                f"file://{secret}",
+                store=process_ptg.PTG2ArtifactStore(tmp_path / "store"),
+            )
+        )
+
+
+def test_download_raw_artifact_rejects_private_host(monkeypatch, tmp_path):
+    monkeypatch.delenv("HLTHPRT_FETCH_ALLOW_LOCAL", raising=False)
+
+    with pytest.raises(ValueError, match="non-public IP"):
+        asyncio.run(
+            process_ptg.download_raw_artifact(
+                "http://169.254.169.254/latest/meta-data/",
+                store=process_ptg.PTG2ArtifactStore(tmp_path / "store"),
+            )
+        )
+
+    with pytest.raises(ValueError, match="non-public IP"):
+        asyncio.run(
+            process_ptg.download_raw_artifact(
+                "http://127.0.0.1/index.json",
+                store=process_ptg.PTG2ArtifactStore(tmp_path / "store"),
+            )
+        )
+
+
+def test_ptg_http_redirect_target_is_validated_before_follow(monkeypatch):
+    from process.ptg_parts import source_download as ptg_source_download
+
+    calls: list[str] = []
+
+    async def fake_assert_safe_url(url: str) -> None:
+        if "169.254.169.254" in url:
+            raise ValueError("non-public IP address is not allowed: 169.254.169.254")
+
+    class _FakeResponse:
+        status = 302
+        headers = {"Location": "http://169.254.169.254/latest/meta-data/"}
+        url = "https://public.example/index.json"
+
+        def release(self) -> None:
+            return None
+
+    class _FakeSession:
+        async def request(self, method: str, url: str, **_kwargs):
+            calls.append(f"{method} {url}")
+            return _FakeResponse()
+
+    monkeypatch.setattr(ptg_source_download, "assert_safe_url", fake_assert_safe_url)
+
+    with pytest.raises(ValueError, match="non-public IP"):
+        asyncio.run(
+            ptg_source_download._open_validated_request(
+                _FakeSession(),
+                "GET",
+                "https://public.example/index.json",
+            )
+        )
+
+    assert calls == ["GET https://public.example/index.json"]
+
+
+def test_download_raw_artifact_aborts_oversize_body(monkeypatch, tmp_path):
+    payload = b"x" * (256 * 1024)
+
+    async def handle(request):
+        if request.method == "HEAD":
+            return web.Response(headers={"Content-Length": "1"})
+        return web.Response(body=payload, headers={"Content-Length": str(len(payload))})
+
+    async def run_download():
+        app = web.Application()
+        app.router.add_route("*", "/big.bin", handle)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        try:
+            return await process_ptg.download_raw_artifact(
+                f"http://127.0.0.1:{port}/big.bin",
+                store=process_ptg.PTG2ArtifactStore(tmp_path / "store"),
+                max_bytes=64 * 1024,
+            )
+        finally:
+            await runner.cleanup()
+
+    monkeypatch.setenv("HLTHPRT_FETCH_ALLOW_LOCAL", "true")
+    monkeypatch.setenv(process_ptg.PTG2_RANGE_DOWNLOADS_ENV, "false")
+
+    with pytest.raises(RuntimeError, match="max-bytes guard exceeded"):
+        asyncio.run(run_download())

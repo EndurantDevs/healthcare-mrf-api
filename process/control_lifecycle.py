@@ -14,11 +14,15 @@ from sqlalchemy import func, update
 
 from db.models import ImportRun, db
 from process.control_cancel import ImportCancelledError
-from process.import_status_events import enqueue_status_event, flush_status_events
+from process.import_status_events import enqueue_status_event, flush_status_events, isoformat_utc
 from process.live_progress import enqueue_live_progress, reset_live_progress_context, set_live_progress_context
 
 
-async def control_single_job_start(ctx: dict[str, Any], task: dict[str, Any] | None = None) -> dict[str, Any]:
+async def control_single_job_start(
+    ctx: dict[str, Any],
+    task: dict[str, Any] | None = None,
+    **_arq_metadata: Any,
+) -> dict[str, Any]:
     """Run a single-job importer while updating the unified import_run registry."""
     payload = task if isinstance(task, dict) else {}
     run_id = str(payload.get("run_id") or "").strip()
@@ -41,7 +45,7 @@ async def control_single_job_start(ctx: dict[str, Any], task: dict[str, Any] | N
         )
         raise RuntimeError("target_module and target_function are required")
 
-    started_at = dt.datetime.now(dt.UTC).replace(tzinfo=None).isoformat()
+    started_at = dt.datetime.now(dt.UTC).isoformat()
     live_token = None
     heartbeat_task = None
     if run_id:
@@ -69,6 +73,16 @@ async def control_single_job_start(ctx: dict[str, Any], task: dict[str, Any] | N
         await mark_control_run(run_id, status="canceled", phase_detail=f"{target_function} canceled", progress_message="canceled")
         await _flush_terminal_status_events()
         return {"status": "canceled", "run_id": run_id}
+    except asyncio.CancelledError as exc:
+        await mark_control_run(
+            run_id,
+            status="failed",
+            phase_detail=f"{target_function} interrupted",
+            progress_message="interrupted",
+            error={"code": "import_interrupted", "message": "worker task was cancelled"},
+        )
+        await _flush_terminal_status_events()
+        return {"status": "failed", "run_id": run_id, "error": str(exc)}
     except Exception as exc:
         await mark_control_run(
             run_id,
@@ -183,6 +197,7 @@ async def mark_control_run(
     error: dict[str, Any] | None = None,
     metrics: dict[str, Any] | None = None,
     progress: dict[str, Any] | None = None,
+    snapshot_id: str | None = None,
 ) -> None:
     if not run_id:
         return
@@ -206,6 +221,8 @@ async def mark_control_run(
     }
     if metrics is not None:
         values["metrics"] = metrics
+    if snapshot_id:
+        values["snapshot_id"] = snapshot_id
     if status == "running":
         values["started_at"] = func.coalesce(ImportRun.started_at, now)
     if done:
@@ -220,8 +237,9 @@ async def mark_control_run(
         "status": status,
         "phase": progress_payload.get("phase") or phase_detail,
         "message": progress_payload.get("message") or progress_message,
-        "started_at": live_started_at.isoformat() if live_started_at else None,
-        "finished_at": live_finished_at.isoformat() if live_finished_at else None,
+        "started_at": isoformat_utc(live_started_at) if live_started_at else None,
+        "finished_at": isoformat_utc(live_finished_at) if live_finished_at else None,
+        "snapshot_id": snapshot_id,
         "publish_event": False,
     }
     enqueue_live_progress(**live_payload)
@@ -233,9 +251,10 @@ async def mark_control_run(
             "progress": progress_payload,
             "metrics": metrics or {},
             "error": error,
-            "heartbeat_at": now.isoformat(),
-            "started_at": live_started_at.isoformat() if live_started_at else None,
-            "finished_at": live_finished_at.isoformat() if live_finished_at else None,
+            "snapshot_id": snapshot_id,
+            "heartbeat_at": isoformat_utc(now),
+            "started_at": isoformat_utc(live_started_at) if live_started_at else None,
+            "finished_at": isoformat_utc(live_finished_at) if live_finished_at else None,
         }
     )
 

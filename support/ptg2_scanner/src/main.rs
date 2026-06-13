@@ -1,4 +1,5 @@
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
+use ptg2_scanner::address_canon::canonicalize_copy_file;
 use ptg2_scanner::config::{
     env_bool, env_usize, progress_interval, split_interval, DEFAULT_COMPACT_COPY_ROTATE_BYTES,
     DEFAULT_COMPACT_RUST_WORKERS, DEFAULT_COMPACT_RUST_WORK_QUEUE, DEFAULT_PROGRESS_BYTES,
@@ -4384,6 +4385,27 @@ fn main() -> io::Result<()> {
         })?;
         let input_paths: Vec<String> = args.collect();
         return merge_manifest_copy_files(&kind, Path::new(&output_path), &input_paths);
+    }
+    if first_arg == "--address-canonicalize-copy" {
+        let input_path = args.next().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "usage: ptg2_scanner --address-canonicalize-copy <input_path> <output_path>",
+            )
+        })?;
+        let output_path = args.next().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "usage: ptg2_scanner --address-canonicalize-copy <input_path> <output_path>",
+            )
+        })?;
+        if args.next().is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "usage: ptg2_scanner --address-canonicalize-copy <input_path> <output_path>",
+            ));
+        }
+        return canonicalize_copy_file(Path::new(&input_path), Path::new(&output_path));
     }
     let arrays: Vec<String> = args.collect();
     if arrays.is_empty() {

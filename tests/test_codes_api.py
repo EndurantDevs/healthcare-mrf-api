@@ -7,6 +7,7 @@ from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 
 import pytest
+import sanic.exceptions
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "api" / "endpoint" / "codes.py"
 MODULE_SPEC = spec_from_file_location("codes_endpoint_unit", MODULE_PATH)
@@ -163,6 +164,17 @@ async def test_get_code_canonicalizes_place_of_service_alias():
 
     assert payload["code_system"] == "POS"
     assert payload["code"] == "23"
+
+
+@pytest.mark.asyncio
+async def test_get_code_hides_restricted_terminology_by_default(monkeypatch):
+    monkeypatch.delenv("HLTHPRT_PUBLIC_RESTRICTED_TERMINOLOGIES", raising=False)
+    request = make_request([FakeResult(rows=[{"code_system": "SNOMEDCT_US", "code": "123"}])])
+
+    with pytest.raises(sanic.exceptions.NotFound):
+        await get_code(request, "snomed", "123")
+
+    assert request.ctx.sa_session.calls == []
 
 
 @pytest.mark.asyncio

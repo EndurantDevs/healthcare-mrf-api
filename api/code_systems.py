@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 INTERNAL_PROCEDURE_CODE_SYSTEM = "HP_PROCEDURE_CODE"
@@ -10,6 +11,7 @@ EQUIVALENT_PROCEDURE_CODE_SYSTEMS = {"CPT", "HCPCS", "CDT"}
 EXTERNAL_PROCEDURE_CODE_SYSTEMS = {*EQUIVALENT_PROCEDURE_CODE_SYSTEMS, "MS_DRG"}
 PROCEDURE_CODE_SYSTEMS = {*EXTERNAL_PROCEDURE_CODE_SYSTEMS, INTERNAL_PROCEDURE_CODE_SYSTEM}
 RX_CODE_SYSTEMS = {"NDC", "RXNORM", "RXCUI", INTERNAL_RX_CODE_SYSTEM}
+RESTRICTED_TERMINOLOGY_CODE_SYSTEMS = {"SNOMEDCT_US"}
 
 CODE_SYSTEM_ALIASES = {
     "CLM_REV_CNTR_CD": "RC",
@@ -55,6 +57,14 @@ def canonical_catalog_code(code_system: str, raw_code: Any) -> str:
     if code_system in {"ICD10CM", "ICD10PCS"}:
         return code.replace(".", "")
     return code
+
+
+def restricted_terminology_public_enabled() -> bool:
+    return str(os.getenv("HLTHPRT_PUBLIC_RESTRICTED_TERMINOLOGIES") or "").strip().lower() in {"1", "true", "yes"}
+
+
+def is_restricted_terminology_system(code_system: Any) -> bool:
+    return normalize_code_system(code_system) in RESTRICTED_TERMINOLOGY_CODE_SYSTEMS
 
 
 def equivalent_external_procedure_pairs(system: str, code: str) -> set[tuple[str, str]]:

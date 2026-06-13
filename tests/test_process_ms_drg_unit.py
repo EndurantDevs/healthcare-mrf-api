@@ -1,6 +1,8 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import importlib
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
@@ -142,3 +144,51 @@ async def test_catalog_only_import_replaces_only_ms_drg_sources(monkeypatch):
         ("catalog", (ms_drg.SOURCE_MS_DRG,)),
         ("synonym", (ms_drg.SOURCE_MS_DRG,)),
     ]
+
+
+def test_download_text_rejects_file_url(tmp_path, monkeypatch):
+    secret = tmp_path / "secret.txt"
+    secret.write_text("top-secret")
+    monkeypatch.delenv("HLTHPRT_FETCH_ALLOW_LOCAL", raising=False)
+
+    with pytest.raises(ValueError, match="http"):
+        ms_drg._download_text(f"file://{secret}")
+
+
+def test_download_text_rejects_private_hosts(monkeypatch):
+    monkeypatch.delenv("HLTHPRT_FETCH_ALLOW_LOCAL", raising=False)
+
+    with pytest.raises(ValueError, match="non-public IP"):
+        ms_drg._download_text("http://169.254.169.254/latest/meta-data/")
+
+    with pytest.raises(ValueError, match="non-public IP"):
+        ms_drg._download_text("http://127.0.0.1/toc.html")
+
+
+def test_download_text_aborts_oversize_body(monkeypatch):
+    body = b"x" * (256 * 1024)
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 - http.server API
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):  # silence test server logging
+            return
+
+    server = HTTPServer(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = server.server_address[1]
+        monkeypatch.setenv("HLTHPRT_FETCH_ALLOW_LOCAL", "true")
+        monkeypatch.setenv("HLTHPRT_FETCH_MAX_BYTES", str(16 * 1024))
+
+        with pytest.raises(ValueError, match="exceeds"):
+            ms_drg._download_text(f"http://127.0.0.1:{port}/toc.html")
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)

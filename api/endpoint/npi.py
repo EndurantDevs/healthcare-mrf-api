@@ -13,6 +13,7 @@ import time
 import urllib.parse
 from datetime import datetime
 from textwrap import dedent
+from types import SimpleNamespace
 from typing import Any, Mapping, Optional, Sequence
 
 import sanic.exceptions
@@ -60,6 +61,7 @@ MEDICATION_ALLOWED_CODE_SYSTEMS = {
 CODE_TOKEN_PATTERN = re.compile(r"^[A-Z0-9._-]+$")
 INT_CODE_PATTERN = re.compile(r"^-?\d+$")
 CHAIN_PECOS_PROVIDER_TYPE_CODES = {"12-C1"}
+PUBLIC_ADDRESS_EXCLUDED_COLUMNS = {"address_key"}
 FACILITY_ENROLLMENT_MODELS: dict[str, Any] = {
     "hospital": ProviderEnrollmentHospital,
     "hha": ProviderEnrollmentHomeHealthAgency,
@@ -68,6 +70,17 @@ FACILITY_ENROLLMENT_MODELS: dict[str, Any] = {
     "rhc": ProviderEnrollmentRHC,
     "snf": ProviderEnrollmentSNF,
 }
+
+
+def _redact_internal_address_fields(value: Any) -> Any:
+    if isinstance(value, dict):
+        value.pop("address_key", None)
+        for child in value.values():
+            _redact_internal_address_fields(child)
+    elif isinstance(value, list):
+        for child in value:
+            _redact_internal_address_fields(child)
+    return value
 
 
 def _env_flag(*names: str, default: bool = False) -> bool:
@@ -2674,6 +2687,8 @@ async def get_all(request):
                             if c.key in row_mapping:
                                 obj[c.key] = row_mapping.get(c.key)
                         for c in NPIAddress.__table__.columns:
+                            if c.key in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
+                                continue
                             if c.key in row_mapping:
                                 obj[c.key] = row_mapping.get(c.key)
                         obj["do_business_as"] = obj.get("do_business_as") or []
@@ -2708,6 +2723,8 @@ async def get_all(request):
                     count += 1
                     if count >= row_len:
                         break
+                    if c.key in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
+                        continue
                     obj[c.key] = r[count]
 
                 npi_value = obj.get("npi")
@@ -2736,6 +2753,7 @@ async def get_all(request):
         res = list(res.values())
         for row in res:
             row["do_business_as"] = row.get("do_business_as") or []
+            _redact_internal_address_fields(row)
         return res
 
     if count_only:
@@ -3481,6 +3499,8 @@ async def get_near_npi(request):
                 obj["distance"] = row_dict.get("distance")
 
             for c in NPIAddress.__table__.columns:
+                if c.key in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
+                    continue
                 if c.key in row_dict:
                     obj[c.key] = row_dict[c.key]
             for c in NPIData.__table__.columns:
@@ -3515,6 +3535,8 @@ async def get_near_npi(request):
             count += 1
             if count >= row_len:
                 break
+            if c.key in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
+                continue
             obj[c.key] = r[count]
         for c in NPIData.__table__.columns:
             count += 1
@@ -3543,6 +3565,7 @@ async def get_near_npi(request):
         res[npi_value] = obj
 
     res = list(res.values())
+    _redact_internal_address_fields(res)
     return response.json(res, default=str)
 
 
@@ -3603,8 +3626,91 @@ async def get_npi(request, npi):
     include_chain_enrichment = _include_chain_provider_enrichment(request.args.get("show"))
     provider_enrichment_view = _normalize_provider_enrichment_view(request.args.get("view"))
     request_session = _request_session(request)
+    db_schema = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    address_archive_cutover = _env_flag("HLTHPRT_ADDRESS_ARCHIVE_CUTOVER")
+    v2_archive_table_resolved = False
+    v2_archive_table_cache: str | None = None
+    v2_archive_table_lock = asyncio.Lock()
 
-    async def update_addr_coordinates(checksum, long, lat, formatted_address, place_id):
+    async def _table_exists(table_name: str) -> bool:
+        value = await db.scalar("SELECT to_regclass(:table_name);", table_name=f"{db_schema}.{table_name}")
+        return isinstance(value, str) and bool(value)
+
+    async def _table_has_column(table_name: str, column_name: str) -> bool:
+        return bool(await db.scalar(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                  FROM information_schema.columns
+                 WHERE table_schema = :schema
+                   AND table_name = :table
+                   AND column_name = :column
+            );
+            """,
+            schema=db_schema,
+            table=table_name,
+            column=column_name,
+        ))
+
+    async def _has_address_key_functions() -> bool:
+        value = await db.scalar(
+            "SELECT to_regprocedure(:signature);",
+            signature=f"{db_schema}.addr_key_v1(text,text,text,text,text,text)",
+        )
+        return isinstance(value, str) and bool(value)
+
+    async def _v2_archive_table() -> str | None:
+        nonlocal v2_archive_table_resolved, v2_archive_table_cache
+        if v2_archive_table_resolved:
+            return v2_archive_table_cache
+        async with v2_archive_table_lock:
+            if v2_archive_table_resolved:
+                return v2_archive_table_cache
+            if address_archive_cutover and hasattr(db, "first"):
+                preferred = os.getenv("HLTHPRT_ADDRESS_ARCHIVE_TABLE", "address_archive_v2").strip() or "address_archive_v2"
+                for table_name in (preferred, "address_archive"):
+                    if (
+                        await _table_exists(table_name)
+                        and await _table_has_column(table_name, "address_key")
+                        and await _has_address_key_functions()
+                    ):
+                        v2_archive_table_cache = table_name
+                        break
+            v2_archive_table_resolved = True
+            return v2_archive_table_cache
+
+    async def _archive_coordinates_for(address):
+        archive_table = await _v2_archive_table()
+        if archive_table:
+            row = await db.first(
+                f"""
+                SELECT long, lat, formatted_address, place_id
+                  FROM {db_schema}.{archive_table}
+                 WHERE address_key = {db_schema}.addr_key_v1(
+                    :first_line, :second_line, :city_name, :state_name, :postal_code, :country_code
+                 )
+                   AND lat IS NOT NULL
+                   AND long IS NOT NULL
+                """,
+                first_line=address.get("first_line"),
+                second_line=address.get("second_line"),
+                city_name=address.get("city_name"),
+                state_name=address.get("state_name"),
+                postal_code=address.get("postal_code"),
+                country_code=address.get("country_code") or "US",
+            )
+            if row:
+                data = row._mapping
+                return SimpleNamespace(
+                    long=data["long"],
+                    lat=data["lat"],
+                    formatted_address=data["formatted_address"],
+                    place_id=data["place_id"],
+                )
+        return await db.scalar(select(AddressArchive).where(AddressArchive.checksum == address["checksum"]))
+
+    async def update_addr_coordinates(address, long, lat, formatted_address, place_id):
+        checksum = address["checksum"]
         await (
             db.update(NPIAddress)
             .where(NPIAddress.checksum == checksum)
@@ -3618,6 +3724,63 @@ async def get_npi(request, npi):
         )
         row = await db.scalar(select(NPIAddress).where(NPIAddress.checksum == checksum))
         if row is None:
+            return
+        archive_table = await _v2_archive_table()
+        if archive_table:
+            await db.status(
+                f"""
+                INSERT INTO {db_schema}.{archive_table} (
+                    address_key, identity_key, identity_version, precision, premise_key,
+                    line1_norm, unit_norm, city_norm, state_code, zip5, zip4, country_code,
+                    first_line, second_line, city_name, state_name, postal_code,
+                    telephone_number, fax_number, formatted_address, lat, long, place_id,
+                    geocode_source, geocode_quality, geocoded_at, source_bits, display_priority,
+                    date_added
+                )
+                SELECT
+                    {db_schema}.addr_key_v1(first_line, second_line, city_name, state_name, postal_code, COALESCE(NULLIF(country_code, ''), 'US')),
+                    {db_schema}.addr_identity_key_v1(first_line, second_line, city_name, state_name, postal_code, COALESCE(NULLIF(country_code, ''), 'US')),
+                    1,
+                    CASE
+                        WHEN split_part({db_schema}.addr_identity_key_v1(first_line, second_line, city_name, state_name, postal_code, COALESCE(NULLIF(country_code, ''), 'US')), '|', 8) = 'city_zip'
+                        THEN 'city_zip' ELSE 'street'
+                    END,
+                    {db_schema}.addr_premise_key_v1(first_line, second_line, city_name, state_name, postal_code, COALESCE(NULLIF(country_code, ''), 'US')),
+                    {db_schema}.addr_street_norm_v1(first_line, second_line),
+                    {db_schema}.addr_unit_norm_v1(first_line, second_line),
+                    {db_schema}.addr_city_norm_v1(city_name),
+                    LEFT({db_schema}.addr_state_code_v1(state_name), 32),
+                    {db_schema}.addr_zip5_norm_v1(postal_code),
+                    NULLIF(substring(regexp_replace(COALESCE(postal_code, ''), '[^0-9]', '', 'g') from 6 for 4), ''),
+                    {db_schema}.addr_country_code_v1(COALESCE(NULLIF(country_code, ''), 'US')),
+                    first_line, second_line, city_name, state_name, postal_code,
+                    telephone_number, fax_number, formatted_address, lat, long, place_id,
+                    'api_geocode', 'unknown', now(), 1, 0, date_added
+                  FROM (
+                    SELECT DISTINCT ON (
+                        {db_schema}.addr_key_v1(first_line, second_line, city_name, state_name, postal_code, COALESCE(NULLIF(country_code, ''), 'US'))
+                    )
+                        *
+                      FROM {db_schema}.npi_address
+                     WHERE checksum = :checksum
+                       AND {db_schema}.addr_key_v1(first_line, second_line, city_name, state_name, postal_code, COALESCE(NULLIF(country_code, ''), 'US')) IS NOT NULL
+                     ORDER BY
+                        {db_schema}.addr_key_v1(first_line, second_line, city_name, state_name, postal_code, COALESCE(NULLIF(country_code, ''), 'US')),
+                        (place_id IS NOT NULL) DESC,
+                        date_added DESC NULLS LAST,
+                        npi
+                  ) source
+                ON CONFLICT (address_key) DO UPDATE SET
+                    formatted_address = COALESCE({db_schema}.{archive_table}.formatted_address, EXCLUDED.formatted_address),
+                    lat = COALESCE({db_schema}.{archive_table}.lat, EXCLUDED.lat),
+                    long = COALESCE({db_schema}.{archive_table}.long, EXCLUDED.long),
+                    place_id = COALESCE({db_schema}.{archive_table}.place_id, EXCLUDED.place_id),
+                    geocoded_at = COALESCE({db_schema}.{archive_table}.geocoded_at, EXCLUDED.geocoded_at),
+                    source_bits = {db_schema}.{archive_table}.source_bits | 1,
+                    last_seen_at = now();
+                """,
+                checksum=checksum,
+            )
             return
         obj = {column.key: getattr(row, column.key, None) for column in AddressArchive.__table__.columns}
 
@@ -3702,7 +3865,7 @@ async def get_npi(request, npi):
                 update_geo = True
 
             if (not d["lat"]) and (not force_address_update):
-                res = await db.scalar(select(AddressArchive).where(AddressArchive.checksum == x["checksum"]))
+                res = await _archive_coordinates_for(x)
                 if res:
                     d["long"] = res.long
                     d["lat"] = res.lat
@@ -3777,7 +3940,7 @@ async def get_npi(request, npi):
 
             if update_geo and d.get("lat"):
                 request.app.add_task(
-                    update_addr_coordinates(x["checksum"], d["long"], d["lat"], d["formatted_address"], d["place_id"])
+                    update_addr_coordinates(x, d["long"], d["lat"], d["formatted_address"], d["place_id"])
                 )
 
         return d
@@ -3801,6 +3964,9 @@ async def get_npi(request, npi):
             data["address_list"] = []
     else:
         data["address_list"] = []
+    for address in data["address_list"]:
+        if isinstance(address, dict):
+            address.pop("address_key", None)
 
     other_names_task = asyncio.create_task(_fetch_other_names(npi))
     if provider_enrichment_view == "summary":
@@ -3870,6 +4036,7 @@ async def get_npi(request, npi):
                 "chain_enrollment_ids": [],
             }
 
+    _redact_internal_address_fields(data)
     return response.json(data, default=str)
 
 
@@ -3881,9 +4048,20 @@ async def _build_npi_details(npi: int, *, session: Any = None) -> dict:
     filter_capabilities = await _resolve_npi_filter_capabilities(session=session)
     procedures_array_available = bool(filter_capabilities.get("npi_procedures_array_available", True))
     medications_array_available = bool(filter_capabilities.get("npi_medications_array_available", True))
+    existing_address_columns = await _table_columns(NPIAddress.__tablename__, session=session)
+    if not existing_address_columns:
+        existing_address_columns = _model_table_columns(NPIAddress)
 
     address_columns = []
     for column in address_table.columns:
+        if column.key in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
+            continue
+        if column.key not in existing_address_columns:
+            if column.key == "procedures_array":
+                address_columns.append(literal_column("'{}'::INTEGER[]").label("procedures_array"))
+            elif column.key == "medications_array":
+                address_columns.append(literal_column("'{}'::INTEGER[]").label("medications_array"))
+            continue
         if column.key == "procedures_array" and not procedures_array_available:
             address_columns.append(literal_column("'{}'::INTEGER[]").label("procedures_array"))
             continue

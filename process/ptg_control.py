@@ -20,7 +20,7 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
     try:
         await mark_control_run(run_id, status="running", phase_detail="ptg import running", progress_message="running")
         await raise_if_cancelled(ctx, payload)
-        await ptg_main(
+        result = await ptg_main(
             test_mode=bool(params.get("test_mode", params.get("test", False))),
             toc_urls=_string_list(params.get("toc_urls") or params.get("toc_url")),
             toc_list=params.get("toc_list"),
@@ -54,9 +54,17 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
         )
         await _flush_terminal_status_events()
         raise
-    await mark_control_run(run_id, status="succeeded", phase_detail="ptg import succeeded", progress_message="succeeded")
+    result_metrics = result if isinstance(result, dict) else {}
+    await mark_control_run(
+        run_id,
+        status="succeeded",
+        phase_detail="ptg import succeeded",
+        progress_message="succeeded",
+        metrics=result_metrics or None,
+        snapshot_id=str(result_metrics.get("snapshot_id") or "").strip() or None,
+    )
     await _flush_terminal_status_events()
-    return {"status": "succeeded", "run_id": run_id}
+    return {**result_metrics, "status": "succeeded", "run_id": run_id}
 
 
 async def _flush_terminal_status_events() -> None:

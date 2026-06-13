@@ -28,9 +28,16 @@ from api import init_api  # noqa: E402
 from db.migrator import db_group  # noqa: E402
 from process import process_group, process_group_end  # noqa: E402
 
-uvloop.install()
-asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-asyncio.set_event_loop(asyncio.new_event_loop())
+
+def _new_event_loop():
+    return uvloop.new_event_loop()
+
+
+def _run_async(coro):
+    return uvloop.run(coro)
+
+
+asyncio.set_event_loop(_new_event_loop())
 
 api = Sanic('mrf-api', env_prefix="HLTHPRT_")
 init_api(api)
@@ -92,12 +99,12 @@ def cli():
         if loop.is_closed():
             raise RuntimeError
     except RuntimeError:
-        loop = asyncio.new_event_loop()
+        loop = _new_event_loop()
         asyncio.set_event_loop(loop)
     else:
         # If uvloop is installed (set above), ensure the active loop uses uvloop's implementation.
         if uvloop is not None and not isinstance(loop, uvloop.Loop):
-            loop = uvloop.new_event_loop()
+            loop = _new_event_loop()
             asyncio.set_event_loop(loop)
 
 
@@ -120,7 +127,7 @@ def sync_structure(skip_columns: bool, skip_indexes: bool):
     from db.maintenance import render_sync_summary
     from db.maintenance import sync_structure as _sync_structure  # lazy import
 
-    results = asyncio.run(
+    results = _run_async(
         _sync_structure(add_columns=not skip_columns, add_indexes=not skip_indexes)
     )
     render_sync_summary(results)
@@ -133,7 +140,7 @@ def rebuild_plan_summary(test: bool):
     from process.plan_summary import \
         rebuild_plan_search_summary as _rebuild  # lazy import
 
-    rows = asyncio.run(_rebuild(test_mode=test))
+    rows = _run_async(_rebuild(test_mode=test))
     click.echo(f"Rebuilt plan_search_summary with {rows} rows")
 
 

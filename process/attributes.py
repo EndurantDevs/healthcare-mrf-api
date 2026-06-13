@@ -16,7 +16,6 @@ import pytz
 from aiocsv import AsyncDictReader
 from aiofile import async_open
 from arq import create_pool
-from async_unzip.unzipper import unzip
 from dateutil.parser import parse as parse_date
 from sqlalchemy.exc import IntegrityError
 
@@ -24,6 +23,7 @@ from api.for_human import plan_attributes_labels_to_key
 from db.connection import init_db
 from db.models import (PlanAttributes, PlanBenefits, PlanPrices,
                        PlanRatingAreas, db)
+from process.ext.archive import unzip
 from process.ext.utils import (download_it_and_save, ensure_database,
                                get_import_schema, make_class, print_time_info,
                                push_objects, return_checksum)

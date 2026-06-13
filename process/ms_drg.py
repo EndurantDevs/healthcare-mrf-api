@@ -18,6 +18,11 @@ from db.models import CodeCatalog, CodeRelationship, CodeSynonym, db
 from process.control_cancel import ImportCancelledError
 from process.ext.utils import ensure_database, make_class, push_objects
 from process.redis_config import build_redis_settings
+from process.url_security import fetch_max_bytes, urlopen_safe
+
+# Tighter default cap for MS-DRG: these are CMS HTML TOC/index pages, not bulk MRF
+# downloads. HLTHPRT_FETCH_MAX_BYTES overrides it per deployment.
+MS_DRG_DEFAULT_MAX_BYTES = 64 * 1024 * 1024
 
 try:
     import redis
@@ -112,10 +117,12 @@ def _download_text(url: str) -> str:
             "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8",
         },
     )
-    with urllib.request.urlopen(request, timeout=120) as response:
-        raw = response.read()
-        charset = response.headers.get_content_charset() or "utf-8"
-    return raw.decode(charset, errors="replace")
+    raw, charset = urlopen_safe(
+        request,
+        timeout=120,
+        max_bytes=fetch_max_bytes(MS_DRG_DEFAULT_MAX_BYTES),
+    )
+    return raw.decode(charset or "utf-8", errors="replace")
 
 
 def _parse_tables(source_html: str) -> list[list[str]]:

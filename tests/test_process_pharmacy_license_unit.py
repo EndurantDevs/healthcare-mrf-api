@@ -2,6 +2,9 @@ import importlib
 import datetime
 import io
 import zipfile
+from unittest.mock import AsyncMock
+
+import pytest
 
 pharmacy_license = importlib.import_module("process.pharmacy_license")
 
@@ -30,6 +33,107 @@ def test_normalize_license_status_maps_known_values():
     assert pharmacy_license._normalize_license_status("Clear") == "active"
     assert pharmacy_license._normalize_license_status("Null And Void") == "inactive"
     assert pharmacy_license._normalize_license_status(None) == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_materialize_snapshot_aborts_on_canonical_address_failure(monkeypatch):
+    monkeypatch.setattr(pharmacy_license, "source_enabled", lambda source: source == "pharmacy_license")
+
+    async def fail_stamp(*_args, **_kwargs):
+        raise RuntimeError("collision")
+
+    monkeypatch.setattr(pharmacy_license, "stamp_address_keys", fail_stamp)
+
+    with pytest.raises(
+        pharmacy_license.PharmacyLicenseCanonicalAddressError,
+        match="canonical address resolve failed",
+    ):
+        await pharmacy_license._materialize_snapshot("mrf", "snapshot_1", "run_1")
+
+
+@pytest.mark.asyncio
+async def test_start_marks_run_failed_on_canonical_address_failure(monkeypatch):
+    run_updates = []
+    snapshot_updates = []
+    coverage_updates = []
+    control_updates = []
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    async def fake_download(*_args, **_kwargs):
+        return """
+        <h2>Board of Pharmacy License Databases by State</h2>
+        <a href="https://example.com/tx">Texas</a>
+        """
+
+    async def fake_import_state(*_args, **_kwargs):
+        return pharmacy_license.StateImportStats(
+            supported=True,
+            status="completed",
+            source_url="https://example.com/tx.csv",
+            unsupported_reason=None,
+            error_text=None,
+            row_count_parsed=1,
+            row_count_matched=1,
+            row_count_dropped=0,
+            row_count_inserted=0,
+            metadata={},
+        )
+
+    async def fail_materialize(*_args, **_kwargs):
+        raise pharmacy_license.PharmacyLicenseCanonicalAddressError("canonical collision")
+
+    class FakeClientSession:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+    async def fake_upsert_run(payload):
+        run_updates.append(payload)
+
+    async def fake_upsert_snapshot(payload):
+        snapshot_updates.append(payload)
+
+    async def fake_upsert_coverage(payload):
+        coverage_updates.append(payload)
+
+    async def fake_mark_control_run(run_id, **payload):
+        control_updates.append({"run_id": run_id, **payload})
+
+    monkeypatch.setattr(pharmacy_license, "ensure_database", noop)
+    monkeypatch.setattr(pharmacy_license, "_ensure_tables", AsyncMock(return_value="mrf"))
+    monkeypatch.setattr(pharmacy_license, "_truncate_stage_table", noop)
+    monkeypatch.setattr(pharmacy_license, "_drop_secondary_indexes", noop)
+    monkeypatch.setattr(pharmacy_license, "_ensure_secondary_indexes", noop)
+    monkeypatch.setattr(pharmacy_license, "_analyze_tables", noop)
+    monkeypatch.setattr(pharmacy_license, "download_it", fake_download)
+    monkeypatch.setattr(pharmacy_license, "_import_state_source", fake_import_state)
+    monkeypatch.setattr(pharmacy_license, "_materialize_snapshot", fail_materialize)
+    monkeypatch.setattr(pharmacy_license, "_upsert_run", fake_upsert_run)
+    monkeypatch.setattr(pharmacy_license, "_upsert_snapshot", fake_upsert_snapshot)
+    monkeypatch.setattr(pharmacy_license, "_upsert_coverage", fake_upsert_coverage)
+    monkeypatch.setattr(pharmacy_license, "mark_control_run", fake_mark_control_run)
+    monkeypatch.setattr(pharmacy_license, "enqueue_live_progress", lambda **_payload: None)
+    monkeypatch.setattr(pharmacy_license.aiohttp, "ClientSession", FakeClientSession)
+
+    with pytest.raises(pharmacy_license.PharmacyLicenseCanonicalAddressError, match="canonical collision"):
+        await pharmacy_license.pharmacy_license_start(
+            {},
+            {"run_id": "run_1", "import_id": "import_1", "test_mode": True},
+        )
+
+    assert run_updates[-1]["status"] == "failed"
+    assert run_updates[-1]["error_text"] == "canonical collision"
+    assert snapshot_updates[-1]["status"] == "failed"
+    assert coverage_updates[-1]["status"] == "failed"
+    assert control_updates[-1]["status"] == "failed"
+    assert control_updates[-1]["error"]["message"] == "canonical collision"
 
 
 def test_normalize_stage_row_drops_missing_npi():

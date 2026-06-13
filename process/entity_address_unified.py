@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 ENTITY_ADDRESS_UNIFIED_QUEUE_NAME = "arq:EntityAddressUnified"
 POSTGRES_IDENTIFIER_MAX_LENGTH = 63
-DEFAULT_MIN_ROWS = 10_000
+DEFAULT_MIN_ROWS = 1_000_000
 DEFAULT_TEST_LIMIT_PER_SOURCE = 20_000
 DEFAULT_SOURCE_CONCURRENCY = 3
 DEFAULT_AGGREGATE_SHARDS = 16
@@ -127,6 +127,14 @@ async def _table_exists(db_schema: str, table_name: str) -> bool:
     return bool(await db.scalar(f"SELECT to_regclass('{db_schema}.{table_name}') IS NOT NULL;"))
 
 
+async def _address_canon_available(db_schema: str) -> bool:
+    value = await db.scalar(
+        "SELECT to_regprocedure(:signature);",
+        signature=f"{db_schema}.addr_key_v1(text,text,text,text,text,text)",
+    )
+    return isinstance(value, str) and bool(value)
+
+
 def _npi_entity_name_expr(alias: str = "n") -> str:
     return (
         "NULLIF(TRIM("
@@ -206,6 +214,7 @@ def _source_priority_expr(expr: str) -> str:
         f"WHEN {expr} = 'provider_enrollment_ffs' THEN 2 "
         f"WHEN {expr} = 'provider_enrollment_ffs_address' THEN 3 "
         f"WHEN {expr} LIKE 'facility_anchor:%' THEN 4 "
+        f"WHEN {expr} = 'mrf' THEN 5 "
         "ELSE 9 END"
     )
 
@@ -256,6 +265,7 @@ def _source_selects(
     has_ffs = available.get("provider_enrollment_ffs", False)
     has_ffs_address = available.get("provider_enrollment_ffs_address", False)
     has_facility = available.get("facility_anchor", False)
+    has_mrf_address = available.get("mrf_address", False)
 
     npi_join = f"LEFT JOIN {db_schema}.npi AS n ON n.npi = a.npi" if has_npi else ""
     doctors_npi_join = f"LEFT JOIN {db_schema}.npi AS n ON n.npi = d.npi" if has_npi else ""
@@ -272,6 +282,14 @@ def _source_selects(
         f"LEFT JOIN LATERAL ("
         f"SELECT pa.taxonomy_array, pa.plans_network_array, pa.procedures_array, pa.medications_array "
         f"FROM {db_schema}.npi_address AS pa WHERE pa.npi = f.npi AND pa.type = 'primary' "
+        f"ORDER BY pa.checksum LIMIT 1) AS pa ON TRUE"
+        if has_npi_address
+        else ""
+    )
+    mrf_pa_from = (
+        f"LEFT JOIN LATERAL ("
+        f"SELECT pa.taxonomy_array, pa.plans_network_array, pa.procedures_array, pa.medications_array "
+        f"FROM {db_schema}.npi_address AS pa WHERE pa.npi = a.npi AND pa.type = 'primary' "
         f"ORDER BY pa.checksum LIMIT 1) AS pa ON TRUE"
         if has_npi_address
         else ""
@@ -436,8 +454,8 @@ def _source_selects(
                 {('COALESCE(pa.plans_network_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS plans_network_array,
                 {('COALESCE(pa.procedures_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS procedures_array,
                 {('COALESCE(pa.medications_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS medications_array,
-                f.address_line_1::varchar AS first_line,
-                f.address_line_2::varchar AS second_line,
+                NULL::varchar AS first_line,
+                NULL::varchar AS second_line,
                 fa.city::varchar AS city_name,
                 fa.state::varchar AS state_name,
                 LEFT(fa.zip_code, 5)::varchar AS postal_code,
@@ -500,6 +518,46 @@ def _source_selects(
             """
         )
 
+    if has_mrf_address:
+        selects.append(
+            f"""
+            SELECT
+                'npi'::varchar AS entity_type,
+                a.npi::varchar AS entity_id,
+                a.npi::bigint AS npi,
+                NULL::bigint AS inferred_npi,
+                NULL::float8 AS inference_confidence,
+                NULL::varchar AS inference_method,
+                {(_npi_entity_name_expr('n') if has_npi else 'NULL::varchar')} AS entity_name,
+                {(_npi_entity_subtype_expr('n') if has_npi else 'NULL::varchar')} AS entity_subtype,
+                COALESCE(NULLIF(a.type, ''), 'practice')::varchar AS type,
+                {('COALESCE(pa.taxonomy_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS taxonomy_array,
+                {('COALESCE(pa.plans_network_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS plans_network_array,
+                {('COALESCE(pa.procedures_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS procedures_array,
+                {('COALESCE(pa.medications_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS medications_array,
+                a.first_line::varchar AS first_line,
+                a.second_line::varchar AS second_line,
+                a.city_name::varchar AS city_name,
+                a.state_name::varchar AS state_name,
+                a.postal_code::varchar AS postal_code,
+                COALESCE(NULLIF(a.country_code, ''), 'US')::varchar AS country_code,
+                a.telephone_number::varchar AS telephone_number,
+                a.fax_number::varchar AS fax_number,
+                a.formatted_address::varchar AS formatted_address,
+                a.lat::numeric AS lat,
+                a.long::numeric AS long,
+                a.date_added::date AS date_added,
+                a.place_id::varchar AS place_id,
+                NOW()::timestamp AS updated_at,
+                'mrf'::varchar AS address_source,
+                ('mrf:' || a.npi::varchar || ':' || COALESCE(a.type, '') || ':' || COALESCE(a.checksum::varchar, '0'))::varchar AS source_record_id
+              FROM {db_schema}.mrf_address AS a
+              {npi_join}
+              {mrf_pa_from}
+             WHERE a.npi IS NOT NULL
+            """
+        )
+
     if test_limit_per_source and test_limit_per_source > 0:
         return [
             "(\n"
@@ -548,12 +606,64 @@ def _prepare_raw_stage_sql(db_schema: str, raw_table: str, *, unlogged: bool = T
         source_priority int NOT NULL,
         address_source varchar,
         source_record_id varchar,
-        checksum int NOT NULL
+        address_key uuid,
+        checksum bigint NOT NULL
     );
     """
 
 
-def _insert_raw_from_source_sql(db_schema: str, raw_table: str, source_select: str) -> str:
+def _address_key_expr(db_schema: str, available: bool) -> str:
+    if available:
+        return (
+            f"{db_schema}.addr_key_v1("
+            "first_line, second_line, city_name, state_name, postal_code, country_code"
+            ")"
+        )
+    return "NULL::uuid"
+
+
+def _key_v2_enabled() -> bool:
+    return _env_bool("HLTHPRT_ENTITY_ADDRESS_UNIFIED_KEY_V2", False)
+
+
+def _dedupe_key_expr(address_canon_available: bool) -> str:
+    if not _key_v2_enabled():
+        return "checksum::text"
+    if not address_canon_available:
+        raise RuntimeError(
+            "HLTHPRT_ENTITY_ADDRESS_UNIFIED_KEY_V2 requires canonical address SQL functions"
+        )
+    return "COALESCE(address_key::text, checksum::text)"
+
+
+def _validate_publish_row_count(
+    *,
+    stage_rows: int,
+    previous_rows: int,
+    test_mode: bool,
+    min_rows_required: int,
+) -> None:
+    if test_mode:
+        return
+    if stage_rows < min_rows_required:
+        raise RuntimeError(
+            f"EntityAddressUnified stage row count {stage_rows} below minimum {min_rows_required}; aborting publish."
+        )
+    min_delta_rows = int(previous_rows * 0.8)
+    if previous_rows > 0 and stage_rows < min_delta_rows:
+        raise RuntimeError(
+            "EntityAddressUnified stage row count "
+            f"{stage_rows} below 80% of previous publish {previous_rows}; aborting publish."
+        )
+
+
+def _insert_raw_from_source_sql(
+    db_schema: str,
+    raw_table: str,
+    source_select: str,
+    *,
+    address_canon_available: bool = True,
+) -> str:
     return f"""
     INSERT INTO {db_schema}.{raw_table} (
         entity_type,
@@ -586,6 +696,7 @@ def _insert_raw_from_source_sql(db_schema: str, raw_table: str, source_select: s
         source_priority,
         address_source,
         source_record_id,
+        address_key,
         checksum
     )
     WITH base_rows AS (
@@ -622,7 +733,8 @@ def _insert_raw_from_source_sql(db_schema: str, raw_table: str, source_select: s
             {_source_priority_expr("address_source")}::int AS source_priority,
             address_source::varchar AS address_source,
             source_record_id::varchar AS source_record_id,
-            updated_at::timestamp AS updated_at
+            updated_at::timestamp AS updated_at,
+            {_address_key_expr(db_schema, address_canon_available)} AS address_key
           FROM base_rows
     ),
     normalized AS (
@@ -657,6 +769,7 @@ def _insert_raw_from_source_sql(db_schema: str, raw_table: str, source_select: s
             address_source,
             source_record_id,
             updated_at,
+            address_key,
             {_address_checksum_expr(
                 first_line_expr=_alnum_norm_expr("first_line"),
                 second_line_expr=_alnum_norm_expr("second_line"),
@@ -699,6 +812,7 @@ def _insert_raw_from_source_sql(db_schema: str, raw_table: str, source_select: s
         source_priority,
         address_source,
         source_record_id,
+        address_key,
         checksum
       FROM normalized;
     """
@@ -711,6 +825,7 @@ def _materialize_from_raw_sql(
     *,
     checksum_modulo: int | None = None,
     checksum_remainder: int | None = None,
+    address_canon_available: bool = True,
 ) -> str:
     shard_filter = ""
     if checksum_modulo and checksum_modulo > 1 and checksum_remainder is not None:
@@ -718,6 +833,7 @@ def _materialize_from_raw_sql(
             " WHERE mod(abs(COALESCE(checksum, 0)), "
             f"{int(checksum_modulo)}) = {int(checksum_remainder)}"
         )
+    dedupe_key_expr = _dedupe_key_expr(address_canon_available)
     return f"""
     INSERT INTO {db_schema}.{stage_table} (
         entity_type,
@@ -751,6 +867,7 @@ def _materialize_from_raw_sql(
         long,
         date_added,
         place_id,
+        address_key,
         updated_at
     )
     WITH aggregated AS (
@@ -758,7 +875,7 @@ def _materialize_from_raw_sql(
             entity_type,
             entity_id,
             type,
-            checksum,
+            (ARRAY_AGG(checksum ORDER BY source_priority ASC, updated_at DESC NULLS LAST))[1]::bigint AS checksum,
             MAX(npi)::bigint AS npi,
             MAX(inferred_npi)::bigint AS inferred_npi,
             MAX(inference_confidence)::float8 AS inference_confidence,
@@ -782,12 +899,13 @@ def _materialize_from_raw_sql(
             (ARRAY_AGG(long ORDER BY source_priority ASC, (long IS NULL), updated_at DESC NULLS LAST))[1]::numeric AS long,
             MAX(date_added)::date AS date_added,
             MAX(place_id)::varchar AS place_id,
+            (ARRAY_AGG(address_key ORDER BY source_priority ASC, (address_key IS NULL), updated_at DESC NULLS LAST))[1]::uuid AS address_key,
             ARRAY_REMOVE(ARRAY_AGG(DISTINCT address_source ORDER BY address_source), NULL)::varchar[] AS address_sources,
             ARRAY_REMOVE(ARRAY_AGG(DISTINCT source_record_id ORDER BY source_record_id), NULL)::varchar[] AS source_record_ids,
             MAX(updated_at)::timestamp AS updated_at
           FROM {db_schema}.{raw_table}
          {shard_filter}
-         GROUP BY entity_type, entity_id, type, checksum
+         GROUP BY entity_type, entity_id, type, {dedupe_key_expr}
     )
     SELECT
         entity_type,
@@ -821,13 +939,21 @@ def _materialize_from_raw_sql(
         long,
         date_added,
         place_id,
+        address_key,
         updated_at
       FROM aggregated;
     """
 
 
-def _materialize_sql(db_schema: str, stage_table: str, source_selects: Iterable[str]) -> str:
+def _materialize_sql(
+    db_schema: str,
+    stage_table: str,
+    source_selects: Iterable[str],
+    *,
+    address_canon_available: bool = True,
+) -> str:
     selects_sql = "\nUNION ALL\n".join(select.strip() for select in source_selects)
+    dedupe_key_expr = _dedupe_key_expr(address_canon_available)
     return f"""
     INSERT INTO {db_schema}.{stage_table} (
         entity_type,
@@ -861,6 +987,7 @@ def _materialize_sql(db_schema: str, stage_table: str, source_selects: Iterable[
         long,
         date_added,
         place_id,
+        address_key,
         updated_at
     )
     WITH base_rows AS (
@@ -897,7 +1024,8 @@ def _materialize_sql(db_schema: str, stage_table: str, source_selects: Iterable[
             {_source_priority_expr("address_source")}::int AS source_priority,
             address_source::varchar AS address_source,
             source_record_id::varchar AS source_record_id,
-            updated_at::timestamp AS updated_at
+            updated_at::timestamp AS updated_at,
+            {_address_key_expr(db_schema, address_canon_available)} AS address_key
           FROM base_rows
     ),
     normalized AS (
@@ -932,6 +1060,7 @@ def _materialize_sql(db_schema: str, stage_table: str, source_selects: Iterable[
             address_source,
             source_record_id,
             updated_at,
+            address_key,
             {_address_checksum_expr(
                 first_line_expr=_alnum_norm_expr("first_line"),
                 second_line_expr=_alnum_norm_expr("second_line"),
@@ -948,7 +1077,7 @@ def _materialize_sql(db_schema: str, stage_table: str, source_selects: Iterable[
             entity_type,
             entity_id,
             type,
-            checksum,
+            (ARRAY_AGG(checksum ORDER BY source_priority ASC, updated_at DESC NULLS LAST))[1]::bigint AS checksum,
             MAX(npi)::bigint AS npi,
             MAX(inferred_npi)::bigint AS inferred_npi,
             MAX(inference_confidence)::float8 AS inference_confidence,
@@ -972,11 +1101,12 @@ def _materialize_sql(db_schema: str, stage_table: str, source_selects: Iterable[
             (ARRAY_AGG(long ORDER BY source_priority ASC, (long IS NULL), updated_at DESC NULLS LAST))[1]::numeric AS long,
             MAX(date_added)::date AS date_added,
             MAX(place_id)::varchar AS place_id,
+            (ARRAY_AGG(address_key ORDER BY source_priority ASC, (address_key IS NULL), updated_at DESC NULLS LAST))[1]::uuid AS address_key,
             ARRAY_REMOVE(ARRAY_AGG(DISTINCT address_source ORDER BY address_source), NULL)::varchar[] AS address_sources,
             ARRAY_REMOVE(ARRAY_AGG(DISTINCT source_record_id ORDER BY source_record_id), NULL)::varchar[] AS source_record_ids,
             MAX(updated_at)::timestamp AS updated_at
           FROM normalized
-      GROUP BY entity_type, entity_id, type, checksum
+      GROUP BY entity_type, entity_id, type, {dedupe_key_expr}
     )
     SELECT
         entity_type,
@@ -1010,6 +1140,7 @@ def _materialize_sql(db_schema: str, stage_table: str, source_selects: Iterable[
         long,
         date_added,
         place_id,
+        address_key,
         updated_at
       FROM aggregated;
     """
@@ -1149,7 +1280,7 @@ def _inference_sql(
             NULL::varchar AS entity_type,
             NULL::varchar AS entity_id,
             NULL::varchar AS type,
-            NULL::integer AS checksum,
+            NULL::bigint AS checksum,
             NULL::bigint AS candidate_npi,
             0::int AS candidate_npi_count
          WHERE FALSE
@@ -1190,7 +1321,7 @@ def _inference_sql(
             NULL::varchar AS entity_type,
             NULL::varchar AS entity_id,
             NULL::varchar AS type,
-            NULL::integer AS checksum,
+            NULL::bigint AS checksum,
             NULL::bigint AS candidate_npi,
             0::int AS candidate_npi_count
          WHERE FALSE
@@ -1634,6 +1765,7 @@ async def process_data(ctx, task=None):
         "provider_enrollment_ffs",
         "provider_enrollment_ffs_address",
         "facility_anchor",
+        "mrf_address",
         "geo_zip_lookup",
     ]
     available = {table: await _table_exists(db_schema, table) for table in required_checks}
@@ -1653,6 +1785,33 @@ async def process_data(ctx, task=None):
         available,
         test_limit_per_source=test_limit_per_source,
     )
+    address_canon_available = await _address_canon_available(db_schema)
+    if not address_canon_available:
+        message = (
+            "canonical address SQL functions are not available; "
+            "entity_address_unified will publish with NULL address_key values"
+        )
+        if run_id:
+            enqueue_live_progress(
+                run_id=run_id,
+                importer="entity-address-unified",
+                status="warning",
+                phase="entity-address-unified canonical unavailable",
+                unit="address_key",
+                done=0,
+                total=1,
+                pct=0,
+                message=message,
+            )
+        if _key_v2_enabled():
+            raise RuntimeError(
+                "HLTHPRT_ENTITY_ADDRESS_UNIFIED_KEY_V2 requires canonical address SQL functions"
+            )
+        logger.warning(
+            "Canonical address SQL functions are not available in schema %s; "
+            "entity_address_unified will publish with NULL address_key values.",
+            db_schema,
+        )
     if not source_selects:
         raise RuntimeError("No source tables are available for entity_address_unified materialization.")
     if run_id:
@@ -1700,7 +1859,14 @@ async def process_data(ctx, task=None):
         async def _load_source(select_sql: str) -> None:
             nonlocal loaded_sources
             async with sem:
-                await db.status(_insert_raw_from_source_sql(db_schema, raw_table, select_sql))
+                await db.status(
+                    _insert_raw_from_source_sql(
+                        db_schema,
+                        raw_table,
+                        select_sql,
+                        address_canon_available=address_canon_available,
+                    )
+                )
             if run_id:
                 async with source_progress_lock:
                     loaded_sources += 1
@@ -1749,6 +1915,7 @@ async def process_data(ctx, task=None):
                     raw_table,
                     checksum_modulo=aggregate_shards,
                     checksum_remainder=remainder,
+                    address_canon_available=address_canon_available,
                 )
             )
             if run_id:
@@ -1774,7 +1941,14 @@ async def process_data(ctx, task=None):
 
             await asyncio.gather(*(_guarded_aggregate(i) for i in range(aggregate_shards)))
         else:
-            await db.status(_materialize_from_raw_sql(db_schema, stage_table, raw_table))
+            await db.status(
+                _materialize_from_raw_sql(
+                    db_schema,
+                    stage_table,
+                    raw_table,
+                    address_canon_available=address_canon_available,
+                )
+            )
 
         await db.status(f"DROP TABLE IF EXISTS {db_schema}.{raw_table};")
     else:
@@ -1790,7 +1964,14 @@ async def process_data(ctx, task=None):
                 message="materializing sources",
             )
         await db.status(f"TRUNCATE TABLE {db_schema}.{stage_table};")
-        await db.status(_materialize_sql(db_schema, stage_table, source_selects))
+        await db.status(
+            _materialize_sql(
+                db_schema,
+                stage_table,
+                source_selects,
+                address_canon_available=address_canon_available,
+            )
+        )
         if run_id:
             enqueue_live_progress(
                 run_id=run_id,
@@ -1917,12 +2098,20 @@ async def shutdown(ctx):
     min_rows_required = int(
         os.getenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_MIN_ROWS", str(DEFAULT_MIN_ROWS))
     )
+    previous_rows = 0
+    if await _table_exists(db_schema, EntityAddressUnified.__main_table__):
+        previous_rows = int(
+            await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{EntityAddressUnified.__main_table__};")
+            or 0
+        )
     if context.get("test_mode"):
         logger.info("EntityAddressUnified test mode: staged rows=%d", stage_rows)
-    elif stage_rows < min_rows_required:
-        raise RuntimeError(
-            f"EntityAddressUnified stage row count {stage_rows} below minimum {min_rows_required}; aborting publish."
-        )
+    _validate_publish_row_count(
+        stage_rows=stage_rows,
+        previous_rows=previous_rows,
+        test_mode=bool(context.get("test_mode")),
+        min_rows_required=min_rows_required,
+    )
 
     async with db.transaction():
         table = EntityAddressUnified.__main_table__

@@ -8,6 +8,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 import zipfile
 from pathlib import PurePath
 
@@ -16,7 +17,6 @@ from aiocsv import AsyncDictReader
 from aiofile import async_open
 from arq import create_pool
 from arq.connections import RedisSettings
-from async_unzip.unzipper import unzip
 from asyncpg import DuplicateTableError
 from dateutil.parser import parse as parse_date
 from sqlalchemy import func, select
@@ -26,6 +26,14 @@ from db.models import (AddressArchive, NPIAddress, NPIData,
                        NPIDataTaxonomyGroup, NPIPhoneStaffing, db)
 from process.control_cancel import raise_if_cancelled
 from process.control_lifecycle import mark_control_run
+from process.ext.archive import unzip
+from process.ext.address_canon import (
+    address_key_v1,
+    archive_table_name,
+    resolve_into_archive,
+    source_enabled,
+    stamp_address_keys,
+)
 from process.ext.utils import (download_it, download_it_and_save,
                                ensure_database, make_class, my_init_db,
                                print_time_info, push_objects, return_checksum)
@@ -42,6 +50,11 @@ TEST_NPI_SECONDARY_ROWS = 1000
 NPI_QUEUE_NAME = "arq:NPI"
 DEFAULT_NPI_MAX_PENDING_SAVE_TASKS = 4
 POSTGRES_IDENTIFIER_MAX_LENGTH = 63
+ADDRESS_KEY_MISMATCH_MESSAGE = "Stamped canonical address key does not match identity_key"
+
+
+class NPIPrerequisiteError(RuntimeError):
+    """Raised when a full NPI import would publish incomplete derived data."""
 
 
 def _env_positive_int(name: str, default: int) -> int:
@@ -53,6 +66,13 @@ def _env_positive_int(name: str, default: int) -> int:
         return value if value > 0 else default
     except (TypeError, ValueError):
         return default
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _archived_identifier(name: str, suffix: str = "_old") -> str:
@@ -72,6 +92,76 @@ def _index_requires_postgis(index: dict) -> bool:
     return "st_makepoint" in elements or "geography" in elements
 
 
+def _npi_requires_nucc(context: dict | None = None) -> bool:
+    context = context or {}
+    if context.get("test_mode"):
+        return _env_bool("HLTHPRT_NPI_REQUIRE_NUCC_IN_TEST", False)
+    return _env_bool("HLTHPRT_NPI_REQUIRE_NUCC", True)
+
+
+async def _assert_nucc_ready(schema: str) -> None:
+    exists = await db.scalar(f"SELECT to_regclass('{schema}.nucc_taxonomy');")
+    if not exists:
+        raise NPIPrerequisiteError(
+            f"NPI import requires {schema}.nucc_taxonomy. Run the NUCC importer before NPI "
+            "or set HLTHPRT_NPI_REQUIRE_NUCC=0 to explicitly skip NPI phone-staffing output."
+        )
+    total_rows = int(await db.scalar(f"SELECT count(*) FROM {schema}.nucc_taxonomy;") or 0)
+    pharmacist_rows = int(
+        await db.scalar(
+            f"""
+            SELECT count(*)
+             FROM {schema}.nucc_taxonomy
+             WHERE lower(classification) = 'pharmacist'
+               AND int_code IS NOT NULL;
+            """
+        )
+        or 0
+    )
+    if total_rows <= 0 or pharmacist_rows <= 0:
+        raise NPIPrerequisiteError(
+            f"NPI import requires populated {schema}.nucc_taxonomy with pharmacist taxonomy codes. "
+            f"Found rows={total_rows}, pharmacist_rows={pharmacist_rows}. Run `python main.py start nucc` "
+            "and its worker before NPI, or set HLTHPRT_NPI_REQUIRE_NUCC=0 to explicitly skip "
+            "NPI phone-staffing output."
+        )
+
+
+async def _assert_nppes_canonical_ready(schema: str) -> None:
+    if not source_enabled("nppes"):
+        return
+    function_exists = await db.scalar(
+        f"SELECT to_regprocedure('{schema}.addr_key_v1(text,text,text,text,text,text)');"
+    )
+    if not function_exists:
+        raise NPIPrerequisiteError(
+            f"NPI canonical address mode requires {schema}.addr_key_v1(...). "
+            "Run the address-canonical migration before enabling HLTHPRT_ADDRESS_CANON_SOURCES=nppes."
+        )
+    archive_table = archive_table_name()
+    archive_exists = await db.scalar(f"SELECT to_regclass('{schema}.{archive_table}');")
+    if not archive_exists:
+        raise NPIPrerequisiteError(
+            f"NPI canonical address mode requires {schema}.{archive_table}. "
+            "Run address-archive-v2 migration/backfill or set HLTHPRT_ADDRESS_ARCHIVE_TABLE correctly."
+        )
+    archive_has_key = await db.scalar(
+        f"""
+        SELECT EXISTS (
+            SELECT 1
+              FROM information_schema.columns
+             WHERE table_schema = '{schema}'
+               AND table_name = '{archive_table}'
+               AND column_name = 'address_key'
+        );
+        """
+    )
+    if not archive_has_key:
+        raise NPIPrerequisiteError(
+            f"NPI canonical address mode requires {schema}.{archive_table}.address_key."
+        )
+
+
 async def _ensure_required_extensions() -> None:
     for extension in ("pg_trgm", "intarray", "btree_gin"):
         await db.status(f"CREATE EXTENSION IF NOT EXISTS {extension};")
@@ -80,8 +170,57 @@ async def _ensure_required_extensions() -> None:
 def is_test_mode(ctx: dict) -> bool:
     return bool(ctx.get("context", {}).get("test_mode"))
 
+
+def _attach_npi_address_key(address: dict, *, canonical_enabled: bool) -> dict:
+    if not canonical_enabled:
+        return address
+    address["address_key"] = address_key_v1(
+        address.get("first_line"),
+        address.get("second_line"),
+        address.get("city_name"),
+        address.get("state_name"),
+        address.get("postal_code"),
+        address.get("country_code") or "US",
+    )
+    return address
+
+
+def _is_address_key_mismatch_error(exc: BaseException) -> bool:
+    return ADDRESS_KEY_MISMATCH_MESSAGE in str(exc)
+
+
+async def _load_nucc_taxonomy_int_code_map(schema: str) -> dict[str, int]:
+    if not await db.scalar(f"SELECT to_regclass('{schema}.nucc_taxonomy');"):
+        return {}
+    rows = await db.all(
+        f"""
+        SELECT code, int_code
+          FROM {schema}.nucc_taxonomy
+         WHERE code IS NOT NULL
+           AND int_code IS NOT NULL;
+        """
+    )
+    return {str(row[0]): int(row[1]) for row in rows if row and row[0] is not None and row[1] is not None}
+
+
+def _taxonomy_array_from_npi_row(row: dict, taxonomy_int_code_map: dict[str, int] | None) -> list[int]:
+    if not taxonomy_int_code_map:
+        return [0]
+    int_codes: set[int] = set()
+    for i in range(1, 16):
+        taxonomy_code = row.get(f'Healthcare Provider Taxonomy Code_{i}')
+        if not taxonomy_code:
+            break
+        int_code = taxonomy_int_code_map.get(taxonomy_code)
+        if int_code is not None:
+            int_codes.add(int(int_code))
+    return sorted(int_codes) if int_codes else [0]
+
+
 async def process_npi_chunk(ctx, task):
     redis = ctx['redis']
+    canonical_addresses_enabled = source_enabled("nppes")
+    taxonomy_int_code_map = task.get("taxonomy_int_code_map") or {}
 
     npi_obj_list = []
     npi_taxonomy_list_dict = {}
@@ -107,6 +246,7 @@ async def process_npi_chunk(ctx, task):
             obj[npi_csv_map[key]] = t
 
         npi_obj_list.append(obj)
+        taxonomy_array = _taxonomy_array_from_npi_row(row, taxonomy_int_code_map)
 
         if row['Provider First Line Business Practice Location Address']:
             obj = {
@@ -124,10 +264,12 @@ async def process_npi_chunk(ctx, task):
                 'type': 'primary',
                 'telephone_number': row['Provider Business Practice Location Address Telephone Number'],
                 'fax_number': row['Provider Business Practice Location Address Fax Number'],
+                'taxonomy_array': taxonomy_array,
                 'date_added': pytz.utc.localize(parse_date(row['Last Update Date'], fuzzy=True))
                 if row['Last Update Date']
                 else None,
             })
+            _attach_npi_address_key(obj, canonical_enabled=canonical_addresses_enabled)
             npi_address_list_dict['_'.join([str(obj['npi']), str(obj['checksum']), obj['type'],])] = obj
 
         if row['Provider First Line Business Mailing Address']:
@@ -146,10 +288,12 @@ async def process_npi_chunk(ctx, task):
                 'type': 'mail',
                 'telephone_number': row['Provider Business Mailing Address Telephone Number'],
                 'fax_number': row['Provider Business Mailing Address Fax Number'],
+                'taxonomy_array': taxonomy_array,
                 'date_added': pytz.utc.localize(parse_date(row['Last Update Date'], fuzzy=True))
                 if row['Last Update Date']
                 else None,
             })
+            _attach_npi_address_key(obj, canonical_enabled=canonical_addresses_enabled)
 
             npi_address_list_dict['_'.join([str(obj['npi']), str(obj['checksum']), obj['type'],])] = obj
 
@@ -221,10 +365,19 @@ async def process_data(ctx, task=None):  # pragma: no cover
     if 'test_mode' in task:
         context['test_mode'] = bool(task.get('test_mode'))
     test_mode = bool(context.get('test_mode', False))
+    canonical_addresses_enabled = source_enabled("nppes")
     await ensure_database(test_mode)
     await _ensure_required_extensions()
 
     import_date = ctx['import_date']
+    db_schema = os.getenv('HLTHPRT_DB_SCHEMA') if os.getenv('HLTHPRT_DB_SCHEMA') else 'mrf'
+    if _npi_requires_nucc(context):
+        await _assert_nucc_ready(db_schema)
+    if canonical_addresses_enabled:
+        await _assert_nppes_canonical_ready(db_schema)
+    taxonomy_int_code_map = await _load_nucc_taxonomy_int_code_map(db_schema)
+    if taxonomy_int_code_map:
+        print(f"Loaded {len(taxonomy_int_code_map)} NUCC taxonomy integer codes for NPI address load.")
     print(os.environ['HLTHPRT_NPPES_DOWNLOAD_URL_DIR'] + os.environ['HLTHPRT_NPPES_DOWNLOAD_URL_FILE'])
     html_source = await download_it(
         os.environ['HLTHPRT_NPPES_DOWNLOAD_URL_DIR'] + os.environ['HLTHPRT_NPPES_DOWNLOAD_URL_FILE'])
@@ -418,6 +571,7 @@ async def process_data(ctx, task=None):  # pragma: no cover
                             'row_list': row_list.copy(),
                             'npi_csv_map': npi_csv_map,
                             'npi_csv_map_reverse': npi_csv_map_reverse,
+                            'taxonomy_int_code_map': taxonomy_int_code_map,
                             'direct': True,
                         }
                         await enqueue_or_flush(coros, process_npi_chunk(ctx, payload))
@@ -432,6 +586,7 @@ async def process_data(ctx, task=None):  # pragma: no cover
                 'row_list': row_list.copy(),
                 'npi_csv_map': npi_csv_map,
                 'npi_csv_map_reverse': npi_csv_map_reverse,
+                'taxonomy_int_code_map': taxonomy_int_code_map,
                 'direct': True,
             }
             await raise_if_cancelled(ctx, task)
@@ -515,6 +670,7 @@ async def process_data(ctx, task=None):  # pragma: no cover
                         'fax_number': row['Provider Practice Location Address - Fax Number'],
                         'date_added': pytz.utc.localize(datetime.datetime.now())
                     })
+                    _attach_npi_address_key(obj, canonical_enabled=canonical_addresses_enabled)
                     npi_address_list_dict['_'.join([str(obj['npi']), str(obj['checksum']), obj['type'], ])] = obj
 
                     if count > current_sql_chunk_size:
@@ -583,7 +739,11 @@ async def startup(ctx):  # pragma: no cover
     ctx['context']['run'] = 0
     ctx['context']['test_mode'] = False
     await ensure_database(False)
-    ctx['import_date'] = datetime.datetime.now().strftime("%Y%m%d")
+    override_import_id = os.getenv("HLTHPRT_IMPORT_ID_OVERRIDE")
+    if override_import_id:
+        ctx['import_date'] = override_import_id
+    else:
+        ctx['import_date'] = datetime.datetime.now().strftime("%Y%m%d")
     import_date = ctx['import_date']
     db_schema = os.getenv('HLTHPRT_DB_SCHEMA') if os.getenv('HLTHPRT_DB_SCHEMA') else 'mrf'
 
@@ -638,7 +798,7 @@ async def refresh_do_business_as(
     target_table: str | None = None,
     source_table: str | None = None,
     test_mode: bool | None = None,
-):
+) -> tuple[int, int] | None:
     """
     Populate the NPI.do_business_as array from other identifier entries (type code 3).
     """
@@ -654,12 +814,6 @@ async def refresh_do_business_as(
         print(f"Skipping do_business_as refresh: source table {db_schema}.{source} does not exist.")
         return
 
-    reset_sql = (
-        f"UPDATE {db_schema}.{table} "
-        f"SET do_business_as = ARRAY[]::varchar[], do_business_as_text = ''"
-    )
-    await db.status(reset_sql)
-
     update_sql = f"""
         WITH sub AS (
             SELECT
@@ -668,16 +822,148 @@ async def refresh_do_business_as(
                 STRING_AGG(DISTINCT other_provider_identifier, ' ' ORDER BY other_provider_identifier) AS search_text
             FROM {db_schema}.{source}
             WHERE other_provider_identifier_type_code = '3'
+              AND NULLIF(other_provider_identifier, '') IS NOT NULL
             GROUP BY npi
+        ),
+        updated AS (
+            UPDATE {db_schema}.{table} AS n
+            SET
+                do_business_as = sub.names,
+                do_business_as_text = COALESCE(sub.search_text, '')
+            FROM sub
+            WHERE n.npi = sub.npi
+              AND (
+                    n.do_business_as IS DISTINCT FROM sub.names
+                 OR COALESCE(n.do_business_as_text, '') IS DISTINCT FROM COALESCE(sub.search_text, '')
+              )
+            RETURNING 1
         )
-        UPDATE {db_schema}.{table} AS n
-        SET
-            do_business_as = sub.names,
-            do_business_as_text = COALESCE(sub.search_text, '')
-        FROM sub
-        WHERE n.npi = sub.npi;
+        SELECT count(*) FROM updated;
     """
-    await db.status(update_sql)
+    updated = int(await db.scalar(update_sql) or 0)
+
+    clear_sql = f"""
+        WITH cleared AS (
+            UPDATE {db_schema}.{table} AS n
+            SET
+                do_business_as = ARRAY[]::varchar[],
+                do_business_as_text = ''
+            WHERE (
+                    COALESCE(array_length(n.do_business_as, 1), 0) > 0
+                 OR COALESCE(n.do_business_as_text, '') <> ''
+            )
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM {db_schema}.{source} AS s
+                    WHERE s.npi = n.npi
+                      AND s.other_provider_identifier_type_code = '3'
+                      AND NULLIF(s.other_provider_identifier, '') IS NOT NULL
+              )
+            RETURNING 1
+        )
+        SELECT count(*) FROM cleared;
+    """
+    cleared = int(await db.scalar(clear_sql) or 0)
+    print(f"do_business_as refresh complete: updated={updated}, cleared={cleared}")
+    return updated, cleared
+
+
+async def refresh_taxonomy_arrays(
+    *,
+    address_table: str,
+    taxonomy_table: str,
+    schema: str,
+) -> int:
+    update_sql = f"""
+        WITH sub AS (
+            SELECT
+                tax.npi,
+                ARRAY_AGG(DISTINCT nucc.int_code ORDER BY nucc.int_code)::int[] AS res
+            FROM {schema}.{taxonomy_table} AS tax
+            INNER JOIN {schema}.nucc_taxonomy AS nucc
+                ON tax.healthcare_provider_taxonomy_code = nucc.code
+            WHERE nucc.int_code IS NOT NULL
+            GROUP BY tax.npi
+        ),
+        updated AS (
+            UPDATE {schema}.{address_table} AS addr
+            SET taxonomy_array = sub.res
+            FROM sub
+            WHERE addr.npi = sub.npi
+              AND addr.taxonomy_array IS DISTINCT FROM sub.res
+            RETURNING 1
+        )
+        SELECT count(*) FROM updated;
+    """
+    updated = int(await db.scalar(update_sql) or 0)
+    print(f"taxonomy_array refresh complete: updated={updated}")
+    return updated
+
+
+async def resolve_npi_address_archive(
+    *,
+    staging_table: str,
+    field_map: dict[str, str],
+    schema: str,
+    cancel_check,
+):
+    missing_key_rows = int(
+        await db.scalar(
+            f"SELECT count(*) FROM {schema}.{staging_table} WHERE address_key IS NULL;"
+        )
+        or 0
+    )
+    if missing_key_rows:
+        configured_shards = int(os.getenv("HLTHPRT_ADDRESS_CANON_NPI_SHARDS", "16"))
+        stamp_shards = 1 if missing_key_rows < 1_000_000 else configured_shards
+        print(
+            "NPI canonical address keys missing after load: "
+            f"{missing_key_rows}; stamping missing keys only with {stamp_shards} shard(s)"
+        )
+        await stamp_address_keys(
+            staging_table,
+            field_map,
+            schema=schema,
+            shards=stamp_shards,
+            cancel_check=cancel_check,
+            update_existing=False,
+            honor_env_override=stamp_shards != 1,
+        )
+    else:
+        print("NPI canonical address keys were populated during load; skipping SQL restamp")
+
+    try:
+        stats = await resolve_into_archive(
+            staging_table,
+            field_map,
+            source_bit=1,
+            priority=0,
+            schema=schema,
+            cancel_check=cancel_check,
+        )
+    except RuntimeError as exc:
+        if not _is_address_key_mismatch_error(exc):
+            raise
+        print("NPI canonical address key mismatch detected; repairing staged keys with SQL canonical stamp")
+        repaired = await stamp_address_keys(
+            staging_table,
+            field_map,
+            schema=schema,
+            shards=int(os.getenv("HLTHPRT_ADDRESS_CANON_NPI_SHARDS", "16")),
+            cancel_check=cancel_check,
+            update_existing=True,
+        )
+        print(f"NPI canonical address SQL repair complete: updated={repaired}")
+        stats = await resolve_into_archive(
+            staging_table,
+            field_map,
+            source_bit=1,
+            priority=0,
+            schema=schema,
+            cancel_check=cancel_check,
+        )
+    print(f"NPI canonical address resolve complete: {stats}")
+    return stats
 
 
 async def rebuild_phone_staffing_table(
@@ -699,11 +985,26 @@ async def rebuild_phone_staffing_table(
         )
         return
     if not await db.scalar(f"SELECT to_regclass('{schema}.nucc_taxonomy');"):
-        print(
-            f"Skipping phone staffing materialization for {schema}.{target_table}: "
-            f"{schema}.nucc_taxonomy is missing."
+        raise NPIPrerequisiteError(
+            f"Cannot materialize {schema}.{target_table}: {schema}.nucc_taxonomy is missing. "
+            "Run the NUCC importer before NPI."
         )
-        return
+    pharmacist_rows = int(
+        await db.scalar(
+            f"""
+            SELECT count(*)
+             FROM {schema}.nucc_taxonomy
+             WHERE lower(classification) = 'pharmacist'
+               AND int_code IS NOT NULL;
+            """
+        )
+        or 0
+    )
+    if pharmacist_rows <= 0:
+        raise NPIPrerequisiteError(
+            f"Cannot materialize {schema}.{target_table}: {schema}.nucc_taxonomy has no "
+            "Pharmacist rows with int_code. Run the NUCC importer before NPI."
+        )
 
     print(f"Materializing phone staffing table {schema}.{target_table} from {schema}.{address_table}...")
     await db.status(f"TRUNCATE TABLE {schema}.{target_table};")
@@ -718,7 +1019,7 @@ async def rebuild_phone_staffing_table(
         WITH pharmacist_taxonomy AS (
             SELECT ARRAY_AGG(int_code) AS codes
             FROM {schema}.nucc_taxonomy
-            WHERE classification = 'Pharmacist'
+            WHERE lower(classification) = 'pharmacist'
         )
         SELECT
             a.state_name,
@@ -744,12 +1045,86 @@ async def shutdown(ctx):  # pragma: no cover
     import_date = ctx['import_date']
     context = ctx.get('context') or {}
     run_id = str(context.get("control_run_id") or ctx.get("control_run_id") or "").strip()
+    shutdown_phase_timings: list[dict[str, object]] = []
+
+    async def timed_shutdown_phase(phase: str, awaitable):
+        started = time.monotonic()
+        started_at = datetime.datetime.now(datetime.UTC).isoformat()
+        print(f"NPI_SHUTDOWN_PHASE_START phase={phase} started_at={started_at}")
+        if run_id:
+            enqueue_live_progress(
+                run_id=run_id,
+                importer="npi",
+                status="running",
+                phase=f"npi shutdown {phase}",
+                unit="phase",
+                total=1,
+                done=0,
+                pct=0,
+                message=f"npi shutdown {phase} started",
+            )
+        try:
+            result = await awaitable
+        except Exception:
+            elapsed = round(time.monotonic() - started, 3)
+            shutdown_phase_timings.append(
+                {
+                    "phase": phase,
+                    "status": "failed",
+                    "elapsed_seconds": elapsed,
+                    "started_at": started_at,
+                    "finished_at": datetime.datetime.now(datetime.UTC).isoformat(),
+                }
+            )
+            print(f"NPI_SHUTDOWN_PHASE_FAILED phase={phase} elapsed_seconds={elapsed}")
+            if run_id:
+                enqueue_live_progress(
+                    run_id=run_id,
+                    importer="npi",
+                    status="failed",
+                    phase=f"npi shutdown {phase}",
+                    unit="phase",
+                    total=1,
+                    done=0,
+                    pct=0,
+                    message=f"npi shutdown {phase} failed",
+                )
+            raise
+        elapsed = round(time.monotonic() - started, 3)
+        shutdown_phase_timings.append(
+            {
+                "phase": phase,
+                "status": "succeeded",
+                "elapsed_seconds": elapsed,
+                "started_at": started_at,
+                "finished_at": datetime.datetime.now(datetime.UTC).isoformat(),
+            }
+        )
+        print(f"NPI_SHUTDOWN_PHASE_DONE phase={phase} elapsed_seconds={elapsed}")
+        if run_id:
+            enqueue_live_progress(
+                run_id=run_id,
+                importer="npi",
+                status="running",
+                phase=f"npi shutdown {phase}",
+                unit="phase",
+                total=1,
+                done=1,
+                pct=100,
+                message=f"npi shutdown {phase} completed",
+            )
+        return result
+
     if not context.get('run'):
         print("No NPI jobs ran in this worker session; skipping shutdown validation.")
         return
     await ensure_database(bool(context.get("test_mode")))
 
     db_schema = os.getenv('HLTHPRT_DB_SCHEMA') if os.getenv('HLTHPRT_DB_SCHEMA') else 'mrf'
+    if _npi_requires_nucc(context):
+        await _assert_nucc_ready(db_schema)
+    if source_enabled("nppes"):
+        await _assert_nppes_canonical_ready(db_schema)
     tables = {}
 
     npi_address_stage_table = f"{NPIAddress.__tablename__}_{import_date}"
@@ -785,6 +1160,19 @@ async def shutdown(ctx):  # pragma: no cover
         exists = await db.scalar(f"SELECT to_regclass('{db_schema}.{table_name}');")
         return bool(exists)
 
+    async def table_has_column(table_name: str, column_name: str) -> bool:
+        return bool(await db.scalar(
+            f"""
+            SELECT EXISTS (
+                SELECT 1
+                  FROM information_schema.columns
+                 WHERE table_schema = '{db_schema}'
+                   AND table_name = '{table_name}'
+                   AND column_name = '{column_name}'
+            );
+            """
+        ))
+
     stage_counts: dict[str, int] = {}
     for cls in processing_classes_array:
         stage_obj = make_class(cls, import_date)
@@ -813,53 +1201,155 @@ async def shutdown(ctx):  # pragma: no cover
         )
         return archived_name
 
+    address_stats = None
+    if source_enabled("nppes"):
+        async def _cancel_check():
+            await raise_if_cancelled(ctx, {})
+
+        npi_address_field_map = {
+            "first_line": "first_line",
+            "second_line": "second_line",
+            "city": "city_name",
+            "state": "state_name",
+            "zip": "postal_code",
+            "country": "COALESCE(NULLIF(country_code, ''), 'US')",
+        }
+
+        async def _canonical_address_resolve():
+            return await resolve_npi_address_archive(
+                staging_table=test.__tablename__,
+                field_map=npi_address_field_map,
+                schema=db_schema,
+                cancel_check=_cancel_check,
+            )
+
+        address_stats = await timed_shutdown_phase(
+            "canonical_address_resolve",
+            _canonical_address_resolve(),
+        )
+
+    async def _timed_geo_update(obj, archive_source: str, use_canonical_archive: bool):
+        async def _run_geo_update():
+            if use_canonical_archive and await table_has_column(archive_source, "address_key"):
+                await db.status(
+                    f"UPDATE {db_schema}.{obj.__tablename__} as a SET formatted_address = b.formatted_address, "
+                    f"lat = b.lat, long = b.long, place_id = b.place_id "
+                    f"FROM {db_schema}.{archive_source} as b "
+                    f"WHERE a.address_key IS NOT NULL AND a.address_key = b.address_key"
+                    f" AND b.lat IS NOT NULL AND b.long IS NOT NULL"
+                )
+                if await table_exists("address_checksum_map"):
+                    await db.status(
+                        f"UPDATE {db_schema}.{obj.__tablename__} as a SET formatted_address = b.formatted_address, "
+                        f"lat = b.lat, long = b.long, place_id = b.place_id "
+                        f"FROM {db_schema}.address_checksum_map as m "
+                        f"JOIN {db_schema}.{archive_source} as b ON b.address_key = m.address_key "
+                        f"WHERE a.address_key IS NULL AND a.checksum = m.checksum"
+                        f" AND b.lat IS NOT NULL AND b.long IS NOT NULL"
+                    )
+            else:
+                await db.status(
+                    f"UPDATE {db_schema}.{obj.__tablename__} as a SET formatted_address = b.formatted_address, "
+                    f"lat = b.lat, long = b.long, place_id = b.place_id "
+                    f"FROM {db_schema}.{archive_source} as b WHERE a.checksum = b.checksum"
+                )
+
+        return await timed_shutdown_phase("geocode_archive_enrichment", _run_geo_update())
+
+    async def create_additional_indexes(cls, obj) -> None:
+        if not hasattr(cls, '__my_additional_indexes__') or not cls.__my_additional_indexes__:
+            return
+        for index in cls.__my_additional_indexes__:
+            index_name = index.get('name', '_'.join(index.get('index_elements')))
+            if _index_requires_postgis(index) and not await has_postgis():
+                print(
+                    f"Skipping index {obj.__tablename__}_idx_{index_name}: "
+                    "requires PostGIS (geography + ST_MakePoint)."
+                )
+                continue
+            using = ""
+            if t := index.get('using'):
+                using = f"USING {t} "
+            where_clause = ""
+            if where := index.get('where'):
+                where_clause = f" WHERE {where}"
+            index_elements = [
+                str(element)
+                .replace("Geography(ST_MakePoint", "public.Geography(public.ST_MakePoint")
+                .replace("geography(st_makepoint", "public.geography(public.st_makepoint")
+                for element in index.get('index_elements')
+            ]
+            create_index_sql = (
+                f"CREATE INDEX IF NOT EXISTS {obj.__tablename__}_idx_{index_name} "
+                f"ON {db_schema}.{obj.__tablename__}  {using}"
+                f"({', '.join(index_elements)}){where_clause};"
+            )
+            print(create_index_sql)
+            await timed_shutdown_phase(
+                f"index_creation:{obj.__tablename__}:{index_name}",
+                db.status(create_index_sql),
+            )
+
+    deferred_npi_indexes_obj = None
+
     async with db.transaction():
         for cls in processing_classes_array:
             tables[cls.__main_table__] = make_class(cls, import_date)
             obj = tables[cls.__main_table__]
+            if cls is NPIData:
+                deferred_npi_indexes_obj = obj
             if cls is NPIDataOtherIdentifier:
                 print('Updating NPI do_business_as arrays from other identifiers...')
                 target_npi_cls = tables.get(NPIData.__main_table__)
                 target_table_name = target_npi_cls.__tablename__ if target_npi_cls else NPIData.__tablename__
                 source_table_name = obj.__tablename__
-                await refresh_do_business_as(
-                    target_table=target_table_name,
-                    source_table=source_table_name,
-                    test_mode=bool(context.get("test_mode")),
+                await timed_shutdown_phase(
+                    "do_business_as_enrichment",
+                    refresh_do_business_as(
+                        target_table=target_table_name,
+                        source_table=source_table_name,
+                        test_mode=bool(context.get("test_mode")),
+                    ),
                 )
+                if deferred_npi_indexes_obj is not None:
+                    await create_additional_indexes(NPIData, deferred_npi_indexes_obj)
+                    deferred_npi_indexes_obj = None
             if cls is NPIAddress:
                 npi_taxonomy_table = f"npi_taxonomy_{import_date}"
                 if await table_exists(npi_taxonomy_table) and await table_exists("nucc_taxonomy"):
                     print("Updating NUCC Taxonomy for NPI Addresses...")
-                    await db.status(f"""WITH x AS (
-    SELECT
-        int_code, code as target_code
-    FROM
-        {db_schema}.nucc_taxonomy
-    )
-    UPDATE {db_schema}.{obj.__tablename__} as addr SET taxonomy_array=b.res FROM (
-    select npi, ARRAY_AGG(x.int_code) as res from {db_schema}.{npi_taxonomy_table}
-    INNER JOIN x ON healthcare_provider_taxonomy_code = x.target_code
-    GROUP BY npi) as b WHERE addr.npi = b.npi;""")
+                    await timed_shutdown_phase(
+                        "taxonomy_array_enrichment",
+                        refresh_taxonomy_arrays(
+                            address_table=obj.__tablename__,
+                            taxonomy_table=npi_taxonomy_table,
+                            schema=db_schema,
+                        ),
+                    )
                 else:
                     print(
                         f"Skipping NUCC taxonomy update: "
                         f"required tables missing ({db_schema}.{npi_taxonomy_table} and/or {db_schema}.nucc_taxonomy)."
                     )
 
-                if await table_exists("address_archive"):
-                    print("Updating NPI Addresses Geo from Archive...")
-                    await db.status(
-                        f"UPDATE {db_schema}.{obj.__tablename__} as a SET formatted_address = b.formatted_address, "
-                        f"lat = b.lat, long = b.long, place_id = b.place_id "
-                        f"FROM {db_schema}.address_archive as b WHERE a.checksum = b.checksum"
-                    )
+                preferred_archive = archive_table_name()
+                use_canonical_archive = _env_bool("HLTHPRT_ADDRESS_ARCHIVE_CUTOVER")
+                archive_source = (
+                    preferred_archive
+                    if use_canonical_archive and await table_exists(preferred_archive)
+                    else "address_archive"
+                )
+                if await table_exists(archive_source):
+                    print(f"Updating NPI Addresses Geo from Archive {archive_source}...")
+                    await _timed_geo_update(obj, archive_source, use_canonical_archive)
                 else:
-                    print(f"Skipping NPI geo update: source table {db_schema}.address_archive is missing.")
+                    print(f"Skipping NPI geo update: no address archive table is available in {db_schema}.")
 
                 if await table_exists("plan_npi_raw"):
                     print("Updating NPI Plan-Network Array from Plans Import Data...")
-                    await db.status(
+                    await timed_shutdown_phase(
+                        "plan_network_array_enrichment",
+                        db.status(
                         f"""UPDATE {db_schema}.{obj.__tablename__} as a
 SET
     plans_network_array = n_list
@@ -872,13 +1362,16 @@ FROM (
 ) as b
 WHERE
     a.npi = b.npi;"""
+                        ),
                     )
                 else:
                     print(f"Skipping NPI plan-network update: source table {db_schema}.plan_npi_raw is missing.")
 
                 if await table_exists("pricing_provider_procedure"):
                     print("Updating NPI procedures_array from pricing provider procedures...")
-                    await db.status(
+                    await timed_shutdown_phase(
+                        "procedures_array_enrichment",
+                        db.status(
                         f"""UPDATE {db_schema}.{obj.__tablename__} AS a
 SET
     procedures_array = b.codes
@@ -891,6 +1384,7 @@ FROM (
 ) AS b
 WHERE
     a.npi = b.npi;"""
+                        ),
                     )
                 else:
                     print(
@@ -900,7 +1394,9 @@ WHERE
 
                 if await table_exists("pricing_provider_prescription"):
                     print("Updating NPI medications_array from pricing provider prescriptions...")
-                    await db.status(
+                    await timed_shutdown_phase(
+                        "medications_array_enrichment",
+                        db.status(
                         f"""UPDATE {db_schema}.{obj.__tablename__} AS a
 SET
     medications_array = b.codes
@@ -916,6 +1412,7 @@ FROM (
 ) AS b
 WHERE
     a.npi = b.npi;"""
+                        ),
                     )
                 else:
                     print(
@@ -931,40 +1428,20 @@ WHERE
                         f"staging table for {NPIAddress.__tablename__} is unavailable."
                     )
                 else:
-                    await rebuild_phone_staffing_table(
-                        target_table=obj.__tablename__,
-                        address_table=address_stage.__tablename__,
-                        schema=db_schema,
+                    await timed_shutdown_phase(
+                        "phone_staffing_rebuild",
+                        rebuild_phone_staffing_table(
+                            target_table=obj.__tablename__,
+                            address_table=address_stage.__tablename__,
+                            schema=db_schema,
+                        ),
                     )
 
-            if hasattr(cls, '__my_additional_indexes__') and cls.__my_additional_indexes__:
-                for index in cls.__my_additional_indexes__:
-                    index_name = index.get('name', '_'.join(index.get('index_elements')))
-                    if _index_requires_postgis(index) and not await has_postgis():
-                        print(
-                            f"Skipping index {obj.__tablename__}_idx_{index_name}: "
-                            "requires PostGIS (geography + ST_MakePoint)."
-                        )
-                        continue
-                    using = ""
-                    if t := index.get('using'):
-                        using = f"USING {t} "
-                    where_clause = ""
-                    if where := index.get('where'):
-                        where_clause = f" WHERE {where}"
-                    index_elements = [
-                        str(element)
-                        .replace("Geography(ST_MakePoint", "public.Geography(public.ST_MakePoint")
-                        .replace("geography(st_makepoint", "public.geography(public.st_makepoint")
-                        for element in index.get('index_elements')
-                    ]
-                    create_index_sql = (
-                        f"CREATE INDEX IF NOT EXISTS {obj.__tablename__}_idx_{index_name} "
-                        f"ON {db_schema}.{obj.__tablename__}  {using}"
-                        f"({', '.join(index_elements)}){where_clause};"
-                    )
-                    print(create_index_sql)
-                    await db.status(create_index_sql)
+            if cls is not NPIData:
+                await create_additional_indexes(cls, obj)
+
+        if deferred_npi_indexes_obj is not None:
+            await create_additional_indexes(NPIData, deferred_npi_indexes_obj)
 
     # Run VACUUM FULL ANALYZE in parallel for all tables
     async def vacuum_table(obj):
@@ -972,7 +1449,10 @@ WHERE
             print(f"Skipping VACUUM FULL ANALYZE {db_schema}.{obj.__tablename__}: table is missing.")
             return
         print(f"Post-Index VACUUM FULL ANALYZE {db_schema}.{obj.__tablename__};")
-        await db.execute_ddl(f"VACUUM FULL ANALYZE {db_schema}.{obj.__tablename__};")
+        await timed_shutdown_phase(
+            f"vacuum_analyze:{obj.__tablename__}",
+            db.execute_ddl(f"VACUUM FULL ANALYZE {db_schema}.{obj.__tablename__};"),
+        )
 
     vacuum_tasks = [
         vacuum_table(tables[cls.__main_table__])
@@ -987,28 +1467,35 @@ WHERE
             if not await table_exists(obj.__tablename__):
                 print(f"Skipping publish rotation for {db_schema}.{obj.__tablename__}: staging table is missing.")
                 continue
-            await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
-            await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{table} RENAME TO {table}_old;")
-            await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{obj.__tablename__} RENAME TO {table};")
 
-            await archive_index(f"{table}_idx_primary")
+            async def _publish_table_rotation(cls=cls, obj=obj, table=table):
+                await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
+                await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{table} RENAME TO {table}_old;")
+                await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{obj.__tablename__} RENAME TO {table};")
 
-            await db.status(f"ALTER INDEX IF EXISTS "
-                            f"{db_schema}.{obj.__tablename__}_idx_primary RENAME TO "
-                            f"{table}_idx_primary;")
+                await archive_index(f"{table}_idx_primary")
 
-            move_indexes = []
-            if hasattr(cls, "__my_initial_indexes__") and cls.__my_initial_indexes__:
-                move_indexes += cls.__my_initial_indexes__
-            if hasattr(cls, '__my_additional_indexes__') and obj.__my_additional_indexes__:
-                move_indexes += obj.__my_additional_indexes__
-
-            for index in move_indexes:
-                index_name = index.get('name', '_'.join(index.get('index_elements')))
-                await archive_index(f"{table}_idx_{index_name}")
                 await db.status(f"ALTER INDEX IF EXISTS "
-                                f"{db_schema}.{obj.__tablename__}_idx_{index_name} RENAME TO "
-                                f"{table}_idx_{index_name};")
+                                f"{db_schema}.{obj.__tablename__}_idx_primary RENAME TO "
+                                f"{table}_idx_primary;")
+
+                move_indexes = []
+                if hasattr(cls, "__my_initial_indexes__") and cls.__my_initial_indexes__:
+                    move_indexes += cls.__my_initial_indexes__
+                if hasattr(cls, '__my_additional_indexes__') and obj.__my_additional_indexes__:
+                    move_indexes += obj.__my_additional_indexes__
+
+                for index in move_indexes:
+                    index_name = index.get('name', '_'.join(index.get('index_elements')))
+                    await archive_index(f"{table}_idx_{index_name}")
+                    await db.status(f"ALTER INDEX IF EXISTS "
+                                    f"{db_schema}.{obj.__tablename__}_idx_{index_name} RENAME TO "
+                                    f"{table}_idx_{index_name};")
+
+            await timed_shutdown_phase(
+                f"publish_swap:{table}",
+                _publish_table_rotation(),
+            )
 
     await mark_control_run(
         run_id,
@@ -1023,7 +1510,12 @@ WHERE
             "message": "succeeded",
             "phase": "npi published",
         },
-        metrics={"stage_rows": stage_counts, "npi_address_rows": int(npi_address_count or 0)},
+        metrics={
+            "stage_rows": stage_counts,
+            "npi_address_rows": int(npi_address_count or 0),
+            "npi_shutdown_phase_timings": shutdown_phase_timings,
+            **({"address_resolve": address_stats.__dict__} if address_stats else {}),
+        },
     )
     print_time_info(ctx['context']['start'])
 

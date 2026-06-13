@@ -27,6 +27,7 @@ from db.connection import db
 from db.models import (PartDFormularySnapshot, PartDImportRun, PartDMedicationCost,
                        PartDMedicationCostStage, PartDPharmacyActivity,
                        PartDPharmacyActivityStage)
+from process.ext.address_canon import resolve_into_archive, source_enabled, stamp_address_keys
 from process.ext.utils import db_startup, download_it, download_it_and_save, push_objects
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
@@ -747,6 +748,31 @@ async def _drop_legacy_partd_tables(schema: str) -> None:
 async def _materialize_activity_snapshot(schema: str, snapshot_id: str) -> None:
     canonical_table = f"{schema}.{PartDPharmacyActivity.__tablename__}"
     stage_table = f"{schema}.{PartDPharmacyActivityStage.__tablename__}"
+    await _fill_activity_address_from_npi(schema, PartDPharmacyActivityStage.__tablename__)
+    await _fill_activity_state_from_zip(schema, PartDPharmacyActivityStage.__tablename__)
+    if source_enabled("partd"):
+        address_fields = {
+            "first_line": "address_line1",
+            "second_line": "address_line2",
+            "city": "city",
+            "state": "state",
+            "zip": "zip_code",
+            "country": "'US'",
+        }
+        await stamp_address_keys(
+            PartDPharmacyActivityStage.__tablename__,
+            address_fields,
+            schema=schema,
+        )
+        stats = await resolve_into_archive(
+            PartDPharmacyActivityStage.__tablename__,
+            address_fields,
+            source_bit=64,
+            priority=7,
+            schema=schema,
+        )
+        print(f"Part D pharmacy activity canonical address resolve complete: {stats}")
+
     await db.status(
         f"DELETE FROM {canonical_table} WHERE snapshot_id = :snapshot_id;",
         snapshot_id=snapshot_id,
@@ -779,7 +805,8 @@ async def _materialize_activity_snapshot(schema: str, snapshot_id: str) -> None:
             effective_from,
             effective_to,
             source_type,
-            plan_ids
+            plan_ids,
+            address_key
         )
         WITH base AS (
             SELECT
@@ -807,6 +834,7 @@ async def _materialize_activity_snapshot(schema: str, snapshot_id: str) -> None:
                 effective_from,
                 effective_to,
                 source_type,
+                address_key,
                 unnest(plan_ids) AS plan_id
             FROM {stage_table}
             WHERE snapshot_id = :snapshot_id
@@ -837,6 +865,7 @@ async def _materialize_activity_snapshot(schema: str, snapshot_id: str) -> None:
                 effective_from,
                 effective_to,
                 source_type,
+                address_key,
                 plan_id
             FROM base
         ),
@@ -866,6 +895,7 @@ async def _materialize_activity_snapshot(schema: str, snapshot_id: str) -> None:
                 effective_from,
                 effective_to,
                 source_type,
+                address_key,
                 array_agg(plan_id ORDER BY plan_id) AS plan_ids
             FROM dedup
             GROUP BY
@@ -892,7 +922,8 @@ async def _materialize_activity_snapshot(schema: str, snapshot_id: str) -> None:
                 dispensing_fee_selected_drug_90,
                 effective_from,
                 effective_to,
-                source_type
+                source_type,
+                address_key
         )
         SELECT
             md5(
@@ -947,7 +978,8 @@ async def _materialize_activity_snapshot(schema: str, snapshot_id: str) -> None:
             effective_from,
             effective_to,
             source_type,
-            plan_ids
+            plan_ids,
+            address_key
         FROM grouped;
         """,
         snapshot_id=snapshot_id,
@@ -958,9 +990,70 @@ async def _materialize_activity_snapshot(schema: str, snapshot_id: str) -> None:
     )
 
 
+async def _fill_activity_address_from_npi(schema: str, table_name: str) -> None:
+    await db.status(
+        f"""
+        DO $$
+        BEGIN
+            IF to_regclass('{schema}.npi_address') IS NOT NULL THEN
+                UPDATE {schema}.{table_name} AS activity
+                   SET address_line1 = COALESCE(NULLIF(activity.address_line1, ''), npi_addr.first_line),
+                       address_line2 = COALESCE(NULLIF(activity.address_line2, ''), npi_addr.second_line),
+                       city = COALESCE(NULLIF(activity.city, ''), npi_addr.city_name),
+                       state = COALESCE(NULLIF(activity.state, ''), npi_addr.state_name),
+                       zip_code = COALESCE(NULLIF(activity.zip_code, ''), npi_addr.postal_code)
+                  FROM (
+                      SELECT DISTINCT ON (npi)
+                             npi,
+                             first_line,
+                             second_line,
+                             city_name,
+                             state_name,
+                             postal_code
+                        FROM {schema}.npi_address
+                       WHERE type = 'primary'
+                         AND NULLIF(first_line, '') IS NOT NULL
+                       ORDER BY npi, (address_key IS NULL), first_line, COALESCE(second_line, '')
+                  ) AS npi_addr
+                 WHERE activity.npi = npi_addr.npi
+                   AND (
+                       NULLIF(activity.address_line1, '') IS NULL
+                       OR NULLIF(activity.city, '') IS NULL
+                       OR NULLIF(activity.state, '') IS NULL
+                       OR NULLIF(activity.zip_code, '') IS NULL
+                   );
+            END IF;
+        END $$;
+        """
+    )
+
+
+async def _fill_activity_state_from_zip(schema: str, table_name: str) -> None:
+    await db.status(
+        f"""
+        UPDATE {schema}.{table_name} AS activity
+           SET state = (
+               SELECT geo.state
+                 FROM {schema}.geo_zip_lookup AS geo
+                WHERE geo.zip_code = LEFT(regexp_replace(COALESCE(activity.zip_code, ''), '[^0-9]', '', 'g'), 5)
+                ORDER BY geo.population DESC NULLS LAST, geo.city
+                LIMIT 1
+           )
+         WHERE NULLIF(activity.state, '') IS NULL
+           AND NULLIF(activity.zip_code, '') IS NOT NULL
+           AND EXISTS (
+               SELECT 1
+                 FROM {schema}.geo_zip_lookup AS geo
+                WHERE geo.zip_code = LEFT(regexp_replace(COALESCE(activity.zip_code, ''), '[^0-9]', '', 'g'), 5)
+           );
+        """
+    )
+
+
 async def _materialize_pricing_snapshot(schema: str, snapshot_id: str) -> None:
     canonical_table = f"{schema}.{PartDMedicationCost.__tablename__}"
     stage_table = f"{schema}.{PartDMedicationCostStage.__tablename__}"
+    await db.status(f"ANALYZE {stage_table};")
     await db.status(
         f"DELETE FROM {canonical_table} WHERE snapshot_id = :snapshot_id;",
         snapshot_id=snapshot_id,
@@ -988,7 +1081,7 @@ async def _materialize_pricing_snapshot(schema: str, snapshot_id: str) -> None:
             source_type,
             plan_ids
         )
-        WITH base AS (
+        WITH grouped AS (
             SELECT
                 snapshot_id,
                 year,
@@ -1007,53 +1100,9 @@ async def _materialize_pricing_snapshot(schema: str, snapshot_id: str) -> None:
                 effective_from,
                 effective_to,
                 source_type,
-                plan_id
+                array_agg(DISTINCT plan_id ORDER BY plan_id) AS plan_ids
             FROM {stage_table}
             WHERE snapshot_id = :snapshot_id
-        ),
-        dedup AS (
-            SELECT DISTINCT
-                snapshot_id,
-                year,
-                code_system,
-                code,
-                normalized_code,
-                rxnorm_id,
-                ndc11,
-                days_supply,
-                drug_name,
-                tier,
-                pharmacy_type,
-                mail_order,
-                cost_type,
-                cost_amount,
-                effective_from,
-                effective_to,
-                source_type,
-                plan_id
-            FROM base
-        ),
-        grouped AS (
-            SELECT
-                snapshot_id,
-                year,
-                code_system,
-                code,
-                normalized_code,
-                rxnorm_id,
-                ndc11,
-                days_supply,
-                drug_name,
-                tier,
-                pharmacy_type,
-                mail_order,
-                cost_type,
-                cost_amount,
-                effective_from,
-                effective_to,
-                source_type,
-                array_agg(plan_id ORDER BY plan_id) AS plan_ids
-            FROM dedup
             GROUP BY
                 snapshot_id,
                 year,
@@ -1473,6 +1522,36 @@ async def _flush_batches(
             aggregated.append(entry)
         return aggregated
 
+    def _pricing_stage_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        seen: set[tuple[Any, ...]] = set()
+        deduped: list[dict[str, Any]] = []
+        for row in rows:
+            key = (
+                row.get("snapshot_id"),
+                row.get("plan_id"),
+                row.get("year"),
+                row.get("code_system"),
+                row.get("code"),
+                row.get("normalized_code"),
+                row.get("rxnorm_id"),
+                row.get("ndc11"),
+                row.get("days_supply"),
+                row.get("drug_name"),
+                row.get("tier"),
+                row.get("pharmacy_type"),
+                row.get("mail_order"),
+                row.get("cost_type"),
+                row.get("cost_amount"),
+                row.get("effective_from"),
+                row.get("effective_to"),
+                row.get("source_type"),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(row)
+        return deduped
+
     tasks: list[Any] = []
     if activity_batch:
         activity_rows = _activity_stage_rows(list(activity_batch))
@@ -1480,9 +1559,10 @@ async def _flush_batches(
         if activity_rows:
             tasks.append(push_objects(activity_rows, PartDPharmacyActivityStage, rewrite=False, use_copy=True))
     if pricing_batch:
-        pricing_rows = list(pricing_batch)
+        pricing_rows = _pricing_stage_rows(list(pricing_batch))
         pricing_batch.clear()
-        tasks.append(push_objects(pricing_rows, PartDMedicationCostStage, rewrite=False, use_copy=True))
+        if pricing_rows:
+            tasks.append(push_objects(pricing_rows, PartDMedicationCostStage, rewrite=False, use_copy=True))
     if tasks:
         await asyncio.gather(*tasks)
 
