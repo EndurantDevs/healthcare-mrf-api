@@ -11,7 +11,13 @@ import sanic.exceptions
 from sanic import Blueprint, response
 from sqlalchemy import and_, func, or_, select
 
-from api.code_systems import PROCEDURE_CODE_SYSTEMS, normalize_code, normalize_code_system
+from api.code_systems import (
+    PROCEDURE_CODE_SYSTEMS,
+    is_restricted_terminology_system,
+    normalize_code,
+    normalize_code_system,
+    restricted_terminology_public_enabled,
+)
 from api.endpoint.pagination import parse_pagination
 from db.models import (
     ClinicalArea,
@@ -55,6 +61,26 @@ def _decode_path_value(raw: Any) -> str:
     return unquote(str(raw or "").strip())
 
 
+def _restricted_public_filter(column):
+    if restricted_terminology_public_enabled():
+        return None
+    return func.upper(column).notin_(("SNOMEDCT_US",))
+
+
+def _restricted_pair_filters(from_column, to_column):
+    if restricted_terminology_public_enabled():
+        return []
+    return [
+        func.upper(from_column).notin_(("SNOMEDCT_US",)),
+        func.upper(to_column).notin_(("SNOMEDCT_US",)),
+    ]
+
+
+def _raise_if_restricted_public(system: str) -> None:
+    if is_restricted_terminology_system(system) and not restricted_terminology_public_enabled():
+        raise sanic.exceptions.NotFound
+
+
 def _row_to_dict(row) -> dict[str, Any]:
     mapping = getattr(row, "_mapping", None)
     return dict(mapping) if mapping is not None else dict(row)
@@ -73,6 +99,7 @@ def _json_safe_row(row: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _resolve_code(session, system: str, code: str, code_type: str | None = None) -> tuple[str, str]:
+    _raise_if_restricted_public(system)
     direct_filters = [
         func.upper(code_table.c.code_system) == system,
         func.upper(code_table.c.code) == code,
@@ -121,6 +148,9 @@ async def _list_codes(request, code_type: str):
         )
 
     filters = [code_table.c.code_type == code_type]
+    restricted_filter = _restricted_public_filter(code_table.c.code_system)
+    if restricted_filter is not None:
+        filters.append(restricted_filter)
     if system:
         filters.append(func.upper(code_table.c.code_system) == system)
     if q:
@@ -213,6 +243,9 @@ async def _list_area_concepts_response(
             raise sanic.exceptions.NotFound
 
     filters = [mapping_table.c.clinical_area_id == clinical_area_id]
+    restricted_filter = _restricted_public_filter(system_col)
+    if restricted_filter is not None:
+        filters.append(restricted_filter)
     if system:
         filters.append(func.upper(system_col) == system)
     if q:
@@ -270,6 +303,9 @@ async def list_concepts(request):
     code_type = str(args.get("code_type") or "").strip().lower()
     q = str(args.get("q") or "").strip().lower()
     filters = []
+    restricted_filter = _restricted_public_filter(code_table.c.code_system)
+    if restricted_filter is not None:
+        filters.append(restricted_filter)
     if system:
         filters.append(func.upper(code_table.c.code_system) == system)
     if code_type:
@@ -309,6 +345,7 @@ async def list_concepts(request):
 async def get_concept(request, system: str, code: str):
     session = _session(request)
     resolved_system, resolved_code = await _resolve_code(session, _normalize_system(system), _normalize_code(code))
+    _raise_if_restricted_public(resolved_system)
     result = await session.execute(
         select(code_table).where(and_(code_table.c.code_system == resolved_system, code_table.c.code == resolved_code)).limit(1)
     )
@@ -324,6 +361,7 @@ async def get_concept(request, system: str, code: str):
     rel_rows = await session.execute(
         select(relationship_table)
         .where(and_(relationship_table.c.from_system == resolved_system, relationship_table.c.from_code == resolved_code))
+        .where(*_restricted_pair_filters(relationship_table.c.from_system, relationship_table.c.to_system))
         .limit(100)
     )
     payload["synonyms"] = [_json_safe_row(_row_to_dict(item)) for item in synonym_rows]
@@ -335,6 +373,7 @@ async def _get_code(request, code_type: str, system: str, code: str):
     session = _session(request)
     requested_system = _normalize_system(system)
     requested_code = _normalize_code(code)
+    _raise_if_restricted_public(requested_system)
     resolved_system, resolved_code = await _resolve_code(
         session,
         requested_system,
@@ -345,6 +384,7 @@ async def _get_code(request, code_type: str, system: str, code: str):
         code_table.c.code_system == resolved_system,
         code_table.c.code == resolved_code,
     ]
+    _raise_if_restricted_public(resolved_system)
     if code_type == "treatment" and resolved_system in PROCEDURE_CODE_SYSTEMS:
         filters.append(or_(code_table.c.code_type == code_type, code_table.c.code_type.is_(None)))
     else:
@@ -382,6 +422,7 @@ async def list_relationships(request):
     to_code = _normalize_code(args.get("to_code"))
     relationship = str(args.get("relationship") or "").strip()
     filters = []
+    filters.extend(_restricted_pair_filters(relationship_table.c.from_system, relationship_table.c.to_system))
     if from_system:
         filters.append(func.upper(relationship_table.c.from_system) == from_system)
     if from_code:
@@ -447,6 +488,7 @@ async def list_clinical_areas(request):
     pagination = parse_pagination(args, default_limit=25, max_limit=MAX_LIMIT)
     q = str(args.get("q") or "").strip().lower()
     filters = []
+    filters.extend(_restricted_pair_filters(crosswalk_table.c.from_system, crosswalk_table.c.to_system))
     if q:
         q_like = f"%{q}%"
         filters.append(

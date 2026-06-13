@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import base64
 import datetime as dt
+import json
 import os
 import shutil
 import uuid
@@ -13,11 +16,11 @@ from typing import Any
 import click
 import redis
 from arq import create_pool
-from sqlalchemy import insert, select, text, update
+from sqlalchemy import and_, insert, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 
 from db.models import ImportRun, db
-from process.import_status_events import enqueue_status_event
+from process.import_status_events import enqueue_status_event, isoformat_utc
 from process.live_progress import enqueue_live_progress, estimate_payload_from_live, progress_payload_from_live, read_live_progress
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
@@ -26,6 +29,14 @@ ENGINE_NAME = "healthcare-mrf-api"
 ACTIVE_STATUSES = {"queued", "starting", "running", "finalizing", "canceling"}
 TERMINAL_STATUSES = {"succeeded", "failed", "canceled", "dead_letter"}
 CANCEL_FLAG_TTL_SECONDS = 7 * 24 * 60 * 60
+MAX_IMPORT_RUN_LIST_LIMIT = 200
+_IMPORT_RUN_ENSURE_LOCK = asyncio.Lock()
+_IMPORT_RUN_ENSURED = False
+_IMPORT_RUN_ADVISORY_LOCK_KEY = 44_706_101_200_001
+
+_IMPORTER_DEPENDENCIES: dict[str, list[str]] = {
+    "npi": ["nucc"],
+}
 
 _SINGLE_JOB_ADAPTERS: dict[str, dict[str, Any]] = {
     "ptg": {"queue": "arq:PTG", "function": "ptg_control_start", "payload": "ptg_control", "job_prefix": "ptg_start"},
@@ -155,9 +166,23 @@ _SINGLE_JOB_ADAPTERS: dict[str, dict[str, Any]] = {
         "target_module": "process.entity_address_unified",
         "target_function": "process_data",
     },
+    "address-archive-v2-migrate": {
+        "queue": "arq:AddressArchive",
+        "function": "control_single_job_start",
+        "payload": "control_wrapped",
+        "target_module": "process.address_archive_migration",
+        "target_function": "process_data",
+    },
 }
 
-_CANCELABLE_IMPORTERS = {"ptg", "npi", "nucc", "places-zcta", "cms-doctors"}
+_CANCELABLE_IMPORTERS = {
+    "ptg",
+    "npi",
+    "nucc",
+    "places-zcta",
+    "cms-doctors",
+    "address-archive-v2-migrate",
+}
 _FINISH_IMPORTERS = {
     "mrf",
     "claims-pricing",
@@ -228,6 +253,7 @@ def importer_registry() -> list[dict[str, Any]]:
                 "retryable": True,
                 "enqueue_adapter": "arq_single_job" if name in _SINGLE_JOB_ADAPTERS else "pending",
                 "queue": _SINGLE_JOB_ADAPTERS.get(name, {}).get("queue"),
+                "depends_on": list(_IMPORTER_DEPENDENCIES.get(name, [])),
                 "params_schema": _param_schema(command),
             }
         )
@@ -243,7 +269,15 @@ def _importer_family(importer: str) -> str:
         return "mrf"
     if importer in {"claims-pricing", "claims-procedures", "drug-claims"}:
         return "claims"
-    if importer in {"npi", "nucc", "provider-quality", "provider-enrichment", "entity-address-unified", "cms-doctors"}:
+    if importer in {
+        "npi",
+        "nucc",
+        "provider-quality",
+        "provider-enrichment",
+        "entity-address-unified",
+        "cms-doctors",
+        "address-archive-v2-migrate",
+    }:
         return "provider"
     if importer in {"partd-formulary-network", "pharmacy-license", "pharmacy-economics"}:
         return "pharmacy"
@@ -258,18 +292,37 @@ def _new_run_id() -> str:
     return f"run_{uuid.uuid4().hex}"
 
 
-def node_health() -> dict[str, Any]:
+async def node_health() -> dict[str, Any]:
     artifact_root = Path(os.getenv("HLTHPRT_PTG2_ARTIFACT_ROOT") or "/tmp")
     try:
         usage = shutil.disk_usage(artifact_root)
         disk = {"path": str(artifact_root), "total": usage.total, "used": usage.used, "free": usage.free}
     except OSError:
         disk = {"path": str(artifact_root), "total": None, "used": None, "free": None}
+    checks: dict[str, dict[str, Any]] = {
+        "database": await _database_check(),
+        "redis": _redis_check(),
+    }
+    workers: dict[str, Any] = {}
+    try:
+        workers = _worker_health()
+        checks["workers"] = {"ok": True, "running": sum(1 for item in workers.values() if item.get("running"))}
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        checks["workers"] = {"ok": False, "error": str(exc)}
+    queue_depth: dict[str, int] = {}
+    try:
+        queue_depth = _queue_depths()
+        checks["queue_depth"] = {"ok": True}
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        checks["queue_depth"] = {"ok": False, "error": str(exc)}
+    failing_checks = sorted(name for name, check in checks.items() if not check.get("ok"))
     return {
         "engine": ENGINE_NAME,
         "node_id": os.getenv("HLTHPRT_IMPORT_NODE_ID"),
-        "status": "ok",
-        "time": utc_now().isoformat(),
+        "status": "degraded" if failing_checks else "ok",
+        "checks": checks,
+        "failing_checks": failing_checks,
+        "time": dt.datetime.now(dt.UTC).isoformat(),
         "features": {
             "control_api": True,
             "ptg_parse_preview": True,
@@ -277,26 +330,39 @@ def node_health() -> dict[str, Any]:
             "enqueue_adapter_count": len(_SINGLE_JOB_ADAPTERS),
         },
         "disk": disk,
-        "queue_depth": _queue_depths(),
-        "workers": _worker_health(),
+        "queue_depth": queue_depth,
+        "workers": workers,
     }
 
 
-def _worker_health() -> dict[str, Any]:
+async def _database_check() -> dict[str, Any]:
     try:
-        from api.control_workers import worker_registry  # pylint: disable=import-outside-toplevel
+        await db.execute(text("SELECT 1"))
+        return {"ok": True}
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        return {"ok": False, "error": str(exc)}
 
-        return {
-            item["queue"]: {
-                "worker_class": item["worker_class"],
-                "role": item["role"],
-                "running": item["running"],
-                "pid": item.get("pid"),
-            }
-            for item in worker_registry()
+
+def _redis_check() -> dict[str, Any]:
+    try:
+        _redis_client().ping()
+        return {"ok": True}
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        return {"ok": False, "error": str(exc)}
+
+
+def _worker_health() -> dict[str, Any]:
+    from api.control_workers import worker_registry  # pylint: disable=import-outside-toplevel
+
+    return {
+        item["queue"]: {
+            "worker_class": item["worker_class"],
+            "role": item["role"],
+            "running": item["running"],
+            "pid": item.get("pid"),
         }
-    except Exception:  # pylint: disable=broad-exception-caught
-        return {}
+        for item in worker_registry()
+    }
 
 
 def _queue_depths() -> dict[str, int]:
@@ -309,11 +375,8 @@ def _queue_depths() -> dict[str, int]:
         queue = str(_SINGLE_JOB_ADAPTERS.get(importer, {}).get("queue") or "").strip()
         if queue:
             queues.add(f"{queue}_finish")
-    try:
-        client = _redis_client()
-        return {queue: int(client.zcard(queue) or 0) for queue in sorted(queues)}
-    except Exception:  # pylint: disable=broad-exception-caught
-        return {}
+    client = _redis_client()
+    return {queue: int(client.zcard(queue) or 0) for queue in sorted(queues)}
 
 
 def _redis_client() -> redis.Redis:
@@ -333,6 +396,17 @@ def _redis_client() -> redis.Redis:
 
 
 async def ensure_import_run_table() -> None:
+    global _IMPORT_RUN_ENSURED  # pylint: disable=global-statement
+    if _IMPORT_RUN_ENSURED:
+        return
+    async with _IMPORT_RUN_ENSURE_LOCK:
+        if _IMPORT_RUN_ENSURED:
+            return
+        await _ensure_import_run_table_once()
+        _IMPORT_RUN_ENSURED = True
+
+
+async def _ensure_import_run_table_once() -> None:
     if not hasattr(db, "connect") or not hasattr(db, "engine"):
         return
     await db.connect()
@@ -340,7 +414,9 @@ async def ensure_import_run_table() -> None:
         return
     async with db.engine.begin() as conn:
         schema = ImportRun.__table__.schema or (os.getenv("HLTHPRT_DB_SCHEMA") or "mrf")
-        await conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
+        quoted_schema = _quote_ident(schema)
+        await conn.execute(text("SELECT pg_advisory_xact_lock(:lock_key)"), {"lock_key": _IMPORT_RUN_ADVISORY_LOCK_KEY})
+        await conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {quoted_schema}"))
         await conn.run_sync(ImportRun.__table__.create, checkfirst=True)
         for spec in getattr(ImportRun, "__my_additional_indexes__", []) or []:
             name = str(spec.get("name") or "").strip()
@@ -350,8 +426,15 @@ async def ensure_import_run_table() -> None:
             unique = "UNIQUE " if spec.get("unique") else ""
             where = f" WHERE {spec['where']}" if spec.get("where") else ""
             await conn.execute(
-                text(f'CREATE {unique}INDEX IF NOT EXISTS {name} ON "{schema}"."{ImportRun.__tablename__}" ({columns}){where}')
+                text(
+                    f"CREATE {unique}INDEX IF NOT EXISTS {_quote_ident(name)} "
+                    f"ON {quoted_schema}.{_quote_ident(ImportRun.__tablename__)} ({columns}){where}"
+                )
             )
+
+
+def _quote_ident(value: str) -> str:
+    return '"' + str(value).replace('"', '""') + '"'
 
 
 def parse_ptg_toc_preview(payload: dict[str, Any]) -> dict[str, Any]:
@@ -404,6 +487,18 @@ def _string_list(value: Any) -> list[str] | None:
     return None
 
 
+_RUN_TIMESTAMP_KEYS = ("created_at", "started_at", "finished_at", "heartbeat_at")
+
+
+def _serialize_run_timestamps(data: dict[str, Any]) -> dict[str, Any]:
+    """Serialize naive-UTC run timestamps as timezone-aware UTC ISO-8601 strings."""
+    data = dict(data)
+    for key in _RUN_TIMESTAMP_KEYS:
+        if data.get(key) is not None:
+            data[key] = isoformat_utc(data[key])
+    return data
+
+
 def normalize_run(row: Any) -> dict[str, Any]:
     if row is None:
         return {}
@@ -413,7 +508,7 @@ def normalize_run(row: Any) -> dict[str, Any]:
         data = dict(row)
     else:
         data = {name: getattr(row, name) for name in ImportRun.__table__.columns.keys() if hasattr(row, name)}
-    return _overlay_live_progress(data)
+    return _overlay_live_progress(_serialize_run_timestamps(data))
 
 
 def _overlay_live_progress(data: dict[str, Any]) -> dict[str, Any]:
@@ -474,20 +569,66 @@ def _finish_function(importer: str):
     return finish_main
 
 
-async def list_import_runs(*, status: str | None = None, importer: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
-    await ensure_import_run_table()
-    bounded_limit = max(1, min(int(limit or 50), 200))
-    stmt = select(ImportRun).order_by(ImportRun.created_at.desc()).limit(bounded_limit)
+async def list_import_runs(
+    *, status: str | None = None, importer: str | None = None, limit: int = 50, cursor: str | None = None
+) -> list[dict[str, Any]]:
+    page = await list_import_runs_page(status=status, importer=importer, limit=limit, cursor=cursor)
+    return page["items"]
+
+
+async def list_import_runs_page(
+    *, status: str | None = None, importer: str | None = None, limit: int = 50, cursor: str | None = None
+) -> dict[str, Any]:
+    bounded_limit = max(1, min(int(limit or 50), MAX_IMPORT_RUN_LIST_LIMIT))
+    stmt = select(ImportRun)
     if status:
         stmt = stmt.where(ImportRun.status == status)
     if importer:
         stmt = stmt.where(ImportRun.importer == importer)
+    if cursor:
+        created_at, run_id = _decode_import_run_cursor(cursor)
+        stmt = stmt.where(
+            or_(
+                ImportRun.created_at < created_at,
+                and_(ImportRun.created_at == created_at, ImportRun.run_id < run_id),
+            )
+        )
+    stmt = stmt.order_by(ImportRun.created_at.desc(), ImportRun.run_id.desc()).limit(bounded_limit + 1)
     result = await db.execute(stmt)
-    return [normalize_run(row) for row in result.scalars().all()]
+    rows = list(result.scalars().all())
+    next_cursor = None
+    if len(rows) > bounded_limit:
+        next_row = rows[bounded_limit - 1]
+        next_cursor = _encode_import_run_cursor(next_row.created_at, next_row.run_id)
+        rows = rows[:bounded_limit]
+    return {"items": [normalize_run(row) for row in rows], "next_cursor": next_cursor}
+
+
+def _encode_import_run_cursor(created_at: dt.datetime | None, run_id: str) -> str | None:
+    if created_at is None or not run_id:
+        return None
+    if created_at.tzinfo is not None:
+        created_at = created_at.astimezone(dt.UTC).replace(tzinfo=None)
+    payload = json.dumps({"created_at": created_at.isoformat(), "run_id": run_id}, separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(payload).decode().rstrip("=")
+
+
+def _decode_import_run_cursor(cursor: str) -> tuple[dt.datetime, str]:
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded.encode()).decode())
+        created_at = dt.datetime.fromisoformat(str(payload["created_at"]).replace("Z", "+00:00"))
+        run_id = str(payload["run_id"]).strip()
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid cursor") from exc
+    if not run_id:
+        raise ValueError("invalid cursor")
+    if created_at.tzinfo is not None:
+        created_at = created_at.astimezone(dt.UTC).replace(tzinfo=None)
+    return created_at, run_id
 
 
 async def get_import_run(run_id: str) -> dict[str, Any] | None:
-    await ensure_import_run_table()
     result = await db.execute(select(ImportRun).where(ImportRun.run_id == run_id).limit(1))
     row = result.scalar_one_or_none()
     return normalize_run(row) if row else None
@@ -525,7 +666,6 @@ async def finalize_import_run(run_id: str, payload: dict[str, Any]) -> dict[str,
 
 
 async def find_active_run_by_idempotency_key(idempotency_key: str) -> dict[str, Any] | None:
-    await ensure_import_run_table()
     result = await db.execute(
         select(ImportRun)
         .where(ImportRun.idempotency_key == idempotency_key)
@@ -536,17 +676,31 @@ async def find_active_run_by_idempotency_key(idempotency_key: str) -> dict[str, 
     return normalize_run(row) if row else None
 
 
+async def find_active_run_by_importer(importer: str) -> dict[str, Any] | None:
+    result = await db.execute(
+        select(ImportRun)
+        .where(ImportRun.importer == importer)
+        .where(ImportRun.status.in_(ACTIVE_STATUSES))
+        .order_by(ImportRun.created_at.asc())
+        .limit(1)
+    )
+    row = result.scalar_one_or_none()
+    return normalize_run(row) if row else None
+
+
 async def create_import_run(payload: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     importer = str(payload.get("importer") or "").strip()
     if importer not in importer_names():
         raise ValueError(f"unknown importer: {importer}")
-    await ensure_import_run_table()
 
     idempotency_key = str(payload.get("idempotency_key") or "").strip() or None
     if idempotency_key:
         active = await find_active_run_by_idempotency_key(idempotency_key)
         if active:
             return active, False
+    active_importer = await find_active_run_by_importer(importer)
+    if active_importer:
+        return active_importer, False
 
     now = utc_now()
     run_id = str(payload.get("run_id") or "").strip() or _new_run_id()
@@ -595,6 +749,7 @@ async def create_import_run(payload: dict[str, Any]) -> tuple[dict[str, Any], bo
             error=row["error"],
         )
     )
+    row = _serialize_run_timestamps(row)
     enqueue_status_event(row)
     _write_run_live_progress(row, publish_event=False)
     return row, True

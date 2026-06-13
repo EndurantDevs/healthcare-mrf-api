@@ -15,6 +15,7 @@ It is intended for readers on GitHub who need to understand:
 - [Data sources](./data-sources.md): source websites and how the project uses them
 - [Import index](./imports/README.md): every import command in one place
 - [MRF source discovery DevOps](./devops/mrf-source-discovery.md): payer/TPA source catalog schedules, smokes, and troubleshooting
+- [Address canonical DevOps](./devops/address-canonical.md): deduplicated address archive rollout, ARQ restart, and smoke checks
 - [MS-DRG DevOps](./devops/ms-drg.md): CMS MS-DRG reference refresh and smoke checks
 - [Clinical reference DevOps](./devops/clinical-reference.md): direct-replace runbook and attribution rule
 

@@ -183,6 +183,7 @@ async def test_get_all_returns_rows(monkeypatch):
     assert payload["total"] == 2
     assert payload["rows"][0]["taxonomy_list"]
     assert payload["rows"][0]["do_business_as"] == ['DBA']
+    assert "address_key" not in payload["rows"][0]
 
 
 def _build_near_row(npi_value: int) -> list:
@@ -409,6 +410,17 @@ def _make_address_row():
         else:
             data[column.key] = f"archive_{column.key}"
     return types.SimpleNamespace(**data)
+
+
+def _make_v2_archive_row(*, lat=42.0, long=-88.0, formatted_address="v2 address", place_id="v2-place"):
+    return types.SimpleNamespace(
+        _mapping={
+            "lat": lat,
+            "long": long,
+            "formatted_address": formatted_address,
+            "place_id": place_id,
+        }
+    )
 
 
 @pytest.mark.asyncio
@@ -1152,6 +1164,21 @@ async def test_get_npi_update_addr_coordinates_row_missing(monkeypatch):
 
     monkeypatch.setattr(npi_module, '_build_npi_details', fake_build)
     monkeypatch.setattr(npi_module, '_fetch_other_names', AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        npi_module,
+        '_fetch_provider_enrichment_summary_detail',
+        AsyncMock(return_value={
+            'summary': None,
+            'enrollments': {
+                'ffs_public': [
+                    {
+                        'address_key': '00000000-0000-0000-0000-000000000002',
+                        'address_line_1': '10 Main',
+                    }
+                ]
+            },
+        }),
+    )
     monkeypatch.setattr(npi_module.random, 'choice', lambda seq: seq[0])
 
     class FakeDB:
@@ -1338,6 +1365,355 @@ async def test_get_npi_skip_update_when_lat_present(monkeypatch):
     payload = json.loads(response.body)
     assert payload['address_list'][0]['lat'] == 40.0
     assert tasks == []
+
+
+@pytest.mark.asyncio
+async def test_get_npi_v2_archive_is_disabled_without_cutover_flag(monkeypatch):
+    monkeypatch.delenv("HLTHPRT_ADDRESS_ARCHIVE_CUTOVER", raising=False)
+    address_entry = {
+        'npi': 1518379601,
+        'type': 'primary',
+        'checksum': 4,
+        'first_line': '13 Main St',
+        'second_line': '',
+        'city_name': 'Town',
+        'state_name': 'IL',
+        'postal_code': '123450000',
+        'lat': None,
+        'long': None,
+        'formatted_address': None,
+        'plans_network_array': [],
+        'taxonomy_array': [],
+    }
+
+    async def fake_build(_npi):
+        return {
+            'npi': _npi,
+            'do_business_as': [],
+            'taxonomy_list': [],
+            'taxonomy_group_list': [],
+            'address_list': [dict(address_entry)],
+        }
+
+    monkeypatch.setattr(npi_module, '_build_npi_details', fake_build)
+    monkeypatch.setattr(npi_module, '_fetch_other_names', AsyncMock(return_value=[]))
+
+    class FakeDB:
+        async def first(self, *_args, **_kwargs):
+            raise AssertionError('v2 archive lookup should require explicit cutover flag')
+
+        async def scalar(self, *_args, **_kwargs):
+            return _make_address_row()
+
+    monkeypatch.setattr(npi_module, 'db', FakeDB())
+
+    async def fail_download(*_args, **_kwargs):  # pragma: no cover - guard
+        raise AssertionError('download should not run when legacy archive hit')
+
+    monkeypatch.setattr(npi_module, 'download_it', fail_download)
+
+    class FakeApp:
+        config = {'NPI_API_UPDATE_GEOCODE': False}
+
+        def add_task(self, coro):  # pragma: no cover - guard
+            raise AssertionError('no geocode update task expected')
+
+    request = types.SimpleNamespace(args={}, app=FakeApp())
+    response = await npi_module.get_npi(request, '1518379601')
+    payload = json.loads(response.body)
+    assert payload['address_list'][0]['lat'] == 41.0
+
+
+@pytest.mark.asyncio
+async def test_get_npi_v2_archive_cutover_reads_geocodes_for_concurrent_addresses(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_ADDRESS_ARCHIVE_CUTOVER", "1")
+    monkeypatch.setenv("HLTHPRT_ADDRESS_ARCHIVE_TABLE", "address_archive_v2")
+    addresses = [
+        {
+            'npi': 1518379601,
+            'type': 'primary',
+            'checksum': 10,
+            'first_line': '10 Main St',
+            'second_line': '',
+            'city_name': 'Town',
+            'state_name': 'IL',
+            'postal_code': '123450000',
+            'country_code': 'US',
+            'lat': None,
+            'long': None,
+            'formatted_address': None,
+            'plans_network_array': [],
+            'taxonomy_array': [],
+        },
+        {
+            'npi': 1518379601,
+            'type': 'secondary',
+            'checksum': 11,
+            'first_line': '11 Main St',
+            'second_line': '',
+            'city_name': 'Town',
+            'state_name': 'IL',
+            'postal_code': '123450000',
+            'country_code': 'US',
+            'lat': None,
+            'long': None,
+            'formatted_address': None,
+            'plans_network_array': [],
+            'taxonomy_array': [],
+        },
+    ]
+
+    async def fake_build(_npi):
+        return {
+            'npi': _npi,
+            'do_business_as': [],
+            'taxonomy_list': [],
+            'taxonomy_group_list': [],
+            'address_list': [dict(address) for address in addresses],
+        }
+
+    monkeypatch.setattr(npi_module, '_build_npi_details', fake_build)
+    monkeypatch.setattr(npi_module, '_fetch_other_names', AsyncMock(return_value=[]))
+
+    class FakeDB:
+        def __init__(self):
+            self.catalog_calls = 0
+            self.first_calls = 0
+
+        async def scalar(self, query, **_kwargs):
+            if not isinstance(query, str):
+                raise AssertionError('legacy checksum archive should not be used when v2 geocode exists')
+            self.catalog_calls += 1
+            if 'to_regclass' in query:
+                await asyncio.sleep(0)
+                return 'mrf.address_archive_v2'
+            if 'information_schema.columns' in query:
+                return True
+            if 'to_regprocedure' in query:
+                return 'mrf.addr_key_v1(text,text,text,text,text,text)'
+            raise AssertionError(query)
+
+        async def first(self, *_args, **_kwargs):
+            self.first_calls += 1
+            return _make_v2_archive_row(lat=42.0 + self.first_calls)
+
+    fake_db = FakeDB()
+    monkeypatch.setattr(npi_module, 'db', fake_db)
+
+    async def fail_download(*_args, **_kwargs):  # pragma: no cover - guard
+        raise AssertionError('download should not run when v2 archive hit')
+
+    monkeypatch.setattr(npi_module, 'download_it', fail_download)
+
+    class FakeApp:
+        config = {'NPI_API_UPDATE_GEOCODE': False}
+
+        def add_task(self, coro):  # pragma: no cover - guard
+            raise AssertionError('no geocode update task expected')
+
+    request = types.SimpleNamespace(args={}, app=FakeApp())
+    response = await npi_module.get_npi(request, '1518379601')
+    payload = json.loads(response.body)
+
+    assert [address['lat'] for address in payload['address_list']] == [43.0, 44.0]
+    assert fake_db.first_calls == 2
+    assert fake_db.catalog_calls == 3
+
+
+@pytest.mark.asyncio
+async def test_get_npi_v2_archive_geocodeless_row_falls_back_to_legacy(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_ADDRESS_ARCHIVE_CUTOVER", "true")
+    address_entry = {
+        'npi': 1518379601,
+        'type': 'primary',
+        'checksum': 12,
+        'first_line': '12 Main St',
+        'second_line': '',
+        'city_name': 'Town',
+        'state_name': 'IL',
+        'postal_code': '123450000',
+        'country_code': 'US',
+        'lat': None,
+        'long': None,
+        'formatted_address': None,
+        'plans_network_array': [],
+        'taxonomy_array': [],
+    }
+
+    async def fake_build(_npi):
+        return {
+            'npi': _npi,
+            'do_business_as': [],
+            'taxonomy_list': [],
+            'taxonomy_group_list': [],
+            'address_list': [dict(address_entry)],
+        }
+
+    monkeypatch.setattr(npi_module, '_build_npi_details', fake_build)
+    monkeypatch.setattr(npi_module, '_fetch_other_names', AsyncMock(return_value=[]))
+
+    class FakeDB:
+        async def scalar(self, query, **_kwargs):
+            if isinstance(query, str):
+                if 'to_regclass' in query:
+                    return 'mrf.address_archive_v2'
+                if 'information_schema.columns' in query:
+                    return True
+                if 'to_regprocedure' in query:
+                    return 'mrf.addr_key_v1(text,text,text,text,text,text)'
+                raise AssertionError(query)
+            return _make_address_row()
+
+        async def first(self, *_args, **_kwargs):
+            return None
+
+    monkeypatch.setattr(npi_module, 'db', FakeDB())
+
+    async def fail_download(*_args, **_kwargs):  # pragma: no cover - guard
+        raise AssertionError('download should not run when legacy archive hit')
+
+    monkeypatch.setattr(npi_module, 'download_it', fail_download)
+
+    class FakeApp:
+        config = {'NPI_API_UPDATE_GEOCODE': False}
+
+        def add_task(self, coro):  # pragma: no cover - guard
+            raise AssertionError('no geocode update task expected')
+
+    request = types.SimpleNamespace(args={}, app=FakeApp())
+    response = await npi_module.get_npi(request, '1518379601')
+    payload = json.loads(response.body)
+    assert payload['address_list'][0]['lat'] == 41.0
+
+
+@pytest.mark.asyncio
+async def test_get_npi_v2_archive_geocode_write_uses_deduped_address_key_upsert(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_ADDRESS_ARCHIVE_CUTOVER", "1")
+    address_entry = {
+        'npi': 1518379601,
+        'type': 'primary',
+        'checksum': 13,
+        'first_line': '13 Main St',
+        'second_line': '',
+        'city_name': 'Town',
+        'state_name': 'IL',
+        'postal_code': '123450000',
+        'country_code': 'US',
+        'lat': None,
+        'long': None,
+        'formatted_address': None,
+        'plans_network_array': [],
+        'taxonomy_array': [],
+    }
+
+    async def fake_build(_npi):
+        return {
+            'npi': _npi,
+            'do_business_as': [],
+            'taxonomy_list': [],
+            'taxonomy_group_list': [],
+            'address_list': [dict(address_entry)],
+        }
+
+    monkeypatch.setattr(npi_module, '_build_npi_details', fake_build)
+    monkeypatch.setattr(npi_module, '_fetch_other_names', AsyncMock(return_value=[]))
+
+    class FakeDB:
+        def __init__(self):
+            self.status_sql = []
+
+        async def scalar(self, query, **_kwargs):
+            if isinstance(query, str):
+                if 'to_regclass' in query:
+                    return 'mrf.address_archive_v2'
+                if 'information_schema.columns' in query:
+                    return True
+                if 'to_regprocedure' in query:
+                    return 'mrf.addr_key_v1(text,text,text,text,text,text)'
+                raise AssertionError(query)
+            return types.SimpleNamespace()
+
+        async def first(self, *_args, **_kwargs):
+            return _make_v2_archive_row(lat=45.0)
+
+        def update(self, *_args, **_kwargs):
+            return FakeUpdate()
+
+        def insert(self, *_args, **_kwargs):
+            raise AssertionError('legacy AddressArchive insert should not run during v2 cutover')
+
+        async def status(self, sql, **_kwargs):
+            self.status_sql.append(sql)
+            return 1
+
+    fake_db = FakeDB()
+    monkeypatch.setattr(npi_module, 'db', fake_db)
+
+    async def fail_download(*_args, **_kwargs):  # pragma: no cover - guard
+        raise AssertionError('download should not run when v2 archive hit')
+
+    monkeypatch.setattr(npi_module, 'download_it', fail_download)
+
+    tasks = []
+
+    class FakeApp:
+        config = {'NPI_API_UPDATE_GEOCODE': True}
+
+        def add_task(self, coro):
+            tasks.append(coro)
+
+    request = types.SimpleNamespace(args={}, app=FakeApp())
+    response = await npi_module.get_npi(request, '1518379601')
+    payload = json.loads(response.body)
+    assert payload['address_list'][0]['lat'] == 45.0
+    assert tasks
+    await tasks[0]
+
+    upsert_sql = "\n".join(fake_db.status_sql)
+    assert "INSERT INTO mrf.address_archive_v2" in upsert_sql
+    assert "SELECT DISTINCT ON" in upsert_sql
+    assert "ON CONFLICT (address_key) DO UPDATE" in upsert_sql
+    assert "WHERE checksum = :checksum" in upsert_sql
+    assert "LEFT(mrf.addr_state_code_v1(state_name), 32)" in upsert_sql
+
+
+@pytest.mark.asyncio
+async def test_get_npi_does_not_expose_internal_address_key(monkeypatch):
+    async def fake_build(_npi):
+        return {
+            'npi': _npi,
+            'do_business_as': [],
+            'taxonomy_list': [],
+            'taxonomy_group_list': [],
+            'address_list': [
+                {
+                    'npi': _npi,
+                    'type': 'primary',
+                    'checksum': 5,
+                    'address_key': '00000000-0000-0000-0000-000000000001',
+                    'lat': 40.0,
+                    'long': -80.0,
+                    'formatted_address': 'Town, IL',
+                    'plans_network_array': [],
+                    'taxonomy_array': [],
+                }
+            ],
+        }
+
+    monkeypatch.setattr(npi_module, '_build_npi_details', fake_build)
+    monkeypatch.setattr(npi_module, '_fetch_other_names', AsyncMock(return_value=[]))
+
+    class FakeApp:
+        config = {'NPI_API_UPDATE_GEOCODE': False}
+
+        def add_task(self, coro):  # pragma: no cover - guard
+            raise AssertionError('no task expected')
+
+    request = types.SimpleNamespace(args={}, app=FakeApp())
+    response = await npi_module.get_npi(request, '1518379601')
+    payload = json.loads(response.body)
+    assert 'address_key' not in payload['address_list'][0]
+    assert 'address_key' not in json.dumps(payload)
 
 
 @pytest.mark.asyncio

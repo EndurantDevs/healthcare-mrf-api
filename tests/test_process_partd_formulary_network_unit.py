@@ -110,6 +110,61 @@ def test_test_mode_skips_full_table_index_maintenance():
     assert "if not test_mode:\n            await _drop_legacy_partd_tables(schema)" in source
 
 
+def test_materialize_pricing_snapshot_analyzes_stage_and_uses_single_aggregate(monkeypatch):
+    executed: list[str] = []
+
+    class FakeDB:
+        async def status(self, stmt, **_kwargs):
+            executed.append(stmt)
+
+    monkeypatch.setattr(module, "db", FakeDB())
+
+    asyncio.run(module._materialize_pricing_snapshot("mrf", "monthly:20260520:test"))  # pylint: disable=protected-access
+
+    assert executed[0] == "ANALYZE mrf.partd_medication_cost_stage_v2;"
+    insert_sql = next(stmt for stmt in executed if "INSERT INTO mrf.partd_medication_cost_v2" in stmt)
+    assert "array_agg(DISTINCT plan_id ORDER BY plan_id) AS plan_ids" in insert_sql
+    assert "dedup AS" not in insert_sql
+    assert "SELECT DISTINCT" not in insert_sql
+
+
+def test_flush_batches_dedupes_exact_pricing_rows_before_copy(monkeypatch):
+    captured: list[tuple[type, list[dict]]] = []
+
+    async def fake_push_objects(rows, model, **_kwargs):
+        captured.append((model, rows))
+
+    monkeypatch.setattr(module, "push_objects", fake_push_objects)
+    row = {
+        "snapshot_id": "monthly:20260520:test",
+        "plan_id": "S1234001000",
+        "year": 2026,
+        "code_system": "ndc",
+        "code": "00000000000",
+        "normalized_code": "00000000000",
+        "rxnorm_id": None,
+        "ndc11": "00000000000",
+        "days_supply": 30,
+        "drug_name": "Drug",
+        "tier": "1",
+        "pharmacy_type": "retail",
+        "mail_order": False,
+        "cost_type": "preferred_days_30",
+        "cost_amount": 1.23,
+        "effective_from": datetime.date(2026, 4, 1),
+        "effective_to": None,
+        "source_type": "monthly",
+    }
+    other_plan = dict(row, plan_id="S1234002000")
+
+    asyncio.run(module._flush_batches([], [dict(row), dict(row), other_plan]))  # pylint: disable=protected-access
+
+    assert len(captured) == 1
+    model, rows = captured[0]
+    assert model is module.PartDMedicationCostStage
+    assert rows == [row, other_plan]
+
+
 def test_ensure_columns_adds_missing_columns(monkeypatch):
     table = module.PartDPharmacyActivityStage.__table__  # pylint: disable=protected-access
     existing = {column.name for column in table.columns}
@@ -129,3 +184,42 @@ def test_ensure_columns_adds_missing_columns(monkeypatch):
     monkeypatch.setattr(module, "db", FakeDB())
     asyncio.run(module._ensure_columns(module.PartDPharmacyActivityStage, "mrf"))  # pylint: disable=protected-access
     assert any("ADD COLUMN IF NOT EXISTS \"dispensing_fee_brand_30\"" in stmt for stmt in executed)
+
+
+def test_fill_activity_state_from_zip_uses_geo_lookup(monkeypatch):
+    executed: list[str] = []
+
+    class FakeDB:
+        async def status(self, stmt, **_kwargs):
+            executed.append(stmt)
+
+    monkeypatch.setattr(module, "db", FakeDB())
+
+    asyncio.run(module._fill_activity_state_from_zip("mrf", "partd_pharmacy_activity_stage_v2"))  # pylint: disable=protected-access
+
+    assert executed
+    stmt = executed[0]
+    assert "UPDATE mrf.partd_pharmacy_activity_stage_v2 AS activity" in stmt
+    assert "FROM mrf.geo_zip_lookup AS geo" in stmt
+    assert "NULLIF(activity.state, '') IS NULL" in stmt
+    assert "regexp_replace(COALESCE(activity.zip_code, ''), '[^0-9]', '', 'g')" in stmt
+
+
+def test_fill_activity_address_from_npi_uses_primary_address(monkeypatch):
+    executed: list[str] = []
+
+    class FakeDB:
+        async def status(self, stmt, **_kwargs):
+            executed.append(stmt)
+
+    monkeypatch.setattr(module, "db", FakeDB())
+
+    asyncio.run(module._fill_activity_address_from_npi("mrf", "partd_pharmacy_activity_stage_v2"))  # pylint: disable=protected-access
+
+    assert executed
+    stmt = executed[0]
+    assert "to_regclass('mrf.npi_address')" in stmt
+    assert "UPDATE mrf.partd_pharmacy_activity_stage_v2 AS activity" in stmt
+    assert "FROM mrf.npi_address" in stmt
+    assert "type = 'primary'" in stmt
+    assert "activity.npi = npi_addr.npi" in stmt

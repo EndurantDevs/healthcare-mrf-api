@@ -8,6 +8,7 @@ import datetime as dt
 import html
 import ipaddress
 import json
+import logging
 import os
 import re
 import socket
@@ -615,7 +616,8 @@ async def _assert_fetch_url_allowed(url: str) -> None:
 
 
 def _assert_public_ip(ip: ipaddress._BaseAddress) -> None:
-    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified:
+    # not is_global also catches ranges the flag checks miss, e.g. CGNAT 100.64.0.0/10
+    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified or not ip.is_global:
         raise ValueError(f"non-public IP address is not allowed: {ip}")
 
 
@@ -2332,6 +2334,9 @@ async def _sync_import_control_seeds(source_rows: list[dict[str, Any]], *, limit
     base_url = str(os.getenv("HLTHPRT_IMPORT_CONTROL_URL") or os.getenv("HP_IMPORT_CONTROL_BASE_URL") or "").strip()
     token = str(os.getenv("HLTHPRT_IMPORT_CONTROL_TOKEN") or os.getenv("HLTHPRT_CONTROL_API_TOKEN") or "").strip()
     if not base_url or not token:
+        logging.getLogger(__name__).warning(
+            "import-control seed sync skipped: HLTHPRT_IMPORT_CONTROL_URL and/or HLTHPRT_IMPORT_CONTROL_TOKEN not configured"
+        )
         return 0
     items = []
     for row in source_rows[: limit or len(source_rows)]:
@@ -2631,11 +2636,22 @@ async def _import_control_snapshot_items(source_ids: list[str]) -> dict[str, lis
     return grouped
 
 
+_IMPORT_CONTROL_STAGED_VISIBILITY = "internal"
+_IMPORT_CONTROL_STAGED_STATUS = "needs_review"
+
+
 async def _promote_import_control_source(
-    session: aiohttp.ClientSession, base: str, row: dict[str, Any]
+    session: aiohttp.ClientSession,
+    base: str,
+    row: dict[str, Any],
+    *,
+    visibility: str = "public",
+    status: str = "active",
+    preserve_operator_state: bool = True,
 ) -> str | None:
-    """Upsert a discovered source into import-control as a public catalog source and return
-    the import-control-derived source_id (it derives ids from the canonical URL, ignoring ours)."""
+    """Upsert a discovered source into import-control and return the import-control-derived
+    source_id (it derives ids from the canonical URL, ignoring ours). The catalog sync stages
+    sources as internal/needs_review and only flips them public after a full plan sync."""
     payload = {
         "index_url": row.get("index_url") or row.get("human_url"),
         "official_url": row.get("human_url"),
@@ -2644,9 +2660,9 @@ async def _promote_import_control_source(
         "payer_name": row.get("display_name"),
         "source_type": row.get("source_type"),
         "domain": row.get("domain"),
-        "visibility": "public",
-        "status": "active",
-        "preserve_operator_state": True,
+        "visibility": visibility,
+        "status": status,
+        "preserve_operator_state": preserve_operator_state,
         "metadata": {
             "hosting_platform": row.get("hosting_platform"),
             "healthcare_source_id": row.get("source_id"),
@@ -2660,6 +2676,21 @@ async def _promote_import_control_source(
             raise RuntimeError(f"import-control source promote failed: {resp.status} {text[:200]}")
         data = await resp.json()
     return str(data.get("source_id") or "") or None
+
+
+async def _fetch_import_control_source(
+    session: aiohttp.ClientSession, base: str, ic_source_id: str
+) -> dict[str, Any] | None:
+    """Read the stored import-control source (the upsert response echoes the request payload,
+    not the persisted operator-controlled visibility/status)."""
+    async with session.get(f"{base}/v1/catalog/sources/{ic_source_id}") as resp:
+        if resp.status == 404:
+            return None
+        if resp.status >= 400:
+            text = await resp.text()
+            raise RuntimeError(f"import-control source fetch failed: {resp.status} {text[:200]}")
+        data = await resp.json()
+    return data if isinstance(data, dict) else None
 
 
 async def _ingest_import_control_preview(
@@ -2701,16 +2732,22 @@ async def _mark_import_control_seed_promoted(
 
 async def _push_import_control_catalog(
     source_rows: list[dict[str, Any]], *, limit: int | None = None
-) -> tuple[int, int]:
+) -> tuple[int, int, list[dict[str, Any]]]:
     """Promote eligible discovered sources into import-control and push their discovered
-    plans (built from the stored MRF file snapshot). Returns (sources_synced, plans_synced).
+    plans (built from the stored MRF file snapshot). Returns
+    (sources_synced, plans_synced, per-source errors).
+
+    Publication is staged: each source is upserted as internal/needs_review first, its plans
+    are ingested and the seed marked promoted, and only then is the source flipped public.
+    A partial failure leaves the source non-public (needs_review) instead of exposing an
+    incomplete plan catalog, and the source does not count as synced.
 
     Reuses import-control's non-destructive upsert (keyed on the stable discovered_plan_id),
     so manual fetch-preview plans and bulk-discovered plans converge instead of duplicating."""
     base_url = str(os.getenv("HLTHPRT_IMPORT_CONTROL_URL") or os.getenv("HP_IMPORT_CONTROL_BASE_URL") or "").strip()
     token = str(os.getenv("HLTHPRT_IMPORT_CONTROL_TOKEN") or os.getenv("HLTHPRT_CONTROL_API_TOKEN") or "").strip()
     if not base_url or not token:
-        return (0, 0)
+        return (0, 0, [])
     eligible = [
         row
         for row in source_rows
@@ -2718,35 +2755,72 @@ async def _push_import_control_catalog(
     ]
     eligible = eligible[: limit or len(eligible)]
     if not eligible:
-        return (0, 0)
+        return (0, 0, [])
     snapshot = await _import_control_snapshot_items([str(row.get("source_id") or "") for row in eligible])
     if not snapshot:
-        return (0, 0)
+        return (0, 0, [])
     base = base_url.rstrip("/")
     timeout = aiohttp.ClientTimeout(total=60, connect=10, sock_read=30)
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json", "User-Agent": USER_AGENT}
     sources_synced = 0
     plans_synced = 0
-    failures = 0
+    errors: list[dict[str, Any]] = []
     async with aiohttp.ClientSession(headers=headers, timeout=timeout, trust_env=False) as session:
         for row in eligible:
-            items = snapshot.get(str(row.get("source_id") or "")) or []
+            source_id = str(row.get("source_id") or "")
+            items = snapshot.get(source_id) or []
             if not items:
                 continue
+            ic_source_id: str | None = None
             try:
-                ic_source_id = await _promote_import_control_source(session, base, row)
+                # Stage the source non-public first so a mid-sync failure never leaves a
+                # public source with an incomplete plan catalog.
+                ic_source_id = await _promote_import_control_source(
+                    session,
+                    base,
+                    row,
+                    visibility=_IMPORT_CONTROL_STAGED_VISIBILITY,
+                    status=_IMPORT_CONTROL_STAGED_STATUS,
+                )
                 if not ic_source_id:
                     continue
-                sources_synced += 1
+                stored = await _fetch_import_control_source(session, base, ic_source_id)
+                # Only flip to public if the row still carries our staged sentinel; any other
+                # state means the source pre-existed and an operator decision must stand.
+                staged = stored is None or (
+                    str(stored.get("visibility") or "") == _IMPORT_CONTROL_STAGED_VISIBILITY
+                    and str(stored.get("status") or "") == _IMPORT_CONTROL_STAGED_STATUS
+                )
+                source_plans = 0
                 for batch in _chunked(_split_preview_items(items), 100):
-                    plans_synced += await _ingest_import_control_preview(session, base, ic_source_id, batch)
+                    source_plans += await _ingest_import_control_preview(session, base, ic_source_id, batch)
                 await _mark_import_control_seed_promoted(session, base, row, ic_source_id)
-            except Exception:  # pylint: disable=broad-exception-caught
-                failures += 1
+                if staged:
+                    await _promote_import_control_source(
+                        session,
+                        base,
+                        row,
+                        visibility="public",
+                        status="active",
+                        preserve_operator_state=False,
+                    )
+                sources_synced += 1
+                plans_synced += source_plans
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                errors.append(
+                    {
+                        "source_id": source_id or None,
+                        "import_control_source_id": ic_source_id,
+                        "message": str(exc),
+                    }
+                )
                 continue
-    if failures and not sources_synced:
-        raise RuntimeError(f"import-control catalog sync failed for all {failures} source(s)")
-    return (sources_synced, plans_synced)
+    if errors and not sources_synced:
+        raise RuntimeError(
+            f"import-control catalog sync failed for all {len(errors)} source(s): "
+            + "; ".join(str(item.get("message") or "") for item in errors)[:500]
+        )
+    return (sources_synced, plans_synced, errors)
 
 
 async def main(
@@ -2929,9 +3003,13 @@ async def main(
         except Exception as exc:  # pylint: disable=broad-exception-caught
             result.errors.append({"provider": "import-control", "message": str(exc)})
         try:
-            sources_synced, plans_synced = await _push_import_control_catalog(source_rows, limit=bounded_limit)
+            sources_synced, plans_synced, catalog_errors = await _push_import_control_catalog(
+                source_rows, limit=bounded_limit
+            )
             result.import_control_sources_synced = sources_synced
             result.import_control_plans_synced = plans_synced
+            for item in catalog_errors:
+                result.errors.append({"provider": "import-control-catalog", **item})
         except Exception as exc:  # pylint: disable=broad-exception-caught
             result.errors.append({"provider": "import-control-catalog", "message": str(exc)})
 

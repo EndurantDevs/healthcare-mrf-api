@@ -20,18 +20,31 @@ python main.py worker process.MRF_finish --burst
 
 Concurrency notes:
 
-- `HLTHPRT_MAX_MRF_JOBS=10` means one `process.MRF` worker process can run up to 10 jobs concurrently.
-- It does not start 10 separate OS worker processes.
-- To launch 10 actual worker processes locally, use the helper script:
+- `HLTHPRT_MAX_MRF_JOBS=8` means one `process.MRF` worker process can run up to 8 jobs concurrently.
+- It does not start 8 separate OS worker processes.
+- Production-style/dev-server runs should launch separate `process.MRF --burst`
+  worker processes as well as setting the per-process concurrency limit.
+- `HLTHPRT_MAX_MRF_FINISH_JOBS=1` should be used for `process.MRF_finish`;
+  the finish queue has one shutdown job and extra ARQ slots only contend on the
+  same lock.
+- On full-source runs, older finish code spent most of its time recomputing
+  canonical keys on `mrf_address_evidence`. The current path stamps
+  `mrf_address` first, then propagates matching evidence keys from the
+  aggregate table via `(npi, type, checksum)` and identical address fields.
+  Residual evidence rows fall back to direct stamping.
+- `HLTHPRT_ADDRESS_CANON_REPAIR_EXISTING=true` is reserved for one-time
+  canonicalizer repairs. Normal finish runs leave it unset/false so parent and
+  evidence stamping only fills missing `address_key` values.
+- To launch 8 actual worker processes locally, use the helper script:
 
 ```bash
-support/run_mrf_parallel.sh --workers 10 --import-id 20260405
+support/run_mrf_parallel.sh --workers 8 --import-id 20260405
 ```
 
 Test-schema smoke run:
 
 ```bash
-support/run_mrf_parallel.sh --test --workers 10 --import-id 20260405
+support/run_mrf_parallel.sh --test --workers 8 --import-id 20260405
 ```
 
 ## Manual Finish

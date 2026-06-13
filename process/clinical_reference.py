@@ -54,6 +54,7 @@ RXCLASS_BY_RXCUI_URL = "https://rxnav.nlm.nih.gov/REST/rxclass/class/byRxcui.jso
 
 DEFAULT_ARTIFACT_ROOT = Path("/Volumes/Data/data/artifacts/terminology")
 DEFAULT_BATCH_SIZE = 5000
+DEFAULT_CLINICAL_REFERENCE_SOURCES = "icd10cm,mesh,rxnorm,medrt"
 CLINICAL_REFERENCE_SOURCES = (
     "cdc_icd10cm",
     "nlm_mesh_descriptor",
@@ -66,6 +67,7 @@ CLINICAL_REFERENCE_SOURCES = (
 
 SNOMED_FSN_TYPE_ID = "900000000000003001"
 SNOMED_SYNONYM_TYPE_ID = "900000000000013009"
+RESTRICTED_SOURCE_ALIASES = {"snomed"}
 
 
 def _schema() -> str:
@@ -138,15 +140,18 @@ def _download_url(url: str, path: Path, *, api_key: str | None = None, force: bo
     tmp = path.with_suffix(path.suffix + ".tmp")
     request_url = url
     if api_key:
-        request_url = f"{UMLS_DOWNLOAD_URL}?url={urllib.parse.quote(url, safe='')}&apiKey={urllib.parse.quote(api_key)}"
+        request_url = _umls_download_url(url, api_key)
     request = urllib.request.Request(request_url, headers={"User-Agent": "HealthPorta terminology importer"})
-    with urllib.request.urlopen(request, timeout=3600) as response, tmp.open("wb") as out:
-        while True:
-            _raise_if_cancelled(run_id)
-            chunk = response.read(1024 * 1024)
-            if not chunk:
-                break
-            out.write(chunk)
+    try:
+        with urllib.request.urlopen(request, timeout=3600) as response, tmp.open("wb") as out:
+            while True:
+                _raise_if_cancelled(run_id)
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                out.write(chunk)
+    except Exception as exc:
+        raise RuntimeError(f"download failed for {_redact_sensitive_url(request_url)}: {_redact_sensitive_url(str(exc))}") from exc
     _raise_if_cancelled(run_id)
     tmp.replace(path)
     manifest = {
@@ -157,6 +162,14 @@ def _download_url(url: str, path: Path, *, api_key: str | None = None, force: bo
     }
     path.with_suffix(path.suffix + ".manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return path
+
+
+def _umls_download_url(url: str, api_key: str) -> str:
+    return f"{UMLS_DOWNLOAD_URL}?url={urllib.parse.quote(url, safe='')}&apiKey={urllib.parse.quote(api_key)}"
+
+
+def _redact_sensitive_url(value: str) -> str:
+    return re.sub(r"(?i)(apiKey=)[^\s&]+", r"\1<redacted>", str(value))
 
 
 def _release_current(release_type: str) -> dict[str, Any]:
@@ -816,8 +829,20 @@ async def _push(stage_cls, rows: list[dict[str, Any]]) -> int:
 
 
 def _selected_sources(raw: str | None) -> set[str]:
-    value = raw or os.getenv("HLTHPRT_CLINICAL_REFERENCE_SOURCES") or "icd10cm,mesh,rxnorm,snomed,medrt"
-    return {item.strip().lower() for item in value.split(",") if item.strip()}
+    explicit = raw if raw is not None else os.getenv("HLTHPRT_CLINICAL_REFERENCE_SOURCES")
+    value = explicit or DEFAULT_CLINICAL_REFERENCE_SOURCES
+    selected = {item.strip().lower() for item in value.split(",") if item.strip()}
+    restricted = selected & RESTRICTED_SOURCE_ALIASES
+    if restricted and not _restricted_terminology_enabled():
+        joined = ", ".join(sorted(restricted))
+        raise RuntimeError(
+            f"restricted terminology source(s) require HLTHPRT_ENABLE_RESTRICTED_TERMINOLOGIES=1: {joined}"
+        )
+    return selected
+
+
+def _restricted_terminology_enabled() -> bool:
+    return str(os.getenv("HLTHPRT_ENABLE_RESTRICTED_TERMINOLOGIES") or "").strip().lower() in {"1", "true", "yes"}
 
 
 async def import_clinical_reference(

@@ -1,14 +1,20 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+import importlib.util
 import json
 import types
+from pathlib import Path
 
 import pytest
+import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
 from sanic.exceptions import Forbidden
 from sanic.exceptions import BadRequest, NotFound
 
+from db.models import ImportRun
+
 from api import control
+from api import metrics as api_metrics
 from api.control import _require_control_auth
 from api import control_imports
 from api.control_imports import (
@@ -21,6 +27,7 @@ from api.control_imports import (
     normalize_run,
     parse_ptg_toc_preview,
 )
+from process.ext import utils as process_utils
 
 CONTROL_HEADERS = {"Authorization": "Bearer secret"}
 
@@ -41,6 +48,10 @@ def test_importer_registry_exposes_ptg_and_finish_lifecycle():
     assert items["mrf-source-discovery"]["family"] == "mrf"
     assert items["mrf-source-discovery"]["enqueue_adapter"] == "arq_single_job"
     assert items["mrf-source-discovery"]["schedulable"] is True
+    assert items["address-archive-v2-migrate"]["family"] == "provider"
+    assert items["address-archive-v2-migrate"]["enqueue_adapter"] == "arq_single_job"
+    assert items["address-archive-v2-migrate"]["queue"] == "arq:AddressArchive"
+    assert items["address-archive-v2-migrate"]["cancelable"] is True
     assert items["code-sets"]["enqueue_adapter"] == "arq_single_job"
     assert items["ms-drg"]["family"] == "reference"
     assert items["ms-drg"]["enqueue_adapter"] == "arq_single_job"
@@ -49,6 +60,7 @@ def test_importer_registry_exposes_ptg_and_finish_lifecycle():
     assert items["geo-census"]["enqueue_adapter"] == "arq_single_job"
     assert items["plan-attributes"]["enqueue_adapter"] == "arq_single_job"
     assert items["npi"]["schedulable"] is True
+    assert items["npi"]["depends_on"] == ["nucc"]
     assert items["ptg"]["cancelable"] is True
     assert items["npi"]["cancelable"] is True
     assert items["claims-pricing"]["cancelable"] is False
@@ -65,12 +77,61 @@ def test_importer_registry_exposes_ptg_and_finish_lifecycle():
     assert any(param["name"] == "file_probe_payer_query" and param["type"] == "text" for param in items["mrf-source-discovery"]["params_schema"])
     assert any(param["name"] == "include_relationships" and param["type"] == "boolean" for param in items["ms-drg"]["params_schema"])
     assert any(param["name"] == "relationship_page_limit" and param["type"] == "integer" for param in items["ms-drg"]["params_schema"])
+    assert any(param["name"] == "dry_run" and param["is_flag"] for param in items["address-archive-v2-migrate"]["params_schema"])
+    assert any(param["name"] == "sample_limit" and param["type"] == "integer" for param in items["address-archive-v2-migrate"]["params_schema"])
+
+
+@pytest.mark.asyncio
+async def test_node_health_reports_degraded_when_redis_fails(monkeypatch):
+    async def fake_database_check():
+        return {"ok": True}
+
+    monkeypatch.setattr(control_imports, "_database_check", fake_database_check)
+    monkeypatch.setattr(control_imports, "_redis_check", lambda: {"ok": False, "error": "redis unavailable"})
+    monkeypatch.setattr(
+        control_imports,
+        "_worker_health",
+        lambda: {"arq:PTG": {"worker_class": "process.PTG", "role": "start", "running": True}},
+    )
+    monkeypatch.setattr(control_imports, "_queue_depths", lambda: {"arq:PTG": 0})
+
+    payload = await control_imports.node_health()
+
+    assert payload["status"] == "degraded"
+    assert payload["checks"]["redis"] == {"ok": False, "error": "redis unavailable"}
+    assert payload["failing_checks"] == ["redis"]
 
 
 def test_normalize_run_accepts_plain_dict():
     row = {"run_id": "run_1", "status": "queued"}
 
     assert normalize_run(row) == row
+
+
+@pytest.mark.asyncio
+async def test_render_prometheus_metrics_includes_engine_health_and_runs(monkeypatch):
+    async def fake_node_health():
+        return {
+            "node_id": "local_mrf",
+            "status": "ok",
+            "disk": {"free": 123},
+            "queue_depth": {"arq:PTG": 2},
+            "workers": {"arq:PTG": {"running": True}},
+        }
+
+    async def fake_active_run_counts():
+        return {"running": 1}, {"ptg": 1}
+
+    monkeypatch.setattr(api_metrics, "node_health", fake_node_health)
+    monkeypatch.setattr(api_metrics, "_active_run_counts", fake_active_run_counts)
+
+    body = await api_metrics.render_prometheus_metrics()
+
+    assert 'hp_mrf_api_node_health{node_id="local_mrf",status="ok"} 1.000000' in body
+    assert 'hp_mrf_api_active_runs_by_status{status="running"} 1.000000' in body
+    assert 'hp_mrf_api_active_runs_by_importer{importer="ptg"} 1.000000' in body
+    assert 'hp_mrf_api_queue_depth{queue="arq:PTG"} 2.000000' in body
+    assert 'hp_mrf_api_worker_running{queue="arq:PTG"} 1.000000' in body
 
 
 def test_normalize_run_overlays_live_progress_for_any_active_importer(monkeypatch):
@@ -221,6 +282,7 @@ async def test_enqueue_import_start_uses_control_run_id(monkeypatch):
     assert args[1]["run_id"] == "run_control"
     assert args[1]["test_mode"] is True
     assert kwargs["_job_id"] == "claims_start_run_control"
+    assert kwargs == {"_queue_name": "arq:ClaimsPricing", "_job_id": "claims_start_run_control"}
 
 
 @pytest.mark.asyncio
@@ -256,6 +318,7 @@ async def test_enqueue_import_start_enqueues_ptg_control_job(monkeypatch):
     assert args[1]["source_file_import_id"] == "source_file_import_1"
     assert args[1]["params"]["source_key"] == "asr_1208"
     assert kwargs["_job_id"] == "ptg_start_run_ptg"
+    assert kwargs == {"_queue_name": "arq:PTG", "_job_id": "ptg_start_run_ptg"}
 
 
 @pytest.mark.asyncio
@@ -283,12 +346,13 @@ async def test_enqueue_import_start_wraps_single_job_lifecycle(monkeypatch):
     result = await _enqueue_import_start(row)
 
     assert result["status"] == "queued"
-    args, _kwargs = calls[0]
+    args, kwargs = calls[0]
     assert args[0] == "control_single_job_start"
     assert args[1]["run_id"] == "run_nucc"
     assert args[1]["target_module"] == "process.nucc"
     assert args[1]["target_function"] == "process_data"
     assert args[1]["task"] == {"test_mode": True}
+    assert kwargs == {"_queue_name": "arq:NUCC"}
 
 
 @pytest.mark.asyncio
@@ -316,12 +380,13 @@ async def test_enqueue_import_start_wraps_direct_process_importers(monkeypatch):
     result = await _enqueue_import_start(row)
 
     assert result["status"] == "queued"
-    args, _kwargs = calls[0]
+    args, kwargs = calls[0]
     assert args[0] == "control_single_job_start"
     assert args[1]["run_id"] == "run_lodes"
     assert args[1]["target_module"] == "process.lodes"
     assert args[1]["target_function"] == "process_data"
     assert args[1]["task"] == {"test_mode": True, "import_id": "smoke_lodes"}
+    assert kwargs == {"_queue_name": "arq:LODES"}
 
 
 @pytest.mark.asyncio
@@ -349,13 +414,14 @@ async def test_enqueue_import_start_wraps_kwargs_importers(monkeypatch):
     result = await _enqueue_import_start(row)
 
     assert result["status"] == "queued"
-    args, _kwargs = calls[0]
+    args, kwargs = calls[0]
     assert args[0] == "control_single_job_start"
     assert args[1]["run_id"] == "run_codes"
     assert args[1]["target_module"] == "process.clinical_reference"
     assert args[1]["target_function"] == "main"
     assert args[1]["call_style"] == "kwargs"
     assert args[1]["task"] == {"test_mode": True, "sources": "icd10cm", "import_id": "smoke_clinical"}
+    assert kwargs == {"_queue_name": "arq:ClinicalReference"}
 
 
 @pytest.mark.asyncio
@@ -383,13 +449,14 @@ async def test_enqueue_import_start_wraps_ms_drg_importer(monkeypatch):
     result = await _enqueue_import_start(row)
 
     assert result["status"] == "queued"
-    args, _kwargs = calls[0]
+    args, kwargs = calls[0]
     assert args[0] == "control_single_job_start"
     assert args[1]["run_id"] == "run_ms_drg"
     assert args[1]["target_module"] == "process.ms_drg"
     assert args[1]["target_function"] == "main"
     assert args[1]["call_style"] == "kwargs"
     assert args[1]["task"] == {"test_mode": True, "include_relationships": True, "relationship_page_limit": 1}
+    assert kwargs == {"_queue_name": "arq:MSDRG"}
 
 
 @pytest.mark.asyncio
@@ -469,6 +536,238 @@ async def test_remove_queued_job_removes_arq_job(monkeypatch):
     assert calls == [("zrem", ("arq:NPI", "job_1")), ("delete", ("arq:job:job_1",))]
 
 
+def _load_import_run_migration():
+    path = Path(__file__).resolve().parents[1] / "alembic" / "versions" / "20260610120000_add_import_run_table.py"
+    spec = importlib.util.spec_from_file_location("migration_add_import_run_table", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class _OpRecorder:
+    def __init__(self):
+        self.tables = {}
+        self.indexes = {}
+
+    def create_table(self, name, *items, schema=None):
+        self.tables[name] = {
+            "columns": [item for item in items if isinstance(item, sa.Column)],
+            "schema": schema,
+        }
+
+    def create_index(self, name, table_name, columns, schema=None, unique=False, **kwargs):
+        self.indexes[name] = {"table": table_name, "columns": columns, "schema": schema, "unique": unique, **kwargs}
+
+
+def test_import_run_migration_mirrors_model(monkeypatch):
+    module = _load_import_run_migration()
+    assert module.revision == "20260610120000_add_import_run_table"
+    assert module.down_revision == "20260319193000_extend_geo_zip_census_profile_metrics"
+
+    monkeypatch.delenv("DB_SCHEMA", raising=False)
+    recorder = _OpRecorder()
+    monkeypatch.setattr(module, "op", recorder)
+
+    module.upgrade()
+
+    table = recorder.tables["import_run"]
+    assert table["schema"] == ImportRun.__table__.schema
+    assert [column.name for column in table["columns"]] == list(ImportRun.__table__.columns.keys())
+    assert {name for name in recorder.indexes} == {spec["name"] for spec in ImportRun.__my_additional_indexes__}
+    idempotency_idx = recorder.indexes["import_run_active_idempotency_idx"]
+    assert idempotency_idx["table"] == "import_run"
+    assert idempotency_idx["unique"] is True
+    assert idempotency_idx["columns"] == ["idempotency_key"]
+    assert str(idempotency_idx["postgresql_where"]) == (
+        "status IN ('queued', 'starting', 'running', 'finalizing', 'canceling')"
+    )
+
+
+def test_control_blueprint_registers_import_run_ensure_listener():
+    listeners = [
+        item
+        for item in control.blueprint._future_listeners
+        if item.listener is control.control_ensure_import_run_table
+    ]
+
+    assert len(listeners) == 1
+    assert listeners[0].event == "before_server_start"
+
+
+@pytest.mark.asyncio
+async def test_control_startup_listener_runs_import_run_ensure(monkeypatch):
+    calls = []
+
+    async def fake_ensure():
+        calls.append(True)
+
+    monkeypatch.setattr(control, "ensure_import_run_table", fake_ensure)
+
+    await control.control_ensure_import_run_table(None, None)
+
+    assert calls == [True]
+
+
+@pytest.mark.asyncio
+async def test_import_run_ensure_is_memoized_and_uses_advisory_lock(monkeypatch):
+    calls = []
+
+    class FakeConnection:
+        async def execute(self, statement, params=None):
+            calls.append(("execute", str(statement), params))
+
+        async def run_sync(self, fn, **kwargs):
+            calls.append(("run_sync", fn, kwargs))
+
+    class FakeBegin:
+        async def __aenter__(self):
+            return FakeConnection()
+
+        async def __aexit__(self, *_exc):
+            return False
+
+    class FakeEngine:
+        def begin(self):
+            return FakeBegin()
+
+    class FakeDb:
+        engine = FakeEngine()
+
+        async def connect(self):
+            calls.append(("connect",))
+
+    monkeypatch.setattr(control_imports, "_IMPORT_RUN_ENSURED", False)
+    monkeypatch.setattr(control_imports, "db", FakeDb())
+
+    await control_imports.ensure_import_run_table()
+    await control_imports.ensure_import_run_table()
+
+    assert calls.count(("connect",)) == 1
+    assert any(
+        item[0] == "execute"
+        and "pg_advisory_xact_lock" in item[1]
+        and item[2] == {"lock_key": control_imports._IMPORT_RUN_ADVISORY_LOCK_KEY}
+        for item in calls
+    )
+    assert len([item for item in calls if item[0] == "run_sync"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_worker_db_startup_runs_import_run_ensure(monkeypatch):
+    calls = []
+
+    async def fake_init(_db):
+        calls.append("init")
+
+    async def fake_ensure():
+        calls.append("ensure")
+
+    monkeypatch.setattr(process_utils, "my_init_db", fake_init)
+    monkeypatch.setattr(control_imports, "ensure_import_run_table", fake_ensure)
+
+    await process_utils.db_startup({})
+
+    assert calls == ["init", "ensure"]
+
+
+@pytest.mark.asyncio
+async def test_import_run_request_paths_do_not_run_ddl(monkeypatch):
+    async def fail_ensure():
+        raise AssertionError("ensure_import_run_table must not run on the request path")
+
+    class FakeScalars:
+        def all(self):
+            return []
+
+    class FakeResult:
+        def scalars(self):
+            return FakeScalars()
+
+        def scalar_one_or_none(self):
+            return None
+
+    class FakeDb:
+        async def execute(self, _statement):
+            return FakeResult()
+
+    async def fake_enqueue(row):
+        return {
+            "status": "queued",
+            "phase_detail": "enqueued",
+            "heartbeat_at": row["heartbeat_at"],
+            "progress": {"message": "queued"},
+            "metrics": {"enqueue_adapter": "arq_single_job", "queue": "arq:NPI"},
+            "error": None,
+        }
+
+    monkeypatch.setattr(control_imports, "ensure_import_run_table", fail_ensure)
+    monkeypatch.setattr(control_imports, "db", FakeDb())
+    monkeypatch.setattr(control_imports, "_enqueue_import_start", fake_enqueue)
+
+    assert await control_imports.list_import_runs() == []
+    assert await control_imports.get_import_run("run_missing") is None
+    assert await control_imports.find_active_run_by_idempotency_key("idem-1") is None
+    row, created = await control_imports.create_import_run(
+        {"importer": "npi", "params": {}, "idempotency_key": "idem-1"}
+    )
+    assert created is True
+    assert row["status"] == "queued"
+
+
+@pytest.mark.asyncio
+async def test_list_import_runs_page_returns_next_cursor(monkeypatch):
+    now = control_imports.utc_now()
+    rows = [
+        types.SimpleNamespace(
+            run_id=f"run_{idx}",
+            engine="healthcare-mrf-api",
+            node_id="node_a",
+            importer="ptg",
+            family="ptg",
+            status="succeeded",
+            phase_detail="done",
+            params={},
+            idempotency_key=None,
+            triggered_by="api",
+            schedule_id=None,
+            subscription_id=None,
+            source_file_import_id=None,
+            created_at=now - control_imports.dt.timedelta(minutes=idx),
+            started_at=None,
+            finished_at=None,
+            heartbeat_at=now - control_imports.dt.timedelta(minutes=idx),
+            progress={},
+            metrics={},
+            error=None,
+            snapshot_id=None,
+            import_id=None,
+            retry_of_run_id=None,
+        )
+        for idx in range(3)
+    ]
+
+    class FakeScalars:
+        def all(self):
+            return rows
+
+    class FakeResult:
+        def scalars(self):
+            return FakeScalars()
+
+    class FakeDb:
+        async def execute(self, _statement):
+            return FakeResult()
+
+    monkeypatch.setattr(control_imports, "db", FakeDb())
+
+    page = await control_imports.list_import_runs_page(limit=2)
+    cursor_created_at, cursor_run_id = control_imports._decode_import_run_cursor(page["next_cursor"])
+
+    assert [item["run_id"] for item in page["items"]] == ["run_0", "run_1"]
+    assert cursor_run_id == "run_1"
+    assert cursor_created_at == rows[1].created_at
+
+
 @pytest.mark.asyncio
 async def test_create_import_run_persists_enqueued_state(monkeypatch):
     statements = []
@@ -478,6 +777,9 @@ async def test_create_import_run_persists_enqueued_state(monkeypatch):
             statements.append(statement)
 
     async def fake_find(_idempotency_key):
+        return None
+
+    async def fake_find_importer(_importer):
         return None
 
     async def fake_enqueue(row):
@@ -492,6 +794,7 @@ async def test_create_import_run_persists_enqueued_state(monkeypatch):
 
     monkeypatch.setattr(control_imports, "db", FakeDb())
     monkeypatch.setattr(control_imports, "find_active_run_by_idempotency_key", fake_find)
+    monkeypatch.setattr(control_imports, "find_active_run_by_importer", fake_find_importer)
     monkeypatch.setattr(control_imports, "_enqueue_import_start", fake_enqueue)
 
     row, created = await create_import_run(
@@ -523,8 +826,12 @@ async def test_create_import_run_returns_active_run_after_integrity_race(monkeyp
         calls["find"] += 1
         return None if calls["find"] == 1 else active
 
+    async def fake_find_importer(_importer):
+        return None
+
     monkeypatch.setattr(control_imports, "db", FakeDb())
     monkeypatch.setattr(control_imports, "find_active_run_by_idempotency_key", fake_find)
+    monkeypatch.setattr(control_imports, "find_active_run_by_importer", fake_find_importer)
 
     row, created = await create_import_run(
         {
@@ -533,6 +840,29 @@ async def test_create_import_run_returns_active_run_after_integrity_race(monkeyp
             "idempotency_key": "idem-race",
         }
     )
+
+    assert created is False
+    assert row == active
+
+
+@pytest.mark.asyncio
+async def test_create_import_run_returns_active_same_importer_run(monkeypatch):
+    active = {"run_id": "run_active_npi", "status": "running", "importer": "npi"}
+
+    async def fake_find_idem(_idempotency_key):
+        return None
+
+    async def fake_find_importer(_importer):
+        return active
+
+    async def fail_enqueue(_row):
+        raise AssertionError("enqueue should not run when importer already has an active run")
+
+    monkeypatch.setattr(control_imports, "find_active_run_by_idempotency_key", fake_find_idem)
+    monkeypatch.setattr(control_imports, "find_active_run_by_importer", fake_find_importer)
+    monkeypatch.setattr(control_imports, "_enqueue_import_start", fail_enqueue)
+
+    row, created = await create_import_run({"run_id": "run_duplicate_npi", "importer": "npi"})
 
     assert created is False
     assert row == active
@@ -745,17 +1075,24 @@ async def test_control_importers_endpoint(monkeypatch):
 @pytest.mark.asyncio
 async def test_control_ptg_parse_toc_preview_endpoint(monkeypatch):
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "secret")
+    to_thread_calls = []
     monkeypatch.setattr(
         control,
         "parse_ptg_toc_preview",
         lambda _payload: {"status": "parsed", "counts": {"entries": 1}, "items": []},
     )
+    async def fake_to_thread(func, payload):
+        to_thread_calls.append(func)
+        return func(payload)
+
+    monkeypatch.setattr(control.asyncio, "to_thread", fake_to_thread)
     request = authed_request(json={"toc": {}})
 
     response = await control.control_ptg_parse_toc_preview(request)
     payload = json.loads(response.body)
 
     assert payload["status"] == "parsed"
+    assert to_thread_calls == [control.parse_ptg_toc_preview]
 
 
 @pytest.mark.asyncio
@@ -794,17 +1131,21 @@ async def test_control_create_import_returns_conflict_for_duplicate(monkeypatch)
 @pytest.mark.asyncio
 async def test_control_list_imports_uses_cursor_list_envelope(monkeypatch):
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "secret")
-    async def fake_list_import_runs(**_kwargs):
-        return [{"run_id": "run_1", "status": "queued"}]
+    calls = []
 
-    monkeypatch.setattr(control, "list_import_runs", fake_list_import_runs)
-    request = authed_request(args={})
+    async def fake_list_import_runs_page(**kwargs):
+        calls.append(kwargs)
+        return {"items": [{"run_id": "run_1", "status": "queued"}], "next_cursor": "cursor_2"}
+
+    monkeypatch.setattr(control, "list_import_runs_page", fake_list_import_runs_page)
+    request = authed_request(args={"limit": "1", "cursor": "cursor_1"})
 
     response = await control.control_list_imports(request)
     payload = json.loads(response.body)
 
     assert response.status == 200
-    assert payload == {"items": [{"run_id": "run_1", "status": "queued"}], "next_cursor": None}
+    assert payload == {"items": [{"run_id": "run_1", "status": "queued"}], "next_cursor": "cursor_2"}
+    assert calls == [{"status": None, "importer": None, "limit": 1, "cursor": "cursor_1"}]
 
 
 @pytest.mark.asyncio

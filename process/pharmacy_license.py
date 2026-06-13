@@ -29,6 +29,7 @@ from db.models import (NPIAddress, NPIData, PartDPharmacyActivity, NPIDataOtherI
                        PharmacyLicenseRecordHistory, PharmacyLicenseRecordStage,
                        PharmacyLicenseSnapshot,
                        PharmacyLicenseStateCoverage)
+from process.ext.address_canon import resolve_into_archive, source_enabled, stamp_address_keys
 from process.ext.utils import db_startup, download_it, ensure_database, push_objects
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
@@ -88,6 +89,10 @@ PHARM_LICENSE_HTTP_USER_AGENT = os.getenv(
         "Chrome/122.0.0.0 Safari/537.36"
     ),
 )
+
+
+class PharmacyLicenseCanonicalAddressError(RuntimeError):
+    """Abort the pharmacy-license run when canonical address resolution fails."""
 PHARM_LICENSE_PARTD_MIN_ROWS_FOR_FALLBACK = max(
     int(os.getenv("HLTHPRT_PHARM_LICENSE_PARTD_MIN_ROWS_FOR_FALLBACK", "25")),
     1,
@@ -2578,6 +2583,34 @@ async def _materialize_snapshot(schema: str, snapshot_id: str, run_id: str) -> i
     canonical_table = f"{schema}.{PharmacyLicenseRecord.__tablename__}"
     history_table = f"{schema}.{PharmacyLicenseRecordHistory.__tablename__}"
 
+    if source_enabled("pharmacy_license"):
+        address_fields = {
+            "first_line": "address_line1",
+            "second_line": "address_line2",
+            "city": "city",
+            "state": "state",
+            "zip": "zip_code",
+            "country": "'US'",
+        }
+        try:
+            await stamp_address_keys(
+                PharmacyLicenseRecordStage.__tablename__,
+                address_fields,
+                schema=schema,
+            )
+            stats = await resolve_into_archive(
+                PharmacyLicenseRecordStage.__tablename__,
+                address_fields,
+                source_bit=32,
+                priority=6,
+                schema=schema,
+            )
+        except Exception as exc:
+            raise PharmacyLicenseCanonicalAddressError(
+                "pharmacy_license canonical address resolve failed"
+            ) from exc
+        print(f"Pharmacy license canonical address resolve complete: {stats}")
+
     await db.status(
         f"""
         WITH latest AS (
@@ -2608,7 +2641,8 @@ async def _materialize_snapshot(schema: str, snapshot_id: str, run_id: str) -> i
                 phone_number,
                 source_record_id,
                 source_last_seen_at,
-                imported_at
+                imported_at,
+                address_key
             FROM {stage_table}
             WHERE snapshot_id = :snapshot_id
             ORDER BY
@@ -2677,7 +2711,8 @@ async def _materialize_snapshot(schema: str, snapshot_id: str, run_id: str) -> i
                 phone_number,
                 source_record_id,
                 COALESCE(source_last_seen_at, imported_at, CURRENT_TIMESTAMP) AS source_last_seen_at,
-                COALESCE(imported_at, CURRENT_TIMESTAMP) AS imported_at
+                COALESCE(imported_at, CURRENT_TIMESTAMP) AS imported_at,
+                address_key
             FROM latest
         )
         INSERT INTO {history_table} (
@@ -2711,7 +2746,8 @@ async def _materialize_snapshot(schema: str, snapshot_id: str, run_id: str) -> i
             phone_number,
             source_record_id,
             source_last_seen_at,
-            imported_at
+            imported_at,
+            address_key
         )
         SELECT
             p.snapshot_id,
@@ -2744,7 +2780,8 @@ async def _materialize_snapshot(schema: str, snapshot_id: str, run_id: str) -> i
             p.phone_number,
             p.source_record_id,
             p.source_last_seen_at,
-            p.imported_at
+            p.imported_at,
+            p.address_key
         FROM prepared p
         LEFT JOIN {canonical_table} c ON c.license_key = p.license_key
         WHERE c.license_key IS NULL OR c.record_signature IS DISTINCT FROM p.record_signature;
@@ -2783,7 +2820,8 @@ async def _materialize_snapshot(schema: str, snapshot_id: str, run_id: str) -> i
                 phone_number,
                 source_record_id,
                 source_last_seen_at,
-                imported_at
+                imported_at,
+                address_key
             FROM {stage_table}
             WHERE snapshot_id = :snapshot_id
             ORDER BY
@@ -2851,7 +2889,8 @@ async def _materialize_snapshot(schema: str, snapshot_id: str, run_id: str) -> i
                 phone_number,
                 source_record_id,
                 COALESCE(source_last_seen_at, imported_at, CURRENT_TIMESTAMP) AS source_last_seen_at,
-                COALESCE(imported_at, CURRENT_TIMESTAMP) AS imported_at
+                COALESCE(imported_at, CURRENT_TIMESTAMP) AS imported_at,
+                address_key
             FROM latest
         )
         INSERT INTO {canonical_table} (
@@ -2886,7 +2925,8 @@ async def _materialize_snapshot(schema: str, snapshot_id: str, run_id: str) -> i
             first_seen_at,
             last_seen_at,
             last_verified_at,
-            updated_at
+            updated_at,
+            address_key
         )
         SELECT
             p.license_key,
@@ -2920,7 +2960,8 @@ async def _materialize_snapshot(schema: str, snapshot_id: str, run_id: str) -> i
             p.source_last_seen_at,
             p.source_last_seen_at,
             p.source_last_seen_at,
-            p.imported_at
+            p.imported_at,
+            p.address_key
         FROM prepared p
         ON CONFLICT (license_key)
         DO UPDATE SET
@@ -2954,7 +2995,8 @@ async def _materialize_snapshot(schema: str, snapshot_id: str, run_id: str) -> i
             first_seen_at = LEAST({canonical_table}.first_seen_at, EXCLUDED.first_seen_at),
             last_seen_at = GREATEST({canonical_table}.last_seen_at, EXCLUDED.last_seen_at),
             last_verified_at = EXCLUDED.last_verified_at,
-            updated_at = EXCLUDED.updated_at;
+            updated_at = EXCLUDED.updated_at,
+            address_key = EXCLUDED.address_key;
         """,
         snapshot_id=snapshot_id,
     )
@@ -2984,7 +3026,7 @@ async def _upsert_coverage(payload: dict[str, Any]) -> None:
     await push_objects([payload], PharmacyLicenseStateCoverage, rewrite=True, use_copy=False)
 
 
-async def pharmacy_license_start(ctx, task=None):  # pragma: no cover
+async def pharmacy_license_start(ctx, task=None):
     del ctx
     task = task or {}
     run_id = _normalize_run_id(task.get("run_id"))
@@ -3226,8 +3268,14 @@ async def pharmacy_license_start(ctx, task=None):  # pragma: no cover
                         unit="states",
                         done=state_index,
                         total=len(state_sources),
-                        message=f"failed {source.state_code}; continuing",
+                        message=(
+                            f"failed {source.state_code}; aborting"
+                            if isinstance(exc, PharmacyLicenseCanonicalAddressError)
+                            else f"failed {source.state_code}; continuing"
+                        ),
                     )
+                    if isinstance(exc, PharmacyLicenseCanonicalAddressError):
+                        raise
 
         if PHARM_LICENSE_DEFER_ADDITIONAL_INDEXES:
             enqueue_live_progress(

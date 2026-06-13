@@ -14,8 +14,9 @@ import re
 import sys
 import tempfile
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 import aiohttp
 
@@ -55,8 +56,57 @@ from process.ptg_parts.domain import (
 )
 from process.ptg_parts.live_progress import write_live_progress
 from process.ptg_parts.screen import _emit_screen_line
+from process.url_security import UnsafeUrlError, assert_safe_url
 
 logger = logging.getLogger(__name__)
+
+# Default streaming cap for control-triggered PTG downloads (bulk MRF artifacts can be
+# very large, so this is generous; HLTHPRT_FETCH_MAX_BYTES tightens it per deployment).
+PTG2_DEFAULT_MAX_BYTES = 64 * 1024 * 1024 * 1024
+_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+_MAX_REDIRECTS = 10
+
+
+async def _open_validated_request(
+    session: aiohttp.ClientSession,
+    method: str,
+    url: str,
+    **kwargs,
+) -> aiohttp.ClientResponse:
+    current_url = str(url)
+    current_method = method.upper()
+    for _ in range(_MAX_REDIRECTS + 1):
+        await assert_safe_url(current_url)
+        response = await session.request(current_method, current_url, allow_redirects=False, **kwargs)
+        if response.status not in _REDIRECT_STATUSES:
+            await assert_safe_url(str(response.url))
+            return response
+        location = response.headers.get("Location")
+        response.release()
+        if not location:
+            raise RuntimeError(f"redirect target is missing for {current_url}")
+        next_url = urljoin(str(response.url), location)
+        await assert_safe_url(next_url)
+        current_url = next_url
+        if response.status == 303 and current_method != "HEAD":
+            current_method = "GET"
+            kwargs.pop("data", None)
+            kwargs.pop("json", None)
+    raise RuntimeError(f"too many redirects for {url}")
+
+
+@asynccontextmanager
+async def _validated_request(
+    session: aiohttp.ClientSession,
+    method: str,
+    url: str,
+    **kwargs,
+):
+    response = await _open_validated_request(session, method, url, **kwargs)
+    try:
+        yield response
+    finally:
+        response.release()
 
 
 def _format_eta_seconds(seconds: float | None) -> str:
@@ -119,22 +169,11 @@ def _safe_download_label(url: str) -> str:
 
 
 async def fetch_head_metadata(url: str, timeout_seconds: int = 30) -> PTG2HeadMetadata:
-    if not str(url).lower().startswith(("http://", "https://")):
-        path = Path(urlsplit(url).path if str(url).startswith("file://") else url)
-        if path.exists():
-            stat = path.stat()
-            return PTG2HeadMetadata(
-                url=url,
-                status=200,
-                content_length=stat.st_size,
-                last_modified=datetime.datetime.fromtimestamp(stat.st_mtime).isoformat(),
-                supports_head=True,
-            )
-        return PTG2HeadMetadata(url=url, supports_head=False)
+    await assert_safe_url(url)
     timeout = aiohttp.ClientTimeout(total=timeout_seconds, connect=min(timeout_seconds, 10))
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.head(url, allow_redirects=True) as response:
+            async with _validated_request(session, "HEAD", url) as response:
                 headers = response.headers
                 length = headers.get("Content-Length")
                 return PTG2HeadMetadata(
@@ -152,10 +191,11 @@ async def fetch_head_metadata(url: str, timeout_seconds: int = 30) -> PTG2HeadMe
 
 
 async def _probe_http_range_support(url: str) -> tuple[bool, int | None, str | None, str | None]:
+    await assert_safe_url(url)
     timeout = aiohttp.ClientTimeout(total=60, connect=30, sock_read=30)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url, allow_redirects=True, headers={"Range": "bytes=0-0"}) as response:
+            async with _validated_request(session, "GET", url, headers={"Range": "bytes=0-0"}) as response:
                 if response.status != 206:
                     return False, None, None, None
                 content_range = response.headers.get("Content-Range") or ""
@@ -212,7 +252,7 @@ async def _download_raw_artifact_ranges(
         counted = 0
         completed_ok = False
         try:
-            async with session.get(url, allow_redirects=True, headers=headers) as response:
+            async with _validated_request(session, "GET", url, headers=headers) as response:
                 if response.status != 206:
                     raise RuntimeError(f"Range download not supported for {url}: status {response.status}")
                 offset = start
@@ -300,6 +340,7 @@ async def download_raw_artifact(
     keep_partial_artifacts: bool | None = None,
 ) -> PTG2RawArtifact:
     store = store or PTG2ArtifactStore()
+    await assert_safe_url(url)
     keep_partials = _env_bool(PTG2_KEEP_PARTIAL_ENV, True) if keep_partial_artifacts is None else keep_partial_artifacts
     canonical_url = canonicalize_url(url)
     head = await fetch_head_metadata(url)
@@ -420,7 +461,7 @@ async def download_raw_artifact(
                                 digest = hashlib.sha256()
                                 byte_count = _hash_existing_file_into(partial_path, digest) if resume_from > 0 else 0
                             headers = {"Range": f"bytes={resume_from}-"} if resume_from > 0 and byte_count == resume_from else None
-                            async with session.get(url, allow_redirects=True, headers=headers) as response:
+                            async with _validated_request(session, "GET", url, headers=headers) as response:
                                 response.raise_for_status()
                                 length = response.headers.get("Content-Length")
                                 if resume_from > 0 and response.status != 206:
@@ -457,6 +498,8 @@ async def download_raw_artifact(
                                 f"Download for {url} ended at {byte_count} bytes, expected {head.content_length}"
                             )
                         break
+                    except UnsafeUrlError:
+                        raise
                     except Exception as exc:
                         if attempt >= retries:
                             raise

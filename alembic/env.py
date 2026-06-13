@@ -2,13 +2,16 @@
 
 import logging
 from logging.config import fileConfig
+import asyncio
+import os
 
-from sqlalchemy import engine_from_config
+import sqlalchemy as sa
 from sqlalchemy import pool
+from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from alembic import context
+from alembic.ddl.impl import DefaultImpl
 from db.connection import db
-import os
 
 
 
@@ -28,6 +31,19 @@ fileConfig(config.config_file_name)
 target_metadata = db.metadata
 
 
+def _wide_version_table_impl(self, *, version_table, version_table_schema, version_table_pk, **kw):
+    del self, kw
+    return sa.Table(
+        version_table,
+        sa.MetaData(),
+        sa.Column("version_num", sa.String(128), primary_key=version_table_pk),
+        schema=version_table_schema,
+    )
+
+
+DefaultImpl.version_table_impl = _wide_version_table_impl
+
+
 exclude_tables = [name.strip() for name in config.get_section('alembic:exclude', {}).get('tables', '').split(',')]
 
 
@@ -40,6 +56,17 @@ def get_db_env(key, default=None):
 
 def target_schema() -> str:
     return get_db_env("DB_SCHEMA", "mrf")
+
+
+def database_url(driver: str = "postgresql") -> str:
+    return '{driver}://{db_user}:{db_password}@{db_host}:{db_port}/{db_database}'.format(
+        driver=driver,
+        db_user=get_db_env("DB_USER"),
+        db_password=get_db_env("DB_PASSWORD"),
+        db_host=get_db_env("DB_HOST"),
+        db_database=get_db_env("DB_DATABASE"),
+        db_port=get_db_env("DB_PORT"),
+    )
 
 
 def include_object(object, name, type_, reflected, compare_to):
@@ -68,15 +95,8 @@ def run_migrations_offline():
     script output.
 
     """
-    # url = config.get_main_option("sqlalchemy.url")
-    url = 'postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_database}'. \
-        format(db_user=get_db_env("DB_USER"),
-               db_password=get_db_env("DB_PASSWORD"),
-               db_host=get_db_env("DB_HOST"),
-               db_database=get_db_env("DB_DATABASE"),
-               db_port=get_db_env("DB_PORT"))
     context.configure(
-        url=url,
+        url=database_url(),
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
@@ -86,47 +106,44 @@ def run_migrations_offline():
         context.run_migrations()
 
 
-def run_migrations_online():
-    """Run migrations in 'online' mode.
+def do_run_migrations(connection):
+    schema = target_schema()
+    connection.dialect.default_schema_name = 'public'
+    context.configure(
+        connection=connection,
+        target_metadata=target_metadata,
+        include_object=include_object,
+        include_schemas=True,
+        version_table_schema=schema,
+        compare_type=True,
+        compare_server_default=True,
+    )
+    with context.begin_transaction():
+        context.execute(f'create schema if not exists "{schema}"')
+        context.execute(f'SET search_path TO "{schema}",public')
+        context.run_migrations()
 
-    In this scenario we need to create an Engine
-    and associate a connection with the context.
 
-    """
-
-    url = 'postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_database}'. \
-        format(db_user=get_db_env("DB_USER"),
-               db_password=get_db_env("DB_PASSWORD"),
-               db_host=get_db_env("DB_HOST"),
-               db_database=get_db_env("DB_DATABASE"),
-               db_port=get_db_env("DB_PORT"))
+async def run_async_migrations():
     schema = target_schema()
     config_dict = {
-        'sqlalchemy.url': url,
-        'sqlalchemy.connect_args': {'options': f"-c search_path={schema},public"}
+        'sqlalchemy.url': database_url("postgresql+asyncpg"),
+        'sqlalchemy.connect_args': {'server_settings': {'search_path': f"{schema},public"}},
     }
 
-    connectable = engine_from_config(
+    connectable = async_engine_from_config(
         config_dict,
         prefix='sqlalchemy.',
         poolclass=pool.NullPool)
 
-    with connectable.connect() as connection:
-        connection.dialect.default_schema_name = 'public'
-        context.configure(
-            connection=connection,
-            target_metadata=target_metadata,
-            include_object=include_object,
-            include_schemas=True,
-            version_table_schema=schema,
-            compare_type=True,
-            compare_server_default=True,
-        )
-        with context.begin_transaction():
-            context.execute(f'create schema if not exists "{schema}"')
+    async with connectable.connect() as connection:
+        await connection.run_sync(do_run_migrations)
+    await connectable.dispose()
 
-            context.execute(f'SET search_path TO "{schema}",public')
-            context.run_migrations()
+
+def run_migrations_online():
+    """Run migrations in online mode using the repo's asyncpg driver."""
+    asyncio.run(run_async_migrations())
 
 
 if context.is_offline_mode():

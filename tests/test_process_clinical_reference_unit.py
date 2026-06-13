@@ -1,6 +1,14 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-from process.clinical_reference import _build_clinical_area_rows, _mesh_clinical_area_root
+import pytest
+
+from process.clinical_reference import (
+    _build_clinical_area_rows,
+    _redact_sensitive_url,
+    _selected_sources,
+    _umls_download_url,
+    _mesh_clinical_area_root,
+)
 
 
 def test_mesh_clinical_area_root_supports_broad_mesh_branches():
@@ -8,6 +16,31 @@ def test_mesh_clinical_area_root_supports_broad_mesh_branches():
     assert _mesh_clinical_area_root("E04.014") == "E04"
     assert _mesh_clinical_area_root("F03.550") == "F03"
     assert _mesh_clinical_area_root("D12.644") is None
+
+
+def test_selected_sources_excludes_restricted_terminologies_by_default(monkeypatch):
+    monkeypatch.delenv("HLTHPRT_CLINICAL_REFERENCE_SOURCES", raising=False)
+    monkeypatch.delenv("HLTHPRT_ENABLE_RESTRICTED_TERMINOLOGIES", raising=False)
+
+    assert "snomed" not in _selected_sources(None)
+
+
+def test_selected_sources_requires_restricted_terminology_opt_in(monkeypatch):
+    monkeypatch.delenv("HLTHPRT_ENABLE_RESTRICTED_TERMINOLOGIES", raising=False)
+    with pytest.raises(RuntimeError, match="restricted terminology"):
+        _selected_sources("icd10cm,snomed")
+
+    monkeypatch.setenv("HLTHPRT_ENABLE_RESTRICTED_TERMINOLOGIES", "1")
+    assert "snomed" in _selected_sources("icd10cm,snomed")
+
+
+def test_umls_download_url_redaction_keeps_api_key_out_of_errors():
+    url = _umls_download_url("https://download.nlm.nih.gov/example.zip", "secret-key")
+
+    redacted = _redact_sensitive_url(f"failed: {url}")
+
+    assert "secret-key" not in redacted
+    assert "apiKey=<redacted>" in redacted
 
 
 def test_build_clinical_area_rows_maps_mesh_and_rxnorm_to_areas():

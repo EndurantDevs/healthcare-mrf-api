@@ -18,7 +18,7 @@ from aiohttp_socks import ProxyConnector
 from aioshutil import copyfile
 from arq import Retry
 from asyncpg.exceptions import (CardinalityViolationError, InterfaceError,
-                                InvalidColumnReferenceError,
+                                InvalidColumnReferenceError, PostgresError,
                                 UndefinedTableError, UniqueViolationError)
 from dateutil.parser import parse as parse_date
 from fastcrc import crc16, crc32
@@ -68,7 +68,7 @@ PARALLEL_DOWNLOAD_RANGE_SIZE = max(
     HTTP_CHUNK_SIZE,
 )
 PROGRESS_INTERVAL_SECONDS = max(float(os.getenv("HLTHPRT_DOWNLOAD_PROGRESS_INTERVAL_SECONDS", "2")), 0.5)
-PREFER_COMPRESSED_STREAM = os.getenv("HLTHPRT_PREFER_COMPRESSED_STREAM", "true").lower() in {
+PREFER_COMPRESSED_STREAM = os.getenv("HLTHPRT_PREFER_COMPRESSED_STREAM", "false").lower() in {
     "1",
     "true",
     "yes",
@@ -357,6 +357,9 @@ async def download_it_and_save_nostream(url, filepath):
 
 async def db_startup(ctx):
     await my_init_db(db)
+    from api.control_imports import ensure_import_run_table  # pylint: disable=import-outside-toplevel
+
+    await ensure_import_run_table()
 
 async def download_it_and_save(url, filepath, chunk_size=None, context=None, logger=None, cache_dir=None):
     print(f"Downloading {url}")
@@ -514,6 +517,10 @@ def make_class(model_cls, table_suffix, schema_override=None):
         new_table = metadata.tables[new_table_name]
     else:
         new_table = model_cls.__table__.tometadata(metadata, name=new_table_name)
+        if "address_key" in new_table.c and list(new_table.c.keys())[-1] != "address_key":
+            address_key_column = new_table.c.address_key
+            new_table._columns.remove(address_key_column)
+            new_table.append_column(address_key_column)
         if schema_override is not None:
             new_table.schema = schema_override
 
@@ -682,6 +689,30 @@ async def push_objects(obj_list, cls, rewrite=False, _missing_table_attempt: int
                 return f"{message[:240]}..."
             return message
 
+        def _is_deadlock_error(err: BaseException) -> bool:
+            err_text = str(getattr(err, "orig", err)).lower()
+            return "deadlock detected" in err_text or "deadlockdetected" in err_text
+
+        async def _status_with_deadlock_retry(stmt):
+            try:
+                max_retries = max(int(os.getenv("HLTHPRT_DB_DEADLOCK_RETRIES", "5")), 0)
+            except ValueError:
+                max_retries = 5
+            attempt = 0
+            while True:
+                try:
+                    return await stmt.status()
+                except (SQLAlchemyError, InterfaceError, PostgresError) as err:
+                    if not _is_deadlock_error(err) or attempt >= max_retries:
+                        raise
+                    attempt += 1
+                    delay = min(0.5 * (2 ** (attempt - 1)), 8.0)
+                    print(
+                        f"deadlock retry {attempt}/{max_retries} for "
+                        f"{cls.__tablename__}: {_short_error(err)}"
+                    )
+                    await asyncio.sleep(delay)
+
         async def _retry_after_missing_table(err: BaseException):
             if _missing_table_attempt >= max_missing_table_retries:
                 raise err
@@ -715,13 +746,13 @@ async def push_objects(obj_list, cls, rewrite=False, _missing_table_attempt: int
             )
 
         def _conflict_targets():
+            if hasattr(cls, "__my_index_elements__") and cls.__my_index_elements__:
+                return list(cls.__my_index_elements__)
             if hasattr(cls, "__my_initial_indexes__") and cls.__my_initial_indexes__:
                 for index in cls.__my_initial_indexes__:
                     elements = index.get("index_elements")
                     if elements:
                         return list(elements)
-            if hasattr(cls, "__my_index_elements__") and cls.__my_index_elements__:
-                return list(cls.__my_index_elements__)
             primary_keys = [key.name for key in inspect(cls.__table__).primary_key]
             return primary_keys or None
 
@@ -790,7 +821,13 @@ async def push_objects(obj_list, cls, rewrite=False, _missing_table_attempt: int
                     if _is_missing_table_error(err):
                         return await _retry_after_missing_table(err)
                     print(f"copy_records_to_table fallback due to {_short_error(err)}")
-                except (UniqueViolationError, NotImplementedError, InvalidColumnReferenceError, CardinalityViolationError) as err:
+                except (
+                    UniqueViolationError,
+                    NotImplementedError,
+                    InvalidColumnReferenceError,
+                    CardinalityViolationError,
+                    TypeError,
+                ) as err:
                     print(f"copy_records_to_table fallback due to {_short_error(err)}")
 
             for chunk in _chunk_records(obj_list):
@@ -809,7 +846,7 @@ async def push_objects(obj_list, cls, rewrite=False, _missing_table_attempt: int
                     else:
                         stmt = stmt.on_conflict_do_nothing(index_elements=targets)
                 try:
-                    await stmt.status()
+                    await _status_with_deadlock_retry(stmt)
                 except (UndefinedTableError, SQLAlchemyError, InterfaceError) as err:
                     if _is_missing_table_error(err):
                         return await _retry_after_missing_table(err)
@@ -831,7 +868,7 @@ async def push_objects(obj_list, cls, rewrite=False, _missing_table_attempt: int
                 if hasattr(cls, "__my_index_elements__"):
                     stmt = stmt.on_conflict_do_nothing(index_elements=cls.__my_index_elements__)
                 try:
-                    await stmt.status()
+                    await _status_with_deadlock_retry(stmt)
                 except (UndefinedTableError, SQLAlchemyError, InterfaceError) as err:
                     if _is_missing_table_error(err):
                         return await _retry_after_missing_table(err)
@@ -859,7 +896,14 @@ async def push_objects(obj_list, cls, rewrite=False, _missing_table_attempt: int
             print(exc)
         except UndefinedTableError as err:
             return await _retry_after_missing_table(err)
-        except (UniqueViolationError, NotImplementedError, InvalidColumnReferenceError, CardinalityViolationError, InterfaceError) as err:
+        except (
+            UniqueViolationError,
+            NotImplementedError,
+            InvalidColumnReferenceError,
+            CardinalityViolationError,
+            InterfaceError,
+            TypeError,
+        ) as err:
             print(f"copy_records_to_table fallback due to {_short_error(err)}")
 
             for chunk in _chunk_records(obj_list):
@@ -867,7 +911,7 @@ async def push_objects(obj_list, cls, rewrite=False, _missing_table_attempt: int
                 if hasattr(cls, "__my_index_elements__"):
                     stmt = stmt.on_conflict_do_nothing(index_elements=cls.__my_index_elements__)
                 try:
-                    await stmt.status()
+                    await _status_with_deadlock_retry(stmt)
                 except (SQLAlchemyError, InterfaceError) as chunk_err:
                     if _is_missing_table_error(chunk_err):
                         return await _retry_after_missing_table(chunk_err)
@@ -877,7 +921,7 @@ async def push_objects(obj_list, cls, rewrite=False, _missing_table_attempt: int
                             single_stmt = db.insert(cls.__table__).values(obj)
                             if hasattr(cls, "__my_index_elements__"):
                                 single_stmt = single_stmt.on_conflict_do_nothing(index_elements=cls.__my_index_elements__)
-                            await single_stmt.status()
+                            await _status_with_deadlock_retry(single_stmt)
                         except (SQLAlchemyError, UniqueViolationError, InterfaceError) as single_err:
                             if _is_missing_table_error(single_err):
                                 return await _retry_after_missing_table(single_err)

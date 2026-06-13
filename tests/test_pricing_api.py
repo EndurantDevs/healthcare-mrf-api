@@ -686,6 +686,65 @@ async def test_get_pricing_provider_score_live_override_all_modes_when_benchmark
 
 
 @pytest.mark.asyncio
+async def test_load_provider_quality_profile_sql_has_no_trailing_cte_comma(monkeypatch):
+    async def _table_exists(_session, _table_name):
+        return True
+
+    async def _table_columns(_session, table_name):
+        if table_name == pricing_module.EntityAddressUnified.__tablename__:
+            return {"checksum", "multi_source_confirmed", "source_count"}
+        if table_name == pricing_module.NUCCTaxonomy.__tablename__:
+            return {"classification"}
+        return set()
+
+    class CapturingSession:
+        async def execute(self, statement, _params=None):
+            sql = str(statement)
+            assert "WITH provider_choice AS" in sql
+            assert "npi_address_choice AS" in sql
+            npi_cte_tail = sql.split("npi_address_choice AS", 1)[1]
+            assert "),\n            SELECT" not in npi_cte_tail
+            return FakeResult(
+                rows=[
+                    {
+                        "npi": 1234567893,
+                        "specialty_key": None,
+                        "taxonomy_code": None,
+                        "taxonomy_classification": None,
+                        "zip5": None,
+                        "state_key": None,
+                        "provider_class": "unknown",
+                        "location_source": "unknown",
+                        "has_enrollment": False,
+                        "has_medicare_claims": False,
+                    }
+                ]
+            )
+
+    monkeypatch.setattr(pricing_module, "_table_exists", _table_exists)
+    monkeypatch.setattr(pricing_module, "_table_columns", _table_columns)
+
+    profile = await pricing_module._load_provider_quality_profile(
+        CapturingSession(),
+        npi=1234567893,
+        year=2023,
+    )
+
+    assert profile == {
+        "npi": 1234567893,
+        "specialty_key": None,
+        "taxonomy_code": None,
+        "taxonomy_classification": None,
+        "zip5": None,
+        "state_key": None,
+        "provider_class": "unknown",
+        "location_source": "unknown",
+        "has_enrollment": False,
+        "has_medicare_claims": False,
+    }
+
+
+@pytest.mark.asyncio
 async def test_get_pricing_provider_score_estimated_fallback(monkeypatch):
     async def _fake_profile(_session, *, npi, year):
         assert npi == 1003000126

@@ -154,3 +154,13 @@ pg_upgrade_*.log
 # macOS metadata
 .DS_Store
 **/.DS_Store
+
+# Local client/demo data and working artifacts (see REPO_CLEANUP_PLAN.md)
+data/
+reports/*
+!reports/address_canonical_baseline_2026-06-11.md
+!reports/address_archive_v2_migration_smoke_2026-06-11.md
+restore/
+service/*.csv
+service/*.csv.zip
+session.md

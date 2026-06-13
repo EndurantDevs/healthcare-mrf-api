@@ -150,8 +150,8 @@ pub fn emit_manifest_serving_copy_row<W: Write>(
 #[cfg(test)]
 mod tests {
     use super::{
-        emit_compact_copy_row, emit_manifest_serving_copy_row, pg_text_array_field, pg_text_copy_field,
-        CompactCopyRow, ManifestServingCopyRow,
+        emit_compact_copy_row, emit_manifest_serving_copy_row, pg_text_array_field,
+        pg_text_copy_field, CompactCopyRow, ManifestServingCopyRow,
     };
 
     #[test]

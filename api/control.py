@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import hmac
 
@@ -10,10 +11,11 @@ from sanic.exceptions import BadRequest, Forbidden, NotFound, SanicException
 
 from api.control_imports import (
     create_import_run,
+    ensure_import_run_table,
     finalize_import_run,
     get_import_run,
     importer_registry,
-    list_import_runs,
+    list_import_runs_page,
     node_health,
     parse_ptg_toc_preview,
     request_cancel,
@@ -22,6 +24,14 @@ from api.control_imports import (
 from api.control_workers import ensure_worker, worker_registry
 
 blueprint = Blueprint("control", url_prefix="/control/v1")
+
+
+@blueprint.listener("before_server_start")
+async def control_ensure_import_run_table(_app, _loop):
+    # Safety net only: mrf.import_run is created by the alembic migration
+    # 20260610120000_add_import_run_table; this idempotent ensure keeps fresh
+    # nodes working before migrations have run, without per-request DDL.
+    await ensure_import_run_table()
 
 
 @blueprint.exception(SanicException)
@@ -53,7 +63,7 @@ async def control_importers(request):
 @blueprint.get("/health/node")
 async def control_node_health(request):
     _require_control_auth(request)
-    return response.json(node_health(), default=str)
+    return response.json(await node_health(), default=str)
 
 
 @blueprint.get("/workers")
@@ -74,7 +84,7 @@ async def control_ptg_parse_toc_preview(request):
     _require_control_auth(request)
     payload = request.json if isinstance(request.json, dict) else {}
     try:
-        preview = parse_ptg_toc_preview(payload)
+        preview = await asyncio.to_thread(parse_ptg_toc_preview, payload)
     except ValueError as exc:
         raise BadRequest(str(exc)) from exc
     return response.json(preview, default=str)
@@ -108,12 +118,16 @@ async def control_create_import(request):
 async def control_list_imports(request):
     _require_control_auth(request)
     args = request.args
-    runs = await list_import_runs(
-        status=args.get("status"),
-        importer=args.get("importer"),
-        limit=int(args.get("limit") or 50),
-    )
-    return response.json({"items": runs, "next_cursor": None}, default=str)
+    try:
+        page = await list_import_runs_page(
+            status=args.get("status"),
+            importer=args.get("importer"),
+            limit=int(args.get("limit") or 50),
+            cursor=args.get("cursor"),
+        )
+    except ValueError as exc:
+        raise BadRequest(str(exc)) from exc
+    return response.json(page, default=str)
 
 
 @blueprint.get("/imports/<run_id>")

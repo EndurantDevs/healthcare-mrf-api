@@ -11,7 +11,12 @@ from sanic import Blueprint, response
 from sanic.exceptions import InvalidUsage
 from sqlalchemy import and_, exists, func, or_, select
 
-from api.code_systems import canonical_catalog_code, normalize_code_system
+from api.code_systems import (
+    canonical_catalog_code,
+    is_restricted_terminology_system,
+    normalize_code_system,
+    restricted_terminology_public_enabled,
+)
 from api.endpoint.pagination import parse_pagination
 from db.models import CodeCatalog, CodeCrosswalk, CodeSynonym
 
@@ -65,6 +70,12 @@ def _canonical_code_for_system(code_system: str, raw_code: Any) -> str:
     return canonical_catalog_code(code_system, raw_code)
 
 
+def _restricted_public_filter(column):
+    if restricted_terminology_public_enabled():
+        return None
+    return func.upper(column).notin_(("SNOMEDCT_US",))
+
+
 @blueprint.get("/")
 async def list_codes(request):
     session = _get_session(request)
@@ -78,6 +89,9 @@ async def list_codes(request):
     order_by = str(args.get("order_by") or "code").strip().lower()
 
     filters = []
+    restricted_filter = _restricted_public_filter(code_catalog_table.c.code_system)
+    if restricted_filter is not None:
+        filters.append(restricted_filter)
     if code_system:
         filters.append(func.upper(code_catalog_table.c.code_system) == code_system)
     if source:
@@ -155,6 +169,8 @@ async def get_code(request, code_system: str, code: str):
     normalized_code = _canonical_code_for_system(normalized_system, code)
     if not normalized_system or not normalized_code:
         raise InvalidUsage("Path parameters 'code_system' and 'code' are required")
+    if is_restricted_terminology_system(normalized_system) and not restricted_terminology_public_enabled():
+        raise sanic.exceptions.NotFound("Code not found")
 
     query = select(code_catalog_table).where(
         and_(
@@ -176,6 +192,8 @@ async def get_related_codes(request, code_system: str, code: str):
     normalized_code = _canonical_code_for_system(normalized_system, code)
     if not normalized_system or not normalized_code:
         raise InvalidUsage("Path parameters 'code_system' and 'code' are required")
+    if is_restricted_terminology_system(normalized_system) and not restricted_terminology_public_enabled():
+        raise sanic.exceptions.NotFound("Code not found")
 
     forward_query = select(code_crosswalk_table).where(
         and_(
@@ -189,6 +207,9 @@ async def get_related_codes(request, code_system: str, code: str):
             func.upper(code_crosswalk_table.c.to_code) == normalized_code,
         )
     )
+    if not restricted_terminology_public_enabled():
+        forward_query = forward_query.where(func.upper(code_crosswalk_table.c.to_system).notin_(("SNOMEDCT_US",)))
+        reverse_query = reverse_query.where(func.upper(code_crosswalk_table.c.from_system).notin_(("SNOMEDCT_US",)))
 
     forward_result = await session.execute(forward_query)
     reverse_result = await session.execute(reverse_query)

@@ -33,6 +33,9 @@ class _FakeResponse:
     def __init__(self, payload: bytes):
         self.content = _FakeContent(payload)
 
+    def raise_for_status(self):
+        return None
+
     async def __aenter__(self):
         return self
 
@@ -85,3 +88,47 @@ async def test_process_data_keeps_multiple_addresses_per_npi(monkeypatch, cms_do
     assert len(pushed_rows) == 2
     assert len({row["address_checksum"] for row in pushed_rows}) == 2
     assert {row["npi"] for row in pushed_rows} == {1111111111}
+
+
+@pytest.mark.asyncio
+async def test_process_data_accepts_current_cms_lowercase_schema(monkeypatch, cms_doctors_module):
+    csv_payload = (
+        "npi,adr_ln_1,adr_ln_2,citytown,state,zip_code,pri_spec\n"
+        "2222222222,456 Oak Ave,Ste 7,Austin,TX,78701,Family Practice\n"
+    )
+    zip_payload = _zip_bytes_with_csv("doctors.csv", csv_payload)
+
+    pushed_rows = []
+
+    async def _fake_push(rows, _cls):
+        pushed_rows.extend(rows)
+
+    monkeypatch.setattr(
+        cms_doctors_module,
+        "_fetch_doctors_download_url",
+        AsyncMock(return_value="https://x/y.zip"),
+    )
+    monkeypatch.setattr(cms_doctors_module, "ensure_database", AsyncMock())
+    monkeypatch.setattr(cms_doctors_module, "push_objects", _fake_push)
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "aiohttp",
+        SimpleNamespace(ClientSession=lambda: _FakeClient(zip_payload)),
+    )
+
+    ctx = {"import_date": "20260321", "context": {}}
+    await cms_doctors_module.process_data(ctx, {"test_mode": True})
+
+    assert pushed_rows == [
+        {
+            "npi": 2222222222,
+            "address_checksum": pushed_rows[0]["address_checksum"],
+            "address_line1": "456 Oak Ave",
+            "address_line2": "Ste 7",
+            "city": "Austin",
+            "state": "TX",
+            "zip_code": "78701",
+            "provider_type": "Family Practice",
+            "updated_at": pushed_rows[0]["updated_at"],
+        }
+    ]

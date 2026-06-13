@@ -185,7 +185,7 @@ async def _process_allowed_amounts_file(
         meta = provided_meta or await _ptg_facade()._extract_metadata_fields(extracted)
         file_row = _build_file_row(url, "allowed-amounts", meta, plan_info, description, from_index_url)
         await _push_ptg2_objects_from_facade([file_row], file_cls, rewrite=True)
-        await _ptg_facade()._record_source_version(
+        source_version = await _ptg_facade()._record_source_version(
             source_type="allowed-amounts",
             domain=PTG2_DOMAIN_ALLOWED_AMOUNT,
             raw_artifact=raw_artifact,
@@ -196,4 +196,16 @@ async def _process_allowed_amounts_file(
             extracted, file_row["file_id"], meta, plan_info, classes, test_mode, import_log_cls, url,
             max_items=max_items,
         )
-    return PTG2FileProcessResult("allowed_amounts", url, True, file_id=file_row["file_id"])
+    summary = {}
+    if source_version is not None:
+        summary = {
+            "engine_source_identity_hash": source_version.source_identity_hash,
+            "engine_source_file_version_id": source_version.source_file_version_id,
+            "canonical_url": source_version.canonical_url,
+            "raw_sha256": source_version.raw_sha256,
+            "logical_sha256": source_version.logical_sha256,
+            "content_length": source_version.content_length,
+            "etag": source_version.etag,
+            "last_modified": source_version.last_modified,
+        }
+    return PTG2FileProcessResult("allowed_amounts", url, True, file_id=file_row["file_id"], summary=summary)
