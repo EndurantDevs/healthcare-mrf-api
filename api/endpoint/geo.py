@@ -35,6 +35,7 @@ zip_state_table = ZipState.__table__
 zip_zcta5_table = Zip_zcta5.__table__
 blueprint = Blueprint('geo', url_prefix='/geo', version=1)
 
+ADDRESS_SERVING_SOURCE_ENV = "HLTHPRT_ADDRESS_SERVING_SOURCE"
 ADDRESS_SERVING_SOURCE_UNIFIED = "entity_address_unified"
 
 CENSUS_PROFILE_FIELDS = (
@@ -143,7 +144,7 @@ def _serialize_census_row(row_mapping):
 
 
 def _address_serving_source() -> str:
-    return str(os.getenv("HLTHPRT_ADDRESS_SERVING_SOURCE") or "legacy").strip().lower()
+    return str(os.getenv(ADDRESS_SERVING_SOURCE_ENV, ADDRESS_SERVING_SOURCE_UNIFIED) or "").strip().lower()
 
 
 def _serialize_places_row(row_mapping):
