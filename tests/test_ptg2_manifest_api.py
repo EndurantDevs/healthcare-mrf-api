@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+from pathlib import Path
 from uuid import UUID
 
 import pytest
@@ -497,6 +498,67 @@ def test_ptg2_manifest_sidecar_lookup_merges_multiple_artifacts(tmp_path):
 
     assert members == (npi_member_1.hex(), npi_member_2.hex())
     assert members_many[provider_set_id] == (npi_member_1.hex(), npi_member_2.hex())
+
+
+def test_ptg2_manifest_sidecar_lookup_remaps_stale_default_artifact_root(tmp_path, monkeypatch):
+    provider_set_id = "0000000000000000000000000000000a"
+    npi_member = bytes.fromhex("0000000000000000") + (1234567890).to_bytes(8, "big")
+    artifact_root = tmp_path / "ptg2-artifacts"
+    serving_dir = artifact_root / "serving"
+    serving_dir.mkdir(parents=True)
+    sidecar = _write_membership_sidecar(
+        serving_dir,
+        "provider_set_npis",
+        "provider_npi",
+        {bytes.fromhex(provider_set_id): [npi_member]},
+    )
+    sidecar["name"] = "provider_npi"
+    sidecar["path"] = f"/tmp/healthporta-ptg2-artifacts/serving/{sidecar['path']}"
+    monkeypatch.setenv("HLTHPRT_PTG2_ARTIFACT_DIR", str(artifact_root))
+    ptg2_serving._PTG2_MANIFEST_SIDECAR_CACHE.clear()
+    tables = ptg2_serving.PTG2ServingTables(
+        storage="manifest_snapshot",
+        serving_table="mrf.ptg2_manifest_serving_snap_manifest",
+        artifacts={"sidecars": [sidecar]},
+    )
+
+    members = ptg2_serving._ptg2_manifest_sidecar_members(tables, "provider_npi", provider_set_id)
+    members_many = ptg2_serving._ptg2_manifest_sidecar_members_many(tables, "provider_npi", [provider_set_id])
+
+    assert members == (npi_member.hex(),)
+    assert members_many[provider_set_id] == (npi_member.hex(),)
+
+
+def test_ptg2_manifest_sidecar_lookup_remaps_stale_serving_directory(tmp_path, monkeypatch):
+    provider_set_id = "0000000000000000000000000000000a"
+    npi_member = bytes.fromhex("0000000000000000") + (1234567890).to_bytes(8, "big")
+    artifact_root = tmp_path / "ptg2-artifacts"
+    serving_dir = artifact_root / "serving" / "current"
+    serving_dir.mkdir(parents=True)
+    sidecar = _write_membership_sidecar(
+        serving_dir,
+        "provider_set_npis",
+        "provider_npi",
+        {bytes.fromhex(provider_set_id): [npi_member]},
+    )
+    sidecar["name"] = "provider_npi"
+    stale_path = Path(sidecar["path"])
+    sidecar["path"] = (
+        f"/tmp/healthporta-ptg2-artifacts/serving/stale/{stale_path.name}"
+    )
+    monkeypatch.setenv("HLTHPRT_PTG2_ARTIFACT_DIR", str(artifact_root))
+    ptg2_serving._PTG2_MANIFEST_SIDECAR_CACHE.clear()
+    tables = ptg2_serving.PTG2ServingTables(
+        storage="manifest_snapshot",
+        serving_table="mrf.ptg2_manifest_serving_snap_manifest",
+        artifacts={"sidecars": [sidecar]},
+    )
+
+    members = ptg2_serving._ptg2_manifest_sidecar_members(tables, "provider_npi", provider_set_id)
+    members_many = ptg2_serving._ptg2_manifest_sidecar_members_many(tables, "provider_npi", [provider_set_id])
+
+    assert members == (npi_member.hex(),)
+    assert members_many[provider_set_id] == (npi_member.hex(),)
 
 
 @pytest.mark.asyncio

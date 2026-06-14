@@ -428,6 +428,37 @@ def _ptg2_manifest_artifact_entry(serving_tables: PTG2ServingTables, name: str) 
     return entries[0] if entries else None
 
 
+def _resolve_ptg2_manifest_sidecar_path(raw_path: str) -> Path:
+    path = Path(raw_path)
+    if path.exists():
+        return path
+    artifact_root = _artifact_root()
+    if not path.is_absolute():
+        candidate = artifact_root / path
+        return candidate if candidate.exists() else path
+
+    marker = "healthporta-ptg2-artifacts"
+    try:
+        marker_index = path.parts.index(marker)
+    except ValueError:
+        return path
+    suffix_parts = path.parts[marker_index + 1 :]
+    if not suffix_parts:
+        return path
+    candidate = artifact_root.joinpath(*suffix_parts)
+    if candidate.exists():
+        return candidate
+
+    if len(suffix_parts) >= 3 and suffix_parts[0] == "serving":
+        filename = suffix_parts[-1]
+        serving_root = artifact_root / "serving"
+        if serving_root.exists():
+            matches = [item for item in serving_root.glob(f"*/{filename}") if item.exists()]
+            if len(matches) == 1:
+                return matches[0]
+    return path
+
+
 def _ptg2_manifest_sidecar_members(
     serving_tables: PTG2ServingTables,
     name: str,
@@ -443,14 +474,15 @@ def _ptg2_manifest_sidecar_members(
         path = str(entry.get("path") or "").strip()
         if not path:
             continue
+        sidecar_path = _resolve_ptg2_manifest_sidecar_path(path)
         cache_owner_id = owner_id if max_members is None else f"{owner_id}:{max_members}"
-        cache_key = (path, str(entry.get("sha256") or ""), cache_owner_id)
+        cache_key = (str(sidecar_path), str(entry.get("sha256") or ""), cache_owner_id)
         cached = _PTG2_MANIFEST_SIDECAR_CACHE.get(cache_key)
         if cached is None:
             cached = tuple(
                 member.hex()
                 for member in lookup_global_sidecar_members(
-                    Path(path),
+                    sidecar_path,
                     owner_id,
                     metadata=entry,
                     max_members=max_members,
@@ -474,11 +506,12 @@ def _ptg2_manifest_sidecar_members_many(
         path = str(entry.get("path") or "").strip()
         if not path:
             continue
+        sidecar_path = _resolve_ptg2_manifest_sidecar_path(path)
         sha = str(entry.get("sha256") or "")
         missing: list[str] = []
         for owner_id in owner_id_list:
             cache_owner_id = owner_id if max_members is None else f"{owner_id}:{max_members}"
-            cache_key = (path, sha, cache_owner_id)
+            cache_key = (str(sidecar_path), sha, cache_owner_id)
             cached = _PTG2_MANIFEST_SIDECAR_CACHE.get(cache_key)
             if cached is None:
                 missing.append(owner_id)
@@ -486,7 +519,7 @@ def _ptg2_manifest_sidecar_members_many(
                 result_sets[owner_id].update(cached)
         if missing:
             members_by_owner = lookup_global_sidecar_members_many(
-                Path(path),
+                sidecar_path,
                 missing,
                 metadata=entry,
                 max_members=max_members,
@@ -498,7 +531,7 @@ def _ptg2_manifest_sidecar_members_many(
                     owner_bytes = b""
                 members = tuple(member.hex() for member in members_by_owner.get(owner_bytes, ()))
                 cache_owner_id = owner_id if max_members is None else f"{owner_id}:{max_members}"
-                _PTG2_MANIFEST_SIDECAR_CACHE[(path, sha, cache_owner_id)] = members
+                _PTG2_MANIFEST_SIDECAR_CACHE[(str(sidecar_path), sha, cache_owner_id)] = members
                 result_sets[owner_id].update(members)
     return {owner_id: tuple(sorted(members)) for owner_id, members in result_sets.items()}
 
