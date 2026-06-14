@@ -85,7 +85,8 @@ until `HLTHPRT_ADDRESS_CANON_SOURCES` is set.
    to increase parallel-sized batches only after measuring lock and CPU impact;
    invalid values fail fast during stamping. `HLTHPRT_ADDRESS_CANON_STAMP_CONCURRENCY`
    controls how many shard updates run at once (default 1). On the 24-core dev
-   host, use 8 for full rebuilds; keep it at 1 for small local databases.
+   host, use 16 with `HLTHPRT_DB_POOL_MAX_SIZE=32` for full rebuilds; keep it at
+   1 for small local databases.
    `HLTHPRT_ADDRESS_CANON_RUST_MATERIALIZE=true` enables the optional
    Rust-backed resolve materializer. Python still owns the database
    transaction, temp table, collision checks, and archive writes; the
@@ -262,7 +263,9 @@ Local verification snapshot from 2026-06-11:
   `HLTHPRT_ADDRESS_CANON_STAMP_SHARDS=24`,
   `HLTHPRT_ADDRESS_CANON_STAMP_CONCURRENCY=16`,
   `HLTHPRT_ADDRESS_CANON_RUST_MATERIALIZE=true`,
-  `HLTHPRT_MAX_MRF_JOBS=8`, and `HLTHPRT_PARALLEL_DOWNLOAD_WORKERS=16`.
+  `HLTHPRT_MAX_MRF_JOBS=16`, `HLTHPRT_MRF_QUEUE_READ_LIMIT=512`,
+  `HLTHPRT_DB_DEADLOCK_RETRIES=20`, and
+  `HLTHPRT_PARALLEL_DOWNLOAD_WORKERS=16`.
   CMS-doctors address stamping over 3,271,389 rows was the observed bottleneck
   when shards ran serially; SQL shard fan-out keyed 100% of rows and the helper
   now has explicit concurrency coverage.

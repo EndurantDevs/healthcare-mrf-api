@@ -1,0 +1,365 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+"""Build the fast PTG provider-location address projection."""
+
+from __future__ import annotations
+
+import datetime
+import logging
+import os
+
+from arq import create_pool
+
+from db.models import PTGAddress, db
+from process.control_lifecycle import mark_control_run
+from process.entity_address_unified import (
+    ARCHIVE_IDENTITY_VERSION,
+    BASE_ADDRESS_VERSION,
+    _archived_identifier,
+    _create_stage_indexes,
+    _location_key_expr,
+    _normalize_import_id,
+    _stage_index_name,
+    _table_exists,
+    _validate_schema_name,
+)
+from process.ext.utils import ensure_database, make_class, my_init_db, print_time_info
+from process.live_progress import enqueue_live_progress
+from process.redis_config import build_redis_settings
+from process.serialization import deserialize_job, serialize_job
+
+logger = logging.getLogger(__name__)
+
+PTG_ADDRESS_QUEUE_NAME = "arq:PTGAddress"
+DEFAULT_MIN_ROWS = 1
+
+
+def _sql_literal(value: str | None) -> str:
+    if value is None:
+        return "NULL"
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+async def _address_canon_available(db_schema: str) -> bool:
+    value = await db.scalar(
+        "SELECT to_regprocedure(:signature);",
+        signature=f"{db_schema}.addr_key_v1(text,text,text,text,text,text)",
+    )
+    return isinstance(value, str) and bool(value)
+
+
+def _ptg_address_insert_sql(
+    db_schema: str,
+    stage_table: str,
+    *,
+    source_key: str,
+    snapshot_id: str,
+    node_id: str | None,
+    address_canon_available: bool,
+    archive_available: bool,
+) -> str:
+    address_key_expr = (
+        f"{db_schema}.addr_key_v1(first_line, second_line, city, state, postal_code, 'US')"
+        if address_canon_available
+        else "NULL::uuid"
+    )
+    archive_join = (
+        f"LEFT JOIN {db_schema}.address_archive_v2 a "
+        "ON a.address_key = k.address_key AND a.merged_into IS NULL"
+        if archive_available
+        else ""
+    )
+    archive_fields = (
+        "a.premise_key, "
+        "'v' || COALESCE(a.identity_version, 1)::text AS archive_identity_version, "
+        "COALESCE(a.precision, CASE WHEN k.address_key IS NULL THEN 'unknown' ELSE 'street' END) AS address_precision, "
+        "COALESCE(a.zip5, k.source_zip5) AS zip5, "
+        "COALESCE(NULLIF(upper(left(a.state_code, 2)), ''), k.source_state_code) AS state_code, "
+        "COALESCE(a.city_norm, k.source_city_norm) AS city_norm, "
+        "NULL::varchar AS county_fips"
+        if archive_available
+        else (
+            "NULL::uuid AS premise_key, "
+            f"'{ARCHIVE_IDENTITY_VERSION}'::varchar AS archive_identity_version, "
+            "CASE WHEN k.address_key IS NULL THEN 'unknown' ELSE 'street' END::varchar AS address_precision, "
+            "k.source_zip5 AS zip5, "
+            "k.source_state_code AS state_code, "
+            "k.source_city_norm AS city_norm, "
+            "NULL::varchar AS county_fips"
+        )
+    )
+    location_key = _location_key_expr(
+        entity_type="'ptg'",
+        entity_id="'npi:' || e.npi::text",
+        npi="e.npi",
+        inferred_npi="NULL::bigint",
+        address_role_id="4",
+        row_origin="'ptg_overlay'",
+        address_key="e.address_key",
+        source_id="7",
+        source_record_id="e.location_hash",
+        zip5="e.zip5",
+        state_code="e.state_code",
+        city_norm="e.city_norm",
+    )
+    return f"""
+    INSERT INTO {db_schema}.{stage_table} (
+        node_id,
+        source_key,
+        snapshot_id,
+        plan_id,
+        ptg_plan_id,
+        market_type,
+        provider_group_id,
+        provider_set_id,
+        npi,
+        tin,
+        location_key,
+        address_key,
+        premise_key,
+        archive_identity_version,
+        address_precision,
+        address_source_id,
+        address_source_record_key,
+        address_role_id,
+        location_confidence_id,
+        zip5,
+        state_code,
+        city_norm,
+        county_fips,
+        lat,
+        long,
+        ptg_plan_array,
+        ptg_source_array,
+        group_plan_array,
+        base_address_version,
+        ptg_snapshot_published_at,
+        observed_at,
+        updated_at
+    )
+    WITH source_locations AS (
+        SELECT
+            loc.location_hash,
+            loc.npi::bigint AS npi,
+            NULLIF(BTRIM(loc.location_source), '')::varchar AS location_source,
+            NULLIF(BTRIM(loc.confidence_code), '')::varchar AS confidence_code,
+            NULLIF(BTRIM(loc.state), '')::varchar AS state,
+            NULLIF(BTRIM(loc.city), '')::varchar AS city,
+            NULLIF(BTRIM(loc.zip5), '')::varchar AS zip5,
+            loc.lat::numeric AS lat,
+            loc.lon::numeric AS long,
+            COALESCE(loc.address_payload::jsonb, '{{}}'::jsonb) AS payload,
+            loc.created_at
+          FROM {db_schema}.ptg2_provider_location loc
+         WHERE loc.npi IS NOT NULL
+    ),
+    shaped AS (
+        SELECT
+            location_hash,
+            npi,
+            location_source,
+            confidence_code,
+            COALESCE(NULLIF(payload->>'first_line', ''), NULLIF(payload->>'address_line1', ''))::varchar AS first_line,
+            COALESCE(NULLIF(payload->>'second_line', ''), NULLIF(payload->>'address_line2', ''))::varchar AS second_line,
+            COALESCE(NULLIF(payload->>'city', ''), city)::varchar AS city,
+            COALESCE(NULLIF(payload->>'state', ''), state)::varchar AS state,
+            COALESCE(NULLIF(payload->>'postal_code', ''), NULLIF(payload->>'zip5', ''), zip5)::varchar AS postal_code,
+            lat,
+            long,
+            created_at
+          FROM source_locations
+    ),
+    keyed AS (
+        SELECT
+            *,
+            NULLIF(LEFT(REGEXP_REPLACE(COALESCE(postal_code, ''), '[^0-9]', '', 'g'), 5), '')::varchar AS source_zip5,
+            NULLIF(upper(left(BTRIM(COALESCE(state, '')), 2)), '')::varchar AS source_state_code,
+            NULLIF(regexp_replace(lower(COALESCE(city, '')), '[^a-z0-9]', '', 'g'), '')::varchar AS source_city_norm,
+            {address_key_expr} AS address_key
+          FROM shaped
+    ),
+    enriched AS (
+        SELECT
+            k.*,
+            {archive_fields}
+          FROM keyed k
+          {archive_join}
+    )
+    SELECT DISTINCT ON ({location_key})
+        {_sql_literal(node_id)}::varchar AS node_id,
+        {_sql_literal(source_key)}::varchar AS source_key,
+        {_sql_literal(snapshot_id)}::varchar AS snapshot_id,
+        NULL::varchar AS plan_id,
+        NULL::varchar AS ptg_plan_id,
+        NULL::varchar AS market_type,
+        NULL::varchar AS provider_group_id,
+        NULL::varchar AS provider_set_id,
+        e.npi,
+        NULL::varchar AS tin,
+        {location_key} AS location_key,
+        e.address_key,
+        e.premise_key,
+        e.archive_identity_version,
+        e.address_precision,
+        CASE
+            WHEN e.location_source = 'npi_address' THEN 1
+            WHEN e.location_source = 'doctor_clinician_address' THEN 3
+            WHEN e.location_source = 'entity_address_unified' THEN 0
+            ELSE 7
+        END::smallint AS address_source_id,
+        e.location_hash::varchar AS address_source_record_key,
+        4::smallint AS address_role_id,
+        CASE
+            WHEN e.location_source = 'npi_address' THEN 4
+            WHEN e.location_source = 'doctor_clinician_address' THEN 5
+            WHEN e.location_source = 'entity_address_unified' THEN 2
+            ELSE 0
+        END::smallint AS location_confidence_id,
+        e.zip5,
+        e.state_code,
+        e.city_norm,
+        e.county_fips,
+        e.lat,
+        e.long,
+        ARRAY[]::varchar[] AS ptg_plan_array,
+        ARRAY[{_sql_literal(source_key)}]::varchar[] AS ptg_source_array,
+        ARRAY[]::varchar[] AS group_plan_array,
+        {_sql_literal(BASE_ADDRESS_VERSION)}::varchar AS base_address_version,
+        NULL::timestamptz AS ptg_snapshot_published_at,
+        COALESCE(e.created_at, NOW())::timestamptz AS observed_at,
+        NOW()::timestamptz AS updated_at
+      FROM enriched e
+     WHERE e.zip5 IS NOT NULL OR e.state_code IS NOT NULL OR e.address_key IS NOT NULL
+     ORDER BY {location_key}, e.created_at DESC NULLS LAST, e.location_hash;
+    """
+
+
+async def process_data(ctx, task=None):
+    task = task or {}
+    ctx.setdefault("context", {})
+    context = ctx["context"]
+    run_id = str(context.get("control_run_id") or ctx.get("control_run_id") or "").strip()
+    if "test_mode" in task:
+        context["test_mode"] = bool(task.get("test_mode"))
+    test_mode = bool(context.get("test_mode", False))
+
+    await ensure_database(test_mode)
+    db_schema = _validate_schema_name(os.getenv("HLTHPRT_DB_SCHEMA") or "mrf")
+    if not await _table_exists(db_schema, "ptg2_provider_location"):
+        raise RuntimeError("ptg2_provider_location is not available; run PTG compact serving first.")
+
+    import_date = ctx["import_date"]
+    stage_cls = make_class(PTGAddress, import_date)
+    stage_table = stage_cls.__tablename__
+    if not context.get("stage_prepared"):
+        await db.status(f"DROP TABLE IF EXISTS {db_schema}.{stage_table};")
+        await db.create_table(stage_cls.__table__, checkfirst=True)
+        context["stage_prepared"] = True
+
+    source_key = str(task.get("source_key") or os.getenv("HLTHPRT_PTG_ADDRESS_SOURCE_KEY") or "ptg2").strip() or "ptg2"
+    snapshot_id = str(task.get("snapshot_id") or os.getenv("HLTHPRT_PTG_ADDRESS_SNAPSHOT_ID") or import_date).strip()
+    node_id = str(os.getenv("HLTHPRT_IMPORT_NODE_ID") or "").strip() or None
+
+    await db.status(f"TRUNCATE TABLE {db_schema}.{stage_table};")
+    await db.status(
+        _ptg_address_insert_sql(
+            db_schema,
+            stage_table,
+            source_key=source_key,
+            snapshot_id=snapshot_id,
+            node_id=node_id,
+            address_canon_available=await _address_canon_available(db_schema),
+            archive_available=await _table_exists(db_schema, "address_archive_v2"),
+        )
+    )
+    await _create_stage_indexes(stage_cls, db_schema)
+    await db.status(f"ANALYZE {db_schema}.{stage_table};")
+    row_count = int(await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{stage_table};") or 0)
+    context["run"] = context.get("run", 0) + 1
+    context["staged_rows"] = row_count
+    if run_id:
+        enqueue_live_progress(
+            run_id=run_id,
+            importer="ptg-address",
+            status="running",
+            phase="ptg-address staged",
+            unit="rows",
+            done=row_count,
+            total=row_count,
+            pct=95,
+            message=f"staged {row_count} PTG address rows",
+        )
+
+
+async def startup(ctx):
+    await my_init_db(db)
+    ctx["context"] = {
+        "start": datetime.datetime.utcnow(),
+        "run": 0,
+        "test_mode": False,
+        "stage_prepared": False,
+    }
+    await ensure_database(False)
+    ctx["import_date"] = _normalize_import_id(os.getenv("HLTHPRT_IMPORT_ID_OVERRIDE"))
+
+
+async def shutdown(ctx):
+    context = ctx.get("context") or {}
+    run_id = str(context.get("control_run_id") or ctx.get("control_run_id") or "").strip()
+    if not context.get("run"):
+        logger.info("No PTGAddress jobs ran; skipping shutdown.")
+        return
+    await ensure_database(bool(context.get("test_mode")))
+    db_schema = _validate_schema_name(os.getenv("HLTHPRT_DB_SCHEMA") or "mrf")
+    stage_cls = make_class(PTGAddress, ctx.get("import_date"))
+    stage_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{stage_cls.__tablename__};") or 0)
+    min_rows = 0 if context.get("test_mode") else int(os.getenv("HLTHPRT_PTG_ADDRESS_MIN_ROWS", str(DEFAULT_MIN_ROWS)))
+    if stage_rows < min_rows:
+        raise RuntimeError(f"PTGAddress stage row count {stage_rows} below minimum {min_rows}; aborting publish.")
+
+    async with db.transaction():
+        table = PTGAddress.__main_table__
+        await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
+        await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{table} RENAME TO {table}_old;")
+        await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{stage_cls.__tablename__} RENAME TO {table};")
+        archived = _archived_identifier(f"{table}_idx_primary")
+        await db.status(f"DROP INDEX IF EXISTS {db_schema}.{archived};")
+        await db.status(f"ALTER INDEX IF EXISTS {db_schema}.{table}_idx_primary RENAME TO {archived};")
+        await db.status(
+            f"ALTER INDEX IF EXISTS {db_schema}.{stage_cls.__tablename__}_idx_primary "
+            f"RENAME TO {table}_idx_primary;"
+        )
+        for index in getattr(stage_cls, "__my_additional_indexes__", []) or []:
+            index_name = index.get("name", "_".join(index.get("index_elements")))
+            old_live_name = f"{table}_idx_{index_name}"
+            archived_live_name = _archived_identifier(old_live_name)
+            await db.status(f"DROP INDEX IF EXISTS {db_schema}.{archived_live_name};")
+            await db.status(f"ALTER INDEX IF EXISTS {db_schema}.{old_live_name} RENAME TO {archived_live_name};")
+            await db.status(
+                f"ALTER INDEX IF EXISTS {db_schema}.{_stage_index_name(stage_cls.__tablename__, index_name)} "
+                f"RENAME TO {old_live_name};"
+            )
+    await mark_control_run(
+        run_id,
+        status="succeeded",
+        phase_detail="ptg-address published",
+        progress_message="succeeded",
+        progress={
+            "unit": "rows",
+            "done": stage_rows,
+            "total": stage_rows,
+            "pct": 100,
+            "message": "succeeded",
+            "phase": "ptg-address published",
+        },
+        metrics={"rows": stage_rows},
+    )
+    print_time_info(context.get("start"))
+
+
+async def main(test_mode: bool = False):
+    redis = await create_pool(
+        build_redis_settings(),
+        job_serializer=serialize_job,
+        job_deserializer=deserialize_job,
+    )
+    await redis.enqueue_job("process_data", {"test_mode": bool(test_mode)}, _queue_name=PTG_ADDRESS_QUEUE_NAME)

@@ -253,15 +253,15 @@ fn state_code(value: Option<&str>) -> Option<String> {
     if cleaned.is_empty() {
         return None;
     }
-    Some(tables().state.get(&cleaned).cloned().unwrap_or(cleaned))
+    tables().state.get(&cleaned).cloned()
 }
 
 fn zip5_norm(value: Option<&str>) -> Option<String> {
     let cleaned = digits(value.unwrap_or(""));
-    if cleaned.is_empty() {
-        None
-    } else {
-        Some(cleaned.chars().take(5).collect())
+    match cleaned.len() {
+        0..=2 => None,
+        3 | 4 => Some(format!("{:0>5}", cleaned)),
+        _ => Some(cleaned.chars().take(5).collect()),
     }
 }
 
@@ -564,7 +564,7 @@ fn identity_key_v1(
     country: Option<&str>,
 ) -> Option<String> {
     let street = street_norm(first_line, second_line);
-    let mut unit = unit_norm(first_line, second_line);
+    let unit = unit_norm(first_line, second_line);
     let city_value = city_norm(city);
     let state_value = state_code(state)?;
     let zip_value = zip5_norm(zip)?;
@@ -575,7 +575,6 @@ fn identity_key_v1(
     let precision = if street.is_some() {
         "street"
     } else if city_value.is_some() {
-        unit.clear();
         "city_zip"
     } else {
         return None;
@@ -794,6 +793,63 @@ mod tests {
             fields[4],
             "v1|27drmellichampdr|ste100|bluffton|SC|29910|US|street"
         );
+    }
+
+    #[test]
+    fn preserves_unit_like_city_zip_values() {
+        let dept_1234 = canonicalize_address(
+            Some("DEPARTMENT 1234"),
+            Some(""),
+            Some("KNOXVILLE"),
+            Some("TN"),
+            Some("37995"),
+            Some("US"),
+        );
+        let dept_5678 = canonicalize_address(
+            Some("DEPARTMENT 5678"),
+            Some(""),
+            Some("KNOXVILLE"),
+            Some("TN"),
+            Some("37995"),
+            Some("US"),
+        );
+
+        assert_eq!(
+            dept_1234.identity_key.as_deref(),
+            Some("v1||dept1234|knoxville|TN|37995|US|city_zip")
+        );
+        assert_eq!(
+            dept_5678.identity_key.as_deref(),
+            Some("v1||dept5678|knoxville|TN|37995|US|city_zip")
+        );
+        assert_ne!(dept_1234.address_key, dept_5678.address_key);
+    }
+
+    #[test]
+    fn pads_short_zip_and_rejects_unknown_state() {
+        let padded_zip = canonicalize_address(
+            Some("1 Main St"),
+            Some(""),
+            Some("Cambridge"),
+            Some("MA"),
+            Some("2138"),
+            Some("US"),
+        );
+        let unknown_state = canonicalize_address(
+            Some("1 Main St"),
+            Some(""),
+            Some("Los Angeles"),
+            Some("calif"),
+            Some("90001"),
+            Some("US"),
+        );
+
+        assert_eq!(
+            padded_zip.identity_key.as_deref(),
+            Some("v1|1mainst||cambridge|MA|02138|US|street")
+        );
+        assert!(unknown_state.identity_key.is_none());
+        assert!(unknown_state.address_key.is_none());
     }
 
     #[test]

@@ -181,12 +181,16 @@ def state_code(value: str | None) -> str | None:
     cleaned = re.sub(r"[^A-Za-z]", "", value or "").upper()
     if not cleaned:
         return None
-    return PUB28_STATE_MAP.get(cleaned, cleaned)
+    return PUB28_STATE_MAP.get(cleaned)
 
 
 def zip5_norm(value: str | None) -> str | None:
     digits = re.sub(r"[^0-9]", "", value or "")
-    return digits[:5] or None
+    if len(digits) >= 5:
+        return digits[:5]
+    if len(digits) in {3, 4}:
+        return digits.zfill(5)
+    return None
 
 
 def country_code(value: str | None) -> str:
@@ -234,7 +238,6 @@ def identity_key_v1(
         precision = "street"
     elif city_value:
         precision = "city_zip"
-        unit = ""
     else:
         return None
     return "|".join([

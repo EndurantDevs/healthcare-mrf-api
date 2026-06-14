@@ -166,6 +166,13 @@ _SINGLE_JOB_ADAPTERS: dict[str, dict[str, Any]] = {
         "target_module": "process.entity_address_unified",
         "target_function": "process_data",
     },
+    "ptg-address": {
+        "queue": "arq:PTGAddress",
+        "function": "control_single_job_start",
+        "payload": "control_wrapped",
+        "target_module": "process.ptg_address",
+        "target_function": "process_data",
+    },
     "address-archive-v2-migrate": {
         "queue": "arq:AddressArchive",
         "function": "control_single_job_start",
@@ -275,6 +282,7 @@ def _importer_family(importer: str) -> str:
         "provider-quality",
         "provider-enrichment",
         "entity-address-unified",
+        "ptg-address",
         "cms-doctors",
         "address-archive-v2-migrate",
     }:

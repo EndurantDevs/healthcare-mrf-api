@@ -1,0 +1,107 @@
+"""Replay canonical address functions after identity bug fixes.
+
+The v1 function bodies are intentionally deterministic, but earlier deployments
+over-merged city/ZIP precision rows by blanking unit-like lockbox fields and
+accepted malformed ZIP/state values. Replay the canonical functions from the
+foundation revision so live databases use the corrected implementations.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+from pathlib import Path
+
+from alembic import op
+
+
+revision = "20260613190000_reapply_address_canonical_identity_hotfixes"
+down_revision = "20260612205000_reapply_address_canonical_nbsp_functions"
+branch_labels = None
+depends_on = None
+
+FUNCTION_NAMES = (
+    "addr_clean_alnum_v1",
+    "addr_space_norm_v1",
+    "addr_zip5_norm_v1",
+    "addr_country_code_v1",
+    "addr_state_code_v1",
+    "addr_unit_prefix_v1",
+    "addr_unit_range_required_v1",
+    "addr_unit_value_valid_v1",
+    "addr_unit_norm_v1",
+    "addr_street_token_norm_v1",
+    "addr_street_norm_v1",
+    "addr_city_norm_v1",
+    "addr_identity_key_v1",
+    "addr_key_from_identity_v1",
+    "addr_key_v1",
+    "addr_premise_identity_key_v1",
+    "addr_premise_key_v1",
+)
+
+
+def _foundation_module():
+    path = Path(__file__).with_name("20260611100000_address_canonical_foundation.py")
+    spec = importlib.util.spec_from_file_location("_address_canonical_foundation", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not load address canonical foundation migration from {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _sql_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _functions_owned_by_current_user(bind, schema: str) -> bool:
+    names = ", ".join(_sql_literal(name) for name in FUNCTION_NAMES)
+    schema_lit = _sql_literal(schema)
+    return bool(
+        bind.exec_driver_sql(
+            f"""
+            SELECT COALESCE(bool_and(pg_get_userbyid(p.proowner) = current_user), true)
+              FROM pg_proc p
+              JOIN pg_namespace n ON n.oid = p.pronamespace
+             WHERE n.nspname = {schema_lit}
+               AND p.proname IN ({names});
+            """
+        ).scalar()
+    )
+
+
+def _identity_hotfixes_current(bind, foundation, schema: str) -> bool:
+    qschema = foundation._quote_ident(schema)
+    return bool(
+        bind.exec_driver_sql(
+            f"""
+            SELECT
+                {qschema}.addr_identity_key_v1(
+                    'DEPARTMENT 1234', '', 'KNOXVILLE', 'TN', '37995', 'US'
+                ) = 'v1||dept1234|knoxville|TN|37995|US|city_zip'
+                AND {qschema}.addr_zip5_norm_v1('2138') = '02138'
+                AND {qschema}.addr_state_code_v1('calif') IS NULL;
+            """
+        ).scalar()
+    )
+
+
+def upgrade():
+    foundation = _foundation_module()
+    schema = foundation._schema()
+    bind = op.get_bind()
+    if not _functions_owned_by_current_user(bind, schema):
+        if _identity_hotfixes_current(bind, foundation, schema):
+            return
+        raise RuntimeError(
+            "Canonical address SQL functions need the identity hotfix replay, "
+            f"but the current database user does not own functions in schema {schema!r}. "
+            "Run this migration as the function owner/superuser, or replay "
+            "20260611100000_address_canonical_foundation._create_functions_sql "
+            "as the owner before stamping this revision."
+        )
+    foundation._exec_sql_batch(bind, foundation._create_functions_sql(schema))
+
+
+def downgrade():
+    return None

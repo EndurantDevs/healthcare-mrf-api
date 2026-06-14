@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-WORKERS=8
+WORKERS=16
 TEST_MODE=0
 IMPORT_ID="${IMPORT_ID:-$(date +%Y%m%d)}"
 LOG_DIR="${LOG_DIR:-/tmp/healthporta_mrf_${IMPORT_ID}}"
@@ -28,8 +28,9 @@ Notes:
     is only one shutdown job.
   - Set PYTHON_BIN to override the Python executable. By default, the script
     prefers venv314/bin/python, then venv/bin/python, then python.
-  - If you want one process with internal concurrency, use:
-      HLTHPRT_MAX_MRF_JOBS=8 python main.py worker process.MRF --burst
+  - Prefer --workers 16 for dev-server/full-import runs. If you want one
+    process with internal concurrency, use:
+      HLTHPRT_MAX_MRF_JOBS=16 HLTHPRT_MRF_QUEUE_READ_LIMIT=512 python main.py worker process.MRF --burst
 EOF
 }
 

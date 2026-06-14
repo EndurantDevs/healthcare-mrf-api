@@ -27,7 +27,7 @@ from api.code_systems import (
     INTERNAL_RX_CODE_SYSTEM,
 )
 from api.endpoint.pagination import parse_pagination
-from db.models import (AddressArchive, Issuer, NPIAddress, NPIData,
+from db.models import (AddressArchive, EntityAddressUnified, Issuer, NPIAddress, NPIData,
                        NPIDataOtherIdentifier, NPIDataTaxonomy,
                        NPIDataTaxonomyGroup, NUCCTaxonomy, PlanNPIRaw,
                        ProviderEnrichmentSummary, ProviderEnrollmentFFS,
@@ -62,6 +62,8 @@ CODE_TOKEN_PATTERN = re.compile(r"^[A-Z0-9._-]+$")
 INT_CODE_PATTERN = re.compile(r"^-?\d+$")
 CHAIN_PECOS_PROVIDER_TYPE_CODES = {"12-C1"}
 PUBLIC_ADDRESS_EXCLUDED_COLUMNS = {"address_key"}
+ADDRESS_SERVING_SOURCE_ENV = "HLTHPRT_ADDRESS_SERVING_SOURCE"
+ADDRESS_SERVING_SOURCE_UNIFIED = "entity_address_unified"
 FACILITY_ENROLLMENT_MODELS: dict[str, Any] = {
     "hospital": ProviderEnrollmentHospital,
     "hha": ProviderEnrollmentHomeHealthAgency,
@@ -723,7 +725,13 @@ async def _fast_has_insurance_count(city: Optional[str], state: Optional[str]) -
     if cached is not None:
         return cached
 
-    table = NPIAddress.__table__
+    required_columns = {"npi", "type", "plans_network_array"}
+    if city:
+        required_columns.add("city_name")
+    if state:
+        required_columns.add("state_name")
+    address_model = await _address_serving_model(required_columns)
+    table = address_model.__table__
     conditions = [
         table.c.type == "primary",
         literal_column("NOT (plans_network_array @@ '0'::query_int)"),
@@ -748,7 +756,9 @@ async def _fast_primary_npi_count() -> int:
     cached = _primary_total_cache_get()
     if cached is not None:
         return cached
-    stmt = select(func.count()).select_from(NPIAddress.__table__).where(NPIAddress.type == "primary")
+    address_model = await _address_serving_model({"type"})
+    table = address_model.__table__
+    stmt = select(func.count()).select_from(table).where(table.c.type == "primary")
     scalar_fn = getattr(db, "scalar", None)
     if scalar_fn is not None:
         try:
@@ -768,6 +778,8 @@ def _build_nearby_sql(
     ilike_clause: str,
     *,
     use_taxonomy_filter: bool,
+    address_table_sql: str = "mrf.npi_address",
+    geo_precision_clause: str = "",
 ) -> str:
     taxonomy_from = ""
     taxonomy_where = ""
@@ -800,13 +812,14 @@ def _build_nearby_sql(
                                2
                            ) AS distance,
                            a.*
-                         FROM mrf.npi_address AS a{taxonomy_from}
+                         FROM {address_table_sql} AS a{taxonomy_from}
                         WHERE ST_DWithin(
                                 Geography(ST_MakePoint(long, lat)),
                                 Geography(ST_MakePoint(:in_long, :in_lat)),
                                 :radius * 1609.34
                              )
                           {taxonomy_where}
+                          {geo_precision_clause}
                           AND (a.type = 'primary' OR a.type = 'secondary')
                           {extra_clause}
                      ORDER BY distance ASC
@@ -821,9 +834,17 @@ def _build_nearby_sql(
     ).format(
         taxonomy_from=taxonomy_from,
         taxonomy_where=taxonomy_where,
+        geo_precision_clause=geo_precision_clause,
         extra_clause=extra_clause,
         ilike_clause=ilike_clause,
+        address_table_sql=address_table_sql,
     )
+
+
+def _exact_geo_precision_clause(address_table_sql: str) -> str:
+    if address_table_sql.endswith(".entity_address_unified"):
+        return "\n                          AND COALESCE(a.address_precision, '') <> 'city_zip'"
+    return ""
 
 
 def _name_like_clause(alias: str = "", param: str = "name_like") -> str:
@@ -1031,6 +1052,29 @@ async def _table_columns(table_name: str, *, session: Any = None) -> set[str]:
         return set(_cache_set(_TABLE_COLUMNS_CACHE, cache_key, {str(row[0]) for row in rows if row and row[0]}))
     except Exception:  # pragma: no cover - defensive fallback for transient DB states
         return set()
+
+
+def _address_serving_unified_requested() -> bool:
+    return os.getenv(ADDRESS_SERVING_SOURCE_ENV, "").strip().lower() == ADDRESS_SERVING_SOURCE_UNIFIED
+
+
+def _public_address_column_keys() -> set[str]:
+    return _model_table_columns(NPIAddress) - PUBLIC_ADDRESS_EXCLUDED_COLUMNS
+
+
+async def _address_serving_model(required_columns: set[str] | None = None, *, session: Any = None):
+    if not _address_serving_unified_requested():
+        return NPIAddress
+    required = set(required_columns or ())
+    columns = await _table_columns(EntityAddressUnified.__tablename__, session=session)
+    if columns and required.issubset(columns):
+        return EntityAddressUnified
+    return NPIAddress
+
+
+async def _address_serving_table_sql(required_columns: set[str] | None = None, *, session: Any = None) -> str:
+    model = await _address_serving_model(required_columns, session=session)
+    return _schema_cache_key(model.__tablename__)
 
 
 async def _fetch_provider_enrichment_summary_map(
@@ -1675,6 +1719,7 @@ async def npi_index_status(request):
 
 @blueprint.get("/active_pharmacists")
 async def active_pharmacists(request):
+    request_session = _request_session(request)
     state = request.args.get("state", None)
     specialization = request.args.get("specialization", None)
     if state and len(state) == 2:
@@ -1682,8 +1727,12 @@ async def active_pharmacists(request):
     else:
         state = None
 
+    address_table_sql = await _address_serving_table_sql(
+        {"npi", "type", "state_name", "telephone_number", "taxonomy_array"},
+        session=request_session,
+    )
     sql = text(
-        """
+        f"""
         WITH pharmacy_taxonomy AS (
             SELECT ARRAY_AGG(int_code) AS codes
             FROM mrf.nucc_taxonomy
@@ -1695,11 +1744,11 @@ async def active_pharmacists(request):
             WHERE
                """
         + ("specialization= :specialization" if specialization else "classification = 'Pharmacist'")
-        + """
+        + f"""
         )
         SELECT COUNT(DISTINCT phm.npi) AS active_pharmacist_count
-        FROM mrf.npi_address ph
-        JOIN mrf.npi_address phm
+        FROM {address_table_sql} ph
+        JOIN {address_table_sql} phm
           ON ph.telephone_number = phm.telephone_number
          AND phm.type = 'primary'
          AND ph.type = 'primary'
@@ -1717,6 +1766,7 @@ async def active_pharmacists(request):
 
 @blueprint.get("/pharmacists_in_pharmacies")
 async def pharmacists_in_pharmacies(request):
+    request_session = _request_session(request)
     # Explicit access helps route collectors pick up query params.
     request.args.get("name_like")
     names = _extract_name_filters(request)
@@ -1724,6 +1774,10 @@ async def pharmacists_in_pharmacies(request):
         return response.json({"count": 0})
 
     name_clause, name_params = _name_like_clauses("d", names)
+    address_table_sql = await _address_serving_table_sql(
+        {"npi", "type", "state_name", "telephone_number", "taxonomy_array"},
+        session=request_session,
+    )
     sql = text(
         f"""
         WITH pharmacy_taxonomy AS (
@@ -1737,8 +1791,8 @@ async def pharmacists_in_pharmacies(request):
             WHERE classification = 'Pharmacist'
         )
         SELECT COUNT(DISTINCT phm.npi) AS pharmacist_count
-        FROM mrf.npi_address ph
-        JOIN mrf.npi_address phm
+        FROM {address_table_sql} ph
+        JOIN {address_table_sql} phm
           ON ph.telephone_number = phm.telephone_number
          AND phm.type = 'primary'
          AND ph.type = 'primary'
@@ -1757,6 +1811,7 @@ async def pharmacists_in_pharmacies(request):
 
 @blueprint.get("/pharmacists_per_pharmacy")
 async def pharmacists_per_pharmacy(request):
+    request_session = _request_session(request)
     state = request.args.get("state", None)
     if state and len(state) == 2:
         state = state.upper()
@@ -1785,6 +1840,10 @@ async def pharmacists_per_pharmacy(request):
         state_filter_join += " AND ph.state_name = :state"
     state_filter_phm = "AND a.state_name = :state" if state else ""
 
+    address_table_sql = await _address_serving_table_sql(
+        {"npi", "type", "state_name", "telephone_number", "taxonomy_array"},
+        session=request_session,
+    )
     base_cte = f"""
         WITH target_npi AS (
             SELECT npi
@@ -1803,7 +1862,7 @@ async def pharmacists_per_pharmacy(request):
         ),
         pharmacy_subset AS (
             SELECT a.npi, a.telephone_number, a.state_name
-              FROM mrf.npi_address AS a, pharmacy_taxonomy AS pc
+              FROM {address_table_sql} AS a, pharmacy_taxonomy AS pc
              WHERE a.npi IN (SELECT npi FROM target_npi)
                AND a.type = 'primary'
                AND a.taxonomy_array && pc.codes
@@ -1812,7 +1871,7 @@ async def pharmacists_per_pharmacy(request):
         ),
         pharmacist_subset AS (
             SELECT a.npi, a.telephone_number, a.state_name
-              FROM mrf.npi_address AS a, pharmacist_taxonomy AS pc
+              FROM {address_table_sql} AS a, pharmacist_taxonomy AS pc
              WHERE a.type = 'primary'
                AND a.taxonomy_array && pc.codes
                {("AND a.state_name = :state" if state else "")}
@@ -2202,6 +2261,11 @@ async def get_all(request):
 
         return params
 
+    address_table_sql = await _address_serving_table_sql(
+        _public_address_column_keys(),
+        session=request_session,
+    )
+
     async def get_count(filters):
         classification = filters.get("classification")
         specialization = filters.get("specialization")
@@ -2274,7 +2338,7 @@ async def get_all(request):
                 )
                 SELECT COUNT(DISTINCT c.npi)
                   FROM filtered_npi AS fn
-                  JOIN mrf.npi_address AS c ON c.npi = fn.npi
+                  JOIN {address_table_sql} AS c ON c.npi = fn.npi
                   CROSS JOIN {taxonomy_subquery}
                  WHERE {' AND '.join(address_where)}
                 """
@@ -2289,7 +2353,7 @@ async def get_all(request):
                 )
                 SELECT COUNT(DISTINCT c.npi)
                   FROM filtered_npi AS fn
-                  JOIN mrf.npi_address AS c ON c.npi = fn.npi
+                  JOIN {address_table_sql} AS c ON c.npi = fn.npi
                  WHERE {' AND '.join(address_where)}
                 """
             )
@@ -2297,7 +2361,7 @@ async def get_all(request):
             query = text(
                 f"""
                 SELECT COUNT(DISTINCT c.npi)
-                  FROM mrf.npi_address AS c,
+                  FROM {address_table_sql} AS c,
                        {taxonomy_subquery}
                  WHERE {' AND '.join(address_where)}
                 """
@@ -2306,7 +2370,7 @@ async def get_all(request):
             query = text(
                 f"""
                 SELECT COUNT(DISTINCT c.npi)
-                  FROM mrf.npi_address AS c
+                  FROM {address_table_sql} AS c
                  WHERE {' AND '.join(address_where)}
                 """
             )
@@ -2419,7 +2483,7 @@ async def get_all(request):
             f"""
             WITH filtered_addresses AS (
                 SELECT DISTINCT c.npi, c.taxonomy_array
-                  FROM mrf.npi_address AS c
+                  FROM {address_table_sql} AS c
                  WHERE {' AND '.join(address_where)}
             )
             SELECT q.classification AS key,
@@ -2497,7 +2561,7 @@ async def get_all(request):
         if not page_npis:
             return []
         query = text(
-            """
+            f"""
             SELECT
                 b.npi,
                 b.provider_organization_name,
@@ -2507,7 +2571,7 @@ async def get_all(request):
                 c.postal_code,
                 c.formatted_address
             FROM mrf.npi AS b
-            JOIN mrf.npi_address AS c ON c.npi = b.npi AND c.type = 'primary'
+            JOIN {address_table_sql} AS c ON c.npi = b.npi AND c.type = 'primary'
             WHERE b.npi = ANY(:page_npis)
             ORDER BY b.npi
             """
@@ -2616,21 +2680,21 @@ async def get_all(request):
         if npi_where and use_taxonomy_filter:
             address_source = (
                 "filtered_npi as fn\n"
-                "    JOIN mrf.npi_address as c ON c.npi = fn.npi\n"
+                f"    JOIN {address_table_sql} as c ON c.npi = fn.npi\n"
                 f"    CROSS JOIN (select ARRAY_AGG(int_code) as int_codes from mrf.nucc_taxonomy where {taxonomy_filter}) as q"
             )
         elif npi_where:
             address_source = (
                 "filtered_npi as fn\n"
-                "    JOIN mrf.npi_address as c ON c.npi = fn.npi"
+                f"    JOIN {address_table_sql} as c ON c.npi = fn.npi"
             )
         elif use_taxonomy_filter:
             address_source = (
-                "mrf.npi_address as c\n"
+                f"{address_table_sql} as c\n"
                 f"    CROSS JOIN (select ARRAY_AGG(int_code) as int_codes from mrf.nucc_taxonomy where {taxonomy_filter}) as q"
             )
         else:
-            address_source = "mrf.npi_address as c"
+            address_source = f"{address_table_sql} as c"
         q = text(
             f"""
         WITH {cte_prefix}
@@ -3454,11 +3518,17 @@ async def get_near_npi(request):
     if extra_filters:
         extra_clause = "\n          AND " + "\n          AND ".join(extra_filters)
 
+    address_table_sql = await _address_serving_table_sql(
+        _public_address_column_keys(),
+        session=request_session,
+    )
     nearby_sql = _build_nearby_sql(
         taxonomy_conditions,
         extra_clause,
         ilike_clause,
         use_taxonomy_filter=bool(where),
+        address_table_sql=address_table_sql,
+        geo_precision_clause=_exact_geo_precision_clause(address_table_sql),
     )
 
     async with db.acquire() as conn:
@@ -3806,15 +3876,27 @@ async def get_npi(request, npi):
         if x.get("lat"):
             return x
         postal_code = x.get("postal_code")
+        if postal_code is not None:
+            postal_code = str(postal_code)
         if postal_code and len(postal_code) > 5:
             postal_code = f"{postal_code[0:5]}-{postal_code[5:]}"
-        t_addr = ", ".join(
-            [
-                x.get("first_line", ""),
-                x.get("second_line", ""),
-                x.get("city_name", ""),
-                f"{x.get('state_name', '')} {postal_code}",
+        state_postal = " ".join(
+            part
+            for part in [
+                str(x.get("state_name") or "").strip(),
+                str(postal_code or "").strip(),
             ]
+            if part
+        )
+        t_addr = ", ".join(
+            part
+            for part in [
+                str(x.get("first_line") or "").strip(),
+                str(x.get("second_line") or "").strip(),
+                str(x.get("city_name") or "").strip(),
+                state_postal,
+            ]
+            if part
         )
         t_addr = t_addr.replace(" , ", " ")
 
@@ -4044,17 +4126,23 @@ async def _build_npi_details(npi: int, *, session: Any = None) -> dict:
     npi_data_table = NPIData.__table__
     taxonomy_table = NPIDataTaxonomy.__table__
     taxonomy_group_table = NPIDataTaxonomyGroup.__table__
-    address_table = NPIAddress.__table__
     filter_capabilities = await _resolve_npi_filter_capabilities(session=session)
     procedures_array_available = bool(filter_capabilities.get("npi_procedures_array_available", True))
     medications_array_available = bool(filter_capabilities.get("npi_medications_array_available", True))
-    existing_address_columns = await _table_columns(NPIAddress.__tablename__, session=session)
+    address_model = await _address_serving_model(
+        _public_address_column_keys() - {"procedures_array", "medications_array"},
+        session=session,
+    )
+    address_table = address_model.__table__
+    existing_address_columns = await _table_columns(address_model.__tablename__, session=session)
     if not existing_address_columns:
-        existing_address_columns = _model_table_columns(NPIAddress)
+        existing_address_columns = _model_table_columns(address_model)
 
     address_columns = []
     for column in address_table.columns:
         if column.key in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
+            continue
+        if column.key not in _model_table_columns(NPIAddress):
             continue
         if column.key not in existing_address_columns:
             if column.key == "procedures_array":
@@ -4068,7 +4156,7 @@ async def _build_npi_details(npi: int, *, session: Any = None) -> dict:
         if column.key == "medications_array" and not medications_array_available:
             address_columns.append(literal_column("'{}'::INTEGER[]").label("medications_array"))
             continue
-        address_columns.append(column)
+        address_columns.append(address_table.c[column.key])
 
     address_subquery_base = (
         select(*address_columns)

@@ -119,7 +119,23 @@ PTG2_WARM_P95_MAX_MS = max(float(os.getenv("HLTHPRT_PTG2_WARM_P95_MAX_MS", "50")
 PTG2_JSON_FALLBACK_ENV = "HLTHPRT_PTG2_ENABLE_JSON_FALLBACK"
 PTG2_SERVING_TABLE_ENV = "HLTHPRT_PTG2_SERVING_TABLE"
 PTG2_FAST_COMPACT_COUNTS_ENV = "HLTHPRT_PTG2_FAST_COMPACT_COUNTS"
+ADDRESS_SERVING_SOURCE_ENV = "HLTHPRT_ADDRESS_SERVING_SOURCE"
+ADDRESS_SERVING_SOURCE_UNIFIED = "entity_address_unified"
 _PTG2_MANIFEST_SIDECAR_CACHE: dict[tuple[str, str, str], tuple[str, ...]] = {}
+_PTG2_LEGACY_ADDRESS_COLUMNS = {
+    "npi",
+    "type",
+    "checksum",
+    "state_name",
+    "city_name",
+    "postal_code",
+    "country_code",
+    "lat",
+    "long",
+    "first_line",
+    "second_line",
+}
+_PTG2_UNIFIED_ADDRESS_COLUMNS = _PTG2_LEGACY_ADDRESS_COLUMNS | {"address_precision"}
 
 
 def normalize_ptg2_mode(value: str | None) -> str:
@@ -127,6 +143,61 @@ def normalize_ptg2_mode(value: str | None) -> str:
     if mode not in {PTG2_MODE_EXACT_SOURCE, PTG2_MODE_PRODUCT_SEARCH}:
         raise ValueError("mode must be exact_source or product_search")
     return mode
+
+
+def _address_serving_unified_requested() -> bool:
+    return os.getenv(ADDRESS_SERVING_SOURCE_ENV, "").strip().lower() == ADDRESS_SERVING_SOURCE_UNIFIED
+
+
+def _is_unified_address_table(table_name: str | None) -> bool:
+    return bool(table_name and table_name.endswith(".entity_address_unified"))
+
+
+async def _ptg2_table_has_columns(session, table_name: str, required_columns: set[str]) -> bool:
+    safe_table_name = _safe_table_name(table_name)
+    if not safe_table_name:
+        return False
+    schema_name, bare_table_name = safe_table_name.split(".", 1)
+    try:
+        result = await session.execute(
+            text(
+                """
+                SELECT column_name
+                  FROM information_schema.columns
+                 WHERE table_schema = :schema_name
+                   AND table_name = :table_name
+                """
+            ),
+            {"schema_name": schema_name, "table_name": bare_table_name},
+        )
+        columns: set[str] = set()
+        for row in result:
+            mapping = getattr(row, "_mapping", None)
+            if mapping is not None:
+                value = mapping.get("column_name")
+            else:
+                value = row[0] if row else None
+            if value:
+                columns.add(str(value))
+        return bool(columns) and set(required_columns).issubset(columns)
+    except Exception:
+        return False
+
+
+async def _ptg2_address_serving_table(
+    session,
+    required_columns: set[str],
+    *,
+    require_legacy_available: bool = False,
+) -> str | None:
+    legacy_table = f"{PTG2_SCHEMA}.npi_address"
+    if _address_serving_unified_requested():
+        unified_table = f"{PTG2_SCHEMA}.entity_address_unified"
+        if await _ptg2_table_has_columns(session, unified_table, required_columns):
+            return unified_table
+    if require_legacy_available and not await _serving_table_available(session, legacy_table):
+        return None
+    return legacy_table
 
 
 def _inferred_provider_taxonomy_rule(args: dict[str, Any]) -> InferredProviderTaxonomyRule | None:
@@ -641,11 +712,12 @@ async def _ptg2_manifest_enriched_provider_rows_for_npis(
     if not npis:
         return []
     npi_data_table = f"{PTG2_SCHEMA}.npi_data"
-    npi_address_table = f"{PTG2_SCHEMA}.npi_address"
-    if not await _serving_table_available(session, npi_data_table) or not await _serving_table_available(
+    npi_address_table = await _ptg2_address_serving_table(
         session,
-        npi_address_table,
-    ):
+        _PTG2_LEGACY_ADDRESS_COLUMNS,
+        require_legacy_available=True,
+    )
+    if not await _serving_table_available(session, npi_data_table) or not npi_address_table:
         return [{"npi": npi, "provider_name": "TiC provider"} for npi in npis]
     enrich_stmt = (
         text(
@@ -715,9 +787,13 @@ async def _ptg2_manifest_location_provider_matches(
     city_value = str(args.get("city") or "").strip().lower()
     zip_value = str(args.get("zip5") or args.get("zip") or "").strip()[:5]
     provider_npi = args.get("npi")
-    npi_address_table = f"{PTG2_SCHEMA}.npi_address"
+    npi_address_table = await _ptg2_address_serving_table(
+        session,
+        _PTG2_LEGACY_ADDRESS_COLUMNS,
+        require_legacy_available=True,
+    )
     npi_data_table = f"{PTG2_SCHEMA}.npi_data"
-    if not await _serving_table_available(session, npi_address_table):
+    if not npi_address_table:
         return None
 
     filters = ["addr.npi IS NOT NULL"]
@@ -1341,7 +1417,13 @@ def _compact_price_payload_sql(serving_tables: PTG2ServingTables, params: dict[s
     """
 
 
-def _compact_provider_filter_sql(serving_tables: PTG2ServingTables, args: dict[str, Any], params: dict[str, Any]) -> tuple[str, bool]:
+def _compact_provider_filter_sql(
+    serving_tables: PTG2ServingTables,
+    args: dict[str, Any],
+    params: dict[str, Any],
+    *,
+    address_table: str | None = None,
+) -> tuple[str, bool]:
     has_geo = bool(args.get("zip5") or args.get("zip") or args.get("city") or args.get("state") or args.get("lat") or args.get("long") or args.get("radius_miles"))
     specialty = str(args.get("specialty") or "").strip().lower()
     inferred_sql = _inferred_provider_taxonomy_code_sql(
@@ -1429,17 +1511,19 @@ def _compact_provider_filter_sql(serving_tables: PTG2ServingTables, args: dict[s
         f"JOIN {serving_tables.provider_group_member_table} pgm_filter ON pgm_filter.provider_group_hash = psc_filter.provider_group_hash",
     ]
     if has_geo:
-        joins.append(f"JOIN {PTG2_SCHEMA}.npi_address addr_filter ON addr_filter.npi = pgm_filter.npi")
+        joins.append(f"JOIN {address_table or f'{PTG2_SCHEMA}.npi_address'} addr_filter ON addr_filter.npi = pgm_filter.npi")
         if params.get("zip5"):
             clauses.append("LEFT(COALESCE(addr_filter.postal_code, ''), 5) = :zip5")
         if params.get("city_exact"):
-            clauses.append("UPPER(COALESCE(addr_filter.city, '')) = :city_exact")
+            clauses.append("UPPER(COALESCE(addr_filter.city_name, '')) = :city_exact")
         if params.get("state_exact"):
-            clauses.append("UPPER(COALESCE(addr_filter.state, '')) = :state_exact")
+            clauses.append("UPPER(COALESCE(addr_filter.state_name, '')) = :state_exact")
         if params.get("geo_lat") is not None:
             clauses.append("addr_filter.lat::float8 BETWEEN :geo_min_lat AND :geo_max_lat")
             clauses.append("addr_filter.long::float8 BETWEEN :geo_min_long AND :geo_max_long")
             clauses.append("(earth_distance(ll_to_earth(:geo_lat, :geo_long), ll_to_earth(addr_filter.lat::float8, addr_filter.long::float8)) / 1609.344) <= :geo_radius_miles")
+            if _is_unified_address_table(address_table):
+                clauses.append("COALESCE(addr_filter.address_precision, '') <> 'city_zip'")
     if specialty or inferred_sql:
         joins.append(f"JOIN {PTG2_SCHEMA}.npi_taxonomy nt_filter ON nt_filter.npi = pgm_filter.npi")
     if specialty:
@@ -1465,7 +1549,13 @@ def _compact_provider_filter_sql(serving_tables: PTG2ServingTables, args: dict[s
     )
 
 
-def _compact_provider_expansion_sql(serving_tables: PTG2ServingTables, args: dict[str, Any], params: dict[str, Any]) -> str:
+def _compact_provider_expansion_sql(
+    serving_tables: PTG2ServingTables,
+    args: dict[str, Any],
+    params: dict[str, Any],
+    *,
+    address_table: str | None = None,
+) -> str:
     if not _request_bool(args.get("include_providers")):
         return ""
     params.setdefault("provider_match_limit", max(int(params.get("limit") or 25) * 8, 64))
@@ -1493,10 +1583,14 @@ def _compact_provider_expansion_sql(serving_tables: PTG2ServingTables, args: dic
         JOIN {serving_tables.provider_group_member_table} pgm
           ON pgm.provider_group_hash = psc.provider_group_hash
         LEFT JOIN LATERAL (
-            SELECT addr.*
-            FROM {PTG2_SCHEMA}.npi_address addr
-            WHERE addr.npi = sp.npi
-            ORDER BY addr.is_primary DESC NULLS LAST
+            SELECT
+                addr.*,
+                CONCAT('npi_address:', addr.npi, ':', addr.type, ':', addr.checksum) AS location_hash,
+                addr.state_name AS state,
+                addr.city_name AS city
+            FROM {address_table or f'{PTG2_SCHEMA}.npi_address'} addr
+            WHERE addr.npi = pgm.npi
+            ORDER BY (addr.type = 'primary') DESC, addr.type, addr.checksum
             LIMIT 1
         ) addr ON TRUE
     """
@@ -1561,10 +1655,36 @@ async def _search_compact_serving_table(
     price_filter_params: dict[str, Any] = {}
     price_filter_clauses, price_filter_query = _price_filter_clauses(args, price_filter_params)
     params.update(price_filter_params)
-    provider_filter_sql, has_provider_filter = _compact_provider_filter_sql(serving_tables, args, params)
-    source_cte = "provider_filtered_rates" if has_provider_filter else "rate_candidates"
     expand_providers = _request_bool(args.get("include_providers"))
-    provider_expansion_sql = _compact_provider_expansion_sql(serving_tables, args, params)
+    has_geo_filter = bool(
+        args.get("zip5")
+        or args.get("zip")
+        or args.get("city")
+        or args.get("state")
+        or args.get("lat")
+        or args.get("long")
+        or args.get("radius_miles")
+    )
+    uses_location_table = bool(serving_tables.provider_group_location_table and has_geo_filter)
+    address_table_sql = None
+    if (has_geo_filter and not uses_location_table) or (expand_providers and not uses_location_table):
+        address_table_sql = await _ptg2_address_serving_table(
+            session,
+            _PTG2_UNIFIED_ADDRESS_COLUMNS if has_geo_filter else _PTG2_LEGACY_ADDRESS_COLUMNS,
+        )
+    provider_filter_sql, has_provider_filter = _compact_provider_filter_sql(
+        serving_tables,
+        args,
+        params,
+        address_table=address_table_sql,
+    )
+    source_cte = "provider_filtered_rates" if has_provider_filter else "rate_candidates"
+    provider_expansion_sql = _compact_provider_expansion_sql(
+        serving_tables,
+        args,
+        params,
+        address_table=address_table_sql,
+    )
     provider_select_sql = ""
     if expand_providers and serving_tables.provider_group_location_table and provider_expansion_sql:
         provider_select_sql = (

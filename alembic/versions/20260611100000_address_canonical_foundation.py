@@ -138,7 +138,15 @@ LANGUAGE sql
 IMMUTABLE
 PARALLEL SAFE
 AS $$
-    SELECT NULLIF(LEFT(regexp_replace(COALESCE(value, ''), '[^0-9]', '', 'g'), 5), '')
+    WITH digits AS (
+        SELECT regexp_replace(COALESCE(value, ''), '[^0-9]', '', 'g') AS v
+    )
+    SELECT CASE
+        WHEN length(v) >= 5 THEN LEFT(v, 5)
+        WHEN length(v) IN (3, 4) THEN lpad(v, 5, '0')
+        ELSE NULL
+    END
+    FROM digits
 $$;
 
 CREATE OR REPLACE FUNCTION {qschema}.addr_country_code_v1(value text)
@@ -166,7 +174,7 @@ AS $$
     SELECT CASE v
         WHEN '' THEN NULL
 {state_case}
-        ELSE NULLIF(v, '')
+        ELSE NULL
     END
     FROM cleaned
 $$;
@@ -398,7 +406,6 @@ BEGIN
         precision_value := 'street';
     ELSIF city_norm IS NOT NULL THEN
         precision_value := 'city_zip';
-        unit_norm := '';
     ELSE
         RETURN NULL;
     END IF;

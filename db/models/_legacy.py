@@ -3885,10 +3885,10 @@ class EntityAddressUnified(Base, JSONOutputMixin):
     __tablename__ = "entity_address_unified"
     __main_table__ = __tablename__
     __table_args__ = (
-        PrimaryKeyConstraint("entity_type", "entity_id", "type", "checksum"),
+        PrimaryKeyConstraint("location_key"),
         {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
     )
-    __my_index_elements__ = ["entity_type", "entity_id", "type", "checksum"]
+    __my_index_elements__ = ["location_key"]
     __my_additional_indexes__ = [
         {"index_elements": ("npi",), "name": "npi"},
         {"index_elements": ("inferred_npi",), "name": "inferred_npi"},
@@ -3897,6 +3897,15 @@ class EntityAddressUnified(Base, JSONOutputMixin):
         {"index_elements": ("type", "state_name", "city_name"), "name": "type_state_city"},
         {"index_elements": ("LEFT(postal_code, 5)",), "name": "postal_code_5"},
         {"index_elements": ("address_sources",), "using": "gin", "name": "address_sources"},
+        {"index_elements": ("row_origin",), "name": "row_origin"},
+        {"index_elements": ("address_precision",), "name": "address_precision"},
+        {"index_elements": ("archive_identity_version",), "name": "archive_identity_version"},
+        {"index_elements": ("premise_key",), "name": "premise_key"},
+        {"index_elements": ("zip5",), "name": "zip5"},
+        {"index_elements": ("state_code", "city_norm"), "name": "state_city_norm"},
+        {"index_elements": ("ptg_plan_array",), "using": "gin", "name": "ptg_plan_array"},
+        {"index_elements": ("ptg_source_array",), "using": "gin", "name": "ptg_source_array"},
+        {"index_elements": ("group_plan_array",), "using": "gin", "name": "group_plan_array"},
         {
             "index_elements": ("taxonomy_array gin__int_ops", "plans_network_array gin__int_ops"),
             "using": "gin",
@@ -3921,10 +3930,32 @@ class EntityAddressUnified(Base, JSONOutputMixin):
     inference_method = Column(String(64))
     entity_name = Column(String(256))
     entity_subtype = Column(String(64))
+    location_key = Column(String(64), nullable=False)
+    row_origin = Column(String(32), nullable=False, server_default="base")
+    archive_identity_version = Column(String(16), nullable=False, server_default="v1")
+    address_precision = Column(String(32), nullable=False, server_default="unknown")
+    premise_key = Column(PG_UUID(as_uuid=True))
+    zip5 = Column(String(5))
+    state_code = Column(String(2))
+    city_norm = Column(String)
+    county_fips = Column(String(5))
+    source_mask = Column(BigInteger, nullable=False, server_default="0")
+    address_source_mask = Column(BigInteger, nullable=False, server_default="0")
     source_count = Column(Integer, nullable=False, server_default="0")
+    independent_source_count = Column(Integer, nullable=False, server_default="0")
     multi_source_confirmed = Column(Boolean, nullable=False, server_default="false")
+    location_confidence_id = Column(SMALLINT, nullable=False, server_default="0")
+    confidence_score = Column(SMALLINT)
+    freshness_score = Column(SMALLINT)
     address_sources = Column(ARRAY(String), nullable=False, server_default=text("'{}'::varchar[]"))
     source_record_ids = Column(ARRAY(String), nullable=False, server_default=text("'{}'::varchar[]"))
+    aca_plan_array = Column(ARRAY(String), nullable=False, server_default=text("'{}'::varchar[]"))
+    aca_network_array = Column(ARRAY(String), nullable=False, server_default=text("'{}'::varchar[]"))
+    ptg_plan_array = Column(ARRAY(String), nullable=False, server_default=text("'{}'::varchar[]"))
+    ptg_source_array = Column(ARRAY(String), nullable=False, server_default=text("'{}'::varchar[]"))
+    group_plan_array = Column(ARRAY(String), nullable=False, server_default=text("'{}'::varchar[]"))
+    base_address_version = Column(String(64))
+    ptg_address_version = Column(String(64))
 
     checksum = Column(BigInteger, nullable=False)
     type = Column(String(32), nullable=False)
@@ -3947,7 +3978,199 @@ class EntityAddressUnified(Base, JSONOutputMixin):
     date_added = Column(DATE)
     place_id = Column(String)
     updated_at = Column(DateTime)
+    last_seen_at = Column(DateTime)
     address_key = Column(PG_UUID(as_uuid=True))
+
+
+class PTGAddress(Base, JSONOutputMixin):
+    __tablename__ = "ptg_address"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("source_key", "snapshot_id", "location_key"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["source_key", "snapshot_id", "location_key"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("source_key", "snapshot_id"), "name": "source_snapshot"},
+        {"index_elements": ("plan_id",), "name": "plan_id"},
+        {"index_elements": ("ptg_plan_id",), "name": "ptg_plan_id"},
+        {"index_elements": ("npi",), "name": "npi"},
+        {"index_elements": ("tin",), "name": "tin"},
+        {"index_elements": ("address_key",), "name": "address_key"},
+        {"index_elements": ("premise_key",), "name": "premise_key"},
+        {"index_elements": ("zip5",), "name": "zip5"},
+        {"index_elements": ("state_code", "city_norm"), "name": "state_city_norm"},
+        {"index_elements": ("ptg_plan_array",), "using": "gin", "name": "ptg_plan_array"},
+        {"index_elements": ("ptg_source_array",), "using": "gin", "name": "ptg_source_array"},
+        {"index_elements": ("group_plan_array",), "using": "gin", "name": "group_plan_array"},
+    ]
+
+    node_id = Column(String)
+    source_key = Column(String, nullable=False)
+    snapshot_id = Column(String, nullable=False)
+    plan_id = Column(String)
+    ptg_plan_id = Column(String)
+    market_type = Column(String)
+    provider_group_id = Column(String)
+    provider_set_id = Column(String)
+    npi = Column(BigInteger)
+    tin = Column(String)
+    location_key = Column(String(64), nullable=False)
+    address_key = Column(PG_UUID(as_uuid=True))
+    premise_key = Column(PG_UUID(as_uuid=True))
+    archive_identity_version = Column(String(16), nullable=False, server_default="v1")
+    address_precision = Column(String(32), nullable=False, server_default="unknown")
+    address_source_id = Column(SMALLINT, nullable=False, server_default="0")
+    address_source_record_key = Column(String)
+    address_role_id = Column(SMALLINT, nullable=False, server_default="0")
+    location_confidence_id = Column(SMALLINT, nullable=False, server_default="0")
+    zip5 = Column(String(5))
+    state_code = Column(String(2))
+    city_norm = Column(String)
+    county_fips = Column(String(5))
+    lat = Column(Numeric(scale=8, precision=11, asdecimal=False, decimal_return_scale=None))
+    long = Column(Numeric(scale=8, precision=11, asdecimal=False, decimal_return_scale=None))
+    ptg_plan_array = Column(ARRAY(String), nullable=False, server_default=text("'{}'::varchar[]"))
+    ptg_source_array = Column(ARRAY(String), nullable=False, server_default=text("'{}'::varchar[]"))
+    group_plan_array = Column(ARRAY(String), nullable=False, server_default=text("'{}'::varchar[]"))
+    base_address_version = Column(String(64))
+    ptg_snapshot_published_at = Column(TIMESTAMP(timezone=True))
+    observed_at = Column(TIMESTAMP(timezone=True))
+    updated_at = Column(TIMESTAMP(timezone=True))
+
+
+class EntityAddressEvidence(Base, JSONOutputMixin):
+    __tablename__ = "entity_address_evidence"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("evidence_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["evidence_id"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("npi",), "name": "npi"},
+        {"index_elements": ("location_key",), "name": "location_key"},
+        {"index_elements": ("address_key",), "name": "address_key"},
+        {"index_elements": ("entity_type", "entity_id"), "name": "entity"},
+        {"index_elements": ("source_id",), "name": "source_id"},
+        {"index_elements": ("source_run_id",), "name": "source_run_id"},
+        {"index_elements": ("plan_id",), "name": "plan_id"},
+        {"index_elements": ("ptg_plan_id",), "name": "ptg_plan_id"},
+        {"index_elements": ("ptg_source_key",), "name": "ptg_source_key"},
+        {"index_elements": ("ptg_snapshot_id",), "name": "ptg_snapshot_id"},
+    ]
+
+    evidence_id = Column(BigInteger, nullable=False)
+    location_key = Column(String(64), nullable=False)
+    address_key = Column(PG_UUID(as_uuid=True))
+    premise_key = Column(PG_UUID(as_uuid=True))
+    archive_identity_version = Column(String(16))
+    entity_type = Column(String(64), nullable=False)
+    entity_id = Column(String(128), nullable=False)
+    npi = Column(BigInteger)
+    tin = Column(String)
+    source_id = Column(SMALLINT, nullable=False)
+    source_record_key = Column(String)
+    source_run_id = Column(String, nullable=False)
+    source_snapshot_id = Column(String)
+    node_id = Column(String)
+    plan_id = Column(String)
+    network_id = Column(String)
+    ptg_plan_id = Column(String)
+    ptg_source_key = Column(String)
+    ptg_snapshot_id = Column(String)
+    market_type = Column(String)
+    address_role_id = Column(SMALLINT)
+    location_confidence_id = Column(SMALLINT, nullable=False, server_default="0")
+    address_precision = Column(String(32))
+    observed_at = Column(TIMESTAMP(timezone=True))
+    last_seen_at = Column(TIMESTAMP(timezone=True))
+    retired_at = Column(TIMESTAMP(timezone=True))
+
+
+class EntityAddressPlanBridge(Base, JSONOutputMixin):
+    __tablename__ = "entity_address_plan_bridge"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("location_key", "entity_type", "entity_id", "plan_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["location_key", "entity_type", "entity_id", "plan_id"]
+    __my_additional_indexes__ = [{"index_elements": ("plan_id", "location_key"), "name": "plan_location"}]
+
+    location_key = Column(String(64), nullable=False)
+    entity_type = Column(String(64), nullable=False)
+    entity_id = Column(String(128), nullable=False)
+    plan_id = Column(String, nullable=False)
+    market_type = Column(String)
+
+
+class EntityAddressNetworkBridge(Base, JSONOutputMixin):
+    __tablename__ = "entity_address_network_bridge"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("location_key", "entity_type", "entity_id", "network_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["location_key", "entity_type", "entity_id", "network_id"]
+    __my_additional_indexes__ = [{"index_elements": ("network_id", "location_key"), "name": "network_location"}]
+
+    location_key = Column(String(64), nullable=False)
+    entity_type = Column(String(64), nullable=False)
+    entity_id = Column(String(128), nullable=False)
+    network_id = Column(String, nullable=False)
+
+
+class EntityAddressPTGBridge(Base, JSONOutputMixin):
+    __tablename__ = "entity_address_ptg_bridge"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("location_key", "entity_type", "entity_id", "source_key", "snapshot_id", "ptg_plan_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["location_key", "entity_type", "entity_id", "source_key", "snapshot_id", "ptg_plan_id"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("ptg_plan_id", "source_key", "location_key"), "name": "ptg_plan_source_location"}
+    ]
+
+    location_key = Column(String(64), nullable=False)
+    entity_type = Column(String(64), nullable=False)
+    entity_id = Column(String(128), nullable=False)
+    source_key = Column(String, nullable=False)
+    snapshot_id = Column(String, nullable=False)
+    ptg_plan_id = Column(String, nullable=False)
+
+
+class EntityAddressProcedureBridge(Base, JSONOutputMixin):
+    __tablename__ = "entity_address_procedure_bridge"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("location_key", "npi", "code_system", "code"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["location_key", "npi", "code_system", "code"]
+    __my_additional_indexes__ = [{"index_elements": ("code_system", "code", "location_key"), "name": "code_location"}]
+
+    location_key = Column(String(64), nullable=False)
+    npi = Column(BigInteger, nullable=False)
+    code_system = Column(String, nullable=False)
+    code = Column(String, nullable=False)
+
+
+class EntityAddressMedicationBridge(Base, JSONOutputMixin):
+    __tablename__ = "entity_address_medication_bridge"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("location_key", "npi", "code_system", "code"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["location_key", "npi", "code_system", "code"]
+    __my_additional_indexes__ = [{"index_elements": ("code_system", "code", "location_key"), "name": "code_location"}]
+
+    location_key = Column(String(64), nullable=False)
+    npi = Column(BigInteger, nullable=False)
+    code_system = Column(String, nullable=False)
+    code = Column(String, nullable=False)
 
 
 class PharmacyEconomicsSummary(Base, JSONOutputMixin):

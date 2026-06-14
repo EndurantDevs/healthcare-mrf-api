@@ -52,7 +52,7 @@ Do the sections in order. Section 1 is safe and high-leverage. Section 5+ touche
 
     git rm -r --cached restore/venv/
 
-**Why:** `restore/` is documented as "frozen legacy snapshots" (per `AGENTS.md`), but freezing source ≠ freezing 200 MB of wheels from Python 3.12. Keep the source tree under `restore/`, drop the venv.
+**Why:** `restore/` is documented as frozen legacy snapshots, but freezing source ≠ freezing 200 MB of wheels from Python 3.12. Keep the source tree under `restore/`, drop the venv.
 
 ### 1.6 Add Rust build artifacts to `.gitignore`
 
@@ -161,7 +161,7 @@ Open the README for each subdirectory (if any) and list every artifact in a scra
     ls tests/ | wc -l   # currently 55
     grep -r "^def test_" __test__/ | wc -l
 
-**Why:** `__test__/` is in `.gitignore` but has files (`test_npi_import.py`, `test_npi_section_guard.py`). `tests/` is the real suite per `pytest.ini` (`testpaths = tests`). `AGENTS.md` says `pytest __test__ -x`. Confirm which directory actually holds active tests before any move.
+**Why:** `__test__/` is in `.gitignore` but has files (`test_npi_import.py`, `test_npi_section_guard.py`). `tests/` is the real suite per `pytest.ini` (`testpaths = tests`). Confirm which directory actually holds active tests before any move.
 
 ### 3.2 Move any unique tests from `__test__/` into `tests/`
 
@@ -185,11 +185,11 @@ Move uniques into `tests/` and run them: `pytest tests/<file> -x`.
 
 **Why:** Single test directory, single source of truth. Eliminates the README/pytest.ini contradiction.
 
-### 3.4 Update `AGENTS.md` to reference `tests/`
+### 3.4 Update contributor docs to reference `tests/`
 
-**What:** In `AGENTS.md`, replace `pytest __test__ -x` with `pytest tests -x` (or just `pytest -x`, since `pytest.ini` already sets `testpaths = tests`).
+**What:** In contributor docs, reference `pytest tests -x` (or just `pytest -x`, since `pytest.ini` already sets `testpaths = tests`).
 
-**Why:** Anyone — human or AI agent — following `AGENTS.md` today is pointed at the wrong directory.
+**Why:** Anyone following stale local notes today is pointed at the wrong directory.
 
 ### 3.5 Commit the test-dir reconciliation
 
@@ -238,9 +238,9 @@ Move uniques into `tests/` and run them: `pytest tests/<file> -x`.
 
 **Why:** Today a new contributor reading `alembic/versions/` will assume migrations cover the whole schema. They don't. The lack of clarity is also why `manage sync-structure` exists.
 
-### 5.2 Cross-link from `AGENTS.md`
+### 5.2 Cross-link from contributor docs
 
-**What:** In `AGENTS.md`, under "Claims/Drug/NPI Integration Notes", add a one-line pointer:
+**What:** In contributor docs, add a one-line pointer:
 
 > See README "Schema sources of truth" for the alembic vs. per-import bootstrap split.
 
@@ -389,7 +389,7 @@ This is the biggest item; it is split into many small steps because moving 3,915
 
 **What:** Create `CONTRIBUTING.md` (~30 lines) covering: branch naming, how to run tests with `--test` mode, the publish/swap rule, the "no parallel `*_finish` workers for ClaimsPricing/DrugClaims" rule, where to add new importers (`process/<name>.py` + register in `process/__init__.py`).
 
-**Why:** Right now this knowledge lives in `AGENTS.md` (written for AI agents) and `specs/base_arch_prompt.md`. A human-facing CONTRIBUTING is the conventional location and will be found by GitHub's contributor UI.
+**Why:** Right now this knowledge is scattered across local notes and `specs/base_arch_prompt.md`. A human-facing CONTRIBUTING is the conventional location and will be found by GitHub's contributor UI.
 
 ### 8.2 Add a one-screen architecture diagram to `docs/`
 

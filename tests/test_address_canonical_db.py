@@ -127,6 +127,8 @@ async def test_address_canonical_sql_functions_are_immutable_parallel_safe_and_p
     assert all(value == ("i", "s") for value in flags.values())
     assert await db.scalar(f"SELECT {schema}.addr_state_code_v1('Puerto Rico');") == "PR"
     assert await db.scalar(f"SELECT {schema}.addr_state_code_v1('Armed Forces Pacific');") == "AP"
+    assert await db.scalar(f"SELECT {schema}.addr_state_code_v1('calif');") is None
+    assert await db.scalar(f"SELECT {schema}.addr_zip5_norm_v1('2138');") == "02138"
     assert await db.scalar(f"SELECT {schema}.addr_country_code_v1('canada');") == "CANADA"
     assert await db.scalar(f"SELECT {schema}.addr_country_code_v1('Usa');") == "US"
     assert await db.scalar(f"SELECT {schema}.addr_street_norm_v1('11 Noreste Turnpike', '');") == "11netpke"
@@ -174,6 +176,21 @@ async def test_address_canonical_sql_functions_are_immutable_parallel_safe_and_p
     assert (
         await db.scalar(
             f"""
+            SELECT {schema}.addr_identity_key_v1(
+                'DEPARTMENT 1234',
+                '',
+                'KNOXVILLE',
+                'TN',
+                '37995',
+                'US'
+            );
+            """
+        )
+        == "v1||dept1234|knoxville|TN|37995|US|city_zip"
+    )
+    assert (
+        await db.scalar(
+            f"""
             SELECT {schema}.addr_key_v1(
                 '27 Dr Mellichamp Dr' || chr(160) || 'Ste 100',
                 '',
@@ -192,7 +209,7 @@ async def test_address_canonical_sql_functions_are_immutable_parallel_safe_and_p
 
 
 @pytest.mark.asyncio(loop_scope="module")
-async def test_address_archive_v2_state_code_allows_long_unmapped_values():
+async def test_address_archive_v2_state_code_rejects_unmapped_values():
     _requires_test_database()
     schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
 
@@ -208,6 +225,7 @@ async def test_address_archive_v2_state_code_allows_long_unmapped_values():
     )
 
     assert int(max_length) >= 32
+    assert await db.scalar(f"SELECT {schema}.addr_state_code_v1('CALIFORNIA (CA)');") is None
 
 
 @pytest.mark.asyncio(loop_scope="module")

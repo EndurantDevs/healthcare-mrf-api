@@ -49,6 +49,7 @@ _START_WORKERS: tuple[WorkerSpec, ...] = (
     WorkerSpec("arq:FacilityAnchors", "process.FacilityAnchors", ("facility-anchors",)),
     WorkerSpec("arq:PharmacyEconomics", "process.PharmacyEconomics", ("pharmacy-economics",)),
     WorkerSpec("arq:EntityAddressUnified", "process.EntityAddressUnified", ("entity-address-unified",)),
+    WorkerSpec("arq:PTGAddress", "process.PTGAddress", ("ptg-address",)),
     WorkerSpec("arq:AddressArchive", "process.AddressArchive", ("address-archive-v2-migrate",)),
 )
 
@@ -59,6 +60,7 @@ _FINISH_WORKERS: tuple[WorkerSpec, ...] = (
     WorkerSpec("arq:ProviderQuality_finish", "process.ProviderQuality_finish", ("provider-quality",), role="finish"),
     WorkerSpec("arq:PartDFormularyNetwork_finish", "process.PartDFormularyNetwork_finish", ("partd-formulary-network",), role="finish"),
     WorkerSpec("arq:PharmacyLicense_finish", "process.PharmacyLicense_finish", ("pharmacy-license",), role="finish"),
+    WorkerSpec("arq:PTGAddress_finish", "process.PTGAddress_finish", ("ptg-address",), role="finish"),
 )
 
 _WORKERS = (*_START_WORKERS, *_FINISH_WORKERS)

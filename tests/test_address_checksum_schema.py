@@ -11,6 +11,12 @@ from sqlalchemy.schema import CreateTable
 from db.models import (
     AddressArchive,
     DoctorClinicianAddress,
+    EntityAddressEvidence,
+    EntityAddressMedicationBridge,
+    EntityAddressNetworkBridge,
+    EntityAddressPTGBridge,
+    EntityAddressPlanBridge,
+    EntityAddressProcedureBridge,
     EntityAddressUnified,
     FacilityAnchor,
     MRFAddress,
@@ -22,6 +28,7 @@ from db.models import (
     NPIDataTaxonomyGroup,
     PartDPharmacyActivity,
     PartDPharmacyActivityStage,
+    PTGAddress,
     PharmacyLicenseRecord,
     PharmacyLicenseRecordHistory,
     PharmacyLicenseRecordStage,
@@ -136,6 +143,38 @@ def test_address_key_is_appended_to_concrete_address_sources():
 
         stage_model = make_class(model, "address_order_test")
         assert list(stage_model.__table__.c.keys())[-1] == "address_key"
+
+
+def test_entity_address_serving_models_expose_compact_keys_and_bridges():
+    unified_columns = EntityAddressUnified.__table__.c
+    for column_name in (
+        "location_key",
+        "row_origin",
+        "archive_identity_version",
+        "address_precision",
+        "premise_key",
+        "zip5",
+        "state_code",
+        "city_norm",
+        "source_mask",
+        "address_source_mask",
+        "independent_source_count",
+        "location_confidence_id",
+        "confidence_score",
+        "ptg_plan_array",
+        "ptg_source_array",
+        "group_plan_array",
+    ):
+        assert column_name in unified_columns
+
+    assert PTGAddress.__tablename__ == "ptg_address"
+    assert PTGAddress.__my_index_elements__ == ["source_key", "snapshot_id", "location_key"]
+    assert EntityAddressEvidence.__tablename__ == "entity_address_evidence"
+    assert EntityAddressPlanBridge.__tablename__ == "entity_address_plan_bridge"
+    assert EntityAddressNetworkBridge.__tablename__ == "entity_address_network_bridge"
+    assert EntityAddressPTGBridge.__tablename__ == "entity_address_ptg_bridge"
+    assert EntityAddressProcedureBridge.__tablename__ == "entity_address_procedure_bridge"
+    assert EntityAddressMedicationBridge.__tablename__ == "entity_address_medication_bridge"
 
 
 def test_address_key_is_not_added_to_address_prototype_archive_model():

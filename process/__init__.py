@@ -11,8 +11,11 @@ except ImportError:
     uvloop = None  # noqa: F841
 
 
+_ASYNCIO_RUN = asyncio.run
+
+
 def _run(coro):
-    if uvloop is not None:
+    if uvloop is not None and asyncio.run is _ASYNCIO_RUN:
         return uvloop.run(coro)
     return asyncio.run(coro)
 
@@ -118,6 +121,10 @@ from process.entity_address_unified import main as initiate_entity_address_unifi
 from process.entity_address_unified import process_data as process_entity_address_unified_data
 from process.entity_address_unified import shutdown as entity_address_unified_shutdown
 from process.entity_address_unified import startup as entity_address_unified_startup
+from process.ptg_address import main as initiate_ptg_address
+from process.ptg_address import process_data as process_ptg_address_data
+from process.ptg_address import shutdown as ptg_address_shutdown
+from process.ptg_address import startup as ptg_address_startup
 from process.address_archive_migration import main as initiate_address_archive_migration
 from process.address_archive_migration import process_data as process_address_archive_migration_data
 from process.redis_config import build_redis_settings
@@ -685,6 +692,32 @@ class EntityAddressUnified_finish:  # pylint: disable=invalid-name
     job_deserializer = deserialize_job
 
 
+class PTGAddress:
+    functions = [process_ptg_address_data, control_single_job_start]
+    on_startup = ptg_address_startup
+    on_shutdown = ptg_address_shutdown
+    max_jobs = 1
+    queue_read_limit = 2
+    queue_name = "arq:PTGAddress"
+    job_timeout = 14400
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
+class PTGAddress_finish:  # pylint: disable=invalid-name
+    functions = [ptg_address_shutdown]
+    on_startup = db_startup
+    max_jobs = 1
+    queue_read_limit = 2
+    queue_name = "arq:PTGAddress_finish"
+    job_timeout = 1800
+    burst = True
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
 class AddressArchive:
     functions = [process_address_archive_migration_data, control_single_job_start]
     on_startup = db_startup
@@ -1032,6 +1065,12 @@ def entity_address_unified(test: bool):
     _run(initiate_entity_address_unified(test_mode=test))
 
 
+@click.command(help="Run fast PTG provider-location address projection")
+@click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
+def ptg_address(test: bool):
+    _run(initiate_ptg_address(test_mode=test))
+
+
 @click.command(help="Run one-time legacy address archive to canonical v2 migration")
 @click.option("--dry-run", is_flag=True, help="Compute counts and verification queries without writing.")
 @click.option("--legacy-table", default="address_archive", show_default=True, help="Legacy archive table name.")
@@ -1183,6 +1222,7 @@ process_group.add_command(cms_doctors, name="cms-doctors")
 process_group.add_command(facility_anchors, name="facility-anchors")
 process_group.add_command(pharmacy_economics, name="pharmacy-economics")
 process_group.add_command(entity_address_unified, name="entity-address-unified")
+process_group.add_command(ptg_address, name="ptg-address")
 process_group.add_command(address_archive_v2_migrate, name="address-archive-v2-migrate")
 process_group.add_command(geo_lookup, name="geo")
 process_group.add_command(geo_census_lookup, name="geo-census")

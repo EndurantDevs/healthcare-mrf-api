@@ -18,6 +18,7 @@ from process.ext.address_pub28 import (
 
 address_canon = importlib.import_module("process.ext.address_canon")
 entity_address_unified = importlib.import_module("process.entity_address_unified")
+ptg_address = importlib.import_module("process.ptg_address")
 utils = importlib.import_module("process.ext.utils")
 FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures"
 
@@ -215,6 +216,13 @@ def test_pub28_state_possession_and_military_codes_are_used():
     assert address_canon.state_code("Northern Mariana Islands") == "MP"
     assert address_canon.state_code("Armed Forces Pacific") == "AP"
     assert address_canon.state_code("Federated States of Micronesia") == "FM"
+    assert address_canon.state_code("calif") is None
+
+
+def test_zip5_norm_left_pads_short_us_zips():
+    assert address_canon.zip5_norm("2138") == "02138"
+    assert address_canon.zip5_norm("501") == "00501"
+    assert address_canon.zip5_norm("38") is None
 
 
 def test_foundation_migration_qualifies_postgis_probe():
@@ -237,6 +245,17 @@ def test_city_zip_precision_does_not_merge_with_street_precision():
     assert street == "v1|1mainst||austin|TX|78701|US|street"
     assert city_zip == "v1|||austin|TX|78701|US|city_zip"
     assert address_canon.key_from_identity(street) != address_canon.key_from_identity(city_zip)
+
+
+def test_city_zip_precision_preserves_unit_like_lockbox_values():
+    dept_1234 = address_canon.identity_key_v1("DEPARTMENT 1234", "", "Knoxville", "TN", "37995", "US")
+    dept_5678 = address_canon.identity_key_v1("DEPARTMENT 5678", "", "Knoxville", "TN", "37995", "US")
+
+    assert address_canon.street_norm("DEPARTMENT 1234", "") is None
+    assert address_canon.unit_norm("DEPARTMENT 1234", "") == "dept1234"
+    assert dept_1234 == "v1||dept1234|knoxville|TN|37995|US|city_zip"
+    assert dept_5678 == "v1||dept5678|knoxville|TN|37995|US|city_zip"
+    assert address_canon.key_from_identity(dept_1234) != address_canon.key_from_identity(dept_5678)
 
 
 def test_unkeyable_rows_return_none():
@@ -585,8 +604,69 @@ def test_entity_address_unified_mrf_source_borrows_arrays_from_primary_npi_addre
     assert "COALESCE(a.taxonomy_array" not in mrf_source
 
 
+def test_entity_address_unified_registers_ptg_address_overlay_source():
+    selects = entity_address_unified._source_selects(
+        "mrf",
+        {
+            "ptg_address": True,
+            "npi": True,
+            "npi_address": True,
+            "address_archive_v2": True,
+        },
+    )
+
+    ptg_source = next(s for s in selects if "'ptg'::varchar AS address_source" in s)
+    assert "FROM mrf.ptg_address AS p" in ptg_source
+    assert "LEFT JOIN mrf.address_archive_v2 AS aa ON aa.address_key = p.address_key" in ptg_source
+    assert "FROM mrf.npi_address AS pa WHERE pa.npi = p.npi AND pa.type = 'primary'" in ptg_source
+    assert "('ptg:' || p.source_key || ':' || p.snapshot_id || ':' || p.location_key)" in ptg_source
+
+
+def test_entity_address_unified_can_range_shard_large_source_selects():
+    selects = entity_address_unified._source_selects(
+        "mrf",
+        {
+            "npi_address": True,
+            "mrf_address": True,
+            "doctor_clinician_address": True,
+            "provider_enrollment_ffs": True,
+            "provider_enrollment_ffs_address": True,
+            "npi": False,
+            "geo_zip_lookup": False,
+        },
+    )
+
+    sharded = entity_address_unified._shard_source_selects(
+        "mrf",
+        selects,
+        npi_address_ranges=[(100, 200), (200, 300)],
+        mrf_address_ranges=[(300, 400), (400, 500)],
+        doctor_clinician_address_ranges=[(500, 600), (600, 700)],
+        provider_enrollment_ffs_ranges=[(700, 800), (800, 900)],
+    )
+
+    assert len(sharded) == 10
+    assert any("FROM mrf.npi_address AS a" in sql and "AND a.npi >= 100" in sql for sql in sharded)
+    assert any("FROM mrf.npi_address AS a" in sql and "AND a.npi < 300" in sql for sql in sharded)
+    assert any("FROM mrf.mrf_address AS a" in sql and "AND a.npi >= 300" in sql for sql in sharded)
+    assert any("FROM mrf.mrf_address AS a" in sql and "AND a.npi < 500" in sql for sql in sharded)
+    assert any("FROM mrf.doctor_clinician_address AS d" in sql and "AND d.npi >= 500" in sql for sql in sharded)
+    assert any("FROM mrf.doctor_clinician_address AS d" in sql and "AND d.npi < 700" in sql for sql in sharded)
+    assert any("FROM mrf.provider_enrollment_ffs AS f" in sql and "AND f.npi >= 700" in sql for sql in sharded)
+    assert any("FROM mrf.provider_enrollment_ffs AS f" in sql and "AND f.npi < 900" in sql for sql in sharded)
+    assert any("FROM mrf.provider_enrollment_ffs_address AS fa" in sql and "AND f.npi >= 700" in sql for sql in sharded)
+    assert any("FROM mrf.provider_enrollment_ffs_address AS fa" in sql and "AND f.npi < 900" in sql for sql in sharded)
+
+
+def test_entity_address_unified_integer_ranges_are_half_open():
+    assert entity_address_unified._integer_ranges(10, 19, 3) == [(10, 14), (14, 18), (18, 20)]
+    assert entity_address_unified._integer_ranges(None, 19, 3) == []
+    assert entity_address_unified._integer_ranges(20, 19, 3) == []
+
+
 def test_entity_address_unified_sql_carries_address_key(monkeypatch):
     raw_sql = entity_address_unified._prepare_raw_stage_sql("mrf", "entity_address_unified_raw")
+    enrich_sql = entity_address_unified._enrich_raw_stage_sql("mrf", "entity_address_unified_raw")
     insert_sql = entity_address_unified._insert_raw_from_source_sql(
         "mrf",
         "entity_address_unified_raw",
@@ -613,8 +693,17 @@ def test_entity_address_unified_sql_carries_address_key(monkeypatch):
     )
 
     assert "address_key uuid" in raw_sql
+    assert "location_key varchar(64)" in raw_sql
+    assert "archive_identity_version varchar(16)" in raw_sql
+    assert "ptg_plan_array varchar[]" in raw_sql
+    assert "JOIN mrf.address_archive_v2 a" in enrich_sql
+    assert "SET premise_key = k.premise_key" in enrich_sql
+    assert "location_key = encode(sha256(convert_to" in enrich_sql
     assert "mrf.addr_key_v1(first_line, second_line, city_name, state_name, postal_code, country_code) AS address_key" in insert_sql
     assert "address_key," in materialize_sql
+    assert "location_key," in materialize_sql
+    assert "archive_identity_version," in materialize_sql
+    assert "confidence_score," in materialize_sql
 
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_KEY_V2", "1")
     flagged_sql = entity_address_unified._materialize_from_raw_sql(
@@ -623,6 +712,159 @@ def test_entity_address_unified_sql_carries_address_key(monkeypatch):
         "entity_address_unified_raw",
     )
     assert "GROUP BY entity_type, entity_id, type, COALESCE(address_key::text, checksum::text)" in flagged_sql
+    sharded_sql = entity_address_unified._materialize_from_raw_sql(
+        "mrf",
+        "entity_address_unified_stage",
+        "entity_address_unified_raw",
+        checksum_modulo=24,
+        checksum_remainder=7,
+    )
+    assert "hashtext(COALESCE(address_key::text, checksum::text))" in sharded_sql
+    assert "% 24 + 24) % 24) = 7" in sharded_sql
+
+
+def test_entity_address_unified_raw_enrichment_can_skip_archive():
+    enrich_sql = entity_address_unified._enrich_raw_stage_sql(
+        "mrf",
+        "entity_address_unified_raw",
+        archive_available=False,
+    )
+
+    assert "JOIN mrf.address_archive_v2" not in enrich_sql
+    assert "'v1'::varchar AS archive_identity_version" in enrich_sql
+    assert "CASE WHEN r.address_key IS NULL THEN 'unknown' ELSE 'street' END" in enrich_sql
+
+
+def test_entity_address_unified_raw_enrichment_can_shard_by_checksum():
+    enrich_sql = entity_address_unified._enrich_raw_stage_sql(
+        "mrf",
+        "entity_address_unified_raw",
+        checksum_min=-100,
+        checksum_max=100,
+    )
+
+    assert "WHERE r.checksum >= -100 AND r.checksum < 100" in enrich_sql
+
+
+def test_entity_address_unified_evidence_stage_updates_by_location_key():
+    evidence_table = entity_address_unified._evidence_stage_table_name("entity_address_unified_stage")
+    prepare_sql = entity_address_unified._prepare_multi_source_evidence_table_sql(
+        "mrf",
+        evidence_table,
+        unlogged=False,
+    )
+    insert_sql = entity_address_unified._insert_multi_source_evidence_shard_sql(
+        "mrf",
+        "entity_address_unified_stage",
+        evidence_table,
+        evidence_shards=32,
+        evidence_shard=7,
+    )
+    index_sql = entity_address_unified._index_multi_source_evidence_table_sql(
+        "mrf",
+        evidence_table,
+    )
+    apply_sql = entity_address_unified._apply_multi_source_evidence_sql(
+        "mrf",
+        "entity_address_unified_stage",
+        evidence_table,
+        evidence_shard=7,
+    )
+
+    assert f"CREATE TABLE mrf.{evidence_table}" in prepare_sql
+    assert "location_key varchar(64) PRIMARY KEY" in prepare_sql
+    assert f"INSERT INTO mrf.{evidence_table}" in insert_sql
+    assert "keyed AS MATERIALIZED" in insert_sql
+    assert "location_key," in insert_sql
+    assert "% 32" in insert_sql
+    assert "= 7" in insert_sql
+    assert "ARRAY_AGG(DISTINCT src.src ORDER BY src.src)" in insert_sql
+    assert "ARRAY_AGG(DISTINCT rid.rid ORDER BY rid.rid)" in insert_sql
+    assert "JOIN mrf.entity_address_unified_stage AS t" in insert_sql
+    assert "ON t.location_key = k.location_key" in insert_sql
+    assert "CREATE INDEX IF NOT EXISTS" in index_sql
+    assert f"ON mrf.{evidence_table} (evidence_shard, location_key)" in index_sql
+    assert f"FROM mrf.{evidence_table} AS e" in apply_sql
+    assert "e.evidence_shard = 7" in apply_sql
+    assert "t.location_key = e.location_key" in apply_sql
+    assert "t.checksum =" not in apply_sql
+    assert "IS DISTINCT FROM e.evidence_sources" in apply_sql
+    assert "IS DISTINCT FROM e.evidence_record_ids" in apply_sql
+    assert "source_count = COALESCE(CARDINALITY(e.evidence_sources), 0)::int" in apply_sql
+    assert "independent_source_count = COALESCE(CARDINALITY(e.evidence_sources), 0)::int" in apply_sql
+    assert "multi_source_confirmed = COALESCE(CARDINALITY(e.evidence_sources), 0) > 1" in apply_sql
+
+
+def test_entity_address_unified_builds_evidence_and_bridge_stage_sql():
+    stage_classes = entity_address_unified._support_stage_classes("20260614")
+    sql_blob = "\n".join(
+        entity_address_unified._support_stage_sql(
+            "mrf",
+            "entity_address_unified_stage",
+            stage_classes,
+            source_run_id="run_1",
+            node_id="node_a",
+            raw_table="entity_address_unified_raw",
+        )
+    )
+
+    assert "TRUNCATE TABLE mrf.entity_address_evidence_20260614" in sql_blob
+    assert "INSERT INTO mrf.entity_address_evidence_20260614" in sql_blob
+    assert "FROM mrf.entity_address_unified_raw" in sql_blob
+    assert "'run_1'::varchar AS source_run_id" in sql_blob
+    assert "'node_a'::varchar AS node_id" in sql_blob
+    assert "INSERT INTO mrf.entity_address_plan_bridge_20260614" in sql_blob
+    assert "unnest(COALESCE(t.aca_plan_array, ARRAY[]::varchar[]))" in sql_blob
+    assert "INSERT INTO mrf.entity_address_network_bridge_20260614" in sql_blob
+    assert "unnest(COALESCE(t.plans_network_array, ARRAY[]::int[]))" in sql_blob
+    assert "INSERT INTO mrf.entity_address_ptg_bridge_20260614" in sql_blob
+    assert "record_id.value LIKE 'ptg:%'" in sql_blob
+    assert "INSERT INTO mrf.entity_address_procedure_bridge_20260614" in sql_blob
+    assert "'HP_PROCEDURE_CODE'::varchar AS code_system" in sql_blob
+    assert "INSERT INTO mrf.entity_address_medication_bridge_20260614" in sql_blob
+    assert "'HP_RX_CODE'::varchar AS code_system" in sql_blob
+
+
+def test_entity_address_unified_support_stage_sql_has_stage_fallback_evidence():
+    stage_classes = entity_address_unified._support_stage_classes("20260615")
+    sql_blob = "\n".join(
+        entity_address_unified._support_stage_sql(
+            "mrf",
+            "entity_address_unified_stage",
+            stage_classes,
+            source_run_id="run_2",
+            node_id=None,
+            raw_table=None,
+        )
+    )
+
+    assert "INSERT INTO mrf.entity_address_evidence_20260615" in sql_blob
+    assert "FROM mrf.entity_address_unified_stage AS t" in sql_blob
+    assert "NULL::varchar AS node_id" in sql_blob
+    assert "'run_2'::varchar AS source_run_id" in sql_blob
+
+
+def test_ptg_address_insert_sql_uses_existing_provider_location_projection():
+    sql = ptg_address._ptg_address_insert_sql(
+        "mrf",
+        "ptg_address_stage",
+        source_key="payer_a",
+        snapshot_id="snap_1",
+        node_id=None,
+        address_canon_available=True,
+        archive_available=True,
+    )
+
+    assert "FROM mrf.ptg2_provider_location loc" in sql
+    assert "mrf.addr_key_v1(first_line, second_line, city, state, postal_code, 'US')" in sql
+    assert "AS source_zip5" in sql
+    assert "COALESCE(a.zip5, k.source_zip5) AS zip5" in sql
+    assert "LEFT JOIN mrf.address_archive_v2 a" in sql
+    assert "NULL::varchar AS node_id" in sql
+    assert "'payer_a'::varchar AS source_key" in sql
+    assert "ARRAY['payer_a']::varchar[] AS ptg_source_array" in sql
+    assert "SELECT DISTINCT ON (encode(sha256(convert_to" in sql
+    assert "encode(sha256(convert_to" in sql
 
 
 def test_entity_address_unified_sql_falls_back_without_canonical_functions():
