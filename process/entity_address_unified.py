@@ -1127,6 +1127,21 @@ def _validate_publish_row_count(
         )
 
 
+async def _invalid_coordinate_count(db_schema: str, table_name: str, *, db_client=None) -> int:
+    client = db if db_client is None else db_client
+    return int(
+        await client.scalar(
+            f"""
+            SELECT COUNT(*)
+              FROM {db_schema}.{table_name}
+             WHERE (lat IS NOT NULL AND (lat < -90 OR lat > 90))
+                OR (long IS NOT NULL AND (long < -180 OR long > 180));
+            """
+        )
+        or 0
+    )
+
+
 async def _validate_publish_integrity(
     db_schema: str,
     stage_table: str,
@@ -1202,6 +1217,11 @@ async def _validate_publish_integrity(
         failures.append(
             f"{archive_identity_mismatch_rows} staged rows use a non-current archive_identity_version"
         )
+
+    invalid_coordinate_rows = await _invalid_coordinate_count(db_schema, stage_table)
+    metrics["invalid_coordinate_rows"] = invalid_coordinate_rows
+    if invalid_coordinate_rows:
+        failures.append(f"{invalid_coordinate_rows} staged rows have invalid latitude/longitude values")
 
     bridge_orphans: dict[str, int] = {}
     for model, support_stage_cls in support_stage_classes.items():

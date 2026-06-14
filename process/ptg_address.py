@@ -19,6 +19,7 @@ from process.entity_address_unified import (
     BASE_ADDRESS_VERSION,
     _archived_identifier,
     _create_stage_indexes,
+    _invalid_coordinate_count,
     _location_key_expr,
     _normalize_import_id,
     _stage_index_name,
@@ -499,6 +500,96 @@ async def process_data(ctx, task=None):
         )
 
 
+async def _validate_publish_integrity(
+    db_schema: str,
+    stage_table: str,
+    *,
+    test_mode: bool,
+) -> dict[str, int]:
+    if test_mode:
+        return {}
+
+    failures: list[str] = []
+    metrics: dict[str, int] = {}
+
+    null_location_keys = int(
+        await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{stage_table} WHERE location_key IS NULL;")
+        or 0
+    )
+    metrics["null_location_keys"] = null_location_keys
+    if null_location_keys:
+        failures.append(f"{null_location_keys} staged rows have NULL location_key")
+
+    invalid_coordinate_rows = await _invalid_coordinate_count(db_schema, stage_table, db_client=db)
+    metrics["invalid_coordinate_rows"] = invalid_coordinate_rows
+    if invalid_coordinate_rows:
+        failures.append(f"{invalid_coordinate_rows} staged rows have invalid latitude/longitude values")
+
+    unresolved_merged_into_rows = 0
+    if await _table_exists(db_schema, "address_archive_v2"):
+        unresolved_merged_into_rows = int(
+            await db.scalar(
+                f"""
+                SELECT COUNT(*)
+                  FROM {db_schema}.{stage_table} AS t
+                  JOIN {db_schema}.address_archive_v2 AS a
+                    ON a.address_key = t.address_key
+                 WHERE t.address_key IS NOT NULL
+                   AND a.merged_into IS NOT NULL;
+                """
+            )
+            or 0
+        )
+    metrics["unresolved_merged_into_rows"] = unresolved_merged_into_rows
+    if unresolved_merged_into_rows:
+        failures.append(
+            f"{unresolved_merged_into_rows} staged rows point to address_archive_v2.merged_into redirects"
+        )
+
+    archive_identity_mismatch_rows = int(
+        await db.scalar(
+            f"""
+            SELECT COUNT(*)
+              FROM {db_schema}.{stage_table}
+             WHERE COALESCE(archive_identity_version, '') <> '{ARCHIVE_IDENTITY_VERSION}';
+            """
+        )
+        or 0
+    )
+    metrics["archive_identity_mismatch_rows"] = archive_identity_mismatch_rows
+    if archive_identity_mismatch_rows:
+        failures.append(
+            f"{archive_identity_mismatch_rows} staged rows use a non-current archive_identity_version"
+        )
+
+    base_archive_identity_mismatch_rows = 0
+    if await _table_exists(db_schema, "entity_address_unified"):
+        base_archive_identity_mismatch_rows = int(
+            await db.scalar(
+                f"""
+                SELECT COUNT(*)
+                  FROM {db_schema}.{stage_table} AS t
+                 WHERE t.archive_identity_version IS NOT NULL
+                   AND NOT EXISTS (
+                         SELECT 1
+                           FROM {db_schema}.entity_address_unified AS e
+                          WHERE e.archive_identity_version = t.archive_identity_version
+                     );
+                """
+            )
+            or 0
+        )
+    metrics["base_archive_identity_mismatch_rows"] = base_archive_identity_mismatch_rows
+    if base_archive_identity_mismatch_rows:
+        failures.append(
+            f"{base_archive_identity_mismatch_rows} staged rows use an archive_identity_version absent from entity_address_unified"
+        )
+
+    if failures:
+        raise RuntimeError("PTGAddress publish integrity validation failed: " + "; ".join(failures))
+    return metrics
+
+
 async def startup(ctx):
     await my_init_db(db)
     ctx["context"] = {
@@ -524,6 +615,12 @@ async def shutdown(ctx):
     min_rows = 0 if context.get("test_mode") else int(os.getenv("HLTHPRT_PTG_ADDRESS_MIN_ROWS", str(DEFAULT_MIN_ROWS)))
     if stage_rows < min_rows:
         raise RuntimeError(f"PTGAddress stage row count {stage_rows} below minimum {min_rows}; aborting publish.")
+    publish_validation = await _validate_publish_integrity(
+        db_schema,
+        stage_cls.__tablename__,
+        test_mode=bool(context.get("test_mode")),
+    )
+    context["publish_validation"] = publish_validation
 
     async with db.transaction():
         table = PTGAddress.__main_table__
@@ -560,7 +657,10 @@ async def shutdown(ctx):
             "message": "succeeded",
             "phase": "ptg-address published",
         },
-        metrics={"rows": stage_rows},
+        metrics={
+            "rows": stage_rows,
+            "publish_validation": context.get("publish_validation") or {},
+        },
     )
     print_time_info(context.get("start"))
 
