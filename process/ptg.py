@@ -1,10 +1,13 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 # pylint: disable=broad-exception-caught,too-many-branches,too-many-locals,too-many-statements,too-many-lines
 
+import asyncio
+import concurrent.futures
 import datetime
 import hashlib
 import json
 import logging
+import multiprocessing
 import os
 import subprocess
 import tempfile
@@ -15,498 +18,298 @@ from pathlib import Path
 from typing import Any
 
 import ijson
-import asyncio
-import concurrent.futures
-import multiprocessing
 
 from db.connection import db
-from db.models import (
-    ImportLog,
-    PTGAllowedItem,
-    PTGAllowedPayment,
-    PTGAllowedProviderPayment,
-    PTGBillingCode,
-    PTG2CurrentPlanSource,
-    PTG2CurrentSnapshot,
-    PTG2CurrentSourceSnapshot,
-    PTG2FactChunk,
-    PTG2GCCandidate,
-    PTG2ImportJob,
-    PTG2ImportRun,
-    PTG2LocationSet,
-    PTG2LocationSetMember,
-    PTG2Plan,
-    PTG2PlanAlias,
-    PTG2PlanMonth,
-    PTG2PlanRateSet,
-    PTG2PriceCodeSet,
-    PTG2PriceSet,
-    PTG2PriceSetEntry,
-    PTG2ProviderEntryComponent,
-    PTG2ProviderSetEntry,
-    PTG2ProviderSetMember,
-    PTG2RateSet,
-    PTG2RateSetContext,
-    PTG2RelatedCodeSet,
-    PTG2ServingRate,
-    PTG2ServingRateCompact,
-    PTG2Snapshot,
-    PTG2SourceCatalog,
-    PTG2SourceTrace,
-    PTG2SourceTraceSet,
-    PTGFile,
-    PTGInNetworkItem,
-    PTGNegotiatedPrice,
-    PTGNegotiatedRate,
-    PTGProviderGroup,
-)
-from process.ext.utils import (
-    ensure_database,
-    flush_error_log,
-    get_import_schema,
-    log_error,
-    make_class,
-    push_objects,
-    return_checksum,
-)
-from process.ptg_parts.artifacts import (
-    PTG2ArtifactStore,
-    _hash_existing_file_into,
-    _load_completed_ranges,
-    _range_sidecar_path,
-    _safe_url_suffix,
-    _write_completed_ranges,
-    choose_reusable_raw_artifact,
-    content_addressed_path,
-    ptg2_temp_parent,
-    resolve_ptg2_artifact_dir,
-    sha256_file,
-)
-from process.ptg_parts.artifact_streams import (
-    load_json_artifact,
-    logical_artifact_identity,
-    open_json_artifact_stream,
-    stream_logical_artifact,
-)
-from process.ptg_parts.allowed_amounts import (
-    _parse_allowed_amounts,
-    _process_allowed_amounts_file,
-)
+from db.models import (ImportLog, PTG2CurrentPlanSource, PTG2CurrentSnapshot,
+                       PTG2CurrentSourceSnapshot, PTG2FactChunk,
+                       PTG2GCCandidate, PTG2ImportJob, PTG2ImportRun,
+                       PTG2LocationSet, PTG2LocationSetMember, PTG2Plan,
+                       PTG2PlanAlias, PTG2PlanMonth, PTG2PlanRateSet,
+                       PTG2PriceCodeSet, PTG2PriceSet, PTG2PriceSetEntry,
+                       PTG2ProviderEntryComponent, PTG2ProviderSetEntry,
+                       PTG2ProviderSetMember, PTG2RateSet, PTG2RateSetContext,
+                       PTG2RelatedCodeSet, PTG2ServingRate,
+                       PTG2ServingRateCompact, PTG2Snapshot, PTG2SourceCatalog,
+                       PTG2SourceTrace, PTG2SourceTraceSet, PTGAllowedItem,
+                       PTGAllowedPayment, PTGAllowedProviderPayment,
+                       PTGBillingCode, PTGFile, PTGInNetworkItem,
+                       PTGNegotiatedPrice, PTGNegotiatedRate, PTGProviderGroup)
+from process.ext.utils import (ensure_database, flush_error_log,
+                               get_import_schema, log_error, make_class,
+                               push_objects, return_checksum)
+from process.ptg_parts.allowed_amounts import (_parse_allowed_amounts,
+                                               _process_allowed_amounts_file)
+from process.ptg_parts.artifact_streams import (load_json_artifact,
+                                                logical_artifact_identity,
+                                                open_json_artifact_stream,
+                                                stream_logical_artifact)
+from process.ptg_parts.artifacts import (PTG2ArtifactStore,
+                                         _hash_existing_file_into,
+                                         _load_completed_ranges,
+                                         _range_sidecar_path, _safe_url_suffix,
+                                         _write_completed_ranges,
+                                         choose_reusable_raw_artifact,
+                                         content_addressed_path,
+                                         ptg2_temp_parent,
+                                         resolve_ptg2_artifact_dir,
+                                         sha256_file)
+from process.ptg_parts.canonical import (_canonical_key, _canonical_sort_key,
+                                         _canonicalize_for_json,
+                                         canonical_json_dumps,
+                                         canonicalize_url, hash_prefix,
+                                         normalize_date,
+                                         normalize_import_month,
+                                         normalize_money,
+                                         normalize_tic_source_url,
+                                         semantic_hash, sha256_bytes)
+from process.ptg_parts.compact_bulk import (_flush_in_network_rows,
+                                            prepare_ptg2_compact_bulk_load)
 from process.ptg_parts.compact_indexes import (
-    _PTG2_COMPACT_MODEL_BY_KIND,
-    _index_snapshot_compact_table_entries,
-    _index_snapshot_compact_tables,
-    _ptg2_compact_dictionary_index_mode,
+    _PTG2_COMPACT_MODEL_BY_KIND, _index_snapshot_compact_table_entries,
+    _index_snapshot_compact_tables, _ptg2_compact_dictionary_index_mode,
     _ptg2_compact_serving_index_mode,
-    _ptg2_compact_serving_reported_index_statement,
-    _ptg2_index_timestamp,
-    _ptg2_model_index_statements_for_table,
-    _ptg2_model_snapshot_index_role,
-    _run_ptg2_index_statement,
-)
-from process.ptg_parts.compact_state import (
-    _compact_add_unique,
-    _compact_state,
-    _compact_streaming_dedupe_tables,
-    _ptg2_price_atom_payload,
-    _ptg2_source_trace_payload,
-)
-from process.ptg_parts.compact_bulk import (
-    _flush_in_network_rows,
-    prepare_ptg2_compact_bulk_load,
-)
-from process.ptg_parts.compact_writes import (
-    _drain_compact_writes,
-    _existing_price_set_hashes,
-    _flush_compact_rate_pack_groups,
-    _flush_compact_rows,
-    _schedule_compact_write,
-)
-from process.ptg_parts.canonical import (
-    _canonical_key,
-    _canonical_sort_key,
-    _canonicalize_for_json,
-    canonical_json_dumps,
-    canonicalize_url,
-    hash_prefix,
-    normalize_date,
-    normalize_import_month,
-    normalize_money,
-    normalize_tic_source_url,
-    semantic_hash,
-    sha256_bytes,
-)
+    _ptg2_compact_serving_reported_index_statement, _ptg2_index_timestamp,
+    _ptg2_model_index_statements_for_table, _ptg2_model_snapshot_index_role,
+    _run_ptg2_index_statement)
+from process.ptg_parts.compact_state import (_compact_add_unique,
+                                             _compact_state,
+                                             _compact_streaming_dedupe_tables,
+                                             _ptg2_price_atom_payload,
+                                             _ptg2_source_trace_payload)
+from process.ptg_parts.compact_writes import (_drain_compact_writes,
+                                              _existing_price_set_hashes,
+                                              _flush_compact_rate_pack_groups,
+                                              _flush_compact_rows,
+                                              _schedule_compact_write)
 from process.ptg_parts.config import (
-    PTG2_ASYNC_WRITE_TASKS_ENV,
-    PTG2_BILLING_BATCH_ROWS_ENV,
-    PTG2_COMPACT_BATCH_ROWS_ENV,
-    PTG2_COMPACT_BULK_DROP_INDEXES_ENV,
-    PTG2_COMPACT_COPY_KIND_TASKS_ENV,
-    PTG2_COMPACT_COPY_TASKS_ENV,
-    PTG2_COMPACT_IMPORT_ENV,
-    PTG2_COMPACT_SERVING_COPY_TASKS_ENV,
-    PTG2_COMPACT_SERVING_TABLE_ENV,
-    PTG2_COPY_UPSERT_ROWS_ENV,
-    PTG2_DEDUPE_SERVING_STAGE_MERGE_ENV,
-    PTG2_DEFAULT_COMPACT_COPY_KIND_TASKS,
-    PTG2_DEFAULT_COMPACT_COPY_TASKS,
-    PTG2_DEFAULT_COMPACT_SERVING_COPY_TASKS,
-    PTG2_DEFAULT_DOWNLOAD_TASKS,
-    PTG2_DEFAULT_RANGE_DOWNLOAD_CHUNK_BYTES,
-    PTG2_DEFAULT_RANGE_DOWNLOAD_MIN_BYTES,
-    PTG2_DEFAULT_RANGE_DOWNLOAD_TASKS,
-    PTG2_DEFAULT_RUST_WORKERS,
-    PTG2_DEFER_PROVIDER_LOCATIONS_ENV,
-    PTG2_DIRECT_COPY_SERVING_RATE_ENV,
-    PTG2_DOWNLOAD_PROGRESS_BYTES_ENV,
-    PTG2_DOWNLOAD_RETRIES_ENV,
-    PTG2_DOWNLOAD_RETRY_DELAY_SECONDS_ENV,
-    PTG2_DOWNLOAD_TASKS_ENV,
-    PTG2_EXPECTED_IN_NETWORK_ITEMS_ENV,
-    PTG2_FAST_FINAL_REBUILD_ENV,
-    PTG2_FAST_OBJECT_ITERATOR_ENV,
-    PTG2_FAST_PROVIDER_AGGREGATION_ENV,
-    PTG2_FAST_PROVIDER_UNION_ENV,
-    PTG2_HASH_MODE_ENV,
-    PTG2_ITEM_BATCH_ROWS_ENV,
-    PTG2_JSON_DECODER_ITERATOR_ENV,
-    PTG2_KEEP_PARTIAL_ENV,
-    PTG2_MANIFEST_PRECOPY_MERGE_ENV,
-    PTG2_KEEP_PRICE_SET_STAGE_ENV,
-    PTG2_KEEP_SERVING_RATE_STAGE_ENV,
-    PTG2_PRICE_BATCH_ROWS_ENV,
-    PTG2_PROGRESS_INTERVAL_SECONDS_ENV,
-    PTG2_PROVIDER_BUCKET_COUNT_ENV,
-    PTG2_PROVIDER_CACHE_BACKEND_ENV,
-    PTG2_PROVIDER_CACHE_MEMORY_REFS_ENV,
-    PTG2_PROVIDER_COMBO_CACHE_REFS_ENV,
-    PTG2_PROVIDER_REF_BATCH_ROWS_ENV,
+    PTG2_ASYNC_WRITE_TASKS_ENV, PTG2_BILLING_BATCH_ROWS_ENV,
+    PTG2_COMPACT_BATCH_ROWS_ENV, PTG2_COMPACT_BULK_DROP_INDEXES_ENV,
+    PTG2_COMPACT_COPY_KIND_TASKS_ENV, PTG2_COMPACT_COPY_TASKS_ENV,
+    PTG2_COMPACT_IMPORT_ENV, PTG2_COMPACT_SERVING_COPY_TASKS_ENV,
+    PTG2_COMPACT_SERVING_TABLE_ENV, PTG2_COPY_UPSERT_ROWS_ENV,
+    PTG2_DEDUPE_SERVING_STAGE_MERGE_ENV, PTG2_DEFAULT_COMPACT_COPY_KIND_TASKS,
+    PTG2_DEFAULT_COMPACT_COPY_TASKS, PTG2_DEFAULT_COMPACT_SERVING_COPY_TASKS,
+    PTG2_DEFAULT_DOWNLOAD_TASKS, PTG2_DEFAULT_RANGE_DOWNLOAD_CHUNK_BYTES,
+    PTG2_DEFAULT_RANGE_DOWNLOAD_MIN_BYTES, PTG2_DEFAULT_RANGE_DOWNLOAD_TASKS,
+    PTG2_DEFAULT_RUST_WORKERS, PTG2_DEFER_PROVIDER_LOCATIONS_ENV,
+    PTG2_DIRECT_COPY_SERVING_RATE_ENV, PTG2_DOWNLOAD_PROGRESS_BYTES_ENV,
+    PTG2_DOWNLOAD_RETRIES_ENV, PTG2_DOWNLOAD_RETRY_DELAY_SECONDS_ENV,
+    PTG2_DOWNLOAD_TASKS_ENV, PTG2_EXPECTED_IN_NETWORK_ITEMS_ENV,
+    PTG2_FAST_FINAL_REBUILD_ENV, PTG2_FAST_OBJECT_ITERATOR_ENV,
+    PTG2_FAST_PROVIDER_AGGREGATION_ENV, PTG2_FAST_PROVIDER_UNION_ENV,
+    PTG2_HASH_MODE_ENV, PTG2_ITEM_BATCH_ROWS_ENV,
+    PTG2_JSON_DECODER_ITERATOR_ENV, PTG2_KEEP_PARTIAL_ENV,
+    PTG2_KEEP_PRICE_SET_STAGE_ENV, PTG2_KEEP_SERVING_RATE_STAGE_ENV,
+    PTG2_MANIFEST_PRECOPY_MERGE_ENV, PTG2_PRICE_BATCH_ROWS_ENV,
+    PTG2_PROGRESS_INTERVAL_SECONDS_ENV, PTG2_PROVIDER_BUCKET_COUNT_ENV,
+    PTG2_PROVIDER_CACHE_BACKEND_ENV, PTG2_PROVIDER_CACHE_MEMORY_REFS_ENV,
+    PTG2_PROVIDER_COMBO_CACHE_REFS_ENV, PTG2_PROVIDER_REF_BATCH_ROWS_ENV,
     PTG2_PROVIDER_SET_INLINE_NPI_LIMIT_ENV,
-    PTG2_RANGE_DOWNLOAD_CHUNK_BYTES_ENV,
-    PTG2_RANGE_DOWNLOAD_MIN_BYTES_ENV,
-    PTG2_RANGE_DOWNLOAD_TASKS_ENV,
-    PTG2_RANGE_DOWNLOADS_ENV,
-    PTG2_RATE_BATCH_ROWS_ENV,
-    PTG2_RATE_GROUP_FLUSH_ITEMS_ENV,
-    PTG2_RAW_WORKER_OBJECTS_ENV,
-    PTG2_RUST_COMPACT_SERVING_ENV,
-    PTG2_RUST_EVENT_QUEUE_ENV,
-    PTG2_RUST_SCANNER_BIN_ENV,
-    PTG2_RUST_SCANNER_ENV,
-    PTG2_RUST_WORKERS_ENV,
-    PTG2_SERVING_ONLY_IMPORT_ENV,
-    PTG2_SERVING_WORKERS_ENV,
-    PTG2_SKIP_BULK_INDEX_ENSURE_ENV,
+    PTG2_RANGE_DOWNLOAD_CHUNK_BYTES_ENV, PTG2_RANGE_DOWNLOAD_MIN_BYTES_ENV,
+    PTG2_RANGE_DOWNLOAD_TASKS_ENV, PTG2_RANGE_DOWNLOADS_ENV,
+    PTG2_RATE_BATCH_ROWS_ENV, PTG2_RATE_GROUP_FLUSH_ITEMS_ENV,
+    PTG2_RAW_WORKER_OBJECTS_ENV, PTG2_RUST_COMPACT_SERVING_ENV,
+    PTG2_RUST_EVENT_QUEUE_ENV, PTG2_RUST_SCANNER_BIN_ENV,
+    PTG2_RUST_SCANNER_ENV, PTG2_RUST_WORKERS_ENV, PTG2_SERVING_ONLY_IMPORT_ENV,
+    PTG2_SERVING_WORKERS_ENV, PTG2_SKIP_BULK_INDEX_ENSURE_ENV,
     PTG2_SKIP_COMPACT_SERVING_INDEX_ENSURE_ENV,
-    PTG2_SKIP_EXISTING_PRICE_SETS_ENV,
-    PTG2_SLIM_SERVING_ROWS_ENV,
-    PTG2_STAGE_COPY_DEDUPE_DEFAULT_KINDS,
-    PTG2_STAGE_COPY_DEDUPE_ENV,
-    PTG2_STAGE_INDEXES_ENV,
-    PTG2_STAGE_PRICE_SETS_ENV,
-    PTG2_STAGE_SERVING_AS_FINAL_ENV,
-    PTG2_STAGE_SERVING_RATES_ENV,
-    PTG2_STREAMING_DEDUPE_ENV,
-    PTG2_UNLOGGED_FINAL_ENV,
-    PTG2_UNLOGGED_STAGE_ENV,
-    PTG2_WORKER_CHUNK_BYTES_ENV,
-    PTG2_WORKER_CHUNK_ITEMS_ENV,
-    PTG2_WORKER_MAX_PENDING_BATCHES_ENV,
-    PTG2_WORKER_MAX_PENDING_BYTES_ENV,
-    PTG2_WORKER_RESULT_FILES_ENV,
-    TEST_ALLOWED_ITEMS,
-    TEST_IN_NETWORK_ITEMS,
-    TEST_NEGOTIATED_PRICES,
-    TEST_PROVIDER_GROUPS,
-    TEST_TOC_FILES,
-    TEST_TOC_JOBS,
-    _env_bool,
-    _env_int,
-    _ptg2_stage_copy_dedupe_enabled,
-    _use_compact_serving_table,
-    _use_rust_compact_serving,
-    _use_serving_only_import,
-    _use_stage_serving_as_final,
-)
-from process.ptg_parts.copy_load import (
-    _copy_compact_serving_rate_file,
-    _copy_compact_serving_rate_rows,
-    _copy_compact_serving_rate_source,
-    _copy_ignore_ptg2_objects,
-    _copy_insert_ptg2_objects,
-    _copy_ptg2_dictionary_file,
-    _copy_stage_price_set_rows,
-    _copy_stage_serving_rate_rows,
-    _copy_upsert_ptg2_objects,
-    _json_default,
-    _primary_key_column_names,
-    _ptg2_conflict_targets,
-    _ptg2_copy_record,
-    _ptg2_json_columns,
-)
-from process.ptg_parts.domain import (
-    PTG2_ARTIFACT_RAW,
-    PTG2_CONFIDENCE_NPPES_MAILING_LOCATION,
-    PTG2_CONFIDENCE_NPPES_PRACTICE_LOCATION,
-    PTG2_CONFIDENCE_PAYER_DIRECTORY,
-    PTG2_CONFIDENCE_TIC_RATE_NPI_TIN,
-    PTG2_DOMAIN_ALLOWED_AMOUNT,
-    PTG2_DOMAIN_DRUG,
-    PTG2_DOMAIN_IN_NETWORK,
-    PTG2_MODE_EXACT_SOURCE,
-    PTG2_MODE_PRODUCT_SEARCH,
-    PTG2_STATUS_BUILDING,
-    PTG2_STATUS_DEAD_LETTER,
-    PTG2_STATUS_FAILED,
-    PTG2_STATUS_PENDING,
-    PTG2_STATUS_PUBLISHED,
-    PTG2_STATUS_RUNNING,
-    PTG2_STATUS_VALIDATED,
-    PTG2ConfidenceEnum,
-    PTG2ContentIdentityValue,
-    PTG2ContractEvent,
-    PTG2DownloadedJob,
-    PTG2FileProcessResult,
-    PTG2HeadMetadata,
-    PTG2LogicalArtifact,
-    PTG2PriceAtomEvent,
-    PTG2PriceSetValue,
-    PTG2ProcedureEvent,
-    PTG2ProviderGroupEvent,
-    PTG2ProviderSetValue,
-    PTG2RatePackValue,
-    PTG2RawArtifact,
-    PTG2SourceCatalogEntry,
-    PTG2SourceTraceSetValue,
-    PTG2SourceVersion,
-    normalize_ptg2_search_mode,
-    ptg2_confidence_statement,
-)
-from process.ptg_parts.db_tables import (
-    _estimated_table_rows,
-    _exact_table_rows,
-    _quote_ident,
-    _table_exists,
-    _table_has_rows,
-)
+    PTG2_SKIP_EXISTING_PRICE_SETS_ENV, PTG2_SLIM_SERVING_ROWS_ENV,
+    PTG2_STAGE_COPY_DEDUPE_DEFAULT_KINDS, PTG2_STAGE_COPY_DEDUPE_ENV,
+    PTG2_STAGE_INDEXES_ENV, PTG2_STAGE_PRICE_SETS_ENV,
+    PTG2_STAGE_SERVING_AS_FINAL_ENV, PTG2_STAGE_SERVING_RATES_ENV,
+    PTG2_STREAMING_DEDUPE_ENV, PTG2_UNLOGGED_FINAL_ENV,
+    PTG2_UNLOGGED_STAGE_ENV, PTG2_WORKER_CHUNK_BYTES_ENV,
+    PTG2_WORKER_CHUNK_ITEMS_ENV, PTG2_WORKER_MAX_PENDING_BATCHES_ENV,
+    PTG2_WORKER_MAX_PENDING_BYTES_ENV, PTG2_WORKER_RESULT_FILES_ENV,
+    TEST_ALLOWED_ITEMS, TEST_IN_NETWORK_ITEMS, TEST_NEGOTIATED_PRICES,
+    TEST_PROVIDER_GROUPS, TEST_TOC_FILES, TEST_TOC_JOBS, _env_bool, _env_int,
+    _ptg2_stage_copy_dedupe_enabled, _use_compact_serving_table,
+    _use_rust_compact_serving, _use_serving_only_import,
+    _use_stage_serving_as_final)
+from process.ptg_parts.copy_load import (_copy_compact_serving_rate_file,
+                                         _copy_compact_serving_rate_rows,
+                                         _copy_compact_serving_rate_source,
+                                         _copy_ignore_ptg2_objects,
+                                         _copy_insert_ptg2_objects,
+                                         _copy_ptg2_dictionary_file,
+                                         _copy_stage_price_set_rows,
+                                         _copy_stage_serving_rate_rows,
+                                         _copy_upsert_ptg2_objects,
+                                         _json_default,
+                                         _primary_key_column_names,
+                                         _ptg2_conflict_targets,
+                                         _ptg2_copy_record, _ptg2_json_columns)
+from process.ptg_parts.db_tables import (_estimated_table_rows,
+                                         _exact_table_rows, _quote_ident,
+                                         _table_exists, _table_has_rows)
+from process.ptg_parts.domain import (PTG2_ARTIFACT_RAW,
+                                      PTG2_CONFIDENCE_NPPES_MAILING_LOCATION,
+                                      PTG2_CONFIDENCE_NPPES_PRACTICE_LOCATION,
+                                      PTG2_CONFIDENCE_PAYER_DIRECTORY,
+                                      PTG2_CONFIDENCE_TIC_RATE_NPI_TIN,
+                                      PTG2_DOMAIN_ALLOWED_AMOUNT,
+                                      PTG2_DOMAIN_DRUG, PTG2_DOMAIN_IN_NETWORK,
+                                      PTG2_MODE_EXACT_SOURCE,
+                                      PTG2_MODE_PRODUCT_SEARCH,
+                                      PTG2_STATUS_BUILDING,
+                                      PTG2_STATUS_DEAD_LETTER,
+                                      PTG2_STATUS_FAILED, PTG2_STATUS_PENDING,
+                                      PTG2_STATUS_PUBLISHED,
+                                      PTG2_STATUS_RUNNING,
+                                      PTG2_STATUS_VALIDATED,
+                                      PTG2ConfidenceEnum,
+                                      PTG2ContentIdentityValue,
+                                      PTG2ContractEvent, PTG2DownloadedJob,
+                                      PTG2FileProcessResult, PTG2HeadMetadata,
+                                      PTG2LogicalArtifact, PTG2PriceAtomEvent,
+                                      PTG2PriceSetValue, PTG2ProcedureEvent,
+                                      PTG2ProviderGroupEvent,
+                                      PTG2ProviderSetValue, PTG2RatePackValue,
+                                      PTG2RawArtifact, PTG2SourceCatalogEntry,
+                                      PTG2SourceTraceSetValue,
+                                      PTG2SourceVersion,
+                                      normalize_ptg2_search_mode,
+                                      ptg2_confidence_statement)
 from process.ptg_parts.import_rows import (
-    _build_provider_set_entry,
-    _combine_provider_set_entries,
-    _fast_provider_entry_from_parts,
-    _fast_provider_entry_from_provider_refs,
-    _normalize_import_id,
-    _ptg2_context_row,
-    _ptg2_plan_rows,
-    _ptg2_price_atom_row,
-    _ptg2_procedure_row,
-    _ptg2_provider_group_rows,
-    _ptg2_provider_set_row,
-    _ptg2_source_trace_rows,
-)
+    _build_provider_set_entry, _combine_provider_set_entries,
+    _fast_provider_entry_from_parts, _fast_provider_entry_from_provider_refs,
+    _normalize_import_id, _ptg2_context_row, _ptg2_plan_rows,
+    _ptg2_price_atom_row, _ptg2_procedure_row, _ptg2_provider_group_rows,
+    _ptg2_provider_set_row, _ptg2_source_trace_rows)
 from process.ptg_parts.json_streams import (
-    _iter_top_level_object_bytes,
-    _iter_top_level_objects,
-    _iter_top_level_objects_fast,
-    _iter_top_level_objects_jsondecoder,
-    _json_loads,
-)
+    _iter_top_level_object_bytes, _iter_top_level_objects,
+    _iter_top_level_objects_fast, _iter_top_level_objects_jsondecoder,
+    _json_loads)
+from process.ptg_parts.live_progress import (reset_live_progress_context,
+                                             set_live_progress_context,
+                                             write_live_progress)
+from process.ptg_parts.progress import (_artifact_progress_position,
+                                        _format_duration,
+                                        _maybe_log_artifact_progress, _utcnow)
 from process.ptg_parts.provider_cache import (
-    PTG2InMemoryProviderReferenceCache,
-    PTG2ProviderReferenceCache,
-    _normalize_provider_ref,
-    _provider_cache_get,
-    _provider_cache_hashes,
-    _provider_cache_put,
-    _provider_combo_cache_get,
-    _provider_combo_cache_key,
-    _provider_combo_cache_put,
-)
+    PTG2InMemoryProviderReferenceCache, PTG2ProviderReferenceCache,
+    _normalize_provider_ref, _provider_cache_get, _provider_cache_hashes,
+    _provider_cache_put, _provider_combo_cache_get, _provider_combo_cache_key,
+    _provider_combo_cache_put)
 from process.ptg_parts.provider_references import (
-    _load_provider_references_from_file,
-    _process_provider_reference_file,
-)
-from process.ptg_parts.progress import (
-    _artifact_progress_position,
-    _format_duration,
-    _maybe_log_artifact_progress,
-    _utcnow,
-)
-from process.ptg_parts.live_progress import (
-    reset_live_progress_context,
-    set_live_progress_context,
-    write_live_progress,
-)
-from process.ptg_parts.row_helpers import (
-    _as_int_list,
-    _as_list,
-    _coerce_date,
-    _make_checksum,
-    _normalize_code_component,
-    _normalize_tin_type,
-    _normalize_tin_value,
-    _normalized_npi_list,
-    _provider_group_hash_prefix,
-    _provider_group_identity_hash,
-)
-from process.ptg_parts.rust_scanner import (
-    _aiter_compact_serving_records_rust,
-    _iter_compact_serving_records_rust,
-    _iter_top_level_object_bytes_rust,
-    _ptg2_rust_scanner_binary,
-)
-from process.ptg_parts.rust_stage import (
-    PTG2_SERVING_STAGE_LANE_PREFIX,
-    _RUST_COPY_TABLE_SPECS,
-    _create_rust_copy_stage_tables,
-    _merge_rust_copy_stage_tables,
-    _ptg2_dictionary_select_columns,
-    _rust_copy_stage_table_name,
-    _serving_stage_lane_key,
-    _serving_stage_table_for_copy,
-    _serving_stage_tables,
-)
-from process.ptg_parts.rust_publish import (
-    _ptg2_publish_timestamp,
-    _ptg2_serving_child_table_name,
-    _publish_renamed_rust_dictionary_table,
-    _publish_rust_compact_snapshot_tables,
-    _publish_rust_serving_stage_tables,
-)
-from process.ptg_parts.screen import _emit_screen_line
+    _load_provider_references_from_file, _process_provider_reference_file)
+from process.ptg_parts.ptg2_manifest_artifacts import (
+    PTG2_MANIFEST_DENSE_MEMBERSHIP_FORMAT, PTG2_MANIFEST_MEMBERSHIP_FORMAT)
 from process.ptg_parts.ptg2_manifest_publish import (
     _copy_ptg2_manifest_price_atom_file,
     _copy_ptg2_manifest_provider_group_member_file,
     _copy_ptg2_manifest_serving_file,
     _create_ptg2_manifest_serving_stage_table,
-    _publish_ptg2_manifest_serving_snapshot,
     _ptg2_manifest_support_stage_table,
-)
-from process.ptg_parts.ptg2_manifest_artifacts import PTG2_MANIFEST_DENSE_MEMBERSHIP_FORMAT, PTG2_MANIFEST_MEMBERSHIP_FORMAT
-from process.ptg_parts.serving_rows import (
-    _provider_group_member_rows,
-    _provider_set_component_rows,
-    _ptg2_compact_serving_rate_row,
-    _ptg2_hp_procedure_code,
-    _ptg2_serving_rate_row,
-)
-from process.ptg_parts.serving_maintenance import (
-    _build_ptg2_provider_locations,
-    _copy_simple_rows,
-    _count_compact_serving_rate_rows,
-    _merge_staged_price_sets,
-    _merge_staged_serving_rates,
-)
+    _publish_ptg2_manifest_serving_snapshot)
+from process.ptg_parts.row_helpers import (_as_int_list, _as_list,
+                                           _coerce_date, _make_checksum,
+                                           _normalize_code_component,
+                                           _normalize_tin_type,
+                                           _normalize_tin_value,
+                                           _normalized_npi_list,
+                                           _provider_group_hash_prefix,
+                                           _provider_group_identity_hash)
+from process.ptg_parts.rust_publish import (
+    _ptg2_publish_timestamp, _ptg2_serving_child_table_name,
+    _publish_renamed_rust_dictionary_table,
+    _publish_rust_compact_snapshot_tables, _publish_rust_serving_stage_tables)
+from process.ptg_parts.rust_scanner import (
+    _aiter_compact_serving_records_rust, _iter_compact_serving_records_rust,
+    _iter_top_level_object_bytes_rust, _ptg2_rust_scanner_binary)
+from process.ptg_parts.rust_stage import (_RUST_COPY_TABLE_SPECS,
+                                          PTG2_SERVING_STAGE_LANE_PREFIX,
+                                          _create_rust_copy_stage_tables,
+                                          _merge_rust_copy_stage_tables,
+                                          _ptg2_dictionary_select_columns,
+                                          _rust_copy_stage_table_name,
+                                          _serving_stage_lane_key,
+                                          _serving_stage_table_for_copy,
+                                          _serving_stage_tables)
+from process.ptg_parts.screen import _emit_screen_line
 from process.ptg_parts.serving_index import (
-    _ptg2_table_available,
-    build_ptg2_compact_serving_index,
-    build_ptg2_db_serving_index,
-    build_ptg2_stage_serving_index,
-    finalize_ptg2_incremental_serving_index,
-)
+    _ptg2_table_available, build_ptg2_compact_serving_index,
+    build_ptg2_db_serving_index, build_ptg2_stage_serving_index,
+    finalize_ptg2_incremental_serving_index)
+from process.ptg_parts.serving_maintenance import (
+    _build_ptg2_provider_locations, _copy_simple_rows,
+    _count_compact_serving_rate_rows, _merge_staged_price_sets,
+    _merge_staged_serving_rates)
 from process.ptg_parts.serving_only import (
-    _iter_worker_result_rows,
-    _normalize_serving_price_payload,
-    _ptg2_worker_capacity_wait_needed,
-    _serving_only_rows_for_payload,
-    _serving_only_hash_int_sets,
-    _serving_only_hash_price_key,
-    _serving_only_hash_text,
-    _serving_only_key_list,
-    _serving_only_key_value,
-    _serving_only_merge_worker_result,
-    _serving_only_price_payload,
-    _serving_only_price_payload_and_key,
-    _serving_only_worker_process_chunk_to_files as _serving_only_worker_process_chunk_to_files_impl,
-    _worker_payload_size,
-)
-from process.ptg_parts.snapshot_tables import (
-    _normalize_source_key,
-    _ptg2_snapshot_index_name,
-    _ptg2_snapshot_table_name,
-    _ptg2_snapshot_table_token,
-)
-from process.ptg_parts.snapshot_cleanup import (
-    _cleanup_old_ptg2_source_tables,
-    _drop_ptg2_snapshot_table_names,
-    _drop_ptg2_snapshot_tables_for_manifest,
-    _snapshot_manifest_table_names,
-)
-from process.ptg_parts.source_pointers import (
-    _current_source_snapshot_id,
-    _ptg2_plan_source_key,
-    _publish_ptg2_source_pointers,
-    _source_plan_rows,
-)
+    _iter_worker_result_rows, _normalize_serving_price_payload,
+    _ptg2_worker_capacity_wait_needed, _serving_only_hash_int_sets,
+    _serving_only_hash_price_key, _serving_only_hash_text,
+    _serving_only_key_list, _serving_only_key_value,
+    _serving_only_merge_worker_result, _serving_only_price_payload,
+    _serving_only_price_payload_and_key, _serving_only_rows_for_payload)
+from process.ptg_parts.serving_only import \
+    _serving_only_worker_process_chunk_to_files as \
+    _serving_only_worker_process_chunk_to_files_impl
+from process.ptg_parts.serving_only import _worker_payload_size
+from process.ptg_parts.serving_rows import (_provider_group_member_rows,
+                                            _provider_set_component_rows,
+                                            _ptg2_compact_serving_rate_row,
+                                            _ptg2_hp_procedure_code,
+                                            _ptg2_serving_rate_row)
 from process.ptg_parts.snapshot_artifacts import (
-    _row_mapping,
-    build_ptg2_compact_snapshot_index_artifact,
-    build_ptg2_snapshot_index_artifact,
-)
+    _row_mapping, build_ptg2_compact_snapshot_index_artifact,
+    build_ptg2_snapshot_index_artifact)
+from process.ptg_parts.snapshot_cleanup import (
+    _cleanup_old_ptg2_source_tables, _drop_ptg2_snapshot_table_names,
+    _drop_ptg2_snapshot_tables_for_manifest, _snapshot_manifest_table_names)
+from process.ptg_parts.snapshot_tables import (_normalize_source_key,
+                                               _ptg2_snapshot_index_name,
+                                               _ptg2_snapshot_table_name,
+                                               _ptg2_snapshot_table_token)
+from process.ptg_parts.source_download import (PTG2_DEFAULT_MAX_BYTES,
+                                               _download_ptg_job_artifact,
+                                               _download_ptg_job_artifact_sync,
+                                               _download_raw_artifact_ranges,
+                                               _emit_download_progress,
+                                               _format_eta_seconds,
+                                               _iter_downloaded_ptg_jobs,
+                                               _probe_http_range_support,
+                                               download_raw_artifact,
+                                               fetch_head_metadata,
+                                               materialize_json_source)
+from process.ptg_parts.source_files import (_build_file_row,
+                                            _derive_plan_fields,
+                                            _extract_metadata_fields,
+                                            _maybe_unzip)
+from process.ptg_parts.source_jobs import (_dedupe_preserve, _dedupe_ptg_jobs,
+                                           _dedupe_rows_by,
+                                           _filter_jobs_by_url_contains,
+                                           _filter_reporting_plans,
+                                           _load_toc_urls_from_file,
+                                           _merge_ptg_job,
+                                           _normalize_filter_values,
+                                           _normalize_plan_payload,
+                                           _plan_identity,
+                                           _plan_matches_filters,
+                                           _ptg_job_identity,
+                                           parse_toc_catalog_entries)
+from process.ptg_parts.source_pointers import (_current_source_snapshot_id,
+                                               _ptg2_plan_source_key,
+                                               _publish_ptg2_source_pointers,
+                                               _source_plan_rows)
 from process.ptg_parts.source_versions import _record_source_version
-from process.ptg_parts.source_jobs import (
-    _dedupe_preserve,
-    _dedupe_ptg_jobs,
-    _dedupe_rows_by,
-    _filter_jobs_by_url_contains,
-    _filter_reporting_plans,
-    _load_toc_urls_from_file,
-    _merge_ptg_job,
-    _normalize_filter_values,
-    _normalize_plan_payload,
-    _plan_identity,
-    _plan_matches_filters,
-    _ptg_job_identity,
-    parse_toc_catalog_entries,
-)
-from process.ptg_parts.source_download import (
-    PTG2_DEFAULT_MAX_BYTES,
-    _download_ptg_job_artifact,
-    _download_ptg_job_artifact_sync,
-    _download_raw_artifact_ranges,
-    _emit_download_progress,
-    _format_eta_seconds,
-    _iter_downloaded_ptg_jobs,
-    _probe_http_range_support,
-    download_raw_artifact,
-    fetch_head_metadata,
-    materialize_json_source,
-)
-from process.url_security import fetch_max_bytes
-from process.ptg_parts.source_files import (
-    _build_file_row,
-    _derive_plan_fields,
-    _extract_metadata_fields,
-    _maybe_unzip,
-)
 from process.ptg_parts.table_setup import (
-    PTG2_MODEL_CLASSES,
-    _drop_ptg2_columns,
-    _ensure_indexes,
-    _ensure_ptg2_price_atom_columns,
-    _ensure_ptg2_price_set_columns,
-    _ensure_ptg2_price_set_stage_table,
-    _ensure_ptg2_provider_set_columns,
-    _ensure_ptg2_serving_rate_columns,
-    _ensure_ptg2_serving_rate_stage_table,
-    _prepare_ptg_tables,
-    ensure_ptg2_tables,
-)
-from process.ptg_parts.values import (
-    _catalog_entry_id,
-    build_fact_chunk,
-    build_price_atom,
-    build_price_set,
-    build_procedure_collection,
-    build_provider_set,
-    build_provider_set_collection,
-    build_rate_pack,
-    build_rate_pack_group,
-    build_rate_pack_procedure_group,
-    build_rate_set,
-    build_source_trace_set,
-    provider_hash_bucket,
-    ptg2_provider_bucket_count,
-)
+    PTG2_MODEL_CLASSES, _drop_ptg2_columns, _ensure_indexes,
+    _ensure_ptg2_price_atom_columns, _ensure_ptg2_price_set_columns,
+    _ensure_ptg2_price_set_stage_table, _ensure_ptg2_provider_set_columns,
+    _ensure_ptg2_serving_rate_columns, _ensure_ptg2_serving_rate_stage_table,
+    _prepare_ptg_tables, ensure_ptg2_tables)
+from process.ptg_parts.values import (_catalog_entry_id, build_fact_chunk,
+                                      build_price_atom, build_price_set,
+                                      build_procedure_collection,
+                                      build_provider_set,
+                                      build_provider_set_collection,
+                                      build_rate_pack, build_rate_pack_group,
+                                      build_rate_pack_procedure_group,
+                                      build_rate_set, build_source_trace_set,
+                                      provider_hash_bucket,
+                                      ptg2_provider_bucket_count)
+from process.url_security import fetch_max_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -631,8 +434,8 @@ def _run_ptg2_manifest_copy_merge_sync(kind: str, output_path: Path, input_paths
         payload = rest[:payload_len]
         if record_kind == b"manifest_copy_merge_summary":
             return json.loads(payload.decode("utf-8"))
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("failed to parse PTG2 manifest pre-COPY merge summary: %s", exc)
     output_rows = _ptg2_copy_file_row_count(output_path)
     input_rows = sum(_ptg2_copy_file_row_count(path) for path in existing_paths)
     return {
@@ -1030,7 +833,7 @@ async def _parse_in_network_items(
                 in_item.get("billing_code"),
                 in_item.get("negotiation_arrangement"),
                 in_item.get("name"),
-            )
+                )
             item_rows.append(
                 {
                     "item_hash": item_hash,
@@ -1049,7 +852,7 @@ async def _parse_in_network_items(
                     "issuer_name": plan_fields.get("issuer_name"),
                     "plan_sponsor_name": plan_fields.get("plan_sponsor_name"),
                 }
-            )
+                )
             for code in in_item.get("bundled_codes", []):
                 billing_rows.append(
                     {
@@ -1331,7 +1134,7 @@ async def _parse_in_network_file_single_pass(
                         "issuer_name": plan_fields.get("issuer_name"),
                         "plan_sponsor_name": plan_fields.get("plan_sponsor_name"),
                     }
-            )
+                )
             for code in payload.get("bundled_codes", []):
                 code_hash = _make_checksum(item_hash, "bundle", code.get("billing_code"))
                 if code_hash in billing_hash_seen:

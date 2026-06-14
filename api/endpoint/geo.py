@@ -1,5 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+import logging
 import os
 from datetime import datetime
 
@@ -10,14 +11,8 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import ProgrammingError
 
 from api.endpoint.pagination import parse_pagination
-from db.models import (
-    EntityAddressUnified,
-    GeoZipCensusProfile,
-    GeoZipLookup,
-    NPIAddress,
-    PricingPlacesZcta,
-    PricingSviZcta,
-)
+from db.models import (EntityAddressUnified, GeoZipCensusProfile, GeoZipLookup,
+                       NPIAddress, PricingPlacesZcta, PricingSviZcta)
 from db.tiger_models import Zip_zcta5, ZipState
 
 
@@ -34,6 +29,7 @@ svi_zcta_table = PricingSviZcta.__table__
 zip_state_table = ZipState.__table__
 zip_zcta5_table = Zip_zcta5.__table__
 blueprint = Blueprint('geo', url_prefix='/geo', version=1)
+logger = logging.getLogger(__name__)
 
 ADDRESS_SERVING_SOURCE_ENV = "HLTHPRT_ADDRESS_SERVING_SOURCE"
 ADDRESS_SERVING_SOURCE_UNIFIED = "entity_address_unified"
@@ -185,8 +181,8 @@ def _log_geo_warning(request, message, *args):
 async def _rollback_session(session):
     try:
         await session.rollback()
-    except Exception:  # pragma: no cover - defensive
-        pass
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("failed to rollback geo session after optional schema error: %s", exc)
 
 
 async def _lookup_svi_profile(session, zip_code):

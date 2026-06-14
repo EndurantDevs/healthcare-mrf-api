@@ -291,8 +291,8 @@ async def _resolve_state_year(
                     return year
                 if resp.status in (404, 403):
                     continue
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("LODES HEAD probe failed for %s: %s", url, exc)
 
         try:
             async with client.get(
