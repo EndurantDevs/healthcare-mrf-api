@@ -54,6 +54,12 @@ def test_site_intelligence_pharmacy_geo_stmt_uses_legacy_by_default(site_intel_m
     assert "3336" in compiled
 
 
+def test_site_intelligence_address_source_defaults_to_unified(site_intel_module, monkeypatch):
+    monkeypatch.delenv("HLTHPRT_ADDRESS_SERVING_SOURCE", raising=False)
+
+    assert site_intel_module._address_serving_source() == "entity_address_unified"
+
+
 def test_site_intelligence_pharmacy_geo_stmt_uses_unified_addresses(site_intel_module):
     stmt = site_intel_module._pharmacy_geo_stmt(
         use_unified_addresses=True,

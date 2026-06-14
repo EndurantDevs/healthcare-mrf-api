@@ -225,7 +225,9 @@ def _safe_float(value, default: float | None = None) -> float | None:
 
 
 def _address_serving_source() -> str:
-    return str(os.getenv("HLTHPRT_ADDRESS_SERVING_SOURCE") or "legacy").strip().lower()
+    return str(
+        os.getenv("HLTHPRT_ADDRESS_SERVING_SOURCE") or ADDRESS_SERVING_SOURCE_UNIFIED
+    ).strip().lower()
 
 
 def _parse_radius_miles(value: str | None) -> float | None:
