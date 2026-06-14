@@ -482,6 +482,7 @@ def _ptg2_manifest_sidecar_members(
         if not path:
             continue
         sidecar_path = _resolve_ptg2_manifest_sidecar_path(path)
+        sidecar_metadata = entry if sidecar_path == Path(path) else None
         cache_owner_id = owner_id if max_members is None else f"{owner_id}:{max_members}"
         cache_key = (str(sidecar_path), str(entry.get("sha256") or ""), cache_owner_id)
         cached = _PTG2_MANIFEST_SIDECAR_CACHE.get(cache_key)
@@ -491,7 +492,7 @@ def _ptg2_manifest_sidecar_members(
                 for member in lookup_global_sidecar_members(
                     sidecar_path,
                     owner_id,
-                    metadata=entry,
+                    metadata=sidecar_metadata,
                     max_members=max_members,
                 )
             )
@@ -514,6 +515,7 @@ def _ptg2_manifest_sidecar_members_many(
         if not path:
             continue
         sidecar_path = _resolve_ptg2_manifest_sidecar_path(path)
+        sidecar_metadata = entry if sidecar_path == Path(path) else None
         sha = str(entry.get("sha256") or "")
         missing: list[str] = []
         for owner_id in owner_id_list:
@@ -528,7 +530,7 @@ def _ptg2_manifest_sidecar_members_many(
             members_by_owner = lookup_global_sidecar_members_many(
                 sidecar_path,
                 missing,
-                metadata=entry,
+                metadata=sidecar_metadata,
                 max_members=max_members,
             )
             for owner_id in missing:

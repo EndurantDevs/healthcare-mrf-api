@@ -544,6 +544,7 @@ def test_ptg2_manifest_sidecar_lookup_remaps_stale_serving_directory(tmp_path, m
     sidecar["name"] = "provider_npi"
     stale_path = Path(sidecar["path"])
     sidecar["path"] = f"/tmp/healthporta-ptg2-artifacts/serving/stale/{stale_path.name}"
+    sidecar["byte_count"] = 1
     monkeypatch.setenv("HLTHPRT_PTG2_ARTIFACT_DIR", str(artifact_root))
     ptg2_serving._PTG2_MANIFEST_SIDECAR_CACHE.clear()
     tables = ptg2_serving.PTG2ServingTables(
