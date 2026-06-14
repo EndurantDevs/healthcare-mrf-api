@@ -2,6 +2,8 @@
 
 import os
 
+import pytest
+
 TEST_ENV_DEFAULTS = {
     "HLTHPRT_DB_DRIVER": "asyncpg",
     "HLTHPRT_DB_HOST": "127.0.0.1",
@@ -18,3 +20,12 @@ TEST_ENV_DEFAULTS = {
 
 for key, value in TEST_ENV_DEFAULTS.items():
     os.environ.setdefault(key, value)
+
+
+@pytest.fixture(autouse=True)
+def clear_npi_detail_response_cache():
+    from api.endpoint import npi as npi_module
+
+    npi_module._NPI_DETAIL_RESPONSE_CACHE.clear()
+    yield
+    npi_module._NPI_DETAIL_RESPONSE_CACHE.clear()
