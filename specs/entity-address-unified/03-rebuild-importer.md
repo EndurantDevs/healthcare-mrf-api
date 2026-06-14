@@ -320,6 +320,11 @@ Do not label the address source as PTG unless PTG supplied the actual address.
 - Keep procedure and medication dimensions in bridges, not hot-row arrays.
 - Move plan/network/PTG filters to bridge tables if arrays bloat the hot row or
   query plans degrade.
+- Build high-cardinality optional bridges only when an API path or query plan
+  uses them. `entity_address_network_bridge` is controlled by
+  `HLTHPRT_ENTITY_ADDRESS_UNIFIED_BUILD_NETWORK_BRIDGE`; when disabled, the
+  table is still published empty while ACA network filters continue to use the
+  hot-row `plans_network_array`.
 
 ## Deployment Topology
 
