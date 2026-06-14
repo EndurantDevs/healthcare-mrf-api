@@ -741,9 +741,9 @@ async def _fast_has_insurance_count(city: Optional[str], state: Optional[str]) -
     if state:
         conditions.append(table.c.state_name == state)
 
-    # For global has_insurance count, primary rows are one-per-NPI in our import shape.
-    # COUNT(*) avoids DISTINCT sorting over >1M values and significantly reduces latency.
-    if city is None and state is None:
+    # Legacy primary rows are one-per-NPI, so COUNT(*) avoids DISTINCT sorting.
+    # Unified serving has one primary row per canonical address and must count NPIs.
+    if city is None and state is None and address_model is NPIAddress:
         stmt = select(func.count()).select_from(table).where(*conditions)
     else:
         stmt = select(func.count(func.distinct(table.c.npi))).where(*conditions)
@@ -758,7 +758,10 @@ async def _fast_primary_npi_count() -> int:
         return cached
     address_model = await _address_serving_model({"type"})
     table = address_model.__table__
-    stmt = select(func.count()).select_from(table).where(table.c.type == "primary")
+    if address_model is EntityAddressUnified:
+        stmt = select(func.count(func.distinct(table.c.npi))).where(table.c.type == "primary")
+    else:
+        stmt = select(func.count()).select_from(table).where(table.c.type == "primary")
     scalar_fn = getattr(db, "scalar", None)
     if scalar_fn is not None:
         try:
@@ -1056,6 +1059,33 @@ async def _table_columns(table_name: str, *, session: Any = None) -> set[str]:
 
 def _address_serving_unified_requested() -> bool:
     return os.getenv(ADDRESS_SERVING_SOURCE_ENV, "").strip().lower() == ADDRESS_SERVING_SOURCE_UNIFIED
+
+
+def _address_table_is_unified(address_table_sql: str) -> bool:
+    return address_table_sql.endswith(f".{EntityAddressUnified.__tablename__}")
+
+
+def _address_zip5_filter(alias: str, address_table_sql: str, *, any_array: bool = False) -> str:
+    column = f"{alias}.zip5" if _address_table_is_unified(address_table_sql) else f"LEFT({alias}.postal_code, 5)"
+    operator = "ANY (:zip_codes)" if any_array else ":zip_code"
+    return f"{column} = {operator}"
+
+
+def _primary_address_order_clause(alias: str, address_table_sql: str) -> str:
+    common = (
+        f"{alias}.npi, "
+        f"({alias}.lat IS NULL OR {alias}.long IS NULL), "
+        f"(NULLIF(TRIM(COALESCE({alias}.first_line, '')), '') IS NULL), "
+    )
+    if _address_table_is_unified(address_table_sql):
+        return (
+            common
+            + f"(COALESCE({alias}.address_precision, '') = 'city_zip'), "
+            + f"{alias}.source_count DESC NULLS LAST, "
+            + f"{alias}.updated_at DESC NULLS LAST, "
+            + f"{alias}.location_key"
+        )
+    return common + f"{alias}.date_added DESC NULLS LAST, {alias}.checksum"
 
 
 def _public_address_column_keys() -> set[str]:
@@ -2318,7 +2348,7 @@ async def get_all(request):
         if state:
             address_where.append("state_name = :state")
         if zip_code:
-            address_where.append("LEFT(c.postal_code, 5) = :zip_code")
+            address_where.append(_address_zip5_filter("c", address_table_sql))
         if phone_digits:
             address_where.append(
                 "regexp_replace(COALESCE(c.telephone_number, ''), '[^0-9]', '', 'g') = :phone_digits"
@@ -2466,7 +2496,7 @@ async def get_all(request):
         if state:
             address_where.append("state_name = :state")
         if zip_code:
-            address_where.append("LEFT(c.postal_code, 5) = :zip_code")
+            address_where.append(_address_zip5_filter("c", address_table_sql))
         if phone_digits:
             address_where.append(
                 "regexp_replace(COALESCE(c.telephone_number, ''), '[^0-9]', '', 'g') = :phone_digits"
@@ -2651,7 +2681,7 @@ async def get_all(request):
         if state:
             address_where.append("state_name = :state")
         if zip_code:
-            address_where.append("LEFT(c.postal_code, 5) = :zip_code")
+            address_where.append(_address_zip5_filter("c", address_table_sql))
         if phone_digits:
             address_where.append(
                 "regexp_replace(COALESCE(c.telephone_number, ''), '[^0-9]', '', 'g') = :phone_digits"
@@ -2695,15 +2725,29 @@ async def get_all(request):
             )
         else:
             address_source = f"{address_table_sql} as c"
+        address_order = _primary_address_order_clause("c", address_table_sql)
         q = text(
             f"""
         WITH {cte_prefix}
-        sub_s AS(select b.npi as npi_code, b.*, g.* from  mrf.npi as b, (select c.*
-    from
-         {address_source}
-    where {' and '.join(address_where)}
-    ORDER BY c.npi
-    limit :limit offset :start) as g WHERE {' and '.join(main_where)}
+        page_npis AS (
+            SELECT DISTINCT c.npi
+              FROM {address_source}
+             WHERE {' and '.join(address_where)}
+             ORDER BY c.npi
+             LIMIT :limit OFFSET :start
+        ),
+        sub_s AS (
+            SELECT b.npi AS npi_code, b.*, g.*
+              FROM page_npis AS pn
+              JOIN mrf.npi AS b ON b.npi = pn.npi
+              JOIN LATERAL (
+                  SELECT c.*
+                    FROM {address_source}
+                   WHERE {' and '.join(address_where)}
+                     AND c.npi = pn.npi
+                   ORDER BY {address_order}
+                   LIMIT 1
+              ) AS g ON TRUE
     )
 
     select sub_s.*, t.* from sub_s, mrf.npi_taxonomy as t
@@ -3423,6 +3467,11 @@ async def get_near_npi(request):
                     in_lat = float(r[0])
                     in_long = float(r[1])
 
+    address_table_sql = await _address_serving_table_sql(
+        _public_address_column_keys(),
+        session=request_session,
+    )
+
     res = {}
     extra_filters: list[str] = []
     if exclude_npi:
@@ -3484,7 +3533,7 @@ async def get_near_npi(request):
     if zip_codes:
         # Default to a reasonable search radius when zip is used; avoid huge fan-out.
         radius = 25
-        extra_filters.append("SUBSTRING(a.postal_code, 1, 5) = ANY (:zip_codes)")
+        extra_filters.append(_address_zip5_filter("a", address_table_sql, any_array=True))
 
     bbox_params: dict[str, float] = {}
     if in_long is not None and in_lat is not None:
@@ -3518,10 +3567,6 @@ async def get_near_npi(request):
     if extra_filters:
         extra_clause = "\n          AND " + "\n          AND ".join(extra_filters)
 
-    address_table_sql = await _address_serving_table_sql(
-        _public_address_column_keys(),
-        session=request_session,
-    )
     nearby_sql = _build_nearby_sql(
         taxonomy_conditions,
         extra_clause,

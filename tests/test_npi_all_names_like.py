@@ -287,6 +287,45 @@ async def test_get_all_zip_phone_and_name_filters_are_applied(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_get_all_unified_pages_distinct_npis_and_uses_zip5(monkeypatch):
+    conn = RecordingConnection()
+
+    async def fake_table_columns(table_name, *, session=None):
+        assert session is None
+        if table_name == "entity_address_unified":
+            return npi_module._public_address_column_keys() | {
+                "address_precision",
+                "location_key",
+                "source_count",
+                "updated_at",
+                "zip5",
+            }
+        return set()
+
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
+    monkeypatch.setattr(npi_module, "_table_columns", fake_table_columns)
+    monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
+
+    request = types.SimpleNamespace(
+        args={
+            "zip_code": "60601-1234",
+            "limit": "5",
+            "start": "0",
+            "include_total": "0",
+        }
+    )
+    await get_all(request)
+
+    assert "FROM mrf.entity_address_unified as c" in conn.last_sql
+    assert "page_npis AS" in conn.last_sql
+    assert "SELECT DISTINCT c.npi" in conn.last_sql
+    assert "JOIN LATERAL" in conn.last_sql
+    assert "AND c.npi = pn.npi" in conn.last_sql
+    assert "c.zip5 = :zip_code" in conn.last_sql
+    assert "LEFT(c.postal_code, 5) = :zip_code" not in conn.last_sql
+
+
+@pytest.mark.asyncio
 async def test_get_all_rejects_invalid_entity_type_code(monkeypatch):
     conn = RecordingConnection()
     monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))

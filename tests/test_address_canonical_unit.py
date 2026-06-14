@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from db.models import MRFAddress
+from db.models import EntityAddressUnified, MRFAddress
 from process.ext.address_pub28 import (
     PUB28_DIRECTIONAL_MAP,
     PUB28_STREET_SUFFIX_MAP,
@@ -805,6 +805,7 @@ def test_entity_address_unified_builds_evidence_and_bridge_stage_sql():
             source_run_id="run_1",
             node_id="node_a",
             raw_table="entity_address_unified_raw",
+            build_network_bridge=True,
         )
     )
 
@@ -823,6 +824,74 @@ def test_entity_address_unified_builds_evidence_and_bridge_stage_sql():
     assert "'HP_PROCEDURE_CODE'::varchar AS code_system" in sql_blob
     assert "INSERT INTO mrf.entity_address_medication_bridge_20260614" in sql_blob
     assert "'HP_RX_CODE'::varchar AS code_system" in sql_blob
+
+
+def test_entity_address_unified_can_skip_network_bridge_stage_sql():
+    stage_classes = entity_address_unified._support_stage_classes("20260614")
+    sql_blob = "\n".join(
+        entity_address_unified._support_stage_sql(
+            "mrf",
+            "entity_address_unified_stage",
+            stage_classes,
+            source_run_id="run_1",
+            node_id="node_a",
+            raw_table="entity_address_unified_raw",
+            build_network_bridge=False,
+        )
+    )
+
+    assert "mrf.entity_address_network_bridge_20260614" in sql_blob
+    assert "INSERT INTO mrf.entity_address_network_bridge_20260614" not in sql_blob
+    assert "unnest(COALESCE(t.plans_network_array, ARRAY[]::int[]))" not in sql_blob
+    assert "INSERT INTO mrf.entity_address_plan_bridge_20260614" in sql_blob
+    assert "INSERT INTO mrf.entity_address_procedure_bridge_20260614" in sql_blob
+    assert "INSERT INTO mrf.entity_address_medication_bridge_20260614" in sql_blob
+
+
+@pytest.mark.asyncio
+async def test_entity_address_unified_stage_indexes_do_not_duplicate_primary(monkeypatch):
+    statements = []
+
+    class FakeDB:
+        async def status(self, statement):
+            statements.append(statement)
+
+    class FakeStage:
+        __tablename__ = "entity_address_unified_stage"
+        __my_index_elements__ = ["location_key"]
+        __my_additional_indexes__ = [
+            {"index_elements": ("npi",), "name": "npi"},
+        ]
+
+    monkeypatch.setattr(entity_address_unified, "db", FakeDB())
+
+    await entity_address_unified._create_stage_indexes(FakeStage, "mrf")
+
+    assert not any("entity_address_unified_stage_idx_primary" in statement for statement in statements)
+    assert any("entity_address_unified_stage_idx_npi" in statement for statement in statements)
+
+
+def test_entity_address_unified_indexes_cover_primary_serving_queries():
+    indexes = {index["name"]: index for index in EntityAddressUnified.__my_additional_indexes__}
+
+    assert indexes["primary_npi"] == {
+        "index_elements": ("npi",),
+        "name": "primary_npi",
+        "where": "type='primary'",
+    }
+    assert indexes["primary_zip5_npi"] == {
+        "index_elements": ("zip5", "npi"),
+        "name": "primary_zip5_npi",
+        "where": "type='primary'",
+    }
+    assert indexes["primary_state_city_npi"] == {
+        "index_elements": ("state_name", "city_name", "npi"),
+        "name": "primary_state_city_npi",
+        "where": "type='primary'",
+    }
+    assert indexes["geo_idx"]["where"] == (
+        "type IN ('primary', 'secondary') AND COALESCE(address_precision, '') <> 'city_zip'"
+    )
 
 
 def test_entity_address_unified_support_stage_sql_has_stage_fallback_evidence():

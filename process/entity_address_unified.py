@@ -43,6 +43,7 @@ DEFAULT_ENRICH_SHARDS = 1
 DEFAULT_ENRICH_CONCURRENCY = 1
 DEFAULT_EVIDENCE_SHARDS = 16
 DEFAULT_EVIDENCE_CONCURRENCY = 4
+DEFAULT_BUILD_NETWORK_BRIDGE = False
 ARCHIVE_IDENTITY_VERSION = "v1"
 BASE_ADDRESS_VERSION = "address_archive_v2:v1"
 SUPPORT_TABLE_MODELS = (
@@ -126,13 +127,6 @@ def _support_stage_classes(import_date: str) -> dict[type, type]:
 
 
 async def _create_stage_indexes(stage_cls, db_schema: str) -> None:
-    if hasattr(stage_cls, "__my_index_elements__") and stage_cls.__my_index_elements__:
-        await db.status(
-            f"CREATE UNIQUE INDEX IF NOT EXISTS {stage_cls.__tablename__}_idx_primary "
-            f"ON {db_schema}.{stage_cls.__tablename__} "
-            f"({', '.join(stage_cls.__my_index_elements__)});"
-        )
-
     if hasattr(stage_cls, "__my_additional_indexes__") and stage_cls.__my_additional_indexes__:
         for index in stage_cls.__my_additional_indexes__:
             index_name = index.get("name", "_".join(index.get("index_elements")))
@@ -2110,6 +2104,7 @@ def _support_stage_sql(
     source_run_id: str,
     node_id: str | None,
     raw_table: str | None = None,
+    build_network_bridge: bool = True,
 ) -> list[str]:
     stage_tables = {model: stage_cls.__tablename__ for model, stage_cls in stage_classes.items()}
     evidence_sql = (
@@ -2129,15 +2124,20 @@ def _support_stage_sql(
             node_id=node_id,
         )
     )
-    return [
+    statements = [
         _truncate_support_stage_sql(db_schema, stage_tables),
         evidence_sql,
         _plan_bridge_sql(db_schema, stage_tables[EntityAddressPlanBridge], stage_table),
-        _network_bridge_sql(db_schema, stage_tables[EntityAddressNetworkBridge], stage_table),
         _ptg_bridge_sql(db_schema, stage_tables[EntityAddressPTGBridge], stage_table),
         _procedure_bridge_sql(db_schema, stage_tables[EntityAddressProcedureBridge], stage_table),
         _medication_bridge_sql(db_schema, stage_tables[EntityAddressMedicationBridge], stage_table),
     ]
+    if build_network_bridge:
+        statements.insert(
+            3,
+            _network_bridge_sql(db_schema, stage_tables[EntityAddressNetworkBridge], stage_table),
+        )
+    return statements
 
 
 async def _populate_support_stage_tables(
@@ -2148,6 +2148,7 @@ async def _populate_support_stage_tables(
     source_run_id: str,
     node_id: str | None,
     raw_table: str | None = None,
+    build_network_bridge: bool = True,
 ) -> dict[str, int]:
     for statement in _support_stage_sql(
         db_schema,
@@ -2156,6 +2157,7 @@ async def _populate_support_stage_tables(
         source_run_id=source_run_id,
         node_id=node_id,
         raw_table=raw_table,
+        build_network_bridge=build_network_bridge,
     ):
         await db.status(statement)
     counts: dict[str, int] = {}
@@ -3167,6 +3169,10 @@ async def process_data(ctx, task=None):
     await db.status(f"DROP TABLE IF EXISTS {db_schema}.{evidence_table};")
 
     node_id = str(os.getenv("HLTHPRT_IMPORT_NODE_ID") or "").strip() or None
+    build_network_bridge = _env_bool(
+        "HLTHPRT_ENTITY_ADDRESS_UNIFIED_BUILD_NETWORK_BRIDGE",
+        DEFAULT_BUILD_NETWORK_BRIDGE,
+    )
     support_counts = await _populate_support_stage_tables(
         db_schema,
         stage_table,
@@ -3174,6 +3180,7 @@ async def process_data(ctx, task=None):
         source_run_id=import_date,
         node_id=node_id,
         raw_table=raw_table,
+        build_network_bridge=build_network_bridge,
     )
     if raw_table:
         await db.status(f"DROP TABLE IF EXISTS {db_schema}.{raw_table};")

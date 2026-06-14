@@ -3891,11 +3891,12 @@ class EntityAddressUnified(Base, JSONOutputMixin):
     __my_index_elements__ = ["location_key"]
     __my_additional_indexes__ = [
         {"index_elements": ("npi",), "name": "npi"},
+        {"index_elements": ("npi",), "name": "primary_npi", "where": "type='primary'"},
         {"index_elements": ("inferred_npi",), "name": "inferred_npi"},
         {"index_elements": ("coalesce(npi, inferred_npi)",), "name": "coalesced_npi"},
         {"index_elements": ("entity_type", "coalesce(npi, inferred_npi)"), "name": "entity_type_coalesced_npi"},
-        {"index_elements": ("type", "state_name", "city_name"), "name": "type_state_city"},
-        {"index_elements": ("LEFT(postal_code, 5)",), "name": "postal_code_5"},
+        {"index_elements": ("state_name", "city_name", "npi"), "name": "primary_state_city_npi", "where": "type='primary'"},
+        {"index_elements": ("zip5", "npi"), "name": "primary_zip5_npi", "where": "type='primary'"},
         {"index_elements": ("address_sources",), "using": "gin", "name": "address_sources"},
         {"index_elements": ("row_origin",), "name": "row_origin"},
         {"index_elements": ("address_precision",), "name": "address_precision"},
@@ -3917,7 +3918,7 @@ class EntityAddressUnified(Base, JSONOutputMixin):
             "index_elements": ("Geography(ST_MakePoint((long)::double precision, (lat)::double precision))",),
             "using": "gist",
             "name": "geo_idx",
-            "where": "type='primary' OR type='secondary' OR type='practice' OR type='site'",
+            "where": "type IN ('primary', 'secondary') AND COALESCE(address_precision, '') <> 'city_zip'",
         },
         {"index_elements": ("address_key",), "name": "address_key"},
     ]
