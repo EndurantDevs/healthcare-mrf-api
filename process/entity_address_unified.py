@@ -1589,6 +1589,7 @@ def _materialize_sql(
         inference_method,
         entity_name,
         entity_subtype,
+        location_key,
         source_count,
         multi_source_confirmed,
         address_sources,
@@ -1686,6 +1687,20 @@ def _materialize_sql(
             source_record_id,
             updated_at,
             address_key,
+            {_location_key_expr(
+                entity_type="entity_type",
+                entity_id="entity_id",
+                npi="npi",
+                inferred_npi="inferred_npi",
+                address_role_id=_address_role_id_expr("type"),
+                row_origin="'base'",
+                address_key="address_key",
+                source_id=_source_id_expr("address_source"),
+                source_record_id="source_record_id",
+                zip5=_zip5_norm_expr("postal_code"),
+                state_code=_state_norm_expr("state_name"),
+                city_norm=_alnum_norm_expr("city_name"),
+            )} AS location_key,
             {_address_checksum_expr(
                 first_line_expr=_alnum_norm_expr("first_line"),
                 second_line_expr=_alnum_norm_expr("second_line"),
@@ -1702,6 +1717,7 @@ def _materialize_sql(
             entity_type,
             entity_id,
             type,
+            (ARRAY_AGG(location_key ORDER BY source_priority ASC, updated_at DESC NULLS LAST))[1]::varchar AS location_key,
             (ARRAY_AGG(checksum ORDER BY source_priority ASC, updated_at DESC NULLS LAST))[1]::bigint AS checksum,
             MAX(npi)::bigint AS npi,
             MAX(inferred_npi)::bigint AS inferred_npi,
@@ -1742,6 +1758,7 @@ def _materialize_sql(
         inference_method,
         entity_name,
         entity_subtype,
+        location_key,
         COALESCE(CARDINALITY(address_sources), 0)::int AS source_count,
         (COALESCE(CARDINALITY(address_sources), 0) > 1) AS multi_source_confirmed,
         COALESCE(address_sources, ARRAY[]::varchar[]) AS address_sources,
@@ -2788,13 +2805,6 @@ async def process_data(ctx, task=None):
         ctx["context"]["support_stage_prepared"] = False
         ctx["context"]["support_stage_indexes_prepared"] = False
 
-    if not ctx["context"].get("support_stage_prepared"):
-        support_stage_classes = await _prepare_support_stage_tables(db_schema, import_date)
-        ctx["context"]["support_stage_prepared"] = True
-        ctx["context"]["support_stage_indexes_prepared"] = False
-    else:
-        support_stage_classes = _support_stage_classes(import_date)
-
     required_checks = [
         "npi",
         "npi_address",
@@ -2885,6 +2895,14 @@ async def process_data(ctx, task=None):
         )
     if not source_selects:
         raise RuntimeError("No source tables are available for entity_address_unified materialization.")
+
+    if not ctx["context"].get("support_stage_prepared"):
+        support_stage_classes = await _prepare_support_stage_tables(db_schema, import_date)
+        ctx["context"]["support_stage_prepared"] = True
+        ctx["context"]["support_stage_indexes_prepared"] = False
+    else:
+        support_stage_classes = _support_stage_classes(import_date)
+
     if run_id:
         enqueue_live_progress(
             run_id=run_id,
