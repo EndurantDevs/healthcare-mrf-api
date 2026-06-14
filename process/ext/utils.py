@@ -695,9 +695,9 @@ async def push_objects(obj_list, cls, rewrite=False, _missing_table_attempt: int
 
         async def _status_with_deadlock_retry(stmt):
             try:
-                max_retries = max(int(os.getenv("HLTHPRT_DB_DEADLOCK_RETRIES", "5")), 0)
+                max_retries = max(int(os.getenv("HLTHPRT_DB_DEADLOCK_RETRIES", "20")), 0)
             except ValueError:
-                max_retries = 5
+                max_retries = 20
             attempt = 0
             while True:
                 try:

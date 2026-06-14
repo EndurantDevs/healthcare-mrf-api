@@ -14,8 +14,10 @@ def test_worker_registry_exposes_shared_and_finish_workers():
     by_queue = {item["queue"]: item for item in items}
 
     assert by_importer["claims-procedures"]["worker_class"] == "process.ClaimsPricing"
+    assert by_importer["ptg-address"]["worker_class"] == "process.PTGAddress"
     assert by_importer["ms-drg"]["worker_class"] == "process.MSDRG"
     assert by_queue["arq:PartDFormularyNetwork_finish"]["role"] == "finish"
+    assert by_queue["arq:PTGAddress_finish"]["role"] == "finish"
 
 
 def test_ensure_worker_starts_registered_burst_worker(monkeypatch, tmp_path):
@@ -136,7 +138,7 @@ def test_kubernetes_start_worker_replicas_use_parallel_job(monkeypatch):
                 "items": [
                     {
                         "metadata": {"name": "worker-job"},
-                        "status": {"active": 8},
+                        "status": {"active": 16},
                     }
                 ]
             }
@@ -144,7 +146,7 @@ def test_kubernetes_start_worker_replicas_use_parallel_job(monkeypatch):
 
     monkeypatch.setenv("HLTHPRT_WORKER_LAUNCHER", "kubernetes")
     monkeypatch.setenv("HLTHPRT_WORKER_JOB_IMAGE", "ghcr.io/endurantdevs/healthcare-mrf-api:dev")
-    monkeypatch.setenv("HLTHPRT_WORKER_JOB_START_REPLICAS", "process.MRF=8")
+    monkeypatch.setenv("HLTHPRT_WORKER_JOB_START_REPLICAS", "process.MRF=16")
     monkeypatch.setenv("HLTHPRT_IMPORT_NODE_ID", "local_mrf")
     monkeypatch.setattr(control_workers, "_kubernetes_configured", lambda: True)
     monkeypatch.setattr(control_workers, "_kubernetes_namespace", lambda: "healthporta-dev")
@@ -155,8 +157,8 @@ def test_kubernetes_start_worker_replicas_use_parallel_job(monkeypatch):
     assert result["status"] == "started"
     post = next(call for call in calls if call[0] == "POST")
     job = post[2]
-    assert job["spec"]["parallelism"] == 8
-    assert job["spec"]["completions"] == 8
+    assert job["spec"]["parallelism"] == 16
+    assert job["spec"]["completions"] == 16
     container = job["spec"]["template"]["spec"]["containers"][0]
     assert container["command"][-2:] == ["process.MRF", "--burst"]
 
@@ -179,7 +181,7 @@ def test_kubernetes_start_worker_replicas_do_not_apply_to_finish(monkeypatch):
 
     monkeypatch.setenv("HLTHPRT_WORKER_LAUNCHER", "kubernetes")
     monkeypatch.setenv("HLTHPRT_WORKER_JOB_IMAGE", "ghcr.io/endurantdevs/healthcare-mrf-api:dev")
-    monkeypatch.setenv("HLTHPRT_WORKER_JOB_START_REPLICAS", "process.MRF=8")
+    monkeypatch.setenv("HLTHPRT_WORKER_JOB_START_REPLICAS", "process.MRF=16")
     monkeypatch.setenv("HLTHPRT_IMPORT_NODE_ID", "local_mrf")
     monkeypatch.setattr(control_workers, "_kubernetes_configured", lambda: True)
     monkeypatch.setattr(control_workers, "_kubernetes_namespace", lambda: "healthporta-dev")

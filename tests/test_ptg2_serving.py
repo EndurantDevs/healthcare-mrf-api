@@ -1170,8 +1170,96 @@ async def test_compact_serving_include_providers_expands_without_geo_filter():
     sql = str(session.calls[0][0][0])
     assert "LEFT JOIN LATERAL (" in sql
     assert "FROM mrf.npi_address addr" in sql
-    assert "addr.npi = sp.npi" in sql
+    assert "addr.npi = pgm.npi" in sql
     assert "LEFT(COALESCE(addr.postal_code, ''), 5) = :zip5" not in sql
+
+
+@pytest.mark.asyncio
+async def test_compact_serving_geo_filter_uses_unified_address_table_when_compatible(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
+    session = FakeSession(
+        [
+            FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
+            FakeResult(rows=[]),
+        ]
+    )
+
+    payload = await ptg2_serving._search_compact_serving_table(
+        session,
+        "mrf.ptg2_serving_rate_compact_token",
+        _compact_tables(),
+        "snap-token",
+        {"plan_id": "010854205", "code": "70551", "lat": "29.7604", "long": "-95.3698", "radius_miles": "10"},
+        FakePagination(),
+        ["snapshot_id = :snapshot_id", "plan_id = :plan_id"],
+        {"snapshot_id": "snap-token", "plan_id": "010854205", "limit": 25, "offset": 0},
+        ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
+    )
+
+    assert payload is None
+    sql = str(session.calls[1][0][0])
+    assert "JOIN mrf.entity_address_unified addr_filter" in sql
+    assert "JOIN mrf.npi_address addr_filter" not in sql
+    assert "addr_filter.address_precision" in sql
+    assert "COALESCE(addr_filter.address_precision, '') <> 'city_zip'" in sql
+
+
+@pytest.mark.asyncio
+async def test_compact_serving_provider_expansion_uses_unified_address_table_when_compatible(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
+    session = FakeSession(
+        [
+            FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_LEGACY_ADDRESS_COLUMNS)]),
+            FakeResult(rows=[]),
+        ]
+    )
+
+    payload = await ptg2_serving._search_compact_serving_table(
+        session,
+        "mrf.ptg2_serving_rate_compact_token",
+        _compact_tables(),
+        "snap-token",
+        {"plan_id": "010854205", "code": "450", "include_providers": "true"},
+        FakePagination(),
+        ["snapshot_id = :snapshot_id", "plan_id = :plan_id"],
+        {"snapshot_id": "snap-token", "plan_id": "010854205", "limit": 25, "offset": 0},
+        ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
+    )
+
+    assert payload is None
+    sql = str(session.calls[1][0][0])
+    assert "FROM mrf.entity_address_unified addr" in sql
+    assert "FROM mrf.npi_address addr" not in sql
+    assert "addr.npi = pgm.npi" in sql
+    assert "addr.npi = sp.npi" not in sql
+
+
+@pytest.mark.asyncio
+async def test_compact_serving_provider_expansion_falls_back_when_unified_incompatible(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
+    session = FakeSession(
+        [
+            FakeResult(rows=[("npi",), ("type",)]),
+            FakeResult(rows=[]),
+        ]
+    )
+
+    payload = await ptg2_serving._search_compact_serving_table(
+        session,
+        "mrf.ptg2_serving_rate_compact_token",
+        _compact_tables(),
+        "snap-token",
+        {"plan_id": "010854205", "code": "450", "include_providers": "true"},
+        FakePagination(),
+        ["snapshot_id = :snapshot_id", "plan_id = :plan_id"],
+        {"snapshot_id": "snap-token", "plan_id": "010854205", "limit": 25, "offset": 0},
+        ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
+    )
+
+    assert payload is None
+    sql = str(session.calls[1][0][0])
+    assert "FROM mrf.npi_address addr" in sql
+    assert "FROM mrf.entity_address_unified addr" not in sql
 
 
 @pytest.mark.asyncio

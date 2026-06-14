@@ -267,6 +267,60 @@ async def test_get_near_npi_with_lat_long_includes_bbox_params(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_get_near_npi_uses_unified_address_table_when_compatible(monkeypatch):
+    captured = {}
+
+    async def fake_table_columns(table_name, *, session=None):
+        assert session is None
+        if table_name == "entity_address_unified":
+            return npi_module._public_address_column_keys()
+        return set()
+
+    class RecordingConnection:
+        async def all(self, sql, **params):
+            captured["sql"] = str(sql)
+            captured["params"] = params
+            return []
+
+        async def first(self, *_args, **_kwargs):
+            return None
+
+    class FakeDB:
+        def acquire(self):
+            return FakeAcquire(RecordingConnection())
+
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
+    monkeypatch.setattr(npi_module, "_table_columns", fake_table_columns)
+    monkeypatch.setattr(npi_module, "db", FakeDB())
+
+    request = types.SimpleNamespace(
+        args={"lat": "41.0", "long": "-87.0", "radius": "10", "limit": "1"},
+        app=types.SimpleNamespace(),
+    )
+    response = await npi_module.get_near_npi(request)
+    assert json.loads(response.body) == []
+    assert "FROM mrf.entity_address_unified AS a" in captured["sql"]
+    assert "FROM mrf.npi_address AS a" not in captured["sql"]
+    assert "COALESCE(a.address_precision, '') <> 'city_zip'" in captured["sql"]
+    assert "min_lat" in captured["params"]
+
+
+@pytest.mark.asyncio
+async def test_address_serving_table_falls_back_to_legacy_when_unified_incompatible(monkeypatch):
+    async def fake_table_columns(table_name, *, session=None):
+        assert session is None
+        if table_name == "entity_address_unified":
+            return {"npi"}
+        return set()
+
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
+    monkeypatch.setattr(npi_module, "_table_columns", fake_table_columns)
+
+    table_name = await npi_module._address_serving_table_sql({"npi", "type"})
+    assert table_name == "mrf.npi_address"
+
+
+@pytest.mark.asyncio
 async def test_get_full_taxonomy_list(monkeypatch):
     class FakeTaxonomy:
         def to_json_dict(self):
@@ -509,6 +563,84 @@ async def test_get_npi_geocode_mapbox(monkeypatch):
     assert payload["address_list"][0]["lat"] == 41.1
     await tasks[0]
     assert hasattr(insert, "payload")
+
+
+@pytest.mark.asyncio
+async def test_get_npi_geocode_omits_null_address_parts(monkeypatch):
+    async def fake_build(_npi):
+        return {
+            "npi": _npi,
+            "taxonomy_list": [],
+            "taxonomy_group_list": [],
+            "do_business_as": [],
+            "address_list": [
+                {
+                    "checksum": 1,
+                    "first_line": None,
+                    "second_line": None,
+                    "city_name": "Chicago",
+                    "state_name": "IL",
+                    "postal_code": None,
+                    "lat": None,
+                    "long": None,
+                }
+            ],
+        }
+
+    monkeypatch.setattr(npi_module, "_build_npi_details", fake_build)
+    monkeypatch.setattr(npi_module, "_fetch_other_names", AsyncMock(return_value=[]))
+
+    requested_urls = []
+
+    async def fake_download(url, *_args, **_kwargs):
+        requested_urls.append(url)
+        return json.dumps(
+            {
+                "features": [
+                    {
+                        "geometry": {"coordinates": [-87.1, 41.1]},
+                        "place_name": "Chicago, IL",
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr(npi_module, "download_it", fake_download)
+
+    class FakeDB:
+        def update(self, *_args, **_kwargs):
+            return FakeUpdate()
+
+        def insert(self, *_args, **_kwargs):
+            return FakeInsert()
+
+        async def scalar(self, *_args, **_kwargs):
+            return None
+
+    monkeypatch.setattr(npi_module, "db", FakeDB())
+    monkeypatch.setattr(npi_module.random, "choice", lambda seq: seq[0])
+
+    class FakeApp:
+        def __init__(self):
+            self.config = {
+                "NPI_API_UPDATE_GEOCODE": True,
+                "GEOCODE_MAPBOX_STYLE_KEY_PARAM": "access_token",
+                "GEOCODE_MAPBOX_STYLE_KEY": "[\"token\"]",
+                "GEOCODE_MAPBOX_STYLE_URL": "https://mock-map/",
+            }
+
+        def add_task(self, coro):
+            if asyncio.iscoroutine(coro):
+                coro.close()
+
+    request = types.SimpleNamespace(args={"force_address_update": "1"}, app=FakeApp())
+    response = await npi_module.get_npi(request, "1518379601")
+    payload = json.loads(response.body)
+
+    assert payload["address_list"][0]["lat"] == 41.1
+    assert requested_urls
+    assert "None" not in requested_urls[0]
+    assert "Chicago" in requested_urls[0]
 
 
 @pytest.mark.asyncio

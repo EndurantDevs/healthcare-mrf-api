@@ -414,7 +414,7 @@ ordered `nucc` -> `npi` full import.
       vacuum/analyze, and publish swap. AC: a completed NPPES smoke report can
       be generated from the run output without manually sampling
       `pg_stat_activity`.
-      Status (Codex, 2026-06-12): partial. NPI shutdown now emits
+      Status (2026-06-12): partial. NPI shutdown now emits
       `NPI_SHUTDOWN_PHASE_*` log lines, live progress updates, and final
       `npi_shutdown_phase_timings` control-run metrics for canonical address
       resolve, DBA enrichment, taxonomy/geocode/plan/procedure/medication
@@ -475,7 +475,7 @@ functions with the exact AC inputs, and R9's mutation check was executed for
 real (installing the old strpos bug into the DB makes the corpus fail).
 Remaining items below are the partial-fix remainders + new findings.
 
-> **COORDINATION (2026-06-11, two agents in parallel):**
+> **COORDINATION (2026-06-11, parallel review):**
 > S2-S10 have local worktree fixes and focused test evidence. S1 remains open
 > because its AC requires a committed/pushed tree and first green GitHub CI run;
 > that source-control step is still owner-controlled.
@@ -486,7 +486,7 @@ Remaining items below are the partial-fix remainders + new findings.
       `tests/test_process_pharmacy_license_unit.py` (R11's test) to the CI
       file list, and a `redis` service or drop the dangling
       `HLTHPRT_REDIS_ADDRESS` env. AC: first green CI run visible on GitHub.
-      Status (Claude, 2026-06-11): CONTENT DONE — pharmacy unit tests + the new
+      Status (2026-06-11): CONTENT DONE — pharmacy unit tests + the new
       S5 run-failure test added to the unit job; dangling Redis env dropped
       (DB suite never touches Redis without a run_id). REMAINING: the commit
       itself — must include the full feature tree, owner's call.
@@ -507,7 +507,7 @@ Remaining items below are the partial-fix remainders + new findings.
       runbook command) + wipe/re-stamp stale `address_key` stamps everywhere.
       AC: mismatch test aborts resolve; runbook documents function re-apply +
       stamp wipe; dev DBs re-stamped.
-      Status (Codex, 2026-06-11): resolver aborts on stamped-key/identity
+      Status (2026-06-11): resolver aborts on stamped-key/identity
       mismatch, writes the recomputed key into the resolve projection, preserves
       missing-stamp gate counters with `staged_address_key`, and has DB
       regression coverage. Added
@@ -522,20 +522,20 @@ Remaining items below are the partial-fix remainders + new findings.
       corpus + CI parity + S2 guard) update spec 02 §SQL-only, 03 §2, and the
       module docstring to "dual implementation, byte-parity enforced by frozen
       corpus + CI + runtime stamp check". AC: spec and code claims agree.
-      Status (Codex, 2026-06-11): spec 02/03 and `address_canon.py` now
+      Status (2026-06-11): spec 02/03 and `address_canon.py` now
       describe the dual SQL/Python producer model and runtime stamp guard.
 - [x] **S4 (S)** R6 remainder: idempotency test double-applies
       `_street_token_norm`, masking even-length cycles, and skips the UNIT map
       entirely. Assert `map.get(v, v) == v` for every value of all three RAW
       maps (suffix, directional, unit). AC: single-application idempotency
       pinned.
-      Status (Codex, 2026-06-11): unit test now checks suffix, directional, and
+      Status (2026-06-11): unit test now checks suffix, directional, and
       unit raw maps.
 - [x] **S5 (S)** R11 remainder: the run-failure path has no test (and
       `pharmacy_license_start` carries `# pragma: no cover`). Drive
       `PharmacyLicenseCanonicalAddressError` through the per-state loop and
       assert `_upsert_run`/`mark_control_run` record `failed` + re-raise.
-      Status (Codex, 2026-06-11): `tests/test_process_pharmacy_license_unit.py`
+      Status (2026-06-11): `tests/test_process_pharmacy_license_unit.py`
       and `tests/test_pharmacy_license_run_failure_unit.py` drive the typed
       error through `pharmacy_license_start`'s state loop with persistence
       stubbed; assert run/control/snapshot/coverage failed and the exception
@@ -544,12 +544,12 @@ Remaining items below are the partial-fix remainders + new findings.
       zero test coverage, and it is gated on `if run_id:` — ad-hoc runs
       degrade with only a logger.info. Test the warning; decide whether
       non-control runs should also surface it.
-      Status (Codex, 2026-06-11): warning event is covered for controlled runs;
+      Status (2026-06-11): warning event is covered for controlled runs;
       ad-hoc degradation now logs at warning level.
 - [x] **S7 (S)** R14 remainder: write the `last_seen_at` trade-off into 03
       (provenance UPDATE guard skips same-source re-imports, so last_seen is
       NOT bumped on unchanged re-import — intentional).
-      Status (Codex, 2026-06-11): documented in `03-data-model.md`.
+      Status (2026-06-11): documented in `03-data-model.md`.
 - [x] **S8 (M)** R15 remainders: (f) zero flag-ON tests — cover v2 read hit,
       geocode-less miss→legacy fall-through, and the shared-checksum upsert
       (FakeDB with `first`); (g) fix the `_v2_archive_table` memoization race
@@ -557,14 +557,14 @@ Remaining items below are the partial-fix remainders + new findings.
       `api/endpoint/npi.py:3663-3665`, so concurrent `_update_address` tasks
       in the same request silently fall to legacy with the flag ON) and
       document `HLTHPRT_ADDRESS_ARCHIVE_CUTOVER` in `.env.example` + runbook.
-      Status (Codex, 2026-06-11): `_v2_archive_table` uses an async lock and
+      Status (2026-06-11): `_v2_archive_table` uses an async lock and
       sets the cache only after probes complete; flag-on tests cover v2 read hit
       under concurrent addresses, geocode-less v2 fallback to legacy, and
       deduped v2 upsert. `.env.example` and runbook document the cutover flag.
 - [x] **S9 (S)** R16 remainder: add the bigint ALTER lock-window estimate to
       the runbook (916,949-row archive ⇒ measure once on the dev copy); fix
       the stale plural "tables" wording post-narrowing.
-      Status (Claude, 2026-06-11): measured empirically on the disposable
+      Status (2026-06-11): measured empirically on the disposable
       Postgres — synthetic 1M-row table + unique index, `ALTER ... TYPE
       bigint` = 1.68 s. Runbook now states the narrowed single-table scope and
       a "under one minute, budget a 5-minute window" production estimate for
@@ -580,7 +580,7 @@ Remaining items below are the partial-fix remainders + new findings.
       `hash()`) in the foundation migration; assert `equivalence_groups`
       fixture cases are mirrored into `explicit_cases`; delete stray
       `tests/test_process_pharmacy_license_unit.pyc`.
-      Status (Codex, 2026-06-11): removed the dead `identity_collisions` gate
+      Status (2026-06-11): removed the dead `identity_collisions` gate
       input and `_index_name`; clamped API v2 `state_code`; qualified the
       PostGIS probe; unified archive advisory lock keys; added
       trailing-punctuation corpus cases and equivalence-group mirror assertion;
@@ -603,7 +603,7 @@ plus that importer's existing tests green.
 - [ ] **2.1 (M)** cms_doctors (pilot) — bit 2, priority 1.
 - [ ] **2.2 (S)** facility_anchors — bit 8, priority 4; geocode fill from CMS
       coordinates with `geocode_source='facility_anchor'`.
-      Status (Codex, 2026-06-12): source-coordinate archive geocode fill is
+      Status (2026-06-12): source-coordinate archive geocode fill is
       implemented after facility-anchor archive resolve and only fills empty
       canonical archive geocodes. DB regression
       `test_facility_anchor_coordinates_refresh_archive_geocode_fields` proves

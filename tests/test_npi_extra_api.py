@@ -134,6 +134,41 @@ async def test_pharmacists_per_pharmacy_state_and_name(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_pharmacists_per_pharmacy_uses_unified_address_table_when_compatible(monkeypatch):
+    captured = {}
+
+    async def fake_table_columns(table_name, *, session=None):
+        assert session is None
+        if table_name == "entity_address_unified":
+            return {"npi", "type", "state_name", "telephone_number", "taxonomy_array"}
+        return set()
+
+    class RecordingConnection:
+        async def all(self, sql, **params):
+            captured.setdefault("sql", str(sql))
+            captured.setdefault("params", params)
+            if "pharmacist_group" in str(sql):
+                return [("1", 2)]
+            return []
+
+        async def first(self, *_args, **_kwargs):
+            return None
+
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
+    monkeypatch.setattr(npi_module, "_table_columns", fake_table_columns)
+    monkeypatch.setattr(npi_module.db, 'acquire', lambda: FakeAcquire(RecordingConnection()))
+
+    request = types.SimpleNamespace(args={'state': 'ny'})
+    response = await pharmacists_per_pharmacy(request)
+    payload = json.loads(response.body)
+
+    assert payload["histogram"][0]['pharmacist_group'] == '1'
+    sql_text = captured["sql"]
+    assert "FROM mrf.entity_address_unified AS a" in sql_text
+    assert "FROM mrf.npi_address AS a" not in sql_text
+
+
+@pytest.mark.asyncio
 async def test_pharmacists_per_pharmacy_full_groups(monkeypatch):
     expected_groups = ['25+'] + [str(i) for i in range(25, 0, -1)]
     fake_rows = [(group, idx) for idx, group in enumerate(expected_groups, start=1)]

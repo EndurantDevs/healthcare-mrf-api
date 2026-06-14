@@ -52,6 +52,9 @@ def test_importer_registry_exposes_ptg_and_finish_lifecycle():
     assert items["address-archive-v2-migrate"]["enqueue_adapter"] == "arq_single_job"
     assert items["address-archive-v2-migrate"]["queue"] == "arq:AddressArchive"
     assert items["address-archive-v2-migrate"]["cancelable"] is True
+    assert items["ptg-address"]["family"] == "provider"
+    assert items["ptg-address"]["enqueue_adapter"] == "arq_single_job"
+    assert items["ptg-address"]["queue"] == "arq:PTGAddress"
     assert items["code-sets"]["enqueue_adapter"] == "arq_single_job"
     assert items["ms-drg"]["family"] == "reference"
     assert items["ms-drg"]["enqueue_adapter"] == "arq_single_job"
