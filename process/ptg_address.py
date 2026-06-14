@@ -364,7 +364,7 @@ def _provider_location_source_ctes(
             NULLIF(pgm.provider_group_global_id_128::text, '')::varchar AS provider_group_id,
             NULL::varchar AS provider_set_id,
             NULL::varchar AS tin,
-            COALESCE(a.updated_at, a.date_added::timestamptz) AS created_at
+            a.date_added::timestamptz AS created_at
           FROM {_qualified_table_ref(db_schema, provider_group_member_table)} pgm
           JOIN {_quote_ident(db_schema)}.npi_address a
             ON a.npi = pgm.npi
