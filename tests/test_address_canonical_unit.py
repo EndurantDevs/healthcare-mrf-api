@@ -1061,6 +1061,8 @@ def test_ptg_address_insert_sql_uses_existing_provider_location_projection():
     assert "mrf.addr_key_v1(first_line, second_line, city, state, postal_code, 'US')" in sql
     assert "AS source_zip5" in sql
     assert "COALESCE(a.zip5, k.source_zip5) AS zip5" in sql
+    assert "SELECT\n            k.*," not in sql
+    assert "k.location_hash,\n            k.npi," in sql
     assert "LEFT JOIN mrf.address_archive_v2 a" in sql
     assert "NULL::varchar AS node_id" in sql
     assert "'payer_a'::varchar AS source_key" in sql
