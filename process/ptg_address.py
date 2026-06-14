@@ -132,14 +132,10 @@ async def _current_source_snapshot(db_schema: str, source_key: str | None) -> tu
             source_key=source_key,
         )
     else:
-        rows = await db.all(
-            f"""
-            SELECT source_key, snapshot_id
-              FROM {_quote_ident(db_schema)}.ptg2_current_source_snapshot
-             ORDER BY updated_at DESC NULLS LAST, source_key
-             LIMIT 1
-            """
-        )
+        rows = [
+            {"source_key": source_key, "snapshot_id": snapshot_id}
+            for source_key, snapshot_id in (await _current_source_snapshots(db_schema))[:1]
+        ]
     if not rows:
         return None
     resolved_source_key = _clean_optional(_row_get(rows[0], "source_key"))
@@ -147,6 +143,31 @@ async def _current_source_snapshot(db_schema: str, source_key: str | None) -> tu
     if not resolved_source_key or not resolved_snapshot_id:
         return None
     return resolved_source_key, resolved_snapshot_id
+
+
+async def _current_source_snapshots(db_schema: str) -> list[tuple[str, str]]:
+    if not await _table_exists(db_schema, "ptg2_current_source_snapshot"):
+        return []
+    rows = await db.all(
+        f"""
+        SELECT source_key, snapshot_id
+          FROM {_quote_ident(db_schema)}.ptg2_current_source_snapshot
+         ORDER BY updated_at DESC NULLS LAST, source_key
+        """
+    )
+    snapshots: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for row in rows:
+        source_key = _clean_optional(_row_get(row, "source_key"))
+        snapshot_id = _clean_optional(_row_get(row, "snapshot_id"))
+        if not source_key or not snapshot_id:
+            continue
+        key = (source_key, snapshot_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        snapshots.append(key)
+    return snapshots
 
 
 async def _snapshot_manifest_tables(db_schema: str, snapshot_id: str | None) -> dict[str, str | None]:
@@ -209,6 +230,46 @@ async def _resolve_ptg_address_input(
         resolved_snapshot_id,
     )
     return resolved_source_key, resolved_snapshot_id, manifest_tables
+
+
+async def _resolve_ptg_address_inputs(
+    db_schema: str,
+    *,
+    source_key: str | None,
+    snapshot_id: str | None,
+    import_date: str,
+) -> list[tuple[str, str, dict[str, str | None]]]:
+    if _clean_optional(source_key) or _clean_optional(snapshot_id):
+        return [
+            await _resolve_ptg_address_input(
+                db_schema,
+                source_key=source_key,
+                snapshot_id=snapshot_id,
+                import_date=import_date,
+            )
+        ]
+
+    current_snapshots = await _current_source_snapshots(db_schema)
+    if not current_snapshots:
+        return [
+            await _resolve_ptg_address_input(
+                db_schema,
+                source_key=None,
+                snapshot_id=None,
+                import_date=import_date,
+            )
+        ]
+
+    inputs: list[tuple[str, str, dict[str, str | None]]] = []
+    for resolved_source_key, resolved_snapshot_id in current_snapshots:
+        inputs.append(
+            (
+                resolved_source_key,
+                resolved_snapshot_id,
+                await _snapshot_manifest_tables(db_schema, resolved_snapshot_id),
+            )
+        )
+    return inputs
 
 
 def _provider_location_source_ctes(db_schema: str, provider_group_location_table: str | None) -> str:
@@ -532,45 +593,85 @@ async def process_data(ctx, task=None):
         await db.create_table(stage_cls.__table__, checkfirst=True)
         context["stage_prepared"] = True
 
-    source_key, snapshot_id, manifest_tables = await _resolve_ptg_address_input(
+    explicit_source_key = task.get("source_key") or os.getenv("HLTHPRT_PTG_ADDRESS_SOURCE_KEY")
+    explicit_snapshot_id = task.get("snapshot_id") or os.getenv("HLTHPRT_PTG_ADDRESS_SNAPSHOT_ID")
+    explicit_input = bool(_clean_optional(explicit_source_key) or _clean_optional(explicit_snapshot_id))
+    address_inputs = await _resolve_ptg_address_inputs(
         db_schema,
-        source_key=task.get("source_key") or os.getenv("HLTHPRT_PTG_ADDRESS_SOURCE_KEY"),
-        snapshot_id=task.get("snapshot_id") or os.getenv("HLTHPRT_PTG_ADDRESS_SNAPSHOT_ID"),
+        source_key=explicit_source_key,
+        snapshot_id=explicit_snapshot_id,
         import_date=import_date,
     )
-    provider_group_location_table = manifest_tables.get("provider_group_location_table")
-    serving_rate_compact_table = manifest_tables.get("serving_rate_compact_table")
-    provider_set_component_table = manifest_tables.get("provider_set_component_table")
-    if not provider_group_location_table and not await _table_exists(db_schema, "ptg2_provider_location"):
-        raise RuntimeError(
-            "No PTG provider-location source is available; publish a compact PTG snapshot "
-            "with provider_group_location_table or run the legacy ptg2_provider_location projection."
-        )
-    context["source_key"] = source_key
-    context["snapshot_id"] = snapshot_id
-    if provider_group_location_table:
-        context["provider_group_location_table"] = provider_group_location_table
-    if serving_rate_compact_table:
-        context["serving_rate_compact_table"] = serving_rate_compact_table
-    if provider_set_component_table:
-        context["provider_set_component_table"] = provider_set_component_table
+    context["source_keys"] = [source_key for source_key, _, _ in address_inputs]
+    context["snapshot_ids"] = [snapshot_id for _, snapshot_id, _ in address_inputs]
+    if len(address_inputs) == 1:
+        context["source_key"] = address_inputs[0][0]
+        context["snapshot_id"] = address_inputs[0][1]
+    else:
+        context["source_key"] = ",".join(context["source_keys"])
+        context["snapshot_id"] = ",".join(context["snapshot_ids"])
     node_id = str(os.getenv("HLTHPRT_IMPORT_NODE_ID") or "").strip() or None
 
     await db.status(f"TRUNCATE TABLE {db_schema}.{stage_table};")
-    await db.status(
-        _ptg_address_insert_sql(
-            db_schema,
-            stage_table,
-            source_key=source_key,
-            snapshot_id=snapshot_id,
-            node_id=node_id,
-            address_canon_available=await _address_canon_available(db_schema),
-            archive_available=await _table_exists(db_schema, "address_archive_v2"),
-            provider_group_location_table=provider_group_location_table,
-            serving_rate_compact_table=serving_rate_compact_table,
-            provider_set_component_table=provider_set_component_table,
+    address_canon_available = await _address_canon_available(db_schema)
+    archive_available = await _table_exists(db_schema, "address_archive_v2")
+    legacy_provider_location_available = await _table_exists(db_schema, "ptg2_provider_location")
+    source_contexts: list[dict[str, str | None]] = []
+    skipped_sources: list[dict[str, str | None]] = []
+    for source_key, snapshot_id, manifest_tables in address_inputs:
+        provider_group_location_table = manifest_tables.get("provider_group_location_table")
+        serving_rate_compact_table = manifest_tables.get("serving_rate_compact_table")
+        provider_set_component_table = manifest_tables.get("provider_set_component_table")
+        if not provider_group_location_table and not legacy_provider_location_available:
+            if not explicit_input and len(address_inputs) > 1:
+                logger.warning(
+                    "Skipping PTG address source %s/%s because its snapshot has no provider-location table",
+                    source_key,
+                    snapshot_id,
+                )
+                skipped_sources.append(
+                    {
+                        "source_key": source_key,
+                        "snapshot_id": snapshot_id,
+                        "reason": "missing_provider_location_table",
+                    }
+                )
+                continue
+            raise RuntimeError(
+                f"No PTG provider-location source is available for {source_key}/{snapshot_id}; "
+                "publish a compact PTG snapshot with provider_group_location_table or run the legacy "
+                "ptg2_provider_location projection."
+            )
+        source_contexts.append(
+            {
+                "source_key": source_key,
+                "snapshot_id": snapshot_id,
+                "provider_group_location_table": provider_group_location_table,
+                "serving_rate_compact_table": serving_rate_compact_table,
+                "provider_set_component_table": provider_set_component_table,
+            }
         )
-    )
+        await db.status(
+            _ptg_address_insert_sql(
+                db_schema,
+                stage_table,
+                source_key=source_key,
+                snapshot_id=snapshot_id,
+                node_id=node_id,
+                address_canon_available=address_canon_available,
+                archive_available=archive_available,
+                provider_group_location_table=provider_group_location_table,
+                serving_rate_compact_table=serving_rate_compact_table,
+                provider_set_component_table=provider_set_component_table,
+            )
+        )
+    context["sources"] = source_contexts
+    context["skipped_sources"] = skipped_sources
+    if not source_contexts:
+        raise RuntimeError(
+            "No PTG provider-location sources were available; publish at least one compact PTG snapshot "
+            "with provider_group_location_table or run the legacy ptg2_provider_location projection."
+        )
     await _create_stage_indexes(stage_cls, db_schema)
     await db.status(f"ANALYZE {db_schema}.{stage_table};")
     row_count = int(await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{stage_table};") or 0)
