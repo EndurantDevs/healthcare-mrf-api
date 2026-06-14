@@ -1197,6 +1197,68 @@ async def test_ptg_address_input_resolves_current_snapshot_manifest_location(mon
     }
 
 
+@pytest.mark.asyncio
+async def test_ptg_address_inputs_resolve_all_current_source_snapshots(monkeypatch):
+    class FakeDB:
+        async def all(self, statement, **params):
+            assert "ptg2_current_source_snapshot" in statement
+            assert params == {}
+            return [
+                {"source_key": "payer_b", "snapshot_id": "snap_b"},
+                {"source_key": "payer_a", "snapshot_id": "snap_a"},
+                {"source_key": "payer_b", "snapshot_id": "snap_b"},
+                {"source_key": "", "snapshot_id": "ignored"},
+            ]
+
+        async def scalar(self, statement, **params):
+            assert "ptg2_snapshot" in statement
+            suffix = params["snapshot_id"][-1]
+            return {
+                "serving_index": {
+                    "table": f"mrf.ptg2_serving_rate_compact_{suffix}",
+                    "provider_group_location_table": f"mrf.ptg2_provider_group_location_{suffix}",
+                    "provider_set_component_table": f"mrf.ptg2_provider_set_component_{suffix}",
+                }
+            }
+
+    async def table_exists(schema_name, table_name):
+        assert schema_name == "mrf"
+        return table_name == "ptg2_current_source_snapshot" or table_name == "ptg2_snapshot" or table_name.endswith(
+            ("_a", "_b")
+        )
+
+    monkeypatch.setattr(ptg_address, "db", FakeDB())
+    monkeypatch.setattr(ptg_address, "_table_exists", table_exists)
+
+    inputs = await ptg_address._resolve_ptg_address_inputs(
+        "mrf",
+        source_key=None,
+        snapshot_id=None,
+        import_date="fallback_date",
+    )
+
+    assert inputs == [
+        (
+            "payer_b",
+            "snap_b",
+            {
+                "provider_group_location_table": "ptg2_provider_group_location_b",
+                "serving_rate_compact_table": "ptg2_serving_rate_compact_b",
+                "provider_set_component_table": "ptg2_provider_set_component_b",
+            },
+        ),
+        (
+            "payer_a",
+            "snap_a",
+            {
+                "provider_group_location_table": "ptg2_provider_group_location_a",
+                "serving_rate_compact_table": "ptg2_serving_rate_compact_a",
+                "provider_set_component_table": "ptg2_provider_set_component_a",
+            },
+        ),
+    ]
+
+
 def test_entity_address_unified_sql_falls_back_without_canonical_functions():
     insert_sql = entity_address_unified._insert_raw_from_source_sql(
         "mrf",
