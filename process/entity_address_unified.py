@@ -1093,6 +1093,115 @@ def _validate_publish_row_count(
         )
 
 
+async def _validate_publish_integrity(
+    db_schema: str,
+    stage_table: str,
+    support_stage_classes: dict[type, type],
+    *,
+    test_mode: bool,
+) -> dict[str, int | dict[str, int]]:
+    if test_mode:
+        return {}
+
+    failures: list[str] = []
+    metrics: dict[str, int | dict[str, int]] = {}
+
+    null_location_keys = int(
+        await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{stage_table} WHERE location_key IS NULL;")
+        or 0
+    )
+    metrics["null_location_keys"] = null_location_keys
+    if null_location_keys:
+        failures.append(f"{null_location_keys} staged rows have NULL location_key")
+
+    duplicate_location_keys = int(
+        await db.scalar(
+            f"""
+            SELECT COUNT(*)
+              FROM (
+                    SELECT location_key
+                      FROM {db_schema}.{stage_table}
+                     GROUP BY location_key
+                    HAVING COUNT(*) > 1
+                   ) AS duplicate_locations;
+            """
+        )
+        or 0
+    )
+    metrics["duplicate_location_keys"] = duplicate_location_keys
+    if duplicate_location_keys:
+        failures.append(f"{duplicate_location_keys} duplicate staged location_key values")
+
+    unresolved_merged_into_rows = 0
+    if await _table_exists(db_schema, "address_archive_v2"):
+        unresolved_merged_into_rows = int(
+            await db.scalar(
+                f"""
+                SELECT COUNT(*)
+                  FROM {db_schema}.{stage_table} AS t
+                  JOIN {db_schema}.address_archive_v2 AS a
+                    ON a.address_key = t.address_key
+                 WHERE t.address_key IS NOT NULL
+                   AND a.merged_into IS NOT NULL;
+                """
+            )
+            or 0
+        )
+    metrics["unresolved_merged_into_rows"] = unresolved_merged_into_rows
+    if unresolved_merged_into_rows:
+        failures.append(
+            f"{unresolved_merged_into_rows} staged rows point to address_archive_v2.merged_into redirects"
+        )
+
+    archive_identity_mismatch_rows = int(
+        await db.scalar(
+            f"""
+            SELECT COUNT(*)
+              FROM {db_schema}.{stage_table}
+             WHERE COALESCE(archive_identity_version, '') <> '{ARCHIVE_IDENTITY_VERSION}';
+            """
+        )
+        or 0
+    )
+    metrics["archive_identity_mismatch_rows"] = archive_identity_mismatch_rows
+    if archive_identity_mismatch_rows:
+        failures.append(
+            f"{archive_identity_mismatch_rows} staged rows use a non-current archive_identity_version"
+        )
+
+    bridge_orphans: dict[str, int] = {}
+    for model, support_stage_cls in support_stage_classes.items():
+        if model is EntityAddressEvidence:
+            continue
+        bridge_table = support_stage_cls.__tablename__
+        if not await _table_exists(db_schema, bridge_table):
+            failures.append(f"support stage table {bridge_table} is missing")
+            bridge_orphans[bridge_table] = -1
+            continue
+        orphan_count = int(
+            await db.scalar(
+                f"""
+                SELECT COUNT(*)
+                  FROM {db_schema}.{bridge_table} AS b
+                 WHERE NOT EXISTS (
+                       SELECT 1
+                         FROM {db_schema}.{stage_table} AS t
+                        WHERE t.location_key = b.location_key
+                 );
+                """
+            )
+            or 0
+        )
+        bridge_orphans[bridge_table] = orphan_count
+        if orphan_count:
+            failures.append(f"{orphan_count} rows in {bridge_table} reference missing staged location_key")
+    metrics["bridge_orphans"] = bridge_orphans
+
+    if failures:
+        raise RuntimeError("EntityAddressUnified publish integrity validation failed: " + "; ".join(failures))
+    return metrics
+
+
 def _insert_raw_from_source_sql(
     db_schema: str,
     raw_table: str,
@@ -3301,6 +3410,13 @@ async def shutdown(ctx):
         test_mode=bool(context.get("test_mode")),
         min_rows_required=min_rows_required,
     )
+    publish_validation = await _validate_publish_integrity(
+        db_schema,
+        stage_cls.__tablename__,
+        support_stage_classes,
+        test_mode=bool(context.get("test_mode")),
+    )
+    context["publish_validation"] = publish_validation
 
     async with db.transaction():
         table = EntityAddressUnified.__main_table__
@@ -3355,6 +3471,7 @@ async def shutdown(ctx):
             "inferred_rows": int(context.get("inferred_rows") or 0),
             "multi_source_rows": int(context.get("multi_source_rows") or 0),
             "support_counts": context.get("support_counts") or {},
+            "publish_validation": context.get("publish_validation") or {},
         },
     )
     print_time_info(context.get("start"))
