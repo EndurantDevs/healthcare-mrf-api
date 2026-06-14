@@ -44,6 +44,7 @@ DEFAULT_ENRICH_CONCURRENCY = 1
 DEFAULT_EVIDENCE_SHARDS = 16
 DEFAULT_EVIDENCE_CONCURRENCY = 4
 DEFAULT_BUILD_NETWORK_BRIDGE = False
+DEFAULT_COMPACT_SOURCE_RECORD_IDS = True
 ARCHIVE_IDENTITY_VERSION = "v1"
 BASE_ADDRESS_VERSION = "address_archive_v2:v1"
 SUPPORT_TABLE_MODELS = (
@@ -124,6 +125,39 @@ def _stage_index_name(stage_table: str, index_name: str) -> str:
 
 def _support_stage_classes(import_date: str) -> dict[type, type]:
     return {model: make_class(model, import_date) for model in SUPPORT_TABLE_MODELS}
+
+
+def _compact_stage_table_name(stage_table: str) -> str:
+    return _archived_identifier(stage_table, "_compact")
+
+
+def _entity_address_unified_columns() -> list[str]:
+    return [column.name for column in EntityAddressUnified.__table__.columns]
+
+
+async def _compact_hot_row_source_record_ids(db_schema: str, stage_table: str) -> int:
+    compact_table = _compact_stage_table_name(stage_table)
+    columns = _entity_address_unified_columns()
+    columns_sql = ", ".join(columns)
+    select_sql = ", ".join(
+        "ARRAY[]::varchar[] AS source_record_ids" if column == "source_record_ids" else column
+        for column in columns
+    )
+    await db.status(f"DROP TABLE IF EXISTS {db_schema}.{compact_table};")
+    await db.status(
+        f"CREATE TABLE {db_schema}.{compact_table} "
+        f"(LIKE {db_schema}.{stage_table} INCLUDING ALL);"
+    )
+    rowcount = await db.status(
+        f"""
+        INSERT INTO {db_schema}.{compact_table} ({columns_sql})
+        SELECT {select_sql}
+          FROM {db_schema}.{stage_table};
+        """
+    )
+    await db.status(f"DROP TABLE {db_schema}.{stage_table};")
+    await db.status(f"ALTER TABLE {db_schema}.{compact_table} RENAME TO {stage_table};")
+    return int(rowcount or 0)
 
 
 async def _create_stage_indexes(stage_cls, db_schema: str) -> None:
@@ -2804,6 +2838,9 @@ async def process_data(ctx, task=None):
         ctx["context"]["stage_indexes_prepared"] = False
         ctx["context"]["support_stage_prepared"] = False
         ctx["context"]["support_stage_indexes_prepared"] = False
+        ctx["context"]["support_stage_populated"] = False
+        ctx["context"]["support_counts"] = {}
+        ctx["context"]["hot_row_source_record_ids_compacted"] = False
 
     required_checks = [
         "npi",
@@ -3300,17 +3337,58 @@ async def process_data(ctx, task=None):
         "HLTHPRT_ENTITY_ADDRESS_UNIFIED_BUILD_NETWORK_BRIDGE",
         DEFAULT_BUILD_NETWORK_BRIDGE,
     )
-    support_counts = await _populate_support_stage_tables(
-        db_schema,
-        stage_table,
-        support_stage_classes,
-        source_run_id=import_date,
-        node_id=node_id,
-        raw_table=raw_table,
-        build_network_bridge=build_network_bridge,
-    )
+    cached_support_counts = context.get("support_counts")
+    if context.get("support_stage_populated") and isinstance(cached_support_counts, dict):
+        support_counts = {str(key): int(value) for key, value in cached_support_counts.items()}
+    else:
+        support_counts = await _populate_support_stage_tables(
+            db_schema,
+            stage_table,
+            support_stage_classes,
+            source_run_id=import_date,
+            node_id=node_id,
+            raw_table=raw_table,
+            build_network_bridge=build_network_bridge,
+        )
+        context["support_stage_populated"] = True
+        context["support_counts"] = support_counts
     if raw_table:
         await db.status(f"DROP TABLE IF EXISTS {db_schema}.{raw_table};")
+
+    if (
+        _env_bool(
+            "HLTHPRT_ENTITY_ADDRESS_UNIFIED_COMPACT_SOURCE_RECORD_IDS",
+            DEFAULT_COMPACT_SOURCE_RECORD_IDS,
+        )
+        and not context.get("hot_row_source_record_ids_compacted")
+    ):
+        if run_id:
+            enqueue_live_progress(
+                run_id=run_id,
+                importer="entity-address-unified",
+                status="running",
+                phase="entity-address-unified compacting hot rows",
+                unit="run",
+                done=0,
+                total=1,
+                pct=88,
+                message="rewriting hot rows without source record id arrays",
+            )
+        compacted_rows = await _compact_hot_row_source_record_ids(db_schema, stage_table)
+        context["hot_row_source_record_ids_compacted"] = True
+        context["hot_row_source_record_ids_compacted_rows"] = compacted_rows
+        if run_id:
+            enqueue_live_progress(
+                run_id=run_id,
+                importer="entity-address-unified",
+                status="running",
+                phase="entity-address-unified compacting hot rows",
+                unit="rows",
+                done=compacted_rows,
+                total=compacted_rows,
+                pct=89,
+                message=f"compacted {compacted_rows:,} hot rows",
+            )
 
     if not ctx["context"].get("stage_indexes_prepared"):
         if run_id:
