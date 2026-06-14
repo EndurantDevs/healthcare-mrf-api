@@ -497,11 +497,22 @@ def _has_insurance_total_cache_set(city: Optional[str], state: Optional[str], va
     )
 
 
-def _npi_detail_cache_key(npi: int, *, view: str, include_chain: bool, sync_geocode: bool) -> str:
+def _npi_detail_cache_key(
+    npi: int,
+    *,
+    view: str,
+    include_chain: bool,
+    sync_geocode: bool,
+    lookup_stored_geocode: bool,
+) -> str:
     schema = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     address_source = os.getenv(ADDRESS_SERVING_SOURCE_ENV) or ADDRESS_SERVING_SOURCE_LEGACY
     geocode_mode = "sync_geo" if sync_geocode else "stored_geo"
-    return f"{schema}|{address_source}|{int(npi)}|{view}|{'chain' if include_chain else 'default'}|{geocode_mode}"
+    archive_mode = "archive_geo" if lookup_stored_geocode else "no_archive_geo"
+    return (
+        f"{schema}|{address_source}|{int(npi)}|{view}|"
+        f"{'chain' if include_chain else 'default'}|{geocode_mode}|{archive_mode}"
+    )
 
 
 def _npi_detail_response_cache_get(cache_key: str) -> bytes | None:
@@ -3790,6 +3801,11 @@ async def get_plans_by_npi(_request, npi):
 async def get_npi(request, npi):
     force_address_update = _parse_bool_arg(request.args.get("force_address_update"), default=False)
     sync_geocode = _env_flag("HLTHPRT_NPI_DETAIL_SYNC_GEOCODE", "HLTHPRT_NPI_API_SYNC_GEOCODE", default=True)
+    lookup_stored_geocode = _env_flag(
+        "HLTHPRT_NPI_DETAIL_LOOKUP_STORED_GEOCODE",
+        "HLTHPRT_NPI_API_LOOKUP_STORED_GEOCODE",
+        default=True,
+    )
     include_chain_enrichment = _include_chain_provider_enrichment(request.args.get("show"))
     provider_enrichment_view = _normalize_provider_enrichment_view(request.args.get("view"))
     npi = int(npi)
@@ -3798,6 +3814,7 @@ async def get_npi(request, npi):
         view=provider_enrichment_view,
         include_chain=include_chain_enrichment,
         sync_geocode=sync_geocode,
+        lookup_stored_geocode=lookup_stored_geocode,
     )
     if not force_address_update:
         cached_body = _npi_detail_response_cache_get(cache_key)
@@ -3860,8 +3877,15 @@ async def get_npi(request, npi):
     async def _archive_coordinates_for(address):
         archive_table = await _v2_archive_table()
         if archive_table:
-            row = await db.first(
-                f"""
+            archive_params = {
+                "first_line": address.get("first_line"),
+                "second_line": address.get("second_line"),
+                "city_name": address.get("city_name"),
+                "state_name": address.get("state_name"),
+                "postal_code": address.get("postal_code"),
+                "country_code": address.get("country_code") or "US",
+            }
+            archive_sql = f"""
                 SELECT long, lat, formatted_address, place_id
                   FROM {db_schema}.{archive_table}
                  WHERE address_key = {db_schema}.addr_key_v1(
@@ -3869,14 +3893,12 @@ async def get_npi(request, npi):
                  )
                    AND lat IS NOT NULL
                    AND long IS NOT NULL
-                """,
-                first_line=address.get("first_line"),
-                second_line=address.get("second_line"),
-                city_name=address.get("city_name"),
-                state_name=address.get("state_name"),
-                postal_code=address.get("postal_code"),
-                country_code=address.get("country_code") or "US",
-            )
+                """
+            if request_session is not None:
+                result = await _execute_stmt(text(archive_sql), session=request_session, params=archive_params)
+                row = result.first()
+            else:
+                row = await db.first(archive_sql, **archive_params)
             if row:
                 data = row._mapping
                 return SimpleNamespace(
@@ -3885,7 +3907,11 @@ async def get_npi(request, npi):
                     formatted_address=data["formatted_address"],
                     place_id=data["place_id"],
                 )
-        return await db.scalar(select(AddressArchive).where(AddressArchive.checksum == address["checksum"]))
+        legacy_stmt = select(AddressArchive).where(AddressArchive.checksum == address["checksum"])
+        if request_session is not None:
+            result = await _execute_stmt(legacy_stmt, session=request_session)
+            return result.scalar()
+        return await db.scalar(legacy_stmt)
 
     async def update_addr_coordinates(address, long, lat, formatted_address, place_id):
         checksum = address["checksum"]
@@ -4054,7 +4080,7 @@ async def get_npi(request, npi):
             if request.app.config.get("NPI_API_UPDATE_GEOCODE") and not d["lat"]:
                 update_geo = True
 
-            if (not d["lat"]) and (not force_address_update):
+            if lookup_stored_geocode and (not d["lat"]) and (not force_address_update):
                 res = await _archive_coordinates_for(x)
                 if res:
                     d["long"] = res.long
@@ -4156,34 +4182,38 @@ async def get_npi(request, npi):
         if isinstance(address, dict):
             address.pop("address_key", None)
 
-    other_names_task = asyncio.create_task(_fetch_other_names(npi))
     if provider_enrichment_view == "summary":
-        provider_enrichment_task = asyncio.create_task(
-            _fetch_provider_enrichment_summary_detail(
-                npi,
-                include_chain=include_chain_enrichment,
-            )
-        )
+        fetch_provider_enrichment = _fetch_provider_enrichment_summary_detail
     else:
-        provider_enrichment_task = asyncio.create_task(
-            _fetch_provider_enrichment_detail(
-                npi,
-                include_chain=include_chain_enrichment,
-            )
-        )
+        fetch_provider_enrichment = _fetch_provider_enrichment_detail
 
     provider_enrichment_payload: Optional[dict[str, Any]] = None
     try:
-        other_names, provider_enrichment_payload = await asyncio.gather(
-            other_names_task,
-            provider_enrichment_task,
-        )
+        if request_session is not None:
+            other_names = await _fetch_other_names(npi, session=request_session)
+            provider_enrichment_payload = await fetch_provider_enrichment(
+                npi,
+                include_chain=include_chain_enrichment,
+                session=request_session,
+            )
+        else:
+            other_names_task = asyncio.create_task(_fetch_other_names(npi))
+            provider_enrichment_task = asyncio.create_task(
+                fetch_provider_enrichment(
+                    npi,
+                    include_chain=include_chain_enrichment,
+                )
+            )
+            other_names, provider_enrichment_payload = await asyncio.gather(
+                other_names_task,
+                provider_enrichment_task,
+            )
     except Exception as exc:  # pragma: no cover - defensive fallback for transient DB states
         logger.debug("Provider enrichment detail fetch failed for npi=%s: %s", npi, exc)
-        if not other_names_task.done():
+        if "other_names_task" in locals() and not other_names_task.done():
             other_names_task.cancel()
         try:
-            other_names = await _fetch_other_names(npi)
+            other_names = await _fetch_other_names(npi, session=request_session)
         except Exception:  # pragma: no cover - defensive fallback
             other_names = []
         provider_enrichment_payload = None
