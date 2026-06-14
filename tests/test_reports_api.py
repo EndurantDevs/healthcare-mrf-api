@@ -170,6 +170,88 @@ async def test_get_pharmacy_market_context_returns_market(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_fetch_pharmacy_context_uses_legacy_address_table_by_default(monkeypatch):
+    monkeypatch.delenv("HLTHPRT_ADDRESS_SERVING_SOURCE", raising=False)
+    monkeypatch.setattr(reports, "_table_exists", AsyncMock(return_value=False))
+
+    class Session:
+        def __init__(self):
+            self.sql = None
+
+        async def execute(self, stmt, _params):
+            self.sql = stmt.text
+            return _FakeMappingRowResult(
+                {
+                    "npi": 1518379601,
+                    "provider_organization_name": "Sample Pharmacy",
+                    "do_business_as_text": None,
+                    "chain_name": None,
+                    "state_name": "TX",
+                    "city_name": "Austin",
+                    "county_name": "Travis",
+                    "zip_code": "78701",
+                    "medicare_active": False,
+                    "mail_order": False,
+                    "pharmacy_type": None,
+                    "has_active_state_license": False,
+                    "disciplinary_flag_any": False,
+                }
+            )
+
+    session = Session()
+    result = await reports._fetch_pharmacy_context(
+        session,
+        npi=1518379601,
+        as_of=reports.datetime.date(2026, 6, 14),
+    )
+
+    assert result["npi"] == 1518379601
+    assert "FROM mrf.npi_address a" in session.sql
+    assert "FROM mrf.entity_address_unified a" not in session.sql
+
+
+@pytest.mark.asyncio
+async def test_fetch_pharmacy_context_uses_unified_address_table_when_enabled(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
+    monkeypatch.setattr(reports, "_table_exists", AsyncMock(return_value=False))
+
+    class Session:
+        def __init__(self):
+            self.sql = None
+
+        async def execute(self, stmt, _params):
+            self.sql = stmt.text
+            return _FakeMappingRowResult(
+                {
+                    "npi": 1518379601,
+                    "provider_organization_name": "Sample Pharmacy",
+                    "do_business_as_text": None,
+                    "chain_name": None,
+                    "state_name": "TX",
+                    "city_name": "Austin",
+                    "county_name": "Travis",
+                    "zip_code": "78701",
+                    "medicare_active": False,
+                    "mail_order": False,
+                    "pharmacy_type": None,
+                    "has_active_state_license": False,
+                    "disciplinary_flag_any": False,
+                }
+            )
+
+    session = Session()
+    result = await reports._fetch_pharmacy_context(
+        session,
+        npi=1518379601,
+        as_of=reports.datetime.date(2026, 6, 14),
+    )
+
+    assert result["npi"] == 1518379601
+    assert "FROM mrf.entity_address_unified a" in session.sql
+    assert "FROM mrf.npi_address a" not in session.sql
+
+
+@pytest.mark.asyncio
 async def test_query_market_summaries_avoids_count_query_when_data_present(monkeypatch):
     monkeypatch.setattr(reports, "_table_exists", AsyncMock(return_value=False))
     monkeypatch.setattr(reports, "_build_market_sql", lambda **_: ("SELECT count", "SELECT data", {}))
