@@ -621,6 +621,10 @@ def test_entity_address_unified_registers_ptg_address_overlay_source():
     assert "LEFT JOIN mrf.address_archive_v2 AS aa ON aa.address_key = p.address_key" in ptg_source
     assert "FROM mrf.npi_address AS pa WHERE pa.npi = p.npi AND pa.type = 'primary'" in ptg_source
     assert "('ptg:' || p.source_key || ':' || p.snapshot_id || ':' || p.location_key)" in ptg_source
+    assert "COALESCE(p.ptg_plan_array, ARRAY[]::varchar[])::varchar[] AS ptg_plan_array" in ptg_source
+    assert "WHEN COALESCE(CARDINALITY(p.ptg_source_array), 0) = 0 THEN ARRAY[p.source_key]::varchar[]" in ptg_source
+    assert "COALESCE(p.group_plan_array, ARRAY[]::varchar[])::varchar[] AS group_plan_array" in ptg_source
+    assert "('ptg:' || p.snapshot_id)::varchar AS ptg_address_version" in ptg_source
 
 
 def test_entity_address_unified_can_range_shard_large_source_selects():
@@ -678,6 +682,10 @@ def test_entity_address_unified_sql_carries_address_key(monkeypatch):
                NULL::varchar AS entity_subtype, 'primary'::varchar AS type,
                ARRAY[0]::int[] AS taxonomy_array, ARRAY[0]::int[] AS plans_network_array,
                ARRAY[0]::int[] AS procedures_array, ARRAY[0]::int[] AS medications_array,
+               ARRAY[]::varchar[] AS aca_plan_array, ARRAY[]::varchar[] AS aca_network_array,
+               ARRAY[]::varchar[] AS ptg_plan_array, ARRAY[]::varchar[] AS ptg_source_array,
+               ARRAY[]::varchar[] AS group_plan_array, 'v1'::varchar AS base_address_version,
+               NULL::varchar AS ptg_address_version,
                '1 Main St'::varchar AS first_line, NULL::varchar AS second_line,
                'Austin'::varchar AS city_name, 'TX'::varchar AS state_name,
                '78701'::varchar AS postal_code, 'US'::varchar AS country_code,
@@ -701,6 +709,9 @@ def test_entity_address_unified_sql_carries_address_key(monkeypatch):
     assert "SET premise_key = k.premise_key" in enrich_sql
     assert "location_key = encode(sha256(convert_to" in enrich_sql
     assert "mrf.addr_key_v1(first_line, second_line, city_name, state_name, postal_code, country_code) AS address_key" in insert_sql
+    assert "ptg_plan_array," in insert_sql
+    assert "COALESCE(ptg_plan_array, ARRAY[]::varchar[])::varchar[] AS ptg_plan_array" in insert_sql
+    assert "ptg_address_version," in insert_sql
     assert "address_key," in materialize_sql
     assert "location_key," in materialize_sql
     assert "archive_identity_version," in materialize_sql
@@ -820,6 +831,7 @@ def test_entity_address_unified_builds_evidence_and_bridge_stage_sql():
     assert "INSERT INTO mrf.entity_address_network_bridge_20260614" in sql_blob
     assert "unnest(COALESCE(t.plans_network_array, ARRAY[]::int[]))" in sql_blob
     assert "INSERT INTO mrf.entity_address_ptg_bridge_20260614" in sql_blob
+    assert "unnest(COALESCE(t.ptg_plan_array, ARRAY[]::varchar[]))" in sql_blob
     assert "record_id.value LIKE 'ptg:%'" in sql_blob
     assert "INSERT INTO mrf.entity_address_procedure_bridge_20260614" in sql_blob
     assert "'HP_PROCEDURE_CODE'::varchar AS code_system" in sql_blob
@@ -1029,9 +1041,18 @@ def test_ptg_address_insert_sql_uses_snapshot_provider_group_location_table():
         address_canon_available=True,
         archive_available=True,
         provider_group_location_table="ptg2_provider_group_location_abc123",
+        serving_rate_compact_table="ptg2_serving_rate_compact_abc123",
+        provider_set_component_table="ptg2_provider_set_component_abc123",
     )
 
     assert 'FROM "mrf"."ptg2_provider_group_location_abc123" loc' in sql
+    assert 'FROM "mrf"."ptg2_serving_rate_compact_abc123" r' in sql
+    assert 'JOIN "mrf"."ptg2_provider_set_component_abc123" c' in sql
+    assert "c.provider_set_hash = r.provider_set_hash" in sql
+    assert "WHERE r.snapshot_id = 'snap_1'" in sql
+    assert "ARRAY_AGG(DISTINCT NULLIF(r.plan_id::text, '')" in sql
+    assert "COALESCE(pgp.ptg_plan_array, ARRAY[]::varchar[]) AS ptg_plan_array" in sql
+    assert "COALESCE(pgp.ptg_plan_array, ARRAY[]::varchar[]) AS group_plan_array" in sql
     assert "FROM mrf.ptg2_provider_location loc" not in sql
     assert "'provider_group_location:' || loc.provider_group_hash::text" in sql
     assert 'loc."long"::numeric AS long' in sql
@@ -1058,7 +1079,9 @@ async def test_ptg_address_input_resolves_current_snapshot_manifest_location(mon
             assert params == {"snapshot_id": "snap_1"}
             return {
                 "serving_index": {
+                    "table": "mrf.ptg2_serving_rate_compact_abc123",
                     "provider_group_location_table": "mrf.ptg2_provider_group_location_abc123",
+                    "provider_set_component_table": "mrf.ptg2_provider_set_component_abc123",
                 }
             }
 
@@ -1067,13 +1090,15 @@ async def test_ptg_address_input_resolves_current_snapshot_manifest_location(mon
         return table_name in {
             "ptg2_current_source_snapshot",
             "ptg2_snapshot",
+            "ptg2_serving_rate_compact_abc123",
             "ptg2_provider_group_location_abc123",
+            "ptg2_provider_set_component_abc123",
         }
 
     monkeypatch.setattr(ptg_address, "db", FakeDB())
     monkeypatch.setattr(ptg_address, "_table_exists", table_exists)
 
-    source_key, snapshot_id, provider_group_location_table = await ptg_address._resolve_ptg_address_input(
+    source_key, snapshot_id, manifest_tables = await ptg_address._resolve_ptg_address_input(
         "mrf",
         source_key=None,
         snapshot_id=None,
@@ -1082,7 +1107,11 @@ async def test_ptg_address_input_resolves_current_snapshot_manifest_location(mon
 
     assert source_key == "payer_a"
     assert snapshot_id == "snap_1"
-    assert provider_group_location_table == "ptg2_provider_group_location_abc123"
+    assert manifest_tables == {
+        "provider_group_location_table": "ptg2_provider_group_location_abc123",
+        "serving_rate_compact_table": "ptg2_serving_rate_compact_abc123",
+        "provider_set_component_table": "ptg2_provider_set_component_abc123",
+    }
 
 
 def test_entity_address_unified_sql_falls_back_without_canonical_functions():
@@ -1096,6 +1125,10 @@ def test_entity_address_unified_sql_falls_back_without_canonical_functions():
                NULL::varchar AS entity_subtype, 'primary'::varchar AS type,
                ARRAY[0]::int[] AS taxonomy_array, ARRAY[0]::int[] AS plans_network_array,
                ARRAY[0]::int[] AS procedures_array, ARRAY[0]::int[] AS medications_array,
+               ARRAY[]::varchar[] AS aca_plan_array, ARRAY[]::varchar[] AS aca_network_array,
+               ARRAY[]::varchar[] AS ptg_plan_array, ARRAY[]::varchar[] AS ptg_source_array,
+               ARRAY[]::varchar[] AS group_plan_array, 'v1'::varchar AS base_address_version,
+               NULL::varchar AS ptg_address_version,
                '1 Main St'::varchar AS first_line, NULL::varchar AS second_line,
                'Austin'::varchar AS city_name, 'TX'::varchar AS state_name,
                '78701'::varchar AS postal_code, 'US'::varchar AS country_code,

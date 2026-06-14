@@ -37,6 +37,8 @@ logger = logging.getLogger(__name__)
 PTG_ADDRESS_QUEUE_NAME = "arq:PTGAddress"
 DEFAULT_MIN_ROWS = 1
 PTG_PROVIDER_GROUP_LOCATION_PREFIX = "ptg2_provider_group_location_"
+PTG_SERVING_RATE_COMPACT_PREFIX = "ptg2_serving_rate_compact_"
+PTG_PROVIDER_SET_COMPONENT_PREFIX = "ptg2_provider_set_component_"
 SNAPSHOT_TABLE_NAME_RE = re.compile(r"[a-z0-9_]{1,63}\Z")
 
 
@@ -82,7 +84,7 @@ def _manifest_serving_index(manifest: Any) -> dict[str, Any]:
     return data
 
 
-def _snapshot_provider_group_location_table_name(value: Any, db_schema: str) -> str | None:
+def _snapshot_table_name(value: Any, db_schema: str, *, prefix: str) -> str | None:
     raw = _clean_optional(value)
     if not raw:
         return None
@@ -93,11 +95,15 @@ def _snapshot_provider_group_location_table_name(value: Any, db_schema: str) -> 
         schema_name, table_name = db_schema, parts[0].strip()
     if schema_name != db_schema:
         return None
-    if not table_name.startswith(PTG_PROVIDER_GROUP_LOCATION_PREFIX):
+    if not table_name.startswith(prefix):
         return None
     if not SNAPSHOT_TABLE_NAME_RE.fullmatch(table_name):
         return None
     return table_name
+
+
+def _snapshot_provider_group_location_table_name(value: Any, db_schema: str) -> str | None:
+    return _snapshot_table_name(value, db_schema, prefix=PTG_PROVIDER_GROUP_LOCATION_PREFIX)
 
 
 def _qualified_table_ref(db_schema: str, table_name: str) -> str:
@@ -143,9 +149,13 @@ async def _current_source_snapshot(db_schema: str, source_key: str | None) -> tu
     return resolved_source_key, resolved_snapshot_id
 
 
-async def _snapshot_provider_group_location_table(db_schema: str, snapshot_id: str | None) -> str | None:
+async def _snapshot_manifest_tables(db_schema: str, snapshot_id: str | None) -> dict[str, str | None]:
     if not snapshot_id or not await _table_exists(db_schema, "ptg2_snapshot"):
-        return None
+        return {
+            "provider_group_location_table": None,
+            "serving_rate_compact_table": None,
+            "provider_set_component_table": None,
+        }
     manifest = await db.scalar(
         f"""
         SELECT manifest
@@ -155,13 +165,28 @@ async def _snapshot_provider_group_location_table(db_schema: str, snapshot_id: s
         """,
         snapshot_id=snapshot_id,
     )
-    table_name = _snapshot_provider_group_location_table_name(
-        _manifest_serving_index(manifest).get("provider_group_location_table"),
-        db_schema,
-    )
-    if not table_name or not await _table_exists(db_schema, table_name):
-        return None
-    return table_name
+    serving_index = _manifest_serving_index(manifest)
+    candidates = {
+        "provider_group_location_table": _snapshot_table_name(
+            serving_index.get("provider_group_location_table"),
+            db_schema,
+            prefix=PTG_PROVIDER_GROUP_LOCATION_PREFIX,
+        ),
+        "serving_rate_compact_table": _snapshot_table_name(
+            serving_index.get("table"),
+            db_schema,
+            prefix=PTG_SERVING_RATE_COMPACT_PREFIX,
+        ),
+        "provider_set_component_table": _snapshot_table_name(
+            serving_index.get("provider_set_component_table"),
+            db_schema,
+            prefix=PTG_PROVIDER_SET_COMPONENT_PREFIX,
+        ),
+    }
+    resolved: dict[str, str | None] = {}
+    for key, table_name in candidates.items():
+        resolved[key] = table_name if table_name and await _table_exists(db_schema, table_name) else None
+    return resolved
 
 
 async def _resolve_ptg_address_input(
@@ -170,7 +195,7 @@ async def _resolve_ptg_address_input(
     source_key: str | None,
     snapshot_id: str | None,
     import_date: str,
-) -> tuple[str, str, str | None]:
+) -> tuple[str, str, dict[str, str | None]]:
     resolved_source_key = _clean_optional(source_key)
     resolved_snapshot_id = _clean_optional(snapshot_id)
     if not resolved_snapshot_id:
@@ -179,11 +204,11 @@ async def _resolve_ptg_address_input(
             resolved_source_key, resolved_snapshot_id = current
     resolved_source_key = resolved_source_key or "ptg2"
     resolved_snapshot_id = resolved_snapshot_id or import_date
-    provider_group_location_table = await _snapshot_provider_group_location_table(
+    manifest_tables = await _snapshot_manifest_tables(
         db_schema,
         resolved_snapshot_id,
     )
-    return resolved_source_key, resolved_snapshot_id, provider_group_location_table
+    return resolved_source_key, resolved_snapshot_id, manifest_tables
 
 
 def _provider_location_source_ctes(db_schema: str, provider_group_location_table: str | None) -> str:
@@ -272,6 +297,41 @@ def _provider_location_source_ctes(db_schema: str, provider_group_location_table
     """
 
 
+def _provider_group_plan_cte(
+    db_schema: str,
+    *,
+    snapshot_id: str,
+    serving_rate_compact_table: str | None,
+    provider_set_component_table: str | None,
+) -> str:
+    if not serving_rate_compact_table or not provider_set_component_table:
+        return """
+    ,
+    provider_group_plans AS (
+        SELECT NULL::varchar AS provider_group_id, ARRAY[]::varchar[] AS ptg_plan_array
+        WHERE FALSE
+    )
+        """
+    return f"""
+    ,
+    provider_group_plans AS (
+        SELECT
+            NULLIF(c.provider_group_hash::text, '')::varchar AS provider_group_id,
+            ARRAY_REMOVE(
+                ARRAY_AGG(DISTINCT NULLIF(r.plan_id::text, '') ORDER BY NULLIF(r.plan_id::text, '')),
+                NULL
+            )::varchar[] AS ptg_plan_array
+          FROM {_qualified_table_ref(db_schema, serving_rate_compact_table)} r
+          JOIN {_qualified_table_ref(db_schema, provider_set_component_table)} c
+            ON c.provider_set_hash = r.provider_set_hash
+         WHERE r.snapshot_id = {_sql_literal(snapshot_id)}
+           AND NULLIF(c.provider_group_hash::text, '') IS NOT NULL
+           AND NULLIF(r.plan_id::text, '') IS NOT NULL
+         GROUP BY NULLIF(c.provider_group_hash::text, '')
+    )
+        """
+
+
 def _ptg_address_insert_sql(
     db_schema: str,
     stage_table: str,
@@ -282,8 +342,16 @@ def _ptg_address_insert_sql(
     address_canon_available: bool,
     archive_available: bool,
     provider_group_location_table: str | None = None,
+    serving_rate_compact_table: str | None = None,
+    provider_set_component_table: str | None = None,
 ) -> str:
     source_ctes = _provider_location_source_ctes(db_schema, provider_group_location_table)
+    plan_cte = _provider_group_plan_cte(
+        db_schema,
+        snapshot_id=snapshot_id,
+        serving_rate_compact_table=serving_rate_compact_table,
+        provider_set_component_table=provider_set_component_table,
+    )
     country_expr = "country_code" if provider_group_location_table else "'US'"
     address_key_expr = (
         f"{db_schema}.addr_key_v1(first_line, second_line, city, state, postal_code, {country_expr})"
@@ -369,7 +437,8 @@ def _ptg_address_insert_sql(
         observed_at,
         updated_at
     )
-    WITH {source_ctes},
+    WITH {source_ctes}
+    {plan_cte},
     keyed AS (
         SELECT
             *,
@@ -390,8 +459,14 @@ def _ptg_address_insert_sql(
         {_sql_literal(node_id)}::varchar AS node_id,
         {_sql_literal(source_key)}::varchar AS source_key,
         {_sql_literal(snapshot_id)}::varchar AS snapshot_id,
-        NULL::varchar AS plan_id,
-        NULL::varchar AS ptg_plan_id,
+        CASE WHEN CARDINALITY(COALESCE(pgp.ptg_plan_array, ARRAY[]::varchar[])) = 1
+             THEN pgp.ptg_plan_array[1]
+             ELSE NULL
+        END::varchar AS plan_id,
+        CASE WHEN CARDINALITY(COALESCE(pgp.ptg_plan_array, ARRAY[]::varchar[])) = 1
+             THEN pgp.ptg_plan_array[1]
+             ELSE NULL
+        END::varchar AS ptg_plan_id,
         NULL::varchar AS market_type,
         e.provider_group_id,
         e.provider_set_id,
@@ -422,14 +497,16 @@ def _ptg_address_insert_sql(
         e.county_fips,
         e.lat,
         e.long,
-        ARRAY[]::varchar[] AS ptg_plan_array,
+        COALESCE(pgp.ptg_plan_array, ARRAY[]::varchar[]) AS ptg_plan_array,
         ARRAY[{_sql_literal(source_key)}]::varchar[] AS ptg_source_array,
-        ARRAY[]::varchar[] AS group_plan_array,
+        COALESCE(pgp.ptg_plan_array, ARRAY[]::varchar[]) AS group_plan_array,
         {_sql_literal(BASE_ADDRESS_VERSION)}::varchar AS base_address_version,
         NULL::timestamptz AS ptg_snapshot_published_at,
         COALESCE(e.created_at, NOW())::timestamptz AS observed_at,
         NOW()::timestamptz AS updated_at
       FROM enriched e
+      LEFT JOIN provider_group_plans pgp
+        ON pgp.provider_group_id = e.provider_group_id
      WHERE e.zip5 IS NOT NULL OR e.state_code IS NOT NULL OR e.address_key IS NOT NULL
      ORDER BY {location_key}, e.created_at DESC NULLS LAST, e.location_hash;
     """
@@ -455,17 +532,28 @@ async def process_data(ctx, task=None):
         await db.create_table(stage_cls.__table__, checkfirst=True)
         context["stage_prepared"] = True
 
-    source_key, snapshot_id, provider_group_location_table = await _resolve_ptg_address_input(
+    source_key, snapshot_id, manifest_tables = await _resolve_ptg_address_input(
         db_schema,
         source_key=task.get("source_key") or os.getenv("HLTHPRT_PTG_ADDRESS_SOURCE_KEY"),
         snapshot_id=task.get("snapshot_id") or os.getenv("HLTHPRT_PTG_ADDRESS_SNAPSHOT_ID"),
         import_date=import_date,
     )
+    provider_group_location_table = manifest_tables.get("provider_group_location_table")
+    serving_rate_compact_table = manifest_tables.get("serving_rate_compact_table")
+    provider_set_component_table = manifest_tables.get("provider_set_component_table")
     if not provider_group_location_table and not await _table_exists(db_schema, "ptg2_provider_location"):
         raise RuntimeError(
             "No PTG provider-location source is available; publish a compact PTG snapshot "
             "with provider_group_location_table or run the legacy ptg2_provider_location projection."
         )
+    context["source_key"] = source_key
+    context["snapshot_id"] = snapshot_id
+    if provider_group_location_table:
+        context["provider_group_location_table"] = provider_group_location_table
+    if serving_rate_compact_table:
+        context["serving_rate_compact_table"] = serving_rate_compact_table
+    if provider_set_component_table:
+        context["provider_set_component_table"] = provider_set_component_table
     node_id = str(os.getenv("HLTHPRT_IMPORT_NODE_ID") or "").strip() or None
 
     await db.status(f"TRUNCATE TABLE {db_schema}.{stage_table};")
@@ -479,6 +567,8 @@ async def process_data(ctx, task=None):
             address_canon_available=await _address_canon_available(db_schema),
             archive_available=await _table_exists(db_schema, "address_archive_v2"),
             provider_group_location_table=provider_group_location_table,
+            serving_rate_compact_table=serving_rate_compact_table,
+            provider_set_component_table=provider_set_component_table,
         )
     )
     await _create_stage_indexes(stage_cls, db_schema)
