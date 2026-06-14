@@ -1,0 +1,92 @@
+name: Update Next Release Notes
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+
+jobs:
+  update-next-release:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Update next release issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          set -euo pipefail
+
+          if printf '%s' "$PR_TITLE" | grep -qiE '^(feat|feature)(\(.+\))?:'; then
+            SECTION="Features"
+          elif printf '%s' "$PR_TITLE" | grep -qiE '^fix(\(.+\))?:'; then
+            SECTION="Fixes"
+          elif printf '%s' "$PR_TITLE" | grep -qiE '^security(\(.+\))?:'; then
+            SECTION="Security"
+          elif printf '%s' "$PR_TITLE" | grep -qiE '^(ops|chore|ci)(\(.+\))?:'; then
+            SECTION="Operations"
+          else
+            SECTION="Other"
+          fi
+
+          gh label create next-release --repo "$REPO" --color 0E8A16 --description "Accumulated release notes" --force >/dev/null
+
+          ISSUE_JSON=$(gh issue list \
+            --repo "$REPO" \
+            --label next-release \
+            --state open \
+            --json number,body \
+            --jq '.[0] // empty')
+
+          TEMPLATE=$(cat <<'MD'
+          ### Features
+
+          ### Fixes
+
+          ### Security
+
+          ### Operations
+
+          ### Other
+          MD
+          )
+
+          if [ -z "$ISSUE_JSON" ]; then
+            ISSUE_URL=$(gh issue create \
+              --repo "$REPO" \
+              --title "Next Release Notes" \
+              --label next-release \
+              --body "$TEMPLATE")
+            ISSUE_NUMBER=$(printf '%s' "$ISSUE_URL" | grep -oE '[0-9]+$')
+            BODY="$TEMPLATE"
+          else
+            ISSUE_NUMBER=$(printf '%s' "$ISSUE_JSON" | jq -r '.number')
+            BODY=$(printf '%s' "$ISSUE_JSON" | jq -r '.body')
+          fi
+
+          if printf '%s' "$BODY" | grep -Fq "$PR_URL"; then
+            echo "PR already present in next release notes."
+            exit 0
+          fi
+
+          ENTRY="- ${PR_TITLE} [#${PR_NUMBER}](${PR_URL})"
+          export ENTRY
+          UPDATED=$(printf '%s\n' "$BODY" | awk -v section="### ${SECTION}" '
+            $0 == section {
+              print
+              print ENVIRON["ENTRY"]
+              next
+            }
+            { print }
+          ')
+
+          gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --body "$UPDATED"

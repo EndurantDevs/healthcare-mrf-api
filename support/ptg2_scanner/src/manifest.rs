@@ -36,6 +36,7 @@ impl GlobalId128 {
         Self(hasher.digest128().to_le_bytes())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn from_price_atom_parts(
         negotiated_type: Option<&str>,
         negotiated_rate: Option<&str>,

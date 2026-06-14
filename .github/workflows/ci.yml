@@ -4,60 +4,47 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  PYTHON_VERSION: "3.14"
+  CARGO_TERM_COLOR: always
 
 jobs:
-  docker-image-build:
+  public-hygiene:
+    name: public hygiene
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - name: Build Python 3.14 image
-        run: docker build --pull --tag healthcare-mrf-api:ci .
-      - name: Smoke Rust scanner in image
-        run: |
-          docker run --rm healthcare-mrf-api:ci test -x /opt/support/ptg2_scanner/target/release/ptg2_scanner
-          docker run --rm healthcare-mrf-api:ci sh -ec '
-            tmp=$(mktemp -d)
-            printf "1\t\\N\t123 Main St\tSuite 2\tAustin\tTX\t78701\tUS\n" > "$tmp/raw.copy"
-            /opt/support/ptg2_scanner/target/release/ptg2_scanner \
-              --address-canonicalize-copy "$tmp/raw.copy" "$tmp/keyed.copy"
-            test -s "$tmp/keyed.copy"
-          '
+      - name: Check public repository hygiene
+        run: python scripts/ci/public_hygiene.py
 
-  ptg2-scanner-tests:
+  python-quality:
+    name: python quality and focused tests
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-      - name: Run scanner tests
-        run: cargo test --manifest-path support/ptg2_scanner/Cargo.toml
-      - name: Build release scanner
-        run: cargo build --release --manifest-path support/ptg2_scanner/Cargo.toml
-      - name: Smoke address canonical COPY CLI
-        run: |
-          tmp=$(mktemp -d)
-          printf "1\t\\N\t123 Main St\tSuite 2\tAustin\tTX\t78701\tUS\n" > "$tmp/raw.copy"
-          support/ptg2_scanner/target/release/ptg2_scanner \
-            --address-canonicalize-copy "$tmp/raw.copy" "$tmp/keyed.copy"
-          test -s "$tmp/keyed.copy"
-
-  control-plane-tests:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.14"
+          python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements-dev.txt
-      - name: Compile control-plane modules
-        run: python -m compileall api process db
+      - name: Compile service modules
+        run: python -m compileall api process db scripts
+      - name: Guard request-time external calls
+        run: python scripts/ci/request_time_external_call_guard.py
       - name: Run control-plane unit tests
         run: >
           python -m pytest -q
@@ -76,11 +63,180 @@ jobs:
           tests/test_process_ptg_unit.py
           tests/test_ptg_control_unit.py
 
-  address-canonical-db-tests:
+  api-contract:
+    name: openapi contract
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+      - name: Run OpenAPI route/spec checks
+        run: python -m pytest -q tests/test_openapi_spec.py tests/test_api_init_and_utils.py tests/test_healthcheck.py
+
+  rust-scanner:
+    name: rust scanner
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: support/ptg2_scanner
+      - name: Format check
+        run: cargo fmt --manifest-path support/ptg2_scanner/Cargo.toml -- --check
+      - name: Clippy
+        run: cargo clippy --manifest-path support/ptg2_scanner/Cargo.toml --all-targets -- -D warnings
+      - name: Scanner tests
+        run: cargo test --manifest-path support/ptg2_scanner/Cargo.toml
+      - name: Cargo audit
+        run: |
+          cargo install cargo-audit --locked
+          cd support/ptg2_scanner
+          cargo audit
+      - name: Build release scanner
+        run: cargo build --release --manifest-path support/ptg2_scanner/Cargo.toml
+      - name: Smoke address canonical COPY CLI
+        run: |
+          tmp=$(mktemp -d)
+          printf "1\t\\N\t123 Main St\tSuite 2\tAustin\tTX\t78701\tUS\n" > "$tmp/raw.copy"
+          support/ptg2_scanner/target/release/ptg2_scanner \
+            --address-canonicalize-copy "$tmp/raw.copy" "$tmp/keyed.copy"
+          test -s "$tmp/keyed.copy"
+
+  security:
+    name: dependency and semgrep security
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Python dependency audit
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pip-audit
+          pip-audit -r requirements.txt
+          pip-audit -r requirements-dev.txt
+      - name: Semgrep
+        uses: semgrep/semgrep-action@v1
+        with:
+          config: .semgrep.yml
+
+  docker-image-build:
+    name: docker image and runtime smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
     services:
       postgres:
-        image: postgres:16
+        image: postgis/postgis:18-3.6
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: healthporta_docker_smoke
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d healthporta_docker_smoke"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Python 3.14 image
+        run: docker build --pull --tag healthcare-mrf-api:ci .
+      - name: Smoke Rust scanner in image
+        run: |
+          docker run --rm healthcare-mrf-api:ci test -x /opt/support/ptg2_scanner/target/release/ptg2_scanner
+          docker run --rm healthcare-mrf-api:ci sh -ec '
+            tmp=$(mktemp -d)
+            printf "1\t\\N\t123 Main St\tSuite 2\tAustin\tTX\t78701\tUS\n" > "$tmp/raw.copy"
+            /opt/support/ptg2_scanner/target/release/ptg2_scanner \
+              --address-canonicalize-copy "$tmp/raw.copy" "$tmp/keyed.copy"
+            test -s "$tmp/keyed.copy"
+          '
+      - name: Runtime health smoke
+        run: |
+          docker run --rm -d --name healthcare-mrf-api-ci --network host \
+            -e HLTHPRT_DB_HOST=127.0.0.1 \
+            -e HLTHPRT_DB_PORT=5432 \
+            -e HLTHPRT_DB_USER=postgres \
+            -e HLTHPRT_DB_PASSWORD=postgres \
+            -e HLTHPRT_DB_DATABASE=healthporta_docker_smoke \
+            -e HLTHPRT_DB_SCHEMA=mrf \
+            healthcare-mrf-api:ci
+          trap 'docker logs healthcare-mrf-api-ci || true; docker rm -f healthcare-mrf-api-ci || true' EXIT
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8080/api/v1/healthcheck/ >/tmp/health.json; then
+              cat /tmp/health.json
+              exit 0
+            fi
+            sleep 2
+          done
+          exit 1
+
+  worker-queue-smoke:
+    name: redis worker queue smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      HLTHPRT_REDIS_ADDRESS: redis://127.0.0.1:6379
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+      - name: Verify Redis queue depth path
+        run: |
+          python - <<'PY'
+          import asyncio
+          from redis.asyncio import Redis
+
+          async def main():
+              redis = Redis(host="127.0.0.1", port=6379, decode_responses=True)
+              await redis.rpush("arq:ci-smoke", "healthporta-ci")
+              assert await redis.llen("arq:ci-smoke") == 1
+              await redis.delete("arq:ci-smoke")
+              await redis.aclose()
+
+          asyncio.run(main())
+          PY
+      - name: Run worker control tests
+        run: python -m pytest -q tests/test_control_workers.py tests/test_control_imports_api.py tests/test_control_cancel.py
+
+  address-canonical-db-tests:
+    name: postgres18 postgis address canonical tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgis/postgis:18-3.6
         env:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: healthporta_address_canon_test
@@ -100,20 +256,38 @@ jobs:
       HLTHPRT_DB_DATABASE: healthporta_address_canon_test
       HLTHPRT_DB_SCHEMA: mrf
       DB_SCHEMA: mrf
-      # No redis service: the DB suite runs without a control run_id, so the
-      # live-progress path returns before touching Redis (process/live_progress.py).
+      HLTHPRT_REDIS_ADDRESS: redis://127.0.0.1:6379
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.14"
+          python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements-dev.txt
-      - name: Prepare address canonical schema
+      - name: Prepare PostGIS and address canonical schema
         run: |
+          python - <<'PY'
+          import asyncio
+          import asyncpg
+          import os
+
+          async def main():
+              conn = await asyncpg.connect(
+                  host=os.environ["HLTHPRT_DB_HOST"],
+                  port=int(os.environ["HLTHPRT_DB_PORT"]),
+                  user=os.environ["HLTHPRT_DB_USER"],
+                  password=os.environ["HLTHPRT_DB_PASSWORD"],
+                  database=os.environ["HLTHPRT_DB_DATABASE"],
+              )
+              await conn.execute("CREATE EXTENSION IF NOT EXISTS postgis")
+              await conn.execute('CREATE SCHEMA IF NOT EXISTS "mrf"')
+              await conn.close()
+
+          asyncio.run(main())
+          PY
           alembic stamp 20260610143000_address_checksums_bigint
           alembic upgrade head
       - name: Build Rust scanner for parity tests

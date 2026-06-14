@@ -141,7 +141,7 @@ cargo build --release --manifest-path support/ptg2_scanner/Cargo.toml
 ```
 
 Dev-server NPI shutdown optimization verification from 2026-06-13
-(`ubuntu@ns1033171.ip-40-160-70.us`, PostgreSQL 18.4, 24 cores):
+(`ubuntu@dev-host.example`, PostgreSQL 18.4, 24 cores):
 
 - Python 3.14.6 was provisioned with `uv`; focused parallel verification
   passed with 24 workers:

@@ -1,0 +1,35 @@
+rules:
+  - id: python-subprocess-shell-true
+    languages: [python]
+    severity: ERROR
+    message: Avoid shell=True; pass argv lists to subprocess APIs.
+    pattern-either:
+      - pattern: subprocess.run(..., shell=True, ...)
+      - pattern: subprocess.Popen(..., shell=True, ...)
+      - pattern: subprocess.call(..., shell=True, ...)
+      - pattern: subprocess.check_call(..., shell=True, ...)
+      - pattern: subprocess.check_output(..., shell=True, ...)
+
+  - id: python-eval-exec
+    languages: [python]
+    severity: ERROR
+    message: eval/exec is not allowed in service code.
+    pattern-either:
+      - pattern: eval(...)
+      - pattern: exec(...)
+
+  - id: hardcoded-token-shape
+    languages: [python]
+    severity: ERROR
+    message: Token-shaped secret committed in Python source.
+    pattern-regex: '(gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,})'
+
+  - id: silent-broad-exception
+    languages: [python]
+    severity: ERROR
+    message: Do not silently swallow broad exceptions.
+    pattern: |
+      try:
+        ...
+      except Exception:
+        pass
