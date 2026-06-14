@@ -545,6 +545,7 @@ async def test_propagate_child_address_keys_uses_parent_join_and_concurrency(mon
 
 def test_entity_address_unified_defaults_to_production_sized_publish_gate():
     assert entity_address_unified.DEFAULT_MIN_ROWS == 1_000_000
+    assert entity_address_unified.DEFAULT_COMPACT_SOURCE_RECORD_IDS is True
 
 
 def test_ffs_address_source_does_not_borrow_parent_street_lines():
@@ -846,6 +847,43 @@ def test_entity_address_unified_can_skip_network_bridge_stage_sql():
     assert "INSERT INTO mrf.entity_address_plan_bridge_20260614" in sql_blob
     assert "INSERT INTO mrf.entity_address_procedure_bridge_20260614" in sql_blob
     assert "INSERT INTO mrf.entity_address_medication_bridge_20260614" in sql_blob
+
+
+@pytest.mark.asyncio
+async def test_entity_address_unified_compacts_source_record_ids_by_rewrite(monkeypatch):
+    statements = []
+
+    class FakeDB:
+        async def status(self, statement):
+            statements.append(statement)
+            if "INSERT INTO mrf.entity_address_unified_stage_compact" in statement:
+                return 42
+            return None
+
+    monkeypatch.setattr(entity_address_unified, "db", FakeDB())
+
+    rows = await entity_address_unified._compact_hot_row_source_record_ids(
+        "mrf",
+        "entity_address_unified_stage",
+    )
+
+    assert rows == 42
+    assert statements[0] == "DROP TABLE IF EXISTS mrf.entity_address_unified_stage_compact;"
+    assert (
+        statements[1]
+        == "CREATE TABLE mrf.entity_address_unified_stage_compact "
+        "(LIKE mrf.entity_address_unified_stage INCLUDING ALL);"
+    )
+    insert_sql = statements[2]
+    assert "INSERT INTO mrf.entity_address_unified_stage_compact" in insert_sql
+    assert "source_record_ids" in insert_sql
+    assert "ARRAY[]::varchar[] AS source_record_ids" in insert_sql
+    assert "UPDATE mrf.entity_address_unified_stage" not in "\n".join(statements)
+    assert statements[3] == "DROP TABLE mrf.entity_address_unified_stage;"
+    assert (
+        statements[4]
+        == "ALTER TABLE mrf.entity_address_unified_stage_compact RENAME TO entity_address_unified_stage;"
+    )
 
 
 @pytest.mark.asyncio
