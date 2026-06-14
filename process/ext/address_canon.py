@@ -1049,10 +1049,11 @@ async def resolve_into_archive(
             HAVING count(DISTINCT unit_norm) > 1
         )
         SELECT jsonb_build_object(
-            'missing_zip', count(*) FILTER (WHERE zip5 IS NULL),
-            'missing_state', count(*) FILTER (WHERE state_code IS NULL),
+            'missing_zip', count(*) FILTER (WHERE country_code = 'US' AND zip5 IS NULL),
+            'missing_state', count(*) FILTER (WHERE country_code = 'US' AND state_code IS NULL),
             'missing_street', count(*) FILTER (
-                WHERE line1_norm IS NULL
+                WHERE country_code = 'US'
+                  AND line1_norm IS NULL
                   AND city_norm IS NOT NULL
                   AND state_code IS NOT NULL
                   AND zip5 IS NOT NULL
