@@ -15,7 +15,7 @@ from sanic.exceptions import InvalidUsage, NotFound
 from sqlalchemy import text
 
 from api.endpoint.pagination import parse_pagination
-from db.models import (NPIDataOtherIdentifier, NPIPhoneStaffing,
+from db.models import (EntityAddressUnified, NPIDataOtherIdentifier, NPIPhoneStaffing,
                        PartDPharmacyActivity, PharmacyLicenseRecord)
 
 blueprint = Blueprint("reports", url_prefix="/reports", version=1)
@@ -47,6 +47,7 @@ _ALLOWED_SORTS = {
 
 _TABLE_EXISTS_CACHE_TTL_SECONDS = 300.0
 _TABLE_EXISTS_CACHE: dict[str, tuple[float, bool]] = {}
+ADDRESS_SERVING_SOURCE_LEGACY = "legacy"
 ADDRESS_SERVING_SOURCE_UNIFIED = "entity_address_unified"
 
 _CHAIN_RULES: list[tuple[str, tuple[str, ...]]] = [
@@ -137,13 +138,35 @@ def _qualified_table_name(table) -> str:
 
 
 def _address_serving_source() -> str:
-    return str(os.getenv("HLTHPRT_ADDRESS_SERVING_SOURCE") or "legacy").strip().lower()
+    return str(
+        os.getenv("HLTHPRT_ADDRESS_SERVING_SOURCE") or ADDRESS_SERVING_SOURCE_UNIFIED
+    ).strip().lower()
 
 
-def _pharmacy_address_table_sql() -> str:
-    if _address_serving_source() == ADDRESS_SERVING_SOURCE_UNIFIED:
+def _pharmacy_address_table_sql(source: str | None = None) -> str:
+    if (source or _address_serving_source()) == ADDRESS_SERVING_SOURCE_UNIFIED:
         return "mrf.entity_address_unified"
     return "mrf.npi_address"
+
+
+def _pharmacy_address_is_unified(address_table_sql: str) -> bool:
+    return address_table_sql.endswith(".entity_address_unified")
+
+
+def _pharmacy_address_zip5_expr(alias: str, address_table_sql: str) -> str:
+    if _pharmacy_address_is_unified(address_table_sql):
+        return f"{alias}.zip5"
+    return f"LEFT(COALESCE({alias}.postal_code, ''), 5)"
+
+
+def _pharmacy_address_order_expr(alias: str, address_table_sql: str) -> str:
+    if _pharmacy_address_is_unified(address_table_sql):
+        return (
+            f"{alias}.npi, ({alias}.telephone_number IS NOT NULL) DESC, "
+            f"({alias}.address_precision = 'street') DESC, {alias}.source_count DESC NULLS LAST, "
+            f"{alias}.checksum ASC"
+        )
+    return f"{alias}.npi, ({alias}.telephone_number IS NOT NULL) DESC, {alias}.checksum ASC"
 
 
 async def _table_exists(session, table) -> bool:
@@ -159,6 +182,15 @@ async def _table_exists(session, table) -> bool:
     else:
         _TABLE_EXISTS_CACHE.pop(qualified, None)
     return exists
+
+
+async def _resolve_pharmacy_address_table_sql(session) -> str:
+    source = _address_serving_source()
+    if source != ADDRESS_SERVING_SOURCE_UNIFIED:
+        return _pharmacy_address_table_sql(ADDRESS_SERVING_SOURCE_LEGACY)
+    if await _table_exists(session, EntityAddressUnified.__table__):
+        return _pharmacy_address_table_sql(ADDRESS_SERVING_SOURCE_UNIFIED)
+    return _pharmacy_address_table_sql(ADDRESS_SERVING_SOURCE_LEGACY)
 
 
 def _slugify(value: str | None) -> str:
@@ -482,7 +514,15 @@ def _is_match_all_name_filters(names: Sequence[str]) -> bool:
     return all(set(name) <= {"%"} for name in normalized)
 
 
-def _build_chain_summary_sql(*, names: list[str], has_staffing_helper: bool, include_states: bool) -> tuple[str, dict[str, Any]]:
+def _build_chain_summary_sql(
+    *,
+    names: list[str],
+    has_staffing_helper: bool,
+    include_states: bool,
+    address_table_sql: str | None = None,
+) -> tuple[str, dict[str, Any]]:
+    address_table_sql = address_table_sql or _pharmacy_address_table_sql()
+    address_order_expr = _pharmacy_address_order_expr("a", address_table_sql)
     match_all_names = _is_match_all_name_filters(names)
     if match_all_names:
         name_clause = ""
@@ -510,7 +550,7 @@ staffing_by_phone AS (
         a.state_name,
         REGEXP_REPLACE(a.telephone_number, '[^0-9]', '', 'g') AS telephone_number,
         COUNT(DISTINCT a.npi)::int AS pharmacist_count
-    FROM {schema}.npi_address AS a
+    FROM {address_table_sql} AS a
     CROSS JOIN pharmacist_taxonomy AS pt
     WHERE a.type = 'primary'
       AND a.state_name IS NOT NULL
@@ -544,7 +584,7 @@ chain_pharmacies AS (
             ELSE TRUE
         END AS has_insurance,
         COALESCE(s.pharmacist_count, 0)::int AS pharmacist_count
-    FROM {schema}.npi_address AS a
+    FROM {address_table_sql} AS a
     CROSS JOIN pharmacy_taxonomy AS pt
     {"JOIN " + schema + ".npi AS d ON d.npi = a.npi" if not match_all_names else ""}
     LEFT JOIN staffing_by_phone AS s
@@ -553,7 +593,7 @@ chain_pharmacies AS (
     WHERE a.type = 'primary'
       AND a.taxonomy_array && pt.codes
       {("AND " + name_clause) if not match_all_names else ""}
-    ORDER BY a.npi, (a.telephone_number IS NOT NULL) DESC, a.checksum ASC
+    ORDER BY {address_order_expr}
 ),
 summary AS (
     SELECT
@@ -657,10 +697,12 @@ async def _query_chain_summary(
     include_states: bool = True,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], bool]:
     has_staffing_helper = await _table_exists(session, NPIPhoneStaffing.__table__)
+    address_table_sql = await _resolve_pharmacy_address_table_sql(session)
     sql, params = _build_chain_summary_sql(
         names=names,
         has_staffing_helper=has_staffing_helper,
         include_states=include_states,
+        address_table_sql=address_table_sql,
     )
     result = await session.execute(text(sql), params)
     row = result.mappings().first() or {}
@@ -718,7 +760,13 @@ def _pharmacy_chain_summary_methodology(*, staffing_helper_available: bool) -> d
     }
 
 
-def _build_pharmacy_state_stats_sql(*, has_staffing_helper: bool) -> str:
+def _build_pharmacy_state_stats_sql(
+    *,
+    has_staffing_helper: bool,
+    address_table_sql: str | None = None,
+) -> str:
+    address_table_sql = address_table_sql or _pharmacy_address_table_sql()
+    address_order_expr = _pharmacy_address_order_expr("a", address_table_sql)
     schema = "mrf"
     staffing_table = _qualified_table_name(NPIPhoneStaffing.__table__)
     if has_staffing_helper:
@@ -764,7 +812,7 @@ staffing_by_phone AS (
         a.state_name,
         REGEXP_REPLACE(a.telephone_number, '[^0-9]', '', 'g') AS telephone_number,
         COUNT(DISTINCT a.npi)::int AS pharmacist_count
-    FROM {schema}.npi_address AS a
+    FROM {address_table_sql} AS a
     CROSS JOIN pharmacist_taxonomy AS pt
     WHERE a.type = 'primary'
       AND (a.country_code IS NULL OR UPPER(a.country_code) IN ('US', 'USA'))
@@ -781,18 +829,18 @@ pharmacist_taxonomy AS (
     FROM {schema}.nucc_taxonomy
     WHERE classification = 'Pharmacist'
 ),""".format(schema=schema)
-        pharmacist_counts_cte = """
+        pharmacist_counts_cte = f"""
 pharmacist_base AS (
     SELECT DISTINCT ON (a.npi)
         a.npi::bigint AS npi,
         COALESCE(NULLIF(a.state_name, ''), 'NA') AS state_name,
         REGEXP_REPLACE(COALESCE(a.telephone_number, ''), '[^0-9]', '', 'g') AS telephone_number
-    FROM {schema}.npi_address AS a
+    FROM {address_table_sql} AS a
     CROSS JOIN pharmacist_taxonomy AS pt
     WHERE a.type = 'primary'
       AND (a.country_code IS NULL OR UPPER(a.country_code) IN ('US', 'USA'))
       AND a.taxonomy_array && pt.codes
-    ORDER BY a.npi, (a.telephone_number IS NOT NULL) DESC, a.checksum ASC
+    ORDER BY {address_order_expr}
 ),
 pharmacist_counts AS (
     SELECT
@@ -813,7 +861,7 @@ active_pharmacist_counts AS (
           AND ph.telephone_number = phm.telephone_number
     )
     GROUP BY phm.state_name
-)""".format(schema=schema)
+)"""
 
     return f"""
 WITH pharmacy_taxonomy AS (
@@ -833,12 +881,12 @@ pharmacy_base AS (
             WHEN a.plans_network_array @@ '0'::query_int THEN FALSE
             ELSE TRUE
         END AS has_insurance
-    FROM {schema}.npi_address AS a
+    FROM {address_table_sql} AS a
     CROSS JOIN pharmacy_taxonomy AS pt
     WHERE a.type = 'primary'
       AND (a.country_code IS NULL OR UPPER(a.country_code) IN ('US', 'USA'))
       AND a.taxonomy_array && pt.codes
-    ORDER BY a.npi, (a.telephone_number IS NOT NULL) DESC, a.checksum ASC
+    ORDER BY {address_order_expr}
 ),
 pharmacy_counts AS (
     SELECT
@@ -896,7 +944,11 @@ def _pharmacy_state_stats_methodology(*, staffing_helper_available: bool) -> dic
 
 async def _query_pharmacy_state_stats(session) -> tuple[list[dict[str, Any]], bool]:
     has_staffing_helper = await _table_exists(session, NPIPhoneStaffing.__table__)
-    sql = _build_pharmacy_state_stats_sql(has_staffing_helper=has_staffing_helper)
+    address_table_sql = await _resolve_pharmacy_address_table_sql(session)
+    sql = _build_pharmacy_state_stats_sql(
+        has_staffing_helper=has_staffing_helper,
+        address_table_sql=address_table_sql,
+    )
     result = await session.execute(text(sql))
     rows = []
     for row in result.mappings().all():
@@ -941,7 +993,10 @@ def _build_market_sql(
     county: str | None,
     zip_code: str | None,
     chain: str | None,
+    address_table_sql: str | None = None,
 ) -> tuple[str, str, dict[str, Any]]:
+    address_table_sql = address_table_sql or _pharmacy_address_table_sql()
+    address_zip5_expr = _pharmacy_address_zip5_expr("a", address_table_sql)
     params: dict[str, Any] = {}
     base_filters: list[str] = [
         "a.type = 'primary'",
@@ -957,7 +1012,7 @@ def _build_market_sql(
         base_filters.append("LOWER(COALESCE(g.county_name, '')) = :county")
         params["county"] = county.lower()
     if zip_code:
-        base_filters.append("LEFT(a.postal_code, 5) = :zip_code")
+        base_filters.append(f"{address_zip5_expr} = :zip_code")
         params["zip_code"] = zip_code
 
     scoped_filters: list[str] = []
@@ -1145,7 +1200,7 @@ identifier_by_npi AS (
         p.npi::bigint AS npi,
         UPPER(COALESCE(p.state_name, '')) AS state_code,
         REGEXP_REPLACE(COALESCE(p.telephone_number, ''), '[^0-9]', '', 'g') AS phone_digits
-    FROM mrf.npi_address p
+    FROM {address_table_sql} p
     CROSS JOIN pharmacist_codes pc
     WHERE p.type = 'primary'
       AND p.taxonomy_array && pc.codes
@@ -1188,7 +1243,7 @@ base AS (
         a.npi::bigint AS npi,
         a.city_name,
         a.state_name,
-        LEFT(COALESCE(a.postal_code, ''), 5) AS zip5,
+        {address_zip5_expr} AS zip5,
         g.county_name,
         COALESCE(g.population, 0)::bigint AS zip_population,
         REGEXP_REPLACE(COALESCE(a.telephone_number, ''), '[^0-9]', '', 'g') AS phone_digits,
@@ -1200,9 +1255,9 @@ base AS (
         {partd_type} AS pharmacy_type,
         {license_active} AS has_active_state_license,
         {disciplinary_flag} AS disciplinary_flag
-    FROM mrf.npi_address a
+    FROM {address_table_sql} a
     JOIN mrf.npi n ON n.npi = a.npi
-    LEFT JOIN mrf.geo_zip_lookup g ON g.zip_code = LEFT(COALESCE(a.postal_code, ''), 5)
+    LEFT JOIN mrf.geo_zip_lookup g ON g.zip_code = {address_zip5_expr}
     {partd_join}
     {license_join}
     CROSS JOIN pharmacy_codes pc
@@ -1455,6 +1510,7 @@ async def _query_market_summaries(
     has_partd = await _table_exists(session, PartDPharmacyActivity.__table__)
     has_license = await _table_exists(session, PharmacyLicenseRecord.__table__)
     has_other_id = await _table_exists(session, NPIDataOtherIdentifier.__table__)
+    address_table_sql = await _resolve_pharmacy_address_table_sql(session)
     count_sql, data_sql, params = _build_market_sql(
         scope=scope,
         sort=sort,
@@ -1469,6 +1525,7 @@ async def _query_market_summaries(
         county=county,
         zip_code=zip_code,
         chain=chain,
+        address_table_sql=address_table_sql,
     )
     params = dict(params)
     params.update(
@@ -1556,7 +1613,8 @@ async def _fetch_pharmacy_context(session, *, npi: int, as_of: datetime.date) ->
     partd_table = _qualified_table_name(PartDPharmacyActivity.__table__)
     license_table = _qualified_table_name(PharmacyLicenseRecord.__table__)
     other_id_table = _qualified_table_name(NPIDataOtherIdentifier.__table__)
-    address_table = _pharmacy_address_table_sql()
+    address_table = await _resolve_pharmacy_address_table_sql(session)
+    address_zip5_expr = _pharmacy_address_zip5_expr("a", address_table)
     chain_case = _chain_case_sql(
         "LOWER(COALESCE(n.provider_organization_name, '') || ' ' || COALESCE(n.do_business_as_text, ''))"
     )
@@ -1683,7 +1741,7 @@ SELECT
     a.npi::bigint AS npi,
     a.city_name,
     a.state_name,
-    LEFT(COALESCE(a.postal_code, ''), 5) AS zip_code,
+    {address_zip5_expr} AS zip_code,
     g.county_name,
     n.provider_organization_name,
     n.do_business_as_text,
@@ -1693,7 +1751,7 @@ SELECT
     {other_id_fields}
 FROM {address_table} a
 JOIN mrf.npi n ON n.npi = a.npi
-LEFT JOIN mrf.geo_zip_lookup g ON g.zip_code = LEFT(COALESCE(a.postal_code, ''), 5)
+LEFT JOIN mrf.geo_zip_lookup g ON g.zip_code = {address_zip5_expr}
 {partd_join}
 {license_join}
 {other_id_join}

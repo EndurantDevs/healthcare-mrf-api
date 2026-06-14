@@ -211,9 +211,13 @@ async def test_fetch_pharmacy_context_uses_legacy_address_table_by_default(monke
 
 
 @pytest.mark.asyncio
-async def test_fetch_pharmacy_context_uses_unified_address_table_when_enabled(monkeypatch):
-    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
-    monkeypatch.setattr(reports, "_table_exists", AsyncMock(return_value=False))
+async def test_fetch_pharmacy_context_uses_unified_address_table_by_default_when_available(monkeypatch):
+    monkeypatch.delenv("HLTHPRT_ADDRESS_SERVING_SOURCE", raising=False)
+
+    async def table_exists(_session, table):
+        return table is reports.EntityAddressUnified.__table__
+
+    monkeypatch.setattr(reports, "_table_exists", table_exists)
 
     class Session:
         def __init__(self):
@@ -249,6 +253,7 @@ async def test_fetch_pharmacy_context_uses_unified_address_table_when_enabled(mo
     assert result["npi"] == 1518379601
     assert "FROM mrf.entity_address_unified a" in session.sql
     assert "FROM mrf.npi_address a" not in session.sql
+    assert "a.zip5 AS zip_code" in session.sql
 
 
 @pytest.mark.asyncio
@@ -474,6 +479,8 @@ async def test_query_chain_summary_uses_helper_table_when_available(monkeypatch)
 
     assert has_helper is True
     assert "FROM mrf.npi_phone_staffing" in captured["sql"]
+    assert "FROM mrf.entity_address_unified AS a" in captured["sql"]
+    assert "FROM mrf.npi_address AS a" not in captured["sql"]
     assert summary["pharmacy_npi_count"] == 2
     assert histogram[0]["label"] == "1"
     assert states[0]["state"] == "CA"
@@ -506,6 +513,8 @@ async def test_query_chain_summary_falls_back_when_helper_missing(monkeypatch):
 
     assert has_helper is False
     assert "FROM mrf.npi_phone_staffing" not in captured["sql"]
+    assert "FROM mrf.npi_address AS a" in captured["sql"]
+    assert "FROM mrf.entity_address_unified AS a" not in captured["sql"]
     assert "GROUP BY a.state_name, REGEXP_REPLACE(a.telephone_number, '[^0-9]', '', 'g')" in captured["sql"]
     assert captured["params"]["include_states"] is False
     assert summary["pharmacy_npi_count"] == 0
@@ -513,7 +522,9 @@ async def test_query_chain_summary_falls_back_when_helper_missing(monkeypatch):
     assert states == []
 
 
-def test_build_market_sql_uses_index_friendly_state_and_zip_filters():
+def test_build_market_sql_uses_unified_address_table_and_index_friendly_filters(monkeypatch):
+    monkeypatch.delenv("HLTHPRT_ADDRESS_SERVING_SOURCE", raising=False)
+
     _count_sql, data_sql, params = reports._build_market_sql(
         scope="state",
         sort="access_score",
@@ -531,7 +542,11 @@ def test_build_market_sql_uses_index_friendly_state_and_zip_filters():
     )
     assert "a.state_name = :state" in data_sql
     assert "UPPER(COALESCE(a.state_name" not in data_sql
-    assert "LEFT(a.postal_code, 5) = :zip_code" in data_sql
+    assert "FROM mrf.entity_address_unified a" in data_sql
+    assert "FROM mrf.npi_address a" not in data_sql
+    assert "a.zip5 = :zip_code" in data_sql
+    assert "LEFT(a.postal_code, 5) = :zip_code" not in data_sql
+    assert "g.zip_code = a.zip5" in data_sql
     assert "pd.npi9 = (a.npi / 10)" in data_sql
     assert "has_ncpdp_identifier" in data_sql
     assert "has_medicaid_identifier" in data_sql
@@ -544,6 +559,31 @@ def test_build_market_sql_uses_index_friendly_state_and_zip_filters():
     assert "clia_identifier_count" in data_sql
     assert "medicare_identifier_count" in data_sql
     assert params["state"] == "TX"
+    assert params["zip_code"] == "78701"
+
+
+def test_build_market_sql_can_force_legacy_address_table(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "legacy")
+
+    _count_sql, data_sql, params = reports._build_market_sql(
+        scope="state",
+        sort="access_score",
+        order="desc",
+        include_staffing=False,
+        has_partd=False,
+        has_license=False,
+        has_other_id=False,
+        market_id_filter=None,
+        state=None,
+        city=None,
+        county=None,
+        zip_code="78701",
+        chain=None,
+    )
+
+    assert "FROM mrf.npi_address a" in data_sql
+    assert "FROM mrf.entity_address_unified a" not in data_sql
+    assert "LEFT(COALESCE(a.postal_code, ''), 5) = :zip_code" in data_sql
     assert params["zip_code"] == "78701"
 
 
@@ -606,6 +646,8 @@ async def test_query_pharmacy_state_stats_uses_helper_table(monkeypatch):
 
     assert has_helper is True
     assert "FROM mrf.npi_phone_staffing" in captured["sql"]
+    assert "FROM mrf.entity_address_unified AS a" in captured["sql"]
+    assert "FROM mrf.npi_address AS a" not in captured["sql"]
     by_state = {row["state"]: row for row in rows}
     assert by_state["CA"]["state"] == "CA"
 
