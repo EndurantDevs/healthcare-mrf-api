@@ -38,6 +38,38 @@ async def test_site_intelligence_requires_coordinates(site_intel_module):
         await site_intel_module.get_site_score(request)
 
 
+def test_site_intelligence_pharmacy_geo_stmt_uses_legacy_by_default(site_intel_module):
+    stmt = site_intel_module._pharmacy_geo_stmt(
+        use_unified_addresses=False,
+        lat=41.892,
+        lng=-87.635,
+        lat_delta=0.1,
+        lng_delta=0.1,
+    )
+    compiled = str(stmt.compile(compile_kwargs={"literal_binds": True})).lower()
+
+    assert "npi_address" in compiled
+    assert "entity_address_unified" not in compiled
+    assert "npi_taxonomy" in compiled
+    assert "3336" in compiled
+
+
+def test_site_intelligence_pharmacy_geo_stmt_uses_unified_addresses(site_intel_module):
+    stmt = site_intel_module._pharmacy_geo_stmt(
+        use_unified_addresses=True,
+        lat=41.892,
+        lng=-87.635,
+        lat_delta=0.1,
+        lng_delta=0.1,
+    )
+    compiled = str(stmt.compile(compile_kwargs={"literal_binds": True})).lower()
+
+    assert "entity_address_unified" in compiled
+    assert "npi_address" not in compiled
+    assert "npi_taxonomy" in compiled
+    assert "3336" in compiled
+
+
 @pytest.mark.asyncio
 async def test_site_intelligence_returns_trade_area_metrics(monkeypatch, site_intel_module):
     async def _always_exists(_session, _model):
