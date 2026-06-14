@@ -309,6 +309,40 @@ async def test_lookup_provider_count_query_avoids_coalesce():
 
 
 @pytest.mark.asyncio
+async def test_lookup_provider_count_uses_entity_address_when_enabled(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
+
+    class CaptureSession:
+        def __init__(self):
+            self.last_stmt = None
+
+        async def execute(self, stmt, *_args, **_kwargs):
+            self.last_stmt = stmt
+            return FakeResult(scalar_value=84)
+
+    session = CaptureSession()
+    value = await geo_module._lookup_provider_count(session, "60654")
+    assert value == 84
+    compiled = str(session.last_stmt).lower()
+    assert "entity_address_unified" in compiled
+    assert "npi_address" not in compiled
+    assert "coalesce" in compiled
+    assert "zip5" in compiled
+
+
+@pytest.mark.asyncio
+async def test_lookup_provider_count_falls_back_when_unified_missing(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
+    error = ProgrammingError("select", {}, None)
+    error.orig = UndefinedTableError("entity_address_unified missing")
+    session = FakeSession([error, FakeResult(scalar_value=21)])
+
+    value = await geo_module._lookup_provider_count(session, "60654")
+
+    assert value == 21
+
+
+@pytest.mark.asyncio
 async def test_geo_states_invalid_sort():
     request = types.SimpleNamespace(
         args={"sort": "invalid"},

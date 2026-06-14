@@ -1,5 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+import os
 from datetime import datetime
 
 from asyncpg import UndefinedColumnError, UndefinedTableError
@@ -10,6 +11,7 @@ from sqlalchemy.exc import ProgrammingError
 
 from api.endpoint.pagination import parse_pagination
 from db.models import (
+    EntityAddressUnified,
     GeoZipCensusProfile,
     GeoZipLookup,
     NPIAddress,
@@ -26,11 +28,14 @@ class TigerUnavailableError(RuntimeError):
 geo_zip_table = GeoZipLookup.__table__
 geo_census_table = GeoZipCensusProfile.__table__
 npi_address_table = NPIAddress.__table__
+entity_address_table = EntityAddressUnified.__table__
 pricing_places_zcta_table = PricingPlacesZcta.__table__
 svi_zcta_table = PricingSviZcta.__table__
 zip_state_table = ZipState.__table__
 zip_zcta5_table = Zip_zcta5.__table__
 blueprint = Blueprint('geo', url_prefix='/geo', version=1)
+
+ADDRESS_SERVING_SOURCE_UNIFIED = "entity_address_unified"
 
 CENSUS_PROFILE_FIELDS = (
     "total_population",
@@ -137,6 +142,10 @@ def _serialize_census_row(row_mapping):
     return {field: row_mapping.get(field) for field in CENSUS_PROFILE_FIELDS}
 
 
+def _address_serving_source() -> str:
+    return str(os.getenv("HLTHPRT_ADDRESS_SERVING_SOURCE") or "legacy").strip().lower()
+
+
 def _serialize_places_row(row_mapping):
     if row_mapping is None:
         return None
@@ -210,7 +219,18 @@ async def _lookup_svi_profile(session, zip_code):
     }
 
 
-async def _lookup_provider_count(session, zip_code):
+async def _execute_provider_count_stmt(session, stmt):
+    try:
+        result = await session.execute(stmt)
+    except ProgrammingError as exc:
+        if _is_optional_schema_error(exc):
+            await _rollback_session(session)
+            return None
+        raise
+    return result.scalar()
+
+
+async def _lookup_provider_count_legacy(session, zip_code):
     stmt = (
         select(func.count(func.distinct(npi_address_table.c.npi)))
         .where(
@@ -218,13 +238,28 @@ async def _lookup_provider_count(session, zip_code):
             func.left(npi_address_table.c.postal_code, 5) == zip_code,
         )
     )
-    try:
-        result = await session.execute(stmt)
-    except ProgrammingError as exc:
-        if _is_optional_schema_error(exc):
-            return None
-        raise
-    return result.scalar()
+    return await _execute_provider_count_stmt(session, stmt)
+
+
+async def _lookup_provider_count_unified(session, zip_code):
+    provider_npi = func.coalesce(entity_address_table.c.npi, entity_address_table.c.inferred_npi)
+    stmt = (
+        select(func.count(func.distinct(provider_npi)))
+        .where(
+            entity_address_table.c.type == "primary",
+            entity_address_table.c.zip5 == zip_code,
+            provider_npi.is_not(None),
+        )
+    )
+    return await _execute_provider_count_stmt(session, stmt)
+
+
+async def _lookup_provider_count(session, zip_code):
+    if _address_serving_source() == ADDRESS_SERVING_SOURCE_UNIFIED:
+        unified_count = await _lookup_provider_count_unified(session, zip_code)
+        if unified_count is not None:
+            return unified_count
+    return await _lookup_provider_count_legacy(session, zip_code)
 
 
 async def _lookup_census_profile(session, zip_code):
