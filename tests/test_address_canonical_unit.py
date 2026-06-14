@@ -1056,6 +1056,70 @@ def test_entity_address_unified_publish_row_count_guard():
 
 
 @pytest.mark.asyncio
+async def test_entity_address_unified_publish_integrity_checks_archive_and_bridge_tables(monkeypatch):
+    statements = []
+    stage_classes = entity_address_unified._support_stage_classes("20260614")
+
+    class FakeDB:
+        async def scalar(self, statement):
+            statements.append(statement)
+            return 0
+
+    async def table_exists(_schema, _table):
+        return True
+
+    monkeypatch.setattr(entity_address_unified, "db", FakeDB())
+    monkeypatch.setattr(entity_address_unified, "_table_exists", table_exists)
+
+    metrics = await entity_address_unified._validate_publish_integrity(
+        "mrf",
+        "entity_address_unified_stage",
+        stage_classes,
+        test_mode=False,
+    )
+
+    assert metrics["null_location_keys"] == 0
+    assert metrics["duplicate_location_keys"] == 0
+    assert metrics["unresolved_merged_into_rows"] == 0
+    assert metrics["archive_identity_mismatch_rows"] == 0
+    assert metrics["bridge_orphans"]["entity_address_plan_bridge_20260614"] == 0
+    assert any("a.merged_into IS NOT NULL" in statement for statement in statements)
+    assert any("COALESCE(archive_identity_version, '') <> 'v1'" in statement for statement in statements)
+    assert any(
+        "FROM mrf.entity_address_procedure_bridge_20260614 AS b" in statement
+        and "WHERE t.location_key = b.location_key" in statement
+        for statement in statements
+    )
+
+
+@pytest.mark.asyncio
+async def test_entity_address_unified_publish_integrity_fails_on_redirects_and_orphans(monkeypatch):
+    stage_classes = entity_address_unified._support_stage_classes("20260614")
+
+    class FakeDB:
+        async def scalar(self, statement):
+            if "a.merged_into IS NOT NULL" in statement:
+                return 2
+            if "FROM mrf.entity_address_procedure_bridge_20260614 AS b" in statement:
+                return 3
+            return 0
+
+    async def table_exists(_schema, _table):
+        return True
+
+    monkeypatch.setattr(entity_address_unified, "db", FakeDB())
+    monkeypatch.setattr(entity_address_unified, "_table_exists", table_exists)
+
+    with pytest.raises(RuntimeError, match="merged_into redirects.*procedure_bridge"):
+        await entity_address_unified._validate_publish_integrity(
+            "mrf",
+            "entity_address_unified_stage",
+            stage_classes,
+            test_mode=False,
+        )
+
+
+@pytest.mark.asyncio
 async def test_push_objects_rewrite_dedupes_mrf_address_on_full_unique_key(monkeypatch):
     captured_chunks = []
 
