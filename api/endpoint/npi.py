@@ -10,7 +10,7 @@ import random
 import re
 import time
 import urllib.parse
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from datetime import datetime
 from textwrap import dedent
 from types import SimpleNamespace
@@ -202,6 +202,12 @@ _NPI_FILTER_CAPABILITIES_CACHE: Optional[tuple[float, str, dict[str, bool]]] = N
 _NPI_PRIMARY_TOTAL_CACHE: Optional[tuple[float, int]] = None
 _NPI_HAS_INSURANCE_TOTAL_CACHE: dict[str, tuple[float, int]] = {}
 _NPI_ALL_TOTAL_TIMEOUT_SECONDS = float(os.getenv("HLTHPRT_NPI_ALL_TOTAL_TIMEOUT_SECONDS", "3.0"))
+_NPI_DETAIL_RESPONSE_CACHE_TTL_SECONDS = max(
+    float(os.getenv("HLTHPRT_NPI_DETAIL_RESPONSE_CACHE_TTL_SECONDS", "300")),
+    0.0,
+)
+_NPI_DETAIL_RESPONSE_CACHE_MAX_KEYS = max(int(os.getenv("HLTHPRT_NPI_DETAIL_RESPONSE_CACHE_MAX_KEYS", "4096")), 0)
+_NPI_DETAIL_RESPONSE_CACHE: OrderedDict[str, tuple[float, bytes]] = OrderedDict()
 _TAXONOMY_CODES_CACHE_TTL_SECONDS = 600.0
 _CLASSIFICATION_TAXONOMY_CODES_CACHE: dict[str, tuple[float, list[str]]] = {}
 _CLASSIFICATION_NPI_CACHE_TTL_SECONDS = 600.0
@@ -489,6 +495,45 @@ def _has_insurance_total_cache_set(city: Optional[str], state: Optional[str], va
             int(value),
         )
     )
+
+
+def _npi_detail_cache_key(npi: int, *, view: str, include_chain: bool) -> str:
+    schema = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    address_source = os.getenv(ADDRESS_SERVING_SOURCE_ENV) or ADDRESS_SERVING_SOURCE_LEGACY
+    return f"{schema}|{address_source}|{int(npi)}|{view}|{'chain' if include_chain else 'default'}"
+
+
+def _npi_detail_response_cache_get(cache_key: str) -> bytes | None:
+    if _NPI_DETAIL_RESPONSE_CACHE_TTL_SECONDS <= 0 or _NPI_DETAIL_RESPONSE_CACHE_MAX_KEYS <= 0:
+        return None
+    entry = _NPI_DETAIL_RESPONSE_CACHE.get(cache_key)
+    if entry is None:
+        return None
+    cached_at, payload = entry
+    if (time.monotonic() - cached_at) > _NPI_DETAIL_RESPONSE_CACHE_TTL_SECONDS:
+        _NPI_DETAIL_RESPONSE_CACHE.pop(cache_key, None)
+        return None
+    _NPI_DETAIL_RESPONSE_CACHE.move_to_end(cache_key)
+    return payload
+
+
+def _npi_detail_response_cache_set(cache_key: str, payload: bytes) -> bytes:
+    if _NPI_DETAIL_RESPONSE_CACHE_TTL_SECONDS <= 0 or _NPI_DETAIL_RESPONSE_CACHE_MAX_KEYS <= 0:
+        return payload
+    _NPI_DETAIL_RESPONSE_CACHE[cache_key] = (time.monotonic(), payload)
+    _NPI_DETAIL_RESPONSE_CACHE.move_to_end(cache_key)
+    while len(_NPI_DETAIL_RESPONSE_CACHE) > _NPI_DETAIL_RESPONSE_CACHE_MAX_KEYS:
+        _NPI_DETAIL_RESPONSE_CACHE.popitem(last=False)
+    return payload
+
+
+def _npi_detail_response_cacheable(data: dict[str, Any], *, force_address_update: bool) -> bool:
+    if force_address_update:
+        return False
+    for address in data.get("address_list") or []:
+        if isinstance(address, dict) and not address.get("lat"):
+            return False
+    return True
 
 
 async def _execute_stmt(stmt: Any, *, session: Any = None, params: Optional[dict[str, Any]] = None):
@@ -3735,9 +3780,19 @@ async def get_plans_by_npi(_request, npi):
 
 @blueprint.get("/id/<npi>")
 async def get_npi(request, npi):
-    force_address_update = request.args.get("force_address_update", 0)
+    force_address_update = _parse_bool_arg(request.args.get("force_address_update"), default=False)
     include_chain_enrichment = _include_chain_provider_enrichment(request.args.get("show"))
     provider_enrichment_view = _normalize_provider_enrichment_view(request.args.get("view"))
+    npi = int(npi)
+    cache_key = _npi_detail_cache_key(
+        npi,
+        view=provider_enrichment_view,
+        include_chain=include_chain_enrichment,
+    )
+    if not force_address_update:
+        cached_body = _npi_detail_response_cache_get(cache_key)
+        if cached_body is not None:
+            return response.raw(cached_body, content_type="application/json")
     request_session = _request_session(request)
     db_schema = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     address_archive_cutover = _env_flag("HLTHPRT_ADDRESS_ARCHIVE_CUTOVER")
@@ -4070,8 +4125,6 @@ async def get_npi(request, npi):
 
         return d
 
-    npi = int(npi)
-
     if request_session is not None:
         data = await _build_npi_details(npi, session=request_session)
     else:
@@ -4162,7 +4215,10 @@ async def get_npi(request, npi):
             }
 
     _redact_internal_address_fields(data)
-    return response.json(data, default=str)
+    response_body = json.dumps(data, default=str, separators=(",", ":")).encode("utf-8")
+    if _npi_detail_response_cacheable(data, force_address_update=force_address_update):
+        _npi_detail_response_cache_set(cache_key, response_body)
+    return response.raw(response_body, content_type="application/json")
 
 
 async def _build_npi_details(npi: int, *, session: Any = None) -> dict:

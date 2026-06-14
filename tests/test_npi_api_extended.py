@@ -967,6 +967,85 @@ async def test_get_npi_uses_cached_address(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_get_npi_uses_response_cache(monkeypatch):
+    calls = 0
+
+    async def fake_build(_npi):
+        nonlocal calls
+        calls += 1
+        return {
+            "npi": _npi,
+            "taxonomy_list": [],
+            "taxonomy_group_list": [],
+            "do_business_as": [],
+            "address_list": [{"checksum": 3, "lat": 40.0, "long": -80.0}],
+        }
+
+    monkeypatch.setattr(npi_module, "_NPI_DETAIL_RESPONSE_CACHE", npi_module.OrderedDict())
+    monkeypatch.setattr(npi_module, "_NPI_DETAIL_RESPONSE_CACHE_TTL_SECONDS", 300.0)
+    monkeypatch.setattr(npi_module, "_NPI_DETAIL_RESPONSE_CACHE_MAX_KEYS", 8)
+    monkeypatch.setattr(npi_module, "_build_npi_details", fake_build)
+    monkeypatch.setattr(npi_module, "_fetch_other_names", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        npi_module,
+        "_fetch_provider_enrichment_detail",
+        AsyncMock(return_value={"summary": None, "enrollments": {}, "ffs_visibility": {}}),
+    )
+
+    request = types.SimpleNamespace(
+        args={},
+        app=types.SimpleNamespace(config={"NPI_API_UPDATE_GEOCODE": False}),
+    )
+    first = await npi_module.get_npi(request, "1518379601")
+    second = await npi_module.get_npi(request, "1518379601")
+
+    assert json.loads(first.body)["npi"] == 1518379601
+    assert first.body == second.body
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_get_npi_force_address_update_bypasses_response_cache(monkeypatch):
+    calls = 0
+
+    async def fake_build(_npi):
+        nonlocal calls
+        calls += 1
+        return {
+            "npi": _npi,
+            "taxonomy_list": [],
+            "taxonomy_group_list": [],
+            "do_business_as": [],
+            "address_list": [{"checksum": 3, "lat": 40.0, "long": -80.0}],
+        }
+
+    monkeypatch.setattr(npi_module, "_NPI_DETAIL_RESPONSE_CACHE", npi_module.OrderedDict())
+    monkeypatch.setattr(npi_module, "_NPI_DETAIL_RESPONSE_CACHE_TTL_SECONDS", 300.0)
+    monkeypatch.setattr(npi_module, "_NPI_DETAIL_RESPONSE_CACHE_MAX_KEYS", 8)
+    monkeypatch.setattr(npi_module, "_build_npi_details", fake_build)
+    monkeypatch.setattr(npi_module, "_fetch_other_names", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        npi_module,
+        "_fetch_provider_enrichment_detail",
+        AsyncMock(return_value={"summary": None, "enrollments": {}, "ffs_visibility": {}}),
+    )
+
+    request = types.SimpleNamespace(
+        args={},
+        app=types.SimpleNamespace(config={"NPI_API_UPDATE_GEOCODE": False}),
+    )
+    await npi_module.get_npi(request, "1518379601")
+
+    force_request = types.SimpleNamespace(
+        args={"force_address_update": "1"},
+        app=types.SimpleNamespace(config={"NPI_API_UPDATE_GEOCODE": False}),
+    )
+    await npi_module.get_npi(force_request, "1518379601")
+
+    assert calls == 2
+
+
+@pytest.mark.asyncio
 async def test_get_npi_not_found(monkeypatch):
     monkeypatch.setattr(npi_module, "_build_npi_details", AsyncMock(return_value={}))
     request = types.SimpleNamespace(args={})
