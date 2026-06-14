@@ -8,6 +8,7 @@ import csv
 import datetime
 import hashlib
 import json
+import logging
 import os
 import re
 import secrets
@@ -24,15 +25,19 @@ from urllib.parse import urlparse
 from arq import create_pool
 
 from db.connection import db
-from db.models import (PartDFormularySnapshot, PartDImportRun, PartDMedicationCost,
-                       PartDMedicationCostStage, PartDPharmacyActivity,
-                       PartDPharmacyActivityStage)
-from process.ext.address_canon import resolve_into_archive, source_enabled, stamp_address_keys
-from process.ext.utils import db_startup, download_it, download_it_and_save, push_objects
+from db.models import (PartDFormularySnapshot, PartDImportRun,
+                       PartDMedicationCost, PartDMedicationCostStage,
+                       PartDPharmacyActivity, PartDPharmacyActivityStage)
+from process.control_lifecycle import mark_control_run
+from process.ext.address_canon import (resolve_into_archive, source_enabled,
+                                       stamp_address_keys)
+from process.ext.utils import (db_startup, download_it, download_it_and_save,
+                               push_objects)
+from process.live_progress import enqueue_live_progress
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
-from process.control_lifecycle import mark_control_run
-from process.live_progress import enqueue_live_progress
+
+logger = logging.getLogger(__name__)
 
 # CMS rows can exceed Python's default field limit.
 _csv_limit = sys.maxsize
@@ -1973,8 +1978,8 @@ async def partd_formulary_network_start(ctx, task=None):  # pragma: no cover
             try:
                 await _ensure_partd_secondary_indexes(schema)
                 await _analyze_partd_tables(schema)
-            except Exception:  # pylint: disable=broad-exception-caught
-                pass
+            except Exception as cleanup_exc:  # pylint: disable=broad-exception-caught
+                logger.warning("failed to restore/analyze Part D secondary indexes: %s", cleanup_exc)
         await _upsert_run(
             {
                 "run_id": run_id,

@@ -3,22 +3,20 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 
 from sqlalchemy import text
 
-from api.ptg2_index_cache import (
-    PTG2_ARTIFACT_KIND_SNAPSHOT_INDEX,
-    PTG2_INDEX_CACHE_TTL_SECONDS,
-    _PTG2_INDEX_CACHE,
-    _artifact_root,
-    _path_from_uri,
-    load_ptg2_index_from_path,
-)
+from api.ptg2_index_cache import (_PTG2_INDEX_CACHE,
+                                  PTG2_ARTIFACT_KIND_SNAPSHOT_INDEX,
+                                  PTG2_INDEX_CACHE_TTL_SECONDS, _artifact_root,
+                                  _path_from_uri, load_ptg2_index_from_path)
 from api.ptg2_types import PTG2ServingIndex
 
 PTG2_SCHEMA = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
+logger = logging.getLogger(__name__)
 _PTG2_SNAPSHOT_RESOLVE_CACHE: dict[tuple[object, ...], tuple[float, str | None]] = {}
 
 
@@ -101,8 +99,8 @@ async def current_source_snapshot_id_for_plan(session, args: dict[str, object]) 
         if callable(rollback):
             try:
                 await rollback()
-            except Exception:
-                pass
+            except Exception as rollback_exc:
+                logger.debug("failed to rollback source snapshot lookup: %s", rollback_exc)
         return _snapshot_cache_set(cache_key, None) if _snapshot_cache_enabled(session) else None
     value = result.scalar()
     value = str(value) if value else None

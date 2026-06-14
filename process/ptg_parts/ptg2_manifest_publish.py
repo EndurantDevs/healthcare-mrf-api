@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 from pathlib import Path
@@ -10,15 +11,15 @@ from typing import Any, Mapping
 
 from db.connection import db
 from process.ptg_parts.config import (
-    PTG2_BINARY_IDS_ENV,
-    PTG2_MANIFEST_PUBLISH_DB_DEDUPE_FALLBACK_ENV,
-    PTG2_UNLOGGED_STAGE_ENV,
-    _env_bool,
-)
-from process.ptg_parts.db_tables import _exact_table_rows, _quote_ident, _table_exists, _table_has_rows
-from process.ptg_parts.snapshot_tables import _ptg2_snapshot_index_name, _ptg2_snapshot_table_name
+    PTG2_BINARY_IDS_ENV, PTG2_MANIFEST_PUBLISH_DB_DEDUPE_FALLBACK_ENV,
+    PTG2_UNLOGGED_STAGE_ENV, _env_bool)
+from process.ptg_parts.db_tables import (_exact_table_rows, _quote_ident,
+                                         _table_exists, _table_has_rows)
+from process.ptg_parts.snapshot_tables import (_ptg2_snapshot_index_name,
+                                               _ptg2_snapshot_table_name)
 
 PTG2_MANIFEST_SERVING_COPY_ENV = "HLTHPRT_PTG2_MANIFEST_SERVING_COPY_PATH"
+logger = logging.getLogger(__name__)
 PTG2_MANIFEST_SERVING_COLUMNS = [
     "serving_content_hash_128",
     "plan_id",
@@ -95,8 +96,8 @@ async def _create_ptg2_manifest_serving_stage_table(token: str) -> str:
             f"ALTER TABLE {_quote_ident(schema_name)}.{_quote_ident(stage_table)} "
             "SET (autovacuum_enabled = false, toast.autovacuum_enabled = false);"
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("failed to disable autovacuum on PTG2 manifest stage table %s: %s", stage_table, exc)
     await _create_ptg2_manifest_price_atom_stage_table(stage_table)
     await _create_ptg2_manifest_provider_group_member_stage_table(stage_table)
     return stage_table

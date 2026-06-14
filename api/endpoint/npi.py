@@ -2,15 +2,15 @@
 # pylint: disable=not-callable,too-many-lines
 
 import asyncio
-from collections import defaultdict
 import json
 import logging
+import math
 import os
 import random
-import math
 import re
 import time
 import urllib.parse
+from collections import defaultdict
 from datetime import datetime
 from textwrap import dedent
 from types import SimpleNamespace
@@ -21,22 +21,22 @@ from sanic import Blueprint, response
 from sqlalchemy import func, or_, select
 from sqlalchemy.sql import literal_column, text, tuple_
 
-from api.code_systems import (
-    EXTERNAL_PROCEDURE_CODE_SYSTEMS,
-    INTERNAL_PROCEDURE_CODE_SYSTEM,
-    INTERNAL_RX_CODE_SYSTEM,
-)
+from api.code_systems import (EXTERNAL_PROCEDURE_CODE_SYSTEMS,
+                              INTERNAL_PROCEDURE_CODE_SYSTEM,
+                              INTERNAL_RX_CODE_SYSTEM)
 from api.endpoint.pagination import parse_pagination
-from db.models import (AddressArchive, EntityAddressUnified, Issuer, NPIAddress, NPIData,
-                       NPIDataOtherIdentifier, NPIDataTaxonomy,
-                       NPIDataTaxonomyGroup, NUCCTaxonomy, PlanNPIRaw,
-                       ProviderEnrichmentSummary, ProviderEnrollmentFFS,
+from db.models import (AddressArchive, EntityAddressUnified, Issuer,
+                       NPIAddress, NPIData, NPIDataOtherIdentifier,
+                       NPIDataTaxonomy, NPIDataTaxonomyGroup, NUCCTaxonomy,
+                       PlanNPIRaw, ProviderEnrichmentSummary,
+                       ProviderEnrollmentFFS,
                        ProviderEnrollmentFFSAdditionalNPI,
                        ProviderEnrollmentFFSAddress,
                        ProviderEnrollmentFFSReassignment,
                        ProviderEnrollmentFFSSecondarySpecialty,
-                       ProviderEnrollmentFQHC, ProviderEnrollmentHomeHealthAgency,
-                       ProviderEnrollmentHospital, ProviderEnrollmentHospice,
+                       ProviderEnrollmentFQHC,
+                       ProviderEnrollmentHomeHealthAgency,
+                       ProviderEnrollmentHospice, ProviderEnrollmentHospital,
                        ProviderEnrollmentRHC, ProviderEnrollmentSNF, db)
 from process.ext.utils import download_it
 
@@ -768,8 +768,8 @@ async def _fast_primary_npi_count() -> int:
         try:
             value = await scalar_fn(stmt)
             return _primary_total_cache_set(int(value or 0))
-        except Exception:  # pragma: no cover - fallback for lightweight test doubles
-            pass
+        except Exception as exc:  # pragma: no cover - fallback for lightweight test doubles
+            logger.debug("primary NPI count scalar path failed; falling back to acquire path: %s", exc)
     async with db.acquire() as conn:
         rows = await conn.all(stmt)
     value = rows[0][0] if rows else 0
@@ -1694,8 +1694,8 @@ def _extract_name_filters(request) -> list[str]:
     elif hasattr(args, "getall"):
         try:
             names.extend(args.getall("name_like"))
-        except Exception:  # pragma: no cover - defensive
-            pass
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("failed to read name_like filters with getall: %s", exc)
     else:
         maybe = args.get("name_like")
         if maybe:
@@ -1763,7 +1763,7 @@ async def active_pharmacists(request):
         session=request_session,
     )
     sql = text(
-        f"""
+        """
         WITH pharmacy_taxonomy AS (
             SELECT ARRAY_AGG(int_code) AS codes
             FROM mrf.nucc_taxonomy
@@ -1869,8 +1869,6 @@ async def pharmacists_per_pharmacy(request):
     state_filter_join = "AND ph.state_name = pc.state_name"
     if state:
         state_filter_join += " AND ph.state_name = :state"
-    state_filter_phm = "AND a.state_name = :state" if state else ""
-
     address_table_sql = await _address_serving_table_sql(
         {"npi", "type", "state_name", "telephone_number", "taxonomy_array"},
         session=request_session,
@@ -2660,7 +2658,6 @@ async def get_all(request):
         zip_code = filters.get("zip_code")
         phone_digits = filters.get("phone_digits")
         where = []
-        main_where = ["b.npi=g.npi"]
         address_where = ["c.type = 'primary'"]
         if classification:
             where.append("classification = :classification")

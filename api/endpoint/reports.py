@@ -5,20 +5,23 @@ from __future__ import annotations
 
 import datetime
 import json
+import logging
 import os
 import re
 import time
-from typing import Any
+from typing import Any, Sequence
 
 from sanic import Blueprint, response
 from sanic.exceptions import InvalidUsage, NotFound
 from sqlalchemy import text
 
 from api.endpoint.pagination import parse_pagination
-from db.models import (EntityAddressUnified, NPIDataOtherIdentifier, NPIPhoneStaffing,
-                       PartDPharmacyActivity, PharmacyLicenseRecord)
+from db.models import (EntityAddressUnified, NPIDataOtherIdentifier,
+                       NPIPhoneStaffing, PartDPharmacyActivity,
+                       PharmacyLicenseRecord)
 
 blueprint = Blueprint("reports", url_prefix="/reports", version=1)
+logger = logging.getLogger(__name__)
 
 DEFAULT_PAGE_SIZE = 25
 MAX_PAGE_SIZE = 200
@@ -420,8 +423,8 @@ def _extract_name_like_filters(args: Any) -> list[str]:
     elif hasattr(args, "getall"):
         try:
             names.extend(args.getall("name_like"))
-        except Exception:  # pragma: no cover - defensive
-            pass
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("failed to read report name_like filters with getall: %s", exc)
     single = args.get("name_like") if hasattr(args, "get") else None
     if single:
         names.append(single)

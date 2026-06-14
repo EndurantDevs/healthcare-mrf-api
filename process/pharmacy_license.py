@@ -10,6 +10,7 @@ import hashlib
 import html
 import io
 import json
+import logging
 import os
 import re
 import tempfile
@@ -24,15 +25,20 @@ import aiohttp
 from arq import create_pool
 
 from db.connection import db
-from db.models import (NPIAddress, NPIData, PartDPharmacyActivity, NPIDataOtherIdentifier, NPIDataTaxonomy,
+from db.models import (NPIAddress, NPIData, NPIDataOtherIdentifier,
+                       NPIDataTaxonomy, PartDPharmacyActivity,
                        PharmacyLicenseImportRun, PharmacyLicenseRecord,
-                       PharmacyLicenseRecordHistory, PharmacyLicenseRecordStage,
-                       PharmacyLicenseSnapshot,
+                       PharmacyLicenseRecordHistory,
+                       PharmacyLicenseRecordStage, PharmacyLicenseSnapshot,
                        PharmacyLicenseStateCoverage)
-from process.ext.address_canon import resolve_into_archive, source_enabled, stamp_address_keys
-from process.ext.utils import db_startup, download_it, ensure_database, push_objects
+from process.ext.address_canon import (resolve_into_archive, source_enabled,
+                                       stamp_address_keys)
+from process.ext.utils import (db_startup, download_it, ensure_database,
+                               push_objects)
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
+
+logger = logging.getLogger(__name__)
 from process.control_lifecycle import mark_control_run
 from process.live_progress import enqueue_live_progress
 
@@ -3326,8 +3332,8 @@ async def pharmacy_license_start(ctx, task=None):
             try:
                 await _ensure_secondary_indexes(schema)
                 await _analyze_tables(schema)
-            except Exception:  # pylint: disable=broad-exception-caught
-                pass
+            except Exception as cleanup_exc:  # pylint: disable=broad-exception-caught
+                logger.warning("failed to restore/analyze pharmacy license secondary indexes: %s", cleanup_exc)
         await _upsert_run(
             {
                 "run_id": run_id,

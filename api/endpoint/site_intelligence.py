@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import time
@@ -18,6 +19,7 @@ from db.models import (DoctorClinicianAddress, EntityAddressUnified,
                        PricingPlacesZcta)
 
 blueprint = Blueprint("site_intelligence", url_prefix="/site-intelligence", version=1)
+logger = logging.getLogger(__name__)
 
 EARTH_RADIUS_MILES = 3958.8
 MILES_TO_METERS = 1609.344
@@ -117,8 +119,8 @@ async def _zcta_overlap_available(session) -> bool:
         if hasattr(session, "rollback"):
             try:
                 await session.rollback()
-            except Exception:
-                pass
+            except Exception as rollback_exc:
+                logger.debug("failed to rollback ZCTA availability probe: %s", rollback_exc)
         available = False
     _ZCTA_OVERLAP_AVAILABLE_CACHE = (now, available)
     return available
@@ -166,8 +168,8 @@ async def _radius_zip_weights(
         if hasattr(session, "rollback"):
             try:
                 await session.rollback()
-            except Exception:
-                pass
+            except Exception as rollback_exc:
+                logger.debug("failed to rollback radius ZIP overlap query: %s", rollback_exc)
         return {}, "zip_centroid"
 
     weights: dict[str, float] = {}
