@@ -625,6 +625,29 @@ async def stamp_address_keys(
         pct=0,
         message="stamping canonical address keys",
     )
+    if not update_existing:
+        has_null_address_key = bool(
+            await db.scalar(
+                f"""
+                SELECT EXISTS (
+                    SELECT 1
+                      FROM {_qtable(schema, staging_table)}
+                     WHERE address_key IS NULL
+                     LIMIT 1
+                );
+                """
+            )
+        )
+        if not has_null_address_key:
+            _emit_progress(
+                phase="address key stamping",
+                unit="shard",
+                total=shards,
+                done=shards,
+                pct=100,
+                message="canonical address keys already populated",
+            )
+            return 0
 
     async def _stamp_shard(shard: int) -> None:
         nonlocal completed, total
@@ -687,6 +710,7 @@ async def propagate_child_address_keys(
     schema: str | None = None,
     shards: int = 8,
     cancel_check: Callable[[], Awaitable[None]] | None = None,
+    skip_when_child_fully_keyed: bool = False,
 ) -> int:
     """Copy address keys from an aggregate address table to child evidence rows."""
     schema = schema or _schema_name()
@@ -721,6 +745,31 @@ async def propagate_child_address_keys(
         pct=0,
         message="propagating canonical address keys",
     )
+    child = _qtable(schema, child_table)
+    parent = _qtable(schema, parent_table)
+    if skip_when_child_fully_keyed:
+        has_null_child_key = bool(
+            await db.scalar(
+                f"""
+                SELECT EXISTS (
+                    SELECT 1
+                      FROM {child}
+                     WHERE address_key IS NULL
+                     LIMIT 1
+                );
+                """
+            )
+        )
+        if not has_null_child_key:
+            _emit_progress(
+                phase="address key propagation",
+                unit="shard",
+                total=shards,
+                done=shards,
+                pct=100,
+                message="child canonical address keys already populated",
+            )
+            return 0
 
     async def _propagate_shard(shard: int) -> None:
         nonlocal completed, total
@@ -732,8 +781,6 @@ async def propagate_child_address_keys(
                 shard_filter = (
                     "AND mod(abs(hashtext(child.ctid::text)::bigint), :shards) = :shard"
                 )
-            child = _qtable(schema, child_table)
-            parent = _qtable(schema, parent_table)
             pending_table = _quote_ident("address_key_propagation_pending")
             params = {"shards": shards, "shard": shard}
             async with db.transaction() as session:

@@ -2254,6 +2254,7 @@ async def shutdown(ctx, task):
             mrf_evidence_stage.__tablename__,
             mrf_address_stage.__tablename__,
             schema=db_schema,
+            skip_when_child_fully_keyed=not repair_existing_address_keys,
         )
         await stamp_address_keys(
             mrf_evidence_stage.__tablename__,

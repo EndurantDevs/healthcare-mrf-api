@@ -321,6 +321,10 @@ async def test_stamp_address_keys_can_be_limited_to_null_rows(monkeypatch):
     calls = []
 
     class _FakeDB:
+        async def scalar(self, sql):
+            assert "WHERE address_key IS NULL" in sql
+            return True
+
         async def status(self, sql, **kwargs):
             calls.append((sql, kwargs))
             return 1
@@ -348,6 +352,46 @@ async def test_stamp_address_keys_can_be_limited_to_null_rows(monkeypatch):
     assert "WHERE address_key IS NULL" in calls[0][0]
     assert "target.address_key IS NULL" in calls[0][0]
     assert "target.address_key IS DISTINCT FROM" not in calls[0][0]
+
+
+@pytest.mark.asyncio
+async def test_stamp_address_keys_skips_null_only_work_when_already_keyed(monkeypatch):
+    calls = []
+    events = []
+
+    class _FakeDB:
+        async def scalar(self, sql):
+            calls.append(("scalar", sql))
+            assert "WHERE address_key IS NULL" in sql
+            return False
+
+        async def status(self, sql, **kwargs):
+            calls.append(("status", sql, kwargs))
+            return 1
+
+    monkeypatch.setenv("HLTHPRT_ADDRESS_CANON_STAMP_SHARDS", "8")
+    monkeypatch.setattr(address_canon, "db", _FakeDB())
+    monkeypatch.setattr(address_canon, "enqueue_live_progress", lambda **payload: events.append(payload))
+
+    stamped = await address_canon.stamp_address_keys(
+        "address_stage",
+        {
+            "first_line": "first_line",
+            "second_line": "second_line",
+            "city": "city_name",
+            "state": "state_name",
+            "zip": "postal_code",
+            "country": "'US'",
+        },
+        schema="mrf",
+        update_existing=False,
+    )
+
+    assert stamped == 0
+    assert [call[0] for call in calls] == ["scalar"]
+    assert events[-1]["message"] == "canonical address keys already populated"
+    assert events[-1]["done"] == 8
+    assert events[-1]["pct"] == 100
 
 
 @pytest.mark.asyncio
@@ -541,6 +585,40 @@ async def test_propagate_child_address_keys_uses_parent_join_and_concurrency(mon
     assert sorted(kwargs["shard"] for _sql, kwargs in calls if "shard" in kwargs) == [0, 1, 2, 3]
     assert events[-1]["phase"] == "address key propagation"
     assert events[-1]["pct"] == 100.0
+
+
+@pytest.mark.asyncio
+async def test_propagate_child_address_keys_can_skip_when_child_already_keyed(monkeypatch):
+    calls = []
+    events = []
+
+    class _FakeDB:
+        async def scalar(self, sql):
+            calls.append(("scalar", sql))
+            assert 'FROM "mrf"."mrf_address_evidence_20260612"' in sql
+            assert "WHERE address_key IS NULL" in sql
+            return False
+
+        def transaction(self):
+            raise AssertionError("propagation transaction should not start")
+
+    monkeypatch.setenv("HLTHPRT_ADDRESS_CANON_STAMP_SHARDS", "4")
+    monkeypatch.setenv("HLTHPRT_ADDRESS_CANON_STAMP_CONCURRENCY", "2")
+    monkeypatch.setattr(address_canon, "db", _FakeDB())
+    monkeypatch.setattr(address_canon, "enqueue_live_progress", lambda **payload: events.append(payload))
+
+    propagated = await address_canon.propagate_child_address_keys(
+        "mrf_address_evidence_20260612",
+        "mrf_address_20260612",
+        schema="mrf",
+        skip_when_child_fully_keyed=True,
+    )
+
+    assert propagated == 0
+    assert [call[0] for call in calls] == ["scalar"]
+    assert events[-1]["message"] == "child canonical address keys already populated"
+    assert events[-1]["done"] == 4
+    assert events[-1]["pct"] == 100
 
 
 def test_entity_address_unified_defaults_to_production_sized_publish_gate():
