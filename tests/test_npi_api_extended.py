@@ -967,6 +967,63 @@ async def test_get_npi_uses_cached_address(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_get_npi_sync_geocode_disabled_skips_live_geocode_and_caches_latless(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_NPI_DETAIL_SYNC_GEOCODE", "false")
+    calls = 0
+
+    async def fake_build(_npi):
+        nonlocal calls
+        calls += 1
+        return {
+            "npi": _npi,
+            "taxonomy_list": [],
+            "taxonomy_group_list": [],
+            "do_business_as": [],
+            "address_list": [
+                {
+                    "checksum": 4,
+                    "first_line": "10 Main",
+                    "second_line": "",
+                    "city_name": "Chicago",
+                    "state_name": "IL",
+                    "postal_code": "60601",
+                    "lat": None,
+                    "long": None,
+                }
+            ],
+        }
+
+    class FakeDB:
+        async def scalar(self, *_args, **_kwargs):
+            return None
+
+    monkeypatch.setattr(npi_module, "_NPI_DETAIL_RESPONSE_CACHE", npi_module.OrderedDict())
+    monkeypatch.setattr(npi_module, "_NPI_DETAIL_RESPONSE_CACHE_TTL_SECONDS", 300.0)
+    monkeypatch.setattr(npi_module, "_NPI_DETAIL_RESPONSE_CACHE_MAX_KEYS", 8)
+    monkeypatch.setattr(npi_module, "_build_npi_details", fake_build)
+    monkeypatch.setattr(npi_module, "_fetch_other_names", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        npi_module,
+        "_fetch_provider_enrichment_detail",
+        AsyncMock(return_value={"summary": None, "enrollments": {}, "ffs_visibility": {}}),
+    )
+    monkeypatch.setattr(npi_module, "db", FakeDB())
+    monkeypatch.setattr(npi_module, "download_it", AsyncMock(side_effect=AssertionError("unexpected geocode call")))
+
+    request = types.SimpleNamespace(
+        args={},
+        app=types.SimpleNamespace(config={"NPI_API_UPDATE_GEOCODE": True}),
+    )
+    first = await npi_module.get_npi(request, "1518379601")
+    second = await npi_module.get_npi(request, "1518379601")
+
+    payload = json.loads(first.body)
+    assert payload["address_list"][0]["lat"] is None
+    assert first.body == second.body
+    assert calls == 1
+
+
+@pytest.mark.asyncio
 async def test_get_npi_uses_response_cache(monkeypatch):
     calls = 0
 

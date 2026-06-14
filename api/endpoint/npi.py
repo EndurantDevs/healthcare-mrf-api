@@ -497,10 +497,11 @@ def _has_insurance_total_cache_set(city: Optional[str], state: Optional[str], va
     )
 
 
-def _npi_detail_cache_key(npi: int, *, view: str, include_chain: bool) -> str:
+def _npi_detail_cache_key(npi: int, *, view: str, include_chain: bool, sync_geocode: bool) -> str:
     schema = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     address_source = os.getenv(ADDRESS_SERVING_SOURCE_ENV) or ADDRESS_SERVING_SOURCE_LEGACY
-    return f"{schema}|{address_source}|{int(npi)}|{view}|{'chain' if include_chain else 'default'}"
+    geocode_mode = "sync_geo" if sync_geocode else "stored_geo"
+    return f"{schema}|{address_source}|{int(npi)}|{view}|{'chain' if include_chain else 'default'}|{geocode_mode}"
 
 
 def _npi_detail_response_cache_get(cache_key: str) -> bytes | None:
@@ -527,9 +528,16 @@ def _npi_detail_response_cache_set(cache_key: str, payload: bytes) -> bytes:
     return payload
 
 
-def _npi_detail_response_cacheable(data: dict[str, Any], *, force_address_update: bool) -> bool:
+def _npi_detail_response_cacheable(
+    data: dict[str, Any],
+    *,
+    force_address_update: bool,
+    sync_geocode: bool,
+) -> bool:
     if force_address_update:
         return False
+    if not sync_geocode:
+        return True
     for address in data.get("address_list") or []:
         if isinstance(address, dict) and not address.get("lat"):
             return False
@@ -3781,6 +3789,7 @@ async def get_plans_by_npi(_request, npi):
 @blueprint.get("/id/<npi>")
 async def get_npi(request, npi):
     force_address_update = _parse_bool_arg(request.args.get("force_address_update"), default=False)
+    sync_geocode = _env_flag("HLTHPRT_NPI_DETAIL_SYNC_GEOCODE", "HLTHPRT_NPI_API_SYNC_GEOCODE", default=True)
     include_chain_enrichment = _include_chain_provider_enrichment(request.args.get("show"))
     provider_enrichment_view = _normalize_provider_enrichment_view(request.args.get("view"))
     npi = int(npi)
@@ -3788,6 +3797,7 @@ async def get_npi(request, npi):
         npi,
         view=provider_enrichment_view,
         include_chain=include_chain_enrichment,
+        sync_geocode=sync_geocode,
     )
     if not force_address_update:
         cached_body = _npi_detail_response_cache_get(cache_key)
@@ -4052,7 +4062,7 @@ async def get_npi(request, npi):
                     d["formatted_address"] = res.formatted_address
                     d["place_id"] = res.place_id
 
-            if not d["lat"]:
+            if (sync_geocode or force_address_update) and not d["lat"]:
                 try:
                     params = {
                         request.app.config.get("GEOCODE_MAPBOX_STYLE_KEY_PARAM"): random.choice(
@@ -4086,7 +4096,7 @@ async def get_npi(request, npi):
                 except Exception as exc:  # pylint: disable=broad-exception-caught
                     logger.debug("Mapbox geocoding failed for %s: %s", t_addr, exc)
 
-            if not d["lat"]:
+            if (sync_geocode or force_address_update) and not d["lat"]:
                 try:
                     params = {
                         request.app.config.get("GEOCODE_GOOGLE_STYLE_ADDRESS_PARAM"): t_addr,
@@ -4216,7 +4226,11 @@ async def get_npi(request, npi):
 
     _redact_internal_address_fields(data)
     response_body = json.dumps(data, default=str, separators=(",", ":")).encode("utf-8")
-    if _npi_detail_response_cacheable(data, force_address_update=force_address_update):
+    if _npi_detail_response_cacheable(
+        data,
+        force_address_update=force_address_update,
+        sync_geocode=sync_geocode,
+    ):
         _npi_detail_response_cache_set(cache_key, response_body)
     return response.raw(response_body, content_type="application/json")
 
