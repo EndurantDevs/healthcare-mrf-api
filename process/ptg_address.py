@@ -577,7 +577,26 @@ def _ptg_address_insert_sql(
     ),
     enriched AS (
         SELECT
-            k.*,
+            k.location_hash,
+            k.npi,
+            k.location_source,
+            k.confidence_code,
+            k.state,
+            k.city,
+            k.lat,
+            k.long,
+            k.first_line,
+            k.second_line,
+            k.postal_code,
+            k.country_code,
+            k.provider_group_id,
+            k.provider_set_id,
+            k.tin,
+            k.created_at,
+            k.source_zip5,
+            k.source_state_code,
+            k.source_city_norm,
+            k.address_key,
             {archive_fields}
           FROM keyed k
           {archive_join}
