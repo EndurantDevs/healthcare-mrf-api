@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
 PTG_ADDRESS_QUEUE_NAME = "arq:PTGAddress"
 DEFAULT_MIN_ROWS = 1
 PTG_PROVIDER_GROUP_LOCATION_PREFIX = "ptg2_provider_group_location_"
+PTG_PROVIDER_GROUP_MEMBER_PREFIX = "ptg2_provider_group_member_"
 PTG_SERVING_RATE_COMPACT_PREFIX = "ptg2_serving_rate_compact_"
 PTG_PROVIDER_SET_COMPONENT_PREFIX = "ptg2_provider_set_component_"
 SNAPSHOT_TABLE_NAME_RE = re.compile(r"[a-z0-9_]{1,63}\Z")
@@ -104,6 +105,10 @@ def _snapshot_table_name(value: Any, db_schema: str, *, prefix: str) -> str | No
 
 def _snapshot_provider_group_location_table_name(value: Any, db_schema: str) -> str | None:
     return _snapshot_table_name(value, db_schema, prefix=PTG_PROVIDER_GROUP_LOCATION_PREFIX)
+
+
+def _snapshot_provider_group_member_table_name(value: Any, db_schema: str) -> str | None:
+    return _snapshot_table_name(value, db_schema, prefix=PTG_PROVIDER_GROUP_MEMBER_PREFIX)
 
 
 def _qualified_table_ref(db_schema: str, table_name: str) -> str:
@@ -174,6 +179,7 @@ async def _snapshot_manifest_tables(db_schema: str, snapshot_id: str | None) -> 
     if not snapshot_id or not await _table_exists(db_schema, "ptg2_snapshot"):
         return {
             "provider_group_location_table": None,
+            "provider_group_member_table": None,
             "serving_rate_compact_table": None,
             "provider_set_component_table": None,
         }
@@ -192,6 +198,11 @@ async def _snapshot_manifest_tables(db_schema: str, snapshot_id: str | None) -> 
             serving_index.get("provider_group_location_table"),
             db_schema,
             prefix=PTG_PROVIDER_GROUP_LOCATION_PREFIX,
+        ),
+        "provider_group_member_table": _snapshot_table_name(
+            serving_index.get("provider_group_member_table"),
+            db_schema,
+            prefix=PTG_PROVIDER_GROUP_MEMBER_PREFIX,
         ),
         "serving_rate_compact_table": _snapshot_table_name(
             serving_index.get("table"),
@@ -272,7 +283,11 @@ async def _resolve_ptg_address_inputs(
     return inputs
 
 
-def _provider_location_source_ctes(db_schema: str, provider_group_location_table: str | None) -> str:
+def _provider_location_source_ctes(
+    db_schema: str,
+    provider_group_location_table: str | None,
+    provider_group_member_table: str | None = None,
+) -> str:
     if provider_group_location_table:
         return f"""
     source_locations AS (
@@ -310,6 +325,52 @@ def _provider_location_source_ctes(db_schema: str, provider_group_location_table
             NULL::timestamptz AS created_at
           FROM {_qualified_table_ref(db_schema, provider_group_location_table)} loc
          WHERE loc.npi IS NOT NULL
+    ),
+    shaped AS (
+        SELECT * FROM source_locations
+    )
+        """
+    if provider_group_member_table:
+        return f"""
+    source_locations AS (
+        SELECT
+            (
+                'provider_group_member_npi_address:' || pgm.provider_group_global_id_128::text || ':' ||
+                a.npi::text || ':' ||
+                COALESCE(NULLIF(a.checksum::text, ''), md5(concat_ws('|',
+                    COALESCE(a.first_line::text, ''),
+                    COALESCE(a.second_line::text, ''),
+                    COALESCE(a.city_name::text, ''),
+                    COALESCE(a.state_name::text, ''),
+                    COALESCE(a.postal_code::text, ''),
+                    COALESCE(a.country_code::text, '')
+                )))
+            )::varchar AS location_hash,
+            a.npi::bigint AS npi,
+            'npi_address'::varchar AS location_source,
+            'provider_group_member_npi_address'::varchar AS confidence_code,
+            NULLIF(BTRIM(a.state_name), '')::varchar AS state,
+            NULLIF(BTRIM(a.city_name), '')::varchar AS city,
+            NULLIF(
+                LEFT(REGEXP_REPLACE(COALESCE(a.postal_code, ''), '[^0-9]', '', 'g'), 5),
+                ''
+            )::varchar AS zip5,
+            a.lat::numeric AS lat,
+            a."long"::numeric AS long,
+            NULLIF(BTRIM(a.first_line), '')::varchar AS first_line,
+            NULLIF(BTRIM(a.second_line), '')::varchar AS second_line,
+            NULLIF(BTRIM(a.postal_code), '')::varchar AS postal_code,
+            COALESCE(NULLIF(BTRIM(a.country_code), ''), 'US')::varchar AS country_code,
+            NULLIF(pgm.provider_group_global_id_128::text, '')::varchar AS provider_group_id,
+            NULL::varchar AS provider_set_id,
+            NULL::varchar AS tin,
+            COALESCE(a.updated_at, a.date_added::timestamptz) AS created_at
+          FROM {_qualified_table_ref(db_schema, provider_group_member_table)} pgm
+          JOIN {_quote_ident(db_schema)}.npi_address a
+            ON a.npi = pgm.npi
+           AND a.type = 'primary'
+         WHERE pgm.npi IS NOT NULL
+           AND pgm.provider_group_global_id_128 IS NOT NULL
     ),
     shaped AS (
         SELECT * FROM source_locations
@@ -403,17 +464,22 @@ def _ptg_address_insert_sql(
     address_canon_available: bool,
     archive_available: bool,
     provider_group_location_table: str | None = None,
+    provider_group_member_table: str | None = None,
     serving_rate_compact_table: str | None = None,
     provider_set_component_table: str | None = None,
 ) -> str:
-    source_ctes = _provider_location_source_ctes(db_schema, provider_group_location_table)
+    source_ctes = _provider_location_source_ctes(
+        db_schema,
+        provider_group_location_table,
+        provider_group_member_table=provider_group_member_table,
+    )
     plan_cte = _provider_group_plan_cte(
         db_schema,
         snapshot_id=snapshot_id,
         serving_rate_compact_table=serving_rate_compact_table,
         provider_set_component_table=provider_set_component_table,
     )
-    country_expr = "country_code" if provider_group_location_table else "'US'"
+    country_expr = "country_code" if provider_group_location_table or provider_group_member_table else "'US'"
     address_key_expr = (
         f"{db_schema}.addr_key_v1(first_line, second_line, city, state, postal_code, {country_expr})"
         if address_canon_available
@@ -620,9 +686,10 @@ async def process_data(ctx, task=None):
     skipped_sources: list[dict[str, str | None]] = []
     for source_key, snapshot_id, manifest_tables in address_inputs:
         provider_group_location_table = manifest_tables.get("provider_group_location_table")
+        provider_group_member_table = manifest_tables.get("provider_group_member_table")
         serving_rate_compact_table = manifest_tables.get("serving_rate_compact_table")
         provider_set_component_table = manifest_tables.get("provider_set_component_table")
-        if not provider_group_location_table and not legacy_provider_location_available:
+        if not provider_group_location_table and not provider_group_member_table and not legacy_provider_location_available:
             if not explicit_input and len(address_inputs) > 1:
                 logger.warning(
                     "Skipping PTG address source %s/%s because its snapshot has no provider-location table",
@@ -647,6 +714,7 @@ async def process_data(ctx, task=None):
                 "source_key": source_key,
                 "snapshot_id": snapshot_id,
                 "provider_group_location_table": provider_group_location_table,
+                "provider_group_member_table": provider_group_member_table,
                 "serving_rate_compact_table": serving_rate_compact_table,
                 "provider_set_component_table": provider_set_component_table,
             }
@@ -661,6 +729,7 @@ async def process_data(ctx, task=None):
                 address_canon_available=address_canon_available,
                 archive_available=archive_available,
                 provider_group_location_table=provider_group_location_table,
+                provider_group_member_table=provider_group_member_table,
                 serving_rate_compact_table=serving_rate_compact_table,
                 provider_set_component_table=provider_set_component_table,
             )
