@@ -323,6 +323,7 @@ async def test_stamp_address_keys_can_be_limited_to_null_rows(monkeypatch):
     class _FakeDB:
         async def scalar(self, sql):
             assert "WHERE address_key IS NULL" in sql
+            assert "addr_key_v1(" in sql
             return True
 
         async def status(self, sql, **kwargs):
@@ -363,6 +364,7 @@ async def test_stamp_address_keys_skips_null_only_work_when_already_keyed(monkey
         async def scalar(self, sql):
             calls.append(("scalar", sql))
             assert "WHERE address_key IS NULL" in sql
+            assert "addr_key_v1(" in sql
             return False
 
         async def status(self, sql, **kwargs):
@@ -389,7 +391,7 @@ async def test_stamp_address_keys_skips_null_only_work_when_already_keyed(monkey
 
     assert stamped == 0
     assert [call[0] for call in calls] == ["scalar"]
-    assert events[-1]["message"] == "canonical address keys already populated"
+    assert events[-1]["message"] == "no keyable address rows need stamping"
     assert events[-1]["done"] == 8
     assert events[-1]["pct"] == 100
 
@@ -596,7 +598,10 @@ async def test_propagate_child_address_keys_can_skip_when_child_already_keyed(mo
         async def scalar(self, sql):
             calls.append(("scalar", sql))
             assert 'FROM "mrf"."mrf_address_evidence_20260612"' in sql
-            assert "WHERE address_key IS NULL" in sql
+            assert 'JOIN "mrf"."mrf_address_20260612" AS parent' in sql
+            assert "WHERE child.address_key IS NULL" in sql
+            assert "parent.address_key IS NOT NULL" in sql
+            assert "child.first_line IS NOT DISTINCT FROM parent.first_line" in sql
             return False
 
         def transaction(self):
@@ -616,7 +621,7 @@ async def test_propagate_child_address_keys_can_skip_when_child_already_keyed(mo
 
     assert propagated == 0
     assert [call[0] for call in calls] == ["scalar"]
-    assert events[-1]["message"] == "child canonical address keys already populated"
+    assert events[-1]["message"] == "no child canonical address keys need propagation"
     assert events[-1]["done"] == 4
     assert events[-1]["pct"] == 100
 
