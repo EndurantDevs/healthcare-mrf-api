@@ -11,10 +11,11 @@ from sanic import Blueprint, response
 from sanic.exceptions import InvalidUsage
 from sqlalchemy import and_, func, select, text
 
-from db.models import (DoctorClinicianAddress, FacilityAnchor, GeoZipLookup,
-                       LODESWorkplaceAggregate, MedicareEnrollmentStats,
-                       NPIAddress, NPIDataTaxonomy, PartDPharmacyActivity,
-                       PharmacyEconomicsSummary, PricingPlacesZcta)
+from db.models import (DoctorClinicianAddress, EntityAddressUnified,
+                       FacilityAnchor, GeoZipLookup, LODESWorkplaceAggregate,
+                       MedicareEnrollmentStats, NPIAddress, NPIDataTaxonomy,
+                       PartDPharmacyActivity, PharmacyEconomicsSummary,
+                       PricingPlacesZcta)
 
 blueprint = Blueprint("site_intelligence", url_prefix="/site-intelligence", version=1)
 
@@ -48,6 +49,7 @@ MAX_ANCHOR_LIST_ITEMS = 25
 TABLE_EXISTS_CACHE_TTL_SECONDS = 300.0
 _TABLE_EXISTS_CACHE: dict[str, tuple[float, bool]] = {}
 _ZCTA_OVERLAP_AVAILABLE_CACHE: tuple[float, bool] | None = None
+ADDRESS_SERVING_SOURCE_UNIFIED = "entity_address_unified"
 
 
 def _get_session(request):
@@ -220,6 +222,10 @@ def _safe_float(value, default: float | None = None) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _address_serving_source() -> str:
+    return str(os.getenv("HLTHPRT_ADDRESS_SERVING_SOURCE") or "legacy").strip().lower()
 
 
 def _parse_radius_miles(value: str | None) -> float | None:
@@ -496,6 +502,32 @@ async def _load_anchor_candidates(
     return by_type
 
 
+def _pharmacy_geo_stmt(
+    *,
+    use_unified_addresses: bool,
+    lat: float,
+    lng: float,
+    lat_delta: float,
+    lng_delta: float,
+):
+    address_model = EntityAddressUnified if use_unified_addresses else NPIAddress
+    return (
+        select(address_model.npi, address_model.lat, address_model.long)
+        .join(NPIDataTaxonomy, NPIDataTaxonomy.npi == address_model.npi)
+        .where(
+            and_(
+                address_model.type == "primary",
+                address_model.npi.isnot(None),
+                address_model.lat.isnot(None),
+                address_model.long.isnot(None),
+                address_model.lat.between(lat - lat_delta, lat + lat_delta),
+                address_model.long.between(lng - lng_delta, lng + lng_delta),
+                NPIDataTaxonomy.healthcare_provider_taxonomy_code.like("3336%"),
+            )
+        )
+    )
+
+
 @blueprint.get("/score")
 async def get_site_score(request):
     lat_str = request.args.get("lat")
@@ -526,6 +558,7 @@ async def get_site_score(request):
         "lodes": await _table_exists_cached(session, LODESWorkplaceAggregate),
         "places": await _table_exists_cached(session, PricingPlacesZcta),
         "doctors": await _table_exists_cached(session, DoctorClinicianAddress),
+        "entity_address": await _table_exists_cached(session, EntityAddressUnified),
         "npi_address": await _table_exists_cached(session, NPIAddress),
         "npi_taxonomy": await _table_exists_cached(session, NPIDataTaxonomy),
         "partd_pharmacy": await _table_exists_cached(session, PartDPharmacyActivity),
@@ -854,20 +887,19 @@ async def get_site_score(request):
             partd_pharmacies_by_zip[zip_code].add(npi)
 
     pharmacy_rows = []
-    if table_exists["npi_address"] and table_exists["npi_taxonomy"]:
+    use_unified_addresses = (
+        _address_serving_source() == ADDRESS_SERVING_SOURCE_UNIFIED
+        and table_exists["entity_address"]
+    )
+    if table_exists["npi_taxonomy"] and (use_unified_addresses or table_exists["npi_address"]):
         pharmacy_rows = (
             await session.execute(
-                select(NPIAddress.npi, NPIAddress.lat, NPIAddress.long)
-                .join(NPIDataTaxonomy, NPIDataTaxonomy.npi == NPIAddress.npi)
-                .where(
-                    and_(
-                        NPIAddress.type == "primary",
-                        NPIAddress.lat.isnot(None),
-                        NPIAddress.long.isnot(None),
-                        NPIAddress.lat.between(lat - lat_delta, lat + lat_delta),
-                        NPIAddress.long.between(lng - lng_delta, lng + lng_delta),
-                        NPIDataTaxonomy.healthcare_provider_taxonomy_code.like("3336%"),
-                    )
+                _pharmacy_geo_stmt(
+                    use_unified_addresses=use_unified_addresses,
+                    lat=lat,
+                    lng=lng,
+                    lat_delta=lat_delta,
+                    lng_delta=lng_delta,
                 )
             )
         ).all()
