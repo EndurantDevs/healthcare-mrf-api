@@ -120,6 +120,7 @@ PTG2_JSON_FALLBACK_ENV = "HLTHPRT_PTG2_ENABLE_JSON_FALLBACK"
 PTG2_SERVING_TABLE_ENV = "HLTHPRT_PTG2_SERVING_TABLE"
 PTG2_FAST_COMPACT_COUNTS_ENV = "HLTHPRT_PTG2_FAST_COMPACT_COUNTS"
 ADDRESS_SERVING_SOURCE_ENV = "HLTHPRT_ADDRESS_SERVING_SOURCE"
+ADDRESS_SERVING_SOURCE_LEGACY = "legacy"
 ADDRESS_SERVING_SOURCE_UNIFIED = "entity_address_unified"
 _PTG2_MANIFEST_SIDECAR_CACHE: dict[tuple[str, str, str], tuple[str, ...]] = {}
 _PTG2_LEGACY_ADDRESS_COLUMNS = {
@@ -146,11 +147,20 @@ def normalize_ptg2_mode(value: str | None) -> str:
 
 
 def _address_serving_unified_requested() -> bool:
-    return os.getenv(ADDRESS_SERVING_SOURCE_ENV, "").strip().lower() == ADDRESS_SERVING_SOURCE_UNIFIED
+    return os.getenv(ADDRESS_SERVING_SOURCE_ENV, ADDRESS_SERVING_SOURCE_UNIFIED).strip().lower() == ADDRESS_SERVING_SOURCE_UNIFIED
 
 
 def _is_unified_address_table(table_name: str | None) -> bool:
     return bool(table_name and table_name.endswith(".entity_address_unified"))
+
+
+def _ptg2_address_location_source(address_table: str | None) -> str:
+    return "entity_address_unified" if _is_unified_address_table(address_table) else "npi_address"
+
+
+def _ptg2_address_location_hash_sql(alias: str, address_table: str | None) -> str:
+    source = _ptg2_address_location_source(address_table)
+    return f"CONCAT('{source}:', {alias}.npi, ':', {alias}.type, ':', {alias}.checksum)"
 
 
 async def _ptg2_table_has_columns(session, table_name: str, required_columns: set[str]) -> bool:
@@ -719,17 +729,19 @@ async def _ptg2_manifest_enriched_provider_rows_for_npis(
     )
     if not await _serving_table_available(session, npi_data_table) or not npi_address_table:
         return [{"npi": npi, "provider_name": "TiC provider"} for npi in npis]
+    address_location_source = _ptg2_address_location_source(npi_address_table)
+    address_location_hash_sql = _ptg2_address_location_hash_sql("addr", npi_address_table)
     enrich_stmt = (
         text(
             f"""
             SELECT
                 source_npis.npi,
-                CONCAT('npi_address:', addr.npi, ':', addr.type, ':', addr.checksum) AS location_hash,
+                {address_location_hash_sql} AS location_hash,
                 addr.state_name AS state,
                 addr.city_name AS city,
                 LEFT(COALESCE(addr.postal_code, ''), 5) AS zip5,
-                'npi_address' AS location_source,
-                'npi_address' AS location_confidence_code,
+                '{address_location_source}' AS location_source,
+                '{address_location_source}' AS location_confidence_code,
                 json_build_object(
                     'first_line', addr.first_line,
                     'second_line', addr.second_line,
@@ -819,6 +831,8 @@ async def _ptg2_manifest_location_provider_matches(
     if len(filters) == 1:
         return None
 
+    address_location_source = _ptg2_address_location_source(npi_address_table)
+    address_location_hash_sql = _ptg2_address_location_hash_sql("addr", npi_address_table)
     has_npi_data = await _serving_table_available(session, npi_data_table)
     provider_join = f"LEFT JOIN {npi_data_table} n ON n.npi = addr.npi" if has_npi_data else ""
     provider_name_sql = (
@@ -861,12 +875,12 @@ async def _ptg2_manifest_location_provider_matches(
             SELECT DISTINCT ON (pgm.provider_group_global_id_128, addr.npi)
                 pgm.provider_group_global_id_128,
                 addr.npi,
-                CONCAT('npi_address:', addr.npi, ':', addr.type, ':', addr.checksum) AS location_hash,
+                {address_location_hash_sql} AS location_hash,
                 addr.state_name AS state,
                 addr.city_name AS city,
                 LEFT(COALESCE(addr.postal_code, ''), 5) AS zip5,
-                'npi_address' AS location_source,
-                'npi_address' AS location_confidence_code,
+                '{address_location_source}' AS location_source,
+                '{address_location_source}' AS location_confidence_code,
                 json_build_object(
                     'first_line', addr.first_line,
                     'second_line', addr.second_line,
@@ -1558,6 +1572,8 @@ def _compact_provider_expansion_sql(
 ) -> str:
     if not _request_bool(args.get("include_providers")):
         return ""
+    resolved_address_table = address_table or f"{PTG2_SCHEMA}.npi_address"
+    address_location_hash_sql = _ptg2_address_location_hash_sql("addr", resolved_address_table)
     params.setdefault("provider_match_limit", max(int(params.get("limit") or 25) * 8, 64))
     if serving_tables.provider_group_location_table and (args.get("zip5") or args.get("zip") or args.get("city") or args.get("state") or args.get("lat") or args.get("long")):
         return f"""
@@ -1585,10 +1601,10 @@ def _compact_provider_expansion_sql(
         LEFT JOIN LATERAL (
             SELECT
                 addr.*,
-                CONCAT('npi_address:', addr.npi, ':', addr.type, ':', addr.checksum) AS location_hash,
+                {address_location_hash_sql} AS location_hash,
                 addr.state_name AS state,
                 addr.city_name AS city
-            FROM {address_table or f'{PTG2_SCHEMA}.npi_address'} addr
+            FROM {resolved_address_table} addr
             WHERE addr.npi = pgm.npi
             ORDER BY (addr.type = 'primary') DESC, addr.type, addr.checksum
             LIMIT 1
@@ -1693,10 +1709,12 @@ async def _search_compact_serving_table(
             "loc.taxonomy_codes, loc.specialties, loc.provider_name,"
         )
     elif expand_providers:
+        address_location_source = _ptg2_address_location_source(address_table_sql)
         provider_select_sql = (
             "pgm.npi, addr.location_hash, addr.state, addr.city, "
             "LEFT(COALESCE(addr.postal_code, ''), 5) AS zip5, "
-            "'npi_address' AS location_source, 'npi_address' AS location_confidence_code, "
+            f"'{address_location_source}' AS location_source, "
+            f"'{address_location_source}' AS location_confidence_code, "
             "to_jsonb(addr.*) AS address_payload, ARRAY[]::varchar[] AS taxonomy_codes, "
             "ARRAY[]::varchar[] AS specialties, NULL::varchar AS provider_name,"
         )

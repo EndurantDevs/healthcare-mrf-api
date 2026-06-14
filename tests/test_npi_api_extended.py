@@ -289,7 +289,7 @@ async def test_get_near_npi_uses_unified_address_table_when_compatible(monkeypat
         def acquire(self):
             return FakeAcquire(RecordingConnection())
 
-    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
+    monkeypatch.delenv("HLTHPRT_ADDRESS_SERVING_SOURCE", raising=False)
     monkeypatch.setattr(npi_module, "_table_columns", fake_table_columns)
     monkeypatch.setattr(npi_module, "db", FakeDB())
 
@@ -313,7 +313,19 @@ async def test_address_serving_table_falls_back_to_legacy_when_unified_incompati
             return {"npi"}
         return set()
 
-    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
+    monkeypatch.delenv("HLTHPRT_ADDRESS_SERVING_SOURCE", raising=False)
+    monkeypatch.setattr(npi_module, "_table_columns", fake_table_columns)
+
+    table_name = await npi_module._address_serving_table_sql({"npi", "type"})
+    assert table_name == "mrf.npi_address"
+
+
+@pytest.mark.asyncio
+async def test_address_serving_table_uses_legacy_when_explicit(monkeypatch):
+    async def fake_table_columns(*_args, **_kwargs):
+        raise AssertionError("legacy mode must not probe unified table columns")
+
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "legacy")
     monkeypatch.setattr(npi_module, "_table_columns", fake_table_columns)
 
     table_name = await npi_module._address_serving_table_sql({"npi", "type"})

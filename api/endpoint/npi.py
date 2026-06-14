@@ -63,6 +63,7 @@ INT_CODE_PATTERN = re.compile(r"^-?\d+$")
 CHAIN_PECOS_PROVIDER_TYPE_CODES = {"12-C1"}
 PUBLIC_ADDRESS_EXCLUDED_COLUMNS = {"address_key"}
 ADDRESS_SERVING_SOURCE_ENV = "HLTHPRT_ADDRESS_SERVING_SOURCE"
+ADDRESS_SERVING_SOURCE_LEGACY = "legacy"
 ADDRESS_SERVING_SOURCE_UNIFIED = "entity_address_unified"
 FACILITY_ENROLLMENT_MODELS: dict[str, Any] = {
     "hospital": ProviderEnrollmentHospital,
@@ -1058,7 +1059,7 @@ async def _table_columns(table_name: str, *, session: Any = None) -> set[str]:
 
 
 def _address_serving_unified_requested() -> bool:
-    return os.getenv(ADDRESS_SERVING_SOURCE_ENV, "").strip().lower() == ADDRESS_SERVING_SOURCE_UNIFIED
+    return os.getenv(ADDRESS_SERVING_SOURCE_ENV, ADDRESS_SERVING_SOURCE_UNIFIED).strip().lower() == ADDRESS_SERVING_SOURCE_UNIFIED
 
 
 def _address_table_is_unified(address_table_sql: str) -> bool:

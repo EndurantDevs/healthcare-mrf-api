@@ -132,6 +132,35 @@ def test_ptg2_serving_utils_split_keeps_serving_facade_helpers_stable():
     assert ptg2_serving._price_filter_clauses is ptg2_serving_utils._price_filter_clauses
 
 
+@pytest.mark.asyncio
+async def test_ptg2_address_serving_table_prefers_unified_by_default(monkeypatch):
+    monkeypatch.delenv("HLTHPRT_ADDRESS_SERVING_SOURCE", raising=False)
+    session = FakeSession(
+        [FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_LEGACY_ADDRESS_COLUMNS)])]
+    )
+
+    table_name = await ptg2_serving._ptg2_address_serving_table(
+        session,
+        ptg2_serving._PTG2_LEGACY_ADDRESS_COLUMNS,
+    )
+
+    assert table_name == "mrf.entity_address_unified"
+
+
+@pytest.mark.asyncio
+async def test_ptg2_address_serving_table_uses_legacy_when_explicit(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "legacy")
+    session = FakeSession([])
+
+    table_name = await ptg2_serving._ptg2_address_serving_table(
+        session,
+        ptg2_serving._PTG2_LEGACY_ADDRESS_COLUMNS,
+    )
+
+    assert table_name == "mrf.npi_address"
+    assert session.calls == []
+
+
 def test_ptg2_code_details_split_keeps_serving_facade_helper_stable():
     assert ptg2_serving._enrich_ptg2_code_details is ptg2_code_details._enrich_ptg2_code_details
 
@@ -1051,7 +1080,8 @@ async def test_compact_serving_requires_normalized_price_tables():
 
 
 @pytest.mark.asyncio
-async def test_compact_serving_geo_search_allows_missing_specialty():
+async def test_compact_serving_geo_search_allows_missing_specialty(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "legacy")
     session = FakeSession([FakeResult(rows=[])])
 
     payload = await ptg2_serving._search_compact_serving_table(
@@ -1079,7 +1109,8 @@ async def test_compact_serving_geo_search_allows_missing_specialty():
 
 
 @pytest.mark.asyncio
-async def test_compact_serving_coordinate_search_filters_npi_addresses():
+async def test_compact_serving_coordinate_search_filters_npi_addresses(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "legacy")
     session = FakeSession([FakeResult(rows=[])])
 
     payload = await ptg2_serving._search_compact_serving_table(
@@ -1113,7 +1144,8 @@ async def test_compact_serving_coordinate_search_filters_npi_addresses():
 
 
 @pytest.mark.asyncio
-async def test_compact_serving_include_providers_expands_without_geo_filter():
+async def test_compact_serving_include_providers_expands_without_geo_filter(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "legacy")
     session = FakeSession(
         [
             FakeResult(
@@ -1230,6 +1262,8 @@ async def test_compact_serving_provider_expansion_uses_unified_address_table_whe
     sql = str(session.calls[1][0][0])
     assert "FROM mrf.entity_address_unified addr" in sql
     assert "FROM mrf.npi_address addr" not in sql
+    assert "'entity_address_unified' AS location_source" in sql
+    assert "'entity_address_unified' AS location_confidence_code" in sql
     assert "addr.npi = pgm.npi" in sql
     assert "addr.npi = sp.npi" not in sql
 
@@ -1263,7 +1297,8 @@ async def test_compact_serving_provider_expansion_falls_back_when_unified_incomp
 
 
 @pytest.mark.asyncio
-async def test_compact_serving_source_scoped_provider_expansion_uses_direct_component_table():
+async def test_compact_serving_source_scoped_provider_expansion_uses_direct_component_table(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "legacy")
     session = FakeSession([FakeResult(rows=[])])
     tables = _compact_tables()
 
@@ -1321,7 +1356,8 @@ async def test_compact_serving_specialty_search_joins_nucc_without_geo():
 
 
 @pytest.mark.asyncio
-async def test_compact_serving_source_scoped_geo_taxonomy_filter_uses_direct_component_table():
+async def test_compact_serving_source_scoped_geo_taxonomy_filter_uses_direct_component_table(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "legacy")
     session = FakeSession([FakeResult(rows=[])])
     tables = _compact_tables()
 

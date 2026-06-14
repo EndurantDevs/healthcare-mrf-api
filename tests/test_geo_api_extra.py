@@ -292,7 +292,9 @@ async def test_geo_by_zip_other_programming_error():
 
 
 @pytest.mark.asyncio
-async def test_lookup_provider_count_query_avoids_coalesce():
+async def test_lookup_provider_count_query_avoids_coalesce(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "legacy")
+
     class CaptureSession:
         def __init__(self):
             self.last_stmt = None
@@ -309,9 +311,7 @@ async def test_lookup_provider_count_query_avoids_coalesce():
 
 
 @pytest.mark.asyncio
-async def test_lookup_provider_count_uses_entity_address_when_enabled(monkeypatch):
-    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
-
+async def test_lookup_provider_count_uses_entity_address_by_default():
     class CaptureSession:
         def __init__(self):
             self.last_stmt = None
@@ -332,7 +332,7 @@ async def test_lookup_provider_count_uses_entity_address_when_enabled(monkeypatc
 
 @pytest.mark.asyncio
 async def test_lookup_provider_count_falls_back_when_unified_missing(monkeypatch):
-    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
+    monkeypatch.delenv("HLTHPRT_ADDRESS_SERVING_SOURCE", raising=False)
     error = ProgrammingError("select", {}, None)
     error.orig = UndefinedTableError("entity_address_unified missing")
     session = FakeSession([error, FakeResult(scalar_value=21)])
