@@ -543,9 +543,7 @@ def test_ptg2_manifest_sidecar_lookup_remaps_stale_serving_directory(tmp_path, m
     )
     sidecar["name"] = "provider_npi"
     stale_path = Path(sidecar["path"])
-    sidecar["path"] = (
-        f"/tmp/healthporta-ptg2-artifacts/serving/stale/{stale_path.name}"
-    )
+    sidecar["path"] = f"/tmp/healthporta-ptg2-artifacts/serving/stale/{stale_path.name}"
     monkeypatch.setenv("HLTHPRT_PTG2_ARTIFACT_DIR", str(artifact_root))
     ptg2_serving._PTG2_MANIFEST_SIDECAR_CACHE.clear()
     tables = ptg2_serving.PTG2ServingTables(
@@ -559,6 +557,20 @@ def test_ptg2_manifest_sidecar_lookup_remaps_stale_serving_directory(tmp_path, m
 
     assert members == (npi_member.hex(),)
     assert members_many[provider_set_id] == (npi_member.hex(),)
+
+
+def test_ptg2_manifest_sidecar_path_resolver_remaps_stale_hash_suffix(tmp_path, monkeypatch):
+    artifact_root = tmp_path / "ptg2-artifacts"
+    current_dir = artifact_root / "serving" / "current"
+    current_dir.mkdir(parents=True)
+    actual = current_dir / "price_forward_currenthash.ptg2sc"
+    actual.write_bytes(b"ptg2")
+    stale = "/tmp/healthporta-ptg2-artifacts/serving/stale/price_forward_stalehash.ptg2sc"
+    monkeypatch.setenv("HLTHPRT_PTG2_ARTIFACT_DIR", str(artifact_root))
+
+    resolved = ptg2_serving._resolve_ptg2_manifest_sidecar_path(stale)
+
+    assert resolved == actual
 
 
 @pytest.mark.asyncio

@@ -456,6 +456,13 @@ def _resolve_ptg2_manifest_sidecar_path(raw_path: str) -> Path:
             matches = [item for item in serving_root.glob(f"*/{filename}") if item.exists()]
             if len(matches) == 1:
                 return matches[0]
+            prefix = filename.rsplit("_", 1)[0]
+            if prefix and prefix != filename:
+                prefix_matches = [
+                    item for item in serving_root.glob(f"*/{prefix}_*.ptg2sc") if item.exists()
+                ]
+                if len(prefix_matches) == 1:
+                    return prefix_matches[0]
     return path
 
 
