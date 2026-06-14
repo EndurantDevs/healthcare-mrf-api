@@ -571,6 +571,30 @@ def _emit_progress(**payload: Any) -> None:
         return
 
 
+def _keyable_null_address_key_exists_sql(
+    *,
+    schema: str,
+    table: str,
+    first: str,
+    second: str,
+    city: str,
+    state: str,
+    zip_code: str,
+    country: str,
+) -> str:
+    return f"""
+        SELECT EXISTS (
+            SELECT 1
+              FROM {_qtable(schema, table)}
+             WHERE address_key IS NULL
+               AND {_quote_ident(schema)}.addr_key_v1(
+                    {first}, {second}, {city}, {state}, {zip_code}, {country}
+               ) IS NOT NULL
+             LIMIT 1
+        );
+    """
+
+
 def _resolve_gate_violations(
     *,
     staged: int,
@@ -626,26 +650,28 @@ async def stamp_address_keys(
         message="stamping canonical address keys",
     )
     if not update_existing:
-        has_null_address_key = bool(
+        has_keyable_null_address_key = bool(
             await db.scalar(
-                f"""
-                SELECT EXISTS (
-                    SELECT 1
-                      FROM {_qtable(schema, staging_table)}
-                     WHERE address_key IS NULL
-                     LIMIT 1
-                );
-                """
+                _keyable_null_address_key_exists_sql(
+                    schema=schema,
+                    table=staging_table,
+                    first=first,
+                    second=second,
+                    city=city,
+                    state=state,
+                    zip_code=zip_code,
+                    country=country,
+                )
             )
         )
-        if not has_null_address_key:
+        if not has_keyable_null_address_key:
             _emit_progress(
                 phase="address key stamping",
                 unit="shard",
                 total=shards,
                 done=shards,
                 pct=100,
-                message="canonical address keys already populated",
+                message="no keyable address rows need stamping",
             )
             return 0
 
@@ -748,26 +774,32 @@ async def propagate_child_address_keys(
     child = _qtable(schema, child_table)
     parent = _qtable(schema, parent_table)
     if skip_when_child_fully_keyed:
-        has_null_child_key = bool(
+        has_child_key_to_propagate = bool(
             await db.scalar(
                 f"""
                 SELECT EXISTS (
                     SELECT 1
-                      FROM {child}
-                     WHERE address_key IS NULL
+                      FROM {child} AS child
+                      JOIN {parent} AS parent
+                        ON child.npi = parent.npi
+                       AND child.type = parent.type
+                       AND child.checksum = parent.checksum
+                     WHERE child.address_key IS NULL
+                       AND parent.address_key IS NOT NULL
+                       AND ({same_address})
                      LIMIT 1
                 );
                 """
             )
         )
-        if not has_null_child_key:
+        if not has_child_key_to_propagate:
             _emit_progress(
                 phase="address key propagation",
                 unit="shard",
                 total=shards,
                 done=shards,
                 pct=100,
-                message="child canonical address keys already populated",
+                message="no child canonical address keys need propagation",
             )
             return 0
 
