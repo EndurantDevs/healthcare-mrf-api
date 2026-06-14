@@ -969,6 +969,7 @@ async def test_get_npi_uses_cached_address(monkeypatch):
 @pytest.mark.asyncio
 async def test_get_npi_sync_geocode_disabled_skips_live_geocode_and_caches_latless(monkeypatch):
     monkeypatch.setenv("HLTHPRT_NPI_DETAIL_SYNC_GEOCODE", "false")
+    monkeypatch.setenv("HLTHPRT_NPI_DETAIL_LOOKUP_STORED_GEOCODE", "false")
     calls = 0
 
     async def fake_build(_npi):
@@ -995,7 +996,7 @@ async def test_get_npi_sync_geocode_disabled_skips_live_geocode_and_caches_latle
 
     class FakeDB:
         async def scalar(self, *_args, **_kwargs):
-            return None
+            raise AssertionError("stored geocode lookup should not execute")
 
     monkeypatch.setattr(npi_module, "_NPI_DETAIL_RESPONSE_CACHE", npi_module.OrderedDict())
     monkeypatch.setattr(npi_module, "_NPI_DETAIL_RESPONSE_CACHE_TTL_SECONDS", 300.0)
