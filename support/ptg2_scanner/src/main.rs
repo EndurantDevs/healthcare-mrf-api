@@ -990,24 +990,13 @@ impl ManifestSidecarSpools {
     }
 }
 
+#[derive(Default)]
 struct ManifestSidecarCollector {
     provider_forward: BTreeMap<GlobalId128, Vec<GlobalId128>>,
     provider_inverted: BTreeMap<GlobalId128, Vec<GlobalId128>>,
     provider_npi: BTreeMap<GlobalId128, Vec<GlobalId128>>,
     price_forward: BTreeMap<GlobalId128, Vec<GlobalId128>>,
     spools: Option<ManifestSidecarSpools>,
-}
-
-impl Default for ManifestSidecarCollector {
-    fn default() -> Self {
-        Self {
-            provider_forward: BTreeMap::new(),
-            provider_inverted: BTreeMap::new(),
-            provider_npi: BTreeMap::new(),
-            price_forward: BTreeMap::new(),
-            spools: None,
-        }
-    }
 }
 
 impl ManifestSidecarCollector {
@@ -4227,6 +4216,7 @@ fn merge_manifest_copy_files(
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use ptg2_scanner::manifest::GLOBAL_ID_BYTES;
