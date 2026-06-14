@@ -936,6 +936,117 @@ def test_ptg_address_insert_sql_uses_existing_provider_location_projection():
     assert "encode(sha256(convert_to" in sql
 
 
+def test_ptg_address_snapshot_table_name_allowlist_rejects_unsafe_names():
+    assert (
+        ptg_address._snapshot_provider_group_location_table_name(
+            "mrf.ptg2_provider_group_location_abc123",
+            "mrf",
+        )
+        == "ptg2_provider_group_location_abc123"
+    )
+    assert (
+        ptg_address._snapshot_provider_group_location_table_name(
+            "ptg2_provider_group_location_abc123",
+            "mrf",
+        )
+        == "ptg2_provider_group_location_abc123"
+    )
+    assert (
+        ptg_address._snapshot_provider_group_location_table_name(
+            "public.ptg2_provider_group_location_abc123",
+            "mrf",
+        )
+        is None
+    )
+    assert (
+        ptg_address._snapshot_provider_group_location_table_name(
+            "mrf.ptg2_provider_group_member_abc123",
+            "mrf",
+        )
+        is None
+    )
+    assert (
+        ptg_address._snapshot_provider_group_location_table_name(
+            "mrf.ptg2_provider_group_location_abc123;drop",
+            "mrf",
+        )
+        is None
+    )
+    assert (
+        ptg_address._snapshot_provider_group_location_table_name(
+            "mrf.PTG2_provider_group_location_abc123",
+            "mrf",
+        )
+        is None
+    )
+
+
+def test_ptg_address_insert_sql_uses_snapshot_provider_group_location_table():
+    sql = ptg_address._ptg_address_insert_sql(
+        "mrf",
+        "ptg_address_stage",
+        source_key="payer_a",
+        snapshot_id="snap_1",
+        node_id="node-1",
+        address_canon_available=True,
+        archive_available=True,
+        provider_group_location_table="ptg2_provider_group_location_abc123",
+    )
+
+    assert 'FROM "mrf"."ptg2_provider_group_location_abc123" loc' in sql
+    assert "FROM mrf.ptg2_provider_location loc" not in sql
+    assert "'provider_group_location:' || loc.provider_group_hash::text" in sql
+    assert 'loc."long"::numeric AS long' in sql
+    assert "loc.first_line" in sql
+    assert "loc.second_line" in sql
+    assert "loc.country_code" in sql
+    assert "mrf.addr_key_v1(first_line, second_line, city, state, postal_code, country_code)" in sql
+    assert "THEN 'provider_group:' || e.provider_group_id || ':npi:' || e.npi::text" in sql
+    assert "e.provider_group_id" in sql
+    assert "'node-1'::varchar AS node_id" in sql
+    assert "'payer_a'::varchar AS source_key" in sql
+
+
+@pytest.mark.asyncio
+async def test_ptg_address_input_resolves_current_snapshot_manifest_location(monkeypatch):
+    class FakeDB:
+        async def all(self, statement, **params):
+            assert "ptg2_current_source_snapshot" in statement
+            assert params == {}
+            return [{"source_key": "payer_a", "snapshot_id": "snap_1"}]
+
+        async def scalar(self, statement, **params):
+            assert "ptg2_snapshot" in statement
+            assert params == {"snapshot_id": "snap_1"}
+            return {
+                "serving_index": {
+                    "provider_group_location_table": "mrf.ptg2_provider_group_location_abc123",
+                }
+            }
+
+    async def table_exists(schema_name, table_name):
+        assert schema_name == "mrf"
+        return table_name in {
+            "ptg2_current_source_snapshot",
+            "ptg2_snapshot",
+            "ptg2_provider_group_location_abc123",
+        }
+
+    monkeypatch.setattr(ptg_address, "db", FakeDB())
+    monkeypatch.setattr(ptg_address, "_table_exists", table_exists)
+
+    source_key, snapshot_id, provider_group_location_table = await ptg_address._resolve_ptg_address_input(
+        "mrf",
+        source_key=None,
+        snapshot_id=None,
+        import_date="fallback_date",
+    )
+
+    assert source_key == "payer_a"
+    assert snapshot_id == "snap_1"
+    assert provider_group_location_table == "ptg2_provider_group_location_abc123"
+
+
 def test_entity_address_unified_sql_falls_back_without_canonical_functions():
     insert_sql = entity_address_unified._insert_raw_from_source_sql(
         "mrf",

@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 import datetime
+import json
 import logging
 import os
+import re
+from typing import Any
 
 from arq import create_pool
 
@@ -24,6 +27,7 @@ from process.entity_address_unified import (
 )
 from process.ext.utils import ensure_database, make_class, my_init_db, print_time_info
 from process.live_progress import enqueue_live_progress
+from process.ptg_parts.db_tables import _quote_ident
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
 
@@ -31,6 +35,8 @@ logger = logging.getLogger(__name__)
 
 PTG_ADDRESS_QUEUE_NAME = "arq:PTGAddress"
 DEFAULT_MIN_ROWS = 1
+PTG_PROVIDER_GROUP_LOCATION_PREFIX = "ptg2_provider_group_location_"
+SNAPSHOT_TABLE_NAME_RE = re.compile(r"[a-z0-9_]{1,63}\Z")
 
 
 def _sql_literal(value: str | None) -> str:
@@ -39,12 +45,230 @@ def _sql_literal(value: str | None) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
+def _row_get(row: Any, key: str) -> Any:
+    if row is None:
+        return None
+    if isinstance(row, dict):
+        return row.get(key)
+    mapping = getattr(row, "_mapping", None)
+    if mapping is not None:
+        return mapping.get(key)
+    return getattr(row, key, None)
+
+
+def _clean_optional(value: Any) -> str | None:
+    cleaned = str(value or "").strip()
+    return cleaned or None
+
+
+def _coerce_json_mapping(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        return decoded if isinstance(decoded, dict) else {}
+    return {}
+
+
+def _manifest_serving_index(manifest: Any) -> dict[str, Any]:
+    data = _coerce_json_mapping(manifest)
+    serving_index = data.get("serving_index")
+    if isinstance(serving_index, dict):
+        return serving_index
+    return data
+
+
+def _snapshot_provider_group_location_table_name(value: Any, db_schema: str) -> str | None:
+    raw = _clean_optional(value)
+    if not raw:
+        return None
+    parts = raw.split(".", 1)
+    if len(parts) == 2:
+        schema_name, table_name = parts[0].strip(), parts[1].strip()
+    else:
+        schema_name, table_name = db_schema, parts[0].strip()
+    if schema_name != db_schema:
+        return None
+    if not table_name.startswith(PTG_PROVIDER_GROUP_LOCATION_PREFIX):
+        return None
+    if not SNAPSHOT_TABLE_NAME_RE.fullmatch(table_name):
+        return None
+    return table_name
+
+
+def _qualified_table_ref(db_schema: str, table_name: str) -> str:
+    return f"{_quote_ident(db_schema)}.{_quote_ident(table_name)}"
+
+
 async def _address_canon_available(db_schema: str) -> bool:
     value = await db.scalar(
         "SELECT to_regprocedure(:signature);",
         signature=f"{db_schema}.addr_key_v1(text,text,text,text,text,text)",
     )
     return isinstance(value, str) and bool(value)
+
+
+async def _current_source_snapshot(db_schema: str, source_key: str | None) -> tuple[str, str] | None:
+    if not await _table_exists(db_schema, "ptg2_current_source_snapshot"):
+        return None
+    if source_key:
+        rows = await db.all(
+            f"""
+            SELECT source_key, snapshot_id
+              FROM {_quote_ident(db_schema)}.ptg2_current_source_snapshot
+             WHERE source_key = :source_key
+             LIMIT 1
+            """,
+            source_key=source_key,
+        )
+    else:
+        rows = await db.all(
+            f"""
+            SELECT source_key, snapshot_id
+              FROM {_quote_ident(db_schema)}.ptg2_current_source_snapshot
+             ORDER BY updated_at DESC NULLS LAST, source_key
+             LIMIT 1
+            """
+        )
+    if not rows:
+        return None
+    resolved_source_key = _clean_optional(_row_get(rows[0], "source_key"))
+    resolved_snapshot_id = _clean_optional(_row_get(rows[0], "snapshot_id"))
+    if not resolved_source_key or not resolved_snapshot_id:
+        return None
+    return resolved_source_key, resolved_snapshot_id
+
+
+async def _snapshot_provider_group_location_table(db_schema: str, snapshot_id: str | None) -> str | None:
+    if not snapshot_id or not await _table_exists(db_schema, "ptg2_snapshot"):
+        return None
+    manifest = await db.scalar(
+        f"""
+        SELECT manifest
+          FROM {_quote_ident(db_schema)}.ptg2_snapshot
+         WHERE snapshot_id = :snapshot_id
+         LIMIT 1
+        """,
+        snapshot_id=snapshot_id,
+    )
+    table_name = _snapshot_provider_group_location_table_name(
+        _manifest_serving_index(manifest).get("provider_group_location_table"),
+        db_schema,
+    )
+    if not table_name or not await _table_exists(db_schema, table_name):
+        return None
+    return table_name
+
+
+async def _resolve_ptg_address_input(
+    db_schema: str,
+    *,
+    source_key: str | None,
+    snapshot_id: str | None,
+    import_date: str,
+) -> tuple[str, str, str | None]:
+    resolved_source_key = _clean_optional(source_key)
+    resolved_snapshot_id = _clean_optional(snapshot_id)
+    if not resolved_snapshot_id:
+        current = await _current_source_snapshot(db_schema, resolved_source_key)
+        if current is not None:
+            resolved_source_key, resolved_snapshot_id = current
+    resolved_source_key = resolved_source_key or "ptg2"
+    resolved_snapshot_id = resolved_snapshot_id or import_date
+    provider_group_location_table = await _snapshot_provider_group_location_table(
+        db_schema,
+        resolved_snapshot_id,
+    )
+    return resolved_source_key, resolved_snapshot_id, provider_group_location_table
+
+
+def _provider_location_source_ctes(db_schema: str, provider_group_location_table: str | None) -> str:
+    if provider_group_location_table:
+        return f"""
+    source_locations AS (
+        SELECT
+            (
+                'provider_group_location:' || loc.provider_group_hash::text || ':' ||
+                loc.npi::text || ':' ||
+                COALESCE(NULLIF(loc.address_checksum::text, ''), md5(concat_ws('|',
+                    COALESCE(loc.first_line::text, ''),
+                    COALESCE(loc.second_line::text, ''),
+                    COALESCE(loc.city_name::text, ''),
+                    COALESCE(loc.state_name::text, ''),
+                    COALESCE(loc.postal_code::text, ''),
+                    COALESCE(loc.country_code::text, '')
+                )))
+            )::varchar AS location_hash,
+            loc.npi::bigint AS npi,
+            'provider_group_location'::varchar AS location_source,
+            'provider_group_location'::varchar AS confidence_code,
+            NULLIF(BTRIM(loc.state_name), '')::varchar AS state,
+            NULLIF(BTRIM(loc.city_name), '')::varchar AS city,
+            NULLIF(
+                LEFT(REGEXP_REPLACE(COALESCE(loc.zip5, loc.postal_code, ''), '[^0-9]', '', 'g'), 5),
+                ''
+            )::varchar AS zip5,
+            loc.lat::numeric AS lat,
+            loc."long"::numeric AS long,
+            NULLIF(BTRIM(loc.first_line), '')::varchar AS first_line,
+            NULLIF(BTRIM(loc.second_line), '')::varchar AS second_line,
+            NULLIF(BTRIM(COALESCE(loc.postal_code, loc.zip5)), '')::varchar AS postal_code,
+            COALESCE(NULLIF(BTRIM(loc.country_code), ''), 'US')::varchar AS country_code,
+            NULLIF(loc.provider_group_hash::text, '')::varchar AS provider_group_id,
+            NULL::varchar AS provider_set_id,
+            NULL::varchar AS tin,
+            NULL::timestamptz AS created_at
+          FROM {_qualified_table_ref(db_schema, provider_group_location_table)} loc
+         WHERE loc.npi IS NOT NULL
+    ),
+    shaped AS (
+        SELECT * FROM source_locations
+    )
+        """
+    return f"""
+    source_locations AS (
+        SELECT
+            loc.location_hash,
+            loc.npi::bigint AS npi,
+            NULLIF(BTRIM(loc.location_source), '')::varchar AS location_source,
+            NULLIF(BTRIM(loc.confidence_code), '')::varchar AS confidence_code,
+            NULLIF(BTRIM(loc.state), '')::varchar AS state,
+            NULLIF(BTRIM(loc.city), '')::varchar AS city,
+            NULLIF(BTRIM(loc.zip5), '')::varchar AS zip5,
+            loc.lat::numeric AS lat,
+            loc.lon::numeric AS long,
+            COALESCE(loc.address_payload::jsonb, '{{}}'::jsonb) AS payload,
+            loc.created_at
+          FROM {db_schema}.ptg2_provider_location loc
+         WHERE loc.npi IS NOT NULL
+    ),
+    shaped AS (
+        SELECT
+            location_hash,
+            npi,
+            location_source,
+            confidence_code,
+            COALESCE(NULLIF(payload->>'first_line', ''), NULLIF(payload->>'address_line1', ''))::varchar AS first_line,
+            COALESCE(
+                NULLIF(payload->>'second_line', ''),
+                NULLIF(payload->>'address_line2', '')
+            )::varchar AS second_line,
+            COALESCE(NULLIF(payload->>'city', ''), city)::varchar AS city,
+            COALESCE(NULLIF(payload->>'state', ''), state)::varchar AS state,
+            COALESCE(NULLIF(payload->>'postal_code', ''), NULLIF(payload->>'zip5', ''), zip5)::varchar AS postal_code,
+            'US'::varchar AS country_code,
+            NULL::varchar AS provider_group_id,
+            NULL::varchar AS provider_set_id,
+            NULL::varchar AS tin,
+            lat,
+            long,
+            created_at
+          FROM source_locations
+    )
+    """
 
 
 def _ptg_address_insert_sql(
@@ -56,9 +280,12 @@ def _ptg_address_insert_sql(
     node_id: str | None,
     address_canon_available: bool,
     archive_available: bool,
+    provider_group_location_table: str | None = None,
 ) -> str:
+    source_ctes = _provider_location_source_ctes(db_schema, provider_group_location_table)
+    country_expr = "country_code" if provider_group_location_table else "'US'"
     address_key_expr = (
-        f"{db_schema}.addr_key_v1(first_line, second_line, city, state, postal_code, 'US')"
+        f"{db_schema}.addr_key_v1(first_line, second_line, city, state, postal_code, {country_expr})"
         if address_canon_available
         else "NULL::uuid"
     )
@@ -87,9 +314,14 @@ def _ptg_address_insert_sql(
             "NULL::varchar AS county_fips"
         )
     )
+    entity_id_expr = (
+        "CASE WHEN e.provider_group_id IS NOT NULL "
+        "THEN 'provider_group:' || e.provider_group_id || ':npi:' || e.npi::text "
+        "ELSE 'npi:' || e.npi::text END"
+    )
     location_key = _location_key_expr(
         entity_type="'ptg'",
-        entity_id="'npi:' || e.npi::text",
+        entity_id=entity_id_expr,
         npi="e.npi",
         inferred_npi="NULL::bigint",
         address_role_id="4",
@@ -136,38 +368,7 @@ def _ptg_address_insert_sql(
         observed_at,
         updated_at
     )
-    WITH source_locations AS (
-        SELECT
-            loc.location_hash,
-            loc.npi::bigint AS npi,
-            NULLIF(BTRIM(loc.location_source), '')::varchar AS location_source,
-            NULLIF(BTRIM(loc.confidence_code), '')::varchar AS confidence_code,
-            NULLIF(BTRIM(loc.state), '')::varchar AS state,
-            NULLIF(BTRIM(loc.city), '')::varchar AS city,
-            NULLIF(BTRIM(loc.zip5), '')::varchar AS zip5,
-            loc.lat::numeric AS lat,
-            loc.lon::numeric AS long,
-            COALESCE(loc.address_payload::jsonb, '{{}}'::jsonb) AS payload,
-            loc.created_at
-          FROM {db_schema}.ptg2_provider_location loc
-         WHERE loc.npi IS NOT NULL
-    ),
-    shaped AS (
-        SELECT
-            location_hash,
-            npi,
-            location_source,
-            confidence_code,
-            COALESCE(NULLIF(payload->>'first_line', ''), NULLIF(payload->>'address_line1', ''))::varchar AS first_line,
-            COALESCE(NULLIF(payload->>'second_line', ''), NULLIF(payload->>'address_line2', ''))::varchar AS second_line,
-            COALESCE(NULLIF(payload->>'city', ''), city)::varchar AS city,
-            COALESCE(NULLIF(payload->>'state', ''), state)::varchar AS state,
-            COALESCE(NULLIF(payload->>'postal_code', ''), NULLIF(payload->>'zip5', ''), zip5)::varchar AS postal_code,
-            lat,
-            long,
-            created_at
-          FROM source_locations
-    ),
+    WITH {source_ctes},
     keyed AS (
         SELECT
             *,
@@ -191,10 +392,10 @@ def _ptg_address_insert_sql(
         NULL::varchar AS plan_id,
         NULL::varchar AS ptg_plan_id,
         NULL::varchar AS market_type,
-        NULL::varchar AS provider_group_id,
-        NULL::varchar AS provider_set_id,
+        e.provider_group_id,
+        e.provider_set_id,
         e.npi,
-        NULL::varchar AS tin,
+        e.tin,
         {location_key} AS location_key,
         e.address_key,
         e.premise_key,
@@ -244,8 +445,6 @@ async def process_data(ctx, task=None):
 
     await ensure_database(test_mode)
     db_schema = _validate_schema_name(os.getenv("HLTHPRT_DB_SCHEMA") or "mrf")
-    if not await _table_exists(db_schema, "ptg2_provider_location"):
-        raise RuntimeError("ptg2_provider_location is not available; run PTG compact serving first.")
 
     import_date = ctx["import_date"]
     stage_cls = make_class(PTGAddress, import_date)
@@ -255,8 +454,17 @@ async def process_data(ctx, task=None):
         await db.create_table(stage_cls.__table__, checkfirst=True)
         context["stage_prepared"] = True
 
-    source_key = str(task.get("source_key") or os.getenv("HLTHPRT_PTG_ADDRESS_SOURCE_KEY") or "ptg2").strip() or "ptg2"
-    snapshot_id = str(task.get("snapshot_id") or os.getenv("HLTHPRT_PTG_ADDRESS_SNAPSHOT_ID") or import_date).strip()
+    source_key, snapshot_id, provider_group_location_table = await _resolve_ptg_address_input(
+        db_schema,
+        source_key=task.get("source_key") or os.getenv("HLTHPRT_PTG_ADDRESS_SOURCE_KEY"),
+        snapshot_id=task.get("snapshot_id") or os.getenv("HLTHPRT_PTG_ADDRESS_SNAPSHOT_ID"),
+        import_date=import_date,
+    )
+    if not provider_group_location_table and not await _table_exists(db_schema, "ptg2_provider_location"):
+        raise RuntimeError(
+            "No PTG provider-location source is available; publish a compact PTG snapshot "
+            "with provider_group_location_table or run the legacy ptg2_provider_location projection."
+        )
     node_id = str(os.getenv("HLTHPRT_IMPORT_NODE_ID") or "").strip() or None
 
     await db.status(f"TRUNCATE TABLE {db_schema}.{stage_table};")
@@ -269,6 +477,7 @@ async def process_data(ctx, task=None):
             node_id=node_id,
             address_canon_available=await _address_canon_available(db_schema),
             archive_available=await _table_exists(db_schema, "address_archive_v2"),
+            provider_group_location_table=provider_group_location_table,
         )
     )
     await _create_stage_indexes(stage_cls, db_schema)
