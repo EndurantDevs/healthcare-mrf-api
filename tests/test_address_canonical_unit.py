@@ -1165,6 +1165,8 @@ def test_ptg_address_insert_sql_uses_provider_group_member_npi_address_fallback(
     assert 'JOIN "mrf".npi_address a' in sql
     assert "a.type = 'primary'" in sql
     assert "'provider_group_member_npi_address:' || pgm.provider_group_global_id_128::text" in sql
+    assert "a.date_added::timestamptz AS created_at" in sql
+    assert "a.updated_at" not in sql
     assert "NULLIF(pgm.provider_group_global_id_128::text, '')::varchar AS provider_group_id" in sql
     assert "mrf.addr_key_v1(first_line, second_line, city, state, postal_code, country_code)" in sql
     assert "'payer_a'::varchar AS source_key" in sql
