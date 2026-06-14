@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import os
 import re
 import time
 from typing import Any
@@ -46,6 +47,7 @@ _ALLOWED_SORTS = {
 
 _TABLE_EXISTS_CACHE_TTL_SECONDS = 300.0
 _TABLE_EXISTS_CACHE: dict[str, tuple[float, bool]] = {}
+ADDRESS_SERVING_SOURCE_UNIFIED = "entity_address_unified"
 
 _CHAIN_RULES: list[tuple[str, tuple[str, ...]]] = [
     ("CVS", ("cvs", "caremark", "omnicare", "longs drug")),
@@ -132,6 +134,16 @@ def _get_session(request):
 def _qualified_table_name(table) -> str:
     schema = table.schema or "mrf"
     return f"{schema}.{table.name}"
+
+
+def _address_serving_source() -> str:
+    return str(os.getenv("HLTHPRT_ADDRESS_SERVING_SOURCE") or "legacy").strip().lower()
+
+
+def _pharmacy_address_table_sql() -> str:
+    if _address_serving_source() == ADDRESS_SERVING_SOURCE_UNIFIED:
+        return "mrf.entity_address_unified"
+    return "mrf.npi_address"
 
 
 async def _table_exists(session, table) -> bool:
@@ -1544,6 +1556,7 @@ async def _fetch_pharmacy_context(session, *, npi: int, as_of: datetime.date) ->
     partd_table = _qualified_table_name(PartDPharmacyActivity.__table__)
     license_table = _qualified_table_name(PharmacyLicenseRecord.__table__)
     other_id_table = _qualified_table_name(NPIDataOtherIdentifier.__table__)
+    address_table = _pharmacy_address_table_sql()
     chain_case = _chain_case_sql(
         "LOWER(COALESCE(n.provider_organization_name, '') || ' ' || COALESCE(n.do_business_as_text, ''))"
     )
@@ -1678,7 +1691,7 @@ SELECT
     {partd_fields},
     {license_fields},
     {other_id_fields}
-FROM mrf.npi_address a
+FROM {address_table} a
 JOIN mrf.npi n ON n.npi = a.npi
 LEFT JOIN mrf.geo_zip_lookup g ON g.zip_code = LEFT(COALESCE(a.postal_code, ''), 5)
 {partd_join}
