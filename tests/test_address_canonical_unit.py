@@ -1149,6 +1149,27 @@ def test_ptg_address_insert_sql_uses_snapshot_provider_group_location_table():
     assert "'payer_a'::varchar AS source_key" in sql
 
 
+def test_ptg_address_insert_sql_uses_provider_group_member_npi_address_fallback():
+    sql = ptg_address._ptg_address_insert_sql(
+        "mrf",
+        "ptg_address_stage",
+        source_key="payer_a",
+        snapshot_id="snap_1",
+        node_id="node-1",
+        address_canon_available=True,
+        archive_available=True,
+        provider_group_member_table="ptg2_provider_group_member_abc123",
+    )
+
+    assert 'FROM "mrf"."ptg2_provider_group_member_abc123" pgm' in sql
+    assert 'JOIN "mrf".npi_address a' in sql
+    assert "a.type = 'primary'" in sql
+    assert "'provider_group_member_npi_address:' || pgm.provider_group_global_id_128::text" in sql
+    assert "NULLIF(pgm.provider_group_global_id_128::text, '')::varchar AS provider_group_id" in sql
+    assert "mrf.addr_key_v1(first_line, second_line, city, state, postal_code, country_code)" in sql
+    assert "'payer_a'::varchar AS source_key" in sql
+
+
 @pytest.mark.asyncio
 async def test_ptg_address_input_resolves_current_snapshot_manifest_location(monkeypatch):
     class FakeDB:
@@ -1164,6 +1185,7 @@ async def test_ptg_address_input_resolves_current_snapshot_manifest_location(mon
                 "serving_index": {
                     "table": "mrf.ptg2_serving_rate_compact_abc123",
                     "provider_group_location_table": "mrf.ptg2_provider_group_location_abc123",
+                    "provider_group_member_table": "mrf.ptg2_provider_group_member_abc123",
                     "provider_set_component_table": "mrf.ptg2_provider_set_component_abc123",
                 }
             }
@@ -1175,6 +1197,7 @@ async def test_ptg_address_input_resolves_current_snapshot_manifest_location(mon
             "ptg2_snapshot",
             "ptg2_serving_rate_compact_abc123",
             "ptg2_provider_group_location_abc123",
+            "ptg2_provider_group_member_abc123",
             "ptg2_provider_set_component_abc123",
         }
 
@@ -1192,6 +1215,7 @@ async def test_ptg_address_input_resolves_current_snapshot_manifest_location(mon
     assert snapshot_id == "snap_1"
     assert manifest_tables == {
         "provider_group_location_table": "ptg2_provider_group_location_abc123",
+        "provider_group_member_table": "ptg2_provider_group_member_abc123",
         "serving_rate_compact_table": "ptg2_serving_rate_compact_abc123",
         "provider_set_component_table": "ptg2_provider_set_component_abc123",
     }
@@ -1217,6 +1241,7 @@ async def test_ptg_address_inputs_resolve_all_current_source_snapshots(monkeypat
                 "serving_index": {
                     "table": f"mrf.ptg2_serving_rate_compact_{suffix}",
                     "provider_group_location_table": f"mrf.ptg2_provider_group_location_{suffix}",
+                    "provider_group_member_table": f"mrf.ptg2_provider_group_member_{suffix}",
                     "provider_set_component_table": f"mrf.ptg2_provider_set_component_{suffix}",
                 }
             }
@@ -1243,6 +1268,7 @@ async def test_ptg_address_inputs_resolve_all_current_source_snapshots(monkeypat
             "snap_b",
             {
                 "provider_group_location_table": "ptg2_provider_group_location_b",
+                "provider_group_member_table": "ptg2_provider_group_member_b",
                 "serving_rate_compact_table": "ptg2_serving_rate_compact_b",
                 "provider_set_component_table": "ptg2_provider_set_component_b",
             },
@@ -1252,6 +1278,7 @@ async def test_ptg_address_inputs_resolve_all_current_source_snapshots(monkeypat
             "snap_a",
             {
                 "provider_group_location_table": "ptg2_provider_group_location_a",
+                "provider_group_member_table": "ptg2_provider_group_member_a",
                 "serving_rate_compact_table": "ptg2_serving_rate_compact_a",
                 "provider_set_component_table": "ptg2_provider_set_component_a",
             },
