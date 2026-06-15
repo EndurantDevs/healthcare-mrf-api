@@ -77,6 +77,31 @@ def _mrf_url_job_id(kind: str, scope: str, url: str) -> str:
     return f"mrf:{kind}:{scope}:{digest}"
 
 
+async def _mark_mrf_provider_file_progress(ctx: dict, *, url: str | None, processed_providers: int) -> None:
+    run_id = str(ctx.get("context", {}).get("control_run_id") or "").strip()
+    if not run_id:
+        return
+    message = f"processed provider file with {processed_providers:,} provider record(s)"
+    await mark_control_run(
+        run_id,
+        status="running",
+        phase_detail="mrf provider jobs running",
+        progress_message=message,
+        metrics={
+            "last_provider_url": url,
+            "last_provider_records": processed_providers,
+        },
+        progress={
+            "unit": "provider_files",
+            "total": 1,
+            "done": 0,
+            "pct": 0,
+            "message": message,
+            "phase": "mrf provider jobs running",
+        },
+    )
+
+
 def is_test_mode(ctx: dict) -> bool:
     return bool(ctx.get("context", {}).get("test_mode"))
 
@@ -1212,6 +1237,11 @@ async def process_provider(ctx, task):
                 )
                 return
     await flush_error_log(myimportlog)
+    await _mark_mrf_provider_file_progress(
+        ctx,
+        url=task.get("url"),
+        processed_providers=processed_providers,
+    )
     return 1
 
 

@@ -311,7 +311,7 @@ async def test_finish_main_enqueues_finalize(monkeypatch):
     enqueue_call = fake_pool.enqueue_job.await_args
     assert enqueue_call.args[0] == "claims_pricing_finalize"
     assert enqueue_call.kwargs["_queue_name"] == claims_pricing.CLAIMS_FINISH_QUEUE_NAME
-    assert enqueue_call.kwargs["_job_id"] == "claims_finalize_run_a"
+    assert enqueue_call.kwargs["_job_id"].startswith("claims_finalize_run_a_")
     assert enqueue_call.args[1]["test_mode"] is True
 
 

@@ -104,15 +104,33 @@ def _resolve_specs(payload: dict[str, Any]) -> list[WorkerSpec]:
 
     importer = str(payload.get("importer") or "").strip()
     role = str(payload.get("role") or "").strip().lower()
+    explicit_role = bool(role)
     if not role:
         status = str(payload.get("status") or "").strip().lower()
         role = "finish" if status == "finalizing" else "start"
+    if importer and role == "start" and not explicit_role:
+        finished_start_spec = _finish_spec_after_completed_start(importer, payload)
+        if finished_start_spec is not None:
+            return [finished_start_spec]
     spec = _BY_IMPORTER_ROLE.get((importer, role))
     if spec is not None:
         return [spec]
     if role == "finish":
         return []
     return [_BY_IMPORTER_ROLE[(importer, "start")]] if (importer, "start") in _BY_IMPORTER_ROLE else []
+
+
+def _finish_spec_after_completed_start(importer: str, payload: dict[str, Any]) -> WorkerSpec | None:
+    if _launcher_mode() != "kubernetes":
+        return None
+    start_spec = _BY_IMPORTER_ROLE.get((importer, "start"))
+    finish_spec = _BY_IMPORTER_ROLE.get((importer, "finish"))
+    if start_spec is None or finish_spec is None:
+        return None
+    state = _worker_state(start_spec, payload)
+    if state.get("job_status") == "succeeded":
+        return finish_spec
+    return None
 
 
 def _ensure_spec(spec: WorkerSpec, payload: dict[str, Any]) -> dict[str, Any]:
@@ -197,17 +215,19 @@ def _ensure_kubernetes_job(
     payload: dict[str, Any],
     state: dict[str, Any],
 ) -> dict[str, Any]:
-    if state.get("job_status") == "succeeded":
-        return {**state, "status": "completed"}
-    if state.get("job_status") == "failed":
-        return {**state, "status": "failed", "message": "worker job failed"}
-
     image = os.getenv("HLTHPRT_WORKER_JOB_IMAGE", "").strip()
     if not image:
         return {**state, "status": "failed", "message": "HLTHPRT_WORKER_JOB_IMAGE is not configured"}
 
-    job = _worker_job_manifest(spec, payload, image)
     namespace = _kubernetes_namespace()
+    if state.get("job_status") in {"succeeded", "failed"} and state.get("job_name"):
+        try:
+            _delete_kubernetes_job(namespace, str(state["job_name"]))
+        except _KubernetesApiError as exc:
+            if exc.status != 404:
+                return {**state, "status": "failed", "message": str(exc)}
+
+    job = _worker_job_manifest(spec, payload, image)
     try:
         _kubernetes_request("POST", f"/apis/batch/v1/namespaces/{namespace}/jobs", job)
     except _KubernetesApiError as exc:
@@ -216,6 +236,16 @@ def _ensure_kubernetes_job(
             return {**refreshed, "status": "already_running" if refreshed.get("running") else "exists"}
         return {**state, "status": "failed", "message": str(exc)}
     return {**_worker_state(spec, payload), "status": "started"}
+
+
+def _delete_kubernetes_job(namespace: str, job_name: str) -> None:
+    encoded = urllib.parse.quote(job_name, safe="")
+    body = {
+        "apiVersion": "v1",
+        "kind": "DeleteOptions",
+        "propagationPolicy": "Background",
+    }
+    _kubernetes_request("DELETE", f"/apis/batch/v1/namespaces/{namespace}/jobs/{encoded}", body)
 
 
 def _kubernetes_worker_state(spec: WorkerSpec, payload: dict[str, Any] | None = None) -> dict[str, Any]:

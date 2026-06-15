@@ -94,6 +94,7 @@ DRUG_CLAIMS_REDIS_TTL_SECONDS = max(int(os.getenv("HLTHPRT_DRUG_CLAIMS_REDIS_TTL
 DRUG_CLAIMS_WORKDIR = os.getenv("HLTHPRT_DRUG_CLAIMS_WORKDIR", os.getenv("HLTHPRT_CLAIMS_WORKDIR", "/tmp/healthporta_claims"))
 DRUG_CLAIMS_KEEP_WORKDIR = _env_bool("HLTHPRT_DRUG_CLAIMS_KEEP_WORKDIR", default=_env_bool("HLTHPRT_CLAIMS_KEEP_WORKDIR", default=False))
 DRUG_CLAIMS_DOWNLOAD_CONCURRENCY = max(int(os.getenv("HLTHPRT_DRUG_CLAIMS_DOWNLOAD_CONCURRENCY", os.getenv("HLTHPRT_CLAIMS_DOWNLOAD_CONCURRENCY", "3"))), 1)
+DRUG_CLAIMS_PREFER_STREAM_DOWNLOAD = _env_bool("HLTHPRT_DRUG_CLAIMS_PREFER_STREAM_DOWNLOAD", default=True)
 DRUG_CLAIMS_DEFER_STAGE_INDEXES = _env_bool("HLTHPRT_DRUG_CLAIMS_DEFER_STAGE_INDEXES", default=_env_bool("HLTHPRT_CLAIMS_DEFER_STAGE_INDEXES", default=True))
 DRUG_CLAIMS_DB_DEADLOCK_RETRIES = max(int(os.getenv("HLTHPRT_DRUG_CLAIMS_DB_DEADLOCK_RETRIES", os.getenv("HLTHPRT_CLAIMS_DB_DEADLOCK_RETRIES", "6"))), 1)
 DRUG_CLAIMS_DB_DEADLOCK_BASE_DELAY_SECONDS = max(
@@ -800,7 +801,11 @@ async def _download_source_file(
             if test_mode:
                 await _download_csv_head(source["url"], path, TEST_MAX_DOWNLOAD_BYTES)
             else:
-                await download_it_and_save(source["url"], path)
+                await download_it_and_save(
+                    source["url"],
+                    path,
+                    prefer_stream=DRUG_CLAIMS_PREFER_STREAM_DOWNLOAD,
+                )
             return path
         except Retry as exc:
             if attempt >= DOWNLOAD_RETRIES:
@@ -2497,7 +2502,7 @@ async def finish_main(
         "drug_claims_finalize",
         payload,
         _queue_name=DRUG_CLAIMS_FINISH_QUEUE_NAME,
-        _job_id=f"drug_claims_finalize_{run_id}",
+        _job_id=f"drug_claims_finalize_{run_id}_{secrets.token_hex(4)}",
     )
     print(
         f"Queued drug-claims finalize: import_id={_normalize_import_id(import_id)} run_id={run_id} stage={stage_suffix}",

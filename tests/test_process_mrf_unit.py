@@ -173,6 +173,8 @@ def test_claims_finish_worker_configuration():
     names = [fn.__name__ for fn in process_pkg.ClaimsPricing_finish.functions]
     assert names == ["claims_pricing_finalize"]
     assert process_pkg.ClaimsPricing_finish.queue_name == "arq:ClaimsPricing_finish"
+    assert process_pkg.ClaimsPricing_finish.max_tries == 720
+    assert process_pkg.DrugClaims_finish.max_tries == 720
 
 
 def test_job_serializer_handles_exceptions():

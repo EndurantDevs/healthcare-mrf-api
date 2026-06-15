@@ -347,6 +347,11 @@ class ClaimsPricing_finish:  # pylint: disable=invalid-name
     queue_read_limit = 2 * max_jobs
     queue_name = 'arq:ClaimsPricing_finish'
     job_timeout = 86400
+    max_tries = (
+        int(os.environ.get('HLTHPRT_CLAIMS_FINALIZE_MAX_TRIES'))
+        if os.environ.get('HLTHPRT_CLAIMS_FINALIZE_MAX_TRIES')
+        else 720
+    )
     burst = True
     redis_settings = build_redis_settings()
     job_serializer = serialize_job
@@ -376,6 +381,11 @@ class DrugClaims_finish:  # pylint: disable=invalid-name
     queue_read_limit = 2 * max_jobs
     queue_name = 'arq:DrugClaims_finish'
     job_timeout = 86400
+    max_tries = (
+        int(os.environ.get('HLTHPRT_DRUG_CLAIMS_FINALIZE_MAX_TRIES'))
+        if os.environ.get('HLTHPRT_DRUG_CLAIMS_FINALIZE_MAX_TRIES')
+        else int(os.environ.get('HLTHPRT_CLAIMS_FINALIZE_MAX_TRIES', 720))
+    )
     burst = True
     redis_settings = build_redis_settings()
     job_serializer = serialize_job

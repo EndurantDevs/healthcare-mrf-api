@@ -15,6 +15,7 @@ import secrets
 import shutil
 import sys
 import tempfile
+import time
 import zipfile
 from dataclasses import dataclass
 from functools import lru_cache
@@ -714,20 +715,51 @@ async def _wait_for_activity_chunks(redis, run_id: str, snapshot_id: str, total_
         return 0, set()
     last_done = -1
     last_progress_at = datetime.datetime.utcnow()
+    last_emit_at = 0.0
     while True:
         total, done, rows = await _get_activity_chunk_progress(redis, run_id, snapshot_id)
         if done >= max(total, total_chunks):
             return rows, await _activity_done_chunk_ids(redis, run_id, snapshot_id)
-        if done > last_done:
+        done_advanced = done > last_done
+        if done_advanced:
             last_done = done
             last_progress_at = datetime.datetime.utcnow()
         stall_seconds = (datetime.datetime.utcnow() - last_progress_at).total_seconds()
+        now_monotonic = time.monotonic()
+        if done_advanced or now_monotonic - last_emit_at >= 30.0:
+            enqueue_live_progress(
+                run_id=run_id,
+                importer="partd-formulary-network",
+                status="running",
+                phase="partd activity chunks running",
+                unit="chunks",
+                done=done,
+                total=max(total, total_chunks),
+                message=(
+                    f"activity chunks done={done}/{max(total, total_chunks)} "
+                    f"rows={rows:,}"
+                ),
+            )
+            last_emit_at = now_monotonic
         if stall_seconds >= PARTD_CHUNK_STALL_SECONDS:
             print(
                 f"[partd] activity chunk progress stalled snapshot={snapshot_id} "
                 f"done={done}/{max(total, total_chunks)} stall_seconds={int(stall_seconds)}; "
                 f"falling back to local processing for remaining chunks",
                 flush=True,
+            )
+            enqueue_live_progress(
+                run_id=run_id,
+                importer="partd-formulary-network",
+                status="running",
+                phase="partd activity chunk fallback",
+                unit="chunks",
+                done=done,
+                total=max(total, total_chunks),
+                message=(
+                    f"activity chunk progress stalled; processing remaining "
+                    f"{max(total, total_chunks) - done} chunk(s) locally"
+                ),
             )
             return rows, await _activity_done_chunk_ids(redis, run_id, snapshot_id)
         print(

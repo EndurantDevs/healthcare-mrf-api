@@ -103,6 +103,47 @@ def test_stage_artifact_file_copies_local_path(tmp_path):
     assert target.read_bytes() == b"zip-bytes"
 
 
+def test_wait_for_activity_chunks_emits_live_progress_and_fallback(monkeypatch):
+    events: list[dict] = []
+
+    class FakeRedis:
+        async def get(self, key):
+            if key.endswith(":activity_total"):
+                return b"2"
+            if key.endswith(":activity_rows"):
+                return b"0"
+            return None
+
+        async def scard(self, _key):
+            return 0
+
+        async def smembers(self, _key):
+            return set()
+
+    monkeypatch.setattr(module, "PARTD_CHUNK_STALL_SECONDS", 0)
+    monkeypatch.setattr(module, "enqueue_live_progress", lambda **payload: events.append(payload))
+
+    rows, done_chunks = asyncio.run(
+        module._wait_for_activity_chunks(  # pylint: disable=protected-access
+            FakeRedis(),
+            "run_partd",
+            "quarterly:20260428:test",
+            2,
+        )
+    )
+
+    assert rows == 0
+    assert done_chunks == set()
+    assert [event["phase"] for event in events] == [
+        "partd activity chunks running",
+        "partd activity chunk fallback",
+    ]
+    assert events[0]["unit"] == "chunks"
+    assert events[0]["done"] == 0
+    assert events[0]["total"] == 2
+    assert "processing remaining 2 chunk(s) locally" in events[1]["message"]
+
+
 def test_test_mode_skips_full_table_index_maintenance():
     source = Path(module.__file__).read_text(encoding="utf-8")
 

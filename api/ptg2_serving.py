@@ -139,6 +139,19 @@ _PTG2_LEGACY_ADDRESS_COLUMNS = {
 _PTG2_UNIFIED_ADDRESS_COLUMNS = _PTG2_LEGACY_ADDRESS_COLUMNS | {"address_precision"}
 
 
+def _ptg2_geo_distance_miles_sql(lat_sql: str, long_sql: str) -> str:
+    """Return a PostgreSQL expression for great-circle distance in miles."""
+    request_lat = "CAST(:geo_lat AS double precision)"
+    request_long = "CAST(:geo_long AS double precision)"
+    return (
+        "(2 * 3958.7613 * asin(least(1.0, sqrt("
+        f"power(sin(radians(({lat_sql}) - {request_lat}) / 2), 2) + "
+        f"cos(radians({request_lat})) * cos(radians({lat_sql})) * "
+        f"power(sin(radians(({long_sql}) - {request_long}) / 2), 2)"
+        "))))"
+    )
+
+
 def normalize_ptg2_mode(value: str | None) -> str:
     mode = str(value or PTG2_MODE_PRODUCT_SEARCH).strip().lower()
     if mode not in {PTG2_MODE_EXACT_SOURCE, PTG2_MODE_PRODUCT_SEARCH}:
@@ -840,15 +853,27 @@ async def _ptg2_manifest_location_provider_matches(
     state_value = str(args.get("state") or "").strip().upper()
     city_value = str(args.get("city") or "").strip().lower()
     zip_value = str(args.get("zip5") or args.get("zip") or "").strip()[:5]
+    geo_lat: float | None = None
+    geo_long: float | None = None
+    geo_radius_miles: float | None = None
+    if args.get("lat") not in (None, "", "null") or args.get("long") not in (None, "", "null"):
+        try:
+            radius_raw = args.get("radius_miles")
+            geo_lat = float(args.get("lat"))
+            geo_long = float(args.get("long"))
+            geo_radius_miles = max(float(radius_raw if radius_raw not in (None, "", "null") else 25.0), 0.0)
+        except (TypeError, ValueError):
+            return None
     provider_npi = args.get("npi")
     npi_address_table = await _ptg2_address_serving_table(
         session,
-        _PTG2_LEGACY_ADDRESS_COLUMNS,
+        _PTG2_UNIFIED_ADDRESS_COLUMNS if geo_lat is not None else _PTG2_LEGACY_ADDRESS_COLUMNS,
         require_legacy_available=True,
     )
     npi_data_table = f"{PTG2_SCHEMA}.npi_data"
     if not npi_address_table:
         return None
+    using_unified_address_table = _is_unified_address_table(npi_address_table)
 
     filters = ["addr.npi IS NOT NULL"]
     configured_limit = _ptg2_manifest_location_match_limit()
@@ -864,6 +889,23 @@ async def _ptg2_manifest_location_provider_matches(
     if zip_value:
         filters.append("left(coalesce(addr.postal_code, ''), 5) = :zip5")
         params["zip5"] = zip_value
+    if geo_lat is not None and geo_long is not None and geo_radius_miles is not None:
+        params.update(
+            geo_lat=geo_lat,
+            geo_long=geo_long,
+            geo_radius_miles=geo_radius_miles,
+            geo_min_lat=geo_lat - geo_radius_miles / 69.0,
+            geo_max_lat=geo_lat + geo_radius_miles / 69.0,
+            geo_min_long=geo_long - geo_radius_miles / 69.0,
+            geo_max_long=geo_long + geo_radius_miles / 69.0,
+        )
+        filters.append("addr.lat::float8 BETWEEN :geo_min_lat AND :geo_max_lat")
+        filters.append("addr.long::float8 BETWEEN :geo_min_long AND :geo_max_long")
+        filters.append(
+            f"{_ptg2_geo_distance_miles_sql('addr.lat::float8', 'addr.long::float8')} <= CAST(:geo_radius_miles AS double precision)"
+        )
+        if using_unified_address_table:
+            filters.append("COALESCE(addr.address_precision, '') <> 'city_zip'")
     if provider_npi is not None:
         try:
             params["provider_npi"] = int(provider_npi)
@@ -911,7 +953,14 @@ async def _ptg2_manifest_location_provider_matches(
                 FROM {npi_address_table} addr
                 WHERE {" AND ".join(address_filters)}
                   AND addr.type = ANY(CAST(:address_types AS varchar[]))
-                ORDER BY addr.npi, (addr.type = 'primary') DESC, addr.type, addr.checksum
+                ORDER BY addr.npi,
+                    CASE addr.type
+                        WHEN 'practice' THEN 0
+                        WHEN 'primary' THEN 1
+                        WHEN 'secondary' THEN 2
+                        ELSE 3
+                    END,
+                    addr.checksum
                 LIMIT :limit
             )
             SELECT DISTINCT ON (pgm.provider_group_global_id_128, addr.npi)
@@ -939,7 +988,15 @@ async def _ptg2_manifest_location_provider_matches(
             FROM location_npis addr
             JOIN {provider_group_member_table} pgm ON pgm.npi = addr.npi
             {provider_join}
-            ORDER BY pgm.provider_group_global_id_128, addr.npi, (addr.type = 'primary') DESC, addr.type, addr.checksum
+            ORDER BY pgm.provider_group_global_id_128,
+                addr.npi,
+                CASE addr.type
+                    WHEN 'practice' THEN 0
+                    WHEN 'primary' THEN 1
+                    WHEN 'secondary' THEN 2
+                    ELSE 3
+                END,
+                addr.checksum
             LIMIT :limit
             """
             ),
@@ -951,9 +1008,15 @@ async def _ptg2_manifest_location_provider_matches(
     # (type, zip5) indexes. The broad primary+secondary form forces a large
     # sort in dense cities, so use primary practice locations for the hot path
     # and fall back to secondary only when primary has no candidates.
-    rows = await _query_location_provider_rows(("primary",) if provider_npi is None else ("primary", "secondary"))
+    if using_unified_address_table:
+        primary_address_types = ("practice", "primary") if provider_npi is None else ("practice", "primary", "secondary")
+        fallback_address_types = ("secondary",)
+    else:
+        primary_address_types = ("primary",) if provider_npi is None else ("primary", "secondary")
+        fallback_address_types = ("secondary",)
+    rows = await _query_location_provider_rows(primary_address_types)
     if not rows and provider_npi is None:
-        rows = await _query_location_provider_rows(("secondary",))
+        rows = await _query_location_provider_rows(fallback_address_types)
     if not rows:
         return set(), {}
     group_ids = tuple(
@@ -1210,13 +1273,11 @@ async def _search_ptg2_manifest_db_serving_table(
         or args.get("zip5")
         or args.get("zip")
         or args.get("npi")
+        or args.get("lat") is not None
+        or args.get("long") is not None
+        or args.get("radius_miles") is not None
     )
-    unsupported_filters = (
-        args.get("q")
-        or args.get("lat")
-        or args.get("long")
-        or args.get("radius_miles")
-    )
+    unsupported_filters = args.get("q")
     if unsupported_filters or not requested_plan or not requested_code:
         return None
     has_provider_npi_sidecar = bool(_ptg2_manifest_artifact_entry(serving_tables, "provider_npi"))
@@ -1266,6 +1327,9 @@ async def _search_ptg2_manifest_db_serving_table(
                         "state": args.get("state") or None,
                         "city": args.get("city") or None,
                         "zip5": args.get("zip5") or None,
+                        "lat": args.get("lat") or None,
+                        "long": args.get("long") or None,
+                        "radius_miles": args.get("radius_miles") or None,
                         "npi": args.get("npi") or None,
                         "source": "ptg2_db",
                         "serving_table": table_name,
@@ -1434,6 +1498,9 @@ async def _search_ptg2_manifest_db_serving_table(
                 "state": args.get("state") or None,
                 "city": args.get("city") or None,
                 "zip5": args.get("zip5") or None,
+                "lat": args.get("lat") or None,
+                "long": args.get("long") or None,
+                "radius_miles": args.get("radius_miles") or None,
                 "npi": args.get("npi") or None,
                 "source": "ptg2_db",
                 "serving_table": table_name,
@@ -1526,7 +1593,9 @@ def _compact_provider_filter_sql(
         if params.get("geo_lat") is not None:
             clauses.append("loc.lat::float8 BETWEEN :geo_min_lat AND :geo_max_lat")
             clauses.append("loc.long::float8 BETWEEN :geo_min_long AND :geo_max_long")
-            clauses.append("(earth_distance(ll_to_earth(:geo_lat, :geo_long), ll_to_earth(loc.lat::float8, loc.long::float8)) / 1609.344) <= :geo_radius_miles")
+            clauses.append(
+                f"{_ptg2_geo_distance_miles_sql('loc.lat::float8', 'loc.long::float8')} <= CAST(:geo_radius_miles AS double precision)"
+            )
         if inferred_sql:
             clauses.append(f"EXISTS (SELECT 1 FROM {PTG2_SCHEMA}.npi_taxonomy nt WHERE nt.npi = loc.npi AND {inferred_sql})")
         if specialty:
@@ -1577,7 +1646,9 @@ def _compact_provider_filter_sql(
         if params.get("geo_lat") is not None:
             clauses.append("addr_filter.lat::float8 BETWEEN :geo_min_lat AND :geo_max_lat")
             clauses.append("addr_filter.long::float8 BETWEEN :geo_min_long AND :geo_max_long")
-            clauses.append("(earth_distance(ll_to_earth(:geo_lat, :geo_long), ll_to_earth(addr_filter.lat::float8, addr_filter.long::float8)) / 1609.344) <= :geo_radius_miles")
+            clauses.append(
+                f"{_ptg2_geo_distance_miles_sql('addr_filter.lat::float8', 'addr_filter.long::float8')} <= CAST(:geo_radius_miles AS double precision)"
+            )
             if _is_unified_address_table(address_table):
                 clauses.append("COALESCE(addr_filter.address_precision, '') <> 'city_zip'")
     if specialty or inferred_sql:
