@@ -12,9 +12,7 @@ import re
 import uuid
 
 from arq import create_pool
-from sqlalchemy import and_, select
-
-from db.models import FacilityAnchor, GeoZipLookup, db
+from db.models import FacilityAnchor, db
 from process.control_lifecycle import mark_control_run
 from process.ext.address_canon import archive_table_name, resolve_into_archive, source_enabled, stamp_address_keys
 from process.ext.utils import (ensure_database, make_class, my_init_db,
@@ -122,57 +120,6 @@ def _parse_lat_lng(row: dict) -> tuple[float | None, float | None]:
     return lat, lng
 
 
-async def _geo_zip_lookup_exists(db_schema: str) -> bool:
-    return bool(await db.scalar("SELECT to_regclass(:qualified_name) IS NOT NULL;", qualified_name=f"{db_schema}.geo_zip_lookup"))
-
-
-async def _load_zip_centroid_rows():
-    stmt = (
-        select(GeoZipLookup.zip_code, GeoZipLookup.latitude, GeoZipLookup.longitude)
-        .where(
-            and_(
-                GeoZipLookup.zip_code.isnot(None),
-                GeoZipLookup.latitude.isnot(None),
-                GeoZipLookup.longitude.isnot(None),
-            )
-        )
-    )
-    return await db.all(stmt)
-
-
-async def _load_zip_centroids(*, test_mode: bool = False) -> dict[str, tuple[float, float]]:
-    db_schema = os.getenv("HLTHPRT_DB_SCHEMA") if os.getenv("HLTHPRT_DB_SCHEMA") else "mrf"
-    if await _geo_zip_lookup_exists(db_schema):
-        result = await _load_zip_centroid_rows()
-    elif test_mode:
-        previous_override = getattr(db, "_database_override", None)
-        db._database_override = None  # type: ignore[attr-defined]
-        try:
-            await db.connect()
-            if await _geo_zip_lookup_exists(db_schema):
-                result = await _load_zip_centroid_rows()
-            else:
-                logger.info("Facility Anchors test mode: %s.geo_zip_lookup is unavailable; hospital coordinates may be empty.", db_schema)
-                result = []
-        finally:
-            db._database_override = previous_override  # type: ignore[attr-defined]
-            await db.connect()
-    else:
-        raise RuntimeError(f"Facility Anchors requires {db_schema}.geo_zip_lookup for ZIP centroid enrichment.")
-    centroids: dict[str, tuple[float, float]] = {}
-    for row in result:
-        zip_code = _normalize_zip(getattr(row, "zip_code", None))
-        if not zip_code:
-            continue
-        try:
-            lat = float(getattr(row, "latitude"))
-            lng = float(getattr(row, "longitude"))
-        except (TypeError, ValueError):
-            continue
-        centroids[zip_code] = (lat, lng)
-    return centroids
-
-
 async def _table_has_column(db_schema: str, table_name: str, column_name: str) -> bool:
     return bool(
         await db.scalar(
@@ -191,10 +138,11 @@ async def _table_has_column(db_schema: str, table_name: str, column_name: str) -
 
 async def _canonical_archive_table(db_schema: str) -> str | None:
     requested = archive_table_name()
-    if await _table_has_column(db_schema, requested, "address_key"):
+    if (
+        await _table_has_column(db_schema, requested, "address_key")
+        and await _table_has_column(db_schema, requested, "geo_source")
+    ):
         return requested
-    if requested == "address_archive_v2" and await _table_has_column(db_schema, "address_archive", "address_key"):
-        return "address_archive"
     return None
 
 
@@ -221,6 +169,7 @@ async def _refresh_archive_geocodes_from_facility_anchors(stage_table: str, db_s
             UPDATE {db_schema}.{archive_table} AS archive
                SET lat = facility_geocodes.lat,
                    long = facility_geocodes.long,
+                   geo_source = COALESCE(archive.geo_source, 'manual'::{db_schema}.address_archive_geo_source),
                    geocode_source = COALESCE(archive.geocode_source, 'facility_anchor'),
                    geocode_quality = COALESCE(archive.geocode_quality, 'facility_anchor'),
                    geocoded_at = COALESCE(archive.geocoded_at, now())
@@ -378,7 +327,6 @@ async def _fetch_and_parse_cms_hospitals(
     test_mode: bool,
     test_limit: int,
     already_accepted: int,
-    zip_centroids: dict[str, tuple[float, float]],
 ) -> tuple[int, int]:
     """Fetch CMS Hospital General Information CSV and store Hospital anchors."""
     logger.info("Fetching CMS Hospital General Information...")
@@ -410,8 +358,6 @@ async def _fetch_and_parse_cms_hospitals(
             zip_code = _normalize_zip(row.get("ZIP Code"))
 
             lat, lng = _parse_lat_lng(row)
-            if (lat is None or lng is None) and zip_code in zip_centroids:
-                lat, lng = zip_centroids[zip_code]
             if lat is not None and lng is not None:
                 with_coordinates += 1
 
@@ -471,7 +417,6 @@ async def process_data(ctx, task=None):
     import aiohttp
     client = aiohttp.ClientSession()
     try:
-        zip_centroids = await _load_zip_centroids(test_mode=test_mode)
         hrsa_count = await _fetch_and_parse_hrsa(client, stage_cls, batch_size, test_mode, test_limit)
         hosp_count, hosp_with_coords = await _fetch_and_parse_cms_hospitals(
             client,
@@ -480,7 +425,6 @@ async def process_data(ctx, task=None):
             test_mode,
             test_limit,
             hrsa_count,
-            zip_centroids,
         )
     finally:
         await client.close()
