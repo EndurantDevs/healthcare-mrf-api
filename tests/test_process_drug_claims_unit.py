@@ -1,6 +1,8 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+import csv
 import sys
+import tempfile
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 from types import SimpleNamespace
@@ -106,6 +108,42 @@ async def test_finish_main_enqueues_finalize(monkeypatch):
 def test_normalize_rx_name_key_strips_non_alnum():
     assert drug_claims._normalize_rx_name_key(" Metformin HCL 500-mg ") == "METFORMINHCL500MG"
     assert drug_claims._normalize_rx_name_key(None) == ""
+
+
+def test_to_str_strips_nul_bytes():
+    assert drug_claims._to_str(" Met\x00formin \x00HCL ") == "Metformin HCL"
+    assert drug_claims._to_str("\x00") is None
+
+
+@pytest.mark.asyncio
+async def test_split_provider_drug_chunks_ignores_overflow_fields(monkeypatch):
+    monkeypatch.setattr(drug_claims, "DRUG_CLAIMS_CHUNK_TARGET_BYTES", 64)
+    monkeypatch.setattr(drug_claims, "DRUG_CLAIMS_PROVIDER_DRUG_MAX_BUCKETS", 4)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        source_path = Path(tmpdir) / "provider_drug.csv"
+        chunks_dir = Path(tmpdir) / "chunks"
+        source_path.write_text(
+            "Prscrbr_NPI,Brnd_Name,Gnrc_Name,Tot_Clms\n"
+            "1000000001,Brand A,Generic A,12,unexpected-overflow\n"
+            "1000000002,Brand B,Generic B,5\n",
+            encoding="utf-8",
+        )
+
+        chunks = await drug_claims._split_source_into_chunks(
+            dataset_key="provider_drug",
+            source_path=str(source_path),
+            chunks_dir=chunks_dir,
+            test_mode=False,
+        )
+
+        assert chunks
+        for chunk in chunks:
+            with open(chunk["chunk_path"], "r", encoding="utf-8-sig", newline="") as handle:
+                reader = csv.DictReader(handle)
+                assert reader.fieldnames == ["Prscrbr_NPI", "Brnd_Name", "Gnrc_Name", "Tot_Clms"]
+                for row in reader:
+                    assert None not in row
 
 
 def test_normalize_external_codes():

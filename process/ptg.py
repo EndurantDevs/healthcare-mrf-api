@@ -2025,8 +2025,19 @@ async def main(
     """
     import_started_monotonic = time.monotonic()
     import_month_value = normalize_import_month(import_month)
-    import_id_val = _normalize_import_id(import_id or import_month_value.strftime("%Y%m%d"))
     source_key_val = _normalize_source_key(source_key or os.getenv("HLTHPRT_PTG2_SOURCE_KEY"))
+    import_id_val = _normalize_import_id(
+        import_id
+        or _default_ptg2_import_id(
+            import_month_value,
+            source_key_val,
+            toc_urls=toc_urls,
+            toc_list=toc_list,
+            in_network_url=in_network_url,
+            allowed_url=allowed_url,
+            provider_ref_url=provider_ref_url,
+        )
+    )
     import_run_id = f"ptg2:{import_id_val}"
     snapshot_id = f"ptg2:{import_month_value.strftime('%Y%m')}:{hash_prefix(semantic_hash(import_run_id), 12)}"
     live_run_id = str(control_run_id or "").strip()
@@ -2613,6 +2624,39 @@ async def main(
         raise
     finally:
         reset_live_progress_context(live_token)
+
+
+def _default_ptg2_import_id(
+    import_month_value: datetime.date,
+    source_key_val: str | None,
+    *,
+    toc_urls: list[str] | None = None,
+    toc_list: str | None = None,
+    in_network_url: str | None = None,
+    allowed_url: str | None = None,
+    provider_ref_url: str | None = None,
+) -> str:
+    month_id = import_month_value.strftime("%Y%m%d")
+    if not source_key_val:
+        return month_id
+    source_inputs = {
+        "source_key": source_key_val,
+        "toc_urls": toc_urls or [],
+        "toc_list": toc_list or "",
+        "in_network_url": in_network_url or "",
+        "allowed_url": allowed_url or "",
+        "provider_ref_url": provider_ref_url or "",
+    }
+    if not any(source_inputs[key] for key in ("toc_urls", "toc_list", "in_network_url", "allowed_url", "provider_ref_url")):
+        return month_id
+    fingerprint = hash_prefix(
+        semantic_hash(
+            {"import_month": month_id, **source_inputs},
+            domain="ptg2_import_identity",
+        ),
+        16,
+    )
+    return f"{month_id}_{fingerprint}"
 
 
 __all__ = [

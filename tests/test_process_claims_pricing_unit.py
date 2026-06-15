@@ -117,6 +117,9 @@ def test_row_value_supports_multiple_header_variants():
 
 
 def test_normalize_state_and_zip5_helpers():
+    assert claims_pricing._to_str(" Los\x00 Angeles ") == "Los Angeles"
+    assert claims_pricing._to_str("\x00") is None
+
     assert _normalize_state("in") == "IN"
     assert _normalize_state(" IN ") == "IN"
     assert _normalize_state("Jill") is None
@@ -354,6 +357,43 @@ async def test_split_provider_service_chunks_partition_by_npi(monkeypatch):
         assert "1000000001" in npi_to_chunk
         assert "1000000002" in npi_to_chunk
         assert "1000000003" in npi_to_chunk
+
+
+@pytest.mark.asyncio
+async def test_split_provider_service_chunks_ignores_overflow_fields(monkeypatch):
+    monkeypatch.setattr(claims_pricing, "CLAIMS_CHUNK_TARGET_BYTES", 64)
+    monkeypatch.setattr(claims_pricing, "CLAIMS_PROVIDER_DRUG_MAX_BUCKETS", 4)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        source_path = Path(tmpdir) / "provider_service.csv"
+        chunks_dir = Path(tmpdir) / "chunks"
+        source_path.write_text(
+            "Rndrng_NPI,HCPCS_Cd,HCPCS_Desc,Rndrng_Prvdr_City,Rndrng_Prvdr_State_Abrvtn\n"
+            "1000000001,99213,Office visit,Los Angeles,CA,unexpected-overflow\n"
+            "1000000002,99214,Office visit,Chicago,IL\n",
+            encoding="utf-8",
+        )
+
+        chunks = await _split_source_into_chunks(
+            dataset_key="provider_service",
+            source_path=str(source_path),
+            chunks_dir=chunks_dir,
+            test_mode=False,
+        )
+
+        assert chunks
+        for chunk in chunks:
+            with open(chunk["chunk_path"], "r", encoding="utf-8-sig", newline="") as handle:
+                reader = csv.DictReader(handle)
+                assert reader.fieldnames == [
+                    "Rndrng_NPI",
+                    "HCPCS_Cd",
+                    "HCPCS_Desc",
+                    "Rndrng_Prvdr_City",
+                    "Rndrng_Prvdr_State_Abrvtn",
+                ]
+                for row in reader:
+                    assert None not in row
 
 
 @pytest.mark.asyncio
