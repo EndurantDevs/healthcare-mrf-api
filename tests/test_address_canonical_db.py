@@ -1042,6 +1042,7 @@ async def test_facility_anchor_coordinates_refresh_archive_geocode_fields():
         UPDATE {schema}.address_archive_v2
            SET lat = NULL,
                long = NULL,
+               geo_source = NULL,
                geocode_source = NULL,
                geocode_quality = NULL,
                geocoded_at = NULL
@@ -1055,7 +1056,7 @@ async def test_facility_anchor_coordinates_refresh_archive_geocode_fields():
 
     row = await db.first(
         f"""
-        SELECT lat, long, geocode_source, geocode_quality
+        SELECT lat, long, geo_source, geocode_source, geocode_quality
           FROM {schema}.address_archive_v2
          WHERE address_key = :address_key;
         """,
@@ -1063,6 +1064,7 @@ async def test_facility_anchor_coordinates_refresh_archive_geocode_fields():
     )
     assert float(row.lat) == pytest.approx(30.2672)
     assert float(row.long) == pytest.approx(-97.7431)
+    assert row.geo_source == "manual"
     assert row.geocode_source == "facility_anchor"
     assert row.geocode_quality == "facility_anchor"
 

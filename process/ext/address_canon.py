@@ -942,10 +942,6 @@ async def _select_canonical_archive_table(schema: str, requested: str) -> str:
             session, schema, requested, "address_key"
         ):
             return requested
-        if requested == "address_archive_v2" and await _table_exists_in_session(
-            session, schema, "address_archive"
-        ) and await _table_has_column_in_session(session, schema, "address_archive", "address_key"):
-            return "address_archive"
     return requested
 
 
@@ -1543,6 +1539,7 @@ async def migrate_legacy_archive_to_v2(
     schema = schema or _schema_name()
     archive_table = archive_table or archive_table_name()
     qschema = _quote_ident(schema)
+    geo_source_type = f"{qschema}.{_quote_ident('address_archive_geo_source')}"
     legacy = _qtable(schema, legacy_table)
     archive = _qtable(schema, archive_table)
     checksum_map = _qtable(schema, "address_checksum_map")
@@ -1632,6 +1629,7 @@ async def migrate_legacy_archive_to_v2(
                 lat numeric,
                 long numeric,
                 place_id text,
+                geo_source text,
                 date_added date
             ) ON COMMIT DROP;
         """))
@@ -1646,14 +1644,14 @@ async def migrate_legacy_archive_to_v2(
                 unit_norm, city_norm, state_code, zip5, zip4, country_code,
                 first_line, second_line, city_name, state_name, postal_code,
                 telephone_number, fax_number, formatted_address, lat, long,
-                place_id, date_added
+                place_id, geo_source, date_added
             )
             VALUES (
                 :checksum, :address_key, :identity_key, :premise_key, :line1_norm,
                 :unit_norm, :city_norm, :state_code, :zip5, :zip4, :country_code,
                 :first_line, :second_line, :city_name, :state_name, :postal_code,
                 :telephone_number, :fax_number, :formatted_address, :lat, :long,
-                :place_id, :date_added
+                :place_id, :geo_source, :date_added
             );
         """)
         while True:
@@ -1713,6 +1711,9 @@ async def migrate_legacy_archive_to_v2(
                     "place_id": str(data.get("place_id")).strip()
                     if data.get("place_id") is not None and str(data.get("place_id")).strip()
                     else None,
+                    "geo_source": "google"
+                    if data.get("place_id") is not None and str(data.get("place_id")).strip()
+                    else None,
                     "date_added": data.get("date_added"),
                 })
             await session.execute(insert_sql, keyed_rows)
@@ -1759,7 +1760,7 @@ async def migrate_legacy_archive_to_v2(
                         line1_norm, unit_norm, city_norm, state_code, zip5, zip4,
                         country_code, first_line, second_line, city_name, state_name,
                         postal_code, telephone_number, fax_number, formatted_address,
-                        lat, long, place_id, geocode_source, geocode_quality,
+                        lat, long, place_id, geo_source, geocode_source, geocode_quality,
                         geocoded_at, source_bits, display_priority, date_added
                     )
                     SELECT
@@ -1787,6 +1788,7 @@ async def migrate_legacy_archive_to_v2(
                         lat,
                         long,
                         place_id,
+                        NULLIF(geo_source, '')::{geo_source_type},
                         CASE WHEN lat IS NOT NULL AND long IS NOT NULL THEN 'archive_backfill' ELSE NULL END,
                         CASE WHEN lat IS NOT NULL AND long IS NOT NULL THEN 'legacy_archive' ELSE NULL END,
                         CASE WHEN lat IS NOT NULL AND long IS NOT NULL THEN now() ELSE NULL END,
@@ -1863,6 +1865,13 @@ async def migrate_legacy_archive_to_v2(
                                   AND COALESCE(EXCLUDED.date_added, DATE '0001-01-01') > COALESCE(target.date_added, DATE '0001-01-01')
                               )
                             THEN EXCLUDED.place_id ELSE COALESCE(target.place_id, EXCLUDED.place_id) END,
+                        geo_source = CASE
+                            WHEN (target.place_id IS NULL AND EXCLUDED.place_id IS NOT NULL)
+                              OR (
+                                  (target.place_id IS NULL) = (EXCLUDED.place_id IS NULL)
+                                  AND COALESCE(EXCLUDED.date_added, DATE '0001-01-01') > COALESCE(target.date_added, DATE '0001-01-01')
+                              )
+                            THEN EXCLUDED.geo_source ELSE COALESCE(target.geo_source, EXCLUDED.geo_source) END,
                         geocode_source = COALESCE(target.geocode_source, EXCLUDED.geocode_source),
                         geocode_quality = COALESCE(target.geocode_quality, EXCLUDED.geocode_quality),
                         geocoded_at = COALESCE(target.geocoded_at, EXCLUDED.geocoded_at),

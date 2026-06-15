@@ -41,12 +41,20 @@ PTG_PROVIDER_GROUP_MEMBER_PREFIX = "ptg2_provider_group_member_"
 PTG_SERVING_RATE_COMPACT_PREFIX = "ptg2_serving_rate_compact_"
 PTG_PROVIDER_SET_COMPONENT_PREFIX = "ptg2_provider_set_component_"
 SNAPSHOT_TABLE_NAME_RE = re.compile(r"[a-z0-9_]{1,63}\Z")
+POSTGRES_SETTING_RE = re.compile(r"[A-Za-z0-9_.:-]{1,64}\Z")
 
 
 def _sql_literal(value: str | None) -> str:
     if value is None:
         return "NULL"
     return "'" + str(value).replace("'", "''") + "'"
+
+
+def _postgres_setting_literal(value: str | None, default: str) -> str:
+    cleaned = str(value or default).strip() or default
+    if not POSTGRES_SETTING_RE.fullmatch(cleaned):
+        raise ValueError(f"Unsafe PostgreSQL setting value: {cleaned!r}")
+    return _sql_literal(cleaned)
 
 
 def _row_get(row: Any, key: str) -> Any:
@@ -322,6 +330,7 @@ def _provider_location_source_ctes(
             NULLIF(loc.provider_group_hash::text, '')::varchar AS provider_group_id,
             NULL::varchar AS provider_set_id,
             NULL::varchar AS tin,
+            NULL::uuid AS source_address_key,
             NULL::timestamptz AS created_at
           FROM {_qualified_table_ref(db_schema, provider_group_location_table)} loc
          WHERE loc.npi IS NOT NULL
@@ -332,10 +341,18 @@ def _provider_location_source_ctes(
         """
     if provider_group_member_table:
         return f"""
+    provider_group_members AS MATERIALIZED (
+        SELECT DISTINCT
+            NULLIF(provider_group_global_id_128::text, '')::varchar AS provider_group_id,
+            npi::bigint AS npi
+          FROM {_qualified_table_ref(db_schema, provider_group_member_table)}
+         WHERE npi IS NOT NULL
+           AND NULLIF(provider_group_global_id_128::text, '') IS NOT NULL
+    ),
     source_locations AS (
         SELECT
             (
-                'provider_group_member_npi_address:' || pgm.provider_group_global_id_128::text || ':' ||
+                'provider_group_member_npi_address:' || pgm.provider_group_id || ':' ||
                 a.npi::text || ':' ||
                 COALESCE(NULLIF(a.checksum::text, ''), md5(concat_ws('|',
                     COALESCE(a.first_line::text, ''),
@@ -361,16 +378,15 @@ def _provider_location_source_ctes(
             NULLIF(BTRIM(a.second_line), '')::varchar AS second_line,
             NULLIF(BTRIM(a.postal_code), '')::varchar AS postal_code,
             COALESCE(NULLIF(BTRIM(a.country_code), ''), 'US')::varchar AS country_code,
-            NULLIF(pgm.provider_group_global_id_128::text, '')::varchar AS provider_group_id,
+            pgm.provider_group_id,
             NULL::varchar AS provider_set_id,
             NULL::varchar AS tin,
+            a.address_key::uuid AS source_address_key,
             a.date_added::timestamptz AS created_at
-          FROM {_qualified_table_ref(db_schema, provider_group_member_table)} pgm
+          FROM provider_group_members pgm
           JOIN {_quote_ident(db_schema)}.npi_address a
             ON a.npi = pgm.npi
            AND a.type = 'primary'
-         WHERE pgm.npi IS NOT NULL
-           AND pgm.provider_group_global_id_128 IS NOT NULL
     ),
     shaped AS (
         SELECT * FROM source_locations
@@ -411,6 +427,7 @@ def _provider_location_source_ctes(
             NULL::varchar AS provider_group_id,
             NULL::varchar AS provider_set_id,
             NULL::varchar AS tin,
+            NULL::uuid AS source_address_key,
             lat,
             long,
             created_at
@@ -422,36 +439,23 @@ def _provider_location_source_ctes(
 def _provider_group_plan_cte(
     db_schema: str,
     *,
+    source_key: str,
     snapshot_id: str,
-    serving_rate_compact_table: str | None,
-    provider_set_component_table: str | None,
 ) -> str:
-    if not serving_rate_compact_table or not provider_set_component_table:
-        return """
-    ,
-    provider_group_plans AS (
-        SELECT NULL::varchar AS provider_group_id, ARRAY[]::varchar[] AS ptg_plan_array
-        WHERE FALSE
-    )
-        """
     return f"""
     ,
-    provider_group_plans AS (
+    source_plans AS (
         SELECT
-            NULLIF(c.provider_group_hash::text, '')::varchar AS provider_group_id,
             ARRAY_REMOVE(
-                ARRAY_AGG(DISTINCT NULLIF(r.plan_id::text, '') ORDER BY NULLIF(r.plan_id::text, '')),
+                ARRAY_AGG(DISTINCT NULLIF(plan_id::text, '') ORDER BY NULLIF(plan_id::text, '')),
                 NULL
             )::varchar[] AS ptg_plan_array
-          FROM {_qualified_table_ref(db_schema, serving_rate_compact_table)} r
-          JOIN {_qualified_table_ref(db_schema, provider_set_component_table)} c
-            ON c.provider_set_hash = r.provider_set_hash
-         WHERE r.snapshot_id = {_sql_literal(snapshot_id)}
-           AND NULLIF(c.provider_group_hash::text, '') IS NOT NULL
-           AND NULLIF(r.plan_id::text, '') IS NOT NULL
-         GROUP BY NULLIF(c.provider_group_hash::text, '')
+          FROM {_quote_ident(db_schema)}.ptg2_current_plan_source
+         WHERE source_key = {_sql_literal(source_key)}
+           AND snapshot_id = {_sql_literal(snapshot_id)}
+           AND NULLIF(plan_id::text, '') IS NOT NULL
     )
-        """
+    """
 
 
 def _ptg_address_insert_sql(
@@ -475,15 +479,14 @@ def _ptg_address_insert_sql(
     )
     plan_cte = _provider_group_plan_cte(
         db_schema,
+        source_key=source_key,
         snapshot_id=snapshot_id,
-        serving_rate_compact_table=serving_rate_compact_table,
-        provider_set_component_table=provider_set_component_table,
     )
     country_expr = "country_code" if provider_group_location_table or provider_group_member_table else "'US'"
     address_key_expr = (
-        f"{db_schema}.addr_key_v1(first_line, second_line, city, state, postal_code, {country_expr})"
+        f"COALESCE(source_address_key, {db_schema}.addr_key_v1(first_line, second_line, city, state, postal_code, {country_expr}))"
         if address_canon_available
-        else "NULL::uuid"
+        else "source_address_key"
     )
     archive_join = (
         f"LEFT JOIN {db_schema}.address_archive_v2 a "
@@ -491,6 +494,8 @@ def _ptg_address_insert_sql(
         if archive_available
         else ""
     )
+    lat_expr = "COALESCE(a.lat, k.lat)" if archive_available else "k.lat"
+    long_expr = 'COALESCE(a."long", k.long)' if archive_available else "k.long"
     archive_fields = (
         "a.premise_key, "
         "'v' || COALESCE(a.identity_version, 1)::text AS archive_identity_version, "
@@ -583,8 +588,8 @@ def _ptg_address_insert_sql(
             k.confidence_code,
             k.state,
             k.city,
-            k.lat,
-            k.long,
+            {lat_expr} AS lat,
+            {long_expr} AS long,
             k.first_line,
             k.second_line,
             k.postal_code,
@@ -601,16 +606,16 @@ def _ptg_address_insert_sql(
           FROM keyed k
           {archive_join}
     )
-    SELECT DISTINCT ON ({location_key})
+    SELECT
         {_sql_literal(node_id)}::varchar AS node_id,
         {_sql_literal(source_key)}::varchar AS source_key,
         {_sql_literal(snapshot_id)}::varchar AS snapshot_id,
-        CASE WHEN CARDINALITY(COALESCE(pgp.ptg_plan_array, ARRAY[]::varchar[])) = 1
-             THEN pgp.ptg_plan_array[1]
+        CASE WHEN CARDINALITY(COALESCE(sp.ptg_plan_array, ARRAY[]::varchar[])) = 1
+             THEN sp.ptg_plan_array[1]
              ELSE NULL
         END::varchar AS plan_id,
-        CASE WHEN CARDINALITY(COALESCE(pgp.ptg_plan_array, ARRAY[]::varchar[])) = 1
-             THEN pgp.ptg_plan_array[1]
+        CASE WHEN CARDINALITY(COALESCE(sp.ptg_plan_array, ARRAY[]::varchar[])) = 1
+             THEN sp.ptg_plan_array[1]
              ELSE NULL
         END::varchar AS ptg_plan_id,
         NULL::varchar AS market_type,
@@ -643,18 +648,17 @@ def _ptg_address_insert_sql(
         e.county_fips,
         e.lat,
         e.long,
-        COALESCE(pgp.ptg_plan_array, ARRAY[]::varchar[]) AS ptg_plan_array,
+        COALESCE(sp.ptg_plan_array, ARRAY[]::varchar[]) AS ptg_plan_array,
         ARRAY[{_sql_literal(source_key)}]::varchar[] AS ptg_source_array,
-        COALESCE(pgp.ptg_plan_array, ARRAY[]::varchar[]) AS group_plan_array,
+        COALESCE(sp.ptg_plan_array, ARRAY[]::varchar[]) AS group_plan_array,
         {_sql_literal(BASE_ADDRESS_VERSION)}::varchar AS base_address_version,
         NULL::timestamptz AS ptg_snapshot_published_at,
         COALESCE(e.created_at, NOW())::timestamptz AS observed_at,
         NOW()::timestamptz AS updated_at
       FROM enriched e
-      LEFT JOIN provider_group_plans pgp
-        ON pgp.provider_group_id = e.provider_group_id
+      CROSS JOIN source_plans sp
      WHERE e.zip5 IS NOT NULL OR e.state_code IS NOT NULL OR e.address_key IS NOT NULL
-     ORDER BY {location_key}, e.created_at DESC NULLS LAST, e.location_hash;
+    ON CONFLICT (source_key, snapshot_id, location_key) DO NOTHING;
     """
 
 
@@ -738,21 +742,26 @@ async def process_data(ctx, task=None):
                 "provider_set_component_table": provider_set_component_table,
             }
         )
-        await db.status(
-            _ptg_address_insert_sql(
-                db_schema,
-                stage_table,
-                source_key=source_key,
-                snapshot_id=snapshot_id,
-                node_id=node_id,
-                address_canon_available=address_canon_available,
-                archive_available=archive_available,
-                provider_group_location_table=provider_group_location_table,
-                provider_group_member_table=provider_group_member_table,
-                serving_rate_compact_table=serving_rate_compact_table,
-                provider_set_component_table=provider_set_component_table,
-            )
+        insert_sql = _ptg_address_insert_sql(
+            db_schema,
+            stage_table,
+            source_key=source_key,
+            snapshot_id=snapshot_id,
+            node_id=node_id,
+            address_canon_available=address_canon_available,
+            archive_available=archive_available,
+            provider_group_location_table=provider_group_location_table,
+            provider_group_member_table=provider_group_member_table,
+            serving_rate_compact_table=serving_rate_compact_table,
+            provider_set_component_table=provider_set_component_table,
         )
+        timeout = _postgres_setting_literal(
+            os.getenv("HLTHPRT_PTG_ADDRESS_STATEMENT_TIMEOUT"),
+            "0",
+        )
+        async with db.transaction() as session:
+            await session.execute(db.text(f"SET LOCAL statement_timeout = {timeout};"))
+            await session.execute(db.text(insert_sql))
     context["sources"] = source_contexts
     context["skipped_sources"] = skipped_sources
     if not source_contexts:

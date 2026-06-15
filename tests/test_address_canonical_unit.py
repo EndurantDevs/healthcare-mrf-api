@@ -790,6 +790,10 @@ def test_entity_address_unified_sql_carries_address_key(monkeypatch):
     assert "ptg_plan_array varchar[]" in raw_sql
     assert "JOIN mrf.address_archive_v2 a" in enrich_sql
     assert "SET premise_key = k.premise_key" in enrich_sql
+    assert "formatted_address = COALESCE(k.archive_formatted_address, r.formatted_address)" in enrich_sql
+    assert "lat = COALESCE(k.archive_lat, r.lat)" in enrich_sql
+    assert "long = COALESCE(k.archive_long, r.long)" in enrich_sql
+    assert "place_id = COALESCE(k.archive_place_id, r.place_id)" in enrich_sql
     assert "location_key = encode(sha256(convert_to" in enrich_sql
     assert "mrf.addr_key_v1(first_line, second_line, city_name, state_name, postal_code, country_code) AS address_key" in insert_sql
     assert "ptg_plan_array," in insert_sql
@@ -799,6 +803,8 @@ def test_entity_address_unified_sql_carries_address_key(monkeypatch):
     assert "location_key," in materialize_sql
     assert "archive_identity_version," in materialize_sql
     assert "confidence_score," in materialize_sql
+    assert "ARRAY_AGG(lat ORDER BY (lat IS NULL), source_priority ASC" in materialize_sql
+    assert "ARRAY_AGG(long ORDER BY (long IS NULL), source_priority ASC" in materialize_sql
 
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_KEY_V2", "1")
     flagged_sql = entity_address_unified._materialize_from_raw_sql(
@@ -1061,14 +1067,17 @@ def test_ptg_address_insert_sql_uses_existing_provider_location_projection():
     assert "mrf.addr_key_v1(first_line, second_line, city, state, postal_code, 'US')" in sql
     assert "AS source_zip5" in sql
     assert "COALESCE(a.zip5, k.source_zip5) AS zip5" in sql
+    assert "COALESCE(a.lat, k.lat) AS lat" in sql
+    assert 'COALESCE(a."long", k.long) AS long' in sql
     assert "SELECT\n            k.*," not in sql
     assert "k.location_hash,\n            k.npi," in sql
     assert "LEFT JOIN mrf.address_archive_v2 a" in sql
     assert "NULL::varchar AS node_id" in sql
     assert "'payer_a'::varchar AS source_key" in sql
     assert "ARRAY['payer_a']::varchar[] AS ptg_source_array" in sql
-    assert "SELECT DISTINCT ON (encode(sha256(convert_to" in sql
+    assert "SELECT DISTINCT ON" not in sql
     assert "encode(sha256(convert_to" in sql
+    assert "ON CONFLICT (source_key, snapshot_id, location_key) DO NOTHING" in sql
 
 
 def test_ptg_address_snapshot_table_name_allowlist_rejects_unsafe_names():
@@ -1131,13 +1140,14 @@ def test_ptg_address_insert_sql_uses_snapshot_provider_group_location_table():
     )
 
     assert 'FROM "mrf"."ptg2_provider_group_location_abc123" loc' in sql
-    assert 'FROM "mrf"."ptg2_serving_rate_compact_abc123" r' in sql
-    assert 'JOIN "mrf"."ptg2_provider_set_component_abc123" c' in sql
-    assert "c.provider_set_hash = r.provider_set_hash" in sql
-    assert "WHERE r.snapshot_id = 'snap_1'" in sql
-    assert "ARRAY_AGG(DISTINCT NULLIF(r.plan_id::text, '')" in sql
-    assert "COALESCE(pgp.ptg_plan_array, ARRAY[]::varchar[]) AS ptg_plan_array" in sql
-    assert "COALESCE(pgp.ptg_plan_array, ARRAY[]::varchar[]) AS group_plan_array" in sql
+    assert 'FROM "mrf".ptg2_current_plan_source' in sql
+    assert "source_key = 'payer_a'" in sql
+    assert "snapshot_id = 'snap_1'" in sql
+    assert 'FROM "mrf"."ptg2_serving_rate_compact_abc123" r' not in sql
+    assert 'JOIN "mrf"."ptg2_provider_set_component_abc123" c' not in sql
+    assert "COALESCE(sp.ptg_plan_array, ARRAY[]::varchar[]) AS ptg_plan_array" in sql
+    assert "COALESCE(sp.ptg_plan_array, ARRAY[]::varchar[]) AS group_plan_array" in sql
+    assert "CROSS JOIN source_plans sp" in sql
     assert "FROM mrf.ptg2_provider_location loc" not in sql
     assert "'provider_group_location:' || loc.provider_group_hash::text" in sql
     assert 'loc."long"::numeric AS long' in sql
@@ -1163,15 +1173,19 @@ def test_ptg_address_insert_sql_uses_provider_group_member_npi_address_fallback(
         provider_group_member_table="ptg2_provider_group_member_abc123",
     )
 
-    assert 'FROM "mrf"."ptg2_provider_group_member_abc123" pgm' in sql
+    assert "provider_group_members AS MATERIALIZED" in sql
+    assert 'FROM "mrf"."ptg2_provider_group_member_abc123"' in sql
     assert 'JOIN "mrf".npi_address a' in sql
     assert "a.type = 'primary'" in sql
-    assert "'provider_group_member_npi_address:' || pgm.provider_group_global_id_128::text" in sql
+    assert "SELECT DISTINCT" in sql
+    assert "'provider_group_member_npi_address:' || pgm.provider_group_id" in sql
     assert "a.date_added::timestamptz AS created_at" in sql
     assert "a.updated_at" not in sql
-    assert "NULLIF(pgm.provider_group_global_id_128::text, '')::varchar AS provider_group_id" in sql
+    assert "NULLIF(provider_group_global_id_128::text, '')::varchar AS provider_group_id" in sql
     assert "mrf.addr_key_v1(first_line, second_line, city, state, postal_code, country_code)" in sql
     assert "'payer_a'::varchar AS source_key" in sql
+    assert "SELECT DISTINCT ON" not in sql
+    assert "ON CONFLICT (source_key, snapshot_id, location_key) DO NOTHING" in sql
 
 
 @pytest.mark.asyncio
@@ -1326,6 +1340,8 @@ def test_entity_address_unified_sql_falls_back_without_canonical_functions():
     assert "NULL::uuid AS address_key" in direct_sql
     assert "addr_key_v1" not in insert_sql
     assert "addr_key_v1" not in direct_sql
+    assert "ARRAY_AGG(lat ORDER BY (lat IS NULL), source_priority ASC" in direct_sql
+    assert "ARRAY_AGG(long ORDER BY (long IS NULL), source_priority ASC" in direct_sql
 
 
 def test_entity_address_unified_key_v2_requires_canonical_functions(monkeypatch):

@@ -4,8 +4,8 @@
 import os
 
 from sqlalchemy import (ARRAY, DATE, JSON, SMALLINT, TEXT, TIMESTAMP,
-                        BigInteger, Boolean, Column, DateTime, Float, Integer,
-                        Numeric, PrimaryKeyConstraint, String, text)
+                        BigInteger, Boolean, Column, DateTime, Enum, Float,
+                        Integer, Numeric, PrimaryKeyConstraint, String, text)
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import declared_attr
 
@@ -1150,6 +1150,62 @@ class AddressArchive(AddressPrototype):
     __main_table__ = __tablename__
     __my_index_elements__ = ['checksum']
     # __my_additional_indexes__ = [{'index_elements': ('healthcare_provider_taxonomy_code', 'npi',)}, ]
+
+
+class AddressArchiveV2(Base, JSONOutputMixin):
+    __tablename__ = "address_archive_v2"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("address_key"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["address_key"]
+
+    address_key = Column(PG_UUID(as_uuid=True), nullable=False)
+    identity_key = Column(TEXT, nullable=False)
+    identity_version = Column(SMALLINT, nullable=False)
+    precision = Column(TEXT, nullable=False)
+    premise_key = Column(PG_UUID(as_uuid=True))
+    line1_norm = Column(TEXT)
+    unit_norm = Column(TEXT)
+    city_norm = Column(TEXT)
+    state_code = Column(String(32))
+    zip5 = Column(String(5))
+    zip4 = Column(String(4))
+    country_code = Column(String(8), nullable=False)
+    first_line = Column(TEXT)
+    second_line = Column(TEXT)
+    city_name = Column(TEXT)
+    state_name = Column(TEXT)
+    postal_code = Column(TEXT)
+    telephone_number = Column(TEXT)
+    fax_number = Column(TEXT)
+    formatted_address = Column(TEXT)
+    lat = Column(Numeric(scale=8, precision=11, asdecimal=False, decimal_return_scale=None))
+    long = Column(Numeric(scale=8, precision=11, asdecimal=False, decimal_return_scale=None))
+    place_id = Column(TEXT)
+    geo_source = Column(
+        Enum(
+            "mapbox",
+            "google",
+            "tiger",
+            "manual",
+            name="address_archive_geo_source",
+            native_enum=True,
+            create_type=False,
+            schema=os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+        )
+    )
+    geocode_source = Column(TEXT)
+    geocode_quality = Column(TEXT)
+    postal_validation_status = Column(TEXT)
+    geocoded_at = Column(TIMESTAMP(timezone=True))
+    source_bits = Column(Integer, nullable=False)
+    first_seen_at = Column(TIMESTAMP(timezone=True), nullable=False)
+    last_seen_at = Column(TIMESTAMP(timezone=True), nullable=False)
+    date_added = Column(DATE)
+    display_priority = Column(SMALLINT, nullable=False)
+    merged_into = Column(PG_UUID(as_uuid=True))
 
 
 class NPIAddress(AddressPrototype):

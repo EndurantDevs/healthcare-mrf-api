@@ -478,13 +478,21 @@ def _make_address_row():
     return types.SimpleNamespace(**data)
 
 
-def _make_v2_archive_row(*, lat=42.0, long=-88.0, formatted_address="v2 address", place_id="v2-place"):
+def _make_v2_archive_row(
+    *,
+    lat=42.0,
+    long=-88.0,
+    formatted_address="v2 address",
+    place_id="v2-place",
+    geo_source=None,
+):
     return types.SimpleNamespace(
         _mapping={
             "lat": lat,
             "long": long,
             "formatted_address": formatted_address,
             "place_id": place_id,
+            "geo_source": geo_source,
         }
     )
 
@@ -573,6 +581,7 @@ async def test_get_npi_geocode_mapbox(monkeypatch):
     response = await npi_module.get_npi(request, "1518379601")
     payload = json.loads(response.body)
     assert payload["address_list"][0]["lat"] == 41.1
+    assert payload["address_list"][0]["geo_source"] == "mapbox"
     await tasks[0]
     assert hasattr(insert, "payload")
 
@@ -745,6 +754,7 @@ async def test_get_npi_geocode_google(monkeypatch):
     response = await npi_module.get_npi(request, "1518379601")
     payload = json.loads(response.body)
     assert payload["address_list"][0]["lat"] == 41.2
+    assert payload["address_list"][0]["geo_source"] == "google"
     await tasks[0]
     assert hasattr(insert, "payload")
 
@@ -1798,7 +1808,7 @@ async def test_get_npi_v2_archive_cutover_reads_geocodes_for_concurrent_addresse
 
     assert [address['lat'] for address in payload['address_list']] == [43.0, 44.0]
     assert fake_db.first_calls == 2
-    assert fake_db.catalog_calls == 3
+    assert fake_db.catalog_calls == 4
 
 
 @pytest.mark.asyncio
@@ -1902,6 +1912,7 @@ async def test_get_npi_v2_archive_geocode_write_uses_deduped_address_key_upsert(
     class FakeDB:
         def __init__(self):
             self.status_sql = []
+            self.status_kwargs = []
 
         async def scalar(self, query, **_kwargs):
             if isinstance(query, str):
@@ -1925,6 +1936,7 @@ async def test_get_npi_v2_archive_geocode_write_uses_deduped_address_key_upsert(
 
         async def status(self, sql, **_kwargs):
             self.status_sql.append(sql)
+            self.status_kwargs.append(_kwargs)
             return 1
 
     fake_db = FakeDB()
@@ -1956,6 +1968,10 @@ async def test_get_npi_v2_archive_geocode_write_uses_deduped_address_key_upsert(
     assert "ON CONFLICT (address_key) DO UPDATE" in upsert_sql
     assert "WHERE checksum = :checksum" in upsert_sql
     assert "LEFT(mrf.addr_state_code_v1(state_name), 32)" in upsert_sql
+    assert "geo_source, geocode_source, geocode_quality" in upsert_sql
+    assert "CAST(:geo_source AS mrf.address_archive_geo_source)" in upsert_sql
+    assert "geo_source = COALESCE(mrf.address_archive_v2.geo_source, EXCLUDED.geo_source)" in upsert_sql
+    assert fake_db.status_kwargs[-1]["geo_source"] == "google"
 
 
 @pytest.mark.asyncio

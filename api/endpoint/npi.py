@@ -3863,10 +3863,11 @@ async def get_npi(request, npi):
                 return v2_archive_table_cache
             if address_archive_cutover and hasattr(db, "first"):
                 preferred = os.getenv("HLTHPRT_ADDRESS_ARCHIVE_TABLE", "address_archive_v2").strip() or "address_archive_v2"
-                for table_name in (preferred, "address_archive"):
+                for table_name in (preferred,):
                     if (
                         await _table_exists(table_name)
                         and await _table_has_column(table_name, "address_key")
+                        and await _table_has_column(table_name, "geo_source")
                         and await _has_address_key_functions()
                     ):
                         v2_archive_table_cache = table_name
@@ -3886,7 +3887,7 @@ async def get_npi(request, npi):
                 "country_code": address.get("country_code") or "US",
             }
             archive_sql = f"""
-                SELECT long, lat, formatted_address, place_id
+                SELECT long, lat, formatted_address, place_id, geo_source
                   FROM {db_schema}.{archive_table}
                  WHERE address_key = {db_schema}.addr_key_v1(
                     :first_line, :second_line, :city_name, :state_name, :postal_code, :country_code
@@ -3906,6 +3907,7 @@ async def get_npi(request, npi):
                     lat=data["lat"],
                     formatted_address=data["formatted_address"],
                     place_id=data["place_id"],
+                    geo_source=data.get("geo_source"),
                 )
         legacy_stmt = select(AddressArchive).where(AddressArchive.checksum == address["checksum"])
         if request_session is not None:
@@ -3913,8 +3915,11 @@ async def get_npi(request, npi):
             return result.scalar()
         return await db.scalar(legacy_stmt)
 
-    async def update_addr_coordinates(address, long, lat, formatted_address, place_id):
+    async def update_addr_coordinates(address, long, lat, formatted_address, place_id, geo_source=None):
         checksum = address["checksum"]
+        geo_source = str(geo_source).strip().lower() if geo_source else None
+        if geo_source not in {"mapbox", "google", "tiger", "manual"}:
+            geo_source = "google" if place_id else None
         await (
             db.update(NPIAddress)
             .where(NPIAddress.checksum == checksum)
@@ -3938,7 +3943,7 @@ async def get_npi(request, npi):
                     line1_norm, unit_norm, city_norm, state_code, zip5, zip4, country_code,
                     first_line, second_line, city_name, state_name, postal_code,
                     telephone_number, fax_number, formatted_address, lat, long, place_id,
-                    geocode_source, geocode_quality, geocoded_at, source_bits, display_priority,
+                    geo_source, geocode_source, geocode_quality, geocoded_at, source_bits, display_priority,
                     date_added
                 )
                 SELECT
@@ -3959,6 +3964,7 @@ async def get_npi(request, npi):
                     {db_schema}.addr_country_code_v1(COALESCE(NULLIF(country_code, ''), 'US')),
                     first_line, second_line, city_name, state_name, postal_code,
                     telephone_number, fax_number, formatted_address, lat, long, place_id,
+                    CAST(:geo_source AS {db_schema}.address_archive_geo_source),
                     'api_geocode', 'unknown', now(), 1, 0, date_added
                   FROM (
                     SELECT DISTINCT ON (
@@ -3979,11 +3985,13 @@ async def get_npi(request, npi):
                     lat = COALESCE({db_schema}.{archive_table}.lat, EXCLUDED.lat),
                     long = COALESCE({db_schema}.{archive_table}.long, EXCLUDED.long),
                     place_id = COALESCE({db_schema}.{archive_table}.place_id, EXCLUDED.place_id),
+                    geo_source = COALESCE({db_schema}.{archive_table}.geo_source, EXCLUDED.geo_source),
                     geocoded_at = COALESCE({db_schema}.{archive_table}.geocoded_at, EXCLUDED.geocoded_at),
                     source_bits = {db_schema}.{archive_table}.source_bits | 1,
                     last_seen_at = now();
                 """,
                 checksum=checksum,
+                geo_source=geo_source,
             )
             return
         obj = {column.key: getattr(row, column.key, None) for column in AddressArchive.__table__.columns}
@@ -4087,6 +4095,7 @@ async def get_npi(request, npi):
                     d["lat"] = res.lat
                     d["formatted_address"] = res.formatted_address
                     d["place_id"] = res.place_id
+                    d["geo_source"] = getattr(res, "geo_source", None) or ("google" if res.place_id else None)
 
             if (sync_geocode or force_address_update) and not d["lat"]:
                 try:
@@ -4119,6 +4128,7 @@ async def get_npi(request, npi):
                         else:
                             d["formatted_address"] = geo_data["features"][0]["place_name"]
                         d["place_id"] = None
+                        d["geo_source"] = "mapbox"
                 except Exception as exc:  # pylint: disable=broad-exception-caught
                     logger.debug("Mapbox geocoding failed for %s: %s", t_addr, exc)
 
@@ -4151,12 +4161,20 @@ async def get_npi(request, npi):
                         d["lat"] = geo_data["results"][0]["geometry"]["location"]["lat"]
                         d["formatted_address"] = geo_data["results"][0]["formatted_address"]
                         d["place_id"] = geo_data["results"][0]["place_id"]
+                        d["geo_source"] = "google"
                 except Exception as exc:  # pylint: disable=broad-exception-caught
                     logger.warning("Google geocoding failed for %s: %s", t_addr, exc)
 
             if update_geo and d.get("lat"):
                 request.app.add_task(
-                    update_addr_coordinates(x, d["long"], d["lat"], d["formatted_address"], d["place_id"])
+                    update_addr_coordinates(
+                        x,
+                        d["long"],
+                        d["lat"],
+                        d["formatted_address"],
+                        d["place_id"],
+                        d.get("geo_source"),
+                    )
                 )
 
         return d

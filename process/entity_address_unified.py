@@ -440,7 +440,6 @@ def _source_selects(
     selects: list[str] = []
     has_npi = available.get("npi", False)
     has_npi_address = available.get("npi_address", False)
-    has_geo = available.get("geo_zip_lookup", False)
     has_doctors = available.get("doctor_clinician_address", False)
     has_ffs = available.get("provider_enrollment_ffs", False)
     has_ffs_address = available.get("provider_enrollment_ffs_address", False)
@@ -490,22 +489,6 @@ def _source_selects(
         if has_archive
         else ""
     )
-    geo_join_d = (
-        f"LEFT JOIN {db_schema}.geo_zip_lookup AS gz ON gz.zip_code = LEFT(COALESCE(d.zip_code, ''), 5)"
-        if has_geo
-        else ""
-    )
-    geo_join_f = (
-        f"LEFT JOIN {db_schema}.geo_zip_lookup AS gz ON gz.zip_code = LEFT(COALESCE(f.zip_code, ''), 5)"
-        if has_geo
-        else ""
-    )
-    geo_join_fa = (
-        f"LEFT JOIN {db_schema}.geo_zip_lookup AS gz ON gz.zip_code = LEFT(COALESCE(fa.zip_code, ''), 5)"
-        if has_geo
-        else ""
-    )
-
     if has_npi_address:
         selects.append(
             f"""
@@ -585,8 +568,8 @@ def _source_selects(
                 NULL::varchar AS telephone_number,
                 NULL::varchar AS fax_number,
                 NULL::varchar AS formatted_address,
-                {('COALESCE(d.latitude, gz.latitude)::numeric' if has_geo else 'd.latitude::numeric')} AS lat,
-                {('COALESCE(d.longitude, gz.longitude)::numeric' if has_geo else 'd.longitude::numeric')} AS long,
+                d.latitude::numeric AS lat,
+                d.longitude::numeric AS long,
                 NULL::date AS date_added,
                 NULL::varchar AS place_id,
                 COALESCE(d.updated_at, NOW())::timestamp AS updated_at,
@@ -595,7 +578,6 @@ def _source_selects(
               FROM {db_schema}.doctor_clinician_address AS d
               {doctors_npi_join}
               {pa_from}
-              {geo_join_d}
              WHERE d.npi IS NOT NULL
             """
         )
@@ -633,8 +615,8 @@ def _source_selects(
                 NULL::varchar AS telephone_number,
                 NULL::varchar AS fax_number,
                 NULL::varchar AS formatted_address,
-                {('COALESCE(gz.latitude, NULL)::numeric' if has_geo else 'NULL::numeric')} AS lat,
-                {('COALESCE(gz.longitude, NULL)::numeric' if has_geo else 'NULL::numeric')} AS long,
+                NULL::numeric AS lat,
+                NULL::numeric AS long,
                 f.reporting_period_end::date AS date_added,
                 NULL::varchar AS place_id,
                 COALESCE(f.imported_at, NOW())::timestamp AS updated_at,
@@ -643,7 +625,6 @@ def _source_selects(
               FROM {db_schema}.provider_enrollment_ffs AS f
               {ffs_npi_join}
               {ffs_pa_from}
-              {geo_join_f}
              WHERE f.npi IS NOT NULL
                AND (
                     NULLIF(f.address_line_1, '') IS NOT NULL
@@ -687,8 +668,8 @@ def _source_selects(
                 NULL::varchar AS telephone_number,
                 NULL::varchar AS fax_number,
                 NULL::varchar AS formatted_address,
-                {('COALESCE(gz.latitude, NULL)::numeric' if has_geo else 'NULL::numeric')} AS lat,
-                {('COALESCE(gz.longitude, NULL)::numeric' if has_geo else 'NULL::numeric')} AS long,
+                NULL::numeric AS lat,
+                NULL::numeric AS long,
                 fa.reporting_period_end::date AS date_added,
                 NULL::varchar AS place_id,
                 COALESCE(f.imported_at, NOW())::timestamp AS updated_at,
@@ -699,7 +680,6 @@ def _source_selects(
                 ON f.enrollment_id = fa.enrollment_id
               {ffs_npi_join}
               {ffs_pa_from}
-              {geo_join_f}
              WHERE f.npi IS NOT NULL
             """
         )
@@ -737,15 +717,14 @@ def _source_selects(
                 NULL::varchar AS telephone_number,
                 NULL::varchar AS fax_number,
                 NULL::varchar AS formatted_address,
-                {('COALESCE(fa.latitude, gz.latitude)::numeric' if has_geo else 'fa.latitude::numeric')} AS lat,
-                {('COALESCE(fa.longitude, gz.longitude)::numeric' if has_geo else 'fa.longitude::numeric')} AS long,
+                fa.latitude::numeric AS lat,
+                fa.longitude::numeric AS long,
                 NULL::date AS date_added,
                 NULL::varchar AS place_id,
                 COALESCE(fa.updated_at, NOW())::timestamp AS updated_at,
                 ('facility_anchor:' || LOWER(COALESCE(fa.source_dataset, 'unknown')))::varchar AS address_source,
                 ('facility_anchor:' || COALESCE(fa.id, 'unknown'))::varchar AS source_record_id
               FROM {db_schema}.facility_anchor AS fa
-              {geo_join_fa}
             """
         )
 
@@ -1050,7 +1029,11 @@ def _enrich_raw_stage_sql(
         "a.zip5 AS archive_zip5, "
         "NULLIF(upper(left(a.state_code, 2)), '') AS archive_state_code, "
         "a.city_norm AS archive_city_norm, "
-        "NULL::varchar AS archive_county_fips"
+        "NULL::varchar AS archive_county_fips, "
+        "a.formatted_address::varchar AS archive_formatted_address, "
+        "a.lat::numeric AS archive_lat, "
+        "a.long::numeric AS archive_long, "
+        "a.place_id::varchar AS archive_place_id"
     )
     if archive_available:
         archive_join = (
@@ -1065,7 +1048,11 @@ def _enrich_raw_stage_sql(
             "NULL::varchar AS archive_zip5, "
             "NULL::varchar AS archive_state_code, "
             "NULL::varchar AS archive_city_norm, "
-            "NULL::varchar AS archive_county_fips"
+            "NULL::varchar AS archive_county_fips, "
+            "NULL::varchar AS archive_formatted_address, "
+            "NULL::numeric AS archive_lat, "
+            "NULL::numeric AS archive_long, "
+            "NULL::varchar AS archive_place_id"
         )
     checksum_where = ""
     if checksum_min is not None and checksum_max is not None:
@@ -1091,6 +1078,10 @@ def _enrich_raw_stage_sql(
             premise_key,
             archive_identity_version,
             address_precision,
+            archive_formatted_address,
+            archive_lat,
+            archive_long,
+            archive_place_id,
             COALESCE(archive_zip5, source_zip5)::varchar AS zip5,
             COALESCE(archive_state_code, source_state_code)::varchar AS state_code,
             COALESCE(archive_city_norm, source_city_norm)::varchar AS city_norm,
@@ -1122,6 +1113,10 @@ def _enrich_raw_stage_sql(
            address_source_mask = k.address_source_mask,
            address_role_id = k.address_role_id,
            location_confidence_id = k.location_confidence_id,
+           formatted_address = COALESCE(k.archive_formatted_address, r.formatted_address),
+           lat = COALESCE(k.archive_lat, r.lat),
+           long = COALESCE(k.archive_long, r.long),
+           place_id = COALESCE(k.archive_place_id, r.place_id),
            row_origin = k.row_origin,
            ptg_source_array = CASE
                WHEN k.source_id = 7 AND COALESCE(CARDINALITY(r.ptg_source_array), 0) = 0
@@ -1615,8 +1610,8 @@ def _materialize_from_raw_sql(
             (ARRAY_AGG(telephone_number ORDER BY source_priority ASC, (telephone_number IS NULL), LENGTH(COALESCE(telephone_number, '')) DESC, updated_at DESC NULLS LAST))[1]::varchar AS telephone_number,
             (ARRAY_AGG(fax_number ORDER BY source_priority ASC, (fax_number IS NULL), LENGTH(COALESCE(fax_number, '')) DESC, updated_at DESC NULLS LAST))[1]::varchar AS fax_number,
             (ARRAY_AGG(formatted_address ORDER BY source_priority ASC, (formatted_address IS NULL), LENGTH(COALESCE(formatted_address, '')) DESC, updated_at DESC NULLS LAST))[1]::varchar AS formatted_address,
-            (ARRAY_AGG(lat ORDER BY source_priority ASC, (lat IS NULL), updated_at DESC NULLS LAST))[1]::numeric AS lat,
-            (ARRAY_AGG(long ORDER BY source_priority ASC, (long IS NULL), updated_at DESC NULLS LAST))[1]::numeric AS long,
+            (ARRAY_AGG(lat ORDER BY (lat IS NULL), source_priority ASC, updated_at DESC NULLS LAST))[1]::numeric AS lat,
+            (ARRAY_AGG(long ORDER BY (long IS NULL), source_priority ASC, updated_at DESC NULLS LAST))[1]::numeric AS long,
             MAX(date_added)::date AS date_added,
             MAX(place_id)::varchar AS place_id,
             (ARRAY_AGG(address_key ORDER BY source_priority ASC, (address_key IS NULL), updated_at DESC NULLS LAST))[1]::uuid AS address_key,
@@ -1876,8 +1871,8 @@ def _materialize_sql(
             (ARRAY_AGG(telephone_number ORDER BY source_priority ASC, (telephone_number IS NULL), LENGTH(COALESCE(telephone_number, '')) DESC, updated_at DESC NULLS LAST))[1]::varchar AS telephone_number,
             (ARRAY_AGG(fax_number ORDER BY source_priority ASC, (fax_number IS NULL), LENGTH(COALESCE(fax_number, '')) DESC, updated_at DESC NULLS LAST))[1]::varchar AS fax_number,
             (ARRAY_AGG(formatted_address ORDER BY source_priority ASC, (formatted_address IS NULL), LENGTH(COALESCE(formatted_address, '')) DESC, updated_at DESC NULLS LAST))[1]::varchar AS formatted_address,
-            (ARRAY_AGG(lat ORDER BY source_priority ASC, (lat IS NULL), updated_at DESC NULLS LAST))[1]::numeric AS lat,
-            (ARRAY_AGG(long ORDER BY source_priority ASC, (long IS NULL), updated_at DESC NULLS LAST))[1]::numeric AS long,
+            (ARRAY_AGG(lat ORDER BY (lat IS NULL), source_priority ASC, updated_at DESC NULLS LAST))[1]::numeric AS lat,
+            (ARRAY_AGG(long ORDER BY (long IS NULL), source_priority ASC, updated_at DESC NULLS LAST))[1]::numeric AS long,
             MAX(date_added)::date AS date_added,
             MAX(place_id)::varchar AS place_id,
             (ARRAY_AGG(address_key ORDER BY source_priority ASC, (address_key IS NULL), updated_at DESC NULLS LAST))[1]::uuid AS address_key,
@@ -2957,7 +2952,6 @@ async def process_data(ctx, task=None):
         "facility_anchor",
         "mrf_address",
         "ptg_address",
-        "geo_zip_lookup",
         "address_archive_v2",
     ]
     available = {table: await _table_exists(db_schema, table) for table in required_checks}
