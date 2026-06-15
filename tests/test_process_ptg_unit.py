@@ -44,6 +44,25 @@ ptg_manifest_publish = importlib.import_module("process.ptg_parts.ptg2_manifest_
 ptg_manifest_cleanup = importlib.import_module("process.ptg_parts.ptg2_manifest_cleanup")
 ptg_screen = importlib.import_module("process.ptg_parts.screen")
 ptg_serving_index = importlib.import_module("process.ptg_parts.serving_index")
+
+
+def test_default_ptg2_import_id_includes_source_inputs():
+    month = process_ptg.normalize_import_month("2026-06")
+
+    heartland_id = process_ptg._default_ptg2_import_id(
+        month,
+        "ptg_d2fc90445ba744ef",
+        allowed_url="https://example.com/heartland-allowed.json.gz",
+    )
+    optum_id = process_ptg._default_ptg2_import_id(
+        month,
+        "ptg_39d5fb35eae985f2",
+        in_network_url="https://example.com/optum-rates.json.gz",
+    )
+
+    assert heartland_id != "20260601"
+    assert optum_id != "20260601"
+    assert heartland_id != optum_id
 ptg_serving_maintenance = importlib.import_module("process.ptg_parts.serving_maintenance")
 ptg_serving_rows = importlib.import_module("process.ptg_parts.serving_rows")
 ptg_serving_only = importlib.import_module("process.ptg_parts.serving_only")

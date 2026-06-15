@@ -515,7 +515,7 @@ def _to_npi(value: Any) -> int | None:
 def _to_str(value: Any) -> str | None:
     if value is None:
         return None
-    text = str(value).strip()
+    text = str(value).replace("\x00", "").strip()
     return text or None
 
 
@@ -916,8 +916,8 @@ async def _split_provider_service_into_chunks(
                 if bucket not in writers:
                     chunk_path = chunks_dir / f"chunk_{bucket:05d}.csv"
                     handle = open(chunk_path, "w", encoding="utf-8", newline="")
-                    fieldnames = list(row.keys())
-                    writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                    fieldnames = [key for key in row.keys() if key is not None]
+                    writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
                     writer.writeheader()
                     handles[bucket] = handle
                     writers[bucket] = writer
