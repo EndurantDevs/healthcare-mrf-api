@@ -177,6 +177,53 @@ def test_entity_address_serving_models_expose_compact_keys_and_bridges():
     assert EntityAddressMedicationBridge.__tablename__ == "entity_address_medication_bridge"
 
 
+def test_facility_anchor_exposes_source_identifiers():
+    columns = FacilityAnchor.__table__.c
+
+    assert "telephone_number" in columns
+    assert columns["telephone_number"].nullable
+    assert "npi" in columns
+    assert columns["npi"].nullable
+    assert columns["npi"].type.python_type is int
+    assert "medicare_ccn" in columns
+    assert columns["medicare_ccn"].nullable
+
+
+def test_entity_address_facility_anchor_uses_source_npi_and_ccn_inference():
+    source_sql = "\n".join(
+        entity_address_unified._source_selects(
+            "mrf",
+            {
+                "facility_anchor": True,
+                "npi": False,
+                "npi_address": False,
+                "doctor_clinician_address": False,
+                "provider_enrollment_ffs": False,
+                "provider_enrollment_ffs_address": False,
+                "mrf_address": False,
+                "ptg_address": False,
+                "address_archive_v2": False,
+            },
+        )
+    )
+    inference_sql = entity_address_unified._inference_sql(
+        "mrf",
+        "entity_address_unified_stage",
+        include_hospital_enrollment=False,
+        include_fqhc_enrollment=True,
+    )
+
+    assert "fa.npi::bigint AS npi" in source_sql
+    assert "fa.telephone_number::varchar AS telephone_number" in source_sql
+    assert "fa.medicare_ccn" in inference_sql
+    assert "f.ccn = fa.medicare_ccn" in inference_sql
+    assert "fqhc_ccn_match" in inference_sql
+    assert "fqhc_enrollment_exact_address" in inference_sql
+    assert "npi_fqhc_exact_address" in inference_sql
+    assert "npi_fqhc_phone_zip" in inference_sql
+    assert "preselected_candidate_counts" in inference_sql
+
+
 def test_address_key_is_not_added_to_address_prototype_archive_model():
     # The legacy archive model remains checksum-shaped until the v2 cutover; adding
     # the column to the abstract base would shift positional c.* readers.

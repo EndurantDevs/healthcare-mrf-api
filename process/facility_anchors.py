@@ -46,6 +46,25 @@ def _normalize_zip(raw: str | None) -> str:
     return digits[:5].rjust(5, "0") if len(digits) >= 5 else ""
 
 
+def _normalize_npi(raw: str | None) -> int | None:
+    digits = "".join(ch for ch in str(raw or "").strip() if ch.isdigit())
+    if len(digits) != 10:
+        return None
+    return int(digits)
+
+
+def _normalize_medicare_ccn(raw: str | None) -> str | None:
+    cleaned = "".join(ch for ch in str(raw or "").strip() if ch.isalnum())
+    return cleaned or None
+
+
+def _normalize_phone(raw: str | None) -> str | None:
+    digits = "".join(ch for ch in str(raw or "").strip() if ch.isdigit())
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    return digits if len(digits) == 10 else None
+
+
 def _validate_schema_name(schema: str) -> str:
     cleaned = (schema or "").strip()
     if not cleaned or not (cleaned[0].isalpha() or cleaned[0] == "_"):
@@ -268,6 +287,9 @@ async def _fetch_and_parse_hrsa(client, stage_cls, batch_size: int, test_mode: b
                 "zip_code": str(row.get("Site Postal Code") or "")[:5],
                 "latitude": lat,
                 "longitude": lng,
+                "telephone_number": _normalize_phone(row.get("Site Telephone Number")),
+                "npi": _normalize_npi(row.get("FQHC Site NPI Number")),
+                "medicare_ccn": _normalize_medicare_ccn(row.get("FQHC Site Medicare Billing Number")),
                 "source_dataset": "HRSA_HEALTH_CENTER_SITES",
                 "updated_at": now,
             })
@@ -371,6 +393,9 @@ async def _fetch_and_parse_cms_hospitals(
                 "zip_code": zip_code,
                 "latitude": lat,
                 "longitude": lng,
+                "telephone_number": None,
+                "npi": None,
+                "medicare_ccn": _normalize_medicare_ccn(facility_id),
                 "source_dataset": "CMS_HOSPITAL_GENERAL_INFO",
                 "updated_at": now,
             })

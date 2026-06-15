@@ -690,7 +690,7 @@ def _source_selects(
             SELECT
                 'facility_anchor'::varchar AS entity_type,
                 fa.id::varchar AS entity_id,
-                NULL::bigint AS npi,
+                fa.npi::bigint AS npi,
                 NULL::bigint AS inferred_npi,
                 NULL::float8 AS inference_confidence,
                 NULL::varchar AS inference_method,
@@ -714,7 +714,7 @@ def _source_selects(
                 fa.state::varchar AS state_name,
                 LEFT(fa.zip_code, 5)::varchar AS postal_code,
                 'US'::varchar AS country_code,
-                NULL::varchar AS telephone_number,
+                fa.telephone_number::varchar AS telephone_number,
                 NULL::varchar AS fax_number,
                 NULL::varchar AS formatted_address,
                 fa.latitude::numeric AS lat,
@@ -2504,9 +2504,143 @@ def _inference_sql(
             NULL::bigint AS checksum,
             NULL::bigint AS candidate_npi,
             0::int AS candidate_npi_count
+        WHERE FALSE
+        """
+    )
+
+    fqhc_ccn_candidates_sql = (
+        f"""
+        SELECT
+            t.entity_type,
+            t.entity_id,
+            t.type,
+            t.checksum,
+            MIN(f.npi)::bigint AS candidate_npi,
+            COUNT(DISTINCT f.npi)::int AS candidate_npi_count
+          FROM {db_schema}.{stage_table} AS t
+          JOIN {db_schema}.facility_anchor AS fa
+            ON fa.id = t.entity_id
+           AND COALESCE(fa.medicare_ccn, '') <> ''
+          JOIN {db_schema}.provider_enrollment_fqhc AS f
+            ON f.ccn = fa.medicare_ccn
+           AND f.npi IS NOT NULL
+         WHERE t.npi IS NULL
+           AND t.inferred_npi IS NULL
+           AND t.entity_type = 'facility_anchor'
+           AND COALESCE(t.entity_subtype, '') = 'FQHC'
+         GROUP BY t.entity_type, t.entity_id, t.type, t.checksum
+        """
+        if include_fqhc_enrollment
+        else """
+        SELECT
+            NULL::varchar AS entity_type,
+            NULL::varchar AS entity_id,
+            NULL::varchar AS type,
+            NULL::bigint AS checksum,
+            NULL::bigint AS candidate_npi,
+            0::int AS candidate_npi_count
          WHERE FALSE
         """
     )
+
+    fqhc_enrollment_address_candidates_sql = (
+        f"""
+        SELECT
+            t.entity_type,
+            t.entity_id,
+            t.type,
+            t.checksum,
+            MIN(f.npi)::bigint AS candidate_npi,
+            COUNT(DISTINCT f.npi)::int AS candidate_npi_count
+          FROM {db_schema}.{stage_table} AS t
+          JOIN {db_schema}.provider_enrollment_fqhc AS f
+            ON f.npi IS NOT NULL
+           AND LEFT(COALESCE(f.zip_code, ''), 5) = LEFT(COALESCE(t.postal_code, ''), 5)
+           AND UPPER(COALESCE(f.state, '')) = UPPER(COALESCE(t.state_name, ''))
+           AND regexp_replace(LOWER(COALESCE(f.address_line_1, '')), '[^a-z0-9]', '', 'g')
+               = regexp_replace(LOWER(COALESCE(t.first_line, '')), '[^a-z0-9]', '', 'g')
+         WHERE t.npi IS NULL
+           AND t.inferred_npi IS NULL
+           AND t.entity_type = 'facility_anchor'
+           AND COALESCE(t.entity_subtype, '') = 'FQHC'
+           AND regexp_replace(LOWER(COALESCE(t.first_line, '')), '[^a-z0-9]', '', 'g') <> ''
+         GROUP BY t.entity_type, t.entity_id, t.type, t.checksum
+        """
+        if include_fqhc_enrollment
+        else """
+        SELECT
+            NULL::varchar AS entity_type,
+            NULL::varchar AS entity_id,
+            NULL::varchar AS type,
+            NULL::bigint AS checksum,
+            NULL::bigint AS candidate_npi,
+            0::int AS candidate_npi_count
+         WHERE FALSE
+        """
+    )
+
+    fqhc_provider_npis_sql = (
+        f"""
+        SELECT DISTINCT npi::bigint AS npi
+          FROM {db_schema}.provider_enrollment_fqhc
+         WHERE npi IS NOT NULL
+        """
+        if include_fqhc_enrollment
+        else """
+        SELECT NULL::bigint AS npi
+         WHERE FALSE
+        """
+    )
+
+    npi_fqhc_exact_address_candidates_sql = f"""
+        SELECT
+            t.entity_type,
+            t.entity_id,
+            t.type,
+            t.checksum,
+            MIN(a.npi)::bigint AS candidate_npi,
+            COUNT(DISTINCT a.npi)::int AS candidate_npi_count
+          FROM {db_schema}.{stage_table} AS t
+          JOIN {db_schema}.npi_address AS a
+            ON a.npi IS NOT NULL
+           AND LEFT(COALESCE(a.postal_code, ''), 5) = LEFT(COALESCE(t.postal_code, ''), 5)
+           AND UPPER(COALESCE(a.state_name, '')) = UPPER(COALESCE(t.state_name, ''))
+           AND regexp_replace(LOWER(COALESCE(a.first_line, '')), '[^a-z0-9]', '', 'g')
+               = regexp_replace(LOWER(COALESCE(t.first_line, '')), '[^a-z0-9]', '', 'g')
+          JOIN fqhc_npis AS fq
+            ON fq.npi = a.npi
+         WHERE t.npi IS NULL
+           AND t.inferred_npi IS NULL
+           AND t.entity_type = 'facility_anchor'
+           AND COALESCE(t.entity_subtype, '') = 'FQHC'
+           AND regexp_replace(LOWER(COALESCE(t.first_line, '')), '[^a-z0-9]', '', 'g') <> ''
+         GROUP BY t.entity_type, t.entity_id, t.type, t.checksum
+    """
+
+    npi_fqhc_phone_zip_candidates_sql = f"""
+        SELECT
+            t.entity_type,
+            t.entity_id,
+            t.type,
+            t.checksum,
+            MIN(a.npi)::bigint AS candidate_npi,
+            COUNT(DISTINCT a.npi)::int AS candidate_npi_count
+          FROM {db_schema}.{stage_table} AS t
+          JOIN {db_schema}.npi_address AS a
+            ON a.npi IS NOT NULL
+           AND LEFT(COALESCE(a.postal_code, ''), 5) = LEFT(COALESCE(t.postal_code, ''), 5)
+           AND regexp_replace(COALESCE(a.telephone_number, ''), '[^0-9]', '', 'g')
+               = regexp_replace(COALESCE(t.telephone_number, ''), '[^0-9]', '', 'g')
+           AND LENGTH(regexp_replace(COALESCE(a.telephone_number, ''), '[^0-9]', '', 'g')) = 10
+           AND LENGTH(regexp_replace(COALESCE(t.telephone_number, ''), '[^0-9]', '', 'g')) = 10
+          JOIN fqhc_npis AS fq
+            ON fq.npi = a.npi
+         WHERE t.npi IS NULL
+           AND t.inferred_npi IS NULL
+           AND t.entity_type = 'facility_anchor'
+           AND COALESCE(t.entity_subtype, '') = 'FQHC'
+         GROUP BY t.entity_type, t.entity_id, t.type, t.checksum
+    """
 
     return f"""
     WITH hospital_ccn_candidates AS (
@@ -2519,6 +2653,7 @@ def _inference_sql(
             type,
             checksum,
             candidate_npi,
+            1::int AS winner_priority,
             0.99::double precision AS winner_confidence,
             'hospital_ccn_match'::varchar AS winner_method
           FROM hospital_ccn_candidates
@@ -2534,15 +2669,146 @@ def _inference_sql(
             type,
             checksum,
             candidate_npi,
+            20::int AS winner_priority,
             0.97::double precision AS winner_confidence,
             'fqhc_enrollment_exact_match'::varchar AS winner_method
           FROM fqhc_exact_candidates
          WHERE candidate_npi_count = 1
     ),
-    preselected_winners AS (
+    fqhc_ccn_candidates AS (
+        {fqhc_ccn_candidates_sql}
+    ),
+    fqhc_ccn_winners AS (
+        SELECT
+            entity_type,
+            entity_id,
+            type,
+            checksum,
+            candidate_npi,
+            10::int AS winner_priority,
+            0.965::double precision AS winner_confidence,
+            'fqhc_ccn_match'::varchar AS winner_method
+          FROM fqhc_ccn_candidates
+         WHERE candidate_npi_count = 1
+    ),
+    fqhc_enrollment_address_candidates AS (
+        {fqhc_enrollment_address_candidates_sql}
+    ),
+    fqhc_enrollment_address_winners AS (
+        SELECT
+            entity_type,
+            entity_id,
+            type,
+            checksum,
+            candidate_npi,
+            30::int AS winner_priority,
+            0.955::double precision AS winner_confidence,
+            'fqhc_enrollment_exact_address'::varchar AS winner_method
+          FROM fqhc_enrollment_address_candidates
+         WHERE candidate_npi_count = 1
+    ),
+    primary_taxonomy AS (
+        SELECT
+            npi::bigint AS npi,
+            healthcare_provider_taxonomy_code AS taxonomy_code
+          FROM {db_schema}.npi_taxonomy
+         WHERE healthcare_provider_primary_taxonomy_switch = 'Y'
+    ),
+    fqhc_npis AS (
+        {fqhc_provider_npis_sql}
+        UNION
+        SELECT DISTINCT pt.npi
+          FROM primary_taxonomy AS pt
+          JOIN {db_schema}.nucc_taxonomy AS nu
+            ON nu.code = pt.taxonomy_code
+         WHERE pt.taxonomy_code = '261QF0400X'
+            OR (
+                COALESCE(nu.classification, '') = 'Clinic/Center'
+                AND COALESCE(nu.specialization, '') ILIKE '%federally qualified health center%'
+            )
+    ),
+    npi_fqhc_exact_address_candidates AS (
+        {npi_fqhc_exact_address_candidates_sql}
+    ),
+    npi_fqhc_exact_address_winners AS (
+        SELECT
+            entity_type,
+            entity_id,
+            type,
+            checksum,
+            candidate_npi,
+            40::int AS winner_priority,
+            0.945::double precision AS winner_confidence,
+            'npi_fqhc_exact_address'::varchar AS winner_method
+          FROM npi_fqhc_exact_address_candidates
+         WHERE candidate_npi_count = 1
+    ),
+    npi_fqhc_phone_zip_candidates AS (
+        {npi_fqhc_phone_zip_candidates_sql}
+    ),
+    npi_fqhc_phone_zip_winners AS (
+        SELECT
+            entity_type,
+            entity_id,
+            type,
+            checksum,
+            candidate_npi,
+            50::int AS winner_priority,
+            0.90::double precision AS winner_confidence,
+            'npi_fqhc_phone_zip'::varchar AS winner_method
+          FROM npi_fqhc_phone_zip_candidates
+         WHERE candidate_npi_count = 1
+    ),
+    preselected_candidates AS (
         SELECT * FROM hospital_ccn_winners
         UNION ALL
         SELECT * FROM fqhc_exact_winners
+        UNION ALL
+        SELECT * FROM fqhc_ccn_winners
+        UNION ALL
+        SELECT * FROM fqhc_enrollment_address_winners
+        UNION ALL
+        SELECT * FROM npi_fqhc_exact_address_winners
+        UNION ALL
+        SELECT * FROM npi_fqhc_phone_zip_winners
+    ),
+    preselected_candidate_counts AS (
+        SELECT
+            entity_type,
+            entity_id,
+            type,
+            checksum,
+            COUNT(DISTINCT candidate_npi)::int AS distinct_candidate_count
+          FROM preselected_candidates
+      GROUP BY entity_type, entity_id, type, checksum
+    ),
+    preselected_ranked AS (
+        SELECT
+            pc.*,
+            pcc.distinct_candidate_count,
+            ROW_NUMBER() OVER (
+                PARTITION BY pc.entity_type, pc.entity_id, pc.type, pc.checksum
+                ORDER BY winner_priority ASC, candidate_npi ASC
+            ) AS preselected_rank
+          FROM preselected_candidates AS pc
+          JOIN preselected_candidate_counts AS pcc
+            ON pcc.entity_type = pc.entity_type
+           AND pcc.entity_id = pc.entity_id
+           AND pcc.type = pc.type
+           AND pcc.checksum = pc.checksum
+    ),
+    preselected_winners AS (
+        SELECT
+            entity_type,
+            entity_id,
+            type,
+            checksum,
+            candidate_npi,
+            winner_confidence,
+            winner_method
+          FROM preselected_ranked
+         WHERE distinct_candidate_count = 1
+           AND preselected_rank = 1
     ),
     target AS (
         SELECT
@@ -2668,13 +2934,6 @@ def _inference_sql(
             addr_type_rank
           FROM candidates_ranked_per_npi
          WHERE candidate_row_rank = 1
-    ),
-    primary_taxonomy AS (
-        SELECT
-            npi::bigint AS npi,
-            healthcare_provider_taxonomy_code AS taxonomy_code
-          FROM {db_schema}.npi_taxonomy
-         WHERE healthcare_provider_primary_taxonomy_switch = 'Y'
     ),
     candidate_enriched AS (
         SELECT
