@@ -2554,7 +2554,7 @@ async def finish_main(
         "claims_pricing_finalize",
         payload,
         _queue_name=CLAIMS_FINISH_QUEUE_NAME,
-        _job_id=f"claims_finalize_{run_id}",
+        _job_id=f"claims_finalize_{run_id}_{secrets.token_hex(4)}",
     )
     _safe_print(
         f"Queued claims-pricing finalize: import_id={_normalize_import_id(import_id)} run_id={run_id} stage={stage_suffix}",

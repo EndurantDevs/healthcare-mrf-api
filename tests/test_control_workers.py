@@ -198,6 +198,78 @@ def test_kubernetes_start_worker_replicas_do_not_apply_to_finish(monkeypatch):
     assert container["command"][-2:] == ["process.MRF_finish", "--burst"]
 
 
+def test_kubernetes_completed_start_job_promotes_running_import_to_finish(monkeypatch):
+    calls: list[tuple[str, str, dict[str, object] | None]] = []
+
+    def fake_request(method, path, body=None):
+        calls.append((method, path, body))
+        if method == "GET":
+            if any(item[0] == "POST" for item in calls):
+                return {
+                    "items": [
+                        {
+                            "metadata": {"name": "worker-job"},
+                            "status": {"active": 1},
+                        }
+                    ]
+                }
+            if len([item for item in calls if item[0] == "GET"]) == 1:
+                return {
+                    "items": [
+                        {
+                            "metadata": {"name": "start-worker-job"},
+                            "status": {"succeeded": 16},
+                        }
+                    ]
+                }
+            return {"items": []}
+        return {}
+
+    monkeypatch.setenv("HLTHPRT_WORKER_LAUNCHER", "kubernetes")
+    monkeypatch.setenv("HLTHPRT_WORKER_JOB_IMAGE", "ghcr.io/endurantdevs/healthcare-mrf-api:dev")
+    monkeypatch.setenv("HLTHPRT_WORKER_JOB_START_REPLICAS", "process.MRF=16")
+    monkeypatch.setenv("HLTHPRT_IMPORT_NODE_ID", "local_mrf")
+    monkeypatch.setattr(control_workers, "_kubernetes_configured", lambda: True)
+    monkeypatch.setattr(control_workers, "_kubernetes_namespace", lambda: "healthporta-dev")
+    monkeypatch.setattr(control_workers, "_kubernetes_request", fake_request)
+
+    result = control_workers.ensure_worker({"importer": "mrf", "run_id": "run_mrf", "status": "running"})
+
+    assert result["status"] == "started"
+    post = next(call for call in calls if call[0] == "POST")
+    job = post[2]
+    assert "parallelism" not in job["spec"]
+    assert "completions" not in job["spec"]
+    container = job["spec"]["template"]["spec"]["containers"][0]
+    assert container["command"][-2:] == ["process.MRF_finish", "--burst"]
+
+
+def test_kubernetes_completed_worker_job_is_recreated(monkeypatch):
+    calls: list[tuple[str, str, dict[str, object] | None]] = []
+
+    def fake_request(method, path, body=None):
+        calls.append((method, path, body))
+        if method == "GET":
+            if any(item[0] == "POST" for item in calls):
+                return {"items": [{"metadata": {"name": "worker-job"}, "status": {"active": 1}}]}
+            return {"items": [{"metadata": {"name": "worker-job"}, "status": {"succeeded": 1}}]}
+        return {}
+
+    monkeypatch.setenv("HLTHPRT_WORKER_LAUNCHER", "kubernetes")
+    monkeypatch.setenv("HLTHPRT_WORKER_JOB_IMAGE", "ghcr.io/endurantdevs/healthcare-mrf-api:dev")
+    monkeypatch.setattr(control_workers, "_kubernetes_configured", lambda: True)
+    monkeypatch.setattr(control_workers, "_kubernetes_namespace", lambda: "healthporta-dev")
+    monkeypatch.setattr(control_workers, "_kubernetes_request", fake_request)
+
+    result = control_workers.ensure_worker(
+        {"importer": "claims-procedures", "run_id": "run_claims", "status": "finalizing"}
+    )
+
+    assert result["status"] == "started"
+    assert any(call[0] == "DELETE" and call[1].endswith("/jobs/worker-job") for call in calls)
+    assert any(call[0] == "POST" and call[1] == "/apis/batch/v1/namespaces/healthporta-dev/jobs" for call in calls)
+
+
 def test_find_running_pid_ignores_other_node_worker(monkeypatch):
     output = """
 111 /opt/python main.py worker process.PTG HLTHPRT_IMPORT_NODE_ID=mrf-local-smoke-b

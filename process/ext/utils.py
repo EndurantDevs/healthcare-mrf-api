@@ -361,7 +361,15 @@ async def db_startup(ctx):
 
     await ensure_import_run_table()
 
-async def download_it_and_save(url, filepath, chunk_size=None, context=None, logger=None, cache_dir=None):
+async def download_it_and_save(
+    url,
+    filepath,
+    chunk_size=None,
+    context=None,
+    logger=None,
+    cache_dir=None,
+    prefer_stream: bool = False,
+):
     print(f"Downloading {url}")
     max_chunk_size = chunk_size if chunk_size else HTTP_CHUNK_SIZE
     file_with_dir = None
@@ -423,6 +431,7 @@ async def download_it_and_save(url, filepath, chunk_size=None, context=None, log
                     and size_bytes >= PARALLEL_DOWNLOAD_THRESHOLD_BYTES
                     and accept_ranges
                     and not PREFER_COMPRESSED_STREAM
+                    and not prefer_stream
                 )
                 if can_parallel:
                     print(f"Response size: {size_bytes} bytes (parallel download)")

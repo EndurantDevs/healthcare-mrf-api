@@ -1137,10 +1137,80 @@ async def test_compact_serving_coordinate_search_filters_npi_addresses(monkeypat
     assert "JOIN mrf.npi_address addr_filter" in sql
     assert "addr_filter.lat::float8 BETWEEN :geo_min_lat AND :geo_max_lat" in sql
     assert "addr_filter.long::float8 BETWEEN :geo_min_long AND :geo_max_long" in sql
-    assert ") <= :geo_radius_miles" in sql
+    assert "ll_to_earth" not in sql
+    assert "2 * 3958.7613 * asin" in sql
+    assert "radians(CAST(:geo_lat AS double precision))" in sql
+    assert ") <= CAST(:geo_radius_miles AS double precision)" in sql
     assert params["geo_lat"] == 29.7604
     assert params["geo_long"] == -95.3698
     assert params["geo_radius_miles"] == 10.0
+
+
+@pytest.mark.asyncio
+async def test_manifest_location_provider_matches_filters_coordinates_with_unified(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
+    group_id = "00000000000000000000000000000011"
+    provider_set_id = "00000000000000000000000000000012"
+    session = FakeSession(
+        [
+            FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
+            False,
+            FakeResult(
+                rows=[
+                    {
+                        "provider_group_global_id_128": group_id,
+                        "npi": 1234567890,
+                        "location_hash": "entity_address_unified:1234567890:primary:1",
+                        "state": "CA",
+                        "city": "GLENDALE",
+                        "zip5": "91204",
+                        "location_source": "entity_address_unified",
+                        "location_confidence_code": "entity_address_unified",
+                        "address_payload": '{"lat":34.14024131,"long":-118.255125}',
+                        "taxonomy_codes": [],
+                        "specialties": [],
+                        "provider_name": "TiC provider",
+                    }
+                ]
+            ),
+        ]
+    )
+    tables = ptg2_serving.PTG2ServingTables(
+        provider_group_member_table="mrf.ptg2_provider_group_member_snap",
+        artifacts={"provider_inverted": {"name": "provider_inverted", "path": "/tmp/provider_inverted.ptg2sc"}},
+    )
+
+    def fake_members_many(_serving_tables, name, group_ids, **_kwargs):
+        assert name == "provider_inverted"
+        assert group_ids == (group_id,)
+        return {group_id: (provider_set_id,)}
+
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_sidecar_members_many", fake_members_many)
+
+    provider_set_ids, providers_by_set = await ptg2_serving._ptg2_manifest_location_provider_matches(
+        session,
+        tables,
+        {"lat": "34.14024131", "long": "-118.255125", "radius_miles": "10", "limit": "5"},
+        candidate_limit=5,
+    )
+
+    assert provider_set_ids == {provider_set_id}
+    assert providers_by_set[provider_set_id][0]["npi"] == 1234567890
+    assert providers_by_set[provider_set_id][0]["zip5"] == "91204"
+    sql = str(session.calls[2][0][0])
+    params = session.calls[2][0][1]
+    assert "FROM mrf.entity_address_unified addr" in sql
+    assert "addr.lat::float8 BETWEEN :geo_min_lat AND :geo_max_lat" in sql
+    assert "addr.long::float8 BETWEEN :geo_min_long AND :geo_max_long" in sql
+    assert "ll_to_earth" not in sql
+    assert "2 * 3958.7613 * asin" in sql
+    assert "radians(CAST(:geo_lat AS double precision))" in sql
+    assert ") <= CAST(:geo_radius_miles AS double precision)" in sql
+    assert "COALESCE(addr.address_precision, '') <> 'city_zip'" in sql
+    assert params["geo_lat"] == 34.14024131
+    assert params["geo_long"] == -118.255125
+    assert params["geo_radius_miles"] == 10.0
+    assert params["address_types"] == ["practice", "primary"]
 
 
 @pytest.mark.asyncio

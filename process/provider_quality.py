@@ -8,6 +8,7 @@ import csv
 import datetime
 import json
 import logging
+import secrets
 import shutil
 import sys
 import time
@@ -2144,7 +2145,7 @@ async def finish_main(
         "provider_quality_finalize",
         payload,
         _queue_name=PROVIDER_QUALITY_FINISH_QUEUE_NAME,
-        _job_id=f"provider_quality_finalize_{run_id}",
+        _job_id=f"provider_quality_finalize_{run_id}_{secrets.token_hex(4)}",
     )
     print(
         f"Queued provider-quality finalize: import_id={_normalize_import_id(import_id)} run_id={run_id} stage={stage_suffix}",

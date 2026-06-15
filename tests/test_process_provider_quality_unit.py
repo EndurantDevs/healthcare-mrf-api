@@ -130,6 +130,27 @@ def test_normalize_split_keeps_facade_helpers_stable():
     assert provider_quality._pick_first_ci is provider_quality_normalize._pick_first_ci
 
 
+@pytest.mark.asyncio
+async def test_finish_main_enqueues_unique_finalize_job(monkeypatch):
+    redis = _FakeRedis()
+
+    async def fake_create_pool(*_args, **_kwargs):
+        return redis
+
+    monkeypatch.setattr(provider_quality, "create_pool", fake_create_pool)
+
+    result = await provider_quality.finish_main(import_id="dev1", run_id="run_a", test_mode=True)
+
+    assert result["queued"] is True
+    assert result["run_id"] == "run_a"
+    assert len(redis.jobs) == 1
+    job = redis.jobs[0]
+    assert job["job_name"] == "provider_quality_finalize"
+    assert job["queue_name"] == provider_quality.PROVIDER_QUALITY_FINISH_QUEUE_NAME
+    assert str(job["job_id"]).startswith("provider_quality_finalize_run_a_")
+    assert job["payload"]["test_mode"] is True
+
+
 def test_lifecycle_split_keeps_facade_helpers_stable():
     assert provider_quality._normalize_import_id is provider_quality_lifecycle._normalize_import_id
     assert provider_quality._format_duration_compact is provider_quality_lifecycle._format_duration_compact

@@ -101,8 +101,37 @@ async def test_finish_main_enqueues_finalize(monkeypatch):
     enqueue_call = fake_pool.enqueue_job.await_args
     assert enqueue_call.args[0] == "drug_claims_finalize"
     assert enqueue_call.kwargs["_queue_name"] == drug_claims.DRUG_CLAIMS_FINISH_QUEUE_NAME
-    assert enqueue_call.kwargs["_job_id"] == "drug_claims_finalize_run_a"
+    assert enqueue_call.kwargs["_job_id"].startswith("drug_claims_finalize_run_a_")
     assert enqueue_call.args[1]["test_mode"] is True
+
+
+@pytest.mark.asyncio
+async def test_download_source_file_forces_streaming_in_production(monkeypatch):
+    calls = []
+
+    async def fake_download(url, path, **kwargs):
+        calls.append((url, path, kwargs))
+        Path(path).write_text("ok", encoding="utf-8")
+
+    monkeypatch.setattr(drug_claims, "download_it_and_save", fake_download)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = await drug_claims._download_source_file(
+            "provider_drug",
+            {"url": "https://example.com/provider-drug.csv"},
+            tmpdir,
+            test_mode=False,
+            reporting_year=2023,
+        )
+
+    assert Path(path).name == "provider_drug_2023.csv"
+    assert calls == [
+        (
+            "https://example.com/provider-drug.csv",
+            path,
+            {"prefer_stream": True},
+        )
+    ]
 
 
 def test_normalize_rx_name_key_strips_non_alnum():
