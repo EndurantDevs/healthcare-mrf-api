@@ -968,6 +968,12 @@ def test_entity_address_unified_builds_facility_anchor_npi_candidate_stage_sql(m
     assert "hospital_nppes_address_key" in sql_blob
     assert "fqhc_parent_enrollment_exact_address" in sql_blob
     assert "fqhc_nppes_address_key" in sql_blob
+    assert "fqhc_nppes_dba_phone_zip" in sql_blob
+    assert "hospital_nppes_dba_zip_state" in sql_blob
+    assert "hospital_dba_zip_state" in sql_blob
+    assert "do_business_as_text" in sql_blob
+    assert "282E00000X" in sql_blob
+    assert "286500000X" in sql_blob
     assert "fqhc_clinic_center_address_key" in sql_blob
     assert "fqhc_clinic_center_phone_zip" in sql_blob
     assert "fqhc_parent_nppes_exact_address_primary" in sql_blob
@@ -1002,6 +1008,8 @@ def test_facility_anchor_npi_candidate_stage_keeps_indexed_nppes_default(monkeyp
     )
 
     assert "fqhc_nppes_address_key" in sql_blob
+    assert "fqhc_nppes_dba_phone_zip" in sql_blob
+    assert "hospital_nppes_dba_zip_state" in sql_blob
     assert "fqhc_clinic_center_address_key" in sql_blob
     assert "fqhc_clinic_center_phone_zip" in sql_blob
     assert "fqhc_parent_nppes_exact_address_primary" not in sql_blob

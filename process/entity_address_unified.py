@@ -57,6 +57,24 @@ SUPPORT_TABLE_MODELS = (
     EntityAddressMedicationBridge,
     FacilityAnchorNPICandidate,
 )
+HOSPITAL_FACILITY_TAXONOMY_CODES = (
+    "281P00000X",
+    "281PC2000X",
+    "282E00000X",
+    "282J00000X",
+    "282N00000X",
+    "282NC0060X",
+    "282NC2000X",
+    "282NR1301X",
+    "282NW0100X",
+    "283Q00000X",
+    "283X00000X",
+    "283XC2000X",
+    "284300000X",
+    "286500000X",
+    "2865M2000X",
+    "2865X1600X",
+)
 
 
 def _normalize_import_id(raw: str | None) -> str:
@@ -103,6 +121,10 @@ def _sql_literal(value: str | None) -> str:
     if value is None:
         return "NULL"
     return "'" + str(value).replace("'", "''") + "'"
+
+
+def _hospital_facility_taxonomy_codes_sql(indent: str = "                ") -> str:
+    return (",\n" + indent).join(_sql_literal(code) for code in HOSPITAL_FACILITY_TAXONOMY_CODES)
 
 
 async def _ensure_schema_exists(db_schema: str) -> None:
@@ -2603,6 +2625,7 @@ def _facility_anchor_npi_candidate_sql(
     fa_parent_state = "target.health_center_organization_state"
     fa_parent_zip = "target.health_center_organization_zip_code"
     target_ccn = "COALESCE(NULLIF(target.medicare_ccn, ''), target.facility_anchor_id)"
+    hospital_taxonomy_codes_sql = _hospital_facility_taxonomy_codes_sql("                ")
 
     candidate_columns = """
             candidate_id,
@@ -2975,17 +2998,99 @@ def _facility_anchor_npi_candidate_sql(
                 OR (
                     target.facility_type = 'Hospital'
                     AND nt.healthcare_provider_taxonomy_code IN (
-                        '282N00000X',
-                        '282NC0060X',
-                        '282NR1301X',
-                        '282NW0100X',
-                        '283Q00000X',
-                        '283X00000X'
+                {hospital_taxonomy_codes_sql}
                     )
                 )
            )
          WHERE target.address_key IS NOT NULL
             """
+        )
+        fragments.extend(
+            [
+                f"""
+        SELECT
+            target.location_key,
+            target.address_key,
+            target.facility_anchor_id,
+            target.facility_type,
+            target.entity_name,
+            target.first_line,
+            target.city_name,
+            target.state_name,
+            target.postal_code,
+            target.telephone_number,
+            a.npi::bigint AS candidate_npi,
+            'fqhc_nppes_dba_phone_zip'::varchar AS candidate_method,
+            68::int AS candidate_priority,
+            0.91::double precision AS match_confidence,
+            jsonb_build_object(
+                'source', 'nppes',
+                'matched_on', 'dba_phone_zip',
+                'address_type', a.type,
+                'taxonomy_code', nt.healthcare_provider_taxonomy_code,
+                'do_business_as_text', n.do_business_as_text
+            ) AS evidence
+          FROM target
+          JOIN {db_schema}.npi AS n
+            ON n.entity_type_code = 2
+           AND {norm_text_sql("n.do_business_as_text")} = {norm_text_sql("target.entity_name")}
+           AND {norm_text_sql("n.do_business_as_text")} <> ''
+          JOIN {db_schema}.npi_address AS a
+            ON a.npi = n.npi
+           AND a.type = 'primary'
+           AND a.npi IS NOT NULL
+           AND {zip5_sql("a.postal_code")} = {zip5_sql("target.postal_code")}
+           AND {phone_sql("a.telephone_number")} = {phone_sql("target.telephone_number")}
+           AND LENGTH({phone_sql("a.telephone_number")}) = 10
+           AND LENGTH({phone_sql("target.telephone_number")}) = 10
+          JOIN {db_schema}.npi_taxonomy AS nt
+            ON nt.npi = n.npi
+           AND nt.healthcare_provider_primary_taxonomy_switch = 'Y'
+           AND nt.healthcare_provider_taxonomy_code = '261QF0400X'
+         WHERE target.facility_type = 'FQHC'
+                """,
+                f"""
+        SELECT
+            target.location_key,
+            target.address_key,
+            target.facility_anchor_id,
+            target.facility_type,
+            target.entity_name,
+            target.first_line,
+            target.city_name,
+            target.state_name,
+            target.postal_code,
+            target.telephone_number,
+            a.npi::bigint AS candidate_npi,
+            'hospital_nppes_dba_zip_state'::varchar AS candidate_method,
+            82::int AS candidate_priority,
+            0.84::double precision AS match_confidence,
+            jsonb_build_object(
+                'source', 'nppes',
+                'matched_on', 'hospital_dba_zip_state',
+                'address_type', a.type,
+                'taxonomy_code', nt.healthcare_provider_taxonomy_code,
+                'do_business_as_text', n.do_business_as_text
+            ) AS evidence
+          FROM target
+          JOIN {db_schema}.npi AS n
+            ON n.entity_type_code = 2
+           AND {norm_text_sql("n.do_business_as_text")} = {norm_text_sql("target.entity_name")}
+           AND {norm_text_sql("n.do_business_as_text")} <> ''
+          JOIN {db_schema}.npi_address AS a
+            ON a.npi = n.npi
+           AND a.npi IS NOT NULL
+           AND {zip5_sql("a.postal_code")} = {zip5_sql("target.postal_code")}
+           AND UPPER(COALESCE(a.state_name, '')) = UPPER(COALESCE(target.state_name, ''))
+          JOIN {db_schema}.npi_taxonomy AS nt
+            ON nt.npi = n.npi
+           AND nt.healthcare_provider_primary_taxonomy_switch = 'Y'
+           AND nt.healthcare_provider_taxonomy_code IN (
+                {hospital_taxonomy_codes_sql}
+           )
+         WHERE target.facility_type = 'Hospital'
+                """,
+            ]
         )
         if include_nucc_taxonomy:
             fragments.append(
@@ -3111,12 +3216,7 @@ def _facility_anchor_npi_candidate_sql(
             ON nt.npi = n.npi
            AND nt.healthcare_provider_primary_taxonomy_switch = 'Y'
            AND nt.healthcare_provider_taxonomy_code IN (
-                '282N00000X',
-                '282NC0060X',
-                '282NR1301X',
-                '282NW0100X',
-                '283Q00000X',
-                '283X00000X'
+                {hospital_taxonomy_codes_sql}
            )
          WHERE target.facility_type = 'Hospital'
                 """,
@@ -3547,6 +3647,7 @@ def _inference_sql(
     fa_health_center_organization_id = "to_jsonb(fa)->>'health_center_organization_id'"
     source_fa_health_center_number = "to_jsonb(source_fa)->>'health_center_number'"
     source_fa_health_center_organization_id = "to_jsonb(source_fa)->>'health_center_organization_id'"
+    hospital_taxonomy_codes_sql = _hospital_facility_taxonomy_codes_sql("                ")
     empty_inference_candidates_sql = """
         SELECT
             NULL::varchar AS entity_type,
@@ -3654,12 +3755,7 @@ def _inference_sql(
             ON nt.npi = n.npi
            AND nt.healthcare_provider_primary_taxonomy_switch = 'Y'
            AND nt.healthcare_provider_taxonomy_code IN (
-                '282N00000X',
-                '282NC0060X',
-                '282NR1301X',
-                '282NW0100X',
-                '283Q00000X',
-                '283X00000X'
+                {hospital_taxonomy_codes_sql}
            )
          WHERE t.npi IS NULL
            AND t.inferred_npi IS NULL
@@ -3730,12 +3826,7 @@ def _inference_sql(
             ON nt.npi = a.npi
            AND nt.healthcare_provider_primary_taxonomy_switch = 'Y'
            AND nt.healthcare_provider_taxonomy_code IN (
-                '282N00000X',
-                '282NC0060X',
-                '282NR1301X',
-                '282NW0100X',
-                '283Q00000X',
-                '283X00000X'
+                {hospital_taxonomy_codes_sql}
            )
          WHERE t.npi IS NULL
            AND t.inferred_npi IS NULL

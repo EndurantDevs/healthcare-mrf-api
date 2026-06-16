@@ -34,7 +34,12 @@ This importer does not fetch an external website directly. It materializes from 
   - Additional-NPI matches are also written as review candidates; CCNs with multiple distinct NPIs remain unresolved instead of being auto-selected.
 - Uses facility-aware ranking logic for ambiguous organization matches (for example hospital/FQHC contexts).
 - Uses canonical `address_key` and primary phone+ZIP matches against NPPES for facility-anchor candidates with hospital/FQHC/clinic taxonomy evidence.
+- Adds review-only NPPES DBA candidates for unresolved facility anchors:
+  - FQHC DBA name + primary phone + ZIP, gated to FQHC taxonomy.
+  - Hospital DBA name + ZIP + state, gated to the expanded NUCC hospital taxonomy set.
+  These DBA matches are not auto-inferred; they require review/approval before promotion.
 - Writes unresolved facility anchors to `facility_anchor_npi_candidate` with single-candidate, conflict, or no-candidate review status. Rows marked `review_status='approved'` are promoted into `facility_anchor_npi_override` before the next refresh and then participate in inference.
+- Keeps a single primary direct/inferred NPI on `entity_address_unified`; additional NPIs remain review candidates/overrides until a separate serving bridge is introduced.
 - Supports `primary`, `secondary`, and `practice` address evidence where applicable.
 - Canonical dedupe runs inside import using normalized address keys (punctuation/case/zip formatting differences collapse into one row).
 - Keeps source evidence on each unified address:
