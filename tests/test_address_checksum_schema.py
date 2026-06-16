@@ -321,6 +321,49 @@ def test_entity_address_facility_anchor_uses_source_npi_and_ccn_inference():
     assert "preselected_candidate_counts" in inference_sql
 
 
+def _facility_source_sql(*, npi_taxonomy: bool) -> str:
+    return "\n".join(
+        entity_address_unified._source_selects(
+            "mrf",
+            {
+                "facility_anchor": True,
+                "provider_enrollment_ffs_additional_npi": True,
+                "provider_enrollment_hospital": True,
+                "provider_enrollment_fqhc": True,
+                "npi_taxonomy": npi_taxonomy,
+            },
+        )
+    )
+
+
+def test_entity_address_facility_ccn_conflicts_resolved_by_taxonomy():
+    # When NPPES taxonomy is available, CCN->multiple-NPI conflicts pick the
+    # facility-type-matching NPI (primary taxonomy preferred) instead of being
+    # dropped to review.
+    source_sql = _facility_source_sql(npi_taxonomy=True)
+    assert "facility_ccn_npi_stats AS" in source_sql
+    assert "facility_ccn_conflict_taxonomy AS" in source_sql
+    assert "facility_ccn_taxonomy_npi AS" in source_sql
+    assert "tax_primary_match" in source_sql
+    assert "tax_any_match" in source_sql
+    assert "healthcare_provider_primary_taxonomy_switch = 'Y'" in source_sql
+    assert "'261QF0400X'" in source_sql
+    assert "fqhc_pecos_ccn_taxonomy" in source_sql
+    assert "hospital_pecos_ccn_taxonomy" in source_sql
+    # the facility anchor join now consumes the unique + taxonomy-resolved union
+    assert "LEFT JOIN facility_ccn_resolved_npi AS ccn_npi" in source_sql
+    # single-NPI keys still resolve deterministically
+    assert "HAVING COUNT(DISTINCT candidate_npi) = 1" in source_sql
+
+
+def test_entity_address_facility_ccn_taxonomy_disabled_without_nppes_taxonomy():
+    # Without NPPES taxonomy the conflict tier is omitted and the anchor join
+    # falls back to the strict single-NPI relation.
+    source_sql = _facility_source_sql(npi_taxonomy=False)
+    assert "facility_ccn_taxonomy_npi" not in source_sql
+    assert "LEFT JOIN facility_ccn_unique_npi AS ccn_npi" in source_sql
+
+
 def test_address_key_is_not_added_to_address_prototype_archive_model():
     # The legacy archive model remains checksum-shaped until the v2 cutover; adding
     # the column to the abstract base would shift positional c.* readers.

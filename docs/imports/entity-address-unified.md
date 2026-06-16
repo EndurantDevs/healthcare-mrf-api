@@ -31,7 +31,9 @@ This importer does not fetch an external website directly. It materializes from 
   - HRSA `FQHC Site NPI Number` is kept as direct `npi`.
   - CMS PECOS hospital/FQHC enrollment rows are normalized into a CCN->NPI crosswalk and populate `inferred_npi` only when a facility CCN has exactly one distinct NPI.
   - Optional PECOS additional-NPI rows are included in the same uniqueness check when `provider_enrollment_ffs_additional_npi` is available.
-  - Additional-NPI matches are also written as review candidates; CCNs with multiple distinct NPIs remain unresolved instead of being auto-selected.
+  - Additional-NPI matches are also written as review candidates.
+  - When NPPES `npi_taxonomy` is available, CCNs with multiple distinct NPIs are disambiguated by facility taxonomy: among the conflicting NPIs the one whose NPPES taxonomy matches the facility type (`261QF0400X` for FQHC, `HOSPITAL_FACILITY_TAXONOMY_CODES` for hospitals) is selected — preferring the NPI that carries it as the primary taxonomy, otherwise the unique any-taxonomy match. These resolve as `inferred_npi` with method `fqhc_pecos_ccn_taxonomy`/`hospital_pecos_ccn_taxonomy` (confidence `0.95`).
+  - CCNs where taxonomy does not isolate a single NPI (multiple NPIs all carry the facility taxonomy, or none does) remain unresolved instead of being auto-selected.
 - Uses facility-aware ranking logic for ambiguous organization matches (for example hospital/FQHC contexts).
 - Uses canonical `address_key` and primary phone+ZIP matches against NPPES for facility-anchor candidates with hospital/FQHC/clinic taxonomy evidence.
 - Adds review-only NPPES DBA candidates for unresolved facility anchors:

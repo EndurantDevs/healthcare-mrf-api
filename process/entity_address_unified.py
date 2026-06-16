@@ -903,6 +903,88 @@ def _source_selects(
                      WHERE FALSE
             """
         )
+        # When NPPES taxonomy is available, resolve CCN->multiple-NPI conflicts by
+        # selecting the candidate NPI whose NPPES taxonomy matches the facility type
+        # (prefer the NPI carrying it as primary, else the unique any-taxonomy match).
+        # CCNs whose conflict is not broken this way stay unresolved and flow to review.
+        has_npi_taxonomy = available.get("npi_taxonomy", False)
+        if has_npi_taxonomy:
+            hospital_taxonomy_codes_sql = _hospital_facility_taxonomy_codes_sql(
+                "                                "
+            )
+            _facility_tax_cond = (
+                "(c.facility_type = 'FQHC' AND nt.healthcare_provider_taxonomy_code = '261QF0400X')\n"
+                "                                OR (c.facility_type = 'Hospital'\n"
+                "                                    AND nt.healthcare_provider_taxonomy_code IN (\n"
+                f"{hospital_taxonomy_codes_sql}\n"
+                "                                ))"
+            )
+            facility_taxonomy_ctes = f""",
+            facility_ccn_npi_stats AS (
+                SELECT facility_type, ccn_key, COUNT(DISTINCT candidate_npi) AS n_distinct_npi
+                  FROM facility_ccn_npi_candidates
+                 WHERE candidate_npi IS NOT NULL
+                   AND COALESCE(ccn_key, '') <> ''
+              GROUP BY facility_type, ccn_key
+            ),
+            facility_ccn_conflict_taxonomy AS (
+                SELECT DISTINCT
+                    c.facility_type,
+                    c.ccn_key,
+                    c.candidate_npi,
+                    (EXISTS (
+                        SELECT 1
+                          FROM {db_schema}.npi_taxonomy AS nt
+                         WHERE nt.npi = c.candidate_npi
+                           AND nt.healthcare_provider_primary_taxonomy_switch = 'Y'
+                           AND ({_facility_tax_cond})
+                    )) AS tax_primary_match,
+                    (EXISTS (
+                        SELECT 1
+                          FROM {db_schema}.npi_taxonomy AS nt
+                         WHERE nt.npi = c.candidate_npi
+                           AND ({_facility_tax_cond})
+                    )) AS tax_any_match
+                  FROM facility_ccn_npi_candidates AS c
+                  JOIN facility_ccn_npi_stats AS s
+                    ON s.facility_type = c.facility_type
+                   AND s.ccn_key = c.ccn_key
+                 WHERE c.candidate_npi IS NOT NULL
+                   AND COALESCE(c.ccn_key, '') <> ''
+                   AND s.n_distinct_npi > 1
+            ),
+            facility_ccn_taxonomy_npi AS (
+                SELECT
+                    facility_type,
+                    ccn_key,
+                    (CASE
+                        WHEN COUNT(*) FILTER (WHERE tax_primary_match) = 1
+                            THEN MIN(candidate_npi) FILTER (WHERE tax_primary_match)
+                        WHEN COUNT(*) FILTER (WHERE tax_any_match) = 1
+                            THEN MIN(candidate_npi) FILTER (WHERE tax_any_match)
+                    END)::bigint AS npi,
+                    0.95::float8 AS confidence,
+                    (CASE
+                        WHEN facility_type = 'FQHC' THEN 'fqhc_pecos_ccn_taxonomy'
+                        ELSE 'hospital_pecos_ccn_taxonomy'
+                    END)::varchar AS inference_method
+                  FROM facility_ccn_conflict_taxonomy
+              GROUP BY facility_type, ccn_key
+                HAVING COUNT(*) FILTER (WHERE tax_primary_match) = 1
+                    OR COUNT(*) FILTER (WHERE tax_any_match) = 1
+            ),
+            facility_ccn_resolved_npi AS (
+                SELECT facility_type, ccn_key, npi, confidence, inference_method
+                  FROM facility_ccn_unique_npi
+                 UNION ALL
+                SELECT facility_type, ccn_key, npi, confidence, inference_method
+                  FROM facility_ccn_taxonomy_npi
+                 WHERE npi IS NOT NULL
+            )"""
+            facility_ccn_relation = "facility_ccn_resolved_npi"
+        else:
+            facility_taxonomy_ctes = ""
+            facility_ccn_relation = "facility_ccn_unique_npi"
         selects.append(
             f"""
             WITH facility_ccn_npi_candidates AS (
@@ -924,7 +1006,7 @@ def _source_selects(
                    AND COALESCE(ccn_key, '') <> ''
               GROUP BY facility_type, ccn_key
                 HAVING COUNT(DISTINCT candidate_npi) = 1
-            )
+            ){facility_taxonomy_ctes}
             SELECT
                 'facility_anchor'::varchar AS entity_type,
                 fa.id::varchar AS entity_id,
@@ -963,7 +1045,7 @@ def _source_selects(
                 ('facility_anchor:' || LOWER(COALESCE(fa.source_dataset, 'unknown')))::varchar AS address_source,
                 ('facility_anchor:' || COALESCE(fa.id, 'unknown'))::varchar AS source_record_id
               FROM {db_schema}.facility_anchor AS fa
-              LEFT JOIN facility_ccn_unique_npi AS ccn_npi
+              LEFT JOIN {facility_ccn_relation} AS ccn_npi
                 ON ccn_npi.facility_type = fa.facility_type
                AND ccn_npi.ccn_key = {ccn_key_sql}
             """
