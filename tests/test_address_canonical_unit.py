@@ -812,7 +812,7 @@ def test_entity_address_unified_sql_carries_address_key(monkeypatch):
         "entity_address_unified_stage",
         "entity_address_unified_raw",
     )
-    assert "GROUP BY entity_type, entity_id, type, COALESCE(address_key::text, checksum::text)" in flagged_sql
+    assert "GROUP BY entity_type, entity_id, type, location_key" in flagged_sql
     sharded_sql = entity_address_unified._materialize_from_raw_sql(
         "mrf",
         "entity_address_unified_stage",
@@ -820,7 +820,7 @@ def test_entity_address_unified_sql_carries_address_key(monkeypatch):
         checksum_modulo=24,
         checksum_remainder=7,
     )
-    assert "hashtext(COALESCE(address_key::text, checksum::text))" in sharded_sql
+    assert "hashtext(location_key)" in sharded_sql
     assert "% 24 + 24) % 24) = 7" in sharded_sql
 
 
@@ -926,6 +926,97 @@ def test_entity_address_unified_builds_evidence_and_bridge_stage_sql():
     assert "'HP_PROCEDURE_CODE'::varchar AS code_system" in sql_blob
     assert "INSERT INTO mrf.entity_address_medication_bridge_20260614" in sql_blob
     assert "'HP_RX_CODE'::varchar AS code_system" in sql_blob
+
+
+def test_entity_address_unified_builds_facility_anchor_npi_candidate_stage_sql(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_FACILITY_ANCHOR_NPI_CANDIDATE_INCLUDE_NPPES", "true")
+    stage_classes = entity_address_unified._support_stage_classes("20260614")
+    sql_blob = "\n".join(
+        entity_address_unified._support_stage_sql(
+            "mrf",
+            "entity_address_unified_stage",
+            stage_classes,
+            source_run_id="run_1",
+            node_id="node_a",
+            raw_table="entity_address_unified_raw",
+            build_network_bridge=True,
+            available={
+                "facility_anchor": True,
+                "provider_enrollment_hospital": True,
+                "provider_enrollment_fqhc": True,
+                "provider_enrollment_ffs_additional_npi": True,
+                "npi": True,
+                "npi_address": True,
+                "npi_taxonomy": True,
+                "nucc_taxonomy": True,
+                "npi_other_identifier": True,
+            },
+        )
+    )
+
+    assert "INSERT INTO mrf.facility_anchor_npi_candidate_20260614" in sql_blob
+    assert "t.entity_type = 'facility_anchor'" in sql_blob
+    assert "t.npi IS NULL" in sql_blob
+    assert "t.inferred_npi IS NULL" in sql_blob
+    assert "hospital_ccn_match" in sql_blob
+    assert "hospital_pecos_additional_npi" in sql_blob
+    assert "hospital_ccn_enrollment_additional_npi" in sql_blob
+    assert "fqhc_pecos_additional_npi" in sql_blob
+    assert "fqhc_ccn_enrollment_additional_npi" in sql_blob
+    assert "provider_enrollment_ffs_additional_npi AS a" in sql_blob
+    assert "regexp_replace(UPPER(COALESCE(h.ccn, '')), '[^A-Z0-9]', '', 'g')" in sql_blob
+    assert "hospital_nppes_address_key" in sql_blob
+    assert "fqhc_parent_enrollment_exact_address" in sql_blob
+    assert "fqhc_nppes_address_key" in sql_blob
+    assert "fqhc_clinic_center_address_key" in sql_blob
+    assert "fqhc_clinic_center_phone_zip" in sql_blob
+    assert "fqhc_parent_nppes_exact_address_primary" in sql_blob
+    assert "target.address_key" in sql_blob
+    assert "no_candidate_after_inference" in sql_blob
+    assert "'run_1'::varchar AS source_run_id" in sql_blob
+
+
+def test_facility_anchor_npi_candidate_stage_keeps_indexed_nppes_default(monkeypatch):
+    monkeypatch.delenv("HLTHPRT_FACILITY_ANCHOR_NPI_CANDIDATE_INCLUDE_NPPES", raising=False)
+    stage_classes = entity_address_unified._support_stage_classes("20260614")
+    sql_blob = "\n".join(
+        entity_address_unified._support_stage_sql(
+            "mrf",
+            "entity_address_unified_stage",
+            stage_classes,
+            source_run_id="run_1",
+            node_id="node_a",
+            raw_table="entity_address_unified_raw",
+            build_network_bridge=True,
+            available={
+                "facility_anchor": True,
+                "provider_enrollment_hospital": True,
+                "provider_enrollment_fqhc": True,
+                "npi": True,
+                "npi_address": True,
+                "npi_taxonomy": True,
+                "nucc_taxonomy": True,
+                "npi_other_identifier": True,
+            },
+        )
+    )
+
+    assert "fqhc_nppes_address_key" in sql_blob
+    assert "fqhc_clinic_center_address_key" in sql_blob
+    assert "fqhc_clinic_center_phone_zip" in sql_blob
+    assert "fqhc_parent_nppes_exact_address_primary" not in sql_blob
+
+
+def test_entity_address_unified_promotes_approved_facility_anchor_candidates_sql():
+    sql = entity_address_unified._promote_approved_facility_anchor_npi_candidates_sql("mrf")
+
+    assert "INSERT INTO mrf.facility_anchor_npi_override" in sql
+    assert "FROM mrf.facility_anchor_npi_candidate AS c" in sql
+    assert "c.review_status = 'approved'" in sql
+    assert "c.candidate_npi IS NOT NULL" in sql
+    assert "ON CONFLICT (facility_anchor_id, npi) DO UPDATE" in sql
+    assert "'facility_anchor_npi_candidate'::varchar AS source" in sql
+    assert "'candidate_evidence', c.evidence" in sql
 
 
 def test_entity_address_unified_can_skip_network_bridge_stage_sql():
@@ -1344,24 +1435,24 @@ def test_entity_address_unified_sql_falls_back_without_canonical_functions():
     assert "ARRAY_AGG(long ORDER BY (long IS NULL), source_priority ASC" in direct_sql
 
 
-def test_entity_address_unified_key_v2_requires_canonical_functions(monkeypatch):
+def test_entity_address_unified_groups_by_location_key_without_canonical_functions(monkeypatch):
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_KEY_V2", "1")
 
-    with pytest.raises(RuntimeError, match="requires canonical address SQL functions"):
-        entity_address_unified._materialize_sql(
-            "mrf",
-            "entity_address_unified_stage",
-            ["SELECT * FROM placeholder_source"],
-            address_canon_available=False,
-        )
+    direct_sql = entity_address_unified._materialize_sql(
+        "mrf",
+        "entity_address_unified_stage",
+        ["SELECT * FROM placeholder_source"],
+        address_canon_available=False,
+    )
+    raw_sql = entity_address_unified._materialize_from_raw_sql(
+        "mrf",
+        "entity_address_unified_stage",
+        "entity_address_unified_raw",
+        address_canon_available=False,
+    )
 
-    with pytest.raises(RuntimeError, match="requires canonical address SQL functions"):
-        entity_address_unified._materialize_from_raw_sql(
-            "mrf",
-            "entity_address_unified_stage",
-            "entity_address_unified_raw",
-            address_canon_available=False,
-        )
+    assert "GROUP BY entity_type, entity_id, type, location_key" in direct_sql
+    assert "GROUP BY entity_type, entity_id, type, location_key" in raw_sql
 
 
 @pytest.mark.asyncio

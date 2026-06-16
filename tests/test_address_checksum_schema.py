@@ -19,6 +19,8 @@ from db.models import (
     EntityAddressProcedureBridge,
     EntityAddressUnified,
     FacilityAnchor,
+    FacilityAnchorNPICandidate,
+    FacilityAnchorNPIOverride,
     MRFAddress,
     MRFAddressEvidence,
     NPIAddress,
@@ -187,6 +189,61 @@ def test_facility_anchor_exposes_source_identifiers():
     assert columns["npi"].type.python_type is int
     assert "medicare_ccn" in columns
     assert columns["medicare_ccn"].nullable
+    assert "health_center_number" in columns
+    assert columns["health_center_number"].nullable
+    assert "health_center_organization_id" in columns
+    assert columns["health_center_organization_id"].nullable
+    assert "bphc_assigned_number" in columns
+    assert columns["bphc_assigned_number"].nullable
+    assert "health_center_name" in columns
+    assert columns["health_center_name"].nullable
+    assert "health_center_organization_address_line1" in columns
+    assert columns["health_center_organization_address_line1"].nullable
+    assert "health_center_organization_city" in columns
+    assert columns["health_center_organization_city"].nullable
+    assert "health_center_organization_state" in columns
+    assert columns["health_center_organization_state"].nullable
+    assert "health_center_organization_zip_code" in columns
+    assert columns["health_center_organization_zip_code"].nullable
+
+
+def test_facility_anchor_npi_override_model_supports_curated_matches():
+    columns = FacilityAnchorNPIOverride.__table__.c
+
+    assert FacilityAnchorNPIOverride.__tablename__ == "facility_anchor_npi_override"
+    assert FacilityAnchorNPIOverride.__my_index_elements__ == ["facility_anchor_id", "npi"]
+    assert "facility_anchor_id" in columns
+    assert not columns["facility_anchor_id"].nullable
+    assert "npi" in columns
+    assert not columns["npi"].nullable
+    assert columns["npi"].type.python_type is int
+    assert "status" in columns
+    assert not columns["status"].nullable
+    assert "evidence" in columns
+    assert columns["evidence"].nullable
+
+
+def test_facility_anchor_npi_candidate_model_supports_review_queue():
+    columns = FacilityAnchorNPICandidate.__table__.c
+
+    assert FacilityAnchorNPICandidate.__tablename__ == "facility_anchor_npi_candidate"
+    assert FacilityAnchorNPICandidate.__my_index_elements__ == ["candidate_id"]
+    assert "location_key" in columns
+    assert not columns["location_key"].nullable
+    assert "address_key" in columns
+    assert columns["address_key"].nullable
+    assert "facility_anchor_id" in columns
+    assert not columns["facility_anchor_id"].nullable
+    assert isinstance(columns["candidate_npi"].type, BigInteger)
+    assert not columns["candidate_status"].nullable
+    assert not columns["review_status"].nullable
+    assert not columns["candidate_count"].nullable
+    assert "reviewed_by" in columns
+    assert columns["reviewed_by"].nullable
+    assert "reviewed_at" in columns
+    assert columns["reviewed_at"].nullable
+    assert "evidence" in columns
+    assert columns["evidence"].nullable
 
 
 def test_entity_address_facility_anchor_uses_source_npi_and_ccn_inference():
@@ -200,6 +257,9 @@ def test_entity_address_facility_anchor_uses_source_npi_and_ccn_inference():
                 "doctor_clinician_address": False,
                 "provider_enrollment_ffs": False,
                 "provider_enrollment_ffs_address": False,
+                "provider_enrollment_ffs_additional_npi": True,
+                "provider_enrollment_hospital": True,
+                "provider_enrollment_fqhc": True,
                 "mrf_address": False,
                 "ptg_address": False,
                 "address_archive_v2": False,
@@ -209,18 +269,55 @@ def test_entity_address_facility_anchor_uses_source_npi_and_ccn_inference():
     inference_sql = entity_address_unified._inference_sql(
         "mrf",
         "entity_address_unified_stage",
-        include_hospital_enrollment=False,
+        include_hospital_enrollment=True,
         include_fqhc_enrollment=True,
+        include_facility_override=True,
+        include_npi_other_identifier=True,
     )
 
     assert "fa.npi::bigint AS npi" in source_sql
+    assert "WITH facility_ccn_npi_candidates AS" in source_sql
+    assert "provider_enrollment_hospital AS h" in source_sql
+    assert "h.cah_or_hospital_ccn" in source_sql
+    assert "provider_enrollment_fqhc AS f" in source_sql
+    assert "provider_enrollment_ffs_additional_npi AS a" in source_sql
+    assert "HAVING COUNT(DISTINCT candidate_npi) = 1" in source_sql
+    assert "WHEN COUNT(DISTINCT candidate_method) = 1 THEN MIN(candidate_method)" in source_sql
+    assert "CASE WHEN fa.npi IS NULL THEN ccn_npi.npi" in source_sql
+    assert "fqhc_pecos_ccn_unique" in source_sql
+    assert "hospital_pecos_ccn_unique" in source_sql
     assert "fa.telephone_number::varchar AS telephone_number" in source_sql
     assert "fa.medicare_ccn" in inference_sql
+    assert "facility_anchor_npi_override" in inference_sql
+    assert "h.cah_or_hospital_ccn = t.entity_id" in inference_sql
+    assert "hospital_nppes_other_identifier" in inference_sql
+    assert "hospital_nppes_name_address" in inference_sql
+    assert "hospital_nppes_address_key" in inference_sql
     assert "f.ccn = fa.medicare_ccn" in inference_sql
     assert "fqhc_ccn_match" in inference_sql
+    assert "fqhc_nppes_other_identifier" in inference_sql
+    assert "health_center_name" in inference_sql
+    assert "fqhc_parent_enrollment_exact_address" in inference_sql
+    assert "fqhc_parent_enrollment_name_state" in inference_sql
+    assert "fqhc_parent_enrollment_address" in inference_sql
+    assert "fqhc_parent_nppes_exact_address" in inference_sql
+    assert "fqhc_parent_nppes_exact_address_primary" in inference_sql
+    assert "fqhc_parent_nppes_name_state" in inference_sql
+    assert "fqhc_parent_nppes_name_state_primary" in inference_sql
+    assert "fqhc_parent_nppes_address" in inference_sql
+    assert "fqhc_parent_nppes_address_primary" in inference_sql
+    assert "fqhc_parent_nppes_exact_primary_candidates AS primary_candidates" in inference_sql
+    assert "fqhc_sibling_source_npi" in inference_sql
     assert "fqhc_enrollment_exact_address" in inference_sql
+    assert "fqhc_enrollment_phone_zip" in inference_sql
+    assert "fqhc_enrollment_phone_name" in inference_sql
     assert "npi_fqhc_exact_address" in inference_sql
+    assert "npi_fqhc_address_key" in inference_sql
+    assert "npi_fqhc_clinic_address_key" in inference_sql
     assert "npi_fqhc_phone_zip" in inference_sql
+    assert "npi_fqhc_clinic_phone_zip" in inference_sql
+    assert "preselected_min_priorities" in inference_sql
+    assert "winner_priority = best_priority" in inference_sql
     assert "preselected_candidate_counts" in inference_sql
 
 

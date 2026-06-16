@@ -20,6 +20,7 @@ from db.models import (
     EntityAddressPlanBridge,
     EntityAddressProcedureBridge,
     EntityAddressUnified,
+    FacilityAnchorNPICandidate,
     PTGAddress,
     db,
 )
@@ -54,6 +55,7 @@ SUPPORT_TABLE_MODELS = (
     EntityAddressPTGBridge,
     EntityAddressProcedureBridge,
     EntityAddressMedicationBridge,
+    FacilityAnchorNPICandidate,
 )
 
 
@@ -186,6 +188,29 @@ async def _create_stage_indexes(stage_cls, db_schema: str) -> None:
                 raise
 
 
+async def _prepare_inference_stage_indexes(db_schema: str, stage_table: str) -> None:
+    await db.status(
+        f"""
+        CREATE INDEX IF NOT EXISTS {stage_table}_idx_facility_unresolved_identity
+        ON {db_schema}.{stage_table} (entity_subtype, entity_id, type, checksum)
+        WHERE entity_type = 'facility_anchor'
+          AND npi IS NULL
+          AND inferred_npi IS NULL;
+        """
+    )
+    await db.status(
+        f"""
+        CREATE INDEX IF NOT EXISTS {stage_table}_idx_facility_unresolved_address
+        ON {db_schema}.{stage_table} (address_key, entity_subtype)
+        WHERE entity_type = 'facility_anchor'
+          AND npi IS NULL
+          AND inferred_npi IS NULL
+          AND address_key IS NOT NULL;
+        """
+    )
+    await db.status(f"ANALYZE {db_schema}.{stage_table};")
+
+
 async def _prepare_support_stage_tables(db_schema: str, import_date: str) -> dict[type, type]:
     stage_classes = _support_stage_classes(import_date)
     for stage_cls in stage_classes.values():
@@ -227,6 +252,67 @@ async def _swap_stage_table(db_schema: str, live_cls, stage_cls) -> None:
 
 async def _table_exists(db_schema: str, table_name: str) -> bool:
     return bool(await db.scalar(f"SELECT to_regclass('{db_schema}.{table_name}') IS NOT NULL;"))
+
+
+def _promote_approved_facility_anchor_npi_candidates_sql(db_schema: str) -> str:
+    return f"""
+    INSERT INTO {db_schema}.facility_anchor_npi_override (
+        facility_anchor_id,
+        npi,
+        status,
+        confidence,
+        method,
+        source,
+        evidence,
+        reviewed_by,
+        reviewed_at,
+        updated_at
+    )
+    SELECT
+        c.facility_anchor_id,
+        c.candidate_npi,
+        'approved'::varchar AS status,
+        c.match_confidence AS confidence,
+        COALESCE(c.candidate_method, 'facility_anchor_npi_candidate')::varchar AS method,
+        'facility_anchor_npi_candidate'::varchar AS source,
+        json_build_object(
+            'candidate_id', c.candidate_id,
+            'location_key', c.location_key,
+            'candidate_status', c.candidate_status,
+            'review_status', c.review_status,
+            'reviewed_by', c.reviewed_by,
+            'reviewed_at', c.reviewed_at,
+            'candidate_evidence', c.evidence
+        )::json AS evidence,
+        c.reviewed_by,
+        COALESCE(c.reviewed_at, NOW())::timestamp AS reviewed_at,
+        NOW()::timestamp AS updated_at
+      FROM {db_schema}.facility_anchor_npi_candidate AS c
+     WHERE c.review_status = 'approved'
+       AND c.candidate_npi IS NOT NULL
+       AND c.facility_anchor_id IS NOT NULL
+    ON CONFLICT (facility_anchor_id, npi) DO UPDATE
+       SET status = 'approved',
+           confidence = EXCLUDED.confidence,
+           method = EXCLUDED.method,
+           source = EXCLUDED.source,
+           evidence = EXCLUDED.evidence,
+           reviewed_by = EXCLUDED.reviewed_by,
+           reviewed_at = EXCLUDED.reviewed_at,
+           updated_at = EXCLUDED.updated_at;
+    """
+
+
+async def _promote_approved_facility_anchor_npi_candidates(db_schema: str) -> int:
+    if not (
+        await _table_exists(db_schema, "facility_anchor_npi_candidate")
+        and await _table_exists(db_schema, "facility_anchor_npi_override")
+    ):
+        return 0
+    return int(
+        await db.status(_promote_approved_facility_anchor_npi_candidates_sql(db_schema))
+        or 0
+    )
 
 
 async def _address_canon_available(db_schema: str) -> bool:
@@ -443,7 +529,10 @@ def _source_selects(
     has_doctors = available.get("doctor_clinician_address", False)
     has_ffs = available.get("provider_enrollment_ffs", False)
     has_ffs_address = available.get("provider_enrollment_ffs_address", False)
+    has_ffs_additional_npi = available.get("provider_enrollment_ffs_additional_npi", False)
     has_facility = available.get("facility_anchor", False)
+    has_hospital_enrollment = available.get("provider_enrollment_hospital", False)
+    has_fqhc_enrollment = available.get("provider_enrollment_fqhc", False)
     has_mrf_address = available.get("mrf_address", False)
     has_ptg_address = available.get("ptg_address", False)
     has_archive = available.get("address_archive_v2", False)
@@ -685,15 +774,142 @@ def _source_selects(
         )
 
     if has_facility:
+        ccn_key_sql = (
+            "regexp_replace(UPPER(COALESCE(NULLIF(fa.medicare_ccn, ''), "
+            "CASE WHEN fa.facility_type = 'Hospital' THEN fa.id ELSE NULL END, '')), "
+            "'[^A-Z0-9]', '', 'g')"
+        )
+        facility_ccn_candidate_fragments: list[str] = []
+        if has_hospital_enrollment:
+            facility_ccn_candidate_fragments.extend(
+                [
+                    f"""
+                    SELECT
+                        'Hospital'::varchar AS facility_type,
+                        regexp_replace(UPPER(COALESCE(h.ccn, '')), '[^A-Z0-9]', '', 'g')::varchar AS ccn_key,
+                        h.npi::bigint AS candidate_npi,
+                        'hospital_pecos_ccn_unique'::varchar AS candidate_method,
+                        0.99::float8 AS confidence
+                      FROM {db_schema}.provider_enrollment_hospital AS h
+                     WHERE h.npi IS NOT NULL
+                       AND COALESCE(h.ccn, '') <> ''
+                    """,
+                    f"""
+                    SELECT
+                        'Hospital'::varchar AS facility_type,
+                        regexp_replace(UPPER(COALESCE(h.cah_or_hospital_ccn, '')), '[^A-Z0-9]', '', 'g')::varchar AS ccn_key,
+                        h.npi::bigint AS candidate_npi,
+                        'hospital_pecos_cah_ccn_unique'::varchar AS candidate_method,
+                        0.99::float8 AS confidence
+                      FROM {db_schema}.provider_enrollment_hospital AS h
+                     WHERE h.npi IS NOT NULL
+                       AND COALESCE(h.cah_or_hospital_ccn, '') <> ''
+                    """,
+                ]
+            )
+            if has_ffs_additional_npi:
+                facility_ccn_candidate_fragments.extend(
+                    [
+                        f"""
+                        SELECT
+                            'Hospital'::varchar AS facility_type,
+                            regexp_replace(UPPER(COALESCE(h.ccn, '')), '[^A-Z0-9]', '', 'g')::varchar AS ccn_key,
+                            a.additional_npi::bigint AS candidate_npi,
+                            'hospital_pecos_additional_npi_unique'::varchar AS candidate_method,
+                            0.975::float8 AS confidence
+                          FROM {db_schema}.provider_enrollment_hospital AS h
+                          JOIN {db_schema}.provider_enrollment_ffs_additional_npi AS a
+                            ON a.enrollment_id = h.enrollment_id
+                           AND a.additional_npi IS NOT NULL
+                         WHERE COALESCE(h.ccn, '') <> ''
+                        """,
+                        f"""
+                        SELECT
+                            'Hospital'::varchar AS facility_type,
+                            regexp_replace(UPPER(COALESCE(h.cah_or_hospital_ccn, '')), '[^A-Z0-9]', '', 'g')::varchar AS ccn_key,
+                            a.additional_npi::bigint AS candidate_npi,
+                            'hospital_pecos_additional_npi_unique'::varchar AS candidate_method,
+                            0.975::float8 AS confidence
+                          FROM {db_schema}.provider_enrollment_hospital AS h
+                          JOIN {db_schema}.provider_enrollment_ffs_additional_npi AS a
+                            ON a.enrollment_id = h.enrollment_id
+                           AND a.additional_npi IS NOT NULL
+                         WHERE COALESCE(h.cah_or_hospital_ccn, '') <> ''
+                        """,
+                    ]
+                )
+        if has_fqhc_enrollment:
+            facility_ccn_candidate_fragments.append(
+                f"""
+                SELECT
+                    'FQHC'::varchar AS facility_type,
+                    regexp_replace(UPPER(COALESCE(f.ccn, '')), '[^A-Z0-9]', '', 'g')::varchar AS ccn_key,
+                    f.npi::bigint AS candidate_npi,
+                    'fqhc_pecos_ccn_unique'::varchar AS candidate_method,
+                    0.985::float8 AS confidence
+                  FROM {db_schema}.provider_enrollment_fqhc AS f
+                 WHERE f.npi IS NOT NULL
+                   AND COALESCE(f.ccn, '') <> ''
+                """
+            )
+            if has_ffs_additional_npi:
+                facility_ccn_candidate_fragments.append(
+                    f"""
+                    SELECT
+                        'FQHC'::varchar AS facility_type,
+                        regexp_replace(UPPER(COALESCE(f.ccn, '')), '[^A-Z0-9]', '', 'g')::varchar AS ccn_key,
+                        a.additional_npi::bigint AS candidate_npi,
+                        'fqhc_pecos_additional_npi_unique'::varchar AS candidate_method,
+                        0.97::float8 AS confidence
+                      FROM {db_schema}.provider_enrollment_fqhc AS f
+                      JOIN {db_schema}.provider_enrollment_ffs_additional_npi AS a
+                        ON a.enrollment_id = f.enrollment_id
+                       AND a.additional_npi IS NOT NULL
+                     WHERE COALESCE(f.ccn, '') <> ''
+                    """
+                )
+        facility_ccn_candidates_sql = (
+            "\n                    UNION ALL\n".join(facility_ccn_candidate_fragments)
+            if facility_ccn_candidate_fragments
+            else """
+                    SELECT
+                        NULL::varchar AS facility_type,
+                        NULL::varchar AS ccn_key,
+                        NULL::bigint AS candidate_npi,
+                        NULL::varchar AS candidate_method,
+                        NULL::float8 AS confidence
+                     WHERE FALSE
+            """
+        )
         selects.append(
             f"""
+            WITH facility_ccn_npi_candidates AS (
+                {facility_ccn_candidates_sql}
+            ),
+            facility_ccn_unique_npi AS (
+                SELECT
+                    facility_type,
+                    ccn_key,
+                    MIN(candidate_npi)::bigint AS npi,
+                    MAX(confidence)::float8 AS confidence,
+                    CASE
+                        WHEN COUNT(DISTINCT candidate_method) = 1 THEN MIN(candidate_method)
+                        WHEN facility_type = 'FQHC' THEN 'fqhc_pecos_ccn_unique'
+                        ELSE 'hospital_pecos_ccn_unique'
+                    END::varchar AS inference_method
+                  FROM facility_ccn_npi_candidates
+                 WHERE candidate_npi IS NOT NULL
+                   AND COALESCE(ccn_key, '') <> ''
+              GROUP BY facility_type, ccn_key
+                HAVING COUNT(DISTINCT candidate_npi) = 1
+            )
             SELECT
                 'facility_anchor'::varchar AS entity_type,
                 fa.id::varchar AS entity_id,
                 fa.npi::bigint AS npi,
-                NULL::bigint AS inferred_npi,
-                NULL::float8 AS inference_confidence,
-                NULL::varchar AS inference_method,
+                CASE WHEN fa.npi IS NULL THEN ccn_npi.npi ELSE NULL::bigint END AS inferred_npi,
+                CASE WHEN fa.npi IS NULL AND ccn_npi.npi IS NOT NULL THEN ccn_npi.confidence ELSE NULL::float8 END AS inference_confidence,
+                CASE WHEN fa.npi IS NULL AND ccn_npi.npi IS NOT NULL THEN ccn_npi.inference_method ELSE NULL::varchar END AS inference_method,
                 fa.name::varchar AS entity_name,
                 fa.facility_type::varchar AS entity_subtype,
                 'site'::varchar AS type,
@@ -725,6 +941,9 @@ def _source_selects(
                 ('facility_anchor:' || LOWER(COALESCE(fa.source_dataset, 'unknown')))::varchar AS address_source,
                 ('facility_anchor:' || COALESCE(fa.id, 'unknown'))::varchar AS source_record_id
               FROM {db_schema}.facility_anchor AS fa
+              LEFT JOIN facility_ccn_unique_npi AS ccn_npi
+                ON ccn_npi.facility_type = fa.facility_type
+               AND ccn_npi.ccn_key = {ccn_key_sql}
             """
         )
 
@@ -1148,13 +1367,7 @@ def _key_v2_enabled() -> bool:
 
 
 def _dedupe_key_expr(address_canon_available: bool) -> str:
-    if not _key_v2_enabled():
-        return "checksum::text"
-    if not address_canon_available:
-        raise RuntimeError(
-            "HLTHPRT_ENTITY_ADDRESS_UNIFIED_KEY_V2 requires canonical address SQL functions"
-        )
-    return "COALESCE(address_key::text, checksum::text)"
+    return "location_key"
 
 
 def _validate_publish_row_count(
@@ -2355,6 +2568,843 @@ def _medication_bridge_sql(db_schema: str, medication_stage_table: str, stage_ta
     """
 
 
+def _facility_anchor_npi_candidate_sql(
+    db_schema: str,
+    candidate_stage_table: str,
+    stage_table: str,
+    *,
+    source_run_id: str,
+    include_hospital_enrollment: bool = False,
+    include_fqhc_enrollment: bool = False,
+    include_npi_address_key: bool = False,
+    include_npi_registry: bool = False,
+    include_npi_taxonomy: bool = False,
+    include_nucc_taxonomy: bool = False,
+    include_npi_other_identifier: bool = False,
+    include_provider_additional_npi: bool = False,
+    include_facility_anchor: bool = False,
+) -> str:
+    candidate_limit = _env_int("HLTHPRT_FACILITY_ANCHOR_NPI_CANDIDATE_LIMIT", 25, minimum=1)
+
+    def norm_text_sql(expr: str) -> str:
+        return f"regexp_replace(LOWER(COALESCE({expr}, '')), '[^a-z0-9]', '', 'g')"
+
+    def zip5_sql(expr: str) -> str:
+        return f"LEFT(COALESCE({expr}, ''), 5)"
+
+    def phone_sql(expr: str) -> str:
+        return f"regexp_replace(COALESCE({expr}, ''), '[^0-9]', '', 'g')"
+
+    def ccn_key_sql(expr: str) -> str:
+        return f"regexp_replace(UPPER(COALESCE({expr}, '')), '[^A-Z0-9]', '', 'g')"
+
+    fa_parent_name = "target.health_center_name"
+    fa_parent_address = "target.health_center_organization_address_line1"
+    fa_parent_state = "target.health_center_organization_state"
+    fa_parent_zip = "target.health_center_organization_zip_code"
+    target_ccn = "COALESCE(NULLIF(target.medicare_ccn, ''), target.facility_anchor_id)"
+
+    candidate_columns = """
+            candidate_id,
+            location_key,
+            address_key,
+            facility_anchor_id,
+            facility_type,
+            entity_name,
+            first_line,
+            city_name,
+            state_name,
+            postal_code,
+            telephone_number,
+            candidate_npi,
+            candidate_method,
+            candidate_priority,
+            candidate_rank,
+            candidate_count,
+            candidate_status,
+            review_status,
+            match_confidence,
+            evidence,
+            source_run_id,
+            updated_at
+    """
+    empty_candidates_sql = f"""
+        SELECT
+            NULL::varchar AS location_key,
+            NULL::uuid AS address_key,
+            NULL::varchar AS facility_anchor_id,
+            NULL::varchar AS facility_type,
+            NULL::varchar AS entity_name,
+            NULL::varchar AS first_line,
+            NULL::varchar AS city_name,
+            NULL::varchar AS state_name,
+            NULL::varchar AS postal_code,
+            NULL::varchar AS telephone_number,
+            NULL::bigint AS candidate_npi,
+            NULL::varchar AS candidate_method,
+            NULL::int AS candidate_priority,
+            NULL::double precision AS match_confidence,
+            NULL::jsonb AS evidence
+         WHERE FALSE
+    """
+
+    fragments: list[str] = []
+
+    if include_hospital_enrollment:
+        fragments.append(
+            f"""
+        SELECT
+            target.location_key,
+            target.address_key,
+            target.facility_anchor_id,
+            target.facility_type,
+            target.entity_name,
+            target.first_line,
+            target.city_name,
+            target.state_name,
+            target.postal_code,
+            target.telephone_number,
+            h.npi::bigint AS candidate_npi,
+            'hospital_ccn_match'::varchar AS candidate_method,
+            10::int AS candidate_priority,
+            0.99::double precision AS match_confidence,
+            jsonb_build_object('source', 'provider_enrollment_hospital', 'matched_on', 'ccn') AS evidence
+          FROM target
+          JOIN {db_schema}.provider_enrollment_hospital AS h
+            ON h.npi IS NOT NULL
+           AND (
+                {ccn_key_sql("h.ccn")} = {ccn_key_sql(target_ccn)}
+                OR {ccn_key_sql("h.cah_or_hospital_ccn")} = {ccn_key_sql(target_ccn)}
+           )
+         WHERE target.facility_type = 'Hospital'
+            """
+        )
+
+    if include_npi_other_identifier:
+        fragments.append(
+            f"""
+        SELECT
+            target.location_key,
+            target.address_key,
+            target.facility_anchor_id,
+            target.facility_type,
+            target.entity_name,
+            target.first_line,
+            target.city_name,
+            target.state_name,
+            target.postal_code,
+            target.telephone_number,
+            oi.npi::bigint AS candidate_npi,
+            CASE
+                WHEN target.facility_type = 'Hospital' THEN 'hospital_nppes_other_identifier'
+                ELSE 'fqhc_nppes_other_identifier'
+            END::varchar AS candidate_method,
+            CASE WHEN target.facility_type = 'Hospital' THEN 12 ELSE 15 END::int AS candidate_priority,
+            0.96::double precision AS match_confidence,
+            jsonb_build_object(
+                'source', 'npi_other_identifier',
+                'other_provider_identifier', oi.other_provider_identifier,
+                'matched_on', 'facility_id_or_ccn'
+            ) AS evidence
+          FROM target
+          JOIN {db_schema}.npi_other_identifier AS oi
+            ON oi.npi IS NOT NULL
+           AND regexp_replace(COALESCE(oi.other_provider_identifier, ''), '[^A-Za-z0-9]', '', 'g')
+               = regexp_replace(
+                    COALESCE(NULLIF(target.medicare_ccn, ''), target.facility_anchor_id, ''),
+                    '[^A-Za-z0-9]',
+                    '',
+                    'g'
+                 )
+           AND (
+                UPPER(COALESCE(oi.other_provider_identifier_state, '')) = UPPER(COALESCE(target.state_name, ''))
+                OR COALESCE(oi.other_provider_identifier_state, '') = ''
+           )
+            """
+        )
+
+    if include_provider_additional_npi:
+        fragments.extend(
+            [
+                f"""
+        SELECT
+            target.location_key,
+            target.address_key,
+            target.facility_anchor_id,
+            target.facility_type,
+            target.entity_name,
+            target.first_line,
+            target.city_name,
+            target.state_name,
+            target.postal_code,
+            target.telephone_number,
+            a.additional_npi::bigint AS candidate_npi,
+            'hospital_pecos_additional_npi'::varchar AS candidate_method,
+            18::int AS candidate_priority,
+            0.975::double precision AS match_confidence,
+            jsonb_build_object(
+                'source', 'provider_enrollment_ffs_additional_npi',
+                'matched_on', 'hospital_ccn_enrollment_additional_npi',
+                'enrollment_id', h.enrollment_id
+            ) AS evidence
+          FROM target
+          JOIN {db_schema}.provider_enrollment_hospital AS h
+            ON h.enrollment_id IS NOT NULL
+           AND (
+                {ccn_key_sql("h.ccn")} = {ccn_key_sql(target_ccn)}
+                OR {ccn_key_sql("h.cah_or_hospital_ccn")} = {ccn_key_sql(target_ccn)}
+           )
+          JOIN {db_schema}.provider_enrollment_ffs_additional_npi AS a
+            ON a.enrollment_id = h.enrollment_id
+           AND a.additional_npi IS NOT NULL
+         WHERE target.facility_type = 'Hospital'
+                """,
+                f"""
+        SELECT
+            target.location_key,
+            target.address_key,
+            target.facility_anchor_id,
+            target.facility_type,
+            target.entity_name,
+            target.first_line,
+            target.city_name,
+            target.state_name,
+            target.postal_code,
+            target.telephone_number,
+            a.additional_npi::bigint AS candidate_npi,
+            'fqhc_pecos_additional_npi'::varchar AS candidate_method,
+            28::int AS candidate_priority,
+            0.97::double precision AS match_confidence,
+            jsonb_build_object(
+                'source', 'provider_enrollment_ffs_additional_npi',
+                'matched_on', 'fqhc_ccn_enrollment_additional_npi',
+                'enrollment_id', f.enrollment_id
+            ) AS evidence
+          FROM target
+          JOIN {db_schema}.provider_enrollment_fqhc AS f
+            ON f.enrollment_id IS NOT NULL
+           AND {ccn_key_sql("f.ccn")} = {ccn_key_sql("target.medicare_ccn")}
+          JOIN {db_schema}.provider_enrollment_ffs_additional_npi AS a
+            ON a.enrollment_id = f.enrollment_id
+           AND a.additional_npi IS NOT NULL
+         WHERE target.facility_type = 'FQHC'
+           AND COALESCE(target.medicare_ccn, '') <> ''
+                """,
+            ]
+        )
+
+    if include_fqhc_enrollment:
+        fragments.extend(
+            [
+                f"""
+        SELECT
+            target.location_key,
+            target.address_key,
+            target.facility_anchor_id,
+            target.facility_type,
+            target.entity_name,
+            target.first_line,
+            target.city_name,
+            target.state_name,
+            target.postal_code,
+            target.telephone_number,
+            f.npi::bigint AS candidate_npi,
+            'fqhc_ccn_match'::varchar AS candidate_method,
+            20::int AS candidate_priority,
+            0.965::double precision AS match_confidence,
+            jsonb_build_object('source', 'provider_enrollment_fqhc', 'matched_on', 'ccn') AS evidence
+          FROM target
+          JOIN {db_schema}.provider_enrollment_fqhc AS f
+            ON f.npi IS NOT NULL
+           AND {ccn_key_sql("f.ccn")} = {ccn_key_sql("target.medicare_ccn")}
+         WHERE target.facility_type = 'FQHC'
+           AND COALESCE(target.medicare_ccn, '') <> ''
+                """,
+                f"""
+        SELECT
+            target.location_key,
+            target.address_key,
+            target.facility_anchor_id,
+            target.facility_type,
+            target.entity_name,
+            target.first_line,
+            target.city_name,
+            target.state_name,
+            target.postal_code,
+            target.telephone_number,
+            f.npi::bigint AS candidate_npi,
+            'fqhc_enrollment_exact_match'::varchar AS candidate_method,
+            30::int AS candidate_priority,
+            0.97::double precision AS match_confidence,
+            jsonb_build_object('source', 'provider_enrollment_fqhc', 'matched_on', 'site_name_address') AS evidence
+          FROM target
+          JOIN {db_schema}.provider_enrollment_fqhc AS f
+            ON f.npi IS NOT NULL
+           AND {zip5_sql("f.zip_code")} = {zip5_sql("target.postal_code")}
+           AND UPPER(COALESCE(f.state, '')) = UPPER(COALESCE(target.state_name, ''))
+           AND {norm_text_sql("f.address_line_1")} = {norm_text_sql("target.first_line")}
+           AND (
+                {norm_text_sql("f.organization_name")} = {norm_text_sql("target.entity_name")}
+                OR {norm_text_sql("f.doing_business_as_name")} = {norm_text_sql("target.entity_name")}
+           )
+         WHERE target.facility_type = 'FQHC'
+                """,
+                f"""
+        SELECT
+            target.location_key,
+            target.address_key,
+            target.facility_anchor_id,
+            target.facility_type,
+            target.entity_name,
+            target.first_line,
+            target.city_name,
+            target.state_name,
+            target.postal_code,
+            target.telephone_number,
+            f.npi::bigint AS candidate_npi,
+            'fqhc_parent_enrollment_exact_address'::varchar AS candidate_method,
+            35::int AS candidate_priority,
+            0.94::double precision AS match_confidence,
+            jsonb_build_object('source', 'provider_enrollment_fqhc', 'matched_on', 'hrsa_parent_name_address') AS evidence
+          FROM target
+          JOIN {db_schema}.provider_enrollment_fqhc AS f
+            ON f.npi IS NOT NULL
+           AND {zip5_sql("f.zip_code")} = {zip5_sql(fa_parent_zip)}
+           AND UPPER(COALESCE(f.state, '')) = UPPER(COALESCE({fa_parent_state}, ''))
+           AND {norm_text_sql("f.address_line_1")} = {norm_text_sql(fa_parent_address)}
+           AND (
+                {norm_text_sql("f.organization_name")} = {norm_text_sql(fa_parent_name)}
+                OR {norm_text_sql("f.doing_business_as_name")} = {norm_text_sql(fa_parent_name)}
+           )
+         WHERE target.facility_type = 'FQHC'
+           AND {norm_text_sql(fa_parent_name)} <> ''
+           AND {norm_text_sql(fa_parent_address)} <> ''
+                """,
+                f"""
+        SELECT
+            target.location_key,
+            target.address_key,
+            target.facility_anchor_id,
+            target.facility_type,
+            target.entity_name,
+            target.first_line,
+            target.city_name,
+            target.state_name,
+            target.postal_code,
+            target.telephone_number,
+            f.npi::bigint AS candidate_npi,
+            'fqhc_enrollment_phone_zip'::varchar AS candidate_method,
+            40::int AS candidate_priority,
+            0.93::double precision AS match_confidence,
+            jsonb_build_object('source', 'provider_enrollment_fqhc', 'matched_on', 'phone_zip') AS evidence
+          FROM target
+          JOIN {db_schema}.provider_enrollment_fqhc AS f
+            ON f.npi IS NOT NULL
+           AND {zip5_sql("f.zip_code")} = {zip5_sql("target.postal_code")}
+           AND {phone_sql("f.telephone_number")} = {phone_sql("target.telephone_number")}
+           AND LENGTH({phone_sql("f.telephone_number")}) = 10
+           AND LENGTH({phone_sql("target.telephone_number")}) = 10
+         WHERE target.facility_type = 'FQHC'
+                """,
+                f"""
+        SELECT
+            target.location_key,
+            target.address_key,
+            target.facility_anchor_id,
+            target.facility_type,
+            target.entity_name,
+            target.first_line,
+            target.city_name,
+            target.state_name,
+            target.postal_code,
+            target.telephone_number,
+            f.npi::bigint AS candidate_npi,
+            'fqhc_parent_enrollment_address'::varchar AS candidate_method,
+            50::int AS candidate_priority,
+            0.90::double precision AS match_confidence,
+            jsonb_build_object('source', 'provider_enrollment_fqhc', 'matched_on', 'hrsa_parent_address') AS evidence
+          FROM target
+          JOIN {db_schema}.provider_enrollment_fqhc AS f
+            ON f.npi IS NOT NULL
+           AND {zip5_sql("f.zip_code")} = {zip5_sql(fa_parent_zip)}
+           AND UPPER(COALESCE(f.state, '')) = UPPER(COALESCE({fa_parent_state}, ''))
+           AND {norm_text_sql("f.address_line_1")} = {norm_text_sql(fa_parent_address)}
+         WHERE target.facility_type = 'FQHC'
+           AND {norm_text_sql(fa_parent_address)} <> ''
+                """,
+            ]
+        )
+
+    if include_npi_address_key and include_npi_taxonomy:
+        fragments.append(
+            f"""
+        SELECT
+            target.location_key,
+            target.address_key,
+            target.facility_anchor_id,
+            target.facility_type,
+            target.entity_name,
+            target.first_line,
+            target.city_name,
+            target.state_name,
+            target.postal_code,
+            target.telephone_number,
+            a.npi::bigint AS candidate_npi,
+            CASE
+                WHEN target.facility_type = 'Hospital' THEN 'hospital_nppes_address_key'
+                ELSE 'fqhc_nppes_address_key'
+            END::varchar AS candidate_method,
+            CASE WHEN target.facility_type = 'Hospital' THEN 55 ELSE 75 END::int AS candidate_priority,
+            CASE WHEN target.facility_type = 'Hospital' THEN 0.93 ELSE 0.925 END::double precision AS match_confidence,
+            jsonb_build_object('source', 'nppes', 'matched_on', 'address_key', 'address_type', a.type) AS evidence
+          FROM target
+          JOIN {db_schema}.npi_address AS a
+            ON a.address_key = target.address_key
+           AND a.npi IS NOT NULL
+          JOIN {db_schema}.npi AS n
+            ON n.npi = a.npi
+           AND n.entity_type_code = 2
+          JOIN {db_schema}.npi_taxonomy AS nt
+            ON nt.npi = a.npi
+           AND nt.healthcare_provider_primary_taxonomy_switch = 'Y'
+           AND (
+                (
+                    target.facility_type = 'FQHC'
+                    AND nt.healthcare_provider_taxonomy_code = '261QF0400X'
+                )
+                OR (
+                    target.facility_type = 'Hospital'
+                    AND nt.healthcare_provider_taxonomy_code IN (
+                        '282N00000X',
+                        '282NC0060X',
+                        '282NR1301X',
+                        '282NW0100X',
+                        '283Q00000X',
+                        '283X00000X'
+                    )
+                )
+           )
+         WHERE target.address_key IS NOT NULL
+            """
+        )
+        if include_nucc_taxonomy:
+            fragments.append(
+                f"""
+        SELECT
+            target.location_key,
+            target.address_key,
+            target.facility_anchor_id,
+            target.facility_type,
+            target.entity_name,
+            target.first_line,
+            target.city_name,
+            target.state_name,
+            target.postal_code,
+            target.telephone_number,
+            a.npi::bigint AS candidate_npi,
+            'fqhc_clinic_center_address_key'::varchar AS candidate_method,
+            78::int AS candidate_priority,
+            0.89::double precision AS match_confidence,
+            jsonb_build_object(
+                'source', 'nppes',
+                'matched_on', 'address_key_clinic_center',
+                'address_type', a.type,
+                'taxonomy_code', nt.healthcare_provider_taxonomy_code
+            ) AS evidence
+          FROM target
+          JOIN {db_schema}.npi_address AS a
+            ON a.address_key = target.address_key
+           AND a.npi IS NOT NULL
+          JOIN {db_schema}.npi AS n
+            ON n.npi = a.npi
+           AND n.entity_type_code = 2
+          JOIN {db_schema}.npi_taxonomy AS nt
+            ON nt.npi = a.npi
+           AND nt.healthcare_provider_primary_taxonomy_switch = 'Y'
+           AND nt.healthcare_provider_taxonomy_code <> '261QF0400X'
+          JOIN {db_schema}.nucc_taxonomy AS nu
+            ON nu.code = nt.healthcare_provider_taxonomy_code
+           AND COALESCE(nu.classification, '') = 'Clinic/Center'
+         WHERE target.address_key IS NOT NULL
+           AND target.facility_type = 'FQHC'
+            """
+            )
+            fragments.append(
+                f"""
+        SELECT
+            target.location_key,
+            target.address_key,
+            target.facility_anchor_id,
+            target.facility_type,
+            target.entity_name,
+            target.first_line,
+            target.city_name,
+            target.state_name,
+            target.postal_code,
+            target.telephone_number,
+            a.npi::bigint AS candidate_npi,
+            'fqhc_clinic_center_phone_zip'::varchar AS candidate_method,
+            88::int AS candidate_priority,
+            0.86::double precision AS match_confidence,
+            jsonb_build_object(
+                'source', 'nppes',
+                'matched_on', 'phone_zip_clinic_center',
+                'address_type', a.type,
+                'taxonomy_code', nt.healthcare_provider_taxonomy_code
+            ) AS evidence
+          FROM target
+          JOIN {db_schema}.npi_address AS a
+            ON a.type = 'primary'
+           AND a.npi IS NOT NULL
+           AND {zip5_sql("a.postal_code")} = target.postal_code
+           AND {phone_sql("a.telephone_number")} = {phone_sql("target.telephone_number")}
+           AND LENGTH({phone_sql("a.telephone_number")}) = 10
+           AND LENGTH({phone_sql("target.telephone_number")}) = 10
+          JOIN {db_schema}.npi AS n
+            ON n.npi = a.npi
+           AND n.entity_type_code = 2
+          JOIN {db_schema}.npi_taxonomy AS nt
+            ON nt.npi = a.npi
+           AND nt.healthcare_provider_primary_taxonomy_switch = 'Y'
+           AND nt.healthcare_provider_taxonomy_code <> '261QF0400X'
+          JOIN {db_schema}.nucc_taxonomy AS nu
+            ON nu.code = nt.healthcare_provider_taxonomy_code
+           AND COALESCE(nu.classification, '') = 'Clinic/Center'
+         WHERE target.facility_type = 'FQHC'
+            """
+            )
+
+    if include_npi_registry and include_npi_taxonomy:
+        fragments.extend(
+            [
+                f"""
+        SELECT
+            target.location_key,
+            target.address_key,
+            target.facility_anchor_id,
+            target.facility_type,
+            target.entity_name,
+            target.first_line,
+            target.city_name,
+            target.state_name,
+            target.postal_code,
+            target.telephone_number,
+            n.npi::bigint AS candidate_npi,
+            'hospital_nppes_name_address'::varchar AS candidate_method,
+            60::int AS candidate_priority,
+            0.94::double precision AS match_confidence,
+            jsonb_build_object('source', 'nppes', 'matched_on', 'hospital_name_address') AS evidence
+          FROM target
+          JOIN {db_schema}.npi AS n
+            ON n.entity_type_code = 2
+           AND (
+                {norm_text_sql("n.provider_organization_name")} = {norm_text_sql("target.entity_name")}
+                OR {norm_text_sql("n.provider_other_organization_name")} = {norm_text_sql("target.entity_name")}
+                OR {norm_text_sql("n.do_business_as_text")} = {norm_text_sql("target.entity_name")}
+           )
+          JOIN {db_schema}.npi_address AS a
+            ON a.npi = n.npi
+           AND {zip5_sql("a.postal_code")} = {zip5_sql("target.postal_code")}
+           AND UPPER(COALESCE(a.state_name, '')) = UPPER(COALESCE(target.state_name, ''))
+           AND {norm_text_sql("a.first_line")} = {norm_text_sql("target.first_line")}
+          JOIN {db_schema}.npi_taxonomy AS nt
+            ON nt.npi = n.npi
+           AND nt.healthcare_provider_primary_taxonomy_switch = 'Y'
+           AND nt.healthcare_provider_taxonomy_code IN (
+                '282N00000X',
+                '282NC0060X',
+                '282NR1301X',
+                '282NW0100X',
+                '283Q00000X',
+                '283X00000X'
+           )
+         WHERE target.facility_type = 'Hospital'
+                """,
+                f"""
+        SELECT
+            target.location_key,
+            target.address_key,
+            target.facility_anchor_id,
+            target.facility_type,
+            target.entity_name,
+            target.first_line,
+            target.city_name,
+            target.state_name,
+            target.postal_code,
+            target.telephone_number,
+            n.npi::bigint AS candidate_npi,
+            CASE WHEN a.type = 'primary'
+                THEN 'fqhc_parent_nppes_exact_address_primary'
+                ELSE 'fqhc_parent_nppes_exact_address'
+            END::varchar AS candidate_method,
+            CASE WHEN a.type = 'primary' THEN 70 ELSE 90 END::int AS candidate_priority,
+            CASE WHEN a.type = 'primary' THEN 0.885 ELSE 0.865 END::double precision AS match_confidence,
+            jsonb_build_object('source', 'nppes', 'matched_on', 'hrsa_parent_name_address', 'address_type', a.type) AS evidence
+          FROM target
+          JOIN {db_schema}.npi AS n
+            ON n.entity_type_code = 2
+           AND (
+                {norm_text_sql("n.provider_organization_name")} = {norm_text_sql(fa_parent_name)}
+                OR {norm_text_sql("n.provider_other_organization_name")} = {norm_text_sql(fa_parent_name)}
+                OR {norm_text_sql("n.do_business_as_text")} = {norm_text_sql(fa_parent_name)}
+           )
+          JOIN {db_schema}.npi_address AS a
+            ON a.npi = n.npi
+           AND {zip5_sql("a.postal_code")} = {zip5_sql(fa_parent_zip)}
+           AND UPPER(COALESCE(a.state_name, '')) = UPPER(COALESCE({fa_parent_state}, ''))
+           AND {norm_text_sql("a.first_line")} = {norm_text_sql(fa_parent_address)}
+          JOIN {db_schema}.npi_taxonomy AS nt
+            ON nt.npi = n.npi
+           AND nt.healthcare_provider_primary_taxonomy_switch = 'Y'
+           AND nt.healthcare_provider_taxonomy_code = '261QF0400X'
+         WHERE target.facility_type = 'FQHC'
+           AND {norm_text_sql(fa_parent_name)} <> ''
+           AND {norm_text_sql(fa_parent_address)} <> ''
+                """,
+                f"""
+        SELECT
+            target.location_key,
+            target.address_key,
+            target.facility_anchor_id,
+            target.facility_type,
+            target.entity_name,
+            target.first_line,
+            target.city_name,
+            target.state_name,
+            target.postal_code,
+            target.telephone_number,
+            a.npi::bigint AS candidate_npi,
+            'npi_fqhc_exact_address'::varchar AS candidate_method,
+            80::int AS candidate_priority,
+            0.945::double precision AS match_confidence,
+            jsonb_build_object('source', 'nppes', 'matched_on', 'site_address') AS evidence
+          FROM target
+          JOIN {db_schema}.npi_address AS a
+            ON a.npi IS NOT NULL
+           AND {zip5_sql("a.postal_code")} = {zip5_sql("target.postal_code")}
+           AND UPPER(COALESCE(a.state_name, '')) = UPPER(COALESCE(target.state_name, ''))
+           AND {norm_text_sql("a.first_line")} = {norm_text_sql("target.first_line")}
+          JOIN {db_schema}.npi_taxonomy AS nt
+            ON nt.npi = a.npi
+           AND nt.healthcare_provider_primary_taxonomy_switch = 'Y'
+           AND nt.healthcare_provider_taxonomy_code = '261QF0400X'
+         WHERE target.facility_type = 'FQHC'
+                """,
+            ]
+        )
+
+    if include_facility_anchor:
+        fragments.append(
+            f"""
+        SELECT
+            target.location_key,
+            target.address_key,
+            target.facility_anchor_id,
+            target.facility_type,
+            target.entity_name,
+            target.first_line,
+            target.city_name,
+            target.state_name,
+            target.postal_code,
+            target.telephone_number,
+            source_fa.npi::bigint AS candidate_npi,
+            'fqhc_sibling_source_npi'::varchar AS candidate_method,
+            85::int AS candidate_priority,
+            0.88::double precision AS match_confidence,
+            jsonb_build_object('source', 'facility_anchor', 'matched_on', 'hrsa_parent_sibling') AS evidence
+          FROM target
+          JOIN {db_schema}.facility_anchor AS source_fa
+            ON source_fa.npi IS NOT NULL
+           AND source_fa.id <> target.facility_anchor_id
+           AND source_fa.facility_type = 'FQHC'
+           AND (
+                (
+                    COALESCE(target.health_center_number, '') <> ''
+                    AND to_jsonb(source_fa)->>'health_center_number' = target.health_center_number
+                )
+                OR (
+                    COALESCE(target.health_center_organization_id, '') <> ''
+                    AND to_jsonb(source_fa)->>'health_center_organization_id' = target.health_center_organization_id
+                )
+           )
+         WHERE target.facility_type = 'FQHC'
+            """
+        )
+
+    candidate_sources_sql = "\n        UNION ALL\n".join(fragments) if fragments else empty_candidates_sql
+    return f"""
+    INSERT INTO {db_schema}.{candidate_stage_table} (
+        candidate_id,
+        location_key,
+        address_key,
+        facility_anchor_id,
+        facility_type,
+        entity_name,
+        first_line,
+        city_name,
+        state_name,
+        postal_code,
+        telephone_number,
+        candidate_npi,
+        candidate_method,
+        candidate_priority,
+        candidate_rank,
+        candidate_count,
+        candidate_status,
+        review_status,
+        match_confidence,
+        evidence,
+        source_run_id,
+        updated_at
+    )
+    WITH target AS (
+        SELECT
+            t.location_key::varchar AS location_key,
+            t.address_key AS address_key,
+            t.entity_id::varchar AS facility_anchor_id,
+            COALESCE(t.entity_subtype, '')::varchar AS facility_type,
+            t.entity_name::varchar AS entity_name,
+            t.first_line::varchar AS first_line,
+            t.city_name::varchar AS city_name,
+            t.state_name::varchar AS state_name,
+            LEFT(COALESCE(t.postal_code, ''), 5)::varchar AS postal_code,
+            t.telephone_number::varchar AS telephone_number,
+            fa.medicare_ccn::varchar AS medicare_ccn,
+            to_jsonb(fa)->>'health_center_number' AS health_center_number,
+            to_jsonb(fa)->>'health_center_organization_id' AS health_center_organization_id,
+            to_jsonb(fa)->>'health_center_name' AS health_center_name,
+            to_jsonb(fa)->>'health_center_organization_address_line1' AS health_center_organization_address_line1,
+            to_jsonb(fa)->>'health_center_organization_state' AS health_center_organization_state,
+            to_jsonb(fa)->>'health_center_organization_zip_code' AS health_center_organization_zip_code
+          FROM {db_schema}.{stage_table} AS t
+          JOIN {db_schema}.facility_anchor AS fa
+            ON fa.id = t.entity_id
+         WHERE t.location_key IS NOT NULL
+           AND t.entity_type = 'facility_anchor'
+           AND t.npi IS NULL
+           AND t.inferred_npi IS NULL
+    ),
+    candidate_sources AS (
+        {candidate_sources_sql}
+    ),
+    dedup_candidates AS (
+        SELECT
+            location_key,
+            address_key,
+            facility_anchor_id,
+            facility_type,
+            entity_name,
+            first_line,
+            city_name,
+            state_name,
+            postal_code,
+            telephone_number,
+            candidate_npi,
+            candidate_method,
+            MIN(candidate_priority)::int AS candidate_priority,
+            MAX(match_confidence)::double precision AS match_confidence,
+            jsonb_build_object('matches', jsonb_agg(evidence ORDER BY candidate_priority, candidate_method)) AS evidence
+          FROM candidate_sources
+         WHERE candidate_npi IS NOT NULL
+      GROUP BY
+            location_key,
+            address_key,
+            facility_anchor_id,
+            facility_type,
+            entity_name,
+            first_line,
+            city_name,
+            state_name,
+            postal_code,
+            telephone_number,
+            candidate_npi,
+            candidate_method
+    ),
+    candidate_counts AS (
+        SELECT
+            location_key,
+            COUNT(DISTINCT candidate_npi)::int AS candidate_count
+          FROM dedup_candidates
+      GROUP BY location_key
+    ),
+    ranked_candidates AS (
+        SELECT
+            d.*,
+            c.candidate_count,
+            ROW_NUMBER() OVER (
+                PARTITION BY d.location_key
+                ORDER BY d.candidate_priority ASC, d.candidate_npi ASC, d.candidate_method ASC
+            )::int AS candidate_rank
+          FROM dedup_candidates AS d
+          JOIN candidate_counts AS c
+            ON c.location_key = d.location_key
+    ),
+    limited_candidates AS (
+        SELECT
+            md5(concat_ws('|', {_sql_literal(source_run_id)}, location_key, candidate_npi::text, candidate_method))::varchar AS candidate_id,
+            location_key,
+            address_key,
+            facility_anchor_id,
+            facility_type,
+            entity_name,
+            first_line,
+            city_name,
+            state_name,
+            postal_code,
+            telephone_number,
+            candidate_npi,
+            candidate_method,
+            candidate_priority,
+            candidate_rank,
+            candidate_count,
+            CASE WHEN candidate_count = 1 THEN 'single_candidate' ELSE 'conflict' END::varchar AS candidate_status,
+            'needs_review'::varchar AS review_status,
+            match_confidence,
+            evidence,
+            {_sql_literal(source_run_id)}::varchar AS source_run_id,
+            NOW()::timestamp AS updated_at
+          FROM ranked_candidates
+         WHERE candidate_rank <= {candidate_limit}
+    ),
+    no_candidate AS (
+        SELECT
+            md5(concat_ws('|', {_sql_literal(source_run_id)}, target.location_key, 'no_candidate'))::varchar AS candidate_id,
+            target.location_key,
+            target.address_key,
+            target.facility_anchor_id,
+            target.facility_type,
+            target.entity_name,
+            target.first_line,
+            target.city_name,
+            target.state_name,
+            target.postal_code,
+            target.telephone_number,
+            NULL::bigint AS candidate_npi,
+            NULL::varchar AS candidate_method,
+            NULL::int AS candidate_priority,
+            1::int AS candidate_rank,
+            0::int AS candidate_count,
+            'no_candidate'::varchar AS candidate_status,
+            'no_candidate'::varchar AS review_status,
+            NULL::double precision AS match_confidence,
+            jsonb_build_object('reason', 'no_candidate_after_inference') AS evidence,
+            {_sql_literal(source_run_id)}::varchar AS source_run_id,
+            NOW()::timestamp AS updated_at
+          FROM target
+         WHERE NOT EXISTS (
+                SELECT 1
+                  FROM dedup_candidates AS d
+                 WHERE d.location_key = target.location_key
+           )
+    )
+    SELECT {candidate_columns}
+      FROM limited_candidates
+    UNION ALL
+    SELECT {candidate_columns}
+      FROM no_candidate;
+    """
+
+
 def _support_stage_sql(
     db_schema: str,
     stage_table: str,
@@ -2364,7 +3414,9 @@ def _support_stage_sql(
     node_id: str | None,
     raw_table: str | None = None,
     build_network_bridge: bool = True,
+    available: dict[str, bool] | None = None,
 ) -> list[str]:
+    available = available or {}
     stage_tables = {model: stage_cls.__tablename__ for model, stage_cls in stage_classes.items()}
     evidence_sql = (
         _evidence_from_raw_sql(
@@ -2391,6 +3443,45 @@ def _support_stage_sql(
         _procedure_bridge_sql(db_schema, stage_tables[EntityAddressProcedureBridge], stage_table),
         _medication_bridge_sql(db_schema, stage_tables[EntityAddressMedicationBridge], stage_table),
     ]
+    if FacilityAnchorNPICandidate in stage_tables and available.get("facility_anchor", False):
+        include_nppes_candidates = _env_bool(
+            "HLTHPRT_FACILITY_ANCHOR_NPI_CANDIDATE_INCLUDE_NPPES",
+            False,
+        )
+        include_other_identifier_candidates = _env_bool(
+            "HLTHPRT_FACILITY_ANCHOR_NPI_CANDIDATE_INCLUDE_OTHER_IDENTIFIER",
+            False,
+        )
+        statements.append(
+            _facility_anchor_npi_candidate_sql(
+                db_schema,
+                stage_tables[FacilityAnchorNPICandidate],
+                stage_table,
+                source_run_id=source_run_id,
+                include_hospital_enrollment=available.get("provider_enrollment_hospital", False),
+                include_fqhc_enrollment=available.get("provider_enrollment_fqhc", False),
+                include_npi_address_key=(
+                    available.get("npi", False)
+                    and available.get("npi_address", False)
+                    and available.get("npi_taxonomy", False)
+                ),
+                include_npi_registry=(
+                    include_nppes_candidates
+                    and available.get("npi", False)
+                    and available.get("npi_address", False)
+                ),
+                include_npi_taxonomy=available.get("npi_taxonomy", False),
+                include_nucc_taxonomy=available.get("nucc_taxonomy", False),
+                include_npi_other_identifier=(
+                    include_other_identifier_candidates
+                    and available.get("npi_other_identifier", False)
+                ),
+                include_provider_additional_npi=available.get(
+                    "provider_enrollment_ffs_additional_npi", False
+                ),
+                include_facility_anchor=available.get("facility_anchor", False),
+            )
+        )
     if build_network_bridge:
         statements.insert(
             3,
@@ -2408,6 +3499,7 @@ async def _populate_support_stage_tables(
     node_id: str | None,
     raw_table: str | None = None,
     build_network_bridge: bool = True,
+    available: dict[str, bool] | None = None,
 ) -> dict[str, int]:
     for statement in _support_stage_sql(
         db_schema,
@@ -2417,6 +3509,7 @@ async def _populate_support_stage_tables(
         node_id=node_id,
         raw_table=raw_table,
         build_network_bridge=build_network_bridge,
+        available=available,
     ):
         await db.status(statement)
     counts: dict[str, int] = {}
@@ -2434,7 +3527,69 @@ def _inference_sql(
     *,
     include_hospital_enrollment: bool,
     include_fqhc_enrollment: bool,
+    include_facility_override: bool = False,
+    include_npi_other_identifier: bool = False,
+    include_name_fallback: bool = False,
+    include_nppes_name_inference: bool = False,
+    include_nppes_broad_inference: bool = False,
 ) -> str:
+    def norm_text_sql(expr: str) -> str:
+        return f"regexp_replace(LOWER(COALESCE({expr}, '')), '[^a-z0-9]', '', 'g')"
+
+    def zip5_sql(expr: str) -> str:
+        return f"LEFT(COALESCE({expr}, ''), 5)"
+
+    fa_parent_name = "to_jsonb(fa)->>'health_center_name'"
+    fa_parent_address = "to_jsonb(fa)->>'health_center_organization_address_line1'"
+    fa_parent_state = "to_jsonb(fa)->>'health_center_organization_state'"
+    fa_parent_zip = "to_jsonb(fa)->>'health_center_organization_zip_code'"
+    fa_health_center_number = "to_jsonb(fa)->>'health_center_number'"
+    fa_health_center_organization_id = "to_jsonb(fa)->>'health_center_organization_id'"
+    source_fa_health_center_number = "to_jsonb(source_fa)->>'health_center_number'"
+    source_fa_health_center_organization_id = "to_jsonb(source_fa)->>'health_center_organization_id'"
+    empty_inference_candidates_sql = """
+        SELECT
+            NULL::varchar AS entity_type,
+            NULL::varchar AS entity_id,
+            NULL::varchar AS type,
+            NULL::bigint AS checksum,
+            NULL::bigint AS candidate_npi,
+            0::int AS candidate_npi_count
+         WHERE FALSE
+    """
+
+    facility_override_candidates_sql = (
+        f"""
+        SELECT
+            t.entity_type,
+            t.entity_id,
+            t.type,
+            t.checksum,
+            MIN(o.npi)::bigint AS candidate_npi,
+            COUNT(DISTINCT o.npi)::int AS candidate_npi_count
+          FROM unresolved_facility AS t
+          JOIN {db_schema}.facility_anchor_npi_override AS o
+            ON o.facility_anchor_id = t.entity_id
+           AND o.npi IS NOT NULL
+           AND LOWER(COALESCE(o.status, '')) = 'approved'
+         WHERE t.npi IS NULL
+           AND t.inferred_npi IS NULL
+           AND t.entity_type = 'facility_anchor'
+         GROUP BY t.entity_type, t.entity_id, t.type, t.checksum
+        """
+        if include_facility_override
+        else """
+        SELECT
+            NULL::varchar AS entity_type,
+            NULL::varchar AS entity_id,
+            NULL::varchar AS type,
+            NULL::bigint AS checksum,
+            NULL::bigint AS candidate_npi,
+            0::int AS candidate_npi_count
+         WHERE FALSE
+        """
+    )
+
     hospital_ccn_candidates_sql = (
         f"""
         SELECT
@@ -2444,10 +3599,13 @@ def _inference_sql(
             t.checksum,
             MIN(h.npi)::bigint AS candidate_npi,
             COUNT(DISTINCT h.npi)::int AS candidate_npi_count
-          FROM {db_schema}.{stage_table} AS t
+          FROM unresolved_facility AS t
           JOIN {db_schema}.provider_enrollment_hospital AS h
-            ON h.ccn = t.entity_id
-           AND h.npi IS NOT NULL
+            ON h.npi IS NOT NULL
+           AND (
+                h.ccn = t.entity_id
+                OR h.cah_or_hospital_ccn = t.entity_id
+           )
          WHERE t.npi IS NULL
            AND t.inferred_npi IS NULL
            AND t.entity_type = 'facility_anchor'
@@ -2467,6 +3625,126 @@ def _inference_sql(
         """
     )
 
+    hospital_nppes_name_address_candidates_sql = (
+        f"""
+        SELECT
+            t.entity_type,
+            t.entity_id,
+            t.type,
+            t.checksum,
+            MIN(n.npi)::bigint AS candidate_npi,
+            COUNT(DISTINCT n.npi)::int AS candidate_npi_count
+          FROM unresolved_facility AS t
+          JOIN {db_schema}.npi AS n
+            ON n.entity_type_code = 2
+           AND (
+                {norm_text_sql("n.provider_organization_name")}
+                    = {norm_text_sql("t.entity_name")}
+                OR {norm_text_sql("n.provider_other_organization_name")}
+                    = {norm_text_sql("t.entity_name")}
+                OR {norm_text_sql("n.do_business_as_text")}
+                    = {norm_text_sql("t.entity_name")}
+           )
+          JOIN {db_schema}.npi_address AS a
+            ON a.npi = n.npi
+           AND {zip5_sql("a.postal_code")} = {zip5_sql("t.postal_code")}
+           AND UPPER(COALESCE(a.state_name, '')) = UPPER(COALESCE(t.state_name, ''))
+           AND {norm_text_sql("a.first_line")} = {norm_text_sql("t.first_line")}
+          JOIN {db_schema}.npi_taxonomy AS nt
+            ON nt.npi = n.npi
+           AND nt.healthcare_provider_primary_taxonomy_switch = 'Y'
+           AND nt.healthcare_provider_taxonomy_code IN (
+                '282N00000X',
+                '282NC0060X',
+                '282NR1301X',
+                '282NW0100X',
+                '283Q00000X',
+                '283X00000X'
+           )
+         WHERE t.npi IS NULL
+           AND t.inferred_npi IS NULL
+           AND t.entity_type = 'facility_anchor'
+           AND COALESCE(t.entity_subtype, '') = 'Hospital'
+           AND {norm_text_sql("t.entity_name")} <> ''
+           AND {norm_text_sql("t.first_line")} <> ''
+         GROUP BY t.entity_type, t.entity_id, t.type, t.checksum
+    """
+        if include_nppes_name_inference
+        else empty_inference_candidates_sql
+    )
+
+    hospital_other_identifier_candidates_sql = (
+        f"""
+        SELECT
+            t.entity_type,
+            t.entity_id,
+            t.type,
+            t.checksum,
+            MIN(oi.npi)::bigint AS candidate_npi,
+            COUNT(DISTINCT oi.npi)::int AS candidate_npi_count
+          FROM unresolved_facility AS t
+          JOIN {db_schema}.npi_other_identifier AS oi
+            ON oi.npi IS NOT NULL
+           AND regexp_replace(COALESCE(oi.other_provider_identifier, ''), '[^A-Za-z0-9]', '', 'g')
+               = regexp_replace(COALESCE(t.entity_id, ''), '[^A-Za-z0-9]', '', 'g')
+           AND (
+                UPPER(COALESCE(oi.other_provider_identifier_state, '')) = UPPER(COALESCE(t.state_name, ''))
+                OR COALESCE(oi.other_provider_identifier_state, '') = ''
+           )
+         WHERE t.npi IS NULL
+           AND t.inferred_npi IS NULL
+           AND t.entity_type = 'facility_anchor'
+           AND COALESCE(t.entity_subtype, '') = 'Hospital'
+           AND COALESCE(t.entity_id, '') <> ''
+         GROUP BY t.entity_type, t.entity_id, t.type, t.checksum
+        """
+        if include_npi_other_identifier
+        else """
+        SELECT
+            NULL::varchar AS entity_type,
+            NULL::varchar AS entity_id,
+            NULL::varchar AS type,
+            NULL::bigint AS checksum,
+            NULL::bigint AS candidate_npi,
+            0::int AS candidate_npi_count
+         WHERE FALSE
+        """
+    )
+
+    hospital_address_key_candidates_sql = f"""
+        SELECT
+            t.entity_type,
+            t.entity_id,
+            t.type,
+            t.checksum,
+            MIN(a.npi)::bigint AS candidate_npi,
+            COUNT(DISTINCT a.npi)::int AS candidate_npi_count
+          FROM unresolved_facility AS t
+          JOIN {db_schema}.npi_address AS a
+            ON a.address_key = t.address_key
+           AND a.npi IS NOT NULL
+          JOIN {db_schema}.npi AS n
+            ON n.npi = a.npi
+           AND n.entity_type_code = 2
+          JOIN {db_schema}.npi_taxonomy AS nt
+            ON nt.npi = a.npi
+           AND nt.healthcare_provider_primary_taxonomy_switch = 'Y'
+           AND nt.healthcare_provider_taxonomy_code IN (
+                '282N00000X',
+                '282NC0060X',
+                '282NR1301X',
+                '282NW0100X',
+                '283Q00000X',
+                '283X00000X'
+           )
+         WHERE t.npi IS NULL
+           AND t.inferred_npi IS NULL
+           AND t.entity_type = 'facility_anchor'
+           AND COALESCE(t.entity_subtype, '') = 'Hospital'
+           AND t.address_key IS NOT NULL
+         GROUP BY t.entity_type, t.entity_id, t.type, t.checksum
+    """
+
     fqhc_exact_candidates_sql = (
         f"""
         SELECT
@@ -2476,7 +3754,7 @@ def _inference_sql(
             t.checksum,
             MIN(f.npi)::bigint AS candidate_npi,
             COUNT(DISTINCT f.npi)::int AS candidate_npi_count
-          FROM {db_schema}.{stage_table} AS t
+          FROM unresolved_facility AS t
           JOIN {db_schema}.provider_enrollment_fqhc AS f
             ON f.npi IS NOT NULL
            AND LEFT(COALESCE(f.zip_code, ''), 5) = LEFT(COALESCE(t.postal_code, ''), 5)
@@ -2508,6 +3786,156 @@ def _inference_sql(
         """
     )
 
+    fqhc_parent_exact_candidates_sql = (
+        f"""
+        SELECT
+            t.entity_type,
+            t.entity_id,
+            t.type,
+            t.checksum,
+            MIN(f.npi)::bigint AS candidate_npi,
+            COUNT(DISTINCT f.npi)::int AS candidate_npi_count
+          FROM unresolved_facility AS t
+          JOIN {db_schema}.facility_anchor AS fa
+            ON fa.id = t.entity_id
+          JOIN {db_schema}.provider_enrollment_fqhc AS f
+            ON f.npi IS NOT NULL
+           AND {zip5_sql("f.zip_code")} = {zip5_sql(fa_parent_zip)}
+           AND UPPER(COALESCE(f.state, '')) = UPPER(COALESCE({fa_parent_state}, ''))
+           AND {norm_text_sql("f.address_line_1")} = {norm_text_sql(fa_parent_address)}
+           AND (
+                {norm_text_sql("f.organization_name")} = {norm_text_sql(fa_parent_name)}
+                OR {norm_text_sql("f.doing_business_as_name")} = {norm_text_sql(fa_parent_name)}
+           )
+         WHERE t.npi IS NULL
+           AND t.inferred_npi IS NULL
+           AND t.entity_type = 'facility_anchor'
+           AND COALESCE(t.entity_subtype, '') = 'FQHC'
+           AND {norm_text_sql(fa_parent_name)} <> ''
+           AND {norm_text_sql(fa_parent_address)} <> ''
+         GROUP BY t.entity_type, t.entity_id, t.type, t.checksum
+        """
+        if include_fqhc_enrollment
+        else """
+        SELECT
+            NULL::varchar AS entity_type,
+            NULL::varchar AS entity_id,
+            NULL::varchar AS type,
+            NULL::bigint AS checksum,
+            NULL::bigint AS candidate_npi,
+            0::int AS candidate_npi_count
+         WHERE FALSE
+        """
+    )
+
+    fqhc_parent_name_state_candidates_sql = (
+        f"""
+        SELECT
+            t.entity_type,
+            t.entity_id,
+            t.type,
+            t.checksum,
+            MIN(f.npi)::bigint AS candidate_npi,
+            COUNT(DISTINCT f.npi)::int AS candidate_npi_count
+          FROM unresolved_facility AS t
+          JOIN {db_schema}.facility_anchor AS fa
+            ON fa.id = t.entity_id
+          JOIN {db_schema}.provider_enrollment_fqhc AS f
+            ON f.npi IS NOT NULL
+           AND UPPER(COALESCE(f.state, '')) = UPPER(COALESCE({fa_parent_state}, fa.state, ''))
+           AND (
+                {norm_text_sql("f.organization_name")} = {norm_text_sql(fa_parent_name)}
+                OR {norm_text_sql("f.doing_business_as_name")} = {norm_text_sql(fa_parent_name)}
+           )
+         WHERE t.npi IS NULL
+           AND t.inferred_npi IS NULL
+           AND t.entity_type = 'facility_anchor'
+           AND COALESCE(t.entity_subtype, '') = 'FQHC'
+           AND {norm_text_sql(fa_parent_name)} <> ''
+         GROUP BY t.entity_type, t.entity_id, t.type, t.checksum
+        """
+        if include_fqhc_enrollment
+        else """
+        SELECT
+            NULL::varchar AS entity_type,
+            NULL::varchar AS entity_id,
+            NULL::varchar AS type,
+            NULL::bigint AS checksum,
+            NULL::bigint AS candidate_npi,
+            0::int AS candidate_npi_count
+         WHERE FALSE
+        """
+    )
+
+    fqhc_parent_address_candidates_sql = (
+        f"""
+        SELECT
+            t.entity_type,
+            t.entity_id,
+            t.type,
+            t.checksum,
+            MIN(f.npi)::bigint AS candidate_npi,
+            COUNT(DISTINCT f.npi)::int AS candidate_npi_count
+          FROM unresolved_facility AS t
+          JOIN {db_schema}.facility_anchor AS fa
+            ON fa.id = t.entity_id
+          JOIN {db_schema}.provider_enrollment_fqhc AS f
+            ON f.npi IS NOT NULL
+           AND {zip5_sql("f.zip_code")} = {zip5_sql(fa_parent_zip)}
+           AND UPPER(COALESCE(f.state, '')) = UPPER(COALESCE({fa_parent_state}, ''))
+           AND {norm_text_sql("f.address_line_1")} = {norm_text_sql(fa_parent_address)}
+         WHERE t.npi IS NULL
+           AND t.inferred_npi IS NULL
+           AND t.entity_type = 'facility_anchor'
+           AND COALESCE(t.entity_subtype, '') = 'FQHC'
+           AND {norm_text_sql(fa_parent_address)} <> ''
+         GROUP BY t.entity_type, t.entity_id, t.type, t.checksum
+        """
+        if include_fqhc_enrollment
+        else """
+        SELECT
+            NULL::varchar AS entity_type,
+            NULL::varchar AS entity_id,
+            NULL::varchar AS type,
+            NULL::bigint AS checksum,
+            NULL::bigint AS candidate_npi,
+            0::int AS candidate_npi_count
+         WHERE FALSE
+        """
+    )
+
+    fqhc_sibling_source_npi_candidates_sql = f"""
+        SELECT
+            t.entity_type,
+            t.entity_id,
+            t.type,
+            t.checksum,
+            MIN(source_fa.npi)::bigint AS candidate_npi,
+            COUNT(DISTINCT source_fa.npi)::int AS candidate_npi_count
+          FROM unresolved_facility AS t
+          JOIN {db_schema}.facility_anchor AS fa
+            ON fa.id = t.entity_id
+          JOIN {db_schema}.facility_anchor AS source_fa
+            ON source_fa.npi IS NOT NULL
+           AND source_fa.id <> fa.id
+           AND source_fa.facility_type = 'FQHC'
+           AND (
+                (
+                    COALESCE({fa_health_center_number}, '') <> ''
+                    AND {source_fa_health_center_number} = {fa_health_center_number}
+                )
+                OR (
+                    COALESCE({fa_health_center_organization_id}, '') <> ''
+                    AND {source_fa_health_center_organization_id} = {fa_health_center_organization_id}
+                )
+           )
+         WHERE t.npi IS NULL
+           AND t.inferred_npi IS NULL
+           AND t.entity_type = 'facility_anchor'
+           AND COALESCE(t.entity_subtype, '') = 'FQHC'
+         GROUP BY t.entity_type, t.entity_id, t.type, t.checksum
+    """
+
     fqhc_ccn_candidates_sql = (
         f"""
         SELECT
@@ -2517,7 +3945,7 @@ def _inference_sql(
             t.checksum,
             MIN(f.npi)::bigint AS candidate_npi,
             COUNT(DISTINCT f.npi)::int AS candidate_npi_count
-          FROM {db_schema}.{stage_table} AS t
+          FROM unresolved_facility AS t
           JOIN {db_schema}.facility_anchor AS fa
             ON fa.id = t.entity_id
            AND COALESCE(fa.medicare_ccn, '') <> ''
@@ -2543,6 +3971,46 @@ def _inference_sql(
         """
     )
 
+    fqhc_other_identifier_candidates_sql = (
+        f"""
+        SELECT
+            t.entity_type,
+            t.entity_id,
+            t.type,
+            t.checksum,
+            MIN(oi.npi)::bigint AS candidate_npi,
+            COUNT(DISTINCT oi.npi)::int AS candidate_npi_count
+          FROM unresolved_facility AS t
+          JOIN {db_schema}.facility_anchor AS fa
+            ON fa.id = t.entity_id
+           AND COALESCE(fa.medicare_ccn, '') <> ''
+          JOIN {db_schema}.npi_other_identifier AS oi
+            ON oi.npi IS NOT NULL
+           AND regexp_replace(COALESCE(oi.other_provider_identifier, ''), '[^A-Za-z0-9]', '', 'g')
+               = regexp_replace(COALESCE(fa.medicare_ccn, ''), '[^A-Za-z0-9]', '', 'g')
+           AND (
+                UPPER(COALESCE(oi.other_provider_identifier_state, '')) = UPPER(COALESCE(t.state_name, ''))
+                OR COALESCE(oi.other_provider_identifier_state, '') = ''
+           )
+         WHERE t.npi IS NULL
+           AND t.inferred_npi IS NULL
+           AND t.entity_type = 'facility_anchor'
+           AND COALESCE(t.entity_subtype, '') = 'FQHC'
+         GROUP BY t.entity_type, t.entity_id, t.type, t.checksum
+        """
+        if include_npi_other_identifier
+        else """
+        SELECT
+            NULL::varchar AS entity_type,
+            NULL::varchar AS entity_id,
+            NULL::varchar AS type,
+            NULL::bigint AS checksum,
+            NULL::bigint AS candidate_npi,
+            0::int AS candidate_npi_count
+         WHERE FALSE
+        """
+    )
+
     fqhc_enrollment_address_candidates_sql = (
         f"""
         SELECT
@@ -2552,7 +4020,7 @@ def _inference_sql(
             t.checksum,
             MIN(f.npi)::bigint AS candidate_npi,
             COUNT(DISTINCT f.npi)::int AS candidate_npi_count
-          FROM {db_schema}.{stage_table} AS t
+          FROM unresolved_facility AS t
           JOIN {db_schema}.provider_enrollment_fqhc AS f
             ON f.npi IS NOT NULL
            AND LEFT(COALESCE(f.zip_code, ''), 5) = LEFT(COALESCE(t.postal_code, ''), 5)
@@ -2564,6 +4032,85 @@ def _inference_sql(
            AND t.entity_type = 'facility_anchor'
            AND COALESCE(t.entity_subtype, '') = 'FQHC'
            AND regexp_replace(LOWER(COALESCE(t.first_line, '')), '[^a-z0-9]', '', 'g') <> ''
+         GROUP BY t.entity_type, t.entity_id, t.type, t.checksum
+        """
+        if include_fqhc_enrollment
+        else """
+        SELECT
+            NULL::varchar AS entity_type,
+            NULL::varchar AS entity_id,
+            NULL::varchar AS type,
+            NULL::bigint AS checksum,
+            NULL::bigint AS candidate_npi,
+            0::int AS candidate_npi_count
+         WHERE FALSE
+        """
+    )
+
+    fqhc_enrollment_phone_zip_candidates_sql = (
+        f"""
+        SELECT
+            t.entity_type,
+            t.entity_id,
+            t.type,
+            t.checksum,
+            MIN(f.npi)::bigint AS candidate_npi,
+            COUNT(DISTINCT f.npi)::int AS candidate_npi_count
+          FROM unresolved_facility AS t
+          JOIN {db_schema}.provider_enrollment_fqhc AS f
+            ON f.npi IS NOT NULL
+           AND LEFT(COALESCE(f.zip_code, ''), 5) = LEFT(COALESCE(t.postal_code, ''), 5)
+           AND regexp_replace(COALESCE(f.telephone_number, ''), '[^0-9]', '', 'g')
+               = regexp_replace(COALESCE(t.telephone_number, ''), '[^0-9]', '', 'g')
+           AND LENGTH(regexp_replace(COALESCE(f.telephone_number, ''), '[^0-9]', '', 'g')) = 10
+           AND LENGTH(regexp_replace(COALESCE(t.telephone_number, ''), '[^0-9]', '', 'g')) = 10
+         WHERE t.npi IS NULL
+           AND t.inferred_npi IS NULL
+           AND t.entity_type = 'facility_anchor'
+           AND COALESCE(t.entity_subtype, '') = 'FQHC'
+         GROUP BY t.entity_type, t.entity_id, t.type, t.checksum
+        """
+        if include_fqhc_enrollment
+        else """
+        SELECT
+            NULL::varchar AS entity_type,
+            NULL::varchar AS entity_id,
+            NULL::varchar AS type,
+            NULL::bigint AS checksum,
+            NULL::bigint AS candidate_npi,
+            0::int AS candidate_npi_count
+         WHERE FALSE
+        """
+    )
+
+    fqhc_enrollment_phone_name_candidates_sql = (
+        f"""
+        SELECT
+            t.entity_type,
+            t.entity_id,
+            t.type,
+            t.checksum,
+            MIN(f.npi)::bigint AS candidate_npi,
+            COUNT(DISTINCT f.npi)::int AS candidate_npi_count
+          FROM unresolved_facility AS t
+          JOIN {db_schema}.provider_enrollment_fqhc AS f
+            ON f.npi IS NOT NULL
+           AND UPPER(COALESCE(f.state, '')) = UPPER(COALESCE(t.state_name, ''))
+           AND regexp_replace(COALESCE(f.telephone_number, ''), '[^0-9]', '', 'g')
+               = regexp_replace(COALESCE(t.telephone_number, ''), '[^0-9]', '', 'g')
+           AND LENGTH(regexp_replace(COALESCE(f.telephone_number, ''), '[^0-9]', '', 'g')) = 10
+           AND LENGTH(regexp_replace(COALESCE(t.telephone_number, ''), '[^0-9]', '', 'g')) = 10
+           AND (
+                regexp_replace(LOWER(COALESCE(f.organization_name, '')), '[^a-z0-9]', '', 'g')
+                    = regexp_replace(LOWER(COALESCE(t.entity_name, '')), '[^a-z0-9]', '', 'g')
+                OR regexp_replace(LOWER(COALESCE(f.doing_business_as_name, '')), '[^a-z0-9]', '', 'g')
+                    = regexp_replace(LOWER(COALESCE(t.entity_name, '')), '[^a-z0-9]', '', 'g')
+           )
+         WHERE t.npi IS NULL
+           AND t.inferred_npi IS NULL
+           AND t.entity_type = 'facility_anchor'
+           AND COALESCE(t.entity_subtype, '') = 'FQHC'
+           AND regexp_replace(LOWER(COALESCE(t.entity_name, '')), '[^a-z0-9]', '', 'g') <> ''
          GROUP BY t.entity_type, t.entity_id, t.type, t.checksum
         """
         if include_fqhc_enrollment
@@ -2592,7 +4139,123 @@ def _inference_sql(
         """
     )
 
-    npi_fqhc_exact_address_candidates_sql = f"""
+    def nppes_address_type_filter(address_type: str | None) -> str:
+        return f"           AND a.type = '{address_type}'\n" if address_type else ""
+
+    def build_fqhc_parent_nppes_exact_candidates_sql(address_type: str | None) -> str:
+        if not include_nppes_name_inference:
+            return empty_inference_candidates_sql
+        return f"""
+        SELECT
+            t.entity_type,
+            t.entity_id,
+            t.type,
+            t.checksum,
+            MIN(n.npi)::bigint AS candidate_npi,
+            COUNT(DISTINCT n.npi)::int AS candidate_npi_count
+          FROM unresolved_facility AS t
+          JOIN {db_schema}.facility_anchor AS fa
+            ON fa.id = t.entity_id
+          JOIN {db_schema}.npi AS n
+            ON n.entity_type_code = 2
+           AND (
+                {norm_text_sql("n.provider_organization_name")} = {norm_text_sql(fa_parent_name)}
+                OR {norm_text_sql("n.provider_other_organization_name")} = {norm_text_sql(fa_parent_name)}
+                OR {norm_text_sql("n.do_business_as_text")} = {norm_text_sql(fa_parent_name)}
+           )
+          JOIN {db_schema}.npi_address AS a
+            ON a.npi = n.npi
+{nppes_address_type_filter(address_type)}           AND {zip5_sql("a.postal_code")} = {zip5_sql(fa_parent_zip)}
+           AND UPPER(COALESCE(a.state_name, '')) = UPPER(COALESCE({fa_parent_state}, ''))
+           AND {norm_text_sql("a.first_line")} = {norm_text_sql(fa_parent_address)}
+          JOIN primary_taxonomy AS pt
+            ON pt.npi = n.npi
+           AND pt.taxonomy_code = '261QF0400X'
+         WHERE t.npi IS NULL
+           AND t.inferred_npi IS NULL
+           AND t.entity_type = 'facility_anchor'
+           AND COALESCE(t.entity_subtype, '') = 'FQHC'
+           AND {norm_text_sql(fa_parent_name)} <> ''
+           AND {norm_text_sql(fa_parent_address)} <> ''
+         GROUP BY t.entity_type, t.entity_id, t.type, t.checksum
+        """
+
+    def build_fqhc_parent_nppes_name_state_candidates_sql(address_type: str | None) -> str:
+        if not include_nppes_name_inference:
+            return empty_inference_candidates_sql
+        return f"""
+        SELECT
+            t.entity_type,
+            t.entity_id,
+            t.type,
+            t.checksum,
+            MIN(n.npi)::bigint AS candidate_npi,
+            COUNT(DISTINCT n.npi)::int AS candidate_npi_count
+          FROM unresolved_facility AS t
+          JOIN {db_schema}.facility_anchor AS fa
+            ON fa.id = t.entity_id
+          JOIN {db_schema}.npi AS n
+            ON n.entity_type_code = 2
+           AND (
+                {norm_text_sql("n.provider_organization_name")} = {norm_text_sql(fa_parent_name)}
+                OR {norm_text_sql("n.provider_other_organization_name")} = {norm_text_sql(fa_parent_name)}
+                OR {norm_text_sql("n.do_business_as_text")} = {norm_text_sql(fa_parent_name)}
+           )
+          JOIN {db_schema}.npi_address AS a
+            ON a.npi = n.npi
+{nppes_address_type_filter(address_type)}           AND UPPER(COALESCE(a.state_name, '')) = UPPER(COALESCE({fa_parent_state}, fa.state, ''))
+          JOIN primary_taxonomy AS pt
+            ON pt.npi = n.npi
+           AND pt.taxonomy_code = '261QF0400X'
+         WHERE t.npi IS NULL
+           AND t.inferred_npi IS NULL
+           AND t.entity_type = 'facility_anchor'
+           AND COALESCE(t.entity_subtype, '') = 'FQHC'
+           AND {norm_text_sql(fa_parent_name)} <> ''
+         GROUP BY t.entity_type, t.entity_id, t.type, t.checksum
+        """
+
+    def build_fqhc_parent_nppes_address_candidates_sql(address_type: str | None) -> str:
+        if not include_nppes_name_inference:
+            return empty_inference_candidates_sql
+        return f"""
+        SELECT
+            t.entity_type,
+            t.entity_id,
+            t.type,
+            t.checksum,
+            MIN(n.npi)::bigint AS candidate_npi,
+            COUNT(DISTINCT n.npi)::int AS candidate_npi_count
+          FROM unresolved_facility AS t
+          JOIN {db_schema}.facility_anchor AS fa
+            ON fa.id = t.entity_id
+          JOIN {db_schema}.npi_address AS a
+            ON {zip5_sql("a.postal_code")} = {zip5_sql(fa_parent_zip)}
+{nppes_address_type_filter(address_type)}           AND UPPER(COALESCE(a.state_name, '')) = UPPER(COALESCE({fa_parent_state}, ''))
+           AND {norm_text_sql("a.first_line")} = {norm_text_sql(fa_parent_address)}
+          JOIN {db_schema}.npi AS n
+            ON n.npi = a.npi
+           AND n.entity_type_code = 2
+          JOIN primary_taxonomy AS pt
+            ON pt.npi = n.npi
+           AND pt.taxonomy_code = '261QF0400X'
+         WHERE t.npi IS NULL
+           AND t.inferred_npi IS NULL
+           AND t.entity_type = 'facility_anchor'
+           AND COALESCE(t.entity_subtype, '') = 'FQHC'
+           AND {norm_text_sql(fa_parent_address)} <> ''
+         GROUP BY t.entity_type, t.entity_id, t.type, t.checksum
+        """
+
+    fqhc_parent_nppes_exact_primary_candidates_sql = build_fqhc_parent_nppes_exact_candidates_sql("primary")
+    fqhc_parent_nppes_exact_all_candidates_sql = build_fqhc_parent_nppes_exact_candidates_sql(None)
+    fqhc_parent_nppes_name_state_primary_candidates_sql = build_fqhc_parent_nppes_name_state_candidates_sql("primary")
+    fqhc_parent_nppes_name_state_all_candidates_sql = build_fqhc_parent_nppes_name_state_candidates_sql(None)
+    fqhc_parent_nppes_address_primary_candidates_sql = build_fqhc_parent_nppes_address_candidates_sql("primary")
+    fqhc_parent_nppes_address_all_candidates_sql = build_fqhc_parent_nppes_address_candidates_sql(None)
+
+    npi_fqhc_exact_address_candidates_sql = (
+        f"""
         SELECT
             t.entity_type,
             t.entity_id,
@@ -2600,7 +4263,7 @@ def _inference_sql(
             t.checksum,
             MIN(a.npi)::bigint AS candidate_npi,
             COUNT(DISTINCT a.npi)::int AS candidate_npi_count
-          FROM {db_schema}.{stage_table} AS t
+          FROM unresolved_facility AS t
           JOIN {db_schema}.npi_address AS a
             ON a.npi IS NOT NULL
            AND LEFT(COALESCE(a.postal_code, ''), 5) = LEFT(COALESCE(t.postal_code, ''), 5)
@@ -2616,8 +4279,11 @@ def _inference_sql(
            AND regexp_replace(LOWER(COALESCE(t.first_line, '')), '[^a-z0-9]', '', 'g') <> ''
          GROUP BY t.entity_type, t.entity_id, t.type, t.checksum
     """
+        if include_nppes_broad_inference
+        else empty_inference_candidates_sql
+    )
 
-    npi_fqhc_phone_zip_candidates_sql = f"""
+    npi_fqhc_address_key_candidates_sql = f"""
         SELECT
             t.entity_type,
             t.entity_id,
@@ -2625,7 +4291,63 @@ def _inference_sql(
             t.checksum,
             MIN(a.npi)::bigint AS candidate_npi,
             COUNT(DISTINCT a.npi)::int AS candidate_npi_count
-          FROM {db_schema}.{stage_table} AS t
+          FROM unresolved_facility AS t
+          JOIN {db_schema}.npi_address AS a
+            ON a.address_key = t.address_key
+           AND a.npi IS NOT NULL
+          JOIN {db_schema}.npi AS n
+            ON n.npi = a.npi
+           AND n.entity_type_code = 2
+          JOIN primary_taxonomy AS pt
+            ON pt.npi = a.npi
+           AND pt.taxonomy_code = '261QF0400X'
+         WHERE t.npi IS NULL
+           AND t.inferred_npi IS NULL
+           AND t.entity_type = 'facility_anchor'
+           AND COALESCE(t.entity_subtype, '') = 'FQHC'
+           AND t.address_key IS NOT NULL
+         GROUP BY t.entity_type, t.entity_id, t.type, t.checksum
+    """
+
+    npi_fqhc_clinic_address_key_candidates_sql = f"""
+        SELECT
+            t.entity_type,
+            t.entity_id,
+            t.type,
+            t.checksum,
+            MIN(a.npi)::bigint AS candidate_npi,
+            COUNT(DISTINCT a.npi)::int AS candidate_npi_count
+          FROM unresolved_facility AS t
+          JOIN {db_schema}.npi_address AS a
+            ON a.address_key = t.address_key
+           AND a.npi IS NOT NULL
+          JOIN {db_schema}.npi AS n
+            ON n.npi = a.npi
+           AND n.entity_type_code = 2
+          JOIN primary_taxonomy AS pt
+            ON pt.npi = a.npi
+           AND pt.taxonomy_code <> '261QF0400X'
+          JOIN {db_schema}.nucc_taxonomy AS nu
+            ON nu.code = pt.taxonomy_code
+           AND COALESCE(nu.classification, '') = 'Clinic/Center'
+         WHERE t.npi IS NULL
+           AND t.inferred_npi IS NULL
+           AND t.entity_type = 'facility_anchor'
+           AND COALESCE(t.entity_subtype, '') = 'FQHC'
+           AND t.address_key IS NOT NULL
+         GROUP BY t.entity_type, t.entity_id, t.type, t.checksum
+    """
+
+    npi_fqhc_phone_zip_candidates_sql = (
+        f"""
+        SELECT
+            t.entity_type,
+            t.entity_id,
+            t.type,
+            t.checksum,
+            MIN(a.npi)::bigint AS candidate_npi,
+            COUNT(DISTINCT a.npi)::int AS candidate_npi_count
+          FROM unresolved_facility AS t
           JOIN {db_schema}.npi_address AS a
             ON a.npi IS NOT NULL
            AND LEFT(COALESCE(a.postal_code, ''), 5) = LEFT(COALESCE(t.postal_code, ''), 5)
@@ -2641,9 +4363,91 @@ def _inference_sql(
            AND COALESCE(t.entity_subtype, '') = 'FQHC'
          GROUP BY t.entity_type, t.entity_id, t.type, t.checksum
     """
+        if include_nppes_broad_inference
+        else empty_inference_candidates_sql
+    )
+
+    npi_fqhc_clinic_phone_zip_candidates_sql = (
+        f"""
+        SELECT
+            t.entity_type,
+            t.entity_id,
+            t.type,
+            t.checksum,
+            MIN(a.npi)::bigint AS candidate_npi,
+            COUNT(DISTINCT a.npi)::int AS candidate_npi_count
+          FROM unresolved_facility AS t
+          JOIN {db_schema}.npi_address AS a
+            ON a.type = 'primary'
+           AND a.npi IS NOT NULL
+           AND LEFT(COALESCE(a.postal_code, ''), 5) = LEFT(COALESCE(t.postal_code, ''), 5)
+           AND regexp_replace(COALESCE(a.telephone_number, ''), '[^0-9]', '', 'g')
+               = regexp_replace(COALESCE(t.telephone_number, ''), '[^0-9]', '', 'g')
+           AND LENGTH(regexp_replace(COALESCE(a.telephone_number, ''), '[^0-9]', '', 'g')) = 10
+           AND LENGTH(regexp_replace(COALESCE(t.telephone_number, ''), '[^0-9]', '', 'g')) = 10
+          JOIN {db_schema}.npi AS n
+            ON n.npi = a.npi
+           AND n.entity_type_code = 2
+          JOIN primary_taxonomy AS pt
+            ON pt.npi = a.npi
+           AND pt.taxonomy_code <> '261QF0400X'
+          JOIN {db_schema}.nucc_taxonomy AS nu
+            ON nu.code = pt.taxonomy_code
+           AND COALESCE(nu.classification, '') = 'Clinic/Center'
+         WHERE t.npi IS NULL
+           AND t.inferred_npi IS NULL
+           AND t.entity_type = 'facility_anchor'
+           AND COALESCE(t.entity_subtype, '') = 'FQHC'
+         GROUP BY t.entity_type, t.entity_id, t.type, t.checksum
+    """
+        if include_nppes_broad_inference
+        else empty_inference_candidates_sql
+    )
+
+    name_fallback_target_filter = (
+        f"""
+         WHERE npi IS NULL
+           AND inferred_npi IS NULL
+           AND entity_type <> 'npi'
+           AND COALESCE(entity_name, '') <> ''
+           AND NOT EXISTS (
+                SELECT 1
+                  FROM preselected_winners AS pw
+                 WHERE pw.entity_type = {db_schema}.{stage_table}.entity_type
+                   AND pw.entity_id = {db_schema}.{stage_table}.entity_id
+                   AND pw.type = {db_schema}.{stage_table}.type
+                   AND pw.checksum = {db_schema}.{stage_table}.checksum
+           )
+        """
+        if include_name_fallback
+        else " WHERE FALSE"
+    )
 
     return f"""
-    WITH hospital_ccn_candidates AS (
+    WITH unresolved_facility AS MATERIALIZED (
+        SELECT *
+          FROM {db_schema}.{stage_table}
+         WHERE npi IS NULL
+           AND inferred_npi IS NULL
+           AND entity_type = 'facility_anchor'
+    ),
+    facility_override_candidates AS (
+        {facility_override_candidates_sql}
+    ),
+    facility_override_winners AS (
+        SELECT
+            entity_type,
+            entity_id,
+            type,
+            checksum,
+            candidate_npi,
+            0::int AS winner_priority,
+            1.0::double precision AS winner_confidence,
+            'facility_anchor_npi_override'::varchar AS winner_method
+          FROM facility_override_candidates
+         WHERE candidate_npi_count = 1
+    ),
+    hospital_ccn_candidates AS (
         {hospital_ccn_candidates_sql}
     ),
     hospital_ccn_winners AS (
@@ -2657,6 +4461,54 @@ def _inference_sql(
             0.99::double precision AS winner_confidence,
             'hospital_ccn_match'::varchar AS winner_method
           FROM hospital_ccn_candidates
+         WHERE candidate_npi_count = 1
+    ),
+    hospital_nppes_name_address_candidates AS (
+        {hospital_nppes_name_address_candidates_sql}
+    ),
+    hospital_other_identifier_candidates AS (
+        {hospital_other_identifier_candidates_sql}
+    ),
+    hospital_other_identifier_winners AS (
+        SELECT
+            entity_type,
+            entity_id,
+            type,
+            checksum,
+            candidate_npi,
+            3::int AS winner_priority,
+            0.96::double precision AS winner_confidence,
+            'hospital_nppes_other_identifier'::varchar AS winner_method
+          FROM hospital_other_identifier_candidates
+         WHERE candidate_npi_count = 1
+    ),
+    hospital_address_key_candidates AS (
+        {hospital_address_key_candidates_sql}
+    ),
+    hospital_address_key_winners AS (
+        SELECT
+            entity_type,
+            entity_id,
+            type,
+            checksum,
+            candidate_npi,
+            6::int AS winner_priority,
+            0.93::double precision AS winner_confidence,
+            'hospital_nppes_address_key'::varchar AS winner_method
+          FROM hospital_address_key_candidates
+         WHERE candidate_npi_count = 1
+    ),
+    hospital_nppes_name_address_winners AS (
+        SELECT
+            entity_type,
+            entity_id,
+            type,
+            checksum,
+            candidate_npi,
+            5::int AS winner_priority,
+            0.94::double precision AS winner_confidence,
+            'hospital_nppes_name_address'::varchar AS winner_method
+          FROM hospital_nppes_name_address_candidates
          WHERE candidate_npi_count = 1
     ),
     fqhc_exact_candidates AS (
@@ -2691,6 +4543,86 @@ def _inference_sql(
           FROM fqhc_ccn_candidates
          WHERE candidate_npi_count = 1
     ),
+    fqhc_other_identifier_candidates AS (
+        {fqhc_other_identifier_candidates_sql}
+    ),
+    fqhc_other_identifier_winners AS (
+        SELECT
+            entity_type,
+            entity_id,
+            type,
+            checksum,
+            candidate_npi,
+            15::int AS winner_priority,
+            0.96::double precision AS winner_confidence,
+            'fqhc_nppes_other_identifier'::varchar AS winner_method
+          FROM fqhc_other_identifier_candidates
+         WHERE candidate_npi_count = 1
+    ),
+    fqhc_parent_exact_candidates AS (
+        {fqhc_parent_exact_candidates_sql}
+    ),
+    fqhc_parent_exact_winners AS (
+        SELECT
+            entity_type,
+            entity_id,
+            type,
+            checksum,
+            candidate_npi,
+            25::int AS winner_priority,
+            0.94::double precision AS winner_confidence,
+            'fqhc_parent_enrollment_exact_address'::varchar AS winner_method
+          FROM fqhc_parent_exact_candidates
+         WHERE candidate_npi_count = 1
+    ),
+    fqhc_parent_name_state_candidates AS (
+        {fqhc_parent_name_state_candidates_sql}
+    ),
+    fqhc_parent_name_state_winners AS (
+        SELECT
+            entity_type,
+            entity_id,
+            type,
+            checksum,
+            candidate_npi,
+            37::int AS winner_priority,
+            0.91::double precision AS winner_confidence,
+            'fqhc_parent_enrollment_name_state'::varchar AS winner_method
+          FROM fqhc_parent_name_state_candidates
+         WHERE candidate_npi_count = 1
+    ),
+    fqhc_parent_address_candidates AS (
+        {fqhc_parent_address_candidates_sql}
+    ),
+    fqhc_parent_address_winners AS (
+        SELECT
+            entity_type,
+            entity_id,
+            type,
+            checksum,
+            candidate_npi,
+            38::int AS winner_priority,
+            0.90::double precision AS winner_confidence,
+            'fqhc_parent_enrollment_address'::varchar AS winner_method
+          FROM fqhc_parent_address_candidates
+         WHERE candidate_npi_count = 1
+    ),
+    fqhc_sibling_source_npi_candidates AS (
+        {fqhc_sibling_source_npi_candidates_sql}
+    ),
+    fqhc_sibling_source_npi_winners AS (
+        SELECT
+            entity_type,
+            entity_id,
+            type,
+            checksum,
+            candidate_npi,
+            39::int AS winner_priority,
+            0.88::double precision AS winner_confidence,
+            'fqhc_sibling_source_npi'::varchar AS winner_method
+          FROM fqhc_sibling_source_npi_candidates
+         WHERE candidate_npi_count = 1
+    ),
     fqhc_enrollment_address_candidates AS (
         {fqhc_enrollment_address_candidates_sql}
     ),
@@ -2705,6 +4637,38 @@ def _inference_sql(
             0.955::double precision AS winner_confidence,
             'fqhc_enrollment_exact_address'::varchar AS winner_method
           FROM fqhc_enrollment_address_candidates
+         WHERE candidate_npi_count = 1
+    ),
+    fqhc_enrollment_phone_zip_candidates AS (
+        {fqhc_enrollment_phone_zip_candidates_sql}
+    ),
+    fqhc_enrollment_phone_zip_winners AS (
+        SELECT
+            entity_type,
+            entity_id,
+            type,
+            checksum,
+            candidate_npi,
+            35::int AS winner_priority,
+            0.93::double precision AS winner_confidence,
+            'fqhc_enrollment_phone_zip'::varchar AS winner_method
+          FROM fqhc_enrollment_phone_zip_candidates
+         WHERE candidate_npi_count = 1
+    ),
+    fqhc_enrollment_phone_name_candidates AS (
+        {fqhc_enrollment_phone_name_candidates_sql}
+    ),
+    fqhc_enrollment_phone_name_winners AS (
+        SELECT
+            entity_type,
+            entity_id,
+            type,
+            checksum,
+            candidate_npi,
+            36::int AS winner_priority,
+            0.94::double precision AS winner_confidence,
+            'fqhc_enrollment_phone_name'::varchar AS winner_method
+          FROM fqhc_enrollment_phone_name_candidates
          WHERE candidate_npi_count = 1
     ),
     primary_taxonomy AS (
@@ -2727,6 +4691,126 @@ def _inference_sql(
                 AND COALESCE(nu.specialization, '') ILIKE '%federally qualified health center%'
             )
     ),
+    fqhc_parent_nppes_exact_primary_candidates AS (
+        {fqhc_parent_nppes_exact_primary_candidates_sql}
+    ),
+    fqhc_parent_nppes_exact_primary_winners AS (
+        SELECT
+            entity_type,
+            entity_id,
+            type,
+            checksum,
+            candidate_npi,
+            41::int AS winner_priority,
+            0.885::double precision AS winner_confidence,
+            'fqhc_parent_nppes_exact_address_primary'::varchar AS winner_method
+          FROM fqhc_parent_nppes_exact_primary_candidates
+         WHERE candidate_npi_count = 1
+    ),
+    fqhc_parent_nppes_exact_all_candidates AS (
+        {fqhc_parent_nppes_exact_all_candidates_sql}
+    ),
+    fqhc_parent_nppes_exact_all_winners AS (
+        SELECT
+            entity_type,
+            entity_id,
+            type,
+            checksum,
+            candidate_npi,
+            44::int AS winner_priority,
+            0.865::double precision AS winner_confidence,
+            'fqhc_parent_nppes_exact_address'::varchar AS winner_method
+          FROM fqhc_parent_nppes_exact_all_candidates AS all_candidates
+         WHERE candidate_npi_count = 1
+           AND NOT EXISTS (
+                SELECT 1
+                  FROM fqhc_parent_nppes_exact_primary_candidates AS primary_candidates
+                 WHERE primary_candidates.entity_type = all_candidates.entity_type
+                   AND primary_candidates.entity_id = all_candidates.entity_id
+                   AND primary_candidates.type = all_candidates.type
+                   AND primary_candidates.checksum = all_candidates.checksum
+           )
+    ),
+    fqhc_parent_nppes_name_state_primary_candidates AS (
+        {fqhc_parent_nppes_name_state_primary_candidates_sql}
+    ),
+    fqhc_parent_nppes_name_state_primary_winners AS (
+        SELECT
+            entity_type,
+            entity_id,
+            type,
+            checksum,
+            candidate_npi,
+            42::int AS winner_priority,
+            0.875::double precision AS winner_confidence,
+            'fqhc_parent_nppes_name_state_primary'::varchar AS winner_method
+          FROM fqhc_parent_nppes_name_state_primary_candidates
+         WHERE candidate_npi_count = 1
+    ),
+    fqhc_parent_nppes_name_state_all_candidates AS (
+        {fqhc_parent_nppes_name_state_all_candidates_sql}
+    ),
+    fqhc_parent_nppes_name_state_all_winners AS (
+        SELECT
+            entity_type,
+            entity_id,
+            type,
+            checksum,
+            candidate_npi,
+            45::int AS winner_priority,
+            0.86::double precision AS winner_confidence,
+            'fqhc_parent_nppes_name_state'::varchar AS winner_method
+          FROM fqhc_parent_nppes_name_state_all_candidates AS all_candidates
+         WHERE candidate_npi_count = 1
+           AND NOT EXISTS (
+                SELECT 1
+                  FROM fqhc_parent_nppes_name_state_primary_candidates AS primary_candidates
+                 WHERE primary_candidates.entity_type = all_candidates.entity_type
+                   AND primary_candidates.entity_id = all_candidates.entity_id
+                   AND primary_candidates.type = all_candidates.type
+                   AND primary_candidates.checksum = all_candidates.checksum
+           )
+    ),
+    fqhc_parent_nppes_address_primary_candidates AS (
+        {fqhc_parent_nppes_address_primary_candidates_sql}
+    ),
+    fqhc_parent_nppes_address_primary_winners AS (
+        SELECT
+            entity_type,
+            entity_id,
+            type,
+            checksum,
+            candidate_npi,
+            43::int AS winner_priority,
+            0.87::double precision AS winner_confidence,
+            'fqhc_parent_nppes_address_primary'::varchar AS winner_method
+          FROM fqhc_parent_nppes_address_primary_candidates
+         WHERE candidate_npi_count = 1
+    ),
+    fqhc_parent_nppes_address_all_candidates AS (
+        {fqhc_parent_nppes_address_all_candidates_sql}
+    ),
+    fqhc_parent_nppes_address_all_winners AS (
+        SELECT
+            entity_type,
+            entity_id,
+            type,
+            checksum,
+            candidate_npi,
+            46::int AS winner_priority,
+            0.855::double precision AS winner_confidence,
+            'fqhc_parent_nppes_address'::varchar AS winner_method
+          FROM fqhc_parent_nppes_address_all_candidates AS all_candidates
+         WHERE candidate_npi_count = 1
+           AND NOT EXISTS (
+                SELECT 1
+                  FROM fqhc_parent_nppes_address_primary_candidates AS primary_candidates
+                 WHERE primary_candidates.entity_type = all_candidates.entity_type
+                   AND primary_candidates.entity_id = all_candidates.entity_id
+                   AND primary_candidates.type = all_candidates.type
+                   AND primary_candidates.checksum = all_candidates.checksum
+           )
+    ),
     npi_fqhc_exact_address_candidates AS (
         {npi_fqhc_exact_address_candidates_sql}
     ),
@@ -2741,6 +4825,38 @@ def _inference_sql(
             0.945::double precision AS winner_confidence,
             'npi_fqhc_exact_address'::varchar AS winner_method
           FROM npi_fqhc_exact_address_candidates
+         WHERE candidate_npi_count = 1
+    ),
+    npi_fqhc_address_key_candidates AS (
+        {npi_fqhc_address_key_candidates_sql}
+    ),
+    npi_fqhc_address_key_winners AS (
+        SELECT
+            entity_type,
+            entity_id,
+            type,
+            checksum,
+            candidate_npi,
+            32::int AS winner_priority,
+            0.94::double precision AS winner_confidence,
+            'npi_fqhc_address_key'::varchar AS winner_method
+          FROM npi_fqhc_address_key_candidates
+         WHERE candidate_npi_count = 1
+    ),
+    npi_fqhc_clinic_address_key_candidates AS (
+        {npi_fqhc_clinic_address_key_candidates_sql}
+    ),
+    npi_fqhc_clinic_address_key_winners AS (
+        SELECT
+            entity_type,
+            entity_id,
+            type,
+            checksum,
+            candidate_npi,
+            34::int AS winner_priority,
+            0.90::double precision AS winner_confidence,
+            'npi_fqhc_clinic_address_key'::varchar AS winner_method
+          FROM npi_fqhc_clinic_address_key_candidates
          WHERE candidate_npi_count = 1
     ),
     npi_fqhc_phone_zip_candidates AS (
@@ -2759,45 +4875,105 @@ def _inference_sql(
           FROM npi_fqhc_phone_zip_candidates
          WHERE candidate_npi_count = 1
     ),
-    preselected_candidates AS (
-        SELECT * FROM hospital_ccn_winners
-        UNION ALL
-        SELECT * FROM fqhc_exact_winners
-        UNION ALL
-        SELECT * FROM fqhc_ccn_winners
-        UNION ALL
-        SELECT * FROM fqhc_enrollment_address_winners
-        UNION ALL
-        SELECT * FROM npi_fqhc_exact_address_winners
-        UNION ALL
-        SELECT * FROM npi_fqhc_phone_zip_winners
+    npi_fqhc_clinic_phone_zip_candidates AS (
+        {npi_fqhc_clinic_phone_zip_candidates_sql}
     ),
-    preselected_candidate_counts AS (
+    npi_fqhc_clinic_phone_zip_winners AS (
         SELECT
             entity_type,
             entity_id,
             type,
             checksum,
-            COUNT(DISTINCT candidate_npi)::int AS distinct_candidate_count
-          FROM preselected_candidates
+            candidate_npi,
+            52::int AS winner_priority,
+            0.87::double precision AS winner_confidence,
+            'npi_fqhc_clinic_phone_zip'::varchar AS winner_method
+          FROM npi_fqhc_clinic_phone_zip_candidates
+         WHERE candidate_npi_count = 1
+    ),
+    strong_preselected_candidates AS (
+        SELECT * FROM facility_override_winners
+        UNION ALL
+        SELECT * FROM hospital_ccn_winners
+        UNION ALL
+        SELECT * FROM hospital_other_identifier_winners
+        UNION ALL
+        SELECT * FROM hospital_nppes_name_address_winners
+        UNION ALL
+        SELECT * FROM hospital_address_key_winners
+        UNION ALL
+        SELECT * FROM fqhc_exact_winners
+        UNION ALL
+        SELECT * FROM fqhc_ccn_winners
+        UNION ALL
+        SELECT * FROM fqhc_other_identifier_winners
+        UNION ALL
+        SELECT * FROM fqhc_parent_exact_winners
+        UNION ALL
+        SELECT * FROM fqhc_enrollment_address_winners
+        UNION ALL
+        SELECT * FROM npi_fqhc_address_key_winners
+        UNION ALL
+        SELECT * FROM npi_fqhc_clinic_address_key_winners
+        UNION ALL
+        SELECT * FROM fqhc_enrollment_phone_zip_winners
+        UNION ALL
+        SELECT * FROM fqhc_enrollment_phone_name_winners
+        UNION ALL
+        SELECT * FROM fqhc_parent_name_state_winners
+        UNION ALL
+        SELECT * FROM fqhc_parent_address_winners
+        UNION ALL
+        SELECT * FROM npi_fqhc_exact_address_winners
+        UNION ALL
+        SELECT * FROM npi_fqhc_phone_zip_winners
+        UNION ALL
+        SELECT * FROM npi_fqhc_clinic_phone_zip_winners
+    ),
+    preselected_min_priorities AS (
+        SELECT
+            entity_type,
+            entity_id,
+            type,
+            checksum,
+            MIN(winner_priority)::int AS best_priority
+          FROM strong_preselected_candidates
       GROUP BY entity_type, entity_id, type, checksum
+    ),
+    preselected_candidate_counts AS (
+        SELECT
+            candidates.entity_type,
+            candidates.entity_id,
+            candidates.type,
+            candidates.checksum,
+            priorities.best_priority,
+            COUNT(DISTINCT candidate_npi)::int AS distinct_candidate_count
+          FROM strong_preselected_candidates AS candidates
+          JOIN preselected_min_priorities AS priorities
+            ON priorities.entity_type = candidates.entity_type
+           AND priorities.entity_id = candidates.entity_id
+           AND priorities.type = candidates.type
+           AND priorities.checksum = candidates.checksum
+           AND priorities.best_priority = candidates.winner_priority
+      GROUP BY candidates.entity_type, candidates.entity_id, candidates.type, candidates.checksum, priorities.best_priority
     ),
     preselected_ranked AS (
         SELECT
             pc.*,
+            pcc.best_priority,
             pcc.distinct_candidate_count,
             ROW_NUMBER() OVER (
                 PARTITION BY pc.entity_type, pc.entity_id, pc.type, pc.checksum
                 ORDER BY winner_priority ASC, candidate_npi ASC
             ) AS preselected_rank
-          FROM preselected_candidates AS pc
+          FROM strong_preselected_candidates AS pc
           JOIN preselected_candidate_counts AS pcc
             ON pcc.entity_type = pc.entity_type
            AND pcc.entity_id = pc.entity_id
            AND pcc.type = pc.type
            AND pcc.checksum = pc.checksum
     ),
-    preselected_winners AS (
+    strong_preselected_winners AS (
         SELECT
             entity_type,
             entity_id,
@@ -2807,8 +4983,75 @@ def _inference_sql(
             winner_confidence,
             winner_method
           FROM preselected_ranked
-         WHERE distinct_candidate_count = 1
+         WHERE winner_priority = best_priority
+           AND distinct_candidate_count = 1
            AND preselected_rank = 1
+    ),
+    fallback_preselected_candidates AS (
+        SELECT * FROM fqhc_parent_nppes_exact_primary_winners
+        UNION ALL
+        SELECT * FROM fqhc_parent_nppes_name_state_primary_winners
+        UNION ALL
+        SELECT * FROM fqhc_parent_nppes_address_primary_winners
+        UNION ALL
+        SELECT * FROM fqhc_parent_nppes_exact_all_winners
+        UNION ALL
+        SELECT * FROM fqhc_parent_nppes_name_state_all_winners
+        UNION ALL
+        SELECT * FROM fqhc_parent_nppes_address_all_winners
+        UNION ALL
+        SELECT * FROM fqhc_sibling_source_npi_winners
+    ),
+    fallback_preselected_candidate_counts AS (
+        SELECT
+            entity_type,
+            entity_id,
+            type,
+            checksum,
+            COUNT(DISTINCT candidate_npi)::int AS distinct_candidate_count
+          FROM fallback_preselected_candidates
+      GROUP BY entity_type, entity_id, type, checksum
+    ),
+    fallback_preselected_ranked AS (
+        SELECT
+            fallback.*,
+            counts.distinct_candidate_count,
+            ROW_NUMBER() OVER (
+                PARTITION BY fallback.entity_type, fallback.entity_id, fallback.type, fallback.checksum
+                ORDER BY winner_priority ASC, candidate_npi ASC
+            ) AS fallback_rank
+          FROM fallback_preselected_candidates AS fallback
+          JOIN fallback_preselected_candidate_counts AS counts
+            ON counts.entity_type = fallback.entity_type
+           AND counts.entity_id = fallback.entity_id
+           AND counts.type = fallback.type
+           AND counts.checksum = fallback.checksum
+    ),
+    fallback_preselected_winners AS (
+        SELECT
+            entity_type,
+            entity_id,
+            type,
+            checksum,
+            candidate_npi,
+            winner_confidence,
+            winner_method
+          FROM fallback_preselected_ranked AS fallback
+         WHERE distinct_candidate_count = 1
+           AND fallback_rank = 1
+           AND NOT EXISTS (
+                SELECT 1
+                  FROM strong_preselected_candidates AS strong
+                 WHERE strong.entity_type = fallback.entity_type
+                   AND strong.entity_id = fallback.entity_id
+                   AND strong.type = fallback.type
+                   AND strong.checksum = fallback.checksum
+           )
+    ),
+    preselected_winners AS (
+        SELECT * FROM strong_preselected_winners
+        UNION ALL
+        SELECT * FROM fallback_preselected_winners
     ),
     target AS (
         SELECT
@@ -2822,18 +5065,7 @@ def _inference_sql(
             state_name,
             LEFT(COALESCE(postal_code, ''), 5) AS zip5
           FROM {db_schema}.{stage_table}
-         WHERE npi IS NULL
-           AND inferred_npi IS NULL
-           AND entity_type <> 'npi'
-           AND COALESCE(entity_name, '') <> ''
-           AND NOT EXISTS (
-                SELECT 1
-                  FROM preselected_winners AS pw
-                 WHERE pw.entity_type = {db_schema}.{stage_table}.entity_type
-                   AND pw.entity_id = {db_schema}.{stage_table}.entity_id
-                   AND pw.type = {db_schema}.{stage_table}.type
-                   AND pw.checksum = {db_schema}.{stage_table}.checksum
-           )
+         {name_fallback_target_filter}
     ),
     candidates AS (
         SELECT
@@ -3187,11 +5419,20 @@ async def process_data(ctx, task=None):
     db_schema = os.getenv("HLTHPRT_DB_SCHEMA") if os.getenv("HLTHPRT_DB_SCHEMA") else "mrf"
     stage_cls = make_class(EntityAddressUnified, import_date)
     stage_table = stage_cls.__tablename__
+    reuse_stage = _env_bool("HLTHPRT_ENTITY_ADDRESS_UNIFIED_REUSE_STAGE", False)
 
     if not ctx["context"].get("stage_prepared"):
         await _ensure_schema_exists(db_schema)
-        await db.status(f"DROP TABLE IF EXISTS {db_schema}.{stage_table};")
-        await db.create_table(stage_cls.__table__, checkfirst=True)
+        if reuse_stage:
+            if not await _table_exists(db_schema, stage_table):
+                raise RuntimeError(
+                    f"HLTHPRT_ENTITY_ADDRESS_UNIFIED_REUSE_STAGE requested, "
+                    f"but {db_schema}.{stage_table} does not exist"
+                )
+            context["stage_reused"] = True
+        else:
+            await db.status(f"DROP TABLE IF EXISTS {db_schema}.{stage_table};")
+            await db.create_table(stage_cls.__table__, checkfirst=True)
         ctx["context"]["stage_prepared"] = True
         ctx["context"]["stage_indexes_prepared"] = False
         ctx["context"]["support_stage_prepared"] = False
@@ -3203,17 +5444,38 @@ async def process_data(ctx, task=None):
     required_checks = [
         "npi",
         "npi_address",
+        "npi_taxonomy",
+        "nucc_taxonomy",
+        "npi_other_identifier",
         "provider_enrollment_hospital",
         "provider_enrollment_fqhc",
+        "provider_enrollment_ffs_additional_npi",
         "doctor_clinician_address",
         "provider_enrollment_ffs",
         "provider_enrollment_ffs_address",
         "facility_anchor",
+        "facility_anchor_npi_override",
+        "facility_anchor_npi_candidate",
         "mrf_address",
         "ptg_address",
         "address_archive_v2",
     ]
     available = {table: await _table_exists(db_schema, table) for table in required_checks}
+    approved_candidate_promotions = 0
+    if available.get("facility_anchor_npi_candidate") and available.get("facility_anchor_npi_override"):
+        approved_candidate_promotions = await _promote_approved_facility_anchor_npi_candidates(db_schema)
+        context["facility_anchor_npi_candidate_promotions"] = approved_candidate_promotions
+        if run_id and approved_candidate_promotions:
+            enqueue_live_progress(
+                run_id=run_id,
+                importer="entity-address-unified",
+                status="running",
+                phase="entity-address-unified promoting reviewed NPI candidates",
+                unit="rows",
+                done=approved_candidate_promotions,
+                total=approved_candidate_promotions,
+                message=f"promoted {approved_candidate_promotions} approved facility-anchor NPI candidates",
+            )
     test_limit_per_source: int | None = None
     limit_any_mode_raw = os.getenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_LIMIT_PER_SOURCE")
     if limit_any_mode_raw not in (None, ""):
@@ -3278,10 +5540,6 @@ async def process_data(ctx, task=None):
                 pct=0,
                 message=message,
             )
-        if _key_v2_enabled():
-            raise RuntimeError(
-                "HLTHPRT_ENTITY_ADDRESS_UNIFIED_KEY_V2 requires canonical address SQL functions"
-            )
         logger.warning(
             "Canonical address SQL functions are not available in schema %s; "
             "entity_address_unified will publish with NULL address_key values.",
@@ -3311,7 +5569,7 @@ async def process_data(ctx, task=None):
 
     chunked_load = _env_bool("HLTHPRT_ENTITY_ADDRESS_UNIFIED_CHUNKED_LOAD", True)
     raw_table: str | None = None
-    if chunked_load:
+    if chunked_load and not reuse_stage:
         source_concurrency = _env_int(
             "HLTHPRT_ENTITY_ADDRESS_UNIFIED_SOURCE_CONCURRENCY",
             DEFAULT_SOURCE_CONCURRENCY,
@@ -3345,106 +5603,134 @@ async def process_data(ctx, task=None):
         )
         raw_table = _raw_stage_table_name(stage_table)
         use_unlogged_raw = _env_bool("HLTHPRT_ENTITY_ADDRESS_UNIFIED_UNLOGGED_RAW_STAGE", True)
+        reuse_raw_stage = _env_bool("HLTHPRT_ENTITY_ADDRESS_UNIFIED_REUSE_RAW_STAGE", False)
 
-        await db.status(f"DROP TABLE IF EXISTS {db_schema}.{raw_table};")
-        await db.status(_prepare_raw_stage_sql(db_schema, raw_table, unlogged=use_unlogged_raw))
-
-        sem = asyncio.Semaphore(source_concurrency)
-        source_progress_lock = asyncio.Lock()
-        loaded_sources = 0
-
-        async def _load_source(select_sql: str) -> None:
-            nonlocal loaded_sources
-            async with sem:
-                await db.status(
-                    _insert_raw_from_source_sql(
-                        db_schema,
-                        raw_table,
-                        select_sql,
-                        address_canon_available=address_canon_available,
-                    )
+        if reuse_raw_stage:
+            if not await _table_exists(db_schema, raw_table):
+                raise RuntimeError(
+                    f"HLTHPRT_ENTITY_ADDRESS_UNIFIED_REUSE_RAW_STAGE requested, "
+                    f"but {db_schema}.{raw_table} does not exist"
                 )
-            if run_id:
-                async with source_progress_lock:
-                    loaded_sources += 1
-                    enqueue_live_progress(
-                        run_id=run_id,
-                        importer="entity-address-unified",
-                        status="running",
-                        phase="entity-address-unified loading sources",
-                        unit="sources",
-                        done=loaded_sources,
-                        total=len(source_selects),
-                        message=f"loaded {loaded_sources}/{len(source_selects)} sources",
-                    )
-
-        if source_concurrency > 1 and len(source_selects) > 1:
-            await asyncio.gather(*(_load_source(select_sql) for select_sql in source_selects))
-        else:
-            for select_sql in source_selects:
-                await _load_source(select_sql)
-
-        if enrich_shards > 1:
-            await db.status(
-                f"CREATE INDEX IF NOT EXISTS {raw_table}_idx_checksum "
-                f"ON {db_schema}.{raw_table} (checksum);"
-            )
-            await db.status(f"ANALYZE {db_schema}.{raw_table};")
+            raw_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{raw_table};") or 0)
+            if raw_rows <= 0:
+                raise RuntimeError(
+                    f"HLTHPRT_ENTITY_ADDRESS_UNIFIED_REUSE_RAW_STAGE requested, "
+                    f"but {db_schema}.{raw_table} is empty"
+                )
+            context["raw_stage_reused"] = True
+            context["raw_stage_reused_rows"] = raw_rows
             if run_id:
                 enqueue_live_progress(
                     run_id=run_id,
                     importer="entity-address-unified",
                     status="running",
-                    phase="entity-address-unified enriching raw",
-                    unit="shards",
-                    done=0,
-                    total=enrich_shards,
-                    message=f"enriching {enrich_shards} checksum shards",
+                    phase="entity-address-unified reusing raw stage",
+                    unit="rows",
+                    done=raw_rows,
+                    total=raw_rows,
+                    message=f"reusing {raw_rows:,} raw rows from {raw_table}",
                 )
-            enrich_sem = asyncio.Semaphore(enrich_concurrency)
-            enrich_progress_lock = asyncio.Lock()
-            enriched_shards = 0
-            checksum_ranges = _integer_ranges(-(2**31), 2**31 - 1, enrich_shards)
+        else:
+            await db.status(f"DROP TABLE IF EXISTS {db_schema}.{raw_table};")
+            await db.status(_prepare_raw_stage_sql(db_schema, raw_table, unlogged=use_unlogged_raw))
 
-            async def _enrich_shard(checksum_min: int, checksum_max: int) -> None:
-                nonlocal enriched_shards
-                async with enrich_sem:
+            sem = asyncio.Semaphore(source_concurrency)
+            source_progress_lock = asyncio.Lock()
+            loaded_sources = 0
+
+            async def _load_source(select_sql: str) -> None:
+                nonlocal loaded_sources
+                async with sem:
                     await db.status(
-                        _enrich_raw_stage_sql(
+                        _insert_raw_from_source_sql(
                             db_schema,
                             raw_table,
-                            archive_available=available.get("address_archive_v2", False),
-                            checksum_min=checksum_min,
-                            checksum_max=checksum_max,
+                            select_sql,
+                            address_canon_available=address_canon_available,
                         )
                     )
                 if run_id:
-                    async with enrich_progress_lock:
-                        enriched_shards += 1
+                    async with source_progress_lock:
+                        loaded_sources += 1
                         enqueue_live_progress(
                             run_id=run_id,
                             importer="entity-address-unified",
                             status="running",
-                            phase="entity-address-unified enriching raw",
-                            unit="shards",
-                            done=enriched_shards,
-                            total=enrich_shards,
-                            message=f"enriched {enriched_shards}/{enrich_shards} raw shards",
+                            phase="entity-address-unified loading sources",
+                            unit="sources",
+                            done=loaded_sources,
+                            total=len(source_selects),
+                            message=f"loaded {loaded_sources}/{len(source_selects)} sources",
                         )
 
-            await asyncio.gather(*(_enrich_shard(low, high) for low, high in checksum_ranges))
-        else:
-            await db.status(
-                _enrich_raw_stage_sql(
-                    db_schema,
-                    raw_table,
-                    archive_available=available.get("address_archive_v2", False),
+            if source_concurrency > 1 and len(source_selects) > 1:
+                await asyncio.gather(*(_load_source(select_sql) for select_sql in source_selects))
+            else:
+                for select_sql in source_selects:
+                    await _load_source(select_sql)
+
+            if enrich_shards > 1:
+                await db.status(
+                    f"CREATE INDEX IF NOT EXISTS {raw_table}_idx_checksum "
+                    f"ON {db_schema}.{raw_table} (checksum);"
                 )
-            )
+                await db.status(f"ANALYZE {db_schema}.{raw_table};")
+                if run_id:
+                    enqueue_live_progress(
+                        run_id=run_id,
+                        importer="entity-address-unified",
+                        status="running",
+                        phase="entity-address-unified enriching raw",
+                        unit="shards",
+                        done=0,
+                        total=enrich_shards,
+                        message=f"enriching {enrich_shards} checksum shards",
+                    )
+                enrich_sem = asyncio.Semaphore(enrich_concurrency)
+                enrich_progress_lock = asyncio.Lock()
+                enriched_shards = 0
+                checksum_ranges = _integer_ranges(-(2**31), 2**31 - 1, enrich_shards)
+
+                async def _enrich_shard(checksum_min: int, checksum_max: int) -> None:
+                    nonlocal enriched_shards
+                    async with enrich_sem:
+                        await db.status(
+                            _enrich_raw_stage_sql(
+                                db_schema,
+                                raw_table,
+                                archive_available=available.get("address_archive_v2", False),
+                                checksum_min=checksum_min,
+                                checksum_max=checksum_max,
+                            )
+                        )
+                    if run_id:
+                        async with enrich_progress_lock:
+                            enriched_shards += 1
+                            enqueue_live_progress(
+                                run_id=run_id,
+                                importer="entity-address-unified",
+                                status="running",
+                                phase="entity-address-unified enriching raw",
+                                unit="shards",
+                                done=enriched_shards,
+                                total=enrich_shards,
+                                message=f"enriched {enriched_shards}/{enrich_shards} raw shards",
+                            )
+
+                await asyncio.gather(*(_enrich_shard(low, high) for low, high in checksum_ranges))
+            else:
+                await db.status(
+                    _enrich_raw_stage_sql(
+                        db_schema,
+                        raw_table,
+                        archive_available=available.get("address_archive_v2", False),
+                    )
+                )
+        await db.status(f"DROP INDEX IF EXISTS {db_schema}.{raw_table}_idx_group_key;")
         await db.status(
-            f"CREATE INDEX IF NOT EXISTS {raw_table}_idx_group_key "
+            f"CREATE INDEX {raw_table}_idx_group_key "
             f"ON {db_schema}.{raw_table} "
-            "(entity_type, entity_id, type, (COALESCE(address_key::text, checksum::text)));"
+            "(entity_type, entity_id, type, location_key);"
         )
         await db.status(
             f"CREATE INDEX IF NOT EXISTS {raw_table}_idx_location_key "
@@ -3509,6 +5795,24 @@ async def process_data(ctx, task=None):
                 )
             )
 
+    elif chunked_load:
+        raw_table = _raw_stage_table_name(stage_table)
+        context["stage_reused"] = True
+        if not await _table_exists(db_schema, raw_table):
+            raw_table = None
+        if run_id:
+            stage_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{stage_table};") or 0)
+            enqueue_live_progress(
+                run_id=run_id,
+                importer="entity-address-unified",
+                status="running",
+                phase="entity-address-unified reusing materialized stage",
+                unit="rows",
+                done=stage_rows,
+                total=stage_rows,
+                message=f"reusing {stage_rows:,} staged rows from {stage_table}",
+            )
+
     else:
         if run_id:
             enqueue_live_progress(
@@ -3543,20 +5847,67 @@ async def process_data(ctx, task=None):
             )
 
     enable_inference = str(
-        os.getenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENABLE_INFERENCE", "true")
+        os.getenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENABLE_INFERENCE", "false")
     ).strip().lower() in {"1", "true", "yes", "on"}
     if test_mode:
         enable_inference = str(
             os.getenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_TEST_ENABLE_INFERENCE", "false")
         ).strip().lower() in {"1", "true", "yes", "on"}
 
-    if enable_inference and available.get("npi", False) and available.get("npi_address", False):
+    if (
+        enable_inference
+        and available.get("npi", False)
+        and available.get("npi_address", False)
+        and available.get("npi_taxonomy", False)
+        and available.get("nucc_taxonomy", False)
+    ):
+        include_facility_override = False
+        if available.get("facility_anchor_npi_override", False):
+            include_facility_override = bool(
+                await db.scalar(
+                    f"""
+                    SELECT EXISTS (
+                        SELECT 1
+                          FROM {db_schema}.facility_anchor_npi_override
+                         WHERE npi IS NOT NULL
+                           AND LOWER(COALESCE(status, '')) = 'approved'
+                         LIMIT 1
+                    );
+                    """
+                )
+            )
+        context["facility_anchor_npi_override_inference_enabled"] = include_facility_override
+        include_npi_other_identifier = (
+            available.get("npi_other_identifier", False)
+            and _env_bool(
+                "HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENABLE_NPI_OTHER_IDENTIFIER_INFERENCE",
+                False,
+            )
+        )
+        context["facility_anchor_npi_other_identifier_inference_enabled"] = (
+            include_npi_other_identifier
+        )
+        await _prepare_inference_stage_indexes(db_schema, stage_table)
         await db.status(
             _inference_sql(
                 db_schema,
                 stage_table,
                 include_hospital_enrollment=available.get("provider_enrollment_hospital", False),
                 include_fqhc_enrollment=available.get("provider_enrollment_fqhc", False),
+                include_facility_override=include_facility_override,
+                include_npi_other_identifier=include_npi_other_identifier,
+                include_name_fallback=_env_bool(
+                    "HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENABLE_NAME_FALLBACK_INFERENCE",
+                    False,
+                ),
+                include_nppes_name_inference=_env_bool(
+                    "HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENABLE_NPPES_NAME_INFERENCE",
+                    False,
+                ),
+                include_nppes_broad_inference=_env_bool(
+                    "HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENABLE_NPPES_BROAD_INFERENCE",
+                    False,
+                ),
             )
         )
 
@@ -3706,6 +6057,7 @@ async def process_data(ctx, task=None):
             node_id=node_id,
             raw_table=raw_table,
             build_network_bridge=build_network_bridge,
+            available=available,
         )
         context["support_stage_populated"] = True
         context["support_counts"] = support_counts

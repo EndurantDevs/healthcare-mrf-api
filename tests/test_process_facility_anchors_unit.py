@@ -41,3 +41,81 @@ def test_normalize_phone_accepts_ten_digit_us_numbers(anchors_module):
     assert anchors_module._normalize_phone("1-312-555-0199") == "3125550199"
     assert anchors_module._normalize_phone("312") is None
     assert anchors_module._normalize_phone("") is None
+
+
+def test_stable_hrsa_site_id_prefers_location_identifier(anchors_module):
+    row = {
+        "BHCMIS Organization Identification Number": "ORG-1",
+        "Health Center Number": "HC-22",
+        "Health Center Location Identification Number": " 12345 ",
+        "Site Name": "First Name",
+        "Site Address": "10 Main St",
+        "Site City": "Boston",
+        "Site State Abbreviation": "MA",
+        "Site Postal Code": "02108",
+    }
+    changed_display_row = {
+        **row,
+        "Site Name": "Changed Name",
+        "Site Address": "Changed Address",
+    }
+
+    assert anchors_module._stable_hrsa_site_id(row) == anchors_module._stable_hrsa_site_id(changed_display_row)
+    assert anchors_module._stable_hrsa_site_id(row) != anchors_module._stable_hrsa_site_id(
+        {**row, "Health Center Location Identification Number": "12346"}
+    )
+    assert anchors_module._stable_hrsa_site_id(row) != anchors_module._stable_hrsa_site_id(
+        {**row, "BHCMIS Organization Identification Number": "ORG-2"}
+    )
+
+
+def test_stable_hrsa_site_id_falls_back_to_normalized_source_fields(anchors_module):
+    row = {
+        "BHCMIS Organization Identification Number": "ORG-1",
+        "Health Center Number": "HC-22",
+        "Site Name": "North Clinic",
+        "Site Address": "10 Main St.",
+        "Site City": "Boston",
+        "Site State Abbreviation": "MA",
+        "Site Postal Code": "02108-1234",
+    }
+    equivalent_row = {
+        "BHCMIS Organization Identification Number": "org 1",
+        "Health Center Number": "HC22",
+        "Site Name": " north clinic ",
+        "Site Address": "10 MAIN ST",
+        "Site City": "BOSTON",
+        "Site State Abbreviation": "ma",
+        "Site Postal Code": "02108",
+    }
+
+    assert anchors_module._stable_hrsa_site_id(row) == anchors_module._stable_hrsa_site_id(equivalent_row)
+
+
+@pytest.mark.asyncio
+async def test_backfill_hospital_coordinates_uses_existing_live_table(monkeypatch, anchors_module):
+    calls = []
+
+    async def fake_table_has_column(schema, table, column):
+        calls.append(("has_column", schema, table, column))
+        return True
+
+    class FakeDb:
+        async def status(self, sql):
+            calls.append(("status", sql))
+            return 7
+
+    monkeypatch.setattr(anchors_module, "_table_has_column", fake_table_has_column)
+    monkeypatch.setattr(anchors_module, "db", FakeDb())
+
+    updated = await anchors_module._backfill_hospital_coordinates_from_existing_live(
+        "facility_anchor_20260615",
+        "mrf",
+    )
+
+    assert updated == 7
+    sql = calls[-1][1]
+    assert "UPDATE mrf.facility_anchor_20260615 AS stage" in sql
+    assert "FROM mrf.facility_anchor AS live" in sql
+    assert "live.id = stage.id" in sql
+    assert "stage.facility_type = 'Hospital'" in sql

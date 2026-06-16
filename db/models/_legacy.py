@@ -3935,9 +3935,86 @@ class FacilityAnchor(Base, JSONOutputMixin):
     telephone_number = Column(String(32))
     npi = Column(BigInteger)
     medicare_ccn = Column(String(32))
+    health_center_number = Column(String(64))
+    health_center_organization_id = Column(String(64))
+    bphc_assigned_number = Column(String(64))
+    health_center_name = Column(String(256))
+    health_center_organization_address_line1 = Column(String(256))
+    health_center_organization_city = Column(String(128))
+    health_center_organization_state = Column(String(2))
+    health_center_organization_zip_code = Column(String(16))
     source_dataset = Column(String(64), nullable=False)
     updated_at = Column(DateTime)
     address_key = Column(PG_UUID(as_uuid=True))
+
+
+class FacilityAnchorNPIOverride(Base, JSONOutputMixin):
+    __tablename__ = "facility_anchor_npi_override"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("facility_anchor_id", "npi"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["facility_anchor_id", "npi"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("status",), "name": "status"},
+        {"index_elements": ("npi",), "name": "npi"},
+        {"index_elements": ("updated_at",), "name": "updated_at"},
+    ]
+
+    facility_anchor_id = Column(String(128), nullable=False)
+    npi = Column(BigInteger, nullable=False)
+    status = Column(String(32), nullable=False, default="approved", server_default="approved")
+    confidence = Column(Float)
+    method = Column(String(64))
+    source = Column(String(128))
+    evidence = Column(JSON)
+    reviewed_by = Column(String(128))
+    reviewed_at = Column(DateTime)
+    updated_at = Column(DateTime)
+
+
+class FacilityAnchorNPICandidate(Base, JSONOutputMixin):
+    __tablename__ = "facility_anchor_npi_candidate"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("candidate_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["candidate_id"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("facility_anchor_id",), "name": "facility_anchor"},
+        {"index_elements": ("location_key",), "name": "location_key"},
+        {"index_elements": ("candidate_npi",), "name": "candidate_npi", "where": "candidate_npi IS NOT NULL"},
+        {"index_elements": ("candidate_status",), "name": "candidate_status"},
+        {"index_elements": ("review_status",), "name": "review_status"},
+        {"index_elements": ("source_run_id",), "name": "source_run_id"},
+    ]
+
+    candidate_id = Column(String(64), nullable=False)
+    location_key = Column(String(64), nullable=False)
+    address_key = Column(PG_UUID(as_uuid=True))
+    facility_anchor_id = Column(String(128), nullable=False)
+    facility_type = Column(String(64))
+    entity_name = Column(String(256))
+    first_line = Column(String(256))
+    city_name = Column(String(128))
+    state_name = Column(String(2))
+    postal_code = Column(String(16))
+    telephone_number = Column(String(32))
+    candidate_npi = Column(BigInteger)
+    candidate_method = Column(String(64))
+    candidate_priority = Column(Integer)
+    candidate_rank = Column(Integer, nullable=False, default=1, server_default="1")
+    candidate_count = Column(Integer, nullable=False, default=0, server_default="0")
+    candidate_status = Column(String(32), nullable=False, default="needs_review", server_default="needs_review")
+    review_status = Column(String(32), nullable=False, default="needs_review", server_default="needs_review")
+    match_confidence = Column(Float)
+    evidence = Column(JSON)
+    reviewed_by = Column(String(128))
+    reviewed_at = Column(DateTime)
+    source_run_id = Column(String(32), nullable=False)
+    updated_at = Column(DateTime)
 
 
 class EntityAddressUnified(Base, JSONOutputMixin):

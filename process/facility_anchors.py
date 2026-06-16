@@ -65,6 +65,33 @@ def _normalize_phone(raw: str | None) -> str | None:
     return digits if len(digits) == 10 else None
 
 
+def _normalize_identity_part(raw: str | None) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(raw or "").strip().lower())
+
+
+def _stable_hrsa_site_id(row: dict) -> str:
+    source_location_id = _normalize_identity_part(row.get("Health Center Location Identification Number"))
+    organization_parts = [
+        _normalize_identity_part(row.get("BHCMIS Organization Identification Number")),
+        _normalize_identity_part(row.get("Health Center Number")),
+        _normalize_identity_part(row.get("BPHC Assigned Number")),
+    ]
+    if source_location_id and any(organization_parts):
+        identity = ":".join(["hrsa-location", *organization_parts, source_location_id])
+    else:
+        identity_parts = [
+            "hrsa-site",
+            *organization_parts,
+            _normalize_identity_part(row.get("Site Name")),
+            _normalize_identity_part(row.get("Site Address")),
+            _normalize_identity_part(row.get("Site City")),
+            _normalize_identity_part(row.get("Site State Abbreviation")),
+            _normalize_zip(row.get("Site Postal Code")),
+        ]
+        identity = ":".join(part for part in identity_parts if part)
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"healthporta:facility-anchor:{identity}"))
+
+
 def _validate_schema_name(schema: str) -> str:
     cleaned = (schema or "").strip()
     if not cleaned or not (cleaned[0].isalpha() or cleaned[0] == "_"):
@@ -202,6 +229,33 @@ async def _refresh_archive_geocodes_from_facility_anchors(stage_table: str, db_s
     )
 
 
+async def _backfill_hospital_coordinates_from_existing_live(stage_table: str, db_schema: str) -> int:
+    db_schema = _validate_schema_name(db_schema)
+    if stage_table == FacilityAnchor.__main_table__:
+        return 0
+    if not await _table_has_column(db_schema, FacilityAnchor.__main_table__, "latitude"):
+        return 0
+
+    return int(
+        await db.status(
+            f"""
+            UPDATE {db_schema}.{stage_table} AS stage
+               SET latitude = live.latitude,
+                   longitude = live.longitude
+              FROM {db_schema}.{FacilityAnchor.__main_table__} AS live
+             WHERE stage.facility_type = 'Hospital'
+               AND live.id = stage.id
+               AND live.facility_type = 'Hospital'
+               AND stage.latitude IS NULL
+               AND stage.longitude IS NULL
+               AND live.latitude IS NOT NULL
+               AND live.longitude IS NOT NULL;
+            """
+        )
+        or 0
+    )
+
+
 async def _create_stage_indexes(stage_cls, db_schema: str) -> None:
     if hasattr(stage_cls, "__my_index_elements__") and stage_cls.__my_index_elements__:
         await db.status(
@@ -278,7 +332,7 @@ async def _fetch_and_parse_hrsa(client, stage_cls, batch_size: int, test_mode: b
                 continue
 
             batch.append({
-                "id": str(uuid.uuid4()),
+                "id": _stable_hrsa_site_id(row),
                 "name": site_name,
                 "facility_type": "FQHC",
                 "address_line1": row.get("Site Address"),
@@ -290,6 +344,18 @@ async def _fetch_and_parse_hrsa(client, stage_cls, batch_size: int, test_mode: b
                 "telephone_number": _normalize_phone(row.get("Site Telephone Number")),
                 "npi": _normalize_npi(row.get("FQHC Site NPI Number")),
                 "medicare_ccn": _normalize_medicare_ccn(row.get("FQHC Site Medicare Billing Number")),
+                "health_center_number": _normalize_medicare_ccn(row.get("Health Center Number")),
+                "health_center_organization_id": _normalize_medicare_ccn(
+                    row.get("BHCMIS Organization Identification Number")
+                ),
+                "bphc_assigned_number": _normalize_medicare_ccn(row.get("BPHC Assigned Number")),
+                "health_center_name": row.get("Health Center Name"),
+                "health_center_organization_address_line1": row.get("Health Center Organization Street Address"),
+                "health_center_organization_city": row.get("Health Center Organization City"),
+                "health_center_organization_state": row.get("Health Center Organization State"),
+                "health_center_organization_zip_code": str(
+                    row.get("Health Center Organization ZIP Code") or ""
+                )[:5],
                 "source_dataset": "HRSA_HEALTH_CENTER_SITES",
                 "updated_at": now,
             })
@@ -496,6 +562,16 @@ async def shutdown(ctx):
 
     db_schema = os.getenv("HLTHPRT_DB_SCHEMA") if os.getenv("HLTHPRT_DB_SCHEMA") else "mrf"
     stage_cls = make_class(FacilityAnchor, import_date)
+
+    backfilled_hospital_coords = await _backfill_hospital_coordinates_from_existing_live(
+        stage_cls.__tablename__,
+        db_schema,
+    )
+    if backfilled_hospital_coords:
+        logger.info(
+            "Facility Anchors backfilled %d hospital coordinate row(s) from previous live table.",
+            backfilled_hospital_coords,
+        )
 
     stage_rows = int(await db.scalar(
         f"SELECT COUNT(*) FROM {db_schema}.{stage_cls.__tablename__};"
