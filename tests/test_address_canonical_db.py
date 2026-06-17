@@ -1115,6 +1115,7 @@ async def test_entity_address_unified_rebuild_includes_mrf_source_with_address_k
             long numeric,
             date_added date,
             place_id varchar,
+            address_key uuid,
             checksum bigint
         );
         """
@@ -1124,12 +1125,14 @@ async def test_entity_address_unified_rebuild_includes_mrf_source_with_address_k
         INSERT INTO {schema}.mrf_address (
             npi, type, first_line, second_line, city_name, state_name,
             postal_code, country_code, telephone_number, fax_number,
-            formatted_address, lat, long, date_added, place_id, checksum
+            formatted_address, lat, long, date_added, place_id, address_key, checksum
         )
         VALUES (
             1234567890, 'practice', '10 Market Street', 'Suite 5',
             'Boston', 'MA', '02108', 'US', '6175550101', NULL, NULL,
-            NULL, NULL, CURRENT_DATE, NULL, 1001
+            NULL, NULL, CURRENT_DATE, NULL,
+            {schema}.addr_key_v1('10 Market Street', 'Suite 5', 'Boston', 'MA', '02108', 'US'),
+            1001
         );
         """
     )
@@ -1169,7 +1172,9 @@ async def test_entity_address_unified_rebuild_includes_mrf_source_with_address_k
     assert row["type"] == "practice"
     assert row["first_line"] == "10 Market Street"
     assert row["city_name"] == "Boston"
-    assert row["address_key"]
+    assert row["address_key"] == str(
+        address_canon.address_key_v1("10 Market Street", "Suite 5", "Boston", "MA", "02108", "US")
+    )
 
 
 @pytest.mark.asyncio(loop_scope="module")
