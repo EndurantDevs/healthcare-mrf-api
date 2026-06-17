@@ -156,7 +156,11 @@ class PTG:  # pylint: disable=too-few-public-methods
     functions = [ptg_control_start]
     on_startup = db_startup
     max_jobs = int(os.environ.get("HLTHPRT_MAX_PTG_JOBS")) if os.environ.get("HLTHPRT_MAX_PTG_JOBS") else 1
-    queue_read_limit = max_jobs
+    queue_read_limit = (
+        int(os.environ.get("HLTHPRT_PTG_QUEUE_READ_LIMIT"))
+        if os.environ.get("HLTHPRT_PTG_QUEUE_READ_LIMIT")
+        else max(16, 4 * max_jobs)
+    )
     job_timeout = int(os.environ.get("HLTHPRT_PTG_JOB_TIMEOUT")) if os.environ.get("HLTHPRT_PTG_JOB_TIMEOUT") else 172800
     burst = True
     queue_name = "arq:PTG"

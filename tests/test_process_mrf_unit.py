@@ -76,6 +76,34 @@ def test_mrf_queue_read_limit_can_be_configured(monkeypatch):
         importlib.reload(process_pkg)
 
 
+def test_ptg_queue_read_limit_defaults_wide_enough_for_parallel_burst_workers(monkeypatch):
+    monkeypatch.delenv("HLTHPRT_MAX_PTG_JOBS", raising=False)
+    monkeypatch.delenv("HLTHPRT_PTG_QUEUE_READ_LIMIT", raising=False)
+
+    reloaded = importlib.reload(process_pkg)
+
+    try:
+        assert reloaded.PTG.max_jobs == 1
+        assert reloaded.PTG.queue_read_limit == 16
+    finally:
+        importlib.reload(process_pkg)
+
+
+def test_ptg_queue_read_limit_can_be_configured(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_MAX_PTG_JOBS", "2")
+    monkeypatch.setenv("HLTHPRT_PTG_QUEUE_READ_LIMIT", "64")
+
+    reloaded = importlib.reload(process_pkg)
+
+    try:
+        assert reloaded.PTG.max_jobs == 2
+        assert reloaded.PTG.queue_read_limit == 64
+    finally:
+        monkeypatch.delenv("HLTHPRT_MAX_PTG_JOBS", raising=False)
+        monkeypatch.delenv("HLTHPRT_PTG_QUEUE_READ_LIMIT", raising=False)
+        importlib.reload(process_pkg)
+
+
 def test_mrf_finish_worker_configuration():
     names = [fn.__name__ for fn in process_pkg.MRF_finish.functions]
     assert names == ["shutdown"]
