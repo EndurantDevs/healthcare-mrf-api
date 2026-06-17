@@ -1,3 +1,11 @@
-/venv/*
-/venv*
+.git
+.DS_Store
+.coverage
 .env
+.pytest_cache
+__pycache__
+logs
+reports
+venv
+venv*
+support/ptg2_scanner/target

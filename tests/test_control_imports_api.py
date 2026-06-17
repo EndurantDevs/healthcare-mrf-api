@@ -900,6 +900,83 @@ async def test_create_import_run_returns_active_same_importer_run(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_create_import_run_allows_parallel_source_file_ptg(monkeypatch):
+    statements = []
+    importer_checks = []
+
+    class FakeDb:
+        async def execute(self, statement):
+            statements.append(statement)
+
+    async def fake_find_idem(_idempotency_key):
+        return None
+
+    async def fail_find_importer(importer):
+        importer_checks.append(importer)
+        raise AssertionError("source-file PTG runs should not use the importer-wide singleton")
+
+    async def fake_enqueue(row):
+        return {
+            "status": "queued",
+            "phase_detail": "enqueued",
+            "heartbeat_at": row["heartbeat_at"],
+            "progress": {"message": "queued"},
+            "metrics": {"enqueue_adapter": "arq_single_job", "queue": "arq:PTG"},
+            "error": None,
+        }
+
+    monkeypatch.setattr(control_imports, "db", FakeDb())
+    monkeypatch.setattr(control_imports, "find_active_run_by_idempotency_key", fake_find_idem)
+    monkeypatch.setattr(control_imports, "find_active_run_by_importer", fail_find_importer)
+    monkeypatch.setattr(control_imports, "_enqueue_import_start", fake_enqueue)
+
+    row, created = await create_import_run(
+        {
+            "run_id": "run_ptg_source_file",
+            "importer": "ptg",
+            "idempotency_key": "source-file-1",
+            "source_file_import_id": "source-file-1",
+        }
+    )
+
+    assert created is True
+    assert row["run_id"] == "run_ptg_source_file"
+    assert row["metrics"]["queue"] == "arq:PTG"
+    assert row["source_file_import_id"] == "source-file-1"
+    assert importer_checks == []
+    assert len(statements) == 2
+
+
+@pytest.mark.asyncio
+async def test_create_import_run_serializes_unsourced_ptg(monkeypatch):
+    active = {"run_id": "run_active_ptg", "status": "running", "importer": "ptg"}
+
+    async def fake_find_idem(_idempotency_key):
+        return None
+
+    async def fake_find_importer(_importer):
+        return active
+
+    async def fail_enqueue(_row):
+        raise AssertionError("enqueue should not run for unsourced PTG while PTG is active")
+
+    monkeypatch.setattr(control_imports, "find_active_run_by_idempotency_key", fake_find_idem)
+    monkeypatch.setattr(control_imports, "find_active_run_by_importer", fake_find_importer)
+    monkeypatch.setattr(control_imports, "_enqueue_import_start", fail_enqueue)
+
+    row, created = await create_import_run(
+        {
+            "run_id": "run_duplicate_ptg",
+            "importer": "ptg",
+            "idempotency_key": "manual-ptg",
+        }
+    )
+
+    assert created is False
+    assert row == active
+
+
+@pytest.mark.asyncio
 async def test_request_cancel_finishes_pending_adapter_run(monkeypatch):
     calls = {"get": 0}
     current = {

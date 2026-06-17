@@ -707,6 +707,17 @@ async def find_active_run_by_importer(importer: str) -> dict[str, Any] | None:
     return normalize_run(row) if row else None
 
 
+def _allows_parallel_active_importer_runs(
+    importer: str,
+    payload: dict[str, Any],
+    idempotency_key: str | None,
+) -> bool:
+    if importer != "ptg":
+        return False
+    source_file_import_id = str(payload.get("source_file_import_id") or "").strip()
+    return bool(source_file_import_id and idempotency_key)
+
+
 async def create_import_run(payload: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     importer = str(payload.get("importer") or "").strip()
     if importer not in importer_names():
@@ -717,9 +728,10 @@ async def create_import_run(payload: dict[str, Any]) -> tuple[dict[str, Any], bo
         active = await find_active_run_by_idempotency_key(idempotency_key)
         if active:
             return active, False
-    active_importer = await find_active_run_by_importer(importer)
-    if active_importer:
-        return active_importer, False
+    if not _allows_parallel_active_importer_runs(importer, payload, idempotency_key):
+        active_importer = await find_active_run_by_importer(importer)
+        if active_importer:
+            return active_importer, False
 
     now = utc_now()
     run_id = str(payload.get("run_id") or "").strip() or _new_run_id()
