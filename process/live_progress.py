@@ -32,6 +32,19 @@ IMPORT_LIVE_PROGRESS_STALE_SECONDS = int(
 
 _context: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar("import_live_progress_context", default={})
 _redis_client: redis.Redis | None = None
+_HEARTBEAT_SOURCE = "import-control-heartbeat"
+_PROGRESS_FIELDS = (
+    "unit",
+    "done",
+    "total",
+    "pct",
+    "message",
+    "phase",
+    "step",
+    "label",
+    "eta_seconds",
+    "estimated_finish_at",
+)
 
 
 def live_progress_key(run_id: str) -> str:
@@ -69,18 +82,18 @@ def write_live_progress(**payload: Any) -> None:
         **{key: value for key, value in payload.items() if value is not None},
     }
     publish_event = bool(merged.pop("publish_event", True))
-    if _should_merge_previous(merged):
-        previous = _read_live_progress_payload(run_id)
-        if previous:
-            for key in ("importer", "source", "confidence"):
-                if not merged.get(key) or merged.get(key) == "unknown":
-                    merged[key] = previous.get(key) or merged.get(key)
-            previous_started_at = _parse_datetime(previous.get("started_at"))
-            current_started_at = _parse_datetime(merged.get("started_at"))
-            if previous_started_at is not None and (
-                current_started_at is None or previous_started_at <= current_started_at
-            ):
-                merged["started_at"] = previous.get("started_at")
+    previous = _read_live_progress_payload(run_id) if _should_merge_previous(merged) else None
+    if previous:
+        _preserve_progress_for_heartbeat(merged, previous, now=now)
+        for key in ("importer", "source", "confidence"):
+            if not merged.get(key) or merged.get(key) == "unknown":
+                merged[key] = previous.get(key) or merged.get(key)
+        previous_started_at = _parse_datetime(previous.get("started_at"))
+        current_started_at = _parse_datetime(merged.get("started_at"))
+        if previous_started_at is not None and (
+            current_started_at is None or previous_started_at <= current_started_at
+        ):
+            merged["started_at"] = previous.get("started_at")
     status = str(merged.get("status") or "").lower()
     terminal = status in {"succeeded", "failed", "canceled", "cancelled", "dead_letter"}
     _normalize_progress_fields(merged, terminal=terminal)
@@ -208,6 +221,29 @@ def _should_merge_previous(merged: dict[str, Any]) -> bool:
     if not merged.get("started_at") and merged.get("done") is not None and merged.get("total") is not None:
         return True
     return str(merged.get("importer") or "") == "unknown"
+
+
+def _preserve_progress_for_heartbeat(
+    merged: dict[str, Any],
+    previous: dict[str, Any],
+    *,
+    now: dt.datetime,
+) -> None:
+    if str(merged.get("source") or "") != _HEARTBEAT_SOURCE:
+        return
+    if str(previous.get("source") or "") in {"", _HEARTBEAT_SOURCE}:
+        return
+    previous_updated_at = _parse_datetime(previous.get("updated_at"))
+    if previous_updated_at is not None:
+        age_seconds = (now - previous_updated_at).total_seconds()
+        if age_seconds > max(IMPORT_LIVE_PROGRESS_STALE_SECONDS, 1):
+            return
+    for key in _PROGRESS_FIELDS:
+        if previous.get(key) is not None:
+            merged[key] = previous[key]
+    for key in ("source", "confidence"):
+        if previous.get(key):
+            merged[key] = previous[key]
 
 
 def _normalize_estimate_fields(merged: dict[str, Any], *, now: dt.datetime, terminal: bool) -> None:

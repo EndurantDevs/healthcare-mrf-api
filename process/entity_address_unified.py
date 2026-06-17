@@ -8,6 +8,7 @@ import datetime
 import hashlib
 import logging
 import os
+import re
 from typing import Iterable
 
 from arq import create_pool
@@ -3750,8 +3751,9 @@ async def _populate_support_stage_tables(
     raw_table: str | None = None,
     build_network_bridge: bool = True,
     available: dict[str, bool] | None = None,
+    run_id: str | None = None,
 ) -> dict[str, int]:
-    for statement in _support_stage_sql(
+    statements = _support_stage_sql(
         db_schema,
         stage_table,
         stage_classes,
@@ -3760,8 +3762,35 @@ async def _populate_support_stage_tables(
         raw_table=raw_table,
         build_network_bridge=build_network_bridge,
         available=available,
-    ):
+    )
+    total_steps = len(statements)
+    for index, statement in enumerate(statements, start=1):
+        if run_id:
+            label = _support_stage_progress_label(statement)
+            enqueue_live_progress(
+                run_id=run_id,
+                importer="entity-address-unified",
+                status="running",
+                phase=f"entity-address-unified building {label}",
+                unit="steps",
+                done=index - 1,
+                total=total_steps,
+                pct=95 + ((index - 1) / max(total_steps, 1)) * 4,
+                message=f"building support table {index}/{total_steps}: {label}",
+            )
         await db.status(statement)
+        if run_id:
+            enqueue_live_progress(
+                run_id=run_id,
+                importer="entity-address-unified",
+                status="running",
+                phase=f"entity-address-unified built {label}",
+                unit="steps",
+                done=index,
+                total=total_steps,
+                pct=95 + (index / max(total_steps, 1)) * 4,
+                message=f"built support table {index}/{total_steps}: {label}",
+            )
     counts: dict[str, int] = {}
     for model, stage_cls in stage_classes.items():
         counts[model.__tablename__] = int(
@@ -3769,6 +3798,22 @@ async def _populate_support_stage_tables(
             or 0
         )
     return counts
+
+
+def _support_stage_progress_label(statement: str) -> str:
+    normalized = " ".join(statement.split())
+    match = re.search(
+        r"\b(?:INSERT\s+INTO|TRUNCATE\s+TABLE)\s+"
+        r"(?:[A-Za-z_][A-Za-z0-9_]*\.)?([A-Za-z0-9_]+)",
+        normalized,
+        re.IGNORECASE,
+    )
+    if not match:
+        return "support tables"
+    table = re.sub(r"_\d{8}$", "", match.group(1))
+    if table.startswith("entity_address_"):
+        table = table[len("entity_address_") :]
+    return table.replace("_", " ")
 
 
 def _inference_sql(
@@ -6299,6 +6344,7 @@ async def process_data(ctx, task=None):
             raw_table=raw_table,
             build_network_bridge=build_network_bridge,
             available=available,
+            run_id=run_id,
         )
         context["support_stage_populated"] = True
         context["support_counts"] = support_counts

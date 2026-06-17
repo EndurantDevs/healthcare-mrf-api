@@ -184,6 +184,58 @@ def test_live_progress_preserves_earliest_started_at(monkeypatch):
     assert payload["started_at"] == previous["started_at"]
 
 
+def test_live_progress_heartbeat_preserves_recent_importer_progress(monkeypatch):
+    store = {}
+
+    class FakeRedis:
+        def get(self, key):
+            return store.get(key)
+
+        def setex(self, key, _ttl, value):
+            store[key] = value
+
+    monkeypatch.setattr(live_progress, "_redis", lambda: FakeRedis())
+    monkeypatch.setattr(live_progress, "enqueue_status_event", lambda _event: None)
+
+    live_progress.write_live_progress(
+        run_id="run_any",
+        importer="entity-address-unified",
+        status="running",
+        phase="entity-address-unified building medication bridge",
+        unit="steps",
+        done=5,
+        total=7,
+        pct=97,
+        message="building support table 5/7: medication bridge",
+        source="import-live-progress",
+        confidence="live",
+    )
+    live_progress.write_live_progress(
+        run_id="run_any",
+        importer="entity-address-unified",
+        status="running",
+        phase="process_data running",
+        unit="run",
+        done=0,
+        total=1,
+        pct=0,
+        message="running",
+        started_at="2026-06-03T12:00:00Z",
+        source="import-control-heartbeat",
+        confidence="heartbeat",
+    )
+
+    payload = json.loads(store["import:progress:run_any"])
+    assert payload["phase"] == "entity-address-unified building medication bridge"
+    assert payload["message"] == "building support table 5/7: medication bridge"
+    assert payload["unit"] == "steps"
+    assert payload["done"] == 5
+    assert payload["total"] == 7
+    assert payload["pct"] == 97
+    assert payload["source"] == "import-live-progress"
+    assert payload["confidence"] == "live"
+
+
 def test_artifact_split_keeps_facade_helpers_stable():
     assert process_ptg.PTG2ArtifactStore is ptg_artifacts.PTG2ArtifactStore
     assert process_ptg.sha256_file is ptg_artifacts.sha256_file
