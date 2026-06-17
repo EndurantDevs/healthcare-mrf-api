@@ -1333,14 +1333,18 @@ def _prepare_raw_stage_sql(db_schema: str, raw_table: str, *, unlogged: bool = T
     """
 
 
-def _address_key_expr(db_schema: str, available: bool) -> str:
+def _address_key_expr(db_schema: str, available: bool, *, address_source: str | None = None) -> str:
     if available:
-        return (
+        fallback = (
             f"{db_schema}.addr_key_v1("
             "first_line, second_line, city_name, state_name, postal_code, country_code"
             ")"
         )
-    return "NULL::uuid"
+    else:
+        fallback = "NULL::uuid"
+    if address_source:
+        return f"CASE WHEN {address_source} = 'ptg' THEN NULL::uuid ELSE {fallback} END"
+    return fallback
 
 
 def _enrich_raw_stage_sql(
@@ -1773,7 +1777,10 @@ def _insert_raw_from_source_sql(
             address_source::varchar AS address_source,
             source_record_id::varchar AS source_record_id,
             updated_at::timestamp AS updated_at,
-            COALESCE(address_key::uuid, {_address_key_expr(db_schema, address_canon_available)}) AS address_key
+            COALESCE(
+                address_key::uuid,
+                {_address_key_expr(db_schema, address_canon_available, address_source="address_source")}
+            ) AS address_key
           FROM base_rows
     ),
     normalized AS (
@@ -2159,7 +2166,10 @@ def _materialize_sql(
             address_source::varchar AS address_source,
             source_record_id::varchar AS source_record_id,
             updated_at::timestamp AS updated_at,
-            COALESCE(address_key::uuid, {_address_key_expr(db_schema, address_canon_available)}) AS address_key
+            COALESCE(
+                address_key::uuid,
+                {_address_key_expr(db_schema, address_canon_available, address_source="address_source")}
+            ) AS address_key
           FROM base_rows
     ),
     normalized AS (

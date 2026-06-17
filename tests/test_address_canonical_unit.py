@@ -798,9 +798,11 @@ def test_entity_address_unified_sql_carries_address_key(monkeypatch):
     assert "long = COALESCE(k.archive_long, r.long)" in enrich_sql
     assert "place_id = COALESCE(k.archive_place_id, r.place_id)" in enrich_sql
     assert "location_key = encode(sha256(convert_to" in enrich_sql
+    assert "COALESCE(" in insert_sql
+    assert "address_key::uuid," in insert_sql
     assert (
-        "COALESCE(address_key::uuid, "
-        "mrf.addr_key_v1(first_line, second_line, city_name, state_name, postal_code, country_code)) AS address_key"
+        "CASE WHEN address_source = 'ptg' THEN NULL::uuid ELSE "
+        "mrf.addr_key_v1(first_line, second_line, city_name, state_name, postal_code, country_code) END"
     ) in insert_sql
     assert "ptg_plan_array," in insert_sql
     assert "COALESCE(ptg_plan_array, ARRAY[]::varchar[])::varchar[] AS ptg_plan_array" in insert_sql
@@ -1459,8 +1461,8 @@ def test_entity_address_unified_sql_falls_back_without_canonical_functions():
         address_canon_available=False,
     )
 
-    assert "COALESCE(address_key::uuid, NULL::uuid) AS address_key" in insert_sql
-    assert "COALESCE(address_key::uuid, NULL::uuid) AS address_key" in direct_sql
+    assert "CASE WHEN address_source = 'ptg' THEN NULL::uuid ELSE NULL::uuid END" in insert_sql
+    assert "CASE WHEN address_source = 'ptg' THEN NULL::uuid ELSE NULL::uuid END" in direct_sql
     assert "addr_key_v1" not in insert_sql
     assert "addr_key_v1" not in direct_sql
     assert "ARRAY_AGG(lat ORDER BY (lat IS NULL), source_priority ASC" in direct_sql
