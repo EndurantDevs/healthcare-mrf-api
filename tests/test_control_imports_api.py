@@ -84,6 +84,34 @@ def test_importer_registry_exposes_ptg_and_finish_lifecycle():
     assert any(param["name"] == "sample_limit" and param["type"] == "integer" for param in items["address-archive-v2-migrate"]["params_schema"])
 
 
+def test_control_wrapped_publish_importers_request_shutdown():
+    facility_payload = control_imports._adapter_payload(
+        control_imports._SINGLE_JOB_ADAPTERS["facility-anchors"],
+        {"run_id": "run_facility", "importer": "facility-anchors", "family": "other"},
+        {},
+    )
+    entity_payload = control_imports._adapter_payload(
+        control_imports._SINGLE_JOB_ADAPTERS["entity-address-unified"],
+        {"run_id": "run_entity", "importer": "entity-address-unified", "family": "provider"},
+        {},
+    )
+    npi_payload = control_imports._adapter_payload(
+        control_imports._SINGLE_JOB_ADAPTERS["npi"],
+        {"run_id": "run_npi", "importer": "npi", "family": "provider"},
+        {},
+    )
+    openaddresses_payload = control_imports._adapter_payload(
+        control_imports._SINGLE_JOB_ADAPTERS["openaddresses"],
+        {"run_id": "run_openaddresses", "importer": "openaddresses", "family": "provider"},
+        {},
+    )
+
+    assert facility_payload["run_shutdown"] is True
+    assert entity_payload["run_shutdown"] is True
+    assert openaddresses_payload["run_shutdown"] is True
+    assert npi_payload["run_shutdown"] is False
+
+
 @pytest.mark.asyncio
 async def test_node_health_reports_degraded_when_redis_fails(monkeypatch):
     async def fake_database_check():

@@ -7,6 +7,7 @@ from db.maintenance import (
     _normalize_index_columns,
     _should_manage_table_schema,
 )
+from sqlalchemy import Column, MetaData, String, Table
 
 
 class _DummyModel:
@@ -14,6 +15,16 @@ class _DummyModel:
     __my_additional_indexes__ = [
         {"index_elements": ("checksum_network"), "using": "gin"},
     ]
+
+
+class _PrimaryKeyModel:
+    __tablename__ = "openaddresses_geocode"
+    __table__ = Table(
+        __tablename__,
+        MetaData(),
+        Column("row_hash", String, primary_key=True),
+    )
+    __my_index_elements__ = ["row_hash"]
 
 
 def test_normalize_index_columns_handles_single_string() -> None:
@@ -25,6 +36,10 @@ def test_iter_index_specs_normalizes_single_string_tuple_bug() -> None:
     assert len(specs) == 1
     assert specs[0]["name"] == "plan_networktier_checksum_network_idx"
     assert specs[0]["columns"] == ("checksum_network",)
+
+
+def test_iter_index_specs_skips_duplicate_primary_key_index() -> None:
+    assert list(_iter_index_specs(_PrimaryKeyModel)) == []
 
 
 def test_build_index_sql_does_not_split_column_name_into_characters() -> None:

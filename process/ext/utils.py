@@ -9,6 +9,7 @@ import ssl
 import time
 from pathlib import Path, PurePath
 from random import choice
+from urllib.parse import urlparse
 
 import aiohttp
 import humanize
@@ -33,6 +34,7 @@ PARALLEL_DOWNLOAD_THRESHOLD_BYTES = int(
     os.getenv("HLTHPRT_PARALLEL_DOWNLOAD_THRESHOLD_BYTES", str(100 * 1024 * 1024))
 )
 PARALLEL_DOWNLOAD_WORKERS = max(int(os.getenv("HLTHPRT_PARALLEL_DOWNLOAD_WORKERS", "8")), 2)
+DEFAULT_PARALLEL_DOWNLOAD_DISABLED_HOSTS = "www22.elevancehealth.com"
 
 
 def _parse_size_bytes(raw_value: str, default_bytes: int) -> int:
@@ -149,7 +151,11 @@ async def _determine_request_timeout(client: aiohttp.ClientSession, url: str, ch
 async def _head_download_info(
     client: aiohttp.ClientSession, url: str
 ) -> tuple[int | None, bool]:
+    range_disabled = _parallel_download_disabled_for_url(url)
+
     async def _probe_total_via_range() -> int | None:
+        if range_disabled:
+            return None
         try:
             probe_headers = {
                 "Range": "bytes=0-0",
@@ -184,6 +190,8 @@ async def _head_download_info(
                     size_bytes = int(content_length)
                 except ValueError:
                     size_bytes = None
+            if range_disabled:
+                return size_bytes, False
             supports_ranges = "bytes" in accept_ranges
             if supports_ranges and (not size_bytes or size_bytes < 1024):
                 probed_total = await _probe_total_via_range()
@@ -193,6 +201,26 @@ async def _head_download_info(
     except (aiohttp.ClientError, asyncio.TimeoutError):
         probed_total = await _probe_total_via_range()
         return probed_total, bool(probed_total)
+
+
+def _parallel_download_disabled_for_url(url: str) -> bool:
+    raw_hosts = os.getenv(
+        "HLTHPRT_PARALLEL_DOWNLOAD_DISABLED_HOSTS",
+        DEFAULT_PARALLEL_DOWNLOAD_DISABLED_HOSTS,
+    )
+    disabled_hosts = {
+        host.strip().lower()
+        for host in raw_hosts.split(",")
+        if host.strip()
+    }
+    if not disabled_hosts:
+        return False
+    hostname = (urlparse(url).hostname or "").lower()
+    return any(
+        hostname == disabled
+        or (disabled.startswith(".") and hostname.endswith(disabled))
+        for disabled in disabled_hosts
+    )
 
 
 async def _download_parallel_by_ranges(
@@ -683,6 +711,16 @@ def deduplicate_dicts(dict_list, key_fields):
     return list(seen.values())
 
 
+def order_dicts_by_fields(dict_list, key_fields):
+    def _stable_value(value):
+        return (value is None, type(value).__name__, repr(value))
+
+    return sorted(
+        dict_list,
+        key=lambda entry: tuple(_stable_value(entry.get(field)) for field in key_fields),
+    )
+
+
 async def push_objects(obj_list, cls, rewrite=False, _missing_table_attempt: int = 0, use_copy: bool = True):
     if obj_list:
         max_missing_table_retries = 5
@@ -806,6 +844,7 @@ async def push_objects(obj_list, cls, rewrite=False, _missing_table_attempt: int
             targets = _conflict_targets()
             if targets:
                 obj_list = deduplicate_dicts(obj_list, targets)
+                obj_list = order_dicts_by_fields(obj_list, targets)
 
             if use_copy:
                 try:
@@ -872,10 +911,13 @@ async def push_objects(obj_list, cls, rewrite=False, _missing_table_attempt: int
         #     obj_list = deduplicate_dicts(obj_list, cls.__my_index_elements__)
         
         if not use_copy:
+            conflict_targets = getattr(cls, "__my_index_elements__", None)
+            if conflict_targets:
+                obj_list = order_dicts_by_fields(obj_list, conflict_targets)
             for chunk in _chunk_records(obj_list):
                 stmt = db.insert(cls.__table__).values(chunk)
-                if hasattr(cls, "__my_index_elements__"):
-                    stmt = stmt.on_conflict_do_nothing(index_elements=cls.__my_index_elements__)
+                if conflict_targets:
+                    stmt = stmt.on_conflict_do_nothing(index_elements=conflict_targets)
                 try:
                     await _status_with_deadlock_retry(stmt)
                 except (UndefinedTableError, SQLAlchemyError, InterfaceError) as err:
@@ -915,10 +957,13 @@ async def push_objects(obj_list, cls, rewrite=False, _missing_table_attempt: int
         ) as err:
             print(f"copy_records_to_table fallback due to {_short_error(err)}")
 
+            conflict_targets = getattr(cls, "__my_index_elements__", None)
+            if conflict_targets:
+                obj_list = order_dicts_by_fields(obj_list, conflict_targets)
             for chunk in _chunk_records(obj_list):
                 stmt = db.insert(cls.__table__).values(chunk)
-                if hasattr(cls, "__my_index_elements__"):
-                    stmt = stmt.on_conflict_do_nothing(index_elements=cls.__my_index_elements__)
+                if conflict_targets:
+                    stmt = stmt.on_conflict_do_nothing(index_elements=conflict_targets)
                 try:
                     await _status_with_deadlock_retry(stmt)
                 except (SQLAlchemyError, InterfaceError) as chunk_err:
@@ -928,8 +973,8 @@ async def push_objects(obj_list, cls, rewrite=False, _missing_table_attempt: int
                     for obj in chunk:
                         try:
                             single_stmt = db.insert(cls.__table__).values(obj)
-                            if hasattr(cls, "__my_index_elements__"):
-                                single_stmt = single_stmt.on_conflict_do_nothing(index_elements=cls.__my_index_elements__)
+                            if conflict_targets:
+                                single_stmt = single_stmt.on_conflict_do_nothing(index_elements=conflict_targets)
                             await _status_with_deadlock_retry(single_stmt)
                         except (SQLAlchemyError, UniqueViolationError, InterfaceError) as single_err:
                             if _is_missing_table_error(single_err):

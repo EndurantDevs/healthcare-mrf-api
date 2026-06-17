@@ -70,6 +70,63 @@ def test_mrf_provider_staging_uses_bigint_for_npi_and_network_checksums():
             assert isinstance(model.__table__.c[column_name].type, BigInteger)
 
 
+def test_address_source_models_use_bigint_for_npi_identifiers():
+    expected_columns = {
+        NPIAddress: ("npi",),
+        MRFAddress: ("npi",),
+    }
+
+    for model, columns in expected_columns.items():
+        for column_name in columns:
+            assert isinstance(model.__table__.c[column_name].type, BigInteger)
+
+
+def test_mrf_address_npi_bigint_migration_targets_address_summaries_only():
+    migration_path = (
+        Path(__file__).resolve().parents[1]
+        / "alembic"
+        / "versions"
+        / "20260616123000_mrf_address_npi_bigint.py"
+    )
+    spec = importlib.util.spec_from_file_location("mrf_address_npi_bigint_migration", migration_path)
+    assert spec is not None and spec.loader is not None
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+
+    class FakeBind:
+        def __init__(self):
+            self.statement = None
+            self.params = None
+
+        def execute(self, statement, params):
+            self.statement = str(statement)
+            self.params = params
+            return [
+                ("mrf_address",),
+                ("mrf_address_20260616",),
+                ("npi_address",),
+                ("npi_address_20260616",),
+            ]
+
+    bind = FakeBind()
+
+    assert migration.down_revision == (
+        "20260616090000_openaddresses_geocode",
+        "20260616110000_facility_anchor_parent_npi_overrides",
+    )
+    assert migration._address_tables_with_narrow_npi(bind, "mrf") == [
+        "mrf_address",
+        "mrf_address_20260616",
+        "npi_address",
+        "npi_address_20260616",
+    ]
+    assert bind.params == {"schema": "mrf"}
+    assert "table_name LIKE 'mrf_address\\_%' ESCAPE '\\'" in bind.statement
+    assert "table_name NOT LIKE 'mrf_address_evidence%'" in bind.statement
+    assert "table_name LIKE 'npi_address\\_%' ESCAPE '\\'" in bind.statement
+    assert "data_type <> 'bigint'" in bind.statement
+
+
 def test_npi_source_models_use_bigint_for_npi_identifiers():
     expected_columns = {
         NPIData: ("npi", "replacement_npi"),

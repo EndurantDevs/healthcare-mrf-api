@@ -51,6 +51,7 @@ _START_WORKERS: tuple[WorkerSpec, ...] = (
     WorkerSpec("arq:EntityAddressUnified", "process.EntityAddressUnified", ("entity-address-unified",)),
     WorkerSpec("arq:PTGAddress", "process.PTGAddress", ("ptg-address",)),
     WorkerSpec("arq:AddressArchive", "process.AddressArchive", ("address-archive-v2-migrate",)),
+    WorkerSpec("arq:OpenAddresses", "process.OpenAddresses", ("openaddresses",)),
 )
 
 _FINISH_WORKERS: tuple[WorkerSpec, ...] = (

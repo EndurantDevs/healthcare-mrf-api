@@ -11,6 +11,7 @@ import os
 
 from asyncpg.exceptions import DeadlockDetectedError
 import pytest
+from sqlalchemy import BigInteger
 
 os.environ.setdefault("HLTHPRT_REDIS_ADDRESS", "redis://localhost")
 
@@ -51,6 +52,10 @@ def test_mrf_worker_configuration():
         "process_formulary",
     ]
     assert process_pkg.MRF.on_startup.__name__ == "startup"
+
+
+def test_mrf_address_npi_uses_bigint():
+    assert isinstance(process_initial.MRFAddress.__table__.c.npi.type, BigInteger)
 
 
 def test_mrf_queue_read_limit_can_be_configured(monkeypatch):
@@ -280,8 +285,9 @@ async def test_refresh_mrf_address_summary_sets_local_work_mem_and_analyzes(monk
 
     assert statements[0] == "SET LOCAL work_mem = '2GB';"
     assert statements[1] == "ANALYZE mrf.mrf_address_evidence_20260612;"
-    assert "UPDATE mrf.mrf_address_20260612 AS a" in statements[2]
+    assert "INSERT INTO mrf.mrf_address_20260612" in statements[2]
     assert "FROM mrf.mrf_address_evidence_20260612" in statements[2]
+    assert "ON CONFLICT (npi, type, checksum) DO UPDATE" in statements[2]
     assert len(statements) == 3
 
 
@@ -314,19 +320,20 @@ async def test_refresh_mrf_address_summary_defers_source_array_indexes(monkeypat
             return address_cls
         return evidence_cls
 
+    monkeypatch.setenv("HLTHPRT_MRF_ADDRESS_AGGREGATE_DURING_INGEST", "1")
     monkeypatch.delenv("HLTHPRT_MRF_ADDRESS_SUMMARY_DEFER_SOURCE_INDEXES", raising=False)
     monkeypatch.setattr(process_initial.db, "transaction", fake_transaction)
     monkeypatch.setattr(process_initial, "make_class", fake_make_class)
 
     await process_initial._refresh_mrf_address_summary("20260612", "mrf")
 
-    update_index = next(i for i, statement in enumerate(statements) if "UPDATE mrf.mrf_address_20260612 AS a" in statement)
+    upsert_index = next(i for i, statement in enumerate(statements) if "INSERT INTO mrf.mrf_address_20260612" in statement)
     assert statements[1:4] == [
         "DROP INDEX IF EXISTS mrf.mrf_address_20260612_idx_address_sources;",
         "DROP INDEX IF EXISTS mrf.mrf_address_20260612_idx_source_issuer_ids;",
         "DROP INDEX IF EXISTS mrf.mrf_address_20260612_idx_source_issuer_names;",
     ]
-    assert update_index == 5
+    assert upsert_index == 5
     assert statements[6:9] == [
         "CREATE INDEX IF NOT EXISTS mrf_address_20260612_idx_address_sources ON mrf.mrf_address_20260612 USING gin (address_sources);",
         "CREATE INDEX IF NOT EXISTS mrf_address_20260612_idx_source_issuer_ids ON mrf.mrf_address_20260612 USING gin (source_issuer_ids);",
@@ -334,6 +341,49 @@ async def test_refresh_mrf_address_summary_defers_source_array_indexes(monkeypat
     ]
     assert statements[9] == "ANALYZE mrf.mrf_address_20260612;"
     assert all("type_npi" not in statement for statement in statements)
+
+
+@pytest.mark.asyncio
+async def test_refresh_mrf_address_summary_defers_all_address_indexes_when_ingest_skips_aggregate(monkeypatch):
+    statements = []
+
+    class FakeSession:
+        async def execute(self, stmt, params=None):
+            statements.append(str(stmt))
+            return SimpleNamespace(rowcount=1)
+
+    @asynccontextmanager
+    async def fake_transaction():
+        yield FakeSession()
+
+    address_cls = SimpleNamespace(
+        __tablename__="mrf_address_20260612",
+        __my_initial_indexes__=[{"index_elements": ("checksum",)}],
+        __my_additional_indexes__=[
+            {"index_elements": ("type", "npi"), "name": "type_npi"},
+            {"index_elements": ("address_sources",), "using": "gin", "name": "address_sources"},
+        ],
+    )
+    evidence_cls = SimpleNamespace(__tablename__="mrf_address_evidence_20260612")
+
+    def fake_make_class(cls, suffix, schema_override=None):
+        if cls is process_initial.MRFAddress:
+            return address_cls
+        return evidence_cls
+
+    monkeypatch.delenv("HLTHPRT_MRF_ADDRESS_AGGREGATE_DURING_INGEST", raising=False)
+    monkeypatch.delenv("HLTHPRT_MRF_ADDRESS_SUMMARY_DEFER_SOURCE_INDEXES", raising=False)
+    monkeypatch.setattr(process_initial.db, "transaction", fake_transaction)
+    monkeypatch.setattr(process_initial, "make_class", fake_make_class)
+
+    await process_initial._refresh_mrf_address_summary("20260612", "mrf")
+
+    assert "DROP INDEX IF EXISTS mrf.mrf_address_20260612_idx_checksum;" in statements
+    assert "DROP INDEX IF EXISTS mrf.mrf_address_20260612_idx_type_npi;" in statements
+    assert "DROP INDEX IF EXISTS mrf.mrf_address_20260612_idx_address_sources;" in statements
+    upsert_index = next(i for i, statement in enumerate(statements) if "INSERT INTO mrf.mrf_address_20260612" in statement)
+    recreate_index = next(i for i, statement in enumerate(statements) if "CREATE INDEX IF NOT EXISTS mrf_address_20260612_idx_checksum" in statement)
+    assert upsert_index < recreate_index
 
 
 @pytest.mark.asyncio
@@ -362,7 +412,7 @@ async def test_refresh_mrf_address_summary_accepts_statement_timeout(monkeypatch
     assert statements[0] == "SET LOCAL work_mem = '1GB';"
     assert statements[1] == "SET LOCAL statement_timeout = '45min';"
     assert statements[2] == "ANALYZE mrf.mrf_address_evidence_20260612;"
-    assert "UPDATE mrf.mrf_address_20260612 AS a" in statements[3]
+    assert "INSERT INTO mrf.mrf_address_20260612" in statements[3]
 
 
 def test_postgres_setting_value_rejects_unsafe_env(monkeypatch):
@@ -757,6 +807,23 @@ async def test_push_objects_retries_deadlock_during_fallback_insert(monkeypatch)
     assert sleep_calls == [0.5]
 
 
+def test_parallel_download_disabled_host_matching(monkeypatch):
+    monkeypatch.setenv(
+        "HLTHPRT_PARALLEL_DOWNLOAD_DISABLED_HOSTS",
+        "www22.elevancehealth.com,.blocked.example",
+    )
+
+    assert utils_module._parallel_download_disabled_for_url(
+        "https://www22.elevancehealth.com/cms/PROVIDERS_TX_2_OF_2.json"
+    )
+    assert utils_module._parallel_download_disabled_for_url(
+        "https://files.blocked.example/provider.json"
+    )
+    assert not utils_module._parallel_download_disabled_for_url(
+        "https://www.example.com/provider.json"
+    )
+
+
 def test_extract_plan_years_from_years_array():
     payload = {"years": [2024, "2025", "2025.0", 2026.0, "bad", None]}
     assert process_initial._extract_plan_years(payload) == [2024, 2025, 2026]
@@ -869,12 +936,12 @@ def test_build_mrf_address_rows_creates_address_and_evidence():
     address_row = address_rows[0]
     assert address_row["npi"] == 1234567890
     assert address_row["type"] == "practice"
-    assert address_row["source_count"] == 2
-    assert address_row["address_sources"] == ["marketplace_provider"]
-    assert address_row["source_import_dates"] == [datetime.date(2026, 4, 2)]
-    assert address_row["source_issuer_ids"] == [12345, 54321]
-    assert address_row["source_issuer_names"] == ["Alpha Health Plan", "Beta Health Plan"]
-    assert address_row["source_urls"] == ["https://issuer.example/providers.json"]
+    assert "source_count" not in address_row
+    assert "address_sources" not in address_row
+    assert "source_import_dates" not in address_row
+    assert "source_issuer_ids" not in address_row
+    assert "source_issuer_names" not in address_row
+    assert "source_urls" not in address_row
     expected_address_key = process_initial.address_key_v1(
         "123 Main St",
         "Suite 5",
@@ -888,3 +955,115 @@ def test_build_mrf_address_rows_creates_address_and_evidence():
     assert evidence_row["issuer_name"] == "Alpha Health Plan"
     assert evidence_row["import_date"] == datetime.date(2026, 4, 2)
     assert evidence_row["address_key"] == expected_address_key
+
+
+@pytest.mark.asyncio
+async def test_push_mrf_address_rows_skips_aggregate_ingest_by_default(monkeypatch):
+    calls = []
+
+    async def fake_push_objects(rows, cls, **kwargs):
+        calls.append((rows, cls, kwargs))
+
+    monkeypatch.delenv("HLTHPRT_MRF_ADDRESS_AGGREGATE_DURING_INGEST", raising=False)
+    monkeypatch.setattr(process_initial, "push_objects", fake_push_objects)
+
+    await process_initial._push_mrf_address_rows(
+        [{"npi": 1234567890, "type": "practice", "checksum": 1}],
+        SimpleNamespace(__tablename__="mrf_address_20260612"),
+    )
+
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_push_mrf_address_rows_uses_insert_do_nothing_when_enabled(monkeypatch):
+    calls = []
+
+    async def fake_push_objects(rows, cls, **kwargs):
+        calls.append((rows, cls, kwargs))
+
+    monkeypatch.setenv("HLTHPRT_MRF_ADDRESS_AGGREGATE_DURING_INGEST", "1")
+    monkeypatch.setattr(process_initial, "push_objects", fake_push_objects)
+
+    cls = SimpleNamespace(__tablename__="mrf_address_20260612")
+    rows = [
+        {
+            "npi": 1234567890,
+            "type": "practice",
+            "checksum": 1,
+            "first_line": "123 Main St",
+            "source_count": 2,
+            "source_issuer_ids": [12345, 54321],
+            "source_urls": ["https://issuer.example/providers.json"],
+        }
+    ]
+    await process_initial._push_mrf_address_rows(rows, cls)
+
+    assert calls == [
+        (
+            [{"npi": 1234567890, "type": "practice", "checksum": 1, "first_line": "123 Main St"}],
+            cls,
+            {"rewrite": False, "use_copy": False},
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_push_mrf_duplicate_tolerant_rows_skips_copy_first(monkeypatch):
+    calls = []
+
+    async def fake_push_objects(rows, cls, **kwargs):
+        calls.append((rows, cls, kwargs))
+
+    monkeypatch.delenv("HLTHPRT_MRF_COPY_FIRST_DUPLICATE_TOLERANT_INSERTS", raising=False)
+    monkeypatch.setattr(process_initial, "push_objects", fake_push_objects)
+
+    cls = SimpleNamespace(__tablename__="plan_npi_raw_20260612")
+    rows = [{"npi": 1234567890, "checksum_network": 42}]
+    await process_initial._push_mrf_duplicate_tolerant_rows(rows, cls)
+
+    assert calls == [(rows, cls, {"rewrite": False, "use_copy": False})]
+
+
+@pytest.mark.asyncio
+async def test_push_mrf_duplicate_tolerant_rows_can_restore_copy_first(monkeypatch):
+    calls = []
+
+    async def fake_push_objects(rows, cls, **kwargs):
+        calls.append((rows, cls, kwargs))
+
+    monkeypatch.setenv("HLTHPRT_MRF_COPY_FIRST_DUPLICATE_TOLERANT_INSERTS", "1")
+    monkeypatch.setattr(process_initial, "push_objects", fake_push_objects)
+
+    cls = SimpleNamespace(__tablename__="plan_npi_raw_20260612")
+    rows = [{"npi": 1234567890, "checksum_network": 42}]
+    await process_initial._push_mrf_duplicate_tolerant_rows(rows, cls)
+
+    assert calls == [(rows, cls, {})]
+
+
+@pytest.mark.asyncio
+async def test_save_mrf_data_skips_mrf_address_aggregate_ingest(monkeypatch):
+    calls = []
+
+    async def fake_push_objects(rows, cls, **kwargs):
+        calls.append((cls.__tablename__, rows, kwargs))
+
+    async def fake_ensure_database(_test_mode):
+        return None
+
+    def fake_make_class(cls, suffix, schema_override=None):
+        return SimpleNamespace(__tablename__=f"{cls.__tablename__}_{suffix}")
+
+    monkeypatch.setattr(process_initial, "push_objects", fake_push_objects)
+    monkeypatch.setattr(process_initial, "ensure_database", fake_ensure_database)
+    monkeypatch.setattr(process_initial, "make_class", fake_make_class)
+    monkeypatch.delenv("HLTHPRT_MRF_ADDRESS_AGGREGATE_DURING_INGEST", raising=False)
+
+    rows = [{"npi": 1234567890, "type": "practice", "checksum": 1}]
+    await process_initial.save_mrf_data(
+        {"context": {"import_date": "20260612", "test_mode": False}},
+        {"mrf_address": rows, "mrf_address_evidence": [{"evidence_checksum": 2}]},
+    )
+
+    assert calls == [("mrf_address_evidence_20260612", [{"evidence_checksum": 2}], {})]

@@ -71,6 +71,7 @@ Each importer is a separate operational pipeline. Together, they build the canon
 | `nucc` | `python main.py start nucc` | NUCC | provider taxonomy lookup tables |
 | `geo` | `python main.py start geo` | repository support files | ZIP/city/state/coordinate lookup tables |
 | `geo-census` | `python main.py start geo-census` | U.S. Census APIs | ZIP/ZCTA demographic and economic profile metrics |
+| `openaddresses` | `python main.py start openaddresses` | OpenAddresses Batch | US-only local address geocode cache and missing archive coordinate backfill |
 | `claims-pricing` | `python main.py start claims-pricing` | CMS Medicare physician claims | provider procedure pricing, peer benchmarks, and procedure geography |
 | `claims-procedures` | `python main.py start claims-procedures` | CMS Medicare physician claims | alias of `claims-pricing` |
 | `drug-claims` | `python main.py start drug-claims` | CMS Medicare Part D claims | provider-drug and prescription claims aggregates |
@@ -114,6 +115,7 @@ Run from repo root in an activated virtualenv.
 | `facility-anchors` | `python main.py start facility-anchors [--test]` | `python main.py worker process.FacilityAnchors --burst` | publish handled in worker shutdown |
 | `pharmacy-economics` | `python main.py start pharmacy-economics [--test]` | `python main.py worker process.PharmacyEconomics --burst` | publish handled in worker shutdown |
 | `entity-address-unified` | `python main.py start entity-address-unified [--test]` | `python main.py worker process.EntityAddressUnified --burst` | publish handled in worker shutdown |
+| `openaddresses` | `python main.py start openaddresses [--test] [--backfill-only]` | `python main.py worker process.OpenAddresses --burst` | publish/backfill handled in worker shutdown |
 
 ### Direct (non-ARQ) imports
 
@@ -125,9 +127,14 @@ Run from repo root in an activated virtualenv.
 | `clinical-reference` | `python main.py start clinical-reference [--test] [--import-id YYYYMMDD]` |
 | `geo` | `python main.py start geo [--file /path/to/geo_city_public.csv]` |
 | `geo-census` | `python main.py start geo-census [--test]` |
+| `openaddresses` | `python main.py start openaddresses [--test] [--backfill-only]` |
 
 Operational note:
 - Do **not** run `ClaimsPricing_finish` and `DrugClaims_finish` at the same time. Both touch shared `code_catalog` and `code_crosswalk`.
+- `openaddresses` imports only U.S. sources from OpenAddresses Batch, then backfills `address_archive_v2` in this order: exact house/street/state/ZIP, strict fuzzy street match, then relaxed city/state/ZIP-scoped street match.
+- `openaddresses` full imports process multiple OpenAddresses source files concurrently; tune with `HLTHPRT_OPENADDRESSES_SOURCE_CONCURRENCY`.
+- For faster dev catch-up, multiple `openaddresses` load shards can use the same `HLTHPRT_IMPORT_ID_OVERRIDE` with `HLTHPRT_OPENADDRESSES_RESUME_STAGE=1`, `HLTHPRT_OPENADDRESSES_LOAD_ONLY=1`, and non-overlapping `HLTHPRT_OPENADDRESSES_START_INDEX`/`HLTHPRT_OPENADDRESSES_END_INDEX`; run one `HLTHPRT_OPENADDRESSES_PUBLISH_ONLY=1` job after all shards complete.
+- `openaddresses` archive backfill can also be sharded with `HLTHPRT_OPENADDRESSES_BACKFILL_STATE_CODE` and optional `HLTHPRT_OPENADDRESSES_BACKFILL_ZIP_PREFIX`; each shard only updates rows that still have no coordinates, so retries are safe.
 
 ## Documentation
 

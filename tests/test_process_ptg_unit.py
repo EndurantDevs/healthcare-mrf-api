@@ -7,6 +7,7 @@ import io
 import json
 import os
 import subprocess
+import threading
 import time
 from types import SimpleNamespace
 from decimal import Decimal
@@ -439,6 +440,49 @@ def test_rust_scanner_split_keeps_facade_helpers_stable():
     assert process_ptg._iter_top_level_object_bytes_rust is ptg_rust_scanner._iter_top_level_object_bytes_rust
     assert process_ptg._iter_compact_serving_records_rust is ptg_rust_scanner._iter_compact_serving_records_rust
     assert process_ptg._aiter_compact_serving_records_rust is ptg_rust_scanner._aiter_compact_serving_records_rust
+
+
+def test_async_rust_scanner_close_suppresses_generator_already_executing(monkeypatch, tmp_path):
+    class BlockingIterator:
+        def __init__(self):
+            self.started = threading.Event()
+            self.closed = threading.Event()
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            self.started.set()
+            self.closed.wait(timeout=5)
+            raise StopIteration
+
+        def close(self):
+            self.closed.set()
+            raise ValueError("generator already executing")
+
+    iterator = BlockingIterator()
+    monkeypatch.setattr(
+        ptg_rust_scanner,
+        "_iter_compact_serving_records_rust",
+        lambda *args, **kwargs: iterator,
+    )
+
+    async def run():
+        records = ptg_rust_scanner._aiter_compact_serving_records_rust(
+            tmp_path / "rates.json.gz",
+            snapshot_id="snap",
+            plan_id="plan",
+            plan_month_id="month",
+            source_trace_set_hash="trace",
+        )
+        task = asyncio.create_task(records.__anext__())
+        assert await asyncio.to_thread(iterator.started.wait, 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert iterator.closed.is_set()
+
+    asyncio.run(run())
 
 
 def test_rust_stage_split_keeps_facade_helpers_stable():

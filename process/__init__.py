@@ -127,6 +127,10 @@ from process.ptg_address import shutdown as ptg_address_shutdown
 from process.ptg_address import startup as ptg_address_startup
 from process.address_archive_migration import main as initiate_address_archive_migration
 from process.address_archive_migration import process_data as process_address_archive_migration_data
+from process.openaddresses import main as initiate_openaddresses
+from process.openaddresses import process_data as process_openaddresses_data
+from process.openaddresses import shutdown as openaddresses_shutdown
+from process.openaddresses import startup as openaddresses_startup
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
 
@@ -740,6 +744,19 @@ class AddressArchive:
     job_deserializer = deserialize_job
 
 
+class OpenAddresses:
+    functions = [process_openaddresses_data, control_single_job_start]
+    on_startup = openaddresses_startup
+    on_shutdown = openaddresses_shutdown
+    max_jobs = 1
+    queue_read_limit = 2
+    queue_name = "arq:OpenAddresses"
+    job_timeout = int(os.environ.get("HLTHPRT_OPENADDRESSES_JOB_TIMEOUT")) if os.environ.get("HLTHPRT_OPENADDRESSES_JOB_TIMEOUT") else 86400
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
 class MRFSourceDiscovery:
     functions = [process_mrf_source_discovery_data, control_single_job_start]
     on_startup = mrf_source_discovery_startup
@@ -1081,6 +1098,13 @@ def ptg_address(test: bool):
     _run(initiate_ptg_address(test_mode=test))
 
 
+@click.command(help="Run OpenAddresses US geocode cache refresh and address archive backfill")
+@click.option("--test", is_flag=True, help="Process a small OpenAddresses subset for a quick smoke run.")
+@click.option("--backfill-only", is_flag=True, help="Backfill archive coordinates from the existing local OpenAddresses cache.")
+def openaddresses(test: bool, backfill_only: bool):
+    _run(initiate_openaddresses(test_mode=test, backfill_only=backfill_only))
+
+
 @click.command(help="Run one-time legacy address archive to canonical v2 migration")
 @click.option("--dry-run", is_flag=True, help="Compute counts and verification queries without writing.")
 @click.option("--legacy-table", default="address_archive", show_default=True, help="Legacy archive table name.")
@@ -1233,6 +1257,7 @@ process_group.add_command(facility_anchors, name="facility-anchors")
 process_group.add_command(pharmacy_economics, name="pharmacy-economics")
 process_group.add_command(entity_address_unified, name="entity-address-unified")
 process_group.add_command(ptg_address, name="ptg-address")
+process_group.add_command(openaddresses, name="openaddresses")
 process_group.add_command(address_archive_v2_migrate, name="address-archive-v2-migrate")
 process_group.add_command(geo_lookup, name="geo")
 process_group.add_command(geo_census_lookup, name="geo-census")

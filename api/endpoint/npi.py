@@ -39,6 +39,7 @@ from db.models import (AddressArchive, EntityAddressUnified, Issuer,
                        ProviderEnrollmentHospice, ProviderEnrollmentHospital,
                        ProviderEnrollmentRHC, ProviderEnrollmentSNF, db)
 from process.ext.utils import download_it
+from process.openaddresses import exact_lookup_sql, fuzzy_lookup_sql, lookup_params_from_address, relaxed_lookup_sql
 
 blueprint = Blueprint("npi", url_prefix="/npi", version=1)
 logger = logging.getLogger(__name__)
@@ -3915,11 +3916,51 @@ async def get_npi(request, npi):
             return result.scalar()
         return await db.scalar(legacy_stmt)
 
-    async def update_addr_coordinates(address, long, lat, formatted_address, place_id, geo_source=None):
+    async def _openaddresses_coordinates_for(address):
+        if request_session is None and not hasattr(db, "first"):
+            return None
+        params = lookup_params_from_address(address)
+        if not params or not await _table_exists("openaddresses_geocode"):
+            return None
+        for query in (exact_lookup_sql(db_schema), fuzzy_lookup_sql(db_schema), relaxed_lookup_sql(db_schema)):
+            if request_session is not None:
+                result = await _execute_stmt(text(query), session=request_session, params=params)
+                row = result.first()
+            else:
+                row = await db.first(query, **params)
+            if row:
+                data = row._mapping
+                return SimpleNamespace(
+                    long=data["long"],
+                    lat=data["lat"],
+                    formatted_address=data["formatted_address"],
+                    place_id=data["place_id"],
+                    geo_source=data["geo_source"],
+                    geocode_source=data["geocode_source"],
+                    geocode_quality=data["geocode_quality"],
+                )
+        return None
+
+    async def update_addr_coordinates(
+        address,
+        long,
+        lat,
+        formatted_address,
+        place_id,
+        geo_source=None,
+        geocode_source=None,
+        geocode_quality=None,
+    ):
         checksum = address["checksum"]
         geo_source = str(geo_source).strip().lower() if geo_source else None
-        if geo_source not in {"mapbox", "google", "tiger", "manual"}:
+        if geo_source not in {"mapbox", "google", "tiger", "manual", "openaddresses"}:
             geo_source = "google" if place_id else None
+        geocode_source = str(geocode_source).strip().lower() if geocode_source else None
+        geocode_quality = str(geocode_quality).strip().lower() if geocode_quality else None
+        if not geocode_source:
+            geocode_source = "api_geocode"
+        if not geocode_quality:
+            geocode_quality = "unknown"
         await (
             db.update(NPIAddress)
             .where(NPIAddress.checksum == checksum)
@@ -3965,7 +4006,7 @@ async def get_npi(request, npi):
                     first_line, second_line, city_name, state_name, postal_code,
                     telephone_number, fax_number, formatted_address, lat, long, place_id,
                     CAST(:geo_source AS {db_schema}.address_archive_geo_source),
-                    'api_geocode', 'unknown', now(), 1, 0, date_added
+                    :geocode_source, :geocode_quality, now(), 1, 0, date_added
                   FROM (
                     SELECT DISTINCT ON (
                         {db_schema}.addr_key_v1(first_line, second_line, city_name, state_name, postal_code, COALESCE(NULLIF(country_code, ''), 'US'))
@@ -3986,12 +4027,16 @@ async def get_npi(request, npi):
                     long = COALESCE({db_schema}.{archive_table}.long, EXCLUDED.long),
                     place_id = COALESCE({db_schema}.{archive_table}.place_id, EXCLUDED.place_id),
                     geo_source = COALESCE({db_schema}.{archive_table}.geo_source, EXCLUDED.geo_source),
+                    geocode_source = COALESCE({db_schema}.{archive_table}.geocode_source, EXCLUDED.geocode_source),
+                    geocode_quality = COALESCE({db_schema}.{archive_table}.geocode_quality, EXCLUDED.geocode_quality),
                     geocoded_at = COALESCE({db_schema}.{archive_table}.geocoded_at, EXCLUDED.geocoded_at),
                     source_bits = {db_schema}.{archive_table}.source_bits | 1,
                     last_seen_at = now();
                 """,
                 checksum=checksum,
                 geo_source=geo_source,
+                geocode_source=geocode_source,
+                geocode_quality=geocode_quality,
             )
             return
         obj = {column.key: getattr(row, column.key, None) for column in AddressArchive.__table__.columns}
@@ -4097,6 +4142,20 @@ async def get_npi(request, npi):
                     d["place_id"] = res.place_id
                     d["geo_source"] = getattr(res, "geo_source", None) or ("google" if res.place_id else None)
 
+            if (lookup_stored_geocode or sync_geocode or force_address_update) and not d["lat"]:
+                try:
+                    res = await _openaddresses_coordinates_for(x)
+                    if res:
+                        d["long"] = res.long
+                        d["lat"] = res.lat
+                        d["formatted_address"] = res.formatted_address
+                        d["place_id"] = res.place_id
+                        d["geo_source"] = res.geo_source
+                        d["geocode_source"] = res.geocode_source
+                        d["geocode_quality"] = res.geocode_quality
+                except Exception as exc:  # pylint: disable=broad-exception-caught
+                    logger.debug("OpenAddresses geocoding failed for %s: %s", t_addr, exc)
+
             if (sync_geocode or force_address_update) and not d["lat"]:
                 try:
                     params = {
@@ -4174,6 +4233,8 @@ async def get_npi(request, npi):
                         d["formatted_address"],
                         d["place_id"],
                         d.get("geo_source"),
+                        d.get("geocode_source"),
+                        d.get("geocode_quality"),
                     )
                 )
 

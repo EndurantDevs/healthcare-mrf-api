@@ -375,5 +375,9 @@ async def _aiter_compact_serving_records_rust(
         if reader_thread.is_alive():
             close = getattr(iterator, "close", None)
             if close is not None:
-                await asyncio.to_thread(close)
+                try:
+                    await asyncio.to_thread(close)
+                except ValueError as exc:
+                    if "generator already executing" not in str(exc):
+                        raise
             reader_thread.join(timeout=5)

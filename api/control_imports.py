@@ -144,6 +144,7 @@ _SINGLE_JOB_ADAPTERS: dict[str, dict[str, Any]] = {
         "payload": "control_wrapped",
         "target_module": "process.facility_anchors",
         "target_function": "process_data",
+        "run_shutdown": True,
     },
     "pharmacy-economics": {
         "queue": "arq:PharmacyEconomics",
@@ -165,6 +166,7 @@ _SINGLE_JOB_ADAPTERS: dict[str, dict[str, Any]] = {
         "payload": "control_wrapped",
         "target_module": "process.entity_address_unified",
         "target_function": "process_data",
+        "run_shutdown": True,
     },
     "ptg-address": {
         "queue": "arq:PTGAddress",
@@ -180,6 +182,14 @@ _SINGLE_JOB_ADAPTERS: dict[str, dict[str, Any]] = {
         "target_module": "process.address_archive_migration",
         "target_function": "process_data",
     },
+    "openaddresses": {
+        "queue": "arq:OpenAddresses",
+        "function": "control_single_job_start",
+        "payload": "control_wrapped",
+        "target_module": "process.openaddresses",
+        "target_function": "process_data",
+        "run_shutdown": True,
+    },
 }
 
 _CANCELABLE_IMPORTERS = {
@@ -189,6 +199,7 @@ _CANCELABLE_IMPORTERS = {
     "places-zcta",
     "cms-doctors",
     "address-archive-v2-migrate",
+    "openaddresses",
 }
 _FINISH_IMPORTERS = {
     "mrf",
@@ -826,6 +837,7 @@ def _adapter_payload(adapter: dict[str, Any], row: dict[str, Any], params: dict[
             "target_module": adapter["target_module"],
             "target_function": adapter["target_function"],
             "call_style": "kwargs" if adapter["payload"] == "control_wrapped_kwargs" else "ctx_task",
+            "run_shutdown": bool(adapter.get("run_shutdown")),
             "task": {"test_mode": test_mode, **params},
         }
     if adapter["payload"] == "run_import":

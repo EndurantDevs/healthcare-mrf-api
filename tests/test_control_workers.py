@@ -16,6 +16,8 @@ def test_worker_registry_exposes_shared_and_finish_workers():
     assert by_importer["claims-procedures"]["worker_class"] == "process.ClaimsPricing"
     assert by_importer["ptg-address"]["worker_class"] == "process.PTGAddress"
     assert by_importer["ms-drg"]["worker_class"] == "process.MSDRG"
+    assert by_importer["openaddresses"]["worker_class"] == "process.OpenAddresses"
+    assert by_queue["arq:OpenAddresses"]["role"] == "start"
     assert by_queue["arq:PartDFormularyNetwork_finish"]["role"] == "finish"
     assert by_queue["arq:PTGAddress_finish"]["role"] == "finish"
 

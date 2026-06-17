@@ -38,6 +38,7 @@ from process.ext.utils import (download_it, download_it_and_save,
                                ensure_database, make_class, my_init_db,
                                print_time_info, push_objects, return_checksum)
 from process.live_progress import enqueue_live_progress
+from process.openaddresses import refresh_archive_geocodes_from_openaddresses
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
 
@@ -1226,6 +1227,14 @@ async def shutdown(ctx):  # pragma: no cover
         address_stats = await timed_shutdown_phase(
             "canonical_address_resolve",
             _canonical_address_resolve(),
+        )
+        oa_stats = await timed_shutdown_phase(
+            "openaddresses_archive_backfill",
+            refresh_archive_geocodes_from_openaddresses(schema=db_schema),
+        )
+        print(
+            "OpenAddresses archive backfill after NPI canonical resolve: "
+            f"exact={oa_stats.exact_updates} fuzzy={oa_stats.fuzzy_updates}"
         )
 
     async def _timed_geo_update(obj, archive_source: str, use_canonical_archive: bool):

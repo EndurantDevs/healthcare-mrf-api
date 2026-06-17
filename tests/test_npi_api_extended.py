@@ -760,6 +760,100 @@ async def test_get_npi_geocode_google(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_get_npi_geocode_openaddresses_before_paid_providers(monkeypatch):
+    async def fake_build(_npi):
+        return {
+            "npi": _npi,
+            "taxonomy_list": [],
+            "taxonomy_group_list": [],
+            "do_business_as": [],
+            "address_list": [
+                {
+                    "checksum": 4,
+                    "first_line": "30 Main Street",
+                    "second_line": "",
+                    "city_name": "Chicago",
+                    "state_name": "IL",
+                    "postal_code": "60601",
+                    "lat": None,
+                    "long": None,
+                }
+            ],
+        }
+
+    monkeypatch.setattr(npi_module, "_build_npi_details", fake_build)
+    monkeypatch.setattr(npi_module, "_fetch_other_names", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        npi_module,
+        "download_it",
+        AsyncMock(side_effect=AssertionError("paid geocoder should not be called")),
+    )
+
+    update = FakeUpdate()
+    insert = FakeInsert()
+
+    class FakeDB:
+        def update(self, *_args, **_kwargs):
+            return update
+
+        def insert(self, *_args, **_kwargs):
+            return insert
+
+        async def scalar(self, query, **_kwargs):
+            if isinstance(query, str) and "to_regclass" in query:
+                return "mrf.openaddresses_geocode"
+            return _make_address_row()
+
+        async def first(self, sql, **_kwargs):
+            assert "openaddresses_geocode" in sql
+            return types.SimpleNamespace(
+                _mapping={
+                    "long": -87.3,
+                    "lat": 41.3,
+                    "formatted_address": "30 Main Street, Chicago, IL 60601",
+                    "place_id": "oa-1",
+                    "geo_source": "openaddresses",
+                    "geocode_source": "openaddresses_exact",
+                    "geocode_quality": "rooftop",
+                }
+            )
+
+    monkeypatch.setattr(npi_module, "db", FakeDB())
+
+    tasks = []
+
+    class FakeApp:
+        config = {
+            "NPI_API_UPDATE_GEOCODE": True,
+            "GEOCODE_MAPBOX_STYLE_KEY_PARAM": "access_token",
+            "GEOCODE_MAPBOX_STYLE_KEY": "[\"token\"]",
+            "GEOCODE_MAPBOX_STYLE_URL": "https://mock-map/",
+            "GEOCODE_GOOGLE_STYLE_ADDRESS_PARAM": "address",
+            "GEOCODE_GOOGLE_STYLE_KEY_PARAM": "key",
+            "GEOCODE_GOOGLE_STYLE_KEY": "secret",
+            "GEOCODE_GOOGLE_STYLE_URL": "https://mock-google",
+            "GEOCODE_GOOGLE_STYLE_ADDITIONAL_QUERY_PARAMS": "region=us",
+        }
+
+        def add_task(self, coro):
+            tasks.append(coro)
+            if asyncio.iscoroutine(coro):
+                coro.close()
+
+    request = types.SimpleNamespace(
+        args={"force_address_update": "1"},
+        app=FakeApp(),
+    )
+    response = await npi_module.get_npi(request, "1518379601")
+    payload = json.loads(response.body)
+    address = payload["address_list"][0]
+    assert address["lat"] == 41.3
+    assert address["geo_source"] == "openaddresses"
+    assert address["geocode_source"] == "openaddresses_exact"
+    assert tasks
+
+
+@pytest.mark.asyncio
 async def test_get_all_full_taxonomy(monkeypatch):
     connections = [FakeConnection([[(1234, 7)]])]
 

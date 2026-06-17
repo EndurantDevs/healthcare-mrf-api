@@ -133,7 +133,7 @@ def _ensure_indexes(sync_conn, inspector, table, model, results: Dict[str, List[
 def _iter_index_specs(model) -> Iterable[Dict[str, Any]]:
     specs: List[Dict[str, Any]] = []
     primary_elements = _normalize_index_columns(getattr(model, "__my_index_elements__", None))
-    if primary_elements:
+    if primary_elements and primary_elements != _primary_key_columns(model):
         specs.append(
             {
                 "name": getattr(model, "__primary_index_name__", f"{model.__tablename__}_idx_primary"),
@@ -156,6 +156,13 @@ def _iter_index_specs(model) -> Iterable[Dict[str, Any]]:
             }
         )
     return specs
+
+
+def _primary_key_columns(model) -> Tuple[str, ...]:
+    table = getattr(model, "__table__", None)
+    if table is None:
+        return ()
+    return tuple(column.name for column in table.primary_key.columns)
 
 
 def _build_index_sql(name: str, schema_prefix: str, table_name: str, spec: Dict[str, Any]) -> str:

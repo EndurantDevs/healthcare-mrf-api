@@ -1190,6 +1190,7 @@ class AddressArchiveV2(Base, JSONOutputMixin):
             "google",
             "tiger",
             "manual",
+            "openaddresses",
             name="address_archive_geo_source",
             native_enum=True,
             create_type=False,
@@ -1206,6 +1207,45 @@ class AddressArchiveV2(Base, JSONOutputMixin):
     date_added = Column(DATE)
     display_priority = Column(SMALLINT, nullable=False)
     merged_into = Column(PG_UUID(as_uuid=True))
+
+
+class OpenAddressesGeocode(Base, JSONOutputMixin):
+    __tablename__ = "openaddresses_geocode"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("row_hash"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["row_hash"]
+    __my_additional_indexes__ = [
+        {
+            "index_elements": ("state_code", "zip5", "house_number", "street_match_key"),
+            "name": "openaddresses_exact_idx",
+        },
+        {"index_elements": ("address_key",), "name": "openaddresses_address_key_idx", "where": "address_key IS NOT NULL"},
+        {"index_elements": ("source",), "name": "openaddresses_source_idx"},
+    ]
+
+    row_hash = Column(String(64), nullable=False)
+    address_key = Column(PG_UUID(as_uuid=True))
+    identity_key = Column(TEXT)
+    house_number = Column(TEXT, nullable=False)
+    street_match_key = Column(TEXT, nullable=False)
+    street_name = Column(TEXT)
+    unit = Column(TEXT)
+    city_name = Column(TEXT)
+    state_code = Column(String(2), nullable=False)
+    zip5 = Column(String(5), nullable=False)
+    formatted_address = Column(TEXT)
+    lat = Column(Numeric(scale=8, precision=11, asdecimal=False, decimal_return_scale=None), nullable=False)
+    long = Column(Numeric(scale=8, precision=11, asdecimal=False, decimal_return_scale=None), nullable=False)
+    source = Column(TEXT)
+    data_id = Column(Integer)
+    job_id = Column(Integer)
+    feature_id = Column(TEXT)
+    accuracy = Column(TEXT)
+    source_updated = Column(TIMESTAMP(timezone=True))
+    imported_at = Column(TIMESTAMP(timezone=True), nullable=False)
 
 
 class NPIAddress(AddressPrototype):
@@ -1285,7 +1325,7 @@ class NPIAddress(AddressPrototype):
         {'index_elements': ('address_key',), 'name': 'address_key'},
     ]
 
-    npi = Column(Integer, primary_key=True)
+    npi = Column(BigInteger, primary_key=True)
     type = Column(String, primary_key=True)
     taxonomy_array = Column(ARRAY(Integer), nullable=False, server_default="{0}")
     plans_network_array = Column(ARRAY(Integer), nullable=False, server_default="{0}")
@@ -1339,7 +1379,7 @@ class MRFAddress(AddressPrototype):
         {"index_elements": ("address_key",), "name": "address_key"},
     ]
 
-    npi = Column(Integer, primary_key=True)
+    npi = Column(BigInteger, primary_key=True)
     type = Column(String, primary_key=True)
     source_count = Column(Integer, nullable=False, server_default="0")
     address_sources = Column(ARRAY(String), nullable=False, server_default=text("'{}'::varchar[]"))

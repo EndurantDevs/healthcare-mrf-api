@@ -215,6 +215,10 @@ def _mrf_address_summary_deferred_indexes(address_cls) -> list[dict]:
     raw = os.getenv("HLTHPRT_MRF_ADDRESS_SUMMARY_DEFER_SOURCE_INDEXES", "true").strip().lower()
     if raw in disabled_values:
         return []
+    if not _truthy(os.getenv("HLTHPRT_MRF_ADDRESS_AGGREGATE_DURING_INGEST"), ("yes", "y", "true", "1")):
+        return list(getattr(address_cls, "__my_initial_indexes__", []) or []) + list(
+            getattr(address_cls, "__my_additional_indexes__", []) or []
+        )
     return [
         index
         for index in getattr(address_cls, "__my_additional_indexes__", []) or []
@@ -417,13 +421,6 @@ def _build_mrf_address_rows(res, network_tiers, import_id, source_url, last_upda
             normalized["country_code"] or "US",
         )
         address_key = (npi, address_type, normalized["checksum"])
-        address_record_id_values = []
-        issuer_ids = []
-        issuer_names = []
-        import_ids = []
-        import_dates = []
-        sources = []
-        source_urls = []
         for network in network_tiers.values():
             issuer_id = network["issuer_id"]
             issuer_name = issuer_lookup.get(issuer_id) or str(issuer_id)
@@ -474,15 +471,6 @@ def _build_mrf_address_rows(res, network_tiers, import_id, source_url, last_upda
                 "observed_at": last_updated_on,
                 "address_key": computed_address_key,
             }
-            address_record_id_values.append(source_record_id)
-            issuer_ids.append(issuer_id)
-            issuer_names.append(issuer_name)
-            import_ids.append(str(import_id))
-            if import_date_value:
-                import_dates.append(import_date_value)
-            sources.append("marketplace_provider")
-            if source_url:
-                source_urls.append(str(source_url))
 
         address_rows[address_key] = {
             "npi": npi,
@@ -498,17 +486,48 @@ def _build_mrf_address_rows(res, network_tiers, import_id, source_url, last_upda
             "formatted_address": normalized["formatted_address"],
             "date_added": last_updated_on.date() if last_updated_on else None,
             "address_key": computed_address_key,
-            "source_count": len(set(address_record_id_values)),
-            "address_sources": sorted(set(sources)),
-            "source_record_ids": sorted(set(address_record_id_values)),
-            "source_import_ids": sorted(set(import_ids)),
-            "source_import_dates": sorted(set(import_dates)),
-            "source_issuer_ids": sorted(set(issuer_ids)),
-            "source_issuer_names": sorted(set(issuer_names)),
-            "source_urls": sorted(set(source_urls)),
         }
 
     return list(address_rows.values()), list(evidence_rows.values())
+
+
+_MRF_ADDRESS_INSERT_COLUMNS = (
+    "npi",
+    "type",
+    "checksum",
+    "first_line",
+    "second_line",
+    "city_name",
+    "state_name",
+    "postal_code",
+    "country_code",
+    "telephone_number",
+    "formatted_address",
+    "date_added",
+    "address_key",
+)
+
+
+async def _push_mrf_address_rows(rows, cls) -> None:
+    if not _truthy(os.getenv("HLTHPRT_MRF_ADDRESS_AGGREGATE_DURING_INGEST"), ("yes", "y", "true", "1")):
+        return
+    # Address provenance arrays are rebuilt from mrf_address_evidence during
+    # finalization, so duplicate aggregate address rows and early provenance
+    # arrays do not need writes or GIN index maintenance during ingestion.
+    insert_rows = [
+        {column: row[column] for column in _MRF_ADDRESS_INSERT_COLUMNS if column in row}
+        for row in rows
+    ]
+    await push_objects(insert_rows, cls, rewrite=False, use_copy=False)
+
+
+async def _push_mrf_duplicate_tolerant_rows(rows, cls) -> None:
+    if not rows:
+        return
+    if _truthy(os.getenv("HLTHPRT_MRF_COPY_FIRST_DUPLICATE_TOLERANT_INSERTS"), ("yes", "y", "true", "1")):
+        await push_objects(rows, cls)
+        return
+    await push_objects(rows, cls, rewrite=False, use_copy=False)
 
 
 async def _refresh_mrf_address_summary(import_date: str, db_schema: str) -> None:
@@ -517,21 +536,89 @@ async def _refresh_mrf_address_summary(import_date: str, db_schema: str) -> None
     deferred_indexes = _mrf_address_summary_deferred_indexes(address_cls)
     work_mem = _postgres_setting_value("HLTHPRT_MRF_ADDRESS_SUMMARY_WORK_MEM", "1GB")
     statement_timeout = os.environ.get("HLTHPRT_MRF_ADDRESS_SUMMARY_STATEMENT_TIMEOUT")
-    update_sql = f"""
-        UPDATE {db_schema}.{address_cls.__tablename__} AS a
-           SET address_sources = COALESCE(src.address_sources, ARRAY[]::varchar[]),
-               source_record_ids = COALESCE(src.source_record_ids, ARRAY[]::varchar[]),
-               source_import_ids = COALESCE(src.source_import_ids, ARRAY[]::varchar[]),
-               source_import_dates = COALESCE(src.source_import_dates, ARRAY[]::date[]),
-               source_issuer_ids = COALESCE(src.source_issuer_ids, ARRAY[]::integer[]),
-               source_issuer_names = COALESCE(src.source_issuer_names, ARRAY[]::varchar[]),
-               source_urls = COALESCE(src.source_urls, ARRAY[]::varchar[]),
-               source_count = COALESCE(src.source_count, 0)
+    upsert_sql = f"""
+        INSERT INTO {db_schema}.{address_cls.__tablename__} (
+            npi,
+            type,
+            checksum,
+            first_line,
+            second_line,
+            city_name,
+            state_name,
+            postal_code,
+            country_code,
+            telephone_number,
+            formatted_address,
+            date_added,
+            address_key,
+            address_sources,
+            source_record_ids,
+            source_import_ids,
+            source_import_dates,
+            source_issuer_ids,
+            source_issuer_names,
+            source_urls,
+            source_count
+        )
+        SELECT
+            npi,
+            type,
+            checksum,
+            first_line,
+            second_line,
+            city_name,
+            state_name,
+            postal_code,
+            country_code,
+            telephone_number,
+            formatted_address,
+            date_added,
+            address_key,
+            COALESCE(address_sources, ARRAY[]::varchar[]) AS address_sources,
+            COALESCE(source_record_ids, ARRAY[]::varchar[]) AS source_record_ids,
+            COALESCE(source_import_ids, ARRAY[]::varchar[]) AS source_import_ids,
+            COALESCE(source_import_dates, ARRAY[]::date[]) AS source_import_dates,
+            COALESCE(source_issuer_ids, ARRAY[]::integer[]) AS source_issuer_ids,
+            COALESCE(source_issuer_names, ARRAY[]::varchar[]) AS source_issuer_names,
+            COALESCE(source_urls, ARRAY[]::varchar[]) AS source_urls,
+            COALESCE(source_count, 0) AS source_count
           FROM (
                 SELECT
                     npi,
                     type,
                     checksum,
+                    MIN(first_line) FILTER (WHERE first_line IS NOT NULL AND first_line <> '') AS first_line,
+                    MIN(second_line) FILTER (WHERE second_line IS NOT NULL AND second_line <> '') AS second_line,
+                    MIN(city_name) FILTER (WHERE city_name IS NOT NULL AND city_name <> '') AS city_name,
+                    MIN(state_name) FILTER (WHERE state_name IS NOT NULL AND state_name <> '') AS state_name,
+                    MIN(postal_code) FILTER (WHERE postal_code IS NOT NULL AND postal_code <> '') AS postal_code,
+                    COALESCE(
+                        MIN(country_code) FILTER (WHERE country_code IS NOT NULL AND country_code <> ''),
+                        'US'
+                    ) AS country_code,
+                    MIN(telephone_number) FILTER (WHERE telephone_number IS NOT NULL AND telephone_number <> '') AS telephone_number,
+                    concat_ws(
+                        ', ',
+                        NULLIF(
+                            concat_ws(
+                                ' ',
+                                MIN(first_line) FILTER (WHERE first_line IS NOT NULL AND first_line <> ''),
+                                MIN(second_line) FILTER (WHERE second_line IS NOT NULL AND second_line <> '')
+                            ),
+                            ''
+                        ),
+                        NULLIF(
+                            concat_ws(
+                                ' ',
+                                MIN(city_name) FILTER (WHERE city_name IS NOT NULL AND city_name <> ''),
+                                MIN(state_name) FILTER (WHERE state_name IS NOT NULL AND state_name <> ''),
+                                MIN(postal_code) FILTER (WHERE postal_code IS NOT NULL AND postal_code <> '')
+                            ),
+                            ''
+                        )
+                    ) AS formatted_address,
+                    MIN(observed_at)::date AS date_added,
+                    MIN(address_key::text) FILTER (WHERE address_key IS NOT NULL)::uuid AS address_key,
                     ARRAY_REMOVE(ARRAY_AGG(DISTINCT address_source ORDER BY address_source), NULL)::varchar[] AS address_sources,
                     ARRAY_REMOVE(ARRAY_AGG(DISTINCT source_record_id ORDER BY source_record_id), NULL)::varchar[] AS source_record_ids,
                     ARRAY_REMOVE(ARRAY_AGG(DISTINCT import_id ORDER BY import_id), NULL)::varchar[] AS source_import_ids,
@@ -543,9 +630,25 @@ async def _refresh_mrf_address_summary(import_date: str, db_schema: str) -> None
                 FROM {db_schema}.{evidence_cls.__tablename__}
                 GROUP BY npi, type, checksum
           ) AS src
-         WHERE a.npi = src.npi
-           AND a.type = src.type
-           AND a.checksum = src.checksum;
+        ON CONFLICT (npi, type, checksum) DO UPDATE
+           SET first_line = EXCLUDED.first_line,
+               second_line = EXCLUDED.second_line,
+               city_name = EXCLUDED.city_name,
+               state_name = EXCLUDED.state_name,
+               postal_code = EXCLUDED.postal_code,
+               country_code = EXCLUDED.country_code,
+               telephone_number = EXCLUDED.telephone_number,
+               formatted_address = EXCLUDED.formatted_address,
+               date_added = EXCLUDED.date_added,
+               address_key = COALESCE({address_cls.__tablename__}.address_key, EXCLUDED.address_key),
+               address_sources = EXCLUDED.address_sources,
+               source_record_ids = EXCLUDED.source_record_ids,
+               source_import_ids = EXCLUDED.source_import_ids,
+               source_import_dates = EXCLUDED.source_import_dates,
+               source_issuer_ids = EXCLUDED.source_issuer_ids,
+               source_issuer_names = EXCLUDED.source_issuer_names,
+               source_urls = EXCLUDED.source_urls,
+               source_count = EXCLUDED.source_count;
         """
     async with db.transaction() as session:
         await session.execute(text(f"SET LOCAL work_mem = '{work_mem}';"))
@@ -555,7 +658,7 @@ async def _refresh_mrf_address_summary(import_date: str, db_schema: str) -> None
         for index in deferred_indexes:
             await session.execute(text(_drop_index_sql(address_cls.__tablename__, index, db_schema)))
         await session.execute(text(f"ANALYZE {db_schema}.{evidence_cls.__tablename__};"))
-        await session.execute(text(update_sql))
+        await session.execute(text(upsert_sql))
         for index in deferred_indexes:
             await session.execute(text(_create_index_sql(address_cls.__tablename__, index, db_schema)))
         if deferred_indexes:
@@ -878,7 +981,7 @@ async def process_plan(ctx, task):
                                             }
                                             planformulary_obj.append(obj)
                                             if count > int(os.environ.get("HLTHPRT_SAVE_PER_PACK", 50)):
-                                                await push_objects(planformulary_obj, myplanformulary)
+                                                await _push_mrf_duplicate_tolerant_rows(planformulary_obj, myplanformulary)
                                                 planformulary_obj.clear()
                                                 count = 0
                                             else:
@@ -919,9 +1022,9 @@ async def process_plan(ctx, task):
                         break
 
                 await asyncio.gather(
-                    push_objects(plan_obj, myplan),
-                    push_objects(planformulary_obj, myplanformulary),
-                    push_objects(planbenefitsmarketplace_obj, myplanbenefitsmarketplace),
+                    _push_mrf_duplicate_tolerant_rows(plan_obj, myplan),
+                    _push_mrf_duplicate_tolerant_rows(planformulary_obj, myplanformulary),
+                    _push_mrf_duplicate_tolerant_rows(planbenefitsmarketplace_obj, myplanbenefitsmarketplace),
                 )
             except ijson.IncompleteJSONError as exc:
                 await log_error(
@@ -1192,10 +1295,13 @@ async def process_provider(ctx, task):
                     count += 1
                     if count > 10000:
                         await asyncio.gather(
-                            push_objects(list(plan_npi_obj_dict.values()), myplan_npi),
-                            push_objects(list(plan_network_year.values()), myplan_networktier),
-                            push_objects(list(mrf_address_obj_dict.values()), mymrfaddress, rewrite=True),
-                            push_objects(list(mrf_address_evidence_dict.values()), mymrfaddressevidence),
+                            _push_mrf_duplicate_tolerant_rows(list(plan_npi_obj_dict.values()), myplan_npi),
+                            _push_mrf_duplicate_tolerant_rows(list(plan_network_year.values()), myplan_networktier),
+                            _push_mrf_address_rows(list(mrf_address_obj_dict.values()), mymrfaddress),
+                            _push_mrf_duplicate_tolerant_rows(
+                                list(mrf_address_evidence_dict.values()),
+                                mymrfaddressevidence,
+                            ),
                         )
                         count = 0
                         plan_npi_obj_dict.clear()
@@ -1204,10 +1310,13 @@ async def process_provider(ctx, task):
                         mrf_address_evidence_dict.clear()
 
                 await asyncio.gather(
-                    push_objects(list(plan_npi_obj_dict.values()), myplan_npi),
-                    push_objects(list(plan_network_year.values()), myplan_networktier),
-                    push_objects(list(mrf_address_obj_dict.values()), mymrfaddress, rewrite=True),
-                    push_objects(list(mrf_address_evidence_dict.values()), mymrfaddressevidence),
+                    _push_mrf_duplicate_tolerant_rows(list(plan_npi_obj_dict.values()), myplan_npi),
+                    _push_mrf_duplicate_tolerant_rows(list(plan_network_year.values()), myplan_networktier),
+                    _push_mrf_address_rows(list(mrf_address_obj_dict.values()), mymrfaddress),
+                    _push_mrf_duplicate_tolerant_rows(
+                        list(mrf_address_evidence_dict.values()),
+                        mymrfaddressevidence,
+                    ),
                 )
                 plan_npi_obj_dict.clear()
                 plan_network_year.clear()
@@ -1485,7 +1594,7 @@ async def process_formulary(ctx, task):
                     if drug_limit and processed >= drug_limit:
                         break
                     if len(batch) > 10000:
-                        await push_objects(batch, myplan_drug)
+                        await _push_mrf_duplicate_tolerant_rows(batch, myplan_drug)
                         batch.clear()
 
         except ijson.IncompleteJSONError as exc:
@@ -1512,7 +1621,7 @@ async def process_formulary(ctx, task):
             return
 
         if batch:
-            await push_objects(batch, myplan_drug)
+            await _push_mrf_duplicate_tolerant_rows(batch, myplan_drug)
 
     if touched_plan_ids:
         await _refresh_plan_drug_statistics(touched_plan_ids, import_date, db_schema)
@@ -1551,7 +1660,7 @@ async def save_mrf_data(ctx, task):
                 x.append(push_objects(task["plan_benefits_marketplace"], myplanbenefitsmarketplace))
             case "mrf_address":
                 mymrfaddress = make_class(MRFAddress, import_date, schema_override=db_schema)
-                x.append(push_objects(task["mrf_address"], mymrfaddress, rewrite=True))
+                x.append(_push_mrf_address_rows(task["mrf_address"], mymrfaddress))
             case "mrf_address_evidence":
                 mymrfaddressevidence = make_class(MRFAddressEvidence, import_date, schema_override=db_schema)
                 x.append(push_objects(task["mrf_address_evidence"], mymrfaddressevidence))

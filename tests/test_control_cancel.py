@@ -108,6 +108,48 @@ async def test_control_single_job_start_ignores_arq_metadata_kwargs(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_control_single_job_start_can_run_module_shutdown(monkeypatch):
+    marks = []
+    calls = []
+
+    async def fake_mark(run_id, **kwargs):
+        marks.append((run_id, kwargs))
+
+    async def fake_target(ctx, task):
+        calls.append(("target", dict(ctx.get("context") or {}), task))
+        ctx.setdefault("context", {})["run"] = 1
+        return None
+
+    async def fake_shutdown(ctx):
+        calls.append(("shutdown", dict(ctx.get("context") or {}), None))
+
+    class FakeModule:
+        process_data = staticmethod(fake_target)
+        shutdown = staticmethod(fake_shutdown)
+
+    monkeypatch.setattr(control_lifecycle, "mark_control_run", fake_mark)
+    monkeypatch.setattr(control_lifecycle, "import_module", lambda name: FakeModule if name == "fake.module" else None)
+
+    result = await control_single_job_start(
+        {"redis": object()},
+        {
+            "run_id": "run_1",
+            "target_module": "fake.module",
+            "target_function": "process_data",
+            "run_shutdown": True,
+        },
+    )
+
+    assert result["status"] == "succeeded"
+    assert calls == [
+        ("target", {"control_run_id": "run_1"}, {"run_id": "run_1"}),
+        ("shutdown", {"control_run_id": "run_1", "run": 1}, None),
+    ]
+    assert result["run_id"] == "run_1"
+    assert [item[1]["status"] for item in marks] == ["running", "succeeded"]
+
+
+@pytest.mark.asyncio
 async def test_control_single_job_start_marks_cancelled(monkeypatch):
     marks = []
 
@@ -183,3 +225,58 @@ async def test_control_run_update_uses_base_database_then_restores_override(monk
         ("execute", "UPDATE", "healthporta"),
         ("connect", "healthporta_test"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_mark_control_run_throttles_repeated_running_db_update(monkeypatch):
+    db_updates = []
+    live_events = []
+    status_events = []
+
+    async def fake_update(stmt):
+        db_updates.append(stmt)
+
+    monkeypatch.setenv("HLTHPRT_CONTROL_RUN_DB_UPDATE_THROTTLE_SECONDS", "60")
+    monkeypatch.setattr(control_lifecycle, "_claim_control_run_db_update_slot", lambda _key, _seconds: False)
+    monkeypatch.setattr(control_lifecycle, "_execute_control_run_update", fake_update)
+    monkeypatch.setattr(control_lifecycle, "enqueue_live_progress", lambda **payload: live_events.append(payload))
+    monkeypatch.setattr(control_lifecycle, "enqueue_status_event", lambda payload: status_events.append(payload))
+
+    await control_lifecycle.mark_control_run(
+        "run_1",
+        status="running",
+        phase_detail="mrf provider jobs running",
+        progress_message="processed provider file",
+        metrics={"last_provider_records": 123},
+    )
+
+    assert db_updates == []
+    assert live_events[-1]["run_id"] == "run_1"
+    assert live_events[-1]["status"] == "running"
+    assert status_events[-1]["phase_detail"] == "mrf provider jobs running"
+
+
+@pytest.mark.asyncio
+async def test_mark_control_run_always_persists_terminal_update(monkeypatch):
+    db_updates = []
+
+    async def fake_update(stmt):
+        db_updates.append(stmt)
+
+    def fail_slot(_key, _seconds):
+        raise AssertionError("terminal updates must not consult the running throttle")
+
+    monkeypatch.setenv("HLTHPRT_CONTROL_RUN_DB_UPDATE_THROTTLE_SECONDS", "60")
+    monkeypatch.setattr(control_lifecycle, "_claim_control_run_db_update_slot", fail_slot)
+    monkeypatch.setattr(control_lifecycle, "_execute_control_run_update", fake_update)
+    monkeypatch.setattr(control_lifecycle, "enqueue_live_progress", lambda **_payload: None)
+    monkeypatch.setattr(control_lifecycle, "enqueue_status_event", lambda _payload: None)
+
+    await control_lifecycle.mark_control_run(
+        "run_1",
+        status="succeeded",
+        phase_detail="mrf import published",
+        progress_message="succeeded",
+    )
+
+    assert len(db_updates) == 1
