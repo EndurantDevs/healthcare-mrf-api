@@ -57,7 +57,8 @@ CREATE TABLE mrf.address_archive (
     -- provenance / history -----------------------------------------------
     source_bits       integer NOT NULL DEFAULT 0,   -- nppes=1, cms_doctors=2, ffs=4,
                                                     -- facility_anchor=8, mrf=16,
-                                                    -- pharmacy=32, partd=64
+                                                    -- pharmacy=32, partd=64,
+                                                    -- ptg_overlay=128
     first_seen_at     timestamptz NOT NULL DEFAULT now(),
     last_seen_at      timestamptz NOT NULL DEFAULT now(),
     date_added        date,                   -- carried over from v1 rows

@@ -43,6 +43,7 @@ from process.ext.utils import (download_it_and_save, ensure_database,
                                flush_error_log, get_import_schema, log_error,
                                make_class, my_init_db, print_time_info,
                                push_objects, return_checksum)
+from process.openaddresses import refresh_archive_geocodes_from_openaddresses
 from process.control_lifecycle import mark_control_run
 from process.live_progress import enqueue_live_progress
 from process.plan_summary import rebuild_plan_search_summary
@@ -2409,6 +2410,13 @@ async def shutdown(ctx, task):
             schema=db_schema,
         )
         logger.info("MRF canonical address resolve complete: %s", address_stats)
+        oa_stats = await refresh_archive_geocodes_from_openaddresses(schema=db_schema)
+        logger.info(
+            "OpenAddresses archive backfill after MRF canonical resolve: exact=%s fuzzy=%s relaxed=%s",
+            oa_stats.exact_updates,
+            oa_stats.fuzzy_updates,
+            oa_stats.relaxed_updates,
+        )
 
     tables = {}
     async with db.transaction():

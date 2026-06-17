@@ -686,6 +686,7 @@ def test_entity_address_unified_mrf_source_borrows_arrays_from_primary_npi_addre
     assert "FROM mrf.npi_address AS pa WHERE pa.npi = a.npi AND pa.type = 'primary'" in mrf_source
     assert "COALESCE(pa.taxonomy_array, ARRAY[0]::int[])::int[] AS taxonomy_array" in mrf_source
     assert "COALESCE(a.taxonomy_array" not in mrf_source
+    assert "a.address_key::uuid AS address_key" in mrf_source
 
 
 def test_entity_address_unified_registers_ptg_address_overlay_source():
@@ -708,6 +709,7 @@ def test_entity_address_unified_registers_ptg_address_overlay_source():
     assert "WHEN COALESCE(CARDINALITY(p.ptg_source_array), 0) = 0 THEN ARRAY[p.source_key]::varchar[]" in ptg_source
     assert "COALESCE(p.group_plan_array, ARRAY[]::varchar[])::varchar[] AS group_plan_array" in ptg_source
     assert "('ptg:' || p.snapshot_id)::varchar AS ptg_address_version" in ptg_source
+    assert "p.address_key::uuid AS address_key" in ptg_source
 
 
 def test_entity_address_unified_can_range_shard_large_source_selects():
@@ -774,7 +776,8 @@ def test_entity_address_unified_sql_carries_address_key(monkeypatch):
                '78701'::varchar AS postal_code, 'US'::varchar AS country_code,
                NULL::varchar AS telephone_number, NULL::varchar AS fax_number,
                NULL::varchar AS formatted_address, NULL::numeric AS lat, NULL::numeric AS long,
-               NULL::date AS date_added, NULL::varchar AS place_id, NOW()::timestamp AS updated_at,
+               NULL::date AS date_added, NULL::varchar AS place_id, NULL::uuid AS address_key,
+               NOW()::timestamp AS updated_at,
                'nppes'::varchar AS address_source, 'nppes:1'::varchar AS source_record_id
         """,
     )
@@ -795,7 +798,10 @@ def test_entity_address_unified_sql_carries_address_key(monkeypatch):
     assert "long = COALESCE(k.archive_long, r.long)" in enrich_sql
     assert "place_id = COALESCE(k.archive_place_id, r.place_id)" in enrich_sql
     assert "location_key = encode(sha256(convert_to" in enrich_sql
-    assert "mrf.addr_key_v1(first_line, second_line, city_name, state_name, postal_code, country_code) AS address_key" in insert_sql
+    assert (
+        "COALESCE(address_key::uuid, "
+        "mrf.addr_key_v1(first_line, second_line, city_name, state_name, postal_code, country_code)) AS address_key"
+    ) in insert_sql
     assert "ptg_plan_array," in insert_sql
     assert "COALESCE(ptg_plan_array, ARRAY[]::varchar[])::varchar[] AS ptg_plan_array" in insert_sql
     assert "ptg_address_version," in insert_sql
@@ -1179,6 +1185,23 @@ def test_ptg_address_insert_sql_uses_existing_provider_location_projection():
     assert "ON CONFLICT (source_key, snapshot_id, location_key) DO NOTHING" in sql
 
 
+def test_ptg_archive_source_sql_materializes_provider_location_addresses():
+    sql = ptg_address._ptg_archive_source_sql(
+        "mrf",
+        "ptg_address_stage_archive_source",
+        address_canon_available=True,
+        provider_group_location_table="ptg2_provider_group_location_abc123",
+    )
+
+    assert "CREATE UNLOGGED TABLE mrf.ptg_address_stage_archive_source AS" in sql
+    assert 'FROM "mrf"."ptg2_provider_group_location_abc123" loc' in sql
+    assert "COALESCE(source_address_key, mrf.addr_key_v1(first_line, second_line, city, state, postal_code, country_code))" in sql
+    assert "SELECT DISTINCT" in sql
+    assert "first_line" in sql
+    assert "city_name" in sql
+    assert "postal_code" in sql
+
+
 def test_ptg_address_snapshot_table_name_allowlist_rejects_unsafe_names():
     assert (
         ptg_address._snapshot_provider_group_location_table_name(
@@ -1423,7 +1446,8 @@ def test_entity_address_unified_sql_falls_back_without_canonical_functions():
                '78701'::varchar AS postal_code, 'US'::varchar AS country_code,
                NULL::varchar AS telephone_number, NULL::varchar AS fax_number,
                NULL::varchar AS formatted_address, NULL::numeric AS lat, NULL::numeric AS long,
-               NULL::date AS date_added, NULL::varchar AS place_id, NOW()::timestamp AS updated_at,
+               NULL::date AS date_added, NULL::varchar AS place_id, NULL::uuid AS address_key,
+               NOW()::timestamp AS updated_at,
                'nppes'::varchar AS address_source, 'nppes:1'::varchar AS source_record_id
         """,
         address_canon_available=False,
@@ -1435,8 +1459,8 @@ def test_entity_address_unified_sql_falls_back_without_canonical_functions():
         address_canon_available=False,
     )
 
-    assert "NULL::uuid AS address_key" in insert_sql
-    assert "NULL::uuid AS address_key" in direct_sql
+    assert "COALESCE(address_key::uuid, NULL::uuid) AS address_key" in insert_sql
+    assert "COALESCE(address_key::uuid, NULL::uuid) AS address_key" in direct_sql
     assert "addr_key_v1" not in insert_sql
     assert "addr_key_v1" not in direct_sql
     assert "ARRAY_AGG(lat ORDER BY (lat IS NULL), source_priority ASC" in direct_sql
@@ -1538,6 +1562,10 @@ async def test_entity_address_unified_publish_integrity_checks_archive_and_bridg
             statements.append(statement)
             return 0
 
+        async def all(self, statement):
+            statements.append(statement)
+            return []
+
     async def table_exists(_schema, _table):
         return True
 
@@ -1554,10 +1582,14 @@ async def test_entity_address_unified_publish_integrity_checks_archive_and_bridg
     assert metrics["null_location_keys"] == 0
     assert metrics["duplicate_location_keys"] == 0
     assert metrics["unresolved_merged_into_rows"] == 0
+    assert metrics["missing_archive_address_key_rows"] == 0
+    assert metrics["practice_null_address_key_rows"] == 0
+    assert metrics["practice_null_address_key_by_source"] == {}
     assert metrics["archive_identity_mismatch_rows"] == 0
     assert metrics["invalid_coordinate_rows"] == 0
     assert metrics["bridge_orphans"]["entity_address_plan_bridge_20260614"] == 0
     assert any("a.merged_into IS NOT NULL" in statement for statement in statements)
+    assert any("NOT EXISTS" in statement and "address_archive_v2 AS a" in statement for statement in statements)
     assert any("COALESCE(archive_identity_version, '') <> 'v1'" in statement for statement in statements)
     assert any("lat < -90 OR lat > 90" in statement for statement in statements)
     assert any(
@@ -1580,6 +1612,9 @@ async def test_entity_address_unified_publish_integrity_fails_on_redirects_and_o
             if "FROM mrf.entity_address_procedure_bridge_20260614 AS b" in statement:
                 return 3
             return 0
+
+        async def all(self, _statement):
+            return []
 
     async def table_exists(_schema, _table):
         return True
@@ -1620,10 +1655,12 @@ async def test_ptg_address_publish_integrity_checks_coordinates_and_archive(monk
     assert metrics["null_location_keys"] == 0
     assert metrics["invalid_coordinate_rows"] == 0
     assert metrics["unresolved_merged_into_rows"] == 0
+    assert metrics["missing_archive_address_key_rows"] == 0
     assert metrics["archive_identity_mismatch_rows"] == 0
     assert metrics["base_archive_identity_mismatch_rows"] == 0
     assert any("lat < -90 OR lat > 90" in statement for statement in statements)
     assert any("a.merged_into IS NOT NULL" in statement for statement in statements)
+    assert any("NOT EXISTS" in statement and "address_archive_v2 AS a" in statement for statement in statements)
     assert any("mrf.entity_address_unified AS e" in statement for statement in statements)
 
 

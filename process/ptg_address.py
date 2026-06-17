@@ -26,8 +26,10 @@ from process.entity_address_unified import (
     _table_exists,
     _validate_schema_name,
 )
+from process.ext.address_canon import resolve_into_archive
 from process.ext.utils import ensure_database, make_class, my_init_db, print_time_info
 from process.live_progress import enqueue_live_progress
+from process.openaddresses import refresh_archive_geocodes_from_openaddresses
 from process.ptg_parts.db_tables import _quote_ident
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
@@ -36,6 +38,8 @@ logger = logging.getLogger(__name__)
 
 PTG_ADDRESS_QUEUE_NAME = "arq:PTGAddress"
 DEFAULT_MIN_ROWS = 1
+PTG_ADDRESS_ARCHIVE_SOURCE_BIT = 128
+PTG_ADDRESS_ARCHIVE_PRIORITY = 8
 PTG_PROVIDER_GROUP_LOCATION_PREFIX = "ptg2_provider_group_location_"
 PTG_PROVIDER_GROUP_MEMBER_PREFIX = "ptg2_provider_group_member_"
 PTG_SERVING_RATE_COMPACT_PREFIX = "ptg2_serving_rate_compact_"
@@ -662,6 +666,87 @@ def _ptg_address_insert_sql(
     """
 
 
+def _ptg_archive_stage_table_name(stage_table: str) -> str:
+    return _archived_identifier(f"{stage_table}_archive_source", "")
+
+
+def _ptg_archive_source_sql(
+    db_schema: str,
+    archive_stage_table: str,
+    *,
+    address_canon_available: bool,
+    provider_group_location_table: str | None = None,
+    provider_group_member_table: str | None = None,
+) -> str:
+    source_ctes = _provider_location_source_ctes(
+        db_schema,
+        provider_group_location_table,
+        provider_group_member_table=provider_group_member_table,
+    )
+    country_expr = "country_code" if provider_group_location_table or provider_group_member_table else "'US'"
+    address_key_expr = (
+        f"COALESCE(source_address_key, {db_schema}.addr_key_v1(first_line, second_line, city, state, postal_code, {country_expr}))"
+        if address_canon_available
+        else "source_address_key"
+    )
+    return f"""
+    CREATE UNLOGGED TABLE {db_schema}.{archive_stage_table} AS
+    WITH {source_ctes}
+    SELECT DISTINCT
+        {address_key_expr}::uuid AS address_key,
+        NULLIF(BTRIM(first_line), '')::varchar AS first_line,
+        NULLIF(BTRIM(second_line), '')::varchar AS second_line,
+        NULLIF(BTRIM(city), '')::varchar AS city_name,
+        NULLIF(BTRIM(state), '')::varchar AS state_name,
+        NULLIF(BTRIM(postal_code), '')::varchar AS postal_code,
+        COALESCE(NULLIF(BTRIM(country_code), ''), 'US')::varchar AS country_code
+      FROM shaped
+     WHERE NULLIF(BTRIM(first_line), '') IS NOT NULL
+        OR NULLIF(BTRIM(city), '') IS NOT NULL
+        OR NULLIF(BTRIM(state), '') IS NOT NULL
+        OR NULLIF(BTRIM(postal_code), '') IS NOT NULL
+        OR source_address_key IS NOT NULL;
+    """
+
+
+async def _sync_ptg_source_into_archive(
+    db_schema: str,
+    archive_stage_table: str,
+    *,
+    address_canon_available: bool,
+    provider_group_location_table: str | None = None,
+    provider_group_member_table: str | None = None,
+):
+    await db.status(f"DROP TABLE IF EXISTS {db_schema}.{archive_stage_table};")
+    try:
+        await db.status(
+            _ptg_archive_source_sql(
+                db_schema,
+                archive_stage_table,
+                address_canon_available=address_canon_available,
+                provider_group_location_table=provider_group_location_table,
+                provider_group_member_table=provider_group_member_table,
+            )
+        )
+        await db.status(f"ANALYZE {db_schema}.{archive_stage_table};")
+        return await resolve_into_archive(
+            archive_stage_table,
+            {
+                "first_line": "first_line",
+                "second_line": "second_line",
+                "city": "city_name",
+                "state": "state_name",
+                "zip": "postal_code",
+                "country": "COALESCE(NULLIF(country_code, ''), 'US')",
+            },
+            source_bit=PTG_ADDRESS_ARCHIVE_SOURCE_BIT,
+            priority=PTG_ADDRESS_ARCHIVE_PRIORITY,
+            schema=db_schema,
+        )
+    finally:
+        await db.status(f"DROP TABLE IF EXISTS {db_schema}.{archive_stage_table};")
+
+
 async def process_data(ctx, task=None):
     task = task or {}
     ctx.setdefault("context", {})
@@ -742,6 +827,70 @@ async def process_data(ctx, task=None):
                 "provider_set_component_table": provider_set_component_table,
             }
         )
+
+    context["sources"] = source_contexts
+    context["skipped_sources"] = skipped_sources
+    if not source_contexts:
+        raise RuntimeError(
+            "No PTG provider-location sources were available; publish at least one compact PTG snapshot "
+            "with provider_group_location_table or run the legacy ptg2_provider_location projection."
+        )
+
+    archive_resolve_stats = []
+    if archive_available and address_canon_available:
+        archive_stage_table = _ptg_archive_stage_table_name(stage_table)
+        for source_context in source_contexts:
+            stats = await _sync_ptg_source_into_archive(
+                db_schema,
+                archive_stage_table,
+                address_canon_available=address_canon_available,
+                provider_group_location_table=source_context.get("provider_group_location_table"),
+                provider_group_member_table=source_context.get("provider_group_member_table"),
+            )
+            archive_resolve_stats.append(
+                {
+                    "source_key": source_context.get("source_key"),
+                    "snapshot_id": source_context.get("snapshot_id"),
+                    "staged": getattr(stats, "staged", None),
+                    "distinct_keys": getattr(stats, "distinct_keys", None),
+                    "inserted": getattr(stats, "inserted", None),
+                    "eligible_null_key_rows": getattr(stats, "eligible_null_key_rows", None),
+                    "gate_violations": list(getattr(stats, "gate_violations", ()) or ()),
+                }
+            )
+            logger.info(
+                "PTG canonical address resolve complete for %s/%s: %s",
+                source_context.get("source_key"),
+                source_context.get("snapshot_id"),
+                stats,
+            )
+        oa_stats = await refresh_archive_geocodes_from_openaddresses(schema=db_schema)
+        context["archive_resolve"] = archive_resolve_stats
+        context["openaddresses_backfill"] = {
+            "exact_updates": oa_stats.exact_updates,
+            "fuzzy_updates": oa_stats.fuzzy_updates,
+            "relaxed_updates": oa_stats.relaxed_updates,
+        }
+        logger.info(
+            "OpenAddresses archive backfill after PTG canonical resolve: exact=%s fuzzy=%s relaxed=%s",
+            oa_stats.exact_updates,
+            oa_stats.fuzzy_updates,
+            oa_stats.relaxed_updates,
+        )
+    else:
+        logger.warning(
+            "Skipping PTG canonical archive sync: address_canon_available=%s archive_available=%s",
+            address_canon_available,
+            archive_available,
+        )
+
+    for source_context in source_contexts:
+        source_key = str(source_context["source_key"] or "")
+        snapshot_id = str(source_context["snapshot_id"] or "")
+        provider_group_location_table = source_context.get("provider_group_location_table")
+        provider_group_member_table = source_context.get("provider_group_member_table")
+        serving_rate_compact_table = source_context.get("serving_rate_compact_table")
+        provider_set_component_table = source_context.get("provider_set_component_table")
         insert_sql = _ptg_address_insert_sql(
             db_schema,
             stage_table,
@@ -762,13 +911,6 @@ async def process_data(ctx, task=None):
         async with db.transaction() as session:
             await session.execute(db.text(f"SET LOCAL statement_timeout = {timeout};"))
             await session.execute(db.text(insert_sql))
-    context["sources"] = source_contexts
-    context["skipped_sources"] = skipped_sources
-    if not source_contexts:
-        raise RuntimeError(
-            "No PTG provider-location sources were available; publish at least one compact PTG snapshot "
-            "with provider_group_location_table or run the legacy ptg2_provider_location projection."
-        )
     await _create_stage_indexes(stage_cls, db_schema)
     await db.status(f"ANALYZE {db_schema}.{stage_table};")
     row_count = int(await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{stage_table};") or 0)
@@ -814,6 +956,7 @@ async def _validate_publish_integrity(
         failures.append(f"{invalid_coordinate_rows} staged rows have invalid latitude/longitude values")
 
     unresolved_merged_into_rows = 0
+    missing_archive_address_key_rows = 0
     if await _table_exists(db_schema, "address_archive_v2"):
         unresolved_merged_into_rows = int(
             await db.scalar(
@@ -828,10 +971,31 @@ async def _validate_publish_integrity(
             )
             or 0
         )
+        missing_archive_address_key_rows = int(
+            await db.scalar(
+                f"""
+                SELECT COUNT(*)
+                  FROM {db_schema}.{stage_table} AS t
+                 WHERE t.address_key IS NOT NULL
+                   AND NOT EXISTS (
+                       SELECT 1
+                         FROM {db_schema}.address_archive_v2 AS a
+                        WHERE a.address_key = t.address_key
+                          AND a.merged_into IS NULL
+                   );
+                """
+            )
+            or 0
+        )
     metrics["unresolved_merged_into_rows"] = unresolved_merged_into_rows
     if unresolved_merged_into_rows:
         failures.append(
             f"{unresolved_merged_into_rows} staged rows point to address_archive_v2.merged_into redirects"
+        )
+    metrics["missing_archive_address_key_rows"] = missing_archive_address_key_rows
+    if missing_archive_address_key_rows:
+        failures.append(
+            f"{missing_archive_address_key_rows} staged rows have address_key values missing from address_archive_v2"
         )
 
     archive_identity_mismatch_rows = int(

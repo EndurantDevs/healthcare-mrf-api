@@ -637,6 +637,7 @@ def _source_selects(
                 a.long::numeric AS long,
                 a.date_added::date AS date_added,
                 a.place_id::varchar AS place_id,
+                a.address_key::uuid AS address_key,
                 NOW()::timestamp AS updated_at,
                 'nppes'::varchar AS address_source,
                 ('nppes:' || a.npi::varchar || ':' || COALESCE(a.type, '') || ':' || COALESCE(a.checksum::varchar, '0'))::varchar AS source_record_id
@@ -683,6 +684,7 @@ def _source_selects(
                 d.longitude::numeric AS long,
                 NULL::date AS date_added,
                 NULL::varchar AS place_id,
+                d.address_key::uuid AS address_key,
                 COALESCE(d.updated_at, NOW())::timestamp AS updated_at,
                 'cms_doctors'::varchar AS address_source,
                 ('cms_doctors:' || d.npi::varchar || ':' || COALESCE(d.address_checksum::varchar, '0'))::varchar AS source_record_id
@@ -730,6 +732,7 @@ def _source_selects(
                 NULL::numeric AS long,
                 f.reporting_period_end::date AS date_added,
                 NULL::varchar AS place_id,
+                f.address_key::uuid AS address_key,
                 COALESCE(f.imported_at, NOW())::timestamp AS updated_at,
                 'provider_enrollment_ffs'::varchar AS address_source,
                 ('provider_enrollment_ffs:' || COALESCE(f.enrollment_id, f.record_hash::varchar))::varchar AS source_record_id
@@ -783,6 +786,7 @@ def _source_selects(
                 NULL::numeric AS long,
                 fa.reporting_period_end::date AS date_added,
                 NULL::varchar AS place_id,
+                fa.address_key::uuid AS address_key,
                 COALESCE(f.imported_at, NOW())::timestamp AS updated_at,
                 'provider_enrollment_ffs_address'::varchar AS address_source,
                 ('provider_enrollment_ffs_address:' || COALESCE(fa.enrollment_id, fa.record_hash::varchar))::varchar AS source_record_id
@@ -1041,6 +1045,7 @@ def _source_selects(
                 fa.longitude::numeric AS long,
                 NULL::date AS date_added,
                 NULL::varchar AS place_id,
+                fa.address_key::uuid AS address_key,
                 COALESCE(fa.updated_at, NOW())::timestamp AS updated_at,
                 ('facility_anchor:' || LOWER(COALESCE(fa.source_dataset, 'unknown')))::varchar AS address_source,
                 ('facility_anchor:' || COALESCE(fa.id, 'unknown'))::varchar AS source_record_id
@@ -1088,6 +1093,7 @@ def _source_selects(
                 a.long::numeric AS long,
                 a.date_added::date AS date_added,
                 a.place_id::varchar AS place_id,
+                a.address_key::uuid AS address_key,
                 NOW()::timestamp AS updated_at,
                 'mrf'::varchar AS address_source,
                 ('mrf:' || a.npi::varchar || ':' || COALESCE(a.type, '') || ':' || COALESCE(a.checksum::varchar, '0'))::varchar AS source_record_id
@@ -1138,6 +1144,7 @@ def _source_selects(
                 p.long::numeric AS long,
                 NULL::date AS date_added,
                 NULL::varchar AS place_id,
+                p.address_key::uuid AS address_key,
                 COALESCE(p.updated_at, NOW())::timestamp AS updated_at,
                 'ptg'::varchar AS address_source,
                 ('ptg:' || p.source_key || ':' || p.snapshot_id || ':' || p.location_key)::varchar AS source_record_id
@@ -1550,6 +1557,7 @@ async def _validate_publish_integrity(
         failures.append(f"{duplicate_location_keys} duplicate staged location_key values")
 
     unresolved_merged_into_rows = 0
+    missing_archive_address_key_rows = 0
     if await _table_exists(db_schema, "address_archive_v2"):
         unresolved_merged_into_rows = int(
             await db.scalar(
@@ -1564,11 +1572,61 @@ async def _validate_publish_integrity(
             )
             or 0
         )
+        missing_archive_address_key_rows = int(
+            await db.scalar(
+                f"""
+                SELECT COUNT(*)
+                  FROM {db_schema}.{stage_table} AS t
+                 WHERE t.address_key IS NOT NULL
+                   AND NOT EXISTS (
+                       SELECT 1
+                         FROM {db_schema}.address_archive_v2 AS a
+                        WHERE a.address_key = t.address_key
+                          AND a.merged_into IS NULL
+                   );
+                """
+            )
+            or 0
+        )
     metrics["unresolved_merged_into_rows"] = unresolved_merged_into_rows
     if unresolved_merged_into_rows:
         failures.append(
             f"{unresolved_merged_into_rows} staged rows point to address_archive_v2.merged_into redirects"
         )
+    metrics["missing_archive_address_key_rows"] = missing_archive_address_key_rows
+    if missing_archive_address_key_rows:
+        failures.append(
+            f"{missing_archive_address_key_rows} staged rows have address_key values missing from address_archive_v2"
+        )
+
+    practice_null_address_key_rows = int(
+        await db.scalar(
+            f"""
+            SELECT COUNT(*)
+              FROM {db_schema}.{stage_table}
+             WHERE type = 'practice'
+               AND address_key IS NULL;
+            """
+        )
+        or 0
+    )
+    metrics["practice_null_address_key_rows"] = practice_null_address_key_rows
+    practice_null_address_key_by_source_rows = await db.all(
+        f"""
+        SELECT COALESCE(source, 'unknown') AS source, COUNT(*)::bigint AS rows
+          FROM {db_schema}.{stage_table} AS t
+          LEFT JOIN LATERAL unnest(t.address_sources) AS source ON TRUE
+         WHERE t.type = 'practice'
+           AND t.address_key IS NULL
+      GROUP BY COALESCE(source, 'unknown')
+      ORDER BY rows DESC, source
+         LIMIT 20;
+        """
+    )
+    metrics["practice_null_address_key_by_source"] = {
+        str(row._mapping["source"]): int(row._mapping["rows"] or 0)
+        for row in practice_null_address_key_by_source_rows
+    }
 
     archive_identity_mismatch_rows = int(
         await db.scalar(
@@ -1715,7 +1773,7 @@ def _insert_raw_from_source_sql(
             address_source::varchar AS address_source,
             source_record_id::varchar AS source_record_id,
             updated_at::timestamp AS updated_at,
-            {_address_key_expr(db_schema, address_canon_available)} AS address_key
+            COALESCE(address_key::uuid, {_address_key_expr(db_schema, address_canon_available)}) AS address_key
           FROM base_rows
     ),
     normalized AS (
@@ -2101,7 +2159,7 @@ def _materialize_sql(
             address_source::varchar AS address_source,
             source_record_id::varchar AS source_record_id,
             updated_at::timestamp AS updated_at,
-            {_address_key_expr(db_schema, address_canon_available)} AS address_key
+            COALESCE(address_key::uuid, {_address_key_expr(db_schema, address_canon_available)}) AS address_key
           FROM base_rows
     ),
     normalized AS (

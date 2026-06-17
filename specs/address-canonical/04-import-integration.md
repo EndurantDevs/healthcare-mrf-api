@@ -64,6 +64,8 @@ verification gate (06).
 ### 5. Marketplace MRF (`process/initial.py`)
 - `address_key` on `MRFAddress` + `MRFAddressEvidence` rows
   (`source_bit=16, priority=5`); resolve runs after `_refresh_mrf_address_summary`.
+- After resolve, the OpenAddresses cache backfills any newly inserted archive
+  rows before downstream unified serving rebuilds consume the archive.
 - Optional (Phase 6): write `address_observation` rows — MRF tables are dropped
   every import, so this is the only durable history MRF addresses will ever have.
 
@@ -86,7 +88,7 @@ verification gate (06).
 - `mrf_address` registered as source select #6 (fixes B3) — independent of the
   flag.
 
-### 9. PTG / PTG2 (group-plan / pricing MRF data) — no changes required
+### 9. PTG / PTG2 (group-plan / pricing MRF data)
 
 Verified directly: the pricing files themselves contain **no postal addresses**.
 
@@ -105,14 +107,12 @@ Verified directly: the pricing files themselves contain **no postal addresses**.
   `location_hash = md5(npi|source|zip5|city_norm|state)` (`:325`) and a
   denormalized `address_payload` JSON. Note the hash is deliberately
   city/zip-grained (no street component).
-- Therefore PTG2 **inherits** address quality from upstream: every Phase 2/5
-  improvement (deduped sources, unified key v2, the B2 chimera fix) flows into
-  PTG2 location candidates automatically on its next precompute.
-- Optional Phase 6 enhancement (not required for correctness): include
-  `address_key` in `address_payload` (and in the
-  `ptg2_provider_group_location_*` snapshots, which today copy
-  `npi_address.checksum` verbatim) so pricing locations are traceable to the
-  canonical address book.
+- Therefore PTG2 **inherits** address quality from upstream for most rows, but
+  the `ptg_address` projection also stages its source address text into the
+  canonical archive before publishing (`source_bit=128, priority=8`). The
+  projection then runs the same OpenAddresses archive backfill and joins
+  `address_archive_v2`, so PTG overlay rows see the current canonical geocode
+  cache without forcing a full unified rebuild.
 
 ### 10. MRF source discovery — no changes
 - `mrf_source_discovery` handles URLs, not postal addresses.
