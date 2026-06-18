@@ -3,6 +3,7 @@
 import asyncio
 import importlib
 import importlib.util
+import inspect
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -71,6 +72,12 @@ def test_address_canonical_current_rekey_migration_uses_single_current_format():
     assert "pg_temp.address_archive_rekey_candidates" in candidate_sql
     assert "{checksum_map}" not in combined
     assert "'v1|'" not in combined
+    source = inspect.getsource(migration._rekey_source_tables)
+    assert "archive_identity_version = 'v2'" in source
+    assert "ptg_address" in migration._foundation_module().ADDRESS_KEY_TABLES
+    assert "entity_address_evidence" in migration._foundation_module().ADDRESS_KEY_TABLES
+    defaults_source = inspect.getsource(migration._set_current_archive_identity_defaults)
+    assert "ALTER COLUMN archive_identity_version SET DEFAULT 'v2'" in defaults_source
 
 
 def test_resolve_materialization_carries_source_ctid_for_resolve_aliases():

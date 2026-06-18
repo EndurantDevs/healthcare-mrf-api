@@ -344,15 +344,28 @@ def _rekey_source_tables(bind, foundation, schema: str) -> None:
     for table in foundation.ADDRESS_KEY_TABLES:
         if not _table_exists(bind, schema, table) or not _column_exists(bind, schema, table, "address_key"):
             continue
+        assignments = ["address_key = m.new_address_key"]
+        if _column_exists(bind, schema, table, "archive_identity_version"):
+            assignments.append("archive_identity_version = 'v2'")
         bind.exec_driver_sql(
             f"""
             UPDATE {_q(schema, table)} AS target
-               SET address_key = m.new_address_key
+               SET {", ".join(assignments)}
               FROM address_archive_rewrite_map AS m
-             WHERE target.address_key = m.old_address_key
-               AND target.address_key IS DISTINCT FROM m.new_address_key;
+             WHERE target.address_key = m.old_address_key;
             """
         )
+
+
+def _set_current_archive_identity_defaults(bind, schema: str) -> None:
+    for table in ("entity_address_unified", "ptg_address"):
+        if _table_exists(bind, schema, table) and _column_exists(bind, schema, table, "archive_identity_version"):
+            bind.exec_driver_sql(
+                f"""
+                ALTER TABLE {_q(schema, table)}
+                ALTER COLUMN archive_identity_version SET DEFAULT 'v2';
+                """
+            )
 
 
 def upgrade() -> None:
@@ -370,6 +383,7 @@ def upgrade() -> None:
     bind.exec_driver_sql(
         f"ALTER TABLE {archive} ALTER COLUMN identity_version SET DEFAULT 2;"
     )
+    _set_current_archive_identity_defaults(bind, schema)
 
     foundation._exec_sql_batch(bind, _create_rekey_candidates_sql(schema))
     unmapped_rows = int(

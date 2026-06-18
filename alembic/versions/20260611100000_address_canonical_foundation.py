@@ -36,6 +36,8 @@ ADDRESS_KEY_TABLES = (
     "partd_pharmacy_activity_v2",
     "partd_pharmacy_activity_stage_v2",
     "entity_address_unified",
+    "ptg_address",
+    "entity_address_evidence",
 )
 
 ORDINAL_WORD_MAP = {
