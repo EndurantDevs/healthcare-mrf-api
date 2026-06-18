@@ -80,10 +80,14 @@ queue_depth() {
   "$PYTHON_BIN" - "$1" <<'PY'
 import asyncio
 import sys
+from pathlib import Path
 
 from arq.connections import create_pool
+from dotenv import load_dotenv
 
 from process.redis_config import build_redis_settings
+
+load_dotenv(Path.cwd() / ".env")
 
 
 async def main() -> None:
