@@ -115,6 +115,35 @@ def _truthy(value, truthy=("yes", "y", "true")) -> bool:
     return bool(value)
 
 
+def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
+    raw_value = os.environ.get(name)
+    if raw_value is None or str(raw_value).strip() == "":
+        return default
+    try:
+        value = int(str(raw_value).strip())
+    except (TypeError, ValueError):
+        logger.warning("Ignoring invalid integer env %s=%r; using %s", name, raw_value, default)
+        return default
+    return max(value, minimum)
+
+
+def _mrf_plan_flush_rows(test_mode: bool = False) -> int:
+    default = min(TEST_PLAN_RECORDS, 10) if test_mode else 2000
+    if os.environ.get("HLTHPRT_MRF_PLAN_FLUSH_ROWS") is not None:
+        return _env_int("HLTHPRT_MRF_PLAN_FLUSH_ROWS", default)
+    return _env_int("HLTHPRT_SAVE_PER_PACK", default)
+
+
+def _mrf_provider_flush_rows(test_mode: bool = False) -> int:
+    default = min(TEST_PROVIDER_RECORDS, 25) if test_mode else 50000
+    return _env_int("HLTHPRT_MRF_PROVIDER_FLUSH_ROWS", default)
+
+
+def _mrf_formulary_flush_rows(test_mode: bool = False) -> int:
+    default = min(TEST_DRUG_RECORDS, 100) if test_mode else 50000
+    return _env_int("HLTHPRT_MRF_FORMULARY_FLUSH_ROWS", default)
+
+
 def _transparency_zip_path(tmpdirname: str, file_idx: int, file: dict) -> str:
     year = re.sub(r"[^0-9A-Za-z_]+", "_", str(file.get("year") or file_idx)).strip("_")
     if not year:
@@ -735,6 +764,7 @@ async def process_plan(ctx, task):
     import_date = ctx["context"]["import_date"]
     test_mode = is_test_mode(ctx)
     plan_limit = TEST_PLAN_RECORDS if test_mode else None
+    plan_flush_rows = _mrf_plan_flush_rows(test_mode)
     await ensure_database(test_mode)
 
     db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
@@ -894,7 +924,7 @@ async def process_plan(ctx, task):
                             if plan_limit and processed_plans >= plan_limit:
                                 stop_processing = True
                                 break
-                            if count > int(os.environ.get("HLTHPRT_SAVE_PER_PACK", 50)):
+                            if count > plan_flush_rows:
                                 await asyncio.gather(
                                     push_objects(plan_obj, myplan),
                                     push_objects(planbenefitsmarketplace_obj, myplanbenefitsmarketplace),
@@ -981,7 +1011,7 @@ async def process_plan(ctx, task):
                                                 "coinsurance_opt": cost_sharing.get("coinsurance_opt", ""),
                                             }
                                             planformulary_obj.append(obj)
-                                            if count > int(os.environ.get("HLTHPRT_SAVE_PER_PACK", 50)):
+                                            if count > plan_flush_rows:
                                                 await _push_mrf_duplicate_tolerant_rows(planformulary_obj, myplanformulary)
                                                 planformulary_obj.clear()
                                                 count = 0
@@ -1071,6 +1101,7 @@ async def process_provider(ctx, task):
     import_date = ctx["context"]["import_date"]
     test_mode = is_test_mode(ctx)
     provider_limit = TEST_PROVIDER_RECORDS if test_mode else None
+    provider_flush_rows = _mrf_provider_flush_rows(test_mode)
     await ensure_database(test_mode)
 
     current_year = datetime.datetime.now().year
@@ -1294,7 +1325,7 @@ async def process_provider(ctx, task):
 
                     processed_providers += 1
                     count += 1
-                    if count > 10000:
+                    if count > provider_flush_rows:
                         await asyncio.gather(
                             _push_mrf_duplicate_tolerant_rows(list(plan_npi_obj_dict.values()), myplan_npi),
                             _push_mrf_duplicate_tolerant_rows(list(plan_network_year.values()), myplan_networktier),
@@ -1491,6 +1522,29 @@ async def _refresh_plan_drug_statistics(plan_ids, import_date, db_schema):
         await tier_insert.status()
 
 
+async def _refresh_all_plan_drug_statistics(import_date, db_schema):
+    plan_drug_cls = make_class(PlanDrugRaw, import_date, schema_override=db_schema)
+    qualified_name = f"{db_schema}.{plan_drug_cls.__tablename__}"
+    exists = await db.scalar("SELECT to_regclass(:qualified_name)", qualified_name=qualified_name)
+    if not exists:
+        logger.info("Skipping plan-drug stats refresh; %s does not exist", qualified_name)
+        return
+
+    rows = await db.all(
+        text(
+            f"""
+            SELECT DISTINCT plan_id
+              FROM {qualified_name}
+             WHERE plan_id IS NOT NULL
+            """
+        )
+    )
+    plan_ids = []
+    for row in rows:
+        plan_ids.append(getattr(row, "plan_id", row[0]))
+    await _refresh_plan_drug_statistics(plan_ids, import_date, db_schema)
+
+
 async def _plan_summary_dependencies_ready(db_schema: str) -> tuple[bool, list[str]]:
     missing = []
     for table_name in ("plan_attributes", "plan_benefits", "plan_prices"):
@@ -1510,12 +1564,12 @@ async def process_formulary(ctx, task):
     import_date = ctx["context"]["import_date"]
     test_mode = is_test_mode(ctx)
     drug_limit = TEST_DRUG_RECORDS if test_mode else None
+    formulary_flush_rows = _mrf_formulary_flush_rows(test_mode)
     await ensure_database(test_mode)
 
     db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
     myimportlog = make_class(ImportLog, import_date, schema_override=db_schema)
     myplan_drug = make_class(PlanDrugRaw, import_date, schema_override=db_schema)
-    touched_plan_ids = set()
 
     print("Starting Formulary file data download: ", task.get("url"))
     with tempfile.TemporaryDirectory() as tmpdirname:
@@ -1589,12 +1643,11 @@ async def process_formulary(ctx, task):
                             except (ValueError, TypeError):
                                 record["last_updated_on"] = None
                         batch.append(record)
-                        touched_plan_ids.add(plan_id)
 
                     processed += 1
                     if drug_limit and processed >= drug_limit:
                         break
-                    if len(batch) > 10000:
+                    if len(batch) > formulary_flush_rows:
                         await _push_mrf_duplicate_tolerant_rows(batch, myplan_drug)
                         batch.clear()
 
@@ -1624,9 +1677,6 @@ async def process_formulary(ctx, task):
         if batch:
             await _push_mrf_duplicate_tolerant_rows(batch, myplan_drug)
 
-    if touched_plan_ids:
-        await _refresh_plan_drug_statistics(touched_plan_ids, import_date, db_schema)
-
     await flush_error_log(myimportlog)
     return 1
 
@@ -1651,9 +1701,6 @@ async def save_mrf_data(ctx, task):
             case "plan_drugs":
                 myplan_drugs = make_class(PlanDrugRaw, import_date, schema_override=db_schema)
                 await push_objects(task["plan_drugs"], myplan_drugs, rewrite=True)
-                plan_ids = {entry.get("plan_id") for entry in task["plan_drugs"] if entry.get("plan_id")}
-                if plan_ids:
-                    await _refresh_plan_drug_statistics(plan_ids, import_date, db_schema)
             case "plan_benefits_marketplace":
                 myplanbenefitsmarketplace = make_class(
                     PlanBenefitsMarketplace, import_date, schema_override=db_schema
@@ -2367,6 +2414,7 @@ async def shutdown(ctx, task):
             print(f"Failed Import: Plans number:{plans_count}")
             sys.exit(1)
 
+    await _refresh_all_plan_drug_statistics(import_date, db_schema)
     await _refresh_mrf_address_summary(import_date, db_schema)
     address_stats = None
     if source_enabled("mrf"):
