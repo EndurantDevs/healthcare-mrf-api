@@ -527,11 +527,16 @@ AS $$
           FROM raw_parts
     ),
     counted AS (
-        SELECT token, ord, count(*) OVER () AS token_count, max(ord) OVER () AS last_ord
+        SELECT
+            token,
+            ord,
+            lead(token) OVER (ORDER BY ord) AS next_token,
+            count(*) OVER () AS token_count,
+            max(ord) OVER () AS last_ord
           FROM parts
     ),
     retained AS (
-        SELECT token, ord, lead(token) OVER (ORDER BY ord) AS next_token
+        SELECT token, ord, next_token
           FROM counted
          WHERE NOT (
             token_count >= 2
@@ -663,6 +668,7 @@ AS $$
         SELECT
             parts.token,
             parts.ord,
+            lead(parts.token) OVER (ORDER BY parts.ord) AS next_token,
             count(*) FILTER (WHERE direction.direction_ord IS NULL OR parts.ord <> direction.direction_ord)
                 OVER () AS retained_count,
             max(parts.ord) FILTER (WHERE direction.direction_ord IS NULL OR parts.ord <> direction.direction_ord)
@@ -671,7 +677,7 @@ AS $$
           FROM parts, direction
     ),
     retained AS (
-        SELECT token, ord, lead(token) OVER (ORDER BY ord) AS next_token
+        SELECT token, ord, next_token
           FROM marked
          WHERE (direction_ord IS NULL OR ord <> direction_ord)
            AND NOT (

@@ -80,6 +80,24 @@ def test_address_canonical_current_rekey_migration_uses_single_current_format():
     assert "ALTER COLUMN archive_identity_version SET DEFAULT 'v2'" in defaults_source
 
 
+def test_sql_street_alias_helpers_keep_original_next_token_context():
+    migration = _load_migration("20260611100000_address_canonical_foundation.py")
+    sql = migration._create_functions_sql("mrf")
+    suffixless_sql = sql.split("CREATE OR REPLACE FUNCTION \"mrf\".addr_street_suffixless_norm_v1", 1)[1].split(
+        "CREATE OR REPLACE FUNCTION \"mrf\".addr_street_direction_index_v1",
+        1,
+    )[0]
+    completion_sql = sql.split("CREATE OR REPLACE FUNCTION \"mrf\".addr_street_completion_norm_v1", 1)[1].split(
+        "CREATE OR REPLACE FUNCTION \"mrf\".addr_city_norm_v1",
+        1,
+    )[0]
+
+    assert "lead(token) OVER (ORDER BY ord) AS next_token" in suffixless_sql
+    assert "SELECT token, ord, next_token\n          FROM counted" in suffixless_sql
+    assert "lead(parts.token) OVER (ORDER BY parts.ord) AS next_token" in completion_sql
+    assert "SELECT token, ord, next_token\n          FROM marked" in completion_sql
+
+
 def test_resolve_materialization_carries_source_ctid_for_resolve_aliases():
     ddl = address_canon._keyed_temp_table_ddl("address_archive_resolve_keyed")
     raw_copy_sql = address_canon._keyed_raw_copy_sql(
