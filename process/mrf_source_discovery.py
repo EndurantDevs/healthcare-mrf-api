@@ -2562,6 +2562,12 @@ def _import_control_supported_rate_domain(value: Any) -> bool:
     return normalized in {"in_network", "in_network_rates"}
 
 
+def _import_control_snapshot_file_is_supported(file_type: Any, metadata: dict[str, Any], from_index_url: Any) -> bool:
+    if not str(from_index_url or "").strip():
+        return False
+    return _import_control_supported_rate_domain(metadata.get("domain") or file_type)
+
+
 async def _import_control_snapshot_items(source_ids: list[str]) -> dict[str, list[dict[str, Any]]]:
     """Read the currently-stored MRF file snapshot for the given sources and build
     import-control preview items grouped by healthcare source_id. Prefer the exact
@@ -2605,7 +2611,7 @@ async def _import_control_snapshot_items(source_ids: list[str]) -> dict[str, lis
     for row in rows:
         metadata = _coerce_metadata(row[5])
         file_domain = metadata.get("domain") or row[3]
-        if not _import_control_supported_rate_domain(file_domain):
+        if not _import_control_snapshot_file_is_supported(file_domain, metadata, row[11]):
             continue
         plan_info = metadata.get("plan_info") or []
         if not plan_info:

@@ -158,6 +158,20 @@ async def test_import_control_snapshot_items_skip_non_serving_rate_files(monkeyp
                 "In-network rates",
                 "https://example.com/index.json",
             ),
+            (
+                "source_1",
+                "https://example.com/direct-in-network-rates.json.gz",
+                "https://example.com/direct-in-network-rates.json.gz",
+                "in-network",
+                789,
+                {"plan_info": plan_info},
+                None,
+                None,
+                None,
+                "Direct In Network",
+                "Direct in-network rates",
+                None,
+            ),
         ]
 
     monkeypatch.setattr(discovery.db, "all", fake_all)
