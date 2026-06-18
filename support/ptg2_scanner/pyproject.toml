@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.14,<2"]
+build-backend = "maturin"
+
+[project]
+name = "ptg2_address_canon"
+version = "0.1.0"
+requires-python = ">=3.13"
+description = "HealthPorta address canonicalizer bindings from the PTG2 Rust scanner"
+
+[tool.maturin]
+features = ["python-extension"]
+module-name = "ptg2_address_canon"

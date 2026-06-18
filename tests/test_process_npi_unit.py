@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 
 import os
 import datetime
+import uuid
 from contextlib import asynccontextmanager
 
 import pytest
@@ -294,6 +295,51 @@ async def test_process_npi_chunk_precomputes_address_key_when_enabled(monkeypatc
         "78702",
         "US",
     )
+
+
+@pytest.mark.asyncio
+async def test_process_npi_chunk_batches_address_key_precompute(monkeypatch, npi_module):
+    monkeypatch.setenv("HLTHPRT_ADDRESS_CANON_SOURCES", "nppes")
+
+    seen_batches = []
+
+    def fake_canonicalize_batch(rows):
+        rows = list(rows)
+        seen_batches.append(rows)
+        return [
+            {"address_key": "00000000-0000-4000-8000-000000000001"},
+            {"address_key": "00000000-0000-4000-8000-000000000002"},
+        ]
+
+    monkeypatch.setattr(npi_module, "canonicalize_address_batch", fake_canonicalize_batch)
+    fake_redis = SimpleNamespace(enqueue_job=AsyncMock())
+    ctx = {"redis": fake_redis, "import_date": "20251104"}
+
+    npi_csv_map = {
+        "NPI": "npi",
+        "Entity Type Code": "entity_type_code",
+        "Provider Organization Name (Legal Business Name)": "provider_organization_name",
+    }
+    npi_csv_map_reverse = {value: key for key, value in npi_csv_map.items()}
+
+    await npi_module.process_npi_chunk(
+        ctx,
+        {
+            "npi_csv_map": npi_csv_map,
+            "npi_csv_map_reverse": npi_csv_map_reverse,
+            "row_list": [_build_minimal_row("1215387113")],
+        },
+    )
+
+    payload = fake_redis.enqueue_job.await_args.args[1]
+    address_by_type = {entry["type"]: entry for entry in payload["npi_address_list"]}
+    assert len(seen_batches) == 1
+    assert seen_batches[0] == [
+        ("123 Main St", "", "AUSTIN", "TX", "78701", "US"),
+        ("PO Box 1", "", "AUSTIN", "TX", "78702", "US"),
+    ]
+    assert address_by_type["primary"]["address_key"] == uuid.UUID("00000000-0000-4000-8000-000000000001")
+    assert address_by_type["mail"]["address_key"] == uuid.UUID("00000000-0000-4000-8000-000000000002")
 
 
 @pytest.mark.asyncio

@@ -26,19 +26,24 @@ until `HLTHPRT_ADDRESS_CANON_SOURCES` is set.
    5-minute window**. The API geocode upsert writes to this table, so run it
    when the API is idle or briefly drained.
 
-   The address identity functions are versioned but their v1 bodies were
-   hardened during review. Revision
+   The SQL function names are stable, but their bodies define the current
+   canonical key contract. Revision
    `20260611130000_reapply_address_canonical_functions` exists specifically to
    replay `CREATE OR REPLACE FUNCTION` on databases that already applied the
    original foundation revision. Revision
    `20260612193000_address_key_from_identity_function` adds the
    `addr_key_from_identity_v1(identity_key)` helper used by the set-based
    resolver/archive materialization path. Revision
-   `20260612205000_reapply_address_canonical_nbsp_functions` replays the v1
+   `20260612205000_reapply_address_canonical_nbsp_functions` replays the
    functions again so already-migrated databases receive the non-breaking-space
-   normalization fix. After applying a function-body fix to an environment with
-   stamped dev data, wipe and re-stamp nullable source
-   `address_key` columns before trusting Phase 2 gates:
+   normalization fix. Revision
+   `20260618100000_address_canonical_current_rekey` replays the current
+   functions and rewrites `address_archive_v2`, checksum maps, collision rows,
+   and known source `address_key` columns to the current `v2` identity format.
+   After applying a function-body fix to an environment with stamped dev data,
+   prefer the rekey migration over manual reset/re-stamp cycles. If you must
+   re-stamp a source manually before the migration, wipe nullable source
+   `address_key` columns first:
 
    ```sql
    UPDATE mrf.npi_address SET address_key = NULL WHERE address_key IS NOT NULL;
@@ -55,7 +60,7 @@ until `HLTHPRT_ADDRESS_CANON_SOURCES` is set.
    ```
 
    Then rerun the enabled importer finish/stamp path, or rerun the importer, so
-   `resolve_into_archive` sees stamps produced by the current v1 contract. The
+   `resolve_into_archive` sees stamps produced by the current contract. The
    resolver now aborts if a staged key disagrees with
    `sha256(identity_key)[:16]`.
 
@@ -87,11 +92,14 @@ until `HLTHPRT_ADDRESS_CANON_SOURCES` is set.
    controls how many shard updates run at once (default 1). On the 24-core dev
    host, use 16 with `HLTHPRT_DB_POOL_MAX_SIZE=32` for full rebuilds; keep it at
    1 for small local databases.
-   `HLTHPRT_ADDRESS_CANON_RUST_MATERIALIZE=true` enables the optional
-   Rust-backed resolve materializer. Python still owns the database
+   `HLTHPRT_ADDRESS_CANON_RUST_MATERIALIZE` defaults to enabled for the
+   Rust-backed resolve materializer. Set it to `0`/`false` to force the SQL
+   materializer. Python still owns the database
    transaction, temp table, collision checks, and archive writes; the
    `ptg2_scanner` binary only transforms exported raw address COPY rows into
-   keyed PostgreSQL COPY rows. The Docker image ships the binary at
+   keyed PostgreSQL COPY rows. Before Rust is used, Python verifies the
+   scanner identity version and embedded PUB28 hash match the Python runtime;
+   stale scanners fall back to SQL with a warning. The Docker image ships the binary at
    `/opt/support/ptg2_scanner/target/release/ptg2_scanner`, also exposed through
    `HLTHPRT_PTG2_RUST_SCANNER_BIN`.
 
@@ -103,19 +111,28 @@ until `HLTHPRT_ADDRESS_CANON_SOURCES` is set.
 - Importer resolve helpers target `HLTHPRT_ADDRESS_ARCHIVE_TABLE`, defaulting to
   `address_archive_v2`.
 - Import resolve materializes a keyed temp table by deduping staged
-  `address_key` values before expensive normalization. With
-  `HLTHPRT_ADDRESS_CANON_RUST_MATERIALIZE=true`, Python exports the deduped raw
+  `address_key` values before expensive normalization. By default, Python exports the deduped raw
   projection through asyncpg COPY, invokes `ptg2_scanner
   --address-canonicalize-copy`, and loads the keyed COPY file into the same
-  transaction-local temp table. If the flag is unset, or the scanner/COPY
+  transaction-local temp table. If the flag is disabled, or the scanner/COPY
   driver is unavailable, resolve falls back to the SQL materializer. Legacy
   archive migration still uses the parity-tested Python oracle because those
   rows do not carry pre-stamped `address_key` values.
+- Python-side batch canonicalization can use the optional `ptg2_address_canon`
+  PyO3 wheel built from `support/ptg2_scanner`. `process.ext.address_fast`
+  verifies the same identity version and PUB28 hash before using the wheel; if
+  it is missing or stale, callers use the pure-Python reference path.
 - Resolve stats include Phase 2 gate counters (`eligible_key_rows`,
   `eligible_null_key_rows`, `gate_violations`, and `gate_sample_rows`). Any
   enabled importer that leaves a street+state+ZIP row without `address_key`
   emits a live warning event; `gate_sample_rows` carries bounded multi-source
   rows for the manual eyeball review.
+- Resolve performs conservative sibling repairs before archive writes:
+  missing ZIP rows are keyed only when street+unit+city+state+country match
+  exactly one observed keyed sibling ZIP, and missing suffix/directional rows
+  are keyed only when the completion-normalized cluster has one higher-
+  specificity sibling. Ambiguous clusters remain split or null-keyed and are
+  reported in `ResolveStats.reason_buckets`.
 - Do not point `HLTHPRT_ADDRESS_ARCHIVE_TABLE` at the live legacy
   `address_archive` until the Phase 3 migration and verification steps are done.
 - `HLTHPRT_ADDRESS_ARCHIVE_CUTOVER` (default **off**) gates the Phase 4 reader

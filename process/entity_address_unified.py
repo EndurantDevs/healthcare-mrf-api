@@ -47,8 +47,8 @@ DEFAULT_EVIDENCE_SHARDS = 16
 DEFAULT_EVIDENCE_CONCURRENCY = 4
 DEFAULT_BUILD_NETWORK_BRIDGE = False
 DEFAULT_COMPACT_SOURCE_RECORD_IDS = True
-ARCHIVE_IDENTITY_VERSION = "v1"
-BASE_ADDRESS_VERSION = "address_archive_v2:v1"
+ARCHIVE_IDENTITY_VERSION = "v2"
+BASE_ADDRESS_VERSION = "address_archive_v2:v2"
 SUPPORT_TABLE_MODELS = (
     EntityAddressEvidence,
     EntityAddressPlanBridge,
@@ -1336,6 +1336,7 @@ def _prepare_raw_stage_sql(db_schema: str, raw_table: str, *, unlogged: bool = T
 
 def _address_key_expr(db_schema: str, available: bool, *, address_source: str | None = None) -> str:
     if available:
+        # Intentional in-DB fallback: this expression runs inside SQL materialization pipelines.
         fallback = (
             f"{db_schema}.addr_key_v1("
             "first_line, second_line, city_name, state_name, postal_code, country_code"
@@ -1359,7 +1360,7 @@ def _enrich_raw_stage_sql(
     archive_join = ""
     archive_fields = (
         "a.premise_key, "
-        "'v' || COALESCE(a.identity_version, 1)::text AS archive_identity_version, "
+        "'v' || COALESCE(a.identity_version, 2)::text AS archive_identity_version, "
         "COALESCE(a.precision, 'unknown') AS address_precision, "
         "a.zip5 AS archive_zip5, "
         "NULLIF(upper(left(a.state_code, 2)), '') AS archive_state_code, "

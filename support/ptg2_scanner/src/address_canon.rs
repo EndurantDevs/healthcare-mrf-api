@@ -1,4 +1,4 @@
-//! Address-canonical v1 materialization helpers.
+//! Address-canonical materialization helpers.
 
 use crate::copy_format::{pg_text_copy_field, write_copy_fields};
 use sha2::{Digest, Sha256};
@@ -9,6 +9,8 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 const PUB28_SOURCE: &str = include_str!("../../../process/ext/address_pub28.py");
+pub const ADDRESS_IDENTITY_VERSION: u8 = 2;
+pub const ADDRESS_IDENTITY_PREFIX: &str = "v2";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonicalAddress {
@@ -463,6 +465,12 @@ fn street_token_norm(value: &str) -> String {
     if token.is_empty() {
         return String::new();
     }
+    if let Some(ordinal) = numeric_ordinal_value(&token) {
+        return ordinal;
+    }
+    if token == "saint" {
+        return "st".to_string();
+    }
     let mapped = tables()
         .directional
         .get(&token)
@@ -475,6 +483,83 @@ fn street_token_norm(value: &str) -> String {
         .or_else(|| tables().suffix.get(&mapped))
         .cloned()
         .unwrap_or(mapped)
+}
+
+fn numeric_ordinal_value(token: &str) -> Option<String> {
+    let suffix = ["st", "nd", "rd", "th"]
+        .iter()
+        .find(|suffix| token.ends_with(**suffix))?;
+    let digits = &token[..token.len() - suffix.len()];
+    if digits.is_empty() || !digits.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    let trimmed = digits.trim_start_matches('0');
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn ordinal_h_typo_value(token: &str) -> Option<String> {
+    let digits = token.strip_suffix('h')?;
+    if digits.is_empty() || !digits.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    let trimmed = digits.trim_start_matches('0');
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn ordinal_word_value(token: &str) -> Option<&'static str> {
+    match token {
+        "first" => Some("1"),
+        "second" => Some("2"),
+        "third" => Some("3"),
+        "fourth" => Some("4"),
+        "fifth" => Some("5"),
+        "sixth" => Some("6"),
+        "seventh" => Some("7"),
+        "eighth" => Some("8"),
+        "ninth" => Some("9"),
+        "tenth" => Some("10"),
+        "eleventh" => Some("11"),
+        "twelfth" => Some("12"),
+        "thirteenth" => Some("13"),
+        "fourteenth" => Some("14"),
+        "fifteenth" => Some("15"),
+        "sixteenth" => Some("16"),
+        "seventeenth" => Some("17"),
+        "eighteenth" => Some("18"),
+        "nineteenth" => Some("19"),
+        "twentieth" => Some("20"),
+        "thirtieth" => Some("30"),
+        _ => None,
+    }
+}
+
+fn street_token_is_suffix(value: &str) -> bool {
+    let token = ascii_alnum_lower(value);
+    tables().suffix.contains_key(&token)
+}
+
+fn street_token_norm_context(token: &str, next_token: Option<&str>) -> String {
+    let cleaned = ascii_alnum_lower(token);
+    if cleaned.is_empty() {
+        return String::new();
+    }
+    if next_token.is_some_and(street_token_is_suffix) {
+        if let Some(value) = ordinal_word_value(&cleaned) {
+            return value.to_string();
+        }
+        if let Some(value) = ordinal_h_typo_value(&cleaned) {
+            return value;
+        }
+    }
+    street_token_norm(&cleaned)
 }
 
 fn replace_po_box(raw: &str) -> String {
@@ -507,18 +592,25 @@ fn replace_po_box(raw: &str) -> String {
 
 fn street_norm(line1: Option<&str>, line2: Option<&str>) -> Option<String> {
     let raw = replace_po_box(&unit_decision(line1, line2).street_text);
-    let mut out = String::new();
+    let mut tokens = Vec::new();
     let mut token = String::new();
     for ch in raw.chars().flat_map(|ch| ch.to_lowercase()) {
         if ch.is_ascii_alphanumeric() {
             token.push(ch);
         } else if !token.is_empty() {
-            out.push_str(&street_token_norm(&token));
+            tokens.push(std::mem::take(&mut token));
             token.clear();
         }
     }
     if !token.is_empty() {
-        out.push_str(&street_token_norm(&token));
+        tokens.push(token);
+    }
+    let mut out = String::new();
+    for idx in 0..tokens.len() {
+        out.push_str(&street_token_norm_context(
+            &tokens[idx],
+            tokens.get(idx + 1).map(|value| value.as_str()),
+        ));
     }
     if out.is_empty() {
         None
@@ -572,18 +664,25 @@ fn identity_key_v1(
     if country_value != "US" {
         return None;
     }
-    let precision = if street.is_some() {
+    let has_street = street.is_some();
+    let precision = if has_street {
         "street"
     } else if city_value.is_some() {
         "city_zip"
     } else {
         return None;
     };
+    let identity_city = if has_street {
+        String::new()
+    } else {
+        city_value.unwrap_or_default()
+    };
     Some(format!(
-        "v1|{}|{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}",
+        ADDRESS_IDENTITY_PREFIX,
         street.unwrap_or_default(),
         unit,
-        city_value.unwrap_or_default(),
+        identity_city,
         state_value,
         zip_value,
         country_value,
@@ -594,13 +693,12 @@ fn identity_key_v1(
 fn premise_identity_key_v1(
     first_line: Option<&str>,
     second_line: Option<&str>,
-    city: Option<&str>,
+    _city: Option<&str>,
     state: Option<&str>,
     zip: Option<&str>,
     country: Option<&str>,
 ) -> Option<String> {
     let street = street_norm(first_line, second_line)?;
-    let city_value = city_norm(city).unwrap_or_default();
     let state_value = state_code(state)?;
     let zip_value = zip5_norm(zip)?;
     let country_value = country_code(country);
@@ -608,9 +706,24 @@ fn premise_identity_key_v1(
         return None;
     }
     Some(format!(
-        "v1|{}||{}|{}|{}|{}|street",
-        street, city_value, state_value, zip_value, country_value
+        "{}|{}|||{}|{}|{}|street",
+        ADDRESS_IDENTITY_PREFIX, street, state_value, zip_value, country_value
     ))
+}
+
+pub fn pub28_sha256() -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(PUB28_SOURCE.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+pub fn canon_version_json() -> String {
+    serde_json::json!({
+        "identity_version": ADDRESS_IDENTITY_VERSION,
+        "identity_prefix": ADDRESS_IDENTITY_PREFIX,
+        "pub28_sha256": pub28_sha256(),
+    })
+    .to_string()
 }
 
 pub fn canonicalize_address(
@@ -672,23 +785,24 @@ fn canonicalize_copy_line(line: &str) -> io::Result<Vec<String>> {
         .split('\t')
         .map(decode_copy_field)
         .collect();
-    if fields.len() != 8 {
+    if fields.len() != 9 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "address canonical COPY row has {} fields, expected 8",
+                "address canonical COPY row has {} fields, expected 9",
                 fields.len()
             ),
         ));
     }
     let rn = fields[0].clone();
-    let staged_address_key = fields[1].clone();
-    let first_line = fields[2].clone();
-    let second_line = fields[3].clone();
-    let city_name = fields[4].clone();
-    let state_name = fields[5].clone();
-    let postal_code = fields[6].clone();
-    let country = fields[7].clone();
+    let source_ctid = fields[1].clone();
+    let staged_address_key = fields[2].clone();
+    let first_line = fields[3].clone();
+    let second_line = fields[4].clone();
+    let city_name = fields[5].clone();
+    let state_name = fields[6].clone();
+    let postal_code = fields[7].clone();
+    let country = fields[8].clone();
     let canonical = canonicalize_address(
         copy_field_ref(&first_line),
         copy_field_ref(&second_line),
@@ -702,6 +816,7 @@ fn canonicalize_copy_line(line: &str) -> io::Result<Vec<String>> {
         .or_else(|| canonical.address_key.clone());
     Ok(vec![
         pg_text_copy_field(copy_field_ref(&rn)),
+        pg_text_copy_field(copy_field_ref(&source_ctid)),
         pg_text_copy_field(copy_field_ref(&staged_address_key)),
         pg_text_copy_field(address_key.as_deref()),
         pg_text_copy_field(canonical.address_key.as_deref()),
@@ -784,14 +899,45 @@ mod tests {
     }
 
     #[test]
+    fn exposes_canonical_version_payload() {
+        let payload: Value = serde_json::from_str(&canon_version_json()).unwrap();
+        assert_eq!(payload["identity_version"], ADDRESS_IDENTITY_VERSION);
+        assert_eq!(payload["identity_prefix"], ADDRESS_IDENTITY_PREFIX);
+        assert_eq!(payload["pub28_sha256"].as_str().unwrap().len(), 64);
+    }
+
+    #[test]
     fn canonicalizes_postgres_copy_line() {
-        let line = "1\t\\N\t27 Dr Mellichamp Dr\u{00a0}Ste 100\t\\N\tBLUFFTON\tSC\t29910\tUS";
+        let line =
+            "1\t(0,1)\t\\N\t27 Dr Mellichamp Dr\u{00a0}Ste 100\t\\N\tBLUFFTON\tSC\t29910\tUS";
         let fields = canonicalize_copy_line(line).unwrap();
         assert_eq!(fields[0], "1");
-        assert_eq!(fields[2], "9b601e19-7700-9fae-5f5f-e710eb093400");
+        assert_eq!(fields[1], "(0,1)");
+        assert_eq!(fields[3], "3e3ea29f-8c26-17ba-dcc8-74424e66fd32");
+        assert_eq!(fields[5], "v2|27drmellichampdr|ste100||SC|29910|US|street");
+    }
+
+    #[test]
+    fn canonicalizes_ordinal_and_saint_tokens() {
         assert_eq!(
-            fields[4],
-            "v1|27drmellichampdr|ste100|bluffton|SC|29910|US|street"
+            street_norm(Some("200 14 St"), None),
+            street_norm(Some("200 14th St"), None)
+        );
+        assert_eq!(
+            street_norm(Some("200 14h St"), None),
+            street_norm(Some("200 14th St"), None)
+        );
+        assert_eq!(
+            street_norm(Some("200 First Ave"), None),
+            street_norm(Some("200 1st Ave"), None)
+        );
+        assert_eq!(
+            street_norm(Some("200 Saint Clair Ave"), None),
+            street_norm(Some("200 St Clair Ave"), None)
+        );
+        assert_ne!(
+            street_norm(Some("14H Main St"), None),
+            street_norm(Some("14 Main St"), None)
         );
     }
 
@@ -816,11 +962,11 @@ mod tests {
 
         assert_eq!(
             dept_1234.identity_key.as_deref(),
-            Some("v1||dept1234|knoxville|TN|37995|US|city_zip")
+            Some("v2||dept1234|knoxville|TN|37995|US|city_zip")
         );
         assert_eq!(
             dept_5678.identity_key.as_deref(),
-            Some("v1||dept5678|knoxville|TN|37995|US|city_zip")
+            Some("v2||dept5678|knoxville|TN|37995|US|city_zip")
         );
         assert_ne!(dept_1234.address_key, dept_5678.address_key);
     }
@@ -846,7 +992,7 @@ mod tests {
 
         assert_eq!(
             padded_zip.identity_key.as_deref(),
-            Some("v1|1mainst||cambridge|MA|02138|US|street")
+            Some("v2|1mainst|||MA|02138|US|street")
         );
         assert!(unknown_state.identity_key.is_none());
         assert!(unknown_state.address_key.is_none());
@@ -864,11 +1010,11 @@ mod tests {
         );
         assert_eq!(
             result.identity_key.as_deref(),
-            Some("v1|519srosellerd2nd|floorpulmanary|schaumburg|IL|60193|US|street")
+            Some("v2|519srosellerd2|floorpulmanary||IL|60193|US|street")
         );
         assert_eq!(
             result.address_key.as_deref(),
-            Some("3cc73b80-3a68-ce62-b695-71b498ad0681")
+            Some("241ff8cf-88c7-48b8-746f-031f75d8de8c")
         );
     }
 
@@ -884,11 +1030,11 @@ mod tests {
         );
         assert_eq!(
             result.identity_key.as_deref(),
-            Some("v1|4344convoyststet||sandiego|CA|92111|US|street")
+            Some("v2|4344convoyststet|||CA|92111|US|street")
         );
         assert_eq!(
             result.address_key.as_deref(),
-            Some("da9bc2f3-103b-efad-30f4-176012d31e38")
+            Some("df8e3c6e-cf4e-688c-c629-2cfc5c3be84a")
         );
     }
 }

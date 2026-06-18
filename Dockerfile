@@ -3,7 +3,13 @@ FROM rust:1-slim-trixie AS ptg2-scanner-builder
 WORKDIR /build
 COPY support/ptg2_scanner/ /build/support/ptg2_scanner/
 COPY process/ext/address_pub28.py /build/process/ext/address_pub28.py
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 python3-pip \
+    && python3 -m pip install --break-system-packages --no-cache-dir "maturin>=1.14,<2" \
+    && rm -rf /var/lib/apt/lists/*
 RUN cargo build --release --manifest-path /build/support/ptg2_scanner/Cargo.toml
+RUN cd /build/support/ptg2_scanner \
+    && python3 -m maturin build --release --features python-extension --out /build/wheels
 
 FROM python:3.14-slim-trixie
 
@@ -81,6 +87,10 @@ COPY support/ /opt/support/
 COPY --from=ptg2-scanner-builder \
     /build/support/ptg2_scanner/target/release/ptg2_scanner \
     /opt/support/ptg2_scanner/target/release/ptg2_scanner
+COPY --from=ptg2-scanner-builder /build/wheels/ /tmp/ptg2-address-canon-wheels/
+RUN . /opt/venv/bin/activate \
+    && pip install --no-compile /tmp/ptg2-address-canon-wheels/*.whl \
+    && rm -rf /tmp/ptg2-address-canon-wheels
 COPY logging.yaml main.py alembic.ini /opt/
 
 EXPOSE 8080

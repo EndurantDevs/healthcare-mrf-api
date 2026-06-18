@@ -14,8 +14,8 @@ see 05). One row = one unique physical address.
 CREATE TABLE mrf.address_archive (
     -- identity -----------------------------------------------------------
     address_key       uuid PRIMARY KEY,       -- first 16 bytes of sha256(identity_key)
-    identity_key      text NOT NULL UNIQUE,   -- 'v1|123mainst|ste200|miami|FL|33156|US|street'
-    identity_version  smallint NOT NULL DEFAULT 1,
+    identity_key      text NOT NULL UNIQUE,   -- 'v2|123mainst|ste200||FL|33156|US|street'
+    identity_version  smallint NOT NULL DEFAULT 2,
     precision         text NOT NULL DEFAULT 'street'
                       CHECK (precision IN ('street','city_zip')),
     premise_key       uuid,                   -- sha256 of identity_key with unit blanked:

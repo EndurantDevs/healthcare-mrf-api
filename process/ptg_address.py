@@ -487,6 +487,7 @@ def _ptg_address_insert_sql(
         snapshot_id=snapshot_id,
     )
     country_expr = "country_code" if provider_group_location_table or provider_group_member_table else "'US'"
+    # Intentional in-DB fallback: this expression runs inside SQL materialization pipelines.
     address_key_expr = (
         f"COALESCE(source_address_key, {db_schema}.addr_key_v1(first_line, second_line, city, state, postal_code, {country_expr}))"
         if address_canon_available
@@ -502,7 +503,7 @@ def _ptg_address_insert_sql(
     long_expr = 'COALESCE(a."long", k.long)' if archive_available else "k.long"
     archive_fields = (
         "a.premise_key, "
-        "'v' || COALESCE(a.identity_version, 1)::text AS archive_identity_version, "
+        "'v' || COALESCE(a.identity_version, 2)::text AS archive_identity_version, "
         "COALESCE(a.precision, CASE WHEN k.address_key IS NULL THEN 'unknown' ELSE 'street' END) AS address_precision, "
         "COALESCE(a.zip5, k.source_zip5) AS zip5, "
         "COALESCE(NULLIF(upper(left(a.state_code, 2)), ''), k.source_state_code) AS state_code, "
@@ -684,6 +685,7 @@ def _ptg_archive_source_sql(
         provider_group_member_table=provider_group_member_table,
     )
     country_expr = "country_code" if provider_group_location_table or provider_group_member_table else "'US'"
+    # Intentional in-DB fallback: this expression runs inside SQL materialization pipelines.
     address_key_expr = (
         f"COALESCE(source_address_key, {db_schema}.addr_key_v1(first_line, second_line, city, state, postal_code, {country_expr}))"
         if address_canon_available

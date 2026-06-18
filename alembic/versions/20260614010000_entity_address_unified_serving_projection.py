@@ -63,7 +63,7 @@ def _entity_address_unified_columns(bind, schema: str) -> None:
     columns = (
         ("location_key", "location_key varchar(64)"),
         ("row_origin", "row_origin varchar(32) NOT NULL DEFAULT 'base'"),
-        ("archive_identity_version", "archive_identity_version varchar(16) NOT NULL DEFAULT 'v1'"),
+        ("archive_identity_version", "archive_identity_version varchar(16) NOT NULL DEFAULT 'v2'"),
         ("address_precision", "address_precision varchar(32) NOT NULL DEFAULT 'unknown'"),
         ("premise_key", "premise_key uuid"),
         ("zip5", "zip5 varchar(5)"),
@@ -106,7 +106,7 @@ def _create_tables(bind, schema: str) -> None:
             location_key varchar(64) NOT NULL,
             address_key uuid,
             premise_key uuid,
-            archive_identity_version varchar(16) NOT NULL DEFAULT 'v1',
+            archive_identity_version varchar(16) NOT NULL DEFAULT 'v2',
             address_precision varchar(32) NOT NULL DEFAULT 'unknown',
             address_source_id smallint NOT NULL DEFAULT 0,
             address_source_record_key varchar,

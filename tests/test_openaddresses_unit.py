@@ -109,6 +109,18 @@ def test_openaddresses_lookup_sql_uses_strict_fuzzy_guards():
     assert "score - next_score >= :fuzzy_margin" in sql
 
 
+def test_openaddresses_exact_lookup_sql_uses_city_when_available():
+    sql = openaddresses.exact_lookup_sql("mrf")
+
+    assert "state_code = :state_code" in sql
+    assert "zip5 = :zip5" in sql
+    assert "house_number = :house_number" in sql
+    assert "street_match_key = :street_match_key" in sql
+    assert ":city_norm IS NULL" in sql
+    assert "addr_city_norm_v1(city_name)" in sql
+    assert "= :city_norm" in sql
+
+
 def test_openaddresses_relaxed_lookup_sql_uses_city_zip_guards():
     sql = openaddresses.relaxed_lookup_sql("mrf")
 
@@ -151,6 +163,15 @@ def test_openaddresses_backfill_ctes_include_state_and_zip_shard_filters():
         assert "state_code = :backfill_state_code" in sql
         assert "zip5 >= :backfill_zip_lower" in sql
         assert "zip5 < :backfill_zip_upper" in sql
+
+
+def test_openaddresses_backfill_source_contains_city_scoped_exact_phase():
+    source = openaddresses.refresh_archive_geocodes_from_openaddresses.__code__.co_consts
+    sql_text = "\n".join(const for const in source if isinstance(const, str))
+
+    assert "openaddresses_exact_city" in sql_text
+    assert "missing.city_norm IS NOT NULL" in sql_text
+    assert "addr_city_norm_v1(oa.city_name)" in sql_text
 
 
 def test_openaddresses_import_control_registration():

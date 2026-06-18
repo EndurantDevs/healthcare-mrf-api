@@ -1,9 +1,8 @@
 """Replay canonical address functions after identity bug fixes.
 
-The v1 function bodies are intentionally deterministic, but earlier deployments
-over-merged city/ZIP precision rows by blanking unit-like lockbox fields and
-accepted malformed ZIP/state values. Replay the canonical functions from the
-foundation revision so live databases use the corrected implementations.
+The function names are stable, but their bodies define the current canonical
+key contract. Replay the canonical functions from the foundation revision so
+live databases use the corrected implementations.
 """
 
 from __future__ import annotations
@@ -30,7 +29,17 @@ FUNCTION_NAMES = (
     "addr_unit_value_valid_v1",
     "addr_unit_norm_v1",
     "addr_street_token_norm_v1",
+    "addr_street_token_is_suffix_v1",
+    "addr_street_token_is_directional_v1",
+    "addr_street_token_norm_context_v1",
+    "addr_street_text_v1",
     "addr_street_norm_v1",
+    "addr_street_suffix_token_v1",
+    "addr_street_suffixless_norm_v1",
+    "addr_street_direction_index_v1",
+    "addr_street_direction_token_v1",
+    "addr_street_directionless_norm_v1",
+    "addr_street_completion_norm_v1",
     "addr_city_norm_v1",
     "addr_identity_key_v1",
     "addr_key_from_identity_v1",
@@ -78,7 +87,7 @@ def _identity_hotfixes_current(bind, foundation, schema: str) -> bool:
             SELECT
                 {qschema}.addr_identity_key_v1(
                     'DEPARTMENT 1234', '', 'KNOXVILLE', 'TN', '37995', 'US'
-                ) = 'v1||dept1234|knoxville|TN|37995|US|city_zip'
+                ) = 'v2||dept1234|knoxville|TN|37995|US|city_zip'
                 AND {qschema}.addr_zip5_norm_v1('2138') = '02138'
                 AND {qschema}.addr_state_code_v1('calif') IS NULL;
             """

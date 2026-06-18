@@ -9,6 +9,7 @@ import re
 import sys
 import tempfile
 import time
+import uuid
 import zipfile
 from pathlib import PurePath
 
@@ -34,6 +35,7 @@ from process.ext.address_canon import (
     source_enabled,
     stamp_address_keys,
 )
+from process.ext.address_fast import canonicalize_batch as canonicalize_address_batch
 from process.ext.utils import (download_it, download_it_and_save,
                                ensure_database, make_class, my_init_db,
                                print_time_info, push_objects, return_checksum)
@@ -173,9 +175,11 @@ def is_test_mode(ctx: dict) -> bool:
 
 
 def _attach_npi_address_key(address: dict, *, canonical_enabled: bool) -> dict:
-    if not canonical_enabled:
-        return address
-    address["address_key"] = address_key_v1(
+    return _attach_npi_address_keys([address], canonical_enabled=canonical_enabled)[0]
+
+
+def _npi_address_canon_row(address: dict) -> tuple[object, object, object, object, object, object]:
+    return (
         address.get("first_line"),
         address.get("second_line"),
         address.get("city_name"),
@@ -183,7 +187,17 @@ def _attach_npi_address_key(address: dict, *, canonical_enabled: bool) -> dict:
         address.get("postal_code"),
         address.get("country_code") or "US",
     )
-    return address
+
+
+def _attach_npi_address_keys(addresses, *, canonical_enabled: bool) -> list[dict]:
+    address_list = list(addresses)
+    if not canonical_enabled:
+        return address_list
+    canonical_rows = canonicalize_address_batch(_npi_address_canon_row(address) for address in address_list)
+    for address, canonical in zip(address_list, canonical_rows):
+        address_key = canonical.get("address_key")
+        address["address_key"] = uuid.UUID(address_key) if isinstance(address_key, str) else address_key
+    return address_list
 
 
 def _is_address_key_mismatch_error(exc: BaseException) -> bool:
@@ -270,7 +284,6 @@ async def process_npi_chunk(ctx, task):
                 if row['Last Update Date']
                 else None,
             })
-            _attach_npi_address_key(obj, canonical_enabled=canonical_addresses_enabled)
             npi_address_list_dict['_'.join([str(obj['npi']), str(obj['checksum']), obj['type'],])] = obj
 
         if row['Provider First Line Business Mailing Address']:
@@ -294,8 +307,6 @@ async def process_npi_chunk(ctx, task):
                 if row['Last Update Date']
                 else None,
             })
-            _attach_npi_address_key(obj, canonical_enabled=canonical_addresses_enabled)
-
             npi_address_list_dict['_'.join([str(obj['npi']), str(obj['checksum']), obj['type'],])] = obj
 
         for i in range(1, 16):
@@ -346,7 +357,10 @@ async def process_npi_chunk(ctx, task):
         'npi_taxonomy_list': list(npi_taxonomy_list_dict.values()),
         'npi_other_id_list': list(npi_other_id_list_dict.values()),
         'npi_taxonomy_group_list': list(npi_taxonomy_group_list_dict.values()),
-        'npi_address_list': list(npi_address_list_dict.values()),
+        'npi_address_list': _attach_npi_address_keys(
+            npi_address_list_dict.values(),
+            canonical_enabled=canonical_addresses_enabled,
+        ),
     }
     if task.get('direct'):
         await save_npi_data(ctx, payload)
@@ -671,7 +685,6 @@ async def process_data(ctx, task=None):  # pragma: no cover
                         'fax_number': row['Provider Practice Location Address - Fax Number'],
                         'date_added': pytz.utc.localize(datetime.datetime.now())
                     })
-                    _attach_npi_address_key(obj, canonical_enabled=canonical_addresses_enabled)
                     npi_address_list_dict['_'.join([str(obj['npi']), str(obj['checksum']), obj['type'], ])] = obj
 
                     if count > current_sql_chunk_size:
@@ -679,7 +692,15 @@ async def process_data(ctx, task=None):  # pragma: no cover
                         await raise_if_cancelled(ctx, task)
                         await enqueue_or_flush(
                             coros,
-                            save_npi_data(ctx, {'npi_address_list': list(npi_address_list_dict.copy().values())}),
+                            save_npi_data(
+                                ctx,
+                                {
+                                    'npi_address_list': _attach_npi_address_keys(
+                                        npi_address_list_dict.copy().values(),
+                                        canonical_enabled=canonical_addresses_enabled,
+                                    )
+                                },
+                            ),
                         )
                         # await redis.enqueue_job('save_npi_data', {
                         #     'npi_address_list': list(npi_address_list_dict.values()),
@@ -709,7 +730,15 @@ async def process_data(ctx, task=None):  # pragma: no cover
             # })
             await enqueue_or_flush(
                 coros,
-                save_npi_data(ctx, {'npi_address_list': list(npi_address_list_dict.copy().values())}),
+                save_npi_data(
+                    ctx,
+                    {
+                        'npi_address_list': _attach_npi_address_keys(
+                            npi_address_list_dict.copy().values(),
+                            canonical_enabled=canonical_addresses_enabled,
+                        )
+                    },
+                ),
             )
             await raise_if_cancelled(ctx, task)
             await asyncio.gather(*coros)

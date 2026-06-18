@@ -2,6 +2,7 @@
 
 import asyncio
 import importlib
+import importlib.util
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -21,11 +22,21 @@ entity_address_unified = importlib.import_module("process.entity_address_unified
 ptg_address = importlib.import_module("process.ptg_address")
 utils = importlib.import_module("process.ext.utils")
 FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures"
+MIGRATIONS_DIR = Path(__file__).resolve().parents[1] / "alembic" / "versions"
 
 
 def _golden_cases():
     payload = json.loads((FIXTURE_DIR / "address_canonical_golden.json").read_text())
     return list(payload["explicit_cases"])
+
+
+def _load_migration(filename: str):
+    path = MIGRATIONS_DIR / filename
+    spec = importlib.util.spec_from_file_location(path.stem, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_suite_variants_share_one_address_key():
@@ -39,8 +50,63 @@ def test_suite_variants_share_one_address_key():
     identities = {address_canon.identity_key_v1(*variant) for variant in variants}
     keys = {address_canon.address_key_v1(*variant) for variant in variants}
 
-    assert identities == {"v1|123mainst|ste200|miami|FL|33156|US|street"}
+    assert identities == {"v2|123mainst|ste200||FL|33156|US|street"}
     assert len(keys) == 1
+
+
+def test_address_canonical_current_rekey_migration_uses_single_current_format():
+    migration = _load_migration("20260618100000_address_canonical_current_rekey.py")
+
+    candidate_sql = migration._create_rekey_candidates_sql("mrf")
+    map_sql = migration._create_rewrite_map_sql()
+    archive_sql = migration._create_rekeyed_archive_sql()
+    checksum_sql = migration._create_rekeyed_checksums_sql("mrf")
+
+    combined = "\n".join([candidate_sql, map_sql, archive_sql, checksum_sql])
+    assert "'v2|'" in combined
+    assert "2::smallint AS identity_version" in combined
+    assert "address_archive_rewrite_map" in combined
+    assert "city_norm" in candidate_sql
+    assert "city_norm" in archive_sql
+    assert "pg_temp.address_archive_rekey_candidates" in candidate_sql
+    assert "{checksum_map}" not in combined
+    assert "'v1|'" not in combined
+
+
+def test_resolve_materialization_carries_source_ctid_for_resolve_aliases():
+    ddl = address_canon._keyed_temp_table_ddl("address_archive_resolve_keyed")
+    raw_copy_sql = address_canon._keyed_raw_copy_sql(
+        staging="mrf.test_stage",
+        first="first_line",
+        second="second_line",
+        city="city_name",
+        state="state_name",
+        zip_code="postal_code",
+        country="country_code",
+    )
+    alias_sql = address_canon._completion_alias_sql(
+        schema="mrf",
+        keyed_table="address_archive_resolve_keyed",
+        archive="mrf.address_archive_v2",
+    )
+    zip_alias_sql = address_canon._zip_alias_sql(
+        keyed_table="address_archive_resolve_keyed",
+        archive="mrf.address_archive_v2",
+    )
+
+    assert "source_ctid" in address_canon.KEYED_COPY_COLUMNS
+    assert "source_ctid text" in ddl
+    assert "ctid::text AS source_ctid" in raw_copy_sql
+    assert "address_completion_aliases" in alias_sql
+    assert "addr_street_completion_norm_v1" in alias_sql
+    assert "HAVING count(DISTINCT target_address_key) = 1" in alias_sql
+    assert "source_ctid" in alias_sql
+    assert "address_zip_aliases" in zip_alias_sql
+    assert "zip5 IS NULL" in zip_alias_sql
+    assert "city_norm IS NOT NULL" in zip_alias_sql
+    assert "JOIN source_keys" in zip_alias_sql
+    assert "HAVING count(DISTINCT target_address_key) = 1" in zip_alias_sql
+    assert "AND count(DISTINCT target_zip5) = 1" in zip_alias_sql
 
 
 def test_unit_is_delivery_point_not_premise_identity():
@@ -81,8 +147,8 @@ def test_unit_extraction_uses_one_decision_for_street_and_unit():
         "78701",
         "US",
     )
-    assert ste_200_apt_5 == "v1|123mainstste200|apt5|austin|TX|78701|US|street"
-    assert ste_300_apt_5 == "v1|123mainstste300|apt5|austin|TX|78701|US|street"
+    assert ste_200_apt_5 == "v2|123mainstste200|apt5||TX|78701|US|street"
+    assert ste_300_apt_5 == "v2|123mainstste300|apt5||TX|78701|US|street"
     assert address_canon.key_from_identity(ste_200_apt_5) != address_canon.key_from_identity(ste_300_apt_5)
 
     assert address_canon.identity_key_v1(
@@ -92,7 +158,7 @@ def test_unit_extraction_uses_one_decision_for_street_and_unit():
         "TX",
         "78701",
         "US",
-    ) == "v1|123mainstste200suite||austin|TX|78701|US|street"
+    ) == "v2|123mainstste200suite|||TX|78701|US|street"
     assert address_canon.identity_key_v1(
         "123 Main St Ste 200",
         "West Wing",
@@ -125,11 +191,11 @@ def test_unit_extraction_uses_one_decision_for_street_and_unit():
     )
     assert (
         address_canon.identity_key_v1("27 Dr Mellichamp Dr\xa0Ste 100", "", "BLUFFTON", "SC", "29910", "US")
-        == "v1|27drmellichampdr|ste100|bluffton|SC|29910|US|street"
+        == "v2|27drmellichampdr|ste100||SC|29910|US|street"
     )
     assert (
         str(address_canon.address_key_v1("27 Dr Mellichamp Dr\xa0Ste 100", "", "BLUFFTON", "SC", "29910", "US"))
-        == "9b601e19-7700-9fae-5f5f-e710eb093400"
+        == "3e3ea29f-8c26-17ba-dcc8-74424e66fd32"
     )
 
 
@@ -176,6 +242,65 @@ def test_python_address_canonical_golden_corpus_matches_frozen_expected_values()
             assert group_keys[group] == current, case["id"]
 
 
+def test_address_fast_python_fallback_matches_reference(monkeypatch):
+    address_fast = importlib.import_module("process.ext.address_fast")
+    monkeypatch.setattr(address_fast, "_FAST_MODULE_CHECKED", True)
+    monkeypatch.setattr(address_fast, "_FAST_MODULE", None)
+
+    result = address_fast.canonicalize_batch([
+        ("123 Main St", "Suite 200", "Austin", "TX", "78701-1234", "US"),
+    ])[0]
+
+    assert result["identity_key"] == address_canon.identity_key_v1(
+        "123 Main St",
+        "Suite 200",
+        "Austin",
+        "TX",
+        "78701-1234",
+        "US",
+    )
+    assert result["address_key"] == str(address_canon.address_key_v1(
+        "123 Main St",
+        "Suite 200",
+        "Austin",
+        "TX",
+        "78701-1234",
+        "US",
+    ))
+    assert result["zip4"] == "1234"
+    assert result["country_code"] == "US"
+
+
+@pytest.mark.asyncio
+async def test_rust_materialize_default_on_falls_back_when_binary_missing(monkeypatch):
+    monkeypatch.delenv(address_canon.ADDRESS_CANON_RUST_MATERIALIZE_ENV, raising=False)
+    monkeypatch.setattr(address_canon, "_ptg2_rust_scanner_binary", lambda: None)
+
+    assert await address_canon._try_materialize_keyed_with_rust(
+        None,
+        keyed_table='"address_archive_resolve_keyed"',
+        keyed_table_name="address_archive_resolve_keyed",
+        raw_copy_sql="SELECT 1",
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_rust_materialize_falls_back_on_version_mismatch(monkeypatch, tmp_path):
+    async def _not_current(_binary):
+        return False
+
+    monkeypatch.delenv(address_canon.ADDRESS_CANON_RUST_MATERIALIZE_ENV, raising=False)
+    monkeypatch.setattr(address_canon, "_ptg2_rust_scanner_binary", lambda: tmp_path / "ptg2_scanner")
+    monkeypatch.setattr(address_canon, "_rust_canon_version_is_current", _not_current)
+
+    assert await address_canon._try_materialize_keyed_with_rust(
+        None,
+        keyed_table='"address_archive_resolve_keyed"',
+        keyed_table_name="address_archive_resolve_keyed",
+        raw_copy_sql="SELECT 1",
+    ) is False
+
+
 def test_equivalence_group_cases_are_mirrored_into_explicit_cases():
     payload = json.loads((FIXTURE_DIR / "address_canonical_golden.json").read_text())
     explicit_values = {
@@ -211,6 +336,50 @@ def test_pub28_raw_maps_are_single_application_idempotent():
             assert mapping.get(mapped, mapped) == mapped, f"{map_name}: {source!r} -> {mapped!r}"
 
 
+def test_ordinal_and_saint_street_tokens_are_canonicalized_safely():
+    assert address_canon.street_norm("200 14 St", "",) == address_canon.street_norm("200 14th St", "")
+    assert address_canon.street_norm("200 14h St", "",) == address_canon.street_norm("200 14th St", "")
+    assert address_canon.street_norm("200 First Ave", "",) == address_canon.street_norm("200 1st Ave", "")
+    assert address_canon.street_norm("200 Saint Clair Ave", "",) == address_canon.street_norm("200 St Clair Ave", "")
+
+    assert address_canon.street_norm("14H Main St", "") != address_canon.street_norm("14 Main St", "")
+    assert address_canon.street_norm("200 First National Way", "") != address_canon.street_norm(
+        "200 1 National Way",
+        "",
+    )
+
+
+def test_suffixless_street_helpers_only_drop_recognized_trailing_suffixes():
+    assert address_canon.street_suffix_token("10 Holcombe Blvd", "") == "blvd"
+    assert address_canon.street_suffixless_norm("10 Holcombe Blvd", "") == "10holcombe"
+    assert address_canon.street_suffix_token("10 Holcombe", "") is None
+    assert address_canon.street_suffixless_norm("10 Holcombe", "") == "10holcombe"
+    assert address_canon.street_suffixless_norm("200 First Ave", "") == "2001"
+    assert address_canon.street_suffixless_norm("14H Main St", "") == "14hmain"
+
+
+def test_directionless_and_completion_helpers_keep_ambiguous_cases_visible():
+    assert address_canon.street_direction_token("10 N Main St", "") == "n"
+    assert address_canon.street_directionless_norm("10 N Main St", "") == "10mainst"
+    assert address_canon.street_direction_token("10 Main St N", "") == "n"
+    assert address_canon.street_directionless_norm("10 Main St N", "") == "10mainst"
+    assert address_canon.street_completion_norm("10 N First Ave", "") == "101"
+    assert address_canon.street_completion_norm("10 First", "") == "10first"
+
+
+def test_current_identity_key_drops_city_only_for_street_precision():
+    new_york = address_canon.identity_key_v1("100 1st Ave", "", "New York", "NY", "10009", "US")
+    new_york_city = address_canon.identity_key_v1("100 First Avenue", "", "New York City", "NY", "10009", "US")
+    city_zip = address_canon.identity_key_v1("", "", "New York", "NY", "10009", "US")
+
+    assert new_york == "v2|1001ave|||NY|10009|US|street"
+    assert new_york_city == new_york
+    assert city_zip == "v2|||newyork|NY|10009|US|city_zip"
+    assert address_canon.address_key_v1("100 Saint Clair Ave", "", "Cleveland", "OH", "44114", "US") == (
+        address_canon.address_key_v1("100 St Clair Ave", "", "Cleveland Heights", "OH", "44114", "US")
+    )
+
+
 def test_pub28_state_possession_and_military_codes_are_used():
     assert address_canon.state_code("Puerto Rico") == "PR"
     assert address_canon.state_code("Northern Mariana Islands") == "MP"
@@ -242,8 +411,8 @@ def test_city_zip_precision_does_not_merge_with_street_precision():
     street = address_canon.identity_key_v1("1 Main St", "", "Austin", "TX", "78701", "US")
     city_zip = address_canon.identity_key_v1("", "", "Austin", "TX", "78701", "US")
 
-    assert street == "v1|1mainst||austin|TX|78701|US|street"
-    assert city_zip == "v1|||austin|TX|78701|US|city_zip"
+    assert street == "v2|1mainst|||TX|78701|US|street"
+    assert city_zip == "v2|||austin|TX|78701|US|city_zip"
     assert address_canon.key_from_identity(street) != address_canon.key_from_identity(city_zip)
 
 
@@ -253,8 +422,8 @@ def test_city_zip_precision_preserves_unit_like_lockbox_values():
 
     assert address_canon.street_norm("DEPARTMENT 1234", "") is None
     assert address_canon.unit_norm("DEPARTMENT 1234", "") == "dept1234"
-    assert dept_1234 == "v1||dept1234|knoxville|TN|37995|US|city_zip"
-    assert dept_5678 == "v1||dept5678|knoxville|TN|37995|US|city_zip"
+    assert dept_1234 == "v2||dept1234|knoxville|TN|37995|US|city_zip"
+    assert dept_5678 == "v2||dept5678|knoxville|TN|37995|US|city_zip"
     assert address_canon.key_from_identity(dept_1234) != address_canon.key_from_identity(dept_5678)
 
 
@@ -840,7 +1009,7 @@ def test_entity_address_unified_raw_enrichment_can_skip_archive():
     )
 
     assert "JOIN mrf.address_archive_v2" not in enrich_sql
-    assert "'v1'::varchar AS archive_identity_version" in enrich_sql
+    assert "'v2'::varchar AS archive_identity_version" in enrich_sql
     assert "CASE WHEN r.address_key IS NULL THEN 'unknown' ELSE 'street' END" in enrich_sql
 
 
@@ -1592,7 +1761,7 @@ async def test_entity_address_unified_publish_integrity_checks_archive_and_bridg
     assert metrics["bridge_orphans"]["entity_address_plan_bridge_20260614"] == 0
     assert any("a.merged_into IS NOT NULL" in statement for statement in statements)
     assert any("NOT EXISTS" in statement and "address_archive_v2 AS a" in statement for statement in statements)
-    assert any("COALESCE(archive_identity_version, '') <> 'v1'" in statement for statement in statements)
+    assert any("COALESCE(archive_identity_version, '') <> 'v2'" in statement for statement in statements)
     assert any("lat < -90 OR lat > 90" in statement for statement in statements)
     assert any(
         "FROM mrf.entity_address_procedure_bridge_20260614 AS b" in statement

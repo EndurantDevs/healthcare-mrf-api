@@ -263,6 +263,7 @@ def lookup_params_from_address(address: dict[str, Any]) -> dict[str, Any] | None
 
 def exact_lookup_sql(schema: str, table_name: str = OPENADDRESSES_TABLE) -> str:
     table = _qtable(schema, table_name)
+    qschema = _quote_ident(schema)
     return f"""
         WITH grouped AS (
             SELECT
@@ -278,6 +279,10 @@ def exact_lookup_sql(schema: str, table_name: str = OPENADDRESSES_TABLE) -> str:
                AND zip5 = :zip5
                AND house_number = :house_number
                AND street_match_key = :street_match_key
+               AND (
+                   :city_norm IS NULL
+                   OR NULLIF({qschema}.addr_city_norm_v1(city_name), '') = :city_norm
+               )
              GROUP BY state_code, zip5, house_number, street_match_key
             HAVING count(*) = 1
                 OR (
@@ -1061,7 +1066,60 @@ async def refresh_archive_geocodes_from_openaddresses(
         if zip_upper:
             params["backfill_zip_upper"] = zip_upper
 
-    exact_updates = _status_count(
+    city_exact_updates = _status_count(
+        await db.status(
+            f"""
+            WITH missing AS ({archive_components}),
+            winners AS (
+                SELECT
+                    missing.address_key,
+                    avg(oa.lat)::numeric(11,8) AS lat,
+                    avg(oa.long)::numeric(11,8) AS long,
+                    min(oa.formatted_address) AS formatted_address,
+                    min(oa.feature_id) AS place_id,
+                    NULLIF(max(NULLIF(oa.accuracy, '')), '') AS accuracy
+                  FROM missing
+                  JOIN {source} AS oa
+                    ON oa.state_code = missing.state_code
+                   AND oa.zip5 = missing.zip5
+                   AND oa.house_number = missing.house_number
+                   AND oa.street_match_key = missing.street_match_key
+                   AND NULLIF({qschema}.addr_city_norm_v1(oa.city_name), '') = missing.city_norm
+                 WHERE missing.house_number IS NOT NULL
+                   AND missing.street_match_key IS NOT NULL
+                   AND missing.city_norm IS NOT NULL
+                   AND oa.lat IS NOT NULL
+                   AND oa.long IS NOT NULL
+                   AND oa.state_code IS NOT NULL
+                   AND oa.zip5 IS NOT NULL
+                   AND oa.house_number IS NOT NULL
+                   AND oa.street_match_key IS NOT NULL
+                 GROUP BY missing.address_key
+                HAVING count(*) = 1
+                    OR (
+                        max(oa.lat) - min(oa.lat) <= :coord_tolerance
+                        AND max(oa.long) - min(oa.long) <= :coord_tolerance
+                    )
+            )
+            UPDATE {archive} AS archive
+               SET lat = winners.lat,
+                   long = winners.long,
+                   formatted_address = COALESCE(archive.formatted_address, winners.formatted_address),
+                   place_id = COALESCE(archive.place_id, winners.place_id),
+                   geo_source = 'openaddresses'::{_quote_ident(schema)}.address_archive_geo_source,
+                   geocode_source = 'openaddresses_exact_city',
+                   geocode_quality = COALESCE(NULLIF(winners.accuracy, ''), 'city_exact'),
+                   geocoded_at = now()
+              FROM winners
+             WHERE archive.address_key = winners.address_key
+               AND archive.lat IS NULL
+               AND archive.long IS NULL;
+            """,
+            **params,
+        )
+    )
+
+    broad_exact_updates = _status_count(
         await db.status(
             f"""
             WITH missing AS ({archive_components}),
@@ -1111,6 +1169,7 @@ async def refresh_archive_geocodes_from_openaddresses(
             **params,
         )
     )
+    exact_updates = city_exact_updates + broad_exact_updates
 
     fuzzy_updates = _status_count(
         await db.status(

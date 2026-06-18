@@ -1,5 +1,5 @@
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
-use ptg2_scanner::address_canon::canonicalize_copy_file;
+use ptg2_scanner::address_canon::{canon_version_json, canonicalize_copy_file};
 use ptg2_scanner::config::{
     env_bool, env_usize, progress_interval, split_interval, DEFAULT_COMPACT_COPY_ROTATE_BYTES,
     DEFAULT_COMPACT_RUST_WORKERS, DEFAULT_COMPACT_RUST_WORK_QUEUE, DEFAULT_PROGRESS_BYTES,
@@ -4342,6 +4342,16 @@ fn main() -> io::Result<()> {
             "usage: ptg2_scanner [--compact-serving] <path> <top_level_array>...",
         )
     })?;
+    if first_arg == "--canon-version" {
+        if args.next().is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "usage: ptg2_scanner --canon-version",
+            ));
+        }
+        println!("{}", canon_version_json());
+        return Ok(());
+    }
     if first_arg == "--compact-serving" {
         let compact_path = args.next().ok_or_else(|| {
             io::Error::new(

@@ -135,6 +135,18 @@ async def test_address_canonical_sql_functions_are_immutable_parallel_safe_and_p
     assert await db.scalar(f"SELECT {schema}.addr_street_norm_v1('12 County Underpass', '');") == "12countyupas"
     assert await db.scalar(f"SELECT {schema}.addr_street_norm_v1('100 Florida Ave Fl 2', '');") == "100floridaave"
     assert await db.scalar(f"SELECT {schema}.addr_street_norm_v1('100 Fleet St Fl 2', '');") == "100fleetst"
+    assert await db.scalar(f"SELECT {schema}.addr_street_norm_v1('200 14 St', '');") == await db.scalar(
+        f"SELECT {schema}.addr_street_norm_v1('200 14th St', '');"
+    )
+    assert await db.scalar(f"SELECT {schema}.addr_street_norm_v1('200 14h St', '');") == await db.scalar(
+        f"SELECT {schema}.addr_street_norm_v1('200 14th St', '');"
+    )
+    assert await db.scalar(f"SELECT {schema}.addr_street_norm_v1('200 First Ave', '');") == await db.scalar(
+        f"SELECT {schema}.addr_street_norm_v1('200 1st Ave', '');"
+    )
+    assert await db.scalar(f"SELECT {schema}.addr_street_norm_v1('200 Saint Clair Ave', '');") == await db.scalar(
+        f"SELECT {schema}.addr_street_norm_v1('200 St Clair Ave', '');"
+    )
     assert await db.scalar(
         f"SELECT {schema}.addr_street_norm_v1('123 Main St Ste 200', 'Apt 5');"
     ) == "123mainstste200"
@@ -171,7 +183,7 @@ async def test_address_canonical_sql_functions_are_immutable_parallel_safe_and_p
             );
             """
         )
-        == "v1|27drmellichampdr|ste100|bluffton|SC|29910|US|street"
+        == "v2|27drmellichampdr|ste100||SC|29910|US|street"
     )
     assert (
         await db.scalar(
@@ -186,7 +198,7 @@ async def test_address_canonical_sql_functions_are_immutable_parallel_safe_and_p
             );
             """
         )
-        == "v1||dept1234|knoxville|TN|37995|US|city_zip"
+        == "v2||dept1234|knoxville|TN|37995|US|city_zip"
     )
     assert (
         await db.scalar(
@@ -201,7 +213,7 @@ async def test_address_canonical_sql_functions_are_immutable_parallel_safe_and_p
             )::text;
             """
         )
-        == "9b601e19-7700-9fae-5f5f-e710eb093400"
+        == "3e3ea29f-8c26-17ba-dcc8-74424e66fd32"
     )
     assert await db.scalar(
         f"SELECT {schema}.addr_identity_key_v1('1 Burrard Street', '', 'Vancouver', 'British Columbia', 'V6B 2W9', 'canada');"
@@ -438,7 +450,7 @@ async def test_rust_materialized_resolve_matches_sql_resolve(monkeypatch):
     )
     await stamp_address_keys(stage_table, field_map, schema=schema, shards=2)
 
-    monkeypatch.delenv(address_canon.ADDRESS_CANON_RUST_MATERIALIZE_ENV, raising=False)
+    monkeypatch.setenv(address_canon.ADDRESS_CANON_RUST_MATERIALIZE_ENV, "false")
     sql_stats = await resolve_into_archive(
         stage_table,
         field_map,
@@ -848,7 +860,7 @@ async def test_resolve_reason_buckets_and_collision_abort(monkeypatch):
             address_key, identity_key, precision, unit_norm, country_code
         )
         VALUES (
-            :address_key, 'v1|differentstreet|ste1|austin|TX|78701|US|street',
+            :address_key, 'v2|differentstreet|ste1||TX|78701|US|street',
             'street', 'ste1', 'US'
         );
         """,
@@ -905,12 +917,185 @@ async def test_resolve_reason_buckets_and_collision_abort(monkeypatch):
 
 
 @pytest.mark.asyncio(loop_scope="module")
+async def test_resolve_aliases_missing_suffix_and_direction_only_when_unique(monkeypatch):
+    _requires_test_database()
+    schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
+    stage_table = "address_canon_stage_completion_alias_test"
+    monkeypatch.setenv(address_canon.ADDRESS_CANON_RUST_MATERIALIZE_ENV, "false")
+
+    await db.status(f"DROP TABLE IF EXISTS {schema}.{stage_table};")
+    await db.status(
+        f"""
+        CREATE TABLE {schema}.{stage_table} (
+            address_key uuid,
+            first_line text,
+            second_line text,
+            city text,
+            state text,
+            zip_code text,
+            country text
+        );
+        """
+    )
+    await db.status(
+        f"TRUNCATE TABLE {schema}.address_checksum_map, "
+        f"{schema}.address_checksum_collision, {schema}.address_archive_v2;"
+    )
+    await db.status(
+        f"""
+        INSERT INTO {schema}.{stage_table} (first_line, second_line, city, state, zip_code, country)
+        VALUES
+            ('10 Holcombe Blvd', NULL, 'Houston', 'TX', '77030', 'US'),
+            ('10 Holcombe', NULL, 'Houston', 'TX', '77030', 'US'),
+            ('30 N Main St', NULL, 'Austin', 'TX', '78701', 'US'),
+            ('30 Main St', NULL, 'Austin', 'TX', '78701', 'US'),
+            ('20 Ambiguous Rd', NULL, 'Austin', 'TX', '78701', 'US'),
+            ('20 Ambiguous Ave', NULL, 'Austin', 'TX', '78701', 'US'),
+            ('20 Ambiguous', NULL, 'Austin', 'TX', '78701', 'US');
+        """
+    )
+
+    stats = await resolve_into_archive(
+        stage_table,
+        {
+            "first_line": "first_line",
+            "second_line": "second_line",
+            "city": "city",
+            "state": "state",
+            "zip": "zip_code",
+            "country": "COALESCE(NULLIF(country, ''), 'US')",
+        },
+        source_bit=2,
+        priority=1,
+        schema=schema,
+    )
+
+    holcombe_target = await db.scalar(
+        f"SELECT {schema}.addr_key_v1('10 Holcombe Blvd', NULL, 'Houston', 'TX', '77030', 'US');"
+    )
+    holcombe_alias = await db.scalar(
+        f"SELECT address_key FROM {schema}.{stage_table} WHERE first_line = '10 Holcombe';"
+    )
+    directional_target = await db.scalar(
+        f"SELECT {schema}.addr_key_v1('30 N Main St', NULL, 'Austin', 'TX', '78701', 'US');"
+    )
+    directional_alias = await db.scalar(
+        f"SELECT address_key FROM {schema}.{stage_table} WHERE first_line = '30 Main St';"
+    )
+    ambiguous_original = await db.scalar(
+        f"SELECT {schema}.addr_key_v1('20 Ambiguous', NULL, 'Austin', 'TX', '78701', 'US');"
+    )
+    ambiguous_alias = await db.scalar(
+        f"SELECT address_key FROM {schema}.{stage_table} WHERE first_line = '20 Ambiguous';"
+    )
+    ambiguous_archive_key = await db.scalar(
+        f"""
+        SELECT address_key
+          FROM {schema}.address_archive_v2
+         WHERE address_key = :address_key;
+        """,
+        address_key=ambiguous_original,
+    )
+
+    assert holcombe_alias == holcombe_target
+    assert directional_alias == directional_target
+    assert ambiguous_alias is None
+    assert ambiguous_archive_key == ambiguous_original
+    assert stats.reason_buckets["completion_aliases"] == 2
+    assert stats.reason_buckets["completion_suffix_aliases"] == 1
+    assert stats.reason_buckets["completion_directional_aliases"] == 1
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_resolve_recovers_missing_zip_from_unique_exact_sibling(monkeypatch):
+    _requires_test_database()
+    schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
+    stage_table = "address_canon_stage_missing_zip_repair_test"
+    monkeypatch.setenv(address_canon.ADDRESS_CANON_RUST_MATERIALIZE_ENV, "false")
+
+    await db.status(f"DROP TABLE IF EXISTS {schema}.{stage_table};")
+    await db.status(
+        f"""
+        CREATE TABLE {schema}.{stage_table} (
+            address_key uuid,
+            first_line text,
+            second_line text,
+            city text,
+            state text,
+            zip_code text,
+            country text
+        );
+        """
+    )
+    await db.status(
+        f"TRUNCATE TABLE {schema}.address_checksum_map, "
+        f"{schema}.address_checksum_collision, {schema}.address_archive_v2;"
+    )
+    await db.status(
+        f"""
+        INSERT INTO {schema}.{stage_table} (first_line, second_line, city, state, zip_code, country)
+        VALUES
+            ('10 Zip Repair Road', NULL, 'Austin', 'TX', '78701', 'US'),
+            ('10 Zip Repair Road', NULL, 'Austin', 'TX', NULL, 'US'),
+            ('20 Ambiguous Zip Road', NULL, 'Austin', 'TX', '78701', 'US'),
+            ('20 Ambiguous Zip Road', NULL, 'Austin', 'TX', '78702', 'US'),
+            ('20 Ambiguous Zip Road', NULL, 'Austin', 'TX', NULL, 'US');
+        """
+    )
+
+    stats = await resolve_into_archive(
+        stage_table,
+        {
+            "first_line": "first_line",
+            "second_line": "second_line",
+            "city": "city",
+            "state": "state",
+            "zip": "zip_code",
+            "country": "COALESCE(NULLIF(country, ''), 'US')",
+        },
+        source_bit=2,
+        priority=1,
+        schema=schema,
+    )
+
+    target_key = await db.scalar(
+        f"""
+        SELECT {schema}.addr_key_v1(
+            '10 Zip Repair Road', NULL, 'Austin', 'TX', '78701', 'US'
+        );
+        """
+    )
+    recovered_key = await db.scalar(
+        f"""
+        SELECT address_key
+          FROM {schema}.{stage_table}
+         WHERE first_line = '10 Zip Repair Road'
+           AND zip_code IS NULL;
+        """
+    )
+    ambiguous_key = await db.scalar(
+        f"""
+        SELECT address_key
+          FROM {schema}.{stage_table}
+         WHERE first_line = '20 Ambiguous Zip Road'
+           AND zip_code IS NULL;
+        """
+    )
+
+    assert recovered_key == target_key
+    assert ambiguous_key is None
+    assert stats.reason_buckets["zip_aliases"] == 1
+    assert stats.reason_buckets["missing_zip_recovered"] == 1
+    assert stats.reason_buckets["missing_zip"] == 1
+
+
+@pytest.mark.asyncio(loop_scope="module")
 async def test_resolve_aborts_same_batch_identity_collision(monkeypatch):
     _requires_test_database()
     schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
     stage_table = "address_canon_stage_batch_collision_test"
     progress_events = []
-    monkeypatch.delenv(address_canon.ADDRESS_CANON_RUST_MATERIALIZE_ENV, raising=False)
+    monkeypatch.setenv(address_canon.ADDRESS_CANON_RUST_MATERIALIZE_ENV, "false")
     monkeypatch.setattr(address_canon, "enqueue_live_progress", lambda **payload: progress_events.append(payload))
 
     await db.status(f"DROP TABLE IF EXISTS {schema}.{stage_table};")

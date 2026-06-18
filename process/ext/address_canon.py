@@ -41,6 +41,9 @@ from process.ptg_parts.rust_scanner import _ptg2_rust_scanner_binary
 logger = logging.getLogger(__name__)
 
 ADDRESS_CANON_RUST_MATERIALIZE_ENV = "HLTHPRT_ADDRESS_CANON_RUST_MATERIALIZE"
+CURRENT_ADDRESS_IDENTITY_VERSION = 2
+CURRENT_ADDRESS_IDENTITY_PREFIX = f"v{CURRENT_ADDRESS_IDENTITY_VERSION}"
+_RUST_CANON_VERSION_CACHE: dict[str, bool] = {}
 
 
 UNIT_DESIGNATOR_PATTERN = "|".join(
@@ -55,6 +58,33 @@ UNIT_TAIL_RE = re.compile(
     rf"(^|[\s,])({UNIT_DESIGNATOR_PATTERN})\.?\s*(?:#\s*)?([a-z0-9][a-z0-9-]*)?[\.,;:]*\s*$",
     re.IGNORECASE,
 )
+NUMERIC_ORDINAL_RE = re.compile(r"^0*([1-9][0-9]*)(?:st|nd|rd|th)$")
+ORDINAL_H_TYPO_RE = re.compile(r"^0*([1-9][0-9]*)h$")
+ORDINAL_WORD_MAP = {
+    "first": "1",
+    "second": "2",
+    "third": "3",
+    "fourth": "4",
+    "fifth": "5",
+    "sixth": "6",
+    "seventh": "7",
+    "eighth": "8",
+    "ninth": "9",
+    "tenth": "10",
+    "eleventh": "11",
+    "twelfth": "12",
+    "thirteenth": "13",
+    "fourteenth": "14",
+    "fifteenth": "15",
+    "sixteenth": "16",
+    "seventeenth": "17",
+    "eighteenth": "18",
+    "nineteenth": "19",
+    "twentieth": "20",
+    "thirtieth": "30",
+}
+STREET_SUFFIX_TOKENS = frozenset(PUB28_STREET_SUFFIX_MAP)
+DIRECTIONAL_TOKENS = frozenset(PUB28_DIRECTIONAL_MAP)
 
 
 @dataclass(frozen=True)
@@ -168,8 +198,65 @@ def _street_token_norm(value: str) -> str:
     token = re.sub(r"[^a-z0-9]", "", value.lower())
     if not token:
         return ""
+    ordinal = NUMERIC_ORDINAL_RE.match(token)
+    if ordinal:
+        return ordinal.group(1)
+    if token == "saint":
+        return "st"
     mapped = PUB28_DIRECTIONAL_MAP.get(token) or PUB28_STREET_SUFFIX_MAP.get(token) or token
     return PUB28_DIRECTIONAL_MAP.get(mapped) or PUB28_STREET_SUFFIX_MAP.get(mapped) or mapped
+
+
+def _street_token_is_suffix(value: str | None) -> bool:
+    token = re.sub(r"[^a-z0-9]", "", (value or "").lower())
+    return token in STREET_SUFFIX_TOKENS
+
+
+def _street_token_is_directional(value: str | None) -> bool:
+    token = re.sub(r"[^a-z0-9]", "", (value or "").lower())
+    return token in DIRECTIONAL_TOKENS
+
+
+def _street_token_norm_context(token: str, index: int, tokens: list[str]) -> str:
+    cleaned = re.sub(r"[^a-z0-9]", "", token.lower())
+    if not cleaned:
+        return ""
+    next_token = tokens[index + 1] if index + 1 < len(tokens) else ""
+    if _street_token_is_suffix(next_token):
+        if cleaned in ORDINAL_WORD_MAP:
+            return ORDINAL_WORD_MAP[cleaned]
+        ordinal_typo = ORDINAL_H_TYPO_RE.match(cleaned)
+        if ordinal_typo:
+            return ordinal_typo.group(1)
+    return _street_token_norm(cleaned)
+
+
+def _street_raw_text(line1: str | None, line2: str | None) -> str:
+    raw = _unit_decision(line1, line2).street_text
+    raw = re.sub(r"\bp\s*\.?\s*o\s*\.?\s*box\b", " pobox ", raw, flags=re.IGNORECASE)
+    return re.sub(r"\bpob\b", " pobox ", raw, flags=re.IGNORECASE)
+
+
+def _street_tokens(line1: str | None, line2: str | None) -> list[str]:
+    return re.findall(r"[a-z0-9]+", _street_raw_text(line1, line2).lower())
+
+
+def _normalized_street_tokens(tokens: list[str]) -> list[str]:
+    return [_street_token_norm_context(token, index, tokens) for index, token in enumerate(tokens)]
+
+
+def _edge_direction_index(tokens: list[str]) -> int | None:
+    if tokens and _street_token_is_directional(tokens[0]):
+        return 0
+    if (
+        len(tokens) >= 2
+        and re.match(r"^[0-9]+[a-z]?$", re.sub(r"[^a-z0-9]", "", tokens[0].lower()))
+        and _street_token_is_directional(tokens[1])
+    ):
+        return 1
+    if tokens and _street_token_is_directional(tokens[-1]):
+        return len(tokens) - 1
+    return None
 
 
 def city_norm(value: str | None) -> str | None:
@@ -211,10 +298,62 @@ def unit_norm(line1: str | None, line2: str | None) -> str:
 
 
 def street_norm(line1: str | None, line2: str | None) -> str | None:
-    raw = _unit_decision(line1, line2).street_text
-    raw = re.sub(r"\bp\s*\.?\s*o\s*\.?\s*box\b", " pobox ", raw, flags=re.IGNORECASE)
-    raw = re.sub(r"\bpob\b", " pobox ", raw, flags=re.IGNORECASE)
-    cleaned = "".join(_street_token_norm(token) for token in re.findall(r"[a-z0-9]+", raw.lower()))
+    tokens = _street_tokens(line1, line2)
+    cleaned = "".join(_normalized_street_tokens(tokens))
+    return cleaned or None
+
+
+def street_suffix_token(line1: str | None, line2: str | None) -> str | None:
+    tokens = _street_tokens(line1, line2)
+    if len(tokens) < 2 or not _street_token_is_suffix(tokens[-1]):
+        return None
+    return _street_token_norm(tokens[-1])
+
+
+def street_suffixless_norm(line1: str | None, line2: str | None) -> str | None:
+    tokens = _street_tokens(line1, line2)
+    stop = len(tokens)
+    if len(tokens) >= 2 and _street_token_is_suffix(tokens[-1]):
+        stop -= 1
+    cleaned = "".join(
+        _street_token_norm_context(token, index, tokens)
+        for index, token in enumerate(tokens[:stop])
+    )
+    return cleaned or None
+
+
+def street_direction_token(line1: str | None, line2: str | None) -> str | None:
+    tokens = _street_tokens(line1, line2)
+    direction_index = _edge_direction_index(tokens)
+    if direction_index is None:
+        return None
+    return _street_token_norm(tokens[direction_index])
+
+
+def street_directionless_norm(line1: str | None, line2: str | None) -> str | None:
+    tokens = _street_tokens(line1, line2)
+    direction_index = _edge_direction_index(tokens)
+    retained = [
+        token
+        for index, token in enumerate(tokens)
+        if index != direction_index
+    ]
+    cleaned = "".join(
+        _street_token_norm_context(token, index, retained)
+        for index, token in enumerate(retained)
+    )
+    return cleaned or None
+
+
+def street_completion_norm(line1: str | None, line2: str | None) -> str | None:
+    tokens = _street_tokens(line1, line2)
+    direction_index = _edge_direction_index(tokens)
+    drop_indexes = {direction_index} if direction_index is not None else set()
+    retained_indexes = [index for index in range(len(tokens)) if index not in drop_indexes]
+    if len(retained_indexes) >= 2 and _street_token_is_suffix(tokens[retained_indexes[-1]]):
+        drop_indexes.add(retained_indexes[-1])
+    normalized = _normalized_street_tokens(tokens)
+    cleaned = "".join(token for index, token in enumerate(normalized) if index not in drop_indexes)
     return cleaned or None
 
 
@@ -236,15 +375,17 @@ def identity_key_v1(
         return None
     if street:
         precision = "street"
+        identity_city = ""
     elif city_value:
         precision = "city_zip"
+        identity_city = city_value
     else:
         return None
     return "|".join([
-        "v1",
+        CURRENT_ADDRESS_IDENTITY_PREFIX,
         street or "",
         unit,
-        city_value or "",
+        identity_city,
         state_value,
         zip_value,
         country_value,
@@ -261,17 +402,16 @@ def premise_identity_key_v1(
     country: str | None = "US",
 ) -> str | None:
     street = street_norm(first_line, second_line)
-    city_value = city_norm(city)
     state_value = state_code(state)
     zip_value = zip5_norm(zip_code)
     country_value = country_code(country)
     if country_value != "US" or not street or not state_value or not zip_value:
         return None
     return "|".join([
-        "v1",
+        CURRENT_ADDRESS_IDENTITY_PREFIX,
         street,
         "",
-        city_value or "",
+        "",
         state_value,
         zip_value,
         country_value,
@@ -336,6 +476,18 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def pub28_source_sha256() -> str:
+    return hashlib.sha256(Path(__file__).with_name("address_pub28.py").read_bytes()).hexdigest()
+
+
+def current_canon_version() -> dict[str, Any]:
+    return {
+        "identity_version": CURRENT_ADDRESS_IDENTITY_VERSION,
+        "identity_prefix": CURRENT_ADDRESS_IDENTITY_PREFIX,
+        "pub28_sha256": pub28_source_sha256(),
+    }
+
+
 def _archive_lock_key(schema: str, table: str, purpose: str) -> str:
     return f"address_archive:{schema}:{table}:{purpose}"
 
@@ -360,6 +512,7 @@ def _key_from_identity_sql(schema: str, identity_expr: str) -> str:
 
 KEYED_COPY_COLUMNS = (
     "rn",
+    "source_ctid",
     "staged_address_key",
     "address_key",
     "computed_address_key",
@@ -384,6 +537,7 @@ def _keyed_temp_table_ddl(keyed_table: str) -> str:
     return f"""
         CREATE TEMP TABLE {keyed_table} (
             rn bigint,
+            source_ctid text,
             staged_address_key uuid,
             address_key uuid,
             computed_address_key uuid,
@@ -419,6 +573,7 @@ def _keyed_raw_copy_sql(
         WITH raw AS (
             SELECT
                 row_number() OVER (ORDER BY ctid) AS rn,
+                ctid::text AS source_ctid,
                 address_key AS staged_address_key,
                 NULLIF(trim(COALESCE({first}, '')), '') AS first_line,
                 NULLIF(trim(COALESCE({second}, '')), '') AS second_line,
@@ -453,6 +608,7 @@ def _keyed_raw_copy_sql(
         raw_to_normalize AS (
             SELECT
                 rn,
+                source_ctid,
                 staged_address_key,
                 first_line,
                 second_line,
@@ -465,6 +621,7 @@ def _keyed_raw_copy_sql(
             UNION ALL
             SELECT
                 rn,
+                source_ctid,
                 staged_address_key,
                 first_line,
                 second_line,
@@ -477,6 +634,7 @@ def _keyed_raw_copy_sql(
         )
         SELECT
             rn,
+            source_ctid,
             staged_address_key,
             first_line,
             second_line,
@@ -488,8 +646,63 @@ def _keyed_raw_copy_sql(
     """
 
 
-async def _run_rust_address_canonicalizer(input_path: Path, output_path: Path) -> None:
-    binary = _ptg2_rust_scanner_binary()
+def _canon_version_matches(payload: Mapping[str, Any]) -> bool:
+    expected = current_canon_version()
+    return (
+        int(payload.get("identity_version") or 0) == expected["identity_version"]
+        and str(payload.get("identity_prefix") or "") == expected["identity_prefix"]
+        and str(payload.get("pub28_sha256") or "") == expected["pub28_sha256"]
+    )
+
+
+async def _rust_canon_version(binary: Path) -> dict[str, Any]:
+    process = await asyncio.create_subprocess_exec(
+        str(binary),
+        "--canon-version",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await process.communicate()
+    if process.returncode != 0:
+        stderr_text = stderr.decode("utf-8", errors="replace")[-1000:]
+        stdout_text = stdout.decode("utf-8", errors="replace")[-1000:]
+        raise RuntimeError(
+            f"Rust address canonicalizer version check failed with exit code {process.returncode}: "
+            f"{stderr_text or stdout_text}"
+        )
+    return json.loads(stdout.decode("utf-8"))
+
+
+async def _rust_canon_version_is_current(binary: Path) -> bool:
+    cache_key = str(binary.resolve())
+    cached = _RUST_CANON_VERSION_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        payload = await _rust_canon_version(binary)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        logger.warning("Rust address canonicalizer version check failed; falling back to SQL: %s", exc)
+        _RUST_CANON_VERSION_CACHE[cache_key] = False
+        return False
+    ok = _canon_version_matches(payload)
+    if not ok:
+        logger.warning(
+            "Rust address canonicalizer version mismatch; falling back to SQL "
+            "(rust=%s python=%s)",
+            payload,
+            current_canon_version(),
+        )
+    _RUST_CANON_VERSION_CACHE[cache_key] = ok
+    return ok
+
+
+async def _run_rust_address_canonicalizer(
+    input_path: Path,
+    output_path: Path,
+    *,
+    binary: Path | None = None,
+) -> None:
+    binary = binary or _ptg2_rust_scanner_binary()
     if binary is None:
         raise FileNotFoundError("ptg2_scanner binary was not found")
     process = await asyncio.create_subprocess_exec(
@@ -517,13 +730,16 @@ async def _try_materialize_keyed_with_rust(
     keyed_table_name: str,
     raw_copy_sql: str,
 ) -> bool:
-    if not _env_bool(ADDRESS_CANON_RUST_MATERIALIZE_ENV):
+    if not _env_bool(ADDRESS_CANON_RUST_MATERIALIZE_ENV, default=True):
         return False
-    if _ptg2_rust_scanner_binary() is None:
+    binary = _ptg2_rust_scanner_binary()
+    if binary is None:
         logger.warning(
             "%s is enabled but ptg2_scanner was not found; falling back to SQL address materialization",
             ADDRESS_CANON_RUST_MATERIALIZE_ENV,
         )
+        return False
+    if not await _rust_canon_version_is_current(binary):
         return False
 
     connection = await session.connection()
@@ -550,7 +766,7 @@ async def _try_materialize_keyed_with_rust(
                 delimiter="\t",
                 null="\\N",
             )
-        await _run_rust_address_canonicalizer(input_path, output_path)
+        await _run_rust_address_canonicalizer(input_path, output_path, binary=binary)
         await session.execute(text(_keyed_temp_table_ddl(keyed_table)))
         with output_path.open("rb") as copy_input:
             await copy_to_table(
@@ -945,6 +1161,321 @@ async def _select_canonical_archive_table(schema: str, requested: str) -> str:
     return requested
 
 
+def _completion_alias_sql(
+    *,
+    schema: str,
+    keyed_table: str,
+    archive: str,
+) -> str:
+    qschema = _quote_ident(schema)
+    return f"""
+        CREATE TEMP TABLE address_completion_aliases ON COMMIT DROP AS
+        WITH source_rows AS (
+            SELECT
+                rn,
+                source_ctid,
+                address_key AS source_address_key,
+                COALESCE(unit_norm, '') AS unit_norm,
+                state_code,
+                zip5,
+                COALESCE(country_code, 'US') AS country_code,
+                {qschema}.addr_street_completion_norm_v1(first_line, second_line) AS completion_norm,
+                {qschema}.addr_street_suffix_token_v1(first_line, second_line) AS suffix_token,
+                {qschema}.addr_street_direction_token_v1(first_line, second_line) AS direction_token
+            FROM {keyed_table}
+            WHERE address_key IS NOT NULL
+              AND identity_key IS NOT NULL
+              AND split_part(identity_key, '|', 8) = 'street'
+              AND state_code IS NOT NULL
+              AND zip5 IS NOT NULL
+        ),
+        source_ranked AS (
+            SELECT
+                *,
+                CASE WHEN suffix_token IS NOT NULL THEN 1 ELSE 0 END
+              + CASE WHEN direction_token IS NOT NULL THEN 1 ELSE 0 END AS completion_rank
+            FROM source_rows
+            WHERE completion_norm IS NOT NULL
+        ),
+        source_keys AS (
+            SELECT DISTINCT completion_norm, unit_norm, state_code, zip5, country_code
+            FROM source_ranked
+        ),
+        target_rows AS (
+            SELECT
+                0 AS target_source_rank,
+                address_key AS target_address_key,
+                identity_key AS target_identity_key,
+                premise_key AS target_premise_key,
+                line1_norm AS target_line1_norm,
+                COALESCE(unit_norm, '') AS target_unit_norm,
+                city_norm AS target_city_norm,
+                state_code AS target_state_code,
+                zip5 AS target_zip5,
+                zip4 AS target_zip4,
+                COALESCE(country_code, 'US') AS target_country_code,
+                first_line AS target_first_line,
+                second_line AS target_second_line,
+                city_name AS target_city_name,
+                state_name AS target_state_name,
+                postal_code AS target_postal_code,
+                COALESCE(unit_norm, '') AS unit_norm,
+                state_code,
+                zip5,
+                COALESCE(country_code, 'US') AS country_code,
+                {qschema}.addr_street_completion_norm_v1(first_line, second_line) AS completion_norm,
+                {qschema}.addr_street_suffix_token_v1(first_line, second_line) AS suffix_token,
+                {qschema}.addr_street_direction_token_v1(first_line, second_line) AS direction_token
+            FROM {keyed_table}
+            WHERE address_key IS NOT NULL
+              AND identity_key IS NOT NULL
+              AND split_part(identity_key, '|', 8) = 'street'
+              AND state_code IS NOT NULL
+              AND zip5 IS NOT NULL
+            UNION ALL
+            SELECT
+                1 AS target_source_rank,
+                archived.address_key AS target_address_key,
+                archived.identity_key AS target_identity_key,
+                archived.premise_key AS target_premise_key,
+                archived.line1_norm AS target_line1_norm,
+                COALESCE(archived.unit_norm, '') AS target_unit_norm,
+                archived.city_norm AS target_city_norm,
+                archived.state_code AS target_state_code,
+                archived.zip5 AS target_zip5,
+                archived.zip4 AS target_zip4,
+                COALESCE(archived.country_code, 'US') AS target_country_code,
+                archived.first_line AS target_first_line,
+                archived.second_line AS target_second_line,
+                archived.city_name AS target_city_name,
+                archived.state_name AS target_state_name,
+                archived.postal_code AS target_postal_code,
+                COALESCE(archived.unit_norm, '') AS unit_norm,
+                archived.state_code,
+                archived.zip5,
+                COALESCE(archived.country_code, 'US') AS country_code,
+                source_keys.completion_norm,
+                {qschema}.addr_street_suffix_token_v1(archived.first_line, archived.second_line) AS suffix_token,
+                {qschema}.addr_street_direction_token_v1(archived.first_line, archived.second_line) AS direction_token
+            FROM {archive} AS archived
+            JOIN source_keys
+              ON COALESCE(archived.unit_norm, '') = source_keys.unit_norm
+             AND archived.state_code = source_keys.state_code
+             AND archived.zip5 = source_keys.zip5
+             AND COALESCE(archived.country_code, 'US') = source_keys.country_code
+             AND {qschema}.addr_street_completion_norm_v1(archived.first_line, archived.second_line)
+                 = source_keys.completion_norm
+            WHERE archived.address_key IS NOT NULL
+              AND archived.identity_key IS NOT NULL
+              AND COALESCE(archived.precision, split_part(archived.identity_key, '|', 8)) = 'street'
+              AND archived.merged_into IS NULL
+              AND archived.state_code IS NOT NULL
+              AND archived.zip5 IS NOT NULL
+        ),
+        target_ranked AS (
+            SELECT
+                *,
+                CASE WHEN suffix_token IS NOT NULL THEN 1 ELSE 0 END
+              + CASE WHEN direction_token IS NOT NULL THEN 1 ELSE 0 END AS completion_rank
+            FROM target_rows
+            WHERE completion_norm IS NOT NULL
+        ),
+        candidates AS (
+            SELECT
+                s.rn,
+                s.source_ctid,
+                s.source_address_key,
+                t.target_address_key,
+                t.target_identity_key,
+                t.target_premise_key,
+                t.target_line1_norm,
+                t.target_unit_norm,
+                t.target_city_norm,
+                t.target_state_code,
+                t.target_zip5,
+                t.target_zip4,
+                t.target_country_code,
+                t.target_first_line,
+                t.target_second_line,
+                t.target_city_name,
+                t.target_state_name,
+                t.target_postal_code,
+                t.completion_rank AS target_completion_rank,
+                t.target_source_rank,
+                (s.suffix_token IS NULL AND t.suffix_token IS NOT NULL) AS filled_suffix,
+                (s.direction_token IS NULL AND t.direction_token IS NOT NULL) AS filled_direction
+            FROM source_ranked AS s
+            JOIN target_ranked AS t
+              ON t.completion_norm = s.completion_norm
+             AND t.unit_norm = s.unit_norm
+             AND t.state_code = s.state_code
+             AND t.zip5 = s.zip5
+             AND t.country_code = s.country_code
+             AND t.target_address_key IS DISTINCT FROM s.source_address_key
+             AND t.completion_rank > s.completion_rank
+            WHERE (s.suffix_token IS NULL AND t.suffix_token IS NOT NULL)
+               OR (s.direction_token IS NULL AND t.direction_token IS NOT NULL)
+        ),
+        unique_candidates AS (
+            SELECT
+                rn,
+                bool_or(filled_suffix) AS filled_suffix,
+                bool_or(filled_direction) AS filled_direction
+            FROM candidates
+            GROUP BY rn
+            HAVING count(DISTINCT target_address_key) = 1
+        )
+        SELECT DISTINCT ON (c.rn)
+            c.*
+        FROM candidates AS c
+        JOIN unique_candidates AS u USING (rn)
+        ORDER BY c.rn, c.target_completion_rank DESC, c.target_source_rank, c.target_address_key;
+    """
+
+
+def _zip_alias_sql(
+    *,
+    keyed_table: str,
+    archive: str,
+) -> str:
+    return f"""
+        CREATE TEMP TABLE address_zip_aliases ON COMMIT DROP AS
+        WITH source_rows AS (
+            SELECT
+                rn,
+                source_ctid,
+                address_key AS source_address_key,
+                line1_norm,
+                COALESCE(unit_norm, '') AS unit_norm,
+                city_norm,
+                state_code,
+                COALESCE(country_code, 'US') AS country_code
+            FROM {keyed_table}
+            WHERE address_key IS NULL
+              AND line1_norm IS NOT NULL
+              AND city_norm IS NOT NULL
+              AND state_code IS NOT NULL
+              AND zip5 IS NULL
+              AND COALESCE(country_code, 'US') = 'US'
+        ),
+        source_keys AS (
+            SELECT DISTINCT line1_norm, unit_norm, city_norm, state_code, country_code
+            FROM source_rows
+        ),
+        target_rows AS (
+            SELECT
+                0 AS target_source_rank,
+                address_key AS target_address_key,
+                identity_key AS target_identity_key,
+                premise_key AS target_premise_key,
+                line1_norm AS target_line1_norm,
+                COALESCE(unit_norm, '') AS target_unit_norm,
+                city_norm AS target_city_norm,
+                state_code AS target_state_code,
+                zip5 AS target_zip5,
+                zip4 AS target_zip4,
+                COALESCE(country_code, 'US') AS target_country_code,
+                first_line AS target_first_line,
+                second_line AS target_second_line,
+                city_name AS target_city_name,
+                state_name AS target_state_name,
+                postal_code AS target_postal_code,
+                line1_norm,
+                COALESCE(unit_norm, '') AS unit_norm,
+                city_norm,
+                state_code,
+                COALESCE(country_code, 'US') AS country_code
+            FROM {keyed_table}
+            WHERE address_key IS NOT NULL
+              AND identity_key IS NOT NULL
+              AND split_part(identity_key, '|', 8) = 'street'
+              AND line1_norm IS NOT NULL
+              AND city_norm IS NOT NULL
+              AND state_code IS NOT NULL
+              AND zip5 IS NOT NULL
+            UNION ALL
+            SELECT
+                1 AS target_source_rank,
+                archived.address_key AS target_address_key,
+                archived.identity_key AS target_identity_key,
+                archived.premise_key AS target_premise_key,
+                archived.line1_norm AS target_line1_norm,
+                COALESCE(archived.unit_norm, '') AS target_unit_norm,
+                archived.city_norm AS target_city_norm,
+                archived.state_code AS target_state_code,
+                archived.zip5 AS target_zip5,
+                archived.zip4 AS target_zip4,
+                COALESCE(archived.country_code, 'US') AS target_country_code,
+                archived.first_line AS target_first_line,
+                archived.second_line AS target_second_line,
+                archived.city_name AS target_city_name,
+                archived.state_name AS target_state_name,
+                archived.postal_code AS target_postal_code,
+                archived.line1_norm,
+                COALESCE(archived.unit_norm, '') AS unit_norm,
+                archived.city_norm,
+                archived.state_code,
+                COALESCE(archived.country_code, 'US') AS country_code
+            FROM {archive} AS archived
+            JOIN source_keys
+              ON archived.line1_norm = source_keys.line1_norm
+             AND COALESCE(archived.unit_norm, '') = source_keys.unit_norm
+             AND archived.city_norm = source_keys.city_norm
+             AND archived.state_code = source_keys.state_code
+             AND COALESCE(archived.country_code, 'US') = source_keys.country_code
+            WHERE archived.address_key IS NOT NULL
+              AND archived.identity_key IS NOT NULL
+              AND COALESCE(archived.precision, split_part(archived.identity_key, '|', 8)) = 'street'
+              AND archived.merged_into IS NULL
+              AND archived.line1_norm IS NOT NULL
+              AND archived.city_norm IS NOT NULL
+              AND archived.state_code IS NOT NULL
+              AND archived.zip5 IS NOT NULL
+        ),
+        candidates AS (
+            SELECT
+                s.rn,
+                s.source_ctid,
+                s.source_address_key,
+                t.target_address_key,
+                t.target_identity_key,
+                t.target_premise_key,
+                t.target_line1_norm,
+                t.target_unit_norm,
+                t.target_city_norm,
+                t.target_state_code,
+                t.target_zip5,
+                t.target_zip4,
+                t.target_country_code,
+                t.target_first_line,
+                t.target_second_line,
+                t.target_city_name,
+                t.target_state_name,
+                t.target_postal_code,
+                t.target_source_rank
+            FROM source_rows AS s
+            JOIN target_rows AS t
+              ON t.line1_norm = s.line1_norm
+             AND t.unit_norm = s.unit_norm
+             AND t.city_norm = s.city_norm
+             AND t.state_code = s.state_code
+             AND t.country_code = s.country_code
+        ),
+        unique_candidates AS (
+            SELECT rn
+            FROM candidates
+            GROUP BY rn
+            HAVING count(DISTINCT target_address_key) = 1
+               AND count(DISTINCT target_zip5) = 1
+        )
+        SELECT DISTINCT ON (c.rn)
+            c.*
+        FROM candidates AS c
+        JOIN unique_candidates AS u USING (rn)
+        ORDER BY c.rn, c.target_source_rank, c.target_address_key;
+    """
+
+
 async def resolve_into_archive(
     staging_table: str,
     field_map: Mapping[str, str],
@@ -984,6 +1515,7 @@ async def resolve_into_archive(
         WITH raw AS (
             SELECT
                 row_number() OVER (ORDER BY ctid) AS rn,
+                ctid::text AS source_ctid,
                 address_key AS staged_address_key,
                 NULLIF(trim(COALESCE({first}, '')), '') AS first_line,
                 NULLIF(trim(COALESCE({second}, '')), '') AS second_line,
@@ -1018,6 +1550,7 @@ async def resolve_into_archive(
         raw_to_normalize AS (
             SELECT
                 rn,
+                source_ctid,
                 staged_address_key,
                 first_line,
                 second_line,
@@ -1030,6 +1563,7 @@ async def resolve_into_archive(
             UNION ALL
             SELECT
                 rn,
+                source_ctid,
                 staged_address_key,
                 first_line,
                 second_line,
@@ -1043,6 +1577,7 @@ async def resolve_into_archive(
         normalized AS (
             SELECT
                 rn,
+                source_ctid,
                 staged_address_key,
                 {qschema}.addr_identity_key_v1(
                     first_line, second_line, city_name, state_name, postal_code, raw_country_code
@@ -1073,6 +1608,7 @@ async def resolve_into_archive(
         )
         SELECT
             rn,
+            source_ctid,
             staged_address_key,
             COALESCE(staged_address_key, computed_address_key) AS address_key,
             computed_address_key,
@@ -1230,6 +1766,103 @@ async def resolve_into_archive(
                 f"stamped={mismatch.staged_address_key} expected={mismatch.computed_address_key} "
                 f"identity={mismatch.identity_key!r}"
             )
+        await session.execute(text("DROP TABLE IF EXISTS pg_temp.address_zip_aliases;"))
+        await session.execute(text(_zip_alias_sql(keyed_table=keyed_table, archive=archive)))
+        zip_alias_stats_raw = (
+            await session.execute(text("""
+                SELECT jsonb_build_object(
+                    'zip_aliases', count(*),
+                    'missing_zip_recovered', count(*)
+                )
+                FROM address_zip_aliases;
+            """))
+        ).scalar() or {}
+        if isinstance(zip_alias_stats_raw, str):
+            zip_alias_stats = json.loads(zip_alias_stats_raw)
+        else:
+            zip_alias_stats = dict(zip_alias_stats_raw)
+        zip_alias_rows = int(zip_alias_stats.get("zip_aliases") or 0)
+        if zip_alias_rows:
+            await session.execute(text(f"""
+                UPDATE {keyed_table} AS keyed
+                   SET address_key = aliases.target_address_key,
+                       computed_address_key = aliases.target_address_key,
+                       identity_key = aliases.target_identity_key,
+                       premise_key = aliases.target_premise_key,
+                       line1_norm = aliases.target_line1_norm,
+                       unit_norm = aliases.target_unit_norm,
+                       city_norm = aliases.target_city_norm,
+                       state_code = aliases.target_state_code,
+                       zip5 = aliases.target_zip5,
+                       zip4 = aliases.target_zip4,
+                       country_code = aliases.target_country_code,
+                       first_line = aliases.target_first_line,
+                       second_line = aliases.target_second_line,
+                       city_name = aliases.target_city_name,
+                       state_name = aliases.target_state_name,
+                       postal_code = aliases.target_postal_code
+                  FROM address_zip_aliases AS aliases
+                 WHERE keyed.rn = aliases.rn;
+            """))
+            await session.execute(text(f"""
+                UPDATE {staging} AS target
+                   SET address_key = aliases.target_address_key
+                  FROM address_zip_aliases AS aliases
+                 WHERE target.ctid::text = aliases.source_ctid
+                   AND target.address_key IS DISTINCT FROM aliases.target_address_key;
+            """))
+        await session.execute(text("DROP TABLE IF EXISTS pg_temp.address_completion_aliases;"))
+        await session.execute(text(_completion_alias_sql(schema=schema, keyed_table=keyed_table, archive=archive)))
+        alias_stats_raw = (
+            await session.execute(text("""
+                SELECT jsonb_build_object(
+                    'completion_aliases', count(*),
+                    'completion_suffix_aliases', count(*) FILTER (WHERE filled_suffix),
+                    'completion_directional_aliases', count(*) FILTER (WHERE filled_direction)
+                )
+                FROM address_completion_aliases;
+            """))
+        ).scalar() or {}
+        if isinstance(alias_stats_raw, str):
+            alias_stats = json.loads(alias_stats_raw)
+        else:
+            alias_stats = dict(alias_stats_raw)
+        completion_alias_rows = int(alias_stats.get("completion_aliases") or 0)
+        if completion_alias_rows:
+            await session.execute(text(f"""
+                UPDATE {keyed_table} AS keyed
+                   SET address_key = aliases.target_address_key,
+                       computed_address_key = aliases.target_address_key,
+                       identity_key = aliases.target_identity_key,
+                       premise_key = aliases.target_premise_key,
+                       line1_norm = aliases.target_line1_norm,
+                       unit_norm = aliases.target_unit_norm,
+                       city_norm = aliases.target_city_norm,
+                       state_code = aliases.target_state_code,
+                       zip5 = aliases.target_zip5,
+                       zip4 = aliases.target_zip4,
+                       country_code = aliases.target_country_code,
+                       first_line = aliases.target_first_line,
+                       second_line = aliases.target_second_line,
+                       city_name = aliases.target_city_name,
+                       state_name = aliases.target_state_name,
+                       postal_code = aliases.target_postal_code
+                  FROM address_completion_aliases AS aliases
+                 WHERE keyed.rn = aliases.rn;
+            """))
+            await session.execute(text(f"""
+                UPDATE {staging} AS target
+                   SET address_key = aliases.target_address_key
+                  FROM address_completion_aliases AS aliases
+                 WHERE (
+                           target.ctid::text = aliases.source_ctid
+                           OR (
+                               aliases.source_address_key IS NOT NULL
+                               AND target.address_key = aliases.source_address_key
+                           )
+                       )
+                   AND target.address_key IS DISTINCT FROM aliases.target_address_key;
+            """))
         _emit_progress(
             phase="address archive resolve",
             unit="row",
@@ -1238,6 +1871,8 @@ async def resolve_into_archive(
             pct=20,
             message="materialized deduplicated canonical address keys",
             keyed_rows=keyed_rows,
+            zip_aliases=zip_alias_rows,
+            completion_aliases=completion_alias_rows,
         )
         await session.execute(text(f"CREATE INDEX ON {keyed_table} (address_key) WHERE address_key IS NOT NULL;"))
         await session.execute(text(f"CREATE INDEX ON {keyed_table} (premise_key) WHERE premise_key IS NOT NULL;"))
@@ -1267,6 +1902,14 @@ async def resolve_into_archive(
         else:
             reason_buckets = dict(raw_reason_buckets)
         reason_buckets = {str(key): int(value or 0) for key, value in reason_buckets.items()}
+        reason_buckets.update({
+            str(key): int(value or 0)
+            for key, value in alias_stats.items()
+        })
+        reason_buckets.update({
+            str(key): int(value or 0)
+            for key, value in zip_alias_stats.items()
+        })
         distinct_keys = int((
             await session.execute(text(f"SELECT count(*) FROM ({dedup_cte}) d;"))
         ).scalar() or 0)
@@ -1362,7 +2005,7 @@ async def resolve_into_archive(
                     SELECT
                         address_key,
                         identity_key,
-                        1,
+                        {CURRENT_ADDRESS_IDENTITY_VERSION},
                         CASE WHEN split_part(identity_key, '|', 8) = 'city_zip'
                              THEN 'city_zip' ELSE 'street' END,
                         premise_key,
@@ -1766,7 +2409,7 @@ async def migrate_legacy_archive_to_v2(
                     SELECT
                         address_key,
                         identity_key,
-                        1,
+                        {CURRENT_ADDRESS_IDENTITY_VERSION},
                         CASE WHEN split_part(identity_key, '|', 8) = 'city_zip'
                              THEN 'city_zip' ELSE 'street' END,
                         premise_key,

@@ -2,8 +2,8 @@
 
 Some databases had already applied the earlier function replay before the
 non-breaking-space normalization fix landed in the foundation revision. Alembic
-does not re-run edited revisions, so replay the deterministic v1 functions at a
-new head without touching tables or data.
+does not re-run edited revisions, so replay the deterministic canonical
+functions at a new head without touching tables or data.
 """
 
 from __future__ import annotations
@@ -30,7 +30,17 @@ FUNCTION_NAMES = (
     "addr_unit_value_valid_v1",
     "addr_unit_norm_v1",
     "addr_street_token_norm_v1",
+    "addr_street_token_is_suffix_v1",
+    "addr_street_token_is_directional_v1",
+    "addr_street_token_norm_context_v1",
+    "addr_street_text_v1",
     "addr_street_norm_v1",
+    "addr_street_suffix_token_v1",
+    "addr_street_suffixless_norm_v1",
+    "addr_street_direction_index_v1",
+    "addr_street_direction_token_v1",
+    "addr_street_directionless_norm_v1",
+    "addr_street_completion_norm_v1",
     "addr_city_norm_v1",
     "addr_identity_key_v1",
     "addr_key_from_identity_v1",

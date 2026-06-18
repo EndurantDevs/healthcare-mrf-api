@@ -83,10 +83,12 @@ have no street line at all (`db/models/_legacy.py:3403-3405`) — only
 city/state/zip. They get identity too, but in a separate class:
 `precision = 'city_zip'` instead of `'street'`. The class is part of the
 identity sentence, so a city-level row can never merge with a street-level row.
-Rows that fail even that (no usable state+zip) simply get no key (`NULL`) and
-stay out of the address book — excluded, never guessed. Every exclusion is
-**counted by reason** in ResolveStats — `missing_zip`, `missing_state`,
-`missing_street` (⇒ `city_zip` class), `unsupported_country`,
+Rows that fail even that (no usable state+zip) start with no key (`NULL`).
+They are not guessed from broad geography. A missing ZIP may be repaired only
+during resolve when the row has street+unit+city+state+country and exactly one
+observed keyed sibling with the same normalized components and one ZIP. Every
+remaining exclusion is **counted by reason** in ResolveStats — `missing_zip`,
+`missing_state`, `missing_street` (⇒ `city_zip` class), `unsupported_country`,
 `ambiguous_unit` — and each import has expected thresholds for these counts:
 a sudden spike in one bucket means the source changed format, and the import
 alerts instead of silently shrinking its address coverage.
@@ -98,8 +100,15 @@ alerts instead of silently shrinking its address coverage.
 One human-readable line, with a version prefix:
 
 ```
-v1|{street_norm}|{unit_norm}|{city_norm}|{state}|{zip5}|{country}|{precision}
+v2|{street_norm}|{unit_norm}|{city_norm_or_blank}|{state}|{zip5}|{country}|{precision}
 ```
+
+For `street` precision rows, `city_norm_or_blank` is intentionally blank:
+`house/street + unit + state + ZIP5 + country` is the identity. City labels are
+stored for display and search, but not for street-precision identity because
+USPS preferred cities, vanity city names, abbreviations, and ZIP boundaries are
+too noisy. For `city_zip` precision rows, city is still load-bearing and remains
+in the identity.
 
 Example — these five raw inputs from four different imports:
 
@@ -114,7 +123,7 @@ Example — these five raw inputs from four different imports:
 …all produce the **same sentence**:
 
 ```
-v1|123mainst|ste200|miami|FL|33156|US|street
+v2|123mainst|ste200||FL|33156|US|street
 ```
 
 Why a readable sentence and not just a hash? **Audit.** The sentence is stored
@@ -126,8 +135,10 @@ What is **deliberately NOT in** the identity: the doctor (NPI), the address
 same no matter who works there or who reported it. (Phones change and are
 recorded separately as display data.)
 
-The `v1|` prefix means: if we ever improve the cleaning rules, that's `v2` —
-a new, explicit, re-keying migration. Identity never drifts silently.
+The `v2|` prefix is the current contract. Function names may keep their
+historical `_v1` suffix for database compatibility, but existing keys are
+rewritten in-place by Alembic migrations instead of carrying parallel runtime
+key versions.
 
 ---
 
@@ -184,6 +195,12 @@ rename swap — the helper never hardcodes the table name.
 ```sql
 -- 0) stamp keys onto the staged rows, set-based, sharded if large:
 UPDATE {staging} SET address_key = mrf.addr_key_v1(first_line, second_line, city, state, zip, country);
+
+-- 0b) repair only observed unique siblings:
+-- - missing ZIP: same street+unit+city+state+country and one keyed sibling ZIP
+-- - missing suffix/directional: same unit+state+ZIP+completion norm and one
+--   higher-specificity sibling
+-- Ambiguous clusters remain split/null-keyed and are counted.
 
 -- A) register unknown addresses (the strainer: dedupe staging first, then one pass):
 INSERT INTO {archive} (address_key, identity_key, ...normalized..., ...display..., source_bits)

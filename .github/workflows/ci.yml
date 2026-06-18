@@ -90,9 +90,17 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: support/ptg2_scanner
+      - name: Install Python build tooling
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
       - name: Format check
         run: cargo fmt --manifest-path support/ptg2_scanner/Cargo.toml -- --check
       - name: Clippy
@@ -106,9 +114,17 @@ jobs:
           cargo audit
       - name: Build release scanner
         run: cargo build --release --manifest-path support/ptg2_scanner/Cargo.toml
+      - name: Build and test PyO3 address canon wheel
+        run: |
+          cd support/ptg2_scanner
+          python -m maturin build --release --features python-extension --out target/wheels
+          python -m pip install target/wheels/*.whl
+          cd ../..
+          python -m pytest -q tests/test_address_canon_pyo3.py
       - name: Smoke address canonical COPY CLI
         run: |
           tmp=$(mktemp -d)
+          support/ptg2_scanner/target/release/ptg2_scanner --canon-version
           printf "1\t\\N\t123 Main St\tSuite 2\tAustin\tTX\t78701\tUS\n" > "$tmp/raw.copy"
           support/ptg2_scanner/target/release/ptg2_scanner \
             --address-canonicalize-copy "$tmp/raw.copy" "$tmp/keyed.copy"
@@ -160,6 +176,8 @@ jobs:
         run: |
           docker run --rm healthcare-mrf-api:ci test -x /opt/support/ptg2_scanner/target/release/ptg2_scanner
           docker run --rm healthcare-mrf-api:ci sh -ec '
+            /opt/support/ptg2_scanner/target/release/ptg2_scanner --canon-version
+            /opt/venv/bin/python -c "import ptg2_address_canon; print(ptg2_address_canon.canon_version())"
             tmp=$(mktemp -d)
             printf "1\t\\N\t123 Main St\tSuite 2\tAustin\tTX\t78701\tUS\n" > "$tmp/raw.copy"
             /opt/support/ptg2_scanner/target/release/ptg2_scanner \

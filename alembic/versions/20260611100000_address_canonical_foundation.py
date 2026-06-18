@@ -38,6 +38,30 @@ ADDRESS_KEY_TABLES = (
     "entity_address_unified",
 )
 
+ORDINAL_WORD_MAP = {
+    "first": "1",
+    "second": "2",
+    "third": "3",
+    "fourth": "4",
+    "fifth": "5",
+    "sixth": "6",
+    "seventh": "7",
+    "eighth": "8",
+    "ninth": "9",
+    "tenth": "10",
+    "eleventh": "11",
+    "twelfth": "12",
+    "thirteenth": "13",
+    "fourteenth": "14",
+    "fifteenth": "15",
+    "sixteenth": "16",
+    "seventeenth": "17",
+    "eighteenth": "18",
+    "nineteenth": "19",
+    "twentieth": "20",
+    "thirtieth": "30",
+}
+
 
 def _schema() -> str:
     return os.getenv("DB_SCHEMA") or os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
@@ -102,6 +126,9 @@ def _unit_regex() -> str:
 def _create_functions_sql(schema: str) -> str:
     qschema = _quote_ident(schema)
     street_token_case = _case_pairs({**PUB28_STREET_SUFFIX_MAP, **PUB28_DIRECTIONAL_MAP}, indent="            ")
+    ordinal_word_case = _case_pairs(ORDINAL_WORD_MAP, indent="            ")
+    suffix_token_case = _case_pairs({key: "1" for key in PUB28_STREET_SUFFIX_MAP}, indent="            ")
+    directional_token_case = _case_pairs({key: "1" for key in PUB28_DIRECTIONAL_MAP}, indent="            ")
     state_case = _case_pairs(PUB28_STATE_MAP)
     unit_case = _case_pairs(PUB28_UNIT_DESIGNATOR_MAP)
     unit_regex = _unit_regex()
@@ -295,14 +322,76 @@ AS $$
     WITH cleaned AS (
         SELECT regexp_replace(lower(COALESCE(value, '')), '[^a-z0-9]', '', 'g') AS v
     )
-    SELECT CASE v
+    SELECT CASE
+        WHEN v ~ '^0*[1-9][0-9]*(st|nd|rd|th)$'
+            THEN regexp_replace(v, '^0*([1-9][0-9]*)(st|nd|rd|th)$', '\1')
+        WHEN v = 'saint'
+            THEN 'st'
+        ELSE CASE v
 {street_token_case}
-        ELSE v
+            ELSE v
+        END
     END
     FROM cleaned
 $$;
 
-CREATE OR REPLACE FUNCTION {qschema}.addr_street_norm_v1(line1 text, line2 text)
+CREATE OR REPLACE FUNCTION {qschema}.addr_street_token_is_suffix_v1(value text)
+RETURNS boolean
+LANGUAGE sql
+IMMUTABLE
+PARALLEL SAFE
+AS $$
+    WITH cleaned AS (
+        SELECT regexp_replace(lower(COALESCE(value, '')), '[^a-z0-9]', '', 'g') AS v
+    )
+    SELECT CASE v
+{suffix_token_case}
+        ELSE '0'
+    END = '1'
+    FROM cleaned
+$$;
+
+CREATE OR REPLACE FUNCTION {qschema}.addr_street_token_is_directional_v1(value text)
+RETURNS boolean
+LANGUAGE sql
+IMMUTABLE
+PARALLEL SAFE
+AS $$
+    WITH cleaned AS (
+        SELECT regexp_replace(lower(COALESCE(value, '')), '[^a-z0-9]', '', 'g') AS v
+    )
+    SELECT CASE v
+{directional_token_case}
+        ELSE '0'
+    END = '1'
+    FROM cleaned
+$$;
+
+CREATE OR REPLACE FUNCTION {qschema}.addr_street_token_norm_context_v1(value text, next_value text)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE
+PARALLEL SAFE
+AS $$
+    WITH cleaned AS (
+        SELECT regexp_replace(lower(COALESCE(value, '')), '[^a-z0-9]', '', 'g') AS v
+    )
+    SELECT CASE
+        WHEN {qschema}.addr_street_token_is_suffix_v1(next_value) THEN
+            CASE
+                WHEN v ~ '^0*[1-9][0-9]*h$'
+                    THEN regexp_replace(v, '^0*([1-9][0-9]*)h$', '\1')
+                ELSE CASE v
+{ordinal_word_case}
+                    ELSE {qschema}.addr_street_token_norm_v1(v)
+                END
+            END
+        ELSE {qschema}.addr_street_token_norm_v1(v)
+    END
+    FROM cleaned
+$$;
+
+CREATE OR REPLACE FUNCTION {qschema}.addr_street_text_v1(line1 text, line2 text)
 RETURNS text
 LANGUAGE plpgsql
 IMMUTABLE
@@ -358,13 +447,242 @@ BEGIN
     END IF;
     raw := regexp_replace(raw, '\mp\s*\.?\s*o\s*\.?\s*box\M', ' pobox ', 'gi');
     raw := regexp_replace(raw, '\mpob\M', ' pobox ', 'gi');
-
-    SELECT NULLIF(string_agg({qschema}.addr_street_token_norm_v1(token), '' ORDER BY ord), '')
-      INTO normalized
-      FROM regexp_split_to_table(raw, '[^a-z0-9]+') WITH ORDINALITY AS parts(token, ord)
-     WHERE token <> '';
-    RETURN normalized;
+    RETURN raw;
 END;
+$$;
+
+CREATE OR REPLACE FUNCTION {qschema}.addr_street_norm_v1(line1 text, line2 text)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE
+PARALLEL SAFE
+AS $$
+    WITH raw_parts AS (
+        SELECT token, ord AS raw_ord
+          FROM regexp_split_to_table({qschema}.addr_street_text_v1(line1, line2), '[^a-z0-9]+')
+               WITH ORDINALITY AS raw(token, ord)
+         WHERE token <> ''
+    ),
+    parts AS (
+        SELECT token, row_number() OVER (ORDER BY raw_ord) AS ord
+          FROM raw_parts
+    ),
+    context AS (
+        SELECT token, ord, lead(token) OVER (ORDER BY ord) AS next_token
+          FROM parts
+    )
+    SELECT NULLIF(
+        string_agg({qschema}.addr_street_token_norm_context_v1(token, next_token), '' ORDER BY ord),
+        ''
+    )
+    FROM context
+$$;
+
+CREATE OR REPLACE FUNCTION {qschema}.addr_street_suffix_token_v1(line1 text, line2 text)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE
+PARALLEL SAFE
+AS $$
+    WITH raw_parts AS (
+        SELECT token, ord AS raw_ord
+          FROM regexp_split_to_table({qschema}.addr_street_text_v1(line1, line2), '[^a-z0-9]+')
+               WITH ORDINALITY AS raw(token, ord)
+         WHERE token <> ''
+    ),
+    parts AS (
+        SELECT token, row_number() OVER (ORDER BY raw_ord) AS ord
+          FROM raw_parts
+    ),
+    last_part AS (
+        SELECT token, count(*) OVER () AS token_count
+          FROM parts
+         ORDER BY ord DESC
+         LIMIT 1
+    )
+    SELECT CASE
+        WHEN token_count >= 2 AND {qschema}.addr_street_token_is_suffix_v1(token)
+            THEN {qschema}.addr_street_token_norm_v1(token)
+        ELSE NULL
+    END
+    FROM last_part
+$$;
+
+CREATE OR REPLACE FUNCTION {qschema}.addr_street_suffixless_norm_v1(line1 text, line2 text)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE
+PARALLEL SAFE
+AS $$
+    WITH raw_parts AS (
+        SELECT token, ord AS raw_ord
+          FROM regexp_split_to_table({qschema}.addr_street_text_v1(line1, line2), '[^a-z0-9]+')
+               WITH ORDINALITY AS raw(token, ord)
+         WHERE token <> ''
+    ),
+    parts AS (
+        SELECT token, row_number() OVER (ORDER BY raw_ord) AS ord
+          FROM raw_parts
+    ),
+    counted AS (
+        SELECT token, ord, count(*) OVER () AS token_count, max(ord) OVER () AS last_ord
+          FROM parts
+    ),
+    retained AS (
+        SELECT token, ord, lead(token) OVER (ORDER BY ord) AS next_token
+          FROM counted
+         WHERE NOT (
+            token_count >= 2
+            AND ord = last_ord
+            AND {qschema}.addr_street_token_is_suffix_v1(token)
+         )
+    )
+    SELECT NULLIF(
+        string_agg({qschema}.addr_street_token_norm_context_v1(token, next_token), '' ORDER BY ord),
+        ''
+    )
+    FROM retained
+$$;
+
+CREATE OR REPLACE FUNCTION {qschema}.addr_street_direction_index_v1(line1 text, line2 text)
+RETURNS integer
+LANGUAGE sql
+IMMUTABLE
+PARALLEL SAFE
+AS $$
+    WITH raw_parts AS (
+        SELECT token, ord AS raw_ord
+          FROM regexp_split_to_table({qschema}.addr_street_text_v1(line1, line2), '[^a-z0-9]+')
+               WITH ORDINALITY AS raw(token, ord)
+         WHERE token <> ''
+    ),
+    parts AS (
+        SELECT token, row_number() OVER (ORDER BY raw_ord) AS ord
+          FROM raw_parts
+    ),
+    counted AS (
+        SELECT token, ord, max(ord) OVER () AS last_ord
+          FROM parts
+    )
+    SELECT CASE
+        WHEN EXISTS (
+            SELECT 1 FROM counted WHERE ord = 1 AND {qschema}.addr_street_token_is_directional_v1(token)
+        ) THEN 1
+        WHEN EXISTS (
+            SELECT 1
+              FROM counted first_part
+              JOIN counted second_part ON second_part.ord = 2
+             WHERE first_part.ord = 1
+               AND regexp_replace(lower(first_part.token), '[^a-z0-9]', '', 'g') ~ '^[0-9]+[a-z]?$'
+               AND {qschema}.addr_street_token_is_directional_v1(second_part.token)
+        ) THEN 2
+        WHEN EXISTS (
+            SELECT 1 FROM counted WHERE ord = last_ord AND {qschema}.addr_street_token_is_directional_v1(token)
+        ) THEN (SELECT max(ord)::integer FROM counted)
+        ELSE NULL
+    END
+$$;
+
+CREATE OR REPLACE FUNCTION {qschema}.addr_street_direction_token_v1(line1 text, line2 text)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE
+PARALLEL SAFE
+AS $$
+    WITH direction AS (
+        SELECT {qschema}.addr_street_direction_index_v1(line1, line2) AS direction_ord
+    ),
+    raw_parts AS (
+        SELECT token, ord AS raw_ord
+          FROM regexp_split_to_table({qschema}.addr_street_text_v1(line1, line2), '[^a-z0-9]+')
+               WITH ORDINALITY AS raw(token, ord)
+         WHERE token <> ''
+    ),
+    parts AS (
+        SELECT token, row_number() OVER (ORDER BY raw_ord) AS ord
+          FROM raw_parts
+    )
+    SELECT {qschema}.addr_street_token_norm_v1(parts.token)
+      FROM parts, direction
+     WHERE parts.ord = direction.direction_ord
+$$;
+
+CREATE OR REPLACE FUNCTION {qschema}.addr_street_directionless_norm_v1(line1 text, line2 text)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE
+PARALLEL SAFE
+AS $$
+    WITH direction AS (
+        SELECT {qschema}.addr_street_direction_index_v1(line1, line2) AS direction_ord
+    ),
+    raw_parts AS (
+        SELECT token, ord AS raw_ord
+          FROM regexp_split_to_table({qschema}.addr_street_text_v1(line1, line2), '[^a-z0-9]+')
+               WITH ORDINALITY AS raw(token, ord)
+         WHERE token <> ''
+    ),
+    parts AS (
+        SELECT token, row_number() OVER (ORDER BY raw_ord) AS ord
+          FROM raw_parts
+    ),
+    retained AS (
+        SELECT token, ord, lead(token) OVER (ORDER BY ord) AS next_token
+          FROM parts, direction
+         WHERE direction.direction_ord IS NULL OR parts.ord <> direction.direction_ord
+    )
+    SELECT NULLIF(
+        string_agg({qschema}.addr_street_token_norm_context_v1(token, next_token), '' ORDER BY ord),
+        ''
+    )
+    FROM retained
+$$;
+
+CREATE OR REPLACE FUNCTION {qschema}.addr_street_completion_norm_v1(line1 text, line2 text)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE
+PARALLEL SAFE
+AS $$
+    WITH direction AS (
+        SELECT {qschema}.addr_street_direction_index_v1(line1, line2) AS direction_ord
+    ),
+    raw_parts AS (
+        SELECT token, ord AS raw_ord
+          FROM regexp_split_to_table({qschema}.addr_street_text_v1(line1, line2), '[^a-z0-9]+')
+               WITH ORDINALITY AS raw(token, ord)
+         WHERE token <> ''
+    ),
+    parts AS (
+        SELECT token, row_number() OVER (ORDER BY raw_ord) AS ord
+          FROM raw_parts
+    ),
+    marked AS (
+        SELECT
+            parts.token,
+            parts.ord,
+            count(*) FILTER (WHERE direction.direction_ord IS NULL OR parts.ord <> direction.direction_ord)
+                OVER () AS retained_count,
+            max(parts.ord) FILTER (WHERE direction.direction_ord IS NULL OR parts.ord <> direction.direction_ord)
+                OVER () AS retained_last_ord,
+            direction.direction_ord
+          FROM parts, direction
+    ),
+    retained AS (
+        SELECT token, ord, lead(token) OVER (ORDER BY ord) AS next_token
+          FROM marked
+         WHERE (direction_ord IS NULL OR ord <> direction_ord)
+           AND NOT (
+                retained_count >= 2
+                AND ord = retained_last_ord
+                AND {qschema}.addr_street_token_is_suffix_v1(token)
+           )
+    )
+    SELECT NULLIF(
+        string_agg({qschema}.addr_street_token_norm_context_v1(token, next_token), '' ORDER BY ord),
+        ''
+    )
+    FROM retained
 $$;
 
 CREATE OR REPLACE FUNCTION {qschema}.addr_city_norm_v1(value text)
@@ -397,6 +715,7 @@ DECLARE
     zip5 text := {qschema}.addr_zip5_norm_v1(zip);
     country_code text := {qschema}.addr_country_code_v1(country);
     precision_value text;
+    identity_city text := COALESCE(city_norm, '');
 BEGIN
     IF country_code <> 'US' OR state_code IS NULL OR zip5 IS NULL THEN
         RETURN NULL;
@@ -404,6 +723,7 @@ BEGIN
 
     IF street_norm IS NOT NULL THEN
         precision_value := 'street';
+        identity_city := '';
     ELSIF city_norm IS NOT NULL THEN
         precision_value := 'city_zip';
     ELSE
@@ -411,10 +731,10 @@ BEGIN
     END IF;
 
     RETURN concat_ws('|',
-        'v1',
+        'v2',
         COALESCE(street_norm, ''),
         COALESCE(unit_norm, ''),
-        COALESCE(city_norm, ''),
+        identity_city,
         state_code,
         zip5,
         country_code,
@@ -469,7 +789,6 @@ PARALLEL SAFE
 AS $$
 DECLARE
     street_norm text := {qschema}.addr_street_norm_v1(first_line, second_line);
-    city_norm text := {qschema}.addr_city_norm_v1(city);
     state_code text := {qschema}.addr_state_code_v1(state);
     zip5 text := {qschema}.addr_zip5_norm_v1(zip);
     country_code text := {qschema}.addr_country_code_v1(country);
@@ -477,7 +796,7 @@ BEGIN
     IF country_code <> 'US' OR street_norm IS NULL OR state_code IS NULL OR zip5 IS NULL THEN
         RETURN NULL;
     END IF;
-    RETURN concat_ws('|', 'v1', street_norm, '', COALESCE(city_norm, ''), state_code, zip5, country_code, 'street');
+    RETURN concat_ws('|', 'v2', street_norm, '', '', state_code, zip5, country_code, 'street');
 END;
 $$;
 
@@ -509,7 +828,7 @@ def _create_archive_sql(schema: str) -> str:
 CREATE TABLE IF NOT EXISTS {archive} (
     address_key uuid PRIMARY KEY,
     identity_key text NOT NULL UNIQUE,
-    identity_version smallint NOT NULL DEFAULT 1,
+    identity_version smallint NOT NULL DEFAULT 2,
     precision text NOT NULL DEFAULT 'street'
         CHECK (precision IN ('street', 'city_zip')),
     premise_key uuid,
@@ -619,7 +938,17 @@ def downgrade() -> None:
         ("addr_key_from_identity_v1", "text"),
         ("addr_identity_key_v1", "text, text, text, text, text, text"),
         ("addr_city_norm_v1", "text"),
+        ("addr_street_completion_norm_v1", "text, text"),
+        ("addr_street_directionless_norm_v1", "text, text"),
+        ("addr_street_direction_token_v1", "text, text"),
+        ("addr_street_direction_index_v1", "text, text"),
+        ("addr_street_suffixless_norm_v1", "text, text"),
+        ("addr_street_suffix_token_v1", "text, text"),
         ("addr_street_norm_v1", "text, text"),
+        ("addr_street_text_v1", "text, text"),
+        ("addr_street_token_norm_context_v1", "text, text"),
+        ("addr_street_token_is_directional_v1", "text"),
+        ("addr_street_token_is_suffix_v1", "text"),
         ("addr_street_token_norm_v1", "text"),
         ("addr_unit_norm_v1", "text, text"),
         ("addr_unit_value_valid_v1", "text"),
