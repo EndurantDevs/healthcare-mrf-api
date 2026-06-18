@@ -840,7 +840,17 @@ async def _enqueue_import_start(row: dict[str, Any]) -> dict[str, Any]:
 def _adapter_payload(adapter: dict[str, Any], row: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:
     test_mode = bool(params.get("test_mode", params.get("test", False)))
     if adapter["payload"] == "test_mode":
-        return {"test_mode": test_mode, "run_id": row["run_id"]}
+        payload = {"test_mode": test_mode, "run_id": row["run_id"]}
+        for key in (
+            "mrf_file_chunking",
+            "mrf_chunk_target_bytes",
+            "mrf_chunk_target_mb",
+            "mrf_chunk_min_bytes",
+            "mrf_chunk_min_mb",
+        ):
+            if key in params:
+                payload[key] = params[key]
+        return payload
     if adapter["payload"] in {"control_wrapped", "control_wrapped_kwargs"}:
         return {
             "run_id": row["run_id"],

@@ -9,7 +9,7 @@ import ssl
 import time
 from pathlib import Path, PurePath
 from random import choice
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import aiohttp
 import humanize
@@ -411,6 +411,11 @@ async def download_it_and_save(
     prefer_stream: bool = False,
 ):
     print(f"Downloading {url}")
+    parsed_url = urlparse(str(url))
+    if parsed_url.scheme == "file":
+        await copyfile(unquote(parsed_url.path), filepath)
+        return
+
     max_chunk_size = chunk_size if chunk_size else HTTP_CHUNK_SIZE
     cache_dir = _resolve_download_cache_dir(cache_dir)
     file_with_dir = None

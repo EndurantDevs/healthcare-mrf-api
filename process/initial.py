@@ -9,11 +9,12 @@ import json
 import logging
 import os
 import re
+import shutil
 import sys
 import tempfile
 import zipfile
 from pathlib import Path, PurePath
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import ijson
 import pylightxl as xl
@@ -142,6 +143,314 @@ def _mrf_provider_flush_rows(test_mode: bool = False) -> int:
 def _mrf_formulary_flush_rows(test_mode: bool = False) -> int:
     default = min(TEST_DRUG_RECORDS, 100) if test_mode else 50000
     return _env_int("HLTHPRT_MRF_FORMULARY_FLUSH_ROWS", default)
+
+
+def _safe_int(raw, default: int = 0) -> int:
+    if raw is None:
+        return default
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _mrf_run_state_ttl_seconds() -> int:
+    return _env_int("HLTHPRT_MRF_RUN_STATE_TTL_SECONDS", 7 * 24 * 60 * 60)
+
+
+def _mrf_run_state_id(ctx: dict) -> str:
+    context = ctx.get("context", {})
+    return str(context.get("control_run_id") or context.get("import_date") or "").strip()
+
+
+def _mrf_state_key(run_id: str, name: str) -> str:
+    return f"mrf:run:{run_id}:{name}"
+
+
+def _mrf_job_scope(ctx: dict) -> str:
+    return _mrf_run_state_id(ctx) or datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S")
+
+
+def _mrf_task_work_id(ctx: dict, task: dict, kind: str) -> str:
+    work_id = str(task.get("work_id") or "").strip()
+    if work_id:
+        return work_id
+    return _mrf_url_job_id(kind, _mrf_job_scope(ctx), str(task.get("url") or task.get("input_url") or kind))
+
+
+async def _init_mrf_run_state(redis, run_id: str) -> None:
+    if not redis or not run_id:
+        return
+    total_key = _mrf_state_key(run_id, "total_work")
+    done_key = _mrf_state_key(run_id, "done_work")
+    lock_key = _mrf_state_key(run_id, "finalize_lock")
+    finalized_key = _mrf_state_key(run_id, "finalized")
+    await redis.delete(total_key, done_key, lock_key, finalized_key)
+    await redis.set(total_key, "0")
+    await redis.expire(total_key, _mrf_run_state_ttl_seconds())
+
+
+async def _increment_mrf_total_work(redis, run_id: str, delta: int) -> None:
+    if not redis or not run_id or delta <= 0:
+        return
+    total_key = _mrf_state_key(run_id, "total_work")
+    await redis.incrby(total_key, int(delta))
+    await redis.expire(total_key, _mrf_run_state_ttl_seconds())
+
+
+async def _mark_mrf_work_done(ctx: dict, work_id: str) -> None:
+    redis = ctx.get("redis")
+    run_id = _mrf_run_state_id(ctx)
+    if not redis or not run_id or not work_id:
+        return
+    done_key = _mrf_state_key(run_id, "done_work")
+    await redis.sadd(done_key, work_id)
+    await redis.expire(done_key, _mrf_run_state_ttl_seconds())
+
+
+async def _get_mrf_run_progress(redis, run_id: str) -> tuple[int, int]:
+    if not redis or not run_id:
+        return (0, 0)
+    total_key = _mrf_state_key(run_id, "total_work")
+    done_key = _mrf_state_key(run_id, "done_work")
+    total_work = _safe_int(await redis.get(total_key), 0)
+    done_work = _safe_int(await redis.scard(done_key), 0)
+    return total_work, done_work
+
+
+async def _claim_mrf_finalize_lock(redis, run_id: str) -> bool:
+    lock_key = _mrf_state_key(run_id, "finalize_lock")
+    lock_set = await redis.set(lock_key, "1", ex=_mrf_run_state_ttl_seconds(), nx=True)
+    return bool(lock_set)
+
+
+def _mrf_size_bytes(name: str, default_bytes: int) -> int:
+    raw_value = os.environ.get(name)
+    if raw_value is None and name.endswith("_BYTES"):
+        raw_value = os.environ.get(f"{name[:-6]}_MB")
+    if raw_value is None or str(raw_value).strip() == "":
+        return default_bytes
+    value = str(raw_value).strip().lower()
+    if value.isdigit():
+        parsed = int(value)
+        return parsed * 1024 * 1024 if parsed < 1024 else parsed
+    match = re.fullmatch(r"(\d+)\s*([kmgt]?i?b?)", value)
+    if not match:
+        logger.warning("Ignoring invalid byte-size env %s=%r; using %s", name, raw_value, default_bytes)
+        return default_bytes
+    number = int(match.group(1))
+    suffix = match.group(2).replace("ib", "").replace("b", "")
+    multiplier = {
+        "": 1,
+        "k": 1024,
+        "m": 1024 * 1024,
+        "g": 1024 * 1024 * 1024,
+        "t": 1024 * 1024 * 1024 * 1024,
+    }.get(suffix, 1)
+    return number * multiplier
+
+
+def _mrf_file_chunking_enabled(kind: str, ctx: dict | None = None) -> bool:
+    context_value = None
+    if ctx:
+        context_value = ctx.get("context", {}).get("mrf_file_chunking")
+    raw_value = str(context_value or os.environ.get("HLTHPRT_MRF_FILE_CHUNKING", "providers,formularies")).strip()
+    if not raw_value:
+        return False
+    lowered = raw_value.lower()
+    if lowered in {"0", "false", "no", "off", "none"}:
+        return False
+    if lowered in {"1", "true", "yes", "on", "all"}:
+        return True
+    aliases = {
+        "plan": {"plan", "plans"},
+        "provider": {"provider", "providers"},
+        "formulary": {"formulary", "formularies", "drug", "drugs"},
+    }
+    enabled = {item.strip().lower() for item in re.split(r"[,;\s]+", lowered) if item.strip()}
+    return bool(enabled & aliases.get(kind, {kind}))
+
+
+def _mrf_chunk_dir(ctx: dict, kind: str, source_url: str) -> Path:
+    base_dir = Path(
+        os.environ.get("HLTHPRT_MRF_CHUNK_WORKDIR")
+        or os.environ.get("HLTHPRT_WORKER_STATE_DIR")
+        or str(PurePath(tempfile.gettempdir(), "healthporta-mrf-chunks"))
+    )
+    run_scope = re.sub(r"[^0-9A-Za-z_.-]+", "_", _mrf_job_scope(ctx)).strip("_") or "run"
+    source_digest = hashlib.sha256(source_url.encode("utf-8")).hexdigest()[:16]
+    return base_dir / run_scope / kind / source_digest
+
+
+def _write_mrf_chunk(chunks: list[dict], path: Path, records: list[bytes]) -> None:
+    with path.open("wb") as handle:
+        handle.write(b"[")
+        for idx, record in enumerate(records):
+            if idx:
+                handle.write(b",")
+            handle.write(record)
+        handle.write(b"]")
+    chunks.append(
+        {
+            "path": str(path),
+            "record_count": len(records),
+            "byte_count": path.stat().st_size,
+        }
+    )
+
+
+def _split_json_array_file_to_chunks(source_path: str, chunk_dir: Path, kind: str, target_bytes: int) -> list[dict]:
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    chunks: list[dict] = []
+    records: list[bytes] = []
+    chunk_bytes = 2
+    record = bytearray()
+    in_array = False
+    record_started = False
+    in_string = False
+    escaped = False
+    depth = 0
+    array_done = False
+
+    def flush_record() -> None:
+        nonlocal chunk_bytes, record
+        if not record:
+            return
+        payload = bytes(record).strip()
+        record.clear()
+        if not payload:
+            return
+        projected = chunk_bytes + len(payload) + (1 if records else 0)
+        if records and projected > target_bytes:
+            _write_mrf_chunk(chunks, chunk_dir / f"{kind}_{len(chunks):05d}.json", records)
+            records.clear()
+            chunk_bytes = 2
+        records.append(payload)
+        chunk_bytes += len(payload) + (1 if len(records) > 1 else 0)
+
+    with open(source_path, "rb") as handle:
+        while True:
+            block = handle.read(1024 * 1024)
+            if not block or array_done:
+                break
+            for byte in block:
+                if not in_array:
+                    if byte in b" \t\r\n":
+                        continue
+                    if byte != ord("["):
+                        return []
+                    in_array = True
+                    continue
+
+                if not record_started:
+                    if byte in b" \t\r\n,":
+                        continue
+                    if byte == ord("]"):
+                        array_done = True
+                        break
+                    record_started = True
+                    depth = 0
+                    in_string = False
+                    escaped = False
+
+                record.append(byte)
+
+                if in_string:
+                    if escaped:
+                        escaped = False
+                    elif byte == ord("\\"):
+                        escaped = True
+                    elif byte == ord('"'):
+                        in_string = False
+                    continue
+
+                if byte == ord('"'):
+                    in_string = True
+                elif byte in (ord("{"), ord("[")):
+                    depth += 1
+                elif byte in (ord("}"), ord("]")):
+                    depth -= 1
+                    if depth == 0:
+                        record_started = False
+                        flush_record()
+
+    if record_started:
+        raise ValueError(f"Unable to split {source_path}; unterminated top-level JSON record")
+    if records:
+        _write_mrf_chunk(chunks, chunk_dir / f"{kind}_{len(chunks):05d}.json", records)
+    if len(chunks) <= 1:
+        shutil.rmtree(chunk_dir, ignore_errors=True)
+        return []
+    return chunks
+
+
+async def _maybe_enqueue_mrf_file_chunks(ctx: dict, task: dict, tmp_filename: str, kind: str, function_name: str) -> bool:
+    if task.get("input_url") or not _mrf_file_chunking_enabled(kind, ctx):
+        return False
+    file_size = os.path.getsize(tmp_filename)
+    min_bytes = _mrf_size_bytes("HLTHPRT_MRF_CHUNK_MIN_BYTES", 512 * 1024 * 1024)
+    if file_size < min_bytes:
+        return False
+    target_bytes = _mrf_size_bytes("HLTHPRT_MRF_CHUNK_TARGET_BYTES", 256 * 1024 * 1024)
+    source_url = str(task.get("source_url") or task.get("url") or "")
+    chunk_dir = _mrf_chunk_dir(ctx, kind, source_url)
+    chunks = _split_json_array_file_to_chunks(tmp_filename, chunk_dir, kind, target_bytes)
+    if not chunks:
+        return False
+
+    redis = ctx["redis"]
+    run_scope = _mrf_job_scope(ctx)
+    await _increment_mrf_total_work(redis, run_scope, len(chunks))
+    for idx, chunk in enumerate(chunks):
+        work_id = _mrf_url_job_id(f"{kind}-chunk", run_scope, f"{source_url}:{idx}")
+        chunk_task = {
+            **task,
+            "url": source_url,
+            "source_url": source_url,
+            "input_url": Path(chunk["path"]).absolute().as_uri(),
+            "work_id": work_id,
+            "chunk_index": idx,
+            "chunk_count": len(chunks),
+        }
+        await redis.enqueue_job(
+            function_name,
+            chunk_task,
+            _queue_name=MRF_QUEUE_NAME,
+            _job_id=work_id,
+        )
+    logger.info(
+        "Enqueued %s %s chunk job(s) for %s (%s bytes)",
+        len(chunks),
+        kind,
+        source_url,
+        file_size,
+    )
+    return True
+
+
+def _cleanup_mrf_chunk_file(task: dict) -> None:
+    input_url = str(task.get("input_url") or "")
+    if not input_url.startswith("file://") or _truthy(os.environ.get("HLTHPRT_MRF_KEEP_CHUNKS"), ("1", "true", "yes", "on")):
+        return
+    parsed = urlparse(input_url)
+    try:
+        Path(unquote(parsed.path)).unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("Failed to remove MRF chunk file %s: %s", parsed.path, exc)
+
+
+def _cleanup_mrf_run_chunks(ctx: dict) -> None:
+    if _truthy(os.environ.get("HLTHPRT_MRF_KEEP_CHUNKS"), ("1", "true", "yes", "on")):
+        return
+    base_dir = Path(
+        os.environ.get("HLTHPRT_MRF_CHUNK_WORKDIR")
+        or os.environ.get("HLTHPRT_WORKER_STATE_DIR")
+        or str(PurePath(tempfile.gettempdir(), "healthporta-mrf-chunks"))
+    )
+    run_scope = re.sub(r"[^0-9A-Za-z_.-]+", "_", _mrf_job_scope(ctx)).strip("_") or "run"
+    shutil.rmtree(base_dir / run_scope, ignore_errors=True)
 
 
 def _transparency_zip_path(tmpdirname: str, file_idx: int, file: dict) -> str:
@@ -765,6 +1074,8 @@ async def process_plan(ctx, task):
     test_mode = is_test_mode(ctx)
     plan_limit = TEST_PLAN_RECORDS if test_mode else None
     plan_flush_rows = _mrf_plan_flush_rows(test_mode)
+    source_url = str(task.get("source_url") or task.get("url") or "")
+    download_url = str(task.get("input_url") or source_url)
     await ensure_database(test_mode)
 
     db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
@@ -773,20 +1084,24 @@ async def process_plan(ctx, task):
     myplanbenefitsmarketplace = make_class(PlanBenefitsMarketplace, import_date, schema_override=db_schema)
     myimportlog = make_class(ImportLog, import_date, schema_override=db_schema)
 
-    print("Starting Plan data download: ", task.get("url"))
+    print("Starting Plan data download: ", source_url)
     with tempfile.TemporaryDirectory() as tmpdirname:
-        p = Path(task.get("url"))
+        p = Path(urlparse(download_url).path if download_url.startswith("file://") else source_url)
         tmp_filename = str(PurePath(str(tmpdirname), p.name))
         try:
             await download_it_and_save(
-                task.get("url"),
+                download_url,
                 tmp_filename,
                 context={"issuer_array": task["issuer_array"], "source": "plans"},
                 logger=myimportlog,
             )
         except Exception as exc:
-            logger.warning("Failed to download plan data from %s: %s", task.get("url"), exc)
+            logger.warning("Failed to download plan data from %s: %s", source_url, exc)
             return
+
+        if await _maybe_enqueue_mrf_file_chunks(ctx, task, tmp_filename, "plan", "process_plan"):
+            await _mark_mrf_work_done(ctx, _mrf_task_work_id(ctx, task, "plan"))
+            return 1
 
         async with async_open(tmp_filename, "rb") as afp:
             plan_obj = []
@@ -1080,6 +1395,8 @@ async def process_plan(ctx, task):
                 )
                 return
     await flush_error_log(myimportlog)
+    await _mark_mrf_work_done(ctx, _mrf_task_work_id(ctx, task, "plan"))
+    _cleanup_mrf_chunk_file(task)
     return 1
 
 
@@ -1102,6 +1419,8 @@ async def process_provider(ctx, task):
     test_mode = is_test_mode(ctx)
     provider_limit = TEST_PROVIDER_RECORDS if test_mode else None
     provider_flush_rows = _mrf_provider_flush_rows(test_mode)
+    source_url = str(task.get("source_url") or task.get("url") or "")
+    download_url = str(task.get("input_url") or source_url)
     await ensure_database(test_mode)
 
     current_year = datetime.datetime.now().year
@@ -1129,20 +1448,24 @@ async def process_provider(ctx, task):
         if row.issuer_id is not None
     }
 
-    print("Starting Provider file data download: ", task.get("url"))
+    print("Starting Provider file data download: ", source_url)
     with tempfile.TemporaryDirectory() as tmpdirname:
-        p = Path(task.get("url"))
+        p = Path(urlparse(download_url).path if download_url.startswith("file://") else source_url)
         tmp_filename = str(PurePath(str(tmpdirname), p.name))
         try:
             await download_it_and_save(
-                task.get("url"),
+                download_url,
                 tmp_filename,
                 context={"issuer_array": task["issuer_array"], "source": "providers"},
                 logger=myimportlog,
             )
         except Exception as exc:
-            logger.warning("Failed to download provider data from %s: %s", task.get("url"), exc)
+            logger.warning("Failed to download provider data from %s: %s", source_url, exc)
             return
+        if await _maybe_enqueue_mrf_file_chunks(ctx, task, tmp_filename, "provider", "process_provider"):
+            await _mark_mrf_work_done(ctx, _mrf_task_work_id(ctx, task, "provider"))
+            return 1
+
         async with async_open(tmp_filename, "rb") as afp:
             plan_npi_obj_dict = {}
             plan_network_year = {}
@@ -1306,7 +1629,7 @@ async def process_provider(ctx, task):
                         res,
                         my_network_tiers,
                         import_date,
-                        task.get("url"),
+                        source_url,
                         last_updated_on,
                         issuer_lookup=issuer_lookup,
                     )
@@ -1380,9 +1703,11 @@ async def process_provider(ctx, task):
     await flush_error_log(myimportlog)
     await _mark_mrf_provider_file_progress(
         ctx,
-        url=task.get("url"),
+        url=source_url,
         processed_providers=processed_providers,
     )
+    await _mark_mrf_work_done(ctx, _mrf_task_work_id(ctx, task, "provider"))
+    _cleanup_mrf_chunk_file(task)
     return 1
 
 
@@ -1568,26 +1893,32 @@ async def process_formulary(ctx, task):
     test_mode = is_test_mode(ctx)
     drug_limit = TEST_DRUG_RECORDS if test_mode else None
     formulary_flush_rows = _mrf_formulary_flush_rows(test_mode)
+    source_url = str(task.get("source_url") or task.get("url") or "")
+    download_url = str(task.get("input_url") or source_url)
     await ensure_database(test_mode)
 
     db_schema = get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
     myimportlog = make_class(ImportLog, import_date, schema_override=db_schema)
     myplan_drug = make_class(PlanDrugRaw, import_date, schema_override=db_schema)
 
-    print("Starting Formulary file data download: ", task.get("url"))
+    print("Starting Formulary file data download: ", source_url)
     with tempfile.TemporaryDirectory() as tmpdirname:
-        p = Path(task.get("url"))
+        p = Path(urlparse(download_url).path if download_url.startswith("file://") else source_url)
         tmp_filename = str(PurePath(str(tmpdirname), p.name))
         try:
             await download_it_and_save(
-                task.get("url"),
+                download_url,
                 tmp_filename,
                 context={"issuer_array": task["issuer_array"], "source": "formulary"},
                 logger=myimportlog,
             )
         except Exception as exc:
-            logger.warning("Failed to download formulary data from %s: %s", task.get("url"), exc)
+            logger.warning("Failed to download formulary data from %s: %s", source_url, exc)
             return
+
+        if await _maybe_enqueue_mrf_file_chunks(ctx, task, tmp_filename, "formulary", "process_formulary"):
+            await _mark_mrf_work_done(ctx, _mrf_task_work_id(ctx, task, "formulary"))
+            return 1
 
         batch = []
         processed = 0
@@ -1681,6 +2012,8 @@ async def process_formulary(ctx, task):
             await _push_mrf_duplicate_tolerant_rows(batch, myplan_drug)
 
     await flush_error_log(myimportlog)
+    await _mark_mrf_work_done(ctx, _mrf_task_work_id(ctx, task, "formulary"))
+    _cleanup_mrf_chunk_file(task)
     return 1
 
 
@@ -1780,10 +2113,13 @@ async def process_json_index(ctx, task):
                     afp, "plan_urls.item", use_float=True
                 ):  # , 'formulary_urls', 'provider_urls'
                     print(f"Plan URL: {url}")
+                    work_id = _mrf_url_job_id("plan", job_scope, str(url))
+                    await _increment_mrf_total_work(redis, job_scope, 1)
                     await redis.enqueue_job(
                         "process_plan",
-                        {"url": url, "issuer_array": issuer_array, "context": ctx["context"]},
+                        {"url": url, "issuer_array": issuer_array, "context": ctx["context"], "work_id": work_id},
                         _queue_name=MRF_QUEUE_NAME,
+                        _job_id=work_id,
                     )
                     # break
                     enqueued_plans += 1
@@ -1806,10 +2142,13 @@ async def process_json_index(ctx, task):
                     afp, "formulary_urls.item", use_float=True
                 ):
                     print(f"Formulary URL: {url}")
+                    work_id = _mrf_url_job_id("formulary", job_scope, str(url))
+                    await _increment_mrf_total_work(redis, job_scope, 1)
                     await redis.enqueue_job(
                         "process_formulary",
-                        {"url": url, "issuer_array": issuer_array, "context": ctx["context"]},
+                        {"url": url, "issuer_array": issuer_array, "context": ctx["context"], "work_id": work_id},
                         _queue_name=MRF_QUEUE_NAME,
+                        _job_id=work_id,
                     )
                     enqueued_formularies += 1
                     if formulary_limit and enqueued_formularies >= formulary_limit:
@@ -1848,11 +2187,13 @@ async def process_json_index(ctx, task):
                         continue
                     seen_provider_urls.add(url)
                     print(f"Provider URL: {url}")
+                    work_id = _mrf_url_job_id("provider", job_scope, url)
+                    await _increment_mrf_total_work(redis, job_scope, 1)
                     await redis.enqueue_job(
                         "process_provider",
-                        {"url": url, "issuer_array": issuer_array, "context": ctx["context"]},
+                        {"url": url, "issuer_array": issuer_array, "context": ctx["context"], "work_id": work_id},
                         _queue_name=MRF_QUEUE_NAME,
-                        _job_id=_mrf_url_job_id("provider", job_scope, url),
+                        _job_id=work_id,
                     )
                     # break
                     enqueued_providers += 1
@@ -1869,6 +2210,7 @@ async def process_json_index(ctx, task):
                     myimportlog,
                 )
                 return
+
             except ijson.JSONError as exc:
                 await log_error(
                     "err",
@@ -1880,6 +2222,8 @@ async def process_json_index(ctx, task):
                     myimportlog,
                 )
                 return
+
+        await _mark_mrf_work_done(ctx, _mrf_task_work_id(ctx, task, "index"))
 
 
 async def import_unknown_state_issuers_data(test_mode: bool = False):
@@ -2118,6 +2462,8 @@ async def init_file(ctx, task=None):
     ctx["context"]["test_mode"] = test_mode
     if run_id:
         ctx["context"]["control_run_id"] = run_id
+    if "mrf_file_chunking" in task:
+        ctx["context"]["mrf_file_chunking"] = task["mrf_file_chunking"]
     await ensure_database(test_mode)
 
     mrf_source = os.environ["HLTHPRT_CMSGOV_MRF_URL_PUF"]
@@ -2326,6 +2672,9 @@ async def init_file(ctx, task=None):
 
         max_urls = TEST_PLAN_URLS if test_mode else None
         selected_urls = sorted(url_list)[:max_urls] if max_urls else sorted(url_list)
+        state_run_id = _mrf_run_state_id(ctx)
+        await _init_mrf_run_state(redis, state_run_id)
+        await _increment_mrf_total_work(redis, state_run_id, len(selected_urls))
         await mark_control_run(
             run_id,
             status="running",
@@ -2342,10 +2691,17 @@ async def init_file(ctx, task=None):
         )
 
         for idx, url in enumerate(selected_urls):
+            work_id = _mrf_url_job_id("index", _mrf_job_scope(ctx), url)
             await redis.enqueue_job(
                 "process_json_index",
-                {"url": url, "issuer_array": url2issuer[url], "context": ctx["context"]},
+                {
+                    "url": url,
+                    "issuer_array": url2issuer[url],
+                    "context": ctx["context"],
+                    "work_id": work_id,
+                },
                 _queue_name=MRF_QUEUE_NAME,
+                _job_id=work_id,
             )
             enqueue_live_progress(
                 run_id=run_id,
@@ -2394,6 +2750,68 @@ async def shutdown(ctx, task):
     run_id = str(ctx.get("context", {}).get("control_run_id") or "").strip() or None
     import_date = ctx["context"]["import_date"]
     test_mode = is_test_mode(ctx)
+    redis = ctx.get("redis")
+    state_run_id = _mrf_run_state_id(ctx)
+    if redis and state_run_id:
+        finalized_key = _mrf_state_key(state_run_id, "finalized")
+        if await redis.get(finalized_key):
+            logger.info("MRF run %s already finalized; skipping duplicate shutdown", state_run_id)
+            return 1
+
+        total_work, done_work = await _get_mrf_run_progress(redis, state_run_id)
+        if total_work and done_work < total_work:
+            wait_count = _safe_int(task.get("mrf_finalize_waits"), 0)
+            max_waits = _env_int("HLTHPRT_MRF_FINISH_MAX_REQUEUES", 360)
+            delay_seconds = _env_int("HLTHPRT_MRF_FINISH_REQUEUE_SECONDS", 60)
+            pct = min(89, int((done_work / max(total_work, 1)) * 85))
+            message = f"waiting for parser jobs {done_work}/{total_work}"
+            await mark_control_run(
+                run_id,
+                status="running",
+                phase_detail="mrf parser jobs running",
+                progress_message=message,
+                progress={
+                    "unit": "work_items",
+                    "total": total_work,
+                    "done": done_work,
+                    "pct": pct,
+                    "message": message,
+                    "phase": "mrf parser jobs running",
+                },
+            )
+            if wait_count >= max_waits:
+                raise RuntimeError(
+                    f"MRF finalization waited too long for parser jobs: done={done_work} total={total_work}"
+                )
+            await redis.enqueue_job(
+                "shutdown",
+                {
+                    "context": ctx["context"],
+                    "test_mode": test_mode,
+                    "mrf_finalize_waits": wait_count + 1,
+                },
+                _job_id=f"shutdown_mrf_{import_date}_wait_{wait_count + 1}",
+                _queue_name=MRF_FINISH_QUEUE_NAME,
+                _defer_by=delay_seconds,
+            )
+            return 1
+
+        if total_work and not await _claim_mrf_finalize_lock(redis, state_run_id):
+            wait_count = _safe_int(task.get("mrf_finalize_waits"), 0)
+            delay_seconds = _env_int("HLTHPRT_MRF_FINISH_REQUEUE_SECONDS", 60)
+            await redis.enqueue_job(
+                "shutdown",
+                {
+                    "context": ctx["context"],
+                    "test_mode": test_mode,
+                    "mrf_finalize_waits": wait_count + 1,
+                },
+                _job_id=f"shutdown_mrf_{import_date}_lock_wait_{wait_count + 1}",
+                _queue_name=MRF_FINISH_QUEUE_NAME,
+                _defer_by=delay_seconds,
+            )
+            return 1
+
     await mark_control_run(
         run_id,
         status="running",
@@ -2551,6 +2969,9 @@ async def shutdown(ctx, task):
         print_time_info(start_time)
     else:
         logger.info("MRF finish context missing start time; skipping elapsed time output")
+    if redis and state_run_id:
+        await redis.set(_mrf_state_key(state_run_id, "finalized"), "1", ex=_mrf_run_state_ttl_seconds())
+        _cleanup_mrf_run_chunks(ctx)
     await mark_control_run(
         run_id,
         status="succeeded",

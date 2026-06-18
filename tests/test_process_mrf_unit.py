@@ -3,6 +3,7 @@
 import asyncio
 import datetime
 from contextlib import asynccontextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -155,10 +156,21 @@ async def test_process_json_index_dedupes_provider_url_jobs(monkeypatch):
     class FakeRedis:
         def __init__(self):
             self.calls = []
+            self.values = {}
+            self.sets = {}
 
         async def enqueue_job(self, *args, **kwargs):
             self.calls.append((args, kwargs))
             return SimpleNamespace()
+
+        async def incrby(self, key, value):
+            self.values[key] = int(self.values.get(key, 0)) + int(value)
+
+        async def expire(self, *_args, **_kwargs):
+            return True
+
+        async def sadd(self, key, value):
+            self.sets.setdefault(key, set()).add(value)
 
     async def fake_download(_url, filename, **_kwargs):
         payload = {
@@ -206,6 +218,93 @@ async def test_process_json_index_dedupes_provider_url_jobs(monkeypatch):
         "run_test_123",
         "https://example.test/providers.json",
     )
+    assert redis.values[process_initial._mrf_state_key("run_test_123", "total_work")] == 1
+    assert process_initial._mrf_url_job_id(
+        "index",
+        "run_test_123",
+        "https://example.test/index.json",
+    ) in redis.sets[process_initial._mrf_state_key("run_test_123", "done_work")]
+
+
+def test_split_json_array_file_to_chunks(tmp_path, monkeypatch):
+    source = tmp_path / "providers.json"
+    source.write_text(
+        process_initial.json.dumps(
+            [
+                {"id": 1, "name": "alpha"},
+                {"id": 2, "name": "bravo"},
+                {"id": 3, "name": "charlie"},
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    chunks = process_initial._split_json_array_file_to_chunks(
+        str(source),
+        tmp_path / "chunks",
+        "provider",
+        target_bytes=35,
+    )
+
+    assert len(chunks) > 1
+    ids = []
+    for chunk in chunks:
+        payload = process_initial.json.loads(Path(chunk["path"]).read_text(encoding="utf-8"))
+        ids.extend(item["id"] for item in payload)
+    assert ids == [1, 2, 3]
+
+
+@pytest.mark.asyncio
+async def test_download_it_and_save_supports_file_urls(tmp_path):
+    source = tmp_path / "source.json"
+    target = tmp_path / "target.json"
+    source.write_text("[{\"ok\": true}]", encoding="utf-8")
+
+    await utils_module.download_it_and_save(source.absolute().as_uri(), str(target))
+
+    assert target.read_text(encoding="utf-8") == "[{\"ok\": true}]"
+
+
+@pytest.mark.asyncio
+async def test_mrf_shutdown_requeues_while_parser_jobs_run(monkeypatch):
+    class FakeRedis:
+        def __init__(self):
+            self.enqueued = []
+
+        async def get(self, key):
+            if key.endswith(":total_work"):
+                return b"3"
+            return None
+
+        async def scard(self, key):
+            assert key.endswith(":done_work")
+            return 2
+
+        async def enqueue_job(self, *args, **kwargs):
+            self.enqueued.append((args, kwargs))
+
+    mark_run = AsyncMock()
+    monkeypatch.setattr(process_initial, "mark_control_run", mark_run)
+
+    ctx = {
+        "redis": FakeRedis(),
+        "context": {
+            "import_date": "20260618",
+            "control_run_id": "run_mrf_wait",
+            "test_mode": True,
+        },
+    }
+
+    result = await process_initial.shutdown(ctx, {"context": ctx["context"], "test_mode": True})
+
+    assert result == 1
+    assert ctx["redis"].enqueued
+    args, kwargs = ctx["redis"].enqueued[0]
+    assert args[0] == "shutdown"
+    assert args[1]["mrf_finalize_waits"] == 1
+    assert kwargs["_queue_name"] == process_initial.MRF_FINISH_QUEUE_NAME
+    assert kwargs["_defer_by"] == 60
+    mark_run.assert_awaited_once()
 
 
 def test_transparency_zip_path_is_unique_per_source(tmp_path):
