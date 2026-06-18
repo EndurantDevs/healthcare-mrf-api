@@ -119,6 +119,56 @@ def test_import_control_snapshot_company_fallback_from_index_url():
     assert enriched[0]["plan_sponsor_name"] == "Heartland Dental LLC"
 
 
+@pytest.mark.asyncio
+async def test_import_control_snapshot_items_skip_non_serving_rate_files(monkeypatch):
+    calls = 0
+
+    async def fake_all(_stmt):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return []
+        plan_info = [{"plan_id": "123", "plan_market_type": "group"}]
+        return [
+            (
+                "source_1",
+                "https://example.com/allowed-amounts.json.gz",
+                "https://example.com/allowed-amounts.json.gz",
+                "allowed-amounts",
+                123,
+                {"plan_info": plan_info},
+                None,
+                None,
+                None,
+                "Allowed",
+                "Allowed amounts",
+                "https://example.com/index.json",
+            ),
+            (
+                "source_1",
+                "https://example.com/in-network-rates.json.gz",
+                "https://example.com/in-network-rates.json.gz",
+                "in-network",
+                456,
+                {"plan_info": plan_info},
+                None,
+                None,
+                None,
+                "In Network",
+                "In-network rates",
+                "https://example.com/index.json",
+            ),
+        ]
+
+    monkeypatch.setattr(discovery.db, "all", fake_all)
+
+    items = await discovery._import_control_snapshot_items(["source_1"])
+
+    assert len(items["source_1"]) == 1
+    assert items["source_1"][0]["canonical_url"] == "https://example.com/in-network-rates.json.gz"
+    assert items["source_1"][0]["domain"] == "in-network"
+
+
 def test_dedupe_candidates_prefers_more_specific_url_for_same_canonical_key():
     short = discovery.SourceCandidate(
         payer_name="Blue Shield",

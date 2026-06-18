@@ -2557,6 +2557,11 @@ def _apply_company_fallback(plan_info: list[dict[str, Any]], company_name: str |
     return next_info
 
 
+def _import_control_supported_rate_domain(value: Any) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
+    return normalized in {"in_network", "in_network_rates"}
+
+
 async def _import_control_snapshot_items(source_ids: list[str]) -> dict[str, list[dict[str, Any]]]:
     """Read the currently-stored MRF file snapshot for the given sources and build
     import-control preview items grouped by healthcare source_id. Prefer the exact
@@ -2599,6 +2604,9 @@ async def _import_control_snapshot_items(source_ids: list[str]) -> dict[str, lis
     grouped: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
         metadata = _coerce_metadata(row[5])
+        file_domain = metadata.get("domain") or row[3]
+        if not _import_control_supported_rate_domain(file_domain):
+            continue
         plan_info = metadata.get("plan_info") or []
         if not plan_info:
             plan_info = _file_column_plan_info(
@@ -2621,7 +2629,7 @@ async def _import_control_snapshot_items(source_ids: list[str]) -> dict[str, lis
             {
                 "original_url": original_url,
                 "canonical_url": row[2] or original_url,
-                "domain": metadata.get("domain") or row[3],
+                "domain": file_domain,
                 "source_type": row[3],
                 "network_name": row[9],
                 "description": row[10] or metadata.get("description") or company_name,
