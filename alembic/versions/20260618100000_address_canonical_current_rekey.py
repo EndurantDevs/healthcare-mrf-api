@@ -39,15 +39,14 @@ def _sql_literal(value: str) -> str:
 def _table_exists(bind, schema: str, table: str) -> bool:
     return bool(
         bind.exec_driver_sql(
-            """
+            f"""
             SELECT EXISTS (
                 SELECT 1
                   FROM information_schema.tables
-                 WHERE table_schema = %(schema)s
-                   AND table_name = %(table)s
+                 WHERE table_schema = {_sql_literal(schema)}
+                   AND table_name = {_sql_literal(table)}
             );
-            """,
-            {"schema": schema, "table": table},
+            """
         ).scalar()
     )
 
@@ -55,16 +54,15 @@ def _table_exists(bind, schema: str, table: str) -> bool:
 def _column_exists(bind, schema: str, table: str, column: str) -> bool:
     return bool(
         bind.exec_driver_sql(
-            """
+            f"""
             SELECT EXISTS (
                 SELECT 1
                   FROM information_schema.columns
-                 WHERE table_schema = %(schema)s
-                   AND table_name = %(table)s
-                   AND column_name = %(column)s
+                 WHERE table_schema = {_sql_literal(schema)}
+                   AND table_name = {_sql_literal(table)}
+                   AND column_name = {_sql_literal(column)}
             );
-            """,
-            {"schema": schema, "table": table, "column": column},
+            """
         ).scalar()
     )
 
