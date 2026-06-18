@@ -129,6 +129,27 @@ def test_mrf_compressed_stream_override(monkeypatch):
     importlib.reload(utils_module)
 
 
+def test_mrf_flush_rows_are_configurable(monkeypatch):
+    monkeypatch.delenv("HLTHPRT_MRF_PLAN_FLUSH_ROWS", raising=False)
+    monkeypatch.delenv("HLTHPRT_SAVE_PER_PACK", raising=False)
+    monkeypatch.delenv("HLTHPRT_MRF_PROVIDER_FLUSH_ROWS", raising=False)
+    monkeypatch.delenv("HLTHPRT_MRF_FORMULARY_FLUSH_ROWS", raising=False)
+
+    assert process_initial._mrf_plan_flush_rows() == 2000
+    assert process_initial._mrf_provider_flush_rows() == 50000
+    assert process_initial._mrf_formulary_flush_rows() == 50000
+
+    monkeypatch.setenv("HLTHPRT_SAVE_PER_PACK", "123")
+    assert process_initial._mrf_plan_flush_rows() == 123
+
+    monkeypatch.setenv("HLTHPRT_MRF_PLAN_FLUSH_ROWS", "456")
+    monkeypatch.setenv("HLTHPRT_MRF_PROVIDER_FLUSH_ROWS", "789")
+    monkeypatch.setenv("HLTHPRT_MRF_FORMULARY_FLUSH_ROWS", "321")
+    assert process_initial._mrf_plan_flush_rows() == 456
+    assert process_initial._mrf_provider_flush_rows() == 789
+    assert process_initial._mrf_formulary_flush_rows() == 321
+
+
 @pytest.mark.asyncio
 async def test_process_json_index_dedupes_provider_url_jobs(monkeypatch):
     class FakeRedis:
@@ -561,6 +582,37 @@ async def test_refresh_plan_drug_statistics_upserts_concurrent_refreshes(monkeyp
     assert tier_insert.table is tier_stats
     assert [column.name for column in tier_insert.index_elements] == ["plan_id", "drug_tier"]
     assert tier_insert.set_ == {"drug_count": "excluded_drug_count"}
+
+
+@pytest.mark.asyncio
+async def test_refresh_all_plan_drug_statistics_batches_from_stage(monkeypatch):
+    calls = []
+
+    async def fake_scalar(sql, **params):
+        assert "to_regclass" in sql
+        assert params["qualified_name"] == "mrf.plan_drug_raw_20260612"
+        return "mrf.plan_drug_raw_20260612"
+
+    async def fake_all(sql):
+        calls.append(str(sql))
+        return [SimpleNamespace(plan_id="94529WI0240007"), ("94529WI0240008",)]
+
+    async def fake_refresh(plan_ids, import_date, db_schema):
+        calls.append((set(plan_ids), import_date, db_schema))
+
+    monkeypatch.setattr(
+        process_initial,
+        "make_class",
+        lambda cls, suffix, schema_override=None: SimpleNamespace(__tablename__=f"{cls.__tablename__}_{suffix}"),
+    )
+    monkeypatch.setattr(process_initial.db, "scalar", fake_scalar)
+    monkeypatch.setattr(process_initial.db, "all", fake_all)
+    monkeypatch.setattr(process_initial, "_refresh_plan_drug_statistics", fake_refresh)
+
+    await process_initial._refresh_all_plan_drug_statistics("20260612", "mrf")
+
+    assert "SELECT DISTINCT plan_id" in calls[0]
+    assert calls[1] == ({"94529WI0240007", "94529WI0240008"}, "20260612", "mrf")
 
 
 @pytest.mark.asyncio

@@ -1541,7 +1541,10 @@ async def _refresh_all_plan_drug_statistics(import_date, db_schema):
     )
     plan_ids = []
     for row in rows:
-        plan_ids.append(getattr(row, "plan_id", row[0]))
+        if hasattr(row, "plan_id"):
+            plan_ids.append(row.plan_id)
+        else:
+            plan_ids.append(row[0])
     await _refresh_plan_drug_statistics(plan_ids, import_date, db_schema)
 
 
