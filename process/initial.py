@@ -2838,7 +2838,7 @@ async def shutdown(ctx, task):
     await _refresh_all_plan_drug_statistics(import_date, db_schema)
     await _refresh_mrf_address_summary(import_date, db_schema)
     address_stats = None
-    if source_enabled("mrf"):
+    if source_enabled("mrf") and not test_mode:
         mrf_address_stage = make_class(MRFAddress, import_date, schema_override=db_schema)
         mrf_evidence_stage = make_class(MRFAddressEvidence, import_date, schema_override=db_schema)
         address_fields = {
@@ -2886,6 +2886,8 @@ async def shutdown(ctx, task):
             oa_stats.fuzzy_updates,
             oa_stats.relaxed_updates,
         )
+    elif test_mode:
+        logger.info("Skipping MRF archive address resolve in test mode")
 
     tables = {}
     async with db.transaction():
