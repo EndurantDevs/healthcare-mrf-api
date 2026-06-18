@@ -94,6 +94,18 @@ PARALLEL_CHUNK_BACKOFF_SECONDS = max(float(os.getenv("HLTHPRT_PARALLEL_CHUNK_BAC
 LARGE_FILE_TIMEOUT_LOG_THRESHOLD_BYTES = 1024 * 1024 * 1024
 
 
+def _resolve_download_cache_dir(cache_dir):
+    if not cache_dir:
+        return None
+
+    configured = os.getenv("HLTHPRT_DOWNLOAD_CACHE_DIR", "").strip()
+    raw_cache_dir = str(cache_dir)
+    normalized_cache_dir = os.path.abspath(os.path.expanduser(raw_cache_dir))
+    if configured and normalized_cache_dir == "/tmp":
+        return configured
+    return raw_cache_dir
+
+
 def _render_progress_line(downloaded: int, total: int | None, speed: float) -> str:
     if total and total > 0:
         ratio = min(max(downloaded / total, 0.0), 1.0)
@@ -400,8 +412,10 @@ async def download_it_and_save(
 ):
     print(f"Downloading {url}")
     max_chunk_size = chunk_size if chunk_size else HTTP_CHUNK_SIZE
+    cache_dir = _resolve_download_cache_dir(cache_dir)
     file_with_dir = None
     if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
         file_with_dir = str(PurePath(str(cache_dir), str(return_checksum([url]))))
     if cache_dir and file_with_dir and os.path.exists(file_with_dir):
         await copyfile(file_with_dir, filepath)
