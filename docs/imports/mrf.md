@@ -28,6 +28,17 @@ Concurrency notes:
 - `HLTHPRT_MAX_MRF_FINISH_JOBS=1` should be used for `process.MRF_finish`;
   the finish queue has one shutdown job and extra ARQ slots only contend on the
   same lock.
+- `HLTHPRT_MRF_PLAN_FLUSH_ROWS`, `HLTHPRT_MRF_PROVIDER_FLUSH_ROWS`, and
+  `HLTHPRT_MRF_FORMULARY_FLUSH_ROWS` control DB write batch sizes. The intended
+  dev/full-import defaults are 2000, 50000, and 50000.
+- Large top-level JSON arrays can be split into parser sub-jobs before loading.
+  `HLTHPRT_MRF_FILE_CHUNKING=providers,formularies` is the default. Use `all`
+  to include plan files, or `off` to keep the legacy one-job-per-file behavior.
+- `HLTHPRT_MRF_CHUNK_TARGET_MB=256` and `HLTHPRT_MRF_CHUNK_MIN_MB=512` tune
+  chunk fan-out. Files below the minimum stay single-job.
+- The finish worker tracks queued parser/chunk jobs in Redis and requeues
+  itself while work is still running. `HLTHPRT_MRF_FINISH_REQUEUE_SECONDS` and
+  `HLTHPRT_MRF_FINISH_MAX_REQUEUES` control the wait cadence and cap.
 - On full-source runs, older finish code spent most of its time recomputing
   canonical keys on `mrf_address_evidence`. The current path stamps
   `mrf_address` first, then propagates matching evidence keys from the

@@ -112,6 +112,26 @@ def test_control_wrapped_publish_importers_request_shutdown():
     assert npi_payload["run_shutdown"] is False
 
 
+def test_mrf_adapter_preserves_chunking_params():
+    payload = control_imports._adapter_payload(
+        control_imports._SINGLE_JOB_ADAPTERS["mrf"],
+        {"run_id": "run_mrf", "importer": "mrf", "family": "pricing"},
+        {
+            "test_mode": True,
+            "mrf_file_chunking": "all",
+            "mrf_chunk_target_mb": 128,
+            "ignored": "value",
+        },
+    )
+
+    assert payload == {
+        "test_mode": True,
+        "run_id": "run_mrf",
+        "mrf_file_chunking": "all",
+        "mrf_chunk_target_mb": 128,
+    }
+
+
 @pytest.mark.asyncio
 async def test_node_health_reports_degraded_when_redis_fails(monkeypatch):
     async def fake_database_check():
