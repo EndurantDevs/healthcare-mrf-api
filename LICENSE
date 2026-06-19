@@ -2,8 +2,11 @@ The HealthPorta HEALTHCARE MRF API Software is licensed under the HealthPorta
 Non-Commercial License (the "HealthPorta Non-Commercial License").
 A copy of the HealthPorta Non-Commercial License is provided below.
 
-For any COMMERCIAL use or for using results of data processing (including AI model
-training, analytics, or marketing usage), please contact nick@endurantdev.com.
+For any COMMERCIAL use, for copying this software's source code into another
+product, or for using this software or the results of its data processing for
+AI/ML model training, fine-tuning, data mining, analytics, or marketing, please
+contact nick@endurantdev.com. The uses described in Rules 4 and 5 below are
+reserved and are not granted by this license.
 
 EndurantDevs LLC processes and prepares US healthcare data for AI model training
 and fine-tuning through custom partnerships and collaborations. Please reach out
@@ -41,6 +44,26 @@ contribution, or both.
    patent claim they would infringe by using this software alone,
    accusing this software, with or without changes, alone or as
    part of a larger application.
+
+4. Notwithstanding any other term of this license, you must not use this
+   software, any part of it, or any output or data produced by it, as
+   training, fine-tuning, validation, evaluation, benchmarking, retrieval, or
+   grounding data for any machine-learning model, artificial-intelligence
+   system, or large language model, and you must not perform automated text or
+   data mining, scraping, or crawling of this software for those purposes. The
+   contributor reserves all text-and-data-mining rights in this software,
+   including the reservation allowed by Article 4 of Directive (EU) 2019/790.
+   This sentence is the contributor's machine-readable reservation of those
+   rights.
+
+5. Notwithstanding any other term of this license, you must not copy,
+   reproduce, or translate the source code of this software, in whole or in
+   part, into any other software, product, or service. The software, and the
+   design and know-how it embodies, are the contributor's property, and the
+   contributor reserves all rights in them. This rule does not restrict
+   viewing, evaluating, or running this software under the terms above, and it
+   does not restrict software you create independently without copying this
+   source code.
 
 You are excused for unknowingly breaking rule 1 if you stop
 doing anything requiring this license within 15 days of
@@ -115,3 +138,12 @@ entities as one:
 
 Contributor will not revoke this waiver, but may change terms for
 future versions of the software.
+
+-----------------------------------------------------------------
+
+Scope of Waivers
+
+Each Waiver above waives only Rule 1 (the commercial trial-period limit) for
+those who qualify. No Waiver waives Rule 2, 3, 4, or 5. Rules 4 and 5 apply to
+every user, including individuals, small businesses, academic and
+non-commercial users, and government users.
