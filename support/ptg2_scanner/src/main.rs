@@ -14,7 +14,7 @@ use ptg2_scanner::hashing::{
     canonical_json, checksum_i64_list, finish_hash_hex, hash_i64_list, hash_string_list, hash_text,
     make_checksum, semantic_hash, update_hash_optional_str, update_hash_string_list,
 };
-use ptg2_scanner::input::open_reader;
+use ptg2_scanner::input::{open_json_reader, open_reader};
 use ptg2_scanner::manifest::{
     normalized_sidecar_entries, price_set_global_id_from_atom_ids, procedure_global_id,
     provider_set_global_id_from_entry_hashes, write_dense_member_sidecar, write_global_sidecar,
@@ -3584,7 +3584,7 @@ fn scan_compact_struson_parallel(
 ) -> io::Result<()> {
     let total_bytes = path.metadata().map(|metadata| metadata.len()).unwrap_or(0);
     let compressed_bytes_read = Arc::new(AtomicU64::new(0));
-    let reader = open_reader(path, Arc::clone(&compressed_bytes_read))?;
+    let reader = open_json_reader(path, Arc::clone(&compressed_bytes_read))?;
     let mut json_reader = JsonStreamReader::new(reader);
     let progress_bytes_interval = progress_interval(
         "HLTHPRT_PTG2_SCANNER_PROGRESS_BYTES",
@@ -3882,7 +3882,7 @@ fn scan_compact_struson_parallel(
 
 fn compact_parallel_has_provider_references(path: &Path) -> io::Result<bool> {
     let compressed_bytes_read = Arc::new(AtomicU64::new(0));
-    let reader = open_reader(path, Arc::clone(&compressed_bytes_read))?;
+    let reader = open_json_reader(path, Arc::clone(&compressed_bytes_read))?;
     let mut json_reader = JsonStreamReader::new(reader);
     json_reader.begin_object().map_err(to_io_error)?;
     while json_reader.has_next().map_err(to_io_error)? {
@@ -3906,7 +3906,7 @@ fn scan_compact_struson(path: &Path) -> io::Result<()> {
         .unwrap_or_else(|_| "tic_rate_npi_tin".to_string());
     let total_bytes = path.metadata().map(|metadata| metadata.len()).unwrap_or(0);
     let compressed_bytes_read = Arc::new(AtomicU64::new(0));
-    let reader = open_reader(path, Arc::clone(&compressed_bytes_read))?;
+    let reader = open_json_reader(path, Arc::clone(&compressed_bytes_read))?;
     let mut json_reader = JsonStreamReader::new(reader);
     let stdout = io::stdout();
     let mut writer = BufWriter::new(stdout.lock());

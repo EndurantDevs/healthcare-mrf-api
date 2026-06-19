@@ -30,6 +30,111 @@ impl<R: Read> Read for CountingReader<R> {
     }
 }
 
+struct LossyUtf8Reader<R: Read> {
+    inner: R,
+    pending: Vec<u8>,
+    output: Vec<u8>,
+    output_pos: usize,
+    eof: bool,
+}
+
+impl<R: Read> LossyUtf8Reader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            pending: Vec::with_capacity(4),
+            output: Vec::new(),
+            output_pos: 0,
+            eof: false,
+        }
+    }
+
+    fn append_valid_utf8_lossy(&mut self, bytes: &[u8], eof: bool) {
+        let mut pos = 0usize;
+        while pos < bytes.len() {
+            match std::str::from_utf8(&bytes[pos..]) {
+                Ok(valid) => {
+                    self.output.extend_from_slice(valid.as_bytes());
+                    self.pending.clear();
+                    return;
+                }
+                Err(error) => {
+                    let valid_up_to = error.valid_up_to();
+                    if valid_up_to > 0 {
+                        self.output
+                            .extend_from_slice(&bytes[pos..pos + valid_up_to]);
+                        pos += valid_up_to;
+                    }
+                    match error.error_len() {
+                        Some(error_len) => {
+                            self.output.extend_from_slice(
+                                char::REPLACEMENT_CHARACTER
+                                    .encode_utf8(&mut [0; 4])
+                                    .as_bytes(),
+                            );
+                            pos += error_len;
+                        }
+                        None => {
+                            self.pending.clear();
+                            if eof {
+                                let text = String::from_utf8_lossy(&bytes[pos..]);
+                                self.output.extend_from_slice(text.as_bytes());
+                            } else {
+                                self.pending.extend_from_slice(&bytes[pos..]);
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        self.pending.clear();
+    }
+
+    fn fill_output(&mut self) -> io::Result<bool> {
+        self.output.clear();
+        self.output_pos = 0;
+        let mut raw = [0u8; 8192];
+        while self.output.is_empty() && !self.eof {
+            let read = self.inner.read(&mut raw)?;
+            if read == 0 {
+                self.eof = true;
+                if !self.pending.is_empty() {
+                    let pending = std::mem::take(&mut self.pending);
+                    self.append_valid_utf8_lossy(&pending, true);
+                }
+                break;
+            }
+            let bytes = if self.pending.is_empty() {
+                raw[..read].to_vec()
+            } else {
+                let mut bytes = Vec::with_capacity(self.pending.len() + read);
+                bytes.extend_from_slice(&self.pending);
+                bytes.extend_from_slice(&raw[..read]);
+                bytes
+            };
+            self.append_valid_utf8_lossy(&bytes, false);
+        }
+        Ok(!self.output.is_empty())
+    }
+}
+
+impl<R: Read> Read for LossyUtf8Reader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.output_pos >= self.output.len() && !self.fill_output()? {
+            return Ok(0);
+        }
+        let available = &self.output[self.output_pos..];
+        let count = available.len().min(buf.len());
+        buf[..count].copy_from_slice(&available[..count]);
+        self.output_pos += count;
+        Ok(count)
+    }
+}
+
 fn is_gzip(path: &Path) -> io::Result<bool> {
     if path
         .extension()
@@ -61,11 +166,21 @@ pub fn open_reader(
     }
 }
 
+pub fn open_json_reader(
+    path: &Path,
+    compressed_bytes_read: Arc<AtomicU64>,
+) -> io::Result<Box<dyn Read>> {
+    Ok(Box::new(LossyUtf8Reader::new(open_reader(
+        path,
+        compressed_bytes_read,
+    )?)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use flate2::{write::GzEncoder, Compression};
-    use std::io::Write;
+    use std::io::{Cursor, Write};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_path(suffix: &str) -> std::path::PathBuf {
@@ -106,5 +221,46 @@ mod tests {
         assert_eq!(text, "{\"ok\":true}");
         assert!(bytes_read.load(Ordering::Relaxed) > 0);
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn open_json_reader_replaces_invalid_utf8_without_loading_file() {
+        let path = temp_path("invalid_utf8.json");
+        std::fs::write(&path, b"{\"name\":\"A\xffB\"}").expect("write invalid utf8 test file");
+        let bytes_read = Arc::new(AtomicU64::new(0));
+        let mut reader =
+            open_json_reader(&path, Arc::clone(&bytes_read)).expect("open json reader");
+        let mut text = String::new();
+        reader.read_to_string(&mut text).expect("read json file");
+        assert_eq!(text, "{\"name\":\"A\u{FFFD}B\"}");
+        assert_eq!(bytes_read.load(Ordering::Relaxed), 14);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn lossy_utf8_reader_preserves_multibyte_sequences_across_reads() {
+        struct OneByteReader(Cursor<Vec<u8>>);
+
+        impl Read for OneByteReader {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if buf.is_empty() {
+                    return Ok(0);
+                }
+                let mut one = [0u8; 1];
+                let read = self.0.read(&mut one)?;
+                if read > 0 {
+                    buf[0] = one[0];
+                }
+                Ok(read)
+            }
+        }
+
+        let mut reader =
+            LossyUtf8Reader::new(OneByteReader(Cursor::new("AéB".as_bytes().to_vec())));
+        let mut text = String::new();
+        reader
+            .read_to_string(&mut text)
+            .expect("read lossy utf8 stream");
+        assert_eq!(text, "AéB");
     }
 }
