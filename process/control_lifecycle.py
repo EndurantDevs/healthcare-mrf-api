@@ -239,6 +239,7 @@ async def mark_control_run(
         values["snapshot_id"] = snapshot_id
     if status == "running":
         values["started_at"] = func.coalesce(ImportRun.started_at, now)
+        values["finished_at"] = None
     if done:
         values["finished_at"] = now
     if await _should_update_control_run_db(

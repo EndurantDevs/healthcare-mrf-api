@@ -161,3 +161,42 @@ async def test_terminal_status_write_does_not_clobber_canceling_run():
         assert row.finished_at is None
     finally:
         await _drop_import_run_schema()
+
+
+async def test_running_status_clears_previous_finished_at(monkeypatch):
+    await _reset_import_run_schema()
+    try:
+        monkeypatch.setenv("HLTHPRT_CONTROL_RUN_DB_UPDATE_THROTTLE_SECONDS", "0")
+        finished_at = control_imports.utc_now()
+        await db.execute(
+            control_imports.insert(ImportRun).values(
+                run_id="run_retry",
+                engine=control_imports.ENGINE_NAME,
+                importer="ptg",
+                family="pricing",
+                status="failed",
+                phase_detail="ptg import failed",
+                params={},
+                created_at=control_imports.utc_now(),
+                started_at=control_imports.utc_now(),
+                finished_at=finished_at,
+                heartbeat_at=finished_at,
+                progress={"unit": "run", "total": 1, "done": 1, "pct": 100, "message": "failed"},
+                error={"code": "low_memory_pause"},
+            )
+        )
+
+        await mark_control_run(
+            "run_retry",
+            status="running",
+            phase_detail="ptg import running",
+            progress_message="running",
+        )
+
+        row = (await db.execute(select(ImportRun).where(ImportRun.run_id == "run_retry"))).scalar_one()
+        assert row.status == "running"
+        assert row.phase_detail == "ptg import running"
+        assert row.finished_at is None
+        assert row.error is None
+    finally:
+        await _drop_import_run_schema()
