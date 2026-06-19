@@ -109,7 +109,7 @@ from process.ptg_parts.config import (
     PTG2_RANGE_DOWNLOAD_TASKS_ENV, PTG2_RANGE_DOWNLOADS_ENV,
     PTG2_RATE_BATCH_ROWS_ENV, PTG2_RATE_GROUP_FLUSH_ITEMS_ENV,
     PTG2_RAW_WORKER_OBJECTS_ENV, PTG2_RUST_COMPACT_SERVING_ENV,
-    PTG2_RUST_EVENT_QUEUE_ENV, PTG2_RUST_SCANNER_BIN_ENV,
+    PTG2_RUST_EVENT_QUEUE_ENV, PTG2_RUST_PARSE_IN_WORKERS_ENV, PTG2_RUST_SCANNER_BIN_ENV,
     PTG2_RUST_SCANNER_ENV, PTG2_RUST_WORKERS_ENV, PTG2_SERVING_ONLY_IMPORT_ENV,
     PTG2_SERVING_WORKERS_ENV, PTG2_SKIP_BULK_INDEX_ENSURE_ENV,
     PTG2_SKIP_COMPACT_SERVING_INDEX_ENSURE_ENV,
@@ -582,6 +582,8 @@ async def _parse_in_network_file_serving_only(
     manifest_copy_rows = 0
     rust_records = 0
     rust_dedupe_summary: dict[str, Any] = {}
+    rust_scanner_config: dict[str, Any] = {}
+    rust_scanner_summary: dict[str, Any] = {}
     procedure_hashes: set[str] = set()
     defer_manifest_copy = _env_bool(PTG2_MANIFEST_PRECOPY_MERGE_ENV, True)
     deferred_copy_files: dict[str, list[dict[str, Any]]] = {
@@ -707,6 +709,12 @@ async def _parse_in_network_file_serving_only(
             if record_kind == "dedupe_summary":
                 rust_dedupe_summary = dict(record_row or {})
                 continue
+            if record_kind == "scanner_config":
+                rust_scanner_config = dict(record_row or {})
+                continue
+            if record_kind == "scanner_summary":
+                rust_scanner_summary = dict(record_row or {})
+                continue
             rust_records += 1
             if record_kind == "manifest_serving_copy_file":
                 compact_copy_tasks.add(asyncio.create_task(copy_ready_manifest_serving_file(record_row)))
@@ -785,6 +793,11 @@ async def _parse_in_network_file_serving_only(
     }
     if rust_dedupe_summary:
         summary["dedupe"] = rust_dedupe_summary
+    if rust_scanner_config or rust_scanner_summary:
+        summary["scanner"] = {
+            "config": rust_scanner_config,
+            "summary": rust_scanner_summary,
+        }
     _emit_screen_line(f"PTG2 serving-only import summary: {summary}")
     logger.info("PTG2 serving-only import summary: %s", summary)
     return summary
@@ -2423,7 +2436,10 @@ async def main(
                 snapshot_id=snapshot_id,
                 source_key=source_key_val,
                 artifacts=manifest_artifacts,
-                db_dedupe_fallback=not bool(manifest_merge_metrics.get("enabled")),
+                db_dedupe_fallback=(
+                    not bool(manifest_merge_metrics.get("enabled"))
+                    or _env_bool(PTG2_RUST_PARSE_IN_WORKERS_ENV, False)
+                ),
             )
             ptg2_manifest_stage_table = None
         else:

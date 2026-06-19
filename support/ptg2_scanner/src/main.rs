@@ -45,6 +45,7 @@ use std::sync::{
 use std::thread;
 use std::time::Instant;
 use struson::reader::{JsonReader, JsonStreamReader};
+use struson::writer::{JsonStreamWriter, JsonWriter};
 use xxhash_rust::xxh3::Xxh3;
 
 fn to_io_error(error: impl Display) -> io::Error {
@@ -474,12 +475,23 @@ fn send_worker_job<W: Write>(
     tx: &Sender<WorkerJob>,
     event_rx: &Receiver<CopyFileEvent>,
     writer: &mut W,
+    producer_blocked_micros: &mut u128,
     mut job: WorkerJob,
 ) -> io::Result<()> {
+    let mut blocked_since: Option<Instant> = None;
     loop {
         match tx.try_send(job) {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                if let Some(started_at) = blocked_since.take() {
+                    *producer_blocked_micros =
+                        producer_blocked_micros.saturating_add(started_at.elapsed().as_micros());
+                }
+                return Ok(());
+            }
             Err(TrySendError::Full(returned_job)) => {
+                if blocked_since.is_none() {
+                    blocked_since = Some(Instant::now());
+                }
                 job = returned_job;
                 drain_copy_file_events(event_rx, writer)?;
                 thread::yield_now();
@@ -566,7 +578,7 @@ fn build_provider_entry(provider_ref: &Value) -> Option<ProviderEntry> {
     if group_payloads.is_empty() {
         return None;
     }
-    group_payloads.sort_by_key(canonical_json);
+    group_payloads.sort_by_cached_key(canonical_json);
     group_hashes.sort_unstable();
     group_hashes.dedup();
     provider_npis.sort_unstable();
@@ -2700,6 +2712,10 @@ enum WorkerJob {
         procedure: Map<String, Value>,
         rates: Vec<RateLite>,
     },
+    RawRates {
+        procedure: Map<String, Value>,
+        raw_rates: Vec<Vec<u8>>,
+    },
 }
 
 impl WorkerJob {
@@ -2707,6 +2723,7 @@ impl WorkerJob {
         match self {
             WorkerJob::ProviderRefs(_) => "provider refs",
             WorkerJob::Rates { .. } => "rates",
+            WorkerJob::RawRates { .. } => "raw rates",
         }
     }
 }
@@ -3122,6 +3139,29 @@ fn read_rate_lite_struson<R: Read>(
     }))
 }
 
+fn transfer_next_value_to_bytes<R: Read>(
+    json_reader: &mut JsonStreamReader<R>,
+) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    {
+        let mut json_writer = JsonStreamWriter::new(&mut bytes);
+        json_reader
+            .transfer_to(&mut json_writer)
+            .map_err(to_io_error)?;
+        json_writer.finish_document().map_err(to_io_error)?;
+    }
+    Ok(bytes)
+}
+
+fn read_rate_lite_bytes(raw: &[u8]) -> io::Result<Option<RateLite>> {
+    let mut json_reader = JsonStreamReader::new(raw);
+    let rate = read_rate_lite_struson(&mut json_reader)?;
+    json_reader
+        .consume_trailing_whitespace()
+        .map_err(to_io_error)?;
+    Ok(rate)
+}
+
 fn read_price_lite_struson<R: Read>(
     json_reader: &mut JsonStreamReader<R>,
 ) -> io::Result<Option<PriceLite>> {
@@ -3296,9 +3336,12 @@ fn enqueue_in_network_struson<R: Read>(
     event_rx: &Receiver<CopyFileEvent>,
     writer: &mut impl Write,
     chunk_size: usize,
+    parse_in_workers: bool,
+    producer_blocked_micros: &mut u128,
 ) -> io::Result<u64> {
     let mut procedure = Map::new();
     let mut rate_chunk: Vec<RateLite> = Vec::with_capacity(chunk_size);
+    let mut raw_rate_chunk: Vec<Vec<u8>> = Vec::with_capacity(chunk_size);
     let mut rate_count = 0u64;
     json_reader.begin_object().map_err(to_io_error)?;
     while json_reader.has_next().map_err(to_io_error)? {
@@ -3316,7 +3359,26 @@ fn enqueue_in_network_struson<R: Read>(
                 json_reader.begin_array().map_err(to_io_error)?;
                 while json_reader.has_next().map_err(to_io_error)? {
                     rate_count += 1;
-                    if let Some(rate) = read_rate_lite_struson(json_reader)? {
+                    if parse_in_workers {
+                        raw_rate_chunk.push(transfer_next_value_to_bytes(json_reader)?);
+                        if raw_rate_chunk.len() >= chunk_size {
+                            let raw_rates = std::mem::replace(
+                                &mut raw_rate_chunk,
+                                Vec::with_capacity(chunk_size),
+                            );
+                            send_worker_job(
+                                tx,
+                                event_rx,
+                                writer,
+                                producer_blocked_micros,
+                                WorkerJob::RawRates {
+                                    procedure: procedure.clone(),
+                                    raw_rates,
+                                },
+                            )?;
+                            drain_copy_file_events(event_rx, writer)?;
+                        }
+                    } else if let Some(rate) = read_rate_lite_struson(json_reader)? {
                         rate_chunk.push(rate);
                         if rate_chunk.len() >= chunk_size {
                             let rates =
@@ -3325,6 +3387,7 @@ fn enqueue_in_network_struson<R: Read>(
                                 tx,
                                 event_rx,
                                 writer,
+                                producer_blocked_micros,
                                 WorkerJob::Rates {
                                     procedure: procedure.clone(),
                                     rates,
@@ -3342,11 +3405,24 @@ fn enqueue_in_network_struson<R: Read>(
         }
     }
     json_reader.end_object().map_err(to_io_error)?;
-    if !rate_chunk.is_empty() {
+    if !raw_rate_chunk.is_empty() {
         send_worker_job(
             tx,
             event_rx,
             writer,
+            producer_blocked_micros,
+            WorkerJob::RawRates {
+                procedure,
+                raw_rates: raw_rate_chunk,
+            },
+        )?;
+        drain_copy_file_events(event_rx, writer)?;
+    } else if !rate_chunk.is_empty() {
+        send_worker_job(
+            tx,
+            event_rx,
+            writer,
+            producer_blocked_micros,
             WorkerJob::Rates {
                 procedure,
                 rates: rate_chunk,
@@ -3435,6 +3511,31 @@ fn compact_worker_loop(
                 };
                 process_compact_rate_lites_worker(&mut state, &rates, &procedure_value)?;
             }
+            WorkerJob::RawRates {
+                procedure,
+                raw_rates,
+            } => {
+                let mut rates = Vec::with_capacity(raw_rates.len());
+                for raw_rate in raw_rates {
+                    if let Some(rate) = read_rate_lite_bytes(&raw_rate)? {
+                        rates.push(rate);
+                    }
+                }
+                let procedure_value = Value::Object(procedure);
+                let mut state = SharedCompactState {
+                    writer: &mut sink,
+                    compact_copy_writer: &mut compact_copy_writer,
+                    manifest_serving_copy_writer: &mut manifest_serving_copy_writer,
+                    dictionary_copy_sinks: &mut dictionary_copy_sinks,
+                    manifest_sidecars: config.manifest_sidecars.clone(),
+                    suppress_v2_serving_output: config.copy_paths.manifest_only,
+                    provider_map: &config.provider_map,
+                    dedupe: &config.dedupe,
+                    price_code_set_hash_cache: &mut price_code_set_hash_cache,
+                    context: &config.context,
+                };
+                process_compact_rate_lites_worker(&mut state, &rates, &procedure_value)?;
+            }
         }
         if let Some(copy_writer) = compact_copy_writer.as_mut() {
             if let Some(event) = copy_writer.maybe_rotate_silent()? {
@@ -3504,6 +3605,7 @@ fn scan_compact_struson_parallel(
         "HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES",
         DEFAULT_SPLIT_NEGOTIATED_RATES,
     );
+    let parse_in_workers = env_bool("HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS", false);
     let bounded_queue_size = queue_size.max(worker_count).max(1);
     let dedupe = Arc::new(SharedDedupe::new(worker_count));
     let manifest_sidecars = if copy_paths.has_manifest_sidecar_paths() {
@@ -3521,6 +3623,21 @@ fn scan_compact_struson_parallel(
     let (event_tx, event_rx) = bounded::<CopyFileEvent>(event_queue_size);
     let stdout = io::stdout();
     let mut writer = BufWriter::new(stdout.lock());
+    let mut producer_blocked_micros = 0u128;
+
+    emit_json_record(
+        &mut writer,
+        "scanner_config",
+        &json!({
+            "worker_count": worker_count,
+            "work_queue": bounded_queue_size,
+            "event_queue": event_queue_size,
+            "split_negotiated_rates": negotiated_rate_chunk_size,
+            "parse_in_workers": parse_in_workers,
+            "panic_strategy": "unwind",
+        }),
+    )?;
+    writer.flush()?;
 
     json_reader.begin_object().map_err(to_io_error)?;
     while json_reader.has_next().map_err(to_io_error)? {
@@ -3601,7 +3718,13 @@ fn scan_compact_struson_parallel(
                 drop(rx);
 
                 for refs in provider_ref_jobs.drain(..) {
-                    send_worker_job(&tx, &event_rx, &mut writer, WorkerJob::ProviderRefs(refs))?;
+                    send_worker_job(
+                        &tx,
+                        &event_rx,
+                        &mut writer,
+                        &mut producer_blocked_micros,
+                        WorkerJob::ProviderRefs(refs),
+                    )?;
                 }
 
                 while json_reader.has_next().map_err(to_io_error)? {
@@ -3616,6 +3739,8 @@ fn scan_compact_struson_parallel(
                                     &event_rx,
                                     &mut writer,
                                     negotiated_rate_chunk_size,
+                                    parse_in_workers,
+                                    &mut producer_blocked_micros,
                                 )?;
                                 drain_copy_file_events(&event_rx, &mut writer)?;
                                 *object_counts.entry("in_network".to_string()).or_insert(0) += 1;
@@ -3705,6 +3830,19 @@ fn scan_compact_struson_parallel(
                     &mut writer,
                     "dedupe_summary",
                     &dedupe_summary_payload(&dedupe, &object_counts),
+                )?;
+                emit_json_record(
+                    &mut writer,
+                    "scanner_summary",
+                    &json!({
+                        "worker_count": worker_count,
+                        "work_queue": bounded_queue_size,
+                        "event_queue": event_queue_size,
+                        "split_negotiated_rates": negotiated_rate_chunk_size,
+                        "parse_in_workers": parse_in_workers,
+                        "producer_blocked_micros": producer_blocked_micros,
+                        "elapsed_seconds": started_at.elapsed().as_secs_f64(),
+                    }),
                 )?;
                 writer.flush()?;
                 json_reader.end_object().map_err(to_io_error)?;

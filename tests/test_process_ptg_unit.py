@@ -494,6 +494,30 @@ def test_rust_scanner_split_keeps_facade_helpers_stable():
     assert process_ptg._aiter_compact_serving_records_rust is ptg_rust_scanner._aiter_compact_serving_records_rust
 
 
+def test_ptg2_rust_scanner_release_requirement_skips_debug_binary(monkeypatch, tmp_path):
+    debug_binary = tmp_path / "support" / "ptg2_scanner" / "target" / "debug" / "ptg2_scanner"
+    debug_binary.parent.mkdir(parents=True)
+    debug_binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    debug_binary.chmod(0o755)
+
+    monkeypatch.setenv(process_ptg.PTG2_RUST_SCANNER_BIN_ENV, str(debug_binary))
+    monkeypatch.setenv(ptg_rust_scanner.PTG2_RUST_REQUIRE_RELEASE_ENV, "true")
+
+    assert ptg_rust_scanner._ptg2_rust_scanner_binary() is None
+
+
+def test_ptg2_rust_scanner_release_requirement_accepts_release_binary(monkeypatch, tmp_path):
+    release_binary = tmp_path / "support" / "ptg2_scanner" / "target" / "release" / "ptg2_scanner"
+    release_binary.parent.mkdir(parents=True)
+    release_binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    release_binary.chmod(0o755)
+
+    monkeypatch.setenv(process_ptg.PTG2_RUST_SCANNER_BIN_ENV, str(release_binary))
+    monkeypatch.setenv(ptg_rust_scanner.PTG2_RUST_REQUIRE_RELEASE_ENV, "true")
+
+    assert ptg_rust_scanner._ptg2_rust_scanner_binary() == release_binary
+
+
 def test_async_rust_scanner_close_suppresses_generator_already_executing(monkeypatch, tmp_path):
     class BlockingIterator:
         def __init__(self):
@@ -2780,6 +2804,116 @@ def test_ptg2_rust_compact_serving_parallel_workers_write_shards(tmp_path):
     assert dedupe_summary["provider_entry_component_duplicate"] == 0
 
 
+def test_ptg2_rust_parse_in_workers_matches_default_on_large_in_network_chunk(tmp_path):
+    binary = process_ptg._ptg2_rust_scanner_binary()
+    if binary is None:
+        pytest.skip("PTG2 Rust scanner binary is not built")
+
+    artifact = tmp_path / "rates.json.gz"
+    negotiated_rates = [
+        {
+            "provider_references": [7],
+            "negotiated_prices": [
+                {
+                    "negotiated_type": "negotiated",
+                    "negotiated_rate": 100 + index,
+                    "service_code": ["11"],
+                    "billing_class": "professional",
+                }
+            ],
+        }
+        for index in range(8)
+    ]
+    payload = {
+        "provider_references": [
+            {
+                "provider_group_id": 7,
+                "provider_groups": [{"npi": [1234567890], "tin": {"type": "ein", "value": "12-3456789"}}],
+            }
+        ],
+        "in_network": [
+            {
+                "billing_code_type": "CPT",
+                "billing_code": "99213",
+                "negotiated_rates": negotiated_rates,
+            }
+        ],
+    }
+    with gzip.open(artifact, "wb") as fp:
+        fp.write(json.dumps(payload).encode("utf-8"))
+
+    def run_scanner(parse_in_workers: bool):
+        run_dir = tmp_path / ("raw-workers" if parse_in_workers else "default")
+        run_dir.mkdir()
+        serving_copy = run_dir / "manifest_serving.copy"
+        price_atom_copy = run_dir / "price_atom.copy"
+        provider_group_member_copy = run_dir / "provider_group_member.copy"
+        env = {
+            **os.environ,
+            "HLTHPRT_PTG2_COMPACT_SNAPSHOT_ID": "snapshot",
+            "HLTHPRT_PTG2_COMPACT_PLAN_ID": "plan",
+            "HLTHPRT_PTG2_COMPACT_PLAN_MONTH_ID": "plan-month",
+            "HLTHPRT_PTG2_COMPACT_SOURCE_TRACE_SET_HASH": "source-trace",
+            "HLTHPRT_PTG2_MANIFEST_SERVING_COPY_PATH": str(serving_copy),
+            "HLTHPRT_PTG2_MANIFEST_PRICE_ATOM_COPY_PATH": str(price_atom_copy),
+            "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_MEMBER_COPY_PATH": str(provider_group_member_copy),
+            "HLTHPRT_PTG2_MANIFEST_ONLY": "true",
+            "HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES": "2",
+            "HLTHPRT_PTG2_RUST_WORKERS": "2",
+            "HLTHPRT_PTG2_RUST_WORK_QUEUE": "2",
+            "HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS": "true" if parse_in_workers else "false",
+        }
+        completed = subprocess.run(
+            [str(binary), "--compact-serving", str(artifact)],
+            check=True,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        frames = []
+        stream = io.BytesIO(completed.stdout)
+        while True:
+            header = stream.readline()
+            if not header:
+                break
+            name, size = header.rstrip(b"\n").split(b"\t", 1)
+            payload_bytes = stream.read(int(size))
+            assert stream.read(1) == b"\n"
+            frames.append((name.decode("utf-8"), json.loads(payload_bytes)))
+        copy_rows = {
+            "serving": sorted(
+                line
+                for path in run_dir.glob("manifest_serving.copy*")
+                for line in path.read_text().splitlines()
+            ),
+            "price_atom": sorted(
+                line
+                for path in run_dir.glob("price_atom.copy*")
+                for line in path.read_text().splitlines()
+            ),
+            "provider_group_member": sorted(
+                line
+                for path in run_dir.glob("provider_group_member.copy*")
+                for line in path.read_text().splitlines()
+            ),
+        }
+        return frames, copy_rows
+
+    default_frames, default_rows = run_scanner(False)
+    worker_frames, worker_rows = run_scanner(True)
+
+    assert worker_rows == default_rows
+    assert len(worker_rows["serving"]) == 8
+    worker_summary = [row for kind, row in worker_frames if kind == "scanner_summary"][0]
+    worker_config = [row for kind, row in worker_frames if kind == "scanner_config"][0]
+    default_summary = [row for kind, row in default_frames if kind == "scanner_summary"][0]
+    assert worker_config["parse_in_workers"] is True
+    assert worker_summary["parse_in_workers"] is True
+    assert default_summary["parse_in_workers"] is False
+    assert worker_summary["split_negotiated_rates"] == 2
+    assert "producer_blocked_micros" in worker_summary
+
+
 def test_ptg2_rust_compact_price_sets_emit_normalized_membership(tmp_path):
     binary = process_ptg._ptg2_rust_scanner_binary()
     if binary is None:
@@ -3524,6 +3658,67 @@ def test_ptg2_source_scoped_report_uses_published_serving_rate_count(monkeypatch
     assert final_report["serving_index"]["serving_rates"] == 987
     assert final_report["successful_files"][0]["summary"]["serving_rates"] == 111
     assert snapshot_rows[-1]["manifest"]["serving_rates"] == 987
+
+
+def test_ptg2_parse_in_workers_keeps_publish_db_dedupe_after_precopy_merge(monkeypatch):
+    publish_kwargs = []
+
+    async def fake_push(_rows, _cls, **_kwargs):
+        return None
+
+    async def fake_downloaded_jobs(jobs, **_kwargs):
+        for job in jobs:
+            yield process_ptg.PTG2DownloadedJob(
+                job=job,
+                raw_artifact=SimpleNamespace(raw_sha256=str(job.get("url") or "")),
+                logical_artifact=SimpleNamespace(logical_path="/tmp/rates.json.gz"),
+            )
+
+    async def fake_process(*_args, **_kwargs):
+        return process_ptg.PTG2FileProcessResult(
+            "in_network",
+            "https://example.test/rates.json.gz",
+            True,
+            summary={"serving_rates": 111, "manifest": {"copy_files": {"manifest_serving": []}}},
+        )
+
+    async def fake_publish(*_args, **kwargs):
+        publish_kwargs.append(kwargs)
+        return {
+            "storage": "manifest_snapshot",
+            "type": "ptg2_manifest_serving",
+            "table": "mrf.ptg2_manifest_serving_exact",
+            "rate_count": 111,
+            "serving_rates": 111,
+        }
+
+    monkeypatch.setenv(process_ptg.PTG2_RUST_PARSE_IN_WORKERS_ENV, "true")
+    monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
+    monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
+    monkeypatch.setattr(process_ptg.db, "status", AsyncMock())
+    monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push)
+    monkeypatch.setattr(process_ptg, "_prepare_ptg_tables", AsyncMock(return_value={"ImportLog": "log"}))
+    monkeypatch.setattr(process_ptg, "_create_ptg2_manifest_serving_stage_table", AsyncMock(return_value="manifest_stage"))
+    monkeypatch.setattr(process_ptg, "_iter_downloaded_ptg_jobs", fake_downloaded_jobs)
+    monkeypatch.setattr(process_ptg, "_process_in_network_file", fake_process)
+    monkeypatch.setattr(process_ptg, "_merge_and_copy_ptg2_manifest_files", AsyncMock(return_value={"enabled": True}))
+    monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
+    monkeypatch.setattr(process_ptg, "_publish_ptg2_manifest_serving_snapshot", fake_publish)
+    monkeypatch.setattr(process_ptg, "_current_source_snapshot_id", AsyncMock(return_value=None))
+    monkeypatch.setattr(process_ptg, "_publish_ptg2_source_pointers", AsyncMock())
+    monkeypatch.setattr(process_ptg, "_cleanup_old_ptg2_source_tables", AsyncMock())
+
+    asyncio.run(
+        process_ptg.main(
+            in_network_url="https://example.test/rates.json.gz",
+            import_month="2026-04",
+            import_id="parse_worker_backstop",
+            source_key="heartland_dental",
+        )
+    )
+
+    assert publish_kwargs
+    assert publish_kwargs[-1]["db_dedupe_fallback"] is True
 
 
 def test_ptg2_test_mode_uses_manifest_source_scoped_import(monkeypatch):

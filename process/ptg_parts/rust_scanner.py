@@ -25,6 +25,7 @@ from process.ptg_parts.config import (
     PTG2_DEFAULT_RUST_WORKERS,
     PTG2_FAST_JSON_LOADS_ENV,
     PTG2_RUST_EVENT_QUEUE_ENV,
+    PTG2_RUST_REQUIRE_RELEASE_ENV,
     PTG2_RUST_SCANNER_BIN_ENV,
     PTG2_RUST_SPLIT_NEGOTIATED_RATES_ENV,
     PTG2_RUST_WORK_QUEUE_ENV,
@@ -38,6 +39,15 @@ from process.ptg_parts.screen import _emit_screen_line
 logger = logging.getLogger(__name__)
 
 
+def _ptg2_scanner_binary_profile(path: Path) -> str:
+    parts = set(path.parts)
+    if "release" in parts:
+        return "release"
+    if "debug" in parts:
+        return "debug"
+    return "custom"
+
+
 def _json_loads(value: str | bytes | bytearray) -> Any:
     if orjson is not None and _env_bool(PTG2_FAST_JSON_LOADS_ENV, True):
         return orjson.loads(value)
@@ -46,20 +56,46 @@ def _json_loads(value: str | bytes | bytearray) -> Any:
 
 def _ptg2_rust_scanner_binary() -> Path | None:
     configured = os.getenv(PTG2_RUST_SCANNER_BIN_ENV)
-    candidates = []
+    require_release = _env_bool(PTG2_RUST_REQUIRE_RELEASE_ENV, False)
     if configured:
-        candidates.append(Path(configured))
+        candidate = Path(configured)
+        if candidate.exists() and os.access(candidate, os.X_OK):
+            profile = _ptg2_scanner_binary_profile(candidate)
+            if require_release and profile == "debug":
+                logger.warning(
+                    "Ignoring PTG2 Rust scanner debug binary because %s is enabled: %s",
+                    PTG2_RUST_REQUIRE_RELEASE_ENV,
+                    candidate,
+                )
+                return None
+            return candidate
+        return None
     root = Path(__file__).resolve().parents[2]
-    candidates.extend(
-        [
-            root / "support" / "ptg2_scanner" / "target" / "release" / "ptg2_scanner",
-            root / "support" / "ptg2_scanner" / "target" / "debug" / "ptg2_scanner",
-        ]
-    )
+    candidates = [
+        root / "support" / "ptg2_scanner" / "target" / "release" / "ptg2_scanner",
+        root / "support" / "ptg2_scanner" / "target" / "debug" / "ptg2_scanner",
+    ]
     for candidate in candidates:
         if candidate.exists() and os.access(candidate, os.X_OK):
+            profile = _ptg2_scanner_binary_profile(candidate)
+            if require_release and profile == "debug":
+                logger.warning(
+                    "Ignoring PTG2 Rust scanner debug binary because %s is enabled: %s",
+                    PTG2_RUST_REQUIRE_RELEASE_ENV,
+                    candidate,
+                )
+                continue
             return candidate
     return None
+
+
+def _log_ptg2_rust_scanner_binary(binary: Path) -> None:
+    logger.info(
+        "PTG2 Rust scanner binary selected path=%s profile=%s require_release=%s",
+        binary,
+        _ptg2_scanner_binary_profile(binary),
+        _env_bool(PTG2_RUST_REQUIRE_RELEASE_ENV, False),
+    )
 
 
 def _scanner_error_message(prefix: str, return_code: int, stderr_tail: list[str]) -> str:
@@ -76,6 +112,7 @@ def _iter_top_level_object_bytes_rust(
             "PTG2 Rust scanner is enabled but no scanner binary was found; "
             "build it with `cargo build --release --manifest-path support/ptg2_scanner/Cargo.toml`"
         )
+    _log_ptg2_rust_scanner_binary(binary)
     process = subprocess.Popen(
         [str(binary), str(path), *sorted(array_names)],
         stdout=subprocess.PIPE,
@@ -173,6 +210,7 @@ def _iter_compact_serving_records_rust(
             "PTG2 Rust compact serving is enabled but no scanner binary was found; "
             "build it with `cargo build --release --manifest-path support/ptg2_scanner/Cargo.toml`"
         )
+    _log_ptg2_rust_scanner_binary(binary)
     env = {
         **os.environ,
         "HLTHPRT_PTG2_COMPACT_SNAPSHOT_ID": snapshot_id,

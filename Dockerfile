@@ -1,5 +1,8 @@
 FROM rust:1-slim-trixie AS ptg2-scanner-builder
 
+ARG TARGETARCH
+ARG PTG2_SCANNER_RUSTFLAGS_AMD64="-C target-cpu=x86-64-v3"
+
 WORKDIR /build
 COPY support/ptg2_scanner/ /build/support/ptg2_scanner/
 COPY process/ext/address_pub28.py /build/process/ext/address_pub28.py
@@ -7,9 +10,17 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends python3 python3-pip \
     && python3 -m pip install --break-system-packages --no-cache-dir "maturin>=1.14,<2" \
     && rm -rf /var/lib/apt/lists/*
-RUN cargo build --release --manifest-path /build/support/ptg2_scanner/Cargo.toml
+RUN if [ "${TARGETARCH:-amd64}" = "amd64" ]; then \
+        RUSTFLAGS="${PTG2_SCANNER_RUSTFLAGS_AMD64}" cargo build --release --manifest-path /build/support/ptg2_scanner/Cargo.toml; \
+    else \
+        cargo build --release --manifest-path /build/support/ptg2_scanner/Cargo.toml; \
+    fi
 RUN cd /build/support/ptg2_scanner \
-    && python3 -m maturin build --release --features python-extension --out /build/wheels
+    && if [ "${TARGETARCH:-amd64}" = "amd64" ]; then \
+        RUSTFLAGS="${PTG2_SCANNER_RUSTFLAGS_AMD64}" python3 -m maturin build --release --features python-extension --out /build/wheels; \
+    else \
+        python3 -m maturin build --release --features python-extension --out /build/wheels; \
+    fi
 
 FROM python:3.14-slim-trixie
 
@@ -70,6 +81,7 @@ ENV HLTHPRT_DB_SCHEMA=${HLTHPRT_DB_SCHEMA}
 ENV HLTHPRT_REDIS_ADDRESS=${HLTHPRT_REDIS_ADDRESS}
 ENV HLTHPRT_SAVE_PER_PACK=${HLTHPRT_SAVE_PER_PACK}
 ENV HLTHPRT_PTG2_RUST_SCANNER_BIN=/opt/support/ptg2_scanner/target/release/ptg2_scanner
+ENV HLTHPRT_PTG2_RUST_REQUIRE_RELEASE=true
 
 ADD service/nginx.conf /etc/nginx/nginx.conf
 ADD service/start_api.sh /usr/local/bin/start_api.sh
