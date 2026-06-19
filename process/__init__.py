@@ -636,8 +636,8 @@ class FacilityAnchors:
     functions = [process_facility_anchors_data, control_single_job_start]
     on_startup = facility_anchors_startup
     on_shutdown = facility_anchors_shutdown
-    max_jobs = 4
-    queue_read_limit = 8
+    max_jobs = 1
+    queue_read_limit = 1
     queue_name = "arq:FacilityAnchors"
     job_timeout = 86400
     redis_settings = build_redis_settings()

@@ -437,7 +437,7 @@ async def test_enqueue_import_start_wraps_single_job_lifecycle(monkeypatch):
     assert args[1]["target_module"] == "process.nucc"
     assert args[1]["target_function"] == "process_data"
     assert args[1]["task"] == {"test_mode": True}
-    assert kwargs == {"_queue_name": "arq:NUCC"}
+    assert kwargs == {"_queue_name": "arq:NUCC", "_max_tries": 1}
 
 
 @pytest.mark.asyncio
@@ -471,7 +471,7 @@ async def test_enqueue_import_start_wraps_direct_process_importers(monkeypatch):
     assert args[1]["target_module"] == "process.lodes"
     assert args[1]["target_function"] == "process_data"
     assert args[1]["task"] == {"test_mode": True, "import_id": "smoke_lodes"}
-    assert kwargs == {"_queue_name": "arq:LODES"}
+    assert kwargs == {"_queue_name": "arq:LODES", "_max_tries": 1}
 
 
 @pytest.mark.asyncio
@@ -506,7 +506,7 @@ async def test_enqueue_import_start_wraps_kwargs_importers(monkeypatch):
     assert args[1]["target_function"] == "main"
     assert args[1]["call_style"] == "kwargs"
     assert args[1]["task"] == {"test_mode": True, "sources": "icd10cm", "import_id": "smoke_clinical"}
-    assert kwargs == {"_queue_name": "arq:ClinicalReference"}
+    assert kwargs == {"_queue_name": "arq:ClinicalReference", "_max_tries": 1}
 
 
 @pytest.mark.asyncio
@@ -541,7 +541,7 @@ async def test_enqueue_import_start_wraps_ms_drg_importer(monkeypatch):
     assert args[1]["target_function"] == "main"
     assert args[1]["call_style"] == "kwargs"
     assert args[1]["task"] == {"test_mode": True, "include_relationships": True, "relationship_page_limit": 1}
-    assert kwargs == {"_queue_name": "arq:MSDRG"}
+    assert kwargs == {"_queue_name": "arq:MSDRG", "_max_tries": 1}
 
 
 @pytest.mark.asyncio
