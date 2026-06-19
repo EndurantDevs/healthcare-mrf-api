@@ -62,8 +62,6 @@ async def control_single_job_start(
             importer=importer,
             status="running",
             started_at=started_at,
-            source="import-control-heartbeat",
-            confidence="heartbeat",
         )
         heartbeat_task = asyncio.create_task(_live_progress_heartbeat(run_id, importer, target_function, started_at))
 

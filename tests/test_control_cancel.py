@@ -44,6 +44,8 @@ async def test_raise_if_cancelled_allows_missing_flag():
 async def test_control_single_job_start_marks_success(monkeypatch):
     marks = []
     calls = []
+    live_contexts = []
+    real_set_live_progress_context = control_lifecycle.set_live_progress_context
 
     async def fake_mark(run_id, **kwargs):
         marks.append((run_id, kwargs))
@@ -55,6 +57,11 @@ async def test_control_single_job_start_marks_success(monkeypatch):
     class FakeModule:
         process_data = staticmethod(fake_target)
 
+    def capture_live_progress_context(**payload):
+        live_contexts.append(payload)
+        return real_set_live_progress_context(**payload)
+
+    monkeypatch.setattr(control_lifecycle, "set_live_progress_context", capture_live_progress_context)
     monkeypatch.setattr(control_lifecycle, "mark_control_run", fake_mark)
     monkeypatch.setattr(control_lifecycle, "import_module", lambda name: FakeModule if name == "fake.module" else None)
 
@@ -71,6 +78,16 @@ async def test_control_single_job_start_marks_success(monkeypatch):
     assert result["status"] == "succeeded"
     assert calls[0][1] == {"test_mode": True, "run_id": "run_1"}
     assert [item[1]["status"] for item in marks] == ["running", "succeeded"]
+    assert live_contexts == [
+        {
+            "run_id": "run_1",
+            "importer": "process_data",
+            "status": "running",
+            "started_at": live_contexts[0]["started_at"],
+        }
+    ]
+    assert "source" not in live_contexts[0]
+    assert "confidence" not in live_contexts[0]
 
 
 @pytest.mark.asyncio

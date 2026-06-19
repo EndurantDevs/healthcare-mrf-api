@@ -44,6 +44,9 @@ DEFAULT_FUZZY_MARGIN = 0.08
 DEFAULT_RELAXED_STREET_THRESHOLD = 0.86
 DEFAULT_RELAXED_MARGIN = 0.10
 DEFAULT_DUPLICATE_COORD_TOLERANCE = 0.0005
+DEFAULT_DOWNLOAD_RETRIES = 4
+DEFAULT_DOWNLOAD_RETRY_BASE_SECONDS = 2.0
+RETRYABLE_DOWNLOAD_STATUSES = {429, 500, 502, 503, 504}
 POSTGRES_IDENTIFIER_MAX_LENGTH = 63
 HOUSE_NUMBER_RE = re.compile(r"^\s*([0-9]+[a-zA-Z]?)\b")
 
@@ -623,15 +626,78 @@ async def _download_file(
 ) -> None:
     await _maybe_raise_if_cancelled(ctx, task)
     headers = {"Authorization": f"Bearer {token}"}
-    async with client.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=None, connect=60, sock_read=600)) as response:
-        if response.status != 200:
-            body = await response.text()
-            raise RuntimeError(f"OpenAddresses download failed HTTP {response.status}: {body[:200]}")
-        with path.open("wb") as handle:
-            async for chunk_index, chunk in _aiter_enumerate(response.content.iter_chunked(1024 * 1024), start=1):
-                handle.write(chunk)
-                if chunk_index % 16 == 0:
-                    await _maybe_raise_if_cancelled(ctx, task)
+    retry_task = task or {}
+    retries = _task_or_env_positive_int(
+        retry_task,
+        "download_retries",
+        "HLTHPRT_OPENADDRESSES_DOWNLOAD_RETRIES",
+        DEFAULT_DOWNLOAD_RETRIES,
+    )
+    max_attempts = max(1, retries + 1)
+    for attempt in range(1, max_attempts + 1):
+        try:
+            async with client.get(
+                url,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=None, connect=60, sock_read=600),
+            ) as response:
+                if response.status != 200:
+                    body = await response.text()
+                    message = f"OpenAddresses download failed HTTP {response.status}: {body[:200]}"
+                    if response.status not in RETRYABLE_DOWNLOAD_STATUSES or attempt >= max_attempts:
+                        raise RuntimeError(message)
+                    raise _RetryableOpenAddressesDownload(message)
+                with path.open("wb") as handle:
+                    async for chunk_index, chunk in _aiter_enumerate(response.content.iter_chunked(1024 * 1024), start=1):
+                        handle.write(chunk)
+                        if chunk_index % 16 == 0:
+                            await _maybe_raise_if_cancelled(ctx, task)
+            await _maybe_raise_if_cancelled(ctx, task)
+            return
+        except _RetryableOpenAddressesDownload as exc:
+            _remove_partial_download(path)
+            logger.warning(
+                "Retrying OpenAddresses download after transient response attempt=%s/%s url=%s error=%s",
+                attempt,
+                max_attempts,
+                url,
+                exc,
+            )
+            await _sleep_before_download_retry(attempt, ctx=ctx, task=task)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            _remove_partial_download(path)
+            if attempt >= max_attempts:
+                raise RuntimeError(f"OpenAddresses download failed after {attempt} attempt(s): {exc}") from exc
+            logger.warning(
+                "Retrying OpenAddresses download after transport error attempt=%s/%s url=%s error=%s",
+                attempt,
+                max_attempts,
+                url,
+                exc,
+            )
+            await _sleep_before_download_retry(attempt, ctx=ctx, task=task)
+
+
+class _RetryableOpenAddressesDownload(RuntimeError):
+    pass
+
+
+def _remove_partial_download(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+async def _sleep_before_download_retry(
+    attempt: int,
+    *,
+    ctx: dict[str, Any] | None,
+    task: dict[str, Any] | None,
+) -> None:
+    await _maybe_raise_if_cancelled(ctx, task)
+    delay = min(DEFAULT_DOWNLOAD_RETRY_BASE_SECONDS * (2 ** max(attempt - 1, 0)), 30.0)
+    await asyncio.sleep(delay)
     await _maybe_raise_if_cancelled(ctx, task)
 
 
@@ -693,6 +759,20 @@ def _task_or_env_bool(task: dict[str, Any], key: str, env_name: str, default: bo
     return _env_bool(env_name, default)
 
 
+def _progress_run_id(ctx: dict[str, Any], task: dict[str, Any]) -> str | None:
+    context = ctx.get("context") if isinstance(ctx, dict) else {}
+    if not isinstance(context, dict):
+        context = {}
+    run_id = (
+        task.get("run_id")
+        or task.get("control_run_id")
+        or ctx.get("control_run_id")
+        or context.get("control_run_id")
+    )
+    value = str(run_id or "").strip()
+    return value or None
+
+
 def _emit_load_progress(
     *,
     processed_files: int,
@@ -701,6 +781,7 @@ def _emit_load_progress(
     accepted_rows: int,
     label: str | None = None,
     phase: str = "loading OpenAddresses sources",
+    run_id: str | None = None,
 ) -> None:
     total = max(int(total_files or 0), 1)
     done = max(int(processed_files or 0), 0)
@@ -709,7 +790,7 @@ def _emit_load_progress(
         f"{done:,}/{total_files:,} sources; "
         f"{processed_rows:,} rows processed; {accepted_rows:,} rows accepted"
     )
-    enqueue_live_progress(
+    payload = dict(
         importer="openaddresses",
         status="running",
         unit="sources",
@@ -720,7 +801,12 @@ def _emit_load_progress(
         message=message,
         label=label,
         step=label,
+        source="openaddresses-load-progress",
+        confidence="live",
     )
+    if run_id:
+        payload["run_id"] = run_id
+    enqueue_live_progress(**payload)
 
 
 async def _load_file(
@@ -827,6 +913,7 @@ async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], st
     processed_files = 0
     processed_rows = 0
     accepted_rows = 0
+    progress_run_id = _progress_run_id(ctx, task)
     timeout = aiohttp.ClientTimeout(total=120, connect=30, sock_read=120)
 
     if local_files:
@@ -839,6 +926,7 @@ async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], st
             processed_rows=0,
             accepted_rows=0,
             phase="loading local OpenAddresses files",
+            run_id=progress_run_id,
         )
         progress_lock = asyncio.Lock()
         queue: asyncio.Queue[tuple[int, Path]] = asyncio.Queue()
@@ -885,6 +973,7 @@ async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], st
                             accepted_rows=accepted_rows,
                             label=str(path),
                             phase="loading local OpenAddresses files",
+                            run_id=progress_run_id,
                         )
                 finally:
                     queue.task_done()
@@ -964,9 +1053,10 @@ async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], st
             total_files=total_files,
             processed_rows=0,
             accepted_rows=0,
+            run_id=progress_run_id,
         )
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             tmpdir_path = Path(tmpdir)
             progress_lock = asyncio.Lock()
             queue: asyncio.Queue[tuple[int, dict[str, Any]]] = asyncio.Queue()
@@ -1013,6 +1103,7 @@ async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], st
                                 processed_rows=processed_rows,
                                 accepted_rows=accepted_rows,
                                 label=source,
+                                run_id=progress_run_id,
                             )
                     finally:
                         queue.task_done()

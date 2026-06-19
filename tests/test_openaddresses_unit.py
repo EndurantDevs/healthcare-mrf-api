@@ -189,10 +189,12 @@ def test_openaddresses_load_progress_payload(monkeypatch):
         processed_rows=3456,
         accepted_rows=1234,
         label="us/tx/example",
+        run_id="run_openaddresses",
     )
 
     assert events == [
         {
+            "run_id": "run_openaddresses",
             "importer": "openaddresses",
             "status": "running",
             "unit": "sources",
@@ -203,8 +205,114 @@ def test_openaddresses_load_progress_payload(monkeypatch):
             "message": "12/100 sources; 3,456 rows processed; 1,234 rows accepted",
             "label": "us/tx/example",
             "step": "us/tx/example",
+            "source": "openaddresses-load-progress",
+            "confidence": "live",
         }
     ]
+
+
+def test_openaddresses_progress_run_id_prefers_task_then_context():
+    assert (
+        openaddresses._progress_run_id(  # pylint: disable=protected-access
+            {"control_run_id": "run_ctx", "context": {"control_run_id": "run_nested"}},
+            {"run_id": " run_task "},
+        )
+        == "run_task"
+    )
+    assert (
+        openaddresses._progress_run_id(  # pylint: disable=protected-access
+            {"control_run_id": "run_ctx", "context": {"control_run_id": "run_nested"}},
+            {},
+        )
+        == "run_ctx"
+    )
+    assert (
+        openaddresses._progress_run_id(  # pylint: disable=protected-access
+            {"context": {"control_run_id": "run_nested"}},
+            {},
+        )
+        == "run_nested"
+    )
+
+
+class _FakeDownloadContent:
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+
+    async def iter_chunked(self, _chunk_size):
+        for chunk in self._chunks:
+            yield chunk
+
+
+class _FakeDownloadResponse:
+    def __init__(self, status, *, body="", chunks=()):
+        self.status = status
+        self._body = body
+        self.content = _FakeDownloadContent(chunks)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+    async def text(self):
+        return self._body
+
+
+class _FakeDownloadClient:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def get(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        return self.responses.pop(0)
+
+
+@pytest.mark.asyncio
+async def test_openaddresses_download_retries_transient_http_status(monkeypatch, tmp_path):
+    sleeps = []
+    client = _FakeDownloadClient(
+        [
+            _FakeDownloadResponse(504, body="gateway timeout"),
+            _FakeDownloadResponse(200, chunks=[b"abc", b"def"]),
+        ]
+    )
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(openaddresses.asyncio, "sleep", fake_sleep)
+    path = tmp_path / "source.geojson.gz"
+
+    await openaddresses._download_file(  # pylint: disable=protected-access
+        client,
+        "https://openaddresses.test/source.geojson.gz",
+        path,
+        "token",
+        task={"download_retries": 1},
+    )
+
+    assert path.read_bytes() == b"abcdef"
+    assert len(client.calls) == 2
+    assert sleeps == [openaddresses.DEFAULT_DOWNLOAD_RETRY_BASE_SECONDS]
+
+
+@pytest.mark.asyncio
+async def test_openaddresses_download_does_not_retry_non_transient_status(tmp_path):
+    client = _FakeDownloadClient([_FakeDownloadResponse(404, body="missing")])
+
+    with pytest.raises(RuntimeError, match="HTTP 404"):
+        await openaddresses._download_file(  # pylint: disable=protected-access
+            client,
+            "https://openaddresses.test/source.geojson.gz",
+            tmp_path / "source.geojson.gz",
+            "token",
+            task={"download_retries": 1},
+        )
+
+    assert len(client.calls) == 1
 
 
 @pytest.mark.asyncio
@@ -332,6 +440,43 @@ async def test_openaddresses_remote_sources_load_in_parallel(monkeypatch):
 
     assert stats == {"processed_files": 3, "processed_rows": 30, "accepted_rows": 15}
     assert max_active > 1
+
+
+@pytest.mark.asyncio
+async def test_openaddresses_remote_tempdir_ignores_cleanup_errors(monkeypatch, tmp_path):
+    tempdir_kwargs = []
+    items = [{"source": "us/tx/source-1", "layer": "addresses", "output": {"output": True}, "id": 1, "job": 1}]
+
+    class FakeTemporaryDirectory:
+        def __init__(self, **kwargs):
+            tempdir_kwargs.append(kwargs)
+
+        def __enter__(self):
+            return str(tmp_path)
+
+        def __exit__(self, *_args):
+            return False
+
+    async def fake_fetch_json(_client, _url, _token):
+        return items
+
+    async def fake_load_source_item(**kwargs):
+        return kwargs["item"]["source"], 10, 5
+
+    monkeypatch.setenv("HLTHPRT_OPENADDRESSES_API_TOKEN", "test-token")
+    monkeypatch.setattr(openaddresses.tempfile, "TemporaryDirectory", FakeTemporaryDirectory)
+    monkeypatch.setattr(openaddresses, "_fetch_json", fake_fetch_json)
+    monkeypatch.setattr(openaddresses, "_load_source_item", fake_load_source_item)
+    monkeypatch.setattr(openaddresses, "_emit_load_progress", lambda **_payload: None)
+
+    stats = await openaddresses._load_openaddresses_data(  # pylint: disable=protected-access
+        {"context": {"test_mode": False}},
+        {"source_concurrency": 1, "max_files": 1},
+        object,
+    )
+
+    assert stats == {"processed_files": 1, "processed_rows": 10, "accepted_rows": 5}
+    assert tempdir_kwargs == [{"ignore_cleanup_errors": True}]
 
 
 @pytest.mark.asyncio
