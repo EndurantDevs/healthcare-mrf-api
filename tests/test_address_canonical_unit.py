@@ -138,6 +138,13 @@ def test_resolve_materialization_carries_source_ctid_for_resolve_aliases():
     assert "AND count(DISTINCT target_zip5) = 1" in zip_alias_sql
 
 
+def test_completion_alias_timeout_detector_matches_asyncpg_message():
+    exc = RuntimeError("asyncpg.exceptions.QueryCanceledError: canceling statement due to statement timeout")
+
+    assert address_canon._is_statement_timeout_error(exc)
+    assert not address_canon._is_statement_timeout_error(RuntimeError("duplicate key value violates unique constraint"))
+
+
 def test_unit_is_delivery_point_not_premise_identity():
     ste_200 = ("123 Main Street", "Suite 200", "Miami", "FL", "33156", "US")
     ste_310 = ("123 Main Street", "Suite 310", "Miami", "FL", "33156", "US")

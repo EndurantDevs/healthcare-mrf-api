@@ -1362,6 +1362,11 @@ def _completion_alias_sql(
     """
 
 
+def _is_statement_timeout_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return "statement timeout" in message or "querycancelederror" in message
+
+
 def _zip_alias_sql(
     *,
     keyed_table: str,
@@ -1840,58 +1845,82 @@ async def resolve_into_archive(
                  WHERE target.ctid::text = aliases.source_ctid
                    AND target.address_key IS DISTINCT FROM aliases.target_address_key;
             """))
-        await session.execute(text("DROP TABLE IF EXISTS pg_temp.address_completion_aliases;"))
-        await session.execute(text(_completion_alias_sql(schema=schema, keyed_table=keyed_table, archive=archive)))
-        alias_stats_raw = (
-            await session.execute(text("""
-                SELECT jsonb_build_object(
-                    'completion_aliases', count(*),
-                    'completion_suffix_aliases', count(*) FILTER (WHERE filled_suffix),
-                    'completion_directional_aliases', count(*) FILTER (WHERE filled_direction)
-                )
-                FROM address_completion_aliases;
-            """))
-        ).scalar() or {}
-        if isinstance(alias_stats_raw, str):
-            alias_stats = json.loads(alias_stats_raw)
-        else:
-            alias_stats = dict(alias_stats_raw)
-        completion_alias_rows = int(alias_stats.get("completion_aliases") or 0)
-        if completion_alias_rows:
-            await session.execute(text(f"""
-                UPDATE {keyed_table} AS keyed
-                   SET address_key = aliases.target_address_key,
-                       computed_address_key = aliases.target_address_key,
-                       identity_key = aliases.target_identity_key,
-                       premise_key = aliases.target_premise_key,
-                       line1_norm = aliases.target_line1_norm,
-                       unit_norm = aliases.target_unit_norm,
-                       city_norm = aliases.target_city_norm,
-                       state_code = aliases.target_state_code,
-                       zip5 = aliases.target_zip5,
-                       zip4 = aliases.target_zip4,
-                       country_code = aliases.target_country_code,
-                       first_line = aliases.target_first_line,
-                       second_line = aliases.target_second_line,
-                       city_name = aliases.target_city_name,
-                       state_name = aliases.target_state_name,
-                       postal_code = aliases.target_postal_code
-                  FROM address_completion_aliases AS aliases
-                 WHERE keyed.rn = aliases.rn;
-            """))
-            await session.execute(text(f"""
-                UPDATE {staging} AS target
-                   SET address_key = aliases.target_address_key
-                  FROM address_completion_aliases AS aliases
-                 WHERE (
-                           target.ctid::text = aliases.source_ctid
-                           OR (
-                               aliases.source_address_key IS NOT NULL
-                               AND target.address_key = aliases.source_address_key
+        alias_stats: dict[str, int] = {}
+        completion_alias_rows = 0
+        await session.execute(text("SAVEPOINT address_completion_alias_repair;"))
+        try:
+            await session.execute(text("DROP TABLE IF EXISTS pg_temp.address_completion_aliases;"))
+            await session.execute(text(_completion_alias_sql(schema=schema, keyed_table=keyed_table, archive=archive)))
+            alias_stats_raw = (
+                await session.execute(text("""
+                    SELECT jsonb_build_object(
+                        'completion_aliases', count(*),
+                        'completion_suffix_aliases', count(*) FILTER (WHERE filled_suffix),
+                        'completion_directional_aliases', count(*) FILTER (WHERE filled_direction)
+                    )
+                    FROM address_completion_aliases;
+                """))
+            ).scalar() or {}
+            if isinstance(alias_stats_raw, str):
+                alias_stats = json.loads(alias_stats_raw)
+            else:
+                alias_stats = dict(alias_stats_raw)
+            completion_alias_rows = int(alias_stats.get("completion_aliases") or 0)
+            if completion_alias_rows:
+                await session.execute(text(f"""
+                    UPDATE {keyed_table} AS keyed
+                       SET address_key = aliases.target_address_key,
+                           computed_address_key = aliases.target_address_key,
+                           identity_key = aliases.target_identity_key,
+                           premise_key = aliases.target_premise_key,
+                           line1_norm = aliases.target_line1_norm,
+                           unit_norm = aliases.target_unit_norm,
+                           city_norm = aliases.target_city_norm,
+                           state_code = aliases.target_state_code,
+                           zip5 = aliases.target_zip5,
+                           zip4 = aliases.target_zip4,
+                           country_code = aliases.target_country_code,
+                           first_line = aliases.target_first_line,
+                           second_line = aliases.target_second_line,
+                           city_name = aliases.target_city_name,
+                           state_name = aliases.target_state_name,
+                           postal_code = aliases.target_postal_code
+                      FROM address_completion_aliases AS aliases
+                     WHERE keyed.rn = aliases.rn;
+                """))
+                await session.execute(text(f"""
+                    UPDATE {staging} AS target
+                       SET address_key = aliases.target_address_key
+                      FROM address_completion_aliases AS aliases
+                     WHERE (
+                               target.ctid::text = aliases.source_ctid
+                               OR (
+                                   aliases.source_address_key IS NOT NULL
+                                   AND target.address_key = aliases.source_address_key
+                               )
                            )
-                       )
-                   AND target.address_key IS DISTINCT FROM aliases.target_address_key;
-            """))
+                       AND target.address_key IS DISTINCT FROM aliases.target_address_key;
+                """))
+            await session.execute(text("RELEASE SAVEPOINT address_completion_alias_repair;"))
+        except Exception as exc:
+            try:
+                await session.execute(text("ROLLBACK TO SAVEPOINT address_completion_alias_repair;"))
+                await session.execute(text("RELEASE SAVEPOINT address_completion_alias_repair;"))
+            except Exception:
+                logger.exception("Failed to roll back address completion alias savepoint")
+                raise
+            if not _is_statement_timeout_error(exc):
+                raise
+            alias_stats = {"completion_aliases": 0, "completion_alias_repair_skipped": 1}
+            logger.warning("Skipping address completion alias repair after statement timeout: %s", exc)
+            _emit_progress(
+                phase="address archive resolve",
+                unit="row",
+                total=staged,
+                done=0,
+                pct=15,
+                message="skipped slow completion alias repair",
+            )
         _emit_progress(
             phase="address archive resolve",
             unit="row",
