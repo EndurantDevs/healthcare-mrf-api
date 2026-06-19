@@ -318,6 +318,20 @@ def test_copy_load_split_keeps_facade_helpers_stable():
     assert process_ptg._copy_ptg2_dictionary_file is ptg_copy_load._copy_ptg2_dictionary_file
 
 
+def test_copy_load_strips_postgres_nuls_from_text_values():
+    row = {
+        "plain": "ab\0cd",
+        "array": ["ef\0gh"],
+        "payload": {"ij\0": ["kl\0mn"]},
+    }
+
+    record = ptg_copy_load._ptg2_copy_record(row, ["plain", "array", "payload"], {"payload"})
+
+    assert record[0] == "abcd"
+    assert record[1] == ["efgh"]
+    assert json.loads(record[2]) == {"ij": ["klmn"]}
+
+
 def test_import_row_split_keeps_facade_helpers_stable():
     assert process_ptg._normalize_import_id is ptg_import_rows._normalize_import_id
     assert process_ptg._ptg2_provider_group_rows is ptg_import_rows._ptg2_provider_group_rows

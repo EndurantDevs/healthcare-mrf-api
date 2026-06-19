@@ -27,6 +27,25 @@ def _json_default(value: Any) -> Any:
     return str(value)
 
 
+def _strip_postgres_nuls(value: Any) -> Any:
+    if isinstance(value, str):
+        return value.replace("\x00", "")
+    if isinstance(value, list):
+        return [_strip_postgres_nuls(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_strip_postgres_nuls(item) for item in value)
+    if isinstance(value, dict):
+        return {
+            _strip_postgres_nuls(key): _strip_postgres_nuls(item)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _copy_record_values(values: tuple[Any, ...]) -> tuple[Any, ...]:
+    return tuple(_strip_postgres_nuls(value) for value in values)
+
+
 def _ptg2_conflict_targets(cls) -> list[str]:
     if hasattr(cls, "__my_initial_indexes__") and cls.__my_initial_indexes__:
         for index in cls.__my_initial_indexes__:
@@ -54,7 +73,7 @@ def _ptg2_json_columns(cls) -> set[str]:
 def _ptg2_copy_record(row: dict[str, Any], columns: list[str], json_columns: set[str]) -> tuple[Any, ...]:
     values: list[Any] = []
     for column in columns:
-        value = row.get(column)
+        value = _strip_postgres_nuls(row.get(column))
         if value is not None and column in json_columns:
             value = json.dumps(value, sort_keys=True, default=_json_default)
         values.append(value)
@@ -186,6 +205,7 @@ async def _copy_stage_price_set_rows(rows: list[dict[str, Any]], snapshot_id: st
         )
         for row in rows
     ]
+    records = [_copy_record_values(record) for record in records]
     async with db.acquire() as conn:
         raw_conn = conn.raw_connection
         driver_conn = getattr(raw_conn, "driver_connection", raw_conn)
@@ -264,6 +284,7 @@ async def _copy_stage_serving_rate_rows(rows: list[dict[str, Any]], snapshot_id:
         )
         for row in rows
     ]
+    records = [_copy_record_values(record) for record in records]
     async with db.acquire() as conn:
         raw_conn = conn.raw_connection
         driver_conn = getattr(raw_conn, "driver_connection", raw_conn)
@@ -310,6 +331,7 @@ async def _copy_compact_serving_rate_rows(rows: list[dict[str, Any]], snapshot_i
         )
         for row in rows
     ]
+    records = [_copy_record_values(record) for record in records]
     async with db.acquire() as conn:
         raw_conn = conn.raw_connection
         driver_conn = getattr(raw_conn, "driver_connection", raw_conn)

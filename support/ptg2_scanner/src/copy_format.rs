@@ -37,6 +37,7 @@ pub fn pg_text_copy_field(value: Option<&str>) -> String {
                     '\t' => out.push_str("\\t"),
                     '\n' => out.push_str("\\n"),
                     '\r' => out.push_str("\\r"),
+                    '\0' => {}
                     _ => out.push(ch),
                 }
             }
@@ -52,7 +53,10 @@ pub fn pg_text_array_field(values: &[String]) -> String {
     let body = values
         .iter()
         .map(|value| {
-            let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+            let escaped = value
+                .replace('\0', "")
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"");
             format!("\"{}\"", escaped)
         })
         .collect::<Vec<_>>()
@@ -78,6 +82,7 @@ fn write_copy_text_field<W: Write>(writer: &mut W, value: Option<&str>) -> io::R
             b'\t' => Some(b"\\t".as_slice()),
             b'\n' => Some(b"\\n".as_slice()),
             b'\r' => Some(b"\\r".as_slice()),
+            b'\0' => Some(b"".as_slice()),
             _ => None,
         };
         if let Some(replacement) = escaped {
@@ -158,17 +163,22 @@ mod tests {
     fn text_copy_fields_escape_postgres_copy_control_chars() {
         assert_eq!(pg_text_copy_field(None), "\\N");
         assert_eq!(
-            pg_text_copy_field(Some("a\\b\tc\nd\re")),
-            "a\\\\b\\tc\\nd\\re"
+            pg_text_copy_field(Some("a\\b\tc\nd\re\0f")),
+            "a\\\\b\\tc\\nd\\ref"
         );
     }
 
     #[test]
     fn text_array_fields_escape_array_quotes_and_backslashes() {
-        let values = vec!["26".to_string(), "a\"b".to_string(), "c\\d".to_string()];
+        let values = vec![
+            "26".to_string(),
+            "a\"b".to_string(),
+            "c\\d".to_string(),
+            "e\0f".to_string(),
+        ];
         assert_eq!(
             pg_text_array_field(&values),
-            "{\"26\",\"a\\\"b\",\"c\\\\d\"}"
+            "{\"26\",\"a\\\"b\",\"c\\\\d\",\"ef\"}"
         );
     }
 
@@ -207,7 +217,7 @@ mod tests {
             provider_set_global_id_128: "provider",
             provider_count: 12,
             price_set_global_id_128: "price",
-            source_trace_set_hash: "source\ntrace",
+            source_trace_set_hash: "source\ntrace\0suffix",
         };
         let mut out = Vec::new();
 
@@ -215,7 +225,7 @@ mod tests {
 
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "serving\tplan\\t1\tCPT\t\\N\tprocedure\tprovider\t12\tprice\tsource\\ntrace\n"
+            "serving\tplan\\t1\tCPT\t\\N\tprocedure\tprovider\t12\tprice\tsource\\ntracesuffix\n"
         );
     }
 }
