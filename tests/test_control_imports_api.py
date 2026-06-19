@@ -1258,6 +1258,103 @@ async def test_control_ptg_parse_toc_preview_endpoint(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_control_ptg_source_snapshot_promote_endpoint(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "secret")
+    calls = []
+
+    async def fake_promote(**kwargs):
+        calls.append(kwargs)
+        return {
+            "source_key": kwargs["source_key"],
+            "snapshot_id": kwargs["snapshot_id"],
+            "previous_snapshot_id": kwargs["expected_current_snapshot_id"],
+            "plan_source_count": 2,
+        }
+
+    monkeypatch.setattr(control, "promote_ptg2_source_snapshot", fake_promote)
+    request = authed_request(
+        json={
+            "source_key": "source_a",
+            "snapshot_id": "snap_new",
+            "expected_current_snapshot_id": "snap_old",
+        }
+    )
+
+    response = await control.control_ptg_source_snapshot_promote(request)
+    payload = json.loads(response.body)
+
+    assert response.status == 200
+    assert payload["snapshot_id"] == "snap_new"
+    assert payload["previous_snapshot_id"] == "snap_old"
+    assert calls == [
+        {
+            "source_key": "source_a",
+            "snapshot_id": "snap_new",
+            "expected_current_snapshot_id": "snap_old",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_control_ptg_source_snapshot_promote_endpoint_maps_stale_pointer_to_conflict(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "secret")
+
+    async def fake_promote(**_kwargs):
+        raise control.SourceSnapshotConflict("current source snapshot changed")
+
+    monkeypatch.setattr(control, "promote_ptg2_source_snapshot", fake_promote)
+
+    with pytest.raises(control.SanicException) as exc_info:
+        await control.control_ptg_source_snapshot_promote(
+            authed_request(json={"source_key": "source_a", "snapshot_id": "snap_new"})
+        )
+
+    assert exc_info.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_control_ptg_source_snapshot_remove_plan_endpoint(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "secret")
+    calls = []
+
+    async def fake_remove_plan(**kwargs):
+        calls.append(kwargs)
+        return {"snapshot_id": kwargs["snapshot_id"], "source_key": kwargs["source_key"], "removable": True}
+
+    monkeypatch.setattr(control, "build_ptg2_source_snapshot_remove_plan", fake_remove_plan)
+
+    response = await control.control_ptg_source_snapshot_remove_plan(
+        authed_request(json={"snapshot_id": "snap_old", "source_key": "source_a"})
+    )
+    payload = json.loads(response.body)
+
+    assert response.status == 200
+    assert payload["removable"] is True
+    assert calls == [{"snapshot_id": "snap_old", "source_key": "source_a"}]
+
+
+@pytest.mark.asyncio
+async def test_control_ptg_source_snapshot_remove_endpoint(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "secret")
+    calls = []
+
+    async def fake_remove(**kwargs):
+        calls.append(kwargs)
+        return {"snapshot_id": kwargs["snapshot_id"], "source_key": kwargs["source_key"], "executed": True}
+
+    monkeypatch.setattr(control, "remove_ptg2_source_snapshot", fake_remove)
+
+    response = await control.control_ptg_source_snapshot_remove(
+        authed_request(json={"snapshot_id": "snap_old", "source_key": "source_a"})
+    )
+    payload = json.loads(response.body)
+
+    assert response.status == 200
+    assert payload["executed"] is True
+    assert calls == [{"snapshot_id": "snap_old", "source_key": "source_a"}]
+
+
+@pytest.mark.asyncio
 async def test_control_create_import_returns_created(monkeypatch):
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "secret")
     async def fake_create(payload):

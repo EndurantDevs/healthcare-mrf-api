@@ -22,6 +22,12 @@ from api.control_imports import (
     retry_import_run,
 )
 from api.control_workers import ensure_worker, worker_registry
+from process.ptg_parts.source_snapshot_control import (
+    SourceSnapshotConflict,
+    build_ptg2_source_snapshot_remove_plan,
+    promote_ptg2_source_snapshot,
+    remove_ptg2_source_snapshot,
+)
 
 blueprint = Blueprint("control", url_prefix="/control/v1")
 
@@ -100,6 +106,55 @@ async def control_ptg_import_file(request):
     except ValueError as exc:
         raise BadRequest(str(exc)) from exc
     return response.json(run, status=201 if created else 409, default=str)
+
+
+@blueprint.post("/ptg/source-snapshots/promote")
+async def control_ptg_source_snapshot_promote(request):
+    _require_control_auth(request)
+    payload = request.json if isinstance(request.json, dict) else {}
+    try:
+        result = await promote_ptg2_source_snapshot(
+            source_key=str(payload.get("source_key") or ""),
+            snapshot_id=str(payload.get("snapshot_id") or ""),
+            expected_current_snapshot_id=(
+                str(payload.get("expected_current_snapshot_id"))
+                if payload.get("expected_current_snapshot_id") is not None
+                else None
+            ),
+        )
+    except SourceSnapshotConflict as exc:
+        raise SanicException(str(exc), status_code=409) from exc
+    except ValueError as exc:
+        raise BadRequest(str(exc)) from exc
+    return response.json(result, default=str)
+
+
+@blueprint.post("/ptg/source-snapshots/remove-plan")
+async def control_ptg_source_snapshot_remove_plan(request):
+    _require_control_auth(request)
+    payload = request.json if isinstance(request.json, dict) else {}
+    try:
+        plan = await build_ptg2_source_snapshot_remove_plan(
+            snapshot_id=str(payload.get("snapshot_id") or ""),
+            source_key=str(payload.get("source_key") or "") or None,
+        )
+    except ValueError as exc:
+        raise BadRequest(str(exc)) from exc
+    return response.json(plan, default=str)
+
+
+@blueprint.post("/ptg/source-snapshots/remove")
+async def control_ptg_source_snapshot_remove(request):
+    _require_control_auth(request)
+    payload = request.json if isinstance(request.json, dict) else {}
+    try:
+        result = await remove_ptg2_source_snapshot(
+            snapshot_id=str(payload.get("snapshot_id") or ""),
+            source_key=str(payload.get("source_key") or "") or None,
+        )
+    except ValueError as exc:
+        raise BadRequest(str(exc)) from exc
+    return response.json(result, default=str)
 
 
 @blueprint.post("/imports")
