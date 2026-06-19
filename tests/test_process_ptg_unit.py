@@ -3674,7 +3674,7 @@ def test_ptg2_source_scoped_report_uses_published_serving_rate_count(monkeypatch
     assert snapshot_rows[-1]["manifest"]["serving_rates"] == 987
 
 
-def test_ptg2_parse_in_workers_keeps_publish_db_dedupe_after_precopy_merge(monkeypatch):
+def test_ptg2_precopy_merge_keeps_publish_db_dedupe(monkeypatch):
     publish_kwargs = []
 
     async def fake_push(_rows, _cls, **_kwargs):
@@ -3706,7 +3706,7 @@ def test_ptg2_parse_in_workers_keeps_publish_db_dedupe_after_precopy_merge(monke
             "serving_rates": 111,
         }
 
-    monkeypatch.setenv(process_ptg.PTG2_RUST_PARSE_IN_WORKERS_ENV, "true")
+    monkeypatch.setenv(process_ptg.PTG2_RUST_PARSE_IN_WORKERS_ENV, "false")
     monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
     monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
     monkeypatch.setattr(process_ptg.db, "status", AsyncMock())

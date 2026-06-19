@@ -2436,10 +2436,10 @@ async def main(
                 snapshot_id=snapshot_id,
                 source_key=source_key_val,
                 artifacts=manifest_artifacts,
-                db_dedupe_fallback=(
-                    not bool(manifest_merge_metrics.get("enabled"))
-                    or _env_bool(PTG2_RUST_PARSE_IN_WORKERS_ENV, False)
-                ),
+                # Pre-copy merge removes exact duplicate rows in the artifact stream,
+                # but live payer files can still produce duplicate serving identities.
+                # Keep the DB DISTINCT pass as the final publish-time guard.
+                db_dedupe_fallback=True,
             )
             ptg2_manifest_stage_table = None
         else:
