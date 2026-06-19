@@ -141,6 +141,7 @@ def test_resolve_materialization_carries_source_ctid_for_resolve_aliases():
 def test_completion_alias_timeout_detector_matches_asyncpg_message():
     exc = RuntimeError("asyncpg.exceptions.QueryCanceledError: canceling statement due to statement timeout")
 
+    assert address_canon.ADDRESS_COMPLETION_ALIAS_TIMEOUT_ENV == "HLTHPRT_ADDRESS_COMPLETION_ALIAS_TIMEOUT"
     assert address_canon._is_statement_timeout_error(exc)
     assert not address_canon._is_statement_timeout_error(RuntimeError("duplicate key value violates unique constraint"))
 

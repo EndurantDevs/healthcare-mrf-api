@@ -41,6 +41,7 @@ from process.ptg_parts.rust_scanner import _ptg2_rust_scanner_binary
 logger = logging.getLogger(__name__)
 
 ADDRESS_CANON_RUST_MATERIALIZE_ENV = "HLTHPRT_ADDRESS_CANON_RUST_MATERIALIZE"
+ADDRESS_COMPLETION_ALIAS_TIMEOUT_ENV = "HLTHPRT_ADDRESS_COMPLETION_ALIAS_TIMEOUT"
 CURRENT_ADDRESS_IDENTITY_VERSION = 2
 CURRENT_ADDRESS_IDENTITY_PREFIX = f"v{CURRENT_ADDRESS_IDENTITY_VERSION}"
 _RUST_CANON_VERSION_CACHE: dict[str, bool] = {}
@@ -1848,7 +1849,11 @@ async def resolve_into_archive(
         alias_stats: dict[str, int] = {}
         completion_alias_rows = 0
         await session.execute(text("SAVEPOINT address_completion_alias_repair;"))
+        completion_alias_timeout = os.getenv(ADDRESS_COMPLETION_ALIAS_TIMEOUT_ENV, "2min")
         try:
+            await session.execute(
+                text(f"SET LOCAL statement_timeout = '{_setting_value(completion_alias_timeout)}';")
+            )
             await session.execute(text("DROP TABLE IF EXISTS pg_temp.address_completion_aliases;"))
             await session.execute(text(_completion_alias_sql(schema=schema, keyed_table=keyed_table, archive=archive)))
             alias_stats_raw = (
@@ -1902,10 +1907,12 @@ async def resolve_into_archive(
                        AND target.address_key IS DISTINCT FROM aliases.target_address_key;
                 """))
             await session.execute(text("RELEASE SAVEPOINT address_completion_alias_repair;"))
+            await session.execute(text(f"SET LOCAL statement_timeout = '{_setting_value(timeout)}';"))
         except Exception as exc:
             try:
                 await session.execute(text("ROLLBACK TO SAVEPOINT address_completion_alias_repair;"))
                 await session.execute(text("RELEASE SAVEPOINT address_completion_alias_repair;"))
+                await session.execute(text(f"SET LOCAL statement_timeout = '{_setting_value(timeout)}';"))
             except Exception:
                 logger.exception("Failed to roll back address completion alias savepoint")
                 raise
