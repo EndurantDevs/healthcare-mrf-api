@@ -1105,8 +1105,64 @@ def ptg_address(test: bool):
 @click.command(help="Run OpenAddresses US geocode cache refresh and address archive backfill")
 @click.option("--test", is_flag=True, help="Process a small OpenAddresses subset for a quick smoke run.")
 @click.option("--backfill-only", is_flag=True, help="Backfill archive coordinates from the existing local OpenAddresses cache.")
-def openaddresses(test: bool, backfill_only: bool):
-    _run(initiate_openaddresses(test_mode=test, backfill_only=backfill_only))
+@click.option("--load-only", is_flag=True, help="Load OpenAddresses data into the stage table without publish/backfill.")
+@click.option("--publish-only", is_flag=True, help="Publish/backfill from an existing OpenAddresses stage table.")
+@click.option("--resume-stage", is_flag=True, help="Reuse an existing stage table instead of dropping it before load.")
+@click.option("--import-id", help="Override import id/date suffix for OpenAddresses stage tables.")
+@click.option("--local-file", "local_files", multiple=True, help="Local GeoJSON/GeoJSON.gz source file; may be repeated.")
+@click.option("--batch-size", type=int, help="Rows per OpenAddresses flush batch.")
+@click.option("--source-concurrency", type=int, help="Number of OpenAddresses source files to load concurrently.")
+@click.option("--max-files", type=int, help="Maximum OpenAddresses remote sources to process.")
+@click.option("--start-index", type=int, help="One-based remote source index to start from.")
+@click.option("--end-index", type=int, help="One-based remote source index to stop at.")
+@click.option("--start-source", help="Remote source path to start from, such as us/ca/city.")
+@click.option("--min-rows", type=int, help="Minimum staged rows required before publish in non-test mode.")
+@click.option("--test-file-limit", type=int, help="Remote source file limit in test mode.")
+@click.option("--test-row-limit", type=int, help="Rows per source file in test mode.")
+@click.option("--backfill-state-code", help="State code for archive backfill sharding.")
+@click.option("--backfill-zip-prefix", help="ZIP prefix for archive backfill sharding.")
+def openaddresses(
+    test: bool,
+    backfill_only: bool,
+    load_only: bool,
+    publish_only: bool,
+    resume_stage: bool,
+    import_id: str | None,
+    local_files: tuple[str, ...],
+    batch_size: int | None,
+    source_concurrency: int | None,
+    max_files: int | None,
+    start_index: int | None,
+    end_index: int | None,
+    start_source: str | None,
+    min_rows: int | None,
+    test_file_limit: int | None,
+    test_row_limit: int | None,
+    backfill_state_code: str | None,
+    backfill_zip_prefix: str | None,
+):
+    _run(
+        initiate_openaddresses(
+            test_mode=test,
+            backfill_only=backfill_only,
+            load_only=load_only,
+            publish_only=publish_only,
+            resume_stage=resume_stage,
+            import_id=import_id,
+            local_files=local_files,
+            batch_size=batch_size,
+            source_concurrency=source_concurrency,
+            max_files=max_files,
+            start_index=start_index,
+            end_index=end_index,
+            start_source=start_source,
+            min_rows=min_rows,
+            test_file_limit=test_file_limit,
+            test_row_limit=test_row_limit,
+            backfill_state_code=backfill_state_code,
+            backfill_zip_prefix=backfill_zip_prefix,
+        )
+    )
 
 
 @click.command(help="Run one-time legacy address archive to canonical v2 migration")

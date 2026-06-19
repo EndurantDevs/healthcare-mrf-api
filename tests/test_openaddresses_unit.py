@@ -1,5 +1,10 @@
 import importlib
+import asyncio
 import json
+
+import pytest
+
+from process.control_cancel import ImportCancelledError
 
 
 openaddresses = importlib.import_module("process.openaddresses")
@@ -172,6 +177,305 @@ def test_openaddresses_backfill_source_contains_city_scoped_exact_phase():
     assert "openaddresses_exact_city" in sql_text
     assert "missing.city_norm IS NOT NULL" in sql_text
     assert "addr_city_norm_v1(oa.city_name)" in sql_text
+
+
+def test_openaddresses_load_progress_payload(monkeypatch):
+    events = []
+    monkeypatch.setattr(openaddresses, "enqueue_live_progress", lambda **payload: events.append(payload))
+
+    openaddresses._emit_load_progress(  # pylint: disable=protected-access
+        processed_files=12,
+        total_files=100,
+        processed_rows=3456,
+        accepted_rows=1234,
+        label="us/tx/example",
+    )
+
+    assert events == [
+        {
+            "importer": "openaddresses",
+            "status": "running",
+            "unit": "sources",
+            "done": 12,
+            "total": 100,
+            "pct": 12.0,
+            "phase": "loading OpenAddresses sources",
+            "message": "12/100 sources; 3,456 rows processed; 1,234 rows accepted",
+            "label": "us/tx/example",
+            "step": "us/tx/example",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_openaddresses_flush_uses_copy_first(monkeypatch):
+    calls = []
+
+    async def fake_push_objects(rows, cls, *, rewrite, use_copy):
+        calls.append((list(rows), cls, rewrite, use_copy))
+
+    rows = [{"row_hash": "a" * 64}]
+    monkeypatch.setattr(openaddresses, "push_objects", fake_push_objects)
+
+    accepted = await openaddresses._flush_rows(rows, object)  # pylint: disable=protected-access
+
+    assert accepted == 1
+    assert rows == []
+    assert calls == [([{"row_hash": "a" * 64}], object, True, True)]
+
+
+@pytest.mark.asyncio
+async def test_openaddresses_repairs_legacy_stage_row_hash_width(monkeypatch):
+    statuses = []
+
+    class FakeDb:
+        async def first(self, _stmt, **params):
+            assert params == {"schema": "mrf", "table_name": "openaddresses_geocode_202606151230024"}
+            return {"data_type": "character varying", "character_maximum_length": 32}
+
+        async def status(self, stmt, **_params):
+            statuses.append(stmt)
+
+    monkeypatch.setattr(openaddresses, "db", FakeDb())
+
+    await openaddresses._ensure_openaddresses_stage_schema(  # pylint: disable=protected-access
+        "openaddresses_geocode_202606151230024",
+        "mrf",
+    )
+
+    assert statuses == ['ALTER TABLE "mrf"."openaddresses_geocode_202606151230024" ALTER COLUMN row_hash TYPE varchar(64);']
+
+
+@pytest.mark.asyncio
+async def test_openaddresses_keeps_current_stage_row_hash_width(monkeypatch):
+    statuses = []
+
+    class FakeDb:
+        async def first(self, _stmt, **_params):
+            return {"data_type": "character varying", "character_maximum_length": 64}
+
+        async def status(self, stmt, **_params):
+            statuses.append(stmt)
+
+    monkeypatch.setattr(openaddresses, "db", FakeDb())
+
+    await openaddresses._ensure_openaddresses_stage_schema(  # pylint: disable=protected-access
+        "openaddresses_geocode_202606151230024",
+        "mrf",
+    )
+
+    assert statuses == []
+
+
+@pytest.mark.asyncio
+async def test_openaddresses_local_files_load_in_parallel(monkeypatch, tmp_path):
+    paths = []
+    for index in range(3):
+        path = tmp_path / f"source-{index}.geojson"
+        path.write_text("{}", encoding="utf-8")
+        paths.append(path)
+
+    active = 0
+    max_active = 0
+
+    async def fake_load_file(path, **_kwargs):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return 10, 5
+
+    monkeypatch.setattr(openaddresses, "_load_file", fake_load_file)
+    monkeypatch.setattr(openaddresses, "_emit_load_progress", lambda **_payload: None)
+
+    stats = await openaddresses._load_openaddresses_data(  # pylint: disable=protected-access
+        {"context": {"test_mode": False}},
+        {"local_files": [str(path) for path in paths], "source_concurrency": 3},
+        object,
+    )
+
+    assert stats == {"processed_files": 3, "processed_rows": 30, "accepted_rows": 15}
+    assert max_active > 1
+
+
+@pytest.mark.asyncio
+async def test_openaddresses_remote_sources_load_in_parallel(monkeypatch):
+    items = [
+        {"source": f"us/tx/source-{index}", "layer": "addresses", "output": {"output": True}, "id": index, "job": index}
+        for index in range(1, 4)
+    ]
+    active = 0
+    max_active = 0
+
+    async def fake_fetch_json(_client, _url, _token):
+        return items
+
+    async def fake_load_source_item(**kwargs):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return kwargs["item"]["source"], 10, 5
+
+    monkeypatch.setenv("HLTHPRT_OPENADDRESSES_API_TOKEN", "test-token")
+    monkeypatch.setattr(openaddresses, "_fetch_json", fake_fetch_json)
+    monkeypatch.setattr(openaddresses, "_load_source_item", fake_load_source_item)
+    monkeypatch.setattr(openaddresses, "_emit_load_progress", lambda **_payload: None)
+
+    stats = await openaddresses._load_openaddresses_data(  # pylint: disable=protected-access
+        {"context": {"test_mode": False}},
+        {"source_concurrency": 3, "max_files": 3},
+        object,
+    )
+
+    assert stats == {"processed_files": 3, "processed_rows": 30, "accepted_rows": 15}
+    assert max_active > 1
+
+
+@pytest.mark.asyncio
+async def test_openaddresses_remote_test_mode_honors_source_concurrency(monkeypatch):
+    items = [
+        {"source": f"us/ca/test-{index}", "layer": "addresses", "output": {"output": True}, "id": index, "job": index}
+        for index in range(1, 4)
+    ]
+    active = 0
+    max_active = 0
+
+    async def fake_fetch_json(_client, _url, _token):
+        return items
+
+    async def fake_load_source_item(**kwargs):
+        nonlocal active, max_active
+        assert kwargs["test_mode"] is True
+        assert kwargs["test_row_limit"] == 10
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return kwargs["item"]["source"], 10, 5
+
+    monkeypatch.setenv("HLTHPRT_OPENADDRESSES_API_TOKEN", "test-token")
+    monkeypatch.setattr(openaddresses, "_fetch_json", fake_fetch_json)
+    monkeypatch.setattr(openaddresses, "_load_source_item", fake_load_source_item)
+    monkeypatch.setattr(openaddresses, "_emit_load_progress", lambda **_payload: None)
+
+    stats = await openaddresses._load_openaddresses_data(  # pylint: disable=protected-access
+        {"context": {"test_mode": True}},
+        {"source_concurrency": 2, "test_file_limit": 3, "test_row_limit": 10},
+        object,
+    )
+
+    assert stats == {"processed_files": 3, "processed_rows": 30, "accepted_rows": 15}
+    assert max_active > 1
+
+
+@pytest.mark.asyncio
+async def test_openaddresses_task_import_id_controls_stage_suffix():
+    ctx = {"context": {}, "import_date": "old"}
+
+    await openaddresses.process_data(
+        ctx,
+        {"publish_only": True, "import_id": "oa-dev-2026/06/19"},
+    )
+
+    assert ctx["import_date"] == "oadev20260619"
+    assert ctx["context"]["import_date"] == "oadev20260619"
+    assert ctx["context"]["publish_only"] is True
+
+
+@pytest.mark.asyncio
+async def test_openaddresses_shutdown_uses_job_import_id_from_shared_context(monkeypatch):
+    seen = {}
+
+    async def fake_ensure_database(_test_mode):
+        return None
+
+    async def fake_table_exists(schema, table_name):
+        seen["table_exists"] = (schema, table_name)
+        return True
+
+    async def fake_create_indexes(table_name, schema):
+        seen["create_indexes"] = (schema, table_name)
+
+    async def fake_refresh_archive_geocodes_from_openaddresses(**_kwargs):
+        return openaddresses.OpenAddressesBackfillStats(exact_updates=0, fuzzy_updates=0, relaxed_updates=0)
+
+    class FakeTransaction:
+        async def __aenter__(self):
+            return None
+
+        async def __aexit__(self, *_exc):
+            return False
+
+    class FakeDb:
+        async def scalar(self, _stmt, **_params):
+            return 3
+
+        async def execute_ddl(self, _stmt):
+            return None
+
+        async def status(self, _stmt, **_params):
+            return None
+
+        def transaction(self):
+            return FakeTransaction()
+
+    monkeypatch.setattr(openaddresses, "ensure_database", fake_ensure_database)
+    monkeypatch.setattr(openaddresses, "_table_exists", fake_table_exists)
+    monkeypatch.setattr(openaddresses, "_create_indexes", fake_create_indexes)
+    monkeypatch.setattr(openaddresses, "refresh_archive_geocodes_from_openaddresses", fake_refresh_archive_geocodes_from_openaddresses)
+    monkeypatch.setattr(openaddresses, "db", FakeDb())
+    monkeypatch.setattr(openaddresses, "print_time_info", lambda _started_at: None)
+
+    await openaddresses.shutdown(
+        {
+            "import_date": "startupwrong",
+            "context": {
+                "run": 1,
+                "test_mode": True,
+                "import_date": "oadev20260619",
+            },
+        }
+    )
+
+    assert seen["table_exists"] == ("mrf", "openaddresses_geocode_oadev20260619")
+    assert seen["create_indexes"] == ("mrf", "openaddresses_geocode_oadev20260619")
+
+
+@pytest.mark.asyncio
+async def test_openaddresses_load_file_stops_when_control_run_cancelled(tmp_path):
+    class FakeRedis:
+        async def get(self, key):
+            assert key == "cancel:run_1"
+            return "1"
+
+    path = tmp_path / "source.geojson"
+    path.write_text(
+        json.dumps(
+            {
+                "type": "Feature",
+                "properties": {
+                    "number": "123",
+                    "street": "Main Street",
+                    "region": "TX",
+                    "postcode": "78701",
+                },
+                "geometry": {"type": "Point", "coordinates": [-97.7431, 30.2672]},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ImportCancelledError):
+        await openaddresses._load_file(  # pylint: disable=protected-access
+            path,
+            stage_cls=object,
+            batch_size=5000,
+            ctx={"redis": FakeRedis()},
+            task={"run_id": "run_1"},
+        )
 
 
 def test_openaddresses_import_control_registration():

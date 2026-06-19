@@ -300,7 +300,7 @@ def _importer_family(importer: str) -> str:
         return "provider"
     if importer in {"partd-formulary-network", "pharmacy-license", "pharmacy-economics"}:
         return "pharmacy"
-    if importer in {"geo", "geo-census", "places-zcta", "lodes"}:
+    if importer in {"geo", "geo-census", "places-zcta", "lodes", "openaddresses"}:
         return "geo"
     if importer in {"code-sets", "ms-drg", "clinical-reference", "plan-attributes"}:
         return "reference"

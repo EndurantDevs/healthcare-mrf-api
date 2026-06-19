@@ -133,7 +133,7 @@ Operational note:
 - Do **not** run `ClaimsPricing_finish` and `DrugClaims_finish` at the same time. Both touch shared `code_catalog` and `code_crosswalk`.
 - `openaddresses` imports only U.S. sources from OpenAddresses Batch, then backfills `address_archive_v2` in this order: exact house/street/state/ZIP, strict fuzzy street match, then relaxed city/state/ZIP-scoped street match.
 - `openaddresses` full imports process multiple OpenAddresses source files concurrently; tune with `HLTHPRT_OPENADDRESSES_SOURCE_CONCURRENCY`.
-- For faster dev catch-up, multiple `openaddresses` load shards can use the same `HLTHPRT_IMPORT_ID_OVERRIDE` with `HLTHPRT_OPENADDRESSES_RESUME_STAGE=1`, `HLTHPRT_OPENADDRESSES_LOAD_ONLY=1`, and non-overlapping `HLTHPRT_OPENADDRESSES_START_INDEX`/`HLTHPRT_OPENADDRESSES_END_INDEX`; run one `HLTHPRT_OPENADDRESSES_PUBLISH_ONLY=1` job after all shards complete.
+- For faster dev catch-up, multiple `openaddresses` load shards can use the same `--import-id`/`import_id` (or `HLTHPRT_IMPORT_ID_OVERRIDE`) with `--resume-stage`, `--load-only`, and non-overlapping `--start-index`/`--end-index`; run one `--publish-only --import-id <same-id>` job after all shards complete.
 - `openaddresses` archive backfill can also be sharded with `HLTHPRT_OPENADDRESSES_BACKFILL_STATE_CODE` and optional `HLTHPRT_OPENADDRESSES_BACKFILL_ZIP_PREFIX`; each shard only updates rows that still have no coordinates, so retries are safe.
 
 ## Documentation

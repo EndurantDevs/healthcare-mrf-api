@@ -22,8 +22,10 @@ import ijson
 from arq import create_pool
 
 from db.models import OpenAddressesGeocode, db
+from process.control_cancel import raise_if_cancelled
 from process.ext import address_canon
 from process.ext.utils import ensure_database, make_class, my_init_db, print_time_info, push_objects
+from process.live_progress import enqueue_live_progress
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
 
@@ -36,7 +38,7 @@ DEFAULT_BATCH_SIZE = 5000
 DEFAULT_MIN_ROWS = 1000
 DEFAULT_TEST_FILE_LIMIT = 2
 DEFAULT_TEST_ROW_LIMIT = 1000
-DEFAULT_SOURCE_CONCURRENCY = 4
+DEFAULT_SOURCE_CONCURRENCY = 8
 DEFAULT_FUZZY_THRESHOLD = 0.92
 DEFAULT_FUZZY_MARGIN = 0.08
 DEFAULT_RELAXED_STREET_THRESHOLD = 0.86
@@ -53,8 +55,18 @@ class OpenAddressesBackfillStats:
     relaxed_updates: int
 
 
+@dataclass(frozen=True)
+class _RecordBatch:
+    processed: int
+    rows: list[dict[str, Any]]
+
+
 def _env_positive_int(name: str, default: int) -> int:
     raw = os.getenv(name)
+    return _positive_int_value(raw, default)
+
+
+def _positive_int_value(raw: Any, default: int) -> int:
     if not raw:
         return default
     try:
@@ -542,7 +554,7 @@ async def _flush_rows(rows: list[dict[str, Any]], stage_cls) -> int:
     if not rows:
         return 0
     accepted = len(rows)
-    await push_objects(rows, stage_cls, rewrite=True, use_copy=False)
+    await push_objects(rows, stage_cls, rewrite=True, use_copy=True)
     rows.clear()
     return accepted
 
@@ -556,15 +568,78 @@ async def _fetch_json(client: aiohttp.ClientSession, url: str, token: str | None
         return await response.json(content_type=None)
 
 
-async def _download_file(client: aiohttp.ClientSession, url: str, path: Path, token: str) -> None:
+async def _maybe_raise_if_cancelled(ctx: dict[str, Any] | None, task: dict[str, Any] | None) -> None:
+    if ctx is not None and task is not None:
+        await raise_if_cancelled(ctx, task)
+
+
+def _iter_record_batches(
+    path: Path,
+    *,
+    batch_size: int,
+    source: str | None = None,
+    data_id: int | None = None,
+    job_id: int | None = None,
+    updated: Any = None,
+    row_limit: int | None = None,
+) -> Iterable[_RecordBatch]:
+    processed = 0
+    rows: list[dict[str, Any]] = []
+    for feature in _iter_geojson_features(path):
+        processed += 1
+        record = _record_from_feature(
+            feature,
+            source=source,
+            data_id=data_id,
+            job_id=job_id,
+            updated=updated,
+        )
+        if record:
+            rows.append(record)
+        if len(rows) >= batch_size:
+            yield _RecordBatch(processed=processed, rows=rows)
+            rows = []
+        if row_limit and processed >= row_limit:
+            break
+    if rows or processed:
+        yield _RecordBatch(processed=processed, rows=rows)
+
+
+def _next_record_batch(iterator: Iterable[_RecordBatch]) -> _RecordBatch | None:
+    try:
+        return next(iterator)  # type: ignore[arg-type]
+    except StopIteration:
+        return None
+
+
+async def _download_file(
+    client: aiohttp.ClientSession,
+    url: str,
+    path: Path,
+    token: str,
+    *,
+    ctx: dict[str, Any] | None = None,
+    task: dict[str, Any] | None = None,
+) -> None:
+    await _maybe_raise_if_cancelled(ctx, task)
     headers = {"Authorization": f"Bearer {token}"}
     async with client.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=None, connect=60, sock_read=600)) as response:
         if response.status != 200:
             body = await response.text()
             raise RuntimeError(f"OpenAddresses download failed HTTP {response.status}: {body[:200]}")
         with path.open("wb") as handle:
-            async for chunk in response.content.iter_chunked(1024 * 1024):
+            async for chunk_index, chunk in _aiter_enumerate(response.content.iter_chunked(1024 * 1024), start=1):
                 handle.write(chunk)
+                if chunk_index % 16 == 0:
+                    await _maybe_raise_if_cancelled(ctx, task)
+    await _maybe_raise_if_cancelled(ctx, task)
+
+
+async def _aiter_enumerate(iterable, *, start: int = 0):
+    index = start
+    async for item in iterable:
+        yield index, item
+        index += 1
 
 
 def _us_data_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -590,6 +665,64 @@ def _local_files_from_env() -> list[Path]:
     return [Path(part.strip()) for part in raw.split(",") if part.strip()]
 
 
+def _local_files_from_task_or_env(task: dict[str, Any]) -> list[Path]:
+    raw = task.get("local_files")
+    if raw is None:
+        raw = task.get("local_file")
+    if raw is None:
+        raw = task.get("openaddresses_local_files")
+    if raw is None:
+        return _local_files_from_env()
+    if isinstance(raw, (list, tuple, set)):
+        return [Path(str(part).strip()) for part in raw if str(part).strip()]
+    return [Path(part.strip()) for part in str(raw).split(",") if part.strip()]
+
+
+def _task_or_env_positive_int(task: dict[str, Any], key: str, env_name: str, default: int) -> int:
+    if key in task and task.get(key) not in {None, ""}:
+        return _positive_int_value(task.get(key), default)
+    return _env_positive_int(env_name, default)
+
+
+def _task_or_env_bool(task: dict[str, Any], key: str, env_name: str, default: bool = False) -> bool:
+    if key in task and task.get(key) is not None:
+        value = task.get(key)
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+    return _env_bool(env_name, default)
+
+
+def _emit_load_progress(
+    *,
+    processed_files: int,
+    total_files: int,
+    processed_rows: int,
+    accepted_rows: int,
+    label: str | None = None,
+    phase: str = "loading OpenAddresses sources",
+) -> None:
+    total = max(int(total_files or 0), 1)
+    done = max(int(processed_files or 0), 0)
+    pct = min((done / total) * 100.0, 100.0)
+    message = (
+        f"{done:,}/{total_files:,} sources; "
+        f"{processed_rows:,} rows processed; {accepted_rows:,} rows accepted"
+    )
+    enqueue_live_progress(
+        importer="openaddresses",
+        status="running",
+        unit="sources",
+        done=done,
+        total=total_files,
+        pct=pct,
+        phase=phase,
+        message=message,
+        label=label,
+        step=label,
+    )
+
+
 async def _load_file(
     path: Path,
     *,
@@ -600,31 +733,37 @@ async def _load_file(
     job_id: int | None = None,
     updated: Any = None,
     row_limit: int | None = None,
+    ctx: dict[str, Any] | None = None,
+    task: dict[str, Any] | None = None,
 ) -> tuple[int, int]:
+    await _maybe_raise_if_cancelled(ctx, task)
     accepted = 0
     processed = 0
-    rows: list[dict[str, Any]] = []
-    for feature in _iter_geojson_features(path):
-        processed += 1
-        record = _record_from_feature(
-            feature,
+    batch_iter = iter(
+        _iter_record_batches(
+            path,
+            batch_size=batch_size,
             source=source,
             data_id=data_id,
             job_id=job_id,
             updated=updated,
+            row_limit=row_limit,
         )
-        if record:
-            rows.append(record)
-        if len(rows) >= batch_size:
-            accepted += await _flush_rows(rows, stage_cls)
-        if row_limit and processed >= row_limit:
+    )
+    while True:
+        batch = await asyncio.to_thread(_next_record_batch, batch_iter)
+        if batch is None:
             break
-    accepted += await _flush_rows(rows, stage_cls)
+        processed = batch.processed
+        accepted += await _flush_rows(batch.rows, stage_cls)
+        await _maybe_raise_if_cancelled(ctx, task)
     return processed, accepted
 
 
 async def _load_source_item(
     *,
+    ctx: dict[str, Any],
+    task: dict[str, Any],
     client: aiohttp.ClientSession,
     item: dict[str, Any],
     tmpdir_path: Path,
@@ -640,7 +779,7 @@ async def _load_source_item(
     url = f"{OPENADDRESSES_API_BASE}/job/{job_id}/output/source.geojson.gz"
     path = tmpdir_path / f"openaddresses-{data_id}-{job_id}.geojson.gz"
     logger.info("Downloading OpenAddresses source=%s job=%s", source, job_id)
-    await _download_file(client, url, path, token)
+    await _download_file(client, url, path, token, ctx=ctx, task=task)
     file_processed, file_accepted = await _load_file(
         path,
         stage_cls=stage_cls,
@@ -650,6 +789,8 @@ async def _load_source_item(
         job_id=job_id,
         updated=item.get("updated"),
         row_limit=test_row_limit if test_mode else None,
+        ctx=ctx,
+        task=task,
     )
     try:
         path.unlink()
@@ -659,13 +800,29 @@ async def _load_source_item(
 
 
 async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], stage_cls) -> dict[str, int]:
+    await _maybe_raise_if_cancelled(ctx, task)
     test_mode = bool(ctx["context"].get("test_mode"))
-    batch_size = _env_positive_int("HLTHPRT_OPENADDRESSES_BATCH_SIZE", DEFAULT_BATCH_SIZE)
-    test_file_limit = _env_positive_int("HLTHPRT_OPENADDRESSES_TEST_FILE_LIMIT", DEFAULT_TEST_FILE_LIMIT)
-    test_row_limit = _env_positive_int("HLTHPRT_OPENADDRESSES_TEST_ROW_LIMIT", DEFAULT_TEST_ROW_LIMIT)
-    max_files = _env_positive_int("HLTHPRT_OPENADDRESSES_MAX_FILES", 0)
-    source_concurrency = _env_positive_int("HLTHPRT_OPENADDRESSES_SOURCE_CONCURRENCY", DEFAULT_SOURCE_CONCURRENCY)
-    local_files = _local_files_from_env()
+    batch_size = _task_or_env_positive_int(task, "batch_size", "HLTHPRT_OPENADDRESSES_BATCH_SIZE", DEFAULT_BATCH_SIZE)
+    test_file_limit = _task_or_env_positive_int(
+        task,
+        "test_file_limit",
+        "HLTHPRT_OPENADDRESSES_TEST_FILE_LIMIT",
+        DEFAULT_TEST_FILE_LIMIT,
+    )
+    test_row_limit = _task_or_env_positive_int(
+        task,
+        "test_row_limit",
+        "HLTHPRT_OPENADDRESSES_TEST_ROW_LIMIT",
+        DEFAULT_TEST_ROW_LIMIT,
+    )
+    max_files = _task_or_env_positive_int(task, "max_files", "HLTHPRT_OPENADDRESSES_MAX_FILES", 0)
+    source_concurrency = _task_or_env_positive_int(
+        task,
+        "source_concurrency",
+        "HLTHPRT_OPENADDRESSES_SOURCE_CONCURRENCY",
+        DEFAULT_SOURCE_CONCURRENCY,
+    )
+    local_files = _local_files_from_task_or_env(task)
 
     processed_files = 0
     processed_rows = 0
@@ -673,19 +830,68 @@ async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], st
     timeout = aiohttp.ClientTimeout(total=120, connect=30, sock_read=120)
 
     if local_files:
-        for path in local_files:
-            if not path.exists():
-                raise FileNotFoundError(f"OpenAddresses local file not found: {path}")
-            file_processed, file_accepted = await _load_file(
-                path,
-                stage_cls=stage_cls,
-                batch_size=batch_size,
-                source="local/openaddresses",
-                row_limit=test_row_limit if test_mode else None,
-            )
-            processed_files += 1
-            processed_rows += file_processed
-            accepted_rows += file_accepted
+        total_files = len(local_files)
+        local_concurrency = min(max(source_concurrency, 1), max(total_files, 1))
+        print(f"OpenAddresses local source concurrency={local_concurrency}", flush=True)
+        _emit_load_progress(
+            processed_files=0,
+            total_files=total_files,
+            processed_rows=0,
+            accepted_rows=0,
+            phase="loading local OpenAddresses files",
+        )
+        progress_lock = asyncio.Lock()
+        queue: asyncio.Queue[tuple[int, Path]] = asyncio.Queue()
+        for source_index, path in enumerate(local_files, start=1):
+            queue.put_nowait((source_index, path))
+
+        async def local_worker(worker_id: int) -> None:
+            nonlocal processed_files, processed_rows, accepted_rows
+            while True:
+                await _maybe_raise_if_cancelled(ctx, task)
+                try:
+                    source_index, path = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                try:
+                    if not path.exists():
+                        raise FileNotFoundError(f"OpenAddresses local file not found: {path}")
+                    file_processed, file_accepted = await _load_file(
+                        path,
+                        stage_cls=stage_cls,
+                        batch_size=batch_size,
+                        source="local/openaddresses",
+                        row_limit=test_row_limit if test_mode else None,
+                        ctx=ctx,
+                        task=task,
+                    )
+                    async with progress_lock:
+                        await _maybe_raise_if_cancelled(ctx, task)
+                        processed_files += 1
+                        processed_rows += file_processed
+                        accepted_rows += file_accepted
+                        print(
+                            "OpenAddresses local source "
+                            f"{processed_files:,}/{total_files:,} "
+                            f"index={source_index:,} worker={worker_id} {path}: "
+                            f"processed={file_processed:,} accepted={file_accepted:,} "
+                            f"accepted_total={accepted_rows:,}",
+                            flush=True,
+                        )
+                        _emit_load_progress(
+                            processed_files=processed_files,
+                            total_files=total_files,
+                            processed_rows=processed_rows,
+                            accepted_rows=accepted_rows,
+                            label=str(path),
+                            phase="loading local OpenAddresses files",
+                        )
+                finally:
+                    queue.task_done()
+
+        async with asyncio.TaskGroup() as task_group:
+            for worker_id in range(1, local_concurrency + 1):
+                task_group.create_task(local_worker(worker_id))
         return {
             "processed_files": processed_files,
             "processed_rows": processed_rows,
@@ -751,8 +957,14 @@ async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], st
             else:
                 raise RuntimeError(f"OpenAddresses start source not found: {start_source}")
         total_files = len(items)
-        source_concurrency = 1 if test_mode else min(max(source_concurrency, 1), max(total_files, 1))
+        source_concurrency = min(max(source_concurrency, 1), max(total_files, 1))
         print(f"OpenAddresses source concurrency={source_concurrency}", flush=True)
+        _emit_load_progress(
+            processed_files=0,
+            total_files=total_files,
+            processed_rows=0,
+            accepted_rows=0,
+        )
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmpdir_path = Path(tmpdir)
@@ -764,12 +976,15 @@ async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], st
             async def worker(worker_id: int) -> None:
                 nonlocal processed_files, processed_rows, accepted_rows
                 while True:
+                    await _maybe_raise_if_cancelled(ctx, task)
                     try:
                         source_index, item = queue.get_nowait()
                     except asyncio.QueueEmpty:
                         return
                     try:
                         source, file_processed, file_accepted = await _load_source_item(
+                            ctx=ctx,
+                            task=task,
                             client=client,
                             item=item,
                             tmpdir_path=tmpdir_path,
@@ -780,6 +995,7 @@ async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], st
                             test_row_limit=test_row_limit,
                         )
                         async with progress_lock:
+                            await _maybe_raise_if_cancelled(ctx, task)
                             processed_files += 1
                             processed_rows += file_processed
                             accepted_rows += file_accepted
@@ -790,6 +1006,13 @@ async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], st
                                 f"processed={file_processed:,} accepted={file_accepted:,} "
                                 f"accepted_total={accepted_rows:,}",
                                 flush=True,
+                            )
+                            _emit_load_progress(
+                                processed_files=processed_files,
+                                total_files=total_files,
+                                processed_rows=processed_rows,
+                                accepted_rows=accepted_rows,
+                                label=source,
                             )
                     finally:
                         queue.task_done()
@@ -817,6 +1040,30 @@ async def _create_indexes(table_name: str, schema: str) -> None:
         )
 
 
+async def _ensure_openaddresses_stage_schema(table_name: str, schema: str) -> None:
+    """Repair dynamic stage tables created by older importer code before resuming."""
+    schema = _validate_schema_name(schema)
+    table = _qtable(schema, table_name)
+    row_hash = await db.first(
+        """
+        SELECT data_type, character_maximum_length
+          FROM information_schema.columns
+         WHERE table_schema = :schema
+           AND table_name = :table_name
+           AND column_name = 'row_hash';
+        """,
+        schema=schema,
+        table_name=table_name,
+    )
+    if not row_hash:
+        return
+    row_hash_mapping = row_hash._mapping if hasattr(row_hash, "_mapping") else row_hash
+    data_type = str(row_hash_mapping["data_type"] or "").lower()
+    max_length = row_hash_mapping["character_maximum_length"]
+    if data_type in {"character varying", "character"} and (max_length is None or int(max_length) < 64):
+        await db.status(f"ALTER TABLE {table} ALTER COLUMN row_hash TYPE varchar(64);")
+
+
 async def _table_exists(schema: str, table_name: str) -> bool:
     schema = _validate_schema_name(schema)
     return bool(await db.scalar("SELECT to_regclass(:qualified_name) IS NOT NULL;", qualified_name=f"{schema}.{table_name}"))
@@ -839,6 +1086,19 @@ async def _table_has_column(schema: str, table_name: str, column_name: str) -> b
             column_name=column_name,
         )
     )
+
+
+async def _prepare_stage_table(stage_cls, schema: str, *, reset: bool) -> None:
+    await db.status(f"CREATE SCHEMA IF NOT EXISTS {_quote_ident(schema)};")
+    exists = await _table_exists(schema, stage_cls.__tablename__)
+    if reset:
+        await db.status(f"DROP TABLE IF EXISTS {_qtable(schema, stage_cls.__tablename__)};")
+        await db.create_table(stage_cls.__table__, checkfirst=True)
+    elif exists:
+        print(f"OpenAddresses resume: preserving existing stage table {schema}.{stage_cls.__tablename__}", flush=True)
+    else:
+        await db.create_table(stage_cls.__table__, checkfirst=True)
+    await _ensure_openaddresses_stage_schema(stage_cls.__tablename__, schema)
 
 
 def _backfill_shard_filter(*, state_code: str | None, zip_prefix: str | None) -> str:
@@ -1327,10 +1587,15 @@ async def refresh_archive_geocodes_from_openaddresses(
 
 async def process_data(ctx, task=None):  # pragma: no cover
     task = task or {}
+    await _maybe_raise_if_cancelled(ctx, task)
     ctx.setdefault("context", {})
     if "test_mode" in task:
         ctx["context"]["test_mode"] = bool(task.get("test_mode"))
-    if task.get("publish_only") or _env_bool("HLTHPRT_OPENADDRESSES_PUBLISH_ONLY"):
+    task_import_id = task.get("import_id") or task.get("stage_suffix")
+    if task_import_id:
+        ctx["import_date"] = _normalize_import_id(task_import_id)
+    ctx["context"]["import_date"] = ctx["import_date"]
+    if _task_or_env_bool(task, "publish_only", "HLTHPRT_OPENADDRESSES_PUBLISH_ONLY"):
         ctx["context"]["run"] = ctx["context"].get("run", 0) + 1
         ctx["context"]["publish_only"] = True
         print("OpenAddresses publish-only mode: using existing stage table", flush=True)
@@ -1366,10 +1631,18 @@ async def process_data(ctx, task=None):  # pragma: no cover
         return
 
     await ensure_database(bool(ctx["context"].get("test_mode", False)))
-    if task.get("load_only") or _env_bool("HLTHPRT_OPENADDRESSES_LOAD_ONLY"):
+    if _task_or_env_bool(task, "load_only", "HLTHPRT_OPENADDRESSES_LOAD_ONLY"):
         ctx["context"]["load_only"] = True
-    import_date = ctx["import_date"]
+    if "min_rows" in task:
+        ctx["context"]["min_rows"] = _positive_int_value(task.get("min_rows"), DEFAULT_MIN_ROWS)
+    import_date = ctx["context"].get("import_date") or ctx["import_date"]
     stage_cls = make_class(OpenAddressesGeocode, import_date)
+    schema = _validate_schema_name(os.getenv("HLTHPRT_DB_SCHEMA") or "mrf")
+    await _prepare_stage_table(
+        stage_cls,
+        schema,
+        reset=not _task_or_env_bool(task, "resume_stage", "HLTHPRT_OPENADDRESSES_RESUME_STAGE"),
+    )
     stats = await _load_openaddresses_data(ctx, task, stage_cls)
     ctx["context"]["audit"] = stats
     ctx["context"]["run"] = ctx["context"].get("run", 0) + 1
@@ -1392,16 +1665,9 @@ async def startup(ctx):  # pragma: no cover
     override_import_id = os.getenv("HLTHPRT_IMPORT_ID_OVERRIDE")
     ctx["import_date"] = _normalize_import_id(override_import_id)
     schema = _validate_schema_name(os.getenv("HLTHPRT_DB_SCHEMA") or "mrf")
-    stage_cls = make_class(OpenAddressesGeocode, ctx["import_date"])
 
-    await db.status(f"CREATE SCHEMA IF NOT EXISTS {_quote_ident(schema)};")
     await db.status("CREATE EXTENSION IF NOT EXISTS pg_trgm;")
-    resume_stage = _env_bool("HLTHPRT_OPENADDRESSES_RESUME_STAGE")
-    if resume_stage and await _table_exists(schema, stage_cls.__tablename__):
-        print(f"OpenAddresses resume: preserving existing stage table {schema}.{stage_cls.__tablename__}", flush=True)
-    else:
-        await db.status(f"DROP TABLE IF EXISTS {_qtable(schema, stage_cls.__tablename__)};")
-        await db.create_table(stage_cls.__table__, checkfirst=True)
+    await db.status(f"CREATE SCHEMA IF NOT EXISTS {_quote_ident(schema)};")
 
 
 async def shutdown(ctx):  # pragma: no cover
@@ -1414,7 +1680,8 @@ async def shutdown(ctx):  # pragma: no cover
 
     await ensure_database(bool(context.get("test_mode")))
     schema = _validate_schema_name(os.getenv("HLTHPRT_DB_SCHEMA") or "mrf")
-    stage_cls = make_class(OpenAddressesGeocode, ctx["import_date"])
+    import_date = context.get("import_date") or ctx["import_date"]
+    stage_cls = make_class(OpenAddressesGeocode, import_date)
     stage_table = stage_cls.__tablename__
     if not await _table_exists(schema, stage_table):
         raise RuntimeError(f"OpenAddresses staging table {schema}.{stage_table} is missing.")
@@ -1423,7 +1690,7 @@ async def shutdown(ctx):  # pragma: no cover
         await db.scalar(f"SELECT COUNT(*) FROM {_qtable(schema, stage_table)};")
         or 0
     )
-    min_rows = _env_positive_int("HLTHPRT_OPENADDRESSES_MIN_ROWS", DEFAULT_MIN_ROWS)
+    min_rows = int(context.get("min_rows") or _env_positive_int("HLTHPRT_OPENADDRESSES_MIN_ROWS", DEFAULT_MIN_ROWS))
     if context.get("test_mode"):
         print(f"OpenAddresses test mode: staged rows={stage_rows:,}")
     elif stage_rows < min_rows:
@@ -1455,13 +1722,24 @@ async def shutdown(ctx):  # pragma: no cover
     print_time_info(context.get("start"))
 
 
-async def main(test_mode: bool = False, backfill_only: bool = False):  # pragma: no cover
+async def main(
+    test_mode: bool = False,
+    backfill_only: bool = False,
+    **params: Any,
+):  # pragma: no cover
     redis = await create_pool(
         build_redis_settings(),
         job_serializer=serialize_job,
         job_deserializer=deserialize_job,
     )
     payload = {"test_mode": bool(test_mode), "backfill_only": bool(backfill_only)}
+    payload.update(
+        {
+            key: value
+            for key, value in params.items()
+            if value is not None and value is not False and value != "" and value != () and value != []
+        }
+    )
     await redis.enqueue_job("process_data", payload, _queue_name=OPENADDRESSES_QUEUE_NAME)
 
 

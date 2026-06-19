@@ -82,6 +82,11 @@ def test_importer_registry_exposes_ptg_and_finish_lifecycle():
     assert any(param["name"] == "relationship_page_limit" and param["type"] == "integer" for param in items["ms-drg"]["params_schema"])
     assert any(param["name"] == "dry_run" and param["is_flag"] for param in items["address-archive-v2-migrate"]["params_schema"])
     assert any(param["name"] == "sample_limit" and param["type"] == "integer" for param in items["address-archive-v2-migrate"]["params_schema"])
+    assert any(param["name"] == "source_concurrency" and param["type"] == "integer" for param in items["openaddresses"]["params_schema"])
+    assert items["openaddresses"]["family"] == "geo"
+    assert any(param["name"] == "import_id" and param["type"] == "text" for param in items["openaddresses"]["params_schema"])
+    assert any(param["name"] == "local_files" and param["multiple"] for param in items["openaddresses"]["params_schema"])
+    assert any(param["name"] == "resume_stage" and param["is_flag"] for param in items["openaddresses"]["params_schema"])
 
 
 def test_control_wrapped_publish_importers_request_shutdown():
@@ -110,6 +115,35 @@ def test_control_wrapped_publish_importers_request_shutdown():
     assert entity_payload["run_shutdown"] is True
     assert openaddresses_payload["run_shutdown"] is True
     assert npi_payload["run_shutdown"] is False
+
+
+def test_openaddresses_adapter_preserves_parallel_load_params():
+    payload = control_imports._adapter_payload(
+        control_imports._SINGLE_JOB_ADAPTERS["openaddresses"],
+        {"run_id": "run_openaddresses", "importer": "openaddresses", "family": "provider"},
+        {
+            "test_mode": True,
+            "source_concurrency": 8,
+            "max_files": 20,
+            "local_files": ["/tmp/a.geojson", "/tmp/b.geojson"],
+            "import_id": "oa_dev_20260619",
+            "resume_stage": True,
+            "load_only": True,
+            "batch_size": 10000,
+        },
+    )
+
+    assert payload["run_shutdown"] is True
+    assert payload["task"] == {
+        "test_mode": True,
+        "source_concurrency": 8,
+        "max_files": 20,
+        "local_files": ["/tmp/a.geojson", "/tmp/b.geojson"],
+        "import_id": "oa_dev_20260619",
+        "resume_stage": True,
+        "load_only": True,
+        "batch_size": 10000,
+    }
 
 
 def test_mrf_adapter_preserves_chunking_params():
