@@ -124,6 +124,10 @@ def test_resolve_materialization_carries_source_ctid_for_resolve_aliases():
     assert "ctid::text AS source_ctid" in raw_copy_sql
     assert "address_completion_aliases" in alias_sql
     assert "addr_street_completion_norm_v1" in alias_sql
+    assert "source_keys AS MATERIALIZED" in alias_sql
+    assert "archive_key_scope AS MATERIALIZED" in alias_sql
+    assert "archive_prefilter AS MATERIALIZED" in alias_sql
+    assert "AND (suffix_token IS NULL OR direction_token IS NULL)" in alias_sql
     assert "HAVING count(DISTINCT target_address_key) = 1" in alias_sql
     assert "source_ctid" in alias_sql
     assert "address_zip_aliases" in zip_alias_sql

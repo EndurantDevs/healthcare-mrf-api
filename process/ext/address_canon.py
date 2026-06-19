@@ -1170,7 +1170,7 @@ def _completion_alias_sql(
     qschema = _quote_ident(schema)
     return f"""
         CREATE TEMP TABLE address_completion_aliases ON COMMIT DROP AS
-        WITH source_rows AS (
+        WITH source_rows AS MATERIALIZED (
             SELECT
                 rn,
                 source_ctid,
@@ -1189,19 +1189,54 @@ def _completion_alias_sql(
               AND state_code IS NOT NULL
               AND zip5 IS NOT NULL
         ),
-        source_ranked AS (
+        source_ranked AS MATERIALIZED (
             SELECT
                 *,
                 CASE WHEN suffix_token IS NOT NULL THEN 1 ELSE 0 END
               + CASE WHEN direction_token IS NOT NULL THEN 1 ELSE 0 END AS completion_rank
             FROM source_rows
             WHERE completion_norm IS NOT NULL
+              AND (suffix_token IS NULL OR direction_token IS NULL)
         ),
-        source_keys AS (
+        source_keys AS MATERIALIZED (
             SELECT DISTINCT completion_norm, unit_norm, state_code, zip5, country_code
             FROM source_ranked
         ),
-        target_rows AS (
+        archive_key_scope AS MATERIALIZED (
+            SELECT DISTINCT unit_norm, state_code, zip5, country_code
+            FROM source_keys
+        ),
+        archive_prefilter AS MATERIALIZED (
+            SELECT
+                archived.address_key,
+                archived.identity_key,
+                archived.premise_key,
+                archived.line1_norm,
+                archived.unit_norm,
+                archived.city_norm,
+                archived.state_code,
+                archived.zip5,
+                archived.zip4,
+                archived.country_code,
+                archived.first_line,
+                archived.second_line,
+                archived.city_name,
+                archived.state_name,
+                archived.postal_code
+            FROM {archive} AS archived
+            JOIN archive_key_scope
+              ON COALESCE(archived.unit_norm, '') = archive_key_scope.unit_norm
+             AND archived.state_code = archive_key_scope.state_code
+             AND archived.zip5 = archive_key_scope.zip5
+             AND COALESCE(archived.country_code, 'US') = archive_key_scope.country_code
+            WHERE archived.address_key IS NOT NULL
+              AND archived.identity_key IS NOT NULL
+              AND COALESCE(archived.precision, split_part(archived.identity_key, '|', 8)) = 'street'
+              AND archived.merged_into IS NULL
+              AND archived.state_code IS NOT NULL
+              AND archived.zip5 IS NOT NULL
+        ),
+        target_rows AS MATERIALIZED (
             SELECT
                 0 AS target_source_rank,
                 address_key AS target_address_key,
@@ -1257,7 +1292,7 @@ def _completion_alias_sql(
                 source_keys.completion_norm,
                 {qschema}.addr_street_suffix_token_v1(archived.first_line, archived.second_line) AS suffix_token,
                 {qschema}.addr_street_direction_token_v1(archived.first_line, archived.second_line) AS direction_token
-            FROM {archive} AS archived
+            FROM archive_prefilter AS archived
             JOIN source_keys
               ON COALESCE(archived.unit_norm, '') = source_keys.unit_norm
              AND archived.state_code = source_keys.state_code
@@ -1265,14 +1300,8 @@ def _completion_alias_sql(
              AND COALESCE(archived.country_code, 'US') = source_keys.country_code
              AND {qschema}.addr_street_completion_norm_v1(archived.first_line, archived.second_line)
                  = source_keys.completion_norm
-            WHERE archived.address_key IS NOT NULL
-              AND archived.identity_key IS NOT NULL
-              AND COALESCE(archived.precision, split_part(archived.identity_key, '|', 8)) = 'street'
-              AND archived.merged_into IS NULL
-              AND archived.state_code IS NOT NULL
-              AND archived.zip5 IS NOT NULL
         ),
-        target_ranked AS (
+        target_ranked AS MATERIALIZED (
             SELECT
                 *,
                 CASE WHEN suffix_token IS NOT NULL THEN 1 ELSE 0 END
