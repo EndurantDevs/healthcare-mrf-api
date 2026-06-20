@@ -42,9 +42,15 @@ logger = logging.getLogger(__name__)
 
 ADDRESS_CANON_RUST_MATERIALIZE_ENV = "HLTHPRT_ADDRESS_CANON_RUST_MATERIALIZE"
 ADDRESS_COMPLETION_ALIAS_TIMEOUT_ENV = "HLTHPRT_ADDRESS_COMPLETION_ALIAS_TIMEOUT"
+ADDRESS_ZIP_RESTORE_ENABLED_ENV = "HLTHPRT_ADDRESS_CANON_ZIP_RESTORE_ENABLED"
+ADDRESS_ZIP_RESTORE_CONCURRENCY_ENV = "HLTHPRT_ADDRESS_CANON_ZIP_RESTORE_CONCURRENCY"
+ADDRESS_ZIP_RESTORE_REQUIRED_ENV = "HLTHPRT_ADDRESS_CANON_ZIP_RESTORE_REQUIRED"
+ADDRESS_ZIP_RESTORE_SHARDS_ENV = "HLTHPRT_ADDRESS_CANON_ZIP_RESTORE_SHARDS"
 CURRENT_ADDRESS_IDENTITY_VERSION = 2
 CURRENT_ADDRESS_IDENTITY_PREFIX = f"v{CURRENT_ADDRESS_IDENTITY_VERSION}"
 _RUST_CANON_VERSION_CACHE: dict[str, bool] = {}
+_LATITUDE_COLUMN_CANDIDATES = ("lat", "latitude")
+_LONGITUDE_COLUMN_CANDIDATES = ("long", "lng", "longitude")
 
 
 UNIT_DESIGNATOR_PATTERN = "|".join(
@@ -511,6 +517,21 @@ def _key_from_identity_sql(schema: str, identity_expr: str) -> str:
     return f"{_quote_ident(schema)}.addr_key_from_identity_v1({identity_expr})"
 
 
+def _simple_column_name(value: str | None) -> str | None:
+    raw = (value or "").strip()
+    if raw.upper() in {"NULL", "TRUE", "FALSE"}:
+        return None
+    return raw if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", raw) else None
+
+
+def _positive_env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    value = int(raw) if raw not in (None, "") else default
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
 KEYED_COPY_COLUMNS = (
     "rn",
     "source_ctid",
@@ -853,6 +874,14 @@ async def stamp_address_keys(
     if db_pool_max <= 0:
         raise ValueError("HLTHPRT_DB_POOL_MAX_SIZE must be a positive integer")
     stamp_concurrency = min(stamp_concurrency, shards, db_pool_max)
+    await restore_missing_zip_from_tiger_zcta(
+        staging_table,
+        field_map,
+        schema=schema,
+        shards=shards,
+        cancel_check=cancel_check,
+        only_null_address_key=True,
+    )
     first, second, city, state, zip_code, country = _address_sql(schema, field_map)
     total = 0
     completed = 0
@@ -1151,6 +1180,231 @@ async def _table_has_column_in_session(session: Any, schema: str, table: str, co
             )
         ).scalar()
     )
+
+
+async def _first_existing_column_in_session(
+    session: Any,
+    schema: str,
+    table: str,
+    candidates: tuple[str, ...],
+) -> str | None:
+    for column in candidates:
+        if await _table_has_column_in_session(session, schema, table, column):
+            return column
+    return None
+
+
+async def _zip_restore_dependencies_available(session: Any, schema: str) -> bool:
+    tiger_zcta = await _table_exists_in_session(session, "tiger", "zcta5")
+    geo_zip_lookup = await _table_exists_in_session(session, schema, "geo_zip_lookup")
+    return tiger_zcta and geo_zip_lookup
+
+
+def _zip_restore_sql(
+    *,
+    schema: str,
+    staging_table: str,
+    zip_column: str,
+    latitude_column: str,
+    longitude_column: str,
+    state_expr: str,
+    country_expr: str,
+    shards: int,
+    has_address_key: bool,
+    only_null_address_key: bool,
+) -> str:
+    qschema = _quote_ident(schema)
+    qtable = _qtable(schema, staging_table)
+    qzip = _quote_ident(zip_column)
+    qlat = _quote_ident(latitude_column)
+    qlon = _quote_ident(longitude_column)
+    source_filters = [
+        f"NULLIF(trim(COALESCE(s.{qzip}::text, '')), '') IS NULL",
+        f"s.{qlat} IS NOT NULL",
+        f"s.{qlon} IS NOT NULL",
+        f"s.{qlat}::double precision BETWEEN -90 AND 90",
+        f"s.{qlon}::double precision BETWEEN -180 AND 180",
+    ]
+    if has_address_key and only_null_address_key:
+        source_filters.append("s.address_key IS NULL")
+    if shards > 1:
+        source_filters.append("mod(abs(hashtext(s.ctid::text)::bigint), :shards) = :shard")
+    source_where = "\n              AND ".join(source_filters)
+    target_filters = [
+        f"NULLIF(trim(COALESCE(target.{qzip}::text, '')), '') IS NULL",
+    ]
+    if has_address_key and only_null_address_key:
+        target_filters.append("target.address_key IS NULL")
+    target_where = "\n                   AND ".join(target_filters)
+
+    return f"""
+        WITH source_rows AS MATERIALIZED (
+            SELECT
+                s.ctid AS source_ctid,
+                {state_expr} AS raw_state,
+                {country_expr} AS raw_country,
+                s.{qlat}::double precision AS latitude,
+                s.{qlon}::double precision AS longitude
+              FROM {qtable} AS s
+             WHERE {source_where}
+        ),
+        normalized AS MATERIALIZED (
+            SELECT
+                source_ctid,
+                {qschema}.addr_state_code_v1(raw_state) AS state_code,
+                {qschema}.addr_country_code_v1(raw_country) AS country_code,
+                latitude,
+                longitude
+              FROM source_rows
+        ),
+        matches AS (
+            SELECT
+                normalized.source_ctid,
+                z.zcta5ce AS zip5
+              FROM normalized
+              JOIN tiger.zcta5 AS z
+                ON ST_Covers(
+                    z.the_geom,
+                    ST_SetSRID(ST_Point(normalized.longitude, normalized.latitude), 4269)
+                )
+              JOIN {qschema}.geo_zip_lookup AS zip_lookup
+                ON zip_lookup.zip_code = z.zcta5ce
+               AND zip_lookup.state = normalized.state_code
+             WHERE normalized.country_code = 'US'
+               AND normalized.state_code IS NOT NULL
+        ),
+        unique_matches AS (
+            SELECT source_ctid, min(zip5) AS zip5
+              FROM matches
+             GROUP BY source_ctid
+            HAVING count(DISTINCT zip5) = 1
+        )
+        UPDATE {qtable} AS target
+           SET {qzip} = unique_matches.zip5
+          FROM unique_matches
+         WHERE target.ctid = unique_matches.source_ctid
+           AND {target_where};
+    """
+
+
+async def restore_missing_zip_from_tiger_zcta(
+    staging_table: str,
+    field_map: Mapping[str, str],
+    *,
+    schema: str | None = None,
+    shards: int = 8,
+    concurrency: int | None = None,
+    cancel_check: Callable[[], Awaitable[None]] | None = None,
+    only_null_address_key: bool = True,
+) -> int:
+    """Restore blank source ZIPs from safe, unique point-in-ZCTA matches.
+
+    This intentionally mutates only the incoming staging table before canonical
+    keys are computed. Existing keyed rows are left alone when address_key is
+    present, avoiding silent archive identity rewrites.
+    """
+
+    if not _env_bool(ADDRESS_ZIP_RESTORE_ENABLED_ENV, default=True):
+        return 0
+    if not hasattr(db, "transaction"):
+        return 0
+    schema = schema or _schema_name()
+    zip_column = _simple_column_name(field_map.get("zip"))
+    if zip_column is None:
+        return 0
+
+    env_shards = os.getenv(ADDRESS_ZIP_RESTORE_SHARDS_ENV)
+    if env_shards not in (None, ""):
+        shards = int(env_shards)
+    shards = int(shards or 1)
+    if shards <= 0:
+        raise ValueError(f"{ADDRESS_ZIP_RESTORE_SHARDS_ENV} must be a positive integer")
+    shards = max(shards, 1)
+    if concurrency is None:
+        concurrency = _positive_env_int(ADDRESS_ZIP_RESTORE_CONCURRENCY_ENV, min(shards, 4))
+    concurrency = min(max(int(concurrency or 1), 1), shards)
+
+    async with db.transaction() as session:
+        if not await _table_exists_in_session(session, schema, staging_table):
+            return 0
+        if not await _table_has_column_in_session(session, schema, staging_table, zip_column):
+            return 0
+        latitude_column = await _first_existing_column_in_session(
+            session,
+            schema,
+            staging_table,
+            _LATITUDE_COLUMN_CANDIDATES,
+        )
+        longitude_column = await _first_existing_column_in_session(
+            session,
+            schema,
+            staging_table,
+            _LONGITUDE_COLUMN_CANDIDATES,
+        )
+        if latitude_column is None or longitude_column is None:
+            return 0
+        has_address_key = await _table_has_column_in_session(session, schema, staging_table, "address_key")
+        dependencies_available = await _zip_restore_dependencies_available(session, schema)
+
+    if not dependencies_available:
+        message = "TIGER ZCTA or geo_zip_lookup is unavailable for address ZIP restore"
+        if _env_bool(ADDRESS_ZIP_RESTORE_REQUIRED_ENV, default=False):
+            raise RuntimeError(message)
+        logger.info("%s; skipping %s.%s", message, schema, staging_table)
+        return 0
+
+    _emit_progress(
+        phase="address ZIP restore",
+        unit="shard",
+        total=shards,
+        done=0,
+        pct=0,
+        message="restoring missing source ZIPs from coordinates",
+    )
+    state_expr = _expr(field_map, "state")
+    country_expr = _expr(field_map, "country", "'US'")
+    semaphore = asyncio.Semaphore(concurrency)
+    progress_lock = asyncio.Lock()
+    completed = 0
+    restored = 0
+
+    async def _restore_shard(shard: int) -> None:
+        nonlocal completed, restored
+        async with semaphore:
+            if cancel_check:
+                await cancel_check()
+            rowcount = await db.status(
+                _zip_restore_sql(
+                    schema=schema,
+                    staging_table=staging_table,
+                    zip_column=zip_column,
+                    latitude_column=latitude_column,
+                    longitude_column=longitude_column,
+                    state_expr=state_expr,
+                    country_expr=country_expr,
+                    shards=shards,
+                    has_address_key=has_address_key,
+                    only_null_address_key=only_null_address_key,
+                ),
+                shards=shards,
+                shard=shard,
+            )
+            async with progress_lock:
+                restored += int(rowcount or 0)
+                completed += 1
+                _emit_progress(
+                    phase="address ZIP restore",
+                    unit="shard",
+                    total=shards,
+                    done=completed,
+                    pct=(completed / shards) * 100.0,
+                    message="restoring missing source ZIPs from coordinates",
+                )
+            await asyncio.sleep(0)
+
+    await asyncio.gather(*(_restore_shard(shard) for shard in range(shards)))
+    logger.info("Restored %d missing ZIPs for %s.%s from coordinates.", restored, schema, staging_table)
+    return restored
 
 
 async def _select_canonical_archive_table(schema: str, requested: str) -> str:
@@ -1527,6 +1781,13 @@ async def resolve_into_archive(
     started = time.monotonic()
     schema = schema or _schema_name()
     archive_table = await _select_canonical_archive_table(schema, archive_table or archive_table_name())
+    await restore_missing_zip_from_tiger_zcta(
+        staging_table,
+        field_map,
+        schema=schema,
+        cancel_check=cancel_check,
+        only_null_address_key=True,
+    )
     first, second, city, state, zip_code, country = _address_sql(schema, field_map)
     staging = _qtable(schema, staging_table)
     archive = _qtable(schema, archive_table)

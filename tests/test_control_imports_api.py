@@ -83,6 +83,10 @@ def test_importer_registry_exposes_ptg_and_finish_lifecycle():
     assert any(param["name"] == "dry_run" and param["is_flag"] for param in items["address-archive-v2-migrate"]["params_schema"])
     assert any(param["name"] == "sample_limit" and param["type"] == "integer" for param in items["address-archive-v2-migrate"]["params_schema"])
     assert any(param["name"] == "source_concurrency" and param["type"] == "integer" for param in items["openaddresses"]["params_schema"])
+    assert any(param["name"] == "backfill_concurrency" and param["type"] == "integer" for param in items["openaddresses"]["params_schema"])
+    assert any(param["name"] == "backfill_zip_prefix_length" and param["type"] == "integer" for param in items["openaddresses"]["params_schema"])
+    assert any(param["name"] == "zip_restore_concurrency" and param["type"] == "integer" for param in items["openaddresses"]["params_schema"])
+    assert any(param["name"] == "zip_restore_shards" and param["type"] == "integer" for param in items["openaddresses"]["params_schema"])
     assert items["openaddresses"]["family"] == "geo"
     assert any(param["name"] == "import_id" and param["type"] == "text" for param in items["openaddresses"]["params_schema"])
     assert any(param["name"] == "local_files" and param["multiple"] for param in items["openaddresses"]["params_schema"])
@@ -130,6 +134,10 @@ def test_openaddresses_adapter_preserves_parallel_load_params():
             "resume_stage": True,
             "load_only": True,
             "batch_size": 10000,
+            "backfill_concurrency": 4,
+            "backfill_zip_prefix_length": 2,
+            "zip_restore_concurrency": 6,
+            "zip_restore_shards": 48,
         },
     )
 
@@ -143,6 +151,10 @@ def test_openaddresses_adapter_preserves_parallel_load_params():
         "resume_stage": True,
         "load_only": True,
         "batch_size": 10000,
+        "backfill_concurrency": 4,
+        "backfill_zip_prefix_length": 2,
+        "zip_restore_concurrency": 6,
+        "zip_restore_shards": 48,
     }
 
 

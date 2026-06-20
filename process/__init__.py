@@ -1121,6 +1121,10 @@ def ptg_address(test: bool):
 @click.option("--test-row-limit", type=int, help="Rows per source file in test mode.")
 @click.option("--backfill-state-code", help="State code for archive backfill sharding.")
 @click.option("--backfill-zip-prefix", help="ZIP prefix for archive backfill sharding.")
+@click.option("--backfill-concurrency", type=int, help="Number of archive backfill shards to process concurrently.")
+@click.option("--backfill-zip-prefix-length", type=int, help="ZIP prefix length for automatic archive backfill shards.")
+@click.option("--zip-restore-concurrency", type=int, help="Number of OpenAddresses ZIP restore shards to process concurrently.")
+@click.option("--zip-restore-shards", type=int, help="Number of OpenAddresses ZIP recovery buckets to stage.")
 def openaddresses(
     test: bool,
     backfill_only: bool,
@@ -1140,6 +1144,10 @@ def openaddresses(
     test_row_limit: int | None,
     backfill_state_code: str | None,
     backfill_zip_prefix: str | None,
+    backfill_concurrency: int | None,
+    backfill_zip_prefix_length: int | None,
+    zip_restore_concurrency: int | None,
+    zip_restore_shards: int | None,
 ):
     _run(
         initiate_openaddresses(
@@ -1161,6 +1169,10 @@ def openaddresses(
             test_row_limit=test_row_limit,
             backfill_state_code=backfill_state_code,
             backfill_zip_prefix=backfill_zip_prefix,
+            backfill_concurrency=backfill_concurrency,
+            backfill_zip_prefix_length=backfill_zip_prefix_length,
+            zip_restore_concurrency=zip_restore_concurrency,
+            zip_restore_shards=zip_restore_shards,
         )
     )
 

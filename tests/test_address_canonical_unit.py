@@ -703,6 +703,108 @@ async def test_stamp_address_keys_clamps_concurrency_to_db_pool(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_restore_missing_zip_from_tiger_zcta_uses_unique_state_checked_point_match(monkeypatch):
+    statements = []
+    progress = []
+    active = 0
+    max_active = 0
+
+    class _FakeResult:
+        def __init__(self, value=None):
+            self._value = value
+
+        def scalar(self):
+            return self._value
+
+    class _FakeSession:
+        async def execute(self, sql, params=None):
+            sql_text = str(sql)
+            if "to_regclass" in sql_text:
+                return _FakeResult(True)
+            if "information_schema.columns" in sql_text:
+                column = (params or {}).get("column")
+                return _FakeResult(column in {"postal_code", "lat", "long", "address_key"})
+            return _FakeResult()
+
+    class _FakeTransaction:
+        async def __aenter__(self):
+            return _FakeSession()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class _FakeDB:
+        def transaction(self):
+            return _FakeTransaction()
+
+        async def status(self, sql, **kwargs):
+            nonlocal active, max_active
+            statements.append((sql, kwargs))
+            active += 1
+            max_active = max(max_active, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+            return 2
+
+    monkeypatch.setattr(address_canon, "db", _FakeDB())
+    monkeypatch.setattr(address_canon, "enqueue_live_progress", lambda **payload: progress.append(payload))
+
+    restored = await address_canon.restore_missing_zip_from_tiger_zcta(
+        "address_stage",
+        {
+            "state": "state_name",
+            "zip": "postal_code",
+            "country": "'US'",
+        },
+        schema="mrf",
+        shards=4,
+        concurrency=2,
+    )
+
+    assert restored == 8
+    assert len(statements) == 4
+    assert max_active == 2
+    sql = statements[0][0]
+    assert 'UPDATE "mrf"."address_stage" AS target' in sql
+    assert 'SET "postal_code" = unique_matches.zip5' in sql
+    assert "ST_Covers(" in sql
+    assert "JOIN tiger.zcta5 AS z" in sql
+    assert 'JOIN "mrf".geo_zip_lookup AS zip_lookup' in sql
+    assert "zip_lookup.state = normalized.state_code" in sql
+    assert "HAVING count(DISTINCT zip5) = 1" in sql
+    assert "s.address_key IS NULL" in sql
+    assert "target.address_key IS NULL" in sql
+    assert sorted(kwargs["shard"] for _sql, kwargs in statements) == [0, 1, 2, 3]
+    assert progress[-1]["phase"] == "address ZIP restore"
+    assert progress[-1]["pct"] == 100.0
+
+
+@pytest.mark.asyncio
+async def test_restore_missing_zip_skips_unsafe_zip_expression(monkeypatch):
+    calls = []
+
+    class _FakeDB:
+        def transaction(self):
+            calls.append("transaction")
+            raise AssertionError("unsafe ZIP expression should skip before DB access")
+
+    monkeypatch.setattr(address_canon, "db", _FakeDB())
+
+    restored = await address_canon.restore_missing_zip_from_tiger_zcta(
+        "address_stage",
+        {
+            "state": "state_name",
+            "zip": "NULL",
+            "country": "'US'",
+        },
+        schema="mrf",
+    )
+
+    assert restored == 0
+    assert calls == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("override", ["0", "-2", "not-an-int"])
 async def test_stamp_address_keys_rejects_invalid_env_concurrency(monkeypatch, override):
     monkeypatch.setenv("HLTHPRT_ADDRESS_CANON_STAMP_CONCURRENCY", override)

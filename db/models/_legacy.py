@@ -1236,7 +1236,37 @@ class OpenAddressesGeocode(Base, JSONOutputMixin):
     city_name = Column(TEXT)
     state_code = Column(String(2), nullable=False)
     zip5 = Column(String(5), nullable=False)
+    zip5_source = Column(TEXT)
+    zip5_restored_at = Column(TIMESTAMP(timezone=True))
     formatted_address = Column(TEXT)
+    lat = Column(Numeric(scale=8, precision=11, asdecimal=False, decimal_return_scale=None), nullable=False)
+    long = Column(Numeric(scale=8, precision=11, asdecimal=False, decimal_return_scale=None), nullable=False)
+    source = Column(TEXT)
+    data_id = Column(Integer)
+    job_id = Column(Integer)
+    feature_id = Column(TEXT)
+    accuracy = Column(TEXT)
+    source_updated = Column(TIMESTAMP(timezone=True))
+    imported_at = Column(TIMESTAMP(timezone=True), nullable=False)
+
+
+class OpenAddressesZipRecovery(Base, JSONOutputMixin):
+    __tablename__ = "openaddresses_zip_recovery"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("raw_hash"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["raw_hash"]
+
+    raw_hash = Column(String(64), nullable=False)
+    restore_bucket = Column(Integer, nullable=False)
+    house_number = Column(TEXT, nullable=False)
+    street_match_key = Column(TEXT, nullable=False)
+    street_name = Column(TEXT, nullable=False)
+    unit = Column(TEXT)
+    city_name = Column(TEXT)
+    state_code = Column(String(2), nullable=False)
     lat = Column(Numeric(scale=8, precision=11, asdecimal=False, decimal_return_scale=None), nullable=False)
     long = Column(Numeric(scale=8, precision=11, asdecimal=False, decimal_return_scale=None), nullable=False)
     source = Column(TEXT)

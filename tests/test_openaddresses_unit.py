@@ -40,6 +40,42 @@ def test_openaddresses_record_uses_us_source_state_and_canonical_keys():
     assert record["state_code"] == "TX"
     assert record["zip5"] == "78701"
     assert record["address_key"] is not None
+    assert record["zip5_source"] == "openaddresses_postcode"
+    assert record["zip5_restored_at"] is None
+
+
+def test_openaddresses_missing_zip_point_is_staged_for_zip_recovery():
+    feature = {
+        "type": "Feature",
+        "properties": {
+            "number": "123",
+            "street": "Main Street",
+            "unit": "Suite 200",
+            "city": "Austin",
+            "region": "TX",
+            "id": "OA-1",
+            "accuracy": "rooftop",
+        },
+        "geometry": {"type": "Point", "coordinates": [-97.7431, 30.2672]},
+    }
+
+    record, reason = openaddresses._zip_recovery_record_from_feature(  # pylint: disable=protected-access
+        feature,
+        source="us/tx/austin",
+        data_id=10,
+        job_id=20,
+        updated=1781288662893,
+        restore_shards=16,
+    )
+
+    assert reason == "missing_zip5"
+    assert record is not None
+    assert record["house_number"] == "123"
+    assert record["street_match_key"] == "mainst"
+    assert record["state_code"] == "TX"
+    assert record["lat"] == 30.2672
+    assert record["long"] == -97.7431
+    assert 0 <= record["restore_bucket"] < 16
 
 
 def test_openaddresses_record_rejects_non_us_coordinates():
@@ -211,6 +247,41 @@ def test_openaddresses_load_progress_payload(monkeypatch):
     ]
 
 
+def test_openaddresses_backfill_progress_payload(monkeypatch):
+    events = []
+    monkeypatch.setattr(openaddresses, "enqueue_live_progress", lambda **payload: events.append(payload))
+
+    openaddresses._emit_backfill_progress(  # pylint: disable=protected-access
+        completed_shards=2,
+        total_shards=5,
+        stats=openaddresses.OpenAddressesBackfillStats(exact_updates=3, fuzzy_updates=2, relaxed_updates=1),
+        label="TX ZIP 75*",
+        total_candidates=1234,
+        run_id="run_openaddresses",
+    )
+
+    assert events == [
+        {
+            "run_id": "run_openaddresses",
+            "importer": "openaddresses",
+            "status": "running",
+            "unit": "shards",
+            "done": 2,
+            "total": 5,
+            "pct": 40.0,
+            "phase": "backfilling address archive from OpenAddresses",
+            "message": (
+                "2/5 shards; 6 archive rows updated "
+                "(exact=3, fuzzy=2, relaxed=1); 1,234 candidate rows"
+            ),
+            "label": "TX ZIP 75*",
+            "step": "TX ZIP 75*",
+            "source": "openaddresses-backfill-progress",
+            "confidence": "live",
+        }
+    ]
+
+
 def test_openaddresses_progress_run_id_prefers_task_then_context():
     assert (
         openaddresses._progress_run_id(  # pylint: disable=protected-access
@@ -233,6 +304,89 @@ def test_openaddresses_progress_run_id_prefers_task_then_context():
         )
         == "run_nested"
     )
+
+
+@pytest.mark.asyncio
+async def test_openaddresses_backfill_plans_state_zip_prefix_shards(monkeypatch):
+    seen = {}
+
+    class FakeDb:
+        async def all(self, stmt, **params):
+            seen["stmt"] = stmt
+            seen["params"] = params
+            return [
+                {"state_code": "TX", "zip_prefix": "75", "candidate_count": 100},
+                {"state_code": "CA", "zip_prefix": "90", "candidate_count": 50},
+            ]
+
+    monkeypatch.setattr(openaddresses, "db", FakeDb())
+
+    shards = await openaddresses._plan_openaddresses_backfill_shards(  # pylint: disable=protected-access
+        schema="mrf",
+        archive_table="address_archive_v2",
+        zip_prefix_length=2,
+    )
+
+    assert seen["params"] == {"backfill_state_code": None, "backfill_zip_prefix_length": 2}
+    assert "substring(zip5 from 1 for :backfill_zip_prefix_length)" in seen["stmt"]
+    assert shards == [
+        openaddresses.OpenAddressesBackfillShard(state_code="TX", zip_prefix="75", candidate_count=100),
+        openaddresses.OpenAddressesBackfillShard(state_code="CA", zip_prefix="90", candidate_count=50),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_openaddresses_sharded_backfill_uses_bounded_concurrency_and_aggregates(monkeypatch):
+    active = 0
+    max_active = 0
+    progress = []
+    shards = [
+        openaddresses.OpenAddressesBackfillShard(state_code="TX", zip_prefix="75", candidate_count=10),
+        openaddresses.OpenAddressesBackfillShard(state_code="CA", zip_prefix="90", candidate_count=20),
+        openaddresses.OpenAddressesBackfillShard(state_code="NY", zip_prefix="10", candidate_count=30),
+    ]
+
+    async def fake_table_exists(_schema, _table):
+        return True
+
+    async def fake_table_has_column(_schema, _table, _column):
+        return True
+
+    async def fake_plan(**_kwargs):
+        return shards
+
+    async def fake_refresh(**kwargs):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return openaddresses.OpenAddressesBackfillStats(
+            exact_updates=int(kwargs["zip_prefix"]),
+            fuzzy_updates=1,
+            relaxed_updates=2,
+        )
+
+    monkeypatch.setattr(openaddresses, "_table_exists", fake_table_exists)
+    monkeypatch.setattr(openaddresses, "_table_has_column", fake_table_has_column)
+    monkeypatch.setattr(openaddresses, "_plan_openaddresses_backfill_shards", fake_plan)
+    monkeypatch.setattr(openaddresses, "refresh_archive_geocodes_from_openaddresses", fake_refresh)
+    monkeypatch.setattr(openaddresses, "enqueue_live_progress", lambda **payload: progress.append(payload))
+
+    stats = await openaddresses.refresh_archive_geocodes_from_openaddresses_sharded(
+        schema="mrf",
+        concurrency=2,
+        run_id="run_openaddresses",
+    )
+
+    assert max_active == 2
+    assert stats == openaddresses.OpenAddressesBackfillStats(
+        exact_updates=175,
+        fuzzy_updates=3,
+        relaxed_updates=6,
+    )
+    assert [event["done"] for event in progress] == [0, 1, 2, 3]
+    assert all(event["run_id"] == "run_openaddresses" for event in progress)
 
 
 class _FakeDownloadContent:
@@ -351,7 +505,11 @@ async def test_openaddresses_repairs_legacy_stage_row_hash_width(monkeypatch):
         "mrf",
     )
 
-    assert statuses == ['ALTER TABLE "mrf"."openaddresses_geocode_202606151230024" ALTER COLUMN row_hash TYPE varchar(64);']
+    assert statuses == [
+        'ALTER TABLE "mrf"."openaddresses_geocode_202606151230024" ALTER COLUMN row_hash TYPE varchar(64);',
+        'ALTER TABLE "mrf"."openaddresses_geocode_202606151230024" ADD COLUMN IF NOT EXISTS zip5_source text;',
+        'ALTER TABLE "mrf"."openaddresses_geocode_202606151230024" ADD COLUMN IF NOT EXISTS zip5_restored_at timestamptz;',
+    ]
 
 
 @pytest.mark.asyncio
@@ -372,7 +530,10 @@ async def test_openaddresses_keeps_current_stage_row_hash_width(monkeypatch):
         "mrf",
     )
 
-    assert statuses == []
+    assert statuses == [
+        'ALTER TABLE "mrf"."openaddresses_geocode_202606151230024" ADD COLUMN IF NOT EXISTS zip5_source text;',
+        'ALTER TABLE "mrf"."openaddresses_geocode_202606151230024" ADD COLUMN IF NOT EXISTS zip5_restored_at timestamptz;',
+    ]
 
 
 @pytest.mark.asyncio
@@ -392,7 +553,7 @@ async def test_openaddresses_local_files_load_in_parallel(monkeypatch, tmp_path)
         max_active = max(max_active, active)
         await asyncio.sleep(0.01)
         active -= 1
-        return 10, 5
+        return 10, 5, 1, {"missing_zip5": 1, "not_point": 4}
 
     monkeypatch.setattr(openaddresses, "_load_file", fake_load_file)
     monkeypatch.setattr(openaddresses, "_emit_load_progress", lambda **_payload: None)
@@ -401,9 +562,19 @@ async def test_openaddresses_local_files_load_in_parallel(monkeypatch, tmp_path)
         {"context": {"test_mode": False}},
         {"local_files": [str(path) for path in paths], "source_concurrency": 3},
         object,
+        object,
     )
 
-    assert stats == {"processed_files": 3, "processed_rows": 30, "accepted_rows": 15}
+    assert stats == {
+        "processed_files": 3,
+        "processed_rows": 30,
+        "accepted_rows": 15,
+        "zip_recovery_rows": 3,
+        "rejected_rows": 12,
+        "rejection_counts": {"missing_zip5": 3, "not_point": 12},
+        "zip_restore_shards": 64,
+        "zip_restore_concurrency": openaddresses.DEFAULT_ZIP_RESTORE_CONCURRENCY,
+    }
     assert max_active > 1
 
 
@@ -425,7 +596,7 @@ async def test_openaddresses_remote_sources_load_in_parallel(monkeypatch):
         max_active = max(max_active, active)
         await asyncio.sleep(0.01)
         active -= 1
-        return kwargs["item"]["source"], 10, 5
+        return kwargs["item"]["source"], 10, 5, 1, {"missing_zip5": 1, "not_point": 4}
 
     monkeypatch.setenv("HLTHPRT_OPENADDRESSES_API_TOKEN", "test-token")
     monkeypatch.setattr(openaddresses, "_fetch_json", fake_fetch_json)
@@ -436,9 +607,19 @@ async def test_openaddresses_remote_sources_load_in_parallel(monkeypatch):
         {"context": {"test_mode": False}},
         {"source_concurrency": 3, "max_files": 3},
         object,
+        object,
     )
 
-    assert stats == {"processed_files": 3, "processed_rows": 30, "accepted_rows": 15}
+    assert stats == {
+        "processed_files": 3,
+        "processed_rows": 30,
+        "accepted_rows": 15,
+        "zip_recovery_rows": 3,
+        "rejected_rows": 12,
+        "rejection_counts": {"missing_zip5": 3, "not_point": 12},
+        "zip_restore_shards": 64,
+        "zip_restore_concurrency": openaddresses.DEFAULT_ZIP_RESTORE_CONCURRENCY,
+    }
     assert max_active > 1
 
 
@@ -461,7 +642,7 @@ async def test_openaddresses_remote_tempdir_ignores_cleanup_errors(monkeypatch, 
         return items
 
     async def fake_load_source_item(**kwargs):
-        return kwargs["item"]["source"], 10, 5
+        return kwargs["item"]["source"], 10, 5, 1, {"missing_zip5": 1, "not_point": 4}
 
     monkeypatch.setenv("HLTHPRT_OPENADDRESSES_API_TOKEN", "test-token")
     monkeypatch.setattr(openaddresses.tempfile, "TemporaryDirectory", FakeTemporaryDirectory)
@@ -473,9 +654,19 @@ async def test_openaddresses_remote_tempdir_ignores_cleanup_errors(monkeypatch, 
         {"context": {"test_mode": False}},
         {"source_concurrency": 1, "max_files": 1},
         object,
+        object,
     )
 
-    assert stats == {"processed_files": 1, "processed_rows": 10, "accepted_rows": 5}
+    assert stats == {
+        "processed_files": 1,
+        "processed_rows": 10,
+        "accepted_rows": 5,
+        "zip_recovery_rows": 1,
+        "rejected_rows": 4,
+        "rejection_counts": {"missing_zip5": 1, "not_point": 4},
+        "zip_restore_shards": 64,
+        "zip_restore_concurrency": openaddresses.DEFAULT_ZIP_RESTORE_CONCURRENCY,
+    }
     assert tempdir_kwargs == [{"ignore_cleanup_errors": True}]
 
 
@@ -499,7 +690,7 @@ async def test_openaddresses_remote_test_mode_honors_source_concurrency(monkeypa
         max_active = max(max_active, active)
         await asyncio.sleep(0.01)
         active -= 1
-        return kwargs["item"]["source"], 10, 5
+        return kwargs["item"]["source"], 10, 5, 1, {"missing_zip5": 1, "not_point": 4}
 
     monkeypatch.setenv("HLTHPRT_OPENADDRESSES_API_TOKEN", "test-token")
     monkeypatch.setattr(openaddresses, "_fetch_json", fake_fetch_json)
@@ -510,9 +701,19 @@ async def test_openaddresses_remote_test_mode_honors_source_concurrency(monkeypa
         {"context": {"test_mode": True}},
         {"source_concurrency": 2, "test_file_limit": 3, "test_row_limit": 10},
         object,
+        object,
     )
 
-    assert stats == {"processed_files": 3, "processed_rows": 30, "accepted_rows": 15}
+    assert stats == {
+        "processed_files": 3,
+        "processed_rows": 30,
+        "accepted_rows": 15,
+        "zip_recovery_rows": 3,
+        "rejected_rows": 12,
+        "rejection_counts": {"missing_zip5": 3, "not_point": 12},
+        "zip_restore_shards": 64,
+        "zip_restore_concurrency": openaddresses.DEFAULT_ZIP_RESTORE_CONCURRENCY,
+    }
     assert max_active > 1
 
 
@@ -544,8 +745,11 @@ async def test_openaddresses_shutdown_uses_job_import_id_from_shared_context(mon
     async def fake_create_indexes(table_name, schema):
         seen["create_indexes"] = (schema, table_name)
 
-    async def fake_refresh_archive_geocodes_from_openaddresses(**_kwargs):
+    async def fake_refresh_archive_geocodes_from_openaddresses_sharded(**_kwargs):
         return openaddresses.OpenAddressesBackfillStats(exact_updates=0, fuzzy_updates=0, relaxed_updates=0)
+
+    async def fake_restore_openaddresses_zip5_from_tiger_zcta(**_kwargs):
+        return openaddresses.OpenAddressesZipRestoreStats()
 
     class FakeTransaction:
         async def __aenter__(self):
@@ -555,7 +759,9 @@ async def test_openaddresses_shutdown_uses_job_import_id_from_shared_context(mon
             return False
 
     class FakeDb:
-        async def scalar(self, _stmt, **_params):
+        async def scalar(self, stmt, **_params):
+            if "WHERE zip5 IS NULL" in stmt:
+                return 0
             return 3
 
         async def execute_ddl(self, _stmt):
@@ -570,7 +776,16 @@ async def test_openaddresses_shutdown_uses_job_import_id_from_shared_context(mon
     monkeypatch.setattr(openaddresses, "ensure_database", fake_ensure_database)
     monkeypatch.setattr(openaddresses, "_table_exists", fake_table_exists)
     monkeypatch.setattr(openaddresses, "_create_indexes", fake_create_indexes)
-    monkeypatch.setattr(openaddresses, "refresh_archive_geocodes_from_openaddresses", fake_refresh_archive_geocodes_from_openaddresses)
+    monkeypatch.setattr(
+        openaddresses,
+        "refresh_archive_geocodes_from_openaddresses_sharded",
+        fake_refresh_archive_geocodes_from_openaddresses_sharded,
+    )
+    monkeypatch.setattr(
+        openaddresses,
+        "restore_openaddresses_zip5_from_tiger_zcta",
+        fake_restore_openaddresses_zip5_from_tiger_zcta,
+    )
     monkeypatch.setattr(openaddresses, "db", FakeDb())
     monkeypatch.setattr(openaddresses, "print_time_info", lambda _started_at: None)
 

@@ -21,7 +21,7 @@ import aiohttp
 import ijson
 from arq import create_pool
 
-from db.models import OpenAddressesGeocode, db
+from db.models import OpenAddressesGeocode, OpenAddressesZipRecovery, db
 from process.control_cancel import raise_if_cancelled
 from process.ext import address_canon
 from process.ext.utils import ensure_database, make_class, my_init_db, print_time_info, push_objects
@@ -39,6 +39,9 @@ DEFAULT_MIN_ROWS = 1000
 DEFAULT_TEST_FILE_LIMIT = 2
 DEFAULT_TEST_ROW_LIMIT = 1000
 DEFAULT_SOURCE_CONCURRENCY = 8
+DEFAULT_BACKFILL_CONCURRENCY = 4
+DEFAULT_BACKFILL_ZIP_PREFIX_LENGTH = 2
+DEFAULT_ZIP_RESTORE_CONCURRENCY = 8
 DEFAULT_FUZZY_THRESHOLD = 0.92
 DEFAULT_FUZZY_MARGIN = 0.08
 DEFAULT_RELAXED_STREET_THRESHOLD = 0.86
@@ -59,9 +62,35 @@ class OpenAddressesBackfillStats:
 
 
 @dataclass(frozen=True)
+class OpenAddressesZipRestoreStats:
+    candidates: int = 0
+    restored: int = 0
+    discarded: int = 0
+    shards: int = 0
+
+
+@dataclass(frozen=True)
+class OpenAddressesBackfillShard:
+    state_code: str | None
+    zip_prefix: str | None
+    candidate_count: int = 0
+
+    @property
+    def label(self) -> str:
+        parts = []
+        if self.state_code:
+            parts.append(self.state_code)
+        if self.zip_prefix:
+            parts.append(f"ZIP {self.zip_prefix}*")
+        return " ".join(parts) or "all"
+
+
+@dataclass(frozen=True)
 class _RecordBatch:
     processed: int
     rows: list[dict[str, Any]]
+    zip_recovery_rows: list[dict[str, Any]]
+    rejection_counts: dict[str, int]
 
 
 def _env_positive_int(name: str, default: int) -> int:
@@ -240,6 +269,125 @@ def _format_address(
 ) -> str:
     state_postal = " ".join(part for part in [state, zip5] if part)
     return ", ".join(part for part in [first_line, unit, city, state_postal] if part)
+
+
+def _openaddresses_row_hash(
+    *,
+    source: str | None,
+    feature_id: str | None,
+    house_number: str,
+    street_match: str,
+    city: str | None,
+    state: str,
+    zip5: str,
+    lat: float,
+    lon: float,
+) -> str:
+    return hashlib.sha256(
+        "|".join(
+            [
+                source or "",
+                feature_id or "",
+                house_number,
+                street_match,
+                city or "",
+                state,
+                zip5,
+                f"{lat:.8f}",
+                f"{lon:.8f}",
+            ]
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _openaddresses_recovery_hash(
+    *,
+    source: str | None,
+    feature_id: str | None,
+    house_number: str,
+    street_match: str,
+    city: str | None,
+    state: str,
+    lat: float,
+    lon: float,
+) -> str:
+    return hashlib.sha256(
+        "|".join(
+            [
+                source or "",
+                feature_id or "",
+                house_number,
+                street_match,
+                city or "",
+                state,
+                f"{lat:.8f}",
+                f"{lon:.8f}",
+            ]
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _zip_restore_bucket(raw_hash: str, shard_count: int) -> int:
+    bounded_shards = max(int(shard_count or 1), 1)
+    return int(str(raw_hash)[:16], 16) % bounded_shards
+
+
+def _feature_parts(
+    feature: dict[str, Any],
+    *,
+    source: str | None,
+    updated: Any,
+) -> tuple[dict[str, Any] | None, str | None]:
+    if not isinstance(feature, dict):
+        return None, "not_dict"
+    properties = feature.get("properties") or {}
+    geometry = feature.get("geometry") or {}
+    coordinates = geometry.get("coordinates") or []
+    if geometry.get("type") != "Point" or len(coordinates) < 2:
+        return None, "not_point"
+    parsed_coord = _valid_us_coordinate(coordinates[1], coordinates[0])
+    if not parsed_coord:
+        return None, "invalid_coordinate"
+    lat, lon = parsed_coord
+
+    house_number = _normalize_house_number(properties.get("number") or properties.get("addr:housenumber"))
+    street_name = _safe_text(properties.get("street") or properties.get("addr:street"))
+    street_match = _street_match_key(street_name)
+    state = (
+        address_canon.state_code(properties.get("region"))
+        or address_canon.state_code(properties.get("state"))
+        or _source_state(source)
+    )
+    zip5 = address_canon.zip5_norm(properties.get("postcode") or properties.get("zip"))
+    if not house_number:
+        return None, "missing_house_number"
+    if not street_name:
+        return None, "missing_street"
+    if not street_match:
+        return None, "missing_street_match_key"
+    if not state:
+        return None, "missing_state"
+
+    unit = _safe_text(properties.get("unit") or properties.get("addr:unit"))
+    city = _safe_text(properties.get("city"))
+    feature_id = _safe_text(properties.get("id") or properties.get("hash"))
+    parts = {
+        "house_number": house_number,
+        "street_name": street_name,
+        "street_match": street_match,
+        "state": state,
+        "zip5": zip5,
+        "unit": unit,
+        "city": city,
+        "feature_id": feature_id,
+        "lat": lat,
+        "lon": lon,
+        "accuracy": _safe_text(properties.get("accuracy")),
+        "source_updated": _source_updated(updated),
+    }
+    if not zip5:
+        return parts, "missing_zip5"
+    return parts, None
 
 
 def lookup_params_from_address(address: dict[str, Any]) -> dict[str, Any] | None:
@@ -430,52 +578,34 @@ def _record_from_feature(
     job_id: int | None,
     updated: Any,
 ) -> dict[str, Any] | None:
-    if not isinstance(feature, dict):
+    parts, reason = _feature_parts(feature, source=source, updated=updated)
+    if reason or not parts:
         return None
-    properties = feature.get("properties") or {}
-    geometry = feature.get("geometry") or {}
-    coordinates = geometry.get("coordinates") or []
-    if geometry.get("type") != "Point" or len(coordinates) < 2:
-        return None
-    parsed_coord = _valid_us_coordinate(coordinates[1], coordinates[0])
-    if not parsed_coord:
-        return None
-    lat, lon = parsed_coord
-
-    house_number = _normalize_house_number(properties.get("number") or properties.get("addr:housenumber"))
-    street_name = _safe_text(properties.get("street") or properties.get("addr:street"))
-    street_match = _street_match_key(street_name)
-    state = (
-        address_canon.state_code(properties.get("region"))
-        or address_canon.state_code(properties.get("state"))
-        or _source_state(source)
-    )
-    zip5 = address_canon.zip5_norm(properties.get("postcode") or properties.get("zip"))
-    if not (house_number and street_match and state and zip5 and street_name):
-        return None
-
-    unit = _safe_text(properties.get("unit") or properties.get("addr:unit"))
-    city = _safe_text(properties.get("city"))
+    house_number = parts["house_number"]
+    street_name = parts["street_name"]
+    street_match = parts["street_match"]
+    state = parts["state"]
+    zip5 = parts["zip5"]
+    unit = parts["unit"]
+    city = parts["city"]
+    lat = parts["lat"]
+    lon = parts["lon"]
     first_line = f"{house_number} {street_name}"
     identity_key = address_canon.identity_key_v1(first_line, unit, city, state, zip5, "US")
     address_key = address_canon.address_key_v1(first_line, unit, city, state, zip5, "US")
     formatted_address = _format_address(first_line=first_line, unit=unit, city=city, state=state, zip5=zip5)
-    feature_id = _safe_text(properties.get("id") or properties.get("hash"))
-    row_hash = hashlib.sha256(
-        "|".join(
-            [
-                source or "",
-                feature_id or "",
-                house_number,
-                street_match,
-                city or "",
-                state,
-                zip5,
-                f"{lat:.8f}",
-                f"{lon:.8f}",
-            ]
-        ).encode("utf-8")
-    ).hexdigest()
+    feature_id = parts["feature_id"]
+    row_hash = _openaddresses_row_hash(
+        source=source,
+        feature_id=feature_id,
+        house_number=house_number,
+        street_match=street_match,
+        city=city,
+        state=state,
+        zip5=zip5,
+        lat=lat,
+        lon=lon,
+    )
     return {
         "row_hash": row_hash,
         "address_key": address_key,
@@ -487,6 +617,8 @@ def _record_from_feature(
         "city_name": city,
         "state_code": state,
         "zip5": zip5,
+        "zip5_source": "openaddresses_postcode",
+        "zip5_restored_at": None,
         "formatted_address": formatted_address,
         "lat": lat,
         "long": lon,
@@ -494,10 +626,53 @@ def _record_from_feature(
         "data_id": data_id,
         "job_id": job_id,
         "feature_id": feature_id,
-        "accuracy": _safe_text(properties.get("accuracy")),
-        "source_updated": _source_updated(updated),
+        "accuracy": parts["accuracy"],
+        "source_updated": parts["source_updated"],
         "imported_at": datetime.datetime.now(datetime.timezone.utc),
     }
+
+
+def _zip_recovery_record_from_feature(
+    feature: dict[str, Any],
+    *,
+    source: str | None,
+    data_id: int | None,
+    job_id: int | None,
+    updated: Any,
+    restore_shards: int,
+) -> tuple[dict[str, Any] | None, str | None]:
+    parts, reason = _feature_parts(feature, source=source, updated=updated)
+    if reason != "missing_zip5" or not parts:
+        return None, reason
+    raw_hash = _openaddresses_recovery_hash(
+        source=source,
+        feature_id=parts["feature_id"],
+        house_number=parts["house_number"],
+        street_match=parts["street_match"],
+        city=parts["city"],
+        state=parts["state"],
+        lat=parts["lat"],
+        lon=parts["lon"],
+    )
+    return {
+        "raw_hash": raw_hash,
+        "restore_bucket": _zip_restore_bucket(raw_hash, restore_shards),
+        "house_number": parts["house_number"],
+        "street_match_key": parts["street_match"],
+        "street_name": parts["street_name"],
+        "unit": parts["unit"],
+        "city_name": parts["city"],
+        "state_code": parts["state"],
+        "lat": parts["lat"],
+        "long": parts["lon"],
+        "source": source,
+        "data_id": data_id,
+        "job_id": job_id,
+        "feature_id": parts["feature_id"],
+        "accuracy": parts["accuracy"],
+        "source_updated": parts["source_updated"],
+        "imported_at": datetime.datetime.now(datetime.timezone.utc),
+    }, reason
 
 
 def _open_geojson(path: Path):
@@ -562,6 +737,15 @@ async def _flush_rows(rows: list[dict[str, Any]], stage_cls) -> int:
     return accepted
 
 
+async def _flush_zip_recovery_rows(rows: list[dict[str, Any]], recovery_cls) -> int:
+    if not rows:
+        return 0
+    accepted = len(rows)
+    await push_objects(rows, recovery_cls, rewrite=True, use_copy=True)
+    rows.clear()
+    return accepted
+
+
 async def _fetch_json(client: aiohttp.ClientSession, url: str, token: str | None) -> Any:
     headers = {"Authorization": f"Bearer {token}"} if token else None
     async with client.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=120)) as response:
@@ -585,9 +769,12 @@ def _iter_record_batches(
     job_id: int | None = None,
     updated: Any = None,
     row_limit: int | None = None,
+    restore_shards: int = 1,
 ) -> Iterable[_RecordBatch]:
     processed = 0
     rows: list[dict[str, Any]] = []
+    zip_recovery_rows: list[dict[str, Any]] = []
+    rejection_counts: dict[str, int] = {}
     for feature in _iter_geojson_features(path):
         processed += 1
         record = _record_from_feature(
@@ -599,13 +786,37 @@ def _iter_record_batches(
         )
         if record:
             rows.append(record)
-        if len(rows) >= batch_size:
-            yield _RecordBatch(processed=processed, rows=rows)
+        else:
+            recovery_record, reason = _zip_recovery_record_from_feature(
+                feature,
+                source=source,
+                data_id=data_id,
+                job_id=job_id,
+                updated=updated,
+                restore_shards=restore_shards,
+            )
+            if recovery_record:
+                zip_recovery_rows.append(recovery_record)
+            rejection_counts[reason or "rejected"] = rejection_counts.get(reason or "rejected", 0) + 1
+        if len(rows) >= batch_size or len(zip_recovery_rows) >= batch_size:
+            yield _RecordBatch(
+                processed=processed,
+                rows=rows,
+                zip_recovery_rows=zip_recovery_rows,
+                rejection_counts=rejection_counts,
+            )
             rows = []
+            zip_recovery_rows = []
+            rejection_counts = {}
         if row_limit and processed >= row_limit:
             break
-    if rows or processed:
-        yield _RecordBatch(processed=processed, rows=rows)
+    if rows or zip_recovery_rows or processed:
+        yield _RecordBatch(
+            processed=processed,
+            rows=rows,
+            zip_recovery_rows=zip_recovery_rows,
+            rejection_counts=rejection_counts,
+        )
 
 
 def _next_record_batch(iterator: Iterable[_RecordBatch]) -> _RecordBatch | None:
@@ -750,6 +961,19 @@ def _task_or_env_positive_int(task: dict[str, Any], key: str, env_name: str, def
     return _env_positive_int(env_name, default)
 
 
+def _task_or_env_int_range(
+    task: dict[str, Any],
+    key: str,
+    env_name: str,
+    default: int,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    value = _task_or_env_positive_int(task, key, env_name, default)
+    return min(max(value, minimum), maximum)
+
+
 def _task_or_env_bool(task: dict[str, Any], key: str, env_name: str, default: bool = False) -> bool:
     if key in task and task.get(key) is not None:
         value = task.get(key)
@@ -809,22 +1033,64 @@ def _emit_load_progress(
     enqueue_live_progress(**payload)
 
 
+def _emit_backfill_progress(
+    *,
+    completed_shards: int,
+    total_shards: int,
+    stats: OpenAddressesBackfillStats,
+    label: str | None = None,
+    total_candidates: int = 0,
+    run_id: str | None = None,
+) -> None:
+    total = max(int(total_shards or 0), 1)
+    done = max(int(completed_shards or 0), 0)
+    pct = min((done / total) * 100.0, 100.0)
+    updated = stats.exact_updates + stats.fuzzy_updates + stats.relaxed_updates
+    candidate_text = f"; {total_candidates:,} candidate rows" if total_candidates else ""
+    message = (
+        f"{done:,}/{total_shards:,} shards; {updated:,} archive rows updated "
+        f"(exact={stats.exact_updates:,}, fuzzy={stats.fuzzy_updates:,}, "
+        f"relaxed={stats.relaxed_updates:,}){candidate_text}"
+    )
+    payload = dict(
+        importer="openaddresses",
+        status="running",
+        unit="shards",
+        done=done,
+        total=total_shards,
+        pct=pct,
+        phase="backfilling address archive from OpenAddresses",
+        message=message,
+        label=label,
+        step=label,
+        source="openaddresses-backfill-progress",
+        confidence="live",
+    )
+    if run_id:
+        payload["run_id"] = run_id
+    enqueue_live_progress(**payload)
+
+
 async def _load_file(
     path: Path,
     *,
     stage_cls,
+    recovery_cls=None,
     batch_size: int,
     source: str | None = None,
     data_id: int | None = None,
     job_id: int | None = None,
     updated: Any = None,
     row_limit: int | None = None,
+    restore_shards: int = 1,
     ctx: dict[str, Any] | None = None,
     task: dict[str, Any] | None = None,
-) -> tuple[int, int]:
+) -> tuple[int, int, int, dict[str, int]]:
     await _maybe_raise_if_cancelled(ctx, task)
     accepted = 0
+    zip_recovery = 0
     processed = 0
+    rejection_counts: dict[str, int] = {}
     batch_iter = iter(
         _iter_record_batches(
             path,
@@ -834,6 +1100,7 @@ async def _load_file(
             job_id=job_id,
             updated=updated,
             row_limit=row_limit,
+            restore_shards=restore_shards,
         )
     )
     while True:
@@ -842,8 +1109,12 @@ async def _load_file(
             break
         processed = batch.processed
         accepted += await _flush_rows(batch.rows, stage_cls)
+        if recovery_cls is not None:
+            zip_recovery += await _flush_zip_recovery_rows(batch.zip_recovery_rows, recovery_cls)
+        for reason, count in batch.rejection_counts.items():
+            rejection_counts[reason] = rejection_counts.get(reason, 0) + count
         await _maybe_raise_if_cancelled(ctx, task)
-    return processed, accepted
+    return processed, accepted, zip_recovery, rejection_counts
 
 
 async def _load_source_item(
@@ -855,10 +1126,12 @@ async def _load_source_item(
     tmpdir_path: Path,
     token: str,
     stage_cls,
+    recovery_cls,
     batch_size: int,
     test_mode: bool,
     test_row_limit: int,
-) -> tuple[str, int, int]:
+    restore_shards: int,
+) -> tuple[str, int, int, int, dict[str, int]]:
     job_id = int(item["job"])
     data_id = int(item["id"])
     source = str(item.get("source") or "")
@@ -866,15 +1139,17 @@ async def _load_source_item(
     path = tmpdir_path / f"openaddresses-{data_id}-{job_id}.geojson.gz"
     logger.info("Downloading OpenAddresses source=%s job=%s", source, job_id)
     await _download_file(client, url, path, token, ctx=ctx, task=task)
-    file_processed, file_accepted = await _load_file(
+    file_processed, file_accepted, file_zip_recovery, rejection_counts = await _load_file(
         path,
         stage_cls=stage_cls,
+        recovery_cls=recovery_cls,
         batch_size=batch_size,
         source=source,
         data_id=data_id,
         job_id=job_id,
         updated=item.get("updated"),
         row_limit=test_row_limit if test_mode else None,
+        restore_shards=restore_shards,
         ctx=ctx,
         task=task,
     )
@@ -882,10 +1157,10 @@ async def _load_source_item(
         path.unlink()
     except FileNotFoundError:
         pass
-    return source, file_processed, file_accepted
+    return source, file_processed, file_accepted, file_zip_recovery, rejection_counts
 
 
-async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], stage_cls) -> dict[str, int]:
+async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], stage_cls, recovery_cls) -> dict[str, int]:
     await _maybe_raise_if_cancelled(ctx, task)
     test_mode = bool(ctx["context"].get("test_mode"))
     batch_size = _task_or_env_positive_int(task, "batch_size", "HLTHPRT_OPENADDRESSES_BATCH_SIZE", DEFAULT_BATCH_SIZE)
@@ -909,10 +1184,26 @@ async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], st
         DEFAULT_SOURCE_CONCURRENCY,
     )
     local_files = _local_files_from_task_or_env(task)
+    zip_restore_concurrency = _task_or_env_positive_int(
+        task,
+        "zip_restore_concurrency",
+        "HLTHPRT_OPENADDRESSES_ZIP_RESTORE_CONCURRENCY",
+        DEFAULT_ZIP_RESTORE_CONCURRENCY,
+    )
+    restore_shards = _task_or_env_positive_int(
+        task,
+        "zip_restore_shards",
+        "HLTHPRT_OPENADDRESSES_ZIP_RESTORE_SHARDS",
+        max(zip_restore_concurrency * 8, 64),
+    )
+    ctx["context"]["zip_restore_concurrency"] = zip_restore_concurrency
+    ctx["context"]["zip_restore_shards"] = restore_shards
 
     processed_files = 0
     processed_rows = 0
     accepted_rows = 0
+    zip_recovery_rows = 0
+    rejection_counts: dict[str, int] = {}
     progress_run_id = _progress_run_id(ctx, task)
     timeout = aiohttp.ClientTimeout(total=120, connect=30, sock_read=120)
 
@@ -934,7 +1225,7 @@ async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], st
             queue.put_nowait((source_index, path))
 
         async def local_worker(worker_id: int) -> None:
-            nonlocal processed_files, processed_rows, accepted_rows
+            nonlocal processed_files, processed_rows, accepted_rows, zip_recovery_rows, rejection_counts
             while True:
                 await _maybe_raise_if_cancelled(ctx, task)
                 try:
@@ -944,12 +1235,14 @@ async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], st
                 try:
                     if not path.exists():
                         raise FileNotFoundError(f"OpenAddresses local file not found: {path}")
-                    file_processed, file_accepted = await _load_file(
+                    file_processed, file_accepted, file_zip_recovery, file_rejection_counts = await _load_file(
                         path,
                         stage_cls=stage_cls,
+                        recovery_cls=recovery_cls,
                         batch_size=batch_size,
                         source="local/openaddresses",
                         row_limit=test_row_limit if test_mode else None,
+                        restore_shards=restore_shards,
                         ctx=ctx,
                         task=task,
                     )
@@ -958,11 +1251,15 @@ async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], st
                         processed_files += 1
                         processed_rows += file_processed
                         accepted_rows += file_accepted
+                        zip_recovery_rows += file_zip_recovery
+                        for reason, count in file_rejection_counts.items():
+                            rejection_counts[reason] = rejection_counts.get(reason, 0) + count
                         print(
                             "OpenAddresses local source "
                             f"{processed_files:,}/{total_files:,} "
                             f"index={source_index:,} worker={worker_id} {path}: "
                             f"processed={file_processed:,} accepted={file_accepted:,} "
+                            f"zip_recovery={file_zip_recovery:,} "
                             f"accepted_total={accepted_rows:,}",
                             flush=True,
                         )
@@ -985,6 +1282,11 @@ async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], st
             "processed_files": processed_files,
             "processed_rows": processed_rows,
             "accepted_rows": accepted_rows,
+            "zip_recovery_rows": zip_recovery_rows,
+            "rejected_rows": max(processed_rows - accepted_rows - zip_recovery_rows, 0),
+            "rejection_counts": rejection_counts,
+            "zip_restore_shards": restore_shards,
+            "zip_restore_concurrency": zip_restore_concurrency,
         }
 
     token = os.getenv("HLTHPRT_OPENADDRESSES_API_TOKEN", "").strip()
@@ -1064,7 +1366,7 @@ async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], st
                 queue.put_nowait((source_index, item))
 
             async def worker(worker_id: int) -> None:
-                nonlocal processed_files, processed_rows, accepted_rows
+                nonlocal processed_files, processed_rows, accepted_rows, zip_recovery_rows, rejection_counts
                 while True:
                     await _maybe_raise_if_cancelled(ctx, task)
                     try:
@@ -1072,7 +1374,13 @@ async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], st
                     except asyncio.QueueEmpty:
                         return
                     try:
-                        source, file_processed, file_accepted = await _load_source_item(
+                        (
+                            source,
+                            file_processed,
+                            file_accepted,
+                            file_zip_recovery,
+                            file_rejection_counts,
+                        ) = await _load_source_item(
                             ctx=ctx,
                             task=task,
                             client=client,
@@ -1080,20 +1388,26 @@ async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], st
                             tmpdir_path=tmpdir_path,
                             token=token,
                             stage_cls=stage_cls,
+                            recovery_cls=recovery_cls,
                             batch_size=batch_size,
                             test_mode=test_mode,
                             test_row_limit=test_row_limit,
+                            restore_shards=restore_shards,
                         )
                         async with progress_lock:
                             await _maybe_raise_if_cancelled(ctx, task)
                             processed_files += 1
                             processed_rows += file_processed
                             accepted_rows += file_accepted
+                            zip_recovery_rows += file_zip_recovery
+                            for reason, count in file_rejection_counts.items():
+                                rejection_counts[reason] = rejection_counts.get(reason, 0) + count
                             print(
                                 "OpenAddresses source "
                                 f"{processed_files:,}/{total_files:,} "
                                 f"index={source_index:,} worker={worker_id} {source}: "
                                 f"processed={file_processed:,} accepted={file_accepted:,} "
+                                f"zip_recovery={file_zip_recovery:,} "
                                 f"accepted_total={accepted_rows:,}",
                                 flush=True,
                             )
@@ -1116,6 +1430,11 @@ async def _load_openaddresses_data(ctx: dict[str, Any], task: dict[str, Any], st
         "processed_files": processed_files,
         "processed_rows": processed_rows,
         "accepted_rows": accepted_rows,
+        "zip_recovery_rows": zip_recovery_rows,
+        "rejected_rows": max(processed_rows - accepted_rows - zip_recovery_rows, 0),
+        "rejection_counts": rejection_counts,
+        "zip_restore_shards": restore_shards,
+        "zip_restore_concurrency": zip_restore_concurrency,
     }
 
 
@@ -1129,6 +1448,24 @@ async def _create_indexes(table_name: str, schema: str) -> None:
             f"CREATE INDEX IF NOT EXISTS {_quote_ident(bounded_index_name)} "
             f"ON {table} ({', '.join(index.get('index_elements'))}){where};"
         )
+
+
+def _zip_recovery_table_name(stage_table: str) -> str:
+    prefix = f"{OPENADDRESSES_TABLE}_"
+    suffix = stage_table[len(prefix):] if stage_table.startswith(prefix) else stage_table
+    return _bounded_identifier(f"{OpenAddressesZipRecovery.__tablename__}_{suffix}")
+
+
+async def _create_zip_recovery_indexes(table_name: str, schema: str) -> None:
+    table = _qtable(schema, table_name)
+    await db.status(
+        f"CREATE INDEX IF NOT EXISTS {_quote_ident(_bounded_identifier(f'{table_name}_idx_restore_bucket'))} "
+        f"ON {table} (restore_bucket);"
+    )
+    await db.status(
+        f"CREATE INDEX IF NOT EXISTS {_quote_ident(_bounded_identifier(f'{table_name}_idx_state_bucket'))} "
+        f"ON {table} (state_code, restore_bucket);"
+    )
 
 
 async def _ensure_openaddresses_stage_schema(table_name: str, schema: str) -> None:
@@ -1153,6 +1490,264 @@ async def _ensure_openaddresses_stage_schema(table_name: str, schema: str) -> No
     max_length = row_hash_mapping["character_maximum_length"]
     if data_type in {"character varying", "character"} and (max_length is None or int(max_length) < 64):
         await db.status(f"ALTER TABLE {table} ALTER COLUMN row_hash TYPE varchar(64);")
+    await db.status(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS zip5_source text;")
+    await db.status(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS zip5_restored_at timestamptz;")
+
+
+async def _prepare_zip_recovery_table(recovery_cls, schema: str, *, reset: bool) -> None:
+    await db.status(f"CREATE SCHEMA IF NOT EXISTS {_quote_ident(schema)};")
+    exists = await _table_exists(schema, recovery_cls.__tablename__)
+    if reset:
+        await db.status(f"DROP TABLE IF EXISTS {_qtable(schema, recovery_cls.__tablename__)};")
+        await db.create_table(recovery_cls.__table__, checkfirst=True)
+    elif exists:
+        print(f"OpenAddresses resume: preserving existing ZIP recovery table {schema}.{recovery_cls.__tablename__}", flush=True)
+    else:
+        await db.create_table(recovery_cls.__table__, checkfirst=True)
+
+
+def _emit_zip_restore_progress(
+    *,
+    completed_shards: int,
+    total_shards: int,
+    candidates: int,
+    restored: int,
+    label: str | None = None,
+    run_id: str | None = None,
+) -> None:
+    total = max(int(total_shards or 0), 1)
+    done = max(int(completed_shards or 0), 0)
+    pct = min((done / total) * 100.0, 100.0)
+    message = (
+        f"{done:,}/{total_shards:,} ZIP restore shards; "
+        f"{restored:,}/{candidates:,} candidates restored"
+    )
+    payload = dict(
+        importer="openaddresses",
+        status="running",
+        unit="shards",
+        done=done,
+        total=total_shards,
+        pct=pct,
+        phase="restoring missing OpenAddresses ZIPs from TIGER ZCTA",
+        message=message,
+        label=label,
+        step=label,
+        source="openaddresses-zip-restore-progress",
+        confidence="live",
+    )
+    if run_id:
+        payload["run_id"] = run_id
+    enqueue_live_progress(**payload)
+
+
+def _openaddresses_zip_restore_insert_sql(schema: str, stage_table: str, recovery_table: str) -> str:
+    stage = _qtable(schema, stage_table)
+    recovery = _qtable(schema, recovery_table)
+    qschema = _quote_ident(schema)
+    return f"""
+        WITH shard AS (
+            SELECT *
+              FROM {recovery}
+             WHERE restore_bucket = :restore_bucket
+        ),
+        matches AS (
+            SELECT
+                r.*,
+                z.zcta5ce AS restored_zip5
+              FROM shard AS r
+              JOIN tiger.zcta5 AS z
+                ON z.the_geom && ST_SetSRID(ST_Point(r.long::double precision, r.lat::double precision), 4269)
+               AND ST_Covers(z.the_geom, ST_SetSRID(ST_Point(r.long::double precision, r.lat::double precision), 4269))
+              JOIN {qschema}.geo_zip_lookup AS g
+                ON g.zip_code = z.zcta5ce
+               AND g.state = r.state_code
+        ),
+        winners AS (
+            SELECT
+                raw_hash,
+                min(house_number) AS house_number,
+                min(street_match_key) AS street_match_key,
+                min(street_name) AS street_name,
+                min(unit) AS unit,
+                min(city_name) AS city_name,
+                min(state_code) AS state_code,
+                min(restored_zip5) AS zip5,
+                min(lat) AS lat,
+                min(long) AS long,
+                min(source) AS source,
+                min(data_id) AS data_id,
+                min(job_id) AS job_id,
+                min(feature_id) AS feature_id,
+                min(accuracy) AS accuracy,
+                min(source_updated) AS source_updated,
+                min(imported_at) AS imported_at
+              FROM matches
+             GROUP BY raw_hash
+            HAVING count(DISTINCT restored_zip5) = 1
+        )
+        INSERT INTO {stage} (
+            row_hash,
+            address_key,
+            identity_key,
+            house_number,
+            street_match_key,
+            street_name,
+            unit,
+            city_name,
+            state_code,
+            zip5,
+            zip5_source,
+            zip5_restored_at,
+            formatted_address,
+            lat,
+            long,
+            source,
+            data_id,
+            job_id,
+            feature_id,
+            accuracy,
+            source_updated,
+            imported_at
+        )
+        SELECT
+            encode(sha256(convert_to(concat_ws('|',
+                COALESCE(source, ''),
+                COALESCE(feature_id, ''),
+                house_number,
+                street_match_key,
+                COALESCE(city_name, ''),
+                state_code,
+                zip5,
+                to_char(lat, 'FM999999990.00000000'),
+                to_char(long, 'FM999999990.00000000')
+            ), 'UTF8')), 'hex') AS row_hash,
+            {qschema}.addr_key_v1(house_number || ' ' || street_name, unit, city_name, state_code, zip5, 'US') AS address_key,
+            {qschema}.addr_identity_key_v1(house_number || ' ' || street_name, unit, city_name, state_code, zip5, 'US') AS identity_key,
+            house_number,
+            street_match_key,
+            street_name,
+            unit,
+            city_name,
+            state_code,
+            zip5,
+            'tiger_zcta_point' AS zip5_source,
+            now() AS zip5_restored_at,
+            concat_ws(', ',
+                house_number || ' ' || street_name,
+                NULLIF(unit, ''),
+                NULLIF(city_name, ''),
+                concat_ws(' ', state_code, zip5)
+            ) AS formatted_address,
+            lat,
+            long,
+            source,
+            data_id,
+            job_id,
+            feature_id,
+            accuracy,
+            source_updated,
+            imported_at
+          FROM winners
+        ON CONFLICT (row_hash) DO NOTHING;
+    """
+
+
+async def restore_openaddresses_zip5_from_tiger_zcta(
+    *,
+    schema: str,
+    stage_table: str,
+    recovery_table: str,
+    concurrency: int,
+    run_id: str | None = None,
+) -> OpenAddressesZipRestoreStats:
+    if not await _table_exists(schema, recovery_table):
+        return OpenAddressesZipRestoreStats()
+    if not await _table_exists("tiger", "zcta5"):
+        if _env_bool("HLTHPRT_OPENADDRESSES_ZIP_RESTORE_REQUIRED"):
+            raise RuntimeError("OpenAddresses ZIP restore requires tiger.zcta5, but it is missing.")
+        logger.warning("Skipping OpenAddresses ZIP restore: tiger.zcta5 is missing")
+        return OpenAddressesZipRestoreStats()
+    if not await _table_exists(schema, "geo_zip_lookup"):
+        if _env_bool("HLTHPRT_OPENADDRESSES_ZIP_RESTORE_REQUIRED"):
+            raise RuntimeError("OpenAddresses ZIP restore requires geo_zip_lookup, but it is missing.")
+        logger.warning("Skipping OpenAddresses ZIP restore: %s.geo_zip_lookup is missing", schema)
+        return OpenAddressesZipRestoreStats()
+
+    await _create_zip_recovery_indexes(recovery_table, schema)
+    rows = await db.all(
+        f"""
+        SELECT restore_bucket, count(*)::bigint AS candidates
+          FROM {_qtable(schema, recovery_table)}
+         GROUP BY restore_bucket
+         ORDER BY restore_bucket;
+        """
+    )
+    shard_counts = {
+        int(_row_mapping(row)["restore_bucket"]): int(_row_mapping(row)["candidates"] or 0)
+        for row in rows or []
+    }
+    total_candidates = sum(shard_counts.values())
+    if not total_candidates:
+        return OpenAddressesZipRestoreStats()
+
+    buckets = sorted(shard_counts)
+    total_shards = len(buckets)
+    restored = 0
+    completed = 0
+    concurrency = max(1, min(int(concurrency or 1), total_shards))
+    semaphore = asyncio.Semaphore(concurrency)
+    progress_lock = asyncio.Lock()
+    insert_sql = _openaddresses_zip_restore_insert_sql(schema, stage_table, recovery_table)
+    _emit_zip_restore_progress(
+        completed_shards=0,
+        total_shards=total_shards,
+        candidates=total_candidates,
+        restored=0,
+        label="planned ZIP restore shards",
+        run_id=run_id,
+    )
+
+    async def run_bucket(bucket: int) -> tuple[int, int]:
+        async with semaphore:
+            inserted = _status_count(await db.status(insert_sql, restore_bucket=bucket))
+            return bucket, inserted
+
+    tasks = [asyncio.create_task(run_bucket(bucket)) for bucket in buckets]
+    try:
+        for finished in asyncio.as_completed(tasks):
+            bucket, inserted = await finished
+            async with progress_lock:
+                restored += inserted
+                completed += 1
+                _emit_zip_restore_progress(
+                    completed_shards=completed,
+                    total_shards=total_shards,
+                    candidates=total_candidates,
+                    restored=restored,
+                    label=f"bucket {bucket}",
+                    run_id=run_id,
+                )
+    except Exception:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+    discarded = max(total_candidates - restored, 0)
+    print(
+        "OpenAddresses ZIP restore complete: "
+        f"candidates={total_candidates:,} restored={restored:,} discarded={discarded:,} "
+        f"shards={total_shards:,} concurrency={concurrency:,}",
+        flush=True,
+    )
+    return OpenAddressesZipRestoreStats(
+        candidates=total_candidates,
+        restored=restored,
+        discarded=discarded,
+        shards=total_shards,
+    )
 
 
 async def _table_exists(schema: str, table_name: str) -> bool:
@@ -1232,6 +1827,10 @@ def _zip_prefix_upper_bound(zip_prefix: str) -> str | None:
     if value >= (10**width) - 1:
         return None
     return str(value + 1).zfill(width).ljust(5, "0")
+
+
+def _row_mapping(row: Any) -> Any:
+    return row._mapping if hasattr(row, "_mapping") else row
 
 
 def _archive_match_components_cte(
@@ -1357,6 +1956,240 @@ def _openaddresses_city_grouped_cte(
                 AND max(long) - min(long) <= :coord_tolerance
             )
     """
+
+
+async def _plan_openaddresses_backfill_shards(
+    *,
+    schema: str,
+    archive_table: str,
+    state_code: str | None = None,
+    zip_prefix: str | None = None,
+    zip_prefix_length: int = DEFAULT_BACKFILL_ZIP_PREFIX_LENGTH,
+) -> list[OpenAddressesBackfillShard]:
+    if zip_prefix:
+        return [OpenAddressesBackfillShard(state_code=state_code, zip_prefix=zip_prefix)]
+
+    archive = _qtable(schema, archive_table)
+    shard_filter = _backfill_shard_filter(state_code=state_code, zip_prefix=None)
+    rows = await db.all(
+        f"""
+        SELECT
+            state_code,
+            substring(zip5 from 1 for :backfill_zip_prefix_length) AS zip_prefix,
+            count(*)::bigint AS candidate_count
+          FROM {archive}
+         WHERE lat IS NULL
+           AND long IS NULL
+           AND COALESCE(country_code, 'US') = 'US'
+           AND precision = 'street'
+           AND first_line IS NOT NULL
+           AND state_code IS NOT NULL
+           AND zip5 IS NOT NULL
+           AND zip5 ~ '^[0-9]{{5}}$'
+{shard_filter}
+         GROUP BY state_code, substring(zip5 from 1 for :backfill_zip_prefix_length)
+         ORDER BY candidate_count DESC, state_code, zip_prefix;
+        """,
+        backfill_state_code=state_code,
+        backfill_zip_prefix_length=zip_prefix_length,
+    )
+    shards: list[OpenAddressesBackfillShard] = []
+    for row in rows or []:
+        mapping = _row_mapping(row)
+        shard_state = _normalize_backfill_state_code(mapping["state_code"])
+        shard_zip = _normalize_backfill_zip_prefix(mapping["zip_prefix"])
+        candidate_count = int(mapping["candidate_count"] or 0)
+        if shard_state and shard_zip:
+            shards.append(
+                OpenAddressesBackfillShard(
+                    state_code=shard_state,
+                    zip_prefix=shard_zip,
+                    candidate_count=candidate_count,
+                )
+            )
+    if shards:
+        return shards
+    return []
+
+
+def _add_backfill_stats(
+    left: OpenAddressesBackfillStats,
+    right: OpenAddressesBackfillStats,
+) -> OpenAddressesBackfillStats:
+    return OpenAddressesBackfillStats(
+        exact_updates=left.exact_updates + right.exact_updates,
+        fuzzy_updates=left.fuzzy_updates + right.fuzzy_updates,
+        relaxed_updates=left.relaxed_updates + right.relaxed_updates,
+    )
+
+
+async def refresh_archive_geocodes_from_openaddresses_sharded(
+    *,
+    schema: str | None = None,
+    archive_table: str | None = None,
+    source_table: str = OPENADDRESSES_TABLE,
+    state_code: str | None = None,
+    zip_prefix: str | None = None,
+    concurrency: int | None = None,
+    zip_prefix_length: int | None = None,
+    run_id: str | None = None,
+    sharded: bool = True,
+) -> OpenAddressesBackfillStats:
+    schema = _validate_schema_name(schema or os.getenv("HLTHPRT_DB_SCHEMA") or "mrf")
+    archive_table = archive_table or os.getenv("HLTHPRT_ADDRESS_ARCHIVE_TABLE", "address_archive_v2").strip() or "address_archive_v2"
+    state_code = _normalize_backfill_state_code(
+        state_code if state_code is not None else os.getenv("HLTHPRT_OPENADDRESSES_BACKFILL_STATE_CODE")
+    )
+    zip_prefix = _normalize_backfill_zip_prefix(
+        zip_prefix if zip_prefix is not None else os.getenv("HLTHPRT_OPENADDRESSES_BACKFILL_ZIP_PREFIX")
+    )
+    if not sharded:
+        return await refresh_archive_geocodes_from_openaddresses(
+            schema=schema,
+            archive_table=archive_table,
+            source_table=source_table,
+            state_code=state_code,
+            zip_prefix=zip_prefix,
+        )
+    if zip_prefix:
+        shard = OpenAddressesBackfillShard(state_code=state_code, zip_prefix=zip_prefix)
+        empty = OpenAddressesBackfillStats(exact_updates=0, fuzzy_updates=0, relaxed_updates=0)
+        _emit_backfill_progress(
+            completed_shards=0,
+            total_shards=1,
+            stats=empty,
+            label=shard.label,
+            run_id=run_id,
+        )
+        stats = await refresh_archive_geocodes_from_openaddresses(
+            schema=schema,
+            archive_table=archive_table,
+            source_table=source_table,
+            state_code=state_code,
+            zip_prefix=zip_prefix,
+        )
+        _emit_backfill_progress(
+            completed_shards=1,
+            total_shards=1,
+            stats=stats,
+            label=shard.label,
+            run_id=run_id,
+        )
+        return stats
+
+    if not await _table_exists(schema, source_table):
+        return await refresh_archive_geocodes_from_openaddresses(
+            schema=schema,
+            archive_table=archive_table,
+            source_table=source_table,
+            state_code=state_code,
+            zip_prefix=zip_prefix,
+        )
+    if not (
+        await _table_has_column(schema, archive_table, "address_key")
+        and await _table_has_column(schema, archive_table, "geo_source")
+    ):
+        return await refresh_archive_geocodes_from_openaddresses(
+            schema=schema,
+            archive_table=archive_table,
+            source_table=source_table,
+            state_code=state_code,
+            zip_prefix=zip_prefix,
+        )
+
+    concurrency = max(int(concurrency or _env_positive_int("HLTHPRT_OPENADDRESSES_BACKFILL_CONCURRENCY", DEFAULT_BACKFILL_CONCURRENCY)), 1)
+    zip_prefix_length = min(
+        max(
+            int(
+                zip_prefix_length
+                or _env_positive_int(
+                    "HLTHPRT_OPENADDRESSES_BACKFILL_ZIP_PREFIX_LENGTH",
+                    DEFAULT_BACKFILL_ZIP_PREFIX_LENGTH,
+                )
+            ),
+            1,
+        ),
+        5,
+    )
+    shards = await _plan_openaddresses_backfill_shards(
+        schema=schema,
+        archive_table=archive_table,
+        state_code=state_code,
+        zip_prefix=zip_prefix,
+        zip_prefix_length=zip_prefix_length,
+    )
+    if not shards:
+        stats = OpenAddressesBackfillStats(exact_updates=0, fuzzy_updates=0, relaxed_updates=0)
+        _emit_backfill_progress(
+            completed_shards=1,
+            total_shards=1,
+            stats=stats,
+            label="no candidates",
+            run_id=run_id,
+        )
+        return stats
+
+    total_shards = len(shards)
+    total_candidates = sum(shard.candidate_count for shard in shards)
+    aggregate = OpenAddressesBackfillStats(exact_updates=0, fuzzy_updates=0, relaxed_updates=0)
+    _emit_backfill_progress(
+        completed_shards=0,
+        total_shards=total_shards,
+        stats=aggregate,
+        label="planned shards",
+        total_candidates=total_candidates,
+        run_id=run_id,
+    )
+    print(
+        "OpenAddresses archive backfill shards: "
+        f"shards={total_shards:,} concurrency={min(concurrency, total_shards):,} "
+        f"zip_prefix_length={zip_prefix_length} candidates={total_candidates:,}",
+        flush=True,
+    )
+
+    semaphore = asyncio.Semaphore(min(concurrency, total_shards))
+
+    async def run_shard(index: int, shard: OpenAddressesBackfillShard):
+        async with semaphore:
+            stats = await refresh_archive_geocodes_from_openaddresses(
+                schema=schema,
+                archive_table=archive_table,
+                source_table=source_table,
+                state_code=shard.state_code,
+                zip_prefix=shard.zip_prefix,
+            )
+            return index, shard, stats
+
+    tasks = [asyncio.create_task(run_shard(index, shard)) for index, shard in enumerate(shards, start=1)]
+    completed = 0
+    try:
+        for finished in asyncio.as_completed(tasks):
+            _index, shard, stats = await finished
+            completed += 1
+            aggregate = _add_backfill_stats(aggregate, stats)
+            _emit_backfill_progress(
+                completed_shards=completed,
+                total_shards=total_shards,
+                stats=aggregate,
+                label=shard.label,
+                total_candidates=total_candidates,
+                run_id=run_id,
+            )
+            print(
+                "OpenAddresses archive backfill shard complete: "
+                f"{completed:,}/{total_shards:,} {shard.label} "
+                f"exact={stats.exact_updates:,} fuzzy={stats.fuzzy_updates:,} "
+                f"relaxed={stats.relaxed_updates:,}",
+                flush=True,
+            )
+    except Exception:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+    return aggregate
 
 
 async def refresh_archive_geocodes_from_openaddresses(
@@ -1695,9 +2528,27 @@ async def process_data(ctx, task=None):  # pragma: no cover
         await ensure_database(bool(ctx["context"].get("test_mode", False)))
         backfill_state_code = task.get("state_code") or task.get("backfill_state_code")
         backfill_zip_prefix = task.get("zip_prefix") or task.get("backfill_zip_prefix")
-        stats = await refresh_archive_geocodes_from_openaddresses(
+        backfill_concurrency = _task_or_env_positive_int(
+            task,
+            "backfill_concurrency",
+            "HLTHPRT_OPENADDRESSES_BACKFILL_CONCURRENCY",
+            DEFAULT_BACKFILL_CONCURRENCY,
+        )
+        backfill_zip_prefix_length = _task_or_env_int_range(
+            task,
+            "backfill_zip_prefix_length",
+            "HLTHPRT_OPENADDRESSES_BACKFILL_ZIP_PREFIX_LENGTH",
+            DEFAULT_BACKFILL_ZIP_PREFIX_LENGTH,
+            minimum=1,
+            maximum=5,
+        )
+        stats = await refresh_archive_geocodes_from_openaddresses_sharded(
             state_code=backfill_state_code,
             zip_prefix=backfill_zip_prefix,
+            concurrency=backfill_concurrency,
+            zip_prefix_length=backfill_zip_prefix_length,
+            run_id=_progress_run_id(ctx, task),
+            sharded=_task_or_env_bool(task, "sharded_backfill", "HLTHPRT_OPENADDRESSES_SHARDED_BACKFILL", True),
         )
         ctx["context"]["backfill"] = {
             "exact_updates": stats.exact_updates,
@@ -1705,6 +2556,8 @@ async def process_data(ctx, task=None):  # pragma: no cover
             "relaxed_updates": stats.relaxed_updates,
             "state_code": _normalize_backfill_state_code(backfill_state_code),
             "zip_prefix": _normalize_backfill_zip_prefix(backfill_zip_prefix),
+            "concurrency": backfill_concurrency,
+            "zip_prefix_length": backfill_zip_prefix_length,
         }
         ctx["context"]["run"] = ctx["context"].get("run", 0) + 1
         ctx["context"]["backfill_only"] = True
@@ -1728,13 +2581,19 @@ async def process_data(ctx, task=None):  # pragma: no cover
         ctx["context"]["min_rows"] = _positive_int_value(task.get("min_rows"), DEFAULT_MIN_ROWS)
     import_date = ctx["context"].get("import_date") or ctx["import_date"]
     stage_cls = make_class(OpenAddressesGeocode, import_date)
+    recovery_cls = make_class(OpenAddressesZipRecovery, import_date)
     schema = _validate_schema_name(os.getenv("HLTHPRT_DB_SCHEMA") or "mrf")
     await _prepare_stage_table(
         stage_cls,
         schema,
         reset=not _task_or_env_bool(task, "resume_stage", "HLTHPRT_OPENADDRESSES_RESUME_STAGE"),
     )
-    stats = await _load_openaddresses_data(ctx, task, stage_cls)
+    await _prepare_zip_recovery_table(
+        recovery_cls,
+        schema,
+        reset=not _task_or_env_bool(task, "resume_stage", "HLTHPRT_OPENADDRESSES_RESUME_STAGE"),
+    )
+    stats = await _load_openaddresses_data(ctx, task, stage_cls, recovery_cls)
     ctx["context"]["audit"] = stats
     ctx["context"]["run"] = ctx["context"].get("run", 0) + 1
     print(
@@ -1773,9 +2632,25 @@ async def shutdown(ctx):  # pragma: no cover
     schema = _validate_schema_name(os.getenv("HLTHPRT_DB_SCHEMA") or "mrf")
     import_date = context.get("import_date") or ctx["import_date"]
     stage_cls = make_class(OpenAddressesGeocode, import_date)
+    recovery_cls = make_class(OpenAddressesZipRecovery, import_date)
     stage_table = stage_cls.__tablename__
+    recovery_table = recovery_cls.__tablename__
     if not await _table_exists(schema, stage_table):
         raise RuntimeError(f"OpenAddresses staging table {schema}.{stage_table} is missing.")
+
+    zip_restore_stats = await restore_openaddresses_zip5_from_tiger_zcta(
+        schema=schema,
+        stage_table=stage_table,
+        recovery_table=recovery_table,
+        concurrency=int(
+            context.get("zip_restore_concurrency")
+            or _env_positive_int(
+                "HLTHPRT_OPENADDRESSES_ZIP_RESTORE_CONCURRENCY",
+                DEFAULT_ZIP_RESTORE_CONCURRENCY,
+            )
+        ),
+        run_id=_progress_run_id(ctx, {}),
+    )
 
     stage_rows = int(
         await db.scalar(f"SELECT COUNT(*) FROM {_qtable(schema, stage_table)};")
@@ -1788,6 +2663,12 @@ async def shutdown(ctx):  # pragma: no cover
         raise RuntimeError(
             f"OpenAddresses stage row count {stage_rows:,} is below minimum {min_rows:,}; aborting publish."
         )
+    null_zip_rows = int(
+        await db.scalar(f"SELECT COUNT(*) FROM {_qtable(schema, stage_table)} WHERE zip5 IS NULL;")
+        or 0
+    )
+    if null_zip_rows:
+        raise RuntimeError(f"OpenAddresses stage contains {null_zip_rows:,} rows with null zip5; aborting publish.")
 
     await _create_indexes(stage_table, schema)
     await db.execute_ddl(f"ANALYZE {_qtable(schema, stage_table)};")
@@ -1799,16 +2680,26 @@ async def shutdown(ctx):  # pragma: no cover
         await db.status(f"ALTER TABLE IF EXISTS {_qtable(schema, live_table)} RENAME TO {_quote_ident(archived)};")
         await db.status(f"ALTER TABLE {_qtable(schema, stage_table)} RENAME TO {_quote_ident(live_table)};")
 
-    stats = await refresh_archive_geocodes_from_openaddresses(schema=schema)
+    stats = await refresh_archive_geocodes_from_openaddresses_sharded(
+        schema=schema,
+        run_id=_progress_run_id(ctx, {}),
+    )
     context["backfill"] = {
         "exact_updates": stats.exact_updates,
         "fuzzy_updates": stats.fuzzy_updates,
         "relaxed_updates": stats.relaxed_updates,
     }
+    context["zip_restore"] = {
+        "candidates": zip_restore_stats.candidates,
+        "restored": zip_restore_stats.restored,
+        "discarded": zip_restore_stats.discarded,
+        "shards": zip_restore_stats.shards,
+    }
+    await db.status(f"DROP TABLE IF EXISTS {_qtable(schema, recovery_table)};")
     print(
         "OpenAddresses publish/backfill complete: "
         f"rows={stage_rows:,} exact={stats.exact_updates:,} fuzzy={stats.fuzzy_updates:,} "
-        f"relaxed={stats.relaxed_updates:,}"
+        f"relaxed={stats.relaxed_updates:,} zip_restored={zip_restore_stats.restored:,}"
     )
     print_time_info(context.get("start"))
 
