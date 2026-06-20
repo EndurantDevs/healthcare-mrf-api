@@ -29,7 +29,7 @@ from process.entity_address_unified import (
 from process.ext.address_canon import resolve_into_archive
 from process.ext.utils import ensure_database, make_class, my_init_db, print_time_info
 from process.live_progress import enqueue_live_progress
-from process.openaddresses import refresh_archive_geocodes_from_openaddresses
+from process.openaddresses import refresh_archive_geocodes_from_openaddresses_sharded
 from process.ptg_parts.db_tables import _quote_ident
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
@@ -866,7 +866,7 @@ async def process_data(ctx, task=None):
                 source_context.get("snapshot_id"),
                 stats,
             )
-        oa_stats = await refresh_archive_geocodes_from_openaddresses(schema=db_schema)
+        oa_stats = await refresh_archive_geocodes_from_openaddresses_sharded(schema=db_schema)
         context["archive_resolve"] = archive_resolve_stats
         context["openaddresses_backfill"] = {
             "exact_updates": oa_stats.exact_updates,
