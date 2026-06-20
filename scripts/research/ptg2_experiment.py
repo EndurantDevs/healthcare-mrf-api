@@ -989,17 +989,19 @@ def render_markdown_report(report: dict[str, Any]) -> str:
         "",
         "## Results",
         "",
-        "| Case | Variant | Kind | Status | Elapsed | Peak RSS |",
-        "| --- | --- | --- | --- | ---: | ---: |",
+        "| Case | Variant | Kind | Status | Scanner | Import | Elapsed | Peak RSS |",
+        "| --- | --- | --- | --- | --- | --- | ---: | ---: |",
     ]
     for result in report.get("results") or []:
         memory = result.get("memory") or {}
         lines.append(
-            "| {case} | {variant} | {kind} | {status} | {elapsed} | {rss} |".format(
+            "| {case} | {variant} | {kind} | {status} | {scanner} | {import_done} | {elapsed} | {rss} |".format(
                 case=result.get("case_id"),
                 variant=result.get("variant_id"),
                 kind=result.get("kind"),
                 status=result.get("status"),
+                scanner=format_scanner_summary(result),
+                import_done=format_import_done(result),
                 elapsed=format_optional_float(result.get("elapsed_seconds")),
                 rss=memory.get("peak_rss_kb") or "",
             )
@@ -1018,6 +1020,36 @@ def format_optional_float(value: Any) -> str:
     if value is None:
         return ""
     return f"{float(value):.3f}"
+
+
+def format_scanner_summary(result: dict[str, Any]) -> str:
+    config = result.get("scanner_config") or {}
+    summary = result.get("scanner_summary") or {}
+    if not config and not summary:
+        return ""
+    parts = []
+    if "parse_in_workers" in config:
+        parts.append(f"parse_workers={str(config.get('parse_in_workers')).lower()}")
+    if config.get("worker_count") is not None:
+        parts.append(f"workers={config.get('worker_count')}")
+    if summary.get("producer_blocked_micros") is not None:
+        parts.append(f"producer_blocked_us={summary.get('producer_blocked_micros')}")
+    return "<br>".join(parts)
+
+
+def format_import_done(result: dict[str, Any]) -> str:
+    import_run = result.get("import_run") or {}
+    done = import_run.get("import_done") if isinstance(import_run, dict) else None
+    if not isinstance(done, dict) or not done:
+        return ""
+    parts = []
+    if done.get("status") is not None:
+        parts.append(str(done.get("status")))
+    if done.get("files_processed") is not None:
+        parts.append(f"files={done.get('files_processed')}")
+    if done.get("serving_rates") is not None:
+        parts.append(f"rates={done.get('serving_rates')}")
+    return "<br>".join(parts)
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -252,3 +252,27 @@ def test_local_ptg_cli_dry_run_writes_fixture_and_command(tmp_path, monkeypatch)
     assert "main.py" in result["command"]
     assert (fixture_dir / "index.json").exists()
     assert (fixture_dir / "rates.json.gz").exists()
+
+
+def test_markdown_report_includes_scanner_and_import_summary():
+    report = {
+        "generated_at": "20260620T000000Z",
+        "gates": {"overall": "passed"},
+        "results": [
+            {
+                "case_id": "local",
+                "variant_id": "default",
+                "kind": "local_ptg_cli",
+                "status": "succeeded",
+                "elapsed_seconds": 1.25,
+                "scanner_config": {"parse_in_workers": True, "worker_count": 2},
+                "scanner_summary": {"producer_blocked_micros": 12},
+                "import_run": {"import_done": {"status": "validated", "files_processed": 1, "serving_rates": 7}},
+            }
+        ],
+    }
+
+    markdown = harness.render_markdown_report(report)
+
+    assert "parse_workers=true<br>workers=2<br>producer_blocked_us=12" in markdown
+    assert "validated<br>files=1<br>rates=7" in markdown
