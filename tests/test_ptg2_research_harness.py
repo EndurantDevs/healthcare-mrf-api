@@ -42,6 +42,20 @@ def test_parse_scanner_progress_and_import_done_lines():
     assert done == {"processed_files": 1, "failed_files": 0, "total_seconds": 12.5}
 
 
+def test_parse_serving_only_summary_extracts_scanner_config():
+    text = (
+        "PTG2 serving-only import summary: "
+        "{'serving_rates': 1, 'scanner': {'config': {'parse_in_workers': True}, "
+        "'summary': {'elapsed_seconds': 0.12}}}"
+    )
+
+    summary = harness.parse_serving_only_summary(text)
+
+    assert summary["serving_rates"] == 1
+    assert summary["scanner"]["config"]["parse_in_workers"] is True
+    assert summary["scanner"]["summary"]["elapsed_seconds"] == 0.12
+
+
 def test_read_proc_status_parses_memory_values(tmp_path):
     status_path = tmp_path / "status"
     status_path.write_text(

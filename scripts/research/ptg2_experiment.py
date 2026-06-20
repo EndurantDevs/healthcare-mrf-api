@@ -11,6 +11,7 @@ promoted to main.
 from __future__ import annotations
 
 import argparse
+import ast
 import datetime as dt
 import functools
 import gzip
@@ -196,6 +197,21 @@ def parse_dedupe_summary(text: bytes | str) -> dict[str, Any] | None:
     for line in decoded.splitlines():
         if line.startswith("PTG2_DEDUPE_SUMMARY\t"):
             return parse_key_value_line(line)
+    return None
+
+
+def parse_serving_only_summary(text: bytes | str) -> dict[str, Any] | None:
+    decoded = text.decode("utf-8", errors="replace") if isinstance(text, bytes) else text
+    prefix = "PTG2 serving-only import summary: "
+    for line in decoded.splitlines():
+        if not line.startswith(prefix):
+            continue
+        payload = line[len(prefix) :]
+        try:
+            parsed = ast.literal_eval(payload)
+        except (ValueError, SyntaxError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
     return None
 
 
@@ -686,6 +702,8 @@ def run_local_ptg_cli(
         completed, elapsed, memory = run_with_sampling(command, env_overrides, cwd=ROOT)
     combined = completed.stdout + b"\n" + completed.stderr
     import_done = parse_import_done(combined)
+    serving_summary = parse_serving_only_summary(combined) or {}
+    scanner_summary = serving_summary.get("scanner") if isinstance(serving_summary.get("scanner"), dict) else {}
     status = "succeeded" if completed.returncode == 0 and (import_done or {}).get("status") == "validated" else "failed"
     return RunResult(
         case_id=case_id,
@@ -697,6 +715,8 @@ def run_local_ptg_cli(
         elapsed_seconds=elapsed,
         returncode=completed.returncode,
         progress=parse_scanner_progress(combined),
+        scanner_config=scanner_summary.get("config") if isinstance(scanner_summary, dict) else None,
+        scanner_summary=scanner_summary.get("summary") if isinstance(scanner_summary, dict) else None,
         dedupe_summary=parse_dedupe_summary(combined),
         memory=memory,
         import_run={
