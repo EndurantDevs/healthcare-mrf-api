@@ -39,6 +39,9 @@ Concurrency notes:
 - The finish worker tracks queued parser/chunk jobs in Redis and requeues
   itself while work is still running. `HLTHPRT_MRF_FINISH_REQUEUE_SECONDS` and
   `HLTHPRT_MRF_FINISH_MAX_REQUEUES` control the wait cadence and cap.
+- Import-control should record `metrics.mrf_resource` for chunked/full runs so
+  future scheduler decisions can split MRF work into memory classes without
+  changing the admin API. For now MRF chunks stay on `arq:MRF`.
 - On full-source runs, older finish code spent most of its time recomputing
   canonical keys on `mrf_address_evidence`. The current path stamps
   `mrf_address` first, then propagates matching evidence keys from the

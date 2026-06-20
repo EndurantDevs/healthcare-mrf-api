@@ -83,3 +83,62 @@ async def test_ptg_control_start_records_ptg2_terminal_identity(monkeypatch):
     assert succeeded_mark["snapshot_id"] == "ptg2:202606:demo"
     assert succeeded_mark["metrics"]["source_key"] == "demo_source"
     assert succeeded_mark["metrics"]["source_file_versions"][0]["engine_source_file_version_id"] == "version_1"
+
+
+@pytest.mark.asyncio
+async def test_ptg_control_start_applies_lane_scanner_env(monkeypatch):
+    observed = {}
+
+    async def fake_ptg_main(**_kwargs):
+        observed["workers"] = ptg_control.os.environ.get("HLTHPRT_PTG2_RUST_WORKERS")
+        observed["parse"] = ptg_control.os.environ.get("HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS")
+        observed["work_queue"] = ptg_control.os.environ.get("HLTHPRT_PTG2_RUST_WORK_QUEUE")
+        observed["event_queue"] = ptg_control.os.environ.get("HLTHPRT_PTG2_RUST_EVENT_QUEUE")
+        return {}
+
+    async def fake_mark_control_run(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setenv("HLTHPRT_ACTIVE_WORKER_QUEUE", "arq:PTGSmall")
+    monkeypatch.setenv("HLTHPRT_ACTIVE_WORKER_CLASS", "process.PTGSmall")
+    monkeypatch.setattr(ptg_control, "ptg_main", fake_ptg_main)
+    monkeypatch.setattr(ptg_control, "mark_control_run", fake_mark_control_run)
+
+    await ptg_control.ptg_control_start(
+        {},
+        {
+            "run_id": "run_ptg",
+            "params": {
+                "_expected_queue": "arq:PTGSmall",
+                "_expected_worker_class": "process.PTGSmall",
+                "_scanner_rust_workers": 4,
+                "_scanner_parse_in_workers": True,
+                "_scanner_work_queue": 5,
+                "_scanner_event_queue": 9,
+            },
+        },
+    )
+
+    assert observed == {"workers": "4", "parse": "true", "work_queue": "5", "event_queue": "9"}
+
+
+@pytest.mark.asyncio
+async def test_ptg_control_start_rejects_wrong_lane(monkeypatch):
+    async def fake_mark_control_run(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setenv("HLTHPRT_ACTIVE_WORKER_QUEUE", "arq:PTGLarge")
+    monkeypatch.setenv("HLTHPRT_ACTIVE_WORKER_CLASS", "process.PTGLarge")
+    monkeypatch.setattr(ptg_control, "mark_control_run", fake_mark_control_run)
+
+    with pytest.raises(RuntimeError, match="expected arq:PTGSmall"):
+        await ptg_control.ptg_control_start(
+            {},
+            {
+                "run_id": "run_ptg",
+                "params": {
+                    "_expected_queue": "arq:PTGSmall",
+                    "_expected_worker_class": "process.PTGSmall",
+                },
+            },
+        )

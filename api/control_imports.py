@@ -192,6 +192,8 @@ _SINGLE_JOB_ADAPTERS: dict[str, dict[str, Any]] = {
     },
 }
 
+_PTG_CONTROL_QUEUES = frozenset({"arq:PTG", "arq:PTGSmall", "arq:PTGNormal", "arq:PTGLarge", "arq:PTGHuge"})
+
 _CANCELABLE_IMPORTERS = {
     "ptg",
     "npi",
@@ -312,12 +314,13 @@ def _new_run_id() -> str:
 
 
 async def node_health() -> dict[str, Any]:
-    artifact_root = Path(os.getenv("HLTHPRT_PTG2_ARTIFACT_ROOT") or "/tmp")
+    artifact_root = Path(os.getenv("HLTHPRT_PTG2_ARTIFACT_ROOT") or os.getenv("HLTHPRT_PTG2_ARTIFACT_DIR") or "/tmp")
     try:
         usage = shutil.disk_usage(artifact_root)
         disk = {"path": str(artifact_root), "total": usage.total, "used": usage.used, "free": usage.free}
     except OSError:
         disk = {"path": str(artifact_root), "total": None, "used": None, "free": None}
+    ram = _ram_status()
     checks: dict[str, dict[str, Any]] = {
         "database": await _database_check(),
         "redis": _redis_check(),
@@ -348,10 +351,34 @@ async def node_health() -> dict[str, Any]:
             "enqueue_adapters": True,
             "enqueue_adapter_count": len(_SINGLE_JOB_ADAPTERS),
         },
+        "ram": ram,
         "disk": disk,
         "queue_depth": queue_depth,
         "workers": workers,
     }
+
+
+def _ram_status() -> dict[str, int | None]:
+    total = None
+    available = None
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as handle:
+            values: dict[str, int] = {}
+            for line in handle:
+                key, _sep, raw_value = line.partition(":")
+                parts = raw_value.strip().split()
+                if parts and parts[0].isdigit():
+                    values[key] = int(parts[0]) * 1024
+            total = values.get("MemTotal")
+            available = values.get("MemAvailable")
+    except OSError:
+        pass
+    if total is None and hasattr(os, "sysconf"):
+        try:
+            total = int(os.sysconf("SC_PAGE_SIZE")) * int(os.sysconf("SC_PHYS_PAGES"))
+        except (OSError, ValueError, TypeError):
+            total = None
+    return {"total": total, "available": available}
 
 
 async def _database_check() -> dict[str, Any]:
@@ -390,6 +417,7 @@ def _queue_depths() -> dict[str, int]:
         for spec in _SINGLE_JOB_ADAPTERS.values()
         if str(spec.get("queue") or "").strip()
     }
+    queues.update(_PTG_CONTROL_QUEUES)
     for importer in _FINISH_IMPORTERS:
         queue = str(_SINGLE_JOB_ADAPTERS.get(importer, {}).get("queue") or "").strip()
         if queue:
@@ -788,8 +816,19 @@ async def create_import_run(payload: dict[str, Any]) -> tuple[dict[str, Any], bo
 
 async def _enqueue_import_start(row: dict[str, Any]) -> dict[str, Any]:
     importer = str(row.get("importer") or "")
-    adapter = _SINGLE_JOB_ADAPTERS.get(importer)
     now = utc_now()
+    params = row.get("params") if isinstance(row.get("params"), dict) else {}
+    try:
+        adapter = _adapter_for_import_row(row)
+    except ValueError as exc:
+        return {
+            "status": "failed",
+            "phase_detail": "enqueue failed",
+            "heartbeat_at": now,
+            "progress": {"unit": "run", "total": 1, "done": 0, "pct": 0, "message": "enqueue failed"},
+            "metrics": {"enqueue_adapter": "arq_single_job", **_ptg_lane_metrics(params)},
+            "error": {"code": "invalid_enqueue_adapter", "message": str(exc)},
+        }
     if adapter is None:
         return {
             "status": "queued",
@@ -800,7 +839,6 @@ async def _enqueue_import_start(row: dict[str, Any]) -> dict[str, Any]:
             "error": None,
         }
 
-    params = row.get("params") if isinstance(row.get("params"), dict) else {}
     job_payload = _adapter_payload(adapter, row, params)
     kwargs = {"_queue_name": adapter["queue"]}
     if adapter.get("function") == "control_single_job_start":
@@ -820,7 +858,12 @@ async def _enqueue_import_start(row: dict[str, Any]) -> dict[str, Any]:
             "phase_detail": "enqueue failed",
             "heartbeat_at": utc_now(),
             "progress": {"unit": "run", "total": 1, "done": 0, "pct": 0, "message": "enqueue failed"},
-            "metrics": {"enqueue_adapter": "arq_single_job", "queue": adapter["queue"], "function": adapter["function"]},
+            "metrics": {
+                "enqueue_adapter": "arq_single_job",
+                "queue": adapter["queue"],
+                "function": adapter["function"],
+                **_ptg_lane_metrics(params),
+            },
             "error": {"code": "enqueue_failed", "message": str(exc)},
         }
     job_id = getattr(job, "job_id", None) or str(job or "")
@@ -834,8 +877,38 @@ async def _enqueue_import_start(row: dict[str, Any]) -> dict[str, Any]:
             "queue": adapter["queue"],
             "function": adapter["function"],
             "job_id": job_id,
+            **_ptg_lane_metrics(params),
         },
         "error": None,
+    }
+
+
+def _adapter_for_import_row(row: dict[str, Any]) -> dict[str, Any] | None:
+    importer = str(row.get("importer") or "")
+    adapter = _SINGLE_JOB_ADAPTERS.get(importer)
+    if adapter is None or importer != "ptg":
+        return adapter
+    params = row.get("params") if isinstance(row.get("params"), dict) else {}
+    queue = str(params.get("_expected_queue") or "").strip()
+    if not queue:
+        return adapter
+    if queue not in _PTG_CONTROL_QUEUES:
+        raise ValueError(f"unsupported PTG queue: {queue}")
+    return {**adapter, "queue": queue}
+
+
+def _ptg_lane_metrics(params: dict[str, Any]) -> dict[str, Any]:
+    queue = str(params.get("_expected_queue") or "").strip()
+    worker_class = str(params.get("_expected_worker_class") or "").strip()
+    resource_class = str(params.get("resource_class") or params.get("_resource_class") or "").strip()
+    return {
+        key: value
+        for key, value in {
+            "queue": queue,
+            "worker_class": worker_class,
+            "resource_class": resource_class,
+        }.items()
+        if value
     }
 
 

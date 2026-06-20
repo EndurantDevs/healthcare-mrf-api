@@ -17,6 +17,8 @@ Allowed statuses:
 - `canceling`
 - `canceled`
 - `dead_letter`
+- `waiting`
+- `blocked`
 
 Transitions:
 
@@ -62,8 +64,29 @@ Cooperative cancellation:
 - Missing heartbeat marks mirrored run stale.
 - Stale run does not automatically fail until timeout policy is met.
 
+## Persisted Latest State
+
+`import-control` persists one importer/node latest-state row outside the active
+run list. The admin status table must survive service restarts and show:
+
+- current active run, if any;
+- latest run;
+- latest terminal run;
+- latest successful run.
+
+The persisted payload includes run params, progress, estimate, metrics, error,
+and timestamps. History purges may remove old `run_mirror` rows, but must not
+erase the latest-state summary.
+
+## Resource Metadata
+
+PTG and MRF runs carry resource metadata in run metrics. PTG source-file imports
+also mirror the selected resource class and queue in their metrics so admin UI,
+worker repair, and retry logic keep the same lane.
+
 ## Acceptance Criteria
 
 - A test import can be started, monitored, canceled, retried, and finalized without CLI intervention.
 - Finish queue is enqueued exactly once.
 - Cancellation is honest per importer capability.
+- Latest completed run state is still visible after import-control/api-app restart.

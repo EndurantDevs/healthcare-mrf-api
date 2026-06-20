@@ -419,6 +419,61 @@ async def test_enqueue_import_start_enqueues_ptg_control_job(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_enqueue_import_start_honors_ptg_lane(monkeypatch):
+    calls = []
+
+    class FakeJob:
+        job_id = "job_ptg_lane"
+
+    class FakeRedis:
+        async def enqueue_job(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            return FakeJob()
+
+    async def fake_create_pool(*_args, **_kwargs):
+        return FakeRedis()
+
+    monkeypatch.setattr("api.control_imports.create_pool", fake_create_pool)
+    row = {
+        "run_id": "run_ptg_lane",
+        "importer": "ptg",
+        "source_file_import_id": "source_file_import_1",
+        "params": {
+            "source_key": "asr_1208",
+            "_expected_queue": "arq:PTGSmall",
+            "_expected_worker_class": "process.PTGSmall",
+            "resource_class": "small",
+        },
+    }
+
+    result = await _enqueue_import_start(row)
+
+    assert result["status"] == "queued"
+    assert result["metrics"]["queue"] == "arq:PTGSmall"
+    assert result["metrics"]["worker_class"] == "process.PTGSmall"
+    assert result["metrics"]["resource_class"] == "small"
+    args, kwargs = calls[0]
+    assert args[0] == "ptg_control_start"
+    assert args[1]["params"]["_expected_queue"] == "arq:PTGSmall"
+    assert kwargs == {"_queue_name": "arq:PTGSmall", "_job_id": "ptg_start_run_ptg_lane"}
+
+
+@pytest.mark.asyncio
+async def test_enqueue_import_start_rejects_invalid_ptg_lane():
+    row = {
+        "run_id": "run_bad_ptg_lane",
+        "importer": "ptg",
+        "params": {"_expected_queue": "arq:NotAQueue"},
+    }
+
+    result = await _enqueue_import_start(row)
+
+    assert result["status"] == "failed"
+    assert result["error"]["code"] == "invalid_enqueue_adapter"
+    assert "unsupported PTG queue" in result["error"]["message"]
+
+
+@pytest.mark.asyncio
 async def test_enqueue_import_start_wraps_single_job_lifecycle(monkeypatch):
     calls = []
 

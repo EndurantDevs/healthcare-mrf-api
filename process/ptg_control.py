@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 from typing import Any
 
 from process.control_cancel import ImportCancelledError, raise_if_cancelled
 from process.control_lifecycle import mark_control_run
 from process.import_status_events import flush_status_events
 from process.ptg import main as ptg_main
+from process.ptg_parts.config import (
+    PTG2_RUST_EVENT_QUEUE_ENV,
+    PTG2_RUST_PARSE_IN_WORKERS_ENV,
+    PTG2_RUST_WORK_QUEUE_ENV,
+    PTG2_RUST_WORKERS_ENV,
+)
 
 PTG_CONTROL_QUEUE_NAME = "arq:PTG"
 
@@ -20,26 +27,28 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
     try:
         await mark_control_run(run_id, status="running", phase_detail="ptg import running", progress_message="running")
         await raise_if_cancelled(ctx, payload)
-        result = await ptg_main(
-            test_mode=bool(params.get("test_mode", params.get("test", False))),
-            toc_urls=_string_list(params.get("toc_urls") or params.get("toc_url")),
-            toc_list=params.get("toc_list"),
-            in_network_url=params.get("in_network_url"),
-            allowed_url=params.get("allowed_url"),
-            provider_ref_url=params.get("provider_ref_url"),
-            import_id=params.get("import_id"),
-            source_key=params.get("source_key"),
-            import_month=params.get("import_month"),
-            max_files=_optional_int(params.get("max_files")),
-            max_items=_optional_int(params.get("max_items")),
-            plan_ids=_string_list(params.get("plan_ids") or params.get("plan_id")),
-            plan_name_contains=_string_list(params.get("plan_name_contains")),
-            plan_market_types=_string_list(params.get("plan_market_types") or params.get("plan_market_type")),
-            file_url_contains=_string_list(params.get("file_url_contains")),
-            reuse_raw_artifacts=bool(params.get("reuse_raw_artifacts", True)),
-            keep_partial_artifacts=params.get("keep_partial_artifacts"),
-            control_run_id=run_id,
-        )
+        _assert_expected_lane(params)
+        with _ptg_lane_environment(params):
+            result = await ptg_main(
+                test_mode=bool(params.get("test_mode", params.get("test", False))),
+                toc_urls=_string_list(params.get("toc_urls") or params.get("toc_url")),
+                toc_list=params.get("toc_list"),
+                in_network_url=params.get("in_network_url"),
+                allowed_url=params.get("allowed_url"),
+                provider_ref_url=params.get("provider_ref_url"),
+                import_id=params.get("import_id"),
+                source_key=params.get("source_key"),
+                import_month=params.get("import_month"),
+                max_files=_optional_int(params.get("max_files")),
+                max_items=_optional_int(params.get("max_items")),
+                plan_ids=_string_list(params.get("plan_ids") or params.get("plan_id")),
+                plan_name_contains=_string_list(params.get("plan_name_contains")),
+                plan_market_types=_string_list(params.get("plan_market_types") or params.get("plan_market_type")),
+                file_url_contains=_string_list(params.get("file_url_contains")),
+                reuse_raw_artifacts=bool(params.get("reuse_raw_artifacts", True)),
+                keep_partial_artifacts=params.get("keep_partial_artifacts"),
+                control_run_id=run_id,
+            )
     except ImportCancelledError:
         await mark_control_run(run_id, status="canceled", phase_detail="ptg import canceled", progress_message="canceled")
         await _flush_terminal_status_events()
@@ -72,6 +81,53 @@ async def _flush_terminal_status_events() -> None:
     if timeout <= 0:
         return
     await flush_status_events(timeout_seconds=timeout)
+
+
+def _assert_expected_lane(params: dict[str, Any]) -> None:
+    expected_queue = str(params.get("_expected_queue") or "").strip()
+    active_queue = os.getenv("HLTHPRT_ACTIVE_WORKER_QUEUE", "").strip()
+    if expected_queue and active_queue and expected_queue != active_queue:
+        raise RuntimeError(f"PTG payload expected {expected_queue}, but active worker queue is {active_queue}")
+    expected_class = str(params.get("_expected_worker_class") or "").strip()
+    active_class = os.getenv("HLTHPRT_ACTIVE_WORKER_CLASS", "").strip()
+    if expected_class and active_class and expected_class != active_class:
+        raise RuntimeError(f"PTG payload expected {expected_class}, but active worker class is {active_class}")
+
+
+@contextmanager
+def _ptg_lane_environment(params: dict[str, Any]):
+    overrides = {
+        PTG2_RUST_WORKERS_ENV: _optional_env_value(params.get("_scanner_rust_workers")),
+        PTG2_RUST_PARSE_IN_WORKERS_ENV: _bool_env_value(params.get("_scanner_parse_in_workers")),
+        PTG2_RUST_WORK_QUEUE_ENV: _optional_env_value(params.get("_scanner_work_queue")),
+        PTG2_RUST_EVENT_QUEUE_ENV: _optional_env_value(params.get("_scanner_event_queue")),
+    }
+    previous: dict[str, str | None] = {}
+    try:
+        for name, value in overrides.items():
+            if value is None:
+                continue
+            previous[name] = os.environ.get(name)
+            os.environ[name] = value
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def _optional_env_value(value: Any) -> str | None:
+    if value is None or value == "":
+        return None
+    return str(value)
+
+
+def _bool_env_value(value: Any) -> str | None:
+    if value is None or value == "":
+        return None
+    return "true" if str(value).strip().lower() in {"1", "true", "yes", "on"} else "false"
 
 
 def _string_list(value: Any) -> list[str] | None:

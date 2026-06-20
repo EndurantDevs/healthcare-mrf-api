@@ -152,6 +152,27 @@ class MRF:
     job_deserializer = deserialize_job
 
 
+def _worker_int_env(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, "").strip() or default)
+    except ValueError:
+        return default
+
+
+def _ptg_max_jobs(name: str, default: int) -> int:
+    return max(_worker_int_env(name, default), 1)
+
+
+def _ptg_queue_read_limit(name: str, max_jobs: int) -> int:
+    raw = os.environ.get(name)
+    if raw:
+        try:
+            return max(int(raw), 1)
+        except ValueError:
+            pass
+    return max(16, 4 * max_jobs)
+
+
 class PTG:  # pylint: disable=too-few-public-methods
     functions = [ptg_control_start]
     on_startup = db_startup
@@ -164,6 +185,58 @@ class PTG:  # pylint: disable=too-few-public-methods
     job_timeout = int(os.environ.get("HLTHPRT_PTG_JOB_TIMEOUT")) if os.environ.get("HLTHPRT_PTG_JOB_TIMEOUT") else 172800
     burst = True
     queue_name = "arq:PTG"
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
+class PTGSmall:  # pylint: disable=too-few-public-methods
+    functions = [ptg_control_start]
+    on_startup = db_startup
+    max_jobs = _ptg_max_jobs("HLTHPRT_MAX_PTG_SMALL_JOBS", 16)
+    queue_read_limit = _ptg_queue_read_limit("HLTHPRT_PTG_SMALL_QUEUE_READ_LIMIT", max_jobs)
+    job_timeout = _worker_int_env("HLTHPRT_PTG_JOB_TIMEOUT", 172800)
+    burst = True
+    queue_name = "arq:PTGSmall"
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
+class PTGNormal:  # pylint: disable=too-few-public-methods
+    functions = [ptg_control_start]
+    on_startup = db_startup
+    max_jobs = _ptg_max_jobs("HLTHPRT_MAX_PTG_NORMAL_JOBS", 8)
+    queue_read_limit = _ptg_queue_read_limit("HLTHPRT_PTG_NORMAL_QUEUE_READ_LIMIT", max_jobs)
+    job_timeout = _worker_int_env("HLTHPRT_PTG_JOB_TIMEOUT", 172800)
+    burst = True
+    queue_name = "arq:PTGNormal"
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
+class PTGLarge:  # pylint: disable=too-few-public-methods
+    functions = [ptg_control_start]
+    on_startup = db_startup
+    max_jobs = _ptg_max_jobs("HLTHPRT_MAX_PTG_LARGE_JOBS", 3)
+    queue_read_limit = _ptg_queue_read_limit("HLTHPRT_PTG_LARGE_QUEUE_READ_LIMIT", max_jobs)
+    job_timeout = _worker_int_env("HLTHPRT_PTG_JOB_TIMEOUT", 172800)
+    burst = True
+    queue_name = "arq:PTGLarge"
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
+class PTGHuge:  # pylint: disable=too-few-public-methods
+    functions = [ptg_control_start]
+    on_startup = db_startup
+    max_jobs = _ptg_max_jobs("HLTHPRT_MAX_PTG_HUGE_JOBS", 1)
+    queue_read_limit = _ptg_queue_read_limit("HLTHPRT_PTG_HUGE_QUEUE_READ_LIMIT", max_jobs)
+    job_timeout = _worker_int_env("HLTHPRT_PTG_JOB_TIMEOUT", 172800)
+    burst = True
+    queue_name = "arq:PTGHuge"
     redis_settings = build_redis_settings()
     job_serializer = serialize_job
     job_deserializer = deserialize_job

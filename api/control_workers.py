@@ -26,6 +26,10 @@ class WorkerSpec:
 
 _START_WORKERS: tuple[WorkerSpec, ...] = (
     WorkerSpec("arq:PTG", "process.PTG", ("ptg",)),
+    WorkerSpec("arq:PTGSmall", "process.PTGSmall", ("ptg",)),
+    WorkerSpec("arq:PTGNormal", "process.PTGNormal", ("ptg",)),
+    WorkerSpec("arq:PTGLarge", "process.PTGLarge", ("ptg",)),
+    WorkerSpec("arq:PTGHuge", "process.PTGHuge", ("ptg",)),
     WorkerSpec("arq:MRF", "process.MRF", ("mrf",)),
     WorkerSpec("arq:NPI", "process.NPI", ("npi",)),
     WorkerSpec("arq:NUCC", "process.NUCC", ("nucc",)),
@@ -66,7 +70,11 @@ _FINISH_WORKERS: tuple[WorkerSpec, ...] = (
 
 _WORKERS = (*_START_WORKERS, *_FINISH_WORKERS)
 _BY_QUEUE = {spec.queue: spec for spec in _WORKERS}
-_BY_IMPORTER_ROLE = {(importer, spec.role): spec for spec in _WORKERS for importer in spec.importers}
+_BY_WORKER_CLASS = {spec.worker_class: spec for spec in _WORKERS}
+_BY_IMPORTER_ROLE: dict[tuple[str, str], WorkerSpec] = {}
+for _spec in _WORKERS:
+    for _importer in _spec.importers:
+        _BY_IMPORTER_ROLE.setdefault((_importer, _spec.role), _spec)
 _ENGINE_LABEL = "mrf"
 _K8S_API_TOKEN = Path("/var/run/secrets/kubernetes.io/serviceaccount/token")
 _K8S_API_CA = Path("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
@@ -98,7 +106,15 @@ def ensure_worker(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _resolve_specs(payload: dict[str, Any]) -> list[WorkerSpec]:
+    worker_class = str(payload.get("worker_class") or "").strip()
     queue = str(payload.get("queue") or "").strip()
+    if worker_class:
+        spec = _BY_WORKER_CLASS.get(worker_class)
+        if spec is None:
+            return []
+        if queue and spec.queue != queue:
+            return []
+        return [spec]
     if queue:
         spec = _BY_QUEUE.get(queue)
         return [spec] if spec is not None else []
@@ -161,6 +177,8 @@ def _start_process(spec: WorkerSpec, payload: dict[str, Any]) -> int:
     log_path = _log_path(spec)
     cmd = [sys.executable, str(_main_path()), "worker", spec.worker_class, "--burst"]
     env = os.environ.copy()
+    env["HLTHPRT_ACTIVE_WORKER_CLASS"] = spec.worker_class
+    env["HLTHPRT_ACTIVE_WORKER_QUEUE"] = spec.queue
     import_id = str(payload.get("import_id") or "").strip()
     if import_id:
         env["HLTHPRT_IMPORT_ID_OVERRIDE"] = import_id
@@ -311,6 +329,8 @@ def _worker_job_manifest(spec: WorkerSpec, payload: dict[str, Any], image: str) 
     env = [
         {"name": "HLTHPRT_WORKER_LAUNCHER", "value": "process"},
         {"name": "HLTHPRT_IMPORT_NODE_ID", "value": os.getenv("HLTHPRT_IMPORT_NODE_ID", "")},
+        {"name": "HLTHPRT_ACTIVE_WORKER_CLASS", "value": spec.worker_class},
+        {"name": "HLTHPRT_ACTIVE_WORKER_QUEUE", "value": spec.queue},
     ]
     import_id = str(payload.get("import_id") or "").strip()
     if import_id:
@@ -327,7 +347,7 @@ def _worker_job_manifest(spec: WorkerSpec, payload: dict[str, Any], image: str) 
     env_from = _worker_job_env_from()
     if env_from:
         container["envFrom"] = env_from
-    resources = _worker_job_resources()
+    resources = _worker_job_resources(spec, payload)
     if resources:
         container["resources"] = resources
     volumes = _worker_job_pvc_volumes()
@@ -399,7 +419,10 @@ def _worker_job_env_from() -> list[dict[str, Any]]:
     return env_from
 
 
-def _worker_job_resources() -> dict[str, Any]:
+def _worker_job_resources(spec: WorkerSpec, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    profile = _worker_job_resource_profile(spec, payload or {})
+    if profile:
+        return profile
     requests = {
         key: value
         for key, value in {
@@ -421,6 +444,50 @@ def _worker_job_resources() -> dict[str, Any]:
         resources["requests"] = requests
     if limits:
         resources["limits"] = limits
+    return resources
+
+
+def _worker_job_resource_profile(spec: WorkerSpec, payload: dict[str, Any]) -> dict[str, Any]:
+    raw = os.getenv("HLTHPRT_WORKER_JOB_RESOURCE_PROFILES_JSON", "").strip()
+    if not raw:
+        return {}
+    try:
+        profiles = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(profiles, dict):
+        return {}
+    resource_class = str(payload.get("resource_class") or "").strip()
+    candidates = [
+        spec.worker_class,
+        spec.queue,
+        resource_class,
+        f"ptg:{resource_class}" if resource_class else "",
+    ]
+    for key in candidates:
+        if not key:
+            continue
+        profile = profiles.get(key)
+        if isinstance(profile, dict):
+            normalized = _normalize_resource_profile(profile)
+            if normalized:
+                return normalized
+    return {}
+
+
+def _normalize_resource_profile(profile: dict[str, Any]) -> dict[str, Any]:
+    resources: dict[str, Any] = {}
+    for section in ("requests", "limits"):
+        values = profile.get(section)
+        if not isinstance(values, dict):
+            continue
+        normalized = {
+            key: str(value).strip()
+            for key, value in values.items()
+            if key in {"cpu", "memory"} and str(value).strip()
+        }
+        if normalized:
+            resources[section] = normalized
     return resources
 
 

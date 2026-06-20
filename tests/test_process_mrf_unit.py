@@ -105,6 +105,28 @@ def test_ptg_queue_read_limit_can_be_configured(monkeypatch):
         importlib.reload(process_pkg)
 
 
+def test_ptg_lane_worker_defaults(monkeypatch):
+    for name in (
+        "HLTHPRT_MAX_PTG_SMALL_JOBS",
+        "HLTHPRT_MAX_PTG_NORMAL_JOBS",
+        "HLTHPRT_MAX_PTG_LARGE_JOBS",
+        "HLTHPRT_MAX_PTG_HUGE_JOBS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    reloaded = importlib.reload(process_pkg)
+
+    try:
+        assert reloaded.PTGSmall.queue_name == "arq:PTGSmall"
+        assert reloaded.PTGSmall.max_jobs == 16
+        assert reloaded.PTGNormal.max_jobs == 8
+        assert reloaded.PTGLarge.max_jobs == 3
+        assert reloaded.PTGHuge.max_jobs == 1
+        assert reloaded.PTGHuge.queue_read_limit == 16
+    finally:
+        importlib.reload(process_pkg)
+
+
 def test_mrf_finish_worker_configuration():
     names = [fn.__name__ for fn in process_pkg.MRF_finish.functions]
     assert names == ["shutdown"]

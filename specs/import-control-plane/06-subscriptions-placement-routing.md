@@ -38,12 +38,20 @@ Select node by:
 - Healthy node status.
 - Base dataset freshness.
 - Disk free.
-- PTG slot availability.
+- PTG memory-lane availability.
 - Queue depth.
 - Optional source/client affinity.
 - Replication requirements.
 
 Default PTG replication factor is 1.
+
+PTG placement is memory-budgeted. A planned file import is classified as
+`small`, `normal`, `large`, or `huge` from historical peak memory first, then
+source-file size/count metadata, then conservative defaults. The selected class
+determines the queue, worker class, Kubernetes resource profile, and whether
+Rust parse-in-workers is enabled. A node may accept more small/normal files
+while a large import is running if its memory budget has headroom; huge imports
+remain isolated.
 
 ## Route Index
 
@@ -68,3 +76,5 @@ After successful import:
 - Multiple client requests to one file produce one import.
 - Route index can route exact-source PTG queries to the correct node.
 - Disabling a node removes or de-prioritizes its routes.
+- Lane routing records `metrics.ptg_resource` and keeps planned work blocked
+  rather than over-admitting when node memory budget is exhausted.

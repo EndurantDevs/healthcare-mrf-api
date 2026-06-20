@@ -18,6 +18,10 @@ def test_worker_registry_exposes_shared_and_finish_workers():
     assert by_importer["ms-drg"]["worker_class"] == "process.MSDRG"
     assert by_importer["openaddresses"]["worker_class"] == "process.OpenAddresses"
     assert by_queue["arq:OpenAddresses"]["role"] == "start"
+    assert by_queue["arq:PTGSmall"]["worker_class"] == "process.PTGSmall"
+    assert by_queue["arq:PTGNormal"]["worker_class"] == "process.PTGNormal"
+    assert by_queue["arq:PTGLarge"]["worker_class"] == "process.PTGLarge"
+    assert by_queue["arq:PTGHuge"]["worker_class"] == "process.PTGHuge"
     assert by_queue["arq:PartDFormularyNetwork_finish"]["role"] == "finish"
     assert by_queue["arq:PTGAddress_finish"]["role"] == "finish"
 
@@ -79,6 +83,43 @@ def test_ensure_worker_uses_finish_role_for_finalizing_run(monkeypatch, tmp_path
     assert captured["cmd"][-2:] == ["process.PartDFormularyNetwork_finish", "--burst"]
 
 
+def test_ensure_worker_uses_explicit_ptg_lane(monkeypatch, tmp_path):
+    class FakeProcess:
+        pid = 789
+
+    captured: dict[str, object] = {}
+
+    monkeypatch.setenv("HLTHPRT_WORKER_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("HLTHPRT_WORKER_LOG_DIR", str(tmp_path / "logs"))
+
+    def fake_popen(cmd, *, env, **_kwargs):
+        captured["cmd"] = cmd
+        captured["env"] = env
+        return FakeProcess()
+
+    monkeypatch.setattr(control_workers.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(control_workers, "_pid_running", lambda pid: pid == FakeProcess.pid)
+    monkeypatch.setattr(control_workers, "_pid_matches_spec", lambda pid, spec: True)
+
+    result = control_workers.ensure_worker(
+        {"importer": "ptg", "queue": "arq:PTGSmall", "worker_class": "process.PTGSmall", "run_id": "run_ptg"}
+    )
+
+    assert result["status"] == "started"
+    assert result["items"][0]["worker_class"] == "process.PTGSmall"
+    assert captured["cmd"][-2:] == ["process.PTGSmall", "--burst"]
+    assert captured["env"]["HLTHPRT_ACTIVE_WORKER_QUEUE"] == "arq:PTGSmall"
+    assert captured["env"]["HLTHPRT_ACTIVE_WORKER_CLASS"] == "process.PTGSmall"
+
+
+def test_ensure_worker_rejects_mismatched_explicit_ptg_lane():
+    result = control_workers.ensure_worker(
+        {"importer": "ptg", "queue": "arq:PTGSmall", "worker_class": "process.PTGLarge", "run_id": "run_ptg"}
+    )
+
+    assert result["status"] == "unsupported"
+
+
 def test_ensure_worker_can_create_kubernetes_job(monkeypatch):
     calls: list[tuple[str, str, dict[str, object] | None]] = []
 
@@ -128,6 +169,41 @@ def test_ensure_worker_can_create_kubernetes_job(monkeypatch):
     assert "parallelism" not in job["spec"]
     assert "completions" not in job["spec"]
     assert job["spec"]["activeDeadlineSeconds"] == 43200
+
+
+def test_kubernetes_worker_job_uses_resource_profile(monkeypatch):
+    calls: list[tuple[str, str, dict[str, object] | None]] = []
+
+    def fake_request(method, path, body=None):
+        calls.append((method, path, body))
+        if method == "GET" and any(item[0] == "POST" for item in calls):
+            return {"items": [{"metadata": {"name": "worker-job"}, "status": {"active": 1}}]}
+        return {"items": []}
+
+    monkeypatch.setenv("HLTHPRT_WORKER_LAUNCHER", "kubernetes")
+    monkeypatch.setenv("HLTHPRT_WORKER_JOB_IMAGE", "ghcr.io/endurantdevs/healthcare-mrf-api:dev")
+    monkeypatch.setenv(
+        "HLTHPRT_WORKER_JOB_RESOURCE_PROFILES_JSON",
+        '{"process.PTGSmall":{"requests":{"cpu":"2","memory":"4Gi"},"limits":{"cpu":"4","memory":"8Gi"}}}',
+    )
+    monkeypatch.setattr(control_workers, "_kubernetes_configured", lambda: True)
+    monkeypatch.setattr(control_workers, "_kubernetes_namespace", lambda: "healthporta-dev")
+    monkeypatch.setattr(control_workers, "_kubernetes_request", fake_request)
+
+    result = control_workers.ensure_worker(
+        {"importer": "ptg", "queue": "arq:PTGSmall", "worker_class": "process.PTGSmall", "run_id": "run_ptg"}
+    )
+
+    assert result["status"] == "started"
+    job = next(call[2] for call in calls if call[0] == "POST")
+    container = job["spec"]["template"]["spec"]["containers"][0]
+    assert container["resources"] == {
+        "requests": {"cpu": "2", "memory": "4Gi"},
+        "limits": {"cpu": "4", "memory": "8Gi"},
+    }
+    env = {item["name"]: item["value"] for item in container["env"]}
+    assert env["HLTHPRT_ACTIVE_WORKER_QUEUE"] == "arq:PTGSmall"
+    assert env["HLTHPRT_ACTIVE_WORKER_CLASS"] == "process.PTGSmall"
 
 
 def test_kubernetes_start_worker_replicas_use_parallel_job(monkeypatch):
