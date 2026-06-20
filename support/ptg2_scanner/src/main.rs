@@ -2,8 +2,9 @@ use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use ptg2_scanner::address_canon::{canon_version_json, canonicalize_copy_file};
 use ptg2_scanner::config::{
     env_bool, env_usize, progress_interval, split_interval, DEFAULT_COMPACT_COPY_ROTATE_BYTES,
-    DEFAULT_COMPACT_RUST_WORKERS, DEFAULT_COMPACT_RUST_WORK_QUEUE, DEFAULT_PROGRESS_BYTES,
-    DEFAULT_PROGRESS_OBJECTS, DEFAULT_SPLIT_NEGOTIATED_RATES, READ_BUF_SIZE,
+    DEFAULT_COMPACT_RUST_WORKERS, DEFAULT_COMPACT_RUST_WORK_QUEUE, DEFAULT_PARSE_IN_WORKERS,
+    DEFAULT_PROGRESS_BYTES, DEFAULT_PROGRESS_OBJECTS, DEFAULT_SPLIT_NEGOTIATED_RATES,
+    READ_BUF_SIZE,
 };
 use ptg2_scanner::copy_format::{
     emit_compact_copy_row, emit_manifest_serving_copy_row, pg_text_array_field, pg_text_copy_field,
@@ -3605,7 +3606,10 @@ fn scan_compact_struson_parallel(
         "HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES",
         DEFAULT_SPLIT_NEGOTIATED_RATES,
     );
-    let parse_in_workers = env_bool("HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS", false);
+    let parse_in_workers = env_bool(
+        "HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS",
+        DEFAULT_PARSE_IN_WORKERS,
+    );
     let bounded_queue_size = queue_size.max(worker_count).max(1);
     let dedupe = Arc::new(SharedDedupe::new(worker_count));
     let manifest_sidecars = if copy_paths.has_manifest_sidecar_paths() {

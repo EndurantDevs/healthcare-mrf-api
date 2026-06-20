@@ -9,6 +9,7 @@ pub const DEFAULT_SPLIT_NEGOTIATED_RATES: usize = 4096;
 pub const DEFAULT_COMPACT_RUST_WORKERS: usize = 8;
 pub const DEFAULT_COMPACT_RUST_WORK_QUEUE: usize = 16;
 pub const DEFAULT_COMPACT_COPY_ROTATE_BYTES: u64 = 128 * 1024 * 1024;
+pub const DEFAULT_PARSE_IN_WORKERS: bool = true;
 
 pub fn split_interval(name: &str, default_value: usize) -> usize {
     env::var(name)
@@ -85,6 +86,22 @@ mod tests {
         });
         scoped_env("PTG2_SCANNER_TEST_BOOL", Some("unknown"), || {
             assert!(env_bool("PTG2_SCANNER_TEST_BOOL", true));
+        });
+    }
+
+    #[test]
+    fn parse_in_workers_defaults_on_but_can_be_disabled() {
+        scoped_env("HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS", None, || {
+            assert!(env_bool(
+                "HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS",
+                DEFAULT_PARSE_IN_WORKERS
+            ));
+        });
+        scoped_env("HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS", Some("false"), || {
+            assert!(!env_bool(
+                "HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS",
+                DEFAULT_PARSE_IN_WORKERS
+            ));
         });
     }
 }
