@@ -1,0 +1,83 @@
+{
+  "version": 1,
+  "description": "Default PTG2 research-branch benchmark suite. Synthetic scanner fixtures run locally; local_ptg_cli requires PostgreSQL on 5440; pilot import is dry-run unless control_url and token are supplied.",
+  "scanner_binary": "support/ptg2_scanner/target/release/ptg2_scanner",
+  "gates": {
+    "min_improvement_pct": 15.0,
+    "max_memory_growth_pct": 20.0
+  },
+  "variants": [
+    {
+      "id": "baseline",
+      "description": "Current guarded scanner behavior.",
+      "env": {
+        "HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS": "false",
+        "HLTHPRT_PTG2_RUST_WORKERS": "2",
+        "HLTHPRT_PTG2_RUST_WORK_QUEUE": "2",
+        "HLTHPRT_PTG2_RUST_EVENT_QUEUE": "8"
+      }
+    },
+    {
+      "id": "parse_in_workers",
+      "description": "Move negotiated-rate parsing into worker threads for comparison.",
+      "env": {
+        "HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS": "true",
+        "HLTHPRT_PTG2_RUST_WORKERS": "2",
+        "HLTHPRT_PTG2_RUST_WORK_QUEUE": "2",
+        "HLTHPRT_PTG2_RUST_EVENT_QUEUE": "8"
+      },
+      "params": {
+        "resource_class": "small",
+        "_expected_queue": "arq:PTGSmall",
+        "_expected_worker_class": "process.PTGSmall"
+      }
+    }
+  ],
+  "cases": [
+    {
+      "id": "large-in-network-fixture",
+      "kind": "scanner_fixture",
+      "fixture": "large_in_network",
+      "negotiated_rates": 8192,
+      "split_negotiated_rates": 256,
+      "variants": ["baseline", "parse_in_workers"]
+    },
+    {
+      "id": "duplicate-serving-fixture",
+      "kind": "scanner_fixture",
+      "fixture": "duplicate_serving",
+      "split_negotiated_rates": 1,
+      "gates": {
+        "performance": false
+      },
+      "variants": ["baseline", "parse_in_workers"]
+    },
+    {
+      "id": "local-db-smoke",
+      "kind": "local_ptg_cli",
+      "fixture": "duplicate_serving",
+      "source_key": "local-play-harness",
+      "import_month": "2026-06",
+      "max_files": 1,
+      "max_items": 5,
+      "gates": {
+        "performance": false
+      },
+      "variants": ["baseline", "parse_in_workers"]
+    },
+    {
+      "id": "ptg-pilot-import",
+      "kind": "import_control_pilot",
+      "variants": ["parse_in_workers"],
+      "params": {
+        "test_mode": true,
+        "max_files": 1,
+        "max_items": 1000,
+        "reuse_raw_artifacts": true,
+        "resource_class": "small",
+        "_expected_queue": "arq:PTGSmall",
+        "_expected_worker_class": "process.PTGSmall"
+      }
+    }
+  ]
+}
