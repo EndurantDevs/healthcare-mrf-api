@@ -3439,6 +3439,58 @@ def test_ptg2_manifest_snapshot_publish_can_fallback_to_db_dedupe(monkeypatch):
     assert "SELECT DISTINCT ON (provider_group_global_id_128, npi)" in joined
 
 
+def test_ptg2_manifest_snapshot_publish_rescues_duplicate_serving_index(monkeypatch):
+    status_calls = []
+    failed_unique_once = False
+
+    async def fake_status(statement, **_params):
+        nonlocal failed_unique_once
+        status_calls.append(statement)
+        if (
+            "CREATE UNIQUE INDEX" in statement
+            and "content_uidx" in statement
+            and "serving_content_hash_128" in statement
+            and not failed_unique_once
+        ):
+            failed_unique_once = True
+            raise RuntimeError(
+                "asyncpg.exceptions.UniqueViolationError: could not create unique index; "
+                "DETAIL: Key (serving_content_hash_128) is duplicated."
+            )
+
+    async def fake_table_exists(_schema, table):
+        return table == "ptg2_manifest_stage_serving_abc"
+
+    monkeypatch.setattr(ptg_manifest_publish.db, "status", fake_status)
+    monkeypatch.setattr(ptg_manifest_publish, "_table_exists", fake_table_exists)
+    monkeypatch.setattr(ptg_manifest_publish, "_table_has_rows", AsyncMock(return_value=True))
+    monkeypatch.setattr(ptg_manifest_publish, "_exact_table_rows", AsyncMock(side_effect=[10, 9, 9]))
+
+    result = asyncio.run(
+        process_ptg._publish_ptg2_manifest_serving_snapshot(
+            "ptg2_manifest_stage_serving_abc",
+            snapshot_id="ptg2:202604:snap",
+            source_key="heartland_dental",
+            db_dedupe_fallback=False,
+        )
+    )
+
+    joined = "\n".join(status_calls)
+    serving_unique_attempts = [
+        statement
+        for statement in status_calls
+        if "CREATE UNIQUE INDEX" in statement
+        and "content_uidx" in statement
+        and "serving_content_hash_128" in statement
+    ]
+    assert len(serving_unique_attempts) == 2
+    assert "SELECT DISTINCT ON (serving_content_hash_128)" in joined
+    assert result["rate_count"] == 9
+    assert result["dedupe"]["db_dedupe"] is True
+    assert result["dedupe"]["rescue"] is True
+    assert result["dedupe"]["serving"] == {"before": 10, "after": 9, "dropped": 1}
+
+
 def test_ptg2_manifest_precopy_merge_copies_merged_files(monkeypatch, tmp_path):
     merge_calls = []
     copy_calls = []

@@ -178,6 +178,134 @@ async def _copy_ptg2_manifest_file(copy_path: Path, *, target_table: str, column
             )
 
 
+def _looks_like_unique_index_duplicate(exc: Exception) -> bool:
+    parts = [str(exc)]
+    orig = getattr(exc, "orig", None)
+    if orig is not None:
+        parts.append(str(orig))
+        cause = getattr(orig, "__cause__", None)
+        if cause is not None:
+            parts.append(str(cause))
+    message = " ".join(parts).lower()
+    return (
+        "uniqueviolation" in message
+        or "unique violation" in message
+        or (
+            "could not create unique index" in message
+            and ("duplicate" in message or "duplicated" in message)
+        )
+    )
+
+
+async def _dedupe_ptg2_manifest_serving_table(schema_name: str, final_table: str) -> dict[str, int]:
+    serving_rows_before_dedupe = await _exact_table_rows(schema_name, final_table)
+    dedup_table = _ptg2_snapshot_index_name(final_table, "dedup")
+    await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(dedup_table)};")
+    await db.status(
+        f"""
+        CREATE UNLOGGED TABLE {_quote_ident(schema_name)}.{_quote_ident(dedup_table)} AS
+        SELECT DISTINCT ON (serving_content_hash_128)
+            serving_content_hash_128,
+            plan_id,
+            procedure_global_id_128,
+            reported_code_system,
+            reported_code,
+            provider_set_global_id_128,
+            provider_count,
+            price_set_global_id_128,
+            source_trace_set_hash
+        FROM {_quote_ident(schema_name)}.{_quote_ident(final_table)}
+        ORDER BY serving_content_hash_128, source_trace_set_hash NULLS LAST;
+        """
+    )
+    await db.status(f"DROP TABLE {_quote_ident(schema_name)}.{_quote_ident(final_table)};")
+    await db.status(
+        f"""
+        ALTER TABLE {_quote_ident(schema_name)}.{_quote_ident(dedup_table)}
+        RENAME TO {_quote_ident(final_table)};
+        """
+    )
+    serving_rows_after_dedupe = await _exact_table_rows(schema_name, final_table)
+    return {
+        "before": serving_rows_before_dedupe,
+        "after": serving_rows_after_dedupe,
+        "dropped": max(serving_rows_before_dedupe - serving_rows_after_dedupe, 0),
+    }
+
+
+async def _dedupe_ptg2_manifest_price_atom_table(schema_name: str, price_atom_table: str) -> dict[str, int]:
+    price_atom_rows_before_dedupe = await _exact_table_rows(schema_name, price_atom_table)
+    price_atom_dedup_table = _ptg2_snapshot_index_name(price_atom_table, "dedup")
+    await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(price_atom_dedup_table)};")
+    await db.status(
+        f"""
+        CREATE UNLOGGED TABLE {_quote_ident(schema_name)}.{_quote_ident(price_atom_dedup_table)} AS
+        SELECT DISTINCT ON (price_atom_global_id_128)
+            price_atom_global_id_128,
+            negotiated_type,
+            negotiated_rate,
+            expiration_date,
+            service_code,
+            billing_class,
+            setting,
+            billing_code_modifier,
+            additional_information
+        FROM {_quote_ident(schema_name)}.{_quote_ident(price_atom_table)}
+        ORDER BY price_atom_global_id_128;
+        """
+    )
+    await db.status(f"DROP TABLE {_quote_ident(schema_name)}.{_quote_ident(price_atom_table)};")
+    await db.status(
+        f"""
+        ALTER TABLE {_quote_ident(schema_name)}.{_quote_ident(price_atom_dedup_table)}
+        RENAME TO {_quote_ident(price_atom_table)};
+        """
+    )
+    price_atom_rows_after_dedupe = await _exact_table_rows(schema_name, price_atom_table)
+    return {
+        "before": price_atom_rows_before_dedupe,
+        "after": price_atom_rows_after_dedupe,
+        "dropped": max(price_atom_rows_before_dedupe - price_atom_rows_after_dedupe, 0),
+    }
+
+
+async def _dedupe_ptg2_manifest_provider_group_member_table(
+    schema_name: str,
+    provider_group_member_table: str,
+) -> dict[str, int]:
+    provider_group_member_rows_before_dedupe = await _exact_table_rows(schema_name, provider_group_member_table)
+    provider_group_member_dedup_table = _ptg2_snapshot_index_name(provider_group_member_table, "dedup")
+    await db.status(
+        f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(provider_group_member_dedup_table)};"
+    )
+    await db.status(
+        f"""
+        CREATE UNLOGGED TABLE {_quote_ident(schema_name)}.{_quote_ident(provider_group_member_dedup_table)} AS
+        SELECT DISTINCT ON (provider_group_global_id_128, npi)
+            provider_group_global_id_128,
+            npi
+        FROM {_quote_ident(schema_name)}.{_quote_ident(provider_group_member_table)}
+        ORDER BY provider_group_global_id_128, npi;
+        """
+    )
+    await db.status(f"DROP TABLE {_quote_ident(schema_name)}.{_quote_ident(provider_group_member_table)};")
+    await db.status(
+        f"""
+        ALTER TABLE {_quote_ident(schema_name)}.{_quote_ident(provider_group_member_dedup_table)}
+        RENAME TO {_quote_ident(provider_group_member_table)};
+        """
+    )
+    provider_group_member_rows_after_dedupe = await _exact_table_rows(schema_name, provider_group_member_table)
+    return {
+        "before": provider_group_member_rows_before_dedupe,
+        "after": provider_group_member_rows_after_dedupe,
+        "dropped": max(
+            provider_group_member_rows_before_dedupe - provider_group_member_rows_after_dedupe,
+            0,
+        ),
+    }
+
+
 async def _publish_ptg2_manifest_serving_snapshot(
     stage_table: str,
     *,
@@ -232,49 +360,39 @@ async def _publish_ptg2_manifest_serving_snapshot(
         else bool(db_dedupe_fallback)
     )
     dedupe_metrics: dict[str, Any] = {"db_dedupe": use_db_dedupe}
+    serving_deduped = False
     if use_db_dedupe:
-        serving_rows_before_dedupe = await _exact_table_rows(schema_name, final_table)
-        dedup_table = _ptg2_snapshot_index_name(final_table, "dedup")
-        await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(dedup_table)};")
-        await db.status(
-            f"""
-            CREATE UNLOGGED TABLE {_quote_ident(schema_name)}.{_quote_ident(dedup_table)} AS
-            SELECT DISTINCT ON (serving_content_hash_128)
-                serving_content_hash_128,
-                plan_id,
-                procedure_global_id_128,
-                reported_code_system,
-                reported_code,
-                provider_set_global_id_128,
-                provider_count,
-                price_set_global_id_128,
-                source_trace_set_hash
-            FROM {_quote_ident(schema_name)}.{_quote_ident(final_table)}
-            ORDER BY serving_content_hash_128, source_trace_set_hash NULLS LAST;
-            """
-        )
-        await db.status(f"DROP TABLE {_quote_ident(schema_name)}.{_quote_ident(final_table)};")
-        await db.status(
-            f"""
-            ALTER TABLE {_quote_ident(schema_name)}.{_quote_ident(dedup_table)}
-            RENAME TO {_quote_ident(final_table)};
-            """
-        )
-        serving_rows_after_dedupe = await _exact_table_rows(schema_name, final_table)
-        dedupe_metrics["serving"] = {
-            "before": serving_rows_before_dedupe,
-            "after": serving_rows_after_dedupe,
-            "dropped": max(serving_rows_before_dedupe - serving_rows_after_dedupe, 0),
-        }
+        dedupe_metrics["serving"] = await _dedupe_ptg2_manifest_serving_table(schema_name, final_table)
+        serving_deduped = True
     unique_index = _ptg2_snapshot_index_name(final_table, "content_uidx")
     lookup_index = _ptg2_snapshot_index_name(final_table, "plan_code_lookup_idx")
-    await db.status(
-        f"""
-        CREATE UNIQUE INDEX {_quote_ident(unique_index)}
-        ON {_quote_ident(schema_name)}.{_quote_ident(final_table)}
-        (serving_content_hash_128);
-        """
-    )
+    try:
+        await db.status(
+            f"""
+            CREATE UNIQUE INDEX {_quote_ident(unique_index)}
+            ON {_quote_ident(schema_name)}.{_quote_ident(final_table)}
+            (serving_content_hash_128);
+            """
+        )
+    except Exception as exc:
+        if serving_deduped or not _looks_like_unique_index_duplicate(exc):
+            raise
+        logger.warning(
+            "PTG2 manifest serving unique index found duplicate rows after direct publish; "
+            "running DB dedupe rescue",
+            exc_info=True,
+        )
+        dedupe_metrics["db_dedupe"] = True
+        dedupe_metrics["rescue"] = True
+        dedupe_metrics["serving"] = await _dedupe_ptg2_manifest_serving_table(schema_name, final_table)
+        serving_deduped = True
+        await db.status(
+            f"""
+            CREATE UNIQUE INDEX {_quote_ident(unique_index)}
+            ON {_quote_ident(schema_name)}.{_quote_ident(final_table)}
+            (serving_content_hash_128);
+            """
+        )
     await db.status(
         f"""
         CREATE INDEX {_quote_ident(lookup_index)}
@@ -287,81 +405,50 @@ async def _publish_ptg2_manifest_serving_snapshot(
     # retaining the 128-bit-only btree adds several GB and is not on the API hot path.
     await db.status(f"DROP INDEX {_quote_ident(schema_name)}.{_quote_ident(unique_index)};")
     if await _table_exists(schema_name, price_atom_table):
+        price_atom_deduped = False
         if use_db_dedupe:
-            price_atom_rows_before_dedupe = await _exact_table_rows(schema_name, price_atom_table)
-            price_atom_dedup_table = _ptg2_snapshot_index_name(price_atom_table, "dedup")
-            await db.status(f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(price_atom_dedup_table)};")
-            await db.status(
-                f"""
-                CREATE UNLOGGED TABLE {_quote_ident(schema_name)}.{_quote_ident(price_atom_dedup_table)} AS
-                SELECT DISTINCT ON (price_atom_global_id_128)
-                    price_atom_global_id_128,
-                    negotiated_type,
-                    negotiated_rate,
-                    expiration_date,
-                    service_code,
-                    billing_class,
-                    setting,
-                    billing_code_modifier,
-                    additional_information
-                FROM {_quote_ident(schema_name)}.{_quote_ident(price_atom_table)}
-                ORDER BY price_atom_global_id_128;
-                """
+            dedupe_metrics["price_atom"] = await _dedupe_ptg2_manifest_price_atom_table(
+                schema_name,
+                price_atom_table,
             )
-            await db.status(f"DROP TABLE {_quote_ident(schema_name)}.{_quote_ident(price_atom_table)};")
-            await db.status(
-                f"""
-                ALTER TABLE {_quote_ident(schema_name)}.{_quote_ident(price_atom_dedup_table)}
-                RENAME TO {_quote_ident(price_atom_table)};
-                """
-            )
-            price_atom_rows_after_dedupe = await _exact_table_rows(schema_name, price_atom_table)
-            dedupe_metrics["price_atom"] = {
-                "before": price_atom_rows_before_dedupe,
-                "after": price_atom_rows_after_dedupe,
-                "dropped": max(price_atom_rows_before_dedupe - price_atom_rows_after_dedupe, 0),
-            }
+            price_atom_deduped = True
         price_atom_index = _ptg2_snapshot_index_name(price_atom_table, "primary")
-        await db.status(
-            f"""
-            CREATE UNIQUE INDEX {_quote_ident(price_atom_index)}
-            ON {_quote_ident(schema_name)}.{_quote_ident(price_atom_table)}
-            (price_atom_global_id_128);
-            """
-        )
+        try:
+            await db.status(
+                f"""
+                CREATE UNIQUE INDEX {_quote_ident(price_atom_index)}
+                ON {_quote_ident(schema_name)}.{_quote_ident(price_atom_table)}
+                (price_atom_global_id_128);
+                """
+            )
+        except Exception as exc:
+            if price_atom_deduped or not _looks_like_unique_index_duplicate(exc):
+                raise
+            logger.warning(
+                "PTG2 manifest price atom unique index found duplicate rows after direct publish; "
+                "running DB dedupe rescue",
+                exc_info=True,
+            )
+            dedupe_metrics["db_dedupe"] = True
+            dedupe_metrics["rescue"] = True
+            dedupe_metrics["price_atom"] = await _dedupe_ptg2_manifest_price_atom_table(
+                schema_name,
+                price_atom_table,
+            )
+            price_atom_deduped = True
+            await db.status(
+                f"""
+                CREATE UNIQUE INDEX {_quote_ident(price_atom_index)}
+                ON {_quote_ident(schema_name)}.{_quote_ident(price_atom_table)}
+                (price_atom_global_id_128);
+                """
+            )
     if await _table_exists(schema_name, provider_group_member_table):
         if use_db_dedupe:
-            provider_group_member_rows_before_dedupe = await _exact_table_rows(schema_name, provider_group_member_table)
-            provider_group_member_dedup_table = _ptg2_snapshot_index_name(provider_group_member_table, "dedup")
-            await db.status(
-                f"DROP TABLE IF EXISTS {_quote_ident(schema_name)}.{_quote_ident(provider_group_member_dedup_table)};"
+            dedupe_metrics["provider_group_member"] = await _dedupe_ptg2_manifest_provider_group_member_table(
+                schema_name,
+                provider_group_member_table,
             )
-            await db.status(
-                f"""
-                CREATE UNLOGGED TABLE {_quote_ident(schema_name)}.{_quote_ident(provider_group_member_dedup_table)} AS
-                SELECT DISTINCT ON (provider_group_global_id_128, npi)
-                    provider_group_global_id_128,
-                    npi
-                FROM {_quote_ident(schema_name)}.{_quote_ident(provider_group_member_table)}
-                ORDER BY provider_group_global_id_128, npi;
-                """
-            )
-            await db.status(f"DROP TABLE {_quote_ident(schema_name)}.{_quote_ident(provider_group_member_table)};")
-            await db.status(
-                f"""
-                ALTER TABLE {_quote_ident(schema_name)}.{_quote_ident(provider_group_member_dedup_table)}
-                RENAME TO {_quote_ident(provider_group_member_table)};
-                """
-            )
-            provider_group_member_rows_after_dedupe = await _exact_table_rows(schema_name, provider_group_member_table)
-            dedupe_metrics["provider_group_member"] = {
-                "before": provider_group_member_rows_before_dedupe,
-                "after": provider_group_member_rows_after_dedupe,
-                "dropped": max(
-                    provider_group_member_rows_before_dedupe - provider_group_member_rows_after_dedupe,
-                    0,
-                ),
-            }
         provider_group_member_index = _ptg2_snapshot_index_name(provider_group_member_table, "group_npi_idx")
         provider_group_member_npi_index = _ptg2_snapshot_index_name(provider_group_member_table, "npi_idx")
         await db.status(
