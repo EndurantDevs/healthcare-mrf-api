@@ -20,7 +20,7 @@ import zipfile
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 from urllib.parse import urlparse
 
 from arq import create_pool
@@ -79,6 +79,10 @@ PARTD_CHUNK_STALL_SECONDS = max(
     int(os.getenv("HLTHPRT_PARTD_CHUNK_STALL_SECONDS", "900")),
     60,
 )
+PARTD_PROGRESS_INTERVAL_ROWS = max(
+    int(os.getenv("HLTHPRT_PARTD_PROGRESS_INTERVAL_ROWS", "50000")),
+    1000,
+)
 
 _DATE_PATTERN = re.compile(r"(20\d{2})(\d{2})(\d{2})")
 _NON_DIGIT = re.compile(r"[^0-9]+")
@@ -107,6 +111,23 @@ class SourceArtifact:
     artifact_name: str
     release_date: datetime.date
     cutoff_month: datetime.date
+
+
+@dataclass(frozen=True)
+class ActivityChunkProgress:
+    total_chunks: int
+    done_chunks: int
+    row_count: int
+    bytes_total: int
+    bytes_done: int
+    started_chunks: int
+
+    def pct(self) -> float | None:
+        if self.bytes_total > 0:
+            return min((self.bytes_done / self.bytes_total) * 100.0, 99.9)
+        if self.total_chunks > 0:
+            return min((self.done_chunks / self.total_chunks) * 100.0, 99.9)
+        return None
 
 
 LEGACY_PARTD_TABLES = (
@@ -658,11 +679,58 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
-async def _init_activity_chunk_state(redis, run_id: str, snapshot_id: str, total_chunks: int) -> None:
+def _format_bytes(value: int) -> str:
+    size = float(max(value, 0))
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if size < 1024 or unit == "GiB":
+            if unit == "B":
+                return f"{int(size)} {unit}"
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GiB"
+
+
+def _redis_hash_int_sum(raw_values: Any, *, exclude: set[str] | None = None) -> int:
+    exclude = exclude or set()
+    if not raw_values:
+        return 0
+    if isinstance(raw_values, dict):
+        items = raw_values.items()
+    else:
+        items = []
+    total = 0
+    for raw_key, raw_value in items:
+        key = raw_key.decode("utf-8") if isinstance(raw_key, bytes) else str(raw_key)
+        if key in exclude:
+            continue
+        total += _safe_int(raw_value, 0)
+    return total
+
+
+async def _init_activity_chunk_state(
+    redis,
+    run_id: str,
+    snapshot_id: str,
+    total_chunks: int,
+    *,
+    total_bytes: int = 0,
+) -> None:
     total_key = _state_key(run_id, snapshot_id, "activity_total")
     done_key = _state_key(run_id, snapshot_id, "activity_done")
     rows_key = _state_key(run_id, snapshot_id, "activity_rows")
-    await redis.delete(total_key, done_key, rows_key)
+    started_key = _state_key(run_id, snapshot_id, "activity_started")
+    bytes_total_key = _state_key(run_id, snapshot_id, "activity_bytes_total")
+    bytes_progress_key = _state_key(run_id, snapshot_id, "activity_bytes_progress")
+    rows_progress_key = _state_key(run_id, snapshot_id, "activity_rows_progress")
+    await redis.delete(
+        total_key,
+        done_key,
+        rows_key,
+        started_key,
+        bytes_total_key,
+        bytes_progress_key,
+        rows_progress_key,
+    )
     await redis.set(total_key, str(max(total_chunks, 0)))
     await redis.expire(total_key, 172800)
     await redis.sadd(done_key, "__init__")
@@ -670,6 +738,50 @@ async def _init_activity_chunk_state(redis, run_id: str, snapshot_id: str, total
     await redis.expire(done_key, 172800)
     await redis.set(rows_key, "0")
     await redis.expire(rows_key, 172800)
+    await redis.sadd(started_key, "__init__")
+    await redis.srem(started_key, "__init__")
+    await redis.expire(started_key, 172800)
+    await redis.set(bytes_total_key, str(max(total_bytes, 0)))
+    await redis.expire(bytes_total_key, 172800)
+    await redis.expire(bytes_progress_key, 172800)
+    await redis.expire(rows_progress_key, 172800)
+
+
+async def _mark_activity_chunk_started(
+    redis,
+    run_id: str,
+    snapshot_id: str,
+    chunk_id: str,
+    *,
+    total_bytes: int = 0,
+) -> None:
+    started_key = _state_key(run_id, snapshot_id, "activity_started")
+    bytes_progress_key = _state_key(run_id, snapshot_id, "activity_bytes_progress")
+    await redis.sadd(started_key, chunk_id)
+    await redis.expire(started_key, 172800)
+    if total_bytes > 0:
+        await redis.hset(bytes_progress_key, chunk_id, "0")
+        await redis.expire(bytes_progress_key, 172800)
+
+
+async def _mark_activity_chunk_progress(
+    redis,
+    run_id: str,
+    snapshot_id: str,
+    chunk_id: str,
+    *,
+    processed_bytes: int,
+    accepted_rows: int,
+    total_bytes: int = 0,
+) -> None:
+    bytes_progress_key = _state_key(run_id, snapshot_id, "activity_bytes_progress")
+    rows_progress_key = _state_key(run_id, snapshot_id, "activity_rows_progress")
+    if total_bytes > 0:
+        processed_bytes = min(max(processed_bytes, 0), total_bytes)
+    await redis.hset(bytes_progress_key, chunk_id, str(max(processed_bytes, 0)))
+    await redis.expire(bytes_progress_key, 172800)
+    await redis.hset(rows_progress_key, chunk_id, str(max(accepted_rows, 0)))
+    await redis.expire(rows_progress_key, 172800)
 
 
 async def _mark_activity_chunk_done(
@@ -678,24 +790,57 @@ async def _mark_activity_chunk_done(
     snapshot_id: str,
     chunk_id: str,
     accepted_rows: int,
+    *,
+    total_bytes: int = 0,
 ) -> None:
     done_key = _state_key(run_id, snapshot_id, "activity_done")
     rows_key = _state_key(run_id, snapshot_id, "activity_rows")
+    rows_progress_key = _state_key(run_id, snapshot_id, "activity_rows_progress")
     await redis.sadd(done_key, chunk_id)
     await redis.expire(done_key, 172800)
+    if total_bytes > 0:
+        await _mark_activity_chunk_progress(
+            redis,
+            run_id,
+            snapshot_id,
+            chunk_id,
+            processed_bytes=total_bytes,
+            accepted_rows=accepted_rows,
+            total_bytes=total_bytes,
+        )
     if accepted_rows > 0:
         await redis.incrby(rows_key, int(accepted_rows))
     await redis.expire(rows_key, 172800)
+    await redis.hdel(rows_progress_key, chunk_id)
+    await redis.expire(rows_progress_key, 172800)
 
 
-async def _get_activity_chunk_progress(redis, run_id: str, snapshot_id: str) -> tuple[int, int, int]:
+async def _get_activity_chunk_progress(redis, run_id: str, snapshot_id: str) -> ActivityChunkProgress:
     total_key = _state_key(run_id, snapshot_id, "activity_total")
     done_key = _state_key(run_id, snapshot_id, "activity_done")
     rows_key = _state_key(run_id, snapshot_id, "activity_rows")
+    started_key = _state_key(run_id, snapshot_id, "activity_started")
+    bytes_total_key = _state_key(run_id, snapshot_id, "activity_bytes_total")
+    bytes_progress_key = _state_key(run_id, snapshot_id, "activity_bytes_progress")
+    rows_progress_key = _state_key(run_id, snapshot_id, "activity_rows_progress")
     total = _safe_int(await redis.get(total_key), 0)
-    done = _safe_int(await redis.scard(done_key), 0)
+    done_ids = await _activity_done_chunk_ids(redis, run_id, snapshot_id)
+    done = len(done_ids)
     rows = _safe_int(await redis.get(rows_key), 0)
-    return total, done, rows
+    rows += _redis_hash_int_sum(await redis.hgetall(rows_progress_key), exclude=done_ids)
+    started = _safe_int(await redis.scard(started_key), 0)
+    bytes_total = _safe_int(await redis.get(bytes_total_key), 0)
+    bytes_done = _redis_hash_int_sum(await redis.hgetall(bytes_progress_key))
+    if bytes_total > 0:
+        bytes_done = min(bytes_done, bytes_total)
+    return ActivityChunkProgress(
+        total_chunks=total,
+        done_chunks=done,
+        row_count=rows,
+        bytes_total=bytes_total,
+        bytes_done=bytes_done,
+        started_chunks=started,
+    )
 
 
 async def _activity_done_chunk_ids(redis, run_id: str, snapshot_id: str) -> set[str]:
@@ -710,41 +855,67 @@ async def _activity_done_chunk_ids(redis, run_id: str, snapshot_id: str) -> set[
     return values
 
 
+async def _activity_completed_rows(redis, run_id: str, snapshot_id: str) -> int:
+    return _safe_int(await redis.get(_state_key(run_id, snapshot_id, "activity_rows")), 0)
+
+
 async def _wait_for_activity_chunks(redis, run_id: str, snapshot_id: str, total_chunks: int) -> tuple[int, set[str]]:
     if total_chunks <= 0:
         return 0, set()
-    last_done = -1
+    last_signature: tuple[int, int, int, int] | None = None
     last_progress_at = datetime.datetime.utcnow()
     last_emit_at = 0.0
     while True:
-        total, done, rows = await _get_activity_chunk_progress(redis, run_id, snapshot_id)
-        if done >= max(total, total_chunks):
-            return rows, await _activity_done_chunk_ids(redis, run_id, snapshot_id)
-        done_advanced = done > last_done
-        if done_advanced:
-            last_done = done
+        progress = await _get_activity_chunk_progress(redis, run_id, snapshot_id)
+        max_total = max(progress.total_chunks, total_chunks)
+        if progress.done_chunks >= max_total:
+            return await _activity_completed_rows(redis, run_id, snapshot_id), await _activity_done_chunk_ids(
+                redis,
+                run_id,
+                snapshot_id,
+            )
+        signature = (
+            progress.done_chunks,
+            progress.row_count,
+            progress.bytes_done,
+            progress.started_chunks,
+        )
+        progress_advanced = signature != last_signature
+        if progress_advanced:
+            last_signature = signature
             last_progress_at = datetime.datetime.utcnow()
         stall_seconds = (datetime.datetime.utcnow() - last_progress_at).total_seconds()
         now_monotonic = time.monotonic()
-        if done_advanced or now_monotonic - last_emit_at >= 30.0:
+        if progress_advanced or now_monotonic - last_emit_at >= 30.0:
+            pct = progress.pct()
+            byte_message = ""
+            if progress.bytes_total > 0:
+                byte_message = (
+                    f" bytes={_format_bytes(progress.bytes_done)}/"
+                    f"{_format_bytes(progress.bytes_total)}"
+                )
             enqueue_live_progress(
                 run_id=run_id,
                 importer="partd-formulary-network",
                 status="running",
                 phase="partd activity chunks running",
                 unit="chunks",
-                done=done,
-                total=max(total, total_chunks),
+                done=progress.done_chunks,
+                total=max_total,
+                pct=pct,
                 message=(
-                    f"activity chunks done={done}/{max(total, total_chunks)} "
-                    f"rows={rows:,}"
+                    f"activity chunks done={progress.done_chunks}/{max_total} "
+                    f"started={progress.started_chunks} rows={progress.row_count:,}"
+                    f"{byte_message}"
                 ),
             )
             last_emit_at = now_monotonic
         if stall_seconds >= PARTD_CHUNK_STALL_SECONDS:
             print(
                 f"[partd] activity chunk progress stalled snapshot={snapshot_id} "
-                f"done={done}/{max(total, total_chunks)} stall_seconds={int(stall_seconds)}; "
+                f"done={progress.done_chunks}/{max_total} rows={progress.row_count} "
+                f"bytes={progress.bytes_done}/{progress.bytes_total} "
+                f"stall_seconds={int(stall_seconds)}; "
                 f"falling back to local processing for remaining chunks",
                 flush=True,
             )
@@ -754,16 +925,23 @@ async def _wait_for_activity_chunks(redis, run_id: str, snapshot_id: str, total_
                 status="running",
                 phase="partd activity chunk fallback",
                 unit="chunks",
-                done=done,
-                total=max(total, total_chunks),
+                done=progress.done_chunks,
+                total=max_total,
+                pct=progress.pct(),
                 message=(
                     f"activity chunk progress stalled; processing remaining "
-                    f"{max(total, total_chunks) - done} chunk(s) locally"
+                    f"{max_total - progress.done_chunks} chunk(s) locally"
                 ),
             )
-            return rows, await _activity_done_chunk_ids(redis, run_id, snapshot_id)
+            return await _activity_completed_rows(redis, run_id, snapshot_id), await _activity_done_chunk_ids(
+                redis,
+                run_id,
+                snapshot_id,
+            )
         print(
-            f"[partd] waiting activity chunks snapshot={snapshot_id} done={done}/{max(total, total_chunks)}",
+            f"[partd] waiting activity chunks snapshot={snapshot_id} "
+            f"done={progress.done_chunks}/{max_total} rows={progress.row_count} "
+            f"bytes={progress.bytes_done}/{progress.bytes_total}",
             flush=True,
         )
         await asyncio.sleep(2)
@@ -1611,14 +1789,31 @@ async def _process_activity_file(
     source_type: str,
     default_date: datetime.date,
     test_mode: bool,
+    progress_callback: Callable[[int, int, int, int], Awaitable[None]] | None = None,
 ) -> int:
     activity_count = 0
     processed_rows = 0
     activity_batch: list[dict[str, Any]] = []
     pricing_batch: list[dict[str, Any]] = []
     delimiter = _detect_delimiter(file_path)
-    with file_path.open("r", encoding="utf-8", errors="replace") as handle:
-        reader = csv.DictReader(handle, delimiter=delimiter)
+    total_bytes = file_path.stat().st_size
+    bytes_read = 0
+
+    async def _maybe_emit_progress(*, final: bool = False) -> None:
+        if progress_callback is None:
+            return
+        if not final and activity_count % PARTD_PROGRESS_INTERVAL_ROWS != 0:
+            return
+        await progress_callback(processed_rows, activity_count, bytes_read, total_bytes)
+
+    with file_path.open("rb") as handle:
+        def _iter_lines():
+            nonlocal bytes_read
+            for raw_line in handle:
+                bytes_read += len(raw_line)
+                yield raw_line.decode("utf-8", "replace")
+
+        reader = csv.DictReader(_iter_lines(), delimiter=delimiter)
         for row in reader:
             activity_row = _activity_row_from_source(
                 row,
@@ -1633,9 +1828,12 @@ async def _process_activity_file(
             processed_rows += 1
             if len(activity_batch) >= PARTD_BATCH_SIZE:
                 await _flush_batches(activity_batch, pricing_batch)
+                await _maybe_emit_progress()
             if test_mode and processed_rows >= PARTD_TEST_MAX_ROWS_PER_FILE:
                 break
+            await _maybe_emit_progress()
     await _flush_batches(activity_batch, pricing_batch)
+    await _maybe_emit_progress(final=True)
     return activity_count
 
 
@@ -1680,7 +1878,14 @@ async def _import_artifact(
 
         max_partd_jobs = max(int(os.getenv("HLTHPRT_MAX_PARTD_JOBS", "4")), 1)
         if redis is not None and run_id and activity_members and max_partd_jobs > 1:
-            await _init_activity_chunk_state(redis, run_id, snapshot_id, len(activity_members))
+            total_activity_bytes = sum(path.stat().st_size for path, _logical_name in activity_members)
+            await _init_activity_chunk_state(
+                redis,
+                run_id,
+                snapshot_id,
+                len(activity_members),
+                total_bytes=total_activity_bytes,
+            )
             snapshot_hash = hashlib.sha1(snapshot_id.encode("utf-8")).hexdigest()[:10]
             chunk_defs: list[tuple[str, Path]] = []
             for idx, (file_path, _logical_name) in enumerate(activity_members):
@@ -1715,9 +1920,27 @@ async def _import_artifact(
                     source_type=artifact.source_type,
                     default_date=artifact.cutoff_month,
                     test_mode=test_mode,
+                    progress_callback=(
+                        lambda _processed, accepted, processed_bytes, total_bytes, _chunk_id=chunk_id: _mark_activity_chunk_progress(
+                            redis,
+                            run_id,
+                            snapshot_id,
+                            _chunk_id,
+                            processed_bytes=processed_bytes,
+                            accepted_rows=accepted,
+                            total_bytes=total_bytes,
+                        )
+                    ),
                 )
                 activity_count += accepted
-                await _mark_activity_chunk_done(redis, run_id, snapshot_id, chunk_id, accepted)
+                await _mark_activity_chunk_done(
+                    redis,
+                    run_id,
+                    snapshot_id,
+                    chunk_id,
+                    accepted,
+                    total_bytes=file_path.stat().st_size,
+                )
         else:
             processed_rows = 0
             for file_path, _logical_name in activity_members:
@@ -1780,17 +2003,53 @@ async def partd_formulary_network_process_chunk(ctx, task=None):  # pragma: no c
     if not path.exists():
         raise RuntimeError(f"Part D activity chunk file does not exist: {chunk_path}")
 
+    redis = ctx.get("redis")
+    total_bytes = path.stat().st_size
+    if redis is not None and run_id:
+        await _mark_activity_chunk_started(
+            redis,
+            run_id,
+            snapshot_id,
+            chunk_id,
+            total_bytes=total_bytes,
+        )
+
+    async def _progress_callback(
+        _processed_rows: int,
+        accepted_rows: int,
+        processed_bytes: int,
+        file_total_bytes: int,
+    ) -> None:
+        if redis is None or not run_id:
+            return
+        await _mark_activity_chunk_progress(
+            redis,
+            run_id,
+            snapshot_id,
+            chunk_id,
+            processed_bytes=processed_bytes,
+            accepted_rows=accepted_rows,
+            total_bytes=file_total_bytes,
+        )
+
     accepted = await _process_activity_file(
         path,
         snapshot_id=snapshot_id,
         source_type=source_type,
         default_date=cutoff_month,
         test_mode=test_mode,
+        progress_callback=_progress_callback if redis is not None and run_id else None,
     )
 
-    redis = ctx.get("redis")
     if redis is not None and run_id:
-        await _mark_activity_chunk_done(redis, run_id, snapshot_id, chunk_id, accepted)
+        await _mark_activity_chunk_done(
+            redis,
+            run_id,
+            snapshot_id,
+            chunk_id,
+            accepted,
+            total_bytes=total_bytes,
+        )
 
     return {"ok": True, "chunk_id": chunk_id, "accepted_rows": accepted}
 

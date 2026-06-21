@@ -112,13 +112,24 @@ def test_wait_for_activity_chunks_emits_live_progress_and_fallback(monkeypatch):
                 return b"2"
             if key.endswith(":activity_rows"):
                 return b"0"
+            if key.endswith(":activity_bytes_total"):
+                return b"1000"
             return None
 
-        async def scard(self, _key):
+        async def scard(self, key):
+            if key.endswith(":activity_started"):
+                return 1
             return 0
 
         async def smembers(self, _key):
             return set()
+
+        async def hgetall(self, key):
+            if key.endswith(":activity_bytes_progress"):
+                return {b"chunk-1": b"250"}
+            if key.endswith(":activity_rows_progress"):
+                return {b"chunk-1": b"10"}
+            return {}
 
     monkeypatch.setattr(module, "PARTD_CHUNK_STALL_SECONDS", 0)
     monkeypatch.setattr(module, "enqueue_live_progress", lambda **payload: events.append(payload))
@@ -141,7 +152,48 @@ def test_wait_for_activity_chunks_emits_live_progress_and_fallback(monkeypatch):
     assert events[0]["unit"] == "chunks"
     assert events[0]["done"] == 0
     assert events[0]["total"] == 2
+    assert events[0]["pct"] == 25
+    assert "started=1" in events[0]["message"]
+    assert "rows=10" in events[0]["message"]
     assert "processing remaining 2 chunk(s) locally" in events[1]["message"]
+
+
+def test_process_activity_file_emits_byte_progress(tmp_path, monkeypatch):
+    source = tmp_path / "activity.csv"
+    source.write_text(
+        "NPI|Contract ID|Plan ID|Segment ID|Pharmacy Name|Pharmacy Retail\n"
+        "1518379601|S1234|001|000|Test Pharmacy|Y\n"
+        "1518379602|S1234|001|000|Other Pharmacy|Y\n",
+        encoding="utf-8",
+    )
+    progress: list[tuple[int, int, int, int]] = []
+
+    async def fake_push_objects(*_args, **_kwargs):
+        return None
+
+    async def capture_progress(processed_rows, accepted_rows, processed_bytes, total_bytes):
+        progress.append((processed_rows, accepted_rows, processed_bytes, total_bytes))
+
+    monkeypatch.setattr(module, "push_objects", fake_push_objects)
+    monkeypatch.setattr(module, "PARTD_PROGRESS_INTERVAL_ROWS", 1)
+
+    accepted = asyncio.run(
+        module._process_activity_file(  # pylint: disable=protected-access
+            source,
+            snapshot_id="quarterly:20260428:test",
+            source_type="quarterly",
+            default_date=datetime.date(2026, 4, 1),
+            test_mode=False,
+            progress_callback=capture_progress,
+        )
+    )
+
+    assert accepted == 2
+    assert progress
+    assert progress[-1][0] == 2
+    assert progress[-1][1] == 2
+    assert progress[-1][2] == source.stat().st_size
+    assert progress[-1][3] == source.stat().st_size
 
 
 def test_test_mode_skips_full_table_index_maintenance():

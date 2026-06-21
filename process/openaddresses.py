@@ -49,6 +49,7 @@ DEFAULT_RELAXED_MARGIN = 0.10
 DEFAULT_DUPLICATE_COORD_TOLERANCE = 0.0005
 DEFAULT_DOWNLOAD_RETRIES = 4
 DEFAULT_DOWNLOAD_RETRY_BASE_SECONDS = 2.0
+BACKFILL_MATCH_MODES = frozenset({"exact", "fuzzy", "relaxed"})
 RETRYABLE_DOWNLOAD_STATUSES = {429, 500, 502, 503, 504}
 POSTGRES_IDENTIFIER_MAX_LENGTH = 63
 HOUSE_NUMBER_RE = re.compile(r"^\s*([0-9]+[a-zA-Z]?)\b")
@@ -124,6 +125,28 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _normalize_backfill_match_modes(value: Any = None) -> frozenset[str]:
+    if value is None:
+        value = os.getenv("HLTHPRT_OPENADDRESSES_BACKFILL_MATCH_MODES")
+    if value is None or value == "":
+        return BACKFILL_MATCH_MODES
+    if isinstance(value, str):
+        raw_modes = [part.strip().lower() for part in re.split(r"[,;\s]+", value) if part.strip()]
+    elif isinstance(value, Iterable):
+        raw_modes = [str(part).strip().lower() for part in value if str(part).strip()]
+    else:
+        raise ValueError(f"Invalid OpenAddresses backfill match modes: {value!r}")
+    if any(mode in {"all", "*"} for mode in raw_modes):
+        return BACKFILL_MATCH_MODES
+    modes = frozenset(raw_modes)
+    if not modes:
+        return BACKFILL_MATCH_MODES
+    invalid = sorted(modes - BACKFILL_MATCH_MODES)
+    if invalid:
+        raise ValueError(f"Invalid OpenAddresses backfill match mode(s): {', '.join(invalid)}")
+    return modes
 
 
 def _validate_schema_name(schema: str) -> str:
@@ -1994,11 +2017,24 @@ async def _plan_openaddresses_backfill_shards(
         backfill_zip_prefix_length=zip_prefix_length,
     )
     shards: list[OpenAddressesBackfillShard] = []
+    skipped_candidates = 0
     for row in rows or []:
         mapping = _row_mapping(row)
-        shard_state = _normalize_backfill_state_code(mapping["state_code"])
-        shard_zip = _normalize_backfill_zip_prefix(mapping["zip_prefix"])
         candidate_count = int(mapping["candidate_count"] or 0)
+        try:
+            shard_state = _normalize_backfill_state_code(mapping["state_code"])
+            shard_zip = _normalize_backfill_zip_prefix(mapping["zip_prefix"])
+        except ValueError as exc:
+            skipped_candidates += candidate_count
+            logger.warning(
+                "Skipping OpenAddresses archive backfill shard with invalid archive data: "
+                "state_code=%r zip_prefix=%r candidates=%s error=%s",
+                mapping["state_code"],
+                mapping["zip_prefix"],
+                candidate_count,
+                exc,
+            )
+            continue
         if shard_state and shard_zip:
             shards.append(
                 OpenAddressesBackfillShard(
@@ -2007,6 +2043,11 @@ async def _plan_openaddresses_backfill_shards(
                     candidate_count=candidate_count,
                 )
             )
+    if skipped_candidates:
+        logger.warning(
+            "Skipped %s OpenAddresses archive backfill candidates with invalid state/ZIP shard values",
+            skipped_candidates,
+        )
     if shards:
         return shards
     return []
@@ -2032,6 +2073,7 @@ async def refresh_archive_geocodes_from_openaddresses_sharded(
     zip_prefix: str | None = None,
     concurrency: int | None = None,
     zip_prefix_length: int | None = None,
+    match_modes: Any = None,
     run_id: str | None = None,
     sharded: bool = True,
 ) -> OpenAddressesBackfillStats:
@@ -2043,6 +2085,7 @@ async def refresh_archive_geocodes_from_openaddresses_sharded(
     zip_prefix = _normalize_backfill_zip_prefix(
         zip_prefix if zip_prefix is not None else os.getenv("HLTHPRT_OPENADDRESSES_BACKFILL_ZIP_PREFIX")
     )
+    match_modes = _normalize_backfill_match_modes(match_modes)
     if not sharded:
         return await refresh_archive_geocodes_from_openaddresses(
             schema=schema,
@@ -2050,6 +2093,7 @@ async def refresh_archive_geocodes_from_openaddresses_sharded(
             source_table=source_table,
             state_code=state_code,
             zip_prefix=zip_prefix,
+            match_modes=match_modes,
         )
     if zip_prefix:
         shard = OpenAddressesBackfillShard(state_code=state_code, zip_prefix=zip_prefix)
@@ -2067,6 +2111,7 @@ async def refresh_archive_geocodes_from_openaddresses_sharded(
             source_table=source_table,
             state_code=state_code,
             zip_prefix=zip_prefix,
+            match_modes=match_modes,
         )
         _emit_backfill_progress(
             completed_shards=1,
@@ -2084,6 +2129,7 @@ async def refresh_archive_geocodes_from_openaddresses_sharded(
             source_table=source_table,
             state_code=state_code,
             zip_prefix=zip_prefix,
+            match_modes=match_modes,
         )
     if not (
         await _table_has_column(schema, archive_table, "address_key")
@@ -2095,6 +2141,7 @@ async def refresh_archive_geocodes_from_openaddresses_sharded(
             source_table=source_table,
             state_code=state_code,
             zip_prefix=zip_prefix,
+            match_modes=match_modes,
         )
 
     concurrency = max(int(concurrency or _env_positive_int("HLTHPRT_OPENADDRESSES_BACKFILL_CONCURRENCY", DEFAULT_BACKFILL_CONCURRENCY)), 1)
@@ -2143,7 +2190,8 @@ async def refresh_archive_geocodes_from_openaddresses_sharded(
     print(
         "OpenAddresses archive backfill shards: "
         f"shards={total_shards:,} concurrency={min(concurrency, total_shards):,} "
-        f"zip_prefix_length={zip_prefix_length} candidates={total_candidates:,}",
+        f"zip_prefix_length={zip_prefix_length} match_modes={','.join(sorted(match_modes))} "
+        f"candidates={total_candidates:,}",
         flush=True,
     )
 
@@ -2157,6 +2205,7 @@ async def refresh_archive_geocodes_from_openaddresses_sharded(
                 source_table=source_table,
                 state_code=shard.state_code,
                 zip_prefix=shard.zip_prefix,
+                match_modes=match_modes,
             )
             return index, shard, stats
 
@@ -2199,6 +2248,7 @@ async def refresh_archive_geocodes_from_openaddresses(
     source_table: str = OPENADDRESSES_TABLE,
     state_code: str | None = None,
     zip_prefix: str | None = None,
+    match_modes: Any = None,
 ) -> OpenAddressesBackfillStats:
     schema = _validate_schema_name(schema or os.getenv("HLTHPRT_DB_SCHEMA") or "mrf")
     archive_table = archive_table or os.getenv("HLTHPRT_ADDRESS_ARCHIVE_TABLE", "address_archive_v2").strip() or "address_archive_v2"
@@ -2208,6 +2258,7 @@ async def refresh_archive_geocodes_from_openaddresses(
     zip_prefix = _normalize_backfill_zip_prefix(
         zip_prefix if zip_prefix is not None else os.getenv("HLTHPRT_OPENADDRESSES_BACKFILL_ZIP_PREFIX")
     )
+    match_modes = _normalize_backfill_match_modes(match_modes)
     if not await _table_exists(schema, source_table):
         logger.warning("Skipping OpenAddresses backfill: %s.%s is missing", schema, source_table)
         return OpenAddressesBackfillStats(exact_updates=0, fuzzy_updates=0, relaxed_updates=0)
@@ -2250,9 +2301,12 @@ async def refresh_archive_geocodes_from_openaddresses(
         if zip_upper:
             params["backfill_zip_upper"] = zip_upper
 
-    city_exact_updates = _status_count(
-        await db.status(
-            f"""
+    city_exact_updates = 0
+    broad_exact_updates = 0
+    if "exact" in match_modes:
+        city_exact_updates = _status_count(
+            await db.status(
+                f"""
             WITH missing AS ({archive_components}),
             winners AS (
                 SELECT
@@ -2299,13 +2353,13 @@ async def refresh_archive_geocodes_from_openaddresses(
                AND archive.lat IS NULL
                AND archive.long IS NULL;
             """,
-            **params,
+                **params,
+            )
         )
-    )
 
-    broad_exact_updates = _status_count(
-        await db.status(
-            f"""
+        broad_exact_updates = _status_count(
+            await db.status(
+                f"""
             WITH missing AS ({archive_components}),
             winners AS (
                 SELECT
@@ -2350,14 +2404,16 @@ async def refresh_archive_geocodes_from_openaddresses(
                AND archive.lat IS NULL
                AND archive.long IS NULL;
             """,
-            **params,
+                **params,
+            )
         )
-    )
     exact_updates = city_exact_updates + broad_exact_updates
 
-    fuzzy_updates = _status_count(
-        await db.status(
-            f"""
+    fuzzy_updates = 0
+    if "fuzzy" in match_modes:
+        fuzzy_updates = _status_count(
+            await db.status(
+                f"""
             WITH missing AS ({archive_components}),
             scored AS (
                 SELECT
@@ -2424,13 +2480,15 @@ async def refresh_archive_geocodes_from_openaddresses(
                AND archive.lat IS NULL
                AND archive.long IS NULL;
             """,
-            **params,
+                **params,
+            )
         )
-    )
 
-    relaxed_updates = _status_count(
-        await db.status(
-            f"""
+    relaxed_updates = 0
+    if "relaxed" in match_modes:
+        relaxed_updates = _status_count(
+            await db.status(
+                f"""
             WITH missing AS ({archive_components}),
             scored AS (
                 SELECT
@@ -2499,9 +2557,9 @@ async def refresh_archive_geocodes_from_openaddresses(
                AND archive.lat IS NULL
                AND archive.long IS NULL;
             """,
-            **params,
+                **params,
+            )
         )
-    )
     return OpenAddressesBackfillStats(
         exact_updates=exact_updates,
         fuzzy_updates=fuzzy_updates,
@@ -2528,6 +2586,7 @@ async def process_data(ctx, task=None):  # pragma: no cover
         await ensure_database(bool(ctx["context"].get("test_mode", False)))
         backfill_state_code = task.get("state_code") or task.get("backfill_state_code")
         backfill_zip_prefix = task.get("zip_prefix") or task.get("backfill_zip_prefix")
+        backfill_match_modes = task.get("match_modes") or task.get("backfill_match_modes")
         backfill_concurrency = _task_or_env_positive_int(
             task,
             "backfill_concurrency",
@@ -2547,9 +2606,11 @@ async def process_data(ctx, task=None):  # pragma: no cover
             zip_prefix=backfill_zip_prefix,
             concurrency=backfill_concurrency,
             zip_prefix_length=backfill_zip_prefix_length,
+            match_modes=backfill_match_modes,
             run_id=_progress_run_id(ctx, task),
             sharded=_task_or_env_bool(task, "sharded_backfill", "HLTHPRT_OPENADDRESSES_SHARDED_BACKFILL", True),
         )
+        normalized_match_modes = _normalize_backfill_match_modes(backfill_match_modes)
         ctx["context"]["backfill"] = {
             "exact_updates": stats.exact_updates,
             "fuzzy_updates": stats.fuzzy_updates,
@@ -2558,6 +2619,7 @@ async def process_data(ctx, task=None):  # pragma: no cover
             "zip_prefix": _normalize_backfill_zip_prefix(backfill_zip_prefix),
             "concurrency": backfill_concurrency,
             "zip_prefix_length": backfill_zip_prefix_length,
+            "match_modes": sorted(normalized_match_modes),
         }
         ctx["context"]["run"] = ctx["context"].get("run", 0) + 1
         ctx["context"]["backfill_only"] = True
@@ -2636,6 +2698,13 @@ async def shutdown(ctx):  # pragma: no cover
     stage_table = stage_cls.__tablename__
     recovery_table = recovery_cls.__tablename__
     if not await _table_exists(schema, stage_table):
+        if context.get("openaddresses_stage_published") and await _table_exists(schema, OpenAddressesGeocode.__main_table__):
+            logger.warning(
+                "Skipping repeated OpenAddresses shutdown: staging table %s.%s was already published.",
+                schema,
+                stage_table,
+            )
+            return
         raise RuntimeError(f"OpenAddresses staging table {schema}.{stage_table} is missing.")
 
     zip_restore_stats = await restore_openaddresses_zip5_from_tiger_zcta(
@@ -2679,6 +2748,7 @@ async def shutdown(ctx):  # pragma: no cover
         await db.status(f"DROP TABLE IF EXISTS {_qtable(schema, archived)};")
         await db.status(f"ALTER TABLE IF EXISTS {_qtable(schema, live_table)} RENAME TO {_quote_ident(archived)};")
         await db.status(f"ALTER TABLE {_qtable(schema, stage_table)} RENAME TO {_quote_ident(live_table)};")
+    context["openaddresses_stage_published"] = True
 
     stats = await refresh_archive_geocodes_from_openaddresses_sharded(
         schema=schema,

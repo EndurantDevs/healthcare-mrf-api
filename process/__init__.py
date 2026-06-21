@@ -1196,6 +1196,7 @@ def ptg_address(test: bool):
 @click.option("--backfill-zip-prefix", help="ZIP prefix for archive backfill sharding.")
 @click.option("--backfill-concurrency", type=int, help="Number of archive backfill shards to process concurrently.")
 @click.option("--backfill-zip-prefix-length", type=int, help="ZIP prefix length for automatic archive backfill shards.")
+@click.option("--backfill-match-modes", help="Comma-separated archive backfill phases: exact,fuzzy,relaxed.")
 @click.option("--zip-restore-concurrency", type=int, help="Number of OpenAddresses ZIP restore shards to process concurrently.")
 @click.option("--zip-restore-shards", type=int, help="Number of OpenAddresses ZIP recovery buckets to stage.")
 def openaddresses(
@@ -1219,6 +1220,7 @@ def openaddresses(
     backfill_zip_prefix: str | None,
     backfill_concurrency: int | None,
     backfill_zip_prefix_length: int | None,
+    backfill_match_modes: str | None,
     zip_restore_concurrency: int | None,
     zip_restore_shards: int | None,
 ):
@@ -1244,6 +1246,7 @@ def openaddresses(
             backfill_zip_prefix=backfill_zip_prefix,
             backfill_concurrency=backfill_concurrency,
             backfill_zip_prefix_length=backfill_zip_prefix_length,
+            backfill_match_modes=backfill_match_modes,
             zip_restore_concurrency=zip_restore_concurrency,
             zip_restore_shards=zip_restore_shards,
         )

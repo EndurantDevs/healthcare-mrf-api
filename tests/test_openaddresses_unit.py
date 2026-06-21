@@ -215,6 +215,16 @@ def test_openaddresses_backfill_source_contains_city_scoped_exact_phase():
     assert "addr_city_norm_v1(oa.city_name)" in sql_text
 
 
+def test_openaddresses_backfill_match_modes_parser():
+    assert openaddresses._normalize_backfill_match_modes(None) == {"exact", "fuzzy", "relaxed"}  # pylint: disable=protected-access
+    assert openaddresses._normalize_backfill_match_modes(" exact, fuzzy ") == {"exact", "fuzzy"}  # pylint: disable=protected-access
+    assert openaddresses._normalize_backfill_match_modes(["relaxed"]) == {"relaxed"}  # pylint: disable=protected-access
+    assert openaddresses._normalize_backfill_match_modes("all") == {"exact", "fuzzy", "relaxed"}  # pylint: disable=protected-access
+
+    with pytest.raises(ValueError, match="bogus"):
+        openaddresses._normalize_backfill_match_modes("exact,bogus")  # pylint: disable=protected-access
+
+
 def test_openaddresses_load_progress_payload(monkeypatch):
     events = []
     monkeypatch.setattr(openaddresses, "enqueue_live_progress", lambda **payload: events.append(payload))
@@ -336,6 +346,29 @@ async def test_openaddresses_backfill_plans_state_zip_prefix_shards(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_openaddresses_backfill_plan_skips_invalid_archive_state_shards(monkeypatch, caplog):
+    class FakeDb:
+        async def all(self, _stmt, **_params):
+            return [
+                {"state_code": "TE", "zip_prefix": "12", "candidate_count": 4},
+                {"state_code": "TX", "zip_prefix": "75", "candidate_count": 10},
+            ]
+
+    monkeypatch.setattr(openaddresses, "db", FakeDb())
+
+    shards = await openaddresses._plan_openaddresses_backfill_shards(  # pylint: disable=protected-access
+        schema="mrf",
+        archive_table="address_archive_v2",
+        zip_prefix_length=2,
+    )
+
+    assert shards == [
+        openaddresses.OpenAddressesBackfillShard(state_code="TX", zip_prefix="75", candidate_count=10),
+    ]
+    assert "Skipping OpenAddresses archive backfill shard" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_openaddresses_sharded_backfill_uses_bounded_concurrency_and_aggregates(monkeypatch):
     active = 0
     max_active = 0
@@ -387,6 +420,42 @@ async def test_openaddresses_sharded_backfill_uses_bounded_concurrency_and_aggre
     )
     assert [event["done"] for event in progress] == [0, 1, 2, 3]
     assert all(event["run_id"] == "run_openaddresses" for event in progress)
+
+
+@pytest.mark.asyncio
+async def test_openaddresses_backfill_exact_match_mode_skips_fuzzy_relaxed(monkeypatch):
+    statements = []
+
+    async def fake_table_exists(_schema, _table):
+        return True
+
+    async def fake_table_has_column(_schema, _table, _column):
+        return True
+
+    class FakeDb:
+        async def status(self, stmt, **_params):
+            statements.append(stmt)
+            return "UPDATE 1" if "UPDATE" in stmt else "CREATE EXTENSION"
+
+    monkeypatch.setattr(openaddresses, "_table_exists", fake_table_exists)
+    monkeypatch.setattr(openaddresses, "_table_has_column", fake_table_has_column)
+    monkeypatch.setattr(openaddresses, "db", FakeDb())
+
+    stats = await openaddresses.refresh_archive_geocodes_from_openaddresses(
+        schema="mrf",
+        archive_table="address_archive_v2",
+        source_table="openaddresses_geocode",
+        state_code="TX",
+        zip_prefix="75",
+        match_modes="exact",
+    )
+
+    sql_text = "\n".join(statements)
+    assert stats == openaddresses.OpenAddressesBackfillStats(exact_updates=2, fuzzy_updates=0, relaxed_updates=0)
+    assert "openaddresses_exact_city" in sql_text
+    assert "openaddresses_exact" in sql_text
+    assert "openaddresses_fuzzy_zip" not in sql_text
+    assert "openaddresses_relaxed_city_zip" not in sql_text
 
 
 class _FakeDownloadContent:
@@ -802,6 +871,32 @@ async def test_openaddresses_shutdown_uses_job_import_id_from_shared_context(mon
 
     assert seen["table_exists"] == ("mrf", "openaddresses_geocode_oadev20260619")
     assert seen["create_indexes"] == ("mrf", "openaddresses_geocode_oadev20260619")
+
+
+@pytest.mark.asyncio
+async def test_openaddresses_shutdown_is_idempotent_after_stage_publish(monkeypatch):
+    calls = []
+
+    async def fake_ensure_database(_test_mode):
+        calls.append("ensure_database")
+
+    async def fake_table_exists(_schema, table_name):
+        return table_name == openaddresses.OpenAddressesGeocode.__main_table__
+
+    monkeypatch.setattr(openaddresses, "ensure_database", fake_ensure_database)
+    monkeypatch.setattr(openaddresses, "_table_exists", fake_table_exists)
+
+    await openaddresses.shutdown(
+        {
+            "import_date": "oadev20260619",
+            "context": {
+                "run": 1,
+                "openaddresses_stage_published": True,
+            },
+        }
+    )
+
+    assert calls == ["ensure_database"]
 
 
 @pytest.mark.asyncio
