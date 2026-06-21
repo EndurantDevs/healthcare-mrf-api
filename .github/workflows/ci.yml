@@ -5,6 +5,16 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      publish_image:
+        description: "Build and push a GHCR image for this ref"
+        required: false
+        type: boolean
+        default: false
+      image_tag:
+        description: "Full image tag to publish, for example ghcr.io/endurantdevs/healthcare-mrf-api:dev-..."
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -247,6 +257,46 @@ jobs:
           PY
       - name: Run worker control tests
         run: python -m pytest -q tests/test_control_workers.py tests/test_control_imports_api.py tests/test_control_cancel.py
+
+  docker-image-publish:
+    name: docker image publish
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_image
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+      - name: Resolve image tag
+        id: image
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.image_tag }}"
+          if [ -z "$tag" ]; then
+            tag="ghcr.io/${GITHUB_REPOSITORY,,}:dev-${GITHUB_SHA::7}"
+          fi
+          case "$tag" in
+            ghcr.io/*) ;;
+            *) echo "image_tag must start with ghcr.io/" >&2; exit 1 ;;
+          esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          pull: true
+          push: true
+          tags: ${{ steps.image.outputs.tag }}
+      - name: Print published image
+        run: echo "${{ steps.image.outputs.tag }}"
 
   address-canonical-db-tests:
     name: postgres18 postgis address canonical tests
