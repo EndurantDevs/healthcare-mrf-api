@@ -402,6 +402,32 @@ def _ptg2_copy_file_row_count(path: Path) -> int:
         return sum(1 for _line in fp)
 
 
+def _collect_ptg2_manifest_sidecar_artifacts(
+    sidecar_paths: dict[str, Path | None],
+) -> dict[str, dict[str, Any]]:
+    artifacts: dict[str, dict[str, Any]] = {}
+    for artifact_kind, artifact_path in sidecar_paths.items():
+        if (
+            artifact_path is None
+            or not artifact_path.exists()
+            or artifact_path.stat().st_size <= 0
+        ):
+            continue
+        digest, byte_count = sha256_file(artifact_path)
+        record_format = PTG2_MANIFEST_MEMBERSHIP_FORMAT
+        with artifact_path.open("rb") as artifact_fp:
+            if artifact_fp.read(8) == b"PTG2MNDS":
+                record_format = PTG2_MANIFEST_DENSE_MEMBERSHIP_FORMAT
+        artifacts[artifact_kind] = {
+            "name": artifact_kind,
+            "path": str(artifact_path),
+            "record_format": record_format,
+            "sha256": digest,
+            "byte_count": byte_count,
+        }
+    return artifacts
+
+
 def _run_ptg2_manifest_copy_merge_sync(kind: str, output_path: Path, input_paths: list[Path]) -> dict[str, Any]:
     binary = _ptg2_rust_scanner_binary()
     if binary is None:
@@ -767,23 +793,7 @@ async def _parse_in_network_file_serving_only(
                         logger.debug("Failed to remove empty PTG2 manifest worker copy file %s", worker_copy_path, exc_info=True)
 
     await flush_error_log(import_log_cls)
-    manifest_artifacts = {}
-    for artifact_kind, artifact_path in manifest_sidecar_paths.items():
-        if artifact_path is None:
-            continue
-        if artifact_path.exists() and artifact_path.stat().st_size > 0:
-            digest, byte_count = sha256_file(artifact_path)
-            record_format = PTG2_MANIFEST_MEMBERSHIP_FORMAT
-            with artifact_path.open("rb") as artifact_fp:
-                if artifact_fp.read(8) == b"PTG2MNDS":
-                    record_format = PTG2_MANIFEST_DENSE_MEMBERSHIP_FORMAT
-            manifest_artifacts[artifact_kind] = {
-                "name": artifact_kind,
-                "path": str(artifact_path),
-                "record_format": record_format,
-                "sha256": digest,
-                "byte_count": byte_count,
-            }
+    manifest_artifacts = _collect_ptg2_manifest_sidecar_artifacts(manifest_sidecar_paths)
     summary = {
         "provider_refs": 0,
         "in_network_items": len(procedure_hashes),

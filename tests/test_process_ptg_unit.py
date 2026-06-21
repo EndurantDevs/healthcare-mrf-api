@@ -3354,6 +3354,26 @@ def test_ptg2_rust_compact_can_omit_provider_npi_sidecar(monkeypatch, tmp_path):
     assert captured_env["HLTHPRT_PTG2_MANIFEST_PRICE_FORWARD_SIDECAR_PATH"].endswith("price_forward.ptg2sc")
 
 
+def test_ptg2_manifest_artifacts_skip_disabled_provider_npi_sidecar(tmp_path):
+    provider_forward = tmp_path / "provider_forward.ptg2sc"
+    provider_forward.write_bytes(b"PTG2MNDS" + b"\0" * 32)
+    empty_price_forward = tmp_path / "price_forward.ptg2sc"
+    empty_price_forward.touch()
+
+    artifacts = process_ptg._collect_ptg2_manifest_sidecar_artifacts(
+        {
+            "provider_forward": provider_forward,
+            "provider_npi": None,
+            "price_forward": empty_price_forward,
+        }
+    )
+
+    assert set(artifacts) == {"provider_forward"}
+    assert artifacts["provider_forward"]["name"] == "provider_forward"
+    assert artifacts["provider_forward"]["record_format"] == process_ptg.PTG2_MANIFEST_DENSE_MEMBERSHIP_FORMAT
+    assert artifacts["provider_forward"]["path"] == str(provider_forward)
+
+
 def test_ptg2_compact_finalize_defers_provider_locations_by_default(monkeypatch):
     status_calls = []
     scalar_values = iter([3, 1, 2])
