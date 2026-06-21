@@ -12,8 +12,8 @@ use ptg2_scanner::copy_format::{
 };
 use ptg2_scanner::dedupe::{dedupe_summary_payload, emit_dedupe_summary, SharedDedupe};
 use ptg2_scanner::hashing::{
-    canonical_json, checksum_i64_list, finish_hash_hex, hash_i64_list, hash_string_list, hash_text,
-    make_checksum, semantic_hash, update_hash_optional_str, update_hash_string_list,
+    checksum_i64_list, finish_hash_hex, hash_i64_list, hash_string_list, hash_text, make_checksum,
+    semantic_hash, update_hash_optional_str, update_hash_string_list, xxh3_63,
 };
 use ptg2_scanner::input::{open_json_reader, open_reader};
 use ptg2_scanner::manifest::{
@@ -621,45 +621,75 @@ fn provider_group_hash(tin: &Value, npi: &[i64]) -> i64 {
     ])
 }
 
+fn provider_group_payload_canonical_json(
+    provider_group_hash: i64,
+    tin_type: &str,
+    tin_value: &str,
+    npi: &[i64],
+) -> String {
+    let tin_type_json = serde_json::to_string(tin_type).unwrap_or_else(|_| "\"\"".to_string());
+    let tin_value_json = serde_json::to_string(tin_value).unwrap_or_else(|_| "\"\"".to_string());
+    let npi_json = serde_json::to_string(npi).unwrap_or_else(|_| "[]".to_string());
+    format!(
+        "{{\"npi\":{npi_json},\"provider_group_hash\":{provider_group_hash},\"tin_type\":{tin_type_json},\"tin_value\":{tin_value_json}}}"
+    )
+}
+
+fn provider_set_checksum_from_group_payloads(mut group_payload_jsons: Vec<String>) -> i64 {
+    group_payload_jsons.sort_unstable();
+    let mut payload = String::from("[\"provider_set\",[");
+    for (idx, item) in group_payload_jsons.iter().enumerate() {
+        if idx > 0 {
+            payload.push(',');
+        }
+        payload.push_str(item);
+    }
+    payload.push_str("]]");
+    xxh3_63(payload.as_bytes()) as i64
+}
+
 fn build_provider_entry(provider_ref: &Value, collect_npis: bool) -> Option<ProviderEntry> {
     let groups = provider_ref.get("provider_groups")?.as_array()?;
-    let mut group_payloads: Vec<Value> = Vec::new();
+    let build_provider_set_payload = groups.len() > 1;
+    let mut group_payload_jsons: Vec<String> = Vec::new();
     let mut group_hashes: Vec<i64> = Vec::new();
     let mut provider_npis: Vec<i64> = Vec::new();
     let mut provider_count = 0i64;
     for group in groups {
         let tin = group.get("tin").unwrap_or(&Value::Null);
         let npi = int_list(group.get("npi"));
-        let group_hash = provider_group_hash(tin, &npi);
+        let tin_type = normalize_tin_type(tin.get("type"));
+        let tin_value = normalize_tin_value(tin.get("value"));
+        let group_hash = make_checksum(vec![
+            json!("provider_group"),
+            json!(tin_type.clone()),
+            json!(tin_value.clone()),
+            json!(npi),
+        ]);
         provider_count += npi.len() as i64;
         group_hashes.push(group_hash);
         if collect_npis {
             provider_npis.extend(npi.iter().copied());
         }
-        group_payloads.push(json!({
-            "provider_group_hash": group_hash,
-            "tin_type": normalize_tin_type(tin.get("type")),
-            "tin_value": normalize_tin_value(tin.get("value")),
-            "npi": npi,
-        }));
+        if build_provider_set_payload {
+            group_payload_jsons.push(provider_group_payload_canonical_json(
+                group_hash, &tin_type, &tin_value, &npi,
+            ));
+        }
     }
-    if group_payloads.is_empty() {
+    if group_hashes.is_empty() {
         return None;
     }
-    group_payloads.sort_by_cached_key(canonical_json);
     group_hashes.sort_unstable();
     group_hashes.dedup();
     if collect_npis {
         provider_npis.sort_unstable();
         provider_npis.dedup();
     }
-    let entry_hash = if group_payloads.len() == 1 {
-        group_payloads[0]
-            .get("provider_group_hash")
-            .and_then(Value::as_i64)
-            .unwrap_or(0)
+    let entry_hash = if build_provider_set_payload {
+        provider_set_checksum_from_group_payloads(group_payload_jsons)
     } else {
-        make_checksum(vec![json!("provider_set"), Value::Array(group_payloads)])
+        group_hashes[0]
     };
     Some(ProviderEntry {
         entry_hash,
@@ -4764,6 +4794,49 @@ mod tests {
         assert_eq!(retained.provider_group_hashes, pruned.provider_group_hashes);
         assert_eq!(retained.npi, vec![1234567890, 1234567891]);
         assert!(pruned.npi.is_empty());
+    }
+
+    #[test]
+    fn provider_entry_compact_provider_set_hash_matches_json_payload_hash() {
+        let provider_ref = json!({
+            "provider_groups": [
+                {
+                    "tin": {"type": "ein", "value": "12-3456789"},
+                    "npi": [1234567891, 1234567890, 1234567890]
+                },
+                {
+                    "tin": {"type": "npi", "value": " 9876543210 "},
+                    "npi": ["2222222222", "1111111111"]
+                }
+            ]
+        });
+
+        let entry = build_provider_entry(&provider_ref, true).unwrap();
+        let mut group_payloads: Vec<Value> = Vec::new();
+        for group in provider_ref
+            .get("provider_groups")
+            .and_then(Value::as_array)
+            .unwrap()
+        {
+            let tin = group.get("tin").unwrap_or(&Value::Null);
+            let npi = int_list(group.get("npi"));
+            let group_hash = provider_group_hash(tin, &npi);
+            group_payloads.push(json!({
+                "provider_group_hash": group_hash,
+                "tin_type": normalize_tin_type(tin.get("type")),
+                "tin_value": normalize_tin_value(tin.get("value")),
+                "npi": npi,
+            }));
+        }
+        group_payloads.sort_by_cached_key(ptg2_scanner::hashing::canonical_json);
+        let expected = make_checksum(vec![json!("provider_set"), Value::Array(group_payloads)]);
+
+        assert_eq!(entry.entry_hash, expected);
+        assert_eq!(entry.provider_count, 4);
+        assert_eq!(
+            entry.npi,
+            vec![1111111111, 1234567890, 1234567891, 2222222222]
+        );
     }
 
     #[test]
