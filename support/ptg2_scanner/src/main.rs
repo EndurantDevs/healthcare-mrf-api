@@ -2888,6 +2888,10 @@ struct ProviderRefWorkerOutput {
     events: Vec<CopyFileEvent>,
 }
 
+type ProviderRefWorkerSender = Sender<Vec<Vec<u8>>>;
+type ProviderRefWorkerHandle = thread::JoinHandle<io::Result<ProviderRefWorkerOutput>>;
+type ProviderRefWorkerHandles = Vec<(usize, ProviderRefWorkerHandle)>;
+
 impl WorkerJob {
     fn name(&self) -> &'static str {
         match self {
@@ -2978,10 +2982,7 @@ impl<R: Read> Read for PrefixReader<R> {
 
 fn join_provider_ref_workers<W: Write>(
     writer: &mut W,
-    provider_handles: Vec<(
-        usize,
-        thread::JoinHandle<io::Result<ProviderRefWorkerOutput>>,
-    )>,
+    provider_handles: ProviderRefWorkerHandles,
 ) -> io::Result<(HashMap<String, ProviderEntry>, Vec<CopyFileEvent>)> {
     let mut provider_worker_error: Option<io::Error> = None;
     let mut provider_map = HashMap::new();
@@ -3023,13 +3024,7 @@ fn spawn_provider_ref_workers(
     provider_ref_paths: CopyPathConfig,
     compact_copy_rotate_bytes: u64,
     collect_provider_npis: bool,
-) -> (
-    Sender<Vec<Vec<u8>>>,
-    Vec<(
-        usize,
-        thread::JoinHandle<io::Result<ProviderRefWorkerOutput>>,
-    )>,
-) {
+) -> (ProviderRefWorkerSender, ProviderRefWorkerHandles) {
     let (provider_tx, provider_rx) = bounded::<Vec<Vec<u8>>>(provider_ref_queue_size);
     let mut provider_handles = Vec::with_capacity(provider_ref_worker_count);
     for worker_id in 0..provider_ref_worker_count {
