@@ -3920,6 +3920,9 @@ fn scan_compact_struson_parallel(
     let mut writer = BufWriter::new(stdout.lock());
     let mut producer_blocked_micros = 0u128;
     let mut raw_chunk_stats = RawChunkStats::default();
+    let mut provider_refs_seconds = 0.0f64;
+    let mut in_network_enqueue_seconds = 0.0f64;
+    let mut worker_join_seconds = 0.0f64;
 
     emit_json_record(
         &mut writer,
@@ -3942,6 +3945,7 @@ fn scan_compact_struson_parallel(
         let name = json_reader.next_name_owned().map_err(to_io_error)?;
         match name.as_str() {
             "provider_references" => {
+                let provider_refs_started_at = Instant::now();
                 let provider_ref_paths = copy_paths.for_provider_refs();
                 let collect_provider_npis = copy_paths.manifest_provider_npi_sidecar.is_some();
                 let mut provider_ref_copy_sinks = DictionaryCopySinks::from_paths(
@@ -3978,6 +3982,7 @@ fn scan_compact_struson_parallel(
                     emit_copy_file_event(&mut writer, &event)?;
                 }
                 writer.flush()?;
+                provider_refs_seconds += provider_refs_started_at.elapsed().as_secs_f64();
 
                 let provider_map = Arc::new(provider_map);
                 let mut handles = Vec::with_capacity(worker_count);
@@ -4030,6 +4035,7 @@ fn scan_compact_struson_parallel(
                     let name = json_reader.next_name_owned().map_err(to_io_error)?;
                     match name.as_str() {
                         "in_network" => {
+                            let in_network_started_at = Instant::now();
                             json_reader.begin_array().map_err(to_io_error)?;
                             while json_reader.has_next().map_err(to_io_error)? {
                                 let rate_count = enqueue_in_network_struson(
@@ -4079,6 +4085,8 @@ fn scan_compact_struson_parallel(
                                 }
                             }
                             json_reader.end_array().map_err(to_io_error)?;
+                            in_network_enqueue_seconds +=
+                                in_network_started_at.elapsed().as_secs_f64();
                         }
                         _ => {
                             json_reader.skip_value().map_err(to_io_error)?;
@@ -4088,6 +4096,7 @@ fn scan_compact_struson_parallel(
 
                 drop(tx);
                 drop(event_tx);
+                let worker_join_started_at = Instant::now();
                 let mut worker_error: Option<io::Error> = None;
                 let mut copy_file_events = Vec::new();
                 for (worker_id, handle) in handles {
@@ -4111,6 +4120,7 @@ fn scan_compact_struson_parallel(
                         }
                     }
                 }
+                worker_join_seconds += worker_join_started_at.elapsed().as_secs_f64();
                 if let Some(err) = worker_error {
                     return Err(err);
                 }
@@ -4147,6 +4157,9 @@ fn scan_compact_struson_parallel(
                         "raw_chunk_max_rates": raw_chunk_stats.max_rates,
                         "parse_in_workers": parse_in_workers,
                         "producer_blocked_micros": producer_blocked_micros,
+                        "provider_refs_seconds": provider_refs_seconds,
+                        "in_network_enqueue_seconds": in_network_enqueue_seconds,
+                        "worker_join_seconds": worker_join_seconds,
                         "elapsed_seconds": started_at.elapsed().as_secs_f64(),
                     }),
                 )?;
