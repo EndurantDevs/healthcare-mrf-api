@@ -586,7 +586,7 @@ fn provider_group_hash(tin: &Value, npi: &[i64]) -> i64 {
     ])
 }
 
-fn build_provider_entry(provider_ref: &Value) -> Option<ProviderEntry> {
+fn build_provider_entry(provider_ref: &Value, collect_npis: bool) -> Option<ProviderEntry> {
     let groups = provider_ref.get("provider_groups")?.as_array()?;
     let mut group_payloads: Vec<Value> = Vec::new();
     let mut group_hashes: Vec<i64> = Vec::new();
@@ -598,7 +598,9 @@ fn build_provider_entry(provider_ref: &Value) -> Option<ProviderEntry> {
         let group_hash = provider_group_hash(tin, &npi);
         provider_count += npi.len() as i64;
         group_hashes.push(group_hash);
-        provider_npis.extend(npi.iter().copied());
+        if collect_npis {
+            provider_npis.extend(npi.iter().copied());
+        }
         group_payloads.push(json!({
             "provider_group_hash": group_hash,
             "tin_type": normalize_tin_type(tin.get("type")),
@@ -612,8 +614,10 @@ fn build_provider_entry(provider_ref: &Value) -> Option<ProviderEntry> {
     group_payloads.sort_by_cached_key(canonical_json);
     group_hashes.sort_unstable();
     group_hashes.dedup();
-    provider_npis.sort_unstable();
-    provider_npis.dedup();
+    if collect_npis {
+        provider_npis.sort_unstable();
+        provider_npis.dedup();
+    }
     let entry_hash = if group_payloads.len() == 1 {
         group_payloads[0]
             .get("provider_group_hash")
@@ -2442,7 +2446,7 @@ fn process_compact_rate_lites<W: Write>(
             let provider_ref = json!({"provider_groups": rate.provider_groups});
             dictionary_copy_sinks
                 .write_provider_group_members(&provider_ref, dedupe.provider_group_members)?;
-            match build_provider_entry(&provider_ref) {
+            match build_provider_entry(&provider_ref, outputs.manifest_sidecars.is_some()) {
                 Some(entry) => entry,
                 None => continue,
             }
@@ -3701,9 +3705,10 @@ fn scan_compact_struson_parallel(
                 while json_reader.has_next().map_err(to_io_error)? {
                     let value: Value = json_reader.deserialize_next().map_err(to_io_error)?;
                     if let Some(key_value) = value.get("provider_group_id") {
-                        if let (Some(key), Some(entry)) =
-                            (provider_ref_key(key_value), build_provider_entry(&value))
-                        {
+                        if let (Some(key), Some(entry)) = (
+                            provider_ref_key(key_value),
+                            build_provider_entry(&value, manifest_sidecars.is_some()),
+                        ) {
                             provider_ref_copy_sinks
                                 .write_provider_group_members_shared(&value, &dedupe)?;
                             provider_map.insert(key, entry);
@@ -4053,9 +4058,10 @@ fn scan_compact_struson(path: &Path) -> io::Result<()> {
                 while json_reader.has_next().map_err(to_io_error)? {
                     let value: Value = json_reader.deserialize_next().map_err(to_io_error)?;
                     if let Some(key_value) = value.get("provider_group_id") {
-                        if let (Some(key), Some(entry)) =
-                            (provider_ref_key(key_value), build_provider_entry(&value))
-                        {
+                        if let (Some(key), Some(entry)) = (
+                            provider_ref_key(key_value),
+                            build_provider_entry(&value, manifest_sidecars.is_some()),
+                        ) {
                             dictionary_copy_sinks.write_provider_group_members(
                                 &value,
                                 &mut emitted_provider_group_members,
@@ -4524,6 +4530,26 @@ mod tests {
         assert!(!member_path.exists());
 
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn provider_entry_can_skip_npi_retention_without_changing_hashes() {
+        let provider_ref = json!({
+            "provider_groups": [{
+                "tin": {"type": "ein", "value": "123456789"},
+                "npi": [1234567890, 1234567891]
+            }]
+        });
+
+        let retained = build_provider_entry(&provider_ref, true).unwrap();
+        let pruned = build_provider_entry(&provider_ref, false).unwrap();
+
+        assert_eq!(retained.entry_hash, pruned.entry_hash);
+        assert_eq!(retained.provider_count, 2);
+        assert_eq!(pruned.provider_count, 2);
+        assert_eq!(retained.provider_group_hashes, pruned.provider_group_hashes);
+        assert_eq!(retained.npi, vec![1234567890, 1234567891]);
+        assert!(pruned.npi.is_empty());
     }
 
     #[test]
