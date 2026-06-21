@@ -5,6 +5,7 @@ import importlib
 import importlib.util
 import inspect
 import json
+from contextlib import asynccontextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -1163,6 +1164,123 @@ def test_entity_address_unified_raw_enrichment_can_shard_by_checksum():
     assert "WHERE r.checksum >= -100 AND r.checksum < 100" in enrich_sql
 
 
+@pytest.mark.asyncio
+async def test_entity_address_unified_sql_phase_uses_scoped_bulk_settings(monkeypatch):
+    statements = []
+    events = []
+
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_WORK_MEM", "64MB")
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_MAINTENANCE_WORK_MEM", "1GB")
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_TEMP_FILE_LIMIT", "32GB")
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_LOCK_TIMEOUT", "15s")
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_STATEMENT_TIMEOUT", "0")
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_SYNCHRONOUS_COMMIT", "off")
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_JIT", "off")
+    monkeypatch.delenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_MAX_PARALLEL_WORKERS_PER_GATHER", raising=False)
+
+    class FakeConn:
+        async def status(self, statement):
+            statements.append(statement)
+            return 7 if statement == "UPDATE mrf.entity_address_unified_raw SET address_key = address_key;" else None
+
+    class FakeDB:
+        @asynccontextmanager
+        async def acquire(self):
+            yield FakeConn()
+
+    monkeypatch.setattr(entity_address_unified, "db", FakeDB())
+    monkeypatch.setattr(entity_address_unified, "enqueue_live_progress", lambda **payload: events.append(payload))
+
+    context = {}
+    rowcount = await entity_address_unified._run_sql_phase(  # pylint: disable=protected-access
+        "UPDATE mrf.entity_address_unified_raw SET address_key = address_key;",
+        context=context,
+        run_id="run_eau",
+        phase="entity-address-unified test phase",
+        unit="shards",
+        done=0,
+        total=1,
+        message="test phase",
+        emit_start=True,
+        emit_done=True,
+    )
+
+    assert rowcount == 7
+    assert statements[:7] == [
+        "SET LOCAL work_mem = '64MB';",
+        "SET LOCAL maintenance_work_mem = '1GB';",
+        "SET LOCAL temp_file_limit = '32GB';",
+        "SET LOCAL lock_timeout = '15s';",
+        "SET LOCAL statement_timeout = '0';",
+        "SET LOCAL synchronous_commit = 'off';",
+        "SET LOCAL jit = 'off';",
+    ]
+    assert statements[-1] == "UPDATE mrf.entity_address_unified_raw SET address_key = address_key;"
+    assert context["phase_timings"]["entity-address-unified test phase"]["count"] == 1
+    assert context["phase_timings"]["entity-address-unified test phase"]["rows"] == 7
+    assert events[0]["source"] == "entity-address-unified-sql-progress"
+    assert events[-1]["message"].startswith("test phase: 7 row(s),")
+
+
+@pytest.mark.asyncio
+async def test_entity_address_unified_support_stage_records_bulk_phase_timings(monkeypatch):
+    statements = []
+    events = []
+
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_WORK_MEM", "32MB")
+
+    class FakeModel:
+        __tablename__ = "entity_address_evidence"
+
+    class FakeStage:
+        __tablename__ = "entity_address_evidence_20260614"
+
+    class FakeConn:
+        async def status(self, statement):
+            statements.append(statement)
+            if "INSERT INTO mrf.entity_address_evidence_20260614" in statement:
+                return 11
+            return None
+
+    class FakeDB:
+        @asynccontextmanager
+        async def acquire(self):
+            yield FakeConn()
+
+        async def scalar(self, statement):
+            statements.append(statement)
+            return 3
+
+    def fake_support_stage_sql(*_args, **_kwargs):
+        return [
+            "TRUNCATE TABLE mrf.entity_address_evidence_20260614;",
+            "INSERT INTO mrf.entity_address_evidence_20260614 SELECT 1;",
+        ]
+
+    monkeypatch.setattr(entity_address_unified, "db", FakeDB())
+    monkeypatch.setattr(entity_address_unified, "_support_stage_sql", fake_support_stage_sql)
+    monkeypatch.setattr(entity_address_unified, "enqueue_live_progress", lambda **payload: events.append(payload))
+
+    context = {}
+    counts = await entity_address_unified._populate_support_stage_tables(  # pylint: disable=protected-access
+        "mrf",
+        "entity_address_unified_stage",
+        {FakeModel: FakeStage},
+        source_run_id="run_1",
+        node_id="node_a",
+        run_id="run_eau",
+        context=context,
+    )
+
+    assert counts == {"entity_address_evidence": 3}
+    assert "SET LOCAL work_mem = '32MB';" in statements
+    assert "INSERT INTO mrf.entity_address_evidence_20260614 SELECT 1;" in statements
+    assert context["phase_timings"]["entity-address-unified building evidence"]["count"] == 2
+    assert context["phase_timings"]["entity-address-unified building evidence"]["rows"] == 11
+    assert events[0]["phase"] == "entity-address-unified building evidence"
+    assert events[-1]["phase"] == "entity-address-unified built evidence"
+
+
 def test_entity_address_unified_evidence_stage_updates_by_location_key():
     evidence_table = entity_address_unified._evidence_stage_table_name("entity_address_unified_stage")
     prepare_sql = entity_address_unified._prepare_multi_source_evidence_table_sql(
@@ -1893,6 +2011,8 @@ async def test_entity_address_unified_publish_integrity_checks_archive_and_bridg
     assert metrics["duplicate_location_keys"] == 0
     assert metrics["unresolved_merged_into_rows"] == 0
     assert metrics["missing_archive_address_key_rows"] == 0
+    assert metrics["archive_coordinate_mismatch_rows"] == 0
+    assert metrics["archive_missing_coordinate_rows"] == 0
     assert metrics["practice_null_address_key_rows"] == 0
     assert metrics["practice_null_address_key_by_source"] == {}
     assert metrics["archive_identity_mismatch_rows"] == 0
@@ -1900,6 +2020,8 @@ async def test_entity_address_unified_publish_integrity_checks_archive_and_bridg
     assert metrics["bridge_orphans"]["entity_address_plan_bridge_20260614"] == 0
     assert any("a.merged_into IS NOT NULL" in statement for statement in statements)
     assert any("NOT EXISTS" in statement and "address_archive_v2 AS a" in statement for statement in statements)
+    assert any("t.lat IS DISTINCT FROM a.lat" in statement for statement in statements)
+    assert any("a.lat IS NULL OR a.long IS NULL" in statement for statement in statements)
     assert any("COALESCE(archive_identity_version, '') <> 'v2'" in statement for statement in statements)
     assert any("lat < -90 OR lat > 90" in statement for statement in statements)
     assert any(
@@ -1917,6 +2039,8 @@ async def test_entity_address_unified_publish_integrity_fails_on_redirects_and_o
         async def scalar(self, statement):
             if "a.merged_into IS NOT NULL" in statement:
                 return 2
+            if "t.lat IS DISTINCT FROM a.lat" in statement:
+                return 6
             if "lat < -90 OR lat > 90" in statement:
                 return 4
             if "FROM mrf.entity_address_procedure_bridge_20260614 AS b" in statement:
@@ -1932,7 +2056,7 @@ async def test_entity_address_unified_publish_integrity_fails_on_redirects_and_o
     monkeypatch.setattr(entity_address_unified, "db", FakeDB())
     monkeypatch.setattr(entity_address_unified, "_table_exists", table_exists)
 
-    with pytest.raises(RuntimeError, match="merged_into redirects.*invalid latitude/longitude.*procedure_bridge"):
+    with pytest.raises(RuntimeError, match="merged_into redirects.*address_archive_v2 coordinates.*invalid latitude/longitude.*procedure_bridge"):
         await entity_address_unified._validate_publish_integrity(
             "mrf",
             "entity_address_unified_stage",

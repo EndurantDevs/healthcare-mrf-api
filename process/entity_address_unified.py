@@ -9,6 +9,7 @@ import hashlib
 import logging
 import os
 import re
+import time
 from typing import Iterable
 
 from arq import create_pool
@@ -47,6 +48,13 @@ DEFAULT_EVIDENCE_SHARDS = 16
 DEFAULT_EVIDENCE_CONCURRENCY = 4
 DEFAULT_BUILD_NETWORK_BRIDGE = False
 DEFAULT_COMPACT_SOURCE_RECORD_IDS = True
+DEFAULT_SQL_WORK_MEM = "256MB"
+DEFAULT_SQL_MAINTENANCE_WORK_MEM = "2GB"
+DEFAULT_SQL_TEMP_FILE_LIMIT = "128GB"
+DEFAULT_SQL_LOCK_TIMEOUT = "30s"
+DEFAULT_SQL_STATEMENT_TIMEOUT = "0"
+DEFAULT_SQL_SYNCHRONOUS_COMMIT = "off"
+DEFAULT_SQL_JIT = "off"
 ARCHIVE_IDENTITY_VERSION = "v2"
 BASE_ADDRESS_VERSION = "address_archive_v2:v2"
 SUPPORT_TABLE_MODELS = (
@@ -118,10 +126,175 @@ def _env_int(name: str, default: int, minimum: int = 0) -> int:
     return max(int(raw), minimum)
 
 
+def _env_sql_setting(name: str, default: str | None) -> str | None:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = str(raw).strip()
+    return value or None
+
+
 def _sql_literal(value: str | None) -> str:
     if value is None:
         return "NULL"
     return "'" + str(value).replace("'", "''") + "'"
+
+
+def _entity_address_sql_settings() -> list[tuple[str, str]]:
+    """Postgres settings for each heavy entity-address SQL statement.
+
+    These are intentionally scoped with SET LOCAL inside the statement
+    transaction so the importer can use PTG-style tuned bulk execution without
+    leaking settings into unrelated DB work.
+    """
+
+    candidates = (
+        ("work_mem", "HLTHPRT_ENTITY_ADDRESS_UNIFIED_WORK_MEM", DEFAULT_SQL_WORK_MEM),
+        (
+            "maintenance_work_mem",
+            "HLTHPRT_ENTITY_ADDRESS_UNIFIED_MAINTENANCE_WORK_MEM",
+            DEFAULT_SQL_MAINTENANCE_WORK_MEM,
+        ),
+        (
+            "temp_file_limit",
+            "HLTHPRT_ENTITY_ADDRESS_UNIFIED_TEMP_FILE_LIMIT",
+            DEFAULT_SQL_TEMP_FILE_LIMIT,
+        ),
+        (
+            "lock_timeout",
+            "HLTHPRT_ENTITY_ADDRESS_UNIFIED_LOCK_TIMEOUT",
+            DEFAULT_SQL_LOCK_TIMEOUT,
+        ),
+        (
+            "statement_timeout",
+            "HLTHPRT_ENTITY_ADDRESS_UNIFIED_STATEMENT_TIMEOUT",
+            DEFAULT_SQL_STATEMENT_TIMEOUT,
+        ),
+        (
+            "synchronous_commit",
+            "HLTHPRT_ENTITY_ADDRESS_UNIFIED_SYNCHRONOUS_COMMIT",
+            DEFAULT_SQL_SYNCHRONOUS_COMMIT,
+        ),
+        ("jit", "HLTHPRT_ENTITY_ADDRESS_UNIFIED_JIT", DEFAULT_SQL_JIT),
+        (
+            "max_parallel_workers_per_gather",
+            "HLTHPRT_ENTITY_ADDRESS_UNIFIED_MAX_PARALLEL_WORKERS_PER_GATHER",
+            None,
+        ),
+    )
+    return [
+        (setting, value)
+        for setting, env_name, default in candidates
+        if (value := _env_sql_setting(env_name, default)) is not None
+    ]
+
+
+def _format_seconds(seconds: float) -> str:
+    if seconds >= 3600:
+        return f"{seconds / 3600:.1f}h"
+    if seconds >= 60:
+        return f"{seconds / 60:.1f}m"
+    return f"{seconds:.1f}s"
+
+
+def _record_phase_timing(
+    context: dict,
+    phase: str,
+    elapsed_seconds: float,
+    rowcount: int | None,
+) -> None:
+    timings = context.setdefault("phase_timings", {})
+    entry = timings.setdefault(
+        phase,
+        {
+            "count": 0,
+            "seconds": 0.0,
+            "max_seconds": 0.0,
+            "rows": 0,
+        },
+    )
+    entry["count"] = int(entry.get("count") or 0) + 1
+    entry["seconds"] = round(float(entry.get("seconds") or 0.0) + elapsed_seconds, 3)
+    entry["max_seconds"] = round(max(float(entry.get("max_seconds") or 0.0), elapsed_seconds), 3)
+    if rowcount is not None and rowcount >= 0:
+        entry["rows"] = int(entry.get("rows") or 0) + int(rowcount)
+
+
+def _coerce_rowcount(value) -> int | None:
+    if isinstance(value, int):
+        return value
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+async def _status_with_entity_address_tuning(statement: str) -> int | None:
+    settings = _entity_address_sql_settings()
+    acquire = getattr(db, "acquire", None)
+    if not settings or not callable(acquire):
+        rowcount = await db.status(statement)
+        return _coerce_rowcount(rowcount)
+
+    async with db.acquire() as conn:
+        for name, value in settings:
+            await conn.status(f"SET LOCAL {name} = {_sql_literal(value)};")
+        rowcount = await conn.status(statement)
+        return _coerce_rowcount(rowcount)
+
+
+async def _run_sql_phase(
+    statement: str,
+    *,
+    context: dict,
+    phase: str,
+    run_id: str | None = None,
+    unit: str = "run",
+    done: int | None = None,
+    total: int | None = None,
+    pct: float | None = None,
+    message: str | None = None,
+    emit_start: bool = False,
+    emit_done: bool = False,
+) -> int | None:
+    started = time.monotonic()
+    if run_id and emit_start:
+        enqueue_live_progress(
+            run_id=run_id,
+            importer="entity-address-unified",
+            status="running",
+            phase=phase,
+            unit=unit,
+            done=done,
+            total=total,
+            pct=pct,
+            message=message or phase,
+            source="entity-address-unified-sql-progress",
+        )
+    rowcount = await _status_with_entity_address_tuning(statement)
+    elapsed = time.monotonic() - started
+    _record_phase_timing(context, phase, elapsed, rowcount)
+    if run_id and emit_done:
+        complete_message = message or phase
+        if rowcount is not None and rowcount >= 0:
+            complete_message = f"{complete_message}: {rowcount:,} row(s), {_format_seconds(elapsed)}"
+        else:
+            complete_message = f"{complete_message}: {_format_seconds(elapsed)}"
+        enqueue_live_progress(
+            run_id=run_id,
+            importer="entity-address-unified",
+            status="running",
+            phase=phase,
+            unit=unit,
+            done=done,
+            total=total,
+            pct=pct,
+            message=complete_message,
+            source="entity-address-unified-sql-progress",
+        )
+    return rowcount
 
 
 def _hospital_facility_taxonomy_codes_sql(indent: str = "                ") -> str:
@@ -160,7 +333,13 @@ def _entity_address_unified_columns() -> list[str]:
     return [column.name for column in EntityAddressUnified.__table__.columns]
 
 
-async def _compact_hot_row_source_record_ids(db_schema: str, stage_table: str) -> int:
+async def _compact_hot_row_source_record_ids(
+    db_schema: str,
+    stage_table: str,
+    *,
+    context: dict | None = None,
+) -> int:
+    phase_context = context if context is not None else {}
     compact_table = _compact_stage_table_name(stage_table)
     columns = _entity_address_unified_columns()
     columns_sql = ", ".join(columns)
@@ -168,24 +347,46 @@ async def _compact_hot_row_source_record_ids(db_schema: str, stage_table: str) -
         "ARRAY[]::varchar[] AS source_record_ids" if column == "source_record_ids" else column
         for column in columns
     )
-    await db.status(f"DROP TABLE IF EXISTS {db_schema}.{compact_table};")
-    await db.status(
-        f"CREATE TABLE {db_schema}.{compact_table} "
-        f"(LIKE {db_schema}.{stage_table} INCLUDING ALL);"
+    await _run_sql_phase(
+        f"DROP TABLE IF EXISTS {db_schema}.{compact_table};",
+        context=phase_context,
+        phase="entity-address-unified compacting hot rows setup",
     )
-    rowcount = await db.status(
+    await _run_sql_phase(
+        f"CREATE TABLE {db_schema}.{compact_table} "
+        f"(LIKE {db_schema}.{stage_table} INCLUDING ALL);",
+        context=phase_context,
+        phase="entity-address-unified compacting hot rows setup",
+    )
+    rowcount = await _run_sql_phase(
         f"""
         INSERT INTO {db_schema}.{compact_table} ({columns_sql})
         SELECT {select_sql}
           FROM {db_schema}.{stage_table};
-        """
+        """,
+        context=phase_context,
+        phase="entity-address-unified compacting hot rows",
     )
-    await db.status(f"DROP TABLE {db_schema}.{stage_table};")
-    await db.status(f"ALTER TABLE {db_schema}.{compact_table} RENAME TO {stage_table};")
+    await _run_sql_phase(
+        f"DROP TABLE {db_schema}.{stage_table};",
+        context=phase_context,
+        phase="entity-address-unified compacting hot rows swap",
+    )
+    await _run_sql_phase(
+        f"ALTER TABLE {db_schema}.{compact_table} RENAME TO {stage_table};",
+        context=phase_context,
+        phase="entity-address-unified compacting hot rows swap",
+    )
     return int(rowcount or 0)
 
 
-async def _create_stage_indexes(stage_cls, db_schema: str) -> None:
+async def _create_stage_indexes(
+    stage_cls,
+    db_schema: str,
+    *,
+    context: dict | None = None,
+) -> None:
+    phase_context = context if context is not None else {}
     if hasattr(stage_cls, "__my_additional_indexes__") and stage_cls.__my_additional_indexes__:
         for index in stage_cls.__my_additional_indexes__:
             index_name = index.get("name", "_".join(index.get("index_elements")))
@@ -198,7 +399,11 @@ async def _create_stage_indexes(stage_cls, db_schema: str) -> None:
                 f"({', '.join(index.get('index_elements'))}){where};"
             )
             try:
-                await db.status(stmt)
+                await _run_sql_phase(
+                    stmt,
+                    context=phase_context,
+                    phase="entity-address-unified indexing stage",
+                )
             except Exception as exc:
                 msg = str(exc).lower()
                 if "st_makepoint" in msg or "geography" in msg or "postgis" in msg:
@@ -211,17 +416,25 @@ async def _create_stage_indexes(stage_cls, db_schema: str) -> None:
                 raise
 
 
-async def _prepare_inference_stage_indexes(db_schema: str, stage_table: str) -> None:
-    await db.status(
+async def _prepare_inference_stage_indexes(
+    db_schema: str,
+    stage_table: str,
+    *,
+    context: dict | None = None,
+) -> None:
+    phase_context = context if context is not None else {}
+    await _run_sql_phase(
         f"""
         CREATE INDEX IF NOT EXISTS {stage_table}_idx_facility_unresolved_identity
         ON {db_schema}.{stage_table} (entity_subtype, entity_id, type, checksum)
         WHERE entity_type = 'facility_anchor'
           AND npi IS NULL
           AND inferred_npi IS NULL;
-        """
+        """,
+        context=phase_context,
+        phase="entity-address-unified preparing inference indexes",
     )
-    await db.status(
+    await _run_sql_phase(
         f"""
         CREATE INDEX IF NOT EXISTS {stage_table}_idx_facility_unresolved_address
         ON {db_schema}.{stage_table} (address_key, entity_subtype)
@@ -229,9 +442,15 @@ async def _prepare_inference_stage_indexes(db_schema: str, stage_table: str) -> 
           AND npi IS NULL
           AND inferred_npi IS NULL
           AND address_key IS NOT NULL;
-        """
+        """,
+        context=phase_context,
+        phase="entity-address-unified preparing inference indexes",
     )
-    await db.status(f"ANALYZE {db_schema}.{stage_table};")
+    await _run_sql_phase(
+        f"ANALYZE {db_schema}.{stage_table};",
+        context=phase_context,
+        phase="entity-address-unified preparing inference indexes",
+    )
 
 
 async def _prepare_support_stage_tables(db_schema: str, import_date: str) -> dict[type, type]:
@@ -242,9 +461,14 @@ async def _prepare_support_stage_tables(db_schema: str, import_date: str) -> dic
     return stage_classes
 
 
-async def _create_support_stage_indexes(stage_classes: dict[type, type], db_schema: str) -> None:
+async def _create_support_stage_indexes(
+    stage_classes: dict[type, type],
+    db_schema: str,
+    *,
+    context: dict | None = None,
+) -> None:
     for stage_cls in stage_classes.values():
-        await _create_stage_indexes(stage_cls, db_schema)
+        await _create_stage_indexes(stage_cls, db_schema, context=context)
 
 
 async def _swap_stage_table(db_schema: str, live_cls, stage_cls) -> None:
@@ -1564,6 +1788,8 @@ async def _validate_publish_integrity(
 
     unresolved_merged_into_rows = 0
     missing_archive_address_key_rows = 0
+    archive_coordinate_mismatch_rows = 0
+    archive_missing_coordinate_rows = 0
     if await _table_exists(db_schema, "address_archive_v2"):
         unresolved_merged_into_rows = int(
             await db.scalar(
@@ -1574,6 +1800,39 @@ async def _validate_publish_integrity(
                     ON a.address_key = t.address_key
                  WHERE t.address_key IS NOT NULL
                    AND a.merged_into IS NOT NULL;
+                """
+            )
+            or 0
+        )
+        archive_coordinate_mismatch_rows = int(
+            await db.scalar(
+                f"""
+                SELECT COUNT(*)
+                  FROM {db_schema}.{stage_table} AS t
+                  JOIN {db_schema}.address_archive_v2 AS a
+                    ON a.address_key = t.address_key
+                   AND a.merged_into IS NULL
+                 WHERE t.address_key IS NOT NULL
+                   AND a.lat IS NOT NULL
+                   AND a.long IS NOT NULL
+                   AND (
+                       t.lat IS DISTINCT FROM a.lat
+                    OR t.long IS DISTINCT FROM a.long
+                   );
+                """
+            )
+            or 0
+        )
+        archive_missing_coordinate_rows = int(
+            await db.scalar(
+                f"""
+                SELECT COUNT(*)
+                  FROM {db_schema}.{stage_table} AS t
+                  JOIN {db_schema}.address_archive_v2 AS a
+                    ON a.address_key = t.address_key
+                   AND a.merged_into IS NULL
+                 WHERE t.address_key IS NOT NULL
+                   AND (a.lat IS NULL OR a.long IS NULL);
                 """
             )
             or 0
@@ -1603,6 +1862,19 @@ async def _validate_publish_integrity(
     if missing_archive_address_key_rows:
         failures.append(
             f"{missing_archive_address_key_rows} staged rows have address_key values missing from address_archive_v2"
+        )
+    metrics["archive_coordinate_mismatch_rows"] = archive_coordinate_mismatch_rows
+    if archive_coordinate_mismatch_rows:
+        failures.append(
+            f"{archive_coordinate_mismatch_rows} staged rows do not match address_archive_v2 coordinates"
+        )
+    metrics["archive_missing_coordinate_rows"] = archive_missing_coordinate_rows
+    if archive_missing_coordinate_rows and _env_bool(
+        "HLTHPRT_ENTITY_ADDRESS_UNIFIED_REQUIRE_ARCHIVE_COORDINATES",
+        False,
+    ):
+        failures.append(
+            f"{archive_missing_coordinate_rows} staged rows reference archive addresses without coordinates"
         )
 
     practice_null_address_key_rows = int(
@@ -3753,7 +4025,9 @@ async def _populate_support_stage_tables(
     build_network_bridge: bool = True,
     available: dict[str, bool] | None = None,
     run_id: str | None = None,
+    context: dict | None = None,
 ) -> dict[str, int]:
+    phase_context = context if context is not None else {}
     statements = _support_stage_sql(
         db_schema,
         stage_table,
@@ -3779,7 +4053,11 @@ async def _populate_support_stage_tables(
                 pct=95 + ((index - 1) / max(total_steps, 1)) * 4,
                 message=f"building support table {index}/{total_steps}: {label}",
             )
-        await db.status(statement)
+        await _run_sql_phase(
+            statement,
+            context=phase_context,
+            phase=f"entity-address-unified building {label}",
+        )
         if run_id:
             enqueue_live_progress(
                 run_id=run_id,
@@ -5764,7 +6042,13 @@ async def process_data(ctx, task=None):
                 message=f"promoted {approved_candidate_promotions} approved facility-anchor NPI candidates",
             )
     test_limit_per_source: int | None = None
-    limit_any_mode_raw = os.getenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_LIMIT_PER_SOURCE")
+    limit_any_mode_raw = (
+        task.get("limit_per_source")
+        if task.get("limit_per_source") not in (None, "")
+        else task.get("source_limit")
+    )
+    if limit_any_mode_raw in (None, ""):
+        limit_any_mode_raw = os.getenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_LIMIT_PER_SOURCE")
     if limit_any_mode_raw not in (None, ""):
         test_limit_per_source = max(int(limit_any_mode_raw), 0)
     elif test_mode:
@@ -5774,6 +6058,7 @@ async def process_data(ctx, task=None):
                 str(DEFAULT_TEST_LIMIT_PER_SOURCE),
             )
         )
+    context["limit_per_source"] = test_limit_per_source
     source_selects = _source_selects(
         db_schema,
         available,
@@ -5928,13 +6213,21 @@ async def process_data(ctx, task=None):
             async def _load_source(select_sql: str) -> None:
                 nonlocal loaded_sources
                 async with sem:
-                    await db.status(
+                    await _run_sql_phase(
                         _insert_raw_from_source_sql(
                             db_schema,
                             raw_table,
                             select_sql,
                             address_canon_available=address_canon_available,
-                        )
+                        ),
+                        context=context,
+                        run_id=run_id,
+                        phase="entity-address-unified loading sources",
+                        unit="sources",
+                        done=loaded_sources,
+                        total=len(source_selects),
+                        message="loading source shard",
+                        emit_start=True,
                     )
                 if run_id:
                     async with source_progress_lock:
@@ -5957,11 +6250,31 @@ async def process_data(ctx, task=None):
                     await _load_source(select_sql)
 
             if enrich_shards > 1:
-                await db.status(
+                await _run_sql_phase(
                     f"CREATE INDEX IF NOT EXISTS {raw_table}_idx_checksum "
-                    f"ON {db_schema}.{raw_table} (checksum);"
+                    f"ON {db_schema}.{raw_table} (checksum);",
+                    context=context,
+                    run_id=run_id,
+                    phase="entity-address-unified indexing raw checksum",
+                    unit="indexes",
+                    done=0,
+                    total=1,
+                    message="indexing raw checksum shards",
+                    emit_start=True,
+                    emit_done=True,
                 )
-                await db.status(f"ANALYZE {db_schema}.{raw_table};")
+                await _run_sql_phase(
+                    f"ANALYZE {db_schema}.{raw_table};",
+                    context=context,
+                    run_id=run_id,
+                    phase="entity-address-unified analyzing raw",
+                    unit="tables",
+                    done=0,
+                    total=1,
+                    message="analyzing raw stage",
+                    emit_start=True,
+                    emit_done=True,
+                )
                 if run_id:
                     enqueue_live_progress(
                         run_id=run_id,
@@ -5981,14 +6294,22 @@ async def process_data(ctx, task=None):
                 async def _enrich_shard(checksum_min: int, checksum_max: int) -> None:
                     nonlocal enriched_shards
                     async with enrich_sem:
-                        await db.status(
+                        await _run_sql_phase(
                             _enrich_raw_stage_sql(
                                 db_schema,
                                 raw_table,
                                 archive_available=available.get("address_archive_v2", False),
                                 checksum_min=checksum_min,
                                 checksum_max=checksum_max,
-                            )
+                            ),
+                            context=context,
+                            run_id=run_id,
+                            phase="entity-address-unified enriching raw",
+                            unit="shards",
+                            done=enriched_shards,
+                            total=enrich_shards,
+                            message=f"enriching checksum range {checksum_min}..{checksum_max}",
+                            emit_start=True,
                         )
                     if run_id:
                         async with enrich_progress_lock:
@@ -6006,22 +6327,53 @@ async def process_data(ctx, task=None):
 
                 await asyncio.gather(*(_enrich_shard(low, high) for low, high in checksum_ranges))
             else:
-                await db.status(
+                await _run_sql_phase(
                     _enrich_raw_stage_sql(
                         db_schema,
                         raw_table,
                         archive_available=available.get("address_archive_v2", False),
-                    )
+                    ),
+                    context=context,
+                    run_id=run_id,
+                    phase="entity-address-unified enriching raw",
+                    unit="run",
+                    done=0,
+                    total=1,
+                    message="enriching raw stage from address archive",
+                    emit_start=True,
+                    emit_done=True,
                 )
-        await db.status(f"DROP INDEX IF EXISTS {db_schema}.{raw_table}_idx_group_key;")
-        await db.status(
+        await _run_sql_phase(
+            f"DROP INDEX IF EXISTS {db_schema}.{raw_table}_idx_group_key;",
+            context=context,
+            phase="entity-address-unified preparing raw group index",
+        )
+        await _run_sql_phase(
             f"CREATE INDEX {raw_table}_idx_group_key "
             f"ON {db_schema}.{raw_table} "
-            "(entity_type, entity_id, type, location_key);"
+            "(entity_type, entity_id, type, location_key);",
+            context=context,
+            run_id=run_id,
+            phase="entity-address-unified indexing raw groups",
+            unit="indexes",
+            done=0,
+            total=2,
+            message="indexing raw entity/location groups",
+            emit_start=True,
+            emit_done=True,
         )
-        await db.status(
+        await _run_sql_phase(
             f"CREATE INDEX IF NOT EXISTS {raw_table}_idx_location_key "
-            f"ON {db_schema}.{raw_table} (location_key);"
+            f"ON {db_schema}.{raw_table} (location_key);",
+            context=context,
+            run_id=run_id,
+            phase="entity-address-unified indexing raw location keys",
+            unit="indexes",
+            done=1,
+            total=2,
+            message="indexing raw location keys",
+            emit_start=True,
+            emit_done=True,
         )
         await db.status(f"TRUNCATE TABLE {db_schema}.{stage_table};")
         if run_id:
@@ -6040,7 +6392,7 @@ async def process_data(ctx, task=None):
 
         async def _aggregate_shard(remainder: int) -> None:
             nonlocal aggregated_shards
-            await db.status(
+            await _run_sql_phase(
                 _materialize_from_raw_sql(
                     db_schema,
                     stage_table,
@@ -6048,7 +6400,15 @@ async def process_data(ctx, task=None):
                     checksum_modulo=aggregate_shards,
                     checksum_remainder=remainder,
                     address_canon_available=address_canon_available,
-                )
+                ),
+                context=context,
+                run_id=run_id,
+                phase="entity-address-unified aggregating",
+                unit="shards",
+                done=aggregated_shards,
+                total=aggregate_shards,
+                message=f"aggregating shard {remainder + 1}/{aggregate_shards}",
+                emit_start=True,
             )
             if run_id:
                 async with aggregate_progress_lock:
@@ -6073,13 +6433,22 @@ async def process_data(ctx, task=None):
 
             await asyncio.gather(*(_guarded_aggregate(i) for i in range(aggregate_shards)))
         else:
-            await db.status(
+            await _run_sql_phase(
                 _materialize_from_raw_sql(
                     db_schema,
                     stage_table,
                     raw_table,
                     address_canon_available=address_canon_available,
-                )
+                ),
+                context=context,
+                run_id=run_id,
+                phase="entity-address-unified aggregating",
+                unit="run",
+                done=0,
+                total=1,
+                message="aggregating raw stage",
+                emit_start=True,
+                emit_done=True,
             )
 
     elif chunked_load:
@@ -6113,13 +6482,22 @@ async def process_data(ctx, task=None):
                 message="materializing sources",
             )
         await db.status(f"TRUNCATE TABLE {db_schema}.{stage_table};")
-        await db.status(
+        await _run_sql_phase(
             _materialize_sql(
                 db_schema,
                 stage_table,
                 source_selects,
                 address_canon_available=address_canon_available,
-            )
+            ),
+            context=context,
+            run_id=run_id,
+            phase="entity-address-unified materializing",
+            unit="sources",
+            done=0,
+            total=len(source_selects),
+            message="materializing sources",
+            emit_start=True,
+            emit_done=True,
         )
         if run_id:
             enqueue_live_progress(
@@ -6174,8 +6552,8 @@ async def process_data(ctx, task=None):
         context["facility_anchor_npi_other_identifier_inference_enabled"] = (
             include_npi_other_identifier
         )
-        await _prepare_inference_stage_indexes(db_schema, stage_table)
-        await db.status(
+        await _prepare_inference_stage_indexes(db_schema, stage_table, context=context)
+        await _run_sql_phase(
             _inference_sql(
                 db_schema,
                 stage_table,
@@ -6195,7 +6573,16 @@ async def process_data(ctx, task=None):
                     "HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENABLE_NPPES_BROAD_INFERENCE",
                     False,
                 ),
-            )
+            ),
+            context=context,
+            run_id=run_id,
+            phase="entity-address-unified inferring NPIs",
+            unit="run",
+            done=0,
+            total=1,
+            message="inferring facility-anchor NPIs",
+            emit_start=True,
+            emit_done=True,
         )
 
     evidence_shards = _env_int(
@@ -6228,26 +6615,43 @@ async def process_data(ctx, task=None):
             total=1,
             message=f"building {evidence_shards}-shard evidence work table",
         )
-    await db.status(
+    await _run_sql_phase(
         _prepare_multi_source_evidence_table_sql(
             db_schema,
             evidence_table,
             unlogged=use_unlogged_evidence,
-        )
+        ),
+        context=context,
+        run_id=run_id,
+        phase="entity-address-unified preparing source evidence",
+        unit="tables",
+        done=0,
+        total=1,
+        message="creating source evidence work table",
+        emit_start=True,
+        emit_done=True,
     )
     evidence_build_progress_lock = asyncio.Lock()
     evidence_build_done = 0
 
     async def _build_evidence_shard(remainder: int) -> None:
         nonlocal evidence_build_done
-        await db.status(
+        await _run_sql_phase(
             _insert_multi_source_evidence_shard_sql(
                 db_schema,
                 stage_table,
                 evidence_table,
                 evidence_shards=evidence_shards,
                 evidence_shard=remainder,
-            )
+            ),
+            context=context,
+            run_id=run_id,
+            phase="entity-address-unified preparing source evidence",
+            unit="shards",
+            done=evidence_build_done,
+            total=evidence_shards,
+            message=f"preparing evidence shard {remainder + 1}/{evidence_shards}",
+            emit_start=True,
         )
         if run_id:
             async with evidence_build_progress_lock:
@@ -6275,8 +6679,30 @@ async def process_data(ctx, task=None):
         )
     else:
         await _build_evidence_shard(0)
-    await db.status(_index_multi_source_evidence_table_sql(db_schema, evidence_table))
-    await db.status(f"ANALYZE {db_schema}.{evidence_table};")
+    await _run_sql_phase(
+        _index_multi_source_evidence_table_sql(db_schema, evidence_table),
+        context=context,
+        run_id=run_id,
+        phase="entity-address-unified indexing source evidence",
+        unit="indexes",
+        done=0,
+        total=1,
+        message="indexing evidence work table",
+        emit_start=True,
+        emit_done=True,
+    )
+    await _run_sql_phase(
+        f"ANALYZE {db_schema}.{evidence_table};",
+        context=context,
+        run_id=run_id,
+        phase="entity-address-unified analyzing source evidence",
+        unit="tables",
+        done=0,
+        total=1,
+        message="analyzing evidence work table",
+        emit_start=True,
+        emit_done=True,
+    )
     if run_id:
         enqueue_live_progress(
             run_id=run_id,
@@ -6293,13 +6719,21 @@ async def process_data(ctx, task=None):
 
     async def _apply_evidence_shard(remainder: int) -> None:
         nonlocal evidence_done
-        await db.status(
+        await _run_sql_phase(
             _apply_multi_source_evidence_sql(
                 db_schema,
                 stage_table,
                 evidence_table,
                 evidence_shard=remainder,
-            )
+            ),
+            context=context,
+            run_id=run_id,
+            phase="entity-address-unified applying source evidence",
+            unit="shards",
+            done=evidence_done,
+            total=evidence_shards,
+            message=f"applying evidence shard {remainder + 1}/{evidence_shards}",
+            emit_start=True,
         )
         if run_id:
             async with evidence_progress_lock:
@@ -6346,6 +6780,7 @@ async def process_data(ctx, task=None):
             build_network_bridge=build_network_bridge,
             available=available,
             run_id=run_id,
+            context=context,
         )
         context["support_stage_populated"] = True
         context["support_counts"] = support_counts
@@ -6371,7 +6806,11 @@ async def process_data(ctx, task=None):
                 pct=88,
                 message="rewriting hot rows without source record id arrays",
             )
-        compacted_rows = await _compact_hot_row_source_record_ids(db_schema, stage_table)
+        compacted_rows = await _compact_hot_row_source_record_ids(
+            db_schema,
+            stage_table,
+            context=context,
+        )
         context["hot_row_source_record_ids_compacted"] = True
         context["hot_row_source_record_ids_compacted_rows"] = compacted_rows
         if run_id:
@@ -6400,11 +6839,11 @@ async def process_data(ctx, task=None):
                 pct=90,
                 message="building indexes",
             )
-        await _create_stage_indexes(stage_cls, db_schema)
+        await _create_stage_indexes(stage_cls, db_schema, context=context)
         context["stage_indexes_prepared"] = True
 
     if not ctx["context"].get("support_stage_indexes_prepared"):
-        await _create_support_stage_indexes(support_stage_classes, db_schema)
+        await _create_support_stage_indexes(support_stage_classes, db_schema, context=context)
         context["support_stage_indexes_prepared"] = True
 
     staged_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{stage_table};") or 0)
@@ -6565,6 +7004,7 @@ async def shutdown(ctx):
             "multi_source_rows": int(context.get("multi_source_rows") or 0),
             "support_counts": context.get("support_counts") or {},
             "publish_validation": context.get("publish_validation") or {},
+            "phase_timings": context.get("phase_timings") or {},
         },
     )
     print_time_info(context.get("start"))
