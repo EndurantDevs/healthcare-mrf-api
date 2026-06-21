@@ -66,6 +66,21 @@
       "variants": ["baseline", "parse_in_workers"]
     },
     {
+      "id": "local-full-file-verify",
+      "kind": "local_ptg_cli",
+      "fixture": "large_in_network",
+      "negotiated_rates": 4096,
+      "source_key": "local-full-file-verify",
+      "import_month": "2026-06",
+      "max_files": 1,
+      "full_file": true,
+      "verify_original": true,
+      "gates": {
+        "performance": false
+      },
+      "variants": ["parse_in_workers"]
+    },
+    {
       "id": "ptg-pilot-import",
       "kind": "import_control_pilot",
       "variants": ["parse_in_workers"],

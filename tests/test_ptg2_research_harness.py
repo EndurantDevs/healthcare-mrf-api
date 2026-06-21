@@ -254,6 +254,53 @@ def test_local_ptg_cli_dry_run_writes_fixture_and_command(tmp_path, monkeypatch)
     assert (fixture_dir / "rates.json.gz").exists()
 
 
+def test_original_file_summary_counts_unique_prices(tmp_path):
+    case = {
+        "id": "full-file",
+        "fixture": "large_in_network",
+        "negotiated_rates": 3,
+    }
+    fixture_dir = tmp_path / "fixture"
+    harness.write_ptg_toc_fixture(case, fixture_dir, base_url="http://127.0.0.1:1")
+
+    summary = harness.expected_original_file_summary(fixture_dir / "rates.json.gz")
+
+    assert summary["provider_references"] == 1
+    assert summary["in_network_items"] == 1
+    assert summary["negotiated_rates"] == 3
+    assert summary["negotiated_prices"] == 3
+    assert summary["unique_price_atoms"] == 3
+    assert summary["unique_provider_npis"] == 1
+    assert len(summary["price_atom_digest"]) == 32
+
+
+def test_local_ptg_cli_full_file_dry_run_omits_max_items(tmp_path, monkeypatch):
+    monkeypatch.setenv("HLTHPRT_DB_USER", "tester")
+    suite = {
+        "variants": [{"id": "parse_in_workers"}],
+        "cases": [
+            {
+                "id": "local-full-file-verify",
+                "kind": "local_ptg_cli",
+                "fixture": "large_in_network",
+                "full_file": True,
+                "verify_original": True,
+                "variants": ["parse_in_workers"],
+            }
+        ],
+    }
+
+    report = harness.run_suite(suite, report_dir=tmp_path, dry_run=True)
+    result = report["results"][0]
+    fixture_dir = Path(result["import_run"]["fixture_dir"])
+
+    assert result["status"] == "dry_run"
+    assert "--max-items" not in result["command"]
+    assert result["import_run"]["fixture_dir"]
+    assert (fixture_dir / "index.json").exists()
+    assert (fixture_dir / "rates.json.gz").exists()
+
+
 def test_markdown_report_includes_scanner_and_import_summary():
     report = {
         "generated_at": "20260620T000000Z",
@@ -267,7 +314,14 @@ def test_markdown_report_includes_scanner_and_import_summary():
                 "elapsed_seconds": 1.25,
                 "scanner_config": {"parse_in_workers": True, "worker_count": 2},
                 "scanner_summary": {"producer_blocked_micros": 12},
-                "import_run": {"import_done": {"status": "validated", "files_processed": 1, "serving_rates": 7}},
+                "import_run": {
+                    "import_done": {"status": "validated", "files_processed": 1, "serving_rates": 7},
+                    "verification": {
+                        "status": "passed",
+                        "expected": {"unique_price_atoms": 7, "unique_provider_npis": 1},
+                        "db": {"price_atom_rows": 7, "provider_npis": 1},
+                    },
+                },
             }
         ],
     }
@@ -276,3 +330,4 @@ def test_markdown_report_includes_scanner_and_import_summary():
 
     assert "parse_workers=true<br>workers=2<br>producer_blocked_us=12" in markdown
     assert "validated<br>files=1<br>rates=7" in markdown
+    assert "passed<br>prices=7/7<br>npis=1/1" in markdown

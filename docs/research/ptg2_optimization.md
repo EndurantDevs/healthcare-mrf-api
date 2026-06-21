@@ -51,6 +51,22 @@ HLTHPRT_TEST_DATABASE_SUFFIX=_test \
   --case local-db-smoke
 ```
 
+Run a full-file local import and verify the published DB snapshot against the
+original generated source file. Unlike `local-db-smoke`, this does not pass
+`--max-items`; after `PTG2_IMPORT_DONE`, the harness reloads `rates.json.gz`,
+computes independent source counts and a sorted price-atom digest, then compares
+those values with the published serving, price atom, and provider-member tables:
+
+```bash
+HLTHPRT_DB_HOST=127.0.0.1 \
+HLTHPRT_DB_PORT=5440 \
+HLTHPRT_DB_USER=nick \
+HLTHPRT_DB_DATABASE=healthporta \
+HLTHPRT_TEST_DATABASE_SUFFIX=_test \
+./venv314/bin/python scripts/research/ptg2_experiment.py run \
+  --case local-full-file-verify
+```
+
 Reports are written to:
 
 ```text

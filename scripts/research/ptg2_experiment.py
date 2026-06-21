@@ -19,6 +19,7 @@ import hashlib
 import http.server
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -33,6 +34,8 @@ ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_SUITE_PATH = ROOT / "docs" / "research" / "ptg2_benchmark_suite.example.json"
 DEFAULT_REPORT_DIR = ROOT / "reports" / "ptg2-experiments"
 DEFAULT_SCANNER = ROOT / "support" / "ptg2_scanner" / "target" / "release" / "ptg2_scanner"
+IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+QUALIFIED_TABLE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*$")
 
 
 @dataclass(frozen=True)
@@ -343,6 +346,15 @@ def build_fixture_payload(case: dict[str, Any]) -> dict[str, Any]:
     raise ValueError(f"unsupported fixture: {fixture}")
 
 
+def load_json_file(path: Path) -> dict[str, Any]:
+    opener = gzip.open if path.suffix == ".gz" else open
+    with opener(path, "rt", encoding="utf-8") as fp:
+        payload = json.load(fp)
+    if not isinstance(payload, dict):
+        raise ValueError(f"expected JSON object in {path}")
+    return payload
+
+
 def write_fixture(case: dict[str, Any], output_dir: Path) -> Path:
     artifact = output_dir / f"{case['id']}.json.gz"
     with gzip.open(artifact, "wb") as fp:
@@ -385,6 +397,194 @@ def write_ptg_toc_fixture(case: dict[str, Any], output_dir: Path, *, base_url: s
     index_path = output_dir / "index.json"
     index_path.write_text(json.dumps(index, separators=(",", ":")), encoding="utf-8")
     return index_path
+
+
+def expected_original_file_summary(path: Path) -> dict[str, Any]:
+    payload = load_json_file(path)
+    provider_npis_by_ref: dict[int, set[str]] = {}
+    for ref in payload.get("provider_references") or []:
+        ref_id = ref.get("provider_group_id")
+        if ref_id is None:
+            continue
+        npis: set[str] = set()
+        for group in ref.get("provider_groups") or []:
+            for npi in group.get("npi") or []:
+                npis.add(str(npi))
+        provider_npis_by_ref[int(ref_id)] = npis
+
+    in_network_items = payload.get("in_network") or []
+    price_keys: list[str] = []
+    used_npis: set[str] = set()
+    negotiated_rate_count = 0
+    for item in in_network_items:
+        for rate in item.get("negotiated_rates") or []:
+            negotiated_rate_count += 1
+            for ref_id in rate.get("provider_references") or []:
+                try:
+                    used_npis.update(provider_npis_by_ref.get(int(ref_id), set()))
+                except (TypeError, ValueError):
+                    continue
+            for price in rate.get("negotiated_prices") or []:
+                price_keys.append(price_atom_original_key(price))
+
+    unique_price_keys = sorted(set(price_keys))
+    return {
+        "provider_references": len(provider_npis_by_ref),
+        "in_network_items": len(in_network_items),
+        "negotiated_rates": negotiated_rate_count,
+        "negotiated_prices": len(price_keys),
+        "unique_price_atoms": len(unique_price_keys),
+        "unique_provider_npis": len(used_npis),
+        "price_atom_digest": digest_text_lines(unique_price_keys),
+    }
+
+
+def price_atom_original_key(price: dict[str, Any]) -> str:
+    return "\t".join(
+        [
+            normalize_text(price.get("negotiated_type")),
+            normalize_rate(price.get("negotiated_rate")),
+            normalize_text(price.get("expiration_date")),
+            ",".join(sorted(normalize_text(item) for item in price.get("service_code") or [])),
+            normalize_text(price.get("billing_class")),
+            normalize_text(price.get("setting")),
+            ",".join(sorted(normalize_text(item) for item in price.get("billing_code_modifier") or [])),
+            normalize_text(price.get("additional_information")),
+        ]
+    )
+
+
+def normalize_text(value: Any) -> str:
+    return "" if value is None else str(value)
+
+
+def normalize_rate(value: Any) -> str:
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return normalize_text(value)
+
+
+def digest_text_lines(lines: list[str]) -> str:
+    digest = hashlib.md5()  # nosec B324 - local non-security parity digest
+    for line in sorted(lines):
+        digest.update(line.encode("utf-8"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def psql_json(env_overrides: dict[str, str], sql: str) -> dict[str, Any]:
+    database = env_overrides["HLTHPRT_DB_DATABASE"]
+    suffix = env_overrides.get("HLTHPRT_TEST_DATABASE_SUFFIX") or ""
+    db_name = f"{database}{suffix}"
+    cmd = [
+        "psql",
+        "-X",
+        "-q",
+        "-A",
+        "-t",
+        "-h",
+        env_overrides["HLTHPRT_DB_HOST"],
+        "-p",
+        env_overrides["HLTHPRT_DB_PORT"],
+        "-U",
+        env_overrides["HLTHPRT_DB_USER"],
+        "-d",
+        db_name,
+        "-c",
+        sql,
+    ]
+    process_env = os.environ.copy()
+    if "HLTHPRT_DB_PASSWORD" in env_overrides:
+        process_env["PGPASSWORD"] = env_overrides["HLTHPRT_DB_PASSWORD"]
+    completed = subprocess.run(cmd, cwd=str(ROOT), env=process_env, check=True, capture_output=True, text=True)
+    output = completed.stdout.strip()
+    if not output:
+        return {}
+    return json.loads(output)
+
+
+def validate_qualified_table_name(value: str) -> str:
+    if not QUALIFIED_TABLE_RE.fullmatch(value or ""):
+        raise ValueError(f"unsafe or invalid qualified table name: {value!r}")
+    return value
+
+
+def validate_identifier(value: str) -> str:
+    if not IDENTIFIER_RE.fullmatch(value or ""):
+        raise ValueError(f"unsafe or invalid identifier: {value!r}")
+    return value
+
+
+def verify_local_import_against_original(
+    *,
+    env_overrides: dict[str, str],
+    original_path: Path,
+    import_run_id: str,
+) -> dict[str, Any]:
+    expected = expected_original_file_summary(original_path)
+    schema_name = validate_identifier(env_overrides["HLTHPRT_DB_SCHEMA"])
+    run_payload = psql_json(
+        env_overrides,
+        "SELECT row_to_json(t) FROM ("
+        "SELECT import_run_id, status, report "
+        f"FROM {schema_name}.ptg2_import_run "
+        f"WHERE import_run_id = '{sql_literal(import_run_id)}'"
+        ") AS t;",
+    )
+    report = run_payload.get("report") or {}
+    serving_index = report.get("serving_index") or {}
+    serving_table = validate_qualified_table_name(str(serving_index.get("table") or ""))
+    price_atom_table = validate_qualified_table_name(str(serving_index.get("price_atom_table") or ""))
+    provider_group_member_table = validate_qualified_table_name(str(serving_index.get("provider_group_member_table") or ""))
+    db_counts = psql_json(
+        env_overrides,
+        "SELECT json_build_object("
+        f"'serving_rows', (SELECT count(*) FROM {serving_table}), "
+        f"'price_atom_rows', (SELECT count(*) FROM {price_atom_table}), "
+        f"'provider_group_member_rows', (SELECT count(*) FROM {provider_group_member_table}), "
+        f"'provider_npis', (SELECT count(DISTINCT npi) FROM {provider_group_member_table}), "
+        "'price_atom_digest', (SELECT md5(COALESCE(string_agg(line, E'\\n' ORDER BY line) || E'\\n', '')) "
+        "FROM (SELECT "
+        "COALESCE(negotiated_type, '') || E'\\t' || "
+        "COALESCE(negotiated_rate::text, '') || E'\\t' || "
+        "COALESCE(expiration_date, '') || E'\\t' || "
+        "COALESCE(array_to_string(ARRAY(SELECT item FROM unnest(service_code) AS item ORDER BY item), ','), '') || E'\\t' || "
+        "COALESCE(billing_class, '') || E'\\t' || "
+        "COALESCE(setting, '') || E'\\t' || "
+        "COALESCE(array_to_string(ARRAY(SELECT item FROM unnest(billing_code_modifier) AS item ORDER BY item), ','), '') || E'\\t' || "
+        "COALESCE(additional_information, '') AS line "
+        f"FROM {price_atom_table}) AS price_lines)"
+        ") AS payload;",
+    )
+    checks = {
+        "run_status": run_payload.get("status") == "validated",
+        "serving_rows": int(db_counts.get("serving_rows") or 0) == expected["unique_price_atoms"],
+        "price_atom_rows": int(db_counts.get("price_atom_rows") or 0) == expected["unique_price_atoms"],
+        "provider_group_member_rows": int(db_counts.get("provider_group_member_rows") or 0)
+        == expected["unique_provider_npis"],
+        "provider_npis": int(db_counts.get("provider_npis") or 0) == expected["unique_provider_npis"],
+        "price_atom_digest": db_counts.get("price_atom_digest") == expected["price_atom_digest"],
+        "report_serving_rates": int(report.get("serving_rates") or 0) == expected["unique_price_atoms"],
+        "report_files_processed": int(report.get("files_processed") or 0) == 1,
+    }
+    failed = [name for name, passed in checks.items() if not passed]
+    return {
+        "status": "failed" if failed else "passed",
+        "failed": failed,
+        "expected": expected,
+        "db": db_counts,
+        "tables": {
+            "serving": serving_table,
+            "price_atom": price_atom_table,
+            "provider_group_member": provider_group_member_table,
+        },
+        "checks": checks,
+    }
+
+
+def sql_literal(value: str) -> str:
+    return str(value).replace("'", "''")
+
 
 
 class QuietHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
@@ -667,13 +867,15 @@ def run_local_ptg_cli(
         import_month,
         "--max-files",
         str(case.get("max_files") or 1),
-        "--max-items",
-        str(case.get("max_items") or 5),
         "--plan-id",
         plan_id,
         "--plan-market-type",
         plan_market_type,
     ]
+    if case.get("full_file") is not True:
+        command.extend(["--max-items", str(case.get("max_items") or 5)])
+    elif case.get("max_items") is not None:
+        raise ValueError("local_ptg_cli full_file=true cannot be combined with max_items")
     if dry_run:
         write_ptg_toc_fixture(case, fixture_dir, base_url="http://127.0.0.1:<auto>")
         return RunResult(
@@ -705,6 +907,15 @@ def run_local_ptg_cli(
     serving_summary = parse_serving_only_summary(combined) or {}
     scanner_summary = serving_summary.get("scanner") if isinstance(serving_summary.get("scanner"), dict) else {}
     status = "succeeded" if completed.returncode == 0 and (import_done or {}).get("status") == "validated" else "failed"
+    verification = None
+    if status == "succeeded" and case.get("verify_original"):
+        verification = verify_local_import_against_original(
+            env_overrides=env_overrides,
+            original_path=fixture_dir / "rates.json.gz",
+            import_run_id=str((import_done or {}).get("import_run_id") or ""),
+        )
+        if verification.get("status") != "passed":
+            status = "failed"
     return RunResult(
         case_id=case_id,
         variant_id=variant_id,
@@ -723,6 +934,7 @@ def run_local_ptg_cli(
             "import_done": import_done or {},
             "fixture_dir": str(fixture_dir),
             "artifact_dir": str(artifact_dir),
+            "verification": verification or {},
         },
         error=completed.stderr.decode("utf-8", errors="replace") if status != "succeeded" else None,
     )
@@ -989,19 +1201,20 @@ def render_markdown_report(report: dict[str, Any]) -> str:
         "",
         "## Results",
         "",
-        "| Case | Variant | Kind | Status | Scanner | Import | Elapsed | Peak RSS |",
-        "| --- | --- | --- | --- | --- | --- | ---: | ---: |",
+        "| Case | Variant | Kind | Status | Scanner | Import | Verification | Elapsed | Peak RSS |",
+        "| --- | --- | --- | --- | --- | --- | --- | ---: | ---: |",
     ]
     for result in report.get("results") or []:
         memory = result.get("memory") or {}
         lines.append(
-            "| {case} | {variant} | {kind} | {status} | {scanner} | {import_done} | {elapsed} | {rss} |".format(
+            "| {case} | {variant} | {kind} | {status} | {scanner} | {import_done} | {verification} | {elapsed} | {rss} |".format(
                 case=result.get("case_id"),
                 variant=result.get("variant_id"),
                 kind=result.get("kind"),
                 status=result.get("status"),
                 scanner=format_scanner_summary(result),
                 import_done=format_import_done(result),
+                verification=format_verification(result),
                 elapsed=format_optional_float(result.get("elapsed_seconds")),
                 rss=memory.get("peak_rss_kb") or "",
             )
@@ -1049,6 +1262,21 @@ def format_import_done(result: dict[str, Any]) -> str:
         parts.append(f"files={done.get('files_processed')}")
     if done.get("serving_rates") is not None:
         parts.append(f"rates={done.get('serving_rates')}")
+    return "<br>".join(parts)
+
+
+def format_verification(result: dict[str, Any]) -> str:
+    import_run = result.get("import_run") or {}
+    verification = import_run.get("verification") if isinstance(import_run, dict) else None
+    if not isinstance(verification, dict) or not verification:
+        return ""
+    parts = [str(verification.get("status") or "unknown")]
+    expected = verification.get("expected") if isinstance(verification.get("expected"), dict) else {}
+    db_counts = verification.get("db") if isinstance(verification.get("db"), dict) else {}
+    if expected.get("unique_price_atoms") is not None and db_counts.get("price_atom_rows") is not None:
+        parts.append(f"prices={db_counts.get('price_atom_rows')}/{expected.get('unique_price_atoms')}")
+    if expected.get("unique_provider_npis") is not None and db_counts.get("provider_npis") is not None:
+        parts.append(f"npis={db_counts.get('provider_npis')}/{expected.get('unique_provider_npis')}")
     return "<br>".join(parts)
 
 
