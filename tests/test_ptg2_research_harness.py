@@ -356,6 +356,90 @@ def test_local_ptg_cli_full_file_dry_run_omits_max_items(tmp_path, monkeypatch):
     assert (fixture_dir / "rates.json.gz").exists()
 
 
+def test_import_control_run_dry_run_builds_generic_import_payload(tmp_path, monkeypatch):
+    monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_URL", "http://import-control.test")
+    suite = {
+        "title": "Entity Address Unified Experiment Report",
+        "variants": [{"id": "current"}],
+        "cases": [
+            {
+                "id": "dev-bounded-smoke-1k",
+                "kind": "import_control_run",
+                "importer": "entity-address-unified",
+                "actor": "codex",
+                "params": {"test": True, "limit_per_source": 1000},
+                "variants": ["current"],
+            }
+        ],
+    }
+
+    report = harness.run_suite(suite, report_dir=tmp_path, dry_run=True)
+    result = report["results"][0]
+    request_payload = result["import_run"]["request_payload"]
+
+    assert report["suite"]["title"] == "Entity Address Unified Experiment Report"
+    assert result["status"] == "dry_run"
+    assert result["kind"] == "import_control_run"
+    assert result["command"][1] == "http://import-control.test/v1/runs"
+    assert request_payload["importer"] == "entity-address-unified"
+    assert request_payload["params"] == {"test": True, "limit_per_source": 1000}
+    assert request_payload["actor"] == "codex"
+
+
+def test_import_control_run_polls_until_terminal(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_post_json(url, payload, *, token):
+        calls.append(("post", url, payload, token))
+        return {
+            "run_id": "run_entity",
+            "status": "running",
+            "progress": {"pct": 5, "phase": "queued"},
+        }
+
+    def fake_get_json(url, *, token):
+        calls.append(("get", url, token))
+        return {
+            "run_id": "run_entity",
+            "status": "succeeded",
+            "phase_detail": "entity-address-unified published",
+            "progress": {"pct": 100, "phase": "entity-address-unified published"},
+            "metrics": {"rows": 123, "phase_timings": {"materializing": {"seconds": 1.2}}},
+        }
+
+    monkeypatch.setattr(harness, "post_json", fake_post_json)
+    monkeypatch.setattr(harness, "get_json", fake_get_json)
+    monkeypatch.setattr(harness.time, "sleep", lambda _seconds: None)
+    monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_URL", "http://import-control.test")
+    monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_API_TOKEN", "secret")
+    suite = {
+        "variants": [{"id": "current"}],
+        "cases": [
+            {
+                "id": "dev-bounded-smoke-1k",
+                "kind": "import_control_run",
+                "importer": "entity-address-unified",
+                "poll_seconds": 0,
+                "timeout_seconds": 10,
+                "params": {"test": True, "limit_per_source": 1000},
+                "variants": ["current"],
+            }
+        ],
+    }
+
+    report = harness.run_suite(suite, report_dir=tmp_path)
+    result = report["results"][0]
+
+    assert result["status"] == "succeeded"
+    assert result["import_run"]["final_run"]["metrics"]["rows"] == 123
+    assert result["progress"] == [
+        {"pct": 5, "phase": "queued"},
+        {"pct": 100, "phase": "entity-address-unified published"},
+    ]
+    assert calls[0][0] == "post"
+    assert calls[1] == ("get", "http://import-control.test/v1/runs/run_entity", "secret")
+
+
 def test_markdown_report_includes_scanner_and_import_summary():
     report = {
         "generated_at": "20260620T000000Z",
@@ -392,3 +476,33 @@ def test_markdown_report_includes_scanner_and_import_summary():
     assert "raw_chunks=3<br>max_raw_chunk_bytes=1024<br>max_raw_chunk_rates=8" in markdown
     assert "validated<br>files=1<br>rates=7" in markdown
     assert "passed<br>prices=7/7<br>npis=1/1" in markdown
+
+
+def test_markdown_report_includes_generic_import_control_summary():
+    report = {
+        "generated_at": "20260621T000000Z",
+        "suite": {"title": "Entity Address Unified Experiment Report"},
+        "gates": {"overall": "passed"},
+        "results": [
+            {
+                "case_id": "dev",
+                "variant_id": "current",
+                "kind": "import_control_run",
+                "status": "succeeded",
+                "elapsed_seconds": 1.0,
+                "import_run": {
+                    "final_run": {
+                        "status": "succeeded",
+                        "phase_detail": "entity-address-unified published",
+                        "progress": {"pct": 100},
+                        "metrics": {"rows": 123},
+                    }
+                },
+            }
+        ],
+    }
+
+    markdown = harness.render_markdown_report(report)
+
+    assert "# Entity Address Unified Experiment Report" in markdown
+    assert "succeeded<br>entity-address-unified published<br>pct=100<br>rows=123" in markdown

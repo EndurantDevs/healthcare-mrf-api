@@ -1,0 +1,76 @@
+{
+  "version": 1,
+  "title": "Entity Address Unified Experiment Report",
+  "description": "Import-control pilots for entity-address-unified. These cases reuse the PTG experiment harness reporting path while targeting bounded and full unified-address materialization runs.",
+  "gates": {
+    "min_improvement_pct": 15.0,
+    "max_memory_growth_pct": 20.0
+  },
+  "variants": [
+    {
+      "id": "current",
+      "description": "Current deployed importer configuration."
+    }
+  ],
+  "cases": [
+    {
+      "id": "dev-bounded-smoke-1k",
+      "kind": "import_control_run",
+      "importer": "entity-address-unified",
+      "triggered_by": "entity-address-unified-research",
+      "actor": "codex",
+      "wait_for_terminal": true,
+      "poll_seconds": 10,
+      "timeout_seconds": 1800,
+      "gates": {
+        "baseline_variant": "current",
+        "performance": false,
+        "memory": false
+      },
+      "params": {
+        "test": true,
+        "limit_per_source": 1000
+      },
+      "variants": ["current"]
+    },
+    {
+      "id": "dev-bounded-smoke-20k",
+      "kind": "import_control_run",
+      "importer": "entity-address-unified",
+      "triggered_by": "entity-address-unified-research",
+      "actor": "codex",
+      "wait_for_terminal": true,
+      "poll_seconds": 15,
+      "timeout_seconds": 3600,
+      "gates": {
+        "baseline_variant": "current",
+        "performance": false,
+        "memory": false
+      },
+      "params": {
+        "test": true,
+        "limit_per_source": 20000
+      },
+      "variants": ["current"]
+    },
+    {
+      "id": "dev-full-run",
+      "kind": "import_control_run",
+      "importer": "entity-address-unified",
+      "triggered_by": "entity-address-unified-research",
+      "actor": "codex",
+      "wait_for_terminal": true,
+      "poll_seconds": 30,
+      "timeout_seconds": 7200,
+      "gates": {
+        "baseline_variant": "current",
+        "performance": false,
+        "memory": false
+      },
+      "params": {
+        "test": false
+      },
+      "variants": ["current"]
+    }
+  ]
+}

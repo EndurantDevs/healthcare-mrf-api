@@ -239,10 +239,15 @@ async def _status_with_entity_address_tuning(statement: str) -> int | None:
         return _coerce_rowcount(rowcount)
 
     async with db.acquire() as conn:
-        for name, value in settings:
+        for index, (name, value) in enumerate(settings):
+            savepoint = f"entity_address_sql_setting_{index}"
+            await conn.status(f"SAVEPOINT {savepoint};")
             try:
                 await conn.status(f"SET LOCAL {name} = {_sql_literal(value)};")
+                await conn.status(f"RELEASE SAVEPOINT {savepoint};")
             except Exception as exc:
+                await conn.status(f"ROLLBACK TO SAVEPOINT {savepoint};")
+                await conn.status(f"RELEASE SAVEPOINT {savepoint};")
                 if "permission denied to set parameter" in str(exc).lower():
                     logger.warning(
                         "Skipping unprivileged entity-address SQL setting %s=%s: %s",
@@ -7021,11 +7026,13 @@ async def shutdown(ctx):
     print_time_info(context.get("start"))
 
 
-async def main(test_mode: bool = False):
+async def main(test_mode: bool = False, limit_per_source: int | None = None):
     redis = await create_pool(
         build_redis_settings(),
         job_serializer=serialize_job,
         job_deserializer=deserialize_job,
     )
     payload = {"test_mode": bool(test_mode)}
+    if limit_per_source is not None:
+        payload["limit_per_source"] = max(int(limit_per_source), 0)
     await redis.enqueue_job("process_data", payload, _queue_name=ENTITY_ADDRESS_UNIFIED_QUEUE_NAME)

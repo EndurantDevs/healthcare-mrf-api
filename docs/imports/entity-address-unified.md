@@ -54,6 +54,7 @@ This importer does not fetch an external website directly. It materializes from 
 
 ```bash
 python main.py start entity-address-unified --test
+python main.py start entity-address-unified --test --limit-per-source 1000
 python main.py worker process.EntityAddressUnified --burst
 ```
 
@@ -61,10 +62,25 @@ python main.py worker process.EntityAddressUnified --burst
 
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_BATCH_SIZE`
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_SOURCE_CONCURRENCY`
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_SOURCE_TABLE_SHARDS`
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENRICH_SHARDS`
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENRICH_CONCURRENCY`
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_AGGREGATE_SHARDS`
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_AGGREGATE_CONCURRENCY`
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_EVIDENCE_SHARDS`
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_EVIDENCE_CONCURRENCY`
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_DEFER_ADDITIONAL_INDEXES`
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_REUSE_STAGE` (default `false`; retry only, resumes from an already-materialized stage table for the current import id)
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_WORK_MEM`
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_MAINTENANCE_WORK_MEM`
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_TEMP_FILE_LIMIT` (best effort; skipped automatically when the database role cannot set it)
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_LOCK_TIMEOUT`
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_STATEMENT_TIMEOUT`
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_SYNCHRONOUS_COMMIT`
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_JIT`
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_MAX_PARALLEL_WORKERS_PER_GATHER`
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_LIMIT_PER_SOURCE` (bounded pilots only; import-control can also pass `limit_per_source`)
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_REQUIRE_ARCHIVE_COORDINATES` (default `false`; when `true`, publish fails if archive rows still lack coordinates)
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENABLE_INFERENCE` (default `false`; enables automatic NPI inference updates; review candidates are still populated when this is off)
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENABLE_NAME_FALLBACK_INFERENCE` (default `false`; enables expensive broad name+ZIP+street automatic inference after deterministic facility-anchor matches)
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENABLE_NPPES_NAME_INFERENCE` (default `false`; enables expensive NPPES organization-name fallback inference; otherwise those rows flow to the candidate review table)
@@ -73,3 +89,16 @@ python main.py worker process.EntityAddressUnified --burst
 - `HLTHPRT_FACILITY_ANCHOR_NPI_CANDIDATE_LIMIT` (default `25`)
 - `HLTHPRT_FACILITY_ANCHOR_NPI_CANDIDATE_INCLUDE_NPPES` (default `false`; broad text-based NPPES review-candidate expansion beyond the default indexed `address_key` and primary phone+ZIP matching)
 - `HLTHPRT_FACILITY_ANCHOR_NPI_CANDIDATE_INCLUDE_OTHER_IDENTIFIER` (default `false`; includes `npi_other_identifier` regex evidence in the review-candidate table)
+
+## Experiment Harness
+
+Entity-address pilots reuse the PTG research harness reporting flow:
+
+```bash
+./venv314/bin/python scripts/research/ptg2_experiment.py run \
+  --suite docs/research/entity_address_unified_benchmark_suite.example.json \
+  --dry-run
+```
+
+See `docs/research/entity_address_unified_optimization.md` for dev import-control
+pilot commands.

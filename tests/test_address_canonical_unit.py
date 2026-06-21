@@ -1206,7 +1206,8 @@ async def test_entity_address_unified_sql_phase_uses_scoped_bulk_settings(monkey
     )
 
     assert rowcount == 7
-    assert statements[:7] == [
+    set_statements = [statement for statement in statements if statement.startswith("SET LOCAL")]
+    assert set_statements[:7] == [
         "SET LOCAL work_mem = '64MB';",
         "SET LOCAL maintenance_work_mem = '1GB';",
         "SET LOCAL temp_file_limit = '32GB';",
@@ -1254,6 +1255,7 @@ async def test_entity_address_unified_sql_phase_skips_unprivileged_bulk_setting(
 
     assert rowcount == 5
     assert "SET LOCAL temp_file_limit = '32GB';" in statements
+    assert any(statement.startswith("ROLLBACK TO SAVEPOINT") for statement in statements)
     assert statements[-1] == "UPDATE mrf.entity_address_unified_raw SET address_key = address_key;"
     assert context["phase_timings"]["entity-address-unified test phase"]["rows"] == 5
 

@@ -91,6 +91,10 @@ def test_importer_registry_exposes_ptg_and_finish_lifecycle():
     assert any(param["name"] == "import_id" and param["type"] == "text" for param in items["openaddresses"]["params_schema"])
     assert any(param["name"] == "local_files" and param["multiple"] for param in items["openaddresses"]["params_schema"])
     assert any(param["name"] == "resume_stage" and param["is_flag"] for param in items["openaddresses"]["params_schema"])
+    assert any(
+        param["name"] == "limit_per_source" and param["type"] == "integer"
+        for param in items["entity-address-unified"]["params_schema"]
+    )
 
 
 def test_control_wrapped_publish_importers_request_shutdown():

@@ -24,6 +24,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,6 +37,7 @@ DEFAULT_REPORT_DIR = ROOT / "reports" / "ptg2-experiments"
 DEFAULT_SCANNER = ROOT / "support" / "ptg2_scanner" / "target" / "release" / "ptg2_scanner"
 IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 QUALIFIED_TABLE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*$")
+TERMINAL_IMPORT_STATUSES = {"succeeded", "failed", "canceled", "dead_letter"}
 
 
 @dataclass(frozen=True)
@@ -841,6 +843,148 @@ def run_import_control_pilot(
     )
 
 
+def run_import_control_run(
+    *,
+    case: dict[str, Any],
+    variant: dict[str, Any],
+    dry_run: bool = False,
+) -> RunResult:
+    case_id = str(case["id"])
+    variant_id = str(variant["id"])
+    params = dict(case.get("params") or {})
+    params.update(case.get("variant_params") or {})
+    params.update(variant.get("params") or {})
+    base_url = str(
+        case.get("control_url")
+        or os.getenv("HLTHPRT_IMPORT_CONTROL_URL")
+        or os.getenv("HLTHPRT_CONTROL_URL")
+        or ""
+    ).rstrip("/")
+    path = str(case.get("runs_path") or "/v1/runs")
+    if not path.startswith("/"):
+        path = f"/{path}"
+    url = f"{base_url}{path}"
+    importer = str(case.get("importer") or params.pop("importer", "") or "").strip()
+    if not importer:
+        raise ValueError(f"case {case_id} must set importer for import_control_run")
+    idempotency_key = str(
+        case.get("idempotency_key")
+        or f"research-{case_id}-{variant_id}-{dt.datetime.now(dt.UTC).strftime('%Y%m%d%H%M%S')}"
+    )
+    payload = {
+        "importer": importer,
+        "params": params,
+        "idempotency_key": idempotency_key,
+        "triggered_by": str(case.get("triggered_by") or "import-research"),
+    }
+    for key in ("run_id", "node_id", "source_file_import_id", "import_id", "schedule_id", "subscription_id"):
+        if case.get(key) is not None:
+            payload[key] = case[key]
+    actor = str(case.get("actor") or os.getenv("HLTHPRT_IMPORT_CONTROL_ACTOR") or "").strip()
+    if actor:
+        payload["actor"] = actor
+    command = ["POST", url, json.dumps(payload, sort_keys=True)]
+    if dry_run:
+        return RunResult(
+            case_id=case_id,
+            variant_id=variant_id,
+            kind="import_control_run",
+            status="dry_run",
+            command=command,
+            env_overrides={"control_url": base_url, "runs_path": path},
+            import_run={"request_payload": payload},
+        )
+
+    token = str(
+        case.get("control_token")
+        or os.getenv("HLTHPRT_IMPORT_CONTROL_API_TOKEN")
+        or os.getenv("HLTHPRT_CONTROL_API_TOKEN")
+        or ""
+    ).strip()
+    if not base_url or not token:
+        return RunResult(
+            case_id=case_id,
+            variant_id=variant_id,
+            kind="import_control_run",
+            status="skipped",
+            command=command,
+            env_overrides={"control_url": base_url, "runs_path": path},
+            import_run={"request_payload": payload},
+            error="control_url and HLTHPRT_IMPORT_CONTROL_API_TOKEN are required to execute import-control runs",
+        )
+
+    started = time.monotonic()
+    progress_samples: list[dict[str, Any]] = []
+    try:
+        response_payload = post_json(url, payload, token=token)
+        run_id = str(response_payload.get("run_id") or "")
+        final_run = response_payload
+        progress = response_payload.get("progress")
+        if isinstance(progress, dict):
+            progress_samples.append(progress)
+        if bool(case.get("wait_for_terminal", True)):
+            final_run, progress_samples = poll_import_control_run(
+                base_url=base_url,
+                path=path,
+                run_id=run_id,
+                token=token,
+                poll_seconds=float(case.get("poll_seconds") or 10),
+                timeout_seconds=float(case.get("timeout_seconds") or 3600),
+                progress_samples=progress_samples,
+            )
+        run_status = str(final_run.get("status") or response_payload.get("status") or "")
+        status = "succeeded" if run_status == "succeeded" else "failed" if run_status in TERMINAL_IMPORT_STATUSES else "succeeded"
+        error = None if status == "succeeded" else json.dumps(final_run.get("error") or {}, sort_keys=True)
+    except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+        response_payload = {}
+        final_run = {}
+        status = "failed"
+        error = str(exc)
+    return RunResult(
+        case_id=case_id,
+        variant_id=variant_id,
+        kind="import_control_run",
+        status=status,
+        command=command,
+        env_overrides={"control_url": base_url, "runs_path": path},
+        elapsed_seconds=time.monotonic() - started,
+        progress=progress_samples,
+        import_run={
+            "request_payload": payload,
+            "response": response_payload,
+            "final_run": final_run,
+        },
+        error=error,
+    )
+
+
+def poll_import_control_run(
+    *,
+    base_url: str,
+    path: str,
+    run_id: str,
+    token: str,
+    poll_seconds: float,
+    timeout_seconds: float,
+    progress_samples: list[dict[str, Any]] | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    if not run_id:
+        raise ValueError("import-control response did not include run_id")
+    samples = list(progress_samples or [])
+    deadline = time.monotonic() + timeout_seconds
+    last_payload: dict[str, Any] = {}
+    while True:
+        last_payload = get_json(f"{base_url}{path}/{urllib.parse.quote(run_id, safe='')}", token=token)
+        progress = last_payload.get("progress")
+        if isinstance(progress, dict):
+            samples.append(progress)
+        if str(last_payload.get("status") or "") in TERMINAL_IMPORT_STATUSES:
+            return last_payload, samples
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"timed out waiting for import run {run_id}")
+        time.sleep(max(poll_seconds, 0.0))
+
+
 def run_local_ptg_cli(
     *,
     case: dict[str, Any],
@@ -1007,6 +1151,18 @@ def post_json(url: str, payload: dict[str, Any], *, token: str) -> dict[str, Any
         return json.loads(response.read().decode("utf-8"))
 
 
+def get_json(url: str, *, token: str) -> dict[str, Any]:
+    request = urllib.request.Request(
+        url,
+        method="GET",
+        headers={
+            "Authorization": f"Bearer {token}",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310 - operator-controlled URL
+        return json.loads(response.read().decode("utf-8"))
+
+
 def run_suite(
     suite: dict[str, Any],
     *,
@@ -1039,6 +1195,8 @@ def run_suite(
                 )
             elif kind == "import_control_pilot":
                 results.append(run_import_control_pilot(case=case, variant=variant, dry_run=dry_run))
+            elif kind == "import_control_run":
+                results.append(run_import_control_run(case=case, variant=variant, dry_run=dry_run))
             elif kind == "local_ptg_cli":
                 results.append(
                     run_local_ptg_cli(
@@ -1065,6 +1223,7 @@ def run_suite(
         "schema_version": 1,
         "generated_at": timestamp,
         "suite": {
+            "title": suite.get("title"),
             "description": suite.get("description"),
             "gates": suite.get("gates") or {},
         },
@@ -1229,8 +1388,10 @@ def write_report(output_root: Path, report: dict[str, Any]) -> None:
 
 
 def render_markdown_report(report: dict[str, Any]) -> str:
+    suite = report.get("suite") if isinstance(report.get("suite"), dict) else {}
+    title = suite.get("title") or "PTG2 Experiment Report"
     lines = [
-        "# PTG2 Experiment Report",
+        f"# {title}",
         "",
         f"- generated_at: `{report.get('generated_at')}`",
         f"- gate_status: `{(report.get('gates') or {}).get('overall')}`",
@@ -1296,7 +1457,21 @@ def format_import_done(result: dict[str, Any]) -> str:
     import_run = result.get("import_run") or {}
     done = import_run.get("import_done") if isinstance(import_run, dict) else None
     if not isinstance(done, dict) or not done:
-        return ""
+        final_run = import_run.get("final_run") if isinstance(import_run, dict) else None
+        if not isinstance(final_run, dict) or not final_run:
+            return ""
+        parts = []
+        if final_run.get("status") is not None:
+            parts.append(str(final_run.get("status")))
+        if final_run.get("phase_detail") is not None:
+            parts.append(str(final_run.get("phase_detail")))
+        progress = final_run.get("progress") if isinstance(final_run.get("progress"), dict) else {}
+        if progress.get("pct") is not None:
+            parts.append(f"pct={progress.get('pct')}")
+        metrics = final_run.get("metrics") if isinstance(final_run.get("metrics"), dict) else {}
+        if metrics.get("rows") is not None:
+            parts.append(f"rows={metrics.get('rows')}")
+        return "<br>".join(parts)
     parts = []
     if done.get("status") is not None:
         parts.append(str(done.get("status")))
