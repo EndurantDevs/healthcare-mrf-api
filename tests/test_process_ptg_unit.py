@@ -2999,8 +2999,9 @@ def test_ptg2_rust_parse_in_workers_matches_default_on_large_in_network_chunk(tm
     with gzip.open(artifact, "wb") as fp:
         fp.write(json.dumps(payload).encode("utf-8"))
 
-    def run_scanner(parse_in_workers: bool):
-        run_dir = tmp_path / ("raw-workers" if parse_in_workers else "default")
+    def run_scanner(parse_in_workers: bool, provider_refs_in_workers: bool = True):
+        suffix = "provider-workers" if provider_refs_in_workers else "provider-serial"
+        run_dir = tmp_path / f"{'raw-workers' if parse_in_workers else 'default'}-{suffix}"
         run_dir.mkdir()
         serving_copy = run_dir / "manifest_serving.copy"
         price_atom_copy = run_dir / "price_atom.copy"
@@ -3019,6 +3020,9 @@ def test_ptg2_rust_parse_in_workers_matches_default_on_large_in_network_chunk(tm
             "HLTHPRT_PTG2_RUST_WORKERS": "2",
             "HLTHPRT_PTG2_RUST_WORK_QUEUE": "2",
             "HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS": "true" if parse_in_workers else "false",
+            "HLTHPRT_PTG2_RUST_PROVIDER_REFS_IN_WORKERS": "true" if provider_refs_in_workers else "false",
+            "HLTHPRT_PTG2_RUST_PROVIDER_REF_CHUNK_ITEMS": "1",
+            "HLTHPRT_PTG2_RUST_PROVIDER_REF_RAW_CHUNK_BYTES": "1",
         }
         completed = subprocess.run(
             [str(binary), "--compact-serving", str(artifact)],
@@ -3056,18 +3060,26 @@ def test_ptg2_rust_parse_in_workers_matches_default_on_large_in_network_chunk(tm
         }
         return frames, copy_rows
 
-    default_frames, default_rows = run_scanner(False)
-    worker_frames, worker_rows = run_scanner(True)
+    serial_frames, serial_rows = run_scanner(False, False)
+    default_frames, default_rows = run_scanner(False, True)
+    worker_frames, worker_rows = run_scanner(True, True)
 
+    assert default_rows == serial_rows
     assert worker_rows == default_rows
     assert len(worker_rows["serving"]) == 8
     worker_summary = [row for kind, row in worker_frames if kind == "scanner_summary"][0]
     worker_config = [row for kind, row in worker_frames if kind == "scanner_config"][0]
+    default_config = [row for kind, row in default_frames if kind == "scanner_config"][0]
+    serial_config = [row for kind, row in serial_frames if kind == "scanner_config"][0]
     default_summary = [row for kind, row in default_frames if kind == "scanner_summary"][0]
+    assert serial_config["provider_refs_in_workers"] is False
+    assert default_config["provider_refs_in_workers"] is True
     assert worker_config["parse_in_workers"] is True
+    assert worker_config["provider_refs_in_workers"] is True
     assert worker_summary["parse_in_workers"] is True
     assert default_summary["parse_in_workers"] is False
     assert worker_summary["split_negotiated_rates"] == 2
+    assert worker_summary["provider_ref_raw_chunk_count"] == 1
     assert "producer_blocked_micros" in worker_summary
 
 

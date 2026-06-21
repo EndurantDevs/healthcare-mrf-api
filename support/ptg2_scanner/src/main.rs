@@ -49,6 +49,8 @@ use struson::reader::{JsonReader, JsonStreamReader};
 use struson::writer::{JsonStreamWriter, JsonWriter};
 use xxhash_rust::xxh3::Xxh3;
 
+const DEFAULT_PROVIDER_REF_CHUNK_ITEMS: usize = 1024;
+
 fn to_io_error(error: impl Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
@@ -569,6 +571,41 @@ fn send_worker_job<W: Write>(
                         "compact worker queue closed while sending {}",
                         returned_job.name()
                     ),
+                ));
+            }
+        }
+    }
+}
+
+fn send_provider_ref_batch<W: Write>(
+    tx: &Sender<Vec<Vec<u8>>>,
+    event_rx: &Receiver<CopyFileEvent>,
+    writer: &mut W,
+    producer_blocked_micros: &mut u128,
+    mut batch: Vec<Vec<u8>>,
+) -> io::Result<()> {
+    let mut blocked_since: Option<Instant> = None;
+    loop {
+        match tx.try_send(batch) {
+            Ok(()) => {
+                if let Some(started_at) = blocked_since.take() {
+                    *producer_blocked_micros =
+                        producer_blocked_micros.saturating_add(started_at.elapsed().as_micros());
+                }
+                return Ok(());
+            }
+            Err(TrySendError::Full(returned_batch)) => {
+                if blocked_since.is_none() {
+                    blocked_since = Some(Instant::now());
+                }
+                batch = returned_batch;
+                drain_copy_file_events(event_rx, writer)?;
+                thread::yield_now();
+            }
+            Err(TrySendError::Disconnected(_returned_batch)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "provider-reference worker queue closed while sending raw batch",
                 ));
             }
         }
@@ -2846,6 +2883,11 @@ impl RawChunkStats {
     }
 }
 
+struct ProviderRefWorkerOutput {
+    provider_map: HashMap<String, ProviderEntry>,
+    events: Vec<CopyFileEvent>,
+}
+
 impl WorkerJob {
     fn name(&self) -> &'static str {
         match self {
@@ -2853,6 +2895,61 @@ impl WorkerJob {
             WorkerJob::RawRates { .. } => "raw rates",
         }
     }
+}
+
+fn process_provider_ref_raw_batch(
+    raw_refs: &[Vec<u8>],
+    collect_provider_npis: bool,
+    provider_map: &mut HashMap<String, ProviderEntry>,
+    dictionary_copy_sinks: &mut DictionaryCopySinks,
+    dedupe: &SharedDedupe,
+) -> io::Result<u64> {
+    let mut processed = 0u64;
+    for raw_ref in raw_refs {
+        let value: Value = serde_json::from_slice(raw_ref).map_err(to_io_error)?;
+        if let Some(key_value) = value.get("provider_group_id") {
+            if let (Some(key), Some(entry)) = (
+                provider_ref_key(key_value),
+                build_provider_entry(&value, collect_provider_npis),
+            ) {
+                dictionary_copy_sinks.write_provider_group_members_shared(&value, dedupe)?;
+                provider_map.insert(key, entry);
+            }
+        }
+        processed = processed.saturating_add(1);
+    }
+    Ok(processed)
+}
+
+fn provider_ref_worker_loop(
+    worker_id: usize,
+    rx: Receiver<Vec<Vec<u8>>>,
+    dedupe: Arc<SharedDedupe>,
+    copy_paths: CopyPathConfig,
+    rotate_bytes: u64,
+    collect_provider_npis: bool,
+) -> io::Result<ProviderRefWorkerOutput> {
+    let worker_paths = copy_paths.for_worker(worker_id);
+    let mut dictionary_copy_sinks = DictionaryCopySinks::from_paths(&worker_paths, rotate_bytes)?;
+    let mut provider_map = HashMap::new();
+    let mut events = Vec::new();
+
+    for raw_refs in rx.iter() {
+        process_provider_ref_raw_batch(
+            &raw_refs,
+            collect_provider_npis,
+            &mut provider_map,
+            &mut dictionary_copy_sinks,
+            &dedupe,
+        )?;
+        events.extend(dictionary_copy_sinks.maybe_rotate_silent()?);
+    }
+    events.extend(dictionary_copy_sinks.finish_silent()?);
+
+    Ok(ProviderRefWorkerOutput {
+        provider_map,
+        events,
+    })
 }
 
 struct SharedCompactState<'a, W: Write> {
@@ -3897,6 +3994,25 @@ fn scan_compact_struson_parallel(
     );
     let raw_chunk_byte_limit =
         env_usize("HLTHPRT_PTG2_RUST_RAW_CHUNK_BYTES", DEFAULT_RAW_CHUNK_BYTES);
+    let provider_refs_in_workers = env_bool("HLTHPRT_PTG2_RUST_PROVIDER_REFS_IN_WORKERS", true);
+    let provider_ref_worker_count =
+        env_usize("HLTHPRT_PTG2_RUST_PROVIDER_REF_WORKERS", worker_count).max(1);
+    let provider_ref_queue_size = env_usize(
+        "HLTHPRT_PTG2_RUST_PROVIDER_REF_QUEUE",
+        provider_ref_worker_count.max(queue_size).max(1),
+    )
+    .max(provider_ref_worker_count)
+    .max(1);
+    let provider_ref_chunk_items = env_usize(
+        "HLTHPRT_PTG2_RUST_PROVIDER_REF_CHUNK_ITEMS",
+        DEFAULT_PROVIDER_REF_CHUNK_ITEMS,
+    )
+    .max(1);
+    let provider_ref_raw_chunk_byte_limit = env_usize(
+        "HLTHPRT_PTG2_RUST_PROVIDER_REF_RAW_CHUNK_BYTES",
+        raw_chunk_byte_limit,
+    )
+    .max(1);
     let parse_in_workers = env_bool(
         "HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS",
         DEFAULT_PARSE_IN_WORKERS,
@@ -3919,7 +4035,9 @@ fn scan_compact_struson_parallel(
     let stdout = io::stdout();
     let mut writer = BufWriter::new(stdout.lock());
     let mut producer_blocked_micros = 0u128;
+    let mut provider_ref_producer_blocked_micros = 0u128;
     let mut raw_chunk_stats = RawChunkStats::default();
+    let mut provider_ref_raw_chunk_stats = RawChunkStats::default();
     let mut provider_refs_seconds = 0.0f64;
     let mut in_network_enqueue_seconds = 0.0f64;
     let mut worker_join_seconds = 0.0f64;
@@ -3934,6 +4052,11 @@ fn scan_compact_struson_parallel(
             "split_negotiated_rates": negotiated_rate_chunk_size,
             "raw_chunk_bytes": raw_chunk_byte_limit,
             "parse_in_workers": parse_in_workers,
+            "provider_refs_in_workers": provider_refs_in_workers,
+            "provider_ref_workers": provider_ref_worker_count,
+            "provider_ref_queue": provider_ref_queue_size,
+            "provider_ref_chunk_items": provider_ref_chunk_items,
+            "provider_ref_raw_chunk_bytes": provider_ref_raw_chunk_byte_limit,
             "provider_npi_sidecar": copy_paths.manifest_provider_npi_sidecar.is_some(),
             "panic_strategy": "unwind",
         }),
@@ -3948,38 +4071,174 @@ fn scan_compact_struson_parallel(
                 let provider_refs_started_at = Instant::now();
                 let provider_ref_paths = copy_paths.for_provider_refs();
                 let collect_provider_npis = copy_paths.manifest_provider_npi_sidecar.is_some();
-                let mut provider_ref_copy_sinks = DictionaryCopySinks::from_paths(
-                    &provider_ref_paths,
-                    compact_copy_rotate_bytes,
-                )?;
-                let mut provider_refs_since_rotate = 0usize;
-                json_reader.begin_array().map_err(to_io_error)?;
-                while json_reader.has_next().map_err(to_io_error)? {
-                    let value: Value = json_reader.deserialize_next().map_err(to_io_error)?;
-                    if let Some(key_value) = value.get("provider_group_id") {
-                        if let (Some(key), Some(entry)) = (
-                            provider_ref_key(key_value),
-                            build_provider_entry(&value, collect_provider_npis),
-                        ) {
-                            provider_ref_copy_sinks
-                                .write_provider_group_members_shared(&value, &dedupe)?;
-                            provider_map.insert(key, entry);
-                            provider_refs_since_rotate += 1;
-                            if provider_refs_since_rotate >= 1024 {
-                                for event in provider_ref_copy_sinks.maybe_rotate_silent()? {
-                                    emit_copy_file_event(&mut writer, &event)?;
+                if provider_refs_in_workers && provider_ref_worker_count > 1 {
+                    let (provider_tx, provider_rx) =
+                        bounded::<Vec<Vec<u8>>>(provider_ref_queue_size);
+                    let mut provider_handles = Vec::with_capacity(provider_ref_worker_count);
+                    for worker_id in 0..provider_ref_worker_count {
+                        let worker_rx = provider_rx.clone();
+                        let worker_dedupe = Arc::clone(&dedupe);
+                        let worker_paths = provider_ref_paths.clone();
+                        provider_handles.push((
+                            worker_id,
+                            thread::spawn(move || {
+                                let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                                    provider_ref_worker_loop(
+                                        worker_id,
+                                        worker_rx,
+                                        worker_dedupe,
+                                        worker_paths,
+                                        compact_copy_rotate_bytes,
+                                        collect_provider_npis,
+                                    )
+                                }));
+                                match result {
+                                    Ok(Ok(output)) => Ok(output),
+                                    Ok(Err(err)) => {
+                                        log_worker_failure(
+                                            worker_id,
+                                            "provider_ref_error",
+                                            &err.to_string(),
+                                        );
+                                        Err(err)
+                                    }
+                                    Err(payload) => {
+                                        let message = panic_payload_message(payload.as_ref());
+                                        log_worker_failure(
+                                            worker_id,
+                                            "provider_ref_panic",
+                                            &message,
+                                        );
+                                        Err(io::Error::other(format!(
+                                            "provider-reference worker {worker_id} panicked: {message}"
+                                        )))
+                                    }
                                 }
-                                provider_refs_since_rotate = 0;
+                            }),
+                        ));
+                    }
+                    drop(provider_rx);
+
+                    let mut raw_refs: Vec<Vec<u8>> = Vec::with_capacity(provider_ref_chunk_items);
+                    let mut raw_ref_bytes = 0usize;
+                    json_reader.begin_array().map_err(to_io_error)?;
+                    while json_reader.has_next().map_err(to_io_error)? {
+                        let raw_ref = transfer_next_value_to_bytes(&mut json_reader)?;
+                        raw_ref_bytes = raw_ref_bytes.saturating_add(raw_ref.len());
+                        raw_refs.push(raw_ref);
+                        *object_counts
+                            .entry("provider_references".to_string())
+                            .or_insert(0) += 1;
+                        if raw_refs.len() >= provider_ref_chunk_items
+                            || raw_ref_bytes >= provider_ref_raw_chunk_byte_limit
+                        {
+                            let batch = std::mem::replace(
+                                &mut raw_refs,
+                                Vec::with_capacity(provider_ref_chunk_items),
+                            );
+                            let batch_bytes = std::mem::take(&mut raw_ref_bytes);
+                            provider_ref_raw_chunk_stats.record(batch.len(), batch_bytes);
+                            send_provider_ref_batch(
+                                &provider_tx,
+                                &event_rx,
+                                &mut writer,
+                                &mut provider_ref_producer_blocked_micros,
+                                batch,
+                            )?;
+                            drain_copy_file_events(&event_rx, &mut writer)?;
+                        }
+                    }
+                    json_reader.end_array().map_err(to_io_error)?;
+                    if !raw_refs.is_empty() {
+                        provider_ref_raw_chunk_stats.record(raw_refs.len(), raw_ref_bytes);
+                        send_provider_ref_batch(
+                            &provider_tx,
+                            &event_rx,
+                            &mut writer,
+                            &mut provider_ref_producer_blocked_micros,
+                            raw_refs,
+                        )?;
+                        drain_copy_file_events(&event_rx, &mut writer)?;
+                    }
+                    drop(provider_tx);
+
+                    let mut provider_worker_error: Option<io::Error> = None;
+                    let mut copy_file_events = Vec::new();
+                    for (worker_id, handle) in provider_handles {
+                        match handle.join() {
+                            Ok(Ok(output)) => {
+                                provider_map.extend(output.provider_map);
+                                copy_file_events.extend(output.events);
+                            }
+                            Ok(Err(err)) => {
+                                let message = err.to_string();
+                                emit_worker_failure(
+                                    &mut writer,
+                                    worker_id,
+                                    "provider_ref_error",
+                                    &message,
+                                )?;
+                                if provider_worker_error.is_none() {
+                                    provider_worker_error = Some(err);
+                                }
+                            }
+                            Err(payload) => {
+                                let message = panic_payload_message(payload.as_ref());
+                                emit_worker_failure(
+                                    &mut writer,
+                                    worker_id,
+                                    "provider_ref_panic",
+                                    &message,
+                                )?;
+                                if provider_worker_error.is_none() {
+                                    provider_worker_error = Some(io::Error::other(format!(
+                                        "provider-reference worker {worker_id} panicked: {message}"
+                                    )));
+                                }
                             }
                         }
                     }
-                    *object_counts
-                        .entry("provider_references".to_string())
-                        .or_insert(0) += 1;
-                }
-                json_reader.end_array().map_err(to_io_error)?;
-                for event in provider_ref_copy_sinks.finish_silent()? {
-                    emit_copy_file_event(&mut writer, &event)?;
+                    if let Some(err) = provider_worker_error {
+                        return Err(err);
+                    }
+                    drain_copy_file_events(&event_rx, &mut writer)?;
+                    for event in copy_file_events {
+                        emit_copy_file_event(&mut writer, &event)?;
+                    }
+                } else {
+                    let mut provider_ref_copy_sinks = DictionaryCopySinks::from_paths(
+                        &provider_ref_paths,
+                        compact_copy_rotate_bytes,
+                    )?;
+                    let mut provider_refs_since_rotate = 0usize;
+                    json_reader.begin_array().map_err(to_io_error)?;
+                    while json_reader.has_next().map_err(to_io_error)? {
+                        let value: Value = json_reader.deserialize_next().map_err(to_io_error)?;
+                        if let Some(key_value) = value.get("provider_group_id") {
+                            if let (Some(key), Some(entry)) = (
+                                provider_ref_key(key_value),
+                                build_provider_entry(&value, collect_provider_npis),
+                            ) {
+                                provider_ref_copy_sinks
+                                    .write_provider_group_members_shared(&value, &dedupe)?;
+                                provider_map.insert(key, entry);
+                                provider_refs_since_rotate += 1;
+                                if provider_refs_since_rotate >= 1024 {
+                                    for event in provider_ref_copy_sinks.maybe_rotate_silent()? {
+                                        emit_copy_file_event(&mut writer, &event)?;
+                                    }
+                                    provider_refs_since_rotate = 0;
+                                }
+                            }
+                        }
+                        *object_counts
+                            .entry("provider_references".to_string())
+                            .or_insert(0) += 1;
+                    }
+                    json_reader.end_array().map_err(to_io_error)?;
+                    for event in provider_ref_copy_sinks.finish_silent()? {
+                        emit_copy_file_event(&mut writer, &event)?;
+                    }
                 }
                 writer.flush()?;
                 provider_refs_seconds += provider_refs_started_at.elapsed().as_secs_f64();
@@ -4155,8 +4414,13 @@ fn scan_compact_struson_parallel(
                         "raw_chunk_total_bytes": raw_chunk_stats.total_bytes,
                         "raw_chunk_max_bytes": raw_chunk_stats.max_bytes,
                         "raw_chunk_max_rates": raw_chunk_stats.max_rates,
+                        "provider_ref_raw_chunk_count": provider_ref_raw_chunk_stats.chunk_count,
+                        "provider_ref_raw_chunk_total_bytes": provider_ref_raw_chunk_stats.total_bytes,
+                        "provider_ref_raw_chunk_max_bytes": provider_ref_raw_chunk_stats.max_bytes,
+                        "provider_ref_raw_chunk_max_items": provider_ref_raw_chunk_stats.max_rates,
                         "parse_in_workers": parse_in_workers,
                         "producer_blocked_micros": producer_blocked_micros,
+                        "provider_ref_producer_blocked_micros": provider_ref_producer_blocked_micros,
                         "provider_refs_seconds": provider_refs_seconds,
                         "in_network_enqueue_seconds": in_network_enqueue_seconds,
                         "worker_join_seconds": worker_join_seconds,
@@ -4812,6 +5076,55 @@ mod tests {
         assert_eq!(retained.provider_group_hashes, pruned.provider_group_hashes);
         assert_eq!(retained.npi, vec![1234567890, 1234567891]);
         assert!(pruned.npi.is_empty());
+    }
+
+    #[test]
+    fn raw_provider_reference_batch_builds_provider_map_without_npi_retention() {
+        let paths = CopyPathConfig {
+            compact: None,
+            manifest_serving: None,
+            manifest_provider_forward_sidecar: None,
+            manifest_provider_inverted_sidecar: None,
+            manifest_provider_npi_sidecar: None,
+            manifest_price_forward_sidecar: None,
+            manifest_price_atom: None,
+            manifest_provider_group_member: None,
+            procedure: None,
+            price_code_set: None,
+            price_atom: None,
+            price_set_entry: None,
+            provider_set: None,
+            provider_set_component: None,
+            provider_set_entry: None,
+            provider_entry_component: None,
+            provider_group_member: None,
+            manifest_only: true,
+        };
+        let mut sinks = DictionaryCopySinks::from_paths(&paths, 0).unwrap();
+        let dedupe = SharedDedupe::new(2);
+        let mut provider_map = HashMap::new();
+        let raw_refs = vec![
+            br#"{"provider_group_id":"7","provider_groups":[{"tin":{"type":"ein","value":"123456789"},"npi":[1234567890,1234567891]}]}"#.to_vec(),
+            br#"{"provider_group_id":8,"provider_groups":[{"tin":{"type":"npi","value":"9876543210"},"npi":["2222222222"]}]}"#.to_vec(),
+        ];
+
+        let processed = process_provider_ref_raw_batch(
+            &raw_refs,
+            false,
+            &mut provider_map,
+            &mut sinks,
+            &dedupe,
+        )
+        .unwrap();
+
+        assert_eq!(processed, 2);
+        assert_eq!(provider_map.len(), 2);
+        assert!(provider_map.contains_key("7"));
+        assert!(provider_map.contains_key("8"));
+        assert_eq!(provider_map["7"].provider_count, 2);
+        assert_eq!(provider_map["8"].provider_count, 1);
+        assert!(provider_map["7"].npi.is_empty());
+        assert!(!provider_map["7"].provider_group_hashes.is_empty());
     }
 
     #[test]
