@@ -207,6 +207,12 @@ async def test_ptg_control_start_applies_lane_scanner_env(monkeypatch):
         observed["provider_ref_raw_chunk_bytes"] = ptg_control.os.environ.get(
             "HLTHPRT_PTG2_RUST_PROVIDER_REF_RAW_CHUNK_BYTES"
         )
+        observed["manifest_merge_chunk_bytes"] = ptg_control.os.environ.get(
+            "HLTHPRT_PTG2_MANIFEST_MERGE_CHUNK_BYTES"
+        )
+        observed["manifest_merge_sort_workers"] = ptg_control.os.environ.get(
+            "HLTHPRT_PTG2_MANIFEST_MERGE_SORT_WORKERS"
+        )
         observed["file_process_concurrency"] = ptg_control.os.environ.get("HLTHPRT_PTG2_FILE_PROCESS_CONCURRENCY")
         return {}
 
@@ -235,6 +241,8 @@ async def test_ptg_control_start_applies_lane_scanner_env(monkeypatch):
                 "_scanner_provider_ref_queue": 4,
                 "_scanner_provider_ref_chunk_items": 512,
                 "_scanner_provider_ref_raw_chunk_bytes": 524288,
+                "_manifest_merge_chunk_bytes": 268435456,
+                "_manifest_merge_sort_workers": 4,
                 "_file_process_concurrency": 2,
             },
         },
@@ -251,6 +259,8 @@ async def test_ptg_control_start_applies_lane_scanner_env(monkeypatch):
         "provider_ref_queue": "4",
         "provider_ref_chunk_items": "512",
         "provider_ref_raw_chunk_bytes": "524288",
+        "manifest_merge_chunk_bytes": "268435456",
+        "manifest_merge_sort_workers": "4",
         "file_process_concurrency": "2",
     }
 

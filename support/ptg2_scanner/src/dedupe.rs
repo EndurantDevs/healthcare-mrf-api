@@ -91,6 +91,7 @@ pub struct SharedDedupe {
     provider_set_component: ShardedDedupe128,
     provider_set_entry: ShardedDedupe128,
     provider_entry_component: Option<ShardedDedupe128>,
+    provider_group: ShardedDedupe64,
     provider_group_member: ShardedDedupe128,
     dedupe_high_cardinality_entries: bool,
     serving_rate_counter: DedupeCounter,
@@ -102,6 +103,7 @@ pub struct SharedDedupe {
     provider_set_component_counter: DedupeCounter,
     provider_set_entry_counter: DedupeCounter,
     provider_entry_component_counter: DedupeCounter,
+    provider_group_counter: DedupeCounter,
     provider_group_member_counter: DedupeCounter,
 }
 
@@ -123,6 +125,7 @@ impl SharedDedupe {
             provider_set_entry: ShardedDedupe128::new(shard_count),
             provider_entry_component: dedupe_high_cardinality_entries
                 .then(|| ShardedDedupe128::new(shard_count)),
+            provider_group: ShardedDedupe64::new(shard_count),
             provider_group_member: ShardedDedupe128::new(shard_count),
             dedupe_high_cardinality_entries,
             serving_rate_counter: DedupeCounter::new(),
@@ -134,6 +137,7 @@ impl SharedDedupe {
             provider_set_component_counter: DedupeCounter::new(),
             provider_set_entry_counter: DedupeCounter::new(),
             provider_entry_component_counter: DedupeCounter::new(),
+            provider_group_counter: DedupeCounter::new(),
             provider_group_member_counter: DedupeCounter::new(),
         }
     }
@@ -225,6 +229,12 @@ impl SharedDedupe {
         inserted
     }
 
+    pub fn insert_provider_group(&self, group_hash: i64) -> bool {
+        let inserted = self.provider_group.insert(group_hash as u64);
+        self.provider_group_counter.record(inserted);
+        inserted
+    }
+
     pub fn insert_provider_group_member(&self, group_hash: i64, npi: i64) -> bool {
         let key = provider_group_member_key(group_hash, npi);
         let inserted = self.provider_group_member.insert(key);
@@ -260,9 +270,10 @@ pub fn dedupe_summary_payload(
     let (pse_attempted, pse_unique, pse_duplicate) = dedupe.provider_set_entry_counter.snapshot();
     let (pec_attempted, pec_unique, pec_duplicate) =
         dedupe.provider_entry_component_counter.snapshot();
+    let (pg_attempted, pg_unique, pg_duplicate) = dedupe.provider_group_counter.snapshot();
     let (pgm_attempted, pgm_unique, pgm_duplicate) =
         dedupe.provider_group_member_counter.snapshot();
-    json!({
+    let mut payload = json!({
         "negotiated_rates": negotiated_rates,
         "serving_rate_attempted": serving_attempted,
         "serving_rate_unique": serving_unique,
@@ -302,7 +313,17 @@ pub fn dedupe_summary_payload(
         "provider_group_member_unique": pgm_unique,
         "provider_group_member_duplicate": pgm_duplicate,
         "provider_group_member_reduction_pct": dedupe_reduction_pct(pgm_attempted, pgm_duplicate),
-    })
+    });
+    if let Some(payload_map) = payload.as_object_mut() {
+        payload_map.insert("provider_group_attempted".to_string(), json!(pg_attempted));
+        payload_map.insert("provider_group_unique".to_string(), json!(pg_unique));
+        payload_map.insert("provider_group_duplicate".to_string(), json!(pg_duplicate));
+        payload_map.insert(
+            "provider_group_reduction_pct".to_string(),
+            json!(dedupe_reduction_pct(pg_attempted, pg_duplicate)),
+        );
+    }
+    payload
 }
 
 pub fn emit_dedupe_summary(dedupe: &SharedDedupe, object_counts: &HashMap<String, u64>) {
@@ -376,11 +397,16 @@ mod tests {
         let dedupe = SharedDedupe::new(2);
         let object_counts = HashMap::new();
 
+        assert!(dedupe.insert_provider_group(100));
+        assert!(!dedupe.insert_provider_group(100));
         assert!(dedupe.insert_provider_group_member(100, 1234567890));
         assert!(!dedupe.insert_provider_group_member(100, 1234567890));
         assert!(dedupe.insert_provider_group_member(100, 9876543210));
 
         let payload = dedupe_summary_payload(&dedupe, &object_counts);
+        assert_eq!(payload["provider_group_attempted"], 2);
+        assert_eq!(payload["provider_group_unique"], 1);
+        assert_eq!(payload["provider_group_duplicate"], 1);
         assert_eq!(payload["provider_group_member_attempted"], 3);
         assert_eq!(payload["provider_group_member_unique"], 2);
         assert_eq!(payload["provider_group_member_duplicate"], 1);

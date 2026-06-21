@@ -2381,6 +2381,9 @@ impl DictionaryCopySinks {
             let tin = group.get("tin").unwrap_or(&Value::Null);
             let npi = int_list(group.get("npi"));
             let group_hash = provider_group_hash(tin, &npi);
+            if !dedupe.insert_provider_group(group_hash) {
+                continue;
+            }
             let provider_group_global_id = provider_group_global_id_from_hash(group_hash).to_hex();
             for npi_value in &npi {
                 if !dedupe.insert_provider_group_member(group_hash, *npi_value) {
@@ -5444,6 +5447,43 @@ fn manifest_sort_chunk(
     Ok(path)
 }
 
+fn manifest_spawn_sort_chunk(
+    kind: &str,
+    rows: Vec<Vec<u8>>,
+    chunk_index: usize,
+    temp_dir: &Path,
+) -> thread::JoinHandle<io::Result<(usize, PathBuf)>> {
+    let kind = kind.to_string();
+    let temp_dir = temp_dir.to_path_buf();
+    thread::spawn(move || {
+        manifest_sort_chunk(&kind, rows, chunk_index, &temp_dir).map(|path| (chunk_index, path))
+    })
+}
+
+fn manifest_join_sort_chunk(
+    handle: thread::JoinHandle<io::Result<(usize, PathBuf)>>,
+) -> io::Result<(usize, PathBuf)> {
+    match handle.join() {
+        Ok(result) => result,
+        Err(payload) => Err(io::Error::other(format!(
+            "manifest copy merge sort worker panicked: {}",
+            panic_payload_message(payload.as_ref())
+        ))),
+    }
+}
+
+fn manifest_flush_sort_handles(
+    handles: &mut Vec<thread::JoinHandle<io::Result<(usize, PathBuf)>>>,
+    sorted_chunks: &mut Vec<(usize, PathBuf)>,
+    max_pending: usize,
+) -> io::Result<()> {
+    while handles.len() >= max_pending {
+        let handle = handles.remove(0);
+        sorted_chunks.push(manifest_join_sort_chunk(handle)?);
+    }
+    Ok(())
+}
+
 #[derive(Eq)]
 struct ManifestMergeItem {
     key: Vec<u8>,
@@ -5502,10 +5542,13 @@ fn merge_manifest_copy_files(
     std::fs::create_dir_all(&temp_dir)?;
     let chunk_max_bytes =
         env_usize("HLTHPRT_PTG2_MANIFEST_MERGE_CHUNK_BYTES", 512 * 1024 * 1024).max(1024 * 1024);
-    let mut chunk_paths = Vec::new();
+    let sort_workers = env_usize("HLTHPRT_PTG2_MANIFEST_MERGE_SORT_WORKERS", 1).max(1);
+    let mut sort_handles: Vec<thread::JoinHandle<io::Result<(usize, PathBuf)>>> = Vec::new();
+    let mut sorted_chunks: Vec<(usize, PathBuf)> = Vec::new();
     let mut chunk_rows: Vec<Vec<u8>> = Vec::new();
     let mut chunk_bytes = 0usize;
     let mut input_rows = 0u64;
+    let mut chunk_count = 0usize;
     for raw_path in input_paths {
         let file = match File::open(raw_path) {
             Ok(file) => file,
@@ -5524,25 +5567,32 @@ fn merge_manifest_copy_files(
             chunk_rows.push(line);
             if chunk_bytes >= chunk_max_bytes {
                 let rows = std::mem::take(&mut chunk_rows);
-                chunk_paths.push(manifest_sort_chunk(
+                sort_handles.push(manifest_spawn_sort_chunk(
                     kind,
                     rows,
-                    chunk_paths.len(),
+                    chunk_count,
                     &temp_dir,
-                )?);
+                ));
+                chunk_count += 1;
                 chunk_bytes = 0;
+                manifest_flush_sort_handles(&mut sort_handles, &mut sorted_chunks, sort_workers)?;
             }
         }
     }
     if !chunk_rows.is_empty() {
         let rows = std::mem::take(&mut chunk_rows);
-        chunk_paths.push(manifest_sort_chunk(
+        sort_handles.push(manifest_spawn_sort_chunk(
             kind,
             rows,
-            chunk_paths.len(),
+            chunk_count,
             &temp_dir,
-        )?);
+        ));
     }
+    for handle in sort_handles {
+        sorted_chunks.push(manifest_join_sort_chunk(handle)?);
+    }
+    sorted_chunks.sort_unstable_by_key(|(index, _)| *index);
+    let chunk_paths: Vec<PathBuf> = sorted_chunks.into_iter().map(|(_, path)| path).collect();
     let mut output = BufWriter::new(File::create(output_path)?);
     let mut output_rows = 0u64;
     if !chunk_paths.is_empty() {
@@ -5587,6 +5637,9 @@ fn merge_manifest_copy_files(
             "input_rows": input_rows,
             "output_rows": output_rows,
             "dropped_rows": input_rows.saturating_sub(output_rows),
+            "chunk_count": chunk_paths.len(),
+            "chunk_max_bytes": chunk_max_bytes,
+            "sort_workers": sort_workers,
             "output_path": output_path.display().to_string(),
         }),
     )?;
@@ -5692,6 +5745,9 @@ mod tests {
         sinks
             .write_provider_group_members_shared(&provider_ref, &dedupe)
             .unwrap();
+        sinks
+            .write_provider_group_members_shared(&provider_ref, &dedupe)
+            .unwrap();
         let events = sinks.finish_silent().unwrap();
 
         assert_eq!(events.len(), 2);
@@ -5709,6 +5765,13 @@ mod tests {
         assert!(member_path.with_extension("copy.provider_refs").exists());
         assert!(!manifest_member_path.exists());
         assert!(!member_path.exists());
+        let summary = dedupe_summary_payload(&dedupe, &HashMap::new());
+        assert_eq!(summary["provider_group_attempted"], 2);
+        assert_eq!(summary["provider_group_unique"], 1);
+        assert_eq!(summary["provider_group_duplicate"], 1);
+        assert_eq!(summary["provider_group_member_attempted"], 2);
+        assert_eq!(summary["provider_group_member_unique"], 2);
+        assert_eq!(summary["provider_group_member_duplicate"], 0);
 
         let _ = std::fs::remove_dir_all(base);
     }
@@ -5933,6 +5996,71 @@ mod tests {
 
         let merged = std::fs::read_to_string(&output).unwrap();
         assert_eq!(merged, "a\t1\nb\t2\nmanifest\t1\t2\t3\t4\t5\t6\t7\ttrace\n");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn manifest_copy_merge_parallel_chunk_sort_matches_serial_output() {
+        let base =
+            std::env::temp_dir().join(format!("ptg2-merge-parallel-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&base);
+        let input_a = base.join("a.copy");
+        let input_b = base.join("b.copy");
+        let serial_output = base.join("serial.copy");
+        let parallel_output = base.join("parallel.copy");
+        let payload_a = "a".repeat(700_000);
+        let payload_b = "b".repeat(700_000);
+        let payload_c = "c".repeat(700_000);
+        std::fs::write(
+            &input_a,
+            format!(
+                "g2\t200\t{payload_a}\n\
+                 g1\t100\t{payload_b}\n\
+                 g3\t300\t{payload_c}\n\
+                 g1\t100\t{payload_b}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &input_b,
+            format!(
+                "g4\t400\t{payload_a}\n\
+                 g2\t200\t{payload_a}\n\
+                 g5\t500\t{payload_c}\n"
+            ),
+        )
+        .unwrap();
+
+        std::env::remove_var("HLTHPRT_PTG2_MANIFEST_MERGE_SORT_WORKERS");
+        std::env::remove_var("HLTHPRT_PTG2_MANIFEST_MERGE_CHUNK_BYTES");
+        merge_manifest_copy_files(
+            "provider_group_member",
+            &serial_output,
+            &[
+                input_a.to_string_lossy().to_string(),
+                input_b.to_string_lossy().to_string(),
+            ],
+        )
+        .unwrap();
+
+        std::env::set_var("HLTHPRT_PTG2_MANIFEST_MERGE_SORT_WORKERS", "2");
+        std::env::set_var("HLTHPRT_PTG2_MANIFEST_MERGE_CHUNK_BYTES", "1");
+        merge_manifest_copy_files(
+            "provider_group_member",
+            &parallel_output,
+            &[
+                input_a.to_string_lossy().to_string(),
+                input_b.to_string_lossy().to_string(),
+            ],
+        )
+        .unwrap();
+        std::env::remove_var("HLTHPRT_PTG2_MANIFEST_MERGE_SORT_WORKERS");
+        std::env::remove_var("HLTHPRT_PTG2_MANIFEST_MERGE_CHUNK_BYTES");
+
+        let serial = std::fs::read_to_string(&serial_output).unwrap();
+        let parallel = std::fs::read_to_string(&parallel_output).unwrap();
+        assert_eq!(parallel, serial);
+        assert_eq!(parallel.lines().count(), 5);
         let _ = std::fs::remove_dir_all(base);
     }
 

@@ -19,6 +19,8 @@ from process.import_status_events import flush_status_events
 from process.ptg import main as ptg_main
 from process.ptg_parts.config import (
     PTG2_FILE_PROCESS_CONCURRENCY_ENV,
+    PTG2_MANIFEST_MERGE_CHUNK_BYTES_ENV,
+    PTG2_MANIFEST_MERGE_SORT_WORKERS_ENV,
     PTG2_RUST_EVENT_QUEUE_ENV,
     PTG2_RUST_PARSE_IN_WORKERS_ENV,
     PTG2_RUST_PROVIDER_REF_CHUNK_ITEMS_ENV,
@@ -193,6 +195,12 @@ def _ptg_lane_environment(params: dict[str, Any]):
         ),
         PTG2_RUST_PROVIDER_REF_RAW_CHUNK_BYTES_ENV: _optional_env_value(
             params.get("_scanner_provider_ref_raw_chunk_bytes")
+        ),
+        PTG2_MANIFEST_MERGE_CHUNK_BYTES_ENV: _optional_env_value(
+            params.get("_manifest_merge_chunk_bytes")
+        ),
+        PTG2_MANIFEST_MERGE_SORT_WORKERS_ENV: _optional_env_value(
+            params.get("_manifest_merge_sort_workers")
         ),
         PTG2_FILE_PROCESS_CONCURRENCY_ENV: _optional_env_value(params.get("_file_process_concurrency")),
     }
