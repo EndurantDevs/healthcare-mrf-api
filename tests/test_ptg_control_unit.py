@@ -86,6 +86,39 @@ async def test_ptg_control_start_records_ptg2_terminal_identity(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_ptg_control_start_runs_live_progress_heartbeat(monkeypatch):
+    heartbeat_calls = []
+    stopped = []
+
+    async def fake_ptg_main(**_kwargs):
+        await ptg_control.asyncio.sleep(0)
+        return {}
+
+    async def fake_mark_control_run(*_args, **_kwargs):
+        return None
+
+    async def fake_heartbeat(*args):
+        heartbeat_calls.append(args)
+
+    async def fake_stop(task):
+        stopped.append(task)
+
+    monkeypatch.setattr(ptg_control, "ptg_main", fake_ptg_main)
+    monkeypatch.setattr(ptg_control, "mark_control_run", fake_mark_control_run)
+    monkeypatch.setattr(ptg_control, "_live_progress_heartbeat", fake_heartbeat)
+    monkeypatch.setattr(ptg_control, "_stop_live_progress_heartbeat", fake_stop)
+
+    await ptg_control.ptg_control_start(
+        {},
+        {"run_id": "run_ptg", "params": {"test_mode": True, "source_key": "demo_source"}},
+    )
+
+    assert heartbeat_calls
+    assert heartbeat_calls[0][:3] == ("run_ptg", "ptg", "ptg_control_start")
+    assert stopped
+
+
+@pytest.mark.asyncio
 async def test_ptg_control_start_applies_lane_scanner_env(monkeypatch):
     observed = {}
 

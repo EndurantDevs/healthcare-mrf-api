@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
+import datetime as dt
 import os
 from contextlib import contextmanager
 from typing import Any
 
 from process.control_cancel import ImportCancelledError, raise_if_cancelled
-from process.control_lifecycle import mark_control_run
+from process.control_lifecycle import (
+    _live_progress_heartbeat,
+    _stop_live_progress_heartbeat,
+    mark_control_run,
+)
 from process.import_status_events import flush_status_events
 from process.ptg import main as ptg_main
 from process.ptg_parts.config import (
@@ -24,8 +30,14 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
     payload = task if isinstance(task, dict) else {}
     run_id = str(payload.get("run_id") or "").strip()
     params = payload.get("params") if isinstance(payload.get("params"), dict) else payload
+    heartbeat_task = None
     try:
         await mark_control_run(run_id, status="running", phase_detail="ptg import running", progress_message="running")
+        if run_id:
+            started_at = dt.datetime.now(dt.UTC).isoformat()
+            heartbeat_task = asyncio.create_task(
+                _live_progress_heartbeat(run_id, "ptg", "ptg_control_start", started_at)
+            )
         await raise_if_cancelled(ctx, payload)
         _assert_expected_lane(params)
         with _ptg_lane_environment(params):
@@ -63,6 +75,8 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
         )
         await _flush_terminal_status_events()
         raise
+    finally:
+        await _stop_live_progress_heartbeat(heartbeat_task)
     result_metrics = result if isinstance(result, dict) else {}
     await mark_control_run(
         run_id,
