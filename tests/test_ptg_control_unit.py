@@ -193,6 +193,7 @@ async def test_ptg_control_start_applies_lane_scanner_env(monkeypatch):
         observed["parse"] = ptg_control.os.environ.get("HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS")
         observed["work_queue"] = ptg_control.os.environ.get("HLTHPRT_PTG2_RUST_WORK_QUEUE")
         observed["event_queue"] = ptg_control.os.environ.get("HLTHPRT_PTG2_RUST_EVENT_QUEUE")
+        observed["file_process_concurrency"] = ptg_control.os.environ.get("HLTHPRT_PTG2_FILE_PROCESS_CONCURRENCY")
         return {}
 
     async def fake_mark_control_run(*_args, **_kwargs):
@@ -214,11 +215,18 @@ async def test_ptg_control_start_applies_lane_scanner_env(monkeypatch):
                 "_scanner_parse_in_workers": True,
                 "_scanner_work_queue": 5,
                 "_scanner_event_queue": 9,
+                "_file_process_concurrency": 2,
             },
         },
     )
 
-    assert observed == {"workers": "4", "parse": "true", "work_queue": "5", "event_queue": "9"}
+    assert observed == {
+        "workers": "4",
+        "parse": "true",
+        "work_queue": "5",
+        "event_queue": "9",
+        "file_process_concurrency": "2",
+    }
 
 
 @pytest.mark.asyncio

@@ -18,6 +18,7 @@ from process.control_lifecycle import (
 from process.import_status_events import flush_status_events
 from process.ptg import main as ptg_main
 from process.ptg_parts.config import (
+    PTG2_FILE_PROCESS_CONCURRENCY_ENV,
     PTG2_RUST_EVENT_QUEUE_ENV,
     PTG2_RUST_PARSE_IN_WORKERS_ENV,
     PTG2_RUST_WORK_QUEUE_ENV,
@@ -175,6 +176,7 @@ def _ptg_lane_environment(params: dict[str, Any]):
         PTG2_RUST_PARSE_IN_WORKERS_ENV: _bool_env_value(params.get("_scanner_parse_in_workers")),
         PTG2_RUST_WORK_QUEUE_ENV: _optional_env_value(params.get("_scanner_work_queue")),
         PTG2_RUST_EVENT_QUEUE_ENV: _optional_env_value(params.get("_scanner_event_queue")),
+        PTG2_FILE_PROCESS_CONCURRENCY_ENV: _optional_env_value(params.get("_file_process_concurrency")),
     }
     previous: dict[str, str | None] = {}
     try:
