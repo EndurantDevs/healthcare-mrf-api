@@ -245,6 +245,41 @@ struct ProviderEntry {
     npi: Vec<i64>,
 }
 
+enum ProviderEntryView<'a> {
+    Borrowed(&'a ProviderEntry),
+    Owned(ProviderEntry),
+}
+
+impl<'a> ProviderEntryView<'a> {
+    fn entry_hash(&self) -> i64 {
+        match self {
+            Self::Borrowed(entry) => entry.entry_hash,
+            Self::Owned(entry) => entry.entry_hash,
+        }
+    }
+
+    fn provider_count(&self) -> i64 {
+        match self {
+            Self::Borrowed(entry) => entry.provider_count,
+            Self::Owned(entry) => entry.provider_count,
+        }
+    }
+
+    fn provider_group_hashes(&self) -> &[i64] {
+        match self {
+            Self::Borrowed(entry) => &entry.provider_group_hashes,
+            Self::Owned(entry) => &entry.provider_group_hashes,
+        }
+    }
+
+    fn npi(&self) -> &[i64] {
+        match self {
+            Self::Borrowed(entry) => &entry.npi,
+            Self::Owned(entry) => &entry.npi,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct RateLite {
     provider_refs: Vec<String>,
@@ -678,6 +713,16 @@ fn provider_set_from_ref_keys(
         provider_group_hashes: sorted_group_hashes,
         npi: sorted_provider_npis,
     })
+}
+
+fn provider_entry_view_from_ref_keys<'a>(
+    provider_map: &'a HashMap<String, ProviderEntry>,
+    refs: &[String],
+) -> Option<ProviderEntryView<'a>> {
+    if refs.len() == 1 {
+        return provider_map.get(&refs[0]).map(ProviderEntryView::Borrowed);
+    }
+    provider_set_from_ref_keys(provider_map, refs).map(ProviderEntryView::Owned)
 }
 
 fn price_atom_from_lite(
@@ -2844,6 +2889,177 @@ fn process_compact_rate_lites_worker<W: Write>(
         )?;
     }
 
+    let group_negotiated_rate_chunks =
+        env_bool("HLTHPRT_PTG2_RUST_GROUP_NEGOTIATED_RATE_CHUNKS", false);
+    if !group_negotiated_rate_chunks {
+        for rate in rates {
+            let Some(provider_entry) =
+                provider_entry_view_from_ref_keys(provider_map, &rate.provider_refs)
+            else {
+                continue;
+            };
+            let Some(price_set) = price_lite_set(&rate.prices, price_code_set_hash_cache) else {
+                continue;
+            };
+            let sorted_provider_entry_hashes = [provider_entry.entry_hash()];
+            let sorted_provider_hashes = provider_entry.provider_group_hashes();
+            let sorted_provider_npis = provider_entry.npi();
+            let provider_count = provider_entry.provider_count();
+            let provider_set_hash = hash_i64_list("provider_set", &sorted_provider_entry_hashes);
+            let rate_pack_hash = hash_text(
+                "serving_rate_pack",
+                &[
+                    context.snapshot_id.clone(),
+                    procedure_hash.clone(),
+                    provider_set_hash.clone(),
+                    price_set.price_set_hash.clone(),
+                ],
+            );
+            let serving_rate_id = hash_text(
+                "serving_rate_id",
+                &[
+                    context.snapshot_id.clone(),
+                    context.plan_id.clone(),
+                    billing_code.clone(),
+                    rate_pack_hash.clone(),
+                ],
+            );
+            let price_set_hash = price_set.price_set_hash.clone();
+            let manifest_identity = manifest_serving_copy_writer.as_ref().map(|_| {
+                manifest_serving_identity_hex(
+                    &context.plan_id,
+                    &procedure_payload,
+                    &sorted_provider_entry_hashes,
+                    &price_set,
+                )
+            });
+            if dedupe.insert_price_set(&price_set.price_set_hash) {
+                if let Some(sidecars) = manifest_sidecars {
+                    sidecars.lock().unwrap().record_price_set(&price_set)?;
+                }
+                dictionary_copy_sinks.write_price_atoms_shared(&price_set.atoms, dedupe)?;
+                dictionary_copy_sinks.write_price_set_entries_shared(
+                    &price_set.price_set_hash,
+                    &price_set.price_atom_hashes,
+                    dedupe,
+                )?;
+            }
+            if dedupe.insert_provider_set(&provider_set_hash) {
+                if let Some(sidecars) = manifest_sidecars {
+                    let provider_set_global_id =
+                        provider_set_global_id_from_entry_hashes(&sorted_provider_entry_hashes);
+                    sidecars.lock().unwrap().record_provider_set(
+                        provider_set_global_id,
+                        sorted_provider_hashes,
+                        sorted_provider_npis,
+                    )?;
+                }
+                if !dictionary_copy_sinks.write_provider_set(
+                    &provider_set_hash,
+                    provider_count,
+                    sorted_provider_hashes,
+                )? {
+                    emit_json_record(
+                        writer,
+                        "provider_set",
+                        &json!({
+                            "provider_set_hash": provider_set_hash,
+                            "hash_prefix": &provider_set_hash[..provider_set_hash.len().min(16)],
+                            "provider_count": provider_count,
+                            "npi": Value::Null,
+                            "tin_type": "set",
+                            "tin_value": Value::Null,
+                            "canonical_payload": {
+                                "provider_group_hashes": sorted_provider_hashes,
+                                "provider_group_count": sorted_provider_hashes.len(),
+                                "provider_count": provider_count,
+                                "provider_count_mode": "summed_provider_groups",
+                                "npi_inline": false,
+                                "tin_type": "set",
+                                "tin_value": Value::Null,
+                            },
+                        }),
+                    )?;
+                }
+                dictionary_copy_sinks.write_provider_set_entries_shared(
+                    &provider_set_hash,
+                    &sorted_provider_entry_hashes,
+                    dedupe,
+                )?;
+                dictionary_copy_sinks.write_provider_set_components_shared(
+                    &provider_set_hash,
+                    sorted_provider_hashes,
+                    dedupe,
+                )?;
+                dictionary_copy_sinks.write_provider_entry_components_shared(
+                    provider_entry.entry_hash(),
+                    sorted_provider_hashes,
+                    dedupe,
+                )?;
+            }
+            if dedupe.insert_serving_rate(&serving_rate_id) {
+                if state.suppress_v2_serving_output {
+                    // See LocalCompactOutputs: manifest-only mode avoids emitting v2
+                    // serving rows over either COPY files or JSON stdout.
+                } else if let Some(copy_writer) = compact_copy_writer.as_mut() {
+                    copy_writer.write_row(&CompactCopyRow {
+                        serving_rate_id: &serving_rate_id,
+                        snapshot_id: &context.snapshot_id,
+                        plan_id: &context.plan_id,
+                        procedure_hash: &procedure_hash,
+                        procedure_code: None,
+                        reported_code_system: reported_code_system.as_deref(),
+                        reported_code: reported_code.as_deref(),
+                        provider_set_hash: &provider_set_hash,
+                        provider_count,
+                        price_set_hash: &price_set_hash,
+                        source_trace_set_hash: &context.source_trace_set_hash,
+                    })?;
+                } else {
+                    emit_json_record(
+                        writer,
+                        "serving_rate_compact",
+                        &json!({
+                            "serving_rate_id": serving_rate_id,
+                            "snapshot_id": context.snapshot_id.clone(),
+                            "plan_id": context.plan_id.clone(),
+                            "plan_month_id": context.plan_month_id.clone(),
+                            "procedure_hash": procedure_hash,
+                            "procedure_code": Value::Null,
+                            "reported_code_system": reported_code_system.clone(),
+                            "reported_code": reported_code.clone(),
+                            "billing_code": billing_code,
+                            "billing_code_type": billing_code_type,
+                            "rate_pack_hash": rate_pack_hash,
+                            "provider_set_hash": provider_set_hash,
+                            "provider_count": provider_count,
+                            "price_set_hash": price_set_hash,
+                            "source_trace_set_hash": context.source_trace_set_hash.clone(),
+                            "confidence_code": context.confidence_code.clone(),
+                        }),
+                    )?;
+                }
+                if let (Some(copy_writer), Some(identity)) = (
+                    manifest_serving_copy_writer.as_mut(),
+                    manifest_identity.as_ref(),
+                ) {
+                    copy_writer.write_manifest_serving_row(&ManifestServingCopyRow {
+                        serving_content_hash_128: &identity.serving_content_hash_128,
+                        plan_id: &context.plan_id,
+                        reported_code_system: reported_code_system.as_deref(),
+                        reported_code: reported_code.as_deref(),
+                        procedure_global_id_128: &identity.procedure_global_id_128,
+                        provider_set_global_id_128: &identity.provider_set_global_id_128,
+                        provider_count,
+                        price_set_global_id_128: &identity.price_set_global_id_128,
+                        source_trace_set_hash: &context.source_trace_set_hash,
+                    })?;
+                }
+            }
+        }
+        return Ok(());
+    }
+
     let parsed_rates: Vec<ParsedCompactRate> = rates
         .iter()
         .filter_map(|rate| {
@@ -2859,8 +3075,6 @@ fn process_compact_rate_lites_worker<W: Write>(
         })
         .collect();
 
-    let group_negotiated_rate_chunks =
-        env_bool("HLTHPRT_PTG2_RUST_GROUP_NEGOTIATED_RATE_CHUNKS", false);
     let grouped: Vec<GroupedPriceSet> = if group_negotiated_rate_chunks {
         let mut by_price_set: BTreeMap<String, GroupedPriceSet> = BTreeMap::new();
         for (
@@ -4550,6 +4764,41 @@ mod tests {
         assert_eq!(retained.provider_group_hashes, pruned.provider_group_hashes);
         assert_eq!(retained.npi, vec![1234567890, 1234567891]);
         assert!(pruned.npi.is_empty());
+    }
+
+    #[test]
+    fn provider_entry_view_borrows_single_refs_and_owns_combined_refs() {
+        let provider_ref_a = json!({
+            "provider_groups": [{
+                "tin": {"type": "ein", "value": "123456789"},
+                "npi": [1234567890]
+            }]
+        });
+        let provider_ref_b = json!({
+            "provider_groups": [{
+                "tin": {"type": "ein", "value": "987654321"},
+                "npi": [1234567891]
+            }]
+        });
+        let mut provider_map = HashMap::new();
+        provider_map.insert(
+            "1".to_string(),
+            build_provider_entry(&provider_ref_a, false).unwrap(),
+        );
+        provider_map.insert(
+            "2".to_string(),
+            build_provider_entry(&provider_ref_b, false).unwrap(),
+        );
+
+        let single = provider_entry_view_from_ref_keys(&provider_map, &["1".to_string()])
+            .expect("single ref should resolve");
+        assert!(matches!(single, ProviderEntryView::Borrowed(_)));
+
+        let combined =
+            provider_entry_view_from_ref_keys(&provider_map, &["1".to_string(), "2".to_string()])
+                .expect("combined refs should resolve");
+        assert!(matches!(combined, ProviderEntryView::Owned(_)));
+        assert_eq!(combined.provider_count(), 2);
     }
 
     #[test]
