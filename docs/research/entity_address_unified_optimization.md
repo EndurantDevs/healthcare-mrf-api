@@ -25,6 +25,10 @@ HLTHPRT_IMPORT_CONTROL_API_TOKEN=<token> \
   --case dev-bounded-smoke-1k
 ```
 
+Bounded smoke cases pass `publish=false`, so they validate staging, support-table
+builds, publish validation, and phase timings without replacing the live serving
+tables.
+
 Run the full dev pilot only when PTG/openaddress jobs are not competing for the
 same database CPU and temp I/O:
 

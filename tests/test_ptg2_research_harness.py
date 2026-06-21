@@ -367,7 +367,7 @@ def test_import_control_run_dry_run_builds_generic_import_payload(tmp_path, monk
                 "kind": "import_control_run",
                 "importer": "entity-address-unified",
                 "actor": "codex",
-                "params": {"test": True, "limit_per_source": 1000},
+                "params": {"test": True, "publish": False, "limit_per_source": 1000},
                 "variants": ["current"],
             }
         ],
@@ -382,7 +382,7 @@ def test_import_control_run_dry_run_builds_generic_import_payload(tmp_path, monk
     assert result["kind"] == "import_control_run"
     assert result["command"][1] == "http://import-control.test/v1/runs"
     assert request_payload["importer"] == "entity-address-unified"
-    assert request_payload["params"] == {"test": True, "limit_per_source": 1000}
+    assert request_payload["params"] == {"test": True, "publish": False, "limit_per_source": 1000}
     assert request_payload["actor"] == "codex"
 
 
@@ -421,7 +421,7 @@ def test_import_control_run_polls_until_terminal(tmp_path, monkeypatch):
                 "importer": "entity-address-unified",
                 "poll_seconds": 0,
                 "timeout_seconds": 10,
-                "params": {"test": True, "limit_per_source": 1000},
+                "params": {"test": True, "publish": False, "limit_per_source": 1000},
                 "variants": ["current"],
             }
         ],

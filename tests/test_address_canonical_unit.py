@@ -940,6 +940,34 @@ def test_entity_address_unified_defaults_to_production_sized_publish_gate():
     assert entity_address_unified.DEFAULT_COMPACT_SOURCE_RECORD_IDS is True
 
 
+def test_entity_address_unified_publish_decision_defaults_to_stage_only_for_test(monkeypatch):
+    monkeypatch.delenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_PUBLISH", raising=False)
+    monkeypatch.delenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_SKIP_PUBLISH", raising=False)
+
+    assert entity_address_unified._publish_requested({}, test_mode=True) is False  # pylint: disable=protected-access
+    assert entity_address_unified._publish_requested({}, test_mode=False) is True  # pylint: disable=protected-access
+    assert entity_address_unified._publish_requested(  # pylint: disable=protected-access
+        {"publish": True},
+        test_mode=True,
+    ) is True
+    assert entity_address_unified._publish_requested(  # pylint: disable=protected-access
+        {"skip_publish": True},
+        test_mode=False,
+    ) is False
+
+
+def test_entity_address_unified_publish_decision_allows_env_override(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_PUBLISH", "true")
+    monkeypatch.delenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_SKIP_PUBLISH", raising=False)
+
+    assert entity_address_unified._publish_requested({}, test_mode=True) is True  # pylint: disable=protected-access
+
+    monkeypatch.delenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_PUBLISH", raising=False)
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_SKIP_PUBLISH", "true")
+
+    assert entity_address_unified._publish_requested({}, test_mode=False) is False  # pylint: disable=protected-access
+
+
 def test_ffs_address_source_does_not_borrow_parent_street_lines():
     selects = entity_address_unified._source_selects(
         "mrf",

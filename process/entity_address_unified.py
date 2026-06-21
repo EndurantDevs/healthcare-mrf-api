@@ -119,6 +119,34 @@ def _env_bool(name: str, default: bool) -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _coerce_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _publish_requested(task: dict, *, test_mode: bool) -> bool:
+    """Return whether this run should publish staged entity-address tables.
+
+    Bounded/test pilots are stage-only by default so they can prove runtime
+    behavior without replacing the live serving table with a small sample.
+    """
+
+    if task.get("skip_publish") not in (None, ""):
+        return not _coerce_bool(task.get("skip_publish"))
+    if task.get("publish") not in (None, ""):
+        return _coerce_bool(task.get("publish"))
+    env_publish = os.getenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_PUBLISH")
+    if env_publish not in (None, ""):
+        return _coerce_bool(env_publish)
+    env_skip = os.getenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_SKIP_PUBLISH")
+    if env_skip not in (None, ""):
+        return not _coerce_bool(env_skip)
+    return not test_mode
+
+
 def _env_int(name: str, default: int, minimum: int = 0) -> int:
     raw = os.getenv(name)
     if raw is None or str(raw).strip() == "":
@@ -511,6 +539,12 @@ async def _swap_stage_table(db_schema: str, live_cls, stage_cls) -> None:
             f"ALTER INDEX IF EXISTS {db_schema}.{_stage_index_name(stage_cls.__tablename__, index_name)} "
             f"RENAME TO {old_live_name};"
         )
+
+
+async def _drop_stage_artifacts(db_schema: str, stage_cls, support_stage_classes: dict[type, type]) -> None:
+    await db.status(f"DROP TABLE IF EXISTS {db_schema}.{stage_cls.__tablename__};")
+    for stage_model in support_stage_classes.values():
+        await db.status(f"DROP TABLE IF EXISTS {db_schema}.{stage_model.__tablename__};")
 
 
 async def _table_exists(db_schema: str, table_name: str) -> bool:
@@ -5993,6 +6027,7 @@ async def process_data(ctx, task=None):
     if "test_mode" in task:
         context["test_mode"] = bool(task.get("test_mode"))
     test_mode = bool(context.get("test_mode", False))
+    context["publish_requested"] = _publish_requested(task, test_mode=test_mode)
 
     await ensure_database(test_mode)
 
@@ -6966,6 +7001,36 @@ async def shutdown(ctx):
     )
     context["publish_validation"] = publish_validation
 
+    if not bool(context.get("publish_requested", True)):
+        logger.info("EntityAddressUnified publish skipped: staged rows=%d", stage_rows)
+        await _drop_stage_artifacts(db_schema, stage_cls, support_stage_classes)
+        await mark_control_run(
+            run_id,
+            status="succeeded",
+            phase_detail="entity-address-unified staged; publish skipped",
+            progress_message="staged; publish skipped",
+            progress={
+                "unit": "rows",
+                "done": stage_rows,
+                "total": stage_rows,
+                "pct": 100,
+                "message": "staged; publish skipped",
+                "phase": "entity-address-unified staged",
+            },
+            metrics={
+                "rows": stage_rows,
+                "publish_skipped": True,
+                "npi_rows": int(context.get("npi_rows") or 0),
+                "inferred_rows": int(context.get("inferred_rows") or 0),
+                "multi_source_rows": int(context.get("multi_source_rows") or 0),
+                "support_counts": context.get("support_counts") or {},
+                "publish_validation": context.get("publish_validation") or {},
+                "phase_timings": context.get("phase_timings") or {},
+            },
+        )
+        print_time_info(context.get("start"))
+        return
+
     async with db.transaction():
         table = EntityAddressUnified.__main_table__
         await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
@@ -7026,7 +7091,11 @@ async def shutdown(ctx):
     print_time_info(context.get("start"))
 
 
-async def main(test_mode: bool = False, limit_per_source: int | None = None):
+async def main(
+    test_mode: bool = False,
+    limit_per_source: int | None = None,
+    publish: bool | None = None,
+):
     redis = await create_pool(
         build_redis_settings(),
         job_serializer=serialize_job,
@@ -7035,4 +7104,6 @@ async def main(test_mode: bool = False, limit_per_source: int | None = None):
     payload = {"test_mode": bool(test_mode)}
     if limit_per_source is not None:
         payload["limit_per_source"] = max(int(limit_per_source), 0)
+    if publish is not None:
+        payload["publish"] = bool(publish)
     await redis.enqueue_job("process_data", payload, _queue_name=ENTITY_ADDRESS_UNIFIED_QUEUE_NAME)

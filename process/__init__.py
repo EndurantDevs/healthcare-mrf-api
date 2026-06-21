@@ -1166,8 +1166,19 @@ def pharmacy_economics(test: bool):
 @click.command(help="Run unified entity-address materialization import")
 @click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
 @click.option("--limit-per-source", type=int, help="Limit rows per source for bounded smoke or pilot runs.")
-def entity_address_unified(test: bool, limit_per_source: int | None):
-    _run(initiate_entity_address_unified(test_mode=test, limit_per_source=limit_per_source))
+@click.option(
+    "--publish/--no-publish",
+    default=None,
+    help="Publish staged output; defaults to false in test mode and true otherwise.",
+)
+def entity_address_unified(test: bool, limit_per_source: int | None, publish: bool | None):
+    _run(
+        initiate_entity_address_unified(
+            test_mode=test,
+            limit_per_source=limit_per_source,
+            publish=publish,
+        )
+    )
 
 
 @click.command(help="Run fast PTG provider-location address projection")

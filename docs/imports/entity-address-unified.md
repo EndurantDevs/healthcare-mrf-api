@@ -55,8 +55,12 @@ This importer does not fetch an external website directly. It materializes from 
 ```bash
 python main.py start entity-address-unified --test
 python main.py start entity-address-unified --test --limit-per-source 1000
+python main.py start entity-address-unified --test --limit-per-source 1000 --publish
 python main.py worker process.EntityAddressUnified --burst
 ```
+
+Test mode is stage-only by default and does not replace the live serving tables
+unless `--publish` or import-control `publish=true` is supplied.
 
 ## Key Environment Variables
 
@@ -80,6 +84,8 @@ python main.py worker process.EntityAddressUnified --burst
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_JIT`
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_MAX_PARALLEL_WORKERS_PER_GATHER`
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_LIMIT_PER_SOURCE` (bounded pilots only; import-control can also pass `limit_per_source`)
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_PUBLISH` (overrides publish decision; by default test mode skips publish and full mode publishes)
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_SKIP_PUBLISH`
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_REQUIRE_ARCHIVE_COORDINATES` (default `false`; when `true`, publish fails if archive rows still lack coordinates)
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENABLE_INFERENCE` (default `false`; enables automatic NPI inference updates; review candidates are still populated when this is off)
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENABLE_NAME_FALLBACK_INFERENCE` (default `false`; enables expensive broad name+ZIP+street automatic inference after deterministic facility-anchor matches)

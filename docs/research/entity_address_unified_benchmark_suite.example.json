@@ -29,6 +29,7 @@
       },
       "params": {
         "test": true,
+        "publish": false,
         "limit_per_source": 1000
       },
       "variants": ["current"]
@@ -49,6 +50,7 @@
       },
       "params": {
         "test": true,
+        "publish": false,
         "limit_per_source": 20000
       },
       "variants": ["current"]
@@ -68,7 +70,8 @@
         "memory": false
       },
       "params": {
-        "test": false
+        "test": false,
+        "publish": true
       },
       "variants": ["current"]
     }
