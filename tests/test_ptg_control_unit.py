@@ -191,6 +191,9 @@ async def test_ptg_control_start_applies_lane_scanner_env(monkeypatch):
     async def fake_ptg_main(**_kwargs):
         observed["workers"] = ptg_control.os.environ.get("HLTHPRT_PTG2_RUST_WORKERS")
         observed["parse"] = ptg_control.os.environ.get("HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS")
+        observed["top_level_byte_scan"] = ptg_control.os.environ.get(
+            "HLTHPRT_PTG2_RUST_TOP_LEVEL_BYTE_SCAN"
+        )
         observed["work_queue"] = ptg_control.os.environ.get("HLTHPRT_PTG2_RUST_WORK_QUEUE")
         observed["event_queue"] = ptg_control.os.environ.get("HLTHPRT_PTG2_RUST_EVENT_QUEUE")
         observed["provider_refs_in_workers"] = ptg_control.os.environ.get(
@@ -224,6 +227,7 @@ async def test_ptg_control_start_applies_lane_scanner_env(monkeypatch):
                 "_expected_worker_class": "process.PTGSmall",
                 "_scanner_rust_workers": 4,
                 "_scanner_parse_in_workers": True,
+                "_scanner_top_level_byte_scan": True,
                 "_scanner_work_queue": 5,
                 "_scanner_event_queue": 9,
                 "_scanner_provider_refs_in_workers": False,
@@ -239,6 +243,7 @@ async def test_ptg_control_start_applies_lane_scanner_env(monkeypatch):
     assert observed == {
         "workers": "4",
         "parse": "true",
+        "top_level_byte_scan": "true",
         "work_queue": "5",
         "event_queue": "9",
         "provider_refs_in_workers": "false",
