@@ -3712,17 +3712,29 @@ fn process_in_network_struson<R: Read, W: Write>(
     Ok(rate_count)
 }
 
-fn enqueue_in_network_struson<R: Read>(
-    json_reader: &mut JsonStreamReader<R>,
-    tx: &Sender<WorkerJob>,
-    event_rx: &Receiver<CopyFileEvent>,
-    writer: &mut impl Write,
+#[derive(Clone, Copy)]
+struct InNetworkEnqueueOptions {
     chunk_size: usize,
     raw_chunk_byte_limit: usize,
     parse_in_workers: bool,
-    producer_blocked_micros: &mut u128,
-    raw_chunk_stats: &mut RawChunkStats,
+}
+
+struct InNetworkEnqueueIo<'a, W: Write> {
+    tx: &'a Sender<WorkerJob>,
+    event_rx: &'a Receiver<CopyFileEvent>,
+    writer: &'a mut W,
+    producer_blocked_micros: &'a mut u128,
+    raw_chunk_stats: &'a mut RawChunkStats,
+}
+
+fn enqueue_in_network_struson<R: Read, W: Write>(
+    json_reader: &mut JsonStreamReader<R>,
+    io_state: &mut InNetworkEnqueueIo<'_, W>,
+    options: InNetworkEnqueueOptions,
 ) -> io::Result<u64> {
+    let chunk_size = options.chunk_size;
+    let raw_chunk_byte_limit = options.raw_chunk_byte_limit;
+    let parse_in_workers = options.parse_in_workers;
     let mut procedure = Map::new();
     let mut rate_chunk: Vec<RateLite> = Vec::with_capacity(chunk_size);
     let mut raw_rate_chunk: Vec<Vec<u8>> = Vec::with_capacity(chunk_size);
@@ -3756,18 +3768,18 @@ fn enqueue_in_network_struson<R: Read>(
                                 Vec::with_capacity(chunk_size),
                             );
                             let raw_bytes = std::mem::take(&mut raw_rate_chunk_bytes);
-                            raw_chunk_stats.record(raw_rates.len(), raw_bytes);
+                            io_state.raw_chunk_stats.record(raw_rates.len(), raw_bytes);
                             send_worker_job(
-                                tx,
-                                event_rx,
-                                writer,
-                                producer_blocked_micros,
+                                io_state.tx,
+                                io_state.event_rx,
+                                io_state.writer,
+                                io_state.producer_blocked_micros,
                                 WorkerJob::RawRates {
                                     procedure: procedure.clone(),
                                     raw_rates,
                                 },
                             )?;
-                            drain_copy_file_events(event_rx, writer)?;
+                            drain_copy_file_events(io_state.event_rx, io_state.writer)?;
                         }
                     } else if let Some(rate) = read_rate_lite_struson(json_reader)? {
                         rate_chunk.push(rate);
@@ -3775,16 +3787,16 @@ fn enqueue_in_network_struson<R: Read>(
                             let rates =
                                 std::mem::replace(&mut rate_chunk, Vec::with_capacity(chunk_size));
                             send_worker_job(
-                                tx,
-                                event_rx,
-                                writer,
-                                producer_blocked_micros,
+                                io_state.tx,
+                                io_state.event_rx,
+                                io_state.writer,
+                                io_state.producer_blocked_micros,
                                 WorkerJob::Rates {
                                     procedure: procedure.clone(),
                                     rates,
                                 },
                             )?;
-                            drain_copy_file_events(event_rx, writer)?;
+                            drain_copy_file_events(io_state.event_rx, io_state.writer)?;
                         }
                     }
                 }
@@ -3797,30 +3809,32 @@ fn enqueue_in_network_struson<R: Read>(
     }
     json_reader.end_object().map_err(to_io_error)?;
     if !raw_rate_chunk.is_empty() {
-        raw_chunk_stats.record(raw_rate_chunk.len(), raw_rate_chunk_bytes);
+        io_state
+            .raw_chunk_stats
+            .record(raw_rate_chunk.len(), raw_rate_chunk_bytes);
         send_worker_job(
-            tx,
-            event_rx,
-            writer,
-            producer_blocked_micros,
+            io_state.tx,
+            io_state.event_rx,
+            io_state.writer,
+            io_state.producer_blocked_micros,
             WorkerJob::RawRates {
                 procedure,
                 raw_rates: raw_rate_chunk,
             },
         )?;
-        drain_copy_file_events(event_rx, writer)?;
+        drain_copy_file_events(io_state.event_rx, io_state.writer)?;
     } else if !rate_chunk.is_empty() {
         send_worker_job(
-            tx,
-            event_rx,
-            writer,
-            producer_blocked_micros,
+            io_state.tx,
+            io_state.event_rx,
+            io_state.writer,
+            io_state.producer_blocked_micros,
             WorkerJob::Rates {
                 procedure,
                 rates: rate_chunk,
             },
         )?;
-        drain_copy_file_events(event_rx, writer)?;
+        drain_copy_file_events(io_state.event_rx, io_state.writer)?;
     }
     Ok(rate_count)
 }
@@ -4297,16 +4311,21 @@ fn scan_compact_struson_parallel(
                             let in_network_started_at = Instant::now();
                             json_reader.begin_array().map_err(to_io_error)?;
                             while json_reader.has_next().map_err(to_io_error)? {
+                                let mut enqueue_io = InNetworkEnqueueIo {
+                                    tx: &tx,
+                                    event_rx: &event_rx,
+                                    writer: &mut writer,
+                                    producer_blocked_micros: &mut producer_blocked_micros,
+                                    raw_chunk_stats: &mut raw_chunk_stats,
+                                };
                                 let rate_count = enqueue_in_network_struson(
                                     &mut json_reader,
-                                    &tx,
-                                    &event_rx,
-                                    &mut writer,
-                                    negotiated_rate_chunk_size,
-                                    raw_chunk_byte_limit,
-                                    parse_in_workers,
-                                    &mut producer_blocked_micros,
-                                    &mut raw_chunk_stats,
+                                    &mut enqueue_io,
+                                    InNetworkEnqueueOptions {
+                                        chunk_size: negotiated_rate_chunk_size,
+                                        raw_chunk_byte_limit,
+                                        parse_in_workers,
+                                    },
                                 )?;
                                 drain_copy_file_events(&event_rx, &mut writer)?;
                                 *object_counts.entry("in_network".to_string()).or_insert(0) += 1;
@@ -5299,16 +5318,21 @@ mod tests {
         let mut producer_blocked_micros = 0u128;
         let mut stats = RawChunkStats::default();
 
+        let mut enqueue_io = InNetworkEnqueueIo {
+            tx: &tx,
+            event_rx: &event_rx,
+            writer: &mut writer,
+            producer_blocked_micros: &mut producer_blocked_micros,
+            raw_chunk_stats: &mut stats,
+        };
         let rate_count = enqueue_in_network_struson(
             &mut reader,
-            &tx,
-            &event_rx,
-            &mut writer,
-            100,
-            1,
-            true,
-            &mut producer_blocked_micros,
-            &mut stats,
+            &mut enqueue_io,
+            InNetworkEnqueueOptions {
+                chunk_size: 100,
+                raw_chunk_byte_limit: 1,
+                parse_in_workers: true,
+            },
         )
         .unwrap();
 

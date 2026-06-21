@@ -285,8 +285,8 @@ jobs:
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ secrets.GHCR_USERNAME || github.actor }}
+          password: ${{ secrets.GHCR_TOKEN || github.token }}
       - name: Build and push image
         uses: docker/build-push-action@v6
         with:
@@ -294,6 +294,8 @@ jobs:
           platforms: linux/amd64
           pull: true
           push: true
+          provenance: false
+          sbom: false
           tags: ${{ steps.image.outputs.tag }}
       - name: Print published image
         run: echo "${{ steps.image.outputs.tag }}"
