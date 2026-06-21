@@ -119,6 +119,72 @@ async def test_ptg_control_start_runs_live_progress_heartbeat(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_ptg_control_start_skips_stale_terminal_run(monkeypatch):
+    async def fake_ptg_main(**_kwargs):
+        raise AssertionError("stale PTG job should not start scanner")
+
+    async def fake_mark_control_run(*_args, **_kwargs):
+        raise AssertionError("stale PTG job should not mark run running")
+
+    async def fake_db_first(*_args, **_kwargs):
+        return ("run_current", "planned", "canceled")
+
+    monkeypatch.setattr(ptg_control, "ptg_main", fake_ptg_main)
+    monkeypatch.setattr(ptg_control, "mark_control_run", fake_mark_control_run)
+    monkeypatch.setattr(ptg_control.db, "first", fake_db_first)
+
+    result = await ptg_control.ptg_control_start(
+        {},
+        {
+            "run_id": "run_old",
+            "source_file_import_id": "source_import_1",
+            "params": {"test_mode": True, "source_key": "demo_source"},
+        },
+    )
+
+    assert result == {
+        "status": "skipped",
+        "run_id": "run_old",
+        "source_file_import_id": "source_import_1",
+        "current_engine_run_id": "run_current",
+        "reason": "run_canceled",
+    }
+
+
+@pytest.mark.asyncio
+async def test_ptg_control_start_skips_superseded_source_import_run(monkeypatch):
+    async def fake_ptg_main(**_kwargs):
+        raise AssertionError("superseded PTG job should not start scanner")
+
+    async def fake_mark_control_run(*_args, **_kwargs):
+        raise AssertionError("superseded PTG job should not mark run running")
+
+    async def fake_db_first(*_args, **_kwargs):
+        return ("run_new", "queued", "queued")
+
+    monkeypatch.setattr(ptg_control, "ptg_main", fake_ptg_main)
+    monkeypatch.setattr(ptg_control, "mark_control_run", fake_mark_control_run)
+    monkeypatch.setattr(ptg_control.db, "first", fake_db_first)
+
+    result = await ptg_control.ptg_control_start(
+        {},
+        {
+            "run_id": "run_old",
+            "source_file_import_id": "source_import_1",
+            "params": {"test_mode": True, "source_key": "demo_source"},
+        },
+    )
+
+    assert result == {
+        "status": "skipped",
+        "run_id": "run_old",
+        "source_file_import_id": "source_import_1",
+        "current_engine_run_id": "run_new",
+        "reason": "superseded_source_import_run",
+    }
+
+
+@pytest.mark.asyncio
 async def test_ptg_control_start_applies_lane_scanner_env(monkeypatch):
     observed = {}
 

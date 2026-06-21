@@ -8,6 +8,7 @@ import os
 from contextlib import contextmanager
 from typing import Any
 
+from db.models import db
 from process.control_cancel import ImportCancelledError, raise_if_cancelled
 from process.control_lifecycle import (
     _live_progress_heartbeat,
@@ -24,12 +25,20 @@ from process.ptg_parts.config import (
 )
 
 PTG_CONTROL_QUEUE_NAME = "arq:PTG"
+_TERMINAL_RUN_STATUSES = {"succeeded", "failed", "canceled", "cancelled", "dead_letter"}
+_TERMINAL_SOURCE_IMPORT_STATUSES = {"succeeded", "failed", "canceled", "cancelled", "unsupported", "dead_letter"}
 
 
 async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
     payload = task if isinstance(task, dict) else {}
     run_id = str(payload.get("run_id") or "").strip()
     params = payload.get("params") if isinstance(payload.get("params"), dict) else payload
+    source_file_import_id = str(
+        payload.get("source_file_import_id") or params.get("source_file_import_id") or ""
+    ).strip()
+    stale_result = await _stale_ptg_job_result(run_id, source_file_import_id)
+    if stale_result is not None:
+        return stale_result
     heartbeat_task = None
     try:
         await mark_control_run(run_id, status="running", phase_detail="ptg import running", progress_message="running")
@@ -88,6 +97,57 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
     )
     await _flush_terminal_status_events()
     return {**result_metrics, "status": "succeeded", "run_id": run_id}
+
+
+async def _stale_ptg_job_result(run_id: str, source_file_import_id: str) -> dict[str, Any] | None:
+    if not run_id or not source_file_import_id:
+        return None
+    row = await db.first(
+        """
+        SELECT sfi.engine_run_id, sfi.status, ir.status
+          FROM hp_import_control.source_file_import sfi
+          LEFT JOIN mrf.import_run ir ON ir.run_id = :run_id
+         WHERE sfi.source_file_import_id = :source_file_import_id
+         LIMIT 1
+        """,
+        run_id=run_id,
+        source_file_import_id=source_file_import_id,
+    )
+    if row is None:
+        return {
+            "status": "skipped",
+            "run_id": run_id,
+            "source_file_import_id": source_file_import_id,
+            "reason": "source_file_import_missing",
+        }
+    current_engine_run_id = str(row[0] or "").strip()
+    source_status = str(row[1] or "").strip().lower()
+    run_status = str(row[2] or "").strip().lower()
+    if run_status in _TERMINAL_RUN_STATUSES:
+        return {
+            "status": "skipped",
+            "run_id": run_id,
+            "source_file_import_id": source_file_import_id,
+            "current_engine_run_id": current_engine_run_id or None,
+            "reason": f"run_{run_status}",
+        }
+    if current_engine_run_id and current_engine_run_id != run_id:
+        return {
+            "status": "skipped",
+            "run_id": run_id,
+            "source_file_import_id": source_file_import_id,
+            "current_engine_run_id": current_engine_run_id,
+            "reason": "superseded_source_import_run",
+        }
+    if source_status in _TERMINAL_SOURCE_IMPORT_STATUSES:
+        return {
+            "status": "skipped",
+            "run_id": run_id,
+            "source_file_import_id": source_file_import_id,
+            "current_engine_run_id": current_engine_run_id or None,
+            "reason": f"source_import_{source_status}",
+        }
+    return None
 
 
 async def _flush_terminal_status_events() -> None:
