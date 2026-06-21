@@ -240,7 +240,18 @@ async def _status_with_entity_address_tuning(statement: str) -> int | None:
 
     async with db.acquire() as conn:
         for name, value in settings:
-            await conn.status(f"SET LOCAL {name} = {_sql_literal(value)};")
+            try:
+                await conn.status(f"SET LOCAL {name} = {_sql_literal(value)};")
+            except Exception as exc:
+                if "permission denied to set parameter" in str(exc).lower():
+                    logger.warning(
+                        "Skipping unprivileged entity-address SQL setting %s=%s: %s",
+                        name,
+                        value,
+                        exc,
+                    )
+                    continue
+                raise
         rowcount = await conn.status(statement)
         return _coerce_rowcount(rowcount)
 

@@ -1223,6 +1223,42 @@ async def test_entity_address_unified_sql_phase_uses_scoped_bulk_settings(monkey
 
 
 @pytest.mark.asyncio
+async def test_entity_address_unified_sql_phase_skips_unprivileged_bulk_setting(monkeypatch):
+    statements = []
+
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_WORK_MEM", "64MB")
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_TEMP_FILE_LIMIT", "32GB")
+
+    class FakeConn:
+        async def status(self, statement):
+            statements.append(statement)
+            if statement == "SET LOCAL temp_file_limit = '32GB';":
+                raise RuntimeError('permission denied to set parameter "temp_file_limit"')
+            if statement == "UPDATE mrf.entity_address_unified_raw SET address_key = address_key;":
+                return 5
+            return None
+
+    class FakeDB:
+        @asynccontextmanager
+        async def acquire(self):
+            yield FakeConn()
+
+    monkeypatch.setattr(entity_address_unified, "db", FakeDB())
+
+    context = {}
+    rowcount = await entity_address_unified._run_sql_phase(  # pylint: disable=protected-access
+        "UPDATE mrf.entity_address_unified_raw SET address_key = address_key;",
+        context=context,
+        phase="entity-address-unified test phase",
+    )
+
+    assert rowcount == 5
+    assert "SET LOCAL temp_file_limit = '32GB';" in statements
+    assert statements[-1] == "UPDATE mrf.entity_address_unified_raw SET address_key = address_key;"
+    assert context["phase_timings"]["entity-address-unified test phase"]["rows"] == 5
+
+
+@pytest.mark.asyncio
 async def test_entity_address_unified_support_stage_records_bulk_phase_timings(monkeypatch):
     statements = []
     events = []
