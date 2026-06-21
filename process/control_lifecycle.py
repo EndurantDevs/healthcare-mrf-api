@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import asyncio
 import hashlib
+import logging
 import os
 from contextlib import suppress
 from inspect import signature
@@ -17,12 +18,19 @@ from sqlalchemy import func, update
 from db.models import ImportRun, db
 from process.control_cancel import ImportCancelledError
 from process.import_status_events import enqueue_status_event, flush_status_events, isoformat_utc
-from process.live_progress import enqueue_live_progress, reset_live_progress_context, set_live_progress_context
+from process.live_progress import (
+    enqueue_live_progress,
+    progress_payload_from_live,
+    read_live_progress,
+    reset_live_progress_context,
+    set_live_progress_context,
+)
 from process.redis_config import build_redis_settings
 
 
 _TERMINAL_STATUSES = {"succeeded", "failed", "canceled", "cancelled", "dead_letter"}
 _control_run_db_throttle_redis: redis.Redis | None = None
+logger = logging.getLogger(__name__)
 
 
 async def control_single_job_start(
@@ -130,6 +138,10 @@ async def _live_progress_heartbeat(run_id: str, importer: str, target_function: 
     phase = f"{target_function} running"
     while True:
         await asyncio.sleep(interval)
+        try:
+            await _persist_control_run_heartbeat(run_id, target_function)
+        except Exception:
+            logger.debug("Failed to persist live import heartbeat for run %s", run_id, exc_info=True)
         enqueue_live_progress(
             run_id=run_id,
             importer=importer,
@@ -144,6 +156,54 @@ async def _live_progress_heartbeat(run_id: str, importer: str, target_function: 
             source="import-control-heartbeat",
             confidence="heartbeat",
         )
+
+
+async def _persist_control_run_heartbeat(run_id: str, target_function: str) -> None:
+    live = read_live_progress(run_id)
+    now = dt.datetime.now(dt.UTC).replace(tzinfo=None)
+    values = _control_run_heartbeat_update_values(target_function, live, now)
+    blocked_statuses = sorted(_TERMINAL_STATUSES | {"canceling"})
+    stmt = (
+        update(ImportRun)
+        .where(ImportRun.run_id == run_id)
+        .where(ImportRun.status.notin_(blocked_statuses))
+    )
+    await _execute_control_run_update(stmt.values(**values))
+
+
+def _control_run_heartbeat_update_values(
+    target_function: str,
+    live: dict[str, Any] | None,
+    now: dt.datetime,
+) -> dict[str, Any]:
+    fallback_phase = f"{target_function} running"
+    if live:
+        progress_payload = progress_payload_from_live(live) or {
+            "unit": "run",
+            "done": 0,
+            "total": 1,
+            "pct": 0,
+            "message": "running",
+            "phase": fallback_phase,
+        }
+        phase_detail = str(live.get("phase") or progress_payload.get("phase") or fallback_phase)[:128]
+    else:
+        phase_detail = fallback_phase
+        progress_payload = {
+            "unit": "run",
+            "done": 0,
+            "total": 1,
+            "pct": 0,
+            "message": "running",
+            "phase": fallback_phase,
+        }
+    return {
+        "status": "running",
+        "phase_detail": phase_detail,
+        "heartbeat_at": now,
+        "progress": progress_payload,
+        "finished_at": None,
+    }
 
 
 async def _stop_live_progress_heartbeat(task: asyncio.Task | None) -> None:

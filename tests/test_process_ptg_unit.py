@@ -575,6 +575,71 @@ def test_async_rust_scanner_close_suppresses_generator_already_executing(monkeyp
     asyncio.run(run())
 
 
+def test_rust_scanner_progress_line_updates_live_progress(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(ptg_rust_scanner, "write_live_progress", lambda **payload: events.append(payload))
+
+    ptg_rust_scanner._emit_scanner_live_progress(
+        "PTG2_SCANNER_PROGRESS\t"
+        "path=/work/raw/rates.json.gz\t"
+        "compressed_bytes=1048576\t"
+        "total_bytes=2097152\t"
+        "percent=50.00\t"
+        "compressed_mib_s=4.50\t"
+        "elapsed_seconds=10\t"
+        "eta_seconds=10\t"
+        "objects=7\t"
+        "provider_references=2\t"
+        "in_network=5\t"
+        "done=false",
+        phase="compact-serving scanner",
+        live_progress_context={"run_id": "run_ptg", "snapshot_id": "snap_1"},
+    )
+
+    assert events
+    payload = events[0]
+    assert payload["run_id"] == "run_ptg"
+    assert payload["snapshot_id"] == "snap_1"
+    assert payload["phase"] == "compact-serving scanner"
+    assert payload["unit"] == "compressed_bytes"
+    assert payload["done"] == 1048576
+    assert payload["total"] == 2097152
+    assert payload["pct"] == 50.0
+    assert payload["eta_seconds"] == 10.0
+    assert payload["source"] == "ptg2-scanner-progress"
+    assert payload["scanner_objects"] == {"provider_references": 2, "in_network": 5}
+
+
+def test_async_rust_scanner_passes_live_progress_context(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_iter(*_args, **kwargs):
+        captured.update(kwargs)
+        return iter(())
+
+    monkeypatch.setattr(ptg_rust_scanner, "_iter_compact_serving_records_rust", fake_iter)
+
+    async def run():
+        token = ptg_live_progress.set_live_progress_context(run_id="run_ptg", snapshot_id="snap_1")
+        try:
+            async for _record in ptg_rust_scanner._aiter_compact_serving_records_rust(
+                tmp_path / "rates.json.gz",
+                snapshot_id="snap",
+                plan_id="plan",
+                plan_month_id="month",
+                source_trace_set_hash="trace",
+            ):
+                pass
+        finally:
+            ptg_live_progress.reset_live_progress_context(token)
+
+    asyncio.run(run())
+
+    assert captured["live_progress_context"]["run_id"] == "run_ptg"
+    assert captured["live_progress_context"]["snapshot_id"] == "snap_1"
+
+
 def test_rust_stage_split_keeps_facade_helpers_stable():
     assert process_ptg.PTG2_SERVING_STAGE_LANE_PREFIX == ptg_rust_stage.PTG2_SERVING_STAGE_LANE_PREFIX
     assert process_ptg._RUST_COPY_TABLE_SPECS is ptg_rust_stage._RUST_COPY_TABLE_SPECS

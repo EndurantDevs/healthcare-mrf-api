@@ -34,9 +34,23 @@ from process.ptg_parts.config import (
     _env_int,
 )
 from process.ptg_parts.domain import PTG2_CONFIDENCE_TIC_RATE_NPI_TIN
+from process.ptg_parts.live_progress import current_live_progress_context, write_live_progress
 from process.ptg_parts.screen import _emit_screen_line
 
 logger = logging.getLogger(__name__)
+
+_SCANNER_PROGRESS_PREFIX = "PTG2_SCANNER_PROGRESS\t"
+_SCANNER_PROGRESS_BASE_KEYS = {
+    "path",
+    "compressed_bytes",
+    "total_bytes",
+    "percent",
+    "compressed_mib_s",
+    "elapsed_seconds",
+    "eta_seconds",
+    "objects",
+    "done",
+}
 
 
 def _ptg2_scanner_binary_profile(path: Path) -> str:
@@ -102,9 +116,101 @@ def _scanner_error_message(prefix: str, return_code: int, stderr_tail: list[str]
     return f"{prefix} failed with exit code {return_code}: {chr(10).join(stderr_tail)[-1000:]}"
 
 
+def _scanner_progress_fields(line: str) -> dict[str, str] | None:
+    if not line.startswith(_SCANNER_PROGRESS_PREFIX):
+        return None
+    fields: dict[str, str] = {}
+    for part in line[len(_SCANNER_PROGRESS_PREFIX):].split("\t"):
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        key = key.strip()
+        if key:
+            fields[key] = value.strip()
+    return fields
+
+
+def _coerce_progress_int(value: Any) -> int | None:
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_progress_float(value: Any) -> float | None:
+    try:
+        return float(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_progress_mib(value: int | None) -> str:
+    if value is None:
+        return "unknown"
+    return f"{value / (1024 ** 2):.1f} MiB"
+
+
+def _emit_scanner_live_progress(
+    line: str,
+    *,
+    phase: str,
+    live_progress_context: dict[str, Any] | None = None,
+) -> None:
+    fields = _scanner_progress_fields(line)
+    if not fields:
+        return
+    compressed_bytes = _coerce_progress_int(fields.get("compressed_bytes"))
+    total_bytes = _coerce_progress_int(fields.get("total_bytes"))
+    percent = _coerce_progress_float(fields.get("percent"))
+    eta_seconds = _coerce_progress_float(fields.get("eta_seconds"))
+    elapsed_seconds = _coerce_progress_float(fields.get("elapsed_seconds"))
+    compressed_mib_s = _coerce_progress_float(fields.get("compressed_mib_s"))
+    object_count = _coerce_progress_int(fields.get("objects"))
+    scanner_objects = {
+        key: count
+        for key, value in fields.items()
+        if key not in _SCANNER_PROGRESS_BASE_KEYS and (count := _coerce_progress_int(value)) is not None
+    }
+    context = {
+        key: value
+        for key, value in (live_progress_context or {}).items()
+        if value not in (None, "")
+    }
+    message_parts = [
+        f"{phase} {percent:.2f}%" if percent is not None else phase,
+        f"read {_format_progress_mib(compressed_bytes)} of {_format_progress_mib(total_bytes)}",
+    ]
+    if object_count is not None:
+        message_parts.append(f"objects={object_count}")
+    if compressed_mib_s is not None:
+        message_parts.append(f"{compressed_mib_s:.2f} MiB/s")
+    payload: dict[str, Any] = {
+        **context,
+        "phase": phase,
+        "unit": "compressed_bytes",
+        "done": compressed_bytes,
+        "total": total_bytes,
+        "pct": percent,
+        "eta_seconds": eta_seconds,
+        "elapsed_seconds": elapsed_seconds,
+        "message": ", ".join(message_parts),
+        "source": "ptg2-scanner-progress",
+        "confidence": "live",
+        "scanner_path": fields.get("path"),
+        "scanner_done": str(fields.get("done") or "").lower() == "true",
+        "scanner_objects": scanner_objects or None,
+    }
+    try:
+        write_live_progress(**payload)
+    except Exception:
+        logger.debug("Failed to write PTG2 scanner live progress", exc_info=True)
+
+
 def _iter_top_level_object_bytes_rust(
     path: str | Path,
     array_names: set[str],
+    *,
+    live_progress_context: dict[str, Any] | None = None,
 ):
     binary = _ptg2_rust_scanner_binary()
     if binary is None:
@@ -113,6 +219,8 @@ def _iter_top_level_object_bytes_rust(
             "build it with `cargo build --release --manifest-path support/ptg2_scanner/Cargo.toml`"
         )
     _log_ptg2_rust_scanner_binary(binary)
+    if live_progress_context is None:
+        live_progress_context = current_live_progress_context()
     process = subprocess.Popen(
         [str(binary), str(path), *sorted(array_names)],
         stdout=subprocess.PIPE,
@@ -132,9 +240,14 @@ def _iter_top_level_object_bytes_rust(
                 stderr_tail.append(line)
                 if len(stderr_tail) > 20:
                     del stderr_tail[:-20]
-                if line.startswith("PTG2_SCANNER_PROGRESS\t"):
+                if line.startswith(_SCANNER_PROGRESS_PREFIX):
                     _emit_screen_line(line)
                     logger.info(line)
+                    _emit_scanner_live_progress(
+                        line,
+                        phase="PTG scanner",
+                        live_progress_context=live_progress_context,
+                    )
                 else:
                     logger.warning("PTG2 Rust scanner stderr: %s", line)
 
@@ -203,6 +316,7 @@ def _iter_compact_serving_records_rust(
     manifest_price_atom_copy_path: str | Path | None = None,
     manifest_provider_group_member_copy_path: str | Path | None = None,
     manifest_only: bool | None = None,
+    live_progress_context: dict[str, Any] | None = None,
 ):
     binary = _ptg2_rust_scanner_binary()
     if binary is None:
@@ -211,6 +325,8 @@ def _iter_compact_serving_records_rust(
             "build it with `cargo build --release --manifest-path support/ptg2_scanner/Cargo.toml`"
         )
     _log_ptg2_rust_scanner_binary(binary)
+    if live_progress_context is None:
+        live_progress_context = current_live_progress_context()
     env = {
         **os.environ,
         "HLTHPRT_PTG2_COMPACT_SNAPSHOT_ID": snapshot_id,
@@ -280,12 +396,18 @@ def _iter_compact_serving_records_rust(
                 if len(stderr_tail) > 20:
                     del stderr_tail[:-20]
                 if (
-                    line.startswith("PTG2_SCANNER_PROGRESS\t")
+                    line.startswith(_SCANNER_PROGRESS_PREFIX)
                     or line.startswith("PTG2_DEDUPE_SUMMARY\t")
                     or line.startswith("PTG2_SCANNER_WORKER_FAILED\t")
                 ):
                     _emit_screen_line(line)
                     logger.info(line)
+                    if line.startswith(_SCANNER_PROGRESS_PREFIX):
+                        _emit_scanner_live_progress(
+                            line,
+                            phase="compact-serving scanner",
+                            live_progress_context=live_progress_context,
+                        )
                 else:
                     logger.warning("PTG2 Rust compact scanner stderr: %s", line)
 
@@ -355,6 +477,7 @@ async def _aiter_compact_serving_records_rust(
     manifest_provider_group_member_copy_path: str | Path | None = None,
     manifest_only: bool | None = None,
 ):
+    live_progress_context = current_live_progress_context()
     iterator = _iter_compact_serving_records_rust(
         path,
         snapshot_id=snapshot_id,
@@ -380,6 +503,7 @@ async def _aiter_compact_serving_records_rust(
         manifest_price_atom_copy_path=manifest_price_atom_copy_path,
         manifest_provider_group_member_copy_path=manifest_provider_group_member_copy_path,
         manifest_only=manifest_only,
+        live_progress_context=live_progress_context,
     )
     event_queue: queue.Queue[Any] = queue.Queue(
         maxsize=max(_env_int(PTG2_RUST_EVENT_QUEUE_ENV, PTG2_DEFAULT_RUST_EVENT_QUEUE), 1)

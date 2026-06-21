@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import asyncio
+import datetime as dt
 
 import pytest
 
@@ -271,6 +272,37 @@ async def test_mark_control_run_throttles_repeated_running_db_update(monkeypatch
     assert live_events[-1]["run_id"] == "run_1"
     assert live_events[-1]["status"] == "running"
     assert status_events[-1]["phase_detail"] == "mrf provider jobs running"
+
+
+def test_control_run_heartbeat_update_values_prefers_live_progress():
+    now = dt.datetime(2026, 6, 21, 12, 0, 0)
+    values = control_lifecycle._control_run_heartbeat_update_values(
+        "process_data",
+        {
+            "phase": "compact-serving scanner",
+            "unit": "compressed_bytes",
+            "done": 1048576,
+            "total": 2097152,
+            "pct": 50,
+            "message": "compact-serving scanner 50.00%",
+            "updated_at": "2026-06-21T12:00:00Z",
+        },
+        now,
+    )
+
+    assert values["status"] == "running"
+    assert values["phase_detail"] == "compact-serving scanner"
+    assert values["heartbeat_at"] == now
+    assert values["finished_at"] is None
+    assert values["progress"] == {
+        "unit": "compressed_bytes",
+        "done": 1048576,
+        "total": 2097152,
+        "pct": 50,
+        "message": "compact-serving scanner 50.00%",
+        "phase": "compact-serving scanner",
+        "updated_at": "2026-06-21T12:00:00Z",
+    }
 
 
 @pytest.mark.asyncio
