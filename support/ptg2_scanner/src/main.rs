@@ -427,6 +427,36 @@ impl CopyPathConfig {
             manifest_only: self.manifest_only,
         }
     }
+
+    fn for_provider_refs(&self) -> Self {
+        let suffix = ".provider_refs";
+        Self {
+            compact: None,
+            manifest_serving: None,
+            manifest_provider_forward_sidecar: None,
+            manifest_provider_inverted_sidecar: None,
+            manifest_provider_npi_sidecar: None,
+            manifest_price_forward_sidecar: None,
+            manifest_price_atom: None,
+            manifest_provider_group_member: self
+                .manifest_provider_group_member
+                .as_ref()
+                .map(|path| format!("{path}{suffix}")),
+            procedure: None,
+            price_code_set: None,
+            price_atom: None,
+            price_set_entry: None,
+            provider_set: None,
+            provider_set_component: None,
+            provider_set_entry: None,
+            provider_entry_component: None,
+            provider_group_member: self
+                .provider_group_member
+                .as_ref()
+                .map(|path| format!("{path}{suffix}")),
+            manifest_only: self.manifest_only,
+        }
+    }
 }
 
 fn env_path(name: &str) -> Option<String> {
@@ -2708,7 +2738,6 @@ struct CompactContext {
 }
 
 enum WorkerJob {
-    ProviderRefs(Vec<Value>),
     Rates {
         procedure: Map<String, Value>,
         rates: Vec<RateLite>,
@@ -2739,22 +2768,10 @@ impl RawChunkStats {
 impl WorkerJob {
     fn name(&self) -> &'static str {
         match self {
-            WorkerJob::ProviderRefs(_) => "provider refs",
             WorkerJob::Rates { .. } => "rates",
             WorkerJob::RawRates { .. } => "raw rates",
         }
     }
-}
-
-fn process_provider_refs_worker(
-    refs: &[Value],
-    dictionary_copy_sinks: &mut DictionaryCopySinks,
-    dedupe: &SharedDedupe,
-) -> io::Result<()> {
-    for provider_ref in refs {
-        dictionary_copy_sinks.write_provider_group_members_shared(provider_ref, dedupe)?;
-    }
-    Ok(())
 }
 
 struct SharedCompactState<'a, W: Write> {
@@ -3520,9 +3537,6 @@ fn compact_worker_loop(
 
     for job in rx.iter() {
         match job {
-            WorkerJob::ProviderRefs(refs) => {
-                process_provider_refs_worker(&refs, &mut dictionary_copy_sinks, &config.dedupe)?;
-            }
             WorkerJob::Rates { procedure, rates } => {
                 let procedure_value = Value::Object(procedure);
                 let mut state = SharedCompactState {
@@ -3627,8 +3641,6 @@ fn scan_compact_struson_parallel(
     let mut object_counts: HashMap<String, u64> = HashMap::new();
     let started_at = Instant::now();
     let mut provider_map: HashMap<String, ProviderEntry> = HashMap::new();
-    let mut provider_ref_jobs: Vec<Vec<Value>> = Vec::new();
-    let mut provider_ref_chunk: Vec<Value> = Vec::with_capacity(1024);
     let negotiated_rate_chunk_size = split_interval(
         "HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES",
         DEFAULT_SPLIT_NEGOTIATED_RATES,
@@ -3679,6 +3691,12 @@ fn scan_compact_struson_parallel(
         let name = json_reader.next_name_owned().map_err(to_io_error)?;
         match name.as_str() {
             "provider_references" => {
+                let provider_ref_paths = copy_paths.for_provider_refs();
+                let mut provider_ref_copy_sinks = DictionaryCopySinks::from_paths(
+                    &provider_ref_paths,
+                    compact_copy_rotate_bytes,
+                )?;
+                let mut provider_refs_since_rotate = 0usize;
                 json_reader.begin_array().map_err(to_io_error)?;
                 while json_reader.has_next().map_err(to_io_error)? {
                     let value: Value = json_reader.deserialize_next().map_err(to_io_error)?;
@@ -3686,13 +3704,15 @@ fn scan_compact_struson_parallel(
                         if let (Some(key), Some(entry)) =
                             (provider_ref_key(key_value), build_provider_entry(&value))
                         {
+                            provider_ref_copy_sinks
+                                .write_provider_group_members_shared(&value, &dedupe)?;
                             provider_map.insert(key, entry);
-                            provider_ref_chunk.push(value);
-                            if provider_ref_chunk.len() >= 1024 {
-                                provider_ref_jobs.push(std::mem::replace(
-                                    &mut provider_ref_chunk,
-                                    Vec::with_capacity(1024),
-                                ));
+                            provider_refs_since_rotate += 1;
+                            if provider_refs_since_rotate >= 1024 {
+                                for event in provider_ref_copy_sinks.maybe_rotate_silent()? {
+                                    emit_copy_file_event(&mut writer, &event)?;
+                                }
+                                provider_refs_since_rotate = 0;
                             }
                         }
                     }
@@ -3701,9 +3721,10 @@ fn scan_compact_struson_parallel(
                         .or_insert(0) += 1;
                 }
                 json_reader.end_array().map_err(to_io_error)?;
-                if !provider_ref_chunk.is_empty() {
-                    provider_ref_jobs.push(std::mem::take(&mut provider_ref_chunk));
+                for event in provider_ref_copy_sinks.finish_silent()? {
+                    emit_copy_file_event(&mut writer, &event)?;
                 }
+                writer.flush()?;
 
                 let provider_map = Arc::new(provider_map);
                 let mut handles = Vec::with_capacity(worker_count);
@@ -3751,16 +3772,6 @@ fn scan_compact_struson_parallel(
                     ));
                 }
                 drop(rx);
-
-                for refs in provider_ref_jobs.drain(..) {
-                    send_worker_job(
-                        &tx,
-                        &event_rx,
-                        &mut writer,
-                        &mut producer_blocked_micros,
-                        WorkerJob::ProviderRefs(refs),
-                    )?;
-                }
 
                 while json_reader.has_next().map_err(to_io_error)? {
                     let name = json_reader.next_name_owned().map_err(to_io_error)?;
@@ -4435,6 +4446,84 @@ mod tests {
         assert!(sinks.provider_set_entry.is_some());
         drop(sinks);
         let _ = std::fs::remove_file(provider_set_entry_path);
+    }
+
+    #[test]
+    fn provider_reference_copy_sinks_are_suffix_isolated() {
+        let base = std::env::temp_dir().join(format!(
+            "ptg2-provider-ref-copy-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&base);
+        let manifest_member_path = base.join("manifest-provider-group-member.copy");
+        let member_path = base.join("provider-group-member.copy");
+        let paths = CopyPathConfig {
+            compact: Some(
+                base.join("unused-compact.copy")
+                    .to_string_lossy()
+                    .to_string(),
+            ),
+            manifest_serving: Some(
+                base.join("unused-serving.copy")
+                    .to_string_lossy()
+                    .to_string(),
+            ),
+            manifest_provider_forward_sidecar: None,
+            manifest_provider_inverted_sidecar: None,
+            manifest_provider_npi_sidecar: None,
+            manifest_price_forward_sidecar: None,
+            manifest_price_atom: Some(base.join("unused-price.copy").to_string_lossy().to_string()),
+            manifest_provider_group_member: Some(
+                manifest_member_path.to_string_lossy().to_string(),
+            ),
+            procedure: Some(
+                base.join("unused-procedure.copy")
+                    .to_string_lossy()
+                    .to_string(),
+            ),
+            price_code_set: None,
+            price_atom: None,
+            price_set_entry: None,
+            provider_set: None,
+            provider_set_component: None,
+            provider_set_entry: None,
+            provider_entry_component: None,
+            provider_group_member: Some(member_path.to_string_lossy().to_string()),
+            manifest_only: true,
+        };
+
+        let provider_ref_paths = paths.for_provider_refs();
+        let mut sinks = DictionaryCopySinks::from_paths(&provider_ref_paths, 0).unwrap();
+        let dedupe = SharedDedupe::new(1);
+        let provider_ref = json!({
+            "provider_groups": [{
+                "tin": {"type": "ein", "value": "123456789"},
+                "npi": [1234567890, 1234567891]
+            }]
+        });
+
+        sinks
+            .write_provider_group_members_shared(&provider_ref, &dedupe)
+            .unwrap();
+        let events = sinks.finish_silent().unwrap();
+
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|event| {
+            event.path.ends_with(".provider_refs")
+                && event.row_count == 2
+                && matches!(
+                    event.record_kind.as_str(),
+                    "manifest_provider_group_member_copy_file" | "provider_group_member_copy_file"
+                )
+        }));
+        assert!(manifest_member_path
+            .with_extension("copy.provider_refs")
+            .exists());
+        assert!(member_path.with_extension("copy.provider_refs").exists());
+        assert!(!manifest_member_path.exists());
+        assert!(!member_path.exists());
+
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]
