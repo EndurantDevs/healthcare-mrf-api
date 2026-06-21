@@ -3083,6 +3083,130 @@ def test_ptg2_rust_parse_in_workers_matches_default_on_large_in_network_chunk(tm
     assert "producer_blocked_micros" in worker_summary
 
 
+def test_ptg2_rust_top_level_byte_scan_matches_default_compact_output(tmp_path):
+    binary = process_ptg._ptg2_rust_scanner_binary()
+    if binary is None:
+        pytest.skip("PTG2 Rust scanner binary is not built")
+
+    artifact = tmp_path / "rates.json.gz"
+    payload = {
+        "provider_references": [
+            {
+                "provider_group_id": 7,
+                "provider_groups": [{"npi": [1234567890], "tin": {"type": "ein", "value": "12-3456789"}}],
+            },
+            {
+                "provider_group_id": "8",
+                "provider_groups": [{"npi": [1234567891], "tin": {"type": "npi", "value": "1234567891"}}],
+            },
+        ],
+        "in_network": [
+            {
+                "billing_code_type": "CPT",
+                "billing_code": "99213",
+                "negotiated_rates": [
+                    {
+                        "provider_references": [7],
+                        "negotiated_prices": [{"negotiated_type": "negotiated", "negotiated_rate": 100}],
+                    },
+                    {
+                        "provider_references": [8],
+                        "negotiated_prices": [{"negotiated_type": "negotiated", "negotiated_rate": 125}],
+                    },
+                ],
+            },
+            {
+                "billing_code_type": "CPT",
+                "billing_code": "99214",
+                "negotiated_rates": [
+                    {
+                        "provider_references": [7, 8],
+                        "negotiated_prices": [{"negotiated_type": "negotiated", "negotiated_rate": 200}],
+                    }
+                ],
+            },
+        ],
+    }
+    with gzip.open(artifact, "wb") as fp:
+        fp.write(json.dumps(payload).encode("utf-8"))
+
+    def run_scanner(name: str, top_level_byte_scan: bool):
+        run_dir = tmp_path / name
+        run_dir.mkdir()
+        serving_copy = run_dir / "manifest_serving.copy"
+        price_atom_copy = run_dir / "price_atom.copy"
+        provider_group_member_copy = run_dir / "provider_group_member.copy"
+        env = {
+            **os.environ,
+            "HLTHPRT_PTG2_COMPACT_SNAPSHOT_ID": "snapshot",
+            "HLTHPRT_PTG2_COMPACT_PLAN_ID": "plan",
+            "HLTHPRT_PTG2_COMPACT_PLAN_MONTH_ID": "plan-month",
+            "HLTHPRT_PTG2_COMPACT_SOURCE_TRACE_SET_HASH": "source-trace",
+            "HLTHPRT_PTG2_MANIFEST_SERVING_COPY_PATH": str(serving_copy),
+            "HLTHPRT_PTG2_MANIFEST_PRICE_ATOM_COPY_PATH": str(price_atom_copy),
+            "HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_MEMBER_COPY_PATH": str(provider_group_member_copy),
+            "HLTHPRT_PTG2_MANIFEST_ONLY": "true",
+            "HLTHPRT_PTG2_RUST_WORKERS": "2",
+            "HLTHPRT_PTG2_RUST_WORK_QUEUE": "2",
+            "HLTHPRT_PTG2_RUST_PROVIDER_REF_WORKERS": "2",
+            "HLTHPRT_PTG2_RUST_PROVIDER_REF_QUEUE": "2",
+            "HLTHPRT_PTG2_RUST_PROVIDER_REF_CHUNK_ITEMS": "1",
+            "HLTHPRT_PTG2_RUST_PROVIDER_REF_RAW_CHUNK_BYTES": "1",
+            "HLTHPRT_PTG2_RUST_TOP_LEVEL_BYTE_SCAN": "true" if top_level_byte_scan else "false",
+        }
+        completed = subprocess.run(
+            [str(binary), "--compact-serving", str(artifact)],
+            check=True,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        frames = []
+        stream = io.BytesIO(completed.stdout)
+        while True:
+            header = stream.readline()
+            if not header:
+                break
+            name, size = header.rstrip(b"\n").split(b"\t", 1)
+            payload_bytes = stream.read(int(size))
+            assert stream.read(1) == b"\n"
+            frames.append((name.decode("utf-8"), json.loads(payload_bytes)))
+        copy_rows = {
+            "serving": sorted(
+                line
+                for path in run_dir.glob("manifest_serving.copy*")
+                for line in path.read_text().splitlines()
+            ),
+            "price_atom": sorted(
+                line
+                for path in run_dir.glob("price_atom.copy*")
+                for line in path.read_text().splitlines()
+            ),
+            "provider_group_member": sorted(
+                line
+                for path in run_dir.glob("provider_group_member.copy*")
+                for line in path.read_text().splitlines()
+            ),
+        }
+        return frames, copy_rows
+
+    default_frames, default_rows = run_scanner("default", False)
+    top_level_frames, top_level_rows = run_scanner("top-level", True)
+
+    assert top_level_rows == default_rows
+    assert len(top_level_rows["serving"]) == 3
+    assert len(top_level_rows["price_atom"]) == 3
+    assert len(top_level_rows["provider_group_member"]) == 2
+    default_summary = [row for kind, row in default_frames if kind == "scanner_summary"][0]
+    top_level_config = [row for kind, row in top_level_frames if kind == "scanner_config"][0]
+    top_level_summary = [row for kind, row in top_level_frames if kind == "scanner_summary"][0]
+    assert "top_level_byte_scan" not in default_summary
+    assert top_level_config["top_level_byte_scan"] is True
+    assert top_level_summary["top_level_byte_scan"] is True
+    assert top_level_summary["provider_ref_raw_chunk_count"] == 2
+    assert top_level_summary["provider_refs_seconds"] >= 0
+
+
 def test_ptg2_rust_compact_price_sets_emit_normalized_membership(tmp_path):
     binary = process_ptg._ptg2_rust_scanner_binary()
     if binary is None:
