@@ -682,9 +682,11 @@ fn build_provider_entry(provider_ref: &Value, collect_npis: bool) -> Option<Prov
     }
     group_hashes.sort_unstable();
     group_hashes.dedup();
+    group_hashes.shrink_to_fit();
     if collect_npis {
         provider_npis.sort_unstable();
         provider_npis.dedup();
+        provider_npis.shrink_to_fit();
     }
     let entry_hash = if build_provider_set_payload {
         provider_set_checksum_from_group_payloads(group_payload_jsons)
@@ -3929,6 +3931,7 @@ fn scan_compact_struson_parallel(
             "split_negotiated_rates": negotiated_rate_chunk_size,
             "raw_chunk_bytes": raw_chunk_byte_limit,
             "parse_in_workers": parse_in_workers,
+            "provider_npi_sidecar": copy_paths.manifest_provider_npi_sidecar.is_some(),
             "panic_strategy": "unwind",
         }),
     )?;
@@ -3940,6 +3943,7 @@ fn scan_compact_struson_parallel(
         match name.as_str() {
             "provider_references" => {
                 let provider_ref_paths = copy_paths.for_provider_refs();
+                let collect_provider_npis = copy_paths.manifest_provider_npi_sidecar.is_some();
                 let mut provider_ref_copy_sinks = DictionaryCopySinks::from_paths(
                     &provider_ref_paths,
                     compact_copy_rotate_bytes,
@@ -3951,7 +3955,7 @@ fn scan_compact_struson_parallel(
                     if let Some(key_value) = value.get("provider_group_id") {
                         if let (Some(key), Some(entry)) = (
                             provider_ref_key(key_value),
-                            build_provider_entry(&value, manifest_sidecars.is_some()),
+                            build_provider_entry(&value, collect_provider_npis),
                         ) {
                             provider_ref_copy_sinks
                                 .write_provider_group_members_shared(&value, &dedupe)?;
@@ -4298,13 +4302,14 @@ fn scan_compact_struson(path: &Path) -> io::Result<()> {
         let name = json_reader.next_name_owned().map_err(to_io_error)?;
         match name.as_str() {
             "provider_references" => {
+                let collect_provider_npis = copy_paths.manifest_provider_npi_sidecar.is_some();
                 json_reader.begin_array().map_err(to_io_error)?;
                 while json_reader.has_next().map_err(to_io_error)? {
                     let value: Value = json_reader.deserialize_next().map_err(to_io_error)?;
                     if let Some(key_value) = value.get("provider_group_id") {
                         if let (Some(key), Some(entry)) = (
                             provider_ref_key(key_value),
-                            build_provider_entry(&value, manifest_sidecars.is_some()),
+                            build_provider_entry(&value, collect_provider_npis),
                         ) {
                             dictionary_copy_sinks.write_provider_group_members(
                                 &value,
