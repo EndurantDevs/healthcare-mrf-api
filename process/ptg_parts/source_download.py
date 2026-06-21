@@ -67,6 +67,25 @@ _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _MAX_REDIRECTS = 10
 
 
+def _expected_gzip_artifact(url: str, path: str | Path) -> bool:
+    url_suffixes = {suffix.lower() for suffix in Path(urlsplit(url).path).suffixes}
+    return ".gz" in url_suffixes or Path(path).suffix.lower() == ".gz"
+
+
+def _gzip_magic_error(url: str, path: str | Path) -> str | None:
+    if not _expected_gzip_artifact(url, path):
+        return None
+    artifact_path = Path(path)
+    try:
+        with artifact_path.open("rb") as fp:
+            magic = fp.read(2)
+    except OSError as exc:
+        return f"raw gzip artifact is not readable: {exc}"
+    if magic != b"\x1f\x8b":
+        return f"raw artifact for gzip URL does not have a gzip header: {artifact_path}"
+    return None
+
+
 async def _open_validated_request(
     session: aiohttp.ClientSession,
     method: str,
@@ -354,6 +373,7 @@ async def download_raw_artifact(
             raw_path = store.path_from_uri(raw_uri)
             expected = candidate.get("raw_sha256") or candidate.get("sha256")
             actual, byte_count = sha256_file(raw_path)
+            magic_error = _gzip_magic_error(url, raw_path)
             if expected and actual != expected:
                 store.record_manifest(
                     {
@@ -363,6 +383,18 @@ async def download_raw_artifact(
                         "raw_sha256": expected,
                         "status": "corrupt",
                         "actual_sha256": actual,
+                    }
+                )
+            elif magic_error:
+                store.record_manifest(
+                    {
+                        "artifact_kind": PTG2_ARTIFACT_RAW,
+                        "canonical_url": canonical_url,
+                        "raw_storage_uri": raw_uri,
+                        "raw_sha256": expected or actual,
+                        "status": "corrupt",
+                        "actual_sha256": actual,
+                        "error": magic_error,
                     }
                 )
             else:
@@ -524,6 +556,23 @@ async def download_raw_artifact(
         actual_sha, actual_size = sha256_file(final_path)
         if actual_sha != raw_sha:
             raise RuntimeError(f"Checksum verification failed for {final_path}")
+        magic_error = _gzip_magic_error(url, final_path)
+        if magic_error:
+            raw_uri = store.storage_uri(final_path)
+            store.record_manifest(
+                {
+                    "artifact_kind": PTG2_ARTIFACT_RAW,
+                    "canonical_url": canonical_url,
+                    "raw_storage_uri": raw_uri,
+                    "raw_sha256": actual_sha,
+                    "sha256": actual_sha,
+                    "status": "corrupt",
+                    "actual_sha256": actual_sha,
+                    "error": magic_error,
+                }
+            )
+            final_path.unlink(missing_ok=True)
+            raise RuntimeError(magic_error)
         _emit_download_progress(
             url=url,
             bytes_read=actual_size,

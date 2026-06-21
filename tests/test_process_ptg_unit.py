@@ -1326,6 +1326,88 @@ def test_ptg2_artifact_reuse_by_strong_etag_and_length(tmp_path):
     assert mode == "strong_etag_length"
 
 
+def test_ptg2_artifact_reuse_skips_missing_metadata_candidate(tmp_path):
+    missing_path = tmp_path / "missing.json.gz"
+    store = process_ptg.PTG2ArtifactStore(tmp_path / "store")
+    candidate = {
+        "artifact_kind": process_ptg.PTG2_ARTIFACT_RAW,
+        "canonical_url": "https://example.test/raw.json.gz",
+        "raw_storage_uri": missing_path.resolve().as_uri(),
+        "raw_sha256": "0" * 64,
+        "content_length": 1024,
+        "etag": '"strong"',
+        "status": "available",
+    }
+    head = process_ptg.PTG2HeadMetadata(
+        url="https://example.test/raw.json.gz",
+        status=200,
+        etag='"strong"',
+        content_length=1024,
+        supports_head=True,
+    )
+
+    reused, mode = process_ptg.choose_reusable_raw_artifact([candidate], head, store=store)
+
+    assert reused is None
+    assert mode is None
+
+
+def test_download_raw_artifact_redownloads_bad_gzip_reuse_candidate(monkeypatch, tmp_path):
+    payload = gzip.compress(b'{"ok": true}')
+    bad_path = tmp_path / "bad.json.gz"
+    bad_path.write_bytes(b"\0\0" + b"x" * (len(payload) - 2))
+    bad_sha, bad_size = process_ptg.sha256_file(bad_path)
+    store = process_ptg.PTG2ArtifactStore(tmp_path / "store")
+
+    async def handle(request):
+        if request.method == "HEAD":
+            return web.Response(
+                headers={
+                    "Content-Length": str(len(payload)),
+                    "ETag": '"reuse-test"',
+                }
+            )
+        return web.Response(body=payload, headers={"Content-Length": str(len(payload))})
+
+    async def run_download():
+        app = web.Application()
+        app.router.add_route("*", "/raw.json.gz", handle)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        url = f"http://127.0.0.1:{port}/raw.json.gz"
+        store.record_manifest(
+            {
+                "artifact_kind": process_ptg.PTG2_ARTIFACT_RAW,
+                "canonical_url": process_ptg.canonicalize_url(url),
+                "raw_storage_uri": bad_path.resolve().as_uri(),
+                "raw_sha256": bad_sha,
+                "sha256": bad_sha,
+                "content_length": len(payload),
+                "byte_count": bad_size,
+                "etag": '"reuse-test"',
+                "status": "available",
+            }
+        )
+        try:
+            return await process_ptg.download_raw_artifact(url, store=store)
+        finally:
+            await runner.cleanup()
+
+    monkeypatch.setenv("HLTHPRT_FETCH_ALLOW_LOCAL", "true")
+    monkeypatch.setenv(process_ptg.PTG2_RANGE_DOWNLOADS_ENV, "false")
+
+    artifact = asyncio.run(run_download())
+    manifest_lines = (tmp_path / "store" / "manifest.jsonl").read_text(encoding="utf-8").splitlines()
+
+    assert artifact.reused is False
+    assert Path(artifact.raw_path).read_bytes() == payload
+    assert any('"status": "corrupt"' in line for line in manifest_lines)
+    assert any('"status": "available"' in line and artifact.raw_sha256 in line for line in manifest_lines)
+
+
 def test_ptg2_range_download_assembles_artifact(monkeypatch, tmp_path):
     payload = (b"0123456789abcdef" * 1024 * 1024)[:3 * 1024 * 1024]
     requests = []

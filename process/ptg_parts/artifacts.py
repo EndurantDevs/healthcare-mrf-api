@@ -166,8 +166,22 @@ def choose_reusable_raw_artifact(
     store: PTG2ArtifactStore | None = None,
     reuse_policy: str = "metadata_or_hash",
 ) -> tuple[dict[str, Any] | None, str | None]:
+    candidates = [
+        candidate
+        for candidate in candidates
+        if candidate.get("status") in (None, "", "available")
+    ]
     if not candidates:
         return None, None
+
+    def raw_exists(candidate: dict[str, Any]) -> bool:
+        if store is None:
+            return True
+        raw_uri = candidate.get("raw_storage_uri") or candidate.get("storage_uri")
+        if not raw_uri:
+            return False
+        return store.path_from_uri(raw_uri).exists()
+
     if head is not None:
         for candidate in reversed(candidates):
             same_length = (
@@ -175,7 +189,12 @@ def choose_reusable_raw_artifact(
                 and candidate.get("content_length") is not None
                 and int(candidate["content_length"]) == int(head.content_length)
             )
-            if same_length and _is_strong_etag(head.etag) and candidate.get("etag") == head.etag:
+            if (
+                same_length
+                and _is_strong_etag(head.etag)
+                and candidate.get("etag") == head.etag
+                and raw_exists(candidate)
+            ):
                 return candidate, "strong_etag_length"
         if reuse_policy in {"metadata", "metadata_or_hash"}:
             for candidate in reversed(candidates):
@@ -185,7 +204,7 @@ def choose_reusable_raw_artifact(
                     and int(candidate["content_length"]) == int(head.content_length)
                 )
                 same_modified = bool(head.last_modified and candidate.get("last_modified") == head.last_modified)
-                if same_length and same_modified:
+                if same_length and same_modified and raw_exists(candidate):
                     return candidate, "length_last_modified"
     if store is not None and reuse_policy in {"hash", "metadata_or_hash"}:
         for candidate in reversed(candidates):
