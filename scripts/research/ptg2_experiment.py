@@ -249,10 +249,33 @@ def read_proc_status(status_path: Path) -> dict[str, int]:
     return metrics
 
 
+def parse_ps_memory(output: str) -> dict[str, int]:
+    parts = output.strip().split()
+    if len(parts) < 2:
+        return {}
+    try:
+        return {"vmrss_kb": int(parts[0]), "vmsize_kb": int(parts[1])}
+    except ValueError:
+        return {}
+
+
+def read_ps_memory(pid: int) -> dict[str, int]:
+    completed = subprocess.run(
+        ["ps", "-o", "rss=", "-o", "vsz=", "-p", str(pid)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        return {}
+    return parse_ps_memory(completed.stdout)
+
+
 class ProcSampler:
     def __init__(self, proc_root: Path | str = "/proc") -> None:
         self.proc_root = Path(proc_root)
         self.samples = 0
+        self.sampler = "proc_status"
         self.peak_rss_kb: int | None = None
         self.peak_hwm_kb: int | None = None
         self.peak_vmsize_kb: int | None = None
@@ -260,7 +283,10 @@ class ProcSampler:
     def sample(self, pid: int) -> None:
         status = read_proc_status(self.proc_root / str(pid) / "status")
         if not status:
-            return
+            status = read_ps_memory(pid)
+            if not status:
+                return
+            self.sampler = "ps"
         self.samples += 1
         self.peak_rss_kb = max_optional(self.peak_rss_kb, status.get("vmrss_kb"))
         self.peak_hwm_kb = max_optional(self.peak_hwm_kb, status.get("vmhwm_kb"))
@@ -268,7 +294,7 @@ class ProcSampler:
 
     def to_json(self) -> dict[str, Any]:
         return {
-            "sampler": "proc_status",
+            "sampler": self.sampler,
             "samples": self.samples,
             "peak_rss_kb": self.peak_rss_kb,
             "peak_hwm_kb": self.peak_hwm_kb,
@@ -288,6 +314,9 @@ def build_fixture_payload(case: dict[str, Any]) -> dict[str, Any]:
     fixture = str(case.get("fixture") or "large_in_network")
     if fixture == "large_in_network":
         rate_count = int(case.get("negotiated_rates") or 64)
+        additional_information = None
+        if int(case.get("additional_information_bytes") or 0) > 0:
+            additional_information = "x" * int(case.get("additional_information_bytes") or 0)
         negotiated_rates = [
             {
                 "provider_references": [7],
@@ -297,6 +326,11 @@ def build_fixture_payload(case: dict[str, Any]) -> dict[str, Any]:
                         "negotiated_rate": 100 + index,
                         "service_code": ["11"],
                         "billing_class": "professional",
+                        **(
+                            {"additional_information": additional_information}
+                            if additional_information is not None
+                            else {}
+                        ),
                     }
                 ],
             }
@@ -1058,7 +1092,9 @@ def evaluate_gates(
         by_case.setdefault(str(result.get("case_id")), []).append(result)
     case_results = {}
     for case_id, results in by_case.items():
-        baseline = next((item for item in results if item.get("variant_id") == "baseline"), None)
+        gate_options = (case_gates or {}).get(case_id) or {}
+        baseline_variant = str(gate_options.get("baseline_variant") or "baseline")
+        baseline = next((item for item in results if item.get("variant_id") == baseline_variant), None)
         candidates = [item for item in results if item is not baseline]
         case_results[case_id] = [
             evaluate_candidate(
@@ -1066,7 +1102,7 @@ def evaluate_gates(
                 candidate,
                 min_improvement_pct=min_improvement_pct,
                 max_memory_growth_pct=max_memory_growth_pct,
-                gate_options=(case_gates or {}).get(case_id) or {},
+                gate_options=gate_options,
             )
             for candidate in candidates
         ]
@@ -1247,6 +1283,12 @@ def format_scanner_summary(result: dict[str, Any]) -> str:
         parts.append(f"workers={config.get('worker_count')}")
     if summary.get("producer_blocked_micros") is not None:
         parts.append(f"producer_blocked_us={summary.get('producer_blocked_micros')}")
+    if summary.get("raw_chunk_count") is not None:
+        parts.append(f"raw_chunks={summary.get('raw_chunk_count')}")
+    if summary.get("raw_chunk_max_bytes") is not None:
+        parts.append(f"max_raw_chunk_bytes={summary.get('raw_chunk_max_bytes')}")
+    if summary.get("raw_chunk_max_rates") is not None:
+        parts.append(f"max_raw_chunk_rates={summary.get('raw_chunk_max_rates')}")
     return "<br>".join(parts)
 
 

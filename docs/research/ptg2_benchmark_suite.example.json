@@ -31,6 +31,17 @@
         "_expected_queue": "arq:PTGSmall",
         "_expected_worker_class": "process.PTGSmall"
       }
+    },
+    {
+      "id": "raw_chunk_1m",
+      "description": "Worker-side parsing with 1 MiB raw negotiated-rate chunks for memory-sensitive huge files.",
+      "env": {
+        "HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS": "true",
+        "HLTHPRT_PTG2_RUST_WORKERS": "2",
+        "HLTHPRT_PTG2_RUST_WORK_QUEUE": "2",
+        "HLTHPRT_PTG2_RUST_EVENT_QUEUE": "8",
+        "HLTHPRT_PTG2_RUST_RAW_CHUNK_BYTES": "1048576"
+      }
     }
   ],
   "cases": [
@@ -51,6 +62,19 @@
         "performance": false
       },
       "variants": ["baseline", "parse_in_workers"]
+    },
+    {
+      "id": "bulky-raw-chunk-fixture",
+      "kind": "scanner_fixture",
+      "fixture": "large_in_network",
+      "negotiated_rates": 4096,
+      "additional_information_bytes": 2048,
+      "split_negotiated_rates": 4096,
+      "gates": {
+        "baseline_variant": "parse_in_workers",
+        "performance": false
+      },
+      "variants": ["parse_in_workers", "raw_chunk_1m"]
     },
     {
       "id": "local-db-smoke",
@@ -79,6 +103,22 @@
         "performance": false
       },
       "variants": ["parse_in_workers"]
+    },
+    {
+      "id": "local-bulky-full-file-verify",
+      "kind": "local_ptg_cli",
+      "fixture": "large_in_network",
+      "negotiated_rates": 4096,
+      "additional_information_bytes": 2048,
+      "source_key": "local-bulky-full-file-verify",
+      "import_month": "2026-06",
+      "max_files": 1,
+      "full_file": true,
+      "verify_original": true,
+      "gates": {
+        "performance": false
+      },
+      "variants": ["raw_chunk_1m"]
     },
     {
       "id": "ptg-pilot-import",

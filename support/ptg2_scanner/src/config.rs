@@ -9,6 +9,7 @@ pub const DEFAULT_SPLIT_NEGOTIATED_RATES: usize = 4096;
 pub const DEFAULT_COMPACT_RUST_WORKERS: usize = 8;
 pub const DEFAULT_COMPACT_RUST_WORK_QUEUE: usize = 16;
 pub const DEFAULT_COMPACT_COPY_ROTATE_BYTES: u64 = 128 * 1024 * 1024;
+pub const DEFAULT_RAW_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_PARSE_IN_WORKERS: bool = true;
 
 pub fn split_interval(name: &str, default_value: usize) -> usize {

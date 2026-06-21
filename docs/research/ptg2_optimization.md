@@ -35,6 +35,22 @@ cargo build --release --manifest-path support/ptg2_scanner/Cargo.toml
   --case duplicate-serving-fixture
 ```
 
+Compare default worker-side raw chunks with a memory-sensitive 1 MiB raw chunk
+cap on a bulky synthetic file:
+
+```bash
+cargo build --release --manifest-path support/ptg2_scanner/Cargo.toml
+./venv314/bin/python scripts/research/ptg2_experiment.py run \
+  --case bulky-raw-chunk-fixture \
+  --variant parse_in_workers \
+  --variant raw_chunk_1m
+```
+
+Inspect `elapsed_seconds`, `peak_rss_kb`, `raw_chunk_count`,
+`raw_chunk_max_bytes`, and matching COPY output digests. This case intentionally
+skips the performance gate because smaller chunks can trade some throughput for
+lower peak memory and more predictable huge-file scheduling.
+
 Run the local DB-backed PTG smoke against PostgreSQL on `127.0.0.1:5440`.
 This serves a tiny TOC and in-network file from a temporary localhost HTTP
 server, enables `HLTHPRT_FETCH_ALLOW_LOCAL=true` only for the child process, and

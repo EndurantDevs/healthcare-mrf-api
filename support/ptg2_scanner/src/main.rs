@@ -3,8 +3,8 @@ use ptg2_scanner::address_canon::{canon_version_json, canonicalize_copy_file};
 use ptg2_scanner::config::{
     env_bool, env_usize, progress_interval, split_interval, DEFAULT_COMPACT_COPY_ROTATE_BYTES,
     DEFAULT_COMPACT_RUST_WORKERS, DEFAULT_COMPACT_RUST_WORK_QUEUE, DEFAULT_PARSE_IN_WORKERS,
-    DEFAULT_PROGRESS_BYTES, DEFAULT_PROGRESS_OBJECTS, DEFAULT_SPLIT_NEGOTIATED_RATES,
-    READ_BUF_SIZE,
+    DEFAULT_PROGRESS_BYTES, DEFAULT_PROGRESS_OBJECTS, DEFAULT_RAW_CHUNK_BYTES,
+    DEFAULT_SPLIT_NEGOTIATED_RATES, READ_BUF_SIZE,
 };
 use ptg2_scanner::copy_format::{
     emit_compact_copy_row, emit_manifest_serving_copy_row, pg_text_array_field, pg_text_copy_field,
@@ -2719,6 +2719,23 @@ enum WorkerJob {
     },
 }
 
+#[derive(Default)]
+struct RawChunkStats {
+    chunk_count: u64,
+    total_bytes: u64,
+    max_bytes: usize,
+    max_rates: usize,
+}
+
+impl RawChunkStats {
+    fn record(&mut self, rate_count: usize, byte_count: usize) {
+        self.chunk_count = self.chunk_count.saturating_add(1);
+        self.total_bytes = self.total_bytes.saturating_add(byte_count as u64);
+        self.max_bytes = self.max_bytes.max(byte_count);
+        self.max_rates = self.max_rates.max(rate_count);
+    }
+}
+
 impl WorkerJob {
     fn name(&self) -> &'static str {
         match self {
@@ -3337,12 +3354,15 @@ fn enqueue_in_network_struson<R: Read>(
     event_rx: &Receiver<CopyFileEvent>,
     writer: &mut impl Write,
     chunk_size: usize,
+    raw_chunk_byte_limit: usize,
     parse_in_workers: bool,
     producer_blocked_micros: &mut u128,
+    raw_chunk_stats: &mut RawChunkStats,
 ) -> io::Result<u64> {
     let mut procedure = Map::new();
     let mut rate_chunk: Vec<RateLite> = Vec::with_capacity(chunk_size);
     let mut raw_rate_chunk: Vec<Vec<u8>> = Vec::with_capacity(chunk_size);
+    let mut raw_rate_chunk_bytes = 0usize;
     let mut rate_count = 0u64;
     json_reader.begin_object().map_err(to_io_error)?;
     while json_reader.has_next().map_err(to_io_error)? {
@@ -3361,12 +3381,18 @@ fn enqueue_in_network_struson<R: Read>(
                 while json_reader.has_next().map_err(to_io_error)? {
                     rate_count += 1;
                     if parse_in_workers {
-                        raw_rate_chunk.push(transfer_next_value_to_bytes(json_reader)?);
-                        if raw_rate_chunk.len() >= chunk_size {
+                        let raw_rate = transfer_next_value_to_bytes(json_reader)?;
+                        raw_rate_chunk_bytes = raw_rate_chunk_bytes.saturating_add(raw_rate.len());
+                        raw_rate_chunk.push(raw_rate);
+                        if raw_rate_chunk.len() >= chunk_size
+                            || raw_rate_chunk_bytes >= raw_chunk_byte_limit
+                        {
                             let raw_rates = std::mem::replace(
                                 &mut raw_rate_chunk,
                                 Vec::with_capacity(chunk_size),
                             );
+                            let raw_bytes = std::mem::take(&mut raw_rate_chunk_bytes);
+                            raw_chunk_stats.record(raw_rates.len(), raw_bytes);
                             send_worker_job(
                                 tx,
                                 event_rx,
@@ -3407,6 +3433,7 @@ fn enqueue_in_network_struson<R: Read>(
     }
     json_reader.end_object().map_err(to_io_error)?;
     if !raw_rate_chunk.is_empty() {
+        raw_chunk_stats.record(raw_rate_chunk.len(), raw_rate_chunk_bytes);
         send_worker_job(
             tx,
             event_rx,
@@ -3606,6 +3633,8 @@ fn scan_compact_struson_parallel(
         "HLTHPRT_PTG2_RUST_SPLIT_NEGOTIATED_RATES",
         DEFAULT_SPLIT_NEGOTIATED_RATES,
     );
+    let raw_chunk_byte_limit =
+        env_usize("HLTHPRT_PTG2_RUST_RAW_CHUNK_BYTES", DEFAULT_RAW_CHUNK_BYTES);
     let parse_in_workers = env_bool(
         "HLTHPRT_PTG2_RUST_PARSE_IN_WORKERS",
         DEFAULT_PARSE_IN_WORKERS,
@@ -3628,6 +3657,7 @@ fn scan_compact_struson_parallel(
     let stdout = io::stdout();
     let mut writer = BufWriter::new(stdout.lock());
     let mut producer_blocked_micros = 0u128;
+    let mut raw_chunk_stats = RawChunkStats::default();
 
     emit_json_record(
         &mut writer,
@@ -3637,6 +3667,7 @@ fn scan_compact_struson_parallel(
             "work_queue": bounded_queue_size,
             "event_queue": event_queue_size,
             "split_negotiated_rates": negotiated_rate_chunk_size,
+            "raw_chunk_bytes": raw_chunk_byte_limit,
             "parse_in_workers": parse_in_workers,
             "panic_strategy": "unwind",
         }),
@@ -3743,8 +3774,10 @@ fn scan_compact_struson_parallel(
                                     &event_rx,
                                     &mut writer,
                                     negotiated_rate_chunk_size,
+                                    raw_chunk_byte_limit,
                                     parse_in_workers,
                                     &mut producer_blocked_micros,
+                                    &mut raw_chunk_stats,
                                 )?;
                                 drain_copy_file_events(&event_rx, &mut writer)?;
                                 *object_counts.entry("in_network".to_string()).or_insert(0) += 1;
@@ -3843,6 +3876,11 @@ fn scan_compact_struson_parallel(
                         "work_queue": bounded_queue_size,
                         "event_queue": event_queue_size,
                         "split_negotiated_rates": negotiated_rate_chunk_size,
+                        "raw_chunk_bytes": raw_chunk_byte_limit,
+                        "raw_chunk_count": raw_chunk_stats.chunk_count,
+                        "raw_chunk_total_bytes": raw_chunk_stats.total_bytes,
+                        "raw_chunk_max_bytes": raw_chunk_stats.max_bytes,
+                        "raw_chunk_max_rates": raw_chunk_stats.max_rates,
                         "parse_in_workers": parse_in_workers,
                         "producer_blocked_micros": producer_blocked_micros,
                         "elapsed_seconds": started_at.elapsed().as_secs_f64(),
@@ -4473,6 +4511,49 @@ mod tests {
         let merged = std::fs::read_to_string(&output).unwrap();
         assert_eq!(merged, "a\t1\nb\t2\nmanifest\t1\t2\t3\t4\t5\t6\t7\ttrace\n");
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn raw_rate_chunks_flush_when_byte_limit_is_reached() {
+        let payload = br#"{
+            "billing_code_type": "CPT",
+            "billing_code": "99213",
+            "negotiated_rates": [
+                {"provider_references":[7],"negotiated_prices":[{"negotiated_type":"negotiated","negotiated_rate":100}]},
+                {"provider_references":[7],"negotiated_prices":[{"negotiated_type":"negotiated","negotiated_rate":101}]},
+                {"provider_references":[7],"negotiated_prices":[{"negotiated_type":"negotiated","negotiated_rate":102}]}
+            ]
+        }"#;
+        let mut reader = JsonStreamReader::new(&payload[..]);
+        let (tx, rx) = bounded::<WorkerJob>(10);
+        let (_event_tx, event_rx) = bounded::<CopyFileEvent>(10);
+        let mut writer = Vec::new();
+        let mut producer_blocked_micros = 0u128;
+        let mut stats = RawChunkStats::default();
+
+        let rate_count = enqueue_in_network_struson(
+            &mut reader,
+            &tx,
+            &event_rx,
+            &mut writer,
+            100,
+            1,
+            true,
+            &mut producer_blocked_micros,
+            &mut stats,
+        )
+        .unwrap();
+
+        drop(tx);
+        let jobs: Vec<_> = rx.try_iter().collect();
+        assert_eq!(rate_count, 3);
+        assert_eq!(stats.chunk_count, 3);
+        assert_eq!(stats.max_rates, 1);
+        assert!(stats.max_bytes > 0);
+        assert!(jobs.iter().all(|job| matches!(
+            job,
+            WorkerJob::RawRates { raw_rates, .. } if raw_rates.len() == 1
+        )));
     }
 }
 

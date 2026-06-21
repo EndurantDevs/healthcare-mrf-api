@@ -73,6 +73,14 @@ def test_read_proc_status_parses_memory_values(tmp_path):
     }
 
 
+def test_parse_ps_memory_parses_rss_and_vsz():
+    assert harness.parse_ps_memory(" 2048 123456\n") == {
+        "vmrss_kb": 2048,
+        "vmsize_kb": 123456,
+    }
+    assert harness.parse_ps_memory("bad output") == {}
+
+
 def test_suite_validation_and_env_expansion(tmp_path):
     suite_path = tmp_path / "suite.json"
     suite_path.write_text(
@@ -213,6 +221,40 @@ def test_gate_evaluation_can_skip_case_performance_gate():
     assert result["cases"]["case-a"][0]["checks"]["performance"] == {"status": "skipped"}
 
 
+def test_gate_evaluation_accepts_case_baseline_variant():
+    report = {
+        "results": [
+            {
+                "case_id": "case-a",
+                "variant_id": "current",
+                "status": "succeeded",
+                "elapsed_seconds": 10.0,
+                "copy_outputs": {"serving": {"rows": 2, "sha256": "same"}},
+                "dedupe_summary": {"negotiated_rates": 2},
+                "memory": {},
+            },
+            {
+                "case_id": "case-a",
+                "variant_id": "smaller_chunks",
+                "status": "succeeded",
+                "elapsed_seconds": 11.0,
+                "copy_outputs": {"serving": {"rows": 2, "sha256": "same"}},
+                "dedupe_summary": {"negotiated_rates": 2},
+                "memory": {},
+            },
+        ]
+    }
+
+    result = harness.evaluate_gates(
+        report,
+        {"min_improvement_pct": 15.0},
+        case_gates={"case-a": {"baseline_variant": "current", "performance": False}},
+    )
+
+    assert result["overall"] == "passed"
+    assert result["cases"]["case-a"][0]["variant_id"] == "smaller_chunks"
+
+
 def test_dry_run_writes_report(tmp_path):
     suite = {
         "variants": [{"id": "baseline"}],
@@ -274,6 +316,19 @@ def test_original_file_summary_counts_unique_prices(tmp_path):
     assert len(summary["price_atom_digest"]) == 32
 
 
+def test_large_fixture_can_add_bulky_rate_payload():
+    payload = harness.build_fixture_payload(
+        {
+            "fixture": "large_in_network",
+            "negotiated_rates": 1,
+            "additional_information_bytes": 128,
+        }
+    )
+
+    price = payload["in_network"][0]["negotiated_rates"][0]["negotiated_prices"][0]
+    assert len(price["additional_information"]) == 128
+
+
 def test_local_ptg_cli_full_file_dry_run_omits_max_items(tmp_path, monkeypatch):
     monkeypatch.setenv("HLTHPRT_DB_USER", "tester")
     suite = {
@@ -313,7 +368,12 @@ def test_markdown_report_includes_scanner_and_import_summary():
                 "status": "succeeded",
                 "elapsed_seconds": 1.25,
                 "scanner_config": {"parse_in_workers": True, "worker_count": 2},
-                "scanner_summary": {"producer_blocked_micros": 12},
+                "scanner_summary": {
+                    "producer_blocked_micros": 12,
+                    "raw_chunk_count": 3,
+                    "raw_chunk_max_bytes": 1024,
+                    "raw_chunk_max_rates": 8,
+                },
                 "import_run": {
                     "import_done": {"status": "validated", "files_processed": 1, "serving_rates": 7},
                     "verification": {
@@ -329,5 +389,6 @@ def test_markdown_report_includes_scanner_and_import_summary():
     markdown = harness.render_markdown_report(report)
 
     assert "parse_workers=true<br>workers=2<br>producer_blocked_us=12" in markdown
+    assert "raw_chunks=3<br>max_raw_chunk_bytes=1024<br>max_raw_chunk_rates=8" in markdown
     assert "validated<br>files=1<br>rates=7" in markdown
     assert "passed<br>prices=7/7<br>npis=1/1" in markdown
