@@ -170,10 +170,11 @@ pub fn open_json_reader(
     path: &Path,
     compressed_bytes_read: Arc<AtomicU64>,
 ) -> io::Result<Box<dyn Read>> {
-    Ok(Box::new(LossyUtf8Reader::new(open_reader(
-        path,
-        compressed_bytes_read,
-    )?)))
+    Ok(lossy_utf8_reader(open_reader(path, compressed_bytes_read)?))
+}
+
+pub fn lossy_utf8_reader<R: Read + 'static>(inner: R) -> Box<dyn Read> {
+    Box::new(LossyUtf8Reader::new(inner))
 }
 
 #[cfg(test)]
