@@ -22,6 +22,7 @@ from process.ptg_parts.config import (
     PTG2_RUST_EVENT_QUEUE_ENV,
     PTG2_RUST_PARSE_IN_WORKERS_ENV,
     PTG2_RUST_PROVIDER_REF_CHUNK_ITEMS_ENV,
+    PTG2_RUST_PROVIDER_REF_BYTE_PRELOAD_ENV,
     PTG2_RUST_PROVIDER_REF_QUEUE_ENV,
     PTG2_RUST_PROVIDER_REF_RAW_CHUNK_BYTES_ENV,
     PTG2_RUST_PROVIDER_REF_WORKERS_ENV,
@@ -191,6 +192,9 @@ def _ptg_lane_environment(params: dict[str, Any]):
         ),
         PTG2_RUST_PROVIDER_REF_RAW_CHUNK_BYTES_ENV: _optional_env_value(
             params.get("_scanner_provider_ref_raw_chunk_bytes")
+        ),
+        PTG2_RUST_PROVIDER_REF_BYTE_PRELOAD_ENV: _bool_env_value(
+            params.get("_scanner_provider_ref_byte_preload")
         ),
         PTG2_FILE_PROCESS_CONCURRENCY_ENV: _optional_env_value(params.get("_file_process_concurrency")),
     }
