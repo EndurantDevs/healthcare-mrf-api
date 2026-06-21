@@ -2147,6 +2147,84 @@ def test_ptg2_downloaded_jobs_are_prefetched_concurrently(monkeypatch):
     assert yielded[1] == "https://example.test/slow.json.gz"
 
 
+def test_ptg2_main_processes_downloaded_files_concurrently_when_enabled(monkeypatch):
+    pushed = []
+    active = 0
+    max_active = 0
+
+    async def fake_push(rows, cls, **_kwargs):
+        pushed.extend((getattr(cls, "__name__", str(cls)), row) for row in rows)
+
+    async def fake_toc(*_args, **_kwargs):
+        return [
+            {"type": "in_network", "url": "https://example.test/rates-a.json.gz"},
+            {"type": "in_network", "url": "https://example.test/rates-b.json.gz"},
+        ]
+
+    async def fake_downloaded_jobs(jobs, **_kwargs):
+        for job in jobs:
+            yield process_ptg.PTG2DownloadedJob(
+                job=job,
+                raw_artifact=SimpleNamespace(
+                    raw_sha256=str(job["url"]),
+                    raw_storage_uri=f"/tmp/{Path(job['url']).name}",
+                ),
+                logical_artifact=SimpleNamespace(logical_path=f"/tmp/{Path(job['url']).name}"),
+            )
+
+    async def fake_process(job, *_args, **_kwargs):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0.05)
+        active -= 1
+        return process_ptg.PTG2FileProcessResult(
+            "in_network",
+            job["url"],
+            True,
+            file_id=len(job["url"]),
+            summary={"serving_rates": 1, "manifest": {"copy_files": {}}},
+        )
+
+    async def fake_publish(*_args, **_kwargs):
+        return {
+            "storage": "manifest_snapshot",
+            "type": "ptg2_manifest_serving",
+            "rate_count": 2,
+            "serving_rates": 2,
+        }
+
+    monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
+    monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
+    monkeypatch.setattr(process_ptg.db, "status", AsyncMock())
+    monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push)
+    monkeypatch.setattr(process_ptg, "_prepare_ptg_tables", AsyncMock(return_value={"ImportLog": "log"}))
+    monkeypatch.setattr(process_ptg, "_create_ptg2_manifest_serving_stage_table", AsyncMock(return_value="manifest_stage"))
+    monkeypatch.setattr(process_ptg, "_process_table_of_contents", fake_toc)
+    monkeypatch.setattr(process_ptg, "_iter_downloaded_ptg_jobs", fake_downloaded_jobs)
+    monkeypatch.setattr(process_ptg, "_process_in_network_file", fake_process)
+    monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
+    monkeypatch.setattr(process_ptg, "_publish_ptg2_manifest_serving_snapshot", fake_publish)
+    monkeypatch.setattr(process_ptg, "_current_source_snapshot_id", AsyncMock(return_value=None))
+    monkeypatch.setattr(process_ptg, "_publish_ptg2_source_pointers", AsyncMock())
+    monkeypatch.setattr(process_ptg, "_cleanup_old_ptg2_source_tables", AsyncMock())
+    monkeypatch.setenv(process_ptg.PTG2_FILE_PROCESS_CONCURRENCY_ENV, "2")
+
+    result = asyncio.run(
+        process_ptg.main(
+            toc_urls=["https://example.test/index.json"],
+            import_month="2026-04",
+            import_id="file_concurrency_test",
+            source_key="file_concurrency_test",
+        )
+    )
+
+    assert max_active == 2
+    assert result["files_processed"] == 2
+    import_run_rows = [row for cls_name, row in pushed if cls_name == "PTG2ImportRun"]
+    assert import_run_rows[-1]["report"]["files_processed"] == 2
+
+
 def test_ptg2_main_marks_failed_when_all_discovered_jobs_fail(monkeypatch):
     pushed = []
 
@@ -3233,6 +3311,47 @@ def test_ptg2_rust_compact_uses_bounded_event_queue_default(monkeypatch, tmp_pat
     assert captured_env["HLTHPRT_PTG2_MANIFEST_PROVIDER_NPI_SIDECAR_PATH"].endswith("provider_npi.ptg2sc")
     assert captured_env["HLTHPRT_PTG2_MANIFEST_PRICE_FORWARD_SIDECAR_PATH"].endswith("price_forward.ptg2sc")
     assert captured_env["HLTHPRT_PTG2_MANIFEST_ONLY"] == "true"
+
+
+def test_ptg2_rust_compact_can_omit_provider_npi_sidecar(monkeypatch, tmp_path):
+    captured_env = {}
+
+    class FakeProcess:
+        stdout = io.BytesIO()
+        stderr = None
+
+        def poll(self):
+            return 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    def fake_popen(_args, stdout, stderr, env):
+        captured_env.update(env)
+        return FakeProcess()
+
+    monkeypatch.setattr(ptg_rust_scanner, "_ptg2_rust_scanner_binary", lambda: tmp_path / "ptg2_scanner")
+    monkeypatch.setattr(ptg_rust_scanner.subprocess, "Popen", fake_popen)
+
+    list(
+        process_ptg._iter_compact_serving_records_rust(
+            tmp_path / "rates.json.gz",
+            snapshot_id="snap",
+            plan_id="plan",
+            plan_month_id="month",
+            source_trace_set_hash="trace",
+            manifest_provider_forward_sidecar_path=tmp_path / "provider_forward.ptg2sc",
+            manifest_provider_inverted_sidecar_path=tmp_path / "provider_inverted.ptg2sc",
+            manifest_provider_npi_sidecar_path=None,
+            manifest_price_forward_sidecar_path=tmp_path / "price_forward.ptg2sc",
+            manifest_only=True,
+        )
+    )
+
+    assert captured_env["HLTHPRT_PTG2_MANIFEST_PROVIDER_FORWARD_SIDECAR_PATH"].endswith("provider_forward.ptg2sc")
+    assert captured_env["HLTHPRT_PTG2_MANIFEST_PROVIDER_INVERTED_SIDECAR_PATH"].endswith("provider_inverted.ptg2sc")
+    assert "HLTHPRT_PTG2_MANIFEST_PROVIDER_NPI_SIDECAR_PATH" not in captured_env
+    assert captured_env["HLTHPRT_PTG2_MANIFEST_PRICE_FORWARD_SIDECAR_PATH"].endswith("price_forward.ptg2sc")
 
 
 def test_ptg2_compact_finalize_defers_provider_locations_by_default(monkeypatch):

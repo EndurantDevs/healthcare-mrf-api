@@ -97,10 +97,12 @@ from process.ptg_parts.config import (
     PTG2_DOWNLOAD_TASKS_ENV, PTG2_EXPECTED_IN_NETWORK_ITEMS_ENV,
     PTG2_FAST_FINAL_REBUILD_ENV, PTG2_FAST_OBJECT_ITERATOR_ENV,
     PTG2_FAST_PROVIDER_AGGREGATION_ENV, PTG2_FAST_PROVIDER_UNION_ENV,
-    PTG2_HASH_MODE_ENV, PTG2_ITEM_BATCH_ROWS_ENV,
-    PTG2_JSON_DECODER_ITERATOR_ENV, PTG2_KEEP_PARTIAL_ENV,
-    PTG2_KEEP_PRICE_SET_STAGE_ENV, PTG2_KEEP_SERVING_RATE_STAGE_ENV,
-    PTG2_MANIFEST_PRECOPY_MERGE_ENV, PTG2_PRICE_BATCH_ROWS_ENV,
+    PTG2_FILE_PROCESS_CONCURRENCY_ENV, PTG2_HASH_MODE_ENV,
+    PTG2_ITEM_BATCH_ROWS_ENV, PTG2_JSON_DECODER_ITERATOR_ENV,
+    PTG2_KEEP_PARTIAL_ENV, PTG2_KEEP_PRICE_SET_STAGE_ENV,
+    PTG2_KEEP_SERVING_RATE_STAGE_ENV, PTG2_MANIFEST_PRECOPY_MERGE_ENV,
+    PTG2_MANIFEST_PROVIDER_NPI_SIDECAR_ENABLED_ENV,
+    PTG2_PRICE_BATCH_ROWS_ENV,
     PTG2_PROGRESS_INTERVAL_SECONDS_ENV, PTG2_PROVIDER_BUCKET_COUNT_ENV,
     PTG2_PROVIDER_CACHE_BACKEND_ENV, PTG2_PROVIDER_CACHE_MEMORY_REFS_ENV,
     PTG2_PROVIDER_COMBO_CACHE_REFS_ENV, PTG2_PROVIDER_REF_BATCH_ROWS_ENV,
@@ -610,10 +612,15 @@ async def _parse_in_network_file_serving_only(
     )
     manifest_artifact_dir.mkdir(parents=True, exist_ok=True)
     manifest_file_token = hashlib.sha256(str(Path(file_path).resolve()).encode("utf-8")).hexdigest()[:16]
+    provider_npi_sidecar_enabled = _env_bool(PTG2_MANIFEST_PROVIDER_NPI_SIDECAR_ENABLED_ENV, True)
     manifest_sidecar_paths = {
         "provider_forward": manifest_artifact_dir / f"provider_forward_{manifest_file_token}.ptg2sc",
         "provider_inverted": manifest_artifact_dir / f"provider_inverted_{manifest_file_token}.ptg2sc",
-        "provider_npi": manifest_artifact_dir / f"provider_npi_{manifest_file_token}.ptg2sc",
+        "provider_npi": (
+            manifest_artifact_dir / f"provider_npi_{manifest_file_token}.ptg2sc"
+            if provider_npi_sidecar_enabled
+            else None
+        ),
         "price_forward": manifest_artifact_dir / f"price_forward_{manifest_file_token}.ptg2sc",
     }
 
@@ -762,6 +769,8 @@ async def _parse_in_network_file_serving_only(
     await flush_error_log(import_log_cls)
     manifest_artifacts = {}
     for artifact_kind, artifact_path in manifest_sidecar_paths.items():
+        if artifact_path is None:
+            continue
         if artifact_path.exists() and artifact_path.stat().st_size > 0:
             digest, byte_count = sha256_file(artifact_path)
             record_format = PTG2_MANIFEST_MEMBERSHIP_FORMAT
@@ -2267,87 +2276,21 @@ async def main(
         successful_files: list[dict[str, Any]] = []
         seen_raw_artifact_hashes: set[str] = set()
         duplicate_raw_files_skipped = 0
-        async for downloaded in _iter_downloaded_ptg_jobs(
-            selected_jobs,
-            reuse_raw_artifacts=reuse_raw_artifacts,
-            max_bytes=max_bytes,
-            keep_partial_artifacts=keep_partial_artifacts,
-        ):
-            job = downloaded.job
-            result: PTG2FileProcessResult | None = None
-            if downloaded.error:
-                logger.warning("Failed to download %s file from %s: %s", job.get("type"), job.get("url"), downloaded.error)
-                result = PTG2FileProcessResult(
-                    str(job.get("type") or "unknown"),
-                    str(job.get("url") or ""),
-                    False,
-                    error=downloaded.error,
-                )
-            elif downloaded.raw_artifact is None or downloaded.logical_artifact is None:
-                result = PTG2FileProcessResult(
-                    str(job.get("type") or "unknown"),
-                    str(job.get("url") or ""),
-                    False,
-                    error="download did not produce an artifact",
-                )
-            elif downloaded.raw_artifact.raw_sha256 in seen_raw_artifact_hashes:
-                duplicate_raw_files_skipped += 1
-                _emit_screen_line(
-                    "PTG2_RAW_JOB_DEDUPE"
-                    f"\ttype={job.get('type')}"
-                    f"\turl={job.get('url')}"
-                    f"\traw_sha256={downloaded.raw_artifact.raw_sha256}"
-                    "\treason=duplicate_raw_artifact"
-                )
-                result = PTG2FileProcessResult(
-                    str(job.get("type") or "unknown"),
-                    str(job.get("url") or ""),
-                    True,
-                    summary={
-                        "raw_sha256": downloaded.raw_artifact.raw_sha256,
-                        "raw_storage_uri": downloaded.raw_artifact.raw_storage_uri,
-                        "reason": "duplicate_raw_artifact",
-                    },
-                    skipped=True,
-                )
-            elif downloaded.raw_artifact.raw_sha256:
-                seen_raw_artifact_hashes.add(downloaded.raw_artifact.raw_sha256)
-            if job.get("type") == "in_network":
-                if result is None:
-                    result = await _process_in_network_file(
-                        job,
-                        classes,
-                        provider_ref_cache,
-                        test_mode,
-                        reuse_raw_artifacts=reuse_raw_artifacts,
-                        max_bytes=max_bytes,
-                        max_items=max_items,
-                        import_run_id=import_run_id,
-                        keep_partial_artifacts=keep_partial_artifacts,
-                        compact_import=compact_import,
-                        snapshot_id=snapshot_id,
-                        import_month=import_month_value,
-                        rust_stage_tables=None,
-                        ptg2_manifest_stage_table=ptg2_manifest_stage_table,
-                        raw_artifact=downloaded.raw_artifact,
-                        logical_artifact=downloaded.logical_artifact,
-                    )
-            elif job.get("type") == "allowed_amounts":
-                if result is None:
-                    result = await _process_allowed_amounts_file(
-                        job,
-                        classes,
-                        test_mode,
-                        reuse_raw_artifacts=reuse_raw_artifacts,
-                        max_bytes=max_bytes,
-                        max_items=max_items,
-                        import_run_id=import_run_id,
-                        keep_partial_artifacts=keep_partial_artifacts,
-                        raw_artifact=downloaded.raw_artifact,
-                        logical_artifact=downloaded.logical_artifact,
-                    )
+        file_process_concurrency = 1
+        if compact_import and _use_serving_only_import() and not test_mode:
+            file_process_concurrency = max(_env_int(PTG2_FILE_PROCESS_CONCURRENCY_ENV, 1), 1)
+        if file_process_concurrency > 1:
+            _emit_screen_line(
+                "PTG2_FILE_PROCESS_CONCURRENCY"
+                f"\tvalue={file_process_concurrency}"
+                f"\tfiles={attempted_files}"
+            )
+        processing_tasks: set[asyncio.Task[PTG2FileProcessResult | None]] = set()
+
+        async def record_file_result(result: PTG2FileProcessResult | None) -> None:
+            nonlocal processed_files
             if result is None:
-                continue
+                return
             if result.success:
                 if result.skipped:
                     skipped_files.append(asdict(result))
@@ -2365,6 +2308,113 @@ async def main(
                         )
             else:
                 failed_files.append(asdict(result))
+
+        async def drain_processing_tasks(*, force: bool = False) -> None:
+            nonlocal processing_tasks
+            if not processing_tasks:
+                return
+            if force:
+                done, pending = await asyncio.wait(processing_tasks, return_when=asyncio.ALL_COMPLETED)
+            elif len(processing_tasks) < file_process_concurrency:
+                return
+            else:
+                done, pending = await asyncio.wait(processing_tasks, return_when=asyncio.FIRST_COMPLETED)
+            processing_tasks = set(pending)
+            for task in done:
+                await record_file_result(task.result())
+
+        async def process_downloaded_job(downloaded) -> PTG2FileProcessResult | None:
+            job = downloaded.job
+            if job.get("type") == "in_network":
+                return await _process_in_network_file(
+                    job,
+                    classes,
+                    provider_ref_cache,
+                    test_mode,
+                    reuse_raw_artifacts=reuse_raw_artifacts,
+                    max_bytes=max_bytes,
+                    max_items=max_items,
+                    import_run_id=import_run_id,
+                    keep_partial_artifacts=keep_partial_artifacts,
+                    compact_import=compact_import,
+                    snapshot_id=snapshot_id,
+                    import_month=import_month_value,
+                    rust_stage_tables=None,
+                    ptg2_manifest_stage_table=ptg2_manifest_stage_table,
+                    raw_artifact=downloaded.raw_artifact,
+                    logical_artifact=downloaded.logical_artifact,
+                )
+            if job.get("type") == "allowed_amounts":
+                return await _process_allowed_amounts_file(
+                    job,
+                    classes,
+                    test_mode,
+                    reuse_raw_artifacts=reuse_raw_artifacts,
+                    max_bytes=max_bytes,
+                    max_items=max_items,
+                    import_run_id=import_run_id,
+                    keep_partial_artifacts=keep_partial_artifacts,
+                    raw_artifact=downloaded.raw_artifact,
+                    logical_artifact=downloaded.logical_artifact,
+                )
+            return None
+
+        try:
+            async for downloaded in _iter_downloaded_ptg_jobs(
+                selected_jobs,
+                reuse_raw_artifacts=reuse_raw_artifacts,
+                max_bytes=max_bytes,
+                keep_partial_artifacts=keep_partial_artifacts,
+            ):
+                job = downloaded.job
+                result: PTG2FileProcessResult | None = None
+                if downloaded.error:
+                    logger.warning("Failed to download %s file from %s: %s", job.get("type"), job.get("url"), downloaded.error)
+                    result = PTG2FileProcessResult(
+                        str(job.get("type") or "unknown"),
+                        str(job.get("url") or ""),
+                        False,
+                        error=downloaded.error,
+                    )
+                elif downloaded.raw_artifact is None or downloaded.logical_artifact is None:
+                    result = PTG2FileProcessResult(
+                        str(job.get("type") or "unknown"),
+                        str(job.get("url") or ""),
+                        False,
+                        error="download did not produce an artifact",
+                    )
+                elif downloaded.raw_artifact.raw_sha256 in seen_raw_artifact_hashes:
+                    duplicate_raw_files_skipped += 1
+                    _emit_screen_line(
+                        "PTG2_RAW_JOB_DEDUPE"
+                        f"\ttype={job.get('type')}"
+                        f"\turl={job.get('url')}"
+                        f"\traw_sha256={downloaded.raw_artifact.raw_sha256}"
+                        "\treason=duplicate_raw_artifact"
+                    )
+                    result = PTG2FileProcessResult(
+                        str(job.get("type") or "unknown"),
+                        str(job.get("url") or ""),
+                        True,
+                        summary={
+                            "raw_sha256": downloaded.raw_artifact.raw_sha256,
+                            "raw_storage_uri": downloaded.raw_artifact.raw_storage_uri,
+                            "reason": "duplicate_raw_artifact",
+                        },
+                        skipped=True,
+                    )
+                elif downloaded.raw_artifact.raw_sha256:
+                    seen_raw_artifact_hashes.add(downloaded.raw_artifact.raw_sha256)
+                if result is not None:
+                    await record_file_result(result)
+                    continue
+
+                processing_tasks.add(asyncio.create_task(process_downloaded_job(downloaded)))
+                await drain_processing_tasks()
+            await drain_processing_tasks(force=True)
+        finally:
+            for task in processing_tasks:
+                task.cancel()
 
         failure_report = {
             "jobs_discovered": jobs_discovered_before_dedupe,
