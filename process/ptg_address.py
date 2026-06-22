@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import json
 import logging
@@ -82,6 +83,14 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_positive_int(name: str, default: int) -> int:
+    try:
+        value = int(str(os.getenv(name) or "").strip())
+    except ValueError:
+        value = 0
+    return value if value > 0 else default
 
 
 def _coerce_json_mapping(value: Any) -> dict[str, Any]:
@@ -812,6 +821,40 @@ async def _sync_ptg_source_into_archive(
         await db.status(f"DROP TABLE IF EXISTS {db_schema}.{archive_stage_table};")
 
 
+async def _insert_ptg_address_source(
+    db_schema: str,
+    stage_table: str,
+    *,
+    source_context: dict[str, str | None],
+    node_id: str | None,
+    address_canon_available: bool,
+    archive_available: bool,
+) -> dict[str, str | None]:
+    source_key = str(source_context["source_key"] or "")
+    snapshot_id = str(source_context["snapshot_id"] or "")
+    insert_sql = _ptg_address_insert_sql(
+        db_schema,
+        stage_table,
+        source_key=source_key,
+        snapshot_id=snapshot_id,
+        node_id=node_id,
+        address_canon_available=address_canon_available,
+        archive_available=archive_available,
+        provider_group_location_table=source_context.get("provider_group_location_table"),
+        provider_group_member_table=source_context.get("provider_group_member_table"),
+        serving_rate_compact_table=source_context.get("serving_rate_compact_table"),
+        provider_set_component_table=source_context.get("provider_set_component_table"),
+    )
+    timeout = _postgres_setting_literal(
+        os.getenv("HLTHPRT_PTG_ADDRESS_STATEMENT_TIMEOUT"),
+        "0",
+    )
+    async with db.transaction() as session:
+        await session.execute(db.text(f"SET LOCAL statement_timeout = {timeout};"))
+        await session.execute(db.text(insert_sql))
+    return {"source_key": source_key, "snapshot_id": snapshot_id}
+
+
 async def process_data(ctx, task=None):
     task = task or {}
     ctx.setdefault("context", {})
@@ -980,33 +1023,47 @@ async def process_data(ctx, task=None):
             archive_available,
         )
 
-    for source_context in source_contexts:
-        source_key = str(source_context["source_key"] or "")
-        snapshot_id = str(source_context["snapshot_id"] or "")
-        provider_group_location_table = source_context.get("provider_group_location_table")
-        provider_group_member_table = source_context.get("provider_group_member_table")
-        serving_rate_compact_table = source_context.get("serving_rate_compact_table")
-        provider_set_component_table = source_context.get("provider_set_component_table")
-        insert_sql = _ptg_address_insert_sql(
-            db_schema,
-            stage_table,
-            source_key=source_key,
-            snapshot_id=snapshot_id,
-            node_id=node_id,
-            address_canon_available=address_canon_available,
-            archive_available=archive_available,
-            provider_group_location_table=provider_group_location_table,
-            provider_group_member_table=provider_group_member_table,
-            serving_rate_compact_table=serving_rate_compact_table,
-            provider_set_component_table=provider_set_component_table,
-        )
-        timeout = _postgres_setting_literal(
-            os.getenv("HLTHPRT_PTG_ADDRESS_STATEMENT_TIMEOUT"),
-            "0",
-        )
-        async with db.transaction() as session:
-            await session.execute(db.text(f"SET LOCAL statement_timeout = {timeout};"))
-            await session.execute(db.text(insert_sql))
+    insert_concurrency = _env_positive_int("HLTHPRT_PTG_ADDRESS_SOURCE_CONCURRENCY", 1)
+    context["source_insert_concurrency"] = insert_concurrency
+    insert_results: list[dict[str, str | None]] = []
+    insert_sem = asyncio.Semaphore(insert_concurrency)
+
+    async def _insert_one(source_context: dict[str, str | None]) -> dict[str, str | None]:
+        async with insert_sem:
+            return await _insert_ptg_address_source(
+                db_schema,
+                stage_table,
+                source_context=source_context,
+                node_id=node_id,
+                address_canon_available=address_canon_available,
+                archive_available=archive_available,
+            )
+
+    insert_tasks = [asyncio.create_task(_insert_one(source_context)) for source_context in source_contexts]
+    try:
+        for future in asyncio.as_completed(insert_tasks):
+            result = await future
+            insert_results.append(result)
+            if run_id:
+                done = len(insert_results)
+                total = len(source_contexts)
+                enqueue_live_progress(
+                    run_id=run_id,
+                    importer="ptg-address",
+                    status="running",
+                    phase="staging PTG address sources",
+                    unit="sources",
+                    done=done,
+                    total=total,
+                    pct=min(90, max(5, (done / max(total, 1)) * 90)),
+                    message=f"staged {done}/{total} PTG address source(s)",
+                )
+    except Exception:
+        for task_item in insert_tasks:
+            task_item.cancel()
+        await asyncio.gather(*insert_tasks, return_exceptions=True)
+        raise
+    context["source_insert_results"] = insert_results
     await _create_stage_indexes(stage_cls, db_schema)
     await db.status(f"ANALYZE {db_schema}.{stage_table};")
     row_count = int(await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{stage_table};") or 0)

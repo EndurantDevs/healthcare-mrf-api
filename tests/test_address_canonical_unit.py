@@ -2010,6 +2010,17 @@ def test_ptg_address_env_bool_defaults_and_truthy(monkeypatch):
     assert not ptg_address._env_bool("HLTHPRT_PTG_ADDRESS_OPENADDRESSES_BACKFILL", True)
 
 
+def test_ptg_address_env_positive_int_defaults(monkeypatch):
+    monkeypatch.delenv("HLTHPRT_PTG_ADDRESS_SOURCE_CONCURRENCY", raising=False)
+    assert ptg_address._env_positive_int("HLTHPRT_PTG_ADDRESS_SOURCE_CONCURRENCY", 3) == 3
+    monkeypatch.setenv("HLTHPRT_PTG_ADDRESS_SOURCE_CONCURRENCY", "8")
+    assert ptg_address._env_positive_int("HLTHPRT_PTG_ADDRESS_SOURCE_CONCURRENCY", 3) == 8
+    monkeypatch.setenv("HLTHPRT_PTG_ADDRESS_SOURCE_CONCURRENCY", "0")
+    assert ptg_address._env_positive_int("HLTHPRT_PTG_ADDRESS_SOURCE_CONCURRENCY", 3) == 3
+    monkeypatch.setenv("HLTHPRT_PTG_ADDRESS_SOURCE_CONCURRENCY", "bad")
+    assert ptg_address._env_positive_int("HLTHPRT_PTG_ADDRESS_SOURCE_CONCURRENCY", 3) == 3
+
+
 @pytest.mark.asyncio
 async def test_ptg_address_input_resolves_current_snapshot_manifest_location(monkeypatch):
     class FakeDB:
