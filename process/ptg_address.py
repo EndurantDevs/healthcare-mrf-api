@@ -721,6 +721,12 @@ def _ptg_archive_stage_table_name(stage_table: str) -> str:
     return _archived_identifier(f"{stage_table}_archive_source", "")
 
 
+def _should_sync_ptg_source_archive(source_context: dict[str, str | None]) -> bool:
+    if source_context.get("provider_group_member_table") and not source_context.get("provider_group_location_table"):
+        return False
+    return True
+
+
 def _ptg_archive_source_sql(
     db_schema: str,
     archive_stage_table: str,
@@ -889,9 +895,19 @@ async def process_data(ctx, task=None):
         )
 
     archive_resolve_stats = []
+    archive_resolve_skipped_sources = []
     if archive_available and address_canon_available:
         archive_stage_table = _ptg_archive_stage_table_name(stage_table)
         for source_context in source_contexts:
+            if not _should_sync_ptg_source_archive(source_context):
+                archive_resolve_skipped_sources.append(
+                    {
+                        "source_key": source_context.get("source_key"),
+                        "snapshot_id": source_context.get("snapshot_id"),
+                        "reason": "npi_address_archive_owned_by_nppes",
+                    }
+                )
+                continue
             stats = await _sync_ptg_source_into_archive(
                 db_schema,
                 archive_stage_table,
@@ -916,19 +932,35 @@ async def process_data(ctx, task=None):
                 source_context.get("snapshot_id"),
                 stats,
             )
-        oa_stats = await refresh_archive_geocodes_from_openaddresses_sharded(schema=db_schema)
+        if archive_resolve_skipped_sources:
+            logger.info(
+                "Skipped PTG canonical archive sync for %s provider-member fallback source(s); "
+                "NPI/NPPES owns canonical archive repair for npi_address-derived rows.",
+                len(archive_resolve_skipped_sources),
+            )
         context["archive_resolve"] = archive_resolve_stats
-        context["openaddresses_backfill"] = {
-            "exact_updates": oa_stats.exact_updates,
-            "fuzzy_updates": oa_stats.fuzzy_updates,
-            "relaxed_updates": oa_stats.relaxed_updates,
-        }
-        logger.info(
-            "OpenAddresses archive backfill after PTG canonical resolve: exact=%s fuzzy=%s relaxed=%s",
-            oa_stats.exact_updates,
-            oa_stats.fuzzy_updates,
-            oa_stats.relaxed_updates,
-        )
+        context["archive_resolve_skipped_sources"] = archive_resolve_skipped_sources
+        if archive_resolve_stats:
+            oa_stats = await refresh_archive_geocodes_from_openaddresses_sharded(schema=db_schema)
+            context["openaddresses_backfill"] = {
+                "exact_updates": oa_stats.exact_updates,
+                "fuzzy_updates": oa_stats.fuzzy_updates,
+                "relaxed_updates": oa_stats.relaxed_updates,
+            }
+            logger.info(
+                "OpenAddresses archive backfill after PTG canonical resolve: exact=%s fuzzy=%s relaxed=%s",
+                oa_stats.exact_updates,
+                oa_stats.fuzzy_updates,
+                oa_stats.relaxed_updates,
+            )
+        else:
+            context["openaddresses_backfill"] = {
+                "exact_updates": 0,
+                "fuzzy_updates": 0,
+                "relaxed_updates": 0,
+                "skipped": True,
+                "reason": "no_ptg_owned_archive_sources",
+            }
     else:
         logger.warning(
             "Skipping PTG canonical archive sync: address_canon_available=%s archive_available=%s",

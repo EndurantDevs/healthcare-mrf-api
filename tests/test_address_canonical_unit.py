@@ -1980,6 +1980,27 @@ def test_ptg_archive_source_sql_recomputes_provider_group_member_npi_address_key
     assert "CREATE UNLOGGED TABLE mrf.ptg_address_stage_archive_source AS" in sql
 
 
+def test_ptg_address_archive_sync_skips_npi_member_fallback_sources():
+    assert not ptg_address._should_sync_ptg_source_archive(
+        {
+            "provider_group_location_table": None,
+            "provider_group_member_table": "ptg2_provider_group_member_abc123",
+        }
+    )
+    assert ptg_address._should_sync_ptg_source_archive(
+        {
+            "provider_group_location_table": "ptg2_provider_group_location_abc123",
+            "provider_group_member_table": "ptg2_provider_group_member_abc123",
+        }
+    )
+    assert ptg_address._should_sync_ptg_source_archive(
+        {
+            "provider_group_location_table": None,
+            "provider_group_member_table": None,
+        }
+    )
+
+
 @pytest.mark.asyncio
 async def test_ptg_address_input_resolves_current_snapshot_manifest_location(monkeypatch):
     class FakeDB:
