@@ -49,7 +49,6 @@ PTG_PROVIDER_SET_COMPONENT_PREFIX = "ptg2_provider_set_component_"
 PTG_ADDRESS_NPI_RANGE_MAX = 10_000_000_000
 DEFAULT_MEMBER_SHARD_MIN_BYTES = 1_073_741_824
 DEFAULT_SQL_WORK_MEM = "2GB"
-DEFAULT_SQL_TEMP_FILE_LIMIT = "-1"
 DEFAULT_SQL_JIT = "off"
 DEFAULT_SQL_SYNCHRONOUS_COMMIT = "off"
 DEFAULT_SQL_MAX_PARALLEL_WORKERS_PER_GATHER = "8"
@@ -105,7 +104,6 @@ def _env_positive_int(name: str, default: int) -> int:
 def _ptg_address_sql_settings(*, include_statement_timeout: bool = True) -> list[tuple[str, str]]:
     candidates: list[tuple[str, str, str]] = [
         ("work_mem", "HLTHPRT_PTG_ADDRESS_WORK_MEM", DEFAULT_SQL_WORK_MEM),
-        ("temp_file_limit", "HLTHPRT_PTG_ADDRESS_TEMP_FILE_LIMIT", DEFAULT_SQL_TEMP_FILE_LIMIT),
         ("jit", "HLTHPRT_PTG_ADDRESS_JIT", DEFAULT_SQL_JIT),
         ("synchronous_commit", "HLTHPRT_PTG_ADDRESS_SYNCHRONOUS_COMMIT", DEFAULT_SQL_SYNCHRONOUS_COMMIT),
         (
