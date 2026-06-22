@@ -53,6 +53,7 @@ DEFAULT_SQL_JIT = "off"
 DEFAULT_SQL_SYNCHRONOUS_COMMIT = "off"
 DEFAULT_SQL_MAX_PARALLEL_WORKERS_PER_GATHER = "8"
 DEFAULT_SQL_HASH_MEM_MULTIPLIER = "4"
+DEFAULT_MEMBER_MATERIALIZE_SHARDS = 8
 SNAPSHOT_TABLE_NAME_RE = re.compile(r"[a-z0-9_]{1,63}\Z")
 POSTGRES_SETTING_RE = re.compile(r"[A-Za-z0-9_.:-]{1,64}\Z")
 
@@ -841,7 +842,10 @@ def _ptg_address_insert_member_coverage_sql(
     node_id: str | None,
     address_canon_available: bool,
     archive_available: bool,
+    npi_range_start: int | None = None,
+    npi_range_end: int | None = None,
 ) -> str:
+    npi_filter = _npi_range_filter("c.npi", npi_range_start, npi_range_end)
     country_expr = "country_code"
     address_key_expr = (
         f"COALESCE(source_address_key, {db_schema}.addr_key_v1(first_line, second_line, city, state, postal_code, {country_expr}))"
@@ -941,6 +945,7 @@ def _ptg_address_insert_member_coverage_sql(
             ON ps.source_key = c.source_key
            AND ps.snapshot_id = c.snapshot_id
          WHERE c.npi IS NOT NULL
+{npi_filter}
          GROUP BY c.npi
     ),
     shaped AS (
@@ -1232,6 +1237,48 @@ async def _insert_ptg_member_coverage_source(
     }
 
 
+async def _insert_ptg_member_fallback_materialize_shard(
+    db_schema: str,
+    stage_table: str,
+    coverage_table: str,
+    *,
+    source_key: str,
+    snapshot_id: str,
+    node_id: str | None,
+    address_canon_available: bool,
+    archive_available: bool,
+    shard_index: int,
+    shard_count: int,
+) -> dict[str, str | int]:
+    npi_range_start, npi_range_end = _npi_range_bounds(shard_index, shard_count)
+    async with db.transaction() as session:
+        await _apply_ptg_address_sql_settings(session)
+        await session.execute(
+            db.text(
+                _ptg_address_insert_member_coverage_sql(
+                    db_schema,
+                    stage_table,
+                    coverage_table,
+                    source_key=source_key,
+                    snapshot_id=snapshot_id,
+                    node_id=node_id,
+                    address_canon_available=address_canon_available,
+                    archive_available=archive_available,
+                    npi_range_start=npi_range_start,
+                    npi_range_end=npi_range_end,
+                )
+            )
+        )
+    return {
+        "source_key": source_key,
+        "snapshot_id": snapshot_id,
+        "shard_index": shard_index,
+        "shard_count": shard_count,
+        "npi_range_start": npi_range_start,
+        "npi_range_end": npi_range_end,
+    }
+
+
 async def _insert_ptg_member_fallback_aggregate(
     db_schema: str,
     stage_table: str,
@@ -1324,28 +1371,69 @@ async def _insert_ptg_member_fallback_aggregate(
             await db.status(f"ANALYZE {db_schema}.ptg2_current_plan_source;")
         if archive_available:
             await db.status(f"ANALYZE {db_schema}.address_archive_v2;")
-        async with db.transaction() as session:
-            await _apply_ptg_address_sql_settings(session)
-            await session.execute(
-                db.text(
-                    _ptg_address_insert_member_coverage_sql(
-                        db_schema,
-                        stage_table,
-                        coverage_table,
-                        source_key=PTG_ADDRESS_MEMBER_FALLBACK_SOURCE_KEY,
-                        snapshot_id=stage_table,
-                        node_id=node_id,
-                        address_canon_available=address_canon_available,
-                        archive_available=archive_available,
-                    )
+        materialize_shards = _env_positive_int(
+            "HLTHPRT_PTG_ADDRESS_MEMBER_MATERIALIZE_SHARDS",
+            DEFAULT_MEMBER_MATERIALIZE_SHARDS,
+        )
+        materialize_concurrency = min(
+            materialize_shards,
+            _env_positive_int(
+                "HLTHPRT_PTG_ADDRESS_MEMBER_MATERIALIZE_CONCURRENCY",
+                insert_concurrency,
+            ),
+        )
+        materialize_sem = asyncio.Semaphore(max(1, materialize_concurrency))
+
+        async def _materialize_one(shard_index: int) -> dict[str, str | int]:
+            async with materialize_sem:
+                return await _insert_ptg_member_fallback_materialize_shard(
+                    db_schema,
+                    stage_table,
+                    coverage_table,
+                    source_key=PTG_ADDRESS_MEMBER_FALLBACK_SOURCE_KEY,
+                    snapshot_id=stage_table,
+                    node_id=node_id,
+                    address_canon_available=address_canon_available,
+                    archive_available=archive_available,
+                    shard_index=shard_index,
+                    shard_count=materialize_shards,
                 )
-            )
+
+        materialize_results: list[dict[str, str | int]] = []
+        materialize_tasks = [
+            asyncio.create_task(_materialize_one(shard_index))
+            for shard_index in range(materialize_shards)
+        ]
+        try:
+            for future in asyncio.as_completed(materialize_tasks):
+                result = await future
+                materialize_results.append(result)
+                if run_id:
+                    done = len(materialize_results)
+                    enqueue_live_progress(
+                        run_id=run_id,
+                        importer="ptg-address",
+                        status="running",
+                        phase="materializing PTG member fallback addresses",
+                        unit="npi shards",
+                        done=done,
+                        total=materialize_shards,
+                        pct=75 + min(15, (done / max(materialize_shards, 1)) * 15),
+                        message=f"materialized {done}/{materialize_shards} PTG member fallback NPI shards",
+                    )
+        except Exception:
+            for task_item in materialize_tasks:
+                task_item.cancel()
+            await asyncio.gather(*materialize_tasks, return_exceptions=True)
+            raise
         return {
             "source_key": PTG_ADDRESS_MEMBER_FALLBACK_SOURCE_KEY,
             "snapshot_id": stage_table,
             "source_unit": "member_coverage_aggregate",
             "member_coverage_sources": len(source_contexts),
             "member_coverage_rows": coverage_rows,
+            "member_materialize_shards": materialize_shards,
+            "member_materialize_concurrency": materialize_concurrency,
         }
     finally:
         await db.status(f"DROP TABLE IF EXISTS {db_schema}.{coverage_table};")

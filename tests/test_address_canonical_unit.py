@@ -2097,9 +2097,13 @@ def test_ptg_address_member_coverage_sql_materializes_fallback_once():
         node_id="local_mrf",
         address_canon_available=True,
         archive_available=True,
+        npi_range_start=2_500_000_000,
+        npi_range_end=5_000_000_000,
     )
 
     assert "FROM mrf.ptg_address_member_coverage c" in sql
+    assert "AND c.npi >= 2500000000" in sql
+    assert "AND c.npi < 5000000000" in sql
     assert 'LEFT JOIN "mrf".ptg2_current_plan_source ps' in sql
     assert 'JOIN "mrf".npi_address a' in sql
     assert "ON a.npi = sp.npi" in sql
