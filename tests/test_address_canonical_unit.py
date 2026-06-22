@@ -2001,6 +2001,15 @@ def test_ptg_address_archive_sync_skips_npi_member_fallback_sources():
     )
 
 
+def test_ptg_address_env_bool_defaults_and_truthy(monkeypatch):
+    monkeypatch.delenv("HLTHPRT_PTG_ADDRESS_OPENADDRESSES_BACKFILL", raising=False)
+    assert not ptg_address._env_bool("HLTHPRT_PTG_ADDRESS_OPENADDRESSES_BACKFILL")
+    monkeypatch.setenv("HLTHPRT_PTG_ADDRESS_OPENADDRESSES_BACKFILL", "yes")
+    assert ptg_address._env_bool("HLTHPRT_PTG_ADDRESS_OPENADDRESSES_BACKFILL")
+    monkeypatch.setenv("HLTHPRT_PTG_ADDRESS_OPENADDRESSES_BACKFILL", "0")
+    assert not ptg_address._env_bool("HLTHPRT_PTG_ADDRESS_OPENADDRESSES_BACKFILL", True)
+
+
 @pytest.mark.asyncio
 async def test_ptg_address_input_resolves_current_snapshot_manifest_location(monkeypatch):
     class FakeDB:

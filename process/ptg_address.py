@@ -77,6 +77,13 @@ def _clean_optional(value: Any) -> str | None:
     return cleaned or None
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _coerce_json_mapping(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
@@ -940,7 +947,8 @@ async def process_data(ctx, task=None):
             )
         context["archive_resolve"] = archive_resolve_stats
         context["archive_resolve_skipped_sources"] = archive_resolve_skipped_sources
-        if archive_resolve_stats:
+        run_openaddresses_backfill = _env_bool("HLTHPRT_PTG_ADDRESS_OPENADDRESSES_BACKFILL", False)
+        if archive_resolve_stats and run_openaddresses_backfill:
             oa_stats = await refresh_archive_geocodes_from_openaddresses_sharded(schema=db_schema)
             context["openaddresses_backfill"] = {
                 "exact_updates": oa_stats.exact_updates,
@@ -959,7 +967,11 @@ async def process_data(ctx, task=None):
                 "fuzzy_updates": 0,
                 "relaxed_updates": 0,
                 "skipped": True,
-                "reason": "no_ptg_owned_archive_sources",
+                "reason": (
+                    "disabled"
+                    if archive_resolve_stats
+                    else "no_ptg_owned_archive_sources"
+                ),
             }
     else:
         logger.warning(
