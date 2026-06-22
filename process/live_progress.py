@@ -233,11 +233,6 @@ def _preserve_progress_for_heartbeat(
         return
     if str(previous.get("source") or "") in {"", _HEARTBEAT_SOURCE}:
         return
-    previous_updated_at = _parse_datetime(previous.get("updated_at"))
-    if previous_updated_at is not None:
-        age_seconds = (now - previous_updated_at).total_seconds()
-        if age_seconds > max(IMPORT_LIVE_PROGRESS_STALE_SECONDS, 1):
-            return
     for key in _PROGRESS_FIELDS:
         if previous.get(key) is not None:
             merged[key] = previous[key]
