@@ -1317,14 +1317,25 @@ async def test_entity_address_unified_support_stage_records_bulk_phase_timings(m
             statements.append(statement)
             return 3
 
-    def fake_support_stage_sql(*_args, **_kwargs):
+    def fake_support_stage_statements(*_args, **_kwargs):
         return [
-            "TRUNCATE TABLE mrf.entity_address_evidence_20260614;",
-            "INSERT INTO mrf.entity_address_evidence_20260614 SELECT 1;",
+            entity_address_unified._SupportStageStatement(  # pylint: disable=protected-access
+                "support tables",
+                "TRUNCATE TABLE mrf.entity_address_evidence_20260614;",
+                parallel=False,
+            ),
+            entity_address_unified._SupportStageStatement(  # pylint: disable=protected-access
+                "evidence",
+                "INSERT INTO mrf.entity_address_evidence_20260614 SELECT 1;",
+            ),
         ]
 
     monkeypatch.setattr(entity_address_unified, "db", FakeDB())
-    monkeypatch.setattr(entity_address_unified, "_support_stage_sql", fake_support_stage_sql)
+    monkeypatch.setattr(
+        entity_address_unified,
+        "_support_stage_statements",
+        fake_support_stage_statements,
+    )
     monkeypatch.setattr(entity_address_unified, "enqueue_live_progress", lambda **payload: events.append(payload))
 
     context = {}
@@ -1341,10 +1352,143 @@ async def test_entity_address_unified_support_stage_records_bulk_phase_timings(m
     assert counts == {"entity_address_evidence": 3}
     assert "SET LOCAL work_mem = '32MB';" in statements
     assert "INSERT INTO mrf.entity_address_evidence_20260614 SELECT 1;" in statements
-    assert context["phase_timings"]["entity-address-unified building evidence"]["count"] == 2
+    assert context["phase_timings"]["entity-address-unified building support tables"]["count"] == 1
+    assert context["phase_timings"]["entity-address-unified building evidence"]["count"] == 1
     assert context["phase_timings"]["entity-address-unified building evidence"]["rows"] == 11
-    assert events[0]["phase"] == "entity-address-unified building evidence"
+    assert events[0]["phase"] == "entity-address-unified building support tables"
     assert events[-1]["phase"] == "entity-address-unified built evidence"
+
+
+@pytest.mark.asyncio
+async def test_entity_address_unified_support_stage_runs_parallel_inserts(monkeypatch):
+    active = 0
+    max_active = 0
+    order = []
+
+    class FakeModel:
+        __tablename__ = "entity_address_evidence"
+
+    class FakeStage:
+        __tablename__ = "entity_address_evidence_20260614"
+
+    class FakeDB:
+        async def status(self, statement):
+            nonlocal active, max_active
+            if "TRUNCATE TABLE" in statement:
+                order.append("truncate")
+                return None
+            order.append(statement)
+            active += 1
+            max_active = max(max_active, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+            return 1
+
+        async def scalar(self, _statement):
+            return 0
+
+    def fake_support_stage_statements(*_args, **_kwargs):
+        return [
+            entity_address_unified._SupportStageStatement(  # pylint: disable=protected-access
+                "support tables",
+                "TRUNCATE TABLE mrf.entity_address_evidence_20260614;",
+                parallel=False,
+            ),
+            entity_address_unified._SupportStageStatement(  # pylint: disable=protected-access
+                "evidence",
+                "INSERT INTO mrf.entity_address_evidence_20260614 SELECT 1;",
+            ),
+            entity_address_unified._SupportStageStatement(  # pylint: disable=protected-access
+                "procedure bridge",
+                "INSERT INTO mrf.entity_address_procedure_bridge_20260614 SELECT 1;",
+            ),
+            entity_address_unified._SupportStageStatement(  # pylint: disable=protected-access
+                "medication bridge",
+                "INSERT INTO mrf.entity_address_medication_bridge_20260614 SELECT 1;",
+            ),
+        ]
+
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_SUPPORT_CONCURRENCY", "2")
+    monkeypatch.setattr(entity_address_unified, "db", FakeDB())
+    monkeypatch.setattr(
+        entity_address_unified,
+        "_support_stage_statements",
+        fake_support_stage_statements,
+    )
+
+    context = {}
+    await entity_address_unified._populate_support_stage_tables(  # pylint: disable=protected-access
+        "mrf",
+        "entity_address_unified_stage",
+        {FakeModel: FakeStage},
+        source_run_id="run_1",
+        node_id="node_a",
+        context=context,
+    )
+
+    assert order[0] == "truncate"
+    assert max_active == 2
+    assert context["support_stage_concurrency"] == 2
+
+
+@pytest.mark.asyncio
+async def test_entity_address_unified_support_stage_indexes_run_parallel(monkeypatch):
+    active = 0
+    max_active = 0
+    events = []
+
+    class FakeModelA:
+        __tablename__ = "entity_address_evidence"
+
+    class FakeModelB:
+        __tablename__ = "entity_address_procedure_bridge"
+
+    class FakeModelC:
+        __tablename__ = "entity_address_medication_bridge"
+
+    class FakeStageA:
+        __tablename__ = "entity_address_evidence_20260614"
+
+    class FakeStageB:
+        __tablename__ = "entity_address_procedure_bridge_20260614"
+
+    class FakeStageC:
+        __tablename__ = "entity_address_medication_bridge_20260614"
+
+    async def fake_create_stage_indexes(_stage_cls, _db_schema, *, context=None):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        if context is not None:
+            context.setdefault("indexed", 0)
+            context["indexed"] += 1
+
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_SUPPORT_INDEX_CONCURRENCY", "2")
+    monkeypatch.setattr(
+        entity_address_unified,
+        "_create_stage_indexes",
+        fake_create_stage_indexes,
+    )
+    monkeypatch.setattr(entity_address_unified, "enqueue_live_progress", lambda **payload: events.append(payload))
+
+    context = {}
+    await entity_address_unified._create_support_stage_indexes(  # pylint: disable=protected-access
+        {
+            FakeModelA: FakeStageA,
+            FakeModelB: FakeStageB,
+            FakeModelC: FakeStageC,
+        },
+        "mrf",
+        context=context,
+        run_id="run_eau",
+    )
+
+    assert max_active == 2
+    assert context["support_stage_index_concurrency"] == 2
+    assert context["indexed"] == 3
+    assert events[-1]["done"] == 3
 
 
 def test_entity_address_unified_evidence_stage_updates_by_location_key():

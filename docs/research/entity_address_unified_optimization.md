@@ -50,3 +50,11 @@ reports/ptg2-experiments/run-<timestamp>/report.md
 Inspect `import_run.final_run.metrics.phase_timings` for the real phase costs.
 The full-run target is under one hour on dev when the database is not already
 saturated by another import.
+
+The importer uses the same bounded-concurrency pattern as the PTG experiments
+for the long independent phases. Dev can tune the final support tail with:
+
+```text
+HLTHPRT_ENTITY_ADDRESS_UNIFIED_SUPPORT_CONCURRENCY
+HLTHPRT_ENTITY_ADDRESS_UNIFIED_SUPPORT_INDEX_CONCURRENCY
+```

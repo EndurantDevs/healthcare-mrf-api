@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import time
+from dataclasses import dataclass
 from typing import Iterable
 
 from arq import create_pool
@@ -46,6 +47,8 @@ DEFAULT_ENRICH_SHARDS = 1
 DEFAULT_ENRICH_CONCURRENCY = 1
 DEFAULT_EVIDENCE_SHARDS = 16
 DEFAULT_EVIDENCE_CONCURRENCY = 4
+DEFAULT_SUPPORT_STAGE_CONCURRENCY = 4
+DEFAULT_SUPPORT_INDEX_CONCURRENCY = 2
 DEFAULT_BUILD_NETWORK_BRIDGE = False
 DEFAULT_COMPACT_SOURCE_RECORD_IDS = True
 DEFAULT_SQL_WORK_MEM = "256MB"
@@ -84,6 +87,13 @@ HOSPITAL_FACILITY_TAXONOMY_CODES = (
     "2865M2000X",
     "2865X1600X",
 )
+
+
+@dataclass(frozen=True)
+class _SupportStageStatement:
+    label: str
+    statement: str
+    parallel: bool = True
 
 
 def _normalize_import_id(raw: str | None) -> str:
@@ -510,9 +520,79 @@ async def _create_support_stage_indexes(
     db_schema: str,
     *,
     context: dict | None = None,
+    run_id: str | None = None,
 ) -> None:
-    for stage_cls in stage_classes.values():
-        await _create_stage_indexes(stage_cls, db_schema, context=context)
+    phase_context = context if context is not None else {}
+    stage_tables = list(stage_classes.values())
+    if not stage_tables:
+        return
+    index_concurrency = min(
+        _env_int(
+            "HLTHPRT_ENTITY_ADDRESS_UNIFIED_SUPPORT_INDEX_CONCURRENCY",
+            DEFAULT_SUPPORT_INDEX_CONCURRENCY,
+            minimum=1,
+        ),
+        len(stage_tables),
+    )
+    phase_context["support_stage_index_concurrency"] = index_concurrency
+    progress_lock = asyncio.Lock()
+    completed = 0
+    total = len(stage_tables)
+
+    async def _index_stage_table(index: int, stage_cls) -> None:
+        nonlocal completed
+        table_name = stage_cls.__tablename__
+        if run_id:
+            async with progress_lock:
+                current_done = completed
+                enqueue_live_progress(
+                    run_id=run_id,
+                    importer="entity-address-unified",
+                    status="running",
+                    phase="entity-address-unified indexing support tables",
+                    unit="tables",
+                    done=current_done,
+                    total=total,
+                    pct=99,
+                    message=(
+                        f"indexing support table {index}/{total}: {table_name} "
+                        f"(concurrency {index_concurrency})"
+                    ),
+                )
+        await _create_stage_indexes(stage_cls, db_schema, context=phase_context)
+        if run_id:
+            async with progress_lock:
+                completed += 1
+                enqueue_live_progress(
+                    run_id=run_id,
+                    importer="entity-address-unified",
+                    status="running",
+                    phase="entity-address-unified indexing support tables",
+                    unit="tables",
+                    done=completed,
+                    total=total,
+                    pct=99,
+                    message=f"indexed support table {index}/{total}: {table_name}",
+                )
+
+    if index_concurrency <= 1 or len(stage_tables) == 1:
+        for index, stage_cls in enumerate(stage_tables, start=1):
+            await _index_stage_table(index, stage_cls)
+        return
+
+    semaphore = asyncio.Semaphore(index_concurrency)
+
+    async def _guarded(index: int, stage_cls) -> None:
+        async with semaphore:
+            await _index_stage_table(index, stage_cls)
+
+    results = await asyncio.gather(
+        *(_guarded(index, stage_cls) for index, stage_cls in enumerate(stage_tables, start=1)),
+        return_exceptions=True,
+    )
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
 
 
 async def _swap_stage_table(db_schema: str, live_cls, stage_cls) -> None:
@@ -4002,7 +4082,7 @@ def _facility_anchor_npi_candidate_sql(
     """
 
 
-def _support_stage_sql(
+def _support_stage_statements(
     db_schema: str,
     stage_table: str,
     stage_classes: dict[type, type],
@@ -4012,7 +4092,7 @@ def _support_stage_sql(
     raw_table: str | None = None,
     build_network_bridge: bool = True,
     available: dict[str, bool] | None = None,
-) -> list[str]:
+) -> list[_SupportStageStatement]:
     available = available or {}
     stage_tables = {model: stage_cls.__tablename__ for model, stage_cls in stage_classes.items()}
     evidence_sql = (
@@ -4033,12 +4113,28 @@ def _support_stage_sql(
         )
     )
     statements = [
-        _truncate_support_stage_sql(db_schema, stage_tables),
-        evidence_sql,
-        _plan_bridge_sql(db_schema, stage_tables[EntityAddressPlanBridge], stage_table),
-        _ptg_bridge_sql(db_schema, stage_tables[EntityAddressPTGBridge], stage_table),
-        _procedure_bridge_sql(db_schema, stage_tables[EntityAddressProcedureBridge], stage_table),
-        _medication_bridge_sql(db_schema, stage_tables[EntityAddressMedicationBridge], stage_table),
+        _SupportStageStatement(
+            "support tables",
+            _truncate_support_stage_sql(db_schema, stage_tables),
+            parallel=False,
+        ),
+        _SupportStageStatement("evidence", evidence_sql),
+        _SupportStageStatement(
+            "plan bridge",
+            _plan_bridge_sql(db_schema, stage_tables[EntityAddressPlanBridge], stage_table),
+        ),
+        _SupportStageStatement(
+            "ptg bridge",
+            _ptg_bridge_sql(db_schema, stage_tables[EntityAddressPTGBridge], stage_table),
+        ),
+        _SupportStageStatement(
+            "procedure bridge",
+            _procedure_bridge_sql(db_schema, stage_tables[EntityAddressProcedureBridge], stage_table),
+        ),
+        _SupportStageStatement(
+            "medication bridge",
+            _medication_bridge_sql(db_schema, stage_tables[EntityAddressMedicationBridge], stage_table),
+        ),
     ]
     if FacilityAnchorNPICandidate in stage_tables and available.get("facility_anchor", False):
         include_nppes_candidates = _env_bool(
@@ -4050,41 +4146,73 @@ def _support_stage_sql(
             False,
         )
         statements.append(
-            _facility_anchor_npi_candidate_sql(
-                db_schema,
-                stage_tables[FacilityAnchorNPICandidate],
-                stage_table,
-                source_run_id=source_run_id,
-                include_hospital_enrollment=available.get("provider_enrollment_hospital", False),
-                include_fqhc_enrollment=available.get("provider_enrollment_fqhc", False),
-                include_npi_address_key=(
-                    available.get("npi", False)
-                    and available.get("npi_address", False)
-                    and available.get("npi_taxonomy", False)
+            _SupportStageStatement(
+                "facility anchor npi candidate",
+                _facility_anchor_npi_candidate_sql(
+                    db_schema,
+                    stage_tables[FacilityAnchorNPICandidate],
+                    stage_table,
+                    source_run_id=source_run_id,
+                    include_hospital_enrollment=available.get("provider_enrollment_hospital", False),
+                    include_fqhc_enrollment=available.get("provider_enrollment_fqhc", False),
+                    include_npi_address_key=(
+                        available.get("npi", False)
+                        and available.get("npi_address", False)
+                        and available.get("npi_taxonomy", False)
+                    ),
+                    include_npi_registry=(
+                        include_nppes_candidates
+                        and available.get("npi", False)
+                        and available.get("npi_address", False)
+                    ),
+                    include_npi_taxonomy=available.get("npi_taxonomy", False),
+                    include_nucc_taxonomy=available.get("nucc_taxonomy", False),
+                    include_npi_other_identifier=(
+                        include_other_identifier_candidates
+                        and available.get("npi_other_identifier", False)
+                    ),
+                    include_provider_additional_npi=available.get(
+                        "provider_enrollment_ffs_additional_npi", False
+                    ),
+                    include_facility_anchor=available.get("facility_anchor", False),
                 ),
-                include_npi_registry=(
-                    include_nppes_candidates
-                    and available.get("npi", False)
-                    and available.get("npi_address", False)
-                ),
-                include_npi_taxonomy=available.get("npi_taxonomy", False),
-                include_nucc_taxonomy=available.get("nucc_taxonomy", False),
-                include_npi_other_identifier=(
-                    include_other_identifier_candidates
-                    and available.get("npi_other_identifier", False)
-                ),
-                include_provider_additional_npi=available.get(
-                    "provider_enrollment_ffs_additional_npi", False
-                ),
-                include_facility_anchor=available.get("facility_anchor", False),
-            )
+            ),
         )
     if build_network_bridge:
         statements.insert(
             3,
-            _network_bridge_sql(db_schema, stage_tables[EntityAddressNetworkBridge], stage_table),
+            _SupportStageStatement(
+                "network bridge",
+                _network_bridge_sql(db_schema, stage_tables[EntityAddressNetworkBridge], stage_table),
+            ),
         )
     return statements
+
+
+def _support_stage_sql(
+    db_schema: str,
+    stage_table: str,
+    stage_classes: dict[type, type],
+    *,
+    source_run_id: str,
+    node_id: str | None,
+    raw_table: str | None = None,
+    build_network_bridge: bool = True,
+    available: dict[str, bool] | None = None,
+) -> list[str]:
+    return [
+        item.statement
+        for item in _support_stage_statements(
+            db_schema,
+            stage_table,
+            stage_classes,
+            source_run_id=source_run_id,
+            node_id=node_id,
+            raw_table=raw_table,
+            build_network_bridge=build_network_bridge,
+            available=available,
+        )
+    ]
 
 
 async def _populate_support_stage_tables(
@@ -4101,7 +4229,7 @@ async def _populate_support_stage_tables(
     context: dict | None = None,
 ) -> dict[str, int]:
     phase_context = context if context is not None else {}
-    statements = _support_stage_sql(
+    statements = _support_stage_statements(
         db_schema,
         stage_table,
         stage_classes,
@@ -4111,38 +4239,92 @@ async def _populate_support_stage_tables(
         build_network_bridge=build_network_bridge,
         available=available,
     )
+    support_concurrency = min(
+        _env_int(
+            "HLTHPRT_ENTITY_ADDRESS_UNIFIED_SUPPORT_CONCURRENCY",
+            DEFAULT_SUPPORT_STAGE_CONCURRENCY,
+            minimum=1,
+        ),
+        max(1, sum(1 for item in statements if item.parallel)),
+    )
+    phase_context["support_stage_concurrency"] = support_concurrency
     total_steps = len(statements)
-    for index, statement in enumerate(statements, start=1):
-        label = _support_stage_progress_label(statement)
+    completed_steps = 0
+    progress_lock = asyncio.Lock()
+
+    async def _run_item(index: int, item: _SupportStageStatement) -> None:
+        nonlocal completed_steps
         if run_id:
-            enqueue_live_progress(
-                run_id=run_id,
-                importer="entity-address-unified",
-                status="running",
-                phase=f"entity-address-unified building {label}",
-                unit="steps",
-                done=index - 1,
-                total=total_steps,
-                pct=95 + ((index - 1) / max(total_steps, 1)) * 4,
-                message=f"building support table {index}/{total_steps}: {label}",
-            )
+            async with progress_lock:
+                current_done = completed_steps
+                enqueue_live_progress(
+                    run_id=run_id,
+                    importer="entity-address-unified",
+                    status="running",
+                    phase=f"entity-address-unified building {item.label}",
+                    unit="steps",
+                    done=current_done,
+                    total=total_steps,
+                    pct=95 + (current_done / max(total_steps, 1)) * 4,
+                    message=(
+                        f"building support table {index}/{total_steps}: {item.label} "
+                        f"(concurrency {support_concurrency})"
+                    ),
+                )
         await _run_sql_phase(
-            statement,
+            item.statement,
             context=phase_context,
-            phase=f"entity-address-unified building {label}",
+            phase=f"entity-address-unified building {item.label}",
         )
-        if run_id:
-            enqueue_live_progress(
-                run_id=run_id,
-                importer="entity-address-unified",
-                status="running",
-                phase=f"entity-address-unified built {label}",
-                unit="steps",
-                done=index,
-                total=total_steps,
-                pct=95 + (index / max(total_steps, 1)) * 4,
-                message=f"built support table {index}/{total_steps}: {label}",
-            )
+
+    async def _finish_item(index: int, item: _SupportStageStatement) -> None:
+        nonlocal completed_steps
+        await _run_item(index, item)
+        async with progress_lock:
+            completed_steps += 1
+            if run_id:
+                enqueue_live_progress(
+                    run_id=run_id,
+                    importer="entity-address-unified",
+                    status="running",
+                    phase=f"entity-address-unified built {item.label}",
+                    unit="steps",
+                    done=completed_steps,
+                    total=total_steps,
+                    pct=95 + (completed_steps / max(total_steps, 1)) * 4,
+                    message=f"built support table {index}/{total_steps}: {item.label}",
+                )
+
+    async def _run_parallel_batch(batch: list[tuple[int, _SupportStageStatement]]) -> None:
+        if not batch:
+            return
+        if support_concurrency <= 1 or len(batch) == 1:
+            for index, item in batch:
+                await _finish_item(index, item)
+            return
+        semaphore = asyncio.Semaphore(support_concurrency)
+
+        async def _guarded(index: int, item: _SupportStageStatement) -> None:
+            async with semaphore:
+                await _finish_item(index, item)
+
+        results = await asyncio.gather(
+            *(_guarded(index, item) for index, item in batch),
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+
+    parallel_batch: list[tuple[int, _SupportStageStatement]] = []
+    for index, item in enumerate(statements, start=1):
+        if item.parallel:
+            parallel_batch.append((index, item))
+            continue
+        await _run_parallel_batch(parallel_batch)
+        parallel_batch = []
+        await _finish_item(index, item)
+    await _run_parallel_batch(parallel_batch)
     counts: dict[str, int] = {}
     for model, stage_cls in stage_classes.items():
         counts[model.__tablename__] = int(
@@ -6917,7 +7099,12 @@ async def process_data(ctx, task=None):
         context["stage_indexes_prepared"] = True
 
     if not ctx["context"].get("support_stage_indexes_prepared"):
-        await _create_support_stage_indexes(support_stage_classes, db_schema, context=context)
+        await _create_support_stage_indexes(
+            support_stage_classes,
+            db_schema,
+            context=context,
+            run_id=run_id,
+        )
         context["support_stage_indexes_prepared"] = True
 
     staged_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{stage_table};") or 0)

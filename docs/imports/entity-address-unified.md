@@ -73,6 +73,8 @@ unless `--publish` or import-control `publish=true` is supplied.
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_AGGREGATE_CONCURRENCY`
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_EVIDENCE_SHARDS`
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_EVIDENCE_CONCURRENCY`
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_SUPPORT_CONCURRENCY` (default `4`; fan-out for independent support-table inserts after the unified stage is built)
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_SUPPORT_INDEX_CONCURRENCY` (default `2`; fan-out for support-table index builds)
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_DEFER_ADDITIONAL_INDEXES`
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_REUSE_STAGE` (default `false`; retry only, resumes from an already-materialized stage table for the current import id)
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_WORK_MEM`
