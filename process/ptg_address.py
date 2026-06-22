@@ -41,6 +41,7 @@ PTG_ADDRESS_QUEUE_NAME = "arq:PTGAddress"
 DEFAULT_MIN_ROWS = 1
 PTG_ADDRESS_ARCHIVE_SOURCE_BIT = 128
 PTG_ADDRESS_ARCHIVE_PRIORITY = 8
+PTG_ADDRESS_MEMBER_FALLBACK_SOURCE_KEY = "ptg_member_fallback"
 PTG_PROVIDER_GROUP_LOCATION_PREFIX = "ptg2_provider_group_location_"
 PTG_PROVIDER_GROUP_MEMBER_PREFIX = "ptg2_provider_group_member_"
 PTG_SERVING_RATE_COMPACT_PREFIX = "ptg2_serving_rate_compact_"
@@ -769,6 +770,269 @@ def _ptg_address_insert_sql(
     """
 
 
+def _ptg_member_coverage_table_name(stage_table: str) -> str:
+    return _archived_identifier(f"{stage_table}_member_coverage", "")
+
+
+def _ptg_member_coverage_insert_sql(
+    db_schema: str,
+    coverage_table: str,
+    *,
+    source_key: str,
+    snapshot_id: str,
+    provider_group_member_table: str,
+    npi_range_start: int | None = None,
+    npi_range_end: int | None = None,
+) -> str:
+    npi_filter = _npi_range_filter("npi", npi_range_start, npi_range_end)
+    return f"""
+    INSERT INTO {db_schema}.{coverage_table} (source_key, snapshot_id, npi)
+    SELECT DISTINCT
+        {_sql_literal(source_key)}::varchar AS source_key,
+        {_sql_literal(snapshot_id)}::varchar AS snapshot_id,
+        npi::bigint AS npi
+      FROM {_qualified_table_ref(db_schema, provider_group_member_table)}
+     WHERE npi IS NOT NULL
+{npi_filter};
+    """
+
+
+def _ptg_address_insert_member_coverage_sql(
+    db_schema: str,
+    stage_table: str,
+    coverage_table: str,
+    *,
+    source_key: str,
+    snapshot_id: str,
+    node_id: str | None,
+    address_canon_available: bool,
+    archive_available: bool,
+) -> str:
+    country_expr = "country_code"
+    address_key_expr = (
+        f"COALESCE(source_address_key, {db_schema}.addr_key_v1(first_line, second_line, city, state, postal_code, {country_expr}))"
+        if address_canon_available
+        else "source_address_key"
+    )
+    archive_join = (
+        f"LEFT JOIN {db_schema}.address_archive_v2 a "
+        "ON a.address_key = k.address_key AND a.merged_into IS NULL"
+        if archive_available
+        else ""
+    )
+    lat_expr = "COALESCE(a.lat, k.lat)" if archive_available else "k.lat"
+    long_expr = 'COALESCE(a."long", k.long)' if archive_available else "k.long"
+    archive_fields = (
+        "a.premise_key, "
+        "'v' || COALESCE(a.identity_version, 2)::text AS archive_identity_version, "
+        "COALESCE(a.precision, CASE WHEN k.address_key IS NULL THEN 'unknown' ELSE 'street' END) AS address_precision, "
+        "COALESCE(a.zip5, k.source_zip5) AS zip5, "
+        "COALESCE(NULLIF(upper(left(a.state_code, 2)), ''), k.source_state_code) AS state_code, "
+        "COALESCE(a.city_norm, k.source_city_norm) AS city_norm, "
+        "NULL::varchar AS county_fips"
+        if archive_available
+        else (
+            "NULL::uuid AS premise_key, "
+            f"'{ARCHIVE_IDENTITY_VERSION}'::varchar AS archive_identity_version, "
+            "CASE WHEN k.address_key IS NULL THEN 'unknown' ELSE 'street' END::varchar AS address_precision, "
+            "k.source_zip5 AS zip5, "
+            "k.source_state_code AS state_code, "
+            "k.source_city_norm AS city_norm, "
+            "NULL::varchar AS county_fips"
+        )
+    )
+    entity_id_expr = "'npi:' || e.npi::text"
+    location_key = _location_key_expr(
+        entity_type="'ptg'",
+        entity_id=entity_id_expr,
+        npi="e.npi",
+        inferred_npi="NULL::bigint",
+        address_role_id="4",
+        row_origin="'ptg_overlay'",
+        address_key="e.address_key",
+        source_id="7",
+        source_record_id="e.location_hash",
+        zip5="e.zip5",
+        state_code="e.state_code",
+        city_norm="e.city_norm",
+    )
+    return f"""
+    INSERT INTO {db_schema}.{stage_table} (
+        node_id,
+        source_key,
+        snapshot_id,
+        plan_id,
+        ptg_plan_id,
+        market_type,
+        provider_group_id,
+        provider_set_id,
+        npi,
+        tin,
+        location_key,
+        address_key,
+        premise_key,
+        archive_identity_version,
+        address_precision,
+        address_source_id,
+        address_source_record_key,
+        address_role_id,
+        location_confidence_id,
+        zip5,
+        state_code,
+        city_norm,
+        county_fips,
+        lat,
+        long,
+        ptg_plan_array,
+        ptg_source_array,
+        group_plan_array,
+        base_address_version,
+        ptg_snapshot_published_at,
+        observed_at,
+        updated_at
+    )
+    WITH source_plans AS (
+        SELECT
+            c.npi,
+            ARRAY_REMOVE(
+                ARRAY_AGG(DISTINCT NULLIF(c.source_key, '') ORDER BY NULLIF(c.source_key, '')),
+                NULL
+            )::varchar[] AS ptg_source_array,
+            ARRAY_REMOVE(
+                ARRAY_AGG(DISTINCT NULLIF(ps.plan_id::text, '') ORDER BY NULLIF(ps.plan_id::text, '')),
+                NULL
+            )::varchar[] AS ptg_plan_array
+          FROM {db_schema}.{coverage_table} c
+          LEFT JOIN {_quote_ident(db_schema)}.ptg2_current_plan_source ps
+            ON ps.source_key = c.source_key
+           AND ps.snapshot_id = c.snapshot_id
+         WHERE c.npi IS NOT NULL
+         GROUP BY c.npi
+    ),
+    shaped AS (
+        SELECT
+            (
+                'provider_group_member_npi_address:' || a.npi::text || ':' ||
+                COALESCE(NULLIF(a.checksum::text, ''), md5(concat_ws('|',
+                    COALESCE(a.first_line::text, ''),
+                    COALESCE(a.second_line::text, ''),
+                    COALESCE(a.city_name::text, ''),
+                    COALESCE(a.state_name::text, ''),
+                    COALESCE(a.postal_code::text, ''),
+                    COALESCE(a.country_code::text, '')
+                )))
+            )::varchar AS location_hash,
+            a.npi::bigint AS npi,
+            'npi_address'::varchar AS location_source,
+            'provider_group_member_npi_address'::varchar AS confidence_code,
+            NULLIF(BTRIM(a.state_name), '')::varchar AS state,
+            NULLIF(BTRIM(a.city_name), '')::varchar AS city,
+            NULLIF(
+                LEFT(REGEXP_REPLACE(COALESCE(a.postal_code, ''), '[^0-9]', '', 'g'), 5),
+                ''
+            )::varchar AS zip5,
+            a.lat::numeric AS lat,
+            a."long"::numeric AS long,
+            NULLIF(BTRIM(a.first_line), '')::varchar AS first_line,
+            NULLIF(BTRIM(a.second_line), '')::varchar AS second_line,
+            NULLIF(BTRIM(a.postal_code), '')::varchar AS postal_code,
+            COALESCE(NULLIF(BTRIM(a.country_code), ''), 'US')::varchar AS country_code,
+            NULL::varchar AS provider_group_id,
+            NULL::varchar AS provider_set_id,
+            NULL::varchar AS tin,
+            NULL::uuid AS source_address_key,
+            a.date_added::timestamptz AS created_at,
+            sp.ptg_source_array,
+            sp.ptg_plan_array,
+            sp.ptg_plan_array AS group_plan_array
+          FROM source_plans sp
+          JOIN {_quote_ident(db_schema)}.npi_address a
+            ON a.npi = sp.npi
+           AND a.type = 'primary'
+    ),
+    keyed AS (
+        SELECT
+            *,
+            NULLIF(LEFT(REGEXP_REPLACE(COALESCE(postal_code, ''), '[^0-9]', '', 'g'), 5), '')::varchar AS source_zip5,
+            NULLIF(upper(left(BTRIM(COALESCE(state, '')), 2)), '')::varchar AS source_state_code,
+            NULLIF(regexp_replace(lower(COALESCE(city, '')), '[^a-z0-9]', '', 'g'), '')::varchar AS source_city_norm,
+            {address_key_expr} AS address_key
+          FROM shaped
+    ),
+    enriched AS (
+        SELECT
+            k.location_hash,
+            k.npi,
+            k.location_source,
+            k.confidence_code,
+            k.state,
+            k.city,
+            {lat_expr} AS lat,
+            {long_expr} AS long,
+            k.first_line,
+            k.second_line,
+            k.postal_code,
+            k.country_code,
+            k.provider_group_id,
+            k.provider_set_id,
+            k.tin,
+            k.created_at,
+            k.ptg_source_array,
+            k.ptg_plan_array,
+            k.group_plan_array,
+            k.source_zip5,
+            k.source_state_code,
+            k.source_city_norm,
+            k.address_key,
+            {archive_fields}
+          FROM keyed k
+          {archive_join}
+    )
+    SELECT
+        {_sql_literal(node_id)}::varchar AS node_id,
+        {_sql_literal(source_key)}::varchar AS source_key,
+        {_sql_literal(snapshot_id)}::varchar AS snapshot_id,
+        CASE WHEN CARDINALITY(COALESCE(e.ptg_plan_array, ARRAY[]::varchar[])) = 1
+             THEN e.ptg_plan_array[1]
+             ELSE NULL
+        END::varchar AS plan_id,
+        CASE WHEN CARDINALITY(COALESCE(e.ptg_plan_array, ARRAY[]::varchar[])) = 1
+             THEN e.ptg_plan_array[1]
+             ELSE NULL
+        END::varchar AS ptg_plan_id,
+        NULL::varchar AS market_type,
+        e.provider_group_id,
+        e.provider_set_id,
+        e.npi,
+        e.tin,
+        {location_key} AS location_key,
+        e.address_key,
+        e.premise_key,
+        e.archive_identity_version,
+        e.address_precision,
+        1::smallint AS address_source_id,
+        e.location_hash::varchar AS address_source_record_key,
+        4::smallint AS address_role_id,
+        4::smallint AS location_confidence_id,
+        e.zip5,
+        e.state_code,
+        e.city_norm,
+        e.county_fips,
+        e.lat,
+        e.long,
+        COALESCE(e.ptg_plan_array, ARRAY[]::varchar[]) AS ptg_plan_array,
+        COALESCE(e.ptg_source_array, ARRAY[]::varchar[]) AS ptg_source_array,
+        COALESCE(e.group_plan_array, ARRAY[]::varchar[]) AS group_plan_array,
+        {_sql_literal(BASE_ADDRESS_VERSION)}::varchar AS base_address_version,
+        NULL::timestamptz AS ptg_snapshot_published_at,
+        COALESCE(e.created_at, NOW())::timestamptz AS observed_at,
+        NOW()::timestamptz AS updated_at
+      FROM enriched e
+     WHERE e.zip5 IS NOT NULL OR e.state_code IS NOT NULL OR e.address_key IS NOT NULL
+    ON CONFLICT (source_key, snapshot_id, location_key) DO NOTHING;
+    """
+
+
 def _ptg_archive_stage_table_name(stage_table: str) -> str:
     return _archived_identifier(f"{stage_table}_archive_source", "")
 
@@ -899,6 +1163,165 @@ async def _insert_ptg_address_source(
         "npi_range_start": str(npi_range_start) if npi_range_start is not None else None,
         "npi_range_end": str(npi_range_end) if npi_range_end is not None else None,
     }
+
+
+async def _insert_ptg_member_coverage_source(
+    db_schema: str,
+    coverage_table: str,
+    *,
+    source_context: dict[str, str | None],
+) -> dict[str, str | None]:
+    source_key = str(source_context["source_key"] or "")
+    snapshot_id = str(source_context["snapshot_id"] or "")
+    provider_group_member_table = str(source_context.get("provider_group_member_table") or "")
+    npi_range_start = source_context.get("npi_range_start")
+    npi_range_end = source_context.get("npi_range_end")
+    if not provider_group_member_table:
+        raise RuntimeError(f"PTG member coverage source {source_key}/{snapshot_id} has no member table")
+    timeout = _postgres_setting_literal(
+        os.getenv("HLTHPRT_PTG_ADDRESS_STATEMENT_TIMEOUT"),
+        "0",
+    )
+    async with db.transaction() as session:
+        await session.execute(db.text(f"SET LOCAL statement_timeout = {timeout};"))
+        await session.execute(
+            db.text(
+                _ptg_member_coverage_insert_sql(
+                    db_schema,
+                    coverage_table,
+                    source_key=source_key,
+                    snapshot_id=snapshot_id,
+                    provider_group_member_table=provider_group_member_table,
+                    npi_range_start=int(npi_range_start) if npi_range_start is not None else None,
+                    npi_range_end=int(npi_range_end) if npi_range_end is not None else None,
+                )
+            )
+        )
+    return {
+        "source_key": source_key,
+        "snapshot_id": snapshot_id,
+        "source_unit": source_context.get("source_unit"),
+        "npi_range_start": str(npi_range_start) if npi_range_start is not None else None,
+        "npi_range_end": str(npi_range_end) if npi_range_end is not None else None,
+    }
+
+
+async def _insert_ptg_member_fallback_aggregate(
+    db_schema: str,
+    stage_table: str,
+    *,
+    source_contexts: list[dict[str, str | None]],
+    node_id: str | None,
+    address_canon_available: bool,
+    archive_available: bool,
+    insert_concurrency: int,
+    run_id: str,
+) -> dict[str, Any]:
+    if not source_contexts:
+        return {
+            "source_key": PTG_ADDRESS_MEMBER_FALLBACK_SOURCE_KEY,
+            "snapshot_id": stage_table,
+            "member_coverage_sources": 0,
+            "member_coverage_rows": 0,
+        }
+
+    coverage_table = _ptg_member_coverage_table_name(stage_table)
+    coverage_index = _stage_index_name(coverage_table, "npi")
+    coverage_source_index = _stage_index_name(coverage_table, "source_snapshot")
+    await db.status(f"DROP TABLE IF EXISTS {db_schema}.{coverage_table};")
+    try:
+        await db.status(
+            f"""
+            CREATE UNLOGGED TABLE {db_schema}.{coverage_table} (
+                source_key varchar NOT NULL,
+                snapshot_id varchar NOT NULL,
+                npi bigint NOT NULL
+            );
+            """
+        )
+        coverage_results: list[dict[str, str | None]] = []
+        coverage_sem = asyncio.Semaphore(insert_concurrency)
+
+        async def _insert_coverage_one(source_context: dict[str, str | None]) -> dict[str, str | None]:
+            async with coverage_sem:
+                return await _insert_ptg_member_coverage_source(
+                    db_schema,
+                    coverage_table,
+                    source_context=source_context,
+                )
+
+        coverage_tasks = [asyncio.create_task(_insert_coverage_one(source_context)) for source_context in source_contexts]
+        try:
+            for future in asyncio.as_completed(coverage_tasks):
+                result = await future
+                coverage_results.append(result)
+                if run_id:
+                    done = len(coverage_results)
+                    total = len(source_contexts)
+                    enqueue_live_progress(
+                        run_id=run_id,
+                        importer="ptg-address",
+                        status="running",
+                        phase="staging PTG member coverage",
+                        unit="source units",
+                        done=done,
+                        total=total,
+                        pct=min(70, max(5, (done / max(total, 1)) * 70)),
+                        message=f"staged {done}/{total} PTG member coverage source units",
+                    )
+        except Exception:
+            for task_item in coverage_tasks:
+                task_item.cancel()
+            await asyncio.gather(*coverage_tasks, return_exceptions=True)
+            raise
+
+        await db.status(f"CREATE INDEX {coverage_index} ON {db_schema}.{coverage_table} (npi);")
+        await db.status(
+            f"CREATE INDEX {coverage_source_index} ON {db_schema}.{coverage_table} (source_key, snapshot_id);"
+        )
+        await db.status(f"ANALYZE {db_schema}.{coverage_table};")
+        coverage_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{coverage_table};") or 0)
+        if run_id:
+            enqueue_live_progress(
+                run_id=run_id,
+                importer="ptg-address",
+                status="running",
+                phase="materializing PTG member fallback addresses",
+                unit="coverage rows",
+                done=coverage_rows,
+                total=coverage_rows,
+                pct=75,
+                message=f"materializing addresses for {coverage_rows} PTG member coverage rows",
+            )
+        timeout = _postgres_setting_literal(
+            os.getenv("HLTHPRT_PTG_ADDRESS_STATEMENT_TIMEOUT"),
+            "0",
+        )
+        async with db.transaction() as session:
+            await session.execute(db.text(f"SET LOCAL statement_timeout = {timeout};"))
+            await session.execute(
+                db.text(
+                    _ptg_address_insert_member_coverage_sql(
+                        db_schema,
+                        stage_table,
+                        coverage_table,
+                        source_key=PTG_ADDRESS_MEMBER_FALLBACK_SOURCE_KEY,
+                        snapshot_id=stage_table,
+                        node_id=node_id,
+                        address_canon_available=address_canon_available,
+                        archive_available=archive_available,
+                    )
+                )
+            )
+        return {
+            "source_key": PTG_ADDRESS_MEMBER_FALLBACK_SOURCE_KEY,
+            "snapshot_id": stage_table,
+            "source_unit": "member_coverage_aggregate",
+            "member_coverage_sources": len(source_contexts),
+            "member_coverage_rows": coverage_rows,
+        }
+    finally:
+        await db.status(f"DROP TABLE IF EXISTS {db_schema}.{coverage_table};")
 
 
 async def process_data(ctx, task=None):
@@ -1110,45 +1533,83 @@ async def process_data(ctx, task=None):
 
     insert_concurrency = _env_positive_int("HLTHPRT_PTG_ADDRESS_SOURCE_CONCURRENCY", 1)
     context["source_insert_concurrency"] = insert_concurrency
-    insert_unit = "source units" if sharded_sources else "sources"
-    insert_results: list[dict[str, str | None]] = []
-    insert_sem = asyncio.Semaphore(insert_concurrency)
-
-    async def _insert_one(source_context: dict[str, str | None]) -> dict[str, str | None]:
-        async with insert_sem:
-            return await _insert_ptg_address_source(
-                db_schema,
-                stage_table,
-                source_context=source_context,
-                node_id=node_id,
-                address_canon_available=address_canon_available,
-                archive_available=archive_available,
+    member_fallback_contexts = [
+        source_context
+        for source_context in source_contexts
+        if source_context.get("provider_group_member_table") and not source_context.get("provider_group_location_table")
+    ]
+    direct_source_contexts = [
+        source_context
+        for source_context in source_contexts
+        if source_context not in member_fallback_contexts
+    ]
+    context["member_fallback_source_units"] = len(member_fallback_contexts)
+    context["direct_source_units"] = len(direct_source_contexts)
+    insert_unit = "source units" if sharded_sources or direct_source_contexts else "sources"
+    insert_results: list[dict[str, Any]] = []
+    if member_fallback_contexts:
+        aggregate_result = await _insert_ptg_member_fallback_aggregate(
+            db_schema,
+            stage_table,
+            source_contexts=member_fallback_contexts,
+            node_id=node_id,
+            address_canon_available=address_canon_available,
+            archive_available=archive_available,
+            insert_concurrency=insert_concurrency,
+            run_id=run_id,
+        )
+        insert_results.append(aggregate_result)
+        if run_id:
+            enqueue_live_progress(
+                run_id=run_id,
+                importer="ptg-address",
+                status="running",
+                phase="PTG member fallback addresses materialized",
+                unit="steps",
+                done=1,
+                total=1 + len(direct_source_contexts),
+                pct=80 if direct_source_contexts else 90,
+                message="materialized aggregate PTG member fallback addresses",
             )
 
-    insert_tasks = [asyncio.create_task(_insert_one(source_context)) for source_context in source_contexts]
-    try:
-        for future in asyncio.as_completed(insert_tasks):
-            result = await future
-            insert_results.append(result)
-            if run_id:
-                done = len(insert_results)
-                total = len(source_contexts)
-                enqueue_live_progress(
-                    run_id=run_id,
-                    importer="ptg-address",
-                    status="running",
-                    phase="staging PTG address sources",
-                    unit=insert_unit,
-                    done=done,
-                    total=total,
-                    pct=min(90, max(5, (done / max(total, 1)) * 90)),
-                    message=f"staged {done}/{total} PTG address {insert_unit}",
+    if direct_source_contexts:
+        insert_sem = asyncio.Semaphore(insert_concurrency)
+
+        async def _insert_one(source_context: dict[str, str | None]) -> dict[str, str | None]:
+            async with insert_sem:
+                return await _insert_ptg_address_source(
+                    db_schema,
+                    stage_table,
+                    source_context=source_context,
+                    node_id=node_id,
+                    address_canon_available=address_canon_available,
+                    archive_available=archive_available,
                 )
-    except Exception:
-        for task_item in insert_tasks:
-            task_item.cancel()
-        await asyncio.gather(*insert_tasks, return_exceptions=True)
-        raise
+
+        insert_tasks = [asyncio.create_task(_insert_one(source_context)) for source_context in direct_source_contexts]
+        try:
+            for future in asyncio.as_completed(insert_tasks):
+                result = await future
+                insert_results.append(result)
+                if run_id:
+                    done = len(insert_results)
+                    total = len(direct_source_contexts) + (1 if member_fallback_contexts else 0)
+                    enqueue_live_progress(
+                        run_id=run_id,
+                        importer="ptg-address",
+                        status="running",
+                        phase="staging PTG address sources",
+                        unit=insert_unit,
+                        done=done,
+                        total=total,
+                        pct=min(90, max(5, (done / max(total, 1)) * 90)),
+                        message=f"staged {done}/{total} PTG address {insert_unit}",
+                    )
+        except Exception:
+            for task_item in insert_tasks:
+                task_item.cancel()
+            await asyncio.gather(*insert_tasks, return_exceptions=True)
+            raise
     context["source_insert_results"] = insert_results
     await _create_stage_indexes(stage_cls, db_schema)
     await db.status(f"ANALYZE {db_schema}.{stage_table};")

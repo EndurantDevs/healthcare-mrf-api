@@ -2050,6 +2050,54 @@ def test_ptg_address_member_sql_can_use_npi_range_predicate():
     assert "npi %" not in sql
 
 
+def test_ptg_member_coverage_insert_sql_stages_distinct_npis_only():
+    sql = ptg_address._ptg_member_coverage_insert_sql(
+        "mrf",
+        "ptg_address_member_coverage",
+        source_key="payer_a",
+        snapshot_id="snap_1",
+        provider_group_member_table="ptg2_provider_group_member_abc123",
+        npi_range_start=2_500_000_000,
+        npi_range_end=5_000_000_000,
+    )
+
+    assert "INSERT INTO mrf.ptg_address_member_coverage (source_key, snapshot_id, npi)" in sql
+    assert "'payer_a'::varchar AS source_key" in sql
+    assert "'snap_1'::varchar AS snapshot_id" in sql
+    assert "SELECT DISTINCT" in sql
+    assert 'FROM "mrf"."ptg2_provider_group_member_abc123"' in sql
+    assert "provider_group_global_id_128" not in sql
+    assert "JOIN" not in sql
+    assert "AND npi >= 2500000000" in sql
+    assert "AND npi < 5000000000" in sql
+
+
+def test_ptg_address_member_coverage_sql_materializes_fallback_once():
+    sql = ptg_address._ptg_address_insert_member_coverage_sql(
+        "mrf",
+        "ptg_address_stage",
+        "ptg_address_member_coverage",
+        source_key=ptg_address.PTG_ADDRESS_MEMBER_FALLBACK_SOURCE_KEY,
+        snapshot_id="ptg_address_stage",
+        node_id="local_mrf",
+        address_canon_available=True,
+        archive_available=True,
+    )
+
+    assert "FROM mrf.ptg_address_member_coverage c" in sql
+    assert 'LEFT JOIN "mrf".ptg2_current_plan_source ps' in sql
+    assert 'JOIN "mrf".npi_address a' in sql
+    assert "ON a.npi = sp.npi" in sql
+    assert "ARRAY_AGG(DISTINCT NULLIF(c.source_key, '')" in sql
+    assert "ARRAY_AGG(DISTINCT NULLIF(ps.plan_id::text, '')" in sql
+    assert "'ptg_member_fallback'::varchar AS source_key" in sql
+    assert "provider_group_global_id_128" not in sql
+    assert "provider_group_members AS MATERIALIZED" not in sql
+    assert "mrf.addr_key_v1(first_line, second_line, city, state, postal_code, country_code)" in sql
+    assert "COALESCE(e.ptg_source_array, ARRAY[]::varchar[]) AS ptg_source_array" in sql
+    assert "ON CONFLICT (source_key, snapshot_id, location_key) DO NOTHING" in sql
+
+
 @pytest.mark.asyncio
 async def test_ptg_address_input_resolves_current_snapshot_manifest_location(monkeypatch):
     class FakeDB:
