@@ -508,7 +508,7 @@ async def main(
     _ = run_id
     await init_db(db)
     try:
-        await ensure_database()
+        await ensure_database(test_mode)
         return await import_terminology_synonyms(test_mode=test_mode, import_id=import_id)
     finally:
         await db.disconnect()
