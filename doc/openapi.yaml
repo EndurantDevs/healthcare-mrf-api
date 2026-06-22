@@ -2314,6 +2314,21 @@ paths:
           schema:
             type: string
           description: Alias for `show`
+        - name: include_sources
+          in: query
+          schema:
+            type: boolean
+          description: Include compact address source and provenance fields for debugging
+        - name: include_evidence
+          in: query
+          schema:
+            type: boolean
+          description: Include detailed address evidence arrays and record identifiers for debugging
+        - name: debug
+          in: query
+          schema:
+            type: boolean
+          description: Convenience flag equivalent to include_sources=true and include_evidence=true
       responses:
         '200':
           description: NPI detail payload
