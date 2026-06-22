@@ -2522,8 +2522,9 @@ paths:
       summary: List provider specialty values for pricing filters
       description: |
         Lists distinct CMS provider type values used by pricing provider searches.
-        The `specialty` filter on pricing search endpoints is a case-insensitive
-        substring match over this provider type text, not a fixed enum.
+        When the terminology synonym import is available, `q`, NUCC taxonomy
+        codes/classifications, and provider-type aliases are resolved before
+        filtering provider type text.
       parameters:
         - name: q
           in: query
@@ -2571,6 +2572,38 @@ paths:
             maximum: 50
             default: 0
           description: Radius around `zip5`; defaults to exact ZIP matching.
+        - name: provider_type
+          in: query
+          schema:
+            type: string
+          description: Provider type alias to resolve through terminology synonyms.
+        - name: classification
+          in: query
+          schema:
+            type: string
+          description: NUCC-style classification alias to resolve through terminology synonyms.
+        - name: taxonomy_code
+          in: query
+          schema:
+            type: string
+          description: NUCC taxonomy code alias to resolve through terminology synonyms.
+        - name: taxonomy_codes
+          in: query
+          schema:
+            type: string
+          description: Comma-separated NUCC taxonomy code aliases.
+        - name: taxonomy_classification
+          in: query
+          schema:
+            type: string
+        - name: taxonomy_specialization
+          in: query
+          schema:
+            type: string
+        - name: taxonomy_section
+          in: query
+          schema:
+            type: string
         - name: page
           in: query
           schema:
@@ -2589,6 +2622,74 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/PricingProviderSpecialtyListResponse'
+  /pricing/provider-types/autocomplete:
+    get:
+      operationId: getPricingProviderTypesAutocomplete
+      summary: Autocomplete provider type and NUCC terminology aliases
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Provider type terminology autocomplete results
+          content:
+            application/json:
+              schema:
+                type: object
+  /pricing/provider-types/resolve:
+    get:
+      operationId: getPricingProviderTypesResolve
+      summary: Resolve a provider type or NUCC alias to pricing provider types
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Provider type terminology resolution
+          content:
+            application/json:
+              schema:
+                type: object
+  /pricing/provider-specialties/autocomplete:
+    get:
+      operationId: getPricingProviderSpecialtiesAutocomplete
+      summary: Autocomplete provider specialties using terminology aliases
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Provider specialty terminology autocomplete results
+          content:
+            application/json:
+              schema:
+                type: object
+  /pricing/provider-specialties/resolve:
+    get:
+      operationId: getPricingProviderSpecialtiesResolve
+      summary: Resolve a provider specialty alias to pricing provider types
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Provider specialty terminology resolution
+          content:
+            application/json:
+              schema:
+                type: object
   /pricing/providers/specialties:
     get:
       operationId: getPricingProvidersSpecialties
@@ -2641,6 +2742,34 @@ paths:
             maximum: 50
             default: 0
           description: Radius around `zip5`; defaults to exact ZIP matching.
+        - name: provider_type
+          in: query
+          schema:
+            type: string
+        - name: classification
+          in: query
+          schema:
+            type: string
+        - name: taxonomy_code
+          in: query
+          schema:
+            type: string
+        - name: taxonomy_codes
+          in: query
+          schema:
+            type: string
+        - name: taxonomy_classification
+          in: query
+          schema:
+            type: string
+        - name: taxonomy_specialization
+          in: query
+          schema:
+            type: string
+        - name: taxonomy_section
+          in: query
+          schema:
+            type: string
         - name: page
           in: query
           schema:
@@ -3067,6 +3196,35 @@ paths:
           in: query
           schema:
             type: string
+        - name: provider_type
+          in: query
+          schema:
+            type: string
+          description: Provider type alias resolved through terminology synonyms before filtering.
+        - name: classification
+          in: query
+          schema:
+            type: string
+        - name: taxonomy_code
+          in: query
+          schema:
+            type: string
+        - name: taxonomy_codes
+          in: query
+          schema:
+            type: string
+        - name: taxonomy_classification
+          in: query
+          schema:
+            type: string
+        - name: taxonomy_specialization
+          in: query
+          schema:
+            type: string
+        - name: taxonomy_section
+          in: query
+          schema:
+            type: string
         - name: q
           in: query
           schema:
@@ -3214,6 +3372,31 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/PricingProcedureAutocompleteResponse'
+  /pricing/procedures/resolve:
+    get:
+      operationId: getPricingProceduresResolve
+      summary: Resolve a procedure/service synonym to procedure codes
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: exact
+          in: query
+          schema:
+            type: boolean
+        - name: include_broad
+          in: query
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: Procedure terminology resolution
+          content:
+            application/json:
+              schema:
+                type: object
   /pricing/prescriptions/autocomplete:
     get:
       operationId: getPricingPrescriptionsAutocomplete
@@ -3245,6 +3428,27 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/PricingPrescriptionAutocompleteResponse'
+  /pricing/medications/resolve:
+    get:
+      operationId: getPricingMedicationsResolve
+      summary: Resolve a medication synonym to drug codes
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: exact
+          in: query
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: Medication terminology resolution
+          content:
+            application/json:
+              schema:
+                type: object
   /pricing/providers/by-procedure:
     get:
       operationId: getPricingProvidersByProcedure
@@ -3286,11 +3490,26 @@ paths:
           schema:
             type: string
           description: Optional specialty text filter. For PTG2 plan-rate results this matches NUCC display name, classification, specialization, or section.
+        - name: provider_type
+          in: query
+          schema:
+            type: string
+          description: Provider type alias resolved through terminology synonyms before filtering.
+        - name: classification
+          in: query
+          schema:
+            type: string
+          description: NUCC-style classification alias resolved through terminology synonyms before filtering.
         - name: taxonomy_code
           in: query
           schema:
             type: string
           description: Optional exact NUCC taxonomy code filter for PTG2 plan-rate provider results.
+        - name: taxonomy_codes
+          in: query
+          schema:
+            type: string
+          description: Comma-separated NUCC taxonomy codes resolved through terminology synonyms for claims results.
         - name: taxonomy_classification
           in: query
           schema:
@@ -3494,6 +3713,35 @@ paths:
           schema:
             type: string
         - name: specialty
+          in: query
+          schema:
+            type: string
+        - name: provider_type
+          in: query
+          schema:
+            type: string
+          description: Provider type alias resolved through terminology synonyms before filtering.
+        - name: classification
+          in: query
+          schema:
+            type: string
+        - name: taxonomy_code
+          in: query
+          schema:
+            type: string
+        - name: taxonomy_codes
+          in: query
+          schema:
+            type: string
+        - name: taxonomy_classification
+          in: query
+          schema:
+            type: string
+        - name: taxonomy_specialization
+          in: query
+          schema:
+            type: string
+        - name: taxonomy_section
           in: query
           schema:
             type: string

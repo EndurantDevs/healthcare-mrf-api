@@ -1265,6 +1265,7 @@ async def test_autocomplete_prescriptions_returns_generic_and_brand():
     request = make_request(
         [
             FakeResult(scalar="mrf.pricing_provider_prescription"),
+            FakeResult(scalar=None),
             FakeResult(scalar=1),
             FakeResult(
                 rows=[
@@ -1303,6 +1304,7 @@ async def test_autocomplete_prescriptions_enriches_ndc_and_rxnorm_codes():
     request = make_request(
         [
             FakeResult(scalar="mrf.pricing_provider_prescription"),
+            FakeResult(scalar=None),
             FakeResult(scalar=1),
             FakeResult(
                 rows=[
@@ -1352,6 +1354,7 @@ async def test_autocomplete_prescriptions_enriches_ndc_and_rxnorm_codes():
 async def test_list_providers_by_procedure_with_q():
     request = make_request(
         [
+            FakeResult(scalar=None),
             FakeResult(scalar=1),
             FakeResult(
                 rows=[
@@ -1397,6 +1400,7 @@ async def test_list_providers_by_procedure_with_q():
 async def test_list_provider_specialties_filters_by_procedure_and_geo():
     request = make_request(
         [
+            FakeResult(scalar=None),
             FakeResult(
                 rows=[
                     {
@@ -1594,6 +1598,7 @@ async def test_list_providers_by_procedure_zip_radius_expands_candidates():
                     {"zip5": "20816", "state": "MD", "city_lower": "bethesda", "distance_miles": 6.5},
                 ]
             ),
+            FakeResult(scalar=None),
             FakeResult(scalar=1),
             FakeResult(
                 rows=[
@@ -1754,6 +1759,7 @@ async def test_list_providers_by_prescription_with_q():
     request = make_request(
         [
             FakeResult(scalar="mrf.pricing_provider_prescription"),
+            FakeResult(scalar=None),
             FakeResult(scalar=1),
             FakeResult(
                 rows=[

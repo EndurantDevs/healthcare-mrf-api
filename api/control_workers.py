@@ -36,6 +36,7 @@ _START_WORKERS: tuple[WorkerSpec, ...] = (
     WorkerSpec("arq:CodeSets", "process.CodeSets", ("code-sets",)),
     WorkerSpec("arq:MSDRG", "process.MSDRG", ("ms-drg",)),
     WorkerSpec("arq:ClinicalReference", "process.ClinicalReference", ("clinical-reference",)),
+    WorkerSpec("arq:TerminologySynonyms", "process.TerminologySynonyms", ("terminology-synonyms",)),
     WorkerSpec("arq:Geo", "process.Geo", ("geo",)),
     WorkerSpec("arq:GeoCensus", "process.GeoCensus", ("geo-census",)),
     WorkerSpec("arq:Attributes", "process.Attributes", ("plan-attributes",)),

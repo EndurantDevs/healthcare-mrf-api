@@ -3807,6 +3807,39 @@ class CodeSynonym(Base, JSONOutputMixin):
     updated_at = Column(DateTime)
 
 
+class TerminologySynonym(Base, JSONOutputMixin):
+    __tablename__ = "terminology_synonym"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("domain", "term_key", "target_system", "target_code"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["domain", "term_key", "target_system", "target_code"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("domain", "term_key"), "name": "terminology_synonym_domain_key_idx"},
+        {"index_elements": ("domain", "lower(synonym)"), "name": "terminology_synonym_domain_synonym_lower_idx"},
+        {"index_elements": ("target_system", "target_code"), "name": "terminology_synonym_target_idx"},
+        {"index_elements": ("domain", "source"), "name": "terminology_synonym_domain_source_idx"},
+        {"index_elements": ("domain", "is_broad"), "name": "terminology_synonym_domain_broad_idx"},
+    ]
+
+    domain = Column(String(32), nullable=False)
+    term_key = Column(String, nullable=False)
+    synonym = Column(String, nullable=False)
+    term_type = Column(String(64), nullable=False)
+    target_system = Column(String(32), nullable=False)
+    target_code = Column(String(128), nullable=False)
+    target_display = Column(String)
+    canonical_term = Column(String)
+    is_broad = Column(Boolean, nullable=False, server_default=text("false"))
+    confidence = Column(Numeric(scale=4, precision=6, asdecimal=False, decimal_return_scale=None))
+    source = Column(String(128), nullable=False)
+    source_attribution = Column(TEXT)
+    license_status = Column(String(64))
+    metadata_json = Column(TEXT)
+    updated_at = Column(DateTime)
+
+
 class CodeRelationship(Base, JSONOutputMixin):
     __tablename__ = "code_relationship"
     __main_table__ = __tablename__

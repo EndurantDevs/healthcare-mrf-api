@@ -59,6 +59,16 @@ def test_importer_registry_exposes_ptg_and_finish_lifecycle():
     assert items["ms-drg"]["family"] == "reference"
     assert items["ms-drg"]["enqueue_adapter"] == "arq_single_job"
     assert items["clinical-reference"]["enqueue_adapter"] == "arq_single_job"
+    assert items["terminology-synonyms"]["family"] == "reference"
+    assert items["terminology-synonyms"]["enqueue_adapter"] == "arq_single_job"
+    assert items["terminology-synonyms"]["queue"] == "arq:TerminologySynonyms"
+    assert items["terminology-synonyms"]["depends_on"] == [
+        "nucc",
+        "code-sets",
+        "clinical-reference",
+        "claims-pricing",
+        "drug-claims",
+    ]
     assert items["geo"]["enqueue_adapter"] == "arq_single_job"
     assert items["geo-census"]["enqueue_adapter"] == "arq_single_job"
     assert items["plan-attributes"]["enqueue_adapter"] == "arq_single_job"

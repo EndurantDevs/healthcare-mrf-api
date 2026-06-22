@@ -30,7 +30,7 @@ from db.models import (CodeCatalog, CodeCrosswalk, PricingProcedure,
                        PricingProviderProcedure,
                        PricingProviderProcedureCostProfile,
                        PricingProviderProcedureLocation,
-                       PricingProcedurePeerStats)
+                       PricingProcedurePeerStats, TerminologySynonym)
 
 blueprint = Blueprint("pricing", url_prefix="/pricing", version=1)
 
@@ -46,6 +46,7 @@ prescription_table = PricingPrescription.__table__
 provider_prescription_table = PricingProviderPrescription.__table__
 code_catalog_table = CodeCatalog.__table__
 code_crosswalk_table = CodeCrosswalk.__table__
+terminology_synonym_table = TerminologySynonym.__table__
 geo_zip_table = GeoZipLookup.__table__
 provider_enrichment_summary_table = ProviderEnrichmentSummary.__table__
 npi_data_table = NPIData.__table__
@@ -1356,6 +1357,237 @@ async def _table_columns(session, table_name: str) -> set[str]:
     if ENABLE_PRICING_SCHEMA_CACHE:
         _PRICING_TABLE_COLUMNS_CACHE[qualified_name] = (time.monotonic(), columns)
     return set(columns)
+
+
+def _normalize_term_key(value: Any) -> str:
+    text_value = str(value or "").strip().lower()
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", text_value)).strip()
+
+
+def _parse_csv_terms(raw: Any) -> list[str]:
+    return [item.strip() for item in str(raw or "").split(",") if item.strip()]
+
+
+def _terminology_item(row: dict[str, Any]) -> dict[str, Any]:
+    metadata_raw = row.get("metadata_json")
+    metadata = {}
+    if metadata_raw:
+        try:
+            metadata = json.loads(metadata_raw)
+        except (TypeError, ValueError):
+            metadata = {"raw": metadata_raw}
+    return {
+        "domain": row.get("domain"),
+        "term": row.get("synonym"),
+        "term_key": row.get("term_key"),
+        "term_type": row.get("term_type"),
+        "target_system": row.get("target_system"),
+        "target_code": row.get("target_code"),
+        "target_display": row.get("target_display"),
+        "canonical_term": row.get("canonical_term"),
+        "is_broad": bool(row.get("is_broad")),
+        "confidence": _as_float(row.get("confidence")),
+        "source": row.get("source"),
+        "source_attribution": row.get("source_attribution"),
+        "license_status": row.get("license_status"),
+        "metadata": metadata,
+    }
+
+
+async def _terminology_available(session) -> bool:
+    return await _table_exists(session, terminology_synonym_table.name)
+
+
+async def _query_terminology(
+    session,
+    *,
+    domain: str,
+    term: Any,
+    exact: bool = False,
+    target_systems: tuple[str, ...] | None = None,
+    include_broad: bool = True,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    term_text = str(term or "").strip()
+    term_key = _normalize_term_key(term_text)
+    if not term_key or not await _terminology_available(session):
+        return []
+
+    synonym_lower = func.lower(func.coalesce(terminology_synonym_table.c.synonym, ""))
+    target_code_lower = func.lower(func.coalesce(terminology_synonym_table.c.target_code, ""))
+    q_like = f"%{term_text.lower()}%"
+    key_like = f"%{term_key}%"
+    filters = [terminology_synonym_table.c.domain == domain]
+    if exact:
+        filters.append(terminology_synonym_table.c.term_key == term_key)
+    else:
+        filters.append(
+            or_(
+                terminology_synonym_table.c.term_key.like(key_like),
+                synonym_lower.like(q_like),
+                target_code_lower.like(q_like),
+            )
+        )
+    if target_systems:
+        filters.append(func.upper(terminology_synonym_table.c.target_system).in_(tuple(system.upper() for system in target_systems)))
+    if not include_broad:
+        filters.append(terminology_synonym_table.c.is_broad.is_(False))
+
+    ranking = case(
+        (terminology_synonym_table.c.term_key == term_key, 0),
+        (terminology_synonym_table.c.term_key.like(f"{term_key}%"), 1),
+        (synonym_lower.like(f"{term_text.lower()}%"), 2),
+        else_=3,
+    )
+    query = (
+        select(terminology_synonym_table)
+        .where(and_(*filters))
+        .order_by(
+            ranking.asc(),
+            terminology_synonym_table.c.confidence.desc().nullslast(),
+            terminology_synonym_table.c.is_broad.asc(),
+            terminology_synonym_table.c.synonym.asc(),
+            terminology_synonym_table.c.target_system.asc(),
+            terminology_synonym_table.c.target_code.asc(),
+        )
+        .limit(limit)
+    )
+    result = await session.execute(query)
+    return [_terminology_item(_row_to_dict(row)) for row in result]
+
+
+async def _resolve_provider_type_terms(
+    session,
+    terms: list[str],
+) -> dict[str, Any]:
+    matches: list[dict[str, Any]] = []
+    provider_types: list[str] = []
+    seen_provider_types: set[str] = set()
+    seen_match_keys: set[tuple[str, str, str]] = set()
+    for term in terms:
+        rows = await _query_terminology(
+            session,
+            domain="provider_type",
+            term=term,
+            exact=True,
+            include_broad=True,
+            limit=25,
+        )
+        for row in rows:
+            match_key = (
+                str(row.get("target_system") or ""),
+                str(row.get("target_code") or ""),
+                str(row.get("term_key") or ""),
+            )
+            if match_key not in seen_match_keys:
+                seen_match_keys.add(match_key)
+                matches.append(row)
+            if str(row.get("target_system") or "").upper() != "PROVIDER_TYPE":
+                if str(row.get("target_system") or "").upper() != "NUCC":
+                    continue
+                provider_type = str(row.get("canonical_term") or row.get("target_display") or "").strip()
+            else:
+                provider_type = str(row.get("target_code") or "").strip()
+            provider_type_key = provider_type.lower()
+            if provider_type and provider_type_key not in seen_provider_types:
+                seen_provider_types.add(provider_type_key)
+                provider_types.append(provider_type)
+    return {
+        "input_terms": terms,
+        "provider_types": provider_types,
+        "matches": matches,
+        "matched": bool(matches),
+    }
+
+
+def _provider_type_search_terms(args, specialty: str | None) -> list[str]:
+    terms: list[str] = []
+    for value in (
+        specialty,
+        args.get("provider_type"),
+        args.get("classification"),
+        args.get("taxonomy_classification"),
+        args.get("taxonomy_specialization"),
+        args.get("taxonomy_code"),
+    ):
+        if value:
+            terms.append(str(value).strip())
+    terms.extend(_parse_csv_terms(args.get("taxonomy_codes")))
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for term in terms:
+        key = _normalize_term_key(term)
+        if key and key not in seen:
+            seen.add(key)
+            deduped.append(term)
+    return deduped
+
+
+async def _provider_type_filter_clause(session, args, provider_type_column, specialty: str | None) -> tuple[Any | None, dict[str, Any] | None]:
+    terms = _provider_type_search_terms(args, specialty)
+    if not terms:
+        return None, None
+    resolution = await _resolve_provider_type_terms(session, terms)
+    provider_types = resolution.get("provider_types") or []
+    if provider_types:
+        lowered = [str(value).strip().lower() for value in provider_types if str(value).strip()]
+        return func.lower(func.trim(provider_type_column)).in_(lowered), resolution
+    if specialty:
+        return func.lower(provider_type_column).like(f"%{specialty}%"), resolution
+    return None, resolution
+
+
+async def _internal_procedure_codes_from_terminology(session, rows: list[dict[str, Any]]) -> list[int]:
+    internal_codes: set[int] = set()
+    seen_pairs: set[tuple[str, str]] = set()
+    for row in rows[:40]:
+        system = str(row.get("target_system") or "").strip().upper()
+        code = str(row.get("target_code") or "").strip().upper()
+        if not system or not code:
+            continue
+        pair = (system, code)
+        if pair in seen_pairs:
+            continue
+        seen_pairs.add(pair)
+        if system == INTERNAL_CODE_SYSTEM and INT_PATTERN.fullmatch(code):
+            internal_codes.add(int(code))
+            continue
+        try:
+            context = await _resolve_code_context(session, system, code, expand_codes=False)
+        except Exception:  # pragma: no cover - defensive fallback for migrating code tables
+            continue
+        internal_codes.update(int(value) for value in context.get("internal_codes", []) if INT_PATTERN.fullmatch(str(value)))
+    return sorted(internal_codes)
+
+
+async def _internal_rx_codes_from_terminology(session, rows: list[dict[str, Any]]) -> list[str]:
+    internal_codes: set[str] = set()
+    external_clauses = []
+    for row in rows[:60]:
+        system = str(row.get("target_system") or "").strip().upper()
+        code = str(row.get("target_code") or "").strip().upper()
+        if not system or not code:
+            continue
+        if system == INTERNAL_RX_CODE_SYSTEM:
+            internal_codes.add(code)
+        else:
+            external_clauses.append(
+                and_(
+                    func.upper(code_crosswalk_table.c.from_system) == system,
+                    func.upper(code_crosswalk_table.c.from_code) == code,
+                    func.upper(code_crosswalk_table.c.to_system) == INTERNAL_RX_CODE_SYSTEM,
+                )
+            )
+    if external_clauses:
+        try:
+            result = await session.execute(select(code_crosswalk_table.c.to_code).where(or_(*external_clauses)))
+            for row in result:
+                value = str(row[0] if not isinstance(row, dict) else row.get("to_code") or "").strip().upper()
+                if value:
+                    internal_codes.add(value)
+        except Exception:  # pragma: no cover - defensive fallback for migrating code tables
+            pass
+    return sorted(internal_codes)
 
 
 def _as_bool(value: Any) -> bool | None:
@@ -3759,8 +3991,14 @@ async def list_pricing_providers(request):
         filters.append(func.upper(provider_table.c.state) == state)
     if city:
         filters.append(func.lower(provider_table.c.city).like(f"%{city}%"))
-    if specialty:
-        filters.append(func.lower(provider_table.c.provider_type).like(f"%{specialty}%"))
+    provider_type_clause, provider_type_resolution = await _provider_type_filter_clause(
+        session,
+        args,
+        provider_table.c.provider_type,
+        specialty,
+    )
+    if provider_type_clause is not None:
+        filters.append(provider_type_clause)
     if q:
         q_like = f"%{q.lower()}%"
         filters.append(
@@ -3856,6 +4094,7 @@ async def list_pricing_providers(request):
                 "state": state or None,
                 "city": city or None,
                 "specialty": specialty or None,
+                "provider_type_resolution": provider_type_resolution,
                 "q": q or None,
                 "min_claims": min_claims,
                 "min_total_cost": min_total_cost,
@@ -5102,6 +5341,13 @@ async def list_procedure_providers(request, code_system: str, code: str):
     specialty = str(args.get("specialty", "")).strip().lower()
     q = str(args.get("q", "")).strip().lower()
     include_legacy_fields = _parse_bool(args.get("include_legacy_fields"), "include_legacy_fields", default=False)
+    args.get("provider_type")
+    args.get("classification")
+    args.get("taxonomy_code")
+    args.get("taxonomy_codes")
+    args.get("taxonomy_classification")
+    args.get("taxonomy_specialization")
+    args.get("taxonomy_section")
 
     year, year_source = await _resolve_year(session, provider_procedure_table, year)
     internal_codes, code_context = await _resolve_internal_codes_for_request(
@@ -5121,8 +5367,14 @@ async def list_procedure_providers(request, code_system: str, code: str):
         filters.append(func.upper(provider_table.c.state) == state)
     if city:
         filters.append(func.lower(provider_table.c.city).like(f"%{city}%"))
-    if specialty:
-        filters.append(func.lower(provider_table.c.provider_type).like(f"%{specialty}%"))
+    provider_type_clause, provider_type_resolution = await _provider_type_filter_clause(
+        session,
+        args,
+        provider_table.c.provider_type,
+        specialty,
+    )
+    if provider_type_clause is not None:
+        filters.append(provider_type_clause)
     if q:
         q_like = f"%{q}%"
         filters.append(
@@ -5208,6 +5460,7 @@ async def list_procedure_providers(request, code_system: str, code: str):
                 "state": state or None,
                 "city": city or None,
                 "specialty": specialty or None,
+                "provider_type_resolution": provider_type_resolution,
                 "q": q or None,
                 "min_claims": min_claims,
                 "min_total_cost": min_total_cost,
@@ -5438,6 +5691,160 @@ async def get_procedure_geo_benchmarks(request, code_system: str, code: str):
     )
 
 
+@blueprint.get("/provider-types/autocomplete", name="pricing.provider_types.autocomplete")
+@blueprint.get("/provider-specialties/autocomplete", name="pricing.provider_specialties.autocomplete")
+async def autocomplete_provider_types(request):
+    session = _get_session(request)
+    args = request.args
+
+    pagination = parse_pagination(args, default_limit=20, max_limit=100)
+    q = _normalize_query_text(args.get("q"), "q", min_len=2)
+    rows = await _query_terminology(
+        session,
+        domain="provider_type",
+        term=q,
+        exact=False,
+        include_broad=True,
+        limit=max((pagination.offset + pagination.limit) * 5, 100),
+    )
+    grouped: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows:
+        target_system = str(row.get("target_system") or "").upper()
+        target_code = str(row.get("target_code") or "")
+        key = (target_system, target_code)
+        current = grouped.get(key)
+        if current is None:
+            current = {
+                "term": row.get("target_display") or row.get("canonical_term") or row.get("term"),
+                "provider_type": target_code if target_system == "PROVIDER_TYPE" else None,
+                "target_system": target_system,
+                "target_code": target_code,
+                "canonical_term": row.get("canonical_term"),
+                "aliases": set(),
+                "sources": set(),
+                "matches": [],
+            }
+            grouped[key] = current
+        if row.get("term"):
+            current["aliases"].add(str(row["term"]))
+        if row.get("source"):
+            current["sources"].add(str(row["source"]))
+        if len(current["matches"]) < 5:
+            current["matches"].append(row)
+
+    ordered = []
+    for item in grouped.values():
+        item["aliases"] = sorted(item["aliases"], key=lambda value: value.lower())
+        item["sources"] = sorted(item["sources"])
+        ordered.append(item)
+    ordered.sort(key=lambda item: (0 if item.get("provider_type") else 1, str(item.get("term") or "").lower()))
+    total = len(ordered)
+    page_items = ordered[pagination.offset: pagination.offset + pagination.limit]
+
+    return response.json(
+        {
+            "items": page_items,
+            "pagination": {
+                "total": total,
+                "limit": pagination.limit,
+                "offset": pagination.offset,
+                "page": pagination.page,
+            },
+            "query": {
+                "q": q,
+                "data_status": "available" if rows else "empty_or_unavailable",
+            },
+        }
+    )
+
+
+@blueprint.get("/provider-types/resolve", name="pricing.provider_types.resolve")
+@blueprint.get("/provider-specialties/resolve", name="pricing.provider_specialties.resolve")
+async def resolve_provider_type(request):
+    session = _get_session(request)
+    q = _normalize_query_text(request.args.get("q"), "q", min_len=2)
+    resolution = await _resolve_provider_type_terms(session, [q])
+    return response.json(
+        {
+            "items": resolution.get("matches", []),
+            "provider_types": resolution.get("provider_types", []),
+            "query": {
+                "q": q,
+                "matched": bool(resolution.get("matches")),
+            },
+        }
+    )
+
+
+@blueprint.get("/procedures/resolve", name="pricing.procedures.resolve")
+@blueprint.get("/services/resolve", name="pricing.services.resolve")
+async def resolve_procedure_term(request):
+    session = _get_session(request)
+    args = request.args
+    q = _normalize_query_text(args.get("q"), "q", min_len=2)
+    exact = _parse_bool(args.get("exact"), "exact", default=True)
+    include_broad = _parse_bool(args.get("include_broad"), "include_broad", default=True)
+    rows = await _query_terminology(
+        session,
+        domain="procedure",
+        term=q,
+        exact=exact,
+        include_broad=include_broad,
+        limit=100,
+    )
+    internal_codes = await _internal_procedure_codes_from_terminology(session, rows)
+    return response.json(
+        {
+            "items": rows,
+            "internal_codes": [str(value) for value in internal_codes],
+            "resolved_codes": [
+                {"code_system": row.get("target_system"), "code": row.get("target_code")}
+                for row in rows
+            ],
+            "query": {
+                "q": q,
+                "exact": exact,
+                "include_broad": include_broad,
+                "matched": bool(rows),
+            },
+        }
+    )
+
+
+@blueprint.get("/medications/resolve", name="pricing.medications.resolve")
+@blueprint.get("/drugs/resolve", name="pricing.drugs.resolve")
+@blueprint.get("/prescriptions/resolve", name="pricing.prescriptions.resolve")
+async def resolve_medication_term(request):
+    session = _get_session(request)
+    args = request.args
+    q = _normalize_query_text(args.get("q"), "q", min_len=2)
+    exact = _parse_bool(args.get("exact"), "exact", default=True)
+    rows = await _query_terminology(
+        session,
+        domain="medication",
+        term=q,
+        exact=exact,
+        include_broad=True,
+        limit=100,
+    )
+    internal_codes = await _internal_rx_codes_from_terminology(session, rows)
+    return response.json(
+        {
+            "items": rows,
+            "internal_codes": internal_codes,
+            "resolved_codes": [
+                {"code_system": row.get("target_system"), "code": row.get("target_code")}
+                for row in rows
+            ],
+            "query": {
+                "q": q,
+                "exact": exact,
+                "matched": bool(rows),
+            },
+        }
+    )
+
+
 @blueprint.get("/procedures/autocomplete", name="pricing.procedures.autocomplete")
 @blueprint.get("/services/autocomplete", name="pricing.services.autocomplete")
 async def autocomplete_procedures(request):
@@ -5527,9 +5934,35 @@ async def autocomplete_procedures(request):
     )
     result = await session.execute(query)
     rows = [_row_to_dict(row) for row in result]
+    terminology_rows = await _query_terminology(
+        session,
+        domain="procedure",
+        term=q,
+        exact=False,
+        target_systems=(_normalize_code_system(code_system_raw),) if code_system_raw else None,
+        include_broad=True,
+        limit=min(fetch_limit, 500),
+    )
 
     if not dedupe_terms:
         items = []
+        for term_row in terminology_rows:
+            code_system = str(term_row.get("target_system") or "").upper()
+            code_value = str(term_row.get("target_code") or "").upper()
+            term = str(term_row.get("canonical_term") or term_row.get("term") or code_value).strip()
+            if not term:
+                continue
+            items.append(
+                {
+                    "term": term,
+                    "matched_term": term_row.get("term"),
+                    "code_systems": [code_system] if code_system else [],
+                    "codes": [{"code_system": code_system, "code": code_value}] if code_system and code_value else [],
+                    "internal_codes": [code_value] if code_system == INTERNAL_CODE_SYSTEM and INT_PATTERN.fullmatch(code_value) else [],
+                    "sources": [term_row.get("source")] if term_row.get("source") else [],
+                    "terminology_match": term_row,
+                }
+            )
         for row in rows:
             display_name = str(row.get("display_name") or row.get("short_description") or row.get("code") or "").strip()
             if not display_name:
@@ -5548,6 +5981,40 @@ async def autocomplete_procedures(request):
         page_items = items[pagination.offset: pagination.offset + pagination.limit]
     else:
         grouped: dict[str, dict[str, Any]] = {}
+        for term_row in terminology_rows:
+            term = str(term_row.get("canonical_term") or term_row.get("target_display") or term_row.get("term") or "").strip()
+            if not term:
+                continue
+            term_key = term.lower()
+            code_system = str(term_row.get("target_system") or "").upper()
+            code_value = str(term_row.get("target_code") or "").upper()
+            current = grouped.get(term_key)
+            if current is None:
+                current = {
+                    "term": term,
+                    "code_systems": set(),
+                    "codes": [],
+                    "internal_codes": set(),
+                    "sources": set(),
+                    "_seen_codes": set(),
+                    "_rank": 0,
+                    "matches": [],
+                }
+                grouped[term_key] = current
+            current["_rank"] = min(current["_rank"], 0)
+            if term_row.get("source"):
+                current["sources"].add(str(term_row["source"]))
+            if len(current.setdefault("matches", [])) < 5:
+                current["matches"].append(term_row)
+            if code_system:
+                current["code_systems"].add(code_system)
+            if code_system and code_value:
+                pair = (code_system, code_value)
+                if pair not in current["_seen_codes"] and len(current["codes"]) < max_codes_per_term:
+                    current["_seen_codes"].add(pair)
+                    current["codes"].append({"code_system": code_system, "code": code_value})
+                if code_system == INTERNAL_CODE_SYSTEM and INT_PATTERN.fullmatch(code_value):
+                    current["internal_codes"].add(code_value)
         for row in rows:
             term = str(row.get("display_name") or row.get("short_description") or row.get("code") or "").strip()
             if not term:
@@ -5573,6 +6040,7 @@ async def autocomplete_procedures(request):
                     "sources": set(),
                     "_seen_codes": set(),
                     "_rank": row_rank,
+                    "matches": [],
                 }
                 grouped[term_key] = current
 
@@ -5602,6 +6070,7 @@ async def autocomplete_procedures(request):
                     "codes": codes,
                     "internal_codes": internal_codes,
                     "sources": sources,
+                    "matches": item.get("matches") or [],
                     "_rank": item["_rank"],
                 }
             )
@@ -5659,6 +6128,13 @@ async def list_provider_specialties(request):
     # Keep this explicit so OpenAPI contract tests see the query parameter.
     args.get("code_system")
     args.get("expand_codes")
+    args.get("provider_type")
+    args.get("classification")
+    args.get("taxonomy_code")
+    args.get("taxonomy_codes")
+    args.get("taxonomy_classification")
+    args.get("taxonomy_specialization")
+    args.get("taxonomy_section")
     args.get("page")
     args.get("limit")
 
@@ -5697,8 +6173,14 @@ async def list_provider_specialties(request):
         filters.append(provider_table.c.zip5.in_(zip_filter_values))
     elif zip5:
         filters.append(provider_table.c.zip5 == zip5)
-    if q:
-        filters.append(func.lower(provider_table.c.provider_type).like(f"%{q}%"))
+    provider_type_clause, provider_type_resolution = await _provider_type_filter_clause(
+        session,
+        args,
+        provider_table.c.provider_type,
+        q,
+    )
+    if provider_type_clause is not None:
+        filters.append(provider_type_clause)
 
     code_context = None
     from_clause = provider_table
@@ -5771,6 +6253,7 @@ async def list_provider_specialties(request):
         "zip5": zip5 or None,
         "zip_radius_miles": zip_radius_miles if zip5 else None,
         "zip_candidate_count": len(zip_filter_values) if zip_filter_values else (1 if zip5 else None),
+        "provider_type_resolution": provider_type_resolution,
     }
     if code_context is not None:
         query_payload.update(
@@ -5797,6 +6280,7 @@ async def list_provider_specialties(request):
 
 @blueprint.get("/prescriptions/autocomplete", name="pricing.prescriptions.autocomplete")
 @blueprint.get("/drugs/autocomplete", name="pricing.drugs.autocomplete")
+@blueprint.get("/medications/autocomplete", name="pricing.medications.autocomplete")
 async def autocomplete_prescriptions(request):
     session = _get_session(request)
     args = request.args
@@ -5827,16 +6311,28 @@ async def autocomplete_prescriptions(request):
     year, year_source = await _resolve_year(session, provider_prescription_table, year)
     q_like = f"%{q}%"
     q_prefix = f"{q}%"
+    terminology_matches = await _query_terminology(
+        session,
+        domain="medication",
+        term=q,
+        exact=True,
+        include_broad=True,
+        limit=50,
+    )
+    terminology_internal_codes = await _internal_rx_codes_from_terminology(session, terminology_matches)
+    text_or_code_filters = [
+        func.lower(func.coalesce(provider_prescription_table.c.rx_name, "")).like(q_like),
+        func.lower(func.coalesce(provider_prescription_table.c.generic_name, "")).like(q_like),
+        func.lower(func.coalesce(provider_prescription_table.c.brand_name, "")).like(q_like),
+        func.lower(func.coalesce(provider_prescription_table.c.rx_code, "")).like(q_like),
+    ]
+    if terminology_internal_codes:
+        text_or_code_filters.append(provider_prescription_table.c.rx_code.in_(terminology_internal_codes))
 
     filters = [
         provider_prescription_table.c.year == year,
         provider_prescription_table.c.rx_code_system == INTERNAL_RX_CODE_SYSTEM,
-        or_(
-            func.lower(func.coalesce(provider_prescription_table.c.rx_name, "")).like(q_like),
-            func.lower(func.coalesce(provider_prescription_table.c.generic_name, "")).like(q_like),
-            func.lower(func.coalesce(provider_prescription_table.c.brand_name, "")).like(q_like),
-            func.lower(func.coalesce(provider_prescription_table.c.rx_code, "")).like(q_like),
-        ),
+        or_(*text_or_code_filters),
     ]
     grouped_query = (
         select(
@@ -5929,6 +6425,11 @@ async def autocomplete_prescriptions(request):
                 "year_source": year_source,
                 "order_by": order_by,
                 "order": order,
+                "medication_term_resolution": {
+                    "input": q,
+                    "matches": terminology_matches,
+                    "internal_codes": terminology_internal_codes,
+                } if terminology_matches else None,
             },
         }
     )
@@ -5992,6 +6493,9 @@ async def list_providers_by_procedure(request):
     snapshot_id = str(args.get("snapshot_id", "")).strip()
     mode = str(args.get("mode", "")).strip()
     npi = _parse_int(args.get("npi"), "npi", minimum=1)
+    args.get("provider_type")
+    args.get("classification")
+    args.get("taxonomy_codes")
 
     if not q and not code:
         raise InvalidUsage("Provide at least one of 'q' or 'code'")
@@ -6124,14 +6628,41 @@ async def list_providers_by_procedure(request):
         filters.append(provider_table.c.zip5.in_(zip_filter_values))
     elif zip5:
         filters.append(provider_table.c.zip5 == zip5)
-    if specialty:
-        filters.append(func.lower(provider_table.c.provider_type).like(f"%{specialty}%"))
+    provider_type_clause, provider_type_resolution = await _provider_type_filter_clause(
+        session,
+        args,
+        provider_table.c.provider_type,
+        specialty,
+    )
+    if provider_type_clause is not None:
+        filters.append(provider_type_clause)
+    procedure_term_resolution: dict[str, Any] | None = None
     if q:
         q_like = f"%{q}%"
+        q_clauses = [
+            func.lower(provider_procedure_table.c.service_description).like(q_like),
+            func.lower(provider_procedure_table.c.reported_code).like(q_like),
+        ]
+        terminology_matches = await _query_terminology(
+            session,
+            domain="procedure",
+            term=q,
+            exact=True,
+            include_broad=True,
+            limit=50,
+        )
+        terminology_internal_codes = await _internal_procedure_codes_from_terminology(session, terminology_matches)
+        if terminology_internal_codes:
+            q_clauses.append(provider_procedure_table.c.procedure_code.in_(terminology_internal_codes))
+        if terminology_matches:
+            procedure_term_resolution = {
+                "input": q,
+                "matches": terminology_matches,
+                "internal_codes": [str(value) for value in terminology_internal_codes],
+            }
         filters.append(
             or_(
-                func.lower(provider_procedure_table.c.service_description).like(q_like),
-                func.lower(provider_procedure_table.c.reported_code).like(q_like),
+                *q_clauses,
             )
         )
     if code:
@@ -6242,6 +6773,8 @@ async def list_providers_by_procedure(request):
         "zip_radius_miles": zip_radius_miles if zip5 else None,
         "zip_candidate_count": len(zip_filter_values) if zip_filter_values else (1 if zip5 else None),
         "specialty": specialty or None,
+        "provider_type_resolution": provider_type_resolution,
+        "procedure_term_resolution": procedure_term_resolution,
         "min_claims": min_claims,
         "min_total_cost": min_total_cost,
         "include_legacy_fields": include_legacy_fields,
@@ -6296,6 +6829,8 @@ async def list_providers_by_procedure(request):
                 "q": q or None,
                 "min_claims": min_claims,
                 "min_total_cost": min_total_cost,
+                "provider_type_resolution": provider_type_resolution,
+                "procedure_term_resolution": procedure_term_resolution,
             },
             "zip_scope": {
                 "anchor_zip5": zip5,
@@ -6325,6 +6860,13 @@ async def list_providers_by_prescription(request):
     specialty = str(args.get("specialty", "")).strip().lower()
     q = str(args.get("q", "")).strip().lower()
     code = str(args.get("code", "")).strip()
+    args.get("provider_type")
+    args.get("classification")
+    args.get("taxonomy_code")
+    args.get("taxonomy_codes")
+    args.get("taxonomy_classification")
+    args.get("taxonomy_specialization")
+    args.get("taxonomy_section")
 
     if not q and not code:
         raise InvalidUsage("Provide at least one of 'q' or 'code'")
@@ -6363,15 +6905,42 @@ async def list_providers_by_prescription(request):
         filters.append(func.lower(provider_prescription_table.c.city).like(f"%{city}%"))
     if zip5:
         filters.append(provider_prescription_table.c.zip5 == zip5)
-    if specialty:
-        filters.append(func.lower(provider_prescription_table.c.provider_type).like(f"%{specialty}%"))
+    provider_type_clause, provider_type_resolution = await _provider_type_filter_clause(
+        session,
+        args,
+        provider_prescription_table.c.provider_type,
+        specialty,
+    )
+    if provider_type_clause is not None:
+        filters.append(provider_type_clause)
+    medication_term_resolution: dict[str, Any] | None = None
     if q:
         q_like = f"%{q}%"
+        q_clauses = [
+            func.lower(provider_prescription_table.c.rx_name).like(q_like),
+            func.lower(provider_prescription_table.c.generic_name).like(q_like),
+            func.lower(provider_prescription_table.c.brand_name).like(q_like),
+        ]
+        terminology_matches = await _query_terminology(
+            session,
+            domain="medication",
+            term=q,
+            exact=True,
+            include_broad=True,
+            limit=50,
+        )
+        terminology_internal_codes = await _internal_rx_codes_from_terminology(session, terminology_matches)
+        if terminology_internal_codes:
+            q_clauses.append(provider_prescription_table.c.rx_code.in_(terminology_internal_codes))
+        if terminology_matches:
+            medication_term_resolution = {
+                "input": q,
+                "matches": terminology_matches,
+                "internal_codes": terminology_internal_codes,
+            }
         filters.append(
             or_(
-                func.lower(provider_prescription_table.c.rx_name).like(q_like),
-                func.lower(provider_prescription_table.c.generic_name).like(q_like),
-                func.lower(provider_prescription_table.c.brand_name).like(q_like),
+                *q_clauses,
             )
         )
     if code:
@@ -6446,6 +7015,8 @@ async def list_providers_by_prescription(request):
         "city": city or None,
         "zip5": zip5 or None,
         "specialty": specialty or None,
+        "provider_type_resolution": provider_type_resolution,
+        "medication_term_resolution": medication_term_resolution,
         "min_claims": min_claims,
         "min_total_cost": min_total_cost,
         "order_by": order_by,

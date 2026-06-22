@@ -36,6 +36,7 @@ _IMPORT_RUN_ADVISORY_LOCK_KEY = 44_706_101_200_001
 
 _IMPORTER_DEPENDENCIES: dict[str, list[str]] = {
     "npi": ["nucc"],
+    "terminology-synonyms": ["nucc", "code-sets", "clinical-reference", "claims-pricing", "drug-claims"],
 }
 
 _SINGLE_JOB_ADAPTERS: dict[str, dict[str, Any]] = {
@@ -74,6 +75,13 @@ _SINGLE_JOB_ADAPTERS: dict[str, dict[str, Any]] = {
         "function": "control_single_job_start",
         "payload": "control_wrapped_kwargs",
         "target_module": "process.clinical_reference",
+        "target_function": "main",
+    },
+    "terminology-synonyms": {
+        "queue": "arq:TerminologySynonyms",
+        "function": "control_single_job_start",
+        "payload": "control_wrapped_kwargs",
+        "target_module": "process.terminology_synonyms",
         "target_function": "main",
     },
     "geo": {
@@ -304,7 +312,7 @@ def _importer_family(importer: str) -> str:
         return "pharmacy"
     if importer in {"geo", "geo-census", "places-zcta", "lodes", "openaddresses"}:
         return "geo"
-    if importer in {"code-sets", "ms-drg", "clinical-reference", "plan-attributes"}:
+    if importer in {"code-sets", "ms-drg", "clinical-reference", "terminology-synonyms", "plan-attributes"}:
         return "reference"
     return "other"
 

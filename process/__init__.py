@@ -56,6 +56,7 @@ from process.claims_pricing import (claims_pricing_finalize,
                                     main as initiate_claims_pricing)
 from process.clinical_reference import main as initiate_clinical_reference
 from process.code_sets import main as initiate_code_sets
+from process.terminology_synonyms import main as initiate_terminology_synonyms
 from process.ms_drg import main as initiate_ms_drg
 from process.drug_claims import (drug_claims_finalize,
                                  drug_claims_process_chunk,
@@ -326,6 +327,19 @@ class ClinicalReference:
     queue_read_limit = 2
     queue_name = "arq:ClinicalReference"
     job_timeout = 86400
+    burst = True
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
+class TerminologySynonyms:
+    functions = [control_single_job_start]
+    on_startup = db_startup
+    max_jobs = 1
+    queue_read_limit = 2
+    queue_name = "arq:TerminologySynonyms"
+    job_timeout = 3600
     burst = True
     redis_settings = build_redis_settings()
     job_serializer = serialize_job
@@ -1031,6 +1045,13 @@ def clinical_reference(test: bool, import_id: str | None, sources: str | None, a
     )
 
 
+@click.command(help="Run terminology synonym/crosswalk materialization import")
+@click.option("--test", is_flag=True, help="Build from a staged test import id.")
+@click.option("--import-id", help="Override import id/date suffix for staging.")
+def terminology_synonyms(test: bool, import_id: str | None):
+    _run(initiate_terminology_synonyms(test_mode=test, import_id=import_id))
+
+
 @click.command(help="Run CMS claims pricing import")
 @click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
 @click.option("--import-id", help="Override import id/date suffix for table names.")
@@ -1425,3 +1446,4 @@ process_group.add_command(nucc)
 process_group.add_command(code_sets, name="code-sets")
 process_group.add_command(ms_drg, name="ms-drg")
 process_group.add_command(clinical_reference, name="clinical-reference")
+process_group.add_command(terminology_synonyms, name="terminology-synonyms")
