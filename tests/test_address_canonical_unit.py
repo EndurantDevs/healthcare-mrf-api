@@ -2024,6 +2024,21 @@ def test_ptg_address_env_positive_int_defaults(monkeypatch):
     assert ptg_address._env_positive_int("HLTHPRT_PTG_ADDRESS_SOURCE_CONCURRENCY", 3) == 3
 
 
+def test_ptg_address_sql_settings_include_bulk_defaults_and_overrides(monkeypatch):
+    monkeypatch.delenv("HLTHPRT_PTG_ADDRESS_WORK_MEM", raising=False)
+    settings = dict(ptg_address._ptg_address_sql_settings())
+    assert settings["work_mem"] == "'2GB'"
+    assert settings["jit"] == "'off'"
+    assert settings["hash_mem_multiplier"] == "'4'"
+    assert settings["statement_timeout"] == "'0'"
+
+    monkeypatch.setenv("HLTHPRT_PTG_ADDRESS_WORK_MEM", "512MB")
+    monkeypatch.setenv("HLTHPRT_PTG_ADDRESS_STATEMENT_TIMEOUT", "30min")
+    settings = dict(ptg_address._ptg_address_sql_settings())
+    assert settings["work_mem"] == "'512MB'"
+    assert settings["statement_timeout"] == "'30min'"
+
+
 def test_ptg_address_member_npi_range_bounds_are_contiguous():
     assert ptg_address._npi_range_bounds(0, 4) == (0, 2_500_000_000)
     assert ptg_address._npi_range_bounds(3, 4) == (7_500_000_000, 10_000_000_000)

@@ -48,6 +48,12 @@ PTG_SERVING_RATE_COMPACT_PREFIX = "ptg2_serving_rate_compact_"
 PTG_PROVIDER_SET_COMPONENT_PREFIX = "ptg2_provider_set_component_"
 PTG_ADDRESS_NPI_RANGE_MAX = 10_000_000_000
 DEFAULT_MEMBER_SHARD_MIN_BYTES = 1_073_741_824
+DEFAULT_SQL_WORK_MEM = "2GB"
+DEFAULT_SQL_TEMP_FILE_LIMIT = "-1"
+DEFAULT_SQL_JIT = "off"
+DEFAULT_SQL_SYNCHRONOUS_COMMIT = "off"
+DEFAULT_SQL_MAX_PARALLEL_WORKERS_PER_GATHER = "8"
+DEFAULT_SQL_HASH_MEM_MULTIPLIER = "4"
 SNAPSHOT_TABLE_NAME_RE = re.compile(r"[a-z0-9_]{1,63}\Z")
 POSTGRES_SETTING_RE = re.compile(r"[A-Za-z0-9_.:-]{1,64}\Z")
 
@@ -94,6 +100,36 @@ def _env_positive_int(name: str, default: int) -> int:
     except ValueError:
         value = 0
     return value if value > 0 else default
+
+
+def _ptg_address_sql_settings(*, include_statement_timeout: bool = True) -> list[tuple[str, str]]:
+    candidates: list[tuple[str, str, str]] = [
+        ("work_mem", "HLTHPRT_PTG_ADDRESS_WORK_MEM", DEFAULT_SQL_WORK_MEM),
+        ("temp_file_limit", "HLTHPRT_PTG_ADDRESS_TEMP_FILE_LIMIT", DEFAULT_SQL_TEMP_FILE_LIMIT),
+        ("jit", "HLTHPRT_PTG_ADDRESS_JIT", DEFAULT_SQL_JIT),
+        ("synchronous_commit", "HLTHPRT_PTG_ADDRESS_SYNCHRONOUS_COMMIT", DEFAULT_SQL_SYNCHRONOUS_COMMIT),
+        (
+            "max_parallel_workers_per_gather",
+            "HLTHPRT_PTG_ADDRESS_MAX_PARALLEL_WORKERS_PER_GATHER",
+            DEFAULT_SQL_MAX_PARALLEL_WORKERS_PER_GATHER,
+        ),
+        (
+            "hash_mem_multiplier",
+            "HLTHPRT_PTG_ADDRESS_HASH_MEM_MULTIPLIER",
+            DEFAULT_SQL_HASH_MEM_MULTIPLIER,
+        ),
+    ]
+    if include_statement_timeout:
+        candidates.append(("statement_timeout", "HLTHPRT_PTG_ADDRESS_STATEMENT_TIMEOUT", "0"))
+    return [
+        (name, _postgres_setting_literal(os.getenv(env_name), default))
+        for name, env_name, default in candidates
+    ]
+
+
+async def _apply_ptg_address_sql_settings(session, *, include_statement_timeout: bool = True) -> None:
+    for name, literal in _ptg_address_sql_settings(include_statement_timeout=include_statement_timeout):
+        await session.execute(db.text(f"SET LOCAL {name} = {literal};"))
 
 
 def _coerce_json_mapping(value: Any) -> dict[str, Any]:
@@ -1149,12 +1185,8 @@ async def _insert_ptg_address_source(
         npi_range_start=int(npi_range_start) if npi_range_start is not None else None,
         npi_range_end=int(npi_range_end) if npi_range_end is not None else None,
     )
-    timeout = _postgres_setting_literal(
-        os.getenv("HLTHPRT_PTG_ADDRESS_STATEMENT_TIMEOUT"),
-        "0",
-    )
     async with db.transaction() as session:
-        await session.execute(db.text(f"SET LOCAL statement_timeout = {timeout};"))
+        await _apply_ptg_address_sql_settings(session)
         await session.execute(db.text(insert_sql))
     return {
         "source_key": source_key,
@@ -1178,12 +1210,8 @@ async def _insert_ptg_member_coverage_source(
     npi_range_end = source_context.get("npi_range_end")
     if not provider_group_member_table:
         raise RuntimeError(f"PTG member coverage source {source_key}/{snapshot_id} has no member table")
-    timeout = _postgres_setting_literal(
-        os.getenv("HLTHPRT_PTG_ADDRESS_STATEMENT_TIMEOUT"),
-        "0",
-    )
     async with db.transaction() as session:
-        await session.execute(db.text(f"SET LOCAL statement_timeout = {timeout};"))
+        await _apply_ptg_address_sql_settings(session)
         await session.execute(
             db.text(
                 _ptg_member_coverage_insert_sql(
@@ -1293,12 +1321,13 @@ async def _insert_ptg_member_fallback_aggregate(
                 pct=75,
                 message=f"materializing addresses for {coverage_rows} PTG member coverage rows",
             )
-        timeout = _postgres_setting_literal(
-            os.getenv("HLTHPRT_PTG_ADDRESS_STATEMENT_TIMEOUT"),
-            "0",
-        )
+        await db.status(f"ANALYZE {db_schema}.npi_address;")
+        if await _table_exists(db_schema, "ptg2_current_plan_source"):
+            await db.status(f"ANALYZE {db_schema}.ptg2_current_plan_source;")
+        if archive_available:
+            await db.status(f"ANALYZE {db_schema}.address_archive_v2;")
         async with db.transaction() as session:
-            await session.execute(db.text(f"SET LOCAL statement_timeout = {timeout};"))
+            await _apply_ptg_address_sql_settings(session)
             await session.execute(
                 db.text(
                     _ptg_address_insert_member_coverage_sql(
