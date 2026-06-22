@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import datetime
+import gzip
 import hashlib
 import logging
 import math
@@ -14,6 +15,7 @@ import re
 import sys
 import tempfile
 import time
+import zlib
 from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit
@@ -65,6 +67,9 @@ logger = logging.getLogger(__name__)
 PTG2_DEFAULT_MAX_BYTES = 64 * 1024 * 1024 * 1024
 _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _MAX_REDIRECTS = 10
+_GZIP_INTEGRITY_CHUNK_BYTES = 8 * 1024 * 1024
+_GZIP_REUSE_VALIDATE_MAX_BYTES_ENV = "HLTHPRT_PTG2_REUSE_GZIP_VALIDATE_MAX_BYTES"
+_GZIP_VALIDATE_FRESH_ENV = "HLTHPRT_PTG2_VALIDATE_FRESH_GZIP"
 
 
 def _expected_gzip_artifact(url: str, path: str | Path) -> bool:
@@ -83,6 +88,33 @@ def _gzip_magic_error(url: str, path: str | Path) -> str | None:
         return f"raw gzip artifact is not readable: {exc}"
     if magic != b"\x1f\x8b":
         return f"raw artifact for gzip URL does not have a gzip header: {artifact_path}"
+    return None
+
+
+def _gzip_reuse_validate_max_bytes() -> int:
+    return _env_int(_GZIP_REUSE_VALIDATE_MAX_BYTES_ENV, 2 * 1024 * 1024 * 1024)
+
+
+def _gzip_integrity_error(url: str, path: str | Path, *, max_bytes: int | None = None) -> str | None:
+    magic_error = _gzip_magic_error(url, path)
+    if magic_error:
+        return magic_error
+    if not _expected_gzip_artifact(url, path):
+        return None
+    artifact_path = Path(path)
+    if max_bytes is not None and max_bytes >= 0:
+        try:
+            if artifact_path.stat().st_size > max_bytes:
+                return None
+        except OSError as exc:
+            return f"raw gzip artifact is not readable: {exc}"
+    try:
+        with gzip.open(artifact_path, "rb") as fp:
+            for chunk in iter(lambda: fp.read(_GZIP_INTEGRITY_CHUNK_BYTES), b""):
+                if not chunk:
+                    break
+    except (EOFError, OSError, zlib.error) as exc:
+        return f"raw gzip artifact failed integrity check: {exc}"
     return None
 
 
@@ -366,6 +398,7 @@ async def download_raw_artifact(
     progress_started_at = time.monotonic()
     progress_interval_bytes = _download_progress_interval_bytes()
     next_progress_bytes = progress_interval_bytes
+    validate_downloaded_gzip = _env_bool(_GZIP_VALIDATE_FRESH_ENV, False)
     if reuse_raw_artifacts:
         candidate, mode = choose_reusable_raw_artifact(store.find_candidates(canonical_url), head, store=store)
         if candidate is not None and mode is not None:
@@ -373,8 +406,13 @@ async def download_raw_artifact(
             raw_path = store.path_from_uri(raw_uri)
             expected = candidate.get("raw_sha256") or candidate.get("sha256")
             actual, byte_count = sha256_file(raw_path)
-            magic_error = _gzip_magic_error(url, raw_path)
+            gzip_error = _gzip_integrity_error(
+                url,
+                raw_path,
+                max_bytes=_gzip_reuse_validate_max_bytes(),
+            )
             if expected and actual != expected:
+                validate_downloaded_gzip = True
                 store.record_manifest(
                     {
                         "artifact_kind": PTG2_ARTIFACT_RAW,
@@ -385,7 +423,8 @@ async def download_raw_artifact(
                         "actual_sha256": actual,
                     }
                 )
-            elif magic_error:
+            elif gzip_error:
+                validate_downloaded_gzip = True
                 store.record_manifest(
                     {
                         "artifact_kind": PTG2_ARTIFACT_RAW,
@@ -394,7 +433,7 @@ async def download_raw_artifact(
                         "raw_sha256": expected or actual,
                         "status": "corrupt",
                         "actual_sha256": actual,
-                        "error": magic_error,
+                        "error": gzip_error,
                     }
                 )
             else:
@@ -556,8 +595,12 @@ async def download_raw_artifact(
         actual_sha, actual_size = sha256_file(final_path)
         if actual_sha != raw_sha:
             raise RuntimeError(f"Checksum verification failed for {final_path}")
-        magic_error = _gzip_magic_error(url, final_path)
-        if magic_error:
+        gzip_error = (
+            _gzip_integrity_error(url, final_path, max_bytes=None)
+            if validate_downloaded_gzip
+            else _gzip_magic_error(url, final_path)
+        )
+        if gzip_error:
             raw_uri = store.storage_uri(final_path)
             store.record_manifest(
                 {
@@ -568,11 +611,11 @@ async def download_raw_artifact(
                     "sha256": actual_sha,
                     "status": "corrupt",
                     "actual_sha256": actual_sha,
-                    "error": magic_error,
+                    "error": gzip_error,
                 }
             )
             final_path.unlink(missing_ok=True)
-            raise RuntimeError(magic_error)
+            raise RuntimeError(gzip_error)
         _emit_download_progress(
             url=url,
             bytes_read=actual_size,
