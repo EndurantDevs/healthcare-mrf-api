@@ -1939,17 +1939,20 @@ def test_ptg_address_insert_sql_uses_provider_group_member_npi_address_fallback(
         provider_group_member_table="ptg2_provider_group_member_abc123",
     )
 
-    assert "provider_group_members AS MATERIALIZED" in sql
+    assert "member_npis AS MATERIALIZED" in sql
+    assert "provider_group_members AS MATERIALIZED" not in sql
     assert 'FROM "mrf"."ptg2_provider_group_member_abc123"' in sql
     assert 'JOIN "mrf".npi_address a' in sql
+    assert "ON a.npi = mn.npi" in sql
     assert "a.type = 'primary'" in sql
     assert "SELECT DISTINCT" in sql
-    assert "'provider_group_member_npi_address:' || pgm.provider_group_id" in sql
+    assert "'provider_group_member_npi_address:' || a.npi::text" in sql
     assert "a.date_added::timestamptz AS created_at" in sql
     assert "a.updated_at" not in sql
     assert "NULL::uuid AS source_address_key" in sql
     assert "a.address_key::uuid AS source_address_key" not in sql
-    assert "NULLIF(provider_group_global_id_128::text, '')::varchar AS provider_group_id" in sql
+    assert "provider_group_global_id_128" not in sql
+    assert "NULL::varchar AS provider_group_id" in sql
     assert "mrf.addr_key_v1(first_line, second_line, city, state, postal_code, country_code)" in sql
     assert "'payer_a'::varchar AS source_key" in sql
     assert "SELECT DISTINCT ON" not in sql
