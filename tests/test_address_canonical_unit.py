@@ -2021,6 +2021,32 @@ def test_ptg_address_env_positive_int_defaults(monkeypatch):
     assert ptg_address._env_positive_int("HLTHPRT_PTG_ADDRESS_SOURCE_CONCURRENCY", 3) == 3
 
 
+def test_ptg_address_member_npi_range_bounds_are_contiguous():
+    assert ptg_address._npi_range_bounds(0, 4) == (0, 2_500_000_000)
+    assert ptg_address._npi_range_bounds(3, 4) == (7_500_000_000, 10_000_000_000)
+    assert ptg_address._npi_range_bounds(0, 1) == (0, 10_000_000_000)
+
+
+def test_ptg_address_member_sql_can_use_npi_range_predicate():
+    sql = ptg_address._ptg_address_insert_sql(
+        "mrf",
+        "ptg_address_stage",
+        source_key="payer_a",
+        snapshot_id="00000000-0000-0000-0000-000000000001",
+        node_id="local_mrf",
+        address_canon_available=True,
+        archive_available=True,
+        provider_group_member_table="ptg2_provider_group_member_abc123",
+        npi_range_start=2_500_000_000,
+        npi_range_end=5_000_000_000,
+    )
+
+    assert 'FROM "mrf"."ptg2_provider_group_member_abc123"' in sql
+    assert "AND npi >= 2500000000" in sql
+    assert "AND npi < 5000000000" in sql
+    assert "npi %" not in sql
+
+
 @pytest.mark.asyncio
 async def test_ptg_address_input_resolves_current_snapshot_manifest_location(monkeypatch):
     class FakeDB:

@@ -45,6 +45,8 @@ PTG_PROVIDER_GROUP_LOCATION_PREFIX = "ptg2_provider_group_location_"
 PTG_PROVIDER_GROUP_MEMBER_PREFIX = "ptg2_provider_group_member_"
 PTG_SERVING_RATE_COMPACT_PREFIX = "ptg2_serving_rate_compact_"
 PTG_PROVIDER_SET_COMPONENT_PREFIX = "ptg2_provider_set_component_"
+PTG_ADDRESS_NPI_RANGE_MAX = 10_000_000_000
+DEFAULT_MEMBER_SHARD_MIN_BYTES = 1_073_741_824
 SNAPSHOT_TABLE_NAME_RE = re.compile(r"[a-z0-9_]{1,63}\Z")
 POSTGRES_SETTING_RE = re.compile(r"[A-Za-z0-9_.:-]{1,64}\Z")
 
@@ -141,6 +143,33 @@ def _snapshot_provider_group_member_table_name(value: Any, db_schema: str) -> st
 
 def _qualified_table_ref(db_schema: str, table_name: str) -> str:
     return f"{_quote_ident(db_schema)}.{_quote_ident(table_name)}"
+
+
+async def _relation_size_bytes(db_schema: str, table_name: str | None) -> int:
+    if not table_name:
+        return 0
+    value = await db.scalar(
+        "SELECT COALESCE(pg_total_relation_size(to_regclass(:qualified_name)), 0);",
+        qualified_name=f"{db_schema}.{table_name}",
+    )
+    return int(value or 0)
+
+
+def _npi_range_bounds(shard_index: int, shard_count: int) -> tuple[int, int]:
+    if shard_count <= 1:
+        return 0, PTG_ADDRESS_NPI_RANGE_MAX
+    start = (PTG_ADDRESS_NPI_RANGE_MAX * shard_index) // shard_count
+    end = (PTG_ADDRESS_NPI_RANGE_MAX * (shard_index + 1)) // shard_count
+    return start, end
+
+
+def _npi_range_filter(column_sql: str, start: int | None, end: int | None) -> str:
+    clauses = []
+    if start is not None and int(start) > 0:
+        clauses.append(f"           AND {column_sql} >= {int(start)}")
+    if end is not None and int(end) < PTG_ADDRESS_NPI_RANGE_MAX:
+        clauses.append(f"           AND {column_sql} < {int(end)}")
+    return "\n".join(clauses)
 
 
 async def _address_canon_available(db_schema: str) -> bool:
@@ -315,8 +344,11 @@ def _provider_location_source_ctes(
     db_schema: str,
     provider_group_location_table: str | None,
     provider_group_member_table: str | None = None,
+    npi_range_start: int | None = None,
+    npi_range_end: int | None = None,
 ) -> str:
     if provider_group_location_table:
+        npi_filter = _npi_range_filter("loc.npi", npi_range_start, npi_range_end)
         return f"""
     source_locations AS (
         SELECT
@@ -354,12 +386,14 @@ def _provider_location_source_ctes(
             NULL::timestamptz AS created_at
           FROM {_qualified_table_ref(db_schema, provider_group_location_table)} loc
          WHERE loc.npi IS NOT NULL
+{npi_filter}
     ),
     shaped AS (
         SELECT * FROM source_locations
     )
         """
     if provider_group_member_table:
+        npi_filter = _npi_range_filter("npi", npi_range_start, npi_range_end)
         # NPI address rows can predate the current canonical-key rules. Recompute keys
         # from address fields in the PTG materialization/archive paths instead of
         # trusting a stamped npi_address.address_key.
@@ -371,6 +405,7 @@ def _provider_location_source_ctes(
           FROM {_qualified_table_ref(db_schema, provider_group_member_table)}
          WHERE npi IS NOT NULL
            AND NULLIF(provider_group_global_id_128::text, '') IS NOT NULL
+{npi_filter}
     ),
     source_locations AS (
         SELECT
@@ -541,11 +576,15 @@ def _ptg_address_insert_sql(
     provider_group_member_table: str | None = None,
     serving_rate_compact_table: str | None = None,
     provider_set_component_table: str | None = None,
+    npi_range_start: int | None = None,
+    npi_range_end: int | None = None,
 ) -> str:
     source_ctes = _provider_location_source_ctes(
         db_schema,
         provider_group_location_table,
         provider_group_member_table=provider_group_member_table,
+        npi_range_start=npi_range_start,
+        npi_range_end=npi_range_end,
     )
     plan_cte = _provider_group_plan_cte(
         db_schema,
@@ -832,6 +871,8 @@ async def _insert_ptg_address_source(
 ) -> dict[str, str | None]:
     source_key = str(source_context["source_key"] or "")
     snapshot_id = str(source_context["snapshot_id"] or "")
+    npi_range_start = source_context.get("npi_range_start")
+    npi_range_end = source_context.get("npi_range_end")
     insert_sql = _ptg_address_insert_sql(
         db_schema,
         stage_table,
@@ -844,6 +885,8 @@ async def _insert_ptg_address_source(
         provider_group_member_table=source_context.get("provider_group_member_table"),
         serving_rate_compact_table=source_context.get("serving_rate_compact_table"),
         provider_set_component_table=source_context.get("provider_set_component_table"),
+        npi_range_start=int(npi_range_start) if npi_range_start is not None else None,
+        npi_range_end=int(npi_range_end) if npi_range_end is not None else None,
     )
     timeout = _postgres_setting_literal(
         os.getenv("HLTHPRT_PTG_ADDRESS_STATEMENT_TIMEOUT"),
@@ -852,7 +895,13 @@ async def _insert_ptg_address_source(
     async with db.transaction() as session:
         await session.execute(db.text(f"SET LOCAL statement_timeout = {timeout};"))
         await session.execute(db.text(insert_sql))
-    return {"source_key": source_key, "snapshot_id": snapshot_id}
+    return {
+        "source_key": source_key,
+        "snapshot_id": snapshot_id,
+        "source_unit": source_context.get("source_unit"),
+        "npi_range_start": str(npi_range_start) if npi_range_start is not None else None,
+        "npi_range_end": str(npi_range_end) if npi_range_end is not None else None,
+    }
 
 
 async def process_data(ctx, task=None):
@@ -898,8 +947,16 @@ async def process_data(ctx, task=None):
     address_canon_available = await _address_canon_available(db_schema)
     archive_available = await _table_exists(db_schema, "address_archive_v2")
     legacy_provider_location_available = await _table_exists(db_schema, "ptg2_provider_location")
+    member_npi_shards = _env_positive_int("HLTHPRT_PTG_ADDRESS_MEMBER_NPI_SHARDS", 1)
+    member_shard_min_bytes = _env_positive_int(
+        "HLTHPRT_PTG_ADDRESS_MEMBER_NPI_SHARD_MIN_BYTES",
+        DEFAULT_MEMBER_SHARD_MIN_BYTES,
+    )
+    context["member_npi_shards"] = member_npi_shards
+    context["member_npi_shard_min_bytes"] = member_shard_min_bytes
     source_contexts: list[dict[str, str | None]] = []
     skipped_sources: list[dict[str, str | None]] = []
+    sharded_sources: list[dict[str, str | int | None]] = []
     for source_key, snapshot_id, manifest_tables in address_inputs:
         provider_group_location_table = manifest_tables.get("provider_group_location_table")
         provider_group_member_table = manifest_tables.get("provider_group_member_table")
@@ -925,19 +982,50 @@ async def process_data(ctx, task=None):
                 "publish a compact PTG snapshot with provider_group_location_table or run the legacy "
                 "ptg2_provider_location projection."
             )
-        source_contexts.append(
-            {
-                "source_key": source_key,
-                "snapshot_id": snapshot_id,
-                "provider_group_location_table": provider_group_location_table,
-                "provider_group_member_table": provider_group_member_table,
-                "serving_rate_compact_table": serving_rate_compact_table,
-                "provider_set_component_table": provider_set_component_table,
-            }
+        source_context = {
+            "source_key": source_key,
+            "snapshot_id": snapshot_id,
+            "provider_group_location_table": provider_group_location_table,
+            "provider_group_member_table": provider_group_member_table,
+            "serving_rate_compact_table": serving_rate_compact_table,
+            "provider_set_component_table": provider_set_component_table,
+        }
+        should_shard_member_source = (
+            member_npi_shards > 1
+            and provider_group_member_table
+            and not provider_group_location_table
         )
+        member_table_size = (
+            await _relation_size_bytes(db_schema, provider_group_member_table)
+            if should_shard_member_source
+            else 0
+        )
+        if should_shard_member_source and member_table_size >= member_shard_min_bytes:
+            sharded_sources.append(
+                {
+                    "source_key": source_key,
+                    "snapshot_id": snapshot_id,
+                    "provider_group_member_table": provider_group_member_table,
+                    "member_table_size": member_table_size,
+                    "shards": member_npi_shards,
+                }
+            )
+            for shard_index in range(member_npi_shards):
+                start, end = _npi_range_bounds(shard_index, member_npi_shards)
+                source_contexts.append(
+                    {
+                        **source_context,
+                        "source_unit": f"npi_range:{shard_index + 1}/{member_npi_shards}",
+                        "npi_range_start": str(start),
+                        "npi_range_end": str(end),
+                    }
+                )
+        else:
+            source_contexts.append(source_context)
 
     context["sources"] = source_contexts
     context["skipped_sources"] = skipped_sources
+    context["sharded_sources"] = sharded_sources
     if not source_contexts:
         raise RuntimeError(
             "No PTG provider-location sources were available; publish at least one compact PTG snapshot "
@@ -1025,6 +1113,7 @@ async def process_data(ctx, task=None):
 
     insert_concurrency = _env_positive_int("HLTHPRT_PTG_ADDRESS_SOURCE_CONCURRENCY", 1)
     context["source_insert_concurrency"] = insert_concurrency
+    insert_unit = "source units" if sharded_sources else "sources"
     insert_results: list[dict[str, str | None]] = []
     insert_sem = asyncio.Semaphore(insert_concurrency)
 
@@ -1052,11 +1141,11 @@ async def process_data(ctx, task=None):
                     importer="ptg-address",
                     status="running",
                     phase="staging PTG address sources",
-                    unit="sources",
+                    unit=insert_unit,
                     done=done,
                     total=total,
                     pct=min(90, max(5, (done / max(total, 1)) * 90)),
-                    message=f"staged {done}/{total} PTG address source(s)",
+                    message=f"staged {done}/{total} PTG address {insert_unit}",
                 )
     except Exception:
         for task_item in insert_tasks:
