@@ -2516,6 +2516,149 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/PricingProviderListResponse'
+  /pricing/provider-specialties:
+    get:
+      operationId: getPricingProviderSpecialties
+      summary: List provider specialty values for pricing filters
+      description: |
+        Lists distinct CMS provider type values used by pricing provider searches.
+        The `specialty` filter on pricing search endpoints is a case-insensitive
+        substring match over this provider type text, not a fixed enum.
+      parameters:
+        - name: q
+          in: query
+          schema:
+            type: string
+          description: Optional provider type substring filter.
+        - name: code
+          in: query
+          schema:
+            type: string
+          description: Optional procedure/service code used to restrict specialties to providers for that code.
+        - name: code_system
+          in: query
+          schema:
+            type: string
+            enum: [HP_PROCEDURE_CODE, CPT, HCPCS, CDT]
+          description: Code system for `code`.
+        - name: expand_codes
+          in: query
+          schema:
+            type: boolean
+          description: Include mapped equivalent procedure codes when resolving `code`.
+        - name: year
+          in: query
+          schema:
+            type: integer
+        - name: state
+          in: query
+          schema:
+            type: string
+        - name: city
+          in: query
+          schema:
+            type: string
+        - name: zip5
+          in: query
+          schema:
+            type: string
+            pattern: '^[0-9]{5}$'
+        - name: zip_radius_miles
+          in: query
+          schema:
+            type: number
+            minimum: 0
+            maximum: 50
+            default: 0
+          description: Radius around `zip5`; defaults to exact ZIP matching.
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+      responses:
+        '200':
+          description: Provider specialty values available for pricing filters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PricingProviderSpecialtyListResponse'
+  /pricing/providers/specialties:
+    get:
+      operationId: getPricingProvidersSpecialties
+      summary: List provider specialty values for pricing provider filters
+      description: Alias of `/pricing/provider-specialties`.
+      parameters:
+        - name: q
+          in: query
+          schema:
+            type: string
+          description: Optional provider type substring filter.
+        - name: code
+          in: query
+          schema:
+            type: string
+          description: Optional procedure/service code used to restrict specialties to providers for that code.
+        - name: code_system
+          in: query
+          schema:
+            type: string
+            enum: [HP_PROCEDURE_CODE, CPT, HCPCS, CDT]
+          description: Code system for `code`.
+        - name: expand_codes
+          in: query
+          schema:
+            type: boolean
+          description: Include mapped equivalent procedure codes when resolving `code`.
+        - name: year
+          in: query
+          schema:
+            type: integer
+        - name: state
+          in: query
+          schema:
+            type: string
+        - name: city
+          in: query
+          schema:
+            type: string
+        - name: zip5
+          in: query
+          schema:
+            type: string
+            pattern: '^[0-9]{5}$'
+        - name: zip_radius_miles
+          in: query
+          schema:
+            type: number
+            minimum: 0
+            maximum: 50
+            default: 0
+          description: Radius around `zip5`; defaults to exact ZIP matching.
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+      responses:
+        '200':
+          description: Provider specialty values available for pricing filters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PricingProviderSpecialtyListResponse'
   /pricing/providers/{npi}:
     get:
       operationId: getPricingProvidersNpi
@@ -4626,6 +4769,38 @@ components:
             order:
               type: string
               enum: [asc, desc]
+    PricingProviderSpecialtyItem:
+      type: object
+      properties:
+        specialty:
+          type: string
+          description: Provider type text accepted by pricing `specialty` filters.
+          example: Family Medicine
+        specialty_key:
+          type: string
+          description: Lowercase normalized provider type text.
+          example: family medicine
+        provider_count:
+          type: integer
+          description: Distinct providers matching the optional procedure/geography filters.
+        total_services:
+          type: number
+          nullable: true
+          description: Total CMS services for the matching providers.
+      required: [specialty, specialty_key, provider_count]
+    PricingProviderSpecialtyListResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/PricingProviderSpecialtyItem'
+        pagination:
+          $ref: '#/components/schemas/PaginationMeta'
+        query:
+          type: object
+          additionalProperties: true
+      required: [items, pagination, query]
     PricingProviderScoreResponse:
       type: object
       properties:

@@ -5638,6 +5638,163 @@ async def autocomplete_procedures(request):
     )
 
 
+@blueprint.get("/provider-specialties", name="pricing.provider_specialties.list")
+@blueprint.get("/providers/specialties", name="pricing.providers.specialties.list")
+async def list_provider_specialties(request):
+    session = _get_session(request)
+    args = request.args
+
+    pagination = parse_pagination(args, default_limit=50, max_limit=MAX_LIMIT)
+    year = _parse_int(args.get("year"), "year", minimum=2013)
+    q = str(args.get("q", "")).strip().lower()
+    state = str(args.get("state", "")).strip().upper()
+    city = str(args.get("city", "")).strip().lower()
+    zip5 = _normalize_zip5(args.get("zip5"))
+    zip_radius_miles = _parse_zip_radius_miles(
+        args.get("zip_radius_miles"),
+        param="zip_radius_miles",
+        default=PROCEDURE_SEARCH_ZIP_RADIUS_DEFAULT_MILES,
+    )
+    code = str(args.get("code", "")).strip()
+    # Keep this explicit so OpenAPI contract tests see the query parameter.
+    args.get("code_system")
+    args.get("expand_codes")
+    args.get("page")
+    args.get("limit")
+
+    year_table = provider_procedure_table if code else provider_table
+    year, year_source = await _resolve_year(session, year_table, year)
+
+    zip_filter_values: list[str] = []
+    if zip5 and zip_radius_miles > 0:
+        zip_rows = await _zip_radius_rows(
+            session,
+            zip5=zip5,
+            radius_miles=zip_radius_miles,
+            state_hint=state or None,
+        )
+        for row in sorted(
+            zip_rows,
+            key=lambda item: (_as_float(item.get("distance_miles")) or 0.0, str(item.get("zip5") or "")),
+        ):
+            candidate_zip = _normalize_zip5(row.get("zip5"))
+            if candidate_zip is None or candidate_zip in zip_filter_values:
+                continue
+            zip_filter_values.append(candidate_zip)
+        if zip5 not in zip_filter_values:
+            zip_filter_values.insert(0, zip5)
+
+    filters = [
+        provider_table.c.year == year,
+        provider_table.c.provider_type.isnot(None),
+        func.length(func.trim(provider_table.c.provider_type)) > 0,
+    ]
+    if state:
+        filters.append(func.upper(provider_table.c.state) == state)
+    if city and not (zip5 and zip_radius_miles > 0):
+        filters.append(func.lower(provider_table.c.city).like(f"%{city}%"))
+    if zip_filter_values:
+        filters.append(provider_table.c.zip5.in_(zip_filter_values))
+    elif zip5:
+        filters.append(provider_table.c.zip5 == zip5)
+    if q:
+        filters.append(func.lower(provider_table.c.provider_type).like(f"%{q}%"))
+
+    code_context = None
+    from_clause = provider_table
+    if code:
+        internal_codes, code_context = await _resolve_internal_codes_for_request(session, code, args)
+        from_clause = provider_procedure_table.join(
+            provider_table,
+            and_(
+                provider_table.c.npi == provider_procedure_table.c.npi,
+                provider_table.c.year == provider_procedure_table.c.year,
+            ),
+        )
+        filters.extend(
+            [
+                provider_procedure_table.c.year == year,
+                provider_procedure_table.c.procedure_code.in_(internal_codes),
+            ]
+        )
+        total_services_expr = func.sum(provider_procedure_table.c.total_services)
+    else:
+        total_services_expr = func.sum(provider_table.c.total_services)
+
+    query = (
+        select(
+            provider_table.c.provider_type.label("specialty"),
+            func.lower(func.trim(provider_table.c.provider_type)).label("specialty_key"),
+            func.count(func.distinct(provider_table.c.npi)).label("provider_count"),
+            total_services_expr.label("total_services"),
+        )
+        .select_from(from_clause)
+        .where(and_(*filters))
+        .group_by(provider_table.c.provider_type)
+        .order_by(func.count(func.distinct(provider_table.c.npi)).desc(), provider_table.c.provider_type.asc())
+        .limit(pagination.limit)
+        .offset(pagination.offset)
+    )
+    rows = [_row_to_dict(row) for row in await session.execute(query)]
+
+    count_query = (
+        select(func.count())
+        .select_from(
+            select(provider_table.c.provider_type)
+            .select_from(from_clause)
+            .where(and_(*filters))
+            .group_by(provider_table.c.provider_type)
+            .subquery()
+        )
+    )
+    count_result = await session.execute(count_query)
+    total = int(count_result.scalar() or 0)
+
+    items = [
+        {
+            "specialty": str(row.get("specialty") or "").strip(),
+            "specialty_key": str(row.get("specialty_key") or "").strip().lower(),
+            "provider_count": int(row.get("provider_count") or 0),
+            "total_services": _as_float(row.get("total_services")),
+        }
+        for row in rows
+    ]
+
+    query_payload: dict[str, Any] = {
+        "q": q or None,
+        "code": code or None,
+        "year": year,
+        "year_used": year,
+        "year_source": year_source,
+        "state": state or None,
+        "city": city or None,
+        "zip5": zip5 or None,
+        "zip_radius_miles": zip_radius_miles if zip5 else None,
+        "zip_candidate_count": len(zip_filter_values) if zip_filter_values else (1 if zip5 else None),
+    }
+    if code_context is not None:
+        query_payload.update(
+            {
+                "input_code": code_context["input_code"],
+                "resolved_codes": code_context["resolved_codes"],
+                "matched_via": code_context["matched_via"],
+            }
+        )
+
+    return response.json(
+        {
+            "items": items,
+            "pagination": {
+                "total": total,
+                "limit": pagination.limit,
+                "offset": pagination.offset,
+                "page": pagination.page,
+            },
+            "query": query_payload,
+        }
+    )
+
+
 @blueprint.get("/prescriptions/autocomplete", name="pricing.prescriptions.autocomplete")
 @blueprint.get("/drugs/autocomplete", name="pricing.drugs.autocomplete")
 async def autocomplete_prescriptions(request):

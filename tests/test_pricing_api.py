@@ -22,6 +22,7 @@ get_pricing_provider_score = pricing_module.get_pricing_provider_score
 autocomplete_prescriptions = pricing_module.autocomplete_prescriptions
 autocomplete_procedures = pricing_module.autocomplete_procedures
 list_pricing_providers = pricing_module.list_pricing_providers
+list_provider_specialties = pricing_module.list_provider_specialties
 list_providers_by_prescription = pricing_module.list_providers_by_prescription
 list_providers_by_procedure = pricing_module.list_providers_by_procedure
 list_procedure_providers = pricing_module.list_procedure_providers
@@ -1390,6 +1391,66 @@ async def test_list_providers_by_procedure_with_q():
     assert payload["sources"][0]["serving_tables"] == ["pricing_provider", "pricing_provider_procedure"]
     assert payload["evidence"]["matched_provider_location_count"] == 1
     assert payload["evidence"]["filters"]["state"] == "MD"
+
+
+@pytest.mark.asyncio
+async def test_list_provider_specialties_filters_by_procedure_and_geo():
+    request = make_request(
+        [
+            FakeResult(
+                rows=[
+                    {
+                        "from_system": "CPT",
+                        "from_code": "99214",
+                        "to_system": pricing_module.INTERNAL_PROCEDURE_CODE_SYSTEM,
+                        "to_code": "1607056713",
+                    }
+                ]
+            ),
+            FakeResult(
+                rows=[
+                    {
+                        "specialty": "Family Medicine",
+                        "specialty_key": "family medicine",
+                        "provider_count": 12,
+                        "total_services": 345.0,
+                    },
+                    {
+                        "specialty": "Internal Medicine",
+                        "specialty_key": "internal medicine",
+                        "provider_count": 7,
+                        "total_services": 123.0,
+                    },
+                ]
+            ),
+            FakeResult(scalar=2),
+        ],
+        args={
+            "code": "99214",
+            "code_system": "CPT",
+            "zip5": "10001",
+            "q": "medicine",
+            "year": "2023",
+            "limit": "10",
+        },
+    )
+
+    response = await list_provider_specialties(request)
+    payload = json.loads(response.body)
+    assert payload["pagination"]["total"] == 2
+    assert payload["items"][0] == {
+        "specialty": "Family Medicine",
+        "specialty_key": "family medicine",
+        "provider_count": 12,
+        "total_services": 345.0,
+    }
+    assert payload["items"][1]["specialty"] == "Internal Medicine"
+    assert payload["query"]["code"] == "99214"
+    assert payload["query"]["zip5"] == "10001"
+    assert payload["query"]["q"] == "medicine"
+    assert {"code_system": pricing_module.INTERNAL_PROCEDURE_CODE_SYSTEM, "code": "1607056713"} in payload["query"][
+        "resolved_codes"
+    ]
 
 
 @pytest.mark.asyncio
