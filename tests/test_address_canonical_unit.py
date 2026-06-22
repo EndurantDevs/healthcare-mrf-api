@@ -2045,6 +2045,18 @@ def test_ptg_address_member_npi_range_bounds_are_contiguous():
     assert ptg_address._npi_range_bounds(0, 1) == (0, 10_000_000_000)
 
 
+def test_ptg_address_observed_npi_range_bounds_split_actual_coverage_range():
+    assert ptg_address._npi_observed_range_bounds(0, 4, 1_000_000_000, 2_999_999_999) == (
+        1_000_000_000,
+        1_500_000_000,
+    )
+    assert ptg_address._npi_observed_range_bounds(3, 4, 1_000_000_000, 2_999_999_999) == (
+        2_500_000_000,
+        3_000_000_000,
+    )
+    assert ptg_address._npi_observed_range_bounds(0, 1, 1_234, 1_234) == (1_234, 1_235)
+
+
 def test_ptg_address_member_sql_can_use_npi_range_predicate():
     sql = ptg_address._ptg_address_insert_sql(
         "mrf",

@@ -199,6 +199,20 @@ def _npi_range_bounds(shard_index: int, shard_count: int) -> tuple[int, int]:
     return start, end
 
 
+def _npi_observed_range_bounds(
+    shard_index: int,
+    shard_count: int,
+    min_npi: int,
+    max_npi: int,
+) -> tuple[int, int]:
+    if shard_count <= 1 or max_npi <= min_npi:
+        return min_npi, max_npi + 1
+    span = max_npi - min_npi + 1
+    start = min_npi + (span * shard_index) // shard_count
+    end = min_npi + (span * (shard_index + 1)) // shard_count
+    return start, end
+
+
 def _npi_range_filter(column_sql: str, start: int | None, end: int | None) -> str:
     clauses = []
     if start is not None and int(start) > 0:
@@ -1249,8 +1263,10 @@ async def _insert_ptg_member_fallback_materialize_shard(
     archive_available: bool,
     shard_index: int,
     shard_count: int,
+    min_npi: int,
+    max_npi: int,
 ) -> dict[str, str | int]:
-    npi_range_start, npi_range_end = _npi_range_bounds(shard_index, shard_count)
+    npi_range_start, npi_range_end = _npi_observed_range_bounds(shard_index, shard_count, min_npi, max_npi)
     async with db.transaction() as session:
         await _apply_ptg_address_sql_settings(session)
         await session.execute(
@@ -1276,6 +1292,8 @@ async def _insert_ptg_member_fallback_materialize_shard(
         "shard_count": shard_count,
         "npi_range_start": npi_range_start,
         "npi_range_end": npi_range_end,
+        "min_npi": min_npi,
+        "max_npi": max_npi,
     }
 
 
@@ -1354,6 +1372,12 @@ async def _insert_ptg_member_fallback_aggregate(
         )
         await db.status(f"ANALYZE {db_schema}.{coverage_table};")
         coverage_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{coverage_table};") or 0)
+        coverage_min_max_rows = await db.all(
+            f"SELECT MIN(npi)::bigint AS min_npi, MAX(npi)::bigint AS max_npi FROM {db_schema}.{coverage_table};"
+        )
+        coverage_min_max = coverage_min_max_rows[0] if coverage_min_max_rows else {}
+        min_npi = int(_row_get(coverage_min_max, "min_npi") or 0)
+        max_npi = int(_row_get(coverage_min_max, "max_npi") or min_npi)
         if run_id:
             enqueue_live_progress(
                 run_id=run_id,
@@ -1397,6 +1421,8 @@ async def _insert_ptg_member_fallback_aggregate(
                     archive_available=archive_available,
                     shard_index=shard_index,
                     shard_count=materialize_shards,
+                    min_npi=min_npi,
+                    max_npi=max_npi,
                 )
 
         materialize_results: list[dict[str, str | int]] = []
@@ -1432,6 +1458,8 @@ async def _insert_ptg_member_fallback_aggregate(
             "source_unit": "member_coverage_aggregate",
             "member_coverage_sources": len(source_contexts),
             "member_coverage_rows": coverage_rows,
+            "member_coverage_min_npi": min_npi,
+            "member_coverage_max_npi": max_npi,
             "member_materialize_shards": materialize_shards,
             "member_materialize_concurrency": materialize_concurrency,
         }
