@@ -2760,19 +2760,27 @@ def _prepare_multi_source_evidence_table_sql(
     CREATE {storage_mode}TABLE {db_schema}.{evidence_table} (
         location_key varchar(64) PRIMARY KEY,
         evidence_shard int NOT NULL,
+        entity_type varchar(64) NOT NULL,
+        entity_id varchar(128) NOT NULL,
+        street_key varchar,
+        city_key varchar,
+        state_key varchar,
+        zip_key varchar,
+        country_key varchar,
+        address_sources varchar[] NOT NULL DEFAULT '{{}}',
+        source_record_ids varchar[] NOT NULL DEFAULT '{{}}',
         evidence_sources varchar[] NOT NULL DEFAULT '{{}}',
         evidence_record_ids varchar[] NOT NULL DEFAULT '{{}}'
     );
     """
 
 
-def _insert_multi_source_evidence_shard_sql(
+def _load_multi_source_evidence_base_sql(
     db_schema: str,
     stage_table: str,
     evidence_table: str,
     *,
     evidence_shards: int,
-    evidence_shard: int,
 ) -> str:
     group_hash_expr = _evidence_group_hash_expr(evidence_shards)
     return f"""
@@ -2785,11 +2793,52 @@ def _insert_multi_source_evidence_shard_sql(
             {_alnum_norm_expr("city_name")}::varchar AS city_key,
             {_state_norm_expr("state_name")}::varchar AS state_key,
             {_zip5_norm_expr("postal_code")}::varchar AS zip_key,
-            {_state_norm_expr("country_code")}::varchar AS country_key
+            {_state_norm_expr("country_code")}::varchar AS country_key,
+            COALESCE(address_sources, ARRAY[]::varchar[])::varchar[] AS address_sources,
+            COALESCE(source_record_ids, ARRAY[]::varchar[])::varchar[] AS source_record_ids
           FROM {db_schema}.{stage_table}
          WHERE location_key IS NOT NULL
-    ),
-    keyed AS MATERIALIZED (
+    )
+    INSERT INTO {db_schema}.{evidence_table} (
+        location_key,
+        evidence_shard,
+        entity_type,
+        entity_id,
+        street_key,
+        city_key,
+        state_key,
+        zip_key,
+        country_key,
+        address_sources,
+        source_record_ids
+    )
+    SELECT
+        location_key,
+        {group_hash_expr} AS evidence_shard,
+        entity_type,
+        entity_id,
+        street_key,
+        city_key,
+        state_key,
+        zip_key,
+        country_key,
+        address_sources,
+        source_record_ids
+      FROM normalized;
+    """
+
+
+def _insert_multi_source_evidence_shard_sql(
+    db_schema: str,
+    stage_table: str,
+    evidence_table: str,
+    *,
+    evidence_shards: int,
+    evidence_shard: int,
+) -> str:
+    del stage_table, evidence_shards
+    return f"""
+    WITH keyed AS MATERIALIZED (
         SELECT
             location_key,
             entity_type,
@@ -2799,9 +2848,10 @@ def _insert_multi_source_evidence_shard_sql(
             state_key,
             zip_key,
             country_key,
-            {group_hash_expr} AS evidence_shard
-          FROM normalized
-         WHERE {group_hash_expr} = {int(evidence_shard)}
+            address_sources,
+            source_record_ids
+          FROM {db_schema}.{evidence_table}
+         WHERE evidence_shard = {int(evidence_shard)}
     ),
     source_evidence AS (
         SELECT
@@ -2814,9 +2864,7 @@ def _insert_multi_source_evidence_shard_sql(
             k.country_key,
             ARRAY_REMOVE(ARRAY_AGG(DISTINCT src.src ORDER BY src.src), NULL)::varchar[] AS evidence_sources
           FROM keyed AS k
-          JOIN {db_schema}.{stage_table} AS t
-            ON t.location_key = k.location_key
-          LEFT JOIN LATERAL unnest(COALESCE(t.address_sources, ARRAY[]::varchar[])) AS src(src) ON TRUE
+          LEFT JOIN LATERAL unnest(COALESCE(k.address_sources, ARRAY[]::varchar[])) AS src(src) ON TRUE
          GROUP BY
             k.entity_type,
             k.entity_id,
@@ -2837,9 +2885,7 @@ def _insert_multi_source_evidence_shard_sql(
             k.country_key,
             ARRAY_REMOVE(ARRAY_AGG(DISTINCT rid.rid ORDER BY rid.rid), NULL)::varchar[] AS evidence_record_ids
           FROM keyed AS k
-          JOIN {db_schema}.{stage_table} AS t
-            ON t.location_key = k.location_key
-          LEFT JOIN LATERAL unnest(COALESCE(t.source_record_ids, ARRAY[]::varchar[])) AS rid(rid) ON TRUE
+          LEFT JOIN LATERAL unnest(COALESCE(k.source_record_ids, ARRAY[]::varchar[])) AS rid(rid) ON TRUE
          GROUP BY
             k.entity_type,
             k.entity_id,
@@ -2849,19 +2895,19 @@ def _insert_multi_source_evidence_shard_sql(
             k.zip_key,
             k.country_key
     )
-    INSERT INTO {db_schema}.{evidence_table} (
-        location_key,
-        evidence_shard,
-        evidence_sources,
-        evidence_record_ids
-    )
-    SELECT
-        k.location_key,
-        k.evidence_shard,
-        COALESCE(se.evidence_sources, ARRAY[]::varchar[]) AS evidence_sources,
-        COALESCE(re.evidence_record_ids, ARRAY[]::varchar[]) AS evidence_record_ids
-      FROM keyed AS k
-      LEFT JOIN source_evidence AS se
+    UPDATE {db_schema}.{evidence_table} AS e
+       SET evidence_sources = COALESCE(se.evidence_sources, ARRAY[]::varchar[]),
+           evidence_record_ids = COALESCE(re.evidence_record_ids, ARRAY[]::varchar[])
+      FROM source_evidence AS se
+      LEFT JOIN record_evidence AS re
+        ON re.entity_type = se.entity_type
+       AND re.entity_id = se.entity_id
+       AND re.street_key IS NOT DISTINCT FROM se.street_key
+       AND re.city_key IS NOT DISTINCT FROM se.city_key
+       AND re.state_key IS NOT DISTINCT FROM se.state_key
+       AND re.zip_key IS NOT DISTINCT FROM se.zip_key
+       AND re.country_key IS NOT DISTINCT FROM se.country_key
+      JOIN keyed AS k
         ON se.entity_type = k.entity_type
        AND se.entity_id = k.entity_id
        AND se.street_key IS NOT DISTINCT FROM k.street_key
@@ -2869,14 +2915,7 @@ def _insert_multi_source_evidence_shard_sql(
        AND se.state_key IS NOT DISTINCT FROM k.state_key
        AND se.zip_key IS NOT DISTINCT FROM k.zip_key
        AND se.country_key IS NOT DISTINCT FROM k.country_key
-      LEFT JOIN record_evidence AS re
-        ON re.entity_type = k.entity_type
-       AND re.entity_id = k.entity_id
-       AND re.street_key IS NOT DISTINCT FROM k.street_key
-       AND re.city_key IS NOT DISTINCT FROM k.city_key
-       AND re.state_key IS NOT DISTINCT FROM k.state_key
-       AND re.zip_key IS NOT DISTINCT FROM k.zip_key
-       AND re.country_key IS NOT DISTINCT FROM k.country_key;
+     WHERE e.location_key = k.location_key;
     """
 
 
@@ -6884,6 +6923,47 @@ async def process_data(ctx, task=None):
         done=0,
         total=1,
         message="creating source evidence work table",
+        emit_start=True,
+        emit_done=True,
+    )
+    await _run_sql_phase(
+        _load_multi_source_evidence_base_sql(
+            db_schema,
+            stage_table,
+            evidence_table,
+            evidence_shards=evidence_shards,
+        ),
+        context=context,
+        run_id=run_id,
+        phase="entity-address-unified loading source evidence base",
+        unit="rows",
+        done=0,
+        total=1,
+        message="normalizing source evidence once",
+        emit_start=True,
+        emit_done=True,
+    )
+    await _run_sql_phase(
+        _index_multi_source_evidence_table_sql(db_schema, evidence_table),
+        context=context,
+        run_id=run_id,
+        phase="entity-address-unified indexing source evidence base",
+        unit="indexes",
+        done=0,
+        total=1,
+        message="indexing source evidence base",
+        emit_start=True,
+        emit_done=True,
+    )
+    await _run_sql_phase(
+        f"ANALYZE {db_schema}.{evidence_table};",
+        context=context,
+        run_id=run_id,
+        phase="entity-address-unified analyzing source evidence base",
+        unit="tables",
+        done=0,
+        total=1,
+        message="analyzing source evidence base",
         emit_start=True,
         emit_done=True,
     )

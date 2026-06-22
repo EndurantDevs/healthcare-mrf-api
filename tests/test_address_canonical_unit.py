@@ -1498,6 +1498,12 @@ def test_entity_address_unified_evidence_stage_updates_by_location_key():
         evidence_table,
         unlogged=False,
     )
+    load_sql = entity_address_unified._load_multi_source_evidence_base_sql(
+        "mrf",
+        "entity_address_unified_stage",
+        evidence_table,
+        evidence_shards=32,
+    )
     insert_sql = entity_address_unified._insert_multi_source_evidence_shard_sql(
         "mrf",
         "entity_address_unified_stage",
@@ -1518,15 +1524,19 @@ def test_entity_address_unified_evidence_stage_updates_by_location_key():
 
     assert f"CREATE TABLE mrf.{evidence_table}" in prepare_sql
     assert "location_key varchar(64) PRIMARY KEY" in prepare_sql
-    assert f"INSERT INTO mrf.{evidence_table}" in insert_sql
+    assert "street_key varchar" in prepare_sql
+    assert "source_record_ids varchar[] NOT NULL" in prepare_sql
+    assert f"INSERT INTO mrf.{evidence_table}" in load_sql
+    assert "FROM mrf.entity_address_unified_stage" in load_sql
+    assert "% 32" in load_sql
     assert "keyed AS MATERIALIZED" in insert_sql
     assert "location_key," in insert_sql
-    assert "% 32" in insert_sql
+    assert f"FROM mrf.{evidence_table}" in insert_sql
     assert "= 7" in insert_sql
     assert "ARRAY_AGG(DISTINCT src.src ORDER BY src.src)" in insert_sql
     assert "ARRAY_AGG(DISTINCT rid.rid ORDER BY rid.rid)" in insert_sql
-    assert "JOIN mrf.entity_address_unified_stage AS t" in insert_sql
-    assert "ON t.location_key = k.location_key" in insert_sql
+    assert "JOIN mrf.entity_address_unified_stage AS t" not in insert_sql
+    assert "UPDATE mrf." in insert_sql
     assert "CREATE INDEX IF NOT EXISTS" in index_sql
     assert f"ON mrf.{evidence_table} (evidence_shard, location_key)" in index_sql
     assert f"FROM mrf.{evidence_table} AS e" in apply_sql
