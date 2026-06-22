@@ -1413,6 +1413,8 @@ def test_entity_address_unified_builds_evidence_and_bridge_stage_sql():
     assert "TRUNCATE TABLE mrf.entity_address_evidence_20260614" in sql_blob
     assert "INSERT INTO mrf.entity_address_evidence_20260614" in sql_blob
     assert "FROM mrf.entity_address_unified_raw" in sql_blob
+    assert "ROW_NUMBER() OVER ()::bigint AS evidence_id" in sql_blob
+    assert "ROW_NUMBER() OVER (ORDER BY" not in sql_blob
     assert "'run_1'::varchar AS source_run_id" in sql_blob
     assert "'node_a'::varchar AS node_id" in sql_blob
     assert "INSERT INTO mrf.entity_address_plan_bridge_20260614" in sql_blob
@@ -2082,13 +2084,15 @@ async def test_entity_address_unified_publish_integrity_checks_archive_and_bridg
     assert metrics["practice_null_address_key_rows"] == 0
     assert metrics["practice_null_address_key_by_source"] == {}
     assert metrics["archive_identity_mismatch_rows"] == 0
+    assert metrics["fallback_archive_identity_mismatch_rows"] == 0
     assert metrics["invalid_coordinate_rows"] == 0
     assert metrics["bridge_orphans"]["entity_address_plan_bridge_20260614"] == 0
     assert any("a.merged_into IS NOT NULL" in statement for statement in statements)
     assert any("NOT EXISTS" in statement and "address_archive_v2 AS a" in statement for statement in statements)
     assert any("t.lat IS DISTINCT FROM a.lat" in statement for statement in statements)
     assert any("a.lat IS NULL OR a.long IS NULL" in statement for statement in statements)
-    assert any("COALESCE(archive_identity_version, '') <> 'v2'" in statement for statement in statements)
+    assert any("t.archive_identity_version" in statement and "a.identity_version" in statement for statement in statements)
+    assert any("address_key IS NULL" in statement and "archive_identity_version" in statement for statement in statements)
     assert any("lat < -90 OR lat > 90" in statement for statement in statements)
     assert any(
         "FROM mrf.entity_address_procedure_bridge_20260614 AS b" in statement
@@ -2107,6 +2111,10 @@ async def test_entity_address_unified_publish_integrity_fails_on_redirects_and_o
                 return 2
             if "t.lat IS DISTINCT FROM a.lat" in statement:
                 return 6
+            if "a.identity_version" in statement:
+                return 5
+            if "address_key IS NULL" in statement and "archive_identity_version" in statement:
+                return 7
             if "lat < -90 OR lat > 90" in statement:
                 return 4
             if "FROM mrf.entity_address_procedure_bridge_20260614 AS b" in statement:
@@ -2122,7 +2130,14 @@ async def test_entity_address_unified_publish_integrity_fails_on_redirects_and_o
     monkeypatch.setattr(entity_address_unified, "db", FakeDB())
     monkeypatch.setattr(entity_address_unified, "_table_exists", table_exists)
 
-    with pytest.raises(RuntimeError, match="merged_into redirects.*address_archive_v2 coordinates.*invalid latitude/longitude.*procedure_bridge"):
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "merged_into redirects.*address_archive_v2 coordinates.*"
+            "address_archive_v2 identity_version.*without address_key.*"
+            "invalid latitude/longitude.*procedure_bridge"
+        ),
+    ):
         await entity_address_unified._validate_publish_integrity(
             "mrf",
             "entity_address_unified_stage",

@@ -1840,6 +1840,7 @@ async def _validate_publish_integrity(
     missing_archive_address_key_rows = 0
     archive_coordinate_mismatch_rows = 0
     archive_missing_coordinate_rows = 0
+    archive_identity_mismatch_rows = 0
     if await _table_exists(db_schema, "address_archive_v2"):
         unresolved_merged_into_rows = int(
             await db.scalar(
@@ -1903,6 +1904,21 @@ async def _validate_publish_integrity(
             )
             or 0
         )
+        archive_identity_mismatch_rows = int(
+            await db.scalar(
+                f"""
+                SELECT COUNT(*)
+                  FROM {db_schema}.{stage_table} AS t
+                  JOIN {db_schema}.address_archive_v2 AS a
+                    ON a.address_key = t.address_key
+                   AND a.merged_into IS NULL
+                 WHERE t.address_key IS NOT NULL
+                   AND COALESCE(t.archive_identity_version, '')
+                       IS DISTINCT FROM ('v' || COALESCE(a.identity_version, 2)::text);
+                """
+            )
+            or 0
+        )
     metrics["unresolved_merged_into_rows"] = unresolved_merged_into_rows
     if unresolved_merged_into_rows:
         failures.append(
@@ -1956,20 +1972,27 @@ async def _validate_publish_integrity(
         for row in practice_null_address_key_by_source_rows
     }
 
-    archive_identity_mismatch_rows = int(
+    metrics["archive_identity_mismatch_rows"] = archive_identity_mismatch_rows
+    if archive_identity_mismatch_rows:
+        failures.append(
+            f"{archive_identity_mismatch_rows} staged rows do not match address_archive_v2 identity_version"
+        )
+
+    fallback_archive_identity_mismatch_rows = int(
         await db.scalar(
             f"""
             SELECT COUNT(*)
               FROM {db_schema}.{stage_table}
-             WHERE COALESCE(archive_identity_version, '') <> '{ARCHIVE_IDENTITY_VERSION}';
+             WHERE address_key IS NULL
+               AND COALESCE(archive_identity_version, '') <> '{ARCHIVE_IDENTITY_VERSION}';
             """
         )
         or 0
     )
-    metrics["archive_identity_mismatch_rows"] = archive_identity_mismatch_rows
-    if archive_identity_mismatch_rows:
+    metrics["fallback_archive_identity_mismatch_rows"] = fallback_archive_identity_mismatch_rows
+    if fallback_archive_identity_mismatch_rows:
         failures.append(
-            f"{archive_identity_mismatch_rows} staged rows use a non-current archive_identity_version"
+            f"{fallback_archive_identity_mismatch_rows} staged rows without address_key use a non-current archive_identity_version"
         )
 
     invalid_coordinate_rows = await _invalid_coordinate_count(db_schema, stage_table)
@@ -2857,7 +2880,7 @@ def _evidence_from_raw_sql(
         retired_at
     )
     SELECT
-        ROW_NUMBER() OVER (ORDER BY location_key, source_id, source_record_id)::bigint AS evidence_id,
+        ROW_NUMBER() OVER ()::bigint AS evidence_id,
         location_key,
         address_key,
         premise_key,
@@ -2929,7 +2952,7 @@ def _evidence_from_stage_sql(
         retired_at
     )
     SELECT
-        ROW_NUMBER() OVER (ORDER BY t.location_key)::bigint AS evidence_id,
+        ROW_NUMBER() OVER ()::bigint AS evidence_id,
         t.location_key,
         t.address_key,
         t.premise_key,
@@ -4090,8 +4113,8 @@ async def _populate_support_stage_tables(
     )
     total_steps = len(statements)
     for index, statement in enumerate(statements, start=1):
+        label = _support_stage_progress_label(statement)
         if run_id:
-            label = _support_stage_progress_label(statement)
             enqueue_live_progress(
                 run_id=run_id,
                 importer="entity-address-unified",
