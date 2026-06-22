@@ -199,20 +199,6 @@ def _npi_range_bounds(shard_index: int, shard_count: int) -> tuple[int, int]:
     return start, end
 
 
-def _npi_observed_range_bounds(
-    shard_index: int,
-    shard_count: int,
-    min_npi: int,
-    max_npi: int,
-) -> tuple[int, int]:
-    if shard_count <= 1 or max_npi <= min_npi:
-        return min_npi, max_npi + 1
-    span = max_npi - min_npi + 1
-    start = min_npi + (span * shard_index) // shard_count
-    end = min_npi + (span * (shard_index + 1)) // shard_count
-    return start, end
-
-
 def _npi_range_filter(column_sql: str, start: int | None, end: int | None) -> str:
     clauses = []
     if start is not None and int(start) > 0:
@@ -832,14 +818,17 @@ def _ptg_member_coverage_insert_sql(
     provider_group_member_table: str,
     npi_range_start: int | None = None,
     npi_range_end: int | None = None,
+    npi_shard_count: int = DEFAULT_MEMBER_MATERIALIZE_SHARDS,
 ) -> str:
     npi_filter = _npi_range_filter("npi", npi_range_start, npi_range_end)
+    safe_shard_count = max(1, int(npi_shard_count))
     return f"""
-    INSERT INTO {db_schema}.{coverage_table} (source_key, snapshot_id, npi)
+    INSERT INTO {db_schema}.{coverage_table} (source_key, snapshot_id, npi, npi_shard)
     SELECT DISTINCT
         {_sql_literal(source_key)}::varchar AS source_key,
         {_sql_literal(snapshot_id)}::varchar AS snapshot_id,
-        npi::bigint AS npi
+        npi::bigint AS npi,
+        (npi::bigint % {safe_shard_count})::int AS npi_shard
       FROM {_qualified_table_ref(db_schema, provider_group_member_table)}
      WHERE npi IS NOT NULL
 {npi_filter};
@@ -858,8 +847,10 @@ def _ptg_address_insert_member_coverage_sql(
     archive_available: bool,
     npi_range_start: int | None = None,
     npi_range_end: int | None = None,
+    npi_shard: int | None = None,
 ) -> str:
     npi_filter = _npi_range_filter("c.npi", npi_range_start, npi_range_end)
+    shard_filter = f"           AND c.npi_shard = {int(npi_shard)}" if npi_shard is not None else ""
     country_expr = "country_code"
     address_key_expr = (
         f"COALESCE(source_address_key, {db_schema}.addr_key_v1(first_line, second_line, city, state, postal_code, {country_expr}))"
@@ -960,6 +951,7 @@ def _ptg_address_insert_member_coverage_sql(
            AND ps.snapshot_id = c.snapshot_id
          WHERE c.npi IS NOT NULL
 {npi_filter}
+{shard_filter}
          GROUP BY c.npi
     ),
     shaped AS (
@@ -1219,6 +1211,7 @@ async def _insert_ptg_member_coverage_source(
     coverage_table: str,
     *,
     source_context: dict[str, str | None],
+    npi_shard_count: int,
 ) -> dict[str, str | None]:
     source_key = str(source_context["source_key"] or "")
     snapshot_id = str(source_context["snapshot_id"] or "")
@@ -1239,6 +1232,7 @@ async def _insert_ptg_member_coverage_source(
                     provider_group_member_table=provider_group_member_table,
                     npi_range_start=int(npi_range_start) if npi_range_start is not None else None,
                     npi_range_end=int(npi_range_end) if npi_range_end is not None else None,
+                    npi_shard_count=npi_shard_count,
                 )
             )
         )
@@ -1263,10 +1257,7 @@ async def _insert_ptg_member_fallback_materialize_shard(
     archive_available: bool,
     shard_index: int,
     shard_count: int,
-    min_npi: int,
-    max_npi: int,
 ) -> dict[str, str | int]:
-    npi_range_start, npi_range_end = _npi_observed_range_bounds(shard_index, shard_count, min_npi, max_npi)
     async with db.transaction() as session:
         await _apply_ptg_address_sql_settings(session)
         await session.execute(
@@ -1280,8 +1271,7 @@ async def _insert_ptg_member_fallback_materialize_shard(
                     node_id=node_id,
                     address_canon_available=address_canon_available,
                     archive_available=archive_available,
-                    npi_range_start=npi_range_start,
-                    npi_range_end=npi_range_end,
+                    npi_shard=shard_index,
                 )
             )
         )
@@ -1290,10 +1280,6 @@ async def _insert_ptg_member_fallback_materialize_shard(
         "snapshot_id": snapshot_id,
         "shard_index": shard_index,
         "shard_count": shard_count,
-        "npi_range_start": npi_range_start,
-        "npi_range_end": npi_range_end,
-        "min_npi": min_npi,
-        "max_npi": max_npi,
     }
 
 
@@ -1317,7 +1303,12 @@ async def _insert_ptg_member_fallback_aggregate(
         }
 
     coverage_table = _ptg_member_coverage_table_name(stage_table)
+    materialize_shards = _env_positive_int(
+        "HLTHPRT_PTG_ADDRESS_MEMBER_MATERIALIZE_SHARDS",
+        DEFAULT_MEMBER_MATERIALIZE_SHARDS,
+    )
     coverage_index = _stage_index_name(coverage_table, "npi")
+    coverage_shard_index = _stage_index_name(coverage_table, "shard_npi")
     coverage_source_index = _stage_index_name(coverage_table, "source_snapshot")
     await db.status(f"DROP TABLE IF EXISTS {db_schema}.{coverage_table};")
     try:
@@ -1326,7 +1317,8 @@ async def _insert_ptg_member_fallback_aggregate(
             CREATE UNLOGGED TABLE {db_schema}.{coverage_table} (
                 source_key varchar NOT NULL,
                 snapshot_id varchar NOT NULL,
-                npi bigint NOT NULL
+                npi bigint NOT NULL,
+                npi_shard int NOT NULL
             );
             """
         )
@@ -1339,6 +1331,7 @@ async def _insert_ptg_member_fallback_aggregate(
                     db_schema,
                     coverage_table,
                     source_context=source_context,
+                    npi_shard_count=materialize_shards,
                 )
 
         coverage_tasks = [asyncio.create_task(_insert_coverage_one(source_context)) for source_context in source_contexts]
@@ -1368,16 +1361,13 @@ async def _insert_ptg_member_fallback_aggregate(
 
         await db.status(f"CREATE INDEX {coverage_index} ON {db_schema}.{coverage_table} (npi);")
         await db.status(
+            f"CREATE INDEX {coverage_shard_index} ON {db_schema}.{coverage_table} (npi_shard, npi);"
+        )
+        await db.status(
             f"CREATE INDEX {coverage_source_index} ON {db_schema}.{coverage_table} (source_key, snapshot_id);"
         )
         await db.status(f"ANALYZE {db_schema}.{coverage_table};")
         coverage_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{coverage_table};") or 0)
-        coverage_min_max_rows = await db.all(
-            f"SELECT MIN(npi)::bigint AS min_npi, MAX(npi)::bigint AS max_npi FROM {db_schema}.{coverage_table};"
-        )
-        coverage_min_max = coverage_min_max_rows[0] if coverage_min_max_rows else {}
-        min_npi = int(_row_get(coverage_min_max, "min_npi") or 0)
-        max_npi = int(_row_get(coverage_min_max, "max_npi") or min_npi)
         if run_id:
             enqueue_live_progress(
                 run_id=run_id,
@@ -1395,10 +1385,6 @@ async def _insert_ptg_member_fallback_aggregate(
             await db.status(f"ANALYZE {db_schema}.ptg2_current_plan_source;")
         if archive_available:
             await db.status(f"ANALYZE {db_schema}.address_archive_v2;")
-        materialize_shards = _env_positive_int(
-            "HLTHPRT_PTG_ADDRESS_MEMBER_MATERIALIZE_SHARDS",
-            DEFAULT_MEMBER_MATERIALIZE_SHARDS,
-        )
         materialize_concurrency = min(
             materialize_shards,
             _env_positive_int(
@@ -1421,8 +1407,6 @@ async def _insert_ptg_member_fallback_aggregate(
                     archive_available=archive_available,
                     shard_index=shard_index,
                     shard_count=materialize_shards,
-                    min_npi=min_npi,
-                    max_npi=max_npi,
                 )
 
         materialize_results: list[dict[str, str | int]] = []
@@ -1458,8 +1442,6 @@ async def _insert_ptg_member_fallback_aggregate(
             "source_unit": "member_coverage_aggregate",
             "member_coverage_sources": len(source_contexts),
             "member_coverage_rows": coverage_rows,
-            "member_coverage_min_npi": min_npi,
-            "member_coverage_max_npi": max_npi,
             "member_materialize_shards": materialize_shards,
             "member_materialize_concurrency": materialize_concurrency,
         }

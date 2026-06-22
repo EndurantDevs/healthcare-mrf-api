@@ -2045,18 +2045,6 @@ def test_ptg_address_member_npi_range_bounds_are_contiguous():
     assert ptg_address._npi_range_bounds(0, 1) == (0, 10_000_000_000)
 
 
-def test_ptg_address_observed_npi_range_bounds_split_actual_coverage_range():
-    assert ptg_address._npi_observed_range_bounds(0, 4, 1_000_000_000, 2_999_999_999) == (
-        1_000_000_000,
-        1_500_000_000,
-    )
-    assert ptg_address._npi_observed_range_bounds(3, 4, 1_000_000_000, 2_999_999_999) == (
-        2_500_000_000,
-        3_000_000_000,
-    )
-    assert ptg_address._npi_observed_range_bounds(0, 1, 1_234, 1_234) == (1_234, 1_235)
-
-
 def test_ptg_address_member_sql_can_use_npi_range_predicate():
     sql = ptg_address._ptg_address_insert_sql(
         "mrf",
@@ -2086,11 +2074,13 @@ def test_ptg_member_coverage_insert_sql_stages_distinct_npis_only():
         provider_group_member_table="ptg2_provider_group_member_abc123",
         npi_range_start=2_500_000_000,
         npi_range_end=5_000_000_000,
+        npi_shard_count=8,
     )
 
-    assert "INSERT INTO mrf.ptg_address_member_coverage (source_key, snapshot_id, npi)" in sql
+    assert "INSERT INTO mrf.ptg_address_member_coverage (source_key, snapshot_id, npi, npi_shard)" in sql
     assert "'payer_a'::varchar AS source_key" in sql
     assert "'snap_1'::varchar AS snapshot_id" in sql
+    assert "(npi::bigint % 8)::int AS npi_shard" in sql
     assert "SELECT DISTINCT" in sql
     assert 'FROM "mrf"."ptg2_provider_group_member_abc123"' in sql
     assert "provider_group_global_id_128" not in sql
@@ -2111,11 +2101,13 @@ def test_ptg_address_member_coverage_sql_materializes_fallback_once():
         archive_available=True,
         npi_range_start=2_500_000_000,
         npi_range_end=5_000_000_000,
+        npi_shard=3,
     )
 
     assert "FROM mrf.ptg_address_member_coverage c" in sql
     assert "AND c.npi >= 2500000000" in sql
     assert "AND c.npi < 5000000000" in sql
+    assert "AND c.npi_shard = 3" in sql
     assert 'LEFT JOIN "mrf".ptg2_current_plan_source ps' in sql
     assert 'JOIN "mrf".npi_address a' in sql
     assert "ON a.npi = sp.npi" in sql
