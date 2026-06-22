@@ -1369,7 +1369,13 @@ async def test_list_providers_by_procedure_with_q():
                 ]
             ),
         ],
-        args={"q": "mri", "year": "2023", "state": "MD"},
+        args={
+            "q": "mri",
+            "year": "2023",
+            "state": "MD",
+            "include_sources": "true",
+            "include_evidence": "true",
+        },
     )
 
     response = await list_providers_by_procedure(request)
@@ -1378,6 +1384,12 @@ async def test_list_providers_by_procedure_with_q():
     assert payload["items"][0]["npi"] == 1003000126
     assert payload["query"]["q"] == "mri"
     assert payload["query"]["state"] == "MD"
+    assert payload["query"]["include_sources"] is True
+    assert payload["query"]["include_evidence"] is True
+    assert payload["sources"][0]["source_importer"] == "claims-pricing"
+    assert payload["sources"][0]["serving_tables"] == ["pricing_provider", "pricing_provider_procedure"]
+    assert payload["evidence"]["matched_provider_location_count"] == 1
+    assert payload["evidence"]["filters"]["state"] == "MD"
 
 
 @pytest.mark.asyncio

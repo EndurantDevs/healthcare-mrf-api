@@ -5822,6 +5822,11 @@ async def list_providers_by_procedure(request):
     order = _normalize_order(args.get("order"))
     order_by = str(args.get("order_by") or "total_allowed_amount")
     include_legacy_fields = _parse_bool(args.get("include_legacy_fields"), "include_legacy_fields", default=False)
+    include_sources = _parse_bool(args.get("include_sources"), "include_sources", default=False)
+    include_evidence = _parse_bool(args.get("include_evidence"), "include_evidence", default=False)
+    include_debug = _parse_bool(args.get("include_debug"), "include_debug", default=False) or _parse_bool(
+        args.get("include_details"), "include_details", default=False
+    )
     internal_codes: list[int] = []
     plan_id = str(args.get("plan_id", "")).strip()
     plan_external_id = str(args.get("plan_external_id", "")).strip()
@@ -6083,6 +6088,9 @@ async def list_providers_by_procedure(request):
         "min_claims": min_claims,
         "min_total_cost": min_total_cost,
         "include_legacy_fields": include_legacy_fields,
+        "include_sources": include_sources,
+        "include_evidence": include_evidence,
+        "include_debug": include_debug,
         "order_by": order_by,
         "order": order,
     }
@@ -6095,18 +6103,51 @@ async def list_providers_by_procedure(request):
             }
         )
 
-    return response.json(
-        {
-            "items": items,
-            "pagination": {
-                "total": total,
-                "limit": pagination.limit,
-                "offset": pagination.offset,
-                "page": pagination.page,
+    payload: dict[str, Any] = {
+        "items": items,
+        "pagination": {
+            "total": total,
+            "limit": pagination.limit,
+            "offset": pagination.offset,
+            "page": pagination.page,
+        },
+        "query": query_payload,
+    }
+    if include_sources:
+        payload["sources"] = [
+            {
+                "source_key": "cms_medicare_provider_services_claims",
+                "source_importer": "claims-pricing",
+                "source_system": "cms_medicare_part_b",
+                "dataset": "Medicare Physician & Other Practitioners by Provider and Service",
+                "serving_tables": ["pricing_provider", "pricing_provider_procedure"],
+                "grain": "provider_npi/year/procedure aggregate",
+                "derived": True,
+            }
+        ]
+    if include_evidence or include_debug:
+        payload["evidence"] = {
+            "matched_provider_location_count": total,
+            "filters": {
+                "year": year,
+                "year_source": year_source,
+                "code": code or None,
+                "state": state or None,
+                "city": city or None,
+                "zip5": zip5 or None,
+                "specialty": specialty or None,
+                "q": q or None,
+                "min_claims": min_claims,
+                "min_total_cost": min_total_cost,
             },
-            "query": query_payload,
+            "zip_scope": {
+                "anchor_zip5": zip5,
+                "zip_radius_miles": zip_radius_miles if zip5 else None,
+                "candidate_count": len(zip_filter_values) if zip_filter_values else (1 if zip5 else None),
+            },
+            "code_resolution": code_context,
         }
-    )
+    return response.json(payload)
 
 
 @blueprint.get("/providers/by-prescription", name="pricing.providers.by_prescription")
