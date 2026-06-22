@@ -443,6 +443,53 @@ def _provider_location_source_ctes(
     """
 
 
+def _archive_source_ctes(
+    db_schema: str,
+    provider_group_location_table: str | None,
+    provider_group_member_table: str | None = None,
+) -> str:
+    if not provider_group_member_table:
+        return _provider_location_source_ctes(
+            db_schema,
+            provider_group_location_table,
+            provider_group_member_table=provider_group_member_table,
+        )
+    return f"""
+    member_npis AS MATERIALIZED (
+        SELECT DISTINCT npi::bigint AS npi
+          FROM {_qualified_table_ref(db_schema, provider_group_member_table)}
+         WHERE npi IS NOT NULL
+    ),
+    shaped AS (
+        SELECT
+            a.npi::bigint AS npi,
+            'npi_address'::varchar AS location_source,
+            'provider_group_member_npi_address'::varchar AS confidence_code,
+            NULLIF(BTRIM(a.state_name), '')::varchar AS state,
+            NULLIF(BTRIM(a.city_name), '')::varchar AS city,
+            NULLIF(
+                LEFT(REGEXP_REPLACE(COALESCE(a.postal_code, ''), '[^0-9]', '', 'g'), 5),
+                ''
+            )::varchar AS zip5,
+            a.lat::numeric AS lat,
+            a."long"::numeric AS long,
+            NULLIF(BTRIM(a.first_line), '')::varchar AS first_line,
+            NULLIF(BTRIM(a.second_line), '')::varchar AS second_line,
+            NULLIF(BTRIM(a.postal_code), '')::varchar AS postal_code,
+            COALESCE(NULLIF(BTRIM(a.country_code), ''), 'US')::varchar AS country_code,
+            NULL::varchar AS provider_group_id,
+            NULL::varchar AS provider_set_id,
+            NULL::varchar AS tin,
+            NULL::uuid AS source_address_key,
+            a.date_added::timestamptz AS created_at
+          FROM member_npis mn
+          JOIN {_quote_ident(db_schema)}.npi_address a
+            ON a.npi = mn.npi
+           AND a.type = 'primary'
+    )
+        """
+
+
 def _provider_group_plan_cte(
     db_schema: str,
     *,
@@ -682,7 +729,7 @@ def _ptg_archive_source_sql(
     provider_group_location_table: str | None = None,
     provider_group_member_table: str | None = None,
 ) -> str:
-    source_ctes = _provider_location_source_ctes(
+    source_ctes = _archive_source_ctes(
         db_schema,
         provider_group_location_table,
         provider_group_member_table=provider_group_member_table,

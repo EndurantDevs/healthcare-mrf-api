@@ -1964,9 +1964,12 @@ def test_ptg_archive_source_sql_recomputes_provider_group_member_npi_address_key
         provider_group_member_table="ptg2_provider_group_member_abc123",
     )
 
-    assert "provider_group_members AS MATERIALIZED" in sql
+    assert "member_npis AS MATERIALIZED" in sql
+    assert "provider_group_members AS MATERIALIZED" not in sql
     assert 'FROM "mrf"."ptg2_provider_group_member_abc123"' in sql
+    assert "provider_group_global_id_128" not in sql
     assert 'JOIN "mrf".npi_address a' in sql
+    assert "ON a.npi = mn.npi" in sql
     assert "NULL::uuid AS source_address_key" in sql
     assert "a.address_key::uuid AS source_address_key" not in sql
     assert (
