@@ -62,7 +62,43 @@ MEDICATION_ALLOWED_CODE_SYSTEMS = {
 CODE_TOKEN_PATTERN = re.compile(r"^[A-Z0-9._-]+$")
 INT_CODE_PATTERN = re.compile(r"^-?\d+$")
 CHAIN_PECOS_PROVIDER_TYPE_CODES = {"12-C1"}
-PUBLIC_ADDRESS_EXCLUDED_COLUMNS = {"address_key"}
+PUBLIC_ADDRESS_EXCLUDED_COLUMNS = {"address_key", "premise_key"}
+PUBLIC_ADDRESS_SOURCE_DEBUG_COLUMNS = {
+    "location_key",
+    "entity_type",
+    "entity_id",
+    "entity_name",
+    "entity_subtype",
+    "row_origin",
+    "archive_identity_version",
+    "address_precision",
+    "zip5",
+    "state_code",
+    "city_norm",
+    "county_fips",
+    "source_mask",
+    "address_source_mask",
+    "source_count",
+    "independent_source_count",
+    "multi_source_confirmed",
+    "location_confidence_id",
+    "confidence_score",
+    "freshness_score",
+    "address_sources",
+}
+PUBLIC_ADDRESS_EVIDENCE_DEBUG_COLUMNS = {
+    "source_record_ids",
+    "aca_plan_array",
+    "aca_network_array",
+    "ptg_plan_array",
+    "ptg_source_array",
+    "group_plan_array",
+    "base_address_version",
+    "ptg_address_version",
+    "inferred_npi",
+    "inference_confidence",
+    "inference_method",
+}
 ADDRESS_SERVING_SOURCE_ENV = "HLTHPRT_ADDRESS_SERVING_SOURCE"
 ADDRESS_SERVING_SOURCE_LEGACY = "legacy"
 ADDRESS_SERVING_SOURCE_UNIFIED = "entity_address_unified"
@@ -78,7 +114,8 @@ FACILITY_ENROLLMENT_MODELS: dict[str, Any] = {
 
 def _redact_internal_address_fields(value: Any) -> Any:
     if isinstance(value, dict):
-        value.pop("address_key", None)
+        for key in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
+            value.pop(key, None)
         for child in value.values():
             _redact_internal_address_fields(child)
     elif isinstance(value, list):
@@ -505,14 +542,17 @@ def _npi_detail_cache_key(
     include_chain: bool,
     sync_geocode: bool,
     lookup_stored_geocode: bool,
+    include_sources: bool = False,
+    include_evidence: bool = False,
 ) -> str:
     schema = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     address_source = os.getenv(ADDRESS_SERVING_SOURCE_ENV) or ADDRESS_SERVING_SOURCE_LEGACY
     geocode_mode = "sync_geo" if sync_geocode else "stored_geo"
     archive_mode = "archive_geo" if lookup_stored_geocode else "no_archive_geo"
+    debug_mode = f"sources:{int(include_sources)}|evidence:{int(include_evidence)}"
     return (
         f"{schema}|{address_source}|{int(npi)}|{view}|"
-        f"{'chain' if include_chain else 'default'}|{geocode_mode}|{archive_mode}"
+        f"{'chain' if include_chain else 'default'}|{geocode_mode}|{archive_mode}|{debug_mode}"
     )
 
 
@@ -3801,6 +3841,11 @@ async def get_plans_by_npi(_request, npi):
 @blueprint.get("/id/<npi>")
 async def get_npi(request, npi):
     force_address_update = _parse_bool_arg(request.args.get("force_address_update"), default=False)
+    include_sources = _parse_bool_arg(request.args.get("include_sources"), default=False)
+    include_evidence = _parse_bool_arg(request.args.get("include_evidence"), default=False)
+    if _parse_bool_arg(request.args.get("debug"), default=False):
+        include_sources = True
+        include_evidence = True
     sync_geocode = _env_flag("HLTHPRT_NPI_DETAIL_SYNC_GEOCODE", "HLTHPRT_NPI_API_SYNC_GEOCODE", default=True)
     lookup_stored_geocode = _env_flag(
         "HLTHPRT_NPI_DETAIL_LOOKUP_STORED_GEOCODE",
@@ -3816,6 +3861,8 @@ async def get_npi(request, npi):
         include_chain=include_chain_enrichment,
         sync_geocode=sync_geocode,
         lookup_stored_geocode=lookup_stored_geocode,
+        include_sources=include_sources,
+        include_evidence=include_evidence,
     )
     if not force_address_update:
         cached_body = _npi_detail_response_cache_get(cache_key)
@@ -4240,10 +4287,13 @@ async def get_npi(request, npi):
 
         return d
 
+    build_kwargs: dict[str, Any] = {}
     if request_session is not None:
-        data = await _build_npi_details(npi, session=request_session)
-    else:
-        data = await _build_npi_details(npi)
+        build_kwargs["session"] = request_session
+    if include_sources or include_evidence:
+        build_kwargs["include_sources"] = include_sources
+        build_kwargs["include_evidence"] = include_evidence
+    data = await _build_npi_details(npi, **build_kwargs)
 
     if not data:
         raise sanic.exceptions.NotFound
@@ -4259,7 +4309,8 @@ async def get_npi(request, npi):
         data["address_list"] = []
     for address in data["address_list"]:
         if isinstance(address, dict):
-            address.pop("address_key", None)
+            for key in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
+                address.pop(key, None)
 
     if provider_enrichment_view == "summary":
         fetch_provider_enrichment = _fetch_provider_enrichment_summary_detail
@@ -4344,7 +4395,13 @@ async def get_npi(request, npi):
     return response.raw(response_body, content_type="application/json")
 
 
-async def _build_npi_details(npi: int, *, session: Any = None) -> dict:
+async def _build_npi_details(
+    npi: int,
+    *,
+    include_sources: bool = False,
+    include_evidence: bool = False,
+    session: Any = None,
+) -> dict:
     npi_data_table = NPIData.__table__
     taxonomy_table = NPIDataTaxonomy.__table__
     taxonomy_group_table = NPIDataTaxonomyGroup.__table__
@@ -4360,11 +4417,17 @@ async def _build_npi_details(npi: int, *, session: Any = None) -> dict:
     if not existing_address_columns:
         existing_address_columns = _model_table_columns(address_model)
 
+    allowed_address_columns = set(_model_table_columns(NPIAddress))
+    if include_sources or include_evidence:
+        allowed_address_columns.update(PUBLIC_ADDRESS_SOURCE_DEBUG_COLUMNS)
+    if include_evidence:
+        allowed_address_columns.update(PUBLIC_ADDRESS_EVIDENCE_DEBUG_COLUMNS)
+
     address_columns = []
     for column in address_table.columns:
         if column.key in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
             continue
-        if column.key not in _model_table_columns(NPIAddress):
+        if column.key not in allowed_address_columns:
             continue
         if column.key not in existing_address_columns:
             if column.key == "procedures_array":

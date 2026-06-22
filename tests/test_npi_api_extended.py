@@ -2108,6 +2108,62 @@ async def test_get_npi_does_not_expose_internal_address_key(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_get_npi_debug_flags_include_sources_and_evidence(monkeypatch):
+    captured_kwargs = {}
+
+    async def fake_build(_npi, **kwargs):
+        captured_kwargs.update(kwargs)
+        return {
+            'npi': _npi,
+            'do_business_as': [],
+            'taxonomy_list': [],
+            'taxonomy_group_list': [],
+            'address_list': [
+                {
+                    'npi': _npi,
+                    'type': 'primary',
+                    'checksum': 5,
+                    'address_key': '00000000-0000-0000-0000-000000000001',
+                    'premise_key': '00000000-0000-0000-0000-000000000002',
+                    'lat': 40.0,
+                    'long': -80.0,
+                    'location_key': 'loc-debug',
+                    'address_sources': ['npi', 'mrf'],
+                    'source_record_ids': ['npi:1518379601', 'mrf:row-1'],
+                    'source_count': 2,
+                    'plans_network_array': [],
+                    'taxonomy_array': [],
+                }
+            ],
+        }
+
+    monkeypatch.setattr(npi_module, '_build_npi_details', fake_build)
+    monkeypatch.setattr(npi_module, '_fetch_other_names', AsyncMock(return_value=[]))
+
+    class FakeApp:
+        config = {'NPI_API_UPDATE_GEOCODE': False}
+
+        def add_task(self, coro):  # pragma: no cover - guard
+            raise AssertionError('no task expected')
+
+    request = types.SimpleNamespace(
+        args={'include_sources': 'true', 'include_evidence': 'true'},
+        app=FakeApp(),
+    )
+    response = await npi_module.get_npi(request, '1518379601')
+    payload = json.loads(response.body)
+    address = payload['address_list'][0]
+
+    assert captured_kwargs['include_sources'] is True
+    assert captured_kwargs['include_evidence'] is True
+    assert address['address_sources'] == ['npi', 'mrf']
+    assert address['source_record_ids'] == ['npi:1518379601', 'mrf:row-1']
+    assert address['source_count'] == 2
+    assert 'address_key' not in address
+    assert 'premise_key' not in address
+
+
+@pytest.mark.asyncio
 async def test_get_npi_address_list_clears_empty_entries(monkeypatch):
     async def fake_build(_npi):
         return {
