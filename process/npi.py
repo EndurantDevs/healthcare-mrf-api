@@ -40,7 +40,7 @@ from process.ext.utils import (download_it, download_it_and_save,
                                ensure_database, make_class, my_init_db,
                                print_time_info, push_objects, return_checksum)
 from process.live_progress import enqueue_live_progress
-from process.openaddresses import refresh_archive_geocodes_from_openaddresses
+from process.openaddresses import refresh_archive_geocodes_from_openaddresses_sharded
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
 
@@ -1257,14 +1257,21 @@ async def shutdown(ctx):  # pragma: no cover
             "canonical_address_resolve",
             _canonical_address_resolve(),
         )
-        oa_stats = await timed_shutdown_phase(
-            "openaddresses_archive_backfill",
-            refresh_archive_geocodes_from_openaddresses(schema=db_schema),
-        )
-        print(
-            "OpenAddresses archive backfill after NPI canonical resolve: "
-            f"exact={oa_stats.exact_updates} fuzzy={oa_stats.fuzzy_updates}"
-        )
+        if _env_bool("HLTHPRT_NPI_OPENADDRESSES_BACKFILL", False):
+            oa_stats = await timed_shutdown_phase(
+                "openaddresses_archive_backfill",
+                refresh_archive_geocodes_from_openaddresses_sharded(schema=db_schema, run_id=run_id or None),
+            )
+            print(
+                "OpenAddresses archive backfill after NPI canonical resolve: "
+                f"exact={oa_stats.exact_updates} fuzzy={oa_stats.fuzzy_updates} "
+                f"relaxed={oa_stats.relaxed_updates}"
+            )
+        else:
+            print(
+                "Skipping OpenAddresses archive backfill after NPI canonical resolve; "
+                "set HLTHPRT_NPI_OPENADDRESSES_BACKFILL=1 to run it."
+            )
 
     async def _timed_geo_update(obj, archive_source: str, use_canonical_archive: bool):
         async def _run_geo_update():
@@ -1553,6 +1560,7 @@ WHERE
             "npi_address_rows": int(npi_address_count or 0),
             "npi_shutdown_phase_timings": shutdown_phase_timings,
             **({"address_resolve": address_stats.__dict__} if address_stats else {}),
+            "openaddresses_backfill_enabled": _env_bool("HLTHPRT_NPI_OPENADDRESSES_BACKFILL", False),
         },
     )
     print_time_info(ctx['context']['start'])

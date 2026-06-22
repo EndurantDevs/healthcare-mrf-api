@@ -570,6 +570,9 @@ async def test_shutdown_handles_rotation(monkeypatch, npi_module):
         "resolve_into_archive",
         AsyncMock(return_value=SimpleNamespace(staged=1, distinct_keys=1, inserted=1, elapsed_seconds=0.1)),
     )
+    openaddresses_backfill = AsyncMock()
+    monkeypatch.delenv("HLTHPRT_NPI_OPENADDRESSES_BACKFILL", raising=False)
+    monkeypatch.setattr(npi_module, "refresh_archive_geocodes_from_openaddresses_sharded", openaddresses_backfill)
     progress_events: list[dict[str, object]] = []
     control_updates: list[tuple[str, dict[str, object]]] = []
 
@@ -595,7 +598,10 @@ async def test_shutdown_handles_rotation(monkeypatch, npi_module):
     assert control_updates[-1][0] == "npi-run-1"
     metrics = control_updates[-1][1]["metrics"]
     timings = metrics["npi_shutdown_phase_timings"]
+    openaddresses_backfill.assert_not_awaited()
+    assert metrics["openaddresses_backfill_enabled"] is False
     assert any(item["phase"] == "canonical_address_resolve" for item in timings)
+    assert not any(item["phase"] == "openaddresses_archive_backfill" for item in timings)
     assert any(str(item["phase"]).startswith("vacuum_analyze:") for item in timings)
     assert any(str(item["phase"]).startswith("publish_swap:") for item in timings)
     assert all("elapsed_seconds" in item for item in timings)
