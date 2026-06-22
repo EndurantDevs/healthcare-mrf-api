@@ -1835,7 +1835,11 @@ def test_ptg_archive_source_sql_materializes_provider_location_addresses():
 
     assert "CREATE UNLOGGED TABLE mrf.ptg_address_stage_archive_source AS" in sql
     assert 'FROM "mrf"."ptg2_provider_group_location_abc123" loc' in sql
-    assert "COALESCE(source_address_key, mrf.addr_key_v1(first_line, second_line, city, state, postal_code, country_code))" in sql
+    assert (
+        "COALESCE(source_address_key, "
+        "mrf.addr_key_v1(first_line, second_line, city, state, postal_code, country_code))"
+        in sql
+    )
     assert "SELECT DISTINCT" in sql
     assert "first_line" in sql
     assert "city_name" in sql
@@ -1943,11 +1947,34 @@ def test_ptg_address_insert_sql_uses_provider_group_member_npi_address_fallback(
     assert "'provider_group_member_npi_address:' || pgm.provider_group_id" in sql
     assert "a.date_added::timestamptz AS created_at" in sql
     assert "a.updated_at" not in sql
+    assert "NULL::uuid AS source_address_key" in sql
+    assert "a.address_key::uuid AS source_address_key" not in sql
     assert "NULLIF(provider_group_global_id_128::text, '')::varchar AS provider_group_id" in sql
     assert "mrf.addr_key_v1(first_line, second_line, city, state, postal_code, country_code)" in sql
     assert "'payer_a'::varchar AS source_key" in sql
     assert "SELECT DISTINCT ON" not in sql
     assert "ON CONFLICT (source_key, snapshot_id, location_key) DO NOTHING" in sql
+
+
+def test_ptg_archive_source_sql_recomputes_provider_group_member_npi_address_keys():
+    sql = ptg_address._ptg_archive_source_sql(
+        "mrf",
+        "ptg_address_stage_archive_source",
+        address_canon_available=True,
+        provider_group_member_table="ptg2_provider_group_member_abc123",
+    )
+
+    assert "provider_group_members AS MATERIALIZED" in sql
+    assert 'FROM "mrf"."ptg2_provider_group_member_abc123"' in sql
+    assert 'JOIN "mrf".npi_address a' in sql
+    assert "NULL::uuid AS source_address_key" in sql
+    assert "a.address_key::uuid AS source_address_key" not in sql
+    assert (
+        "COALESCE(source_address_key, "
+        "mrf.addr_key_v1(first_line, second_line, city, state, postal_code, country_code))"
+        in sql
+    )
+    assert "CREATE UNLOGGED TABLE mrf.ptg_address_stage_archive_source AS" in sql
 
 
 @pytest.mark.asyncio

@@ -344,6 +344,9 @@ def _provider_location_source_ctes(
     )
         """
     if provider_group_member_table:
+        # NPI address rows can predate the current canonical-key rules. Recompute keys
+        # from address fields in the PTG materialization/archive paths instead of
+        # trusting a stamped npi_address.address_key.
         return f"""
     provider_group_members AS MATERIALIZED (
         SELECT DISTINCT
@@ -385,7 +388,7 @@ def _provider_location_source_ctes(
             pgm.provider_group_id,
             NULL::varchar AS provider_set_id,
             NULL::varchar AS tin,
-            a.address_key::uuid AS source_address_key,
+            NULL::uuid AS source_address_key,
             a.date_added::timestamptz AS created_at
           FROM provider_group_members pgm
           JOIN {_quote_ident(db_schema)}.npi_address a
