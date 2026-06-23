@@ -3966,83 +3966,44 @@ async def group_plan_providers(request):
         })
 
     serving_tables = await snapshot_serving_tables(session, snapshot_id)
-    serving_table = _safe_table_name(serving_tables.serving_table)
-    set_component_table = _safe_table_name(serving_tables.provider_set_component_table)
     group_member_table = _safe_table_name(serving_tables.provider_group_member_table)
-
-    if (request.args.get("debug") or "").strip():
-        diag: dict[str, Any] = {
-            "snapshot_id": snapshot_id,
-            "serving_tables": {k: getattr(serving_tables, k) for k in serving_tables.__dataclass_fields__},
-        }
-        async def _cols(tbl):
-            if not tbl:
-                return None
-            try:
-                schema, _, name = tbl.partition(".")
-                r = await session.execute(text(
-                    "SELECT column_name FROM information_schema.columns "
-                    "WHERE table_schema=:s AND table_name=:t ORDER BY ordinal_position"
-                ), {"s": schema, "t": name})
-                return [row[0] for row in r.fetchall()]
-            except Exception as exc:  # noqa: BLE001
-                return f"err: {exc}"
-        diag["serving_columns"] = await _cols(serving_table)
-        diag["group_member_columns"] = await _cols(group_member_table)
-        try:
-            r = await session.execute(text(
-                f"SELECT plan_id, COUNT(*) AS n FROM {serving_table} GROUP BY plan_id ORDER BY n DESC LIMIT 10"
-            ))
-            diag["serving_plan_ids"] = [{"plan_id": row[0], "rows": int(row[1])} for row in r.fetchall()]
-        except Exception as exc:  # noqa: BLE001
-            diag["serving_plan_ids"] = f"err: {exc}"
-        try:
-            r = await session.execute(text(
-                f"SELECT COUNT(DISTINCT npi) FROM {group_member_table} WHERE npi > 0"
-            ))
-            diag["group_member_distinct_npi"] = int(r.scalar() or 0)
-        except Exception as exc:  # noqa: BLE001
-            diag["group_member_distinct_npi"] = f"err: {exc}"
-        return response.json({"ok": True, "debug": diag})
-
-    if not (serving_table and set_component_table and group_member_table):
+    if not group_member_table:
         return response.json({
             "ok": False, "error_type": "unsupported_storage",
             "plan_id": plan_id, "market_type": market_type, "snapshot_id": snapshot_id,
-            "reason": "serving snapshot does not expose relational provider tables "
-                      "(sidecar/manifest provider mode not yet supported here)",
-            "serving_tables": {
-                "serving": serving_table,
-                "set_component": set_component_table,
-                "group_member": group_member_table,
-            },
+            "reason": "serving snapshot does not expose a provider_group_member table",
+            "serving_table": _safe_table_name(serving_tables.serving_table),
         }, status=501)
 
-    npi_sql = text(
-        f"""
-        WITH plan_sets AS (
-            SELECT DISTINCT r.provider_set_hash AS provider_set_hash
-              FROM {serving_table} r
-             WHERE r.plan_id = :plan_id
-               AND r.provider_set_hash IS NOT NULL
-        ),
-        plan_groups AS (
-            SELECT DISTINCT psc.provider_group_hash AS provider_group_hash
-              FROM {set_component_table} psc
-              JOIN plan_sets ps ON ps.provider_set_hash = psc.provider_set_hash
-        )
-        SELECT DISTINCT pgm.npi AS npi
-          FROM {group_member_table} pgm
-          JOIN plan_groups pg ON pg.provider_group_hash = pgm.provider_group_hash
-         WHERE pgm.npi > :cursor_npi
-         ORDER BY pgm.npi
-         LIMIT :limit
-        """
-    )
+    # current_source_snapshot_id_for_plan resolves the plan's per-SOURCE serving
+    # snapshot, which for PTG group-plan imports is snapshot-scoped to a single
+    # plan (snapshot_scoped=true; the serving table carries only this plan_id). So
+    # the snapshot's provider_group_member table holds exactly this plan's
+    # in-network provider NPIs (group_global_id -> npi). Enumerate them DISTINCT,
+    # keyset-paginated by NPI -- an index on npi keeps the cursor scan cheap even
+    # at national-network scale (e.g. HealthJoy/UMR ~2.08M distinct NPIs). The
+    # in-DB group_member table is used instead of the binary set->group sidecars,
+    # which is both correct (single-plan snapshot) and the only tractable way to
+    # page millions of providers.
     rows = (await session.execute(
-        npi_sql, {"plan_id": plan_id, "cursor_npi": cursor_npi, "limit": limit}
+        text(
+            f"""
+            SELECT DISTINCT npi
+              FROM {group_member_table}
+             WHERE npi > :cursor_npi
+             ORDER BY npi
+             LIMIT :limit
+            """
+        ),
+        {"cursor_npi": max(cursor_npi, 0), "limit": limit},
     )).fetchall()
     npis = [int(row.npi) for row in rows if row.npi is not None]
+
+    total_distinct = None
+    if (request.args.get("count") or "").strip().lower() in ("1", "true", "yes"):
+        total_distinct = int((await session.execute(
+            text(f"SELECT COUNT(DISTINCT npi) FROM {group_member_table} WHERE npi > 0")
+        )).scalar() or 0)
 
     items: list[dict[str, Any]] = [{"npi": npi} for npi in npis]
     if enrich and npis:
@@ -4074,7 +4035,12 @@ async def group_plan_providers(request):
         "market_type": market_type,
         "snapshot_id": snapshot_id,
         "resolved": True,
-        "providers": {"count": len(items), "items": items, "next_cursor": next_cursor},
+        "providers": {
+            "count": len(items),
+            "total_distinct": total_distinct,
+            "items": items,
+            "next_cursor": next_cursor,
+        },
         "exhausted": next_cursor is None,
     })
 
