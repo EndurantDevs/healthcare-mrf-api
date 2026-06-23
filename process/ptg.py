@@ -316,6 +316,96 @@ from process.url_security import fetch_max_bytes
 logger = logging.getLogger(__name__)
 
 PTG2_SOURCE_SCOPED_TEST_ENV = "HLTHPRT_PTG2_SOURCE_SCOPED_TEST"
+PTG2_AUTO_ADDRESS_REFRESH_ENV = "HLTHPRT_PTG2_AUTO_ADDRESS_REFRESH"
+PTG2_AUTO_ADDRESS_REFRESH_TEST_ENV = "HLTHPRT_PTG2_AUTO_ADDRESS_REFRESH_TEST"
+PTG2_AUTO_ADDRESS_REFRESH_LIMIT_ENV = "HLTHPRT_PTG2_AUTO_ADDRESS_REFRESH_LIMIT_PER_SOURCE"
+PTG2_AUTO_ADDRESS_REFRESH_PUBLISH_ENV = "HLTHPRT_PTG2_AUTO_ADDRESS_REFRESH_PUBLISH"
+
+
+def _ptg2_auto_address_refresh_enabled(*, test_mode: bool) -> tuple[bool, str | None]:
+    if not _env_bool(PTG2_AUTO_ADDRESS_REFRESH_ENV, True):
+        return False, "disabled"
+    if test_mode and not _env_bool(PTG2_AUTO_ADDRESS_REFRESH_TEST_ENV, False):
+        return False, "test-mode-disabled"
+    return True, None
+
+
+def _ptg2_auto_address_refresh_payload(
+    *,
+    source_key: str,
+    snapshot_id: str,
+    import_run_id: str,
+    test_mode: bool,
+) -> dict[str, Any]:
+    params: dict[str, Any] = {
+        "source_key": source_key,
+        "snapshot_id": snapshot_id,
+        "ptg_refresh_mode": "partial",
+        "entity_refresh_mode": "ptg-partial",
+        "publish": _env_bool(PTG2_AUTO_ADDRESS_REFRESH_PUBLISH_ENV, True),
+    }
+    if test_mode:
+        params["test_mode"] = True
+    limit_per_source = max(_env_int(PTG2_AUTO_ADDRESS_REFRESH_LIMIT_ENV, 0), 0)
+    if limit_per_source:
+        params["limit_per_source"] = limit_per_source
+    return {
+        "run_id": None,
+        "importer": "ptg-address-entity-refresh",
+        "params": params,
+        "idempotency_key": f"ptg-address-entity-refresh:{source_key}:{snapshot_id}",
+        "triggered_by": "ptg_import",
+        "schedule_id": None,
+        "subscription_id": None,
+        "import_id": f"ptg-address-entity-refresh:{import_run_id}",
+    }
+
+
+async def _enqueue_ptg2_auto_address_refresh_after_import(
+    *,
+    source_key: str | None,
+    snapshot_id: str,
+    import_run_id: str,
+    has_serving_files: bool,
+    source_scoped_compact: bool,
+    test_mode: bool,
+) -> dict[str, Any]:
+    if not has_serving_files:
+        return {"status": "skipped", "reason": "no-serving-files"}
+    if not source_scoped_compact:
+        return {"status": "skipped", "reason": "not-source-scoped"}
+    if not source_key:
+        return {"status": "skipped", "reason": "missing-source-key"}
+    enabled, reason = _ptg2_auto_address_refresh_enabled(test_mode=test_mode)
+    if not enabled:
+        return {"status": "skipped", "reason": reason}
+    payload = _ptg2_auto_address_refresh_payload(
+        source_key=source_key,
+        snapshot_id=snapshot_id,
+        import_run_id=import_run_id,
+        test_mode=test_mode,
+    )
+    try:
+        from api.control_imports import create_import_run, ensure_import_run_table  # pylint: disable=import-outside-toplevel
+
+        await ensure_import_run_table()
+        run, created = await create_import_run(payload)
+        return {
+            "status": "queued" if created else "existing",
+            "created": bool(created),
+            "run_id": run.get("run_id"),
+            "importer": run.get("importer") or payload["importer"],
+            "idempotency_key": payload["idempotency_key"],
+            "params": payload["params"],
+        }
+    except Exception as exc:
+        logger.exception("Failed to enqueue PTG address refresh after PTG import %s", import_run_id)
+        return {
+            "status": "enqueue_failed",
+            "error": str(exc),
+            "idempotency_key": payload["idempotency_key"],
+            "params": payload["params"],
+        }
 
 
 async def _push_ptg2_objects(rows: list[dict[str, Any]], cls, rewrite: bool = True) -> None:
@@ -2605,6 +2695,15 @@ async def main(
             if previous_snapshot_id:
                 keep_snapshot_ids.add(previous_snapshot_id)
             await _cleanup_old_ptg2_source_tables(source_key_val, keep_snapshot_ids)
+        address_refresh_result = await _enqueue_ptg2_auto_address_refresh_after_import(
+            source_key=source_key_val,
+            snapshot_id=snapshot_id,
+            import_run_id=import_run_id,
+            has_serving_files=has_serving_files,
+            source_scoped_compact=source_scoped_compact,
+            test_mode=test_mode,
+        )
+        report_payload["address_refresh"] = address_refresh_result
         await _push_ptg2_objects(
             [
                 {
@@ -2665,6 +2764,7 @@ async def main(
             "serving_rates": report_payload.get("serving_rates"),
             "rate_count": report_payload.get("rate_count"),
             "source_file_versions": _ptg2_source_file_versions_from_results(successful_files + skipped_files),
+            "address_refresh": address_refresh_result,
         }
     except Exception as exc:
         write_live_progress(

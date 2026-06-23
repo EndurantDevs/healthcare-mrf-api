@@ -7,6 +7,10 @@ control handler with ``refresh_addresses=true``, and executes the generated
 That keeps the test isolated from shared Redis workers while still exercising
 the deployed promotion, payload mapping, and refresh code paths against a real
 PostgreSQL database.
+
+The ``auto-import-hook`` scenario seeds the same disposable HealthJoy-style
+source after source-pointer publication and invokes the post-PTG-import refresh
+enqueue hook directly with the control enqueue patched to run synchronously.
 """
 
 from __future__ import annotations
@@ -59,6 +63,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--schema", default=os.getenv("HLTHPRT_SMOKE_SCHEMA") or _default_schema())
     parser.add_argument("--base-schema", default=os.getenv("HLTHPRT_SMOKE_BASE_SCHEMA") or "mrf")
+    parser.add_argument(
+        "--scenario",
+        choices=("promote-plus-refresh", "auto-import-hook"),
+        default=os.getenv("HLTHPRT_SMOKE_SCENARIO") or "promote-plus-refresh",
+    )
     parser.add_argument("--keep-schema", action="store_true", help="keep the disposable schema after a successful run")
     return parser.parse_args()
 
@@ -67,6 +76,9 @@ async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
     schema = _validate_identifier(args.schema, label="schema")
     base_schema = _validate_identifier(args.base_schema, label="base-schema")
     pgl_table = _validate_identifier(DEFAULT_PROVIDER_GROUP_LOCATION_TABLE, label="provider-group-location table")
+    source_key = "healthjoy"
+    unchanged_source_key = "source-b"
+    promoted_seed = args.scenario == "auto-import-hook"
 
     os.environ["HLTHPRT_DB_SCHEMA"] = schema
     os.environ.setdefault("HLTHPRT_CONTROL_API_TOKEN", "codex-smoke-token")
@@ -78,9 +90,10 @@ async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
 
     # Import after HLTHPRT_DB_SCHEMA is set so SQLAlchemy model schemas bind to
     # the disposable schema.
-    from api import control  # pylint: disable=import-outside-toplevel
+    from api import control, control_imports  # pylint: disable=import-outside-toplevel
     from db.models import db  # pylint: disable=import-outside-toplevel
     from process.ext.utils import my_init_db  # pylint: disable=import-outside-toplevel
+    from process import ptg as process_ptg  # pylint: disable=import-outside-toplevel
     from process.ptg_address_entity_refresh import process_data as refresh_process_data  # pylint: disable=import-outside-toplevel
 
     await my_init_db(db)
@@ -154,7 +167,7 @@ async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
         manifest = json.dumps(
             {
                 "serving_index": {
-                    "source_key": "source-a",
+                    "source_key": source_key,
                     "provider_group_location_table": f"{schema}.{pgl_table}",
                 }
             }
@@ -213,10 +226,11 @@ async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
             f"""
             INSERT INTO {schema}.ptg2_current_source_snapshot (
                 source_key, snapshot_id, previous_snapshot_id, import_month, updated_at
-            ) VALUES (:source_key, :snapshot_id, NULL, :import_month, NOW());
+            ) VALUES (:source_key, :snapshot_id, :previous_snapshot_id, :import_month, NOW());
             """,
-            source_key="source-a",
-            snapshot_id="snap-old",
+            source_key=source_key,
+            snapshot_id="snap-new" if promoted_seed else "snap-old",
+            previous_snapshot_id="snap-old" if promoted_seed else None,
             import_month=DEFAULT_IMPORT_MONTH,
         )
         await db.status(
@@ -229,12 +243,12 @@ async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
                 :snapshot_id, NULL, NOW()
             );
             """,
-            plan_source_key="old-source-a-plan",
-            plan_id="plan-old",
+            plan_source_key=("healthjoy-plan-new" if promoted_seed else "old-healthjoy-plan"),
+            plan_id=("plan-new" if promoted_seed else "plan-old"),
             plan_market_type="group",
             import_month=DEFAULT_IMPORT_MONTH,
-            source_key="source-a",
-            snapshot_id="snap-old",
+            source_key=source_key,
+            snapshot_id=("snap-new" if promoted_seed else "snap-old"),
         )
         await db.status(
             f"""
@@ -245,18 +259,20 @@ async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
                 base_address_version, observed_at, updated_at
             ) VALUES
             (
-                'source-a', 'snap-old', 'plan-old', 'plan-old', 'pg-old', 1234567890,
-                'old-source-a-location', 'old-source-a-record', '02109', 'MA', 'boston',
-                42.36, -71.06, ARRAY['plan-old']::varchar[], ARRAY['source-a']::varchar[], ARRAY['plan-old']::varchar[],
+                :source_key, 'snap-old', 'plan-old', 'plan-old', 'pg-old', 1234567890,
+                'old-healthjoy-location', 'old-healthjoy-record', '02109', 'MA', 'boston',
+                42.36, -71.06, ARRAY['plan-old']::varchar[], ARRAY[CAST(:source_key AS varchar)]::varchar[], ARRAY['plan-old']::varchar[],
                 'address_archive_v2:v2', NOW(), NOW()
             ),
             (
-                'source-b', 'snap-keep', 'plan-keep', 'plan-keep', 'pg-keep', 2222222222,
+                :unchanged_source_key, 'snap-keep', 'plan-keep', 'plan-keep', 'pg-keep', 2222222222,
                 'keep-source-b-location', 'keep-source-b-record', '10001', 'NY', 'newyork',
-                40.75, -73.99, ARRAY['plan-keep']::varchar[], ARRAY['source-b']::varchar[], ARRAY['plan-keep']::varchar[],
+                40.75, -73.99, ARRAY['plan-keep']::varchar[], ARRAY[CAST(:unchanged_source_key AS varchar)]::varchar[], ARRAY['plan-keep']::varchar[],
                 'address_archive_v2:v2', NOW(), NOW()
             );
-            """
+            """,
+            source_key=source_key,
+            unchanged_source_key=unchanged_source_key,
         )
         await db.status(
             f"""
@@ -267,39 +283,47 @@ async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
                 lat, "long", updated_at
             ) VALUES
             (
-                'npi', '1234567890', 1234567890, 'old-source-a-location', 1, 'practice',
-                ARRAY['plan-old']::varchar[], ARRAY['source-a']::varchar[], ARRAY['plan-old']::varchar[],
+                'npi', '1234567890', 1234567890, 'old-healthjoy-location', 1, 'practice',
+                ARRAY['plan-old']::varchar[], ARRAY[CAST(:source_key AS varchar)]::varchar[], ARRAY['plan-old']::varchar[],
                 'address_archive_v2:v2', 'ptg:snap-old', 'boston', 'MA', '02109', 'US',
                 42.36, -71.06, NOW()
             ),
             (
                 'npi', '2222222222', 2222222222, 'keep-source-b-location', 2, 'practice',
-                ARRAY['plan-keep']::varchar[], ARRAY['source-b']::varchar[], ARRAY['plan-keep']::varchar[],
+                ARRAY['plan-keep']::varchar[], ARRAY[CAST(:unchanged_source_key AS varchar)]::varchar[], ARRAY['plan-keep']::varchar[],
                 'address_archive_v2:v2', 'ptg:snap-keep', 'newyork', 'NY', '10001', 'US',
                 40.75, -73.99, NOW()
             );
-            """
+            """,
+            source_key=source_key,
+            unchanged_source_key=unchanged_source_key,
         )
 
     async def checks() -> dict[str, Any]:
         return {
             "current_source_snapshot": await scalar(
-                f"SELECT snapshot_id FROM {schema}.ptg2_current_source_snapshot WHERE source_key='source-a';"
+                f"SELECT snapshot_id FROM {schema}.ptg2_current_source_snapshot WHERE source_key=:source_key;",
+                source_key=source_key,
             ),
             "current_plan_snapshot": await scalar(
-                f"SELECT snapshot_id FROM {schema}.ptg2_current_plan_source WHERE source_key='source-a';"
+                f"SELECT snapshot_id FROM {schema}.ptg2_current_plan_source WHERE source_key=:source_key;",
+                source_key=source_key,
             ),
             "current_plan_id": await scalar(
-                f"SELECT plan_id FROM {schema}.ptg2_current_plan_source WHERE source_key='source-a';"
+                f"SELECT plan_id FROM {schema}.ptg2_current_plan_source WHERE source_key=:source_key;",
+                source_key=source_key,
             ),
             "ptg_old_source_rows": await scalar(
-                f"SELECT COUNT(*) FROM {schema}.ptg_address WHERE source_key='source-a' AND snapshot_id='snap-old';"
+                f"SELECT COUNT(*) FROM {schema}.ptg_address WHERE source_key=:source_key AND snapshot_id='snap-old';",
+                source_key=source_key,
             ),
             "ptg_new_source_rows": await scalar(
-                f"SELECT COUNT(*) FROM {schema}.ptg_address WHERE source_key='source-a' AND snapshot_id='snap-new';"
+                f"SELECT COUNT(*) FROM {schema}.ptg_address WHERE source_key=:source_key AND snapshot_id='snap-new';",
+                source_key=source_key,
             ),
             "ptg_unchanged_rows": await scalar(
-                f"SELECT COUNT(*) FROM {schema}.ptg_address WHERE source_key='source-b' AND snapshot_id='snap-keep';"
+                f"SELECT COUNT(*) FROM {schema}.ptg_address WHERE source_key=:unchanged_source_key AND snapshot_id='snap-keep';",
+                unchanged_source_key=unchanged_source_key,
             ),
             "entity_old_rows": await scalar(
                 f"SELECT COUNT(*) FROM {schema}.entity_address_unified WHERE ptg_address_version='ptg:snap-old';"
@@ -332,11 +356,13 @@ async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
     await seed()
     timings: dict[str, float] = {}
     captured_payloads: list[dict[str, Any]] = []
+    refresh_results: list[dict[str, Any]] = []
 
     async def fake_create_import_run(run_payload: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         captured_payloads.append(run_payload)
         start = time.perf_counter()
         refresh_result = await refresh_process_data({}, run_payload["params"])
+        refresh_results.append(refresh_result)
         timings["refresh_seconds"] = round(time.perf_counter() - start, 6)
         return (
             {
@@ -349,29 +375,51 @@ async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
             True,
         )
 
+    async def fake_ensure_import_run_table() -> None:
+        return None
+
     control.create_import_run = fake_create_import_run
+    control_imports.create_import_run = fake_create_import_run
+    control_imports.ensure_import_run_table = fake_ensure_import_run_table
     token = os.getenv("HLTHPRT_CONTROL_API_TOKEN") or "codex-smoke-token"
-    request = types.SimpleNamespace(
-        headers={"Authorization": f"Bearer {token}"},
-        json={
-            "source_key": "source-a",
-            "snapshot_id": "snap-new",
-            "expected_current_snapshot_id": "snap-old",
-            "refresh_addresses": True,
-            "address_refresh": {
-                "publish": True,
-                "limit_per_source": 25,
-                "idempotency_key": "codex-dev-refresh-source-a-snap-new",
-            },
-        },
-        id="codex-dev-promote-refresh-smoke",
-    )
 
     try:
-        start = time.perf_counter()
-        response = await control.control_ptg_source_snapshot_promote(request)
-        timings["promote_plus_refresh_seconds"] = round(time.perf_counter() - start, 6)
-        body = json.loads(response.body)
+        body: dict[str, Any] = {}
+        response_status: int | None = None
+        hook_result: dict[str, Any] | None = None
+        if args.scenario == "promote-plus-refresh":
+            request = types.SimpleNamespace(
+                headers={"Authorization": f"Bearer {token}"},
+                json={
+                    "source_key": source_key,
+                    "snapshot_id": "snap-new",
+                    "expected_current_snapshot_id": "snap-old",
+                    "refresh_addresses": True,
+                    "address_refresh": {
+                        "publish": True,
+                        "limit_per_source": 25,
+                        "idempotency_key": "codex-dev-refresh-healthjoy-snap-new",
+                    },
+                },
+                id="codex-dev-promote-refresh-smoke",
+            )
+            start = time.perf_counter()
+            response = await control.control_ptg_source_snapshot_promote(request)
+            timings["promote_plus_refresh_seconds"] = round(time.perf_counter() - start, 6)
+            response_status = response.status
+            body = json.loads(response.body)
+        else:
+            start = time.perf_counter()
+            hook_result = await process_ptg._enqueue_ptg2_auto_address_refresh_after_import(
+                source_key=source_key,
+                snapshot_id="snap-new",
+                import_run_id="healthjoy-run-new",
+                has_serving_files=True,
+                source_scoped_compact=True,
+                test_mode=False,
+            )
+            timings["auto_import_hook_seconds"] = round(time.perf_counter() - start, 6)
+            body = {"address_refresh": hook_result}
         check_values = await checks()
         expected = {
             "current_source_snapshot": "snap-new",
@@ -385,15 +433,17 @@ async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
             "entity_unchanged_rows": 1,
             "stage_tables_left": 0,
         }
-        if response.status != 200 or check_values != expected:
+        if response_status not in (None, 200) or check_values != expected:
             raise AssertionError(
                 {
-                    "status": response.status,
+                    "status": response_status,
                     "expected": expected,
                     "actual": check_values,
                     "body": body,
                 }
             )
+        if not captured_payloads:
+            raise AssertionError({"error": "refresh payload was not captured", "body": body})
         run_payload = captured_payloads[0]
         payload_checks = {
             "importer": run_payload["importer"],
@@ -414,12 +464,14 @@ async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
         )
         return {
             "schema": schema,
+            "scenario": args.scenario,
             "schema_exists_after_cleanup": schema_exists,
-            "response_status": response.status,
+            "response_status": response_status,
             "timings": timings,
             "checks": check_values,
             "payload_checks": payload_checks,
-            "refresh_result": body["address_refresh"]["run"]["result"],
+            "address_refresh": body["address_refresh"],
+            "refresh_result": refresh_results[0],
         }
     except Exception:
         print(json.dumps({"schema_retained_for_debug": schema}, sort_keys=True), flush=True)

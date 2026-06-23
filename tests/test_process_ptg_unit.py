@@ -64,6 +64,150 @@ def test_default_ptg2_import_id_includes_source_inputs():
     assert heartland_id != "20260601"
     assert optum_id != "20260601"
     assert heartland_id != optum_id
+
+
+def test_ptg2_auto_address_refresh_payload_defaults(monkeypatch):
+    monkeypatch.delenv(process_ptg.PTG2_AUTO_ADDRESS_REFRESH_LIMIT_ENV, raising=False)
+    monkeypatch.delenv(process_ptg.PTG2_AUTO_ADDRESS_REFRESH_PUBLISH_ENV, raising=False)
+
+    payload = process_ptg._ptg2_auto_address_refresh_payload(
+        source_key="healthjoy",
+        snapshot_id="snap-new",
+        import_run_id="run-healthjoy",
+        test_mode=False,
+    )
+
+    assert payload == {
+        "run_id": None,
+        "importer": "ptg-address-entity-refresh",
+        "params": {
+            "source_key": "healthjoy",
+            "snapshot_id": "snap-new",
+            "ptg_refresh_mode": "partial",
+            "entity_refresh_mode": "ptg-partial",
+            "publish": True,
+        },
+        "idempotency_key": "ptg-address-entity-refresh:healthjoy:snap-new",
+        "triggered_by": "ptg_import",
+        "schedule_id": None,
+        "subscription_id": None,
+        "import_id": "ptg-address-entity-refresh:run-healthjoy",
+    }
+
+
+def test_ptg2_auto_address_refresh_payload_honors_limit_and_publish_env(monkeypatch):
+    monkeypatch.setenv(process_ptg.PTG2_AUTO_ADDRESS_REFRESH_LIMIT_ENV, "25")
+    monkeypatch.setenv(process_ptg.PTG2_AUTO_ADDRESS_REFRESH_PUBLISH_ENV, "false")
+
+    payload = process_ptg._ptg2_auto_address_refresh_payload(
+        source_key="healthjoy",
+        snapshot_id="snap-new",
+        import_run_id="run-healthjoy",
+        test_mode=True,
+    )
+
+    assert payload["params"]["publish"] is False
+    assert payload["params"]["limit_per_source"] == 25
+    assert payload["params"]["test_mode"] is True
+
+
+def test_ptg2_auto_address_refresh_skips_test_mode_by_default(monkeypatch):
+    monkeypatch.delenv(process_ptg.PTG2_AUTO_ADDRESS_REFRESH_TEST_ENV, raising=False)
+
+    result = asyncio.run(
+        process_ptg._enqueue_ptg2_auto_address_refresh_after_import(
+            source_key="healthjoy",
+            snapshot_id="snap-new",
+            import_run_id="run-healthjoy",
+            has_serving_files=True,
+            source_scoped_compact=True,
+            test_mode=True,
+        )
+    )
+
+    assert result == {"status": "skipped", "reason": "test-mode-disabled"}
+
+
+def test_ptg2_auto_address_refresh_enqueues_control_run(monkeypatch):
+    control_imports = importlib.import_module("api.control_imports")
+    calls = []
+
+    async def fake_ensure_import_run_table():
+        calls.append({"ensure": True})
+
+    async def fake_create_import_run(payload):
+        calls.append(payload)
+        return {"run_id": "run-refresh", "importer": payload["importer"]}, True
+
+    monkeypatch.setattr(control_imports, "ensure_import_run_table", fake_ensure_import_run_table)
+    monkeypatch.setattr(control_imports, "create_import_run", fake_create_import_run)
+
+    result = asyncio.run(
+        process_ptg._enqueue_ptg2_auto_address_refresh_after_import(
+            source_key="healthjoy",
+            snapshot_id="snap-new",
+            import_run_id="run-healthjoy",
+            has_serving_files=True,
+            source_scoped_compact=True,
+            test_mode=False,
+        )
+    )
+
+    assert result["status"] == "queued"
+    assert result["created"] is True
+    assert result["run_id"] == "run-refresh"
+    assert calls[0] == {"ensure": True}
+    assert calls[1]["importer"] == "ptg-address-entity-refresh"
+    assert calls[1]["idempotency_key"] == "ptg-address-entity-refresh:healthjoy:snap-new"
+    assert calls[1]["triggered_by"] == "ptg_import"
+    assert calls[1]["params"]["source_key"] == "healthjoy"
+    assert calls[1]["params"]["snapshot_id"] == "snap-new"
+
+
+def test_ptg2_auto_address_refresh_reports_existing_or_enqueue_failure(monkeypatch):
+    control_imports = importlib.import_module("api.control_imports")
+
+    async def fake_ensure_import_run_table():
+        return None
+
+    async def fake_existing_import_run(payload):
+        return {"run_id": "run-existing", "importer": payload["importer"]}, False
+
+    monkeypatch.setattr(control_imports, "ensure_import_run_table", fake_ensure_import_run_table)
+    monkeypatch.setattr(control_imports, "create_import_run", fake_existing_import_run)
+    existing = asyncio.run(
+        process_ptg._enqueue_ptg2_auto_address_refresh_after_import(
+            source_key="healthjoy",
+            snapshot_id="snap-new",
+            import_run_id="run-healthjoy",
+            has_serving_files=True,
+            source_scoped_compact=True,
+            test_mode=False,
+        )
+    )
+
+    async def fake_failed_import_run(_payload):
+        raise RuntimeError("redis unavailable")
+
+    monkeypatch.setattr(control_imports, "create_import_run", fake_failed_import_run)
+    failed = asyncio.run(
+        process_ptg._enqueue_ptg2_auto_address_refresh_after_import(
+            source_key="healthjoy",
+            snapshot_id="snap-new",
+            import_run_id="run-healthjoy",
+            has_serving_files=True,
+            source_scoped_compact=True,
+            test_mode=False,
+        )
+    )
+
+    assert existing["status"] == "existing"
+    assert existing["created"] is False
+    assert existing["run_id"] == "run-existing"
+    assert failed["status"] == "enqueue_failed"
+    assert failed["error"] == "redis unavailable"
+
+
 ptg_serving_maintenance = importlib.import_module("process.ptg_parts.serving_maintenance")
 ptg_serving_rows = importlib.import_module("process.ptg_parts.serving_rows")
 ptg_serving_only = importlib.import_module("process.ptg_parts.serving_only")
@@ -2354,6 +2498,8 @@ def test_ptg2_main_processes_downloaded_files_concurrently_when_enabled(monkeypa
             "serving_rates": 2,
         }
 
+    refresh_mock = AsyncMock(return_value={"status": "queued", "run_id": "run-refresh"})
+
     monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
     monkeypatch.setattr(process_ptg, "ensure_ptg2_tables", AsyncMock())
     monkeypatch.setattr(process_ptg.db, "status", AsyncMock())
@@ -2368,6 +2514,7 @@ def test_ptg2_main_processes_downloaded_files_concurrently_when_enabled(monkeypa
     monkeypatch.setattr(process_ptg, "_current_source_snapshot_id", AsyncMock(return_value=None))
     monkeypatch.setattr(process_ptg, "_publish_ptg2_source_pointers", AsyncMock())
     monkeypatch.setattr(process_ptg, "_cleanup_old_ptg2_source_tables", AsyncMock())
+    monkeypatch.setattr(process_ptg, "_enqueue_ptg2_auto_address_refresh_after_import", refresh_mock)
     monkeypatch.setenv(process_ptg.PTG2_FILE_PROCESS_CONCURRENCY_ENV, "2")
 
     result = asyncio.run(
@@ -2381,8 +2528,18 @@ def test_ptg2_main_processes_downloaded_files_concurrently_when_enabled(monkeypa
 
     assert max_active == 2
     assert result["files_processed"] == 2
+    assert result["address_refresh"] == {"status": "queued", "run_id": "run-refresh"}
+    refresh_mock.assert_awaited_once()
+    refresh_kwargs = refresh_mock.await_args.kwargs
+    assert refresh_kwargs["source_key"] == "file_concurrency_test"
+    assert refresh_kwargs["snapshot_id"] == result["snapshot_id"]
+    assert refresh_kwargs["import_run_id"] == "ptg2:file_concurrency_test"
+    assert refresh_kwargs["has_serving_files"] is True
+    assert refresh_kwargs["source_scoped_compact"] is True
+    assert refresh_kwargs["test_mode"] is False
     import_run_rows = [row for cls_name, row in pushed if cls_name == "PTG2ImportRun"]
     assert import_run_rows[-1]["report"]["files_processed"] == 2
+    assert import_run_rows[-1]["report"]["address_refresh"] == {"status": "queued", "run_id": "run-refresh"}
 
 
 def test_ptg2_main_marks_failed_when_all_discovered_jobs_fail(monkeypatch):
