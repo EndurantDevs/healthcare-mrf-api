@@ -21,6 +21,8 @@ from sqlalchemy import (Column, Float, Integer, MetaData, String, Table, and_, c
 from api.code_systems import INTERNAL_PROCEDURE_CODE_SYSTEM, INTERNAL_RX_CODE_SYSTEM
 from api.endpoint.pagination import parse_pagination
 from api.ptg2_serving import normalize_ptg2_mode, search_current_ptg2_index, search_ptg2_provider_procedures
+from api.ptg2_snapshot import PTG2_SCHEMA, current_source_snapshot_id_for_plan
+from api.ptg2_tables import _safe_table_name, snapshot_serving_tables
 from db.models import (CodeCatalog, CodeCrosswalk, PricingProcedure,
                        PricingProcedureGeoBenchmark,
                        DoctorClinicianAddress, EntityAddressUnified,
@@ -3921,6 +3923,124 @@ def _apply_prescription_code_preferences(
         )
         item["preferred_prescription_code_system"] = preferred_system
         item["preferred_prescription_code"] = preferred_code
+
+
+@blueprint.get("/group-plan-providers", name="pricing.group_plan_providers")
+async def group_plan_providers(request):
+    """Enumerate ALL distinct in-network provider NPIs for an imported MRF/PTG
+    group plan, keyed by EIN plan_id + market_type, keyset-paginated by NPI.
+
+    Resolves the plan's published serving snapshot via ptg2_current_plan_source,
+    then expands provider_set -> provider_group -> member NPI for that plan. The
+    PTG2 serving search itself hard-requires a procedure code, so this is the only
+    path that can answer "all providers for this group plan". Proxied by api-layer
+    and surfaced as the api-mcp find_group_plan_providers orchestrator tool.
+    """
+    session = _get_session(request)
+    plan_id = (request.args.get("plan_id") or "").strip()
+    if not plan_id:
+        raise InvalidUsage("plan_id (EIN) is required")
+    market_type = (request.args.get("market_type") or "group").strip().lower()
+    try:
+        limit = int(request.args.get("limit") or 200)
+    except (TypeError, ValueError):
+        limit = 200
+    limit = max(1, min(limit, 1000))
+    cursor_raw = (request.args.get("cursor") or "").strip()
+    try:
+        cursor_npi = int(cursor_raw) if cursor_raw else 0
+    except (TypeError, ValueError):
+        cursor_npi = 0
+    enrich = (request.args.get("enrich") or "").strip().lower() in ("1", "true", "yes")
+
+    snapshot_id = await current_source_snapshot_id_for_plan(
+        session, {"plan_id": plan_id, "plan_market_type": market_type}
+    )
+    if not snapshot_id:
+        return response.json({
+            "ok": True, "plan_id": plan_id, "market_type": market_type,
+            "snapshot_id": None, "resolved": False,
+            "reason": "no published serving snapshot for this plan_id + market_type",
+            "providers": {"count": 0, "items": [], "next_cursor": None},
+            "exhausted": True,
+        })
+
+    serving_tables = await snapshot_serving_tables(session, snapshot_id)
+    serving_table = _safe_table_name(serving_tables.serving_table)
+    set_component_table = _safe_table_name(serving_tables.provider_set_component_table)
+    group_member_table = _safe_table_name(serving_tables.provider_group_member_table)
+    if not (serving_table and set_component_table and group_member_table):
+        return response.json({
+            "ok": False, "error_type": "unsupported_storage",
+            "plan_id": plan_id, "market_type": market_type, "snapshot_id": snapshot_id,
+            "reason": "serving snapshot does not expose relational provider tables "
+                      "(sidecar/manifest provider mode not yet supported here)",
+            "serving_tables": {
+                "serving": serving_table,
+                "set_component": set_component_table,
+                "group_member": group_member_table,
+            },
+        }, status=501)
+
+    npi_sql = text(
+        f"""
+        WITH plan_sets AS (
+            SELECT DISTINCT r.provider_set_hash AS provider_set_hash
+              FROM {serving_table} r
+             WHERE r.plan_id = :plan_id
+               AND r.provider_set_hash IS NOT NULL
+        ),
+        plan_groups AS (
+            SELECT DISTINCT psc.provider_group_hash AS provider_group_hash
+              FROM {set_component_table} psc
+              JOIN plan_sets ps ON ps.provider_set_hash = psc.provider_set_hash
+        )
+        SELECT DISTINCT pgm.npi AS npi
+          FROM {group_member_table} pgm
+          JOIN plan_groups pg ON pg.provider_group_hash = pgm.provider_group_hash
+         WHERE pgm.npi > :cursor_npi
+         ORDER BY pgm.npi
+         LIMIT :limit
+        """
+    )
+    rows = (await session.execute(
+        npi_sql, {"plan_id": plan_id, "cursor_npi": cursor_npi, "limit": limit}
+    )).fetchall()
+    npis = [int(row.npi) for row in rows if row.npi is not None]
+
+    items: list[dict[str, Any]] = [{"npi": npi} for npi in npis]
+    if enrich and npis:
+        enrich_rows = (await session.execute(
+            text(
+                f"""
+                SELECT npi, provider_first_name, provider_last_name,
+                       provider_credential_text, entity_type_code
+                  FROM {PTG2_SCHEMA}.npi_data
+                 WHERE npi = ANY(:npis)
+                """
+            ),
+            {"npis": npis},
+        )).fetchall()
+        by_npi = {int(r.npi): r for r in enrich_rows}
+        for item in items:
+            r = by_npi.get(item["npi"])
+            if r is None:
+                continue
+            person = " ".join(p for p in [r.provider_first_name, r.provider_last_name] if p)
+            item["name"] = person or None
+            item["credential"] = r.provider_credential_text
+            item["entity_type_code"] = r.entity_type_code
+
+    next_cursor = str(npis[-1]) if len(npis) == limit else None
+    return response.json({
+        "ok": True,
+        "plan_id": plan_id,
+        "market_type": market_type,
+        "snapshot_id": snapshot_id,
+        "resolved": True,
+        "providers": {"count": len(items), "items": items, "next_cursor": next_cursor},
+        "exhausted": next_cursor is None,
+    })
 
 
 @blueprint.get("/statistics", name="pricing.statistics")
