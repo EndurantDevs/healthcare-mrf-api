@@ -938,6 +938,26 @@ def test_as_int_list_normalizes_npi_strings():
     ]
 
 
+def test_normalized_npi_list_keeps_only_ten_digit_npis():
+    assert process_ptg._normalized_npi_list(
+        ["114911247", "1053488122", 1093228306, "", None, "bad", "10000000000"]
+    ) == [
+        1053488122,
+        1093228306,
+    ]
+
+
+def test_provider_group_member_rows_skip_malformed_npis():
+    rows = process_ptg._provider_group_member_rows(
+        {"__hash__": "123", "npi": ["114911247", "1053488122", 1093228306]}
+    )
+
+    assert rows == [
+        {"provider_group_hash": 123, "npi": 1053488122},
+        {"provider_group_hash": 123, "npi": 1093228306},
+    ]
+
+
 def test_ptg2_semantic_hash_ignores_set_like_array_order():
     first = {
         "npi": [1093228306, 1053488122],
@@ -1037,16 +1057,16 @@ def test_ptg2_provider_group_identity_is_source_independent_and_order_insensitiv
     tin_a = {"type": "EIN", "value": "12-3456789"}
     tin_b = {"type": "ein", "value": "123456789"}
 
-    first = process_ptg._provider_group_identity_hash(tin_a, [3, 1, 2, 2])
-    second = process_ptg._provider_group_identity_hash(tin_b, [2, 3, 1])
+    first = process_ptg._provider_group_identity_hash(tin_a, [1053488122, 114911247, 1093228306])
+    second = process_ptg._provider_group_identity_hash(tin_b, [1093228306, 1053488122])
 
     assert first == second
 
 
 def test_ptg2_provider_set_entry_packs_groups_order_insensitively():
     groups_a = [
-        {"tin": {"type": "ein", "value": "111"}, "npi": [3, 1]},
-        {"tin": {"type": "ein", "value": "222"}, "npi": [2]},
+        {"tin": {"type": "ein", "value": "111"}, "npi": [1000000003, 1000000001]},
+        {"tin": {"type": "ein", "value": "222"}, "npi": [1000000002]},
     ]
     groups_b = list(reversed(groups_a))
 
@@ -1065,7 +1085,7 @@ def test_ptg2_provider_set_entry_packs_groups_order_insensitively():
 
     assert entry_a["__hash__"] == entry_b["__hash__"]
     assert row_a["provider_group_hash"] == row_b["provider_group_hash"]
-    assert row_a["npi"] == [1, 2, 3]
+    assert row_a["npi"] == [1000000001, 1000000002, 1000000003]
     assert row_a["tin_type"] == "set"
 
 
@@ -1073,13 +1093,13 @@ def test_ptg2_combined_provider_set_entry_packs_rate_provider_refs():
     first, _ = process_ptg._build_provider_set_entry(
         file_id=1,
         provider_group_ref=10,
-        provider_groups=[{"tin": {"type": "ein", "value": "111"}, "npi": [1, 2]}],
+        provider_groups=[{"tin": {"type": "ein", "value": "111"}, "npi": [1000000001, 1000000002]}],
         network_names=["A"],
     )
     second, _ = process_ptg._build_provider_set_entry(
         file_id=1,
         provider_group_ref=11,
-        provider_groups=[{"tin": {"type": "ein", "value": "222"}, "npi": [3]}],
+        provider_groups=[{"tin": {"type": "ein", "value": "222"}, "npi": [1000000003]}],
         network_names=["A"],
     )
 
@@ -1088,19 +1108,19 @@ def test_ptg2_combined_provider_set_entry_packs_rate_provider_refs():
 
     assert combined_a["__hash__"] == combined_b["__hash__"]
     assert row_a["provider_group_hash"] == row_b["provider_group_hash"]
-    assert row_a["npi"] == [1, 2, 3]
+    assert row_a["npi"] == [1000000001, 1000000002, 1000000003]
     assert row_a["tin_type"] == "set"
 
 
 def test_ptg2_provider_group_rows_are_canonical_and_source_independent():
-    groups_a = [{"tin": {"type": "ein", "value": "12-3456789"}, "npi": [3, 1, 2]}]
-    groups_b = [{"tin": {"type": "EIN", "value": "123456789"}, "npi": [2, 3, 1]}]
+    groups_a = [{"tin": {"type": "ein", "value": "12-3456789"}, "npi": [1000000003, 1000000001, 1000000002]}]
+    groups_b = [{"tin": {"type": "EIN", "value": "123456789"}, "npi": [1000000002, 1000000003, 1000000001]}]
 
     row_a = process_ptg._ptg2_provider_group_rows(provider_groups=groups_a)[0]
     row_b = process_ptg._ptg2_provider_group_rows(provider_groups=groups_b)[0]
 
     assert row_a["provider_group_hash"] == row_b["provider_group_hash"]
-    assert row_a["npi"] == [1, 2, 3]
+    assert row_a["npi"] == [1000000001, 1000000002, 1000000003]
     assert row_a["tin_type"] == "ein"
     assert row_a["tin_value"] == "123456789"
 
@@ -1110,12 +1130,12 @@ def test_ptg2_large_provider_set_row_omits_inline_npi_when_group_hashes_availabl
     first, _ = process_ptg._build_provider_set_entry(
         file_id=1,
         provider_group_ref=10,
-        provider_groups=[{"tin": {"type": "ein", "value": "111"}, "npi": [1, 2]}],
+        provider_groups=[{"tin": {"type": "ein", "value": "111"}, "npi": [1000000001, 1000000002]}],
     )
     second, _ = process_ptg._build_provider_set_entry(
         file_id=1,
         provider_group_ref=11,
-        provider_groups=[{"tin": {"type": "ein", "value": "222"}, "npi": [3]}],
+        provider_groups=[{"tin": {"type": "ein", "value": "222"}, "npi": [1000000003]}],
     )
     combined, _ = process_ptg._combine_provider_set_entries(file_id=1, entries=[first, second])
 
@@ -1132,7 +1152,7 @@ def test_ptg2_provider_set_row_omits_inline_npi_by_default_when_group_hashes_ava
     entry, _ = process_ptg._build_provider_set_entry(
         file_id=1,
         provider_group_ref=10,
-        provider_groups=[{"tin": {"type": "ein", "value": "111"}, "npi": [1]}],
+        provider_groups=[{"tin": {"type": "ein", "value": "111"}, "npi": [1000000001]}],
     )
 
     row = process_ptg._ptg2_provider_set_row(entry)

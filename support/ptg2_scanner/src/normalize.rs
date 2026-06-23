@@ -3,6 +3,9 @@ use std::fmt::Display;
 use std::io::{self, Read};
 use struson::reader::{JsonReader, JsonStreamReader, ValueType};
 
+pub const NPI_MIN: i64 = 1_000_000_000;
+pub const NPI_MAX: i64 = 9_999_999_999;
+
 fn to_io_error(error: impl Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
@@ -64,6 +67,20 @@ pub fn int_list(value: Option<&Value>) -> Vec<i64> {
         }
         None => {}
     }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+pub fn is_valid_npi(value: i64) -> bool {
+    (NPI_MIN..=NPI_MAX).contains(&value)
+}
+
+pub fn npi_list(value: Option<&Value>) -> Vec<i64> {
+    let mut out: Vec<i64> = int_list(value)
+        .into_iter()
+        .filter(|value| is_valid_npi(*value))
+        .collect();
     out.sort_unstable();
     out.dedup();
     out
@@ -176,7 +193,7 @@ mod tests {
     use super::{
         canonical_text_list, int_list, normalize_code, normalize_money_text, normalize_string,
         normalize_tin_type, normalize_tin_value, normalized_money_from_reader,
-        normalized_scalar_from_reader, normalized_string_list_from_reader,
+        normalized_scalar_from_reader, normalized_string_list_from_reader, npi_list,
     };
     use serde_json::json;
     use struson::reader::JsonStreamReader;
@@ -202,6 +219,20 @@ mod tests {
         assert_eq!(normalize_tin_value(Some(&json!(" 12-34 ab "))), "1234AB");
         assert_eq!(int_list(Some(&json!(["2", 1, "bad", 2]))), vec![1, 2]);
         assert_eq!(int_list(Some(&json!("42"))), vec![42]);
+    }
+
+    #[test]
+    fn normalizes_npi_lists_to_ten_digit_values() {
+        assert_eq!(
+            npi_list(Some(&json!([
+                "114911247",
+                "1234567890",
+                9_999_999_999i64,
+                10_000_000_000i64,
+                "bad"
+            ]))),
+            vec![1_234_567_890, 9_999_999_999]
+        );
     }
 
     #[test]

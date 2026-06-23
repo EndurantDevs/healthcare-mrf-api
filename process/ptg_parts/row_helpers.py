@@ -11,6 +11,9 @@ from dateutil.parser import parse as parse_date
 
 from process.ptg_parts.canonical import canonical_json_dumps
 
+NPI_MIN = 1_000_000_000
+NPI_MAX = 9_999_999_999
+
 
 def _make_checksum(*values: Any) -> int:
     digest = hashlib.sha256(canonical_json_dumps(list(values)).encode("utf-8")).digest()
@@ -57,8 +60,12 @@ def _as_int_list(value: Any) -> list[int]:
     return result
 
 
+def _is_valid_npi(value: int) -> bool:
+    return NPI_MIN <= int(value) <= NPI_MAX
+
+
 def _normalized_npi_list(value: Any) -> list[int]:
-    return sorted(set(_as_int_list(value)))
+    return sorted({number for number in _as_int_list(value) if _is_valid_npi(number)})
 
 
 def _normalize_tin_type(value: Any) -> str:

@@ -22,9 +22,9 @@ use ptg2_scanner::manifest::{
     GlobalId128, SidecarEntry, GLOBAL_ID_BYTES,
 };
 use ptg2_scanner::normalize::{
-    canonical_text_list, int_list, normalize_code, normalize_string, normalize_tin_type,
-    normalize_tin_value, normalized_money_from_reader, normalized_scalar_from_reader,
-    normalized_string_list_from_reader,
+    canonical_text_list, normalize_code, normalize_string, normalize_tin_type, normalize_tin_value,
+    normalized_money_from_reader, normalized_scalar_from_reader,
+    normalized_string_list_from_reader, npi_list,
 };
 use ptg2_scanner::output::{emit_json_record, emit_object};
 use ptg2_scanner::progress::emit_progress;
@@ -694,7 +694,7 @@ fn build_provider_entry(provider_ref: &Value, collect_npis: bool) -> Option<Prov
     let mut provider_count = 0i64;
     for group in groups {
         let tin = group.get("tin").unwrap_or(&Value::Null);
-        let npi = int_list(group.get("npi"));
+        let npi = npi_list(group.get("npi"));
         let tin_type = normalize_tin_type(tin.get("type"));
         let tin_value = normalize_tin_value(tin.get("value"));
         let group_hash = make_checksum(vec![
@@ -2316,7 +2316,7 @@ impl DictionaryCopySinks {
         let mut manifest_rows_written = 0u64;
         for group in groups {
             let tin = group.get("tin").unwrap_or(&Value::Null);
-            let npi = int_list(group.get("npi"));
+            let npi = npi_list(group.get("npi"));
             let group_hash = provider_group_hash(tin, &npi);
             let provider_group_global_id = provider_group_global_id_from_hash(group_hash).to_hex();
             for npi_value in &npi {
@@ -2379,7 +2379,7 @@ impl DictionaryCopySinks {
         let mut manifest_rows_written = 0u64;
         for group in groups {
             let tin = group.get("tin").unwrap_or(&Value::Null);
-            let npi = int_list(group.get("npi"));
+            let npi = npi_list(group.get("npi"));
             let group_hash = provider_group_hash(tin, &npi);
             if !dedupe.insert_provider_group(group_hash) {
                 continue;
@@ -5851,11 +5851,11 @@ mod tests {
             "provider_groups": [
                 {
                     "tin": {"type": "ein", "value": "12-3456789"},
-                    "npi": [1234567891, 1234567890, 1234567890]
+                    "npi": [1234567891, 1234567890, 1234567890, 114911247]
                 },
                 {
                     "tin": {"type": "npi", "value": " 9876543210 "},
-                    "npi": ["2222222222", "1111111111"]
+                    "npi": ["2222222222", "1111111111", "263839538"]
                 }
             ]
         });
@@ -5868,7 +5868,7 @@ mod tests {
             .unwrap()
         {
             let tin = group.get("tin").unwrap_or(&Value::Null);
-            let npi = int_list(group.get("npi"));
+            let npi = npi_list(group.get("npi"));
             let group_hash = provider_group_hash(tin, &npi);
             group_payloads.push(json!({
                 "provider_group_hash": group_hash,
