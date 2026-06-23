@@ -1170,7 +1170,7 @@ def test_entity_address_unified_registers_ptg_address_overlay_source():
     assert "p.address_key::uuid AS address_key" in ptg_source
 
 
-def test_entity_address_unified_ptg_partial_filters_to_requested_ptg_source():
+def test_entity_address_unified_ptg_partial_filters_sources_to_requested_scope():
     selects = entity_address_unified._source_selects(
         "mrf",
         {
@@ -1186,15 +1186,20 @@ def test_entity_address_unified_ptg_partial_filters_to_requested_ptg_source():
         "mrf",
         selects,
         source_keys=["payer_a", "payer_b's"],
+        affected_group_table="entity_address_unified_20260623_ptg_groups",
     )
 
-    assert len(filtered) == 1
-    assert "FROM mrf.ptg_address AS p" in filtered[0]
-    assert "FROM mrf.mrf_address AS a" not in filtered[0]
-    assert "AND (p.source_key IN ('payer_a', 'payer_b''s')" in filtered[0]
-    assert "COALESCE(p.ptg_source_array, ARRAY[]::varchar[]) && ARRAY['payer_a', 'payer_b''s']::varchar[]" in filtered[0]
-    assert "FROM mrf.entity_address_unified AS live" in filtered[0]
-    assert "live.location_key = p.location_key" in filtered[0]
+    assert len(filtered) == 2
+    ptg_source = next(s for s in filtered if "FROM mrf.ptg_address AS p" in s)
+    mrf_source = next(s for s in filtered if "FROM mrf.mrf_address AS a" in s)
+    assert "AND (p.source_key IN ('payer_a', 'payer_b''s')" in ptg_source
+    assert "COALESCE(p.ptg_source_array, ARRAY[]::varchar[]) && ARRAY['payer_a', 'payer_b''s']::varchar[]" in ptg_source
+    assert "FROM mrf.entity_address_unified AS live" in ptg_source
+    assert "live.location_key = p.location_key" in ptg_source
+    assert "FROM mrf.entity_address_unified_20260623_ptg_groups AS affected" in mrf_source
+    assert "affected.entity_type = src.entity_type" in mrf_source
+    assert "affected.entity_id = src.entity_id" in mrf_source
+    assert "affected.street_key IS NOT DISTINCT FROM" in mrf_source
 
 
 def test_entity_address_unified_partial_reuse_sql_excludes_changed_and_raw_locations():
@@ -1203,11 +1208,14 @@ def test_entity_address_unified_partial_reuse_sql_excludes_changed_and_raw_locat
         "entity_address_unified_20260623",
         "entity_address_unified_20260623_raw",
         source_keys=["payer_a"],
+        affected_group_table="entity_address_unified_20260623_ptg_groups",
     )
 
     assert "INSERT INTO mrf.entity_address_unified_20260623" in sql
     assert "FROM mrf.entity_address_unified AS live" in sql
     assert "COALESCE(live.ptg_source_array, ARRAY[]::varchar[]) && ARRAY['payer_a']::varchar[]" in sql
+    assert "FROM mrf.entity_address_unified_20260623_ptg_groups AS affected" in sql
+    assert "affected.entity_type = live.entity_type" in sql
     assert "FROM mrf.entity_address_unified_20260623_raw AS raw" in sql
     assert "raw.location_key = live.location_key" in sql
 
@@ -1226,13 +1234,25 @@ def test_entity_address_unified_ptg_bridge_falls_back_to_compacted_arrays():
     assert "NOT EXISTS" in sql
 
 
-def test_entity_address_unified_partial_mixed_rows_sql_guards_base_ptg_merges():
-    sql = entity_address_unified._entity_address_partial_mixed_rows_sql("mrf", ["payer_a"])
+def test_entity_address_unified_prepares_ptg_partial_affected_groups():
+    sql = entity_address_unified._prepare_ptg_partial_affected_groups_sql(
+        "mrf",
+        "entity_address_unified_20260623_ptg_groups",
+        ["payer_a"],
+    )
 
+    assert "CREATE UNLOGGED TABLE mrf.entity_address_unified_20260623_ptg_groups AS" in sql
+    assert "SELECT DISTINCT" in sql
     assert "FROM mrf.entity_address_unified AS live" in sql
     assert "COALESCE(live.ptg_source_array, ARRAY[]::varchar[]) && ARRAY['payer_a']::varchar[]" in sql
-    assert "COALESCE(CARDINALITY(live.address_sources), 0) > 1" in sql
-    assert "COALESCE(CARDINALITY(live.ptg_source_array), 0) > 1" not in sql
+    assert "street_key" in sql
+
+    index_sql = entity_address_unified._index_ptg_partial_affected_groups_sql(
+        "mrf",
+        "entity_address_unified_20260623_ptg_groups",
+    )
+    assert "CREATE INDEX entity_address_unified_20260623_ptg_groups_idx_group" in index_sql
+    assert "ON mrf.entity_address_unified_20260623_ptg_groups" in index_sql
 
 
 def test_entity_address_unified_can_range_shard_large_source_selects():
