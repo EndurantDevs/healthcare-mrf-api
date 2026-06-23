@@ -138,7 +138,9 @@ def parse_toc_catalog_entries(
         if not plans:
             continue
         plan_tuple = tuple(plans)
-        for file_entry in structure.get("in_network_files") or []:
+        for file_entry in _as_list(structure.get("in_network_files")):
+            if not isinstance(file_entry, dict):
+                continue
             location = file_entry.get("location")
             if location:
                 location = normalize_tic_source_url(location)
@@ -155,8 +157,11 @@ def parse_toc_catalog_entries(
                         plan_info=plan_tuple,
                     )
                 )
-        allowed_amount_file = structure.get("allowed_amount_file") or {}
-        if allowed_amount_file.get("location"):
+        for allowed_amount_file in _as_list(structure.get("allowed_amount_file")):
+            if not isinstance(allowed_amount_file, dict):
+                continue
+            if not allowed_amount_file.get("location"):
+                continue
             location = normalize_tic_source_url(allowed_amount_file["location"])
             entries.append(
                 PTG2SourceCatalogEntry(

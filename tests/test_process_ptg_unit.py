@@ -1368,6 +1368,35 @@ def test_ptg2_toc_parser_handles_uhc_sponsor_typo_and_duplicate_signed_urls():
     assert in_network_entries[0].plan_info[0]["plan_sponsor_name"] == "Heartland Co"
 
 
+def test_ptg2_toc_parser_accepts_list_shaped_file_fields():
+    toc = {
+        "reporting_entity_name": "BCBS",
+        "reporting_entity_type": "third-party administrator",
+        "reporting_structure": [
+            {
+                "reporting_plans": [{"plan_name": "Group PPO", "plan_id": "12-3456789", "plan_market_type": "group"}],
+                "in_network_files": {"location": "https://cdn.test/in-network-rates.json.gz"},
+                "allowed_amount_file": [
+                    {"location": "https://cdn.test/allowed-amounts-1.json.gz", "description": "Allowed 1"},
+                    {"location": "https://cdn.test/allowed-amounts-2.json.gz", "description": "Allowed 2"},
+                ],
+            }
+        ],
+    }
+
+    entries = process_ptg.parse_toc_catalog_entries(toc, "https://payer.test/toc.json")
+
+    assert [entry.source_type for entry in entries] == [
+        "table-of-contents",
+        "in-network",
+        "allowed-amounts",
+        "allowed-amounts",
+    ]
+    assert entries[1].original_url == "https://cdn.test/in-network-rates.json.gz"
+    assert entries[2].description == "Allowed 1"
+    assert entries[3].description == "Allowed 2"
+
+
 def test_ptg2_toc_parser_normalizes_asr_download_links():
     toc = {
         "reporting_entity_name": "ASR Health Benefits",
