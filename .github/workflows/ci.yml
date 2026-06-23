@@ -15,6 +15,11 @@ on:
         description: "Full image tag to publish, for example ghcr.io/endurantdevs/healthcare-mrf-api:dev-..."
         required: false
         type: string
+      run_docker_smoke:
+        description: "Run the Docker image/runtime smoke job on GitHub-hosted runners"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -163,6 +168,7 @@ jobs:
 
   docker-image-build:
     name: docker image and runtime smoke
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_docker_smoke }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     services:
