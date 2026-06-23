@@ -21,7 +21,7 @@ from sqlalchemy import (Column, Float, Integer, MetaData, String, Table, and_, c
 from api.code_systems import INTERNAL_PROCEDURE_CODE_SYSTEM, INTERNAL_RX_CODE_SYSTEM
 from api.endpoint.pagination import parse_pagination
 from api.ptg2_serving import normalize_ptg2_mode, search_current_ptg2_index, search_ptg2_provider_procedures
-from api.ptg2_snapshot import PTG2_SCHEMA, current_source_snapshot_id_for_plan
+from api.ptg2_snapshot import current_source_snapshot_id_for_plan
 from api.ptg2_tables import _safe_table_name, snapshot_serving_tables
 from db.models import (CodeCatalog, CodeCrosswalk, PricingProcedure,
                        PricingProcedureGeoBenchmark,
@@ -4008,15 +4008,14 @@ async def group_plan_providers(request):
     items: list[dict[str, Any]] = [{"npi": npi} for npi in npis]
     if enrich and npis:
         enrich_rows = (await session.execute(
-            text(
-                f"""
-                SELECT npi, provider_first_name, provider_last_name,
-                       provider_credential_text, entity_type_code
-                  FROM {PTG2_SCHEMA}.npi_data
-                 WHERE npi = ANY(:npis)
-                """
-            ),
-            {"npis": npis},
+            select(
+                npi_data_table.c.npi,
+                npi_data_table.c.provider_first_name,
+                npi_data_table.c.provider_last_name,
+                npi_data_table.c.provider_organization_name,
+                npi_data_table.c.provider_credential_text,
+                npi_data_table.c.entity_type_code,
+            ).where(npi_data_table.c.npi.in_(npis))
         )).fetchall()
         by_npi = {int(r.npi): r for r in enrich_rows}
         for item in items:
@@ -4024,7 +4023,7 @@ async def group_plan_providers(request):
             if r is None:
                 continue
             person = " ".join(p for p in [r.provider_first_name, r.provider_last_name] if p)
-            item["name"] = person or None
+            item["name"] = person or (r.provider_organization_name or None)
             item["credential"] = r.provider_credential_text
             item["entity_type_code"] = r.entity_type_code
 
