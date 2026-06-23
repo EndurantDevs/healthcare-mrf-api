@@ -1395,7 +1395,7 @@ async def test_compact_serving_source_scoped_provider_expansion_uses_direct_comp
 
 
 @pytest.mark.asyncio
-async def test_compact_serving_specialty_search_joins_nucc_without_geo():
+async def test_compact_serving_specialty_search_uses_primary_taxonomy_codes_without_geo():
     session = FakeSession([FakeResult(rows=[])])
 
     payload = await ptg2_serving._search_compact_serving_table(
@@ -1403,7 +1403,7 @@ async def test_compact_serving_specialty_search_joins_nucc_without_geo():
         "mrf.ptg2_serving_rate_compact_token",
         _compact_tables(),
         "snap-token",
-        {"plan_id": "010854205", "code": "70551", "specialty": "dentist"},
+        {"plan_id": "010854205", "code": "70551", "specialty": "Family Medicine"},
         FakePagination(),
         ["snapshot_id = :snapshot_id", "plan_id = :plan_id"],
         {"snapshot_id": "snap-token", "plan_id": "010854205", "limit": 25, "offset": 0},
@@ -1414,15 +1414,56 @@ async def test_compact_serving_specialty_search_joins_nucc_without_geo():
     sql = str(session.calls[0][0][0])
     params = session.calls[0][0][1]
     assert "provider_filtered_rates AS MATERIALIZED" in sql
-    assert "JOIN mrf.npi_taxonomy nt_filter" in sql
-    assert "JOIN mrf.nucc_taxonomy nucc_filter" in sql
     assert "JOIN mrf.ptg2_provider_group_member_token pgm_filter" in sql
     assert "FROM mrf.ptg2_provider_set_component_token psc_filter" in sql
     assert "pgm_filter.provider_group_hash = psc_filter.provider_group_hash" in sql
     assert "psc_filter.provider_set_hash = r.provider_set_hash" in sql
     assert "ptg2_provider_entry_component_token" not in sql
-    assert "nt_filter.npi = pgm_filter.npi" in sql
-    assert params["specialty_like"] == "%dentist%"
+    assert "LOWER(COALESCE" not in sql
+    assert "nucc_filter.display_name" not in sql
+    assert "mrf.npi_taxonomy provider_specialty_nt" in sql
+    assert "provider_specialty_nt.npi = pgm_filter.npi" in sql
+    assert "healthcare_provider_primary_taxonomy_switch" in sql
+    assert params["provider_specialty_taxonomy_code_0"] == "207Q00000X"
+    assert params["provider_specialty_taxonomy_code_1"] == "208D00000X"
+
+
+@pytest.mark.asyncio
+async def test_compact_serving_specialty_search_filters_minimal_provider_group_layout():
+    session = FakeSession([FakeResult(rows=[])])
+
+    payload = await ptg2_serving._search_compact_serving_table(
+        session,
+        "mrf.ptg2_serving_rate_compact_token",
+        _compact_tables(provider_set_component_table=None, provider_group_location_table=None),
+        "snap-token",
+        {
+            "plan_id": "010854205",
+            "code": "99214",
+            "specialty": "primary care",
+            "include_providers": "true",
+        },
+        FakePagination(),
+        ["snapshot_id = :snapshot_id", "plan_id = :plan_id"],
+        {"snapshot_id": "snap-token", "plan_id": "010854205", "limit": 25, "offset": 0},
+        ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
+    )
+
+    assert payload is None
+    sql = str(session.calls[-1][0][0])
+    params = session.calls[-1][0][1]
+    assert "provider_filtered_rates AS MATERIALIZED" in sql
+    assert "ptg2_provider_set_component_token" not in sql
+    assert "FROM mrf.ptg2_provider_group_member_token pgm_filter" in sql
+    assert "pgm_filter.provider_group_hash = r.provider_set_hash" in sql
+    assert "JOIN mrf.ptg2_provider_group_member_token pgm" in sql
+    assert "ON pgm.provider_group_hash = r.provider_set_hash" in sql
+    assert "provider_specialty_nt.npi = pgm_filter.npi" in sql
+    assert "363A00000X" not in params.values()
+    assert set(
+        value for key, value in params.items()
+        if key.startswith("provider_specialty_taxonomy_code_")
+    ) >= {"207Q00000X", "207R00000X", "208000000X", "208D00000X"}
 
 
 @pytest.mark.asyncio
@@ -1451,7 +1492,7 @@ async def test_compact_serving_source_scoped_geo_taxonomy_filter_uses_direct_com
     assert "psc_filter.provider_set_hash = r.provider_set_hash" in sql
     assert "ptg2_provider_entry_component_token" not in sql
     assert "JOIN mrf.npi_address addr_filter" in sql
-    assert "JOIN mrf.npi_taxonomy nt_filter" in sql
+    assert "mrf.npi_taxonomy provider_specialty_nt" in sql
     assert "provider_group_hashes" not in sql
 
 

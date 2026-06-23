@@ -111,6 +111,10 @@ from api.ptg2_serving_utils import (
     _row_mapping,
     _uuid_to_hex,
 )
+from api.provider_specialty_filters import (
+    provider_specialty_taxonomy_exists_sql,
+    resolve_provider_specialty_filter,
+)
 
 PTG2_MODE_EXACT_SOURCE = "exact_source"
 PTG2_MODE_PRODUCT_SEARCH = "product_search"
@@ -1548,7 +1552,7 @@ def _compact_provider_filter_sql(
     address_table: str | None = None,
 ) -> tuple[str, bool]:
     has_geo = bool(args.get("zip5") or args.get("zip") or args.get("city") or args.get("state") or args.get("lat") or args.get("long") or args.get("radius_miles"))
-    specialty = str(args.get("specialty") or "").strip().lower()
+    specialty_filter = resolve_provider_specialty_filter(args)
     inferred_sql = _inferred_provider_taxonomy_code_sql(
         args,
         nt_alias="nt",
@@ -1556,8 +1560,10 @@ def _compact_provider_filter_sql(
         params=params,
         param_prefix="inferred_taxonomy",
     )
-    has_provider_filter = has_geo or specialty or bool(inferred_sql)
+    has_provider_filter = has_geo or specialty_filter.active or bool(inferred_sql)
     if not has_provider_filter:
+        return "", False
+    if not serving_tables.provider_group_member_table:
         return "", False
     if args.get("zip5") or args.get("zip"):
         params["zip5"] = _normalize_zip5(args.get("zip5") or args.get("zip"))
@@ -1578,8 +1584,6 @@ def _compact_provider_filter_sql(
             geo_min_long=lon - radius / 69.0,
             geo_max_long=lon + radius / 69.0,
         )
-    if specialty:
-        params["specialty_like"] = f"%{specialty}%"
     if serving_tables.provider_group_location_table and has_geo:
         params.setdefault("provider_match_limit", max(int(params.get("limit") or 25) * 8, 64))
         params.setdefault("location_rate_candidate_limit", max(int(params.get("limit") or 25) * 200, 4096))
@@ -1598,17 +1602,26 @@ def _compact_provider_filter_sql(
             )
         if inferred_sql:
             clauses.append(f"EXISTS (SELECT 1 FROM {PTG2_SCHEMA}.npi_taxonomy nt WHERE nt.npi = loc.npi AND {inferred_sql})")
-        if specialty:
+        if specialty_filter.active:
             clauses.append(
-                f"""EXISTS (
-                    SELECT 1
-                    FROM {PTG2_SCHEMA}.npi_taxonomy nt
-                    JOIN {PTG2_SCHEMA}.nucc_taxonomy nucc ON nucc.code = nt.healthcare_provider_taxonomy_code
-                    WHERE nt.npi = loc.npi
-                      AND LOWER(COALESCE(nucc.display_name, '')) LIKE :specialty_like
-                )"""
+                provider_specialty_taxonomy_exists_sql(
+                    "loc.npi",
+                    params,
+                    "provider_specialty_loc",
+                    specialty_filter,
+                    schema=PTG2_SCHEMA,
+                )
             )
         where = " AND ".join(clauses) or "TRUE"
+        component_join = ""
+        provider_match_predicate = "FALSE"
+        if serving_tables.provider_set_component_table:
+            component_join = f"""
+                JOIN {serving_tables.provider_set_component_table} psc_filter
+                  ON psc_filter.provider_set_hash = r.provider_set_hash"""
+            provider_match_predicate = "pgm_filter.provider_group_hash = psc_filter.provider_group_hash"
+        elif serving_tables.provider_group_member_table:
+            provider_match_predicate = "pgm_filter.provider_group_hash = r.provider_set_hash"
         return (
             f"""
             , filtered_locations AS MATERIALIZED (
@@ -1620,10 +1633,9 @@ def _compact_provider_filter_sql(
             , provider_filtered_rates AS MATERIALIZED (
                 SELECT DISTINCT r.*
                 FROM rate_candidates r
-                JOIN {serving_tables.provider_set_component_table} psc_filter
-                  ON psc_filter.provider_set_hash = r.provider_set_hash
+                {component_join}
                 JOIN {serving_tables.provider_group_member_table} pgm_filter
-                  ON pgm_filter.provider_group_hash = psc_filter.provider_group_hash
+                  ON {provider_match_predicate}
                 JOIN filtered_locations loc ON loc.npi = pgm_filter.npi
                 WHERE loc.npi IS NOT NULL
             )
@@ -1631,10 +1643,17 @@ def _compact_provider_filter_sql(
             True,
         )
     clauses = []
-    joins = [
-        f"FROM {serving_tables.provider_set_component_table} psc_filter",
-        f"JOIN {serving_tables.provider_group_member_table} pgm_filter ON pgm_filter.provider_group_hash = psc_filter.provider_group_hash",
-    ]
+    joins = []
+    provider_set_predicate = ""
+    if serving_tables.provider_set_component_table:
+        joins.append(f"FROM {serving_tables.provider_set_component_table} psc_filter")
+        joins.append(f"JOIN {serving_tables.provider_group_member_table} pgm_filter ON pgm_filter.provider_group_hash = psc_filter.provider_group_hash")
+        provider_set_predicate = "psc_filter.provider_set_hash = r.provider_set_hash"
+    elif serving_tables.provider_group_member_table:
+        joins.append(f"FROM {serving_tables.provider_group_member_table} pgm_filter")
+        provider_set_predicate = "pgm_filter.provider_group_hash = r.provider_set_hash"
+    else:
+        return "", False
     if has_geo:
         joins.append(f"JOIN {address_table or f'{PTG2_SCHEMA}.npi_address'} addr_filter ON addr_filter.npi = pgm_filter.npi")
         if params.get("zip5"):
@@ -1651,13 +1670,18 @@ def _compact_provider_filter_sql(
             )
             if _is_unified_address_table(address_table):
                 clauses.append("COALESCE(addr_filter.address_precision, '') <> 'city_zip'")
-    if specialty or inferred_sql:
-        joins.append(f"JOIN {PTG2_SCHEMA}.npi_taxonomy nt_filter ON nt_filter.npi = pgm_filter.npi")
-    if specialty:
-        joins.append(f"JOIN {PTG2_SCHEMA}.nucc_taxonomy nucc_filter ON nucc_filter.code = nt_filter.healthcare_provider_taxonomy_code")
-        clauses.append("LOWER(COALESCE(nucc_filter.display_name, '')) LIKE :specialty_like")
+    if specialty_filter.active:
+        clauses.append(
+            provider_specialty_taxonomy_exists_sql(
+                "pgm_filter.npi",
+                params,
+                "provider_specialty",
+                specialty_filter,
+                schema=PTG2_SCHEMA,
+            )
+        )
     if inferred_sql:
-        clauses.append(inferred_sql.replace("nt.", "nt_filter."))
+        clauses.append(f"EXISTS (SELECT 1 FROM {PTG2_SCHEMA}.npi_taxonomy nt WHERE nt.npi = pgm_filter.npi AND {inferred_sql})")
     where = " AND ".join(clauses) or "TRUE"
     return (
         f"""
@@ -1667,7 +1691,7 @@ def _compact_provider_filter_sql(
             WHERE EXISTS (
                 SELECT 1
                 {' '.join(joins)}
-                WHERE psc_filter.provider_set_hash = r.provider_set_hash
+                WHERE {provider_set_predicate}
                   AND {where}
             )
         )
@@ -1688,12 +1712,25 @@ def _compact_provider_expansion_sql(
     resolved_address_table = address_table or f"{PTG2_SCHEMA}.npi_address"
     address_location_hash_sql = _ptg2_address_location_hash_sql("addr", resolved_address_table)
     params.setdefault("provider_match_limit", max(int(params.get("limit") or 25) * 8, 64))
+    component_join = ""
+    member_join = ""
+    if serving_tables.provider_set_component_table:
+        component_join = f"""
+        JOIN {serving_tables.provider_set_component_table} psc
+          ON psc.provider_set_hash = r.provider_set_hash"""
+        member_join = f"""
+        JOIN {serving_tables.provider_group_member_table} pgm
+          ON pgm.provider_group_hash = psc.provider_group_hash"""
+    elif serving_tables.provider_group_member_table:
+        member_join = f"""
+        JOIN {serving_tables.provider_group_member_table} pgm
+          ON pgm.provider_group_hash = r.provider_set_hash"""
+    else:
+        return ""
     if serving_tables.provider_group_location_table and (args.get("zip5") or args.get("zip") or args.get("city") or args.get("state") or args.get("lat") or args.get("long")):
         return f"""
-        JOIN {serving_tables.provider_set_component_table} psc
-          ON psc.provider_set_hash = r.provider_set_hash
-        JOIN {serving_tables.provider_group_member_table} pgm
-          ON pgm.provider_group_hash = psc.provider_group_hash
+        {component_join}
+        {member_join}
         JOIN LATERAL (
             SELECT loc.*
             FROM {serving_tables.provider_group_location_table} loc
@@ -1707,10 +1744,8 @@ def _compact_provider_expansion_sql(
         ) loc ON TRUE
         """
     return f"""
-        JOIN {serving_tables.provider_set_component_table} psc
-          ON psc.provider_set_hash = r.provider_set_hash
-        JOIN {serving_tables.provider_group_member_table} pgm
-          ON pgm.provider_group_hash = psc.provider_group_hash
+        {component_join}
+        {member_join}
         LEFT JOIN LATERAL (
             SELECT
                 addr.*,

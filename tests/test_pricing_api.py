@@ -151,7 +151,47 @@ async def test_group_plan_providers_filters_to_ten_digit_npis(monkeypatch):
     assert first_params["npi_max"] == 9999999999
     assert count_params["npi_min"] == 1000000000
     assert count_params["npi_max"] == 9999999999
-    assert "npi BETWEEN :npi_min AND :npi_max" in str(request.ctx.sa_session.executions[0][0][0])
+    assert "gm.npi BETWEEN :npi_min AND :npi_max" in str(request.ctx.sa_session.executions[0][0][0])
+
+
+@pytest.mark.asyncio
+async def test_group_plan_providers_filters_by_primary_taxonomy(monkeypatch):
+    async def fake_current_source_snapshot_id_for_plan(_session, _plan_fields):
+        return "ptg2:test"
+
+    async def fake_snapshot_serving_tables(_session, _snapshot_id):
+        return types.SimpleNamespace(provider_group_member_table="mrf.ptg2_provider_group_member_test")
+
+    monkeypatch.setattr(
+        pricing_module,
+        "current_source_snapshot_id_for_plan",
+        fake_current_source_snapshot_id_for_plan,
+    )
+    monkeypatch.setattr(pricing_module, "snapshot_serving_tables", fake_snapshot_serving_tables)
+    request = make_request(
+        [FakeResult(rows=[types.SimpleNamespace(npi=1234567890)])],
+        args={
+            "plan_id": "465722012",
+            "market_type": "group",
+            "specialty": "Family Medicine",
+            "limit": "10",
+        },
+    )
+
+    response = await group_plan_providers(request)
+    payload = json.loads(response.body)
+
+    assert [item["npi"] for item in payload["providers"]["items"]] == [1234567890]
+    assert payload["taxonomy_filter"]["specialty"] == "Family Medicine"
+    assert payload["taxonomy_filter"]["taxonomy_code_set"] == ["207Q00000X", "208D00000X"]
+    sql = str(request.ctx.sa_session.executions[0][0][0])
+    params = request.ctx.sa_session.executions[0][0][1]
+    assert "mrf.npi_taxonomy group_provider_specialty_nt" in sql
+    assert "group_provider_specialty_nt.npi = gm.npi" in sql
+    assert "healthcare_provider_primary_taxonomy_switch" in sql
+    assert "display_name" not in sql
+    assert params["group_provider_specialty_taxonomy_code_0"] == "207Q00000X"
+    assert params["group_provider_specialty_taxonomy_code_1"] == "208D00000X"
 
 
 @pytest.mark.asyncio

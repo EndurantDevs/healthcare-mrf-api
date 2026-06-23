@@ -23,6 +23,10 @@ from api.endpoint.pagination import parse_pagination
 from api.ptg2_serving import normalize_ptg2_mode, search_current_ptg2_index, search_ptg2_provider_procedures
 from api.ptg2_snapshot import current_source_snapshot_id_for_plan
 from api.ptg2_tables import _safe_table_name, snapshot_serving_tables
+from api.provider_specialty_filters import (
+    provider_specialty_taxonomy_exists_sql,
+    resolve_provider_specialty_filter,
+)
 from db.models import (CodeCatalog, CodeCrosswalk, PricingProcedure,
                        PricingProcedureGeoBenchmark,
                        DoctorClinicianAddress, EntityAddressUnified,
@@ -3954,6 +3958,7 @@ async def group_plan_providers(request):
     except (TypeError, ValueError):
         cursor_npi = 0
     enrich = (request.args.get("enrich") or "").strip().lower() in ("1", "true", "yes")
+    specialty_filter = resolve_provider_specialty_filter(request.args)
 
     snapshot_id = await current_source_snapshot_id_for_plan(
         session, {"plan_id": plan_id, "plan_market_type": market_type}
@@ -3964,6 +3969,7 @@ async def group_plan_providers(request):
             "snapshot_id": None, "resolved": False,
             "reason": "no published serving snapshot for this plan_id + market_type",
             "providers": {"count": 0, "items": [], "next_cursor": None},
+            "taxonomy_filter": specialty_filter.response_payload(),
             "exhausted": True,
         })
 
@@ -3987,23 +3993,32 @@ async def group_plan_providers(request):
     # in-DB group_member table is used instead of the binary set->group sidecars,
     # which is both correct (single-plan snapshot) and the only tractable way to
     # page millions of providers.
+    params = {
+        "cursor_npi": max(cursor_npi, 0),
+        "limit": limit,
+        "npi_min": NPI_MIN,
+        "npi_max": NPI_MAX,
+    }
+    taxonomy_predicate = provider_specialty_taxonomy_exists_sql(
+        "gm.npi",
+        params,
+        "group_provider_specialty",
+        specialty_filter,
+    ) if specialty_filter.active else ""
+    taxonomy_where = f"\n               AND {taxonomy_predicate}" if taxonomy_predicate else ""
+
     rows = (await session.execute(
         text(
             f"""
-            SELECT DISTINCT npi
-              FROM {group_member_table}
-             WHERE npi BETWEEN :npi_min AND :npi_max
-               AND npi > :cursor_npi
-             ORDER BY npi
+            SELECT DISTINCT gm.npi
+              FROM {group_member_table} gm
+             WHERE gm.npi BETWEEN :npi_min AND :npi_max
+               AND gm.npi > :cursor_npi{taxonomy_where}
+             ORDER BY gm.npi
              LIMIT :limit
             """
         ),
-        {
-            "cursor_npi": max(cursor_npi, 0),
-            "limit": limit,
-            "npi_min": NPI_MIN,
-            "npi_max": NPI_MAX,
-        },
+        params,
     )).fetchall()
     npis = [int(row.npi) for row in rows if row.npi is not None]
 
@@ -4012,12 +4027,12 @@ async def group_plan_providers(request):
         total_distinct = int((await session.execute(
             text(
                 f"""
-                SELECT COUNT(DISTINCT npi)
-                  FROM {group_member_table}
-                 WHERE npi BETWEEN :npi_min AND :npi_max
+                SELECT COUNT(DISTINCT gm.npi)
+                  FROM {group_member_table} gm
+                 WHERE gm.npi BETWEEN :npi_min AND :npi_max{taxonomy_where}
                 """
             ),
-            {"npi_min": NPI_MIN, "npi_max": NPI_MAX},
+            params,
         )).scalar() or 0)
 
     items: list[dict[str, Any]] = [{"npi": npi} for npi in npis]
@@ -4049,6 +4064,7 @@ async def group_plan_providers(request):
         "market_type": market_type,
         "snapshot_id": snapshot_id,
         "resolved": True,
+        "taxonomy_filter": specialty_filter.response_payload(),
         "providers": {
             "count": len(items),
             "total_distinct": total_distinct,
