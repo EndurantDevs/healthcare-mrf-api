@@ -204,4 +204,17 @@ async def main(
         payload["limit_per_source"] = max(int(limit_per_source), 0)
     if publish is not None:
         payload["publish"] = bool(publish)
-    await redis.enqueue_job("process_data", payload, _queue_name=PTG_ADDRESS_ENTITY_REFRESH_QUEUE_NAME)
+    await redis.enqueue_job(
+        "control_single_job_start",
+        {
+            "importer": "ptg-address-entity-refresh",
+            "family": "provider",
+            "target_module": "process.ptg_address_entity_refresh",
+            "target_function": "process_data",
+            "call_style": "ctx_task",
+            "run_shutdown": False,
+            "task": payload,
+        },
+        _queue_name=PTG_ADDRESS_ENTITY_REFRESH_QUEUE_NAME,
+        _max_tries=1,
+    )

@@ -152,3 +152,49 @@ async def test_ptg_address_entity_refresh_allows_explicit_full_modes_without_sou
         {"test_mode": True, "refresh_mode": "full"},
     ]
     assert result["rows"] == 1
+
+
+@pytest.mark.asyncio
+async def test_ptg_address_entity_refresh_main_enqueues_control_wrapper(monkeypatch):
+    workflow = _workflow_module()
+    calls = []
+
+    class FakeRedis:
+        async def enqueue_job(self, *args, **kwargs):
+            calls.append((args, kwargs))
+
+    async def fake_create_pool(*_args, **_kwargs):
+        return FakeRedis()
+
+    monkeypatch.setattr(workflow, "create_pool", fake_create_pool)
+
+    await workflow.main(
+        test_mode=True,
+        source_key="source-a",
+        snapshot_id="snap-new",
+        ptg_refresh_mode="partial",
+        entity_refresh_mode="ptg-partial",
+        limit_per_source=25,
+        publish=True,
+    )
+
+    args, kwargs = calls[0]
+    assert args[0] == "control_single_job_start"
+    assert args[1] == {
+        "importer": "ptg-address-entity-refresh",
+        "family": "provider",
+        "target_module": "process.ptg_address_entity_refresh",
+        "target_function": "process_data",
+        "call_style": "ctx_task",
+        "run_shutdown": False,
+        "task": {
+            "test_mode": True,
+            "source_key": "source-a",
+            "snapshot_id": "snap-new",
+            "ptg_refresh_mode": "partial",
+            "entity_refresh_mode": "ptg-partial",
+            "limit_per_source": 25,
+            "publish": True,
+        },
+    }
+    assert kwargs == {"_queue_name": "arq:EntityAddressUnified", "_max_tries": 1}
