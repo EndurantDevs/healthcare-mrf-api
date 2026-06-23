@@ -59,6 +59,7 @@ DEFAULT_SQL_STATEMENT_TIMEOUT = "0"
 DEFAULT_SQL_SYNCHRONOUS_COMMIT = "off"
 DEFAULT_SQL_JIT = "off"
 DEFAULT_PTG_PARTIAL_PATCH_SUPPORT = True
+DEFAULT_PTG_PARTIAL_PATCH_MAIN = True
 ENTITY_ADDRESS_REFRESH_MODE_FULL = "full"
 ENTITY_ADDRESS_REFRESH_MODE_PTG_PARTIAL = "ptg-partial"
 ENTITY_ADDRESS_REFRESH_MODES = {ENTITY_ADDRESS_REFRESH_MODE_FULL, ENTITY_ADDRESS_REFRESH_MODE_PTG_PARTIAL}
@@ -1863,8 +1864,12 @@ def _ptg_partial_source_selects(
     return filtered
 
 
+def _entity_address_column_names() -> list[str]:
+    return [column.name for column in EntityAddressUnified.__table__.columns]
+
+
 def _entity_address_column_list() -> str:
-    return ", ".join(column.name for column in EntityAddressUnified.__table__.columns)
+    return ", ".join(_entity_address_column_names())
 
 
 def _entity_address_ptg_source_overlap_sql(source_keys: list[str], *, alias: str = "live") -> str:
@@ -1903,6 +1908,67 @@ def _entity_address_reuse_live_rows_sql(
              WHERE raw.location_key = live.location_key
        );
     """
+
+
+def _delete_live_entity_for_affected_groups_sql(
+    db_schema: str,
+    live_table: str,
+    affected_group_table: str,
+    *,
+    replacement_stage_table: str | None = None,
+) -> str:
+    replacement_filter = ""
+    if replacement_stage_table:
+        replacement_filter = f"""
+        OR EXISTS (
+            SELECT 1
+              FROM {db_schema}.{replacement_stage_table} AS replacement
+             WHERE replacement.location_key = live.location_key
+        )"""
+    return f"""
+    DELETE FROM {db_schema}.{live_table} AS live
+     WHERE EXISTS (
+            SELECT 1
+              FROM {db_schema}.{affected_group_table} AS affected
+             WHERE {_entity_address_evidence_group_match_sql("affected", "live")}
+       )
+       {replacement_filter};
+    """
+
+
+def _insert_stage_entity_into_live_sql(db_schema: str, live_table: str, stage_table: str) -> str:
+    columns = _entity_address_column_names()
+    column_list = ", ".join(columns)
+    select_list = ", ".join(f"stage.{column}" for column in columns)
+    return f"""
+    INSERT INTO {db_schema}.{live_table} ({column_list})
+    SELECT {select_list}
+      FROM {db_schema}.{stage_table} AS stage;
+    """
+
+
+def _partial_main_patch_sql(
+    db_schema: str,
+    *,
+    live_table: str,
+    stage_table: str,
+    affected_group_table: str,
+) -> list[tuple[str, str]]:
+    return [
+        (
+            "delete affected entity rows",
+            _delete_live_entity_for_affected_groups_sql(
+                db_schema,
+                live_table,
+                affected_group_table,
+                replacement_stage_table=stage_table,
+            ),
+        ),
+        (
+            "insert affected entity rows",
+            _insert_stage_entity_into_live_sql(db_schema, live_table, stage_table),
+        ),
+    ]
 
 
 async def _copy_reusable_entity_address_rows(
@@ -3437,16 +3503,30 @@ def _delete_live_support_for_affected_groups_sql(
     live_support_table: str,
     old_entity_table: str,
     affected_group_table: str,
+    *,
+    replacement_stage_table: str | None = None,
 ) -> str:
+    replacement_filter = ""
+    if replacement_stage_table:
+        replacement_filter = f"""
+        OR EXISTS (
+            SELECT 1
+              FROM {db_schema}.{replacement_stage_table} AS replacement
+             WHERE replacement.location_key = support.location_key
+        )"""
     return f"""
     DELETE FROM {db_schema}.{live_support_table} AS support
-     USING {db_schema}.{old_entity_table} AS live
-     WHERE support.location_key = live.location_key
-       AND EXISTS (
+     WHERE EXISTS (
             SELECT 1
-              FROM {db_schema}.{affected_group_table} AS affected
-             WHERE {_entity_address_evidence_group_match_sql("affected", "live")}
-       );
+              FROM {db_schema}.{old_entity_table} AS live
+             WHERE live.location_key = support.location_key
+               AND EXISTS (
+                    SELECT 1
+                      FROM {db_schema}.{affected_group_table} AS affected
+                     WHERE {_entity_address_evidence_group_match_sql("affected", "live")}
+               )
+       )
+       {replacement_filter};
     """
 
 
@@ -3484,6 +3564,7 @@ def _partial_support_patch_sql(
     old_entity_table: str,
     affected_group_table: str,
     build_network_bridge: bool,
+    replacement_stage_table: str | None = None,
 ) -> list[tuple[str, str]]:
     statements: list[tuple[str, str]] = []
     for model in _support_patch_models(build_network_bridge=build_network_bridge):
@@ -3497,6 +3578,7 @@ def _partial_support_patch_sql(
                     model.__main_table__,
                     old_entity_table,
                     affected_group_table,
+                    replacement_stage_table=replacement_stage_table,
                 ),
             )
         )
@@ -7213,6 +7295,31 @@ async def process_data(ctx, task=None):
     else:
         support_stage_classes = _support_stage_classes(import_date)
 
+    build_network_bridge = _env_bool(
+        "HLTHPRT_ENTITY_ADDRESS_UNIFIED_BUILD_NETWORK_BRIDGE",
+        DEFAULT_BUILD_NETWORK_BRIDGE,
+    )
+    context["build_network_bridge"] = build_network_bridge
+    context["partial_ptg_support_bridge_reuse"] = False
+    context["partial_ptg_support_patch_publish"] = False
+    context["partial_ptg_main_patch_publish"] = False
+    if partial_ptg_refresh and affected_group_table:
+        support_reuse_available = await _support_bridge_reuse_available(
+            db_schema,
+            build_network_bridge=build_network_bridge,
+        )
+        context["partial_ptg_support_bridge_reuse"] = support_reuse_available
+        if support_reuse_available:
+            patch_support = _env_bool(
+                "HLTHPRT_ENTITY_ADDRESS_UNIFIED_PTG_PARTIAL_PATCH_SUPPORT",
+                DEFAULT_PTG_PARTIAL_PATCH_SUPPORT,
+            )
+            context["partial_ptg_support_patch_publish"] = patch_support
+            context["partial_ptg_main_patch_publish"] = patch_support and _env_bool(
+                "HLTHPRT_ENTITY_ADDRESS_UNIFIED_PTG_PARTIAL_PATCH_MAIN",
+                DEFAULT_PTG_PARTIAL_PATCH_MAIN,
+            )
+
     if run_id:
         enqueue_live_progress(
             run_id=run_id,
@@ -7468,15 +7575,30 @@ async def process_data(ctx, task=None):
         )
         await db.status(f"TRUNCATE TABLE {db_schema}.{stage_table};")
         if partial_ptg_refresh:
-            reused_rows = await _copy_reusable_entity_address_rows(
-                db_schema,
-                stage_table,
-                raw_table,
-                source_keys=ptg_source_keys,
-                affected_group_table=affected_group_table,
-            )
+            if context.get("partial_ptg_main_patch_publish"):
+                reused_rows = 0
+                if run_id:
+                    enqueue_live_progress(
+                        run_id=run_id,
+                        importer="entity-address-unified",
+                        status="running",
+                        phase="entity-address-unified using affected-only stage",
+                        unit="rows",
+                        done=0,
+                        total=0,
+                        pct=55,
+                        message="using affected-only stage for partial PTG main patch",
+                    )
+            else:
+                reused_rows = await _copy_reusable_entity_address_rows(
+                    db_schema,
+                    stage_table,
+                    raw_table,
+                    source_keys=ptg_source_keys,
+                    affected_group_table=affected_group_table,
+                )
             context["partial_ptg_reused_rows"] = reused_rows
-            if run_id:
+            if run_id and not context.get("partial_ptg_main_patch_publish"):
                 enqueue_live_progress(
                     run_id=run_id,
                     importer="entity-address-unified",
@@ -7918,11 +8040,6 @@ async def process_data(ctx, task=None):
     await db.status(f"DROP TABLE IF EXISTS {db_schema}.{evidence_table};")
 
     node_id = str(os.getenv("HLTHPRT_IMPORT_NODE_ID") or "").strip() or None
-    build_network_bridge = _env_bool(
-        "HLTHPRT_ENTITY_ADDRESS_UNIFIED_BUILD_NETWORK_BRIDGE",
-        DEFAULT_BUILD_NETWORK_BRIDGE,
-    )
-    context["build_network_bridge"] = build_network_bridge
     cached_support_counts = context.get("support_counts")
     if context.get("support_stage_populated") and isinstance(cached_support_counts, dict):
         support_counts = {str(key): int(value) for key, value in cached_support_counts.items()}
@@ -7930,22 +8047,15 @@ async def process_data(ctx, task=None):
         support_raw_table = None if partial_ptg_refresh else raw_table
         support_affected_group_table = None
         copy_unaffected_support_bridges = True
-        if partial_ptg_refresh and affected_group_table:
-            support_reuse_available = await _support_bridge_reuse_available(
-                db_schema,
-                build_network_bridge=build_network_bridge,
+        if (
+            partial_ptg_refresh
+            and affected_group_table
+            and context.get("partial_ptg_support_bridge_reuse")
+        ):
+            support_affected_group_table = affected_group_table
+            copy_unaffected_support_bridges = not bool(
+                context.get("partial_ptg_support_patch_publish")
             )
-            context["partial_ptg_support_bridge_reuse"] = support_reuse_available
-            if support_reuse_available:
-                support_affected_group_table = affected_group_table
-                patch_support = _env_bool(
-                    "HLTHPRT_ENTITY_ADDRESS_UNIFIED_PTG_PARTIAL_PATCH_SUPPORT",
-                    DEFAULT_PTG_PARTIAL_PATCH_SUPPORT,
-                )
-                context["partial_ptg_support_patch_publish"] = patch_support
-                copy_unaffected_support_bridges = not patch_support
-            else:
-                context["partial_ptg_support_patch_publish"] = False
         support_counts = await _populate_support_stage_tables(
             db_schema,
             stage_table,
@@ -7964,7 +8074,11 @@ async def process_data(ctx, task=None):
         context["support_counts"] = support_counts
     if raw_table:
         await db.status(f"DROP TABLE IF EXISTS {db_schema}.{raw_table};")
-    if affected_group_table and not context.get("partial_ptg_support_patch_publish"):
+    if (
+        affected_group_table
+        and not context.get("partial_ptg_support_patch_publish")
+        and not context.get("partial_ptg_main_patch_publish")
+    ):
         await db.status(f"DROP TABLE IF EXISTS {db_schema}.{affected_group_table};")
 
     if (
@@ -8006,7 +8120,10 @@ async def process_data(ctx, task=None):
                 message=f"compacted {compacted_rows:,} hot rows",
             )
 
-    if not ctx["context"].get("stage_indexes_prepared"):
+    if (
+        not ctx["context"].get("stage_indexes_prepared")
+        and not context.get("partial_ptg_main_patch_publish")
+    ):
         if run_id:
             enqueue_live_progress(
                 run_id=run_id,
@@ -8113,6 +8230,11 @@ async def shutdown(ctx):
     support_stage_classes = _support_stage_classes(import_date)
     affected_group_table = str(context.get("partial_ptg_affected_group_table") or "").strip()
     partial_support_patch = bool(context.get("partial_ptg_support_patch_publish"))
+    partial_main_patch = bool(context.get("partial_ptg_main_patch_publish"))
+    if partial_main_patch and not partial_support_patch:
+        raise RuntimeError(
+            "entity-address-unified ptg-partial main patch publish requires support patch publish."
+        )
 
     stage_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{stage_cls.__tablename__};") or 0)
     min_rows_required = int(
@@ -8126,12 +8248,18 @@ async def shutdown(ctx):
         )
     if context.get("test_mode"):
         logger.info("EntityAddressUnified test mode: staged rows=%d", stage_rows)
-    _validate_publish_row_count(
-        stage_rows=stage_rows,
-        previous_rows=previous_rows,
-        test_mode=bool(context.get("test_mode")),
-        min_rows_required=min_rows_required,
-    )
+    if partial_main_patch:
+        if previous_rows <= 0:
+            raise RuntimeError(
+                "entity-address-unified ptg-partial main patch publish requires an existing live table."
+            )
+    else:
+        _validate_publish_row_count(
+            stage_rows=stage_rows,
+            previous_rows=previous_rows,
+            test_mode=bool(context.get("test_mode")),
+            min_rows_required=min_rows_required,
+        )
     publish_validation = await _validate_publish_integrity(
         db_schema,
         stage_cls.__tablename__,
@@ -8180,46 +8308,19 @@ async def shutdown(ctx):
 
     async with db.transaction():
         table = EntityAddressUnified.__main_table__
-        await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
-        await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{table} RENAME TO {table}_old;")
-        await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{stage_cls.__tablename__} RENAME TO {table};")
-
-        archived = _archived_identifier(f"{table}_idx_primary")
-        await db.status(f"DROP INDEX IF EXISTS {db_schema}.{archived};")
-        await db.status(f"ALTER INDEX IF EXISTS {db_schema}.{table}_idx_primary RENAME TO {archived};")
-        await db.status(
-            f"ALTER INDEX IF EXISTS {db_schema}.{stage_cls.__tablename__}_idx_primary "
-            f"RENAME TO {table}_idx_primary;"
-        )
-
-        if hasattr(stage_cls, "__my_additional_indexes__") and stage_cls.__my_additional_indexes__:
-            for index in stage_cls.__my_additional_indexes__:
-                index_name = index.get("name", "_".join(index.get("index_elements")))
-                old_live_name = f"{table}_idx_{index_name}"
-                archived_live_name = _archived_identifier(old_live_name)
-                await db.status(f"DROP INDEX IF EXISTS {db_schema}.{archived_live_name};")
-                await db.status(
-                    f"ALTER INDEX IF EXISTS {db_schema}.{old_live_name} "
-                    f"RENAME TO {archived_live_name};"
-                )
-                await db.status(
-                    f"ALTER INDEX IF EXISTS "
-                    f"{db_schema}.{_stage_index_name(stage_cls.__tablename__, index_name)} "
-                    f"RENAME TO {old_live_name};"
-                )
-
-        if partial_support_patch:
+        if partial_main_patch:
             if not affected_group_table or not await _table_exists(db_schema, affected_group_table):
                 raise RuntimeError(
-                    "entity-address-unified ptg-partial support patch publish requires "
+                    "entity-address-unified ptg-partial main patch publish requires "
                     "the affected group table to remain available through shutdown."
                 )
             for label, statement in _partial_support_patch_sql(
                 db_schema,
                 support_stage_classes,
-                old_entity_table=f"{table}_old",
+                old_entity_table=table,
                 affected_group_table=affected_group_table,
                 build_network_bridge=bool(context.get("build_network_bridge", DEFAULT_BUILD_NETWORK_BRIDGE)),
+                replacement_stage_table=stage_cls.__tablename__,
             ):
                 started = time.monotonic()
                 rowcount = await db.status(statement)
@@ -8229,11 +8330,75 @@ async def shutdown(ctx):
                     time.monotonic() - started,
                     _coerce_rowcount(rowcount),
                 )
+            for label, statement in _partial_main_patch_sql(
+                db_schema,
+                live_table=table,
+                stage_table=stage_cls.__tablename__,
+                affected_group_table=affected_group_table,
+            ):
+                started = time.monotonic()
+                rowcount = await db.status(statement)
+                _record_phase_timing(
+                    context,
+                    f"entity-address-unified patching main {label}",
+                    time.monotonic() - started,
+                    _coerce_rowcount(rowcount),
+                )
         else:
-            for live_cls, support_stage_cls in support_stage_classes.items():
-                await _swap_stage_table(db_schema, live_cls, support_stage_cls)
+            await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
+            await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{table} RENAME TO {table}_old;")
+            await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{stage_cls.__tablename__} RENAME TO {table};")
 
-    if partial_support_patch:
+            archived = _archived_identifier(f"{table}_idx_primary")
+            await db.status(f"DROP INDEX IF EXISTS {db_schema}.{archived};")
+            await db.status(f"ALTER INDEX IF EXISTS {db_schema}.{table}_idx_primary RENAME TO {archived};")
+            await db.status(
+                f"ALTER INDEX IF EXISTS {db_schema}.{stage_cls.__tablename__}_idx_primary "
+                f"RENAME TO {table}_idx_primary;"
+            )
+
+            if hasattr(stage_cls, "__my_additional_indexes__") and stage_cls.__my_additional_indexes__:
+                for index in stage_cls.__my_additional_indexes__:
+                    index_name = index.get("name", "_".join(index.get("index_elements")))
+                    old_live_name = f"{table}_idx_{index_name}"
+                    archived_live_name = _archived_identifier(old_live_name)
+                    await db.status(f"DROP INDEX IF EXISTS {db_schema}.{archived_live_name};")
+                    await db.status(
+                        f"ALTER INDEX IF EXISTS {db_schema}.{old_live_name} "
+                        f"RENAME TO {archived_live_name};"
+                    )
+                    await db.status(
+                        f"ALTER INDEX IF EXISTS "
+                        f"{db_schema}.{_stage_index_name(stage_cls.__tablename__, index_name)} "
+                        f"RENAME TO {old_live_name};"
+                    )
+
+            if partial_support_patch:
+                if not affected_group_table or not await _table_exists(db_schema, affected_group_table):
+                    raise RuntimeError(
+                        "entity-address-unified ptg-partial support patch publish requires "
+                        "the affected group table to remain available through shutdown."
+                    )
+                for label, statement in _partial_support_patch_sql(
+                    db_schema,
+                    support_stage_classes,
+                    old_entity_table=f"{table}_old",
+                    affected_group_table=affected_group_table,
+                    build_network_bridge=bool(context.get("build_network_bridge", DEFAULT_BUILD_NETWORK_BRIDGE)),
+                ):
+                    started = time.monotonic()
+                    rowcount = await db.status(statement)
+                    _record_phase_timing(
+                        context,
+                        f"entity-address-unified patching support {label}",
+                        time.monotonic() - started,
+                        _coerce_rowcount(rowcount),
+                    )
+            else:
+                for live_cls, support_stage_cls in support_stage_classes.items():
+                    await _swap_stage_table(db_schema, live_cls, support_stage_cls)
+
+    if partial_support_patch or partial_main_patch:
         await _drop_stage_artifacts(
             db_schema,
             stage_cls,
@@ -8241,7 +8406,15 @@ async def shutdown(ctx):
             extra_tables=[affected_group_table],
         )
 
-    logger.info("EntityAddressUnified publish complete: rows=%d", stage_rows)
+    published_rows = stage_rows
+    if partial_main_patch:
+        published_rows = int(
+            await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{EntityAddressUnified.__main_table__};")
+            or 0
+        )
+        context["partial_ptg_patched_rows"] = stage_rows
+
+    logger.info("EntityAddressUnified publish complete: rows=%d", published_rows)
     await mark_control_run(
         run_id,
         status="succeeded",
@@ -8249,17 +8422,18 @@ async def shutdown(ctx):
         progress_message="succeeded",
         progress={
             "unit": "rows",
-            "done": stage_rows,
-            "total": stage_rows,
+            "done": published_rows,
+            "total": published_rows,
             "pct": 100,
             "message": "succeeded",
             "phase": "entity-address-unified published",
         },
         metrics={
-            "rows": stage_rows,
+            "rows": published_rows,
             "refresh_mode": context.get("refresh_mode") or ENTITY_ADDRESS_REFRESH_MODE_FULL,
             "partial_ptg_source_keys": context.get("partial_ptg_source_keys") or [],
             "partial_ptg_reused_rows": int(context.get("partial_ptg_reused_rows") or 0),
+            "partial_ptg_patched_rows": int(context.get("partial_ptg_patched_rows") or 0),
             "npi_rows": int(context.get("npi_rows") or 0),
             "inferred_rows": int(context.get("inferred_rows") or 0),
             "multi_source_rows": int(context.get("multi_source_rows") or 0),
