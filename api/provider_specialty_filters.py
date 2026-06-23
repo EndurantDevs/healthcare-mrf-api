@@ -96,6 +96,16 @@ _SPECIALTY_CLASSIFICATION_ALIASES: dict[str, str] = {
     "physician assistant": "Physician Assistant",
 }
 
+_CLASSIFICATION_BASE_TAXONOMY_CODE_ALIASES: dict[str, tuple[str, ...]] = {
+    "family medicine": FAMILY_MEDICINE_TAXONOMY_CODES,
+    "internal medicine": ("207R00000X",),
+    "pediatrics": ("208000000X",),
+    "general practice": ("208D00000X",),
+    "dermatology": ("207N00000X",),
+    "emergency medicine": ("207P00000X",),
+    "dentist": ("122300000X",),
+}
+
 
 def _normalize_bool(value: Any) -> bool:
     if isinstance(value, bool):
@@ -130,6 +140,7 @@ class ProviderSpecialtyFilter:
     taxonomy_codes: tuple[str, ...] = ()
     include_subspecialties: bool = False
     primary_only: bool = True
+    use_classification_predicate: bool = True
 
     @property
     def active(self) -> bool:
@@ -162,12 +173,23 @@ def resolve_provider_specialty_filter(args: Mapping[str, Any]) -> ProviderSpecia
         taxonomy_codes = _SPECIALTY_TAXONOMY_CODE_ALIASES[key]
     if not classification and key in _SPECIALTY_CLASSIFICATION_ALIASES:
         classification = _SPECIALTY_CLASSIFICATION_ALIASES[key]
+    use_classification_predicate = True
+    classification_key = classification.lower()
+    if (
+        classification_key
+        and not taxonomy_codes
+        and not include_subspecialties
+        and classification_key in _CLASSIFICATION_BASE_TAXONOMY_CODE_ALIASES
+    ):
+        taxonomy_codes = _CLASSIFICATION_BASE_TAXONOMY_CODE_ALIASES[classification_key]
+        use_classification_predicate = False
 
     return ProviderSpecialtyFilter(
         specialty=specialty or None,
         classification=classification or None,
         taxonomy_codes=taxonomy_codes,
         include_subspecialties=include_subspecialties,
+        use_classification_predicate=use_classification_predicate,
     )
 
 
@@ -202,7 +224,7 @@ def provider_specialty_taxonomy_exists_sql(
             f"UPPER(COALESCE({nt}.healthcare_provider_taxonomy_code, '')) IN ({', '.join(code_placeholders)})"
         )
 
-    if specialty_filter.classification:
+    if specialty_filter.classification and specialty_filter.use_classification_predicate:
         classification_key = f"{param_prefix}_classification"
         params[classification_key] = specialty_filter.classification
         joins = f"\n                    JOIN {schema}.nucc_taxonomy {nucc} ON {nucc}.code = {nt}.healthcare_provider_taxonomy_code"

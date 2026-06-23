@@ -195,6 +195,41 @@ async def test_group_plan_providers_filters_by_primary_taxonomy(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_group_plan_providers_classification_internal_medicine_uses_base_taxonomy(monkeypatch):
+    async def fake_current_source_snapshot_id_for_plan(_session, _plan_fields):
+        return "ptg2:test"
+
+    async def fake_snapshot_serving_tables(_session, _snapshot_id):
+        return types.SimpleNamespace(provider_group_member_table="mrf.ptg2_provider_group_member_test")
+
+    monkeypatch.setattr(
+        pricing_module,
+        "current_source_snapshot_id_for_plan",
+        fake_current_source_snapshot_id_for_plan,
+    )
+    monkeypatch.setattr(pricing_module, "snapshot_serving_tables", fake_snapshot_serving_tables)
+    request = make_request(
+        [FakeResult(rows=[types.SimpleNamespace(npi=1003000530)])],
+        args={
+            "plan_id": "465722012",
+            "market_type": "group",
+            "classification": "Internal Medicine",
+            "limit": "10",
+        },
+    )
+
+    response = await group_plan_providers(request)
+    payload = json.loads(response.body)
+
+    assert payload["taxonomy_filter"]["classification"] == "Internal Medicine"
+    assert payload["taxonomy_filter"]["taxonomy_code_set"] == ["207R00000X"]
+    sql = str(request.ctx.sa_session.executions[0][0][0])
+    params = request.ctx.sa_session.executions[0][0][1]
+    assert "nucc_taxonomy" not in sql
+    assert params["group_provider_specialty_taxonomy_code_0"] == "207R00000X"
+
+
+@pytest.mark.asyncio
 async def test_list_provider_procedures_success():
     request = make_request(
         [
