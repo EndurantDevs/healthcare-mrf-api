@@ -112,10 +112,12 @@ async def control_ptg_import_file(request):
 async def control_ptg_source_snapshot_promote(request):
     _require_control_auth(request)
     payload = request.json if isinstance(request.json, dict) else {}
+    source_key = str(payload.get("source_key") or "")
+    snapshot_id = str(payload.get("snapshot_id") or "")
     try:
         result = await promote_ptg2_source_snapshot(
-            source_key=str(payload.get("source_key") or ""),
-            snapshot_id=str(payload.get("snapshot_id") or ""),
+            source_key=source_key,
+            snapshot_id=snapshot_id,
             expected_current_snapshot_id=(
                 str(payload.get("expected_current_snapshot_id"))
                 if payload.get("expected_current_snapshot_id") is not None
@@ -126,6 +128,18 @@ async def control_ptg_source_snapshot_promote(request):
         raise SanicException(str(exc), status_code=409) from exc
     except ValueError as exc:
         raise BadRequest(str(exc)) from exc
+    if _ptg_source_snapshot_refresh_requested(payload):
+        try:
+            refresh_payload = _ptg_source_snapshot_refresh_payload(
+                payload,
+                source_key=source_key,
+                snapshot_id=snapshot_id,
+            )
+            refresh_run, created = await create_import_run(refresh_payload)
+        except ValueError as exc:
+            raise BadRequest(str(exc)) from exc
+        result = dict(result)
+        result["address_refresh"] = {"run": refresh_run, "created": created}
     return response.json(result, default=str)
 
 
@@ -255,6 +269,63 @@ def _ptg_import_file_payload(payload: dict) -> dict:
         "schedule_id": payload.get("schedule_id"),
         "subscription_id": payload.get("subscription_id"),
         "source_file_import_id": payload.get("source_file_import_id") or params.get("source_file_import_id"),
+    }
+
+
+def _request_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _ptg_source_snapshot_refresh_requested(payload: dict) -> bool:
+    refresh = payload.get("address_refresh") if isinstance(payload.get("address_refresh"), dict) else {}
+    return any(
+        _request_bool(value)
+        for value in (
+            payload.get("refresh_addresses"),
+            payload.get("enqueue_address_refresh"),
+            payload.get("run_address_refresh"),
+            refresh.get("enabled"),
+        )
+    )
+
+
+def _ptg_source_snapshot_refresh_payload(payload: dict, *, source_key: str, snapshot_id: str) -> dict:
+    raw_refresh = payload.get("address_refresh")
+    if raw_refresh is not None and not isinstance(raw_refresh, dict):
+        raise ValueError("address_refresh must be an object")
+    refresh = raw_refresh or {}
+    params = dict(refresh.get("params") or {})
+    for key in (
+        "test_mode",
+        "limit_per_source",
+        "publish",
+        "skip_publish",
+        "ptg_refresh_mode",
+        "entity_refresh_mode",
+    ):
+        if key in refresh and key not in params:
+            params[key] = refresh[key]
+        elif key in payload and key not in params:
+            params[key] = payload[key]
+    params["source_key"] = source_key
+    params["snapshot_id"] = snapshot_id
+    params.setdefault("ptg_refresh_mode", "partial")
+    params.setdefault("entity_refresh_mode", "ptg-partial")
+    return {
+        "run_id": refresh.get("run_id") or payload.get("refresh_run_id"),
+        "importer": "ptg-address-entity-refresh",
+        "params": params,
+        "idempotency_key": (
+            refresh.get("idempotency_key")
+            or payload.get("refresh_idempotency_key")
+            or f"ptg-address-entity-refresh:{source_key}:{snapshot_id}"
+        ),
+        "triggered_by": refresh.get("triggered_by") or payload.get("triggered_by") or "ptg_source_snapshot_promote",
+        "schedule_id": refresh.get("schedule_id") or payload.get("schedule_id"),
+        "subscription_id": refresh.get("subscription_id") or payload.get("subscription_id"),
+        "import_id": refresh.get("import_id") or payload.get("refresh_import_id"),
     }
 
 

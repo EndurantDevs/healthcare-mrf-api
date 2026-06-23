@@ -56,6 +56,31 @@ python main.py start ptg-address --refresh-mode partial --source-key <source_key
 python main.py worker process.PTGAddress --burst
 ```
 
+When the source snapshot pointer is promoted through import-control, operators
+can enqueue the chained fast refresh in the same request:
+
+```json
+{
+  "source_key": "<source_key>",
+  "snapshot_id": "<snapshot_id>",
+  "expected_current_snapshot_id": "<previous_snapshot_id>",
+  "refresh_addresses": true,
+  "address_refresh": {
+    "publish": true,
+    "limit_per_source": 1000
+  }
+}
+```
+
+This creates a `ptg-address-entity-refresh` import run with default modes
+`ptg_refresh_mode=partial` and `entity_refresh_mode=ptg-partial`. To run it
+manually instead, enqueue:
+
+```bash
+python main.py start ptg-address-entity-refresh --source-key <source_key> --snapshot-id <snapshot_id> --publish
+python main.py worker process.EntityAddressUnified --burst
+```
+
 `--refresh-mode full` remains the default and rebuilds every current PTG source.
 The partial path stages a full replacement table by copying live `ptg_address`
 rows for unchanged source keys and recomputing only the requested source. It

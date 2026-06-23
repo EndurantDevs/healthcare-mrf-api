@@ -1479,6 +1479,78 @@ async def test_control_ptg_source_snapshot_promote_endpoint(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_control_ptg_source_snapshot_promote_endpoint_can_enqueue_address_refresh(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "secret")
+    promote_calls = []
+    import_calls = []
+
+    async def fake_promote(**kwargs):
+        promote_calls.append(kwargs)
+        return {
+            "source_key": kwargs["source_key"],
+            "snapshot_id": kwargs["snapshot_id"],
+            "previous_snapshot_id": kwargs["expected_current_snapshot_id"],
+            "plan_source_count": 2,
+        }
+
+    async def fake_create_import_run(payload):
+        import_calls.append(payload)
+        return {"run_id": "run_refresh", "importer": payload["importer"], "params": payload["params"]}, True
+
+    monkeypatch.setattr(control, "promote_ptg2_source_snapshot", fake_promote)
+    monkeypatch.setattr(control, "create_import_run", fake_create_import_run)
+    request = authed_request(
+        json={
+            "source_key": "source_a",
+            "snapshot_id": "snap_new",
+            "expected_current_snapshot_id": "snap_old",
+            "refresh_addresses": True,
+            "address_refresh": {
+                "idempotency_key": "idem-refresh",
+                "test_mode": True,
+                "limit_per_source": 25,
+                "publish": True,
+            },
+        }
+    )
+
+    response = await control.control_ptg_source_snapshot_promote(request)
+    payload = json.loads(response.body)
+
+    assert response.status == 200
+    assert payload["snapshot_id"] == "snap_new"
+    assert payload["address_refresh"]["created"] is True
+    assert payload["address_refresh"]["run"]["run_id"] == "run_refresh"
+    assert promote_calls == [
+        {
+            "source_key": "source_a",
+            "snapshot_id": "snap_new",
+            "expected_current_snapshot_id": "snap_old",
+        }
+    ]
+    assert import_calls == [
+        {
+            "run_id": None,
+            "importer": "ptg-address-entity-refresh",
+            "params": {
+                "test_mode": True,
+                "limit_per_source": 25,
+                "publish": True,
+                "source_key": "source_a",
+                "snapshot_id": "snap_new",
+                "ptg_refresh_mode": "partial",
+                "entity_refresh_mode": "ptg-partial",
+            },
+            "idempotency_key": "idem-refresh",
+            "triggered_by": "ptg_source_snapshot_promote",
+            "schedule_id": None,
+            "subscription_id": None,
+            "import_id": None,
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_control_ptg_source_snapshot_promote_endpoint_maps_stale_pointer_to_conflict(monkeypatch):
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "secret")
 

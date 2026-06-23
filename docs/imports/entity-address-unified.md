@@ -19,6 +19,11 @@ python main.py start entity-address-unified --refresh-mode ptg-partial --ptg-sou
 python main.py worker process.EntityAddressUnified --burst
 ```
 
+For source snapshot promotions, prefer the chained `ptg-address-entity-refresh`
+importer or the import-control `refresh_addresses=true` option documented in
+`docs/imports/ptg.md`; it refreshes `ptg_address` first and then runs this
+PTG-partial entity refresh against the same source key.
+
 The partial path reuses the published `entity_address_unified` rows for unchanged
 locations, reloads only the requested PTG source from `ptg_address`, and still
 publishes via the normal stage-table swap. It fails closed and requires
