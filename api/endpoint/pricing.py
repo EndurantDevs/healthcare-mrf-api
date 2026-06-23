@@ -64,6 +64,8 @@ QUALITY_SVI_TABLE_NAME = "pricing_svi_zcta"
 
 
 MAX_LIMIT = 200
+NPI_MIN = 1_000_000_000
+NPI_MAX = 9_999_999_999
 INTERNAL_CODE_SYSTEM = INTERNAL_PROCEDURE_CODE_SYSTEM
 PROCEDURE_OVERRIDE_CODE_SYSTEMS = (INTERNAL_CODE_SYSTEM, "CPT", "HCPCS", "CDT")
 RX_EXTERNAL_CODE_PRIORITY = ("NDC", "RXNORM")
@@ -3990,19 +3992,32 @@ async def group_plan_providers(request):
             f"""
             SELECT DISTINCT npi
               FROM {group_member_table}
-             WHERE npi > :cursor_npi
+             WHERE npi BETWEEN :npi_min AND :npi_max
+               AND npi > :cursor_npi
              ORDER BY npi
              LIMIT :limit
             """
         ),
-        {"cursor_npi": max(cursor_npi, 0), "limit": limit},
+        {
+            "cursor_npi": max(cursor_npi, 0),
+            "limit": limit,
+            "npi_min": NPI_MIN,
+            "npi_max": NPI_MAX,
+        },
     )).fetchall()
     npis = [int(row.npi) for row in rows if row.npi is not None]
 
     total_distinct = None
     if (request.args.get("count") or "").strip().lower() in ("1", "true", "yes"):
         total_distinct = int((await session.execute(
-            text(f"SELECT COUNT(DISTINCT npi) FROM {group_member_table} WHERE npi > 0")
+            text(
+                f"""
+                SELECT COUNT(DISTINCT npi)
+                  FROM {group_member_table}
+                 WHERE npi BETWEEN :npi_min AND :npi_max
+                """
+            ),
+            {"npi_min": NPI_MIN, "npi_max": NPI_MAX},
         )).scalar() or 0)
 
     items: list[dict[str, Any]] = [{"npi": npi} for npi in npis]

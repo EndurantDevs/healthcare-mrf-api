@@ -19,6 +19,7 @@ get_procedure_geo_benchmarks = pricing_module.get_procedure_geo_benchmarks
 get_provider_prescription = pricing_module.get_provider_prescription
 get_prescription_benchmarks = pricing_module.get_prescription_benchmarks
 get_pricing_provider_score = pricing_module.get_pricing_provider_score
+group_plan_providers = pricing_module.group_plan_providers
 autocomplete_prescriptions = pricing_module.autocomplete_prescriptions
 autocomplete_procedures = pricing_module.autocomplete_procedures
 list_pricing_providers = pricing_module.list_pricing_providers
@@ -44,6 +45,9 @@ class FakeResult:
     def first(self):
         return self._rows[0] if self._rows else None
 
+    def fetchall(self):
+        return self._rows
+
     def __iter__(self):
         return iter(self._rows)
 
@@ -51,8 +55,10 @@ class FakeResult:
 class FakeSession:
     def __init__(self, results=None):
         self._results = list(results or [])
+        self.executions = []
 
     async def execute(self, *_args, **_kwargs):
+        self.executions.append((_args, _kwargs))
         if self._results:
             return self._results.pop(0)
         return FakeResult([], 0)
@@ -110,6 +116,42 @@ async def test_list_pricing_providers_tier_relevance_ordering():
     assert payload["items"][0]["npi"] == 1003000126
     assert payload["query"]["order_by"] == "tier_relevance"
     assert payload["query"]["benchmark_mode"] == "national"
+
+
+@pytest.mark.asyncio
+async def test_group_plan_providers_filters_to_ten_digit_npis(monkeypatch):
+    async def fake_current_source_snapshot_id_for_plan(_session, _plan_fields):
+        return "ptg2:test"
+
+    async def fake_snapshot_serving_tables(_session, _snapshot_id):
+        return types.SimpleNamespace(provider_group_member_table="mrf.ptg2_provider_group_member_test")
+
+    monkeypatch.setattr(
+        pricing_module,
+        "current_source_snapshot_id_for_plan",
+        fake_current_source_snapshot_id_for_plan,
+    )
+    monkeypatch.setattr(pricing_module, "snapshot_serving_tables", fake_snapshot_serving_tables)
+    request = make_request(
+        [
+            FakeResult(rows=[types.SimpleNamespace(npi=1000000000), types.SimpleNamespace(npi=1234567890)]),
+            FakeResult(scalar=2),
+        ],
+        args={"plan_id": "465722012", "market_type": "group", "count": "true", "limit": "100"},
+    )
+
+    response = await group_plan_providers(request)
+    payload = json.loads(response.body)
+
+    assert [item["npi"] for item in payload["providers"]["items"]] == [1000000000, 1234567890]
+    assert payload["providers"]["total_distinct"] == 2
+    first_params = request.ctx.sa_session.executions[0][0][1]
+    count_params = request.ctx.sa_session.executions[1][0][1]
+    assert first_params["npi_min"] == 1000000000
+    assert first_params["npi_max"] == 9999999999
+    assert count_params["npi_min"] == 1000000000
+    assert count_params["npi_max"] == 9999999999
+    assert "npi BETWEEN :npi_min AND :npi_max" in str(request.ctx.sa_session.executions[0][0][0])
 
 
 @pytest.mark.asyncio
