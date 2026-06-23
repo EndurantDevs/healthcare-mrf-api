@@ -24,6 +24,7 @@ def test_promote_ptg2_source_snapshot_repoints_source_and_plan_pointers(monkeypa
             return False
 
     async def fake_source_plan_rows(**kwargs):
+        assert kwargs["updated_at"].tzinfo is None
         return [
             {
                 "plan_source_key": "ps_1",

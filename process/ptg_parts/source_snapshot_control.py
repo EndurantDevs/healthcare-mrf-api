@@ -75,7 +75,7 @@ async def promote_ptg2_source_snapshot(
     if expected_current_snapshot_id is not None and str(expected_current_snapshot_id or "") != str(previous_snapshot_id or ""):
         raise SourceSnapshotConflict("current source snapshot changed")
     import_month = _date_value(snapshot.get("import_month"))
-    updated_at = datetime.datetime.now(datetime.timezone.utc)
+    updated_at = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
     plan_rows = await _source_plan_rows(
         snapshot_id=snapshot_id,
         source_key=source_key,
