@@ -1814,6 +1814,36 @@ def test_entity_address_unified_builds_evidence_and_bridge_stage_sql():
     assert "'HP_RX_CODE'::varchar AS code_system" in sql_blob
 
 
+def test_entity_address_unified_partial_ptg_support_stage_reuses_live_bridge_rows():
+    stage_classes = entity_address_unified._support_stage_classes("20260614")
+    sql_blob = "\n".join(
+        entity_address_unified._support_stage_sql(
+            "mrf",
+            "entity_address_unified_stage",
+            stage_classes,
+            source_run_id="run_1",
+            node_id="node_a",
+            build_network_bridge=True,
+            affected_group_table="entity_address_unified_stage_ptg_groups",
+        )
+    )
+
+    assert "INSERT INTO mrf.entity_address_procedure_bridge_20260614 (location_key, npi, code_system, code)" in sql_blob
+    assert "FROM mrf.entity_address_procedure_bridge AS b" in sql_blob
+    assert "FROM mrf.entity_address_medication_bridge AS b" in sql_blob
+    assert "FROM mrf.entity_address_ptg_bridge AS b" in sql_blob
+    assert "FROM mrf.entity_address_plan_bridge AS b" in sql_blob
+    assert "FROM mrf.entity_address_network_bridge AS b" in sql_blob
+    assert "JOIN mrf.entity_address_unified AS live" in sql_blob
+    assert "FROM mrf.entity_address_unified_stage_ptg_groups AS affected" in sql_blob
+    assert "affected.entity_type = live.entity_type" in sql_blob
+    assert "affected.address_key = live.address_key" in sql_blob
+    assert "affected.entity_type = t.entity_type" in sql_blob
+    assert "affected.address_key = t.address_key" in sql_blob
+    assert "unnest(COALESCE(t.medications_array, ARRAY[]::int[]))" in sql_blob
+    assert "unnest(COALESCE(t.procedures_array, ARRAY[]::int[]))" in sql_blob
+
+
 def test_entity_address_unified_builds_facility_anchor_npi_candidate_stage_sql(monkeypatch):
     monkeypatch.setenv("HLTHPRT_FACILITY_ANCHOR_NPI_CANDIDATE_INCLUDE_NPPES", "true")
     stage_classes = entity_address_unified._support_stage_classes("20260614")

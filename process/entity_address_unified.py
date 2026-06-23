@@ -711,6 +711,21 @@ async def _table_column_exists(db_schema: str, table_name: str, column_name: str
     )
 
 
+async def _support_bridge_reuse_available(db_schema: str, *, build_network_bridge: bool) -> bool:
+    bridge_models: list[type] = [
+        EntityAddressPlanBridge,
+        EntityAddressPTGBridge,
+        EntityAddressProcedureBridge,
+        EntityAddressMedicationBridge,
+    ]
+    if build_network_bridge:
+        bridge_models.append(EntityAddressNetworkBridge)
+    for model in bridge_models:
+        if not await _table_exists(db_schema, model.__main_table__):
+            return False
+    return True
+
+
 def _promote_approved_facility_anchor_npi_candidates_sql(db_schema: str) -> str:
     return f"""
     INSERT INTO {db_schema}.facility_anchor_npi_override (
@@ -3355,6 +3370,41 @@ def _truncate_support_stage_sql(db_schema: str, stage_tables: dict[type, str]) -
     return f"TRUNCATE TABLE {table_names};"
 
 
+def _affected_stage_row_filter_sql(db_schema: str, affected_group_table: str | None, row_alias: str = "t") -> str:
+    if not affected_group_table:
+        return ""
+    return f"""
+       AND EXISTS (
+            SELECT 1
+              FROM {db_schema}.{affected_group_table} AS affected
+             WHERE {_entity_address_evidence_group_match_sql("affected", row_alias)}
+       )
+    """
+
+
+def _copy_unaffected_bridge_rows_sql(
+    db_schema: str,
+    live_bridge_table: str,
+    stage_bridge_table: str,
+    columns: Iterable[str],
+    affected_group_table: str,
+) -> str:
+    column_list = ", ".join(columns)
+    selected_columns = ", ".join(f"b.{column}" for column in columns)
+    return f"""
+    INSERT INTO {db_schema}.{stage_bridge_table} ({column_list})
+    SELECT {selected_columns}
+      FROM {db_schema}.{live_bridge_table} AS b
+      JOIN {db_schema}.{EntityAddressUnified.__main_table__} AS live
+        ON live.location_key = b.location_key
+     WHERE NOT EXISTS (
+           SELECT 1
+             FROM {db_schema}.{affected_group_table} AS affected
+            WHERE {_entity_address_evidence_group_match_sql("affected", "live")}
+     );
+    """
+
+
 def _evidence_from_raw_sql(
     db_schema: str,
     evidence_stage_table: str,
@@ -3496,7 +3546,14 @@ def _evidence_from_stage_sql(
     """
 
 
-def _plan_bridge_sql(db_schema: str, plan_stage_table: str, stage_table: str) -> str:
+def _plan_bridge_sql(
+    db_schema: str,
+    plan_stage_table: str,
+    stage_table: str,
+    *,
+    affected_group_table: str | None = None,
+) -> str:
+    affected_filter = _affected_stage_row_filter_sql(db_schema, affected_group_table)
     return f"""
     INSERT INTO {db_schema}.{plan_stage_table} (location_key, entity_type, entity_id, plan_id, market_type)
     SELECT DISTINCT
@@ -3508,11 +3565,19 @@ def _plan_bridge_sql(db_schema: str, plan_stage_table: str, stage_table: str) ->
       FROM {db_schema}.{stage_table} AS t
       JOIN LATERAL unnest(COALESCE(t.aca_plan_array, ARRAY[]::varchar[])) AS plan_id(value) ON TRUE
      WHERE t.location_key IS NOT NULL
+       {affected_filter}
        AND NULLIF(plan_id.value, '') IS NOT NULL;
     """
 
 
-def _network_bridge_sql(db_schema: str, network_stage_table: str, stage_table: str) -> str:
+def _network_bridge_sql(
+    db_schema: str,
+    network_stage_table: str,
+    stage_table: str,
+    *,
+    affected_group_table: str | None = None,
+) -> str:
+    affected_filter = _affected_stage_row_filter_sql(db_schema, affected_group_table)
     return f"""
     INSERT INTO {db_schema}.{network_stage_table} (location_key, entity_type, entity_id, network_id)
     SELECT DISTINCT location_key, entity_type, entity_id, network_id
@@ -3525,6 +3590,7 @@ def _network_bridge_sql(db_schema: str, network_stage_table: str, stage_table: s
           FROM {db_schema}.{stage_table} AS t
           JOIN LATERAL unnest(COALESCE(t.plans_network_array, ARRAY[]::int[])) AS legacy_network(value) ON TRUE
          WHERE t.location_key IS NOT NULL
+           {affected_filter}
            AND legacy_network.value <> 0
         UNION ALL
         SELECT
@@ -3535,12 +3601,20 @@ def _network_bridge_sql(db_schema: str, network_stage_table: str, stage_table: s
           FROM {db_schema}.{stage_table} AS t
           JOIN LATERAL unnest(COALESCE(t.aca_network_array, ARRAY[]::varchar[])) AS aca_network(value) ON TRUE
          WHERE t.location_key IS NOT NULL
+           {affected_filter}
            AND NULLIF(aca_network.value, '') IS NOT NULL
       ) AS bridge_rows;
     """
 
 
-def _ptg_bridge_sql(db_schema: str, ptg_stage_table: str, stage_table: str) -> str:
+def _ptg_bridge_sql(
+    db_schema: str,
+    ptg_stage_table: str,
+    stage_table: str,
+    *,
+    affected_group_table: str | None = None,
+) -> str:
+    affected_filter = _affected_stage_row_filter_sql(db_schema, affected_group_table)
     return f"""
     INSERT INTO {db_schema}.{ptg_stage_table} (
         location_key,
@@ -3562,6 +3636,7 @@ def _ptg_bridge_sql(db_schema: str, ptg_stage_table: str, stage_table: str) -> s
           JOIN LATERAL unnest(COALESCE(t.source_record_ids, ARRAY[]::varchar[])) AS record_id(value) ON TRUE
           JOIN LATERAL unnest(COALESCE(t.ptg_plan_array, ARRAY[]::varchar[])) AS plan_id(value) ON TRUE
          WHERE t.location_key IS NOT NULL
+           {affected_filter}
            AND record_id.value LIKE 'ptg:%'
            AND NULLIF(plan_id.value, '') IS NOT NULL
            AND NULLIF(split_part(record_id.value, ':', 2), '') IS NOT NULL
@@ -3579,6 +3654,7 @@ def _ptg_bridge_sql(db_schema: str, ptg_stage_table: str, stage_table: str) -> s
           JOIN LATERAL unnest(COALESCE(t.ptg_source_array, ARRAY[]::varchar[])) AS source_key(value) ON TRUE
           JOIN LATERAL unnest(COALESCE(t.ptg_plan_array, ARRAY[]::varchar[])) AS plan_id(value) ON TRUE
          WHERE t.location_key IS NOT NULL
+           {affected_filter}
            AND NULLIF(source_key.value, '') IS NOT NULL
            AND NULLIF(plan_id.value, '') IS NOT NULL
            AND NULLIF(regexp_replace(COALESCE(t.ptg_address_version, ''), '^ptg:', ''), '') IS NOT NULL
@@ -3610,7 +3686,14 @@ def _ptg_bridge_sql(db_schema: str, ptg_stage_table: str, stage_table: str) -> s
     """
 
 
-def _procedure_bridge_sql(db_schema: str, procedure_stage_table: str, stage_table: str) -> str:
+def _procedure_bridge_sql(
+    db_schema: str,
+    procedure_stage_table: str,
+    stage_table: str,
+    *,
+    affected_group_table: str | None = None,
+) -> str:
+    affected_filter = _affected_stage_row_filter_sql(db_schema, affected_group_table)
     return f"""
     INSERT INTO {db_schema}.{procedure_stage_table} (location_key, npi, code_system, code)
     SELECT DISTINCT
@@ -3622,11 +3705,19 @@ def _procedure_bridge_sql(db_schema: str, procedure_stage_table: str, stage_tabl
       JOIN LATERAL unnest(COALESCE(t.procedures_array, ARRAY[]::int[])) AS procedure_code(value) ON TRUE
      WHERE t.location_key IS NOT NULL
        AND t.npi IS NOT NULL
+       {affected_filter}
        AND procedure_code.value <> 0;
     """
 
 
-def _medication_bridge_sql(db_schema: str, medication_stage_table: str, stage_table: str) -> str:
+def _medication_bridge_sql(
+    db_schema: str,
+    medication_stage_table: str,
+    stage_table: str,
+    *,
+    affected_group_table: str | None = None,
+) -> str:
+    affected_filter = _affected_stage_row_filter_sql(db_schema, affected_group_table)
     return f"""
     INSERT INTO {db_schema}.{medication_stage_table} (location_key, npi, code_system, code)
     SELECT DISTINCT
@@ -3638,6 +3729,7 @@ def _medication_bridge_sql(db_schema: str, medication_stage_table: str, stage_ta
       JOIN LATERAL unnest(COALESCE(t.medications_array, ARRAY[]::int[])) AS medication_code(value) ON TRUE
      WHERE t.location_key IS NOT NULL
        AND t.npi IS NOT NULL
+       {affected_filter}
        AND medication_code.value <> 0;
     """
 
@@ -4567,9 +4659,11 @@ def _support_stage_statements(
     raw_table: str | None = None,
     build_network_bridge: bool = True,
     available: dict[str, bool] | None = None,
+    affected_group_table: str | None = None,
 ) -> list[_SupportStageStatement]:
     available = available or {}
     stage_tables = {model: stage_cls.__tablename__ for model, stage_cls in stage_classes.items()}
+    partial_bridge_reuse = bool(affected_group_table)
     evidence_sql = (
         _evidence_from_raw_sql(
             db_schema,
@@ -4594,21 +4688,31 @@ def _support_stage_statements(
             parallel=False,
         ),
         _SupportStageStatement("evidence", evidence_sql),
-        _SupportStageStatement(
+    ]
+    bridge_specs = [
+        (
+            EntityAddressPlanBridge,
             "plan bridge",
-            _plan_bridge_sql(db_schema, stage_tables[EntityAddressPlanBridge], stage_table),
+            ("location_key", "entity_type", "entity_id", "plan_id", "market_type"),
+            _plan_bridge_sql,
         ),
-        _SupportStageStatement(
+        (
+            EntityAddressPTGBridge,
             "ptg bridge",
-            _ptg_bridge_sql(db_schema, stage_tables[EntityAddressPTGBridge], stage_table),
+            ("location_key", "entity_type", "entity_id", "source_key", "snapshot_id", "ptg_plan_id"),
+            _ptg_bridge_sql,
         ),
-        _SupportStageStatement(
+        (
+            EntityAddressProcedureBridge,
             "procedure bridge",
-            _procedure_bridge_sql(db_schema, stage_tables[EntityAddressProcedureBridge], stage_table),
+            ("location_key", "npi", "code_system", "code"),
+            _procedure_bridge_sql,
         ),
-        _SupportStageStatement(
+        (
+            EntityAddressMedicationBridge,
             "medication bridge",
-            _medication_bridge_sql(db_schema, stage_tables[EntityAddressMedicationBridge], stage_table),
+            ("location_key", "npi", "code_system", "code"),
+            _medication_bridge_sql,
         ),
     ]
     if (
@@ -4659,12 +4763,39 @@ def _support_stage_statements(
             ),
         )
     if build_network_bridge:
-        statements.insert(
-            3,
-            _SupportStageStatement(
+        bridge_specs.insert(
+            1,
+            (
+                EntityAddressNetworkBridge,
                 "network bridge",
-                _network_bridge_sql(db_schema, stage_tables[EntityAddressNetworkBridge], stage_table),
+                ("location_key", "entity_type", "entity_id", "network_id"),
+                _network_bridge_sql,
             ),
+        )
+    for model, label, columns, builder in bridge_specs:
+        if partial_bridge_reuse:
+            statements.append(
+                _SupportStageStatement(
+                    f"reusing {label}",
+                    _copy_unaffected_bridge_rows_sql(
+                        db_schema,
+                        model.__main_table__,
+                        stage_tables[model],
+                        columns,
+                        affected_group_table,
+                    ),
+                )
+            )
+        statements.append(
+            _SupportStageStatement(
+                label,
+                builder(
+                    db_schema,
+                    stage_tables[model],
+                    stage_table,
+                    affected_group_table=affected_group_table if partial_bridge_reuse else None,
+                ),
+            )
         )
     return statements
 
@@ -4679,6 +4810,7 @@ def _support_stage_sql(
     raw_table: str | None = None,
     build_network_bridge: bool = True,
     available: dict[str, bool] | None = None,
+    affected_group_table: str | None = None,
 ) -> list[str]:
     return [
         item.statement
@@ -4691,6 +4823,7 @@ def _support_stage_sql(
             raw_table=raw_table,
             build_network_bridge=build_network_bridge,
             available=available,
+            affected_group_table=affected_group_table,
         )
     ]
 
@@ -4707,6 +4840,7 @@ async def _populate_support_stage_tables(
     available: dict[str, bool] | None = None,
     run_id: str | None = None,
     context: dict | None = None,
+    affected_group_table: str | None = None,
 ) -> dict[str, int]:
     phase_context = context if context is not None else {}
     statements = _support_stage_statements(
@@ -4718,6 +4852,7 @@ async def _populate_support_stage_tables(
         raw_table=raw_table,
         build_network_bridge=build_network_bridge,
         available=available,
+        affected_group_table=affected_group_table,
     )
     support_concurrency = min(
         _env_int(
@@ -7671,6 +7806,15 @@ async def process_data(ctx, task=None):
         support_counts = {str(key): int(value) for key, value in cached_support_counts.items()}
     else:
         support_raw_table = None if partial_ptg_refresh else raw_table
+        support_affected_group_table = None
+        if partial_ptg_refresh and affected_group_table:
+            support_reuse_available = await _support_bridge_reuse_available(
+                db_schema,
+                build_network_bridge=build_network_bridge,
+            )
+            context["partial_ptg_support_bridge_reuse"] = support_reuse_available
+            if support_reuse_available:
+                support_affected_group_table = affected_group_table
         support_counts = await _populate_support_stage_tables(
             db_schema,
             stage_table,
@@ -7682,6 +7826,7 @@ async def process_data(ctx, task=None):
             available=available,
             run_id=run_id,
             context=context,
+            affected_group_table=support_affected_group_table,
         )
         context["support_stage_populated"] = True
         context["support_counts"] = support_counts
