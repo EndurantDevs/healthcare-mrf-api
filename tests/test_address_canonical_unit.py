@@ -1844,6 +1844,54 @@ def test_entity_address_unified_partial_ptg_support_stage_reuses_live_bridge_row
     assert "unnest(COALESCE(t.procedures_array, ARRAY[]::int[]))" in sql_blob
 
 
+def test_entity_address_unified_partial_ptg_support_patch_stages_only_affected_rows():
+    stage_classes = entity_address_unified._support_stage_classes("20260614")
+    sql_blob = "\n".join(
+        entity_address_unified._support_stage_sql(
+            "mrf",
+            "entity_address_unified_stage",
+            stage_classes,
+            source_run_id="run_1",
+            node_id="node_a",
+            build_network_bridge=True,
+            available={"facility_anchor": True, "facility_anchor.medicare_ccn": True},
+            affected_group_table="entity_address_unified_stage_ptg_groups",
+            copy_unaffected_bridges=False,
+        )
+    )
+
+    assert "FROM mrf.entity_address_procedure_bridge AS b" not in sql_blob
+    assert "FROM mrf.entity_address_medication_bridge AS b" not in sql_blob
+    assert "FROM mrf.entity_address_unified_stage_ptg_groups AS affected" in sql_blob
+    assert "affected.entity_type = t.entity_type" in sql_blob
+    assert "affected.address_key = t.address_key" in sql_blob
+    assert "INSERT INTO mrf.entity_address_evidence_20260614" in sql_blob
+    assert "FROM mrf.entity_address_unified_stage AS t" in sql_blob
+    assert "INSERT INTO mrf.facility_anchor_npi_candidate_20260614" not in sql_blob
+
+
+def test_entity_address_unified_partial_support_patch_sql_offsets_evidence_ids():
+    stage_classes = entity_address_unified._support_stage_classes("20260614")
+    statements = entity_address_unified._partial_support_patch_sql(  # pylint: disable=protected-access
+        "mrf",
+        stage_classes,
+        old_entity_table="entity_address_unified_old",
+        affected_group_table="entity_address_unified_stage_ptg_groups",
+        build_network_bridge=True,
+    )
+    sql_blob = "\n".join(statement for _, statement in statements)
+
+    assert "DELETE FROM mrf.entity_address_evidence AS support" in sql_blob
+    assert "DELETE FROM mrf.entity_address_procedure_bridge AS support" in sql_blob
+    assert "USING mrf.entity_address_unified_old AS live" in sql_blob
+    assert "FROM mrf.entity_address_unified_stage_ptg_groups AS affected" in sql_blob
+    assert "INSERT INTO mrf.entity_address_evidence (evidence_id" in sql_blob
+    assert "SELECT COALESCE(MAX(evidence_id), 0) FROM mrf.entity_address_evidence" in sql_blob
+    assert "ROW_NUMBER() OVER ())::bigint AS evidence_id" in sql_blob
+    assert "INSERT INTO mrf.entity_address_ptg_bridge" in sql_blob
+    assert "FROM mrf.entity_address_ptg_bridge_20260614 AS stage" in sql_blob
+
+
 def test_entity_address_unified_builds_facility_anchor_npi_candidate_stage_sql(monkeypatch):
     monkeypatch.setenv("HLTHPRT_FACILITY_ANCHOR_NPI_CANDIDATE_INCLUDE_NPPES", "true")
     stage_classes = entity_address_unified._support_stage_classes("20260614")
@@ -2848,6 +2896,93 @@ async def test_entity_address_unified_publish_integrity_fails_on_redirects_and_o
             stage_classes,
             test_mode=False,
         )
+
+
+@pytest.mark.asyncio
+async def test_entity_address_unified_shutdown_patch_publishes_partial_support(monkeypatch):
+    statements = []
+    marked_runs = []
+
+    class FakeTransaction:
+        async def __aenter__(self):
+            statements.append("BEGIN")
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            statements.append("ROLLBACK" if exc else "COMMIT")
+            return False
+
+    class FakeDB:
+        async def scalar(self, statement, **_kwargs):
+            statements.append(statement)
+            normalized = " ".join(statement.split())
+            if normalized == "SELECT COUNT(*) FROM mrf.entity_address_unified_20260614;":
+                return 1000
+            if normalized == "SELECT COUNT(*) FROM mrf.entity_address_unified;":
+                return 1000
+            if "to_regclass(" in statement:
+                return True
+            return 0
+
+        async def all(self, statement, **_kwargs):
+            statements.append(statement)
+            return []
+
+        async def status(self, statement):
+            statements.append(statement)
+            if "DELETE FROM mrf.entity_address_ptg_bridge AS support" in statement:
+                return 2
+            if "INSERT INTO mrf.entity_address_ptg_bridge" in statement:
+                return 3
+            return 0
+
+        def transaction(self):
+            return FakeTransaction()
+
+    async def fake_table_exists(_schema, _table):
+        return True
+
+    async def fake_mark_control_run(*_args, **kwargs):
+        marked_runs.append(kwargs)
+
+    monkeypatch.setattr(entity_address_unified, "db", FakeDB())
+    monkeypatch.setattr(entity_address_unified, "ensure_database", AsyncMock())
+    monkeypatch.setattr(entity_address_unified, "_table_exists", fake_table_exists)
+    monkeypatch.setattr(entity_address_unified, "mark_control_run", fake_mark_control_run)
+    monkeypatch.setattr(entity_address_unified, "print_time_info", lambda *_args, **_kwargs: None)
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_MIN_ROWS", "1")
+
+    await entity_address_unified.shutdown(
+        {
+            "import_date": "20260614",
+            "context": {
+                "run": 1,
+                "test_mode": False,
+                "publish_requested": True,
+                "partial_ptg_support_patch_publish": True,
+                "partial_ptg_affected_group_table": "entity_address_unified_20260614_ptg_groups",
+                "build_network_bridge": True,
+                "support_counts": {},
+            },
+        }
+    )
+
+    joined = "\n".join(statements)
+    assert "ALTER TABLE IF EXISTS mrf.entity_address_unified_20260614 RENAME TO entity_address_unified;" in joined
+    assert "DELETE FROM mrf.entity_address_ptg_bridge AS support" in joined
+    assert "USING mrf.entity_address_unified_old AS live" in joined
+    assert "INSERT INTO mrf.entity_address_evidence (evidence_id" in joined
+    assert "SELECT COALESCE(MAX(evidence_id), 0) FROM mrf.entity_address_evidence" in joined
+    assert "ALTER TABLE IF EXISTS mrf.entity_address_ptg_bridge_20260614 RENAME TO entity_address_ptg_bridge" not in joined
+    assert "DROP TABLE IF EXISTS mrf.entity_address_unified_20260614_ptg_groups;" in joined
+    assert statements[-1] == "DROP TABLE IF EXISTS mrf.entity_address_unified_20260614_ptg_groups;"
+    assert marked_runs
+    assert (
+        marked_runs[-1]["metrics"]["phase_timings"][
+            "entity-address-unified patching support insert affected ptg_bridge"
+        ]["rows"]
+        == 3
+    )
 
 
 @pytest.mark.asyncio

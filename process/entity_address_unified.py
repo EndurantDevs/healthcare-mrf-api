@@ -58,6 +58,7 @@ DEFAULT_SQL_LOCK_TIMEOUT = "30s"
 DEFAULT_SQL_STATEMENT_TIMEOUT = "0"
 DEFAULT_SQL_SYNCHRONOUS_COMMIT = "off"
 DEFAULT_SQL_JIT = "off"
+DEFAULT_PTG_PARTIAL_PATCH_SUPPORT = True
 ENTITY_ADDRESS_REFRESH_MODE_FULL = "full"
 ENTITY_ADDRESS_REFRESH_MODE_PTG_PARTIAL = "ptg-partial"
 ENTITY_ADDRESS_REFRESH_MODES = {ENTITY_ADDRESS_REFRESH_MODE_FULL, ENTITY_ADDRESS_REFRESH_MODE_PTG_PARTIAL}
@@ -682,10 +683,19 @@ async def _swap_stage_table(db_schema: str, live_cls, stage_cls) -> None:
         )
 
 
-async def _drop_stage_artifacts(db_schema: str, stage_cls, support_stage_classes: dict[type, type]) -> None:
+async def _drop_stage_artifacts(
+    db_schema: str,
+    stage_cls,
+    support_stage_classes: dict[type, type],
+    *,
+    extra_tables: Iterable[str] = (),
+) -> None:
     await db.status(f"DROP TABLE IF EXISTS {db_schema}.{stage_cls.__tablename__};")
     for stage_model in support_stage_classes.values():
         await db.status(f"DROP TABLE IF EXISTS {db_schema}.{stage_model.__tablename__};")
+    for table_name in extra_tables:
+        if table_name:
+            await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table_name};")
 
 
 async def _table_exists(db_schema: str, table_name: str) -> bool:
@@ -3405,6 +3415,105 @@ def _copy_unaffected_bridge_rows_sql(
     """
 
 
+def _support_patch_models(*, build_network_bridge: bool) -> list[type]:
+    models: list[type] = [
+        EntityAddressEvidence,
+        EntityAddressPlanBridge,
+        EntityAddressPTGBridge,
+        EntityAddressProcedureBridge,
+        EntityAddressMedicationBridge,
+    ]
+    if build_network_bridge:
+        models.insert(2, EntityAddressNetworkBridge)
+    return models
+
+
+def _model_column_names(model: type) -> list[str]:
+    return [column.name for column in model.__table__.columns]
+
+
+def _delete_live_support_for_affected_groups_sql(
+    db_schema: str,
+    live_support_table: str,
+    old_entity_table: str,
+    affected_group_table: str,
+) -> str:
+    return f"""
+    DELETE FROM {db_schema}.{live_support_table} AS support
+     USING {db_schema}.{old_entity_table} AS live
+     WHERE support.location_key = live.location_key
+       AND EXISTS (
+            SELECT 1
+              FROM {db_schema}.{affected_group_table} AS affected
+             WHERE {_entity_address_evidence_group_match_sql("affected", "live")}
+       );
+    """
+
+
+def _insert_stage_support_into_live_sql(
+    db_schema: str,
+    model: type,
+    live_support_table: str,
+    stage_support_table: str,
+) -> str:
+    columns = _model_column_names(model)
+    column_list = ", ".join(columns)
+    if model is EntityAddressEvidence:
+        select_list = ", ".join(
+            (
+                "((SELECT COALESCE(MAX(evidence_id), 0) FROM "
+                f"{db_schema}.{live_support_table}) + ROW_NUMBER() OVER ())::bigint AS evidence_id"
+            )
+            if column == "evidence_id"
+            else f"stage.{column}"
+            for column in columns
+        )
+    else:
+        select_list = ", ".join(f"stage.{column}" for column in columns)
+    return f"""
+    INSERT INTO {db_schema}.{live_support_table} ({column_list})
+    SELECT {select_list}
+      FROM {db_schema}.{stage_support_table} AS stage;
+    """
+
+
+def _partial_support_patch_sql(
+    db_schema: str,
+    stage_classes: dict[type, type],
+    *,
+    old_entity_table: str,
+    affected_group_table: str,
+    build_network_bridge: bool,
+) -> list[tuple[str, str]]:
+    statements: list[tuple[str, str]] = []
+    for model in _support_patch_models(build_network_bridge=build_network_bridge):
+        stage_cls = stage_classes[model]
+        label = model.__main_table__.replace("entity_address_", "")
+        statements.append(
+            (
+                f"delete affected {label}",
+                _delete_live_support_for_affected_groups_sql(
+                    db_schema,
+                    model.__main_table__,
+                    old_entity_table,
+                    affected_group_table,
+                ),
+            )
+        )
+        statements.append(
+            (
+                f"insert affected {label}",
+                _insert_stage_support_into_live_sql(
+                    db_schema,
+                    model,
+                    model.__main_table__,
+                    stage_cls.__tablename__,
+                ),
+            )
+        )
+    return statements
+
+
 def _evidence_from_raw_sql(
     db_schema: str,
     evidence_stage_table: str,
@@ -3484,7 +3593,9 @@ def _evidence_from_stage_sql(
     *,
     source_run_id: str,
     node_id: str | None,
+    affected_group_table: str | None = None,
 ) -> str:
+    affected_filter = _affected_stage_row_filter_sql(db_schema, affected_group_table)
     return f"""
     INSERT INTO {db_schema}.{evidence_stage_table} (
         evidence_id,
@@ -3542,7 +3653,8 @@ def _evidence_from_stage_sql(
         t.last_seen_at::timestamptz AS last_seen_at,
         NULL::timestamptz AS retired_at
       FROM {db_schema}.{stage_table} AS t
-     WHERE t.location_key IS NOT NULL;
+     WHERE t.location_key IS NOT NULL
+       {affected_filter};
     """
 
 
@@ -4660,10 +4772,12 @@ def _support_stage_statements(
     build_network_bridge: bool = True,
     available: dict[str, bool] | None = None,
     affected_group_table: str | None = None,
+    copy_unaffected_bridges: bool = True,
 ) -> list[_SupportStageStatement]:
     available = available or {}
     stage_tables = {model: stage_cls.__tablename__ for model, stage_cls in stage_classes.items()}
     partial_bridge_reuse = bool(affected_group_table)
+    partial_support_patch = partial_bridge_reuse and not copy_unaffected_bridges
     evidence_sql = (
         _evidence_from_raw_sql(
             db_schema,
@@ -4679,6 +4793,7 @@ def _support_stage_statements(
             stage_table,
             source_run_id=source_run_id,
             node_id=node_id,
+            affected_group_table=affected_group_table if partial_support_patch else None,
         )
     )
     statements = [
@@ -4716,7 +4831,8 @@ def _support_stage_statements(
         ),
     ]
     if (
-        FacilityAnchorNPICandidate in stage_tables
+        not partial_support_patch
+        and FacilityAnchorNPICandidate in stage_tables
         and available.get("facility_anchor", False)
         and available.get("facility_anchor.medicare_ccn", available.get("facility_anchor", False))
     ):
@@ -4773,7 +4889,7 @@ def _support_stage_statements(
             ),
         )
     for model, label, columns, builder in bridge_specs:
-        if partial_bridge_reuse:
+        if partial_bridge_reuse and copy_unaffected_bridges:
             statements.append(
                 _SupportStageStatement(
                     f"reusing {label}",
@@ -4811,6 +4927,7 @@ def _support_stage_sql(
     build_network_bridge: bool = True,
     available: dict[str, bool] | None = None,
     affected_group_table: str | None = None,
+    copy_unaffected_bridges: bool = True,
 ) -> list[str]:
     return [
         item.statement
@@ -4824,6 +4941,7 @@ def _support_stage_sql(
             build_network_bridge=build_network_bridge,
             available=available,
             affected_group_table=affected_group_table,
+            copy_unaffected_bridges=copy_unaffected_bridges,
         )
     ]
 
@@ -4841,6 +4959,7 @@ async def _populate_support_stage_tables(
     run_id: str | None = None,
     context: dict | None = None,
     affected_group_table: str | None = None,
+    copy_unaffected_bridges: bool = True,
 ) -> dict[str, int]:
     phase_context = context if context is not None else {}
     statements = _support_stage_statements(
@@ -4853,6 +4972,7 @@ async def _populate_support_stage_tables(
         build_network_bridge=build_network_bridge,
         available=available,
         affected_group_table=affected_group_table,
+        copy_unaffected_bridges=copy_unaffected_bridges,
     )
     support_concurrency = min(
         _env_int(
@@ -6973,6 +7093,7 @@ async def process_data(ctx, task=None):
                 "entity_address_unified table does not exist; run refresh_mode=full first."
             )
         affected_group_table = _ptg_partial_affected_group_table_name(stage_table)
+        context["partial_ptg_affected_group_table"] = affected_group_table
         await db.status(f"DROP TABLE IF EXISTS {db_schema}.{affected_group_table};")
         await _run_sql_phase(
             _prepare_ptg_partial_affected_groups_sql(
@@ -7801,12 +7922,14 @@ async def process_data(ctx, task=None):
         "HLTHPRT_ENTITY_ADDRESS_UNIFIED_BUILD_NETWORK_BRIDGE",
         DEFAULT_BUILD_NETWORK_BRIDGE,
     )
+    context["build_network_bridge"] = build_network_bridge
     cached_support_counts = context.get("support_counts")
     if context.get("support_stage_populated") and isinstance(cached_support_counts, dict):
         support_counts = {str(key): int(value) for key, value in cached_support_counts.items()}
     else:
         support_raw_table = None if partial_ptg_refresh else raw_table
         support_affected_group_table = None
+        copy_unaffected_support_bridges = True
         if partial_ptg_refresh and affected_group_table:
             support_reuse_available = await _support_bridge_reuse_available(
                 db_schema,
@@ -7815,6 +7938,14 @@ async def process_data(ctx, task=None):
             context["partial_ptg_support_bridge_reuse"] = support_reuse_available
             if support_reuse_available:
                 support_affected_group_table = affected_group_table
+                patch_support = _env_bool(
+                    "HLTHPRT_ENTITY_ADDRESS_UNIFIED_PTG_PARTIAL_PATCH_SUPPORT",
+                    DEFAULT_PTG_PARTIAL_PATCH_SUPPORT,
+                )
+                context["partial_ptg_support_patch_publish"] = patch_support
+                copy_unaffected_support_bridges = not patch_support
+            else:
+                context["partial_ptg_support_patch_publish"] = False
         support_counts = await _populate_support_stage_tables(
             db_schema,
             stage_table,
@@ -7827,12 +7958,13 @@ async def process_data(ctx, task=None):
             run_id=run_id,
             context=context,
             affected_group_table=support_affected_group_table,
+            copy_unaffected_bridges=copy_unaffected_support_bridges,
         )
         context["support_stage_populated"] = True
         context["support_counts"] = support_counts
     if raw_table:
         await db.status(f"DROP TABLE IF EXISTS {db_schema}.{raw_table};")
-    if affected_group_table:
+    if affected_group_table and not context.get("partial_ptg_support_patch_publish"):
         await db.status(f"DROP TABLE IF EXISTS {db_schema}.{affected_group_table};")
 
     if (
@@ -7890,7 +8022,10 @@ async def process_data(ctx, task=None):
         await _create_stage_indexes(stage_cls, db_schema, context=context)
         context["stage_indexes_prepared"] = True
 
-    if not ctx["context"].get("support_stage_indexes_prepared"):
+    if (
+        not ctx["context"].get("support_stage_indexes_prepared")
+        and not context.get("partial_ptg_support_patch_publish")
+    ):
         await _create_support_stage_indexes(
             support_stage_classes,
             db_schema,
@@ -7976,6 +8111,8 @@ async def shutdown(ctx):
     db_schema = os.getenv("HLTHPRT_DB_SCHEMA") if os.getenv("HLTHPRT_DB_SCHEMA") else "mrf"
     stage_cls = make_class(EntityAddressUnified, import_date)
     support_stage_classes = _support_stage_classes(import_date)
+    affected_group_table = str(context.get("partial_ptg_affected_group_table") or "").strip()
+    partial_support_patch = bool(context.get("partial_ptg_support_patch_publish"))
 
     stage_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{stage_cls.__tablename__};") or 0)
     min_rows_required = int(
@@ -8005,7 +8142,12 @@ async def shutdown(ctx):
 
     if not bool(context.get("publish_requested", True)):
         logger.info("EntityAddressUnified publish skipped: staged rows=%d", stage_rows)
-        await _drop_stage_artifacts(db_schema, stage_cls, support_stage_classes)
+        await _drop_stage_artifacts(
+            db_schema,
+            stage_cls,
+            support_stage_classes,
+            extra_tables=[affected_group_table],
+        )
         await mark_control_run(
             run_id,
             status="succeeded",
@@ -8066,8 +8208,38 @@ async def shutdown(ctx):
                     f"RENAME TO {old_live_name};"
                 )
 
-        for live_cls, support_stage_cls in support_stage_classes.items():
-            await _swap_stage_table(db_schema, live_cls, support_stage_cls)
+        if partial_support_patch:
+            if not affected_group_table or not await _table_exists(db_schema, affected_group_table):
+                raise RuntimeError(
+                    "entity-address-unified ptg-partial support patch publish requires "
+                    "the affected group table to remain available through shutdown."
+                )
+            for label, statement in _partial_support_patch_sql(
+                db_schema,
+                support_stage_classes,
+                old_entity_table=f"{table}_old",
+                affected_group_table=affected_group_table,
+                build_network_bridge=bool(context.get("build_network_bridge", DEFAULT_BUILD_NETWORK_BRIDGE)),
+            ):
+                started = time.monotonic()
+                rowcount = await db.status(statement)
+                _record_phase_timing(
+                    context,
+                    f"entity-address-unified patching support {label}",
+                    time.monotonic() - started,
+                    _coerce_rowcount(rowcount),
+                )
+        else:
+            for live_cls, support_stage_cls in support_stage_classes.items():
+                await _swap_stage_table(db_schema, live_cls, support_stage_cls)
+
+    if partial_support_patch:
+        await _drop_stage_artifacts(
+            db_schema,
+            stage_cls,
+            support_stage_classes,
+            extra_tables=[affected_group_table],
+        )
 
     logger.info("EntityAddressUnified publish complete: rows=%d", stage_rows)
     await mark_control_run(
