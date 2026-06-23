@@ -2406,6 +2406,29 @@ def test_ptg_address_partial_reuse_sql_excludes_changed_member_npis():
     assert "member_src.npi IS NOT NULL" in sql
 
 
+def test_ptg_address_partial_patch_sql_deletes_same_changed_scope_and_inserts_stage():
+    delete_sql = ptg_address._delete_live_ptg_address_partial_sql(  # pylint: disable=protected-access
+        "mrf",
+        changed_source_keys=["payer_a"],
+        changed_member_tables=["ptg2_provider_group_member_a"],
+    )
+    insert_sql = ptg_address._insert_stage_ptg_address_into_live_sql(  # pylint: disable=protected-access
+        "mrf",
+        "ptg_address_20260623",
+    )
+
+    assert 'DELETE FROM "mrf"."ptg_address" AS live' in delete_sql
+    assert "live.source_key IN ('payer_a')" in delete_sql
+    assert "live.source_key = 'ptg_member_fallback'" in delete_sql
+    assert "COALESCE(live.ptg_source_array, ARRAY[]::varchar[]) && ARRAY['payer_a']::varchar[]" in delete_sql
+    assert 'FROM "mrf"."ptg2_provider_group_member_a" member_src' in delete_sql
+    assert "live.npi IN (" in delete_sql
+    assert 'INSERT INTO "mrf"."ptg_address"' in insert_sql
+    assert 'FROM "mrf"."ptg_address_20260623" AS stage' in insert_sql
+    assert 'stage."source_key"' in insert_sql
+    assert 'stage."location_key"' in insert_sql
+
+
 def test_ptg_address_partial_refresh_allows_member_fallback_sources():
     ptg_address._validate_partial_refresh_sources(
         [
@@ -3094,6 +3117,88 @@ async def test_entity_address_unified_shutdown_patch_publishes_partial_main_and_
         ]["rows"]
         == 2
     )
+
+
+@pytest.mark.asyncio
+async def test_ptg_address_shutdown_patch_publishes_partial_stage(monkeypatch):
+    statements = []
+    marked_runs = []
+
+    class FakeTransaction:
+        async def __aenter__(self):
+            statements.append("BEGIN")
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            statements.append("ROLLBACK" if exc else "COMMIT")
+            return False
+
+    class FakeDB:
+        async def scalar(self, statement, **_kwargs):
+            statements.append(statement)
+            normalized = " ".join(statement.split())
+            if normalized == "SELECT COUNT(*) FROM mrf.ptg_address_20260614;":
+                return 2
+            if normalized == "SELECT COUNT(*) FROM mrf.ptg_address;":
+                return 1000
+            if "to_regclass(" in statement:
+                return True
+            return 0
+
+        async def status(self, statement):
+            statements.append(statement)
+            if 'DELETE FROM "mrf"."ptg_address" AS live' in statement:
+                return 2
+            if 'INSERT INTO "mrf"."ptg_address"' in statement:
+                return 2
+            return 0
+
+        def transaction(self):
+            return FakeTransaction()
+
+    async def fake_table_exists(_schema, _table):
+        return True
+
+    async def fake_validate_publish_integrity(*_args, **_kwargs):
+        return {"null_location_keys": 0}
+
+    async def fake_mark_control_run(*_args, **kwargs):
+        marked_runs.append(kwargs)
+
+    monkeypatch.setattr(ptg_address, "db", FakeDB())
+    monkeypatch.setattr(ptg_address, "ensure_database", AsyncMock())
+    monkeypatch.setattr(ptg_address, "_table_exists", fake_table_exists)
+    monkeypatch.setattr(ptg_address, "_validate_publish_integrity", fake_validate_publish_integrity)
+    monkeypatch.setattr(ptg_address, "mark_control_run", fake_mark_control_run)
+    monkeypatch.setattr(ptg_address, "print_time_info", lambda *_args, **_kwargs: None)
+
+    await ptg_address.shutdown(
+        {
+            "import_date": "20260614",
+            "context": {
+                "run": 1,
+                "test_mode": False,
+                "refresh_mode": "partial",
+                "partial_refresh_patch_publish": True,
+                "partial_refresh_source_keys": ["payer_a"],
+                "partial_refresh_member_tables": ["ptg2_provider_group_member_a"],
+                "partial_refresh_reused_rows": 0,
+            },
+        }
+    )
+
+    joined = "\n".join(statements)
+    assert "ALTER TABLE IF EXISTS mrf.ptg_address_20260614 RENAME TO ptg_address;" not in joined
+    assert 'DELETE FROM "mrf"."ptg_address" AS live' in joined
+    assert "live.source_key IN ('payer_a')" in joined
+    assert 'FROM "mrf"."ptg2_provider_group_member_a" member_src' in joined
+    assert 'INSERT INTO "mrf"."ptg_address"' in joined
+    assert 'FROM "mrf"."ptg_address_20260614" AS stage' in joined
+    assert "DROP TABLE IF EXISTS mrf.ptg_address_20260614;" in joined
+    assert marked_runs
+    assert marked_runs[-1]["metrics"]["rows"] == 1000
+    assert marked_runs[-1]["metrics"]["partial_refresh_patched_rows"] == 2
+    assert marked_runs[-1]["metrics"]["partial_refresh_patch_publish"] is True
 
 
 @pytest.mark.asyncio

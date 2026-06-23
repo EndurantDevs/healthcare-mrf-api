@@ -54,6 +54,7 @@ DEFAULT_SQL_SYNCHRONOUS_COMMIT = "off"
 DEFAULT_SQL_MAX_PARALLEL_WORKERS_PER_GATHER = "8"
 DEFAULT_SQL_HASH_MEM_MULTIPLIER = "4"
 DEFAULT_MEMBER_MATERIALIZE_SHARDS = 8
+DEFAULT_PARTIAL_PATCH_PUBLISH = True
 PTG_ADDRESS_REFRESH_MODE_FULL = "full"
 PTG_ADDRESS_REFRESH_MODE_PARTIAL = "partial"
 PTG_ADDRESS_REFRESH_MODES = {PTG_ADDRESS_REFRESH_MODE_FULL, PTG_ADDRESS_REFRESH_MODE_PARTIAL}
@@ -205,13 +206,21 @@ def _qualified_table_ref(db_schema: str, table_name: str) -> str:
     return f"{_quote_ident(db_schema)}.{_quote_ident(table_name)}"
 
 
+def _ptg_address_column_names() -> list[str]:
+    return [column.name for column in PTGAddress.__table__.columns]
+
+
 def _ptg_address_column_list() -> str:
-    return ", ".join(_quote_ident(column.name) for column in PTGAddress.__table__.columns)
+    return ", ".join(_quote_ident(column) for column in _ptg_address_column_names())
 
 
-def _ptg_address_reuse_live_rows_sql(
+def _ptg_address_select_column_list(alias: str) -> str:
+    return ", ".join(f"{alias}.{_quote_ident(column)}" for column in _ptg_address_column_names())
+
+
+def _ptg_address_changed_live_predicate_sql(
     db_schema: str,
-    stage_table: str,
+    live_alias: str,
     changed_source_keys: list[str],
     changed_member_tables: list[str] | None = None,
 ) -> str:
@@ -236,26 +245,59 @@ def _ptg_address_reuse_live_rows_sql(
         )
         member_npi_filter = (
             "\n         OR (\n"
-            f"                live.source_key = {_sql_literal(PTG_ADDRESS_MEMBER_FALLBACK_SOURCE_KEY)}\n"
-            "            AND live.npi IS NOT NULL\n"
-            "            AND live.npi IN (\n"
+            f"                {live_alias}.source_key = {_sql_literal(PTG_ADDRESS_MEMBER_FALLBACK_SOURCE_KEY)}\n"
+            f"            AND {live_alias}.npi IS NOT NULL\n"
+            f"            AND {live_alias}.npi IN (\n"
             f"{member_npi_selects}\n"
             "            )\n"
             "         )"
         )
+    return f"""
+            {live_alias}.source_key IN ({source_literals})
+         OR (
+                {live_alias}.source_key = {_sql_literal(PTG_ADDRESS_MEMBER_FALLBACK_SOURCE_KEY)}
+            AND COALESCE({live_alias}.ptg_source_array, ARRAY[]::varchar[]) && {source_array}
+         )
+{member_npi_filter}
+    """
+
+
+def _ptg_address_reuse_live_rows_sql(
+    db_schema: str,
+    stage_table: str,
+    changed_source_keys: list[str],
+    changed_member_tables: list[str] | None = None,
+) -> str:
     columns = _ptg_address_column_list()
     return f"""
     INSERT INTO {_qualified_table_ref(db_schema, stage_table)} ({columns})
     SELECT {columns}
       FROM {_qualified_table_ref(db_schema, PTGAddress.__main_table__)} AS live
      WHERE NOT (
-            live.source_key IN ({source_literals})
-         OR (
-                live.source_key = {_sql_literal(PTG_ADDRESS_MEMBER_FALLBACK_SOURCE_KEY)}
-            AND COALESCE(live.ptg_source_array, ARRAY[]::varchar[]) && {source_array}
-         )
-{member_npi_filter}
+{_ptg_address_changed_live_predicate_sql(db_schema, "live", changed_source_keys, changed_member_tables)}
      );
+    """
+
+
+def _delete_live_ptg_address_partial_sql(
+    db_schema: str,
+    *,
+    changed_source_keys: list[str],
+    changed_member_tables: list[str] | None = None,
+) -> str:
+    return f"""
+    DELETE FROM {_qualified_table_ref(db_schema, PTGAddress.__main_table__)} AS live
+     WHERE {_ptg_address_changed_live_predicate_sql(db_schema, "live", changed_source_keys, changed_member_tables)};
+    """
+
+
+def _insert_stage_ptg_address_into_live_sql(db_schema: str, stage_table: str) -> str:
+    columns = _ptg_address_column_list()
+    select_columns = _ptg_address_select_column_list("stage")
+    return f"""
+    INSERT INTO {_qualified_table_ref(db_schema, PTGAddress.__main_table__)} ({columns})
+    SELECT {select_columns}
+      FROM {_qualified_table_ref(db_schema, stage_table)} AS stage;
     """
 
 
@@ -1721,6 +1763,7 @@ async def process_data(ctx, task=None):
     refresh_mode = _ptg_address_refresh_mode(task)
     partial_refresh = refresh_mode == PTG_ADDRESS_REFRESH_MODE_PARTIAL
     context["refresh_mode"] = refresh_mode
+    context["partial_refresh_patch_publish"] = False
 
     import_date = ctx["import_date"]
     stage_cls = make_class(PTGAddress, import_date)
@@ -1871,17 +1914,42 @@ async def process_data(ctx, task=None):
         )
         if not changed_source_keys:
             raise RuntimeError("PTG address partial refresh did not resolve any changed source keys.")
-        reused_rows = await _copy_reusable_ptg_address_rows(
-            db_schema,
-            stage_table,
-            changed_source_keys=changed_source_keys,
-            changed_member_tables=changed_member_tables,
+        patch_publish = _env_bool(
+            "HLTHPRT_PTG_ADDRESS_PARTIAL_PATCH_PUBLISH",
+            DEFAULT_PARTIAL_PATCH_PUBLISH,
         )
+        context["partial_refresh_patch_publish"] = patch_publish
         context["partial_refresh_source_keys"] = changed_source_keys
         context["partial_refresh_member_source_keys"] = changed_member_source_keys
         context["partial_refresh_member_tables"] = changed_member_tables
+        if patch_publish:
+            if not await _table_exists(db_schema, PTGAddress.__main_table__):
+                raise RuntimeError(
+                    "PTG address partial patch publish requested, but the live ptg_address table does not exist; "
+                    "run refresh_mode=full first."
+                )
+            reused_rows = 0
+        else:
+            reused_rows = await _copy_reusable_ptg_address_rows(
+                db_schema,
+                stage_table,
+                changed_source_keys=changed_source_keys,
+                changed_member_tables=changed_member_tables,
+            )
         context["partial_refresh_reused_rows"] = reused_rows
-        if run_id:
+        if run_id and patch_publish:
+            enqueue_live_progress(
+                run_id=run_id,
+                importer="ptg-address",
+                status="running",
+                phase="ptg-address using affected-only stage",
+                unit="rows",
+                done=0,
+                total=0,
+                pct=5,
+                message="using affected-only stage for PTG address partial patch",
+            )
+        elif run_id:
             enqueue_live_progress(
                 run_id=run_id,
                 importer="ptg-address",
@@ -2068,7 +2136,8 @@ async def process_data(ctx, task=None):
             await asyncio.gather(*insert_tasks, return_exceptions=True)
             raise
     context["source_insert_results"] = insert_results
-    await _create_stage_indexes(stage_cls, db_schema)
+    if not context.get("partial_refresh_patch_publish"):
+        await _create_stage_indexes(stage_cls, db_schema)
     await db.status(f"ANALYZE {db_schema}.{stage_table};")
     row_count = int(await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{stage_table};") or 0)
     context["run"] = context.get("run", 0) + 1
@@ -2224,6 +2293,7 @@ async def shutdown(ctx):
     await ensure_database(bool(context.get("test_mode")))
     db_schema = _validate_schema_name(os.getenv("HLTHPRT_DB_SCHEMA") or "mrf")
     stage_cls = make_class(PTGAddress, ctx.get("import_date"))
+    partial_patch = bool(context.get("partial_refresh_patch_publish"))
     stage_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{stage_cls.__tablename__};") or 0)
     min_rows = 0 if context.get("test_mode") else int(os.getenv("HLTHPRT_PTG_ADDRESS_MIN_ROWS", str(DEFAULT_MIN_ROWS)))
     if stage_rows < min_rows:
@@ -2237,26 +2307,57 @@ async def shutdown(ctx):
 
     async with db.transaction():
         table = PTGAddress.__main_table__
-        await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
-        await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{table} RENAME TO {table}_old;")
-        await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{stage_cls.__tablename__} RENAME TO {table};")
-        archived = _archived_identifier(f"{table}_idx_primary")
-        await db.status(f"DROP INDEX IF EXISTS {db_schema}.{archived};")
-        await db.status(f"ALTER INDEX IF EXISTS {db_schema}.{table}_idx_primary RENAME TO {archived};")
-        await db.status(
-            f"ALTER INDEX IF EXISTS {db_schema}.{stage_cls.__tablename__}_idx_primary "
-            f"RENAME TO {table}_idx_primary;"
-        )
-        for index in getattr(stage_cls, "__my_additional_indexes__", []) or []:
-            index_name = index.get("name", "_".join(index.get("index_elements")))
-            old_live_name = f"{table}_idx_{index_name}"
-            archived_live_name = _archived_identifier(old_live_name)
-            await db.status(f"DROP INDEX IF EXISTS {db_schema}.{archived_live_name};")
-            await db.status(f"ALTER INDEX IF EXISTS {db_schema}.{old_live_name} RENAME TO {archived_live_name};")
+        if partial_patch:
+            changed_source_keys = [
+                str(source_key)
+                for source_key in context.get("partial_refresh_source_keys") or []
+                if _clean_optional(source_key)
+            ]
+            changed_member_tables = [
+                str(table_name)
+                for table_name in context.get("partial_refresh_member_tables") or []
+                if _clean_optional(table_name)
+            ]
+            if not changed_source_keys:
+                raise RuntimeError("PTG address partial patch publish requires changed source keys.")
+            if not await _table_exists(db_schema, table):
+                raise RuntimeError(
+                    "PTG address partial patch publish requested, but the live ptg_address table does not exist."
+                )
             await db.status(
-                f"ALTER INDEX IF EXISTS {db_schema}.{_stage_index_name(stage_cls.__tablename__, index_name)} "
-                f"RENAME TO {old_live_name};"
+                _delete_live_ptg_address_partial_sql(
+                    db_schema,
+                    changed_source_keys=changed_source_keys,
+                    changed_member_tables=changed_member_tables,
+                )
             )
+            await db.status(_insert_stage_ptg_address_into_live_sql(db_schema, stage_cls.__tablename__))
+        else:
+            await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
+            await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{table} RENAME TO {table}_old;")
+            await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{stage_cls.__tablename__} RENAME TO {table};")
+            archived = _archived_identifier(f"{table}_idx_primary")
+            await db.status(f"DROP INDEX IF EXISTS {db_schema}.{archived};")
+            await db.status(f"ALTER INDEX IF EXISTS {db_schema}.{table}_idx_primary RENAME TO {archived};")
+            await db.status(
+                f"ALTER INDEX IF EXISTS {db_schema}.{stage_cls.__tablename__}_idx_primary "
+                f"RENAME TO {table}_idx_primary;"
+            )
+            for index in getattr(stage_cls, "__my_additional_indexes__", []) or []:
+                index_name = index.get("name", "_".join(index.get("index_elements")))
+                old_live_name = f"{table}_idx_{index_name}"
+                archived_live_name = _archived_identifier(old_live_name)
+                await db.status(f"DROP INDEX IF EXISTS {db_schema}.{archived_live_name};")
+                await db.status(f"ALTER INDEX IF EXISTS {db_schema}.{old_live_name} RENAME TO {archived_live_name};")
+                await db.status(
+                    f"ALTER INDEX IF EXISTS {db_schema}.{_stage_index_name(stage_cls.__tablename__, index_name)} "
+                    f"RENAME TO {old_live_name};"
+                )
+    published_rows = stage_rows
+    if partial_patch:
+        await db.status(f"DROP TABLE IF EXISTS {db_schema}.{stage_cls.__tablename__};")
+        published_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{PTGAddress.__main_table__};") or 0)
+        context["partial_refresh_patched_rows"] = stage_rows
     await mark_control_run(
         run_id,
         status="succeeded",
@@ -2264,17 +2365,19 @@ async def shutdown(ctx):
         progress_message="succeeded",
         progress={
             "unit": "rows",
-            "done": stage_rows,
-            "total": stage_rows,
+            "done": published_rows,
+            "total": published_rows,
             "pct": 100,
             "message": "succeeded",
             "phase": "ptg-address published",
         },
         metrics={
-            "rows": stage_rows,
+            "rows": published_rows,
             "refresh_mode": context.get("refresh_mode") or PTG_ADDRESS_REFRESH_MODE_FULL,
             "partial_refresh_source_keys": context.get("partial_refresh_source_keys") or [],
             "partial_refresh_reused_rows": int(context.get("partial_refresh_reused_rows") or 0),
+            "partial_refresh_patched_rows": int(context.get("partial_refresh_patched_rows") or 0),
+            "partial_refresh_patch_publish": partial_patch,
             "publish_validation": context.get("publish_validation") or {},
         },
     )
