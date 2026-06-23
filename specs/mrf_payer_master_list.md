@@ -36,6 +36,7 @@ Last one-time research refresh: 2026-06-05.
 | BCBS Texas | blue | https://www.bcbstx.com/member/policy-forms/machine-readable-file | observed current; 26,939 plans; 90,002 files |
 | BCBS Vermont | blue | https://www.bluecrossvt.org/our-plans/employers-and-groups/machine-readable-files | curated source row |
 | BCBS Wyoming | blue | - | needs official source URL |
+| Blue Cross Blue Shield | blue | - | needs official source URL |
 | Blue Cross Blue Shield Alabama | blue | - | needs official source URL |
 | Blue Cross Blue Shield Arizona | blue | - | needs official source URL |
 | Blue Cross Blue Shield Arkansas | blue | - | needs official source URL |
@@ -56,6 +57,7 @@ Last one-time research refresh: 2026-06-05.
 | Blue Cross Blue Shield of Arizona | blue | https://bcbsaz.healthsparq.com/app/public/#/one/insurerCode=BCBSAZ_I&brandCode=BCBSAZ/machine-readable-transparency-in-coverage | observed stale; 1,159 plans; 15,928 files |
 | Blue Cross Blue Shield of Nebraska | blue | https://bcbsneweb.healthsparq.com/app/public/#/one/insurerCode=BCBSNE_I&brandCode=BCBSNE/machine-readable-transparency-in-coverage | observed current; 28 plans; 2,823 files |
 | Blue Cross Blue Shield Oklahoma | blue | - | needs official source URL |
+| Blue Cross Blue Shield Puerto Rico | blue | - | needs official source URL |
 | Blue Cross Blue Shield Rhode Island | blue | - | needs official source URL |
 | Blue Cross Blue Shield South Carolina | blue | - | needs official source URL |
 | Blue Cross Blue Shield Tennessee | blue | - | needs stable TOC or landing URL |
@@ -74,6 +76,7 @@ Last one-time research refresh: 2026-06-05.
 | Capital Health Plan | blue | https://capitalhealth.com/transparency-in-coverage | curated source row |
 | CareFirst | blue | https://individual.carefirst.com/individuals-families/mandates-policies/machine-readable-file.page | curated source row |
 | CareFirst BCBS | blue | https://individual.carefirst.com/individuals-families/mandates-policies/machine-readable-file.page | observed stale; 13,312 plans; 1,931 files |
+| Empire BlueCross BlueShield | blue | - | needs official source URL |
 | Excellus BCBS | blue | https://excellusbcbs.healthsparq.com/app/public/#/one/insurerCode=EXC_I&brandCode=EXC/ | curated source row |
 | Florida Blue | blue | https://www.floridablue.com/members/tools-resources/transparency/machine-readable-files | curated source row |
 | HCSC | blue | https://www.hcsc.com/who-we-are/transparency-in-coverage | curated source row |
@@ -159,10 +162,17 @@ Last one-time research refresh: 2026-06-05.
 | UnitedHealthcare | national | https://providermrf.uhc.com/IFP | curated source row |
 | UnitedHealthcare | national | https://transparency-in-coverage.uhc.com/ | curated source row |
 | UnitedHealthcare Community Plan | national | - | needs official source URL |
+| American Specialty Health | network/tpa | - | needs official source URL |
+| Carelon | network/tpa | - | needs official source URL |
+| Davis Vision | network/tpa | - | needs official source URL |
+| EyeMed | network/tpa | - | needs official source URL |
 | GEHA | network/tpa | - | needs official source URL |
 | HealthLink | network/tpa | - | needs official source URL |
 | MultiPlan | network/tpa | - | needs official source URL |
+| Northwell Direct | network/tpa | - | needs official source URL |
+| Northwood | network/tpa | - | needs official source URL |
 | PHCS | network/tpa | https://sisconosurprise.com/ppo/phcs/index.html | public transparency URL |
+| VSP Vision | network/tpa | - | needs official source URL |
 | AllWays | provider_sponsored | https://massgeneralbrighamhealthplan.org/meet-us/transparency-regulations | curated source row |
 | Avera Health Plans | provider_sponsored | https://portaldocs.dakotacare.com/MachineReadableFiles/Avera | curated source row |
 | Baylor Scott & White HP | provider_sponsored | https://www.swhp.org/en-us/about-us/transparency-in-coverage | curated source row |

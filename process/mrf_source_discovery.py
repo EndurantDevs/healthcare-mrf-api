@@ -545,11 +545,15 @@ def _decode_response_body(body: bytes, *, charset: str = "utf-8") -> str:
 
 
 async def _fetch_json(url: str, *, max_bytes: int = MAX_TOC_BYTES_DEFAULT, session: aiohttp.ClientSession | None = None) -> dict[str, Any]:
-    text = await _fetch_text(url, max_bytes=max_bytes, session=session, expect_json=True)
-    data = json.loads(text)
+    data = await _fetch_json_value(url, max_bytes=max_bytes, session=session)
     if not isinstance(data, dict):
         raise ValueError("expected JSON object")
     return data
+
+
+async def _fetch_json_value(url: str, *, max_bytes: int = MAX_TOC_BYTES_DEFAULT, session: aiohttp.ClientSession | None = None) -> Any:
+    text = await _fetch_text(url, max_bytes=max_bytes, session=session, expect_json=True)
+    return json.loads(text)
 
 
 async def _post_json(
@@ -1176,6 +1180,8 @@ def _html_link_candidates(html_text: str, *, base_url: str) -> list[dict[str, An
     )
     for match in attr_pattern.finditer(html_text or ""):
         candidates.append({"attr": match.group("attr"), "value": match.group("value"), "label": ""})
+    for url in _embedded_http_urls(html_text):
+        candidates.append({"attr": "text", "value": url, "label": Path(urlsplit(url).path).name})
     normalized: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
     for item in candidates:
@@ -1191,11 +1197,55 @@ def _html_link_candidates(html_text: str, *, base_url: str) -> list[dict[str, An
     return normalized
 
 
+def _embedded_http_urls(value: str | None) -> list[str]:
+    """Extract bare URLs from HTML, including JSON/JS escaped URL strings."""
+
+    text = html.unescape(str(value or ""))
+    replacements = {
+        "\\/": "/",
+        "\\u002f": "/",
+        "\\u002F": "/",
+        "\\x2f": "/",
+        "\\x2F": "/",
+        "\\u003a": ":",
+        "\\u003A": ":",
+        "\\x3a": ":",
+        "\\x3A": ":",
+        "\\u0026": "&",
+        "\\u0026amp;": "&",
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    urls: list[str] = []
+    seen: set[str] = set()
+    for match in re.finditer(r"https?://[^\s\"'<>]+", text, flags=re.I):
+        url = match.group(0).rstrip("\\,.;)")
+        while url.endswith(("]", "}")) and (url.count("[") < url.count("]") or url.count("{") < url.count("}")):
+            url = url[:-1]
+        if not url:
+            continue
+        key = _canonical_or_none(url) or url
+        if key in seen:
+            continue
+        seen.add(key)
+        urls.append(url)
+    return urls
+
+
 def _looks_html_mrf_toc_url(url: str | None, label: str | None = None) -> bool:
-    path = urlsplit(str(url or "")).path.lower()
-    text = f"{path} {label or ''}".lower().replace("_", "-")
+    parsed = urlsplit(str(url or ""))
+    host = parsed.netloc.lower()
+    path = parsed.path.lower()
+    query = parsed.query.lower()
+    text = f"{path} {query} {label or ''}".lower().replace("_", "-")
     if path.endswith((".json", ".json.gz")):
-        return any(token in text for token in ("index.json", "index.json.gz", "toc", "table-of-contents", "table of contents"))
+        return any(token in text for token in ("index.json", "index.json.gz", "cms-data-index", "toc", "table-of-contents", "table of contents"))
+    if "sapphiremrfhub.com" in host and "/tocs/" in path:
+        return True
+    if "name=table-of-contents" in query and "ext=json" in query:
+        return True
+    if any(token in text for token in ("/toc-json", "table-of-contents.json", "cms-data-index")):
+        return True
     file_name = Path(path).name.replace("_", "-")
     if "." in file_name:
         return False
@@ -1374,6 +1424,79 @@ def _parse_cigna_lookup_targets(
     return list(targets_by_url.values())
 
 
+def _parse_bcbs_asomrf_filelist_targets(
+    payload: Any,
+    *,
+    filelist_url: str,
+    source: dict[str, Any],
+    resolver: dict[str, Any],
+) -> list[CrawlTarget]:
+    if not isinstance(payload, list):
+        raise ValueError("expected BCBS ASO filelist JSON array")
+    toc_max_bytes = _parse_size_bytes(resolver.get("toc_max_bytes")) or 100 * 1024 * 1024
+    targets_by_url: dict[str, CrawlTarget] = {}
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        file_url = str(item.get("url") or "").strip()
+        file_name = _clean_text(item.get("name")) or Path(urlsplit(file_url).path).name
+        if not file_url or _mrf_file_type_from_text(file_url, file_name) != "table-of-contents":
+            continue
+        metadata = {
+            "resolver": "bcbs_asomrf_filelist",
+            "target_kind": "toc_json",
+            "target_file_type": "table-of-contents",
+            "target_max_bytes": toc_max_bytes,
+            "filelist_url": filelist_url,
+            "file_name": file_name,
+            "state": _clean_text(item.get("state")),
+            "ein": _clean_text(item.get("ein")),
+            "last_update_date": _clean_text(item.get("last_update_date")),
+        }
+        key = _canonical_or_none(file_url) or file_url
+        targets_by_url[key] = CrawlTarget(
+            source=source,
+            url=file_url,
+            label=file_name or str(source.get("display_name") or "BCBS ASO MRF index"),
+            resolved_from_url=filelist_url,
+            metadata={key: value for key, value in metadata.items() if value not in (None, "")},
+        )
+    return list(targets_by_url.values())
+
+
+def _bcbs_asomrf_filelist_urls_from_html(html_text: str, *, base_url: str) -> list[str]:
+    urls: list[str] = []
+    for candidate in _html_link_candidates(html_text, base_url=base_url):
+        url = str(candidate.get("url") or "").strip()
+        path = urlsplit(url).path.lower()
+        if path.endswith("/content/dam/bcbs/mrf/si-filelist.json") and url not in urls:
+            urls.append(url)
+    for match in re.finditer(r"""(?P<quote>["'])(?P<path>/content/dam/bcbs/mrf/si-filelist\.json)(?P=quote)""", html_text or "", flags=re.I):
+        url = urljoin(base_url, html.unescape(match.group("path")))
+        if url not in urls:
+            urls.append(url)
+    return urls
+
+
+async def _resolve_bcbs_asomrf_filelist(
+    source: dict[str, Any],
+    url: str,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    html_text = await _fetch_text(url, max_bytes=int(resolver.get("max_bytes") or 5 * 1024 * 1024), session=session)
+    filelist_urls = _bcbs_asomrf_filelist_urls_from_html(html_text, base_url=url)
+    if not filelist_urls:
+        raise ValueError(f"no BCBS ASO filelist URL found in {url}")
+    targets: list[CrawlTarget] = []
+    for filelist_url in filelist_urls:
+        payload = await _fetch_json_value(filelist_url, max_bytes=int(resolver.get("filelist_max_bytes") or 20 * 1024 * 1024), session=session)
+        targets.extend(_parse_bcbs_asomrf_filelist_targets(payload, filelist_url=filelist_url, source=source, resolver=resolver))
+    if not targets:
+        raise ValueError(f"no BCBS ASO index URLs found from {url}")
+    return targets
+
+
 def _add_months(value: dt.datetime, offset: int) -> dt.datetime:
     month_index = value.year * 12 + (value.month - 1) + offset
     year = month_index // 12
@@ -1544,8 +1667,17 @@ async def _resolve_healthsparq_public_mrf(
 
 
 def _looks_direct_toc_url(url: str | None) -> bool:
-    path = urlsplit(str(url or "")).path.lower()
+    parsed = urlsplit(str(url or ""))
+    host = parsed.netloc.lower()
+    path = parsed.path.lower()
+    query = parsed.query.lower()
     if path.endswith((".json", ".json.gz")):
+        return True
+    if "sapphiremrfhub.com" in host and "/tocs/" in path:
+        return True
+    if "name=table-of-contents" in query and "ext=json" in query:
+        return True
+    if "/toc-json" in path:
         return True
     file_name = Path(path).name.replace("_", "-")
     return "." not in file_name and file_name.endswith(("-index", "-toc")) and "/mrf/" in path
@@ -1559,6 +1691,8 @@ async def _crawl_targets_for_source(source: dict[str, Any], url: str, session: a
         return _bcbsma_monthly_toc_targets(source, url, resolver)
     if resolver_type == "cigna_static_mrf_lookup":
         return await _resolve_cigna_static_mrf_lookup(source, url, resolver, session)
+    if resolver_type == "bcbs_asomrf_filelist":
+        return await _resolve_bcbs_asomrf_filelist(source, url, resolver, session)
     if resolver_type == "healthsparq_public_mrf":
         return await _resolve_healthsparq_public_mrf(source, url, resolver, session)
     if resolver_type == "highmark_hmhs_script":

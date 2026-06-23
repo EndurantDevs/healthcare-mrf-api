@@ -57,6 +57,12 @@
       "lookup_max_bytes": 2097152,
       "toc_max_bytes": 104857600,
       "lookup_paths": ["/static/mrf/latest.json", "/static/mrf/co/latest.json"]
+    },
+    "bcbs_asomrf": {
+      "type": "bcbs_asomrf_filelist",
+      "max_bytes": 5242880,
+      "filelist_max_bytes": 20971520,
+      "toc_max_bytes": 104857600
     }
   }
 }

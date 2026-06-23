@@ -22,6 +22,7 @@ def test_source_urls_are_loaded_from_registry_file():
     assert config["platform_resolvers"]["uhc_public_blobs"]["type"] == "uhc_blob_listing"
     assert config["platform_resolvers"]["bcbsma_monthly_tocs"]["type"] == "bcbsma_monthly_tocs"
     assert config["platform_resolvers"]["cigna_static_mrf_lookup"]["type"] == "cigna_static_mrf_lookup"
+    assert config["platform_resolvers"]["bcbs_asomrf"]["type"] == "bcbs_asomrf_filelist"
     assert config["platform_resolvers"]["aetna_health1"]["tenant_overrides"]["MERITAIN_I"] == "aetnacvs"
 
 
@@ -712,6 +713,50 @@ def test_parse_html_mrf_links_extracts_tocs_and_body_file_references():
     ]
 
 
+def test_parse_html_mrf_links_extracts_embedded_escaped_toc_urls():
+    html = r"""
+    <script>
+    window.__DATA__ = {
+      "toc": "https:\/\/tic-mrf.regence.com\/mrf\/current\/2026-06-01_Regence%20BlueShield-ASO_index.json",
+      "bcbsks": "https:\/\/mrf.secure.bcbsks.com\/api\/filedownloadhttptrigger?name=table-of-contents\u0026ext=json",
+      "bcbsm": "https:\/\/bcbsm.sapphiremrfhub.com\/tocs\/current\/blue_cross_blue_shield_of_michigan"
+    };
+    </script>
+    """
+
+    targets = discovery._parse_html_mrf_links(html, base_url="https://example.com/transparency")
+
+    assert targets == [
+        {
+            "url": "https://tic-mrf.regence.com/mrf/current/2026-06-01_Regence%20BlueShield-ASO_index.json",
+            "label": "2026-06-01_Regence%20BlueShield-ASO_index.json",
+            "resolver": "html_mrf_link",
+            "target_kind": "toc_json",
+            "target_file_type": "table-of-contents",
+            "container_format": None,
+            "html_attr": "text",
+        },
+        {
+            "url": "https://mrf.secure.bcbsks.com/api/filedownloadhttptrigger?name=table-of-contents&ext=json",
+            "label": "filedownloadhttptrigger",
+            "resolver": "html_mrf_link",
+            "target_kind": "toc_json",
+            "target_file_type": "table-of-contents",
+            "container_format": None,
+            "html_attr": "text",
+        },
+        {
+            "url": "https://bcbsm.sapphiremrfhub.com/tocs/current/blue_cross_blue_shield_of_michigan",
+            "label": "blue_cross_blue_shield_of_michigan",
+            "resolver": "html_mrf_link",
+            "target_kind": "toc_json",
+            "target_file_type": "table-of-contents",
+            "container_format": None,
+            "html_attr": "text",
+        },
+    ]
+
+
 def test_fetch_text_decode_response_body_handles_raw_gzip_json():
     payload = discovery._decode_response_body(gzip.compress(b'{"ok": true}'))
 
@@ -720,6 +765,9 @@ def test_fetch_text_decode_response_body_handles_raw_gzip_json():
 
 def test_direct_toc_url_accepts_no_extension_mrf_index():
     assert discovery._looks_direct_toc_url("https://mrf.example.com/mrf/hmo_ha_hii_example_index")
+    assert discovery._looks_direct_toc_url("https://bcbsm.sapphiremrfhub.com/tocs/current/blue_cross_blue_shield_of_michigan")
+    assert discovery._looks_direct_toc_url("https://www.bluecrossvt.org/documents/toc-json")
+    assert discovery._looks_direct_toc_url("https://mrf.secure.bcbsks.com/api/filedownloadhttptrigger?name=table-of-contents&ext=json")
 
 
 def test_cigna_lookup_html_extracts_configured_and_page_lookup_urls():
@@ -736,6 +784,42 @@ def test_cigna_lookup_html_extracts_configured_and_page_lookup_urls():
         "https://www.cigna.com/static/mrf/latest.json",
         "https://www.cigna.com/static/mrf/co/latest.json",
     ]
+
+
+def test_bcbs_asomrf_filelist_html_extracts_filelist_url():
+    html = """<script>var filelist = "/content/dam/bcbs/mrf/si-filelist.json";</script>"""
+
+    urls = discovery._bcbs_asomrf_filelist_urls_from_html(html, base_url="https://www.bcbsil.com/asomrf?EIN=260241222")
+
+    assert urls == ["https://www.bcbsil.com/content/dam/bcbs/mrf/si-filelist.json"]
+
+
+def test_parse_bcbs_asomrf_filelist_targets_expands_index_urls():
+    source = {"source_id": "source_1", "payer_id": "payer_1", "display_name": "BCBS Illinois"}
+    payload = [
+        {
+            "last_update_date": "2026-05-21",
+            "state": "IL",
+            "url": "https://app.example/toc/2026-05-21_Blue-Cross-and-Blue-Shield-of-Illinois_260241222_index.json",
+            "name": "2026-05-21_Blue-Cross-and-Blue-Shield-of-Illinois_260241222_index",
+            "ein": "260241222",
+        },
+        {"url": "https://app.example/body/in-network-rates.json.gz", "name": "skip body file"},
+    ]
+
+    [target] = discovery._parse_bcbs_asomrf_filelist_targets(
+        payload,
+        filelist_url="https://www.bcbsil.com/content/dam/bcbs/mrf/si-filelist.json",
+        source=source,
+        resolver={"toc_max_bytes": 12345},
+    )
+
+    assert target.url == "https://app.example/toc/2026-05-21_Blue-Cross-and-Blue-Shield-of-Illinois_260241222_index.json"
+    assert target.resolved_from_url == "https://www.bcbsil.com/content/dam/bcbs/mrf/si-filelist.json"
+    assert target.metadata["resolver"] == "bcbs_asomrf_filelist"
+    assert target.metadata["state"] == "IL"
+    assert target.metadata["ein"] == "260241222"
+    assert target.metadata["target_max_bytes"] == 12345
 
 
 def test_cigna_lookup_targets_preserve_file_metadata_and_large_toc_limit():
