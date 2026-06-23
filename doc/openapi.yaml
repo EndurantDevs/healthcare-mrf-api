@@ -2426,6 +2426,61 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/CodeRelatedResponse'
+  /pricing/group-plan-providers:
+    get:
+      operationId: getPricingGroupPlanProviders
+      summary: List distinct in-network provider NPIs for an imported group plan
+      description: |
+        Resolves the published PTG2 serving snapshot for a group plan by EIN
+        `plan_id` and `market_type`, then enumerates the snapshot provider
+        membership table as keyset-paginated 10-digit NPI values.
+      parameters:
+        - name: plan_id
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Group plan EIN.
+        - name: market_type
+          in: query
+          schema:
+            type: string
+            default: group
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 200
+        - name: cursor
+          in: query
+          schema:
+            type: string
+          description: Last NPI from the previous page.
+        - name: enrich
+          in: query
+          schema:
+            type: boolean
+          description: Include available NPPES provider name fields.
+        - name: count
+          in: query
+          schema:
+            type: boolean
+          description: Include total distinct provider count.
+      responses:
+        '200':
+          description: Group plan provider page
+          content:
+            application/json:
+              schema:
+                type: object
+        '501':
+          description: Snapshot does not expose provider membership storage
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /pricing/statistics:
     get:
       operationId: getPricingStatistics
