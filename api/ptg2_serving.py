@@ -1712,6 +1712,30 @@ def _compact_provider_expansion_sql(
     resolved_address_table = address_table or f"{PTG2_SCHEMA}.npi_address"
     address_location_hash_sql = _ptg2_address_location_hash_sql("addr", resolved_address_table)
     params.setdefault("provider_match_limit", max(int(params.get("limit") or 25) * 8, 64))
+    member_predicates: list[str] = []
+    specialty_filter = resolve_provider_specialty_filter(args)
+    if specialty_filter.active:
+        member_predicates.append(
+            provider_specialty_taxonomy_exists_sql(
+                "pgm.npi",
+                params,
+                "provider_expansion_specialty",
+                specialty_filter,
+                schema=PTG2_SCHEMA,
+            )
+        )
+    inferred_sql = _inferred_provider_taxonomy_code_sql(
+        args,
+        nt_alias="nt",
+        schema=PTG2_SCHEMA,
+        params=params,
+        param_prefix="provider_expansion_inferred_taxonomy",
+    )
+    if inferred_sql:
+        member_predicates.append(
+            f"EXISTS (SELECT 1 FROM {PTG2_SCHEMA}.npi_taxonomy nt WHERE nt.npi = pgm.npi AND {inferred_sql})"
+        )
+    member_filter_sql = "".join(f"\n          AND {predicate}" for predicate in member_predicates)
     component_join = ""
     member_join = ""
     if serving_tables.provider_set_component_table:
@@ -1720,11 +1744,11 @@ def _compact_provider_expansion_sql(
           ON psc.provider_set_hash = r.provider_set_hash"""
         member_join = f"""
         JOIN {serving_tables.provider_group_member_table} pgm
-          ON pgm.provider_group_hash = psc.provider_group_hash"""
+          ON pgm.provider_group_hash = psc.provider_group_hash{member_filter_sql}"""
     elif serving_tables.provider_group_member_table:
         member_join = f"""
         JOIN {serving_tables.provider_group_member_table} pgm
-          ON pgm.provider_group_hash = r.provider_set_hash"""
+          ON pgm.provider_group_hash = r.provider_set_hash{member_filter_sql}"""
     else:
         return ""
     if serving_tables.provider_group_location_table and (args.get("zip5") or args.get("zip") or args.get("city") or args.get("state") or args.get("lat") or args.get("long")):
@@ -1757,6 +1781,15 @@ def _compact_provider_expansion_sql(
             ORDER BY (addr.type = 'primary') DESC, addr.type, addr.checksum
             LIMIT 1
         ) addr ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT
+                array_agg(nt.healthcare_provider_taxonomy_code ORDER BY (UPPER(COALESCE(nt.healthcare_provider_primary_taxonomy_switch, '')) = 'Y') DESC, nt.checksum) AS taxonomy_codes,
+                array_agg(COALESCE(nucc.display_name, nucc.classification) ORDER BY (UPPER(COALESCE(nt.healthcare_provider_primary_taxonomy_switch, '')) = 'Y') DESC, nt.checksum) AS specialties
+            FROM {PTG2_SCHEMA}.npi_taxonomy nt
+            LEFT JOIN {PTG2_SCHEMA}.nucc_taxonomy nucc
+              ON nucc.code = nt.healthcare_provider_taxonomy_code
+            WHERE nt.npi = pgm.npi
+        ) tax ON TRUE
     """
 
 
@@ -1863,8 +1896,10 @@ async def _search_compact_serving_table(
             "LEFT(COALESCE(addr.postal_code, ''), 5) AS zip5, "
             f"'{address_location_source}' AS location_source, "
             f"'{address_location_source}' AS location_confidence_code, "
-            "to_jsonb(addr.*) AS address_payload, ARRAY[]::varchar[] AS taxonomy_codes, "
-            "ARRAY[]::varchar[] AS specialties, NULL::varchar AS provider_name,"
+            "to_jsonb(addr.*) AS address_payload, "
+            "COALESCE(tax.taxonomy_codes, ARRAY[]::varchar[]) AS taxonomy_codes, "
+            "COALESCE(tax.specialties, ARRAY[]::varchar[]) AS specialties, "
+            "NULL::varchar AS provider_name,"
         )
     price_exists_sql = ""
     if price_filter_clauses:

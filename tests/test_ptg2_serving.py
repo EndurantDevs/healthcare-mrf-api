@@ -1459,6 +1459,9 @@ async def test_compact_serving_specialty_search_filters_minimal_provider_group_l
     assert "JOIN mrf.ptg2_provider_group_member_token pgm" in sql
     assert "ON pgm.provider_group_hash = r.provider_set_hash" in sql
     assert "provider_specialty_nt.npi = pgm_filter.npi" in sql
+    assert "provider_expansion_specialty_nt.npi = pgm.npi" in sql
+    assert "LEFT JOIN LATERAL" in sql
+    assert "tax.taxonomy_codes" in sql
     assert "363A00000X" not in params.values()
     assert set(
         value for key, value in params.items()
