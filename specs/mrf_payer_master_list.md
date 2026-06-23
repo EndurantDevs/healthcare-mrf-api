@@ -101,9 +101,9 @@ Last one-time research refresh: 2026-06-05.
 | Bright HealthCare | dtc | - | needs official source URL |
 | Clover Health | dtc | https://www.cloverhealth.com/members/plan-documents | public transparency URL |
 | Devoted Health | dtc | https://www.devoted.com/plan-documents/ | public transparency URL |
-| Gravie | dtc | - | needs official source URL |
+| Gravie | dtc | https://www.gravie.com/compliance/transparency-in-coverage/ | public transparency URL |
 | Oscar Health | dtc | https://www.hioscar.com/transparency-in-coverage-files/oscar | curated source row |
-| Sidecar Health | dtc | - | needs official source URL |
+| Sidecar Health | dtc | https://sidecarhealth.com/transparency-in-coverage/ | public transparency URL |
 | Alameda Alliance / CalOptima / CalViva / Central CA Alliance / Contra Costa / Partnership HealthPlan / Health Plan of San Mateo / Denver Health / Hennepin Health | medicaid_mco | - | needs official source URL |
 | Alameda Alliance for Health | medicaid_mco | https://alamedaalliance.org/about/pricing-transparency/ | public transparency URL |
 | AmeriHealth Caritas | medicaid_mco | https://www.amerihealthcaritas.com/price-transparency/ | curated source row |
@@ -115,9 +115,10 @@ Last one-time research refresh: 2026-06-05.
 | Healthfirst | medicaid_mco | https://healthfirst.org/machine-readable-files/ | curated source row |
 | Highmark Independence National Alliance | medicaid_mco | - | needs official source URL |
 | Inland Empire Health Plan | medicaid_mco | - | needs official source URL |
-| L.A. Care | medicaid_mco | - | needs official source URL |
+| LA Care Health Plan | medicaid_mco | https://www.lacare.org/transparency-coverage-machine-readable-files | public transparency URL |
 | Meridian | medicaid_mco | - | needs official source URL |
 | MetroPlus Health | medicaid_mco | https://www.metroplus.org/provider/provider-resources/price-transparency | curated source row |
+| MetroPlus Health | medicaid_mco | https://metroplus.org/machine-readable-files/ | public transparency URL |
 | Molina | medicaid_mco | - | needs official source URL |
 | Molina Healthcare | medicaid_mco | https://www.molinamarketplace.com/marketplace/oh/en-us/About/compinfo/PricingTransparency | observed current; 719 plans; 7,776 files |
 | Neighborhood Health Plan RI | medicaid_mco | https://www.nhpri.org/members/commercial-members-individual-family-plans/price-transparency-machine-readable-files/ | curated source row |
@@ -161,7 +162,7 @@ Last one-time research refresh: 2026-06-05.
 | GEHA | network/tpa | - | needs official source URL |
 | HealthLink | network/tpa | - | needs official source URL |
 | MultiPlan | network/tpa | - | needs official source URL |
-| PHCS | network/tpa | - | needs official source URL |
+| PHCS | network/tpa | https://sisconosurprise.com/ppo/phcs/index.html | public transparency URL |
 | AllWays | provider_sponsored | https://massgeneralbrighamhealthplan.org/meet-us/transparency-regulations | curated source row |
 | Avera Health Plans | provider_sponsored | https://portaldocs.dakotacare.com/MachineReadableFiles/Avera | curated source row |
 | Baylor Scott & White HP | provider_sponsored | https://www.swhp.org/en-us/about-us/transparency-in-coverage | curated source row |
@@ -171,7 +172,7 @@ Last one-time research refresh: 2026-06-05.
 | CHRISTUS Health Plan | provider_sponsored | https://www.christushealthplan.org/transparency-in-coverage | curated source row |
 | Cook Children's HP | provider_sponsored | - | needs official source URL |
 | Dean Health Plan | provider_sponsored | https://www.deancare.com/helpful-links/transparency-in-coverage | curated source row |
-| Froedtert Health Plan | provider_sponsored | - | needs official source URL |
+| Froedtert Health Plan | provider_sponsored | https://www.froedtert.com/price-transparency | public transparency URL |
 | Geisinger Health Plan | provider_sponsored | https://www.geisinger.org/health-plan/no-surprises-act | curated source row |
 | Hally/Health Alliance | provider_sponsored | - | needs official source URL |
 | HAP | provider_sponsored | https://www.hap.org/transparency | curated source row |
@@ -185,7 +186,7 @@ Last one-time research refresh: 2026-06-05.
 | Mercy/MercyCare | provider_sponsored | - | needs official source URL |
 | Ohio Health Choice | provider_sponsored | - | needs official source URL |
 | Optima Health | provider_sponsored | https://www.optimahealth.com/transparency-in-coverage | curated source row |
-| OSF HealthCare | provider_sponsored | - | needs official source URL |
+| OSF HealthCare | provider_sponsored | https://www.osfhealthcare.org/patients-visitors/billing-insurance/price-transparency | public transparency URL |
 | Paramount Health Care | provider_sponsored | https://www.paramounthealthcare.com/transparency-in-coverage/ | curated source row |
 | Physicians Health Plan | provider_sponsored | https://www.phpmichigan.com/About-Us/Transparency-in-Coverage | curated source row |
 | Physicians Health Plan of N. Indiana | provider_sponsored | - | needs official source URL |
@@ -196,13 +197,13 @@ Last one-time research refresh: 2026-06-05.
 | Providence Health Plan | provider_sponsored | https://mrfhub.providencehealthplan.com/ | curated source row |
 | Quartz Benefits | provider_sponsored | https://quartzfhir.healthsparq.com/app/public/#/one/insurerCode=QUARTZ_I&brandCode=QUARTZ/ | curated source row |
 | Sanford Health Plan | provider_sponsored | https://www.sanfordhealthplan.com/transparency-in-coverage-rule | curated source row |
-| Scripps Health Plan | provider_sponsored | - | needs official source URL |
+| Scripps Health Plan | provider_sponsored | https://www.scrippshealthplan.com/transparency-in-coverage#component_8a5f07e7c7 | public transparency URL |
 | Security Health Plan | provider_sponsored | https://www.securityhealth.org/insurance-resources/json | curated source row |
 | SelectHealth | provider_sponsored | https://selecthealth.org/machine-readable-data | curated source row |
 | Sentara | provider_sponsored | https://www.optimahealth.com/transparency-in-coverage | curated source row |
 | Sharp Health Plan | provider_sponsored | - | needs official source URL |
-| SSM Health Plan | provider_sponsored | - | needs official source URL |
-| Sutter Health Plan | provider_sponsored | - | needs official source URL |
+| SSM Health Plan | provider_sponsored | https://www.ssmhealth.com/resources/pay-my-bill/price-estimate/price-transparency | public transparency URL |
+| Sutter Health Plan | provider_sponsored | https://www.sutterhealthplan.org/healthcare-cost-transparency | public transparency URL |
 | University of Utah HP | provider_sponsored | https://www.hopkinshealthplans.org/transparency-in-coverage/ | curated source row |
 | UPMC Health Plan | provider_sponsored | https://www.upmchealthplan.com/transparency-in-coverage/mrf/ | curated source row |
 | UPMC Health System | provider_sponsored | - | needs official source URL |
@@ -246,10 +247,11 @@ Last one-time research refresh: 2026-06-05.
 | Excellus | regional | https://excellusbcbs.healthsparq.com/app/public/#/one/insurerCode=EXC_I&brandCode=EXC/machine-readable-transparency-in-coverage | observed current; 3,288 plans; 34,862 files |
 | Excellus BlueCross BlueShield | regional | - | needs official source URL |
 | Fallon Health | regional | https://fallon.sapphiremrfhub.com/ | curated source row |
-| Farm Bureau | regional | - | needs official source URL |
+| Farm Bureau Health Plans | regional | https://fbhealthplans.com/forms-resources/ | public transparency URL |
 | Fidelis | regional | - | needs official source URL |
 | First Choice Health | regional | https://www.fchn.com/machine-readable-files | curated source row |
-| First Choice Next | regional | https://www.fchn.com/machine-readable-files | curated source row |
+| First Choice Health | regional | https://www.fchn.com/PayorSearch | public transparency URL |
+| First Choice Next | regional | https://www.firstchoicenext.com/json | public transparency URL |
 | First Health | regional | https://www.health1.firsthealth.com/app/public/#/one/insurerCode=FIRSTHEALTH_I&brandCode=FIRSTH/machine-readable-transparency-in-coverage | observed current; 1,441 plans; 1,438 files |
 | First Medical | regional | - | needs official source URL |
 | Florida Complete Care | regional | - | needs official source URL |
@@ -259,7 +261,7 @@ Last one-time research refresh: 2026-06-05.
 | Harvard Pilgrim | regional | https://www.harvardpilgrim.org/public/machine-readable-files | curated source row |
 | Harvard Pilgrim Health Care | regional | https://www.harvardpilgrim.org/public/machine-readable-files | observed stale; 407 plans; 1,731 files |
 | Hawaii Medical Service Association | regional | https://www.hmsa.com/help-center/transparency-in-coverage-machine-readable-files/ | observed current; 41 plans; 1,741 files |
-| Health Advantage Arkansas | regional | - | needs official source URL |
+| Health Advantage Arkansas | regional | https://www.healthadvantage-hmo.com/interoperability/machine-readable-files | public transparency URL |
 | Health Plan of Nevada | regional | https://www.healthplanofnevada.com/transparency-in-coverage | curated source row |
 | Health Plan of San Mateo | regional | - | needs official source URL |
 | HealthNet | regional | - | needs official source URL |
@@ -268,7 +270,7 @@ Last one-time research refresh: 2026-06-05.
 | HMAA | regional | https://www.hmaa.com/provider-directory/machine-readable-files/ | curated source row |
 | HMAA Hawaii Management | regional | https://www.hmaa.com/provider-directory/machine-readable-files/ | observed stale |
 | Independent Health | regional | https://www.independenthealth.com/about-independent-health/transparency-in-coverage | curated source row |
-| Indiana University Health Plans | regional | - | needs official source URL |
+| Indiana University Health Plans | regional | https://www.iuhealthplans.org/price-transparency-information | public transparency URL |
 | LA Care Health Plan | regional | - | needs official source URL |
 | Lifewise Assurance Company | regional | - | needs official source URL |
 | Managed Health Network | regional | - | needs official source URL |
@@ -287,14 +289,15 @@ Last one-time research refresh: 2026-06-05.
 | Network Health | regional | https://networkhealth.com/price-transparency | curated source row |
 | PacificSource | regional | https://pacificsource.com/resources/json-files | curated source row |
 | Paramount | regional | - | needs official source URL |
-| Partnership HealthPlan | regional | - | needs official source URL |
-| Piedmont Health Plan | regional | - | needs official source URL |
+| Partnership HealthPlan | regional | https://www.healthplan.org/machine_readable_files | public transparency URL |
+| Piedmont Health Plan | regional | https://pchp.net/index.php/transparency-in-coverage.html | public transparency URL |
 | Point 72 Health | regional | - | needs official source URL |
 | ProMedica Health System | regional | - | needs official source URL |
 | QualChoice | regional | - | needs official source URL |
 | Select Health | regional | - | needs official source URL |
 | Spectrum | regional | - | needs official source URL |
 | SummaCare | regional | - | needs official source URL |
+| The Health Plan | regional | https://www.healthplan.org/multiplan_mrfs | public transparency URL |
 | The Health Plan of the Upper Ohio Valley | regional | - | needs official source URL |
 | The Jefferson Health Plan | regional | - | needs official source URL |
 | Tufts Health Plan | regional | https://tuftshealthplan.com/visitor/legal-notices/machine-readable-files | curated source row |
@@ -318,12 +321,14 @@ Last one-time research refresh: 2026-06-05.
 | Collective Health | tpa | https://transparency-in-coverage.collectivehealth.com/ | public transparency URL |
 | Collective Health | tpa | https://transparency-in-coverage.collectivehealth.com/index.html | curated source row |
 | HealthScope Benefits | tpa | - | needs official source URL |
+| Health Plans Inc (HPI) | tpa | https://hpitpa.com/transparency-in-coverage-machine-readable-files/ | public transparency URL |
 | MedCost | tpa | https://www.medcost.com/employers/resources/news/transparency-coverage-update-machine-readable-files | curated source row |
 | Meritain Health | tpa | https://health1.aetna.com/app/public/#/one/insurerCode=MERITAIN_I&brandCode=MERITAINOVER/machine-readable-transparency-in-coverage | curated source row |
 | PBA | tpa | https://www.pbaclaims.com/mrfs/ | curated source row |
 | Professional Benefit Administrators | tpa | https://www.pbaclaims.com/mrfs/ | curated source row |
 | Quartz Benefits | tpa | https://quartzfhir.healthsparq.com/app/public/#/one/insurerCode=QUARTZ_I&brandCode=QUARTZ/machine-readable-transparency-in-coverage | observed current; 2,557 plans; 49,120 files |
 | WebTPA | tpa | https://www.webtpa.com/rights-protections | curated source row |
+| WebTPA | tpa | https://price-transparency.webtpa.com/ | public transparency URL |
 
 ## Maintenance
 

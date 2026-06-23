@@ -1,5 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+import gzip
 import importlib
 import types
 
@@ -663,6 +664,7 @@ def test_parse_html_mrf_metadata_links_extracts_meta_txt_files():
 def test_parse_html_mrf_links_extracts_tocs_and_body_file_references():
     html = """
     <a href="/mrf/2026-06-01_example_index.json">TOC</a>
+    <a href="/mrf/hmo_ha_hii_arkbluecross_index">No-extension TOC</a>
     <a href="/files/in-network-rates.zip">In Network ZIP</a>
     <a href="/files/allowed-amounts.json.gz">Allowed Amounts</a>
     <a href="/not-mrf/file.json">Ignore</a>
@@ -674,6 +676,15 @@ def test_parse_html_mrf_links_extracts_tocs_and_body_file_references():
         {
             "url": "https://example.com/mrf/2026-06-01_example_index.json",
             "label": "TOC",
+            "resolver": "html_mrf_link",
+            "target_kind": "toc_json",
+            "target_file_type": "table-of-contents",
+            "container_format": None,
+            "html_attr": "href",
+        },
+        {
+            "url": "https://example.com/mrf/hmo_ha_hii_arkbluecross_index",
+            "label": "No-extension TOC",
             "resolver": "html_mrf_link",
             "target_kind": "toc_json",
             "target_file_type": "table-of-contents",
@@ -699,6 +710,16 @@ def test_parse_html_mrf_links_extracts_tocs_and_body_file_references():
             "html_attr": "href",
         },
     ]
+
+
+def test_fetch_text_decode_response_body_handles_raw_gzip_json():
+    payload = discovery._decode_response_body(gzip.compress(b'{"ok": true}'))
+
+    assert payload == '{"ok": true}'
+
+
+def test_direct_toc_url_accepts_no_extension_mrf_index():
+    assert discovery._looks_direct_toc_url("https://mrf.example.com/mrf/hmo_ha_hii_example_index")
 
 
 def test_cigna_lookup_html_extracts_configured_and_page_lookup_urls():
@@ -1110,3 +1131,65 @@ async def test_dry_run_uses_master_list_without_database(monkeypatch):
     assert result["providers"] == ["master-list"]
     assert result["candidates"] == 3
     assert result["payers"] == 3
+
+
+@pytest.mark.asyncio
+async def test_direct_discovery_run_emits_import_control_visible_state(monkeypatch):
+    pushed = []
+    events = []
+    progress = []
+    flushed = []
+
+    async def fake_load_candidates(_provider, *, test_mode, limit):
+        assert test_mode is True
+        assert limit == 1
+        return [
+            discovery.SourceCandidate(
+                payer_name="Example Payer",
+                provider="master-list",
+                index_url="https://example.com/index.json",
+                status="active",
+            )
+        ]
+
+    async def fake_push_objects(rows, model, *, rewrite, use_copy):
+        pushed.append((model, rows, rewrite, use_copy))
+
+    async def fake_store_candidates(_candidates):
+        return (
+            [{"payer_id": "payer_1"}],
+            [{"source_id": "source_1", "index_url": "https://example.com/index.json"}],
+        )
+
+    async def fake_noop(*_args, **_kwargs):
+        return None
+
+    async def fake_flush(timeout_seconds):
+        flushed.append(timeout_seconds)
+
+    monkeypatch.setattr(discovery, "_load_candidates", fake_load_candidates)
+    monkeypatch.setattr(discovery, "init_db", fake_noop)
+    monkeypatch.setattr(discovery, "ensure_database", fake_noop)
+    monkeypatch.setattr(discovery, "_ensure_catalog_tables", fake_noop)
+    monkeypatch.setattr(discovery, "push_objects", fake_push_objects)
+    monkeypatch.setattr(discovery, "_store_candidates", fake_store_candidates)
+    monkeypatch.setattr(discovery, "enqueue_status_event", lambda payload: events.append(payload))
+    monkeypatch.setattr(discovery, "enqueue_live_progress", lambda **payload: progress.append(payload))
+    monkeypatch.setattr(discovery, "flush_status_events", fake_flush)
+
+    result = await discovery.main(test_mode=True, provider="master-list", limit=1)
+
+    control_run_id = result["crawl_run_id"]
+    crawl_rows = [rows[0] for model, rows, _rewrite, _use_copy in pushed if model is discovery.MRFCrawlRun]
+    assert control_run_id.startswith("mrfcrawl_")
+    assert [event["status"] for event in events] == ["running", "succeeded"]
+    assert all(event["run_id"] == control_run_id for event in events)
+    assert events[0]["importer"] == "mrf-source-discovery"
+    assert events[0]["triggered_by"] == "direct_cli"
+    assert events[0]["params"]["provider"] == "master-list"
+    assert events[1]["metrics"]["crawl_run_id"] == control_run_id
+    assert events[1]["metrics"]["crawl_status"] == "succeeded"
+    assert events[1]["metrics"]["sources"] == 1
+    assert [row["run_id"] for row in crawl_rows] == [control_run_id, control_run_id]
+    assert [item["run_id"] for item in progress] == [control_run_id, control_run_id, control_run_id]
+    assert flushed == [1.0]

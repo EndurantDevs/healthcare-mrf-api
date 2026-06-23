@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import gzip
 import html
 import ipaddress
 import json
@@ -33,6 +34,7 @@ from db.models import (
     db,
 )
 from process.ext.utils import ensure_database, push_objects
+from process.import_status_events import enqueue_status_event, flush_status_events
 from process.live_progress import enqueue_live_progress
 from process.ptg_parts.canonical import canonicalize_url, semantic_hash
 from process.ptg_parts.source_jobs import parse_toc_catalog_entries
@@ -533,7 +535,13 @@ async def _fetch_text(
                     raise ValueError("response body is not JSON")
             chunks.append(chunk)
         charset = resp.charset or "utf-8"
-    return b"".join(chunks).decode(charset, errors="replace")
+    return _decode_response_body(b"".join(chunks), charset=charset)
+
+
+def _decode_response_body(body: bytes, *, charset: str = "utf-8") -> str:
+    if body.startswith(b"\x1f\x8b"):
+        body = gzip.decompress(body)
+    return body.decode(charset or "utf-8", errors="replace")
 
 
 async def _fetch_json(url: str, *, max_bytes: int = MAX_TOC_BYTES_DEFAULT, session: aiohttp.ClientSession | None = None) -> dict[str, Any]:
@@ -1185,10 +1193,15 @@ def _html_link_candidates(html_text: str, *, base_url: str) -> list[dict[str, An
 
 def _looks_html_mrf_toc_url(url: str | None, label: str | None = None) -> bool:
     path = urlsplit(str(url or "")).path.lower()
-    if not path.endswith(".json"):
-        return False
     text = f"{path} {label or ''}".lower().replace("_", "-")
-    return any(token in text for token in ("index.json", "toc", "table-of-contents", "table of contents"))
+    if path.endswith((".json", ".json.gz")):
+        return any(token in text for token in ("index.json", "index.json.gz", "toc", "table-of-contents", "table of contents"))
+    file_name = Path(path).name.replace("_", "-")
+    if "." in file_name:
+        return False
+    if not file_name.endswith(("-index", "-toc")):
+        return False
+    return any(token in text for token in ("/mrf/", "mrf", "machine-readable", "transparency", "table-of-contents", "table of contents"))
 
 
 def _looks_html_mrf_body_reference(url: str | None, label: str | None = None) -> bool:
@@ -1532,7 +1545,10 @@ async def _resolve_healthsparq_public_mrf(
 
 def _looks_direct_toc_url(url: str | None) -> bool:
     path = urlsplit(str(url or "")).path.lower()
-    return path.endswith(".json")
+    if path.endswith((".json", ".json.gz")):
+        return True
+    file_name = Path(path).name.replace("_", "-")
+    return "." not in file_name and file_name.endswith(("-index", "-toc")) and "/mrf/" in path
 
 
 async def _crawl_targets_for_source(source: dict[str, Any], url: str, session: aiohttp.ClientSession) -> list[CrawlTarget]:
@@ -2837,6 +2853,121 @@ async def _push_import_control_catalog(
     return (sources_synced, plans_synced, errors)
 
 
+def _discovery_run_params(
+    *,
+    test_mode: bool,
+    provider: str | None,
+    limit: int | None,
+    source_entity_types: tuple[str, ...],
+    source_payer_query: str | None,
+    check_urls: bool,
+    crawl: bool,
+    probe_files: bool,
+    file_probe_limit: int | None,
+    file_probe_types: tuple[str, ...],
+    file_probe_entity_types: tuple[str, ...],
+    file_probe_payer_query: str | None,
+    sync_import_control: bool,
+    max_toc_bytes: int,
+    concurrency: int,
+    crawl_target_limit: int | None,
+) -> dict[str, Any]:
+    return {
+        "test_mode": test_mode,
+        "provider": provider,
+        "limit": limit,
+        "source_entity_types": list(source_entity_types),
+        "source_payer_query": source_payer_query,
+        "check_urls": check_urls,
+        "crawl": crawl,
+        "probe_files": probe_files,
+        "file_probe_limit": file_probe_limit,
+        "file_probe_types": list(file_probe_types),
+        "file_probe_entity_types": list(file_probe_entity_types),
+        "file_probe_payer_query": file_probe_payer_query,
+        "sync_import_control": sync_import_control,
+        "max_toc_bytes": max_toc_bytes,
+        "concurrency": concurrency,
+        "crawl_target_limit": crawl_target_limit,
+    }
+
+
+def _control_status_from_crawl_status(crawl_status: str) -> str:
+    return "succeeded" if crawl_status == "succeeded_with_errors" else crawl_status
+
+
+def _discovery_control_metrics(
+    result: DiscoveryResult,
+    *,
+    crawl_status: str,
+    crawl_run_id: str,
+    run_mode: str,
+    bytes_streamed: int = 0,
+) -> dict[str, Any]:
+    return {
+        "crawl_run_id": crawl_run_id,
+        "crawl_status": crawl_status,
+        "run_mode": run_mode,
+        "candidates": result.candidates,
+        "payers": result.payers,
+        "sources": result.sources,
+        "urls_checked": result.urls_checked,
+        "plans_discovered": result.plans,
+        "files_discovered": result.files,
+        "files_probed": result.files_probed,
+        "file_probe_ok": result.file_probe_ok,
+        "bytes_streamed": bytes_streamed,
+        "import_control_synced": result.import_control_synced,
+        "import_control_sources_synced": result.import_control_sources_synced,
+        "import_control_plans_synced": result.import_control_plans_synced,
+        "error_count": len(result.errors),
+    }
+
+
+def _emit_discovery_control_event(
+    *,
+    control_run_id: str,
+    crawl_run_id: str,
+    status: str,
+    phase_detail: str,
+    progress: dict[str, Any],
+    params: dict[str, Any],
+    started_at: dt.datetime,
+    finished_at: dt.datetime | None = None,
+    triggered_by: str | None = None,
+    metrics: dict[str, Any] | None = None,
+    error: dict[str, Any] | None = None,
+) -> None:
+    if not control_run_id:
+        return
+    heartbeat_at = finished_at or _utc_now()
+    payload = {
+        "run_id": control_run_id,
+        "importer": "mrf-source-discovery",
+        "status": status,
+        "phase_detail": phase_detail,
+        "params": params,
+        "progress": progress,
+        "metrics": {"crawl_run_id": crawl_run_id, **(metrics or {})},
+        "error": error,
+        "created_at": started_at,
+        "started_at": started_at,
+        "heartbeat_at": heartbeat_at,
+    }
+    if finished_at is not None:
+        payload["finished_at"] = finished_at
+    if triggered_by:
+        payload["triggered_by"] = triggered_by
+    enqueue_status_event(payload)
+
+
+async def _flush_discovery_control_events() -> None:
+    timeout = float(os.getenv("HLTHPRT_MRF_DISCOVERY_CONTROL_EVENT_FLUSH_SECONDS", "1.0"))
+    if timeout <= 0:
+        return
+    await flush_status_events(timeout_seconds=timeout)
+
+
 async def main(
     test_mode: bool = False,
     provider: str | None = None,
@@ -2873,9 +3004,47 @@ async def main(
     crawl_run_id = _id("mrfcrawl", {"started_at": started_at.isoformat(), "providers": providers, "run_id": run_id})
     run_mode = _discovery_run_mode(crawl=crawl, check_urls=check_urls, probe_files=probe_files)
     result.crawl_run_id = crawl_run_id
-    if run_id:
+    control_run_id = run_id or crawl_run_id
+    run_params = _discovery_run_params(
+        test_mode=test_mode,
+        provider=provider,
+        limit=limit,
+        source_entity_types=parsed_source_entity_types,
+        source_payer_query=parsed_source_payer_query,
+        check_urls=check_urls,
+        crawl=crawl,
+        probe_files=probe_files,
+        file_probe_limit=file_probe_limit,
+        file_probe_types=parsed_file_probe_types,
+        file_probe_entity_types=parsed_file_probe_entity_types,
+        file_probe_payer_query=parsed_file_probe_payer_query,
+        sync_import_control=sync_import_control,
+        max_toc_bytes=max_toc_bytes,
+        concurrency=concurrency,
+        crawl_target_limit=crawl_target_limit,
+    )
+    emit_standalone_control_events = bool(not dry_run and not run_id)
+    if emit_standalone_control_events:
+        _emit_discovery_control_event(
+            control_run_id=control_run_id,
+            crawl_run_id=crawl_run_id,
+            status="running",
+            phase_detail="loading source providers",
+            progress={
+                "unit": "providers",
+                "done": 0,
+                "total": len(providers),
+                "pct": 0,
+                "message": "loading source providers",
+                "phase": "loading source providers",
+            },
+            params=run_params,
+            started_at=started_at,
+            triggered_by="direct_cli" if not run_id else None,
+        )
+    if control_run_id and not dry_run:
         enqueue_live_progress(
-            run_id=run_id,
+            run_id=control_run_id,
             importer="mrf-source-discovery",
             status="running",
             phase="loading source providers",
@@ -2893,9 +3062,9 @@ async def main(
                 candidates.extend(await _load_candidates(provider_name, test_mode=test_mode, limit=bounded_limit))
             except Exception as exc:  # pylint: disable=broad-exception-caught
                 result.errors.append({"provider": provider_name, "message": str(exc)})
-            if run_id:
+            if control_run_id and not dry_run:
                 enqueue_live_progress(
-                    run_id=run_id,
+                    run_id=control_run_id,
                     importer="mrf-source-discovery",
                     status="running",
                     phase="loading source providers",
@@ -2932,29 +3101,12 @@ async def main(
         [
             {
                 "crawl_run_id": crawl_run_id,
-                "run_id": run_id,
+                "run_id": control_run_id,
                 "provider": ",".join(providers),
                 "mode": run_mode,
                 "status": "running",
                 "started_at": started_at,
-                "params": {
-                    "test_mode": test_mode,
-                    "provider": provider,
-                    "limit": limit,
-                    "source_entity_types": list(parsed_source_entity_types),
-                    "source_payer_query": parsed_source_payer_query,
-                    "check_urls": check_urls,
-                    "crawl": crawl,
-                    "probe_files": probe_files,
-                    "file_probe_limit": file_probe_limit,
-                    "file_probe_types": list(parsed_file_probe_types),
-                    "file_probe_entity_types": list(parsed_file_probe_entity_types),
-                    "file_probe_payer_query": parsed_file_probe_payer_query,
-                    "sync_import_control": sync_import_control,
-                    "max_toc_bytes": max_toc_bytes,
-                    "concurrency": concurrency,
-                    "crawl_target_limit": crawl_target_limit,
-                },
+                "params": run_params,
                 "sources_discovered": 0,
                 "urls_checked": 0,
                 "etag_skipped": 0,
@@ -2973,8 +3125,8 @@ async def main(
     result.payers = len(payer_rows)
     result.sources = len(source_rows)
     observations: list[dict[str, Any]] = []
-    observation_run_id = run_id or crawl_run_id
-    progress_run_id = run_id
+    observation_run_id = control_run_id
+    progress_run_id = control_run_id
     if check_urls:
         observations = await _store_observations(
             source_rows,
@@ -3027,40 +3179,26 @@ async def main(
         except Exception as exc:  # pylint: disable=broad-exception-caught
             result.errors.append({"provider": "import-control-catalog", "message": str(exc)})
 
+    crawl_status = "succeeded" if not result.errors else "succeeded_with_errors"
+    finished_at = _utc_now()
+    bytes_streamed = sum(int(item.get("content_length") or 0) for item in observations)
     await push_objects(
         [
             {
                 "crawl_run_id": crawl_run_id,
-                "run_id": run_id,
+                "run_id": control_run_id,
                 "provider": ",".join(providers),
                 "mode": run_mode,
-                "status": "succeeded" if not result.errors else "succeeded_with_errors",
+                "status": crawl_status,
                 "started_at": started_at,
-                "finished_at": _utc_now(),
-                "params": {
-                    "test_mode": test_mode,
-                    "provider": provider,
-                    "limit": limit,
-                    "source_entity_types": list(parsed_source_entity_types),
-                    "source_payer_query": parsed_source_payer_query,
-                    "check_urls": check_urls,
-                    "crawl": crawl,
-                    "probe_files": probe_files,
-                    "file_probe_limit": file_probe_limit,
-                    "file_probe_types": list(parsed_file_probe_types),
-                    "file_probe_entity_types": list(parsed_file_probe_entity_types),
-                    "file_probe_payer_query": parsed_file_probe_payer_query,
-                    "sync_import_control": sync_import_control,
-                    "max_toc_bytes": max_toc_bytes,
-                    "concurrency": concurrency,
-                    "crawl_target_limit": crawl_target_limit,
-                },
+                "finished_at": finished_at,
+                "params": run_params,
                 "sources_discovered": result.sources,
                 "urls_checked": result.urls_checked,
                 "etag_skipped": 0,
                 "plans_discovered": result.plans,
                 "files_discovered": result.files,
-                "bytes_streamed": sum(int(item.get("content_length") or 0) for item in observations),
+                "bytes_streamed": bytes_streamed,
                 "errors": result.errors,
             }
         ],
@@ -3068,9 +3206,9 @@ async def main(
         rewrite=True,
         use_copy=False,
     )
-    if run_id:
+    if control_run_id:
         enqueue_live_progress(
-            run_id=run_id,
+            run_id=control_run_id,
             importer="mrf-source-discovery",
             status="succeeded",
             phase="mrf source discovery complete",
@@ -3080,6 +3218,32 @@ async def main(
             pct=100,
             message="mrf source discovery complete",
         )
+        if emit_standalone_control_events:
+            _emit_discovery_control_event(
+                control_run_id=control_run_id,
+                crawl_run_id=crawl_run_id,
+                status=_control_status_from_crawl_status(crawl_status),
+                phase_detail="mrf source discovery complete",
+                progress={
+                    "unit": "sources",
+                    "done": result.sources,
+                    "total": result.sources,
+                    "pct": 100,
+                    "message": "mrf source discovery complete",
+                    "phase": "mrf source discovery complete",
+                },
+                params=run_params,
+                metrics=_discovery_control_metrics(
+                    result,
+                    crawl_status=crawl_status,
+                    crawl_run_id=crawl_run_id,
+                    run_mode=run_mode,
+                    bytes_streamed=bytes_streamed,
+                ),
+                started_at=started_at,
+                finished_at=finished_at,
+            )
+            await _flush_discovery_control_events()
     return result.as_dict()
 
 
