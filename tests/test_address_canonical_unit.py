@@ -1199,6 +1199,7 @@ def test_entity_address_unified_ptg_partial_filters_sources_to_requested_scope()
     assert "FROM mrf.entity_address_unified_20260623_ptg_groups AS affected" in mrf_source
     assert "affected.entity_type = src.entity_type" in mrf_source
     assert "affected.entity_id = src.entity_id" in mrf_source
+    assert "affected.address_key = src.address_key" in mrf_source
     assert "affected.street_key IS NOT DISTINCT FROM" in mrf_source
 
 
@@ -1244,7 +1245,12 @@ def test_entity_address_unified_prepares_ptg_partial_affected_groups():
     assert "CREATE UNLOGGED TABLE mrf.entity_address_unified_20260623_ptg_groups AS" in sql
     assert "SELECT DISTINCT" in sql
     assert "FROM mrf.entity_address_unified AS live" in sql
+    assert "live.address_key::uuid AS address_key" in sql
     assert "COALESCE(live.ptg_source_array, ARRAY[]::varchar[]) && ARRAY['payer_a']::varchar[]" in sql
+    assert "UNION" in sql
+    assert "FROM mrf.ptg_address AS p" in sql
+    assert "p.address_key::uuid AS address_key" in sql
+    assert "p.source_key IN ('payer_a')" in sql
     assert "street_key" in sql
 
     index_sql = entity_address_unified._index_ptg_partial_affected_groups_sql(
@@ -1253,6 +1259,7 @@ def test_entity_address_unified_prepares_ptg_partial_affected_groups():
     )
     assert "CREATE INDEX entity_address_unified_20260623_ptg_groups_idx_group" in index_sql
     assert "ON mrf.entity_address_unified_20260623_ptg_groups" in index_sql
+    assert "address_key" in index_sql
 
 
 def test_entity_address_unified_can_range_shard_large_source_selects():
@@ -1753,6 +1760,24 @@ def test_entity_address_unified_evidence_stage_updates_by_location_key():
     assert "source_count = COALESCE(CARDINALITY(e.evidence_sources), 0)::int" in apply_sql
     assert "independent_source_count = COALESCE(CARDINALITY(e.evidence_sources), 0)::int" in apply_sql
     assert "multi_source_confirmed = COALESCE(CARDINALITY(e.evidence_sources), 0) > 1" in apply_sql
+
+
+def test_entity_address_unified_evidence_base_can_scope_to_affected_groups():
+    evidence_table = entity_address_unified._evidence_stage_table_name("entity_address_unified_stage")
+    load_sql = entity_address_unified._load_multi_source_evidence_base_sql(
+        "mrf",
+        "entity_address_unified_stage",
+        evidence_table,
+        evidence_shards=32,
+        affected_group_table="entity_address_unified_stage_ptg_groups",
+    )
+
+    assert "FROM mrf.entity_address_unified_stage AS t" in load_sql
+    assert "FROM mrf.entity_address_unified_stage_ptg_groups AS affected" in load_sql
+    assert "affected.entity_type = t.entity_type" in load_sql
+    assert "affected.entity_id = t.entity_id" in load_sql
+    assert "affected.address_key = t.address_key" in load_sql
+    assert "affected.street_key IS NOT DISTINCT FROM" in load_sql
 
 
 def test_entity_address_unified_builds_evidence_and_bridge_stage_sql():

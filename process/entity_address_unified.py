@@ -1728,11 +1728,17 @@ def _entity_address_evidence_group_match_sql(group_alias: str, row_alias: str) -
     return (
         f"{group_alias}.entity_type = {row_alias}.entity_type\n"
         f"       AND {group_alias}.entity_id = {row_alias}.entity_id\n"
-        f"       AND {group_alias}.street_key IS NOT DISTINCT FROM {_street_soft_norm_expr(f'{row_alias}.first_line')}\n"
-        f"       AND {group_alias}.city_key IS NOT DISTINCT FROM {_alnum_norm_expr(f'{row_alias}.city_name')}\n"
-        f"       AND {group_alias}.state_key IS NOT DISTINCT FROM {_state_norm_expr(f'{row_alias}.state_name')}\n"
-        f"       AND {group_alias}.zip_key IS NOT DISTINCT FROM {_zip5_norm_expr(f'{row_alias}.postal_code')}\n"
-        f"       AND {group_alias}.country_key IS NOT DISTINCT FROM {_state_norm_expr(f'{row_alias}.country_code')}"
+        f"       AND (\n"
+        f"            ({group_alias}.address_key IS NOT NULL AND {row_alias}.address_key IS NOT NULL "
+        f"AND {group_alias}.address_key = {row_alias}.address_key)\n"
+        f"            OR (\n"
+        f"                {group_alias}.street_key IS NOT DISTINCT FROM {_street_soft_norm_expr(f'{row_alias}.first_line')}\n"
+        f"            AND {group_alias}.city_key IS NOT DISTINCT FROM {_alnum_norm_expr(f'{row_alias}.city_name')}\n"
+        f"            AND {group_alias}.state_key IS NOT DISTINCT FROM {_state_norm_expr(f'{row_alias}.state_name')}\n"
+        f"            AND {group_alias}.zip_key IS NOT DISTINCT FROM {_zip5_norm_expr(f'{row_alias}.postal_code')}\n"
+        f"            AND {group_alias}.country_key IS NOT DISTINCT FROM {_state_norm_expr(f'{row_alias}.country_code')}\n"
+        f"            )\n"
+        f"       )"
     )
 
 
@@ -1746,6 +1752,7 @@ def _prepare_ptg_partial_affected_groups_sql(db_schema: str, group_table: str, s
     SELECT DISTINCT
         live.entity_type::varchar AS entity_type,
         live.entity_id::varchar AS entity_id,
+        live.address_key::uuid AS address_key,
         {_street_soft_norm_expr("live.first_line")}::varchar AS street_key,
         {_alnum_norm_expr("live.city_name")}::varchar AS city_key,
         {_state_norm_expr("live.state_name")}::varchar AS state_key,
@@ -1753,7 +1760,21 @@ def _prepare_ptg_partial_affected_groups_sql(db_schema: str, group_table: str, s
         {_state_norm_expr("live.country_code")}::varchar AS country_key
       FROM {db_schema}.{EntityAddressUnified.__main_table__} AS live
      WHERE {_entity_address_ptg_source_overlap_sql(source_keys, alias="live")}
-       AND live.location_key IS NOT NULL;
+       AND live.location_key IS NOT NULL
+    UNION
+    SELECT DISTINCT
+        'npi'::varchar AS entity_type,
+        p.npi::varchar AS entity_id,
+        p.address_key::uuid AS address_key,
+        NULL::varchar AS street_key,
+        {_alnum_norm_expr("p.city_norm")}::varchar AS city_key,
+        {_state_norm_expr("p.state_code")}::varchar AS state_key,
+        {_zip5_norm_expr("p.zip5")}::varchar AS zip_key,
+        'us'::varchar AS country_key
+      FROM {db_schema}.ptg_address AS p
+     WHERE p.npi IS NOT NULL
+       AND p.location_key IS NOT NULL
+       AND {_ptg_source_key_filter(db_schema, source_keys)};
     """
 
 
@@ -1764,6 +1785,7 @@ def _index_ptg_partial_affected_groups_sql(db_schema: str, group_table: str) -> 
         ON {db_schema}.{group_table} (
             entity_type,
             entity_id,
+            address_key,
             street_key,
             city_key,
             state_key,
@@ -3143,23 +3165,33 @@ def _load_multi_source_evidence_base_sql(
     evidence_table: str,
     *,
     evidence_shards: int,
+    affected_group_table: str | None = None,
 ) -> str:
     group_hash_expr = _evidence_group_hash_expr(evidence_shards)
+    affected_filter = ""
+    if affected_group_table:
+        affected_filter = f"""
+           AND EXISTS (
+                SELECT 1
+                  FROM {db_schema}.{affected_group_table} AS affected
+                 WHERE {_entity_address_evidence_group_match_sql("affected", "t")}
+           )"""
     return f"""
     WITH normalized AS (
         SELECT
-            location_key,
-            entity_type,
-            entity_id,
-            {_street_soft_norm_expr("first_line")}::varchar AS street_key,
-            {_alnum_norm_expr("city_name")}::varchar AS city_key,
-            {_state_norm_expr("state_name")}::varchar AS state_key,
-            {_zip5_norm_expr("postal_code")}::varchar AS zip_key,
-            {_state_norm_expr("country_code")}::varchar AS country_key,
-            COALESCE(address_sources, ARRAY[]::varchar[])::varchar[] AS address_sources,
-            COALESCE(source_record_ids, ARRAY[]::varchar[])::varchar[] AS source_record_ids
-          FROM {db_schema}.{stage_table}
-         WHERE location_key IS NOT NULL
+            t.location_key,
+            t.entity_type,
+            t.entity_id,
+            {_street_soft_norm_expr("t.first_line")}::varchar AS street_key,
+            {_alnum_norm_expr("t.city_name")}::varchar AS city_key,
+            {_state_norm_expr("t.state_name")}::varchar AS state_key,
+            {_zip5_norm_expr("t.postal_code")}::varchar AS zip_key,
+            {_state_norm_expr("t.country_code")}::varchar AS country_key,
+            COALESCE(t.address_sources, ARRAY[]::varchar[])::varchar[] AS address_sources,
+            COALESCE(t.source_record_ids, ARRAY[]::varchar[])::varchar[] AS source_record_ids
+          FROM {db_schema}.{stage_table} AS t
+         WHERE t.location_key IS NOT NULL
+           {affected_filter}
     )
     INSERT INTO {db_schema}.{evidence_table} (
         location_key,
@@ -7463,6 +7495,7 @@ async def process_data(ctx, task=None):
             stage_table,
             evidence_table,
             evidence_shards=evidence_shards,
+            affected_group_table=affected_group_table,
         ),
         context=context,
         run_id=run_id,
