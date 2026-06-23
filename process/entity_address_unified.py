@@ -767,6 +767,53 @@ def _zip5_norm_expr(expr: str) -> str:
     )
 
 
+def _address_source_text_present_predicate(expr: str) -> str:
+    cleaned = f"NULLIF(BTRIM(COALESCE({expr}, '')), '')"
+    token = f"UPPER(REGEXP_REPLACE(BTRIM(COALESCE({expr}, '')), '[^A-Za-z0-9]+', '', 'g'))"
+    return (
+        f"{cleaned} IS NOT NULL "
+        f"AND {token} NOT IN ('NULL', 'NONE', 'NA', 'NAN', 'UNKNOWN', 'UNSPECIFIED')"
+    )
+
+
+def _address_source_state_present_predicate(expr: str) -> str:
+    cleaned = f"NULLIF(BTRIM(COALESCE({expr}, '')), '')"
+    token = f"UPPER(REGEXP_REPLACE(BTRIM(COALESCE({expr}, '')), '[^A-Za-z]+', '', 'g'))"
+    return (
+        f"{cleaned} IS NOT NULL "
+        f"AND {token} NOT IN ('NULL', 'NONE', 'NA', 'NAN', 'UN', 'UNKNOWN', 'UNSPECIFIED', 'XX', 'ZZ')"
+    )
+
+
+def _address_source_zip5_present_predicate(expr: str) -> str:
+    zip5 = _zip5_norm_expr(expr)
+    return f"{zip5} IS NOT NULL AND {zip5} NOT IN ('00000', '99999')"
+
+
+def _address_source_us_country_predicate(expr: str) -> str:
+    token = f"UPPER(REGEXP_REPLACE(BTRIM(COALESCE({expr}, '')), '[^A-Za-z]+', '', 'g'))"
+    return f"({token} = '' OR {token} IN ('US', 'USA', 'UNITEDSTATES', 'UNITEDSTATESOFAMERICA'))"
+
+
+def _address_source_keyable_predicate(
+    *,
+    first_line: str,
+    city: str,
+    state: str,
+    zip_code: str,
+    country: str = "'US'",
+) -> str:
+    return (
+        f"{_address_source_state_present_predicate(state)}\n"
+        f"               AND {_address_source_zip5_present_predicate(zip_code)}\n"
+        f"               AND {_address_source_us_country_predicate(country)}\n"
+        "               AND (\n"
+        f"                    {_address_source_text_present_predicate(first_line)}\n"
+        f"                    OR {_address_source_text_present_predicate(city)}\n"
+        "               )"
+    )
+
+
 def _phone_norm_expr(expr: str) -> str:
     return f"NULLIF(regexp_replace(COALESCE({expr}, ''), '[^0-9]', '', 'g'), '')"
 
@@ -913,6 +960,19 @@ def _source_selects(
     has_mrf_address = available.get("mrf_address", False)
     has_ptg_address = available.get("ptg_address", False)
     has_archive = available.get("address_archive_v2", False)
+    ffs_practice_address_predicate = _address_source_keyable_predicate(
+        first_line="NULL",
+        city="fa.city",
+        state="fa.state",
+        zip_code="fa.zip_code",
+    )
+    mrf_address_predicate = _address_source_keyable_predicate(
+        first_line="a.first_line",
+        city="a.city_name",
+        state="a.state_name",
+        zip_code="a.postal_code",
+        country="a.country_code",
+    )
 
     npi_join = f"LEFT JOIN {db_schema}.npi AS n ON n.npi = a.npi" if has_npi else ""
     doctors_npi_join = f"LEFT JOIN {db_schema}.npi AS n ON n.npi = d.npi" if has_npi else ""
@@ -1050,60 +1110,6 @@ def _source_selects(
             """
         )
 
-    if has_ffs:
-        selects.append(
-            f"""
-            SELECT
-                'npi'::varchar AS entity_type,
-                f.npi::varchar AS entity_id,
-                f.npi::bigint AS npi,
-                NULL::bigint AS inferred_npi,
-                NULL::float8 AS inference_confidence,
-                NULL::varchar AS inference_method,
-                {(_npi_entity_name_expr('n') if has_npi else 'NULL::varchar')} AS entity_name,
-                {(_npi_entity_subtype_expr('n') if has_npi else 'NULL::varchar')} AS entity_subtype,
-                'primary'::varchar AS type,
-                {('COALESCE(pa.taxonomy_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS taxonomy_array,
-                {('COALESCE(pa.plans_network_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS plans_network_array,
-                {('COALESCE(pa.procedures_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS procedures_array,
-                {('COALESCE(pa.medications_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS medications_array,
-                ARRAY[]::varchar[] AS aca_plan_array,
-                ARRAY[]::varchar[] AS aca_network_array,
-                ARRAY[]::varchar[] AS ptg_plan_array,
-                ARRAY[]::varchar[] AS ptg_source_array,
-                ARRAY[]::varchar[] AS group_plan_array,
-                '{BASE_ADDRESS_VERSION}'::varchar AS base_address_version,
-                NULL::varchar AS ptg_address_version,
-                f.address_line_1::varchar AS first_line,
-                f.address_line_2::varchar AS second_line,
-                f.city::varchar AS city_name,
-                f.state::varchar AS state_name,
-                LEFT(f.zip_code, 5)::varchar AS postal_code,
-                'US'::varchar AS country_code,
-                NULL::varchar AS telephone_number,
-                NULL::varchar AS fax_number,
-                NULL::varchar AS formatted_address,
-                NULL::numeric AS lat,
-                NULL::numeric AS long,
-                f.reporting_period_end::date AS date_added,
-                NULL::varchar AS place_id,
-                f.address_key::uuid AS address_key,
-                COALESCE(f.imported_at, NOW())::timestamp AS updated_at,
-                'provider_enrollment_ffs'::varchar AS address_source,
-                ('provider_enrollment_ffs:' || COALESCE(f.enrollment_id, f.record_hash::varchar))::varchar AS source_record_id
-              FROM {db_schema}.provider_enrollment_ffs AS f
-              {ffs_npi_join}
-              {ffs_pa_from}
-             WHERE f.npi IS NOT NULL
-               AND (
-                    NULLIF(f.address_line_1, '') IS NOT NULL
-                    OR NULLIF(f.city, '') IS NOT NULL
-                    OR NULLIF(f.state, '') IS NOT NULL
-                    OR LEFT(COALESCE(f.zip_code, ''), 5) <> ''
-               )
-            """
-        )
-
     if has_ffs and has_ffs_address:
         selects.append(
             f"""
@@ -1151,6 +1157,7 @@ def _source_selects(
               {ffs_npi_join}
               {ffs_pa_from}
              WHERE f.npi IS NOT NULL
+               AND {ffs_practice_address_predicate}
             """
         )
 
@@ -1456,6 +1463,7 @@ def _source_selects(
               {npi_join}
               {mrf_pa_from}
              WHERE a.npi IS NOT NULL
+               AND {mrf_address_predicate}
             """
         )
 

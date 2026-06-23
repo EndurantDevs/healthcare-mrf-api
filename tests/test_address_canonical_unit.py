@@ -968,7 +968,7 @@ def test_entity_address_unified_publish_decision_allows_env_override(monkeypatch
     assert entity_address_unified._publish_requested({}, test_mode=False) is False  # pylint: disable=protected-access
 
 
-def test_ffs_address_source_does_not_borrow_parent_street_lines():
+def test_ffs_parent_source_is_not_a_unified_address_source():
     selects = entity_address_unified._source_selects(
         "mrf",
         {
@@ -979,13 +979,33 @@ def test_ffs_address_source_does_not_borrow_parent_street_lines():
             "geo_zip_lookup": False,
         },
     )
-    parent_source = next(s for s in selects if "'provider_enrollment_ffs'::varchar AS address_source" in s)
     child_source = next(s for s in selects if "'provider_enrollment_ffs_address'::varchar AS address_source" in s)
 
-    assert "f.address_line_1::varchar AS first_line" in parent_source
-    assert "f.address_line_2::varchar AS second_line" in parent_source
+    assert not any("'provider_enrollment_ffs'::varchar AS address_source" in s for s in selects)
     assert "NULL::varchar AS first_line" in child_source
     assert "NULL::varchar AS second_line" in child_source
+
+
+def test_ffs_address_source_filters_unkeyable_practice_locations():
+    selects = entity_address_unified._source_selects(
+        "mrf",
+        {
+            "provider_enrollment_ffs": True,
+            "provider_enrollment_ffs_address": True,
+            "npi": False,
+            "npi_address": False,
+            "geo_zip_lookup": False,
+        },
+    )
+
+    child_source = next(s for s in selects if "'provider_enrollment_ffs_address'::varchar AS address_source" in s)
+    assert "WHERE f.npi IS NOT NULL" in child_source
+    assert "NULLIF(BTRIM(COALESCE(fa.state, '')), '') IS NOT NULL" in child_source
+    assert "NOT IN ('NULL', 'NONE', 'NA', 'NAN', 'UN', 'UNKNOWN', 'UNSPECIFIED', 'XX', 'ZZ')" in child_source
+    assert "NULLIF(LEFT(regexp_replace(COALESCE(fa.zip_code, ''), '[^0-9]', '', 'g'), 5), '') IS NOT NULL" in child_source
+    assert "NOT IN ('00000', '99999')" in child_source
+    assert "NULLIF(BTRIM(COALESCE(fa.city, '')), '') IS NOT NULL" in child_source
+    assert "'provider_enrollment_ffs'::varchar AS address_source" not in child_source
 
 
 def test_entity_address_unified_registers_mrf_address_source():
@@ -1005,6 +1025,29 @@ def test_entity_address_unified_registers_mrf_address_source():
     assert "a.postal_code::varchar AS postal_code" in mrf_source
     assert "a.taxonomy_array" not in mrf_source
     assert "ARRAY[0]::int[] AS taxonomy_array" in mrf_source
+
+
+def test_entity_address_unified_mrf_source_filters_placeholder_addresses():
+    selects = entity_address_unified._source_selects(
+        "mrf",
+        {
+            "mrf_address": True,
+            "npi": False,
+            "npi_address": False,
+            "geo_zip_lookup": False,
+        },
+    )
+
+    mrf_source = next(s for s in selects if "'mrf'::varchar AS address_source" in s)
+    assert "WHERE a.npi IS NOT NULL" in mrf_source
+    assert "NULLIF(BTRIM(COALESCE(a.state_name, '')), '') IS NOT NULL" in mrf_source
+    assert "NOT IN ('NULL', 'NONE', 'NA', 'NAN', 'UN', 'UNKNOWN', 'UNSPECIFIED', 'XX', 'ZZ')" in mrf_source
+    assert "NULLIF(LEFT(regexp_replace(COALESCE(a.postal_code, ''), '[^0-9]', '', 'g'), 5), '') IS NOT NULL" in mrf_source
+    assert "NOT IN ('00000', '99999')" in mrf_source
+    assert "BTRIM(COALESCE(a.country_code, ''))" in mrf_source
+    assert "UNITEDSTATESOFAMERICA" in mrf_source
+    assert "NULLIF(BTRIM(COALESCE(a.first_line, '')), '') IS NOT NULL" in mrf_source
+    assert "OR NULLIF(BTRIM(COALESCE(a.city_name, '')), '') IS NOT NULL" in mrf_source
 
 
 def test_entity_address_unified_mrf_source_borrows_arrays_from_primary_npi_address():
@@ -1072,15 +1115,14 @@ def test_entity_address_unified_can_range_shard_large_source_selects():
         provider_enrollment_ffs_ranges=[(700, 800), (800, 900)],
     )
 
-    assert len(sharded) == 10
+    assert len(sharded) == 8
     assert any("FROM mrf.npi_address AS a" in sql and "AND a.npi >= 100" in sql for sql in sharded)
     assert any("FROM mrf.npi_address AS a" in sql and "AND a.npi < 300" in sql for sql in sharded)
     assert any("FROM mrf.mrf_address AS a" in sql and "AND a.npi >= 300" in sql for sql in sharded)
     assert any("FROM mrf.mrf_address AS a" in sql and "AND a.npi < 500" in sql for sql in sharded)
     assert any("FROM mrf.doctor_clinician_address AS d" in sql and "AND d.npi >= 500" in sql for sql in sharded)
     assert any("FROM mrf.doctor_clinician_address AS d" in sql and "AND d.npi < 700" in sql for sql in sharded)
-    assert any("FROM mrf.provider_enrollment_ffs AS f" in sql and "AND f.npi >= 700" in sql for sql in sharded)
-    assert any("FROM mrf.provider_enrollment_ffs AS f" in sql and "AND f.npi < 900" in sql for sql in sharded)
+    assert not any("'provider_enrollment_ffs'::varchar AS address_source" in sql for sql in sharded)
     assert any("FROM mrf.provider_enrollment_ffs_address AS fa" in sql and "AND f.npi >= 700" in sql for sql in sharded)
     assert any("FROM mrf.provider_enrollment_ffs_address AS fa" in sql and "AND f.npi < 900" in sql for sql in sharded)
 
