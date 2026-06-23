@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import datetime as dt
+import importlib
 import json
 import os
 import re
@@ -93,8 +94,9 @@ async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
     from api import control, control_imports  # pylint: disable=import-outside-toplevel
     from db.models import db  # pylint: disable=import-outside-toplevel
     from process.ext.utils import my_init_db  # pylint: disable=import-outside-toplevel
-    from process import ptg as process_ptg  # pylint: disable=import-outside-toplevel
     from process.ptg_address_entity_refresh import process_data as refresh_process_data  # pylint: disable=import-outside-toplevel
+
+    process_ptg = importlib.import_module("process.ptg")
 
     await my_init_db(db)
 
