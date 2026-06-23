@@ -3969,6 +3969,42 @@ async def group_plan_providers(request):
     serving_table = _safe_table_name(serving_tables.serving_table)
     set_component_table = _safe_table_name(serving_tables.provider_set_component_table)
     group_member_table = _safe_table_name(serving_tables.provider_group_member_table)
+
+    if (request.args.get("debug") or "").strip():
+        diag: dict[str, Any] = {
+            "snapshot_id": snapshot_id,
+            "serving_tables": {k: getattr(serving_tables, k) for k in serving_tables.__dataclass_fields__},
+        }
+        async def _cols(tbl):
+            if not tbl:
+                return None
+            try:
+                schema, _, name = tbl.partition(".")
+                r = await session.execute(text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema=:s AND table_name=:t ORDER BY ordinal_position"
+                ), {"s": schema, "t": name})
+                return [row[0] for row in r.fetchall()]
+            except Exception as exc:  # noqa: BLE001
+                return f"err: {exc}"
+        diag["serving_columns"] = await _cols(serving_table)
+        diag["group_member_columns"] = await _cols(group_member_table)
+        try:
+            r = await session.execute(text(
+                f"SELECT plan_id, COUNT(*) AS n FROM {serving_table} GROUP BY plan_id ORDER BY n DESC LIMIT 10"
+            ))
+            diag["serving_plan_ids"] = [{"plan_id": row[0], "rows": int(row[1])} for row in r.fetchall()]
+        except Exception as exc:  # noqa: BLE001
+            diag["serving_plan_ids"] = f"err: {exc}"
+        try:
+            r = await session.execute(text(
+                f"SELECT COUNT(DISTINCT npi) FROM {group_member_table} WHERE npi > 0"
+            ))
+            diag["group_member_distinct_npi"] = int(r.scalar() or 0)
+        except Exception as exc:  # noqa: BLE001
+            diag["group_member_distinct_npi"] = f"err: {exc}"
+        return response.json({"ok": True, "debug": diag})
+
     if not (serving_table and set_component_table and group_member_table):
         return response.json({
             "ok": False, "error_type": "unsupported_storage",
