@@ -2254,6 +2254,20 @@ def test_ptg_address_partial_refresh_rejects_member_fallback_only_sources():
     )
 
 
+def test_ptg_address_partial_refresh_rejects_legacy_aggregate_sources():
+    with pytest.raises(RuntimeError, match="legacy aggregate provider-location"):
+        ptg_address._validate_partial_refresh_sources(
+            [
+                {
+                    "source_key": "payer_a",
+                    "snapshot_id": "snap_a",
+                    "provider_group_location_table": None,
+                    "provider_group_member_table": None,
+                }
+            ]
+        )
+
+
 def test_ptg_address_sql_settings_include_bulk_defaults_and_overrides(monkeypatch):
     monkeypatch.delenv("HLTHPRT_PTG_ADDRESS_WORK_MEM", raising=False)
     settings = dict(ptg_address._ptg_address_sql_settings())

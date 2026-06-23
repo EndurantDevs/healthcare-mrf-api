@@ -259,6 +259,18 @@ def _validate_partial_refresh_sources(source_contexts: list[dict[str, str | None
             "PTG address partial refresh cannot safely update member-fallback-only snapshots "
             f"({', '.join(fallback_only)}); run refresh_mode=full for this source."
         )
+    legacy_aggregate_only = [
+        f"{source_context.get('source_key')}/{source_context.get('snapshot_id')}"
+        for source_context in source_contexts
+        if not source_context.get("provider_group_location_table")
+        and not source_context.get("provider_group_member_table")
+    ]
+    if legacy_aggregate_only:
+        raise RuntimeError(
+            "PTG address partial refresh cannot safely update legacy aggregate provider-location snapshots "
+            f"({', '.join(legacy_aggregate_only)}); publish source-scoped provider_group_location tables "
+            "or run refresh_mode=full."
+        )
 
 
 async def _relation_size_bytes(db_schema: str, table_name: str | None) -> int:
