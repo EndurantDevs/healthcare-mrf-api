@@ -433,7 +433,7 @@ async def _ensure_schema_exists(db_schema: str) -> None:
 
 
 def _stage_index_name(stage_table: str, index_name: str) -> str:
-    return f"{stage_table}_idx_{index_name}"
+    return _archived_identifier(f"{stage_table}_idx", f"_{index_name}")
 
 
 def _support_stage_classes(import_date: str) -> dict[type, type]:
@@ -1703,11 +1703,25 @@ def _string_array_literal(values: list[str]) -> str:
     return "ARRAY[" + ", ".join(_sql_literal(value) for value in values) + "]::varchar[]"
 
 
-def _ptg_source_key_filter(source_keys: list[str], *, column_sql: str = "p.source_key") -> str:
+def _ptg_source_key_filter(
+    db_schema: str,
+    source_keys: list[str],
+    *,
+    column_sql: str = "p.source_key",
+) -> str:
     if not source_keys:
         raise ValueError("source_keys must be non-empty for PTG partial refresh")
     source_literals = ", ".join(_sql_literal(source_key) for source_key in source_keys)
-    return f"{column_sql} IN ({source_literals})"
+    source_array = _string_array_literal(source_keys)
+    return (
+        f"({column_sql} IN ({source_literals}) "
+        f"OR COALESCE(p.ptg_source_array, ARRAY[]::varchar[]) && {source_array} "
+        "OR EXISTS ("
+        f"SELECT 1 FROM {db_schema}.{EntityAddressUnified.__main_table__} AS live "
+        "WHERE live.location_key = p.location_key "
+        f"AND {_entity_address_ptg_source_overlap_sql(source_keys, alias='live')}"
+        "))"
+    )
 
 
 def _ptg_partial_source_selects(
@@ -1727,7 +1741,7 @@ def _ptg_partial_source_selects(
         filtered.append(
             source_select.replace(
                 where_marker,
-                f"{where_marker}\n               AND {_ptg_source_key_filter(source_keys)}",
+                f"{where_marker}\n               AND {_ptg_source_key_filter(db_schema, source_keys)}",
                 1,
             )
         )
@@ -1750,10 +1764,7 @@ def _entity_address_partial_mixed_rows_sql(db_schema: str, source_keys: list[str
     SELECT COUNT(*)
       FROM {db_schema}.{EntityAddressUnified.__main_table__} AS live
      WHERE {_entity_address_ptg_source_overlap_sql(source_keys, alias="live")}
-       AND (
-            COALESCE(CARDINALITY(live.address_sources), 0) > 1
-         OR COALESCE(CARDINALITY(live.ptg_source_array), 0) > 1
-       );
+       AND COALESCE(CARDINALITY(live.address_sources), 0) > 1;
     """
 
 

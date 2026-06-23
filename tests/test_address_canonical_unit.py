@@ -991,6 +991,23 @@ def test_entity_address_unified_refresh_mode_and_ptg_source_keys(monkeypatch):
         entity_address_unified._entity_address_refresh_mode({"refresh_mode": "fastish"})
 
 
+def test_entity_address_unified_stage_index_name_is_hash_safe_for_long_names():
+    first = entity_address_unified._stage_index_name(
+        "ptg_address_codex_member_partial_smokefull_member_coverage",
+        "npi",
+    )
+    second = entity_address_unified._stage_index_name(
+        "ptg_address_codex_member_partial_smokefull_member_coverage",
+        "shard_npi",
+    )
+
+    assert first != second
+    assert len(first) <= 63
+    assert len(second) <= 63
+    assert first.endswith("_npi")
+    assert second.endswith("_shard_npi")
+
+
 def test_ffs_parent_source_is_not_a_unified_address_source():
     selects = entity_address_unified._source_selects(
         "mrf",
@@ -1174,7 +1191,10 @@ def test_entity_address_unified_ptg_partial_filters_to_requested_ptg_source():
     assert len(filtered) == 1
     assert "FROM mrf.ptg_address AS p" in filtered[0]
     assert "FROM mrf.mrf_address AS a" not in filtered[0]
-    assert "AND p.source_key IN ('payer_a', 'payer_b''s')" in filtered[0]
+    assert "AND (p.source_key IN ('payer_a', 'payer_b''s')" in filtered[0]
+    assert "COALESCE(p.ptg_source_array, ARRAY[]::varchar[]) && ARRAY['payer_a', 'payer_b''s']::varchar[]" in filtered[0]
+    assert "FROM mrf.entity_address_unified AS live" in filtered[0]
+    assert "live.location_key = p.location_key" in filtered[0]
 
 
 def test_entity_address_unified_partial_reuse_sql_excludes_changed_and_raw_locations():
@@ -1212,7 +1232,7 @@ def test_entity_address_unified_partial_mixed_rows_sql_guards_base_ptg_merges():
     assert "FROM mrf.entity_address_unified AS live" in sql
     assert "COALESCE(live.ptg_source_array, ARRAY[]::varchar[]) && ARRAY['payer_a']::varchar[]" in sql
     assert "COALESCE(CARDINALITY(live.address_sources), 0) > 1" in sql
-    assert "COALESCE(CARDINALITY(live.ptg_source_array), 0) > 1" in sql
+    assert "COALESCE(CARDINALITY(live.ptg_source_array), 0) > 1" not in sql
 
 
 def test_entity_address_unified_can_range_shard_large_source_selects():
@@ -2222,31 +2242,46 @@ def test_ptg_address_partial_reuse_sql_excludes_changed_source_keys():
 
     assert 'INSERT INTO "mrf"."ptg_address_20260623"' in sql
     assert 'FROM "mrf"."ptg_address" AS live' in sql
-    assert "live.source_key NOT IN ('payer_a', 'payer_b''s')" in sql
+    assert "live.source_key IN ('payer_a', 'payer_b''s')" in sql
+    assert "live.source_key = 'ptg_member_fallback'" in sql
+    assert "COALESCE(live.ptg_source_array, ARRAY[]::varchar[]) && ARRAY['payer_a', 'payer_b''s']::varchar[]" in sql
     assert '"source_key"' in sql
     assert '"snapshot_id"' in sql
     assert '"location_key"' in sql
     assert "SELECT " in sql
 
 
-def test_ptg_address_partial_refresh_rejects_member_fallback_only_sources():
-    with pytest.raises(RuntimeError, match="member-fallback-only"):
-        ptg_address._validate_partial_refresh_sources(
-            [
-                {
-                    "source_key": "payer_a",
-                    "snapshot_id": "snap_a",
-                    "provider_group_location_table": None,
-                    "provider_group_member_table": "ptg2_provider_group_member_a",
-                }
-            ]
-        )
+def test_ptg_address_partial_reuse_sql_excludes_changed_member_npis():
+    sql = ptg_address._ptg_address_reuse_live_rows_sql(
+        "mrf",
+        "ptg_address_20260623",
+        ["payer_a"],
+        changed_member_tables=["ptg2_provider_group_member_a"],
+    )
 
+    assert "live.source_key = 'ptg_member_fallback'" in sql
+    assert 'FROM "mrf"."ptg2_provider_group_member_a" member_src' in sql
+    assert "live.npi IN (" in sql
+    assert "member_src.npi IS NOT NULL" in sql
+
+
+def test_ptg_address_partial_refresh_allows_member_fallback_sources():
     ptg_address._validate_partial_refresh_sources(
         [
             {
                 "source_key": "payer_a",
                 "snapshot_id": "snap_a",
+                "provider_group_location_table": None,
+                "provider_group_member_table": "ptg2_provider_group_member_a",
+            }
+        ]
+    )
+
+    ptg_address._validate_partial_refresh_sources(
+        [
+            {
+                "source_key": "payer_b",
+                "snapshot_id": "snap_b",
                 "provider_group_location_table": "ptg2_provider_group_location_a",
                 "provider_group_member_table": "ptg2_provider_group_member_a",
             }
@@ -2324,13 +2359,48 @@ def test_ptg_member_coverage_insert_sql_stages_distinct_npis_only():
     assert "INSERT INTO mrf.ptg_address_member_coverage (source_key, snapshot_id, npi, npi_shard)" in sql
     assert "'payer_a'::varchar AS source_key" in sql
     assert "'snap_1'::varchar AS snapshot_id" in sql
-    assert "(npi::bigint % 8)::int AS npi_shard" in sql
+    assert "(m.npi::bigint % 8)::int AS npi_shard" in sql
     assert "SELECT DISTINCT" in sql
-    assert 'FROM "mrf"."ptg2_provider_group_member_abc123"' in sql
+    assert 'FROM "mrf"."ptg2_provider_group_member_abc123" m' in sql
     assert "provider_group_global_id_128" not in sql
     assert "JOIN" not in sql
-    assert "AND npi >= 2500000000" in sql
-    assert "AND npi < 5000000000" in sql
+    assert "AND m.npi >= 2500000000" in sql
+    assert "AND m.npi < 5000000000" in sql
+
+
+def test_ptg_member_coverage_insert_sql_can_filter_impacted_npis():
+    sql = ptg_address._ptg_member_coverage_insert_sql(
+        "mrf",
+        "ptg_address_member_coverage",
+        source_key="payer_a",
+        snapshot_id="snap_1",
+        provider_group_member_table="ptg2_provider_group_member_abc123",
+        impacted_npis_table="ptg_address_member_impacted_npis",
+    )
+
+    assert "JOIN mrf.ptg_address_member_impacted_npis impacted" in sql
+    assert "ON impacted.npi = m.npi" in sql
+    assert "WHERE m.npi IS NOT NULL" in sql
+
+
+def test_ptg_member_impacted_npis_sql_covers_live_and_current_members():
+    live_sql = ptg_address._ptg_member_live_impacted_npis_insert_sql(
+        "mrf",
+        "ptg_address_member_impacted_npis",
+        changed_source_keys=["payer_a"],
+    )
+    current_sql = ptg_address._ptg_member_current_impacted_npis_insert_sql(
+        "mrf",
+        "ptg_address_member_impacted_npis",
+        provider_group_member_table="ptg2_provider_group_member_abc123",
+    )
+
+    assert "FROM \"mrf\".\"ptg_address\" AS live" in live_sql
+    assert "live.source_key = 'ptg_member_fallback'" in live_sql
+    assert "COALESCE(live.ptg_source_array, ARRAY[]::varchar[]) && ARRAY['payer_a']::varchar[]" in live_sql
+    assert "ON CONFLICT (npi) DO NOTHING" in live_sql
+    assert 'FROM "mrf"."ptg2_provider_group_member_abc123" m' in current_sql
+    assert "ON CONFLICT (npi) DO NOTHING" in current_sql
 
 
 def test_ptg_address_member_coverage_sql_materializes_fallback_once():

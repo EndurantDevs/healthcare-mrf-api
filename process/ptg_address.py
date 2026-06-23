@@ -213,16 +213,49 @@ def _ptg_address_reuse_live_rows_sql(
     db_schema: str,
     stage_table: str,
     changed_source_keys: list[str],
+    changed_member_tables: list[str] | None = None,
 ) -> str:
     if not changed_source_keys:
         raise ValueError("changed_source_keys must be non-empty for PTG address partial refresh")
     source_literals = ", ".join(_sql_literal(source_key) for source_key in changed_source_keys)
+    source_array = "ARRAY[" + source_literals + "]::varchar[]"
+    member_tables = sorted(
+        {
+            cleaned
+            for table_name in changed_member_tables or []
+            if (cleaned := _clean_optional(table_name))
+        }
+    )
+    member_npi_filter = ""
+    if member_tables:
+        member_npi_selects = "\n            UNION\n".join(
+            f"            SELECT member_src.npi::bigint AS npi\n"
+            f"              FROM {_qualified_table_ref(db_schema, table_name)} member_src\n"
+            "             WHERE member_src.npi IS NOT NULL"
+            for table_name in member_tables
+        )
+        member_npi_filter = (
+            "\n         OR (\n"
+            f"                live.source_key = {_sql_literal(PTG_ADDRESS_MEMBER_FALLBACK_SOURCE_KEY)}\n"
+            "            AND live.npi IS NOT NULL\n"
+            "            AND live.npi IN (\n"
+            f"{member_npi_selects}\n"
+            "            )\n"
+            "         )"
+        )
     columns = _ptg_address_column_list()
     return f"""
     INSERT INTO {_qualified_table_ref(db_schema, stage_table)} ({columns})
     SELECT {columns}
       FROM {_qualified_table_ref(db_schema, PTGAddress.__main_table__)} AS live
-     WHERE live.source_key NOT IN ({source_literals});
+     WHERE NOT (
+            live.source_key IN ({source_literals})
+         OR (
+                live.source_key = {_sql_literal(PTG_ADDRESS_MEMBER_FALLBACK_SOURCE_KEY)}
+            AND COALESCE(live.ptg_source_array, ARRAY[]::varchar[]) && {source_array}
+         )
+{member_npi_filter}
+     );
     """
 
 
@@ -231,6 +264,7 @@ async def _copy_reusable_ptg_address_rows(
     stage_table: str,
     *,
     changed_source_keys: list[str],
+    changed_member_tables: list[str] | None = None,
 ) -> int:
     if not await _table_exists(db_schema, PTGAddress.__main_table__):
         raise RuntimeError(
@@ -242,23 +276,13 @@ async def _copy_reusable_ptg_address_rows(
             db_schema,
             stage_table,
             changed_source_keys,
+            changed_member_tables=changed_member_tables,
         )
     )
     return int(rowcount or 0)
 
 
 def _validate_partial_refresh_sources(source_contexts: list[dict[str, str | None]]) -> None:
-    fallback_only = [
-        f"{source_context.get('source_key')}/{source_context.get('snapshot_id')}"
-        for source_context in source_contexts
-        if source_context.get("provider_group_member_table")
-        and not source_context.get("provider_group_location_table")
-    ]
-    if fallback_only:
-        raise RuntimeError(
-            "PTG address partial refresh cannot safely update member-fallback-only snapshots "
-            f"({', '.join(fallback_only)}); run refresh_mode=full for this source."
-        )
     legacy_aggregate_only = [
         f"{source_context.get('source_key')}/{source_context.get('snapshot_id')}"
         for source_context in source_contexts
@@ -485,6 +509,34 @@ async def _resolve_ptg_address_inputs(
             )
         )
     return inputs
+
+
+async def _resolve_current_member_fallback_source_contexts(
+    db_schema: str,
+    *,
+    import_date: str,
+) -> list[dict[str, str | None]]:
+    contexts: list[dict[str, str | None]] = []
+    for source_key, snapshot_id, manifest_tables in await _resolve_ptg_address_inputs(
+        db_schema,
+        source_key=None,
+        snapshot_id=None,
+        import_date=import_date,
+    ):
+        provider_group_location_table = manifest_tables.get("provider_group_location_table")
+        provider_group_member_table = manifest_tables.get("provider_group_member_table")
+        if provider_group_member_table and not provider_group_location_table:
+            contexts.append(
+                {
+                    "source_key": source_key,
+                    "snapshot_id": snapshot_id,
+                    "provider_group_location_table": provider_group_location_table,
+                    "provider_group_member_table": provider_group_member_table,
+                    "serving_rate_compact_table": manifest_tables.get("serving_rate_compact_table"),
+                    "provider_set_component_table": manifest_tables.get("provider_set_component_table"),
+                }
+            )
+    return contexts
 
 
 def _provider_location_source_ctes(
@@ -920,6 +972,49 @@ def _ptg_member_coverage_table_name(stage_table: str) -> str:
     return _archived_identifier(f"{stage_table}_member_coverage", "")
 
 
+def _ptg_member_impacted_npis_table_name(stage_table: str) -> str:
+    return _archived_identifier(f"{stage_table}_member_impacted_npis", "")
+
+
+def _ptg_member_live_impacted_npis_insert_sql(
+    db_schema: str,
+    impacted_table: str,
+    *,
+    changed_source_keys: list[str],
+) -> str:
+    if not changed_source_keys:
+        raise ValueError("changed_source_keys must be non-empty for PTG member fallback partial refresh")
+    source_array = "ARRAY[" + ", ".join(_sql_literal(source_key) for source_key in changed_source_keys) + "]::varchar[]"
+    return f"""
+    INSERT INTO {db_schema}.{impacted_table} (npi)
+    SELECT DISTINCT live.npi::bigint AS npi
+      FROM {_qualified_table_ref(db_schema, PTGAddress.__main_table__)} AS live
+     WHERE live.source_key = {_sql_literal(PTG_ADDRESS_MEMBER_FALLBACK_SOURCE_KEY)}
+       AND live.npi IS NOT NULL
+       AND COALESCE(live.ptg_source_array, ARRAY[]::varchar[]) && {source_array}
+    ON CONFLICT (npi) DO NOTHING;
+    """
+
+
+def _ptg_member_current_impacted_npis_insert_sql(
+    db_schema: str,
+    impacted_table: str,
+    *,
+    provider_group_member_table: str,
+    npi_range_start: int | None = None,
+    npi_range_end: int | None = None,
+) -> str:
+    npi_filter = _npi_range_filter("m.npi", npi_range_start, npi_range_end)
+    return f"""
+    INSERT INTO {db_schema}.{impacted_table} (npi)
+    SELECT DISTINCT m.npi::bigint AS npi
+      FROM {_qualified_table_ref(db_schema, provider_group_member_table)} m
+     WHERE m.npi IS NOT NULL
+{npi_filter}
+    ON CONFLICT (npi) DO NOTHING;
+    """
+
+
 def _ptg_member_coverage_insert_sql(
     db_schema: str,
     coverage_table: str,
@@ -930,18 +1025,25 @@ def _ptg_member_coverage_insert_sql(
     npi_range_start: int | None = None,
     npi_range_end: int | None = None,
     npi_shard_count: int = DEFAULT_MEMBER_MATERIALIZE_SHARDS,
+    impacted_npis_table: str | None = None,
 ) -> str:
-    npi_filter = _npi_range_filter("npi", npi_range_start, npi_range_end)
+    npi_filter = _npi_range_filter("m.npi", npi_range_start, npi_range_end)
     safe_shard_count = max(1, int(npi_shard_count))
+    impacted_join = (
+        f"      JOIN {db_schema}.{impacted_npis_table} impacted\n"
+        "        ON impacted.npi = m.npi\n"
+        if impacted_npis_table
+        else ""
+    )
     return f"""
     INSERT INTO {db_schema}.{coverage_table} (source_key, snapshot_id, npi, npi_shard)
     SELECT DISTINCT
         {_sql_literal(source_key)}::varchar AS source_key,
         {_sql_literal(snapshot_id)}::varchar AS snapshot_id,
-        npi::bigint AS npi,
-        (npi::bigint % {safe_shard_count})::int AS npi_shard
-      FROM {_qualified_table_ref(db_schema, provider_group_member_table)}
-     WHERE npi IS NOT NULL
+        m.npi::bigint AS npi,
+        (m.npi::bigint % {safe_shard_count})::int AS npi_shard
+      FROM {_qualified_table_ref(db_schema, provider_group_member_table)} m
+{impacted_join}     WHERE m.npi IS NOT NULL
 {npi_filter};
     """
 
@@ -1323,6 +1425,7 @@ async def _insert_ptg_member_coverage_source(
     *,
     source_context: dict[str, str | None],
     npi_shard_count: int,
+    impacted_npis_table: str | None = None,
 ) -> dict[str, str | None]:
     source_key = str(source_context["source_key"] or "")
     snapshot_id = str(source_context["snapshot_id"] or "")
@@ -1344,6 +1447,7 @@ async def _insert_ptg_member_coverage_source(
                     npi_range_start=int(npi_range_start) if npi_range_start is not None else None,
                     npi_range_end=int(npi_range_end) if npi_range_end is not None else None,
                     npi_shard_count=npi_shard_count,
+                    impacted_npis_table=impacted_npis_table,
                 )
             )
         )
@@ -1399,6 +1503,8 @@ async def _insert_ptg_member_fallback_aggregate(
     stage_table: str,
     *,
     source_contexts: list[dict[str, str | None]],
+    changed_source_keys: list[str] | None = None,
+    changed_source_contexts: list[dict[str, str | None]] | None = None,
     node_id: str | None,
     address_canon_available: bool,
     archive_available: bool,
@@ -1414,6 +1520,7 @@ async def _insert_ptg_member_fallback_aggregate(
         }
 
     coverage_table = _ptg_member_coverage_table_name(stage_table)
+    impacted_table = _ptg_member_impacted_npis_table_name(stage_table) if changed_source_keys else None
     materialize_shards = _env_positive_int(
         "HLTHPRT_PTG_ADDRESS_MEMBER_MATERIALIZE_SHARDS",
         DEFAULT_MEMBER_MATERIALIZE_SHARDS,
@@ -1434,6 +1541,42 @@ async def _insert_ptg_member_fallback_aggregate(
             """
         )
         coverage_results: list[dict[str, str | None]] = []
+        impacted_rows = None
+        if impacted_table:
+            await db.status(f"DROP TABLE IF EXISTS {db_schema}.{impacted_table};")
+            await db.status(f"CREATE UNLOGGED TABLE {db_schema}.{impacted_table} (npi bigint PRIMARY KEY);")
+            await db.status(
+                _ptg_member_live_impacted_npis_insert_sql(
+                    db_schema,
+                    impacted_table,
+                    changed_source_keys=changed_source_keys or [],
+                )
+            )
+            for source_context in changed_source_contexts or source_contexts:
+                provider_group_member_table = source_context.get("provider_group_member_table")
+                if not provider_group_member_table:
+                    continue
+                await db.status(
+                    _ptg_member_current_impacted_npis_insert_sql(
+                        db_schema,
+                        impacted_table,
+                        provider_group_member_table=provider_group_member_table,
+                    )
+                )
+            await db.status(f"ANALYZE {db_schema}.{impacted_table};")
+            impacted_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{impacted_table};") or 0)
+            if run_id:
+                enqueue_live_progress(
+                    run_id=run_id,
+                    importer="ptg-address",
+                    status="running",
+                    phase="staging PTG member fallback impacted NPIs",
+                    unit="npi",
+                    done=impacted_rows,
+                    total=impacted_rows,
+                    pct=10,
+                    message=f"staged {impacted_rows:,} impacted PTG member fallback NPIs",
+                )
         coverage_sem = asyncio.Semaphore(insert_concurrency)
 
         async def _insert_coverage_one(source_context: dict[str, str | None]) -> dict[str, str | None]:
@@ -1443,6 +1586,7 @@ async def _insert_ptg_member_fallback_aggregate(
                     coverage_table,
                     source_context=source_context,
                     npi_shard_count=materialize_shards,
+                    impacted_npis_table=impacted_table,
                 )
 
         coverage_tasks = [asyncio.create_task(_insert_coverage_one(source_context)) for source_context in source_contexts]
@@ -1553,11 +1697,14 @@ async def _insert_ptg_member_fallback_aggregate(
             "source_unit": "member_coverage_aggregate",
             "member_coverage_sources": len(source_contexts),
             "member_coverage_rows": coverage_rows,
+            "member_impacted_npis": impacted_rows,
             "member_materialize_shards": materialize_shards,
             "member_materialize_concurrency": materialize_concurrency,
         }
     finally:
         await db.status(f"DROP TABLE IF EXISTS {db_schema}.{coverage_table};")
+        if impacted_table:
+            await db.status(f"DROP TABLE IF EXISTS {db_schema}.{impacted_table};")
 
 
 async def process_data(ctx, task=None):
@@ -1694,6 +1841,7 @@ async def process_data(ctx, task=None):
             "No PTG provider-location sources were available; publish at least one compact PTG snapshot "
             "with provider_group_location_table or run the legacy ptg2_provider_location projection."
         )
+    changed_member_source_keys: list[str] = []
     if partial_refresh:
         _validate_partial_refresh_sources(source_contexts)
         changed_source_keys = sorted(
@@ -1703,14 +1851,35 @@ async def process_data(ctx, task=None):
                 if (source_key := _clean_optional(source_context.get("source_key")))
             }
         )
+        changed_member_source_keys = sorted(
+            {
+                source_key
+                for source_context in source_contexts
+                if source_context.get("provider_group_member_table")
+                and not source_context.get("provider_group_location_table")
+                and (source_key := _clean_optional(source_context.get("source_key")))
+            }
+        )
+        changed_member_tables = sorted(
+            {
+                table_name
+                for source_context in source_contexts
+                if source_context.get("provider_group_member_table")
+                and not source_context.get("provider_group_location_table")
+                and (table_name := _clean_optional(source_context.get("provider_group_member_table")))
+            }
+        )
         if not changed_source_keys:
             raise RuntimeError("PTG address partial refresh did not resolve any changed source keys.")
         reused_rows = await _copy_reusable_ptg_address_rows(
             db_schema,
             stage_table,
             changed_source_keys=changed_source_keys,
+            changed_member_tables=changed_member_tables,
         )
         context["partial_refresh_source_keys"] = changed_source_keys
+        context["partial_refresh_member_source_keys"] = changed_member_source_keys
+        context["partial_refresh_member_tables"] = changed_member_tables
         context["partial_refresh_reused_rows"] = reused_rows
         if run_id:
             enqueue_live_progress(
@@ -1823,10 +1992,23 @@ async def process_data(ctx, task=None):
     insert_unit = "source units" if sharded_sources or direct_source_contexts else "sources"
     insert_results: list[dict[str, Any]] = []
     if member_fallback_contexts:
+        member_fallback_insert_contexts = member_fallback_contexts
+        if partial_refresh and changed_member_source_keys:
+            member_fallback_insert_contexts = await _resolve_current_member_fallback_source_contexts(
+                db_schema,
+                import_date=import_date,
+            )
+            if not member_fallback_insert_contexts:
+                raise RuntimeError(
+                    "PTG address member-fallback partial refresh resolved no current member-fallback sources."
+                )
+            context["member_fallback_partial_all_source_units"] = len(member_fallback_insert_contexts)
         aggregate_result = await _insert_ptg_member_fallback_aggregate(
             db_schema,
             stage_table,
-            source_contexts=member_fallback_contexts,
+            source_contexts=member_fallback_insert_contexts,
+            changed_source_keys=changed_member_source_keys if partial_refresh else None,
+            changed_source_contexts=member_fallback_contexts if partial_refresh else None,
             node_id=node_id,
             address_canon_available=address_canon_available,
             archive_available=archive_available,
