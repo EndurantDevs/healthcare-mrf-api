@@ -3,19 +3,17 @@
 
 from __future__ import annotations
 
+from importlib import import_module
 from typing import Any
 
 from arq import create_pool
 
-from process import entity_address_unified, ptg_address
 from process.control_lifecycle import mark_control_run
 from process.entity_address_unified import (
-    ENTITY_ADDRESS_REFRESH_MODE_FULL,
     ENTITY_ADDRESS_REFRESH_MODE_PTG_PARTIAL,
     ENTITY_ADDRESS_REFRESH_MODES,
 )
 from process.ptg_address import (
-    PTG_ADDRESS_REFRESH_MODE_FULL,
     PTG_ADDRESS_REFRESH_MODE_PARTIAL,
     PTG_ADDRESS_REFRESH_MODES,
 )
@@ -25,6 +23,8 @@ from process.serialization import deserialize_job, serialize_job
 PTG_ADDRESS_ENTITY_REFRESH_QUEUE_NAME = "arq:EntityAddressUnified"
 DEFAULT_PTG_REFRESH_MODE = PTG_ADDRESS_REFRESH_MODE_PARTIAL
 DEFAULT_ENTITY_REFRESH_MODE = ENTITY_ADDRESS_REFRESH_MODE_PTG_PARTIAL
+ptg_address = import_module("process.ptg_address")
+entity_address_unified = import_module("process.entity_address_unified")
 
 
 def _clean_optional(value: Any) -> str | None:
