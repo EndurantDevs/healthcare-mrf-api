@@ -1092,6 +1092,44 @@ def test_entity_address_unified_mrf_source_borrows_arrays_from_primary_npi_addre
     assert "a.address_key::uuid AS address_key" in mrf_source
 
 
+def test_entity_address_unified_nppes_source_restores_missing_zip_from_archive():
+    selects = entity_address_unified._source_selects(
+        "mrf",
+        {
+            "npi": True,
+            "npi_address": True,
+            "address_archive_v2": True,
+        },
+    )
+
+    nppes_source = next(s for s in selects if "'nppes'::varchar AS address_source" in s)
+    assert "LEFT JOIN LATERAL" in nppes_source
+    assert "AS nppes_zip_restore ON TRUE" in nppes_source
+    assert "mrf.addr_zip5_norm_v1(a.postal_code) IS NULL" in nppes_source
+    assert "aa.line1_norm = mrf.addr_street_norm_v1(a.first_line, a.second_line)" in nppes_source
+    assert "bit_count(bit_or(COALESCE(aa.source_bits, 0))::bit(64))::int AS source_ref_count" in nppes_source
+    assert "candidate_count = 1" in nppes_source
+    assert "source_ref_count > COALESCE(next_source_ref_count, -1)" in nppes_source
+    assert "LEFT(zip5, 3) = LEFT(next_zip5, 3)" in nppes_source
+    assert "OR ABS(zip5::int - next_zip5::int) <= 10" in nppes_source
+    assert "THEN nppes_zip_restore.restored_zip5 ELSE a.postal_code END::varchar AS postal_code" in nppes_source
+
+
+def test_entity_address_unified_nppes_source_skips_zip_restore_without_archive():
+    selects = entity_address_unified._source_selects(
+        "mrf",
+        {
+            "npi": True,
+            "npi_address": True,
+            "address_archive_v2": False,
+        },
+    )
+
+    nppes_source = next(s for s in selects if "'nppes'::varchar AS address_source" in s)
+    assert "a.postal_code::varchar AS postal_code" in nppes_source
+    assert "nppes_zip_restore" not in nppes_source
+
+
 def test_entity_address_unified_registers_ptg_address_overlay_source():
     selects = entity_address_unified._source_selects(
         "mrf",

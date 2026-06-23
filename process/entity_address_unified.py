@@ -1021,6 +1021,78 @@ def _street_soft_norm_expr(expr: str) -> str:
     )
 
 
+def _nppes_zip_restore_join(db_schema: str, *, alias: str = "a") -> str:
+    """Return a lateral join that safely restores missing NPPES ZIPs from archive evidence."""
+    return f"""
+              LEFT JOIN LATERAL (
+                WITH candidate_rows AS (
+                    SELECT
+                        aa.zip5::varchar AS zip5,
+                        COUNT(*)::int AS archive_rows,
+                        bit_count(bit_or(COALESCE(aa.source_bits, 0))::bit(64))::int AS source_ref_count,
+                        bit_or(COALESCE(aa.source_bits, 0))::bigint AS source_bits
+                      FROM {db_schema}.address_archive_v2 AS aa
+                     WHERE aa.merged_into IS NULL
+                       AND aa.zip5 IS NOT NULL
+                       AND {db_schema}.addr_country_code_v1(COALESCE(NULLIF({alias}.country_code, ''), 'US')) = 'US'
+                       AND {db_schema}.addr_zip5_norm_v1({alias}.postal_code) IS NULL
+                       AND {db_schema}.addr_street_norm_v1({alias}.first_line, {alias}.second_line) IS NOT NULL
+                       AND aa.line1_norm = {db_schema}.addr_street_norm_v1({alias}.first_line, {alias}.second_line)
+                       AND COALESCE(aa.unit_norm, '') = ''
+                       AND aa.city_norm = {db_schema}.addr_city_norm_v1({alias}.city_name)
+                       AND aa.state_code = {db_schema}.addr_state_code_v1({alias}.state_name)
+                       AND COALESCE(aa.country_code, 'US') = 'US'
+                     GROUP BY aa.zip5
+                ),
+                ranked AS (
+                    SELECT
+                        candidate_rows.*,
+                        COUNT(*) OVER () AS candidate_count,
+                        LEAD(zip5) OVER restore_rank AS next_zip5,
+                        LEAD(source_ref_count) OVER restore_rank AS next_source_ref_count,
+                        LEAD(archive_rows) OVER restore_rank AS next_archive_rows,
+                        ROW_NUMBER() OVER restore_rank AS restore_rank
+                      FROM candidate_rows
+                    WINDOW restore_rank AS (
+                        ORDER BY source_ref_count DESC, archive_rows DESC, source_bits DESC, zip5 ASC
+                    )
+                )
+                SELECT zip5 AS restored_zip5
+                  FROM ranked
+                 WHERE restore_rank = 1
+                   AND (
+                        candidate_count = 1
+                        OR (
+                            candidate_count > 1
+                            AND (
+                                source_ref_count > COALESCE(next_source_ref_count, -1)
+                                OR (
+                                    source_ref_count = COALESCE(next_source_ref_count, -1)
+                                    AND archive_rows > COALESCE(next_archive_rows, -1)
+                                )
+                            )
+                            AND (source_ref_count > 1 OR archive_rows > 1)
+                            AND next_zip5 IS NOT NULL
+                            AND (
+                                LEFT(zip5, 3) = LEFT(next_zip5, 3)
+                                OR ABS(zip5::int - next_zip5::int) <= 10
+                            )
+                        )
+                   )
+                 LIMIT 1
+              ) AS nppes_zip_restore ON TRUE"""
+
+
+def _nppes_postal_code_expr(db_schema: str, *, alias: str = "a", restore_alias: str = "nppes_zip_restore") -> str:
+    return (
+        "CASE "
+        f"WHEN {restore_alias}.restored_zip5 IS NOT NULL "
+        f"AND {db_schema}.addr_zip5_norm_v1({alias}.postal_code) IS NULL "
+        f"THEN {restore_alias}.restored_zip5 "
+        f"ELSE {alias}.postal_code END"
+    )
+
+
 def _source_selects(
     db_schema: str,
     available: dict[str, bool],
@@ -1108,6 +1180,8 @@ def _source_selects(
         if has_archive and has_ptg_address_key
         else ""
     )
+    nppes_zip_restore_join = _nppes_zip_restore_join(db_schema) if has_archive else ""
+    nppes_postal_code = _nppes_postal_code_expr(db_schema, alias="a") if has_archive else "a.postal_code"
     if has_npi_address:
         selects.append(
             f"""
@@ -1136,7 +1210,7 @@ def _source_selects(
                 a.second_line::varchar AS second_line,
                 a.city_name::varchar AS city_name,
                 a.state_name::varchar AS state_name,
-                a.postal_code::varchar AS postal_code,
+                {nppes_postal_code}::varchar AS postal_code,
                 COALESCE(NULLIF(a.country_code, ''), 'US')::varchar AS country_code,
                 a.telephone_number::varchar AS telephone_number,
                 a.fax_number::varchar AS fax_number,
@@ -1151,6 +1225,7 @@ def _source_selects(
                 ('nppes:' || a.npi::varchar || ':' || COALESCE(a.type, '') || ':' || COALESCE(a.checksum::varchar, '0'))::varchar AS source_record_id
               FROM {db_schema}.npi_address AS a
               {npi_join}
+              {nppes_zip_restore_join}
              WHERE a.npi IS NOT NULL
             """
         )
