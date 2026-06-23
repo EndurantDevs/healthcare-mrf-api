@@ -1025,6 +1025,34 @@ def test_toc_rows_store_plan_info_on_file_metadata(monkeypatch):
     assert plan_rows[0]["plan_id_type"] == "ein"
 
 
+def test_toc_rows_truncate_long_schema_version(monkeypatch):
+    monkeypatch.setattr(
+        discovery,
+        "parse_toc_catalog_entries",
+        lambda *_args: [
+            types.SimpleNamespace(
+                source_type="in-network",
+                original_url="https://example.com/rates.json.gz",
+                canonical_url="https://example.com/rates.json.gz",
+                from_index_url="https://example.com/index.json",
+                description="In-Network Rates",
+                domain="example.com",
+                reporting_entity_name="Example Payer",
+                reporting_entity_type="third_party_administrator",
+                plan_info=({"plan_id": "123", "plan_market_type": "group", "plan_name": "Plan A"},),
+            )
+        ],
+    )
+
+    _, file_rows = discovery._toc_rows_from_content(
+        {"source_id": "source_1"},
+        "https://example.com/index.json",
+        {"version": "3.5.5 f501aab30e8114503c6248f178858c9a27ba9c14"},
+    )
+
+    assert file_rows[0]["schema_version"] == "3.5.5 f501aab30e8114503c6248f178"
+
+
 def test_eligible_for_public_promotion_only_free_direct_sources():
     assert discovery._eligible_for_public_promotion({"access_model": "free", "source_type": "community_index"}) is True
     assert discovery._eligible_for_public_promotion({"access_model": "paid", "source_type": "vendor_aggregator"}) is False

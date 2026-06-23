@@ -270,6 +270,13 @@ def _as_int(value: Any) -> int | None:
         return None
 
 
+def _truncate_text(value: Any, limit: int) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    return text[:limit]
+
+
 def _parse_size_bytes(value: Any) -> int | None:
     parsed = _as_int(value)
     if parsed is not None:
@@ -914,7 +921,7 @@ def _toc_rows_from_content(source: dict[str, Any], url: str, toc: dict[str, Any]
     plan_rows: list[dict[str, Any]] = []
     file_rows: list[dict[str, Any]] = []
     entries = parse_toc_catalog_entries(toc, str(url))
-    schema_version = str(toc.get("version") or "")
+    schema_version = _truncate_text(toc.get("version"), 32)
     for entry in entries:
         plan_info = list(entry.plan_info or ())
         for plan in plan_info:
@@ -967,7 +974,7 @@ def _toc_rows_from_content(source: dict[str, Any], url: str, toc: dict[str, Any]
                 "market_types": sorted({plan.get("plan_market_type") for plan in plan_info if plan.get("plan_market_type")}),
                 "is_signed_url": _looks_signed(entry.original_url),
                 "size_bytes": None,
-                "schema_version": schema_version or None,
+                "schema_version": schema_version,
                 "metadata_json": {
                     "container_format": _container_format(entry.original_url),
                     "domain": entry.domain,
