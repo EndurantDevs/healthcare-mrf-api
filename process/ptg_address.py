@@ -54,6 +54,9 @@ DEFAULT_SQL_SYNCHRONOUS_COMMIT = "off"
 DEFAULT_SQL_MAX_PARALLEL_WORKERS_PER_GATHER = "8"
 DEFAULT_SQL_HASH_MEM_MULTIPLIER = "4"
 DEFAULT_MEMBER_MATERIALIZE_SHARDS = 8
+PTG_ADDRESS_REFRESH_MODE_FULL = "full"
+PTG_ADDRESS_REFRESH_MODE_PARTIAL = "partial"
+PTG_ADDRESS_REFRESH_MODES = {PTG_ADDRESS_REFRESH_MODE_FULL, PTG_ADDRESS_REFRESH_MODE_PARTIAL}
 SNAPSHOT_TABLE_NAME_RE = re.compile(r"[a-z0-9_]{1,63}\Z")
 POSTGRES_SETTING_RE = re.compile(r"[A-Za-z0-9_.:-]{1,64}\Z")
 
@@ -100,6 +103,27 @@ def _env_positive_int(name: str, default: int) -> int:
     except ValueError:
         value = 0
     return value if value > 0 else default
+
+
+def _ptg_address_refresh_mode(task: dict[str, Any]) -> str:
+    raw = (
+        task.get("refresh_mode")
+        or task.get("mode")
+        or task.get("refresh_scope")
+        or os.getenv("HLTHPRT_PTG_ADDRESS_REFRESH_MODE")
+        or ""
+    )
+    value = str(raw).strip().lower().replace("_", "-")
+    if not value:
+        return PTG_ADDRESS_REFRESH_MODE_FULL
+    if value in {"full", "rebuild", "full-rebuild"}:
+        return PTG_ADDRESS_REFRESH_MODE_FULL
+    if value in {"partial", "incremental", "source", "source-refresh", "reuse-live", "reuse-existing"}:
+        return PTG_ADDRESS_REFRESH_MODE_PARTIAL
+    raise ValueError(
+        f"Unsupported PTG address refresh_mode {raw!r}; "
+        f"expected one of {sorted(PTG_ADDRESS_REFRESH_MODES)}"
+    )
 
 
 def _ptg_address_sql_settings(*, include_statement_timeout: bool = True) -> list[tuple[str, str]]:
@@ -181,6 +205,62 @@ def _qualified_table_ref(db_schema: str, table_name: str) -> str:
     return f"{_quote_ident(db_schema)}.{_quote_ident(table_name)}"
 
 
+def _ptg_address_column_list() -> str:
+    return ", ".join(_quote_ident(column.name) for column in PTGAddress.__table__.columns)
+
+
+def _ptg_address_reuse_live_rows_sql(
+    db_schema: str,
+    stage_table: str,
+    changed_source_keys: list[str],
+) -> str:
+    if not changed_source_keys:
+        raise ValueError("changed_source_keys must be non-empty for PTG address partial refresh")
+    source_literals = ", ".join(_sql_literal(source_key) for source_key in changed_source_keys)
+    columns = _ptg_address_column_list()
+    return f"""
+    INSERT INTO {_qualified_table_ref(db_schema, stage_table)} ({columns})
+    SELECT {columns}
+      FROM {_qualified_table_ref(db_schema, PTGAddress.__main_table__)} AS live
+     WHERE live.source_key NOT IN ({source_literals});
+    """
+
+
+async def _copy_reusable_ptg_address_rows(
+    db_schema: str,
+    stage_table: str,
+    *,
+    changed_source_keys: list[str],
+) -> int:
+    if not await _table_exists(db_schema, PTGAddress.__main_table__):
+        raise RuntimeError(
+            "PTG address partial refresh requested, but the live ptg_address table does not exist; "
+            "run refresh_mode=full first."
+        )
+    rowcount = await db.status(
+        _ptg_address_reuse_live_rows_sql(
+            db_schema,
+            stage_table,
+            changed_source_keys,
+        )
+    )
+    return int(rowcount or 0)
+
+
+def _validate_partial_refresh_sources(source_contexts: list[dict[str, str | None]]) -> None:
+    fallback_only = [
+        f"{source_context.get('source_key')}/{source_context.get('snapshot_id')}"
+        for source_context in source_contexts
+        if source_context.get("provider_group_member_table")
+        and not source_context.get("provider_group_location_table")
+    ]
+    if fallback_only:
+        raise RuntimeError(
+            "PTG address partial refresh cannot safely update member-fallback-only snapshots "
+            f"({', '.join(fallback_only)}); run refresh_mode=full for this source."
+        )
+
+
 async def _relation_size_bytes(db_schema: str, table_name: str | None) -> int:
     if not table_name:
         return 0
@@ -214,6 +294,25 @@ async def _address_canon_available(db_schema: str) -> bool:
         signature=f"{db_schema}.addr_key_v1(text,text,text,text,text,text)",
     )
     return isinstance(value, str) and bool(value)
+
+
+async def _table_column_exists(db_schema: str, table_name: str, column_name: str) -> bool:
+    return bool(
+        await db.scalar(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                  FROM information_schema.columns
+                 WHERE table_schema = :db_schema
+                   AND table_name = :table_name
+                   AND column_name = :column_name
+            );
+            """,
+            db_schema=db_schema,
+            table_name=table_name,
+            column_name=column_name,
+        )
+    )
 
 
 async def _current_source_snapshot(db_schema: str, source_key: str | None) -> tuple[str, str] | None:
@@ -1460,6 +1559,9 @@ async def process_data(ctx, task=None):
 
     await ensure_database(test_mode)
     db_schema = _validate_schema_name(os.getenv("HLTHPRT_DB_SCHEMA") or "mrf")
+    refresh_mode = _ptg_address_refresh_mode(task)
+    partial_refresh = refresh_mode == PTG_ADDRESS_REFRESH_MODE_PARTIAL
+    context["refresh_mode"] = refresh_mode
 
     import_date = ctx["import_date"]
     stage_cls = make_class(PTGAddress, import_date)
@@ -1471,6 +1573,10 @@ async def process_data(ctx, task=None):
 
     explicit_source_key = task.get("source_key") or os.getenv("HLTHPRT_PTG_ADDRESS_SOURCE_KEY")
     explicit_snapshot_id = task.get("snapshot_id") or os.getenv("HLTHPRT_PTG_ADDRESS_SNAPSHOT_ID")
+    if partial_refresh and not _clean_optional(explicit_source_key):
+        raise RuntimeError(
+            "PTG address partial refresh requires source_key so unchanged live rows can be reused safely."
+        )
     explicit_input = bool(_clean_optional(explicit_source_key) or _clean_optional(explicit_snapshot_id))
     address_inputs = await _resolve_ptg_address_inputs(
         db_schema,
@@ -1576,6 +1682,38 @@ async def process_data(ctx, task=None):
             "No PTG provider-location sources were available; publish at least one compact PTG snapshot "
             "with provider_group_location_table or run the legacy ptg2_provider_location projection."
         )
+    if partial_refresh:
+        _validate_partial_refresh_sources(source_contexts)
+        changed_source_keys = sorted(
+            {
+                source_key
+                for source_context in source_contexts
+                if (source_key := _clean_optional(source_context.get("source_key")))
+            }
+        )
+        if not changed_source_keys:
+            raise RuntimeError("PTG address partial refresh did not resolve any changed source keys.")
+        reused_rows = await _copy_reusable_ptg_address_rows(
+            db_schema,
+            stage_table,
+            changed_source_keys=changed_source_keys,
+        )
+        context["partial_refresh_source_keys"] = changed_source_keys
+        context["partial_refresh_reused_rows"] = reused_rows
+        if run_id:
+            enqueue_live_progress(
+                run_id=run_id,
+                importer="ptg-address",
+                status="running",
+                phase="ptg-address reusing unchanged sources",
+                unit="rows",
+                done=reused_rows,
+                total=reused_rows,
+                pct=5,
+                message=f"reused {reused_rows:,} live PTG address rows from unchanged sources",
+            )
+    else:
+        context["partial_refresh_reused_rows"] = 0
 
     archive_resolve_stats = []
     archive_resolve_skipped_sources = []
@@ -1840,7 +1978,11 @@ async def _validate_publish_integrity(
         )
 
     base_archive_identity_mismatch_rows = 0
-    if await _table_exists(db_schema, "entity_address_unified"):
+    if await _table_exists(db_schema, "entity_address_unified") and await _table_column_exists(
+        db_schema,
+        "entity_address_unified",
+        "archive_identity_version",
+    ):
         base_archive_identity_mismatch_rows = int(
             await db.scalar(
                 f"""
@@ -1936,16 +2078,31 @@ async def shutdown(ctx):
         },
         metrics={
             "rows": stage_rows,
+            "refresh_mode": context.get("refresh_mode") or PTG_ADDRESS_REFRESH_MODE_FULL,
+            "partial_refresh_source_keys": context.get("partial_refresh_source_keys") or [],
+            "partial_refresh_reused_rows": int(context.get("partial_refresh_reused_rows") or 0),
             "publish_validation": context.get("publish_validation") or {},
         },
     )
     print_time_info(context.get("start"))
 
 
-async def main(test_mode: bool = False):
+async def main(
+    test_mode: bool = False,
+    source_key: str | None = None,
+    snapshot_id: str | None = None,
+    refresh_mode: str | None = None,
+):
     redis = await create_pool(
         build_redis_settings(),
         job_serializer=serialize_job,
         job_deserializer=deserialize_job,
     )
-    await redis.enqueue_job("process_data", {"test_mode": bool(test_mode)}, _queue_name=PTG_ADDRESS_QUEUE_NAME)
+    payload: dict[str, Any] = {"test_mode": bool(test_mode)}
+    if source_key:
+        payload["source_key"] = source_key
+    if snapshot_id:
+        payload["snapshot_id"] = snapshot_id
+    if refresh_mode:
+        payload["refresh_mode"] = refresh_mode
+    await redis.enqueue_job("process_data", payload, _queue_name=PTG_ADDRESS_QUEUE_NAME)

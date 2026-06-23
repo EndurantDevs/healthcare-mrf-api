@@ -48,6 +48,20 @@ TOC imports can be scoped with repeatable filters:
 
 When filters match a TOC structure containing multiple plans, only the matched plan metadata is attached to imported rows.
 
+After a PTG source publishes a new compact snapshot, `ptg-address` can refresh
+that source without rebuilding unchanged PTG sources:
+
+```bash
+python main.py start ptg-address --refresh-mode partial --source-key <source_key>
+python main.py worker process.PTGAddress --burst
+```
+
+`--refresh-mode full` remains the default and rebuilds every current PTG source.
+The partial path stages a full replacement table by copying live `ptg_address`
+rows for unchanged source keys and recomputing only the requested source. It
+requires an existing live `ptg_address` table and fails closed for
+member-fallback-only snapshots; run the full path in those cases.
+
 ## Main Outputs
 - PTG2 control tables such as `ptg2_import_run`, `ptg2_snapshot`, `ptg2_current_snapshot`, `ptg2_current_source_snapshot`, `ptg2_current_plan_source`, and `ptg2_artifact_manifest`
 - One manifest-backed snapshot serving table for the imported source/month

@@ -55,6 +55,9 @@ def test_importer_registry_exposes_ptg_and_finish_lifecycle():
     assert items["ptg-address"]["family"] == "provider"
     assert items["ptg-address"]["enqueue_adapter"] == "arq_single_job"
     assert items["ptg-address"]["queue"] == "arq:PTGAddress"
+    assert any(param["name"] == "source_key" and param["type"] == "text" for param in items["ptg-address"]["params_schema"])
+    assert any(param["name"] == "snapshot_id" and param["type"] == "text" for param in items["ptg-address"]["params_schema"])
+    assert any(param["name"] == "refresh_mode" and param["type"] == "choice" for param in items["ptg-address"]["params_schema"])
     assert items["code-sets"]["enqueue_adapter"] == "arq_single_job"
     assert items["ms-drg"]["family"] == "reference"
     assert items["ms-drg"]["enqueue_adapter"] == "arq_single_job"
@@ -109,6 +112,14 @@ def test_importer_registry_exposes_ptg_and_finish_lifecycle():
         param["name"] == "publish" and param["type"] == "boolean"
         for param in items["entity-address-unified"]["params_schema"]
     )
+    assert any(
+        param["name"] == "refresh_mode" and param["type"] == "choice"
+        for param in items["entity-address-unified"]["params_schema"]
+    )
+    assert any(
+        param["name"] == "ptg_source_key" and param["type"] == "text"
+        for param in items["entity-address-unified"]["params_schema"]
+    )
 
 
 def test_control_wrapped_publish_importers_request_shutdown():
@@ -120,6 +131,11 @@ def test_control_wrapped_publish_importers_request_shutdown():
     entity_payload = control_imports._adapter_payload(
         control_imports._SINGLE_JOB_ADAPTERS["entity-address-unified"],
         {"run_id": "run_entity", "importer": "entity-address-unified", "family": "provider"},
+        {},
+    )
+    ptg_address_payload = control_imports._adapter_payload(
+        control_imports._SINGLE_JOB_ADAPTERS["ptg-address"],
+        {"run_id": "run_ptg_address", "importer": "ptg-address", "family": "provider"},
         {},
     )
     npi_payload = control_imports._adapter_payload(
@@ -135,6 +151,7 @@ def test_control_wrapped_publish_importers_request_shutdown():
 
     assert facility_payload["run_shutdown"] is True
     assert entity_payload["run_shutdown"] is True
+    assert ptg_address_payload["run_shutdown"] is True
     assert openaddresses_payload["run_shutdown"] is True
     assert npi_payload["run_shutdown"] is False
 

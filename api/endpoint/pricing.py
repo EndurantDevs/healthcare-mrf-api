@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 import os
 import re
@@ -33,6 +34,7 @@ from db.models import (CodeCatalog, CodeCrosswalk, PricingProcedure,
                        PricingProcedurePeerStats, TerminologySynonym)
 
 blueprint = Blueprint("pricing", url_prefix="/pricing", version=1)
+logger = logging.getLogger(__name__)
 
 
 provider_table = PricingProvider.__table__
@@ -1585,8 +1587,8 @@ async def _internal_rx_codes_from_terminology(session, rows: list[dict[str, Any]
                 value = str(row[0] if not isinstance(row, dict) else row.get("to_code") or "").strip().upper()
                 if value:
                     internal_codes.add(value)
-        except Exception:  # pragma: no cover - defensive fallback for migrating code tables
-            pass
+        except Exception as exc:  # pragma: no cover - defensive fallback for migrating code tables
+            logger.debug("Skipping rx terminology crosswalk expansion: %s", exc)
     return sorted(internal_codes)
 
 

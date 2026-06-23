@@ -182,6 +182,7 @@ _SINGLE_JOB_ADAPTERS: dict[str, dict[str, Any]] = {
         "payload": "control_wrapped",
         "target_module": "process.ptg_address",
         "target_function": "process_data",
+        "run_shutdown": True,
     },
     "address-archive-v2-migrate": {
         "queue": "arq:AddressArchive",

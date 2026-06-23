@@ -1192,20 +1192,52 @@ def pharmacy_economics(test: bool):
     default=None,
     help="Publish staged output; defaults to false in test mode and true otherwise.",
 )
-def entity_address_unified(test: bool, limit_per_source: int | None, publish: bool | None):
+@click.option(
+    "--refresh-mode",
+    type=click.Choice(["full", "ptg-partial"], case_sensitive=False),
+    default="full",
+    show_default=True,
+    help="full rebuilds all sources; ptg-partial reuses live rows while refreshing one PTG source.",
+)
+@click.option("--ptg-source-key", help="PTG source key to refresh when --refresh-mode=ptg-partial.")
+def entity_address_unified(
+    test: bool,
+    limit_per_source: int | None,
+    publish: bool | None,
+    refresh_mode: str,
+    ptg_source_key: str | None,
+):
     _run(
         initiate_entity_address_unified(
             test_mode=test,
             limit_per_source=limit_per_source,
             publish=publish,
+            refresh_mode=refresh_mode,
+            ptg_source_key=ptg_source_key,
         )
     )
 
 
 @click.command(help="Run fast PTG provider-location address projection")
 @click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
-def ptg_address(test: bool):
-    _run(initiate_ptg_address(test_mode=test))
+@click.option("--source-key", help="Refresh a single PTG source key.")
+@click.option("--snapshot-id", help="Refresh a specific PTG source snapshot; defaults to the current snapshot.")
+@click.option(
+    "--refresh-mode",
+    type=click.Choice(["full", "partial"], case_sensitive=False),
+    default="full",
+    show_default=True,
+    help="full rebuilds every current PTG source; partial reuses unchanged live rows for the requested source.",
+)
+def ptg_address(test: bool, source_key: str | None, snapshot_id: str | None, refresh_mode: str):
+    _run(
+        initiate_ptg_address(
+            test_mode=test,
+            source_key=source_key,
+            snapshot_id=snapshot_id,
+            refresh_mode=refresh_mode,
+        )
+    )
 
 
 @click.command(help="Run OpenAddresses US geocode cache refresh and address archive backfill")

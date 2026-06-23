@@ -968,6 +968,29 @@ def test_entity_address_unified_publish_decision_allows_env_override(monkeypatch
     assert entity_address_unified._publish_requested({}, test_mode=False) is False  # pylint: disable=protected-access
 
 
+def test_entity_address_unified_refresh_mode_and_ptg_source_keys(monkeypatch):
+    monkeypatch.delenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_REFRESH_MODE", raising=False)
+    monkeypatch.delenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_PTG_SOURCE_KEY", raising=False)
+
+    assert entity_address_unified._entity_address_refresh_mode({}) == "full"
+    assert entity_address_unified._entity_address_refresh_mode({"refresh_mode": "ptg-partial"}) == "ptg-partial"
+    assert entity_address_unified._entity_address_refresh_mode({"mode": "partial-ptg"}) == "ptg-partial"
+
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_REFRESH_MODE", "ptg-source-refresh")
+    assert entity_address_unified._entity_address_refresh_mode({}) == "ptg-partial"
+
+    assert entity_address_unified._entity_address_ptg_source_keys({"ptg_source_key": "payer_a,payer_b"}) == [
+        "payer_a",
+        "payer_b",
+    ]
+    assert entity_address_unified._entity_address_ptg_source_keys({"ptg_source_keys": ["payer_a", "payer_a"]}) == [
+        "payer_a"
+    ]
+
+    with pytest.raises(ValueError, match="Unsupported entity-address-unified refresh_mode"):
+        entity_address_unified._entity_address_refresh_mode({"refresh_mode": "fastish"})
+
+
 def test_ffs_parent_source_is_not_a_unified_address_source():
     selects = entity_address_unified._source_selects(
         "mrf",
@@ -1090,6 +1113,68 @@ def test_entity_address_unified_registers_ptg_address_overlay_source():
     assert "COALESCE(p.group_plan_array, ARRAY[]::varchar[])::varchar[] AS group_plan_array" in ptg_source
     assert "('ptg:' || p.snapshot_id)::varchar AS ptg_address_version" in ptg_source
     assert "p.address_key::uuid AS address_key" in ptg_source
+
+
+def test_entity_address_unified_ptg_partial_filters_to_requested_ptg_source():
+    selects = entity_address_unified._source_selects(
+        "mrf",
+        {
+            "ptg_address": True,
+            "mrf_address": True,
+            "npi": False,
+            "npi_address": False,
+            "address_archive_v2": False,
+        },
+    )
+
+    filtered = entity_address_unified._ptg_partial_source_selects(
+        "mrf",
+        selects,
+        source_keys=["payer_a", "payer_b's"],
+    )
+
+    assert len(filtered) == 1
+    assert "FROM mrf.ptg_address AS p" in filtered[0]
+    assert "FROM mrf.mrf_address AS a" not in filtered[0]
+    assert "AND p.source_key IN ('payer_a', 'payer_b''s')" in filtered[0]
+
+
+def test_entity_address_unified_partial_reuse_sql_excludes_changed_and_raw_locations():
+    sql = entity_address_unified._entity_address_reuse_live_rows_sql(
+        "mrf",
+        "entity_address_unified_20260623",
+        "entity_address_unified_20260623_raw",
+        source_keys=["payer_a"],
+    )
+
+    assert "INSERT INTO mrf.entity_address_unified_20260623" in sql
+    assert "FROM mrf.entity_address_unified AS live" in sql
+    assert "COALESCE(live.ptg_source_array, ARRAY[]::varchar[]) && ARRAY['payer_a']::varchar[]" in sql
+    assert "FROM mrf.entity_address_unified_20260623_raw AS raw" in sql
+    assert "raw.location_key = live.location_key" in sql
+
+
+def test_entity_address_unified_ptg_bridge_falls_back_to_compacted_arrays():
+    sql = entity_address_unified._ptg_bridge_sql(  # pylint: disable=protected-access
+        "mrf",
+        "entity_address_ptg_bridge_20260623",
+        "entity_address_unified_20260623",
+    )
+
+    assert "source_record_bridge AS" in sql
+    assert "array_bridge AS" in sql
+    assert "unnest(COALESCE(t.ptg_source_array" in sql
+    assert "regexp_replace(COALESCE(t.ptg_address_version, ''), '^ptg:', '')" in sql
+    assert "NOT EXISTS" in sql
+
+
+def test_entity_address_unified_partial_mixed_rows_sql_guards_base_ptg_merges():
+    sql = entity_address_unified._entity_address_partial_mixed_rows_sql("mrf", ["payer_a"])
+
+    assert "FROM mrf.entity_address_unified AS live" in sql
+    assert "COALESCE(live.ptg_source_array, ARRAY[]::varchar[]) && ARRAY['payer_a']::varchar[]" in sql
+    assert "COALESCE(CARDINALITY(live.address_sources), 0) > 1" in sql
+    assert "COALESCE(CARDINALITY(live.ptg_source_array), 0) > 1" in sql
 
 
 def test_entity_address_unified_can_range_shard_large_source_selects():
@@ -2076,6 +2161,61 @@ def test_ptg_address_env_positive_int_defaults(monkeypatch):
     assert ptg_address._env_positive_int("HLTHPRT_PTG_ADDRESS_SOURCE_CONCURRENCY", 3) == 3
 
 
+def test_ptg_address_refresh_mode_defaults_aliases_and_rejects_invalid(monkeypatch):
+    monkeypatch.delenv("HLTHPRT_PTG_ADDRESS_REFRESH_MODE", raising=False)
+    assert ptg_address._ptg_address_refresh_mode({}) == "full"
+    assert ptg_address._ptg_address_refresh_mode({"refresh_mode": "partial"}) == "partial"
+    assert ptg_address._ptg_address_refresh_mode({"refresh_mode": "source-refresh"}) == "partial"
+    assert ptg_address._ptg_address_refresh_mode({"mode": "full-rebuild"}) == "full"
+
+    monkeypatch.setenv("HLTHPRT_PTG_ADDRESS_REFRESH_MODE", "reuse-live")
+    assert ptg_address._ptg_address_refresh_mode({}) == "partial"
+
+    with pytest.raises(ValueError, match="Unsupported PTG address refresh_mode"):
+        ptg_address._ptg_address_refresh_mode({"refresh_mode": "fastish"})
+
+
+def test_ptg_address_partial_reuse_sql_excludes_changed_source_keys():
+    sql = ptg_address._ptg_address_reuse_live_rows_sql(
+        "mrf",
+        "ptg_address_20260623",
+        ["payer_a", "payer_b's"],
+    )
+
+    assert 'INSERT INTO "mrf"."ptg_address_20260623"' in sql
+    assert 'FROM "mrf"."ptg_address" AS live' in sql
+    assert "live.source_key NOT IN ('payer_a', 'payer_b''s')" in sql
+    assert '"source_key"' in sql
+    assert '"snapshot_id"' in sql
+    assert '"location_key"' in sql
+    assert "SELECT " in sql
+
+
+def test_ptg_address_partial_refresh_rejects_member_fallback_only_sources():
+    with pytest.raises(RuntimeError, match="member-fallback-only"):
+        ptg_address._validate_partial_refresh_sources(
+            [
+                {
+                    "source_key": "payer_a",
+                    "snapshot_id": "snap_a",
+                    "provider_group_location_table": None,
+                    "provider_group_member_table": "ptg2_provider_group_member_a",
+                }
+            ]
+        )
+
+    ptg_address._validate_partial_refresh_sources(
+        [
+            {
+                "source_key": "payer_a",
+                "snapshot_id": "snap_a",
+                "provider_group_location_table": "ptg2_provider_group_location_a",
+                "provider_group_member_table": "ptg2_provider_group_member_a",
+            }
+        ]
+    )
+
+
 def test_ptg_address_sql_settings_include_bulk_defaults_and_overrides(monkeypatch):
     monkeypatch.delenv("HLTHPRT_PTG_ADDRESS_WORK_MEM", raising=False)
     settings = dict(ptg_address._ptg_address_sql_settings())
@@ -2525,8 +2665,12 @@ async def test_ptg_address_publish_integrity_checks_coordinates_and_archive(monk
     async def table_exists(_schema, _table):
         return True
 
+    async def table_column_exists(_schema, _table, _column):
+        return True
+
     monkeypatch.setattr(ptg_address, "db", FakeDB())
     monkeypatch.setattr(ptg_address, "_table_exists", table_exists)
+    monkeypatch.setattr(ptg_address, "_table_column_exists", table_column_exists)
 
     metrics = await ptg_address._validate_publish_integrity(
         "mrf",
@@ -2557,8 +2701,12 @@ async def test_ptg_address_publish_integrity_fails_on_invalid_coordinates(monkey
     async def table_exists(_schema, _table):
         return True
 
+    async def table_column_exists(_schema, _table, _column):
+        return True
+
     monkeypatch.setattr(ptg_address, "db", FakeDB())
     monkeypatch.setattr(ptg_address, "_table_exists", table_exists)
+    monkeypatch.setattr(ptg_address, "_table_column_exists", table_column_exists)
 
     with pytest.raises(RuntimeError, match="invalid latitude/longitude"):
         await ptg_address._validate_publish_integrity(
@@ -2579,8 +2727,12 @@ async def test_ptg_address_publish_integrity_fails_on_base_archive_identity_mism
     async def table_exists(_schema, _table):
         return True
 
+    async def table_column_exists(_schema, _table, _column):
+        return True
+
     monkeypatch.setattr(ptg_address, "db", FakeDB())
     monkeypatch.setattr(ptg_address, "_table_exists", table_exists)
+    monkeypatch.setattr(ptg_address, "_table_column_exists", table_column_exists)
 
     with pytest.raises(RuntimeError, match="archive_identity_version absent from entity_address_unified"):
         await ptg_address._validate_publish_integrity(
