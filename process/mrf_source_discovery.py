@@ -2311,11 +2311,11 @@ async def _crawl_toc_metadata(
     max_toc_bytes: int,
     concurrency: int = DEFAULT_CONCURRENCY,
     crawl_target_limit: int | None = None,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[int, int, list[dict[str, Any]]]:
     if test_mode:
-        return [], [], []
-    plan_ids: set[str] = set()
-    file_ids: set[str] = set()
+        return 0, 0, []
+    plans_discovered = 0
+    files_discovered = 0
     observation_ids: set[str] = set()
     worker_count = max(1, int(concurrency or DEFAULT_CONCURRENCY))
     write_batch_size = WRITE_BATCH_SIZE
@@ -2351,8 +2351,8 @@ async def _crawl_toc_metadata(
         target_rows: list[dict[str, Any]] = []
         for target in targets:
             row = _toc_target_file_row(target)
-            file_ids.add(row["mrf_file_id"])
             target_rows.append(row)
+        files_discovered += len(target_rows)
         for observation in resolver_observations:
             observation_ids.add(observation["observation_id"])
         await _push_crawl_row_batches([], target_rows, resolver_observations, batch_size=write_batch_size)
@@ -2380,6 +2380,7 @@ async def _crawl_toc_metadata(
                     target_queue.task_done()
 
         async def writer(active_workers: int) -> None:
+            nonlocal plans_discovered, files_discovered
             done = 0
             finished_workers = 0
             plan_batch: list[dict[str, Any]] = []
@@ -2392,10 +2393,8 @@ async def _crawl_toc_metadata(
                     continue
                 plan_rows, file_rows, crawl_observations, url = item
                 done += 1
-                for row in plan_rows:
-                    plan_ids.add(row["mrf_plan_id"])
-                for row in file_rows:
-                    file_ids.add(row["mrf_file_id"])
+                plans_discovered += len(plan_rows)
+                files_discovered += len(file_rows)
                 for row in crawl_observations:
                     observation_ids.add(row["observation_id"])
                 plan_batch.extend(plan_rows)
@@ -2445,8 +2444,8 @@ async def _crawl_toc_metadata(
             await asyncio.gather(worker_group, writer_task, return_exceptions=True)
             raise
     return (
-        [{"mrf_plan_id": value} for value in plan_ids],
-        [{"mrf_file_id": value} for value in file_ids],
+        plans_discovered,
+        files_discovered,
         [{"observation_id": value} for value in observation_ids],
     )
 
@@ -3278,7 +3277,7 @@ async def main(
         )
         result.urls_checked = len(observations)
     if crawl:
-        plan_rows, file_rows, crawl_observations = await _crawl_toc_metadata(
+        plans_discovered, files_discovered, crawl_observations = await _crawl_toc_metadata(
             source_rows,
             test_mode=test_mode,
             run_id=observation_run_id,
@@ -3288,8 +3287,8 @@ async def main(
             crawl_target_limit=crawl_target_limit,
         )
         observations.extend(crawl_observations)
-        result.plans = len(plan_rows)
-        result.files = len(file_rows)
+        result.plans = plans_discovered
+        result.files = files_discovered
     if probe_files:
         probe_observations, ok_count = await _probe_mrf_file_heads(
             file_types=parsed_file_probe_types,
