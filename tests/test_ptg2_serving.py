@@ -133,6 +133,26 @@ def test_ptg2_serving_utils_split_keeps_serving_facade_helpers_stable():
 
 
 @pytest.mark.asyncio
+async def test_manifest_filter_npis_by_provider_taxonomy_uses_primary_code_set():
+    session = FakeSession([FakeResult(rows=[{"npi": 1234567890}])])
+
+    filtered = await ptg2_serving._ptg2_manifest_filter_npis_by_provider_taxonomy(
+        session,
+        {"specialty": "Family Medicine"},
+        [1234567890, 1003179466, 1003141920],
+        limit=10,
+    )
+
+    assert filtered == (1234567890,)
+    sql = str(session.calls[0][0][0])
+    params = session.calls[0][0][1]
+    assert "manifest_provider_specialty_nt.npi = source_npis.npi" in sql
+    assert "healthcare_provider_primary_taxonomy_switch" in sql
+    assert params["manifest_provider_specialty_taxonomy_code_0"] == "207Q00000X"
+    assert params["manifest_provider_specialty_taxonomy_code_1"] == "208D00000X"
+
+
+@pytest.mark.asyncio
 async def test_ptg2_address_serving_table_prefers_unified_by_default(monkeypatch):
     monkeypatch.delenv("HLTHPRT_ADDRESS_SERVING_SOURCE", raising=False)
     session = FakeSession(

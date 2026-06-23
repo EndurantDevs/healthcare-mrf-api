@@ -435,7 +435,7 @@ async def test_ptg2_manifest_db_snapshot_expands_provider_npi_sidecar(tmp_path):
                         "serving_content_hash_128": "serving-hash",
                         "plan_id": "010854205",
                         "reported_code_system": "CPT",
-                        "reported_code": "70551",
+                        "reported_code": "99214",
                         "procedure_global_id_128": "procedure-hash",
                         "provider_set_global_id_128": provider_set_id,
                         "provider_count": 1,
@@ -453,7 +453,7 @@ async def test_ptg2_manifest_db_snapshot_expands_provider_npi_sidecar(tmp_path):
         "snap-manifest",
         {
             "plan_id": "010854205",
-            "code": "70551",
+            "code": "99214",
             "code_system": "CPT",
             "include_providers": "true",
         },

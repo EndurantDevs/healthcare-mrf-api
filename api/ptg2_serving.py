@@ -811,8 +811,8 @@ async def _ptg2_manifest_enriched_provider_rows_for_npis(
                     'lat', addr.lat,
                     'long', addr.long
                 )::text AS address_payload,
-                ARRAY[]::varchar[] AS taxonomy_codes,
-                ARRAY[]::varchar[] AS specialties,
+                COALESCE(tax.taxonomy_codes, ARRAY[]::varchar[]) AS taxonomy_codes,
+                COALESCE(tax.specialties, ARRAY[]::varchar[]) AS specialties,
                 COALESCE(
                     NULLIF(BTRIM(n.provider_organization_name), ''),
                     NULLIF(BTRIM(CONCAT_WS(' ', n.provider_first_name, n.provider_middle_name, n.provider_last_name)), ''),
@@ -827,12 +827,78 @@ async def _ptg2_manifest_enriched_provider_rows_for_npis(
                  ORDER BY (addr.type = 'primary') DESC, addr.type, addr.checksum
                  LIMIT 1
             ) addr ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT
+                    array_agg(nt.healthcare_provider_taxonomy_code ORDER BY (UPPER(COALESCE(nt.healthcare_provider_primary_taxonomy_switch, '')) = 'Y') DESC, nt.checksum) AS taxonomy_codes,
+                    array_agg(COALESCE(nucc.display_name, nucc.classification) ORDER BY (UPPER(COALESCE(nt.healthcare_provider_primary_taxonomy_switch, '')) = 'Y') DESC, nt.checksum) AS specialties
+                FROM {PTG2_SCHEMA}.npi_taxonomy nt
+                LEFT JOIN {PTG2_SCHEMA}.nucc_taxonomy nucc
+                  ON nucc.code = nt.healthcare_provider_taxonomy_code
+                WHERE nt.npi = source_npis.npi
+            ) tax ON TRUE
             ORDER BY provider_name, source_npis.npi
             """
         )
     )
     result = await session.execute(enrich_stmt, {"npis": npis})
     return [_row_mapping(row) for row in result]
+
+
+def _ptg2_provider_taxonomy_filter_requested(args: dict[str, Any]) -> bool:
+    if resolve_provider_specialty_filter(args).active:
+        return True
+    return _inferred_provider_taxonomy_rule(args) is not None
+
+
+async def _ptg2_manifest_filter_npis_by_provider_taxonomy(
+    session,
+    args: dict[str, Any],
+    npis: list[int] | tuple[int, ...],
+    *,
+    limit: int,
+) -> tuple[int, ...]:
+    candidate_npis = tuple(sorted({int(npi) for npi in npis if int(npi) > 0}))
+    if not candidate_npis:
+        return ()
+    specialty_filter = resolve_provider_specialty_filter(args)
+    params: dict[str, Any] = {"npis": list(candidate_npis), "limit": max(int(limit), 1)}
+    predicates: list[str] = []
+    if specialty_filter.active:
+        predicates.append(
+            provider_specialty_taxonomy_exists_sql(
+                "source_npis.npi",
+                params,
+                "manifest_provider_specialty",
+                specialty_filter,
+                schema=PTG2_SCHEMA,
+            )
+        )
+    inferred_sql = _inferred_provider_taxonomy_code_sql(
+        args,
+        nt_alias="nt",
+        schema=PTG2_SCHEMA,
+        params=params,
+        param_prefix="manifest_provider_inferred_taxonomy",
+    )
+    if inferred_sql:
+        predicates.append(
+            f"EXISTS (SELECT 1 FROM {PTG2_SCHEMA}.npi_taxonomy nt WHERE nt.npi = source_npis.npi AND {inferred_sql})"
+        )
+    if not predicates:
+        return candidate_npis[: max(int(limit), 1)]
+    result = await session.execute(
+        text(
+            f"""
+            SELECT source_npis.npi
+            FROM (SELECT UNNEST(CAST(:npis AS bigint[])) AS npi) source_npis
+            WHERE {" AND ".join(predicates)}
+            ORDER BY source_npis.npi
+            LIMIT :limit
+            """
+        ),
+        params,
+    )
+    return tuple(int(_row_mapping(row).get("npi")) for row in result if _row_mapping(row).get("npi") is not None)
 
 
 def _ptg2_manifest_location_match_limit() -> int:
@@ -1104,15 +1170,21 @@ async def _ptg2_manifest_provider_rows_for_provider_sets(
     provider_set_global_ids: list[str] | tuple[str, ...],
     *,
     limit_per_set: int,
+    args: dict[str, Any] | None = None,
 ) -> dict[str, list[dict[str, Any]]] | None:
     provider_set_ids = _ptg2_manifest_ids(tuple(provider_set_global_ids))
     if not provider_set_ids:
         return {}
+    args = args or {}
+    provider_taxonomy_filter_requested = _ptg2_provider_taxonomy_filter_requested(args)
+    candidate_limit_per_set = max(int(limit_per_set), 1)
+    if provider_taxonomy_filter_requested:
+        candidate_limit_per_set = max(candidate_limit_per_set * 200, 1000)
 
     npis_by_set = _ptg2_manifest_provider_npis_for_provider_sets(
         serving_tables,
         provider_set_ids,
-        limit_per_set=max(int(limit_per_set), 1),
+        limit_per_set=candidate_limit_per_set,
     )
     missing_provider_set_ids = [provider_set_id for provider_set_id in provider_set_ids if not npis_by_set.get(provider_set_id)]
     if missing_provider_set_ids:
@@ -1146,6 +1218,17 @@ async def _ptg2_manifest_provider_rows_for_provider_sets(
             for group_id in groups_by_set.get(provider_set_id, ()):
                 npis.update(npis_by_group.get(group_id, set()))
             npis_by_set[provider_set_id] = tuple(sorted(npis))
+
+    if provider_taxonomy_filter_requested:
+        filtered_npis_by_set: dict[str, tuple[int, ...]] = {}
+        for provider_set_id in provider_set_ids:
+            filtered_npis_by_set[provider_set_id] = await _ptg2_manifest_filter_npis_by_provider_taxonomy(
+                session,
+                args,
+                npis_by_set.get(provider_set_id, ()),
+                limit=max(int(limit_per_set), 1),
+            )
+        npis_by_set = filtered_npis_by_set
 
     all_npis = tuple(
         dict.fromkeys(
@@ -1416,6 +1499,7 @@ async def _search_ptg2_manifest_db_serving_table(
                 serving_tables,
                 provider_set_ids,
                 limit_per_set=max(int(pagination.limit), 1),
+                args=args,
             )
             if provider_rows_by_set is None:
                 return None
