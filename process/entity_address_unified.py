@@ -1724,17 +1724,85 @@ def _ptg_source_key_filter(
     )
 
 
+def _entity_address_evidence_group_match_sql(group_alias: str, row_alias: str) -> str:
+    return (
+        f"{group_alias}.entity_type = {row_alias}.entity_type\n"
+        f"       AND {group_alias}.entity_id = {row_alias}.entity_id\n"
+        f"       AND {group_alias}.street_key IS NOT DISTINCT FROM {_street_soft_norm_expr(f'{row_alias}.first_line')}\n"
+        f"       AND {group_alias}.city_key IS NOT DISTINCT FROM {_alnum_norm_expr(f'{row_alias}.city_name')}\n"
+        f"       AND {group_alias}.state_key IS NOT DISTINCT FROM {_state_norm_expr(f'{row_alias}.state_name')}\n"
+        f"       AND {group_alias}.zip_key IS NOT DISTINCT FROM {_zip5_norm_expr(f'{row_alias}.postal_code')}\n"
+        f"       AND {group_alias}.country_key IS NOT DISTINCT FROM {_state_norm_expr(f'{row_alias}.country_code')}"
+    )
+
+
+def _ptg_partial_affected_group_table_name(stage_table: str) -> str:
+    return _archived_identifier(stage_table, "_ptg_groups")
+
+
+def _prepare_ptg_partial_affected_groups_sql(db_schema: str, group_table: str, source_keys: list[str]) -> str:
+    return f"""
+    CREATE UNLOGGED TABLE {db_schema}.{group_table} AS
+    SELECT DISTINCT
+        live.entity_type::varchar AS entity_type,
+        live.entity_id::varchar AS entity_id,
+        {_street_soft_norm_expr("live.first_line")}::varchar AS street_key,
+        {_alnum_norm_expr("live.city_name")}::varchar AS city_key,
+        {_state_norm_expr("live.state_name")}::varchar AS state_key,
+        {_zip5_norm_expr("live.postal_code")}::varchar AS zip_key,
+        {_state_norm_expr("live.country_code")}::varchar AS country_key
+      FROM {db_schema}.{EntityAddressUnified.__main_table__} AS live
+     WHERE {_entity_address_ptg_source_overlap_sql(source_keys, alias="live")}
+       AND live.location_key IS NOT NULL;
+    """
+
+
+def _index_ptg_partial_affected_groups_sql(db_schema: str, group_table: str) -> str:
+    index_name = _archived_identifier(f"{group_table}_idx_group", "")
+    return f"""
+    CREATE INDEX {index_name}
+        ON {db_schema}.{group_table} (
+            entity_type,
+            entity_id,
+            street_key,
+            city_key,
+            state_key,
+            zip_key,
+            country_key
+        );
+    """
+
+
+def _affected_group_source_select_sql(db_schema: str, source_select: str, group_table: str) -> str:
+    return f"""
+    SELECT src.*
+      FROM (
+        {source_select.strip()}
+      ) AS src
+     WHERE EXISTS (
+            SELECT 1
+              FROM {db_schema}.{group_table} AS affected
+             WHERE {_entity_address_evidence_group_match_sql("affected", "src")}
+     )
+    """
+
+
 def _ptg_partial_source_selects(
     db_schema: str,
     source_selects: list[str],
     *,
     source_keys: list[str],
+    affected_group_table: str | None = None,
 ) -> list[str]:
     marker = f"FROM {db_schema}.ptg_address AS p"
     where_marker = "WHERE p.npi IS NOT NULL"
     filtered: list[str] = []
     for source_select in source_selects:
         if marker not in source_select:
+            if affected_group_table:
+                filtered.append(
+                    _affected_group_source_select_sql(db_schema, source_select, affected_group_table)
+                )
             continue
         if where_marker not in source_select:
             raise RuntimeError("PTG source select shape changed; cannot apply ptg-partial source filter")
@@ -1759,28 +1827,29 @@ def _entity_address_ptg_source_overlap_sql(source_keys: list[str], *, alias: str
     )
 
 
-def _entity_address_partial_mixed_rows_sql(db_schema: str, source_keys: list[str]) -> str:
-    return f"""
-    SELECT COUNT(*)
-      FROM {db_schema}.{EntityAddressUnified.__main_table__} AS live
-     WHERE {_entity_address_ptg_source_overlap_sql(source_keys, alias="live")}
-       AND COALESCE(CARDINALITY(live.address_sources), 0) > 1;
-    """
-
-
 def _entity_address_reuse_live_rows_sql(
     db_schema: str,
     stage_table: str,
     raw_table: str,
     *,
     source_keys: list[str],
+    affected_group_table: str | None = None,
 ) -> str:
     columns = _entity_address_column_list()
+    affected_group_exclusion = ""
+    if affected_group_table:
+        affected_group_exclusion = f"""
+       AND NOT EXISTS (
+            SELECT 1
+              FROM {db_schema}.{affected_group_table} AS affected
+             WHERE {_entity_address_evidence_group_match_sql("affected", "live")}
+       )"""
     return f"""
     INSERT INTO {db_schema}.{stage_table} ({columns})
     SELECT {columns}
       FROM {db_schema}.{EntityAddressUnified.__main_table__} AS live
      WHERE NOT ({_entity_address_ptg_source_overlap_sql(source_keys, alias="live")})
+       {affected_group_exclusion}
        AND NOT EXISTS (
             SELECT 1
               FROM {db_schema}.{raw_table} AS raw
@@ -1795,18 +1864,12 @@ async def _copy_reusable_entity_address_rows(
     raw_table: str,
     *,
     source_keys: list[str],
+    affected_group_table: str | None = None,
 ) -> int:
     if not await _table_exists(db_schema, EntityAddressUnified.__main_table__):
         raise RuntimeError(
             "entity-address-unified ptg-partial refresh requested, but the live "
             "entity_address_unified table does not exist; run refresh_mode=full first."
-        )
-    mixed_rows = int(await db.scalar(_entity_address_partial_mixed_rows_sql(db_schema, source_keys)) or 0)
-    if mixed_rows:
-        raise RuntimeError(
-            "entity-address-unified ptg-partial refresh found "
-            f"{mixed_rows} live mixed or multi-PTG-source row(s) for PTG source(s) {', '.join(source_keys)}; "
-            "run refresh_mode=full to preserve unchanged source rows exactly."
         )
     rowcount = await db.status(
         _entity_address_reuse_live_rows_sql(
@@ -1814,6 +1877,7 @@ async def _copy_reusable_entity_address_rows(
             stage_table,
             raw_table,
             source_keys=source_keys,
+            affected_group_table=affected_group_table,
         )
     )
     return int(rowcount or 0)
@@ -6734,11 +6798,64 @@ async def process_data(ctx, task=None):
         available,
         test_limit_per_source=test_limit_per_source,
     )
+    affected_group_table: str | None = None
     if partial_ptg_refresh:
+        if not await _table_exists(db_schema, EntityAddressUnified.__main_table__):
+            raise RuntimeError(
+                "entity-address-unified ptg-partial refresh requested, but the live "
+                "entity_address_unified table does not exist; run refresh_mode=full first."
+            )
+        affected_group_table = _ptg_partial_affected_group_table_name(stage_table)
+        await db.status(f"DROP TABLE IF EXISTS {db_schema}.{affected_group_table};")
+        await _run_sql_phase(
+            _prepare_ptg_partial_affected_groups_sql(
+                db_schema,
+                affected_group_table,
+                ptg_source_keys,
+            ),
+            context=context,
+            run_id=run_id,
+            phase="entity-address-unified preparing affected PTG groups",
+            unit="tables",
+            done=0,
+            total=1,
+            message="preparing affected PTG evidence groups",
+            emit_start=True,
+            emit_done=True,
+        )
+        await _run_sql_phase(
+            _index_ptg_partial_affected_groups_sql(db_schema, affected_group_table),
+            context=context,
+            run_id=run_id,
+            phase="entity-address-unified indexing affected PTG groups",
+            unit="indexes",
+            done=0,
+            total=1,
+            message="indexing affected PTG evidence groups",
+            emit_start=True,
+            emit_done=True,
+        )
+        await _run_sql_phase(
+            f"ANALYZE {db_schema}.{affected_group_table};",
+            context=context,
+            run_id=run_id,
+            phase="entity-address-unified analyzing affected PTG groups",
+            unit="tables",
+            done=0,
+            total=1,
+            message="analyzing affected PTG evidence groups",
+            emit_start=True,
+            emit_done=True,
+        )
+        affected_group_rows = int(
+            await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{affected_group_table};") or 0
+        )
+        context["partial_ptg_affected_groups"] = affected_group_rows
         source_selects = _ptg_partial_source_selects(
             db_schema,
             source_selects,
             source_keys=ptg_source_keys,
+            affected_group_table=affected_group_table,
         )
         if not source_selects:
             raise RuntimeError(
@@ -7068,6 +7185,7 @@ async def process_data(ctx, task=None):
                 stage_table,
                 raw_table,
                 source_keys=ptg_source_keys,
+                affected_group_table=affected_group_table,
             )
             context["partial_ptg_reused_rows"] = reused_rows
             if run_id:
@@ -7536,6 +7654,8 @@ async def process_data(ctx, task=None):
         context["support_counts"] = support_counts
     if raw_table:
         await db.status(f"DROP TABLE IF EXISTS {db_schema}.{raw_table};")
+    if affected_group_table:
+        await db.status(f"DROP TABLE IF EXISTS {db_schema}.{affected_group_table};")
 
     if (
         _env_bool(
