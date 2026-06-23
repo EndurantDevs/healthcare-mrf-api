@@ -771,6 +771,47 @@ async def _ptg2_manifest_prices_for_price_sets(
     return prices_by_set
 
 
+async def _ptg2_manifest_taxonomy_rows_for_npis(
+    session,
+    npis: list[int] | tuple[int, ...],
+) -> dict[int, dict[str, Any]]:
+    npis = tuple(sorted({int(npi) for npi in npis if int(npi) > 0}))
+    if not npis:
+        return {}
+    result = await session.execute(
+        text(
+            f"""
+            SELECT
+                source_npis.npi,
+                COALESCE(tax.taxonomy_codes, ARRAY[]::varchar[]) AS taxonomy_codes,
+                COALESCE(tax.specialties, ARRAY[]::varchar[]) AS specialties
+            FROM (SELECT UNNEST(CAST(:npis AS bigint[])) AS npi) source_npis
+            LEFT JOIN LATERAL (
+                SELECT
+                    array_agg(nt.healthcare_provider_taxonomy_code ORDER BY (UPPER(COALESCE(nt.healthcare_provider_primary_taxonomy_switch, '')) = 'Y') DESC, nt.checksum) AS taxonomy_codes,
+                    array_agg(COALESCE(nucc.display_name, nucc.classification) ORDER BY (UPPER(COALESCE(nt.healthcare_provider_primary_taxonomy_switch, '')) = 'Y') DESC, nt.checksum) AS specialties
+                FROM {PTG2_SCHEMA}.npi_taxonomy nt
+                LEFT JOIN {PTG2_SCHEMA}.nucc_taxonomy nucc
+                  ON nucc.code = nt.healthcare_provider_taxonomy_code
+                WHERE nt.npi = source_npis.npi
+            ) tax ON TRUE
+            """
+        ),
+        {"npis": list(npis)},
+    )
+    taxonomy_by_npi: dict[int, dict[str, Any]] = {}
+    for row in result:
+        data = _row_mapping(row)
+        npi = data.get("npi")
+        if npi is None:
+            continue
+        taxonomy_by_npi[int(npi)] = {
+            "taxonomy_codes": data.get("taxonomy_codes") or [],
+            "specialties": data.get("specialties") or [],
+        }
+    return taxonomy_by_npi
+
+
 async def _ptg2_manifest_enriched_provider_rows_for_npis(
     session,
     *,
@@ -787,7 +828,16 @@ async def _ptg2_manifest_enriched_provider_rows_for_npis(
         require_legacy_available=True,
     )
     if not await _serving_table_available(session, npi_data_table) or not npi_address_table:
-        return [{"npi": npi, "provider_name": "TiC provider"} for npi in npis]
+        taxonomy_by_npi = await _ptg2_manifest_taxonomy_rows_for_npis(session, npis)
+        return [
+            {
+                "npi": npi,
+                "provider_name": "TiC provider",
+                "taxonomy_codes": taxonomy_by_npi.get(npi, {}).get("taxonomy_codes", []),
+                "specialties": taxonomy_by_npi.get(npi, {}).get("specialties", []),
+            }
+            for npi in npis
+        ]
     address_location_source = _ptg2_address_location_source(npi_address_table)
     address_location_hash_sql = _ptg2_address_location_hash_sql("addr", npi_address_table)
     enrich_stmt = (

@@ -153,6 +153,42 @@ async def test_manifest_filter_npis_by_provider_taxonomy_uses_primary_code_set()
 
 
 @pytest.mark.asyncio
+async def test_manifest_enriched_provider_fallback_includes_taxonomy(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "legacy")
+    session = FakeSession(
+        [
+            False,
+            False,
+            FakeResult(
+                rows=[
+                    {
+                        "npi": 1234567890,
+                        "taxonomy_codes": ["207Q00000X"],
+                        "specialties": ["Family Medicine"],
+                    }
+                ]
+            ),
+        ]
+    )
+
+    rows = await ptg2_serving._ptg2_manifest_enriched_provider_rows_for_npis(
+        session,
+        npis=[1234567890],
+        limit=5,
+    )
+
+    assert rows == [
+        {
+            "npi": 1234567890,
+            "provider_name": "TiC provider",
+            "taxonomy_codes": ["207Q00000X"],
+            "specialties": ["Family Medicine"],
+        }
+    ]
+    assert "FROM mrf.npi_taxonomy nt" in str(session.calls[2][0][0])
+
+
+@pytest.mark.asyncio
 async def test_ptg2_address_serving_table_prefers_unified_by_default(monkeypatch):
     monkeypatch.delenv("HLTHPRT_ADDRESS_SERVING_SOURCE", raising=False)
     session = FakeSession(
