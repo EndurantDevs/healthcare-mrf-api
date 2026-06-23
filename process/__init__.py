@@ -126,6 +126,7 @@ from process.ptg_address import main as initiate_ptg_address
 from process.ptg_address import process_data as process_ptg_address_data
 from process.ptg_address import shutdown as ptg_address_shutdown
 from process.ptg_address import startup as ptg_address_startup
+from process.ptg_address_entity_refresh import main as initiate_ptg_address_entity_refresh
 from process.address_archive_migration import main as initiate_address_archive_migration
 from process.address_archive_migration import process_data as process_address_archive_migration_data
 from process.openaddresses import main as initiate_openaddresses
@@ -1240,6 +1241,52 @@ def ptg_address(test: bool, source_key: str | None, snapshot_id: str | None, ref
     )
 
 
+@click.command(help="Run PTG address refresh followed by entity-address PTG refresh")
+@click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
+@click.option("--source-key", help="PTG source key to refresh.")
+@click.option("--snapshot-id", help="Refresh a specific PTG source snapshot; defaults to the current snapshot.")
+@click.option(
+    "--ptg-refresh-mode",
+    type=click.Choice(["full", "partial"], case_sensitive=False),
+    default="partial",
+    show_default=True,
+    help="PTG address mode; partial patches only the requested source.",
+)
+@click.option(
+    "--entity-refresh-mode",
+    type=click.Choice(["full", "ptg-partial"], case_sensitive=False),
+    default="ptg-partial",
+    show_default=True,
+    help="Entity-address mode; ptg-partial patches only affected PTG rows.",
+)
+@click.option("--limit-per-source", type=int, help="Limit entity-address rows per source for bounded smoke or pilot runs.")
+@click.option(
+    "--publish/--no-publish",
+    default=None,
+    help="Publish entity-address staged output; defaults to false in test mode and true otherwise.",
+)
+def ptg_address_entity_refresh(
+    test: bool,
+    source_key: str | None,
+    snapshot_id: str | None,
+    ptg_refresh_mode: str,
+    entity_refresh_mode: str,
+    limit_per_source: int | None,
+    publish: bool | None,
+):
+    _run(
+        initiate_ptg_address_entity_refresh(
+            test_mode=test,
+            source_key=source_key,
+            snapshot_id=snapshot_id,
+            ptg_refresh_mode=ptg_refresh_mode,
+            entity_refresh_mode=entity_refresh_mode,
+            limit_per_source=limit_per_source,
+            publish=publish,
+        )
+    )
+
+
 @click.command(help="Run OpenAddresses US geocode cache refresh and address archive backfill")
 @click.option("--test", is_flag=True, help="Process a small OpenAddresses subset for a quick smoke run.")
 @click.option("--backfill-only", is_flag=True, help="Backfill archive coordinates from the existing local OpenAddresses cache.")
@@ -1470,6 +1517,7 @@ process_group.add_command(facility_anchors, name="facility-anchors")
 process_group.add_command(pharmacy_economics, name="pharmacy-economics")
 process_group.add_command(entity_address_unified, name="entity-address-unified")
 process_group.add_command(ptg_address, name="ptg-address")
+process_group.add_command(ptg_address_entity_refresh, name="ptg-address-entity-refresh")
 process_group.add_command(openaddresses, name="openaddresses")
 process_group.add_command(address_archive_v2_migrate, name="address-archive-v2-migrate")
 process_group.add_command(geo_lookup, name="geo")

@@ -58,6 +58,21 @@ def test_importer_registry_exposes_ptg_and_finish_lifecycle():
     assert any(param["name"] == "source_key" and param["type"] == "text" for param in items["ptg-address"]["params_schema"])
     assert any(param["name"] == "snapshot_id" and param["type"] == "text" for param in items["ptg-address"]["params_schema"])
     assert any(param["name"] == "refresh_mode" and param["type"] == "choice" for param in items["ptg-address"]["params_schema"])
+    assert items["ptg-address-entity-refresh"]["family"] == "provider"
+    assert items["ptg-address-entity-refresh"]["enqueue_adapter"] == "arq_single_job"
+    assert items["ptg-address-entity-refresh"]["queue"] == "arq:EntityAddressUnified"
+    assert any(
+        param["name"] == "source_key" and param["type"] == "text"
+        for param in items["ptg-address-entity-refresh"]["params_schema"]
+    )
+    assert any(
+        param["name"] == "ptg_refresh_mode" and param["type"] == "choice"
+        for param in items["ptg-address-entity-refresh"]["params_schema"]
+    )
+    assert any(
+        param["name"] == "entity_refresh_mode" and param["type"] == "choice"
+        for param in items["ptg-address-entity-refresh"]["params_schema"]
+    )
     assert items["code-sets"]["enqueue_adapter"] == "arq_single_job"
     assert items["ms-drg"]["family"] == "reference"
     assert items["ms-drg"]["enqueue_adapter"] == "arq_single_job"
@@ -154,6 +169,36 @@ def test_control_wrapped_publish_importers_request_shutdown():
     assert ptg_address_payload["run_shutdown"] is True
     assert openaddresses_payload["run_shutdown"] is True
     assert npi_payload["run_shutdown"] is False
+
+
+def test_ptg_address_entity_refresh_adapter_payload():
+    payload = control_imports._adapter_payload(
+        control_imports._SINGLE_JOB_ADAPTERS["ptg-address-entity-refresh"],
+        {
+            "run_id": "run_ptg_entity",
+            "importer": "ptg-address-entity-refresh",
+            "family": "provider",
+        },
+        {
+            "source_key": "source-a",
+            "snapshot_id": "snap-new",
+            "test_mode": True,
+            "limit_per_source": 25,
+            "publish": True,
+        },
+    )
+
+    assert payload["run_id"] == "run_ptg_entity"
+    assert payload["target_module"] == "process.ptg_address_entity_refresh"
+    assert payload["target_function"] == "process_data"
+    assert payload["run_shutdown"] is False
+    assert payload["task"] == {
+        "test_mode": True,
+        "source_key": "source-a",
+        "snapshot_id": "snap-new",
+        "limit_per_source": 25,
+        "publish": True,
+    }
 
 
 def test_openaddresses_adapter_preserves_parallel_load_params():
@@ -609,6 +654,42 @@ async def test_enqueue_import_start_wraps_kwargs_importers(monkeypatch):
     assert args[1]["call_style"] == "kwargs"
     assert args[1]["task"] == {"test_mode": True, "sources": "icd10cm", "import_id": "smoke_clinical"}
     assert kwargs == {"_queue_name": "arq:ClinicalReference", "_max_tries": 1}
+
+
+@pytest.mark.asyncio
+async def test_enqueue_import_start_wraps_ptg_address_entity_refresh(monkeypatch):
+    calls = []
+
+    class FakeJob:
+        job_id = "job_ptg_entity"
+
+    class FakeRedis:
+        async def enqueue_job(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            return FakeJob()
+
+    async def fake_create_pool(*_args, **_kwargs):
+        return FakeRedis()
+
+    monkeypatch.setattr("api.control_imports.create_pool", fake_create_pool)
+    row = {
+        "run_id": "run_ptg_entity",
+        "importer": "ptg-address-entity-refresh",
+        "family": "provider",
+        "params": {"source_key": "source-a", "snapshot_id": "snap-new", "test_mode": True},
+    }
+
+    result = await _enqueue_import_start(row)
+
+    assert result["status"] == "queued"
+    assert result["metrics"]["queue"] == "arq:EntityAddressUnified"
+    args, kwargs = calls[0]
+    assert args[0] == "control_single_job_start"
+    assert args[1]["run_id"] == "run_ptg_entity"
+    assert args[1]["target_module"] == "process.ptg_address_entity_refresh"
+    assert args[1]["target_function"] == "process_data"
+    assert args[1]["task"] == {"test_mode": True, "source_key": "source-a", "snapshot_id": "snap-new"}
+    assert kwargs == {"_queue_name": "arq:EntityAddressUnified", "_max_tries": 1}
 
 
 @pytest.mark.asyncio
