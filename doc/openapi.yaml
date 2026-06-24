@@ -3009,6 +3009,10 @@ paths:
           in: query
           schema:
             type: string
+        - name: market_type
+          in: query
+          schema:
+            type: string
         - name: source_key
           in: query
           schema:
@@ -3545,6 +3549,11 @@ paths:
           schema:
             type: string
           description: Optional specialty text filter. For PTG2 plan-rate results this matches NUCC display name, classification, specialization, or section.
+        - name: include_subspecialties
+          in: query
+          schema:
+            type: boolean
+          description: Include NUCC subspecialties when applying specialty text filters.
         - name: provider_type
           in: query
           schema:
@@ -3608,6 +3617,11 @@ paths:
           schema:
             type: string
           description: Optional PTG2 plan market type, for example group.
+        - name: market_type
+          in: query
+          schema:
+            type: string
+          description: Alias for plan_market_type when resolving a PTG2 source snapshot.
         - name: source_key
           in: query
           schema:
