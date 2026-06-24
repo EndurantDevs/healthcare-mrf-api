@@ -1211,6 +1211,27 @@ def _mymedicalshopper_employer_slug_from_url(url: str | None) -> str | None:
     return None
 
 
+def _mymedicalshopper_group_id_from_employer_slug(slug: str | None) -> str | None:
+    parts = [part for part in re.split(r"[-_]+", str(slug or "").strip()) if part]
+    if parts and re.fullmatch(r"\d+", parts[-1]):
+        return parts[-1]
+    return None
+
+
+def _mymedicalshopper_tpa_slug_from_employer_slug(slug: str | None) -> str | None:
+    parts = [part for part in re.split(r"[-_]+", str(slug or "").strip()) if part]
+    if len(parts) >= 2 and re.fullmatch(r"\d+", parts[-1]):
+        return parts[-2]
+    return None
+
+
+def _slug_label(value: str | None) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    return re.sub(r"\s+", " ", text.replace("_", " ").replace("-", " ")).strip().title()
+
+
 def _mymedicalshopper_employer_selector(entity_slug: str, *, all_employers_searchable: bool) -> dict[str, Any]:
     selector: dict[str, Any] = {"tpaSlug": entity_slug, "status": "Enabled"}
     if not all_employers_searchable:
@@ -1357,6 +1378,14 @@ def _mymedicalshopper_entity_config_from_messages(messages: list[dict[str, Any]]
     return {}
 
 
+def _mymedicalshopper_tpa_name_from_config(config: dict[str, Any], entity_slug: str | None) -> str | None:
+    for key in ("name", "displayName", "display_name", "companyName", "company_name", "title"):
+        value = _clean_text(config.get(key))
+        if value:
+            return value
+    return _slug_label(entity_slug)
+
+
 def _mymedicalshopper_oid_value(value: Any) -> str:
     if isinstance(value, dict) and value.get("$type") == "oid":
         return str(value.get("$value") or "").strip()
@@ -1404,6 +1433,7 @@ async def _mymedicalshopper_entity_employers(
         timeout_seconds=timeout_seconds,
     )
     config = _mymedicalshopper_entity_config_from_messages(config_messages, entity_slug)
+    tpa_name = _mymedicalshopper_tpa_name_from_config(config, entity_slug)
     machine_readable_files = config.get("machineReadableFiles") if isinstance(config.get("machineReadableFiles"), dict) else {}
     selector = _mymedicalshopper_employer_selector(
         entity_slug,
@@ -1436,6 +1466,10 @@ async def _mymedicalshopper_entity_employers(
         for employer in _mymedicalshopper_employer_docs_from_messages(doc_messages):
             slug = str(employer.get("slug") or "").strip()
             if slug:
+                employer = dict(employer)
+                employer.setdefault("tpaSlug", entity_slug)
+                if tpa_name:
+                    employer.setdefault("tpaName", tpa_name)
                 employers[slug] = employer
         offset += len(ids)
         if offset >= (_as_int(info.get("records_filtered")) or len(ids)):
@@ -1514,6 +1548,11 @@ def _mymedicalshopper_targets_from_generated(
 ) -> list[CrawlTarget]:
     employer_slug = str(employer.get("slug") or "").strip()
     employer_name = _clean_text(employer.get("name") or employer_slug)
+    employer_id = _mymedicalshopper_oid_value(employer.get("_id") or employer.get("id")) or None
+    group_id = str(employer.get("groupId") or employer.get("group_id") or "").strip() or _mymedicalshopper_group_id_from_employer_slug(employer_slug)
+    tpa_slug = str(employer.get("tpaSlug") or employer.get("tpa_slug") or entity_slug or "").strip() or _mymedicalshopper_tpa_slug_from_employer_slug(employer_slug)
+    tpa_name = _clean_text(employer.get("tpaName") or employer.get("tpa_name")) or _slug_label(tpa_slug)
+    ein = str(employer.get("ein") or employer.get("EIN") or "").strip() or None
     targets_by_url: dict[str, CrawlTarget] = {}
     for entry in _mymedicalshopper_generated_entries(generated):
         plan_id = _mymedicalshopper_entry_plan_value(entry, ("planId", "plan_id", "id", "_id"))
@@ -1543,11 +1582,17 @@ def _mymedicalshopper_targets_from_generated(
             metadata={
                 "resolver": resolver_type,
                 "target_file_type": "table-of-contents",
-                "entity_slug": entity_slug or employer.get("tpaSlug"),
+                "entity_slug": entity_slug or tpa_slug,
+                "tpa_slug": tpa_slug,
+                "tpa_name": tpa_name,
+                "client_id": employer_id,
+                "client_name": employer_name or None,
+                "employer_id": employer_id or employer_slug or None,
                 "employer_slug": employer_slug or None,
                 "employer_name": employer_name or None,
-                "group_id": employer.get("groupId"),
-                "ein": employer.get("ein"),
+                "group_id": group_id,
+                "group_number": group_id,
+                "ein": ein,
                 "plan_id": str(plan_id) if plan_id not in (None, "") else None,
                 "plan_name": plan_name or None,
                 "month": month,
@@ -1586,7 +1631,16 @@ async def _resolve_mymedicalshopper_talon_mrf(
                 request_id=f"mms-employer-name-{employer_slug}",
                 timeout_seconds=timeout_seconds,
             )
-            employers = [{"slug": employer_slug, "name": employer_name}]
+            direct_tpa_slug = _mymedicalshopper_tpa_slug_from_employer_slug(employer_slug)
+            employers = [
+                {
+                    "slug": employer_slug,
+                    "name": employer_name,
+                    "tpaSlug": direct_tpa_slug,
+                    "tpaName": _slug_label(direct_tpa_slug),
+                    "groupId": _mymedicalshopper_group_id_from_employer_slug(employer_slug),
+                }
+            ]
         targets: list[CrawlTarget] = []
         for employer in employers:
             slug = str(employer.get("slug") or "").strip()
@@ -1634,6 +1688,22 @@ def _crawl_target_context_metadata(target: CrawlTarget) -> dict[str, str]:
         context["group_number"] = group_number
     if target.label:
         context["target_label"] = str(target.label)
+    for key in (
+        "client_id",
+        "client_name",
+        "employer_id",
+        "employer_name",
+        "employer_slug",
+        "entity_slug",
+        "tpa_slug",
+        "tpa_name",
+        "ein",
+        "plan_id",
+        "plan_name",
+    ):
+        value = str(metadata.get(key) or "").strip()
+        if value:
+            context[key] = value
     return context
 
 
@@ -4073,7 +4143,22 @@ def _import_control_snapshot_file_is_supported(file_type: Any, metadata: dict[st
 
 def _import_control_preview_context(metadata: dict[str, Any], from_index_url: Any, canonical_url: Any) -> dict[str, str]:
     context: dict[str, str] = {}
-    for key in ("group_id", "group_number", "client_id", "client_name", "employer_id", "employer_name", "target_label"):
+    for key in (
+        "group_id",
+        "group_number",
+        "client_id",
+        "client_name",
+        "employer_id",
+        "employer_name",
+        "employer_slug",
+        "entity_slug",
+        "tpa_slug",
+        "tpa_name",
+        "ein",
+        "plan_id",
+        "plan_name",
+        "target_label",
+    ):
         value = str(metadata.get(key) or "").strip()
         if value:
             context[key] = value

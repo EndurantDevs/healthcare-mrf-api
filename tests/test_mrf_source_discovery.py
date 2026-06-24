@@ -782,8 +782,25 @@ def test_mymedicalshopper_targets_keep_latest_generated_toc_per_plan():
     assert targets[0].label == "EWIF - HAP / First Health - EWIF In Network 01/01/2023 - 2026-06-01"
     assert targets[0].metadata["target_file_type"] == "table-of-contents"
     assert targets[0].metadata["entity_slug"] == "varipro"
+    assert targets[0].metadata["tpa_slug"] == "varipro"
+    assert targets[0].metadata["tpa_name"] == "Varipro"
+    assert targets[0].metadata["client_id"] is None
+    assert targets[0].metadata["client_name"] == "EWIF - HAP / First Health"
     assert targets[0].metadata["employer_slug"] == "electrical-workers-cofinity-varipro-77100"
+    assert targets[0].metadata["employer_name"] == "EWIF - HAP / First Health"
+    assert targets[0].metadata["group_id"] == "77100"
+    assert targets[0].metadata["group_number"] == "77100"
+    assert targets[0].metadata["ein"] == "381393235"
     assert targets[0].metadata["history_month_count"] == 3
+    context = discovery._crawl_target_context_metadata(targets[0])
+    assert context["client_name"] == "EWIF - HAP / First Health"
+    assert context["tpa_slug"] == "varipro"
+    assert context["group_number"] == "77100"
+
+
+def test_mymedicalshopper_direct_employer_slug_infers_tpa_and_group_context():
+    assert discovery._mymedicalshopper_group_id_from_employer_slug("electrical-workers-cofinity-varipro-77100") == "77100"
+    assert discovery._mymedicalshopper_tpa_slug_from_employer_slug("electrical-workers-cofinity-varipro-77100") == "varipro"
 
 
 def test_highmark_hmhs_script_expands_current_month_index_urls():
