@@ -153,6 +153,102 @@ async def test_manifest_filter_npis_by_provider_taxonomy_uses_primary_code_set()
 
 
 @pytest.mark.asyncio
+async def test_manifest_serving_taxonomy_expansion_uses_wider_rate_candidate_window(monkeypatch):
+    provider_sets = [f"{idx:032x}" for idx in range(1, 6)]
+    price_sets = [f"{idx:032x}" for idx in range(101, 106)]
+    rows = [
+        {
+            "serving_content_hash_128": f"{idx + 201:032x}",
+            "plan_id": "465722012",
+            "reported_code_system": "CPT",
+            "reported_code": "99214",
+            "procedure_global_id_128": f"{idx + 301:032x}",
+            "provider_set_global_id_128": provider_sets[idx],
+            "provider_count": 100 - idx,
+            "price_set_global_id_128": price_sets[idx],
+            "source_trace_set_hash": None,
+        }
+        for idx in range(5)
+    ]
+    session = FakeSession([5, FakeResult(rows=rows)])
+    tables = ptg2_serving.PTG2ServingTables(
+        serving_table="mrf.ptg2_serving_manifest_token",
+        price_atom_table="mrf.ptg2_price_atom_manifest_token",
+        provider_group_member_table="mrf.ptg2_provider_group_member_manifest_token",
+    )
+
+    class LimitOnePagination:
+        limit = 1
+        offset = 0
+
+    async def fake_available(_session, table_name):
+        assert table_name == "mrf.ptg2_serving_manifest_token"
+        return True
+
+    async def fake_prices(_session, _tables, price_set_ids):
+        assert tuple(price_set_ids) == tuple(price_sets)
+        return {
+            price_set_id: [{"negotiated_type": "fee schedule", "negotiated_rate": 114.82}]
+            for price_set_id in price_set_ids
+        }
+
+    async def fake_providers(_session, _tables, provider_set_ids, *, limit_per_set, args):
+        assert tuple(provider_set_ids) == tuple(provider_sets)
+        assert limit_per_set == 1
+        assert args["specialty"] == "Family Medicine"
+        return {
+            provider_sets[1]: [
+                {
+                    "npi": 1851399604,
+                    "provider_name": "Family Medicine Provider",
+                    "state": "FL",
+                    "city": "Jacksonville",
+                    "zip5": "32210",
+                    "taxonomy_codes": ["207Q00000X"],
+                    "specialties": ["Family Medicine Physician"],
+                }
+            ]
+        }
+
+    async def fake_procedure_details(_session, row_data):
+        assert [row["provider_set_global_id_128"] for row in row_data] == provider_sets
+        return {("CPT", "99214"): {"procedure_name": "Office/outpatient visit"}}
+
+    monkeypatch.setattr(ptg2_serving, "_serving_table_available", fake_available)
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_prices_for_price_sets", fake_prices)
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_provider_rows_for_provider_sets", fake_providers)
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_procedure_details_for_rows", fake_procedure_details)
+
+    payload = await ptg2_serving._search_ptg2_manifest_db_serving_table(
+        session,
+        "ptg2:202606:test",
+        {
+            "plan_id": "465722012",
+            "market_type": "group",
+            "code": "99214",
+            "code_system": "CPT",
+            "include_providers": "true",
+            "specialty": "Family Medicine",
+        },
+        LimitOnePagination(),
+        tables,
+        ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
+    )
+
+    assert len(payload["items"]) == 1
+    assert payload["items"][0]["npi"] == 1851399604
+    assert payload["items"][0]["taxonomy_codes"] == ["207Q00000X"]
+    assert payload["pagination"]["limit"] == 1
+    assert payload["query"]["plan_market_type"] == "group"
+    row_sql = str(session.calls[1][0][0])
+    row_params = session.calls[1][0][1]
+    assert "LIMIT :rate_candidate_limit" in row_sql
+    assert row_params["limit"] == 1
+    assert row_params["rate_candidate_limit"] > row_params["limit"]
+    assert row_params["rate_candidate_limit"] <= ptg2_serving._PTG2_MANIFEST_TAXONOMY_RATE_CANDIDATE_LIMIT
+
+
+@pytest.mark.asyncio
 async def test_manifest_enriched_provider_fallback_includes_taxonomy(monkeypatch):
     monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "legacy")
     session = FakeSession(

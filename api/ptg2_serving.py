@@ -127,6 +127,7 @@ ADDRESS_SERVING_SOURCE_ENV = "HLTHPRT_ADDRESS_SERVING_SOURCE"
 ADDRESS_SERVING_SOURCE_LEGACY = "legacy"
 ADDRESS_SERVING_SOURCE_UNIFIED = "entity_address_unified"
 _PTG2_MANIFEST_SIDECAR_CACHE: dict[tuple[str, str, str], tuple[str, ...]] = {}
+_PTG2_MANIFEST_TAXONOMY_RATE_CANDIDATE_LIMIT = 25
 _PTG2_LEGACY_ADDRESS_COLUMNS = {
     "npi",
     "type",
@@ -900,6 +901,22 @@ def _ptg2_provider_taxonomy_filter_requested(args: dict[str, Any]) -> bool:
     return _inferred_provider_taxonomy_rule(args) is not None
 
 
+def _ptg2_manifest_rate_candidate_limit(
+    args: dict[str, Any],
+    pagination,
+    *,
+    expand_providers: bool,
+    location_filter_requested: bool,
+) -> int:
+    requested_limit = max(int(pagination.limit), 1)
+    if expand_providers and not location_filter_requested and _ptg2_provider_taxonomy_filter_requested(args):
+        return min(
+            _PTG2_MANIFEST_TAXONOMY_RATE_CANDIDATE_LIMIT,
+            max(requested_limit, requested_limit * 5, 5),
+        )
+    return requested_limit
+
+
 async def _ptg2_manifest_filter_npis_by_provider_taxonomy(
     session,
     args: dict[str, Any],
@@ -1421,11 +1438,18 @@ async def _search_ptg2_manifest_db_serving_table(
     if expand_providers and not serving_tables.provider_group_member_table and not has_provider_npi_sidecar:
         return None
 
+    rate_candidate_limit = _ptg2_manifest_rate_candidate_limit(
+        args,
+        pagination,
+        expand_providers=expand_providers,
+        location_filter_requested=location_filter_requested,
+    )
     filters = ["plan_id = :plan_id", "reported_code = :reported_code"]
     params: dict[str, Any] = {
         "plan_id": requested_plan,
         "reported_code": requested_code,
         "limit": int(pagination.limit),
+        "rate_candidate_limit": rate_candidate_limit,
         "offset": int(pagination.offset),
     }
     if requested_system:
@@ -1455,7 +1479,7 @@ async def _search_ptg2_manifest_db_serving_table(
                     "query": {
                         "plan_id": args.get("plan_id"),
                         "plan_external_id": args.get("plan_external_id"),
-                        "plan_market_type": args.get("plan_market_type") or None,
+                        "plan_market_type": args.get("plan_market_type") or args.get("market_type") or None,
                         "source_key": args.get("source_key") or None,
                         "snapshot_id": snapshot_id,
                         "mode": mode_value,
@@ -1524,7 +1548,7 @@ async def _search_ptg2_manifest_db_serving_table(
             FROM {table_name}
             WHERE {where_sql}
             ORDER BY provider_count DESC NULLS LAST, serving_content_hash_128
-            LIMIT :limit OFFSET :offset
+            LIMIT :rate_candidate_limit OFFSET :offset
             """
         ),
         params,
@@ -1627,7 +1651,7 @@ async def _search_ptg2_manifest_db_serving_table(
             "query": {
                 "plan_id": args.get("plan_id"),
                 "plan_external_id": args.get("plan_external_id"),
-                "plan_market_type": args.get("plan_market_type") or None,
+                "plan_market_type": args.get("plan_market_type") or args.get("market_type") or None,
                 "source_key": args.get("source_key") or None,
                 "snapshot_id": snapshot_id,
                 "mode": mode_value,
