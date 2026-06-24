@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import datetime as dt
 import gzip
 import html
@@ -200,6 +201,33 @@ def _platform_resolver_config(platform: str | None) -> dict[str, Any]:
     return dict(config) if isinstance(config, dict) else {}
 
 
+def _seed_list_config(name: str | None) -> dict[str, Any]:
+    seed_list_name = str(name or "").strip()
+    if not seed_list_name:
+        raise ValueError("seed list name is required")
+    seed_lists = _source_config().get("seed_lists") or {}
+    config = seed_lists.get(seed_list_name)
+    if not isinstance(config, dict):
+        raise ValueError(f"unsupported seed list: {seed_list_name}")
+    return dict(config)
+
+
+def _load_seed_list_rows(name: str | None) -> list[dict[str, str]]:
+    config = _seed_list_config(name)
+    schema = str(config.get("schema") or "").strip()
+    if schema != "group_number_seed_v1":
+        raise ValueError(f"unsupported seed list schema: {schema or 'missing'}")
+    path = _resolve_config_path(str(config.get("path") or ""))
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = set(reader.fieldnames or ())
+        required = {"group_number", "status"}
+        missing = sorted(required - fieldnames)
+        if missing:
+            raise ValueError(f"seed list {name} missing required column(s): {', '.join(missing)}")
+        return [{key: str(value or "").strip() for key, value in row.items()} for row in reader]
+
+
 def _configured_provider_names(key: str) -> list[str]:
     values = _source_config().get(key) or []
     return [str(item).strip().lower() for item in values if str(item).strip()]
@@ -346,10 +374,20 @@ def classify_hosting_platform(url: str | None) -> str | None:
     host = _domain(url) or ""
     raw = str(url or "").lower()
     path = urlsplit(str(url or "")).path.lower()
+    if host == "mrfsearch.meritain.com":
+        return "meritain_mrf_search"
+    if host == "mrf.healthcarebluebook.com":
+        return "healthcarebluebook_mrf"
+    if host == "www.myhealthbenefits.com" and path.startswith("/myhealthbenefits/home/mrfs"):
+        return "html_mrf_with_healthcarebluebook"
+    if host.endswith("lucenthealth.com") and path.startswith("/transparency-in-coverage"):
+        return "html_mrf_with_healthcarebluebook"
     if host == "transparency.auxiant.com" and not path.startswith(("/wp-admin/", "/wp-content/", "/wp-includes/")):
         return "auxiant_wordpress"
     if host in {"www.mymedicalshopper.com", "mymedicalshopper.com"} and path.startswith(("/mrf-search/", "/mrf/")):
         return "mymedicalshopper_talon"
+    if host == "www.asrhealthbenefits.com" and path.startswith(("/mrf", "/umbraco/surface/mrfdownload", "/home/umbraco/surface/mrfdownload")):
+        return "asr_health_benefits"
     if host in {"transparency-in-coverage.uhc.com", "transparency-in-coverage.optum.com"}:
         return "uhc_public_blobs"
     if host == "transparency-in-coverage.bluecrossma.com":
@@ -360,7 +398,7 @@ def classify_hosting_platform(url: str | None) -> str | None:
         return "healthsparq"
     if "sapphiremrfhub.com" in host:
         return "sapphire"
-    if "health1.aetna.com" in host or "health1.firsthealth.com" in host:
+    if "health1.aetna.com" in host or "health1.firsthealth.com" in host or "health1.meritain.com" in host:
         return "aetna_health1"
     if "mrfdata.hmhs.com" in host:
         return "highmark_hmhs"
@@ -1577,6 +1615,77 @@ async def _resolve_mymedicalshopper_talon_mrf(
         await ws.close()
 
 
+def _asr_group_number_from_url(url: str | None) -> str | None:
+    query = {key.lower(): value for key, value in parse_qsl(urlsplit(str(url or "")).query, keep_blank_values=True)}
+    group_number = str(query.get("groupnumber") or query.get("g") or "").strip()
+    return group_number or None
+
+
+def _asr_group_numbers_from_seed_list(seed_list_name: str | None) -> list[str]:
+    if not seed_list_name:
+        return []
+    group_numbers: list[str] = []
+    for row in _load_seed_list_rows(seed_list_name):
+        if str(row.get("status") or "").strip().lower() != "active":
+            continue
+        group_number = str(row.get("group_number") or "").strip()
+        if not re.fullmatch(r"\d{4}", group_number):
+            raise ValueError(f"ASR seed list {seed_list_name} contains a non-4-digit group number")
+        group_numbers.append(group_number)
+    return group_numbers
+
+
+def _asr_configured_group_numbers(resolver: dict[str, Any]) -> list[str]:
+    group_numbers: list[str] = []
+    group_numbers.extend(_asr_group_numbers_from_seed_list(str(resolver.get("seed_list") or "").strip() or None))
+    group_numbers.extend(str(value).strip() for value in (resolver.get("group_numbers") or ()))
+    for group_number in group_numbers:
+        if group_number and not re.fullmatch(r"\d{4}", group_number):
+            raise ValueError("ASR configured group numbers must be 4 digits")
+    return group_numbers
+
+
+def _asr_group_numbers_for_source(url: str, resolver: dict[str, Any]) -> list[str]:
+    group_numbers: list[str] = []
+    seen: set[str] = set()
+    for value in (_asr_group_number_from_url(url), *_asr_configured_group_numbers(resolver)):
+        group_number = str(value or "").strip()
+        if not group_number or group_number in seen:
+            continue
+        seen.add(group_number)
+        group_numbers.append(group_number)
+    return group_numbers
+
+
+def _asr_toc_url(base_url: str, resolver: dict[str, Any], group_number: str) -> str:
+    toc_path = str(resolver.get("toc_path") or "/umbraco/surface/mrfdownload").strip()
+    return urljoin(_url_origin(base_url) + "/", toc_path.lstrip("/")) + "?" + urlencode(
+        {"fileType": "TableOfContents", "groupNumber": group_number}
+    )
+
+
+def _resolve_asr_health_benefits_mrf(source: dict[str, Any], url: str, resolver: dict[str, Any]) -> list[CrawlTarget]:
+    resolver_type = str(resolver.get("type") or "asr_health_benefits_mrf")
+    targets: list[CrawlTarget] = []
+    for group_number in _asr_group_numbers_for_source(url, resolver):
+        targets.append(
+            CrawlTarget(
+                source=source,
+                url=_asr_toc_url(url, resolver, group_number),
+                label=f"{source.get('display_name') or 'ASR Health Benefits'} group {group_number}",
+                resolved_from_url=url,
+                metadata={
+                    "resolver": resolver_type,
+                    "target_file_type": "table-of-contents",
+                    "group_number": group_number,
+                },
+            )
+        )
+    if not targets:
+        raise ValueError("no ASR Health Benefits group numbers configured")
+    return targets
+
+
 def _wordpress_entry_content(html_text: str) -> str:
     match = re.search(
         r"""<div\b[^>]*class=(?P<quote>["'])(?=[^"']*\bentry-content\b)[^"']*(?P=quote)[^>]*>(?P<content>.*?)</div>\s*<!--\s*\.entry-content\s*-->""",
@@ -1598,11 +1707,7 @@ def _auxiant_network_label(label: Any) -> str:
 def _auxiant_anchor_links(html_text: str, *, base_url: str) -> list[dict[str, str]]:
     links: list[dict[str, str]] = []
     for match in re.finditer(r"<a\b(?P<attrs>[^>]*)>(?P<label>.*?)</a>", html_text or "", flags=re.I | re.S):
-        href_match = re.search(
-            r"""href\s*=\s*(?P<quote>["'])(?P<value>.*?)(?P=quote)""",
-            match.group("attrs") or "",
-            flags=re.I | re.S,
-        )
+        href_match = re.search(r"""href\s*=\s*(?P<quote>["'])(?P<value>.*?)(?P=quote)""", match.group("attrs") or "", flags=re.I | re.S)
         if not href_match:
             continue
         raw = html.unescape(str(href_match.group("value") or "")).strip()
@@ -2108,6 +2213,382 @@ def _parse_html_mrf_metadata_links(html_text: str, *, base_url: str) -> list[dic
     ]
 
 
+def _plan_info_from_label(
+    label: str,
+    *,
+    plan_id: str | None = None,
+    plan_id_type: str | None = None,
+    market_type: str | None = "group",
+) -> list[dict[str, Any]]:
+    clean_label = _clean_text(label)
+    resolved_plan_id = str(plan_id or "").strip()
+    resolved_plan_id_type = plan_id_type
+    if not resolved_plan_id:
+        match = re.search(r"\b(?P<ein>\d{9})\b", clean_label)
+        if match:
+            resolved_plan_id = match.group("ein")
+            resolved_plan_id_type = "ein"
+    if not clean_label and not resolved_plan_id:
+        return []
+    return [
+        {
+            "plan_id": resolved_plan_id or None,
+            "plan_id_type": resolved_plan_id_type,
+            "plan_market_type": market_type,
+            "plan_name": clean_label or resolved_plan_id,
+        }
+    ]
+
+
+def _metadata_plan_info(metadata: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_plan_info = metadata.get("plan_info")
+    if not isinstance(raw_plan_info, list):
+        return []
+    plan_info: list[dict[str, Any]] = []
+    for item in raw_plan_info:
+        if not isinstance(item, dict):
+            continue
+        plan = dict(item)
+        if "plan_market_type" not in plan and plan.get("market_type"):
+            plan["plan_market_type"] = plan.get("market_type")
+        if not any(plan.get(key) for key in ("plan_id", "plan_name", "plan_sponsor_name", "issuer_name")):
+            continue
+        plan_info.append(plan)
+    return plan_info
+
+
+def _plan_rows_from_target_metadata(target: CrawlTarget) -> list[dict[str, Any]]:
+    source = target.source
+    metadata = dict(target.metadata or {})
+    plan_rows_by_id: dict[str, dict[str, Any]] = {}
+    now = _utc_now()
+    for plan in _metadata_plan_info(metadata):
+        plan_id = str(plan.get("plan_id") or "").strip()
+        plan_name = plan.get("plan_name") or plan.get("plan_sponsor_name") or plan.get("issuer_name") or target.label
+        market_type = plan.get("plan_market_type")
+        row_id = _id(
+            "mrfplan",
+            {
+                "source": source["source_id"],
+                "plan_id": plan_id,
+                "plan_name": plan_name,
+                "market_type": market_type,
+                "target_url": target.url,
+            },
+        )
+        plan_rows_by_id[row_id] = {
+            "mrf_plan_id": row_id,
+            "payer_id": source.get("payer_id"),
+            "source_id": source["source_id"],
+            "plan_id": plan_id or None,
+            "plan_id_type": plan.get("plan_id_type"),
+            "plan_name": plan_name,
+            "market_type": market_type,
+            "reporting_entity_name": metadata.get("reporting_entity_name") or source.get("display_name"),
+            "reporting_entity_type": metadata.get("reporting_entity_type") or "third_party_administrator",
+            "metadata_json": {
+                "raw_plan": plan,
+                "resolver": metadata.get("resolver"),
+                "target_url": target.url,
+                "resolved_from_url": target.resolved_from_url,
+            },
+            "first_seen_at": now,
+            "last_seen_at": now,
+        }
+    return list(plan_rows_by_id.values())
+
+
+def _meritain_group_id_from_healthsparq_url(url: str | None) -> str | None:
+    try:
+        params = _healthsparq_public_params(str(url or ""))
+    except ValueError:
+        return None
+    reporting_entity_type = str(params.get("reportingEntityType") or "").strip()
+    match = re.search(r"\bTPA[_-](?P<group>\d+)\b", reporting_entity_type, flags=re.I)
+    return match.group("group") if match else None
+
+
+def _parse_meritain_mrf_search_targets(
+    html_text: str,
+    *,
+    base_url: str,
+    source: dict[str, Any],
+    resolver_type: str,
+) -> list[CrawlTarget]:
+    targets_by_url: dict[str, CrawlTarget] = {}
+    for candidate in _html_link_candidates(html_text, base_url=base_url):
+        url = str(candidate.get("url") or "").strip()
+        host = _domain(url) or ""
+        if host not in {"health1.meritain.com", "health1.aetna.com"}:
+            continue
+        try:
+            params = _healthsparq_public_params(url)
+        except ValueError:
+            continue
+        if str(params.get("insurerCode") or "").upper() != "MERITAIN_I":
+            continue
+        group_id = _meritain_group_id_from_healthsparq_url(url)
+        label = _clean_text(candidate.get("label")) or (f"Meritain group {group_id}" if group_id else "Meritain Health")
+        plan_info = _plan_info_from_label(
+            f"Meritain group {group_id}" if group_id else label,
+            plan_id=group_id,
+            plan_id_type="group_id" if group_id else None,
+        )
+        key = _canonical_or_none(url) or url
+        targets_by_url[key] = CrawlTarget(
+            source=source,
+            url=url,
+            label=label,
+            resolved_from_url=base_url,
+            metadata={
+                "resolver": resolver_type,
+                "target_kind": "file_reference",
+                "target_file_type": "table-of-contents",
+                "source_format": "healthsparq_app",
+                "insurer_code": params.get("insurerCode"),
+                "brand_code": params.get("brandCode"),
+                "reporting_entity_type": params.get("reportingEntityType"),
+                "group_id": group_id,
+                "plan_info": plan_info,
+            },
+        )
+    return list(targets_by_url.values())
+
+
+async def _resolve_meritain_mrf_search(
+    source: dict[str, Any],
+    url: str,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    resolver_type = str(resolver.get("type") or "meritain_mrf_search")
+    html_text = await _fetch_text(url, max_bytes=int(resolver.get("max_bytes") or 20 * 1024 * 1024), session=session)
+    targets = _parse_meritain_mrf_search_targets(html_text, base_url=url, source=source, resolver_type=resolver_type)
+    max_targets = _as_int(resolver.get("max_targets"))
+    if max_targets:
+        targets = targets[:max_targets]
+    if not targets:
+        raise ValueError(f"no Meritain Health group MRF links found for {url}")
+    return targets
+
+
+def _healthcarebluebook_file_type(type_text: Any, label: str, url: str) -> str | None:
+    normalized = _clean_text(type_text).lower().replace("-", " ")
+    if "table of contents" in normalized:
+        return "table-of-contents"
+    if "out of network" in normalized or normalized == "oon":
+        return "allowed-amounts"
+    if "in network" in normalized:
+        return "in-network"
+    return _mrf_file_type_from_text(url, label)
+
+
+def _healthcarebluebook_source_format(url: str) -> str | None:
+    path = urlsplit(url).path.lower()
+    if path.endswith(".csv"):
+        return "csv"
+    if path.endswith(".7z"):
+        return "7z"
+    if path.endswith(".zip") or _domain(url) == "mrf.healthcarebluebook.com":
+        return "zip"
+    if path.endswith((".json.gz", ".gz")):
+        return "gzip"
+    if path.endswith(".json"):
+        return "json"
+    return None
+
+
+def _healthcarebluebook_grid_items(html_text: str, *, base_url: str) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    pattern = re.compile(
+        r"""<div\b[^>]*class=(?P<quote>["'])(?=[^"']*\bgrid-item\b)[^"']*(?P=quote)[^>]*>(?P<content>.*?)</div>""",
+        flags=re.I | re.S,
+    )
+    for match in pattern.finditer(html_text or ""):
+        content = match.group("content") or ""
+        links = _html_link_candidates(content, base_url=base_url)
+        link = next((item for item in links if item.get("attr") == "href"), None)
+        label = _strip_html_tags(content)
+        items.append(
+            {
+                "url": str(link.get("url")) if link else None,
+                "label": _clean_text(link.get("label")) if link else label,
+                "text": label,
+            }
+        )
+    return items
+
+
+def _healthcarebluebook_relative_file_url(url: str) -> bool:
+    parsed = urlsplit(url)
+    return parsed.netloc.lower() == "mrf.healthcarebluebook.com" and bool(re.match(r"^/[^/]+/\d+/?$", parsed.path))
+
+
+def _healthcarebluebook_nested_target(
+    target: CrawlTarget,
+    *,
+    source: dict[str, Any],
+    listing_url: str,
+    link_url: str,
+    label: str,
+    file_type: str | None,
+    resolver_type: str,
+) -> CrawlTarget:
+    metadata = dict(target.metadata or {})
+    nested_resolver = metadata.get("resolver")
+    metadata.update(
+        {
+            "resolver": resolver_type,
+            "nested_resolver": nested_resolver,
+            "healthcarebluebook_listing_url": listing_url,
+            "healthcarebluebook_link_url": link_url,
+            "healthcarebluebook_link_label": label,
+            "healthcarebluebook_file_type": file_type,
+            "nested_target_label": target.label,
+        }
+    )
+    return CrawlTarget(
+        source=source,
+        url=target.url,
+        label=target.label or label,
+        resolved_from_url=target.resolved_from_url or link_url,
+        metadata=metadata,
+    )
+
+
+async def _resolve_healthcarebluebook_mrf(
+    source: dict[str, Any],
+    url: str,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    resolver_type = str(resolver.get("type") or "healthcarebluebook_mrf")
+    html_text = await _fetch_text(url, max_bytes=int(resolver.get("max_bytes") or 10 * 1024 * 1024), session=session)
+    items = _healthcarebluebook_grid_items(html_text, base_url=url)
+    targets_by_url: dict[str, CrawlTarget] = {}
+    for index, item in enumerate(items):
+        link_url = str(item.get("url") or "").strip()
+        if not link_url:
+            continue
+        label = _clean_text(item.get("label")) or Path(urlsplit(link_url).path).name or "MRF file"
+        type_text = items[index + 1].get("text") if index + 1 < len(items) else ""
+        file_type = _healthcarebluebook_file_type(type_text, label, link_url)
+        if not file_type:
+            continue
+        if _healthcarebluebook_relative_file_url(link_url) or _looks_direct_mrf_body_url(link_url):
+            plan_info = _plan_info_from_label(label)
+            metadata = {
+                "resolver": resolver_type,
+                "target_kind": "file_reference",
+                "target_file_type": file_type,
+                "container_format": _container_format(link_url) or ("zip" if _healthcarebluebook_relative_file_url(link_url) else None),
+                "source_format": _healthcarebluebook_source_format(link_url),
+                "healthcarebluebook_listing_url": url,
+                "healthcarebluebook_file_type": _clean_text(type_text),
+                "plan_info": plan_info,
+            }
+            key = _canonical_or_none(link_url) or link_url
+            targets_by_url[key] = CrawlTarget(
+                source=source,
+                url=link_url,
+                label=label,
+                resolved_from_url=url,
+                metadata={key: value for key, value in metadata.items() if value not in (None, "", [])},
+            )
+            continue
+        nested_platform = classify_hosting_platform(link_url)
+        if not nested_platform:
+            continue
+        nested_source = {**source, "hosting_platform": nested_platform}
+        try:
+            nested_targets = await _crawl_targets_for_source(nested_source, link_url, session)
+        except Exception:  # pylint: disable=broad-exception-caught
+            nested_targets = []
+        for nested_target in nested_targets:
+            annotated = _healthcarebluebook_nested_target(
+                nested_target,
+                source=source,
+                listing_url=url,
+                link_url=link_url,
+                label=label,
+                file_type=file_type,
+                resolver_type=resolver_type,
+            )
+            key = _canonical_or_none(annotated.url) or annotated.url
+            targets_by_url[key] = annotated
+    targets = list(targets_by_url.values())
+    max_targets = _as_int(resolver.get("max_targets"))
+    if max_targets:
+        targets = targets[:max_targets]
+    if not targets:
+        raise ValueError(f"no Healthcare Bluebook MRF links found for {url}")
+    return targets
+
+
+async def _resolve_html_mrf_with_healthcarebluebook(
+    source: dict[str, Any],
+    url: str,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    resolver_type = str(resolver.get("type") or "html_mrf_with_healthcarebluebook")
+    html_text = await _fetch_text(url, max_bytes=int(resolver.get("max_bytes") or 10 * 1024 * 1024), session=session)
+    targets_by_url: dict[str, CrawlTarget] = {}
+    for target in _parse_html_mrf_links(html_text, base_url=url):
+        target_url = str(target["url"])
+        source_format = "csv" if urlsplit(target_url).path.lower().endswith(".csv") else None
+        metadata = {
+            "resolver": target.get("resolver") or resolver_type,
+            "target_kind": target.get("target_kind"),
+            "target_file_type": target.get("target_file_type"),
+            "container_format": target.get("container_format"),
+            "source_format": source_format,
+            "html_attr": target.get("html_attr"),
+            "landing_url": url,
+        }
+        key = _canonical_or_none(target_url) or target_url
+        targets_by_url[key] = CrawlTarget(
+            source=source,
+            url=target_url,
+            label=str(target.get("label") or source.get("display_name") or ""),
+            resolved_from_url=url,
+            metadata={key: value for key, value in metadata.items() if value not in (None, "")},
+        )
+    for candidate in _html_link_candidates(html_text, base_url=url):
+        link_url = str(candidate.get("url") or "").strip()
+        if _domain(link_url) != "mrf.healthcarebluebook.com":
+            continue
+        nested_source = {**source, "hosting_platform": "healthcarebluebook_mrf"}
+        nested_resolver = _platform_resolver_config("healthcarebluebook_mrf") or {"type": "healthcarebluebook_mrf"}
+        nested_targets = await _resolve_healthcarebluebook_mrf(nested_source, link_url, nested_resolver, session)
+        for nested_target in nested_targets:
+            metadata = dict(nested_target.metadata or {})
+            metadata.update(
+                {
+                    "resolver": resolver_type,
+                    "nested_resolver": metadata.get("resolver"),
+                    "landing_url": url,
+                    "healthcarebluebook_url": link_url,
+                }
+            )
+            annotated = CrawlTarget(
+                source=source,
+                url=nested_target.url,
+                label=nested_target.label,
+                resolved_from_url=nested_target.resolved_from_url or link_url,
+                metadata=metadata,
+            )
+            key = _canonical_or_none(annotated.url) or annotated.url
+            targets_by_url[key] = annotated
+    targets = list(targets_by_url.values())
+    max_targets = _as_int(resolver.get("max_targets"))
+    if max_targets:
+        targets = targets[:max_targets]
+    if not targets:
+        raise ValueError(f"no HTML or Healthcare Bluebook MRF links found for {url}")
+    return targets
+
+
 def _cigna_lookup_urls_from_html(html_text: str, *, base_url: str, resolver: dict[str, Any]) -> list[str]:
     urls: list[str] = []
     for candidate in _html_link_candidates(html_text, base_url=base_url):
@@ -2383,10 +2864,19 @@ async def _resolve_cigna_static_mrf_lookup(
 
 def _healthsparq_public_params(url: str) -> dict[str, str]:
     raw = html.unescape(str(url or ""))
-    match = re.search(r"#/(?:one|public)/([^/?#]+)", raw)
-    param_text = match.group(1) if match else urlsplit(raw).query
-    param_text = param_text.split("/", 1)[0]
-    params = {key: value for key, value in parse_qsl(param_text, keep_blank_values=False) if key and value}
+    parsed = urlsplit(raw)
+    params: dict[str, str] = {}
+    fragment = parsed.fragment
+    match = re.search(r"^/?(?:one|public)/(?P<params>[^/?#]+)(?P<tail>.*)$", fragment)
+    if match:
+        route_params = match.group("params").split("/", 1)[0]
+        params.update({key: value for key, value in parse_qsl(route_params, keep_blank_values=False) if key and value})
+        tail = match.group("tail") or ""
+        if "?" in tail:
+            query_text = tail.split("?", 1)[1]
+            params.update({key: value for key, value in parse_qsl(query_text, keep_blank_values=False) if key and value})
+    if not params:
+        params.update({key: value for key, value in parse_qsl(parsed.query, keep_blank_values=False) if key and value})
     if "insurerCode" not in params or "brandCode" not in params:
         raise ValueError("HealthSparq public URL must include insurerCode and brandCode")
     return params
@@ -2421,6 +2911,8 @@ def _healthsparq_tenant(params: dict[str, str], resolver: dict[str, Any] | None 
 
 
 def _healthsparq_direct_metadata_url(resolver: dict[str, Any], params: dict[str, str]) -> str | None:
+    if any(params.get(key) for key in ("reportingEntityType", "searchTerm")):
+        return None
     template = str(resolver.get("metadata_url_template") or "").strip()
     if not template:
         return None
@@ -2440,6 +2932,8 @@ def _healthsparq_target(source: dict[str, Any], metadata_url: str, resolved_from
             "resolver": "healthsparq_public_mrf",
             "insurer_code": params["insurerCode"],
             "brand_code": params["brandCode"],
+            "reporting_entity_type": params.get("reportingEntityType"),
+            "search_term": params.get("searchTerm"),
         },
     )
 
@@ -2459,9 +2953,14 @@ async def _resolve_healthsparq_public_mrf(
     login_query = {"_": str(int(_utc_now().timestamp() * 1000)), **params}
     await _fetch_json(f"{login_url}?{urlencode(login_query)}", max_bytes=int(resolver.get("max_bytes") or 50 * 1024 * 1024), session=session)
     mrf_all_url = _healthsparq_service_url(url, resolver, "mrf_all_path")
+    payload = {
+        key: value
+        for key, value in params.items()
+        if key in {"brandCode", "insurerCode", "reportingEntityType", "searchTerm", "productCode"} and value
+    }
     payload = await _post_json(
         mrf_all_url,
-        {"brandCode": params["brandCode"], "insurerCode": params["insurerCode"]},
+        payload,
         max_bytes=int(resolver.get("max_bytes") or 50 * 1024 * 1024),
         session=session,
     )
@@ -2498,12 +2997,20 @@ async def _crawl_targets_for_source(source: dict[str, Any], url: str, session: a
         return await _resolve_cigna_static_mrf_lookup(source, url, resolver, session)
     if resolver_type == "bcbs_asomrf_filelist":
         return await _resolve_bcbs_asomrf_filelist(source, url, resolver, session)
+    if resolver_type == "meritain_mrf_search":
+        return await _resolve_meritain_mrf_search(source, url, resolver, session)
+    if resolver_type == "healthcarebluebook_mrf":
+        return await _resolve_healthcarebluebook_mrf(source, url, resolver, session)
+    if resolver_type == "html_mrf_with_healthcarebluebook":
+        return await _resolve_html_mrf_with_healthcarebluebook(source, url, resolver, session)
     if resolver_type == "auxiant_wordpress_directory":
         return await _resolve_auxiant_wordpress_directory(source, url, resolver, session)
     if resolver_type == "healthsparq_public_mrf":
         return await _resolve_healthsparq_public_mrf(source, url, resolver, session)
     if resolver_type == "mymedicalshopper_talon_mrf":
         return await _resolve_mymedicalshopper_talon_mrf(source, url, resolver, session)
+    if resolver_type == "asr_health_benefits_mrf":
+        return _resolve_asr_health_benefits_mrf(source, url, resolver)
     if resolver_type == "highmark_hmhs_script":
         script_path = str(resolver.get("script_path") or "/js/script.js")
         script_url = urljoin(url, script_path)
@@ -2727,6 +3234,7 @@ def _toc_target_file_row(target: CrawlTarget) -> dict[str, Any]:
     source = target.source
     target_metadata = {key: value for key, value in dict(target.metadata or {}).items() if value not in (None, "")}
     file_type = str(target_metadata.get("target_file_type") or "table-of-contents")
+    plan_info = _metadata_plan_info(target_metadata)
     size_bytes = (
         _parse_size_bytes(target_metadata.get("blob_size"))
         or _parse_size_bytes(target_metadata.get("size_bytes"))
@@ -2742,9 +3250,9 @@ def _toc_target_file_row(target: CrawlTarget) -> dict[str, Any]:
         "from_index_url": target.resolved_from_url,
         "description": target.label,
         "network_name": target.label,
-        "plan_ids": [],
-        "plan_names": [],
-        "market_types": [],
+        "plan_ids": [plan.get("plan_id") for plan in plan_info if plan.get("plan_id")],
+        "plan_names": [plan.get("plan_name") for plan in plan_info if plan.get("plan_name")],
+        "market_types": sorted({plan.get("plan_market_type") for plan in plan_info if plan.get("plan_market_type")}),
         "is_signed_url": _looks_signed(target.url),
         "size_bytes": size_bytes,
         "etag": target_metadata.get("etag"),
@@ -3132,7 +3640,8 @@ async def _crawl_toc_metadata(
             target_kind = (target.metadata or {}).get("target_kind")
             target_max_bytes = _target_fetch_max_bytes(target, max_toc_bytes)
             if target_kind in {"file_reference", "source_landing_page"}:
-                return [], [], [_crawl_ok_observation(target, run_id=run_id, plans=0, files=1)], target.url
+                plan_rows = _plan_rows_from_target_metadata(target)
+                return plan_rows, [], [_crawl_ok_observation(target, run_id=run_id, plans=len(plan_rows), files=1)], target.url
             if target_kind == "metadata_text":
                 text = await _fetch_text(target.url, max_bytes=target_max_bytes, session=session)
                 plan_rows, file_rows = _metadata_text_rows_from_content(target.source, target.url, text)
@@ -3524,6 +4033,8 @@ def _import_control_supported_rate_domain(value: Any) -> bool:
 
 def _import_control_snapshot_file_is_supported(file_type: Any, metadata: dict[str, Any], from_index_url: Any) -> bool:
     if not str(from_index_url or "").strip():
+        return False
+    if str(metadata.get("source_format") or "").strip().lower() == "csv":
         return False
     return _import_control_supported_rate_domain(metadata.get("domain") or file_type)
 

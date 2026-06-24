@@ -326,14 +326,17 @@ Last one-time research refresh: 2026-06-05.
 | Allied Benefit Systems | tpa | https://alliedbenefit.sapphiremrfhub.com/ | curated source row |
 | Allied Benefit Systems | tpa | https://www.alliedbenefit.com/transparency-in-coverage-mrf | public transparency URL |
 | AmeriBen | tpa | https://github.com/AmeriBen/MRF | curated source row |
+| ASR Health Benefits | tpa | https://www.asrhealthbenefits.com/MRF | public group-number MRF lookup; resolver uses configured public group seeds |
 | Auxiant | tpa | https://transparency.auxiant.com/directory-of-data-sources/ | public WordPress data source directory; resolver expands data-available network pages |
 | Benefits and Risk Management Services | tpa | - | needs official source URL |
-| BRMS | tpa | https://www.brmsonline.com/solutions/compliance-administration | curated source row |
+| BRMS | tpa | https://www.myhealthbenefits.com/MyHealthBenefits/Home/MRFs/ | public MRF table; resolver catalogs direct files and Healthcare Bluebook delegated rows |
 | Collective Health | tpa | https://transparency-in-coverage.collectivehealth.com/ | public transparency URL |
 | Collective Health | tpa | https://transparency-in-coverage.collectivehealth.com/index.html | curated source row |
 | HealthScope Benefits | tpa | - | needs official source URL |
 | Health Plans Inc (HPI) | tpa | https://hpitpa.com/transparency-in-coverage-machine-readable-files/ | public transparency URL |
+| Lucent Health | tpa | https://lucenthealth.com/transparency-in-coverage/ | public transparency page; delegates INN MRF listing to Healthcare Bluebook |
 | MedCost | tpa | https://www.medcost.com/employers/resources/news/transparency-coverage-update-machine-readable-files | curated source row |
+| Meritain Health | tpa | https://mrfsearch.meritain.com/ | public group/client search table; resolver catalogs group-level HealthSparq links |
 | Meritain Health | tpa | https://health1.aetna.com/app/public/#/one/insurerCode=MERITAIN_I&brandCode=MERITAINOVER/machine-readable-transparency-in-coverage | curated source row |
 | PBA | tpa | https://www.pbaclaims.com/mrfs/ | curated source row |
 | Professional Benefit Administrators | tpa | https://www.pbaclaims.com/mrfs/ | curated source row |

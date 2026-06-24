@@ -7,6 +7,12 @@
       "path": "specs/mrf_payer_master_list.md"
     }
   },
+  "seed_lists": {
+    "asr_health_benefits_groups": {
+      "schema": "group_number_seed_v1",
+      "path": "specs/mrf_seed_lists/asr_health_benefits_groups.csv"
+    }
+  },
   "platform_resolvers": {
     "aetna_health1": {
       "type": "healthsparq_public_mrf",
@@ -50,6 +56,11 @@
       "max_plans_per_employer": 500,
       "ddp_timeout_seconds": 30
     },
+    "asr_health_benefits": {
+      "type": "asr_health_benefits_mrf",
+      "toc_path": "/umbraco/surface/mrfdownload",
+      "seed_list": "asr_health_benefits_groups"
+    },
     "uhc_public_blobs": {
       "type": "uhc_blob_listing",
       "max_bytes": 67108864,
@@ -71,6 +82,18 @@
       "lookup_max_bytes": 2097152,
       "toc_max_bytes": 104857600,
       "lookup_paths": ["/static/mrf/latest.json", "/static/mrf/co/latest.json"]
+    },
+    "meritain_mrf_search": {
+      "type": "meritain_mrf_search",
+      "max_bytes": 52428800
+    },
+    "healthcarebluebook_mrf": {
+      "type": "healthcarebluebook_mrf",
+      "max_bytes": 10485760
+    },
+    "html_mrf_with_healthcarebluebook": {
+      "type": "html_mrf_with_healthcarebluebook",
+      "max_bytes": 10485760
     },
     "bcbs_asomrf": {
       "type": "bcbs_asomrf_filelist",
