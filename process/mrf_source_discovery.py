@@ -1468,7 +1468,26 @@ def _parse_bcbs_asomrf_filelist_targets(
             resolved_from_url=filelist_url,
             metadata={key: value for key, value in metadata.items() if value not in (None, "")},
         )
-    return list(targets_by_url.values())
+    targets = list(targets_by_url.values())
+    return _limit_crawl_targets_round_robin(targets, "state", _as_int(resolver.get("max_targets")))
+
+
+def _limit_crawl_targets_round_robin(targets: list[CrawlTarget], metadata_key: str, limit: int | None) -> list[CrawlTarget]:
+    if not limit or limit <= 0 or len(targets) <= limit:
+        return targets
+    buckets: dict[str, list[CrawlTarget]] = {}
+    for target in targets:
+        bucket_key = str((target.metadata or {}).get(metadata_key) or "")
+        buckets.setdefault(bucket_key, []).append(target)
+    limited: list[CrawlTarget] = []
+    max_bucket_size = max((len(bucket) for bucket in buckets.values()), default=0)
+    for index in range(max_bucket_size):
+        for bucket in buckets.values():
+            if index < len(bucket):
+                limited.append(bucket[index])
+                if len(limited) >= limit:
+                    return limited
+    return limited
 
 
 def _bcbs_asomrf_filelist_urls_from_html(html_text: str, *, base_url: str) -> list[str]:

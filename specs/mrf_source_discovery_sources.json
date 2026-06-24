@@ -62,7 +62,8 @@
       "type": "bcbs_asomrf_filelist",
       "max_bytes": 5242880,
       "filelist_max_bytes": 20971520,
-      "toc_max_bytes": 104857600
+      "toc_max_bytes": 104857600,
+      "max_targets": 250
     }
   }
 }

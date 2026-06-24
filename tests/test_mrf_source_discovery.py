@@ -23,6 +23,7 @@ def test_source_urls_are_loaded_from_registry_file():
     assert config["platform_resolvers"]["bcbsma_monthly_tocs"]["type"] == "bcbsma_monthly_tocs"
     assert config["platform_resolvers"]["cigna_static_mrf_lookup"]["type"] == "cigna_static_mrf_lookup"
     assert config["platform_resolvers"]["bcbs_asomrf"]["type"] == "bcbs_asomrf_filelist"
+    assert config["platform_resolvers"]["bcbs_asomrf"]["max_targets"] == 250
     assert config["platform_resolvers"]["aetna_health1"]["tenant_overrides"]["MERITAIN_I"] == "aetnacvs"
 
 
@@ -820,6 +821,29 @@ def test_parse_bcbs_asomrf_filelist_targets_expands_index_urls():
     assert target.metadata["state"] == "IL"
     assert target.metadata["ein"] == "260241222"
     assert target.metadata["target_max_bytes"] == 12345
+
+
+def test_parse_bcbs_asomrf_filelist_targets_applies_state_balanced_limit():
+    source = {"source_id": "source_1", "payer_id": "payer_1", "display_name": "BCBS Illinois"}
+    payload = [
+        {
+            "state": state,
+            "url": f"https://app.example/toc/2026-05-21_Blue-Cross-and-Blue-Shield-of-{state}_{index}_index.json",
+            "name": f"2026-05-21_Blue-Cross-and-Blue-Shield-of-{state}_{index}_index",
+            "ein": str(index),
+        }
+        for state in ("TX", "TX", "TX", "IL", "IL", "OK")
+        for index in range(2)
+    ]
+
+    targets = discovery._parse_bcbs_asomrf_filelist_targets(
+        payload,
+        filelist_url="https://www.bcbsil.com/content/dam/bcbs/mrf/si-filelist.json",
+        source=source,
+        resolver={"max_targets": 5},
+    )
+
+    assert [target.metadata["state"] for target in targets] == ["TX", "IL", "OK", "TX", "IL"]
 
 
 def test_cigna_lookup_targets_preserve_file_metadata_and_large_toc_limit():
