@@ -21,7 +21,7 @@ ijson>=3.5.0
 jellyfish>=1.2.1
 Jinja2
 msgpack
-numpy>=2.4.6
+numpy>=2.5.0
 orjson>=3.11.9
 pandas>=3.0.3
 propcache>=0.5.2
@@ -31,10 +31,10 @@ pyogrio>=0.12.1
 pyproj>=3.7.2
 python-dateutil
 python-dotenv>=1.2.2
-python-socks==2.8.1
+python-socks==2.8.2
 pytz
 PyYAML>=6.0.3
-redis[hiredis]>=5.0.0,<6
+redis[hiredis]>=8.0.1,<9
 ruamel.ext.msgpack
 sanic>=25.12.1
 sanic_ext>=25.12.0
