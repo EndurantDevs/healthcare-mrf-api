@@ -22,9 +22,15 @@ def test_source_urls_are_loaded_from_registry_file():
     assert config["platform_resolvers"]["sapphire"]["type"] == "sapphire_html_tocs"
     assert config["platform_resolvers"]["auxiant_wordpress"]["type"] == "auxiant_wordpress_directory"
     assert config["platform_resolvers"]["mymedicalshopper_talon"]["type"] == "mymedicalshopper_talon_mrf"
+    assert config["platform_resolvers"]["asr_health_benefits"]["type"] == "asr_health_benefits_mrf"
+    assert config["platform_resolvers"]["asr_health_benefits"]["seed_list"] == "asr_health_benefits_groups"
+    assert config["seed_lists"]["asr_health_benefits_groups"]["schema"] == "group_number_seed_v1"
     assert config["platform_resolvers"]["uhc_public_blobs"]["type"] == "uhc_blob_listing"
     assert config["platform_resolvers"]["bcbsma_monthly_tocs"]["type"] == "bcbsma_monthly_tocs"
     assert config["platform_resolvers"]["cigna_static_mrf_lookup"]["type"] == "cigna_static_mrf_lookup"
+    assert config["platform_resolvers"]["meritain_mrf_search"]["type"] == "meritain_mrf_search"
+    assert config["platform_resolvers"]["healthcarebluebook_mrf"]["type"] == "healthcarebluebook_mrf"
+    assert config["platform_resolvers"]["html_mrf_with_healthcarebluebook"]["type"] == "html_mrf_with_healthcarebluebook"
     assert config["platform_resolvers"]["bcbs_asomrf"]["type"] == "bcbs_asomrf_filelist"
     assert config["platform_resolvers"]["bcbs_asomrf"]["max_targets"] == 250
     assert config["platform_resolvers"]["aetna_health1"]["tenant_overrides"]["MERITAIN_I"] == "aetnacvs"
@@ -65,6 +71,7 @@ def test_parse_master_list_preserves_tpa_hint_and_multiple_urls():
 | Payer | Type | Public TOC / landing URL | Notes |
 |---|---|---|---|
 | Collective Health | TPA | https://transparency-in-coverage.collectivehealth.com/index.html · https://transparency-in-coverage.collectivehealth.com/ | public indexes |
+| ASR Health Benefits | tpa | https://www.asrhealthbenefits.com/MRF | public group-number MRF lookup |
 """
 
     candidates = discovery.parse_master_list(markdown)
@@ -75,6 +82,9 @@ def test_parse_master_list_preserves_tpa_hint_and_multiple_urls():
     collective = [item for item in candidates if item.payer_name == "Collective Health"]
     assert len(collective) == 2
     assert {item.entity_type for item in collective} == {"tpa"}
+    [asr] = [item for item in candidates if item.payer_name == "ASR Health Benefits"]
+    assert asr.entity_type == "tpa"
+    assert asr.hosting_platform == "asr_health_benefits"
 
 
 def test_parse_master_list_skips_placeholder_source_urls():
@@ -189,6 +199,25 @@ async def test_import_control_snapshot_items_skip_non_serving_rate_files(monkeyp
     assert items["source_1"][0]["domain"] == "in-network"
 
 
+def test_import_control_snapshot_file_support_excludes_csv_catalog_references():
+    assert (
+        discovery._import_control_snapshot_file_is_supported(
+            "in-network",
+            {"source_format": "csv", "domain": "in-network"},
+            "https://example.com/index.json",
+        )
+        is False
+    )
+    assert (
+        discovery._import_control_snapshot_file_is_supported(
+            "in-network",
+            {"source_format": "zip", "domain": "in-network"},
+            "https://example.com/index.json",
+        )
+        is True
+    )
+
+
 def test_dedupe_candidates_prefers_more_specific_url_for_same_canonical_key():
     short = discovery.SourceCandidate(
         payer_name="Blue Shield",
@@ -215,11 +244,302 @@ def test_classify_hosting_platforms():
     assert discovery.classify_hosting_platform("https://www.cigna.com/legal/compliance/machine-readable-files") == "cigna_static_mrf_lookup"
     assert discovery.classify_hosting_platform("https://transparency.auxiant.com/directory-of-data-sources/") == "auxiant_wordpress"
     assert discovery.classify_hosting_platform("https://transparency.auxiant.com/healthsmart/") == "auxiant_wordpress"
+    assert discovery.classify_hosting_platform("https://www.asrhealthbenefits.com/MRF") == "asr_health_benefits"
+    assert discovery.classify_hosting_platform("https://mrfsearch.meritain.com/") == "meritain_mrf_search"
+    assert discovery.classify_hosting_platform("https://mrf.healthcarebluebook.com/Lucent") == "healthcarebluebook_mrf"
+    assert (
+        discovery.classify_hosting_platform("https://www.myhealthbenefits.com/MyHealthBenefits/Home/MRFs/")
+        == "html_mrf_with_healthcarebluebook"
+    )
+    assert discovery.classify_hosting_platform("https://lucenthealth.com/transparency-in-coverage/") == "html_mrf_with_healthcarebluebook"
     assert discovery.classify_hosting_platform("https://www.mymedicalshopper.com/mrf-search/varipro") == "mymedicalshopper_talon"
     assert (
         discovery.classify_hosting_platform("https://www.mymedicalshopper.com/mrf/electrical-workers-cofinity-varipro-77100")
         == "mymedicalshopper_talon"
     )
+
+
+def test_meritain_mrf_search_parser_extracts_group_healthsparq_links():
+    source = {"source_id": "source_1", "payer_id": "payer_1", "display_name": "Meritain Health"}
+    html = """
+    <table>
+      <tr>
+        <td>14445</td>
+        <td><a href="https://Health1.Meritain.com/app/public/#/one/insurerCode=MERITAIN_I&amp;brandCode=MERITAINOVER/machine-readable-transparency-in-coverage?reportingEntityType=TPA_14445&amp;lock=true">MRF</a></td>
+      </tr>
+      <tr>
+        <td>ignore</td>
+        <td><a href="https://meritain.com/">Return to home</a></td>
+      </tr>
+    </table>
+    """
+
+    [target] = discovery._parse_meritain_mrf_search_targets(
+        html,
+        base_url="https://mrfsearch.meritain.com/",
+        source=source,
+        resolver_type="meritain_mrf_search",
+    )
+
+    assert target.url == (
+        "https://Health1.Meritain.com/app/public/#/one/insurerCode=MERITAIN_I&brandCode=MERITAINOVER/"
+        "machine-readable-transparency-in-coverage?reportingEntityType=TPA_14445&lock=true"
+    )
+    assert target.metadata["target_kind"] == "file_reference"
+    assert target.metadata["target_file_type"] == "table-of-contents"
+    assert target.metadata["group_id"] == "14445"
+    assert target.metadata["plan_info"] == [
+        {
+            "plan_id": "14445",
+            "plan_id_type": "group_id",
+            "plan_market_type": "group",
+            "plan_name": "Meritain group 14445",
+        }
+    ]
+
+
+def test_healthcarebluebook_grid_parser_extracts_link_type_pairs():
+    html = """
+    <div class="grid-item"><a href="/Lucent/350504">Lucent Health</a></div>
+    <div class="grid-item">Table of Contents</div>
+    <div class="grid-item"><a href="/Lucent/350380">Lucent Health 042171239</a></div>
+    <div class="grid-item">Out of Network</div>
+    <div class="grid-item"><a href="https://hcbbmrfprod.blob.core.windows.net/mrf/External/example_in-network-rates.json.zip">Center Care</a></div>
+    <div class="grid-item">In Network</div>
+    """
+
+    items = discovery._healthcarebluebook_grid_items(html, base_url="https://mrf.healthcarebluebook.com/Lucent")
+
+    assert items == [
+        {"url": "https://mrf.healthcarebluebook.com/Lucent/350504", "label": "Lucent Health", "text": "Lucent Health"},
+        {"url": None, "label": "Table of Contents", "text": "Table of Contents"},
+        {"url": "https://mrf.healthcarebluebook.com/Lucent/350380", "label": "Lucent Health 042171239", "text": "Lucent Health 042171239"},
+        {"url": None, "label": "Out of Network", "text": "Out of Network"},
+        {
+            "url": "https://hcbbmrfprod.blob.core.windows.net/mrf/External/example_in-network-rates.json.zip",
+            "label": "Center Care",
+            "text": "Center Care",
+        },
+        {"url": None, "label": "In Network", "text": "In Network"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_healthcarebluebook_resolver_catalogs_stable_file_links(monkeypatch):
+    source = {"source_id": "source_1", "payer_id": "payer_1", "display_name": "Lucent Health"}
+    html = """
+    <div class="grid-item"><a href="/Lucent/350504">Lucent Health</a></div>
+    <div class="grid-item">Table of Contents</div>
+    <div class="grid-item"><a href="/Lucent/350380">Lucent Health 042171239</a></div>
+    <div class="grid-item">Out of Network</div>
+    <div class="grid-item"><a href="https://hcbbmrfprod.blob.core.windows.net/mrf/External/example_in-network-rates.json.zip">Center Care</a></div>
+    <div class="grid-item">In Network</div>
+    """
+
+    async def fake_fetch_text(url, **_kwargs):
+        assert url == "https://mrf.healthcarebluebook.com/Lucent"
+        return html
+
+    monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
+
+    targets = await discovery._resolve_healthcarebluebook_mrf(
+        source,
+        "https://mrf.healthcarebluebook.com/Lucent",
+        {"type": "healthcarebluebook_mrf"},
+        None,
+    )
+
+    assert [target.url for target in targets] == [
+        "https://mrf.healthcarebluebook.com/Lucent/350504",
+        "https://mrf.healthcarebluebook.com/Lucent/350380",
+        "https://hcbbmrfprod.blob.core.windows.net/mrf/External/example_in-network-rates.json.zip",
+    ]
+    assert targets[0].metadata["target_file_type"] == "table-of-contents"
+    assert targets[0].metadata["source_format"] == "zip"
+    assert targets[1].metadata["target_file_type"] == "allowed-amounts"
+    assert targets[1].metadata["plan_info"][0]["plan_id"] == "042171239"
+    assert targets[1].metadata["plan_info"][0]["plan_id_type"] == "ein"
+    assert targets[2].metadata["target_file_type"] == "in-network"
+    assert targets[2].metadata["container_format"] == "zip"
+
+
+@pytest.mark.asyncio
+async def test_html_healthcarebluebook_resolver_combines_direct_and_delegated_links(monkeypatch):
+    source = {"source_id": "source_1", "payer_id": "payer_1", "display_name": "BRMS"}
+    html_by_url = {
+        "https://www.myhealthbenefits.com/MyHealthBenefits/Home/MRFs/": """
+          <a href="https://www.myhealthbenefits.com/MRF/2026-06-04_ClaimDOC_BRMS_index.json">BRMS Index</a>
+          <a href="https://www.myhealthbenefits.com/MRF/2026-06-01_BRMS_allowed-amounts.csv">Zelis In-Network</a>
+          <a href="https://mrf.healthcarebluebook.com/BRMS">Out-of-Network</a>
+        """,
+        "https://mrf.healthcarebluebook.com/BRMS": """
+          <div class="grid-item"><a href="/BRMS/326940">Benefit &amp; Risk Management Services, Inc. (BRMS)</a></div>
+          <div class="grid-item">Table of Contents</div>
+          <div class="grid-item"><a href="/BRMS/314355">Benefit &amp; Risk Management Services, Inc. (BRMS) 030506501</a></div>
+          <div class="grid-item">Out of Network</div>
+        """,
+    }
+
+    async def fake_fetch_text(url, **_kwargs):
+        return html_by_url[url]
+
+    monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
+
+    targets = await discovery._resolve_html_mrf_with_healthcarebluebook(
+        source,
+        "https://www.myhealthbenefits.com/MyHealthBenefits/Home/MRFs/",
+        {"type": "html_mrf_with_healthcarebluebook"},
+        None,
+    )
+
+    by_url = {target.url: target for target in targets}
+    assert by_url["https://www.myhealthbenefits.com/MRF/2026-06-04_ClaimDOC_BRMS_index.json"].metadata["target_file_type"] == (
+        "table-of-contents"
+    )
+    csv_target = by_url["https://www.myhealthbenefits.com/MRF/2026-06-01_BRMS_allowed-amounts.csv"]
+    assert csv_target.metadata["target_file_type"] == "allowed-amounts"
+    assert csv_target.metadata["source_format"] == "csv"
+    delegated = by_url["https://mrf.healthcarebluebook.com/BRMS/314355"]
+    assert delegated.metadata["resolver"] == "html_mrf_with_healthcarebluebook"
+    assert delegated.metadata["nested_resolver"] == "healthcarebluebook_mrf"
+    assert delegated.metadata["plan_info"][0]["plan_id"] == "030506501"
+
+
+def test_asr_health_benefits_resolver_expands_configured_group_numbers():
+    source = {"source_id": "source_1", "display_name": "ASR Health Benefits"}
+    resolver = {"type": "asr_health_benefits_mrf", "toc_path": "/umbraco/surface/mrfdownload", "group_numbers": ["1208"]}
+
+    [target] = discovery._resolve_asr_health_benefits_mrf(source, "https://www.asrhealthbenefits.com/MRF", resolver)
+
+    assert target.url == "https://www.asrhealthbenefits.com/umbraco/surface/mrfdownload?fileType=TableOfContents&groupNumber=1208"
+    assert target.label == "ASR Health Benefits group 1208"
+    assert target.resolved_from_url == "https://www.asrhealthbenefits.com/MRF"
+    assert target.metadata["resolver"] == "asr_health_benefits_mrf"
+    assert target.metadata["group_number"] == "1208"
+
+
+def test_asr_health_benefits_resolver_preserves_direct_group_number():
+    source = {"source_id": "source_1", "display_name": "ASR Health Benefits"}
+    resolver = {"type": "asr_health_benefits_mrf", "toc_path": "/umbraco/surface/mrfdownload", "group_numbers": ["1208"]}
+
+    targets = discovery._resolve_asr_health_benefits_mrf(
+        source,
+        "https://www.asrhealthbenefits.com/umbraco/surface/mrfdownload?fileType=TableOfContents&groupNumber=1194",
+        resolver,
+    )
+
+    assert [target.metadata["group_number"] for target in targets] == ["1194", "1208"]
+
+
+def test_asr_health_benefits_resolver_uses_seed_list():
+    source = {"source_id": "source_1", "display_name": "ASR Health Benefits"}
+    resolver = discovery._source_config()["platform_resolvers"]["asr_health_benefits"]
+    expected_groups = discovery._asr_group_numbers_from_seed_list(resolver["seed_list"])
+
+    targets = discovery._resolve_asr_health_benefits_mrf(source, "https://www.asrhealthbenefits.com/MRF", resolver)
+
+    assert {"1194", "1208"}.issubset(set(expected_groups))
+    assert [target.metadata["group_number"] for target in targets] == expected_groups
+    assert targets[0].url.startswith(
+        "https://www.asrhealthbenefits.com/umbraco/surface/mrfdownload?fileType=TableOfContents&groupNumber="
+    )
+
+
+def test_asr_health_benefits_seed_list_filters_active_rows(tmp_path, monkeypatch):
+    seed_path = tmp_path / "asr-groups.csv"
+    seed_path.write_text(
+        "group_number,status,source_url,first_seen_at,last_verified_at,notes\n"
+        "1194,active,https://www.asrhealthbenefits.com/MRF,2026-06-24,2026-06-24,public\n"
+        "1208,retired,https://www.asrhealthbenefits.com/MRF,2026-06-24,2026-06-24,old\n"
+        "1210,active,https://www.asrhealthbenefits.com/MRF,2026-06-24,2026-06-24,public\n",
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "sources.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "providers": {},
+                "seed_lists": {
+                    "asr_test": {
+                        "schema": "group_number_seed_v1",
+                        "path": str(seed_path),
+                    }
+                },
+                "platform_resolvers": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(discovery.SOURCE_CONFIG_ENV, str(config_path))
+    monkeypatch.setattr(discovery, "_SOURCE_CONFIG_CACHE", None)
+
+    assert discovery._asr_group_numbers_from_seed_list("asr_test") == ["1194", "1210"]
+
+
+def test_asr_health_benefits_seed_list_dedupes_direct_and_configured_numbers(tmp_path, monkeypatch):
+    seed_path = tmp_path / "asr-groups.csv"
+    seed_path.write_text(
+        "group_number,status\n1194,active\n1208,active\n1194,active\n",
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "sources.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "providers": {},
+                "seed_lists": {
+                    "asr_test": {
+                        "schema": "group_number_seed_v1",
+                        "path": str(seed_path),
+                    }
+                },
+                "platform_resolvers": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(discovery.SOURCE_CONFIG_ENV, str(config_path))
+    monkeypatch.setattr(discovery, "_SOURCE_CONFIG_CACHE", None)
+    resolver = {
+        "type": "asr_health_benefits_mrf",
+        "toc_path": "/umbraco/surface/mrfdownload",
+        "seed_list": "asr_test",
+        "group_numbers": ["1208"],
+    }
+
+    assert (
+        discovery._asr_group_numbers_for_source(
+            "https://www.asrhealthbenefits.com/umbraco/surface/mrfdownload?fileType=TableOfContents&groupNumber=1194",
+            resolver,
+        )
+        == ["1194", "1208"]
+    )
+
+
+def test_asr_health_benefits_seed_list_rejects_non_four_digit_values(tmp_path, monkeypatch):
+    seed_path = tmp_path / "asr-groups.csv"
+    seed_path.write_text("group_number,status\n1208,active\n12,active\n", encoding="utf-8")
+    config_path = tmp_path / "sources.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "providers": {},
+                "seed_lists": {
+                    "asr_test": {
+                        "schema": "group_number_seed_v1",
+                        "path": str(seed_path),
+                    }
+                },
+                "platform_resolvers": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(discovery.SOURCE_CONFIG_ENV, str(config_path))
+    monkeypatch.setattr(discovery, "_SOURCE_CONFIG_CACHE", None)
+
+    with pytest.raises(ValueError, match="4-digit"):
+        discovery._asr_group_numbers_from_seed_list("asr_test")
 
 
 def test_auxiant_directory_parser_extracts_data_available_networks():
@@ -490,6 +810,19 @@ def test_healthsparq_public_params_from_public_fragment():
     assert params == {"insurerCode": "AETNACVS_I", "brandCode": "ALICFI"}
 
 
+def test_healthsparq_public_params_preserve_filtered_fragment_query():
+    params = discovery._healthsparq_public_params(
+        "https://health1.meritain.com/app/public/#/one/insurerCode=MERITAIN_I&brandCode=MERITAINOVER/machine-readable-transparency-in-coverage?reportingEntityType=TPA_14445&lock=true"
+    )
+
+    assert params == {
+        "insurerCode": "MERITAIN_I",
+        "brandCode": "MERITAINOVER",
+        "reportingEntityType": "TPA_14445",
+        "lock": "true",
+    }
+
+
 def test_healthsparq_direct_metadata_url_uses_configured_template():
     resolver = discovery._source_config()["platform_resolvers"]["aetna_health1"]
     params = {"insurerCode": "AETNACVS_I", "brandCode": "ALICFI"}
@@ -506,6 +839,13 @@ def test_healthsparq_direct_metadata_url_uses_configured_tenant_override():
     url = discovery._healthsparq_direct_metadata_url(resolver, params)
 
     assert url == "https://mrf.healthsparq.com/aetnacvs-egress.nophi.kyruushsq.com/prd/mrf/MERITAIN_I/MERITAINOVER/latest_metadata.json"
+
+
+def test_healthsparq_direct_metadata_url_skips_scoped_filters():
+    resolver = discovery._source_config()["platform_resolvers"]["aetna_health1"]
+    params = {"insurerCode": "MERITAIN_I", "brandCode": "MERITAINOVER", "reportingEntityType": "TPA_14445"}
+
+    assert discovery._healthsparq_direct_metadata_url(resolver, params) is None
 
 
 def test_healthsparq_metadata_rows_include_direct_file_urls_and_plans():
@@ -1160,6 +1500,40 @@ def test_metadata_text_rows_accept_zip_body_references():
     assert len(file_rows) == 1
     assert file_rows[0]["file_type"] == "in-network"
     assert file_rows[0]["metadata_json"]["container_format"] == "zip"
+
+
+def test_file_reference_target_rows_preserve_plan_info_for_client_indexing():
+    source = {"source_id": "source_1", "payer_id": "payer_1", "display_name": "Lucent Health"}
+    target = discovery.CrawlTarget(
+        source=source,
+        url="https://mrf.healthcarebluebook.com/Lucent/350380",
+        label="Lucent Health 042171239",
+        resolved_from_url="https://mrf.healthcarebluebook.com/Lucent",
+        metadata={
+            "resolver": "healthcarebluebook_mrf",
+            "target_kind": "file_reference",
+            "target_file_type": "allowed-amounts",
+            "source_format": "zip",
+            "plan_info": [
+                {
+                    "plan_id": "042171239",
+                    "plan_id_type": "ein",
+                    "plan_market_type": "group",
+                    "plan_name": "Lucent Health 042171239",
+                }
+            ],
+        },
+    )
+
+    file_row = discovery._toc_target_file_row(target)
+    [plan_row] = discovery._plan_rows_from_target_metadata(target)
+
+    assert file_row["plan_ids"] == ["042171239"]
+    assert file_row["market_types"] == ["group"]
+    assert file_row["metadata_json"]["source_format"] == "zip"
+    assert plan_row["plan_id"] == "042171239"
+    assert plan_row["plan_id_type"] == "ein"
+    assert plan_row["reporting_entity_name"] == "Lucent Health"
 
 
 def test_crawl_target_limit_prefers_resolved_json_before_landing_pages():
