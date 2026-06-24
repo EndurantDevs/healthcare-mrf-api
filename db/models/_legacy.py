@@ -4154,10 +4154,19 @@ class EntityAddressUnified(Base, JSONOutputMixin):
         {"index_elements": ("procedures_array gin__int_ops",), "using": "gin", "name": "procedures_array"},
         {"index_elements": ("medications_array gin__int_ops",), "using": "gin", "name": "medications_array"},
         {
+            # Geo GiST index over every geocoded SERVICE location, not just the
+            # NPPES primary/secondary -- so a radius search finds providers at their
+            # TiC/PTG and ACA practice/site locations too. city_zip-precision rows
+            # have no exact point and are intentionally excluded. The query-side type
+            # filter (api/endpoint/npi.py geo path) MUST match this predicate for the
+            # index to be used; widening the geo query is gated on a rebuild that
+            # recreates this partial index (CREATE INDEX IF NOT EXISTS on a fresh
+            # stage table, _create_stage_indexes), so the index lands before the
+            # query that depends on it is activated.
             "index_elements": ("Geography(ST_MakePoint((long)::double precision, (lat)::double precision))",),
             "using": "gist",
             "name": "geo_idx",
-            "where": "type IN ('primary', 'secondary') AND COALESCE(address_precision, '') <> 'city_zip'",
+            "where": "type IN ('primary', 'secondary', 'practice', 'site') AND COALESCE(address_precision, '') <> 'city_zip'",
         },
         {"index_elements": ("address_key",), "name": "address_key"},
     ]

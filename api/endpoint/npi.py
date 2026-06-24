@@ -111,6 +111,20 @@ PUBLIC_ADDRESS_ATTRIBUTION_COLUMNS = {
     "ptg_source_array",
     "group_plan_array",
 }
+# When true, the geo radius search returns providers at ALL geocoded service
+# locations (NPPES primary/secondary PLUS TiC/PTG/ACA practice/site), matching the
+# widened geo_idx partial predicate. Default OFF: the live geo_idx must be rebuilt
+# to cover practice/site rows (via an entity_address_unified refresh) BEFORE this is
+# enabled, otherwise the widened query cannot use the index and seq-scans the table.
+GEO_SERVICE_LOCATIONS_ENV = "HLTHPRT_GEO_INCLUDE_SERVICE_LOCATIONS"
+# Address types that are concrete service locations (the geo_idx + detail surface).
+GEO_SERVICE_LOCATION_TYPES = ("primary", "secondary", "practice", "site")
+
+
+def _geo_includes_service_locations() -> bool:
+    return os.getenv(GEO_SERVICE_LOCATIONS_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 ADDRESS_SERVING_SOURCE_ENV = "HLTHPRT_ADDRESS_SERVING_SOURCE"
 ADDRESS_SERVING_SOURCE_LEGACY = "legacy"
 ADDRESS_SERVING_SOURCE_UNIFIED = "entity_address_unified"
@@ -914,6 +928,15 @@ def _build_nearby_sql(
             "                              ) AS g"
         )
         taxonomy_where = "\n                          AND a.taxonomy_array && g.codes"
+    # Match the geo_idx partial predicate so the GiST index is used. Only widen to
+    # practice/site when serving the unified table AND the rebuilt index covers them
+    # (flag-gated); otherwise keep the NPPES primary/secondary filter the live index
+    # supports, so geo search never seq-scans.
+    if address_table_sql.endswith(".entity_address_unified") and _geo_includes_service_locations():
+        type_list = ", ".join(f"'{t}'" for t in GEO_SERVICE_LOCATION_TYPES)
+        geo_type_clause = f"AND a.type IN ({type_list})"
+    else:
+        geo_type_clause = "AND (a.type = 'primary' OR a.type = 'secondary')"
     return dedent(
         """
         WITH sub_s AS (
@@ -941,7 +964,7 @@ def _build_nearby_sql(
                              )
                           {taxonomy_where}
                           {geo_precision_clause}
-                          AND (a.type = 'primary' OR a.type = 'secondary')
+                          {geo_type_clause}
                           {extra_clause}
                      ORDER BY distance ASC
                      LIMIT :limit
@@ -956,6 +979,7 @@ def _build_nearby_sql(
         taxonomy_from=taxonomy_from,
         taxonomy_where=taxonomy_where,
         geo_precision_clause=geo_precision_clause,
+        geo_type_clause=geo_type_clause,
         extra_clause=extra_clause,
         ilike_clause=ilike_clause,
         address_table_sql=address_table_sql,
