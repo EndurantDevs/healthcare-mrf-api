@@ -16,6 +16,8 @@ The source registry is data-driven:
 
 - Resolver configuration: `specs/mrf_source_discovery_sources.json`
 - Curated payer/source roster: `specs/mrf_payer_master_list.md`
+- Seed-list registry: `seed_lists` in `specs/mrf_source_discovery_sources.json`
+- ASR Health Benefits group seeds: `specs/mrf_seed_lists/asr_health_benefits_groups.csv`
 - Design/spec notes: `specs/mrf_payer_source_registry.md`
 
 Do not put payer/TPA source URLs in Python code or provider config. Add or correct them in the
@@ -49,6 +51,11 @@ Configure these in `import-control`, not hard-coded cron:
 
 Use `--crawl-target-limit` for production smoke/canary runs before unbounded monthly crawls.
 
+ASR Health Benefits is intentionally different from normal landing-page crawls. The public endpoint
+requires a 4-digit group number, so the resolver references the named
+`asr_health_benefits_groups` seed list. Monthly discovery reads only active rows from that committed
+CSV. Do not put a `0001..9999` sweep in the monthly schedule.
+
 ## Local Smoke Commands
 
 Local dev uses `.env`; in the shared dev setup this points PostgreSQL at `127.0.0.1:5440`.
@@ -58,9 +65,27 @@ Local dev uses `.env`; in the shared dev setup this points PostgreSQL at `127.0.
 ./venv314/bin/python main.py start mrf-source-discovery --probe-files --file-probe-entity-types tpa --file-probe-limit 100 --concurrency 10
 ./venv314/bin/python main.py start mrf-source-discovery --provider master-list --source-payer-query Meritain --crawl --concurrency 3
 ./venv314/bin/python main.py start mrf-source-discovery --probe-files --file-probe-payer-query Meritain --file-probe-limit 20 --concurrency 5
+./venv314/bin/python main.py start mrf-source-discovery --provider master-list --source-payer-query BRMS --check-urls --crawl --concurrency 3
+./venv314/bin/python main.py start mrf-source-discovery --provider master-list --source-payer-query Lucent --check-urls --crawl --concurrency 3
 ./venv314/bin/python main.py start mrf-source-discovery --provider master-list --source-payer-query Cigna --crawl --concurrency 3
 ./venv314/bin/python main.py start mrf-source-discovery --provider master-list --source-payer-query Varipro --check-urls --crawl --concurrency 3 --sync-import-control
+./venv314/bin/python main.py start mrf-source-discovery --provider master-list --source-payer-query "ASR Health Benefits" --crawl --concurrency 3
 ```
+
+Meritain, BRMS, and Lucent should create `mrf_plan` rows from client/group metadata during crawl.
+BRMS and Lucent Healthcare Bluebook links should remain stable `mrf.healthcarebluebook.com/...`
+URLs in `mrf_file`; do not store signed blob redirect URLs as canonical catalog rows. BRMS direct
+CSV links are cataloged only and are intentionally excluded from import-control ingest previews.
+
+One-time ASR group discovery:
+
+```bash
+./venv314/bin/python scripts/research/discover_asr_health_benefits_groups.py --start 1 --end 9999 --concurrency 2 --write
+```
+
+The discovery utility probes ASR group numbers with `HEAD` first and fetches JSON only for positive
+hits. It merges found groups into `specs/mrf_seed_lists/asr_health_benefits_groups.csv` unless
+`--replace` is passed.
 
 Useful verification queries:
 

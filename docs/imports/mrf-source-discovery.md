@@ -37,6 +37,16 @@ Platform resolvers are also configured in that file. The importer currently reso
 - MyMedicalShopper/TALON MRF search pages into current employer plan TOC/index JSON targets by
   enumerating enabled entity employers through the public DDP API and keeping only the newest
   generated month per plan.
+- Meritain MRF search pages into group/client HealthSparq links, preserving the group ID as
+  `plan_info` so client-level rows are indexed even when the target remains an app-scoped link.
+- Healthcare Bluebook MRF listing pages into stable tenant/file endpoints, with grid labels and
+  EINs captured as group plan metadata for BRMS and Lucent delegated sources.
+- HTML TPA pages that include both direct MRF links and Healthcare Bluebook delegations, including
+  BRMS and Lucent landing pages. Direct CSV links are cataloged for visibility but excluded from
+  import-control preview promotion.
+- ASR Health Benefits group-number MRF pages into deterministic TOC URLs using the named
+  `asr_health_benefits_groups` seed list and active rows from
+  `specs/mrf_seed_lists/asr_health_benefits_groups.csv`.
 - Cigna compliance landing pages into current `/static/mrf/*.json` lookup files, then into the
   current signed federal and Colorado TOC/index JSON targets. The resolver carries a larger
   per-target TOC byte cap because Cigna federal indexes can exceed the generic 25 MB default.
@@ -53,10 +63,12 @@ publish required MRFs. See [45 CFR 147.212](https://www.ecfr.gov/current/title-4
 and [CMS technical clarification Q36](https://www.cms.gov/healthplan-price-transparency/resources/technical-clarification).
 
 Current curated TPA seeds live in `specs/mrf_payer_master_list.md` and include Allied Benefit
-Systems, AmeriBen, BRMS, Collective Health, HPI, MedCost, PBA, Varipro, WebTPA, HealthScope, Aetna
-Signature Administrators, and Meritain. Meritain uses a configured HealthSparq tenant override in
-`specs/mrf_source_discovery_sources.json`; Varipro uses the configured MyMedicalShopper/TALON
-resolver.
+Systems, AmeriBen, BRMS, Collective Health, HPI, Lucent, MedCost, PBA, Varipro, WebTPA,
+HealthScope, Aetna Signature Administrators, and Meritain. Meritain uses both the aggregate
+HealthSparq tenant override and the public Meritain group search resolver. BRMS and Lucent delegate
+some client MRF rows to Healthcare Bluebook, where discovery stores the stable listing/file
+endpoints rather than any signed storage redirect. Varipro uses the configured
+MyMedicalShopper/TALON resolver.
 
 Resolved TOC targets are stored as `mrf_file.file_type = table-of-contents` rows even when
 `--crawl-target-limit` limits how many target TOCs are parsed in a smoke run.
@@ -94,6 +106,14 @@ Useful environment knobs for full crawls:
 - `HLTHPRT_MRF_DISCOVERY_MAX_TOC_BYTES`: generic TOC/metadata fetch limit; defaults to 25 MB.
   Resolver-specific caps in `specs/mrf_source_discovery_sources.json` can raise this for known
   larger index files without changing the global default.
+
+ASR Health Benefits does not expose an all-groups catalog. Keep monthly imports constrained to the
+`asr_health_benefits_groups` seed list, and refresh the CSV only through an intentional maintenance
+sweep:
+
+```bash
+python scripts/research/discover_asr_health_benefits_groups.py --start 1 --end 9999 --concurrency 2 --write
+```
 
 ## Stored Data
 
