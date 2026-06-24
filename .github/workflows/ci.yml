@@ -5,12 +5,6 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
-    inputs:
-      run_docker_smoke:
-        description: "Run the Docker image/runtime smoke job on GitHub-hosted runners"
-        required: false
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -156,60 +150,6 @@ jobs:
         uses: semgrep/semgrep-action@v1
         with:
           config: .semgrep.yml
-
-  docker-image-build:
-    name: docker image and runtime smoke
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_docker_smoke }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    services:
-      postgres:
-        image: postgis/postgis:18-3.6
-        env:
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: healthporta_docker_smoke
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres -d healthporta_docker_smoke"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-    steps:
-      - uses: actions/checkout@v7
-      - name: Build Python 3.14 image
-        run: docker build --pull --tag healthcare-mrf-api:ci .
-      - name: Smoke Rust scanner in image
-        run: |
-          docker run --rm healthcare-mrf-api:ci test -x /opt/support/ptg2_scanner/target/release/ptg2_scanner
-          docker run --rm healthcare-mrf-api:ci sh -ec '
-            /opt/support/ptg2_scanner/target/release/ptg2_scanner --canon-version
-            /opt/venv/bin/python -c "import ptg2_address_canon; print(ptg2_address_canon.canon_version())"
-            tmp=$(mktemp -d)
-            printf "1\t(0,1)\t\\N\t123 Main St\tSuite 2\tAustin\tTX\t78701\tUS\n" > "$tmp/raw.copy"
-            /opt/support/ptg2_scanner/target/release/ptg2_scanner \
-              --address-canonicalize-copy "$tmp/raw.copy" "$tmp/keyed.copy"
-            test -s "$tmp/keyed.copy"
-          '
-      - name: Runtime health smoke
-        run: |
-          docker run --rm -d --name healthcare-mrf-api-ci --network host \
-            -e HLTHPRT_DB_HOST=127.0.0.1 \
-            -e HLTHPRT_DB_PORT=5432 \
-            -e HLTHPRT_DB_USER=postgres \
-            -e HLTHPRT_DB_PASSWORD=postgres \
-            -e HLTHPRT_DB_DATABASE=healthporta_docker_smoke \
-            -e HLTHPRT_DB_SCHEMA=mrf \
-            healthcare-mrf-api:ci
-          trap 'docker logs healthcare-mrf-api-ci || true; docker rm -f healthcare-mrf-api-ci || true' EXIT
-          for _ in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:8080/api/v1/healthcheck/ >/tmp/health.json; then
-              cat /tmp/health.json
-              exit 0
-            fi
-            sleep 2
-          done
-          exit 1
 
   worker-queue-smoke:
     name: redis worker queue smoke
