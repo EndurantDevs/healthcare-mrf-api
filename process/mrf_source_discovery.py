@@ -3297,11 +3297,11 @@ async def _resolve_crawl_targets(
                 run_id=progress_run_id,
                 importer="mrf-source-discovery",
                 status="running",
-                phase="resolving source TOCs",
+                phase="resolving source pages",
                 unit="sources",
                 done=done,
                 total=total,
-                message=f"resolved {done}/{total} source TOC targets",
+                message=f"resolved {done}/{total} source pages",
             )
     return targets, observations
 
@@ -3763,6 +3763,7 @@ async def _crawl_toc_metadata(
             concurrency=concurrency,
         )
         targets = sorted(targets, key=_crawl_target_rank)
+        expanded_target_count = len(targets)
         target_rows: list[dict[str, Any]] = []
         for target in targets:
             row = _toc_target_file_row(target)
@@ -3774,6 +3775,20 @@ async def _crawl_toc_metadata(
         if crawl_target_limit:
             targets = targets[: max(1, int(crawl_target_limit))]
         total = len(targets)
+        if progress_run_id:
+            message = f"resolved {expanded_target_count} TOC targets from {len(crawl_source_rows)} source pages"
+            if total != expanded_target_count:
+                message = f"{message}; crawling first {total}"
+            enqueue_live_progress(
+                run_id=progress_run_id,
+                importer="mrf-source-discovery",
+                status="running",
+                phase="resolved source TOCs",
+                unit="targets",
+                done=expanded_target_count,
+                total=expanded_target_count,
+                message=message,
+            )
         target_queue: asyncio.Queue[CrawlTarget | None] = asyncio.Queue()
         result_queue: asyncio.Queue[tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], str] | None] = asyncio.Queue(
             maxsize=max(worker_count * 4, 1)
@@ -3822,7 +3837,7 @@ async def _crawl_toc_metadata(
                             importer="mrf-source-discovery",
                             status="running",
                             phase="writing TOC metadata rows",
-                            unit="sources",
+                            unit="targets",
                             done=done,
                             total=total,
                             message=f"writing rows for TOC target {done}/{total}",
@@ -3835,7 +3850,7 @@ async def _crawl_toc_metadata(
                         importer="mrf-source-discovery",
                         status="running",
                         phase="crawling TOC metadata",
-                        unit="sources",
+                        unit="targets",
                         done=done,
                         total=total,
                         message=f"crawled {done}/{total} TOC targets",

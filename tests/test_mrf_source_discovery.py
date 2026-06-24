@@ -1634,6 +1634,88 @@ def test_toc_target_file_row_stores_html_zip_reference_without_body_fetch():
     assert row["metadata_json"]["container_format"] == "zip"
 
 
+@pytest.mark.asyncio
+async def test_resolve_crawl_targets_progress_reports_source_pages(monkeypatch):
+    progress = []
+
+    async def fake_crawl_targets_for_source(source, url, session):
+        return [discovery.CrawlTarget(source=source, url=f"{url}/index.json")]
+
+    monkeypatch.setattr(discovery, "_crawl_targets_for_source", fake_crawl_targets_for_source)
+    monkeypatch.setattr(discovery, "enqueue_live_progress", lambda **payload: progress.append(payload))
+
+    targets, observations = await discovery._resolve_crawl_targets(
+        [
+            {"source_id": "source_1", "index_url": "https://example.com/source-1"},
+            {"source_id": "source_2", "index_url": "https://example.com/source-2"},
+        ],
+        session=object(),
+        run_id="run_1",
+        progress_run_id="control_run_1",
+        concurrency=1,
+    )
+
+    assert len(targets) == 2
+    assert observations == []
+    assert progress[-1]["phase"] == "resolving source pages"
+    assert progress[-1]["unit"] == "sources"
+    assert progress[-1]["message"] == "resolved 2/2 source pages"
+
+
+@pytest.mark.asyncio
+async def test_crawl_toc_metadata_reports_expanded_target_count(monkeypatch):
+    progress = []
+
+    source_rows = [
+        {"source_id": "source_1", "payer_id": "payer_1", "index_url": "https://example.com/source-1"},
+        {"source_id": "source_2", "payer_id": "payer_2", "index_url": "https://example.com/source-2"},
+    ]
+
+    async def fake_resolve_crawl_targets(rows, **_kwargs):
+        return [
+            discovery.CrawlTarget(
+                source=rows[0],
+                url="https://example.com/source-1/in-network-1.json",
+                metadata={"target_kind": "file_reference", "target_file_type": "in-network"},
+            ),
+            discovery.CrawlTarget(
+                source=rows[0],
+                url="https://example.com/source-1/in-network-2.json",
+                metadata={"target_kind": "file_reference", "target_file_type": "in-network"},
+            ),
+            discovery.CrawlTarget(
+                source=rows[1],
+                url="https://example.com/source-2/in-network-1.json",
+                metadata={"target_kind": "file_reference", "target_file_type": "in-network"},
+            ),
+        ], []
+
+    async def fake_push_crawl_row_batches(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(discovery, "_resolve_crawl_targets", fake_resolve_crawl_targets)
+    monkeypatch.setattr(discovery, "_push_crawl_row_batches", fake_push_crawl_row_batches)
+    monkeypatch.setattr(discovery, "enqueue_live_progress", lambda **payload: progress.append(payload))
+
+    await discovery._crawl_toc_metadata(
+        source_rows,
+        test_mode=False,
+        run_id="run_1",
+        progress_run_id="control_run_1",
+        max_toc_bytes=1024,
+        concurrency=1,
+        crawl_target_limit=2,
+    )
+
+    [expanded_event] = [event for event in progress if event["phase"] == "resolved source TOCs"]
+    assert expanded_event["unit"] == "targets"
+    assert expanded_event["done"] == 3
+    assert expanded_event["total"] == 3
+    assert expanded_event["message"] == "resolved 3 TOC targets from 2 source pages; crawling first 2"
+    assert [event["total"] for event in progress if event["phase"] == "crawling TOC metadata"] == [2, 2]
+    assert [event["unit"] for event in progress if event["phase"] == "crawling TOC metadata"] == ["targets", "targets"]
+
+
 def test_toc_rows_skip_non_http_body_placeholders(monkeypatch):
     monkeypatch.setattr(
         discovery,
