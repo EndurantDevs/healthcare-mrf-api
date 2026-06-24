@@ -88,16 +88,28 @@ PUBLIC_ADDRESS_SOURCE_DEBUG_COLUMNS = {
 }
 PUBLIC_ADDRESS_EVIDENCE_DEBUG_COLUMNS = {
     "source_record_ids",
-    "aca_plan_array",
-    "aca_network_array",
-    "ptg_plan_array",
-    "ptg_source_array",
-    "group_plan_array",
     "base_address_version",
     "ptg_address_version",
     "inferred_npi",
     "inference_confidence",
     "inference_method",
+}
+# Per-address SOURCE + plan/network attribution surfaced BY DEFAULT when serving the
+# unified address table, so a consumer can see where an address came from (NPPES /
+# ACA / PTG-TiC) and which plans/networks it is associated with -- i.e. confirm an
+# address is valid for a given plan/network. These columns do not exist on the
+# legacy NPIAddress table, so they are only added for the EntityAddressUnified model.
+PUBLIC_ADDRESS_ATTRIBUTION_COLUMNS = {
+    "address_sources",
+    "address_precision",
+    "source_count",
+    "independent_source_count",
+    "multi_source_confirmed",
+    "aca_plan_array",
+    "aca_network_array",
+    "ptg_plan_array",
+    "ptg_source_array",
+    "group_plan_array",
 }
 ADDRESS_SERVING_SOURCE_ENV = "HLTHPRT_ADDRESS_SERVING_SOURCE"
 ADDRESS_SERVING_SOURCE_LEGACY = "legacy"
@@ -546,7 +558,7 @@ def _npi_detail_cache_key(
     include_evidence: bool = False,
 ) -> str:
     schema = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
-    address_source = os.getenv(ADDRESS_SERVING_SOURCE_ENV) or ADDRESS_SERVING_SOURCE_LEGACY
+    address_source = os.getenv(ADDRESS_SERVING_SOURCE_ENV, ADDRESS_SERVING_SOURCE_UNIFIED).strip().lower()
     geocode_mode = "sync_geo" if sync_geocode else "stored_geo"
     archive_mode = "archive_geo" if lookup_stored_geocode else "no_archive_geo"
     debug_mode = f"sources:{int(include_sources)}|evidence:{int(include_evidence)}"
@@ -4418,6 +4430,11 @@ async def _build_npi_details(
         existing_address_columns = _model_table_columns(address_model)
 
     allowed_address_columns = set(_model_table_columns(NPIAddress))
+    if address_model is EntityAddressUnified:
+        # Surface per-address source + plan/network attribution by default so the
+        # unified table fulfils its purpose: see where each address came from and
+        # which plans/networks it belongs to. Heavier internals stay behind flags.
+        allowed_address_columns.update(PUBLIC_ADDRESS_ATTRIBUTION_COLUMNS)
     if include_sources or include_evidence:
         allowed_address_columns.update(PUBLIC_ADDRESS_SOURCE_DEBUG_COLUMNS)
     if include_evidence:
@@ -4443,15 +4460,23 @@ async def _build_npi_details(
             continue
         address_columns.append(address_table.c[column.key])
 
+    # Return EVERY known service location, not just the NPPES primary/secondary.
+    # The unified builder stores TiC/PTG and ACA practice locations as type
+    # 'practice'/'site', so the legacy primary/secondary-only filter silently
+    # dropped all TiC addresses. Widen the filter for the unified model only;
+    # legacy NPIAddress behaviour is unchanged.
+    if address_model is EntityAddressUnified:
+        address_type_clause = address_table.c.type.in_(
+            ("primary", "secondary", "practice", "site")
+        )
+    else:
+        address_type_clause = or_(
+            address_table.c.type == "primary",
+            address_table.c.type == "secondary",
+        )
     address_subquery_base = (
         select(*address_columns)
-        .where(
-            (address_table.c.npi == npi)
-            & or_(
-                address_table.c.type == "primary",
-                address_table.c.type == "secondary",
-            )
-        )
+        .where((address_table.c.npi == npi) & address_type_clause)
         .order_by(address_table.c.type)
     )
     try:
