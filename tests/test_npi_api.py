@@ -30,7 +30,7 @@ async def test_npi_index(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_get_npi_includes_other_names(monkeypatch):
-    async def fake_build(_npi):
+    async def fake_build(_npi, **_kwargs):
         return {
             "npi": _npi,
             "taxonomy_list": [],
@@ -67,7 +67,7 @@ async def test_get_npi_includes_other_names(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_get_npi_uses_other_names_for_dba(monkeypatch):
-    async def fake_build(_npi):
+    async def fake_build(_npi, **_kwargs):
         return {
             "npi": _npi,
             "taxonomy_list": [],

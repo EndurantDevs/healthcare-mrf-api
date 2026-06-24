@@ -562,6 +562,15 @@ def _has_insurance_total_cache_set(city: Optional[str], state: Optional[str], va
     )
 
 
+# A handful of reference labs / large health systems carry 1k+ service locations.
+# Returning every address inline produces multi-MB responses and 90ms+ build times
+# (one geocode-enrichment task per address). Page the address_list by default so the
+# common provider (a few addresses) is unchanged while the outliers stay bounded;
+# callers walk every address via address_offset, or opt out with address_limit=all.
+NPI_DETAIL_ADDRESS_DEFAULT_LIMIT = 200
+NPI_DETAIL_ADDRESS_MAX_LIMIT = 1000
+
+
 def _npi_detail_cache_key(
     npi: int,
     *,
@@ -572,16 +581,19 @@ def _npi_detail_cache_key(
     lookup_stored_geocode: bool,
     include_sources: bool = False,
     include_evidence: bool = False,
+    address_limit: int | None = None,
+    address_offset: int = 0,
 ) -> str:
     schema = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     address_source = os.getenv(ADDRESS_SERVING_SOURCE_ENV, ADDRESS_SERVING_SOURCE_UNIFIED).strip().lower()
     geocode_mode = "sync_geo" if sync_geocode else "stored_geo"
     archive_mode = "archive_geo" if lookup_stored_geocode else "no_archive_geo"
     debug_mode = f"sources:{int(include_sources)}|evidence:{int(include_evidence)}"
+    page_mode = f"alim:{address_limit if address_limit is not None else 'all'}|aoff:{int(address_offset or 0)}"
     return (
         f"{schema}|{address_source}|{int(npi)}|{view}|"
         f"{'chain' if include_chain else 'default'}|"
-        f"extra:{int(extra_info)}|{geocode_mode}|{archive_mode}|{debug_mode}"
+        f"extra:{int(extra_info)}|{geocode_mode}|{archive_mode}|{debug_mode}|{page_mode}"
     )
 
 
@@ -3063,6 +3075,13 @@ async def get_all(request):
                                 continue
                             if c.key in row_mapping:
                                 obj[c.key] = row_mapping.get(c.key)
+                        # Unified serving: include per-address source/plan attribution
+                        # (not declared on the legacy NPIAddress model) so list results
+                        # match the detail + geo endpoints.
+                        if address_table_sql.endswith(".entity_address_unified"):
+                            for key in PUBLIC_ADDRESS_ATTRIBUTION_COLUMNS:
+                                if key in row_mapping and key not in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
+                                    obj[key] = row_mapping.get(key)
                         obj["do_business_as"] = obj.get("do_business_as") or []
                         obj.setdefault("procedures_array", [])
                         obj.setdefault("medications_array", [])
@@ -3883,6 +3902,14 @@ async def get_near_npi(request):
                     continue
                 if c.key in row_dict:
                     obj[c.key] = row_dict[c.key]
+            # Unified serving carries per-address source/plan attribution that the
+            # legacy NPIAddress model doesn't declare, so the loop above skips it.
+            # Surface it here so geo results show WHERE each address came from and
+            # which plans/networks confirm it (parity with the detail endpoint).
+            if address_table_sql.endswith(".entity_address_unified"):
+                for key in PUBLIC_ADDRESS_ATTRIBUTION_COLUMNS:
+                    if key in row_dict and key not in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
+                        obj[key] = row_dict[key]
             for c in NPIData.__table__.columns:
                 if c.key in ("npi", "checksum", "do_business_as_text"):
                     continue
@@ -4017,6 +4044,22 @@ async def get_npi(request, npi):
     )
     include_chain_enrichment = _include_chain_provider_enrichment(request.args.get("show"))
     provider_enrichment_view = _normalize_provider_enrichment_view(request.args.get("view"))
+    # address_list paging: default-bounded so high-volume providers never serialize
+    # 1k+ addresses; address_limit=all (or 0) opts out and returns the full list.
+    raw_address_limit = request.args.get("address_limit")
+    if raw_address_limit is None or str(raw_address_limit).strip() == "":
+        address_limit = NPI_DETAIL_ADDRESS_DEFAULT_LIMIT
+    elif str(raw_address_limit).strip().lower() in ("all", "0", "-1"):
+        address_limit = None
+    else:
+        try:
+            address_limit = max(1, min(int(raw_address_limit), NPI_DETAIL_ADDRESS_MAX_LIMIT))
+        except (TypeError, ValueError):
+            address_limit = NPI_DETAIL_ADDRESS_DEFAULT_LIMIT
+    try:
+        address_offset = max(int(request.args.get("address_offset") or 0), 0)
+    except (TypeError, ValueError):
+        address_offset = 0
     npi = int(npi)
     cache_key = _npi_detail_cache_key(
         npi,
@@ -4027,6 +4070,8 @@ async def get_npi(request, npi):
         lookup_stored_geocode=lookup_stored_geocode,
         include_sources=include_sources,
         include_evidence=include_evidence,
+        address_limit=address_limit,
+        address_offset=address_offset,
     )
     if not force_address_update:
         cached_body = _npi_detail_response_cache_get(cache_key)
@@ -4451,7 +4496,10 @@ async def get_npi(request, npi):
 
         return d
 
-    build_kwargs: dict[str, Any] = {}
+    build_kwargs: dict[str, Any] = {
+        "address_limit": address_limit,
+        "address_offset": address_offset,
+    }
     if request_session is not None:
         build_kwargs["session"] = request_session
     if include_sources or include_evidence:
@@ -4461,6 +4509,8 @@ async def get_npi(request, npi):
 
     if not data:
         raise sanic.exceptions.NotFound
+
+    address_total = data.pop("address_total", None)
 
     addresses = data.get("address_list") or []
     if not include_extra_info:
@@ -4478,6 +4528,16 @@ async def get_npi(request, npi):
         if isinstance(address, dict):
             for key in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
                 address.pop(key, None)
+    if address_limit is not None:
+        # Never silently truncate: tell the caller the full count and how to page.
+        returned = len(data["address_list"])
+        data["address_pagination"] = {
+            "limit": address_limit,
+            "offset": address_offset,
+            "returned": returned,
+            "total": address_total,
+            "has_more": bool(address_total is not None and address_offset + address_limit < address_total),
+        }
 
     if provider_enrichment_view == "summary":
         fetch_provider_enrichment = _fetch_provider_enrichment_summary_detail
@@ -4567,6 +4627,8 @@ async def _build_npi_details(
     *,
     include_sources: bool = False,
     include_evidence: bool = False,
+    address_limit: int | None = None,
+    address_offset: int = 0,
     session: Any = None,
 ) -> dict:
     npi_data_table = NPIData.__table__
@@ -4632,8 +4694,29 @@ async def _build_npi_details(
     address_subquery_base = (
         select(*address_columns)
         .where((address_table.c.npi == npi) & address_type_clause)
-        .order_by(address_table.c.type)
+        # Deterministic order so address_offset paging is stable across requests.
+        .order_by(
+            address_table.c.type,
+            address_table.c.first_line,
+            address_table.c.city_name,
+        )
     )
+    address_total: int | None = None
+    if address_limit is not None:
+        count_stmt = (
+            select(func.count())
+            .select_from(address_table)
+            .where((address_table.c.npi == npi) & address_type_clause)
+        )
+        if session is not None:
+            total_res = await session.execute(count_stmt)
+            address_total = int(total_res.scalar() or 0)
+        else:
+            try:
+                address_total = int(await db.scalar(count_stmt) or 0)
+            except Exception:  # pragma: no cover - gino fallback when no session bound
+                address_total = None
+        address_subquery_base = address_subquery_base.limit(address_limit).offset(max(address_offset or 0, 0))
     try:
         address_subquery = address_subquery_base.alias("address_list")
     except NameError:
@@ -4689,6 +4772,8 @@ async def _build_npi_details(
     idx += 1
     if idx < len(result_row) and result_row[idx]:
         obj["address_list"] = result_row[idx]
+    if address_total is not None:
+        obj["address_total"] = address_total
     obj["do_business_as"] = obj.get("do_business_as") or []
     return obj
 

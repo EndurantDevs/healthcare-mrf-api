@@ -164,7 +164,7 @@ async def test_fetch_provider_enrichment_detail_moves_chain_flags_to_visibility(
 
 @pytest.mark.asyncio
 async def test_get_npi_includes_provider_enrichment(monkeypatch):
-    async def fake_build(_npi):
+    async def fake_build(_npi, **_kwargs):
         return {
             "npi": _npi,
             "taxonomy_list": [],
@@ -265,7 +265,7 @@ async def test_get_npi_filters_non_street_addresses_unless_extra_info(monkeypatc
 
 @pytest.mark.asyncio
 async def test_get_npi_can_include_chain_provider_enrichment(monkeypatch):
-    async def fake_build(_npi):
+    async def fake_build(_npi, **_kwargs):
         return {
             "npi": _npi,
             "taxonomy_list": [],
@@ -289,7 +289,7 @@ async def test_get_npi_can_include_chain_provider_enrichment(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_get_npi_can_return_summary_view(monkeypatch):
-    async def fake_build(_npi):
+    async def fake_build(_npi, **_kwargs):
         return {
             "npi": _npi,
             "taxonomy_list": [],

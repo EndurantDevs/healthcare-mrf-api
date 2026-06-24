@@ -499,7 +499,7 @@ def _make_v2_archive_row(
 
 @pytest.mark.asyncio
 async def test_get_npi_geocode_mapbox(monkeypatch):
-    async def fake_build(_npi):
+    async def fake_build(_npi, **_kwargs):
         return {
             "npi": _npi,
             "taxonomy_list": [],
@@ -588,7 +588,7 @@ async def test_get_npi_geocode_mapbox(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_get_npi_geocode_omits_null_address_parts(monkeypatch):
-    async def fake_build(_npi):
+    async def fake_build(_npi, **_kwargs):
         return {
             "npi": _npi,
             "taxonomy_list": [],
@@ -666,7 +666,7 @@ async def test_get_npi_geocode_omits_null_address_parts(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_get_npi_geocode_google(monkeypatch):
-    async def fake_build(_npi):
+    async def fake_build(_npi, **_kwargs):
         return {
             "npi": _npi,
             "taxonomy_list": [],
@@ -761,7 +761,7 @@ async def test_get_npi_geocode_google(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_get_npi_geocode_openaddresses_before_paid_providers(monkeypatch):
-    async def fake_build(_npi):
+    async def fake_build(_npi, **_kwargs):
         return {
             "npi": _npi,
             "taxonomy_list": [],
@@ -1031,7 +1031,7 @@ async def test_get_near_npi_does_not_crash_on_short_positional_rows(monkeypatch)
 
 @pytest.mark.asyncio
 async def test_get_npi_uses_cached_address(monkeypatch):
-    async def fake_build(_npi):
+    async def fake_build(_npi, **_kwargs):
         return {
             "npi": _npi,
             "taxonomy_list": [],
@@ -1076,7 +1076,7 @@ async def test_get_npi_sync_geocode_disabled_skips_live_geocode_and_caches_latle
     monkeypatch.setenv("HLTHPRT_NPI_DETAIL_LOOKUP_STORED_GEOCODE", "false")
     calls = 0
 
-    async def fake_build(_npi):
+    async def fake_build(_npi, **_kwargs):
         nonlocal calls
         calls += 1
         return {
@@ -1132,7 +1132,7 @@ async def test_get_npi_sync_geocode_disabled_skips_live_geocode_and_caches_latle
 async def test_get_npi_uses_response_cache(monkeypatch):
     calls = 0
 
-    async def fake_build(_npi):
+    async def fake_build(_npi, **_kwargs):
         nonlocal calls
         calls += 1
         return {
@@ -1170,7 +1170,7 @@ async def test_get_npi_uses_response_cache(monkeypatch):
 async def test_get_npi_force_address_update_bypasses_response_cache(monkeypatch):
     calls = 0
 
-    async def fake_build(_npi):
+    async def fake_build(_npi, **_kwargs):
         nonlocal calls
         calls += 1
         return {
@@ -1509,7 +1509,7 @@ async def test_get_npi_address_geocode_paths(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_get_npi_not_found(monkeypatch):
-    async def fake_build(_npi):
+    async def fake_build(_npi, **_kwargs):
         return {}
 
     monkeypatch.setattr(npi_module, '_build_npi_details', AsyncMock(side_effect=fake_build))
@@ -1537,7 +1537,7 @@ async def test_get_npi_update_addr_coordinates_row_missing(monkeypatch):
         'taxonomy_array': [],
     }
 
-    async def fake_build(_npi):
+    async def fake_build(_npi, **_kwargs):
         payload = {
             'npi': _npi,
             'do_business_as': [],
@@ -1624,7 +1624,7 @@ async def test_get_npi_update_addr_coordinates_handles_exception(monkeypatch):
         'taxonomy_array': [],
     }
 
-    async def fake_build(_npi):
+    async def fake_build(_npi, **_kwargs):
         return {
             'npi': _npi,
             'do_business_as': [],
@@ -1710,7 +1710,7 @@ async def test_get_npi_skip_update_when_lat_present(monkeypatch):
         'taxonomy_array': [],
     }
 
-    async def fake_build(_npi):
+    async def fake_build(_npi, **_kwargs):
         return {
             'npi': _npi,
             'do_business_as': [],
@@ -1771,7 +1771,7 @@ async def test_get_npi_v2_archive_is_disabled_without_cutover_flag(monkeypatch):
         'taxonomy_array': [],
     }
 
-    async def fake_build(_npi):
+    async def fake_build(_npi, **_kwargs):
         return {
             'npi': _npi,
             'do_business_as': [],
@@ -1848,7 +1848,7 @@ async def test_get_npi_v2_archive_cutover_reads_geocodes_for_concurrent_addresse
         },
     ]
 
-    async def fake_build(_npi):
+    async def fake_build(_npi, **_kwargs):
         return {
             'npi': _npi,
             'do_business_as': [],
@@ -1925,7 +1925,7 @@ async def test_get_npi_v2_archive_geocodeless_row_falls_back_to_legacy(monkeypat
         'taxonomy_array': [],
     }
 
-    async def fake_build(_npi):
+    async def fake_build(_npi, **_kwargs):
         return {
             'npi': _npi,
             'do_business_as': [],
@@ -1991,7 +1991,7 @@ async def test_get_npi_v2_archive_geocode_write_uses_deduped_address_key_upsert(
         'taxonomy_array': [],
     }
 
-    async def fake_build(_npi):
+    async def fake_build(_npi, **_kwargs):
         return {
             'npi': _npi,
             'do_business_as': [],
@@ -2070,7 +2070,7 @@ async def test_get_npi_v2_archive_geocode_write_uses_deduped_address_key_upsert(
 
 @pytest.mark.asyncio
 async def test_get_npi_exposes_address_key_and_hides_premise_key(monkeypatch):
-    async def fake_build(_npi):
+    async def fake_build(_npi, **_kwargs):
         return {
             'npi': _npi,
             'do_business_as': [],
@@ -2167,7 +2167,7 @@ async def test_get_npi_debug_flags_include_sources_and_evidence(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_get_npi_address_list_clears_empty_entries(monkeypatch):
-    async def fake_build(_npi):
+    async def fake_build(_npi, **_kwargs):
         return {
             'npi': _npi,
             'do_business_as': [],
