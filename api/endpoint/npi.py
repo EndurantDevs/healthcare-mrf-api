@@ -62,7 +62,7 @@ MEDICATION_ALLOWED_CODE_SYSTEMS = {
 CODE_TOKEN_PATTERN = re.compile(r"^[A-Z0-9._-]+$")
 INT_CODE_PATTERN = re.compile(r"^-?\d+$")
 CHAIN_PECOS_PROVIDER_TYPE_CODES = {"12-C1"}
-PUBLIC_ADDRESS_EXCLUDED_COLUMNS = {"address_key", "premise_key"}
+PUBLIC_ADDRESS_EXCLUDED_COLUMNS = {"premise_key"}
 PUBLIC_ADDRESS_SOURCE_DEBUG_COLUMNS = {
     "location_key",
     "entity_type",

@@ -183,7 +183,7 @@ async def test_get_all_returns_rows(monkeypatch):
     assert payload["total"] == 2
     assert payload["rows"][0]["taxonomy_list"]
     assert payload["rows"][0]["do_business_as"] == ['DBA']
-    assert "address_key" not in payload["rows"][0]
+    assert payload["rows"][0]["address_key"] == "addr_address_key"
 
 
 def _build_near_row(npi_value: int) -> list:
@@ -2069,7 +2069,7 @@ async def test_get_npi_v2_archive_geocode_write_uses_deduped_address_key_upsert(
 
 
 @pytest.mark.asyncio
-async def test_get_npi_does_not_expose_internal_address_key(monkeypatch):
+async def test_get_npi_exposes_address_key_and_hides_premise_key(monkeypatch):
     async def fake_build(_npi):
         return {
             'npi': _npi,
@@ -2082,6 +2082,7 @@ async def test_get_npi_does_not_expose_internal_address_key(monkeypatch):
                     'type': 'primary',
                     'checksum': 5,
                     'address_key': '00000000-0000-0000-0000-000000000001',
+                    'premise_key': '00000000-0000-0000-0000-000000000002',
                     'lat': 40.0,
                     'long': -80.0,
                     'formatted_address': 'Town, IL',
@@ -2103,8 +2104,9 @@ async def test_get_npi_does_not_expose_internal_address_key(monkeypatch):
     request = types.SimpleNamespace(args={}, app=FakeApp())
     response = await npi_module.get_npi(request, '1518379601')
     payload = json.loads(response.body)
-    assert 'address_key' not in payload['address_list'][0]
-    assert 'address_key' not in json.dumps(payload)
+    assert payload['address_list'][0]['address_key'] == '00000000-0000-0000-0000-000000000001'
+    assert 'premise_key' not in payload['address_list'][0]
+    assert 'premise_key' not in json.dumps(payload)
 
 
 @pytest.mark.asyncio
@@ -2159,7 +2161,7 @@ async def test_get_npi_debug_flags_include_sources_and_evidence(monkeypatch):
     assert address['address_sources'] == ['npi', 'mrf']
     assert address['source_record_ids'] == ['npi:1518379601', 'mrf:row-1']
     assert address['source_count'] == 2
-    assert 'address_key' not in address
+    assert address['address_key'] == '00000000-0000-0000-0000-000000000001'
     assert 'premise_key' not in address
 
 

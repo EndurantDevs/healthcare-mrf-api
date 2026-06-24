@@ -1318,7 +1318,7 @@ async def test_manifest_location_provider_matches_filters_coordinates_with_unifi
                         "zip5": "91204",
                         "location_source": "entity_address_unified",
                         "location_confidence_code": "entity_address_unified",
-                        "address_payload": '{"lat":34.14024131,"long":-118.255125}',
+                        "address_payload": '{"address_key":"00000000-0000-0000-0000-000000000001","lat":34.14024131,"long":-118.255125}',
                         "taxonomy_codes": [],
                         "specialties": [],
                         "provider_name": "TiC provider",
@@ -1349,9 +1349,12 @@ async def test_manifest_location_provider_matches_filters_coordinates_with_unifi
     assert provider_set_ids == {provider_set_id}
     assert providers_by_set[provider_set_id][0]["npi"] == 1234567890
     assert providers_by_set[provider_set_id][0]["zip5"] == "91204"
+    address = json.loads(providers_by_set[provider_set_id][0]["address_payload"])
+    assert address["address_key"] == "00000000-0000-0000-0000-000000000001"
     sql = str(session.calls[2][0][0])
     params = session.calls[2][0][1]
     assert "FROM mrf.entity_address_unified addr" in sql
+    assert "addr.address_key" in sql
     assert "addr.lat::float8 BETWEEN :geo_min_lat AND :geo_max_lat" in sql
     assert "addr.long::float8 BETWEEN :geo_min_long AND :geo_max_long" in sql
     assert "ll_to_earth" not in sql
@@ -1380,7 +1383,10 @@ async def test_compact_serving_include_providers_expands_without_geo_filter(monk
                         "zip5": "61636",
                         "location_source": "nppes",
                         "location_confidence_code": "nppes_practice_location",
-                        "address_payload": {"line1": "1 Main St"},
+                        "address_payload": {
+                            "address_key": "00000000-0000-0000-0000-000000000002",
+                            "line1": "1 Main St",
+                        },
                         "taxonomy_codes": [],
                         "specialties": [],
                         "provider_name": "Example Provider",
@@ -1420,6 +1426,7 @@ async def test_compact_serving_include_providers_expands_without_geo_filter(monk
     assert item["npi"] == 1234567890
     assert item["provider_name"] == "Example Provider"
     assert item["state"] == "IL"
+    assert item["address"]["address_key"] == "00000000-0000-0000-0000-000000000002"
     assert item["tic_prices"][0]["negotiated_rate"] == 60
     sql = str(session.calls[0][0][0])
     assert "LEFT JOIN LATERAL (" in sql
@@ -1486,6 +1493,7 @@ async def test_compact_serving_provider_expansion_uses_unified_address_table_whe
     assert "FROM mrf.npi_address addr" not in sql
     assert "'entity_address_unified' AS location_source" in sql
     assert "'entity_address_unified' AS location_confidence_code" in sql
+    assert "(to_jsonb(addr.*) - 'premise_key') AS address_payload" in sql
     assert "addr.npi = pgm.npi" in sql
     assert "addr.npi = sp.npi" not in sql
 
@@ -1665,7 +1673,12 @@ async def test_compact_serving_include_providers_with_geo_uses_npi_scoped_locati
                         "zip5": "77030",
                         "location_source": "npi_address",
                         "location_confidence_code": "npi_address",
-                        "address_payload": {"city": "HOUSTON", "state": "TX", "postal_code": "77030"},
+                        "address_payload": {
+                            "address_key": "00000000-0000-0000-0000-000000000003",
+                            "city": "HOUSTON",
+                            "state": "TX",
+                            "postal_code": "77030",
+                        },
                         "taxonomy_codes": ["207Q00000X"],
                         "specialties": ["Family Medicine Physician"],
                         "provider_name": "Example Provider",
@@ -1709,6 +1722,7 @@ async def test_compact_serving_include_providers_with_geo_uses_npi_scoped_locati
 
     assert payload["query"]["result_granularity"] == "provider"
     assert payload["items"][0]["location_source"] == "npi_address"
+    assert payload["items"][0]["address"]["address_key"] == "00000000-0000-0000-0000-000000000003"
     assert payload["items"][0]["specialties"] == ["Family Medicine Physician"]
     sql = str(session.calls[0][0][0])
     params = session.calls[0][0][1]

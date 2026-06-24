@@ -132,6 +132,7 @@ _PTG2_LEGACY_ADDRESS_COLUMNS = {
     "npi",
     "type",
     "checksum",
+    "address_key",
     "state_name",
     "city_name",
     "postal_code",
@@ -859,6 +860,7 @@ async def _ptg2_manifest_enriched_provider_rows_for_npis(
                     'state', addr.state_name,
                     'postal_code', addr.postal_code,
                     'country_code', addr.country_code,
+                    'address_key', addr.address_key::text,
                     'lat', addr.lat,
                     'long', addr.long
                 )::text AS address_payload,
@@ -1083,6 +1085,7 @@ async def _ptg2_manifest_location_provider_matches(
                     addr.city_name,
                     addr.postal_code,
                     addr.country_code,
+                    addr.address_key,
                     addr.lat,
                     addr.long,
                     addr.first_line,
@@ -1116,6 +1119,7 @@ async def _ptg2_manifest_location_provider_matches(
                     'state', addr.state_name,
                     'postal_code', addr.postal_code,
                     'country_code', addr.country_code,
+                    'address_key', addr.address_key::text,
                     'lat', addr.lat,
                     'long', addr.long
                 )::text AS address_payload,
@@ -2054,7 +2058,7 @@ async def _search_compact_serving_table(
             "LEFT(COALESCE(addr.postal_code, ''), 5) AS zip5, "
             f"'{address_location_source}' AS location_source, "
             f"'{address_location_source}' AS location_confidence_code, "
-            "to_jsonb(addr.*) AS address_payload, "
+            "(to_jsonb(addr.*) - 'premise_key') AS address_payload, "
             "COALESCE(tax.taxonomy_codes, ARRAY[]::varchar[]) AS taxonomy_codes, "
             "COALESCE(tax.specialties, ARRAY[]::varchar[]) AS specialties, "
             "NULL::varchar AS provider_name,"

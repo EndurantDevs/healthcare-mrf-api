@@ -250,6 +250,7 @@ async def _build_ptg2_provider_locations(snapshot_id: str) -> None:
                     'city', d.city,
                     'state', d.state,
                     'zip5', NULLIF(LEFT(REGEXP_REPLACE(COALESCE(d.zip_code, ''), '[^0-9]', '', 'g'), 5), ''),
+                    'address_key', NULL,
                     'source', 'doctor_clinician_address'
                 ) AS address_payload
             FROM selected_npis n
@@ -274,6 +275,7 @@ async def _build_ptg2_provider_locations(snapshot_id: str) -> None:
                     'city', e.city_name,
                     'state', e.state_name,
                     'zip5', NULLIF(LEFT(REGEXP_REPLACE(COALESCE(e.postal_code, ''), '[^0-9]', '', 'g'), 5), ''),
+                    'address_key', e.address_key::text,
                     'formatted_address', e.formatted_address,
                     'source', 'entity_address_unified'
                 ) AS address_payload
@@ -300,6 +302,7 @@ async def _build_ptg2_provider_locations(snapshot_id: str) -> None:
                     'city', a.city_name,
                     'state', a.state_name,
                     'zip5', NULLIF(LEFT(REGEXP_REPLACE(COALESCE(a.postal_code, ''), '[^0-9]', '', 'g'), 5), ''),
+                    'address_key', a.address_key::text,
                     'formatted_address', a.formatted_address,
                     'source', 'npi_address'
                 ) AS address_payload
