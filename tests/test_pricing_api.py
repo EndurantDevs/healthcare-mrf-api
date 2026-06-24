@@ -1596,13 +1596,16 @@ async def test_list_providers_by_procedure_routes_plan_filter_to_ptg2(monkeypatc
         [FakeResult(scalar=1)],
         args={
             "plan_id": "010854205",
-            "plan_market_type": "group",
+            "market_type": "group",
             "source_key": "heartland_dental",
             "code": "70551",
             "limit": "10",
             "include_providers": "true",
             "include_code_details": "true",
             "include_sources": "true",
+            "classification": "Internal Medicine",
+            "taxonomy_codes": "207R00000X",
+            "include_subspecialties": "false",
             "lat": "29.7604",
             "long": "-95.3698",
             "radius_miles": "10",
@@ -1620,6 +1623,9 @@ async def test_list_providers_by_procedure_routes_plan_filter_to_ptg2(monkeypatc
     assert seen_args["include_code_details"] == "true"
     assert seen_args["include_sources"] == "true"
     assert seen_args["include_details"] is None
+    assert seen_args["classification"] == "Internal Medicine"
+    assert seen_args["taxonomy_codes"] == "207R00000X"
+    assert seen_args["include_subspecialties"] == "false"
     assert seen_args["lat"] == 29.7604
     assert seen_args["long"] == -95.3698
     assert seen_args["radius_miles"] == 10.0

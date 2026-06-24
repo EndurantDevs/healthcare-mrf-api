@@ -4715,7 +4715,7 @@ async def list_provider_procedures(request, npi: str):
     include_legacy_fields = _parse_bool(args.get("include_legacy_fields"), "include_legacy_fields", default=False)
     plan_id = str(args.get("plan_id", "")).strip()
     plan_external_id = str(args.get("plan_external_id", "")).strip()
-    plan_market_type = str(args.get("plan_market_type", "")).strip().lower()
+    plan_market_type = str(args.get("plan_market_type") or args.get("market_type") or "").strip().lower()
     source_key = str(args.get("source_key", "")).strip().lower()
     snapshot_id = str(args.get("snapshot_id", "")).strip()
     mode = str(args.get("mode", "")).strip()
@@ -6642,7 +6642,7 @@ async def list_providers_by_procedure(request):
     internal_codes: list[int] = []
     plan_id = str(args.get("plan_id", "")).strip()
     plan_external_id = str(args.get("plan_external_id", "")).strip()
-    plan_market_type = str(args.get("plan_market_type", "")).strip().lower()
+    plan_market_type = str(args.get("plan_market_type") or args.get("market_type") or "").strip().lower()
     source_key = str(args.get("source_key", "")).strip().lower()
     snapshot_id = str(args.get("snapshot_id", "")).strip()
     mode = str(args.get("mode", "")).strip()
@@ -6672,6 +6672,9 @@ async def list_providers_by_procedure(request):
                 "code_system": args.get("code_system") or None,
                 "q": q or None,
                 "specialty": specialty or None,
+                "classification": args.get("classification") or None,
+                "taxonomy_codes": args.get("taxonomy_codes") or args.get("taxonomy_code") or None,
+                "include_subspecialties": args.get("include_subspecialties") or None,
                 "taxonomy_code": args.get("taxonomy_code") or None,
                 "taxonomy_classification": args.get("taxonomy_classification") or None,
                 "taxonomy_specialization": args.get("taxonomy_specialization") or None,
