@@ -2163,12 +2163,22 @@ def _prepare_raw_stage_sql(db_schema: str, raw_table: str, *, unlogged: bool = T
     """
 
 
-def _address_key_expr(db_schema: str, available: bool, *, address_source: str | None = None) -> str:
+def _address_key_expr(
+    db_schema: str,
+    available: bool,
+    *,
+    address_source: str | None = None,
+    table_alias: str | None = None,
+) -> str:
+    def col(name: str) -> str:
+        return f"{table_alias}.{name}" if table_alias else name
+
     if available:
         # Intentional in-DB fallback: this expression runs inside SQL materialization pipelines.
         fallback = (
             f"{db_schema}.addr_key_v1("
-            "first_line, second_line, city_name, state_name, postal_code, country_code"
+            f"{col('first_line')}, {col('second_line')}, {col('city_name')}, "
+            f"{col('state_name')}, {col('postal_code')}, {col('country_code')}"
             ")"
         )
     else:
@@ -2183,11 +2193,13 @@ def _enrich_raw_stage_sql(
     raw_table: str,
     *,
     archive_available: bool = True,
+    address_canon_available: bool = True,
     checksum_min: int | None = None,
     checksum_max: int | None = None,
 ) -> str:
     archive_join = ""
     archive_fields = (
+        "a.address_key AS archive_address_key, "
         "a.premise_key, "
         "'v' || COALESCE(a.identity_version, 2)::text AS archive_identity_version, "
         "COALESCE(a.precision, 'unknown') AS address_precision, "
@@ -2201,12 +2213,28 @@ def _enrich_raw_stage_sql(
         "a.place_id::varchar AS archive_place_id"
     )
     if archive_available:
+        computed_address_key = _address_key_expr(
+            db_schema,
+            address_canon_available,
+            address_source="r.address_source",
+            table_alias="r",
+        )
         archive_join = (
-            f"LEFT JOIN {db_schema}.address_archive_v2 a "
-            "ON a.address_key = r.address_key AND a.merged_into IS NULL"
+            f"""
+          LEFT JOIN LATERAL (
+              SELECT aa.*
+                FROM (VALUES ({computed_address_key}, 0), (r.address_key, 1)) AS candidate(address_key, priority)
+                JOIN {db_schema}.address_archive_v2 aa
+                  ON aa.address_key = candidate.address_key
+                 AND aa.merged_into IS NULL
+               WHERE candidate.address_key IS NOT NULL
+            ORDER BY candidate.priority
+               LIMIT 1
+          ) a ON TRUE"""
         )
     else:
         archive_fields = (
+            "NULL::uuid AS archive_address_key, "
             "NULL::uuid AS premise_key, "
             f"'{ARCHIVE_IDENTITY_VERSION}'::varchar AS archive_identity_version, "
             "CASE WHEN r.address_key IS NULL THEN 'unknown' ELSE 'street' END::varchar AS address_precision, "
@@ -2226,6 +2254,7 @@ def _enrich_raw_stage_sql(
     WITH enriched AS (
         SELECT
             r.ctid AS row_id,
+            r.address_key AS source_address_key,
             {archive_fields},
             NULLIF(LEFT(REGEXP_REPLACE(COALESCE(r.postal_code, ''), '[^0-9]', '', 'g'), 5), '')::varchar AS source_zip5,
             NULLIF(upper(left(BTRIM(COALESCE(r.state_name, '')), 2)), '')::varchar AS source_state_code,
@@ -2240,6 +2269,7 @@ def _enrich_raw_stage_sql(
     keyed AS (
         SELECT
             row_id,
+            {"archive_address_key" if archive_available else "source_address_key"} AS address_key,
             premise_key,
             archive_identity_version,
             address_precision,
@@ -2266,7 +2296,8 @@ def _enrich_raw_stage_sql(
           FROM enriched
     )
     UPDATE {db_schema}.{raw_table} r
-       SET premise_key = k.premise_key,
+       SET address_key = k.address_key,
+           premise_key = k.premise_key,
            archive_identity_version = k.archive_identity_version,
            address_precision = k.address_precision,
            zip5 = k.zip5,
@@ -2296,7 +2327,7 @@ def _enrich_raw_stage_sql(
                inferred_npi='r.inferred_npi',
                address_role_id='k.address_role_id',
                row_origin='k.row_origin',
-               address_key='r.address_key',
+               address_key='k.address_key',
                source_id='k.source_id',
                source_record_id='r.source_record_id',
                zip5='k.zip5',
@@ -2679,10 +2710,7 @@ def _insert_raw_from_source_sql(
             address_source::varchar AS address_source,
             source_record_id::varchar AS source_record_id,
             updated_at::timestamp AS updated_at,
-            COALESCE(
-                {_address_key_expr(db_schema, address_canon_available, address_source="address_source")},
-                address_key::uuid
-            ) AS address_key
+            address_key::uuid AS address_key
           FROM base_rows
     ),
     normalized AS (
@@ -3068,10 +3096,7 @@ def _materialize_sql(
             address_source::varchar AS address_source,
             source_record_id::varchar AS source_record_id,
             updated_at::timestamp AS updated_at,
-            COALESCE(
-                {_address_key_expr(db_schema, address_canon_available, address_source="address_source")},
-                address_key::uuid
-            ) AS address_key
+            address_key::uuid AS address_key
           FROM base_rows
     ),
     normalized AS (
@@ -7497,6 +7522,7 @@ async def process_data(ctx, task=None):
                                 db_schema,
                                 raw_table,
                                 archive_available=available.get("address_archive_v2", False),
+                                address_canon_available=address_canon_available,
                                 checksum_min=checksum_min,
                                 checksum_max=checksum_max,
                             ),
@@ -7530,6 +7556,7 @@ async def process_data(ctx, task=None):
                         db_schema,
                         raw_table,
                         archive_available=available.get("address_archive_v2", False),
+                        address_canon_available=address_canon_available,
                     ),
                     context=context,
                     run_id=run_id,

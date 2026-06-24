@@ -1344,19 +1344,18 @@ def test_entity_address_unified_sql_carries_address_key(monkeypatch):
     assert "location_key varchar(64)" in raw_sql
     assert "archive_identity_version varchar(16)" in raw_sql
     assert "ptg_plan_array varchar[]" in raw_sql
-    assert "JOIN mrf.address_archive_v2 a" in enrich_sql
-    assert "SET premise_key = k.premise_key" in enrich_sql
+    assert "LEFT JOIN LATERAL" in enrich_sql
+    assert "mrf.addr_key_v1(r.first_line, r.second_line, r.city_name, r.state_name, r.postal_code, r.country_code)" in enrich_sql
+    assert "JOIN mrf.address_archive_v2 aa" in enrich_sql
+    assert "ORDER BY candidate.priority" in enrich_sql
+    assert "SET address_key = k.address_key" in enrich_sql
+    assert "premise_key = k.premise_key" in enrich_sql
     assert "formatted_address = COALESCE(k.archive_formatted_address, r.formatted_address)" in enrich_sql
     assert "lat = COALESCE(k.archive_lat, r.lat)" in enrich_sql
     assert "long = COALESCE(k.archive_long, r.long)" in enrich_sql
     assert "place_id = COALESCE(k.archive_place_id, r.place_id)" in enrich_sql
     assert "location_key = encode(sha256(convert_to" in enrich_sql
-    assert "COALESCE(" in insert_sql
-    assert (
-        "CASE WHEN address_source = 'ptg' THEN NULL::uuid ELSE "
-        "mrf.addr_key_v1(first_line, second_line, city_name, state_name, postal_code, country_code) END,\n"
-        "                address_key::uuid"
-    ) in insert_sql
+    assert "address_key::uuid AS address_key" in insert_sql
     assert "ptg_plan_array," in insert_sql
     assert "COALESCE(ptg_plan_array, ARRAY[]::varchar[])::varchar[] AS ptg_plan_array" in insert_sql
     assert "ptg_address_version," in insert_sql
@@ -2760,14 +2759,8 @@ def test_entity_address_unified_sql_falls_back_without_canonical_functions():
         address_canon_available=False,
     )
 
-    assert (
-        "CASE WHEN address_source = 'ptg' THEN NULL::uuid ELSE NULL::uuid END,\n"
-        "                address_key::uuid"
-    ) in insert_sql
-    assert (
-        "CASE WHEN address_source = 'ptg' THEN NULL::uuid ELSE NULL::uuid END,\n"
-        "                address_key::uuid"
-    ) in direct_sql
+    assert "address_key::uuid AS address_key" in insert_sql
+    assert "address_key::uuid AS address_key" in direct_sql
     assert "addr_key_v1" not in insert_sql
     assert "addr_key_v1" not in direct_sql
     assert "ARRAY_AGG(lat ORDER BY (lat IS NULL), source_priority ASC" in direct_sql
