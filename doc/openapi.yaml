@@ -2020,6 +2020,12 @@ paths:
             type: string
             minLength: 2
             maxLength: 2
+        - name: address_key
+          in: query
+          schema:
+            type: string
+            format: uuid
+          description: Canonical provider address UUID filter for unified-address searches
         - name: zip_code
           in: query
           schema:
@@ -2324,6 +2330,11 @@ paths:
           schema:
             type: boolean
           description: Include detailed address evidence arrays and record identifiers for debugging
+        - name: extra_info
+          in: query
+          schema:
+            type: boolean
+          description: Include extended NPI profile fields that are omitted from the compact response
         - name: debug
           in: query
           schema:
