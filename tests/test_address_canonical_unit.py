@@ -2110,7 +2110,7 @@ def test_entity_address_unified_indexes_cover_primary_serving_queries():
         "where": "type='primary'",
     }
     assert indexes["geo_idx"]["where"] == (
-        "type IN ('primary', 'secondary') AND COALESCE(address_precision, '') <> 'city_zip'"
+        "type IN ('primary', 'secondary', 'practice', 'site') AND COALESCE(address_precision, '') <> 'city_zip'"
     )
 
 
