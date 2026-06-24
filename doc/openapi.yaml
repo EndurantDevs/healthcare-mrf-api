@@ -2340,6 +2340,17 @@ paths:
           schema:
             type: boolean
           description: Convenience flag equivalent to include_sources=true and include_evidence=true
+        - name: address_limit
+          in: query
+          schema:
+            type: string
+          description: Maximum address_list rows to return; use all, 0, or -1 to return all addresses
+        - name: address_offset
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+          description: Zero-based address_list offset used with address_limit
       responses:
         '200':
           description: NPI detail payload
