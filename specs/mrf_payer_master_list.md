@@ -326,6 +326,7 @@ Last one-time research refresh: 2026-06-05.
 | Allied Benefit Systems | tpa | https://alliedbenefit.sapphiremrfhub.com/ | curated source row |
 | Allied Benefit Systems | tpa | https://www.alliedbenefit.com/transparency-in-coverage-mrf | public transparency URL |
 | AmeriBen | tpa | https://github.com/AmeriBen/MRF | curated source row |
+| Auxiant | tpa | https://transparency.auxiant.com/directory-of-data-sources/ | public WordPress data source directory; resolver expands data-available network pages |
 | Benefits and Risk Management Services | tpa | - | needs official source URL |
 | BRMS | tpa | https://www.brmsonline.com/solutions/compliance-administration | curated source row |
 | Collective Health | tpa | https://transparency-in-coverage.collectivehealth.com/ | public transparency URL |

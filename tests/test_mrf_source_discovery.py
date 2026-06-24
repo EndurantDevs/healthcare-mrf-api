@@ -20,6 +20,7 @@ def test_source_urls_are_loaded_from_registry_file():
     assert config["platform_resolvers"]["healthsparq"]["type"] == "healthsparq_public_mrf"
     assert config["platform_resolvers"]["highmark_hmhs"]["type"] == "highmark_hmhs_script"
     assert config["platform_resolvers"]["sapphire"]["type"] == "sapphire_html_tocs"
+    assert config["platform_resolvers"]["auxiant_wordpress"]["type"] == "auxiant_wordpress_directory"
     assert config["platform_resolvers"]["mymedicalshopper_talon"]["type"] == "mymedicalshopper_talon_mrf"
     assert config["platform_resolvers"]["uhc_public_blobs"]["type"] == "uhc_blob_listing"
     assert config["platform_resolvers"]["bcbsma_monthly_tocs"]["type"] == "bcbsma_monthly_tocs"
@@ -212,11 +213,143 @@ def test_classify_hosting_platforms():
     assert discovery.classify_hosting_platform("https://www.bcbsil.com/asomrf?EIN=260241222") == "bcbs_asomrf"
     assert discovery.classify_hosting_platform("https://transparency-in-coverage.bluecrossma.com/") == "bcbsma_monthly_tocs"
     assert discovery.classify_hosting_platform("https://www.cigna.com/legal/compliance/machine-readable-files") == "cigna_static_mrf_lookup"
+    assert discovery.classify_hosting_platform("https://transparency.auxiant.com/directory-of-data-sources/") == "auxiant_wordpress"
+    assert discovery.classify_hosting_platform("https://transparency.auxiant.com/healthsmart/") == "auxiant_wordpress"
     assert discovery.classify_hosting_platform("https://www.mymedicalshopper.com/mrf-search/varipro") == "mymedicalshopper_talon"
     assert (
         discovery.classify_hosting_platform("https://www.mymedicalshopper.com/mrf/electrical-workers-cofinity-varipro-77100")
         == "mymedicalshopper_talon"
     )
+
+
+def test_auxiant_directory_parser_extracts_data_available_networks():
+    html = """
+    <div class="entry-content">
+      <p>
+        <a href="https://transparency.auxiant.com/aetna/">*Aetna</a><br>
+        <a href="https://transparency.auxiant.com/implementation-in-process/">CHA Health</a><br>
+        <a href="https://transparency.auxiant.com/healthsmart/">*HealthSmart</a>
+        <a href="https://transparency.auxiant.com/first-choice-health/">First Choice Health</a><br>
+        <a href="https://transparency.auxiant.com/first-choice-health/">*First Choice Health</a>
+      </p>
+    </div><!-- .entry-content -->
+    """
+
+    networks = discovery._parse_auxiant_directory_networks(
+        html,
+        base_url="https://transparency.auxiant.com/directory-of-data-sources/",
+    )
+
+    assert networks == [
+        {"url": "https://transparency.auxiant.com/aetna/", "label": "Aetna", "data_available": True},
+        {"url": "https://transparency.auxiant.com/healthsmart/", "label": "HealthSmart", "data_available": True},
+        {"url": "https://transparency.auxiant.com/first-choice-health/", "label": "First Choice Health", "data_available": True},
+    ]
+
+
+def test_auxiant_page_link_parser_extracts_external_and_direct_files():
+    html = """
+    <div class="entry-content">
+      <p><a href="https://health1.aetna.com/app/public/#/one/insurerCode=AETNACVS_I&amp;brandCode=ASA/machine-readable-transparency-in-coverage">Aetna hosted files</a></p>
+      <table>
+        <tr><td><a href="https://s3.us-east-2.amazonaws.com/transparency.auxiant.com/healthsmart/2022-07-01_HealthSmart-Payors-Organization_in-network-rates.json.zip">HealthSmart ZIP</a></td></tr>
+        <tr><td><a href="https://transparency.auxiant.com/wp-admin/admin-ajax.php?action=mk_file_folder_manager&amp;cmd=file&amp;target=fls2_Rmlyc3RDaG9pY2VIZWFsdGgvMjAyNjAxMDItcHJvdmlkZXJzMjAyNjAxMDJmY3BuLnppcA">20260102-providers20260102fcpn.zip</a></td></tr>
+        <tr><td><a href="https://s3.us-east-2.amazonaws.com/transparency.auxiant.com/Trilogy/2022-08-01_Trilogy_in-network_rates.7z">Trilogy 7z</a></td></tr>
+        <tr><td><a href="https://s3.us-east-2.amazonaws.com/transparency.auxiant.com/zelis/OON/Auxiant+OON+MRF+v1+062722.csv">Auxiant OON MRF v1 062722.csv</a></td></tr>
+      </table>
+      <p><a href="https://transparency.auxiant.com/directory-of-data-sources/">Return to list of networks...</a></p>
+    </div><!-- .entry-content -->
+    """
+
+    links = discovery._parse_auxiant_page_links(html, base_url="https://transparency.auxiant.com/healthsmart/")
+
+    assert links == [
+        {
+            "url": "https://health1.aetna.com/app/public/#/one/insurerCode=AETNACVS_I&brandCode=ASA/machine-readable-transparency-in-coverage",
+            "label": "Aetna hosted files",
+            "target_kind": "external_landing",
+            "hosting_platform": "aetna_health1",
+        },
+        {
+            "url": "https://s3.us-east-2.amazonaws.com/transparency.auxiant.com/healthsmart/2022-07-01_HealthSmart-Payors-Organization_in-network-rates.json.zip",
+            "label": "HealthSmart ZIP",
+            "target_kind": "file_reference",
+            "target_file_type": "in-network",
+            "container_format": "zip",
+        },
+        {
+            "url": "https://transparency.auxiant.com/wp-admin/admin-ajax.php?action=mk_file_folder_manager&cmd=file&target=fls2_Rmlyc3RDaG9pY2VIZWFsdGgvMjAyNjAxMDItcHJvdmlkZXJzMjAyNjAxMDJmY3BuLnppcA",
+            "label": "20260102-providers20260102fcpn.zip",
+            "target_kind": "file_reference",
+            "target_file_type": "in-network",
+            "container_format": "zip",
+        },
+        {
+            "url": "https://s3.us-east-2.amazonaws.com/transparency.auxiant.com/Trilogy/2022-08-01_Trilogy_in-network_rates.7z",
+            "label": "Trilogy 7z",
+            "target_kind": "file_reference",
+            "target_file_type": "in-network",
+            "container_format": "7z",
+        },
+        {
+            "url": "https://s3.us-east-2.amazonaws.com/transparency.auxiant.com/zelis/OON/Auxiant+OON+MRF+v1+062722.csv",
+            "label": "Auxiant OON MRF v1 062722.csv",
+            "target_kind": "file_reference",
+            "target_file_type": "allowed-amounts",
+            "container_format": None,
+        },
+    ]
+    assert discovery._auxiant_file_type("https://example.com/MPI_HST_allowedamounts_20220901.zip") == "allowed-amounts"
+
+
+def test_auxiant_direct_target_keeps_network_context_searchable():
+    source = {"source_id": "source_auxiant", "payer_id": "payer_auxiant"}
+    link = {
+        "url": "https://s3.us-east-2.amazonaws.com/transparency.auxiant.com/FirstChoiceHealth/20250707-innrfppog07072025.zip",
+        "label": "20250707-innrfppog07072025.zip",
+        "target_file_type": "in-network",
+        "container_format": "zip",
+    }
+
+    target = discovery._auxiant_direct_target(
+        source,
+        link,
+        network_name="First Choice Health",
+        page_url="https://transparency.auxiant.com/first-choice-health/",
+        directory_url="https://transparency.auxiant.com/directory-of-data-sources/",
+        resolver_type="auxiant_wordpress_directory",
+    )
+
+    assert target.label == "Auxiant - First Choice Health"
+    assert target.resolved_from_url == "https://transparency.auxiant.com/first-choice-health/"
+    assert target.metadata["resolver"] == "auxiant_wordpress_directory"
+    assert target.metadata["target_kind"] == "file_reference"
+    assert target.metadata["auxiant_network_name"] == "First Choice Health"
+    assert target.metadata["file_label"] == "20250707-innrfppog07072025.zip"
+
+
+def test_auxiant_landing_target_indexes_unresolved_network_pages():
+    source = {"source_id": "source_auxiant", "payer_id": "payer_auxiant"}
+
+    target = discovery._auxiant_landing_target(
+        source,
+        network_name="HealthLink",
+        page_url="https://transparency.auxiant.com/healthlink/",
+        directory_url="https://transparency.auxiant.com/directory-of-data-sources/",
+        landing_url="https://www.healthlink.com/machine-readable-file/search/",
+        resolver_type="auxiant_wordpress_directory",
+        reason="external_landing_no_concrete_targets",
+        landing_label="HealthLink hosted files",
+        nested_error="no links found",
+    )
+
+    assert target.label == "Auxiant - HealthLink"
+    assert target.url == "https://www.healthlink.com/machine-readable-file/search/"
+    assert target.metadata["target_kind"] == "source_landing_page"
+    assert target.metadata["target_file_type"] == "source-landing-page"
+    assert target.metadata["auxiant_network_name"] == "HealthLink"
+    assert target.metadata["landing_reason"] == "external_landing_no_concrete_targets"
+    assert target.metadata["nested_error"] == "no links found"
 
 
 def test_mymedicalshopper_url_helpers_and_employer_selector():

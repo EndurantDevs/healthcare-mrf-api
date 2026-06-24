@@ -36,6 +36,13 @@
       "type": "sapphire_html_tocs",
       "max_bytes": 5242880
     },
+    "auxiant_wordpress": {
+      "type": "auxiant_wordpress_directory",
+      "directory_path": "/directory-of-data-sources/",
+      "data_available_only": true,
+      "max_bytes": 5242880,
+      "page_max_bytes": 10485760
+    },
     "mymedicalshopper_talon": {
       "type": "mymedicalshopper_talon_mrf",
       "page_size": 100,

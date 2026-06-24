@@ -312,6 +312,8 @@ def _container_format(url: str | None) -> str | None:
     path = urlsplit(str(url or "")).path.lower()
     if path.endswith(".zip"):
         return "zip"
+    if path.endswith(".7z"):
+        return "7z"
     if path.endswith((".json.gz", ".gz")):
         return "gzip"
     return None
@@ -319,9 +321,10 @@ def _container_format(url: str | None) -> str | None:
 
 def _mrf_file_type_from_text(url: str | None, label: str | None = None) -> str | None:
     text = f"{url or ''} {label or ''}".lower().replace("_", "-")
-    if "allowed-amount" in text or "allowed amount" in text:
+    compact = re.sub(r"[^a-z0-9]+", "", text)
+    if "allowed-amount" in text or "allowed amount" in text or "allowedamount" in compact:
         return "allowed-amounts"
-    if "in-network" in text or "in network" in text or "negotiated-rate" in text:
+    if "in-network" in text or "in network" in text or "innetwork" in compact or "negotiated-rate" in text:
         return "in-network"
     if "payer-drug" in text or "prescription-drug" in text or "drug-file" in text:
         return "payer-drug"
@@ -343,6 +346,8 @@ def classify_hosting_platform(url: str | None) -> str | None:
     host = _domain(url) or ""
     raw = str(url or "").lower()
     path = urlsplit(str(url or "")).path.lower()
+    if host == "transparency.auxiant.com" and not path.startswith(("/wp-admin/", "/wp-content/", "/wp-includes/")):
+        return "auxiant_wordpress"
     if host in {"www.mymedicalshopper.com", "mymedicalshopper.com"} and path.startswith(("/mrf-search/", "/mrf/")):
         return "mymedicalshopper_talon"
     if host in {"transparency-in-coverage.uhc.com", "transparency-in-coverage.optum.com"}:
@@ -1005,7 +1010,7 @@ def _metadata_text_file_type(value: Any) -> str:
 
 def _looks_direct_mrf_body_url(url: str | None) -> bool:
     path = urlsplit(str(url or "")).path.lower()
-    if not path.endswith((".json", ".json.gz", ".zip")):
+    if not path.endswith((".json", ".json.gz", ".zip", ".7z", ".csv")):
         return False
     if re.search(r"(^|[_/-])index\.json(?:\.gz)?$", path):
         return False
@@ -1570,6 +1575,362 @@ async def _resolve_mymedicalshopper_talon_mrf(
         return targets
     finally:
         await ws.close()
+
+
+def _wordpress_entry_content(html_text: str) -> str:
+    match = re.search(
+        r"""<div\b[^>]*class=(?P<quote>["'])(?=[^"']*\bentry-content\b)[^"']*(?P=quote)[^>]*>(?P<content>.*?)</div>\s*<!--\s*\.entry-content\s*-->""",
+        html_text or "",
+        flags=re.I | re.S,
+    )
+    return match.group("content") if match else (html_text or "")
+
+
+def _auxiant_directory_url(url: str, resolver: dict[str, Any]) -> str:
+    path = str(resolver.get("directory_path") or "/directory-of-data-sources/").strip() or "/directory-of-data-sources/"
+    return urljoin(_url_origin(url) + "/", path.lstrip("/"))
+
+
+def _auxiant_network_label(label: Any) -> str:
+    return _clean_text(str(label or "").lstrip("*"))
+
+
+def _auxiant_anchor_links(html_text: str, *, base_url: str) -> list[dict[str, str]]:
+    links: list[dict[str, str]] = []
+    for match in re.finditer(r"<a\b(?P<attrs>[^>]*)>(?P<label>.*?)</a>", html_text or "", flags=re.I | re.S):
+        href_match = re.search(
+            r"""href\s*=\s*(?P<quote>["'])(?P<value>.*?)(?P=quote)""",
+            match.group("attrs") or "",
+            flags=re.I | re.S,
+        )
+        if not href_match:
+            continue
+        raw = html.unescape(str(href_match.group("value") or "")).strip()
+        if not raw or raw.lower().startswith(("javascript:", "mailto:", "tel:", "#")):
+            continue
+        label = html.unescape(re.sub(r"<[^>]+>", " ", match.group("label") or "")).replace("\xa0", " ")
+        label = re.sub(r"\s+", " ", label).strip()
+        links.append({"url": urljoin(base_url, raw), "label": label})
+    return links
+
+
+def _parse_auxiant_directory_networks(
+    html_text: str,
+    *,
+    base_url: str,
+    data_available_only: bool = True,
+) -> list[dict[str, Any]]:
+    content = _wordpress_entry_content(html_text)
+    base_host = _domain(base_url)
+    networks: dict[str, dict[str, Any]] = {}
+    for candidate in _auxiant_anchor_links(content, base_url=base_url):
+        raw_label = str(candidate.get("label") or "").strip()
+        if not raw_label:
+            continue
+        data_available = raw_label.startswith("*")
+        if data_available_only and not data_available:
+            continue
+        url = str(candidate.get("url") or "").strip()
+        if _domain(url) != base_host:
+            continue
+        path = urlsplit(url).path.rstrip("/") + "/"
+        if path in {"/", "/directory-of-data-sources/", "/implementation-in-process/"}:
+            continue
+        if path.startswith(("/wp-", "/index/")):
+            continue
+        label = _auxiant_network_label(raw_label)
+        if not label:
+            continue
+        key = _canonical_or_none(url) or url
+        previous = networks.get(key)
+        if previous and previous.get("data_available"):
+            continue
+        networks[key] = {"url": url, "label": label, "data_available": data_available}
+    return list(networks.values())
+
+
+def _auxiant_download_extension(url: str | None, label: str | None = None) -> str | None:
+    parsed = urlsplit(str(url or ""))
+    text = f"{parsed.path} {parsed.query} {label or ''}".lower()
+    for extension in (".json.gz", ".json.zip", ".zip", ".7z", ".json", ".csv", ".gz"):
+        if extension in text:
+            return extension
+    return None
+
+
+def _auxiant_container_format(url: str | None, label: str | None = None) -> str | None:
+    detected = _container_format(url)
+    if detected:
+        return detected
+    extension = _auxiant_download_extension(url, label)
+    if extension in {".zip", ".json.zip"}:
+        return "zip"
+    if extension == ".7z":
+        return "7z"
+    if extension in {".json.gz", ".gz"}:
+        return "gzip"
+    return None
+
+
+def _auxiant_is_download_link(url: str | None, label: str | None = None) -> bool:
+    if not _auxiant_download_extension(url, label):
+        return False
+    parsed = urlsplit(str(url or ""))
+    path = parsed.path.lower()
+    if path.startswith(("/wp-content/", "/wp-includes/")):
+        return False
+    if path.startswith("/wp-admin/admin-ajax.php"):
+        query = {key.lower(): value for key, value in parse_qsl(parsed.query, keep_blank_values=True)}
+        return query.get("cmd") == "file"
+    return True
+
+
+def _auxiant_file_type(url: str | None, label: str | None = None) -> str:
+    text = f"{url or ''} {label or ''}".lower().replace("_", "-")
+    if any(token in text for token in ("allowed-amount", "allowed amount", "out-of-network", "out of network", "/oon/", " oon ", "oon-mrf")):
+        return "allowed-amounts"
+    if any(token in text for token in ("payer-drug", "prescription-drug", "pharmacy", " rx ", "/rx/")):
+        return "payer-drug"
+    return _mrf_file_type_from_text(url, label) or "in-network"
+
+
+def _parse_auxiant_page_links(html_text: str, *, base_url: str) -> list[dict[str, Any]]:
+    content = _wordpress_entry_content(html_text)
+    base_host = _domain(base_url)
+    links: dict[tuple[str, str], dict[str, Any]] = {}
+    for candidate in _html_link_candidates(content, base_url=base_url):
+        if candidate.get("attr") != "href":
+            continue
+        url = str(candidate.get("url") or "").strip()
+        if not url:
+            continue
+        label = _clean_text(candidate.get("label")) or Path(urlsplit(url).path).name or "MRF file"
+        if "return to list" in label.lower():
+            continue
+        parsed = urlsplit(url)
+        if _auxiant_is_download_link(url, label):
+            key = ("file_reference", _canonical_or_none(url) or url)
+            links[key] = {
+                "url": url,
+                "label": label,
+                "target_kind": "file_reference",
+                "target_file_type": _auxiant_file_type(url, label),
+                "container_format": _auxiant_container_format(url, label),
+            }
+            continue
+        if parsed.scheme in {"http", "https"} and _domain(url) != base_host:
+            key = ("external_landing", _canonical_or_none(url) or url)
+            links[key] = {
+                "url": url,
+                "label": label,
+                "target_kind": "external_landing",
+                "hosting_platform": classify_hosting_platform(url),
+            }
+    return list(links.values())
+
+
+def _auxiant_display_label(network_name: str) -> str:
+    return f"Auxiant - {network_name}" if network_name else "Auxiant"
+
+
+def _auxiant_direct_target(
+    source: dict[str, Any],
+    link: dict[str, Any],
+    *,
+    network_name: str,
+    page_url: str,
+    directory_url: str,
+    resolver_type: str,
+) -> CrawlTarget:
+    return CrawlTarget(
+        source=source,
+        url=str(link["url"]),
+        label=_auxiant_display_label(network_name),
+        resolved_from_url=page_url,
+        metadata={
+            "resolver": resolver_type,
+            "target_kind": "file_reference",
+            "target_file_type": link.get("target_file_type"),
+            "container_format": link.get("container_format"),
+            "auxiant_network_name": network_name,
+            "auxiant_network_url": page_url,
+            "auxiant_directory_url": directory_url,
+            "file_label": link.get("label"),
+        },
+    )
+
+
+def _auxiant_landing_target(
+    source: dict[str, Any],
+    *,
+    network_name: str,
+    page_url: str,
+    directory_url: str,
+    landing_url: str,
+    resolver_type: str,
+    reason: str,
+    landing_label: str | None = None,
+    nested_error: str | None = None,
+) -> CrawlTarget:
+    return CrawlTarget(
+        source=source,
+        url=landing_url,
+        label=_auxiant_display_label(network_name),
+        resolved_from_url=page_url,
+        metadata={
+            "resolver": resolver_type,
+            "target_kind": "source_landing_page",
+            "target_file_type": "source-landing-page",
+            "auxiant_network_name": network_name,
+            "auxiant_network_url": page_url,
+            "auxiant_directory_url": directory_url,
+            "external_source_url": landing_url if landing_url != page_url else None,
+            "external_hosting_platform": classify_hosting_platform(landing_url),
+            "landing_label": landing_label,
+            "landing_reason": reason,
+            "nested_error": _truncate_text(nested_error, 500),
+        },
+    )
+
+
+def _auxiant_annotated_target(
+    target: CrawlTarget,
+    *,
+    source: dict[str, Any],
+    network_name: str,
+    page_url: str,
+    directory_url: str,
+    external_url: str,
+    resolver_type: str,
+) -> CrawlTarget:
+    metadata = dict(target.metadata or {})
+    nested_resolver = metadata.get("resolver")
+    metadata.update(
+        {
+            "resolver": resolver_type,
+            "nested_resolver": nested_resolver,
+            "auxiant_network_name": network_name,
+            "auxiant_network_url": page_url,
+            "auxiant_directory_url": directory_url,
+            "external_source_url": external_url,
+            "external_hosting_platform": classify_hosting_platform(external_url),
+            "nested_target_label": target.label,
+        }
+    )
+    return CrawlTarget(
+        source=source,
+        url=target.url,
+        label=_auxiant_display_label(network_name),
+        resolved_from_url=target.resolved_from_url or external_url,
+        metadata=metadata,
+    )
+
+
+async def _resolve_auxiant_wordpress_directory(
+    source: dict[str, Any],
+    url: str,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    resolver_type = str(resolver.get("type") or "auxiant_wordpress_directory")
+    directory_url = _auxiant_directory_url(url, resolver)
+    directory_html = await _fetch_text(directory_url, max_bytes=int(resolver.get("max_bytes") or 5 * 1024 * 1024), session=session)
+    networks = _parse_auxiant_directory_networks(
+        directory_html,
+        base_url=directory_url,
+        data_available_only=bool(resolver.get("data_available_only", True)),
+    )
+    max_networks = _as_int(resolver.get("max_networks"))
+    if max_networks:
+        networks = networks[:max_networks]
+
+    targets: list[CrawlTarget] = []
+    for link in _parse_auxiant_page_links(directory_html, base_url=directory_url):
+        if link.get("target_kind") == "file_reference":
+            targets.append(
+                _auxiant_direct_target(
+                    source,
+                    link,
+                    network_name="Historical Out of Network Allowed Amounts",
+                    page_url=directory_url,
+                    directory_url=directory_url,
+                    resolver_type=resolver_type,
+                )
+            )
+
+    for network in networks:
+        page_url = str(network["url"])
+        network_name = str(network["label"])
+        page_html = await _fetch_text(page_url, max_bytes=int(resolver.get("page_max_bytes") or 10 * 1024 * 1024), session=session)
+        page_links = _parse_auxiant_page_links(page_html, base_url=page_url)
+        for link in page_links:
+            if link.get("target_kind") == "file_reference":
+                targets.append(
+                    _auxiant_direct_target(
+                        source,
+                        link,
+                        network_name=network_name,
+                        page_url=page_url,
+                        directory_url=directory_url,
+                        resolver_type=resolver_type,
+                    )
+                )
+                continue
+            external_url = str(link.get("url") or "").strip()
+            if not external_url:
+                continue
+            nested_platform = classify_hosting_platform(external_url)
+            nested_source = {**source, "hosting_platform": nested_platform}
+            nested_error: str | None = None
+            try:
+                nested_targets = await _crawl_targets_for_source(nested_source, external_url, session)
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                nested_targets = []
+                nested_error = f"{type(exc).__name__}: {exc}"
+            for nested_target in nested_targets:
+                targets.append(
+                    _auxiant_annotated_target(
+                        nested_target,
+                        source=source,
+                        network_name=network_name,
+                        page_url=page_url,
+                        directory_url=directory_url,
+                        external_url=external_url,
+                        resolver_type=resolver_type,
+                    )
+                )
+            if not nested_targets:
+                targets.append(
+                    _auxiant_landing_target(
+                        source,
+                        network_name=network_name,
+                        page_url=page_url,
+                        directory_url=directory_url,
+                        landing_url=external_url,
+                        resolver_type=resolver_type,
+                        reason="external_landing_no_concrete_targets",
+                        landing_label=str(link.get("label") or ""),
+                        nested_error=nested_error,
+                    )
+                )
+        if not page_links:
+            targets.append(
+                _auxiant_landing_target(
+                    source,
+                    network_name=network_name,
+                    page_url=page_url,
+                    directory_url=directory_url,
+                    landing_url=page_url,
+                    resolver_type=resolver_type,
+                    reason="auxiant_page_without_file_links",
+                    landing_label=network_name,
+                )
+            )
+    if not targets:
+        raise ValueError(f"no Auxiant network MRF links found for {directory_url}")
+    return targets
+
+
 def _parse_sapphire_toc_links(html_text: str, *, base_url: str) -> list[dict[str, Any]]:
     urls: dict[str, dict[str, Any]] = {}
     for href in re.findall(r"""href=["']([^"']+)["']""", html_text or "", flags=re.I):
@@ -2137,6 +2498,8 @@ async def _crawl_targets_for_source(source: dict[str, Any], url: str, session: a
         return await _resolve_cigna_static_mrf_lookup(source, url, resolver, session)
     if resolver_type == "bcbs_asomrf_filelist":
         return await _resolve_bcbs_asomrf_filelist(source, url, resolver, session)
+    if resolver_type == "auxiant_wordpress_directory":
+        return await _resolve_auxiant_wordpress_directory(source, url, resolver, session)
     if resolver_type == "healthsparq_public_mrf":
         return await _resolve_healthsparq_public_mrf(source, url, resolver, session)
     if resolver_type == "mymedicalshopper_talon_mrf":
@@ -2341,6 +2704,8 @@ def _crawl_target_rank(target: CrawlTarget) -> tuple[int, str]:
     url = str(target.url or "").lower()
     if (target.metadata or {}).get("target_kind") == "file_reference":
         return 20, url
+    if (target.metadata or {}).get("target_kind") == "source_landing_page":
+        return 30, url
     if target.resolved_from_url:
         return 0, url
     if urlsplit(url).path.endswith(".json"):
@@ -2766,7 +3131,7 @@ async def _crawl_toc_metadata(
         try:
             target_kind = (target.metadata or {}).get("target_kind")
             target_max_bytes = _target_fetch_max_bytes(target, max_toc_bytes)
-            if target_kind == "file_reference":
+            if target_kind in {"file_reference", "source_landing_page"}:
                 return [], [], [_crawl_ok_observation(target, run_id=run_id, plans=0, files=1)], target.url
             if target_kind == "metadata_text":
                 text = await _fetch_text(target.url, max_bytes=target_max_bytes, session=session)
