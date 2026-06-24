@@ -34,6 +34,9 @@ Platform resolvers are also configured in that file. The importer currently reso
   suffixes exposed by the payer app bundle.
 - Highmark HMHS landing pages into the current-month state/licensee TOC/index JSON targets.
 - Sapphire MRF Hub pages into direct `/tocs/YYYYMM/*_index.json` targets from server-rendered HTML.
+- MyMedicalShopper/TALON MRF search pages into current employer plan TOC/index JSON targets by
+  enumerating enabled entity employers through the public DDP API and keeping only the newest
+  generated month per plan.
 - Cigna compliance landing pages into current `/static/mrf/*.json` lookup files, then into the
   current signed federal and Colorado TOC/index JSON targets. The resolver carries a larger
   per-target TOC byte cap because Cigna federal indexes can exceed the generic 25 MB default.
@@ -50,9 +53,10 @@ publish required MRFs. See [45 CFR 147.212](https://www.ecfr.gov/current/title-4
 and [CMS technical clarification Q36](https://www.cms.gov/healthplan-price-transparency/resources/technical-clarification).
 
 Current curated TPA seeds live in `specs/mrf_payer_master_list.md` and include Allied Benefit
-Systems, AmeriBen, BRMS, Collective Health, HPI, MedCost, PBA, WebTPA, HealthScope, Aetna Signature
-Administrators, and Meritain. Meritain uses a configured HealthSparq tenant override in
-`specs/mrf_source_discovery_sources.json`.
+Systems, AmeriBen, BRMS, Collective Health, HPI, MedCost, PBA, Varipro, WebTPA, HealthScope, Aetna
+Signature Administrators, and Meritain. Meritain uses a configured HealthSparq tenant override in
+`specs/mrf_source_discovery_sources.json`; Varipro uses the configured MyMedicalShopper/TALON
+resolver.
 
 Resolved TOC targets are stored as `mrf_file.file_type = table-of-contents` rows even when
 `--crawl-target-limit` limits how many target TOCs are parsed in a smoke run.

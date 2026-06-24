@@ -59,6 +59,7 @@ Local dev uses `.env`; in the shared dev setup this points PostgreSQL at `127.0.
 ./venv314/bin/python main.py start mrf-source-discovery --provider master-list --source-payer-query Meritain --crawl --concurrency 3
 ./venv314/bin/python main.py start mrf-source-discovery --probe-files --file-probe-payer-query Meritain --file-probe-limit 20 --concurrency 5
 ./venv314/bin/python main.py start mrf-source-discovery --provider master-list --source-payer-query Cigna --crawl --concurrency 3
+./venv314/bin/python main.py start mrf-source-discovery --provider master-list --source-payer-query Varipro --check-urls --crawl --concurrency 3 --sync-import-control
 ```
 
 Useful verification queries:
@@ -108,6 +109,15 @@ Validated against local PostgreSQL on `127.0.0.1:5440`:
 - Aetna Signature crawl: `mrfcrawl_0a4f6816eb7fed3d`, `22` plans, `30` files; file probe `7/7` OK.
 - Meritain crawl with configured tenant override: `mrfcrawl_5bf49692b577a39d`, `8,691` plans, `4,045` files; file-probe sample `20/20` OK.
 
+## 2026-06-24 Local Evidence
+
+Validated against local PostgreSQL on `127.0.0.1:5440`:
+
+- Varipro MyMedicalShopper/TALON resolver smoke: `mrfcrawl_79cd2871d5239e49`, `1` source,
+  `1` source URL check, `19` plan observations, `24` file observations, no run errors.
+- Persisted Varipro catalog rows after dedupe: `4` distinct plans and `12` file rows, including
+  `5` current `2026-06-01` employer plan TOC targets.
+
 ## Known Edge Cases
 
 - Some landing pages have incomplete TLS chains. Treat the source URL `HEAD` failure as an
@@ -118,6 +128,8 @@ Validated against local PostgreSQL on `127.0.0.1:5440`:
 - TPA pages are heterogeneous: Sapphire pages expose TOCs, Collective exposes `.txt` metadata
   indexes, and other TPAs may point to carrier/EIN search pages. Add new resolver rules only when a
   pattern is generic enough to be reused.
+- MyMedicalShopper/TALON entity search pages are JavaScript shells. Use the configured DDP resolver
+  instead of scraping the `/mrf-search/{entity}` HTML.
 - Cigna uses HTML-discovered `/static/mrf/*.json` lookup files, not a direct TOC URL on the
   compliance page. Keep those lookup paths in `specs/mrf_source_discovery_sources.json`.
 - BCBS Massachusetts uses deterministic current-month issuer TOC filenames on

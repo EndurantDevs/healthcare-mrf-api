@@ -343,6 +343,8 @@ def classify_hosting_platform(url: str | None) -> str | None:
     host = _domain(url) or ""
     raw = str(url or "").lower()
     path = urlsplit(str(url or "")).path.lower()
+    if host in {"www.mymedicalshopper.com", "mymedicalshopper.com"} and path.startswith(("/mrf-search/", "/mrf/")):
+        return "mymedicalshopper_talon"
     if host in {"transparency-in-coverage.uhc.com", "transparency-in-coverage.optum.com"}:
         return "uhc_public_blobs"
     if host == "transparency-in-coverage.bluecrossma.com":
@@ -1152,6 +1154,422 @@ def _parse_uhc_blob_listing(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return targets
 
 
+def _mymedicalshopper_entity_slug_from_url(url: str | None) -> str | None:
+    parts = [part for part in urlsplit(str(url or "")).path.strip("/").split("/") if part]
+    if len(parts) >= 2 and parts[0].lower() == "mrf-search":
+        return parts[1]
+    return None
+
+
+def _mymedicalshopper_employer_slug_from_url(url: str | None) -> str | None:
+    parts = [part for part in urlsplit(str(url or "")).path.strip("/").split("/") if part]
+    if len(parts) >= 2 and parts[0].lower() == "mrf":
+        return parts[1]
+    return None
+
+
+def _mymedicalshopper_employer_selector(entity_slug: str, *, all_employers_searchable: bool) -> dict[str, Any]:
+    selector: dict[str, Any] = {"tpaSlug": entity_slug, "status": "Enabled"}
+    if not all_employers_searchable:
+        selector["machineReadableFiles.makeMRFsSearchable"] = True
+    return selector
+
+
+def _mymedicalshopper_sockjs_ws_url(base_url: str) -> str:
+    parsed = urlsplit(str(base_url or ""))
+    scheme = "wss" if parsed.scheme == "https" else "ws"
+    server_id = str(abs(hash((parsed.netloc, os.getpid()))) % 1000).zfill(3)
+    try:
+        task_id = id(asyncio.current_task())
+    except RuntimeError:
+        task_id = 0
+    session_id = semantic_hash(
+        {"url": base_url, "pid": os.getpid(), "task": task_id, "ts": _utc_now().isoformat()},
+        domain="mms_sockjs",
+    )[:8]
+    return f"{scheme}://{parsed.netloc}/sockjs/{server_id}/{session_id}/websocket"
+
+
+def _mymedicalshopper_sockjs_messages(frame: str) -> list[dict[str, Any]]:
+    text = str(frame or "")
+    if text in {"o", "h"}:
+        return []
+    if not text.startswith("a"):
+        return []
+    try:
+        payload = json.loads(text[1:])
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(payload, list):
+        return []
+    messages: list[dict[str, Any]] = []
+    for item in payload:
+        try:
+            message = json.loads(str(item))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(message, dict):
+            messages.append(message)
+    return messages
+
+
+async def _mymedicalshopper_ddp_send(ws: aiohttp.ClientWebSocketResponse, payload: dict[str, Any]) -> None:
+    encoded = json.dumps([json.dumps(payload, separators=(",", ":"))], separators=(",", ":"))
+    await ws.send_str(encoded)
+
+
+async def _mymedicalshopper_ddp_recv(ws: aiohttp.ClientWebSocketResponse, *, timeout_seconds: float) -> list[dict[str, Any]]:
+    while True:
+        frame = await asyncio.wait_for(ws.receive(), timeout=timeout_seconds)
+        if frame.type == aiohttp.WSMsgType.TEXT:
+            messages = _mymedicalshopper_sockjs_messages(str(frame.data))
+            returned: list[dict[str, Any]] = []
+            for message in messages:
+                if message.get("msg") == "ping":
+                    pong: dict[str, Any] = {"msg": "pong"}
+                    if message.get("id") is not None:
+                        pong["id"] = message.get("id")
+                    await _mymedicalshopper_ddp_send(ws, pong)
+                    continue
+                returned.append(message)
+            if returned:
+                return returned
+            continue
+        if frame.type in {aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING}:
+            raise ValueError("MyMedicalShopper DDP websocket closed before a response was received")
+        if frame.type == aiohttp.WSMsgType.ERROR:
+            raise ValueError(f"MyMedicalShopper DDP websocket error: {ws.exception()}")
+
+
+async def _mymedicalshopper_ddp_connect(
+    session: aiohttp.ClientSession,
+    base_url: str,
+    *,
+    timeout_seconds: float,
+) -> aiohttp.ClientWebSocketResponse:
+    await _assert_fetch_url_allowed(base_url)
+    parsed = urlsplit(str(base_url or ""))
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    ws = await session.ws_connect(
+        _mymedicalshopper_sockjs_ws_url(base_url),
+        headers={"User-Agent": USER_AGENT, "Origin": origin},
+        timeout=timeout_seconds,
+    )
+    await asyncio.wait_for(ws.receive(), timeout=timeout_seconds)
+    await _mymedicalshopper_ddp_send(ws, {"msg": "connect", "version": "1", "support": ["1", "pre2", "pre1"]})
+    while True:
+        for message in await _mymedicalshopper_ddp_recv(ws, timeout_seconds=timeout_seconds):
+            if message.get("msg") == "connected":
+                return ws
+            if message.get("msg") == "failed":
+                raise ValueError(f"MyMedicalShopper DDP connection failed: {message}")
+
+
+async def _mymedicalshopper_ddp_call(
+    ws: aiohttp.ClientWebSocketResponse,
+    *,
+    method: str,
+    params: list[Any],
+    request_id: str,
+    timeout_seconds: float,
+) -> Any:
+    await _mymedicalshopper_ddp_send(ws, {"msg": "method", "id": request_id, "method": method, "params": params})
+    while True:
+        for message in await _mymedicalshopper_ddp_recv(ws, timeout_seconds=timeout_seconds):
+            if message.get("msg") != "result" or message.get("id") != request_id:
+                continue
+            if message.get("error"):
+                raise ValueError(f"MyMedicalShopper DDP method {method} failed: {message['error']}")
+            return message.get("result")
+
+
+async def _mymedicalshopper_ddp_subscribe_collect(
+    ws: aiohttp.ClientWebSocketResponse,
+    *,
+    name: str,
+    params: list[Any],
+    sub_id: str,
+    timeout_seconds: float,
+) -> list[dict[str, Any]]:
+    await _mymedicalshopper_ddp_send(ws, {"msg": "sub", "id": sub_id, "name": name, "params": params})
+    collected: list[dict[str, Any]] = []
+    while True:
+        for message in await _mymedicalshopper_ddp_recv(ws, timeout_seconds=timeout_seconds):
+            if message.get("msg") in {"added", "changed", "removed"}:
+                collected.append(message)
+                continue
+            if message.get("msg") == "ready" and sub_id in (message.get("subs") or []):
+                return collected
+            if message.get("msg") == "nosub" and message.get("id") == sub_id:
+                raise ValueError(f"MyMedicalShopper DDP subscription {name} failed: {message.get('error') or message}")
+
+
+def _mymedicalshopper_entity_config_from_messages(messages: list[dict[str, Any]], entity_slug: str) -> dict[str, Any]:
+    for message in messages:
+        if message.get("collection") != "thirdPartyAdministrators":
+            continue
+        fields = message.get("fields") if isinstance(message.get("fields"), dict) else {}
+        if str(fields.get("slug") or "").strip() == entity_slug:
+            return dict(fields)
+    return {}
+
+
+def _mymedicalshopper_oid_value(value: Any) -> str:
+    if isinstance(value, dict) and value.get("$type") == "oid":
+        return str(value.get("$value") or "").strip()
+    return str(value or "").strip()
+
+
+def _mymedicalshopper_tabular_info_from_messages(messages: list[dict[str, Any]], table_id: str = "EntityMRFEmployers") -> dict[str, Any]:
+    info: dict[str, Any] = {"ids": [], "records_total": 0, "records_filtered": 0}
+    for message in messages:
+        if message.get("collection") != "tabular_records" or message.get("id") != table_id:
+            continue
+        fields = message.get("fields") if isinstance(message.get("fields"), dict) else {}
+        ids = fields.get("ids") if isinstance(fields.get("ids"), list) else []
+        info["ids"] = ids
+        info["records_total"] = _as_int(fields.get("recordsTotal")) or len(ids)
+        info["records_filtered"] = _as_int(fields.get("recordsFiltered")) or info["records_total"]
+    return info
+
+
+def _mymedicalshopper_employer_docs_from_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    employers: dict[str, dict[str, Any]] = {}
+    for message in messages:
+        if message.get("collection") != "employers" or message.get("msg") not in {"added", "changed"}:
+            continue
+        fields = message.get("fields") if isinstance(message.get("fields"), dict) else {}
+        slug = str(fields.get("slug") or "").strip()
+        if not slug:
+            continue
+        employers[slug] = {"_id": _mymedicalshopper_oid_value(message.get("id")), **fields}
+    return list(employers.values())
+
+
+async def _mymedicalshopper_entity_employers(
+    ws: aiohttp.ClientWebSocketResponse,
+    *,
+    entity_slug: str,
+    resolver: dict[str, Any],
+    timeout_seconds: float,
+) -> list[dict[str, Any]]:
+    config_messages = await _mymedicalshopper_ddp_subscribe_collect(
+        ws,
+        name="entityMRFsConfig",
+        params=[entity_slug],
+        sub_id=f"mms-config-{entity_slug}",
+        timeout_seconds=timeout_seconds,
+    )
+    config = _mymedicalshopper_entity_config_from_messages(config_messages, entity_slug)
+    machine_readable_files = config.get("machineReadableFiles") if isinstance(config.get("machineReadableFiles"), dict) else {}
+    selector = _mymedicalshopper_employer_selector(
+        entity_slug,
+        all_employers_searchable=bool(machine_readable_files.get("allEmployersSearchable")),
+    )
+    page_size = max(_as_int(resolver.get("page_size")) or 100, 1)
+    max_employers = max(_as_int(resolver.get("max_employers")) or 10000, 1)
+    fields = {"name": 1, "slug": 1, "tpaSlug": 1, "status": 1, "machineReadableFiles": 1, "groupId": 1, "ein": 1}
+    employers: dict[str, dict[str, Any]] = {}
+    offset = 0
+    while offset < max_employers:
+        info_messages = await _mymedicalshopper_ddp_subscribe_collect(
+            ws,
+            name="tabular_getInfo",
+            params=["EntityMRFEmployers", selector, [["name", "asc"]], offset, min(page_size, max_employers - offset)],
+            sub_id=f"mms-info-{entity_slug}-{offset}",
+            timeout_seconds=timeout_seconds,
+        )
+        info = _mymedicalshopper_tabular_info_from_messages(info_messages)
+        ids = [item for item in info.get("ids") or [] if item]
+        if not ids:
+            break
+        doc_messages = await _mymedicalshopper_ddp_subscribe_collect(
+            ws,
+            name="entityMRFEmployers",
+            params=["EntityMRFEmployers", ids, fields],
+            sub_id=f"mms-employers-{entity_slug}-{offset}",
+            timeout_seconds=timeout_seconds,
+        )
+        for employer in _mymedicalshopper_employer_docs_from_messages(doc_messages):
+            slug = str(employer.get("slug") or "").strip()
+            if slug:
+                employers[slug] = employer
+        offset += len(ids)
+        if offset >= (_as_int(info.get("records_filtered")) or len(ids)):
+            break
+    return list(employers.values())
+
+
+async def _mymedicalshopper_generated_for_employer(
+    ws: aiohttp.ClientWebSocketResponse,
+    *,
+    employer_slug: str,
+    timeout_seconds: float,
+    max_plans: int | None = None,
+) -> Any:
+    plans = await _mymedicalshopper_ddp_call(
+        ws,
+        method="getBenefitPlans",
+        params=[{"employerSlug": employer_slug, "skipPlanDesign": True}],
+        request_id=f"mms-plans-{employer_slug}",
+        timeout_seconds=timeout_seconds,
+    )
+    if not isinstance(plans, list) or not plans:
+        return []
+    if max_plans and max_plans > 0:
+        plans = plans[:max_plans]
+    return await _mymedicalshopper_ddp_call(
+        ws,
+        method="getGeneratedMRFInfoByPlan",
+        params=[plans],
+        request_id=f"mms-generated-{employer_slug}",
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def _mymedicalshopper_generated_entries(generated: Any) -> list[dict[str, Any]]:
+    if isinstance(generated, list):
+        return [item for item in generated if isinstance(item, dict)]
+    if not isinstance(generated, dict):
+        return []
+    for key in ("mrfGeneratedPlans", "generatedPlans", "plans", "result"):
+        value = generated.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+    return [generated]
+
+
+def _mymedicalshopper_entry_plan_value(entry: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        value = entry.get(key)
+        if value not in (None, ""):
+            return value
+    plan = entry.get("plan") if isinstance(entry.get("plan"), dict) else {}
+    for key in keys:
+        value = plan.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _mymedicalshopper_entry_history(entry: dict[str, Any]) -> list[dict[str, Any]]:
+    for key in ("mrfGeneratedInfo", "generatedMRFInfo", "mrfInfo", "history"):
+        value = entry.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def _mymedicalshopper_targets_from_generated(
+    source: dict[str, Any],
+    *,
+    entity_slug: str | None,
+    employer: dict[str, Any],
+    generated: Any,
+    resolver_type: str,
+    resolved_from_url: str,
+) -> list[CrawlTarget]:
+    employer_slug = str(employer.get("slug") or "").strip()
+    employer_name = _clean_text(employer.get("name") or employer_slug)
+    targets_by_url: dict[str, CrawlTarget] = {}
+    for entry in _mymedicalshopper_generated_entries(generated):
+        plan_id = _mymedicalshopper_entry_plan_value(entry, ("planId", "plan_id", "id", "_id"))
+        plan_name = _clean_text(_mymedicalshopper_entry_plan_value(entry, ("planName", "plan_name", "name")) or "")
+        history = _mymedicalshopper_entry_history(entry)
+        latest = sorted(
+            (
+                item
+                for item in history
+                if item.get("mrfGenerated") is True and str(item.get("link") or "").strip().startswith(("http://", "https://"))
+            ),
+            key=lambda item: str(item.get("month") or ""),
+            reverse=True,
+        )
+        if not latest:
+            continue
+        item = latest[0]
+        url = str(item.get("link") or "").strip()
+        canonical = _canonical_or_none(url) or url
+        month = str(item.get("month") or "").strip() or None
+        label_parts = [part for part in (employer_name, plan_name, month) if part]
+        targets_by_url[canonical] = CrawlTarget(
+            source=source,
+            url=url,
+            label=" - ".join(label_parts),
+            resolved_from_url=resolved_from_url,
+            metadata={
+                "resolver": resolver_type,
+                "target_file_type": "table-of-contents",
+                "entity_slug": entity_slug or employer.get("tpaSlug"),
+                "employer_slug": employer_slug or None,
+                "employer_name": employer_name or None,
+                "group_id": employer.get("groupId"),
+                "ein": employer.get("ein"),
+                "plan_id": str(plan_id) if plan_id not in (None, "") else None,
+                "plan_name": plan_name or None,
+                "month": month,
+                "history_month_count": len(history),
+            },
+        )
+    return list(targets_by_url.values())
+
+
+async def _resolve_mymedicalshopper_talon_mrf(
+    source: dict[str, Any],
+    url: str,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    entity_slug = _mymedicalshopper_entity_slug_from_url(url)
+    employer_slug = _mymedicalshopper_employer_slug_from_url(url)
+    if not entity_slug and not employer_slug:
+        raise ValueError(f"unsupported MyMedicalShopper MRF URL: {url}")
+    timeout_seconds = float(_as_int(resolver.get("ddp_timeout_seconds")) or 30)
+    max_plans = _as_int(resolver.get("max_plans_per_employer"))
+    ws = await _mymedicalshopper_ddp_connect(session, url, timeout_seconds=timeout_seconds)
+    try:
+        if entity_slug:
+            employers = await _mymedicalshopper_entity_employers(
+                ws,
+                entity_slug=entity_slug,
+                resolver=resolver,
+                timeout_seconds=timeout_seconds,
+            )
+        else:
+            employer_name = await _mymedicalshopper_ddp_call(
+                ws,
+                method="getEmployerName",
+                params=[employer_slug],
+                request_id=f"mms-employer-name-{employer_slug}",
+                timeout_seconds=timeout_seconds,
+            )
+            employers = [{"slug": employer_slug, "name": employer_name}]
+        targets: list[CrawlTarget] = []
+        for employer in employers:
+            slug = str(employer.get("slug") or "").strip()
+            if not slug:
+                continue
+            generated = await _mymedicalshopper_generated_for_employer(
+                ws,
+                employer_slug=slug,
+                timeout_seconds=timeout_seconds,
+                max_plans=max_plans,
+            )
+            targets.extend(
+                _mymedicalshopper_targets_from_generated(
+                    source,
+                    entity_slug=entity_slug or str(employer.get("tpaSlug") or "").strip() or None,
+                    employer=employer,
+                    generated=generated,
+                    resolver_type=str(resolver.get("type") or "mymedicalshopper_talon_mrf"),
+                    resolved_from_url=url,
+                )
+            )
+        if not targets:
+            raise ValueError(f"no generated MyMedicalShopper MRF links found for {url}")
+        return targets
+    finally:
+        await ws.close()
 def _parse_sapphire_toc_links(html_text: str, *, base_url: str) -> list[dict[str, Any]]:
     urls: dict[str, dict[str, Any]] = {}
     for href in re.findall(r"""href=["']([^"']+)["']""", html_text or "", flags=re.I):
@@ -1721,6 +2139,8 @@ async def _crawl_targets_for_source(source: dict[str, Any], url: str, session: a
         return await _resolve_bcbs_asomrf_filelist(source, url, resolver, session)
     if resolver_type == "healthsparq_public_mrf":
         return await _resolve_healthsparq_public_mrf(source, url, resolver, session)
+    if resolver_type == "mymedicalshopper_talon_mrf":
+        return await _resolve_mymedicalshopper_talon_mrf(source, url, resolver, session)
     if resolver_type == "highmark_hmhs_script":
         script_path = str(resolver.get("script_path") or "/js/script.js")
         script_url = urljoin(url, script_path)

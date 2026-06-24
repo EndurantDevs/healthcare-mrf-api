@@ -337,6 +337,7 @@ Last one-time research refresh: 2026-06-05.
 | PBA | tpa | https://www.pbaclaims.com/mrfs/ | curated source row |
 | Professional Benefit Administrators | tpa | https://www.pbaclaims.com/mrfs/ | curated source row |
 | Quartz Benefits | tpa | https://quartzfhir.healthsparq.com/app/public/#/one/insurerCode=QUARTZ_I&brandCode=QUARTZ/machine-readable-transparency-in-coverage | observed current; 2,557 plans; 49,120 files |
+| Varipro | tpa | https://www.mymedicalshopper.com/mrf-search/varipro | MyMedicalShopper/TALON MRF search; resolver enumerates current employer plan TOCs |
 | WebTPA | tpa | https://www.webtpa.com/rights-protections | curated source row |
 | WebTPA | tpa | https://price-transparency.webtpa.com/ | public transparency URL |
 

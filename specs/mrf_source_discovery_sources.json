@@ -36,6 +36,13 @@
       "type": "sapphire_html_tocs",
       "max_bytes": 5242880
     },
+    "mymedicalshopper_talon": {
+      "type": "mymedicalshopper_talon_mrf",
+      "page_size": 100,
+      "max_employers": 10000,
+      "max_plans_per_employer": 500,
+      "ddp_timeout_seconds": 30
+    },
     "uhc_public_blobs": {
       "type": "uhc_blob_listing",
       "max_bytes": 67108864,

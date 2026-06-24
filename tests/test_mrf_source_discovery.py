@@ -2,6 +2,7 @@
 
 import gzip
 import importlib
+import json
 import types
 
 import pytest
@@ -19,6 +20,7 @@ def test_source_urls_are_loaded_from_registry_file():
     assert config["platform_resolvers"]["healthsparq"]["type"] == "healthsparq_public_mrf"
     assert config["platform_resolvers"]["highmark_hmhs"]["type"] == "highmark_hmhs_script"
     assert config["platform_resolvers"]["sapphire"]["type"] == "sapphire_html_tocs"
+    assert config["platform_resolvers"]["mymedicalshopper_talon"]["type"] == "mymedicalshopper_talon_mrf"
     assert config["platform_resolvers"]["uhc_public_blobs"]["type"] == "uhc_blob_listing"
     assert config["platform_resolvers"]["bcbsma_monthly_tocs"]["type"] == "bcbsma_monthly_tocs"
     assert config["platform_resolvers"]["cigna_static_mrf_lookup"]["type"] == "cigna_static_mrf_lookup"
@@ -210,6 +212,102 @@ def test_classify_hosting_platforms():
     assert discovery.classify_hosting_platform("https://www.bcbsil.com/asomrf?EIN=260241222") == "bcbs_asomrf"
     assert discovery.classify_hosting_platform("https://transparency-in-coverage.bluecrossma.com/") == "bcbsma_monthly_tocs"
     assert discovery.classify_hosting_platform("https://www.cigna.com/legal/compliance/machine-readable-files") == "cigna_static_mrf_lookup"
+    assert discovery.classify_hosting_platform("https://www.mymedicalshopper.com/mrf-search/varipro") == "mymedicalshopper_talon"
+    assert (
+        discovery.classify_hosting_platform("https://www.mymedicalshopper.com/mrf/electrical-workers-cofinity-varipro-77100")
+        == "mymedicalshopper_talon"
+    )
+
+
+def test_mymedicalshopper_url_helpers_and_employer_selector():
+    assert discovery._mymedicalshopper_entity_slug_from_url("https://www.mymedicalshopper.com/mrf-search/varipro") == "varipro"
+    assert (
+        discovery._mymedicalshopper_employer_slug_from_url(
+            "https://www.mymedicalshopper.com/mrf/electrical-workers-cofinity-varipro-77100"
+        )
+        == "electrical-workers-cofinity-varipro-77100"
+    )
+    assert discovery._mymedicalshopper_employer_selector("varipro", all_employers_searchable=True) == {
+        "tpaSlug": "varipro",
+        "status": "Enabled",
+    }
+    assert discovery._mymedicalshopper_employer_selector("varipro", all_employers_searchable=False) == {
+        "tpaSlug": "varipro",
+        "status": "Enabled",
+        "machineReadableFiles.makeMRFsSearchable": True,
+    }
+
+
+def test_mymedicalshopper_sockjs_frame_and_publication_helpers():
+    frame = "a" + json.dumps(
+        [
+            json.dumps({"msg": "added", "collection": "tabular_records", "id": "EntityMRFEmployers", "fields": {"ids": [{"$type": "oid", "$value": "61a"}], "recordsTotal": 5, "recordsFiltered": 1}}),
+            json.dumps({"msg": "added", "collection": "employers", "id": "61a", "fields": {"name": "EWIF - HAP / First Health", "slug": "electrical-workers-cofinity-varipro-77100", "tpaSlug": "varipro", "status": "Enabled"}}),
+        ]
+    )
+
+    messages = discovery._mymedicalshopper_sockjs_messages(frame)
+    info = discovery._mymedicalshopper_tabular_info_from_messages(messages)
+    employers = discovery._mymedicalshopper_employer_docs_from_messages(messages)
+
+    assert info["ids"] == [{"$type": "oid", "$value": "61a"}]
+    assert info["records_filtered"] == 1
+    assert employers == [
+        {
+            "_id": "61a",
+            "name": "EWIF - HAP / First Health",
+            "slug": "electrical-workers-cofinity-varipro-77100",
+            "tpaSlug": "varipro",
+            "status": "Enabled",
+        }
+    ]
+
+
+def test_mymedicalshopper_targets_keep_latest_generated_toc_per_plan():
+    source = {"source_id": "source_varipro", "payer_id": "payer_varipro"}
+    employer = {
+        "slug": "electrical-workers-cofinity-varipro-77100",
+        "name": "EWIF - HAP / First Health",
+        "tpaSlug": "varipro",
+        "groupId": "77100",
+        "ein": "381393235",
+    }
+    generated = [
+        {
+            "planId": "4907",
+            "planName": "EWIF In Network 01/01/2023",
+            "mrfGeneratedInfo": [
+                {"month": "2026-05-01", "mrfGenerated": True, "link": "https://mrf.mmsanalytics.com/2026-05-01_ewif_index.json"},
+                {"month": "2026-06-01", "mrfGenerated": True, "link": "https://mrf.mmsanalytics.com/2026-06-01_ewif_index.json"},
+                {"month": "2026-07-01", "mrfGenerated": False, "link": "https://mrf.mmsanalytics.com/2026-07-01_ewif_index.json"},
+            ],
+        },
+        {
+            "plan": {"id": "4907", "name": "EWIF In Network 01/01/2022"},
+            "mrfGeneratedInfo": [
+                {"month": "2026-06-01", "mrfGenerated": True, "link": "https://mrf.mmsanalytics.com/2026-06-01_ewif_2022_index.json"}
+            ],
+        },
+    ]
+
+    targets = discovery._mymedicalshopper_targets_from_generated(
+        source,
+        entity_slug="varipro",
+        employer=employer,
+        generated=generated,
+        resolver_type="mymedicalshopper_talon_mrf",
+        resolved_from_url="https://www.mymedicalshopper.com/mrf-search/varipro",
+    )
+
+    assert [target.url for target in targets] == [
+        "https://mrf.mmsanalytics.com/2026-06-01_ewif_index.json",
+        "https://mrf.mmsanalytics.com/2026-06-01_ewif_2022_index.json",
+    ]
+    assert targets[0].label == "EWIF - HAP / First Health - EWIF In Network 01/01/2023 - 2026-06-01"
+    assert targets[0].metadata["target_file_type"] == "table-of-contents"
+    assert targets[0].metadata["entity_slug"] == "varipro"
+    assert targets[0].metadata["employer_slug"] == "electrical-workers-cofinity-varipro-77100"
+    assert targets[0].metadata["history_month_count"] == 3
 
 
 def test_highmark_hmhs_script_expands_current_month_index_urls():
