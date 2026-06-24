@@ -127,6 +127,12 @@ def test_import_control_snapshot_company_fallback_from_index_url():
         )
         == "Heartland Dental LLC"
     )
+    assert (
+        discovery._company_name_from_index_url(
+            "https://www.asrhealthbenefits.com/umbraco/surface/mrfdownload?fileType=TableOfContents&groupNumber=1247"
+        )
+        is None
+    )
     enriched = discovery._apply_company_fallback(
         [{"plan_id": "010854205", "plan_market_type": "group", "plan_name": "POS-CHOICE-PLUS"}],
         "Heartland Dental LLC",

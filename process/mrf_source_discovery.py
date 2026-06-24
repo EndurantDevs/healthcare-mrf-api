@@ -4009,7 +4009,7 @@ def _company_name_from_index_url(value: Any) -> str | None:
     name = re.sub(r"_index$", "", name, flags=re.IGNORECASE)
     name = re.sub(r"^\d{4}-\d{2}-\d{2}[_-]+", "", name)
     name = name.replace("_", " ").replace("-", " ").strip()
-    if not name or name.lower() in {"index", "toc", "table of contents"}:
+    if not name or name.lower() in {"index", "toc", "table of contents", "mrfdownload"}:
         return None
     return re.sub(r"\s+", " ", name)
 
