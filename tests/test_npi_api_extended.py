@@ -380,6 +380,43 @@ async def test_get_plans_by_npi(monkeypatch):
     assert payload["npi_data"][0]["issuer_info"]["issuer"] == 2
 
 
+def test_public_nested_taxonomy_rows_hide_internal_identity_and_dedupe():
+    rows = [
+        {
+            "npi": 1194956268,
+            "checksum": -1,
+            "healthcare_provider_taxonomy_code": "261QM1200X",
+            "healthcare_provider_primary_taxonomy_switch": "Y",
+        },
+        {
+            "npi": 1194956268,
+            "checksum": -2,
+            "healthcare_provider_taxonomy_code": "261QM1200X",
+            "healthcare_provider_primary_taxonomy_switch": "Y",
+        },
+        {
+            "npi": 1194956268,
+            "checksum": -3,
+            "healthcare_provider_taxonomy_code": "2085R0202X",
+            "healthcare_provider_primary_taxonomy_switch": "N",
+        },
+    ]
+
+    payload = npi_module._public_nested_taxonomy_rows(rows)
+
+    assert payload == [
+        {
+            "healthcare_provider_taxonomy_code": "261QM1200X",
+            "healthcare_provider_primary_taxonomy_switch": "Y",
+        },
+        {
+            "healthcare_provider_taxonomy_code": "2085R0202X",
+            "healthcare_provider_primary_taxonomy_switch": "N",
+        },
+    ]
+    assert all("npi" not in row and "checksum" not in row for row in payload)
+
+
 @pytest.mark.asyncio
 async def test_build_npi_details(monkeypatch):
     row_values = []
@@ -388,8 +425,8 @@ async def test_build_npi_details(monkeypatch):
             row_values.append(1234567890)
         else:
             row_values.append(f"data_{column.key}")
-    row_values.append([{"taxonomy": 1}])
-    row_values.append([{"group": 2}])
+    row_values.append([{"npi": 1234567890, "checksum": 11, "taxonomy": 1}])
+    row_values.append([{"npi": 1234567890, "checksum": 12, "group": 2}])
     row_values.append([{"checksum": 1, "type": "primary"}])
 
     class FakeSelect:
@@ -418,7 +455,9 @@ async def test_build_npi_details(monkeypatch):
     monkeypatch.setattr(npi_module, "db", FakeDB())
     payload = await npi_module._build_npi_details(1234567890)
     assert payload["taxonomy_list"]
+    assert payload["taxonomy_list"] == [{"taxonomy": 1}]
     assert payload["taxonomy_group_list"]
+    assert payload["taxonomy_group_list"] == [{"group": 2}]
     assert payload["address_list"]
 
 

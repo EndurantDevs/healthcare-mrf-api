@@ -112,6 +112,30 @@ PUBLIC_ADDRESS_ATTRIBUTION_COLUMNS = {
     "ptg_source_array",
     "group_plan_array",
 }
+PUBLIC_NESTED_TAXONOMY_EXCLUDED_COLUMNS = {"npi", "checksum"}
+
+
+def _public_nested_taxonomy_rows(rows: Sequence[Any]) -> list[dict[str, Any]]:
+    public_rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for entry in rows or []:
+        if not isinstance(entry, Mapping):
+            continue
+        public_entry = {
+            str(key): value
+            for key, value in entry.items()
+            if str(key) not in PUBLIC_NESTED_TAXONOMY_EXCLUDED_COLUMNS
+        }
+        if not public_entry:
+            continue
+        dedupe_key = json.dumps(public_entry, default=str, sort_keys=True, separators=(",", ":"))
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        public_rows.append(public_entry)
+    return public_rows
+
+
 # When true, the geo radius search returns providers at ALL geocoded service
 # locations (NPPES primary/secondary PLUS TiC/PTG/ACA practice/site), matching the
 # widened geo_idx partial predicate. Default OFF: the live geo_idx must be rebuilt
@@ -4765,10 +4789,10 @@ async def _build_npi_details(
         obj[column.key] = value
 
     if result_row[idx]:
-        obj["taxonomy_list"].extend([entry for entry in result_row[idx] if entry])
+        obj["taxonomy_list"].extend(_public_nested_taxonomy_rows(result_row[idx]))
     idx += 1
     if result_row[idx]:
-        obj["taxonomy_group_list"].extend([entry for entry in result_row[idx] if entry])
+        obj["taxonomy_group_list"].extend(_public_nested_taxonomy_rows(result_row[idx]))
     idx += 1
     if idx < len(result_row) and result_row[idx]:
         obj["address_list"] = result_row[idx]
