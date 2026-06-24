@@ -451,6 +451,23 @@ def test_asr_health_benefits_resolver_uses_seed_list():
     )
 
 
+def test_asr_health_benefits_target_context_applies_to_file_rows():
+    target = discovery.CrawlTarget(
+        source={"source_id": "source_1", "display_name": "ASR Health Benefits"},
+        url="https://www.asrhealthbenefits.com/umbraco/surface/mrfdownload?fileType=TableOfContents&groupNumber=1208",
+        label="ASR Health Benefits group 1208",
+        resolved_from_url="https://www.asrhealthbenefits.com/MRF",
+        metadata={"resolver": "asr_health_benefits_mrf", "group_number": "1208"},
+    )
+    rows = [{"mrf_file_id": "file_1", "metadata_json": {"container_format": None}}]
+
+    [row] = discovery._apply_crawl_target_context_to_file_rows(rows, target)
+
+    assert row["metadata_json"]["group_id"] == "1208"
+    assert row["metadata_json"]["group_number"] == "1208"
+    assert row["metadata_json"]["target_label"] == "ASR Health Benefits group 1208"
+
+
 def test_asr_health_benefits_seed_list_filters_active_rows(tmp_path, monkeypatch):
     seed_path = tmp_path / "asr-groups.csv"
     seed_path.write_text(

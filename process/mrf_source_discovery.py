@@ -1621,6 +1621,35 @@ def _asr_group_number_from_url(url: str | None) -> str | None:
     return group_number or None
 
 
+def _crawl_target_context_metadata(target: CrawlTarget) -> dict[str, str]:
+    metadata = dict(target.metadata or {})
+    group_number = (
+        str(metadata.get("group_number") or metadata.get("group_id") or "").strip()
+        or _asr_group_number_from_url(target.url)
+        or _asr_group_number_from_url(target.resolved_from_url)
+    )
+    context: dict[str, str] = {}
+    if group_number:
+        context["group_id"] = group_number
+        context["group_number"] = group_number
+    if target.label:
+        context["target_label"] = str(target.label)
+    return context
+
+
+def _apply_crawl_target_context_to_file_rows(file_rows: list[dict[str, Any]], target: CrawlTarget) -> list[dict[str, Any]]:
+    context = _crawl_target_context_metadata(target)
+    if not context:
+        return file_rows
+    annotated: list[dict[str, Any]] = []
+    for row in file_rows:
+        metadata = dict(row.get("metadata_json") or {})
+        for key, value in context.items():
+            metadata.setdefault(key, value)
+        annotated.append({**row, "metadata_json": metadata})
+    return annotated
+
+
 def _asr_group_numbers_from_seed_list(seed_list_name: str | None) -> list[str]:
     if not seed_list_name:
         return []
@@ -3233,6 +3262,7 @@ def _toc_target_file_row(target: CrawlTarget) -> dict[str, Any]:
     now = _utc_now()
     source = target.source
     target_metadata = {key: value for key, value in dict(target.metadata or {}).items() if value not in (None, "")}
+    context_metadata = _crawl_target_context_metadata(target)
     file_type = str(target_metadata.get("target_file_type") or "table-of-contents")
     plan_info = _metadata_plan_info(target_metadata)
     size_bytes = (
@@ -3263,6 +3293,7 @@ def _toc_target_file_row(target: CrawlTarget) -> dict[str, Any]:
             "resolved_from_url": target.resolved_from_url,
             "target_label": target.label,
             **target_metadata,
+            **context_metadata,
         },
         "first_seen_at": now,
         "last_seen_at": now,
@@ -3648,6 +3679,7 @@ async def _crawl_toc_metadata(
             else:
                 toc = await _fetch_json(target.url, max_bytes=target_max_bytes, session=session)
                 plan_rows, file_rows = _toc_rows_from_content(target.source, target.url, toc)
+                file_rows = _apply_crawl_target_context_to_file_rows(file_rows, target)
             return plan_rows, file_rows, [_crawl_ok_observation(target, run_id=run_id, plans=len(plan_rows), files=len(file_rows))], target.url
         except Exception as exc:  # pylint: disable=broad-exception-caught
             return [], [], [_crawl_failed_observation(target.source, target.url, exc, run_id)], target.url
@@ -4039,6 +4071,24 @@ def _import_control_snapshot_file_is_supported(file_type: Any, metadata: dict[st
     return _import_control_supported_rate_domain(metadata.get("domain") or file_type)
 
 
+def _import_control_preview_context(metadata: dict[str, Any], from_index_url: Any, canonical_url: Any) -> dict[str, str]:
+    context: dict[str, str] = {}
+    for key in ("group_id", "group_number", "client_id", "client_name", "employer_id", "employer_name", "target_label"):
+        value = str(metadata.get(key) or "").strip()
+        if value:
+            context[key] = value
+    group_number = (
+        context.get("group_id")
+        or context.get("group_number")
+        or _asr_group_number_from_url(str(from_index_url or ""))
+        or _asr_group_number_from_url(str(canonical_url or ""))
+    )
+    if group_number:
+        context["group_id"] = group_number
+        context["group_number"] = group_number
+    return context
+
+
 async def _import_control_snapshot_items(source_ids: list[str]) -> dict[str, list[dict[str, Any]]]:
     """Read the currently-stored MRF file snapshot for the given sources and build
     import-control preview items grouped by healthcare source_id. Prefer the exact
@@ -4102,6 +4152,7 @@ async def _import_control_snapshot_items(source_ids: list[str]) -> dict[str, lis
         original_url = row[1] or row[2]
         if not original_url:
             continue
+        context = _import_control_preview_context(metadata, row[11], row[2] or original_url)
         grouped.setdefault(row[0], []).append(
             {
                 "original_url": original_url,
@@ -4116,6 +4167,7 @@ async def _import_control_snapshot_items(source_ids: list[str]) -> dict[str, lis
                 or _reporting_entity_from_plan_info(row[0], plan_info, plan_lookup),
                 "content_length": row[4],
                 "plan_info": plan_info,
+                **context,
             }
         )
     return grouped
