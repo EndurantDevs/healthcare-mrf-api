@@ -2680,8 +2680,8 @@ def _insert_raw_from_source_sql(
             source_record_id::varchar AS source_record_id,
             updated_at::timestamp AS updated_at,
             COALESCE(
-                address_key::uuid,
-                {_address_key_expr(db_schema, address_canon_available, address_source="address_source")}
+                {_address_key_expr(db_schema, address_canon_available, address_source="address_source")},
+                address_key::uuid
             ) AS address_key
           FROM base_rows
     ),
@@ -3069,8 +3069,8 @@ def _materialize_sql(
             source_record_id::varchar AS source_record_id,
             updated_at::timestamp AS updated_at,
             COALESCE(
-                address_key::uuid,
-                {_address_key_expr(db_schema, address_canon_available, address_source="address_source")}
+                {_address_key_expr(db_schema, address_canon_available, address_source="address_source")},
+                address_key::uuid
             ) AS address_key
           FROM base_rows
     ),

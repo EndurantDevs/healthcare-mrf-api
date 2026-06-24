@@ -144,6 +144,9 @@ async def test_address_canonical_sql_functions_are_immutable_parallel_safe_and_p
     assert await db.scalar(f"SELECT {schema}.addr_street_norm_v1('200 First Ave', '');") == await db.scalar(
         f"SELECT {schema}.addr_street_norm_v1('200 1st Ave', '');"
     )
+    assert await db.scalar(f"SELECT {schema}.addr_street_norm_v1('1200 First Street, NE', '');") == await db.scalar(
+        f"SELECT {schema}.addr_street_norm_v1('1200 1ST ST NE', '');"
+    )
     assert await db.scalar(f"SELECT {schema}.addr_street_norm_v1('200 Saint Clair Ave', '');") == await db.scalar(
         f"SELECT {schema}.addr_street_norm_v1('200 St Clair Ave', '');"
     )

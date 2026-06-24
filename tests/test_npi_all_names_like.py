@@ -269,6 +269,7 @@ async def test_get_all_zip_phone_and_name_filters_are_applied(monkeypatch):
             "first_name": "john",
             "last_name": "doe",
             "organization_name": "walgreens",
+            "address_key": "3A47E595-03BF-597D-8825-04B75D783FC9",
             "entity_type_code": "2",
             "limit": "5",
             "start": "0",
@@ -278,12 +279,14 @@ async def test_get_all_zip_phone_and_name_filters_are_applied(monkeypatch):
 
     assert conn.last_params["zip_code"] == "60601"
     assert conn.last_params["phone_digits"] == "3125551212"
+    assert conn.last_params["address_key"] == "3a47e595-03bf-597d-8825-04b75d783fc9"
     assert conn.last_params["first_name"] == "%john%"
     assert conn.last_params["last_name"] == "%doe%"
     assert conn.last_params["organization_name"] == "%walgreens%"
     assert conn.last_params["entity_type_code"] == 2
     assert "LEFT(c.postal_code, 5) = :zip_code" in conn.last_sql
     assert "regexp_replace(COALESCE(c.telephone_number, ''), '[^0-9]', '', 'g') = :phone_digits" in conn.last_sql
+    assert "c.address_key = CAST(:address_key AS uuid)" in conn.last_sql
 
 
 @pytest.mark.asyncio

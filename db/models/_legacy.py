@@ -4136,6 +4136,14 @@ class EntityAddressUnified(Base, JSONOutputMixin):
         {"index_elements": ("entity_type", "coalesce(npi, inferred_npi)"), "name": "entity_type_coalesced_npi"},
         {"index_elements": ("state_name", "city_name", "npi"), "name": "primary_state_city_npi", "where": "type='primary'"},
         {"index_elements": ("zip5", "npi"), "name": "primary_zip5_npi", "where": "type='primary'"},
+        {
+            "index_elements": (
+                "regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g')",
+                "npi",
+            ),
+            "name": "primary_phone_digits_npi",
+            "where": "type='primary'",
+        },
         {"index_elements": ("address_sources",), "using": "gin", "name": "address_sources"},
         {"index_elements": ("row_origin",), "name": "row_origin"},
         {"index_elements": ("address_precision",), "name": "address_precision"},

@@ -192,6 +192,78 @@ async def test_get_npi_includes_provider_enrichment(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_get_npi_filters_non_street_addresses_unless_extra_info(monkeypatch):
+    async def fake_build(_npi, **_kwargs):
+        return {
+            "npi": _npi,
+            "taxonomy_list": [],
+            "taxonomy_group_list": [],
+            "address_list": [
+                {
+                    "type": "primary",
+                    "first_line": "1200 1ST ST NE",
+                    "city_name": "WASHINGTON",
+                    "state_name": "DC",
+                    "postal_code": "20002",
+                    "address_key": "3a47e595-03bf-597d-8825-04b75d783fc9",
+                    "address_precision": "street",
+                    "address_sources": ["nppes"],
+                    "source_count": 1,
+                    "lat": 38.0,
+                    "long": -77.0,
+                },
+                {
+                    "type": "practice",
+                    "first_line": "1200 First Street, NE",
+                    "city_name": "WASHINGTON",
+                    "state_name": "DC",
+                    "postal_code": "20002",
+                    "address_key": "3a47e595-03bf-597d-8825-04b75d783fc9",
+                    "address_precision": "street",
+                    "address_sources": ["mrf"],
+                    "source_count": 1,
+                    "lat": 38.0,
+                    "long": -77.0,
+                },
+                {
+                    "type": "secondary",
+                    "first_line": None,
+                    "city_name": "WASHINGTON",
+                    "state_name": "DC",
+                    "postal_code": "20002",
+                    "address_precision": "city_zip",
+                    "lat": 38.0,
+                    "long": -77.0,
+                },
+            ],
+            "do_business_as": [],
+        }
+
+    monkeypatch.setattr(npi_module, "_build_npi_details", fake_build)
+    monkeypatch.setattr(npi_module, "_fetch_other_names", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        npi_module,
+        "_fetch_provider_enrichment_detail",
+        AsyncMock(return_value={"summary": {"status": "enriched"}, "enrollments": {"ffs_public": []}}),
+    )
+
+    npi_module._NPI_DETAIL_RESPONSE_CACHE.clear()
+    default_response = await npi_module.get_npi(types.SimpleNamespace(args={}), "1518379601")
+    default_payload = json.loads(default_response.body)
+    assert [address["address_precision"] for address in default_payload["address_list"]] == ["street"]
+    assert default_payload["address_list"][0]["address_sources"] == ["nppes", "mrf"]
+    assert default_payload["address_list"][0]["source_count"] == 2
+
+    npi_module._NPI_DETAIL_RESPONSE_CACHE.clear()
+    extra_response = await npi_module.get_npi(
+        types.SimpleNamespace(args={"extra_info": "true"}),
+        "1518379601",
+    )
+    extra_payload = json.loads(extra_response.body)
+    assert [address["address_precision"] for address in extra_payload["address_list"]] == ["street", "city_zip"]
+
+
+@pytest.mark.asyncio
 async def test_get_npi_can_include_chain_provider_enrichment(monkeypatch):
     async def fake_build(_npi):
         return {

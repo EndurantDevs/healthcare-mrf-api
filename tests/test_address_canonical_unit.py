@@ -378,6 +378,7 @@ def test_ordinal_and_saint_street_tokens_are_canonicalized_safely():
     assert address_canon.street_norm("200 14 St", "",) == address_canon.street_norm("200 14th St", "")
     assert address_canon.street_norm("200 14h St", "",) == address_canon.street_norm("200 14th St", "")
     assert address_canon.street_norm("200 First Ave", "",) == address_canon.street_norm("200 1st Ave", "")
+    assert address_canon.street_norm("1200 First Street, NE", "") == address_canon.street_norm("1200 1ST ST NE", "")
     assert address_canon.street_norm("200 Saint Clair Ave", "",) == address_canon.street_norm("200 St Clair Ave", "")
 
     assert address_canon.street_norm("14H Main St", "") != address_canon.street_norm("14 Main St", "")
@@ -415,6 +416,9 @@ def test_current_identity_key_drops_city_only_for_street_precision():
     assert city_zip == "v2|||newyork|NY|10009|US|city_zip"
     assert address_canon.address_key_v1("100 Saint Clair Ave", "", "Cleveland", "OH", "44114", "US") == (
         address_canon.address_key_v1("100 St Clair Ave", "", "Cleveland Heights", "OH", "44114", "US")
+    )
+    assert address_canon.address_key_v1("1200 First Street, NE", "", "Washington", "DC", "20002", "US") == (
+        address_canon.address_key_v1("1200 1ST ST NE", "", "Washington", "DC", "20002-3361", "US")
     )
 
 
@@ -1348,10 +1352,10 @@ def test_entity_address_unified_sql_carries_address_key(monkeypatch):
     assert "place_id = COALESCE(k.archive_place_id, r.place_id)" in enrich_sql
     assert "location_key = encode(sha256(convert_to" in enrich_sql
     assert "COALESCE(" in insert_sql
-    assert "address_key::uuid," in insert_sql
     assert (
         "CASE WHEN address_source = 'ptg' THEN NULL::uuid ELSE "
-        "mrf.addr_key_v1(first_line, second_line, city_name, state_name, postal_code, country_code) END"
+        "mrf.addr_key_v1(first_line, second_line, city_name, state_name, postal_code, country_code) END,\n"
+        "                address_key::uuid"
     ) in insert_sql
     assert "ptg_plan_array," in insert_sql
     assert "COALESCE(ptg_plan_array, ARRAY[]::varchar[])::varchar[] AS ptg_plan_array" in insert_sql
@@ -2104,6 +2108,14 @@ def test_entity_address_unified_indexes_cover_primary_serving_queries():
         "name": "primary_zip5_npi",
         "where": "type='primary'",
     }
+    assert indexes["primary_phone_digits_npi"] == {
+        "index_elements": (
+            "regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g')",
+            "npi",
+        ),
+        "name": "primary_phone_digits_npi",
+        "where": "type='primary'",
+    }
     assert indexes["primary_state_city_npi"] == {
         "index_elements": ("state_name", "city_name", "npi"),
         "name": "primary_state_city_npi",
@@ -2748,8 +2760,14 @@ def test_entity_address_unified_sql_falls_back_without_canonical_functions():
         address_canon_available=False,
     )
 
-    assert "CASE WHEN address_source = 'ptg' THEN NULL::uuid ELSE NULL::uuid END" in insert_sql
-    assert "CASE WHEN address_source = 'ptg' THEN NULL::uuid ELSE NULL::uuid END" in direct_sql
+    assert (
+        "CASE WHEN address_source = 'ptg' THEN NULL::uuid ELSE NULL::uuid END,\n"
+        "                address_key::uuid"
+    ) in insert_sql
+    assert (
+        "CASE WHEN address_source = 'ptg' THEN NULL::uuid ELSE NULL::uuid END,\n"
+        "                address_key::uuid"
+    ) in direct_sql
     assert "addr_key_v1" not in insert_sql
     assert "addr_key_v1" not in direct_sql
     assert "ARRAY_AGG(lat ORDER BY (lat IS NULL), source_priority ASC" in direct_sql

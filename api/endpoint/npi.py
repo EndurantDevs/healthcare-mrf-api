@@ -10,6 +10,7 @@ import random
 import re
 import time
 import urllib.parse
+import uuid
 from collections import OrderedDict, defaultdict
 from datetime import datetime
 from textwrap import dedent
@@ -566,6 +567,7 @@ def _npi_detail_cache_key(
     *,
     view: str,
     include_chain: bool,
+    extra_info: bool,
     sync_geocode: bool,
     lookup_stored_geocode: bool,
     include_sources: bool = False,
@@ -578,7 +580,8 @@ def _npi_detail_cache_key(
     debug_mode = f"sources:{int(include_sources)}|evidence:{int(include_evidence)}"
     return (
         f"{schema}|{address_source}|{int(npi)}|{view}|"
-        f"{'chain' if include_chain else 'default'}|{geocode_mode}|{archive_mode}|{debug_mode}"
+        f"{'chain' if include_chain else 'default'}|"
+        f"extra:{int(extra_info)}|{geocode_mode}|{archive_mode}|{debug_mode}"
     )
 
 
@@ -620,6 +623,100 @@ def _npi_detail_response_cacheable(
         if isinstance(address, dict) and not address.get("lat"):
             return False
     return True
+
+
+def _is_public_street_level_address(address: Any) -> bool:
+    if not isinstance(address, dict):
+        return False
+    precision = address.get("address_precision")
+    if precision is None:
+        return True
+    return str(precision).strip().lower() == "street"
+
+
+def _address_type_rank(address: Mapping[str, Any]) -> int:
+    return {
+        "primary": 0,
+        "practice": 1,
+        "site": 2,
+        "secondary": 3,
+        "mail": 4,
+    }.get(str(address.get("type") or "").strip().lower(), 9)
+
+
+def _merge_unique_list_values(first: Any, second: Any) -> list[Any]:
+    merged: list[Any] = []
+    seen: set[str] = set()
+    for values in (first, second):
+        if values is None:
+            continue
+        candidates = values if isinstance(values, list) else [values]
+        for value in candidates:
+            if value in (None, ""):
+                continue
+            marker = json.dumps(value, sort_keys=True, default=str)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            merged.append(value)
+    return merged
+
+
+def _merge_duplicate_address(base: dict[str, Any], duplicate: Mapping[str, Any]) -> None:
+    for key in (
+        "address_sources",
+        "source_record_ids",
+        "aca_plan_array",
+        "aca_network_array",
+        "ptg_plan_array",
+        "ptg_source_array",
+        "group_plan_array",
+        "taxonomy_array",
+        "plans_network_array",
+        "procedures_array",
+        "medications_array",
+    ):
+        merged = _merge_unique_list_values(base.get(key), duplicate.get(key))
+        if merged:
+            base[key] = merged
+
+    for key in ("telephone_number", "fax_number", "formatted_address", "lat", "long", "place_id"):
+        if base.get(key) in (None, "") and duplicate.get(key) not in (None, ""):
+            base[key] = duplicate.get(key)
+
+    merged_sources = base.get("address_sources") or []
+    if isinstance(merged_sources, list):
+        base["source_count"] = max(
+            int(base.get("source_count") or 0),
+            int(duplicate.get("source_count") or 0),
+            len(merged_sources),
+        )
+        base["independent_source_count"] = max(
+            int(base.get("independent_source_count") or 0),
+            int(duplicate.get("independent_source_count") or 0),
+            len(merged_sources),
+        )
+        base["multi_source_confirmed"] = len(merged_sources) > 1
+
+
+def _dedupe_addresses_by_key(addresses: Sequence[Any]) -> list[dict[str, Any]]:
+    keyed: dict[str, dict[str, Any]] = {}
+    unkeyed: list[dict[str, Any]] = []
+    for address in sorted(
+        (entry for entry in addresses if isinstance(entry, dict)),
+        key=lambda entry: (_address_type_rank(entry), str(entry.get("first_line") or "")),
+    ):
+        raw_key = address.get("address_key")
+        key = str(raw_key).strip().lower() if raw_key not in (None, "") else ""
+        if not key:
+            unkeyed.append(address)
+            continue
+        existing = keyed.get(key)
+        if existing is None:
+            keyed[key] = address
+            continue
+        _merge_duplicate_address(existing, address)
+    return list(keyed.values()) + unkeyed
 
 
 async def _execute_stmt(stmt: Any, *, session: Any = None, params: Optional[dict[str, Any]] = None):
@@ -1051,6 +1148,18 @@ def _normalize_phone_digits(raw: Optional[str]) -> Optional[str]:
             "phone must contain between 7 and 15 digits"
         )
     return digits
+
+
+def _normalize_address_key(raw: Optional[str]) -> Optional[str]:
+    if raw is None:
+        return None
+    text_value = str(raw).strip()
+    if not text_value:
+        return None
+    try:
+        return str(uuid.UUID(text_value))
+    except (TypeError, ValueError) as exc:
+        raise sanic.exceptions.InvalidUsage("address_key must be a valid UUID") from exc
 
 
 def _normalize_code_system(raw: Optional[str], param_name: str, allowed: set[str]) -> str:
@@ -2174,6 +2283,7 @@ async def get_all(request):
     last_name = request.args.get("last_name")
     organization_name = request.args.get("organization_name")
     phone = request.args.get("phone")
+    address_key_raw = request.args.get("address_key")
     zip_code_raw = request.args.get("zip_code")
     postal_code_raw = request.args.get("postal_code")
     entity_type_code_raw = request.args.get("entity_type_code")
@@ -2305,6 +2415,7 @@ async def get_all(request):
     zip_code = zip_code or postal_code
 
     phone_digits = _normalize_phone_digits(phone)
+    address_key = _normalize_address_key(address_key_raw)
     entity_type_code: Optional[int] = None
     if entity_type_code_raw not in (None, ""):
         try:
@@ -2327,6 +2438,7 @@ async def get_all(request):
         "last_name": last_name,
         "organization_name": organization_name,
         "phone_digits": phone_digits,
+        "address_key": address_key,
         "zip_code": zip_code,
         "entity_type_code": entity_type_code,
         "plan_network": plan_network,
@@ -2363,6 +2475,7 @@ async def get_all(request):
             "last_name",
             "organization_name",
             "phone_digits",
+            "address_key",
             "zip_code",
             "entity_type_code",
             "plan_network",
@@ -2453,6 +2566,7 @@ async def get_all(request):
         state = filters.get("state")
         zip_code = filters.get("zip_code")
         phone_digits = filters.get("phone_digits")
+        address_key = filters.get("address_key")
 
         taxonomy_filters = []
         if classification:
@@ -2493,6 +2607,8 @@ async def get_all(request):
             address_where.append(
                 "regexp_replace(COALESCE(c.telephone_number, ''), '[^0-9]', '', 'g') = :phone_digits"
             )
+        if address_key:
+            address_where.append("c.address_key = CAST(:address_key AS uuid)")
         dynamic_code_params = _append_array_filters(address_where, filters)
 
         taxonomy_conditions = " AND ".join(taxonomy_filters) if taxonomy_filters else "1=1"
@@ -2555,6 +2671,7 @@ async def get_all(request):
             "state": state.upper() if state else None,
             "zip_code": zip_code,
             "phone_digits": phone_digits,
+            "address_key": address_key,
             "specialization": specialization,
             "first_name": first_name,
             "last_name": last_name,
@@ -2604,6 +2721,7 @@ async def get_all(request):
         state = filters.get("state")
         zip_code = filters.get("zip_code")
         phone_digits = filters.get("phone_digits")
+        address_key = filters.get("address_key")
 
         taxonomy_filters = []
         if classification:
@@ -2641,6 +2759,8 @@ async def get_all(request):
             address_where.append(
                 "regexp_replace(COALESCE(c.telephone_number, ''), '[^0-9]', '', 'g') = :phone_digits"
             )
+        if address_key:
+            address_where.append("c.address_key = CAST(:address_key AS uuid)")
         dynamic_code_params = _append_array_filters(address_where, filters)
         if npi_where:
             address_where.append(
@@ -2674,6 +2794,7 @@ async def get_all(request):
             "state": state,
             "zip_code": zip_code,
             "phone_digits": phone_digits,
+            "address_key": address_key,
             "specialization": specialization,
             "first_name": first_name,
             "last_name": last_name,
@@ -2798,6 +2919,7 @@ async def get_all(request):
         has_insurance = filters.get("has_insurance")
         zip_code = filters.get("zip_code")
         phone_digits = filters.get("phone_digits")
+        address_key = filters.get("address_key")
         where = []
         address_where = ["c.type = 'primary'"]
         if classification:
@@ -2825,6 +2947,8 @@ async def get_all(request):
             address_where.append(
                 "regexp_replace(COALESCE(c.telephone_number, ''), '[^0-9]', '', 'g') = :phone_digits"
             )
+        if address_key:
+            address_where.append("c.address_key = CAST(:address_key AS uuid)")
         dynamic_code_params = _append_array_filters(address_where, filters)
         npi_where, npi_params = _build_npi_where_clause(
             "b",
@@ -2909,6 +3033,7 @@ async def get_all(request):
                 state=state,
                 zip_code=zip_code,
                 phone_digits=phone_digits,
+                address_key=address_key,
                 **npi_params,
                 **dynamic_code_params,
             )
@@ -3046,6 +3171,7 @@ async def get_all(request):
                 last_name,
                 organization_name,
                 phone_digits,
+                address_key,
                 zip_code,
                 entity_type_code,
                 plan_network,
@@ -3882,6 +4008,7 @@ async def get_npi(request, npi):
     if _parse_bool_arg(request.args.get("debug"), default=False):
         include_sources = True
         include_evidence = True
+    include_extra_info = _parse_bool_arg(request.args.get("extra_info"), default=False)
     sync_geocode = _env_flag("HLTHPRT_NPI_DETAIL_SYNC_GEOCODE", "HLTHPRT_NPI_API_SYNC_GEOCODE", default=True)
     lookup_stored_geocode = _env_flag(
         "HLTHPRT_NPI_DETAIL_LOOKUP_STORED_GEOCODE",
@@ -3895,6 +4022,7 @@ async def get_npi(request, npi):
         npi,
         view=provider_enrichment_view,
         include_chain=include_chain_enrichment,
+        extra_info=include_extra_info,
         sync_geocode=sync_geocode,
         lookup_stored_geocode=lookup_stored_geocode,
         include_sources=include_sources,
@@ -4335,6 +4463,9 @@ async def get_npi(request, npi):
         raise sanic.exceptions.NotFound
 
     addresses = data.get("address_list") or []
+    if not include_extra_info:
+        addresses = [address for address in addresses if _is_public_street_level_address(address)]
+    addresses = _dedupe_addresses_by_key(addresses)
     if addresses:
         update_address_tasks = [_update_address(a) for a in addresses if a]
         if update_address_tasks:
