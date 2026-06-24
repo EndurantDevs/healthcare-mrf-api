@@ -1,0 +1,55 @@
+name: Queue dev deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: queue-dev-deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  queue:
+    name: Queue dev-node build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Install SSH key
+        env:
+          DEV_DEPLOY_SSH_KEY: ${{ secrets.DEV_DEPLOY_SSH_KEY }}
+          DEV_DEPLOY_KNOWN_HOSTS: ${{ secrets.DEV_DEPLOY_KNOWN_HOSTS }}
+        run: |
+          for name in DEV_DEPLOY_SSH_KEY DEV_DEPLOY_KNOWN_HOSTS; do
+            if [ -z "${!name}" ]; then
+              echo "::error::${name} is not configured"
+              exit 1
+            fi
+          done
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "${DEV_DEPLOY_SSH_KEY}" > ~/.ssh/dev-deploy
+          chmod 600 ~/.ssh/dev-deploy
+          printf '%s\n' "${DEV_DEPLOY_KNOWN_HOSTS}" > ~/.ssh/known_hosts
+
+      - name: Queue build on dev node
+        env:
+          DEV_DEPLOY_HOST: ${{ secrets.DEV_DEPLOY_HOST }}
+        run: |
+          if [ -z "${DEV_DEPLOY_HOST}" ]; then
+            echo "::error::DEV_DEPLOY_HOST is not configured"
+            exit 1
+          fi
+          if ! ssh -i ~/.ssh/dev-deploy \
+            -o IdentitiesOnly=yes \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile=~/.ssh/known_hosts \
+            "ubuntu@${DEV_DEPLOY_HOST}" \
+            "${GITHUB_SHA} ${GITHUB_REF_NAME} --detach" >/tmp/dev-deploy.out 2>/tmp/dev-deploy.err; then
+            echo "::error::Failed to queue dev deploy"
+            exit 1
+          fi
+          echo "Dev deploy queued."
