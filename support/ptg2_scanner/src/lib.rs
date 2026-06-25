@@ -63,6 +63,9 @@ mod python_api {
         if let Some(prefix) = payload.get("identity_prefix").and_then(Value::as_str) {
             dict.set_item("identity_prefix", prefix)?;
         }
+        if let Some(version) = payload.get("ruleset_version").and_then(Value::as_u64) {
+            dict.set_item("ruleset_version", version)?;
+        }
         if let Some(hash) = payload.get("pub28_sha256").and_then(Value::as_str) {
             dict.set_item("pub28_sha256", hash)?;
         }
