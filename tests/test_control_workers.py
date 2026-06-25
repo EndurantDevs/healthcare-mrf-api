@@ -15,6 +15,7 @@ def test_worker_registry_exposes_shared_and_finish_workers():
 
     assert by_importer["claims-procedures"]["worker_class"] == "process.ClaimsPricing"
     assert by_importer["ptg-address"]["worker_class"] == "process.PTGAddress"
+    assert by_importer["ptg-address-entity-refresh"]["worker_class"] == "process.EntityAddressUnified"
     assert by_importer["ms-drg"]["worker_class"] == "process.MSDRG"
     assert by_importer["terminology-synonyms"]["worker_class"] == "process.TerminologySynonyms"
     assert by_importer["openaddresses"]["worker_class"] == "process.OpenAddresses"
@@ -23,6 +24,7 @@ def test_worker_registry_exposes_shared_and_finish_workers():
     assert by_queue["arq:PTGNormal"]["worker_class"] == "process.PTGNormal"
     assert by_queue["arq:PTGLarge"]["worker_class"] == "process.PTGLarge"
     assert by_queue["arq:PTGHuge"]["worker_class"] == "process.PTGHuge"
+    assert "ptg-address-entity-refresh" in by_queue["arq:EntityAddressUnified"]["importers"]
     assert by_queue["arq:PartDFormularyNetwork_finish"]["role"] == "finish"
     assert by_queue["arq:PTGAddress_finish"]["role"] == "finish"
 
@@ -111,6 +113,32 @@ def test_ensure_worker_uses_explicit_ptg_lane(monkeypatch, tmp_path):
     assert captured["cmd"][-2:] == ["process.PTGSmall", "--burst"]
     assert captured["env"]["HLTHPRT_ACTIVE_WORKER_QUEUE"] == "arq:PTGSmall"
     assert captured["env"]["HLTHPRT_ACTIVE_WORKER_CLASS"] == "process.PTGSmall"
+
+
+def test_ensure_worker_starts_ptg_address_entity_refresh_shared_worker(monkeypatch, tmp_path):
+    class FakeProcess:
+        pid = 2468
+
+    captured: dict[str, object] = {}
+
+    monkeypatch.setenv("HLTHPRT_WORKER_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("HLTHPRT_WORKER_LOG_DIR", str(tmp_path / "logs"))
+
+    def fake_popen(cmd, *, env, **_kwargs):
+        captured["cmd"] = cmd
+        captured["env"] = env
+        return FakeProcess()
+
+    monkeypatch.setattr(control_workers.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(control_workers, "_pid_running", lambda pid: pid == FakeProcess.pid)
+    monkeypatch.setattr(control_workers, "_pid_matches_spec", lambda pid, spec: True)
+
+    result = control_workers.ensure_worker({"importer": "ptg-address-entity-refresh", "run_id": "run_refresh"})
+
+    assert result["status"] == "started"
+    assert result["items"][0]["worker_class"] == "process.EntityAddressUnified"
+    assert captured["cmd"][-2:] == ["process.EntityAddressUnified", "--burst"]
+    assert captured["env"]["HLTHPRT_ACTIVE_WORKER_QUEUE"] == "arq:EntityAddressUnified"
 
 
 def test_ensure_worker_rejects_mismatched_explicit_ptg_lane():
