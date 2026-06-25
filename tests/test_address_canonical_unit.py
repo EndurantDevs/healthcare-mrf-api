@@ -189,6 +189,39 @@ def test_unit_extraction_uses_one_decision_for_street_and_unit():
     assert ste_300_apt_5 == "v2|123mainstste300|apt5||TX|78701|US|street"
     assert address_canon.key_from_identity(ste_200_apt_5) != address_canon.key_from_identity(ste_300_apt_5)
 
+    duplicate_suite = address_canon.identity_key_v1(
+        "123 Main St Suite 100",
+        "Suite 100",
+        "Austin",
+        "TX",
+        "78701",
+        "US",
+    )
+    line2_suite = address_canon.identity_key_v1(
+        "123 Main St",
+        "Suite 100",
+        "Austin",
+        "TX",
+        "78701",
+        "US",
+    )
+    inline_suite = address_canon.identity_key_v1(
+        "123 Main St Ste 100",
+        "",
+        "Austin",
+        "TX",
+        "78701",
+        "US",
+    )
+    assert duplicate_suite == "v2|123mainst|ste100||TX|78701|US|street"
+    assert duplicate_suite == line2_suite == inline_suite
+    assert address_canon.street_norm("123 Main St Suite 100", "Suite 100") == "123mainst"
+    assert address_canon.unit_norm("123 Main St Suite 100", "Suite 100") == "ste100"
+    assert (
+        address_canon.identity_key_v1("123 Main St 1st Fl", "1st Floor", "Austin", "TX", "78701", "US")
+        == "v2|123mainst|fl1||TX|78701|US|street"
+    )
+
     assert address_canon.identity_key_v1(
         "123 Main St Ste 200",
         "Suite",
@@ -235,6 +268,30 @@ def test_unit_extraction_uses_one_decision_for_street_and_unit():
         str(address_canon.address_key_v1("27 Dr Mellichamp Dr\xa0Ste 100", "", "BLUFFTON", "SC", "29910", "US"))
         == "3e3ea29f-8c26-17ba-dcc8-74424e66fd32"
     )
+
+
+def test_unit_extraction_handles_high_confidence_free_text_variants():
+    assert address_canon.unit_norm("123 Main St", "Suite E") == "stee"
+    assert address_canon.street_norm("123 Main St", "Suite E") == "123mainst"
+    assert address_canon.unit_norm("123 Main St STE W", "") == "stew"
+    assert address_canon.street_norm("123 Main St STE W", "") == "123mainst"
+    assert address_canon.unit_norm("123 Main St", "Unit N") == "unitn"
+    assert address_canon.street_norm("123 Main St", "Unit N") == "123mainst"
+
+    assert address_canon.unit_norm("123 Main St", "Suite 200 A") == "ste200a"
+    assert address_canon.street_norm("123 Main St", "Suite 200 A") == "123mainst"
+    assert address_canon.unit_norm("123 Main St STE 310 D", "") == "ste310d"
+    assert address_canon.street_norm("123 Main St STE 310 D", "") == "123mainst"
+
+    assert address_canon.unit_norm("123 Main St", "2nd Floor") == "fl2"
+    assert address_canon.unit_norm("123 Main St", "Second Fl") == "fl2"
+    assert address_canon.street_norm("123 Main St", "Second Fl") == "123mainst"
+    assert address_canon.unit_norm("123 Main St 1st Fl", "") == "fl1"
+    assert address_canon.street_norm("123 Main St 1st Fl", "") == "123mainst"
+
+    assert address_canon.unit_norm("123 Main St", "Suite Road") == ""
+    assert address_canon.unit_norm("123 Main St", "Floor Road") == ""
+    assert address_canon.unit_norm("123 Main St", "Unit 200 A") == ""
 
 
 def test_non_us_addresses_are_not_keyed():

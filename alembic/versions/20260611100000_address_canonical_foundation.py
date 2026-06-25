@@ -63,6 +63,8 @@ ORDINAL_WORD_MAP = {
     "twentieth": "20",
     "thirtieth": "30",
 }
+EXPLICIT_SINGLE_LETTER_UNIT_PREFIXES = {"apt", "ste", "unit"}
+SPACED_UNIT_SUFFIX_PREFIXES = {"ste"}
 
 
 def _schema() -> str:
@@ -125,6 +127,11 @@ def _unit_regex() -> str:
     return "(" + "|".join(escaped) + ")"
 
 
+def _floor_value_regex() -> str:
+    words = sorted((value.replace("'", "''") for value in ORDINAL_WORD_MAP), key=len, reverse=True)
+    return "(" + "|".join([r"[0-9]+(st|nd|rd|th)?", *words]) + ")"
+
+
 def _create_functions_sql(schema: str) -> str:
     qschema = _quote_ident(schema)
     street_token_case = _case_pairs({**PUB28_STREET_SUFFIX_MAP, **PUB28_DIRECTIONAL_MAP}, indent="            ")
@@ -134,8 +141,11 @@ def _create_functions_sql(schema: str) -> str:
     state_case = _case_pairs(PUB28_STATE_MAP)
     unit_case = _case_pairs(PUB28_UNIT_DESIGNATOR_MAP)
     unit_regex = _unit_regex()
+    floor_value_regex = _floor_value_regex()
     unit_no_range = _sql_in(PUB28_UNIT_NO_RANGE)
     invalid_unit_values = _sql_in(PUB28_INVALID_UNIT_VALUES)
+    explicit_single_letter_unit_prefixes = _sql_in(EXPLICIT_SINGLE_LETTER_UNIT_PREFIXES)
+    spaced_unit_suffix_prefixes = _sql_in(SPACED_UNIT_SUFFIX_PREFIXES)
     return rf"""
 CREATE OR REPLACE FUNCTION {qschema}.addr_clean_alnum_v1(value text)
 RETURNS text
@@ -249,6 +259,96 @@ AS $$
     FROM cleaned
 $$;
 
+CREATE OR REPLACE FUNCTION {qschema}.addr_floor_value_norm_v1(value text)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE
+PARALLEL SAFE
+AS $$
+    WITH cleaned AS (
+        SELECT regexp_replace(lower(COALESCE(value, '')), '[^a-z0-9]', '', 'g') AS v
+    )
+    SELECT CASE
+        WHEN v ~ '^0*[1-9][0-9]*(st|nd|rd|th)$'
+            THEN regexp_replace(v, '^0*([1-9][0-9]*)(st|nd|rd|th)$', '\1')
+        WHEN v ~ '^0*[1-9][0-9]*$'
+            THEN regexp_replace(v, '^0*([1-9][0-9]*)$', '\1')
+        ELSE CASE v
+{ordinal_word_case}
+            ELSE NULL
+        END
+    END
+    FROM cleaned
+$$;
+
+CREATE OR REPLACE FUNCTION {qschema}.addr_strip_duplicate_tail_unit_v1(street_text text, unit_norm text)
+RETURNS text
+LANGUAGE plpgsql
+IMMUTABLE
+PARALLEL SAFE
+AS $$
+DECLARE
+    raw text := COALESCE(street_text, '');
+    wanted text := COALESCE(unit_norm, '');
+    m text[];
+    prefix text;
+    unit_value text;
+    unit_value_raw text;
+    tail_unit text;
+    has_spaced_suffix boolean;
+BEGIN
+    IF wanted = '' THEN
+        RETURN raw;
+    END IF;
+
+    m := regexp_match(raw,
+        '(^|[\s,]){floor_value_regex}\s+(floor|fl)\.?[.,;:]*\s*$');
+    IF m IS NOT NULL THEN
+        unit_value := {qschema}.addr_floor_value_norm_v1(m[2]);
+        IF unit_value IS NOT NULL AND 'fl' || unit_value = wanted THEN
+            RETURN regexp_replace(raw,
+                '(^|[\s,]){floor_value_regex}\s+(floor|fl)\.?[.,;:]*\s*$',
+                '',
+                '');
+        END IF;
+    END IF;
+
+    m := regexp_match(raw,
+        '(^|[\s,]){unit_regex}\.?\s*(#\s*)?(([a-z0-9][a-z0-9-]*)(\s+[a-z0-9])?)?[.,;:]*\s*$');
+    IF m IS NOT NULL THEN
+        prefix := {qschema}.addr_unit_prefix_v1(m[2]);
+        unit_value_raw := COALESCE(m[4], '');
+        has_spaced_suffix := unit_value_raw ~ '\s';
+        unit_value := regexp_replace(lower(unit_value_raw), '[^a-z0-9]', '', 'g');
+
+        IF prefix IS NOT NULL THEN
+            IF unit_value = '' THEN
+                IF NOT {qschema}.addr_unit_range_required_v1(prefix) THEN
+                    tail_unit := prefix;
+                END IF;
+            ELSIF
+                (NOT has_spaced_suffix OR prefix IN ({spaced_unit_suffix_prefixes}))
+                AND (
+                    {qschema}.addr_unit_value_valid_v1(unit_value)
+                    OR (prefix IN ({explicit_single_letter_unit_prefixes}) AND unit_value ~ '^[a-z]$')
+                )
+            THEN
+                tail_unit := prefix || unit_value;
+            END IF;
+
+            IF tail_unit = wanted THEN
+                RETURN regexp_replace(raw,
+                    '(^|[\s,]){unit_regex}\.?\s*(#\s*)?(([a-z0-9][a-z0-9-]*)(\s+[a-z0-9])?)?[.,;:]*\s*$',
+                    '',
+                    '');
+            END IF;
+        END IF;
+    END IF;
+
+    RETURN raw;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION {qschema}.addr_unit_norm_v1(line1 text, line2 text)
 RETURNS text
 LANGUAGE plpgsql
@@ -259,15 +359,28 @@ DECLARE
     m text[];
     prefix text;
     unit_value text;
+    unit_value_raw text;
+    has_spaced_suffix boolean;
 BEGIN
     line1 := {qschema}.addr_space_norm_v1(line1);
     line2 := {qschema}.addr_space_norm_v1(line2);
 
     m := regexp_match(lower(COALESCE(line2, '')),
-        '^\s*{unit_regex}\.?\s*(#\s*)?([a-z0-9][a-z0-9-]*)?[.,;:]*\s*$');
+        '^\s*{floor_value_regex}\s+(floor|fl)\.?[.,;:]*\s*$');
+    IF m IS NOT NULL THEN
+        unit_value := {qschema}.addr_floor_value_norm_v1(m[1]);
+        IF unit_value IS NOT NULL AND unit_value <> '' THEN
+            RETURN 'fl' || unit_value;
+        END IF;
+    END IF;
+
+    m := regexp_match(lower(COALESCE(line2, '')),
+        '^\s*{unit_regex}\.?\s*(#\s*)?(([a-z0-9][a-z0-9-]*)(\s+[a-z0-9])?)?[.,;:]*\s*$');
     IF m IS NOT NULL THEN
         prefix := {qschema}.addr_unit_prefix_v1(m[1]);
-        unit_value := m[3];
+        unit_value_raw := COALESCE(m[3], '');
+        has_spaced_suffix := unit_value_raw ~ '\s';
+        unit_value := unit_value_raw;
 
         IF prefix IS NULL THEN
             RETURN '';
@@ -281,7 +394,14 @@ BEGIN
             RETURN '';
         END IF;
 
-        IF NOT {qschema}.addr_unit_value_valid_v1(unit_value) THEN
+        IF has_spaced_suffix AND prefix NOT IN ({spaced_unit_suffix_prefixes}) THEN
+            RETURN '';
+        END IF;
+
+        IF NOT (
+            {qschema}.addr_unit_value_valid_v1(unit_value)
+            OR (prefix IN ({explicit_single_letter_unit_prefixes}) AND unit_value ~ '^[a-z]$')
+        ) THEN
             RETURN '';
         END IF;
 
@@ -289,10 +409,21 @@ BEGIN
     END IF;
 
     m := regexp_match(' ' || lower(COALESCE(line1, '')) || ' ' || lower(COALESCE(line2, '')) || ' ',
-        '(^|[\s,]){unit_regex}\.?\s*(#\s*)?([a-z0-9][a-z0-9-]*)?[.,;:]*\s*$');
+        '(^|[\s,]){floor_value_regex}\s+(floor|fl)\.?[.,;:]*\s*$');
+    IF m IS NOT NULL THEN
+        unit_value := {qschema}.addr_floor_value_norm_v1(m[2]);
+        IF unit_value IS NOT NULL AND unit_value <> '' THEN
+            RETURN 'fl' || unit_value;
+        END IF;
+    END IF;
+
+    m := regexp_match(' ' || lower(COALESCE(line1, '')) || ' ' || lower(COALESCE(line2, '')) || ' ',
+        '(^|[\s,]){unit_regex}\.?\s*(#\s*)?(([a-z0-9][a-z0-9-]*)(\s+[a-z0-9])?)?[.,;:]*\s*$');
     IF m IS NOT NULL THEN
         prefix := {qschema}.addr_unit_prefix_v1(m[2]);
-        unit_value := m[4];
+        unit_value_raw := COALESCE(m[4], '');
+        has_spaced_suffix := unit_value_raw ~ '\s';
+        unit_value := unit_value_raw;
     END IF;
 
     IF prefix IS NULL THEN
@@ -307,7 +438,14 @@ BEGIN
         RETURN '';
     END IF;
 
-    IF NOT {qschema}.addr_unit_value_valid_v1(unit_value) THEN
+    IF has_spaced_suffix AND prefix NOT IN ({spaced_unit_suffix_prefixes}) THEN
+        RETURN '';
+    END IF;
+
+    IF NOT (
+        {qschema}.addr_unit_value_valid_v1(unit_value)
+        OR (prefix IN ({explicit_single_letter_unit_prefixes}) AND unit_value ~ '^[a-z]$')
+    ) THEN
         RETURN '';
     END IF;
 
@@ -406,30 +544,76 @@ DECLARE
     m text[];
     prefix text;
     unit_value text;
-    normalized text;
+    unit_value_raw text;
+    has_spaced_suffix boolean;
 BEGIN
     m := regexp_match(l2,
-        '^\s*{unit_regex}\.?\s*(#\s*)?([a-z0-9][a-z0-9-]*)?[.,;:]*\s*$');
+        '^\s*{floor_value_regex}\s+(floor|fl)\.?[.,;:]*\s*$');
     IF m IS NOT NULL THEN
-        prefix := {qschema}.addr_unit_prefix_v1(m[1]);
-        unit_value := regexp_replace(lower(COALESCE(m[3], '')), '[^a-z0-9]', '', 'g');
-        IF prefix IS NOT NULL AND (
-            (unit_value <> '' AND {qschema}.addr_unit_value_valid_v1(unit_value))
-            OR (unit_value = '' AND NOT {qschema}.addr_unit_range_required_v1(prefix))
-        ) THEN
-            raw := ' ' || l1 || ' ';
-        ELSE
-            raw := ' ' || l1 || ' ' || l2 || ' ';
+        unit_value := {qschema}.addr_floor_value_norm_v1(m[1]);
+        IF unit_value IS NOT NULL AND unit_value <> '' THEN
+            raw := {qschema}.addr_strip_duplicate_tail_unit_v1(' ' || l1 || ' ', 'fl' || unit_value);
         END IF;
-    ELSE
+    END IF;
+
+    IF raw IS NULL THEN
+        m := regexp_match(l2,
+            '^\s*{unit_regex}\.?\s*(#\s*)?(([a-z0-9][a-z0-9-]*)(\s+[a-z0-9])?)?[.,;:]*\s*$');
+        IF m IS NOT NULL THEN
+            prefix := {qschema}.addr_unit_prefix_v1(m[1]);
+            unit_value_raw := COALESCE(m[3], '');
+            has_spaced_suffix := unit_value_raw ~ '\s';
+            unit_value := regexp_replace(lower(unit_value_raw), '[^a-z0-9]', '', 'g');
+            IF prefix IS NOT NULL AND (
+                (
+                    unit_value <> ''
+                    AND (NOT has_spaced_suffix OR prefix IN ({spaced_unit_suffix_prefixes}))
+                    AND (
+                        {qschema}.addr_unit_value_valid_v1(unit_value)
+                        OR (prefix IN ({explicit_single_letter_unit_prefixes}) AND unit_value ~ '^[a-z]$')
+                    )
+                )
+                OR (unit_value = '' AND NOT {qschema}.addr_unit_range_required_v1(prefix))
+            ) THEN
+                raw := {qschema}.addr_strip_duplicate_tail_unit_v1(' ' || l1 || ' ', prefix || unit_value);
+            ELSE
+                raw := ' ' || l1 || ' ' || l2 || ' ';
+            END IF;
+        END IF;
+    END IF;
+
+    IF raw IS NULL THEN
         raw := ' ' || l1 || ' ' || l2 || ' ';
         m := regexp_match(raw,
-            '(^|[\s,]){unit_regex}\.?\s*(#\s*)?([a-z0-9][a-z0-9-]*)?[.,;:]*\s*$');
+            '(^|[\s,]){floor_value_regex}\s+(floor|fl)\.?[.,;:]*\s*$');
+        IF m IS NOT NULL THEN
+            unit_value := {qschema}.addr_floor_value_norm_v1(m[2]);
+            IF unit_value IS NOT NULL AND unit_value <> '' THEN
+                raw := regexp_replace(raw,
+                    '(^|[\s,]){floor_value_regex}\s+(floor|fl)\.?[.,;:]*\s*$',
+                    '',
+                    '');
+            END IF;
+        END IF;
+    END IF;
+
+    IF raw IS NOT NULL AND raw = ' ' || l1 || ' ' || l2 || ' ' THEN
+        m := regexp_match(raw,
+            '(^|[\s,]){unit_regex}\.?\s*(#\s*)?(([a-z0-9][a-z0-9-]*)(\s+[a-z0-9])?)?[.,;:]*\s*$');
         IF m IS NOT NULL THEN
             prefix := {qschema}.addr_unit_prefix_v1(m[2]);
-            unit_value := regexp_replace(lower(COALESCE(m[4], '')), '[^a-z0-9]', '', 'g');
+            unit_value_raw := COALESCE(m[4], '');
+            has_spaced_suffix := unit_value_raw ~ '\s';
+            unit_value := regexp_replace(lower(unit_value_raw), '[^a-z0-9]', '', 'g');
             IF prefix IS NOT NULL AND (
-                (unit_value <> '' AND {qschema}.addr_unit_value_valid_v1(unit_value))
+                (
+                    unit_value <> ''
+                    AND (NOT has_spaced_suffix OR prefix IN ({spaced_unit_suffix_prefixes}))
+                    AND (
+                        {qschema}.addr_unit_value_valid_v1(unit_value)
+                        OR (prefix IN ({explicit_single_letter_unit_prefixes}) AND unit_value ~ '^[a-z]$')
+                    )
+                )
                 OR (
                     unit_value = ''
                     AND trim(l2) = ''
@@ -437,7 +621,7 @@ BEGIN
                 )
             ) THEN
                 raw := regexp_replace(raw,
-                    '(^|[\s,]){unit_regex}\.?\s*(#\s*)?([a-z0-9][a-z0-9-]*)?[.,;:]*\s*$',
+                    '(^|[\s,]){unit_regex}\.?\s*(#\s*)?(([a-z0-9][a-z0-9-]*)(\s+[a-z0-9])?)?[.,;:]*\s*$',
                     '',
                     '');
             END IF;
@@ -959,6 +1143,8 @@ def downgrade() -> None:
         ("addr_street_token_is_suffix_v1", "text"),
         ("addr_street_token_norm_v1", "text"),
         ("addr_unit_norm_v1", "text, text"),
+        ("addr_strip_duplicate_tail_unit_v1", "text, text"),
+        ("addr_floor_value_norm_v1", "text"),
         ("addr_unit_value_valid_v1", "text"),
         ("addr_unit_range_required_v1", "text"),
         ("addr_unit_prefix_v1", "text"),

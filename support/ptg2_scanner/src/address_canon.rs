@@ -11,6 +11,7 @@ use std::sync::OnceLock;
 const PUB28_SOURCE: &str = include_str!("../../../process/ext/address_pub28.py");
 pub const ADDRESS_IDENTITY_VERSION: u8 = 2;
 pub const ADDRESS_IDENTITY_PREFIX: &str = "v2";
+pub const ADDRESS_CANON_RULESET_VERSION: u8 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonicalAddress {
@@ -300,18 +301,40 @@ fn unit_prefix(value: &str) -> Option<String> {
     tables().unit.get(&cleaned).cloned()
 }
 
-fn valid_unit_value(value: &str) -> bool {
+fn single_letter_unit_prefix_allowed(prefix: &str) -> bool {
+    matches!(prefix, "apt" | "ste" | "unit")
+}
+
+fn spaced_unit_suffix_allowed(prefix: &str) -> bool {
+    prefix == "ste"
+}
+
+fn valid_unit_value(value: &str, prefix: &str) -> bool {
     let cleaned = ascii_alnum_lower(value);
+    if !cleaned.is_empty()
+        && single_letter_unit_prefix_allowed(prefix)
+        && cleaned.len() == 1
+        && cleaned.chars().all(|ch| ch.is_ascii_alphabetic())
+    {
+        return true;
+    }
     !cleaned.is_empty() && !tables().invalid_unit_values.contains(&cleaned)
 }
 
-fn unit_from_parts(prefix_raw: &str, value_raw: Option<&str>) -> String {
+fn unit_from_parts(prefix_raw: &str, value_raw: Option<&str>, suffix_raw: Option<&str>) -> String {
     let Some(prefix) = unit_prefix(prefix_raw) else {
         return String::new();
     };
-    let cleaned = ascii_alnum_lower(value_raw.unwrap_or(""));
+    if suffix_raw.is_some_and(|suffix| !suffix.is_empty()) && !spaced_unit_suffix_allowed(&prefix) {
+        return String::new();
+    }
+    let cleaned = ascii_alnum_lower(&format!(
+        "{}{}",
+        value_raw.unwrap_or(""),
+        suffix_raw.unwrap_or("")
+    ));
     if !cleaned.is_empty() {
-        if !valid_unit_value(&cleaned) {
+        if !valid_unit_value(&cleaned, &prefix) {
             return String::new();
         }
         return format!("{prefix}{cleaned}");
@@ -321,6 +344,25 @@ fn unit_from_parts(prefix_raw: &str, value_raw: Option<&str>) -> String {
     } else {
         String::new()
     }
+}
+
+fn floor_value_norm(value: &str) -> Option<String> {
+    let cleaned = ascii_alnum_lower(value);
+    if cleaned.is_empty() {
+        return None;
+    }
+    if let Some(value) = numeric_ordinal_value(&cleaned) {
+        return Some(value);
+    }
+    if cleaned.chars().all(|ch| ch.is_ascii_digit()) {
+        let trimmed = cleaned.trim_start_matches('0');
+        return if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
+    }
+    ordinal_word_value(&cleaned).map(str::to_string)
 }
 
 fn unit_remainder_allowed(value: &str) -> bool {
@@ -383,12 +425,37 @@ fn parse_unit_at(value: &str, start: usize) -> UnitMatch {
         } else {
             None
         };
+        let mut suffix_value = None;
+        let suffix_checkpoint = pos;
+        let mut suffix_pos = pos;
+        let mut saw_suffix_whitespace = false;
+        while let Some(ch) = value[suffix_pos..].chars().next() {
+            if ch.is_whitespace() {
+                saw_suffix_whitespace = true;
+                suffix_pos += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        if saw_suffix_whitespace {
+            let suffix_start = suffix_pos;
+            if let Some(ch) = value[suffix_pos..].chars().next() {
+                if ch.is_ascii_alphanumeric() {
+                    suffix_pos += ch.len_utf8();
+                    suffix_value = Some(&value[suffix_start..suffix_pos]);
+                    pos = suffix_pos;
+                }
+            }
+        }
+        if suffix_value.is_none() {
+            pos = suffix_checkpoint;
+        }
         if !unit_remainder_allowed(&value[pos..]) {
             continue;
         }
         return UnitMatch {
             matched: true,
-            unit: unit_from_parts(key, unit_value),
+            unit: unit_from_parts(key, unit_value, suffix_value),
             has_value: unit_value.is_some(),
             start,
         };
@@ -401,10 +468,97 @@ fn parse_unit_at(value: &str, start: usize) -> UnitMatch {
     }
 }
 
+fn parse_floor_unit_at(value: &str, start: usize) -> UnitMatch {
+    let mut pos = start;
+    let value_start = pos;
+    if let Some(ch) = value[pos..].chars().next() {
+        if ch.is_ascii_alphanumeric() {
+            pos += ch.len_utf8();
+            while let Some(ch) = value[pos..].chars().next() {
+                if ch.is_ascii_alphanumeric() {
+                    pos += ch.len_utf8();
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    if pos == value_start {
+        return UnitMatch {
+            matched: false,
+            unit: String::new(),
+            has_value: false,
+            start,
+        };
+    }
+    let Some(floor_value) = floor_value_norm(&value[value_start..pos]) else {
+        return UnitMatch {
+            matched: false,
+            unit: String::new(),
+            has_value: false,
+            start,
+        };
+    };
+    let mut saw_whitespace = false;
+    while let Some(ch) = value[pos..].chars().next() {
+        if ch.is_whitespace() {
+            saw_whitespace = true;
+            pos += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if !saw_whitespace {
+        return UnitMatch {
+            matched: false,
+            unit: String::new(),
+            has_value: false,
+            start,
+        };
+    }
+    let remainder = &value[pos..];
+    let floor_len = if remainder.starts_with("floor") {
+        "floor".len()
+    } else if remainder.starts_with("fl") {
+        "fl".len()
+    } else {
+        return UnitMatch {
+            matched: false,
+            unit: String::new(),
+            has_value: false,
+            start,
+        };
+    };
+    pos += floor_len;
+    if value[pos..].starts_with('.') {
+        pos += 1;
+    }
+    if !unit_remainder_allowed(&value[pos..]) {
+        return UnitMatch {
+            matched: false,
+            unit: String::new(),
+            has_value: false,
+            start,
+        };
+    }
+    UnitMatch {
+        matched: true,
+        unit: format!("fl{floor_value}"),
+        has_value: true,
+        start,
+    }
+}
+
 fn parse_full_unit(value: &str) -> UnitMatch {
     let trimmed = value.trim_start();
     let start = value.len() - trimmed.len();
     parse_unit_at(value, start)
+}
+
+fn parse_full_floor_unit(value: &str) -> UnitMatch {
+    let trimmed = value.trim_start();
+    let start = value.len() - trimmed.len();
+    parse_floor_unit_at(value, start)
 }
 
 fn parse_tail_unit(value: &str) -> UnitMatch {
@@ -429,15 +583,67 @@ fn parse_tail_unit(value: &str) -> UnitMatch {
     }
 }
 
+fn parse_tail_floor_unit(value: &str) -> UnitMatch {
+    for (idx, ch) in value.char_indices() {
+        if idx != 0 && !ch.is_whitespace() && ch != ',' {
+            continue;
+        }
+        let start = idx + ch.len_utf8();
+        let candidate = parse_floor_unit_at(value, start);
+        if candidate.matched {
+            return UnitMatch {
+                start: idx,
+                ..candidate
+            };
+        }
+    }
+    UnitMatch {
+        matched: false,
+        unit: String::new(),
+        has_value: false,
+        start: 0,
+    }
+}
+
+fn strip_duplicate_tail_unit(street_text: String, unit: &str) -> String {
+    if unit.is_empty() {
+        return street_text;
+    }
+
+    let floor_tail = parse_tail_floor_unit(&street_text);
+    if floor_tail.matched && floor_tail.unit == unit {
+        return street_text[..floor_tail.start].to_string();
+    }
+
+    let tail = parse_tail_unit(&street_text);
+    if tail.matched && tail.unit == unit {
+        return street_text[..tail.start].to_string();
+    }
+
+    street_text
+}
+
 fn unit_decision(line1: Option<&str>, line2: Option<&str>) -> UnitDecision {
     let l1 = line1.unwrap_or("").to_lowercase();
     let l2 = line2.unwrap_or("").to_lowercase();
+    let line2_floor_match = parse_full_floor_unit(&l2);
+    if line2_floor_match.matched && !line2_floor_match.unit.is_empty() {
+        let unit = line2_floor_match.unit;
+        let street_text = strip_duplicate_tail_unit(format!(" {l1} "), &unit);
+        return UnitDecision {
+            unit,
+            street_text,
+        };
+    }
+
     let line2_match = parse_full_unit(&l2);
     if line2_match.matched {
         if !line2_match.unit.is_empty() {
+            let unit = line2_match.unit;
+            let street_text = strip_duplicate_tail_unit(format!(" {l1} "), &unit);
             return UnitDecision {
-                unit: line2_match.unit,
-                street_text: format!(" {l1} "),
+                unit,
+                street_text,
             };
         }
         return UnitDecision {
@@ -447,6 +653,14 @@ fn unit_decision(line1: Option<&str>, line2: Option<&str>) -> UnitDecision {
     }
 
     let joined = format!(" {l1} {l2} ");
+    let floor_tail = parse_tail_floor_unit(&joined);
+    if floor_tail.matched && !floor_tail.unit.is_empty() {
+        return UnitDecision {
+            unit: floor_tail.unit,
+            street_text: joined[..floor_tail.start].to_string(),
+        };
+    }
+
     let tail = parse_tail_unit(&joined);
     if tail.matched && !tail.unit.is_empty() && (tail.has_value || l2.trim().is_empty()) {
         return UnitDecision {
@@ -732,6 +946,7 @@ pub fn canon_version_json() -> String {
     serde_json::json!({
         "identity_version": ADDRESS_IDENTITY_VERSION,
         "identity_prefix": ADDRESS_IDENTITY_PREFIX,
+        "ruleset_version": ADDRESS_CANON_RULESET_VERSION,
         "pub28_sha256": pub28_sha256(),
     })
     .to_string()

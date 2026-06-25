@@ -48,9 +48,12 @@ ADDRESS_ZIP_RESTORE_REQUIRED_ENV = "HLTHPRT_ADDRESS_CANON_ZIP_RESTORE_REQUIRED"
 ADDRESS_ZIP_RESTORE_SHARDS_ENV = "HLTHPRT_ADDRESS_CANON_ZIP_RESTORE_SHARDS"
 CURRENT_ADDRESS_IDENTITY_VERSION = 2
 CURRENT_ADDRESS_IDENTITY_PREFIX = f"v{CURRENT_ADDRESS_IDENTITY_VERSION}"
+CURRENT_ADDRESS_CANON_RULESET_VERSION = 3
 _RUST_CANON_VERSION_CACHE: dict[str, bool] = {}
 _LATITUDE_COLUMN_CANDIDATES = ("lat", "latitude")
 _LONGITUDE_COLUMN_CANDIDATES = ("long", "lng", "longitude")
+EXPLICIT_SINGLE_LETTER_UNIT_PREFIXES = frozenset({"apt", "ste", "unit"})
+SPACED_UNIT_SUFFIX_PREFIXES = frozenset({"ste"})
 
 
 UNIT_DESIGNATOR_PATTERN = "|".join(
@@ -58,11 +61,13 @@ UNIT_DESIGNATOR_PATTERN = "|".join(
     for value in sorted(PUB28_UNIT_DESIGNATOR_MAP, key=len, reverse=True)
 )
 UNIT_RE = re.compile(
-    rf"^\s*({UNIT_DESIGNATOR_PATTERN})\.?\s*(?:#\s*)?([a-z0-9][a-z0-9-]*)?[\.,;:]*\s*$",
+    rf"^\s*({UNIT_DESIGNATOR_PATTERN})\.?\s*(?:#\s*)?"
+    rf"(?:([a-z0-9][a-z0-9-]*)(?:\s+([a-z0-9]))?)?[\.,;:]*\s*$",
     re.IGNORECASE,
 )
 UNIT_TAIL_RE = re.compile(
-    rf"(^|[\s,])({UNIT_DESIGNATOR_PATTERN})\.?\s*(?:#\s*)?([a-z0-9][a-z0-9-]*)?[\.,;:]*\s*$",
+    rf"(^|[\s,])({UNIT_DESIGNATOR_PATTERN})\.?\s*(?:#\s*)?"
+    rf"(?:([a-z0-9][a-z0-9-]*)(?:\s+([a-z0-9]))?)?[\.,;:]*\s*$",
     re.IGNORECASE,
 )
 NUMERIC_ORDINAL_RE = re.compile(r"^0*([1-9][0-9]*)(?:st|nd|rd|th)$")
@@ -90,6 +95,20 @@ ORDINAL_WORD_MAP = {
     "twentieth": "20",
     "thirtieth": "30",
 }
+FLOOR_VALUE_PATTERN = "|".join(
+    [
+        r"[0-9]+(?:st|nd|rd|th)?",
+        *(re.escape(value) for value in sorted(ORDINAL_WORD_MAP, key=len, reverse=True)),
+    ]
+)
+FLOOR_RE = re.compile(
+    rf"^\s*({FLOOR_VALUE_PATTERN})\s+(?:floor|fl)\.?[\.,;:]*\s*$",
+    re.IGNORECASE,
+)
+FLOOR_TAIL_RE = re.compile(
+    rf"(^|[\s,])({FLOOR_VALUE_PATTERN})\s+(?:floor|fl)\.?[\.,;:]*\s*$",
+    re.IGNORECASE,
+)
 STREET_SUFFIX_TOKENS = frozenset(PUB28_STREET_SUFFIX_MAP)
 DIRECTIONAL_TOKENS = frozenset(PUB28_DIRECTIONAL_MAP)
 
@@ -162,19 +181,29 @@ def _unit_prefix(value: str | None) -> str | None:
     return PUB28_UNIT_DESIGNATOR_MAP.get(cleaned)
 
 
-def _valid_unit_value(value: str | None) -> bool:
+def _valid_unit_value(value: str | None, prefix: str | None = None) -> bool:
     cleaned = re.sub(r"[^a-z0-9]", "", (value or "").lower())
+    if cleaned and prefix in EXPLICIT_SINGLE_LETTER_UNIT_PREFIXES and re.match(r"^[a-z]$", cleaned):
+        return True
     return bool(cleaned and cleaned not in PUB28_INVALID_UNIT_VALUES)
 
 
-def _unit_from_match(match: re.Match[str], prefix_group: int, value_group: int) -> str:
+def _unit_from_match(
+    match: re.Match[str],
+    prefix_group: int,
+    value_group: int,
+    suffix_group: int | None = None,
+) -> str:
     prefix = _unit_prefix(match.group(prefix_group))
     unit_value = match.group(value_group) or ""
+    suffix = match.group(suffix_group) if suffix_group is not None else ""
     if not prefix:
         return ""
-    cleaned = re.sub(r"[^a-z0-9]", "", unit_value.lower())
+    if suffix and prefix not in SPACED_UNIT_SUFFIX_PREFIXES:
+        return ""
+    cleaned = re.sub(r"[^a-z0-9]", "", f"{unit_value}{suffix or ''}".lower())
     if cleaned:
-        if not _valid_unit_value(cleaned):
+        if not _valid_unit_value(cleaned, prefix):
             return ""
         return f"{prefix}{cleaned}"
     if prefix in PUB28_UNIT_NO_RANGE:
@@ -182,20 +211,67 @@ def _unit_from_match(match: re.Match[str], prefix_group: int, value_group: int) 
     return ""
 
 
+def _floor_value_norm(value: str | None) -> str:
+    cleaned = re.sub(r"[^a-z0-9]", "", (value or "").lower())
+    if not cleaned:
+        return ""
+    numeric = NUMERIC_ORDINAL_RE.match(cleaned)
+    if numeric:
+        return numeric.group(1)
+    digits = re.match(r"^0*([1-9][0-9]*)$", cleaned)
+    if digits:
+        return digits.group(1)
+    return ORDINAL_WORD_MAP.get(cleaned, "")
+
+
+def _floor_from_match(match: re.Match[str], value_group: int) -> str:
+    value = _floor_value_norm(match.group(value_group))
+    return f"fl{value}" if value else ""
+
+
+def _strip_duplicate_tail_unit(street_text: str, unit: str) -> str:
+    if not unit:
+        return street_text
+
+    floor_tail = FLOOR_TAIL_RE.search(street_text)
+    if floor_tail and _floor_from_match(floor_tail, 2) == unit:
+        return street_text[: floor_tail.start()]
+
+    tail = UNIT_TAIL_RE.search(street_text)
+    if tail and _unit_from_match(tail, 2, 3, 4) == unit:
+        return street_text[: tail.start()]
+
+    return street_text
+
+
 def _unit_decision(line1: str | None, line2: str | None) -> _UnitDecision:
     l1 = (line1 or "").lower()
     l2 = (line2 or "").lower()
+    line2_floor = FLOOR_RE.match(l2)
+    if line2_floor:
+        unit = _floor_from_match(line2_floor, 1)
+        if unit:
+            street_text = _strip_duplicate_tail_unit(f" {l1} ", unit)
+            return _UnitDecision(unit=unit, street_text=street_text)
+
     line2_match = UNIT_RE.match(l2)
     if line2_match:
-        unit = _unit_from_match(line2_match, 1, 2)
+        unit = _unit_from_match(line2_match, 1, 2, 3)
         if unit:
-            return _UnitDecision(unit=unit, street_text=f" {l1} ")
+            street_text = _strip_duplicate_tail_unit(f" {l1} ", unit)
+            return _UnitDecision(unit=unit, street_text=street_text)
         return _UnitDecision(unit="", street_text=f" {l1} {l2} ")
 
     joined = f" {l1} {l2} "
+    floor_tail = FLOOR_TAIL_RE.search(joined)
+    if floor_tail:
+        unit = _floor_from_match(floor_tail, 2)
+        if unit:
+            return _UnitDecision(unit=unit, street_text=joined[: floor_tail.start()])
+
     tail = UNIT_TAIL_RE.search(joined)
     if tail:
-        unit = _unit_from_match(tail, 2, 3)
+        unit = _unit_from_match(tail, 2, 3, 4)
         if unit and (tail.group(3) or not l2.strip()):
             return _UnitDecision(unit=unit, street_text=joined[: tail.start()])
     return _UnitDecision(unit="", street_text=joined)
@@ -491,6 +567,7 @@ def current_canon_version() -> dict[str, Any]:
     return {
         "identity_version": CURRENT_ADDRESS_IDENTITY_VERSION,
         "identity_prefix": CURRENT_ADDRESS_IDENTITY_PREFIX,
+        "ruleset_version": CURRENT_ADDRESS_CANON_RULESET_VERSION,
         "pub28_sha256": pub28_source_sha256(),
     }
 
