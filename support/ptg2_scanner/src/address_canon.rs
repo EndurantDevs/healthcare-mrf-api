@@ -663,10 +663,7 @@ fn unit_decision(line1: Option<&str>, line2: Option<&str>) -> UnitDecision {
     if line2_floor_match.matched && !line2_floor_match.unit.is_empty() {
         let unit = line2_floor_match.unit;
         let street_text = strip_duplicate_tail_unit(format!(" {l1} "), &unit);
-        return UnitDecision {
-            unit,
-            street_text,
-        };
+        return UnitDecision { unit, street_text };
     }
 
     let line2_match = parse_full_unit(&l2);
@@ -674,10 +671,7 @@ fn unit_decision(line1: Option<&str>, line2: Option<&str>) -> UnitDecision {
         if !line2_match.unit.is_empty() {
             let unit = line2_match.unit;
             let street_text = strip_duplicate_tail_unit(format!(" {l1} "), &unit);
-            return UnitDecision {
-                unit,
-                street_text,
-            };
+            return UnitDecision { unit, street_text };
         }
         return UnitDecision {
             unit: String::new(),
