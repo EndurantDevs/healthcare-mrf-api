@@ -103,6 +103,38 @@ def _unit_parser_current(bind, foundation, schema: str) -> bool:
                     '78701',
                     'US'
                 )
+                AND {qschema}.addr_street_norm_v1('7281 E EARLL DR STE 1 BLDG A', 'Ste 1 Bldg A') = '7281eearlldrste1'
+                AND {qschema}.addr_identity_key_v1(
+                    '7281 E EARLL DR STE 1 BLDG A',
+                    'Ste 1 Bldg A',
+                    'Austin',
+                    'TX',
+                    '78701',
+                    'US'
+                ) = {qschema}.addr_identity_key_v1(
+                    '7281 E EARLL DR STE 1 BLDG A',
+                    '',
+                    'Austin',
+                    'TX',
+                    '78701',
+                    'US'
+                )
+                AND {qschema}.addr_street_norm_v1('1623 3rd Ave Ste 201 Ofc 5', 'Ste 201 Ofc 5') = '16233aveste201'
+                AND {qschema}.addr_identity_key_v1(
+                    '1623 3rd Ave Ste 201 Ofc 5',
+                    'Ste 201 Ofc 5',
+                    'Austin',
+                    'TX',
+                    '78701',
+                    'US'
+                ) = {qschema}.addr_identity_key_v1(
+                    '1623 3rd Ave Ste 201 Ofc 5',
+                    '',
+                    'Austin',
+                    'TX',
+                    '78701',
+                    'US'
+                )
                 AND {qschema}.addr_unit_norm_v1('100 Main Street', 'Suite Road') = '';
             """
         ).scalar()

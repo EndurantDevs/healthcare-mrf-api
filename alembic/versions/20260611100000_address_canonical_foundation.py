@@ -582,6 +582,13 @@ BEGIN
         END IF;
     END IF;
 
+    IF raw IS NULL AND l2 <> '' AND (l1 = l2 OR right(l1, length(l2) + 1) = ' ' || l2) THEN
+        unit_value := {qschema}.addr_unit_norm_v1('', l2);
+        IF unit_value <> '' THEN
+            raw := {qschema}.addr_strip_duplicate_tail_unit_v1(' ' || l1 || ' ', unit_value);
+        END IF;
+    END IF;
+
     IF raw IS NULL THEN
         raw := ' ' || l1 || ' ' || l2 || ' ';
         m := regexp_match(raw,

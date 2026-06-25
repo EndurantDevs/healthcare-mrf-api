@@ -193,6 +193,64 @@ async def test_address_canonical_sql_functions_are_immutable_parallel_safe_and_p
     assert await db.scalar(
         f"SELECT {schema}.addr_identity_key_v1('123 Main St 1st Fl', '1st Floor', 'Austin', 'TX', '78701', 'US');"
     ) == "v2|123mainst|fl1||TX|78701|US|street"
+    assert await db.scalar(
+        f"""
+        SELECT {schema}.addr_identity_key_v1(
+            '7281 E EARLL DR STE 1 BLDG A',
+            'Ste 1 Bldg A',
+            'Austin',
+            'TX',
+            '78701',
+            'US'
+        );
+        """
+    ) == await db.scalar(
+        f"""
+        SELECT {schema}.addr_identity_key_v1(
+            '7281 E EARLL DR STE 1 BLDG A',
+            '',
+            'Austin',
+            'TX',
+            '78701',
+            'US'
+        );
+        """
+    )
+    assert await db.scalar(
+        f"SELECT {schema}.addr_street_norm_v1('7281 E EARLL DR STE 1 BLDG A', 'Ste 1 Bldg A');"
+    ) == "7281eearlldrste1"
+    assert await db.scalar(
+        f"SELECT {schema}.addr_unit_norm_v1('7281 E EARLL DR STE 1 BLDG A', 'Ste 1 Bldg A');"
+    ) == "bldga"
+    assert await db.scalar(
+        f"""
+        SELECT {schema}.addr_identity_key_v1(
+            '1623 3rd Ave Ste 201 Ofc 5',
+            'Ste 201 Ofc 5',
+            'Austin',
+            'TX',
+            '78701',
+            'US'
+        );
+        """
+    ) == await db.scalar(
+        f"""
+        SELECT {schema}.addr_identity_key_v1(
+            '1623 3rd Ave Ste 201 Ofc 5',
+            '',
+            'Austin',
+            'TX',
+            '78701',
+            'US'
+        );
+        """
+    )
+    assert await db.scalar(
+        f"SELECT {schema}.addr_street_norm_v1('1623 3rd Ave Ste 201 Ofc 5', 'Ste 201 Ofc 5');"
+    ) == "16233aveste201"
+    assert await db.scalar(
+        f"SELECT {schema}.addr_unit_norm_v1('1623 3rd Ave Ste 201 Ofc 5', 'Ste 201 Ofc 5');"
+    ) == "ofc5"
     assert await db.scalar(f"SELECT {schema}.addr_unit_norm_v1('100 Main Street Basement', '');") == "bsmt"
     assert await db.scalar(f"SELECT {schema}.addr_unit_norm_v1('100 Main Street', 'Penthouse');") == "ph"
     assert await db.scalar(f"SELECT {schema}.addr_unit_norm_v1('123 Main St Ste 200', 'Apt 5');") == "apt5"

@@ -605,22 +605,55 @@ fn parse_tail_floor_unit(value: &str) -> UnitMatch {
     }
 }
 
+fn tail_unit(value: &str) -> Option<(String, usize)> {
+    let floor_tail = parse_tail_floor_unit(value);
+    if floor_tail.matched && !floor_tail.unit.is_empty() {
+        return Some((floor_tail.unit, floor_tail.start));
+    }
+
+    let tail = parse_tail_unit(value);
+    if tail.matched && !tail.unit.is_empty() {
+        return Some((tail.unit, tail.start));
+    }
+
+    None
+}
+
 fn strip_duplicate_tail_unit(street_text: String, unit: &str) -> String {
     if unit.is_empty() {
         return street_text;
     }
 
-    let floor_tail = parse_tail_floor_unit(&street_text);
-    if floor_tail.matched && floor_tail.unit == unit {
-        return street_text[..floor_tail.start].to_string();
-    }
-
-    let tail = parse_tail_unit(&street_text);
-    if tail.matched && tail.unit == unit {
-        return street_text[..tail.start].to_string();
+    if let Some((tail_unit, start)) = tail_unit(&street_text) {
+        if tail_unit == unit {
+            return street_text[..start].to_string();
+        }
     }
 
     street_text
+}
+
+fn collapse_spaces_lower(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn repeated_line2_suffix_decision(l1: &str, l2: &str) -> Option<UnitDecision> {
+    let l1_clean = collapse_spaces_lower(l1);
+    let l2_clean = collapse_spaces_lower(l2);
+    if l1_clean.is_empty() || l2_clean.is_empty() {
+        return None;
+    }
+    if l1_clean != l2_clean && !l1_clean.ends_with(&format!(" {l2_clean}")) {
+        return None;
+    }
+
+    let (unit, _) = tail_unit(&format!(" {l2_clean} "))?;
+    let street_text = strip_duplicate_tail_unit(format!(" {l1_clean} "), &unit);
+    Some(UnitDecision { unit, street_text })
 }
 
 fn unit_decision(line1: Option<&str>, line2: Option<&str>) -> UnitDecision {
@@ -650,6 +683,10 @@ fn unit_decision(line1: Option<&str>, line2: Option<&str>) -> UnitDecision {
             unit: String::new(),
             street_text: format!(" {l1} {l2} "),
         };
+    }
+
+    if let Some(decision) = repeated_line2_suffix_decision(&l1, &l2) {
+        return decision;
     }
 
     let joined = format!(" {l1} {l2} ");

@@ -221,6 +221,40 @@ def test_unit_extraction_uses_one_decision_for_street_and_unit():
         address_canon.identity_key_v1("123 Main St 1st Fl", "1st Floor", "Austin", "TX", "78701", "US")
         == "v2|123mainst|fl1||TX|78701|US|street"
     )
+    assert address_canon.identity_key_v1(
+        "7281 E EARLL DR STE 1 BLDG A",
+        "Ste 1 Bldg A",
+        "Austin",
+        "TX",
+        "78701",
+        "US",
+    ) == address_canon.identity_key_v1(
+        "7281 E EARLL DR STE 1 BLDG A",
+        "",
+        "Austin",
+        "TX",
+        "78701",
+        "US",
+    )
+    assert address_canon.street_norm("7281 E EARLL DR STE 1 BLDG A", "Ste 1 Bldg A") == "7281eearlldrste1"
+    assert address_canon.unit_norm("7281 E EARLL DR STE 1 BLDG A", "Ste 1 Bldg A") == "bldga"
+    assert address_canon.identity_key_v1(
+        "1623 3rd Ave Ste 201 Ofc 5",
+        "Ste 201 Ofc 5",
+        "Austin",
+        "TX",
+        "78701",
+        "US",
+    ) == address_canon.identity_key_v1(
+        "1623 3rd Ave Ste 201 Ofc 5",
+        "",
+        "Austin",
+        "TX",
+        "78701",
+        "US",
+    )
+    assert address_canon.street_norm("1623 3rd Ave Ste 201 Ofc 5", "Ste 201 Ofc 5") == "16233aveste201"
+    assert address_canon.unit_norm("1623 3rd Ave Ste 201 Ofc 5", "Ste 201 Ofc 5") == "ofc5"
 
     assert address_canon.identity_key_v1(
         "123 Main St Ste 200",

@@ -3710,6 +3710,32 @@
       "expected_premise_key": "670d0852-36bc-3ed7-e419-a3b6f05ef323"
     },
     {
+      "id": "compound-unit-repeat-building",
+      "first_line": "7281 E EARLL DR STE 1 BLDG A",
+      "second_line": "Ste 1 Bldg A",
+      "city": "PHOENIX",
+      "state": "AZ",
+      "zip": "85001",
+      "country": "US",
+      "expected_identity_key": "v2|7281eearlldrste1|bldga||AZ|85001|US|street",
+      "expected_address_key": "b3485362-1cfb-6817-4735-43bba6b8023b",
+      "expected_premise_identity_key": "v2|7281eearlldrste1|||AZ|85001|US|street",
+      "expected_premise_key": "519489da-f87a-76fe-acda-0ee9136e0444"
+    },
+    {
+      "id": "compound-unit-repeat-office",
+      "first_line": "1623 3rd Ave Ste 201 Ofc 5",
+      "second_line": "Ste 201 Ofc 5",
+      "city": "NEW YORK",
+      "state": "NY",
+      "zip": "10001",
+      "country": "US",
+      "expected_identity_key": "v2|16233aveste201|ofc5||NY|10001|US|street",
+      "expected_address_key": "a62a7ff2-3dde-b26a-c84e-d608bfff59a5",
+      "expected_premise_identity_key": "v2|16233aveste201|||NY|10001|US|street",
+      "expected_premise_key": "80a48be7-cb1f-3d9f-f6b9-a1cd5c0dfd3a"
+    },
+    {
       "id": "unit-line2-bare-suite",
       "first_line": "123 Main St Ste 200",
       "second_line": "Suite",

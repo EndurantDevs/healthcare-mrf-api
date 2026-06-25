@@ -229,19 +229,47 @@ def _floor_from_match(match: re.Match[str], value_group: int) -> str:
     return f"fl{value}" if value else ""
 
 
+def _tail_unit(street_text: str) -> tuple[str, int] | None:
+    floor_tail = FLOOR_TAIL_RE.search(street_text)
+    if floor_tail:
+        unit = _floor_from_match(floor_tail, 2)
+        if unit:
+            return unit, floor_tail.start()
+
+    tail = UNIT_TAIL_RE.search(street_text)
+    if tail:
+        unit = _unit_from_match(tail, 2, 3, 4)
+        if unit:
+            return unit, tail.start()
+
+    return None
+
+
 def _strip_duplicate_tail_unit(street_text: str, unit: str) -> str:
     if not unit:
         return street_text
 
-    floor_tail = FLOOR_TAIL_RE.search(street_text)
-    if floor_tail and _floor_from_match(floor_tail, 2) == unit:
-        return street_text[: floor_tail.start()]
-
-    tail = UNIT_TAIL_RE.search(street_text)
-    if tail and _unit_from_match(tail, 2, 3, 4) == unit:
-        return street_text[: tail.start()]
+    tail = _tail_unit(street_text)
+    if tail and tail[0] == unit:
+        return street_text[: tail[1]]
 
     return street_text
+
+
+def _repeated_line2_suffix_decision(l1: str, l2: str) -> _UnitDecision | None:
+    l1_clean = re.sub(r"\s+", " ", l1.strip())
+    l2_clean = re.sub(r"\s+", " ", l2.strip())
+    if not l1_clean or not l2_clean:
+        return None
+    if l1_clean != l2_clean and not l1_clean.endswith(f" {l2_clean}"):
+        return None
+
+    tail = _tail_unit(f" {l2_clean} ")
+    if not tail:
+        return None
+    unit = tail[0]
+    street_text = _strip_duplicate_tail_unit(f" {l1_clean} ", unit)
+    return _UnitDecision(unit=unit, street_text=street_text)
 
 
 def _unit_decision(line1: str | None, line2: str | None) -> _UnitDecision:
@@ -261,6 +289,10 @@ def _unit_decision(line1: str | None, line2: str | None) -> _UnitDecision:
             street_text = _strip_duplicate_tail_unit(f" {l1} ", unit)
             return _UnitDecision(unit=unit, street_text=street_text)
         return _UnitDecision(unit="", street_text=f" {l1} {l2} ")
+
+    repeated_suffix = _repeated_line2_suffix_decision(l1, l2)
+    if repeated_suffix:
+        return repeated_suffix
 
     joined = f" {l1} {l2} "
     floor_tail = FLOOR_TAIL_RE.search(joined)
