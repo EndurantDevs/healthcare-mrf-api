@@ -192,7 +192,10 @@ async def test_process_json_index_dedupes_provider_url_jobs(monkeypatch):
             return True
 
         async def sadd(self, key, value):
-            self.sets.setdefault(key, set()).add(value)
+            values = self.sets.setdefault(key, set())
+            before = len(values)
+            values.add(value)
+            return 1 if len(values) > before else 0
 
     async def fake_download(_url, filename, **_kwargs):
         payload = {
@@ -246,6 +249,152 @@ async def test_process_json_index_dedupes_provider_url_jobs(monkeypatch):
         "run_test_123",
         "https://example.test/index.json",
     ) in redis.sets[process_initial._mrf_state_key("run_test_123", "done_work")]
+
+
+@pytest.mark.asyncio
+async def test_process_json_index_test_limit_counts_unique_registered_jobs(monkeypatch):
+    class FakeRedis:
+        def __init__(self):
+            self.calls = []
+            self.values = {}
+            self.sets = {}
+
+        async def enqueue_job(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return SimpleNamespace()
+
+        async def incrby(self, key, value):
+            self.values[key] = int(self.values.get(key, 0)) + int(value)
+
+        async def expire(self, *_args, **_kwargs):
+            return True
+
+        async def sadd(self, key, value):
+            values = self.sets.setdefault(key, set())
+            before = len(values)
+            values.add(value)
+            return 1 if len(values) > before else 0
+
+    async def fake_download(_url, filename, **_kwargs):
+        payload = {
+            "plan_urls": [
+                "https://example.test/plan-a.json",
+                "https://example.test/plan-a.json",
+                "https://example.test/plan-b.json",
+            ],
+            "formulary_urls": [],
+            "provider_urls": [],
+        }
+        with open(filename, "w", encoding="utf-8") as fp:
+            process_initial.json.dump(payload, fp)
+
+    monkeypatch.setattr(process_initial, "download_it_and_save", fake_download)
+    monkeypatch.setattr(process_initial, "ensure_database", AsyncMock())
+    monkeypatch.setattr(process_initial, "make_class", lambda *_args, **_kwargs: SimpleNamespace())
+
+    redis = FakeRedis()
+    ctx = {
+        "redis": redis,
+        "context": {
+            "import_date": "20260613",
+            "control_run_id": "run_test_unique_limit",
+            "test_mode": True,
+        },
+    }
+
+    await process_initial.process_json_index(
+        ctx,
+        {
+            "url": "https://example.test/index.json",
+            "issuer_array": [11111],
+            "context": ctx["context"],
+        },
+    )
+
+    plan_calls = [call for call in redis.calls if call[0][0] == "process_plan"]
+    assert [call[0][1]["url"] for call in plan_calls] == [
+        "https://example.test/plan-a.json",
+        "https://example.test/plan-b.json",
+    ]
+    assert redis.values[process_initial._mrf_state_key("run_test_unique_limit", "total_work")] == 2
+
+
+@pytest.mark.asyncio
+async def test_register_mrf_work_counts_unique_work_ids_once():
+    class FakeRedis:
+        def __init__(self):
+            self.values = {}
+            self.sets = {}
+
+        async def incrby(self, key, value):
+            self.values[key] = int(self.values.get(key, 0)) + int(value)
+
+        async def expire(self, *_args, **_kwargs):
+            return True
+
+        async def sadd(self, key, value):
+            values = self.sets.setdefault(key, set())
+            before = len(values)
+            values.add(value)
+            return 1 if len(values) > before else 0
+
+    redis = FakeRedis()
+
+    assert await process_initial._register_mrf_work(redis, "run_test", "work-1") is True
+    assert await process_initial._register_mrf_work(redis, "run_test", "work-1") is False
+    assert await process_initial._register_mrf_work(redis, "run_test", "work-2") is True
+
+    assert redis.values[process_initial._mrf_state_key("run_test", "total_work")] == 2
+    assert redis.sets[process_initial._mrf_state_key("run_test", "expected_work")] == {"work-1", "work-2"}
+
+
+@pytest.mark.asyncio
+async def test_process_json_index_marks_terminal_parse_error_done(monkeypatch):
+    class FakeRedis:
+        def __init__(self):
+            self.sets = {}
+
+        async def expire(self, *_args, **_kwargs):
+            return True
+
+        async def sadd(self, key, value):
+            values = self.sets.setdefault(key, set())
+            before = len(values)
+            values.add(value)
+            return 1 if len(values) > before else 0
+
+    async def fake_download(_url, filename, **_kwargs):
+        Path(filename).write_text("<html>not json</html>", encoding="utf-8")
+
+    monkeypatch.setattr(process_initial, "download_it_and_save", fake_download)
+    monkeypatch.setattr(process_initial, "ensure_database", AsyncMock())
+    monkeypatch.setattr(process_initial, "make_class", lambda *_args, **_kwargs: SimpleNamespace())
+    monkeypatch.setattr(process_initial, "log_error", AsyncMock())
+
+    redis = FakeRedis()
+    ctx = {
+        "redis": redis,
+        "context": {
+            "import_date": "20260613",
+            "control_run_id": "run_test_terminal",
+            "test_mode": True,
+        },
+    }
+
+    await process_initial.process_json_index(
+        ctx,
+        {
+            "url": "https://example.test/bad-index.json",
+            "issuer_array": [11111],
+            "context": ctx["context"],
+        },
+    )
+
+    assert process_initial._mrf_url_job_id(
+        "index",
+        "run_test_terminal",
+        "https://example.test/bad-index.json",
+    ) in redis.sets[process_initial._mrf_state_key("run_test_terminal", "done_work")]
 
 
 def test_split_json_array_file_to_chunks(tmp_path, monkeypatch):

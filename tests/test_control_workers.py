@@ -29,6 +29,22 @@ def test_worker_registry_exposes_shared_and_finish_workers():
     assert by_queue["arq:PTGAddress_finish"]["role"] == "finish"
 
 
+def test_resolve_specs_prefers_finish_role_over_stale_start_queue():
+    specs = control_workers._resolve_specs(  # pylint: disable=protected-access
+        {"importer": "mrf", "role": "finish", "queue": "arq:MRF"}
+    )
+
+    assert [spec.queue for spec in specs] == ["arq:MRF_finish"]
+
+
+def test_resolve_specs_prefers_finalizing_status_over_stale_start_queue():
+    specs = control_workers._resolve_specs(  # pylint: disable=protected-access
+        {"importer": "mrf", "status": "finalizing", "queue": "arq:MRF"}
+    )
+
+    assert [spec.queue for spec in specs] == ["arq:MRF_finish"]
+
+
 def test_ensure_worker_starts_registered_burst_worker(monkeypatch, tmp_path):
     captured: dict[str, object] = {}
 

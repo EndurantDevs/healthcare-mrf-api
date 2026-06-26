@@ -116,16 +116,17 @@ def _resolve_specs(payload: dict[str, Any]) -> list[WorkerSpec]:
         if queue and spec.queue != queue:
             return []
         return [spec]
-    if queue:
-        spec = _BY_QUEUE.get(queue)
-        return [spec] if spec is not None else []
 
     importer = str(payload.get("importer") or "").strip()
     role = str(payload.get("role") or "").strip().lower()
     explicit_role = bool(role)
+    status = str(payload.get("status") or "").strip().lower()
     if not role:
-        status = str(payload.get("status") or "").strip().lower()
         role = "finish" if status == "finalizing" else "start"
+    role_overrides_queue = bool(importer and (explicit_role or status == "finalizing"))
+    if queue and not role_overrides_queue:
+        spec = _BY_QUEUE.get(queue)
+        return [spec] if spec is not None else []
     if importer and role == "start" and not explicit_role:
         finished_start_spec = _finish_spec_after_completed_start(importer, payload)
         if finished_start_spec is not None:

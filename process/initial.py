@@ -185,9 +185,10 @@ async def _init_mrf_run_state(redis, run_id: str) -> None:
         return
     total_key = _mrf_state_key(run_id, "total_work")
     done_key = _mrf_state_key(run_id, "done_work")
+    expected_key = _mrf_state_key(run_id, "expected_work")
     lock_key = _mrf_state_key(run_id, "finalize_lock")
     finalized_key = _mrf_state_key(run_id, "finalized")
-    await redis.delete(total_key, done_key, lock_key, finalized_key)
+    await redis.delete(total_key, done_key, expected_key, lock_key, finalized_key)
     await redis.set(total_key, "0")
     await redis.expire(total_key, _mrf_run_state_ttl_seconds())
 
@@ -198,6 +199,17 @@ async def _increment_mrf_total_work(redis, run_id: str, delta: int) -> None:
     total_key = _mrf_state_key(run_id, "total_work")
     await redis.incrby(total_key, int(delta))
     await redis.expire(total_key, _mrf_run_state_ttl_seconds())
+
+
+async def _register_mrf_work(redis, run_id: str, work_id: str) -> bool:
+    if not redis or not run_id or not work_id:
+        return False
+    expected_key = _mrf_state_key(run_id, "expected_work")
+    added = await redis.sadd(expected_key, work_id)
+    await redis.expire(expected_key, _mrf_run_state_ttl_seconds())
+    if added:
+        await _increment_mrf_total_work(redis, run_id, 1)
+    return bool(added)
 
 
 async def _mark_mrf_work_done(ctx: dict, work_id: str) -> None:
@@ -402,9 +414,10 @@ async def _maybe_enqueue_mrf_file_chunks(ctx: dict, task: dict, tmp_filename: st
 
     redis = ctx["redis"]
     run_scope = _mrf_job_scope(ctx)
-    await _increment_mrf_total_work(redis, run_scope, len(chunks))
     for idx, chunk in enumerate(chunks):
         work_id = _mrf_url_job_id(f"{kind}-chunk", run_scope, f"{source_url}:{idx}")
+        if not await _register_mrf_work(redis, run_scope, work_id):
+            continue
         chunk_task = {
             **task,
             "url": source_url,
@@ -439,6 +452,12 @@ def _cleanup_mrf_chunk_file(task: dict) -> None:
         Path(unquote(parsed.path)).unlink(missing_ok=True)
     except OSError as exc:
         logger.warning("Failed to remove MRF chunk file %s: %s", parsed.path, exc)
+
+
+async def _mark_mrf_task_terminal(ctx: dict, task: dict, kind: str, *, cleanup_chunk: bool = False) -> None:
+    await _mark_mrf_work_done(ctx, _mrf_task_work_id(ctx, task, kind))
+    if cleanup_chunk:
+        _cleanup_mrf_chunk_file(task)
 
 
 def _cleanup_mrf_run_chunks(ctx: dict) -> None:
@@ -1097,6 +1116,7 @@ async def process_plan(ctx, task):
             )
         except Exception as exc:
             logger.warning("Failed to download plan data from %s: %s", source_url, exc)
+            await _mark_mrf_task_terminal(ctx, task, "plan", cleanup_chunk=True)
             return
 
         if await _maybe_enqueue_mrf_file_chunks(ctx, task, tmp_filename, "plan", "process_plan"):
@@ -1382,6 +1402,7 @@ async def process_plan(ctx, task):
                     "json",
                     myimportlog,
                 )
+                await _mark_mrf_task_terminal(ctx, task, "plan", cleanup_chunk=True)
                 return
             except ijson.JSONError as exc:
                 await log_error(
@@ -1393,6 +1414,7 @@ async def process_plan(ctx, task):
                     "json",
                     myimportlog,
                 )
+                await _mark_mrf_task_terminal(ctx, task, "plan", cleanup_chunk=True)
                 return
     await flush_error_log(myimportlog)
     await _mark_mrf_work_done(ctx, _mrf_task_work_id(ctx, task, "plan"))
@@ -1461,6 +1483,7 @@ async def process_provider(ctx, task):
             )
         except Exception as exc:
             logger.warning("Failed to download provider data from %s: %s", source_url, exc)
+            await _mark_mrf_task_terminal(ctx, task, "provider", cleanup_chunk=True)
             return
         if await _maybe_enqueue_mrf_file_chunks(ctx, task, tmp_filename, "provider", "process_provider"):
             await _mark_mrf_work_done(ctx, _mrf_task_work_id(ctx, task, "provider"))
@@ -1688,6 +1711,7 @@ async def process_provider(ctx, task):
                     "json",
                     myimportlog,
                 )
+                await _mark_mrf_task_terminal(ctx, task, "provider", cleanup_chunk=True)
                 return
             except ijson.JSONError as exc:
                 await log_error(
@@ -1699,6 +1723,7 @@ async def process_provider(ctx, task):
                     "json",
                     myimportlog,
                 )
+                await _mark_mrf_task_terminal(ctx, task, "provider", cleanup_chunk=True)
                 return
     await flush_error_log(myimportlog)
     await _mark_mrf_provider_file_progress(
@@ -1914,6 +1939,7 @@ async def process_formulary(ctx, task):
             )
         except Exception as exc:
             logger.warning("Failed to download formulary data from %s: %s", source_url, exc)
+            await _mark_mrf_task_terminal(ctx, task, "formulary", cleanup_chunk=True)
             return
 
         if await _maybe_enqueue_mrf_file_chunks(ctx, task, tmp_filename, "formulary", "process_formulary"):
@@ -1995,6 +2021,7 @@ async def process_formulary(ctx, task):
                 "json",
                 myimportlog,
             )
+            await _mark_mrf_task_terminal(ctx, task, "formulary", cleanup_chunk=True)
             return
         except ijson.JSONError as exc:
             await log_error(
@@ -2006,6 +2033,7 @@ async def process_formulary(ctx, task):
                 "json",
                 myimportlog,
             )
+            await _mark_mrf_task_terminal(ctx, task, "formulary", cleanup_chunk=True)
             return
 
         if batch:
@@ -2094,12 +2122,17 @@ async def process_json_index(ctx, task):
     with tempfile.TemporaryDirectory() as tmpdirname:
         p = Path(task.get("url"))
         tmp_filename = str(PurePath(str(tmpdirname), p.name))
-        await download_it_and_save(
-            task.get("url"),
-            tmp_filename,
-            context={"issuer_array": task["issuer_array"], "source": "json_index"},
-            logger=myimportlog,
-        )
+        try:
+            await download_it_and_save(
+                task.get("url"),
+                tmp_filename,
+                context={"issuer_array": task["issuer_array"], "source": "json_index"},
+                logger=myimportlog,
+            )
+        except Exception as exc:
+            logger.warning("Failed to download MRF index data from %s: %s", task.get("url"), exc)
+            await _mark_mrf_task_terminal(ctx, task, "index")
+            return
         plan_limit = TEST_PLAN_URLS if test_mode else None
         provider_limit = TEST_PROVIDER_URLS if test_mode else None
         formulary_limit = TEST_FORMULARY_URLS if test_mode else None
@@ -2114,7 +2147,8 @@ async def process_json_index(ctx, task):
                 ):  # , 'formulary_urls', 'provider_urls'
                     print(f"Plan URL: {url}")
                     work_id = _mrf_url_job_id("plan", job_scope, str(url))
-                    await _increment_mrf_total_work(redis, job_scope, 1)
+                    if not await _register_mrf_work(redis, job_scope, work_id):
+                        continue
                     await redis.enqueue_job(
                         "process_plan",
                         {"url": url, "issuer_array": issuer_array, "context": ctx["context"], "work_id": work_id},
@@ -2135,6 +2169,7 @@ async def process_json_index(ctx, task):
                     "json",
                     myimportlog,
                 )
+                await _mark_mrf_task_terminal(ctx, task, "index")
                 return
         async with async_open(tmp_filename, "rb") as afp:
             try:
@@ -2143,7 +2178,8 @@ async def process_json_index(ctx, task):
                 ):
                     print(f"Formulary URL: {url}")
                     work_id = _mrf_url_job_id("formulary", job_scope, str(url))
-                    await _increment_mrf_total_work(redis, job_scope, 1)
+                    if not await _register_mrf_work(redis, job_scope, work_id):
+                        continue
                     await redis.enqueue_job(
                         "process_formulary",
                         {"url": url, "issuer_array": issuer_array, "context": ctx["context"], "work_id": work_id},
@@ -2163,6 +2199,7 @@ async def process_json_index(ctx, task):
                     "json",
                     myimportlog,
                 )
+                await _mark_mrf_task_terminal(ctx, task, "index")
                 return
             except ijson.JSONError as exc:
                 await log_error(
@@ -2174,6 +2211,7 @@ async def process_json_index(ctx, task):
                     "json",
                     myimportlog,
                 )
+                await _mark_mrf_task_terminal(ctx, task, "index")
                 return
 
         seen_provider_urls = set()
@@ -2188,7 +2226,8 @@ async def process_json_index(ctx, task):
                     seen_provider_urls.add(url)
                     print(f"Provider URL: {url}")
                     work_id = _mrf_url_job_id("provider", job_scope, url)
-                    await _increment_mrf_total_work(redis, job_scope, 1)
+                    if not await _register_mrf_work(redis, job_scope, work_id):
+                        continue
                     await redis.enqueue_job(
                         "process_provider",
                         {"url": url, "issuer_array": issuer_array, "context": ctx["context"], "work_id": work_id},
@@ -2209,6 +2248,7 @@ async def process_json_index(ctx, task):
                     "json",
                     myimportlog,
                 )
+                await _mark_mrf_task_terminal(ctx, task, "index")
                 return
 
             except ijson.JSONError as exc:
@@ -2221,6 +2261,7 @@ async def process_json_index(ctx, task):
                     "json",
                     myimportlog,
                 )
+                await _mark_mrf_task_terminal(ctx, task, "index")
                 return
 
         await _mark_mrf_work_done(ctx, _mrf_task_work_id(ctx, task, "index"))
@@ -2674,7 +2715,6 @@ async def init_file(ctx, task=None):
         selected_urls = sorted(url_list)[:max_urls] if max_urls else sorted(url_list)
         state_run_id = _mrf_run_state_id(ctx)
         await _init_mrf_run_state(redis, state_run_id)
-        await _increment_mrf_total_work(redis, state_run_id, len(selected_urls))
         await mark_control_run(
             run_id,
             status="running",
@@ -2692,6 +2732,8 @@ async def init_file(ctx, task=None):
 
         for idx, url in enumerate(selected_urls):
             work_id = _mrf_url_job_id("index", _mrf_job_scope(ctx), url)
+            if not await _register_mrf_work(redis, state_run_id, work_id):
+                continue
             await redis.enqueue_job(
                 "process_json_index",
                 {
@@ -2879,13 +2921,16 @@ async def shutdown(ctx, task):
             schema=db_schema,
         )
         logger.info("MRF canonical address resolve complete: %s", address_stats)
-        oa_stats = await refresh_archive_geocodes_from_openaddresses(schema=db_schema)
-        logger.info(
-            "OpenAddresses archive backfill after MRF canonical resolve: exact=%s fuzzy=%s relaxed=%s",
-            oa_stats.exact_updates,
-            oa_stats.fuzzy_updates,
-            oa_stats.relaxed_updates,
-        )
+        if _truthy(os.environ.get("HLTHPRT_MRF_OPENADDRESSES_BACKFILL"), ("yes", "y", "true", "1")):
+            oa_stats = await refresh_archive_geocodes_from_openaddresses(schema=db_schema)
+            logger.info(
+                "OpenAddresses archive backfill after MRF canonical resolve: exact=%s fuzzy=%s relaxed=%s",
+                oa_stats.exact_updates,
+                oa_stats.fuzzy_updates,
+                oa_stats.relaxed_updates,
+            )
+        else:
+            logger.info("Skipping OpenAddresses archive backfill during MRF publish")
     elif test_mode:
         logger.info("Skipping MRF archive address resolve in test mode")
 
