@@ -2347,6 +2347,32 @@ def _dedupe_key_expr(address_canon_available: bool) -> str:
     return "location_key"
 
 
+def _aggregate_shard_expr(dedupe_key_expr: str, aggregate_shards: int) -> str:
+    shards = max(int(aggregate_shards), 1)
+    return f"((hashtext({dedupe_key_expr}) % {shards} + {shards}) % {shards})"
+
+
+def _raw_aggregate_group_index_sql(
+    db_schema: str,
+    raw_table: str,
+    *,
+    aggregate_shards: int,
+    address_canon_available: bool = True,
+) -> str:
+    dedupe_key_expr = _dedupe_key_expr(address_canon_available)
+    if aggregate_shards > 1:
+        shard_expr = _aggregate_shard_expr(dedupe_key_expr, aggregate_shards)
+        return f"""
+        CREATE INDEX {raw_table}_idx_aggregate_shard_group
+        ON {db_schema}.{raw_table}
+        (({shard_expr}), entity_type, entity_id, type, {dedupe_key_expr});
+        """
+    return f"""
+    CREATE INDEX {raw_table}_idx_group_key
+    ON {db_schema}.{raw_table} (entity_type, entity_id, type, {dedupe_key_expr});
+    """
+
+
 def _validate_publish_row_count(
     *,
     stage_rows: int,
@@ -2821,8 +2847,8 @@ def _materialize_from_raw_sql(
     shard_filter = ""
     if checksum_modulo and checksum_modulo > 1 and checksum_remainder is not None:
         shard_filter = (
-            f" WHERE ((hashtext({dedupe_key_expr}) % {int(checksum_modulo)} "
-            f"+ {int(checksum_modulo)}) % {int(checksum_modulo)}) = {int(checksum_remainder)}"
+            f" WHERE {_aggregate_shard_expr(dedupe_key_expr, int(checksum_modulo))} "
+            f"= {int(checksum_remainder)}"
         )
     return f"""
     INSERT INTO {db_schema}.{stage_table} (
@@ -7574,9 +7600,17 @@ async def process_data(ctx, task=None):
             phase="entity-address-unified preparing raw group index",
         )
         await _run_sql_phase(
-            f"CREATE INDEX {raw_table}_idx_group_key "
-            f"ON {db_schema}.{raw_table} "
-            "(entity_type, entity_id, type, location_key);",
+            f"DROP INDEX IF EXISTS {db_schema}.{raw_table}_idx_aggregate_shard_group;",
+            context=context,
+            phase="entity-address-unified preparing raw group index",
+        )
+        await _run_sql_phase(
+            _raw_aggregate_group_index_sql(
+                db_schema,
+                raw_table,
+                aggregate_shards=aggregate_shards,
+                address_canon_available=address_canon_available,
+            ),
             context=context,
             run_id=run_id,
             phase="entity-address-unified indexing raw groups",
@@ -7597,6 +7631,18 @@ async def process_data(ctx, task=None):
             done=1,
             total=2,
             message="indexing raw location keys",
+            emit_start=True,
+            emit_done=True,
+        )
+        await _run_sql_phase(
+            f"ANALYZE {db_schema}.{raw_table};",
+            context=context,
+            run_id=run_id,
+            phase="entity-address-unified analyzing raw aggregate inputs",
+            unit="tables",
+            done=0,
+            total=1,
+            message="analyzing raw aggregate inputs",
             emit_start=True,
             emit_done=True,
         )

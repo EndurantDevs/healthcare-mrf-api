@@ -1485,6 +1485,21 @@ def test_entity_address_unified_sql_carries_address_key(monkeypatch):
     )
     assert "hashtext(location_key)" in sharded_sql
     assert "% 24 + 24) % 24) = 7" in sharded_sql
+    sharded_index_sql = entity_address_unified._raw_aggregate_group_index_sql(
+        "mrf",
+        "entity_address_unified_raw",
+        aggregate_shards=24,
+    )
+    assert "entity_address_unified_raw_idx_aggregate_shard_group" in sharded_index_sql
+    assert "((hashtext(location_key) % 24 + 24) % 24)" in sharded_index_sql
+    assert "entity_type, entity_id, type, location_key" in sharded_index_sql
+    unsharded_index_sql = entity_address_unified._raw_aggregate_group_index_sql(
+        "mrf",
+        "entity_address_unified_raw",
+        aggregate_shards=1,
+    )
+    assert "entity_address_unified_raw_idx_group_key" in unsharded_index_sql
+    assert "idx_aggregate_shard_group" not in unsharded_index_sql
 
 
 def test_entity_address_unified_raw_enrichment_can_skip_archive():
