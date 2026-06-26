@@ -4501,7 +4501,7 @@ async def list_pricing_providers(request):
     args = request.args
 
     pagination = parse_pagination(args, default_limit=25, max_limit=MAX_LIMIT)
-    npi = _parse_int(args.get("npi"), "npi", minimum=1)
+    npi = _parse_int(args.get("npi") or None, "npi", minimum=1)
     year = _parse_int(args.get("year"), "year", minimum=2013)
     min_claims = _parse_float(args.get("min_claims"), "min_claims", minimum=0)
     min_total_cost = _parse_float(args.get("min_total_cost"), "min_total_cost", minimum=0)
@@ -7106,7 +7106,7 @@ async def list_providers_by_procedure(request):
     source_key = str(args.get("source_key", "")).strip().lower()
     snapshot_id = str(args.get("snapshot_id", "")).strip()
     mode = str(args.get("mode", "")).strip()
-    npi = _parse_int(args.get("npi"), "npi", minimum=1)
+    npi = _parse_int(args.get("npi") or None, "npi", minimum=1)
     args.get("provider_type")
     args.get("classification")
     args.get("taxonomy_codes")

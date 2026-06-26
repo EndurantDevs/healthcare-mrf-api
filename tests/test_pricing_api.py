@@ -1787,6 +1787,7 @@ async def test_list_providers_by_procedure_routes_zip_as_default_radius_to_ptg2(
             "code": "29888",
             "zip5": "62401",
             "include_providers": "true",
+            "npi": [],
         },
     )
 
