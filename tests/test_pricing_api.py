@@ -1803,6 +1803,56 @@ async def test_list_providers_by_procedure_routes_zip_as_default_radius_to_ptg2(
 
 
 @pytest.mark.asyncio
+async def test_list_providers_by_procedure_allows_100_mile_zip_radius_to_ptg2(monkeypatch):
+    seen_args = {}
+
+    async def fake_search(_session, args, pagination):
+        seen_args.update(args)
+        return {
+            "items": [],
+            "pagination": {
+                "total": 0,
+                "limit": pagination.limit,
+                "offset": pagination.offset,
+                "page": pagination.page,
+            },
+            "query": {"source": "ptg2", "zip_radius_miles": args["zip_radius_miles"]},
+        }
+
+    monkeypatch.setattr(pricing_module, "search_current_ptg2_index", fake_search)
+    request = make_request(
+        [
+            FakeResult(
+                rows=[
+                    {
+                        "zip5": "62401",
+                        "state": "IL",
+                        "city_lower": "effingham",
+                        "latitude": 39.1200,
+                        "longitude": -88.5434,
+                    }
+                ]
+            )
+        ],
+        args={
+            "plan_id": "010854205",
+            "market_type": "group",
+            "code": "29888",
+            "zip5": "62401",
+            "zip_radius_miles": "100",
+            "include_providers": "true",
+        },
+    )
+
+    response = await list_providers_by_procedure(request)
+    payload = json.loads(response.body)
+
+    assert payload["query"]["zip_radius_miles"] == 100.0
+    assert seen_args["zip_radius_miles"] == 100.0
+    assert seen_args["radius_miles"] == 100.0
+
+
+@pytest.mark.asyncio
 async def test_list_providers_by_procedure_empty_loaded_ptg_source_reports_no_match(monkeypatch):
     async def fake_search(_session, _args, _pagination):
         return None

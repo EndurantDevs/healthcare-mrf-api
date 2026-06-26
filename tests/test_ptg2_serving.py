@@ -249,6 +249,106 @@ async def test_manifest_serving_taxonomy_expansion_uses_wider_rate_candidate_win
 
 
 @pytest.mark.asyncio
+async def test_manifest_serving_geo_expansion_uses_wider_location_candidate_window(monkeypatch):
+    provider_set_id = "00000000000000000000000000000012"
+    price_set_id = "00000000000000000000000000000101"
+    row = {
+        "serving_content_hash_128": "00000000000000000000000000000201",
+        "plan_id": "010854205",
+        "reported_code_system": "CPT",
+        "reported_code": "29888",
+        "procedure_global_id_128": "00000000000000000000000000000301",
+        "provider_set_global_id_128": provider_set_id,
+        "provider_count": 335,
+        "price_set_global_id_128": price_set_id,
+        "source_trace_set_hash": None,
+    }
+    session = FakeSession([FakeResult(rows=[row])])
+    tables = ptg2_serving.PTG2ServingTables(
+        serving_table="mrf.ptg2_serving_manifest_token",
+        price_atom_table="mrf.ptg2_price_atom_manifest_token",
+        provider_group_member_table="mrf.ptg2_provider_group_member_manifest_token",
+        artifacts={"provider_inverted": {"name": "provider_inverted", "path": "/tmp/provider_inverted.ptg2sc"}},
+    )
+
+    class LimitOnePagination:
+        limit = 1
+        offset = 0
+
+    seen_candidate_limit = {}
+
+    async def fake_available(_session, table_name):
+        assert table_name == "mrf.ptg2_serving_manifest_token"
+        return True
+
+    async def fake_location_matches(_session, _tables, args, *, candidate_limit=None):
+        assert args["zip5"] == "62401"
+        seen_candidate_limit["value"] = candidate_limit
+        return {
+            provider_set_id,
+        }, {
+            provider_set_id: [
+                {
+                    "npi": 1154321222,
+                    "provider_name": "ACL Surgeon",
+                    "state": "IL",
+                    "city": "PANA",
+                    "zip5": "62557",
+                    "taxonomy_codes": ["207XS0114X"],
+                    "specialties": ["Orthopaedic Surgery Physician"],
+                    "classifications": ["Orthopaedic Surgery"],
+                    "specializations": ["Sports Medicine"],
+                    "primary_specialty": "Orthopaedic Surgery Physician",
+                    "primary_specialization": "Sports Medicine",
+                }
+            ]
+        }
+
+    async def fake_prices(_session, _tables, price_set_ids):
+        assert tuple(price_set_ids) == (price_set_id,)
+        return {price_set_id: [{"negotiated_type": "negotiated", "negotiated_rate": 1074.22}]}
+
+    async def fake_procedure_details(_session, row_data):
+        assert [row["provider_set_global_id_128"] for row in row_data] == [provider_set_id]
+        return {("CPT", "29888"): {"procedure_name": "ACL reconstruction"}}
+
+    monkeypatch.setattr(ptg2_serving, "_serving_table_available", fake_available)
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_location_provider_matches", fake_location_matches)
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_prices_for_price_sets", fake_prices)
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_procedure_details_for_rows", fake_procedure_details)
+
+    payload = await ptg2_serving._search_ptg2_manifest_db_serving_table(
+        session,
+        "ptg2:202606:test",
+        {
+            "plan_id": "010854205",
+            "market_type": "group",
+            "code": "29888",
+            "code_system": "CPT",
+            "zip5": "62401",
+            "lat": "39.11952",
+            "long": "-88.56418",
+            "radius_miles": "100",
+            "include_providers": "true",
+        },
+        LimitOnePagination(),
+        tables,
+        ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
+    )
+
+    assert len(payload["items"]) == 1
+    assert payload["items"][0]["npi"] == 1154321222
+    assert payload["items"][0]["specialization"] == "Sports Medicine"
+    assert seen_candidate_limit["value"] >= 500
+    row_sql = str(session.calls[0][0][0])
+    row_params = session.calls[0][0][1]
+    assert "LIMIT :rate_candidate_limit" in row_sql
+    assert row_params["limit"] == 1
+    assert row_params["rate_candidate_limit"] == seen_candidate_limit["value"]
+    assert row_params["rate_candidate_limit"] > row_params["limit"]
+
+
+@pytest.mark.asyncio
 async def test_manifest_enriched_provider_fallback_includes_taxonomy(monkeypatch):
     monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "legacy")
     session = FakeSession(
@@ -279,6 +379,10 @@ async def test_manifest_enriched_provider_fallback_includes_taxonomy(monkeypatch
             "provider_name": "TiC provider",
             "taxonomy_codes": ["207Q00000X"],
             "specialties": ["Family Medicine"],
+            "classifications": [],
+            "specializations": [],
+            "primary_specialty": None,
+            "primary_specialization": None,
         }
     ]
     assert "FROM mrf.npi_taxonomy nt" in str(session.calls[2][0][0])
@@ -1411,8 +1515,12 @@ async def test_manifest_location_provider_matches_filters_coordinates_with_unifi
                         "location_source": "entity_address_unified",
                         "location_confidence_code": "entity_address_unified",
                         "address_payload": '{"address_key":"00000000-0000-0000-0000-000000000001","lat":34.14024131,"long":-118.255125}',
-                        "taxonomy_codes": [],
-                        "specialties": [],
+                        "taxonomy_codes": ["207XS0114X"],
+                        "specialties": ["Orthopaedic Surgery Physician"],
+                        "classifications": ["Orthopaedic Surgery"],
+                        "specializations": ["Sports Medicine"],
+                        "primary_specialty": "Orthopaedic Surgery Physician",
+                        "primary_specialization": "Sports Medicine",
                         "provider_name": "TiC provider",
                     }
                 ]
@@ -1439,9 +1547,14 @@ async def test_manifest_location_provider_matches_filters_coordinates_with_unifi
     )
 
     assert provider_set_ids == {provider_set_id}
-    assert providers_by_set[provider_set_id][0]["npi"] == 1234567890
-    assert providers_by_set[provider_set_id][0]["zip5"] == "91204"
-    address = json.loads(providers_by_set[provider_set_id][0]["address_payload"])
+    provider = providers_by_set[provider_set_id][0]
+    assert provider["npi"] == 1234567890
+    assert provider["zip5"] == "91204"
+    assert provider["taxonomy_codes"] == ["207XS0114X"]
+    assert provider["classifications"] == ["Orthopaedic Surgery"]
+    assert provider["specializations"] == ["Sports Medicine"]
+    assert provider["primary_specialization"] == "Sports Medicine"
+    address = json.loads(provider["address_payload"])
     assert address["address_key"] == "00000000-0000-0000-0000-000000000001"
     sql = str(session.calls[2][0][0])
     params = session.calls[2][0][1]
@@ -1458,6 +1571,9 @@ async def test_manifest_location_provider_matches_filters_coordinates_with_unifi
     assert "JOIN location_npis loc ON loc.npi = na.npi" in sql
     assert "LEFT JOIN fallback_addresses na" in sql
     assert "LEFT JOIN LATERAL (\n                SELECT na.first_line" not in sql
+    assert "COALESCE(tax.classifications, ARRAY[]::varchar[]) AS classifications" in sql
+    assert "COALESCE(tax.specializations, ARRAY[]::varchar[]) AS specializations" in sql
+    assert "WHERE nt.npi = addr.npi" in sql
     assert params["geo_lat"] == 34.14024131
     assert params["geo_long"] == -118.255125
     assert params["geo_radius_miles"] == 10.0

@@ -800,17 +800,13 @@ async def _ptg2_manifest_taxonomy_rows_for_npis(
             SELECT
                 source_npis.npi,
                 COALESCE(tax.taxonomy_codes, ARRAY[]::varchar[]) AS taxonomy_codes,
-                COALESCE(tax.specialties, ARRAY[]::varchar[]) AS specialties
+                COALESCE(tax.specialties, ARRAY[]::varchar[]) AS specialties,
+                COALESCE(tax.classifications, ARRAY[]::varchar[]) AS classifications,
+                COALESCE(tax.specializations, ARRAY[]::varchar[]) AS specializations,
+                tax.primary_specialty,
+                tax.primary_specialization
             FROM (SELECT UNNEST(CAST(:npis AS bigint[])) AS npi) source_npis
-            LEFT JOIN LATERAL (
-                SELECT
-                    array_agg(nt.healthcare_provider_taxonomy_code ORDER BY (UPPER(COALESCE(nt.healthcare_provider_primary_taxonomy_switch, '')) = 'Y') DESC, nt.checksum) AS taxonomy_codes,
-                    array_agg(COALESCE(nucc.display_name, nucc.classification) ORDER BY (UPPER(COALESCE(nt.healthcare_provider_primary_taxonomy_switch, '')) = 'Y') DESC, nt.checksum) AS specialties
-                FROM {PTG2_SCHEMA}.npi_taxonomy nt
-                LEFT JOIN {PTG2_SCHEMA}.nucc_taxonomy nucc
-                  ON nucc.code = nt.healthcare_provider_taxonomy_code
-                WHERE nt.npi = source_npis.npi
-            ) tax ON TRUE
+            {_provider_taxonomy_summary_lateral_sql("source_npis.npi")}
             """
         ),
         {"npis": list(npis)},
@@ -824,6 +820,10 @@ async def _ptg2_manifest_taxonomy_rows_for_npis(
         taxonomy_by_npi[int(npi)] = {
             "taxonomy_codes": data.get("taxonomy_codes") or [],
             "specialties": data.get("specialties") or [],
+            "classifications": data.get("classifications") or [],
+            "specializations": data.get("specializations") or [],
+            "primary_specialty": data.get("primary_specialty"),
+            "primary_specialization": data.get("primary_specialization"),
         }
     return taxonomy_by_npi
 
@@ -851,6 +851,10 @@ async def _ptg2_manifest_enriched_provider_rows_for_npis(
                 "provider_name": "TiC provider",
                 "taxonomy_codes": taxonomy_by_npi.get(npi, {}).get("taxonomy_codes", []),
                 "specialties": taxonomy_by_npi.get(npi, {}).get("specialties", []),
+                "classifications": taxonomy_by_npi.get(npi, {}).get("classifications", []),
+                "specializations": taxonomy_by_npi.get(npi, {}).get("specializations", []),
+                "primary_specialty": taxonomy_by_npi.get(npi, {}).get("primary_specialty"),
+                "primary_specialization": taxonomy_by_npi.get(npi, {}).get("primary_specialization"),
             }
             for npi in npis
         ]
@@ -917,6 +921,10 @@ async def _ptg2_manifest_enriched_provider_rows_for_npis(
                 )::text AS address_payload,
                 COALESCE(tax.taxonomy_codes, ARRAY[]::varchar[]) AS taxonomy_codes,
                 COALESCE(tax.specialties, ARRAY[]::varchar[]) AS specialties,
+                COALESCE(tax.classifications, ARRAY[]::varchar[]) AS classifications,
+                COALESCE(tax.specializations, ARRAY[]::varchar[]) AS specializations,
+                tax.primary_specialty,
+                tax.primary_specialization,
                 {_ptg2_provider_name_sql("n")} AS provider_name
             FROM source_npis
             LEFT JOIN {npi_data_table} n ON n.npi = source_npis.npi
@@ -928,15 +936,7 @@ async def _ptg2_manifest_enriched_provider_rows_for_npis(
                  LIMIT 1
             ) addr ON TRUE
             {enrich_address_fallback_join}
-            LEFT JOIN LATERAL (
-                SELECT
-                    array_agg(nt.healthcare_provider_taxonomy_code ORDER BY (UPPER(COALESCE(nt.healthcare_provider_primary_taxonomy_switch, '')) = 'Y') DESC, nt.checksum) AS taxonomy_codes,
-                    array_agg(COALESCE(nucc.display_name, nucc.classification) ORDER BY (UPPER(COALESCE(nt.healthcare_provider_primary_taxonomy_switch, '')) = 'Y') DESC, nt.checksum) AS specialties
-                FROM {PTG2_SCHEMA}.npi_taxonomy nt
-                LEFT JOIN {PTG2_SCHEMA}.nucc_taxonomy nucc
-                  ON nucc.code = nt.healthcare_provider_taxonomy_code
-                WHERE nt.npi = source_npis.npi
-            ) tax ON TRUE
+            {_provider_taxonomy_summary_lateral_sql("source_npis.npi")}
             ORDER BY provider_name, source_npis.npi
             """
         )
@@ -959,10 +959,16 @@ def _ptg2_manifest_rate_candidate_limit(
     location_filter_requested: bool,
 ) -> int:
     requested_limit = max(int(pagination.limit), 1)
+    requested_offset = max(int(getattr(pagination, "offset", 0) or 0), 0)
+    if expand_providers and location_filter_requested:
+        return min(
+            _ptg2_manifest_location_match_limit(),
+            max(requested_limit * 200, requested_offset + requested_limit, 500),
+        )
     if expand_providers and not location_filter_requested and _ptg2_provider_taxonomy_filter_requested(args):
         return min(
             _PTG2_MANIFEST_TAXONOMY_RATE_CANDIDATE_LIMIT,
-            max(requested_limit, requested_limit * 5, 5),
+            max(requested_limit, requested_offset + requested_limit, requested_limit * 5, 5),
         )
     return requested_limit
 
@@ -1238,13 +1244,18 @@ async def _ptg2_manifest_location_provider_matches(
                     'lat', {_eff('lat')},
                     'long', {_eff('long')}
                 )::text AS address_payload,
-                ARRAY[]::varchar[] AS taxonomy_codes,
-                ARRAY[]::varchar[] AS specialties,
+                COALESCE(tax.taxonomy_codes, ARRAY[]::varchar[]) AS taxonomy_codes,
+                COALESCE(tax.specialties, ARRAY[]::varchar[]) AS specialties,
+                COALESCE(tax.classifications, ARRAY[]::varchar[]) AS classifications,
+                COALESCE(tax.specializations, ARRAY[]::varchar[]) AS specializations,
+                tax.primary_specialty,
+                tax.primary_specialization,
                 {provider_name_sql} AS provider_name
             FROM location_npis addr
             JOIN {provider_group_member_table} pgm ON pgm.npi = addr.npi
             {provider_join}
             {address_fallback_join}
+            {_provider_taxonomy_summary_lateral_sql("addr.npi")}
             ORDER BY pgm.provider_group_global_id_128,
                 addr.npi,
                 CASE addr.type
@@ -1302,6 +1313,10 @@ async def _ptg2_manifest_location_provider_matches(
             "address_payload": row.get("address_payload"),
             "taxonomy_codes": row.get("taxonomy_codes") or [],
             "specialties": row.get("specialties") or [],
+            "classifications": row.get("classifications") or [],
+            "specializations": row.get("specializations") or [],
+            "primary_specialty": row.get("primary_specialty"),
+            "primary_specialization": row.get("primary_specialization"),
         }
         for provider_set_id in sets_by_group.get(group_id, ()):
             provider_set_ids.add(provider_set_id)
@@ -1581,7 +1596,7 @@ async def _search_ptg2_manifest_db_serving_table(
             session,
             serving_tables,
             args,
-            candidate_limit=max(int(pagination.limit), 1),
+            candidate_limit=rate_candidate_limit,
         )
         if location_matches is None:
             return None
@@ -1754,6 +1769,13 @@ async def _search_ptg2_manifest_db_serving_table(
                     "address": _coerce_json_payload(provider.get("address_payload"), {}),
                     "taxonomy_codes": _coerce_json_payload(provider.get("taxonomy_codes"), []),
                     "specialties": _coerce_json_payload(provider.get("specialties"), []),
+                    "primary_specialty": provider.get("primary_specialty"),
+                    "classification": (_coerce_json_payload(provider.get("classifications"), []) or [None])[0],
+                    "classifications": _coerce_json_payload(provider.get("classifications"), []),
+                    "specialization": provider.get("primary_specialization")
+                    or ((_coerce_json_payload(provider.get("specializations"), []) or [None])[0]),
+                    "primary_specialization": provider.get("primary_specialization"),
+                    "specializations": _coerce_json_payload(provider.get("specializations"), []),
                 }
             )
             items.append(item)
