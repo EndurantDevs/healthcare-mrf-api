@@ -50,6 +50,7 @@ DEFAULT_EVIDENCE_CONCURRENCY = 4
 DEFAULT_SUPPORT_STAGE_CONCURRENCY = 4
 DEFAULT_SUPPORT_INDEX_CONCURRENCY = 2
 DEFAULT_FACILITY_CANDIDATE_SHARDS = 4
+DEFAULT_SUPPORT_CODE_LOCATION_INDEXES = False
 DEFAULT_SUPPORT_HEAP_LOAD = True
 DEFAULT_BUILD_NETWORK_BRIDGE = False
 DEFAULT_COMPACT_SOURCE_RECORD_IDS = True
@@ -442,6 +443,30 @@ def _stage_index_name(stage_table: str, index_name: str) -> str:
     return _archived_identifier(f"{stage_table}_idx", f"_{index_name}")
 
 
+def _is_support_code_location_index(stage_cls, index: dict) -> bool:
+    index_name = index.get("name", "_".join(index.get("index_elements") or ()))
+    if index_name != "code_location":
+        return False
+    table_name = getattr(stage_cls, "__tablename__", "") or ""
+    main_table = getattr(stage_cls, "__main_table__", "") or ""
+    code_bridge_tables = {
+        EntityAddressProcedureBridge.__main_table__,
+        EntityAddressMedicationBridge.__main_table__,
+    }
+    if main_table in code_bridge_tables:
+        return True
+    return any(table_name.startswith(f"{bridge_table}_") for bridge_table in code_bridge_tables)
+
+
+def _stage_index_enabled(stage_cls, index: dict) -> bool:
+    if _is_support_code_location_index(stage_cls, index):
+        return _env_bool(
+            "HLTHPRT_ENTITY_ADDRESS_UNIFIED_SUPPORT_CODE_LOCATION_INDEXES",
+            DEFAULT_SUPPORT_CODE_LOCATION_INDEXES,
+        )
+    return True
+
+
 def _support_stage_classes(import_date: str) -> dict[type, type]:
     return {model: make_class(model, import_date) for model in SUPPORT_TABLE_MODELS}
 
@@ -543,6 +568,10 @@ async def _create_stage_indexes(
     if hasattr(stage_cls, "__my_additional_indexes__") and stage_cls.__my_additional_indexes__:
         for index in stage_cls.__my_additional_indexes__:
             index_name = index.get("name", "_".join(index.get("index_elements")))
+            if not _stage_index_enabled(stage_cls, index):
+                skipped_indexes = phase_context.setdefault("skipped_stage_indexes", [])
+                skipped_indexes.append(f"{stage_cls.__tablename__}.{index_name}")
+                continue
             using = f"USING {index.get('using')} " if index.get("using") else ""
             where = f" WHERE {index.get('where')}" if index.get("where") else ""
             stmt = (
@@ -8632,6 +8661,7 @@ async def shutdown(ctx):
                 "support_counts": context.get("support_counts") or {},
                 "publish_validation": context.get("publish_validation") or {},
                 "phase_timings": context.get("phase_timings") or {},
+                "skipped_stage_indexes": context.get("skipped_stage_indexes") or [],
             },
         )
         print_time_info(context.get("start"))
@@ -8771,6 +8801,7 @@ async def shutdown(ctx):
             "support_counts": context.get("support_counts") or {},
             "publish_validation": context.get("publish_validation") or {},
             "phase_timings": context.get("phase_timings") or {},
+            "skipped_stage_indexes": context.get("skipped_stage_indexes") or [],
         },
     )
     print_time_info(context.get("start"))

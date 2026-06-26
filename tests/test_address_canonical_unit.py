@@ -2458,6 +2458,58 @@ async def test_entity_address_unified_stage_indexes_do_not_duplicate_primary(mon
     assert any("entity_address_unified_stage_idx_npi" in statement for statement in statements)
 
 
+@pytest.mark.asyncio
+async def test_entity_address_unified_skips_support_code_location_indexes_by_default(monkeypatch):
+    statements = []
+    context = {}
+
+    class FakeDB:
+        async def status(self, statement):
+            statements.append(statement)
+
+    class FakeStage:
+        __tablename__ = "entity_address_medication_bridge_20260614"
+        __main_table__ = "entity_address_medication_bridge"
+        __my_additional_indexes__ = [
+            {"index_elements": ("code_system", "code", "location_key"), "name": "code_location"},
+            {"index_elements": ("npi",), "name": "npi"},
+        ]
+
+    monkeypatch.delenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_SUPPORT_CODE_LOCATION_INDEXES", raising=False)
+    monkeypatch.setattr(entity_address_unified, "db", FakeDB())
+
+    await entity_address_unified._create_stage_indexes(FakeStage, "mrf", context=context)
+
+    assert "entity_address_medication_bridge_20260614.code_location" in context["skipped_stage_indexes"]
+    assert not any("idx_code_location" in statement for statement in statements)
+    assert any("idx_npi" in statement for statement in statements)
+
+
+@pytest.mark.asyncio
+async def test_entity_address_unified_support_code_location_indexes_can_be_enabled(monkeypatch):
+    statements = []
+    context = {}
+
+    class FakeDB:
+        async def status(self, statement):
+            statements.append(statement)
+
+    class FakeStage:
+        __tablename__ = "entity_address_procedure_bridge_20260614"
+        __main_table__ = "entity_address_procedure_bridge"
+        __my_additional_indexes__ = [
+            {"index_elements": ("code_system", "code", "location_key"), "name": "code_location"},
+        ]
+
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_SUPPORT_CODE_LOCATION_INDEXES", "1")
+    monkeypatch.setattr(entity_address_unified, "db", FakeDB())
+
+    await entity_address_unified._create_stage_indexes(FakeStage, "mrf", context=context)
+
+    assert context.get("skipped_stage_indexes") in (None, [])
+    assert any("idx_code_location" in statement for statement in statements)
+
+
 def test_entity_address_unified_indexes_cover_primary_serving_queries():
     indexes = {index["name"]: index for index in EntityAddressUnified.__my_additional_indexes__}
 
