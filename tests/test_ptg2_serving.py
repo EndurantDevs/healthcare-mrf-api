@@ -1398,6 +1398,66 @@ async def test_manifest_location_provider_matches_filters_coordinates_with_unifi
     assert params["address_types"] == ["practice", "primary"]
 
 
+def test_orthopedic_surgery_specialty_resolves_to_taxonomy():
+    from api.provider_specialty_filters import (
+        ORTHOPAEDIC_SURGERY_TAXONOMY_CODES,
+        resolve_provider_specialty_filter,
+    )
+
+    for term in ("orthopedic surgery", "Orthopaedic Surgeon", "orthopedics", "ortho"):
+        resolved = resolve_provider_specialty_filter({"specialty": term})
+        assert resolved.active, term
+        assert resolved.taxonomy_codes == ORTHOPAEDIC_SURGERY_TAXONOMY_CODES, term
+        assert "207X00000X" in resolved.taxonomy_codes
+
+
+@pytest.mark.asyncio
+async def test_manifest_location_provider_matches_applies_specialty_taxonomy_filter(monkeypatch):
+    # Regression: a location (geo/ZIP) provider search must still scope to the
+    # requested clinical specialty. Without the taxonomy predicate, a procedure+ZIP
+    # lookup returns every NPI that bills at that address (e.g. an optometry practice
+    # or a hospital for an orthopedic ACL repair) instead of orthopedic surgeons.
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
+    group_id = "00000000000000000000000000000011"
+    provider_set_id = "00000000000000000000000000000012"
+    session = FakeSession(
+        [
+            FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
+            False,
+            FakeResult(rows=[]),
+        ]
+    )
+    tables = ptg2_serving.PTG2ServingTables(
+        provider_group_member_table="mrf.ptg2_provider_group_member_snap",
+        artifacts={"provider_inverted": {"name": "provider_inverted", "path": "/tmp/provider_inverted.ptg2sc"}},
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_ptg2_manifest_sidecar_members_many",
+        lambda *_a, **_k: {group_id: (provider_set_id,)},
+    )
+
+    await ptg2_serving._ptg2_manifest_location_provider_matches(
+        session,
+        tables,
+        {
+            "lat": "34.14024131",
+            "long": "-118.255125",
+            "radius_miles": "10",
+            "limit": "5",
+            "specialty": "orthopedic surgery",
+        },
+        candidate_limit=5,
+    )
+
+    sql = str(session.calls[2][0][0])
+    params = session.calls[2][0][1]
+    # The location query is now scoped by an npi_taxonomy EXISTS predicate on addr.npi.
+    assert "mrf.npi_taxonomy" in sql
+    assert "addr.npi" in sql
+    assert "207X00000X" in str(params)
+
+
 @pytest.mark.asyncio
 async def test_compact_serving_include_providers_expands_without_geo_filter(monkeypatch):
     monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "legacy")

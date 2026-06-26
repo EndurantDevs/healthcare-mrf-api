@@ -25,6 +25,20 @@ FAMILY_MEDICINE_TAXONOMY_CODES: tuple[str, ...] = (
     "208D00000X",  # General Practice
 )
 
+# Full NUCC 207X "Orthopaedic Surgery" family (base + subspecialties), so that a
+# request for an orthopedic procedure (e.g. ACL reconstruction, CPT 29888) scopes to
+# every orthopedic surgeon regardless of subspecialty.
+ORTHOPAEDIC_SURGERY_TAXONOMY_CODES: tuple[str, ...] = (
+    "207X00000X",  # Orthopaedic Surgery
+    "207XP3100X",  # Pediatric Orthopaedic Surgery
+    "207XS0106X",  # Hand Surgery (Orthopaedic)
+    "207XS0114X",  # Adult Reconstructive Orthopaedic Surgery
+    "207XS0117X",  # Orthopaedic Surgery of the Spine
+    "207XX0004X",  # Foot and Ankle Orthopaedic Surgery
+    "207XX0005X",  # Sports Medicine (Orthopaedic Surgery)
+    "207XX0801X",  # Orthopaedic Trauma
+)
+
 _SPECIALTY_TAXONOMY_CODE_ALIASES: dict[str, tuple[str, ...]] = {
     "primary care": PRIMARY_CARE_TAXONOMY_CODES,
     "pcp": PRIMARY_CARE_TAXONOMY_CODES,
@@ -47,6 +61,17 @@ _SPECIALTY_TAXONOMY_CODE_ALIASES: dict[str, tuple[str, ...]] = {
     "er": ("207P00000X",),
     "spinal surgeon": ("207XS0117X", "207T00000X"),
     "spine surgeon": ("207XS0117X", "207T00000X"),
+    "orthopedic surgery": ORTHOPAEDIC_SURGERY_TAXONOMY_CODES,
+    "orthopaedic surgery": ORTHOPAEDIC_SURGERY_TAXONOMY_CODES,
+    "orthopedic surgeon": ORTHOPAEDIC_SURGERY_TAXONOMY_CODES,
+    "orthopaedic surgeon": ORTHOPAEDIC_SURGERY_TAXONOMY_CODES,
+    "orthopedics": ORTHOPAEDIC_SURGERY_TAXONOMY_CODES,
+    "orthopaedics": ORTHOPAEDIC_SURGERY_TAXONOMY_CODES,
+    "orthopedist": ORTHOPAEDIC_SURGERY_TAXONOMY_CODES,
+    "orthopaedist": ORTHOPAEDIC_SURGERY_TAXONOMY_CODES,
+    "orthopedic": ORTHOPAEDIC_SURGERY_TAXONOMY_CODES,
+    "orthopaedic": ORTHOPAEDIC_SURGERY_TAXONOMY_CODES,
+    "ortho": ORTHOPAEDIC_SURGERY_TAXONOMY_CODES,
     "neurology": ("2084N0400X",),
     "neurologist": ("2084N0400X",),
     "multiple sclerosis": ("2084N0400X",),

@@ -1097,6 +1097,36 @@ async def _ptg2_manifest_location_provider_matches(
     if len(filters) == 1:
         return None
 
+    # Scope location matches to the requested clinical specialty/taxonomy, mirroring
+    # the non-location taxonomy filter (_ptg2_manifest_filter_npis_by_provider_taxonomy)
+    # and the compact provider filter. Without this, a procedure+ZIP search returns
+    # every NPI that merely carries a negotiated rate at that address (e.g. an
+    # optometry practice or a hospital for an arthroscopic ACL repair) instead of the
+    # clinically appropriate specialists (orthopedic surgeons).
+    location_specialty_filter = resolve_provider_specialty_filter(args)
+    if location_specialty_filter.active:
+        filters.append(
+            provider_specialty_taxonomy_exists_sql(
+                "addr.npi",
+                params,
+                "manifest_location_specialty",
+                location_specialty_filter,
+                schema=PTG2_SCHEMA,
+            )
+        )
+    location_inferred_taxonomy_sql = _inferred_provider_taxonomy_code_sql(
+        args,
+        nt_alias="nt",
+        schema=PTG2_SCHEMA,
+        params=params,
+        param_prefix="manifest_location_inferred_taxonomy",
+    )
+    if location_inferred_taxonomy_sql:
+        filters.append(
+            f"EXISTS (SELECT 1 FROM {PTG2_SCHEMA}.npi_taxonomy nt "
+            f"WHERE nt.npi = addr.npi AND {location_inferred_taxonomy_sql})"
+        )
+
     address_location_source = _ptg2_address_location_source(npi_address_table)
     address_location_hash_sql = _ptg2_address_location_hash_sql("addr", npi_address_table)
     has_npi_data = await _serving_table_available(session, npi_data_table)
