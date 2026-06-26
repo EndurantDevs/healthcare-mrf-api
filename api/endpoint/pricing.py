@@ -5137,6 +5137,7 @@ async def list_provider_procedures(request, npi: str):
             pagination,
         )
         if ptg2_payload is None:
+            ptg_empty_status = "no_match" if (source_key or snapshot_id) else "snapshot_not_loaded"
             return response.json(
                 {
                     "items": [],
@@ -5157,7 +5158,7 @@ async def list_provider_procedures(request, npi: str):
                         "code": code or reported_code or None,
                         "q": q or service_name or None,
                         "source": "ptg2",
-                        "status": "snapshot_not_loaded",
+                        "status": ptg_empty_status,
                     },
                 }
             )
@@ -7183,6 +7184,7 @@ async def list_providers_by_procedure(request):
             pagination,
         )
         if ptg2_payload is None:
+            ptg_empty_status = "no_match" if (source_key or snapshot_id) else "snapshot_not_loaded"
             return response.json(
                 {
                     "items": [],
@@ -7209,9 +7211,10 @@ async def list_providers_by_procedure(request):
                         "state": state or None,
                         "city": city or None,
                         "zip5": zip5 or None,
+                        "zip_radius_miles": zip_radius_miles if zip5 else None,
                         "npi": npi,
                         "source": "ptg2",
-                        "status": "snapshot_not_loaded",
+                        "status": ptg_empty_status,
                     },
                 }
             )

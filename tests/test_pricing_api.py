@@ -1803,6 +1803,32 @@ async def test_list_providers_by_procedure_routes_zip_as_default_radius_to_ptg2(
 
 
 @pytest.mark.asyncio
+async def test_list_providers_by_procedure_empty_loaded_ptg_source_reports_no_match(monkeypatch):
+    async def fake_search(_session, _args, _pagination):
+        return None
+
+    monkeypatch.setattr(pricing_module, "search_current_ptg2_index", fake_search)
+    request = make_request(
+        [],
+        args={
+            "plan_id": "010854205",
+            "market_type": "group",
+            "source_key": "ptg_2627a71e793162ac",
+            "snapshot_id": "ptg2:202606:7ed1678cf1a2",
+            "code": "29888",
+        },
+    )
+
+    response = await list_providers_by_procedure(request)
+    payload = json.loads(response.body)
+
+    assert payload["items"] == []
+    assert payload["pagination"]["total"] == 0
+    assert payload["query"]["source"] == "ptg2"
+    assert payload["query"]["status"] == "no_match"
+
+
+@pytest.mark.asyncio
 async def test_list_providers_by_procedure_cost_index_requires_code():
     request = make_request(
         [],
