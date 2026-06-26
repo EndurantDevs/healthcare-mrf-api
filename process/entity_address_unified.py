@@ -49,8 +49,10 @@ DEFAULT_EVIDENCE_SHARDS = 16
 DEFAULT_EVIDENCE_CONCURRENCY = 4
 DEFAULT_SUPPORT_STAGE_CONCURRENCY = 4
 DEFAULT_SUPPORT_INDEX_CONCURRENCY = 2
+DEFAULT_SUPPORT_HEAP_LOAD = True
 DEFAULT_BUILD_NETWORK_BRIDGE = False
 DEFAULT_COMPACT_SOURCE_RECORD_IDS = True
+DEFAULT_COMPACT_SOURCE_RECORD_IDS_BY_REWRITE = False
 DEFAULT_SQL_WORK_MEM = "256MB"
 DEFAULT_SQL_MAINTENANCE_WORK_MEM = "2GB"
 DEFAULT_SQL_TEMP_FILE_LIMIT = "128GB"
@@ -457,6 +459,38 @@ async def _compact_hot_row_source_record_ids(
     context: dict | None = None,
 ) -> int:
     phase_context = context if context is not None else {}
+    if not _env_bool(
+        "HLTHPRT_ENTITY_ADDRESS_UNIFIED_COMPACT_SOURCE_RECORD_IDS_BY_REWRITE",
+        DEFAULT_COMPACT_SOURCE_RECORD_IDS_BY_REWRITE,
+    ):
+        row_estimate = int(
+            await db.scalar(
+                f"""
+                SELECT GREATEST(COALESCE(c.reltuples, 0), 0)::bigint
+                  FROM pg_class c
+                  JOIN pg_namespace n
+                    ON n.oid = c.relnamespace
+                 WHERE n.nspname = {_sql_literal(db_schema)}
+                   AND c.relname = {_sql_literal(stage_table)};
+                """
+            )
+            or 0
+        )
+        await _run_sql_phase(
+            f"ALTER TABLE {db_schema}.{stage_table} DROP COLUMN source_record_ids;",
+            context=phase_context,
+            phase="entity-address-unified compacting hot rows metadata",
+        )
+        await _run_sql_phase(
+            f"""
+            ALTER TABLE {db_schema}.{stage_table}
+                ADD COLUMN source_record_ids varchar[] NOT NULL DEFAULT '{{}}'::varchar[];
+            """,
+            context=phase_context,
+            phase="entity-address-unified compacting hot rows metadata",
+        )
+        return row_estimate
+
     compact_table = _compact_stage_table_name(stage_table)
     columns = _entity_address_unified_columns()
     columns_sql = ", ".join(columns)
@@ -570,11 +604,101 @@ async def _prepare_inference_stage_indexes(
     )
 
 
+def _drop_stage_primary_key_sql(db_schema: str, table_name: str) -> str:
+    return f"""
+    DO $$
+    DECLARE
+        existing_constraint text;
+    BEGIN
+        SELECT c.conname
+          INTO existing_constraint
+          FROM pg_constraint c
+          JOIN pg_class t
+            ON t.oid = c.conrelid
+          JOIN pg_namespace n
+            ON n.oid = t.relnamespace
+         WHERE n.nspname = {_sql_literal(db_schema)}
+           AND t.relname = {_sql_literal(table_name)}
+           AND c.contype = 'p'
+         LIMIT 1;
+
+        IF existing_constraint IS NOT NULL THEN
+            EXECUTE format(
+                'ALTER TABLE %I.%I DROP CONSTRAINT %I',
+                {_sql_literal(db_schema)},
+                {_sql_literal(table_name)},
+                existing_constraint
+            );
+        END IF;
+    END $$;
+    """
+
+
+def _ensure_stage_primary_key_sql(
+    db_schema: str,
+    table_name: str,
+    primary_key_columns: Iterable[str],
+) -> str:
+    columns = list(primary_key_columns)
+    if not columns:
+        return ""
+    constraint_name = _archived_identifier(table_name, "_pkey")
+    column_sql = ", ".join(columns)
+    return f"""
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1
+              FROM pg_constraint c
+              JOIN pg_class t
+                ON t.oid = c.conrelid
+              JOIN pg_namespace n
+                ON n.oid = t.relnamespace
+             WHERE n.nspname = {_sql_literal(db_schema)}
+               AND t.relname = {_sql_literal(table_name)}
+               AND c.contype = 'p'
+        ) THEN
+            ALTER TABLE {db_schema}.{table_name}
+                ADD CONSTRAINT {constraint_name}
+                PRIMARY KEY ({column_sql});
+        END IF;
+    END $$;
+    """
+
+
+async def _ensure_stage_primary_key(
+    stage_cls,
+    db_schema: str,
+    *,
+    context: dict | None = None,
+) -> None:
+    if not hasattr(stage_cls, "__table__"):
+        return
+    primary_key_columns = [column.name for column in stage_cls.__table__.primary_key.columns]
+    if not primary_key_columns:
+        return
+    await _run_sql_phase(
+        _ensure_stage_primary_key_sql(
+            db_schema,
+            stage_cls.__tablename__,
+            primary_key_columns,
+        ),
+        context=context,
+        phase="entity-address-unified indexing support primary key",
+    )
+
+
 async def _prepare_support_stage_tables(db_schema: str, import_date: str) -> dict[type, type]:
     stage_classes = _support_stage_classes(import_date)
+    heap_load = _env_bool(
+        "HLTHPRT_ENTITY_ADDRESS_UNIFIED_SUPPORT_HEAP_LOAD",
+        DEFAULT_SUPPORT_HEAP_LOAD,
+    )
     for stage_cls in stage_classes.values():
         await db.status(f"DROP TABLE IF EXISTS {db_schema}.{stage_cls.__tablename__};")
         await db.create_table(stage_cls.__table__, checkfirst=True)
+        if heap_load:
+            await db.status(_drop_stage_primary_key_sql(db_schema, stage_cls.__tablename__))
     return stage_classes
 
 
@@ -622,6 +746,7 @@ async def _create_support_stage_indexes(
                         f"(concurrency {index_concurrency})"
                     ),
                 )
+        await _ensure_stage_primary_key(stage_cls, db_schema, context=phase_context)
         await _create_stage_indexes(stage_cls, db_schema, context=phase_context)
         if run_id:
             async with progress_lock:

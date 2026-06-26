@@ -1824,6 +1824,134 @@ async def test_entity_address_unified_support_stage_indexes_run_parallel(monkeyp
     assert events[-1]["done"] == 3
 
 
+@pytest.mark.asyncio
+async def test_entity_address_unified_prepare_support_tables_heap_load_drops_primary(monkeypatch):
+    statements = []
+    created_tables = []
+
+    class FakeDB:
+        async def status(self, statement):
+            statements.append(statement)
+
+        async def create_table(self, table, checkfirst=True):
+            created_tables.append((table, checkfirst))
+
+    class FakeStage:
+        __tablename__ = "entity_address_procedure_bridge_20260614"
+        __table__ = object()
+
+    monkeypatch.delenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_SUPPORT_HEAP_LOAD", raising=False)
+    monkeypatch.setattr(entity_address_unified, "db", FakeDB())
+    monkeypatch.setattr(
+        entity_address_unified,
+        "_support_stage_classes",
+        lambda _import_date: {entity_address_unified.EntityAddressProcedureBridge: FakeStage},
+    )
+
+    stages = await entity_address_unified._prepare_support_stage_tables(  # pylint: disable=protected-access
+        "mrf",
+        "20260614",
+    )
+
+    assert stages == {entity_address_unified.EntityAddressProcedureBridge: FakeStage}
+    assert created_tables == [(FakeStage.__table__, True)]
+    assert statements[0] == "DROP TABLE IF EXISTS mrf.entity_address_procedure_bridge_20260614;"
+    assert "DROP CONSTRAINT" in statements[1]
+    assert "entity_address_procedure_bridge_20260614" in statements[1]
+
+
+@pytest.mark.asyncio
+async def test_entity_address_unified_prepare_support_tables_can_keep_primary(monkeypatch):
+    statements = []
+
+    class FakeDB:
+        async def status(self, statement):
+            statements.append(statement)
+
+        async def create_table(self, table, checkfirst=True):
+            del table, checkfirst
+
+    class FakeStage:
+        __tablename__ = "entity_address_procedure_bridge_20260614"
+        __table__ = object()
+
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_SUPPORT_HEAP_LOAD", "0")
+    monkeypatch.setattr(entity_address_unified, "db", FakeDB())
+    monkeypatch.setattr(
+        entity_address_unified,
+        "_support_stage_classes",
+        lambda _import_date: {entity_address_unified.EntityAddressProcedureBridge: FakeStage},
+    )
+
+    await entity_address_unified._prepare_support_stage_tables(  # pylint: disable=protected-access
+        "mrf",
+        "20260614",
+    )
+
+    assert statements == ["DROP TABLE IF EXISTS mrf.entity_address_procedure_bridge_20260614;"]
+
+
+def test_entity_address_unified_support_primary_key_sql_restores_constraint():
+    sql = entity_address_unified._ensure_stage_primary_key_sql(  # pylint: disable=protected-access
+        "mrf",
+        "entity_address_procedure_bridge_20260614",
+        ["location_key", "npi", "code_system", "code"],
+    )
+
+    assert "IF NOT EXISTS" in sql
+    assert "ADD CONSTRAINT entity_address_procedure_bridge_20260614_pkey" in sql
+    assert "PRIMARY KEY (location_key, npi, code_system, code)" in sql
+
+
+@pytest.mark.asyncio
+async def test_entity_address_unified_support_indexes_restore_primary_before_secondary(monkeypatch):
+    order = []
+
+    class FakeModelA:
+        __tablename__ = "entity_address_procedure_bridge"
+
+    class FakeStageA:
+        __tablename__ = "entity_address_procedure_bridge_20260614"
+
+    class FakeModelB:
+        __tablename__ = "entity_address_medication_bridge"
+
+    class FakeStageB:
+        __tablename__ = "entity_address_medication_bridge_20260614"
+
+    async def fake_ensure_stage_primary_key(stage_cls, _db_schema, *, context=None):
+        del context
+        order.append(f"pk:{stage_cls.__tablename__}")
+
+    async def fake_create_stage_indexes(stage_cls, _db_schema, *, context=None):
+        del context
+        order.append(f"idx:{stage_cls.__tablename__}")
+
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_SUPPORT_INDEX_CONCURRENCY", "1")
+    monkeypatch.setattr(
+        entity_address_unified,
+        "_ensure_stage_primary_key",
+        fake_ensure_stage_primary_key,
+    )
+    monkeypatch.setattr(
+        entity_address_unified,
+        "_create_stage_indexes",
+        fake_create_stage_indexes,
+    )
+
+    await entity_address_unified._create_support_stage_indexes(  # pylint: disable=protected-access
+        {FakeModelA: FakeStageA, FakeModelB: FakeStageB},
+        "mrf",
+    )
+
+    assert order == [
+        "pk:entity_address_procedure_bridge_20260614",
+        "idx:entity_address_procedure_bridge_20260614",
+        "pk:entity_address_medication_bridge_20260614",
+        "idx:entity_address_medication_bridge_20260614",
+    ]
+
+
 def test_entity_address_unified_evidence_stage_updates_by_location_key():
     evidence_table = entity_address_unified._evidence_stage_table_name("entity_address_unified_stage")
     prepare_sql = entity_address_unified._prepare_multi_source_evidence_table_sql(
@@ -2153,7 +2281,39 @@ def test_entity_address_unified_can_skip_network_bridge_stage_sql():
 
 
 @pytest.mark.asyncio
-async def test_entity_address_unified_compacts_source_record_ids_by_rewrite(monkeypatch):
+async def test_entity_address_unified_compacts_source_record_ids_by_metadata_reset(monkeypatch):
+    statements = []
+
+    class FakeDB:
+        async def scalar(self, statement):
+            statements.append(statement)
+            return 42
+
+        async def status(self, statement):
+            statements.append(statement)
+            return None
+
+    monkeypatch.delenv(
+        "HLTHPRT_ENTITY_ADDRESS_UNIFIED_COMPACT_SOURCE_RECORD_IDS_BY_REWRITE",
+        raising=False,
+    )
+    monkeypatch.setattr(entity_address_unified, "db", FakeDB())
+
+    rows = await entity_address_unified._compact_hot_row_source_record_ids(  # pylint: disable=protected-access
+        "mrf",
+        "entity_address_unified_stage",
+    )
+
+    assert rows == 42
+    joined = "\n".join(statements)
+    assert "pg_class" in statements[0]
+    assert "ALTER TABLE mrf.entity_address_unified_stage DROP COLUMN source_record_ids" in joined
+    assert "ADD COLUMN source_record_ids varchar[] NOT NULL DEFAULT '{}'" in joined
+    assert "entity_address_unified_stage_compact" not in joined
+
+
+@pytest.mark.asyncio
+async def test_entity_address_unified_can_compact_source_record_ids_by_rewrite(monkeypatch):
     statements = []
 
     class FakeDB:
@@ -2163,9 +2323,10 @@ async def test_entity_address_unified_compacts_source_record_ids_by_rewrite(monk
                 return 42
             return None
 
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_COMPACT_SOURCE_RECORD_IDS_BY_REWRITE", "1")
     monkeypatch.setattr(entity_address_unified, "db", FakeDB())
 
-    rows = await entity_address_unified._compact_hot_row_source_record_ids(
+    rows = await entity_address_unified._compact_hot_row_source_record_ids(  # pylint: disable=protected-access
         "mrf",
         "entity_address_unified_stage",
     )
