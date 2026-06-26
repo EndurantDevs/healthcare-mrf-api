@@ -23,7 +23,10 @@ from api.endpoint.pagination import parse_pagination
 from api.ptg2_serving import normalize_ptg2_mode, search_current_ptg2_index, search_ptg2_provider_procedures
 from api.ptg2_snapshot import current_source_snapshot_id_for_plan
 from api.ptg2_tables import _safe_table_name, snapshot_serving_tables
+from api.ptg2_code_filters import INFERRED_PROVIDER_TAXONOMY_RULES
 from api.provider_specialty_filters import (
+    ORTHOPAEDIC_SURGERY_TAXONOMY_CODES,
+    PRIMARY_CARE_TAXONOMY_CODES,
     provider_specialty_taxonomy_exists_sql,
     resolve_provider_specialty_filter,
 )
@@ -85,6 +88,58 @@ PROVIDER_QUALITY_SHRINKAGE_ALPHA = max(float(os.getenv("HLTHPRT_PROVIDER_QUALITY
 PROVIDER_QUALITY_DEFAULT_SVI = min(
     max(float(os.getenv("HLTHPRT_PROVIDER_QUALITY_DEFAULT_SVI", "0.5")), 0.0),
     1.0,
+)
+PROCEDURE_TAXONOMY_MIN_REPRESENTATIVE_NPIS = max(
+    int(os.getenv("HLTHPRT_PROCEDURE_TAXONOMY_MIN_REPRESENTATIVE_NPIS", "20")),
+    1,
+)
+PROCEDURE_TAXONOMY_MIN_REPRESENTATIVE_BENEFICIARIES = max(
+    int(os.getenv("HLTHPRT_PROCEDURE_TAXONOMY_MIN_REPRESENTATIVE_BENEFICIARIES", "100")),
+    0,
+)
+PROCEDURE_TAXONOMY_MEDIUM_NPI_SHARE = min(
+    max(float(os.getenv("HLTHPRT_PROCEDURE_TAXONOMY_MEDIUM_NPI_SHARE", "0.35")), 0.0),
+    1.0,
+)
+PROCEDURE_TAXONOMY_HIGH_NPI_SHARE = min(
+    max(float(os.getenv("HLTHPRT_PROCEDURE_TAXONOMY_HIGH_NPI_SHARE", "0.60")), 0.0),
+    1.0,
+)
+PROCEDURE_TAXONOMY_HARD_FILTER_REQUIRES_ALLOW = (
+    str(os.getenv("HLTHPRT_PROCEDURE_TAXONOMY_HARD_FILTER_REQUIRES_ALLOW", "true")).strip().lower()
+    not in {"0", "false", "no", "off"}
+)
+PROCEDURE_TAXONOMY_OFFICE_EM_CODES = frozenset(str(code) for code in range(99201, 99216))
+PROCEDURE_TAXONOMY_KNOWN_YOUNG_SKEW_CODES = frozenset({"29888"})
+PROCEDURE_TAXONOMY_PRIMARY_CARE_INTENT_TERMS = frozenset(
+    {
+        "annual",
+        "checkup",
+        "cold",
+        "cough",
+        "family",
+        "flu",
+        "pcp",
+        "physical",
+        "primary",
+        "primary care",
+        "routine",
+        "sinus",
+        "strep",
+        "uti",
+        "wellness",
+    }
+)
+PROCEDURE_TAXONOMY_ORTHOPAEDIC_INTENT_TERMS = frozenset(
+    {
+        "acl",
+        "knee",
+        "ligament",
+        "orthopedic",
+        "orthopaedic",
+        "ortho",
+        "sports",
+    }
 )
 
 
@@ -240,7 +295,7 @@ PROCEDURE_COST_LEVEL_ZIP_RADIUS_DEFAULT_MILES = min(
     PROCEDURE_ZIP_MAX_RADIUS_MILES,
 )
 PROCEDURE_SEARCH_ZIP_RADIUS_DEFAULT_MILES = min(
-    max(float(os.getenv("HLTHPRT_PRICING_PROCEDURE_SEARCH_ZIP_RADIUS_DEFAULT_MILES", "0")), 0.0),
+    max(float(os.getenv("HLTHPRT_PRICING_PROCEDURE_SEARCH_ZIP_RADIUS_DEFAULT_MILES", "10")), 0.0),
     PROCEDURE_ZIP_MAX_RADIUS_MILES,
 )
 PROCEDURE_COST_COHORT_STRATEGY_PRECOMPUTED = "precomputed"
@@ -3746,6 +3801,327 @@ async def _resolve_internal_codes_for_request(
     return internal_codes, code_context
 
 
+def _normalized_intent_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip().lower())
+
+
+def _intent_contains_any(intent: str, terms: frozenset[str]) -> bool:
+    if not intent:
+        return False
+    normalized = f" {intent} "
+    return any(f" {term} " in normalized or term in intent for term in terms)
+
+
+def _taxonomy_codes_for_intent(clinical_intent: Any) -> tuple[tuple[str, ...], str | None]:
+    intent = _normalized_intent_text(clinical_intent)
+    if not intent:
+        return (), None
+    if _intent_contains_any(intent, PROCEDURE_TAXONOMY_PRIMARY_CARE_INTENT_TERMS):
+        return PRIMARY_CARE_TAXONOMY_CODES, "primary_care_intent"
+    if _intent_contains_any(intent, PROCEDURE_TAXONOMY_ORTHOPAEDIC_INTENT_TERMS):
+        return ORTHOPAEDIC_SURGERY_TAXONOMY_CODES, "orthopaedic_intent"
+    return (), None
+
+
+def _taxonomy_rule_for_reported_code(code: Any) -> dict[str, Any] | None:
+    normalized = str(code or "").strip().upper()
+    if not normalized.isdigit():
+        return None
+    code_value = int(normalized)
+    for rule in INFERRED_PROVIDER_TAXONOMY_RULES:
+        if rule.matches(code_value):
+            return {
+                "taxonomy_codes": list(rule.taxonomy_codes),
+                "display_terms": list(rule.display_terms),
+                "source": "curated_code_range",
+            }
+    return None
+
+
+def _dedupe_taxonomy_codes(*groups: list[str] | tuple[str, ...]) -> list[str]:
+    codes: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for value in group:
+            code = str(value or "").strip().upper()
+            if not code or code in seen:
+                continue
+            seen.add(code)
+            codes.append(code)
+    return codes
+
+
+def _taxonomy_evidence_item(row: dict[str, Any]) -> dict[str, Any]:
+    distinct_npis = _as_int(row.get("distinct_npis")) or 0
+    total_services = _as_float(row.get("total_services")) or 0.0
+    total_beneficiaries = _as_float(row.get("total_beneficiaries")) or 0.0
+    provider_types = row.get("provider_types") or []
+    if isinstance(provider_types, str):
+        provider_types = [provider_types]
+    provider_types = [str(value).strip() for value in provider_types if str(value or "").strip()]
+    return {
+        "taxonomy_code": str(row.get("taxonomy_code") or "").strip().upper() or None,
+        "classification": str(row.get("classification") or "").strip() or None,
+        "specialization": str(row.get("specialization") or "").strip() or None,
+        "display_name": str(row.get("display_name") or "").strip() or None,
+        "distinct_npis": distinct_npis,
+        "total_services": total_services,
+        "total_beneficiaries": total_beneficiaries,
+        "provider_types": provider_types[:12],
+    }
+
+
+def _classify_procedure_taxonomy_resolution(
+    *,
+    reported_code: str,
+    clinical_intent: Any,
+    evidence_items: list[dict[str, Any]],
+    allow_hard_filter: bool,
+) -> dict[str, Any]:
+    normalized_code = str(reported_code or "").strip().upper()
+    intent_codes, intent_source = _taxonomy_codes_for_intent(clinical_intent)
+    curated_rule = _taxonomy_rule_for_reported_code(normalized_code)
+    curated_codes = tuple(curated_rule.get("taxonomy_codes") or ()) if curated_rule else ()
+    is_em_ambiguous = normalized_code in PROCEDURE_TAXONOMY_OFFICE_EM_CODES and not intent_source
+    is_known_young_skew = normalized_code in PROCEDURE_TAXONOMY_KNOWN_YOUNG_SKEW_CODES
+
+    evidence_totals = {
+        "distinct_npis": sum(item.get("distinct_npis") or 0 for item in evidence_items),
+        "total_services": sum(_as_float(item.get("total_services")) or 0.0 for item in evidence_items),
+        "total_beneficiaries": sum(_as_float(item.get("total_beneficiaries")) or 0.0 for item in evidence_items),
+    }
+    for item in evidence_items:
+        total_npis = max(float(evidence_totals["distinct_npis"]), 1.0)
+        total_services = max(float(evidence_totals["total_services"]), 1.0)
+        item["distinct_npi_share"] = round(float(item.get("distinct_npis") or 0) / total_npis, 6)
+        item["service_share"] = round(float(item.get("total_services") or 0.0) / total_services, 6)
+
+    top_item = evidence_items[0] if evidence_items else None
+    top_npi_share = _as_float(top_item.get("distinct_npi_share")) if top_item else 0.0
+    representative = (
+        evidence_totals["distinct_npis"] >= PROCEDURE_TAXONOMY_MIN_REPRESENTATIVE_NPIS
+        and evidence_totals["total_beneficiaries"] >= PROCEDURE_TAXONOMY_MIN_REPRESENTATIVE_BENEFICIARIES
+        and not is_known_young_skew
+    )
+    if top_npi_share is not None and top_npi_share >= PROCEDURE_TAXONOMY_HIGH_NPI_SHARE and representative:
+        confidence = "high"
+    elif top_npi_share is not None and top_npi_share >= PROCEDURE_TAXONOMY_MEDIUM_NPI_SHARE and representative:
+        confidence = "medium"
+    elif evidence_items:
+        confidence = "low"
+    else:
+        confidence = "none"
+
+    recommended_codes = _dedupe_taxonomy_codes(intent_codes, curated_codes)
+    source = intent_source or (curated_rule or {}).get("source")
+    if not recommended_codes and top_item and top_item.get("taxonomy_code"):
+        recommended_codes = [str(top_item["taxonomy_code"])]
+        source = "medicare_provider_taxonomy_evidence"
+
+    needs_intent = bool(is_em_ambiguous)
+    needs_review = False
+    conflict_reasons: list[str] = []
+    if intent_codes and curated_codes and set(intent_codes).isdisjoint(set(curated_codes)):
+        needs_review = True
+        conflict_reasons.append("intent_conflicts_with_curated_code_range")
+    if recommended_codes and top_item and top_item.get("taxonomy_code") not in recommended_codes:
+        top_share = _as_float(top_item.get("distinct_npi_share")) or 0.0
+        if top_share >= PROCEDURE_TAXONOMY_MEDIUM_NPI_SHARE:
+            needs_review = True
+            conflict_reasons.append("utilization_top_taxonomy_conflicts_with_selected_taxonomy")
+
+    bias_notes = [
+        "cms_physician_other_practitioners_is_medicare_fee_for_service_only",
+        "cells_suppressed_by_cms_are_absent_from_the_aggregate",
+    ]
+    if is_known_young_skew:
+        bias_notes.append("procedure_is_known_to_skew_younger_than_medicare_ffs")
+    if not representative:
+        bias_notes.append("representativeness_gate_failed")
+
+    safe_for_hard_filter = (
+        bool(recommended_codes)
+        and not needs_intent
+        and not needs_review
+        and confidence == "high"
+        and representative
+    )
+    hard_filter_allowed_by_request = allow_hard_filter or not PROCEDURE_TAXONOMY_HARD_FILTER_REQUIRES_ALLOW
+    if needs_intent:
+        status = "ambiguous"
+        recommended_mode = "ambiguous"
+    elif not recommended_codes:
+        status = "insufficient_evidence"
+        recommended_mode = "validate_only"
+    elif safe_for_hard_filter and hard_filter_allowed_by_request:
+        status = "resolved"
+        recommended_mode = "hard_filter"
+    else:
+        status = "resolved"
+        recommended_mode = "soft_boost"
+
+    filter_payload = None
+    boost_payload = None
+    if recommended_codes:
+        payload = {
+            "taxonomy_codes": recommended_codes,
+            "include_subspecialties": False,
+            "primary_only": False,
+        }
+        if recommended_mode == "hard_filter":
+            filter_payload = payload
+        else:
+            boost_payload = payload
+
+    return {
+        "status": status,
+        "recommended_mode": recommended_mode,
+        "confidence": confidence,
+        "needs_intent": needs_intent,
+        "needs_review": needs_review,
+        "safe_for_hard_filter": safe_for_hard_filter,
+        "taxonomy_codes": recommended_codes,
+        "taxonomy_source": source,
+        "provider_filter": filter_payload,
+        "provider_boost": boost_payload,
+        "conflict_reasons": conflict_reasons,
+        "representativeness": {
+            "passed": representative,
+            "distinct_npis": evidence_totals["distinct_npis"],
+            "total_services": evidence_totals["total_services"],
+            "total_beneficiaries": evidence_totals["total_beneficiaries"],
+            "min_distinct_npis": PROCEDURE_TAXONOMY_MIN_REPRESENTATIVE_NPIS,
+            "min_total_beneficiaries": PROCEDURE_TAXONOMY_MIN_REPRESENTATIVE_BENEFICIARIES,
+            "known_young_skew": is_known_young_skew,
+        },
+        "bias_notes": bias_notes,
+        "curated_rule": curated_rule,
+        "intent_source": intent_source,
+    }
+
+
+async def _load_procedure_taxonomy_evidence(
+    session,
+    *,
+    year: int,
+    internal_codes: list[int],
+    limit: int,
+) -> list[dict[str, Any]]:
+    if not internal_codes:
+        return []
+
+    quality_feature_exists = await _table_exists(session, QUALITY_FEATURE_TABLE_NAME)
+    quality_join_sql = (
+        f"""
+        LEFT JOIN {PRICING_SCHEMA}.{QUALITY_FEATURE_TABLE_NAME} qf
+          ON qf.npi = pp.npi
+         AND qf.year = pp.year
+        """
+        if quality_feature_exists
+        else ""
+    )
+    quality_select_sql = (
+        """
+            qf.taxonomy_code AS quality_taxonomy_code,
+            qf.taxonomy_classification AS quality_classification,
+        """
+        if quality_feature_exists
+        else """
+            NULL::varchar AS quality_taxonomy_code,
+            NULL::varchar AS quality_classification,
+        """
+    )
+    params = {
+        "year": year,
+        "internal_codes": list(internal_codes),
+        "limit": limit,
+    }
+    result = await session.execute(
+        text(
+            f"""
+            WITH base AS (
+                SELECT
+                    pp.npi,
+                    pp.total_services,
+                    pp.total_beneficiaries,
+                    p.provider_type,
+                    {quality_select_sql}
+                    nt.healthcare_provider_taxonomy_code AS nppes_taxonomy_code
+                FROM {PRICING_SCHEMA}.{PricingProviderProcedure.__tablename__} pp
+                JOIN {PRICING_SCHEMA}.{PricingProvider.__tablename__} p
+                  ON p.npi = pp.npi
+                 AND p.year = pp.year
+                {quality_join_sql}
+                LEFT JOIN LATERAL (
+                    SELECT t.healthcare_provider_taxonomy_code
+                    FROM {PRICING_SCHEMA}.{NPIDataTaxonomy.__tablename__} t
+                    WHERE t.npi = pp.npi
+                      AND NULLIF(BTRIM(COALESCE(t.healthcare_provider_taxonomy_code, '')), '') IS NOT NULL
+                    ORDER BY
+                        CASE
+                            WHEN UPPER(COALESCE(t.healthcare_provider_primary_taxonomy_switch, '')) = 'Y' THEN 0
+                            ELSE 1
+                        END,
+                        t.checksum
+                    LIMIT 1
+                ) nt ON TRUE
+                WHERE pp.year = :year
+                  AND pp.procedure_code = ANY(:internal_codes)
+            ),
+            normalized AS (
+                SELECT
+                    npi,
+                    total_services,
+                    total_beneficiaries,
+                    provider_type,
+                    COALESCE(
+                        NULLIF(
+                            CASE
+                                WHEN UPPER(NULLIF(BTRIM(COALESCE(quality_taxonomy_code, '')), '')) IN ('UNKNOWN', 'NA', 'N/A')
+                                THEN NULL
+                                ELSE UPPER(NULLIF(BTRIM(COALESCE(quality_taxonomy_code, '')), ''))
+                            END,
+                            ''
+                        ),
+                        UPPER(NULLIF(BTRIM(COALESCE(nppes_taxonomy_code, '')), ''))
+                    ) AS taxonomy_code,
+                    CASE
+                        WHEN UPPER(NULLIF(BTRIM(COALESCE(quality_classification, '')), '')) IN ('UNKNOWN', 'NA', 'N/A')
+                        THEN NULL
+                        ELSE NULLIF(BTRIM(COALESCE(quality_classification, '')), '')
+                    END AS quality_classification
+                FROM base
+            )
+            SELECT
+                n.taxonomy_code,
+                COALESCE(n.quality_classification, nu.classification)::varchar AS classification,
+                nu.specialization::varchar AS specialization,
+                nu.display_name::varchar AS display_name,
+                COUNT(DISTINCT n.npi)::int AS distinct_npis,
+                COALESCE(SUM(n.total_services), 0)::float AS total_services,
+                COALESCE(SUM(n.total_beneficiaries), 0)::float AS total_beneficiaries,
+                ARRAY_REMOVE(ARRAY_AGG(DISTINCT NULLIF(BTRIM(COALESCE(n.provider_type, '')), '')), NULL)::varchar[] AS provider_types
+            FROM normalized n
+            LEFT JOIN {PRICING_SCHEMA}.{NUCCTaxonomy.__tablename__} nu
+              ON UPPER(BTRIM(COALESCE(nu.code, ''))) = n.taxonomy_code
+            WHERE n.taxonomy_code IS NOT NULL
+            GROUP BY
+                n.taxonomy_code,
+                COALESCE(n.quality_classification, nu.classification),
+                nu.specialization,
+                nu.display_name
+            ORDER BY
+                COUNT(DISTINCT n.npi) DESC,
+                COALESCE(SUM(n.total_services), 0) DESC,
+                n.taxonomy_code ASC
+            LIMIT :limit
+            """
+        ),
+        params,
+    )
+    return [_taxonomy_evidence_item(_row_to_dict(row)) for row in result]
+
+
 async def _resolve_internal_rx_codes_for_request(
     session,
     rx_code_value: Any,
@@ -6261,6 +6637,90 @@ async def autocomplete_procedures(request):
     )
 
 
+@blueprint.get("/procedure-taxonomy/resolve", name="pricing.procedure_taxonomy.resolve")
+async def resolve_procedure_taxonomy(request):
+    session = _get_session(request)
+    args = request.args
+    code = _normalize_code(args.get("code"), "code")
+    requested_year = _parse_int(args.get("year"), "year", minimum=2013)
+    year, year_source = await _resolve_year(session, provider_procedure_table, requested_year)
+    evidence_limit = max(1, min(_parse_int(args.get("limit"), "limit", minimum=1) or 10, 50))
+    clinical_intent = str(args.get("clinical_intent") or args.get("intent") or "").strip()
+    setting_key = _parse_setting_key(args.get("setting_key") or args.get("setting"))
+    allow_hard_filter = _parse_bool(args.get("allow_hard_filter"), "allow_hard_filter", default=False)
+    # Keep these explicit so OpenAPI contract tests see the supported query parameters.
+    args.get("code_system")
+    args.get("expand_codes")
+    args.get("include_evidence")
+
+    resolver_args = dict(args)
+    default_system = _reported_procedure_code_system(code) or INTERNAL_CODE_SYSTEM
+    if not resolver_args.get("code_system"):
+        resolver_args["code_system"] = default_system
+
+    internal_codes: list[int] = []
+    code_context: dict[str, Any]
+    try:
+        internal_codes, code_context = await _resolve_internal_codes_for_request(
+            session,
+            code,
+            resolver_args,
+            default_system=default_system,
+        )
+    except sanic.exceptions.NotFound:
+        code_system = _normalize_code_system(resolver_args.get("code_system") or default_system)
+        code_context = {
+            "input_code": {"code_system": code_system, "code": code},
+            "resolved_codes": [],
+            "internal_codes": [],
+            "matched_via": [],
+            "expanded": _parse_bool(resolver_args.get("expand_codes"), "expand_codes", default=False),
+            "resolution_status": "unmapped",
+        }
+
+    evidence_items = await _load_procedure_taxonomy_evidence(
+        session,
+        year=year,
+        internal_codes=internal_codes,
+        limit=evidence_limit,
+    )
+    resolution = _classify_procedure_taxonomy_resolution(
+        reported_code=code,
+        clinical_intent=clinical_intent,
+        evidence_items=evidence_items,
+        allow_hard_filter=allow_hard_filter,
+    )
+    evidence_payload = {
+        "source": "cms_physician_other_practitioners_medicare_ffs",
+        "ranking": "distinct_npi_share_then_service_share",
+        "coverage": resolution["representativeness"],
+        "bias_notes": resolution["bias_notes"],
+        "top_taxonomies": evidence_items,
+    }
+
+    return response.json(
+        {
+            "ok": True,
+            "query": {
+                "code": code,
+                "code_system": code_context.get("input_code", {}).get("code_system"),
+                "year": year,
+                "year_source": year_source,
+                "clinical_intent": clinical_intent or None,
+                "setting_key": setting_key,
+                "allow_hard_filter": allow_hard_filter,
+            },
+            "resolution": {
+                key: value
+                for key, value in resolution.items()
+                if key not in {"representativeness", "bias_notes"}
+            },
+            "evidence": evidence_payload,
+            "code_context": code_context,
+        }
+    )
+
+
 @blueprint.get("/provider-specialties", name="pricing.provider_specialties.list")
 @blueprint.get("/providers/specialties", name="pricing.providers.specialties.list")
 async def list_provider_specialties(request):
@@ -6659,6 +7119,18 @@ async def list_providers_by_procedure(request):
         except ValueError as exc:
             raise InvalidUsage(str(exc)) from exc
     if plan_id or plan_external_id or snapshot_id:
+        ptg_latitude = latitude
+        ptg_longitude = longitude
+        ptg_radius_miles = coordinate_radius_miles if latitude is not None else None
+        if zip5 and latitude is None and zip_radius_miles > 0:
+            zip_context = await _lookup_zip_context(session, zip5)
+            if zip_context is not None:
+                zip_latitude = _as_float(zip_context.get("latitude"))
+                zip_longitude = _as_float(zip_context.get("longitude"))
+                if zip_latitude is not None and zip_longitude is not None:
+                    ptg_latitude = zip_latitude
+                    ptg_longitude = zip_longitude
+                    ptg_radius_miles = zip_radius_miles
         ptg2_payload = await search_current_ptg2_index(
             session,
             {
@@ -6682,9 +7154,10 @@ async def list_providers_by_procedure(request):
                 "state": state or None,
                 "city": city or None,
                 "zip5": zip5 or None,
-                "lat": latitude,
-                "long": longitude,
-                "radius_miles": coordinate_radius_miles if latitude is not None else None,
+                "zip_radius_miles": zip_radius_miles if zip5 else None,
+                "lat": ptg_latitude,
+                "long": ptg_longitude,
+                "radius_miles": ptg_radius_miles,
                 "pos": args.get("pos") or args.get("place_of_service") or None,
                 "service_code": args.get("service_code") or None,
                 "modifier": args.get("modifier") or args.get("modifiers") or None,

@@ -1069,8 +1069,8 @@ async def _ptg2_manifest_location_provider_matches(
         filters.append("addr.city_name = :city_value")
         params["city_value"] = city_value.upper()
     if zip_value:
-        filters.append("left(coalesce(addr.postal_code, ''), 5) = :zip5")
         params["zip5"] = zip_value
+    geo_filters: list[str] = []
     if geo_lat is not None and geo_long is not None and geo_radius_miles is not None:
         params.update(
             geo_lat=geo_lat,
@@ -1081,13 +1081,19 @@ async def _ptg2_manifest_location_provider_matches(
             geo_min_long=geo_long - geo_radius_miles / 69.0,
             geo_max_long=geo_long + geo_radius_miles / 69.0,
         )
-        filters.append("addr.lat::float8 BETWEEN :geo_min_lat AND :geo_max_lat")
-        filters.append("addr.long::float8 BETWEEN :geo_min_long AND :geo_max_long")
-        filters.append(
+        geo_filters.append("addr.lat::float8 BETWEEN :geo_min_lat AND :geo_max_lat")
+        geo_filters.append("addr.long::float8 BETWEEN :geo_min_long AND :geo_max_long")
+        geo_filters.append(
             f"{_ptg2_geo_distance_miles_sql('addr.lat::float8', 'addr.long::float8')} <= CAST(:geo_radius_miles AS double precision)"
         )
         if using_unified_address_table:
-            filters.append("COALESCE(addr.address_precision, '') <> 'city_zip'")
+            geo_filters.append("COALESCE(addr.address_precision, '') <> 'city_zip'")
+    if zip_value and geo_filters:
+        filters.append(f"(left(coalesce(addr.postal_code, ''), 5) = :zip5 OR ({' AND '.join(geo_filters)}))")
+    elif zip_value:
+        filters.append("left(coalesce(addr.postal_code, ''), 5) = :zip5")
+    elif geo_filters:
+        filters.extend(geo_filters)
     if provider_npi is not None:
         try:
             params["provider_npi"] = int(provider_npi)
@@ -1855,18 +1861,23 @@ def _compact_provider_filter_sql(
         params.setdefault("provider_match_limit", max(int(params.get("limit") or 25) * 8, 64))
         params.setdefault("location_rate_candidate_limit", max(int(params.get("limit") or 25) * 200, 4096))
         clauses = []
-        if params.get("zip5"):
+        geo_clauses: list[str] = []
+        if params.get("geo_lat") is not None:
+            geo_clauses.append("loc.lat::float8 BETWEEN :geo_min_lat AND :geo_max_lat")
+            geo_clauses.append("loc.long::float8 BETWEEN :geo_min_long AND :geo_max_long")
+            geo_clauses.append(
+                f"{_ptg2_geo_distance_miles_sql('loc.lat::float8', 'loc.long::float8')} <= CAST(:geo_radius_miles AS double precision)"
+            )
+        if params.get("zip5") and geo_clauses:
+            clauses.append(f"(LEFT(COALESCE(loc.zip5, loc.postal_code, ''), 5) = :zip5 OR ({' AND '.join(geo_clauses)}))")
+        elif params.get("zip5"):
             clauses.append("LEFT(COALESCE(loc.zip5, loc.postal_code, ''), 5) = :zip5")
+        elif geo_clauses:
+            clauses.extend(geo_clauses)
         if params.get("city_exact"):
             clauses.append("UPPER(COALESCE(loc.city, '')) = :city_exact")
         if params.get("state_exact"):
             clauses.append("UPPER(COALESCE(loc.state, '')) = :state_exact")
-        if params.get("geo_lat") is not None:
-            clauses.append("loc.lat::float8 BETWEEN :geo_min_lat AND :geo_max_lat")
-            clauses.append("loc.long::float8 BETWEEN :geo_min_long AND :geo_max_long")
-            clauses.append(
-                f"{_ptg2_geo_distance_miles_sql('loc.lat::float8', 'loc.long::float8')} <= CAST(:geo_radius_miles AS double precision)"
-            )
         if inferred_sql:
             clauses.append(f"EXISTS (SELECT 1 FROM {PTG2_SCHEMA}.npi_taxonomy nt WHERE nt.npi = loc.npi AND {inferred_sql})")
         if specialty_filter.active:
@@ -1923,20 +1934,25 @@ def _compact_provider_filter_sql(
         return "", False
     if has_geo:
         joins.append(f"JOIN {address_table or f'{PTG2_SCHEMA}.npi_address'} addr_filter ON addr_filter.npi = pgm_filter.npi")
-        if params.get("zip5"):
+        geo_clauses = []
+        if params.get("geo_lat") is not None:
+            geo_clauses.append("addr_filter.lat::float8 BETWEEN :geo_min_lat AND :geo_max_lat")
+            geo_clauses.append("addr_filter.long::float8 BETWEEN :geo_min_long AND :geo_max_long")
+            geo_clauses.append(
+                f"{_ptg2_geo_distance_miles_sql('addr_filter.lat::float8', 'addr_filter.long::float8')} <= CAST(:geo_radius_miles AS double precision)"
+            )
+            if _is_unified_address_table(address_table):
+                geo_clauses.append("COALESCE(addr_filter.address_precision, '') <> 'city_zip'")
+        if params.get("zip5") and geo_clauses:
+            clauses.append(f"(LEFT(COALESCE(addr_filter.postal_code, ''), 5) = :zip5 OR ({' AND '.join(geo_clauses)}))")
+        elif params.get("zip5"):
             clauses.append("LEFT(COALESCE(addr_filter.postal_code, ''), 5) = :zip5")
+        elif geo_clauses:
+            clauses.extend(geo_clauses)
         if params.get("city_exact"):
             clauses.append("UPPER(COALESCE(addr_filter.city_name, '')) = :city_exact")
         if params.get("state_exact"):
             clauses.append("UPPER(COALESCE(addr_filter.state_name, '')) = :state_exact")
-        if params.get("geo_lat") is not None:
-            clauses.append("addr_filter.lat::float8 BETWEEN :geo_min_lat AND :geo_max_lat")
-            clauses.append("addr_filter.long::float8 BETWEEN :geo_min_long AND :geo_max_long")
-            clauses.append(
-                f"{_ptg2_geo_distance_miles_sql('addr_filter.lat::float8', 'addr_filter.long::float8')} <= CAST(:geo_radius_miles AS double precision)"
-            )
-            if _is_unified_address_table(address_table):
-                clauses.append("COALESCE(addr_filter.address_precision, '') <> 'city_zip'")
     if specialty_filter.active:
         clauses.append(
             provider_specialty_taxonomy_exists_sql(
@@ -2020,6 +2036,16 @@ def _compact_provider_expansion_sql(
     else:
         return ""
     if serving_tables.provider_group_location_table and (args.get("zip5") or args.get("zip") or args.get("city") or args.get("state") or args.get("lat") or args.get("long")):
+        location_order_sql = ""
+        if params.get("geo_lat") is not None:
+            zip_rank_sql = "0"
+            if params.get("zip5"):
+                zip_rank_sql = "CASE WHEN LEFT(COALESCE(loc.zip5, loc.postal_code, ''), 5) = :zip5 THEN 0 ELSE 1 END"
+            location_order_sql = f"""
+            ORDER BY {zip_rank_sql},
+                     {_ptg2_geo_distance_miles_sql('loc.lat::float8', 'loc.long::float8')} ASC NULLS LAST,
+                     loc.location_hash
+            """
         return f"""
         {component_join}
         {member_join}
@@ -2031,6 +2057,7 @@ def _compact_provider_expansion_sql(
                   SELECT 1 FROM filtered_locations filtered
                   WHERE filtered.npi = loc.npi
               )
+            {location_order_sql}
             OFFSET 0
             LIMIT 1
         ) loc ON TRUE
@@ -2101,6 +2128,14 @@ def _compact_item_from_row(data: dict[str, Any], args: dict[str, Any]) -> dict[s
         "source_trace": _coerce_json_payload(data.get("source_trace"), []),
         "confidence": data.get("confidence") or {"network": "tic_rate_npi_tin"},
     }
+    if data.get("distance_miles") is not None:
+        item["distance_miles"] = data.get("distance_miles")
+    if data.get("zip_match_type") is not None:
+        item["zip_match_type"] = data.get("zip_match_type")
+    if data.get("anchor_zip5") is not None:
+        item["anchor_zip5"] = data.get("anchor_zip5")
+    if data.get("zip_radius_miles") is not None:
+        item["zip_radius_miles"] = data.get("zip_radius_miles")
     return {key: value for key, value in item.items() if value is not None}
 
 
@@ -2160,11 +2195,29 @@ async def _search_compact_serving_table(
         provider_name_table=provider_name_table,
     )
     provider_select_sql = ""
+    provider_distance_order_sql = ""
     if expand_providers and serving_tables.provider_group_location_table and provider_expansion_sql:
+        provider_distance_select_sql = ""
+        if params.get("geo_lat") is not None:
+            loc_distance_sql = _ptg2_geo_distance_miles_sql("loc.lat::float8", "loc.long::float8")
+            if params.get("zip5"):
+                same_zip_sql = "LEFT(COALESCE(loc.zip5, loc.postal_code, ''), 5) = :zip5"
+                provider_distance_select_sql = (
+                    f"CASE WHEN {same_zip_sql} THEN 0.0 ELSE {loc_distance_sql} END AS distance_miles, "
+                    f"CASE WHEN {same_zip_sql} THEN 'same_zip' ELSE 'radius' END AS zip_match_type, "
+                    ":zip5 AS anchor_zip5, :geo_radius_miles AS zip_radius_miles, "
+                )
+            else:
+                provider_distance_select_sql = (
+                    f"{loc_distance_sql} AS distance_miles, "
+                    "'radius' AS zip_match_type, NULL::varchar AS anchor_zip5, :geo_radius_miles AS zip_radius_miles, "
+                )
+            provider_distance_order_sql = "ORDER BY distance_miles ASC NULLS LAST, r.reported_code_system, r.reported_code"
         provider_select_sql = (
             "loc.npi, loc.location_hash, loc.state, loc.city, loc.zip5, "
             "loc.location_source, loc.location_confidence_code, loc.address_payload, "
             "loc.taxonomy_codes, loc.specialties, loc.provider_name,"
+            f"{provider_distance_select_sql}"
         )
     elif expand_providers:
         address_location_source = _ptg2_address_location_source(address_table_sql)
@@ -2246,6 +2299,7 @@ async def _search_compact_serving_table(
         {provider_expansion_sql}
         WHERE TRUE
           {"AND price_payload.prices IS NOT NULL" if price_filter_clauses else ""}
+        {provider_distance_order_sql}
         """
     )
     result = await session.execute(row_stmt, params)
@@ -2276,6 +2330,7 @@ async def _search_compact_serving_table(
                 "state": args.get("state") or None,
                 "city": args.get("city") or None,
                 "zip5": args.get("zip5") or args.get("zip") or None,
+                "zip_radius_miles": args.get("zip_radius_miles") or args.get("radius_miles") or None,
                 "source": "ptg2_db",
                 "serving_table": table_name,
                 "include_providers": expand_providers,

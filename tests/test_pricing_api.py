@@ -31,6 +31,7 @@ list_prescription_providers = pricing_module.list_prescription_providers
 list_provider_procedure_locations = pricing_module.list_provider_procedure_locations
 list_provider_procedures = pricing_module.list_provider_procedures
 list_provider_prescriptions = pricing_module.list_provider_prescriptions
+resolve_procedure_taxonomy = pricing_module.resolve_procedure_taxonomy
 pricing_statistics = pricing_module.pricing_statistics
 
 
@@ -1553,6 +1554,7 @@ async def test_list_provider_specialties_filters_by_procedure_and_geo():
             "q": "medicine",
             "year": "2023",
             "limit": "10",
+            "zip_radius_miles": "0",
         },
     )
 
@@ -1572,6 +1574,122 @@ async def test_list_provider_specialties_filters_by_procedure_and_geo():
     assert {"code_system": pricing_module.INTERNAL_PROCEDURE_CODE_SYSTEM, "code": "1607056713"} in payload["query"][
         "resolved_codes"
     ]
+
+
+@pytest.mark.asyncio
+async def test_resolve_procedure_taxonomy_em_code_needs_intent(monkeypatch):
+    async def fake_resolve_internal_codes(_session, _code, _args, default_system=None):
+        return [1607056713], {
+            "input_code": {"code_system": default_system, "code": "99214"},
+            "resolved_codes": [{"code_system": pricing_module.INTERNAL_PROCEDURE_CODE_SYSTEM, "code": "1607056713"}],
+            "internal_codes": [1607056713],
+            "matched_via": [],
+            "expanded": False,
+        }
+
+    async def fake_load_evidence(_session, *, year, internal_codes, limit):
+        assert year == 2023
+        assert internal_codes == [1607056713]
+        assert limit == 10
+        return [
+            {
+                "taxonomy_code": "207Q00000X",
+                "classification": "Family Medicine",
+                "specialization": None,
+                "display_name": "Family Medicine",
+                "distinct_npis": 80,
+                "total_services": 500.0,
+                "total_beneficiaries": 400.0,
+                "provider_types": ["Family Practice"],
+            }
+        ]
+
+    monkeypatch.setattr(pricing_module, "_resolve_internal_codes_for_request", fake_resolve_internal_codes)
+    monkeypatch.setattr(pricing_module, "_load_procedure_taxonomy_evidence", fake_load_evidence)
+    request = make_request([], args={"code": "99214", "code_system": "CPT", "year": "2023"})
+
+    response = await resolve_procedure_taxonomy(request)
+    payload = json.loads(response.body)
+
+    assert payload["resolution"]["status"] == "ambiguous"
+    assert payload["resolution"]["recommended_mode"] == "ambiguous"
+    assert payload["resolution"]["needs_intent"] is True
+    assert payload["resolution"]["provider_filter"] is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_procedure_taxonomy_acl_uses_soft_ortho_boost(monkeypatch):
+    async def fake_resolve_internal_codes(_session, _code, _args, default_system=None):
+        return [12329888], {
+            "input_code": {"code_system": default_system, "code": "29888"},
+            "resolved_codes": [{"code_system": pricing_module.INTERNAL_PROCEDURE_CODE_SYSTEM, "code": "12329888"}],
+            "internal_codes": [12329888],
+            "matched_via": [],
+            "expanded": False,
+        }
+
+    async def fake_load_evidence(_session, *, year, internal_codes, limit):
+        return []
+
+    monkeypatch.setattr(pricing_module, "_resolve_internal_codes_for_request", fake_resolve_internal_codes)
+    monkeypatch.setattr(pricing_module, "_load_procedure_taxonomy_evidence", fake_load_evidence)
+    request = make_request([], args={"code": "29888", "code_system": "CPT", "year": "2023"})
+
+    response = await resolve_procedure_taxonomy(request)
+    payload = json.loads(response.body)
+
+    assert payload["resolution"]["status"] == "resolved"
+    assert payload["resolution"]["recommended_mode"] == "soft_boost"
+    assert payload["resolution"]["safe_for_hard_filter"] is False
+    assert "207X00000X" in payload["resolution"]["taxonomy_codes"]
+    assert payload["resolution"]["provider_boost"]["primary_only"] is False
+    assert "procedure_is_known_to_skew_younger_than_medicare_ffs" in payload["evidence"]["bias_notes"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_procedure_taxonomy_requires_explicit_hard_filter_opt_in(monkeypatch):
+    async def fake_resolve_internal_codes(_session, _code, _args, default_system=None):
+        return [170551], {
+            "input_code": {"code_system": default_system, "code": "70551"},
+            "resolved_codes": [{"code_system": pricing_module.INTERNAL_PROCEDURE_CODE_SYSTEM, "code": "170551"}],
+            "internal_codes": [170551],
+            "matched_via": [],
+            "expanded": False,
+        }
+
+    async def fake_load_evidence(_session, *, year, internal_codes, limit):
+        return [
+            {
+                "taxonomy_code": "2085R0202X",
+                "classification": "Radiology",
+                "specialization": "Diagnostic Radiology",
+                "display_name": "Diagnostic Radiology Physician",
+                "distinct_npis": 120,
+                "total_services": 900.0,
+                "total_beneficiaries": 500.0,
+                "provider_types": ["Diagnostic Radiology"],
+            }
+        ]
+
+    monkeypatch.setattr(pricing_module, "_resolve_internal_codes_for_request", fake_resolve_internal_codes)
+    monkeypatch.setattr(pricing_module, "_load_procedure_taxonomy_evidence", fake_load_evidence)
+
+    request = make_request([], args={"code": "70551", "code_system": "CPT", "year": "2023"})
+    response = await resolve_procedure_taxonomy(request)
+    payload = json.loads(response.body)
+    assert payload["resolution"]["safe_for_hard_filter"] is True
+    assert payload["resolution"]["recommended_mode"] == "soft_boost"
+    assert payload["resolution"]["provider_filter"] is None
+
+    request = make_request(
+        [],
+        args={"code": "70551", "code_system": "CPT", "year": "2023", "allow_hard_filter": "true"},
+    )
+    response = await resolve_procedure_taxonomy(request)
+    payload = json.loads(response.body)
+    assert payload["resolution"]["recommended_mode"] == "hard_filter"
+    assert "2085R0202X" in payload["resolution"]["provider_filter"]["taxonomy_codes"]
+    assert payload["resolution"]["provider_filter"]["primary_only"] is False
 
 
 @pytest.mark.asyncio
@@ -1632,6 +1750,58 @@ async def test_list_providers_by_procedure_routes_plan_filter_to_ptg2(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_list_providers_by_procedure_routes_zip_as_default_radius_to_ptg2(monkeypatch):
+    seen_args = {}
+
+    async def fake_search(_session, args, pagination):
+        seen_args.update(args)
+        return {
+            "items": [],
+            "pagination": {
+                "total": 0,
+                "limit": pagination.limit,
+                "offset": pagination.offset,
+                "page": pagination.page,
+            },
+            "query": {"source": "ptg2", "zip_radius_miles": args["zip_radius_miles"]},
+        }
+
+    monkeypatch.setattr(pricing_module, "search_current_ptg2_index", fake_search)
+    request = make_request(
+        [
+            FakeResult(
+                rows=[
+                    {
+                        "zip5": "62401",
+                        "state": "IL",
+                        "city_lower": "effingham",
+                        "latitude": 39.1200,
+                        "longitude": -88.5434,
+                    }
+                ]
+            )
+        ],
+        args={
+            "plan_id": "010854205",
+            "market_type": "group",
+            "code": "29888",
+            "zip5": "62401",
+            "include_providers": "true",
+        },
+    )
+
+    response = await list_providers_by_procedure(request)
+    payload = json.loads(response.body)
+
+    assert payload["query"]["zip_radius_miles"] == 10.0
+    assert seen_args["zip5"] == "62401"
+    assert seen_args["zip_radius_miles"] == 10.0
+    assert seen_args["lat"] == 39.1200
+    assert seen_args["long"] == -88.5434
+    assert seen_args["radius_miles"] == 10.0
+
+
+@pytest.mark.asyncio
 async def test_list_providers_by_procedure_cost_index_requires_code():
     request = make_request(
         [],
@@ -1680,7 +1850,14 @@ async def test_list_providers_by_procedure_cost_index_with_code_and_zip5():
                 ]
             ),
         ],
-        args={"code": "123", "zip5": "20814", "order_by": "cost_index", "order": "asc", "year": "2023"},
+        args={
+            "code": "123",
+            "zip5": "20814",
+            "zip_radius_miles": "0",
+            "order_by": "cost_index",
+            "order": "asc",
+            "year": "2023",
+        },
     )
 
     response = await list_providers_by_procedure(request)
@@ -1819,7 +1996,14 @@ async def test_list_providers_by_procedure_cost_index_enriched_from_peer_stats()
                 ]
             ),
         ],
-        args={"code": "123", "zip5": "20814", "order_by": "cost_index", "order": "asc", "year": "2023"},
+        args={
+            "code": "123",
+            "zip5": "20814",
+            "zip_radius_miles": "0",
+            "order_by": "cost_index",
+            "order": "asc",
+            "year": "2023",
+        },
     )
 
     response = await list_providers_by_procedure(request)
@@ -1858,6 +2042,7 @@ async def test_list_providers_by_procedure_cost_index_with_legacy_aliases_opt_in
         args={
             "code": "123",
             "zip5": "20814",
+            "zip_radius_miles": "0",
             "order_by": "cost_index",
             "order": "asc",
             "year": "2023",

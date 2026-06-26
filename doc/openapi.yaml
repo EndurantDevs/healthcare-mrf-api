@@ -2647,8 +2647,8 @@ paths:
             type: number
             minimum: 0
             maximum: 50
-            default: 0
-          description: Radius around `zip5`; defaults to exact ZIP matching.
+            default: 10
+          description: Radius around `zip5`; defaults to 10 miles. Set `0` for same-ZIP-only matching.
         - name: provider_type
           in: query
           schema:
@@ -2699,6 +2699,98 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/PricingProviderSpecialtyListResponse'
+  /pricing/procedure-taxonomy/resolve:
+    get:
+      operationId: getPricingProcedureTaxonomyResolve
+      summary: Resolve provider-taxonomy guidance for a procedure code
+      description: |
+        Resolves a procedure billing code to provider-taxonomy guidance before
+        provider pricing/search. Office E/M codes such as `99213` and `99214`
+        remain ambiguous without clinical intent. Medicare FFS utilization is
+        treated as evidence, not proof of clinical competency; thin or biased
+        evidence returns `soft_boost` or `validate_only` instead of silently
+        applying a hard provider pre-filter.
+      parameters:
+        - name: code
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Procedure, revenue, or service code to resolve.
+        - name: code_system
+          in: query
+          schema:
+            type: string
+            enum: [HP_PROCEDURE_CODE, CPT, HCPCS, CDT]
+          description: Code system for `code`; 5-digit numeric codes default to CPT when omitted.
+        - name: year
+          in: query
+          schema:
+            type: integer
+        - name: clinical_intent
+          in: query
+          schema:
+            type: string
+          description: Plain-language clinical intent, such as `flu visit` or `ACL repair`.
+        - name: intent
+          in: query
+          schema:
+            type: string
+          description: Alias for `clinical_intent`.
+        - name: setting
+          in: query
+          schema:
+            type: string
+            default: all
+          description: Requested setting key; current claims-derived evidence is setting `all`.
+        - name: setting_key
+          in: query
+          schema:
+            type: string
+          description: Alias for `setting`.
+        - name: expand_codes
+          in: query
+          schema:
+            type: boolean
+          description: Include mapped equivalent procedure codes when resolving `code`.
+        - name: allow_hard_filter
+          in: query
+          schema:
+            type: boolean
+            default: false
+          description: Opt in to `hard_filter` only when the resolver says it is safe.
+        - name: include_evidence
+          in: query
+          schema:
+            type: boolean
+            default: true
+          description: Evidence summary is included in all responses.
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50
+            default: 10
+          description: Maximum evidence taxonomy rows to return.
+      responses:
+        '200':
+          description: Procedure taxonomy guidance.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  query:
+                    type: object
+                  resolution:
+                    type: object
+                  evidence:
+                    type: object
+                  code_context:
+                    type: object
   /pricing/provider-types/autocomplete:
     get:
       operationId: getPricingProviderTypesAutocomplete
@@ -2817,8 +2909,8 @@ paths:
             type: number
             minimum: 0
             maximum: 50
-            default: 0
-          description: Radius around `zip5`; defaults to exact ZIP matching.
+            default: 10
+          description: Radius around `zip5`; defaults to 10 miles. Set `0` for same-ZIP-only matching.
         - name: provider_type
           in: query
           schema:
@@ -3564,8 +3656,9 @@ paths:
           schema:
             type: number
             minimum: 0
+            default: 10
           description: |
-            Optional ZIP-based search radius (miles). Applies when `zip5` is provided.
+            Optional ZIP-based search radius (miles). Defaults to 10 when `zip5` is provided; set `0` for same-ZIP-only matching.
         - name: specialty
           in: query
           schema:

@@ -1313,6 +1313,41 @@ async def test_compact_serving_geo_search_allows_missing_specialty(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_compact_serving_zip_centroid_search_allows_same_zip_or_radius(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "legacy")
+    session = FakeSession([FakeResult(rows=[])])
+
+    payload = await ptg2_serving._search_compact_serving_table(
+        session,
+        "mrf.ptg2_serving_rate_compact_token",
+        _compact_tables(),
+        "snap-token",
+        {
+            "plan_id": "010854205",
+            "code": "70551",
+            "zip5": "60601",
+            "lat": 41.8820,
+            "long": -87.6278,
+            "radius_miles": 10.0,
+        },
+        FakePagination(),
+        ["snapshot_id = :snapshot_id", "plan_id = :plan_id"],
+        {"snapshot_id": "snap-token", "plan_id": "010854205", "limit": 25, "offset": 0},
+        ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
+    )
+
+    assert payload is None
+    sql = str(session.calls[0][0][0])
+    params = session.calls[0][0][1]
+    assert "(LEFT(COALESCE(addr_filter.postal_code, ''), 5) = :zip5 OR (" in sql
+    assert "addr_filter.lat::float8 BETWEEN :geo_min_lat AND :geo_max_lat" in sql
+    assert "addr_filter.long::float8 BETWEEN :geo_min_long AND :geo_max_long" in sql
+    assert "CAST(:geo_radius_miles AS double precision)" in sql
+    assert params["zip5"] == "60601"
+    assert params["geo_radius_miles"] == 10.0
+
+
+@pytest.mark.asyncio
 async def test_compact_serving_coordinate_search_filters_npi_addresses(monkeypatch):
     monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "legacy")
     session = FakeSession([FakeResult(rows=[])])
