@@ -285,6 +285,32 @@ async def test_manifest_enriched_provider_fallback_includes_taxonomy(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_manifest_enriched_provider_unified_fallback_uses_bounded_cte(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
+    session = FakeSession(
+        [
+            FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_LEGACY_ADDRESS_COLUMNS)]),
+            "mrf.npi",
+            FakeResult(rows=[]),
+        ]
+    )
+
+    rows = await ptg2_serving._ptg2_manifest_enriched_provider_rows_for_npis(
+        session,
+        npis=[1234567890],
+        limit=5,
+    )
+
+    assert rows == []
+    sql = str(session.calls[-1][0][0])
+    assert "source_npis AS MATERIALIZED" in sql
+    assert "fallback_addresses AS MATERIALIZED" in sql
+    assert "JOIN source_npis source_filter ON source_filter.npi = na.npi" in sql
+    assert "LEFT JOIN fallback_addresses na" in sql
+    assert "LEFT JOIN LATERAL (\n                SELECT na.first_line" not in sql
+
+
+@pytest.mark.asyncio
 async def test_ptg2_address_serving_table_prefers_unified_by_default(monkeypatch):
     monkeypatch.delenv("HLTHPRT_ADDRESS_SERVING_SOURCE", raising=False)
     session = FakeSession(
@@ -1362,6 +1388,10 @@ async def test_manifest_location_provider_matches_filters_coordinates_with_unifi
     assert "radians(CAST(:geo_lat AS double precision))" in sql
     assert ") <= CAST(:geo_radius_miles AS double precision)" in sql
     assert "COALESCE(addr.address_precision, '') <> 'city_zip'" in sql
+    assert "fallback_addresses AS MATERIALIZED" in sql
+    assert "JOIN location_npis loc ON loc.npi = na.npi" in sql
+    assert "LEFT JOIN fallback_addresses na" in sql
+    assert "LEFT JOIN LATERAL (\n                SELECT na.first_line" not in sql
     assert params["geo_lat"] == 34.14024131
     assert params["geo_long"] == -118.255125
     assert params["geo_radius_miles"] == 10.0
@@ -1373,6 +1403,7 @@ async def test_compact_serving_include_providers_expands_without_geo_filter(monk
     monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "legacy")
     session = FakeSession(
         [
+            "mrf.npi",
             FakeResult(
                 rows=[
                     {
@@ -1428,7 +1459,7 @@ async def test_compact_serving_include_providers_expands_without_geo_filter(monk
     assert item["state"] == "IL"
     assert item["address"]["address_key"] == "00000000-0000-0000-0000-000000000002"
     assert item["tic_prices"][0]["negotiated_rate"] == 60
-    sql = str(session.calls[0][0][0])
+    sql = str(session.calls[-1][0][0])
     assert "LEFT JOIN LATERAL (" in sql
     assert "FROM mrf.npi_address addr" in sql
     assert "addr.npi = pgm.npi" in sql
@@ -1471,6 +1502,7 @@ async def test_compact_serving_provider_expansion_uses_unified_address_table_whe
     session = FakeSession(
         [
             FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_LEGACY_ADDRESS_COLUMNS)]),
+            "mrf.npi",
             FakeResult(rows=[]),
         ]
     )
@@ -1488,7 +1520,7 @@ async def test_compact_serving_provider_expansion_uses_unified_address_table_whe
     )
 
     assert payload is None
-    sql = str(session.calls[1][0][0])
+    sql = str(session.calls[-1][0][0])
     assert "FROM mrf.entity_address_unified addr" in sql
     assert "FROM mrf.npi_address addr" not in sql
     assert "'entity_address_unified' AS location_source" in sql
@@ -1496,6 +1528,42 @@ async def test_compact_serving_provider_expansion_uses_unified_address_table_whe
     assert "(to_jsonb(addr.*) - 'premise_key') AS address_payload" in sql
     assert "addr.npi = pgm.npi" in sql
     assert "addr.npi = sp.npi" not in sql
+    # Provider name is resolved from the canonical NPI table (mrf.npi), never
+    # left as the NULL/"TiC provider" placeholder, and street-bearing address
+    # rows are preferred so city/zip-only unified rows don't hide the street.
+    assert "LEFT JOIN mrf.npi n ON n.npi = pgm.npi" in sql
+    assert "NULL::varchar AS provider_name" not in sql
+    assert "n.provider_organization_name" in sql
+    assert "NULLIF(BTRIM(addr.first_line), '') IS NULL" in sql
+
+
+@pytest.mark.asyncio
+async def test_compact_serving_provider_expansion_uses_placeholder_without_npi_table(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
+    session = FakeSession(
+        [
+            FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_LEGACY_ADDRESS_COLUMNS)]),
+            FakeResult(scalar=None),
+            FakeResult(rows=[]),
+        ]
+    )
+
+    payload = await ptg2_serving._search_compact_serving_table(
+        session,
+        "mrf.ptg2_serving_rate_compact_token",
+        _compact_tables(),
+        "snap-token",
+        {"plan_id": "010854205", "code": "450", "include_providers": "true"},
+        FakePagination(),
+        ["snapshot_id = :snapshot_id", "plan_id = :plan_id"],
+        {"snapshot_id": "snap-token", "plan_id": "010854205", "limit": 25, "offset": 0},
+        ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
+    )
+
+    assert payload is None
+    sql = str(session.calls[-1][0][0])
+    assert "LEFT JOIN mrf.npi n ON n.npi = pgm.npi" not in sql
+    assert "'TiC provider' AS provider_name" in sql
 
 
 @pytest.mark.asyncio
@@ -1504,6 +1572,7 @@ async def test_compact_serving_provider_expansion_falls_back_when_unified_incomp
     session = FakeSession(
         [
             FakeResult(rows=[("npi",), ("type",)]),
+            "mrf.npi",
             FakeResult(rows=[]),
         ]
     )
@@ -1521,7 +1590,7 @@ async def test_compact_serving_provider_expansion_falls_back_when_unified_incomp
     )
 
     assert payload is None
-    sql = str(session.calls[1][0][0])
+    sql = str(session.calls[-1][0][0])
     assert "FROM mrf.npi_address addr" in sql
     assert "FROM mrf.entity_address_unified addr" not in sql
 
@@ -1529,7 +1598,7 @@ async def test_compact_serving_provider_expansion_falls_back_when_unified_incomp
 @pytest.mark.asyncio
 async def test_compact_serving_source_scoped_provider_expansion_uses_direct_component_table(monkeypatch):
     monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "legacy")
-    session = FakeSession([FakeResult(rows=[])])
+    session = FakeSession(["mrf.npi", FakeResult(rows=[])])
     tables = _compact_tables()
 
     payload = await ptg2_serving._search_compact_serving_table(
@@ -1545,7 +1614,7 @@ async def test_compact_serving_source_scoped_provider_expansion_uses_direct_comp
     )
 
     assert payload is None
-    sql = str(session.calls[0][0][0])
+    sql = str(session.calls[-1][0][0])
     assert "JOIN mrf.ptg2_provider_set_component_token psc" in sql
     assert "ON psc.provider_set_hash = r.provider_set_hash" in sql
     assert "JOIN mrf.ptg2_provider_group_member_token pgm" in sql

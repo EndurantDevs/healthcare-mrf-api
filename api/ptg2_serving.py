@@ -182,6 +182,15 @@ def _ptg2_address_location_hash_sql(alias: str, address_table: str | None) -> st
     return f"CONCAT('{source}:', {alias}.npi, ':', {alias}.type, ':', {alias}.checksum)"
 
 
+def _ptg2_provider_name_sql(alias: str = "n") -> str:
+    return (
+        "COALESCE("
+        f"NULLIF(BTRIM({alias}.provider_organization_name), ''), "
+        f"NULLIF(BTRIM(CONCAT_WS(' ', {alias}.provider_first_name, {alias}.provider_middle_name, {alias}.provider_last_name)), ''), "
+        "'TiC provider')"
+    )
+
+
 async def _ptg2_table_has_columns(session, table_name: str, required_columns: set[str]) -> bool:
     safe_table_name = _safe_table_name(table_name)
     if not safe_table_name:
@@ -823,7 +832,7 @@ async def _ptg2_manifest_enriched_provider_rows_for_npis(
     npis = tuple(sorted({int(npi) for npi in npis if int(npi) > 0}))[:limit]
     if not npis:
         return []
-    npi_data_table = f"{PTG2_SCHEMA}.npi_data"
+    npi_data_table = f"{PTG2_SCHEMA}.npi"
     npi_address_table = await _ptg2_address_serving_table(
         session,
         _PTG2_LEGACY_ADDRESS_COLUMNS,
@@ -842,36 +851,69 @@ async def _ptg2_manifest_enriched_provider_rows_for_npis(
         ]
     address_location_source = _ptg2_address_location_source(npi_address_table)
     address_location_hash_sql = _ptg2_address_location_hash_sql("addr", npi_address_table)
+    using_unified_enrich = _is_unified_address_table(npi_address_table)
+    # Same street-fill as the location search: when the unified row has no
+    # first_line (or no row at all), fall back to the NPPES npi_address row.
+    if using_unified_enrich:
+        enrich_address_fallback_cte = f"""
+            , fallback_addresses AS MATERIALIZED (
+                SELECT DISTINCT ON (na.npi)
+                       na.npi, na.first_line, na.second_line, na.city_name, na.state_name,
+                       na.postal_code, na.country_code, na.lat, na.long
+                  FROM {PTG2_SCHEMA}.npi_address na
+                  JOIN source_npis source_filter ON source_filter.npi = na.npi
+                 WHERE NULLIF(BTRIM(na.first_line), '') IS NOT NULL
+                 ORDER BY na.npi,
+                          CASE na.type WHEN 'primary' THEN 0 WHEN 'practice' THEN 1
+                                       WHEN 'secondary' THEN 2 ELSE 3 END,
+                          na.checksum
+            )"""
+        enrich_address_fallback_join = """
+            LEFT JOIN fallback_addresses na
+              ON na.npi = source_npis.npi
+             AND NULLIF(BTRIM(addr.first_line), '') IS NULL"""
+
+        def _eff_enrich(column: str) -> str:
+            return (
+                "CASE WHEN NULLIF(BTRIM(addr.first_line), '') IS NULL "
+                f"AND na.first_line IS NOT NULL THEN na.{column} ELSE addr.{column} END"
+            )
+    else:
+        enrich_address_fallback_cte = ""
+        enrich_address_fallback_join = ""
+
+        def _eff_enrich(column: str) -> str:
+            return f"addr.{column}"
     enrich_stmt = (
         text(
             f"""
+            WITH source_npis AS MATERIALIZED (
+                SELECT UNNEST(CAST(:npis AS bigint[])) AS npi
+            )
+            {enrich_address_fallback_cte}
             SELECT
                 source_npis.npi,
                 {address_location_hash_sql} AS location_hash,
-                addr.state_name AS state,
-                addr.city_name AS city,
-                LEFT(COALESCE(addr.postal_code, ''), 5) AS zip5,
+                {_eff_enrich('state_name')} AS state,
+                {_eff_enrich('city_name')} AS city,
+                LEFT(COALESCE({_eff_enrich('postal_code')}, ''), 5) AS zip5,
                 '{address_location_source}' AS location_source,
                 '{address_location_source}' AS location_confidence_code,
                 json_build_object(
-                    'first_line', addr.first_line,
-                    'second_line', addr.second_line,
-                    'city', addr.city_name,
-                    'state', addr.state_name,
-                    'postal_code', addr.postal_code,
-                    'country_code', addr.country_code,
+                    'first_line', {_eff_enrich('first_line')},
+                    'second_line', {_eff_enrich('second_line')},
+                    'city', {_eff_enrich('city_name')},
+                    'state', {_eff_enrich('state_name')},
+                    'postal_code', {_eff_enrich('postal_code')},
+                    'country_code', {_eff_enrich('country_code')},
                     'address_key', addr.address_key::text,
-                    'lat', addr.lat,
-                    'long', addr.long
+                    'lat', {_eff_enrich('lat')},
+                    'long', {_eff_enrich('long')}
                 )::text AS address_payload,
                 COALESCE(tax.taxonomy_codes, ARRAY[]::varchar[]) AS taxonomy_codes,
                 COALESCE(tax.specialties, ARRAY[]::varchar[]) AS specialties,
-                COALESCE(
-                    NULLIF(BTRIM(n.provider_organization_name), ''),
-                    NULLIF(BTRIM(CONCAT_WS(' ', n.provider_first_name, n.provider_middle_name, n.provider_last_name)), ''),
-                    'TiC provider'
-                ) AS provider_name
-            FROM (SELECT UNNEST(CAST(:npis AS bigint[])) AS npi) source_npis
+                {_ptg2_provider_name_sql("n")} AS provider_name
+            FROM source_npis
             LEFT JOIN {npi_data_table} n ON n.npi = source_npis.npi
             LEFT JOIN LATERAL (
                 SELECT addr.*
@@ -880,6 +922,7 @@ async def _ptg2_manifest_enriched_provider_rows_for_npis(
                  ORDER BY (addr.type = 'primary') DESC, addr.type, addr.checksum
                  LIMIT 1
             ) addr ON TRUE
+            {enrich_address_fallback_join}
             LEFT JOIN LATERAL (
                 SELECT
                     array_agg(nt.healthcare_provider_taxonomy_code ORDER BY (UPPER(COALESCE(nt.healthcare_provider_primary_taxonomy_switch, '')) = 'Y') DESC, nt.checksum) AS taxonomy_codes,
@@ -1009,7 +1052,7 @@ async def _ptg2_manifest_location_provider_matches(
         _PTG2_UNIFIED_ADDRESS_COLUMNS if geo_lat is not None else _PTG2_LEGACY_ADDRESS_COLUMNS,
         require_legacy_available=True,
     )
-    npi_data_table = f"{PTG2_SCHEMA}.npi_data"
+    npi_data_table = f"{PTG2_SCHEMA}.npi"
     if not npi_address_table:
         return None
     using_unified_address_table = _is_unified_address_table(npi_address_table)
@@ -1059,16 +1102,46 @@ async def _ptg2_manifest_location_provider_matches(
     has_npi_data = await _serving_table_available(session, npi_data_table)
     provider_join = f"LEFT JOIN {npi_data_table} n ON n.npi = addr.npi" if has_npi_data else ""
     provider_name_sql = (
-        """
-        COALESCE(
-            NULLIF(BTRIM(n.provider_organization_name), ''),
-            NULLIF(BTRIM(CONCAT_WS(' ', n.provider_first_name, n.provider_middle_name, n.provider_last_name)), ''),
-            'TiC provider'
-        )
-        """
+        _ptg2_provider_name_sql("n")
         if has_npi_data
         else "'TiC provider'"
     )
+
+    # entity_address_unified can resolve a NPI to a city/zip-only row with no
+    # street (first_line). When that happens, fall back to the NPPES npi_address
+    # practice/primary row WHOLESALE (every field), so the displayed address stays
+    # internally consistent instead of mixing one source's street with another's
+    # city. Only applies when the unified table is the primary source.
+    if using_unified_address_table:
+        address_fallback_cte = f"""
+            , fallback_addresses AS MATERIALIZED (
+                SELECT DISTINCT ON (na.npi)
+                       na.npi, na.first_line, na.second_line, na.city_name, na.state_name,
+                       na.postal_code, na.country_code, na.lat, na.long
+                  FROM {PTG2_SCHEMA}.npi_address na
+                  JOIN location_npis loc ON loc.npi = na.npi
+                 WHERE NULLIF(BTRIM(na.first_line), '') IS NOT NULL
+                 ORDER BY na.npi,
+                          CASE na.type WHEN 'primary' THEN 0 WHEN 'practice' THEN 1
+                                       WHEN 'secondary' THEN 2 ELSE 3 END,
+                          na.checksum
+            )"""
+        address_fallback_join = """
+            LEFT JOIN fallback_addresses na
+              ON na.npi = addr.npi
+             AND NULLIF(BTRIM(addr.first_line), '') IS NULL"""
+
+        def _eff(column: str) -> str:
+            return (
+                "CASE WHEN NULLIF(BTRIM(addr.first_line), '') IS NULL "
+                f"AND na.first_line IS NOT NULL THEN na.{column} ELSE addr.{column} END"
+            )
+    else:
+        address_fallback_cte = ""
+        address_fallback_join = ""
+
+        def _eff(column: str) -> str:
+            return f"addr.{column}"
 
     async def _query_location_provider_rows(address_types: tuple[str, ...]) -> list[dict[str, Any]]:
         address_filters = [*filters]
@@ -1103,25 +1176,26 @@ async def _ptg2_manifest_location_provider_matches(
                     addr.checksum
                 LIMIT :limit
             )
+            {address_fallback_cte}
             SELECT DISTINCT ON (pgm.provider_group_global_id_128, addr.npi)
                 pgm.provider_group_global_id_128,
                 addr.npi,
                 {address_location_hash_sql} AS location_hash,
-                addr.state_name AS state,
-                addr.city_name AS city,
-                LEFT(COALESCE(addr.postal_code, ''), 5) AS zip5,
+                {_eff('state_name')} AS state,
+                {_eff('city_name')} AS city,
+                LEFT(COALESCE({_eff('postal_code')}, ''), 5) AS zip5,
                 '{address_location_source}' AS location_source,
                 '{address_location_source}' AS location_confidence_code,
                 json_build_object(
-                    'first_line', addr.first_line,
-                    'second_line', addr.second_line,
-                    'city', addr.city_name,
-                    'state', addr.state_name,
-                    'postal_code', addr.postal_code,
-                    'country_code', addr.country_code,
+                    'first_line', {_eff('first_line')},
+                    'second_line', {_eff('second_line')},
+                    'city', {_eff('city_name')},
+                    'state', {_eff('state_name')},
+                    'postal_code', {_eff('postal_code')},
+                    'country_code', {_eff('country_code')},
                     'address_key', addr.address_key::text,
-                    'lat', addr.lat,
-                    'long', addr.long
+                    'lat', {_eff('lat')},
+                    'long', {_eff('long')}
                 )::text AS address_payload,
                 ARRAY[]::varchar[] AS taxonomy_codes,
                 ARRAY[]::varchar[] AS specialties,
@@ -1129,6 +1203,7 @@ async def _ptg2_manifest_location_provider_matches(
             FROM location_npis addr
             JOIN {provider_group_member_table} pgm ON pgm.npi = addr.npi
             {provider_join}
+            {address_fallback_join}
             ORDER BY pgm.provider_group_global_id_128,
                 addr.npi,
                 CASE addr.type
@@ -1868,6 +1943,7 @@ def _compact_provider_expansion_sql(
     params: dict[str, Any],
     *,
     address_table: str | None = None,
+    provider_name_table: str | None = None,
 ) -> str:
     if not _request_bool(args.get("include_providers")):
         return ""
@@ -1929,9 +2005,11 @@ def _compact_provider_expansion_sql(
             LIMIT 1
         ) loc ON TRUE
         """
+    provider_name_join = f"LEFT JOIN {provider_name_table} n ON n.npi = pgm.npi" if provider_name_table else ""
     return f"""
         {component_join}
         {member_join}
+        {provider_name_join}
         LEFT JOIN LATERAL (
             SELECT
                 addr.*,
@@ -1940,7 +2018,8 @@ def _compact_provider_expansion_sql(
                 addr.city_name AS city
             FROM {resolved_address_table} addr
             WHERE addr.npi = pgm.npi
-            ORDER BY (addr.type = 'primary') DESC, addr.type, addr.checksum
+            ORDER BY (NULLIF(BTRIM(addr.first_line), '') IS NULL),
+                     (addr.type = 'primary') DESC, addr.type, addr.checksum
             LIMIT 1
         ) addr ON TRUE
         LEFT JOIN LATERAL (
@@ -2031,6 +2110,11 @@ async def _search_compact_serving_table(
             session,
             _PTG2_UNIFIED_ADDRESS_COLUMNS if has_geo_filter else _PTG2_LEGACY_ADDRESS_COLUMNS,
         )
+    provider_name_table = None
+    if expand_providers and not uses_location_table:
+        candidate_provider_name_table = f"{PTG2_SCHEMA}.npi"
+        if await _serving_table_available(session, candidate_provider_name_table):
+            provider_name_table = candidate_provider_name_table
     provider_filter_sql, has_provider_filter = _compact_provider_filter_sql(
         serving_tables,
         args,
@@ -2043,6 +2127,7 @@ async def _search_compact_serving_table(
         args,
         params,
         address_table=address_table_sql,
+        provider_name_table=provider_name_table,
     )
     provider_select_sql = ""
     if expand_providers and serving_tables.provider_group_location_table and provider_expansion_sql:
@@ -2053,6 +2138,11 @@ async def _search_compact_serving_table(
         )
     elif expand_providers:
         address_location_source = _ptg2_address_location_source(address_table_sql)
+        provider_name_sql = (
+            f"{_ptg2_provider_name_sql('n')} AS provider_name,"
+            if provider_name_table
+            else "'TiC provider' AS provider_name,"
+        )
         provider_select_sql = (
             "pgm.npi, addr.location_hash, addr.state, addr.city, "
             "LEFT(COALESCE(addr.postal_code, ''), 5) AS zip5, "
@@ -2061,7 +2151,7 @@ async def _search_compact_serving_table(
             "(to_jsonb(addr.*) - 'premise_key') AS address_payload, "
             "COALESCE(tax.taxonomy_codes, ARRAY[]::varchar[]) AS taxonomy_codes, "
             "COALESCE(tax.specialties, ARRAY[]::varchar[]) AS specialties, "
-            "NULL::varchar AS provider_name,"
+            f"{provider_name_sql}"
         )
     price_exists_sql = ""
     if price_filter_clauses:
