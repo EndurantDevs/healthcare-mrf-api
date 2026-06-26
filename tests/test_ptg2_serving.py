@@ -960,6 +960,32 @@ async def test_current_ptg2_snapshot_routes_by_plan_source_pointer():
 
 
 @pytest.mark.asyncio
+async def test_current_ptg2_snapshot_prefers_loaded_serving_table():
+    # Regression: a plan with multiple networks must resolve to a snapshot whose
+    # serving table is actually materialized (to_regclass), not merely manifest-claimed,
+    # so an unloaded newer network does not yield snapshot_not_loaded / 0 results.
+    session = FakeSession(["snap-loaded"])
+    snapshot_id = await ptg2_serving.resolve_current_ptg2_snapshot_id(
+        session,
+        {"plan_id": "010854205", "plan_market_type": "group"},
+    )
+    assert snapshot_id == "snap-loaded"
+    sql = str(session.calls[0][0][0])
+    assert "to_regclass(s.manifest->'serving_index'->>'table') IS NOT NULL) DESC" in sql
+    # recency stays the tiebreaker among loaded snapshots
+    assert "cps.import_month DESC NULLS LAST" in sql
+
+
+def test_musculoskeletal_surgery_cpt_infers_orthopedic_taxonomy():
+    for code in ("29888", "27447", "20000", "29999"):
+        rule = ptg2_serving._inferred_provider_taxonomy_rule({"code": code, "code_system": "cpt"})
+        assert rule is not None, code
+        assert "207X00000X" in rule.taxonomy_codes, code
+    # office-visit / non-musculoskeletal codes must NOT infer orthopedic surgery
+    assert ptg2_serving._inferred_provider_taxonomy_rule({"code": "99213", "code_system": "cpt"}) is None
+
+
+@pytest.mark.asyncio
 async def test_current_ptg2_snapshot_rolls_back_missing_source_pointer_before_fallback():
     session = FakeSession([RuntimeError("missing source pointer"), "snap-global"])
 

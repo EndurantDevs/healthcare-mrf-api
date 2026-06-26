@@ -37,6 +37,25 @@ INFERRED_PROVIDER_TAXONOMY_RULES = (
         display_terms=("radiation oncology",),
     ),
     InferredProviderTaxonomyRule(
+        # CPT musculoskeletal-system surgery (20000-29999), e.g. arthroscopic ACL
+        # reconstruction 29888 -> orthopaedic surgery (NUCC 207X family). Scopes a
+        # procedure search to orthopedic surgeons and narrows the in-network provider
+        # expansion so plan+location lookups stay fast instead of scanning the whole
+        # (national) network.
+        ranges=((20000, 29999),),
+        taxonomy_codes=(
+            "207X00000X",  # Orthopaedic Surgery
+            "207XP3100X",  # Pediatric Orthopaedic Surgery
+            "207XS0106X",  # Hand Surgery (Orthopaedic)
+            "207XS0114X",  # Adult Reconstructive Orthopaedic Surgery
+            "207XS0117X",  # Orthopaedic Surgery of the Spine
+            "207XX0004X",  # Foot and Ankle Orthopaedic Surgery
+            "207XX0005X",  # Sports Medicine (Orthopaedic Surgery)
+            "207XX0801X",  # Orthopaedic Trauma
+        ),
+        display_terms=("orthopaedic surgery", "orthopedic surgery"),
+    ),
+    InferredProviderTaxonomyRule(
         ranges=((70000, 77260), (77800, 79999)),
         taxonomy_codes=(
             "2084D0003X",

@@ -88,7 +88,13 @@ async def current_source_snapshot_id_for_plan(session, args: dict[str, object]) 
                    {source_sql}
                    AND s.status = 'published'
                    AND s.manifest->'serving_index'->>'table' IS NOT NULL
-                 ORDER BY cps.import_month DESC NULLS LAST, cps.updated_at DESC NULLS LAST
+                 -- Prefer a snapshot whose serving table is actually materialized
+                 -- (to_regclass), not merely claimed by the manifest, so a plan with
+                 -- multiple networks resolves to the loaded one instead of an
+                 -- unloaded newer network (which yields snapshot_not_loaded / 0
+                 -- results). Falls back to recency when none/all are loaded.
+                 ORDER BY (to_regclass(s.manifest->'serving_index'->>'table') IS NOT NULL) DESC,
+                          cps.import_month DESC NULLS LAST, cps.updated_at DESC NULLS LAST
                  LIMIT 1
                 """
             ),
