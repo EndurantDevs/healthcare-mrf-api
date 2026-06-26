@@ -9,6 +9,9 @@ import json
 import logging
 import os
 import re
+import tempfile
+import time
+from pathlib import Path
 from typing import Any
 
 from arq import create_pool
@@ -27,11 +30,18 @@ from process.entity_address_unified import (
     _table_exists,
     _validate_schema_name,
 )
-from process.ext.address_canon import resolve_into_archive
+from process.ext.address_canon import (
+    ADDRESS_CANON_RUST_MATERIALIZE_ENV,
+    KEYED_COPY_COLUMNS,
+    _run_rust_address_canonicalizer,
+    _rust_canon_version_is_current,
+    resolve_into_archive,
+)
 from process.ext.utils import ensure_database, make_class, my_init_db, print_time_info
 from process.live_progress import enqueue_live_progress
 from process.openaddresses import refresh_archive_geocodes_from_openaddresses_sharded
 from process.ptg_parts.db_tables import _quote_ident
+from process.ptg_parts.rust_scanner import _ptg2_rust_scanner_binary
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
 
@@ -58,6 +68,16 @@ DEFAULT_PARTIAL_PATCH_PUBLISH = True
 PTG_ADDRESS_REFRESH_MODE_FULL = "full"
 PTG_ADDRESS_REFRESH_MODE_PARTIAL = "partial"
 PTG_ADDRESS_REFRESH_MODES = {PTG_ADDRESS_REFRESH_MODE_FULL, PTG_ADDRESS_REFRESH_MODE_PARTIAL}
+PTG_ADDRESS_MEMBER_KEY_MODE_AUTO = "auto"
+PTG_ADDRESS_MEMBER_KEY_MODE_RUST = "rust"
+PTG_ADDRESS_MEMBER_KEY_MODE_SQL = "sql"
+PTG_ADDRESS_MEMBER_KEY_MODE_INLINE = "inline"
+PTG_ADDRESS_MEMBER_KEY_MODES = {
+    PTG_ADDRESS_MEMBER_KEY_MODE_AUTO,
+    PTG_ADDRESS_MEMBER_KEY_MODE_RUST,
+    PTG_ADDRESS_MEMBER_KEY_MODE_SQL,
+    PTG_ADDRESS_MEMBER_KEY_MODE_INLINE,
+}
 SNAPSHOT_TABLE_NAME_RE = re.compile(r"[a-z0-9_]{1,63}\Z")
 POSTGRES_SETTING_RE = re.compile(r"[A-Za-z0-9_.:-]{1,64}\Z")
 
@@ -84,6 +104,64 @@ def _row_get(row: Any, key: str) -> Any:
     if mapping is not None:
         return mapping.get(key)
     return getattr(row, key, None)
+
+
+def _record_phase_timing(
+    context: dict[str, Any],
+    phase: str,
+    elapsed_seconds: float,
+    rowcount: int | None = None,
+) -> None:
+    timings = context.setdefault("phase_timings", {})
+    entry = timings.setdefault(
+        phase,
+        {
+            "count": 0,
+            "seconds": 0.0,
+            "max_seconds": 0.0,
+            "rows": 0,
+        },
+    )
+    entry["count"] = int(entry.get("count") or 0) + 1
+    entry["seconds"] = round(float(entry.get("seconds") or 0.0) + elapsed_seconds, 3)
+    entry["max_seconds"] = round(max(float(entry.get("max_seconds") or 0.0), elapsed_seconds), 3)
+    if rowcount is not None and rowcount >= 0:
+        entry["rows"] = int(entry.get("rows") or 0) + int(rowcount)
+
+
+async def _timed_status(timings: dict[str, Any], phase: str, statement: str) -> int | None:
+    started = time.monotonic()
+    rowcount = await db.status(statement)
+    _record_phase_timing(timings, phase, time.monotonic() - started, rowcount)
+    return rowcount
+
+
+async def _timed_scalar(timings: dict[str, Any], phase: str, statement: str) -> Any:
+    started = time.monotonic()
+    value = await db.scalar(statement)
+    _record_phase_timing(timings, phase, time.monotonic() - started, None)
+    return value
+
+
+def _merge_phase_timings(target: dict[str, Any], source: dict[str, Any]) -> None:
+    for phase, raw_entry in (source or {}).items():
+        if not isinstance(raw_entry, dict):
+            continue
+        entry = target.setdefault("phase_timings", {}).setdefault(
+            phase,
+            {
+                "count": 0,
+                "seconds": 0.0,
+                "max_seconds": 0.0,
+                "rows": 0,
+            },
+        )
+        entry["count"] = int(entry.get("count") or 0) + int(raw_entry.get("count") or 0)
+        seconds = float(raw_entry.get("seconds") or 0.0)
+        max_seconds = float(raw_entry.get("max_seconds") or 0.0)
+        entry["seconds"] = round(float(entry.get("seconds") or 0.0) + seconds, 3)
+        entry["max_seconds"] = round(max(float(entry.get("max_seconds") or 0.0), max_seconds), 3)
+        entry["rows"] = int(entry.get("rows") or 0) + int(raw_entry.get("rows") or 0)
 
 
 def _clean_optional(value: Any) -> str | None:
@@ -125,6 +203,19 @@ def _ptg_address_refresh_mode(task: dict[str, Any]) -> str:
         f"Unsupported PTG address refresh_mode {raw!r}; "
         f"expected one of {sorted(PTG_ADDRESS_REFRESH_MODES)}"
     )
+
+
+def _ptg_member_key_mode() -> str:
+    raw = str(os.getenv("HLTHPRT_PTG_ADDRESS_MEMBER_KEY_MODE") or PTG_ADDRESS_MEMBER_KEY_MODE_AUTO).strip().lower()
+    value = raw.replace("_", "-")
+    if value in {"legacy", "old", "inline-sql"}:
+        value = PTG_ADDRESS_MEMBER_KEY_MODE_INLINE
+    if value not in PTG_ADDRESS_MEMBER_KEY_MODES:
+        raise ValueError(
+            f"Unsupported HLTHPRT_PTG_ADDRESS_MEMBER_KEY_MODE={raw!r}; "
+            f"expected one of {sorted(PTG_ADDRESS_MEMBER_KEY_MODES)}"
+        )
+    return value
 
 
 def _ptg_address_sql_settings(*, include_statement_timeout: bool = True) -> list[tuple[str, str]]:
@@ -1014,6 +1105,22 @@ def _ptg_member_coverage_table_name(stage_table: str) -> str:
     return _archived_identifier(f"{stage_table}_member_coverage", "")
 
 
+def _ptg_member_source_plan_table_name(stage_table: str) -> str:
+    return _archived_identifier(f"{stage_table}_member_source_plan", "")
+
+
+def _ptg_member_address_table_name(stage_table: str) -> str:
+    return _archived_identifier(f"{stage_table}_member_address", "")
+
+
+def _ptg_member_address_raw_table_name(stage_table: str) -> str:
+    return _archived_identifier(f"{stage_table}_member_address_raw", "")
+
+
+def _ptg_member_address_keyed_table_name(stage_table: str) -> str:
+    return _archived_identifier(f"{stage_table}_member_address_keyed", "")
+
+
 def _ptg_member_impacted_npis_table_name(stage_table: str) -> str:
     return _archived_identifier(f"{stage_table}_member_impacted_npis", "")
 
@@ -1090,6 +1197,478 @@ def _ptg_member_coverage_insert_sql(
     """
 
 
+def _ptg_member_source_plan_sql(
+    db_schema: str,
+    coverage_table: str,
+    *,
+    source_plan_table: str,
+) -> str:
+    return f"""
+    CREATE UNLOGGED TABLE {db_schema}.{source_plan_table} AS
+    SELECT
+        c.npi::bigint AS npi,
+        MIN(c.npi_shard)::int AS npi_shard,
+        ARRAY_REMOVE(
+            ARRAY_AGG(DISTINCT NULLIF(c.source_key, '') ORDER BY NULLIF(c.source_key, '')),
+            NULL
+        )::varchar[] AS ptg_source_array,
+        ARRAY_REMOVE(
+            ARRAY_AGG(DISTINCT NULLIF(ps.plan_id::text, '') ORDER BY NULLIF(ps.plan_id::text, '')),
+            NULL
+        )::varchar[] AS ptg_plan_array
+      FROM {db_schema}.{coverage_table} c
+      LEFT JOIN {_quote_ident(db_schema)}.ptg2_current_plan_source ps
+        ON ps.source_key = c.source_key
+       AND ps.snapshot_id = c.snapshot_id
+     WHERE c.npi IS NOT NULL
+     GROUP BY c.npi;
+    """
+
+
+def _ptg_member_address_select_sql(
+    db_schema: str,
+    source_plan_table: str,
+    *,
+    address_canon_available: bool,
+    archive_available: bool,
+    npi_shard: int | None = None,
+    empty: bool = False,
+) -> str:
+    country_expr = "country_code"
+    address_key_expr = (
+        f"COALESCE(source_address_key, {db_schema}.addr_key_v1(first_line, second_line, city, state, postal_code, {country_expr}))"
+        if address_canon_available
+        else "source_address_key"
+    )
+    archive_join = (
+        f"LEFT JOIN {db_schema}.address_archive_v2 a "
+        "ON a.address_key = k.address_key AND a.merged_into IS NULL"
+        if archive_available
+        else ""
+    )
+    lat_expr = "COALESCE(a.lat, k.lat)" if archive_available else "k.lat"
+    long_expr = 'COALESCE(a."long", k.long)' if archive_available else "k.long"
+    archive_fields = (
+        "a.premise_key, "
+        "'v' || COALESCE(a.identity_version, 2)::text AS archive_identity_version, "
+        "COALESCE(a.precision, CASE WHEN k.address_key IS NULL THEN 'unknown' ELSE 'street' END) AS address_precision, "
+        "COALESCE(a.zip5, k.source_zip5) AS zip5, "
+        "COALESCE(NULLIF(upper(left(a.state_code, 2)), ''), k.source_state_code) AS state_code, "
+        "COALESCE(a.city_norm, k.source_city_norm) AS city_norm, "
+        "NULL::varchar AS county_fips"
+        if archive_available
+        else (
+            "NULL::uuid AS premise_key, "
+            f"'{ARCHIVE_IDENTITY_VERSION}'::varchar AS archive_identity_version, "
+            "CASE WHEN k.address_key IS NULL THEN 'unknown' ELSE 'street' END::varchar AS address_precision, "
+            "k.source_zip5 AS zip5, "
+            "k.source_state_code AS state_code, "
+            "k.source_city_norm AS city_norm, "
+            "NULL::varchar AS county_fips"
+        )
+    )
+    source_plan_filters = []
+    if npi_shard is not None:
+        source_plan_filters.append(f"sp.npi_shard = {int(npi_shard)}")
+    if empty:
+        source_plan_filters.append("FALSE")
+    source_plan_where = f"         WHERE {' AND '.join(source_plan_filters)}" if source_plan_filters else ""
+    return f"""
+    WITH shaped AS (
+        SELECT
+            (
+                'provider_group_member_npi_address:' || a.npi::text || ':' ||
+                COALESCE(NULLIF(a.checksum::text, ''), md5(concat_ws('|',
+                    COALESCE(a.first_line::text, ''),
+                    COALESCE(a.second_line::text, ''),
+                    COALESCE(a.city_name::text, ''),
+                    COALESCE(a.state_name::text, ''),
+                    COALESCE(a.postal_code::text, ''),
+                    COALESCE(a.country_code::text, '')
+                )))
+            )::varchar AS location_hash,
+            a.npi::bigint AS npi,
+            sp.npi_shard::int AS npi_shard,
+            'npi_address'::varchar AS location_source,
+            'provider_group_member_npi_address'::varchar AS confidence_code,
+            NULLIF(BTRIM(a.state_name), '')::varchar AS state,
+            NULLIF(BTRIM(a.city_name), '')::varchar AS city,
+            NULLIF(
+                LEFT(REGEXP_REPLACE(COALESCE(a.postal_code, ''), '[^0-9]', '', 'g'), 5),
+                ''
+            )::varchar AS zip5,
+            a.lat::numeric AS lat,
+            a."long"::numeric AS long,
+            NULLIF(BTRIM(a.first_line), '')::varchar AS first_line,
+            NULLIF(BTRIM(a.second_line), '')::varchar AS second_line,
+            NULLIF(BTRIM(a.postal_code), '')::varchar AS postal_code,
+            COALESCE(NULLIF(BTRIM(a.country_code), ''), 'US')::varchar AS country_code,
+            NULL::varchar AS provider_group_id,
+            NULL::varchar AS provider_set_id,
+            NULL::varchar AS tin,
+            NULL::uuid AS source_address_key,
+            a.date_added::timestamptz AS created_at,
+            sp.ptg_source_array,
+            sp.ptg_plan_array,
+            sp.ptg_plan_array AS group_plan_array
+          FROM {db_schema}.{source_plan_table} sp
+          JOIN {_quote_ident(db_schema)}.npi_address a
+            ON a.npi = sp.npi
+           AND a.type = 'primary'
+{source_plan_where}
+    ),
+    keyed AS (
+        SELECT
+            *,
+            NULLIF(LEFT(REGEXP_REPLACE(COALESCE(postal_code, ''), '[^0-9]', '', 'g'), 5), '')::varchar AS source_zip5,
+            NULLIF(upper(left(BTRIM(COALESCE(state, '')), 2)), '')::varchar AS source_state_code,
+            NULLIF(regexp_replace(lower(COALESCE(city, '')), '[^a-z0-9]', '', 'g'), '')::varchar AS source_city_norm,
+            {address_key_expr} AS address_key
+          FROM shaped
+    )
+    SELECT
+        k.location_hash,
+        k.npi,
+        k.npi_shard,
+        k.location_source,
+        k.confidence_code,
+        k.state,
+        k.city,
+        {lat_expr} AS lat,
+        {long_expr} AS long,
+        k.first_line,
+        k.second_line,
+        k.postal_code,
+        k.country_code,
+        k.provider_group_id,
+        k.provider_set_id,
+        k.tin,
+        k.created_at,
+        k.ptg_source_array,
+        k.ptg_plan_array,
+        k.group_plan_array,
+        k.source_zip5,
+        k.source_state_code,
+        k.source_city_norm,
+        k.address_key,
+        {archive_fields}
+      FROM keyed k
+      {archive_join}
+     WHERE k.zip5 IS NOT NULL OR k.source_state_code IS NOT NULL OR k.address_key IS NOT NULL;
+    """
+
+
+def _ptg_member_address_sql(
+    db_schema: str,
+    source_plan_table: str,
+    member_address_table: str,
+    *,
+    address_canon_available: bool,
+    archive_available: bool,
+    empty: bool = False,
+) -> str:
+    return f"""
+    CREATE UNLOGGED TABLE {db_schema}.{member_address_table} AS
+{_ptg_member_address_select_sql(
+        db_schema,
+        source_plan_table,
+        address_canon_available=address_canon_available,
+        archive_available=archive_available,
+        empty=empty,
+    )}
+    """
+
+
+def _ptg_member_address_insert_sql(
+    db_schema: str,
+    source_plan_table: str,
+    member_address_table: str,
+    *,
+    address_canon_available: bool,
+    archive_available: bool,
+    npi_shard: int,
+) -> str:
+    return f"""
+    INSERT INTO {db_schema}.{member_address_table}
+{_ptg_member_address_select_sql(
+        db_schema,
+        source_plan_table,
+        address_canon_available=address_canon_available,
+        archive_available=archive_available,
+        npi_shard=npi_shard,
+    )}
+    """
+
+
+def _ptg_member_address_raw_sql(
+    db_schema: str,
+    source_plan_table: str,
+    raw_table: str,
+) -> str:
+    return f"""
+    CREATE UNLOGGED TABLE {db_schema}.{raw_table} AS
+    SELECT
+        row_number() OVER (ORDER BY sp.npi, a.checksum) AS rn,
+        sp.npi::bigint AS npi,
+        sp.npi_shard::int AS npi_shard,
+        (
+            'provider_group_member_npi_address:' || a.npi::text || ':' ||
+            COALESCE(NULLIF(a.checksum::text, ''), md5(concat_ws('|',
+                COALESCE(a.first_line::text, ''),
+                COALESCE(a.second_line::text, ''),
+                COALESCE(a.city_name::text, ''),
+                COALESCE(a.state_name::text, ''),
+                COALESCE(a.postal_code::text, ''),
+                COALESCE(a.country_code::text, '')
+            )))
+        )::varchar AS location_hash,
+        'npi_address'::varchar AS location_source,
+        'provider_group_member_npi_address'::varchar AS confidence_code,
+        NULLIF(BTRIM(a.state_name), '')::varchar AS state,
+        NULLIF(BTRIM(a.city_name), '')::varchar AS city,
+        NULLIF(LEFT(REGEXP_REPLACE(COALESCE(a.postal_code, ''), '[^0-9]', '', 'g'), 5), '')::varchar AS source_zip5,
+        NULLIF(upper(left(BTRIM(COALESCE(a.state_name, '')), 2)), '')::varchar AS source_state_code,
+        NULLIF(regexp_replace(lower(COALESCE(a.city_name, '')), '[^a-z0-9]', '', 'g'), '')::varchar AS source_city_norm,
+        a.lat::numeric AS lat,
+        a."long"::numeric AS long,
+        NULLIF(BTRIM(a.first_line), '')::varchar AS first_line,
+        NULLIF(BTRIM(a.second_line), '')::varchar AS second_line,
+        NULLIF(BTRIM(a.postal_code), '')::varchar AS postal_code,
+        COALESCE(NULLIF(BTRIM(a.country_code), ''), 'US')::varchar AS country_code,
+        NULL::varchar AS provider_group_id,
+        NULL::varchar AS provider_set_id,
+        NULL::varchar AS tin,
+        a.date_added::timestamptz AS created_at,
+        sp.ptg_source_array,
+        sp.ptg_plan_array,
+        sp.ptg_plan_array AS group_plan_array
+      FROM {db_schema}.{source_plan_table} sp
+      JOIN {_quote_ident(db_schema)}.npi_address a
+        ON a.npi = sp.npi
+       AND a.type = 'primary';
+    """
+
+
+def _ptg_member_address_keyed_table_sql(db_schema: str, keyed_table: str) -> str:
+    return f"""
+    CREATE UNLOGGED TABLE {db_schema}.{keyed_table} (
+        rn bigint,
+        source_ctid text,
+        staged_address_key uuid,
+        address_key uuid,
+        computed_address_key uuid,
+        identity_key text,
+        premise_key uuid,
+        line1_norm text,
+        unit_norm text,
+        city_norm text,
+        state_code text,
+        zip5 text,
+        zip4 text,
+        country_code text,
+        first_line text,
+        second_line text,
+        city_name text,
+        state_name text,
+        postal_code text
+    );
+    """
+
+
+def _ptg_member_address_rust_copy_sql(db_schema: str, raw_table: str) -> str:
+    return f"""
+    SELECT
+        rn,
+        rn::text AS source_ctid,
+        NULL::uuid AS staged_address_key,
+        first_line,
+        second_line,
+        city,
+        state,
+        postal_code,
+        country_code
+      FROM {db_schema}.{raw_table}
+     ORDER BY 1
+    """
+
+
+def _ptg_member_address_from_rust_sql(
+    db_schema: str,
+    raw_table: str,
+    keyed_table: str,
+    member_address_table: str,
+    *,
+    archive_available: bool,
+) -> str:
+    archive_join = (
+        f"LEFT JOIN {db_schema}.address_archive_v2 a "
+        "ON a.address_key = k.address_key AND a.merged_into IS NULL"
+        if archive_available
+        else ""
+    )
+    lat_expr = "COALESCE(a.lat, r.lat)" if archive_available else "r.lat"
+    long_expr = 'COALESCE(a."long", r.long)' if archive_available else "r.long"
+    archive_fields = (
+        "a.premise_key, "
+        "'v' || COALESCE(a.identity_version, 2)::text AS archive_identity_version, "
+        "COALESCE(a.precision, CASE WHEN k.address_key IS NULL THEN 'unknown' ELSE 'street' END) AS address_precision, "
+        "COALESCE(a.zip5, r.source_zip5) AS zip5, "
+        "COALESCE(NULLIF(upper(left(a.state_code, 2)), ''), r.source_state_code) AS state_code, "
+        "COALESCE(a.city_norm, r.source_city_norm) AS city_norm, "
+        "NULL::varchar AS county_fips"
+        if archive_available
+        else (
+            "NULL::uuid AS premise_key, "
+            f"'{ARCHIVE_IDENTITY_VERSION}'::varchar AS archive_identity_version, "
+            "CASE WHEN k.address_key IS NULL THEN 'unknown' ELSE 'street' END::varchar AS address_precision, "
+            "r.source_zip5 AS zip5, "
+            "r.source_state_code AS state_code, "
+            "r.source_city_norm AS city_norm, "
+            "NULL::varchar AS county_fips"
+        )
+    )
+    return f"""
+    CREATE UNLOGGED TABLE {db_schema}.{member_address_table} AS
+    SELECT
+        r.location_hash,
+        r.npi,
+        r.npi_shard,
+        r.location_source,
+        r.confidence_code,
+        r.state,
+        r.city,
+        {lat_expr} AS lat,
+        {long_expr} AS long,
+        r.first_line,
+        r.second_line,
+        r.postal_code,
+        r.country_code,
+        r.provider_group_id,
+        r.provider_set_id,
+        r.tin,
+        r.created_at,
+        r.ptg_source_array,
+        r.ptg_plan_array,
+        r.group_plan_array,
+        r.source_zip5,
+        r.source_state_code,
+        r.source_city_norm,
+        k.address_key,
+        {archive_fields}
+      FROM {db_schema}.{raw_table} r
+      JOIN {db_schema}.{keyed_table} k
+        ON k.rn = r.rn
+      {archive_join}
+     WHERE r.source_zip5 IS NOT NULL OR r.source_state_code IS NOT NULL OR k.address_key IS NOT NULL;
+    """
+
+
+def _ptg_address_insert_member_address_sql(
+    db_schema: str,
+    stage_table: str,
+    member_address_table: str,
+    *,
+    source_key: str,
+    snapshot_id: str,
+    node_id: str | None,
+    npi_shard: int | None = None,
+) -> str:
+    shard_filter = f"     WHERE e.npi_shard = {int(npi_shard)}" if npi_shard is not None else ""
+    entity_id_expr = "'npi:' || e.npi::text"
+    location_key = _location_key_expr(
+        entity_type="'ptg'",
+        entity_id=entity_id_expr,
+        npi="e.npi",
+        inferred_npi="NULL::bigint",
+        address_role_id="4",
+        row_origin="'ptg_overlay'",
+        address_key="e.address_key",
+        source_id="7",
+        source_record_id="e.location_hash",
+        zip5="e.zip5",
+        state_code="e.state_code",
+        city_norm="e.city_norm",
+    )
+    return f"""
+    INSERT INTO {db_schema}.{stage_table} (
+        node_id,
+        source_key,
+        snapshot_id,
+        plan_id,
+        ptg_plan_id,
+        market_type,
+        provider_group_id,
+        provider_set_id,
+        npi,
+        tin,
+        location_key,
+        address_key,
+        premise_key,
+        archive_identity_version,
+        address_precision,
+        address_source_id,
+        address_source_record_key,
+        address_role_id,
+        location_confidence_id,
+        zip5,
+        state_code,
+        city_norm,
+        county_fips,
+        lat,
+        long,
+        ptg_plan_array,
+        ptg_source_array,
+        group_plan_array,
+        base_address_version,
+        ptg_snapshot_published_at,
+        observed_at,
+        updated_at
+    )
+    SELECT
+        {_sql_literal(node_id)}::varchar AS node_id,
+        {_sql_literal(source_key)}::varchar AS source_key,
+        {_sql_literal(snapshot_id)}::varchar AS snapshot_id,
+        CASE WHEN CARDINALITY(COALESCE(e.ptg_plan_array, ARRAY[]::varchar[])) = 1
+             THEN e.ptg_plan_array[1]
+             ELSE NULL
+        END::varchar AS plan_id,
+        CASE WHEN CARDINALITY(COALESCE(e.ptg_plan_array, ARRAY[]::varchar[])) = 1
+             THEN e.ptg_plan_array[1]
+             ELSE NULL
+        END::varchar AS ptg_plan_id,
+        NULL::varchar AS market_type,
+        e.provider_group_id,
+        e.provider_set_id,
+        e.npi,
+        e.tin,
+        {location_key} AS location_key,
+        e.address_key,
+        e.premise_key,
+        e.archive_identity_version,
+        e.address_precision,
+        1::smallint AS address_source_id,
+        e.location_hash::varchar AS address_source_record_key,
+        4::smallint AS address_role_id,
+        4::smallint AS location_confidence_id,
+        e.zip5,
+        e.state_code,
+        e.city_norm,
+        e.county_fips,
+        e.lat,
+        e.long,
+        COALESCE(e.ptg_plan_array, ARRAY[]::varchar[]) AS ptg_plan_array,
+        COALESCE(e.ptg_source_array, ARRAY[]::varchar[]) AS ptg_source_array,
+        COALESCE(e.group_plan_array, ARRAY[]::varchar[]) AS group_plan_array,
+        {_sql_literal(BASE_ADDRESS_VERSION)}::varchar AS base_address_version,
+        NULL::timestamptz AS ptg_snapshot_published_at,
+        COALESCE(e.created_at, NOW())::timestamptz AS observed_at,
+        NOW()::timestamptz AS updated_at
+      FROM {db_schema}.{member_address_table} e
+{shard_filter}
+    ON CONFLICT (source_key, snapshot_id, location_key) DO NOTHING;
+    """
+
+
 def _ptg_address_insert_member_coverage_sql(
     db_schema: str,
     stage_table: str,
@@ -1104,6 +1683,8 @@ def _ptg_address_insert_member_coverage_sql(
     npi_range_end: int | None = None,
     npi_shard: int | None = None,
 ) -> str:
+    # Legacy inline shape retained for tests/rollback reference. The runtime hot path uses
+    # precomputed member source-plan and keyed-address tables instead.
     npi_filter = _npi_range_filter("c.npi", npi_range_start, npi_range_end)
     shard_filter = f"           AND c.npi_shard = {int(npi_shard)}" if npi_shard is not None else ""
     country_expr = "country_code"
@@ -1502,36 +2083,219 @@ async def _insert_ptg_member_coverage_source(
     }
 
 
+async def _insert_ptg_member_address_shard(
+    db_schema: str,
+    source_plan_table: str,
+    member_address_table: str,
+    *,
+    address_canon_available: bool,
+    archive_available: bool,
+    shard_index: int,
+) -> dict[str, str | int]:
+    insert_sql = _ptg_member_address_insert_sql(
+        db_schema,
+        source_plan_table,
+        member_address_table,
+        address_canon_available=address_canon_available,
+        archive_available=archive_available,
+        npi_shard=shard_index,
+    )
+    async with db.transaction() as session:
+        await _apply_ptg_address_sql_settings(session)
+        await session.execute(db.text(insert_sql))
+    return {"shard_index": shard_index}
+
+
+async def _ptg_member_address_rust_binary(*, required: bool) -> Path | None:
+    if not _env_bool(ADDRESS_CANON_RUST_MATERIALIZE_ENV, True):
+        if required:
+            raise RuntimeError(f"{ADDRESS_CANON_RUST_MATERIALIZE_ENV} disabled PTG member Rust keying")
+        return None
+    binary = _ptg2_rust_scanner_binary()
+    if binary is None:
+        if required:
+            raise FileNotFoundError("ptg2_scanner binary was not found for PTG member Rust keying")
+        logger.warning("PTG member Rust keying skipped because ptg2_scanner was not found")
+        return None
+    if not await _rust_canon_version_is_current(binary):
+        if required:
+            raise RuntimeError(f"ptg2_scanner address canonicalizer is not current: {binary}")
+        return None
+    return binary
+
+
+async def _try_materialize_ptg_member_address_with_rust(
+    db_schema: str,
+    source_plan_table: str,
+    raw_table: str,
+    keyed_table: str,
+    member_address_table: str,
+    *,
+    archive_available: bool,
+    raw_index: str,
+    keyed_rn_index: str,
+    keyed_address_key_index: str,
+    phase_timings: dict[str, Any],
+    required: bool = False,
+) -> bool:
+    binary = await _ptg_member_address_rust_binary(required=required)
+    if binary is None:
+        return False
+    try:
+        await _timed_status(
+            phase_timings,
+            "ptg-address member address rust raw materialize",
+            _ptg_member_address_raw_sql(
+                db_schema,
+                source_plan_table,
+                raw_table,
+            ),
+        )
+        await _timed_status(
+            phase_timings,
+            "ptg-address member address rust raw index rn",
+            f"CREATE INDEX {raw_index} ON {db_schema}.{raw_table} (rn);",
+        )
+        await _timed_status(
+            phase_timings,
+            "ptg-address member address rust raw analyze",
+            f"ANALYZE {db_schema}.{raw_table};",
+        )
+        await _timed_status(
+            phase_timings,
+            "ptg-address member address rust keyed create table",
+            _ptg_member_address_keyed_table_sql(db_schema, keyed_table),
+        )
+        async with db.transaction() as session:
+            await _apply_ptg_address_sql_settings(session)
+            connection = await session.connection()
+            raw_connection = await connection.get_raw_connection()
+            driver_connection = getattr(raw_connection, "driver_connection", raw_connection)
+            copy_from_query = getattr(driver_connection, "copy_from_query", None)
+            copy_to_table = getattr(driver_connection, "copy_to_table", None)
+            if copy_from_query is None or copy_to_table is None:
+                if required:
+                    raise RuntimeError("active database driver lacks COPY support for PTG member Rust keying")
+                logger.warning("PTG member Rust keying skipped because the active database driver lacks COPY support")
+                return False
+            with tempfile.TemporaryDirectory(prefix="ptg-address-member-rust-") as tmpdir:
+                input_path = Path(tmpdir) / "raw.copy"
+                output_path = Path(tmpdir) / "keyed.copy"
+                started = time.monotonic()
+                with input_path.open("wb") as copy_output:
+                    await copy_from_query(
+                        _ptg_member_address_rust_copy_sql(db_schema, raw_table),
+                        output=copy_output,
+                        format="text",
+                        delimiter="\t",
+                        null="\\N",
+                    )
+                _record_phase_timing(
+                    phase_timings,
+                    "ptg-address member address rust export",
+                    time.monotonic() - started,
+                    None,
+                )
+                started = time.monotonic()
+                await _run_rust_address_canonicalizer(input_path, output_path, binary=binary)
+                _record_phase_timing(
+                    phase_timings,
+                    "ptg-address member address rust canonicalize",
+                    time.monotonic() - started,
+                    None,
+                )
+                started = time.monotonic()
+                with output_path.open("rb") as copy_input:
+                    await copy_to_table(
+                        keyed_table,
+                        source=copy_input,
+                        schema_name=db_schema,
+                        columns=list(KEYED_COPY_COLUMNS),
+                        format="text",
+                        delimiter="\t",
+                        null="\\N",
+                    )
+                _record_phase_timing(
+                    phase_timings,
+                    "ptg-address member address rust load",
+                    time.monotonic() - started,
+                    None,
+                )
+        await _timed_status(
+            phase_timings,
+            "ptg-address member address rust keyed index rn",
+            f"CREATE INDEX {keyed_rn_index} ON {db_schema}.{keyed_table} (rn);",
+        )
+        await _timed_status(
+            phase_timings,
+            "ptg-address member address rust keyed index address",
+            f"CREATE INDEX {keyed_address_key_index} ON {db_schema}.{keyed_table} (address_key);",
+        )
+        await _timed_status(
+            phase_timings,
+            "ptg-address member address rust keyed analyze",
+            f"ANALYZE {db_schema}.{keyed_table};",
+        )
+        await _timed_status(
+            phase_timings,
+            "ptg-address member address rust finalize",
+            _ptg_member_address_from_rust_sql(
+                db_schema,
+                raw_table,
+                keyed_table,
+                member_address_table,
+                archive_available=archive_available,
+            ),
+        )
+        return True
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        await db.status(f"DROP TABLE IF EXISTS {db_schema}.{member_address_table};")
+        if required:
+            raise
+        logger.warning("PTG member Rust keying failed; falling back to SQL: %s", exc)
+        return False
+
+
 async def _insert_ptg_member_fallback_materialize_shard(
     db_schema: str,
     stage_table: str,
-    coverage_table: str,
+    member_input_table: str,
     *,
     source_key: str,
     snapshot_id: str,
     node_id: str | None,
+    use_precomputed_address_table: bool,
     address_canon_available: bool,
     archive_available: bool,
     shard_index: int,
     shard_count: int,
 ) -> dict[str, str | int]:
+    insert_sql = (
+        _ptg_address_insert_member_address_sql(
+            db_schema,
+            stage_table,
+            member_input_table,
+            source_key=source_key,
+            snapshot_id=snapshot_id,
+            node_id=node_id,
+            npi_shard=shard_index,
+        )
+        if use_precomputed_address_table
+        else _ptg_address_insert_member_coverage_sql(
+            db_schema,
+            stage_table,
+            member_input_table,
+            source_key=source_key,
+            snapshot_id=snapshot_id,
+            node_id=node_id,
+            address_canon_available=address_canon_available,
+            archive_available=archive_available,
+            npi_shard=shard_index,
+        )
+    )
     async with db.transaction() as session:
         await _apply_ptg_address_sql_settings(session)
-        await session.execute(
-            db.text(
-                _ptg_address_insert_member_coverage_sql(
-                    db_schema,
-                    stage_table,
-                    coverage_table,
-                    source_key=source_key,
-                    snapshot_id=snapshot_id,
-                    node_id=node_id,
-                    address_canon_available=address_canon_available,
-                    archive_available=archive_available,
-                    npi_shard=shard_index,
-                )
-            )
-        )
+        await session.execute(db.text(insert_sql))
     return {
         "source_key": source_key,
         "snapshot_id": snapshot_id,
@@ -1562,17 +2326,37 @@ async def _insert_ptg_member_fallback_aggregate(
         }
 
     coverage_table = _ptg_member_coverage_table_name(stage_table)
+    source_plan_table = _ptg_member_source_plan_table_name(stage_table)
+    member_address_table = _ptg_member_address_table_name(stage_table)
+    member_address_raw_table = _ptg_member_address_raw_table_name(stage_table)
+    member_address_keyed_table = _ptg_member_address_keyed_table_name(stage_table)
     impacted_table = _ptg_member_impacted_npis_table_name(stage_table) if changed_source_keys else None
     materialize_shards = _env_positive_int(
         "HLTHPRT_PTG_ADDRESS_MEMBER_MATERIALIZE_SHARDS",
         DEFAULT_MEMBER_MATERIALIZE_SHARDS,
     )
+    member_key_mode = _ptg_member_key_mode()
+    use_precomputed_member_address = member_key_mode != PTG_ADDRESS_MEMBER_KEY_MODE_INLINE
     coverage_index = _stage_index_name(coverage_table, "npi")
     coverage_shard_index = _stage_index_name(coverage_table, "shard_npi")
     coverage_source_index = _stage_index_name(coverage_table, "source_snapshot")
+    source_plan_npi_index = _stage_index_name(source_plan_table, "npi")
+    source_plan_shard_index = _stage_index_name(source_plan_table, "shard_npi")
+    member_address_shard_index = _stage_index_name(member_address_table, "shard_npi")
+    member_address_npi_index = _stage_index_name(member_address_table, "npi")
+    member_address_raw_rn_index = _stage_index_name(member_address_raw_table, "rn")
+    member_address_keyed_rn_index = _stage_index_name(member_address_keyed_table, "rn")
+    member_address_keyed_address_index = _stage_index_name(member_address_keyed_table, "address")
+    phase_timings: dict[str, Any] = {}
     await db.status(f"DROP TABLE IF EXISTS {db_schema}.{coverage_table};")
+    await db.status(f"DROP TABLE IF EXISTS {db_schema}.{source_plan_table};")
+    await db.status(f"DROP TABLE IF EXISTS {db_schema}.{member_address_table};")
+    await db.status(f"DROP TABLE IF EXISTS {db_schema}.{member_address_raw_table};")
+    await db.status(f"DROP TABLE IF EXISTS {db_schema}.{member_address_keyed_table};")
     try:
-        await db.status(
+        await _timed_status(
+            phase_timings,
+            "ptg-address member coverage create table",
             f"""
             CREATE UNLOGGED TABLE {db_schema}.{coverage_table} (
                 source_key varchar NOT NULL,
@@ -1585,9 +2369,19 @@ async def _insert_ptg_member_fallback_aggregate(
         coverage_results: list[dict[str, str | None]] = []
         impacted_rows = None
         if impacted_table:
-            await db.status(f"DROP TABLE IF EXISTS {db_schema}.{impacted_table};")
-            await db.status(f"CREATE UNLOGGED TABLE {db_schema}.{impacted_table} (npi bigint PRIMARY KEY);")
-            await db.status(
+            await _timed_status(
+                phase_timings,
+                "ptg-address member impacted drop table",
+                f"DROP TABLE IF EXISTS {db_schema}.{impacted_table};",
+            )
+            await _timed_status(
+                phase_timings,
+                "ptg-address member impacted create table",
+                f"CREATE UNLOGGED TABLE {db_schema}.{impacted_table} (npi bigint PRIMARY KEY);",
+            )
+            await _timed_status(
+                phase_timings,
+                "ptg-address member impacted live npis",
                 _ptg_member_live_impacted_npis_insert_sql(
                     db_schema,
                     impacted_table,
@@ -1598,15 +2392,28 @@ async def _insert_ptg_member_fallback_aggregate(
                 provider_group_member_table = source_context.get("provider_group_member_table")
                 if not provider_group_member_table:
                     continue
-                await db.status(
+                await _timed_status(
+                    phase_timings,
+                    "ptg-address member impacted current npis",
                     _ptg_member_current_impacted_npis_insert_sql(
                         db_schema,
                         impacted_table,
                         provider_group_member_table=provider_group_member_table,
                     )
                 )
-            await db.status(f"ANALYZE {db_schema}.{impacted_table};")
-            impacted_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{impacted_table};") or 0)
+            await _timed_status(
+                phase_timings,
+                "ptg-address member impacted analyze",
+                f"ANALYZE {db_schema}.{impacted_table};",
+            )
+            impacted_rows = int(
+                await _timed_scalar(
+                    phase_timings,
+                    "ptg-address member impacted count",
+                    f"SELECT COUNT(*) FROM {db_schema}.{impacted_table};",
+                )
+                or 0
+            )
             if run_id:
                 enqueue_live_progress(
                     run_id=run_id,
@@ -1623,19 +2430,28 @@ async def _insert_ptg_member_fallback_aggregate(
 
         async def _insert_coverage_one(source_context: dict[str, str | None]) -> dict[str, str | None]:
             async with coverage_sem:
-                return await _insert_ptg_member_coverage_source(
+                started = time.monotonic()
+                result = await _insert_ptg_member_coverage_source(
                     db_schema,
                     coverage_table,
                     source_context=source_context,
                     npi_shard_count=materialize_shards,
                     impacted_npis_table=impacted_table,
                 )
+                result["elapsed_seconds"] = f"{time.monotonic() - started:.6f}"
+                return result
 
         coverage_tasks = [asyncio.create_task(_insert_coverage_one(source_context)) for source_context in source_contexts]
         try:
             for future in asyncio.as_completed(coverage_tasks):
                 result = await future
                 coverage_results.append(result)
+                _record_phase_timing(
+                    phase_timings,
+                    "ptg-address member coverage source insert",
+                    float(result.pop("elapsed_seconds", 0.0) or 0.0),
+                    None,
+                )
                 if run_id:
                     done = len(coverage_results)
                     total = len(source_contexts)
@@ -1656,15 +2472,34 @@ async def _insert_ptg_member_fallback_aggregate(
             await asyncio.gather(*coverage_tasks, return_exceptions=True)
             raise
 
-        await db.status(f"CREATE INDEX {coverage_index} ON {db_schema}.{coverage_table} (npi);")
-        await db.status(
+        await _timed_status(
+            phase_timings,
+            "ptg-address member coverage index npi",
+            f"CREATE INDEX {coverage_index} ON {db_schema}.{coverage_table} (npi);",
+        )
+        await _timed_status(
+            phase_timings,
+            "ptg-address member coverage index shard",
             f"CREATE INDEX {coverage_shard_index} ON {db_schema}.{coverage_table} (npi_shard, npi);"
         )
-        await db.status(
+        await _timed_status(
+            phase_timings,
+            "ptg-address member coverage index source",
             f"CREATE INDEX {coverage_source_index} ON {db_schema}.{coverage_table} (source_key, snapshot_id);"
         )
-        await db.status(f"ANALYZE {db_schema}.{coverage_table};")
-        coverage_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{coverage_table};") or 0)
+        await _timed_status(
+            phase_timings,
+            "ptg-address member coverage analyze",
+            f"ANALYZE {db_schema}.{coverage_table};",
+        )
+        coverage_rows = int(
+            await _timed_scalar(
+                phase_timings,
+                "ptg-address member coverage count",
+                f"SELECT COUNT(*) FROM {db_schema}.{coverage_table};",
+            )
+            or 0
+        )
         if run_id:
             enqueue_live_progress(
                 run_id=run_id,
@@ -1677,11 +2512,27 @@ async def _insert_ptg_member_fallback_aggregate(
                 pct=75,
                 message=f"materializing addresses for {coverage_rows} PTG member coverage rows",
             )
-        await db.status(f"ANALYZE {db_schema}.npi_address;")
-        if await _table_exists(db_schema, "ptg2_current_plan_source"):
-            await db.status(f"ANALYZE {db_schema}.ptg2_current_plan_source;")
-        if archive_available:
-            await db.status(f"ANALYZE {db_schema}.address_archive_v2;")
+        analyze_base_tables = _env_bool("HLTHPRT_PTG_ADDRESS_ANALYZE_BASE_TABLES", False)
+        if analyze_base_tables:
+            await _timed_status(
+                phase_timings,
+                "ptg-address npi_address analyze",
+                f"ANALYZE {db_schema}.npi_address;",
+            )
+            if await _table_exists(db_schema, "ptg2_current_plan_source"):
+                await _timed_status(
+                    phase_timings,
+                    "ptg-address current plan source analyze",
+                    f"ANALYZE {db_schema}.ptg2_current_plan_source;",
+                )
+            if archive_available:
+                await _timed_status(
+                    phase_timings,
+                    "ptg-address archive analyze",
+                    f"ANALYZE {db_schema}.address_archive_v2;",
+                )
+        source_plan_rows = 0
+        member_address_rows = 0
         materialize_concurrency = min(
             materialize_shards,
             _env_positive_int(
@@ -1689,22 +2540,185 @@ async def _insert_ptg_member_fallback_aggregate(
                 insert_concurrency,
             ),
         )
+        member_address_concurrency = min(
+            materialize_shards,
+            _env_positive_int(
+                "HLTHPRT_PTG_ADDRESS_MEMBER_ADDRESS_CONCURRENCY",
+                materialize_concurrency,
+            ),
+        )
+        member_address_sharded = _env_bool("HLTHPRT_PTG_ADDRESS_MEMBER_ADDRESS_SHARDED", False)
+        member_address_materializer = "inline" if not use_precomputed_member_address else "sql"
+        if use_precomputed_member_address:
+            await _timed_status(
+                phase_timings,
+                "ptg-address member source-plan materialize",
+                _ptg_member_source_plan_sql(
+                    db_schema,
+                    coverage_table,
+                    source_plan_table=source_plan_table,
+                ),
+            )
+            await _timed_status(
+                phase_timings,
+                "ptg-address member source-plan index npi",
+                f"CREATE INDEX {source_plan_npi_index} ON {db_schema}.{source_plan_table} (npi);",
+            )
+            await _timed_status(
+                phase_timings,
+                "ptg-address member source-plan index shard",
+                f"CREATE INDEX {source_plan_shard_index} ON {db_schema}.{source_plan_table} (npi_shard, npi);",
+            )
+            await _timed_status(
+                phase_timings,
+                "ptg-address member source-plan analyze",
+                f"ANALYZE {db_schema}.{source_plan_table};",
+            )
+            source_plan_rows = int(
+                await _timed_scalar(
+                    phase_timings,
+                    "ptg-address member source-plan count",
+                    f"SELECT COUNT(*) FROM {db_schema}.{source_plan_table};",
+                )
+                or 0
+            )
+            rust_materialized = False
+            if member_key_mode in {PTG_ADDRESS_MEMBER_KEY_MODE_AUTO, PTG_ADDRESS_MEMBER_KEY_MODE_RUST}:
+                rust_materialized = await _try_materialize_ptg_member_address_with_rust(
+                    db_schema,
+                    source_plan_table,
+                    member_address_raw_table,
+                    member_address_keyed_table,
+                    member_address_table,
+                    archive_available=archive_available,
+                    raw_index=member_address_raw_rn_index,
+                    keyed_rn_index=member_address_keyed_rn_index,
+                    keyed_address_key_index=member_address_keyed_address_index,
+                    phase_timings=phase_timings,
+                    required=member_key_mode == PTG_ADDRESS_MEMBER_KEY_MODE_RUST,
+                )
+                if rust_materialized:
+                    member_address_materializer = "rust"
+            if rust_materialized:
+                pass
+            elif member_address_sharded:
+                await _timed_status(
+                    phase_timings,
+                    "ptg-address member address create table",
+                    _ptg_member_address_sql(
+                        db_schema,
+                        source_plan_table,
+                        member_address_table,
+                        address_canon_available=address_canon_available,
+                        archive_available=archive_available,
+                        empty=True,
+                    ),
+                )
+                member_address_sem = asyncio.Semaphore(max(1, member_address_concurrency))
+
+                async def _insert_member_address_one(shard_index: int) -> dict[str, str | int]:
+                    async with member_address_sem:
+                        started = time.monotonic()
+                        result = await _insert_ptg_member_address_shard(
+                            db_schema,
+                            source_plan_table,
+                            member_address_table,
+                            address_canon_available=address_canon_available,
+                            archive_available=archive_available,
+                            shard_index=shard_index,
+                        )
+                        result["elapsed_seconds"] = f"{time.monotonic() - started:.6f}"
+                        return result
+
+                member_address_tasks = [
+                    asyncio.create_task(_insert_member_address_one(shard_index))
+                    for shard_index in range(materialize_shards)
+                ]
+                member_address_results: list[dict[str, str | int]] = []
+                try:
+                    for future in asyncio.as_completed(member_address_tasks):
+                        result = await future
+                        _record_phase_timing(
+                            phase_timings,
+                            "ptg-address member address shard insert",
+                            float(result.pop("elapsed_seconds", 0.0) or 0.0),
+                            None,
+                        )
+                        member_address_results.append(result)
+                        if run_id:
+                            done = len(member_address_results)
+                            enqueue_live_progress(
+                                run_id=run_id,
+                                importer="ptg-address",
+                                status="running",
+                                phase="precomputing PTG member fallback addresses",
+                                unit="npi shards",
+                                done=done,
+                                total=materialize_shards,
+                                pct=75 + min(10, (done / max(materialize_shards, 1)) * 10),
+                                message=f"precomputed {done}/{materialize_shards} PTG member fallback address shards",
+                            )
+                except Exception:
+                    for task_item in member_address_tasks:
+                        task_item.cancel()
+                    await asyncio.gather(*member_address_tasks, return_exceptions=True)
+                    raise
+            else:
+                await _timed_status(
+                    phase_timings,
+                    "ptg-address member address materialize",
+                    _ptg_member_address_sql(
+                        db_schema,
+                        source_plan_table,
+                        member_address_table,
+                        address_canon_available=address_canon_available,
+                        archive_available=archive_available,
+                    ),
+                )
+                member_address_materializer = "sql"
+            await _timed_status(
+                phase_timings,
+                "ptg-address member address index shard",
+                f"CREATE INDEX {member_address_shard_index} ON {db_schema}.{member_address_table} (npi_shard, npi);",
+            )
+            await _timed_status(
+                phase_timings,
+                "ptg-address member address index npi",
+                f"CREATE INDEX {member_address_npi_index} ON {db_schema}.{member_address_table} (npi);",
+            )
+            await _timed_status(
+                phase_timings,
+                "ptg-address member address analyze",
+                f"ANALYZE {db_schema}.{member_address_table};",
+            )
+            member_address_rows = int(
+                await _timed_scalar(
+                    phase_timings,
+                    "ptg-address member address count",
+                    f"SELECT COUNT(*) FROM {db_schema}.{member_address_table};",
+                )
+                or 0
+            )
         materialize_sem = asyncio.Semaphore(max(1, materialize_concurrency))
 
         async def _materialize_one(shard_index: int) -> dict[str, str | int]:
             async with materialize_sem:
-                return await _insert_ptg_member_fallback_materialize_shard(
+                started = time.monotonic()
+                result = await _insert_ptg_member_fallback_materialize_shard(
                     db_schema,
                     stage_table,
-                    coverage_table,
+                    member_address_table if use_precomputed_member_address else coverage_table,
                     source_key=PTG_ADDRESS_MEMBER_FALLBACK_SOURCE_KEY,
                     snapshot_id=stage_table,
                     node_id=node_id,
+                    use_precomputed_address_table=use_precomputed_member_address,
                     address_canon_available=address_canon_available,
                     archive_available=archive_available,
                     shard_index=shard_index,
                     shard_count=materialize_shards,
                 )
+                result["elapsed_seconds"] = f"{time.monotonic() - started:.6f}"
+                return result
 
         materialize_results: list[dict[str, str | int]] = []
         materialize_tasks = [
@@ -1714,6 +2728,12 @@ async def _insert_ptg_member_fallback_aggregate(
         try:
             for future in asyncio.as_completed(materialize_tasks):
                 result = await future
+                _record_phase_timing(
+                    phase_timings,
+                    "ptg-address member final shard insert",
+                    float(result.pop("elapsed_seconds", 0.0) or 0.0),
+                    None,
+                )
                 materialize_results.append(result)
                 if run_id:
                     done = len(materialize_results)
@@ -1739,12 +2759,24 @@ async def _insert_ptg_member_fallback_aggregate(
             "source_unit": "member_coverage_aggregate",
             "member_coverage_sources": len(source_contexts),
             "member_coverage_rows": coverage_rows,
+            "member_source_plan_rows": source_plan_rows,
+            "member_address_rows": member_address_rows,
             "member_impacted_npis": impacted_rows,
+            "member_key_mode": member_key_mode,
+            "member_address_materializer": member_address_materializer,
+            "member_analyze_base_tables": analyze_base_tables,
             "member_materialize_shards": materialize_shards,
+            "member_address_sharded": member_address_sharded,
+            "member_address_concurrency": member_address_concurrency,
             "member_materialize_concurrency": materialize_concurrency,
+            "member_phase_timings": phase_timings.get("phase_timings") or {},
         }
     finally:
         await db.status(f"DROP TABLE IF EXISTS {db_schema}.{coverage_table};")
+        await db.status(f"DROP TABLE IF EXISTS {db_schema}.{source_plan_table};")
+        await db.status(f"DROP TABLE IF EXISTS {db_schema}.{member_address_table};")
+        await db.status(f"DROP TABLE IF EXISTS {db_schema}.{member_address_raw_table};")
+        await db.status(f"DROP TABLE IF EXISTS {db_schema}.{member_address_keyed_table};")
         if impacted_table:
             await db.status(f"DROP TABLE IF EXISTS {db_schema}.{impacted_table};")
 
@@ -2083,6 +3115,7 @@ async def process_data(ctx, task=None):
             insert_concurrency=insert_concurrency,
             run_id=run_id,
         )
+        _merge_phase_timings(context, aggregate_result.get("member_phase_timings") or {})
         insert_results.append(aggregate_result)
         if run_id:
             enqueue_live_progress(
@@ -2379,6 +3412,8 @@ async def shutdown(ctx):
             "partial_refresh_patched_rows": int(context.get("partial_refresh_patched_rows") or 0),
             "partial_refresh_patch_publish": partial_patch,
             "publish_validation": context.get("publish_validation") or {},
+            "phase_timings": context.get("phase_timings") or {},
+            "source_insert_results": context.get("source_insert_results") or [],
         },
     )
     print_time_info(context.get("start"))

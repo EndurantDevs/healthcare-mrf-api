@@ -782,6 +782,7 @@ def _canon_version_matches(payload: Mapping[str, Any]) -> bool:
     return (
         int(payload.get("identity_version") or 0) == expected["identity_version"]
         and str(payload.get("identity_prefix") or "") == expected["identity_prefix"]
+        and int(payload.get("ruleset_version") or 0) == expected["ruleset_version"]
         and str(payload.get("pub28_sha256") or "") == expected["pub28_sha256"]
     )
 

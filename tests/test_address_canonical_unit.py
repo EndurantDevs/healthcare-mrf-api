@@ -400,6 +400,18 @@ def test_address_fast_python_fallback_matches_reference(monkeypatch):
     assert result["country_code"] == "US"
 
 
+def test_rust_canon_version_match_requires_ruleset_version():
+    current = address_canon.current_canon_version()
+
+    assert address_canon._canon_version_matches(current)
+    assert not address_canon._canon_version_matches(
+        {
+            **current,
+            "ruleset_version": current["ruleset_version"] - 1,
+        }
+    )
+
+
 @pytest.mark.asyncio
 async def test_rust_materialize_default_on_falls_back_when_binary_missing(monkeypatch):
     monkeypatch.delenv(address_canon.ADDRESS_CANON_RUST_MATERIALIZE_ENV, raising=False)
@@ -2476,6 +2488,24 @@ def test_ptg_address_refresh_mode_defaults_aliases_and_rejects_invalid(monkeypat
         ptg_address._ptg_address_refresh_mode({"refresh_mode": "fastish"})
 
 
+def test_ptg_address_member_key_mode_defaults_aliases_and_rejects_invalid(monkeypatch):
+    monkeypatch.delenv("HLTHPRT_PTG_ADDRESS_MEMBER_KEY_MODE", raising=False)
+    assert ptg_address._ptg_member_key_mode() == "auto"
+
+    monkeypatch.setenv("HLTHPRT_PTG_ADDRESS_MEMBER_KEY_MODE", "sql")
+    assert ptg_address._ptg_member_key_mode() == "sql"
+
+    monkeypatch.setenv("HLTHPRT_PTG_ADDRESS_MEMBER_KEY_MODE", "rust")
+    assert ptg_address._ptg_member_key_mode() == "rust"
+
+    monkeypatch.setenv("HLTHPRT_PTG_ADDRESS_MEMBER_KEY_MODE", "legacy")
+    assert ptg_address._ptg_member_key_mode() == "inline"
+
+    monkeypatch.setenv("HLTHPRT_PTG_ADDRESS_MEMBER_KEY_MODE", "bad")
+    with pytest.raises(ValueError, match="Unsupported HLTHPRT_PTG_ADDRESS_MEMBER_KEY_MODE"):
+        ptg_address._ptg_member_key_mode()
+
+
 def test_ptg_address_partial_reuse_sql_excludes_changed_source_keys():
     sql = ptg_address._ptg_address_reuse_live_rows_sql(
         "mrf",
@@ -2698,6 +2728,145 @@ def test_ptg_address_member_coverage_sql_materializes_fallback_once():
     assert "provider_group_members AS MATERIALIZED" not in sql
     assert "mrf.addr_key_v1(first_line, second_line, city, state, postal_code, country_code)" in sql
     assert "COALESCE(e.ptg_source_array, ARRAY[]::varchar[]) AS ptg_source_array" in sql
+    assert "ON CONFLICT (source_key, snapshot_id, location_key) DO NOTHING" in sql
+
+
+def test_ptg_member_source_plan_sql_materializes_arrays_once():
+    sql = ptg_address._ptg_member_source_plan_sql(
+        "mrf",
+        "ptg_address_member_coverage",
+        source_plan_table="ptg_address_member_source_plan",
+    )
+
+    assert "CREATE UNLOGGED TABLE mrf.ptg_address_member_source_plan AS" in sql
+    assert "FROM mrf.ptg_address_member_coverage c" in sql
+    assert 'LEFT JOIN "mrf".ptg2_current_plan_source ps' in sql
+    assert "GROUP BY c.npi" in sql
+    assert "MIN(c.npi_shard)::int AS npi_shard" in sql
+    assert "ARRAY_AGG(DISTINCT NULLIF(c.source_key, '')" in sql
+    assert "ARRAY_AGG(DISTINCT NULLIF(ps.plan_id::text, '')" in sql
+    assert "addr_key_v1" not in sql
+    assert 'JOIN "mrf".npi_address' not in sql
+
+
+def test_ptg_member_address_sql_materializes_current_keys_once():
+    sql = ptg_address._ptg_member_address_sql(
+        "mrf",
+        "ptg_address_member_source_plan",
+        "ptg_address_member_address",
+        address_canon_available=True,
+        archive_available=True,
+    )
+
+    assert "CREATE UNLOGGED TABLE mrf.ptg_address_member_address AS" in sql
+    assert "FROM mrf.ptg_address_member_source_plan sp" in sql
+    assert 'JOIN "mrf".npi_address a' in sql
+    assert "ON a.npi = sp.npi" in sql
+    assert "sp.npi_shard::int AS npi_shard" in sql
+    assert "NULL::uuid AS source_address_key" in sql
+    assert "a.address_key::uuid AS source_address_key" not in sql
+    assert "mrf.addr_key_v1(first_line, second_line, city, state, postal_code, country_code)" in sql
+    assert "LEFT JOIN mrf.address_archive_v2 a ON a.address_key = k.address_key" in sql
+    assert "ARRAY_AGG" not in sql
+
+
+def test_ptg_member_address_sql_can_create_empty_helper_table():
+    sql = ptg_address._ptg_member_address_sql(
+        "mrf",
+        "ptg_address_member_source_plan",
+        "ptg_address_member_address",
+        address_canon_available=True,
+        archive_available=True,
+        empty=True,
+    )
+
+    assert "CREATE UNLOGGED TABLE mrf.ptg_address_member_address AS" in sql
+    assert "WHERE FALSE" in sql
+
+
+def test_ptg_member_address_insert_sql_can_fill_one_shard():
+    sql = ptg_address._ptg_member_address_insert_sql(
+        "mrf",
+        "ptg_address_member_source_plan",
+        "ptg_address_member_address",
+        address_canon_available=True,
+        archive_available=True,
+        npi_shard=3,
+    )
+
+    assert "INSERT INTO mrf.ptg_address_member_address" in sql
+    assert "CREATE UNLOGGED TABLE" not in sql
+    assert "FROM mrf.ptg_address_member_source_plan sp" in sql
+    assert "WHERE sp.npi_shard = 3" in sql
+    assert "mrf.addr_key_v1(first_line, second_line, city, state, postal_code, country_code)" in sql
+    assert "ARRAY_AGG" not in sql
+
+
+def test_ptg_member_address_raw_sql_preserves_current_source_fallbacks():
+    sql = ptg_address._ptg_member_address_raw_sql(
+        "mrf",
+        "ptg_address_member_source_plan",
+        "ptg_address_member_raw",
+    )
+
+    assert "CREATE UNLOGGED TABLE mrf.ptg_address_member_raw AS" in sql
+    assert "row_number() OVER (ORDER BY sp.npi, a.checksum) AS rn" in sql
+    assert 'JOIN "mrf".npi_address a' in sql
+    assert "NULLIF(upper(left(BTRIM(COALESCE(a.state_name, '')), 2)), '')::varchar AS source_state_code" in sql
+    assert "NULLIF(regexp_replace(lower(COALESCE(a.city_name, '')), '[^a-z0-9]', '', 'g'), '')::varchar AS source_city_norm" in sql
+    assert "addr_key_v1" not in sql
+
+
+def test_ptg_member_address_rust_copy_sql_exports_canonical_fields():
+    sql = ptg_address._ptg_member_address_rust_copy_sql(
+        "mrf",
+        "ptg_address_member_raw",
+    )
+
+    assert "SELECT" in sql
+    assert "NULL::uuid AS staged_address_key" in sql
+    assert "first_line" in sql
+    assert "second_line" in sql
+    assert "postal_code" in sql
+    assert "ORDER BY 1" in sql
+
+
+def test_ptg_member_address_from_rust_sql_matches_sql_fallback_fields():
+    sql = ptg_address._ptg_member_address_from_rust_sql(
+        "mrf",
+        "ptg_address_member_raw",
+        "ptg_address_member_keyed",
+        "ptg_address_member_address",
+        archive_available=True,
+    )
+
+    assert "CREATE UNLOGGED TABLE mrf.ptg_address_member_address AS" in sql
+    assert "JOIN mrf.ptg_address_member_keyed k" in sql
+    assert "ON k.rn = r.rn" in sql
+    assert "LEFT JOIN mrf.address_archive_v2 a ON a.address_key = k.address_key" in sql
+    assert "COALESCE(a.zip5, r.source_zip5) AS zip5" in sql
+    assert "COALESCE(NULLIF(upper(left(a.state_code, 2)), ''), r.source_state_code) AS state_code" in sql
+    assert "COALESCE(a.city_norm, r.source_city_norm) AS city_norm" in sql
+    assert "addr_key_v1" not in sql
+
+
+def test_ptg_address_member_address_insert_uses_precomputed_table():
+    sql = ptg_address._ptg_address_insert_member_address_sql(
+        "mrf",
+        "ptg_address_stage",
+        "ptg_address_member_address",
+        source_key=ptg_address.PTG_ADDRESS_MEMBER_FALLBACK_SOURCE_KEY,
+        snapshot_id="ptg_address_stage",
+        node_id="local_mrf",
+        npi_shard=3,
+    )
+
+    assert "FROM mrf.ptg_address_member_address e" in sql
+    assert "WHERE e.npi_shard = 3" in sql
+    assert "'ptg_member_fallback'::varchar AS source_key" in sql
+    assert "mrf.addr_key_v1" not in sql
+    assert "ARRAY_AGG" not in sql
+    assert 'JOIN "mrf".npi_address' not in sql
     assert "ON CONFLICT (source_key, snapshot_id, location_key) DO NOTHING" in sql
 
 
