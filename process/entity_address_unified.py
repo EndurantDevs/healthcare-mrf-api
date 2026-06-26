@@ -49,6 +49,7 @@ DEFAULT_EVIDENCE_SHARDS = 16
 DEFAULT_EVIDENCE_CONCURRENCY = 4
 DEFAULT_SUPPORT_STAGE_CONCURRENCY = 4
 DEFAULT_SUPPORT_INDEX_CONCURRENCY = 2
+DEFAULT_FACILITY_CANDIDATE_SHARDS = 4
 DEFAULT_SUPPORT_HEAP_LOAD = True
 DEFAULT_BUILD_NETWORK_BRIDGE = False
 DEFAULT_COMPACT_SOURCE_RECORD_IDS = True
@@ -4227,8 +4228,17 @@ def _facility_anchor_npi_candidate_sql(
     include_npi_other_identifier: bool = False,
     include_provider_additional_npi: bool = False,
     include_facility_anchor: bool = False,
+    candidate_shards: int = 1,
+    candidate_shard: int | None = None,
 ) -> str:
     candidate_limit = _env_int("HLTHPRT_FACILITY_ANCHOR_NPI_CANDIDATE_LIMIT", 25, minimum=1)
+    shard_filter = ""
+    if candidate_shards > 1:
+        shard = 0 if candidate_shard is None else int(candidate_shard)
+        shards = max(int(candidate_shards), 1)
+        shard_filter = f"""
+           AND (((hashtext(t.location_key) % {shards}) + {shards}) % {shards}) = {shard}
+        """
 
     def norm_text_sql(expr: str) -> str:
         return f"regexp_replace(LOWER(COALESCE({expr}, '')), '[^a-z0-9]', '', 'g')"
@@ -5005,6 +5015,7 @@ def _facility_anchor_npi_candidate_sql(
            AND t.entity_type = 'facility_anchor'
            AND t.npi IS NULL
            AND t.inferred_npi IS NULL
+           {shard_filter}
     ),
     candidate_sources AS (
         {candidate_sources_sql}
@@ -5210,40 +5221,54 @@ def _support_stage_statements(
             "HLTHPRT_FACILITY_ANCHOR_NPI_CANDIDATE_INCLUDE_OTHER_IDENTIFIER",
             False,
         )
-        statements.append(
-            _SupportStageStatement(
-                "facility anchor npi candidate",
-                _facility_anchor_npi_candidate_sql(
-                    db_schema,
-                    stage_tables[FacilityAnchorNPICandidate],
-                    stage_table,
-                    source_run_id=source_run_id,
-                    include_hospital_enrollment=available.get("provider_enrollment_hospital", False),
-                    include_fqhc_enrollment=available.get("provider_enrollment_fqhc", False),
-                    include_npi_address_key=(
-                        available.get("npi", False)
-                        and available.get("npi_address", False)
-                        and available.get("npi_address.address_key", available.get("npi_address", False))
-                        and available.get("npi_taxonomy", False)
-                    ),
-                    include_npi_registry=(
-                        include_nppes_candidates
-                        and available.get("npi", False)
-                        and available.get("npi_address", False)
-                    ),
-                    include_npi_taxonomy=available.get("npi_taxonomy", False),
-                    include_nucc_taxonomy=available.get("nucc_taxonomy", False),
-                    include_npi_other_identifier=(
-                        include_other_identifier_candidates
-                        and available.get("npi_other_identifier", False)
-                    ),
-                    include_provider_additional_npi=available.get(
-                        "provider_enrollment_ffs_additional_npi", False
-                    ),
-                    include_facility_anchor=available.get("facility_anchor", False),
-                ),
-            ),
+        facility_candidate_shards = _env_int(
+            "HLTHPRT_ENTITY_ADDRESS_UNIFIED_FACILITY_CANDIDATE_SHARDS",
+            DEFAULT_FACILITY_CANDIDATE_SHARDS,
+            minimum=1,
         )
+        facility_candidate_kwargs = dict(
+            source_run_id=source_run_id,
+            include_hospital_enrollment=available.get("provider_enrollment_hospital", False),
+            include_fqhc_enrollment=available.get("provider_enrollment_fqhc", False),
+            include_npi_address_key=(
+                available.get("npi", False)
+                and available.get("npi_address", False)
+                and available.get("npi_address.address_key", available.get("npi_address", False))
+                and available.get("npi_taxonomy", False)
+            ),
+            include_npi_registry=(
+                include_nppes_candidates
+                and available.get("npi", False)
+                and available.get("npi_address", False)
+            ),
+            include_npi_taxonomy=available.get("npi_taxonomy", False),
+            include_nucc_taxonomy=available.get("nucc_taxonomy", False),
+            include_npi_other_identifier=(
+                include_other_identifier_candidates
+                and available.get("npi_other_identifier", False)
+            ),
+            include_provider_additional_npi=available.get(
+                "provider_enrollment_ffs_additional_npi", False
+            ),
+            include_facility_anchor=available.get("facility_anchor", False),
+        )
+        for shard in range(facility_candidate_shards):
+            label = "facility anchor npi candidate"
+            if facility_candidate_shards > 1:
+                label = f"{label} shard {shard + 1}/{facility_candidate_shards}"
+            statements.append(
+                _SupportStageStatement(
+                    label,
+                    _facility_anchor_npi_candidate_sql(
+                        db_schema,
+                        stage_tables[FacilityAnchorNPICandidate],
+                        stage_table,
+                        candidate_shards=facility_candidate_shards,
+                        candidate_shard=shard,
+                        **facility_candidate_kwargs,
+                    ),
+                )
+            )
     if build_network_bridge:
         bridge_specs.insert(
             1,
