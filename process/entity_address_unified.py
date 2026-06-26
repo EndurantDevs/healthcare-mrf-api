@@ -53,6 +53,7 @@ DEFAULT_SUPPORT_HEAP_LOAD = True
 DEFAULT_BUILD_NETWORK_BRIDGE = False
 DEFAULT_COMPACT_SOURCE_RECORD_IDS = True
 DEFAULT_COMPACT_SOURCE_RECORD_IDS_BY_REWRITE = False
+DEFAULT_TRUST_SOURCE_ADDRESS_KEY = True
 DEFAULT_SQL_WORK_MEM = "256MB"
 DEFAULT_SQL_MAINTENANCE_WORK_MEM = "2GB"
 DEFAULT_SQL_TEMP_FILE_LIMIT = "128GB"
@@ -2323,20 +2324,7 @@ def _enrich_raw_stage_sql(
     checksum_max: int | None = None,
 ) -> str:
     archive_join = ""
-    archive_fields = (
-        "a.address_key AS archive_address_key, "
-        "a.premise_key, "
-        "'v' || COALESCE(a.identity_version, 2)::text AS archive_identity_version, "
-        "COALESCE(a.precision, 'unknown') AS address_precision, "
-        "a.zip5 AS archive_zip5, "
-        "NULLIF(upper(left(a.state_code, 2)), '') AS archive_state_code, "
-        "a.city_norm AS archive_city_norm, "
-        "NULL::varchar AS archive_county_fips, "
-        "a.formatted_address::varchar AS archive_formatted_address, "
-        "a.lat::numeric AS archive_lat, "
-        "a.long::numeric AS archive_long, "
-        "a.place_id::varchar AS archive_place_id"
-    )
+    archive_fields = ""
     if archive_available:
         computed_address_key = _address_key_expr(
             db_schema,
@@ -2344,8 +2332,56 @@ def _enrich_raw_stage_sql(
             address_source="r.address_source",
             table_alias="r",
         )
-        archive_join = (
-            f"""
+        trust_source_key = _env_bool(
+            "HLTHPRT_ENTITY_ADDRESS_UNIFIED_TRUST_SOURCE_ADDRESS_KEY",
+            DEFAULT_TRUST_SOURCE_ADDRESS_KEY,
+        )
+        if trust_source_key:
+            archive_fields = (
+                "COALESCE(a_direct.address_key, a_fallback.address_key) AS archive_address_key, "
+                "COALESCE(a_direct.premise_key, a_fallback.premise_key) AS premise_key, "
+                "'v' || COALESCE(COALESCE(a_direct.identity_version, a_fallback.identity_version), 2)::text AS archive_identity_version, "
+                "COALESCE(a_direct.precision, a_fallback.precision, 'unknown') AS address_precision, "
+                "COALESCE(a_direct.zip5, a_fallback.zip5) AS archive_zip5, "
+                "NULLIF(upper(left(COALESCE(a_direct.state_code, a_fallback.state_code), 2)), '') AS archive_state_code, "
+                "COALESCE(a_direct.city_norm, a_fallback.city_norm) AS archive_city_norm, "
+                "NULL::varchar AS archive_county_fips, "
+                "COALESCE(a_direct.formatted_address, a_fallback.formatted_address)::varchar AS archive_formatted_address, "
+                "COALESCE(a_direct.lat, a_fallback.lat)::numeric AS archive_lat, "
+                "COALESCE(a_direct.long, a_fallback.long)::numeric AS archive_long, "
+                "COALESCE(a_direct.place_id, a_fallback.place_id)::varchar AS archive_place_id"
+            )
+            archive_join = (
+                f"""
+          LEFT JOIN {db_schema}.address_archive_v2 a_direct
+            ON a_direct.address_key = r.address_key
+           AND a_direct.merged_into IS NULL
+          LEFT JOIN LATERAL (
+              SELECT aa.*
+                FROM {db_schema}.address_archive_v2 aa
+               WHERE a_direct.address_key IS NULL
+                 AND aa.address_key = {computed_address_key}
+                 AND aa.merged_into IS NULL
+               LIMIT 1
+          ) a_fallback ON TRUE"""
+            )
+        else:
+            archive_fields = (
+                "a.address_key AS archive_address_key, "
+                "a.premise_key, "
+                "'v' || COALESCE(a.identity_version, 2)::text AS archive_identity_version, "
+                "COALESCE(a.precision, 'unknown') AS address_precision, "
+                "a.zip5 AS archive_zip5, "
+                "NULLIF(upper(left(a.state_code, 2)), '') AS archive_state_code, "
+                "a.city_norm AS archive_city_norm, "
+                "NULL::varchar AS archive_county_fips, "
+                "a.formatted_address::varchar AS archive_formatted_address, "
+                "a.lat::numeric AS archive_lat, "
+                "a.long::numeric AS archive_long, "
+                "a.place_id::varchar AS archive_place_id"
+            )
+            archive_join = (
+                f"""
           LEFT JOIN LATERAL (
               SELECT aa.*
                 FROM (VALUES ({computed_address_key}, 0), (r.address_key, 1)) AS candidate(address_key, priority)
@@ -2356,7 +2392,7 @@ def _enrich_raw_stage_sql(
             ORDER BY candidate.priority
                LIMIT 1
           ) a ON TRUE"""
-        )
+            )
     else:
         archive_fields = (
             "NULL::uuid AS archive_address_key, "

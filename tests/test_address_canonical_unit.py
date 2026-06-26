@@ -1447,10 +1447,15 @@ def test_entity_address_unified_sql_carries_address_key(monkeypatch):
     assert "location_key varchar(64)" in raw_sql
     assert "archive_identity_version varchar(16)" in raw_sql
     assert "ptg_plan_array varchar[]" in raw_sql
+    assert "LEFT JOIN mrf.address_archive_v2 a_direct" in enrich_sql
     assert "LEFT JOIN LATERAL" in enrich_sql
+    assert "a_direct.address_key IS NULL" in enrich_sql
     assert "mrf.addr_key_v1(r.first_line, r.second_line, r.city_name, r.state_name, r.postal_code, r.country_code)" in enrich_sql
-    assert "JOIN mrf.address_archive_v2 aa" in enrich_sql
-    assert "ORDER BY candidate.priority" in enrich_sql
+    assert "FROM mrf.address_archive_v2 aa" in enrich_sql
+    assert "ORDER BY candidate.priority" not in enrich_sql
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_TRUST_SOURCE_ADDRESS_KEY", "0")
+    legacy_enrich_sql = entity_address_unified._enrich_raw_stage_sql("mrf", "entity_address_unified_raw")
+    assert "ORDER BY candidate.priority" in legacy_enrich_sql
     assert "SET address_key = k.address_key" in enrich_sql
     assert "premise_key = k.premise_key" in enrich_sql
     assert "formatted_address = COALESCE(k.archive_formatted_address, r.formatted_address)" in enrich_sql
