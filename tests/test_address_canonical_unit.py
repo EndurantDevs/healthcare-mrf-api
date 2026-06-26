@@ -1990,17 +1990,25 @@ def test_entity_address_unified_evidence_stage_updates_by_location_key():
 
     assert f"CREATE TABLE mrf.{evidence_table}" in prepare_sql
     assert "location_key varchar(64) PRIMARY KEY" in prepare_sql
+    assert "address_key uuid" in prepare_sql
     assert "street_key varchar" in prepare_sql
     assert "source_record_ids varchar[] NOT NULL" in prepare_sql
     assert f"INSERT INTO mrf.{evidence_table}" in load_sql
     assert "FROM mrf.entity_address_unified_stage" in load_sql
+    assert "COALESCE(address_key::text, '')" in load_sql
+    assert "t.address_key::uuid AS address_key" in load_sql
+    assert "CASE WHEN t.address_key IS NULL THEN regexp_replace(" in load_sql
+    assert "COALESCE(NULLIF(t.city_norm, '')" in load_sql
     assert "% 32" in load_sql
     assert "keyed AS MATERIALIZED" in insert_sql
     assert "location_key," in insert_sql
+    assert "address_key," in insert_sql
     assert f"FROM mrf.{evidence_table}" in insert_sql
     assert "= 7" in insert_sql
     assert "ARRAY_AGG(DISTINCT src.src ORDER BY src.src)" in insert_sql
     assert "ARRAY_AGG(DISTINCT rid.rid ORDER BY rid.rid)" in insert_sql
+    assert "re.address_key IS NOT DISTINCT FROM se.address_key" in insert_sql
+    assert "se.address_key IS NOT DISTINCT FROM k.address_key" in insert_sql
     assert "JOIN mrf.entity_address_unified_stage AS t" not in insert_sql
     assert "UPDATE mrf." in insert_sql
     assert "CREATE INDEX IF NOT EXISTS" in index_sql

@@ -3427,6 +3427,7 @@ def _evidence_group_hash_expr(evidence_shards: int) -> str:
             '|',
             COALESCE(entity_type, ''),
             COALESCE(entity_id, ''),
+            COALESCE(address_key::text, ''),
             COALESCE(street_key, ''),
             COALESCE(city_key, ''),
             COALESCE(state_key, ''),
@@ -3449,6 +3450,7 @@ def _prepare_multi_source_evidence_table_sql(
         evidence_shard int NOT NULL,
         entity_type varchar(64) NOT NULL,
         entity_id varchar(128) NOT NULL,
+        address_key uuid,
         street_key varchar,
         city_key varchar,
         state_key varchar,
@@ -3485,11 +3487,18 @@ def _load_multi_source_evidence_base_sql(
             t.location_key,
             t.entity_type,
             t.entity_id,
-            {_street_soft_norm_expr("t.first_line")}::varchar AS street_key,
-            {_alnum_norm_expr("t.city_name")}::varchar AS city_key,
-            {_state_norm_expr("t.state_name")}::varchar AS state_key,
-            {_zip5_norm_expr("t.postal_code")}::varchar AS zip_key,
-            {_state_norm_expr("t.country_code")}::varchar AS country_key,
+            t.address_key::uuid AS address_key,
+            CASE WHEN t.address_key IS NULL THEN {_street_soft_norm_expr("t.first_line")} END::varchar AS street_key,
+            CASE WHEN t.address_key IS NULL
+                THEN COALESCE(NULLIF(t.city_norm, ''), {_alnum_norm_expr("t.city_name")})
+            END::varchar AS city_key,
+            CASE WHEN t.address_key IS NULL
+                THEN COALESCE(NULLIF(t.state_code, ''), {_state_norm_expr("t.state_name")})
+            END::varchar AS state_key,
+            CASE WHEN t.address_key IS NULL
+                THEN COALESCE(NULLIF(t.zip5, ''), {_zip5_norm_expr("t.postal_code")})
+            END::varchar AS zip_key,
+            CASE WHEN t.address_key IS NULL THEN {_state_norm_expr("t.country_code")} END::varchar AS country_key,
             COALESCE(t.address_sources, ARRAY[]::varchar[])::varchar[] AS address_sources,
             COALESCE(t.source_record_ids, ARRAY[]::varchar[])::varchar[] AS source_record_ids
           FROM {db_schema}.{stage_table} AS t
@@ -3501,6 +3510,7 @@ def _load_multi_source_evidence_base_sql(
         evidence_shard,
         entity_type,
         entity_id,
+        address_key,
         street_key,
         city_key,
         state_key,
@@ -3514,6 +3524,7 @@ def _load_multi_source_evidence_base_sql(
         {group_hash_expr} AS evidence_shard,
         entity_type,
         entity_id,
+        address_key,
         street_key,
         city_key,
         state_key,
@@ -3540,6 +3551,7 @@ def _insert_multi_source_evidence_shard_sql(
             location_key,
             entity_type,
             entity_id,
+            address_key,
             street_key,
             city_key,
             state_key,
@@ -3554,6 +3566,7 @@ def _insert_multi_source_evidence_shard_sql(
         SELECT
             k.entity_type,
             k.entity_id,
+            k.address_key,
             k.street_key,
             k.city_key,
             k.state_key,
@@ -3565,6 +3578,7 @@ def _insert_multi_source_evidence_shard_sql(
          GROUP BY
             k.entity_type,
             k.entity_id,
+            k.address_key,
             k.street_key,
             k.city_key,
             k.state_key,
@@ -3575,6 +3589,7 @@ def _insert_multi_source_evidence_shard_sql(
         SELECT
             k.entity_type,
             k.entity_id,
+            k.address_key,
             k.street_key,
             k.city_key,
             k.state_key,
@@ -3586,6 +3601,7 @@ def _insert_multi_source_evidence_shard_sql(
          GROUP BY
             k.entity_type,
             k.entity_id,
+            k.address_key,
             k.street_key,
             k.city_key,
             k.state_key,
@@ -3599,6 +3615,7 @@ def _insert_multi_source_evidence_shard_sql(
       LEFT JOIN record_evidence AS re
         ON re.entity_type = se.entity_type
        AND re.entity_id = se.entity_id
+       AND re.address_key IS NOT DISTINCT FROM se.address_key
        AND re.street_key IS NOT DISTINCT FROM se.street_key
        AND re.city_key IS NOT DISTINCT FROM se.city_key
        AND re.state_key IS NOT DISTINCT FROM se.state_key
@@ -3607,6 +3624,7 @@ def _insert_multi_source_evidence_shard_sql(
       JOIN keyed AS k
         ON se.entity_type = k.entity_type
        AND se.entity_id = k.entity_id
+       AND se.address_key IS NOT DISTINCT FROM k.address_key
        AND se.street_key IS NOT DISTINCT FROM k.street_key
        AND se.city_key IS NOT DISTINCT FROM k.city_key
        AND se.state_key IS NOT DISTINCT FROM k.state_key
