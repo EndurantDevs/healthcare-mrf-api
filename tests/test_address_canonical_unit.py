@@ -1904,9 +1904,12 @@ def test_entity_address_unified_support_primary_key_sql_restores_constraint():
     )
 
     assert "IF NOT EXISTS" in sql
+    assert "target_table_oid" in sql
+    assert "resolved_constraint_name" in sql
     assert "orphan_index" in sql
     assert "DROP INDEX IF EXISTS %I.%I" in sql
     assert "ADD CONSTRAINT %I" in sql
+    assert "MD5(target_table_oid::text)" in sql
     assert "entity_address_procedure_bridge_20260614_pkey" in sql
     assert "PRIMARY KEY (location_key, npi, code_system, code)" in sql
 

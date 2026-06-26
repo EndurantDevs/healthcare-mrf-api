@@ -648,33 +648,59 @@ def _ensure_stage_primary_key_sql(
     return f"""
     DO $$
     DECLARE
+        target_table_oid oid;
+        conflicting_relation text;
+        conflicting_table_oid oid;
+        conflicting_constraint text;
         orphan_index text;
+        resolved_constraint_name text := {_sql_literal(constraint_name)};
     BEGIN
+        SELECT t.oid
+          INTO target_table_oid
+          FROM pg_class t
+          JOIN pg_namespace n
+            ON n.oid = t.relnamespace
+         WHERE n.nspname = {_sql_literal(db_schema)}
+           AND t.relname = {_sql_literal(table_name)}
+         LIMIT 1;
+
         IF NOT EXISTS (
             SELECT 1
               FROM pg_constraint c
-              JOIN pg_class t
-                ON t.oid = c.conrelid
-              JOIN pg_namespace n
-                ON n.oid = t.relnamespace
-             WHERE n.nspname = {_sql_literal(db_schema)}
-               AND t.relname = {_sql_literal(table_name)}
+             WHERE c.conrelid = target_table_oid
                AND c.contype = 'p'
         ) THEN
-            SELECT i.relname
-              INTO orphan_index
+            SELECT i.relname, ix.indrelid, c.conname
+              INTO conflicting_relation, conflicting_table_oid, conflicting_constraint
               FROM pg_class i
               JOIN pg_namespace n
                 ON n.oid = i.relnamespace
+              LEFT JOIN pg_index ix
+                ON ix.indexrelid = i.oid
+              LEFT JOIN pg_constraint c
+                ON c.conindid = i.oid
              WHERE n.nspname = {_sql_literal(db_schema)}
                AND i.relname = {_sql_literal(constraint_name)}
-               AND i.relkind IN ('i', 'I')
-               AND NOT EXISTS (
-                    SELECT 1
-                      FROM pg_constraint c
-                     WHERE c.conindid = i.oid
-               )
              LIMIT 1;
+
+            IF conflicting_relation IS NOT NULL
+               AND conflicting_table_oid = target_table_oid
+               AND conflicting_constraint IS NULL THEN
+                orphan_index := conflicting_relation;
+            ELSIF conflicting_relation IS NOT NULL
+                  AND conflicting_table_oid = target_table_oid
+                  AND conflicting_constraint IS NOT NULL THEN
+                EXECUTE format(
+                    'ALTER TABLE %I.%I DROP CONSTRAINT %I',
+                    {_sql_literal(db_schema)},
+                    {_sql_literal(table_name)},
+                    conflicting_constraint
+                );
+            ELSIF conflicting_relation IS NOT NULL THEN
+                resolved_constraint_name := LEFT({_sql_literal(constraint_name)}, 54)
+                    || '_'
+                    || SUBSTRING(MD5(target_table_oid::text), 1, 8);
+            END IF;
 
             IF orphan_index IS NOT NULL THEN
                 EXECUTE format(
@@ -688,7 +714,7 @@ def _ensure_stage_primary_key_sql(
                 'ALTER TABLE %I.%I ADD CONSTRAINT %I PRIMARY KEY ({column_sql})',
                 {_sql_literal(db_schema)},
                 {_sql_literal(table_name)},
-                {_sql_literal(constraint_name)}
+                resolved_constraint_name
             );
         END IF;
     END $$;
