@@ -1978,11 +1978,35 @@ def test_entity_address_unified_facility_candidate_sql_can_shard_targets():
     assert "t.entity_type = 'facility_anchor'" in sql
 
 
+def test_entity_address_unified_bridge_sql_can_shard_by_location_key():
+    procedure_sql = entity_address_unified._procedure_bridge_sql(  # pylint: disable=protected-access
+        "mrf",
+        "entity_address_procedure_bridge_20260614",
+        "entity_address_unified_20260614",
+        bridge_shards=4,
+        bridge_shard=3,
+    )
+    medication_sql = entity_address_unified._medication_bridge_sql(  # pylint: disable=protected-access
+        "mrf",
+        "entity_address_medication_bridge_20260614",
+        "entity_address_unified_20260614",
+        bridge_shards=2,
+        bridge_shard=1,
+    )
+
+    assert "hashtext(t.location_key) % 4" in procedure_sql
+    assert "= 3" in procedure_sql
+    assert "hashtext(t.location_key) % 2" in medication_sql
+    assert "= 1" in medication_sql
+
+
 def test_entity_address_unified_support_statements_shard_facility_candidates(monkeypatch):
     def stage(name):
         return type(f"Stage_{name}", (), {"__tablename__": name})
 
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_FACILITY_CANDIDATE_SHARDS", "3")
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_PROCEDURE_BRIDGE_SHARDS", "1")
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_MEDICATION_BRIDGE_SHARDS", "1")
 
     statements = entity_address_unified._support_stage_statements(  # pylint: disable=protected-access
         "mrf",
@@ -2027,6 +2051,58 @@ def test_entity_address_unified_support_statements_shard_facility_candidates(mon
     assert "= 0" in facility_statements[0].statement
     assert "= 1" in facility_statements[1].statement
     assert "= 2" in facility_statements[2].statement
+
+
+def test_entity_address_unified_support_statements_shard_code_bridges(monkeypatch):
+    def stage(name):
+        return type(f"Stage_{name}", (), {"__tablename__": name})
+
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_PROCEDURE_BRIDGE_SHARDS", "3")
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_MEDICATION_BRIDGE_SHARDS", "2")
+
+    statements = entity_address_unified._support_stage_statements(  # pylint: disable=protected-access
+        "mrf",
+        "entity_address_unified_20260614",
+        {
+            entity_address_unified.EntityAddressEvidence: stage("entity_address_evidence_20260614"),
+            entity_address_unified.EntityAddressPlanBridge: stage(
+                "entity_address_plan_bridge_20260614"
+            ),
+            entity_address_unified.EntityAddressPTGBridge: stage(
+                "entity_address_ptg_bridge_20260614"
+            ),
+            entity_address_unified.EntityAddressProcedureBridge: stage(
+                "entity_address_procedure_bridge_20260614"
+            ),
+            entity_address_unified.EntityAddressMedicationBridge: stage(
+                "entity_address_medication_bridge_20260614"
+            ),
+        },
+        source_run_id="run_1",
+        node_id=None,
+        build_network_bridge=False,
+        available={},
+    )
+
+    procedure_statements = [item for item in statements if item.label.startswith("procedure bridge")]
+    medication_statements = [item for item in statements if item.label.startswith("medication bridge")]
+
+    assert [item.label for item in procedure_statements] == [
+        "procedure bridge shard 1/3",
+        "procedure bridge shard 2/3",
+        "procedure bridge shard 3/3",
+    ]
+    assert [item.label for item in medication_statements] == [
+        "medication bridge shard 1/2",
+        "medication bridge shard 2/2",
+    ]
+    assert "hashtext(t.location_key) % 3" in procedure_statements[0].statement
+    assert "= 0" in procedure_statements[0].statement
+    assert "= 1" in procedure_statements[1].statement
+    assert "= 2" in procedure_statements[2].statement
+    assert "hashtext(t.location_key) % 2" in medication_statements[0].statement
+    assert "= 0" in medication_statements[0].statement
+    assert "= 1" in medication_statements[1].statement
 
 
 def test_entity_address_unified_evidence_stage_updates_by_location_key():

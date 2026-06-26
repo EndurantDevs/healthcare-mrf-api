@@ -50,6 +50,8 @@ DEFAULT_EVIDENCE_CONCURRENCY = 4
 DEFAULT_SUPPORT_STAGE_CONCURRENCY = 4
 DEFAULT_SUPPORT_INDEX_CONCURRENCY = 2
 DEFAULT_FACILITY_CANDIDATE_SHARDS = 4
+DEFAULT_PROCEDURE_BRIDGE_SHARDS = 2
+DEFAULT_MEDICATION_BRIDGE_SHARDS = 2
 DEFAULT_SUPPORT_CODE_LOCATION_INDEXES = False
 DEFAULT_SUPPORT_HEAP_LOAD = True
 DEFAULT_BUILD_NETWORK_BRIDGE = False
@@ -244,6 +246,21 @@ def _sql_literal(value: str | None) -> str:
     if value is None:
         return "NULL"
     return "'" + str(value).replace("'", "''") + "'"
+
+
+def _location_key_shard_filter_sql(
+    expression: str,
+    *,
+    shards: int = 1,
+    shard: int | None = None,
+) -> str:
+    shard_count = max(int(shards or 1), 1)
+    if shard_count <= 1:
+        return ""
+    shard_index = 0 if shard is None else int(shard)
+    return f"""
+       AND (((hashtext({expression}) % {shard_count}) + {shard_count}) % {shard_count}) = {shard_index}
+    """
 
 
 def _entity_address_sql_settings() -> list[tuple[str, str]]:
@@ -4200,8 +4217,15 @@ def _procedure_bridge_sql(
     stage_table: str,
     *,
     affected_group_table: str | None = None,
+    bridge_shards: int = 1,
+    bridge_shard: int | None = None,
 ) -> str:
     affected_filter = _affected_stage_row_filter_sql(db_schema, affected_group_table)
+    shard_filter = _location_key_shard_filter_sql(
+        "t.location_key",
+        shards=bridge_shards,
+        shard=bridge_shard,
+    )
     return f"""
     INSERT INTO {db_schema}.{procedure_stage_table} (location_key, npi, code_system, code)
     SELECT DISTINCT
@@ -4214,6 +4238,7 @@ def _procedure_bridge_sql(
      WHERE t.location_key IS NOT NULL
        AND t.npi IS NOT NULL
        {affected_filter}
+       {shard_filter}
        AND procedure_code.value <> 0;
     """
 
@@ -4224,8 +4249,15 @@ def _medication_bridge_sql(
     stage_table: str,
     *,
     affected_group_table: str | None = None,
+    bridge_shards: int = 1,
+    bridge_shard: int | None = None,
 ) -> str:
     affected_filter = _affected_stage_row_filter_sql(db_schema, affected_group_table)
+    shard_filter = _location_key_shard_filter_sql(
+        "t.location_key",
+        shards=bridge_shards,
+        shard=bridge_shard,
+    )
     return f"""
     INSERT INTO {db_schema}.{medication_stage_table} (location_key, npi, code_system, code)
     SELECT DISTINCT
@@ -4238,6 +4270,7 @@ def _medication_bridge_sql(
      WHERE t.location_key IS NOT NULL
        AND t.npi IS NOT NULL
        {affected_filter}
+       {shard_filter}
        AND medication_code.value <> 0;
     """
 
@@ -4261,13 +4294,11 @@ def _facility_anchor_npi_candidate_sql(
     candidate_shard: int | None = None,
 ) -> str:
     candidate_limit = _env_int("HLTHPRT_FACILITY_ANCHOR_NPI_CANDIDATE_LIMIT", 25, minimum=1)
-    shard_filter = ""
-    if candidate_shards > 1:
-        shard = 0 if candidate_shard is None else int(candidate_shard)
-        shards = max(int(candidate_shards), 1)
-        shard_filter = f"""
-           AND (((hashtext(t.location_key) % {shards}) + {shards}) % {shards}) = {shard}
-        """
+    shard_filter = _location_key_shard_filter_sql(
+        "t.location_key",
+        shards=candidate_shards,
+        shard=candidate_shard,
+    )
 
     def norm_text_sql(expr: str) -> str:
         return f"regexp_replace(LOWER(COALESCE({expr}, '')), '[^a-z0-9]', '', 'g')"
@@ -5216,24 +5247,32 @@ def _support_stage_statements(
             "plan bridge",
             ("location_key", "entity_type", "entity_id", "plan_id", "market_type"),
             _plan_bridge_sql,
+            None,
+            1,
         ),
         (
             EntityAddressPTGBridge,
             "ptg bridge",
             ("location_key", "entity_type", "entity_id", "source_key", "snapshot_id", "ptg_plan_id"),
             _ptg_bridge_sql,
+            None,
+            1,
         ),
         (
             EntityAddressProcedureBridge,
             "procedure bridge",
             ("location_key", "npi", "code_system", "code"),
             _procedure_bridge_sql,
+            "HLTHPRT_ENTITY_ADDRESS_UNIFIED_PROCEDURE_BRIDGE_SHARDS",
+            DEFAULT_PROCEDURE_BRIDGE_SHARDS,
         ),
         (
             EntityAddressMedicationBridge,
             "medication bridge",
             ("location_key", "npi", "code_system", "code"),
             _medication_bridge_sql,
+            "HLTHPRT_ENTITY_ADDRESS_UNIFIED_MEDICATION_BRIDGE_SHARDS",
+            DEFAULT_MEDICATION_BRIDGE_SHARDS,
         ),
     ]
     if (
@@ -5306,9 +5345,11 @@ def _support_stage_statements(
                 "network bridge",
                 ("location_key", "entity_type", "entity_id", "network_id"),
                 _network_bridge_sql,
+                None,
+                1,
             ),
         )
-    for model, label, columns, builder in bridge_specs:
+    for model, label, columns, builder, shard_env, default_shards in bridge_specs:
         if partial_bridge_reuse and copy_unaffected_bridges:
             statements.append(
                 _SupportStageStatement(
@@ -5322,17 +5363,31 @@ def _support_stage_statements(
                     ),
                 )
             )
-        statements.append(
-            _SupportStageStatement(
-                label,
-                builder(
-                    db_schema,
-                    stage_tables[model],
-                    stage_table,
-                    affected_group_table=affected_group_table if partial_bridge_reuse else None,
-                ),
-            )
+        bridge_shards = (
+            _env_int(shard_env, default_shards, minimum=1)
+            if shard_env
+            else 1
         )
+        for shard in range(bridge_shards):
+            statement_label = label
+            if bridge_shards > 1:
+                statement_label = f"{label} shard {shard + 1}/{bridge_shards}"
+            kwargs = {
+                "affected_group_table": affected_group_table if partial_bridge_reuse else None,
+            }
+            if shard_env:
+                kwargs.update({"bridge_shards": bridge_shards, "bridge_shard": shard})
+            statements.append(
+                _SupportStageStatement(
+                    statement_label,
+                    builder(
+                        db_schema,
+                        stage_tables[model],
+                        stage_table,
+                        **kwargs,
+                    ),
+                )
+            )
     return statements
 
 
