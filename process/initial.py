@@ -169,6 +169,47 @@ def _mrf_state_key(run_id: str, name: str) -> str:
     return f"mrf:run:{run_id}:{name}"
 
 
+def _decode_redis_text(value) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def _is_mrf_finalize_job_id(job_id: str, import_date: str) -> bool:
+    base = f"shutdown_mrf_{import_date}"
+    return job_id == base or job_id.startswith(f"{base}_wait_") or job_id.startswith(f"{base}_lock_wait_")
+
+
+async def _cleanup_mrf_finalize_jobs(redis, import_date: str) -> int:
+    """Remove obsolete MRF finish jobs for an import date after finalization."""
+    if not redis or not import_date:
+        return 0
+    base_job_id = f"shutdown_mrf_{import_date}"
+    job_ids = {base_job_id}
+    try:
+        queued = await redis.zrange(MRF_FINISH_QUEUE_NAME, 0, -1)
+    except Exception:  # pragma: no cover - cleanup must not fail publish
+        logger.debug("Unable to inspect MRF finish queue for cleanup", exc_info=True)
+        queued = []
+    for raw_job_id in queued or []:
+        job_id = _decode_redis_text(raw_job_id)
+        if _is_mrf_finalize_job_id(job_id, import_date):
+            job_ids.add(job_id)
+
+    removed = 0
+    for job_id in sorted(job_ids):
+        try:
+            removed += int(await redis.zrem(MRF_FINISH_QUEUE_NAME, job_id) or 0)
+            await redis.delete(
+                f"arq:job:{job_id}",
+                f"arq:result:{job_id}",
+                f"arq:retry:{job_id}",
+            )
+        except Exception:  # pragma: no cover - best-effort cleanup only
+            logger.debug("Unable to clean obsolete MRF finalize job %s", job_id, exc_info=True)
+    return removed
+
+
 def _mrf_job_scope(ctx: dict) -> str:
     return _mrf_run_state_id(ctx) or datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S")
 
@@ -2798,6 +2839,7 @@ async def shutdown(ctx, task):
         finalized_key = _mrf_state_key(state_run_id, "finalized")
         if await redis.get(finalized_key):
             logger.info("MRF run %s already finalized; skipping duplicate shutdown", state_run_id)
+            await _cleanup_mrf_finalize_jobs(redis, import_date)
             return 1
 
         total_work, done_work = await _get_mrf_run_progress(redis, state_run_id)
@@ -3031,6 +3073,8 @@ async def shutdown(ctx, task):
         },
         progress={"unit": "phase", "total": 4, "done": 4, "pct": 100, "message": "succeeded", "phase": "mrf import published"},
     )
+    if redis:
+        await _cleanup_mrf_finalize_jobs(redis, import_date)
 
 
 async def main(test_mode: bool = False):

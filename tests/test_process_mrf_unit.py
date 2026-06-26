@@ -478,6 +478,75 @@ async def test_mrf_shutdown_requeues_while_parser_jobs_run(monkeypatch):
     mark_run.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_mrf_shutdown_cleans_stale_finalize_jobs_when_already_finalized(monkeypatch):
+    class FakeRedis:
+        def __init__(self):
+            self.zrem_calls = []
+            self.delete_calls = []
+
+        async def get(self, key):
+            if key.endswith(":finalized"):
+                return b"1"
+            return None
+
+        async def zrange(self, *args):
+            assert args == (process_initial.MRF_FINISH_QUEUE_NAME, 0, -1)
+            return [
+                b"shutdown_mrf_20260626",
+                b"shutdown_mrf_20260626_wait_12",
+                b"shutdown_mrf_20260626_lock_wait_13",
+                b"shutdown_mrf_20260625_wait_4",
+            ]
+
+        async def zrem(self, *args):
+            self.zrem_calls.append(args)
+            return 1
+
+        async def delete(self, *args):
+            self.delete_calls.append(args)
+            return len(args)
+
+    mark_run = AsyncMock()
+    monkeypatch.setattr(process_initial, "mark_control_run", mark_run)
+
+    ctx = {
+        "redis": FakeRedis(),
+        "context": {
+            "import_date": "20260626",
+            "control_run_id": "run_mrf_done",
+            "test_mode": True,
+        },
+    }
+
+    result = await process_initial.shutdown(ctx, {"context": ctx["context"], "test_mode": True})
+
+    assert result == 1
+    assert set(ctx["redis"].zrem_calls) == {
+        (process_initial.MRF_FINISH_QUEUE_NAME, "shutdown_mrf_20260626"),
+        (process_initial.MRF_FINISH_QUEUE_NAME, "shutdown_mrf_20260626_wait_12"),
+        (process_initial.MRF_FINISH_QUEUE_NAME, "shutdown_mrf_20260626_lock_wait_13"),
+    }
+    assert ctx["redis"].delete_calls == [
+        (
+            "arq:job:shutdown_mrf_20260626",
+            "arq:result:shutdown_mrf_20260626",
+            "arq:retry:shutdown_mrf_20260626",
+        ),
+        (
+            "arq:job:shutdown_mrf_20260626_lock_wait_13",
+            "arq:result:shutdown_mrf_20260626_lock_wait_13",
+            "arq:retry:shutdown_mrf_20260626_lock_wait_13",
+        ),
+        (
+            "arq:job:shutdown_mrf_20260626_wait_12",
+            "arq:result:shutdown_mrf_20260626_wait_12",
+            "arq:retry:shutdown_mrf_20260626_wait_12",
+        ),
+    ]
+    mark_run.assert_not_awaited()
+
+
 def test_transparency_zip_path_is_unique_per_source(tmp_path):
     first = process_initial._transparency_zip_path(str(tmp_path), 0, {"year": "2026"})
     second = process_initial._transparency_zip_path(str(tmp_path), 1, {"year": "2025"})
