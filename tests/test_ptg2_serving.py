@@ -981,8 +981,13 @@ def test_musculoskeletal_surgery_cpt_infers_orthopedic_taxonomy():
         rule = ptg2_serving._inferred_provider_taxonomy_rule({"code": code, "code_system": "cpt"})
         assert rule is not None, code
         assert "207X00000X" in rule.taxonomy_codes, code
+    omitted_system_rule = ptg2_serving._inferred_provider_taxonomy_rule({"code": "29888"})
+    assert omitted_system_rule is not None
+    assert "207X00000X" in omitted_system_rule.taxonomy_codes
     # office-visit / non-musculoskeletal codes must NOT infer orthopedic surgery
     assert ptg2_serving._inferred_provider_taxonomy_rule({"code": "99213", "code_system": "cpt"}) is None
+    # Short numeric revenue codes are not CPT by default.
+    assert ptg2_serving._inferred_provider_taxonomy_rule({"code": "450"}) is None
 
 
 @pytest.mark.asyncio
@@ -1293,7 +1298,7 @@ async def test_compact_serving_geo_search_allows_missing_specialty(monkeypatch):
         "mrf.ptg2_serving_rate_compact_token",
         _compact_tables(),
         "snap-token",
-        {"plan_id": "010854205", "code": "70551", "zip5": "60601"},
+        {"plan_id": "010854205", "code": "99213", "zip5": "60601"},
         FakePagination(),
         ["snapshot_id = :snapshot_id", "plan_id = :plan_id"],
         {"snapshot_id": "snap-token", "plan_id": "010854205", "limit": 25, "offset": 0},
@@ -1871,6 +1876,10 @@ async def test_compact_serving_include_providers_with_geo_uses_npi_scoped_locati
                         },
                         "taxonomy_codes": ["207Q00000X"],
                         "specialties": ["Family Medicine Physician"],
+                        "classifications": ["Family Medicine"],
+                        "specializations": ["Sports Medicine"],
+                        "primary_specialty": "Family Medicine Physician",
+                        "primary_specialization": "Sports Medicine",
                         "provider_name": "Example Provider",
                         "procedure_code": None,
                         "reported_code_system": "CPT",
@@ -1914,6 +1923,9 @@ async def test_compact_serving_include_providers_with_geo_uses_npi_scoped_locati
     assert payload["items"][0]["location_source"] == "npi_address"
     assert payload["items"][0]["address"]["address_key"] == "00000000-0000-0000-0000-000000000003"
     assert payload["items"][0]["specialties"] == ["Family Medicine Physician"]
+    assert payload["items"][0]["specialization"] == "Sports Medicine"
+    assert payload["items"][0]["specializations"] == ["Sports Medicine"]
+    assert payload["items"][0]["classifications"] == ["Family Medicine"]
     sql = str(session.calls[0][0][0])
     params = session.calls[0][0][1]
     assert "WITH rate_candidates AS MATERIALIZED" in sql
@@ -1924,11 +1936,92 @@ async def test_compact_serving_include_providers_with_geo_uses_npi_scoped_locati
     assert "loc.npi" in sql
     assert "AND EXISTS (" in sql
     assert "OFFSET 0" in sql
+    assert "COALESCE(tax.specializations, loc.specializations" not in sql
+    assert "COALESCE(tax.specializations, ARRAY[]::varchar[]) AS specializations" in sql
+    assert "array_remove(array_agg(NULLIF(nucc.specialization, '')" in sql
     assert "FROM mrf.npi_address addr" not in sql
     assert "JOIN mrf.npi_address addr_filter" not in sql
     assert params["city_exact"] == "HOUSTON"
     assert params["provider_match_limit"] >= 64
     assert params["location_rate_candidate_limit"] >= 4096
+
+
+@pytest.mark.asyncio
+async def test_compact_serving_geo_provider_filter_paginates_after_provider_match():
+    class LimitOnePagination:
+        limit = 1
+        offset = 0
+
+    session = FakeSession(
+        [
+            FakeResult(
+                rows=[
+                    {
+                        "npi": 1234567890,
+                        "location_hash": "npi_address:1234567890:primary:addr-1",
+                        "state": "IL",
+                        "city": "EFFINGHAM",
+                        "zip5": "62401",
+                        "location_source": "npi_address",
+                        "location_confidence_code": "npi_address",
+                        "address_payload": {"address_key": "addr-1"},
+                        "taxonomy_codes": ["207X00000X"],
+                        "specialties": ["Orthopaedic Surgery Physician"],
+                        "classifications": ["Orthopaedic Surgery"],
+                        "specializations": ["Sports Medicine"],
+                        "primary_specialty": "Orthopaedic Surgery Physician",
+                        "primary_specialization": "Sports Medicine",
+                        "provider_name": "ACL Surgeon",
+                        "procedure_code": None,
+                        "reported_code_system": "CPT",
+                        "reported_code": "29888",
+                        "billing_code": "29888",
+                        "billing_code_type": "CPT",
+                        "procedure_display_name": "ACL reconstruction",
+                        "procedure_name": "ACL reconstruction",
+                        "procedure_description": "ACL reconstruction",
+                        "provider_set_hashes": ["provider-set-1"],
+                        "rate_count": 1,
+                        "prices": [{"negotiated_type": "negotiated", "negotiated_rate": 904.61}],
+                        "source_trace": [],
+                    }
+                ]
+            )
+        ]
+    )
+    tables = _compact_tables(provider_group_location_table="mrf.ptg2_provider_group_location_token")
+
+    payload = await ptg2_serving._search_compact_serving_table(
+        session,
+        "mrf.ptg2_serving_rate_compact_token",
+        tables,
+        "snap-token",
+        {
+            "plan_id": "010854205",
+            "code": "29888",
+            "zip5": "62401",
+            "lat": "39.11952",
+            "long": "-88.56418",
+            "radius_miles": "10",
+            "include_providers": "true",
+        },
+        LimitOnePagination(),
+        ["snapshot_id = :snapshot_id", "plan_id = :plan_id"],
+        {"snapshot_id": "snap-token", "plan_id": "010854205", "limit": 1, "offset": 0},
+        ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
+    )
+
+    assert payload["items"][0]["provider_name"] == "ACL Surgeon"
+    assert payload["items"][0]["specialization"] == "Sports Medicine"
+    sql = str(session.calls[0][0][0])
+    params = session.calls[0][0][1]
+    assert "WITH rate_candidates AS MATERIALIZED" in sql
+    assert "LIMIT :rate_candidate_limit" in sql
+    assert "LIMIT :rate_candidate_limit OFFSET" not in sql
+    assert "provider_filtered_rates AS MATERIALIZED" in sql
+    assert sql.rstrip().endswith("LIMIT :limit OFFSET :offset")
+    assert params["limit"] == 1
+    assert params["rate_candidate_limit"] > params["limit"]
 
 
 @pytest.mark.asyncio

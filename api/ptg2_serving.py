@@ -239,8 +239,13 @@ async def _ptg2_address_serving_table(
 
 
 def _inferred_provider_taxonomy_rule(args: dict[str, Any]) -> InferredProviderTaxonomyRule | None:
-    requested_system = _normalize_code_system(args.get("code_system"))
-    requested_code = _normalize_code(args.get("code"))
+    requested_system = _normalize_code_system(args.get("code_system") or args.get("reported_code_system"))
+    requested_code = _normalize_code(args.get("code") or args.get("reported_code"))
+    # api-layer/OpenAPI compatibility paths can arrive with only a 5-digit CPT code.
+    # Keep the default narrow so short numeric revenue codes such as "450" do not
+    # accidentally inherit CPT taxonomy inference.
+    if not requested_system and requested_code and requested_code.isdigit() and len(requested_code) == 5:
+        requested_system = "CPT"
     if requested_system not in EQUIVALENT_PROCEDURE_CODE_SYSTEMS or not requested_code or not requested_code.isdigit():
         return None
     code_value = int(requested_code)
@@ -1983,6 +1988,28 @@ def _compact_provider_filter_sql(
     )
 
 
+def _provider_taxonomy_summary_lateral_sql(npi_sql: str, alias: str = "tax") -> str:
+    taxonomy_order_sql = (
+        "(UPPER(COALESCE(nt.healthcare_provider_primary_taxonomy_switch, '')) = 'Y') DESC, "
+        "nt.checksum"
+    )
+    return f"""
+        LEFT JOIN LATERAL (
+            SELECT
+                array_agg(nt.healthcare_provider_taxonomy_code ORDER BY {taxonomy_order_sql}) AS taxonomy_codes,
+                array_agg(COALESCE(nucc.display_name, nucc.classification) ORDER BY {taxonomy_order_sql}) AS specialties,
+                array_remove(array_agg(NULLIF(nucc.classification, '') ORDER BY {taxonomy_order_sql}), NULL) AS classifications,
+                array_remove(array_agg(NULLIF(nucc.specialization, '') ORDER BY {taxonomy_order_sql}), NULL) AS specializations,
+                (array_agg(COALESCE(nucc.display_name, nucc.classification) ORDER BY {taxonomy_order_sql}))[1] AS primary_specialty,
+                (array_remove(array_agg(NULLIF(nucc.specialization, '') ORDER BY {taxonomy_order_sql}), NULL))[1] AS primary_specialization
+            FROM {PTG2_SCHEMA}.npi_taxonomy nt
+            LEFT JOIN {PTG2_SCHEMA}.nucc_taxonomy nucc
+              ON nucc.code = nt.healthcare_provider_taxonomy_code
+            WHERE nt.npi = {npi_sql}
+        ) {alias} ON TRUE
+    """
+
+
 def _compact_provider_expansion_sql(
     serving_tables: PTG2ServingTables,
     args: dict[str, Any],
@@ -2061,6 +2088,7 @@ def _compact_provider_expansion_sql(
             OFFSET 0
             LIMIT 1
         ) loc ON TRUE
+        {_provider_taxonomy_summary_lateral_sql("pgm.npi")}
         """
     provider_name_join = f"LEFT JOIN {provider_name_table} n ON n.npi = pgm.npi" if provider_name_table else ""
     return f"""
@@ -2079,15 +2107,7 @@ def _compact_provider_expansion_sql(
                      (addr.type = 'primary') DESC, addr.type, addr.checksum
             LIMIT 1
         ) addr ON TRUE
-        LEFT JOIN LATERAL (
-            SELECT
-                array_agg(nt.healthcare_provider_taxonomy_code ORDER BY (UPPER(COALESCE(nt.healthcare_provider_primary_taxonomy_switch, '')) = 'Y') DESC, nt.checksum) AS taxonomy_codes,
-                array_agg(COALESCE(nucc.display_name, nucc.classification) ORDER BY (UPPER(COALESCE(nt.healthcare_provider_primary_taxonomy_switch, '')) = 'Y') DESC, nt.checksum) AS specialties
-            FROM {PTG2_SCHEMA}.npi_taxonomy nt
-            LEFT JOIN {PTG2_SCHEMA}.nucc_taxonomy nucc
-              ON nucc.code = nt.healthcare_provider_taxonomy_code
-            WHERE nt.npi = pgm.npi
-        ) tax ON TRUE
+        {_provider_taxonomy_summary_lateral_sql("pgm.npi")}
     """
 
 
@@ -2095,6 +2115,11 @@ def _compact_item_from_row(data: dict[str, Any], args: dict[str, Any]) -> dict[s
     prices = _normalize_price_payload(data.get("prices") or [])
     provider_set_hashes = _coerce_json_payload(data.get("provider_set_hashes"), [])
     provider_set_hash = data.get("provider_set_hash") or (provider_set_hashes[0] if provider_set_hashes else None)
+    specialties = _coerce_json_payload(data.get("specialties"), [])
+    specializations = _coerce_json_payload(data.get("specializations"), [])
+    classifications = _coerce_json_payload(data.get("classifications"), [])
+    primary_specialty = data.get("primary_specialty") or (specialties[0] if specialties else None)
+    primary_specialization = data.get("primary_specialization") or (specializations[0] if specializations else None)
     item = {
         "npi": data.get("npi") or args.get("npi"),
         "provider_ordinal": data.get("provider_ordinal") or data.get("npi") or provider_set_hash,
@@ -2107,7 +2132,13 @@ def _compact_item_from_row(data: dict[str, Any], args: dict[str, Any]) -> dict[s
         "location_confidence_code": data.get("location_confidence_code"),
         "address": _coerce_json_payload(data.get("address_payload"), {}),
         "taxonomy_codes": _coerce_json_payload(data.get("taxonomy_codes"), []),
-        "specialties": _coerce_json_payload(data.get("specialties"), []),
+        "specialties": specialties,
+        "primary_specialty": primary_specialty,
+        "classification": classifications[0] if classifications else None,
+        "classifications": classifications,
+        "specialization": primary_specialization,
+        "primary_specialization": primary_specialization,
+        "specializations": specializations,
         "procedure_code": data.get("procedure_code"),
         "hp_procedure_code": data.get("procedure_code"),
         "procedure_name": data.get("procedure_name") or data.get("procedure_display_name"),
@@ -2186,6 +2217,18 @@ async def _search_compact_serving_table(
         params,
         address_table=address_table_sql,
     )
+    if has_provider_filter:
+        public_limit = max(int(params.get("limit") or 25), 1)
+        public_offset = max(int(params.get("offset") or 0), 0)
+        params.setdefault(
+            "rate_candidate_limit",
+            max(
+                public_limit * 200,
+                public_offset + public_limit,
+                int(params.get("location_rate_candidate_limit") or 0),
+                4096,
+            ),
+        )
     source_cte = "provider_filtered_rates" if has_provider_filter else "rate_candidates"
     provider_expansion_sql = _compact_provider_expansion_sql(
         serving_tables,
@@ -2216,7 +2259,11 @@ async def _search_compact_serving_table(
         provider_select_sql = (
             "loc.npi, loc.location_hash, loc.state, loc.city, loc.zip5, "
             "loc.location_source, loc.location_confidence_code, loc.address_payload, "
-            "loc.taxonomy_codes, loc.specialties, loc.provider_name,"
+            "COALESCE(tax.taxonomy_codes, loc.taxonomy_codes, ARRAY[]::varchar[]) AS taxonomy_codes, "
+            "COALESCE(tax.specialties, loc.specialties, ARRAY[]::varchar[]) AS specialties, "
+            "COALESCE(tax.classifications, ARRAY[]::varchar[]) AS classifications, "
+            "COALESCE(tax.specializations, ARRAY[]::varchar[]) AS specializations, "
+            "tax.primary_specialty, tax.primary_specialization, loc.provider_name,"
             f"{provider_distance_select_sql}"
         )
     elif expand_providers:
@@ -2234,6 +2281,9 @@ async def _search_compact_serving_table(
             "(to_jsonb(addr.*) - 'premise_key') AS address_payload, "
             "COALESCE(tax.taxonomy_codes, ARRAY[]::varchar[]) AS taxonomy_codes, "
             "COALESCE(tax.specialties, ARRAY[]::varchar[]) AS specialties, "
+            "COALESCE(tax.classifications, ARRAY[]::varchar[]) AS classifications, "
+            "COALESCE(tax.specializations, ARRAY[]::varchar[]) AS specializations, "
+            "tax.primary_specialty, tax.primary_specialization, "
             f"{provider_name_sql}"
         )
     price_exists_sql = ""
@@ -2252,6 +2302,14 @@ async def _search_compact_serving_table(
               AND {' AND '.join(price_filter_clauses)}
         )
         """
+    rate_candidate_limit_sql = ":rate_candidate_limit" if has_provider_filter else ":limit"
+    rate_candidate_offset_sql = "" if has_provider_filter else "OFFSET :offset"
+    final_order_sql = provider_distance_order_sql
+    final_pagination_sql = ""
+    if has_provider_filter:
+        if not final_order_sql:
+            final_order_sql = "ORDER BY r.reported_code_system, r.reported_code, r.provider_count DESC NULLS LAST"
+        final_pagination_sql = "LIMIT :limit OFFSET :offset"
     row_stmt = text(
         f"""
         WITH rate_candidates AS MATERIALIZED (
@@ -2260,7 +2318,7 @@ async def _search_compact_serving_table(
             WHERE {' AND '.join(filters)}
               {price_exists_sql}
             ORDER BY r.reported_code_system, r.reported_code, r.provider_count DESC NULLS LAST
-            LIMIT :limit OFFSET :offset
+            LIMIT {rate_candidate_limit_sql} {rate_candidate_offset_sql}
         )
         {provider_filter_sql}
         SELECT
@@ -2299,7 +2357,8 @@ async def _search_compact_serving_table(
         {provider_expansion_sql}
         WHERE TRUE
           {"AND price_payload.prices IS NOT NULL" if price_filter_clauses else ""}
-        {provider_distance_order_sql}
+        {final_order_sql}
+        {final_pagination_sql}
         """
     )
     result = await session.execute(row_stmt, params)
