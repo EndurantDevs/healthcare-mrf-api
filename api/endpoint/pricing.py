@@ -534,6 +534,8 @@ def _normalize_prescription_provider_aggregate(payload: dict[str, Any]) -> dict[
 
 
 def _parse_int(raw: Any, param: str, minimum: int | None = None) -> int | None:
+    if isinstance(raw, (list, tuple)):
+        raw = next((item for item in reversed(raw) if item not in (None, "", "null")), None)
     if raw in (None, "", "null"):
         return None
     try:
