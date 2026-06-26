@@ -647,6 +647,8 @@ def _ensure_stage_primary_key_sql(
     column_sql = ", ".join(columns)
     return f"""
     DO $$
+    DECLARE
+        orphan_index text;
     BEGIN
         IF NOT EXISTS (
             SELECT 1
@@ -659,9 +661,35 @@ def _ensure_stage_primary_key_sql(
                AND t.relname = {_sql_literal(table_name)}
                AND c.contype = 'p'
         ) THEN
-            ALTER TABLE {db_schema}.{table_name}
-                ADD CONSTRAINT {constraint_name}
-                PRIMARY KEY ({column_sql});
+            SELECT i.relname
+              INTO orphan_index
+              FROM pg_class i
+              JOIN pg_namespace n
+                ON n.oid = i.relnamespace
+             WHERE n.nspname = {_sql_literal(db_schema)}
+               AND i.relname = {_sql_literal(constraint_name)}
+               AND i.relkind IN ('i', 'I')
+               AND NOT EXISTS (
+                    SELECT 1
+                      FROM pg_constraint c
+                     WHERE c.conindid = i.oid
+               )
+             LIMIT 1;
+
+            IF orphan_index IS NOT NULL THEN
+                EXECUTE format(
+                    'DROP INDEX IF EXISTS %I.%I',
+                    {_sql_literal(db_schema)},
+                    orphan_index
+                );
+            END IF;
+
+            EXECUTE format(
+                'ALTER TABLE %I.%I ADD CONSTRAINT %I PRIMARY KEY ({column_sql})',
+                {_sql_literal(db_schema)},
+                {_sql_literal(table_name)},
+                {_sql_literal(constraint_name)}
+            );
         END IF;
     END $$;
     """

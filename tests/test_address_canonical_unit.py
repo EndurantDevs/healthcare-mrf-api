@@ -1904,7 +1904,10 @@ def test_entity_address_unified_support_primary_key_sql_restores_constraint():
     )
 
     assert "IF NOT EXISTS" in sql
-    assert "ADD CONSTRAINT entity_address_procedure_bridge_20260614_pkey" in sql
+    assert "orphan_index" in sql
+    assert "DROP INDEX IF EXISTS %I.%I" in sql
+    assert "ADD CONSTRAINT %I" in sql
+    assert "entity_address_procedure_bridge_20260614_pkey" in sql
     assert "PRIMARY KEY (location_key, npi, code_system, code)" in sql
 
 
