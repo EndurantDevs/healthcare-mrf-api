@@ -327,6 +327,7 @@ Last one-time research refresh: 2026-06-05.
 | WPS Health | regional | - | needs official source URL |
 | Aetna CVS - Aetna Signature Administrators | tpa | https://health1.aetna.com/app/public/#/one/insurerCode=AETNACVS_I&brandCode=ASA/machine-readable-transparency-in-coverage | observed current; 22 plans; 178 files; aliases: ASA, Aetna Signature |
 | Aetna CVS - Joint Care Administration | tpa | https://health1.aetna.com/app/public/#/one/insurerCode=AETNACVS_I&brandCode=AJCA/machine-readable-transparency-in-coverage | observed current; 73 plans; 2,011 files |
+| 90 Degree Benefits | tpa | https://portal.90degreebenefits.com/MemberPortal/MachineReadableFiles | public Healthspace machine-readable file portal; aliases: 90 Degree, 90DB |
 | Aetna Signature Administrators | tpa | https://health1.aetna.com/app/public/#/one/insurerCode=AETNACVS_I&brandCode=ASA/machine-readable-transparency-in-coverage | curated source row; aliases: ASA, Aetna Signature |
 | Allegiance Benefit Plan Management | tpa | https://mrf.healthcarebluebook.com/Allegiance | public Healthcare Bluebook MRF directory; current TOC is allowed-amount only with no in-network files observed; aliases: Allegiance Benefit Plan Management Inc, AskAllegiance |
 | Allied Benefit Systems | tpa | https://alliedbenefit.sapphiremrfhub.com/ | curated source row; aliases: Allied Benefit |

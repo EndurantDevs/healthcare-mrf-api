@@ -403,8 +403,11 @@ def _mrf_file_type_from_text(url: str | None, label: str | None = None) -> str |
         or "allowed amount" in text
         or "allowedamount" in compact
         or "out-of-network" in text
+        or "out-network" in text
         or "out of network" in text
+        or "out network" in text
         or "outofnetwork" in compact
+        or "outnetwork" in compact
         or re.search(r"(^|[-/_.])oon([-/_.]|$)", text)
     ):
         return "allowed-amounts"
@@ -663,6 +666,10 @@ def classify_hosting_platform(url: str | None) -> str | None:
         return "html_mrf_links"
     if host == "sisconosurprise.com" and path.startswith("/ppo/"):
         return "html_mrf_links"
+    if host == "portal.90degreebenefits.com" and path.startswith(
+        "/memberportal/machinereadablefiles"
+    ):
+        return "healthspace_machine_readable_files"
     if host == "transparency-in-coverage.collectivehealth.com":
         return "html_mrf_links"
     if (
@@ -1343,6 +1350,51 @@ async def _post_json_value(
             chunks.append(chunk)
         charset = resp.charset or "utf-8"
     return json.loads(b"".join(chunks).decode(charset, errors="replace"))
+
+
+async def _post_text(
+    url: str,
+    payload: str,
+    *,
+    headers: dict[str, str] | None = None,
+    max_bytes: int = MAX_TOC_BYTES_DEFAULT,
+    session: aiohttp.ClientSession | None = None,
+) -> str:
+    await _assert_fetch_url_allowed(url)
+    if session is None:
+        timeout = aiohttp.ClientTimeout(
+            total=HTTP_TOTAL_TIMEOUT, connect=15, sock_read=HTTP_READ_TIMEOUT
+        )
+        connector = _tcp_connector(limit=0)
+        async with aiohttp.ClientSession(
+            headers={"User-Agent": USER_AGENT},
+            timeout=timeout,
+            connector=connector,
+            trust_env=False,
+        ) as owned_session:
+            return await _post_text(
+                url,
+                payload,
+                headers=headers,
+                max_bytes=max_bytes,
+                session=owned_session,
+            )
+    async with session.post(
+        url,
+        data=payload,
+        headers=headers or {},
+        allow_redirects=True,
+    ) as resp:
+        await _assert_fetch_url_allowed(str(resp.url))
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in resp.content.iter_chunked(64 * 1024):
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(f"response exceeds {max_bytes} byte discovery limit")
+            chunks.append(chunk)
+        charset = resp.charset or "utf-8"
+    return _decode_response_body(b"".join(chunks), charset=charset)
 
 
 async def _load_candidates(
@@ -6236,6 +6288,151 @@ def _xml_child_text(element: ElementTree.Element, child_name: str) -> str:
     return ""
 
 
+def _healthspace_session_id_from_html(html_text: str | None) -> str | None:
+    for pattern in (
+        r"HealthspaceSessionId['\"]\s*,\s*['\"](?P<session>[^'\"]+)['\"]",
+        r"HealthspaceSessionId['\"]\]\s*=\s*['\"](?P<session>[^'\"]+)['\"]",
+    ):
+        match = re.search(pattern, html_text or "", flags=re.I)
+        if match:
+            return _clean_text(match.group("session")) or None
+    return None
+
+
+def _healthspace_execute_soap_envelope(
+    *,
+    session_id: str,
+    operation_id: str,
+    parameters_xml: str = "<hslist />",
+) -> str:
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<soap:Envelope xmlns:ns0="https://www.p2phealthcare.com" '
+        'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
+        'xmlns:xsd="http://www.w3.org/2001/XMLSchema" '
+        'xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">'
+        "<soap:Body><ns0:Execute>"
+        f"<ns0:sessionId>{html.escape(session_id)}</ns0:sessionId>"
+        f"<ns0:operationId>{html.escape(operation_id)}</ns0:operationId>"
+        f"<ns0:parameters>{parameters_xml}</ns0:parameters>"
+        "</ns0:Execute></soap:Body></soap:Envelope>"
+    )
+
+
+def _healthspace_mrf_targets_from_soap(
+    source: dict[str, Any],
+    soap_text: str,
+    *,
+    resolved_from_url: str,
+    resolver: dict[str, Any],
+) -> list[CrawlTarget]:
+    root = ElementTree.fromstring((soap_text or "").lstrip("\ufeff"))
+    resolver_type = str(resolver.get("type") or "healthspace_machine_readable_files")
+    targets: list[CrawlTarget] = []
+    seen: set[str] = set()
+    for item in root.iter():
+        if item.tag.rsplit("}", 1)[-1] != "MachineReadableFile":
+            continue
+        url = _clean_text(item.attrib.get("FilePathURL"))
+        file_name = (
+            _clean_text(item.attrib.get("FileName")) or Path(urlsplit(url).path).name
+        )
+        if not url:
+            continue
+        file_type = _mrf_file_type_from_text(url, file_name)
+        if not file_type and _looks_non_tic_mrf_reference(url, file_name):
+            continue
+        if not file_type:
+            continue
+        target_kind = (
+            "toc_json"
+            if file_type == "table-of-contents"
+            and urlsplit(url).path.lower().endswith((".json", ".json.gz"))
+            else "file_reference"
+        )
+        company_id = _clean_text(item.attrib.get("CompanyId"))
+        company_name = _clean_text(item.attrib.get("CompanyName"))
+        plan_info = []
+        if company_name:
+            plan_info.append(
+                {
+                    "plan_id": company_name,
+                    "plan_id_type": "healthspace_company_name",
+                    "plan_market_type": "group",
+                    "plan_name": company_name,
+                }
+            )
+        key = _canonical_or_none(url) or url
+        if key in seen:
+            continue
+        seen.add(key)
+        targets.append(
+            CrawlTarget(
+                source=source,
+                url=url,
+                label=company_name or _mrf_file_plan_label(file_name) or file_name,
+                resolved_from_url=resolved_from_url,
+                metadata={
+                    "resolver": resolver_type,
+                    "target_kind": target_kind,
+                    "target_file_type": file_type,
+                    "container_format": _container_format(url),
+                    "company_id": company_id,
+                    "company_name": company_name,
+                    "file_name": file_name,
+                    "plan_info": plan_info,
+                },
+            )
+        )
+    return targets
+
+
+async def _resolve_healthspace_machine_readable_files(
+    source: dict[str, Any],
+    url: str,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    page_html = await _fetch_text(
+        url,
+        max_bytes=int(resolver.get("page_max_bytes") or 1024 * 1024),
+        session=session,
+    )
+    session_id = _healthspace_session_id_from_html(page_html)
+    if not session_id:
+        raise ValueError("Healthspace public page did not expose a session id")
+    service_url = urljoin(
+        url, str(resolver.get("service_path") or "/Healthspace/Healthspace.svc")
+    )
+    operation_id = str(
+        resolver.get("operation_id") or "P2PHC.Document.GetMachineReadableFiles"
+    )
+    soap_text = await _post_text(
+        service_url,
+        _healthspace_execute_soap_envelope(
+            session_id=session_id,
+            operation_id=operation_id,
+            parameters_xml=str(resolver.get("parameters_xml") or "<hslist />"),
+        ),
+        headers={
+            "Content-Type": "text/xml",
+            "SOAPAction": "https://www.p2phealthcare.com/IHealthspace/Execute",
+        },
+        max_bytes=int(resolver.get("max_bytes") or 10 * 1024 * 1024),
+        session=session,
+    )
+    targets = _healthspace_mrf_targets_from_soap(
+        source, soap_text, resolved_from_url=service_url, resolver=resolver
+    )
+    targets = _dedupe_crawl_targets_by_url(targets)
+    max_targets = _as_int(resolver.get("max_targets"))
+    if max_targets and max_targets > 0:
+        targets = targets[:max_targets]
+    if not targets:
+        raise ValueError(f"no Healthspace MRF targets found for {url}")
+    return targets
+
+
 def _s3_xml_listing_targets_from_xml(
     source: dict[str, Any],
     xml_text: str,
@@ -6746,6 +6943,10 @@ async def _crawl_targets_for_source(
         return await _resolve_html_mrf_links(source, url, resolver, session)
     if resolver_type == "json_mrf_directory_links":
         return await _resolve_json_mrf_directory_links(source, url, resolver, session)
+    if resolver_type == "healthspace_machine_readable_files":
+        return await _resolve_healthspace_machine_readable_files(
+            source, url, resolver, session
+        )
     if resolver_type == "payercompass_mrf":
         return await _resolve_payercompass_mrf(source, url, resolver, session)
     if resolver_type == "webtpa_mrf_api":
@@ -6868,6 +7069,10 @@ async def _crawl_targets_for_source(
         return await _resolve_html_mrf_links(source, url, resolver, session)
     if resolver_type == "json_mrf_directory_links":
         return await _resolve_json_mrf_directory_links(source, url, resolver, session)
+    if resolver_type == "healthspace_machine_readable_files":
+        return await _resolve_healthspace_machine_readable_files(
+            source, url, resolver, session
+        )
     if resolver_type == "payercompass_mrf":
         return await _resolve_payercompass_mrf(source, url, resolver, session)
     if resolver_type == "webtpa_mrf_api":

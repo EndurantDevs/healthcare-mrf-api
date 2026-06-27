@@ -132,6 +132,15 @@
       "max_directories": 20,
       "max_targets": 10000
     },
+    "healthspace_machine_readable_files": {
+      "type": "healthspace_machine_readable_files",
+      "service_path": "/Healthspace/Healthspace.svc",
+      "operation_id": "P2PHC.Document.GetMachineReadableFiles",
+      "parameters_xml": "<hslist />",
+      "page_max_bytes": 1048576,
+      "max_bytes": 10485760,
+      "max_targets": 2000
+    },
     "webtpa_mrf_api": {
       "type": "webtpa_mrf_api",
       "plans_path": "/machinereadablefile/plans",

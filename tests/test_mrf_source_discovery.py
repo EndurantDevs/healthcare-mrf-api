@@ -49,6 +49,10 @@ def test_source_urls_are_loaded_from_registry_file():
         config["platform_resolvers"]["json_mrf_directory_links"]["type"]
         == "json_mrf_directory_links"
     )
+    assert (
+        config["platform_resolvers"]["healthspace_machine_readable_files"]["type"]
+        == "healthspace_machine_readable_files"
+    )
     assert config["platform_resolvers"]["webtpa_mrf_api"]["type"] == "webtpa_mrf_api"
     assert (
         config["platform_resolvers"]["cmstic_file_info"]["type"] == "cmstic_file_info"
@@ -253,6 +257,12 @@ def test_classify_hosting_platform_recognizes_public_adapter_pages():
     assert (
         discovery.classify_hosting_platform("https://www.simplepayhealth.com/")
         == "html_delegated_mrf_links"
+    )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://portal.90degreebenefits.com/MemberPortal/MachineReadableFiles"
+        )
+        == "healthspace_machine_readable_files"
     )
     assert (
         discovery.classify_hosting_platform(
@@ -555,6 +565,7 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
     markdown = """
 | Payer | Type | Public MRF TOC / landing URL | Notes |
 |---|---|---|---|
+| 90 Degree Benefits | tpa | https://portal.90degreebenefits.com/MemberPortal/MachineReadableFiles | aliases: 90 Degree, 90DB |
 | Select Health | regional | https://www.selecthealth.org/disclaimers/machine-readable-data | aliases: SelectHealth |
 | EMI Health | regional | https://emihealth.com/machinereadables | public machine-readable files page |
 | MotivHealth Insurance Company | regional | https://www.motivhealth.com/machinereadablefiles/ | aliases: MotivHealth |
@@ -582,6 +593,11 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
     candidates = discovery.parse_master_list(markdown)
     by_name = {candidate.payer_name: candidate for candidate in candidates}
 
+    assert (
+        by_name["90 Degree Benefits"].hosting_platform
+        == "healthspace_machine_readable_files"
+    )
+    assert by_name["90 Degree Benefits"].aliases == ("90 Degree", "90DB")
     assert by_name["Select Health"].hosting_platform == "html_mrf_links"
     assert by_name["Select Health"].aliases == ("SelectHealth",)
     assert by_name["EMI Health"].hosting_platform == "html_mrf_links"
@@ -3528,6 +3544,163 @@ async def test_s3_xml_listing_resolver_caps_newest_targets_first(monkeypatch):
         "https://transparency.lacare.org/download/new-innetwork.json"
     ]
     assert targets[0].metadata["last_modified"] == "2026-06-16T17:53:46.000Z"
+
+
+def test_healthspace_session_id_from_html_extracts_public_session():
+    html = """
+    <script>
+      window.sessionStorage.setItem('HealthspaceSessionId', '123456789-987654321');
+    </script>
+    """
+
+    assert discovery._healthspace_session_id_from_html(html) == "123456789-987654321"
+
+
+def test_healthspace_soap_targets_extract_mrf_files_only():
+    source = {
+        "source_id": "source_1",
+        "payer_id": "payer_1",
+        "display_name": "90 Degree Benefits",
+    }
+    soap_text = """
+    <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+      <s:Body>
+        <ExecuteResponse xmlns="https://www.p2phealthcare.com">
+          <ExecuteResult>
+            <MachineReadableFiles xmlns="">
+              <MachineReadableFile
+                CompanyId="company-1"
+                CompanyName="123456789"
+                FileName="2026-06-01_example-plan_Index.ZIP"
+                FilePathURL="https://mrfexport.blob.core.windows.net/caa/2026-06-01_example-plan_Index.ZIP" />
+              <MachineReadableFile
+                CompanyId="company-2"
+                CompanyName="987654321"
+                FileName="2026-06-01_example-plan_in-network-rates.zip"
+                FilePathURL="https://mrfexport.blob.core.windows.net/caa/2026-06-01_example-plan_in-network-rates.zip" />
+              <MachineReadableFile
+                CompanyId="company-3"
+                CompanyName=""
+                FileName="2026-06-01_example-plan_out-network-rates.zip"
+                FilePathURL="https://mrfexport.blob.core.windows.net/caa/2026-06-01_example-plan_out-network-rates.zip" />
+              <MachineReadableFile
+                CompanyId="company-4"
+                CompanyName="ignore"
+                FileName="provider-data.json"
+                FilePathURL="https://mrfexport.blob.core.windows.net/caa/provider-data.json" />
+            </MachineReadableFiles>
+          </ExecuteResult>
+        </ExecuteResponse>
+      </s:Body>
+    </s:Envelope>
+    """
+
+    targets = discovery._healthspace_mrf_targets_from_soap(
+        source,
+        soap_text,
+        resolved_from_url="https://portal.example.test/Healthspace/Healthspace.svc",
+        resolver={"type": "healthspace_machine_readable_files"},
+    )
+
+    assert [target.metadata["target_file_type"] for target in targets] == [
+        "table-of-contents",
+        "in-network",
+        "allowed-amounts",
+    ]
+    assert [target.metadata["target_kind"] for target in targets] == [
+        "file_reference",
+        "file_reference",
+        "file_reference",
+    ]
+    assert targets[0].metadata["container_format"] == "zip"
+    assert targets[0].metadata["company_id"] == "company-1"
+    assert targets[0].metadata["plan_info"] == [
+        {
+            "plan_id": "123456789",
+            "plan_id_type": "healthspace_company_name",
+            "plan_market_type": "group",
+            "plan_name": "123456789",
+        }
+    ]
+    assert targets[2].metadata["plan_info"] == []
+
+
+@pytest.mark.asyncio
+async def test_healthspace_resolver_posts_execute_soap_and_caps_targets(monkeypatch):
+    source = {
+        "source_id": "source_1",
+        "payer_id": "payer_1",
+        "display_name": "90 Degree Benefits",
+    }
+    page_html = """
+    <script>
+      window.sessionStorage.setItem('HealthspaceSessionId', '123456789-987654321');
+    </script>
+    """
+    soap_text = """
+    <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+      <s:Body>
+        <ExecuteResponse xmlns="https://www.p2phealthcare.com">
+          <ExecuteResult>
+            <MachineReadableFiles xmlns="">
+              <MachineReadableFile
+                CompanyId="company-1"
+                CompanyName="123456789"
+                FileName="2026-06-01_example-plan_in-network-rates.zip"
+                FilePathURL="https://mrfexport.blob.core.windows.net/caa/2026-06-01_example-plan_in-network-rates.zip" />
+              <MachineReadableFile
+                CompanyId="company-2"
+                CompanyName="987654321"
+                FileName="2026-06-01_other-plan_in-network-rates.zip"
+                FilePathURL="https://mrfexport.blob.core.windows.net/caa/2026-06-01_other-plan_in-network-rates.zip" />
+            </MachineReadableFiles>
+          </ExecuteResult>
+        </ExecuteResponse>
+      </s:Body>
+    </s:Envelope>
+    """
+    post_calls = []
+
+    async def fake_fetch_text(*_args, **_kwargs):
+        return page_html
+
+    async def fake_post_text(url, payload, **kwargs):
+        post_calls.append(
+            {"url": url, "payload": payload, "headers": kwargs["headers"]}
+        )
+        return soap_text
+
+    monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
+    monkeypatch.setattr(discovery, "_post_text", fake_post_text)
+
+    targets = await discovery._resolve_healthspace_machine_readable_files(
+        source,
+        "https://portal.90degreebenefits.com/MemberPortal/MachineReadableFiles",
+        {
+            "type": "healthspace_machine_readable_files",
+            "service_path": "/Healthspace/Healthspace.svc",
+            "operation_id": "P2PHC.Document.GetMachineReadableFiles",
+            "parameters_xml": "<hslist />",
+            "max_targets": 1,
+        },
+        None,
+    )
+
+    assert [target.url for target in targets] == [
+        "https://mrfexport.blob.core.windows.net/caa/2026-06-01_example-plan_in-network-rates.zip"
+    ]
+    assert post_calls[0]["url"] == (
+        "https://portal.90degreebenefits.com/Healthspace/Healthspace.svc"
+    )
+    assert (
+        post_calls[0]["headers"]["SOAPAction"]
+        == "https://www.p2phealthcare.com/IHealthspace/Execute"
+    )
+    assert (
+        "<ns0:operationId>P2PHC.Document.GetMachineReadableFiles</ns0:operationId>"
+        in (post_calls[0]["payload"])
+    )
+    assert "<hslist />" in post_calls[0]["payload"]
 
 
 def test_delegated_mrf_source_urls_extracts_supported_links_and_bare_hosts():
