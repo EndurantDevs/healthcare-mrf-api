@@ -353,6 +353,7 @@ Last one-time research refresh: 2026-06-05.
 | Health Plans Inc (HPI) | tpa | https://hpitpa.com/transparency-in-coverage-machine-readable-files/ | public transparency URL; delegates MRF listing to Healthcare Bluebook; aliases: HPI, Health Plans Inc, Health Plans, Inc, HealthPlans Inc |
 | HealthComp | tpa | https://healthcomp.sapphiremrfhub.com/ | public Sapphire MRF hub; aliases: HealthComp LLC, HCOnline, Personify Health, Personify |
 | Healthgram | tpa | https://mrf.healthgram.com/ | public MRF network directory; resolver expands network pages to current TOC JSON links |
+| Insurance Management Services | tpa | https://mrf.healthcarebluebook.com/IMS | public Healthcare Bluebook MRF directory linked from IMS healthcare reform page; aliases: IMS, IMS TPA, Insurance Management Services TX, Insurance Management Services Amarillo |
 | Group Administrators | tpa | https://www.groupadministrators.com/machinereadablefiles/ | public iframe-hosted MRF table; aliases: Group Administrators Ltd |
 | Loomis | tpa | https://mrf.healthcarebluebook.com/Loomis | public Healthcare Bluebook MRF directory; aliases: Loomis Company, Loomis Benefit Administrators, The Loomis Company, LOOMIS COMPANY (THE) |
 | Lucent Health | tpa | https://lucenthealth.com/transparency-in-coverage/ | public transparency page; delegates INN MRF listing to Healthcare Bluebook; aliases: Cypress Benefit Administrators, Cypress Benefit Administrators now Lucent Health |

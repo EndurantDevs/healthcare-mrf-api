@@ -597,6 +597,7 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
 | EBMS | tpa | https://caa.ebms.com/ | aliases: Employee Benefit Management Services |
 | EBPA | tpa | https://tuition.ebpabenefits.com/employers/machine-readable-file-links | aliases: EBPA Benefits |
 | HealthNow Administrative Services | tpa | https://www.hnas.com/digital-resources/machine-readable-files | aliases: HNAS |
+| Insurance Management Services | tpa | https://mrf.healthcarebluebook.com/IMS | aliases: IMS, IMS TPA |
 | Boon-Chapman | tpa | https://boonchapman-mrf.zakipointhealth.com/ | aliases: Boon Chapman |
 | Tall Tree Administrators | tpa | https://talltreeadmin.com/machine-readable-files | aliases: Tall Tree |
 | Carefactor | tpa | https://mrf.healthcarebluebook.com/Carefactor | aliases: CareFactor |
@@ -659,6 +660,11 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
         by_name["HealthNow Administrative Services"].hosting_platform
         == "html_delegated_mrf_links"
     )
+    assert (
+        by_name["Insurance Management Services"].hosting_platform
+        == "healthcarebluebook_mrf"
+    )
+    assert by_name["Insurance Management Services"].aliases == ("IMS", "IMS TPA")
     assert by_name["Boon-Chapman"].hosting_platform == "html_mrf_links"
     assert by_name["Tall Tree Administrators"].hosting_platform == "html_mrf_links"
     assert by_name["Carefactor"].hosting_platform == "healthcarebluebook_mrf"
