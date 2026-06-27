@@ -772,6 +772,7 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "EyeMed Vision Care" in by_name["EyeMed"].aliases
     assert "HealthLink Network" in by_name["HealthLink"].aliases
     assert by_name["HealthLink"].hosting_platform == "anthem_s3_mrf"
+    assert "Delta Dental of Oregon" in by_name["Moda Health"].aliases
     assert by_name["VSP Vision"].hosting_platform == "sapphire"
     assert "VSP" in by_name["VSP Vision"].aliases
     assert by_name["The Health Plan"].hosting_platform == "healthplan_html_mrf_links"

@@ -294,7 +294,7 @@ Last one-time research refresh: 2026-06-05.
 | Medical Mutual of Ohio | regional | https://www.medmutual.com/Employers/Machine-Readable-Files.aspx | curated source row |
 | Mercy Health Plan | regional | - | needs official source URL |
 | Midwest Health Plan | regional | - | needs official source URL |
-| Moda Health | regional | https://www.modahealth.com/privacy-center/machine-readable-files.shtml | curated source row; aliases: Oregon Dental Service, Delta Dental Plan of Oregon, Delta Dental of Alaska |
+| Moda Health | regional | https://www.modahealth.com/privacy-center/machine-readable-files.shtml | curated source row; aliases: Oregon Dental Service, Delta Dental Plan of Oregon, Delta Dental of Oregon, Delta Dental of Alaska |
 | MotivHealth Insurance Company | regional | https://www.motivhealth.com/machinereadablefiles/ | public MRF landing page; aliases: MotivHealth, MOTIVHEALTH INSURANCE COMPANY |
 | MVP HEALTH | regional | - | needs official source URL |
 | MVP Health Care | regional | https://www.mvphealthcare.com/developers/machine-readable-files | curated source row |
