@@ -1514,6 +1514,44 @@ async def test_compact_serving_coordinate_search_filters_npi_addresses(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_compact_serving_provider_expansion_fallback_projects_address_distance(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "legacy")
+    session = FakeSession(["mrf.npi", FakeResult(rows=[])])
+
+    payload = await ptg2_serving._search_compact_serving_table(
+        session,
+        "mrf.ptg2_serving_rate_compact_token",
+        _compact_tables(),
+        "snap-token",
+        {
+            "plan_id": "010854205",
+            "code": "29888",
+            "zip5": "62401",
+            "lat": 39.11952,
+            "long": -88.56418,
+            "radius_miles": 100.0,
+            "include_providers": "true",
+        },
+        FakePagination(),
+        ["snapshot_id = :snapshot_id", "plan_id = :plan_id"],
+        {"snapshot_id": "snap-token", "plan_id": "010854205", "limit": 25, "offset": 0},
+        ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
+    )
+
+    assert payload is None
+    sql = str(session.calls[-1][0][0])
+    params = session.calls[-1][0][1]
+    assert "addr.distance_miles, addr.zip_match_type, addr.anchor_zip5, addr.zip_radius_miles" in sql
+    assert "CASE WHEN LEFT(COALESCE(addr.postal_code, ''), 5) = :zip5 THEN 0.0 ELSE" in sql
+    assert "AS distance_miles" in sql
+    assert ":zip5 AS anchor_zip5, :geo_radius_miles AS zip_radius_miles" in sql
+    assert "ORDER BY distance_miles ASC NULLS LAST, r.reported_code_system, r.reported_code" in sql
+    assert "ORDER BY CASE WHEN LEFT(COALESCE(addr.postal_code, ''), 5) = :zip5 THEN 0 ELSE 1 END" in sql
+    assert params["zip5"] == "62401"
+    assert params["geo_radius_miles"] == 100.0
+
+
+@pytest.mark.asyncio
 async def test_manifest_location_provider_matches_filters_coordinates_with_unified(monkeypatch):
     monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
     group_id = "00000000000000000000000000000011"

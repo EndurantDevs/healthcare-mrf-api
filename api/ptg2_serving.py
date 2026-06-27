@@ -2125,6 +2125,39 @@ def _compact_provider_expansion_sql(
         {_provider_taxonomy_summary_lateral_sql("pgm.npi")}
         """
     provider_name_join = f"LEFT JOIN {provider_name_table} n ON n.npi = pgm.npi" if provider_name_table else ""
+    address_distance_select_sql = (
+        "NULL::double precision AS distance_miles, "
+        "NULL::varchar AS zip_match_type, "
+        "NULL::varchar AS anchor_zip5, "
+        "NULL::double precision AS zip_radius_miles"
+    )
+    address_order_sql = """
+            ORDER BY (NULLIF(BTRIM(addr.first_line), '') IS NULL),
+                     (addr.type = 'primary') DESC, addr.type, addr.checksum
+    """
+    if params.get("geo_lat") is not None:
+        address_distance_sql = _ptg2_geo_distance_miles_sql("addr.lat::float8", "addr.long::float8")
+        if params.get("zip5"):
+            same_zip_sql = "LEFT(COALESCE(addr.postal_code, ''), 5) = :zip5"
+            address_distance_select_sql = (
+                f"CASE WHEN {same_zip_sql} THEN 0.0 ELSE {address_distance_sql} END AS distance_miles, "
+                f"CASE WHEN {same_zip_sql} THEN 'same_zip' ELSE 'radius' END AS zip_match_type, "
+                ":zip5 AS anchor_zip5, :geo_radius_miles AS zip_radius_miles"
+            )
+            zip_rank_sql = f"CASE WHEN {same_zip_sql} THEN 0 ELSE 1 END"
+        else:
+            address_distance_select_sql = (
+                f"{address_distance_sql} AS distance_miles, "
+                "'radius' AS zip_match_type, "
+                "NULL::varchar AS anchor_zip5, :geo_radius_miles AS zip_radius_miles"
+            )
+            zip_rank_sql = "0"
+        address_order_sql = f"""
+            ORDER BY {zip_rank_sql},
+                     distance_miles ASC NULLS LAST,
+                     (NULLIF(BTRIM(addr.first_line), '') IS NULL),
+                     (addr.type = 'primary') DESC, addr.type, addr.checksum
+        """
     return f"""
         {component_join}
         {member_join}
@@ -2134,11 +2167,11 @@ def _compact_provider_expansion_sql(
                 addr.*,
                 {address_location_hash_sql} AS location_hash,
                 addr.state_name AS state,
-                addr.city_name AS city
+                addr.city_name AS city,
+                {address_distance_select_sql}
             FROM {resolved_address_table} addr
             WHERE addr.npi = pgm.npi
-            ORDER BY (NULLIF(BTRIM(addr.first_line), '') IS NULL),
-                     (addr.type = 'primary') DESC, addr.type, addr.checksum
+            {address_order_sql}
             LIMIT 1
         ) addr ON TRUE
         {_provider_taxonomy_summary_lateral_sql("pgm.npi")}
@@ -2318,8 +2351,11 @@ async def _search_compact_serving_table(
             "COALESCE(tax.classifications, ARRAY[]::varchar[]) AS classifications, "
             "COALESCE(tax.specializations, ARRAY[]::varchar[]) AS specializations, "
             "tax.primary_specialty, tax.primary_specialization, "
+            "addr.distance_miles, addr.zip_match_type, addr.anchor_zip5, addr.zip_radius_miles, "
             f"{provider_name_sql}"
         )
+        if params.get("geo_lat") is not None:
+            provider_distance_order_sql = "ORDER BY distance_miles ASC NULLS LAST, r.reported_code_system, r.reported_code"
     price_exists_sql = ""
     if price_filter_clauses:
         price_exists_sql = f"""
