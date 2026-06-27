@@ -44,7 +44,10 @@
     },
     "sapphire": {
       "type": "sapphire_html_tocs",
-      "max_bytes": 5242880
+      "max_bytes": 5242880,
+      "page_data_max_bytes": 1048576,
+      "static_query_max_bytes": 52428800,
+      "max_static_queries": 8
     },
     "anthem_s3_mrf": {
       "type": "anthem_s3_mrf",

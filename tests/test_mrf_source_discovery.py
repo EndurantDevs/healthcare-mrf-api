@@ -29,6 +29,7 @@ def test_source_urls_are_loaded_from_registry_file():
         config["platform_resolvers"]["highmark_hmhs"]["type"] == "highmark_hmhs_script"
     )
     assert config["platform_resolvers"]["sapphire"]["type"] == "sapphire_html_tocs"
+    assert config["platform_resolvers"]["sapphire"]["max_static_queries"] == 8
     assert config["platform_resolvers"]["anthem_s3_mrf"]["type"] == "anthem_s3_mrf"
     assert (
         config["platform_resolvers"]["hcsc_asomrf_landing"]["type"]
@@ -242,6 +243,16 @@ def test_classify_hosting_platform_recognizes_public_adapter_pages():
             "https://sisconosurprise.com/ppo/phcs/index.html"
         )
         == "html_mrf_links"
+    )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://sisconosurprise.com/ppo/hps/index.html"
+        )
+        == "html_mrf_links"
+    )
+    assert (
+        discovery.classify_hosting_platform("https://www.simplepayhealth.com/")
+        == "html_delegated_mrf_links"
     )
     assert (
         discovery.classify_hosting_platform(
@@ -551,8 +562,11 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
 | PacificSource | regional | https://mrf.pacificsource.com/File/Visit/Index | aliases: Pacific Source |
 | Allegiance Benefit Plan Management | tpa | https://mrf.healthcarebluebook.com/Allegiance | aliases: AskAllegiance |
 | Healthcare Management Administrators | tpa | https://sawus2prdticmrfhma.z5.web.core.windows.net/ | aliases: HMA, AccessHMA |
+| HealthComp | tpa | https://healthcomp.sapphiremrfhub.com/ | aliases: Personify Health, Personify |
 | Pinnacle Claims Management | tpa | https://mrf.healthcarebluebook.com/Pinnacle | aliases: PCMI |
 | Regency Employee Benefits | tpa | https://www.mymedicalshopper.com/mrf-search/robbins-regency-employee-benefits-inc-regn | aliases: Robbins Regency Employee Benefits |
+| SimplePay Health | tpa | https://www.simplepayhealth.com/ | aliases: SimplePay |
+| SISCO | tpa | https://sisconosurprise.com/ppo/phcs/index.html | aliases: SISCO Benefits, Self Insured Services Company |
 | CBA Blue | tpa | https://www.cbabluevt.com/employer-resources/ | aliases: CBA BLUE |
 | EBMS | tpa | https://caa.ebms.com/ | aliases: Employee Benefit Management Services |
 | EBPA | tpa | https://tuition.ebpabenefits.com/employers/machine-readable-file-links | aliases: EBPA Benefits |
@@ -585,6 +599,8 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
         by_name["Healthcare Management Administrators"].hosting_platform
         == "html_mrf_links"
     )
+    assert by_name["HealthComp"].hosting_platform == "sapphire"
+    assert by_name["HealthComp"].aliases == ("Personify Health", "Personify")
     assert (
         by_name["Pinnacle Claims Management"].hosting_platform
         == "healthcarebluebook_mrf"
@@ -592,6 +608,12 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
     assert (
         by_name["Regency Employee Benefits"].hosting_platform
         == "mymedicalshopper_talon"
+    )
+    assert by_name["SimplePay Health"].hosting_platform == "html_delegated_mrf_links"
+    assert by_name["SISCO"].hosting_platform == "html_mrf_links"
+    assert by_name["SISCO"].aliases == (
+        "SISCO Benefits",
+        "Self Insured Services Company",
     )
     assert by_name["CBA Blue"].hosting_platform == "html_mrf_links"
     assert by_name["EBMS"].hosting_platform == "ebms_caa_directory"
@@ -2731,6 +2753,119 @@ def test_parse_sapphire_toc_links_extracts_unique_json_hrefs():
     ]
 
 
+def test_sapphire_static_query_hashes_are_loaded_from_gatsby_page_data():
+    page_data = json.dumps(
+        {
+            "componentChunkName": "component---src-pages-index-jsx",
+            "staticQueryHashes": ["254433488", "3220486668", "254433488"],
+        }
+    )
+
+    assert discovery._sapphire_static_query_hashes(page_data) == [
+        "254433488",
+        "3220486668",
+    ]
+
+
+def test_parse_sapphire_static_query_toc_links_extracts_current_tocs():
+    query_json = json.dumps(
+        {
+            "data": {
+                "allTocsJson": {
+                    "edges": [
+                        {
+                            "node": {
+                                "payer_name": "Example Employer",
+                                "file_name": "2026-06-01_example-employer_index.json",
+                                "url": "https://healthcomp.sapphiremrfhub.com/tocs/202606/2026-06-01_example-employer_index.json",
+                            }
+                        },
+                        {
+                            "node": {
+                                "payer_name": "Ignore",
+                                "file_name": "provider-data.json",
+                                "url": "https://healthcomp.sapphiremrfhub.com/provider-data.json",
+                            }
+                        },
+                    ]
+                }
+            }
+        }
+    )
+
+    assert discovery._parse_sapphire_static_query_toc_links(query_json) == [
+        {
+            "url": "https://healthcomp.sapphiremrfhub.com/tocs/202606/2026-06-01_example-employer_index.json",
+            "label": "Example Employer",
+            "file_name": "2026-06-01_example-employer_index.json",
+            "payer_name": "Example Employer",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sapphire_resolver_falls_back_to_gatsby_static_queries(monkeypatch):
+    source = {
+        "source_id": "source_1",
+        "payer_id": "payer_1",
+        "display_name": "HealthComp",
+    }
+    html = "<html><tbody></tbody></html>"
+    page_data = json.dumps(
+        {
+            "componentChunkName": "component---src-pages-index-jsx",
+            "staticQueryHashes": ["254433488"],
+        }
+    )
+    static_query = json.dumps(
+        {
+            "data": {
+                "allTocsJson": {
+                    "edges": [
+                        {
+                            "node": {
+                                "payer_name": "Example Employer",
+                                "file_name": "2026-06-01_example-employer_index.json",
+                                "url": "https://healthcomp.sapphiremrfhub.com/tocs/202606/2026-06-01_example-employer_index.json",
+                            }
+                        }
+                    ]
+                }
+            }
+        }
+    )
+    html_by_url = {
+        "https://healthcomp.sapphiremrfhub.com/": html,
+        "https://healthcomp.sapphiremrfhub.com/page-data/index/page-data.json": page_data,
+        "https://healthcomp.sapphiremrfhub.com/page-data/sq/d/254433488.json": static_query,
+    }
+
+    async def fake_fetch_text(url, **_kwargs):
+        return html_by_url[url]
+
+    monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
+
+    targets = await discovery._crawl_targets_for_source(
+        source,
+        "https://healthcomp.sapphiremrfhub.com/",
+        None,
+    )
+
+    assert targets == [
+        discovery.CrawlTarget(
+            source=source,
+            url="https://healthcomp.sapphiremrfhub.com/tocs/202606/2026-06-01_example-employer_index.json",
+            label="Example Employer",
+            resolved_from_url="https://healthcomp.sapphiremrfhub.com/",
+            metadata={
+                "resolver": "sapphire_html_tocs",
+                "file_name": "2026-06-01_example-employer_index.json",
+                "payer_name": "Example Employer",
+            },
+        )
+    ]
+
+
 def test_parse_html_mrf_metadata_links_extracts_meta_txt_files():
     html = """
     <a href="./in-network-rates-meta.txt">In Network</a>
@@ -4287,6 +4422,64 @@ def test_toc_rows_skip_non_http_body_placeholders(monkeypatch):
 
     assert plan_rows == []
     assert file_rows == []
+
+
+def test_parse_toc_catalog_entries_skips_non_mrf_body_locations():
+    source_jobs = importlib.import_module("process.ptg_parts.source_jobs")
+    toc = {
+        "reporting_entity_name": "HealthComp",
+        "reporting_entity_type": "third_party_administrator",
+        "reporting_structure": [
+            {
+                "reporting_plans": [
+                    {
+                        "plan_id": "123",
+                        "plan_market_type": "group",
+                        "plan_name": "Example Plan",
+                    }
+                ],
+                "in_network_files": [
+                    {"location": "https://www.zelis.com/"},
+                    {
+                        "location": "https://cdn.example.com/2026-06_in-network-rates.json.gz"
+                    },
+                    {
+                        "location": (
+                            "https://cdn.example.com/2026-06_ELAP_allowed-amounts.json.gz"
+                        )
+                    },
+                    {
+                        "location": (
+                            "https://www.asrhealthbenefits.com/home/umbraco/surface/"
+                            "mrfdownload/index?g=1208&i=595&t=InNetwork"
+                        )
+                    },
+                ],
+                "allowed_amount_file": {"location": "Missing file"},
+                "drug_file": {"location": "ftp://example.com/ndc.json.gz"},
+            }
+        ],
+    }
+
+    entries = source_jobs.parse_toc_catalog_entries(
+        toc, "https://healthcomp.sapphiremrfhub.com/tocs/index.json"
+    )
+
+    assert [entry.source_type for entry in entries] == [
+        "table-of-contents",
+        "in-network",
+        "allowed-amounts",
+        "in-network",
+    ]
+    assert [entry.original_url for entry in entries] == [
+        "https://healthcomp.sapphiremrfhub.com/tocs/index.json",
+        "https://cdn.example.com/2026-06_in-network-rates.json.gz",
+        "https://cdn.example.com/2026-06_ELAP_allowed-amounts.json.gz",
+        (
+            "https://www.asrhealthbenefits.com/umbraco/surface/mrfdownload"
+            "?groupNumber=1208&fileType=InNetwork&fileId=595"
+        ),
+    ]
 
 
 def test_toc_rows_store_plan_info_on_file_metadata(monkeypatch):

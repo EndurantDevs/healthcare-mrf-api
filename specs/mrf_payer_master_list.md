@@ -349,6 +349,7 @@ Last one-time research refresh: 2026-06-05.
 | Healthcare Management Administrators | tpa | https://sawus2prdticmrfhma.z5.web.core.windows.net/ | public HMA machine-readable file directory; aliases: HMA, AccessHMA |
 | HealthScope Benefits | tpa | - | needs official source URL |
 | Health Plans Inc (HPI) | tpa | https://hpitpa.com/transparency-in-coverage-machine-readable-files/ | public transparency URL; delegates MRF listing to Healthcare Bluebook; aliases: HPI, Health Plans Inc, Health Plans, Inc, HealthPlans Inc |
+| HealthComp | tpa | https://healthcomp.sapphiremrfhub.com/ | public Sapphire MRF hub; aliases: HealthComp LLC, HCOnline, Personify Health, Personify |
 | Healthgram | tpa | https://mrf.healthgram.com/ | public MRF network directory; resolver expands network pages to current TOC JSON links |
 | Group Administrators | tpa | https://www.groupadministrators.com/machinereadablefiles/ | public iframe-hosted MRF table; aliases: Group Administrators Ltd |
 | Loomis | tpa | https://mrf.healthcarebluebook.com/Loomis | public Healthcare Bluebook MRF directory; aliases: Loomis Company, Loomis Benefit Administrators, The Loomis Company, LOOMIS COMPANY (THE) |
@@ -365,6 +366,9 @@ Last one-time research refresh: 2026-06-05.
 | Professional Benefit Administrators | tpa | https://www.pbaclaims.com/mrfs/ | curated source row |
 | Quartz Benefits | tpa | https://quartzfhir.healthsparq.com/app/public/#/one/insurerCode=QUARTZ_I&brandCode=QUARTZ/machine-readable-transparency-in-coverage | observed current; 2,557 plans; 49,120 files |
 | Regency Employee Benefits | tpa | https://www.mymedicalshopper.com/mrf-search/robbins-regency-employee-benefits-inc-regn | public MyMedicalShopper/TALON MRF search; aliases: Robbins Regency Employee Benefits |
+| SimplePay Health | tpa | https://www.simplepayhealth.com/ | public landing page delegates MRF access to Meritain/Aetna HealthSparq; aliases: SimplePay |
+| SISCO | tpa | https://sisconosurprise.com/ppo/phcs/index.html | public SISCO PPO machine-readable file page for PHCS TOC; aliases: SISCO Benefits, Self Insured Services Company |
+| SISCO | tpa | https://sisconosurprise.com/ppo/hps/index.html | public SISCO PPO machine-readable file page for HPS in-network file; aliases: SISCO Benefits, Self Insured Services Company |
 | Tall Tree Administrators | tpa | https://talltreeadmin.com/machine-readable-files | public MRF link page; aliases: Tall Tree, Tall Tree Administration |
 | Unified Group Services | tpa | https://mrf.healthcarebluebook.com/unified | public Healthcare Bluebook MRF directory; aliases: UGS, UnifiedGrp |
 | Varipro | tpa | https://www.mymedicalshopper.com/mrf-search/varipro | MyMedicalShopper/TALON MRF search; resolver enumerates current employer plan TOCs |

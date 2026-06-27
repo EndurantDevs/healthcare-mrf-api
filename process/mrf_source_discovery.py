@@ -627,6 +627,10 @@ def classify_hosting_platform(url: str | None) -> str | None:
             host in {"www.anglehealth.com", "anglehealth.com"}
             and "machine-readable-files" in path
         )
+        or (
+            host in {"www.simplepayhealth.com", "simplepayhealth.com"}
+            and path in {"", "/"}
+        )
         or host == "transparency.abadmin.com"
     ):
         return "html_delegated_mrf_links"
@@ -657,7 +661,7 @@ def classify_hosting_platform(url: str | None) -> str | None:
         and "machine-readable-files" in path
     ):
         return "html_mrf_links"
-    if host == "sisconosurprise.com" and path.startswith("/ppo/phcs/"):
+    if host == "sisconosurprise.com" and path.startswith("/ppo/"):
         return "html_mrf_links"
     if host == "transparency-in-coverage.collectivehealth.com":
         return "html_mrf_links"
@@ -3201,6 +3205,120 @@ def _parse_sapphire_toc_links(html_text: str, *, base_url: str) -> list[dict[str
             "label": _label_from_index_name(Path(path).name),
         }
     return list(urls.values())
+
+
+def _sapphire_origin_url(url: str) -> str:
+    parsed = urlsplit(str(url or ""))
+    if not parsed.scheme or not parsed.netloc:
+        return url
+    return f"{parsed.scheme}://{parsed.netloc}/"
+
+
+def _sapphire_page_data_url(url: str) -> str:
+    return urljoin(_sapphire_origin_url(url), "page-data/index/page-data.json")
+
+
+def _sapphire_static_query_url(url: str, query_hash: str) -> str:
+    return urljoin(
+        _sapphire_origin_url(url),
+        f"page-data/sq/d/{quote(str(query_hash).strip(), safe='')}.json",
+    )
+
+
+def _sapphire_static_query_hashes(page_data_text: str | None) -> list[str]:
+    hashes: list[str] = []
+    try:
+        payload = json.loads(page_data_text or "{}")
+    except json.JSONDecodeError:
+        payload = {}
+    if isinstance(payload, dict):
+        raw_hashes = payload.get("staticQueryHashes")
+        if not isinstance(raw_hashes, list):
+            result = payload.get("result")
+            if isinstance(result, dict):
+                raw_hashes = result.get("staticQueryHashes")
+        if isinstance(raw_hashes, list):
+            for item in raw_hashes:
+                value = str(item or "").strip()
+                if value:
+                    hashes.append(value)
+    if hashes:
+        return list(dict.fromkeys(hashes))
+    for match in re.finditer(
+        r'"staticQueryHashes"\s*:\s*\[(?P<values>[^\]]*)\]',
+        page_data_text or "",
+        flags=re.I | re.S,
+    ):
+        for value in re.findall(r'"([^"]+)"', match.group("values")):
+            value = value.strip()
+            if value:
+                hashes.append(value)
+    return list(dict.fromkeys(hashes))
+
+
+def _parse_sapphire_static_query_toc_links(
+    query_text: str | None,
+) -> list[dict[str, Any]]:
+    try:
+        payload = json.loads(query_text or "{}")
+    except json.JSONDecodeError:
+        return []
+    data = payload.get("data") if isinstance(payload, dict) else None
+    all_tocs = data.get("allTocsJson") if isinstance(data, dict) else None
+    edges = all_tocs.get("edges") if isinstance(all_tocs, dict) else None
+    if not isinstance(edges, list):
+        return []
+    urls: dict[str, dict[str, Any]] = {}
+    for edge in edges:
+        node = edge.get("node") if isinstance(edge, dict) else None
+        if not isinstance(node, dict):
+            continue
+        url = str(node.get("url") or "").strip()
+        file_name = str(node.get("file_name") or Path(urlsplit(url).path).name)
+        payer_name = _clean_text(node.get("payer_name"))
+        if not url or not _looks_html_mrf_toc_url(url, file_name or payer_name):
+            continue
+        label = payer_name or _label_from_index_name(file_name)
+        urls[_canonical_or_none(url) or url] = {
+            "url": url,
+            "label": label,
+            "file_name": file_name,
+            "payer_name": payer_name,
+        }
+    return list(urls.values())
+
+
+async def _resolve_sapphire_static_query_toc_links(
+    url: str,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> list[dict[str, Any]]:
+    page_data_url = _sapphire_page_data_url(url)
+    page_data_text = await _fetch_text(
+        page_data_url,
+        max_bytes=int(resolver.get("page_data_max_bytes") or 1024 * 1024),
+        session=session,
+        expect_json=True,
+    )
+    max_queries = _as_int(resolver.get("max_static_queries")) or 8
+    max_targets = _as_int(resolver.get("max_targets"))
+    targets: dict[str, dict[str, Any]] = {}
+    for query_hash in _sapphire_static_query_hashes(page_data_text)[:max_queries]:
+        query_text = await _fetch_text(
+            _sapphire_static_query_url(url, query_hash),
+            max_bytes=int(resolver.get("static_query_max_bytes") or 25 * 1024 * 1024),
+            session=session,
+            expect_json=True,
+        )
+        for target in _parse_sapphire_static_query_toc_links(query_text):
+            key = _canonical_or_none(str(target.get("url") or "")) or str(
+                target.get("url") or ""
+            )
+            if key:
+                targets[key] = target
+            if max_targets and len(targets) >= max_targets:
+                return list(targets.values())
+    return list(targets.values())
 
 
 def _parse_healthgram_network_pages(
@@ -6717,6 +6835,10 @@ async def _crawl_targets_for_source(
         )
         targets = _parse_sapphire_toc_links(html_text, base_url=url)
         if not targets:
+            targets = await _resolve_sapphire_static_query_toc_links(
+                url, resolver, session
+            )
+        if not targets:
             raise ValueError(f"no Sapphire TOC links found for {url}")
         return [
             CrawlTarget(
@@ -6724,7 +6846,11 @@ async def _crawl_targets_for_source(
                 url=str(target["url"]),
                 label=str(target.get("label") or source.get("display_name") or ""),
                 resolved_from_url=url,
-                metadata={"resolver": resolver_type},
+                metadata={
+                    "resolver": resolver_type,
+                    "file_name": target.get("file_name"),
+                    "payer_name": target.get("payer_name"),
+                },
             )
             for target in targets
         ]
