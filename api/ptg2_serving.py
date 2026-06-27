@@ -1270,14 +1270,14 @@ async def _ptg2_manifest_location_provider_matches(
             location_select_sql = (
                 f"CASE WHEN {same_zip_sql} THEN 0.0 ELSE {distance_sql} END AS distance_miles, "
                 f"CASE WHEN {same_zip_sql} THEN 'same_zip' ELSE 'radius' END AS zip_match_type, "
-                ":zip5 AS anchor_zip5, :geo_radius_miles AS zip_radius_miles, "
+                ":zip5 AS anchor_zip5, CAST(:geo_radius_miles AS double precision) AS zip_radius_miles, "
                 f"CASE WHEN {same_zip_sql} THEN 0 ELSE 1 END AS zip_rank"
             )
         else:
             location_select_sql = (
                 f"{distance_sql} AS distance_miles, "
                 "'radius' AS zip_match_type, "
-                "NULL::varchar AS anchor_zip5, :geo_radius_miles AS zip_radius_miles, "
+                "NULL::varchar AS anchor_zip5, CAST(:geo_radius_miles AS double precision) AS zip_radius_miles, "
                 "0 AS zip_rank"
             )
         location_order_sql = "addr.npi, zip_rank, distance_miles ASC NULLS LAST"

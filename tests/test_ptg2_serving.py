@@ -1647,7 +1647,7 @@ async def test_manifest_location_provider_matches_filters_coordinates_with_unifi
     assert "ORDER BY zip_rank, distance_miles ASC NULLS LAST, npi" in sql
     assert "AS distance_miles" in sql
     assert "AS zip_match_type" in sql
-    assert ":geo_radius_miles AS zip_radius_miles" in sql
+    assert "CAST(:geo_radius_miles AS double precision) AS zip_radius_miles" in sql
     assert "addr.telephone_number" in sql
     assert "'telephone_number', " in sql
     assert "AS telephone_number" in sql
