@@ -166,6 +166,7 @@ Last one-time research refresh: 2026-06-05.
 | American Specialty Health | network/tpa | - | needs official source URL |
 | Carelon | network/tpa | - | needs official source URL |
 | Davis Vision | network/tpa | - | needs official source URL |
+| Delta Dental Plan of Michigan | dental | https://bcbsm.sapphiremrfhub.com/tocs/current/delta_dental_plan_of_mich | public Delta Dental Plan of Michigan machine-readable file linked through BCBSM Sapphire current TOC; aliases: Delta Dental of Michigan, Delta Dental Plan of Mich |
 | EyeMed | network/tpa | - | needs official source URL |
 | GEHA | network/tpa | - | needs official source URL |
 | HealthLink | network/tpa | https://www.healthlink.com/machine-readable-file/search/ | public Anthem/Elevance machine-readable file search page; aliases: HealthLink Network |
