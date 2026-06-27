@@ -486,6 +486,25 @@ def test_master_list_aliases_are_stored_on_source_and_payer_rows():
     assert source_row["metadata_json"]["source_coverage"] == ["national"]
 
 
+def test_master_list_public_gap_sources_classify_supported_platforms():
+    markdown = """
+| Payer | Type | Public MRF TOC / landing URL | Notes |
+|---|---|---|---|
+| Select Health | regional | https://www.selecthealth.org/disclaimers/machine-readable-data | aliases: SelectHealth |
+| EMI Health | regional | https://emihealth.com/machinereadables | public machine-readable files page |
+| Carefactor | tpa | https://mrf.healthcarebluebook.com/Carefactor | aliases: CareFactor |
+"""
+
+    candidates = discovery.parse_master_list(markdown)
+    by_name = {candidate.payer_name: candidate for candidate in candidates}
+
+    assert by_name["Select Health"].hosting_platform == "html_mrf_links"
+    assert by_name["Select Health"].aliases == ("SelectHealth",)
+    assert by_name["EMI Health"].hosting_platform == "html_mrf_links"
+    assert by_name["Carefactor"].hosting_platform == "healthcarebluebook_mrf"
+    assert by_name["Carefactor"].aliases == ("CareFactor",)
+
+
 def test_crawl_target_context_metadata_carries_benefit_lines_from_source():
     target = discovery.CrawlTarget(
         source={

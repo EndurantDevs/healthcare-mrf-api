@@ -660,6 +660,15 @@ def classify_hosting_platform(url: str | None) -> str | None:
     ):
         return "html_mrf_links"
     if (
+        host in {"www.selecthealth.org", "selecthealth.org"}
+        and "machine-readable-data" in path
+    ):
+        return "html_mrf_links"
+    if host in {"www.emihealth.com", "emihealth.com"} and path.startswith(
+        "/machinereadables"
+    ):
+        return "html_mrf_links"
+    if (
         host in {"www.sanfordhealthplan.com", "sanfordhealthplan.com"}
         and "transparency-in-coverage-rule" in path
     ):
