@@ -89,7 +89,7 @@ Last one-time research refresh: 2026-06-05.
 | Highmark Blue Shield of Northeastern New York | blue | - | needs official source URL |
 | Highmark Blue Shield Pennsylvania | blue | - | needs official source URL |
 | HMSA | blue | https://www.hmsa.com/help-center/transparency-in-coverage-machine-readable-files/ | curated source row; aliases: HAWAII BLUE CROSS BLUE SHIELD HMSA, Hawaii Blue Cross Blue Shield HMSA |
-| Horizon BCBS NJ | blue | https://horizonblue.sapphiremrfhub.com/ | curated source row |
+| Horizon BCBS NJ | blue | https://horizonblue.sapphiremrfhub.com/ | curated source row; aliases: Horizon Blue Cross of New Jersey, Horizon Blue Cross Blue Shield of New Jersey |
 | Horizon Blue | blue | https://horizonblue.sapphiremrfhub.com/ | observed current; 2,591 plans; 3,446 files |
 | Horizon Blue Cross Blue Shield New Jersey | blue | - | needs official source URL |
 | Independence Blue Cross | blue | https://www.ibx.com/cmstic/?brand=qcc | curated source row; aliases: Independence Administrators, Pennsylvania Independence Blue Cross |
@@ -204,7 +204,7 @@ Last one-time research refresh: 2026-06-05.
 | Physicians Health Plan of N. Indiana | provider_sponsored | - | needs official source URL |
 | Presbyterian Health Plan | provider_sponsored | https://www.phs.org/tools-resources/member/Pages/applicable-rates.aspx | curated source row |
 | Prevea360 | provider_sponsored | https://www.deancare.com/helpful-links/transparency-in-coverage | curated source row |
-| Priority Health | provider_sponsored | https://www.priorityhealth.com/landing/transparency | curated source row |
+| Priority Health | provider_sponsored | https://www.priorityhealth.com/landing/transparency | curated source row; aliases: Priority Health of Michigan |
 | ProMedica | provider_sponsored | - | needs official source URL |
 | Providence Health Plan | provider_sponsored | https://mrfhub.providencehealthplan.com/ | curated source row |
 | Quartz Benefits | provider_sponsored | https://quartzfhir.healthsparq.com/app/public/#/one/insurerCode=QUARTZ_I&brandCode=QUARTZ/ | curated source row |
@@ -215,7 +215,7 @@ Last one-time research refresh: 2026-06-05.
 | Sentara | provider_sponsored | https://www.optimahealth.com/transparency-in-coverage | curated source row; aliases: Sentara Health |
 | Sharp Health Plan | provider_sponsored | - | needs official source URL |
 | SSM Health Plan | provider_sponsored | https://www.ssmhealth.com/resources/pay-my-bill/price-estimate/price-transparency | public transparency URL |
-| Sutter Health Plan | provider_sponsored | https://www.sutterhealthplan.org/healthcare-cost-transparency | public transparency URL |
+| Sutter Health Plan | provider_sponsored | https://www.sutterhealthplan.org/healthcare-cost-transparency | public transparency URL; aliases: Sutter Health Plus |
 | University of Utah HP | provider_sponsored | https://www.hopkinshealthplans.org/transparency-in-coverage/ | curated source row |
 | UPMC Health Plan | provider_sponsored | https://www.upmchealthplan.com/transparency-in-coverage/mrf/ | curated source row |
 | UPMC Health System | provider_sponsored | - | needs official source URL |
@@ -317,7 +317,7 @@ Last one-time research refresh: 2026-06-05.
 | The Health Plan of the Upper Ohio Valley | regional | - | needs official source URL |
 | The Jefferson Health Plan | regional | - | needs official source URL |
 | Tufts Health Plan | regional | https://tuftshealthplan.com/visitor/legal-notices/machine-readable-files | curated source row |
-| UHA Health Insurance | regional | https://www.uhahealth.com/important-notices/transparency-in-coverage-and-no-surprises-act-overview | curated source row |
+| UHA Health Insurance | regional | https://www.uhahealth.com/important-notices/transparency-in-coverage-and-no-surprises-act-overview | curated source row; aliases: UHA |
 | Univera Healthcare | regional | - | needs official source URL |
 | USAble Mutual Insurance | regional | - | needs official source URL |
 | WEA Trust | regional | - | needs official source URL |

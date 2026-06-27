@@ -674,6 +674,7 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Employee Benefit Management Services EBMS" in by_name["EBMS"].aliases
     assert "Independence Administrators" in by_name["Independence Blue Cross"].aliases
     assert "Regence BlueShield" in by_name["Regence"].aliases
+    assert "Horizon Blue Cross of New Jersey" in by_name["Horizon BCBS NJ"].aliases
     assert by_name["Delta Dental Plan of Michigan"].entity_type == "dental"
     assert by_name["Delta Dental Plan of Michigan"].hosting_platform == "sapphire"
     assert (
@@ -705,6 +706,9 @@ async def test_master_list_keeps_high_value_public_aliases():
     )
     assert "Cypress Benefit Administrators" in by_name["Lucent Health"].aliases
     assert "Sierra Health and Life" in by_name["United Healthcare"].aliases
+    assert "Priority Health of Michigan" in by_name["Priority Health"].aliases
+    assert "Sutter Health Plus" in by_name["Sutter Health Plan"].aliases
+    assert "UHA" in by_name["UHA Health Insurance"].aliases
     assert "Auxient TPA" in by_name["Auxiant"].aliases
     assert "EBPA Employee Benefits" in by_name["EBPA"].aliases
     assert "AmeriBen Anthem Blue Cross" in by_name["AmeriBen"].aliases
