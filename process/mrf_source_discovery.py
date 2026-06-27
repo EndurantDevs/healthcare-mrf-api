@@ -7852,6 +7852,60 @@ def _import_control_plan_info_with_context_ids(
     return next_info
 
 
+_GENERIC_IMPORT_CONTROL_PLAN_LABELS = {
+    "allowed amount",
+    "allowed amounts",
+    "allowed amount file",
+    "allowed amounts file",
+    "in network",
+    "in-network",
+    "in network file",
+    "in-network file",
+    "in network rates",
+    "in-network rates",
+    "local in-network negotiated rates file",
+    "local network",
+    "machine readable files",
+}
+
+
+def _import_control_file_context_plan_info(
+    *,
+    source_id: str,
+    description: Any,
+    network_name: Any,
+    company_name: Any,
+    from_index_url: Any,
+    canonical_url: Any,
+) -> list[dict[str, Any]]:
+    for candidate in (description, network_name, company_name):
+        plan_name = _clean_text(candidate)
+        if not plan_name:
+            continue
+        normalized = re.sub(r"[^a-z0-9]+", " ", plan_name.lower()).strip()
+        if normalized in _GENERIC_IMPORT_CONTROL_PLAN_LABELS:
+            continue
+        plan_id = semantic_hash(
+            {
+                "source_id": source_id,
+                "source_index_url": str(from_index_url or "").strip(),
+                "canonical_url": str(canonical_url or "").strip(),
+                "plan_name": plan_name,
+                "market_type": "group",
+            },
+            domain="mrf_source_file_context_plan",
+        )[:32]
+        return [
+            {
+                "plan_id": plan_id,
+                "plan_id_type": "source_file_context_hash",
+                "plan_market_type": "group",
+                "plan_name": plan_name,
+            }
+        ]
+    return []
+
+
 def _plan_lookup_from_rows(
     rows: list[Any],
 ) -> dict[tuple[str, str, str | None, str | None], dict[str, Any]]:
@@ -8085,10 +8139,19 @@ async def _import_control_snapshot_items(
             plan_info = _enrich_plan_info_from_lookup(row[0], plan_info, plan_lookup)
         company_name = _company_name_from_index_url(row[11])
         plan_info = _apply_company_fallback(plan_info, company_name)
-        if not plan_info:
-            continue
         original_url = row[1] or row[2]
         if not original_url:
+            continue
+        if not plan_info:
+            plan_info = _import_control_file_context_plan_info(
+                source_id=row[0],
+                description=row[10] or metadata.get("description"),
+                network_name=row[9],
+                company_name=company_name,
+                from_index_url=row[11],
+                canonical_url=row[2] or original_url,
+            )
+        if not plan_info:
             continue
         plan_info = _import_control_plan_info_with_context_ids(
             source_id=row[0],

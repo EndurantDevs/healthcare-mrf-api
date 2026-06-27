@@ -2298,6 +2298,45 @@ def test_import_control_context_plan_info_adds_stable_ids_for_label_only_plans()
     assert enriched[1]["plan_id_type"] == "ein"
 
 
+def test_import_control_file_context_plan_info_uses_meaningful_file_labels():
+    plan_info = discovery._import_control_file_context_plan_info(
+        source_id="source_1",
+        description="PHCS/Multiplan Network",
+        network_name="In-Network file",
+        company_name="Machine Readable Files",
+        from_index_url="https://example.test/machine-readable-files",
+        canonical_url="https://example.test/rates.json.gz",
+    )
+    repeated = discovery._import_control_file_context_plan_info(
+        source_id="source_1",
+        description="PHCS/Multiplan Network",
+        network_name="In-Network file",
+        company_name="Machine Readable Files",
+        from_index_url="https://example.test/machine-readable-files",
+        canonical_url="https://example.test/rates.json.gz",
+    )
+
+    assert plan_info == repeated
+    assert plan_info[0]["plan_id"]
+    assert plan_info[0]["plan_id_type"] == "source_file_context_hash"
+    assert plan_info[0]["plan_market_type"] == "group"
+    assert plan_info[0]["plan_name"] == "PHCS/Multiplan Network"
+
+
+def test_import_control_file_context_plan_info_skips_generic_file_labels():
+    assert (
+        discovery._import_control_file_context_plan_info(
+            source_id="source_1",
+            description="In-Network file",
+            network_name="Local network",
+            company_name="Machine Readable Files",
+            from_index_url="https://example.test/machine-readable-files",
+            canonical_url="https://example.test/rates.json.gz",
+        )
+        == []
+    )
+
+
 def test_split_preview_items_slices_large_plan_info_without_changing_file_identity():
     [first, second, third] = discovery._split_preview_items(
         [
