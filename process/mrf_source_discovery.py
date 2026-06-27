@@ -623,6 +623,10 @@ def classify_hosting_platform(url: str | None) -> str | None:
             and path.startswith("/resources/mrf")
         )
         or (host in {"www.hnas.com", "hnas.com"} and "machine-readable-files" in path)
+        or (
+            host in {"www.anglehealth.com", "anglehealth.com"}
+            and "machine-readable-files" in path
+        )
         or host == "transparency.abadmin.com"
     ):
         return "html_delegated_mrf_links"
@@ -669,6 +673,11 @@ def classify_hosting_platform(url: str | None) -> str | None:
         return "html_mrf_links"
     if host in {"www.emihealth.com", "emihealth.com"} and path.startswith(
         "/machinereadables"
+    ):
+        return "html_mrf_links"
+    if (
+        host in {"www.pacificsource.com", "pacificsource.com"}
+        and "resources/json-files" in path
     ):
         return "html_mrf_links"
     if host == "boonchapman-mrf.zakipointhealth.com":

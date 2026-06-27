@@ -537,6 +537,8 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
 | Select Health | regional | https://www.selecthealth.org/disclaimers/machine-readable-data | aliases: SelectHealth |
 | EMI Health | regional | https://emihealth.com/machinereadables | public machine-readable files page |
 | MotivHealth Insurance Company | regional | https://www.motivhealth.com/machinereadablefiles/ | aliases: MotivHealth |
+| PacificSource | regional | https://pacificsource.com/resources/json-files | aliases: Pacific Source |
+| Angle Health | regional | https://www.anglehealth.com/machine-readable-files | aliases: Angle, Adrem Administrators |
 | CBA Blue | tpa | https://www.cbabluevt.com/employer-resources/ | aliases: CBA BLUE |
 | EBMS | tpa | https://caa.ebms.com/ | aliases: Employee Benefit Management Services |
 | EBPA | tpa | https://tuition.ebpabenefits.com/employers/machine-readable-file-links | aliases: EBPA Benefits |
@@ -556,6 +558,10 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
     assert by_name["Select Health"].aliases == ("SelectHealth",)
     assert by_name["EMI Health"].hosting_platform == "html_mrf_links"
     assert by_name["MotivHealth Insurance Company"].hosting_platform == "html_mrf_links"
+    assert by_name["PacificSource"].hosting_platform == "html_mrf_links"
+    assert by_name["PacificSource"].aliases == ("Pacific Source",)
+    assert by_name["Angle Health"].hosting_platform == "html_delegated_mrf_links"
+    assert by_name["Angle Health"].aliases == ("Angle", "Adrem Administrators")
     assert by_name["CBA Blue"].hosting_platform == "html_mrf_links"
     assert by_name["EBMS"].hosting_platform == "ebms_caa_directory"
     assert by_name["EBPA"].hosting_platform == "html_mrf_links"
@@ -580,6 +586,11 @@ async def test_master_list_keeps_high_value_public_aliases():
         "master-list", test_mode=True, limit=2000
     )
     by_name = {candidate.payer_name: candidate for candidate in candidates}
+    aliases_by_name = {}
+    for candidate in candidates:
+        aliases_by_name.setdefault(candidate.payer_name, set()).update(
+            candidate.aliases
+        )
 
     assert "Wellmark Blue Cross and Blue Shield" in by_name["Wellmark"].aliases
     assert "Meritain Health An Aetna Company" in by_name["Meritain Health"].aliases
@@ -590,6 +601,19 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "United Healthcare Dental" in by_name["United Healthcare"].aliases
     assert "UHC Vision" in by_name["United Healthcare"].aliases
     assert "Employee Benefit Management Services EBMS" in by_name["EBMS"].aliases
+    assert "Blue Cross Blue Shield of NC" in aliases_by_name["BCBS North Carolina"]
+    assert "Blue Cross Blue Shield of SC" in aliases_by_name["BCBS South Carolina"]
+    assert (
+        "Blue Benefit Administrators of Massachusetts"
+        in by_name["BCBS Massachusetts"].aliases
+    )
+    assert "MISSOURI BLUE CROSS OF KANSAS CITY" in by_name["BCBS Kansas City"].aliases
+    assert "BlueCross BlueShield of AZ" in by_name["BCBS Arizona"].aliases
+    assert "Pacific Source" in by_name["PacificSource"].aliases
+    assert "Angle" in by_name["Angle Health"].aliases
+    assert "Adrem Administrators" in by_name["Angle Health"].aliases
+    assert "Auxient TPA" in by_name["Auxiant"].aliases
+    assert "EBPA Employee Benefits" in by_name["EBPA"].aliases
 
 
 @pytest.mark.asyncio
@@ -940,6 +964,12 @@ def test_classify_hosting_platforms():
     )
     assert (
         discovery.classify_hosting_platform(
+            "https://www.anglehealth.com/machine-readable-files"
+        )
+        == "html_delegated_mrf_links"
+    )
+    assert (
+        discovery.classify_hosting_platform(
             "https://www.lacare.org/transparency-coverage-machine-readable-files"
         )
         == "html_delegated_mrf_links"
@@ -973,6 +1003,12 @@ def test_classify_hosting_platforms():
     assert (
         discovery.classify_hosting_platform(
             "https://www.securityhealth.org/insurance-resources/json"
+        )
+        == "html_mrf_links"
+    )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://pacificsource.com/resources/json-files"
         )
         == "html_mrf_links"
     )
