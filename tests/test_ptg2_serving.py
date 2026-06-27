@@ -153,6 +153,25 @@ async def test_manifest_filter_npis_by_provider_taxonomy_uses_primary_code_set()
 
 
 @pytest.mark.asyncio
+async def test_manifest_filter_npis_by_inferred_taxonomy_requires_individual_npi():
+    session = FakeSession([FakeResult(rows=[{"npi": 1234567890}])])
+
+    filtered = await ptg2_serving._ptg2_manifest_filter_npis_by_provider_taxonomy(
+        session,
+        {"code": "29888"},
+        [1234567890, 1003179466, 1003141920],
+        limit=10,
+    )
+
+    assert filtered == (1234567890,)
+    sql = str(session.calls[0][0][0])
+    params = session.calls[0][0][1]
+    assert "FROM mrf.npi_taxonomy nt WHERE nt.npi = source_npis.npi" in sql
+    assert "n_entity.entity_type_code" in sql
+    assert "207X00000X" in str(params)
+
+
+@pytest.mark.asyncio
 async def test_manifest_serving_taxonomy_expansion_uses_wider_rate_candidate_window(monkeypatch):
     provider_sets = [f"{idx:032x}" for idx in range(1, 6)]
     price_sets = [f"{idx:032x}" for idx in range(101, 106)]
@@ -1641,6 +1660,48 @@ async def test_manifest_location_provider_matches_applies_specialty_taxonomy_fil
 
 
 @pytest.mark.asyncio
+async def test_manifest_location_provider_matches_inferred_taxonomy_requires_individual_npi(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
+    group_id = "00000000000000000000000000000011"
+    provider_set_id = "00000000000000000000000000000012"
+    session = FakeSession(
+        [
+            FakeResult(rows=[(column,) for column in sorted(ptg2_serving._PTG2_UNIFIED_ADDRESS_COLUMNS)]),
+            False,
+            FakeResult(rows=[]),
+        ]
+    )
+    tables = ptg2_serving.PTG2ServingTables(
+        provider_group_member_table="mrf.ptg2_provider_group_member_snap",
+        artifacts={"provider_inverted": {"name": "provider_inverted", "path": "/tmp/provider_inverted.ptg2sc"}},
+    )
+    monkeypatch.setattr(
+        ptg2_serving,
+        "_ptg2_manifest_sidecar_members_many",
+        lambda *_a, **_k: {group_id: (provider_set_id,)},
+    )
+
+    await ptg2_serving._ptg2_manifest_location_provider_matches(
+        session,
+        tables,
+        {
+            "lat": "34.14024131",
+            "long": "-118.255125",
+            "radius_miles": "10",
+            "limit": "5",
+            "code": "29888",
+        },
+        candidate_limit=5,
+    )
+
+    sql = str(session.calls[2][0][0])
+    params = session.calls[2][0][1]
+    assert "FROM mrf.npi_taxonomy nt WHERE nt.npi = addr.npi" in sql
+    assert "n_entity.entity_type_code" in sql
+    assert "207X00000X" in str(params)
+
+
+@pytest.mark.asyncio
 async def test_compact_serving_include_providers_expands_without_geo_filter(monkeypatch):
     monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "legacy")
     session = FakeSession(
@@ -2136,6 +2197,7 @@ async def test_compact_serving_geo_provider_filter_paginates_after_provider_matc
     assert "LIMIT :rate_candidate_limit OFFSET" not in sql
     assert "provider_filtered_rates AS MATERIALIZED" in sql
     assert sql.rstrip().endswith("LIMIT :limit OFFSET :offset")
+    assert "n_entity.entity_type_code" in sql
     assert params["limit"] == 1
     assert params["rate_candidate_limit"] > params["limit"]
 

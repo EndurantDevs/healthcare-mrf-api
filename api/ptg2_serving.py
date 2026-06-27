@@ -191,6 +191,13 @@ def _ptg2_provider_name_sql(alias: str = "n") -> str:
     )
 
 
+def _ptg2_individual_npi_exists_sql(npi_sql: str) -> str:
+    return (
+        f"EXISTS (SELECT 1 FROM {PTG2_SCHEMA}.npi n_entity "
+        f"WHERE n_entity.npi = {npi_sql} AND COALESCE(n_entity.entity_type_code, 0) = 1)"
+    )
+
+
 async def _ptg2_table_has_columns(session, table_name: str, required_columns: set[str]) -> bool:
     safe_table_name = _safe_table_name(table_name)
     if not safe_table_name:
@@ -1007,6 +1014,7 @@ async def _ptg2_manifest_filter_npis_by_provider_taxonomy(
         predicates.append(
             f"EXISTS (SELECT 1 FROM {PTG2_SCHEMA}.npi_taxonomy nt WHERE nt.npi = source_npis.npi AND {inferred_sql})"
         )
+        predicates.append(_ptg2_individual_npi_exists_sql("source_npis.npi"))
     if not predicates:
         return candidate_npis[: max(int(limit), 1)]
     result = await session.execute(
@@ -1143,6 +1151,7 @@ async def _ptg2_manifest_location_provider_matches(
             f"EXISTS (SELECT 1 FROM {PTG2_SCHEMA}.npi_taxonomy nt "
             f"WHERE nt.npi = addr.npi AND {location_inferred_taxonomy_sql})"
         )
+        filters.append(_ptg2_individual_npi_exists_sql("addr.npi"))
 
     address_location_source = _ptg2_address_location_source(npi_address_table)
     address_location_hash_sql = _ptg2_address_location_hash_sql("addr", npi_address_table)
@@ -1907,6 +1916,7 @@ def _compact_provider_filter_sql(
             clauses.append("UPPER(COALESCE(loc.state, '')) = :state_exact")
         if inferred_sql:
             clauses.append(f"EXISTS (SELECT 1 FROM {PTG2_SCHEMA}.npi_taxonomy nt WHERE nt.npi = loc.npi AND {inferred_sql})")
+            clauses.append(_ptg2_individual_npi_exists_sql("loc.npi"))
         if specialty_filter.active:
             clauses.append(
                 provider_specialty_taxonomy_exists_sql(
@@ -1992,6 +2002,7 @@ def _compact_provider_filter_sql(
         )
     if inferred_sql:
         clauses.append(f"EXISTS (SELECT 1 FROM {PTG2_SCHEMA}.npi_taxonomy nt WHERE nt.npi = pgm_filter.npi AND {inferred_sql})")
+        clauses.append(_ptg2_individual_npi_exists_sql("pgm_filter.npi"))
     where = " AND ".join(clauses) or "TRUE"
     return (
         f"""
@@ -2068,6 +2079,7 @@ def _compact_provider_expansion_sql(
         member_predicates.append(
             f"EXISTS (SELECT 1 FROM {PTG2_SCHEMA}.npi_taxonomy nt WHERE nt.npi = pgm.npi AND {inferred_sql})"
         )
+        member_predicates.append(_ptg2_individual_npi_exists_sql("pgm.npi"))
     member_filter_sql = "".join(f"\n          AND {predicate}" for predicate in member_predicates)
     component_join = ""
     member_join = ""
