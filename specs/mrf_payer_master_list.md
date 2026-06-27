@@ -304,7 +304,7 @@ Last one-time research refresh: 2026-06-05.
 | EMI Health | regional | https://emihealth.com/machinereadables | public machine-readable files page with direct health-plan index links; dental-specific rates not evidenced |
 | PacificSource | regional | https://mrf.pacificsource.com/File/Visit/Index | public PacificSource MRF directory; resolver enumerates current Azure index files; resources/json-files is provider/pharmacy/formulary JSON and not a rate MRF source; aliases: PACIFICSOURCE HEALTH PLANS, PacificSource Health Plans, Pacific Source, PacificSource Administrators |
 | Paramount | regional | - | needs official source URL |
-| Partnership HealthPlan | regional | https://www.healthplan.org/machine_readable_files | public transparency URL |
+| Partnership HealthPlan | regional | - | needs official source URL; previous healthplan.org source belongs to The Health Plan |
 | PEHP | regional | https://www.pehp.org/machinereadablefiles | public PEHP machine-readable file page with opaque JSON downloads; aliases: Public Employee Health Plan, PUBLIC EMPLOYEE HEALTH PLAN (PEHP) |
 | Piedmont Health Plan | regional | https://pchp.net/index.php/transparency-in-coverage.html | public transparency URL |
 | Point 72 Health | regional | - | needs official source URL |
@@ -313,8 +313,8 @@ Last one-time research refresh: 2026-06-05.
 | Select Health | regional | https://www.selecthealth.org/disclaimers/machine-readable-data | public machine-readable data page with commercial plan index links; aliases: SelectHealth, Select Health |
 | Spectrum | regional | - | needs official source URL |
 | SummaCare | regional | - | needs official source URL |
-| The Health Plan | regional | https://www.healthplan.org/multiplan_mrfs | public transparency URL |
-| The Health Plan of the Upper Ohio Valley | regional | - | needs official source URL |
+| The Health Plan | regional | https://www.healthplan.org/machine_readable_files | public parent MRF page with network-specific directories; aliases: The Health Plan of West Virginia, The Health Plan of WV, The Health Plan of the Upper Ohio Valley, THP |
+| The Health Plan of the Upper Ohio Valley | regional | - | represented by The Health Plan public parent MRF page alias |
 | The Jefferson Health Plan | regional | - | needs official source URL |
 | Tufts Health Plan | regional | https://tuftshealthplan.com/visitor/legal-notices/machine-readable-files | curated source row |
 | UHA Health Insurance | regional | https://www.uhahealth.com/important-notices/transparency-in-coverage-and-no-surprises-act-overview | curated source row; aliases: UHA |

@@ -46,6 +46,14 @@ def test_source_urls_are_loaded_from_registry_file():
     assert config["platform_resolvers"]["html_mrf_links"]["type"] == "html_mrf_links"
     assert config["platform_resolvers"]["html_mrf_links"]["max_frames"] == 5
     assert (
+        config["platform_resolvers"]["healthplan_html_mrf_links"]["type"]
+        == "html_mrf_links"
+    )
+    assert (
+        config["platform_resolvers"]["healthplan_html_mrf_links"]["max_directories"]
+        == 20
+    )
+    assert (
         config["platform_resolvers"]["json_mrf_directory_links"]["type"]
         == "json_mrf_directory_links"
     )
@@ -334,7 +342,21 @@ def test_classify_hosting_platform_recognizes_public_adapter_pages():
     )
     assert (
         discovery.classify_hosting_platform("https://www.healthplan.org/multiplan_mrfs")
-        == "html_mrf_links"
+        == "healthplan_html_mrf_links"
+    )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://www.healthplan.org/machine_readable_files"
+        )
+        == "healthplan_html_mrf_links"
+    )
+    assert (
+        discovery.classify_hosting_platform("https://www.healthplan.org/thp_mrfs")
+        == "healthplan_html_mrf_links"
+    )
+    assert (
+        discovery.classify_hosting_platform("https://www.healthplan.org/amps_mrfs")
+        == "healthplan_html_mrf_links"
     )
     assert (
         discovery.classify_hosting_platform(
@@ -498,6 +520,25 @@ def test_parse_master_list_preserves_benefit_lines_for_dental_vision_source():
     assert candidate.aliases == ("Example DV",)
 
 
+def test_candidate_text_filter_matches_public_aliases():
+    candidate = discovery.SourceCandidate(
+        payer_name="The Health Plan",
+        provider="master-list",
+        index_url="https://www.healthplan.org/machine_readable_files",
+        aliases=("The Health Plan of the Upper Ohio Valley", "THP"),
+    )
+
+    assert discovery._candidate_matches_text_filters(
+        candidate, entity_types=(), payer_query="Upper Ohio Valley"
+    )
+    assert discovery._candidate_matches_text_filters(
+        candidate, entity_types=(), payer_query="THP"
+    )
+    assert not discovery._candidate_matches_text_filters(
+        candidate, entity_types=(), payer_query="Unrelated"
+    )
+
+
 def test_parse_master_list_prefers_active_duplicate_over_unsupported_fragment():
     markdown = """
 ## C. Regional, provider-sponsored, Medicaid-MCO, DTC & TPA payers
@@ -604,6 +645,7 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
 | Point C | tpa | https://mrf.healthcarebluebook.com/pointc | aliases: Point C Health |
 | Unified Group Services | tpa | https://mrf.healthcarebluebook.com/unified | aliases: UGS |
 | WellNet | tpa | https://mrf.healthcarebluebook.com/Wellnet | aliases: WellNet Healthcare |
+| The Health Plan | regional | https://www.healthplan.org/machine_readable_files | aliases: The Health Plan of West Virginia, THP |
 """
 
     candidates = discovery.parse_master_list(markdown)
@@ -674,6 +716,11 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
         by_name["Unified Group Services"].hosting_platform == "healthcarebluebook_mrf"
     )
     assert by_name["WellNet"].hosting_platform == "healthcarebluebook_mrf"
+    assert by_name["The Health Plan"].hosting_platform == "healthplan_html_mrf_links"
+    assert by_name["The Health Plan"].aliases == (
+        "The Health Plan of West Virginia",
+        "THP",
+    )
 
 
 @pytest.mark.asyncio
@@ -711,6 +758,12 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert by_name["HealthLink"].hosting_platform == "anthem_s3_mrf"
     assert by_name["VSP Vision"].hosting_platform == "sapphire"
     assert "VSP" in by_name["VSP Vision"].aliases
+    assert by_name["The Health Plan"].hosting_platform == "healthplan_html_mrf_links"
+    assert "The Health Plan of West Virginia" in by_name["The Health Plan"].aliases
+    assert (
+        "The Health Plan of the Upper Ohio Valley" in by_name["The Health Plan"].aliases
+    )
+    assert "THP" in by_name["The Health Plan"].aliases
     assert "Blue Cross Blue Shield of NC" in aliases_by_name["BCBS North Carolina"]
     assert "Blue Cross Blue Shield of SC" in aliases_by_name["BCBS South Carolina"]
     assert (
@@ -3059,6 +3112,33 @@ def test_parse_html_mrf_links_extracts_tocs_and_body_file_references():
     ]
 
 
+def test_parse_html_mrf_links_accepts_plan_named_tic_index_under_mrf_path():
+    html = """
+    <a href="/mrf/thp/2026-06-01_The-Health-Plan-of-WV-Inc_index.json">
+      2026-06-01_The-Health-Plan-of-WV-Inc_index.json
+    </a>
+    """
+
+    targets = discovery._parse_html_mrf_links(
+        html, base_url="https://www.healthplan.org/thp_mrfs"
+    )
+
+    assert targets == [
+        {
+            "url": (
+                "https://www.healthplan.org/mrf/thp/"
+                "2026-06-01_The-Health-Plan-of-WV-Inc_index.json"
+            ),
+            "label": "2026-06-01_The-Health-Plan-of-WV-Inc_index.json",
+            "resolver": "html_mrf_link",
+            "target_kind": "toc_json",
+            "target_file_type": "table-of-contents",
+            "container_format": None,
+            "html_attr": "href",
+        }
+    ]
+
+
 def test_parse_html_mrf_links_uses_section_context_for_split_body_files():
     html = """
     <h2>Alliance Group Care Price Transparency Machine-Readable Files</h2>
@@ -3488,6 +3568,7 @@ def test_html_mrf_directory_urls_extracts_clear_directory_links():
     <a href="/pricetransparency/MRF/Base">
       Click here to access machine-readable files.
     </a>
+    <a href="/thp_mrfs">THP</a>
     <a href="http://20.114.211.146/CHP/">CHP Machine Readable Files</a>
     <a href="https://www.cms.gov/healthplan-price-transparency">CMS guidance</a>
     <a href="https://github.com/CMSgov/price-transparency-guide">CMS code</a>
@@ -3506,6 +3587,7 @@ def test_html_mrf_directory_urls_extracts_clear_directory_links():
         "https://files.example.test/mrf/plan/TOC/",
         "https://files.example.test/mrf/plan/InNetwork/",
         "https://example.test/pricetransparency/MRF/Base",
+        "https://example.test/thp_mrfs",
         "http://20.114.211.146/CHP/",
     ]
 

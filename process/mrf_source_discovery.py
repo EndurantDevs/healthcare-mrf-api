@@ -455,6 +455,10 @@ def _looks_non_tic_mrf_reference(url: str | None, label: str | None = None) -> b
         )
     ):
         return True
+    if re.match(r"^\d{4}-\d{2}-\d{2}[-_].*[-_]index\.json$", file_name) and re.search(
+        r"/(?:mrf|mrfs)/", path
+    ):
+        return False
     if re.search(
         r"(^|[-/_.])(?:providers?|plans?|drugs?|rx-plan)(?:[-/_.]|\d|$)",
         file_name,
@@ -732,10 +736,12 @@ def classify_hosting_platform(url: str | None) -> str | None:
         and "transparency-in-coverage" in path
     ):
         return "html_mrf_links"
-    if host in {"www.healthplan.org", "healthplan.org"} and path.startswith(
-        "/multiplan_mrfs"
+    if host in {"www.healthplan.org", "healthplan.org"} and (
+        path.startswith("/machine_readable_files")
+        or path.startswith("/multiplan_mrfs")
+        or path.endswith("_mrfs")
     ):
-        return "html_mrf_links"
+        return "healthplan_html_mrf_links"
     if (
         host in {"www.westernhealth.com", "westernhealth.com"}
         and "price-transparency" in path
@@ -7472,11 +7478,13 @@ def _candidate_matches_text_filters(
         entity_type = str(candidate.entity_type or "").lower()
         if not any(item in entity_type for item in entity_types):
             return False
-    if (
-        payer_query
-        and payer_query.lower() not in _clean_text(candidate.payer_name).lower()
-    ):
-        return False
+    if payer_query:
+        query = payer_query.lower()
+        searchable_names = (candidate.payer_name, *candidate.aliases)
+        if not any(
+            query in _clean_text(name).lower() for name in searchable_names if name
+        ):
+            return False
     return True
 
 
