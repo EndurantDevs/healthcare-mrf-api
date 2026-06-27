@@ -855,6 +855,11 @@ def classify_hosting_platform(url: str | None) -> str | None:
         "transparency-in-coverage-machine-readable-files" in path
     ):
         return "hmsa_monthly_toc"
+    if (
+        host in {"www.uhahealth.com", "uhahealth.com"}
+        and "transparency-in-coverage" in path
+    ) or (host == "app.uhahealth.com" and path.startswith("/mrf")):
+        return "uha_monthly_toc"
     if host == "mrfhub.providencehealthplan.com":
         return "providence_mrf_api"
     if host == "transparency.lacare.org":

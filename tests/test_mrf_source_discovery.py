@@ -90,6 +90,10 @@ def test_source_urls_are_loaded_from_registry_file():
         == "bcbsma_monthly_tocs"
     )
     assert (
+        config["platform_resolvers"]["uha_monthly_toc"]["type"]
+        == "monthly_toc_templates"
+    )
+    assert (
         config["platform_resolvers"]["hmsa_monthly_toc"]["type"]
         == "monthly_toc_templates"
     )
@@ -363,6 +367,16 @@ def test_classify_hosting_platform_recognizes_public_adapter_pages():
             "https://www.hmsa.com/help-center/transparency-in-coverage-machine-readable-files/"
         )
         == "hmsa_monthly_toc"
+    )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://www.uhahealth.com/important-notices/transparency-in-coverage-and-no-surprises-act-overview"
+        )
+        == "uha_monthly_toc"
+    )
+    assert (
+        discovery.classify_hosting_platform("https://app.uhahealth.com/mrf/")
+        == "uha_monthly_toc"
     )
     assert (
         discovery.classify_hosting_platform("https://www.bcbsri.com/developers")

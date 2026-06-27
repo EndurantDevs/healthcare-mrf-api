@@ -98,6 +98,13 @@
       "month_offsets": [0, -1],
       "toc_max_bytes": 5242880
     },
+    "uha_monthly_toc": {
+      "type": "monthly_toc_templates",
+      "base_url": "https://app.uhahealth.com/mrf/",
+      "file_templates": ["{month_start}_uha_index.json"],
+      "month_offsets": [0, -1],
+      "toc_max_bytes": 52428800
+    },
     "bcbsri_azure_mrf_listing": {
       "type": "azure_mrf_listing",
       "listing_urls": [
