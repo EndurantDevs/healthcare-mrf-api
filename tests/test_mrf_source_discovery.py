@@ -537,7 +537,6 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
 | Select Health | regional | https://www.selecthealth.org/disclaimers/machine-readable-data | aliases: SelectHealth |
 | EMI Health | regional | https://emihealth.com/machinereadables | public machine-readable files page |
 | MotivHealth Insurance Company | regional | https://www.motivhealth.com/machinereadablefiles/ | aliases: MotivHealth |
-| PacificSource | regional | https://pacificsource.com/resources/json-files | aliases: Pacific Source |
 | Angle Health | regional | https://www.anglehealth.com/machine-readable-files | aliases: Angle, Adrem Administrators |
 | CBA Blue | tpa | https://www.cbabluevt.com/employer-resources/ | aliases: CBA BLUE |
 | EBMS | tpa | https://caa.ebms.com/ | aliases: Employee Benefit Management Services |
@@ -558,8 +557,6 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
     assert by_name["Select Health"].aliases == ("SelectHealth",)
     assert by_name["EMI Health"].hosting_platform == "html_mrf_links"
     assert by_name["MotivHealth Insurance Company"].hosting_platform == "html_mrf_links"
-    assert by_name["PacificSource"].hosting_platform == "html_mrf_links"
-    assert by_name["PacificSource"].aliases == ("Pacific Source",)
     assert by_name["Angle Health"].hosting_platform == "html_delegated_mrf_links"
     assert by_name["Angle Health"].aliases == ("Angle", "Adrem Administrators")
     assert by_name["CBA Blue"].hosting_platform == "html_mrf_links"
@@ -1003,12 +1000,6 @@ def test_classify_hosting_platforms():
     assert (
         discovery.classify_hosting_platform(
             "https://www.securityhealth.org/insurance-resources/json"
-        )
-        == "html_mrf_links"
-    )
-    assert (
-        discovery.classify_hosting_platform(
-            "https://pacificsource.com/resources/json-files"
         )
         == "html_mrf_links"
     )

@@ -301,7 +301,7 @@ Last one-time research refresh: 2026-06-05.
 | Neighborhood Health Plan of RI | regional | https://www.nhpri.org/members/commercial-members-individual-family-plans/price-transparency-machine-readable-files/ | observed current |
 | Network Health | regional | https://networkhealth.com/price-transparency | curated source row |
 | EMI Health | regional | https://emihealth.com/machinereadables | public machine-readable files page with direct health-plan index links; dental-specific rates not evidenced |
-| PacificSource | regional | https://pacificsource.com/resources/json-files | curated source row; aliases: PACIFICSOURCE HEALTH PLANS, PacificSource Health Plans, Pacific Source |
+| PacificSource | regional | - | needs official rate MRF source URL; resources/json-files exposes provider/pharmacy/formulary JSON, not TiC rate files; aliases: PACIFICSOURCE HEALTH PLANS, PacificSource Health Plans, Pacific Source |
 | Paramount | regional | - | needs official source URL |
 | Partnership HealthPlan | regional | https://www.healthplan.org/machine_readable_files | public transparency URL |
 | PEHP | regional | https://www.pehp.org/machinereadablefiles | public PEHP machine-readable file page with opaque JSON downloads; aliases: Public Employee Health Plan |

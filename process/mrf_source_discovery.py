@@ -675,11 +675,6 @@ def classify_hosting_platform(url: str | None) -> str | None:
         "/machinereadables"
     ):
         return "html_mrf_links"
-    if (
-        host in {"www.pacificsource.com", "pacificsource.com"}
-        and "resources/json-files" in path
-    ):
-        return "html_mrf_links"
     if host == "boonchapman-mrf.zakipointhealth.com":
         return "html_mrf_links"
     if (
