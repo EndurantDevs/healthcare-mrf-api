@@ -159,7 +159,7 @@ Last one-time research refresh: 2026-06-05.
 | Optum | national | https://transparency-in-coverage.optum.com/ | curated source row |
 | PreferredOne | national | - | needs official source URL |
 | UMR | national | - | needs official source URL |
-| United Healthcare | national | https://transparency-in-coverage.uhc.com/ | observed current; 26,032 plans; 208,318 files; aliases: UHC, UMR, UMR Inc, UMR-Inc, UMR - A United Healthcare Company, Surest, Surest ASO, UnitedHealthcare Service LLC, UnitedHealthcare Insurance Company, United Healthcare Oxford, Dental Benefit Providers, Connection Dental, United Healthcare Dental, UnitedHealthcare Dental, UHC Dental, United Healthcare Vision, UnitedHealthcare Vision, UHC Vision, Spectera, Spectera Network |
+| United Healthcare | national | https://transparency-in-coverage.uhc.com/ | observed current; 26,032 plans; 208,318 files; aliases: UHC, UMR, UMR Inc, UMR-Inc, UMR - A United Healthcare Company, Surest, Surest ASO, UnitedHealthcare Service LLC, UnitedHealthcare Insurance Company, United Healthcare Oxford, Dental Benefit Providers, Connection Dental, United Healthcare Dental, UnitedHealthcare Dental, UHC Dental, United Healthcare Vision, UnitedHealthcare Vision, UHC Vision, Spectera, Spectera Network, Sierra Health and Life, Sierra Health & Life, Sierra Health and Life Insurance Company |
 | UnitedHealthcare | national | https://providermrf.uhc.com/IFP | curated source row |
 | UnitedHealthcare | national | https://transparency-in-coverage.uhc.com/ | curated source row |
 | UnitedHealthcare Community Plan | national | - | needs official source URL |
@@ -301,7 +301,7 @@ Last one-time research refresh: 2026-06-05.
 | Neighborhood Health Plan of RI | regional | https://www.nhpri.org/members/commercial-members-individual-family-plans/price-transparency-machine-readable-files/ | observed current |
 | Network Health | regional | https://networkhealth.com/price-transparency | curated source row |
 | EMI Health | regional | https://emihealth.com/machinereadables | public machine-readable files page with direct health-plan index links; dental-specific rates not evidenced |
-| PacificSource | regional | - | needs official rate MRF source URL; resources/json-files exposes provider/pharmacy/formulary JSON, not TiC rate files; aliases: PACIFICSOURCE HEALTH PLANS, PacificSource Health Plans, Pacific Source |
+| PacificSource | regional | https://mrf.pacificsource.com/File/Visit/Index | public PacificSource MRF directory; resolver enumerates current Azure index files; resources/json-files is provider/pharmacy/formulary JSON and not a rate MRF source; aliases: PACIFICSOURCE HEALTH PLANS, PacificSource Health Plans, Pacific Source, PacificSource Administrators |
 | Paramount | regional | - | needs official source URL |
 | Partnership HealthPlan | regional | https://www.healthplan.org/machine_readable_files | public transparency URL |
 | PEHP | regional | https://www.pehp.org/machinereadablefiles | public PEHP machine-readable file page with opaque JSON downloads; aliases: Public Employee Health Plan |
@@ -328,6 +328,7 @@ Last one-time research refresh: 2026-06-05.
 | Aetna CVS - Aetna Signature Administrators | tpa | https://health1.aetna.com/app/public/#/one/insurerCode=AETNACVS_I&brandCode=ASA/machine-readable-transparency-in-coverage | observed current; 22 plans; 178 files; aliases: ASA, Aetna Signature |
 | Aetna CVS - Joint Care Administration | tpa | https://health1.aetna.com/app/public/#/one/insurerCode=AETNACVS_I&brandCode=AJCA/machine-readable-transparency-in-coverage | observed current; 73 plans; 2,011 files |
 | Aetna Signature Administrators | tpa | https://health1.aetna.com/app/public/#/one/insurerCode=AETNACVS_I&brandCode=ASA/machine-readable-transparency-in-coverage | curated source row; aliases: ASA, Aetna Signature |
+| Allegiance Benefit Plan Management | tpa | https://mrf.healthcarebluebook.com/Allegiance | public Healthcare Bluebook MRF directory; aliases: Allegiance Benefit Plan Management Inc, AskAllegiance |
 | Allied Benefit Systems | tpa | https://alliedbenefit.sapphiremrfhub.com/ | curated source row; aliases: Allied Benefit |
 | Allied Benefit Systems | tpa | https://www.alliedbenefit.com/transparency-in-coverage-mrf | public transparency URL |
 | AmeriBen | tpa | https://github.com/AmeriBen/MRF | curated source row |
@@ -345,12 +346,13 @@ Last one-time research refresh: 2026-06-05.
 | EBMS | tpa | https://caa.ebms.com/ | public EBMS CAA MRF client directory; resolver expands public client pages to current TOC files; aliases: Employee Benefit Management Services, Employee Benefit Management Services EBMS, Employee Benefit Management Services Inc |
 | EBPA | tpa | https://tuition.ebpabenefits.com/employers/machine-readable-file-links | public EBPA MRF network selector; aliases: EBPA Benefits, EBPA Employee Benefits, EBPA LLC |
 | HealthNow Administrative Services | tpa | https://www.hnas.com/digital-resources/machine-readable-files | public HNAS delegated MRF directory; aliases: HNAS, Brokerage Concepts LLC dba HealthNow Administrative Services |
+| Healthcare Management Administrators | tpa | https://sawus2prdticmrfhma.z5.web.core.windows.net/ | public HMA machine-readable file directory; aliases: HMA, AccessHMA |
 | HealthScope Benefits | tpa | - | needs official source URL |
 | Health Plans Inc (HPI) | tpa | https://hpitpa.com/transparency-in-coverage-machine-readable-files/ | public transparency URL; delegates MRF listing to Healthcare Bluebook; aliases: HPI, Health Plans Inc, Health Plans, Inc, HealthPlans Inc |
 | Healthgram | tpa | https://mrf.healthgram.com/ | public MRF network directory; resolver expands network pages to current TOC JSON links |
 | Group Administrators | tpa | https://www.groupadministrators.com/machinereadablefiles/ | public iframe-hosted MRF table; aliases: Group Administrators Ltd |
 | Loomis | tpa | https://mrf.healthcarebluebook.com/Loomis | public Healthcare Bluebook MRF directory; aliases: Loomis Company, Loomis Benefit Administrators, The Loomis Company, LOOMIS COMPANY (THE) |
-| Lucent Health | tpa | https://lucenthealth.com/transparency-in-coverage/ | public transparency page; delegates INN MRF listing to Healthcare Bluebook |
+| Lucent Health | tpa | https://lucenthealth.com/transparency-in-coverage/ | public transparency page; delegates INN MRF listing to Healthcare Bluebook; aliases: Cypress Benefit Administrators, Cypress Benefit Administrators now Lucent Health |
 | Luminare Health Benefits | tpa | https://mrf.healthcarebluebook.com/luminarehealth | public Healthcare Bluebook MRF directory; aliases: Luminare Health, Luminare Health Benefits (formerly Trustmark), Anthem administered by Luminare Health, Trustmark Health Benefits, Trustmark |
 | MedBen | tpa | https://mb.mrf.payercompass.com/ | public Zelis/PayerCompass MRF repository; aliases: Medical Benefits Mutual Life Insurance Co, Medical Benefits Administrators |
 | MedCost | tpa | https://mrf.mmsanalytics.com/medcost/ | public MRF directory linked from MedCost transparency page; aliases: MedCost, MEDCOST BENEFIT SERVICES (MBS) |
@@ -358,9 +360,11 @@ Last one-time research refresh: 2026-06-05.
 | Meritain Health | tpa | https://health1.aetna.com/app/public/#/one/insurerCode=MERITAIN_I&brandCode=MERITAINOVER/machine-readable-transparency-in-coverage | curated source row; aliases: Meritain, Meritain Health An Aetna Company, MERITAIN HEALTH NORTH AMERICAN HEALTH PLAN |
 | Nova Healthcare Administrators | tpa | https://www.novahealthcare.com/resources/mrf.html | public transparency page with direct and delegated network MRF links; aliases: Nova Healthcare, Nova Healthcare Administrators Inc |
 | PBA | tpa | https://www.pbaclaims.com/mrfs/ | curated source row |
+| Pinnacle Claims Management | tpa | https://mrf.healthcarebluebook.com/Pinnacle | public Healthcare Bluebook MRF directory; aliases: Pinnacle Claims Management Inc, PCMI |
 | Point C | tpa | https://mrf.healthcarebluebook.com/pointc | public Healthcare Bluebook MRF directory; aliases: Point C Health |
 | Professional Benefit Administrators | tpa | https://www.pbaclaims.com/mrfs/ | curated source row |
 | Quartz Benefits | tpa | https://quartzfhir.healthsparq.com/app/public/#/one/insurerCode=QUARTZ_I&brandCode=QUARTZ/machine-readable-transparency-in-coverage | observed current; 2,557 plans; 49,120 files |
+| Regency Employee Benefits | tpa | https://www.mymedicalshopper.com/mrf-search/robbins-regency-employee-benefits-inc-regn | public MyMedicalShopper/TALON MRF search; aliases: Robbins Regency Employee Benefits |
 | Tall Tree Administrators | tpa | https://talltreeadmin.com/machine-readable-files | public MRF link page; aliases: Tall Tree, Tall Tree Administration |
 | Unified Group Services | tpa | https://mrf.healthcarebluebook.com/unified | public Healthcare Bluebook MRF directory; aliases: UGS, UnifiedGrp |
 | Varipro | tpa | https://www.mymedicalshopper.com/mrf-search/varipro | MyMedicalShopper/TALON MRF search; resolver enumerates current employer plan TOCs |

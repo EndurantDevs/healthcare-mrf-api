@@ -93,6 +93,16 @@ def test_source_urls_are_loaded_from_registry_file():
         == "azure_mrf_listing"
     )
     assert (
+        config["platform_resolvers"]["pacificsource_azure_mrf_listing"]["type"]
+        == "azure_mrf_listing"
+    )
+    assert (
+        "w2bipdmrfsa.blob.core.windows.net"
+        in config["platform_resolvers"]["pacificsource_azure_mrf_listing"][
+            "listing_urls"
+        ][0]
+    )
+    assert (
         config["platform_resolvers"]["payercompass_mrf"]["type"] == "payercompass_mrf"
     )
     assert (
@@ -538,6 +548,11 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
 | EMI Health | regional | https://emihealth.com/machinereadables | public machine-readable files page |
 | MotivHealth Insurance Company | regional | https://www.motivhealth.com/machinereadablefiles/ | aliases: MotivHealth |
 | Angle Health | regional | https://www.anglehealth.com/machine-readable-files | aliases: Angle, Adrem Administrators |
+| PacificSource | regional | https://mrf.pacificsource.com/File/Visit/Index | aliases: Pacific Source |
+| Allegiance Benefit Plan Management | tpa | https://mrf.healthcarebluebook.com/Allegiance | aliases: AskAllegiance |
+| Healthcare Management Administrators | tpa | https://sawus2prdticmrfhma.z5.web.core.windows.net/ | aliases: HMA, AccessHMA |
+| Pinnacle Claims Management | tpa | https://mrf.healthcarebluebook.com/Pinnacle | aliases: PCMI |
+| Regency Employee Benefits | tpa | https://www.mymedicalshopper.com/mrf-search/robbins-regency-employee-benefits-inc-regn | aliases: Robbins Regency Employee Benefits |
 | CBA Blue | tpa | https://www.cbabluevt.com/employer-resources/ | aliases: CBA BLUE |
 | EBMS | tpa | https://caa.ebms.com/ | aliases: Employee Benefit Management Services |
 | EBPA | tpa | https://tuition.ebpabenefits.com/employers/machine-readable-file-links | aliases: EBPA Benefits |
@@ -559,6 +574,25 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
     assert by_name["MotivHealth Insurance Company"].hosting_platform == "html_mrf_links"
     assert by_name["Angle Health"].hosting_platform == "html_delegated_mrf_links"
     assert by_name["Angle Health"].aliases == ("Angle", "Adrem Administrators")
+    assert (
+        by_name["PacificSource"].hosting_platform == "pacificsource_azure_mrf_listing"
+    )
+    assert (
+        by_name["Allegiance Benefit Plan Management"].hosting_platform
+        == "healthcarebluebook_mrf"
+    )
+    assert (
+        by_name["Healthcare Management Administrators"].hosting_platform
+        == "html_mrf_links"
+    )
+    assert (
+        by_name["Pinnacle Claims Management"].hosting_platform
+        == "healthcarebluebook_mrf"
+    )
+    assert (
+        by_name["Regency Employee Benefits"].hosting_platform
+        == "mymedicalshopper_talon"
+    )
     assert by_name["CBA Blue"].hosting_platform == "html_mrf_links"
     assert by_name["EBMS"].hosting_platform == "ebms_caa_directory"
     assert by_name["EBPA"].hosting_platform == "html_mrf_links"
@@ -607,8 +641,18 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "MISSOURI BLUE CROSS OF KANSAS CITY" in by_name["BCBS Kansas City"].aliases
     assert "BlueCross BlueShield of AZ" in by_name["BCBS Arizona"].aliases
     assert "Pacific Source" in by_name["PacificSource"].aliases
+    assert "PacificSource Administrators" in by_name["PacificSource"].aliases
     assert "Angle" in by_name["Angle Health"].aliases
     assert "Adrem Administrators" in by_name["Angle Health"].aliases
+    assert "AskAllegiance" in by_name["Allegiance Benefit Plan Management"].aliases
+    assert "AccessHMA" in by_name["Healthcare Management Administrators"].aliases
+    assert "PCMI" in by_name["Pinnacle Claims Management"].aliases
+    assert (
+        "Robbins Regency Employee Benefits"
+        in by_name["Regency Employee Benefits"].aliases
+    )
+    assert "Cypress Benefit Administrators" in by_name["Lucent Health"].aliases
+    assert "Sierra Health and Life" in by_name["United Healthcare"].aliases
     assert "Auxient TPA" in by_name["Auxiant"].aliases
     assert "EBPA Employee Benefits" in by_name["EBPA"].aliases
 
@@ -964,6 +1008,18 @@ def test_classify_hosting_platforms():
             "https://www.anglehealth.com/machine-readable-files"
         )
         == "html_delegated_mrf_links"
+    )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://mrf.pacificsource.com/File/Visit/Index"
+        )
+        == "pacificsource_azure_mrf_listing"
+    )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://sawus2prdticmrfhma.z5.web.core.windows.net/"
+        )
+        == "html_mrf_links"
     )
     assert (
         discovery.classify_hosting_platform(

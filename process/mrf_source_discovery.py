@@ -699,6 +699,13 @@ def classify_hosting_platform(url: str | None) -> str | None:
         and "machine-readable-file" in path
     ):
         return "html_mrf_links"
+    if host == "mrf.pacificsource.com" and path.startswith("/file/visit"):
+        return "pacificsource_azure_mrf_listing"
+    if host in {
+        "sawus2prdticmrfhma.z5.web.core.windows.net",
+        "sawus2prdticmrfhma.blob.core.windows.net",
+    }:
+        return "html_mrf_links"
     if (
         host in {"www.sanfordhealthplan.com", "sanfordhealthplan.com"}
         and "transparency-in-coverage-rule" in path
