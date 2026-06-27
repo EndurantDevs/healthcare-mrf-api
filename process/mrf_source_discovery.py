@@ -17,8 +17,9 @@ import socket
 import ssl
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
-from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit
+from typing import Any, Iterable
+from urllib.parse import parse_qs, parse_qsl, quote, urlencode, urljoin, urlsplit
+from xml.etree import ElementTree
 
 import aiohttp
 from sqlalchemy import func, or_, select, update
@@ -51,9 +52,13 @@ DISCOVERY_TABLES = (
     MRFPayerScorecard,
     MRFUrlObservation,
 )
-MAX_TOC_BYTES_DEFAULT = int(os.getenv("HLTHPRT_MRF_DISCOVERY_MAX_TOC_BYTES", str(25 * 1024 * 1024)))
+MAX_TOC_BYTES_DEFAULT = int(
+    os.getenv("HLTHPRT_MRF_DISCOVERY_MAX_TOC_BYTES", str(25 * 1024 * 1024))
+)
 DEFAULT_CONCURRENCY = max(int(os.getenv("HLTHPRT_MRF_DISCOVERY_CONCURRENCY", "10")), 1)
-WRITE_BATCH_SIZE = max(int(os.getenv("HLTHPRT_MRF_DISCOVERY_WRITE_BATCH_SIZE", "2000")), 1)
+WRITE_BATCH_SIZE = max(
+    int(os.getenv("HLTHPRT_MRF_DISCOVERY_WRITE_BATCH_SIZE", "2000")), 1
+)
 HTTP_TOTAL_TIMEOUT = max(int(os.getenv("HLTHPRT_MRF_DISCOVERY_HTTP_TIMEOUT", "300")), 1)
 HTTP_READ_TIMEOUT = max(int(os.getenv("HLTHPRT_MRF_DISCOVERY_READ_TIMEOUT", "120")), 1)
 DEFAULT_FILE_PROBE_TYPES = ("in-network", "allowed-amounts")
@@ -88,6 +93,8 @@ class SourceCandidate:
     hosting_platform: str | None = None
     parent_group: str | None = None
     entity_type: str | None = None
+    aliases: tuple[str, ...] = ()
+    benefit_lines: tuple[str, ...] = ("medical",)
     states: tuple[str, ...] = ()
     eins: tuple[str, ...] = ()
     source_coverage: tuple[str, ...] = ()
@@ -175,13 +182,20 @@ def _default_ssl_context() -> ssl.SSLContext:
 
 
 def _tcp_connector(limit: int) -> aiohttp.TCPConnector:
-    return aiohttp.TCPConnector(limit=limit, family=socket.AF_INET, ttl_dns_cache=300, ssl=_default_ssl_context())
+    return aiohttp.TCPConnector(
+        limit=limit,
+        family=socket.AF_INET,
+        ttl_dns_cache=300,
+        ssl=_default_ssl_context(),
+    )
 
 
 def _source_config() -> dict[str, Any]:
     global _SOURCE_CONFIG_CACHE  # pylint: disable=global-statement
     if _SOURCE_CONFIG_CACHE is None:
-        _SOURCE_CONFIG_CACHE = json.loads(_source_config_path().read_text(encoding="utf-8"))
+        _SOURCE_CONFIG_CACHE = json.loads(
+            _source_config_path().read_text(encoding="utf-8")
+        )
     return _SOURCE_CONFIG_CACHE
 
 
@@ -224,8 +238,13 @@ def _load_seed_list_rows(name: str | None) -> list[dict[str, str]]:
         required = {"group_number", "status"}
         missing = sorted(required - fieldnames)
         if missing:
-            raise ValueError(f"seed list {name} missing required column(s): {', '.join(missing)}")
-        return [{key: str(value or "").strip() for key, value in row.items()} for row in reader]
+            raise ValueError(
+                f"seed list {name} missing required column(s): {', '.join(missing)}"
+            )
+        return [
+            {key: str(value or "").strip() for key, value in row.items()}
+            for row in reader
+        ]
 
 
 def _configured_provider_names(key: str) -> list[str]:
@@ -312,7 +331,9 @@ def _parse_size_bytes(value: Any) -> int | None:
     text = str(value or "").strip().replace(",", "")
     if not text:
         return None
-    match = re.match(r"^(?P<number>\d+(?:\.\d+)?)\s*(?P<unit>[kmgtp]?i?b|bytes?)?$", text, flags=re.I)
+    match = re.match(
+        r"^(?P<number>\d+(?:\.\d+)?)\s*(?P<unit>[kmgtp]?i?b|bytes?)?$", text, flags=re.I
+    )
     if not match:
         return None
     number = float(match.group("number"))
@@ -336,8 +357,35 @@ def _parse_size_bytes(value: Any) -> int | None:
     return int(number * multiplier) if multiplier else None
 
 
+def _query_mrf_file_name(url: str | None) -> str | None:
+    parsed = urlsplit(str(url or ""))
+    for key, values in parse_qs(parsed.query).items():
+        if key.lower() not in {"file", "filename", "file_name", "name"}:
+            continue
+        for value in values:
+            file_name = _clean_text(value)
+            lower = file_name.lower()
+            if not lower.endswith((".json", ".json.gz", ".zip", ".7z", ".csv")):
+                continue
+            if any(
+                token in lower.replace("_", "-")
+                for token in (
+                    "allowed",
+                    "in-network",
+                    "out-of-network",
+                    "negotiated",
+                    "rate",
+                    "rates",
+                    "index",
+                    "table-of-contents",
+                )
+            ):
+                return file_name
+    return None
+
+
 def _container_format(url: str | None) -> str | None:
-    path = urlsplit(str(url or "")).path.lower()
+    path = (_query_mrf_file_name(url) or urlsplit(str(url or "")).path).lower()
     if path.endswith(".zip"):
         return "zip"
     if path.endswith(".7z"):
@@ -350,15 +398,132 @@ def _container_format(url: str | None) -> str | None:
 def _mrf_file_type_from_text(url: str | None, label: str | None = None) -> str | None:
     text = f"{url or ''} {label or ''}".lower().replace("_", "-")
     compact = re.sub(r"[^a-z0-9]+", "", text)
-    if "allowed-amount" in text or "allowed amount" in text or "allowedamount" in compact:
+    if (
+        "allowed-amount" in text
+        or "allowed amount" in text
+        or "allowedamount" in compact
+        or "out-of-network" in text
+        or "out of network" in text
+        or "outofnetwork" in compact
+        or re.search(r"(^|[-/_.])oon([-/_.]|$)", text)
+    ):
         return "allowed-amounts"
-    if "in-network" in text or "in network" in text or "innetwork" in compact or "negotiated-rate" in text:
+    if (
+        "in-network" in text
+        or "in network" in text
+        or "innetwork" in compact
+        or "negotiated-rate" in text
+    ):
         return "in-network"
     if "payer-drug" in text or "prescription-drug" in text or "drug-file" in text:
         return "payer-drug"
-    if "table-of-content" in text or "toc" in text or re.search(r"(^|[/_-])index(?:\.json|[/?#]|$)", text):
+    if (
+        "table-of-content" in text
+        or "toc" in text
+        or re.search(r"(^|[/_-])index(?:\.json|[/?#]|$)", text)
+    ):
+        return "table-of-contents"
+    file_name = Path(urlsplit(str(url or "")).path.lower()).name.replace("_", "-")
+    if re.search(r"(^|-)index(?:-[a-z0-9]+)?\.zip$", file_name) and any(
+        token in text
+        for token in ("mrf", "machine-readable", "price-transparency", "transparency")
+    ):
         return "table-of-contents"
     return None
+
+
+def _looks_non_tic_mrf_reference(url: str | None, label: str | None = None) -> bool:
+    parsed = urlsplit(str(url or ""))
+    path = parsed.path.lower().replace("_", "-")
+    file_name = Path(path).name
+    text = f"{path} {parsed.query.lower()} {label or ''}".lower().replace("_", "-")
+    if "cms-data-index" in path:
+        return True
+    if "hospital-price-transparency" in text or "standardcharges" in file_name:
+        return True
+    if any(
+        token in text
+        for token in (
+            "formulary",
+            "provider-data",
+            "provider-directory",
+            "provider-network",
+            "provider-search",
+        )
+    ):
+        return True
+    if re.search(
+        r"(^|[-/_.])(?:providers?|plans?|drugs?|rx-plan)(?:[-/_.]|\d|$)",
+        file_name,
+        flags=re.I,
+    ) and not any(
+        token in text
+        for token in (
+            "allowed",
+            "in-network",
+            "out-of-network",
+            "negotiated",
+            "rate",
+            "rates",
+            "price-transparency",
+            "transparency",
+            "table-of-contents",
+            "toc",
+        )
+    ):
+        return True
+    return False
+
+
+def _mrf_body_file_type_from_text(
+    url: str | None, label: str | None = None
+) -> str | None:
+    if _looks_non_tic_mrf_reference(url, label):
+        return None
+    inferred = _mrf_file_type_from_text(url, label)
+    if inferred:
+        return inferred
+    if not _looks_direct_mrf_body_url(url):
+        return None
+    parsed = urlsplit(str(url or ""))
+    path = parsed.path.lower().replace("_", "-")
+    file_name = Path(path).name
+    if "mrf" in file_name or re.search(r"/(?:mrf|mrfs)(?:/|$)", path):
+        return "in-network"
+    if any(token in path for token in ("/machine-readable", "/transparency")):
+        return "in-network"
+    return None
+
+
+def _mrf_file_type_from_html_section(html_fragment: str | None) -> str | None:
+    text = _strip_html_tags(html_fragment or "").lower().replace("_", "-")
+    if not text:
+        return None
+    matches: list[tuple[int, str]] = []
+    for file_type, patterns in (
+        (
+            "allowed-amounts",
+            (
+                r"\bout[-\s]+of[-\s]+network\s+allowed(?:\s+amounts?)?",
+                r"\ballowed\s+amounts?(?:\s+and\s+billed\s+charges)?",
+                r"\ballowed[-\s]+amt(?:[-\s]+details)?",
+            ),
+        ),
+        (
+            "in-network",
+            (
+                r"\bin[-\s]+network\s+(?:provider\s+)?rates?\b",
+                r"\bin[-\s]+network\s+negotiated\b",
+                r"\bnegotiated\s+rates?\b",
+            ),
+        ),
+    ):
+        for pattern in patterns:
+            for match in re.finditer(pattern, text, flags=re.I):
+                matches.append((match.start(), file_type))
+    if not matches:
+        return None
+    return max(matches, key=lambda item: item[0])[1]
 
 
 def _canonical_or_none(url: str | None) -> str | None:
@@ -378,27 +543,333 @@ def classify_hosting_platform(url: str | None) -> str | None:
         return "meritain_mrf_search"
     if host == "mrf.healthcarebluebook.com":
         return "healthcarebluebook_mrf"
-    if host == "www.myhealthbenefits.com" and path.startswith("/myhealthbenefits/home/mrfs"):
+    if host.endswith("sapphiremrfhub.com"):
+        return "sapphire"
+    if host == "mrf.healthgram.com":
+        return "healthgram"
+    if host == "github.com" and len([part for part in path.split("/") if part]) >= 2:
+        return "github_repo_mrf"
+    if (
+        host
+        in {
+            "www.anthem.com",
+            "anthem.com",
+            "www.empireblue.com",
+            "empireblue.com",
+            "www.healthlink.com",
+            "healthlink.com",
+            "www.unicaremass.com",
+            "unicaremass.com",
+        }
+        and "/machine-readable-file/search" in path
+    ):
+        return "anthem_s3_mrf"
+    if host in {"www.hcsc.com", "hcsc.com"} and "transparency-in-coverage" in path:
+        return "hcsc_asomrf_landing"
+    if (
+        (
+            host in {"www.harvardpilgrim.org", "harvardpilgrim.org"}
+            and "machine-readable-files" in path
+        )
+        or (
+            host in {"tuftshealthplan.com", "www.tuftshealthplan.com"}
+            and "machine-readable-files" in path
+        )
+        or (
+            host
+            in {
+                "massgeneralbrighamhealthplan.org",
+                "www.massgeneralbrighamhealthplan.org",
+            }
+            and "transparency" in path
+        )
+    ):
+        return "point32_azure_mrf_directory"
+    if (
+        (host in {"www.pbaclaims.com", "pbaclaims.com"} and path.startswith("/mrfs"))
+        or (
+            host in {"healthy.kaiserpermanente.org", "www.kaiserpermanente.org"}
+            and "machine-readable" in path
+        )
+        or (
+            host in {"www.alliedbenefit.com", "alliedbenefit.com"}
+            and "transparency" in path
+        )
+        or (host in {"www.webtpa.com", "webtpa.com"} and "rights-protections" in path)
+        or (
+            host in {"www.healthnet.com", "healthnet.com"}
+            and "transparency-files" in path
+        )
+        or (
+            host in {"www.lacare.org", "lacare.org"}
+            and "transparency-coverage-machine-readable-files" in path
+        )
+        or (
+            host in {"www.gravie.com", "gravie.com"}
+            and "transparency-in-coverage" in path
+        )
+        or (
+            host in {"www.priorityhealth.com", "priorityhealth.com"}
+            and path.startswith("/landing/transparency")
+        )
+        or (
+            host in {"www.mvphealthcare.com", "mvphealthcare.com"}
+            and "machine-readable-files" in path
+        )
+        or (
+            host in {"www.novahealthcare.com", "novahealthcare.com"}
+            and path.startswith("/resources/mrf")
+        )
+        or host == "transparency.abadmin.com"
+    ):
+        return "html_delegated_mrf_links"
+    if host.endswith(".mrf.payercompass.com") or host == "mrf.payercompass.com":
+        return "payercompass_mrf"
+    if (
+        host in {"www.molinamarketplace.com", "molinamarketplace.com"}
+        and "pricingtransparency" in path
+    ):
+        return "html_mrf_links"
+    if (
+        host in {"thealliance.health", "www.thealliance.health"}
+        and "transparency-in-coverage-cms-9915-machine-readable-files" in path
+    ):
+        return "html_mrf_links"
+    if (
+        host in {"alamedaalliance.org", "www.alamedaalliance.org"}
+        and "pricing-transparency" in path
+    ):
+        return "html_mrf_links"
+    if (
+        host in {"www.arkansasbluecross.com", "arkansasbluecross.com"}
+        and "machine-readable-files" in path
+    ):
+        return "html_mrf_links"
+    if (
+        host in {"www.healthadvantage-hmo.com", "healthadvantage-hmo.com"}
+        and "machine-readable-files" in path
+    ):
+        return "html_mrf_links"
+    if host == "sisconosurprise.com" and path.startswith("/ppo/phcs/"):
+        return "html_mrf_links"
+    if host == "transparency-in-coverage.collectivehealth.com":
+        return "html_mrf_links"
+    if (
+        host in {"www.modahealth.com", "modahealth.com"}
+        and "machine-readable-files" in path
+    ):
+        return "html_mrf_links"
+    if (
+        host in {"www.sanfordhealthplan.com", "sanfordhealthplan.com"}
+        and "transparency-in-coverage-rule" in path
+    ):
+        return "html_mrf_links"
+    if (
+        host in {"www.scrippshealthplan.com", "scrippshealthplan.com"}
+        and "transparency-in-coverage" in path
+    ):
+        return "html_mrf_links"
+    if (
+        host in {"chorushealthplans.org", "www.chorushealthplans.org"}
+        and "transparency-in-coverage" in path
+    ):
+        return "html_mrf_links"
+    if host in {"www.healthplan.org", "healthplan.org"} and path.startswith(
+        "/multiplan_mrfs"
+    ):
+        return "html_mrf_links"
+    if (
+        host in {"www.westernhealth.com", "westernhealth.com"}
+        and "price-transparency" in path
+    ):
+        return "html_mrf_links"
+    if host in {"www.firstchoicenext.com", "firstchoicenext.com"} and path.startswith(
+        "/json"
+    ):
+        return "html_mrf_links"
+    if (
+        host in {"www.centene.com", "centene.com"}
+        and "price-transparency-files" in path
+    ):
+        return "html_mrf_links"
+    if host in {"www.bcbsal.org", "bcbsal.org"} and path.startswith("/web/tcr"):
+        return "bcbsal_html_mrf_links"
+    if (
+        (host in {"www.bcbsks.com", "bcbsks.com"} and path.startswith("/mrf"))
+        or (host in {"www.bcbsm.com", "bcbsm.com"} and path.startswith("/mrf/index"))
+        or (
+            host in {"www.bcbsms.com", "bcbsms.com"}
+            and "transparency-in-coverage" in path
+        )
+        or (
+            host
+            in {
+                "www.bcbsmt.com",
+                "bcbsmt.com",
+                "www.bcbsnm.com",
+                "bcbsnm.com",
+                "www.bcbsok.com",
+                "bcbsok.com",
+                "www.bcbstx.com",
+                "bcbstx.com",
+            }
+            and "machine-readable-file" in path
+        )
+        or (
+            host in {"www.bluecrossnc.com", "bluecrossnc.com"}
+            and "transparency-coverage-mrf" in path
+        )
+        or (
+            host in {"www.southcarolinablues.com", "southcarolinablues.com"}
+            and "transparency-in-coverage" in path
+        )
+        or (
+            host in {"www.bluecrossvt.org", "bluecrossvt.org"}
+            and "machine-readable-files" in path
+        )
+        or (host in {"individual.carefirst.com"} and "machine-readable-file" in path)
+        or (
+            host in {"www.floridablue.com", "floridablue.com"}
+            and "machine-readable-files" in path
+        )
+        or (
+            host in {"www.asuris.com", "asuris.com", "www.regence.com", "regence.com"}
+            and "transparency-in-coverage" in path
+        )
+        or (
+            host in {"www.cdphp.com", "cdphp.com"}
+            and "machine-readable-pricing-data-files" in path
+        )
+        or (
+            host in {"www.healthoptions.org", "healthoptions.org"}
+            and "policies-notices" in path
+        )
+        or (
+            host in {"www.bswhealthplan.com", "bswhealthplan.com"}
+            and path.startswith("/transparency")
+        )
+        or (
+            host in {"capitalhealth.com", "www.capitalhealth.com"}
+            and "transparency-in-coverage" in path
+        )
+        or (
+            host in {"chppayment.christushealth.org"}
+            and path.startswith("/documents/atex")
+        )
+        or (
+            host in {"ebu.intermountainhealthcare.org"}
+            and path.startswith("/selecthealth/transparencyincoverage")
+        )
+        or (
+            host in {"www.wellsense.org", "wellsense.org"}
+            and path.startswith("/about-us/interoperability")
+        )
+        or (
+            host in {"www.securityhealth.org", "securityhealth.org"}
+            and path.startswith("/insurance-resources/json")
+        )
+        or (
+            host in {"www.nhpri.org", "nhpri.org"}
+            and "price-transparency-machine-readable-files" in path
+        )
+        or (host in {"transparency.connecticare.com", "transparency.emblemhealth.com"})
+        or (
+            host in {"www.sidecarhealth.com", "sidecarhealth.com"}
+            and "transparency-in-coverage" in path
+        )
+        or (
+            host in {"metroplus.org", "www.metroplus.org"}
+            and "machine-readable-files" in path
+        )
+        or (host in {"www.pehp.org", "pehp.org"} and "machinereadablefiles" in path)
+        or (
+            host in {"curative.com", "www.curative.com"}
+            and "transparency-in-coverage-rates" in path
+        )
+        or (
+            host in {"www.groupadministrators.com", "groupadministrators.com"}
+            and "machinereadablefiles" in path
+        )
+        or (host == "mrf.mmsanalytics.com" and (path == "/" or path.endswith("/")))
+    ):
+        return "html_mrf_links"
+    if host in {"www.hmsa.com", "hmsa.com"} and (
+        "transparency-in-coverage-machine-readable-files" in path
+    ):
+        return "hmsa_monthly_toc"
+    if host == "mrfhub.providencehealthplan.com":
+        return "providence_mrf_api"
+    if host == "transparency.lacare.org":
+        return "lacare_s3_listing"
+    if host in {"www.bcbsri.com", "bcbsri.com"} and path.startswith("/developers"):
+        return "bcbsri_azure_mrf_listing"
+    if host in {"alliantplans.com", "www.alliantplans.com"} and path.startswith(
+        "/json/pt/"
+    ):
+        return "html_mrf_links"
+    if host in {"www.bcbst.com", "bcbst.com"} and path.startswith("/tcr"):
+        return "json_mrf_directory_links"
+    if host == "price-transparency.webtpa.com":
+        return "webtpa_mrf_api"
+    if host in {
+        "www.ibx.com",
+        "ibx.com",
+        "www.amerihealth.com",
+        "amerihealth.com",
+        "www.amerihealthnj.com",
+        "amerihealthnj.com",
+    } and path.startswith(("/cmstic", "/cmsticsvc/", "/developer-resources")):
+        return "cmstic_file_info"
+    if host == "www.myhealthbenefits.com" and path.startswith(
+        "/myhealthbenefits/home/mrfs"
+    ):
         return "html_mrf_with_healthcarebluebook"
-    if host.endswith("lucenthealth.com") and path.startswith("/transparency-in-coverage"):
+    if host.endswith("lucenthealth.com") and path.startswith(
+        "/transparency-in-coverage"
+    ):
         return "html_mrf_with_healthcarebluebook"
-    if host == "transparency.auxiant.com" and not path.startswith(("/wp-admin/", "/wp-content/", "/wp-includes/")):
+    if (
+        host in {"hpitpa.com", "www.hpitpa.com"}
+        and "transparency-in-coverage-machine-readable-files" in path
+    ):
+        return "html_mrf_with_healthcarebluebook"
+    if host == "transparency.auxiant.com" and not path.startswith(
+        ("/wp-admin/", "/wp-content/", "/wp-includes/")
+    ):
         return "auxiant_wordpress"
-    if host in {"www.mymedicalshopper.com", "mymedicalshopper.com"} and path.startswith(("/mrf-search/", "/mrf/")):
+    if host in {"www.mymedicalshopper.com", "mymedicalshopper.com"} and path.startswith(
+        ("/mrf-search/", "/mrf/")
+    ):
         return "mymedicalshopper_talon"
-    if host == "www.asrhealthbenefits.com" and path.startswith(("/mrf", "/umbraco/surface/mrfdownload", "/home/umbraco/surface/mrfdownload")):
+    if host == "www.asrhealthbenefits.com" and path.startswith(
+        ("/mrf", "/umbraco/surface/mrfdownload", "/home/umbraco/surface/mrfdownload")
+    ):
         return "asr_health_benefits"
-    if host in {"transparency-in-coverage.uhc.com", "transparency-in-coverage.optum.com"}:
+    if host in {
+        "transparency-in-coverage.uhc.com",
+        "transparency-in-coverage.optum.com",
+    }:
         return "uhc_public_blobs"
     if host == "transparency-in-coverage.bluecrossma.com":
         return "bcbsma_monthly_tocs"
-    if host.endswith("cigna.com") and ("machine-readable" in path or "/static/mrf/" in path):
+    if (
+        host in {"www.upmchealthplan.com", "upmchealthplan.com"}
+        and "transparency-in-coverage/mrf" in path
+    ):
+        return "upmc_monthly_toc"
+    if host.endswith("cigna.com") and (
+        "machine-readable" in path or "/static/mrf/" in path
+    ):
         return "cigna_static_mrf_lookup"
     if "healthsparq.com" in host:
         return "healthsparq"
     if "sapphiremrfhub.com" in host:
         return "sapphire"
-    if "health1.aetna.com" in host or "health1.firsthealth.com" in host or "health1.meritain.com" in host:
+    if (
+        "health1.aetna.com" in host
+        or "health1.firsthealth.com" in host
+        or "health1.meritain.com" in host
+    ):
         return "aetna_health1"
     if "mrfdata.hmhs.com" in host:
         return "highmark_hmhs"
@@ -411,15 +882,25 @@ def classify_hosting_platform(url: str | None) -> str | None:
     return "custom" if host else None
 
 
-def _master_list_url_cell(cells: list[str], type_value: str | None) -> tuple[str | None, str, str]:
+def _master_list_url_cell(
+    cells: list[str], type_value: str | None
+) -> tuple[str | None, str, str]:
     if len(cells) == 3:
         middle, tail = cells[1], cells[2]
-        if _http_urls(middle) or _is_placeholder_source_url(middle) or middle.strip() in {"", "-", "—"}:
+        if (
+            _http_urls(middle)
+            or _is_placeholder_source_url(middle)
+            or middle.strip() in {"", "-", "—"}
+        ):
             return type_value, middle, tail
         return type_value, tail, ""
     second, third, fourth = cells[1], cells[2], cells[3]
     normalized_type = _normalize_entity_type(second) or type_value
-    if _http_urls(third) or _is_placeholder_source_url(third) or third.strip() in {"", "-", "—"}:
+    if (
+        _http_urls(third)
+        or _is_placeholder_source_url(third)
+        or third.strip() in {"", "-", "—"}
+    ):
         return normalized_type, third, fourth
     return normalized_type, fourth, ""
 
@@ -435,6 +916,106 @@ def _master_list_status(url: str | None, notes: str) -> str:
     if "observed stale" in normalized:
         return "stale"
     return "active"
+
+
+def _master_list_aliases(notes: str) -> tuple[str, ...]:
+    match = re.search(
+        r"\baliases?\s*:\s*(?P<aliases>[^;]+)", notes or "", flags=re.IGNORECASE
+    )
+    if not match:
+        return ()
+    aliases: list[str] = []
+    seen: set[str] = set()
+    for raw_alias in match.group("aliases").split(","):
+        alias = _clean_text(raw_alias)
+        if not alias:
+            continue
+        key = alias.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        aliases.append(alias)
+    return tuple(aliases)
+
+
+_BENEFIT_LINE_ALIASES = {
+    "medical": "medical",
+    "health": "medical",
+    "healthcare": "medical",
+    "dental": "dental",
+    "vision": "vision",
+    "optical": "vision",
+    "mixed": "mixed",
+    "unknown": "unknown",
+}
+
+
+def _normalize_benefit_lines(values: Iterable[Any]) -> tuple[str, ...]:
+    lines: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        for raw_part in re.split(r"[,/]+|\band\b", str(value or ""), flags=re.I):
+            key = _clean_text(raw_part).lower().replace(" ", "_")
+            normalized = _BENEFIT_LINE_ALIASES.get(key)
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            lines.append(normalized)
+    return tuple(lines)
+
+
+def _benefit_line_values(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return list(value)
+    return [value]
+
+
+def _master_list_benefit_lines(notes: str) -> tuple[str, ...]:
+    match = re.search(
+        r"\bbenefit[-_\s]*lines?\s*:\s*(?P<benefit_lines>[^;]+)",
+        notes or "",
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return ("medical",)
+    return _normalize_benefit_lines([match.group("benefit_lines")]) or ("medical",)
+
+
+def _infer_benefit_lines_from_text(*values: Any) -> tuple[str, ...]:
+    text = " ".join(str(value or "") for value in values).lower().replace("_", "-")
+    lines: list[str] = []
+    if re.search(r"\b(dental|dentist|orthodont|connection-dental)\b", text):
+        lines.append("dental")
+    if re.search(
+        r"\b(vision|optical|eyemed|vsp|spectera|davis-vision|superior-vision)\b",
+        text,
+    ):
+        lines.append("vision")
+    return tuple(dict.fromkeys(lines))
+
+
+def _source_benefit_lines(source: dict[str, Any]) -> tuple[str, ...]:
+    metadata = dict((source or {}).get("metadata_json") or {})
+    return _normalize_benefit_lines(
+        _benefit_line_values(metadata.get("benefit_lines"))
+        + _benefit_line_values(metadata.get("benefit_line"))
+    )
+
+
+def _file_benefit_lines(source: dict[str, Any], *values: Any) -> tuple[str, ...]:
+    return _infer_benefit_lines_from_text(*values) or _source_benefit_lines(source)
+
+
+def _file_benefit_metadata(source: dict[str, Any], *values: Any) -> dict[str, Any]:
+    lines = _file_benefit_lines(source, *values)
+    if not lines:
+        return {}
+    metadata: dict[str, Any] = {"benefit_lines": list(lines)}
+    if len(lines) == 1:
+        metadata["benefit_line"] = lines[0]
+    return metadata
 
 
 def parse_master_list(markdown_text: str) -> list[SourceCandidate]:
@@ -457,7 +1038,9 @@ def parse_master_list(markdown_text: str) -> list[SourceCandidate]:
             continue
         type_value = _infer_entity_type(current_section, raw_payer_name)
         type_value, url_cell, notes_text = _master_list_url_cell(cells, type_value)
-        urls = tuple(url for url in _http_urls(url_cell) if not _is_placeholder_source_url(url)) or (None,)
+        urls = tuple(
+            url for url in _http_urls(url_cell) if not _is_placeholder_source_url(url)
+        ) or (None,)
         parent_group = _infer_parent_group(current_section, payer_name)
         for url in urls:
             candidates.append(
@@ -473,6 +1056,8 @@ def parse_master_list(markdown_text: str) -> list[SourceCandidate]:
                     hosting_platform=classify_hosting_platform(url),
                     parent_group=parent_group,
                     entity_type=type_value,
+                    aliases=_master_list_aliases(notes_text),
+                    benefit_lines=_master_list_benefit_lines(notes_text),
                     confidence=85 if url else 45,
                     license_status="curated_public_research",
                     review_status="pending",
@@ -536,25 +1121,40 @@ def _infer_parent_group(section: str, payer_name: str) -> str | None:
 
 def _dedupe_candidates(candidates: list[SourceCandidate]) -> list[SourceCandidate]:
     by_key: dict[tuple[str, str | None], SourceCandidate] = {}
+
+    def rank(item: SourceCandidate) -> tuple[int, int, int]:
+        status_rank = {
+            "active": 5,
+            "stale": 4,
+            "needs_review": 3,
+            "unsupported": 1,
+            "archived": 0,
+        }.get(str(item.status or "").lower(), 2)
+        item_url = item.index_url or item.human_url or ""
+        return (status_rank, 1 if item_url else 0, len(item_url))
+
     for item in candidates:
-        key = (_clean_text(item.payer_name).lower(), _canonical_or_none(item.index_url or item.human_url))
+        key = (
+            _clean_text(item.payer_name).lower(),
+            _canonical_or_none(item.index_url or item.human_url),
+        )
         previous = by_key.get(key)
-        previous_url = previous.index_url or previous.human_url if previous else None
-        item_url = item.index_url or item.human_url
-        if (
-            previous is None
-            or (not previous_url and item_url)
-            or (previous_url and item_url and len(item_url) > len(previous_url))
-        ):
+        if previous is None or rank(item) > rank(previous):
             by_key[key] = item
     return list(by_key.values())
 
 
 def _parse_provider_list(provider: str | None, *, test_mode: bool) -> list[str]:
     if not provider or provider == "all":
-        return _configured_provider_names("test_providers" if test_mode else "default_providers")
-    parts = [item.strip().lower() for item in re.split(r"[, ]+", provider) if item.strip()]
-    return parts or _configured_provider_names("test_providers" if test_mode else "default_providers")
+        return _configured_provider_names(
+            "test_providers" if test_mode else "default_providers"
+        )
+    parts = [
+        item.strip().lower() for item in re.split(r"[, ]+", provider) if item.strip()
+    ]
+    return parts or _configured_provider_names(
+        "test_providers" if test_mode else "default_providers"
+    )
 
 
 async def _fetch_text(
@@ -566,15 +1166,29 @@ async def _fetch_text(
 ) -> str:
     await _assert_fetch_url_allowed(url)
     if session is None:
-        timeout = aiohttp.ClientTimeout(total=HTTP_TOTAL_TIMEOUT, connect=15, sock_read=HTTP_READ_TIMEOUT)
+        timeout = aiohttp.ClientTimeout(
+            total=HTTP_TOTAL_TIMEOUT, connect=15, sock_read=HTTP_READ_TIMEOUT
+        )
         connector = _tcp_connector(limit=0)
-        async with aiohttp.ClientSession(headers={"User-Agent": USER_AGENT}, timeout=timeout, connector=connector, trust_env=False) as owned_session:
-            return await _fetch_text(url, max_bytes=max_bytes, session=owned_session, expect_json=expect_json)
+        async with aiohttp.ClientSession(
+            headers={"User-Agent": USER_AGENT},
+            timeout=timeout,
+            connector=connector,
+            trust_env=False,
+        ) as owned_session:
+            return await _fetch_text(
+                url, max_bytes=max_bytes, session=owned_session, expect_json=expect_json
+            )
     async with session.get(url, allow_redirects=True) as resp:
         await _assert_fetch_url_allowed(str(resp.url))
         content_type = str(resp.headers.get("Content-Type") or "").lower()
-        if expect_json and any(marker in content_type for marker in ("text/html", "application/xhtml", "application/pdf", "xml")):
-            raise ValueError(f"response content-type is not JSON: {content_type or 'unknown'}")
+        if expect_json and any(
+            marker in content_type
+            for marker in ("text/html", "application/xhtml", "application/pdf", "xml")
+        ):
+            raise ValueError(
+                f"response content-type is not JSON: {content_type or 'unknown'}"
+            )
         chunks: list[bytes] = []
         total = 0
         async for chunk in resp.content.iter_chunked(64 * 1024):
@@ -596,15 +1210,27 @@ def _decode_response_body(body: bytes, *, charset: str = "utf-8") -> str:
     return body.decode(charset or "utf-8", errors="replace")
 
 
-async def _fetch_json(url: str, *, max_bytes: int = MAX_TOC_BYTES_DEFAULT, session: aiohttp.ClientSession | None = None) -> dict[str, Any]:
+async def _fetch_json(
+    url: str,
+    *,
+    max_bytes: int = MAX_TOC_BYTES_DEFAULT,
+    session: aiohttp.ClientSession | None = None,
+) -> dict[str, Any]:
     data = await _fetch_json_value(url, max_bytes=max_bytes, session=session)
     if not isinstance(data, dict):
         raise ValueError("expected JSON object")
     return data
 
 
-async def _fetch_json_value(url: str, *, max_bytes: int = MAX_TOC_BYTES_DEFAULT, session: aiohttp.ClientSession | None = None) -> Any:
-    text = await _fetch_text(url, max_bytes=max_bytes, session=session, expect_json=True)
+async def _fetch_json_value(
+    url: str,
+    *,
+    max_bytes: int = MAX_TOC_BYTES_DEFAULT,
+    session: aiohttp.ClientSession | None = None,
+) -> Any:
+    text = await _fetch_text(
+        url, max_bytes=max_bytes, session=session, expect_json=True
+    )
     return json.loads(text)
 
 
@@ -615,17 +1241,44 @@ async def _post_json(
     max_bytes: int = MAX_TOC_BYTES_DEFAULT,
     session: aiohttp.ClientSession | None = None,
 ) -> dict[str, Any]:
+    data = await _post_json_value(url, payload, max_bytes=max_bytes, session=session)
+    if not isinstance(data, dict):
+        raise ValueError("expected JSON object")
+    return data
+
+
+async def _post_json_value(
+    url: str,
+    payload: dict[str, Any],
+    *,
+    max_bytes: int = MAX_TOC_BYTES_DEFAULT,
+    session: aiohttp.ClientSession | None = None,
+) -> Any:
     await _assert_fetch_url_allowed(url)
     if session is None:
-        timeout = aiohttp.ClientTimeout(total=HTTP_TOTAL_TIMEOUT, connect=15, sock_read=HTTP_READ_TIMEOUT)
+        timeout = aiohttp.ClientTimeout(
+            total=HTTP_TOTAL_TIMEOUT, connect=15, sock_read=HTTP_READ_TIMEOUT
+        )
         connector = _tcp_connector(limit=0)
-        async with aiohttp.ClientSession(headers={"User-Agent": USER_AGENT}, timeout=timeout, connector=connector, trust_env=False) as owned_session:
-            return await _post_json(url, payload, max_bytes=max_bytes, session=owned_session)
+        async with aiohttp.ClientSession(
+            headers={"User-Agent": USER_AGENT},
+            timeout=timeout,
+            connector=connector,
+            trust_env=False,
+        ) as owned_session:
+            return await _post_json_value(
+                url, payload, max_bytes=max_bytes, session=owned_session
+            )
     async with session.post(url, json=payload, allow_redirects=True) as resp:
         await _assert_fetch_url_allowed(str(resp.url))
         content_type = str(resp.headers.get("Content-Type") or "").lower()
-        if any(marker in content_type for marker in ("text/html", "application/xhtml", "application/pdf", "xml")):
-            raise ValueError(f"response content-type is not JSON: {content_type or 'unknown'}")
+        if any(
+            marker in content_type
+            for marker in ("text/html", "application/xhtml", "application/pdf", "xml")
+        ):
+            raise ValueError(
+                f"response content-type is not JSON: {content_type or 'unknown'}"
+            )
         chunks: list[bytes] = []
         total = 0
         async for chunk in resp.content.iter_chunked(64 * 1024):
@@ -638,13 +1291,12 @@ async def _post_json(
                     raise ValueError("response body is not JSON")
             chunks.append(chunk)
         charset = resp.charset or "utf-8"
-    data = json.loads(b"".join(chunks).decode(charset, errors="replace"))
-    if not isinstance(data, dict):
-        raise ValueError("expected JSON object")
-    return data
+    return json.loads(b"".join(chunks).decode(charset, errors="replace"))
 
 
-async def _load_candidates(provider: str, *, test_mode: bool, limit: int | None) -> list[SourceCandidate]:
+async def _load_candidates(
+    provider: str, *, test_mode: bool, limit: int | None
+) -> list[SourceCandidate]:
     config = _provider_config(provider)
     parser = str(config.get("parser") or provider).strip().lower()
     if parser == "master-list":
@@ -670,28 +1322,47 @@ async def _assert_fetch_url_allowed(url: str) -> None:
         return
     except ValueError:
         pass
-    infos = await asyncio.to_thread(socket.getaddrinfo, hostname, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)
+    infos = await asyncio.to_thread(
+        socket.getaddrinfo,
+        hostname,
+        parsed.port or (443 if parsed.scheme == "https" else 80),
+        type=socket.SOCK_STREAM,
+    )
     for info in infos:
         address = info[4][0]
         try:
             _assert_public_ip(ipaddress.ip_address(address))
         except ValueError as exc:
-            raise ValueError(f"URL resolves to a non-public address: {address}") from exc
+            raise ValueError(
+                f"URL resolves to a non-public address: {address}"
+            ) from exc
 
 
 def _assert_public_ip(ip: ipaddress._BaseAddress) -> None:
     # not is_global also catches ranges the flag checks miss, e.g. CGNAT 100.64.0.0/10
-    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified or not ip.is_global:
+    if (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+        or not ip.is_global
+    ):
         raise ValueError(f"non-public IP address is not allowed: {ip}")
 
 
-async def _head_url(url: str, session: aiohttp.ClientSession | None = None) -> dict[str, Any]:
+async def _head_url(
+    url: str, session: aiohttp.ClientSession | None = None
+) -> dict[str, Any]:
     checked_at = _utc_now()
     try:
         await _assert_fetch_url_allowed(url)
         if session is None:
             timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=15)
-            async with aiohttp.ClientSession(headers={"User-Agent": USER_AGENT}, timeout=timeout, trust_env=False) as owned_session:
+            async with aiohttp.ClientSession(
+                headers={"User-Agent": USER_AGENT}, timeout=timeout, trust_env=False
+            ) as owned_session:
                 return await _head_url(url, owned_session)
         async with session.head(url, allow_redirects=True) as resp:
             await _assert_fetch_url_allowed(str(resp.url))
@@ -715,27 +1386,51 @@ async def _ensure_catalog_tables() -> None:
         await db.create_table(model.__table__, checkfirst=True)
 
 
-def _candidate_to_rows(candidate: SourceCandidate, now: dt.datetime) -> tuple[dict[str, Any], dict[str, Any] | None]:
+def _candidate_to_rows(
+    candidate: SourceCandidate, now: dt.datetime
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
     payer_id = _id("mrfpayer", _clean_text(candidate.payer_name).lower())
     source_url = candidate.index_url or candidate.human_url
-    source_id = _id("mrfsource", {"payer": payer_id, "url": _canonical_or_none(source_url), "provider": candidate.provider})
+    aliases = sorted(
+        {
+            _clean_text(value)
+            for value in (candidate.payer_name, *candidate.aliases)
+            if _clean_text(value)
+        },
+        key=str.lower,
+    )
+    source_id = _id(
+        "mrfsource",
+        {
+            "payer": payer_id,
+            "url": _canonical_or_none(source_url),
+            "provider": candidate.provider,
+        },
+    )
     payer_row = {
         "payer_id": payer_id,
         "canonical_name": _clean_text(candidate.payer_name),
-        "aliases": [candidate.payer_name],
+        "aliases": aliases,
         "parent_group": candidate.parent_group,
         "entity_type": candidate.entity_type,
         "states": list(candidate.states),
         "eins": list(candidate.eins),
         "lifecycle": "active",
         "source_coverage": list(candidate.source_coverage),
-        "metadata_json": {"providers": [candidate.provider], "raw": candidate.raw_payload},
+        "metadata_json": {
+            "providers": [candidate.provider],
+            "aliases": aliases,
+            "benefit_lines": list(candidate.benefit_lines),
+            "raw": candidate.raw_payload,
+        },
         "created_at": now,
         "updated_at": now,
     }
     if not source_url:
         return payer_row, None
-    source_key_base = _slug(f"{candidate.provider}-{candidate.payer_name}-{_domain(source_url) or ''}")
+    source_key_base = _slug(
+        f"{candidate.provider}-{candidate.payer_name}-{_domain(source_url) or ''}"
+    )
     source_key = f"{source_key_base[:80]}-{source_id[-8:]}"
     source_row = {
         "source_id": source_id,
@@ -743,7 +1438,8 @@ def _candidate_to_rows(candidate: SourceCandidate, now: dt.datetime) -> tuple[di
         "source_key": source_key,
         "display_name": _clean_text(candidate.payer_name),
         "source_type": candidate.source_type,
-        "hosting_platform": candidate.hosting_platform or classify_hosting_platform(source_url),
+        "hosting_platform": candidate.hosting_platform
+        or classify_hosting_platform(source_url),
         "access_model": candidate.access_model,
         "index_url": candidate.index_url,
         "human_url": candidate.human_url,
@@ -761,14 +1457,21 @@ def _candidate_to_rows(candidate: SourceCandidate, now: dt.datetime) -> tuple[di
         "confidence": candidate.confidence,
         "license_status": candidate.license_status,
         "review_status": candidate.review_status,
-        "metadata_json": {"source_coverage": list(candidate.source_coverage), "raw": candidate.raw_payload},
+        "metadata_json": {
+            "aliases": aliases,
+            "benefit_lines": list(candidate.benefit_lines),
+            "source_coverage": list(candidate.source_coverage),
+            "raw": candidate.raw_payload,
+        },
         "created_at": now,
         "updated_at": now,
     }
     return payer_row, source_row
 
 
-async def _store_candidates(candidates: list[SourceCandidate]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+async def _store_candidates(
+    candidates: list[SourceCandidate],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     now = _utc_now()
     payer_rows_by_id: dict[str, dict[str, Any]] = {}
     source_rows_by_id: dict[str, dict[str, Any]] = {}
@@ -776,11 +1479,30 @@ async def _store_candidates(candidates: list[SourceCandidate]) -> tuple[list[dic
         payer_row, source_row = _candidate_to_rows(candidate, now)
         existing = payer_rows_by_id.get(payer_row["payer_id"])
         if existing:
-            existing["aliases"] = sorted(set((existing.get("aliases") or []) + (payer_row.get("aliases") or [])))
-            existing["source_coverage"] = sorted(set((existing.get("source_coverage") or []) + (payer_row.get("source_coverage") or [])))
+            existing["aliases"] = sorted(
+                set((existing.get("aliases") or []) + (payer_row.get("aliases") or []))
+            )
+            existing["source_coverage"] = sorted(
+                set(
+                    (existing.get("source_coverage") or [])
+                    + (payer_row.get("source_coverage") or [])
+                )
+            )
+            existing_metadata = dict(existing.get("metadata_json") or {})
+            existing_metadata["benefit_lines"] = sorted(
+                set(
+                    (existing_metadata.get("benefit_lines") or [])
+                    + list(candidate.benefit_lines)
+                )
+            )
             existing["metadata_json"] = {
-                **dict(existing.get("metadata_json") or {}),
-                "providers": sorted(set((existing.get("metadata_json") or {}).get("providers", []) + [candidate.provider])),
+                **existing_metadata,
+                "providers": sorted(
+                    set(
+                        (existing.get("metadata_json") or {}).get("providers", [])
+                        + [candidate.provider]
+                    )
+                ),
             }
         else:
             payer_rows_by_id[payer_row["payer_id"]] = payer_row
@@ -802,20 +1524,35 @@ async def _store_observations(
     concurrency: int = DEFAULT_CONCURRENCY,
 ) -> list[dict[str, Any]]:
     observations: list[dict[str, Any]] = []
-    items = [(source, source.get("index_url") or source.get("human_url")) for source in source_rows if source.get("index_url") or source.get("human_url")]
+    items = [
+        (source, source.get("index_url") or source.get("human_url"))
+        for source in source_rows
+        if source.get("index_url") or source.get("human_url")
+    ]
     total = len(items)
     semaphore = asyncio.Semaphore(max(1, int(concurrency or DEFAULT_CONCURRENCY)))
     timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=15)
-    connector = _tcp_connector(limit=max(1, int(concurrency or DEFAULT_CONCURRENCY)) * 2)
+    connector = _tcp_connector(
+        limit=max(1, int(concurrency or DEFAULT_CONCURRENCY)) * 2
+    )
 
-    async def check_one(source: dict[str, Any], url: Any, session: aiohttp.ClientSession) -> dict[str, Any]:
+    async def check_one(
+        source: dict[str, Any], url: Any, session: aiohttp.ClientSession
+    ) -> dict[str, Any]:
         async with semaphore:
             if test_mode:
                 head = {"status": "skipped_test_mode", "checked_at": _utc_now()}
             else:
                 head = await _head_url(str(url), session=session)
             return {
-                "observation_id": _id("mrfurlobs", {"source_id": source["source_id"], "url": url, "checked_at": head["checked_at"].isoformat()}),
+                "observation_id": _id(
+                    "mrfurlobs",
+                    {
+                        "source_id": source["source_id"],
+                        "url": url,
+                        "checked_at": head["checked_at"].isoformat(),
+                    },
+                ),
                 "source_id": source["source_id"],
                 "url": str(url),
                 "canonical_url": _canonical_or_none(str(url)),
@@ -832,8 +1569,16 @@ async def _store_observations(
                 "metadata_json": {"run_id": run_id},
             }
 
-    async with aiohttp.ClientSession(headers={"User-Agent": USER_AGENT}, timeout=timeout, connector=connector, trust_env=False) as session:
-        tasks = [asyncio.create_task(check_one(source, url, session)) for source, url in items]
+    async with aiohttp.ClientSession(
+        headers={"User-Agent": USER_AGENT},
+        timeout=timeout,
+        connector=connector,
+        trust_env=False,
+    ) as session:
+        tasks = [
+            asyncio.create_task(check_one(source, url, session))
+            for source, url in items
+        ]
         for done, task in enumerate(asyncio.as_completed(tasks), start=1):
             observation = await task
             observations.append(observation)
@@ -876,7 +1621,9 @@ def _healthsparq_file_url(metadata_url: str, file_path: Any) -> str:
     return urljoin(metadata_url.rsplit("/", 1)[0] + "/", path)
 
 
-def _healthsparq_rows_from_metadata(source: dict[str, Any], metadata_url: str, payload: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _healthsparq_rows_from_metadata(
+    source: dict[str, Any], metadata_url: str, payload: dict[str, Any]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     files = payload.get("files") if isinstance(payload, dict) else None
     if not isinstance(files, list):
         return [], []
@@ -889,7 +1636,11 @@ def _healthsparq_rows_from_metadata(source: dict[str, Any], metadata_url: str, p
         file_url = _healthsparq_file_url(metadata_url, file_item.get("filePath"))
         if not file_url:
             continue
-        reporting_plans = [plan for plan in (file_item.get("reportingPlans") or []) if isinstance(plan, dict)]
+        reporting_plans = [
+            plan
+            for plan in (file_item.get("reportingPlans") or [])
+            if isinstance(plan, dict)
+        ]
         for plan in reporting_plans:
             plan_id = str(plan.get("planId") or "").strip()
             plan_name = plan.get("planName")
@@ -913,13 +1664,19 @@ def _healthsparq_rows_from_metadata(source: dict[str, Any], metadata_url: str, p
                 "market_type": market_type,
                 "reporting_entity_name": file_item.get("reportingEntityName"),
                 "reporting_entity_type": file_item.get("reportingEntityType"),
-                "metadata_json": {"raw_plan": plan, "resolver": "healthsparq_public_mrf"},
+                "metadata_json": {
+                    "raw_plan": plan,
+                    "resolver": "healthsparq_public_mrf",
+                },
                 "first_seen_at": now,
                 "last_seen_at": now,
             }
         file_type = _healthsparq_file_type(file_item.get("fileSchema"))
         canonical_url = _canonical_or_none(file_url) or file_url
-        file_row_id = _id("mrffile", {"source": source["source_id"], "type": file_type, "url": canonical_url})
+        file_row_id = _id(
+            "mrffile",
+            {"source": source["source_id"], "type": file_type, "url": canonical_url},
+        )
         file_rows_by_id[file_row_id] = {
             "mrf_file_id": file_row_id,
             "payer_id": source.get("payer_id"),
@@ -930,15 +1687,31 @@ def _healthsparq_rows_from_metadata(source: dict[str, Any], metadata_url: str, p
             "from_index_url": metadata_url,
             "description": file_item.get("fileName"),
             "network_name": file_item.get("fileName"),
-            "plan_ids": [plan.get("planId") for plan in reporting_plans if plan.get("planId")],
-            "plan_names": [plan.get("planName") for plan in reporting_plans if plan.get("planName")],
-            "market_types": sorted({plan.get("planMarketType") for plan in reporting_plans if plan.get("planMarketType")}),
+            "plan_ids": [
+                plan.get("planId") for plan in reporting_plans if plan.get("planId")
+            ],
+            "plan_names": [
+                plan.get("planName") for plan in reporting_plans if plan.get("planName")
+            ],
+            "market_types": sorted(
+                {
+                    plan.get("planMarketType")
+                    for plan in reporting_plans
+                    if plan.get("planMarketType")
+                }
+            ),
             "is_signed_url": _looks_signed(file_url),
             "size_bytes": None,
             "schema_version": None,
             "metadata_json": {
                 "resolver": "healthsparq_public_mrf",
                 "container_format": _container_format(file_url),
+                **_file_benefit_metadata(
+                    source,
+                    file_url,
+                    file_item.get("fileName"),
+                    file_item.get("reportingEntityName"),
+                ),
                 "file_path": file_item.get("filePath"),
                 "file_schema": file_item.get("fileSchema"),
                 "last_updated_on": file_item.get("lastUpdatedOn"),
@@ -960,7 +1733,9 @@ def _healthsparq_rows_from_metadata(source: dict[str, Any], metadata_url: str, p
     return list(plan_rows_by_id.values()), list(file_rows_by_id.values())
 
 
-def _toc_rows_from_content(source: dict[str, Any], url: str, toc: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _toc_rows_from_content(
+    source: dict[str, Any], url: str, toc: dict[str, Any]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     if isinstance(toc.get("files"), list):
         return _healthsparq_rows_from_metadata(source, url, toc)
     plan_rows: list[dict[str, Any]] = []
@@ -1002,7 +1777,14 @@ def _toc_rows_from_content(source: dict[str, Any], url: str, toc: dict[str, Any]
             continue
         if not str(entry.original_url or "").startswith(("http://", "https://")):
             continue
-        file_row_id = _id("mrffile", {"source": source["source_id"], "type": entry.source_type, "url": entry.canonical_url})
+        file_row_id = _id(
+            "mrffile",
+            {
+                "source": source["source_id"],
+                "type": entry.source_type,
+                "url": entry.canonical_url,
+            },
+        )
         file_rows.append(
             {
                 "mrf_file_id": file_row_id,
@@ -1014,14 +1796,30 @@ def _toc_rows_from_content(source: dict[str, Any], url: str, toc: dict[str, Any]
                 "from_index_url": entry.from_index_url,
                 "description": entry.description,
                 "network_name": entry.description,
-                "plan_ids": [plan.get("plan_id") for plan in plan_info if plan.get("plan_id")],
-                "plan_names": [plan.get("plan_name") for plan in plan_info if plan.get("plan_name")],
-                "market_types": sorted({plan.get("plan_market_type") for plan in plan_info if plan.get("plan_market_type")}),
+                "plan_ids": [
+                    plan.get("plan_id") for plan in plan_info if plan.get("plan_id")
+                ],
+                "plan_names": [
+                    plan.get("plan_name") for plan in plan_info if plan.get("plan_name")
+                ],
+                "market_types": sorted(
+                    {
+                        plan.get("plan_market_type")
+                        for plan in plan_info
+                        if plan.get("plan_market_type")
+                    }
+                ),
                 "is_signed_url": _looks_signed(entry.original_url),
                 "size_bytes": None,
                 "schema_version": schema_version,
                 "metadata_json": {
                     "container_format": _container_format(entry.original_url),
+                    **_file_benefit_metadata(
+                        source,
+                        entry.original_url,
+                        entry.description,
+                        entry.reporting_entity_name,
+                    ),
                     "domain": entry.domain,
                     "reporting_entity_name": entry.reporting_entity_name,
                     # Preserve the exact per-file plan list (with plan_id_type) so the
@@ -1067,7 +1865,9 @@ def _metadata_text_fields(line: str) -> dict[str, str]:
     return fields
 
 
-def _metadata_text_rows_from_content(source: dict[str, Any], url: str, text: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _metadata_text_rows_from_content(
+    source: dict[str, Any], url: str, text: str
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     now = _utc_now()
     plan_rows_by_id: dict[str, dict[str, Any]] = {}
     file_rows_by_id: dict[str, dict[str, Any]] = {}
@@ -1076,7 +1876,9 @@ def _metadata_text_rows_from_content(source: dict[str, Any], url: str, text: str
         if not file_url or not _looks_direct_mrf_body_url(file_url):
             continue
         fields = _metadata_text_fields(line)
-        file_type = _metadata_text_file_type(fields.get("file scope") or fields.get("scope"))
+        file_type = _metadata_text_file_type(
+            fields.get("file scope") or fields.get("scope")
+        )
         plan_name = fields.get("plan name")
         sponsor_ein = fields.get("sponsor ein") or fields.get("ein")
         plan_row_id = _id(
@@ -1104,7 +1906,10 @@ def _metadata_text_rows_from_content(source: dict[str, Any], url: str, text: str
                 "last_seen_at": now,
             }
         canonical_url = _canonical_or_none(file_url) or file_url
-        file_row_id = _id("mrffile", {"source": source["source_id"], "type": file_type, "url": canonical_url})
+        file_row_id = _id(
+            "mrffile",
+            {"source": source["source_id"], "type": file_type, "url": canonical_url},
+        )
         file_rows_by_id[file_row_id] = {
             "mrf_file_id": file_row_id,
             "payer_id": source.get("payer_id"),
@@ -1124,6 +1929,7 @@ def _metadata_text_rows_from_content(source: dict[str, Any], url: str, text: str
             "metadata_json": {
                 "resolver": "html_metadata_text",
                 "container_format": _container_format(file_url),
+                **_file_benefit_metadata(source, file_url, plan_name, line),
                 "metadata_fields": fields,
                 "metadata_url": url,
             },
@@ -1144,7 +1950,9 @@ def _render_highmark_hmhs_path(path: str, *, month_start: str | None = None) -> 
     return rendered.replace("FIRST_DAY_CUR_MONTH", date_value)
 
 
-def _parse_highmark_hmhs_script(script_text: str, *, base_url: str, month_start: str | None = None) -> list[dict[str, Any]]:
+def _parse_highmark_hmhs_script(
+    script_text: str, *, base_url: str, month_start: str | None = None
+) -> list[dict[str, Any]]:
     targets: list[dict[str, Any]] = []
     for match in re.finditer(
         r"\{\s*regName:\s*[\"'](?P<region>[^\"']*)[\"']\s*,\s*dl:\s*[\"'](?P<path>[^\"']+)[\"']\s*,\s*dt:\s*[\"'](?P<label>[^\"']*)[\"']\s*\}",
@@ -1198,14 +2006,18 @@ def _parse_uhc_blob_listing(payload: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _mymedicalshopper_entity_slug_from_url(url: str | None) -> str | None:
-    parts = [part for part in urlsplit(str(url or "")).path.strip("/").split("/") if part]
+    parts = [
+        part for part in urlsplit(str(url or "")).path.strip("/").split("/") if part
+    ]
     if len(parts) >= 2 and parts[0].lower() == "mrf-search":
         return parts[1]
     return None
 
 
 def _mymedicalshopper_employer_slug_from_url(url: str | None) -> str | None:
-    parts = [part for part in urlsplit(str(url or "")).path.strip("/").split("/") if part]
+    parts = [
+        part for part in urlsplit(str(url or "")).path.strip("/").split("/") if part
+    ]
     if len(parts) >= 2 and parts[0].lower() == "mrf":
         return parts[1]
     return None
@@ -1232,7 +2044,9 @@ def _slug_label(value: str | None) -> str | None:
     return re.sub(r"\s+", " ", text.replace("_", " ").replace("-", " ")).strip().title()
 
 
-def _mymedicalshopper_employer_selector(entity_slug: str, *, all_employers_searchable: bool) -> dict[str, Any]:
+def _mymedicalshopper_employer_selector(
+    entity_slug: str, *, all_employers_searchable: bool
+) -> dict[str, Any]:
     selector: dict[str, Any] = {"tpaSlug": entity_slug, "status": "Enabled"}
     if not all_employers_searchable:
         selector["machineReadableFiles.makeMRFsSearchable"] = True
@@ -1248,7 +2062,12 @@ def _mymedicalshopper_sockjs_ws_url(base_url: str) -> str:
     except RuntimeError:
         task_id = 0
     session_id = semantic_hash(
-        {"url": base_url, "pid": os.getpid(), "task": task_id, "ts": _utc_now().isoformat()},
+        {
+            "url": base_url,
+            "pid": os.getpid(),
+            "task": task_id,
+            "ts": _utc_now().isoformat(),
+        },
         domain="mms_sockjs",
     )[:8]
     return f"{scheme}://{parsed.netloc}/sockjs/{server_id}/{session_id}/websocket"
@@ -1277,12 +2096,18 @@ def _mymedicalshopper_sockjs_messages(frame: str) -> list[dict[str, Any]]:
     return messages
 
 
-async def _mymedicalshopper_ddp_send(ws: aiohttp.ClientWebSocketResponse, payload: dict[str, Any]) -> None:
-    encoded = json.dumps([json.dumps(payload, separators=(",", ":"))], separators=(",", ":"))
+async def _mymedicalshopper_ddp_send(
+    ws: aiohttp.ClientWebSocketResponse, payload: dict[str, Any]
+) -> None:
+    encoded = json.dumps(
+        [json.dumps(payload, separators=(",", ":"))], separators=(",", ":")
+    )
     await ws.send_str(encoded)
 
 
-async def _mymedicalshopper_ddp_recv(ws: aiohttp.ClientWebSocketResponse, *, timeout_seconds: float) -> list[dict[str, Any]]:
+async def _mymedicalshopper_ddp_recv(
+    ws: aiohttp.ClientWebSocketResponse, *, timeout_seconds: float
+) -> list[dict[str, Any]]:
     while True:
         frame = await asyncio.wait_for(ws.receive(), timeout=timeout_seconds)
         if frame.type == aiohttp.WSMsgType.TEXT:
@@ -1299,8 +2124,14 @@ async def _mymedicalshopper_ddp_recv(ws: aiohttp.ClientWebSocketResponse, *, tim
             if returned:
                 return returned
             continue
-        if frame.type in {aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING}:
-            raise ValueError("MyMedicalShopper DDP websocket closed before a response was received")
+        if frame.type in {
+            aiohttp.WSMsgType.CLOSE,
+            aiohttp.WSMsgType.CLOSED,
+            aiohttp.WSMsgType.CLOSING,
+        }:
+            raise ValueError(
+                "MyMedicalShopper DDP websocket closed before a response was received"
+            )
         if frame.type == aiohttp.WSMsgType.ERROR:
             raise ValueError(f"MyMedicalShopper DDP websocket error: {ws.exception()}")
 
@@ -1320,9 +2151,13 @@ async def _mymedicalshopper_ddp_connect(
         timeout=timeout_seconds,
     )
     await asyncio.wait_for(ws.receive(), timeout=timeout_seconds)
-    await _mymedicalshopper_ddp_send(ws, {"msg": "connect", "version": "1", "support": ["1", "pre2", "pre1"]})
+    await _mymedicalshopper_ddp_send(
+        ws, {"msg": "connect", "version": "1", "support": ["1", "pre2", "pre1"]}
+    )
     while True:
-        for message in await _mymedicalshopper_ddp_recv(ws, timeout_seconds=timeout_seconds):
+        for message in await _mymedicalshopper_ddp_recv(
+            ws, timeout_seconds=timeout_seconds
+        ):
             if message.get("msg") == "connected":
                 return ws
             if message.get("msg") == "failed":
@@ -1337,13 +2172,19 @@ async def _mymedicalshopper_ddp_call(
     request_id: str,
     timeout_seconds: float,
 ) -> Any:
-    await _mymedicalshopper_ddp_send(ws, {"msg": "method", "id": request_id, "method": method, "params": params})
+    await _mymedicalshopper_ddp_send(
+        ws, {"msg": "method", "id": request_id, "method": method, "params": params}
+    )
     while True:
-        for message in await _mymedicalshopper_ddp_recv(ws, timeout_seconds=timeout_seconds):
+        for message in await _mymedicalshopper_ddp_recv(
+            ws, timeout_seconds=timeout_seconds
+        ):
             if message.get("msg") != "result" or message.get("id") != request_id:
                 continue
             if message.get("error"):
-                raise ValueError(f"MyMedicalShopper DDP method {method} failed: {message['error']}")
+                raise ValueError(
+                    f"MyMedicalShopper DDP method {method} failed: {message['error']}"
+                )
             return message.get("result")
 
 
@@ -1355,31 +2196,50 @@ async def _mymedicalshopper_ddp_subscribe_collect(
     sub_id: str,
     timeout_seconds: float,
 ) -> list[dict[str, Any]]:
-    await _mymedicalshopper_ddp_send(ws, {"msg": "sub", "id": sub_id, "name": name, "params": params})
+    await _mymedicalshopper_ddp_send(
+        ws, {"msg": "sub", "id": sub_id, "name": name, "params": params}
+    )
     collected: list[dict[str, Any]] = []
     while True:
-        for message in await _mymedicalshopper_ddp_recv(ws, timeout_seconds=timeout_seconds):
+        for message in await _mymedicalshopper_ddp_recv(
+            ws, timeout_seconds=timeout_seconds
+        ):
             if message.get("msg") in {"added", "changed", "removed"}:
                 collected.append(message)
                 continue
             if message.get("msg") == "ready" and sub_id in (message.get("subs") or []):
                 return collected
             if message.get("msg") == "nosub" and message.get("id") == sub_id:
-                raise ValueError(f"MyMedicalShopper DDP subscription {name} failed: {message.get('error') or message}")
+                raise ValueError(
+                    f"MyMedicalShopper DDP subscription {name} failed: {message.get('error') or message}"
+                )
 
 
-def _mymedicalshopper_entity_config_from_messages(messages: list[dict[str, Any]], entity_slug: str) -> dict[str, Any]:
+def _mymedicalshopper_entity_config_from_messages(
+    messages: list[dict[str, Any]], entity_slug: str
+) -> dict[str, Any]:
     for message in messages:
         if message.get("collection") != "thirdPartyAdministrators":
             continue
-        fields = message.get("fields") if isinstance(message.get("fields"), dict) else {}
+        fields = (
+            message.get("fields") if isinstance(message.get("fields"), dict) else {}
+        )
         if str(fields.get("slug") or "").strip() == entity_slug:
             return dict(fields)
     return {}
 
 
-def _mymedicalshopper_tpa_name_from_config(config: dict[str, Any], entity_slug: str | None) -> str | None:
-    for key in ("name", "displayName", "display_name", "companyName", "company_name", "title"):
+def _mymedicalshopper_tpa_name_from_config(
+    config: dict[str, Any], entity_slug: str | None
+) -> str | None:
+    for key in (
+        "name",
+        "displayName",
+        "display_name",
+        "companyName",
+        "company_name",
+        "title",
+    ):
         value = _clean_text(config.get(key))
         if value:
             return value
@@ -1392,29 +2252,48 @@ def _mymedicalshopper_oid_value(value: Any) -> str:
     return str(value or "").strip()
 
 
-def _mymedicalshopper_tabular_info_from_messages(messages: list[dict[str, Any]], table_id: str = "EntityMRFEmployers") -> dict[str, Any]:
+def _mymedicalshopper_tabular_info_from_messages(
+    messages: list[dict[str, Any]], table_id: str = "EntityMRFEmployers"
+) -> dict[str, Any]:
     info: dict[str, Any] = {"ids": [], "records_total": 0, "records_filtered": 0}
     for message in messages:
-        if message.get("collection") != "tabular_records" or message.get("id") != table_id:
+        if (
+            message.get("collection") != "tabular_records"
+            or message.get("id") != table_id
+        ):
             continue
-        fields = message.get("fields") if isinstance(message.get("fields"), dict) else {}
+        fields = (
+            message.get("fields") if isinstance(message.get("fields"), dict) else {}
+        )
         ids = fields.get("ids") if isinstance(fields.get("ids"), list) else []
         info["ids"] = ids
         info["records_total"] = _as_int(fields.get("recordsTotal")) or len(ids)
-        info["records_filtered"] = _as_int(fields.get("recordsFiltered")) or info["records_total"]
+        info["records_filtered"] = (
+            _as_int(fields.get("recordsFiltered")) or info["records_total"]
+        )
     return info
 
 
-def _mymedicalshopper_employer_docs_from_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _mymedicalshopper_employer_docs_from_messages(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     employers: dict[str, dict[str, Any]] = {}
     for message in messages:
-        if message.get("collection") != "employers" or message.get("msg") not in {"added", "changed"}:
+        if message.get("collection") != "employers" or message.get("msg") not in {
+            "added",
+            "changed",
+        }:
             continue
-        fields = message.get("fields") if isinstance(message.get("fields"), dict) else {}
+        fields = (
+            message.get("fields") if isinstance(message.get("fields"), dict) else {}
+        )
         slug = str(fields.get("slug") or "").strip()
         if not slug:
             continue
-        employers[slug] = {"_id": _mymedicalshopper_oid_value(message.get("id")), **fields}
+        employers[slug] = {
+            "_id": _mymedicalshopper_oid_value(message.get("id")),
+            **fields,
+        }
     return list(employers.values())
 
 
@@ -1434,21 +2313,41 @@ async def _mymedicalshopper_entity_employers(
     )
     config = _mymedicalshopper_entity_config_from_messages(config_messages, entity_slug)
     tpa_name = _mymedicalshopper_tpa_name_from_config(config, entity_slug)
-    machine_readable_files = config.get("machineReadableFiles") if isinstance(config.get("machineReadableFiles"), dict) else {}
+    machine_readable_files = (
+        config.get("machineReadableFiles")
+        if isinstance(config.get("machineReadableFiles"), dict)
+        else {}
+    )
     selector = _mymedicalshopper_employer_selector(
         entity_slug,
-        all_employers_searchable=bool(machine_readable_files.get("allEmployersSearchable")),
+        all_employers_searchable=bool(
+            machine_readable_files.get("allEmployersSearchable")
+        ),
     )
     page_size = max(_as_int(resolver.get("page_size")) or 100, 1)
     max_employers = max(_as_int(resolver.get("max_employers")) or 10000, 1)
-    fields = {"name": 1, "slug": 1, "tpaSlug": 1, "status": 1, "machineReadableFiles": 1, "groupId": 1, "ein": 1}
+    fields = {
+        "name": 1,
+        "slug": 1,
+        "tpaSlug": 1,
+        "status": 1,
+        "machineReadableFiles": 1,
+        "groupId": 1,
+        "ein": 1,
+    }
     employers: dict[str, dict[str, Any]] = {}
     offset = 0
     while offset < max_employers:
         info_messages = await _mymedicalshopper_ddp_subscribe_collect(
             ws,
             name="tabular_getInfo",
-            params=["EntityMRFEmployers", selector, [["name", "asc"]], offset, min(page_size, max_employers - offset)],
+            params=[
+                "EntityMRFEmployers",
+                selector,
+                [["name", "asc"]],
+                offset,
+                min(page_size, max_employers - offset),
+            ],
             sub_id=f"mms-info-{entity_slug}-{offset}",
             timeout_seconds=timeout_seconds,
         )
@@ -1516,7 +2415,9 @@ def _mymedicalshopper_generated_entries(generated: Any) -> list[dict[str, Any]]:
     return [generated]
 
 
-def _mymedicalshopper_entry_plan_value(entry: dict[str, Any], keys: tuple[str, ...]) -> Any:
+def _mymedicalshopper_entry_plan_value(
+    entry: dict[str, Any], keys: tuple[str, ...]
+) -> Any:
     for key in keys:
         value = entry.get(key)
         if value not in (None, ""):
@@ -1548,21 +2449,37 @@ def _mymedicalshopper_targets_from_generated(
 ) -> list[CrawlTarget]:
     employer_slug = str(employer.get("slug") or "").strip()
     employer_name = _clean_text(employer.get("name") or employer_slug)
-    employer_id = _mymedicalshopper_oid_value(employer.get("_id") or employer.get("id")) or None
-    group_id = str(employer.get("groupId") or employer.get("group_id") or "").strip() or _mymedicalshopper_group_id_from_employer_slug(employer_slug)
-    tpa_slug = str(employer.get("tpaSlug") or employer.get("tpa_slug") or entity_slug or "").strip() or _mymedicalshopper_tpa_slug_from_employer_slug(employer_slug)
-    tpa_name = _clean_text(employer.get("tpaName") or employer.get("tpa_name")) or _slug_label(tpa_slug)
+    employer_id = (
+        _mymedicalshopper_oid_value(employer.get("_id") or employer.get("id")) or None
+    )
+    group_id = str(
+        employer.get("groupId") or employer.get("group_id") or ""
+    ).strip() or _mymedicalshopper_group_id_from_employer_slug(employer_slug)
+    tpa_slug = str(
+        employer.get("tpaSlug") or employer.get("tpa_slug") or entity_slug or ""
+    ).strip() or _mymedicalshopper_tpa_slug_from_employer_slug(employer_slug)
+    tpa_name = _clean_text(
+        employer.get("tpaName") or employer.get("tpa_name")
+    ) or _slug_label(tpa_slug)
     ein = str(employer.get("ein") or employer.get("EIN") or "").strip() or None
     targets_by_url: dict[str, CrawlTarget] = {}
     for entry in _mymedicalshopper_generated_entries(generated):
-        plan_id = _mymedicalshopper_entry_plan_value(entry, ("planId", "plan_id", "id", "_id"))
-        plan_name = _clean_text(_mymedicalshopper_entry_plan_value(entry, ("planName", "plan_name", "name")) or "")
+        plan_id = _mymedicalshopper_entry_plan_value(
+            entry, ("planId", "plan_id", "id", "_id")
+        )
+        plan_name = _clean_text(
+            _mymedicalshopper_entry_plan_value(entry, ("planName", "plan_name", "name"))
+            or ""
+        )
         history = _mymedicalshopper_entry_history(entry)
         latest = sorted(
             (
                 item
                 for item in history
-                if item.get("mrfGenerated") is True and str(item.get("link") or "").strip().startswith(("http://", "https://"))
+                if item.get("mrfGenerated") is True
+                and str(item.get("link") or "")
+                .strip()
+                .startswith(("http://", "https://"))
             ),
             key=lambda item: str(item.get("month") or ""),
             reverse=True,
@@ -1614,7 +2531,9 @@ async def _resolve_mymedicalshopper_talon_mrf(
         raise ValueError(f"unsupported MyMedicalShopper MRF URL: {url}")
     timeout_seconds = float(_as_int(resolver.get("ddp_timeout_seconds")) or 30)
     max_plans = _as_int(resolver.get("max_plans_per_employer"))
-    ws = await _mymedicalshopper_ddp_connect(session, url, timeout_seconds=timeout_seconds)
+    ws = await _mymedicalshopper_ddp_connect(
+        session, url, timeout_seconds=timeout_seconds
+    )
     try:
         if entity_slug:
             employers = await _mymedicalshopper_entity_employers(
@@ -1631,14 +2550,18 @@ async def _resolve_mymedicalshopper_talon_mrf(
                 request_id=f"mms-employer-name-{employer_slug}",
                 timeout_seconds=timeout_seconds,
             )
-            direct_tpa_slug = _mymedicalshopper_tpa_slug_from_employer_slug(employer_slug)
+            direct_tpa_slug = _mymedicalshopper_tpa_slug_from_employer_slug(
+                employer_slug
+            )
             employers = [
                 {
                     "slug": employer_slug,
                     "name": employer_name,
                     "tpaSlug": direct_tpa_slug,
                     "tpaName": _slug_label(direct_tpa_slug),
-                    "groupId": _mymedicalshopper_group_id_from_employer_slug(employer_slug),
+                    "groupId": _mymedicalshopper_group_id_from_employer_slug(
+                        employer_slug
+                    ),
                 }
             ]
         targets: list[CrawlTarget] = []
@@ -1655,10 +2578,14 @@ async def _resolve_mymedicalshopper_talon_mrf(
             targets.extend(
                 _mymedicalshopper_targets_from_generated(
                     source,
-                    entity_slug=entity_slug or str(employer.get("tpaSlug") or "").strip() or None,
+                    entity_slug=entity_slug
+                    or str(employer.get("tpaSlug") or "").strip()
+                    or None,
                     employer=employer,
                     generated=generated,
-                    resolver_type=str(resolver.get("type") or "mymedicalshopper_talon_mrf"),
+                    resolver_type=str(
+                        resolver.get("type") or "mymedicalshopper_talon_mrf"
+                    ),
                     resolved_from_url=url,
                 )
             )
@@ -1670,19 +2597,35 @@ async def _resolve_mymedicalshopper_talon_mrf(
 
 
 def _asr_group_number_from_url(url: str | None) -> str | None:
-    query = {key.lower(): value for key, value in parse_qsl(urlsplit(str(url or "")).query, keep_blank_values=True)}
+    query = {
+        key.lower(): value
+        for key, value in parse_qsl(
+            urlsplit(str(url or "")).query, keep_blank_values=True
+        )
+    }
     group_number = str(query.get("groupnumber") or query.get("g") or "").strip()
     return group_number or None
 
 
-def _crawl_target_context_metadata(target: CrawlTarget) -> dict[str, str]:
+def _crawl_target_context_metadata(target: CrawlTarget) -> dict[str, Any]:
     metadata = dict(target.metadata or {})
+    source_metadata = dict((target.source or {}).get("metadata_json") or {})
     group_number = (
         str(metadata.get("group_number") or metadata.get("group_id") or "").strip()
         or _asr_group_number_from_url(target.url)
         or _asr_group_number_from_url(target.resolved_from_url)
     )
-    context: dict[str, str] = {}
+    context: dict[str, Any] = {}
+    benefit_lines = _normalize_benefit_lines(
+        _benefit_line_values(metadata.get("benefit_lines"))
+        + _benefit_line_values(metadata.get("benefit_line"))
+        + _benefit_line_values(source_metadata.get("benefit_lines"))
+        + _benefit_line_values(source_metadata.get("benefit_line"))
+    )
+    if benefit_lines:
+        context["benefit_lines"] = list(benefit_lines)
+        if len(benefit_lines) == 1:
+            context["benefit_line"] = benefit_lines[0]
     if group_number:
         context["group_id"] = group_number
         context["group_number"] = group_number
@@ -1707,7 +2650,9 @@ def _crawl_target_context_metadata(target: CrawlTarget) -> dict[str, str]:
     return context
 
 
-def _apply_crawl_target_context_to_file_rows(file_rows: list[dict[str, Any]], target: CrawlTarget) -> list[dict[str, Any]]:
+def _apply_crawl_target_context_to_file_rows(
+    file_rows: list[dict[str, Any]], target: CrawlTarget
+) -> list[dict[str, Any]]:
     context = _crawl_target_context_metadata(target)
     if not context:
         return file_rows
@@ -1729,15 +2674,23 @@ def _asr_group_numbers_from_seed_list(seed_list_name: str | None) -> list[str]:
             continue
         group_number = str(row.get("group_number") or "").strip()
         if not re.fullmatch(r"\d{4}", group_number):
-            raise ValueError(f"ASR seed list {seed_list_name} contains a non-4-digit group number")
+            raise ValueError(
+                f"ASR seed list {seed_list_name} contains a non-4-digit group number"
+            )
         group_numbers.append(group_number)
     return group_numbers
 
 
 def _asr_configured_group_numbers(resolver: dict[str, Any]) -> list[str]:
     group_numbers: list[str] = []
-    group_numbers.extend(_asr_group_numbers_from_seed_list(str(resolver.get("seed_list") or "").strip() or None))
-    group_numbers.extend(str(value).strip() for value in (resolver.get("group_numbers") or ()))
+    group_numbers.extend(
+        _asr_group_numbers_from_seed_list(
+            str(resolver.get("seed_list") or "").strip() or None
+        )
+    )
+    group_numbers.extend(
+        str(value).strip() for value in (resolver.get("group_numbers") or ())
+    )
     for group_number in group_numbers:
         if group_number and not re.fullmatch(r"\d{4}", group_number):
             raise ValueError("ASR configured group numbers must be 4 digits")
@@ -1747,7 +2700,10 @@ def _asr_configured_group_numbers(resolver: dict[str, Any]) -> list[str]:
 def _asr_group_numbers_for_source(url: str, resolver: dict[str, Any]) -> list[str]:
     group_numbers: list[str] = []
     seen: set[str] = set()
-    for value in (_asr_group_number_from_url(url), *_asr_configured_group_numbers(resolver)):
+    for value in (
+        _asr_group_number_from_url(url),
+        *_asr_configured_group_numbers(resolver),
+    ):
         group_number = str(value or "").strip()
         if not group_number or group_number in seen:
             continue
@@ -1758,12 +2714,16 @@ def _asr_group_numbers_for_source(url: str, resolver: dict[str, Any]) -> list[st
 
 def _asr_toc_url(base_url: str, resolver: dict[str, Any], group_number: str) -> str:
     toc_path = str(resolver.get("toc_path") or "/umbraco/surface/mrfdownload").strip()
-    return urljoin(_url_origin(base_url) + "/", toc_path.lstrip("/")) + "?" + urlencode(
-        {"fileType": "TableOfContents", "groupNumber": group_number}
+    return (
+        urljoin(_url_origin(base_url) + "/", toc_path.lstrip("/"))
+        + "?"
+        + urlencode({"fileType": "TableOfContents", "groupNumber": group_number})
     )
 
 
-def _resolve_asr_health_benefits_mrf(source: dict[str, Any], url: str, resolver: dict[str, Any]) -> list[CrawlTarget]:
+def _resolve_asr_health_benefits_mrf(
+    source: dict[str, Any], url: str, resolver: dict[str, Any]
+) -> list[CrawlTarget]:
     resolver_type = str(resolver.get("type") or "asr_health_benefits_mrf")
     targets: list[CrawlTarget] = []
     for group_number in _asr_group_numbers_for_source(url, resolver):
@@ -1795,7 +2755,10 @@ def _wordpress_entry_content(html_text: str) -> str:
 
 
 def _auxiant_directory_url(url: str, resolver: dict[str, Any]) -> str:
-    path = str(resolver.get("directory_path") or "/directory-of-data-sources/").strip() or "/directory-of-data-sources/"
+    path = (
+        str(resolver.get("directory_path") or "/directory-of-data-sources/").strip()
+        or "/directory-of-data-sources/"
+    )
     return urljoin(_url_origin(url) + "/", path.lstrip("/"))
 
 
@@ -1805,14 +2768,22 @@ def _auxiant_network_label(label: Any) -> str:
 
 def _auxiant_anchor_links(html_text: str, *, base_url: str) -> list[dict[str, str]]:
     links: list[dict[str, str]] = []
-    for match in re.finditer(r"<a\b(?P<attrs>[^>]*)>(?P<label>.*?)</a>", html_text or "", flags=re.I | re.S):
-        href_match = re.search(r"""href\s*=\s*(?P<quote>["'])(?P<value>.*?)(?P=quote)""", match.group("attrs") or "", flags=re.I | re.S)
+    for match in re.finditer(
+        r"<a\b(?P<attrs>[^>]*)>(?P<label>.*?)</a>", html_text or "", flags=re.I | re.S
+    ):
+        href_match = re.search(
+            r"""href\s*=\s*(?P<quote>["'])(?P<value>.*?)(?P=quote)""",
+            match.group("attrs") or "",
+            flags=re.I | re.S,
+        )
         if not href_match:
             continue
         raw = html.unescape(str(href_match.group("value") or "")).strip()
         if not raw or raw.lower().startswith(("javascript:", "mailto:", "tel:", "#")):
             continue
-        label = html.unescape(re.sub(r"<[^>]+>", " ", match.group("label") or "")).replace("\xa0", " ")
+        label = html.unescape(
+            re.sub(r"<[^>]+>", " ", match.group("label") or "")
+        ).replace("\xa0", " ")
         label = re.sub(r"\s+", " ", label).strip()
         links.append({"url": urljoin(base_url, raw), "label": label})
     return links
@@ -1853,7 +2824,9 @@ def _parse_auxiant_directory_networks(
     return list(networks.values())
 
 
-def _auxiant_download_extension(url: str | None, label: str | None = None) -> str | None:
+def _auxiant_download_extension(
+    url: str | None, label: str | None = None
+) -> str | None:
     parsed = urlsplit(str(url or ""))
     text = f"{parsed.path} {parsed.query} {label or ''}".lower()
     for extension in (".json.gz", ".json.zip", ".zip", ".7z", ".json", ".csv", ".gz"):
@@ -1884,16 +2857,33 @@ def _auxiant_is_download_link(url: str | None, label: str | None = None) -> bool
     if path.startswith(("/wp-content/", "/wp-includes/")):
         return False
     if path.startswith("/wp-admin/admin-ajax.php"):
-        query = {key.lower(): value for key, value in parse_qsl(parsed.query, keep_blank_values=True)}
+        query = {
+            key.lower(): value
+            for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        }
         return query.get("cmd") == "file"
     return True
 
 
 def _auxiant_file_type(url: str | None, label: str | None = None) -> str:
     text = f"{url or ''} {label or ''}".lower().replace("_", "-")
-    if any(token in text for token in ("allowed-amount", "allowed amount", "out-of-network", "out of network", "/oon/", " oon ", "oon-mrf")):
+    if any(
+        token in text
+        for token in (
+            "allowed-amount",
+            "allowed amount",
+            "out-of-network",
+            "out of network",
+            "/oon/",
+            " oon ",
+            "oon-mrf",
+        )
+    ):
         return "allowed-amounts"
-    if any(token in text for token in ("payer-drug", "prescription-drug", "pharmacy", " rx ", "/rx/")):
+    if any(
+        token in text
+        for token in ("payer-drug", "prescription-drug", "pharmacy", " rx ", "/rx/")
+    ):
         return "payer-drug"
     return _mrf_file_type_from_text(url, label) or "in-network"
 
@@ -1908,7 +2898,11 @@ def _parse_auxiant_page_links(html_text: str, *, base_url: str) -> list[dict[str
         url = str(candidate.get("url") or "").strip()
         if not url:
             continue
-        label = _clean_text(candidate.get("label")) or Path(urlsplit(url).path).name or "MRF file"
+        label = (
+            _clean_text(candidate.get("label"))
+            or Path(urlsplit(url).path).name
+            or "MRF file"
+        )
         if "return to list" in label.lower():
             continue
         parsed = urlsplit(url)
@@ -2038,7 +3032,11 @@ async def _resolve_auxiant_wordpress_directory(
 ) -> list[CrawlTarget]:
     resolver_type = str(resolver.get("type") or "auxiant_wordpress_directory")
     directory_url = _auxiant_directory_url(url, resolver)
-    directory_html = await _fetch_text(directory_url, max_bytes=int(resolver.get("max_bytes") or 5 * 1024 * 1024), session=session)
+    directory_html = await _fetch_text(
+        directory_url,
+        max_bytes=int(resolver.get("max_bytes") or 5 * 1024 * 1024),
+        session=session,
+    )
     networks = _parse_auxiant_directory_networks(
         directory_html,
         base_url=directory_url,
@@ -2065,7 +3063,11 @@ async def _resolve_auxiant_wordpress_directory(
     for network in networks:
         page_url = str(network["url"])
         network_name = str(network["label"])
-        page_html = await _fetch_text(page_url, max_bytes=int(resolver.get("page_max_bytes") or 10 * 1024 * 1024), session=session)
+        page_html = await _fetch_text(
+            page_url,
+            max_bytes=int(resolver.get("page_max_bytes") or 10 * 1024 * 1024),
+            session=session,
+        )
         page_links = _parse_auxiant_page_links(page_html, base_url=page_url)
         for link in page_links:
             if link.get("target_kind") == "file_reference":
@@ -2087,7 +3089,9 @@ async def _resolve_auxiant_wordpress_directory(
             nested_source = {**source, "hosting_platform": nested_platform}
             nested_error: str | None = None
             try:
-                nested_targets = await _crawl_targets_for_source(nested_source, external_url, session)
+                nested_targets = await _crawl_targets_for_source(
+                    nested_source, external_url, session
+                )
             except Exception as exc:  # pylint: disable=broad-exception-caught
                 nested_targets = []
                 nested_error = f"{type(exc).__name__}: {exc}"
@@ -2152,26 +3156,1251 @@ def _parse_sapphire_toc_links(html_text: str, *, base_url: str) -> list[dict[str
     return list(urls.values())
 
 
+def _parse_healthgram_network_pages(
+    html_text: str, *, base_url: str
+) -> list[dict[str, Any]]:
+    pages: dict[str, dict[str, Any]] = {}
+    for candidate in _html_link_candidates(html_text, base_url=base_url):
+        url = str(candidate.get("url") or "").strip()
+        parsed = urlsplit(url)
+        if parsed.netloc.lower() != "mrf.healthgram.com" or not re.match(
+            r"^/network/[^/?#]+\.cfm$", parsed.path, flags=re.I
+        ):
+            continue
+        label = _clean_text(candidate.get("label")) or Path(parsed.path).stem
+        pages[_canonical_or_none(url) or url] = {"url": url, "label": label}
+    return list(pages.values())
+
+
+async def _resolve_healthgram_network_index(
+    source: dict[str, Any],
+    url: str,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    resolver_type = str(resolver.get("type") or "healthgram_network_index")
+    html_text = await _fetch_text(
+        url,
+        max_bytes=int(resolver.get("max_bytes") or 5 * 1024 * 1024),
+        session=session,
+    )
+    network_pages = _parse_healthgram_network_pages(html_text, base_url=url)
+    if not network_pages:
+        network_pages = [
+            {"url": url, "label": source.get("display_name") or "Healthgram"}
+        ]
+    max_pages = _as_int(resolver.get("max_network_pages")) or 50
+    targets_by_url: dict[str, CrawlTarget] = {}
+    for network_page in network_pages[:max_pages]:
+        page_url = str(network_page.get("url") or "").strip()
+        page_label = (
+            _clean_text(network_page.get("label"))
+            or source.get("display_name")
+            or "Healthgram"
+        )
+        page_html = (
+            html_text
+            if page_url == url
+            else await _fetch_text(
+                page_url,
+                max_bytes=int(
+                    resolver.get("network_page_max_bytes")
+                    or resolver.get("max_bytes")
+                    or 5 * 1024 * 1024
+                ),
+                session=session,
+            )
+        )
+        for target in _parse_html_mrf_links(page_html, base_url=page_url):
+            if target.get("target_file_type") != "table-of-contents":
+                continue
+            target_url = str(target.get("url") or "").strip()
+            if not target_url:
+                continue
+            index_label = _clean_text(target.get("label"))
+            key = _canonical_or_none(target_url) or target_url
+            targets_by_url[key] = CrawlTarget(
+                source=source,
+                url=target_url,
+                label=page_label,
+                resolved_from_url=page_url,
+                metadata={
+                    "resolver": resolver_type,
+                    "target_kind": target.get("target_kind"),
+                    "target_file_type": "table-of-contents",
+                    "container_format": target.get("container_format"),
+                    "html_attr": target.get("html_attr"),
+                    "healthgram_index_label": index_label,
+                    "healthgram_landing_url": url,
+                    "healthgram_network_page_url": page_url,
+                    "healthgram_network_name": page_label,
+                },
+            )
+    targets = list(targets_by_url.values())
+    if not targets:
+        raise ValueError(f"no Healthgram network index links found for {url}")
+    return targets
+
+
+async def _resolve_anthem_s3_mrf(
+    source: dict[str, Any],
+    url: str,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    html_text = await _fetch_text(
+        url, max_bytes=int(resolver.get("max_bytes") or 1024 * 1024), session=session
+    )
+    script_urls = [
+        str(candidate.get("url") or "")
+        for candidate in _html_link_candidates(html_text, base_url=url)
+        if urlsplit(str(candidate.get("url") or "")).path.endswith(".js")
+        and "script"
+        in Path(urlsplit(str(candidate.get("url") or "")).path).name.lower()
+    ]
+    configured_script = str(resolver.get("script_path") or "").strip()
+    if configured_script:
+        script_urls.append(urljoin(url, configured_script))
+    script_text = ""
+    for script_url in dict.fromkeys(script_urls):
+        try:
+            script_text = await _fetch_text(
+                script_url,
+                max_bytes=int(resolver.get("max_bytes") or 1024 * 1024),
+                session=session,
+            )
+            if script_text:
+                break
+        except Exception:  # pylint: disable=broad-exception-caught
+            continue
+    bases = _anthem_s3_bases_from_script(script_text)
+    for status_url in _anthem_s3_status_urls_from_script(script_text):
+        head = await _head_url(status_url, session)
+        if str(head.get("status") or "") == "ok":
+            bases.insert(0, status_url.rsplit("/", 1)[0] + "/")
+            break
+    if not bases:
+        bases = ["https://antm-pt-prod-dataz-nogbd-nophi-us-east1.s3.amazonaws.com/"]
+    targets = _anthem_s3_toc_targets(
+        source,
+        bases[0],
+        _anthem_s3_toc_patterns_from_script(script_text, source_url=url),
+        resolver,
+        source_url=url,
+    )
+    if not targets:
+        raise ValueError(f"no Anthem S3 TOC targets resolved for {url}")
+    return targets
+
+
+async def _resolve_hcsc_asomrf_landing(
+    source: dict[str, Any],
+    url: str,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    html_text = await _fetch_text(
+        url,
+        max_bytes=int(resolver.get("max_bytes") or 5 * 1024 * 1024),
+        session=session,
+    )
+    state_urls = _hcsc_asomrf_urls_from_html(html_text, base_url=url)
+    max_state_pages = _as_int(resolver.get("max_state_pages")) or 10
+    nested_resolver = dict(resolver)
+    nested_resolver["type"] = "bcbs_asomrf_filelist"
+    nested_resolver.pop("max_targets", None)
+    targets: list[CrawlTarget] = []
+    for state_url in state_urls[:max_state_pages]:
+        try:
+            for target in await _resolve_bcbs_asomrf_filelist(
+                source, state_url, nested_resolver, session
+            ):
+                metadata = {
+                    **dict(target.metadata or {}),
+                    "resolver": "hcsc_asomrf_landing",
+                    "delegated_resolver": (target.metadata or {}).get("resolver"),
+                    "delegated_source_url": state_url,
+                    "hcsc_landing_url": url,
+                }
+                targets.append(
+                    CrawlTarget(
+                        source=source,
+                        url=target.url,
+                        label=target.label,
+                        resolved_from_url=target.resolved_from_url,
+                        metadata=metadata,
+                    )
+                )
+        except Exception:  # pylint: disable=broad-exception-caught
+            continue
+    targets = _dedupe_crawl_targets_by_url(targets)
+    targets = _limit_crawl_targets_round_robin(
+        targets, "state", _as_int(resolver.get("max_targets"))
+    )
+    if not targets:
+        raise ValueError(f"no HCSC ASO MRF targets found for {url}")
+    return targets
+
+
+async def _resolve_point32_azure_mrf_directory(
+    source: dict[str, Any],
+    url: str,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    targets: list[CrawlTarget] = []
+    if urlsplit(url).netloc.lower().endswith(".web.core.windows.net"):
+        directory_urls = [url]
+    else:
+        html_text = await _fetch_text(
+            url,
+            max_bytes=int(resolver.get("max_bytes") or 5 * 1024 * 1024),
+            session=session,
+        )
+        for target in _crawl_targets_from_html_mrf_links(
+            source,
+            html_text,
+            base_url=url,
+            resolver="point32_azure_mrf_directory",
+        ):
+            metadata = {
+                **dict(target.metadata or {}),
+                "resolver": "point32_azure_mrf_directory",
+                "point32_landing_url": url,
+            }
+            targets.append(
+                CrawlTarget(
+                    source=source,
+                    url=target.url,
+                    label=target.label,
+                    resolved_from_url=target.resolved_from_url,
+                    metadata=metadata,
+                )
+            )
+        directory_urls = _point32_directory_urls_from_html(html_text, base_url=url)
+        if not directory_urls:
+            directory_urls = _html_mrf_directory_urls(html_text, base_url=url)
+    max_directories = _as_int(resolver.get("max_directories")) or 5
+    for directory_url in directory_urls[:max_directories]:
+        directory_html = await _fetch_text(
+            directory_url,
+            max_bytes=int(resolver.get("directory_max_bytes") or 50 * 1024 * 1024),
+            session=session,
+        )
+        for target in _crawl_targets_from_html_mrf_links(
+            source,
+            directory_html,
+            base_url=directory_url,
+            resolver="point32_azure_mrf_directory",
+        ):
+            metadata = {
+                **dict(target.metadata or {}),
+                "resolver": "point32_azure_mrf_directory",
+                "point32_landing_url": url,
+                "point32_directory_url": directory_url,
+            }
+            targets.append(
+                CrawlTarget(
+                    source=source,
+                    url=target.url,
+                    label=target.label,
+                    resolved_from_url=directory_url,
+                    metadata=metadata,
+                )
+            )
+    targets = _dedupe_crawl_targets_by_url(targets)
+    max_targets = _as_int(resolver.get("max_targets"))
+    if max_targets and max_targets > 0:
+        targets = targets[:max_targets]
+    if not targets:
+        raise ValueError(f"no Point32 Azure MRF directory targets found for {url}")
+    return targets
+
+
+async def _resolve_html_delegated_mrf_links(
+    source: dict[str, Any],
+    url: str,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    html_text = await _fetch_text(
+        url,
+        max_bytes=int(resolver.get("max_bytes") or 5 * 1024 * 1024),
+        session=session,
+    )
+    targets = _crawl_targets_from_html_mrf_links(
+        source, html_text, base_url=url, resolver="html_delegated_mrf_links"
+    )
+    max_links = _as_int(resolver.get("max_links")) or 40
+    for delegated_url in _delegated_mrf_source_urls_from_html(html_text, base_url=url)[
+        :max_links
+    ]:
+        platform = classify_hosting_platform(delegated_url)
+        nested_source = {
+            **source,
+            "hosting_platform": platform,
+            "index_url": delegated_url,
+            "human_url": delegated_url,
+        }
+        try:
+            delegated_targets = await _crawl_targets_for_source(
+                nested_source,
+                delegated_url,
+                session,
+                target_limit=_as_int(resolver.get("max_targets")),
+            )
+        except Exception:  # pylint: disable=broad-exception-caught
+            continue
+        for target in delegated_targets:
+            metadata = {
+                **dict(target.metadata or {}),
+                "delegated_source_url": delegated_url,
+                "delegated_source_platform": platform,
+                "delegated_landing_url": url,
+            }
+            targets.append(
+                CrawlTarget(
+                    source=source,
+                    url=target.url,
+                    label=target.label,
+                    resolved_from_url=target.resolved_from_url or delegated_url,
+                    metadata=metadata,
+                )
+            )
+    targets = _dedupe_crawl_targets_by_url(targets)
+    max_targets = _as_int(resolver.get("max_targets"))
+    if max_targets and max_targets > 0:
+        targets = targets[:max_targets]
+    if not targets:
+        raise ValueError(f"no delegated MRF links found for {url}")
+    return targets
+
+
+async def _resolve_html_mrf_links(
+    source: dict[str, Any],
+    url: str,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    html_text = await _fetch_text(
+        url,
+        max_bytes=int(resolver.get("max_bytes") or 5 * 1024 * 1024),
+        session=session,
+    )
+    target_max_bytes = _parse_size_bytes(resolver.get("toc_max_bytes"))
+    targets = _crawl_targets_from_html_mrf_links(
+        source,
+        html_text,
+        base_url=url,
+        resolver="html_mrf_links",
+        target_max_bytes=target_max_bytes,
+    )
+    if not targets and resolver.get("follow_directory_links", True):
+        directory_urls = _html_mrf_directory_urls(html_text, base_url=url)
+        max_directories = _as_int(resolver.get("max_directories")) or 10
+        directory_max_bytes = int(
+            resolver.get("directory_max_bytes")
+            or resolver.get("max_bytes")
+            or 5 * 1024 * 1024
+        )
+        for directory_url in directory_urls[:max_directories]:
+            try:
+                directory_html = await _fetch_text(
+                    directory_url,
+                    max_bytes=directory_max_bytes,
+                    session=session,
+                )
+            except Exception:  # pylint: disable=broad-exception-caught
+                continue
+            directory_targets = _crawl_targets_from_html_mrf_links(
+                source,
+                directory_html,
+                base_url=directory_url,
+                resolver="html_mrf_directory_link",
+                target_max_bytes=target_max_bytes,
+            )
+            for target in directory_targets:
+                metadata = {
+                    **dict(target.metadata or {}),
+                    "directory_url": directory_url,
+                }
+                targets.append(
+                    CrawlTarget(
+                        source=source,
+                        url=target.url,
+                        label=target.label,
+                        resolved_from_url=target.resolved_from_url,
+                        metadata=metadata,
+                    )
+                )
+        targets = _dedupe_crawl_targets_by_url(targets)
+    if not targets and resolver.get("follow_iframe_links", True):
+        frame_urls = _html_mrf_frame_urls(html_text, base_url=url)
+        max_frames = _as_int(resolver.get("max_frames")) or 5
+        frame_max_bytes = int(
+            resolver.get("frame_max_bytes")
+            or resolver.get("directory_max_bytes")
+            or resolver.get("max_bytes")
+            or 5 * 1024 * 1024
+        )
+        for frame_url in frame_urls[:max_frames]:
+            try:
+                frame_html = await _fetch_text(
+                    frame_url,
+                    max_bytes=frame_max_bytes,
+                    session=session,
+                )
+            except Exception:  # pylint: disable=broad-exception-caught
+                continue
+            frame_targets = _crawl_targets_from_html_mrf_links(
+                source,
+                frame_html,
+                base_url=frame_url,
+                resolver="html_mrf_frame_link",
+                target_max_bytes=target_max_bytes,
+            )
+            for target in frame_targets:
+                metadata = {
+                    **dict(target.metadata or {}),
+                    "frame_url": frame_url,
+                }
+                targets.append(
+                    CrawlTarget(
+                        source=source,
+                        url=target.url,
+                        label=target.label,
+                        resolved_from_url=target.resolved_from_url,
+                        metadata=metadata,
+                    )
+                )
+        targets = _dedupe_crawl_targets_by_url(targets)
+    max_targets = _as_int(resolver.get("max_targets"))
+    if max_targets and max_targets > 0:
+        targets = targets[:max_targets]
+    if not targets:
+        raise ValueError(f"no direct HTML MRF links found for {url}")
+    return targets
+
+
+def _html_mrf_directory_urls(html_text: str, *, base_url: str) -> list[str]:
+    urls: list[str] = []
+    seen: set[str] = set()
+    base_key = _canonical_or_none(base_url) or base_url
+    for candidate in _html_link_candidates(html_text, base_url=base_url):
+        url = str(candidate.get("url") or "")
+        parsed = urlsplit(url)
+        host = parsed.netloc.lower()
+        path = parsed.path.lower()
+        file_name = Path(path).name
+        label = _clean_text(candidate.get("label"))
+        text = f"{path} {label}".lower().replace("_", "-")
+        if host == "github.com" and path.startswith("/cmsgov/price-transparency-guide"):
+            continue
+        if host.endswith("cms.gov") and "price-transparency" in path:
+            continue
+        if not (path.endswith("/") or "." not in file_name):
+            continue
+        if not path.endswith("/") and "." not in file_name:
+            base_host = urlsplit(base_url).netloc.lower()
+            host = parsed.netloc.lower()
+            if host != base_host and "mrf" not in f"{host} {path} {text}":
+                continue
+        if not any(
+            token in text
+            for token in (
+                "/mrf/",
+                "mrf",
+                "machine-readable",
+                "machine readable",
+                "transparency",
+                "in-network",
+                "out-of-network",
+                "allowed",
+                "toc",
+                "table-of-contents",
+            )
+        ):
+            continue
+        key = _canonical_or_none(url) or url
+        if key == base_key or key in seen:
+            continue
+        seen.add(key)
+        urls.append(url)
+    return urls
+
+
+def _json_mrf_directory_links_from_html(html_text: str, *, base_url: str) -> list[str]:
+    urls: list[str] = []
+    seen: set[str] = set()
+    candidates = [
+        str(item.get("url") or "")
+        for item in _html_link_candidates(html_text, base_url=base_url)
+    ]
+    candidates.extend(_embedded_http_urls(html_text))
+    for url in candidates:
+        parsed = urlsplit(url)
+        path = parsed.path.lower()
+        label = Path(path).name.lower()
+        text = f"{path} {label}".replace("_", "-")
+        if not path.endswith(".json"):
+            continue
+        if not any(
+            token in text
+            for token in (
+                "directory",
+                "mrf",
+                "machine-readable",
+                "transparency",
+                "toc",
+                "tcr",
+            )
+        ):
+            continue
+        key = _canonical_or_none(url) or url
+        if key in seen:
+            continue
+        seen.add(key)
+        urls.append(url)
+    return urls
+
+
+def _json_mrf_directory_targets_from_payload(
+    source: dict[str, Any],
+    payload: Any,
+    *,
+    directory_url: str,
+    resolver_type: str,
+) -> list[CrawlTarget]:
+    targets: list[CrawlTarget] = []
+    seen: set[str] = set()
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            for nested in value.values():
+                visit(nested)
+            return
+        if isinstance(value, list):
+            for nested in value:
+                visit(nested)
+            return
+        if not isinstance(value, str):
+            return
+        for file_url in _embedded_http_urls(value):
+            label = Path(urlsplit(file_url).path).name
+            target_kind: str | None = None
+            target_file_type: str | None = None
+            if _looks_html_mrf_toc_url(file_url, label):
+                target_kind = "toc_json"
+                target_file_type = "table-of-contents"
+            elif _looks_html_mrf_body_reference(file_url, label):
+                target_kind = "file_reference"
+                target_file_type = _mrf_file_type_from_text(file_url, label)
+            if not target_kind or not target_file_type:
+                continue
+            key = _canonical_or_none(file_url) or file_url
+            if key in seen:
+                continue
+            seen.add(key)
+            plan_info = (
+                _plan_info_from_label(label) if target_kind == "file_reference" else []
+            )
+            metadata = {
+                "resolver": resolver_type,
+                "target_kind": target_kind,
+                "target_file_type": target_file_type,
+                "container_format": _container_format(file_url),
+                "directory_url": directory_url,
+                "plan_info": plan_info,
+            }
+            targets.append(
+                CrawlTarget(
+                    source=source,
+                    url=file_url,
+                    label=_mrf_file_plan_label(label) or label,
+                    resolved_from_url=directory_url,
+                    metadata={
+                        key: value
+                        for key, value in metadata.items()
+                        if value not in (None, "", [])
+                    },
+                )
+            )
+
+    visit(payload)
+    return targets
+
+
+async def _resolve_json_mrf_directory_links(
+    source: dict[str, Any],
+    url: str,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    if urlsplit(url).path.lower().endswith(".json"):
+        directory_urls = [url]
+    else:
+        html_text = await _fetch_text(
+            url,
+            max_bytes=int(resolver.get("max_bytes") or 5 * 1024 * 1024),
+            session=session,
+        )
+        directory_urls = _json_mrf_directory_links_from_html(html_text, base_url=url)
+    max_directories = _as_int(resolver.get("max_directories")) or 20
+    targets: list[CrawlTarget] = []
+    for directory_url in directory_urls[:max_directories]:
+        payload = await _fetch_json(
+            directory_url,
+            max_bytes=int(resolver.get("directory_max_bytes") or 20 * 1024 * 1024),
+            session=session,
+        )
+        targets.extend(
+            _json_mrf_directory_targets_from_payload(
+                source,
+                payload,
+                directory_url=directory_url,
+                resolver_type="json_mrf_directory_links",
+            )
+        )
+    targets = _dedupe_crawl_targets_by_url(targets)
+    max_targets = _as_int(resolver.get("max_targets"))
+    if max_targets and max_targets > 0:
+        targets = targets[:max_targets]
+    if not targets:
+        raise ValueError(f"no JSON directory MRF targets found for {url}")
+    return targets
+
+
+def _payercompass_file_type(frame: dict[str, Any], label: str | None = None) -> str:
+    file_type = _as_int(frame.get("fileType"))
+    if file_type == 1:
+        return "in-network"
+    if file_type == 2:
+        return "allowed-amounts"
+    inferred = _mrf_file_type_from_text(label or "", label or "")
+    return inferred or "in-network"
+
+
+def _payercompass_download_url(
+    base_url: str, resolver: dict[str, Any], file_id: str
+) -> str:
+    download_path = str(resolver.get("download_path") or "/api/File/Download")
+    download_url = urljoin(base_url, download_path)
+    return f"{download_url}?{urlencode({'Id': file_id})}"
+
+
+def _payercompass_target_for_file(
+    source: dict[str, Any],
+    *,
+    base_url: str,
+    resolver: dict[str, Any],
+    frame: dict[str, Any],
+    file_item: dict[str, Any],
+) -> CrawlTarget | None:
+    file_id = str(file_item.get("id") or frame.get("id") or "").strip()
+    if not file_id:
+        return None
+    file_name = str(file_item.get("name") or frame.get("name") or file_id).strip()
+    file_type = _payercompass_file_type(frame, file_name)
+    size_bytes = _parse_size_bytes(file_item.get("size"))
+    metadata = {
+        "resolver": "payercompass_mrf",
+        "target_kind": "file_reference",
+        "target_file_type": file_type,
+        "container_format": _container_format(file_name),
+        "payercompass_file_id": file_id,
+        "payercompass_file_name": file_name,
+        "payercompass_timeframe_id": frame.get("id"),
+        "payercompass_timeframe_name": frame.get("name"),
+        "size_bytes": size_bytes,
+    }
+    return CrawlTarget(
+        source=source,
+        url=_payercompass_download_url(base_url, resolver, file_id),
+        label=_mrf_file_plan_label(file_name) or file_name,
+        resolved_from_url=base_url,
+        metadata={
+            key: value for key, value in metadata.items() if value not in (None, "", [])
+        },
+    )
+
+
+def _payercompass_targets_from_structure(
+    source: dict[str, Any],
+    *,
+    base_url: str,
+    resolver: dict[str, Any],
+    structure: dict[str, Any],
+    file_lists: dict[str, list[dict[str, Any]]],
+) -> list[CrawlTarget]:
+    mrf_config = structure.get("mrfConfig") if isinstance(structure, dict) else None
+    frames = (
+        (mrf_config or {}).get("timeFrames") if isinstance(mrf_config, dict) else []
+    )
+    if not isinstance(frames, list):
+        return []
+    targets: list[CrawlTarget] = []
+    max_timeframes = _as_int(resolver.get("max_timeframes")) or len(frames)
+    for frame in frames[:max_timeframes]:
+        if not isinstance(frame, dict):
+            continue
+        timeframe_id = str(frame.get("id") or "").strip()
+        if not timeframe_id:
+            continue
+        listing = file_lists.get(timeframe_id) or []
+        if not listing and (_as_int(frame.get("fileCount")) or 0) == 1:
+            listing = [
+                {"id": timeframe_id, "name": str(frame.get("name") or timeframe_id)}
+            ]
+        for file_item in listing:
+            if not isinstance(file_item, dict):
+                continue
+            target = _payercompass_target_for_file(
+                source,
+                base_url=base_url,
+                resolver=resolver,
+                frame=frame,
+                file_item=file_item,
+            )
+            if target:
+                targets.append(target)
+    targets = _dedupe_crawl_targets_by_url(targets)
+    max_targets = _as_int(resolver.get("max_targets"))
+    if max_targets and max_targets > 0:
+        targets = targets[:max_targets]
+    return targets
+
+
+async def _resolve_payercompass_mrf(
+    source: dict[str, Any],
+    url: str,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    structure_path = str(resolver.get("structure_path") or "/api/Home/GetStructureInfo")
+    file_list_path = str(resolver.get("file_list_path") or "/api/File/List")
+    structure_url = urljoin(url, structure_path)
+    file_list_url = urljoin(url, file_list_path)
+    max_bytes = int(resolver.get("max_bytes") or 10 * 1024 * 1024)
+    structure = await _post_json(
+        structure_url, {}, max_bytes=max_bytes, session=session
+    )
+    mrf_config = structure.get("mrfConfig") if isinstance(structure, dict) else None
+    frames = (
+        (mrf_config or {}).get("timeFrames") if isinstance(mrf_config, dict) else []
+    )
+    if not isinstance(frames, list):
+        frames = []
+    max_timeframes = _as_int(resolver.get("max_timeframes")) or len(frames)
+    file_lists: dict[str, list[dict[str, Any]]] = {}
+    for frame in frames[:max_timeframes]:
+        if not isinstance(frame, dict):
+            continue
+        timeframe_id = str(frame.get("id") or "").strip()
+        if not timeframe_id:
+            continue
+        payload = await _post_json_value(
+            file_list_url,
+            {"timeFrameId": timeframe_id},
+            max_bytes=max_bytes,
+            session=session,
+        )
+        file_lists[timeframe_id] = payload if isinstance(payload, list) else []
+    targets = _payercompass_targets_from_structure(
+        source,
+        base_url=url,
+        resolver=resolver,
+        structure=structure,
+        file_lists=file_lists,
+    )
+    if not targets:
+        raise ValueError(f"no PayerCompass MRF files found for {url}")
+    return targets
+
+
+def _webtpa_api_base_url(url: str) -> str:
+    parsed = urlsplit(str(url or "").strip())
+    if not parsed.scheme or not parsed.netloc:
+        raise ValueError(f"unsupported WebTPA MRF URL: {url}")
+    return f"{parsed.scheme}://{parsed.netloc}/"
+
+
+def _webtpa_plan_id(plan: dict[str, Any]) -> str | None:
+    for key in ("mrfBenefitplanId", "benefitplanId", "planId", "id"):
+        value = plan.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return None
+
+
+def _webtpa_plan_name(plan: dict[str, Any]) -> str | None:
+    for key in ("benefitplanNm", "benefitPlanName", "planName", "name"):
+        value = _clean_text(plan.get(key))
+        if value:
+            return value
+    return None
+
+
+def _webtpa_file_id(record: dict[str, Any], file_type: str) -> str | None:
+    keys = (
+        ("mrfInNetworkRatesId", "inNetworkRatesId", "id")
+        if file_type == "in-network"
+        else ("mrfAllowedAmountsId", "allowedAmountsId", "id")
+    )
+    for key in keys:
+        value = record.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return None
+
+
+def _webtpa_record_location(record: dict[str, Any]) -> str | None:
+    location = str(record.get("location") or record.get("url") or "").strip()
+    return location if location.startswith(("http://", "https://")) else None
+
+
+def _webtpa_record_target(
+    source: dict[str, Any],
+    *,
+    plan: dict[str, Any],
+    record: dict[str, Any],
+    file_type: str,
+    file_url: str,
+    resolved_from_url: str,
+) -> CrawlTarget | None:
+    plan_id = _webtpa_plan_id(plan)
+    plan_name = _webtpa_plan_name(plan)
+    file_id = _webtpa_file_id(record, file_type)
+    file_name = _clean_text(record.get("fileName") or record.get("name"))
+    label = " - ".join(part for part in (plan_name, file_name) if part)
+    plan_info: list[dict[str, Any]] = []
+    if plan_id or plan_name:
+        plan_info.append(
+            {
+                "plan_id": plan_id,
+                "plan_id_type": "webtpa_mrf_benefitplan_id" if plan_id else None,
+                "plan_name": plan_name,
+            }
+        )
+    return CrawlTarget(
+        source=source,
+        url=file_url,
+        label=label or file_name or plan_name or Path(urlsplit(file_url).path).name,
+        resolved_from_url=resolved_from_url,
+        metadata={
+            "resolver": "webtpa_mrf_api",
+            "target_kind": "file_reference",
+            "target_file_type": file_type,
+            "container_format": _container_format(file_url),
+            "plan_info": plan_info,
+            "webtpa_plan_id": plan_id,
+            "webtpa_file_id": file_id,
+            "webtpa_file_name": file_name,
+            "webtpa_record_type": record.get("type"),
+        },
+    )
+
+
+async def _resolve_webtpa_mrf_api(
+    source: dict[str, Any],
+    url: str,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    base_url = _webtpa_api_base_url(url)
+    plans_url = urljoin(base_url, str(resolver.get("plans_path") or ""))
+    plans = await _fetch_json_value(
+        plans_url,
+        max_bytes=int(resolver.get("max_bytes") or 50 * 1024 * 1024),
+        session=session,
+    )
+    if not isinstance(plans, list):
+        raise ValueError(f"WebTPA plans endpoint did not return a list: {plans_url}")
+    max_plans = _as_int(resolver.get("max_plans")) or len(plans)
+    targets: list[CrawlTarget] = []
+    endpoint_specs = (
+        (
+            "in-network",
+            str(
+                resolver.get("in_network_path_template")
+                or "/machinereadablefile/plans/{plan_id}/in-network-rates"
+            ),
+            str(
+                resolver.get("in_network_location_path_template")
+                or "/machinereadablefile/in-network-rates/{file_id}/location"
+            ),
+        ),
+        (
+            "allowed-amounts",
+            str(
+                resolver.get("allowed_amounts_path_template")
+                or "/machinereadablefile/plans/{plan_id}/allowed-amounts"
+            ),
+            "",
+        ),
+    )
+    for plan in [item for item in plans if isinstance(item, dict)][:max_plans]:
+        plan_id = _webtpa_plan_id(plan)
+        if not plan_id:
+            continue
+        for file_type, list_template, location_template in endpoint_specs:
+            list_url = urljoin(base_url, list_template.format(plan_id=quote(plan_id)))
+            records = await _fetch_json_value(
+                list_url,
+                max_bytes=int(resolver.get("max_bytes") or 50 * 1024 * 1024),
+                session=session,
+            )
+            if not isinstance(records, list):
+                continue
+            for record in [item for item in records if isinstance(item, dict)]:
+                file_url = _webtpa_record_location(record)
+                file_id = _webtpa_file_id(record, file_type)
+                resolved_from_url = list_url
+                if not file_url and file_type == "in-network" and file_id:
+                    location_url = urljoin(
+                        base_url, location_template.format(file_id=quote(file_id))
+                    )
+                    try:
+                        location_payload = await _fetch_json(
+                            location_url,
+                            max_bytes=1024 * 1024,
+                            session=session,
+                        )
+                    except Exception:  # pylint: disable=broad-exception-caught
+                        location_payload = {}
+                    if isinstance(location_payload, dict):
+                        file_url = _webtpa_record_location(location_payload)
+                        resolved_from_url = location_url
+                if not file_url:
+                    continue
+                target = _webtpa_record_target(
+                    source,
+                    plan=plan,
+                    record=record,
+                    file_type=file_type,
+                    file_url=file_url,
+                    resolved_from_url=resolved_from_url,
+                )
+                if target:
+                    targets.append(target)
+                max_targets = _as_int(resolver.get("max_targets"))
+                if max_targets and len(targets) >= max_targets:
+                    return _dedupe_crawl_targets_by_url(targets)[:max_targets]
+    targets = _dedupe_crawl_targets_by_url(targets)
+    max_targets = _as_int(resolver.get("max_targets"))
+    if max_targets and max_targets > 0:
+        targets = targets[:max_targets]
+    if not targets:
+        raise ValueError(f"no WebTPA MRF file targets found for {url}")
+    return targets
+
+
+def _cmstic_brand_from_url(url: str) -> str | None:
+    parsed = urlsplit(str(url or ""))
+    params = parse_qs(parsed.query)
+    for key in ("brand", "brandCode"):
+        values = params.get(key) or []
+        for value in values:
+            value = str(value or "").strip()
+            if value:
+                return value
+    return None
+
+
+def _cmstic_brands_from_url(url: str, resolver: dict[str, Any]) -> list[str]:
+    parsed = urlsplit(str(url or ""))
+    host = parsed.netloc.lower()
+    brand = _cmstic_brand_from_url(url)
+    if brand:
+        return [brand]
+    configured = resolver.get("default_brands_by_host")
+    configured = configured if isinstance(configured, dict) else {}
+    brands = configured.get(host) or configured.get(host.lstrip("www."))
+    if isinstance(brands, str):
+        brands = [brands]
+    if isinstance(brands, list):
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for item in brands:
+            item = str(item or "").strip()
+            if item and item not in seen:
+                seen.add(item)
+                deduped.append(item)
+        if deduped:
+            return deduped
+    if "amerihealthnj.com" in host:
+        return ["ahnj", "ahnjhmo"]
+    if "amerihealth.com" in host:
+        return ["ahpa"]
+    if "ibx.com" in host:
+        return ["qcc"]
+    return []
+
+
+def _cmstic_api_url(url: str, brand: str | None = None) -> str:
+    parsed = urlsplit(str(url or ""))
+    host = parsed.netloc.lower()
+    brand = str(brand or _cmstic_brand_from_url(url) or "").strip()
+    if not brand:
+        raise ValueError(f"CMSTIC URL is missing a brand parameter: {url}")
+    if brand.lower() in {"ahnj", "ahnjhmo"}:
+        base = "https://www.amerihealthnj.com/cmsticsvc/api/fi"
+    elif brand.lower() == "ahpa":
+        base = "https://www.amerihealth.com/cmsticsvc/api/fi"
+    elif brand.lower() in {"qcc", "khpe", "bc", "iac"}:
+        base = "https://www.ibx.com/cmsticsvc/api/fi"
+    else:
+        raise ValueError(f"unsupported CMSTIC host: {url}")
+    return f"{base}?{urlencode({'brand': brand})}"
+
+
+def _cmstic_target_from_payload(
+    source: dict[str, Any],
+    payload: dict[str, Any],
+    *,
+    api_url: str,
+    resolver_type: str,
+) -> CrawlTarget | None:
+    file_url = str(payload.get("url") or payload.get("href") or "").strip()
+    if not file_url.startswith(("http://", "https://")):
+        return None
+    label = _clean_text(payload.get("name")) or Path(urlsplit(file_url).path).name
+    if not _looks_html_mrf_toc_url(file_url, label):
+        return None
+    return CrawlTarget(
+        source=source,
+        url=file_url,
+        label=label,
+        resolved_from_url=api_url,
+        metadata={
+            "resolver": resolver_type,
+            "target_kind": "toc_json",
+            "target_file_type": "table-of-contents",
+            "container_format": _container_format(file_url),
+            "cmstic_name": payload.get("name"),
+            "cmstic_brand": _cmstic_brand_from_url(api_url),
+        },
+    )
+
+
+async def _resolve_cmstic_file_info(
+    source: dict[str, Any],
+    url: str,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    targets: list[CrawlTarget] = []
+    for brand in _cmstic_brands_from_url(url, resolver):
+        api_url = _cmstic_api_url(url, brand)
+        payload = await _fetch_json(
+            api_url,
+            max_bytes=int(resolver.get("max_bytes") or 5 * 1024 * 1024),
+            session=session,
+        )
+        target = _cmstic_target_from_payload(
+            source, payload, api_url=api_url, resolver_type="cmstic_file_info"
+        )
+        if target:
+            targets.append(target)
+    targets = _dedupe_crawl_targets_by_url(targets)
+    if not targets:
+        raise ValueError(f"CMSTIC file-info response did not include a TOC: {url}")
+    return targets
+
+
+def _github_repo_parts_from_url(
+    url: str | None,
+) -> tuple[str, str, str | None, str | None]:
+    parsed = urlsplit(str(url or "").strip())
+    if parsed.netloc.lower() != "github.com":
+        raise ValueError(f"unsupported GitHub MRF URL: {url}")
+    parts = [part for part in parsed.path.strip("/").split("/") if part]
+    if len(parts) < 2:
+        raise ValueError(f"GitHub MRF URL must include owner and repo: {url}")
+    owner, repo = parts[0], parts[1]
+    branch: str | None = None
+    path_prefix: str | None = None
+    if len(parts) >= 4 and parts[2] in {"tree", "blob"}:
+        branch = parts[3]
+        if len(parts) > 4:
+            path_prefix = "/".join(parts[4:]).strip("/") or None
+    return owner, repo, branch, path_prefix
+
+
+def _github_raw_url(owner: str, repo: str, branch: str, path: str) -> str:
+    escaped_path = quote(path.strip("/"), safe="/")
+    return f"https://raw.githubusercontent.com/{owner}/{repo}/{quote(branch, safe='')}/{escaped_path}"
+
+
+def _mrf_file_plan_label(path: str) -> str | None:
+    name = Path(path).name
+    name = re.sub(r"\.(?:json(?:\.gz)?|zip|7z|csv)$", "", name, flags=re.I)
+    name = re.sub(r"^\d{4}-\d{2}-\d{2}[_-]", "", name)
+    name = re.sub(
+        r"[_-](?:in[_-]?network|in[_-]?network[_-]?rates|allowed[_-]?amounts?|rates?)$",
+        "",
+        name,
+        flags=re.I,
+    )
+    name = re.sub(
+        r"^(?:mrf|tic|toc|index|table[_-]?of[_-]?contents|[a-z0-9]+)[_-]+",
+        "",
+        name,
+        flags=re.I,
+    )
+    return _slug_label(name)
+
+
+def _github_mrf_plan_label(path: str) -> str | None:
+    return _mrf_file_plan_label(path)
+
+
+def _github_tree_mrf_target(
+    source: dict[str, Any],
+    *,
+    owner: str,
+    repo: str,
+    branch: str,
+    item: dict[str, Any],
+    tree_url: str,
+    resolver_type: str,
+) -> CrawlTarget | None:
+    if str(item.get("type") or "").lower() != "blob":
+        return None
+    path = str(item.get("path") or "").strip()
+    if not path:
+        return None
+    raw_url = _github_raw_url(owner, repo, branch, path)
+    label = _github_mrf_plan_label(path) or Path(path).name
+    file_type: str | None = None
+    target_kind: str | None = None
+    if _looks_html_mrf_toc_url(raw_url, label):
+        file_type = "table-of-contents"
+        target_kind = "toc_json"
+    elif _looks_direct_mrf_body_url(raw_url):
+        file_type = _mrf_file_type_from_text(raw_url, label)
+        target_kind = "file_reference"
+    if not file_type or not target_kind:
+        return None
+    plan_info = _plan_info_from_label(label)
+    return CrawlTarget(
+        source=source,
+        url=raw_url,
+        label=label,
+        resolved_from_url=tree_url,
+        metadata={
+            "resolver": resolver_type,
+            "target_kind": target_kind,
+            "target_file_type": file_type,
+            "container_format": _container_format(raw_url),
+            "github_owner": owner,
+            "github_repo": repo,
+            "github_branch": branch,
+            "github_path": path,
+            "github_sha": item.get("sha"),
+            "blob_size": item.get("size"),
+            "plan_info": plan_info,
+        },
+    )
+
+
+async def _resolve_github_repo_mrf(
+    source: dict[str, Any],
+    url: str,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    resolver_type = str(resolver.get("type") or "github_repo_mrf_tree")
+    owner, repo, branch, path_prefix = _github_repo_parts_from_url(url)
+    repo_url = f"https://api.github.com/repos/{owner}/{repo}"
+    if not branch:
+        repo_payload = await _fetch_json(
+            repo_url,
+            max_bytes=int(resolver.get("repo_max_bytes") or 1024 * 1024),
+            session=session,
+        )
+        branch = str(repo_payload.get("default_branch") or "main").strip() or "main"
+    tree_url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{quote(branch, safe='')}?recursive=1"
+    tree_payload = await _fetch_json(
+        tree_url,
+        max_bytes=int(resolver.get("tree_max_bytes") or 50 * 1024 * 1024),
+        session=session,
+    )
+    tree = tree_payload.get("tree")
+    if not isinstance(tree, list):
+        raise ValueError(
+            f"GitHub MRF tree response did not include file list for {owner}/{repo}"
+        )
+    targets: list[CrawlTarget] = []
+    prefix = (path_prefix or "").strip("/")
+    for item in tree:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or "")
+        if prefix and path != prefix and not path.startswith(f"{prefix}/"):
+            continue
+        target = _github_tree_mrf_target(
+            source,
+            owner=owner,
+            repo=repo,
+            branch=branch,
+            item=item,
+            tree_url=tree_url,
+            resolver_type=resolver_type,
+        )
+        if target:
+            targets.append(target)
+    max_targets = _as_int(resolver.get("max_targets"))
+    if max_targets and max_targets > 0:
+        targets = targets[:max_targets]
+    if not targets:
+        raise ValueError(f"no GitHub MRF files found for {owner}/{repo}")
+    return targets
+
+
 def _strip_html_tags(value: str) -> str:
     return _clean_text(re.sub(r"<[^>]+>", " ", value or ""))
 
 
 def _html_link_candidates(html_text: str, *, base_url: str) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
-    for match in re.finditer(r"<a\b(?P<attrs>[^>]*)>(?P<label>.*?)</a>", html_text or "", flags=re.I | re.S):
+    for match in re.finditer(
+        r"<a\b(?P<attrs>[^>]*)>(?P<label>.*?)</a>", html_text or "", flags=re.I | re.S
+    ):
         attrs = match.group("attrs") or ""
         label = _strip_html_tags(match.group("label") or "")
-        href_match = re.search(r"""href\s*=\s*(?P<quote>["'])(?P<value>.*?)(?P=quote)""", attrs, flags=re.I | re.S)
+        href_match = re.search(
+            r"""href\s*=\s*(?P<quote>["'])(?P<value>.*?)(?P=quote)""",
+            attrs,
+            flags=re.I | re.S,
+        )
         if href_match:
-            candidates.append({"attr": "href", "value": href_match.group("value"), "label": label})
+            candidates.append(
+                {
+                    "attr": "href",
+                    "value": href_match.group("value"),
+                    "label": label,
+                    "html_start": match.start(),
+                    "html_end": match.end(),
+                }
+            )
     attr_pattern = re.compile(
-        r"""\b(?P<attr>src|data-[a-z0-9_-]*(?:url|href|file|path|lookup)[a-z0-9_-]*)\s*=\s*(?P<quote>["'])(?P<value>.*?)(?P=quote)""",
+        r"""\b(?P<attr>src|data-(?:key|[a-z0-9_-]*(?:url|href|file|path|lookup|key)[a-z0-9_-]*))\s*=\s*(?P<quote>["'])(?P<value>.*?)(?P=quote)""",
         flags=re.I | re.S,
     )
     for match in attr_pattern.finditer(html_text or ""):
-        candidates.append({"attr": match.group("attr"), "value": match.group("value"), "label": ""})
+        candidates.append(
+            {
+                "attr": match.group("attr"),
+                "value": match.group("value"),
+                "label": "",
+                "html_start": match.start(),
+                "html_end": match.end(),
+            }
+        )
     for url in _embedded_http_urls(html_text):
-        candidates.append({"attr": "text", "value": url, "label": Path(urlsplit(url).path).name})
+        candidates.append(
+            {"attr": "text", "value": url, "label": Path(urlsplit(url).path).name}
+        )
     normalized: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
     for item in candidates:
@@ -2183,7 +4412,16 @@ def _html_link_candidates(html_text: str, *, base_url: str) -> list[dict[str, An
         if key in seen:
             continue
         seen.add(key)
-        normalized.append({"attr": key[0], "url": url, "label": item.get("label") or Path(urlsplit(url).path).name})
+        row = {
+            "attr": key[0],
+            "url": url,
+            "label": item.get("label") or Path(urlsplit(url).path).name,
+        }
+        if isinstance(item.get("html_start"), int):
+            row["html_start"] = item.get("html_start")
+        if isinstance(item.get("html_end"), int):
+            row["html_end"] = item.get("html_end")
+        normalized.append(row)
     return normalized
 
 
@@ -2210,7 +4448,9 @@ def _embedded_http_urls(value: str | None) -> list[str]:
     seen: set[str] = set()
     for match in re.finditer(r"https?://[^\s\"'<>]+", text, flags=re.I):
         url = match.group(0).rstrip("\\,.;)")
-        while url.endswith(("]", "}")) and (url.count("[") < url.count("]") or url.count("{") < url.count("}")):
+        while url.endswith(("]", "}")) and (
+            url.count("[") < url.count("]") or url.count("{") < url.count("}")
+        ):
             url = url[:-1]
         if not url:
             continue
@@ -2228,27 +4468,125 @@ def _looks_html_mrf_toc_url(url: str | None, label: str | None = None) -> bool:
     path = parsed.path.lower()
     query = parsed.query.lower()
     text = f"{path} {query} {label or ''}".lower().replace("_", "-")
+    if _looks_non_tic_mrf_reference(url, label):
+        return False
+    if any(
+        token in text for token in ("formulary", "provider-data", "provider ")
+    ) and not any(
+        token in text
+        for token in (
+            "allowed",
+            "in-network",
+            "in network",
+            "rate",
+            "rates",
+            "toc",
+            "table-of-contents",
+            "table of contents",
+        )
+    ):
+        return False
+    if host == "d3oz7y1cwsecds.cloudfront.net" and path == "/member-prod/bcbsal":
+        return True
     if path.endswith((".json", ".json.gz")):
-        return any(token in text for token in ("index.json", "index.json.gz", "cms-data-index", "toc", "table-of-contents", "table of contents"))
+        file_name = Path(path).name.replace("_", "-")
+        if re.search(r"(^|-)index(?:-[a-z0-9]+)?\.json(?:\.gz)?$", file_name) and any(
+            token in text
+            for token in (
+                "mrf",
+                "machine-readable",
+                "price-transparency",
+                "transparency",
+                "table-of-contents",
+                "table of contents",
+            )
+        ):
+            return True
+        return any(
+            token in text
+            for token in (
+                "index.json",
+                "index.json.gz",
+                "toc",
+                "table-of-contents",
+                "table of contents",
+            )
+        )
     if "sapphiremrfhub.com" in host and "/tocs/" in path:
         return True
     if "name=table-of-contents" in query and "ext=json" in query:
         return True
-    if any(token in text for token in ("/toc-json", "table-of-contents.json", "cms-data-index")):
+    if any(token in text for token in ("/toc-json", "table-of-contents.json")):
+        return True
+    if (
+        "mrf" in path
+        and "toc" in text
+        and any(token in text for token in ("index", "table-of-contents"))
+    ):
         return True
     file_name = Path(path).name.replace("_", "-")
     if "." in file_name:
         return False
     if not file_name.endswith(("-index", "-toc")):
         return False
-    return any(token in text for token in ("/mrf/", "mrf", "machine-readable", "transparency", "table-of-contents", "table of contents"))
+    return any(
+        token in text
+        for token in (
+            "/mrf/",
+            "mrf",
+            "machine-readable",
+            "transparency",
+            "table-of-contents",
+            "table of contents",
+        )
+    )
 
 
 def _looks_html_mrf_body_reference(url: str | None, label: str | None = None) -> bool:
-    if not _looks_direct_mrf_body_url(url):
+    query_file_name = _query_mrf_file_name(url)
+    direct_body = _looks_direct_mrf_body_url(url) or bool(query_file_name)
+    parsed = urlsplit(str(url or ""))
+    host = parsed.netloc.lower()
+    path = parsed.path.lower()
+    if host == "github.com" and path.startswith("/cmsgov/price-transparency-guide"):
         return False
-    path = urlsplit(str(url or "")).path.lower()
-    text = f"{path} {label or ''}".lower().replace("_", "-")
+    if _looks_non_tic_mrf_reference(url, label):
+        return False
+    if path.endswith("/") and not query_file_name:
+        return False
+    text = f"{path} {label or ''} {query_file_name or ''}".lower().replace("_", "-")
+    if not direct_body:
+        file_name = Path(path).name
+        if "." in file_name:
+            return False
+        if not any(
+            token in text
+            for token in (
+                "getmachinereadablefile",
+                "machine-readable",
+                "mrf",
+                "transparency",
+            )
+        ):
+            return False
+        if not any(
+            token in text
+            for token in (
+                "allowed",
+                "in-network",
+                "in network",
+                "negotiated",
+                "out-of-network",
+                "out of network",
+                "rate",
+                "rates",
+            )
+        ):
+            return False
+    if any(token in text for token in ("formulary", "provider-data", "provider ")):
+        return False
+    if direct_body and _mrf_file_type_from_text(url, label) == "table-of-contents":
+        return True
     return any(
         token in text
         for token in (
@@ -2258,6 +4596,8 @@ def _looks_html_mrf_body_reference(url: str | None, label: str | None = None) ->
             "negotiated",
             "rate",
             "rates",
+            "table-of-contents",
+            "table of contents",
             "mrf",
             "machine-readable",
             "transparency",
@@ -2265,34 +4605,122 @@ def _looks_html_mrf_body_reference(url: str | None, label: str | None = None) ->
     )
 
 
+def _html_mrf_frame_urls(html_text: str, *, base_url: str) -> list[str]:
+    urls: list[str] = []
+    seen: set[str] = set()
+    base_key = _canonical_or_none(base_url) or base_url
+    for match in re.finditer(
+        r"<iframe\b(?P<attrs>[^>]*)>", html_text or "", flags=re.I | re.S
+    ):
+        attrs = match.group("attrs") or ""
+        src_match = re.search(
+            r"""src\s*=\s*(?P<quote>["'])(?P<value>.*?)(?P=quote)""",
+            attrs,
+            flags=re.I | re.S,
+        )
+        if not src_match:
+            continue
+        raw_src = html.unescape(src_match.group("value") or "").strip()
+        if not raw_src or raw_src.lower().startswith(("javascript:", "mailto:", "#")):
+            continue
+        url = urljoin(base_url, raw_src)
+        parsed = urlsplit(url)
+        path = parsed.path.lower()
+        text = f"{path} {parsed.query}".replace("_", "-")
+        if not any(
+            token in text
+            for token in ("mrf", "machine-readable", "transparency", "tic")
+        ):
+            continue
+        key = _canonical_or_none(url) or url
+        if key == base_key or key in seen:
+            continue
+        seen.add(key)
+        urls.append(url)
+    return urls
+
+
+def _html_label_looks_fileish(label: str | None, path: str) -> bool:
+    text = _clean_text(label)
+    if not text:
+        return True
+    if text.lower() in {"here", "download", "file", "mrf", "mrf file", "json"}:
+        return True
+    if "..>" in text or "..." in text:
+        return True
+    if re.search(r"\.(?:json|gz|zip|7z|csv)\b", text, flags=re.I):
+        return True
+    return bool(re.match(r"^\d{4}-\d{2}-\d{2}[_-]", text))
+
+
 def _parse_html_mrf_links(html_text: str, *, base_url: str) -> list[dict[str, Any]]:
     urls: dict[tuple[str, str], dict[str, Any]] = {}
+    section_file_type: str | None = None
+    last_html_position = 0
     for candidate in _html_link_candidates(html_text, base_url=base_url):
+        html_start = candidate.get("html_start")
+        if isinstance(html_start, int):
+            section = _mrf_file_type_from_html_section(
+                html_text[last_html_position:html_start]
+            )
+            if section:
+                section_file_type = section
+            html_end = candidate.get("html_end")
+            if isinstance(html_end, int):
+                last_html_position = max(last_html_position, html_end)
         url = str(candidate["url"])
-        label = _clean_text(candidate.get("label")) or Path(urlsplit(url).path).name or "MRF file"
+        label = (
+            _clean_text(candidate.get("label"))
+            or Path(urlsplit(url).path).name
+            or "MRF file"
+        )
         attr = str(candidate.get("attr") or "")
         path = urlsplit(url).path.lower()
         label_or_path = f"{path} {label}".lower()
         target_kind: str | None = None
         target_file_type: str | None = None
         resolver = "html_mrf_link"
-        if path.endswith(".txt") and any(token in label_or_path for token in ("meta", "mrf", "machine-readable", "transparency")):
+        query_file_name = _query_mrf_file_name(url)
+        direct_body = _looks_direct_mrf_body_url(url) or bool(query_file_name)
+        if path.endswith(".txt") and any(
+            token in label_or_path
+            for token in ("meta", "mrf", "machine-readable", "transparency")
+        ):
             target_kind = "metadata_text"
             target_file_type = "metadata-index"
             resolver = "html_metadata_text"
         elif _looks_html_mrf_toc_url(url, label):
             target_kind = "toc_json"
             target_file_type = "table-of-contents"
-        elif _looks_html_mrf_body_reference(url, label):
+        elif _looks_html_mrf_body_reference(url, label) or (
+            direct_body
+            and section_file_type
+            and not _looks_non_tic_mrf_reference(url, label)
+        ):
             target_kind = "file_reference"
-            target_file_type = _mrf_file_type_from_text(url, label)
+            target_file_type = _mrf_body_file_type_from_text(url, label) or (
+                section_file_type if direct_body else None
+            )
             if not target_file_type:
                 continue
             resolver = "html_file_reference"
+            inferred_label = _mrf_file_plan_label(path)
+            if (
+                _looks_direct_mrf_body_url(url)
+                and inferred_label
+                and _html_label_looks_fileish(label, path)
+            ):
+                label = inferred_label
         if not target_kind or not target_file_type:
             continue
+        plan_info = (
+            _plan_info_from_label(label)
+            if target_kind == "file_reference"
+            and _html_label_looks_fileish(candidate.get("label"), path)
+            else []
+        )
         key = (target_kind, _canonical_or_none(url) or url)
-        urls[key] = {
+        row = {
             "url": url,
             "label": label,
             "resolver": resolver,
@@ -2301,12 +4729,257 @@ def _parse_html_mrf_links(html_text: str, *, base_url: str) -> list[dict[str, An
             "container_format": _container_format(url),
             "html_attr": attr,
         }
+        if plan_info:
+            row["plan_info"] = plan_info
+        existing = urls.get(key)
+        if existing is None or (
+            existing.get("html_attr") == "text" and row.get("html_attr") != "text"
+        ):
+            urls[key] = row
     return list(urls.values())
 
 
-def _parse_html_mrf_metadata_links(html_text: str, *, base_url: str) -> list[dict[str, Any]]:
+def _dedupe_crawl_targets_by_url(targets: list[CrawlTarget]) -> list[CrawlTarget]:
+    deduped: dict[str, CrawlTarget] = {}
+    for target in targets:
+        key = _canonical_or_none(target.url) or target.url
+        if key not in deduped:
+            deduped[key] = target
+    return list(deduped.values())
+
+
+def _crawl_targets_from_html_mrf_links(
+    source: dict[str, Any],
+    html_text: str,
+    *,
+    base_url: str,
+    resolver: str,
+    target_max_bytes: int | None = None,
+) -> list[CrawlTarget]:
+    targets: list[CrawlTarget] = []
+    for target in _parse_html_mrf_links(html_text, base_url=base_url):
+        metadata = {
+            "resolver": target.get("resolver") or resolver,
+            "target_kind": target.get("target_kind"),
+            "target_file_type": target.get("target_file_type"),
+            "container_format": target.get("container_format"),
+            "html_attr": target.get("html_attr"),
+            "plan_info": target.get("plan_info"),
+            "target_max_bytes": (
+                target_max_bytes if target.get("target_kind") == "toc_json" else None
+            ),
+        }
+        targets.append(
+            CrawlTarget(
+                source=source,
+                url=str(target["url"]),
+                label=str(target.get("label") or source.get("display_name") or ""),
+                resolved_from_url=base_url,
+                metadata={
+                    key: value
+                    for key, value in metadata.items()
+                    if value not in (None, "", [])
+                },
+            )
+        )
+    return targets
+
+
+def _embedded_mrf_host_urls(value: str | None) -> list[str]:
+    text = html.unescape(str(value or ""))
+    host_patterns = (
+        r"(?P<host>[a-z0-9.-]+\.sapphiremrfhub\.com)(?P<path>/[^\s\"'<>)]*)?",
+        r"(?P<host>mrf\.healthcarebluebook\.com)(?P<path>/[A-Za-z0-9_.~%/-]+)?",
+        r"(?P<host>mrf\.healthgram\.com)(?P<path>/[A-Za-z0-9_.~%/-]+)?",
+        r"(?P<host>mrfsearch\.meritain\.com)(?P<path>/[A-Za-z0-9_.~%/-]+)?",
+        r"(?P<host>transparency-in-coverage\.uhc\.com)(?P<path>/[A-Za-z0-9_.~%/-]+)?",
+    )
+    urls: list[str] = []
+    seen: set[str] = set()
+    for pattern in host_patterns:
+        for match in re.finditer(pattern, text, flags=re.I):
+            host = str(match.group("host") or "").rstrip(".").lower()
+            path = str(match.groupdict().get("path") or "/").rstrip(".,;")
+            url = f"https://{host}{path or '/'}"
+            key = _canonical_or_none(url) or url
+            if key in seen:
+                continue
+            seen.add(key)
+            urls.append(url)
+    return urls
+
+
+def _delegated_mrf_source_urls_from_html(html_text: str, *, base_url: str) -> list[str]:
+    urls: list[str] = []
+    seen: set[str] = set()
+    candidates = [
+        str(item.get("url") or "")
+        for item in _html_link_candidates(html_text, base_url=base_url)
+    ]
+    candidates.extend(_embedded_mrf_host_urls(html_text))
+    source_key = _canonical_or_none(base_url) or base_url
+    for url in candidates:
+        key = _canonical_or_none(url) or url
+        if not url or key == source_key or key in seen:
+            continue
+        platform = classify_hosting_platform(url)
+        if not platform or platform in {
+            "custom",
+            "s3",
+            "change_healthcare",
+            "github_repo_mrf",
+            "html_delegated_mrf_links",
+        }:
+            continue
+        if not _platform_resolver_config(platform):
+            continue
+        seen.add(key)
+        urls.append(url)
+    return urls
+
+
+def _hcsc_asomrf_urls_from_html(html_text: str, *, base_url: str) -> list[str]:
+    urls: list[str] = []
+    seen: set[str] = set()
+    for candidate in _html_link_candidates(html_text, base_url=base_url):
+        url = str(candidate.get("url") or "")
+        if "/asomrf" not in urlsplit(url).path.lower():
+            continue
+        key = _canonical_or_none(url) or url
+        if key in seen:
+            continue
+        seen.add(key)
+        urls.append(url)
+    return urls
+
+
+def _point32_directory_urls_from_html(html_text: str, *, base_url: str) -> list[str]:
+    urls: list[str] = []
+    seen: set[str] = set()
+    candidates = [
+        str(item.get("url") or "")
+        for item in _html_link_candidates(html_text, base_url=base_url)
+    ]
+    candidates.extend(_embedded_http_urls(html_text))
+    for url in candidates:
+        parsed = urlsplit(url)
+        host = parsed.netloc.lower()
+        if not host.endswith(".web.core.windows.net"):
+            continue
+        if "mrf" not in host and "mrf" not in parsed.path.lower():
+            continue
+        key = _canonical_or_none(url) or url
+        if key in seen:
+            continue
+        seen.add(key)
+        urls.append(url)
+    return urls
+
+
+def _anthem_s3_status_urls_from_script(script_text: str) -> list[str]:
     return [
-        {"url": target["url"], "label": Path(urlsplit(str(target["url"])).path).name or target["label"]}
+        url
+        for url in _embedded_http_urls(script_text)
+        if urlsplit(url).netloc.endswith("amazonaws.com")
+        and urlsplit(url).path.endswith("/status.json")
+    ]
+
+
+def _anthem_s3_bases_from_script(script_text: str) -> list[str]:
+    bases: list[str] = []
+    seen: set[str] = set()
+    for match in re.finditer(
+        r"""s3url\s*=\s*(?P<quote>["'])(?P<url>https?://.*?/)(?P=quote)""",
+        script_text or "",
+        flags=re.I,
+    ):
+        url = html.unescape(match.group("url"))
+        key = _canonical_or_none(url) or url
+        if key in seen:
+            continue
+        seen.add(key)
+        bases.append(url)
+    return bases
+
+
+def _anthem_s3_toc_patterns_from_script(
+    script_text: str, *, source_url: str
+) -> list[tuple[str, str, str]]:
+    patterns: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    regex = re.compile(
+        r"""s3url\s*\+\s*["'](?P<prefix>[^"']+/)["']\s*\+\s*year\s*\+\s*["']-["']\s*\+\s*month\s*\+\s*["']-01_(?P<slug>[^"']+)_index\.json(?P<gzip>\.gz)?["']""",
+        flags=re.I,
+    )
+    for match in regex.finditer(script_text or ""):
+        pattern = (
+            match.group("prefix").strip("/"),
+            match.group("slug"),
+            ".json.gz" if match.group("gzip") else ".json",
+        )
+        if pattern not in seen:
+            seen.add(pattern)
+            patterns.append(pattern)
+    if patterns:
+        return patterns
+    host = _domain(source_url) or ""
+    if "healthlink" in host:
+        return [("healthlink", "healthlink", ".json")]
+    return [("anthem", "anthem", ".json.gz")]
+
+
+def _anthem_s3_toc_targets(
+    source: dict[str, Any],
+    base_url: str,
+    patterns: list[tuple[str, str, str]],
+    resolver: dict[str, Any],
+    *,
+    source_url: str,
+    now: dt.datetime | None = None,
+) -> list[CrawlTarget]:
+    month_offsets = resolver.get("month_offsets")
+    if not isinstance(month_offsets, list) or not month_offsets:
+        month_offsets = [0]
+    targets: list[CrawlTarget] = []
+    current = now or _utc_now()
+    for raw_offset in month_offsets:
+        offset = _as_int(raw_offset)
+        if offset is None:
+            continue
+        month_date = _add_months(current, offset)
+        month_start = month_date.strftime("%Y-%m-01")
+        for prefix, slug, extension in patterns:
+            file_name = f"{month_start}_{slug}_index{extension}"
+            target_url = urljoin(
+                base_url.rstrip("/") + "/", f"{prefix.strip('/')}/{file_name}"
+            )
+            targets.append(
+                CrawlTarget(
+                    source=source,
+                    url=target_url,
+                    label=file_name,
+                    resolved_from_url=source_url,
+                    metadata={
+                        "resolver": "anthem_s3_mrf",
+                        "target_kind": "toc_json",
+                        "target_file_type": "table-of-contents",
+                        "container_format": _container_format(target_url),
+                        "month_start": month_start,
+                        "s3_prefix": prefix,
+                    },
+                )
+            )
+    return _dedupe_crawl_targets_by_url(targets)
+
+
+def _parse_html_mrf_metadata_links(
+    html_text: str, *, base_url: str
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "url": target["url"],
+            "label": Path(urlsplit(str(target["url"])).path).name or target["label"],
+        }
         for target in _parse_html_mrf_links(html_text, base_url=base_url)
         if target.get("target_kind") == "metadata_text"
     ]
@@ -2350,7 +5023,10 @@ def _metadata_plan_info(metadata: dict[str, Any]) -> list[dict[str, Any]]:
         plan = dict(item)
         if "plan_market_type" not in plan and plan.get("market_type"):
             plan["plan_market_type"] = plan.get("market_type")
-        if not any(plan.get(key) for key in ("plan_id", "plan_name", "plan_sponsor_name", "issuer_name")):
+        if not any(
+            plan.get(key)
+            for key in ("plan_id", "plan_name", "plan_sponsor_name", "issuer_name")
+        ):
             continue
         plan_info.append(plan)
     return plan_info
@@ -2363,7 +5039,12 @@ def _plan_rows_from_target_metadata(target: CrawlTarget) -> list[dict[str, Any]]
     now = _utc_now()
     for plan in _metadata_plan_info(metadata):
         plan_id = str(plan.get("plan_id") or "").strip()
-        plan_name = plan.get("plan_name") or plan.get("plan_sponsor_name") or plan.get("issuer_name") or target.label
+        plan_name = (
+            plan.get("plan_name")
+            or plan.get("plan_sponsor_name")
+            or plan.get("issuer_name")
+            or target.label
+        )
         market_type = plan.get("plan_market_type")
         row_id = _id(
             "mrfplan",
@@ -2383,8 +5064,10 @@ def _plan_rows_from_target_metadata(target: CrawlTarget) -> list[dict[str, Any]]
             "plan_id_type": plan.get("plan_id_type"),
             "plan_name": plan_name,
             "market_type": market_type,
-            "reporting_entity_name": metadata.get("reporting_entity_name") or source.get("display_name"),
-            "reporting_entity_type": metadata.get("reporting_entity_type") or "third_party_administrator",
+            "reporting_entity_name": metadata.get("reporting_entity_name")
+            or source.get("display_name"),
+            "reporting_entity_type": metadata.get("reporting_entity_type")
+            or "third_party_administrator",
             "metadata_json": {
                 "raw_plan": plan,
                 "resolver": metadata.get("resolver"),
@@ -2427,7 +5110,9 @@ def _parse_meritain_mrf_search_targets(
         if str(params.get("insurerCode") or "").upper() != "MERITAIN_I":
             continue
         group_id = _meritain_group_id_from_healthsparq_url(url)
-        label = _clean_text(candidate.get("label")) or (f"Meritain group {group_id}" if group_id else "Meritain Health")
+        label = _clean_text(candidate.get("label")) or (
+            f"Meritain group {group_id}" if group_id else "Meritain Health"
+        )
         plan_info = _plan_info_from_label(
             f"Meritain group {group_id}" if group_id else label,
             plan_id=group_id,
@@ -2461,8 +5146,14 @@ async def _resolve_meritain_mrf_search(
     session: aiohttp.ClientSession,
 ) -> list[CrawlTarget]:
     resolver_type = str(resolver.get("type") or "meritain_mrf_search")
-    html_text = await _fetch_text(url, max_bytes=int(resolver.get("max_bytes") or 20 * 1024 * 1024), session=session)
-    targets = _parse_meritain_mrf_search_targets(html_text, base_url=url, source=source, resolver_type=resolver_type)
+    html_text = await _fetch_text(
+        url,
+        max_bytes=int(resolver.get("max_bytes") or 20 * 1024 * 1024),
+        session=session,
+    )
+    targets = _parse_meritain_mrf_search_targets(
+        html_text, base_url=url, source=source, resolver_type=resolver_type
+    )
     max_targets = _as_int(resolver.get("max_targets"))
     if max_targets:
         targets = targets[:max_targets]
@@ -2497,7 +5188,9 @@ def _healthcarebluebook_source_format(url: str) -> str | None:
     return None
 
 
-def _healthcarebluebook_grid_items(html_text: str, *, base_url: str) -> list[dict[str, Any]]:
+def _healthcarebluebook_grid_items(
+    html_text: str, *, base_url: str
+) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     pattern = re.compile(
         r"""<div\b[^>]*class=(?P<quote>["'])(?=[^"']*\bgrid-item\b)[^"']*(?P=quote)[^>]*>(?P<content>.*?)</div>""",
@@ -2520,7 +5213,9 @@ def _healthcarebluebook_grid_items(html_text: str, *, base_url: str) -> list[dic
 
 def _healthcarebluebook_relative_file_url(url: str) -> bool:
     parsed = urlsplit(url)
-    return parsed.netloc.lower() == "mrf.healthcarebluebook.com" and bool(re.match(r"^/[^/]+/\d+/?$", parsed.path))
+    return parsed.netloc.lower() == "mrf.healthcarebluebook.com" and bool(
+        re.match(r"^/[^/]+/\d+/?$", parsed.path)
+    )
 
 
 def _healthcarebluebook_nested_target(
@@ -2562,25 +5257,39 @@ async def _resolve_healthcarebluebook_mrf(
     session: aiohttp.ClientSession,
 ) -> list[CrawlTarget]:
     resolver_type = str(resolver.get("type") or "healthcarebluebook_mrf")
-    html_text = await _fetch_text(url, max_bytes=int(resolver.get("max_bytes") or 10 * 1024 * 1024), session=session)
+    html_text = await _fetch_text(
+        url,
+        max_bytes=int(resolver.get("max_bytes") or 10 * 1024 * 1024),
+        session=session,
+    )
     items = _healthcarebluebook_grid_items(html_text, base_url=url)
     targets_by_url: dict[str, CrawlTarget] = {}
+    max_targets = _as_int(resolver.get("max_targets"))
     for index, item in enumerate(items):
+        if max_targets and len(targets_by_url) >= max_targets:
+            break
         link_url = str(item.get("url") or "").strip()
         if not link_url:
             continue
-        label = _clean_text(item.get("label")) or Path(urlsplit(link_url).path).name or "MRF file"
+        label = (
+            _clean_text(item.get("label"))
+            or Path(urlsplit(link_url).path).name
+            or "MRF file"
+        )
         type_text = items[index + 1].get("text") if index + 1 < len(items) else ""
         file_type = _healthcarebluebook_file_type(type_text, label, link_url)
         if not file_type:
             continue
-        if _healthcarebluebook_relative_file_url(link_url) or _looks_direct_mrf_body_url(link_url):
+        if _healthcarebluebook_relative_file_url(
+            link_url
+        ) or _looks_direct_mrf_body_url(link_url):
             plan_info = _plan_info_from_label(label)
             metadata = {
                 "resolver": resolver_type,
                 "target_kind": "file_reference",
                 "target_file_type": file_type,
-                "container_format": _container_format(link_url) or ("zip" if _healthcarebluebook_relative_file_url(link_url) else None),
+                "container_format": _container_format(link_url)
+                or ("zip" if _healthcarebluebook_relative_file_url(link_url) else None),
                 "source_format": _healthcarebluebook_source_format(link_url),
                 "healthcarebluebook_listing_url": url,
                 "healthcarebluebook_file_type": _clean_text(type_text),
@@ -2592,7 +5301,11 @@ async def _resolve_healthcarebluebook_mrf(
                 url=link_url,
                 label=label,
                 resolved_from_url=url,
-                metadata={key: value for key, value in metadata.items() if value not in (None, "", [])},
+                metadata={
+                    key: value
+                    for key, value in metadata.items()
+                    if value not in (None, "", [])
+                },
             )
             continue
         nested_platform = classify_hosting_platform(link_url)
@@ -2600,7 +5313,9 @@ async def _resolve_healthcarebluebook_mrf(
             continue
         nested_source = {**source, "hosting_platform": nested_platform}
         try:
-            nested_targets = await _crawl_targets_for_source(nested_source, link_url, session)
+            nested_targets = await _crawl_targets_for_source(
+                nested_source, link_url, session
+            )
         except Exception:  # pylint: disable=broad-exception-caught
             nested_targets = []
         for nested_target in nested_targets:
@@ -2615,8 +5330,9 @@ async def _resolve_healthcarebluebook_mrf(
             )
             key = _canonical_or_none(annotated.url) or annotated.url
             targets_by_url[key] = annotated
+            if max_targets and len(targets_by_url) >= max_targets:
+                break
     targets = list(targets_by_url.values())
-    max_targets = _as_int(resolver.get("max_targets"))
     if max_targets:
         targets = targets[:max_targets]
     if not targets:
@@ -2631,11 +5347,17 @@ async def _resolve_html_mrf_with_healthcarebluebook(
     session: aiohttp.ClientSession,
 ) -> list[CrawlTarget]:
     resolver_type = str(resolver.get("type") or "html_mrf_with_healthcarebluebook")
-    html_text = await _fetch_text(url, max_bytes=int(resolver.get("max_bytes") or 10 * 1024 * 1024), session=session)
+    html_text = await _fetch_text(
+        url,
+        max_bytes=int(resolver.get("max_bytes") or 10 * 1024 * 1024),
+        session=session,
+    )
     targets_by_url: dict[str, CrawlTarget] = {}
     for target in _parse_html_mrf_links(html_text, base_url=url):
         target_url = str(target["url"])
-        source_format = "csv" if urlsplit(target_url).path.lower().endswith(".csv") else None
+        source_format = (
+            "csv" if urlsplit(target_url).path.lower().endswith(".csv") else None
+        )
         metadata = {
             "resolver": target.get("resolver") or resolver_type,
             "target_kind": target.get("target_kind"),
@@ -2644,6 +5366,7 @@ async def _resolve_html_mrf_with_healthcarebluebook(
             "source_format": source_format,
             "html_attr": target.get("html_attr"),
             "landing_url": url,
+            "plan_info": target.get("plan_info"),
         }
         key = _canonical_or_none(target_url) or target_url
         targets_by_url[key] = CrawlTarget(
@@ -2651,15 +5374,29 @@ async def _resolve_html_mrf_with_healthcarebluebook(
             url=target_url,
             label=str(target.get("label") or source.get("display_name") or ""),
             resolved_from_url=url,
-            metadata={key: value for key, value in metadata.items() if value not in (None, "")},
+            metadata={
+                key: value for key, value in metadata.items() if value not in (None, "")
+            },
         )
     for candidate in _html_link_candidates(html_text, base_url=url):
         link_url = str(candidate.get("url") or "").strip()
         if _domain(link_url) != "mrf.healthcarebluebook.com":
             continue
         nested_source = {**source, "hosting_platform": "healthcarebluebook_mrf"}
-        nested_resolver = _platform_resolver_config("healthcarebluebook_mrf") or {"type": "healthcarebluebook_mrf"}
-        nested_targets = await _resolve_healthcarebluebook_mrf(nested_source, link_url, nested_resolver, session)
+        nested_resolver = _platform_resolver_config("healthcarebluebook_mrf") or {
+            "type": "healthcarebluebook_mrf"
+        }
+        max_targets = _as_int(resolver.get("max_targets"))
+        if max_targets:
+            existing_nested_max = _as_int(nested_resolver.get("max_targets"))
+            nested_resolver["max_targets"] = (
+                min(existing_nested_max, max_targets)
+                if existing_nested_max
+                else max_targets
+            )
+        nested_targets = await _resolve_healthcarebluebook_mrf(
+            nested_source, link_url, nested_resolver, session
+        )
         for nested_target in nested_targets:
             metadata = dict(nested_target.metadata or {})
             metadata.update(
@@ -2688,7 +5425,9 @@ async def _resolve_html_mrf_with_healthcarebluebook(
     return targets
 
 
-def _cigna_lookup_urls_from_html(html_text: str, *, base_url: str, resolver: dict[str, Any]) -> list[str]:
+def _cigna_lookup_urls_from_html(
+    html_text: str, *, base_url: str, resolver: dict[str, Any]
+) -> list[str]:
     urls: list[str] = []
     for candidate in _html_link_candidates(html_text, base_url=base_url):
         attr = str(candidate.get("attr") or "").lower()
@@ -2713,7 +5452,9 @@ def _first_dict_value(item: dict[str, Any], keys: tuple[str, ...]) -> Any:
 
 
 def _cigna_file_url(item: dict[str, Any]) -> str | None:
-    value = _first_dict_value(item, ("url", "download_url", "downloadUrl", "location", "file_url", "fileUrl"))
+    value = _first_dict_value(
+        item, ("url", "download_url", "downloadUrl", "location", "file_url", "fileUrl")
+    )
     return str(value).strip() if value else None
 
 
@@ -2724,7 +5465,9 @@ def _parse_cigna_lookup_targets(
     source: dict[str, Any],
     resolver: dict[str, Any],
 ) -> list[CrawlTarget]:
-    toc_max_bytes = _parse_size_bytes(resolver.get("toc_max_bytes")) or 100 * 1024 * 1024
+    toc_max_bytes = (
+        _parse_size_bytes(resolver.get("toc_max_bytes")) or 100 * 1024 * 1024
+    )
     groups = payload.get("mrfs") if isinstance(payload.get("mrfs"), list) else None
     if groups is None:
         groups = payload.get("mrf") if isinstance(payload.get("mrf"), list) else None
@@ -2734,7 +5477,9 @@ def _parse_cigna_lookup_targets(
     for group in groups:
         if not isinstance(group, dict):
             continue
-        group_files = group.get("files") if isinstance(group.get("files"), list) else None
+        group_files = (
+            group.get("files") if isinstance(group.get("files"), list) else None
+        )
         files = group_files or [group]
         for file_item in files:
             if not isinstance(file_item, dict):
@@ -2748,20 +5493,67 @@ def _parse_cigna_lookup_targets(
                 or _first_dict_value(group, ("file_name", "fileName", "name", "label"))
                 or Path(urlsplit(file_url).path).name
             )
-            if not (_looks_direct_toc_url(file_url) or _mrf_file_type_from_text(file_url, file_name) == "table-of-contents"):
+            if not (
+                _looks_direct_toc_url(file_url)
+                or _mrf_file_type_from_text(file_url, file_name) == "table-of-contents"
+            ):
                 continue
             size_bytes = _parse_size_bytes(
-                _first_dict_value(file_item, ("file_size", "fileSize", "size", "content_length", "contentLength"))
-                or _first_dict_value(group, ("file_size", "fileSize", "size", "content_length", "contentLength"))
+                _first_dict_value(
+                    file_item,
+                    (
+                        "file_size",
+                        "fileSize",
+                        "size",
+                        "content_length",
+                        "contentLength",
+                    ),
+                )
+                or _first_dict_value(
+                    group,
+                    (
+                        "file_size",
+                        "fileSize",
+                        "size",
+                        "content_length",
+                        "contentLength",
+                    ),
+                )
             )
             reporting_entity_name = _first_dict_value(
                 file_item,
-                ("reporting_entity_name", "reportingEntityName", "entity_name", "entityName"),
-            ) or _first_dict_value(group, ("reporting_entity_name", "reportingEntityName", "entity_name", "entityName"))
+                (
+                    "reporting_entity_name",
+                    "reportingEntityName",
+                    "entity_name",
+                    "entityName",
+                ),
+            ) or _first_dict_value(
+                group,
+                (
+                    "reporting_entity_name",
+                    "reportingEntityName",
+                    "entity_name",
+                    "entityName",
+                ),
+            )
             reporting_entity_type = _first_dict_value(
                 file_item,
-                ("reporting_entity_type", "reportingEntityType", "entity_type", "entityType"),
-            ) or _first_dict_value(group, ("reporting_entity_type", "reportingEntityType", "entity_type", "entityType"))
+                (
+                    "reporting_entity_type",
+                    "reportingEntityType",
+                    "entity_type",
+                    "entityType",
+                ),
+            ) or _first_dict_value(
+                group,
+                (
+                    "reporting_entity_type",
+                    "reportingEntityType",
+                    "entity_type",
+                    "entityType",
+                ),
+            )
             metadata = {
                 "resolver": "cigna_static_mrf_lookup",
                 "target_kind": "toc_json",
@@ -2772,11 +5564,17 @@ def _parse_cigna_lookup_targets(
                 "blob_size": size_bytes,
                 "reporting_entity_name": reporting_entity_name,
                 "reporting_entity_type": reporting_entity_type,
-                "last_updated_on": _first_dict_value(file_item, ("last_updated_on", "lastUpdatedOn"))
+                "last_updated_on": _first_dict_value(
+                    file_item, ("last_updated_on", "lastUpdatedOn")
+                )
                 or _first_dict_value(group, ("last_updated_on", "lastUpdatedOn")),
-                "reporting_month": _first_dict_value(file_item, ("reporting_month", "reportingMonth"))
+                "reporting_month": _first_dict_value(
+                    file_item, ("reporting_month", "reportingMonth")
+                )
                 or _first_dict_value(group, ("reporting_month", "reportingMonth")),
-                "product_type": _first_dict_value(file_item, ("product_type", "productType"))
+                "product_type": _first_dict_value(
+                    file_item, ("product_type", "productType")
+                )
                 or _first_dict_value(group, ("product_type", "productType")),
             }
             key = _canonical_or_none(file_url) or file_url
@@ -2785,7 +5583,11 @@ def _parse_cigna_lookup_targets(
                 url=file_url,
                 label=file_name or str(source.get("display_name") or "Cigna MRF index"),
                 resolved_from_url=lookup_url,
-                metadata={key: value for key, value in metadata.items() if value not in (None, "")},
+                metadata={
+                    key: value
+                    for key, value in metadata.items()
+                    if value not in (None, "")
+                },
             )
     return list(targets_by_url.values())
 
@@ -2799,14 +5601,19 @@ def _parse_bcbs_asomrf_filelist_targets(
 ) -> list[CrawlTarget]:
     if not isinstance(payload, list):
         raise ValueError("expected BCBS ASO filelist JSON array")
-    toc_max_bytes = _parse_size_bytes(resolver.get("toc_max_bytes")) or 100 * 1024 * 1024
+    toc_max_bytes = (
+        _parse_size_bytes(resolver.get("toc_max_bytes")) or 100 * 1024 * 1024
+    )
     targets_by_url: dict[str, CrawlTarget] = {}
     for item in payload:
         if not isinstance(item, dict):
             continue
         file_url = str(item.get("url") or "").strip()
         file_name = _clean_text(item.get("name")) or Path(urlsplit(file_url).path).name
-        if not file_url or _mrf_file_type_from_text(file_url, file_name) != "table-of-contents":
+        if (
+            not file_url
+            or _mrf_file_type_from_text(file_url, file_name) != "table-of-contents"
+        ):
             continue
         metadata = {
             "resolver": "bcbs_asomrf_filelist",
@@ -2825,13 +5632,19 @@ def _parse_bcbs_asomrf_filelist_targets(
             url=file_url,
             label=file_name or str(source.get("display_name") or "BCBS ASO MRF index"),
             resolved_from_url=filelist_url,
-            metadata={key: value for key, value in metadata.items() if value not in (None, "")},
+            metadata={
+                key: value for key, value in metadata.items() if value not in (None, "")
+            },
         )
     targets = list(targets_by_url.values())
-    return _limit_crawl_targets_round_robin(targets, "state", _as_int(resolver.get("max_targets")))
+    return _limit_crawl_targets_round_robin(
+        targets, "state", _as_int(resolver.get("max_targets"))
+    )
 
 
-def _limit_crawl_targets_round_robin(targets: list[CrawlTarget], metadata_key: str, limit: int | None) -> list[CrawlTarget]:
+def _limit_crawl_targets_round_robin(
+    targets: list[CrawlTarget], metadata_key: str, limit: int | None
+) -> list[CrawlTarget]:
     if not limit or limit <= 0 or len(targets) <= limit:
         return targets
     buckets: dict[str, list[CrawlTarget]] = {}
@@ -2856,7 +5669,11 @@ def _bcbs_asomrf_filelist_urls_from_html(html_text: str, *, base_url: str) -> li
         path = urlsplit(url).path.lower()
         if path.endswith("/content/dam/bcbs/mrf/si-filelist.json") and url not in urls:
             urls.append(url)
-    for match in re.finditer(r"""(?P<quote>["'])(?P<path>/content/dam/bcbs/mrf/si-filelist\.json)(?P=quote)""", html_text or "", flags=re.I):
+    for match in re.finditer(
+        r"""(?P<quote>["'])(?P<path>/content/dam/bcbs/mrf/si-filelist\.json)(?P=quote)""",
+        html_text or "",
+        flags=re.I,
+    ):
         url = urljoin(base_url, html.unescape(match.group("path")))
         if url not in urls:
             urls.append(url)
@@ -2869,14 +5686,26 @@ async def _resolve_bcbs_asomrf_filelist(
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
 ) -> list[CrawlTarget]:
-    html_text = await _fetch_text(url, max_bytes=int(resolver.get("max_bytes") or 5 * 1024 * 1024), session=session)
+    html_text = await _fetch_text(
+        url,
+        max_bytes=int(resolver.get("max_bytes") or 5 * 1024 * 1024),
+        session=session,
+    )
     filelist_urls = _bcbs_asomrf_filelist_urls_from_html(html_text, base_url=url)
     if not filelist_urls:
         raise ValueError(f"no BCBS ASO filelist URL found in {url}")
     targets: list[CrawlTarget] = []
     for filelist_url in filelist_urls:
-        payload = await _fetch_json_value(filelist_url, max_bytes=int(resolver.get("filelist_max_bytes") or 20 * 1024 * 1024), session=session)
-        targets.extend(_parse_bcbs_asomrf_filelist_targets(payload, filelist_url=filelist_url, source=source, resolver=resolver))
+        payload = await _fetch_json_value(
+            filelist_url,
+            max_bytes=int(resolver.get("filelist_max_bytes") or 20 * 1024 * 1024),
+            session=session,
+        )
+        targets.extend(
+            _parse_bcbs_asomrf_filelist_targets(
+                payload, filelist_url=filelist_url, source=source, resolver=resolver
+            )
+        )
     if not targets:
         raise ValueError(f"no BCBS ASO index URLs found from {url}")
     return targets
@@ -2899,7 +5728,11 @@ def _bcbsma_monthly_toc_targets(
     base_url = str(resolver.get("base_url") or url or "").strip()
     if not base_url:
         raise ValueError("BCBSMA resolver requires base_url or source URL")
-    suffixes = [str(item).strip() for item in (resolver.get("toc_suffixes") or ()) if str(item).strip()]
+    suffixes = [
+        str(item).strip()
+        for item in (resolver.get("toc_suffixes") or ())
+        if str(item).strip()
+    ]
     if not suffixes:
         raise ValueError("BCBSMA resolver requires toc_suffixes")
     month_offsets = resolver.get("month_offsets")
@@ -2934,10 +5767,274 @@ def _bcbsma_monthly_toc_targets(
                         "target_file_type": "table-of-contents",
                         "month_start": month_start,
                         "file_name": file_name,
-                        "issuer_slug": suffix.removeprefix("-01_").removesuffix("_index.json"),
+                        "issuer_slug": suffix.removeprefix("-01_").removesuffix(
+                            "_index.json"
+                        ),
                     },
                 )
             )
+    return targets
+
+
+def _monthly_toc_targets(
+    source: dict[str, Any],
+    url: str,
+    resolver: dict[str, Any],
+    *,
+    now: dt.datetime | None = None,
+) -> list[CrawlTarget]:
+    base_url = str(resolver.get("base_url") or url or "").strip()
+    if not base_url:
+        raise ValueError("monthly TOC resolver requires base_url or source URL")
+    templates = [
+        str(item).strip()
+        for item in (resolver.get("file_templates") or ())
+        if str(item).strip()
+    ]
+    if not templates:
+        raise ValueError("monthly TOC resolver requires file_templates")
+    month_offsets = resolver.get("month_offsets")
+    if not isinstance(month_offsets, list) or not month_offsets:
+        month_offsets = [0]
+    target_max_bytes = _parse_size_bytes(resolver.get("toc_max_bytes"))
+    current = now or _utc_now()
+    targets: list[CrawlTarget] = []
+    seen: set[str] = set()
+    for raw_offset in month_offsets:
+        offset = _as_int(raw_offset)
+        if offset is None:
+            continue
+        month_date = _add_months(current, offset)
+        values = {
+            "year": month_date.strftime("%Y"),
+            "month": month_date.strftime("%m"),
+            "month_start": month_date.strftime("%Y-%m-01"),
+            "month_prefix": month_date.strftime("%Y-%m"),
+            "yyyymm": month_date.strftime("%Y%m"),
+        }
+        for template in templates:
+            file_path = template.format(**values)
+            file_name = Path(urlsplit(file_path).path).name or file_path
+            target_url = (
+                file_path
+                if file_path.startswith(("http://", "https://"))
+                else urljoin(base_url.rstrip("/") + "/", file_path.lstrip("/"))
+            )
+            key = _canonical_or_none(target_url) or target_url
+            if key in seen:
+                continue
+            seen.add(key)
+            targets.append(
+                CrawlTarget(
+                    source=source,
+                    url=target_url,
+                    label=file_name,
+                    resolved_from_url=url,
+                    metadata={
+                        "resolver": str(resolver.get("type") or "monthly_toc"),
+                        "target_kind": "toc_json",
+                        "target_file_type": "table-of-contents",
+                        "month_start": values["month_start"],
+                        "file_name": file_name,
+                        "target_max_bytes": target_max_bytes,
+                    },
+                )
+            )
+    return targets
+
+
+def _azure_mrf_listing_targets_from_xml(
+    source: dict[str, Any],
+    xml_text: str,
+    *,
+    listing_url: str,
+    resolver: dict[str, Any],
+) -> list[CrawlTarget]:
+    root = ElementTree.fromstring((xml_text or "").lstrip("\ufeff"))
+    container_url = _clean_text(root.attrib.get("ContainerName"))
+    target_max_bytes = _parse_size_bytes(resolver.get("toc_max_bytes"))
+    resolver_type = str(resolver.get("type") or "azure_mrf_listing")
+    targets: list[CrawlTarget] = []
+    seen: set[str] = set()
+    for blob in root.findall(".//Blob"):
+        name = _clean_text(blob.findtext("Name"))
+        file_url = _clean_text(blob.findtext("Url"))
+        if not file_url and container_url and name:
+            file_url = urljoin(container_url.rstrip("/") + "/", name.lstrip("/"))
+        label = Path(urlsplit(file_url).path).name or name
+        target_kind: str | None = None
+        target_file_type: str | None = None
+        if _looks_html_mrf_toc_url(file_url, label):
+            target_kind = "toc_json"
+            target_file_type = "table-of-contents"
+        elif _looks_html_mrf_body_reference(file_url, label):
+            target_kind = "file_reference"
+            target_file_type = _mrf_file_type_from_text(file_url, label)
+        if not file_url or not target_kind or not target_file_type:
+            continue
+        key = _canonical_or_none(file_url) or file_url
+        if key in seen:
+            continue
+        seen.add(key)
+        targets.append(
+            CrawlTarget(
+                source=source,
+                url=file_url,
+                label=label,
+                resolved_from_url=listing_url,
+                metadata={
+                    "resolver": resolver_type,
+                    "target_kind": target_kind,
+                    "target_file_type": target_file_type,
+                    "container_format": _container_format(file_url),
+                    "blob_name": name,
+                    "content_length": blob.findtext("Properties/Content-Length"),
+                    "content_type": blob.findtext("Properties/Content-Type"),
+                    "etag": blob.findtext("Properties/Etag"),
+                    "last_modified": blob.findtext("Properties/Last-Modified"),
+                    "target_max_bytes": (
+                        target_max_bytes if target_kind == "toc_json" else None
+                    ),
+                },
+            )
+        )
+    return targets
+
+
+async def _resolve_azure_mrf_listing(
+    source: dict[str, Any],
+    url: str,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    listing_urls = [
+        str(item).strip()
+        for item in (resolver.get("listing_urls") or [url])
+        if str(item).strip()
+    ]
+    targets: list[CrawlTarget] = []
+    for listing_url in listing_urls:
+        xml_text = await _fetch_text(
+            listing_url,
+            max_bytes=int(resolver.get("max_bytes") or 10 * 1024 * 1024),
+            session=session,
+        )
+        targets.extend(
+            _azure_mrf_listing_targets_from_xml(
+                source, xml_text, listing_url=listing_url, resolver=resolver
+            )
+        )
+    targets = _dedupe_crawl_targets_by_url(targets)
+    max_targets = _as_int(resolver.get("max_targets"))
+    if max_targets and max_targets > 0:
+        targets = targets[:max_targets]
+    if not targets:
+        raise ValueError(f"no Azure MRF listing targets found for {url}")
+    return targets
+
+
+def _xml_child_text(element: ElementTree.Element, child_name: str) -> str:
+    for child in list(element):
+        if child.tag.rsplit("}", 1)[-1] == child_name:
+            return _clean_text(child.text)
+    return ""
+
+
+def _s3_xml_listing_targets_from_xml(
+    source: dict[str, Any],
+    xml_text: str,
+    *,
+    listing_url: str,
+    resolver: dict[str, Any],
+) -> list[CrawlTarget]:
+    root = ElementTree.fromstring((xml_text or "").lstrip("\ufeff"))
+    resolver_type = str(resolver.get("type") or "s3_xml_listing")
+    public_base_url = str(resolver.get("public_base_url") or listing_url).rstrip("/")
+    include_prefixes = tuple(
+        str(item).strip()
+        for item in (resolver.get("include_prefixes") or ())
+        if str(item).strip()
+    )
+    exclude_prefixes = tuple(
+        str(item).strip()
+        for item in (resolver.get("exclude_prefixes") or ())
+        if str(item).strip()
+    )
+    targets: list[CrawlTarget] = []
+    seen: set[str] = set()
+    for item in root.iter():
+        if item.tag.rsplit("}", 1)[-1] != "Contents":
+            continue
+        object_key = _xml_child_text(item, "Key")
+        if not object_key or object_key.endswith("/"):
+            continue
+        if include_prefixes and not object_key.startswith(include_prefixes):
+            continue
+        if exclude_prefixes and object_key.startswith(exclude_prefixes):
+            continue
+        file_url = f"{public_base_url}/{quote(object_key, safe='/')}"
+        label = Path(object_key).name
+        file_type = _mrf_file_type_from_text(file_url, label)
+        if not file_type:
+            continue
+        key = _canonical_or_none(file_url) or file_url
+        if key in seen:
+            continue
+        seen.add(key)
+        targets.append(
+            CrawlTarget(
+                source=source,
+                url=file_url,
+                label=_mrf_file_plan_label(label) or label,
+                resolved_from_url=listing_url,
+                metadata={
+                    "resolver": resolver_type,
+                    "target_kind": "file_reference",
+                    "target_file_type": file_type,
+                    "container_format": _container_format(file_url),
+                    "object_key": object_key,
+                    "content_length": _xml_child_text(item, "Size"),
+                    "etag": _xml_child_text(item, "ETag").strip('"'),
+                    "last_modified": _xml_child_text(item, "LastModified"),
+                },
+            )
+        )
+    return targets
+
+
+async def _resolve_s3_xml_listing(
+    source: dict[str, Any],
+    url: str,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    listing_urls = [
+        str(item).strip()
+        for item in (resolver.get("listing_urls") or [url])
+        if str(item).strip()
+    ]
+    targets: list[CrawlTarget] = []
+    for listing_url in listing_urls:
+        xml_text = await _fetch_text(
+            listing_url,
+            max_bytes=int(resolver.get("max_bytes") or 50 * 1024 * 1024),
+            session=session,
+        )
+        targets.extend(
+            _s3_xml_listing_targets_from_xml(
+                source, xml_text, listing_url=listing_url, resolver=resolver
+            )
+        )
+    targets = _dedupe_crawl_targets_by_url(targets)
+    targets.sort(
+        key=lambda target: str((target.metadata or {}).get("last_modified") or ""),
+        reverse=True,
+    )
+    max_targets = _as_int(resolver.get("max_targets"))
+    if max_targets and max_targets > 0:
+        targets = targets[:max_targets]
+    if not targets:
+        raise ValueError(f"no S3 XML MRF listing targets found for {url}")
     return targets
 
 
@@ -2947,15 +6044,27 @@ async def _resolve_cigna_static_mrf_lookup(
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
 ) -> list[CrawlTarget]:
-    html_text = await _fetch_text(url, max_bytes=int(resolver.get("max_bytes") or 5 * 1024 * 1024), session=session)
-    lookup_urls = _cigna_lookup_urls_from_html(html_text, base_url=url, resolver=resolver)
+    html_text = await _fetch_text(
+        url,
+        max_bytes=int(resolver.get("max_bytes") or 5 * 1024 * 1024),
+        session=session,
+    )
+    lookup_urls = _cigna_lookup_urls_from_html(
+        html_text, base_url=url, resolver=resolver
+    )
     if not lookup_urls:
         raise ValueError(f"no Cigna MRF lookup URLs found in {url}")
     lookup_max_bytes = int(resolver.get("lookup_max_bytes") or 2 * 1024 * 1024)
     targets: list[CrawlTarget] = []
     for lookup_url in lookup_urls:
-        payload = await _fetch_json(lookup_url, max_bytes=lookup_max_bytes, session=session)
-        targets.extend(_parse_cigna_lookup_targets(payload, lookup_url=lookup_url, source=source, resolver=resolver))
+        payload = await _fetch_json(
+            lookup_url, max_bytes=lookup_max_bytes, session=session
+        )
+        targets.extend(
+            _parse_cigna_lookup_targets(
+                payload, lookup_url=lookup_url, source=source, resolver=resolver
+            )
+        )
     if not targets:
         raise ValueError(f"no Cigna MRF index URLs found from {url}")
     return targets
@@ -2969,15 +6078,35 @@ def _healthsparq_public_params(url: str) -> dict[str, str]:
     match = re.search(r"^/?(?:one|public)/(?P<params>[^/?#]+)(?P<tail>.*)$", fragment)
     if match:
         route_params = match.group("params").split("/", 1)[0]
-        params.update({key: value for key, value in parse_qsl(route_params, keep_blank_values=False) if key and value})
+        params.update(
+            {
+                key: value
+                for key, value in parse_qsl(route_params, keep_blank_values=False)
+                if key and value
+            }
+        )
         tail = match.group("tail") or ""
         if "?" in tail:
             query_text = tail.split("?", 1)[1]
-            params.update({key: value for key, value in parse_qsl(query_text, keep_blank_values=False) if key and value})
+            params.update(
+                {
+                    key: value
+                    for key, value in parse_qsl(query_text, keep_blank_values=False)
+                    if key and value
+                }
+            )
     if not params:
-        params.update({key: value for key, value in parse_qsl(parsed.query, keep_blank_values=False) if key and value})
+        params.update(
+            {
+                key: value
+                for key, value in parse_qsl(parsed.query, keep_blank_values=False)
+                if key and value
+            }
+        )
     if "insurerCode" not in params or "brandCode" not in params:
-        raise ValueError("HealthSparq public URL must include insurerCode and brandCode")
+        raise ValueError(
+            "HealthSparq public URL must include insurerCode and brandCode"
+        )
     return params
 
 
@@ -2988,17 +6117,29 @@ def _url_origin(url: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
-def _healthsparq_service_url(source_url: str, resolver: dict[str, Any], path_key: str) -> str:
-    service_path = str(resolver.get("public_service_path") or "/healthsparq/public/service").strip()
+def _healthsparq_service_url(
+    source_url: str, resolver: dict[str, Any], path_key: str
+) -> str:
+    service_path = str(
+        resolver.get("public_service_path") or "/healthsparq/public/service"
+    ).strip()
     path = str(resolver.get(path_key) or "").strip()
     if not path:
         raise ValueError(f"HealthSparq resolver missing {path_key}")
-    return urljoin(_url_origin(source_url) + "/", f"{service_path.strip('/')}/{path.lstrip('/')}")
+    return urljoin(
+        _url_origin(source_url) + "/", f"{service_path.strip('/')}/{path.lstrip('/')}"
+    )
 
 
-def _healthsparq_tenant(params: dict[str, str], resolver: dict[str, Any] | None = None) -> str:
+def _healthsparq_tenant(
+    params: dict[str, str], resolver: dict[str, Any] | None = None
+) -> str:
     resolver = resolver or {}
-    overrides = resolver.get("tenant_overrides") if isinstance(resolver.get("tenant_overrides"), dict) else {}
+    overrides = (
+        resolver.get("tenant_overrides")
+        if isinstance(resolver.get("tenant_overrides"), dict)
+        else {}
+    )
     insurer_code = str(params.get("insurerCode") or "").strip()
     for key in (insurer_code, insurer_code.upper(), insurer_code.lower()):
         override = str(overrides.get(key) or "").strip()
@@ -3009,8 +6150,10 @@ def _healthsparq_tenant(params: dict[str, str], resolver: dict[str, Any] | None 
     return re.sub(r"[^a-z0-9]+", "-", tenant).strip("-")
 
 
-def _healthsparq_direct_metadata_url(resolver: dict[str, Any], params: dict[str, str]) -> str | None:
-    if any(params.get(key) for key in ("reportingEntityType", "searchTerm")):
+def _healthsparq_direct_metadata_url(
+    resolver: dict[str, Any], params: dict[str, str]
+) -> str | None:
+    if params.get("reportingEntityType"):
         return None
     template = str(resolver.get("metadata_url_template") or "").strip()
     if not template:
@@ -3018,10 +6161,17 @@ def _healthsparq_direct_metadata_url(resolver: dict[str, Any], params: dict[str,
     tenant = _healthsparq_tenant(params, resolver)
     if not tenant:
         return None
-    return template.format(tenant=tenant, insurerCode=params["insurerCode"], brandCode=params["brandCode"])
+    return template.format(
+        tenant=tenant, insurerCode=params["insurerCode"], brandCode=params["brandCode"]
+    )
 
 
-def _healthsparq_target(source: dict[str, Any], metadata_url: str, resolved_from_url: str, params: dict[str, str]) -> CrawlTarget:
+def _healthsparq_target(
+    source: dict[str, Any],
+    metadata_url: str,
+    resolved_from_url: str,
+    params: dict[str, str],
+) -> CrawlTarget:
     return CrawlTarget(
         source=source,
         url=metadata_url,
@@ -3029,6 +6179,8 @@ def _healthsparq_target(source: dict[str, Any], metadata_url: str, resolved_from
         resolved_from_url=resolved_from_url,
         metadata={
             "resolver": "healthsparq_public_mrf",
+            "target_kind": "toc_json",
+            "target_file_type": "table-of-contents",
             "insurer_code": params["insurerCode"],
             "brand_code": params["brandCode"],
             "reporting_entity_type": params.get("reportingEntityType"),
@@ -3050,12 +6202,24 @@ async def _resolve_healthsparq_public_mrf(
         return [_healthsparq_target(source, metadata_url, url, params)]
     login_url = _healthsparq_service_url(url, resolver, "login_path")
     login_query = {"_": str(int(_utc_now().timestamp() * 1000)), **params}
-    await _fetch_json(f"{login_url}?{urlencode(login_query)}", max_bytes=int(resolver.get("max_bytes") or 50 * 1024 * 1024), session=session)
+    await _fetch_json(
+        f"{login_url}?{urlencode(login_query)}",
+        max_bytes=int(resolver.get("max_bytes") or 50 * 1024 * 1024),
+        session=session,
+    )
     mrf_all_url = _healthsparq_service_url(url, resolver, "mrf_all_path")
     payload = {
         key: value
         for key, value in params.items()
-        if key in {"brandCode", "insurerCode", "reportingEntityType", "searchTerm", "productCode"} and value
+        if key
+        in {
+            "brandCode",
+            "insurerCode",
+            "reportingEntityType",
+            "searchTerm",
+            "productCode",
+        }
+        and value
     }
     payload = await _post_json(
         mrf_all_url,
@@ -3069,11 +6233,151 @@ async def _resolve_healthsparq_public_mrf(
     return [_healthsparq_target(source, metadata_url, mrf_all_url, params)]
 
 
+async def _fetch_json_with_headers(
+    url: str,
+    *,
+    headers: dict[str, str],
+    max_bytes: int,
+    session: aiohttp.ClientSession,
+) -> dict[str, Any]:
+    await _assert_fetch_url_allowed(url)
+    async with session.get(url, headers=headers, allow_redirects=True) as resp:
+        await _assert_fetch_url_allowed(str(resp.url))
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in resp.content.iter_chunked(64 * 1024):
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(f"response exceeds {max_bytes} byte discovery limit")
+            chunks.append(chunk)
+        payload = json.loads(
+            _decode_response_body(b"".join(chunks), charset=resp.charset or "utf-8")
+        )
+    if not isinstance(payload, dict):
+        raise ValueError("expected JSON object")
+    return payload
+
+
+def _providence_toc_targets_from_payload(
+    source: dict[str, Any],
+    payload: dict[str, Any],
+    *,
+    api_url: str,
+    resolver_type: str,
+) -> list[CrawlTarget]:
+    targets: list[CrawlTarget] = []
+    for group in payload.get("groups") or []:
+        if not isinstance(group, dict):
+            continue
+        group_id = _clean_text(group.get("group-id"))
+        group_name = _clean_text(group.get("group-name"))
+        for item in group.get("tocs") or []:
+            if not isinstance(item, dict):
+                continue
+            toc_url = _clean_text(item.get("TOC_URL"))
+            if not _looks_html_mrf_toc_url(toc_url, Path(urlsplit(toc_url).path).name):
+                continue
+            metadata = {
+                "resolver": resolver_type,
+                "target_kind": "toc_json",
+                "target_file_type": "table-of-contents",
+                "group_id": group_id,
+                "group_name": group_name,
+                "providence_api_url": api_url,
+                "plan_info": [
+                    {
+                        "plan_id": group_id or None,
+                        "plan_id_type": "providence_group_id" if group_id else None,
+                        "plan_market_type": "group",
+                        "plan_name": group_name or None,
+                    }
+                ],
+            }
+            targets.append(
+                CrawlTarget(
+                    source=source,
+                    url=toc_url,
+                    label=Path(urlsplit(toc_url).path).name or group_name,
+                    resolved_from_url=api_url,
+                    metadata={
+                        key: value
+                        for key, value in metadata.items()
+                        if value not in (None, "", [])
+                    },
+                )
+            )
+    return targets
+
+
+async def _resolve_providence_mrf_api(
+    source: dict[str, Any],
+    url: str,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    resolver_type = str(resolver.get("type") or "providence_mrf_api")
+    config_url = urljoin(url, str(resolver.get("config_path") or "/config.json"))
+    config = await _fetch_json(
+        config_url,
+        max_bytes=int(resolver.get("config_max_bytes") or 1024 * 1024),
+        session=session,
+    )
+    api_endpoint = str(config.get("API_ENDPOINT") or "").strip()
+    api_key = str(config.get("X_API_KEY") or "").strip()
+    if not api_endpoint or not api_key:
+        raise ValueError("Providence MRF config did not include API endpoint/key")
+    max_bytes = int(resolver.get("max_bytes") or 10 * 1024 * 1024)
+    headers = {"X-API-Key": api_key}
+    group_queries = [
+        str(item).strip()
+        for item in (resolver.get("group_queries") or ["Individual and Family Plans"])
+        if str(item).strip()
+    ]
+    groups_by_id: dict[str, dict[str, Any]] = {}
+    for query in group_queries:
+        group_url = urljoin(api_endpoint.rstrip("/") + "/", "group/")
+        group_url = f"{group_url}?{urlencode({'groupname': query})}"
+        group_payload = await _fetch_json_with_headers(
+            group_url, headers=headers, max_bytes=max_bytes, session=session
+        )
+        for group in group_payload.get("groups") or []:
+            if not isinstance(group, dict):
+                continue
+            group_id = _clean_text(group.get("group-id"))
+            if group_id:
+                groups_by_id.setdefault(group_id, group)
+    max_groups = _as_int(resolver.get("max_groups")) or 25
+    targets: list[CrawlTarget] = []
+    for group_id in list(groups_by_id)[:max_groups]:
+        toc_url = urljoin(api_endpoint.rstrip("/") + "/", "toc/")
+        toc_url = f"{toc_url}?{urlencode({'groupid': group_id})}"
+        toc_payload = await _fetch_json_with_headers(
+            toc_url, headers=headers, max_bytes=max_bytes, session=session
+        )
+        targets.extend(
+            _providence_toc_targets_from_payload(
+                source,
+                toc_payload,
+                api_url=toc_url,
+                resolver_type=resolver_type,
+            )
+        )
+    targets = _dedupe_crawl_targets_by_url(targets)
+    max_targets = _as_int(resolver.get("max_targets"))
+    if max_targets and max_targets > 0:
+        targets = targets[:max_targets]
+    if not targets:
+        raise ValueError(f"no Providence MRF API targets found for {url}")
+    return targets
+
+
 def _looks_direct_toc_url(url: str | None) -> bool:
     parsed = urlsplit(str(url or ""))
     host = parsed.netloc.lower()
     path = parsed.path.lower()
     query = parsed.query.lower()
+    if host == "d3oz7y1cwsecds.cloudfront.net" and path == "/member-prod/bcbsal":
+        return True
     if path.endswith((".json", ".json.gz")):
         return True
     if "sapphiremrfhub.com" in host and "/tocs/" in path:
@@ -3083,15 +6387,39 @@ def _looks_direct_toc_url(url: str | None) -> bool:
     if "/toc-json" in path:
         return True
     file_name = Path(path).name.replace("_", "-")
-    return "." not in file_name and file_name.endswith(("-index", "-toc")) and "/mrf/" in path
+    return (
+        "." not in file_name
+        and file_name.endswith(("-index", "-toc"))
+        and "/mrf/" in path
+    )
 
 
-async def _crawl_targets_for_source(source: dict[str, Any], url: str, session: aiohttp.ClientSession) -> list[CrawlTarget]:
+async def _crawl_targets_for_source(
+    source: dict[str, Any],
+    url: str,
+    session: aiohttp.ClientSession,
+    *,
+    target_limit: int | None = None,
+) -> list[CrawlTarget]:
     platform = source.get("hosting_platform") or classify_hosting_platform(url)
     resolver = _platform_resolver_config(str(platform) if platform else None)
+    if resolver and target_limit and target_limit > 0:
+        resolver = dict(resolver)
+        existing_max_targets = _as_int(resolver.get("max_targets"))
+        resolver["max_targets"] = (
+            min(existing_max_targets, target_limit)
+            if existing_max_targets
+            else target_limit
+        )
     resolver_type = str(resolver.get("type") or "").strip()
     if resolver_type == "bcbsma_monthly_tocs":
         return _bcbsma_monthly_toc_targets(source, url, resolver)
+    if resolver_type == "monthly_toc_templates":
+        return _monthly_toc_targets(source, url, resolver)
+    if resolver_type == "azure_mrf_listing":
+        return await _resolve_azure_mrf_listing(source, url, resolver, session)
+    if resolver_type == "s3_xml_listing":
+        return await _resolve_s3_xml_listing(source, url, resolver, session)
     if resolver_type == "cigna_static_mrf_lookup":
         return await _resolve_cigna_static_mrf_lookup(source, url, resolver, session)
     if resolver_type == "bcbs_asomrf_filelist":
@@ -3101,11 +6429,41 @@ async def _crawl_targets_for_source(source: dict[str, Any], url: str, session: a
     if resolver_type == "healthcarebluebook_mrf":
         return await _resolve_healthcarebluebook_mrf(source, url, resolver, session)
     if resolver_type == "html_mrf_with_healthcarebluebook":
-        return await _resolve_html_mrf_with_healthcarebluebook(source, url, resolver, session)
+        return await _resolve_html_mrf_with_healthcarebluebook(
+            source, url, resolver, session
+        )
+    if resolver_type == "healthgram_network_index":
+        return await _resolve_healthgram_network_index(source, url, resolver, session)
+    if resolver_type == "anthem_s3_mrf":
+        return await _resolve_anthem_s3_mrf(source, url, resolver, session)
+    if resolver_type == "hcsc_asomrf_landing":
+        return await _resolve_hcsc_asomrf_landing(source, url, resolver, session)
+    if resolver_type == "point32_azure_mrf_directory":
+        return await _resolve_point32_azure_mrf_directory(
+            source, url, resolver, session
+        )
+    if resolver_type == "html_delegated_mrf_links":
+        return await _resolve_html_delegated_mrf_links(source, url, resolver, session)
+    if resolver_type == "html_mrf_links":
+        return await _resolve_html_mrf_links(source, url, resolver, session)
+    if resolver_type == "json_mrf_directory_links":
+        return await _resolve_json_mrf_directory_links(source, url, resolver, session)
+    if resolver_type == "payercompass_mrf":
+        return await _resolve_payercompass_mrf(source, url, resolver, session)
+    if resolver_type == "webtpa_mrf_api":
+        return await _resolve_webtpa_mrf_api(source, url, resolver, session)
+    if resolver_type == "cmstic_file_info":
+        return await _resolve_cmstic_file_info(source, url, resolver, session)
+    if resolver_type == "github_repo_mrf_tree":
+        return await _resolve_github_repo_mrf(source, url, resolver, session)
     if resolver_type == "auxiant_wordpress_directory":
-        return await _resolve_auxiant_wordpress_directory(source, url, resolver, session)
+        return await _resolve_auxiant_wordpress_directory(
+            source, url, resolver, session
+        )
     if resolver_type == "healthsparq_public_mrf":
         return await _resolve_healthsparq_public_mrf(source, url, resolver, session)
+    if resolver_type == "providence_mrf_api":
+        return await _resolve_providence_mrf_api(source, url, resolver, session)
     if resolver_type == "mymedicalshopper_talon_mrf":
         return await _resolve_mymedicalshopper_talon_mrf(source, url, resolver, session)
     if resolver_type == "asr_health_benefits_mrf":
@@ -3113,7 +6471,11 @@ async def _crawl_targets_for_source(source: dict[str, Any], url: str, session: a
     if resolver_type == "highmark_hmhs_script":
         script_path = str(resolver.get("script_path") or "/js/script.js")
         script_url = urljoin(url, script_path)
-        script_text = await _fetch_text(script_url, max_bytes=int(resolver.get("max_bytes") or 1024 * 1024), session=session)
+        script_text = await _fetch_text(
+            script_url,
+            max_bytes=int(resolver.get("max_bytes") or 1024 * 1024),
+            session=session,
+        )
         targets = _parse_highmark_hmhs_script(script_text, base_url=url)
         if not targets:
             raise ValueError(f"no Highmark HMHS index links found in {script_url}")
@@ -3134,18 +6496,28 @@ async def _crawl_targets_for_source(source: dict[str, Any], url: str, session: a
         ]
     if resolver_type == "uhc_blob_listing":
         host = _domain(url) or ""
-        configured_paths = resolver.get("optum_path_templates") if "optum.com" in host else resolver.get("path_templates")
+        configured_paths = (
+            resolver.get("optum_path_templates")
+            if "optum.com" in host
+            else resolver.get("path_templates")
+        )
         paths = [str(item) for item in (configured_paths or ()) if str(item).strip()]
         targets: list[CrawlTarget] = []
         for path in paths:
             listing_url = urljoin(url, path)
-            listing = await _fetch_json(listing_url, max_bytes=int(resolver.get("max_bytes") or 64 * 1024 * 1024), session=session)
+            listing = await _fetch_json(
+                listing_url,
+                max_bytes=int(resolver.get("max_bytes") or 64 * 1024 * 1024),
+                session=session,
+            )
             for target in _parse_uhc_blob_listing(listing):
                 targets.append(
                     CrawlTarget(
                         source=source,
                         url=str(target["url"]),
-                        label=str(target.get("label") or source.get("display_name") or ""),
+                        label=str(
+                            target.get("label") or source.get("display_name") or ""
+                        ),
                         resolved_from_url=listing_url,
                         metadata={
                             "resolver": resolver_type,
@@ -3158,7 +6530,11 @@ async def _crawl_targets_for_source(source: dict[str, Any], url: str, session: a
             raise ValueError(f"no UHC blob index links found for {url}")
         return targets
     if resolver_type == "sapphire_html_tocs":
-        html_text = await _fetch_text(url, max_bytes=int(resolver.get("max_bytes") or 5 * 1024 * 1024), session=session)
+        html_text = await _fetch_text(
+            url,
+            max_bytes=int(resolver.get("max_bytes") or 5 * 1024 * 1024),
+            session=session,
+        )
         targets = _parse_sapphire_toc_links(html_text, base_url=url)
         if not targets:
             raise ValueError(f"no Sapphire TOC links found for {url}")
@@ -3172,6 +6548,26 @@ async def _crawl_targets_for_source(source: dict[str, Any], url: str, session: a
             )
             for target in targets
         ]
+    if resolver_type == "anthem_s3_mrf":
+        return await _resolve_anthem_s3_mrf(source, url, resolver, session)
+    if resolver_type == "hcsc_asomrf_landing":
+        return await _resolve_hcsc_asomrf_landing(source, url, resolver, session)
+    if resolver_type == "point32_azure_mrf_directory":
+        return await _resolve_point32_azure_mrf_directory(
+            source, url, resolver, session
+        )
+    if resolver_type == "html_delegated_mrf_links":
+        return await _resolve_html_delegated_mrf_links(source, url, resolver, session)
+    if resolver_type == "html_mrf_links":
+        return await _resolve_html_mrf_links(source, url, resolver, session)
+    if resolver_type == "json_mrf_directory_links":
+        return await _resolve_json_mrf_directory_links(source, url, resolver, session)
+    if resolver_type == "payercompass_mrf":
+        return await _resolve_payercompass_mrf(source, url, resolver, session)
+    if resolver_type == "webtpa_mrf_api":
+        return await _resolve_webtpa_mrf_api(source, url, resolver, session)
+    if resolver_type == "cmstic_file_info":
+        return await _resolve_cmstic_file_info(source, url, resolver, session)
     if not _looks_direct_toc_url(url):
         html_text = await _fetch_text(url, max_bytes=5 * 1024 * 1024, session=session)
         html_targets = _parse_html_mrf_links(html_text, base_url=url)
@@ -3188,18 +6584,36 @@ async def _crawl_targets_for_source(source: dict[str, Any], url: str, session: a
                         "target_file_type": target.get("target_file_type"),
                         "container_format": target.get("container_format"),
                         "html_attr": target.get("html_attr"),
+                        "plan_info": target.get("plan_info"),
                     },
                 )
                 for target in html_targets
             ]
         return []
-    return [CrawlTarget(source=source, url=url, label=str(source.get("display_name") or ""), metadata={"resolver": None})]
+    return [
+        CrawlTarget(
+            source=source,
+            url=url,
+            label=str(source.get("display_name") or ""),
+            metadata={"resolver": None},
+        )
+    ]
 
 
-def _crawl_skipped_observation(source: dict[str, Any], url: str, reason: str, run_id: str | None) -> dict[str, Any]:
+def _crawl_skipped_observation(
+    source: dict[str, Any], url: str, reason: str, run_id: str | None
+) -> dict[str, Any]:
     checked_at = _utc_now()
     return {
-        "observation_id": _id("mrfurlobs", {"source_id": source["source_id"], "url": url, "crawl_skipped": reason, "checked_at": checked_at.isoformat()}),
+        "observation_id": _id(
+            "mrfurlobs",
+            {
+                "source_id": source["source_id"],
+                "url": url,
+                "crawl_skipped": reason,
+                "checked_at": checked_at.isoformat(),
+            },
+        ),
         "source_id": source["source_id"],
         "url": str(url),
         "canonical_url": _canonical_or_none(str(url)),
@@ -3211,10 +6625,20 @@ def _crawl_skipped_observation(source: dict[str, Any], url: str, reason: str, ru
     }
 
 
-def _crawl_failed_observation(source: dict[str, Any], url: str, exc: Exception, run_id: str | None) -> dict[str, Any]:
+def _crawl_failed_observation(
+    source: dict[str, Any], url: str, exc: Exception, run_id: str | None
+) -> dict[str, Any]:
     checked_at = _utc_now()
     return {
-        "observation_id": _id("mrfurlobs", {"source_id": source["source_id"], "url": url, "crawl_error": str(exc), "checked_at": checked_at.isoformat()}),
+        "observation_id": _id(
+            "mrfurlobs",
+            {
+                "source_id": source["source_id"],
+                "url": url,
+                "crawl_error": str(exc),
+                "checked_at": checked_at.isoformat(),
+            },
+        ),
         "source_id": source["source_id"],
         "url": str(url),
         "canonical_url": _canonical_or_none(str(url)),
@@ -3226,7 +6650,9 @@ def _crawl_failed_observation(source: dict[str, Any], url: str, exc: Exception, 
     }
 
 
-def _crawl_ok_observation(target: CrawlTarget, *, run_id: str | None, plans: int, files: int) -> dict[str, Any]:
+def _crawl_ok_observation(
+    target: CrawlTarget, *, run_id: str | None, plans: int, files: int
+) -> dict[str, Any]:
     checked_at = _utc_now()
     return {
         "observation_id": _id(
@@ -3262,18 +6688,30 @@ async def _resolve_crawl_targets(
     run_id: str | None,
     progress_run_id: str | None = None,
     concurrency: int,
+    crawl_target_limit: int | None = None,
 ) -> tuple[list[CrawlTarget], list[dict[str, Any]]]:
-    items = [(source, source.get("index_url") or source.get("human_url")) for source in source_rows if source.get("index_url") or source.get("human_url")]
+    items = [
+        (source, source.get("index_url") or source.get("human_url"))
+        for source in source_rows
+        if source.get("index_url") or source.get("human_url")
+    ]
     total = len(items)
     targets: list[CrawlTarget] = []
     observations: list[dict[str, Any]] = []
     semaphore = asyncio.Semaphore(max(1, int(concurrency or DEFAULT_CONCURRENCY)))
 
-    async def resolve_one(source: dict[str, Any], url: Any) -> tuple[list[CrawlTarget], list[dict[str, Any]]]:
+    async def resolve_one(
+        source: dict[str, Any], url: Any
+    ) -> tuple[list[CrawlTarget], list[dict[str, Any]]]:
         url_text = str(url)
         async with semaphore:
             try:
-                resolved_targets = await _crawl_targets_for_source(source, url_text, session)
+                resolved_targets = await _crawl_targets_for_source(
+                    source,
+                    url_text,
+                    session,
+                    target_limit=crawl_target_limit,
+                )
                 if not resolved_targets:
                     return [], [
                         _crawl_skipped_observation(
@@ -3331,7 +6769,11 @@ def _target_fetch_max_bytes(target: CrawlTarget, default: int) -> int:
 def _toc_target_file_row(target: CrawlTarget) -> dict[str, Any]:
     now = _utc_now()
     source = target.source
-    target_metadata = {key: value for key, value in dict(target.metadata or {}).items() if value not in (None, "")}
+    target_metadata = {
+        key: value
+        for key, value in dict(target.metadata or {}).items()
+        if value not in (None, "")
+    }
     context_metadata = _crawl_target_context_metadata(target)
     file_type = str(target_metadata.get("target_file_type") or "table-of-contents")
     plan_info = _metadata_plan_info(target_metadata)
@@ -3341,7 +6783,14 @@ def _toc_target_file_row(target: CrawlTarget) -> dict[str, Any]:
         or _parse_size_bytes(target_metadata.get("content_length"))
     )
     return {
-        "mrf_file_id": _id("mrffile", {"source": source["source_id"], "type": file_type, "url": _canonical_or_none(target.url)}),
+        "mrf_file_id": _id(
+            "mrffile",
+            {
+                "source": source["source_id"],
+                "type": file_type,
+                "url": _canonical_or_none(target.url),
+            },
+        ),
         "payer_id": source.get("payer_id"),
         "source_id": source["source_id"],
         "file_type": file_type,
@@ -3351,19 +6800,34 @@ def _toc_target_file_row(target: CrawlTarget) -> dict[str, Any]:
         "description": target.label,
         "network_name": target.label,
         "plan_ids": [plan.get("plan_id") for plan in plan_info if plan.get("plan_id")],
-        "plan_names": [plan.get("plan_name") for plan in plan_info if plan.get("plan_name")],
-        "market_types": sorted({plan.get("plan_market_type") for plan in plan_info if plan.get("plan_market_type")}),
+        "plan_names": [
+            plan.get("plan_name") for plan in plan_info if plan.get("plan_name")
+        ],
+        "market_types": sorted(
+            {
+                plan.get("plan_market_type")
+                for plan in plan_info
+                if plan.get("plan_market_type")
+            }
+        ),
         "is_signed_url": _looks_signed(target.url),
         "size_bytes": size_bytes,
         "etag": target_metadata.get("etag"),
         "last_modified": target_metadata.get("last_modified"),
         "schema_version": None,
         "metadata_json": {
-            "container_format": target_metadata.get("container_format") or _container_format(target.url),
+            "container_format": target_metadata.get("container_format")
+            or _container_format(target.url),
             "resolved_from_url": target.resolved_from_url,
             "target_label": target.label,
             **target_metadata,
             **context_metadata,
+            **_file_benefit_metadata(
+                source,
+                target.url,
+                target.label,
+                target.resolved_from_url,
+            ),
         },
         "first_seen_at": now,
         "last_seen_at": now,
@@ -3381,7 +6845,9 @@ def _crawl_source_score(source: dict[str, Any]) -> tuple[int, int]:
     return curation_score, _as_int(source.get("confidence")) or 0
 
 
-def _dedupe_source_rows_for_crawl(source_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _dedupe_source_rows_for_crawl(
+    source_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     by_url: dict[str, dict[str, Any]] = {}
     no_url: list[dict[str, Any]] = []
     for source in source_rows:
@@ -3391,7 +6857,9 @@ def _dedupe_source_rows_for_crawl(source_rows: list[dict[str, Any]]) -> list[dic
             continue
         key = _canonical_or_none(str(url)) or str(url)
         previous = by_url.get(key)
-        if previous is None or _crawl_source_score(source) > _crawl_source_score(previous):
+        if previous is None or _crawl_source_score(source) > _crawl_source_score(
+            previous
+        ):
             by_url[key] = source
     return list(by_url.values()) + no_url
 
@@ -3474,7 +6942,10 @@ def _candidate_matches_text_filters(
         entity_type = str(candidate.entity_type or "").lower()
         if not any(item in entity_type for item in entity_types):
             return False
-    if payer_query and payer_query.lower() not in _clean_text(candidate.payer_name).lower():
+    if (
+        payer_query
+        and payer_query.lower() not in _clean_text(candidate.payer_name).lower()
+    ):
         return False
     return True
 
@@ -3521,7 +6992,11 @@ async def _load_file_probe_targets(
     )
     if entity_types:
         entity_value = func.lower(func.coalesce(MRFPayer.entity_type, ""))
-        stmt = stmt.where(or_(*[entity_value.like(f"%{entity_type}%") for entity_type in entity_types]))
+        stmt = stmt.where(
+            or_(
+                *[entity_value.like(f"%{entity_type}%") for entity_type in entity_types]
+            )
+        )
     if payer_query:
         payer_value = func.lower(func.coalesce(MRFPayer.canonical_name, ""))
         stmt = stmt.where(payer_value.like(f"%{payer_query.lower()}%"))
@@ -3545,7 +7020,9 @@ def _file_probe_target_host(target: dict[str, Any]) -> str:
     return (urlsplit(str(target.get("url") or "")).netloc or "unknown").lower()
 
 
-def _interleave_file_probe_targets_by_host(targets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _interleave_file_probe_targets_by_host(
+    targets: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     by_host: dict[str, list[dict[str, Any]]] = {}
     for target in targets:
         by_host.setdefault(_file_probe_target_host(target), []).append(target)
@@ -3563,7 +7040,9 @@ def _interleave_file_probe_targets_by_host(targets: list[dict[str, Any]]) -> lis
     return interleaved
 
 
-def _file_probe_observation(target: dict[str, Any], head: dict[str, Any], run_id: str | None) -> dict[str, Any]:
+def _file_probe_observation(
+    target: dict[str, Any], head: dict[str, Any], run_id: str | None
+) -> dict[str, Any]:
     checked_at = head["checked_at"]
     return {
         "observation_id": _id(
@@ -3598,7 +7077,9 @@ def _file_probe_observation(target: dict[str, Any], head: dict[str, Any], run_id
     }
 
 
-def _file_probe_update_values(target: dict[str, Any], head: dict[str, Any]) -> dict[str, Any]:
+def _file_probe_update_values(
+    target: dict[str, Any], head: dict[str, Any]
+) -> dict[str, Any]:
     if str(head.get("status") or "") != "ok":
         return {}
     values: dict[str, Any] = {}
@@ -3608,10 +7089,14 @@ def _file_probe_update_values(target: dict[str, Any], head: dict[str, Any]) -> d
         values["etag"] = head.get("etag")
     if head.get("last_modified") is not None:
         values["last_modified"] = head.get("last_modified")
-    return {
-        "mrf_file_id": target["mrf_file_id"],
-        **values,
-    } if values else {}
+    return (
+        {
+            "mrf_file_id": target["mrf_file_id"],
+            **values,
+        }
+        if values
+        else {}
+    )
 
 
 async def _update_mrf_file_probe_metadata(updates: list[dict[str, Any]]) -> None:
@@ -3623,7 +7108,9 @@ async def _update_mrf_file_probe_metadata(updates: list[dict[str, Any]]) -> None
             values = {key: value for key, value in item.items() if key != "mrf_file_id"}
             if not file_id or not values:
                 continue
-            await session.execute(update(MRFFile).where(MRFFile.mrf_file_id == file_id).values(**values))
+            await session.execute(
+                update(MRFFile).where(MRFFile.mrf_file_id == file_id).values(**values)
+            )
 
 
 async def _probe_mrf_file_heads(
@@ -3636,14 +7123,18 @@ async def _probe_mrf_file_heads(
     progress_run_id: str | None = None,
     concurrency: int,
 ) -> tuple[list[dict[str, Any]], int]:
-    targets = await _load_file_probe_targets(file_types, limit, entity_types=entity_types, payer_query=payer_query)
+    targets = await _load_file_probe_targets(
+        file_types, limit, entity_types=entity_types, payer_query=payer_query
+    )
     if not targets:
         return [], 0
     worker_count = max(1, int(concurrency or DEFAULT_CONCURRENCY))
     timeout = aiohttp.ClientTimeout(total=60, connect=10, sock_read=30)
     connector = _tcp_connector(limit=worker_count * 2)
     target_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
-    result_queue: asyncio.Queue[tuple[dict[str, Any], dict[str, Any]] | None] = asyncio.Queue(maxsize=max(worker_count * 4, 1))
+    result_queue: asyncio.Queue[tuple[dict[str, Any], dict[str, Any]] | None] = (
+        asyncio.Queue(maxsize=max(worker_count * 4, 1))
+    )
     for target in targets:
         target_queue.put_nowait(target)
     for _ in range(worker_count):
@@ -3685,7 +7176,9 @@ async def _probe_mrf_file_heads(
             if update_values:
                 update_batch.append(update_values)
             if len(observation_batch) >= WRITE_BATCH_SIZE:
-                await push_objects(observation_batch, MRFUrlObservation, rewrite=True, use_copy=False)
+                await push_objects(
+                    observation_batch, MRFUrlObservation, rewrite=True, use_copy=False
+                )
                 observation_batch.clear()
             if len(update_batch) >= WRITE_BATCH_SIZE:
                 await _update_mrf_file_probe_metadata(update_batch)
@@ -3703,11 +7196,18 @@ async def _probe_mrf_file_heads(
                     label=str(target.get("url") or ""),
                 )
         if observation_batch:
-            await push_objects(observation_batch, MRFUrlObservation, rewrite=True, use_copy=False)
+            await push_objects(
+                observation_batch, MRFUrlObservation, rewrite=True, use_copy=False
+            )
         await _update_mrf_file_probe_metadata(update_batch)
         return all_observations, ok_count
 
-    async with aiohttp.ClientSession(headers={"User-Agent": USER_AGENT}, timeout=timeout, connector=connector, trust_env=False) as session:
+    async with aiohttp.ClientSession(
+        headers={"User-Agent": USER_AGENT},
+        timeout=timeout,
+        connector=connector,
+        trust_env=False,
+    ) as session:
         workers = [asyncio.create_task(worker(session)) for _ in range(worker_count)]
         writer_task = asyncio.create_task(writer())
         await target_queue.join()
@@ -3732,38 +7232,84 @@ async def _crawl_toc_metadata(
     observation_ids: set[str] = set()
     worker_count = max(1, int(concurrency or DEFAULT_CONCURRENCY))
     write_batch_size = WRITE_BATCH_SIZE
-    timeout = aiohttp.ClientTimeout(total=HTTP_TOTAL_TIMEOUT, connect=15, sock_read=HTTP_READ_TIMEOUT)
+    timeout = aiohttp.ClientTimeout(
+        total=HTTP_TOTAL_TIMEOUT, connect=15, sock_read=HTTP_READ_TIMEOUT
+    )
     connector = _tcp_connector(limit=worker_count * 2)
     crawl_source_rows = _dedupe_source_rows_for_crawl(source_rows)
 
-    async def crawl_one(target: CrawlTarget, session: aiohttp.ClientSession) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], str]:
+    async def crawl_one(
+        target: CrawlTarget, session: aiohttp.ClientSession
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], str]:
         try:
             target_kind = (target.metadata or {}).get("target_kind")
             target_max_bytes = _target_fetch_max_bytes(target, max_toc_bytes)
             if target_kind in {"file_reference", "source_landing_page"}:
                 plan_rows = _plan_rows_from_target_metadata(target)
-                return plan_rows, [], [_crawl_ok_observation(target, run_id=run_id, plans=len(plan_rows), files=1)], target.url
+                return (
+                    plan_rows,
+                    [],
+                    [
+                        _crawl_ok_observation(
+                            target, run_id=run_id, plans=len(plan_rows), files=1
+                        )
+                    ],
+                    target.url,
+                )
             if target_kind == "metadata_text":
-                text = await _fetch_text(target.url, max_bytes=target_max_bytes, session=session)
-                plan_rows, file_rows = _metadata_text_rows_from_content(target.source, target.url, text)
+                text = await _fetch_text(
+                    target.url, max_bytes=target_max_bytes, session=session
+                )
+                plan_rows, file_rows = _metadata_text_rows_from_content(
+                    target.source, target.url, text
+                )
             else:
-                toc = await _fetch_json(target.url, max_bytes=target_max_bytes, session=session)
-                plan_rows, file_rows = _toc_rows_from_content(target.source, target.url, toc)
+                toc = await _fetch_json(
+                    target.url, max_bytes=target_max_bytes, session=session
+                )
+                plan_rows, file_rows = _toc_rows_from_content(
+                    target.source, target.url, toc
+                )
                 file_rows = _apply_crawl_target_context_to_file_rows(file_rows, target)
-            return plan_rows, file_rows, [_crawl_ok_observation(target, run_id=run_id, plans=len(plan_rows), files=len(file_rows))], target.url
+            return (
+                plan_rows,
+                file_rows,
+                [
+                    _crawl_ok_observation(
+                        target,
+                        run_id=run_id,
+                        plans=len(plan_rows),
+                        files=len(file_rows),
+                    )
+                ],
+                target.url,
+            )
         except Exception as exc:  # pylint: disable=broad-exception-caught
-            return [], [], [_crawl_failed_observation(target.source, target.url, exc, run_id)], target.url
+            return (
+                [],
+                [],
+                [_crawl_failed_observation(target.source, target.url, exc, run_id)],
+                target.url,
+            )
 
-    async with aiohttp.ClientSession(headers={"User-Agent": USER_AGENT}, timeout=timeout, connector=connector, trust_env=False) as session:
+    async with aiohttp.ClientSession(
+        headers={"User-Agent": USER_AGENT},
+        timeout=timeout,
+        connector=connector,
+        trust_env=False,
+    ) as session:
         targets, resolver_observations = await _resolve_crawl_targets(
             crawl_source_rows,
             session=session,
             run_id=run_id,
             progress_run_id=progress_run_id,
             concurrency=concurrency,
+            crawl_target_limit=crawl_target_limit,
         )
         targets = sorted(targets, key=_crawl_target_rank)
         expanded_target_count = len(targets)
+        if crawl_target_limit:
+            targets = targets[: max(1, int(crawl_target_limit))]
         target_rows: list[dict[str, Any]] = []
         for target in targets:
             row = _toc_target_file_row(target)
@@ -3771,9 +7317,9 @@ async def _crawl_toc_metadata(
         files_discovered += len(target_rows)
         for observation in resolver_observations:
             observation_ids.add(observation["observation_id"])
-        await _push_crawl_row_batches([], target_rows, resolver_observations, batch_size=write_batch_size)
-        if crawl_target_limit:
-            targets = targets[: max(1, int(crawl_target_limit))]
+        await _push_crawl_row_batches(
+            [], target_rows, resolver_observations, batch_size=write_batch_size
+        )
         total = len(targets)
         if progress_run_id:
             message = f"resolved {expanded_target_count} TOC targets from {len(crawl_source_rows)} source pages"
@@ -3790,9 +7336,10 @@ async def _crawl_toc_metadata(
                 message=message,
             )
         target_queue: asyncio.Queue[CrawlTarget | None] = asyncio.Queue()
-        result_queue: asyncio.Queue[tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], str] | None] = asyncio.Queue(
-            maxsize=max(worker_count * 4, 1)
-        )
+        result_queue: asyncio.Queue[
+            tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], str]
+            | None
+        ] = asyncio.Queue(maxsize=max(worker_count * 4, 1))
         for target in targets:
             target_queue.put_nowait(target)
         for _ in range(min(worker_count, max(total, 1))):
@@ -3830,7 +7377,11 @@ async def _crawl_toc_metadata(
                 plan_batch.extend(plan_rows)
                 file_batch.extend(file_rows)
                 observation_batch.extend(crawl_observations)
-                if len(plan_batch) >= write_batch_size or len(file_batch) >= write_batch_size or len(observation_batch) >= write_batch_size:
+                if (
+                    len(plan_batch) >= write_batch_size
+                    or len(file_batch) >= write_batch_size
+                    or len(observation_batch) >= write_batch_size
+                ):
                     if progress_run_id:
                         enqueue_live_progress(
                             run_id=progress_run_id,
@@ -3843,7 +7394,12 @@ async def _crawl_toc_metadata(
                             message=f"writing rows for TOC target {done}/{total}",
                             label=str(url),
                         )
-                    await _push_crawl_row_batches(plan_batch, file_batch, observation_batch, batch_size=write_batch_size)
+                    await _push_crawl_row_batches(
+                        plan_batch,
+                        file_batch,
+                        observation_batch,
+                        batch_size=write_batch_size,
+                    )
                 if progress_run_id:
                     enqueue_live_progress(
                         run_id=progress_run_id,
@@ -3856,14 +7412,18 @@ async def _crawl_toc_metadata(
                         message=f"crawled {done}/{total} TOC targets",
                         label=str(url),
                     )
-            await _push_crawl_row_batches(plan_batch, file_batch, observation_batch, batch_size=write_batch_size)
+            await _push_crawl_row_batches(
+                plan_batch, file_batch, observation_batch, batch_size=write_batch_size
+            )
 
         active_workers = min(worker_count, max(total, 1))
         workers = [asyncio.create_task(worker()) for _ in range(active_workers)]
         writer_task = asyncio.create_task(writer(active_workers))
         worker_group = asyncio.gather(*workers)
         try:
-            done, _ = await asyncio.wait({worker_group, writer_task}, return_when=asyncio.FIRST_EXCEPTION)
+            done, _ = await asyncio.wait(
+                {worker_group, writer_task}, return_when=asyncio.FIRST_EXCEPTION
+            )
             for task in done:
                 task.result()
             await worker_group
@@ -3882,7 +7442,16 @@ async def _crawl_toc_metadata(
 
 def _looks_signed(url: str | None) -> bool:
     raw = str(url or "").lower()
-    return any(token in raw for token in ("signature=", "x-amz-signature=", "sig=", "expires=", "x-goog-signature="))
+    return any(
+        token in raw
+        for token in (
+            "signature=",
+            "x-amz-signature=",
+            "sig=",
+            "expires=",
+            "x-goog-signature=",
+        )
+    )
 
 
 def _import_control_seed_item(
@@ -3907,6 +7476,19 @@ def _import_control_seed_item(
             "source_type": row.get("source_type"),
             "domain": row.get("domain"),
             "healthcare_source_id": row.get("source_id"),
+            "benefit_lines": list(
+                dict.fromkeys(
+                    (row.get("metadata_json") or {}).get("benefit_lines") or []
+                )
+            ),
+            "aliases": list(
+                dict.fromkeys((row.get("metadata_json") or {}).get("aliases") or [])
+            ),
+            "source_coverage": list(
+                dict.fromkeys(
+                    (row.get("metadata_json") or {}).get("source_coverage") or []
+                )
+            ),
         },
     }
     if promoted_source_id:
@@ -3916,9 +7498,19 @@ def _import_control_seed_item(
     return item
 
 
-async def _sync_import_control_seeds(source_rows: list[dict[str, Any]], *, limit: int | None = None) -> int:
-    base_url = str(os.getenv("HLTHPRT_IMPORT_CONTROL_URL") or os.getenv("HP_IMPORT_CONTROL_BASE_URL") or "").strip()
-    token = str(os.getenv("HLTHPRT_IMPORT_CONTROL_TOKEN") or os.getenv("HLTHPRT_CONTROL_API_TOKEN") or "").strip()
+async def _sync_import_control_seeds(
+    source_rows: list[dict[str, Any]], *, limit: int | None = None
+) -> int:
+    base_url = str(
+        os.getenv("HLTHPRT_IMPORT_CONTROL_URL")
+        or os.getenv("HP_IMPORT_CONTROL_BASE_URL")
+        or ""
+    ).strip()
+    token = str(
+        os.getenv("HLTHPRT_IMPORT_CONTROL_TOKEN")
+        or os.getenv("HLTHPRT_CONTROL_API_TOKEN")
+        or ""
+    ).strip()
     if not base_url or not token:
         logging.getLogger(__name__).warning(
             "import-control seed sync skipped: HLTHPRT_IMPORT_CONTROL_URL and/or HLTHPRT_IMPORT_CONTROL_TOKEN not configured"
@@ -3932,12 +7524,23 @@ async def _sync_import_control_seeds(source_rows: list[dict[str, Any]], *, limit
     if not items:
         return 0
     timeout = aiohttp.ClientTimeout(total=60, connect=10, sock_read=30)
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json", "User-Agent": USER_AGENT}
-    async with aiohttp.ClientSession(headers=headers, timeout=timeout, trust_env=False) as session:
-        async with session.post(f"{base_url.rstrip('/')}/v1/catalog/seeds/import", json={"seed_provider": "healthcare-mrf-api", "items": items}) as resp:
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+    async with aiohttp.ClientSession(
+        headers=headers, timeout=timeout, trust_env=False
+    ) as session:
+        async with session.post(
+            f"{base_url.rstrip('/')}/v1/catalog/seeds/import",
+            json={"seed_provider": "healthcare-mrf-api", "items": items},
+        ) as resp:
             if resp.status >= 400:
                 text = await resp.text()
-                raise RuntimeError(f"import-control seed sync failed: {resp.status} {text[:200]}")
+                raise RuntimeError(
+                    f"import-control seed sync failed: {resp.status} {text[:200]}"
+                )
             payload = await resp.json()
     return int(payload.get("count") or len(payload.get("items") or []))
 
@@ -3971,7 +7574,9 @@ def _chunked(items: list[Any], size: int):
         yield items[start : start + size]
 
 
-def _split_preview_items(items: list[dict[str, Any]], *, max_plan_info: int = 200) -> list[dict[str, Any]]:
+def _split_preview_items(
+    items: list[dict[str, Any]], *, max_plan_info: int = 200
+) -> list[dict[str, Any]]:
     """Split large per-file plan arrays into smaller preview items.
 
     Some payers list thousands of plans against every file reference. import-control
@@ -4015,7 +7620,11 @@ def _file_column_plan_info(
     items: list[dict[str, Any]] = []
     for index, plan_id in enumerate(ids):
         plan_name = names[index] if index < len(names) else None
-        market_type = markets[index] if index < len(markets) else (markets[0] if len(markets) == 1 else None)
+        market_type = (
+            markets[index]
+            if index < len(markets)
+            else (markets[0] if len(markets) == 1 else None)
+        )
         lookup = (
             plan_lookup.get((source_id, plan_id, plan_name, market_type))
             or plan_lookup.get((source_id, plan_id, plan_name, None))
@@ -4036,7 +7645,9 @@ def _file_column_plan_info(
     return items
 
 
-def _plan_lookup_from_rows(rows: list[Any]) -> dict[tuple[str, str, str | None, str | None], dict[str, Any]]:
+def _plan_lookup_from_rows(
+    rows: list[Any],
+) -> dict[tuple[str, str, str | None, str | None], dict[str, Any]]:
     lookup: dict[tuple[str, str, str | None, str | None], dict[str, Any]] = {}
     for row in rows:
         source_id = str(row[0] or "")
@@ -4044,7 +7655,11 @@ def _plan_lookup_from_rows(rows: list[Any]) -> dict[tuple[str, str, str | None, 
         if not source_id or not plan_id:
             continue
         metadata = _coerce_metadata(row[6] if len(row) > 6 else None)
-        raw_plan = metadata.get("raw_plan") if isinstance(metadata.get("raw_plan"), dict) else {}
+        raw_plan = (
+            metadata.get("raw_plan")
+            if isinstance(metadata.get("raw_plan"), dict)
+            else {}
+        )
         item = {
             "plan_id_type": row[2],
             "market_type": row[3],
@@ -4089,7 +7704,9 @@ def _enrich_plan_info_from_lookup(
         )
         if not next_plan.get("issuer_name") and lookup.get("issuer_name"):
             next_plan["issuer_name"] = lookup["issuer_name"]
-        if not (next_plan.get("plan_sponsor_name") or next_plan.get("plan_sponser_name")) and lookup.get("plan_sponsor_name"):
+        if not (
+            next_plan.get("plan_sponsor_name") or next_plan.get("plan_sponser_name")
+        ) and lookup.get("plan_sponsor_name"):
             next_plan["plan_sponsor_name"] = lookup["plan_sponsor_name"]
         enriched.append(next_plan)
     return enriched
@@ -4131,13 +7748,19 @@ def _company_name_from_index_url(value: Any) -> str | None:
     return re.sub(r"\s+", " ", name)
 
 
-def _apply_company_fallback(plan_info: list[dict[str, Any]], company_name: str | None) -> list[dict[str, Any]]:
+def _apply_company_fallback(
+    plan_info: list[dict[str, Any]], company_name: str | None
+) -> list[dict[str, Any]]:
     if not company_name:
         return plan_info
     next_info: list[dict[str, Any]] = []
     for plan in plan_info:
         next_plan = dict(plan)
-        if not (next_plan.get("plan_sponsor_name") or next_plan.get("plan_sponser_name") or next_plan.get("sponsor_name")):
+        if not (
+            next_plan.get("plan_sponsor_name")
+            or next_plan.get("plan_sponser_name")
+            or next_plan.get("sponsor_name")
+        ):
             next_plan["plan_sponsor_name"] = company_name
         next_info.append(next_plan)
     return next_info
@@ -4148,7 +7771,9 @@ def _import_control_supported_rate_domain(value: Any) -> bool:
     return normalized in {"in_network", "in_network_rates"}
 
 
-def _import_control_snapshot_file_is_supported(file_type: Any, metadata: dict[str, Any], from_index_url: Any) -> bool:
+def _import_control_snapshot_file_is_supported(
+    file_type: Any, metadata: dict[str, Any], from_index_url: Any
+) -> bool:
     if not str(from_index_url or "").strip():
         return False
     if str(metadata.get("source_format") or "").strip().lower() == "csv":
@@ -4156,7 +7781,9 @@ def _import_control_snapshot_file_is_supported(file_type: Any, metadata: dict[st
     return _import_control_supported_rate_domain(metadata.get("domain") or file_type)
 
 
-def _import_control_preview_context(metadata: dict[str, Any], from_index_url: Any, canonical_url: Any) -> dict[str, str]:
+def _import_control_preview_context(
+    metadata: dict[str, Any], from_index_url: Any, canonical_url: Any
+) -> dict[str, str]:
     context: dict[str, str] = {}
     for key in (
         "group_id",
@@ -4189,7 +7816,9 @@ def _import_control_preview_context(metadata: dict[str, Any], from_index_url: An
     return context
 
 
-async def _import_control_snapshot_items(source_ids: list[str]) -> dict[str, list[dict[str, Any]]]:
+async def _import_control_snapshot_items(
+    source_ids: list[str],
+) -> dict[str, list[dict[str, Any]]]:
     """Read the currently-stored MRF file snapshot for the given sources and build
     import-control preview items grouped by healthcare source_id. Prefer the exact
     per-file plan list captured on MRFFile.metadata_json; for older resolver rows,
@@ -4232,7 +7861,9 @@ async def _import_control_snapshot_items(source_ids: list[str]) -> dict[str, lis
     for row in rows:
         metadata = _coerce_metadata(row[5])
         file_domain = metadata.get("domain") or row[3]
-        if not _import_control_snapshot_file_is_supported(file_domain, metadata, row[11]):
+        if not _import_control_snapshot_file_is_supported(
+            file_domain, metadata, row[11]
+        ):
             continue
         plan_info = metadata.get("plan_info") or []
         if not plan_info:
@@ -4252,7 +7883,9 @@ async def _import_control_snapshot_items(source_ids: list[str]) -> dict[str, lis
         original_url = row[1] or row[2]
         if not original_url:
             continue
-        context = _import_control_preview_context(metadata, row[11], row[2] or original_url)
+        context = _import_control_preview_context(
+            metadata, row[11], row[2] or original_url
+        )
         grouped.setdefault(row[0], []).append(
             {
                 "original_url": original_url,
@@ -4288,7 +7921,8 @@ async def _promote_import_control_source(
 ) -> str | None:
     """Upsert a discovered source into import-control and return the import-control-derived
     source_id (it derives ids from the canonical URL, ignoring ours). The catalog sync stages
-    sources as internal/needs_review and only flips them public after a full plan sync."""
+    sources as internal/needs_review and only flips them public after a full plan sync.
+    """
     payload = {
         "index_url": row.get("index_url") or row.get("human_url"),
         "official_url": row.get("human_url"),
@@ -4305,12 +7939,28 @@ async def _promote_import_control_source(
             "healthcare_source_id": row.get("source_id"),
             "seed_provider": row.get("seed_provider"),
             "access_model": row.get("access_model"),
+            "aliases": list(
+                dict.fromkeys((row.get("metadata_json") or {}).get("aliases") or [])
+            ),
+            "benefit_lines": list(
+                dict.fromkeys(
+                    (row.get("metadata_json") or {}).get("benefit_lines") or []
+                )
+            ),
+            "source_coverage": list(
+                dict.fromkeys(
+                    (row.get("metadata_json") or {}).get("source_coverage") or []
+                )
+            ),
+            "raw": (row.get("metadata_json") or {}).get("raw") or {},
         },
     }
     async with session.post(f"{base}/v1/catalog/sources", json=payload) as resp:
         if resp.status >= 400:
             text = await resp.text()
-            raise RuntimeError(f"import-control source promote failed: {resp.status} {text[:200]}")
+            raise RuntimeError(
+                f"import-control source promote failed: {resp.status} {text[:200]}"
+            )
         data = await resp.json()
     return str(data.get("source_id") or "") or None
 
@@ -4325,19 +7975,28 @@ async def _fetch_import_control_source(
             return None
         if resp.status >= 400:
             text = await resp.text()
-            raise RuntimeError(f"import-control source fetch failed: {resp.status} {text[:200]}")
+            raise RuntimeError(
+                f"import-control source fetch failed: {resp.status} {text[:200]}"
+            )
         data = await resp.json()
     return data if isinstance(data, dict) else None
 
 
 async def _ingest_import_control_preview(
-    session: aiohttp.ClientSession, base: str, ic_source_id: str, items: list[dict[str, Any]]
+    session: aiohttp.ClientSession,
+    base: str,
+    ic_source_id: str,
+    items: list[dict[str, Any]],
 ) -> int:
     preview = {"source_id": ic_source_id, "items": items}
-    async with session.post(f"{base}/v1/ptg/discover/ingest-preview", json=preview) as resp:
+    async with session.post(
+        f"{base}/v1/ptg/discover/ingest-preview", json=preview
+    ) as resp:
         if resp.status >= 400:
             text = await resp.text()
-            raise RuntimeError(f"import-control plan ingest failed: {resp.status} {text[:200]}")
+            raise RuntimeError(
+                f"import-control plan ingest failed: {resp.status} {text[:200]}"
+            )
         data = await resp.json()
     counts = data.get("counts") or {}
     return int(counts.get("plans") or 0)
@@ -4362,7 +8021,9 @@ async def _mark_import_control_seed_promoted(
     ) as resp:
         if resp.status >= 400:
             text = await resp.text()
-            raise RuntimeError(f"import-control promoted seed sync failed: {resp.status} {text[:200]}")
+            raise RuntimeError(
+                f"import-control promoted seed sync failed: {resp.status} {text[:200]}"
+            )
         await resp.json()
     return True
 
@@ -4380,29 +8041,47 @@ async def _push_import_control_catalog(
     incomplete plan catalog, and the source does not count as synced.
 
     Reuses import-control's non-destructive upsert (keyed on the stable discovered_plan_id),
-    so manual fetch-preview plans and bulk-discovered plans converge instead of duplicating."""
-    base_url = str(os.getenv("HLTHPRT_IMPORT_CONTROL_URL") or os.getenv("HP_IMPORT_CONTROL_BASE_URL") or "").strip()
-    token = str(os.getenv("HLTHPRT_IMPORT_CONTROL_TOKEN") or os.getenv("HLTHPRT_CONTROL_API_TOKEN") or "").strip()
+    so manual fetch-preview plans and bulk-discovered plans converge instead of duplicating.
+    """
+    base_url = str(
+        os.getenv("HLTHPRT_IMPORT_CONTROL_URL")
+        or os.getenv("HP_IMPORT_CONTROL_BASE_URL")
+        or ""
+    ).strip()
+    token = str(
+        os.getenv("HLTHPRT_IMPORT_CONTROL_TOKEN")
+        or os.getenv("HLTHPRT_CONTROL_API_TOKEN")
+        or ""
+    ).strip()
     if not base_url or not token:
         return (0, 0, [])
     eligible = [
         row
         for row in source_rows
-        if _eligible_for_public_promotion(row) and (row.get("index_url") or row.get("human_url"))
+        if _eligible_for_public_promotion(row)
+        and (row.get("index_url") or row.get("human_url"))
     ]
     eligible = eligible[: limit or len(eligible)]
     if not eligible:
         return (0, 0, [])
-    snapshot = await _import_control_snapshot_items([str(row.get("source_id") or "") for row in eligible])
+    snapshot = await _import_control_snapshot_items(
+        [str(row.get("source_id") or "") for row in eligible]
+    )
     if not snapshot:
         return (0, 0, [])
     base = base_url.rstrip("/")
     timeout = aiohttp.ClientTimeout(total=60, connect=10, sock_read=30)
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json", "User-Agent": USER_AGENT}
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+    }
     sources_synced = 0
     plans_synced = 0
     errors: list[dict[str, Any]] = []
-    async with aiohttp.ClientSession(headers=headers, timeout=timeout, trust_env=False) as session:
+    async with aiohttp.ClientSession(
+        headers=headers, timeout=timeout, trust_env=False
+    ) as session:
         for row in eligible:
             source_id = str(row.get("source_id") or "")
             items = snapshot.get(source_id) or []
@@ -4425,13 +8104,18 @@ async def _push_import_control_catalog(
                 # Only flip to public if the row still carries our staged sentinel; any other
                 # state means the source pre-existed and an operator decision must stand.
                 staged = stored is None or (
-                    str(stored.get("visibility") or "") == _IMPORT_CONTROL_STAGED_VISIBILITY
+                    str(stored.get("visibility") or "")
+                    == _IMPORT_CONTROL_STAGED_VISIBILITY
                     and str(stored.get("status") or "") == _IMPORT_CONTROL_STAGED_STATUS
                 )
                 source_plans = 0
                 for batch in _chunked(_split_preview_items(items), 100):
-                    source_plans += await _ingest_import_control_preview(session, base, ic_source_id, batch)
-                await _mark_import_control_seed_promoted(session, base, row, ic_source_id)
+                    source_plans += await _ingest_import_control_preview(
+                        session, base, ic_source_id, batch
+                    )
+                await _mark_import_control_seed_promoted(
+                    session, base, row, ic_source_id
+                )
                 if staged:
                     await _promote_import_control_source(
                         session,
@@ -4569,7 +8253,9 @@ def _emit_discovery_control_event(
 
 
 async def _flush_discovery_control_events() -> None:
-    timeout = float(os.getenv("HLTHPRT_MRF_DISCOVERY_CONTROL_EVENT_FLUSH_SECONDS", "1.0"))
+    timeout = float(
+        os.getenv("HLTHPRT_MRF_DISCOVERY_CONTROL_EVENT_FLUSH_SECONDS", "1.0")
+    )
     if timeout <= 0:
         return
     await flush_status_events(timeout_seconds=timeout)
@@ -4608,8 +8294,17 @@ async def main(
     bounded_limit = max(1, int(limit)) if limit else (25 if test_mode else None)
     result = DiscoveryResult(providers=providers)
     started_at = _utc_now()
-    crawl_run_id = _id("mrfcrawl", {"started_at": started_at.isoformat(), "providers": providers, "run_id": run_id})
-    run_mode = _discovery_run_mode(crawl=crawl, check_urls=check_urls, probe_files=probe_files)
+    crawl_run_id = _id(
+        "mrfcrawl",
+        {
+            "started_at": started_at.isoformat(),
+            "providers": providers,
+            "run_id": run_id,
+        },
+    )
+    run_mode = _discovery_run_mode(
+        crawl=crawl, check_urls=check_urls, probe_files=probe_files
+    )
     result.crawl_run_id = crawl_run_id
     control_run_id = run_id or crawl_run_id
     run_params = _discovery_run_params(
@@ -4661,12 +8356,18 @@ async def main(
             message="loading source providers",
         )
 
-    needs_source_load = bool(dry_run or check_urls or crawl or sync_import_control or not probe_files)
+    needs_source_load = bool(
+        dry_run or check_urls or crawl or sync_import_control or not probe_files
+    )
     candidates: list[SourceCandidate] = []
     if needs_source_load:
         for index, provider_name in enumerate(providers):
             try:
-                candidates.extend(await _load_candidates(provider_name, test_mode=test_mode, limit=bounded_limit))
+                candidates.extend(
+                    await _load_candidates(
+                        provider_name, test_mode=test_mode, limit=bounded_limit
+                    )
+                )
             except Exception as exc:  # pylint: disable=broad-exception-caught
                 result.errors.append({"provider": provider_name, "message": str(exc)})
             if control_run_id and not dry_run:
@@ -4691,14 +8392,26 @@ async def main(
                 payer_query=parsed_source_payer_query,
             )
         ]
-    candidates = [candidate for candidate in candidates if _candidate_is_importable_source(candidate)]
+    candidates = [
+        candidate
+        for candidate in candidates
+        if _candidate_is_importable_source(candidate)
+    ]
     if bounded_limit:
         candidates = candidates[:bounded_limit]
     result.candidates = len(candidates)
 
     if dry_run:
-        result.payers = len({_clean_text(candidate.payer_name).lower() for candidate in candidates})
-        result.sources = len([candidate for candidate in candidates if candidate.index_url or candidate.human_url])
+        result.payers = len(
+            {_clean_text(candidate.payer_name).lower() for candidate in candidates}
+        )
+        result.sources = len(
+            [
+                candidate
+                for candidate in candidates
+                if candidate.index_url or candidate.human_url
+            ]
+        )
         return result.as_dict()
 
     await init_db(db, asyncio.get_event_loop())
@@ -4744,14 +8457,16 @@ async def main(
         )
         result.urls_checked = len(observations)
     if crawl:
-        plans_discovered, files_discovered, crawl_observations = await _crawl_toc_metadata(
-            source_rows,
-            test_mode=test_mode,
-            run_id=observation_run_id,
-            progress_run_id=progress_run_id,
-            max_toc_bytes=max_toc_bytes,
-            concurrency=concurrency,
-            crawl_target_limit=crawl_target_limit,
+        plans_discovered, files_discovered, crawl_observations = (
+            await _crawl_toc_metadata(
+                source_rows,
+                test_mode=test_mode,
+                run_id=observation_run_id,
+                progress_run_id=progress_run_id,
+                max_toc_bytes=max_toc_bytes,
+                concurrency=concurrency,
+                crawl_target_limit=crawl_target_limit,
+            )
         )
         observations.extend(crawl_observations)
         result.plans = plans_discovered
@@ -4772,19 +8487,23 @@ async def main(
         result.urls_checked += len(probe_observations)
     if sync_import_control:
         try:
-            result.import_control_synced = await _sync_import_control_seeds(source_rows, limit=bounded_limit)
+            result.import_control_synced = await _sync_import_control_seeds(
+                source_rows, limit=bounded_limit
+            )
         except Exception as exc:  # pylint: disable=broad-exception-caught
             result.errors.append({"provider": "import-control", "message": str(exc)})
         try:
-            sources_synced, plans_synced, catalog_errors = await _push_import_control_catalog(
-                source_rows, limit=bounded_limit
+            sources_synced, plans_synced, catalog_errors = (
+                await _push_import_control_catalog(source_rows, limit=bounded_limit)
             )
             result.import_control_sources_synced = sources_synced
             result.import_control_plans_synced = plans_synced
             for item in catalog_errors:
                 result.errors.append({"provider": "import-control-catalog", **item})
         except Exception as exc:  # pylint: disable=broad-exception-caught
-            result.errors.append({"provider": "import-control-catalog", "message": str(exc)})
+            result.errors.append(
+                {"provider": "import-control-catalog", "message": str(exc)}
+            )
 
     crawl_status = "succeeded" if not result.errors else "succeeded_with_errors"
     finished_at = _utc_now()
@@ -4854,9 +8573,19 @@ async def main(
     return result.as_dict()
 
 
-async def process_data(ctx: dict[str, Any] | None = None, task: dict[str, Any] | None = None) -> dict[str, Any]:
+async def process_data(
+    ctx: dict[str, Any] | None = None, task: dict[str, Any] | None = None
+) -> dict[str, Any]:
     task = task or {}
-    run_id = str(task.get("run_id") or (ctx or {}).get("control_run_id") or (ctx or {}).get("context", {}).get("control_run_id") or "").strip() or None
+    run_id = (
+        str(
+            task.get("run_id")
+            or (ctx or {}).get("control_run_id")
+            or (ctx or {}).get("context", {}).get("control_run_id")
+            or ""
+        ).strip()
+        or None
+    )
     return await main(
         test_mode=bool(task.get("test_mode", task.get("test", False))),
         provider=task.get("provider"),
@@ -4871,7 +8600,12 @@ async def process_data(ctx: dict[str, Any] | None = None, task: dict[str, Any] |
         file_probe_types=task.get("file_probe_types"),
         file_probe_entity_types=task.get("file_probe_entity_types"),
         file_probe_payer_query=task.get("file_probe_payer_query"),
-        sync_import_control=bool(task.get("sync_import_control", _env_flag("HLTHPRT_MRF_DISCOVERY_SYNC_IMPORT_CONTROL_DEFAULT"))),
+        sync_import_control=bool(
+            task.get(
+                "sync_import_control",
+                _env_flag("HLTHPRT_MRF_DISCOVERY_SYNC_IMPORT_CONTROL_DEFAULT"),
+            )
+        ),
         max_toc_bytes=int(task.get("max_toc_bytes") or MAX_TOC_BYTES_DEFAULT),
         concurrency=int(task.get("concurrency") or DEFAULT_CONCURRENCY),
         crawl_target_limit=_as_int(task.get("crawl_target_limit")),

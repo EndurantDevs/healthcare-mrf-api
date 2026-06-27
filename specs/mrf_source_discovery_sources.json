@@ -18,7 +18,8 @@
       "type": "healthsparq_public_mrf",
       "metadata_url_template": "https://mrf.healthsparq.com/{tenant}-egress.nophi.kyruushsq.com/prd/mrf/{insurerCode}/{brandCode}/latest_metadata.json",
       "tenant_overrides": {
-        "MERITAIN_I": "aetnacvs"
+        "MERITAIN_I": "aetnacvs",
+        "LIFEWISE_I": "premera"
       },
       "public_service_path": "/healthsparq/public/service",
       "login_path": "/login",
@@ -28,6 +29,9 @@
     "healthsparq": {
       "type": "healthsparq_public_mrf",
       "metadata_url_template": "https://mrf.healthsparq.com/{tenant}-egress.nophi.kyruushsq.com/prd/mrf/{insurerCode}/{brandCode}/latest_metadata.json",
+      "tenant_overrides": {
+        "LIFEWISE_I": "premera"
+      },
       "public_service_path": "/healthsparq/public/service",
       "login_path": "/login",
       "mrf_all_path": "/v2/mrf/all",
@@ -41,6 +45,114 @@
     "sapphire": {
       "type": "sapphire_html_tocs",
       "max_bytes": 5242880
+    },
+    "anthem_s3_mrf": {
+      "type": "anthem_s3_mrf",
+      "script_path": "/machine-readable-file/search/script.js",
+      "month_offsets": [0, -1],
+      "max_bytes": 1048576
+    },
+    "hcsc_asomrf_landing": {
+      "type": "hcsc_asomrf_landing",
+      "max_bytes": 5242880,
+      "filelist_max_bytes": 20971520,
+      "toc_max_bytes": 104857600,
+      "max_state_pages": 10,
+      "max_targets": 500
+    },
+    "point32_azure_mrf_directory": {
+      "type": "point32_azure_mrf_directory",
+      "max_bytes": 5242880,
+      "directory_max_bytes": 52428800,
+      "max_directories": 5,
+      "max_targets": 5000
+    },
+    "html_delegated_mrf_links": {
+      "type": "html_delegated_mrf_links",
+      "max_bytes": 5242880,
+      "max_links": 40,
+      "max_targets": 1000
+    },
+    "html_mrf_links": {
+      "type": "html_mrf_links",
+      "max_bytes": 5242880,
+      "directory_max_bytes": 5242880,
+      "max_directories": 10,
+      "frame_max_bytes": 5242880,
+      "max_frames": 5,
+      "max_targets": 1000
+    },
+    "bcbsal_html_mrf_links": {
+      "type": "html_mrf_links",
+      "max_bytes": 5242880,
+      "toc_max_bytes": 314572800,
+      "max_targets": 10
+    },
+    "hmsa_monthly_toc": {
+      "type": "monthly_toc_templates",
+      "base_url": "https://hmsa-cost-transparency-west2.s3.us-west-2.amazonaws.com/",
+      "file_templates": ["{month_start}_hmsa_index.json"],
+      "month_offsets": [0, -1],
+      "toc_max_bytes": 5242880
+    },
+    "bcbsri_azure_mrf_listing": {
+      "type": "azure_mrf_listing",
+      "listing_urls": [
+        "https://api.bcbsri.com/public/price-transparency?restype=container&comp=list&prefix=/index/"
+      ],
+      "max_bytes": 10485760,
+      "toc_max_bytes": 52428800,
+      "max_targets": 1000
+    },
+    "payercompass_mrf": {
+      "type": "payercompass_mrf",
+      "structure_path": "/api/Home/GetStructureInfo",
+      "file_list_path": "/api/File/List",
+      "download_path": "/api/File/Download",
+      "max_bytes": 10485760,
+      "max_timeframes": 2,
+      "max_targets": 1000
+    },
+    "json_mrf_directory_links": {
+      "type": "json_mrf_directory_links",
+      "max_bytes": 5242880,
+      "directory_max_bytes": 20971520,
+      "max_directories": 20,
+      "max_targets": 10000
+    },
+    "webtpa_mrf_api": {
+      "type": "webtpa_mrf_api",
+      "plans_path": "/machinereadablefile/plans",
+      "in_network_path_template": "/machinereadablefile/plans/{plan_id}/in-network-rates",
+      "allowed_amounts_path_template": "/machinereadablefile/plans/{plan_id}/allowed-amounts",
+      "in_network_location_path_template": "/machinereadablefile/in-network-rates/{file_id}/location",
+      "max_bytes": 52428800,
+      "max_plans": 10000,
+      "max_targets": 10000
+    },
+    "cmstic_file_info": {
+      "type": "cmstic_file_info",
+      "max_bytes": 5242880,
+      "default_brands_by_host": {
+        "www.amerihealth.com": ["ahpa", "ahnj", "ahnjhmo"],
+        "amerihealth.com": ["ahpa", "ahnj", "ahnjhmo"],
+        "www.amerihealthnj.com": ["ahnj", "ahnjhmo"],
+        "amerihealthnj.com": ["ahnj", "ahnjhmo"],
+        "www.ibx.com": ["qcc"],
+        "ibx.com": ["qcc"]
+      }
+    },
+    "healthgram": {
+      "type": "healthgram_network_index",
+      "max_bytes": 5242880,
+      "network_page_max_bytes": 5242880,
+      "max_network_pages": 50
+    },
+    "github_repo_mrf": {
+      "type": "github_repo_mrf_tree",
+      "repo_max_bytes": 1048576,
+      "tree_max_bytes": 52428800,
+      "max_targets": 10000
     },
     "auxiant_wordpress": {
       "type": "auxiant_wordpress_directory",
@@ -61,6 +173,22 @@
       "toc_path": "/umbraco/surface/mrfdownload",
       "seed_list": "asr_health_benefits_groups"
     },
+    "lacare_s3_listing": {
+      "type": "s3_xml_listing",
+      "listing_urls": ["https://lac-transparency-prod.s3.amazonaws.com"],
+      "public_base_url": "https://transparency.lacare.org",
+      "include_prefixes": ["index/", "download/"],
+      "max_bytes": 52428800,
+      "max_targets": 5000
+    },
+    "providence_mrf_api": {
+      "type": "providence_mrf_api",
+      "config_path": "/config.json",
+      "group_queries": ["Individual and Family Plans", "PROVIDENCE"],
+      "max_groups": 10,
+      "max_targets": 1000,
+      "max_bytes": 10485760
+    },
     "uhc_public_blobs": {
       "type": "uhc_blob_listing",
       "max_bytes": 67108864,
@@ -75,6 +203,13 @@
         "-01_Blue-Cross-and-Blue-Shield-of-Massachusetts-HMO-Blue-Inc_index.json",
         "-01_Blue-Cross-and-Blue-Shield-of-Massachusetts-Inc_index.json"
       ]
+    },
+    "upmc_monthly_toc": {
+      "type": "monthly_toc_templates",
+      "base_url": "https://content.upmchp.com/publicweb/table-of-contents/",
+      "file_templates": ["{month_start}_UPMC-Health-Plan_index.json"],
+      "month_offsets": [0, -1],
+      "toc_max_bytes": 52428800
     },
     "cigna_static_mrf_lookup": {
       "type": "cigna_static_mrf_lookup",
