@@ -910,9 +910,10 @@ async def _ptg2_manifest_enriched_provider_rows_for_npis(
              AND NULLIF(BTRIM(addr.first_line), '') IS NULL"""
 
         def _eff_enrich(column: str) -> str:
+            cast_suffix = "::numeric" if column in {"lat", "long"} else ""
             return (
                 "CASE WHEN NULLIF(BTRIM(addr.first_line), '') IS NULL "
-                f"AND na.first_line IS NOT NULL THEN na.{column} ELSE addr.{column} END"
+                f"AND na.first_line IS NOT NULL THEN na.{column}{cast_suffix} ELSE addr.{column}{cast_suffix} END"
             )
     else:
         enrich_address_fallback_cte = ""
@@ -1308,9 +1309,10 @@ async def _ptg2_manifest_location_provider_matches(
              AND NULLIF(BTRIM(addr.first_line), '') IS NULL"""
 
         def _eff(column: str) -> str:
+            cast_suffix = "::numeric" if column in {"lat", "long"} else ""
             return (
                 "CASE WHEN NULLIF(BTRIM(addr.first_line), '') IS NULL "
-                f"AND na.first_line IS NOT NULL THEN na.{column} ELSE addr.{column} END"
+                f"AND na.first_line IS NOT NULL THEN na.{column}{cast_suffix} ELSE addr.{column}{cast_suffix} END"
             )
     else:
         address_fallback_cte = ""
