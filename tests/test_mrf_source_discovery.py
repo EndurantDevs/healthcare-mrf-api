@@ -45,6 +45,7 @@ def test_source_urls_are_loaded_from_registry_file():
     )
     assert config["platform_resolvers"]["html_mrf_links"]["type"] == "html_mrf_links"
     assert config["platform_resolvers"]["html_mrf_links"]["max_frames"] == 5
+    assert config["platform_resolvers"]["direct_mrf_body"]["type"] == "direct_mrf_body"
     assert (
         config["platform_resolvers"]["healthplan_html_mrf_links"]["type"]
         == "html_mrf_links"
@@ -458,6 +459,12 @@ def test_classify_hosting_platform_recognizes_public_adapter_pages():
         )
         == "cmstic_file_info"
     )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://content.eyemedvisioncare.com/EyeMed_HCSC/eyemed_in-network-rates.json"
+        )
+        == "direct_mrf_body"
+    )
 
 
 def test_parse_master_list_preserves_payers_and_urls():
@@ -622,6 +629,7 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
 |---|---|---|---|
 | 90 Degree Benefits | tpa | https://portal.90degreebenefits.com/MemberPortal/MachineReadableFiles | aliases: 90 Degree, 90DB |
 | Select Health | regional | https://www.selecthealth.org/disclaimers/machine-readable-data | aliases: SelectHealth |
+| EyeMed | vision | https://content.eyemedvisioncare.com/EyeMed_HCSC/eyemed_in-network-rates.json | benefit lines: vision; aliases: EyeMed Vision Care |
 | EMI Health | regional | https://emihealth.com/machinereadables | public machine-readable files page |
 | MotivHealth Insurance Company | regional | https://www.motivhealth.com/machinereadablefiles/ | aliases: MotivHealth |
 | Angle Health | regional | https://www.anglehealth.com/machine-readable-files | aliases: Angle, Adrem Administrators |
@@ -658,6 +666,10 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
     assert by_name["90 Degree Benefits"].aliases == ("90 Degree", "90DB")
     assert by_name["Select Health"].hosting_platform == "html_mrf_links"
     assert by_name["Select Health"].aliases == ("SelectHealth",)
+    assert by_name["EyeMed"].entity_type == "vision"
+    assert by_name["EyeMed"].benefit_lines == ("vision",)
+    assert by_name["EyeMed"].hosting_platform == "direct_mrf_body"
+    assert by_name["EyeMed"].aliases == ("EyeMed Vision Care",)
     assert by_name["EMI Health"].hosting_platform == "html_mrf_links"
     assert by_name["MotivHealth Insurance Company"].hosting_platform == "html_mrf_links"
     assert by_name["Angle Health"].hosting_platform == "html_delegated_mrf_links"
@@ -754,6 +766,10 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert (
         "Delta Dental of Michigan" in by_name["Delta Dental Plan of Michigan"].aliases
     )
+    assert by_name["EyeMed"].entity_type == "vision"
+    assert by_name["EyeMed"].benefit_lines == ("vision",)
+    assert by_name["EyeMed"].hosting_platform == "direct_mrf_body"
+    assert "EyeMed Vision Care" in by_name["EyeMed"].aliases
     assert "HealthLink Network" in by_name["HealthLink"].aliases
     assert by_name["HealthLink"].hosting_platform == "anthem_s3_mrf"
     assert by_name["VSP Vision"].hosting_platform == "sapphire"
@@ -819,6 +835,41 @@ async def test_sapphire_resolver_keeps_direct_toc_urls_without_fetching(monkeypa
     )
     assert targets[0].metadata["resolver"] == "sapphire_html_tocs"
     assert targets[0].metadata["file_name"] == "example_vision"
+
+
+@pytest.mark.asyncio
+async def test_direct_mrf_body_source_becomes_file_reference_without_fetching(
+    monkeypatch,
+):
+    async def fail_fetch(*_args, **_kwargs):
+        raise AssertionError("direct MRF bodies should be cataloged without fetching")
+
+    monkeypatch.setattr(discovery, "_fetch_text", fail_fetch)
+    source = {
+        "source_id": "source_eyemed",
+        "payer_id": "payer_eyemed",
+        "display_name": "EyeMed",
+        "hosting_platform": "direct_mrf_body",
+    }
+
+    [target] = await discovery._crawl_targets_for_source(
+        source,
+        "https://content.eyemedvisioncare.com/EyeMed_HCSC/eyemed_in-network-rates.json",
+        None,
+    )
+
+    assert target.label == "Eyemed"
+    assert target.metadata["resolver"] == "direct_mrf_body"
+    assert target.metadata["target_kind"] == "file_reference"
+    assert target.metadata["target_file_type"] == "in-network"
+    assert target.metadata["plan_info"] == [
+        {
+            "plan_id": None,
+            "plan_id_type": None,
+            "plan_market_type": "group",
+            "plan_name": "Eyemed",
+        }
+    ]
 
 
 @pytest.mark.asyncio

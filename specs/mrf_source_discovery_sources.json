@@ -85,6 +85,9 @@
       "max_frames": 5,
       "max_targets": 1000
     },
+    "direct_mrf_body": {
+      "type": "direct_mrf_body"
+    },
     "healthplan_html_mrf_links": {
       "type": "html_mrf_links",
       "max_bytes": 5242880,

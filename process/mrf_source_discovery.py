@@ -552,6 +552,8 @@ def classify_hosting_platform(url: str | None) -> str | None:
         return "healthcarebluebook_mrf"
     if host == "caa.ebms.com":
         return "ebms_caa_directory"
+    if _looks_direct_mrf_body_url(raw) and _mrf_body_file_type_from_text(raw):
+        return "direct_mrf_body"
     if host.endswith("sapphiremrfhub.com"):
         return "sapphire"
     if host == "mrf.healthgram.com":
@@ -6964,6 +6966,11 @@ async def _crawl_targets_for_source(
         return await _resolve_webtpa_mrf_api(source, url, resolver, session)
     if resolver_type == "cmstic_file_info":
         return await _resolve_cmstic_file_info(source, url, resolver, session)
+    if resolver_type == "direct_mrf_body":
+        target = _direct_mrf_body_crawl_target(source, url, resolver=resolver_type)
+        if target:
+            return [target]
+        raise ValueError(f"no direct MRF body target found for {url}")
     if resolver_type == "github_repo_mrf_tree":
         return await _resolve_github_repo_mrf(source, url, resolver, session)
     if resolver_type == "auxiant_wordpress_directory":
@@ -7104,6 +7111,14 @@ async def _crawl_targets_for_source(
         return await _resolve_webtpa_mrf_api(source, url, resolver, session)
     if resolver_type == "cmstic_file_info":
         return await _resolve_cmstic_file_info(source, url, resolver, session)
+    if resolver_type == "direct_mrf_body":
+        target = _direct_mrf_body_crawl_target(source, url, resolver=resolver_type)
+        if target:
+            return [target]
+        raise ValueError(f"no direct MRF body target found for {url}")
+    direct_body_target = _direct_mrf_body_crawl_target(source, url)
+    if direct_body_target:
+        return [direct_body_target]
     if not _looks_direct_toc_url(url):
         html_text = await _fetch_text(url, max_bytes=5 * 1024 * 1024, session=session)
         html_targets = _parse_html_mrf_links(html_text, base_url=url)
@@ -7291,6 +7306,36 @@ def _crawl_target_rank(target: CrawlTarget) -> tuple[int, str]:
     if urlsplit(url).path.endswith(".json"):
         return 1, url
     return 10, url
+
+
+def _direct_mrf_body_crawl_target(
+    source: dict[str, Any], url: str, *, resolver: str = "direct_mrf_body"
+) -> CrawlTarget | None:
+    if not _looks_direct_mrf_body_url(url):
+        return None
+    file_type = _mrf_body_file_type_from_text(
+        url, str(source.get("display_name") or "")
+    )
+    if not file_type:
+        return None
+    label = (
+        _mrf_file_plan_label(urlsplit(str(url or "")).path)
+        or str(source.get("display_name") or "").strip()
+        or Path(urlsplit(str(url or "")).path).name
+        or "MRF file"
+    )
+    return CrawlTarget(
+        source=source,
+        url=url,
+        label=label,
+        metadata={
+            "resolver": resolver,
+            "target_kind": "file_reference",
+            "target_file_type": file_type,
+            "container_format": _container_format(url),
+            "plan_info": _plan_info_from_label(label),
+        },
+    )
 
 
 def _target_fetch_max_bytes(target: CrawlTarget, default: int) -> int:
