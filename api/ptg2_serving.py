@@ -1418,30 +1418,6 @@ async def _ptg2_manifest_location_provider_matches(
             LEFT JOIN fallback_addresses na
               ON na.npi = addr.npi
              AND NULLIF(BTRIM(addr.first_line), '') IS NULL"""
-        phone_fallback_cte = f"""
-            , phone_fallbacks AS MATERIALIZED (
-                SELECT DISTINCT ON (loc.npi, loc.address_key)
-                       loc.npi,
-                       loc.address_key,
-                       src.telephone_number,
-                       src.fax_number
-                  FROM location_npis loc
-                  JOIN {npi_address_table} src
-                    ON src.address_key IS NOT DISTINCT FROM loc.address_key
-                    OR (loc.premise_key IS NOT NULL AND src.premise_key = loc.premise_key)
-                 WHERE NULLIF(BTRIM(src.telephone_number), '') IS NOT NULL
-                 ORDER BY loc.npi,
-                          loc.address_key,
-                          (src.npi = loc.npi) DESC,
-                          (src.address_key IS NOT DISTINCT FROM loc.address_key) DESC,
-                          CASE src.type WHEN 'primary' THEN 0 WHEN 'practice' THEN 1
-                                       WHEN 'secondary' THEN 2 ELSE 3 END,
-                          src.checksum
-            )"""
-        phone_fallback_join = """
-            LEFT JOIN phone_fallbacks pf
-              ON pf.npi = addr.npi
-             AND pf.address_key IS NOT DISTINCT FROM addr.address_key"""
 
         def _eff(column: str) -> str:
             cast_suffix = "::numeric" if column in {"lat", "long"} else ""
@@ -1449,20 +1425,12 @@ async def _ptg2_manifest_location_provider_matches(
                 "CASE WHEN NULLIF(BTRIM(addr.first_line), '') IS NULL "
                 f"AND na.first_line IS NOT NULL THEN na.{column}{cast_suffix} ELSE addr.{column}{cast_suffix} END"
             )
-
-        def _phone_eff(column: str) -> str:
-            return f"COALESCE(NULLIF(BTRIM({_eff(column)}), ''), pf.{column})"
     else:
         premise_key_select_sql = "NULL::uuid AS premise_key,"
         address_fallback_cte = ""
         address_fallback_join = ""
-        phone_fallback_cte = ""
-        phone_fallback_join = ""
 
         def _eff(column: str) -> str:
-            return f"addr.{column}"
-
-        def _phone_eff(column: str) -> str:
             return f"addr.{column}"
 
     async def _query_location_provider_rows(address_types: tuple[str, ...]) -> list[dict[str, Any]]:
@@ -1508,10 +1476,11 @@ async def _ptg2_manifest_location_provider_matches(
                 LIMIT :limit
             )
             {address_fallback_cte}
-            {phone_fallback_cte}
             SELECT DISTINCT ON (pgm.provider_group_global_id_128, addr.npi)
                 pgm.provider_group_global_id_128,
                 addr.npi,
+                addr.address_key::text AS address_key,
+                addr.premise_key::text AS premise_key,
                 {address_location_hash_sql} AS location_hash,
                 {_eff('state_name')} AS state,
                 {_eff('city_name')} AS city,
@@ -1529,14 +1498,14 @@ async def _ptg2_manifest_location_provider_matches(
                     'state', {_eff('state_name')},
                     'postal_code', {_eff('postal_code')},
                     'country_code', {_eff('country_code')},
-                    'telephone_number', {_phone_eff('telephone_number')},
-                    'fax_number', {_phone_eff('fax_number')},
+                    'telephone_number', {_eff('telephone_number')},
+                    'fax_number', {_eff('fax_number')},
                     'address_key', addr.address_key::text,
                     'lat', {_eff('lat')},
                     'long', {_eff('long')}
                 )::text AS address_payload,
-                {_phone_eff('telephone_number')} AS telephone_number,
-                {_phone_eff('fax_number')} AS fax_number,
+                {_eff('telephone_number')} AS telephone_number,
+                {_eff('fax_number')} AS fax_number,
                 COALESCE(tax.taxonomy_codes, ARRAY[]::varchar[]) AS taxonomy_codes,
                 COALESCE(tax.specialties, ARRAY[]::varchar[]) AS specialties,
                 COALESCE(tax.classifications, ARRAY[]::varchar[]) AS classifications,
@@ -1548,7 +1517,6 @@ async def _ptg2_manifest_location_provider_matches(
             JOIN {provider_group_member_table} pgm ON pgm.npi = addr.npi
             {provider_join}
             {address_fallback_join}
-            {phone_fallback_join}
             {_provider_taxonomy_summary_lateral_sql("addr.npi")}
             ORDER BY pgm.provider_group_global_id_128,
                 addr.npi,
@@ -1566,6 +1534,78 @@ async def _ptg2_manifest_location_provider_matches(
         )
         return [_row_mapping(row) for row in result]
 
+    async def _fill_location_phone_fallbacks(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not using_unified_address_table:
+            return rows
+        missing_rows = [row for row in rows if not row.get("telephone_number")]
+        if not missing_rows:
+            return rows
+        address_keys = sorted({str(row.get("address_key")) for row in missing_rows if row.get("address_key")})
+        premise_keys = sorted({str(row.get("premise_key")) for row in missing_rows if row.get("premise_key")})
+        if not address_keys and not premise_keys:
+            return rows
+        fallback_result = await session.execute(
+            text(
+                f"""
+                SELECT npi,
+                       address_key::text AS address_key,
+                       premise_key::text AS premise_key,
+                       telephone_number,
+                       fax_number,
+                       type,
+                       checksum
+                  FROM {npi_address_table}
+                 WHERE NULLIF(BTRIM(telephone_number), '') IS NOT NULL
+                   AND (
+                        address_key::text = ANY(CAST(:address_keys AS text[]))
+                        OR premise_key::text = ANY(CAST(:premise_keys AS text[]))
+                   )
+                """
+            ),
+            {"address_keys": address_keys, "premise_keys": premise_keys},
+        )
+        candidates = [_row_mapping(row) for row in fallback_result]
+        if not candidates:
+            return rows
+
+        def _fallback_rank(candidate: dict[str, Any], row: dict[str, Any]) -> tuple[int, int, int, str]:
+            type_rank = {"primary": 0, "practice": 1, "secondary": 2}.get(str(candidate.get("type") or ""), 3)
+            return (
+                0 if candidate.get("npi") == row.get("npi") else 1,
+                0 if str(candidate.get("address_key") or "") == str(row.get("address_key") or "") else 1,
+                type_rank,
+                str(candidate.get("checksum") or ""),
+            )
+
+        filled_rows: list[dict[str, Any]] = []
+        for row in rows:
+            if row.get("telephone_number"):
+                filled_rows.append(row)
+                continue
+            row_address_key = str(row.get("address_key") or "")
+            row_premise_key = str(row.get("premise_key") or "")
+            matches = [
+                candidate
+                for candidate in candidates
+                if (row_address_key and str(candidate.get("address_key") or "") == row_address_key)
+                or (row_premise_key and str(candidate.get("premise_key") or "") == row_premise_key)
+            ]
+            if not matches:
+                filled_rows.append(row)
+                continue
+            best = sorted(matches, key=lambda candidate: _fallback_rank(candidate, row))[0]
+            row = dict(row)
+            row["telephone_number"] = best.get("telephone_number")
+            row["fax_number"] = row.get("fax_number") or best.get("fax_number")
+            address_payload = _coerce_json_payload(row.get("address_payload"), {})
+            if isinstance(address_payload, dict):
+                address_payload["telephone_number"] = row["telephone_number"]
+                if row.get("fax_number"):
+                    address_payload["fax_number"] = row["fax_number"]
+                row["address_payload"] = address_payload
+            filled_rows.append(row)
+        return filled_rows
+
     # Primary addresses map to the existing (type, state, city, npi) and
     # (type, zip5) indexes. The broad primary+secondary form forces a large
     # sort in dense cities, so use primary practice locations for the hot path
@@ -1581,6 +1621,7 @@ async def _ptg2_manifest_location_provider_matches(
         rows = await _query_location_provider_rows(fallback_address_types)
     if not rows:
         return set(), {}
+    rows = await _fill_location_phone_fallbacks(rows)
     group_ids = tuple(
         sorted({_ptg2_manifest_id(row.get("provider_group_global_id_128")) for row in rows if row.get("provider_group_global_id_128")})
     )
