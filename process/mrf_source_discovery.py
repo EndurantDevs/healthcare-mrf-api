@@ -7814,6 +7814,44 @@ def _file_column_plan_info(
     return items
 
 
+def _import_control_plan_info_with_context_ids(
+    *,
+    source_id: str,
+    plan_info: list[dict[str, Any]],
+    from_index_url: Any,
+    canonical_url: Any,
+) -> list[dict[str, Any]]:
+    next_info: list[dict[str, Any]] = []
+    source_index_url = (
+        str(from_index_url or "").strip() or str(canonical_url or "").strip()
+    )
+    for plan in plan_info:
+        next_plan = dict(plan)
+        plan_id = str(next_plan.get("plan_id") or "").strip()
+        plan_name = str(
+            next_plan.get("plan_name")
+            or next_plan.get("plan_sponsor_name")
+            or next_plan.get("issuer_name")
+            or ""
+        ).strip()
+        market_type = str(next_plan.get("plan_market_type") or "").strip()
+        if not plan_id and plan_name and market_type:
+            next_plan["plan_id"] = semantic_hash(
+                {
+                    "source_id": source_id,
+                    "source_index_url": source_index_url,
+                    "plan_name": plan_name,
+                    "market_type": market_type,
+                },
+                domain="mrf_source_context_plan",
+            )[:32]
+            next_plan["plan_id_type"] = (
+                next_plan.get("plan_id_type") or "source_context_hash"
+            )
+        next_info.append(next_plan)
+    return next_info
+
+
 def _plan_lookup_from_rows(
     rows: list[Any],
 ) -> dict[tuple[str, str, str | None, str | None], dict[str, Any]]:
@@ -8052,6 +8090,12 @@ async def _import_control_snapshot_items(
         original_url = row[1] or row[2]
         if not original_url:
             continue
+        plan_info = _import_control_plan_info_with_context_ids(
+            source_id=row[0],
+            plan_info=plan_info,
+            from_index_url=row[11],
+            canonical_url=row[2] or original_url,
+        )
         context = _import_control_preview_context(
             metadata, row[11], row[2] or original_url
         )

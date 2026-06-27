@@ -2262,6 +2262,42 @@ def test_file_column_plan_info_synthesizes_import_control_plan_shape():
     )
 
 
+def test_import_control_context_plan_info_adds_stable_ids_for_label_only_plans():
+    plan_info = [
+        {
+            "plan_id": None,
+            "plan_id_type": None,
+            "plan_market_type": "group",
+            "plan_name": "Example Client Medical Plan",
+        },
+        {
+            "plan_id": "391125346",
+            "plan_id_type": "ein",
+            "plan_market_type": "group",
+            "plan_name": "Known EIN Plan",
+        },
+    ]
+
+    enriched = discovery._import_control_plan_info_with_context_ids(
+        source_id="source_1",
+        plan_info=plan_info,
+        from_index_url="https://example.test/2026-06-01_index.json",
+        canonical_url="https://example.test/rates.json.gz",
+    )
+    repeated = discovery._import_control_plan_info_with_context_ids(
+        source_id="source_1",
+        plan_info=plan_info,
+        from_index_url="https://example.test/2026-06-01_index.json",
+        canonical_url="https://example.test/rates.json.gz",
+    )
+
+    assert enriched[0]["plan_id"]
+    assert enriched[0]["plan_id_type"] == "source_context_hash"
+    assert enriched[0]["plan_id"] == repeated[0]["plan_id"]
+    assert enriched[1]["plan_id"] == "391125346"
+    assert enriched[1]["plan_id_type"] == "ein"
+
+
 def test_split_preview_items_slices_large_plan_info_without_changing_file_identity():
     [first, second, third] = discovery._split_preview_items(
         [
