@@ -7029,6 +7029,20 @@ async def _crawl_targets_for_source(
             raise ValueError(f"no UHC blob index links found for {url}")
         return targets
     if resolver_type == "sapphire_html_tocs":
+        if _looks_direct_toc_url(url):
+            return [
+                CrawlTarget(
+                    source=source,
+                    url=url,
+                    label=str(source.get("display_name") or ""),
+                    resolved_from_url=url,
+                    metadata={
+                        "resolver": resolver_type,
+                        "file_name": Path(urlsplit(url).path).name,
+                        "payer_name": source.get("display_name"),
+                    },
+                )
+            ]
         html_text = await _fetch_text(
             url,
             max_bytes=int(resolver.get("max_bytes") or 5 * 1024 * 1024),

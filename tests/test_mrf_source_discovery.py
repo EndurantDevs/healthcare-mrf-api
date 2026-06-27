@@ -669,7 +669,15 @@ async def test_master_list_keeps_high_value_public_aliases():
     )
     assert "United Healthcare Dental" in by_name["United Healthcare"].aliases
     assert "UHC Vision" in by_name["United Healthcare"].aliases
+    assert "UHC Vision Using Spectera Network" in by_name["United Healthcare"].aliases
+    assert "UHC Global" in by_name["United Healthcare"].aliases
     assert "Employee Benefit Management Services EBMS" in by_name["EBMS"].aliases
+    assert "Independence Administrators" in by_name["Independence Blue Cross"].aliases
+    assert "Regence BlueShield" in by_name["Regence"].aliases
+    assert "HealthLink Network" in by_name["HealthLink"].aliases
+    assert by_name["HealthLink"].hosting_platform == "anthem_s3_mrf"
+    assert by_name["VSP Vision"].hosting_platform == "sapphire"
+    assert "VSP" in by_name["VSP Vision"].aliases
     assert "Blue Cross Blue Shield of NC" in aliases_by_name["BCBS North Carolina"]
     assert "Blue Cross Blue Shield of SC" in aliases_by_name["BCBS South Carolina"]
     assert (
@@ -683,6 +691,7 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Angle" in by_name["Angle Health"].aliases
     assert "Adrem Administrators" in by_name["Angle Health"].aliases
     assert "AskAllegiance" in by_name["Allegiance Benefit Plan Management"].aliases
+    assert "Allegiance" in by_name["Allegiance Benefit Plan Management"].aliases
     assert "AccessHMA" in by_name["Healthcare Management Administrators"].aliases
     assert "PCMI" in by_name["Pinnacle Claims Management"].aliases
     assert (
@@ -693,6 +702,34 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Sierra Health and Life" in by_name["United Healthcare"].aliases
     assert "Auxient TPA" in by_name["Auxiant"].aliases
     assert "EBPA Employee Benefits" in by_name["EBPA"].aliases
+    assert "AmeriBen Anthem Blue Cross" in by_name["AmeriBen"].aliases
+
+
+@pytest.mark.asyncio
+async def test_sapphire_resolver_keeps_direct_toc_urls_without_fetching(monkeypatch):
+    async def fail_fetch(*_args, **_kwargs):
+        raise AssertionError("direct Sapphire TOCs should not be fetched as hub pages")
+
+    monkeypatch.setattr(discovery, "_fetch_text", fail_fetch)
+    source = {
+        "source_id": "source_vsp",
+        "payer_id": "payer_vsp",
+        "display_name": "VSP Vision",
+    }
+
+    targets = await discovery._crawl_targets_for_source(
+        source,
+        "https://example.sapphiremrfhub.com/tocs/current/example_vision",
+        None,
+    )
+
+    assert len(targets) == 1
+    assert (
+        targets[0].url
+        == "https://example.sapphiremrfhub.com/tocs/current/example_vision"
+    )
+    assert targets[0].metadata["resolver"] == "sapphire_html_tocs"
+    assert targets[0].metadata["file_name"] == "example_vision"
 
 
 @pytest.mark.asyncio
@@ -965,6 +1002,12 @@ def test_classify_hosting_platforms():
     )
     assert (
         discovery.classify_hosting_platform("https://bci.sapphiremrfhub.com/")
+        == "sapphire"
+    )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://bcbsm.sapphiremrfhub.com/tocs/current/vsp_vision"
+        )
         == "sapphire"
     )
     assert (
