@@ -368,6 +368,7 @@ Last one-time research refresh: 2026-06-05.
 | Professional Benefit Administrators | tpa | https://www.pbaclaims.com/mrfs/ | curated source row |
 | Quartz Benefits | tpa | https://quartzfhir.healthsparq.com/app/public/#/one/insurerCode=QUARTZ_I&brandCode=QUARTZ/machine-readable-transparency-in-coverage | observed current; 2,557 plans; 49,120 files |
 | Regency Employee Benefits | tpa | https://www.mymedicalshopper.com/mrf-search/robbins-regency-employee-benefits-inc-regn | public MyMedicalShopper/TALON MRF search; aliases: Robbins Regency Employee Benefits |
+| S&S Health | tpa | https://mrf.healthcarebluebook.com/SandS | public Healthcare Bluebook MRF directory; aliases: S&S HealthCare, S&S Healthcare, S&S HealthCare Strategies, SandS, Reflect Health |
 | SimplePay Health | tpa | https://www.simplepayhealth.com/ | public landing page delegates MRF access to Meritain/Aetna HealthSparq; aliases: SimplePay |
 | SISCO | tpa | https://sisconosurprise.com/ppo/phcs/index.html | public SISCO PPO machine-readable file page for PHCS TOC; aliases: SISCO Benefits, Self Insured Services Company |
 | SISCO | tpa | https://sisconosurprise.com/ppo/hps/index.html | public SISCO PPO machine-readable file page for HPS in-network file; aliases: SISCO Benefits, Self Insured Services Company |

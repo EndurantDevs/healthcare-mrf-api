@@ -590,6 +590,7 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
 | HealthComp | tpa | https://healthcomp.sapphiremrfhub.com/ | aliases: Personify Health, Personify |
 | Pinnacle Claims Management | tpa | https://mrf.healthcarebluebook.com/Pinnacle | aliases: PCMI |
 | Regency Employee Benefits | tpa | https://www.mymedicalshopper.com/mrf-search/robbins-regency-employee-benefits-inc-regn | aliases: Robbins Regency Employee Benefits |
+| S&S Health | tpa | https://mrf.healthcarebluebook.com/SandS | aliases: S&S HealthCare, SandS, Reflect Health |
 | SimplePay Health | tpa | https://www.simplepayhealth.com/ | aliases: SimplePay |
 | SISCO | tpa | https://sisconosurprise.com/ppo/phcs/index.html | aliases: SISCO Benefits, Self Insured Services Company |
 | CBA Blue | tpa | https://www.cbabluevt.com/employer-resources/ | aliases: CBA BLUE |
@@ -638,6 +639,12 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
     assert (
         by_name["Regency Employee Benefits"].hosting_platform
         == "mymedicalshopper_talon"
+    )
+    assert by_name["S&S Health"].hosting_platform == "healthcarebluebook_mrf"
+    assert by_name["S&S Health"].aliases == (
+        "S&S HealthCare",
+        "SandS",
+        "Reflect Health",
     )
     assert by_name["SimplePay Health"].hosting_platform == "html_delegated_mrf_links"
     assert by_name["SISCO"].hosting_platform == "html_mrf_links"
