@@ -375,7 +375,7 @@ Last one-time research refresh: 2026-06-05.
 | SISCO | tpa | https://sisconosurprise.com/ppo/hps/index.html | public SISCO PPO machine-readable file page for HPS in-network file; aliases: SISCO Benefits, Self Insured Services Company |
 | Tall Tree Administrators | tpa | https://talltreeadmin.com/machine-readable-files | public MRF link page; aliases: Tall Tree, Tall Tree Administration |
 | Unified Group Services | tpa | https://mrf.healthcarebluebook.com/unified | public Healthcare Bluebook MRF directory; aliases: UGS, UnifiedGrp |
-| Varipro | tpa | https://www.mymedicalshopper.com/mrf-search/varipro | MyMedicalShopper/TALON MRF search; resolver enumerates current employer plan TOCs |
+| Varipro | tpa | https://www.mymedicalshopper.com/mrf-search/varipro | MyMedicalShopper/TALON MRF search; resolver enumerates current employer plan TOCs; aliases: Varipro TPA, Valipro, Valipro TPA, Professional Benefits Services, PBS |
 | Vitori Health | tpa | https://mrf.healthcarebluebook.com/Flume | public Healthcare Bluebook MRF directory for Flume/Vitori sources; aliases: Vitori, Flume |
 | WebTPA | tpa | https://www.webtpa.com/rights-protections | curated source row |
 | WebTPA | tpa | https://price-transparency.webtpa.com/ | public transparency URL |

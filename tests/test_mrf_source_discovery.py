@@ -639,6 +639,7 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
 | HealthComp | tpa | https://healthcomp.sapphiremrfhub.com/ | aliases: Personify Health, Personify |
 | Pinnacle Claims Management | tpa | https://mrf.healthcarebluebook.com/Pinnacle | aliases: PCMI |
 | Regency Employee Benefits | tpa | https://www.mymedicalshopper.com/mrf-search/robbins-regency-employee-benefits-inc-regn | aliases: Robbins Regency Employee Benefits |
+| Varipro | tpa | https://www.mymedicalshopper.com/mrf-search/varipro | aliases: Varipro TPA, Valipro TPA |
 | S&S Health | tpa | https://mrf.healthcarebluebook.com/SandS | aliases: S&S HealthCare, SandS, Reflect Health |
 | SimplePay Health | tpa | https://www.simplepayhealth.com/ | aliases: SimplePay |
 | SISCO | tpa | https://sisconosurprise.com/ppo/phcs/index.html | aliases: SISCO Benefits, Self Insured Services Company |
@@ -695,6 +696,8 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
         by_name["Regency Employee Benefits"].hosting_platform
         == "mymedicalshopper_talon"
     )
+    assert by_name["Varipro"].hosting_platform == "mymedicalshopper_talon"
+    assert by_name["Varipro"].aliases == ("Varipro TPA", "Valipro TPA")
     assert by_name["S&S Health"].hosting_platform == "healthcarebluebook_mrf"
     assert by_name["S&S Health"].aliases == (
         "S&S HealthCare",
@@ -781,6 +784,12 @@ async def test_master_list_keeps_high_value_public_aliases():
         "The Health Plan of the Upper Ohio Valley" in by_name["The Health Plan"].aliases
     )
     assert "THP" in by_name["The Health Plan"].aliases
+    assert by_name["Varipro"].hosting_platform == "mymedicalshopper_talon"
+    assert "Varipro TPA" in by_name["Varipro"].aliases
+    assert "Valipro" in by_name["Varipro"].aliases
+    assert "Valipro TPA" in by_name["Varipro"].aliases
+    assert "Professional Benefits Services" in by_name["Varipro"].aliases
+    assert "PBS" in by_name["Varipro"].aliases
     assert "Blue Cross Blue Shield of NC" in aliases_by_name["BCBS North Carolina"]
     assert "Blue Cross Blue Shield of SC" in aliases_by_name["BCBS South Carolina"]
     assert (
