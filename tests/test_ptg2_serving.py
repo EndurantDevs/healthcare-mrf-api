@@ -313,6 +313,9 @@ async def test_manifest_serving_geo_expansion_uses_wider_location_candidate_wind
                     "state": "IL",
                     "city": "PANA",
                     "zip5": "62557",
+                    "telephone_number": "2175551212",
+                    "fax_number": "2175551213",
+                    "address_payload": '{"telephone_number":"2175551212","fax_number":"2175551213"}',
                     "taxonomy_codes": ["207XS0114X"],
                     "specialties": ["Orthopaedic Surgery Physician"],
                     "classifications": ["Orthopaedic Surgery"],
@@ -358,6 +361,11 @@ async def test_manifest_serving_geo_expansion_uses_wider_location_candidate_wind
     assert len(payload["items"]) == 1
     assert payload["items"][0]["npi"] == 1154321222
     assert payload["items"][0]["specialization"] == "Sports Medicine"
+    assert payload["items"][0]["phone"] == "2175551212"
+    assert payload["items"][0]["phone_number"] == "2175551212"
+    assert payload["items"][0]["telephone_number"] == "2175551212"
+    assert payload["items"][0]["fax_number"] == "2175551213"
+    assert payload["items"][0]["address"]["telephone_number"] == "2175551212"
     assert seen_candidate_limit["value"] >= 500
     row_sql = str(session.calls[0][0][0])
     row_params = session.calls[0][0][1]
@@ -1569,9 +1577,19 @@ async def test_manifest_location_provider_matches_filters_coordinates_with_unifi
                         "state": "CA",
                         "city": "GLENDALE",
                         "zip5": "91204",
+                        "distance_miles": 3.25,
+                        "zip_match_type": "radius",
+                        "anchor_zip5": "91204",
+                        "zip_radius_miles": 10.0,
+                        "telephone_number": "8185551212",
+                        "fax_number": "8185551213",
                         "location_source": "entity_address_unified",
                         "location_confidence_code": "entity_address_unified",
-                        "address_payload": '{"address_key":"00000000-0000-0000-0000-000000000001","lat":34.14024131,"long":-118.255125}',
+                        "address_payload": (
+                            '{"address_key":"00000000-0000-0000-0000-000000000001",'
+                            '"telephone_number":"8185551212","fax_number":"8185551213",'
+                            '"lat":34.14024131,"long":-118.255125}'
+                        ),
                         "taxonomy_codes": ["207XS0114X"],
                         "specialties": ["Orthopaedic Surgery Physician"],
                         "classifications": ["Orthopaedic Surgery"],
@@ -1607,15 +1625,33 @@ async def test_manifest_location_provider_matches_filters_coordinates_with_unifi
     provider = providers_by_set[provider_set_id][0]
     assert provider["npi"] == 1234567890
     assert provider["zip5"] == "91204"
+    assert provider["distance_miles"] == 3.25
+    assert provider["zip_match_type"] == "radius"
+    assert provider["anchor_zip5"] == "91204"
+    assert provider["zip_radius_miles"] == 10.0
+    assert provider["telephone_number"] == "8185551212"
+    assert provider["fax_number"] == "8185551213"
     assert provider["taxonomy_codes"] == ["207XS0114X"]
     assert provider["classifications"] == ["Orthopaedic Surgery"]
     assert provider["specializations"] == ["Sports Medicine"]
     assert provider["primary_specialization"] == "Sports Medicine"
     address = json.loads(provider["address_payload"])
     assert address["address_key"] == "00000000-0000-0000-0000-000000000001"
+    assert address["telephone_number"] == "8185551212"
+    assert address["fax_number"] == "8185551213"
     sql = str(session.calls[2][0][0])
     params = session.calls[2][0][1]
     assert "FROM mrf.entity_address_unified addr" in sql
+    assert "raw_location_npis AS" in sql
+    assert "location_npis AS MATERIALIZED" in sql
+    assert "ORDER BY zip_rank, distance_miles ASC NULLS LAST, npi" in sql
+    assert "AS distance_miles" in sql
+    assert "AS zip_match_type" in sql
+    assert ":geo_radius_miles AS zip_radius_miles" in sql
+    assert "addr.telephone_number" in sql
+    assert "'telephone_number', " in sql
+    assert "AS telephone_number" in sql
+    assert "AS fax_number" in sql
     assert "addr.address_key" in sql
     assert "addr.lat::float8 BETWEEN :geo_min_lat AND :geo_max_lat" in sql
     assert "addr.long::float8 BETWEEN :geo_min_long AND :geo_max_long" in sql
@@ -1635,6 +1671,57 @@ async def test_manifest_location_provider_matches_filters_coordinates_with_unifi
     assert params["geo_long"] == -118.255125
     assert params["geo_radius_miles"] == 10.0
     assert params["address_types"] == ["practice", "primary"]
+
+
+def test_sort_ptg2_manifest_provider_items_supports_cost_and_distance():
+    items = [
+        {
+            "provider_name": "Far cheap",
+            "prices": [{"negotiated_rate": 100.0}],
+            "distance_miles": 45.0,
+        },
+        {
+            "provider_name": "Near expensive",
+            "prices": [{"negotiated_rate": 500.0}],
+            "distance_miles": 2.0,
+        },
+    ]
+
+    by_cost = ptg2_serving._sort_ptg2_manifest_provider_items(
+        items,
+        {"order_by": "total_allowed_amount", "order": "asc"},
+        location_filter_requested=True,
+    )
+    by_distance = ptg2_serving._sort_ptg2_manifest_provider_items(
+        items,
+        {"order_by": "distance", "order": "asc"},
+        location_filter_requested=True,
+    )
+
+    assert [item["provider_name"] for item in by_cost] == ["Far cheap", "Near expensive"]
+    assert [item["provider_name"] for item in by_distance] == ["Near expensive", "Far cheap"]
+
+
+def test_compact_item_promotes_location_phone_from_address_payload():
+    item = ptg2_serving._compact_item_from_row(
+        {
+            "npi": 1234567890,
+            "provider_name": "Example Surgeon",
+            "address_payload": {
+                "address_key": "00000000-0000-0000-0000-000000000001",
+                "telephone_number": "3125551212",
+                "fax_number": "3125551213",
+            },
+            "prices": [],
+        },
+        {},
+    )
+
+    assert item["phone"] == "3125551212"
+    assert item["phone_number"] == "3125551212"
+    assert item["telephone_number"] == "3125551212"
+    assert item["fax_number"] == "3125551213"
+    assert item["address"]["telephone_number"] == "3125551212"
 
 
 def test_orthopedic_surgery_specialty_resolves_to_taxonomy():

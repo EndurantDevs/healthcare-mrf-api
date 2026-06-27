@@ -1724,6 +1724,7 @@ async def test_list_providers_by_procedure_routes_plan_filter_to_ptg2(monkeypatc
             "classification": "Internal Medicine",
             "taxonomy_codes": "207R00000X",
             "include_subspecialties": "false",
+            "primary_only": "false",
             "lat": "29.7604",
             "long": "-95.3698",
             "radius_miles": "10",
@@ -1744,6 +1745,9 @@ async def test_list_providers_by_procedure_routes_plan_filter_to_ptg2(monkeypatc
     assert seen_args["classification"] == "Internal Medicine"
     assert seen_args["taxonomy_codes"] == "207R00000X"
     assert seen_args["include_subspecialties"] == "false"
+    assert seen_args["primary_only"] == "false"
+    assert seen_args["order_by"] == "total_allowed_amount"
+    assert seen_args["order"] == "asc"
     assert seen_args["lat"] == 29.7604
     assert seen_args["long"] == -95.3698
     assert seen_args["radius_miles"] == 10.0

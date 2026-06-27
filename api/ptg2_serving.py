@@ -141,6 +141,8 @@ _PTG2_LEGACY_ADDRESS_COLUMNS = {
     "long",
     "first_line",
     "second_line",
+    "telephone_number",
+    "fax_number",
 }
 _PTG2_UNIFIED_ADDRESS_COLUMNS = _PTG2_LEGACY_ADDRESS_COLUMNS | {"address_precision"}
 
@@ -189,6 +191,23 @@ def _ptg2_provider_name_sql(alias: str = "n") -> str:
         f"NULLIF(BTRIM(CONCAT_WS(' ', {alias}.provider_first_name, {alias}.provider_middle_name, {alias}.provider_last_name)), ''), "
         "'TiC provider')"
     )
+
+
+def _add_location_phone_fields(item: dict[str, Any], data: dict[str, Any], address_payload: dict[str, Any]) -> None:
+    phone = (
+        data.get("telephone_number")
+        or data.get("phone_number")
+        or address_payload.get("telephone_number")
+        or address_payload.get("phone_number")
+        or address_payload.get("phone")
+    )
+    if phone not in (None, "", "null"):
+        item["telephone_number"] = phone
+        item["phone_number"] = phone
+        item["phone"] = phone
+    fax = data.get("fax_number") or address_payload.get("fax_number")
+    if fax not in (None, "", "null"):
+        item["fax_number"] = fax
 
 
 def _ptg2_individual_npi_exists_sql(npi_sql: str) -> str:
@@ -875,7 +894,8 @@ async def _ptg2_manifest_enriched_provider_rows_for_npis(
             , fallback_addresses AS MATERIALIZED (
                 SELECT DISTINCT ON (na.npi)
                        na.npi, na.first_line, na.second_line, na.city_name, na.state_name,
-                       na.postal_code, na.country_code, na.lat, na.long
+                       na.postal_code, na.country_code, na.telephone_number, na.fax_number,
+                       na.lat, na.long
                   FROM {PTG2_SCHEMA}.npi_address na
                   JOIN source_npis source_filter ON source_filter.npi = na.npi
                  WHERE NULLIF(BTRIM(na.first_line), '') IS NOT NULL
@@ -922,10 +942,14 @@ async def _ptg2_manifest_enriched_provider_rows_for_npis(
                     'state', {_eff_enrich('state_name')},
                     'postal_code', {_eff_enrich('postal_code')},
                     'country_code', {_eff_enrich('country_code')},
+                    'telephone_number', {_eff_enrich('telephone_number')},
+                    'fax_number', {_eff_enrich('fax_number')},
                     'address_key', addr.address_key::text,
                     'lat', {_eff_enrich('lat')},
                     'long', {_eff_enrich('long')}
                 )::text AS address_payload,
+                {_eff_enrich('telephone_number')} AS telephone_number,
+                {_eff_enrich('fax_number')} AS fax_number,
                 COALESCE(tax.taxonomy_codes, ARRAY[]::varchar[]) AS taxonomy_codes,
                 COALESCE(tax.specialties, ARRAY[]::varchar[]) AS specialties,
                 COALESCE(tax.classifications, ARRAY[]::varchar[]) AS classifications,
@@ -978,6 +1002,72 @@ def _ptg2_manifest_rate_candidate_limit(
             max(requested_limit, requested_offset + requested_limit, requested_limit * 5, 5),
         )
     return requested_limit
+
+
+def _ptg2_provider_price_sort_value(item: dict[str, Any]) -> float:
+    rates: list[float] = []
+    for price in _coerce_json_payload(item.get("prices"), []):
+        if not isinstance(price, dict):
+            continue
+        rate = _coerce_numeric_rate(price.get("negotiated_rate"))
+        if rate is not None:
+            rates.append(float(rate))
+    for summary in _coerce_json_payload(item.get("price_summary"), []):
+        if not isinstance(summary, dict):
+            continue
+        rate = _coerce_numeric_rate(summary.get("rate"))
+        if rate is not None:
+            rates.append(float(rate))
+    return min(rates) if rates else math.inf
+
+
+def _ptg2_provider_distance_sort_value(item: dict[str, Any]) -> float:
+    value = _optional_float(item.get("distance_miles"))
+    return value if value is not None else math.inf
+
+
+def _sort_ptg2_manifest_provider_items(
+    items: list[dict[str, Any]],
+    args: dict[str, Any],
+    *,
+    location_filter_requested: bool,
+) -> list[dict[str, Any]]:
+    order_by = str(args.get("order_by") or "").strip().lower()
+    order = str(args.get("order") or "").strip().lower()
+    descending = order == "desc"
+    cost_order_fields = {
+        "total_allowed_amount",
+        "total_drug_cost",
+        "cost",
+        "price",
+        "rate",
+        "negotiated_rate",
+        "amount",
+    }
+    distance_order_fields = {"distance", "distance_miles"}
+    if order_by in cost_order_fields:
+        return sorted(
+            items,
+            key=lambda item: (
+                _ptg2_provider_price_sort_value(item),
+                _ptg2_provider_distance_sort_value(item),
+                str(item.get("provider_name") or ""),
+                str(item.get("npi") or ""),
+            ),
+            reverse=descending,
+        )
+    if order_by in distance_order_fields or (location_filter_requested and not order_by):
+        return sorted(
+            items,
+            key=lambda item: (
+                _ptg2_provider_distance_sort_value(item),
+                _ptg2_provider_price_sort_value(item),
+                str(item.get("provider_name") or ""),
+                str(item.get("npi") or ""),
+            ),
+            reverse=descending,
+        )
+    return items
 
 
 async def _ptg2_manifest_filter_npis_by_provider_taxonomy(
@@ -1162,6 +1252,35 @@ async def _ptg2_manifest_location_provider_matches(
         if has_npi_data
         else "'TiC provider'"
     )
+    distance_sql = ""
+    location_select_sql = (
+        "NULL::double precision AS distance_miles, "
+        "NULL::varchar AS zip_match_type, "
+        "NULL::varchar AS anchor_zip5, "
+        "NULL::double precision AS zip_radius_miles, "
+        "0 AS zip_rank"
+    )
+    location_order_sql = "addr.npi"
+    limited_location_order_sql = "npi"
+    if geo_lat is not None and geo_long is not None and geo_radius_miles is not None:
+        distance_sql = _ptg2_geo_distance_miles_sql("addr.lat::float8", "addr.long::float8")
+        if zip_value:
+            same_zip_sql = "LEFT(COALESCE(addr.postal_code, ''), 5) = :zip5"
+            location_select_sql = (
+                f"CASE WHEN {same_zip_sql} THEN 0.0 ELSE {distance_sql} END AS distance_miles, "
+                f"CASE WHEN {same_zip_sql} THEN 'same_zip' ELSE 'radius' END AS zip_match_type, "
+                ":zip5 AS anchor_zip5, :geo_radius_miles AS zip_radius_miles, "
+                f"CASE WHEN {same_zip_sql} THEN 0 ELSE 1 END AS zip_rank"
+            )
+        else:
+            location_select_sql = (
+                f"{distance_sql} AS distance_miles, "
+                "'radius' AS zip_match_type, "
+                "NULL::varchar AS anchor_zip5, :geo_radius_miles AS zip_radius_miles, "
+                "0 AS zip_rank"
+            )
+        location_order_sql = "addr.npi, zip_rank, distance_miles ASC NULLS LAST"
+        limited_location_order_sql = "zip_rank, distance_miles ASC NULLS LAST, npi"
 
     # entity_address_unified can resolve a NPI to a city/zip-only row with no
     # street (first_line). When that happens, fall back to the NPPES npi_address
@@ -1173,7 +1292,8 @@ async def _ptg2_manifest_location_provider_matches(
             , fallback_addresses AS MATERIALIZED (
                 SELECT DISTINCT ON (na.npi)
                        na.npi, na.first_line, na.second_line, na.city_name, na.state_name,
-                       na.postal_code, na.country_code, na.lat, na.long
+                       na.postal_code, na.country_code, na.telephone_number, na.fax_number,
+                       na.lat, na.long
                   FROM {PTG2_SCHEMA}.npi_address na
                   JOIN location_npis loc ON loc.npi = na.npi
                  WHERE NULLIF(BTRIM(na.first_line), '') IS NOT NULL
@@ -1205,7 +1325,7 @@ async def _ptg2_manifest_location_provider_matches(
         result = await session.execute(
             text(
                 f"""
-            WITH location_npis AS (
+            WITH raw_location_npis AS (
                 SELECT DISTINCT ON (addr.npi)
                     addr.npi,
                     addr.type,
@@ -1218,11 +1338,14 @@ async def _ptg2_manifest_location_provider_matches(
                     addr.lat,
                     addr.long,
                     addr.first_line,
-                    addr.second_line
+                    addr.second_line,
+                    addr.telephone_number,
+                    addr.fax_number,
+                    {location_select_sql}
                 FROM {npi_address_table} addr
                 WHERE {" AND ".join(address_filters)}
                   AND addr.type = ANY(CAST(:address_types AS varchar[]))
-                ORDER BY addr.npi,
+                ORDER BY {location_order_sql},
                     CASE addr.type
                         WHEN 'practice' THEN 0
                         WHEN 'primary' THEN 1
@@ -1230,6 +1353,11 @@ async def _ptg2_manifest_location_provider_matches(
                         ELSE 3
                     END,
                     addr.checksum
+            ),
+            location_npis AS MATERIALIZED (
+                SELECT *
+                FROM raw_location_npis
+                ORDER BY {limited_location_order_sql}
                 LIMIT :limit
             )
             {address_fallback_cte}
@@ -1240,6 +1368,10 @@ async def _ptg2_manifest_location_provider_matches(
                 {_eff('state_name')} AS state,
                 {_eff('city_name')} AS city,
                 LEFT(COALESCE({_eff('postal_code')}, ''), 5) AS zip5,
+                addr.distance_miles,
+                addr.zip_match_type,
+                addr.anchor_zip5,
+                addr.zip_radius_miles,
                 '{address_location_source}' AS location_source,
                 '{address_location_source}' AS location_confidence_code,
                 json_build_object(
@@ -1249,10 +1381,14 @@ async def _ptg2_manifest_location_provider_matches(
                     'state', {_eff('state_name')},
                     'postal_code', {_eff('postal_code')},
                     'country_code', {_eff('country_code')},
+                    'telephone_number', {_eff('telephone_number')},
+                    'fax_number', {_eff('fax_number')},
                     'address_key', addr.address_key::text,
                     'lat', {_eff('lat')},
                     'long', {_eff('long')}
                 )::text AS address_payload,
+                {_eff('telephone_number')} AS telephone_number,
+                {_eff('fax_number')} AS fax_number,
                 COALESCE(tax.taxonomy_codes, ARRAY[]::varchar[]) AS taxonomy_codes,
                 COALESCE(tax.specialties, ARRAY[]::varchar[]) AS specialties,
                 COALESCE(tax.classifications, ARRAY[]::varchar[]) AS classifications,
@@ -1316,6 +1452,12 @@ async def _ptg2_manifest_location_provider_matches(
             "state": row.get("state"),
             "city": row.get("city"),
             "zip5": row.get("zip5"),
+            "distance_miles": row.get("distance_miles"),
+            "zip_match_type": row.get("zip_match_type"),
+            "anchor_zip5": row.get("anchor_zip5"),
+            "zip_radius_miles": row.get("zip_radius_miles"),
+            "telephone_number": row.get("telephone_number"),
+            "fax_number": row.get("fax_number"),
             "location_hash": row.get("location_hash"),
             "location_source": row.get("location_source"),
             "location_confidence_code": row.get("location_confidence_code"),
@@ -1764,6 +1906,7 @@ async def _search_ptg2_manifest_db_serving_table(
             break
         for provider in providers_by_set.get(_ptg2_manifest_id(data.get("provider_set_global_id_128")), [])[:remaining]:
             item = dict(base_item)
+            address_payload = _coerce_json_payload(provider.get("address_payload"), {})
             item.update(
                 {
                     "provider_ordinal": provider.get("npi") or provider_set_hash,
@@ -1775,7 +1918,7 @@ async def _search_ptg2_manifest_db_serving_table(
                     "location_hash": provider.get("location_hash"),
                     "location_source": provider.get("location_source"),
                     "location_confidence_code": provider.get("location_confidence_code"),
-                    "address": _coerce_json_payload(provider.get("address_payload"), {}),
+                    "address": address_payload,
                     "taxonomy_codes": _coerce_json_payload(provider.get("taxonomy_codes"), []),
                     "specialties": _coerce_json_payload(provider.get("specialties"), []),
                     "primary_specialty": provider.get("primary_specialty"),
@@ -1785,11 +1928,21 @@ async def _search_ptg2_manifest_db_serving_table(
                     or ((_coerce_json_payload(provider.get("specializations"), []) or [None])[0]),
                     "primary_specialization": provider.get("primary_specialization"),
                     "specializations": _coerce_json_payload(provider.get("specializations"), []),
+                    "distance_miles": provider.get("distance_miles"),
+                    "zip_match_type": provider.get("zip_match_type"),
+                    "anchor_zip5": provider.get("anchor_zip5"),
+                    "zip_radius_miles": provider.get("zip_radius_miles"),
                 }
             )
+            _add_location_phone_fields(item, provider, address_payload)
             items.append(item)
     if not items:
         return None
+    items = _sort_ptg2_manifest_provider_items(
+        items,
+        args,
+        location_filter_requested=location_filter_requested and expand_providers,
+    )
     return _shape_ptg2_manifest_response(
         {
             "items": items,
@@ -2187,6 +2340,7 @@ def _compact_item_from_row(data: dict[str, Any], args: dict[str, Any]) -> dict[s
     classifications = _coerce_json_payload(data.get("classifications"), [])
     primary_specialty = data.get("primary_specialty") or (specialties[0] if specialties else None)
     primary_specialization = data.get("primary_specialization") or (specializations[0] if specializations else None)
+    address_payload = _coerce_json_payload(data.get("address_payload"), {})
     item = {
         "npi": data.get("npi") or args.get("npi"),
         "provider_ordinal": data.get("provider_ordinal") or data.get("npi") or provider_set_hash,
@@ -2197,7 +2351,7 @@ def _compact_item_from_row(data: dict[str, Any], args: dict[str, Any]) -> dict[s
         "location_hash": data.get("location_hash"),
         "location_source": data.get("location_source"),
         "location_confidence_code": data.get("location_confidence_code"),
-        "address": _coerce_json_payload(data.get("address_payload"), {}),
+        "address": address_payload,
         "taxonomy_codes": _coerce_json_payload(data.get("taxonomy_codes"), []),
         "specialties": specialties,
         "primary_specialty": primary_specialty,
@@ -2234,6 +2388,7 @@ def _compact_item_from_row(data: dict[str, Any], args: dict[str, Any]) -> dict[s
         item["anchor_zip5"] = data.get("anchor_zip5")
     if data.get("zip_radius_miles") is not None:
         item["zip_radius_miles"] = data.get("zip_radius_miles")
+    _add_location_phone_fields(item, data, address_payload)
     return {key: value for key, value in item.items() if value is not None}
 
 

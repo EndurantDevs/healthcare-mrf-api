@@ -7139,6 +7139,9 @@ async def list_providers_by_procedure(request):
                     ptg_latitude = zip_latitude
                     ptg_longitude = zip_longitude
                     ptg_radius_miles = zip_radius_miles
+        ptg_order = order
+        if args.get("order") in (None, "", "null"):
+            ptg_order = "asc"
         ptg2_payload = await search_current_ptg2_index(
             session,
             {
@@ -7155,10 +7158,13 @@ async def list_providers_by_procedure(request):
                 "classification": args.get("classification") or None,
                 "taxonomy_codes": args.get("taxonomy_codes") or args.get("taxonomy_code") or None,
                 "include_subspecialties": args.get("include_subspecialties") or None,
+                "primary_only": args.get("primary_only") or None,
                 "taxonomy_code": args.get("taxonomy_code") or None,
                 "taxonomy_classification": args.get("taxonomy_classification") or None,
                 "taxonomy_specialization": args.get("taxonomy_specialization") or None,
                 "taxonomy_section": args.get("taxonomy_section") or None,
+                "order_by": order_by or None,
+                "order": ptg_order or None,
                 "state": state or None,
                 "city": city or None,
                 "zip5": zip5 or None,
