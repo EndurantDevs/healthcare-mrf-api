@@ -1593,7 +1593,19 @@ async def _ptg2_manifest_location_provider_matches(
             if not matches:
                 filled_rows.append(row)
                 continue
-            best = sorted(matches, key=lambda candidate: _fallback_rank(candidate, row))[0]
+            same_npi_matches = [candidate for candidate in matches if candidate.get("npi") == row.get("npi")]
+            if same_npi_matches:
+                best = sorted(same_npi_matches, key=lambda candidate: _fallback_rank(candidate, row))[0]
+            else:
+                distinct_phones = {
+                    str(candidate.get("telephone_number") or "").strip()
+                    for candidate in matches
+                    if str(candidate.get("telephone_number") or "").strip()
+                }
+                if len(distinct_phones) != 1:
+                    filled_rows.append(row)
+                    continue
+                best = sorted(matches, key=lambda candidate: _fallback_rank(candidate, row))[0]
             row = dict(row)
             row["telephone_number"] = best.get("telephone_number")
             row["fax_number"] = row.get("fax_number") or best.get("fax_number")
