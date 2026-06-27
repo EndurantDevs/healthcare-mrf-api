@@ -124,6 +124,10 @@ def test_source_urls_are_loaded_from_registry_file():
         config["platform_resolvers"]["aetna_health1"]["tenant_overrides"]["MERITAIN_I"]
         == "aetnacvs"
     )
+    assert (
+        config["platform_resolvers"]["ebms_caa_directory"]["type"]
+        == "ebms_caa_directory"
+    )
 
 
 def test_classify_hosting_platform_recognizes_public_adapter_pages():
@@ -158,6 +162,12 @@ def test_classify_hosting_platform_recognizes_public_adapter_pages():
     assert (
         discovery.classify_hosting_platform(
             "https://www.novahealthcare.com/resources/mrf.html"
+        )
+        == "html_delegated_mrf_links"
+    )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://www.hnas.com/digital-resources/machine-readable-files"
         )
         == "html_delegated_mrf_links"
     )
@@ -232,6 +242,40 @@ def test_classify_hosting_platform_recognizes_public_adapter_pages():
     assert (
         discovery.classify_hosting_platform(
             "https://www.modahealth.com/privacy-center/machine-readable-files.shtml"
+        )
+        == "html_mrf_links"
+    )
+    assert (
+        discovery.classify_hosting_platform("https://caa.ebms.com/")
+        == "ebms_caa_directory"
+    )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://boonchapman-mrf.zakipointhealth.com/"
+        )
+        == "html_mrf_links"
+    )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://talltreeadmin.com/machine-readable-files"
+        )
+        == "html_mrf_links"
+    )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://www.motivhealth.com/machinereadablefiles/"
+        )
+        == "html_mrf_links"
+    )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://www.cbabluevt.com/employer-resources/"
+        )
+        == "html_mrf_links"
+    )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://tuition.ebpabenefits.com/employers/machine-readable-file-links"
         )
         == "html_mrf_links"
     )
@@ -492,7 +536,17 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
 |---|---|---|---|
 | Select Health | regional | https://www.selecthealth.org/disclaimers/machine-readable-data | aliases: SelectHealth |
 | EMI Health | regional | https://emihealth.com/machinereadables | public machine-readable files page |
+| MotivHealth Insurance Company | regional | https://www.motivhealth.com/machinereadablefiles/ | aliases: MotivHealth |
+| CBA Blue | tpa | https://www.cbabluevt.com/employer-resources/ | aliases: CBA BLUE |
+| EBMS | tpa | https://caa.ebms.com/ | aliases: Employee Benefit Management Services |
+| EBPA | tpa | https://tuition.ebpabenefits.com/employers/machine-readable-file-links | aliases: EBPA Benefits |
+| HealthNow Administrative Services | tpa | https://www.hnas.com/digital-resources/machine-readable-files | aliases: HNAS |
+| Boon-Chapman | tpa | https://boonchapman-mrf.zakipointhealth.com/ | aliases: Boon Chapman |
+| Tall Tree Administrators | tpa | https://talltreeadmin.com/machine-readable-files | aliases: Tall Tree |
 | Carefactor | tpa | https://mrf.healthcarebluebook.com/Carefactor | aliases: CareFactor |
+| Point C | tpa | https://mrf.healthcarebluebook.com/pointc | aliases: Point C Health |
+| Unified Group Services | tpa | https://mrf.healthcarebluebook.com/unified | aliases: UGS |
+| WellNet | tpa | https://mrf.healthcarebluebook.com/Wellnet | aliases: WellNet Healthcare |
 """
 
     candidates = discovery.parse_master_list(markdown)
@@ -501,8 +555,100 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
     assert by_name["Select Health"].hosting_platform == "html_mrf_links"
     assert by_name["Select Health"].aliases == ("SelectHealth",)
     assert by_name["EMI Health"].hosting_platform == "html_mrf_links"
+    assert by_name["MotivHealth Insurance Company"].hosting_platform == "html_mrf_links"
+    assert by_name["CBA Blue"].hosting_platform == "html_mrf_links"
+    assert by_name["EBMS"].hosting_platform == "ebms_caa_directory"
+    assert by_name["EBPA"].hosting_platform == "html_mrf_links"
+    assert (
+        by_name["HealthNow Administrative Services"].hosting_platform
+        == "html_delegated_mrf_links"
+    )
+    assert by_name["Boon-Chapman"].hosting_platform == "html_mrf_links"
+    assert by_name["Tall Tree Administrators"].hosting_platform == "html_mrf_links"
     assert by_name["Carefactor"].hosting_platform == "healthcarebluebook_mrf"
     assert by_name["Carefactor"].aliases == ("CareFactor",)
+    assert by_name["Point C"].hosting_platform == "healthcarebluebook_mrf"
+    assert (
+        by_name["Unified Group Services"].hosting_platform == "healthcarebluebook_mrf"
+    )
+    assert by_name["WellNet"].hosting_platform == "healthcarebluebook_mrf"
+
+
+@pytest.mark.asyncio
+async def test_master_list_keeps_high_value_public_aliases():
+    candidates = await discovery._load_candidates(
+        "master-list", test_mode=True, limit=2000
+    )
+    by_name = {candidate.payer_name: candidate for candidate in candidates}
+
+    assert "Wellmark Blue Cross and Blue Shield" in by_name["Wellmark"].aliases
+    assert "Meritain Health An Aetna Company" in by_name["Meritain Health"].aliases
+    assert (
+        "MERITAIN HEALTH NORTH AMERICAN HEALTH PLAN"
+        in by_name["Meritain Health"].aliases
+    )
+    assert "United Healthcare Dental" in by_name["United Healthcare"].aliases
+    assert "UHC Vision" in by_name["United Healthcare"].aliases
+    assert "Employee Benefit Management Services EBMS" in by_name["EBMS"].aliases
+
+
+@pytest.mark.asyncio
+async def test_resolve_ebms_caa_directory_discovers_client_tocs(monkeypatch):
+    pages = {
+        "https://caa.ebms.com/": """
+            <html><body>
+            <a href="Example Public Group/index.html">Example Public Group</a>
+            <a href="Example Nested Group/index.html">Example Nested Group</a>
+            </body></html>
+        """,
+        "https://caa.ebms.com/Example Public Group/index.html": """
+            <html><body>
+            <a href=" 2026-06-01_EBMS_index.json" download>
+                2026-06-01_EBMS_index.json
+            </a>
+            </body></html>
+        """,
+        "https://caa.ebms.com/Example Nested Group/index.html": """
+            <html><body>
+            <a href="Plan A/index.html">Plan A</a>
+            </body></html>
+        """,
+        "https://caa.ebms.com/Example Nested Group/Plan A/index.html": """
+            <html><body>
+            <a href="2026-06-01_EBMS_index.json">2026-06-01_EBMS_index.json</a>
+            </body></html>
+        """,
+    }
+
+    async def fake_fetch_text(url, *, max_bytes, session=None):
+        return pages[url]
+
+    monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
+
+    targets = await discovery._resolve_ebms_caa_directory(
+        {"source_id": "source_1", "display_name": "EBMS"},
+        "https://caa.ebms.com/",
+        {
+            "type": "ebms_caa_directory",
+            "max_clients": 10,
+            "max_nested_pages_per_client": 5,
+            "max_targets": 10,
+        },
+        session=None,
+    )
+
+    assert [target.url for target in targets] == [
+        "https://caa.ebms.com/Example Public Group/2026-06-01_EBMS_index.json",
+        "https://caa.ebms.com/Example Nested Group/Plan A/2026-06-01_EBMS_index.json",
+    ]
+    assert all(
+        target.metadata["resolver"] == "ebms_caa_directory" for target in targets
+    )
+    assert targets[0].metadata["ebms_client_label"] == "Example Public Group"
+    assert (
+        targets[1].metadata["ebms_nested_url"]
+        == "https://caa.ebms.com/Example Nested Group/Plan A/index.html"
+    )
 
 
 def test_crawl_target_context_metadata_carries_benefit_lines_from_source():

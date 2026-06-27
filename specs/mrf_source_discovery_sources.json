@@ -226,6 +226,15 @@
       "type": "healthcarebluebook_mrf",
       "max_bytes": 10485760
     },
+    "ebms_caa_directory": {
+      "type": "ebms_caa_directory",
+      "max_bytes": 5242880,
+      "client_page_max_bytes": 5242880,
+      "nested_page_max_bytes": 5242880,
+      "max_clients": 500,
+      "max_nested_pages_per_client": 20,
+      "max_targets": 5000
+    },
     "html_mrf_with_healthcarebluebook": {
       "type": "html_mrf_with_healthcarebluebook",
       "max_bytes": 10485760

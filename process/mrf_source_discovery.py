@@ -543,6 +543,8 @@ def classify_hosting_platform(url: str | None) -> str | None:
         return "meritain_mrf_search"
     if host == "mrf.healthcarebluebook.com":
         return "healthcarebluebook_mrf"
+    if host == "caa.ebms.com":
+        return "ebms_caa_directory"
     if host.endswith("sapphiremrfhub.com"):
         return "sapphire"
     if host == "mrf.healthgram.com":
@@ -620,6 +622,7 @@ def classify_hosting_platform(url: str | None) -> str | None:
             host in {"www.novahealthcare.com", "novahealthcare.com"}
             and path.startswith("/resources/mrf")
         )
+        or (host in {"www.hnas.com", "hnas.com"} and "machine-readable-files" in path)
         or host == "transparency.abadmin.com"
     ):
         return "html_delegated_mrf_links"
@@ -666,6 +669,30 @@ def classify_hosting_platform(url: str | None) -> str | None:
         return "html_mrf_links"
     if host in {"www.emihealth.com", "emihealth.com"} and path.startswith(
         "/machinereadables"
+    ):
+        return "html_mrf_links"
+    if host == "boonchapman-mrf.zakipointhealth.com":
+        return "html_mrf_links"
+    if (
+        host in {"www.boonchapman.com", "boonchapman.com"}
+        and "machine-readable-files" in path
+    ):
+        return "html_mrf_links"
+    if (
+        host in {"www.talltreeadmin.com", "talltreeadmin.com"}
+        and "machine-readable-files" in path
+    ):
+        return "html_mrf_links"
+    if (
+        host in {"www.motivhealth.com", "motivhealth.com"}
+        and "machinereadablefiles" in path
+    ):
+        return "html_mrf_links"
+    if host in {"www.cbabluevt.com", "cbabluevt.com"} and "employer-resources" in path:
+        return "html_mrf_links"
+    if (
+        host in {"tuition.ebpabenefits.com", "www.ebpabenefits.com", "ebpabenefits.com"}
+        and "machine-readable-file" in path
     ):
         return "html_mrf_links"
     if (
@@ -3591,6 +3618,137 @@ async def _resolve_html_mrf_links(
     return targets
 
 
+def _ebms_index_page_urls(html_text: str, *, base_url: str) -> list[tuple[str, str]]:
+    urls: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    base_host = urlsplit(base_url).netloc.lower()
+    base_key = _canonical_or_none(base_url) or base_url
+    for candidate in _html_link_candidates(html_text, base_url=base_url):
+        url = str(candidate.get("url") or "")
+        parsed = urlsplit(url)
+        if parsed.netloc.lower() != base_host:
+            continue
+        if not parsed.path.lower().endswith("/index.html"):
+            continue
+        key = _canonical_or_none(url) or url
+        if key == base_key or key in seen:
+            continue
+        seen.add(key)
+        urls.append((url, _clean_text(candidate.get("label"))))
+    return urls
+
+
+async def _resolve_ebms_caa_directory(
+    source: dict[str, Any],
+    url: str,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    root_html = await _fetch_text(
+        url,
+        max_bytes=int(resolver.get("max_bytes") or 5 * 1024 * 1024),
+        session=session,
+    )
+    targets: list[CrawlTarget] = []
+    target_max_bytes = _parse_size_bytes(resolver.get("toc_max_bytes"))
+    max_targets = _as_int(resolver.get("max_targets")) or 5000
+    max_clients = _as_int(resolver.get("max_clients")) or 500
+    max_nested = _as_int(resolver.get("max_nested_pages_per_client")) or 20
+    client_page_max_bytes = int(
+        resolver.get("client_page_max_bytes")
+        or resolver.get("max_bytes")
+        or 5 * 1024 * 1024
+    )
+    nested_page_max_bytes = int(
+        resolver.get("nested_page_max_bytes")
+        or resolver.get("client_page_max_bytes")
+        or resolver.get("max_bytes")
+        or 5 * 1024 * 1024
+    )
+
+    async def page_targets(
+        page_url: str, *, client_url: str, client_label: str, nested_url: str | None
+    ) -> list[CrawlTarget]:
+        page_html = await _fetch_text(
+            page_url,
+            max_bytes=nested_page_max_bytes if nested_url else client_page_max_bytes,
+            session=session,
+        )
+        page_targets = _crawl_targets_from_html_mrf_links(
+            source,
+            page_html,
+            base_url=page_url,
+            resolver="ebms_caa_directory",
+            target_max_bytes=target_max_bytes,
+        )
+        enriched: list[CrawlTarget] = []
+        for target in page_targets:
+            metadata = {
+                **dict(target.metadata or {}),
+                "resolver": "ebms_caa_directory",
+                "ebms_client_url": client_url,
+            }
+            if client_label:
+                metadata["ebms_client_label"] = client_label
+            if nested_url:
+                metadata["ebms_nested_url"] = nested_url
+            enriched.append(
+                CrawlTarget(
+                    source=source,
+                    url=target.url,
+                    label=target.label,
+                    resolved_from_url=page_url,
+                    metadata=metadata,
+                )
+            )
+        return enriched
+
+    for client_url, client_label in _ebms_index_page_urls(root_html, base_url=url)[
+        :max_clients
+    ]:
+        try:
+            client_targets = await page_targets(
+                client_url,
+                client_url=client_url,
+                client_label=client_label,
+                nested_url=None,
+            )
+        except Exception:  # pylint: disable=broad-exception-caught
+            continue
+        targets.extend(client_targets)
+        if not client_targets:
+            try:
+                client_html = await _fetch_text(
+                    client_url, max_bytes=client_page_max_bytes, session=session
+                )
+            except Exception:  # pylint: disable=broad-exception-caught
+                client_html = ""
+            for nested_url, _nested_label in _ebms_index_page_urls(
+                client_html, base_url=client_url
+            )[:max_nested]:
+                try:
+                    targets.extend(
+                        await page_targets(
+                            nested_url,
+                            client_url=client_url,
+                            client_label=client_label,
+                            nested_url=nested_url,
+                        )
+                    )
+                except Exception:  # pylint: disable=broad-exception-caught
+                    continue
+                if len(targets) >= max_targets:
+                    break
+        if len(targets) >= max_targets:
+            break
+    targets = _dedupe_crawl_targets_by_url(targets)
+    if max_targets and max_targets > 0:
+        targets = targets[:max_targets]
+    if not targets:
+        raise ValueError(f"no EBMS CAA directory MRF links found for {url}")
+    return targets
+
+
 def _html_mrf_directory_urls(html_text: str, *, base_url: str) -> list[str]:
     urls: list[str] = []
     seen: set[str] = set()
@@ -6437,6 +6595,8 @@ async def _crawl_targets_for_source(
         return await _resolve_meritain_mrf_search(source, url, resolver, session)
     if resolver_type == "healthcarebluebook_mrf":
         return await _resolve_healthcarebluebook_mrf(source, url, resolver, session)
+    if resolver_type == "ebms_caa_directory":
+        return await _resolve_ebms_caa_directory(source, url, resolver, session)
     if resolver_type == "html_mrf_with_healthcarebluebook":
         return await _resolve_html_mrf_with_healthcarebluebook(
             source, url, resolver, session
