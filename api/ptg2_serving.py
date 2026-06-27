@@ -1071,6 +1071,116 @@ def _sort_ptg2_manifest_provider_items(
     return items
 
 
+def _ptg2_provider_rate_group_key(item: dict[str, Any]) -> tuple[str, str, str, str] | None:
+    npi = item.get("npi")
+    if npi in (None, ""):
+        return None
+    address_payload = _coerce_json_payload(item.get("address"), {})
+    if not isinstance(address_payload, dict):
+        address_payload = {}
+    location_key = (
+        item.get("location_hash")
+        or address_payload.get("address_key")
+        or address_payload.get("premise_key")
+    )
+    if not location_key:
+        location_key = "|".join(
+            str(
+                address_payload.get(key)
+                or item.get(key)
+                or ""
+            ).strip().upper()
+            for key in ("first_line", "second_line", "city", "state", "zip5")
+        )
+    reported_system = (
+        item.get("reported_code_system")
+        or item.get("service_code_system")
+        or item.get("billing_code_type")
+        or ""
+    )
+    reported_code = (
+        item.get("reported_code")
+        or item.get("service_code")
+        or item.get("billing_code")
+        or ""
+    )
+    return str(npi), str(location_key), str(reported_system), str(reported_code)
+
+
+def _append_unique_value(values: list[Any], value: Any) -> None:
+    if value in (None, ""):
+        return
+    if value not in values:
+        values.append(value)
+
+
+def _merge_unique_payload_list(target: dict[str, Any], field: str, value: Any) -> None:
+    payload = _coerce_json_payload(value, [])
+    if payload in (None, ""):
+        return
+    if not isinstance(payload, list):
+        payload = [payload]
+    target_values = target.setdefault(field, [])
+    if not isinstance(target_values, list):
+        target_values = [target_values]
+        target[field] = target_values
+    seen = {_price_row_key(item) if isinstance(item, dict) else str(item) for item in target_values}
+    for item in payload:
+        if item in (None, ""):
+            continue
+        key = _price_row_key(item) if isinstance(item, dict) else str(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        target_values.append(item)
+
+
+def _merge_ptg2_provider_rate_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse duplicate provider/location rows while preserving every rate option."""
+    merged: list[dict[str, Any]] = []
+    grouped: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    for item in items:
+        group_key = _ptg2_provider_rate_group_key(item)
+        if group_key is None:
+            merged.append(item)
+            continue
+        existing = grouped.get(group_key)
+        if existing is None:
+            existing = dict(item)
+            existing["prices"] = _normalize_price_payload(existing.get("prices"))
+            existing["tic_prices"] = list(existing["prices"])
+            existing["price_summary"] = _price_response_fields(existing["prices"])["price_summary"]
+            existing.setdefault("price_set_hashes", [])
+            existing.setdefault("rate_pack_hashes", [])
+            existing.setdefault("provider_set_hashes", [])
+            _append_unique_value(existing["price_set_hashes"], item.get("price_set_hash"))
+            _append_unique_value(existing["rate_pack_hashes"], item.get("rate_pack_hash"))
+            _append_unique_value(existing["provider_set_hashes"], item.get("provider_set_hash"))
+            _merge_unique_payload_list(existing, "price_set_hashes", item.get("price_set_hashes"))
+            _merge_unique_payload_list(existing, "rate_pack_hashes", item.get("rate_pack_hashes"))
+            _merge_unique_payload_list(existing, "provider_set_hashes", item.get("provider_set_hashes"))
+            grouped[group_key] = existing
+            merged.append(existing)
+            continue
+
+        combined_prices = (
+            _normalize_price_payload(existing.get("prices"))
+            + _normalize_price_payload(item.get("prices"))
+        )
+        price_fields = _price_response_fields(combined_prices)
+        existing.update(price_fields)
+        _append_unique_value(existing.setdefault("price_set_hashes", []), item.get("price_set_hash"))
+        _append_unique_value(existing.setdefault("rate_pack_hashes", []), item.get("rate_pack_hash"))
+        _append_unique_value(existing.setdefault("provider_set_hashes", []), item.get("provider_set_hash"))
+        _merge_unique_payload_list(existing, "price_set_hashes", item.get("price_set_hashes"))
+        _merge_unique_payload_list(existing, "rate_pack_hashes", item.get("rate_pack_hashes"))
+        _merge_unique_payload_list(existing, "provider_set_hashes", item.get("provider_set_hashes"))
+        _merge_unique_payload_list(existing, "source_trace", item.get("source_trace"))
+        existing["price_set_count"] = len(existing.get("price_set_hashes") or [])
+        existing["rate_pack_count"] = len(existing.get("rate_pack_hashes") or [])
+    return merged
+
+
 async def _ptg2_manifest_filter_npis_by_provider_taxonomy(
     session,
     args: dict[str, Any],
@@ -1289,6 +1399,7 @@ async def _ptg2_manifest_location_provider_matches(
     # internally consistent instead of mixing one source's street with another's
     # city. Only applies when the unified table is the primary source.
     if using_unified_address_table:
+        premise_key_select_sql = "addr.premise_key,"
         address_fallback_cte = f"""
             , fallback_addresses AS MATERIALIZED (
                 SELECT DISTINCT ON (na.npi)
@@ -1307,6 +1418,30 @@ async def _ptg2_manifest_location_provider_matches(
             LEFT JOIN fallback_addresses na
               ON na.npi = addr.npi
              AND NULLIF(BTRIM(addr.first_line), '') IS NULL"""
+        phone_fallback_cte = f"""
+            , phone_fallbacks AS MATERIALIZED (
+                SELECT DISTINCT ON (loc.npi, loc.address_key)
+                       loc.npi,
+                       loc.address_key,
+                       src.telephone_number,
+                       src.fax_number
+                  FROM location_npis loc
+                  JOIN {npi_address_table} src
+                    ON src.address_key IS NOT DISTINCT FROM loc.address_key
+                    OR (loc.premise_key IS NOT NULL AND src.premise_key = loc.premise_key)
+                 WHERE NULLIF(BTRIM(src.telephone_number), '') IS NOT NULL
+                 ORDER BY loc.npi,
+                          loc.address_key,
+                          (src.npi = loc.npi) DESC,
+                          (src.address_key IS NOT DISTINCT FROM loc.address_key) DESC,
+                          CASE src.type WHEN 'primary' THEN 0 WHEN 'practice' THEN 1
+                                       WHEN 'secondary' THEN 2 ELSE 3 END,
+                          src.checksum
+            )"""
+        phone_fallback_join = """
+            LEFT JOIN phone_fallbacks pf
+              ON pf.npi = addr.npi
+             AND pf.address_key IS NOT DISTINCT FROM addr.address_key"""
 
         def _eff(column: str) -> str:
             cast_suffix = "::numeric" if column in {"lat", "long"} else ""
@@ -1314,11 +1449,20 @@ async def _ptg2_manifest_location_provider_matches(
                 "CASE WHEN NULLIF(BTRIM(addr.first_line), '') IS NULL "
                 f"AND na.first_line IS NOT NULL THEN na.{column}{cast_suffix} ELSE addr.{column}{cast_suffix} END"
             )
+
+        def _phone_eff(column: str) -> str:
+            return f"COALESCE(NULLIF(BTRIM({_eff(column)}), ''), pf.{column})"
     else:
+        premise_key_select_sql = "NULL::uuid AS premise_key,"
         address_fallback_cte = ""
         address_fallback_join = ""
+        phone_fallback_cte = ""
+        phone_fallback_join = ""
 
         def _eff(column: str) -> str:
+            return f"addr.{column}"
+
+        def _phone_eff(column: str) -> str:
             return f"addr.{column}"
 
     async def _query_location_provider_rows(address_types: tuple[str, ...]) -> list[dict[str, Any]]:
@@ -1337,6 +1481,7 @@ async def _ptg2_manifest_location_provider_matches(
                     addr.postal_code,
                     addr.country_code,
                     addr.address_key,
+                    {premise_key_select_sql}
                     addr.lat,
                     addr.long,
                     addr.first_line,
@@ -1363,6 +1508,7 @@ async def _ptg2_manifest_location_provider_matches(
                 LIMIT :limit
             )
             {address_fallback_cte}
+            {phone_fallback_cte}
             SELECT DISTINCT ON (pgm.provider_group_global_id_128, addr.npi)
                 pgm.provider_group_global_id_128,
                 addr.npi,
@@ -1383,14 +1529,14 @@ async def _ptg2_manifest_location_provider_matches(
                     'state', {_eff('state_name')},
                     'postal_code', {_eff('postal_code')},
                     'country_code', {_eff('country_code')},
-                    'telephone_number', {_eff('telephone_number')},
-                    'fax_number', {_eff('fax_number')},
+                    'telephone_number', {_phone_eff('telephone_number')},
+                    'fax_number', {_phone_eff('fax_number')},
                     'address_key', addr.address_key::text,
                     'lat', {_eff('lat')},
                     'long', {_eff('long')}
                 )::text AS address_payload,
-                {_eff('telephone_number')} AS telephone_number,
-                {_eff('fax_number')} AS fax_number,
+                {_phone_eff('telephone_number')} AS telephone_number,
+                {_phone_eff('fax_number')} AS fax_number,
                 COALESCE(tax.taxonomy_codes, ARRAY[]::varchar[]) AS taxonomy_codes,
                 COALESCE(tax.specialties, ARRAY[]::varchar[]) AS specialties,
                 COALESCE(tax.classifications, ARRAY[]::varchar[]) AS classifications,
@@ -1402,6 +1548,7 @@ async def _ptg2_manifest_location_provider_matches(
             JOIN {provider_group_member_table} pgm ON pgm.npi = addr.npi
             {provider_join}
             {address_fallback_join}
+            {phone_fallback_join}
             {_provider_taxonomy_summary_lateral_sql("addr.npi")}
             ORDER BY pgm.provider_group_global_id_128,
                 addr.npi,
@@ -1738,6 +1885,7 @@ async def _search_ptg2_manifest_db_serving_table(
         "reported_code": requested_code,
         "limit": int(pagination.limit),
         "rate_candidate_limit": rate_candidate_limit,
+        "rate_candidate_offset": 0 if expand_providers else int(pagination.offset),
         "offset": int(pagination.offset),
     }
     if requested_system:
@@ -1836,7 +1984,7 @@ async def _search_ptg2_manifest_db_serving_table(
             FROM {table_name}
             WHERE {where_sql}
             ORDER BY provider_count DESC NULLS LAST, serving_content_hash_128
-            LIMIT :rate_candidate_limit OFFSET :offset
+            LIMIT :rate_candidate_limit OFFSET :rate_candidate_offset
             """
         ),
         params,
@@ -1868,7 +2016,7 @@ async def _search_ptg2_manifest_db_serving_table(
             providers_by_set = provider_rows_by_set
     procedure_details = await _ptg2_manifest_procedure_details_for_rows(session, row_data)
     for data in row_data:
-        if len(items) >= int(pagination.limit):
+        if not expand_providers and len(items) >= int(pagination.limit):
             break
         reported_code = data.get("reported_code")
         reported_system = data.get("reported_code_system")
@@ -1903,10 +2051,7 @@ async def _search_ptg2_manifest_db_serving_table(
         if not expand_providers:
             items.append(base_item)
             continue
-        remaining = max(int(pagination.limit) - len(items), 0)
-        if remaining <= 0:
-            break
-        for provider in providers_by_set.get(_ptg2_manifest_id(data.get("provider_set_global_id_128")), [])[:remaining]:
+        for provider in providers_by_set.get(_ptg2_manifest_id(data.get("provider_set_global_id_128")), []):
             item = dict(base_item)
             address_payload = _coerce_json_payload(provider.get("address_payload"), {})
             item.update(
@@ -1940,16 +2085,29 @@ async def _search_ptg2_manifest_db_serving_table(
             items.append(item)
     if not items:
         return None
+    if expand_providers:
+        items = _merge_ptg2_provider_rate_items(items)
     items = _sort_ptg2_manifest_provider_items(
         items,
         args,
         location_filter_requested=location_filter_requested and expand_providers,
     )
+    total_items = len(items)
+    if expand_providers:
+        start = max(int(pagination.offset), 0)
+        end = start + max(int(pagination.limit), 0)
+        items = items[start:end]
     return _shape_ptg2_manifest_response(
         {
             "items": items,
             "pagination": {
-                "total": total if total is not None else int(pagination.offset) + len(items),
+                "total": (
+                    total_items
+                    if expand_providers
+                    else total
+                    if total is not None
+                    else int(pagination.offset) + len(items)
+                ),
                 "limit": pagination.limit,
                 "offset": pagination.offset,
                 "page": (pagination.offset // pagination.limit) + 1 if pagination.limit else 1,
@@ -2536,7 +2694,8 @@ async def _search_compact_serving_table(
     if has_provider_filter:
         if not final_order_sql:
             final_order_sql = "ORDER BY r.reported_code_system, r.reported_code, r.provider_count DESC NULLS LAST"
-        final_pagination_sql = "LIMIT :limit OFFSET :offset"
+        if not expand_providers:
+            final_pagination_sql = "LIMIT :limit OFFSET :offset"
     row_stmt = text(
         f"""
         WITH rate_candidates AS MATERIALIZED (
@@ -2593,11 +2752,23 @@ async def _search_compact_serving_table(
     if not rows:
         return None
     items = [_compact_item_from_row(row, args) for row in rows]
+    total_items = int(pagination.offset) + len(items)
+    if expand_providers:
+        items = _merge_ptg2_provider_rate_items(items)
+        items = _sort_ptg2_manifest_provider_items(
+            items,
+            args,
+            location_filter_requested=has_geo_filter,
+        )
+        total_items = len(items)
+        start = max(int(pagination.offset), 0)
+        end = start + max(int(pagination.limit), 0)
+        items = items[start:end]
     return _shape_ptg2_response(
         {
             "items": items,
             "pagination": {
-                "total": int(pagination.offset) + len(items),
+                "total": total_items,
                 "limit": pagination.limit,
                 "offset": pagination.offset,
                 "page": (pagination.offset // pagination.limit) + 1 if pagination.limit else 1,

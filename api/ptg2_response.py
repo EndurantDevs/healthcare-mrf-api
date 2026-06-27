@@ -23,10 +23,12 @@ PTG2_ITEM_DIAGNOSTIC_FIELDS = {
     "location_confidence_code",
     "location_hash",
     "price_set_hash",
+    "price_set_hashes",
     "provider_ordinal",
     "provider_set_hash",
     "provider_set_hashes",
     "rate_pack_hash",
+    "rate_pack_hashes",
 }
 PTG2_QUERY_SOURCE_FIELDS = {
     "source",

@@ -1702,6 +1702,57 @@ def test_sort_ptg2_manifest_provider_items_supports_cost_and_distance():
     assert [item["provider_name"] for item in by_distance] == ["Near expensive", "Far cheap"]
 
 
+def test_merge_ptg2_provider_rate_items_preserves_same_provider_location_rates():
+    items = [
+        {
+            "provider_name": "David Clayton Tapscott",
+            "npi": "1255711370",
+            "reported_code_system": "CPT",
+            "reported_code": "29888",
+            "location_hash": "loc-1",
+            "address": {"address_key": "loc-1", "first_line": "101 E 9th St"},
+            "price_set_hash": "price-a",
+            "rate_pack_hash": "rate-a",
+            "provider_set_hash": "provider-a",
+            "prices": [
+                {
+                    "negotiated_type": "negotiated",
+                    "negotiated_rate": 1074.22,
+                    "billing_class": "professional",
+                    "setting": "outpatient",
+                }
+            ],
+        },
+        {
+            "provider_name": "David Clayton Tapscott",
+            "npi": "1255711370",
+            "reported_code_system": "CPT",
+            "reported_code": "29888",
+            "location_hash": "loc-1",
+            "address": {"address_key": "loc-1", "first_line": "101 E 9th St"},
+            "price_set_hash": "price-b",
+            "rate_pack_hash": "rate-b",
+            "provider_set_hash": "provider-b",
+            "prices": [
+                {
+                    "negotiated_type": "negotiated",
+                    "negotiated_rate": 3193.10,
+                    "billing_class": "professional",
+                    "setting": "outpatient",
+                }
+            ],
+        },
+    ]
+
+    merged = ptg2_serving._merge_ptg2_provider_rate_items(items)
+
+    assert len(merged) == 1
+    assert [summary["rate"] for summary in merged[0]["price_summary"]] == [1074.22, 3193.10]
+    assert merged[0]["price_set_hashes"] == ["price-a", "price-b"]
+    assert merged[0]["rate_pack_hashes"] == ["rate-a", "rate-b"]
+    assert merged[0]["rate_pack_count"] == 2
+
+
 def test_compact_item_promotes_location_phone_from_address_payload():
     item = ptg2_serving._compact_item_from_row(
         {
@@ -2321,7 +2372,9 @@ async def test_compact_serving_geo_provider_filter_paginates_after_provider_matc
     assert "LIMIT :rate_candidate_limit" in sql
     assert "LIMIT :rate_candidate_limit OFFSET" not in sql
     assert "provider_filtered_rates AS MATERIALIZED" in sql
-    assert sql.rstrip().endswith("LIMIT :limit OFFSET :offset")
+    assert not sql.rstrip().endswith("LIMIT :limit OFFSET :offset")
+    assert payload["pagination"]["limit"] == 1
+    assert payload["pagination"]["total"] == 1
     assert "n_entity.entity_type_code" in sql
     assert params["limit"] == 1
     assert params["rate_candidate_limit"] > params["limit"]
