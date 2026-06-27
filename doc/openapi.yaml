@@ -3689,6 +3689,11 @@ paths:
           schema:
             type: string
           description: Comma-separated NUCC taxonomy codes resolved through terminology synonyms for claims results.
+        - name: primary_only
+          in: query
+          schema:
+            type: boolean
+          description: Restrict taxonomy filters to the NPI primary taxonomy when true.
         - name: taxonomy_classification
           in: query
           schema:

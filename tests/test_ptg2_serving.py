@@ -1552,7 +1552,7 @@ async def test_compact_serving_provider_expansion_fallback_projects_address_dist
     assert "addr.distance_miles, addr.zip_match_type, addr.anchor_zip5, addr.zip_radius_miles" in sql
     assert "CASE WHEN LEFT(COALESCE(addr.postal_code, ''), 5) = :zip5 THEN 0.0 ELSE" in sql
     assert "AS distance_miles" in sql
-    assert ":zip5 AS anchor_zip5, :geo_radius_miles AS zip_radius_miles" in sql
+    assert ":zip5 AS anchor_zip5, CAST(:geo_radius_miles AS double precision) AS zip_radius_miles" in sql
     assert "ORDER BY distance_miles ASC NULLS LAST, r.reported_code_system, r.reported_code" in sql
     assert "ORDER BY CASE WHEN LEFT(COALESCE(addr.postal_code, ''), 5) = :zip5 THEN 0 ELSE 1 END" in sql
     assert params["zip5"] == "62401"

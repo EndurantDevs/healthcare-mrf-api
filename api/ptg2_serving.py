@@ -2297,14 +2297,14 @@ def _compact_provider_expansion_sql(
             address_distance_select_sql = (
                 f"CASE WHEN {same_zip_sql} THEN 0.0 ELSE {address_distance_sql} END AS distance_miles, "
                 f"CASE WHEN {same_zip_sql} THEN 'same_zip' ELSE 'radius' END AS zip_match_type, "
-                ":zip5 AS anchor_zip5, :geo_radius_miles AS zip_radius_miles"
+                ":zip5 AS anchor_zip5, CAST(:geo_radius_miles AS double precision) AS zip_radius_miles"
             )
             zip_rank_sql = f"CASE WHEN {same_zip_sql} THEN 0 ELSE 1 END"
         else:
             address_distance_select_sql = (
                 f"{address_distance_sql} AS distance_miles, "
                 "'radius' AS zip_match_type, "
-                "NULL::varchar AS anchor_zip5, :geo_radius_miles AS zip_radius_miles"
+                "NULL::varchar AS anchor_zip5, CAST(:geo_radius_miles AS double precision) AS zip_radius_miles"
             )
             zip_rank_sql = "0"
         address_order_sql = f"""
@@ -2472,12 +2472,12 @@ async def _search_compact_serving_table(
                 provider_distance_select_sql = (
                     f"CASE WHEN {same_zip_sql} THEN 0.0 ELSE {loc_distance_sql} END AS distance_miles, "
                     f"CASE WHEN {same_zip_sql} THEN 'same_zip' ELSE 'radius' END AS zip_match_type, "
-                    ":zip5 AS anchor_zip5, :geo_radius_miles AS zip_radius_miles, "
+                    ":zip5 AS anchor_zip5, CAST(:geo_radius_miles AS double precision) AS zip_radius_miles, "
                 )
             else:
                 provider_distance_select_sql = (
                     f"{loc_distance_sql} AS distance_miles, "
-                    "'radius' AS zip_match_type, NULL::varchar AS anchor_zip5, :geo_radius_miles AS zip_radius_miles, "
+                    "'radius' AS zip_match_type, NULL::varchar AS anchor_zip5, CAST(:geo_radius_miles AS double precision) AS zip_radius_miles, "
                 )
             provider_distance_order_sql = "ORDER BY distance_miles ASC NULLS LAST, r.reported_code_system, r.reported_code"
         provider_select_sql = (
