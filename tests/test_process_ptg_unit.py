@@ -1545,6 +1545,90 @@ def test_ptg2_toc_jobs_normalize_asr_download_links(monkeypatch):
     assert any(row["url"] == expected_url and row["file_type"] == "in-network" for row in pushed_file_rows)
 
 
+def test_ptg2_toc_jobs_repair_ucare_json_and_allowed_amount_lists(
+    monkeypatch, tmp_path
+):
+    toc_path = tmp_path / "ucare_toc.json"
+    toc_path.write_text(
+        """
+        {
+          "reporting_entity_name": "UCare Minnesota",
+          "reporting_entity_type": "Health Insurance Issuer",
+          "version": "1.0.0",
+          "reporting_structure": [
+            {
+              "reporting_plans": [
+                {
+                  "plan_name": "UCare IFP",
+                  "plan_id_type": "hios",
+                  "plan_id": "85736MN023",
+                  "plan_market_type": "Individual"
+                }
+              ],
+              "in_network_files": [
+                {
+                  "description": "rates for UCare network",
+                  "location": "https://ucm-p-001.sitecorecontenthub.cloud/api/public/content/UCare_InNetwork.json?download=true"
+                }
+                {
+                  "description": "rates for dental network",
+                  "location": "https://ucm-p-001.sitecorecontenthub.cloud/api/public/content/Dental_InNetwork.json?download=true"
+                }
+              ],
+              "allowed_amount_file": [
+                {
+                  "description": "UCare allowed amounts",
+                  "location": "https://ucm-p-001.sitecorecontenthub.cloud/api/public/content/UCare_AllowedAmount.json?download=true"
+                },
+                {
+                  "description": "Fulcrum allowed amounts",
+                  "location": "https://ucm-p-001.sitecorecontenthub.cloud/api/public/content/Fulcrum_AllowedAmount.json?download=true"
+                }
+              ]
+            }
+          ]
+        }
+        """,
+        encoding="utf-8",
+    )
+    pushed_file_rows = []
+
+    async def fake_materialize(*_args, **_kwargs):
+        artifact = SimpleNamespace(logical_path=toc_path)
+        return artifact, artifact
+
+    async def fake_push_objects(rows, _cls, **_kwargs):
+        pushed_file_rows.extend(rows)
+
+    monkeypatch.setattr(process_ptg, "materialize_json_source", fake_materialize)
+    monkeypatch.setattr(process_ptg, "push_objects", fake_push_objects)
+    monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
+
+    jobs = asyncio.run(
+        process_ptg._process_table_of_contents(
+            "https://ucm-p-001.sitecorecontenthub.cloud/api/public/content/ucare_toc.json?download=true",
+            {"PTGFile": object, "ImportLog": object},
+            test_mode=False,
+        )
+    )
+
+    assert [job["type"] for job in jobs] == [
+        "in_network",
+        "in_network",
+        "allowed_amounts",
+        "allowed_amounts",
+    ]
+    assert jobs[1]["url"].endswith("/Dental_InNetwork.json?download=true")
+    assert jobs[3]["url"].endswith("/Fulcrum_AllowedAmount.json?download=true")
+    assert [row["file_type"] for row in pushed_file_rows] == [
+        "table-of-contents",
+        "in-network",
+        "in-network",
+        "allowed-amounts",
+        "allowed-amounts",
+    ]
+
+
 def test_ptg2_artifact_reuse_by_strong_etag_and_length(tmp_path):
     raw_path = tmp_path / "raw.json"
     raw_path.write_text('{"ok": true}', encoding="utf-8")

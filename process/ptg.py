@@ -9,6 +9,7 @@ import json
 import logging
 import multiprocessing
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -1799,7 +1800,7 @@ async def _process_table_of_contents(
             if raise_on_error:
                 raise RuntimeError(f"Failed to download table-of-contents from {toc_url}: {exc}") from exc
             return []
-        toc_content = load_json_artifact(logical_artifact.logical_path)
+        toc_content = _load_table_of_contents_artifact(logical_artifact.logical_path)
         if import_run_id:
             await _record_source_version(
                 source_type="table-of-contents",
@@ -1871,7 +1872,15 @@ async def _process_table_of_contents(
         if not plans:
             continue
         in_network_files = structure.get("in_network_files") or []
-        allowed_amount_file = structure.get("allowed_amount_file")
+        allowed_amount_value = structure.get("allowed_amount_file")
+        if isinstance(allowed_amount_value, list):
+            allowed_amount_files = [
+                item for item in allowed_amount_value if isinstance(item, dict)
+            ]
+        elif isinstance(allowed_amount_value, dict):
+            allowed_amount_files = [allowed_amount_value]
+        else:
+            allowed_amount_files = []
 
         for entry in in_network_files:
             location = entry.get("location")
@@ -1896,7 +1905,7 @@ async def _process_table_of_contents(
             if test_mode and len(jobs) >= TEST_TOC_JOBS:
                 break
 
-        if allowed_amount_file:
+        for allowed_amount_file in allowed_amount_files:
             location = allowed_amount_file.get("location")
             if location:
                 location = normalize_tic_source_url(location)
@@ -1924,6 +1933,38 @@ async def _process_table_of_contents(
         await push_objects(file_rows, file_cls, rewrite=True)
     await flush_error_log(import_log_cls)
     return jobs
+
+
+def _looks_tic_toc_json_text(text: str) -> bool:
+    normalized = str(text or "").lower()
+    return (
+        '"reporting_structure"' in normalized
+        and '"reporting_plans"' in normalized
+        and (
+            '"in_network_files"' in normalized
+            or '"allowed_amount_file"' in normalized
+            or '"allowed_amount_files"' in normalized
+        )
+    )
+
+
+def _repair_missing_array_object_commas(text: str) -> str:
+    return re.sub(r"}(\s*){", r"},\1{", text)
+
+
+def _load_table_of_contents_artifact(path: str | Path) -> dict[str, Any]:
+    try:
+        toc = load_json_artifact(path)
+    except json.JSONDecodeError:
+        with open_json_artifact_stream(path) as fp:
+            raw = fp.read()
+        text = raw.decode("utf-8", errors="replace")
+        if not _looks_tic_toc_json_text(text):
+            raise
+        toc = json.loads(_repair_missing_array_object_commas(text))
+    if not isinstance(toc, dict):
+        raise ValueError("expected table-of-contents JSON object")
+    return toc
 
 
 async def _process_in_network_file(

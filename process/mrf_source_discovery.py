@@ -856,6 +856,13 @@ def classify_hosting_platform(url: str | None) -> str | None:
         and "price-transparency" in path
     ):
         return "html_mrf_links"
+    if (
+        host in {"www.ucare.org", "ucare.org"}
+        and "transparency-in-coverage" in path
+    ):
+        return "html_mrf_links"
+    if host == "stmercycaremrf.z14.web.core.windows.net":
+        return "html_mrf_links"
     if host == "files.myplancentral.com" and path.startswith("/tic/toc"):
         return "html_mrf_links"
     if host in {"www.healthplan.org", "healthplan.org"} and (
@@ -1520,7 +1527,38 @@ async def _fetch_json_value(
     text = await _fetch_text(
         url, max_bytes=max_bytes, session=session, expect_json=True
     )
-    return json.loads(text)
+    return _loads_mrf_json_value(text)
+
+
+def _looks_tic_toc_json_text(text: str) -> bool:
+    normalized = str(text or "").lower()
+    return (
+        '"reporting_structure"' in normalized
+        and '"reporting_plans"' in normalized
+        and (
+            '"in_network_files"' in normalized
+            or '"allowed_amount_file"' in normalized
+            or '"allowed_amount_files"' in normalized
+        )
+    )
+
+
+def _repair_missing_array_object_commas(text: str) -> str:
+    # Some payer TOCs are published with adjacent objects in an array but no comma.
+    # Keep this intentionally narrow and only apply it to TiC TOC-looking payloads.
+    return re.sub(r"}(\s*){", r"},\1{", text)
+
+
+def _loads_mrf_json_value(text: str) -> Any:
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        if not _looks_tic_toc_json_text(text):
+            raise
+        repaired = _repair_missing_array_object_commas(text)
+        if repaired == text:
+            raise
+        return json.loads(repaired)
 
 
 def _json_values_from_zip_bytes(
@@ -3653,7 +3691,9 @@ def _auxiant_network_label(label: Any) -> str:
 def _auxiant_anchor_links(html_text: str, *, base_url: str) -> list[dict[str, str]]:
     links: list[dict[str, str]] = []
     for match in re.finditer(
-        r"<a\b(?P<attrs>[^>]*)>(?P<label>.*?)</a>", html_text or "", flags=re.I | re.S
+        r"<a\b(?P<attrs>[^>]*)>(?P<label>.*?)</a\s*>",
+        html_text or "",
+        flags=re.I | re.S,
     ):
         href_match = re.search(
             r"""href\s*=\s*(?P<quote>["'])(?P<value>.*?)(?P=quote)""",
@@ -6063,7 +6103,9 @@ def _strip_html_tags(value: str) -> str:
 def _html_link_candidates(html_text: str, *, base_url: str) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     for match in re.finditer(
-        r"<a\b(?P<attrs>[^>]*)>(?P<label>.*?)</a>", html_text or "", flags=re.I | re.S
+        r"<a\b(?P<attrs>[^>]*)>(?P<label>.*?)</a\s*>",
+        html_text or "",
+        flags=re.I | re.S,
     ):
         attrs = match.group("attrs") or ""
         label = _strip_html_tags(match.group("label") or "")

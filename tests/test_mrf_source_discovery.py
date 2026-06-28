@@ -662,6 +662,24 @@ def test_classify_hosting_platform_recognizes_public_adapter_pages():
         discovery.classify_hosting_platform("https://ehptransparency.org/")
         == "html_mrf_links"
     )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://www.ucare.org/legal-notices/transparency-in-coverage"
+        )
+        == "html_mrf_links"
+    )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://stmercycaremrf.z14.web.core.windows.net/in_network.html"
+        )
+        == "html_mrf_links"
+    )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://stmercycaremrf.z14.web.core.windows.net/OON.html"
+        )
+        == "html_mrf_links"
+    )
 
 
 def test_parse_master_list_preserves_payers_and_urls():
@@ -853,8 +871,12 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
 | UMWA Health and Retirement Funds | tpa | https://mrf.healthcarebluebook.com/healthsmartfundsaccount | aliases: UMWA Funds |
 | BlueAdvantage Administrators of Arkansas | tpa | https://www.blueadvantagearkansas.com/interoperability/machine-readable-files | aliases: BlueAdvantage, Skai BCBS |
 | GEHA | network/tpa | https://www.geha.com/transparency-in-coverage | benefit lines: dental, medical; aliases: Connection Dental |
+| HealthSmart | network/tpa | https://mrf.healthcarebluebook.com/Healthsmart | benefit lines: medical, dental; aliases: HealthSmart Benefit Solutions, HealthSmart-Dental, HealthSmart Dental |
 | Valley Health Plan | medicaid_mco | https://data.sccgov.org/data.json | benefit lines: medical, dental, vision; aliases: VHP |
+| UCare | medicaid_mco | https://www.ucare.org/legal-notices/transparency-in-coverage | benefit lines: medical, dental; aliases: UCare Minnesota, UCare IFP |
 | Sharp Health Plan | provider_sponsored | https://www.sharphealthplan.com/api-access-for-developers | aliases: Sharp Health Plan of San Diego |
+| Mercy/MercyCare | provider_sponsored | https://stmercycaremrf.z14.web.core.windows.net/in_network.html | benefit lines: medical; aliases: MercyCare Health Plans, Mercyhealth |
+| Mercy/MercyCare | provider_sponsored | https://stmercycaremrf.z14.web.core.windows.net/OON.html | benefit lines: medical; aliases: MercyCare Health Plans, Mercyhealth |
 | Group Health Cooperative of Eau Claire | regional | https://group-health.com/price-transparency | aliases: Group Health Eau Claire |
 | S&S Health | tpa | https://mrf.healthcarebluebook.com/SandS | aliases: S&S HealthCare, SandS, Reflect Health |
 | SimplePay Health | tpa | https://www.simplepayhealth.com/ | aliases: SimplePay |
@@ -1046,6 +1068,22 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
     assert by_name["WPS Health"].aliases == ("Wisconsin Physicians Service", "WPS")
     assert by_name["SummaCare"].hosting_platform == "html_mrf_links"
     assert by_name["SummaCare"].aliases == ("SummaCare MEWA", "Summa Health System")
+    assert by_name["HealthSmart"].hosting_platform == "healthcarebluebook_mrf"
+    assert by_name["HealthSmart"].benefit_lines == ("medical", "dental")
+    assert by_name["HealthSmart"].aliases == (
+        "HealthSmart Benefit Solutions",
+        "HealthSmart-Dental",
+        "HealthSmart Dental",
+    )
+    assert by_name["UCare"].hosting_platform == "html_mrf_links"
+    assert by_name["UCare"].benefit_lines == ("medical", "dental")
+    assert by_name["UCare"].aliases == ("UCare Minnesota", "UCare IFP")
+    mercycare = [
+        candidate for candidate in candidates if candidate.payer_name == "Mercy/MercyCare"
+    ]
+    assert len(mercycare) == 2
+    assert {candidate.hosting_platform for candidate in mercycare} == {"html_mrf_links"}
+    assert all(candidate.benefit_lines == ("medical",) for candidate in mercycare)
 
 
 @pytest.mark.asyncio
@@ -5619,6 +5657,122 @@ def test_parse_html_mrf_links_extracts_tocs_and_body_file_references():
             ],
         },
     ]
+
+
+def test_parse_html_mrf_links_accepts_spaced_anchor_close_tags():
+    html = """
+    <a href="/files/2026-06-01_MERCYCARE-COMMERCIAL_in-network-rates.json">
+      In Network
+    </a    >
+    <a href="/files/2026-06-01_MERCYCARE-COMMERCIAL_index.json">
+      Table of Contents
+    </a    >
+    <a href="/files/2026-06-01_MERCYCARE-COMMERCIAL_allowed-amounts.json">
+      Allowed Amounts
+    </a    >
+    """
+
+    targets = discovery._parse_html_mrf_links(
+        html, base_url="https://stmercycaremrf.z14.web.core.windows.net/in_network.html"
+    )
+
+    assert [
+        (target["url"], target["target_file_type"], target["target_kind"])
+        for target in targets
+    ] == [
+        (
+            "https://stmercycaremrf.z14.web.core.windows.net/files/2026-06-01_MERCYCARE-COMMERCIAL_in-network-rates.json",
+            "in-network",
+            "file_reference",
+        ),
+        (
+            "https://stmercycaremrf.z14.web.core.windows.net/files/2026-06-01_MERCYCARE-COMMERCIAL_index.json",
+            "table-of-contents",
+            "toc_json",
+        ),
+        (
+            "https://stmercycaremrf.z14.web.core.windows.net/files/2026-06-01_MERCYCARE-COMMERCIAL_allowed-amounts.json",
+            "allowed-amounts",
+            "file_reference",
+        ),
+    ]
+
+
+def test_parse_html_mrf_links_extracts_ucare_landing_toc_download():
+    html = """
+    <p>
+      <a href="https://ucm-p-001.sitecorecontenthub.cloud/api/public/content/ucare_toc.json?download=true">
+        Table of Contents
+      </a>
+    </p>
+    """
+
+    targets = discovery._parse_html_mrf_links(
+        html, base_url="https://www.ucare.org/legal-notices/transparency-in-coverage"
+    )
+
+    assert targets == [
+        {
+            "url": "https://ucm-p-001.sitecorecontenthub.cloud/api/public/content/ucare_toc.json?download=true",
+            "label": "Table of Contents",
+            "resolver": "html_mrf_link",
+            "target_kind": "toc_json",
+            "target_file_type": "table-of-contents",
+            "container_format": None,
+            "html_attr": "href",
+        }
+    ]
+
+
+def test_mrf_json_loader_repairs_missing_commas_between_toc_file_objects():
+    toc_text = """
+    {
+      "reporting_entity_name": "UCare Minnesota",
+      "reporting_entity_type": "Health Insurance Issuer",
+      "version": "1.0.0",
+      "reporting_structure": [
+        {
+          "reporting_plans": [
+            {
+              "plan_name": "UCare IFP",
+              "plan_id_type": "hios",
+              "plan_id": "85736MN023",
+              "plan_market_type": "Individual"
+            }
+          ],
+          "in_network_files": [
+            {
+              "description": "rates for UCare network",
+              "location": "https://ucm-p-001.sitecorecontenthub.cloud/api/public/content/UCare_InNetwork.json?download=true"
+            }
+            {
+              "description": "rates for dental network",
+              "location": "https://ucm-p-001.sitecorecontenthub.cloud/api/public/content/Dental_InNetwork.json?download=true"
+            }
+          ],
+          "allowed_amount_file": [
+            {
+              "description": "out-of-network allowed amounts",
+              "location": "https://ucm-p-001.sitecorecontenthub.cloud/api/public/content/UCare_AllowedAmount.json?download=true"
+            }
+          ]
+        }
+      ]
+    }
+    """
+
+    toc = discovery._loads_mrf_json_value(toc_text)
+    plan_rows, file_rows = discovery._toc_rows_from_content(
+        {"source_id": "source_ucare"}, "https://example.test/ucare_toc.json", toc
+    )
+
+    assert len(plan_rows) == 3
+    assert [row["file_type"] for row in file_rows] == [
+        "in-network",
+        "in-network",
+        "allowed-amounts",
+    ]
+    assert file_rows[1]["url"].endswith("/Dental_InNetwork.json?download=true")
 
 
 def test_parse_html_mrf_links_classifies_singular_table_of_content_indexes():
