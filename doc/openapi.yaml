@@ -3829,6 +3829,11 @@ paths:
           in: query
           schema:
             type: boolean
+        - name: include_unverified_addresses
+          in: query
+          schema:
+            type: boolean
+          description: Internal diagnostics only. When true, returns PTG provider addresses that are not proven network-bound; default responses suppress them.
         - name: include_evidence
           in: query
           schema:
