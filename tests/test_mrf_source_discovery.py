@@ -5698,6 +5698,31 @@ def test_parse_html_mrf_links_accepts_spaced_anchor_close_tags():
     ]
 
 
+def test_parse_html_mrf_links_accepts_unquoted_href_and_gt_in_attrs():
+    html = """
+    <a class="download" data-title="2 > 1"
+       href=/files/2026-06-01_EXAMPLE-COMMERCIAL_index.json>
+      Table of Contents
+    </a>
+    """
+
+    targets = discovery._parse_html_mrf_links(
+        html, base_url="https://files.example.test/transparency"
+    )
+
+    assert targets == [
+        {
+            "url": "https://files.example.test/files/2026-06-01_EXAMPLE-COMMERCIAL_index.json",
+            "label": "Table of Contents",
+            "resolver": "html_mrf_link",
+            "target_kind": "toc_json",
+            "target_file_type": "table-of-contents",
+            "container_format": None,
+            "html_attr": "href",
+        }
+    ]
+
+
 def test_parse_html_mrf_links_extracts_ucare_landing_toc_download():
     html = """
     <p>
@@ -5773,6 +5798,38 @@ def test_mrf_json_loader_repairs_missing_commas_between_toc_file_objects():
         "allowed-amounts",
     ]
     assert file_rows[1]["url"].endswith("/Dental_InNetwork.json?download=true")
+
+
+def test_mrf_json_loader_repairs_toc_without_mutating_string_literals():
+    toc_text = """
+    {
+      "reporting_entity_name": "Example Payer",
+      "reporting_entity_type": "Health Insurance Issuer",
+      "reporting_structure": [
+        {
+          "reporting_plans": [{"plan_name": "Example Plan"}],
+          "in_network_files": [
+            {
+              "description": "keep }{ literal",
+              "location": "https://files.example.test/2026-06_in-network-rates.json.gz"
+            }
+            {
+              "description": "next file",
+              "location": "https://files.example.test/2026-06_dental-in-network-rates.json.gz"
+            }
+          ]
+        }
+      ]
+    }
+    """
+
+    toc = discovery._loads_mrf_json_value(toc_text)
+
+    descriptions = [
+        row["description"]
+        for row in toc["reporting_structure"][0]["in_network_files"]
+    ]
+    assert descriptions == ["keep }{ literal", "next file"]
 
 
 def test_parse_html_mrf_links_classifies_singular_table_of_content_indexes():
@@ -6082,6 +6139,37 @@ def test_parse_html_mrf_links_extracts_embedded_escaped_toc_urls():
             "container_format": None,
             "html_attr": "text",
         },
+    ]
+
+
+def test_parse_html_mrf_links_extracts_embedded_escaped_relative_urls():
+    html = r"""
+    <script>
+    window.__DATA__ = {
+      "toc": "\/mrf\/current\/2026-06-01_example_index.json",
+      "rates": "/mrf/current/2026-06-01_example_in-network-rates.json.gz"
+    };
+    </script>
+    """
+
+    targets = discovery._parse_html_mrf_links(
+        html, base_url="https://payer.example.test/transparency"
+    )
+
+    assert [
+        (target["url"], target["target_kind"], target["target_file_type"])
+        for target in targets
+    ] == [
+        (
+            "https://payer.example.test/mrf/current/2026-06-01_example_index.json",
+            "toc_json",
+            "table-of-contents",
+        ),
+        (
+            "https://payer.example.test/mrf/current/2026-06-01_example_in-network-rates.json.gz",
+            "file_reference",
+            "in-network",
+        ),
     ]
 
 
@@ -6492,6 +6580,33 @@ def test_json_values_from_zip_bytes_reads_zipped_toc_member():
             {"reporting_entity_name": "Example Payer"},
         )
     ]
+
+
+def test_json_values_from_zip_bytes_repairs_zipped_toc_member():
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(
+            "2026-06-01_example_index.json",
+            """
+            {
+              "reporting_entity_name": "Example Payer",
+              "reporting_entity_type": "payer",
+              "reporting_structure": [
+                {
+                  "reporting_plans": [{"plan_name": "Example Plan"}],
+                  "in_network_files": [
+                    {"location": "https://files.example.test/a_in-network-rates.json.gz"}
+                    {"location": "https://files.example.test/b_in-network-rates.json.gz"}
+                  ]
+                }
+              ]
+            }
+            """,
+        )
+
+    values = discovery._json_values_from_zip_bytes(buffer.getvalue())
+
+    assert len(values[0][1]["reporting_structure"][0]["in_network_files"]) == 2
 
 
 def test_parse_html_mrf_links_ignores_provider_formulary_indexes():

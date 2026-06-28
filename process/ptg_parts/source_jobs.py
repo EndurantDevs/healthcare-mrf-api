@@ -291,7 +291,10 @@ def parse_toc_catalog_entries(
                         plan_info=plan_tuple,
                     )
                 )
-        for allowed_amount_file in _as_list(structure.get("allowed_amount_file")):
+        allowed_amount_files = _as_list(structure.get("allowed_amount_file")) + _as_list(
+            structure.get("allowed_amount_files")
+        )
+        for allowed_amount_file in allowed_amount_files:
             if not isinstance(allowed_amount_file, dict):
                 continue
             if not _looks_like_toc_body_file_location(

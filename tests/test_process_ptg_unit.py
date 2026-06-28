@@ -1450,6 +1450,32 @@ def test_ptg2_toc_parser_accepts_list_shaped_file_fields():
     assert entries[3].description == "Allowed 2"
 
 
+def test_ptg2_toc_parser_accepts_plural_allowed_amount_files():
+    toc = {
+        "reporting_entity_name": "BCBS",
+        "reporting_entity_type": "third-party administrator",
+        "reporting_structure": [
+            {
+                "reporting_plans": [{"plan_name": "Group PPO", "plan_id": "12-3456789", "plan_market_type": "group"}],
+                "allowed_amount_files": [
+                    {"location": "https://cdn.test/allowed-amounts-1.json.gz", "description": "Allowed 1"},
+                    {"location": "https://cdn.test/allowed-amounts-2.json.gz", "description": "Allowed 2"},
+                ],
+            }
+        ],
+    }
+
+    entries = process_ptg.parse_toc_catalog_entries(toc, "https://payer.test/toc.json")
+
+    assert [entry.source_type for entry in entries] == [
+        "table-of-contents",
+        "allowed-amounts",
+        "allowed-amounts",
+    ]
+    assert entries[1].description == "Allowed 1"
+    assert entries[2].description == "Allowed 2"
+
+
 def test_ptg2_toc_parser_normalizes_asr_download_links():
     toc = {
         "reporting_entity_name": "ASR Health Benefits",
@@ -1627,6 +1653,122 @@ def test_ptg2_toc_jobs_repair_ucare_json_and_allowed_amount_lists(
         "allowed-amounts",
         "allowed-amounts",
     ]
+
+
+def test_ptg2_toc_jobs_skip_non_mrf_body_locations(monkeypatch, tmp_path):
+    toc_path = tmp_path / "toc.json"
+    toc_path.write_text(
+        json.dumps(
+            {
+                "reporting_entity_name": "Example Payer",
+                "reporting_entity_type": "third-party administrator",
+                "reporting_structure": [
+                    {
+                        "reporting_plans": [
+                            {
+                                "plan_name": "Example Plan",
+                                "plan_id": "123",
+                                "plan_market_type": "group",
+                            }
+                        ],
+                        "in_network_files": [
+                            {"location": "https://www.zelis.com/"},
+                            {"location": "Missing file"},
+                            {"location": "ftp://example.test/rates.json.gz"},
+                            {
+                                "location": (
+                                    "https://cdn.example.test/"
+                                    "2026-06_in-network-rates.json.gz"
+                                )
+                            },
+                        ],
+                        "allowed_amount_files": [
+                            {"location": "https://example.test/"},
+                            {
+                                "location": (
+                                    "https://cdn.example.test/"
+                                    "2026-06_allowed-amounts.json.gz"
+                                )
+                            },
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    pushed_file_rows = []
+
+    async def fake_materialize(*_args, **_kwargs):
+        artifact = SimpleNamespace(logical_path=toc_path)
+        return artifact, artifact
+
+    async def fake_push_objects(rows, _cls, **_kwargs):
+        pushed_file_rows.extend(rows)
+
+    monkeypatch.setattr(process_ptg, "materialize_json_source", fake_materialize)
+    monkeypatch.setattr(process_ptg, "push_objects", fake_push_objects)
+    monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
+
+    jobs = asyncio.run(
+        process_ptg._process_table_of_contents(
+            "https://payer.test/toc.json",
+            {"PTGFile": object, "ImportLog": object},
+            test_mode=False,
+        )
+    )
+
+    assert [(job["type"], job["url"]) for job in jobs] == [
+        (
+            "in_network",
+            "https://cdn.example.test/2026-06_in-network-rates.json.gz",
+        ),
+        (
+            "allowed_amounts",
+            "https://cdn.example.test/2026-06_allowed-amounts.json.gz",
+        ),
+    ]
+    assert [row["file_type"] for row in pushed_file_rows] == [
+        "table-of-contents",
+        "in-network",
+        "allowed-amounts",
+    ]
+
+
+def test_ptg2_toc_artifact_repair_preserves_string_literals(tmp_path):
+    toc_path = tmp_path / "toc.json"
+    toc_path.write_text(
+        """
+        {
+          "reporting_entity_name": "Example Payer",
+          "reporting_entity_type": "payer",
+          "reporting_structure": [
+            {
+              "reporting_plans": [{"plan_name": "Example Plan"}],
+              "in_network_files": [
+                {
+                  "description": "keep }{ literal",
+                  "location": "https://files.example.test/a_in-network-rates.json.gz"
+                }
+                {
+                  "description": "next file",
+                  "location": "https://files.example.test/b_in-network-rates.json.gz"
+                }
+              ]
+            }
+          ]
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    toc = process_ptg._load_table_of_contents_artifact(toc_path)
+
+    descriptions = [
+        row["description"]
+        for row in toc["reporting_structure"][0]["in_network_files"]
+    ]
+    assert descriptions == ["keep }{ literal", "next file"]
 
 
 def test_ptg2_artifact_reuse_by_strong_etag_and_length(tmp_path):

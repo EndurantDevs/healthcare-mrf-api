@@ -284,6 +284,7 @@ from process.ptg_parts.source_jobs import (_dedupe_preserve, _dedupe_ptg_jobs,
                                            _filter_jobs_by_url_contains,
                                            _filter_reporting_plans,
                                            _load_toc_urls_from_file,
+                                           _looks_like_toc_body_file_location,
                                            _merge_ptg_job,
                                            _normalize_filter_values,
                                            _normalize_plan_payload,
@@ -1874,20 +1875,21 @@ async def _process_table_of_contents(
         )
         if not plans:
             continue
-        in_network_files = structure.get("in_network_files") or []
-        allowed_amount_value = structure.get("allowed_amount_file")
-        if isinstance(allowed_amount_value, list):
-            allowed_amount_files = [
-                item for item in allowed_amount_value if isinstance(item, dict)
-            ]
-        elif isinstance(allowed_amount_value, dict):
-            allowed_amount_files = [allowed_amount_value]
-        else:
-            allowed_amount_files = []
+        in_network_files = [
+            item for item in _as_list(structure.get("in_network_files")) if isinstance(item, dict)
+        ]
+        allowed_amount_files = [
+            item
+            for item in (
+                _as_list(structure.get("allowed_amount_file"))
+                + _as_list(structure.get("allowed_amount_files"))
+            )
+            if isinstance(item, dict)
+        ]
 
         for entry in in_network_files:
             location = entry.get("location")
-            if not location:
+            if not _looks_like_toc_body_file_location(location):
                 continue
             location = normalize_tic_source_url(location)
             meta = dict(toc_meta)
@@ -1910,25 +1912,26 @@ async def _process_table_of_contents(
 
         for allowed_amount_file in allowed_amount_files:
             location = allowed_amount_file.get("location")
-            if location:
-                location = normalize_tic_source_url(location)
-                meta = dict(toc_meta)
-                file_row = _build_file_row(
-                    location, "allowed-amounts", meta, plans, allowed_amount_file.get("description"), toc_url
-                )
-                if file_row["file_id"] not in seen_files:
-                    file_rows.append(file_row)
-                    seen_files.add(file_row["file_id"])
-                jobs.append(
-                    {
-                        "type": "allowed_amounts",
-                        "url": location,
-                        "description": allowed_amount_file.get("description"),
-                        "plan_info": plans,
-                        "from_index_url": toc_url,
-                        "meta": meta,
-                    }
-                )
+            if not _looks_like_toc_body_file_location(location):
+                continue
+            location = normalize_tic_source_url(location)
+            meta = dict(toc_meta)
+            file_row = _build_file_row(
+                location, "allowed-amounts", meta, plans, allowed_amount_file.get("description"), toc_url
+            )
+            if file_row["file_id"] not in seen_files:
+                file_rows.append(file_row)
+                seen_files.add(file_row["file_id"])
+            jobs.append(
+                {
+                    "type": "allowed_amounts",
+                    "url": location,
+                    "description": allowed_amount_file.get("description"),
+                    "plan_info": plans,
+                    "from_index_url": toc_url,
+                    "meta": meta,
+                }
+            )
         if test_mode and len(jobs) >= TEST_TOC_JOBS:
             break
 
@@ -1952,7 +1955,31 @@ def _looks_tic_toc_json_text(text: str) -> bool:
 
 
 def _repair_missing_array_object_commas(text: str) -> str:
-    return re.sub(r"}(\s*){", r"},\1{", text)
+    repaired: list[str] = []
+    in_string = False
+    escaped = False
+    length = len(text)
+    for idx, char in enumerate(text):
+        repaired.append(char)
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+            continue
+        if char != "}":
+            continue
+        lookahead = idx + 1
+        while lookahead < length and text[lookahead].isspace():
+            lookahead += 1
+        if lookahead < length and text[lookahead] == "{":
+            repaired.append(",")
+    return "".join(repaired)
 
 
 def _load_table_of_contents_artifact(path: str | Path) -> dict[str, Any]:

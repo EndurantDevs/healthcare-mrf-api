@@ -18,6 +18,7 @@ import socket
 import ssl
 import zipfile
 from dataclasses import dataclass, field
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import parse_qs, parse_qsl, quote, urlencode, urljoin, urlsplit
@@ -1546,7 +1547,31 @@ def _looks_tic_toc_json_text(text: str) -> bool:
 def _repair_missing_array_object_commas(text: str) -> str:
     # Some payer TOCs are published with adjacent objects in an array but no comma.
     # Keep this intentionally narrow and only apply it to TiC TOC-looking payloads.
-    return re.sub(r"}(\s*){", r"},\1{", text)
+    repaired: list[str] = []
+    in_string = False
+    escaped = False
+    length = len(text)
+    for idx, char in enumerate(text):
+        repaired.append(char)
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+            continue
+        if char != "}":
+            continue
+        lookahead = idx + 1
+        while lookahead < length and text[lookahead].isspace():
+            lookahead += 1
+        if lookahead < length and text[lookahead] == "{":
+            repaired.append(",")
+    return "".join(repaired)
 
 
 def _loads_mrf_json_value(text: str) -> Any:
@@ -1590,7 +1615,7 @@ def _json_values_from_zip_bytes(
                     )
                 payload = archive.read(info)
                 text = _decode_response_body(payload)
-                values.append((name, json.loads(text)))
+                values.append((name, _loads_mrf_json_value(text)))
     except zipfile.BadZipFile as exc:
         raise ValueError("response body is not a readable ZIP archive") from exc
     if not values:
@@ -5001,10 +5026,10 @@ def _embedded_mrf_urls(value: str, *, base_url: str | None = None) -> list[str]:
         relative_text = re.sub(
             r"https?://[^\s|)<>\"']+",
             " ",
-            html.unescape(str(value or "")),
+            _decode_embedded_url_text(value),
         )
         for match in re.finditer(
-            r"""(?<![A-Za-z0-9:/])(?P<url>/?[A-Za-z0-9._~!$&'()*+,;=:@%/-]+(?:\.json(?:\.gz)?|\.zip|\.7z|\.csv)(?:\?[A-Za-z0-9._~!$&'()*+,;=:@%/?-]+)?)""",
+            r"""(?<![A-Za-z0-9:/])(?P<url>/(?!/)[A-Za-z0-9._~!$&'()*+,;=:@%/-]+(?:\.json(?:\.gz)?|\.zip|\.7z|\.csv)(?:\?[A-Za-z0-9._~!$&'()*+,;=:@%/?-]+)?)""",
             relative_text,
         ):
             relative = match.group("url").strip()
@@ -6100,45 +6125,138 @@ def _strip_html_tags(value: str) -> str:
     return _clean_text(re.sub(r"<[^>]+>", " ", value or ""))
 
 
-def _html_link_candidates(html_text: str, *, base_url: str) -> list[dict[str, Any]]:
-    candidates: list[dict[str, Any]] = []
-    for match in re.finditer(
-        r"<a\b(?P<attrs>[^>]*)>(?P<label>.*?)</a\s*>",
-        html_text or "",
-        flags=re.I | re.S,
-    ):
-        attrs = match.group("attrs") or ""
-        label = _strip_html_tags(match.group("label") or "")
-        href_match = re.search(
-            r"""href\s*=\s*(?P<quote>["'])(?P<value>.*?)(?P=quote)""",
-            attrs,
-            flags=re.I | re.S,
-        )
-        if href_match:
-            candidates.append(
+_HTML_ATTR_MRF_REFERENCE_RE = re.compile(
+    r"^data-(?:key|[a-z0-9_-]*(?:url|href|file|path|lookup|key)[a-z0-9_-]*)$",
+    flags=re.I,
+)
+
+
+class _MRFHtmlLinkParser(HTMLParser):
+    def __init__(self, html_text: str):
+        super().__init__(convert_charrefs=True)
+        self.html_text = html_text or ""
+        self.line_offsets = self._compute_line_offsets(self.html_text)
+        self.candidates: list[dict[str, Any]] = []
+        self._anchor_stack: list[dict[str, Any]] = []
+        self.text_parts: list[str] = []
+
+    @staticmethod
+    def _compute_line_offsets(text: str) -> list[int]:
+        offsets: list[int] = []
+        offset = 0
+        for line in text.splitlines(keepends=True):
+            offsets.append(offset)
+            offset += len(line)
+        offsets.append(offset)
+        return offsets
+
+    def _offset(self) -> int:
+        line, column = self.getpos()
+        if line <= 0:
+            return 0
+        if line > len(self.line_offsets):
+            return len(self.html_text)
+        return min(self.line_offsets[line - 1] + column, len(self.html_text))
+
+    def _tag_end(self, start: int) -> int:
+        end = self.html_text.find(">", start)
+        if end < 0:
+            return start
+        return end + 1
+
+    @staticmethod
+    def _is_reference_attr(attr: str) -> bool:
+        attr = attr.lower()
+        return attr == "src" or bool(_HTML_ATTR_MRF_REFERENCE_RE.match(attr))
+
+    def _append_attr_candidates(
+        self,
+        attrs: list[tuple[str, str | None]],
+        *,
+        label: str,
+        html_start: int,
+        html_end: int,
+        include_href: bool,
+    ) -> None:
+        for attr, value in attrs:
+            attr = (attr or "").lower()
+            if value is None:
+                continue
+            if attr == "href":
+                if not include_href:
+                    continue
+            elif not self._is_reference_attr(attr):
+                continue
+            self.candidates.append(
                 {
-                    "attr": "href",
-                    "value": href_match.group("value"),
+                    "attr": attr,
+                    "value": value,
                     "label": label,
-                    "html_start": match.start(),
-                    "html_end": match.end(),
+                    "html_start": html_start,
+                    "html_end": html_end,
                 }
             )
-    attr_pattern = re.compile(
-        r"""\b(?P<attr>src|data-(?:key|[a-z0-9_-]*(?:url|href|file|path|lookup|key)[a-z0-9_-]*))\s*=\s*(?P<quote>["'])(?P<value>.*?)(?P=quote)""",
-        flags=re.I | re.S,
-    )
-    for match in attr_pattern.finditer(html_text or ""):
-        candidates.append(
-            {
-                "attr": match.group("attr"),
-                "value": match.group("value"),
-                "label": "",
-                "html_start": match.start(),
-                "html_end": match.end(),
-            }
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        start = self._offset()
+        end = self._tag_end(start)
+        if tag == "a":
+            self._anchor_stack.append(
+                {"attrs": attrs, "label_parts": [], "html_start": start}
+            )
+            return
+        self._append_attr_candidates(
+            attrs, label="", html_start=start, html_end=end, include_href=False
         )
-    for url in _embedded_http_urls(html_text):
+
+    def handle_startendtag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        start = self._offset()
+        end = self._tag_end(start)
+        self._append_attr_candidates(
+            attrs,
+            label="",
+            html_start=start,
+            html_end=end,
+            include_href=tag.lower() == "a",
+        )
+
+    def handle_data(self, data: str) -> None:
+        if data:
+            self.text_parts.append(data)
+        if self._anchor_stack:
+            self._anchor_stack[-1]["label_parts"].append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() != "a" or not self._anchor_stack:
+            return
+        start = self._offset()
+        end = self._tag_end(start)
+        anchor = self._anchor_stack.pop()
+        label = _clean_text(" ".join(anchor.get("label_parts") or []))
+        self._append_attr_candidates(
+            anchor.get("attrs") or [],
+            label=label,
+            html_start=int(anchor.get("html_start") or 0),
+            html_end=end,
+            include_href=True,
+        )
+
+
+def _html_link_candidates(html_text: str, *, base_url: str) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    parser = _MRFHtmlLinkParser(html_text or "")
+    embedded_source = html_text or ""
+    try:
+        parser.feed(html_text or "")
+        parser.close()
+        candidates.extend(parser.candidates)
+        embedded_source = "\n".join(parser.text_parts)
+    except Exception:
+        LOGGER.debug("failed to parse HTML links with HTMLParser", exc_info=True)
+    for url in _embedded_mrf_urls(embedded_source, base_url=base_url):
         candidates.append(
             {"attr": "text", "value": url, "label": Path(urlsplit(url).path).name}
         )
@@ -6153,10 +6271,19 @@ def _html_link_candidates(html_text: str, *, base_url: str) -> list[dict[str, An
         if key in seen:
             continue
         seen.add(key)
+        label = item.get("label") or Path(urlsplit(url).path).name
+        if key[0] != "href" and _clean_text(label).lower() in {
+            "download",
+            "view",
+            "open",
+            "file",
+            "here",
+        }:
+            label = Path(urlsplit(url).path).name
         row = {
             "attr": key[0],
             "url": url,
-            "label": item.get("label") or Path(urlsplit(url).path).name,
+            "label": label,
         }
         if isinstance(item.get("html_start"), int):
             row["html_start"] = item.get("html_start")
@@ -6169,6 +6296,26 @@ def _html_link_candidates(html_text: str, *, base_url: str) -> list[dict[str, An
 def _embedded_http_urls(value: str | None) -> list[str]:
     """Extract bare URLs from HTML, including JSON/JS escaped URL strings."""
 
+    text = _decode_embedded_url_text(value)
+    urls: list[str] = []
+    seen: set[str] = set()
+    for match in re.finditer(r"https?://[^\s\"'<>]+", text, flags=re.I):
+        url = match.group(0).rstrip("\\,.;)")
+        while url.endswith(("]", "}")) and (
+            url.count("[") < url.count("]") or url.count("{") < url.count("}")
+        ):
+            url = url[:-1]
+        if not url:
+            continue
+        key = _canonical_or_none(url) or url
+        if key in seen:
+            continue
+        seen.add(key)
+        urls.append(url)
+    return urls
+
+
+def _decode_embedded_url_text(value: str | None) -> str:
     text = html.unescape(str(value or ""))
     replacements = {
         "\\/": "/",
@@ -6193,22 +6340,7 @@ def _embedded_http_urls(value: str | None) -> list[str]:
     }
     for old, new in replacements.items():
         text = text.replace(old, new)
-    urls: list[str] = []
-    seen: set[str] = set()
-    for match in re.finditer(r"https?://[^\s\"'<>]+", text, flags=re.I):
-        url = match.group(0).rstrip("\\,.;)")
-        while url.endswith(("]", "}")) and (
-            url.count("[") < url.count("]") or url.count("{") < url.count("}")
-        ):
-            url = url[:-1]
-        if not url:
-            continue
-        key = _canonical_or_none(url) or url
-        if key in seen:
-            continue
-        seen.add(key)
-        urls.append(url)
-    return urls
+    return text
 
 
 def _looks_html_mrf_toc_url(url: str | None, label: str | None = None) -> bool:
