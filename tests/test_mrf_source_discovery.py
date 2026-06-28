@@ -5038,15 +5038,7 @@ async def test_push_import_control_catalog_preserves_registry_stale_status(
 
     async def fake_snapshot(source_ids):
         assert source_ids == ["source_stale"]
-        return {
-            "source_stale": [
-                {
-                    "canonical_url": "https://example.com/rates.json.gz",
-                    "domain": "in_network",
-                    "plan_info": [{"plan_id": "123", "plan_market_type": "group"}],
-                }
-            ]
-        }
+        return {}
 
     monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_URL", "http://import-control.test")
     monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_TOKEN", "secret")
@@ -5076,11 +5068,16 @@ async def test_push_import_control_catalog_preserves_registry_stale_status(
     ]
 
     assert sources_synced == 1
-    assert plans_synced == 1
+    assert plans_synced == 0
     assert errors == []
     assert len(final_public_sources) == 1
     assert final_public_sources[0]["status"] == "stale"
     assert final_public_sources[0]["preserve_operator_state"] is False
+    assert not [
+        call
+        for call in calls
+        if call["url"].endswith("/v1/ptg/discover/ingest-preview")
+    ]
 
 
 @pytest.mark.asyncio

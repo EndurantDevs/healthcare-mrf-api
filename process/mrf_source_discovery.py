@@ -11007,7 +11007,10 @@ async def _push_import_control_catalog(
     snapshot = await _import_control_snapshot_items(
         [str(row.get("source_id") or "") for row in eligible]
     )
-    if not snapshot:
+    if not snapshot and all(
+        str(row.get("status") or "active").strip().lower() == "active"
+        for row in eligible
+    ):
         return (0, 0, [])
     base = base_url.rstrip("/")
     timeout = aiohttp.ClientTimeout(total=60, connect=10, sock_read=30)
@@ -11025,7 +11028,8 @@ async def _push_import_control_catalog(
         for row in eligible:
             source_id = str(row.get("source_id") or "")
             items = snapshot.get(source_id) or []
-            if not items:
+            source_status = str(row.get("status") or "active").strip() or "active"
+            if not items and source_status.lower() == "active":
                 continue
             ic_source_id: str | None = None
             try:
@@ -11049,21 +11053,21 @@ async def _push_import_control_catalog(
                     and str(stored.get("status") or "") == _IMPORT_CONTROL_STAGED_STATUS
                 )
                 source_plans = 0
-                for batch in _chunked(_split_preview_items(items), 100):
-                    source_plans += await _ingest_import_control_preview(
-                        session, base, ic_source_id, batch
+                if items:
+                    for batch in _chunked(_split_preview_items(items), 100):
+                        source_plans += await _ingest_import_control_preview(
+                            session, base, ic_source_id, batch
+                        )
+                    await _mark_import_control_seed_promoted(
+                        session, base, row, ic_source_id
                     )
-                await _mark_import_control_seed_promoted(
-                    session, base, row, ic_source_id
-                )
-                public_status = str(row.get("status") or "active").strip() or "active"
-                if staged or public_status.lower() != "active":
+                if staged or source_status.lower() != "active":
                     await _promote_import_control_source(
                         session,
                         base,
                         row,
                         visibility="public",
-                        status=public_status,
+                        status=source_status,
                         preserve_operator_state=False,
                     )
                 sources_synced += 1
