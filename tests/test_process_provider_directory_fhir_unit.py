@@ -875,6 +875,44 @@ def test_sql_ref_matches_resource_accepts_absolute_url_suffixes():
     assert "refs.ref LIKE '%/Organization/' || org.resource_id" in sql
 
 
+def test_linked_resource_candidate_urls_use_network_endpoint_for_network_refs():
+    urls = importer._linked_resource_candidate_urls(  # pylint: disable=protected-access
+        {
+            "api_base": "https://example.test/fhir",
+            "endpoint_organization": "Organization",
+            "endpoint_network": "Organization?type=ntwk",
+        },
+        "Organization",
+        "network-1",
+        reference="Organization/network-1",
+        reference_field="network_refs",
+    )
+
+    assert urls[:2] == [
+        "https://example.test/fhir/Organization?type=ntwk&_count=1&_id=network-1",
+        "https://example.test/fhir/Organization/network-1",
+    ]
+
+
+def test_linked_resource_candidate_urls_use_organization_endpoint_for_owner_refs():
+    urls = importer._linked_resource_candidate_urls(  # pylint: disable=protected-access
+        {
+            "api_base": "https://example.test/fhir",
+            "endpoint_organization": "Organization?type=prov",
+            "endpoint_network": "Organization?type=ntwk",
+        },
+        "Organization",
+        "org-1",
+        reference="Organization/org-1",
+        reference_field="owned_by_ref",
+    )
+
+    assert urls[:2] == [
+        "https://example.test/fhir/Organization?type=prov&_count=1&_id=org-1",
+        "https://example.test/fhir/Organization/org-1",
+    ]
+
+
 @pytest.mark.asyncio
 async def test_import_linked_resource_rows_fetches_role_references_and_upserts(monkeypatch):
     async def fake_fetch_json(url, *, timeout):  # pylint: disable=unused-argument
@@ -927,6 +965,50 @@ async def test_import_linked_resource_rows_fetches_role_references_and_upserts(m
         ProviderDirectoryLocation,
         ProviderDirectoryInsurancePlan,
     ]
+
+
+@pytest.mark.asyncio
+async def test_import_linked_resource_rows_fetches_network_organization_from_network_endpoint(monkeypatch):
+    calls: list[str] = []
+
+    async def fake_fetch_json(url, *, timeout):  # pylint: disable=unused-argument
+        calls.append(url)
+        if "type=ntwk" in url:
+            return 200, {"resourceType": "Bundle", "entry": [{"resource": {"resourceType": "Organization", "id": "network-1", "name": "Gold Network"}}]}, None, 5
+        return 404, None, None, 5
+
+    upserts = []
+
+    async def fake_upsert(model, rows, **_kwargs):
+        upserts.append((model, rows))
+        return len(rows)
+
+    monkeypatch.setattr(importer, "_fetch_json", fake_fetch_json)
+    monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
+
+    counts = await importer._import_linked_resource_rows(  # pylint: disable=protected-access
+        {
+            "source_id": "source_a",
+            "api_base": "https://example.test/fhir",
+            "endpoint_network": "Organization?type=ntwk",
+        },
+        {
+            "InsurancePlan": [
+                {
+                    "resource_id": "plan-1",
+                    "network_refs": ["Organization/network-1"],
+                }
+            ]
+        },
+        per_source_limit=5,
+        timeout=3,
+        run_id="run_1",
+    )
+
+    assert counts == {"Organization": 1}
+    assert calls[0] == "https://example.test/fhir/Organization?type=ntwk&_count=1&_id=network-1"
+    assert upserts[0][0] is ProviderDirectoryOrganization
+    assert upserts[0][1][0]["name"] == "Gold Network"
 
 
 @pytest.mark.asyncio

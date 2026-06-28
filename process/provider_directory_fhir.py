@@ -2808,6 +2808,7 @@ def _linked_resource_candidate_urls(
     resource_id: str,
     *,
     reference: str | None = None,
+    reference_field: str | None = None,
 ) -> list[str]:
     urls: list[str] = []
     reference = _clean_text(reference)
@@ -2816,6 +2817,45 @@ def _linked_resource_candidate_urls(
         if parsed_ref.scheme and parsed_ref.netloc:
             urls.append(urllib.parse.urlunsplit((parsed_ref.scheme, parsed_ref.netloc, parsed_ref.path, "", "")))
     api_base = _canonical_base(source.get("api_base"))
+    endpoint = None
+    if resource_type == "Organization" and reference_field == "network_refs":
+        endpoint = _clean_text(source.get("endpoint_network"))
+    if not endpoint:
+        endpoint_field = RESOURCE_ENDPOINT_FIELDS.get(resource_type)
+        endpoint = _clean_text(source.get(endpoint_field)) if endpoint_field else None
+    if endpoint and not _is_placeholder_url(endpoint):
+        encoded_id = urllib.parse.quote(resource_id, safe="")
+        parsed_endpoint = urllib.parse.urlsplit(endpoint)
+        endpoint_url = endpoint if parsed_endpoint.scheme and parsed_endpoint.netloc else None
+        if not endpoint_url and api_base:
+            endpoint_url = urllib.parse.urljoin(api_base.rstrip("/") + "/", endpoint)
+        if endpoint_url:
+            endpoint_with_count = _url_with_count(endpoint_url, 1)
+            parsed_endpoint = urllib.parse.urlsplit(endpoint_with_count)
+            endpoint_query = urllib.parse.parse_qsl(parsed_endpoint.query, keep_blank_values=True)
+            if not any(key == "_id" for key, _value in endpoint_query):
+                endpoint_query.append(("_id", resource_id))
+            urls.append(
+                urllib.parse.urlunsplit(
+                    (
+                        parsed_endpoint.scheme,
+                        parsed_endpoint.netloc,
+                        parsed_endpoint.path,
+                        urllib.parse.urlencode(endpoint_query, doseq=True),
+                        parsed_endpoint.fragment,
+                    )
+                )
+            )
+            endpoint_path_base = urllib.parse.urlunsplit(
+                (
+                    parsed_endpoint.scheme,
+                    parsed_endpoint.netloc,
+                    parsed_endpoint.path.rstrip("/") + "/",
+                    "",
+                    "",
+                )
+            )
+            urls.append(urllib.parse.urljoin(endpoint_path_base, encoded_id))
     if api_base:
         encoded_id = urllib.parse.quote(resource_id, safe="")
         urls.append(f"{api_base}/{resource_type}/{encoded_id}")
@@ -2842,18 +2882,20 @@ def _row_reference_values(row: dict[str, Any], fields: tuple[str, ...]) -> list[
     return values
 
 
-def _linked_resource_refs(rows_by_resource: dict[str, list[dict[str, Any]]]) -> list[tuple[str, str, str]]:
-    refs: list[tuple[str, str, str]] = []
+def _linked_resource_refs(rows_by_resource: dict[str, list[dict[str, Any]]]) -> list[tuple[str, str, str, str]]:
+    refs: list[tuple[str, str, str, str]] = []
     seen: set[tuple[str, str]] = set()
     for source_resource_type, fields_by_target in LINKED_REFERENCE_FIELDS.items():
         for row in rows_by_resource.get(source_resource_type, []):
             for target_resource_type, fields in fields_by_target.items():
-                for reference in _row_reference_values(row, fields):
-                    key = _reference_resource_key(reference, target_resource_type)
-                    if not key or key in seen:
-                        continue
-                    seen.add(key)
-                    refs.append((target_resource_type, key[1], reference))
+                for field in fields:
+                    references = _row_reference_values(row, (field,))
+                    for reference in references:
+                        key = _reference_resource_key(reference, target_resource_type)
+                        if not key or key in seen:
+                            continue
+                        seen.add(key)
+                        refs.append((target_resource_type, key[1], reference, field))
     return refs
 
 
@@ -2863,6 +2905,7 @@ async def _fetch_linked_resource_row(
     resource_id: str,
     *,
     reference: str | None,
+    reference_field: str | None = None,
     timeout: int,
     run_id: str | None,
 ) -> tuple[type, dict[str, Any]] | None:
@@ -2871,6 +2914,7 @@ async def _fetch_linked_resource_row(
         resource_type,
         resource_id,
         reference=reference,
+        reference_field=reference_field,
     ):
         status_code, payload, error, _elapsed = await _fetch_source_json(source, url, timeout=timeout)
         if status_code != 200 or error or not payload:
@@ -2907,24 +2951,25 @@ async def _import_linked_resource_rows(
         for row in rows
         if row.get("resource_id")
     }
-    refs_to_fetch: list[tuple[str, str, str]] = []
-    for resource_type, resource_id, reference in _linked_resource_refs(rows_by_resource):
+    refs_to_fetch: list[tuple[str, str, str, str]] = []
+    for resource_type, resource_id, reference, reference_field in _linked_resource_refs(rows_by_resource):
         if len(refs_to_fetch) >= per_source_limit:
             break
         if (resource_type, resource_id) in existing:
             continue
-        refs_to_fetch.append((resource_type, resource_id, reference))
+        refs_to_fetch.append((resource_type, resource_id, reference, reference_field))
 
     semaphore = asyncio.Semaphore(max(1, concurrency))
 
-    async def _fetch_one(ref: tuple[str, str, str]) -> tuple[str, type, dict[str, Any]] | None:
-        resource_type, resource_id, reference = ref
+    async def _fetch_one(ref: tuple[str, str, str, str]) -> tuple[str, type, dict[str, Any]] | None:
+        resource_type, resource_id, reference, reference_field = ref
         async with semaphore:
             result = await _fetch_linked_resource_row(
                 source,
                 resource_type,
                 resource_id,
                 reference=reference,
+                reference_field=reference_field,
                 timeout=timeout,
                 run_id=run_id,
             )
