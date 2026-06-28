@@ -213,7 +213,7 @@ Last one-time research refresh: 2026-06-05.
 | Security Health Plan | provider_sponsored | https://www.securityhealth.org/insurance-resources/json | curated source row |
 | SelectHealth | provider_sponsored | https://ebu.intermountainhealthcare.org/selecthealth/transparencyincoverage/ | public MRF directory |
 | Sentara | provider_sponsored | https://www.optimahealth.com/transparency-in-coverage | curated source row; aliases: Sentara Health |
-| Sharp Health Plan | provider_sponsored | - | needs official source URL |
+| Sharp Health Plan | provider_sponsored | https://www.sharphealthplan.com/api-access-for-developers | public MRF page with direct Sharp CAP/FFS files; aliases: Sharp Health Plan of San Diego |
 | SSM Health Plan | provider_sponsored | https://www.ssmhealth.com/resources/pay-my-bill/price-estimate/price-transparency | public transparency URL |
 | Sutter Health Plan | provider_sponsored | https://www.sutterhealthplan.org/healthcare-cost-transparency | public transparency URL; aliases: Sutter Health Plus |
 | University of Utah HP | provider_sponsored | https://www.hopkinshealthplans.org/transparency-in-coverage/ | curated source row |
@@ -269,7 +269,7 @@ Last one-time research refresh: 2026-06-05.
 | First Medical | regional | - | needs official source URL |
 | Florida Complete Care | regional | - | needs official source URL |
 | Group Health Coop | regional | https://ghcscw.com/transparency-in-coverage | curated source row |
-| Group Health Cooperative of Eau Claire | regional | - | needs official source URL |
+| Group Health Cooperative of Eau Claire | regional | https://group-health.com/price-transparency | public direct MRF file links; aliases: Group Health Eau Claire |
 | Group Health Cooperative of SC Wisconsin | regional | - | needs official source URL |
 | Harvard Pilgrim | regional | https://www.harvardpilgrim.org/public/machine-readable-files | curated source row |
 | Harvard Pilgrim Health Care | regional | https://www.harvardpilgrim.org/public/machine-readable-files | observed stale; 407 plans; 1,731 files |

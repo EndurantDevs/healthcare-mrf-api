@@ -752,6 +752,16 @@ def classify_hosting_platform(url: str | None) -> str | None:
     ):
         return "html_mrf_links"
     if (
+        host in {"www.sharphealthplan.com", "sharphealthplan.com"}
+        and "api-access-for-developers" in path
+    ):
+        return "html_mrf_links"
+    if (
+        host in {"group-health.com", "www.group-health.com"}
+        and "price-transparency" in path
+    ):
+        return "html_mrf_links"
+    if (
         host in {"chorushealthplans.org", "www.chorushealthplans.org"}
         and "transparency-in-coverage" in path
     ):

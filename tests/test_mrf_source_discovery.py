@@ -271,6 +271,18 @@ def test_classify_hosting_platform_recognizes_public_adapter_pages():
     )
     assert (
         discovery.classify_hosting_platform(
+            "https://www.sharphealthplan.com/api-access-for-developers"
+        )
+        == "html_mrf_links"
+    )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://group-health.com/price-transparency"
+        )
+        == "html_mrf_links"
+    )
+    assert (
+        discovery.classify_hosting_platform(
             "https://sisconosurprise.com/ppo/phcs/index.html"
         )
         == "html_mrf_links"
@@ -662,6 +674,8 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
 | BlueAdvantage Administrators of Arkansas | tpa | https://www.blueadvantagearkansas.com/interoperability/machine-readable-files | aliases: BlueAdvantage, Skai BCBS |
 | GEHA | network/tpa | https://www.geha.com/transparency-in-coverage | benefit lines: dental, medical; aliases: Connection Dental |
 | Valley Health Plan | medicaid_mco | https://data.sccgov.org/data.json | benefit lines: medical, dental, vision; aliases: VHP |
+| Sharp Health Plan | provider_sponsored | https://www.sharphealthplan.com/api-access-for-developers | aliases: Sharp Health Plan of San Diego |
+| Group Health Cooperative of Eau Claire | regional | https://group-health.com/price-transparency | aliases: Group Health Eau Claire |
 | S&S Health | tpa | https://mrf.healthcarebluebook.com/SandS | aliases: S&S HealthCare, SandS, Reflect Health |
 | SimplePay Health | tpa | https://www.simplepayhealth.com/ | aliases: SimplePay |
 | SISCO | tpa | https://sisconosurprise.com/ppo/phcs/index.html | aliases: SISCO Benefits, Self Insured Services Company |
@@ -746,6 +760,15 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
         "medical",
         "dental",
         "vision",
+    )
+    assert by_name["Sharp Health Plan"].hosting_platform == "html_mrf_links"
+    assert by_name["Sharp Health Plan"].aliases == ("Sharp Health Plan of San Diego",)
+    assert (
+        by_name["Group Health Cooperative of Eau Claire"].hosting_platform
+        == "html_mrf_links"
+    )
+    assert by_name["Group Health Cooperative of Eau Claire"].aliases == (
+        "Group Health Eau Claire",
     )
     assert by_name["S&S Health"].hosting_platform == "healthcarebluebook_mrf"
     assert by_name["S&S Health"].aliases == (
@@ -1347,6 +1370,18 @@ def test_classify_hosting_platforms():
             "https://www.geha.com/transparency-in-coverage"
         )
         == "html_delegated_mrf_links"
+    )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://www.sharphealthplan.com/api-access-for-developers"
+        )
+        == "html_mrf_links"
+    )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://group-health.com/price-transparency"
+        )
+        == "html_mrf_links"
     )
     assert (
         discovery.classify_hosting_platform("https://data.sccgov.org/data.json")
@@ -3760,6 +3795,94 @@ def test_parse_html_mrf_links_extracts_price_transparency_index_suffix():
     ]
 
 
+def test_parse_html_mrf_links_extracts_sharp_direct_zip_files():
+    html = """
+    <a href="/docs/default-source/price-transparency/2026-06-tableofcontents.zip">
+      Table of Contents
+    </a>
+    <a href="/docs/default-source/price-transparency/2026-06-allowed_amounts.zip">
+      Allowed Amounts
+    </a>
+    <a href="https://docs.sharphealthplan.com/shp-documents/doc/2026-06-IN_NETWORK_CAP.zip">
+      In-Network - CAP
+    </a>
+    <a href="https://docs.sharphealthplan.com/shp-documents/doc/2026-06-IN_NETWORK_FFS.zip">
+      In-Network - FFS
+    </a>
+    """
+
+    targets = discovery._parse_html_mrf_links(
+        html, base_url="https://www.sharphealthplan.com/api-access-for-developers"
+    )
+
+    assert targets == [
+        {
+            "url": "https://www.sharphealthplan.com/docs/default-source/price-transparency/2026-06-allowed_amounts.zip",
+            "label": "Allowed Amounts",
+            "resolver": "html_file_reference",
+            "target_kind": "file_reference",
+            "target_file_type": "allowed-amounts",
+            "container_format": "zip",
+            "html_attr": "href",
+        },
+        {
+            "url": "https://docs.sharphealthplan.com/shp-documents/doc/2026-06-IN_NETWORK_CAP.zip",
+            "label": "In-Network - CAP",
+            "resolver": "html_file_reference",
+            "target_kind": "file_reference",
+            "target_file_type": "in-network",
+            "container_format": "zip",
+            "html_attr": "href",
+        },
+        {
+            "url": "https://docs.sharphealthplan.com/shp-documents/doc/2026-06-IN_NETWORK_FFS.zip",
+            "label": "In-Network - FFS",
+            "resolver": "html_file_reference",
+            "target_kind": "file_reference",
+            "target_file_type": "in-network",
+            "container_format": "zip",
+            "html_attr": "href",
+        },
+    ]
+
+
+def test_parse_html_mrf_links_extracts_group_health_eau_claire_json_files():
+    html = """
+    <p>
+      <a href="/getmedia/fa7482cb-b902-415a-8779-f4abfa2f6bd5/2024-06-03_group-health-cooperative-of-eau-claire_medicaid_in-network-rates.json">
+        Medicaid JSON
+      </a>
+      <a href="/getmedia/55db35a9-0f8c-4bed-acae-7236b11be506/2024-06-03_group-health-cooperative-of-eau-claire_medicare_in-network-rates.json">
+        Medicare JSON
+      </a>
+      <a href="/getmedia/1cda96fc-8e5e-40d3-acd1-a3dd203a730c/2024-06-03_group-health-cooperative-of-eau-claire_commercial_in-network-rates.json">
+        Commercial JSON
+      </a>
+      <a href="/getmedia/e797fd3a-2708-490f-badb-61468ddab7a6/2024-02-05_group-health-cooperative-of-eau-claire_commercial_allowed-amounts.json">
+        Commercial Allowed Amounts JSON
+      </a>
+    </p>
+    """
+
+    targets = discovery._parse_html_mrf_links(
+        html, base_url="https://group-health.com/price-transparency"
+    )
+
+    assert [target["target_file_type"] for target in targets] == [
+        "in-network",
+        "in-network",
+        "in-network",
+        "allowed-amounts",
+    ]
+    assert [target["label"] for target in targets] == [
+        "Medicaid JSON",
+        "Medicare JSON",
+        "Commercial JSON",
+        "Commercial Allowed Amounts JSON",
+    ]
+    assert all(target["target_kind"] == "file_reference" for target in targets)
+
+
 def test_parse_html_mrf_links_accepts_extensionless_toc_and_oon_files():
     html = """
     <a href="https://files.example.test/mrf-files/opaque-token">
@@ -4313,6 +4436,30 @@ def test_delegated_mrf_source_urls_extracts_supported_links_and_bare_hosts():
         "https://www.anthem.com/machine-readable-file/search",
         "https://bcbsil.com/asomrf?EIN=300088171",
         "https://alliedbenefit.sapphiremrfhub.com/",
+    ]
+
+
+def test_delegated_mrf_source_urls_extracts_sharp_network_links():
+    html = """
+    <a href="https://transparency-in-coverage.optum.com/">
+      Optum Behavioral Health MRFs
+    </a>
+    <a href="https://health1.aetna.com/app/public/#/one/insurerCode=ASA_12&brandCode=AETNAASA/machine-readable-transparency-in-coverage">
+      Aetna MRFs
+    </a>
+    <a href="https://www.health1.firsthealth.com/app/public/#/one/insurerCode=FIRSTHEALTH_I&brandCode=FIRSTH/machine-readable-transparency-in-coverage">
+      First Health MRFs
+    </a>
+    """
+
+    urls = discovery._delegated_mrf_source_urls_from_html(
+        html, base_url="https://www.sharphealthplan.com/api-access-for-developers"
+    )
+
+    assert urls == [
+        "https://transparency-in-coverage.optum.com/",
+        "https://health1.aetna.com/app/public/#/one/insurerCode=ASA_12&brandCode=AETNAASA/machine-readable-transparency-in-coverage",
+        "https://www.health1.firsthealth.com/app/public/#/one/insurerCode=FIRSTHEALTH_I&brandCode=FIRSTH/machine-readable-transparency-in-coverage",
     ]
 
 
