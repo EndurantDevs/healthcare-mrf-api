@@ -916,6 +916,14 @@ def classify_hosting_platform(url: str | None) -> str | None:
         ("/mrf", "/umbraco/surface/mrfdownload", "/home/umbraco/surface/mrfdownload")
     ):
         return "asr_health_benefits"
+    if host in {"www.blueadvantagearkansas.com", "blueadvantagearkansas.com"} and (
+        "machine-readable-files" in path
+    ):
+        return "html_mrf_links"
+    if host in {"www.geha.com", "geha.com"} and path.startswith(
+        "/transparency-in-coverage"
+    ):
+        return "html_delegated_mrf_links"
     if host in {
         "transparency-in-coverage.uhc.com",
         "transparency-in-coverage.optum.com",

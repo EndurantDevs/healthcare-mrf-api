@@ -644,6 +644,13 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
 | Pinnacle Claims Management | tpa | https://mrf.healthcarebluebook.com/Pinnacle | aliases: PCMI |
 | Regency Employee Benefits | tpa | https://www.mymedicalshopper.com/mrf-search/robbins-regency-employee-benefits-inc-regn | aliases: Robbins Regency Employee Benefits |
 | Varipro | tpa | https://www.mymedicalshopper.com/mrf-search/varipro | aliases: Varipro TPA, Valipro TPA |
+| ACS Benefit Services | tpa | https://acsbenefitservices.sapphiremrfhub.com/ | aliases: ACS Benefits |
+| Marpai | tpa | https://www.mymedicalshopper.com/mrf-search/marpai | aliases: Marpai Health |
+| Simplified Benefits Administrators | tpa | https://mrf.healthcarebluebook.com/SBA | aliases: SBA |
+| Nippon Life Benefits | tpa | https://mrf.healthcarebluebook.com/Nippon | aliases: Nippon Life |
+| UMWA Health and Retirement Funds | tpa | https://mrf.healthcarebluebook.com/healthsmartfundsaccount | aliases: UMWA Funds |
+| BlueAdvantage Administrators of Arkansas | tpa | https://www.blueadvantagearkansas.com/interoperability/machine-readable-files | aliases: BlueAdvantage, Skai BCBS |
+| GEHA | network/tpa | https://www.geha.com/transparency-in-coverage | benefit lines: dental, medical; aliases: Connection Dental |
 | S&S Health | tpa | https://mrf.healthcarebluebook.com/SandS | aliases: S&S HealthCare, SandS, Reflect Health |
 | SimplePay Health | tpa | https://www.simplepayhealth.com/ | aliases: SimplePay |
 | SISCO | tpa | https://sisconosurprise.com/ppo/phcs/index.html | aliases: SISCO Benefits, Self Insured Services Company |
@@ -703,6 +710,23 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
     )
     assert by_name["Varipro"].hosting_platform == "mymedicalshopper_talon"
     assert by_name["Varipro"].aliases == ("Varipro TPA", "Valipro TPA")
+    assert by_name["ACS Benefit Services"].hosting_platform == "sapphire"
+    assert by_name["Marpai"].hosting_platform == "mymedicalshopper_talon"
+    assert (
+        by_name["Simplified Benefits Administrators"].hosting_platform
+        == "healthcarebluebook_mrf"
+    )
+    assert by_name["Nippon Life Benefits"].hosting_platform == "healthcarebluebook_mrf"
+    assert (
+        by_name["UMWA Health and Retirement Funds"].hosting_platform
+        == "healthcarebluebook_mrf"
+    )
+    assert (
+        by_name["BlueAdvantage Administrators of Arkansas"].hosting_platform
+        == "html_mrf_links"
+    )
+    assert by_name["GEHA"].hosting_platform == "html_delegated_mrf_links"
+    assert by_name["GEHA"].benefit_lines == ("dental", "medical")
     assert by_name["S&S Health"].hosting_platform == "healthcarebluebook_mrf"
     assert by_name["S&S Health"].aliases == (
         "S&S HealthCare",
@@ -775,6 +799,12 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert (
         "Delta Dental of Michigan" in by_name["Delta Dental Plan of Michigan"].aliases
     )
+    assert "Delta Dental of Indiana" in by_name["Delta Dental Plan of Michigan"].aliases
+    assert (
+        "Delta Dental Plan of Ohio" in by_name["Delta Dental Plan of Michigan"].aliases
+    )
+    assert "Cigna Dental PPO" in by_name["Cigna"].aliases
+    assert "Horizon Healthcare Dental" in by_name["Horizon BCBS NJ"].aliases
     assert by_name["EyeMed"].entity_type == "vision"
     assert by_name["EyeMed"].benefit_lines == ("vision",)
     assert by_name["EyeMed"].hosting_platform == "direct_mrf_body"
@@ -783,7 +813,11 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert by_name["HealthLink"].hosting_platform == "anthem_s3_mrf"
     assert "Delta Dental of Oregon" in by_name["Moda Health"].aliases
     assert by_name["VSP Vision"].hosting_platform == "sapphire"
+    assert by_name["VSP Vision"].benefit_lines == ("vision",)
     assert "VSP" in by_name["VSP Vision"].aliases
+    assert by_name["GEHA"].hosting_platform == "html_delegated_mrf_links"
+    assert by_name["GEHA"].benefit_lines == ("dental", "medical")
+    assert "Connection Dental Federal" in by_name["GEHA"].aliases
     assert by_name["The Health Plan"].hosting_platform == "healthplan_html_mrf_links"
     assert "The Health Plan of West Virginia" in by_name["The Health Plan"].aliases
     assert (
@@ -1281,6 +1315,18 @@ def test_classify_hosting_platforms():
             "https://www.mymedicalshopper.com/mrf/electrical-workers-cofinity-varipro-77100"
         )
         == "mymedicalshopper_talon"
+    )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://www.blueadvantagearkansas.com/interoperability/machine-readable-files"
+        )
+        == "html_mrf_links"
+    )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://www.geha.com/transparency-in-coverage"
+        )
+        == "html_delegated_mrf_links"
     )
     assert (
         discovery.classify_hosting_platform("https://transparency.emblemhealth.com/")

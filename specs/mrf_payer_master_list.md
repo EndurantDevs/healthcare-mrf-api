@@ -89,7 +89,7 @@ Last one-time research refresh: 2026-06-05.
 | Highmark Blue Shield of Northeastern New York | blue | - | needs official source URL |
 | Highmark Blue Shield Pennsylvania | blue | - | needs official source URL |
 | HMSA | blue | https://www.hmsa.com/help-center/transparency-in-coverage-machine-readable-files/ | curated source row; aliases: HAWAII BLUE CROSS BLUE SHIELD HMSA, Hawaii Blue Cross Blue Shield HMSA |
-| Horizon BCBS NJ | blue | https://horizonblue.sapphiremrfhub.com/ | curated source row; aliases: Horizon Blue Cross of New Jersey, Horizon Blue Cross Blue Shield of New Jersey |
+| Horizon BCBS NJ | blue | https://horizonblue.sapphiremrfhub.com/ | curated source row; aliases: Horizon Blue Cross of New Jersey, Horizon Blue Cross Blue Shield of New Jersey, Horizon Healthcare Dental, Horizon Dental |
 | Horizon Blue | blue | https://horizonblue.sapphiremrfhub.com/ | observed current; 2,591 plans; 3,446 files |
 | Horizon Blue Cross Blue Shield New Jersey | blue | - | needs official source URL |
 | Independence Blue Cross | blue | https://www.ibx.com/cmstic/?brand=qcc | curated source row; aliases: Independence Administrators, Pennsylvania Independence Blue Cross |
@@ -149,7 +149,7 @@ Last one-time research refresh: 2026-06-05.
 | Anthem | national | https://www.anthem.com/machine-readable-file/search/ | curated source row; aliases: Anthem Blue Cross, Anthem Blue Cross California, ANTHEM BLUE CROSS CALIFORNIA, Anthem Blue Cross and Blue Shield, Anthem BlueCross and BlueShield, Anthem Blue Cross Blue Shield, Anthem Health Plans of Kentucky Inc, Anthem Health Plans of Virginia Inc, Anthem Insurance Companies, Anthem Insurance Companies Inc, Blue Cross and Blue Shield of Georgia, Blue Cross Blue Shield of Georgia, HealthKeepers |
 | Centene | national | https://www.centene.com/price-transparency-files.html | curated source row |
 | Centene Wellcare | national | https://www.centene.com/price-transparency-files.html | observed stale; 4,895 plans; 965 files |
-| Cigna | national | https://www.cigna.com/legal/compliance/machine-readable-files | curated source row |
+| Cigna | national | https://www.cigna.com/legal/compliance/machine-readable-files | curated source row; aliases: Cigna Dental, Cigna Dental PPO, Cigna Dental HMO, Cigna Dental Care |
 | Elevance Health | national | https://www.anthem.com/machine-readable-file/search/ | curated source row |
 | First Health | national | https://www.health1.firsthealth.com/app/public/#/one/insurerCode=FIRSTHEALTH_I&brandCode=FIRSTH/ | curated source row |
 | Humana | national | https://developers.humana.com/cost-transparency | curated source row |
@@ -166,15 +166,15 @@ Last one-time research refresh: 2026-06-05.
 | American Specialty Health | network/tpa | - | needs official source URL |
 | Carelon | network/tpa | - | needs official source URL |
 | Davis Vision | network/tpa | - | needs official source URL |
-| Delta Dental Plan of Michigan | dental | https://bcbsm.sapphiremrfhub.com/tocs/current/delta_dental_plan_of_mich | public Delta Dental Plan of Michigan machine-readable file linked through BCBSM Sapphire current TOC; aliases: Delta Dental of Michigan, Delta Dental Plan of Mich |
+| Delta Dental Plan of Michigan | dental | https://bcbsm.sapphiremrfhub.com/tocs/current/delta_dental_plan_of_mich | public Delta Dental Plan of Michigan machine-readable file linked through BCBSM Sapphire current TOC; aliases: Delta Dental of Michigan, Delta Dental Plan of Mich, Delta Dental of Indiana, Delta Dental of Ohio, Delta Dental Plan of Indiana, Delta Dental Plan of Ohio |
 | EyeMed | vision | https://content.eyemedvisioncare.com/EyeMed_HCSC/eyemed_in-network-rates.json | public HCSC-linked EyeMed in-network MRF body; benefit lines: vision; aliases: EyeMed Vision Care |
-| GEHA | network/tpa | - | needs official source URL |
+| GEHA | network/tpa | https://www.geha.com/transparency-in-coverage | official GEHA TiC landing page; delegates MRF access to UnitedHealthcare; benefit lines: dental, medical; aliases: Government Employees Health Association, Connection Dental Federal, Connection Dental Plus, Connection Dental |
 | HealthLink | network/tpa | https://www.healthlink.com/machine-readable-file/search/ | public Anthem/Elevance machine-readable file search page; aliases: HealthLink Network |
 | MultiPlan | network/tpa | - | needs official source URL |
 | Northwell Direct | network/tpa | - | needs official source URL |
 | Northwood | network/tpa | - | needs official source URL |
 | PHCS | network/tpa | https://sisconosurprise.com/ppo/phcs/index.html | public transparency URL |
-| VSP Vision | network/tpa | https://bcbsm.sapphiremrfhub.com/tocs/current/vsp_vision | public VSP Vision machine-readable file linked from VSP careers transparency note; aliases: VSP, Vision Service Plan, Vision Plan Service, VSP Vision Care |
+| VSP Vision | network/tpa | https://bcbsm.sapphiremrfhub.com/tocs/current/vsp_vision | public VSP Vision machine-readable file linked from VSP careers transparency note; benefit lines: vision; aliases: VSP, Vision Service Plan, Vision Plan Service, VSP Vision Care |
 | AllWays | provider_sponsored | https://massgeneralbrighamhealthplan.org/meet-us/transparency-regulations | curated source row |
 | Avera Health Plans | provider_sponsored | https://portaldocs.dakotacare.com/MachineReadableFiles/Avera | curated source row |
 | Baylor Scott & White HP | provider_sponsored | https://www.bswhealthplan.com/transparency | curated source row |
@@ -345,6 +345,8 @@ Last one-time research refresh: 2026-06-05.
 | Collective Health | tpa | https://transparency-in-coverage.collectivehealth.com/index.html | curated source row |
 | Consociate Health | tpa | https://mrf.healthcarebluebook.com/Consociate | public Healthcare Bluebook MRF directory; aliases: Consociate, Consociate Inc. |
 | Carefactor | tpa | https://mrf.healthcarebluebook.com/Carefactor | public Healthcare Bluebook MRF directory; aliases: CareFactor |
+| ACS Benefit Services | tpa | https://acsbenefitservices.sapphiremrfhub.com/ | public ACS MRF hub; aliases: ACS Benefits, ACS Benefit Services LLC |
+| BlueAdvantage Administrators of Arkansas | tpa | https://www.blueadvantagearkansas.com/interoperability/machine-readable-files | official machine-readable files page with Arkansas Blue Cross, Health Advantage, Skai, and BlueAdvantage TOC links; aliases: BlueAdvantage, Skai Blue Cross Blue Shield, Skai BCBS |
 | EBMS | tpa | https://caa.ebms.com/ | public EBMS CAA MRF client directory; resolver expands public client pages to current TOC files; aliases: Employee Benefit Management Services, Employee Benefit Management Services EBMS, Employee Benefit Management Services Inc |
 | EBPA | tpa | https://tuition.ebpabenefits.com/employers/machine-readable-file-links | public EBPA MRF network selector; aliases: EBPA Benefits, EBPA Employee Benefits, EBPA LLC |
 | HealthNow Administrative Services | tpa | https://www.hnas.com/digital-resources/machine-readable-files | public HNAS delegated MRF directory; aliases: HNAS, Brokerage Concepts LLC dba HealthNow Administrative Services |
@@ -358,10 +360,12 @@ Last one-time research refresh: 2026-06-05.
 | Loomis | tpa | https://mrf.healthcarebluebook.com/Loomis | public Healthcare Bluebook MRF directory; aliases: Loomis Company, Loomis Benefit Administrators, The Loomis Company, LOOMIS COMPANY (THE) |
 | Lucent Health | tpa | https://lucenthealth.com/transparency-in-coverage/ | public transparency page; delegates INN MRF listing to Healthcare Bluebook; aliases: Cypress Benefit Administrators, Cypress Benefit Administrators now Lucent Health |
 | Luminare Health Benefits | tpa | https://mrf.healthcarebluebook.com/luminarehealth | public Healthcare Bluebook MRF directory; aliases: Luminare Health, Luminare Health Benefits (formerly Trustmark), Anthem administered by Luminare Health, Trustmark Health Benefits, Trustmark |
+| Marpai | tpa | https://www.mymedicalshopper.com/mrf-search/marpai | public MyMedicalShopper/TALON MRF search linked from Marpai transparency page; aliases: Marpai Health, Marpai Administrators |
 | MedBen | tpa | https://mb.mrf.payercompass.com/ | public Zelis/PayerCompass MRF repository; aliases: Medical Benefits Mutual Life Insurance Co, Medical Benefits Administrators |
 | MedCost | tpa | https://mrf.mmsanalytics.com/medcost/ | public MRF directory linked from MedCost transparency page; aliases: MedCost, MEDCOST BENEFIT SERVICES (MBS) |
 | Meritain Health | tpa | https://mrfsearch.meritain.com/ | public group/client search table; resolver catalogs group-level HealthSparq links; aliases: Meritain, Meritain Health An Aetna Company, MERITAIN HEALTH NORTH AMERICAN HEALTH PLAN |
 | Meritain Health | tpa | https://health1.aetna.com/app/public/#/one/insurerCode=MERITAIN_I&brandCode=MERITAINOVER/machine-readable-transparency-in-coverage | curated source row; aliases: Meritain, Meritain Health An Aetna Company, MERITAIN HEALTH NORTH AMERICAN HEALTH PLAN |
+| Nippon Life Benefits | tpa | https://mrf.healthcarebluebook.com/Nippon | public Healthcare Bluebook MRF directory; aliases: Nippon Life, Nippon Life Insurance Company of America |
 | Nova Healthcare Administrators | tpa | https://www.novahealthcare.com/resources/mrf.html | public transparency page with direct and delegated network MRF links; aliases: Nova Healthcare, Nova Healthcare Administrators Inc |
 | PBA | tpa | https://www.pbaclaims.com/mrfs/ | curated source row |
 | Pinnacle Claims Management | tpa | https://mrf.healthcarebluebook.com/Pinnacle | public Healthcare Bluebook MRF directory; aliases: Pinnacle Claims Management Inc, PCMI |
@@ -373,8 +377,10 @@ Last one-time research refresh: 2026-06-05.
 | SimplePay Health | tpa | https://www.simplepayhealth.com/ | public landing page delegates MRF access to Meritain/Aetna HealthSparq; aliases: SimplePay |
 | SISCO | tpa | https://sisconosurprise.com/ppo/phcs/index.html | public SISCO PPO machine-readable file page for PHCS TOC; aliases: SISCO Benefits, Self Insured Services Company |
 | SISCO | tpa | https://sisconosurprise.com/ppo/hps/index.html | public SISCO PPO machine-readable file page for HPS in-network file; aliases: SISCO Benefits, Self Insured Services Company |
+| Simplified Benefits Administrators | tpa | https://mrf.healthcarebluebook.com/SBA | public Healthcare Bluebook MRF directory; aliases: SBA, Simplified Benefits |
 | Tall Tree Administrators | tpa | https://talltreeadmin.com/machine-readable-files | public MRF link page; aliases: Tall Tree, Tall Tree Administration |
 | Unified Group Services | tpa | https://mrf.healthcarebluebook.com/unified | public Healthcare Bluebook MRF directory; aliases: UGS, UnifiedGrp |
+| UMWA Health and Retirement Funds | tpa | https://mrf.healthcarebluebook.com/healthsmartfundsaccount | public Healthcare Bluebook MRF directory linked from UMWA transparency page; aliases: UMWA Funds, HealthSmart Funds Account |
 | Varipro | tpa | https://www.mymedicalshopper.com/mrf-search/varipro | MyMedicalShopper/TALON MRF search; resolver enumerates current employer plan TOCs; aliases: Varipro TPA, Valipro, Valipro TPA, Professional Benefits Services, PBS |
 | Vitori Health | tpa | https://mrf.healthcarebluebook.com/Flume | public Healthcare Bluebook MRF directory for Flume/Vitori sources; aliases: Vitori, Flume |
 | WebTPA | tpa | https://www.webtpa.com/rights-protections | curated source row |
