@@ -7,6 +7,7 @@ import base64
 import datetime
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -48,6 +49,7 @@ from process.ext.utils import ensure_database
 DEFAULT_SEED_DB_URL = (
     "https://raw.githubusercontent.com/hltiunn/provider-directory-db/main/data/provider_directory.db"
 )
+LOGGER = logging.getLogger(__name__)
 DEFAULT_RESOURCES = (
     "InsurancePlan",
     "PractitionerRole",
@@ -2052,7 +2054,11 @@ async def publish_provider_directory_ptg_address_corroboration_table(
         try:
             await db.status(f"DROP TABLE IF EXISTS {stage_ref};")
         except Exception:  # pragma: no cover - cleanup best effort
-            pass
+            LOGGER.warning(
+                "Failed to clean provider directory PTG address stage table %s",
+                stage_ref,
+                exc_info=True,
+            )
         raise
 
 

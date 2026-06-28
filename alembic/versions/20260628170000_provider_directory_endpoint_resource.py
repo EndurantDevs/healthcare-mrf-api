@@ -3,6 +3,7 @@
 import os
 
 from alembic import op
+from sqlalchemy import text
 
 
 revision = "20260628170000_provider_directory_endpoint_resource"
@@ -25,16 +26,9 @@ def _qt(schema: str, table: str) -> str:
 
 def _table_exists(bind, schema: str, table: str) -> bool:
     return bool(
-        bind.exec_driver_sql(
-            """
-            SELECT EXISTS (
-                SELECT 1
-                  FROM information_schema.tables
-                 WHERE table_schema = %(schema)s
-                   AND table_name = %(table)s
-            )
-            """,
-            {"schema": schema, "table": table},
+        bind.execute(
+            text("SELECT to_regclass(:name)"),
+            {"name": f"{schema}.{table}"},
         ).scalar()
     )
 
