@@ -1209,7 +1209,7 @@ def test_import_control_snapshot_company_fallback_from_index_url():
 
 
 @pytest.mark.asyncio
-async def test_import_control_snapshot_items_skip_non_serving_rate_files(monkeypatch):
+async def test_import_control_snapshot_items_keep_serving_rate_files(monkeypatch):
     calls = 0
 
     async def fake_all(_stmt):
@@ -1267,12 +1267,18 @@ async def test_import_control_snapshot_items_skip_non_serving_rate_files(monkeyp
 
     items = await discovery._import_control_snapshot_items(["source_1"])
 
-    assert len(items["source_1"]) == 1
+    assert len(items["source_1"]) == 2
     assert (
         items["source_1"][0]["canonical_url"]
         == "https://example.com/in-network-rates.json.gz"
     )
     assert items["source_1"][0]["domain"] == "in-network"
+    assert (
+        items["source_1"][1]["canonical_url"]
+        == "https://example.com/direct-in-network-rates.json.gz"
+    )
+    assert items["source_1"][1]["domain"] == "in-network"
+    assert items["source_1"][1]["from_index_url"] is None
 
 
 def test_import_control_snapshot_file_support_excludes_csv_catalog_references():
@@ -1289,6 +1295,14 @@ def test_import_control_snapshot_file_support_excludes_csv_catalog_references():
             "in-network",
             {"source_format": "zip", "domain": "in-network"},
             "https://example.com/index.json",
+        )
+        is True
+    )
+    assert (
+        discovery._import_control_snapshot_file_is_supported(
+            "in-network",
+            {"domain": "in-network"},
+            None,
         )
         is True
     )

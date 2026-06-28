@@ -9123,8 +9123,6 @@ def _import_control_supported_rate_domain(value: Any) -> bool:
 def _import_control_snapshot_file_is_supported(
     file_type: Any, metadata: dict[str, Any], from_index_url: Any
 ) -> bool:
-    if not str(from_index_url or "").strip():
-        return False
     if str(metadata.get("source_format") or "").strip().lower() == "csv":
         return False
     return _import_control_supported_rate_domain(metadata.get("domain") or file_type)
