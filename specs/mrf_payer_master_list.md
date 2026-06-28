@@ -167,14 +167,14 @@ Last one-time research refresh: 2026-06-05.
 | Carelon | network/tpa | - | needs official source URL |
 | Davis Vision | network/tpa | - | needs official source URL |
 | Delta Dental Plan of Michigan | dental | https://bcbsm.sapphiremrfhub.com/tocs/current/delta_dental_plan_of_mich | public Delta Dental Plan of Michigan machine-readable file linked through BCBSM Sapphire current TOC; aliases: Delta Dental of Michigan, Delta Dental Plan of Mich, Delta Dental of Indiana, Delta Dental of Ohio, Delta Dental Plan of Indiana, Delta Dental Plan of Ohio |
-| EyeMed | vision | https://content.eyemedvisioncare.com/EyeMed_HCSC/eyemed_in-network-rates.json | public HCSC-linked EyeMed in-network MRF body; benefit lines: vision; aliases: EyeMed Vision Care |
+| EyeMed | vision | https://content.eyemedvisioncare.com/EyeMed_HCSC/eyemed_in-network-rates.json | public HCSC-linked EyeMed in-network MRF body; benefit lines: vision; aliases: EyeMed Vision Care, EyeMed Vision Benefits, EyeMed Vision Network, EyeMed Vision Care LLC, Eye Med, Ameritas EyeMed, Ameritas with EyeMed, Mutual of Omaha EyeMed, Mutual of Omaha EyeMed Vision Care, BlueCare Vision EyeMed, BlueCare Vision of Texas |
 | GEHA | network/tpa | https://www.geha.com/transparency-in-coverage | official GEHA TiC landing page; delegates MRF access to UnitedHealthcare; benefit lines: dental, medical; aliases: Government Employees Health Association, Connection Dental Federal, Connection Dental Plus, Connection Dental |
 | HealthLink | network/tpa | https://www.healthlink.com/machine-readable-file/search/ | public Anthem/Elevance machine-readable file search page; aliases: HealthLink Network |
 | MultiPlan | network/tpa | - | needs official source URL |
 | Northwell Direct | network/tpa | - | needs official source URL |
 | Northwood | network/tpa | - | needs official source URL |
 | PHCS | network/tpa | https://sisconosurprise.com/ppo/phcs/index.html | public transparency URL |
-| VSP Vision | network/tpa | https://bcbsm.sapphiremrfhub.com/tocs/current/vsp_vision | public VSP Vision machine-readable file linked from VSP careers transparency note; benefit lines: vision; aliases: VSP, Vision Service Plan, Vision Plan Service, VSP Vision Care |
+| VSP Vision | network/tpa | https://bcbsm.sapphiremrfhub.com/tocs/current/vsp_vision | public VSP Vision machine-readable file linked from VSP careers transparency note; benefit lines: vision; aliases: VSP, Vision Service Plan, Vision Service Plan (VSP), Vision Plan Service, VSP Vision Care, VSP Choice, VSP Choice Network, VSP Choice Plan, Principal VSP, Principal Financial Group VSP, MetLife VSP, MetLife VSP Choice, MetLife Vision with VSP Choice, Sun Life VSP, SunLife VSP, Guardian VSP, Guardian VSP Network, Guardian - VSP Network, Ameritas VSP, Ameritas with VSP |
 | AllWays | provider_sponsored | https://massgeneralbrighamhealthplan.org/meet-us/transparency-regulations | curated source row |
 | Avera Health Plans | provider_sponsored | https://portaldocs.dakotacare.com/MachineReadableFiles/Avera | curated source row |
 | Baylor Scott & White HP | provider_sponsored | https://www.bswhealthplan.com/transparency | curated source row |
@@ -333,19 +333,24 @@ Last one-time research refresh: 2026-06-05.
 | Allegiance Benefit Plan Management | tpa | https://mrf.healthcarebluebook.com/Allegiance | public Healthcare Bluebook MRF directory; current TOC is allowed-amount only with no in-network files observed; aliases: Allegiance, Allegiance Benefit Plan Management Inc, AskAllegiance |
 | Allied Benefit Systems | tpa | https://alliedbenefit.sapphiremrfhub.com/ | curated source row; aliases: Allied Benefit |
 | Allied Benefit Systems | tpa | https://www.alliedbenefit.com/transparency-in-coverage-mrf | public transparency URL |
+| American Plan Administrators | tpa | https://apatpa.com/disclosures-terms-conditions-privacy-policy-american-plan-administrators/ | public APA disclosure page with delegated Cigna, MagnaCare, The Alliance, Prime Health, and PHCS MRF links; aliases: APA, APA TPA |
 | AmeriBen | tpa | https://github.com/AmeriBen/MRF | curated source row; aliases: AmeriBen Anthem, AmeriBen Anthem Blue Cross |
 | ASR Health Benefits | tpa | https://www.asrhealthbenefits.com/MRF | public group-number MRF lookup; resolver uses configured public group seeds |
 | Assured Benefits Administrators | tpa | https://transparency.abadmin.com/ | public transparency page with delegated network MRF links; aliases: ABA, ABAdmin |
 | Auxiant | tpa | https://transparency.auxiant.com/directory-of-data-sources/ | public WordPress data source directory; resolver expands data-available network pages; aliases: Auxiant TPA, Auxient TPA, Auxient |
 | Benefits and Risk Management Services | tpa | - | needs official source URL |
+| Benefit Plan Administrators | tpa | https://www.mymedicalshopper.com/mrf-search/benefit-plan-administrators | public BPA/TALON MRF search linked from BPA machine-readable files page; aliases: BPA, BPA TPA, BPA Inc, Benefit Plan Administrators Inc |
 | Boon-Chapman | tpa | https://boonchapman-mrf.zakipointhealth.com/ | public ZakiPoint MRF directory linked from Boon-Chapman transparency page; aliases: Boon Chapman, Boon-Chapman Benefit Administrators |
 | BRMS | tpa | https://www.myhealthbenefits.com/MyHealthBenefits/Home/MRFs/ | public MRF table; resolver catalogs direct files and Healthcare Bluebook delegated rows |
+| ByWater | tpa | https://www.mymedicalshopper.com/mrf-search/bywater | public ByWater transparency page delegates MRF search to TALON/MyMedicalShopper; aliases: Bywater, ByWater Health, Choose ByWater |
 | CBA Blue | tpa | https://www.cbabluevt.com/employer-resources/ | public CBA Blue MRF page; aliases: CBA BLUE, CBA Blue VT |
+| Coastal Administrative Services | tpa | https://mrf.healthcarebluebook.com/CAS | public Healthcare Bluebook MRF directory for Coastal Administrative Services; aliases: CAS, CAS Benefits |
 | Collective Health | tpa | https://transparency-in-coverage.collectivehealth.com/ | public transparency URL |
 | Collective Health | tpa | https://transparency-in-coverage.collectivehealth.com/index.html | curated source row |
 | Consociate Health | tpa | https://mrf.healthcarebluebook.com/Consociate | public Healthcare Bluebook MRF directory; aliases: Consociate, Consociate Inc. |
 | Carefactor | tpa | https://mrf.healthcarebluebook.com/Carefactor | public Healthcare Bluebook MRF directory; aliases: CareFactor |
 | ACS Benefit Services | tpa | https://acsbenefitservices.sapphiremrfhub.com/ | public ACS MRF hub; aliases: ACS Benefits, ACS Benefit Services LLC |
+| Diversified Group | tpa | https://www.mymedicalshopper.com/mrf-search/diversified-group | public Diversified Group transparency notice delegates group MRF search to TALON/MyMedicalShopper; aliases: The Diversified Group, Diversified Group Benefits, Diversified Group TPA |
 | BlueAdvantage Administrators of Arkansas | tpa | https://www.blueadvantagearkansas.com/interoperability/machine-readable-files | official machine-readable files page with Arkansas Blue Cross, Health Advantage, Skai, and BlueAdvantage TOC links; aliases: BlueAdvantage, Skai Blue Cross Blue Shield, Skai BCBS |
 | EBMS | tpa | https://caa.ebms.com/ | public EBMS CAA MRF client directory; resolver expands public client pages to current TOC files; aliases: Employee Benefit Management Services, Employee Benefit Management Services EBMS, Employee Benefit Management Services Inc |
 | EBPA | tpa | https://tuition.ebpabenefits.com/employers/machine-readable-file-links | public EBPA MRF network selector; aliases: EBPA Benefits, EBPA Employee Benefits, EBPA LLC |
@@ -355,11 +360,12 @@ Last one-time research refresh: 2026-06-05.
 | Health Plans Inc (HPI) | tpa | https://hpitpa.com/transparency-in-coverage-machine-readable-files/ | public transparency URL; delegates MRF listing to Healthcare Bluebook; aliases: HPI, Health Plans Inc, Health Plans, Inc, HealthPlans Inc |
 | HealthComp | tpa | https://healthcomp.sapphiremrfhub.com/ | public Sapphire MRF hub; aliases: HealthComp LLC, HCOnline, Personify Health, Personify |
 | Healthgram | tpa | https://mrf.healthgram.com/ | public MRF network directory; resolver expands network pages to current TOC JSON links |
+| Imagine360 | tpa | https://caa.imagine360.com/IMAGINE360%20SERVICES%20LLC/index.html | public Imagine360 CAA table-of-contents directory linked from Imagine360 machine-readable files page; aliases: Imagine 360, Imagine360 Services, Imagine360 Services LLC |
 | Insurance Management Services | tpa | https://mrf.healthcarebluebook.com/IMS | public Healthcare Bluebook MRF directory linked from IMS healthcare reform page; aliases: IMS, IMS TPA, Insurance Management Services TX, Insurance Management Services Amarillo |
 | Group Administrators | tpa | https://www.groupadministrators.com/machinereadablefiles/ | public iframe-hosted MRF table; aliases: Group Administrators Ltd |
 | Loomis | tpa | https://mrf.healthcarebluebook.com/Loomis | public Healthcare Bluebook MRF directory; aliases: Loomis Company, Loomis Benefit Administrators, The Loomis Company, LOOMIS COMPANY (THE) |
 | Lucent Health | tpa | https://lucenthealth.com/transparency-in-coverage/ | public transparency page; delegates INN MRF listing to Healthcare Bluebook; aliases: Cypress Benefit Administrators, Cypress Benefit Administrators now Lucent Health |
-| Luminare Health Benefits | tpa | https://mrf.healthcarebluebook.com/luminarehealth | public Healthcare Bluebook MRF directory; aliases: Luminare Health, Luminare Health Benefits (formerly Trustmark), Anthem administered by Luminare Health, Trustmark Health Benefits, Trustmark |
+| Luminare Health Benefits | tpa | https://mrf.healthcarebluebook.com/luminarehealth | public Healthcare Bluebook MRF directory; aliases: Luminare Health, Luminare Health Benefits (formerly Trustmark), Anthem administered by Luminare Health, Trustmark Health Benefits, Trustmark, EVHC, Evolution Healthcare, Evolution Healthcare EVHC |
 | Marpai | tpa | https://www.mymedicalshopper.com/mrf-search/marpai | public MyMedicalShopper/TALON MRF search linked from Marpai transparency page; aliases: Marpai Health, Marpai Administrators |
 | MedBen | tpa | https://mb.mrf.payercompass.com/ | public Zelis/PayerCompass MRF repository; aliases: Medical Benefits Mutual Life Insurance Co, Medical Benefits Administrators |
 | MedCost | tpa | https://mrf.mmsanalytics.com/medcost/ | public MRF directory linked from MedCost transparency page; aliases: MedCost, MEDCOST BENEFIT SERVICES (MBS) |

@@ -655,6 +655,11 @@ def classify_hosting_platform(url: str | None) -> str | None:
             and "machine-readable-files" in path
         )
         or (
+            host in {"apatpa.com", "www.apatpa.com"}
+            and "disclosures" in path
+            and "american-plan-administrators" in path
+        )
+        or (
             host in {"www.simplepayhealth.com", "simplepayhealth.com"}
             and path in {"", "/"}
         )
@@ -689,6 +694,8 @@ def classify_hosting_platform(url: str | None) -> str | None:
     ):
         return "html_mrf_links"
     if host == "sisconosurprise.com" and path.startswith("/ppo/"):
+        return "html_mrf_links"
+    if host == "caa.imagine360.com" and path.endswith("/index.html"):
         return "html_mrf_links"
     if host == "portal.90degreebenefits.com" and path.startswith(
         "/memberportal/machinereadablefiles"
@@ -2478,6 +2485,9 @@ async def _mymedicalshopper_entity_employers(
     )
     page_size = max(_as_int(resolver.get("page_size")) or 100, 1)
     max_employers = max(_as_int(resolver.get("max_employers")) or 10000, 1)
+    max_targets = _as_int(resolver.get("max_targets"))
+    if max_targets and max_targets > 0:
+        max_employers = min(max_employers, max_targets)
     fields = {
         "name": 1,
         "slug": 1,
@@ -2683,6 +2693,7 @@ async def _resolve_mymedicalshopper_talon_mrf(
         raise ValueError(f"unsupported MyMedicalShopper MRF URL: {url}")
     timeout_seconds = float(_as_int(resolver.get("ddp_timeout_seconds")) or 30)
     max_plans = _as_int(resolver.get("max_plans_per_employer"))
+    max_targets = _as_int(resolver.get("max_targets"))
     ws = await _mymedicalshopper_ddp_connect(
         session, url, timeout_seconds=timeout_seconds
     )
@@ -2741,6 +2752,9 @@ async def _resolve_mymedicalshopper_talon_mrf(
                     resolved_from_url=url,
                 )
             )
+            if max_targets and max_targets > 0 and len(targets) >= max_targets:
+                targets = targets[:max_targets]
+                break
         if not targets:
             raise ValueError(f"no generated MyMedicalShopper MRF links found for {url}")
         return targets
@@ -9473,11 +9487,16 @@ async def main(
     )
     candidates: list[SourceCandidate] = []
     if needs_source_load:
+        provider_load_limit = (
+            None
+            if parsed_source_entity_types or parsed_source_payer_query
+            else bounded_limit
+        )
         for index, provider_name in enumerate(providers):
             try:
                 candidates.extend(
                     await _load_candidates(
-                        provider_name, test_mode=test_mode, limit=bounded_limit
+                        provider_name, test_mode=test_mode, limit=provider_load_limit
                     )
                 )
             except Exception as exc:  # pylint: disable=broad-exception-caught

@@ -491,6 +491,18 @@ def test_classify_hosting_platform_recognizes_public_adapter_pages():
         )
         == "direct_mrf_body"
     )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://apatpa.com/disclosures-terms-conditions-privacy-policy-american-plan-administrators/"
+        )
+        == "html_delegated_mrf_links"
+    )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://caa.imagine360.com/IMAGINE360%20SERVICES%20LLC/index.html"
+        )
+        == "html_mrf_links"
+    )
 
 
 def test_parse_master_list_preserves_payers_and_urls():
@@ -655,7 +667,7 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
 |---|---|---|---|
 | 90 Degree Benefits | tpa | https://portal.90degreebenefits.com/MemberPortal/MachineReadableFiles | aliases: 90 Degree, 90DB |
 | Select Health | regional | https://www.selecthealth.org/disclaimers/machine-readable-data | aliases: SelectHealth |
-| EyeMed | vision | https://content.eyemedvisioncare.com/EyeMed_HCSC/eyemed_in-network-rates.json | benefit lines: vision; aliases: EyeMed Vision Care |
+| EyeMed | vision | https://content.eyemedvisioncare.com/EyeMed_HCSC/eyemed_in-network-rates.json | benefit lines: vision; aliases: EyeMed Vision Care, Eye Med, Ameritas with EyeMed |
 | EMI Health | regional | https://emihealth.com/machinereadables | public machine-readable files page |
 | MotivHealth Insurance Company | regional | https://www.motivhealth.com/machinereadablefiles/ | aliases: MotivHealth |
 | Angle Health | regional | https://www.anglehealth.com/machine-readable-files | aliases: Angle, Adrem Administrators |
@@ -667,7 +679,13 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
 | Regency Employee Benefits | tpa | https://www.mymedicalshopper.com/mrf-search/robbins-regency-employee-benefits-inc-regn | aliases: Robbins Regency Employee Benefits |
 | Varipro | tpa | https://www.mymedicalshopper.com/mrf-search/varipro | aliases: Varipro TPA, Valipro TPA |
 | ACS Benefit Services | tpa | https://acsbenefitservices.sapphiremrfhub.com/ | aliases: ACS Benefits |
+| American Plan Administrators | tpa | https://apatpa.com/disclosures-terms-conditions-privacy-policy-american-plan-administrators/ | aliases: APA, APA TPA |
+| Benefit Plan Administrators | tpa | https://www.mymedicalshopper.com/mrf-search/benefit-plan-administrators | aliases: BPA, BPA TPA |
+| ByWater | tpa | https://www.mymedicalshopper.com/mrf-search/bywater | aliases: Bywater, Choose ByWater |
+| Coastal Administrative Services | tpa | https://mrf.healthcarebluebook.com/CAS | aliases: CAS |
+| Diversified Group | tpa | https://www.mymedicalshopper.com/mrf-search/diversified-group | aliases: The Diversified Group |
 | Marpai | tpa | https://www.mymedicalshopper.com/mrf-search/marpai | aliases: Marpai Health |
+| Imagine360 | tpa | https://caa.imagine360.com/IMAGINE360%20SERVICES%20LLC/index.html | aliases: Imagine 360 |
 | Simplified Benefits Administrators | tpa | https://mrf.healthcarebluebook.com/SBA | aliases: SBA |
 | Nippon Life Benefits | tpa | https://mrf.healthcarebluebook.com/Nippon | aliases: Nippon Life |
 | UMWA Health and Retirement Funds | tpa | https://mrf.healthcarebluebook.com/healthsmartfundsaccount | aliases: UMWA Funds |
@@ -707,7 +725,11 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
     assert by_name["EyeMed"].entity_type == "vision"
     assert by_name["EyeMed"].benefit_lines == ("vision",)
     assert by_name["EyeMed"].hosting_platform == "direct_mrf_body"
-    assert by_name["EyeMed"].aliases == ("EyeMed Vision Care",)
+    assert by_name["EyeMed"].aliases == (
+        "EyeMed Vision Care",
+        "Eye Med",
+        "Ameritas with EyeMed",
+    )
     assert by_name["EMI Health"].hosting_platform == "html_mrf_links"
     assert by_name["MotivHealth Insurance Company"].hosting_platform == "html_mrf_links"
     assert by_name["Angle Health"].hosting_platform == "html_delegated_mrf_links"
@@ -736,7 +758,28 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
     assert by_name["Varipro"].hosting_platform == "mymedicalshopper_talon"
     assert by_name["Varipro"].aliases == ("Varipro TPA", "Valipro TPA")
     assert by_name["ACS Benefit Services"].hosting_platform == "sapphire"
+    assert (
+        by_name["American Plan Administrators"].hosting_platform
+        == "html_delegated_mrf_links"
+    )
+    assert by_name["American Plan Administrators"].aliases == ("APA", "APA TPA")
+    assert (
+        by_name["Benefit Plan Administrators"].hosting_platform
+        == "mymedicalshopper_talon"
+    )
+    assert by_name["Benefit Plan Administrators"].aliases == ("BPA", "BPA TPA")
+    assert by_name["ByWater"].hosting_platform == "mymedicalshopper_talon"
+    assert by_name["ByWater"].aliases == ("Bywater", "Choose ByWater")
+    assert (
+        by_name["Coastal Administrative Services"].hosting_platform
+        == "healthcarebluebook_mrf"
+    )
+    assert by_name["Coastal Administrative Services"].aliases == ("CAS",)
+    assert by_name["Diversified Group"].hosting_platform == "mymedicalshopper_talon"
+    assert by_name["Diversified Group"].aliases == ("The Diversified Group",)
     assert by_name["Marpai"].hosting_platform == "mymedicalshopper_talon"
+    assert by_name["Imagine360"].hosting_platform == "html_mrf_links"
+    assert by_name["Imagine360"].aliases == ("Imagine 360",)
     assert (
         by_name["Simplified Benefits Administrators"].hosting_platform
         == "healthcarebluebook_mrf"
@@ -852,12 +895,20 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert by_name["EyeMed"].benefit_lines == ("vision",)
     assert by_name["EyeMed"].hosting_platform == "direct_mrf_body"
     assert "EyeMed Vision Care" in by_name["EyeMed"].aliases
+    assert "Eye Med" in by_name["EyeMed"].aliases
+    assert "Ameritas with EyeMed" in by_name["EyeMed"].aliases
     assert "HealthLink Network" in by_name["HealthLink"].aliases
     assert by_name["HealthLink"].hosting_platform == "anthem_s3_mrf"
     assert "Delta Dental of Oregon" in by_name["Moda Health"].aliases
     assert by_name["VSP Vision"].hosting_platform == "sapphire"
     assert by_name["VSP Vision"].benefit_lines == ("vision",)
     assert "VSP" in by_name["VSP Vision"].aliases
+    assert "Vision Service Plan (VSP)" in by_name["VSP Vision"].aliases
+    assert "VSP Choice Network" in by_name["VSP Vision"].aliases
+    assert "Guardian VSP Network" in by_name["VSP Vision"].aliases
+    assert "Principal Financial Group VSP" in by_name["VSP Vision"].aliases
+    assert "MetLife VSP Choice" in by_name["VSP Vision"].aliases
+    assert "Ameritas with VSP" in by_name["VSP Vision"].aliases
     assert by_name["GEHA"].hosting_platform == "html_delegated_mrf_links"
     assert by_name["GEHA"].benefit_lines == ("dental", "medical")
     assert "Connection Dental Federal" in by_name["GEHA"].aliases
@@ -901,6 +952,9 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Auxient TPA" in by_name["Auxiant"].aliases
     assert "EBPA Employee Benefits" in by_name["EBPA"].aliases
     assert "AmeriBen Anthem Blue Cross" in by_name["AmeriBen"].aliases
+    assert "EVHC" in by_name["Luminare Health Benefits"].aliases
+    assert "Evolution Healthcare" in by_name["Luminare Health Benefits"].aliases
+    assert "Evolution Healthcare EVHC" in by_name["Luminare Health Benefits"].aliases
 
 
 @pytest.mark.asyncio
@@ -2541,6 +2595,65 @@ def test_mymedicalshopper_direct_employer_slug_infers_tpa_and_group_context():
         )
         == "varipro"
     )
+
+
+@pytest.mark.asyncio
+async def test_mymedicalshopper_resolver_honors_max_targets(monkeypatch):
+    generated_for = []
+
+    class FakeWS:
+        async def close(self):
+            return None
+
+    async def fake_connect(_session, _url, *, timeout_seconds):
+        assert timeout_seconds == 30
+        return FakeWS()
+
+    async def fake_entity_employers(_ws, *, entity_slug, resolver, timeout_seconds):
+        assert entity_slug == "bywater"
+        assert timeout_seconds == 30
+        assert resolver["max_targets"] == 2
+        return [
+            {"slug": "client-one-bywater-10001", "name": "Client One"},
+            {"slug": "client-two-bywater-10002", "name": "Client Two"},
+            {"slug": "client-three-bywater-10003", "name": "Client Three"},
+        ]
+
+    async def fake_generated_for_employer(_ws, *, employer_slug, **_kwargs):
+        generated_for.append(employer_slug)
+        return [
+            {
+                "planId": employer_slug,
+                "planName": employer_slug,
+                "mrfGeneratedInfo": [
+                    {
+                        "month": "2026-06-01",
+                        "mrfGenerated": True,
+                        "link": f"https://mrf.mmsanalytics.com/{employer_slug}_index.json",
+                    }
+                ],
+            }
+        ]
+
+    monkeypatch.setattr(discovery, "_mymedicalshopper_ddp_connect", fake_connect)
+    monkeypatch.setattr(
+        discovery, "_mymedicalshopper_entity_employers", fake_entity_employers
+    )
+    monkeypatch.setattr(
+        discovery,
+        "_mymedicalshopper_generated_for_employer",
+        fake_generated_for_employer,
+    )
+
+    targets = await discovery._resolve_mymedicalshopper_talon_mrf(
+        {"source_id": "source_bywater", "payer_id": "payer_bywater"},
+        "https://www.mymedicalshopper.com/mrf-search/bywater",
+        {"type": "mymedicalshopper_talon_mrf", "max_targets": 2},
+        session=object(),
+    )
+
+    assert generated_for == ["client-one-bywater-10001", "client-two-bywater-10002"]
+    assert [target.metadata["employer_slug"] for target in targets] == generated_for
 
 
 def test_highmark_hmhs_script_expands_current_month_index_urls():
@@ -5824,6 +5937,44 @@ async def test_dry_run_uses_master_list_without_database(monkeypatch):
     assert result["providers"] == ["master-list"]
     assert result["candidates"] == 3
     assert result["payers"] == 3
+
+
+@pytest.mark.asyncio
+async def test_source_payer_query_filters_before_candidate_limit(monkeypatch):
+    observed_limits = []
+
+    async def fake_load_candidates(_provider, *, test_mode, limit):
+        observed_limits.append(limit)
+        assert test_mode is False
+        return [
+            discovery.SourceCandidate(
+                payer_name="Early Payer",
+                provider="master-list",
+                index_url="https://example.com/early-index.json",
+                status="active",
+            ),
+            discovery.SourceCandidate(
+                payer_name="VSP Vision",
+                provider="master-list",
+                index_url="https://bcbsm.sapphiremrfhub.com/tocs/current/vsp_vision",
+                status="active",
+                aliases=("Guardian VSP Network",),
+            ),
+        ]
+
+    monkeypatch.setattr(discovery, "_load_candidates", fake_load_candidates)
+
+    result = await discovery.main(
+        provider="master-list",
+        source_payer_query="Guardian VSP",
+        limit=1,
+        dry_run=True,
+    )
+
+    assert observed_limits == [None]
+    assert result["candidates"] == 1
+    assert result["payers"] == 1
+    assert result["sources"] == 1
 
 
 @pytest.mark.asyncio
