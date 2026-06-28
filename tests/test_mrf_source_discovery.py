@@ -961,6 +961,17 @@ async def test_master_list_keeps_high_value_public_aliases():
         "MERITAIN HEALTH NORTH AMERICAN HEALTH PLAN"
         in by_name["Meritain Health"].aliases
     )
+    assert "The Standard AHL" in aliases_by_name["Meritain Health"]
+    assert "American Heritage Life" in aliases_by_name["Meritain Health"]
+    assert (
+        "American Heritage Life Insurance Company"
+        in aliases_by_name["Meritain Health"]
+    )
+    assert "The Standard AHL" in aliases_by_name["Allied Benefit Systems"]
+    assert (
+        "American Heritage Life Insurance Company"
+        in aliases_by_name["Allied Benefit Systems"]
+    )
     assert "United Healthcare Dental" in by_name["United Healthcare"].aliases
     assert "UHC Vision" in by_name["United Healthcare"].aliases
     assert "UHC Vision Using Spectera Network" in by_name["United Healthcare"].aliases

@@ -330,7 +330,7 @@ Last one-time research refresh: 2026-06-05.
 | 90 Degree Benefits | tpa | https://portal.90degreebenefits.com/MemberPortal/MachineReadableFiles | public Healthspace machine-readable file portal; aliases: 90 Degree, 90DB |
 | Aetna Signature Administrators | tpa | https://health1.aetna.com/app/public/#/one/insurerCode=AETNACVS_I&brandCode=ASA/machine-readable-transparency-in-coverage | curated source row; aliases: ASA, Aetna Signature |
 | Allegiance Benefit Plan Management | tpa | https://mrf.healthcarebluebook.com/Allegiance | public Healthcare Bluebook MRF directory; current TOC is allowed-amount only with no in-network files observed; aliases: Allegiance, Allegiance Benefit Plan Management Inc, AskAllegiance |
-| Allied Benefit Systems | tpa | https://alliedbenefit.sapphiremrfhub.com/ | curated source row; aliases: Allied Benefit |
+| Allied Benefit Systems | tpa | https://alliedbenefit.sapphiremrfhub.com/ | curated source row; aliases: Allied Benefit, The Standard AHL, Standard AHL, American Heritage Life, American Heritage Life Insurance Company, The Standard American Heritage Life |
 | Allied Benefit Systems | tpa | https://www.alliedbenefit.com/transparency-in-coverage-mrf | public transparency URL |
 | American Plan Administrators | tpa | https://apatpa.com/disclosures-terms-conditions-privacy-policy-american-plan-administrators/ | public APA disclosure page with delegated Cigna, MagnaCare, The Alliance, Prime Health, and PHCS MRF links; aliases: APA, APA TPA |
 | AmeriBen | tpa | https://github.com/AmeriBen/MRF | curated source row; aliases: AmeriBen Anthem, AmeriBen Anthem Blue Cross |
@@ -370,8 +370,8 @@ Last one-time research refresh: 2026-06-05.
 | Marpai | tpa | https://www.mymedicalshopper.com/mrf-search/marpai | public MyMedicalShopper/TALON MRF search linked from Marpai transparency page; aliases: Marpai Health, Marpai Administrators |
 | MedBen | tpa | https://mb.mrf.payercompass.com/ | public Zelis/PayerCompass MRF repository; aliases: Medical Benefits Mutual Life Insurance Co, Medical Benefits Administrators |
 | MedCost | tpa | https://mrf.mmsanalytics.com/medcost/ | public MRF directory linked from MedCost transparency page; aliases: MedCost, MEDCOST BENEFIT SERVICES (MBS) |
-| Meritain Health | tpa | https://mrfsearch.meritain.com/ | public group/client search table; resolver catalogs group-level HealthSparq links; aliases: Meritain, Meritain Health An Aetna Company, MERITAIN HEALTH NORTH AMERICAN HEALTH PLAN |
-| Meritain Health | tpa | https://health1.aetna.com/app/public/#/one/insurerCode=MERITAIN_I&brandCode=MERITAINOVER/machine-readable-transparency-in-coverage | curated source row; aliases: Meritain, Meritain Health An Aetna Company, MERITAIN HEALTH NORTH AMERICAN HEALTH PLAN |
+| Meritain Health | tpa | https://mrfsearch.meritain.com/ | public group/client search table; resolver catalogs group-level HealthSparq links; aliases: Meritain, Meritain Health An Aetna Company, MERITAIN HEALTH NORTH AMERICAN HEALTH PLAN, The Standard AHL, Standard AHL, American Heritage Life, American Heritage Life Insurance Company |
+| Meritain Health | tpa | https://health1.aetna.com/app/public/#/one/insurerCode=MERITAIN_I&brandCode=MERITAINOVER/machine-readable-transparency-in-coverage | curated source row; aliases: Meritain, Meritain Health An Aetna Company, MERITAIN HEALTH NORTH AMERICAN HEALTH PLAN, The Standard AHL, Standard AHL, American Heritage Life, American Heritage Life Insurance Company |
 | Nippon Life Benefits | tpa | https://mrf.healthcarebluebook.com/Nippon | public Healthcare Bluebook MRF directory; aliases: Nippon Life, Nippon Life Insurance Company of America |
 | Nova Healthcare Administrators | tpa | https://www.novahealthcare.com/resources/mrf.html | public transparency page with direct and delegated network MRF links; aliases: Nova Healthcare, Nova Healthcare Administrators Inc |
 | PBA | tpa | https://www.pbaclaims.com/mrfs/ | curated source row |

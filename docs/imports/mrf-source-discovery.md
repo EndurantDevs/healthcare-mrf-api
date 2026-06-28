@@ -68,10 +68,12 @@ and [CMS technical clarification Q36](https://www.cms.gov/healthplan-price-trans
 Current curated TPA seeds live in `specs/mrf_payer_master_list.md` and include Allied Benefit
 Systems, AmeriBen, BRMS, Collective Health, HPI, Lucent, MedCost, PBA, Varipro, WebTPA,
 HealthScope, Aetna Signature Administrators, and Meritain. Meritain uses both the aggregate
-HealthSparq tenant override and the public Meritain group search resolver. BRMS and Lucent delegate
-some client MRF rows to Healthcare Bluebook, where discovery stores the stable listing/file
-endpoints rather than any signed storage redirect. Varipro uses the configured
-MyMedicalShopper/TALON resolver.
+HealthSparq tenant override and the public Meritain group search resolver. Standard/AHL searches
+are routed to the public Allied Benefit Systems and Meritain delegated sources named by Standard's
+AHL resources page, because the Standard page itself can present bot interstitials to automated
+fetchers. BRMS and Lucent delegate some client MRF rows to Healthcare Bluebook, where discovery
+stores the stable listing/file endpoints rather than any signed storage redirect. Varipro uses the
+configured MyMedicalShopper/TALON resolver.
 
 Resolved TOC targets are stored as `mrf_file.file_type = table-of-contents` rows even when
 `--crawl-target-limit` limits how many target TOCs are parsed in a smoke run.
