@@ -8679,7 +8679,7 @@ def _parse_text_filter_values(value: Any) -> tuple[str, ...]:
 
 
 def _normalize_text_query(value: Any) -> str | None:
-    text = str(value or "").strip()
+    text = _clean_text(value)
     return text or None
 
 
@@ -8694,7 +8694,7 @@ def _candidate_matches_text_filters(
         if not any(item in entity_type for item in entity_types):
             return False
     if payer_query:
-        query = payer_query.lower()
+        query = _clean_text(payer_query).lower()
         searchable_names = (candidate.payer_name, *candidate.aliases)
         if not any(
             query in _clean_text(name).lower() for name in searchable_names if name
