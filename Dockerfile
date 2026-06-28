@@ -37,7 +37,8 @@ RUN apt-get update \
     && . venv/bin/activate \
     && pip install --no-compile --upgrade pip \
     && pip install --no-compile -r /wheels/requirements-dev.txt -f /wheels \
-    && install -d -o nobody -g root -m 700 \
+    && install -d -o nobody -g nogroup -m 755 /run /var/log/nginx \
+    && install -d -o nobody -g nogroup -m 700 \
         /var/lib/nginx/body \
         /var/lib/nginx/proxy \
         /var/lib/nginx/fastcgi \
@@ -82,6 +83,7 @@ ENV HLTHPRT_REDIS_ADDRESS=${HLTHPRT_REDIS_ADDRESS}
 ENV HLTHPRT_SAVE_PER_PACK=${HLTHPRT_SAVE_PER_PACK}
 ENV HLTHPRT_PTG2_RUST_SCANNER_BIN=/opt/support/ptg2_scanner/target/release/ptg2_scanner
 ENV HLTHPRT_PTG2_RUST_REQUIRE_RELEASE=true
+ENV PYTHONDONTWRITEBYTECODE=1
 
 ADD service/nginx.conf /etc/nginx/nginx.conf
 ADD service/start_api.sh /usr/local/bin/start_api.sh
@@ -105,6 +107,8 @@ RUN . /opt/venv/bin/activate \
     && pip install --no-compile /tmp/ptg2-address-canon-wheels/*.whl \
     && rm -rf /tmp/ptg2-address-canon-wheels
 COPY logging.yaml main.py alembic.ini /opt/
+
+USER nobody:nogroup
 
 EXPOSE 8080
 CMD ["/usr/local/bin/start_api.sh"]

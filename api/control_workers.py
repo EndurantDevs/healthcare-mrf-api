@@ -346,6 +346,7 @@ def _worker_job_manifest(spec: WorkerSpec, payload: dict[str, Any], image: str) 
         "workingDir": str(_repo_root()),
         "command": [_worker_python(), str(_main_path()), "worker", spec.worker_class, "--burst"],
         "env": env,
+        "securityContext": _worker_job_container_security_context(),
     }
     env_from = _worker_job_env_from()
     if env_from:
@@ -359,6 +360,8 @@ def _worker_job_manifest(spec: WorkerSpec, payload: dict[str, Any], image: str) 
 
     pod_spec: dict[str, Any] = {
         "restartPolicy": "Never",
+        "automountServiceAccountToken": False,
+        "securityContext": _worker_job_pod_security_context(has_pvc=bool(volumes)),
         "containers": [container],
     }
     if volumes:
@@ -420,6 +423,26 @@ def _worker_job_env_from() -> list[dict[str, Any]]:
     for name in _csv(os.getenv("HLTHPRT_WORKER_JOB_ENV_FROM_SECRET", "")):
         env_from.append({"secretRef": {"name": name}})
     return env_from
+
+
+def _worker_job_container_security_context() -> dict[str, Any]:
+    return {
+        "allowPrivilegeEscalation": False,
+        "capabilities": {"drop": ["ALL"]},
+    }
+
+
+def _worker_job_pod_security_context(*, has_pvc: bool) -> dict[str, Any]:
+    security_context: dict[str, Any] = {
+        "runAsNonRoot": True,
+        "runAsUser": 65534,
+        "runAsGroup": 65534,
+        "seccompProfile": {"type": "RuntimeDefault"},
+    }
+    if has_pvc:
+        security_context["fsGroup"] = 65534
+        security_context["fsGroupChangePolicy"] = "OnRootMismatch"
+    return security_context
 
 
 def _worker_job_resources(spec: WorkerSpec, payload: dict[str, Any] | None = None) -> dict[str, Any]:
