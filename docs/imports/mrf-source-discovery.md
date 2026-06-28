@@ -50,6 +50,9 @@ Platform resolvers are also configured in that file. The importer currently reso
 - Cigna compliance landing pages into current `/static/mrf/*.json` lookup files, then into the
   current signed federal and Colorado TOC/index JSON targets. The resolver carries a larger
   per-target TOC byte cap because Cigna federal indexes can exceed the generic 25 MB default.
+- IBX/QCC keyed Transparency in Coverage links, including public employer landing pages such as
+  Reliance Matrix, into stable TOC targets while following the current monthly redirect at fetch
+  time.
 - Simple compliance landing pages into linked TOC JSON files, metadata text indexes, and direct
   body-file references when the HTML exposes them. Metadata text files are parsed only for direct
   body-file URLs. ZIP, gzip, and plain JSON body references are stored as `mrf_file` rows and are

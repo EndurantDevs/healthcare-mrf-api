@@ -238,6 +238,10 @@
         "ibx.com": ["qcc"]
       }
     },
+    "cmstic_keyed_toc_redirect": {
+      "type": "cmstic_keyed_toc_redirect",
+      "toc_max_bytes": 104857600
+    },
     "healthgram": {
       "type": "healthgram_network_index",
       "max_bytes": 5242880,

@@ -94,6 +94,10 @@ def test_source_urls_are_loaded_from_registry_file():
         config["platform_resolvers"]["cmstic_file_info"]["type"] == "cmstic_file_info"
     )
     assert (
+        config["platform_resolvers"]["cmstic_keyed_toc_redirect"]["type"]
+        == "cmstic_keyed_toc_redirect"
+    )
+    assert (
         config["platform_resolvers"]["auxiant_wordpress"]["type"]
         == "auxiant_wordpress_directory"
     )
@@ -533,6 +537,18 @@ def test_classify_hosting_platform_recognizes_public_adapter_pages():
     )
     assert (
         discovery.classify_hosting_platform(
+            "https://www.ibx.com/transparency-in-coverage/821410?key=abc123"
+        )
+        == "cmstic_keyed_toc_redirect"
+    )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://www.reliancematrix.com/privacy-notice/transparency-in-coverage"
+        )
+        == "html_delegated_mrf_links"
+    )
+    assert (
+        discovery.classify_hosting_platform(
             "https://www.amerihealth.com/developer-resources/index.html"
         )
         == "cmstic_file_info"
@@ -730,6 +746,7 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
 | Pinnacle Claims Management | tpa | https://mrf.healthcarebluebook.com/Pinnacle | aliases: PCMI |
 | Regency Employee Benefits | tpa | https://www.mymedicalshopper.com/mrf-search/robbins-regency-employee-benefits-inc-regn | aliases: Robbins Regency Employee Benefits |
 | Varipro | tpa | https://www.mymedicalshopper.com/mrf-search/varipro | aliases: Varipro TPA, Valipro TPA |
+| Reliance Matrix | tpa | https://www.reliancematrix.com/privacy-notice/transparency-in-coverage | aliases: Reliance Standard, Reliance Standard Life Insurance Company |
 | ACS Benefit Services | tpa | https://acsbenefitservices.sapphiremrfhub.com/ | aliases: ACS Benefits |
 | American Plan Administrators | tpa | https://apatpa.com/disclosures-terms-conditions-privacy-policy-american-plan-administrators/ | aliases: APA, APA TPA |
 | Benefit Plan Administrators | tpa | https://www.mymedicalshopper.com/mrf-search/benefit-plan-administrators | aliases: BPA, BPA TPA |
@@ -811,6 +828,11 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
     )
     assert by_name["Varipro"].hosting_platform == "mymedicalshopper_talon"
     assert by_name["Varipro"].aliases == ("Varipro TPA", "Valipro TPA")
+    assert by_name["Reliance Matrix"].hosting_platform == "html_delegated_mrf_links"
+    assert by_name["Reliance Matrix"].aliases == (
+        "Reliance Standard",
+        "Reliance Standard Life Insurance Company",
+    )
     assert by_name["ACS Benefit Services"].hosting_platform == "sapphire"
     assert (
         by_name["American Plan Administrators"].hosting_platform
@@ -998,6 +1020,13 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Valipro TPA" in by_name["Varipro"].aliases
     assert "Professional Benefits Services" in by_name["Varipro"].aliases
     assert "PBS" in by_name["Varipro"].aliases
+    assert by_name["Reliance Matrix"].hosting_platform == "html_delegated_mrf_links"
+    assert "Reliance Standard" in by_name["Reliance Matrix"].aliases
+    assert (
+        "Reliance Standard Life Insurance Company"
+        in by_name["Reliance Matrix"].aliases
+    )
+    assert "Reliance Standard Life Ins Co" in by_name["Reliance Matrix"].aliases
     assert by_name["BCBS North Carolina"].hosting_platform == "direct_toc"
     assert "Blue Cross Blue Shield of NC" in aliases_by_name["BCBS North Carolina"]
     assert "BlueCross BlueShield of NC" in aliases_by_name["BCBS North Carolina"]
@@ -5041,6 +5070,23 @@ def test_delegated_mrf_source_urls_extracts_supported_links_and_bare_hosts():
     ]
 
 
+def test_delegated_mrf_source_urls_extracts_ibx_keyed_toc_links():
+    html = """
+    <a href="https://www.ibx.com/transparency-in-coverage/821410?key=abc123">
+      QCC machine-readable files
+    </a>
+    """
+
+    urls = discovery._delegated_mrf_source_urls_from_html(
+        html,
+        base_url="https://www.reliancematrix.com/privacy-notice/transparency-in-coverage",
+    )
+
+    assert urls == [
+        "https://www.ibx.com/transparency-in-coverage/821410?key=abc123"
+    ]
+
+
 def test_delegated_mrf_source_urls_extracts_sharp_network_links():
     html = """
     <a href="https://transparency-in-coverage.optum.com/">
@@ -5161,6 +5207,32 @@ def test_cmstic_file_info_payload_builds_toc_target():
     assert target.metadata["resolver"] == "cmstic_file_info"
     assert target.metadata["target_kind"] == "toc_json"
     assert target.metadata["target_file_type"] == "table-of-contents"
+
+
+def test_cmstic_keyed_toc_target_preserves_redirect_provenance():
+    source = {"source_id": "source_1", "display_name": "Reliance Matrix"}
+    keyed_url = "https://www.ibx.com/transparency-in-coverage/821410?key=abc123"
+    final_url = (
+        "https://storage.googleapis.com/ihg-dart-edw-mrf-prod-public/qcc/"
+        "2026-06-01_821410_index.json"
+    )
+
+    assert discovery._looks_cmstic_keyed_toc_url(keyed_url) is True
+    target = discovery._cmstic_keyed_toc_crawl_target(
+        source,
+        keyed_url,
+        final_url=final_url,
+        resolver={"toc_max_bytes": 104857600},
+        resolver_type="cmstic_keyed_toc_redirect",
+    )
+
+    assert target is not None
+    assert target.url == final_url
+    assert target.resolved_from_url == keyed_url
+    assert target.metadata["resolver"] == "cmstic_keyed_toc_redirect"
+    assert target.metadata["target_file_type"] == "table-of-contents"
+    assert target.metadata["cmstic_source_id"] == "821410"
+    assert target.metadata["target_max_bytes"] == 104857600
 
 
 def test_cmstic_brand_defaults_cover_amerihealth_developer_page():

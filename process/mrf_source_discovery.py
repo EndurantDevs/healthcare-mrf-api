@@ -963,6 +963,12 @@ def classify_hosting_platform(url: str | None) -> str | None:
         "amerihealthnj.com",
     } and path.startswith(("/cmstic", "/cmsticsvc/", "/developer-resources")):
         return "cmstic_file_info"
+    if _looks_cmstic_keyed_toc_url(raw):
+        return "cmstic_keyed_toc_redirect"
+    if host in {"www.reliancematrix.com", "reliancematrix.com"} and (
+        "transparency-in-coverage" in path
+    ):
+        return "html_delegated_mrf_links"
     if host == "www.myhealthbenefits.com" and path.startswith(
         "/myhealthbenefits/home/mrfs"
     ):
@@ -4836,6 +4842,92 @@ def _cmstic_api_url(url: str, brand: str | None = None) -> str:
     return f"{base}?{urlencode({'brand': brand})}"
 
 
+def _looks_cmstic_keyed_toc_url(url: str | None) -> bool:
+    parsed = urlsplit(str(url or "").strip())
+    host = parsed.netloc.lower()
+    if host not in {"www.ibx.com", "ibx.com"}:
+        return False
+    if not re.match(r"^/transparency-in-coverage/[A-Za-z0-9_-]+/?$", parsed.path):
+        return False
+    return any(str(value or "").strip() for value in parse_qs(parsed.query).get("key", ()))
+
+
+def _cmstic_keyed_toc_crawl_target(
+    source: dict[str, Any],
+    url: str,
+    *,
+    final_url: str,
+    resolver: dict[str, Any],
+    resolver_type: str,
+) -> CrawlTarget | None:
+    if not _looks_cmstic_keyed_toc_url(url):
+        return None
+    if not _looks_direct_toc_url(final_url):
+        return None
+    source_id = Path(urlsplit(str(url or "")).path.rstrip("/")).name
+    toc_max_bytes = _parse_size_bytes(resolver.get("toc_max_bytes"))
+    metadata = {
+        "resolver": resolver_type,
+        "target_kind": "toc_json",
+        "target_file_type": "table-of-contents",
+        "cmstic_source_id": source_id,
+        "file_name": f"{source_id}_index.json" if source_id else None,
+        "payer_name": source.get("display_name"),
+    }
+    if toc_max_bytes:
+        metadata["target_max_bytes"] = toc_max_bytes
+    return CrawlTarget(
+        source=source,
+        url=final_url,
+        label=str(source.get("display_name") or source_id or ""),
+        resolved_from_url=url,
+        metadata=metadata,
+    )
+
+
+async def _resolve_cmstic_keyed_toc_redirect(
+    source: dict[str, Any],
+    url: str,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    if not _looks_cmstic_keyed_toc_url(url):
+        raise ValueError(f"unsupported CMSTIC keyed TOC URL: {url}")
+    await _assert_fetch_url_allowed(url)
+    async with session.head(url, allow_redirects=True) as resp:
+        await _assert_fetch_url_allowed(str(resp.url))
+        if resp.status >= 400:
+            raise ValueError(f"CMSTIC keyed TOC redirect returned HTTP {resp.status}")
+        final_url = str(resp.url)
+        metadata = {
+            "etag": resp.headers.get("ETag"),
+            "last_modified": resp.headers.get("Last-Modified"),
+            "content_length": resp.headers.get("Content-Length"),
+            "content_type": resp.headers.get("Content-Type"),
+        }
+    target = _cmstic_keyed_toc_crawl_target(
+        source,
+        url,
+        final_url=final_url,
+        resolver=resolver,
+        resolver_type=str(resolver.get("type") or "cmstic_keyed_toc_redirect"),
+    )
+    if not target:
+        raise ValueError(f"CMSTIC keyed TOC redirect did not resolve to a TOC: {url}")
+    return [
+        CrawlTarget(
+            source=target.source,
+            url=target.url,
+            label=target.label,
+            resolved_from_url=target.resolved_from_url,
+            metadata={
+                **target.metadata,
+                **{key: value for key, value in metadata.items() if value},
+            },
+        )
+    ]
+
+
 def _cmstic_target_from_payload(
     source: dict[str, Any],
     payload: dict[str, Any],
@@ -7991,6 +8083,10 @@ async def _crawl_targets_for_source(
         return await _resolve_webtpa_mrf_api(source, url, resolver, session)
     if resolver_type == "cmstic_file_info":
         return await _resolve_cmstic_file_info(source, url, resolver, session)
+    if resolver_type == "cmstic_keyed_toc_redirect":
+        return await _resolve_cmstic_keyed_toc_redirect(
+            source, url, resolver, session
+        )
     if resolver_type == "direct_toc":
         target = _direct_toc_crawl_target(source, url, resolver=resolver_type)
         if target:
@@ -8149,6 +8245,10 @@ async def _crawl_targets_for_source(
         return await _resolve_webtpa_mrf_api(source, url, resolver, session)
     if resolver_type == "cmstic_file_info":
         return await _resolve_cmstic_file_info(source, url, resolver, session)
+    if resolver_type == "cmstic_keyed_toc_redirect":
+        return await _resolve_cmstic_keyed_toc_redirect(
+            source, url, resolver, session
+        )
     if resolver_type == "direct_toc":
         target = _direct_toc_crawl_target(source, url, resolver=resolver_type)
         if target:
