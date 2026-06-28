@@ -2568,6 +2568,9 @@ def test_entity_address_unified_partial_main_patch_sql_deletes_and_inserts_affec
     assert "replacement.location_key = live.location_key" in sql_blob
     assert "INSERT INTO mrf.entity_address_unified" in sql_blob
     assert "FROM mrf.entity_address_unified_20260614 AS stage" in sql_blob
+    assert "ON CONFLICT (location_key) DO UPDATE" in sql_blob
+    assert "entity_type = EXCLUDED.entity_type" in sql_blob
+    assert "location_key = EXCLUDED.location_key" not in sql_blob
 
 
 def test_entity_address_unified_builds_facility_anchor_npi_candidate_stage_sql(monkeypatch):
@@ -4825,6 +4828,7 @@ async def test_entity_address_unified_shutdown_patch_publishes_partial_main_and_
     assert "FROM mrf.entity_address_unified_20260614 AS replacement" in joined
     assert "DELETE FROM mrf.entity_address_unified AS live" in joined
     assert "INSERT INTO mrf.entity_address_unified" in joined
+    assert "ON CONFLICT (location_key) DO UPDATE" in joined
     assert "DROP TABLE IF EXISTS mrf.entity_address_unified_20260614;" in joined
     assert "DROP TABLE IF EXISTS mrf.entity_address_unified_20260614_ptg_groups;" in joined
     assert marked_runs
@@ -4912,6 +4916,7 @@ async def test_entity_address_unified_shutdown_patch_publishes_provider_director
     joined = "\n".join(statements)
     assert "DELETE FROM mrf.entity_address_unified AS live" in joined
     assert "INSERT INTO mrf.entity_address_unified" in joined
+    assert "ON CONFLICT (location_key) DO UPDATE" in joined
     assert "DELETE FROM mrf.entity_address_ptg_bridge AS support" not in joined
     assert "ALTER TABLE IF EXISTS mrf.entity_address_unified_20260614 RENAME TO entity_address_unified;" not in joined
     assert "DROP TABLE IF EXISTS mrf.entity_address_unified_20260614_pd_groups;" in joined

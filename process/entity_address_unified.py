@@ -3122,10 +3122,17 @@ def _insert_stage_entity_into_live_sql(db_schema: str, live_table: str, stage_ta
     columns = _entity_address_column_names()
     column_list = ", ".join(columns)
     select_list = ", ".join(f"stage.{column}" for column in columns)
+    update_list = ",\n        ".join(
+        f"{column} = EXCLUDED.{column}"
+        for column in columns
+        if column != "location_key"
+    )
     return f"""
     INSERT INTO {db_schema}.{live_table} ({column_list})
     SELECT {select_list}
-      FROM {db_schema}.{stage_table} AS stage;
+      FROM {db_schema}.{stage_table} AS stage
+    ON CONFLICT (location_key) DO UPDATE
+       SET {update_list};
     """
 
 
