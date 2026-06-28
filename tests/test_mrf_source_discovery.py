@@ -25,6 +25,10 @@ def test_source_urls_are_loaded_from_registry_file():
     assert (
         config["platform_resolvers"]["healthsparq"]["type"] == "healthsparq_public_mrf"
     )
+    assert config["platform_resolvers"]["healthsparq"]["max_bytes"] >= 100 * 1024 * 1024
+    assert (
+        config["platform_resolvers"]["aetna_health1"]["max_bytes"] >= 100 * 1024 * 1024
+    )
     assert (
         config["platform_resolvers"]["highmark_hmhs"]["type"] == "highmark_hmhs_script"
     )
@@ -645,6 +649,7 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
 | SISCO | tpa | https://sisconosurprise.com/ppo/phcs/index.html | aliases: SISCO Benefits, Self Insured Services Company |
 | CBA Blue | tpa | https://www.cbabluevt.com/employer-resources/ | aliases: CBA BLUE |
 | EBMS | tpa | https://caa.ebms.com/ | aliases: Employee Benefit Management Services |
+| Univera Healthcare | regional | https://univerahc.healthsparq.com/healthsparq/public/#/one/insurerCode=UNVRA_I&brandCode=UNVRA&productCode=MRF/machine-readable-transparency-in-coverage | official HealthSparq MRF link |
 | EBPA | tpa | https://tuition.ebpabenefits.com/employers/machine-readable-file-links | aliases: EBPA Benefits |
 | HealthNow Administrative Services | tpa | https://www.hnas.com/digital-resources/machine-readable-files | aliases: HNAS |
 | Insurance Management Services | tpa | https://mrf.healthcarebluebook.com/IMS | aliases: IMS, IMS TPA |
@@ -712,6 +717,7 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
     )
     assert by_name["CBA Blue"].hosting_platform == "html_mrf_links"
     assert by_name["EBMS"].hosting_platform == "ebms_caa_directory"
+    assert by_name["Univera Healthcare"].hosting_platform == "healthsparq"
     assert by_name["EBPA"].hosting_platform == "html_mrf_links"
     assert (
         by_name["HealthNow Administrative Services"].hosting_platform
@@ -2460,6 +2466,155 @@ def test_healthsparq_metadata_rows_include_direct_file_urls_and_plans():
             "plan_name": "Aetna Open Access",
         }
     ]
+
+
+def test_healthsparq_targets_from_metadata_expand_direct_file_urls_and_plans():
+    source = {"source_id": "source_1", "payer_id": "payer_1"}
+    metadata_url = (
+        "https://mrf.healthsparq.com/example/prd/mrf/UNVRA_I/UNVRA/latest_metadata.json"
+    )
+    payload = {
+        "files": [
+            {
+                "reportingEntityName": "Univera Healthcare",
+                "reportingEntityType": "Health Insurance Issuer",
+                "reportingPlans": [
+                    {
+                        "planName": "Group PPO",
+                        "planIdType": "ein",
+                        "planId": "123456789",
+                        "planMarketType": "group",
+                    }
+                ],
+                "lastUpdatedOn": "2026-07-01",
+                "fileSchema": "IN_NETWORK_RATES",
+                "fileName": "rates.json.zip",
+                "filePath": "2026-07-01/inNetworkRates/rates.json.zip",
+            },
+            {
+                "reportingEntityName": "Univera Healthcare",
+                "reportingEntityType": "Health Insurance Issuer",
+                "reportingPlans": [],
+                "lastUpdatedOn": "2026-07-01",
+                "fileSchema": "TABLE_OF_CONTENTS",
+                "fileName": "index.json.gz",
+                "filePath": "2026-07-01/tableOfContents/index.json.gz",
+            },
+        ]
+    }
+
+    targets = discovery._healthsparq_targets_from_metadata(
+        source,
+        metadata_url,
+        payload,
+        resolved_from_url="https://univerahc.healthsparq.com/healthsparq/public/",
+        params={"insurerCode": "UNVRA_I", "brandCode": "UNVRA"},
+    )
+
+    assert [target.metadata["target_kind"] for target in targets] == [
+        "file_reference",
+        "file_reference",
+    ]
+    assert targets[0].url == (
+        "https://mrf.healthsparq.com/example/prd/mrf/UNVRA_I/UNVRA/"
+        "2026-07-01/inNetworkRates/rates.json.zip"
+    )
+    assert targets[0].metadata["target_file_type"] == "in-network"
+    assert targets[0].metadata["container_format"] == "zip"
+    assert targets[0].metadata["metadata_url"] == metadata_url
+    assert targets[0].metadata["plan_info"] == [
+        {
+            "plan_id": "123456789",
+            "plan_id_type": "ein",
+            "plan_market_type": "group",
+            "plan_name": "Group PPO",
+        }
+    ]
+    assert targets[1].metadata["target_file_type"] == "table-of-contents"
+
+
+@pytest.mark.asyncio
+async def test_healthsparq_resolver_expands_direct_metadata_manifest(monkeypatch):
+    source = {
+        "source_id": "source_1",
+        "payer_id": "payer_1",
+        "display_name": "Univera Healthcare",
+    }
+    resolver = discovery._source_config()["platform_resolvers"]["healthsparq"]
+    source_url = (
+        "https://univerahc.healthsparq.com/healthsparq/public/#/one/"
+        "insurerCode=UNVRA_I&brandCode=UNVRA/machine-readable-transparency-in-coverage"
+    )
+    metadata_url = (
+        "https://mrf.healthsparq.com/unvra-egress.nophi.kyruushsq.com/prd/mrf/"
+        "UNVRA_I/UNVRA/latest_metadata.json"
+    )
+
+    async def fake_fetch_json(url, **_kwargs):
+        assert url == metadata_url
+        return {
+            "files": [
+                {
+                    "reportingEntityName": "Univera Healthcare",
+                    "reportingEntityType": "Health Insurance Issuer",
+                    "reportingPlans": [
+                        {
+                            "planName": "Group PPO",
+                            "planIdType": "ein",
+                            "planId": "123456789",
+                            "planMarketType": "group",
+                        }
+                    ],
+                    "lastUpdatedOn": "2026-07-01",
+                    "fileSchema": "IN_NETWORK_RATES",
+                    "fileName": "rates.json.zip",
+                    "filePath": "2026-07-01/inNetworkRates/rates.json.zip",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(discovery, "_fetch_json", fake_fetch_json)
+
+    targets = await discovery._resolve_healthsparq_public_mrf(
+        source, source_url, resolver, None
+    )
+
+    assert len(targets) == 1
+    assert targets[0].url == (
+        "https://mrf.healthsparq.com/unvra-egress.nophi.kyruushsq.com/prd/mrf/"
+        "UNVRA_I/UNVRA/2026-07-01/inNetworkRates/rates.json.zip"
+    )
+    assert targets[0].resolved_from_url == metadata_url
+    assert targets[0].metadata["target_kind"] == "file_reference"
+    assert targets[0].metadata["plan_info"][0]["plan_id"] == "123456789"
+
+
+@pytest.mark.asyncio
+async def test_healthsparq_resolver_falls_back_to_metadata_target(monkeypatch):
+    source = {
+        "source_id": "source_1",
+        "payer_id": "payer_1",
+        "display_name": "Univera Healthcare",
+    }
+    resolver = discovery._source_config()["platform_resolvers"]["healthsparq"]
+    source_url = (
+        "https://univerahc.healthsparq.com/healthsparq/public/#/one/"
+        "insurerCode=UNVRA_I&brandCode=UNVRA/machine-readable-transparency-in-coverage"
+    )
+
+    async def fake_fetch_json(_url, **_kwargs):
+        raise ValueError("too large")
+
+    monkeypatch.setattr(discovery, "_fetch_json", fake_fetch_json)
+
+    targets = await discovery._resolve_healthsparq_public_mrf(
+        source, source_url, resolver, None
+    )
+
+    assert len(targets) == 1
+    assert targets[0].url.endswith("/UNVRA_I/UNVRA/latest_metadata.json")
+    assert targets[0].metadata["target_kind"] == "toc_json"
+    assert targets[0].metadata["target_file_type"] == "table-of-contents"
 
 
 @pytest.mark.asyncio

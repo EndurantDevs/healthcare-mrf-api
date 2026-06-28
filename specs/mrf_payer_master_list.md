@@ -318,7 +318,7 @@ Last one-time research refresh: 2026-06-05.
 | The Jefferson Health Plan | regional | - | needs official source URL |
 | Tufts Health Plan | regional | https://tuftshealthplan.com/visitor/legal-notices/machine-readable-files | curated source row |
 | UHA Health Insurance | regional | https://www.uhahealth.com/important-notices/transparency-in-coverage-and-no-surprises-act-overview | curated source row; aliases: UHA |
-| Univera Healthcare | regional | - | needs official source URL |
+| Univera Healthcare | regional | https://univerahc.healthsparq.com/healthsparq/public/#/one/insurerCode=UNVRA_I&brandCode=UNVRA&productCode=MRF/machine-readable-transparency-in-coverage | public HealthSparq MRF link from official Univera transparency page |
 | USAble Mutual Insurance | regional | - | needs official source URL |
 | WEA Trust | regional | - | needs official source URL |
 | WellCare | regional | - | needs official source URL |

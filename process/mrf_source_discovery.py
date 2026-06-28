@@ -6695,6 +6695,81 @@ def _healthsparq_target(
     )
 
 
+def _healthsparq_plan_info(file_item: dict[str, Any]) -> list[dict[str, Any]]:
+    reporting_plans = [
+        plan
+        for plan in (file_item.get("reportingPlans") or [])
+        if isinstance(plan, dict)
+    ]
+    return [
+        {
+            "plan_id": plan.get("planId"),
+            "plan_id_type": plan.get("planIdType"),
+            "plan_market_type": plan.get("planMarketType"),
+            "plan_name": plan.get("planName"),
+        }
+        for plan in reporting_plans
+    ]
+
+
+def _healthsparq_targets_from_metadata(
+    source: dict[str, Any],
+    metadata_url: str,
+    payload: dict[str, Any],
+    *,
+    resolved_from_url: str,
+    params: dict[str, str],
+) -> list[CrawlTarget]:
+    files = payload.get("files") if isinstance(payload, dict) else None
+    if not isinstance(files, list):
+        return []
+    targets_by_key: dict[tuple[str, str], CrawlTarget] = {}
+    for file_item in files:
+        if not isinstance(file_item, dict):
+            continue
+        file_url = _healthsparq_file_url(metadata_url, file_item.get("filePath"))
+        if not file_url:
+            continue
+        file_type = _healthsparq_file_type(file_item.get("fileSchema"))
+        if not file_type or file_type == "unknown":
+            continue
+        target_kind = "file_reference"
+        file_name = _clean_text(file_item.get("fileName"))
+        label = (
+            file_name
+            or _clean_text(file_item.get("reportingEntityName"))
+            or str(source.get("display_name") or params["brandCode"])
+        )
+        metadata = {
+            "resolver": "healthsparq_public_mrf",
+            "target_kind": target_kind,
+            "target_file_type": file_type,
+            "container_format": _container_format(file_url),
+            "insurer_code": params["insurerCode"],
+            "brand_code": params["brandCode"],
+            "reporting_entity_type": file_item.get("reportingEntityType")
+            or params.get("reportingEntityType"),
+            "reporting_entity_name": file_item.get("reportingEntityName"),
+            "search_term": params.get("searchTerm"),
+            "source_format": "healthsparq_metadata",
+            "metadata_url": metadata_url,
+            "healthsparq_public_url": resolved_from_url,
+            "file_path": file_item.get("filePath"),
+            "file_schema": file_item.get("fileSchema"),
+            "last_updated_on": file_item.get("lastUpdatedOn"),
+            "plan_info": _healthsparq_plan_info(file_item),
+        }
+        key = (target_kind, _canonical_or_none(file_url) or file_url)
+        targets_by_key[key] = CrawlTarget(
+            source=source,
+            url=file_url,
+            label=label,
+            resolved_from_url=metadata_url,
+            metadata=metadata,
+        )
+    return list(targets_by_key.values())
+
+
 async def _resolve_healthsparq_public_mrf(
     source: dict[str, Any],
     url: str,
@@ -6705,6 +6780,24 @@ async def _resolve_healthsparq_public_mrf(
     metadata_url = _healthsparq_direct_metadata_url(resolver, params)
     if metadata_url:
         await _assert_fetch_url_allowed(metadata_url)
+        try:
+            payload = await _fetch_json(
+                metadata_url,
+                max_bytes=int(resolver.get("max_bytes") or 50 * 1024 * 1024),
+                session=session,
+            )
+        except Exception:
+            return [_healthsparq_target(source, metadata_url, url, params)]
+        targets = _healthsparq_targets_from_metadata(
+            source,
+            metadata_url,
+            payload,
+            resolved_from_url=url,
+            params=params,
+        )
+        if targets:
+            max_targets = _as_int(resolver.get("max_targets"))
+            return targets[:max_targets] if max_targets else targets
         return [_healthsparq_target(source, metadata_url, url, params)]
     login_url = _healthsparq_service_url(url, resolver, "login_path")
     login_query = {"_": str(int(_utc_now().timestamp() * 1000)), **params}
@@ -6736,6 +6829,24 @@ async def _resolve_healthsparq_public_mrf(
     metadata_url = str(payload.get("url") or "").strip()
     if not metadata_url:
         raise ValueError("HealthSparq public MRF API did not return a metadata URL")
+    try:
+        metadata_payload = await _fetch_json(
+            metadata_url,
+            max_bytes=int(resolver.get("max_bytes") or 50 * 1024 * 1024),
+            session=session,
+        )
+    except Exception:
+        return [_healthsparq_target(source, metadata_url, mrf_all_url, params)]
+    targets = _healthsparq_targets_from_metadata(
+        source,
+        metadata_url,
+        metadata_payload,
+        resolved_from_url=mrf_all_url,
+        params=params,
+    )
+    if targets:
+        max_targets = _as_int(resolver.get("max_targets"))
+        return targets[:max_targets] if max_targets else targets
     return [_healthsparq_target(source, metadata_url, mrf_all_url, params)]
 
 
