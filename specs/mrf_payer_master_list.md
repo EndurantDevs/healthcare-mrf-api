@@ -10,7 +10,7 @@ Last one-time research refresh: 2026-06-05.
 |---|---|---|---|
 | Arkansas BCBS | blue | https://www.arkansasbluecross.com/interoperability/machine-readable-files | curated source row |
 | Asuris Northwest Health | blue | https://www.asuris.com/transparency-in-coverage/ | curated source row |
-| BCBS Alabama | blue | https://www.bcbsal.org/web/tcr | curated source row; aliases: Blue Cross and Blue Shield of Alabama, Blue Cross Blue Shield Alabama, Blue Cross Blue Shield of Alabama, BCBSAL |
+| BCBS Alabama | blue | https://www.bcbsal.org/web/tcr | curated source row; aliases: Blue Cross and Blue Shield of Alabama, Blue Cross Blue Shield Alabama, Blue Cross Blue Shield of Alabama, BlueCross BlueShield of Alabama, BCBSAL |
 | BCBS Arizona | blue | https://bcbsaz.healthsparq.com/app/public/#/one/insurerCode=BCBSAZ_I&brandCode=BCBSAZ/ | curated source row; aliases: Blue Cross Blue Shield of AZ, BlueCross BlueShield of AZ, BlueCross BlueShield of Arizona, Blue Cross and Blue Shield of Arizona Inc, "Blue Cross and Blue Shield of Arizona, Inc.", BCBSAZ |
 | BCBS Idaho | blue | https://bci.sapphiremrfhub.com/ | observed current; 577 plans; 2,403 files |
 | BCBS IL, TX, NM, OK, MT | blue | https://www.hcsc.com/who-we-are/transparency-in-coverage | curated source row |
@@ -18,10 +18,10 @@ Last one-time research refresh: 2026-06-05.
 | BCBS Kansas | blue | https://www.bcbsks.com/mrf | curated source row; aliases: Blue Cross and Blue Shield of Kansas, Blue Cross Blue Shield Kansas, BCBSKS |
 | BCBS Kansas City | blue | https://bcbskc.sapphiremrfhub.com/ | curated source row; aliases: Blue Cross Blue Shield of Kansas City, Blue Cross and Blue Shield of Kansas City, MISSOURI BLUE CROSS OF KANSAS CITY, BCBSKC |
 | BCBS Louisiana | blue | https://bcbsla.sapphiremrfhub.com/ | curated source row; aliases: Blue Cross and Blue Shield of Louisiana, Blue Cross Blue Shield of Louisiana, BCBSLA |
-| BCBS Massachusetts | blue | https://transparency-in-coverage.bluecrossma.com/ | curated source row; aliases: Blue Cross and Blue Shield of Massachusetts, Blue Cross Blue Shield Massachusetts, Blue Cross Blue Shield of Massachusetts, Blue Cross Blue Shield of MA, BCBSMA, Blue Benefit Administrators of Massachusetts, Blue Cross and Blue Shield of Massachusetts HMO Blue, Inc. |
+| BCBS Massachusetts | blue | https://transparency-in-coverage.bluecrossma.com/ | curated source row; aliases: Blue Cross and Blue Shield of Massachusetts, Blue Cross Blue Shield Massachusetts, Blue Cross Blue Shield of Massachusetts, Blue Cross Blue Shield of MA, BCBSMA, Blue Benefit Administrators of Massachusetts, "Blue Cross and Blue Shield of Massachusetts HMO Blue, Inc." |
 | BCBS Michigan | blue | https://www.bcbsm.com/mrf/index/ | curated source row; aliases: Blue Cross and Blue Shield of Michigan, Blue Cross Blue Shield Michigan, Blue Cross Blue Shield of Michigan, Blue Cross Blue Shield of Michigan Mutual Insurance Company, Blue Care Network of Michigan, BCBSM |
 | BCBS Minnesota | blue | https://www.bluecrossmn.com/transparency-coverage-machine-readable-files | curated source row |
-| BCBS Mississippi | blue | https://www.bcbsms.com/about-us/transparency-in-coverage | curated source row; aliases: Blue Cross and Blue Shield of Mississippi, Blue Cross Blue Shield Mississippi, BCBSMS |
+| BCBS Mississippi | blue | https://www.bcbsms.com/about-us/transparency-in-coverage | curated source row; aliases: Blue Cross and Blue Shield of Mississippi, Blue Cross & Blue Shield of Mississippi, Blue Cross Blue Shield Mississippi, BlueCross BlueShield of Mississippi, BCBSMS |
 | BCBS Montana | blue | https://www.bcbsmt.com/member/policy-forms/machine-readable-file | observed current; 26,939 plans; 90,002 files; aliases: Blue Cross and Blue Shield of Montana, Blue Cross Blue Shield Montana, Blue Cross Blue Shield of Montana, BCBSMT |
 | BCBS Nebraska | blue | https://bcbsneweb.healthsparq.com/app/public/#/one/insurerCode=BCBSNE_I&brandCode=BCBSNE/ | curated source row; aliases: Blue Cross and Blue Shield of Nebraska, Blue Cross Blue Shield Nebraska, BCBSNE |
 | BCBS New Mexico | blue | https://www.bcbsnm.com/member/policy-forms/machine-readable-file | observed current; 26,939 plans; 90,002 files |
@@ -30,7 +30,7 @@ Last one-time research refresh: 2026-06-05.
 | BCBS Oklahoma | blue | https://www.bcbsok.com/member/policy-forms/machine-readable-file | observed current; 26,939 plans; 90,002 files; aliases: Blue Cross and Blue Shield of Oklahoma, Blue Cross Blue Shield Oklahoma, Blue Cross Blue Shield of Oklahoma, BCBSOK |
 | BCBS PA, DE, WV, Western NY, NE NY | blue | https://mrfdata.hmhs.com/ | curated source row |
 | BCBS Rhode Island | blue | https://www.bcbsri.com/developers | curated source row |
-| BCBS South Carolina | blue | https://www.southcarolinablues.com/web/public/brands/universal/transparency-in-coverage/ | curated source row; aliases: Blue Cross and Blue Shield of South Carolina, Blue Cross Blue Shield of South Carolina, Blue Cross Blue Shield of SC, BCBSSC |
+| BCBS South Carolina | blue | https://www.southcarolinablues.com/web/public/brands/universal/transparency-in-coverage/ | curated source row; aliases: Blue Cross and Blue Shield of South Carolina, Blue Cross Blue Shield of South Carolina, BlueCross BlueShield of South Carolina, Blue Cross Blue Shield of SC, BCBSSC |
 | BCBS South Carolina | blue | https://www.southcarolinablues.com/web/public/brands/universal/transparency-in-coverage/?branding=sc | observed stale |
 | BCBS Tennessee | blue | https://www.bcbst.com/tcr | curated source row; aliases: Blue Cross and Blue Shield of Tennessee, Blue Cross Blue Shield of Tennessee, BlueCross BlueShield of Tennessee, BCBST |
 | BCBS Texas | blue | https://www.bcbstx.com/member/policy-forms/machine-readable-file | observed current; 26,939 plans; 90,002 files; aliases: Blue Cross and Blue Shield of Texas, Blue Cross Blue Shield Texas, Blue Cross Blue Shield of Texas, BlueCross BlueShield of Texas, Blue Cross Blue Shield of TX, Blue Cross Blue Sheild of TX, BLUE CROSS BLUE SHIELD of TEXAS, BCBSTX |
@@ -73,13 +73,13 @@ Last one-time research refresh: 2026-06-05.
 | Capital Blue Cross | blue | https://capitalbluecross.healthsparq.com/app/public/#/one/insurerCode=CAPBC_I&brandCode=CAPBC/ | curated source row; aliases: NVA, National Vision Administrators, National Vision Administrator, Capital Blue Cross Vision NVA |
 | Capital Blue Cross | blue | https://capitalbluecross.healthsparq.com/app/public/#/one/insurerCode=CAPBC_I&brandCode=CAPBC/machine-readable-transparency-in-coverage | observed current; 7,555 plans; 4,892 files; aliases: NVA, National Vision Administrators, National Vision Administrator, Capital Blue Cross Vision NVA |
 | Capital Health Plan | blue | https://capitalhealth.com/transparency-in-coverage | curated source row |
-| CareFirst | blue | https://individual.carefirst.com/individuals-families/mandates-policies/machine-readable-file.page | curated source row; aliases: CareFirst Administrators |
+| CareFirst | blue | https://individual.carefirst.com/individuals-families/mandates-policies/machine-readable-file.page | curated source row; aliases: CareFirst Administrators, "CareFirst BlueChoice, Inc." |
 | CareFirst BCBS | blue | https://individual.carefirst.com/individuals-families/mandates-policies/machine-readable-file.page | observed stale; 13,312 plans; 1,931 files |
 | Empire BlueCross BlueShield | blue | - | needs official source URL |
 | Excellus BCBS | blue | https://excellusbcbs.healthsparq.com/app/public/#/one/insurerCode=EXC_I&brandCode=EXC/ | curated source row |
 | Florida Blue | blue | https://www.floridablue.com/members/tools-resources/transparency/machine-readable-files | curated source row; aliases: Blue Cross and Blue Shield of Florida, Blue Cross Blue Shield of Florida, FL Blue, FLORIDA BLUE CROSS |
 | HCSC | blue | https://www.hcsc.com/who-we-are/transparency-in-coverage | curated source row |
-| Highmark | blue | https://mrfdata.hmhs.com/ | curated source row; aliases: Highmark Inc., Highmark Blue Cross Blue Shield |
+| Highmark | blue | https://mrfdata.hmhs.com/ | curated source row; aliases: Highmark Inc., Highmark Blue Cross Blue Shield, Highmark Blue Shield |
 | Highmark BCBS | blue | https://mrfdata.hmhs.com/ | observed current; 21,729 plans; 15,682 files |
 | Highmark Blue Cross Blue Shield Delaware | blue | - | needs official source URL |
 | Highmark Blue Cross Blue Shield Pennsylvania | blue | - | needs official source URL |
@@ -91,12 +91,12 @@ Last one-time research refresh: 2026-06-05.
 | Horizon BCBS NJ | blue | https://horizonblue.sapphiremrfhub.com/ | curated source row; aliases: Horizon Blue Cross of New Jersey, Horizon Blue Cross Blue Shield of New Jersey, Horizon Healthcare Dental, Horizon Dental |
 | Horizon Blue | blue | https://horizonblue.sapphiremrfhub.com/ | observed current; 2,591 plans; 3,446 files |
 | Horizon Blue Cross Blue Shield New Jersey | blue | - | needs official source URL |
-| Independence Blue Cross | blue | https://www.ibx.com/cmstic/?brand=qcc | curated source row; aliases: Independence Administrators, Pennsylvania Independence Blue Cross |
-| Medica | blue | https://web.healthsparq.com/healthsparq/public/#/one/insurerCode=MEDICA_I&brandCode=MEDICA&productCode=MRF/ | curated source row |
+| Independence Blue Cross | blue | https://www.ibx.com/cmstic/?brand=qcc | curated source row; aliases: Independence Administrators, Pennsylvania Independence Blue Cross, Independence Blue Cross IBX, Independence Blue Cross (IBX), Independence Blue Cross QCC Insurance Company, Independence Blue Cross (QCC Ins. Co.) |
+| Medica | blue | https://web.healthsparq.com/healthsparq/public/#/one/insurerCode=MEDICA_I&brandCode=MEDICA&productCode=MRF/ | curated source row; aliases: Medica Insurance Company |
 | Premera BCBS | blue | https://premera.healthsparq.com/healthsparq/public/#/one/insurerCode=PREMERA_I&brandCode=PREMERA/machine-readable-transparency-in-coverage | observed current HealthSparq metadata source |
 | Premera Blue Cross | blue | https://premera.healthsparq.com/healthsparq/public/#/one/insurerCode=PREMERA_I&brandCode=PREMERA/machine-readable-transparency-in-coverage | curated HealthSparq metadata source |
 | Premera Blue Cross ASO | blue | - | needs official source URL |
-| Regence | blue | https://www.regence.com/transparency-in-coverage/ | curated source row; aliases: Regence Group Administrators, Regence BlueShield, Regence BlueCross BlueShield, Regence Blue Cross Blue Shield, REGENCE BLUE CROSS BLUE SHIELD of UTAH |
+| Regence | blue | https://www.regence.com/transparency-in-coverage/ | curated source row; aliases: Regence Group Administrators, Regence BlueShield, Regence BlueCross BlueShield, Regence Blue Cross Blue Shield, REGENCE BLUE CROSS BLUE SHIELD of UTAH, UTAH REGENCE BLUE CROSS BLUE SHIELD |
 | Regence Blue Cross Blue Shield ASO | blue | - | needs official source URL |
 | Triple-S Salud | blue | https://salud.grupotriples.com/en/transparency-in-coverage-machine-readable-files/ | public transparency page backed by public MTT API; aliases: Triple-S, Triple S, Blue Cross Blue Shield Triple-S, Triple-S Salud Care Plus ELA, Care Plus ELA |
 | Wellmark | blue | https://web.healthsparq.com/app/public/#/one/insurerCode=WMRK_I&brandCode=WELLMARK/ | curated source row; aliases: Wellmark Blue Cross and Blue Shield, Wellmark Blue Cross Blue Shield of IA, Wellmark Blue Cross Blue Shield of Iowa and SD, Wellmark of Iowa |
@@ -153,7 +153,7 @@ Last one-time research refresh: 2026-06-05.
 | First Health | national | https://www.health1.firsthealth.com/app/public/#/one/insurerCode=FIRSTHEALTH_I&brandCode=FIRSTH/ | curated source row |
 | Humana | national | https://developers.humana.com/cost-transparency | curated source row |
 | Humana | national | https://developers.humana.com/syntheticdata/Resource/PCTFilesList?fileType=innetwork | observed archived |
-| Kaiser Permanente | national | https://healthy.kaiserpermanente.org/front-door/machine-readable | curated source row; aliases: Kaiser, Kaiser Permanente Insurance Company, Kaiser Permanente of Northern CA, Kaiser Permanente of Southern CA, Kaiser Foundation Health Plan, Kaiser Foundation Health Plan Inc, "Kaiser Foundation Health Plan, Inc.", Kaiser Foundation Health Plan of N CA Region, Kaiser Foundation Health Plan of S CA Region, Kaiser Foundation Health Plan of the Northwest, Kaiser Foundation Health Plan of the Mid-Atlantic States Inc, "Kaiser Foundation Health Plan of the Mid-Atlantic States, Inc.", Kaiser Foundation Health Plan of the Mid-Atlantic States, Kaiser Foundation Health Plan of Hawaii, Kaiser Foundation Health Plan of Georgia, Kaiser Foundation Health Plan of Colorado, Kaiser Foundation Health Plan of Washington |
+| Kaiser Permanente | national | https://healthy.kaiserpermanente.org/front-door/machine-readable | curated source row; aliases: Kaiser, Kasier Permanente, Kaiser Permanente Insurance Company, Kaiser Permanente of Northern CA, Kaiser Permanente of Southern CA, Kaiser Foundation Health Plan, Kaiser Foundation Health Plan Inc, "Kaiser Foundation Health Plan, Inc.", Kaiser Foundation Health Plan of N CA Region, Kaiser Foundation Health Plan of S CA Region, Kaiser Foundation Health Plan of the Northwest, Kaiser Foundation Health Plan of the Mid-Atlantic States Inc, "Kaiser Foundation Health Plan of the Mid-Atlantic States, Inc.", Kaiser Foundation Health Plan of the Mid-Atlantic States, Kaiser Foundation Health Plan of Hawaii, Kaiser Foundation Health Plan of Georgia, Kaiser Foundation Health Plan of Colorado, Kaiser Foundation Health Plan of Washington |
 | Molina Healthcare | national | https://www.molinahealthcare.com/members/common/mrf.aspx | curated source row |
 | Optum | national | https://transparency-in-coverage.optum.com/ | curated source row |
 | PreferredOne | national | - | needs official source URL |
@@ -218,7 +218,7 @@ Last one-time research refresh: 2026-06-05.
 | Scripps Health Plan | provider_sponsored | https://www.scrippshealthplan.com/transparency-in-coverage#component_8a5f07e7c7 | public transparency URL |
 | Security Health Plan | provider_sponsored | https://www.securityhealth.org/insurance-resources/json | curated source row |
 | SelectHealth | provider_sponsored | https://ebu.intermountainhealthcare.org/selecthealth/transparencyincoverage/ | public MRF directory |
-| Sentara | provider_sponsored | https://www.optimahealth.com/transparency-in-coverage | curated source row; aliases: Sentara Health |
+| Sentara | provider_sponsored | https://www.optimahealth.com/transparency-in-coverage | curated source row; aliases: Sentara Health, Sentara Health Plans |
 | Sharp Health Plan | provider_sponsored | https://www.sharphealthplan.com/api-access-for-developers | public MRF page with direct Sharp CAP/FFS files; aliases: Sharp Health Plan of San Diego |
 | SSM Health Plan | provider_sponsored | https://www.ssmhealth.com/resources/pay-my-bill/price-estimate/price-transparency | public transparency URL |
 | Sutter Health Plan | provider_sponsored | https://www.sutterhealthplan.org/healthcare-cost-transparency | public transparency URL; aliases: Sutter Health Plus |
@@ -334,12 +334,12 @@ Last one-time research refresh: 2026-06-05.
 | WPS Health | regional | - | needs official source URL |
 | Aetna CVS - Aetna Signature Administrators | tpa | https://health1.aetna.com/app/public/#/one/insurerCode=AETNACVS_I&brandCode=ASA/machine-readable-transparency-in-coverage | observed current; 22 plans; 178 files; aliases: ASA, Aetna Signature |
 | Aetna CVS - Joint Care Administration | tpa | https://health1.aetna.com/app/public/#/one/insurerCode=AETNACVS_I&brandCode=AJCA/machine-readable-transparency-in-coverage | observed current; 73 plans; 2,011 files |
-| 90 Degree Benefits | tpa | https://portal.90degreebenefits.com/MemberPortal/MachineReadableFiles | public Healthspace machine-readable file portal; aliases: 90 Degree, 90DB |
+| 90 Degree Benefits | tpa | https://portal.90degreebenefits.com/MemberPortal/MachineReadableFiles | public Healthspace machine-readable file portal; aliases: 90 Degree, 90DB, 90 Degree Benefits Inc, "90 Degree Benefits, Inc." |
 | Aetna Signature Administrators | tpa | https://health1.aetna.com/app/public/#/one/insurerCode=AETNACVS_I&brandCode=ASA/machine-readable-transparency-in-coverage | curated source row; aliases: ASA, Aetna Signature |
 | Allegiance Benefit Plan Management | tpa | https://mrf.healthcarebluebook.com/Allegiance | public Healthcare Bluebook MRF directory; current TOC is allowed-amount only with no in-network files observed; aliases: Allegiance, Allegiance Benefit Plan Management Inc, "ALLEGIANCE BENEFIT PLAN MANAGEMENT INC.", AskAllegiance |
 | Allied Benefit Systems | tpa | https://alliedbenefit.sapphiremrfhub.com/ | curated source row; aliases: Allied Benefit, The Standard AHL, Standard AHL, American Heritage Life, American Heritage Life Insurance Company, The Standard American Heritage Life |
 | Allied Benefit Systems | tpa | https://www.alliedbenefit.com/transparency-in-coverage-mrf | public transparency URL |
-| American Plan Administrators | tpa | https://apatpa.com/disclosures-terms-conditions-privacy-policy-american-plan-administrators/ | public APA disclosure page with delegated Cigna, MagnaCare, The Alliance, Prime Health, and PHCS MRF links; aliases: APA, APA TPA |
+| American Plan Administrators | tpa | https://apatpa.com/disclosures-terms-conditions-privacy-policy-american-plan-administrators/ | public APA disclosure page with delegated Cigna, MagnaCare, The Alliance, Prime Health, and PHCS MRF links; aliases: APA, APA TPA, American Plan Administartors |
 | AmeriBen | tpa | https://github.com/AmeriBen/MRF | curated source row; aliases: AmeriBen Anthem, AmeriBen: Anthem, AmeriBen Anthem Blue Cross, AmeriBen: Anthem Blue Cross |
 | ASR Health Benefits | tpa | https://www.asrhealthbenefits.com/MRF | public group-number MRF lookup; resolver uses configured public group seeds |
 | Assured Benefits Administrators | tpa | https://transparency.abadmin.com/ | public transparency page with delegated network MRF links; aliases: ABA, ABAdmin |
@@ -373,7 +373,7 @@ Last one-time research refresh: 2026-06-05.
 | Group Administrators | tpa | https://www.groupadministrators.com/machinereadablefiles/ | public iframe-hosted MRF table; aliases: Group Administrators Ltd |
 | Loomis | tpa | https://mrf.healthcarebluebook.com/Loomis | public Healthcare Bluebook MRF directory; aliases: Loomis Company, Loomis Benefit Administrators, The Loomis Company, LOOMIS COMPANY (THE) |
 | Lucent Health | tpa | https://lucenthealth.com/transparency-in-coverage/ | public transparency page; delegates INN MRF listing to Healthcare Bluebook; aliases: Cypress Benefit Administrators, Cypress Benefit Administrators now Lucent Health |
-| Luminare Health Benefits | tpa | https://mrf.healthcarebluebook.com/luminarehealth | public Healthcare Bluebook MRF directory; aliases: Luminare Health, Luminare Health Benefits (formerly Trustmark), Anthem administered by Luminare Health, Anthem/Luminare Health, LUMINARE HEALTH AZ IL IN MD MN NC PA, Trustmark Health Benefits, Trustmark, EVHC, Evolution Healthcare, Evolution Healthcare EVHC |
+| Luminare Health Benefits | tpa | https://mrf.healthcarebluebook.com/luminarehealth | public Healthcare Bluebook MRF directory; aliases: Luminare Health, Luminare Health Benefits (formerly Trustmark), Anthem administered by Luminare Health, Anthem administered by EVHC, Anthem (Administered by EVHC), Anthem/Luminare Health, LUMINARE HEALTH AZ IL IN MD MN NC PA, Trustmark Health Benefits, Trustmark, EVHC, Evolution Healthcare, Evolution Healthcare EVHC |
 | Marpai | tpa | https://www.mymedicalshopper.com/mrf-search/marpai | public MyMedicalShopper/TALON MRF search linked from Marpai transparency page; aliases: Marpai Health, Marpai Administrators |
 | MedBen | tpa | https://mb.mrf.payercompass.com/ | public Zelis/PayerCompass MRF repository; aliases: Medical Benefits Mutual Life Insurance Co, Medical Benefits Administrators, Medical Benefits Administrators Inc, "Medical Benefits Administrators, Inc." |
 | MedCost | tpa | https://mrf.mmsanalytics.com/medcost/ | public MRF directory linked from MedCost transparency page; aliases: MedCost, MEDCOST BENEFIT SERVICES (MBS) |
@@ -394,7 +394,7 @@ Last one-time research refresh: 2026-06-05.
 | SISCO | tpa | https://sisconosurprise.com/ppo/hps/index.html | public SISCO PPO machine-readable file page for HPS in-network file; aliases: SISCO Benefits, Self Insured Services Company |
 | Simplified Benefits Administrators | tpa | https://mrf.healthcarebluebook.com/SBA | public Healthcare Bluebook MRF directory; aliases: SBA, Simplified Benefits |
 | Tall Tree Administrators | tpa | https://talltreeadmin.com/machine-readable-files | public MRF link page; aliases: Tall Tree, Tall Tree Administration |
-| Unified Group Services | tpa | https://mrf.healthcarebluebook.com/unified | public Healthcare Bluebook MRF directory; aliases: UGS, UnifiedGrp |
+| Unified Group Services | tpa | https://mrf.healthcarebluebook.com/unified | public Healthcare Bluebook MRF directory; aliases: UGS, UnifiedGrp, Unified Group |
 | UMWA Health and Retirement Funds | tpa | https://mrf.healthcarebluebook.com/healthsmartfundsaccount | public Healthcare Bluebook MRF directory linked from UMWA transparency page; aliases: UMWA Funds, HealthSmart Funds Account |
 | Varipro | tpa | https://www.mymedicalshopper.com/mrf-search/varipro | MyMedicalShopper/TALON MRF search; resolver enumerates current employer plan TOCs; aliases: Varipro TPA, Valipro, Valipro TPA, Professional Benefits Services, PBS |
 | Vitori Health | tpa | https://mrf.healthcarebluebook.com/Flume | public Healthcare Bluebook MRF directory for Flume/Vitori sources; aliases: Vitori, Flume |
