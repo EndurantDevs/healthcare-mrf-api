@@ -35,7 +35,7 @@ Last one-time research refresh: 2026-06-05.
 | BCBS Tennessee | blue | https://www.bcbst.com/tcr | curated source row; aliases: Blue Cross and Blue Shield of Tennessee, Blue Cross Blue Shield of Tennessee, BlueCross BlueShield of Tennessee, BCBST |
 | BCBS Texas | blue | https://www.bcbstx.com/member/policy-forms/machine-readable-file | observed current; 26,939 plans; 90,002 files; aliases: Blue Cross and Blue Shield of Texas, Blue Cross Blue Shield Texas, Blue Cross Blue Shield of Texas, BlueCross BlueShield of Texas, Blue Cross Blue Shield of TX, Blue Cross Blue Sheild of TX, BLUE CROSS BLUE SHIELD of TEXAS, BCBSTX |
 | BCBS Vermont | blue | https://www.bluecrossvt.org/our-plans/employers-and-groups/machine-readable-files | curated source row |
-| BCBS Wyoming | blue | - | needs official source URL |
+| BCBS Wyoming | blue | https://www.bcbswy.com/machine-readable-files/ | public BCBS Wyoming machine-readable-files page delegates current TiC TOC to HMHS/mrfdata Wyoming path; aliases: Blue Cross and Blue Shield of Wyoming, Blue Cross Blue Shield Wyoming, Blue Cross Blue Shield of Wyoming, BCBSWY |
 | Blue Cross Blue Shield | blue | - | needs official source URL |
 | Blue Cross Blue Shield Alabama | blue | - | needs official source URL |
 | Blue Cross Blue Shield Arizona | blue | - | needs official source URL |
@@ -361,7 +361,7 @@ Last one-time research refresh: 2026-06-05.
 | Wellmark | regional | https://web.healthsparq.com/app/public/#/one/insurerCode=WMRK_I&brandCode=WELLMARK/machine-readable-transparency-in-coverage | observed stale; 140,399 plans; 24,143 files; aliases: Wellmark Blue Cross and Blue Shield, Wellmark Blue Cross Blue Shield of IA, Wellmark Blue Cross Blue Shield of Iowa and SD, Wellmark of Iowa |
 | Western Health Advantage | regional | https://www.westernhealth.com/mywha/price-transparency/ | curated source row |
 | Wisconsin Physicians Health | regional | - | needs official source URL |
-| WPS Health | regional | - | needs official source URL |
+| WPS Health | regional | https://www.wpshealth.com/resources/customer-resources/price-transparency.shtml | public WPS price transparency page delegates MRFs to transparency.healthcare/Turquoise; observed current zipped TOC and in-network/allowed-amount ZIP links; aliases: WPS Health Insurance, Wisconsin Physicians Service Insurance Corporation, Wisconsin Physicians Service, WPS |
 | Aetna CVS - Aetna Signature Administrators | tpa | https://health1.aetna.com/app/public/#/one/insurerCode=AETNACVS_I&brandCode=ASA/machine-readable-transparency-in-coverage | observed current; 22 plans; 178 files; aliases: ASA, Aetna Signature |
 | Aetna CVS - Joint Care Administration | tpa | https://health1.aetna.com/app/public/#/one/insurerCode=AETNACVS_I&brandCode=AJCA/machine-readable-transparency-in-coverage | observed current; 73 plans; 2,011 files |
 | 90 Degree Benefits | tpa | https://portal.90degreebenefits.com/MemberPortal/MachineReadableFiles | public Healthspace machine-readable file portal; aliases: 90 Degree, 90DB, 90 Degree Benefits Inc, "90 Degree Benefits, Inc." |

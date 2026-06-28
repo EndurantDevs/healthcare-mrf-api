@@ -851,6 +851,11 @@ def classify_hosting_platform(url: str | None) -> str | None:
         and "transparency-in-coverage" in path
     ):
         return "html_mrf_links"
+    if (
+        host in {"www.wpshealth.com", "wpshealth.com"}
+        and "price-transparency" in path
+    ):
+        return "html_mrf_links"
     if host in {"www.healthplan.org", "healthplan.org"} and (
         path.startswith("/machine_readable_files")
         or path.startswith("/multiplan_mrfs")
@@ -1089,6 +1094,11 @@ def classify_hosting_platform(url: str | None) -> str | None:
         return "uhc_provider_mrf_files"
     if host == "transparency-in-coverage.bluecrossma.com":
         return "bcbsma_monthly_tocs"
+    if (
+        host in {"www.bcbswy.com", "bcbswy.com"}
+        and "machine-readable-files" in path
+    ):
+        return "bcbswy_hmhs_monthly_toc"
     if (
         host in {"www.upmchealthplan.com", "upmchealthplan.com"}
         and "transparency-in-coverage/mrf" in path

@@ -34,6 +34,13 @@ def test_source_urls_are_loaded_from_registry_file():
     assert (
         config["platform_resolvers"]["highmark_hmhs"]["type"] == "highmark_hmhs_script"
     )
+    assert (
+        config["platform_resolvers"]["bcbswy_hmhs_monthly_toc"]["type"]
+        == "monthly_toc_templates"
+    )
+    assert config["platform_resolvers"]["bcbswy_hmhs_monthly_toc"][
+        "file_templates"
+    ] == ["{month_start}_Blue_Cross_Blue_Shield_of_Wyoming_index.json"]
     assert config["platform_resolvers"]["sapphire"]["type"] == "sapphire_html_tocs"
     assert config["platform_resolvers"]["sapphire"]["max_static_queries"] == 8
     assert config["platform_resolvers"]["anthem_s3_mrf"]["type"] == "anthem_s3_mrf"
@@ -866,6 +873,8 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
 | Unified Group Services | tpa | https://mrf.healthcarebluebook.com/unified | aliases: UGS |
 | WellNet | tpa | https://mrf.healthcarebluebook.com/Wellnet | aliases: WellNet Healthcare |
 | The Health Plan | regional | https://www.healthplan.org/machine_readable_files | aliases: The Health Plan of West Virginia, THP |
+| BCBS Wyoming | blue | https://www.bcbswy.com/machine-readable-files/ | aliases: Blue Cross and Blue Shield of Wyoming, BCBSWY |
+| WPS Health | regional | https://www.wpshealth.com/resources/customer-resources/price-transparency.shtml | aliases: Wisconsin Physicians Service, WPS |
 """
 
     candidates = discovery.parse_master_list(markdown)
@@ -1027,6 +1036,13 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
         "The Health Plan of West Virginia",
         "THP",
     )
+    assert by_name["BCBS Wyoming"].hosting_platform == "bcbswy_hmhs_monthly_toc"
+    assert by_name["BCBS Wyoming"].aliases == (
+        "Blue Cross and Blue Shield of Wyoming",
+        "BCBSWY",
+    )
+    assert by_name["WPS Health"].hosting_platform == "html_mrf_links"
+    assert by_name["WPS Health"].aliases == ("Wisconsin Physicians Service", "WPS")
 
 
 @pytest.mark.asyncio
@@ -1385,6 +1401,9 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Blue Cross Blue Shield of SC" in aliases_by_name["BCBS South Carolina"]
     assert "BlueCross BlueShield of South Carolina" in aliases_by_name["BCBS South Carolina"]
     assert "BlueCross BlueShield of Alabama" in by_name["BCBS Alabama"].aliases
+    assert by_name["BCBS Wyoming"].hosting_platform == "bcbswy_hmhs_monthly_toc"
+    assert "Blue Cross and Blue Shield of Wyoming" in by_name["BCBS Wyoming"].aliases
+    assert "BCBSWY" in by_name["BCBS Wyoming"].aliases
     assert "Blue Cross & Blue Shield of Mississippi" in by_name["BCBS Mississippi"].aliases
     assert "BlueCross BlueShield of Mississippi" in by_name["BCBS Mississippi"].aliases
     assert (
@@ -1482,6 +1501,11 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert by_name["EMI Health"].hosting_platform == "html_mrf_links"
     assert "Companion Life dental" in by_name["EMI Health"].aliases
     assert "Companion Life EMI Dental Plans" in by_name["EMI Health"].aliases
+    assert by_name["WPS Health"].hosting_platform == "html_mrf_links"
+    assert "WPS Health Insurance" in by_name["WPS Health"].aliases
+    assert "Wisconsin Physicians Service Insurance Corporation" in (
+        by_name["WPS Health"].aliases
+    )
     assert "Health Plans, Inc" in by_name["Health Plans Inc"].aliases
     assert "Health Plans, Inc." in by_name["Health Plans Inc"].aliases
     assert "HealthPlans Inc." in by_name["Health Plans Inc"].aliases
@@ -2169,6 +2193,12 @@ def test_classify_hosting_platforms():
     )
     assert (
         discovery.classify_hosting_platform(
+            "https://www.bcbswy.com/machine-readable-files/"
+        )
+        == "bcbswy_hmhs_monthly_toc"
+    )
+    assert (
+        discovery.classify_hosting_platform(
             "https://www.bcbsil.com/asomrf?EIN=260241222"
         )
         == "bcbs_asomrf"
@@ -2347,6 +2377,12 @@ def test_classify_hosting_platforms():
     assert (
         discovery.classify_hosting_platform(
             "https://group-health.com/price-transparency"
+        )
+        == "html_mrf_links"
+    )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://www.wpshealth.com/resources/customer-resources/price-transparency.shtml"
         )
         == "html_mrf_links"
     )
@@ -7253,6 +7289,30 @@ def test_monthly_toc_templates_generate_current_and_previous_month_targets():
         "https://files.example.test/2026-05-01_example_index.json",
     ]
     assert targets[0].metadata["target_max_bytes"] == 123456
+    assert targets[0].metadata["month_start"] == "2026-06-01"
+
+
+def test_bcbswy_monthly_toc_template_generates_scoped_hmhs_target():
+    source = {
+        "source_id": "source_1",
+        "payer_id": "payer_1",
+        "display_name": "BCBS Wyoming",
+    }
+    resolver = discovery._source_config()["platform_resolvers"][
+        "bcbswy_hmhs_monthly_toc"
+    ]
+
+    targets = discovery._monthly_toc_targets(
+        source,
+        "https://www.bcbswy.com/machine-readable-files/",
+        resolver,
+        now=discovery.dt.datetime(2026, 6, 27, 12, 0, 0),
+    )
+
+    assert [target.url for target in targets] == [
+        "https://mrfdata.hmhs.com/files/460/wy/inbound/local/2026-06-01_Blue_Cross_Blue_Shield_of_Wyoming_index.json"
+    ]
+    assert targets[0].metadata["resolver"] == "monthly_toc_templates"
     assert targets[0].metadata["month_start"] == "2026-06-01"
 
 
