@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -37,6 +38,54 @@ PTG2_MANIFEST_PRICE_SET_MEMBER_KINDS = {"price_set_members", "price_set_membersh
 PTG2_MANIFEST_SOURCE_TRACE_KINDS = {"source_trace_sets", "source_traces"}
 PTG2_MANIFEST_ROW_LIMIT_ENV = "HLTHPRT_PTG2_MANIFEST_ROW_LIMIT"
 PTG2_MANIFEST_BYTE_LIMIT_ENV = "HLTHPRT_PTG2_MANIFEST_BYTE_LIMIT"
+PTG_NO_DISPLAY_ADDRESS_FIELDS = {
+    "address",
+    "formatted_address",
+    "address_key",
+    "city",
+    "state",
+    "zip5",
+    "zip_code",
+    "postal_code",
+    "lat",
+    "long",
+    "latitude",
+    "longitude",
+    "distance",
+    "distance_miles",
+    "zip_match_type",
+    "google_maps_url",
+    "google_map_url",
+    "maps_url",
+    "phone",
+    "telephone",
+    "telephone_number",
+    "phone_number",
+    "fax",
+    "fax_number",
+    "location_hash",
+    "location_source",
+    "location_confidence_code",
+    "address_sources",
+    "address_precision",
+    "source_count",
+    "multi_source_confirmed",
+    "source_mask",
+    "address_source_mask",
+}
+PTG_DIRECT_PAYER_LOCATION_RECORD_KEYS = {
+    "source_record_id",
+    "source_record_key",
+    "source_provider_reference_id",
+    "provider_reference_id",
+    "provider_reference",
+    "provider_group_id",
+    "provider_group_global_id_128",
+    "provider_group_hash",
+    "provider_group_location_hash",
+    "raw_provider_location_key",
+    "json_pointer",
+}
 
 
 def _env_int(name: str, default: int) -> int:
@@ -47,6 +96,297 @@ def _env_int(name: str, default: int) -> int:
         return int(str(raw).strip())
     except ValueError:
         return default
+
+
+def _coerce_str_list(value: Any) -> list[str]:
+    if value in (None, ""):
+        return []
+    payload = _coerce_json_payload(value, None) if isinstance(value, str) else _coerce_json_payload(value, [])
+    if payload in (None, ""):
+        payload = value
+    if isinstance(payload, str):
+        payload = [payload]
+    if not isinstance(payload, list):
+        return []
+    values: list[str] = []
+    for item in payload:
+        text = str(item or "").strip()
+        if text and text not in values:
+            values.append(text)
+    return values
+
+
+def _optional_bool(value: Any) -> bool | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return bool(value)
+    normalized = str(value or "").strip().lower()
+    if normalized in {"1", "true", "t", "yes", "y"}:
+        return True
+    if normalized in {"0", "false", "f", "no", "n"}:
+        return False
+    return None
+
+
+def _nonempty_value(source: Mapping[str, Any], *keys: str) -> bool:
+    return any(source.get(key) not in (None, "", [], {}) for key in keys)
+
+
+def _has_displayable_address(source: Mapping[str, Any]) -> bool:
+    if _nonempty_value(source, "first_line", "address_line_1", "street", "street_address"):
+        return True
+    has_city = _nonempty_value(source, "city", "city_name")
+    has_region = _nonempty_value(source, "state", "state_name", "postal_code", "zip5")
+    if has_city and has_region:
+        return True
+    nested_address = source.get("address")
+    return isinstance(nested_address, Mapping) and _has_displayable_address(nested_address)
+
+
+def _normalized_markers(*values: Any) -> set[str]:
+    return {
+        str(value or "").strip().lower().replace("-", "_")
+        for value in values
+        if str(value or "").strip()
+    }
+
+
+def _manifest_plan_context_matched(address_payload: Mapping[str, Any]) -> bool:
+    if address_payload.get("provider_directory_plan_context_matched") is True:
+        return True
+    evidence = _coerce_json_payload(address_payload.get("address_verification_evidence"), {})
+    if isinstance(evidence, dict):
+        return str(evidence.get("matched_on") or "").strip().lower().endswith("_plan")
+    return False
+
+
+def _canonical_network_name(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+def _manifest_network_name_matches(
+    item: Mapping[str, Any],
+    address_payload: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    ptg_names = _coerce_str_list(item.get("network_names") or address_payload.get("network_names"))
+    ptg_by_key = {
+        _canonical_network_name(value): value
+        for value in ptg_names
+        if _canonical_network_name(value)
+    }
+    if not ptg_by_key:
+        return []
+    raw_directory_networks = _coerce_json_payload(address_payload.get("provider_directory_network_matches"), [])
+    directory_networks = list(raw_directory_networks) if isinstance(raw_directory_networks, list) else []
+    for name in _coerce_str_list(address_payload.get("provider_directory_network_names")):
+        directory_networks.append({"name": name})
+
+    matches: list[dict[str, Any]] = []
+    seen_candidate_keys: set[str] = set()
+    for network in directory_networks:
+        if not isinstance(network, dict):
+            continue
+        candidate_values = [network.get("name"), network.get("provider_directory_network_name")]
+        aliases = _coerce_json_payload(network.get("aliases"), [])
+        if isinstance(aliases, list):
+            candidate_values.extend(aliases)
+        for candidate in candidate_values:
+            candidate_key = _canonical_network_name(candidate)
+            if not candidate_key or candidate_key not in ptg_by_key or candidate_key in seen_candidate_keys:
+                continue
+            seen_candidate_keys.add(candidate_key)
+            matches.append(
+                {
+                    "ptg_network_name": ptg_by_key[candidate_key],
+                    "provider_directory_network_name": str(candidate or ""),
+                    "provider_directory_network_resource_id": (
+                        network.get("resource_id") or network.get("provider_directory_network_resource_id")
+                    ),
+                    "provider_directory_network_ref": network.get("ref") or network.get("provider_directory_network_ref"),
+                }
+            )
+    return matches
+
+
+def _manifest_address_verification_evidence(
+    address_payload: Mapping[str, Any],
+    network_name_matches: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    evidence = _coerce_json_payload(address_payload.get("address_verification_evidence"), {})
+    if not isinstance(evidence, dict):
+        evidence = {}
+    if not evidence and not network_name_matches:
+        return None
+    updated = dict(evidence)
+    if network_name_matches and not _manifest_plan_context_matched(address_payload):
+        matched_on = str(updated.get("matched_on") or "").strip()
+        if matched_on and not matched_on.endswith("_network_name"):
+            updated["matched_on"] = f"{matched_on}_network_name"
+        elif not matched_on:
+            updated["matched_on"] = "npi_address_key_role_location_network_name"
+        updated["network_name_context_matched"] = True
+        updated["network_name_matches"] = network_name_matches
+    elif not network_name_matches and not _manifest_plan_context_matched(address_payload):
+        matched_on = str(updated.get("matched_on") or "").strip()
+        if matched_on.endswith("_network_name"):
+            updated["matched_on"] = matched_on.removesuffix("_network_name") or "npi_address_key_role_location"
+        updated.pop("network_name_context_matched", None)
+        updated.pop("network_name_matches", None)
+    return updated
+
+
+def _manifest_has_direct_payer_location_record_evidence(address_payload: Mapping[str, Any]) -> bool:
+    evidence = _coerce_json_payload(address_payload.get("address_verification_evidence"), {})
+    if not isinstance(evidence, dict):
+        return False
+    return any(evidence.get(key) not in (None, "", [], {}) for key in PTG_DIRECT_PAYER_LOCATION_RECORD_KEYS)
+
+
+def _manifest_address_payload(item: Mapping[str, Any], provider: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    provider = provider or {}
+    payload = _coerce_json_payload(item.get("address_payload") or provider.get("address_payload"), {})
+    address = _coerce_json_payload(item.get("address") or provider.get("address"), {})
+    merged: dict[str, Any] = {}
+    if isinstance(address, dict):
+        merged.update(address)
+    if isinstance(payload, dict):
+        merged.update(payload)
+    return merged
+
+
+def _manifest_address_verification(
+    item: Mapping[str, Any],
+    *,
+    provider: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    provider = provider or {}
+    address_payload = _manifest_address_payload(item, provider)
+    address_sources = _coerce_str_list(item.get("address_sources") or address_payload.get("address_sources"))
+    location_source = (
+        item.get("location_source")
+        or provider.get("location_source")
+        or address_payload.get("location_source")
+    )
+    location_confidence_code = (
+        item.get("location_confidence_code")
+        or provider.get("location_confidence_code")
+        or address_payload.get("location_confidence_code")
+    )
+    displayed = _has_displayable_address(address_payload) or _has_displayable_address(item)
+    if displayed is False:
+        return {
+            "rate_network_binding": "tic_provider_group_npi_tin",
+            "address_network_binding": "inferred_from_provider_identity",
+            "address_evidence_level": "unknown",
+            "requires_location_confirmation": True,
+            "reason": "PTG proves the provider identity is in network, but no displayable address is available.",
+            "displayed_address_present": False,
+        }
+
+    markers = {
+        *(_normalized_markers(*address_sources)),
+        *_normalized_markers(location_source, location_confidence_code),
+    }
+    direct_payer = bool(
+        markers
+        & {
+            "payer_confirmed_location",
+            "payer_provider_group_location",
+            "ptg_provider_group_location",
+            "tic_provider_group_location",
+        }
+    ) and _manifest_has_direct_payer_location_record_evidence(address_payload)
+    provider_directory = bool(
+        markers & {"provider_directory", "provider_directory_fhir", "payer_provider_directory"}
+    )
+    provider_directory_network_name_matches = _manifest_network_name_matches(item, address_payload)
+    provider_directory_network_context = bool(
+        provider_directory
+        and (
+            _manifest_plan_context_matched(address_payload)
+            or provider_directory_network_name_matches
+        )
+    )
+    provider_directory_evidence = _manifest_address_verification_evidence(
+        address_payload,
+        provider_directory_network_name_matches,
+    )
+    nppes = bool(markers & {"nppes", "npi_address"})
+    if direct_payer:
+        address_binding = "payer_confirmed_location"
+        evidence_level = "payer_confirmed_location"
+        requires_confirmation = False
+        reason = "The payer/PTG source supplied the provider location used for this result."
+    elif provider_directory_network_context:
+        address_binding = "payer_directory_corroborated_location"
+        evidence_level = "payer_directory_network_location"
+        requires_confirmation = False
+        reason = "A payer Provider Directory record links this provider, network or plan context, and displayed address."
+    elif provider_directory:
+        address_binding = "inferred_from_provider_identity"
+        evidence_level = "provider_directory_address"
+        requires_confirmation = True
+        reason = "A payer Provider Directory record corroborates the displayed provider address, but the PTG rate file did not supply it."
+    elif nppes:
+        address_binding = "inferred_from_provider_identity"
+        evidence_level = "nppes_provider_address"
+        requires_confirmation = True
+        reason = "PTG proves the NPI/TIN is in network; the displayed address comes from NPPES/provider enrichment."
+    elif displayed:
+        address_binding = "inferred_from_provider_identity"
+        evidence_level = "unified_provider_address"
+        requires_confirmation = True
+        reason = "PTG proves the provider identity is in network; the displayed address comes from provider-address enrichment."
+    else:
+        address_binding = "inferred_from_provider_identity"
+        evidence_level = "unknown"
+        requires_confirmation = True
+        reason = "PTG proves the provider identity is in network, but address provenance is weak or unavailable."
+    response_address_sources = list(address_sources)
+    if address_binding != "payer_confirmed_location":
+        response_address_sources = [
+            value
+            for value in response_address_sources
+            if value.lower().replace("-", "_") not in {"ptg", "tic", "tic_provider_group"}
+        ]
+    provider_directory_plan_context = (
+        True
+        if _manifest_plan_context_matched(address_payload)
+        else _optional_bool(address_payload.get("provider_directory_plan_context_matched"))
+    )
+    payload = {
+        "rate_network_binding": "tic_provider_group_npi_tin",
+        "address_network_binding": address_binding,
+        "address_evidence_level": evidence_level,
+        "requires_location_confirmation": requires_confirmation,
+        "reason": reason,
+        "displayed_address_present": displayed,
+    }
+    optional_fields = {
+        "location_source": location_source,
+        "location_confidence_code": location_confidence_code,
+        "address_sources": response_address_sources,
+        "provider_directory_plan_context_matched": provider_directory_plan_context,
+        "provider_directory_network_name_matched": bool(provider_directory_network_name_matches) or None,
+        "provider_directory_network_names": _coerce_str_list(address_payload.get("provider_directory_network_names")),
+        "provider_directory_network_matches": provider_directory_network_name_matches,
+        "address_verification_evidence": provider_directory_evidence,
+    }
+    for key, value in optional_fields.items():
+        if value not in (None, "", []):
+            payload[key] = value
+    return payload
+
+
+def _strip_no_display_address_fields(item: dict[str, Any]) -> None:
+    verification = item.get("address_verification")
+    if not isinstance(verification, dict) or verification.get("displayed_address_present") is not False:
+        return
+    for key in PTG_NO_DISPLAY_ADDRESS_FIELDS:
+        item.pop(key, None)
 
 
 @dataclass(frozen=True)
@@ -437,12 +777,15 @@ def search_ptg2_manifest_snapshot(
                 "price_set_hash": price_set_hash,
                 "rate_pack_hash": row.get("rate_pack_hash"),
                 "source_trace": source_trace,
+                "network_names": _coerce_str_list(row.get("network_names")),
                 "confidence": row.get("confidence")
                 or {
                     "network": "tic_rate_npi_tin",
                     "location": "nppes_practice_location",
                 },
             }
+        base_item["address_verification"] = _manifest_address_verification(base_item)
+        _strip_no_display_address_fields(base_item)
         if not expand_providers:
             items.append(base_item)
             continue
@@ -452,6 +795,7 @@ def search_ptg2_manifest_snapshot(
         for provider in providers:
             item = dict(base_item)
             npi = provider.get("npi") or provider.get("provider_npi")
+            address_payload = _manifest_address_payload(provider)
             item.update(
                 {
                     "npi": npi,
@@ -461,11 +805,17 @@ def search_ptg2_manifest_snapshot(
                     "city": provider.get("city"),
                     "zip5": provider.get("zip5"),
                     "location_hash": provider.get("location_hash"),
-                    "address_payload": provider.get("address_payload"),
+                    "location_source": provider.get("location_source"),
+                    "location_confidence_code": provider.get("location_confidence_code"),
+                    "address": address_payload,
+                    "telephone_number": provider.get("telephone_number") or address_payload.get("telephone_number"),
+                    "fax_number": provider.get("fax_number") or address_payload.get("fax_number"),
                     "taxonomy_codes": provider.get("taxonomy_codes") or [],
                     "specialties": provider.get("specialties") or [],
                 }
             )
+            item["address_verification"] = _manifest_address_verification(item, provider=provider)
+            _strip_no_display_address_fields(item)
             items.append(item)
     total_items = len(items) if expand_providers else len(matched_rows)
     if expand_providers:

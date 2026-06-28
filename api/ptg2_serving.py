@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -145,6 +146,57 @@ _PTG2_LEGACY_ADDRESS_COLUMNS = {
     "fax_number",
 }
 _PTG2_UNIFIED_ADDRESS_COLUMNS = _PTG2_LEGACY_ADDRESS_COLUMNS | {"address_precision"}
+PTG_PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW = (
+    f"{PTG2_SCHEMA}.ptg_provider_directory_address_corroboration"
+)
+PTG_NO_DISPLAY_ADDRESS_FIELDS = {
+    "address",
+    "formatted_address",
+    "address_key",
+    "city",
+    "state",
+    "zip5",
+    "zip_code",
+    "postal_code",
+    "lat",
+    "long",
+    "latitude",
+    "longitude",
+    "distance",
+    "distance_miles",
+    "zip_match_type",
+    "google_maps_url",
+    "google_map_url",
+    "maps_url",
+    "phone",
+    "telephone",
+    "telephone_number",
+    "phone_number",
+    "fax",
+    "fax_number",
+    "location_hash",
+    "location_source",
+    "location_confidence_code",
+    "address_sources",
+    "address_precision",
+    "source_count",
+    "multi_source_confirmed",
+    "source_mask",
+    "address_source_mask",
+}
+PTG_DIRECT_PAYER_LOCATION_RECORD_KEYS = {
+    "source_record_id",
+    "source_record_key",
+    "source_provider_reference_id",
+    "provider_reference_id",
+    "provider_reference",
+    "provider_group_id",
+    "provider_group_global_id_128",
+    "provider_group_hash",
+    "provider_group_location_hash",
+    "raw_provider_location_key",
+    "json_pointer",
+}
 
 
 def _ptg2_geo_distance_miles_sql(lat_sql: str, long_sql: str) -> str:
@@ -210,6 +262,419 @@ def _add_location_phone_fields(item: dict[str, Any], data: dict[str, Any], addre
         item["fax_number"] = fax
 
 
+def _coerce_bool_payload(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return bool(value)
+    normalized = str(value or "").strip().lower()
+    return normalized in {"1", "true", "t", "yes", "y"}
+
+
+def _optional_bool_payload(value: Any) -> bool | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return bool(value)
+    normalized = str(value or "").strip().lower()
+    if normalized in {"1", "true", "t", "yes", "y"}:
+        return True
+    if normalized in {"0", "false", "f", "no", "n"}:
+        return False
+    return None
+
+
+def _coerce_int_payload(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_str_list_payload(value: Any) -> list[str]:
+    if value in (None, ""):
+        return []
+    payload = _coerce_json_payload(value, None) if isinstance(value, str) else _coerce_json_payload(value, [])
+    if payload in (None, ""):
+        payload = value
+    if isinstance(payload, str):
+        payload = [payload]
+    if not isinstance(payload, list):
+        return []
+    values: list[str] = []
+    for item in payload:
+        text = str(item or "").strip()
+        if text and text not in values:
+            values.append(text)
+    return values
+
+
+def _first_payload_value(*values: Any) -> Any:
+    for value in values:
+        if value not in (None, "", []):
+            return value
+    return None
+
+
+def _nonempty_payload_value(source: dict[str, Any], *keys: str) -> bool:
+    return any(source.get(key) not in (None, "", [], {}) for key in keys)
+
+
+def _has_displayable_address_fields(source: dict[str, Any]) -> bool:
+    if _nonempty_payload_value(source, "first_line", "address_line_1", "street", "street_address"):
+        return True
+    has_city = _nonempty_payload_value(source, "city", "city_name")
+    has_region = _nonempty_payload_value(source, "state", "state_name", "postal_code", "zip5")
+    return has_city and has_region
+
+
+def _has_displayed_address_payload(item: dict[str, Any], address_payload: dict[str, Any]) -> bool:
+    for source in (address_payload, item):
+        if _has_displayable_address_fields(source):
+            return True
+        nested_address = source.get("address")
+        if isinstance(nested_address, dict) and _has_displayable_address_fields(nested_address):
+            return True
+    return False
+
+
+def _provider_directory_plan_context_matched(address_payload: dict[str, Any]) -> bool:
+    if _coerce_bool_payload(address_payload.get("provider_directory_plan_context_matched")):
+        return True
+    evidence = _coerce_json_payload(address_payload.get("address_verification_evidence"), {})
+    if isinstance(evidence, dict):
+        matched_on = str(evidence.get("matched_on") or "").strip().lower()
+        return matched_on.endswith("_plan")
+    return False
+
+
+def _canonical_network_name_payload(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+def _provider_directory_network_name_matches(
+    item: dict[str, Any],
+    address_payload: dict[str, Any],
+) -> list[dict[str, Any]]:
+    ptg_names = _coerce_str_list_payload(
+        _first_payload_value(item.get("network_names"), address_payload.get("network_names"))
+    )
+    ptg_by_key = {
+        _canonical_network_name_payload(value): value
+        for value in ptg_names
+        if _canonical_network_name_payload(value)
+    }
+    if not ptg_by_key:
+        return []
+
+    raw_directory_networks = _coerce_json_payload(address_payload.get("provider_directory_network_matches"), [])
+    directory_networks = list(raw_directory_networks) if isinstance(raw_directory_networks, list) else []
+    for name in _coerce_str_list_payload(address_payload.get("provider_directory_network_names")):
+        directory_networks.append({"name": name})
+
+    matches: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str | None]] = set()
+    seen_candidate_keys: set[str] = set()
+    for network in directory_networks:
+        if not isinstance(network, dict):
+            continue
+        candidate_values = [network.get("name"), network.get("provider_directory_network_name")]
+        aliases = _coerce_json_payload(network.get("aliases"), [])
+        if isinstance(aliases, list):
+            candidate_values.extend(aliases)
+        for candidate in candidate_values:
+            candidate_key = _canonical_network_name_payload(candidate)
+            if not candidate_key or candidate_key not in ptg_by_key:
+                continue
+            if candidate_key in seen_candidate_keys:
+                continue
+            match_key = (candidate_key, str(network.get("resource_id") or ""), str(network.get("ref") or ""))
+            if match_key in seen:
+                continue
+            seen.add(match_key)
+            seen_candidate_keys.add(candidate_key)
+            matches.append(
+                {
+                    "ptg_network_name": ptg_by_key[candidate_key],
+                    "provider_directory_network_name": str(candidate or ""),
+                    "provider_directory_network_resource_id": (
+                        network.get("resource_id") or network.get("provider_directory_network_resource_id")
+                    ),
+                    "provider_directory_network_ref": network.get("ref") or network.get("provider_directory_network_ref"),
+                }
+            )
+    return matches
+
+
+def _provider_directory_network_context_matched(
+    item: dict[str, Any],
+    address_payload: dict[str, Any],
+) -> bool:
+    if _provider_directory_plan_context_matched(address_payload):
+        return True
+    return bool(_provider_directory_network_name_matches(item, address_payload))
+
+
+def _has_direct_payer_location_record_evidence(address_payload: dict[str, Any]) -> bool:
+    evidence = _coerce_json_payload(address_payload.get("address_verification_evidence"), {})
+    if not isinstance(evidence, dict):
+        return False
+    return any(evidence.get(key) not in (None, "", [], {}) for key in PTG_DIRECT_PAYER_LOCATION_RECORD_KEYS)
+
+
+def _provider_directory_address_verification_evidence(
+    address_payload: dict[str, Any],
+    provider_directory_network_name_matches: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    evidence = _coerce_json_payload(address_payload.get("address_verification_evidence"), {})
+    if not isinstance(evidence, dict):
+        evidence = {}
+    if not evidence and not provider_directory_network_name_matches:
+        return None
+    updated = dict(evidence)
+    if provider_directory_network_name_matches and not _provider_directory_plan_context_matched(address_payload):
+        matched_on = str(updated.get("matched_on") or "").strip()
+        if matched_on and not matched_on.endswith("_network_name"):
+            updated["matched_on"] = f"{matched_on}_network_name"
+        elif not matched_on:
+            updated["matched_on"] = "npi_address_key_role_location_network_name"
+        updated["network_name_matches"] = provider_directory_network_name_matches
+        updated["network_name_context_matched"] = True
+    elif not provider_directory_network_name_matches and not _provider_directory_plan_context_matched(address_payload):
+        matched_on = str(updated.get("matched_on") or "").strip()
+        if matched_on.endswith("_network_name"):
+            updated["matched_on"] = matched_on.removesuffix("_network_name") or "npi_address_key_role_location"
+        updated.pop("network_name_matches", None)
+        updated.pop("network_name_context_matched", None)
+    return updated
+
+
+def _promote_address_provenance_fields(item: dict[str, Any], address_payload: dict[str, Any]) -> None:
+    for key in (
+        "address_precision",
+        "source_count",
+        "multi_source_confirmed",
+        "source_mask",
+        "address_source_mask",
+        "location_confidence_id",
+    ):
+        value = address_payload.get(key)
+        if value not in (None, "") and item.get(key) in (None, ""):
+            item[key] = value
+
+
+def _address_verification_payload(
+    item: dict[str, Any],
+    data: dict[str, Any],
+    address_payload: dict[str, Any],
+) -> dict[str, Any]:
+    displayed_address_present = _has_displayed_address_payload(item, address_payload)
+    if displayed_address_present is False:
+        return {
+            "rate_network_binding": "tic_provider_group_npi_tin",
+            "address_network_binding": "inferred_from_provider_identity",
+            "address_evidence_level": "unknown",
+            "requires_location_confirmation": True,
+            "reason": "PTG proves the provider identity is in network, but no displayable address is available.",
+            "displayed_address_present": False,
+        }
+
+    location_source = item.get("location_source") or data.get("location_source")
+    location_confidence_code = item.get("location_confidence_code") or data.get("location_confidence_code")
+    address_sources = _coerce_str_list_payload(
+        _first_payload_value(item.get("address_sources"), address_payload.get("address_sources"))
+    )
+    address_precision = (
+        item.get("address_precision")
+        or address_payload.get("address_precision")
+        or ("street" if address_payload.get("first_line") else None)
+    )
+    source_count = _coerce_int_payload(
+        _first_payload_value(item.get("source_count"), address_payload.get("source_count"))
+    )
+    source_mask = (
+        _coerce_int_payload(_first_payload_value(item.get("source_mask"), address_payload.get("source_mask")))
+        or 0
+    )
+    address_source_mask = (
+        _coerce_int_payload(
+            _first_payload_value(item.get("address_source_mask"), address_payload.get("address_source_mask"))
+        )
+        or 0
+    )
+    multi_source_confirmed = _coerce_bool_payload(
+        _first_payload_value(item.get("multi_source_confirmed"), address_payload.get("multi_source_confirmed"))
+    )
+    if not multi_source_confirmed and source_count is not None:
+        multi_source_confirmed = source_count > 1
+
+    source_markers = {
+        str(value or "").strip().lower()
+        for value in (
+            location_source,
+            location_confidence_code,
+            item.get("address_network_binding"),
+            data.get("address_network_binding"),
+            address_payload.get("address_network_binding"),
+            address_payload.get("location_source"),
+            address_payload.get("location_confidence_code"),
+        )
+    }
+    direct_ptg_location = bool(
+        source_markers
+        & {
+            "payer_confirmed_location",
+            "payer_provider_group_location",
+            "ptg_provider_group_location",
+            "tic_provider_group_location",
+        }
+    ) and _has_direct_payer_location_record_evidence(address_payload)
+    normalized_sources = {value.lower().replace("-", "_") for value in address_sources}
+    provider_directory_address = bool(
+        source_markers
+        & {
+            "provider_directory_fhir",
+            "provider_directory_address",
+            "payer_provider_directory",
+            "payer_directory_corroborated_location",
+        }
+    ) or bool(normalized_sources & {"provider_directory", "provider_directory_fhir", "payer_provider_directory"})
+    provider_directory_network_name_matches = _provider_directory_network_name_matches(item, address_payload)
+    provider_directory_evidence = _provider_directory_address_verification_evidence(
+        address_payload,
+        provider_directory_network_name_matches,
+    )
+    provider_directory_network_location = bool(
+        provider_directory_address
+        or source_markers
+        & {
+            "payer_directory_corroborated_location",
+            "provider_directory_network_location",
+            "provider_directory_plan_network_location",
+        }
+    ) and _provider_directory_network_context_matched(item, address_payload)
+    direct_mrf_address = bool(address_source_mask & 2) or "mrf" in normalized_sources
+    nppes_address = bool(address_source_mask & 1) or "nppes" in normalized_sources
+    if direct_ptg_location:
+        address_evidence_level = "payer_confirmed_location"
+        address_network_binding = "payer_confirmed_location"
+        requires_location_confirmation = False
+        reason = "The payer/PTG source supplied the provider location used for this result."
+    elif provider_directory_network_location:
+        address_evidence_level = "payer_directory_network_location"
+        address_network_binding = "payer_directory_corroborated_location"
+        requires_location_confirmation = False
+        reason = "A payer Provider Directory record links this provider, network or plan context, and displayed address."
+    elif provider_directory_address:
+        address_evidence_level = "provider_directory_address"
+        address_network_binding = "inferred_from_provider_identity"
+        requires_location_confirmation = True
+        reason = "A payer Provider Directory record corroborates the displayed provider address, but the PTG rate file did not supply it."
+    elif address_precision == "city_zip":
+        address_evidence_level = "city_zip_fallback"
+        address_network_binding = "inferred_from_provider_identity"
+        requires_location_confirmation = True
+        reason = "PTG proves the provider identity is in network, but only city/ZIP address evidence is available."
+    elif direct_mrf_address and multi_source_confirmed:
+        address_evidence_level = "multi_source_direct_mrf_address"
+        address_network_binding = "inferred_from_provider_identity"
+        requires_location_confirmation = True
+        reason = "The street address is corroborated by MRF and another source, but not by this PTG rate file."
+    elif direct_mrf_address:
+        address_evidence_level = "direct_mrf_address"
+        address_network_binding = "inferred_from_provider_identity"
+        requires_location_confirmation = True
+        reason = "The street address came from MRF provider-address evidence, but not from this PTG rate file."
+    elif multi_source_confirmed:
+        address_evidence_level = "multi_source_provider_address"
+        address_network_binding = "inferred_from_provider_identity"
+        requires_location_confirmation = True
+        reason = "The street address is corroborated by multiple provider-address sources, but not by this PTG rate file."
+    elif nppes_address or str(location_source or "").strip().lower() == "npi_address":
+        address_evidence_level = "nppes_provider_address"
+        address_network_binding = "inferred_from_provider_identity"
+        requires_location_confirmation = True
+        reason = "PTG proves the NPI/TIN is in network; the displayed address comes from NPPES/provider enrichment."
+    elif str(location_source or "").strip().lower() == "entity_address_unified":
+        address_evidence_level = "unified_provider_address"
+        address_network_binding = "inferred_from_provider_identity"
+        requires_location_confirmation = True
+        reason = "PTG proves the provider identity is in network; the displayed address comes from unified address evidence."
+    else:
+        address_evidence_level = "unknown"
+        address_network_binding = "inferred_from_provider_identity"
+        requires_location_confirmation = True
+        reason = "PTG proves the provider identity is in network, but address provenance is weak or unavailable."
+
+    response_address_sources = list(address_sources)
+    if address_network_binding != "payer_confirmed_location":
+        response_address_sources = [
+            value
+            for value in response_address_sources
+            if value.lower().replace("-", "_") not in {"ptg", "tic", "tic_provider_group"}
+        ]
+    provider_directory_plan_context = (
+        True
+        if _provider_directory_plan_context_matched(address_payload)
+        else _optional_bool_payload(address_payload.get("provider_directory_plan_context_matched"))
+    )
+    provider_directory_network_context_present = _optional_bool_payload(
+        address_payload.get("provider_directory_network_context_present")
+    )
+
+    payload = {
+        "rate_network_binding": "tic_provider_group_npi_tin",
+        "address_network_binding": address_network_binding,
+        "address_evidence_level": address_evidence_level,
+        "requires_location_confirmation": requires_location_confirmation,
+        "reason": reason,
+    }
+    optional_fields = {
+        "displayed_address_present": displayed_address_present,
+        "location_source": location_source,
+        "location_confidence_code": location_confidence_code,
+        "address_precision": address_precision,
+        "address_sources": response_address_sources,
+        "source_count": source_count,
+        "multi_source_confirmed": multi_source_confirmed,
+        "source_mask": source_mask or None,
+        "address_source_mask": address_source_mask or None,
+        "provider_directory_source_id": address_payload.get("provider_directory_source_id"),
+        "provider_directory_location_resource_id": address_payload.get("provider_directory_location_resource_id"),
+        "provider_directory_location_name": address_payload.get("provider_directory_location_name"),
+        "provider_directory_plan_context_matched": provider_directory_plan_context,
+        "provider_directory_network_name_matched": bool(provider_directory_network_name_matches) or None,
+        "provider_directory_network_context_present": provider_directory_network_context_present,
+        "provider_directory_network_refs": _coerce_str_list_payload(address_payload.get("provider_directory_network_refs")),
+        "provider_directory_network_names": _coerce_str_list_payload(address_payload.get("provider_directory_network_names")),
+        "provider_directory_network_matches": provider_directory_network_name_matches,
+        "provider_directory_insurance_plan_refs": _coerce_str_list_payload(
+            address_payload.get("provider_directory_insurance_plan_refs")
+        ),
+        "provider_directory_insurance_plan_matches": _coerce_str_list_payload(
+            address_payload.get("provider_directory_insurance_plan_matches")
+        ),
+        "provider_directory_match_type": address_payload.get("provider_directory_match_type"),
+        "address_verification_evidence": provider_directory_evidence,
+    }
+    for key, value in optional_fields.items():
+        if value not in (None, "", []):
+            payload[key] = value
+    return payload
+
+
+def _strip_no_display_address_fields(item: dict[str, Any]) -> None:
+    verification = item.get("address_verification")
+    if not isinstance(verification, dict) or verification.get("displayed_address_present") is not False:
+        return
+    for key in PTG_NO_DISPLAY_ADDRESS_FIELDS:
+        item.pop(key, None)
+
+
 def _ptg2_individual_npi_exists_sql(npi_sql: str) -> str:
     return (
         f"EXISTS (SELECT 1 FROM {PTG2_SCHEMA}.npi n_entity "
@@ -245,7 +710,196 @@ async def _ptg2_table_has_columns(session, table_name: str, required_columns: se
                 columns.add(str(value))
         return bool(columns) and set(required_columns).issubset(columns)
     except Exception:
+        await _rollback_optional_ptg2_query(session)
         return False
+
+
+async def _rollback_optional_ptg2_query(session) -> None:
+    rollback = getattr(session, "rollback", None)
+    if rollback is None:
+        return
+    try:
+        result = rollback()
+        if hasattr(result, "__await__"):
+            await result
+    except Exception:
+        return
+
+
+def _ptg2_row_address_key(row: dict[str, Any]) -> str | None:
+    address_key = row.get("address_key")
+    if address_key not in (None, ""):
+        return str(address_key)
+    address_payload = _coerce_json_payload(row.get("address_payload") or row.get("address"), {})
+    if isinstance(address_payload, dict):
+        address_key = address_payload.get("address_key")
+        if address_key not in (None, ""):
+            return str(address_key)
+    return None
+
+
+async def _ptg2_provider_directory_corroboration_table(session) -> str | None:
+    if await _serving_table_available(session, PTG_PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW):
+        return PTG_PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW
+    return None
+
+
+async def _overlay_provider_directory_corroboration(
+    session,
+    rows: list[dict[str, Any]],
+    *,
+    plan_id: str | None = None,
+    snapshot_id: str | None = None,
+    source_key: str | None = None,
+) -> list[dict[str, Any]]:
+    if not rows or not (plan_id or snapshot_id or source_key):
+        return rows
+    lookup_pairs: list[tuple[int, str]] = []
+    for row in rows:
+        npi = row.get("npi")
+        address_key = _ptg2_row_address_key(row)
+        if npi in (None, "") or not address_key:
+            continue
+        try:
+            lookup_pairs.append((int(npi), address_key))
+        except (TypeError, ValueError):
+            continue
+    if not lookup_pairs:
+        return rows
+    corroboration_table = await _ptg2_provider_directory_corroboration_table(session)
+    if not corroboration_table:
+        return rows
+    npis = sorted({npi for npi, _address_key in lookup_pairs})
+    address_keys = sorted({address_key for _npi, address_key in lookup_pairs})
+    try:
+        result = await session.execute(
+            text(
+                f"""
+                SELECT DISTINCT ON (npi, address_key::text)
+                    npi,
+                    address_key::text AS address_key,
+                    source_key,
+                    snapshot_id,
+                    plan_id,
+                    ptg_plan_id,
+                    provider_directory_source_id,
+                    provider_directory_org_name,
+                    provider_directory_plan_name,
+                    provider_directory_provider_resource_id,
+                    provider_directory_provider_name,
+                    provider_directory_role_resource_id,
+                    provider_directory_location_resource_id,
+                    provider_directory_location_name,
+                    provider_directory_telephone_number,
+                    provider_directory_fax_number,
+                    provider_directory_network_refs,
+                    provider_directory_insurance_plan_refs,
+                    provider_directory_network_names,
+                    provider_directory_network_matches,
+                    provider_directory_plan_context_matched,
+                    provider_directory_network_context_present,
+                    provider_directory_insurance_plan_matches,
+                    provider_directory_match_type,
+                    provider_directory_observed_at,
+                    address_network_binding,
+                    address_verification_evidence
+                FROM {corroboration_table}
+                WHERE provider_directory_active_match IS TRUE
+                  AND npi = ANY(CAST(:npis AS bigint[]))
+                  AND address_key::text = ANY(CAST(:address_keys AS text[]))
+                  AND (:source_key IS NULL OR source_key = :source_key)
+                  AND (:snapshot_id IS NULL OR snapshot_id = :snapshot_id)
+                  AND (
+                        :plan_id IS NULL
+                     OR plan_id = :plan_id
+                     OR ptg_plan_id = :plan_id
+                  )
+                ORDER BY npi,
+                         address_key::text,
+                         provider_directory_observed_at DESC NULLS LAST,
+                         provider_directory_source_id
+                """
+            ),
+            {
+                "npis": npis,
+                "address_keys": address_keys,
+                "source_key": source_key,
+                "snapshot_id": snapshot_id,
+                "plan_id": plan_id,
+            },
+        )
+    except Exception:
+        await _rollback_optional_ptg2_query(session)
+        return rows
+    matches = {
+        (int(data.get("npi")), str(data.get("address_key"))): data
+        for data in (_row_mapping(row) for row in result)
+        if data.get("npi") is not None and data.get("address_key")
+    }
+    if not matches:
+        return rows
+    overlaid: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            match_key = (int(row.get("npi")), str(_ptg2_row_address_key(row)))
+        except (TypeError, ValueError):
+            overlaid.append(row)
+            continue
+        corroboration = matches.get(match_key)
+        if not corroboration:
+            overlaid.append(row)
+            continue
+        address_network_binding = (
+            str(corroboration.get("address_network_binding") or "payer_directory_corroborated_location").strip()
+        )
+        if (
+            address_network_binding == "payer_directory_corroborated_location"
+            and not _coerce_bool_payload(corroboration.get("provider_directory_plan_context_matched"))
+        ):
+            address_network_binding = "provider_directory_address"
+        updated = dict(row)
+        updated["location_source"] = "provider_directory_fhir"
+        updated["location_confidence_code"] = address_network_binding
+        if corroboration.get("provider_directory_telephone_number"):
+            updated["telephone_number"] = corroboration.get("provider_directory_telephone_number")
+        if corroboration.get("provider_directory_fax_number"):
+            updated["fax_number"] = corroboration.get("provider_directory_fax_number")
+        address_payload = _coerce_json_payload(updated.get("address_payload") or updated.get("address"), {})
+        if not isinstance(address_payload, dict):
+            address_payload = {}
+        address_sources = _coerce_str_list_payload(address_payload.get("address_sources"))
+        if "provider_directory_fhir" not in address_sources:
+            address_sources.append("provider_directory_fhir")
+        address_payload.update(
+            {
+                "address_sources": address_sources,
+                "address_network_binding": address_network_binding,
+                "provider_directory_source_id": corroboration.get("provider_directory_source_id"),
+                "provider_directory_org_name": corroboration.get("provider_directory_org_name"),
+                "provider_directory_plan_name": corroboration.get("provider_directory_plan_name"),
+                "provider_directory_provider_resource_id": corroboration.get("provider_directory_provider_resource_id"),
+                "provider_directory_provider_name": corroboration.get("provider_directory_provider_name"),
+                "provider_directory_role_resource_id": corroboration.get("provider_directory_role_resource_id"),
+                "provider_directory_location_resource_id": corroboration.get("provider_directory_location_resource_id"),
+                "provider_directory_location_name": corroboration.get("provider_directory_location_name"),
+                "provider_directory_network_refs": corroboration.get("provider_directory_network_refs"),
+                "provider_directory_insurance_plan_refs": corroboration.get("provider_directory_insurance_plan_refs"),
+                "provider_directory_network_names": corroboration.get("provider_directory_network_names"),
+                "provider_directory_network_matches": corroboration.get("provider_directory_network_matches"),
+                "provider_directory_plan_context_matched": corroboration.get("provider_directory_plan_context_matched"),
+                "provider_directory_network_context_present": corroboration.get("provider_directory_network_context_present"),
+                "provider_directory_insurance_plan_matches": corroboration.get("provider_directory_insurance_plan_matches"),
+                "provider_directory_match_type": corroboration.get("provider_directory_match_type"),
+                "address_verification_evidence": corroboration.get("address_verification_evidence"),
+            }
+        )
+        if updated.get("telephone_number"):
+            address_payload["telephone_number"] = updated.get("telephone_number")
+        if updated.get("fax_number"):
+            address_payload["fax_number"] = updated.get("fax_number")
+        updated["address_payload"] = address_payload
+        overlaid.append(updated)
+    return overlaid
 
 
 async def _ptg2_address_serving_table(
@@ -420,8 +1074,21 @@ def search_ptg2_index(
             "procedure_description": procedure.get("description") or procedure.get("procedure_description"),
             **_price_response_fields(prices),
             "source_trace": _coerce_json_payload(rate.get("source_trace"), []),
+            "network_names": _coerce_str_list_payload(rate.get("network_names")),
             "confidence": rate.get("confidence") or {"network": "tic_rate_npi_tin"},
         }
+        address_payload = _coerce_json_payload(
+            _first_payload_value(provider.get("address_payload"), provider.get("address")),
+            {},
+        )
+        if not isinstance(address_payload, dict):
+            address_payload = {}
+        if address_payload and not isinstance(item.get("address"), dict):
+            item["address"] = address_payload
+        _add_location_phone_fields(item, provider, address_payload)
+        _promote_address_provenance_fields(item, address_payload)
+        item["address_verification"] = _address_verification_payload(item, provider, address_payload)
+        _strip_no_display_address_fields(item)
         items.append(item)
     return _shape_ptg2_response(
         {
@@ -859,6 +1526,9 @@ async def _ptg2_manifest_enriched_provider_rows_for_npis(
     *,
     npis: list[int] | tuple[int, ...],
     limit: int,
+    plan_id: str | None = None,
+    snapshot_id: str | None = None,
+    source_key: str | None = None,
 ) -> list[dict[str, Any]] | None:
     npis = tuple(sorted({int(npi) for npi in npis if int(npi) > 0}))[:limit]
     if not npis:
@@ -974,7 +1644,14 @@ async def _ptg2_manifest_enriched_provider_rows_for_npis(
         )
     )
     result = await session.execute(enrich_stmt, {"npis": npis})
-    return [_row_mapping(row) for row in result]
+    rows = [_row_mapping(row) for row in result]
+    return await _overlay_provider_directory_corroboration(
+        session,
+        rows,
+        plan_id=plan_id,
+        snapshot_id=snapshot_id,
+        source_key=source_key,
+    )
 
 
 def _ptg2_provider_taxonomy_filter_requested(args: dict[str, Any]) -> bool:
@@ -1069,6 +1746,43 @@ def _sort_ptg2_manifest_provider_items(
             reverse=descending,
         )
     return items
+
+
+def _ptg2_manifest_provider_procedure_item(
+    *,
+    npi: int,
+    data: dict[str, Any],
+    prices: list[dict[str, Any]],
+    procedure_detail: dict[str, Any],
+    provider_context: dict[str, Any] | None,
+    args: dict[str, Any],
+) -> dict[str, Any]:
+    reported_code = data.get("reported_code")
+    reported_system = data.get("reported_code_system")
+    provider_set_hash = _ptg2_manifest_id(data.get("provider_set_global_id_128"))
+    price_set_hash = _ptg2_manifest_id(data.get("price_set_global_id_128"))
+    rate_pack_hash = _ptg2_manifest_id(data.get("serving_content_hash_128"))
+    item_data = dict(provider_context or {})
+    item_data.update(
+        {
+            "npi": npi,
+            "provider_set_hash": provider_set_hash,
+            "provider_count": data.get("provider_count") or 0,
+            "provider_set_count": 1 if provider_set_hash else 0,
+            "network_names": _coerce_str_list_payload(data.get("network_names")),
+            "procedure_code": reported_code,
+            "procedure_name": procedure_detail.get("procedure_name"),
+            "procedure_description": procedure_detail.get("procedure_description"),
+            "reported_code": reported_code,
+            "reported_code_system": reported_system,
+            "billing_code": reported_code,
+            "billing_code_type": reported_system,
+            "prices": prices,
+            "price_set_hash": price_set_hash,
+            "rate_pack_hash": rate_pack_hash,
+        }
+    )
+    return _compact_item_from_row(item_data, args)
 
 
 def _ptg2_provider_rate_group_key(item: dict[str, Any]) -> tuple[str, str, str, str] | None:
@@ -1247,6 +1961,9 @@ async def _ptg2_manifest_location_provider_matches(
     args: dict[str, Any],
     *,
     candidate_limit: int | None = None,
+    plan_id: str | None = None,
+    snapshot_id: str | None = None,
+    source_key: str | None = None,
 ) -> tuple[set[str], dict[str, list[dict[str, Any]]]] | None:
     provider_group_member_table = _safe_table_name(serving_tables.provider_group_member_table)
     if not provider_group_member_table or not _ptg2_manifest_artifact_entry(serving_tables, "provider_inverted"):
@@ -1634,6 +2351,13 @@ async def _ptg2_manifest_location_provider_matches(
     if not rows:
         return set(), {}
     rows = await _fill_location_phone_fallbacks(rows)
+    rows = await _overlay_provider_directory_corroboration(
+        session,
+        rows,
+        plan_id=plan_id,
+        snapshot_id=snapshot_id,
+        source_key=source_key,
+    )
     group_ids = tuple(
         sorted({_ptg2_manifest_id(row.get("provider_group_global_id_128")) for row in rows if row.get("provider_group_global_id_128")})
     )
@@ -1796,6 +2520,9 @@ async def _ptg2_manifest_provider_rows_for_provider_sets(
         session,
         npis=all_npis,
         limit=max(len(all_npis), 1),
+        plan_id=str(args.get("plan_id") or args.get("plan_external_id") or "").strip() or None,
+        snapshot_id=str(args.get("snapshot_id") or "").strip() or None,
+        source_key=serving_tables.source_key or str(args.get("source_key") or "").strip() or None,
     )
     if provider_rows is None:
         return None
@@ -1875,6 +2602,7 @@ async def _ptg2_manifest_procedure_details_for_rows(
             params,
         )
     except Exception:
+        await _rollback_optional_ptg2_query(session)
         return {}
     return {
         (str(data.get("code_system") or ""), str(data.get("code") or "")): {
@@ -1951,6 +2679,9 @@ async def _search_ptg2_manifest_db_serving_table(
             serving_tables,
             args,
             candidate_limit=rate_candidate_limit,
+            plan_id=requested_plan,
+            snapshot_id=snapshot_id,
+            source_key=serving_tables.source_key or args.get("source_key"),
         )
         if location_matches is None:
             return None
@@ -2021,6 +2752,11 @@ async def _search_ptg2_manifest_db_serving_table(
         if total <= 0:
             return None
 
+    network_names_select_sql = (
+        "network_names"
+        if await _ptg2_table_has_columns(session, table_name, {"network_names"})
+        else "NULL::varchar[] AS network_names"
+    )
     row_result = await session.execute(
         text(
             f"""
@@ -2033,7 +2769,8 @@ async def _search_ptg2_manifest_db_serving_table(
                 provider_set_global_id_128,
                 provider_count,
                 price_set_global_id_128,
-                source_trace_set_hash
+                source_trace_set_hash,
+                {network_names_select_sql}
             FROM {table_name}
             WHERE {where_sql}
             ORDER BY provider_count DESC NULLS LAST, serving_content_hash_128
@@ -2046,6 +2783,10 @@ async def _search_ptg2_manifest_db_serving_table(
     row_data = [_row_mapping(row) for row in row_result]
     if not row_data:
         return None
+    source_traces_by_set = await _ptg2_source_traces_for_trace_sets(
+        session,
+        [data.get("source_trace_set_hash") for data in row_data],
+    )
     prices_by_price_set = await _ptg2_manifest_prices_for_price_sets(
         session,
         serving_tables,
@@ -2062,7 +2803,7 @@ async def _search_ptg2_manifest_db_serving_table(
                 serving_tables,
                 provider_set_ids,
                 limit_per_set=max(int(pagination.limit), 1),
-                args=args,
+                args={**args, "snapshot_id": snapshot_id, "source_key": serving_tables.source_key or args.get("source_key")},
             )
             if provider_rows_by_set is None:
                 return None
@@ -2079,28 +2820,33 @@ async def _search_ptg2_manifest_db_serving_table(
         prices = prices_by_price_set.get(price_set_hash, [])
         procedure_detail = procedure_details.get(_catalog_key(reported_system, reported_code) or ("", ""), {})
         base_item = {
-                "provider_ordinal": provider_set_hash,
-                "provider_set_hash": provider_set_hash,
-                "provider_set_hashes": [provider_set_hash] if provider_set_hash else [],
-                "provider_name": "TiC provider set",
-                "provider_count": data.get("provider_count") or 0,
-                "provider_set_count": 1 if provider_set_hash else 0,
-                "procedure_code": reported_code,
-                "hp_procedure_code": reported_code,
-                "procedure_name": procedure_detail.get("procedure_name"),
-                "procedure_description": procedure_detail.get("procedure_description"),
-                "service_code": reported_code,
-                "service_code_system": reported_system or requested_system or "CPT",
-                "reported_code": reported_code,
-                "reported_code_system": reported_system,
-                "billing_code": reported_code,
-                "billing_code_type": reported_system,
-                **_price_response_fields(prices),
-                "price_set_hash": price_set_hash,
-                "rate_pack_hash": rate_pack_hash,
-                "source_trace": [],
-                "confidence": {"network": "tic_rate_npi_tin", "location": "nppes_practice_location"},
-            }
+            "provider_ordinal": provider_set_hash,
+            "provider_set_hash": provider_set_hash,
+            "provider_set_hashes": [provider_set_hash] if provider_set_hash else [],
+            "provider_name": "TiC provider set",
+            "source_key": serving_tables.source_key or args.get("source_key"),
+            "snapshot_id": snapshot_id,
+            "network_names": _coerce_str_list_payload(data.get("network_names")),
+            "provider_count": data.get("provider_count") or 0,
+            "provider_set_count": 1 if provider_set_hash else 0,
+            "procedure_code": reported_code,
+            "hp_procedure_code": reported_code,
+            "procedure_name": procedure_detail.get("procedure_name"),
+            "procedure_description": procedure_detail.get("procedure_description"),
+            "service_code": reported_code,
+            "service_code_system": reported_system or requested_system or "CPT",
+            "reported_code": reported_code,
+            "reported_code_system": reported_system,
+            "billing_code": reported_code,
+            "billing_code_type": reported_system,
+            **_price_response_fields(prices),
+            "price_set_hash": price_set_hash,
+            "rate_pack_hash": rate_pack_hash,
+            "source_trace": source_traces_by_set.get(str(data.get("source_trace_set_hash") or ""), []),
+            "confidence": {"network": "tic_rate_npi_tin", "location": "nppes_practice_location"},
+        }
+        base_item["address_verification"] = _address_verification_payload(base_item, {}, {})
+        _strip_no_display_address_fields(base_item)
         if not expand_providers:
             items.append(base_item)
             continue
@@ -2135,6 +2881,9 @@ async def _search_ptg2_manifest_db_serving_table(
                 }
             )
             _add_location_phone_fields(item, provider, address_payload)
+            _promote_address_provenance_fields(item, address_payload)
+            item["address_verification"] = _address_verification_payload(item, provider, address_payload)
+            _strip_no_display_address_fields(item)
             items.append(item)
     if not items:
         return None
@@ -2219,6 +2968,82 @@ def _compact_price_payload_sql(serving_tables: PTG2ServingTables, params: dict[s
     """
 
 
+def _source_trace_payload_sql(row_alias: str = "r") -> str:
+    return f"""
+        COALESCE(
+            NULLIF({row_alias}.source_trace::jsonb, '[]'::jsonb),
+            source_trace_payload.source_trace,
+            '[]'::jsonb
+        ) AS source_trace
+    """
+
+
+def _source_trace_payload_lateral_sql(row_alias: str = "r") -> str:
+    return f"""
+        LEFT JOIN LATERAL (
+            SELECT jsonb_agg(
+                       jsonb_strip_nulls(
+                           jsonb_build_object(
+                               'source_file_version_id', st.source_file_version_id,
+                               'original_url', st.original_url,
+                               'canonical_url', st.canonical_url,
+                               'json_pointer', st.json_pointer,
+                               'line_number', st.line_number
+                           )
+                       )
+                       ORDER BY st.source_trace_hash
+                   ) AS source_trace
+            FROM {PTG2_SCHEMA}.ptg2_source_trace_set sts
+            JOIN {PTG2_SCHEMA}.ptg2_source_trace st
+              ON st.source_trace_hash = ANY(sts.source_trace_hashes)
+            WHERE sts.source_trace_set_hash = {row_alias}.source_trace_set_hash
+        ) source_trace_payload ON TRUE
+    """
+
+
+async def _ptg2_source_traces_for_trace_sets(
+    session,
+    source_trace_set_hashes: list[Any] | tuple[Any, ...] | set[Any],
+) -> dict[str, list[dict[str, Any]]]:
+    trace_set_hashes = sorted({str(value).strip() for value in source_trace_set_hashes if str(value or "").strip()})
+    if not trace_set_hashes:
+        return {}
+    result = await session.execute(
+        text(
+            f"""
+            SELECT
+                sts.source_trace_set_hash,
+                COALESCE(
+                    jsonb_agg(
+                        jsonb_strip_nulls(
+                            jsonb_build_object(
+                                'source_file_version_id', st.source_file_version_id,
+                                'original_url', st.original_url,
+                                'canonical_url', st.canonical_url,
+                                'json_pointer', st.json_pointer,
+                                'line_number', st.line_number
+                            )
+                        )
+                        ORDER BY st.source_trace_hash
+                    ),
+                    '[]'::jsonb
+                ) AS source_trace
+            FROM {PTG2_SCHEMA}.ptg2_source_trace_set sts
+            JOIN {PTG2_SCHEMA}.ptg2_source_trace st
+              ON st.source_trace_hash = ANY(sts.source_trace_hashes)
+            WHERE sts.source_trace_set_hash = ANY(CAST(:source_trace_set_hashes AS varchar[]))
+            GROUP BY sts.source_trace_set_hash
+            """
+        ),
+        {"source_trace_set_hashes": trace_set_hashes},
+    )
+    return {
+        str(data.get("source_trace_set_hash")): _coerce_json_payload(data.get("source_trace"), [])
+        for data in (_row_mapping(row) for row in result)
+        if data.get("source_trace_set_hash")
+    }
+
+
 def _compact_provider_filter_sql(
     serving_tables: PTG2ServingTables,
     args: dict[str, Any],
@@ -2266,14 +3091,14 @@ def _compact_provider_filter_sql(
         geo_clauses: list[str] = []
         if params.get("geo_lat") is not None:
             geo_clauses.append("loc.lat::float8 BETWEEN :geo_min_lat AND :geo_max_lat")
-            geo_clauses.append("loc.long::float8 BETWEEN :geo_min_long AND :geo_max_long")
+            geo_clauses.append("loc.lon::float8 BETWEEN :geo_min_long AND :geo_max_long")
             geo_clauses.append(
-                f"{_ptg2_geo_distance_miles_sql('loc.lat::float8', 'loc.long::float8')} <= CAST(:geo_radius_miles AS double precision)"
+                f"{_ptg2_geo_distance_miles_sql('loc.lat::float8', 'loc.lon::float8')} <= CAST(:geo_radius_miles AS double precision)"
             )
         if params.get("zip5") and geo_clauses:
-            clauses.append(f"(LEFT(COALESCE(loc.zip5, loc.postal_code, ''), 5) = :zip5 OR ({' AND '.join(geo_clauses)}))")
+            clauses.append(f"(LEFT(COALESCE(loc.zip5, ''), 5) = :zip5 OR ({' AND '.join(geo_clauses)}))")
         elif params.get("zip5"):
-            clauses.append("LEFT(COALESCE(loc.zip5, loc.postal_code, ''), 5) = :zip5")
+            clauses.append("LEFT(COALESCE(loc.zip5, ''), 5) = :zip5")
         elif geo_clauses:
             clauses.extend(geo_clauses)
         if params.get("city_exact"):
@@ -2467,10 +3292,10 @@ def _compact_provider_expansion_sql(
         if params.get("geo_lat") is not None:
             zip_rank_sql = "0"
             if params.get("zip5"):
-                zip_rank_sql = "CASE WHEN LEFT(COALESCE(loc.zip5, loc.postal_code, ''), 5) = :zip5 THEN 0 ELSE 1 END"
+                zip_rank_sql = "CASE WHEN LEFT(COALESCE(loc.zip5, ''), 5) = :zip5 THEN 0 ELSE 1 END"
             location_order_sql = f"""
             ORDER BY {zip_rank_sql},
-                     {_ptg2_geo_distance_miles_sql('loc.lat::float8', 'loc.long::float8')} ASC NULLS LAST,
+                     {_ptg2_geo_distance_miles_sql('loc.lat::float8', 'loc.lon::float8')} ASC NULLS LAST,
                      loc.location_hash
             """
         return f"""
@@ -2589,8 +3414,14 @@ def _compact_item_from_row(data: dict[str, Any], args: dict[str, Any]) -> dict[s
         "provider_set_count": data.get("provider_set_count"),
         "price_set_hash": data.get("price_set_hash"),
         "rate_pack_hash": data.get("rate_pack_hash") or data.get("serving_rate_id"),
+        "source_key": data.get("source_key") or args.get("source_key"),
+        "snapshot_id": data.get("snapshot_id") or args.get("snapshot_id"),
+        "network_names": _coerce_str_list_payload(data.get("network_names")),
         **_price_response_fields(prices),
-        "source_trace": _coerce_json_payload(data.get("source_trace"), []),
+        "source_trace": _coerce_json_payload(
+            _first_payload_value(data.get("hydrated_source_trace"), data.get("source_trace")),
+            [],
+        ),
         "confidence": data.get("confidence") or {"network": "tic_rate_npi_tin"},
     }
     if data.get("distance_miles") is not None:
@@ -2602,6 +3433,9 @@ def _compact_item_from_row(data: dict[str, Any], args: dict[str, Any]) -> dict[s
     if data.get("zip_radius_miles") is not None:
         item["zip_radius_miles"] = data.get("zip_radius_miles")
     _add_location_phone_fields(item, data, address_payload)
+    _promote_address_provenance_fields(item, address_payload)
+    item["address_verification"] = _address_verification_payload(item, data, address_payload)
+    _strip_no_display_address_fields(item)
     return {key: value for key, value in item.items() if value is not None}
 
 
@@ -2677,9 +3511,9 @@ async def _search_compact_serving_table(
     if expand_providers and serving_tables.provider_group_location_table and provider_expansion_sql:
         provider_distance_select_sql = ""
         if params.get("geo_lat") is not None:
-            loc_distance_sql = _ptg2_geo_distance_miles_sql("loc.lat::float8", "loc.long::float8")
+            loc_distance_sql = _ptg2_geo_distance_miles_sql("loc.lat::float8", "loc.lon::float8")
             if params.get("zip5"):
-                same_zip_sql = "LEFT(COALESCE(loc.zip5, loc.postal_code, ''), 5) = :zip5"
+                same_zip_sql = "LEFT(COALESCE(loc.zip5, ''), 5) = :zip5"
                 provider_distance_select_sql = (
                     f"CASE WHEN {same_zip_sql} THEN 0.0 ELSE {loc_distance_sql} END AS distance_miles, "
                     f"CASE WHEN {same_zip_sql} THEN 'same_zip' ELSE 'radius' END AS zip_match_type, "
@@ -2782,7 +3616,7 @@ async def _search_compact_serving_table(
             COALESCE(r.provider_set_count, NULL::integer) AS provider_set_count,
             r.price_set_hash,
             price_payload.prices AS prices,
-            r.source_trace
+            {_source_trace_payload_sql("r")}
         FROM {source_cte} r
         LEFT JOIN LATERAL (
             SELECT *
@@ -2793,6 +3627,7 @@ async def _search_compact_serving_table(
         LEFT JOIN LATERAL (
             {_compact_price_payload_sql(serving_tables, params, args)}
         ) price_payload ON TRUE
+        {_source_trace_payload_lateral_sql("r")}
         {provider_expansion_sql}
         WHERE TRUE
           {"AND price_payload.prices IS NOT NULL" if price_filter_clauses else ""}
@@ -2804,6 +3639,14 @@ async def _search_compact_serving_table(
     rows = [_row_mapping(row) for row in result]
     if not rows:
         return None
+    if expand_providers:
+        rows = await _overlay_provider_directory_corroboration(
+            session,
+            rows,
+            plan_id=str(args.get("plan_id") or args.get("plan_external_id") or "").strip() or None,
+            snapshot_id=snapshot_id,
+            source_key=serving_tables.source_key or args.get("source_key"),
+        )
     items = [_compact_item_from_row(row, args) for row in rows]
     total_items = int(pagination.offset) + len(items)
     if expand_providers:
@@ -2869,8 +3712,11 @@ async def _search_legacy_serving_table(
     row_result = await session.execute(
         text(
             f"""
-            SELECT *
+            SELECT
+                r.*,
+                {_source_trace_payload_sql("r").replace(" AS source_trace", " AS hydrated_source_trace")}
             FROM {table_name} r
+            {_source_trace_payload_lateral_sql("r")}
             WHERE {' AND '.join(filters)}
             ORDER BY r.provider_count DESC NULLS LAST, r.serving_rate_id
             LIMIT :limit OFFSET :offset
@@ -3080,6 +3926,11 @@ async def _search_ptg2_manifest_provider_procedures(
         limit_sql = "LIMIT :limit"
         offset_sql = "OFFSET :offset"
     where_sql = " AND ".join(filters)
+    network_names_select_sql = (
+        "network_names"
+        if await _ptg2_table_has_columns(session, table_name, {"network_names"})
+        else "NULL::varchar[] AS network_names"
+    )
     row_stmt = text(
         f"""
             SELECT
@@ -3091,7 +3942,8 @@ async def _search_ptg2_manifest_provider_procedures(
                 provider_set_global_id_128,
                 provider_count,
                 price_set_global_id_128,
-                source_trace_set_hash
+                source_trace_set_hash,
+                {network_names_select_sql}
             FROM {table_name}
             WHERE {where_sql}
             ORDER BY reported_code_system, reported_code, provider_count DESC NULLS LAST, serving_content_hash_128
@@ -3100,12 +3952,26 @@ async def _search_ptg2_manifest_provider_procedures(
     )
     row_result = await session.execute(row_stmt, params)
     row_data = [_row_mapping(row) for row in row_result]
+    source_traces_by_set = await _ptg2_source_traces_for_trace_sets(
+        session,
+        [data.get("source_trace_set_hash") for data in row_data],
+    )
     prices_by_price_set = await _ptg2_manifest_prices_for_price_sets(
         session,
         serving_tables,
         [_ptg2_manifest_id(data.get("price_set_global_id_128")) for data in row_data],
     )
     procedure_details = await _ptg2_manifest_procedure_details_for_rows(session, row_data)
+    provider_context_rows = await _ptg2_manifest_enriched_provider_rows_for_npis(
+        session,
+        npis=[npi],
+        limit=1,
+        plan_id=requested_plan or None,
+        snapshot_id=snapshot_id,
+        source_key=args.get("source_key") or None,
+    )
+    provider_context = provider_context_rows[0] if provider_context_rows else {"npi": npi}
+    item_args = {**args, "snapshot_id": snapshot_id}
 
     items: list[dict[str, Any]] = []
     skipped_for_offset = 0
@@ -3124,30 +3990,19 @@ async def _search_ptg2_manifest_provider_procedures(
         reported_code = data.get("reported_code")
         reported_system = data.get("reported_code_system")
         procedure_detail = procedure_details.get(_catalog_key(reported_system, reported_code) or ("", ""), {})
-        provider_set_hash = _ptg2_manifest_id(data.get("provider_set_global_id_128"))
-        price_set_hash = _ptg2_manifest_id(data.get("price_set_global_id_128"))
-        rate_pack_hash = _ptg2_manifest_id(data.get("serving_content_hash_128"))
+        data_with_trace = {
+            **data,
+            "source_trace": source_traces_by_set.get(str(data.get("source_trace_set_hash") or ""), []),
+        }
         items.append(
-            {
-                "npi": npi,
-                "provider_set_hash": provider_set_hash,
-                "provider_count": data.get("provider_count") or 0,
-                "provider_set_count": 1 if provider_set_hash else 0,
-                "procedure_code": reported_code,
-                "hp_procedure_code": reported_code,
-                "procedure_name": procedure_detail.get("procedure_name"),
-                "procedure_description": procedure_detail.get("procedure_description"),
-                "service_code": reported_code,
-                "service_code_system": reported_system or args.get("code_system") or "CPT",
-                "reported_code": reported_code,
-                "reported_code_system": reported_system,
-                "billing_code": reported_code,
-                "billing_code_type": reported_system,
-                **_price_response_fields(prices),
-                "price_set_hash": price_set_hash,
-                "rate_pack_hash": rate_pack_hash,
-                "confidence": {"network": "tic_rate_npi_tin", "location": "nppes_practice_location"},
-            }
+            _ptg2_manifest_provider_procedure_item(
+                npi=npi,
+                data=data_with_trace,
+                prices=prices,
+                procedure_detail=procedure_detail,
+                provider_context=provider_context,
+                args=item_args,
+            )
         )
     total = int(pagination.offset) + len(items)
     if not items:
@@ -3274,7 +4129,7 @@ async def _search_compact_provider_procedures(
             NULL::integer AS provider_set_count,
             r.price_set_hash,
             price_payload.prices AS prices,
-            r.source_trace
+            {_source_trace_payload_sql("r")}
         FROM {table_name} r
         JOIN provider_sets ps ON ps.provider_set_hash = r.provider_set_hash
         LEFT JOIN {serving_tables.procedure_table or f'{PTG2_SCHEMA}.ptg2_procedure'} proc
@@ -3282,6 +4137,7 @@ async def _search_compact_provider_procedures(
         LEFT JOIN LATERAL (
             {_compact_price_payload_sql(serving_tables, params, args) if _compact_required_tables(serving_tables) else 'SELECT r.prices AS prices'}
         ) price_payload ON TRUE
+        {_source_trace_payload_lateral_sql("r")}
         WHERE {' AND '.join(filters)}
           {price_exists_sql}
           {"AND price_payload.prices IS NOT NULL" if price_filter_clauses else ""}

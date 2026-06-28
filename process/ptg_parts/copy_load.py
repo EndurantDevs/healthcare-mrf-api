@@ -312,6 +312,7 @@ async def _copy_compact_serving_rate_rows(rows: list[dict[str, Any]], snapshot_i
         "provider_count",
         "price_set_hash",
         "source_trace_set_hash",
+        "network_names",
         "created_at",
     ]
     records = [
@@ -327,6 +328,7 @@ async def _copy_compact_serving_rate_rows(rows: list[dict[str, Any]], snapshot_i
             row.get("provider_count"),
             row.get("price_set_hash"),
             row.get("source_trace_set_hash"),
+            row.get("network_names") or [],
             row.get("created_at"),
         )
         for row in rows
@@ -363,6 +365,7 @@ async def _copy_compact_serving_rate_source(source, *, target_table: str = "ptg2
         "provider_count",
         "price_set_hash",
         "source_trace_set_hash",
+        "network_names",
     ]
     async with db.acquire() as conn:
         raw_conn = conn.raw_connection

@@ -841,6 +841,25 @@ def test_serving_index_split_keeps_facade_helpers_stable():
     assert process_ptg.build_ptg2_compact_serving_index is ptg_serving_index.build_ptg2_compact_serving_index
 
 
+def test_ptg2_source_trace_payload_keeps_source_file_version_id():
+    payload = process_ptg._ptg2_source_trace_payload(
+        {
+            "source_file_version_id": "source-version-1",
+            "original_url": "https://example.test/rates.json.gz",
+            "canonical_url": "https://example.test/rates.json.gz",
+        }
+    )
+
+    assert payload == [
+        {
+            "source_file_version_id": "source-version-1",
+            "url": "https://example.test/rates.json.gz",
+            "canonical_url": "https://example.test/rates.json.gz",
+            "statement": "Published negotiated rate from Transparency in Coverage source file.",
+        }
+    ]
+
+
 def test_filter_reporting_plans_matches_group_plan_id():
     plans = [
         {
@@ -1233,6 +1252,34 @@ def test_ptg2_provider_set_entry_packs_groups_order_insensitively():
     assert row_a["tin_type"] == "set"
 
 
+def test_ptg2_provider_set_entry_does_not_materialize_direct_location_fields():
+    entry, row = process_ptg._build_provider_set_entry(
+        file_id=1,
+        provider_group_ref=10,
+        provider_groups=[
+            {
+                "tin": {"type": "ein", "value": "111"},
+                "npi": [1000000001],
+                "address": {
+                    "street": "900 W Temple Ave",
+                    "city": "Effingham",
+                    "state": "IL",
+                    "postal_code": "62401",
+                },
+                "phone": "217-540-2350",
+            }
+        ],
+        network_names=["C2"],
+    )
+
+    assert entry["network_name"] == ["C2"]
+    assert row["network_names"] == ["C2"]
+    assert "address" not in entry
+    assert "phone" not in entry
+    assert "address" not in row
+    assert "phone" not in row
+
+
 def test_ptg2_combined_provider_set_entry_packs_rate_provider_refs():
     first, _ = process_ptg._build_provider_set_entry(
         file_id=1,
@@ -1332,6 +1379,12 @@ def test_ptg2_canonicalize_url_strips_signed_params():
     )
 
     assert process_ptg.canonicalize_url(url) == "https://example.com/path/file.json.gz?a=1&b=2&foo=bar"
+
+
+def test_ptg2_normalize_tic_source_url_unescapes_html_query_separators():
+    url = "https://example.com/rates.json.gz?Expires=1&#38;Policy=abc"
+
+    assert process_ptg.normalize_tic_source_url(url) == "https://example.com/rates.json.gz?Expires=1&Policy=abc"
 
 
 def test_ptg2_toc_parser_handles_uhc_sponsor_typo_and_duplicate_signed_urls():
@@ -1918,7 +1971,12 @@ def test_ptg2_compact_rate_pack_flush_writes_serving_rows(monkeypatch):
     }
     state["price_payloads"] = {"price": [{"negotiated_rate": "50", "negotiated_type": "negotiated"}]}
     state["provider_set_counts"] = {"provider-a": 10, "provider-b": 20}
-    state["source_trace_payload"] = [{"url": "https://example.test/rates.json.gz"}]
+    state["source_trace_payload"] = [
+        {
+            "source_file_version_id": "source-version-1",
+            "original_url": "https://example.test/rates.json.gz",
+        }
+    ]
     state["rate_pack_groups"] = {("proc-a", "price", "source"): {"provider-a", "provider-b"}}
 
     asyncio.run(process_ptg._flush_compact_rate_pack_groups(state, "ctx"))
@@ -1930,6 +1988,8 @@ def test_ptg2_compact_rate_pack_flush_writes_serving_rows(monkeypatch):
     assert serving_row["procedure_code"] == process_ptg.return_checksum(["CPT", "00102"])
     assert serving_row["provider_count"] == 30
     assert serving_row["prices"][0]["negotiated_rate"] == 50
+    assert serving_row["source_trace"][0]["source_file_version_id"] == "source-version-1"
+    assert serving_row["source_trace"][0]["original_url"] == "https://example.test/rates.json.gz"
 
 
 def test_ptg2_compact_rows_can_schedule_async_writes(monkeypatch):
@@ -2868,6 +2928,61 @@ def test_ptg2_snapshot_artifact_builder_writes_serving_index(monkeypatch, tmp_pa
     assert payload["rates"]["010854205"]["70551"][0]["prices"][0]["negotiated_rate"] == 450
 
 
+def test_ptg2_compact_snapshot_artifact_keeps_source_file_version_id(monkeypatch, tmp_path):
+    observed = {}
+    rows = [
+        {
+            "plan_id": "010854205",
+            "plan_name": "Heartland",
+            "plan_id_type": "EIN",
+            "plan_market_type": "group",
+            "issuer_name": "Heartland",
+            "plan_sponsor_name": "Heartland",
+            "billing_code": "29888",
+            "billing_code_type": "CPT",
+            "procedure_name": "ACL reconstruction",
+            "procedure_description": "ACL reconstruction",
+            "rate_pack_hash": "rate-pack-1",
+            "provider_set_hash": "provider-set-1",
+            "price_set_hash": "price-set-1",
+            "rate_payload": {"provider_set_hashes": ["provider-set-1"]},
+            "prices": [{"negotiated_type": "negotiated", "negotiated_rate": 1138.57}],
+            "source_trace": [
+                {
+                    "source_file_version_id": "source-version-1",
+                    "url": "https://payer.example.invalid/mrf/rates.json.gz",
+                    "canonical_url": "https://payer.example.invalid/mrf/rates.json.gz",
+                }
+            ],
+            "provider_set_count": 1,
+            "provider_count": 2,
+        }
+    ]
+
+    async def fake_all(sql, **params):
+        observed["sql"] = sql
+        observed["params"] = params
+        return rows
+
+    async def fake_push_objects(_payload, _cls, rewrite=False):
+        return None
+
+    monkeypatch.setenv("HLTHPRT_PTG2_ARTIFACT_DIR", str(tmp_path))
+    monkeypatch.setattr(process_ptg.db, "all", fake_all)
+    monkeypatch.setattr(ptg_snapshot_artifacts, "_push_ptg2_objects_from_facade", fake_push_objects)
+
+    result = asyncio.run(process_ptg.build_ptg2_compact_snapshot_index_artifact("snap-test", "run-test"))
+
+    assert result["provider_granularity"] == "provider_set"
+    assert "'source_file_version_id', st.source_file_version_id" in observed["sql"]
+    assert "unnest(COALESCE(sts.source_trace_hashes" in observed["sql"]
+    assert "sts.canonical_payload::jsonb->'source_trace_hashes'" not in observed["sql"]
+    artifact_path = tmp_path / "snapshot_index" / "snap-test.json"
+    payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+    trace = payload["rates"]["010854205"]["29888"][0]["source_trace"]
+    assert trace[0]["source_file_version_id"] == "source-version-1"
+
+
 def test_ptg2_db_serving_index_builder_materializes_table(monkeypatch, tmp_path):
     statuses = []
 
@@ -2907,6 +3022,9 @@ def test_ptg2_db_serving_index_builder_materializes_table(monkeypatch, tmp_path)
     assert result["procedure_consolidation"]["system"] == "HP_PROCEDURE_CODE"
     assert "code_crosswalk" in insert_sql
     assert "pricing_procedure" in insert_sql
+    assert "'source_file_version_id', st.source_file_version_id" in insert_sql
+    assert "unnest(COALESCE(sts.source_trace_hashes" in insert_sql
+    assert "sts.canonical_payload::jsonb->'source_trace_hashes'" not in insert_sql
     assert "code_catalog" in insert_sql
     assert "code_system IN ('CPT', 'HCPCS', 'CDT', 'MS_DRG')" in source_observed_catalog_sql
     assert "source_attribution" in source_observed_catalog_sql
@@ -4249,8 +4367,10 @@ def test_ptg2_manifest_stage_uses_uuid_ids_when_enabled(monkeypatch):
     assert "procedure_global_id_128 uuid NOT NULL" in joined
     assert "provider_set_global_id_128 uuid NOT NULL" in joined
     assert "price_set_global_id_128 uuid NOT NULL" in joined
+    assert "network_names varchar[] NOT NULL DEFAULT '{}'" in joined
     assert "price_atom_global_id_128 uuid NOT NULL" in joined
     assert "provider_group_global_id_128 uuid NOT NULL" in joined
+    assert ptg_manifest_publish.PTG2_MANIFEST_SERVING_COLUMNS[-1] == "network_names"
 
 
 def test_ptg2_source_plan_rows_falls_back_to_serving_index_table(monkeypatch):

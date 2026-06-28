@@ -95,6 +95,7 @@ COPY restore/ /opt/restore/
 COPY specs/ /opt/specs/
 COPY alembic/ /opt/alembic/
 COPY process/ /opt/process/
+COPY scripts/ /opt/scripts/
 COPY support/ /opt/support/
 COPY --from=ptg2-scanner-builder \
     /build/support/ptg2_scanner/target/release/ptg2_scanner \

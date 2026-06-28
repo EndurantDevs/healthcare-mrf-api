@@ -108,6 +108,7 @@ def _ptg2_price_atom_payload(price_atom_row: dict[str, Any]) -> dict[str, Any]:
 def _ptg2_source_trace_payload(source_trace_row: dict[str, Any]) -> list[dict[str, Any]]:
     return [
         {
+            "source_file_version_id": source_trace_row.get("source_file_version_id"),
             "url": source_trace_row.get("original_url"),
             "canonical_url": source_trace_row.get("canonical_url"),
             "statement": "Published negotiated rate from Transparency in Coverage source file.",

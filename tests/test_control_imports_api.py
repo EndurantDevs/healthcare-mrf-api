@@ -61,6 +61,18 @@ def test_importer_registry_exposes_ptg_and_finish_lifecycle():
     assert items["ptg-address-entity-refresh"]["family"] == "provider"
     assert items["ptg-address-entity-refresh"]["enqueue_adapter"] == "arq_single_job"
     assert items["ptg-address-entity-refresh"]["queue"] == "arq:EntityAddressUnified"
+    assert items["provider-directory-fhir"]["family"] == "provider"
+    assert items["provider-directory-fhir"]["enqueue_adapter"] == "arq_single_job"
+    assert items["provider-directory-fhir"]["queue"] == "arq:ProviderDirectoryFHIR"
+    assert items["provider-directory-fhir"]["schedulable"] is True
+    assert items["provider-directory-fhir"]["cancelable"] is True
+    assert any(param["name"] == "source_query" and param["type"] == "text" for param in items["provider-directory-fhir"]["params_schema"])
+    assert any(param["name"] == "resource_limit" and param["type"] == "integer" for param in items["provider-directory-fhir"]["params_schema"])
+    assert any(param["name"] == "full_refresh" and param["type"] == "boolean" for param in items["provider-directory-fhir"]["params_schema"])
+    assert any(param["name"] == "stale_cleanup" and param["type"] == "boolean" for param in items["provider-directory-fhir"]["params_schema"])
+    assert any(param["name"] == "stream_batch_size" and param["type"] == "integer" for param in items["provider-directory-fhir"]["params_schema"])
+    assert any(param["name"] == "source_concurrency" and param["type"] == "integer" for param in items["provider-directory-fhir"]["params_schema"])
+    assert any(param["name"] == "open_only" and param["type"] == "boolean" for param in items["provider-directory-fhir"]["params_schema"])
     assert any(
         param["name"] == "source_key" and param["type"] == "text"
         for param in items["ptg-address-entity-refresh"]["params_schema"]
@@ -163,11 +175,19 @@ def test_control_wrapped_publish_importers_request_shutdown():
         {"run_id": "run_openaddresses", "importer": "openaddresses", "family": "provider"},
         {},
     )
+    provider_directory_payload = control_imports._adapter_payload(
+        control_imports._SINGLE_JOB_ADAPTERS["provider-directory-fhir"],
+        {"run_id": "run_provider_directory", "importer": "provider-directory-fhir", "family": "provider"},
+        {"import_resources": True, "resource_limit": 100},
+    )
 
     assert facility_payload["run_shutdown"] is True
     assert entity_payload["run_shutdown"] is True
     assert ptg_address_payload["run_shutdown"] is True
     assert openaddresses_payload["run_shutdown"] is True
+    assert provider_directory_payload["run_shutdown"] is True
+    assert provider_directory_payload["target_module"] == "process.provider_directory_fhir"
+    assert provider_directory_payload["task"]["resource_limit"] == 100
     assert npi_payload["run_shutdown"] is False
 
 

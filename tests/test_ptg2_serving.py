@@ -15,6 +15,7 @@ from api import ptg2_serving_utils
 from api import ptg2_code_details
 from api import ptg2_code_context
 from api import ptg2_snapshot
+from process.ptg_parts.address_assurance import summarize_ptg_price_address_payload
 
 
 class FakeResult:
@@ -53,6 +54,211 @@ class FakePagination:
     offset = 0
 
 
+@pytest.mark.asyncio
+async def test_overlay_provider_directory_corroboration_marks_address_and_prefers_directory_phone():
+    session = FakeSession(
+        [
+            "mrf.ptg_provider_directory_address_corroboration",
+            FakeResult(
+                rows=[
+                    {
+                        "npi": 1234567890,
+                        "address_key": "00000000-0000-0000-0000-000000000001",
+                        "source_key": "ptg_source",
+                        "snapshot_id": "ptg2:202606:snap",
+                        "plan_id": "010854205",
+                        "ptg_plan_id": "ptg-plan",
+                        "provider_directory_source_id": "pdfhir_1",
+                        "provider_directory_org_name": "Example Payer",
+                        "provider_directory_plan_name": "Example Plan",
+                        "provider_directory_provider_resource_id": "prac-1",
+                        "provider_directory_provider_name": "Alex Rivera",
+                        "provider_directory_role_resource_id": "role-1",
+                        "provider_directory_location_resource_id": "loc-1",
+                        "provider_directory_location_name": "Example Clinic",
+                        "provider_directory_telephone_number": "312-555-0100",
+                        "provider_directory_fax_number": "312-555-0101",
+                        "provider_directory_plan_context_matched": True,
+                        "provider_directory_network_context_present": True,
+                        "provider_directory_network_refs": ["Organization/network-1"],
+                        "provider_directory_insurance_plan_refs": ["InsurancePlan/plan-1"],
+                        "provider_directory_insurance_plan_matches": ["InsurancePlan/plan-1"],
+                        "provider_directory_match_type": "practitioner_role",
+                        "provider_directory_observed_at": "2026-06-28T00:00:00",
+                        "address_network_binding": "payer_directory_corroborated_location",
+                        "address_verification_evidence": {
+                            "source": "provider_directory_fhir",
+                            "matched_on": "npi_address_key_role_location_plan",
+                        },
+                    }
+                ]
+            ),
+        ]
+    )
+
+    rows = await ptg2_serving._overlay_provider_directory_corroboration(
+        session,
+        [
+            {
+                "npi": 1234567890,
+                "location_source": "npi_address",
+                "location_confidence_code": "npi_address",
+                "telephone_number": "312-000-0000",
+                "address_payload": {
+                    "address_key": "00000000-0000-0000-0000-000000000001",
+                    "first_line": "100 Main St",
+                },
+            }
+        ],
+        plan_id="010854205",
+        snapshot_id="ptg2:202606:snap",
+        source_key="ptg_source",
+    )
+
+    row = rows[0]
+    assert row["location_source"] == "provider_directory_fhir"
+    assert row["location_confidence_code"] == "payer_directory_corroborated_location"
+    assert row["telephone_number"] == "312-555-0100"
+    assert row["fax_number"] == "312-555-0101"
+    assert row["address_payload"]["address_sources"] == ["provider_directory_fhir"]
+    assert row["address_payload"]["address_network_binding"] == "payer_directory_corroborated_location"
+    assert row["address_payload"]["provider_directory_location_name"] == "Example Clinic"
+    item = ptg2_serving._compact_item_from_row({**row, "prices": []}, {})
+    assert item["address_verification"]["address_network_binding"] == "payer_directory_corroborated_location"
+    assert item["address_verification"]["requires_location_confirmation"] is False
+    assert item["address_verification"]["displayed_address_present"] is True
+    assert item["address_verification"]["provider_directory_plan_context_matched"] is True
+    assert item["address_verification"]["provider_directory_location_resource_id"] == "loc-1"
+    assert item["address_verification"]["provider_directory_insurance_plan_matches"] == ["InsurancePlan/plan-1"]
+    assert item["address_verification"]["address_verification_evidence"]["matched_on"].endswith("_plan")
+
+
+@pytest.mark.asyncio
+async def test_overlay_provider_directory_address_only_keeps_network_binding_inferred():
+    session = FakeSession(
+        [
+            "mrf.ptg_provider_directory_address_corroboration",
+            FakeResult(
+                rows=[
+                    {
+                        "npi": 1234567890,
+                        "address_key": "00000000-0000-0000-0000-000000000001",
+                        "source_key": "ptg_source",
+                        "snapshot_id": "ptg2:202606:snap",
+                        "plan_id": "010854205",
+                        "ptg_plan_id": "ptg-plan",
+                        "provider_directory_source_id": "pdfhir_1",
+                        "provider_directory_location_resource_id": "loc-1",
+                        "provider_directory_location_name": "Example Clinic",
+                        "provider_directory_plan_context_matched": False,
+                        "provider_directory_network_context_present": True,
+                        "provider_directory_network_refs": ["Organization/network-1"],
+                        "provider_directory_insurance_plan_refs": [],
+                        "provider_directory_insurance_plan_matches": [],
+                        "address_network_binding": "provider_directory_address",
+                        "address_verification_evidence": {
+                            "source": "provider_directory_fhir",
+                            "matched_on": "npi_address_key_role_location",
+                        },
+                    }
+                ]
+            ),
+        ]
+    )
+
+    rows = await ptg2_serving._overlay_provider_directory_corroboration(
+        session,
+        [
+            {
+                "npi": 1234567890,
+                "location_source": "npi_address",
+                "location_confidence_code": "npi_address",
+                "address_payload": {
+                    "address_key": "00000000-0000-0000-0000-000000000001",
+                    "first_line": "100 Main St",
+                },
+            }
+        ],
+        plan_id="010854205",
+        snapshot_id="ptg2:202606:snap",
+        source_key="ptg_source",
+    )
+
+    item = ptg2_serving._compact_item_from_row({**rows[0], "prices": []}, {})
+
+    assert rows[0]["location_confidence_code"] == "provider_directory_address"
+    assert rows[0]["address_payload"]["provider_directory_network_refs"] == ["Organization/network-1"]
+    assert item["address_verification"]["address_evidence_level"] == "provider_directory_address"
+    assert item["address_verification"]["address_network_binding"] == "inferred_from_provider_identity"
+    assert item["address_verification"]["requires_location_confirmation"] is True
+    assert item["address_verification"]["displayed_address_present"] is True
+    assert item["address_verification"]["provider_directory_plan_context_matched"] is False
+    assert item["address_verification"]["provider_directory_network_context_present"] is True
+    assert item["address_verification"]["provider_directory_network_refs"] == ["Organization/network-1"]
+    assert item["address_verification"]["address_verification_evidence"]["matched_on"] == "npi_address_key_role_location"
+
+
+@pytest.mark.asyncio
+async def test_overlay_provider_directory_without_plan_match_downgrades_network_marker():
+    session = FakeSession(
+        [
+            "mrf.ptg_provider_directory_address_corroboration",
+            FakeResult(
+                rows=[
+                    {
+                        "npi": 1234567890,
+                        "address_key": "00000000-0000-0000-0000-000000000001",
+                        "source_key": "ptg_source",
+                        "snapshot_id": "ptg2:202606:snap",
+                        "plan_id": "010854205",
+                        "ptg_plan_id": "ptg-plan",
+                        "provider_directory_source_id": "pdfhir_1",
+                        "provider_directory_location_resource_id": "loc-1",
+                        "provider_directory_location_name": "Example Clinic",
+                        "provider_directory_plan_context_matched": False,
+                        "provider_directory_network_context_present": True,
+                        "provider_directory_network_refs": ["Organization/network-1"],
+                        "provider_directory_insurance_plan_refs": [],
+                        "provider_directory_insurance_plan_matches": [],
+                        "address_network_binding": "payer_directory_corroborated_location",
+                        "address_verification_evidence": {
+                            "source": "provider_directory_fhir",
+                            "matched_on": "npi_address_key_role_location",
+                        },
+                    }
+                ]
+            ),
+        ]
+    )
+
+    rows = await ptg2_serving._overlay_provider_directory_corroboration(
+        session,
+        [
+            {
+                "npi": 1234567890,
+                "location_source": "npi_address",
+                "location_confidence_code": "npi_address",
+                "address_payload": {
+                    "address_key": "00000000-0000-0000-0000-000000000001",
+                    "first_line": "100 Main St",
+                },
+            }
+        ],
+        plan_id="010854205",
+        snapshot_id="ptg2:202606:snap",
+        source_key="ptg_source",
+    )
+
+    item = ptg2_serving._compact_item_from_row({**rows[0], "prices": []}, {})
+
+    assert rows[0]["location_confidence_code"] == "provider_directory_address"
+    assert rows[0]["address_payload"]["address_network_binding"] == "provider_directory_address"
+    assert item["address_verification"]["address_evidence_level"] == "provider_directory_address"
+    assert item["address_verification"]["address_network_binding"] == "inferred_from_provider_identity"
+    assert item["address_verification"]["requires_location_confirmation"] is True
+    assert item["address_verification"]["provider_directory_plan_context_matched"] is False
+
+
 def test_ptg2_response_split_keeps_serving_facade_helpers_stable():
     assert ptg2_serving._shape_ptg2_response is ptg2_response._shape_ptg2_response
     assert ptg2_serving._catalog_key is ptg2_response._catalog_key
@@ -61,6 +267,38 @@ def test_ptg2_response_split_keeps_serving_facade_helpers_stable():
     assert ptg2_serving._normalize_price_payload is ptg2_response._normalize_price_payload
     assert ptg2_serving._summarize_price_payload is ptg2_response._summarize_price_payload
     assert ptg2_serving._price_response_fields is ptg2_response._price_response_fields
+
+
+def test_ptg2_response_shape_keeps_address_verification_without_source_opt_in():
+    shaped = ptg2_serving._shape_ptg2_response(
+        {
+            "items": [
+                {
+                    "npi": 1234567890,
+                    "source_key": "ptg_source",
+                    "snapshot_id": "ptg2:202606:snap",
+                    "network_names": ["C2"],
+                    "address_verification": {
+                        "address_network_binding": "payer_directory_corroborated_location",
+                        "provider_directory_plan_context_matched": True,
+                        "address_verification_evidence": {
+                            "matched_on": "npi_address_key_role_location_plan"
+                        },
+                    },
+                }
+            ],
+            "query": {"source_key": "ptg_source", "snapshot_id": "ptg2:202606:snap"},
+        },
+        {},
+    )
+
+    item = shaped["items"][0]
+    assert "source_key" not in item
+    assert "snapshot_id" not in item
+    assert "network_names" not in item
+    assert item["address_verification"]["address_network_binding"] == "payer_directory_corroborated_location"
+    assert item["address_verification"]["provider_directory_plan_context_matched"] is True
+    assert item["address_verification"]["address_verification_evidence"]["matched_on"].endswith("_plan")
 
 
 def test_ptg2_price_sql_split_keeps_serving_facade_helpers_stable():
@@ -186,10 +424,11 @@ async def test_manifest_serving_taxonomy_expansion_uses_wider_rate_candidate_win
             "provider_count": 100 - idx,
             "price_set_global_id_128": price_sets[idx],
             "source_trace_set_hash": None,
+            "network_names": ["C2"],
         }
         for idx in range(5)
     ]
-    session = FakeSession([5, FakeResult(rows=rows)])
+    session = FakeSession([5, FakeResult(rows=[{"column_name": "network_names"}]), FakeResult(rows=rows)])
     tables = ptg2_serving.PTG2ServingTables(
         serving_table="mrf.ptg2_serving_manifest_token",
         price_atom_table="mrf.ptg2_price_atom_manifest_token",
@@ -245,10 +484,11 @@ async def test_manifest_serving_taxonomy_expansion_uses_wider_rate_candidate_win
             "plan_id": "465722012",
             "market_type": "group",
             "code": "99214",
-            "code_system": "CPT",
-            "include_providers": "true",
-            "specialty": "Family Medicine",
-        },
+                "code_system": "CPT",
+                "include_providers": "true",
+                "include_sources": "true",
+                "specialty": "Family Medicine",
+            },
         LimitOnePagination(),
         tables,
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
@@ -256,11 +496,12 @@ async def test_manifest_serving_taxonomy_expansion_uses_wider_rate_candidate_win
 
     assert len(payload["items"]) == 1
     assert payload["items"][0]["npi"] == 1851399604
+    assert payload["items"][0]["network_names"] == ["C2"]
     assert payload["items"][0]["taxonomy_codes"] == ["207Q00000X"]
     assert payload["pagination"]["limit"] == 1
     assert payload["query"]["plan_market_type"] == "group"
-    row_sql = str(session.calls[1][0][0])
-    row_params = session.calls[1][0][1]
+    row_sql = str(session.calls[2][0][0])
+    row_params = session.calls[2][0][1]
     assert "LIMIT :rate_candidate_limit" in row_sql
     assert row_params["limit"] == 1
     assert row_params["rate_candidate_limit"] > row_params["limit"]
@@ -281,8 +522,9 @@ async def test_manifest_serving_geo_expansion_uses_wider_location_candidate_wind
         "provider_count": 335,
         "price_set_global_id_128": price_set_id,
         "source_trace_set_hash": None,
+        "network_names": ["C2"],
     }
-    session = FakeSession([FakeResult(rows=[row])])
+    session = FakeSession([FakeResult(rows=[{"column_name": "network_names"}]), FakeResult(rows=[row])])
     tables = ptg2_serving.PTG2ServingTables(
         serving_table="mrf.ptg2_serving_manifest_token",
         price_atom_table="mrf.ptg2_price_atom_manifest_token",
@@ -300,8 +542,20 @@ async def test_manifest_serving_geo_expansion_uses_wider_location_candidate_wind
         assert table_name == "mrf.ptg2_serving_manifest_token"
         return True
 
-    async def fake_location_matches(_session, _tables, args, *, candidate_limit=None):
+    async def fake_location_matches(
+        _session,
+        _tables,
+        args,
+        *,
+        candidate_limit=None,
+        plan_id=None,
+        snapshot_id=None,
+        source_key=None,
+    ):
         assert args["zip5"] == "62401"
+        assert plan_id == "010854205"
+        assert snapshot_id == "ptg2:202606:test"
+        assert source_key is None
         seen_candidate_limit["value"] = candidate_limit
         return {
             provider_set_id,
@@ -350,9 +604,10 @@ async def test_manifest_serving_geo_expansion_uses_wider_location_candidate_wind
             "zip5": "62401",
             "lat": "39.11952",
             "long": "-88.56418",
-            "radius_miles": "100",
-            "include_providers": "true",
-        },
+                "radius_miles": "100",
+                "include_providers": "true",
+                "include_sources": "true",
+            },
         LimitOnePagination(),
         tables,
         ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
@@ -360,6 +615,7 @@ async def test_manifest_serving_geo_expansion_uses_wider_location_candidate_wind
 
     assert len(payload["items"]) == 1
     assert payload["items"][0]["npi"] == 1154321222
+    assert payload["items"][0]["network_names"] == ["C2"]
     assert payload["items"][0]["specialization"] == "Sports Medicine"
     assert payload["items"][0]["phone"] == "2175551212"
     assert payload["items"][0]["phone_number"] == "2175551212"
@@ -367,8 +623,8 @@ async def test_manifest_serving_geo_expansion_uses_wider_location_candidate_wind
     assert payload["items"][0]["fax_number"] == "2175551213"
     assert payload["items"][0]["address"]["telephone_number"] == "2175551212"
     assert seen_candidate_limit["value"] >= 500
-    row_sql = str(session.calls[0][0][0])
-    row_params = session.calls[0][0][1]
+    row_sql = str(session.calls[1][0][0])
+    row_params = session.calls[1][0][1]
     assert "LIMIT :rate_candidate_limit" in row_sql
     assert row_params["limit"] == 1
     assert row_params["rate_candidate_limit"] == seen_candidate_limit["value"]
@@ -525,7 +781,13 @@ def _db_serving_session():
                                 "billing_code_modifier": ["TC", "ZZ"],
                             }
                         ],
-                        "source_trace": [{"url": "https://example.test/rates.json.gz"}],
+                        "source_trace": [
+                            {
+                                "source_file_version_id": "source-version-db-row",
+                                "original_url": "https://example.test/rates.json.gz",
+                            }
+                        ],
+                        "network_names": ["C2"],
                         "confidence": {"network": "tic_rate_npi_tin"},
                     }
                 ]
@@ -555,6 +817,16 @@ def _fixture_payload():
                 "city": "Peoria",
                 "state": "IL",
                 "zip5": "61636",
+                "location_source": "npi_address",
+                "location_confidence_code": "npi_address",
+                "address_payload": {
+                    "first_line": "1 Main St",
+                    "city_name": "Peoria",
+                    "state_name": "IL",
+                    "postal_code": "61636",
+                    "address_sources": ["nppes"],
+                    "address_source_mask": 1,
+                },
             }
         },
         "rates": {
@@ -563,7 +835,13 @@ def _fixture_payload():
                     {
                         "provider_ordinal": 1,
                         "prices": [{"negotiated_type": "negotiated", "negotiated_rate": 450}],
-                        "source_trace": [{"url": "https://example.test/tic.json.gz"}],
+                        "network_names": ["C2"],
+                        "source_trace": [
+                            {
+                                "source_file_version_id": "source-version-fixture",
+                                "original_url": "https://example.test/tic.json.gz",
+                            }
+                        ],
                     }
                 ]
             }
@@ -580,8 +858,13 @@ def test_search_ptg2_index_returns_prices_and_source_trace():
     item = payload["items"][0]
     assert item["npi"] == 1234567890
     assert item["tic_prices"][0]["negotiated_rate"] == 450
-    assert item["source_trace"][0]["url"] == "https://example.test/tic.json.gz"
+    assert item["network_names"] == ["C2"]
+    assert item["source_trace"][0]["source_file_version_id"] == "source-version-fixture"
+    assert item["source_trace"][0]["original_url"] == "https://example.test/tic.json.gz"
     assert item["confidence"]["network"] == "tic_rate_npi_tin"
+    assert item["address_verification"]["address_network_binding"] == "inferred_from_provider_identity"
+    assert item["address_verification"]["address_evidence_level"] == "nppes_provider_address"
+    assert item["address_verification"]["requires_location_confirmation"] is True
     assert payload["query"]["source"] == "ptg2"
 
 
@@ -875,9 +1158,14 @@ async def test_search_current_ptg2_index_reads_db_serving_table():
     assert item["tic_prices"][0]["negotiated_rate"] == 450
     assert item["provider_count"] == 123
     assert "source_trace" not in item
+    assert "snapshot_id" not in item
+    assert "network_names" not in item
     assert "confidence" not in item
     assert "price_set_hash" not in item
     assert "provider_set_hash" not in item
+    assert item["address_verification"]["rate_network_binding"] == "tic_provider_group_npi_tin"
+    assert item["address_verification"]["address_evidence_level"] == "unknown"
+    assert item["address_verification"]["displayed_address_present"] is False
 
 
 @pytest.mark.asyncio
@@ -894,9 +1182,99 @@ async def test_search_current_ptg2_index_can_include_sources_without_debug_field
     assert payload["query"]["serving_table"] == "mrf.ptg2_serving_rate"
     assert "procedure_consolidation" not in payload["query"]
     item = payload["items"][0]
-    assert item["source_trace"][0]["url"] == "https://example.test/rates.json.gz"
+    assert item["source_trace"][0]["source_file_version_id"] == "source-version-db-row"
+    assert item["source_trace"][0]["original_url"] == "https://example.test/rates.json.gz"
+    assert item["snapshot_id"] == "snap-db"
+    assert item["network_names"] == ["C2"]
     assert "confidence" not in item
     assert "price_set_hash" not in item
+    assert item["address_verification"]["rate_network_binding"] == "tic_provider_group_npi_tin"
+    row_sql = "\n".join(str(call[0][0]) for call in session.calls if call[0])
+    assert "ptg2_source_trace_set" in row_sql
+    assert "ptg2_source_trace" in row_sql
+    assert "'source_file_version_id', st.source_file_version_id" in row_sql
+    assert "sts.source_trace_set_hash = r.source_trace_set_hash" in row_sql
+
+
+@pytest.mark.asyncio
+async def test_manifest_db_serving_hydrates_source_trace_from_trace_set(monkeypatch):
+    provider_set_id = "00000000000000000000000000000012"
+    price_set_id = "00000000000000000000000000000101"
+    rate_pack_id = "00000000000000000000000000000201"
+    row = {
+        "serving_content_hash_128": rate_pack_id,
+        "plan_id": "010854205",
+        "reported_code_system": "CPT",
+        "reported_code": "29888",
+        "procedure_global_id_128": "00000000000000000000000000000301",
+        "provider_set_global_id_128": provider_set_id,
+        "provider_count": 2,
+        "price_set_global_id_128": price_set_id,
+        "source_trace_set_hash": "trace-set-1",
+        "network_names": ["C2"],
+    }
+    session = FakeSession(
+        [
+            1,
+            FakeResult(rows=[row]),
+            FakeResult(
+                rows=[
+                    {
+                        "source_trace_set_hash": "trace-set-1",
+                        "source_trace": [
+                            {
+                                "source_file_version_id": "source-version-1",
+                                "original_url": "https://payer.example.invalid/mrf/rates.json.gz",
+                            }
+                        ],
+                    }
+                ]
+            ),
+        ]
+    )
+    tables = ptg2_serving.PTG2ServingTables(serving_table="mrf.ptg2_serving_manifest_token")
+
+    async def fake_available(_session, table_name):
+        assert table_name == "mrf.ptg2_serving_manifest_token"
+        return True
+
+    async def fake_has_columns(_session, _table_name, required_columns):
+        assert required_columns == {"network_names"}
+        return True
+
+    async def fake_prices(_session, _tables, price_set_ids):
+        assert price_set_ids == [price_set_id]
+        return {price_set_id: [{"negotiated_type": "negotiated", "negotiated_rate": 1138.57}]}
+
+    async def fake_procedure_details(_session, row_data):
+        assert row_data[0]["source_trace_set_hash"] == "trace-set-1"
+        return {("CPT", "29888"): {"procedure_name": "ACL reconstruction"}}
+
+    monkeypatch.setattr(ptg2_serving, "_serving_table_available", fake_available)
+    monkeypatch.setattr(ptg2_serving, "_ptg2_table_has_columns", fake_has_columns)
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_prices_for_price_sets", fake_prices)
+    monkeypatch.setattr(ptg2_serving, "_ptg2_manifest_procedure_details_for_rows", fake_procedure_details)
+
+    payload = await ptg2_serving._search_ptg2_manifest_db_serving_table(
+        session,
+        "ptg2:202606:test",
+        {
+            "plan_id": "010854205",
+            "market_type": "group",
+            "code": "29888",
+            "code_system": "CPT",
+            "include_sources": "true",
+        },
+        FakePagination(),
+        tables,
+        ptg2_serving.PTG2_MODE_PRODUCT_SEARCH,
+    )
+
+    item = payload["items"][0]
+    assert item["source_trace"][0]["source_file_version_id"] == "source-version-1"
+    assert item["source_trace"][0]["original_url"] == "https://payer.example.invalid/mrf/rates.json.gz"
+    assert item["address_verification"]["rate_network_binding"] == "tic_provider_group_npi_tin"
+    assert any("ptg2_source_trace_set" in str(call[0][0]) for call in session.calls if call[0])
 
 
 @pytest.mark.asyncio
@@ -912,10 +1290,12 @@ async def test_search_current_ptg2_index_can_include_full_details():
     assert payload["query"]["source"] == "ptg2_db"
     assert payload["query"]["procedure_consolidation"] == "HP_PROCEDURE_CODE"
     item = payload["items"][0]
-    assert item["source_trace"][0]["url"] == "https://example.test/rates.json.gz"
+    assert item["source_trace"][0]["source_file_version_id"] == "source-version-db-row"
+    assert item["source_trace"][0]["original_url"] == "https://example.test/rates.json.gz"
     assert item["confidence"]["network"] == "tic_rate_npi_tin"
     assert item["price_set_hash"] == "price-set-1"
     assert item["provider_set_hash"] == "provider-set-1"
+    assert item["address_verification"]["address_evidence_level"] == "unknown"
 
 
 @pytest.mark.asyncio
@@ -986,7 +1366,12 @@ async def test_search_current_ptg2_index_caches_shaped_positive_responses(monkey
             "items": [
                 {
                     "reported_code": "70551",
-                    "source_trace": [{"url": "https://example.test/rates.json.gz"}],
+                    "source_trace": [
+                        {
+                            "source_file_version_id": "source-version-cache",
+                            "original_url": "https://example.test/rates.json.gz",
+                        }
+                    ],
                     "provider_set_hash": "provider-set-1",
                 }
             ],
@@ -1760,6 +2145,9 @@ def test_compact_item_promotes_location_phone_from_address_payload():
             "provider_name": "Example Surgeon",
             "address_payload": {
                 "address_key": "00000000-0000-0000-0000-000000000001",
+                "first_line": "100 Network Way",
+                "city": "Chicago",
+                "state": "IL",
                 "telephone_number": "3125551212",
                 "fax_number": "3125551213",
             },
@@ -1773,6 +2161,778 @@ def test_compact_item_promotes_location_phone_from_address_payload():
     assert item["telephone_number"] == "3125551212"
     assert item["fax_number"] == "3125551213"
     assert item["address"]["telephone_number"] == "3125551212"
+
+
+def test_compact_item_marks_unified_address_as_inferred_from_provider_identity():
+    item = ptg2_serving._compact_item_from_row(
+        {
+            "npi": 1234567890,
+            "provider_name": "Example Surgeon",
+            "location_source": "entity_address_unified",
+            "location_confidence_code": "entity_address_unified",
+            "address_payload": {
+                "first_line": "900 W Temple Ave",
+                "city_name": "EFFINGHAM",
+                "state_name": "IL",
+                "postal_code": "62401",
+                "address_precision": "street",
+                "address_sources": ["nppes"],
+                "source_count": 1,
+                "source_mask": 65,
+                "address_source_mask": 1,
+                "multi_source_confirmed": False,
+            },
+            "network_names": ["C2"],
+            "prices": [],
+        },
+        {"source_key": "ptg_heartland", "snapshot_id": "ptg2:202606:demo"},
+    )
+
+    assert item["address_precision"] == "street"
+    assert item["source_key"] == "ptg_heartland"
+    assert item["snapshot_id"] == "ptg2:202606:demo"
+    assert item["network_names"] == ["C2"]
+    assert item["address_verification"] == {
+        "rate_network_binding": "tic_provider_group_npi_tin",
+        "address_network_binding": "inferred_from_provider_identity",
+        "address_evidence_level": "nppes_provider_address",
+        "requires_location_confirmation": True,
+        "reason": "PTG proves the NPI/TIN is in network; the displayed address comes from NPPES/provider enrichment.",
+        "displayed_address_present": True,
+        "location_source": "entity_address_unified",
+        "location_confidence_code": "entity_address_unified",
+        "address_precision": "street",
+        "address_sources": ["nppes"],
+        "source_count": 1,
+        "multi_source_confirmed": False,
+        "source_mask": 65,
+        "address_source_mask": 1,
+    }
+
+
+def test_compact_item_with_displayable_address_passes_assurance_contract():
+    item = ptg2_serving._compact_item_from_row(
+        {
+            "npi": 1234567890,
+            "provider_name": "Example Surgeon",
+            "location_source": "entity_address_unified",
+            "location_confidence_code": "entity_address_unified",
+            "address_payload": {
+                "first_line": "900 W Temple Ave",
+                "city": "Effingham",
+                "state": "IL",
+                "postal_code": "62401",
+                "address_sources": ["nppes"],
+                "address_source_mask": 1,
+                "source_mask": 65,
+            },
+            "network_names": ["C2"],
+            "prices": [],
+        },
+        {"source_key": "ptg_heartland", "snapshot_id": "ptg2:202606:demo"},
+    )
+
+    summary = summarize_ptg_price_address_payload({"data": {"items": [item]}})
+
+    assert summary["ok"] is True
+    assert summary["address_verification_rows"] == 1
+    assert summary["displayed_address_rows"] == 1
+    assert summary["issues"] == []
+
+
+def test_manifest_provider_procedure_item_includes_address_verification():
+    item = ptg2_serving._ptg2_manifest_provider_procedure_item(
+        npi=1234567890,
+        data={
+            "serving_content_hash_128": "rate-pack",
+            "provider_set_global_id_128": "provider-set",
+            "provider_count": 3,
+            "price_set_global_id_128": "price-set",
+            "reported_code": "29888",
+            "reported_code_system": "CPT",
+            "network_names": ["C2"],
+        },
+        prices=[
+            {
+                "negotiated_type": "negotiated",
+                "negotiated_rate": 1138.57,
+                "billing_class": "professional",
+            }
+        ],
+        procedure_detail={
+            "procedure_name": "ACL reconstruction",
+            "procedure_description": "Repair of anterior cruciate ligament",
+        },
+        provider_context={
+            "provider_name": "Example Surgeon",
+            "location_source": "npi_address",
+            "address_payload": {
+                "first_line": "900 W Temple Ave",
+                "city": "Effingham",
+                "state": "IL",
+                "postal_code": "62401",
+                "address_sources": ["nppes"],
+            },
+        },
+        args={"snapshot_id": "ptg2:202606:test"},
+    )
+
+    assert item["npi"] == 1234567890
+    assert item["procedure_code"] == "29888"
+    assert item["network_names"] == ["C2"]
+    assert item["address"]["first_line"] == "900 W Temple Ave"
+    assert item["address_verification"]["rate_network_binding"] == "tic_provider_group_npi_tin"
+    assert item["address_verification"]["address_network_binding"] == "inferred_from_provider_identity"
+    assert item["address_verification"]["address_evidence_level"] == "nppes_provider_address"
+    assert item["address_verification"]["displayed_address_present"] is True
+    summary = summarize_ptg_price_address_payload({"data": {"items": [item]}})
+    assert summary["ok"] is True
+
+
+def test_compact_item_filters_ptg_from_inferred_address_sources():
+    item = ptg2_serving._compact_item_from_row(
+        {
+            "npi": 1234567890,
+            "provider_name": "Example Surgeon",
+            "location_source": "entity_address_unified",
+            "location_confidence_code": "entity_address_unified",
+            "address_payload": {
+                "first_line": "900 W Temple Ave",
+                "city": "Effingham",
+                "state": "IL",
+                "postal_code": "62401",
+                "address_sources": ["nppes", "ptg"],
+                "address_source_mask": 1,
+                "source_mask": 65,
+            },
+            "network_names": ["C2"],
+            "prices": [],
+        },
+        {"source_key": "ptg_heartland", "snapshot_id": "ptg2:202606:demo"},
+    )
+
+    assert "address_sources" not in item
+    assert item["address_verification"]["address_network_binding"] == "inferred_from_provider_identity"
+    assert item["address_verification"]["address_sources"] == ["nppes"]
+
+
+def test_compact_item_keeps_npi_backed_provider_group_location_as_inferred():
+    item = ptg2_serving._compact_item_from_row(
+        {
+            "npi": 1234567890,
+            "provider_name": "Example Surgeon",
+            "location_source": "npi_address",
+            "location_confidence_code": "npi_address",
+            "address_payload": {
+                "first_line": "100 Network Way",
+                "city": "Example",
+                "state": "IL",
+                "postal_code": "62401",
+                "address_verification_evidence": {
+                    "source": "payer_provider_group_location",
+                    "provider_group_id": 1662,
+                    "json_pointer": "/provider_references/0/provider_groups/0/address",
+                },
+            },
+            "prices": [],
+        },
+        {},
+    )
+
+    assert item["address_verification"]["address_evidence_level"] == "nppes_provider_address"
+    assert item["address_verification"]["address_network_binding"] == "inferred_from_provider_identity"
+    assert item["address_verification"]["requires_location_confirmation"] is True
+
+
+def test_compact_item_marks_explicit_payer_location_as_payer_confirmed():
+    item = ptg2_serving._compact_item_from_row(
+        {
+            "npi": 1234567890,
+            "provider_name": "Example Surgeon",
+            "location_source": "payer_provider_group_location",
+            "location_confidence_code": "payer_confirmed_location",
+            "address_payload": {
+                "first_line": "100 Network Way",
+                "city": "Example",
+                "state": "IL",
+                "postal_code": "62401",
+                "address_verification_evidence": {
+                    "source": "payer_provider_group_location",
+                    "provider_group_id": 1662,
+                    "json_pointer": "/provider_references/0/provider_groups/0/address",
+                },
+            },
+            "prices": [],
+        },
+        {},
+    )
+
+    assert item["address_verification"]["address_evidence_level"] == "payer_confirmed_location"
+    assert item["address_verification"]["address_network_binding"] == "payer_confirmed_location"
+    assert item["address_verification"]["requires_location_confirmation"] is False
+
+
+def test_compact_item_does_not_mark_payer_location_without_source_record_evidence():
+    item = ptg2_serving._compact_item_from_row(
+        {
+            "npi": 1234567890,
+            "provider_name": "Example Surgeon",
+            "location_source": "payer_provider_group_location",
+            "location_confidence_code": "payer_confirmed_location",
+            "address_payload": {
+                "first_line": "100 Network Way",
+                "city": "Example",
+                "state": "IL",
+                "postal_code": "62401",
+            },
+            "prices": [],
+        },
+        {},
+    )
+
+    assert item["address_verification"]["address_network_binding"] == "inferred_from_provider_identity"
+    assert item["address_verification"]["requires_location_confirmation"] is True
+
+
+def test_compact_item_marks_provider_directory_network_location_as_corroborated():
+    item = ptg2_serving._compact_item_from_row(
+        {
+            "npi": 1234567890,
+            "provider_name": "Example Surgeon",
+            "location_source": "provider_directory_fhir",
+            "location_confidence_code": "payer_directory_corroborated_location",
+            "address_payload": {
+                "first_line": "100 Network Way",
+                "city": "Example",
+                "state": "IL",
+                "postal_code": "62401",
+                "address_sources": ["provider_directory_fhir"],
+                "provider_directory_plan_context_matched": True,
+                "address_verification_evidence": {
+                    "matched_on": "npi_address_key_role_location_plan",
+                },
+            },
+            "prices": [],
+        },
+        {},
+    )
+
+    assert item["address_verification"]["address_evidence_level"] == "payer_directory_network_location"
+    assert item["address_verification"]["address_network_binding"] == "payer_directory_corroborated_location"
+    assert item["address_verification"]["requires_location_confirmation"] is False
+
+
+def test_compact_item_promotes_provider_directory_network_name_match():
+    item = ptg2_serving._compact_item_from_row(
+        {
+            "npi": 1234567890,
+            "provider_name": "Example Surgeon",
+            "network_names": ["C2"],
+            "location_source": "provider_directory_fhir",
+            "location_confidence_code": "provider_directory_address",
+            "address_payload": {
+                "first_line": "100 Network Way",
+                "city": "Example",
+                "state": "IL",
+                "postal_code": "62401",
+                "address_sources": ["provider_directory_fhir"],
+                "provider_directory_plan_context_matched": False,
+                "provider_directory_network_context_present": True,
+                "provider_directory_network_names": ["C2"],
+                "provider_directory_network_matches": [
+                    {
+                        "ref": "Organization/network-1",
+                        "resource_id": "network-1",
+                        "name": "C2",
+                        "aliases": ["C Two"],
+                    }
+                ],
+                "address_verification_evidence": {
+                    "matched_on": "npi_address_key_role_location",
+                },
+            },
+            "prices": [],
+        },
+        {},
+    )
+
+    verification = item["address_verification"]
+    assert verification["address_evidence_level"] == "payer_directory_network_location"
+    assert verification["address_network_binding"] == "payer_directory_corroborated_location"
+    assert verification["requires_location_confirmation"] is False
+    assert verification["provider_directory_plan_context_matched"] is False
+    assert verification["provider_directory_network_name_matched"] is True
+    assert verification["provider_directory_network_matches"] == [
+        {
+            "ptg_network_name": "C2",
+            "provider_directory_network_name": "C2",
+            "provider_directory_network_resource_id": "network-1",
+            "provider_directory_network_ref": "Organization/network-1",
+        }
+    ]
+    assert verification["address_verification_evidence"]["matched_on"] == (
+        "npi_address_key_role_location_network_name"
+    )
+    assert verification["address_verification_evidence"]["network_name_context_matched"] is True
+    assert verification["address_verification_evidence"]["network_name_matches"] == [
+        {
+            "ptg_network_name": "C2",
+            "provider_directory_network_name": "C2",
+            "provider_directory_network_resource_id": "network-1",
+            "provider_directory_network_ref": "Organization/network-1",
+        }
+    ]
+
+
+def test_provider_directory_network_name_matching_does_not_mutate_payload():
+    address_payload = {
+        "first_line": "100 Network Way",
+        "city": "Example",
+        "state": "IL",
+        "postal_code": "62401",
+        "address_sources": ["provider_directory_fhir"],
+        "address_network_binding": "provider_directory_address",
+        "provider_directory_plan_context_matched": False,
+        "provider_directory_network_context_present": True,
+        "provider_directory_network_names": ["C2"],
+        "provider_directory_network_matches": [
+            {
+                "ref": "Organization/network-1",
+                "resource_id": "network-1",
+                "name": "C2",
+                "aliases": ["C Two"],
+            }
+        ],
+        "address_verification_evidence": {
+            "matched_on": "npi_address_key_role_location",
+        },
+    }
+    original_payload = json.loads(json.dumps(address_payload))
+    item = {
+        "network_names": ["C2"],
+        "address": {
+            "first_line": "100 Network Way",
+            "city": "Example",
+            "state": "IL",
+            "postal_code": "62401",
+        },
+    }
+
+    first = ptg2_serving._address_verification_payload(item, {}, address_payload)
+    second = ptg2_serving._address_verification_payload(item, {}, address_payload)
+
+    assert address_payload == original_payload
+    assert second["provider_directory_network_matches"] == first["provider_directory_network_matches"]
+    assert len(second["provider_directory_network_matches"]) == 1
+
+
+def test_compact_item_promotes_pre_shaped_provider_directory_network_match():
+    item = ptg2_serving._compact_item_from_row(
+        {
+            "npi": 1234567890,
+            "provider_name": "Example Surgeon",
+            "network_names": ["C2"],
+            "location_source": "provider_directory_fhir",
+            "location_confidence_code": "provider_directory_address",
+            "address_payload": {
+                "first_line": "100 Network Way",
+                "city": "Example",
+                "state": "IL",
+                "postal_code": "62401",
+                "address_sources": ["provider_directory_fhir"],
+                "provider_directory_plan_context_matched": False,
+                "provider_directory_network_context_present": True,
+                "provider_directory_network_matches": [
+                    {
+                        "ptg_network_name": "C2",
+                        "provider_directory_network_name": "C2",
+                        "provider_directory_network_resource_id": "network-1",
+                        "provider_directory_network_ref": "Organization/network-1",
+                    }
+                ],
+                "address_verification_evidence": {
+                    "matched_on": "npi_address_key_role_location",
+                },
+            },
+            "prices": [],
+        },
+        {},
+    )
+
+    verification = item["address_verification"]
+    assert verification["address_network_binding"] == "payer_directory_corroborated_location"
+    assert verification["provider_directory_network_name_matched"] is True
+    assert verification["provider_directory_network_matches"] == [
+        {
+            "ptg_network_name": "C2",
+            "provider_directory_network_name": "C2",
+            "provider_directory_network_resource_id": "network-1",
+            "provider_directory_network_ref": "Organization/network-1",
+        }
+    ]
+
+
+def test_compact_item_downgrades_pre_shaped_network_match_without_served_network_names():
+    item = ptg2_serving._compact_item_from_row(
+        {
+            "npi": 1234567890,
+            "provider_name": "Example Surgeon",
+            "location_source": "provider_directory_fhir",
+            "location_confidence_code": "provider_directory_address",
+            "address_payload": {
+                "first_line": "100 Network Way",
+                "city": "Example",
+                "state": "IL",
+                "postal_code": "62401",
+                "address_sources": ["provider_directory_fhir"],
+                "provider_directory_plan_context_matched": False,
+                "provider_directory_network_context_present": True,
+                "provider_directory_network_matches": [
+                    {
+                        "ptg_network_name": "C2",
+                        "provider_directory_network_name": "C2",
+                    }
+                ],
+                "address_verification_evidence": {
+                    "matched_on": "npi_address_key_role_location_network_name",
+                    "network_name_context_matched": True,
+                },
+            },
+            "prices": [],
+        },
+        {},
+    )
+
+    verification = item["address_verification"]
+    assert verification["address_network_binding"] == "inferred_from_provider_identity"
+    assert verification["address_evidence_level"] == "provider_directory_address"
+    assert verification["requires_location_confirmation"] is True
+    assert "provider_directory_network_name_matched" not in verification
+    assert "provider_directory_network_matches" not in verification
+    assert verification["address_verification_evidence"]["matched_on"] == "npi_address_key_role_location"
+
+
+def test_compact_item_normalizes_provider_directory_boolean_strings():
+    item = ptg2_serving._compact_item_from_row(
+        {
+            "npi": 1234567890,
+            "provider_name": "Example Surgeon",
+            "network_names": ["C2"],
+            "location_source": "provider_directory_fhir",
+            "location_confidence_code": "provider_directory_address",
+            "address_payload": {
+                "first_line": "100 Network Way",
+                "city": "Example",
+                "state": "IL",
+                "postal_code": "62401",
+                "address_sources": ["provider_directory_fhir"],
+                "provider_directory_plan_context_matched": "false",
+                "provider_directory_network_context_present": "true",
+                "provider_directory_network_refs": '["Organization/network-1"]',
+                "provider_directory_network_names": ["C2"],
+                "provider_directory_network_matches": [
+                    {
+                        "ref": "Organization/network-1",
+                        "resource_id": "network-1",
+                        "name": "C2",
+                    }
+                ],
+                "address_verification_evidence": {
+                    "matched_on": "npi_address_key_role_location",
+                },
+                "provider_directory_insurance_plan_refs": "InsurancePlan/plan-1",
+                "provider_directory_insurance_plan_matches": '["InsurancePlan/plan-1"]',
+            },
+            "prices": [],
+        },
+        {},
+    )
+
+    verification = item["address_verification"]
+    assert verification["provider_directory_plan_context_matched"] is False
+    assert verification["provider_directory_network_context_present"] is True
+    assert verification["provider_directory_network_name_matched"] is True
+    assert verification["provider_directory_network_refs"] == ["Organization/network-1"]
+    assert verification["provider_directory_network_names"] == ["C2"]
+    assert verification["provider_directory_insurance_plan_refs"] == ["InsurancePlan/plan-1"]
+    assert verification["provider_directory_insurance_plan_matches"] == ["InsurancePlan/plan-1"]
+
+
+def test_compact_item_downgrades_provider_directory_network_marker_without_plan_context():
+    item = ptg2_serving._compact_item_from_row(
+        {
+            "npi": 1234567890,
+            "provider_name": "Example Surgeon",
+            "location_source": "provider_directory_fhir",
+            "location_confidence_code": "payer_directory_corroborated_location",
+            "address_payload": {
+                "first_line": "100 Network Way",
+                "city": "Example",
+                "state": "IL",
+                "postal_code": "62401",
+                "address_sources": ["provider_directory_fhir"],
+                "provider_directory_plan_context_matched": False,
+                "address_verification_evidence": {
+                    "matched_on": "npi_address_key_role_location",
+                },
+            },
+            "prices": [],
+        },
+        {},
+    )
+
+    assert item["address_verification"]["address_evidence_level"] == "provider_directory_address"
+    assert item["address_verification"]["address_network_binding"] == "inferred_from_provider_identity"
+    assert item["address_verification"]["requires_location_confirmation"] is True
+    assert item["address_verification"]["provider_directory_plan_context_matched"] is False
+
+
+def test_compact_item_rejects_loose_provider_directory_network_name_marker():
+    item = ptg2_serving._compact_item_from_row(
+        {
+            "npi": 1234567890,
+            "provider_name": "Example Surgeon",
+            "network_names": ["C2"],
+            "location_source": "provider_directory_fhir",
+            "location_confidence_code": "payer_directory_corroborated_location",
+            "address_payload": {
+                "first_line": "100 Network Way",
+                "city": "Example",
+                "state": "IL",
+                "postal_code": "62401",
+                "address_sources": ["provider_directory_fhir"],
+                "provider_directory_plan_context_matched": False,
+                "provider_directory_network_name_matched": True,
+                "provider_directory_network_matches": [
+                    {
+                        "ref": "Organization/network-2",
+                        "resource_id": "network-2",
+                        "name": "PPO NDC",
+                    }
+                ],
+                "address_verification_evidence": {
+                    "matched_on": "npi_address_key_role_location_network_name",
+                    "network_name_context_matched": True,
+                    "network_name_matches": [
+                        {
+                            "ptg_network_name": "C2",
+                            "provider_directory_network_name": "C2",
+                        }
+                    ],
+                },
+            },
+            "prices": [],
+        },
+        {},
+    )
+
+    verification = item["address_verification"]
+    assert verification["address_evidence_level"] == "provider_directory_address"
+    assert verification["address_network_binding"] == "inferred_from_provider_identity"
+    assert verification["requires_location_confirmation"] is True
+    assert "provider_directory_network_name_matched" not in verification
+    assert "provider_directory_network_matches" not in verification
+    assert verification["address_verification_evidence"]["matched_on"] == "npi_address_key_role_location"
+    assert "network_name_context_matched" not in verification["address_verification_evidence"]
+    assert "network_name_matches" not in verification["address_verification_evidence"]
+
+
+def test_compact_item_marks_provider_directory_address_without_network_as_inferred():
+    item = ptg2_serving._compact_item_from_row(
+        {
+            "npi": 1234567890,
+            "provider_name": "Example Surgeon",
+            "location_source": "entity_address_unified",
+            "address_payload": {
+                "first_line": "100 Network Way",
+                "city": "Example",
+                "state": "IL",
+                "postal_code": "62401",
+                "address_sources": ["provider_directory_fhir"],
+            },
+            "prices": [],
+        },
+        {},
+    )
+
+    assert item["address_verification"]["address_evidence_level"] == "provider_directory_address"
+    assert item["address_verification"]["address_network_binding"] == "inferred_from_provider_identity"
+    assert item["address_verification"]["requires_location_confirmation"] is True
+
+
+def test_address_verification_treats_nested_address_as_displayable():
+    verification = ptg2_serving._address_verification_payload(
+        {
+            "network_names": ["C2"],
+            "address": {
+                "first_line": "100 Test St",
+                "city": "Chicago",
+                "state": "IL",
+                "postal_code": "60601",
+            },
+        },
+        {},
+        {
+            "address_network_binding": "payer_directory_corroborated_location",
+            "location_source": "provider_directory_fhir",
+            "address_sources": ["provider_directory_fhir"],
+            "provider_directory_plan_context_matched": True,
+        },
+    )
+
+    assert verification["displayed_address_present"] is True
+    assert verification["address_network_binding"] == "payer_directory_corroborated_location"
+    assert verification["address_evidence_level"] == "payer_directory_network_location"
+
+
+def test_compact_item_marks_missing_address_as_not_displayable():
+    item = ptg2_serving._compact_item_from_row(
+        {
+            "npi": 1234567890,
+            "provider_name": "Example Surgeon",
+            "prices": [],
+        },
+        {},
+    )
+
+    assert item["address_verification"]["address_evidence_level"] == "unknown"
+    assert item["address_verification"]["address_network_binding"] == "inferred_from_provider_identity"
+    assert item["address_verification"]["requires_location_confirmation"] is True
+    assert item["address_verification"]["displayed_address_present"] is False
+    assert "address" not in item
+    assert "phone" not in item
+    summary = summarize_ptg_price_address_payload({"data": {"items": [item]}})
+    assert summary["ok"] is False
+    assert {
+        "severity": "error",
+        "item_index": 0,
+        "message": "displayed_address_present=false",
+    } in summary["issues"]
+    assert {
+        "severity": "error",
+        "item_index": 0,
+        "message": "address_verification is present but no usable address fields are displayed",
+    } in summary["issues"]
+
+
+def test_compact_item_marks_address_key_only_as_not_displayable():
+    item = ptg2_serving._compact_item_from_row(
+        {
+            "npi": 1234567890,
+            "provider_name": "Example Surgeon",
+            "address_payload": {
+                "address_key": "00000000-0000-0000-0000-000000000001",
+            },
+            "prices": [],
+        },
+        {},
+    )
+
+    assert item["address_verification"]["displayed_address_present"] is False
+    assert item["address_verification"]["address_evidence_level"] == "unknown"
+    assert item["address_verification"]["requires_location_confirmation"] is True
+    for key in ("location_source", "address_sources", "address_precision", "source_count"):
+        assert key not in item["address_verification"]
+    assert "address" not in item
+    assert "address_key" not in item
+    summary = summarize_ptg_price_address_payload({"data": {"items": [item]}})
+    assert summary["ok"] is False
+    assert {
+        "severity": "error",
+        "item_index": 0,
+        "message": "displayed_address_present=false",
+    } in summary["issues"]
+
+
+def test_compact_item_marks_city_only_as_not_displayable():
+    item = ptg2_serving._compact_item_from_row(
+        {
+            "npi": 1234567890,
+            "provider_name": "Example Surgeon",
+            "address_payload": {
+                "city": "Effingham",
+                "address_precision": "city_zip",
+            },
+            "prices": [],
+        },
+        {},
+    )
+
+    assert item["address_verification"]["address_evidence_level"] == "unknown"
+    assert item["address_verification"]["displayed_address_present"] is False
+    assert item["address_verification"]["requires_location_confirmation"] is True
+    for key in ("location_source", "address_sources", "address_precision", "source_count"):
+        assert key not in item["address_verification"]
+    assert "address" not in item
+    assert "city" not in item
+    summary = summarize_ptg_price_address_payload({"data": {"items": [item]}})
+    assert summary["ok"] is False
+    assert {
+        "severity": "error",
+        "item_index": 0,
+        "message": "address_verification is present but no usable address fields are displayed",
+    } in summary["issues"]
+
+
+def test_compact_item_strips_phone_and_distance_for_no_display_address():
+    item = ptg2_serving._compact_item_from_row(
+        {
+            "npi": 1234567890,
+            "provider_name": "Example Surgeon",
+            "address_payload": {
+                "address_key": "00000000-0000-0000-0000-000000000001",
+                "telephone_number": "217-555-0100",
+                "fax_number": "217-555-0101",
+            },
+            "distance_miles": 2.3,
+            "zip_match_type": "radius",
+            "location_source": "entity_address_unified",
+            "prices": [],
+        },
+        {},
+    )
+
+    assert item["address_verification"]["displayed_address_present"] is False
+    assert item["address_verification"]["address_evidence_level"] == "unknown"
+    assert item["address_verification"]["reason"] == (
+        "PTG proves the provider identity is in network, but no displayable address is available."
+    )
+    for key in ("location_source", "address_sources", "address_precision", "source_count"):
+        assert key not in item["address_verification"]
+    for key in (
+        "address",
+        "telephone_number",
+        "phone_number",
+        "phone",
+        "fax_number",
+        "distance_miles",
+        "zip_match_type",
+        "location_source",
+    ):
+        assert key not in item
+
+
+def test_compact_item_marks_city_state_fallback_as_displayable_but_unconfirmed():
+    item = ptg2_serving._compact_item_from_row(
+        {
+            "npi": 1234567890,
+            "provider_name": "Example Surgeon",
+            "address_payload": {
+                "city": "Effingham",
+                "state": "IL",
+                "address_precision": "city_zip",
+            },
+            "prices": [],
+        },
+        {},
+    )
+
+    assert item["address_verification"]["address_evidence_level"] == "city_zip_fallback"
+    assert item["address_verification"]["requires_location_confirmation"] is True
+    assert item["address_verification"]["displayed_address_present"] is True
+    summary = summarize_ptg_price_address_payload({"data": {"items": [item]}})
+    assert summary["ok"] is True
+    assert summary["displayed_address_rows"] == 1
 
 
 def test_orthopedic_surgery_specialty_resolves_to_taxonomy():
@@ -1938,7 +3098,7 @@ async def test_compact_serving_include_providers_expands_without_geo_filter(monk
     assert item["state"] == "IL"
     assert item["address"]["address_key"] == "00000000-0000-0000-0000-000000000002"
     assert item["tic_prices"][0]["negotiated_rate"] == 60
-    sql = str(session.calls[-1][0][0])
+    sql = str(session.calls[-2][0][0])
     assert "LEFT JOIN LATERAL (" in sql
     assert "FROM mrf.npi_address addr" in sql
     assert "addr.npi = pgm.npi" in sql

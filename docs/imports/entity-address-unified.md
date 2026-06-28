@@ -92,9 +92,53 @@ unless `--publish` or import-control `publish=true` is supplied.
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_AGGREGATE_CONCURRENCY`
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_EVIDENCE_SHARDS`
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_EVIDENCE_CONCURRENCY`
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_INLINE_SOURCE_EVIDENCE` (default `true`; computes multi-source evidence during raw aggregation and skips the separate evidence work-table update pass for full rebuilds)
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_REQUIRE_INLINE_SOURCE_EVIDENCE` (default `false`; fail fast if the optimized inline evidence path is not active, used by the dev serving-only speed profile to avoid silently falling back to the old evidence work-table pass)
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_SPLIT_ARRAY_AGGREGATES` (default `false`; aggregates plan/source arrays in a separate pass to avoid multiplying grouped rows when raw rows carry many array values)
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_STAGE_INDEX_CONCURRENCY` (default `4`; fan-out for independent main-stage index builds)
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_STAGE_INDEX_PROFILE` (default `all`; set `serving` to keep provider lookup, plan/network, taxonomy/procedure/medication, address-key, primary ZIP/city, and bounded geo serving indexes while skipping provenance/debug indexes and the broad standalone ZIP/GiST geo indexes)
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_POST_PUBLISH_INDEX_PROFILE` (default `none`; set `serving` with `STAGE_INDEX_PROFILE=none` to publish the row-complete table first, mark the import published, then warm the same serving indexes on the live table outside the critical publish path)
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_POST_PUBLISH_INDEX_CONCURRENCY` (default: `STAGE_INDEX_CONCURRENCY`; fan-out for the optional live-table post-publish index warmup)
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_POST_PUBLISH_INDEX_CONCURRENTLY` (default `true`; uses `CREATE INDEX CONCURRENTLY` for live-table warmup. Set `false` for the publish-swap/read-mostly serving table to build normal indexes in parallel; reads stay available, but writes to the published table are blocked while each index builds.)
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_DEFER_PUBLISH_VALIDATION` (default `false`; for full serving-only refreshes, publish after row-count and table constraints, then run the same deep integrity validation on the live table before final warmup success)
+
+When post-publish index warmup is enabled, use `metrics.published_elapsed_seconds`
+as the publish-time measurement. Successful post-publish validation and warmup
+updates preserve the original publish `finished_at`, so import-control duration
+also reflects the row-complete publish time while metrics retain the post-publish
+tail timings. A post-publish validation failure still marks the run failed at the
+failure time. Total worker wall time can still include live index warmup after
+the row-complete table has been published. `CREATE INDEX
+CONCURRENTLY` warmup is forced to run one index at a time because PostgreSQL can
+deadlock multiple concurrent index builds on the same table. For
+entity-address-unified full serving refreshes the published table is read-mostly,
+so dev uses non-concurrent warmup with parallelism to keep reads available while
+finishing the serving indexes much faster. Before each warmup build, the importer
+drops any invalid leftover index with the target name, so a canceled previous
+warmup does not make `IF NOT EXISTS` skip a missing serving index. During the
+publish-first window,
+`metrics.post_publish_index_pending=true` means the live row-complete table is
+published while serving indexes are still warming; the same status includes the
+planned `metrics.post_publish_index_total` and current
+`metrics.post_publish_index_completed`. After warmup,
+`metrics.post_publish_index_completed` should match
+`metrics.post_publish_index_total` and `metrics.post_publish_index_pending`
+should be `false`. Deferred validation keeps all integrity checks, but uses the
+valid primary key on `location_key` as catalog proof for non-null/uniqueness and
+runs independent archive, coordinate, practice, and fallback checks in parallel.
+
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_RAW_GROUP_INDEX_PROFILE` (default `group`; set `shard` for sharded inline-evidence full refreshes to index only `evidence_shard` before aggregation instead of the full grouping key)
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_SUPPORT_CONCURRENCY` (default `4`; fan-out for independent support-table inserts after the unified stage is built)
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_SUPPORT_INDEX_CONCURRENCY` (default `2`; fan-out for support-table index builds)
-- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_DEFER_ADDITIONAL_INDEXES`
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_BUILD_CODE_BRIDGES` (default `true`; set `false` for serving-focused rebuilds that do not need procedure/medication support bridge refresh)
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_BUILD_FACILITY_CANDIDATES` (default `true`; set `false` for serving-focused rebuilds that do not need facility-anchor candidate refresh)
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_SERVING_ONLY` (default `false`; for full refreshes, publish only the denormalized serving table and leave existing support/provenance tables unchanged)
+- `serving_only_refresh` import-control param / `--serving-only-refresh` CLI option (task-level override for `HLTHPRT_ENTITY_ADDRESS_UNIFIED_SERVING_ONLY`; used by the daily Provider Directory serving projection)
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_UNLOGGED_STAGE` (default `false`; dev-speed option for full rebuilds that builds the main stage table without WAL, trading crash durability for faster refreshes)
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_AGGREGATE_SOURCE_RECORD_IDS` (default `true`; set `false` for compacted serving refreshes to skip the expensive `source_record_ids` aggregation when final rows intentionally keep this array empty)
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_FINAL_SUMMARY_COUNTS` (default `true`; set `false` for full serving refreshes to use the exact aggregate INSERT rowcount for staged rows and skip the final detailed count scan)
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_KEEP_RAW_STAGE` (default `false`; experiment/retry aid that leaves the raw stage table in place for reuse; do not enable for normal scheduled refreshes)
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_DEFER_ADDITIONAL_INDEXES` (default `false`; when `true`, skips all non-primary-key stage indexes and records them as skipped; intended only for bounded proof runs)
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_REUSE_STAGE` (default `false`; retry only, resumes from an already-materialized stage table for the current import id)
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_WORK_MEM`
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_MAINTENANCE_WORK_MEM`

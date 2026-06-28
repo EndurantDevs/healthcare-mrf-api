@@ -12,6 +12,7 @@ pub struct CompactCopyRow<'a> {
     pub provider_count: i64,
     pub price_set_hash: &'a str,
     pub source_trace_set_hash: &'a str,
+    pub network_names: &'a [String],
 }
 
 pub struct ManifestServingCopyRow<'a> {
@@ -24,6 +25,7 @@ pub struct ManifestServingCopyRow<'a> {
     pub provider_count: i64,
     pub price_set_global_id_128: &'a str,
     pub source_trace_set_hash: &'a str,
+    pub network_names: &'a [String],
 }
 
 pub fn pg_text_copy_field(value: Option<&str>) -> String {
@@ -113,6 +115,7 @@ fn write_copy_text_fields<W: Write>(writer: &mut W, fields: &[Option<&str>]) -> 
 pub fn emit_compact_copy_row<W: Write>(writer: &mut W, row: &CompactCopyRow<'_>) -> io::Result<()> {
     let procedure_code_text = row.procedure_code.map(|value| value.to_string());
     let provider_count_text = row.provider_count.to_string();
+    let network_names_text = pg_text_array_field(row.network_names);
     write_copy_text_fields(
         writer,
         &[
@@ -127,6 +130,7 @@ pub fn emit_compact_copy_row<W: Write>(writer: &mut W, row: &CompactCopyRow<'_>)
             Some(&provider_count_text),
             Some(row.price_set_hash),
             Some(row.source_trace_set_hash),
+            Some(&network_names_text),
         ],
     )
 }
@@ -136,6 +140,7 @@ pub fn emit_manifest_serving_copy_row<W: Write>(
     row: &ManifestServingCopyRow<'_>,
 ) -> io::Result<()> {
     let provider_count_text = row.provider_count.to_string();
+    let network_names_text = pg_text_array_field(row.network_names);
     write_copy_text_fields(
         writer,
         &[
@@ -148,6 +153,7 @@ pub fn emit_manifest_serving_copy_row<W: Write>(
             Some(&provider_count_text),
             Some(row.price_set_global_id_128),
             Some(row.source_trace_set_hash),
+            Some(&network_names_text),
         ],
     )
 }
@@ -184,6 +190,7 @@ mod tests {
 
     #[test]
     fn compact_copy_rows_use_null_and_escaped_text_fields() {
+        let network_names = vec!["C2".to_string(), "PPO NDC".to_string()];
         let row = CompactCopyRow {
             serving_rate_id: "rate\t1",
             snapshot_id: "snap",
@@ -196,18 +203,20 @@ mod tests {
             provider_count: 2,
             price_set_hash: "price",
             source_trace_set_hash: "source",
+            network_names: &network_names,
         };
         let mut out = Vec::new();
         emit_compact_copy_row(&mut out, &row).unwrap();
 
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "rate\\t1\tsnap\tplan\tproc\t\\N\tRC\t0450\tprovider\t2\tprice\tsource\n"
+            "rate\\t1\tsnap\tplan\tproc\t\\N\tRC\t0450\tprovider\t2\tprice\tsource\t{\"C2\",\"PPO NDC\"}\n"
         );
     }
 
     #[test]
     fn manifest_serving_copy_rows_include_nullable_reported_code_fields() {
+        let network_names = vec!["C2".to_string()];
         let row = ManifestServingCopyRow {
             serving_content_hash_128: "serving",
             plan_id: "plan\t1",
@@ -218,6 +227,7 @@ mod tests {
             provider_count: 12,
             price_set_global_id_128: "price",
             source_trace_set_hash: "source\ntrace\0suffix",
+            network_names: &network_names,
         };
         let mut out = Vec::new();
 
@@ -225,7 +235,7 @@ mod tests {
 
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "serving\tplan\\t1\tCPT\t\\N\tprocedure\tprovider\t12\tprice\tsource\\ntracesuffix\n"
+            "serving\tplan\\t1\tCPT\t\\N\tprocedure\tprovider\t12\tprice\tsource\\ntracesuffix\t{\"C2\"}\n"
         );
     }
 }

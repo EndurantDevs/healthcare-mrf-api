@@ -13,7 +13,10 @@ from api.code_systems import canonical_catalog_code, normalize_code_system
 NUMERIC_PATTERN = re.compile(r"^-?\d+(\.\d+)?$")
 
 PTG2_ITEM_SOURCE_FIELDS = {
+    "snapshot_id",
+    "source_key",
     "source_trace",
+    "network_names",
 }
 PTG2_ITEM_DIAGNOSTIC_FIELDS = {
     "billing_code",

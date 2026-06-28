@@ -2351,6 +2351,7 @@ class PTG2ServingRateCompact(Base, JSONOutputMixin):
     provider_count = Column(Integer)
     price_set_hash = Column(String(64))
     source_trace_set_hash = Column(String(64))
+    network_names = Column(ARRAY(String))
     created_at = Column(DateTime)
 
 
@@ -4144,6 +4145,11 @@ class EntityAddressUnified(Base, JSONOutputMixin):
             "name": "primary_phone_digits_npi",
             "where": "type='primary'",
         },
+        {
+            "index_elements": ("telephone_number", "npi"),
+            "name": "primary_phone_npi",
+            "where": "type='primary' AND telephone_number IS NOT NULL AND telephone_number <> ''",
+        },
         {"index_elements": ("address_sources",), "using": "gin", "name": "address_sources"},
         {"index_elements": ("row_origin",), "name": "row_origin"},
         {"index_elements": ("address_precision",), "name": "address_precision"},
@@ -4158,9 +4164,20 @@ class EntityAddressUnified(Base, JSONOutputMixin):
             "index_elements": ("taxonomy_array gin__int_ops", "plans_network_array gin__int_ops"),
             "using": "gin",
             "name": "taxonomy_plans_network",
+            "where": "type='primary'",
         },
-        {"index_elements": ("procedures_array gin__int_ops",), "using": "gin", "name": "procedures_array"},
-        {"index_elements": ("medications_array gin__int_ops",), "using": "gin", "name": "medications_array"},
+        {
+            "index_elements": ("procedures_array gin__int_ops",),
+            "using": "gin",
+            "name": "procedures_array",
+            "where": "type='primary'",
+        },
+        {
+            "index_elements": ("medications_array gin__int_ops",),
+            "using": "gin",
+            "name": "medications_array",
+            "where": "type='primary'",
+        },
         {
             # Geo GiST index over every geocoded SERVICE location, not just the
             # NPPES primary/secondary -- so a radius search finds providers at their
@@ -4174,7 +4191,25 @@ class EntityAddressUnified(Base, JSONOutputMixin):
             "index_elements": ("Geography(ST_MakePoint((long)::double precision, (lat)::double precision))",),
             "using": "gist",
             "name": "geo_idx",
-            "where": "type IN ('primary', 'secondary', 'practice', 'site') AND COALESCE(address_precision, '') <> 'city_zip'",
+            "where": (
+                "type IN ('primary', 'secondary', 'practice', 'site') "
+                "AND COALESCE(address_precision, '') <> 'city_zip' "
+                "AND lat IS NOT NULL AND long IS NOT NULL"
+            ),
+        },
+        {
+            # Cheaper serving index for /npi/near/. The query applies a lat/long
+            # bounding box before exact ST_DWithin distance filtering, so this
+            # preserves exact results while avoiding the full GiST build on each
+            # serving-only refresh. The GiST geo_idx stays available in the full
+            # index profile for workloads that need expression-index radius scans.
+            "index_elements": ("lat", "long"),
+            "name": "geo_bbox",
+            "where": (
+                "type IN ('primary', 'secondary', 'practice', 'site') "
+                "AND COALESCE(address_precision, '') <> 'city_zip' "
+                "AND lat IS NOT NULL AND long IS NOT NULL"
+            ),
         },
         {"index_elements": ("address_key",), "name": "address_key"},
     ]

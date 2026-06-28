@@ -23,6 +23,7 @@ For the canonical source website registry, see [../data-sources.md](../data-sour
 | Drug claims | `python main.py start drug-claims` | `process.DrugClaims_finish` worker or `finish drug-claims` | Medicare Part D provider-drug imports |
 | Provider quality | `python main.py start provider-quality` | `process.ProviderQuality_finish` worker or `finish provider-quality` | Quality scoring inputs and provider benchmarks |
 | Provider enrichment | `python main.py start provider-enrichment` | `process.ProviderEnrichment` or `process.ProviderEnrichment_finish` | PECOS / Medicare enrollment sidecar import |
+| Provider Directory FHIR | `python main.py start provider-directory-fhir` | shutdown metrics in worker | payer Provider Directory FHIR source/capability/resource catalog import |
 | Part D formulary network | `python main.py start partd-formulary-network` | `process.PartDFormularyNetwork_finish` worker or `finish partd-formulary-network` | Medicare Part D pharmacy activity and medication cost data |
 | Pharmacy license | `python main.py start pharmacy-license` | `process.PharmacyLicense_finish` worker or `finish pharmacy-license` | State pharmacy board license normalization (direct connectors + machine-readable discovery) |
 | LODES workplace demand | `python main.py start lodes` | shutdown publish in worker | LEHD workplace demand by ZCTA with tract-to-ZIP crosswalk validation |
@@ -49,6 +50,7 @@ For the canonical source website registry, see [../data-sources.md](../data-sour
 - [Drug claims import](./drug-claims.md)
 - [Provider quality import](./provider-quality.md)
 - [Provider enrichment import](./provider-enrichment.md)
+- [Provider Directory FHIR import](./provider-directory-fhir.md)
 - [Part D formulary and pharmacy network import](./partd-formulary-network.md)
 - [Pharmacy license import](./pharmacy-license.md)
 - [LODES workplace demand import](./lodes.md)

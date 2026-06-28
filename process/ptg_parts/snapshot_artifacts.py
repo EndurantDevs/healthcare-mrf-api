@@ -306,6 +306,7 @@ async def build_ptg2_compact_snapshot_index_artifact(
                 SELECT COALESCE(
                     jsonb_agg(
                         jsonb_build_object(
+                            'source_file_version_id', st.source_file_version_id,
                             'url', st.original_url,
                             'canonical_url', st.canonical_url,
                             'statement', 'Published negotiated rate from Transparency in Coverage source file.'
@@ -315,7 +316,7 @@ async def build_ptg2_compact_snapshot_index_artifact(
                     '[]'::jsonb
                 ) AS source_trace
                 FROM {schema}.ptg2_source_trace_set sts
-                JOIN LATERAL jsonb_array_elements_text(COALESCE(sts.canonical_payload::jsonb->'source_trace_hashes', '[]'::jsonb)) AS sth(source_trace_hash) ON true
+                JOIN LATERAL unnest(COALESCE(sts.source_trace_hashes, ARRAY[]::varchar[])) AS sth(source_trace_hash) ON true
                 JOIN {schema}.ptg2_source_trace st ON st.source_trace_hash = sth.source_trace_hash
                 WHERE sts.source_trace_set_hash = rp.source_trace_set_hash
             ) traces ON true

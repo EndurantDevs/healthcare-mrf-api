@@ -286,6 +286,7 @@ impl<'a> ProviderEntryView<'a> {
 struct RateLite {
     provider_refs: Vec<String>,
     provider_groups: Vec<Value>,
+    network_names: Vec<String>,
     prices: Vec<PriceLite>,
 }
 
@@ -2431,7 +2432,7 @@ impl DictionaryCopySinks {
     }
 }
 
-type ParsedCompactRate = (PriceSetLite, i64, Vec<i64>, Vec<i64>, i64);
+type ParsedCompactRate = (PriceSetLite, i64, Vec<i64>, Vec<i64>, i64, Vec<String>);
 type ProviderEntryComponents = BTreeMap<i64, Vec<i64>>;
 
 struct GroupedPriceSet {
@@ -2440,6 +2441,7 @@ struct GroupedPriceSet {
     provider_group_hashes: HashSet<i64>,
     provider_npis: HashSet<i64>,
     provider_count: i64,
+    network_names: HashSet<String>,
     provider_entry_components: ProviderEntryComponents,
 }
 
@@ -2450,6 +2452,7 @@ impl
         HashSet<i64>,
         HashSet<i64>,
         i64,
+        HashSet<String>,
         ProviderEntryComponents,
     )> for GroupedPriceSet
 {
@@ -2460,6 +2463,7 @@ impl
             HashSet<i64>,
             HashSet<i64>,
             i64,
+            HashSet<String>,
             ProviderEntryComponents,
         ),
     ) -> Self {
@@ -2469,7 +2473,8 @@ impl
             provider_group_hashes: value.2,
             provider_npis: value.3,
             provider_count: value.4,
-            provider_entry_components: value.5,
+            network_names: value.5,
+            provider_entry_components: value.6,
         }
     }
 }
@@ -2582,6 +2587,7 @@ fn process_compact_rate_lites<W: Write>(
             provider_entry.provider_group_hashes,
             provider_entry.npi,
             provider_entry.provider_count,
+            rate.network_names.clone(),
         ));
     }
 
@@ -2595,6 +2601,7 @@ fn process_compact_rate_lites<W: Write>(
             provider_group_hashes,
             provider_npis,
             provider_count,
+            network_names,
         ) in parsed_rates
         {
             let group = by_price_set
@@ -2605,8 +2612,12 @@ fn process_compact_rate_lites<W: Write>(
                     provider_group_hashes: HashSet::new(),
                     provider_npis: HashSet::new(),
                     provider_count: 0,
+                    network_names: HashSet::new(),
                     provider_entry_components: BTreeMap::new(),
                 });
+            for network_name in network_names {
+                group.network_names.insert(network_name);
+            }
             if group.provider_entry_hashes.insert(provider_entry_hash) {
                 let mut sorted_components = provider_group_hashes;
                 sorted_components.sort_unstable();
@@ -2645,6 +2656,7 @@ fn process_compact_rate_lites<W: Write>(
                     mut provider_group_hashes,
                     provider_npis,
                     provider_count,
+                    network_names,
                 )| {
                     provider_group_hashes.sort_unstable();
                     provider_group_hashes.dedup();
@@ -2666,6 +2678,7 @@ fn process_compact_rate_lites<W: Write>(
                         provider_group_hashes: provider_group_hashes_set,
                         provider_npis,
                         provider_count,
+                        network_names: network_names.into_iter().collect(),
                         provider_entry_components,
                     }
                 },
@@ -2682,6 +2695,8 @@ fn process_compact_rate_lites<W: Write>(
         sorted_provider_hashes.sort_unstable();
         let mut sorted_provider_npis: Vec<i64> = group.provider_npis.into_iter().collect();
         sorted_provider_npis.sort_unstable();
+        let mut network_names: Vec<String> = group.network_names.into_iter().collect();
+        network_names.sort_unstable();
         let provider_set_hash = hash_i64_list("provider_set", &sorted_provider_entry_hashes);
         let rate_pack_hash = hash_text(
             "serving_rate_pack",
@@ -2804,6 +2819,7 @@ fn process_compact_rate_lites<W: Write>(
                 provider_count: group.provider_count,
                 price_set_hash: &price_set_hash,
                 source_trace_set_hash: &context.source_trace_set_hash,
+                network_names: &network_names,
             })?;
         } else {
             emit_json_record(
@@ -2825,6 +2841,7 @@ fn process_compact_rate_lites<W: Write>(
                     "provider_count": group.provider_count,
                     "price_set_hash": price_set_hash,
                     "source_trace_set_hash": context.source_trace_set_hash.clone(),
+                    "network_names": network_names,
                     "confidence_code": context.confidence_code.clone(),
                 }),
             )?;
@@ -2843,6 +2860,7 @@ fn process_compact_rate_lites<W: Write>(
                 provider_count: group.provider_count,
                 price_set_global_id_128: &identity.price_set_global_id_128,
                 source_trace_set_hash: &context.source_trace_set_hash,
+                network_names: &network_names,
             })?;
         }
     }
@@ -3259,6 +3277,7 @@ fn process_compact_rate_lites_worker<W: Write>(
                         provider_count,
                         price_set_hash: &price_set_hash,
                         source_trace_set_hash: &context.source_trace_set_hash,
+                        network_names: &rate.network_names,
                     })?;
                 } else {
                     emit_json_record(
@@ -3280,6 +3299,7 @@ fn process_compact_rate_lites_worker<W: Write>(
                             "provider_count": provider_count,
                             "price_set_hash": price_set_hash,
                             "source_trace_set_hash": context.source_trace_set_hash.clone(),
+                            "network_names": rate.network_names.clone(),
                             "confidence_code": context.confidence_code.clone(),
                         }),
                     )?;
@@ -3298,6 +3318,7 @@ fn process_compact_rate_lites_worker<W: Write>(
                         provider_count,
                         price_set_global_id_128: &identity.price_set_global_id_128,
                         source_trace_set_hash: &context.source_trace_set_hash,
+                        network_names: &rate.network_names,
                     })?;
                 }
             }
@@ -3316,6 +3337,7 @@ fn process_compact_rate_lites_worker<W: Write>(
                 provider_entry.provider_group_hashes,
                 provider_entry.npi,
                 provider_entry.provider_count,
+                rate.network_names.clone(),
             ))
         })
         .collect();
@@ -3328,6 +3350,7 @@ fn process_compact_rate_lites_worker<W: Write>(
             provider_group_hashes,
             provider_npis,
             provider_count,
+            network_names,
         ) in parsed_rates
         {
             let group = by_price_set
@@ -3338,8 +3361,12 @@ fn process_compact_rate_lites_worker<W: Write>(
                     provider_group_hashes: HashSet::new(),
                     provider_npis: HashSet::new(),
                     provider_count: 0,
+                    network_names: HashSet::new(),
                     provider_entry_components: BTreeMap::new(),
                 });
+            for network_name in network_names {
+                group.network_names.insert(network_name);
+            }
             if group.provider_entry_hashes.insert(provider_entry_hash) {
                 let mut sorted_components = provider_group_hashes;
                 sorted_components.sort_unstable();
@@ -3378,6 +3405,7 @@ fn process_compact_rate_lites_worker<W: Write>(
                     mut provider_group_hashes,
                     provider_npis,
                     provider_count,
+                    network_names,
                 )| {
                     provider_group_hashes.sort_unstable();
                     provider_group_hashes.dedup();
@@ -3399,6 +3427,7 @@ fn process_compact_rate_lites_worker<W: Write>(
                         provider_group_hashes: provider_group_hashes_set,
                         provider_npis,
                         provider_count,
+                        network_names: network_names.into_iter().collect(),
                         provider_entry_components,
                     }
                 },
@@ -3415,6 +3444,8 @@ fn process_compact_rate_lites_worker<W: Write>(
         sorted_provider_hashes.sort_unstable();
         let mut sorted_provider_npis: Vec<i64> = group.provider_npis.into_iter().collect();
         sorted_provider_npis.sort_unstable();
+        let mut network_names: Vec<String> = group.network_names.into_iter().collect();
+        network_names.sort_unstable();
         let provider_set_hash = hash_i64_list("provider_set", &sorted_provider_entry_hashes);
         let rate_pack_hash = hash_text(
             "serving_rate_pack",
@@ -3534,6 +3565,7 @@ fn process_compact_rate_lites_worker<W: Write>(
                     provider_count: group.provider_count,
                     price_set_hash: &price_set_hash,
                     source_trace_set_hash: &context.source_trace_set_hash,
+                    network_names: &network_names,
                 })?;
             } else {
                 emit_json_record(
@@ -3555,6 +3587,7 @@ fn process_compact_rate_lites_worker<W: Write>(
                         "provider_count": group.provider_count,
                         "price_set_hash": price_set_hash,
                         "source_trace_set_hash": context.source_trace_set_hash.clone(),
+                        "network_names": network_names,
                         "confidence_code": context.confidence_code.clone(),
                     }),
                 )?;
@@ -3573,6 +3606,7 @@ fn process_compact_rate_lites_worker<W: Write>(
                     provider_count: group.provider_count,
                     price_set_global_id_128: &identity.price_set_global_id_128,
                     source_trace_set_hash: &context.source_trace_set_hash,
+                    network_names: &network_names,
                 })?;
             }
         }
@@ -3585,6 +3619,7 @@ fn read_rate_lite_struson<R: Read>(
 ) -> io::Result<Option<RateLite>> {
     let mut provider_refs: Vec<String> = Vec::new();
     let mut provider_groups: Vec<Value> = Vec::new();
+    let mut network_names: Vec<String> = Vec::new();
     let mut prices: Vec<PriceLite> = Vec::new();
     json_reader.begin_object().map_err(to_io_error)?;
     while json_reader.has_next().map_err(to_io_error)? {
@@ -3592,6 +3627,7 @@ fn read_rate_lite_struson<R: Read>(
             "provider_groups" => 1,
             "provider_references" => 2,
             "negotiated_prices" => 3,
+            "network_name" | "network_names" => 4,
             _ => 0,
         };
         match field {
@@ -3621,6 +3657,9 @@ fn read_rate_lite_struson<R: Read>(
                 }
                 json_reader.end_array().map_err(to_io_error)?;
             }
+            4 => {
+                network_names.extend(normalized_string_list_from_reader(json_reader)?);
+            }
             _ => {
                 json_reader.skip_value().map_err(to_io_error)?;
             }
@@ -3633,6 +3672,7 @@ fn read_rate_lite_struson<R: Read>(
     Ok(Some(RateLite {
         provider_refs,
         provider_groups,
+        network_names: canonical_text_list(network_names, false),
         prices,
     }))
 }

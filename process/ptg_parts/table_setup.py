@@ -166,6 +166,20 @@ async def _ensure_ptg2_serving_rate_columns(db_schema: str) -> None:
             logger.debug("Skipping ptg2_serving_rate column %s ensure: %s", column_name, exc)
 
 
+async def _ensure_ptg2_serving_rate_compact_columns(db_schema: str) -> None:
+    column_specs = {
+        "network_names": "varchar[]",
+    }
+    for column_name, column_type in column_specs.items():
+        try:
+            await db.status(
+                f"ALTER TABLE {db_schema}.ptg2_serving_rate_compact "
+                f"ADD COLUMN IF NOT EXISTS {column_name} {column_type};"
+            )
+        except Exception as exc:
+            logger.debug("Skipping ptg2_serving_rate_compact column %s ensure: %s", column_name, exc)
+
+
 async def _ensure_ptg2_provider_set_columns(db_schema: str) -> None:
     for column_name in ("hash_prefix", "npi", "provider_group_hashes", "tin_type", "tin_value", "canonical_payload"):
         try:
@@ -366,6 +380,8 @@ async def ensure_ptg2_tables() -> None:
             raise RuntimeError(f"PTG2 create table {db_schema}.{cls.__tablename__} failed: {exc}") from exc
         if cls is PTG2ServingRate:
             await _ensure_ptg2_serving_rate_columns(db_schema)
+        if cls is PTG2ServingRateCompact:
+            await _ensure_ptg2_serving_rate_compact_columns(db_schema)
         if cls is PTG2PriceSet:
             await _ensure_ptg2_price_set_columns(db_schema)
         if cls is PTG2ProviderSet:

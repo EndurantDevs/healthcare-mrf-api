@@ -1047,6 +1047,14 @@ def test_entity_address_unified_defaults_to_production_sized_publish_gate():
     assert entity_address_unified.DEFAULT_COMPACT_SOURCE_RECORD_IDS is True
 
 
+def test_entity_address_unified_inline_source_evidence_guard_defaults_off(monkeypatch):
+    monkeypatch.delenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_REQUIRE_INLINE_SOURCE_EVIDENCE", raising=False)
+    assert entity_address_unified._require_inline_source_evidence() is False  # pylint: disable=protected-access
+
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_REQUIRE_INLINE_SOURCE_EVIDENCE", "true")
+    assert entity_address_unified._require_inline_source_evidence() is True  # pylint: disable=protected-access
+
+
 def test_entity_address_unified_publish_decision_defaults_to_stage_only_for_test(monkeypatch):
     monkeypatch.delenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_PUBLISH", raising=False)
     monkeypatch.delenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_SKIP_PUBLISH", raising=False)
@@ -1462,6 +1470,15 @@ def test_entity_address_unified_sql_carries_address_key(monkeypatch):
     assert "lat = COALESCE(k.archive_lat, r.lat)" in enrich_sql
     assert "long = COALESCE(k.archive_long, r.long)" in enrich_sql
     assert "place_id = COALESCE(k.archive_place_id, r.place_id)" in enrich_sql
+    assert "evidence_shard =" not in enrich_sql
+    sharded_enrich_sql = entity_address_unified._enrich_raw_stage_sql(
+        "mrf",
+        "entity_address_unified_raw",
+        evidence_shards=24,
+    )
+    assert "evidence_shard =" in sharded_enrich_sql
+    assert "COALESCE(k.entity_type" in sharded_enrich_sql
+    assert "% 24) + 24) % 24)::int" in sharded_enrich_sql
     assert "location_key = encode(sha256(convert_to" in enrich_sql
     assert "address_key::uuid AS address_key" in insert_sql
     assert "ptg_plan_array," in insert_sql
@@ -1505,6 +1522,135 @@ def test_entity_address_unified_sql_carries_address_key(monkeypatch):
     )
     assert "entity_address_unified_raw_idx_group_key" in unsharded_index_sql
     assert "idx_aggregate_shard_group" not in unsharded_index_sql
+
+
+def test_entity_address_unified_can_inline_source_evidence():
+    inline_sql = entity_address_unified._materialize_from_raw_sql(
+        "mrf",
+        "entity_address_unified_stage",
+        "entity_address_unified_raw",
+        inline_source_evidence=True,
+    )
+
+    assert "evidence AS (" in inline_sql
+    assert "FROM aggregated AS agg" in inline_sql
+    assert "COALESCE(e.evidence_sources, address_sources" in inline_sql
+    assert "COALESCE(e.evidence_record_ids, source_record_ids" in inline_sql
+    assert "LEFT JOIN evidence e" in inline_sql
+
+
+def test_entity_address_unified_can_skip_source_record_id_aggregation(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_AGGREGATE_SOURCE_RECORD_IDS", "0")
+
+    raw_sql = entity_address_unified._materialize_from_raw_sql(
+        "mrf",
+        "entity_address_unified_stage",
+        "entity_address_unified_raw",
+        inline_source_evidence=True,
+    )
+    direct_sql = entity_address_unified._materialize_sql(
+        "mrf",
+        "entity_address_unified_stage",
+        [
+            """
+            SELECT 'npi'::varchar AS entity_type, '1'::varchar AS entity_id, 1::bigint AS npi,
+                   NULL::bigint AS inferred_npi, NULL::float8 AS inference_confidence,
+                   NULL::varchar AS inference_method, NULL::varchar AS entity_name,
+                   NULL::varchar AS entity_subtype, 'primary'::varchar AS type,
+                   ARRAY[0]::int[] AS taxonomy_array, ARRAY[0]::int[] AS plans_network_array,
+                   ARRAY[0]::int[] AS procedures_array, ARRAY[0]::int[] AS medications_array,
+                   '1 Main St'::varchar AS first_line, NULL::varchar AS second_line,
+                   'Austin'::varchar AS city_name, 'TX'::varchar AS state_name,
+                   '78701'::varchar AS postal_code, 'US'::varchar AS country_code,
+                   NULL::varchar AS telephone_number, NULL::varchar AS fax_number,
+                   NULL::varchar AS formatted_address, NULL::numeric AS lat, NULL::numeric AS long,
+                   NULL::date AS date_added, NULL::varchar AS place_id, NULL::uuid AS address_key,
+                   NOW()::timestamp AS updated_at,
+                   'nppes'::varchar AS address_source, 'nppes:1'::varchar AS source_record_id
+            """
+        ],
+    )
+
+    assert "ARRAY[]::varchar[] AS source_record_ids" in raw_sql
+    assert "ARRAY[]::varchar[] AS source_record_ids" in direct_sql
+    assert "ARRAY_AGG(DISTINCT source_record_id ORDER BY source_record_id)" not in raw_sql
+    assert "ARRAY_AGG(DISTINCT source_record_id ORDER BY source_record_id)" not in direct_sql
+    assert "COALESCE(e.evidence_record_ids, source_record_ids" in raw_sql
+
+
+def test_entity_address_unified_can_split_array_aggregates(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_SPLIT_ARRAY_AGGREGATES", "1")
+
+    split_sql = entity_address_unified._materialize_from_raw_sql(
+        "mrf",
+        "entity_address_unified_stage",
+        "entity_address_unified_raw",
+    )
+    split_inline_sql = entity_address_unified._materialize_from_raw_sql(
+        "mrf",
+        "entity_address_unified_stage",
+        "entity_address_unified_raw",
+        inline_source_evidence=True,
+    )
+    split_sharded_inline_sql = entity_address_unified._materialize_from_raw_sql(
+        "mrf",
+        "entity_address_unified_stage",
+        "entity_address_unified_raw",
+        checksum_modulo=24,
+        checksum_remainder=7,
+        inline_source_evidence=True,
+    )
+
+    assert "array_aggregates AS (" in split_sql
+    assert "CROSS JOIN LATERAL" in split_sql
+    assert "array_value.kind = 'ptg_source'" in split_sql
+    assert "COALESCE(CARDINALITY(ptg_source_array), 0) > 0" in split_sql
+    assert "LEFT JOIN LATERAL unnest(COALESCE(ptg_source_array" not in split_sql
+    assert "arr.aggregate_key IS NOT DISTINCT FROM aggregated.location_key" in split_sql
+    assert "LEFT JOIN array_aggregates arr" in split_sql
+    assert "FROM aggregated\n      LEFT JOIN array_aggregates arr" in split_sql
+    assert "LEFT JOIN evidence e" in split_inline_sql
+    assert "LEFT JOIN array_aggregates arr" in split_inline_sql
+    assert split_inline_sql.rfind("LEFT JOIN evidence e") < split_inline_sql.rfind(
+        "LEFT JOIN array_aggregates arr"
+    )
+    assert "WHERE evidence_shard = 7 AND (" in split_sharded_inline_sql
+    assert "COALESCE(CARDINALITY(group_plan_array), 0) > 0" in split_sharded_inline_sql
+
+
+def test_entity_address_unified_inline_source_evidence_shards_by_evidence_group(monkeypatch):
+    sharded_sql = entity_address_unified._materialize_from_raw_sql(
+        "mrf",
+        "entity_address_unified_stage",
+        "entity_address_unified_raw",
+        checksum_modulo=24,
+        checksum_remainder=7,
+        inline_source_evidence=True,
+    )
+    sharded_index_sql = entity_address_unified._raw_aggregate_group_index_sql(
+        "mrf",
+        "entity_address_unified_raw",
+        aggregate_shards=24,
+        inline_source_evidence=True,
+    )
+
+    assert "WHERE evidence_shard = 7" in sharded_sql
+    assert "hashtext(location_key)" not in sharded_sql
+    assert "entity_address_unified_raw_idx_evidence_shard_group" in sharded_index_sql
+    assert "((evidence_shard), entity_type, entity_id, type, location_key)" in sharded_index_sql
+    assert "entity_type, entity_id, type, location_key" in sharded_index_sql
+
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_RAW_GROUP_INDEX_PROFILE", "shard")
+    shard_only_index_sql = entity_address_unified._raw_aggregate_group_index_sql(
+        "mrf",
+        "entity_address_unified_raw",
+        aggregate_shards=24,
+        inline_source_evidence=True,
+    )
+    assert "entity_address_unified_raw_idx_evidence_shard" in shard_only_index_sql
+    assert "CREATE INDEX IF NOT EXISTS" in shard_only_index_sql
+    assert "ON mrf.entity_address_unified_raw (evidence_shard)" in shard_only_index_sql
+    assert "entity_type, entity_id, type, location_key" not in shard_only_index_sql
 
 
 def test_entity_address_unified_raw_enrichment_can_skip_archive():
@@ -1583,8 +1729,12 @@ async def test_entity_address_unified_sql_phase_uses_scoped_bulk_settings(monkey
         "SET LOCAL jit = 'off';",
     ]
     assert statements[-1] == "UPDATE mrf.entity_address_unified_raw SET address_key = address_key;"
-    assert context["phase_timings"]["entity-address-unified test phase"]["count"] == 1
-    assert context["phase_timings"]["entity-address-unified test phase"]["rows"] == 7
+    timing = context["phase_timings"]["entity-address-unified test phase"]
+    assert timing["count"] == 1
+    assert timing["rows"] == 7
+    assert timing["first_started_at"] is not None
+    assert timing["last_finished_at"] is not None
+    assert timing["wall_seconds"] >= 0
     assert events[0]["source"] == "entity-address-unified-sql-progress"
     assert events[-1]["message"].startswith("test phase: 7 row(s),")
 
@@ -2105,6 +2255,55 @@ def test_entity_address_unified_support_statements_shard_code_bridges(monkeypatc
     assert "= 1" in medication_statements[1].statement
 
 
+def test_entity_address_unified_support_statements_can_skip_optional_serving_tables(
+    monkeypatch,
+):
+    def stage(name):
+        return type(f"Stage_{name}", (), {"__tablename__": name})
+
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_BUILD_CODE_BRIDGES", "0")
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_BUILD_FACILITY_CANDIDATES", "0")
+
+    statements = entity_address_unified._support_stage_statements(  # pylint: disable=protected-access
+        "mrf",
+        "entity_address_unified_20260614",
+        {
+            entity_address_unified.EntityAddressEvidence: stage("entity_address_evidence_20260614"),
+            entity_address_unified.EntityAddressPlanBridge: stage(
+                "entity_address_plan_bridge_20260614"
+            ),
+            entity_address_unified.EntityAddressPTGBridge: stage(
+                "entity_address_ptg_bridge_20260614"
+            ),
+            entity_address_unified.EntityAddressProcedureBridge: stage(
+                "entity_address_procedure_bridge_20260614"
+            ),
+            entity_address_unified.EntityAddressMedicationBridge: stage(
+                "entity_address_medication_bridge_20260614"
+            ),
+            entity_address_unified.FacilityAnchorNPICandidate: stage(
+                "facility_anchor_npi_candidate_20260614"
+            ),
+        },
+        source_run_id="run_1",
+        node_id=None,
+        build_network_bridge=False,
+        available={
+            "facility_anchor": True,
+            "facility_anchor.medicare_ccn": True,
+        },
+    )
+
+    labels = [item.label for item in statements]
+
+    assert "evidence" in labels
+    assert "plan bridge" in labels
+    assert "ptg bridge" in labels
+    assert not any(label.startswith("procedure bridge") for label in labels)
+    assert not any(label.startswith("medication bridge") for label in labels)
+    assert not any(label.startswith("facility anchor npi candidate") for label in labels)
+
+
 def test_entity_address_unified_evidence_stage_updates_by_location_key():
     evidence_table = entity_address_unified._evidence_stage_table_name("entity_address_unified_stage")
     prepare_sql = entity_address_unified._prepare_multi_source_evidence_table_sql(
@@ -2586,6 +2785,286 @@ async def test_entity_address_unified_support_code_location_indexes_can_be_enabl
     assert any("idx_code_location" in statement for statement in statements)
 
 
+@pytest.mark.asyncio
+async def test_entity_address_unified_serving_stage_index_profile_skips_debug_indexes(monkeypatch):
+    statements = []
+    context = {}
+
+    class FakeDB:
+        async def status(self, statement):
+            statements.append(statement)
+
+    class FakeStage:
+        __tablename__ = "entity_address_unified_20260614"
+        __main_table__ = "entity_address_unified"
+        __my_additional_indexes__ = [
+            {"index_elements": ("npi",), "name": "npi"},
+            {"index_elements": ("inferred_npi",), "name": "inferred_npi"},
+            {"index_elements": ("entity_type", "coalesce(npi, inferred_npi)"), "name": "entity_type_coalesced_npi"},
+            {
+                "index_elements": (
+                    "regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g')",
+                    "npi",
+                ),
+                "name": "primary_phone_digits_npi",
+                "where": "type='primary'",
+            },
+            {
+                "index_elements": ("telephone_number", "npi"),
+                "name": "primary_phone_npi",
+                "where": "type='primary' AND telephone_number IS NOT NULL AND telephone_number <> ''",
+            },
+            {"index_elements": ("row_origin",), "name": "row_origin"},
+            {"index_elements": ("zip5",), "name": "zip5"},
+            {"index_elements": ("ptg_plan_array",), "using": "gin", "name": "ptg_plan_array"},
+            {"index_elements": ("procedures_array gin__int_ops",), "using": "gin", "name": "procedures_array"},
+            {
+                "index_elements": ("Geography(ST_MakePoint((long)::double precision, (lat)::double precision))",),
+                "using": "gist",
+                "name": "geo_idx",
+                "where": "lat IS NOT NULL AND long IS NOT NULL",
+            },
+            {
+                "index_elements": ("lat", "long"),
+                "name": "geo_bbox",
+                "where": "lat IS NOT NULL AND long IS NOT NULL",
+            },
+        ]
+
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_STAGE_INDEX_PROFILE", "serving")
+    monkeypatch.setattr(entity_address_unified, "db", FakeDB())
+
+    await entity_address_unified._create_stage_indexes(FakeStage, "mrf", context=context)
+
+    joined = "\n".join(statements)
+    assert context["stage_index_profile"] == "serving"
+    assert "idx_npi" in joined
+    assert "idx_procedures_array" in joined
+    assert "idx_geo_bbox" in joined
+    assert "idx_primary_phone_npi" in joined
+    assert "idx_primary_phone_digits_npi" not in joined
+    assert "idx_geo_idx" not in joined
+    assert "idx_inferred_npi" not in joined
+    assert "idx_entity_type_coalesced_npi" not in joined
+    assert "idx_row_origin" not in joined
+    assert "idx_zip5" not in joined
+    assert "idx_ptg_plan_array" not in joined
+    assert "entity_address_unified_20260614.inferred_npi" in context["skipped_stage_indexes"]
+    assert "entity_address_unified_20260614.entity_type_coalesced_npi" in context["skipped_stage_indexes"]
+    assert "entity_address_unified_20260614.primary_phone_digits_npi" in context["skipped_stage_indexes"]
+    assert "entity_address_unified_20260614.geo_idx" in context["skipped_stage_indexes"]
+    assert "entity_address_unified_20260614.row_origin" in context["skipped_stage_indexes"]
+    assert "entity_address_unified_20260614.zip5" in context["skipped_stage_indexes"]
+    assert "entity_address_unified_20260614.ptg_plan_array" in context["skipped_stage_indexes"]
+
+
+@pytest.mark.asyncio
+async def test_entity_address_unified_can_defer_all_additional_stage_indexes(monkeypatch):
+    statements = []
+    context = {}
+
+    class FakeDB:
+        async def status(self, statement):
+            statements.append(statement)
+
+    class FakeStage:
+        __tablename__ = "entity_address_unified_20260614"
+        __main_table__ = "entity_address_unified"
+        __my_additional_indexes__ = [
+            {"index_elements": ("npi",), "name": "npi"},
+            {"index_elements": ("address_key",), "name": "address_key"},
+        ]
+
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_DEFER_ADDITIONAL_INDEXES", "1")
+    monkeypatch.setattr(entity_address_unified, "db", FakeDB())
+
+    await entity_address_unified._create_stage_indexes(FakeStage, "mrf", context=context)
+
+    assert statements == []
+    assert context["stage_index_profile"] == "none"
+    assert context["skipped_stage_indexes"] == [
+        "entity_address_unified_20260614.npi",
+        "entity_address_unified_20260614.address_key",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_entity_address_unified_post_publish_serving_indexes_use_live_table(monkeypatch):
+    statements = []
+    context = {}
+
+    class FakeDB:
+        async def scalar(self, _statement):
+            return None
+
+        async def execute_ddl(self, statement):
+            statements.append(statement)
+
+        async def status(self, statement):
+            raise AssertionError(f"post-publish concurrent indexes should use execute_ddl: {statement}")
+
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_POST_PUBLISH_INDEX_PROFILE", "serving")
+    monkeypatch.setattr(entity_address_unified, "db", FakeDB())
+
+    await entity_address_unified._create_post_publish_indexes("mrf", context=context)
+
+    joined = "\n".join(statements)
+    assert context["post_publish_index_profile"] == "serving"
+    assert context["post_publish_index_concurrently"] is True
+    assert "CREATE INDEX CONCURRENTLY IF NOT EXISTS entity_address_unified_idx_npi" in joined
+    assert "ON mrf.entity_address_unified (npi)" in joined
+    assert "entity_address_unified_idx_geo_bbox" in joined
+    assert "entity_address_unified_idx_primary_phone_npi" in joined
+    assert "entity_address_unified_idx_geo_idx" not in joined
+    assert "entity_address_unified.geo_idx" in context["post_publish_skipped_indexes"]
+    assert "entity_address_unified.zip5" in context["post_publish_skipped_indexes"]
+    assert context["post_publish_index_concurrency"] == 1
+    assert context["post_publish_index_total"] == len(statements)
+    assert context["post_publish_index_completed"] == len(statements)
+    assert context["post_publish_index_pending"] is False
+    assert len(context["post_publish_index_timings"]) == len(statements)
+
+
+@pytest.mark.asyncio
+async def test_entity_address_unified_post_publish_non_concurrent_indexes_can_fan_out(monkeypatch):
+    statements = []
+    context = {}
+
+    class FakeDB:
+        async def scalar(self, _statement):
+            return None
+
+        async def execute_ddl(self, statement):
+            raise AssertionError(f"non-concurrent indexes should use status: {statement}")
+
+        async def status(self, statement):
+            statements.append(statement)
+            return "CREATE INDEX"
+
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_POST_PUBLISH_INDEX_PROFILE", "serving")
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_POST_PUBLISH_INDEX_CONCURRENTLY", "false")
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_POST_PUBLISH_INDEX_CONCURRENCY", "6")
+    monkeypatch.setattr(entity_address_unified, "db", FakeDB())
+
+    await entity_address_unified._create_post_publish_indexes("mrf", context=context)
+
+    joined = "\n".join(statements)
+    assert context["post_publish_index_profile"] == "serving"
+    assert context["post_publish_index_concurrently"] is False
+    assert context["post_publish_index_concurrency"] == 6
+    assert "CREATE INDEX IF NOT EXISTS entity_address_unified_idx_npi" in joined
+    assert "CREATE INDEX CONCURRENTLY" not in joined
+    assert context["post_publish_index_total"] == len(statements)
+    assert context["post_publish_index_completed"] == len(statements)
+    assert context["post_publish_index_pending"] is False
+
+
+@pytest.mark.asyncio
+async def test_entity_address_unified_post_publish_drops_invalid_index_before_retry(monkeypatch):
+    statements = []
+    invalid_checks = []
+
+    class FakeDB:
+        async def scalar(self, statement):
+            invalid_checks.append(statement)
+            return 1 if len(invalid_checks) == 1 else None
+
+        async def execute_ddl(self, statement):
+            statements.append(statement)
+
+        async def status(self, statement):
+            raise AssertionError(f"post-publish concurrent indexes should use execute_ddl: {statement}")
+
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_POST_PUBLISH_INDEX_PROFILE", "serving")
+    monkeypatch.setattr(entity_address_unified, "db", FakeDB())
+    monkeypatch.setattr(
+        entity_address_unified.EntityAddressUnified,
+        "__my_additional_indexes__",
+        [{"index_elements": ("npi",), "name": "npi"}],
+    )
+
+    context = {}
+    await entity_address_unified._create_post_publish_indexes("mrf", context=context)
+
+    assert statements[0] == "DROP INDEX CONCURRENTLY IF EXISTS mrf.entity_address_unified_idx_npi;"
+    assert statements[1].startswith("CREATE INDEX CONCURRENTLY IF NOT EXISTS entity_address_unified_idx_npi")
+    assert "ix.indisvalid IS FALSE" in invalid_checks[0]
+    assert context["post_publish_index_total"] == 1
+    assert context["post_publish_index_completed"] == 1
+    assert context["post_publish_index_pending"] is False
+    assert context["post_publish_index_timings"][0]["index"] == "npi"
+
+
+@pytest.mark.asyncio
+async def test_entity_address_unified_stage_summary_counts_use_single_scan(monkeypatch):
+    statements = []
+
+    class FakeDB:
+        async def all(self, statement):
+            statements.append(statement)
+            return [
+                {
+                    "staged_rows": 10,
+                    "npi_rows": 7,
+                    "inferred_rows": 2,
+                    "multi_source_rows": 3,
+                }
+            ]
+
+    monkeypatch.setattr(entity_address_unified, "db", FakeDB())
+
+    counts = await entity_address_unified._stage_summary_counts(  # pylint: disable=protected-access
+        "mrf",
+        "entity_address_unified_20260614",
+    )
+
+    assert counts == {
+        "staged_rows": 10,
+        "npi_rows": 7,
+        "inferred_rows": 2,
+        "multi_source_rows": 3,
+    }
+    assert len(statements) == 1
+    joined = " ".join(statements[0].split())
+    assert "COUNT(*)::bigint AS staged_rows" in joined
+    assert "COUNT(*) FILTER (WHERE entity_type = 'npi')::bigint AS npi_rows" in joined
+    assert "COUNT(*) FILTER (WHERE inferred_npi IS NOT NULL)::bigint AS inferred_rows" in joined
+    assert "COUNT(*) FILTER (WHERE multi_source_confirmed IS TRUE)::bigint AS multi_source_rows" in joined
+
+
+def test_entity_address_unified_phase_timing_rows_reads_insert_rowcount():
+    context = {
+        "phase_timings": {
+            "entity-address-unified aggregating": {
+                "rows": 35553296,
+            },
+        },
+    }
+
+    assert (
+        entity_address_unified._phase_timing_rows(  # pylint: disable=protected-access
+            context,
+            "entity-address-unified aggregating",
+        )
+        == 35553296
+    )
+    assert entity_address_unified._phase_timing_rows(context, "missing") == 0  # pylint: disable=protected-access
+
+
+def test_entity_address_unified_final_summary_counts_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_FINAL_SUMMARY_COUNTS", "false")
+
+    assert entity_address_unified._final_summary_counts() is False  # pylint: disable=protected-access
+
+
+def test_entity_address_unified_keep_raw_stage_is_opt_in(monkeypatch):
+    monkeypatch.delenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_KEEP_RAW_STAGE", raising=False)
+    assert entity_address_unified._keep_raw_stage() is False  # pylint: disable=protected-access
+
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_KEEP_RAW_STAGE", "true")
+    assert entity_address_unified._keep_raw_stage() is True  # pylint: disable=protected-access
+
+
 def test_entity_address_unified_indexes_cover_primary_serving_queries():
     indexes = {index["name"]: index for index in EntityAddressUnified.__my_additional_indexes__}
 
@@ -2607,13 +3086,47 @@ def test_entity_address_unified_indexes_cover_primary_serving_queries():
         "name": "primary_phone_digits_npi",
         "where": "type='primary'",
     }
+    assert indexes["primary_phone_npi"] == {
+        "index_elements": ("telephone_number", "npi"),
+        "name": "primary_phone_npi",
+        "where": "type='primary' AND telephone_number IS NOT NULL AND telephone_number <> ''",
+    }
     assert indexes["primary_state_city_npi"] == {
         "index_elements": ("state_name", "city_name", "npi"),
         "name": "primary_state_city_npi",
         "where": "type='primary'",
     }
+    assert indexes["taxonomy_plans_network"]["where"] == "type='primary'"
+    assert indexes["procedures_array"]["where"] == "type='primary'"
+    assert indexes["medications_array"]["where"] == "type='primary'"
     assert indexes["geo_idx"]["where"] == (
-        "type IN ('primary', 'secondary', 'practice', 'site') AND COALESCE(address_precision, '') <> 'city_zip'"
+        "type IN ('primary', 'secondary', 'practice', 'site') "
+        "AND COALESCE(address_precision, '') <> 'city_zip' "
+        "AND lat IS NOT NULL AND long IS NOT NULL"
+    )
+    assert indexes["geo_bbox"] == {
+        "index_elements": ("lat", "long"),
+        "name": "geo_bbox",
+        "where": (
+            "type IN ('primary', 'secondary', 'practice', 'site') "
+            "AND COALESCE(address_precision, '') <> 'city_zip' "
+            "AND lat IS NOT NULL AND long IS NOT NULL"
+        ),
+    }
+
+
+def test_entity_address_unified_disables_autovacuum_on_disposable_tables():
+    sql = entity_address_unified._disable_autovacuum_sql("mrf", "entity_address_unified_raw")
+
+    assert "ALTER TABLE mrf.entity_address_unified_raw" in sql
+    assert "autovacuum_enabled = false" in sql
+    assert "toast.autovacuum_enabled = false" in sql
+
+
+def test_entity_address_unified_can_make_stage_unlogged():
+    assert (
+        entity_address_unified._set_unlogged_table_sql("mrf", "entity_address_unified_20260627")
+        == "ALTER TABLE mrf.entity_address_unified_20260627 SET UNLOGGED;"
     )
 
 
@@ -3555,6 +4068,44 @@ async def test_entity_address_unified_publish_integrity_checks_archive_and_bridg
 
 
 @pytest.mark.asyncio
+async def test_entity_address_unified_publish_integrity_uses_location_key_primary_key(monkeypatch):
+    statements = []
+
+    class FakeDB:
+        async def scalar(self, statement):
+            statements.append(statement)
+            if "pg_constraint con" in statement:
+                return 1
+            if "location_key IS NULL" in statement or "duplicate_locations" in statement:
+                raise AssertionError(f"location_key scan should be skipped: {statement}")
+            return 0
+
+        async def all(self, statement):
+            statements.append(statement)
+            return []
+
+    async def table_exists(_schema, _table):
+        return False
+
+    monkeypatch.setattr(entity_address_unified, "db", FakeDB())
+    monkeypatch.setattr(entity_address_unified, "_table_exists", table_exists)
+
+    metrics = await entity_address_unified._validate_publish_integrity(
+        "mrf",
+        "entity_address_unified_stage",
+        {},
+        test_mode=False,
+    )
+
+    assert metrics["location_key_constraint_validated"] is True
+    assert metrics["null_location_keys"] == 0
+    assert metrics["duplicate_location_keys"] == 0
+    assert any("pg_constraint con" in statement for statement in statements)
+    assert any("att.attname::text" in statement for statement in statements)
+    assert any("ARRAY['location_key']::text[]" in statement for statement in statements)
+
+
+@pytest.mark.asyncio
 async def test_entity_address_unified_publish_integrity_fails_on_redirects_and_orphans(monkeypatch):
     stage_classes = entity_address_unified._support_stage_classes("20260614")
 
@@ -3597,6 +4148,456 @@ async def test_entity_address_unified_publish_integrity_fails_on_redirects_and_o
             stage_classes,
             test_mode=False,
         )
+
+
+@pytest.mark.asyncio
+async def test_entity_address_unified_publish_integrity_can_skip_support_validation(monkeypatch):
+    statements = []
+
+    class FakeDB:
+        async def scalar(self, statement):
+            statements.append(statement)
+            return 0
+
+        async def all(self, statement):
+            statements.append(statement)
+            return []
+
+    async def table_exists(_schema, _table):
+        return True
+
+    monkeypatch.setattr(entity_address_unified, "db", FakeDB())
+    monkeypatch.setattr(entity_address_unified, "_table_exists", table_exists)
+
+    metrics = await entity_address_unified._validate_publish_integrity(
+        "mrf",
+        "entity_address_unified_stage",
+        {},
+        test_mode=False,
+    )
+
+    assert metrics["bridge_orphans"] == {}
+    assert not any("entity_address_plan_bridge" in statement for statement in statements)
+    assert not any("entity_address_ptg_bridge" in statement for statement in statements)
+
+
+@pytest.mark.asyncio
+async def test_entity_address_unified_shutdown_serving_only_preserves_support_tables(monkeypatch):
+    statements = []
+    marked_runs = []
+
+    class FakeTransaction:
+        async def __aenter__(self):
+            statements.append("BEGIN")
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            statements.append("ROLLBACK" if exc else "COMMIT")
+            return False
+
+    class FakeDB:
+        async def scalar(self, statement, **_kwargs):
+            statements.append(statement)
+            normalized = " ".join(statement.split())
+            if normalized == "SELECT COUNT(*) FROM mrf.entity_address_unified_20260614;":
+                return 1000
+            if normalized == "SELECT COUNT(*) FROM mrf.entity_address_unified;":
+                return 1000
+            if "to_regclass(" in statement:
+                return True
+            return 0
+
+        async def all(self, statement, **_kwargs):
+            statements.append(statement)
+            return []
+
+        async def status(self, statement):
+            statements.append(statement)
+            return 0
+
+        def transaction(self):
+            return FakeTransaction()
+
+    async def fake_table_exists(_schema, _table):
+        return True
+
+    async def fake_mark_control_run(*_args, **kwargs):
+        marked_runs.append(kwargs)
+
+    monkeypatch.setattr(entity_address_unified, "db", FakeDB())
+    monkeypatch.setattr(entity_address_unified, "ensure_database", AsyncMock())
+    monkeypatch.setattr(entity_address_unified, "_table_exists", fake_table_exists)
+    monkeypatch.setattr(entity_address_unified, "mark_control_run", fake_mark_control_run)
+    monkeypatch.setattr(entity_address_unified, "print_time_info", lambda *_args, **_kwargs: None)
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_MIN_ROWS", "1")
+
+    await entity_address_unified.shutdown(
+        {
+            "import_date": "20260614",
+            "context": {
+                "run": 1,
+                "test_mode": False,
+                "publish_requested": True,
+                "serving_only_refresh": True,
+                "support_stage_skipped": True,
+                "support_counts": {},
+                "inline_source_evidence": True,
+                "split_array_aggregates": True,
+                "source_table_shards": 128,
+                "source_select_count": 514,
+                "source_concurrency": 3,
+                "raw_location_key_index_skipped": True,
+                "enrich_shards": 8,
+                "enrich_concurrency": 4,
+                "aggregate_shards": 32,
+                "aggregate_concurrency": 16,
+                "stage_index_concurrency": 4,
+                "aggregate_source_record_ids": False,
+                "unlogged_stage": True,
+            },
+        }
+    )
+
+    joined = "\n".join(statements)
+    assert "ALTER TABLE IF EXISTS mrf.entity_address_unified_20260614 RENAME TO entity_address_unified;" in joined
+    assert "entity_address_evidence_20260614 RENAME TO entity_address_evidence" not in joined
+    assert "entity_address_ptg_bridge_20260614 RENAME TO entity_address_ptg_bridge" not in joined
+    assert marked_runs
+    metrics = marked_runs[-1]["metrics"]
+    assert metrics["serving_only_refresh"] is True
+    assert metrics["support_stage_skipped"] is True
+    assert metrics["inline_source_evidence"] is True
+    assert metrics["split_array_aggregates"] is True
+    assert metrics["source_table_shards"] == 128
+    assert metrics["source_select_count"] == 514
+    assert metrics["source_concurrency"] == 3
+    assert metrics["raw_location_key_index_skipped"] is True
+    assert metrics["aggregate_shards"] == 32
+    assert metrics["aggregate_concurrency"] == 16
+    assert metrics["stage_index_concurrency"] == 4
+    assert metrics["aggregate_source_record_ids"] is False
+    assert metrics["unlogged_stage"] is True
+    assert metrics["publish_validation"]["bridge_orphans"] == {}
+
+
+@pytest.mark.asyncio
+async def test_entity_address_unified_shutdown_marks_publish_before_post_publish_indexing(monkeypatch):
+    statements = []
+    marked_runs = []
+    events = []
+
+    class FakeTransaction:
+        async def __aenter__(self):
+            statements.append("BEGIN")
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            statements.append("ROLLBACK" if exc else "COMMIT")
+            return False
+
+    class FakeDB:
+        async def scalar(self, statement, **_kwargs):
+            statements.append(statement)
+            normalized = " ".join(statement.split())
+            if normalized == "SELECT COUNT(*) FROM mrf.entity_address_unified_20260614;":
+                return 1000
+            if normalized == "SELECT COUNT(*) FROM mrf.entity_address_unified;":
+                return 1000
+            if "to_regclass(" in statement:
+                return True
+            return 0
+
+        async def all(self, statement, **_kwargs):
+            statements.append(statement)
+            return []
+
+        async def status(self, statement):
+            statements.append(statement)
+            return 0
+
+        def transaction(self):
+            return FakeTransaction()
+
+    async def fake_table_exists(_schema, _table):
+        return True
+
+    async def fake_mark_control_run(*_args, **kwargs):
+        events.append("mark")
+        marked_runs.append(kwargs)
+
+    async def fake_post_publish_indexes(_schema, *, context):
+        events.append("post_publish")
+        assert marked_runs
+        assert marked_runs[-1]["phase_detail"] == "entity-address-unified published"
+        assert marked_runs[-1]["metrics"]["published_elapsed_seconds"] >= 0
+        assert marked_runs[-1]["metrics"]["post_publish_index_pending"] is True
+        total = marked_runs[-1]["metrics"]["post_publish_index_total"]
+        assert total > 0
+        assert marked_runs[-1]["metrics"]["post_publish_index_completed"] == 0
+        context["post_publish_index_timings"] = [{"index": "npi", "seconds": 0.1}]
+        context["post_publish_index_total"] = total
+        context["post_publish_index_completed"] = total
+        context["post_publish_index_pending"] = False
+
+    monkeypatch.setattr(entity_address_unified, "db", FakeDB())
+    monkeypatch.setattr(entity_address_unified, "ensure_database", AsyncMock())
+    monkeypatch.setattr(entity_address_unified, "_table_exists", fake_table_exists)
+    monkeypatch.setattr(entity_address_unified, "mark_control_run", fake_mark_control_run)
+    monkeypatch.setattr(entity_address_unified, "_create_post_publish_indexes", fake_post_publish_indexes)
+    monkeypatch.setattr(entity_address_unified, "print_time_info", lambda *_args, **_kwargs: None)
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_MIN_ROWS", "1")
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_POST_PUBLISH_INDEX_PROFILE", "serving")
+
+    await entity_address_unified.shutdown(
+        {
+            "import_date": "20260614",
+            "context": {
+                "run": 1,
+                "start": entity_address_unified.datetime.datetime.utcnow(),
+                "test_mode": False,
+                "publish_requested": True,
+                "serving_only_refresh": True,
+                "support_stage_skipped": True,
+                "support_counts": {},
+                "stage_index_profile": "none",
+            },
+        }
+    )
+
+    assert events == ["mark", "post_publish", "mark"]
+    assert marked_runs[0]["phase_detail"] == "entity-address-unified published"
+    assert marked_runs[0]["metrics"]["post_publish_index_profile"] == "serving"
+    assert marked_runs[0]["metrics"]["post_publish_index_concurrently"] is True
+    assert marked_runs[0]["metrics"]["post_publish_index_pending"] is True
+    assert marked_runs[0]["metrics"]["post_publish_index_total"] > 0
+    assert marked_runs[0]["metrics"]["post_publish_index_completed"] == 0
+    assert "entity_address_unified.geo_idx" in marked_runs[0]["metrics"]["post_publish_skipped_indexes"]
+    assert marked_runs[0]["metrics"]["post_publish_index_timings"] == []
+    assert marked_runs[0].get("preserve_finished_at") is not True
+    assert marked_runs[-1]["phase_detail"] == "entity-address-unified post-publish indexes warmed"
+    assert marked_runs[-1]["preserve_finished_at"] is True
+    assert marked_runs[-1]["metrics"]["post_publish_index_profile"] == "serving"
+    assert marked_runs[-1]["metrics"]["stage_index_profile"] == "none"
+    assert marked_runs[-1]["metrics"]["post_publish_index_pending"] is False
+    assert marked_runs[-1]["metrics"]["post_publish_index_total"] == marked_runs[0]["metrics"]["post_publish_index_total"]
+    assert (
+        marked_runs[-1]["metrics"]["post_publish_index_completed"]
+        == marked_runs[-1]["metrics"]["post_publish_index_total"]
+    )
+    assert marked_runs[-1]["metrics"]["post_publish_index_timings"][0]["index"] == "npi"
+
+
+@pytest.mark.asyncio
+async def test_entity_address_unified_shutdown_can_defer_publish_validation(monkeypatch):
+    statements = []
+    marked_runs = []
+    events = []
+    validations = []
+
+    class FakeTransaction:
+        async def __aenter__(self):
+            statements.append("BEGIN")
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            statements.append("ROLLBACK" if exc else "COMMIT")
+            return False
+
+    class FakeDB:
+        async def scalar(self, statement, **_kwargs):
+            statements.append(statement)
+            normalized = " ".join(statement.split())
+            if normalized == "SELECT COUNT(*) FROM mrf.entity_address_unified_20260614;":
+                return 1000
+            if normalized == "SELECT COUNT(*) FROM mrf.entity_address_unified;":
+                return 1000
+            if "to_regclass(" in statement:
+                return True
+            return 0
+
+        async def all(self, statement, **_kwargs):
+            statements.append(statement)
+            return []
+
+        async def status(self, statement):
+            statements.append(statement)
+            return 0
+
+        def transaction(self):
+            return FakeTransaction()
+
+    async def fake_table_exists(_schema, _table):
+        return True
+
+    async def fake_mark_control_run(*_args, **kwargs):
+        events.append(kwargs["phase_detail"])
+        marked_runs.append(kwargs)
+
+    async def fake_validate(_schema, table_name, _support_stage_classes, *, test_mode):
+        validations.append((table_name, test_mode, list(events)))
+        return {"null_location_keys": 0, "duplicate_location_keys": 0}
+
+    async def fake_post_publish_indexes(_schema, *, context):
+        events.append("post_publish")
+        assert marked_runs[-1]["phase_detail"] == "entity-address-unified post-publish validation complete"
+        context["post_publish_index_timings"] = [{"index": "npi", "seconds": 0.1}]
+        context["post_publish_index_total"] = 1
+        context["post_publish_index_completed"] = 1
+        context["post_publish_index_pending"] = False
+
+    monkeypatch.setattr(entity_address_unified, "db", FakeDB())
+    monkeypatch.setattr(entity_address_unified, "ensure_database", AsyncMock())
+    monkeypatch.setattr(entity_address_unified, "_table_exists", fake_table_exists)
+    monkeypatch.setattr(entity_address_unified, "mark_control_run", fake_mark_control_run)
+    monkeypatch.setattr(entity_address_unified, "_validate_publish_integrity", fake_validate)
+    monkeypatch.setattr(entity_address_unified, "_create_post_publish_indexes", fake_post_publish_indexes)
+    monkeypatch.setattr(entity_address_unified, "print_time_info", lambda *_args, **_kwargs: None)
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_MIN_ROWS", "1")
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_DEFER_PUBLISH_VALIDATION", "true")
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_POST_PUBLISH_INDEX_PROFILE", "serving")
+
+    await entity_address_unified.shutdown(
+        {
+            "import_date": "20260614",
+            "context": {
+                "run": 1,
+                "start": entity_address_unified.datetime.datetime.utcnow(),
+                "test_mode": False,
+                "publish_requested": True,
+                "serving_only_refresh": True,
+                "support_stage_skipped": True,
+                "support_counts": {},
+                "stage_index_profile": "none",
+            },
+        }
+    )
+
+    assert validations == [
+        ("entity_address_unified", False, ["entity-address-unified published"]),
+    ]
+    assert events == [
+        "entity-address-unified published",
+        "entity-address-unified post-publish validation complete",
+        "post_publish",
+        "entity-address-unified post-publish indexes warmed",
+    ]
+    published_metrics = marked_runs[0]["metrics"]
+    assert published_metrics["publish_validation"] == {"deferred": True, "status": "pending"}
+    validation_metrics = marked_runs[1]["metrics"]
+    assert marked_runs[1]["preserve_finished_at"] is True
+    assert validation_metrics["publish_validation"]["deferred"] is True
+    assert validation_metrics["publish_validation"]["status"] == "complete"
+    assert validation_metrics["publish_validation"]["duplicate_location_keys"] == 0
+    assert marked_runs[-1]["preserve_finished_at"] is True
+    assert marked_runs[-1]["metrics"]["post_publish_index_pending"] is False
+
+
+@pytest.mark.asyncio
+async def test_entity_address_unified_shutdown_skips_publish_validation_when_publish_skipped(monkeypatch):
+    statements = []
+    marked_runs = []
+
+    class FakeDB:
+        async def scalar(self, statement, **_kwargs):
+            statements.append(statement)
+            normalized = " ".join(statement.split())
+            if "address_archive_v2" in statement or "duplicate_locations" in statement:
+                raise AssertionError("stage-only shutdown should not run publish integrity validation")
+            if normalized == "SELECT COUNT(*) FROM mrf.entity_address_unified_20260614;":
+                return 1000
+            if normalized == "SELECT COUNT(*) FROM mrf.entity_address_unified;":
+                return 1000
+            if "to_regclass(" in statement:
+                return True
+            return 0
+
+        async def status(self, statement):
+            statements.append(statement)
+            return 0
+
+    async def fake_table_exists(_schema, _table):
+        return True
+
+    async def fake_mark_control_run(*_args, **kwargs):
+        marked_runs.append(kwargs)
+
+    monkeypatch.setattr(entity_address_unified, "db", FakeDB())
+    monkeypatch.setattr(entity_address_unified, "ensure_database", AsyncMock())
+    monkeypatch.setattr(entity_address_unified, "_table_exists", fake_table_exists)
+    monkeypatch.setattr(entity_address_unified, "mark_control_run", fake_mark_control_run)
+    monkeypatch.setattr(entity_address_unified, "print_time_info", lambda *_args, **_kwargs: None)
+
+    await entity_address_unified.shutdown(
+        {
+            "import_date": "20260614",
+            "context": {
+                "run": 1,
+                "test_mode": False,
+                "publish_requested": False,
+                "serving_only_refresh": True,
+                "support_stage_skipped": True,
+                "support_counts": {},
+            },
+        }
+    )
+
+    joined = "\n".join(statements)
+    assert "DROP TABLE IF EXISTS mrf.entity_address_unified_20260614;" in joined
+    assert "address_archive_v2" not in joined
+    assert marked_runs
+    metrics = marked_runs[-1]["metrics"]
+    assert metrics["publish_skipped"] is True
+    assert metrics["publish_validation"] == {}
+
+
+@pytest.mark.asyncio
+async def test_entity_address_unified_shutdown_reuses_cached_stage_count(monkeypatch):
+    statements = []
+    marked_runs = []
+
+    class FakeDB:
+        async def scalar(self, statement, **_kwargs):
+            statements.append(statement)
+            normalized = " ".join(statement.split())
+            if normalized == "SELECT COUNT(*) FROM mrf.entity_address_unified_20260614;":
+                raise AssertionError("shutdown should reuse staged_rows from process_data")
+            if "to_regclass(" in statement:
+                return False
+            return 0
+
+        async def status(self, statement):
+            statements.append(statement)
+            return 0
+
+    async def fake_table_exists(_schema, _table):
+        return False
+
+    async def fake_mark_control_run(*_args, **kwargs):
+        marked_runs.append(kwargs)
+
+    monkeypatch.setattr(entity_address_unified, "db", FakeDB())
+    monkeypatch.setattr(entity_address_unified, "ensure_database", AsyncMock())
+    monkeypatch.setattr(entity_address_unified, "_table_exists", fake_table_exists)
+    monkeypatch.setattr(entity_address_unified, "mark_control_run", fake_mark_control_run)
+    monkeypatch.setattr(entity_address_unified, "print_time_info", lambda *_args, **_kwargs: None)
+
+    await entity_address_unified.shutdown(
+        {
+            "import_date": "20260614",
+            "context": {
+                "run": 1,
+                "test_mode": False,
+                "publish_requested": False,
+                "serving_only_refresh": True,
+                "support_stage_skipped": True,
+                "support_counts": {},
+                "staged_rows": 4321,
+            },
+        }
+    )
+
+    assert "SELECT COUNT(*) FROM mrf.entity_address_unified_20260614;" not in statements
+    assert marked_runs[-1]["metrics"]["rows"] == 4321
 
 
 @pytest.mark.asyncio

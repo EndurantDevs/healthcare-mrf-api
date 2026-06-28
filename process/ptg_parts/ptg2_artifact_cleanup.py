@@ -65,12 +65,48 @@ def _resolve_existing_root(root: str | Path | None = None) -> Path:
     return sidecar_root.resolve()
 
 
-def _normalize_referenced_paths(paths: Iterable[str | Path]) -> set[Path]:
+def _resolve_referenced_path(value: str | Path, sidecar_root: Path) -> Path:
+    path = Path(value).expanduser()
+    if path.exists():
+        return path.resolve()
+    if not path.is_absolute():
+        candidate = sidecar_root / path
+        return candidate.resolve() if candidate.exists() else path.resolve()
+
+    marker = "healthporta-ptg2-artifacts"
+    try:
+        marker_index = path.parts.index(marker)
+    except ValueError:
+        return path.resolve()
+    suffix_parts = path.parts[marker_index + 1 :]
+    if not suffix_parts:
+        return path.resolve()
+    artifact_root = sidecar_root.parent
+    candidate = artifact_root.joinpath(*suffix_parts)
+    if candidate.exists():
+        return candidate.resolve()
+
+    if len(suffix_parts) >= 3 and suffix_parts[0] == "serving":
+        filename = suffix_parts[-1]
+        matches = [item for item in sidecar_root.glob(f"*/{filename}") if item.exists()]
+        if len(matches) == 1:
+            return matches[0].resolve()
+        prefix = filename.rsplit("_", 1)[0]
+        if prefix and prefix != filename:
+            prefix_matches = [
+                item for item in sidecar_root.glob(f"*/{prefix}_*.ptg2sc") if item.exists()
+            ]
+            if len(prefix_matches) == 1:
+                return prefix_matches[0].resolve()
+    return path.resolve()
+
+
+def _normalize_referenced_paths(paths: Iterable[str | Path], *, sidecar_root: Path) -> set[Path]:
     normalized: set[Path] = set()
     for value in paths:
         if not value:
             continue
-        normalized.add(Path(value).expanduser().resolve())
+        normalized.add(_resolve_referenced_path(value, sidecar_root))
     return normalized
 
 
@@ -80,7 +116,7 @@ def build_ptg2_artifact_cleanup_plan(
     referenced_paths: Iterable[str | Path] = (),
 ) -> PTG2ArtifactCleanupPlan:
     sidecar_root = _resolve_existing_root(root)
-    referenced = _normalize_referenced_paths(referenced_paths)
+    referenced = _normalize_referenced_paths(referenced_paths, sidecar_root=sidecar_root)
     if not sidecar_root.exists():
         return PTG2ArtifactCleanupPlan(
             root=sidecar_root,

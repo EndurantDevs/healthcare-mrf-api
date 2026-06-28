@@ -117,8 +117,16 @@ async def control_single_job_start(
         await _stop_live_progress_heartbeat(heartbeat_task)
         if live_token is not None:
             reset_live_progress_context(live_token)
-    terminal_progress = _terminal_progress_from_result(target_function, result)
-    terminal_metrics = result if isinstance(result, dict) else ({"result": result} if isinstance(result, (int, float, str, bool)) else None)
+    terminal_metrics = _terminal_metrics_from_result(
+        result,
+        context=ctx.get("context") if run_shutdown else None,
+    )
+    terminal_progress = _terminal_progress_from_result(target_function, terminal_metrics or result)
+    preserve_finished_at = bool(
+        run_shutdown
+        and isinstance(ctx.get("context"), dict)
+        and ctx["context"].get("preserve_control_run_finished_at")
+    )
     await mark_control_run(
         run_id,
         status="succeeded",
@@ -126,6 +134,7 @@ async def control_single_job_start(
         progress_message="succeeded",
         metrics=terminal_metrics,
         progress=terminal_progress,
+        preserve_finished_at=preserve_finished_at,
     )
     await _flush_terminal_status_events()
     return {"status": "succeeded", "run_id": run_id, "result": result}
@@ -253,6 +262,71 @@ def _terminal_progress_from_result(target_function: str, result: Any) -> dict[st
     }
 
 
+def _terminal_metrics_from_result(result: Any, *, context: Any = None) -> dict[str, Any] | None:
+    metrics = dict(result) if isinstance(result, dict) else (
+        {"result": result} if isinstance(result, (int, float, str, bool)) else None
+    )
+    context_metrics = _terminal_metrics_from_context(context)
+    if metrics is None:
+        return context_metrics
+    if context_metrics:
+        return {**context_metrics, **metrics}
+    return metrics
+
+
+def _terminal_metrics_from_context(context: Any) -> dict[str, Any] | None:
+    if not isinstance(context, dict):
+        return None
+    keys = (
+        "staged_rows",
+        "rows",
+        "npi_rows",
+        "inferred_rows",
+        "multi_source_rows",
+        "support_counts",
+        "refresh_mode",
+        "partial_ptg_source_keys",
+        "partial_ptg_reused_rows",
+        "partial_ptg_patched_rows",
+        "serving_only_refresh",
+        "support_stage_skipped",
+        "inline_source_evidence",
+        "split_array_aggregates",
+        "source_table_shards",
+        "source_select_count",
+        "source_concurrency",
+        "raw_location_key_index_skipped",
+        "enrich_shards",
+        "enrich_concurrency",
+        "aggregate_shards",
+        "aggregate_concurrency",
+        "stage_index_concurrency",
+        "stage_index_profile",
+        "post_publish_index_profile",
+        "post_publish_index_concurrency",
+        "post_publish_index_concurrently",
+        "post_publish_index_pending",
+        "post_publish_index_total",
+        "post_publish_index_completed",
+        "post_publish_index_timings",
+        "post_publish_index_error",
+        "post_publish_skipped_indexes",
+        "raw_group_index_profile",
+        "stage_index_timings",
+        "aggregate_source_record_ids",
+        "unlogged_stage",
+        "published_elapsed_seconds",
+        "publish_validation",
+        "phase_timings",
+        "skipped_stage_indexes",
+    )
+    metrics = {key: context[key] for key in keys if key in context}
+    staged_rows = metrics.get("staged_rows")
+    if "rows" not in metrics and isinstance(staged_rows, int):
+        metrics["rows"] = staged_rows
+    return metrics or None
+
+
 async def _flush_terminal_status_events() -> None:
     timeout = float(os.getenv("HLTHPRT_IMPORT_STATUS_EVENT_TERMINAL_FLUSH_SECONDS", "0.25"))
     if timeout <= 0:
@@ -270,6 +344,7 @@ async def mark_control_run(
     metrics: dict[str, Any] | None = None,
     progress: dict[str, Any] | None = None,
     snapshot_id: str | None = None,
+    preserve_finished_at: bool = False,
 ) -> None:
     if not run_id:
         return
@@ -283,7 +358,7 @@ async def mark_control_run(
         "message": progress_message,
     }
     live_started_at = now if status == "running" else None
-    live_finished_at = now if done else None
+    live_finished_at = now if done and not preserve_finished_at else None
     values: dict[str, Any] = {
         "status": status,
         "phase_detail": phase_detail,
@@ -298,7 +373,7 @@ async def mark_control_run(
     if status == "running":
         values["started_at"] = func.coalesce(ImportRun.started_at, now)
         values["finished_at"] = None
-    if done:
+    if done and not preserve_finished_at:
         values["finished_at"] = now
     if await _should_update_control_run_db(
         run_id=run_id,

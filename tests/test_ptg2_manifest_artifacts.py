@@ -5,6 +5,7 @@ import hashlib
 
 import pytest
 
+from api import ptg2_manifest_artifacts as serving_manifest
 from process.ptg_parts.ptg2_manifest_artifacts import (
     PTG2_MANIFEST_DENSE_MEMBERSHIP_FORMAT,
     PTG2_MANIFEST_DENSE_MEMBERSHIP_MAGIC,
@@ -26,6 +27,527 @@ from process.ptg_parts.ptg2_manifest_artifacts import (
 GLOBAL_A = bytes.fromhex("0000000000000000000000000000000a")
 GLOBAL_B = bytes.fromhex("0000000000000000000000000000000b")
 GLOBAL_C = bytes.fromhex("0000000000000000000000000000000c")
+
+
+def test_manifest_artifact_provider_address_verification_marks_inferred_nppes_address():
+    item = {
+        "network_names": ["C2"],
+        "address": {
+            "first_line": "900 W Temple Ave",
+            "city": "Effingham",
+            "state": "IL",
+            "postal_code": "62401",
+            "address_sources": ["nppes"],
+        },
+        "location_source": "npi_address",
+    }
+
+    verification = serving_manifest._manifest_address_verification(item)
+
+    assert verification["rate_network_binding"] == "tic_provider_group_npi_tin"
+    assert verification["address_network_binding"] == "inferred_from_provider_identity"
+    assert verification["address_evidence_level"] == "nppes_provider_address"
+    assert verification["requires_location_confirmation"] is True
+    assert verification["displayed_address_present"] is True
+    assert verification["address_sources"] == ["nppes"]
+
+
+def test_manifest_artifact_does_not_treat_bare_ptg_source_as_payer_confirmed():
+    verification = serving_manifest._manifest_address_verification(
+        {
+            "address": {
+                "first_line": "900 W Temple Ave",
+                "city": "Effingham",
+                "state": "IL",
+                "postal_code": "62401",
+                "address_sources": ["nppes", "ptg"],
+            }
+        }
+    )
+
+    assert verification["address_network_binding"] == "inferred_from_provider_identity"
+    assert verification["address_evidence_level"] == "nppes_provider_address"
+    assert verification["requires_location_confirmation"] is True
+    assert verification["address_sources"] == ["nppes"]
+
+
+def test_manifest_artifact_marks_explicit_payer_location_as_payer_confirmed():
+    verification = serving_manifest._manifest_address_verification(
+        {
+            "location_source": "payer_provider_group_location",
+            "address": {
+                "first_line": "900 W Temple Ave",
+                "city": "Effingham",
+                "state": "IL",
+                "postal_code": "62401",
+                "address_sources": ["ptg"],
+                "address_verification_evidence": {
+                    "source": "payer_provider_group_location",
+                    "provider_group_id": 1662,
+                    "json_pointer": "/provider_references/0/provider_groups/0/address",
+                },
+            },
+        }
+    )
+
+    assert verification["address_network_binding"] == "payer_confirmed_location"
+    assert verification["address_evidence_level"] == "payer_confirmed_location"
+    assert verification["requires_location_confirmation"] is False
+    assert verification["address_sources"] == ["ptg"]
+
+
+def test_manifest_artifact_does_not_mark_payer_location_without_source_record_evidence():
+    verification = serving_manifest._manifest_address_verification(
+        {
+            "location_source": "payer_provider_group_location",
+            "address": {
+                "first_line": "900 W Temple Ave",
+                "city": "Effingham",
+                "state": "IL",
+                "postal_code": "62401",
+                "address_sources": ["ptg"],
+            },
+        }
+    )
+
+    assert verification["address_network_binding"] == "inferred_from_provider_identity"
+    assert verification["requires_location_confirmation"] is True
+    assert "address_sources" not in verification
+
+
+def test_manifest_artifact_marks_provider_directory_network_name_match_as_corroborated():
+    verification = serving_manifest._manifest_address_verification(
+        {
+            "network_names": ["C2"],
+            "address": {
+                "first_line": "900 W Temple Ave",
+                "city": "Effingham",
+                "state": "IL",
+                "postal_code": "62401",
+                "address_sources": ["provider_directory_fhir"],
+                "provider_directory_plan_context_matched": False,
+                "provider_directory_network_names": ["C2"],
+                "provider_directory_network_matches": [
+                    {
+                        "ref": "Organization/network-1",
+                        "resource_id": "network-1",
+                        "name": "C2",
+                        "aliases": ["C Two"],
+                    }
+                ],
+                "address_verification_evidence": {
+                    "source": "provider_directory_fhir",
+                    "matched_on": "npi_address_key_role_location",
+                },
+            },
+        }
+    )
+
+    assert verification["address_network_binding"] == "payer_directory_corroborated_location"
+    assert verification["address_evidence_level"] == "payer_directory_network_location"
+    assert verification["requires_location_confirmation"] is False
+    assert verification["provider_directory_plan_context_matched"] is False
+    assert verification["provider_directory_network_name_matched"] is True
+    assert verification["provider_directory_network_matches"] == [
+        {
+            "ptg_network_name": "C2",
+            "provider_directory_network_name": "C2",
+            "provider_directory_network_resource_id": "network-1",
+            "provider_directory_network_ref": "Organization/network-1",
+        }
+    ]
+    assert verification["address_verification_evidence"]["matched_on"] == (
+        "npi_address_key_role_location_network_name"
+    )
+    assert verification["address_verification_evidence"]["network_name_context_matched"] is True
+
+
+def test_manifest_artifact_network_name_matching_does_not_mutate_payload():
+    raw_match = {
+        "ref": "Organization/network-1",
+        "resource_id": "network-1",
+        "name": "C2",
+        "aliases": ["C Two"],
+    }
+    item = {
+        "network_names": ["C2"],
+        "address": {
+            "first_line": "900 W Temple Ave",
+            "city": "Effingham",
+            "state": "IL",
+            "postal_code": "62401",
+            "address_sources": ["provider_directory_fhir"],
+            "provider_directory_plan_context_matched": False,
+            "provider_directory_network_names": ["C2"],
+            "provider_directory_network_matches": [raw_match],
+            "address_verification_evidence": {
+                "source": "provider_directory_fhir",
+                "matched_on": "npi_address_key_role_location",
+            },
+        },
+    }
+
+    first = serving_manifest._manifest_address_verification(item)
+    second = serving_manifest._manifest_address_verification(item)
+
+    assert item["address"]["provider_directory_network_matches"] == [raw_match]
+    assert second["provider_directory_network_matches"] == first["provider_directory_network_matches"]
+    assert len(second["provider_directory_network_matches"]) == 1
+
+
+def test_manifest_artifact_accepts_pre_shaped_provider_directory_network_match():
+    verification = serving_manifest._manifest_address_verification(
+        {
+            "network_names": ["C2"],
+            "address": {
+                "first_line": "900 W Temple Ave",
+                "city": "Effingham",
+                "state": "IL",
+                "postal_code": "62401",
+                "address_sources": ["provider_directory_fhir"],
+                "provider_directory_plan_context_matched": False,
+                "provider_directory_network_matches": [
+                    {
+                        "ptg_network_name": "C2",
+                        "provider_directory_network_name": "C2",
+                        "provider_directory_network_resource_id": "network-1",
+                        "provider_directory_network_ref": "Organization/network-1",
+                    }
+                ],
+                "address_verification_evidence": {
+                    "source": "provider_directory_fhir",
+                    "matched_on": "npi_address_key_role_location",
+                },
+            },
+        }
+    )
+
+    assert verification["address_network_binding"] == "payer_directory_corroborated_location"
+    assert verification["provider_directory_network_name_matched"] is True
+    assert verification["provider_directory_network_matches"] == [
+        {
+            "ptg_network_name": "C2",
+            "provider_directory_network_name": "C2",
+            "provider_directory_network_resource_id": "network-1",
+            "provider_directory_network_ref": "Organization/network-1",
+        }
+    ]
+
+
+def test_manifest_artifact_downgrades_pre_shaped_network_match_without_served_network_names():
+    verification = serving_manifest._manifest_address_verification(
+        {
+            "address": {
+                "first_line": "900 W Temple Ave",
+                "city": "Effingham",
+                "state": "IL",
+                "postal_code": "62401",
+                "address_sources": ["provider_directory_fhir"],
+                "provider_directory_plan_context_matched": False,
+                "provider_directory_network_matches": [
+                    {
+                        "ptg_network_name": "C2",
+                        "provider_directory_network_name": "C2",
+                    }
+                ],
+                "address_verification_evidence": {
+                    "source": "provider_directory_fhir",
+                    "matched_on": "npi_address_key_role_location_network_name",
+                    "network_name_context_matched": True,
+                },
+            },
+        }
+    )
+
+    assert verification["address_network_binding"] == "inferred_from_provider_identity"
+    assert verification["address_evidence_level"] == "provider_directory_address"
+    assert verification["requires_location_confirmation"] is True
+    assert "provider_directory_network_name_matched" not in verification
+    assert "provider_directory_network_matches" not in verification
+    assert verification["address_verification_evidence"]["matched_on"] == "npi_address_key_role_location"
+
+
+def test_manifest_artifact_normalizes_provider_directory_boolean_strings():
+    verification = serving_manifest._manifest_address_verification(
+        {
+            "network_names": ["C2"],
+            "address": {
+                "first_line": "900 W Temple Ave",
+                "city": "Effingham",
+                "state": "IL",
+                "postal_code": "62401",
+                "address_sources": ["provider_directory_fhir"],
+                "provider_directory_plan_context_matched": "false",
+                "provider_directory_network_names": '["C2"]',
+                "provider_directory_network_matches": [
+                    {
+                        "ref": "Organization/network-1",
+                        "resource_id": "network-1",
+                        "name": "C2",
+                    }
+                ],
+                "address_verification_evidence": {
+                    "source": "provider_directory_fhir",
+                    "matched_on": "npi_address_key_role_location",
+                },
+            },
+        }
+    )
+
+    assert verification["provider_directory_plan_context_matched"] is False
+    assert verification["provider_directory_network_name_matched"] is True
+    assert verification["provider_directory_network_names"] == ["C2"]
+
+
+def test_manifest_artifact_does_not_accept_loose_provider_directory_network_marker():
+    verification = serving_manifest._manifest_address_verification(
+        {
+            "network_names": ["C2"],
+            "address": {
+                "first_line": "900 W Temple Ave",
+                "city": "Effingham",
+                "state": "IL",
+                "postal_code": "62401",
+                "address_sources": ["provider_directory_fhir"],
+                "provider_directory_plan_context_matched": False,
+                "provider_directory_network_name_matched": True,
+                "address_verification_evidence": {
+                    "source": "provider_directory_fhir",
+                    "matched_on": "npi_address_key_role_location",
+                },
+            },
+        }
+    )
+
+    assert verification["address_network_binding"] == "inferred_from_provider_identity"
+    assert verification["address_evidence_level"] == "provider_directory_address"
+    assert verification["requires_location_confirmation"] is True
+    assert "provider_directory_network_name_matched" not in verification
+
+
+def test_manifest_artifact_strips_stale_provider_directory_network_evidence():
+    verification = serving_manifest._manifest_address_verification(
+        {
+            "network_names": ["C2"],
+            "address": {
+                "first_line": "900 W Temple Ave",
+                "city": "Effingham",
+                "state": "IL",
+                "postal_code": "62401",
+                "address_sources": ["provider_directory_fhir"],
+                "provider_directory_plan_context_matched": False,
+                "provider_directory_network_name_matched": True,
+                "provider_directory_network_matches": [
+                    {
+                        "ref": "Organization/network-2",
+                        "resource_id": "network-2",
+                        "name": "PPO NDC",
+                    }
+                ],
+                "address_verification_evidence": {
+                    "source": "provider_directory_fhir",
+                    "matched_on": "npi_address_key_role_location_network_name",
+                    "network_name_context_matched": True,
+                    "network_name_matches": [
+                        {
+                            "ptg_network_name": "C2",
+                            "provider_directory_network_name": "C2",
+                        }
+                    ],
+                },
+            },
+        }
+    )
+
+    assert verification["address_network_binding"] == "inferred_from_provider_identity"
+    assert verification["address_evidence_level"] == "provider_directory_address"
+    assert verification["requires_location_confirmation"] is True
+    assert "provider_directory_network_name_matched" not in verification
+    assert "provider_directory_network_matches" not in verification
+    assert verification["address_verification_evidence"]["matched_on"] == "npi_address_key_role_location"
+    assert "network_name_context_matched" not in verification["address_verification_evidence"]
+    assert "network_name_matches" not in verification["address_verification_evidence"]
+
+
+def test_manifest_artifact_provider_set_without_address_has_explicit_unknown_verification():
+    verification = serving_manifest._manifest_address_verification({"provider_name": "TiC provider set"})
+
+    assert verification["rate_network_binding"] == "tic_provider_group_npi_tin"
+    assert verification["address_network_binding"] == "inferred_from_provider_identity"
+    assert verification["address_evidence_level"] == "unknown"
+    assert verification["requires_location_confirmation"] is True
+    assert verification["displayed_address_present"] is False
+    assert verification["reason"] == (
+        "PTG proves the provider identity is in network, but no displayable address is available."
+    )
+
+
+def test_manifest_artifact_no_display_verification_drops_nested_address_evidence():
+    verification = serving_manifest._manifest_address_verification(
+        {
+            "provider_name": "Example Surgeon",
+            "location_source": "entity_address_unified",
+            "address_sources": ["nppes"],
+            "address_payload": {
+                "address_key": "00000000-0000-0000-0000-000000000001",
+                "location_source": "entity_address_unified",
+                "address_sources": ["nppes"],
+            },
+        }
+    )
+
+    assert verification == {
+        "rate_network_binding": "tic_provider_group_npi_tin",
+        "address_network_binding": "inferred_from_provider_identity",
+        "address_evidence_level": "unknown",
+        "requires_location_confirmation": True,
+        "reason": "PTG proves the provider identity is in network, but no displayable address is available.",
+        "displayed_address_present": False,
+    }
+
+
+def test_manifest_artifact_treats_nested_address_as_displayable():
+    verification = serving_manifest._manifest_address_verification(
+        {
+            "network_names": ["C2"],
+            "address": {
+                "first_line": "100 Test St",
+                "city": "Chicago",
+                "state": "IL",
+                "postal_code": "60601",
+            },
+            "address_payload": {
+                "location_source": "provider_directory_fhir",
+                "address_sources": ["provider_directory_fhir"],
+                "provider_directory_plan_context_matched": True,
+            },
+        }
+    )
+
+    assert verification["displayed_address_present"] is True
+    assert verification["address_network_binding"] == "payer_directory_corroborated_location"
+    assert verification["address_evidence_level"] == "payer_directory_network_location"
+
+
+def test_search_manifest_snapshot_adds_address_verification_to_expanded_provider_rows():
+    snapshot = serving_manifest.PTG2ManifestSnapshot(
+        snapshot_id="ptg2:202606:test",
+        source_uri="file:///tmp/manifest.json",
+        manifest={},
+        plans={"010854205": {"plan_name": "Heartland Dental"}},
+        procedures={"CPT:29888": {"procedure_name": "ACL reconstruction"}},
+        rows=(
+            {
+                "plan_id": "010854205",
+                "reported_code": "29888",
+                "reported_code_system": "CPT",
+                "provider_set_hash": "provider-set",
+                "prices": [{"negotiated_rate": 1138.57, "negotiated_type": "negotiated"}],
+                "network_names": ["C2"],
+            },
+        ),
+        providers={
+            "provider-1": {
+                "npi": 1234567890,
+                "provider_name": "Example Surgeon",
+                "location_source": "npi_address",
+                "address_payload": {
+                    "first_line": "900 W Temple Ave",
+                    "city": "Effingham",
+                    "state": "IL",
+                    "postal_code": "62401",
+                    "address_sources": ["nppes"],
+                },
+            }
+        },
+        price_sets={},
+        price_atoms={},
+        provider_set_members={"provider-set": ("provider-1",)},
+        price_set_members={},
+        source_trace_sets={},
+    )
+    pagination = type("Pagination", (), {"limit": 5, "offset": 0})()
+
+    payload = serving_manifest.search_ptg2_manifest_snapshot(
+        snapshot,
+        {
+            "plan_id": "010854205",
+            "code": "29888",
+            "code_system": "CPT",
+            "include_providers": "true",
+        },
+        pagination,
+        mode_value="product_search",
+    )
+
+    assert payload is not None
+    item = payload["items"][0]
+    assert item["address"]["first_line"] == "900 W Temple Ave"
+    assert item["address_verification"]["rate_network_binding"] == "tic_provider_group_npi_tin"
+    assert item["address_verification"]["address_evidence_level"] == "nppes_provider_address"
+    assert item["address_verification"]["displayed_address_present"] is True
+
+
+def test_search_manifest_snapshot_strips_no_display_provider_address_fields():
+    snapshot = serving_manifest.PTG2ManifestSnapshot(
+        snapshot_id="ptg2:202606:test",
+        source_uri="file:///tmp/manifest.json",
+        manifest={},
+        plans={"010854205": {"plan_name": "Heartland Dental"}},
+        procedures={"CPT:29888": {"procedure_name": "ACL reconstruction"}},
+        rows=(
+            {
+                "plan_id": "010854205",
+                "reported_code": "29888",
+                "reported_code_system": "CPT",
+                "provider_set_hash": "provider-set",
+                "prices": [{"negotiated_rate": 1138.57, "negotiated_type": "negotiated"}],
+                "network_names": ["C2"],
+            },
+        ),
+        providers={
+            "provider-1": {
+                "npi": 1234567890,
+                "provider_name": "Example Surgeon",
+                "location_source": "entity_address_unified",
+                "address_payload": {
+                    "address_key": "00000000-0000-0000-0000-000000000001",
+                    "telephone_number": "217-555-0100",
+                },
+                "telephone_number": "217-555-0100",
+            }
+        },
+        price_sets={},
+        price_atoms={},
+        provider_set_members={"provider-set": ("provider-1",)},
+        price_set_members={},
+        source_trace_sets={},
+    )
+    pagination = type("Pagination", (), {"limit": 5, "offset": 0})()
+
+    payload = serving_manifest.search_ptg2_manifest_snapshot(
+        snapshot,
+        {
+            "plan_id": "010854205",
+            "code": "29888",
+            "code_system": "CPT",
+            "include_providers": "true",
+        },
+        pagination,
+        mode_value="product_search",
+    )
+
+    assert payload is not None
+    item = payload["items"][0]
+    assert item["address_verification"]["displayed_address_present"] is False
+    assert item["address_verification"]["address_evidence_level"] == "unknown"
+    assert item["address_verification"]["reason"] == (
+        "PTG proves the provider identity is in network, but no displayable address is available."
+    )
+    for key in ("location_source", "address_sources", "address_precision", "source_count"):
+        assert key not in item["address_verification"]
+    for key in ("address", "telephone_number", "phone", "location_source", "city", "state", "zip5"):
+        assert key not in item
 
 
 def test_ptg2_manifest_dense_id_mapping_is_sorted_and_deduped():

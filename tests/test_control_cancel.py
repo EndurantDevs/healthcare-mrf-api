@@ -140,6 +140,30 @@ async def test_control_single_job_start_can_run_module_shutdown(monkeypatch):
 
     async def fake_shutdown(ctx):
         calls.append(("shutdown", dict(ctx.get("context") or {}), None))
+        ctx.setdefault("context", {}).update(
+            {
+                "staged_rows": 123,
+                "source_table_shards": 64,
+                "stage_index_profile": "serving",
+                "post_publish_index_profile": "serving",
+                "post_publish_index_concurrently": True,
+                "post_publish_index_pending": False,
+                "post_publish_index_total": 1,
+                "post_publish_index_completed": 1,
+                "post_publish_index_timings": [
+                    {"index": "geo_bbox", "seconds": 13.4},
+                ],
+                "post_publish_skipped_indexes": ["entity_address_unified.geo_idx"],
+                "published_elapsed_seconds": 233.2,
+                "phase_timings": {
+                    "entity-address-unified indexing stage": {"wall_seconds": 24.1}
+                },
+                "stage_index_timings": [
+                    {"index": "primary_npi", "seconds": 1.2},
+                ],
+                "preserve_control_run_finished_at": True,
+            }
+        )
 
     class FakeModule:
         process_data = staticmethod(fake_target)
@@ -165,6 +189,23 @@ async def test_control_single_job_start_can_run_module_shutdown(monkeypatch):
     ]
     assert result["run_id"] == "run_1"
     assert [item[1]["status"] for item in marks] == ["running", "succeeded"]
+    terminal = marks[-1][1]
+    assert terminal["metrics"]["rows"] == 123
+    assert terminal["metrics"]["staged_rows"] == 123
+    assert terminal["metrics"]["source_table_shards"] == 64
+    assert terminal["metrics"]["stage_index_profile"] == "serving"
+    assert terminal["metrics"]["post_publish_index_profile"] == "serving"
+    assert terminal["metrics"]["post_publish_index_concurrently"] is True
+    assert terminal["metrics"]["post_publish_index_pending"] is False
+    assert terminal["metrics"]["post_publish_index_total"] == 1
+    assert terminal["metrics"]["post_publish_index_completed"] == 1
+    assert terminal["metrics"]["post_publish_index_timings"][0]["index"] == "geo_bbox"
+    assert terminal["metrics"]["post_publish_skipped_indexes"] == ["entity_address_unified.geo_idx"]
+    assert terminal["metrics"]["published_elapsed_seconds"] == 233.2
+    assert terminal["metrics"]["phase_timings"]["entity-address-unified indexing stage"]["wall_seconds"] == 24.1
+    assert terminal["metrics"]["stage_index_timings"][0]["index"] == "primary_npi"
+    assert terminal["progress"]["done"] == 123
+    assert terminal["preserve_finished_at"] is True
 
 
 @pytest.mark.asyncio
@@ -329,3 +370,30 @@ async def test_mark_control_run_always_persists_terminal_update(monkeypatch):
     )
 
     assert len(db_updates) == 1
+
+
+@pytest.mark.asyncio
+async def test_mark_control_run_can_preserve_existing_finished_at(monkeypatch):
+    db_updates = []
+    live_events = []
+    status_events = []
+
+    async def fake_update(stmt):
+        db_updates.append(stmt)
+
+    monkeypatch.setattr(control_lifecycle, "_execute_control_run_update", fake_update)
+    monkeypatch.setattr(control_lifecycle, "enqueue_live_progress", lambda **payload: live_events.append(payload))
+    monkeypatch.setattr(control_lifecycle, "enqueue_status_event", lambda payload: status_events.append(payload))
+
+    await control_lifecycle.mark_control_run(
+        "run_1",
+        status="succeeded",
+        phase_detail="entity-address-unified post-publish indexes warmed",
+        progress_message="post-publish indexes warmed",
+        preserve_finished_at=True,
+    )
+
+    values = {getattr(key, "key", str(key)): value for key, value in db_updates[0]._values.items()}
+    assert "finished_at" not in values
+    assert live_events[-1]["finished_at"] is None
+    assert status_events[-1]["finished_at"] is None

@@ -51,3 +51,18 @@ def test_ptg2_artifact_cleanup_reports_missing_referenced_files(tmp_path):
     assert plan.referenced_files == ()
     assert plan.unreferenced_files == ()
     assert plan.missing_referenced_files == (missing.resolve(),)
+
+
+def test_ptg2_artifact_cleanup_remaps_stale_default_artifact_root(tmp_path):
+    artifact_root = tmp_path / "ptg2-artifacts"
+    root = artifact_root / "serving"
+    keep = root / "snapshot_a" / "provider_npi_current.ptg2sc"
+    keep.parent.mkdir(parents=True)
+    keep.write_bytes(b"keep")
+
+    stale_path = "/tmp/healthporta-ptg2-artifacts/serving/stale/provider_npi_old.ptg2sc"
+    plan = build_ptg2_artifact_cleanup_plan(root=root, referenced_paths=[stale_path])
+
+    assert plan.referenced_files == (keep.resolve(),)
+    assert plan.unreferenced_files == ()
+    assert plan.missing_referenced_files == ()

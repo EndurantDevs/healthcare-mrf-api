@@ -77,6 +77,12 @@ from process.provider_enrichment import (main as initiate_provider_enrichment,
                                          save_provider_enrichment_data,
                                          shutdown as provider_enrichment_shutdown,
                                          startup as provider_enrichment_startup)
+from process.provider_directory_fhir import (
+    main as initiate_provider_directory_fhir,
+    process_data as process_provider_directory_fhir_data,
+    shutdown as provider_directory_fhir_shutdown,
+    startup as provider_directory_fhir_startup,
+)
 from process.partd_formulary_network import (
     finish_main as finish_partd_formulary_network,
     main as initiate_partd_formulary_network,
@@ -561,6 +567,27 @@ class ProviderEnrichment_finish:  # pylint: disable=invalid-name
     queue_name = 'arq:ProviderEnrichment_finish'
     job_timeout = 86400
     burst = True
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
+class ProviderDirectoryFHIR:
+    functions = [process_provider_directory_fhir_data, control_single_job_start]
+    on_startup = provider_directory_fhir_startup
+    on_shutdown = provider_directory_fhir_shutdown
+    max_jobs = (
+        int(os.environ.get("HLTHPRT_MAX_PROVIDER_DIRECTORY_FHIR_JOBS"))
+        if os.environ.get("HLTHPRT_MAX_PROVIDER_DIRECTORY_FHIR_JOBS")
+        else 2
+    )
+    queue_read_limit = 2 * max_jobs
+    queue_name = "arq:ProviderDirectoryFHIR"
+    job_timeout = (
+        int(os.environ.get("HLTHPRT_PROVIDER_DIRECTORY_FHIR_JOB_TIMEOUT"))
+        if os.environ.get("HLTHPRT_PROVIDER_DIRECTORY_FHIR_JOB_TIMEOUT")
+        else 86400
+    )
     redis_settings = build_redis_settings()
     job_serializer = serialize_job
     job_deserializer = deserialize_job
@@ -1119,6 +1146,105 @@ def provider_enrichment(test: bool):
     _run(initiate_provider_enrichment(test_mode=test))
 
 
+@click.command(help="Run payer Provider Directory FHIR source/catalog/resource import")
+@click.option("--test", is_flag=True, help="Use a tiny built-in source fixture for a quick smoke run.")
+@click.option("--seed-db-path", help="Path to provider-directory-db SQLite seed file.")
+@click.option("--seed-db-url", help="URL for provider-directory-db SQLite seed file.")
+@click.option("--limit", type=int, help="Maximum seed sources to process.")
+@click.option("--source-query", help="Case-insensitive org/plan substring filter for the seed database.")
+@click.option("--seed-only", is_flag=True, help="Load source rows without probing endpoints.")
+@click.option("--no-probe", is_flag=True, help="Skip CapabilityStatement probes.")
+@click.option("--import-resources", is_flag=True, help="Fetch resources from importable FHIR endpoints.")
+@click.option(
+    "--full-refresh/--sample-refresh",
+    default=False,
+    show_default=True,
+    help="Default to unbounded resource/page scanning for full Provider Directory refreshes.",
+)
+@click.option(
+    "--stale-cleanup/--no-stale-cleanup",
+    default=None,
+    help="Delete rows absent from a completed source/resource scan. Defaults on for non-test resource imports.",
+)
+@click.option(
+    "--publish-artifacts/--no-publish-artifacts",
+    default=None,
+    help="Refresh derived Provider Directory address/search artifacts. Defaults on only for full default resource imports.",
+)
+@click.option(
+    "--open-only/--include-credentialed",
+    default=True,
+    show_default=True,
+    help=(
+        "Limit resource fetches to sources marked open/none or passing unauthenticated metadata probe "
+        "unless explicitly including credentialed endpoints."
+    ),
+)
+@click.option("--include-auth-required", is_flag=True, help="Attempt resources from seed rows last marked auth_required.")
+@click.option(
+    "--resources",
+    help="Comma-separated resources to fetch. Defaults to InsurancePlan,PractitionerRole,Practitioner,Organization,Location,HealthcareService,OrganizationAffiliation.",
+)
+@click.option("--resource-limit", type=int, help="Rows per source/resource to retain.")
+@click.option("--linked-resource-limit", type=int, help="Referenced FHIR resources per source to fetch after paged resources.")
+@click.option("--page-limit", type=int, help="Maximum FHIR pages per source/resource.")
+@click.option("--page-count", type=int, help="FHIR _count page size.")
+@click.option("--stream-batch-size", type=int, help="Rows per streaming upsert batch. Use 0 to retain rows and upsert after each resource scan.")
+@click.option("--source-concurrency", type=int, help="Concurrent source resource imports.")
+@click.option("--concurrency", type=int, help="Concurrent source metadata probes.")
+@click.option("--timeout", type=int, help="Per-request timeout in seconds.")
+def provider_directory_fhir(
+    test: bool,
+    seed_db_path: str | None,
+    seed_db_url: str | None,
+    limit: int | None,
+    source_query: str | None,
+    seed_only: bool,
+    no_probe: bool,
+    import_resources: bool,
+    full_refresh: bool,
+    stale_cleanup: bool | None,
+    publish_artifacts: bool | None,
+    open_only: bool,
+    include_auth_required: bool,
+    resources: str | None,
+    resource_limit: int | None,
+    linked_resource_limit: int | None,
+    page_limit: int | None,
+    page_count: int | None,
+    stream_batch_size: int | None,
+    source_concurrency: int | None,
+    concurrency: int | None,
+    timeout: int | None,
+):
+    _run(
+        initiate_provider_directory_fhir(
+            test_mode=test,
+            seed_db_path=seed_db_path,
+            seed_db_url=seed_db_url,
+            limit=limit,
+            source_query=source_query,
+            seed_only=seed_only,
+            probe=not no_probe,
+            import_resources=import_resources,
+            full_refresh=full_refresh,
+            stale_cleanup=stale_cleanup,
+            publish_artifacts=publish_artifacts,
+            open_only=open_only,
+            include_auth_required=include_auth_required,
+            resources=resources,
+            resource_limit=resource_limit,
+            linked_resource_limit=linked_resource_limit,
+            page_limit=page_limit,
+            page_count=page_count,
+            stream_batch_size=stream_batch_size,
+            source_concurrency=source_concurrency,
+            concurrency=concurrency,
+            timeout=timeout,
+        )
+    )
+
+
 @click.command(help="Finish provider quality import for a queued run id")
 @click.option("--import-id", required=True, help="Import id/date suffix used for staging tables.")
 @click.option("--run-id", required=True, help="Run id emitted by `start provider-quality`.")
@@ -1201,12 +1327,18 @@ def pharmacy_economics(test: bool):
     help="full rebuilds all sources; ptg-partial reuses live rows while refreshing one PTG source.",
 )
 @click.option("--ptg-source-key", help="PTG source key to refresh when --refresh-mode=ptg-partial.")
+@click.option(
+    "--serving-only-refresh/--full-refresh-support",
+    default=None,
+    help="For full refreshes, publish only the denormalized serving table and leave support tables unchanged.",
+)
 def entity_address_unified(
     test: bool,
     limit_per_source: int | None,
     publish: bool | None,
     refresh_mode: str,
     ptg_source_key: str | None,
+    serving_only_refresh: bool | None,
 ):
     _run(
         initiate_entity_address_unified(
@@ -1215,6 +1347,7 @@ def entity_address_unified(
             publish=publish,
             refresh_mode=refresh_mode,
             ptg_source_key=ptg_source_key,
+            serving_only_refresh=serving_only_refresh,
         )
     )
 
@@ -1505,6 +1638,7 @@ process_group.add_command(claims_pricing, name="claims-pricing")
 process_group.add_command(claims_procedures, name="claims-procedures")
 process_group.add_command(drug_claims, name="drug-claims")
 process_group.add_command(provider_quality, name="provider-quality")
+process_group.add_command(provider_directory_fhir, name="provider-directory-fhir")
 process_group.add_command(partd_formulary_network, name="partd-formulary-network")
 process_group.add_command(pharmacy_license, name="pharmacy-license")
 process_group.add_command(places_zcta, name="places-zcta")

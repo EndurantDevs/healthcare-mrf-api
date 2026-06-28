@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import html
 import json
 import os
 from dataclasses import asdict, is_dataclass
@@ -180,7 +181,7 @@ def canonicalize_url(url: str) -> str:
 
 def normalize_tic_source_url(url: str) -> str:
     """Normalize known payer TOC download URLs that point at stale wrappers."""
-    raw_url = str(url or "").strip()
+    raw_url = html.unescape(str(url or "").strip())
     parsed = urlsplit(raw_url)
     if parsed.netloc.lower() == "www.asrhealthbenefits.com":
         path = parsed.path.rstrip("/")

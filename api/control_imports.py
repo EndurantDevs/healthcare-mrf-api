@@ -168,6 +168,14 @@ _SINGLE_JOB_ADAPTERS: dict[str, dict[str, Any]] = {
         "target_module": "process.provider_enrichment",
         "target_function": "process_data",
     },
+    "provider-directory-fhir": {
+        "queue": "arq:ProviderDirectoryFHIR",
+        "function": "control_single_job_start",
+        "payload": "control_wrapped",
+        "target_module": "process.provider_directory_fhir",
+        "target_function": "process_data",
+        "run_shutdown": True,
+    },
     "entity-address-unified": {
         "queue": "arq:EntityAddressUnified",
         "function": "control_single_job_start",
@@ -216,6 +224,7 @@ _CANCELABLE_IMPORTERS = {
     "nucc",
     "places-zcta",
     "cms-doctors",
+    "provider-directory-fhir",
     "address-archive-v2-migrate",
     "openaddresses",
 }
@@ -310,6 +319,7 @@ def _importer_family(importer: str) -> str:
         "nucc",
         "provider-quality",
         "provider-enrichment",
+        "provider-directory-fhir",
         "entity-address-unified",
         "ptg-address",
         "ptg-address-entity-refresh",

@@ -30,6 +30,7 @@ PTG2_MANIFEST_SERVING_COLUMNS = [
     "provider_count",
     "price_set_global_id_128",
     "source_trace_set_hash",
+    "network_names",
 ]
 PTG2_MANIFEST_PRICE_ATOM_COLUMNS = [
     "price_atom_global_id_128",
@@ -87,7 +88,8 @@ async def _create_ptg2_manifest_serving_stage_table(token: str) -> str:
             provider_set_global_id_128 {id_type} NOT NULL,
             provider_count integer,
             price_set_global_id_128 {id_type} NOT NULL,
-            source_trace_set_hash varchar(64)
+            source_trace_set_hash varchar(64),
+            network_names varchar[] NOT NULL DEFAULT '{{}}'
         );
         """
     )
@@ -213,7 +215,8 @@ async def _dedupe_ptg2_manifest_serving_table(schema_name: str, final_table: str
             provider_set_global_id_128,
             provider_count,
             price_set_global_id_128,
-            source_trace_set_hash
+            source_trace_set_hash,
+            network_names
         FROM {_quote_ident(schema_name)}.{_quote_ident(final_table)}
         ORDER BY serving_content_hash_128, source_trace_set_hash NULLS LAST;
         """

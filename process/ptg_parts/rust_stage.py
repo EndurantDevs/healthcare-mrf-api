@@ -37,6 +37,7 @@ _RUST_COPY_TABLE_SPECS = {
             "provider_count",
             "price_set_hash",
             "source_trace_set_hash",
+            "network_names",
         ],
         ["serving_rate_id"],
     ),
