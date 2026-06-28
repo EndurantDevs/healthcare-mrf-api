@@ -75,6 +75,7 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
                 plan_name_contains=_string_list(params.get("plan_name_contains")),
                 plan_market_types=_string_list(params.get("plan_market_types") or params.get("plan_market_type")),
                 file_url_contains=_string_list(params.get("file_url_contains")),
+                source_network_names=_string_list(params.get("source_network_names") or params.get("source_network_name")),
                 reuse_raw_artifacts=bool(params.get("reuse_raw_artifacts", True)),
                 keep_partial_artifacts=params.get("keep_partial_artifacts"),
                 control_run_id=run_id,

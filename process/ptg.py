@@ -678,6 +678,7 @@ async def _parse_in_network_file_serving_only(
     max_items: int | None = None,
     rust_stage_tables: dict[str, str] | None = None,
     ptg2_manifest_stage_table: str | None = None,
+    source_network_names: list[str] | str | None = None,
 ) -> dict[str, Any]:
     if not ptg2_manifest_stage_table:
         raise RuntimeError("PTG imports require manifest serving stage tables")
@@ -687,6 +688,7 @@ async def _parse_in_network_file_serving_only(
         logger.info("Ignoring max_items=%s for manifest-backed Rust PTG import", max_items)
 
     plan_fields = _derive_plan_fields(meta, plan_info)
+    source_network_name_values = _normalize_source_network_names(source_network_names)
     plan_row, alias_rows, plan_month_row = _ptg2_plan_rows(plan_fields, snapshot_id, import_month)
     _source_trace_row, _source_trace_set_row = _ptg2_source_trace_rows(source_version, source_url)
     source_trace_set_hash = _source_trace_set_row["source_trace_set_hash"]
@@ -828,6 +830,7 @@ async def _parse_in_network_file_serving_only(
             manifest_price_forward_sidecar_path=manifest_sidecar_paths.get("price_forward"),
             manifest_price_atom_copy_path=manifest_price_atom_copy_path,
             manifest_provider_group_member_copy_path=manifest_provider_group_member_copy_path,
+            source_network_names=source_network_name_values,
             manifest_only=True,
         ):
             if record_kind == "dedupe_summary":
@@ -1982,6 +1985,7 @@ async def _process_in_network_file(
     import_month: datetime.date | None = None,
     rust_stage_tables: dict[str, str] | None = None,
     ptg2_manifest_stage_table: str | None = None,
+    source_network_names: list[str] | str | None = None,
     raw_artifact: PTG2RawArtifact | None = None,
     logical_artifact: PTG2LogicalArtifact | None = None,
 ) -> PTG2FileProcessResult:
@@ -2025,6 +2029,7 @@ async def _process_in_network_file(
         else:
             provider_cache = PTG2ProviderReferenceCache(Path(tmpdir) / "provider_refs.sqlite", provider_ref_cache)
         parse_summary: dict[str, Any] | None = None
+        source_network_name_values = _normalize_source_network_names(source_network_names or job.get("source_network_names"))
         try:
             if compact_import:
                 parse_summary = await _parse_in_network_file_serving_only(
@@ -2042,6 +2047,7 @@ async def _process_in_network_file(
                     max_items=max_items,
                     rust_stage_tables=rust_stage_tables,
                     ptg2_manifest_stage_table=ptg2_manifest_stage_table,
+                    source_network_names=source_network_name_values,
                 )
             else:
                 parse_summary = await _parse_in_network_file_single_pass(
@@ -2170,6 +2176,18 @@ def _ptg2_source_file_versions_from_results(files: list[dict[str, Any]]) -> list
     return versions
 
 
+def _normalize_source_network_names(value: Any) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for raw_value in _as_list(value):
+        name = str(raw_value or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+    return names
+
+
 async def main(
     test_mode: bool = False,
     toc_urls: list[str] | None = None,
@@ -2186,6 +2204,7 @@ async def main(
     plan_name_contains: list[str] | None = None,
     plan_market_types: list[str] | None = None,
     file_url_contains: list[str] | None = None,
+    source_network_names: list[str] | str | None = None,
     reuse_raw_artifacts: bool = True,
     keep_partial_artifacts: bool | None = None,
     control_run_id: str | None = None,
@@ -2217,6 +2236,7 @@ async def main(
         snapshot_id=snapshot_id,
         import_run_id=import_run_id,
     )
+    source_network_name_values = _normalize_source_network_names(source_network_names)
     # Enforce a streaming size cap on every caller-supplied URL (never None for
     # control-triggered runs) so a malicious/huge target cannot OOM or fill the node.
     max_bytes = fetch_max_bytes(PTG2_DEFAULT_MAX_BYTES)
@@ -2249,6 +2269,7 @@ async def main(
         "plan_name_contains": plan_name_contains or [],
         "plan_market_types": plan_market_types or [],
         "file_url_contains": file_url_contains or [],
+        "source_network_names": source_network_name_values,
         "max_files": max_files,
         "max_items": max_items,
         "reuse_raw_artifacts": reuse_raw_artifacts,
@@ -2355,10 +2376,19 @@ async def main(
             )
 
         if in_network_url:
-            jobs.append({"type": "in_network", "url": in_network_url})
+            job: dict[str, Any] = {"type": "in_network", "url": in_network_url}
+            if source_network_name_values:
+                job["source_network_names"] = source_network_name_values
+            jobs.append(job)
         if allowed_url:
             jobs.append({"type": "allowed_amounts", "url": allowed_url})
         jobs = _filter_jobs_by_url_contains(jobs, file_url_contains)
+        if source_network_name_values:
+            for job in jobs:
+                if job.get("type") == "in_network" and not _normalize_source_network_names(
+                    job.get("source_network_names")
+                ):
+                    job["source_network_names"] = source_network_name_values
         jobs_discovered_before_dedupe = len(jobs)
         jobs, duplicate_jobs_skipped = _dedupe_ptg_jobs(jobs)
         if duplicate_jobs_skipped:
@@ -2489,6 +2519,7 @@ async def main(
                     import_month=import_month_value,
                     rust_stage_tables=None,
                     ptg2_manifest_stage_table=ptg2_manifest_stage_table,
+                    source_network_names=job.get("source_network_names"),
                     raw_artifact=downloaded.raw_artifact,
                     logical_artifact=downloaded.logical_artifact,
                 )

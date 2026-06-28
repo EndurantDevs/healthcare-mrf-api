@@ -315,6 +315,7 @@ def _iter_compact_serving_records_rust(
     manifest_price_forward_sidecar_path: str | Path | None = None,
     manifest_price_atom_copy_path: str | Path | None = None,
     manifest_provider_group_member_copy_path: str | Path | None = None,
+    source_network_names: list[str] | tuple[str, ...] | set[str] | None = None,
     manifest_only: bool | None = None,
     live_progress_context: dict[str, Any] | None = None,
 ):
@@ -369,6 +370,11 @@ def _iter_compact_serving_records_rust(
         env["HLTHPRT_PTG2_MANIFEST_PRICE_ATOM_COPY_PATH"] = str(manifest_price_atom_copy_path)
     if manifest_provider_group_member_copy_path is not None:
         env["HLTHPRT_PTG2_MANIFEST_PROVIDER_GROUP_MEMBER_COPY_PATH"] = str(manifest_provider_group_member_copy_path)
+    normalized_source_network_names = sorted(
+        {str(value).strip() for value in (source_network_names or []) if str(value or "").strip()}
+    )
+    if normalized_source_network_names:
+        env["HLTHPRT_PTG2_SOURCE_NETWORK_NAMES_JSON"] = json.dumps(normalized_source_network_names)
     if manifest_only is not None:
         env["HLTHPRT_PTG2_MANIFEST_ONLY"] = "true" if manifest_only else "false"
     env.setdefault(PTG2_RUST_WORKERS_ENV, str(PTG2_DEFAULT_RUST_WORKERS))
@@ -475,6 +481,7 @@ async def _aiter_compact_serving_records_rust(
     manifest_price_forward_sidecar_path: str | Path | None = None,
     manifest_price_atom_copy_path: str | Path | None = None,
     manifest_provider_group_member_copy_path: str | Path | None = None,
+    source_network_names: list[str] | tuple[str, ...] | set[str] | None = None,
     manifest_only: bool | None = None,
 ):
     live_progress_context = current_live_progress_context()
@@ -502,6 +509,7 @@ async def _aiter_compact_serving_records_rust(
         manifest_price_forward_sidecar_path=manifest_price_forward_sidecar_path,
         manifest_price_atom_copy_path=manifest_price_atom_copy_path,
         manifest_provider_group_member_copy_path=manifest_provider_group_member_copy_path,
+        source_network_names=source_network_names,
         manifest_only=manifest_only,
         live_progress_context=live_progress_context,
     )

@@ -2635,6 +2635,7 @@ def test_ptg2_main_processes_downloaded_files_concurrently_when_enabled(monkeypa
     pushed = []
     active = 0
     max_active = 0
+    processed_jobs = []
 
     async def fake_push(rows, cls, **_kwargs):
         pushed.extend((getattr(cls, "__name__", str(cls)), row) for row in rows)
@@ -2658,6 +2659,7 @@ def test_ptg2_main_processes_downloaded_files_concurrently_when_enabled(monkeypa
 
     async def fake_process(job, *_args, **_kwargs):
         nonlocal active, max_active
+        processed_jobs.append(dict(job))
         active += 1
         max_active = max(max_active, active)
         await asyncio.sleep(0.05)
@@ -2703,10 +2705,12 @@ def test_ptg2_main_processes_downloaded_files_concurrently_when_enabled(monkeypa
             import_month="2026-04",
             import_id="file_concurrency_test",
             source_key="file_concurrency_test",
+            source_network_names=["C2"],
         )
     )
 
     assert max_active == 2
+    assert [job["source_network_names"] for job in processed_jobs] == [["C2"], ["C2"]]
     assert result["files_processed"] == 2
     assert result["address_refresh"] == {"status": "queued", "run_id": "run-refresh"}
     refresh_mock.assert_awaited_once()

@@ -504,6 +504,31 @@ fn env_path(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn env_json_text_list(name: &str) -> Vec<String> {
+    let Some(raw) = env_path(name) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+        return Vec::new();
+    };
+    let mut values = Vec::new();
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                if let Some(text) = normalize_string(Some(&item)) {
+                    values.push(text);
+                }
+            }
+        }
+        item => {
+            if let Some(text) = normalize_string(Some(&item)) {
+                values.push(text);
+            }
+        }
+    }
+    canonical_text_list(values, false)
+}
+
 struct CopyFileEvent {
     record_kind: String,
     path: String,
@@ -2587,7 +2612,7 @@ fn process_compact_rate_lites<W: Write>(
             provider_entry.provider_group_hashes,
             provider_entry.npi,
             provider_entry.provider_count,
-            rate.network_names.clone(),
+            rate_network_names(rate, context),
         ));
     }
 
@@ -2874,6 +2899,15 @@ struct CompactContext {
     plan_month_id: String,
     source_trace_set_hash: String,
     confidence_code: String,
+    source_network_names: Vec<String>,
+}
+
+fn rate_network_names(rate: &RateLite, context: &CompactContext) -> Vec<String> {
+    if rate.network_names.is_empty() {
+        context.source_network_names.clone()
+    } else {
+        rate.network_names.clone()
+    }
 }
 
 enum WorkerJob {
@@ -3164,6 +3198,7 @@ fn process_compact_rate_lites_worker<W: Write>(
             let Some(price_set) = price_lite_set(&rate.prices, price_code_set_hash_cache) else {
                 continue;
             };
+            let network_names = rate_network_names(rate, context);
             let sorted_provider_entry_hashes = [provider_entry.entry_hash()];
             let sorted_provider_hashes = provider_entry.provider_group_hashes();
             let sorted_provider_npis = provider_entry.npi();
@@ -3277,7 +3312,7 @@ fn process_compact_rate_lites_worker<W: Write>(
                         provider_count,
                         price_set_hash: &price_set_hash,
                         source_trace_set_hash: &context.source_trace_set_hash,
-                        network_names: &rate.network_names,
+                        network_names: &network_names,
                     })?;
                 } else {
                     emit_json_record(
@@ -3299,7 +3334,7 @@ fn process_compact_rate_lites_worker<W: Write>(
                             "provider_count": provider_count,
                             "price_set_hash": price_set_hash,
                             "source_trace_set_hash": context.source_trace_set_hash.clone(),
-                            "network_names": rate.network_names.clone(),
+                            "network_names": network_names.clone(),
                             "confidence_code": context.confidence_code.clone(),
                         }),
                     )?;
@@ -3318,7 +3353,7 @@ fn process_compact_rate_lites_worker<W: Write>(
                         provider_count,
                         price_set_global_id_128: &identity.price_set_global_id_128,
                         source_trace_set_hash: &context.source_trace_set_hash,
-                        network_names: &rate.network_names,
+                        network_names: &network_names,
                     })?;
                 }
             }
@@ -3337,7 +3372,7 @@ fn process_compact_rate_lites_worker<W: Write>(
                 provider_entry.provider_group_hashes,
                 provider_entry.npi,
                 provider_entry.provider_count,
-                rate.network_names.clone(),
+                rate_network_names(rate, context),
             ))
         })
         .collect();
@@ -5185,6 +5220,7 @@ fn scan_compact_struson(path: &Path) -> io::Result<()> {
         "HLTHPRT_PTG2_RUST_WORK_QUEUE",
         DEFAULT_COMPACT_RUST_WORK_QUEUE,
     );
+    let source_network_names = env_json_text_list("HLTHPRT_PTG2_SOURCE_NETWORK_NAMES_JSON");
     if rust_worker_count > 1
         && copy_paths.has_file_paths()
         && compact_parallel_has_provider_references(path)?
@@ -5198,6 +5234,7 @@ fn scan_compact_struson(path: &Path) -> io::Result<()> {
                     plan_month_id,
                     source_trace_set_hash,
                     confidence_code,
+                    source_network_names: source_network_names.clone(),
                 },
                 rust_worker_count,
                 rust_queue_size,
@@ -5213,6 +5250,7 @@ fn scan_compact_struson(path: &Path) -> io::Result<()> {
                 plan_month_id,
                 source_trace_set_hash,
                 confidence_code,
+                source_network_names,
             },
             rust_worker_count,
             rust_queue_size,
@@ -5329,6 +5367,7 @@ fn scan_compact_struson(path: &Path) -> io::Result<()> {
                             plan_month_id: plan_month_id.clone(),
                             source_trace_set_hash: source_trace_set_hash.clone(),
                             confidence_code: confidence_code.clone(),
+                            source_network_names: source_network_names.clone(),
                         },
                         chunk_size: negotiated_rate_chunk_size,
                     };
