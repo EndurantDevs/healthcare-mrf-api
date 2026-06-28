@@ -1588,7 +1588,7 @@ def test_entity_address_unified_can_inline_source_evidence():
     assert "LEFT JOIN evidence e" in inline_sql
 
 
-def test_entity_address_unified_can_skip_source_record_id_aggregation(monkeypatch):
+def test_entity_address_unified_retains_provider_directory_record_ids_when_aggregation_disabled(monkeypatch):
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_AGGREGATE_SOURCE_RECORD_IDS", "0")
 
     raw_sql = entity_address_unified._materialize_from_raw_sql(
@@ -1620,10 +1620,12 @@ def test_entity_address_unified_can_skip_source_record_id_aggregation(monkeypatc
         ],
     )
 
-    assert "ARRAY[]::varchar[] AS source_record_ids" in raw_sql
-    assert "ARRAY[]::varchar[] AS source_record_ids" in direct_sql
-    assert "ARRAY_AGG(DISTINCT source_record_id ORDER BY source_record_id)" not in raw_sql
-    assert "ARRAY_AGG(DISTINCT source_record_id ORDER BY source_record_id)" not in direct_sql
+    assert "FILTER (WHERE source_record_id LIKE 'provider_directory_fhir:%')" in raw_sql
+    assert "FILTER (WHERE source_record_id LIKE 'provider_directory_fhir:%')" in direct_sql
+    assert "ARRAY[]::varchar[])::varchar[] AS source_record_ids" in raw_sql
+    assert "ARRAY[]::varchar[])::varchar[] AS source_record_ids" in direct_sql
+    assert "ARRAY[]::varchar[] AS source_record_ids" not in raw_sql
+    assert "ARRAY[]::varchar[] AS source_record_ids" not in direct_sql
     assert "COALESCE(e.evidence_record_ids, source_record_ids" in raw_sql
 
 

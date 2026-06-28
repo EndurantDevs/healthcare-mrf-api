@@ -703,6 +703,20 @@ def _aggregate_source_record_ids() -> bool:
     )
 
 
+def _source_record_ids_select_sql() -> str:
+    if _aggregate_source_record_ids():
+        return (
+            "ARRAY_REMOVE(ARRAY_AGG(DISTINCT source_record_id ORDER BY source_record_id), NULL)"
+            "::varchar[] AS source_record_ids"
+        )
+    return (
+        "COALESCE(ARRAY_REMOVE("
+        "ARRAY_AGG(DISTINCT source_record_id ORDER BY source_record_id) "
+        "FILTER (WHERE source_record_id LIKE 'provider_directory_fhir:%'), "
+        "NULL), ARRAY[]::varchar[])::varchar[] AS source_record_ids"
+    )
+
+
 def _require_inline_source_evidence() -> bool:
     return _env_bool(
         "HLTHPRT_ENTITY_ADDRESS_UNIFIED_REQUIRE_INLINE_SOURCE_EVIDENCE",
@@ -4120,11 +4134,7 @@ def _materialize_from_raw_sql(
     inline_source_evidence: bool = False,
 ) -> str:
     dedupe_key_expr = _dedupe_key_expr(address_canon_available)
-    source_record_ids_select = (
-        "ARRAY_REMOVE(ARRAY_AGG(DISTINCT source_record_id ORDER BY source_record_id), NULL)::varchar[] AS source_record_ids"
-        if _aggregate_source_record_ids()
-        else "ARRAY[]::varchar[] AS source_record_ids"
-    )
+    source_record_ids_select = _source_record_ids_select_sql()
     split_array_aggregates = _env_bool(
         "HLTHPRT_ENTITY_ADDRESS_UNIFIED_SPLIT_ARRAY_AGGREGATES",
         DEFAULT_SPLIT_ARRAY_AGGREGATES,
@@ -4433,11 +4443,7 @@ def _materialize_sql(
 ) -> str:
     selects_sql = "\nUNION ALL\n".join(select.strip() for select in source_selects)
     dedupe_key_expr = _dedupe_key_expr(address_canon_available)
-    source_record_ids_select = (
-        "ARRAY_REMOVE(ARRAY_AGG(DISTINCT source_record_id ORDER BY source_record_id), NULL)::varchar[] AS source_record_ids"
-        if _aggregate_source_record_ids()
-        else "ARRAY[]::varchar[] AS source_record_ids"
-    )
+    source_record_ids_select = _source_record_ids_select_sql()
     return f"""
     INSERT INTO {db_schema}.{stage_table} (
         entity_type,
