@@ -975,6 +975,7 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "United Healthcare Dental" in by_name["United Healthcare"].aliases
     assert "UHC Vision" in by_name["United Healthcare"].aliases
     assert "UHC Vision Using Spectera Network" in by_name["United Healthcare"].aliases
+    assert "UMR (Using Spectera Network)" in by_name["United Healthcare"].aliases
     assert "UHC Global" in by_name["United Healthcare"].aliases
     assert "Employee Benefit Management Services EBMS" in by_name["EBMS"].aliases
     assert "Independence Administrators" in by_name["Independence Blue Cross"].aliases
@@ -992,14 +993,30 @@ async def test_master_list_keeps_high_value_public_aliases():
     )
     assert "Cigna Dental PPO" in by_name["Cigna"].aliases
     assert "Horizon Healthcare Dental" in by_name["Horizon BCBS NJ"].aliases
+    assert "NVA" in aliases_by_name["Capital Blue Cross"]
+    assert "National Vision Administrators" in aliases_by_name["Capital Blue Cross"]
+    assert "Capital Blue Cross Vision NVA" in aliases_by_name["Capital Blue Cross"]
+    assert by_name["Davis Vision"].status == "needs_review"
+    assert "Davis Vision by MetLife" in by_name["Davis Vision"].aliases
+    assert by_name["Superior Vision"].status == "needs_review"
+    assert "Versant Health Superior Vision" in by_name["Superior Vision"].aliases
     assert by_name["EyeMed"].entity_type == "vision"
     assert by_name["EyeMed"].benefit_lines == ("vision",)
     assert by_name["EyeMed"].hosting_platform == "direct_mrf_body"
     assert "EyeMed Vision Care" in by_name["EyeMed"].aliases
     assert "Eye Med" in by_name["EyeMed"].aliases
     assert "Ameritas with EyeMed" in by_name["EyeMed"].aliases
+    assert "Mutual of Omaha with EyeMed" in by_name["EyeMed"].aliases
+    assert "BlueCare Vision of Texas (powered by EyeMed)" in by_name["EyeMed"].aliases
+    assert "Cigna Vision serviced by EyeMed" in by_name["EyeMed"].aliases
+    assert "Delta Vision EyeMed" in by_name["EyeMed"].aliases
     assert "DeltaVision EyeMed" in by_name["EyeMed"].aliases
+    assert "DeltaVision administered by EyeMed" in by_name["EyeMed"].aliases
     assert "DeltaVision with EyeMed" in by_name["EyeMed"].aliases
+    assert "Unum Vision Powered by Eyemed" in by_name["EyeMed"].aliases
+    assert "Surency Vision" in by_name["EyeMed"].aliases
+    assert "Surency EyeMed" in by_name["EyeMed"].aliases
+    assert "Companion Life EyeMed" in by_name["EyeMed"].aliases
     assert "ProTec" in by_name["EyeMed"].aliases
     assert "Advantica" in by_name["EyeMed"].aliases
     assert "HealthLink Network" in by_name["HealthLink"].aliases
@@ -1009,13 +1026,29 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert by_name["VSP Vision"].benefit_lines == ("vision",)
     assert "VSP" in by_name["VSP Vision"].aliases
     assert "Vision Service Plan (VSP)" in by_name["VSP Vision"].aliases
+    assert "Vision Plan Service (VSP)" in by_name["VSP Vision"].aliases
+    assert "Vision Serivce Plan (VSP)" in by_name["VSP Vision"].aliases
     assert "VSP Choice Network" in by_name["VSP Vision"].aliases
     assert "Guardian VSP Network" in by_name["VSP Vision"].aliases
+    assert "Guardian Vision Powered by VSP" in by_name["VSP Vision"].aliases
     assert "Principal Financial Group VSP" in by_name["VSP Vision"].aliases
+    assert "Principal Vision VSP" in by_name["VSP Vision"].aliases
     assert "MetLife VSP Choice" in by_name["VSP Vision"].aliases
+    assert "MetLife using VSP Choice Network" in by_name["VSP Vision"].aliases
+    assert "Sun Life Vision VSP" in by_name["VSP Vision"].aliases
     assert "Ameritas with VSP" in by_name["VSP Vision"].aliases
+    assert "VSP Ameritas" in by_name["VSP Vision"].aliases
+    assert "Equitable Vision VSP" in by_name["VSP Vision"].aliases
+    assert "Renaissance Vision VSP" in by_name["VSP Vision"].aliases
+    assert "Beam Benefits VSP" in by_name["VSP Vision"].aliases
+    assert "Companion Life VSP" in by_name["VSP Vision"].aliases
+    assert "DeltaVision" in by_name["VSP Vision"].aliases
     assert "DeltaVision VSP" in by_name["VSP Vision"].aliases
     assert "DeltaVision with VSP" in by_name["VSP Vision"].aliases
+    assert by_name["Vision Benefits of America"].status == "needs_review"
+    assert "VBA" in by_name["Vision Benefits of America"].aliases
+    assert by_name["Avesis"].status == "needs_review"
+    assert "Avesis Vision" in by_name["Avesis"].aliases
     assert by_name["GEHA"].hosting_platform == "html_delegated_mrf_links"
     assert by_name["GEHA"].benefit_lines == ("dental", "medical")
     assert "Connection Dental Federal" in by_name["GEHA"].aliases
@@ -1041,6 +1074,8 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert by_name["BCBS North Carolina"].hosting_platform == "direct_toc"
     assert "Blue Cross Blue Shield of NC" in aliases_by_name["BCBS North Carolina"]
     assert "BlueCross BlueShield of NC" in aliases_by_name["BCBS North Carolina"]
+    assert "Community Eye Care" in aliases_by_name["BCBS North Carolina"]
+    assert "CEC Vision" in aliases_by_name["BCBS North Carolina"]
     assert by_name["Triple-S Salud"].hosting_platform == "triples_mtt_api"
     assert "Care Plus ELA" in by_name["Triple-S Salud"].aliases
     assert (
@@ -1078,6 +1113,36 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "EVHC" in by_name["Luminare Health Benefits"].aliases
     assert "Evolution Healthcare" in by_name["Luminare Health Benefits"].aliases
     assert "Evolution Healthcare EVHC" in by_name["Luminare Health Benefits"].aliases
+
+
+@pytest.mark.asyncio
+async def test_master_list_public_alias_queries_match_expected_candidates():
+    candidates = await discovery._load_candidates(
+        "master-list", test_mode=True, limit=2000
+    )
+
+    def matching_names(query: str) -> set[str]:
+        return {
+            candidate.payer_name
+            for candidate in candidates
+            if discovery._candidate_matches_text_filters(
+                candidate,
+                entity_types=(),
+                payer_query=query,
+            )
+        }
+
+    assert "United Healthcare" in matching_names("UMR (Using Spectera Network)")
+    assert "EyeMed" in matching_names("Cigna Vision serviced by EyeMed")
+    assert "EyeMed" in matching_names("BlueCare Vision of Texas (powered by EyeMed)")
+    assert "EyeMed" in matching_names("DeltaVision administered by EyeMed")
+    assert "EyeMed" in matching_names("Surency Vision")
+    assert "VSP Vision" in matching_names("Vision Serivce Plan")
+    assert "VSP Vision" in matching_names("MetLife using VSP Choice Network")
+    assert "VSP Vision" in matching_names("Renaissance Vision VSP")
+    assert "Capital Blue Cross" in matching_names("Capital Blue Cross Vision NVA")
+    assert "BCBS North Carolina" in matching_names("Community Eye Care")
+    assert "Superior Vision" in matching_names("Versant Health Superior Vision")
 
 
 @pytest.mark.asyncio
