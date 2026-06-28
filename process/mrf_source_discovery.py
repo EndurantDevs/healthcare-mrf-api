@@ -11056,13 +11056,14 @@ async def _push_import_control_catalog(
                 await _mark_import_control_seed_promoted(
                     session, base, row, ic_source_id
                 )
-                if staged:
+                public_status = str(row.get("status") or "active").strip() or "active"
+                if staged or public_status.lower() != "active":
                     await _promote_import_control_source(
                         session,
                         base,
                         row,
                         visibility="public",
-                        status="active",
+                        status=public_status,
                         preserve_operator_state=False,
                     )
                 sources_synced += 1

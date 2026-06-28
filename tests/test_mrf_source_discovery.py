@@ -4982,6 +4982,108 @@ async def test_push_import_control_catalog_marks_successful_seed_promoted(monkey
 
 
 @pytest.mark.asyncio
+async def test_push_import_control_catalog_preserves_registry_stale_status(
+    monkeypatch,
+):
+    calls = []
+
+    class FakeResponse:
+        def __init__(self, payload, status=200):
+            self.payload = payload
+            self.status = status
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        async def json(self):
+            return self.payload
+
+        async def text(self):
+            return "error"
+
+    class FakeSession:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        def post(self, url, json):
+            calls.append({"url": url, "json": json})
+            if url.endswith("/v1/catalog/sources"):
+                return FakeResponse({"source_id": "ic_source_1"})
+            if url.endswith("/v1/ptg/discover/ingest-preview"):
+                return FakeResponse({"counts": {"plans": 1}})
+            if url.endswith("/v1/catalog/seeds/import"):
+                return FakeResponse({"count": 1, "items": json.get("items") or []})
+            return FakeResponse({}, status=404)
+
+        def get(self, url):
+            calls.append({"url": url, "json": None})
+            if url.endswith("/v1/catalog/sources/ic_source_1"):
+                return FakeResponse(
+                    {
+                        "source_id": "ic_source_1",
+                        "visibility": "public",
+                        "status": "active",
+                    }
+                )
+            return FakeResponse({}, status=404)
+
+    async def fake_snapshot(source_ids):
+        assert source_ids == ["source_stale"]
+        return {
+            "source_stale": [
+                {
+                    "canonical_url": "https://example.com/rates.json.gz",
+                    "domain": "in_network",
+                    "plan_info": [{"plan_id": "123", "plan_market_type": "group"}],
+                }
+            ]
+        }
+
+    monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_URL", "http://import-control.test")
+    monkeypatch.setenv("HLTHPRT_IMPORT_CONTROL_TOKEN", "secret")
+    monkeypatch.setattr(discovery, "_import_control_snapshot_items", fake_snapshot)
+    monkeypatch.setattr(discovery.aiohttp, "ClientSession", FakeSession)
+
+    sources_synced, plans_synced, errors = await discovery._push_import_control_catalog(
+        [
+            {
+                "source_id": "source_stale",
+                "index_url": "https://example.com/old-index.json",
+                "display_name": "Example Stale",
+                "source_key": "example-stale",
+                "seed_provider": "master-list",
+                "access_model": "free",
+                "source_type": "toc_json",
+                "status": "stale",
+            }
+        ]
+    )
+
+    final_public_sources = [
+        call["json"]
+        for call in calls
+        if call["url"].endswith("/v1/catalog/sources")
+        and call["json"].get("visibility") == "public"
+    ]
+
+    assert sources_synced == 1
+    assert plans_synced == 1
+    assert errors == []
+    assert len(final_public_sources) == 1
+    assert final_public_sources[0]["status"] == "stale"
+    assert final_public_sources[0]["preserve_operator_state"] is False
+
+
+@pytest.mark.asyncio
 async def test_push_import_control_catalog_keeps_failed_source_internal_and_reports_error(
     monkeypatch,
 ):
