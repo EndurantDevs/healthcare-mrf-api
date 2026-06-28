@@ -1015,6 +1015,9 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert by_name["EyeMed"].hosting_platform == "direct_mrf_body"
     assert "EyeMed Vision Care" in by_name["EyeMed"].aliases
     assert "Eye Med" in by_name["EyeMed"].aliases
+    assert "Aetna Vision" in by_name["EyeMed"].aliases
+    assert "Aetna Vision Preferred" in by_name["EyeMed"].aliases
+    assert "Ameritas Vision EyeMed" in by_name["EyeMed"].aliases
     assert "Ameritas with EyeMed" in by_name["EyeMed"].aliases
     assert "Mutual of Omaha with EyeMed" in by_name["EyeMed"].aliases
     assert "BlueCare Vision of Texas (powered by EyeMed)" in by_name["EyeMed"].aliases
@@ -1053,6 +1056,7 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Metlife / VSP" in by_name["VSP Vision"].aliases
     assert "Sun Life Vision VSP" in by_name["VSP Vision"].aliases
     assert "SunLife/VSP" in by_name["VSP Vision"].aliases
+    assert "Ameritas Vision VSP" in by_name["VSP Vision"].aliases
     assert "Ameritas with VSP" in by_name["VSP Vision"].aliases
     assert "VSP Ameritas" in by_name["VSP Vision"].aliases
     assert "Equitable Vision VSP" in by_name["VSP Vision"].aliases
@@ -1141,8 +1145,20 @@ async def test_master_list_keeps_high_value_public_aliases():
         "Blue Cross and Blue Shield of Arizona, Inc."
         in by_name["BCBS Arizona"].aliases
     )
+    assert "Blue Cross Blue Shield of Arizona, Inc." in by_name["BCBS Arizona"].aliases
     assert "BlueCross BlueShield of IL" in by_name["BCBS Illinois"].aliases
+    assert "ILLINOIS BLUE CROSS" in by_name["BCBS Illinois"].aliases
+    assert "Blue Cross and Blue Shield of Minnesota" in by_name["BCBS Minnesota"].aliases
+    assert "BlueCross BlueShield of Minnesota" in by_name["BCBS Minnesota"].aliases
+    assert "BlueCross BlueShield of Oklahoma" in by_name["BCBS Oklahoma"].aliases
+    assert "BlueCross BlueShield of Nebraska" in by_name["BCBS Nebraska"].aliases
+    assert "Blue Cross Blue Shield of NE" in by_name["BCBS Nebraska"].aliases
     assert "Blue Cross Blue Sheild of TX" in by_name["BCBS Texas"].aliases
+    assert "Premera Blue Cross WA AK" in by_name["Premera Blue Cross"].aliases
+    assert (
+        "BLUE CROSS WA/AK PREMERA BLUE CROSS"
+        in by_name["Premera Blue Cross"].aliases
+    )
     assert "Pacific Source" in by_name["PacificSource"].aliases
     assert "PacificSource Administrators" in by_name["PacificSource"].aliases
     assert "Angle" in by_name["Angle Health"].aliases
@@ -1172,11 +1188,17 @@ async def test_master_list_keeps_high_value_public_aliases():
     )
     assert "Cypress Benefit Administrators" in by_name["Lucent Health"].aliases
     assert "Sierra Health and Life" in by_name["United Healthcare"].aliases
+    assert "UnitedHealthcare of Arizona, Inc." in by_name["United Healthcare"].aliases
     assert (
         "Sierra Health and Life Insurance Company, Inc."
         in by_name["United Healthcare"].aliases
     )
+    assert "Ameritas Holding Company Health Plan" in by_name["United Healthcare"].aliases
     assert "Anthem CA" in by_name["Anthem"].aliases
+    assert "Blue Cross of California" in by_name["Anthem"].aliases
+    assert "Blue Cross and Blue Shield of Georgia (Anthem)" in by_name["Anthem"].aliases
+    assert "Blue Cross and Blue Shield of Georgia, Inc." in by_name["Anthem"].aliases
+    assert "Indiana Blue Cross" in by_name["Anthem"].aliases
     assert "Anthem Health Plans of Kentucky, Inc." in by_name["Anthem"].aliases
     assert "Anthem Health Plans of Virginia, Inc." in by_name["Anthem"].aliases
     assert "Anthem Insurance Companies, Inc." in by_name["Anthem"].aliases
@@ -1195,11 +1217,19 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Companion Life dental" in by_name["EMI Health"].aliases
     assert "Companion Life EMI Dental Plans" in by_name["EMI Health"].aliases
     assert "Health Plans, Inc" in by_name["Health Plans Inc"].aliases
+    assert "Health Plans, Inc." in by_name["Health Plans Inc"].aliases
+    assert "HealthPlans Inc." in by_name["Health Plans Inc"].aliases
     assert "Auxient TPA" in by_name["Auxiant"].aliases
     assert "90 Degree Benefits, Inc." in by_name["90 Degree Benefits"].aliases
     assert (
         "American Plan Administartors"
         in by_name["American Plan Administrators"].aliases
+    )
+    assert "Allied" in aliases_by_name["Allied Benefit Systems"]
+    assert "Allied Benefits" in aliases_by_name["Allied Benefit Systems"]
+    assert (
+        "Professional Benefit Administrators (Oak Brook, IL)"
+        in aliases_by_name["Professional Benefit Administrators"]
     )
     assert "EBPA Employee Benefits" in by_name["EBPA"].aliases
     assert "AmeriBen: Anthem" in by_name["AmeriBen"].aliases
@@ -1246,8 +1276,12 @@ async def test_master_list_public_alias_queries_match_expected_candidates():
     assert "United Healthcare" in matching_names(
         "Sierra Health and Life Insurance Company, Inc."
     )
+    assert "United Healthcare" in matching_names("UnitedHealthcare of Arizona, Inc.")
     assert "Anthem" in matching_names("Anthem Health Plans of Kentucky, Inc.")
     assert "Anthem" in matching_names("Anthem CA")
+    assert "Anthem" in matching_names("Blue Cross of California")
+    assert "Anthem" in matching_names("Blue Cross and Blue Shield of Georgia, Inc.")
+    assert "Anthem" in matching_names("INDIANA BLUE CROSS")
     assert "Kaiser Permanente" in matching_names("Kaiser Foundation Health Plan, Inc.")
     assert "BCBS Arizona" in matching_names(
         "Blue Cross and Blue Shield of Arizona, Inc."
@@ -1259,7 +1293,11 @@ async def test_master_list_public_alias_queries_match_expected_candidates():
     assert "BCBS Mississippi" in matching_names("Blue Cross & Blue Shield of Mississippi")
     assert "BCBS South Carolina" in matching_names("BlueCross BlueShield of South Carolina")
     assert "BCBS Illinois" in matching_names("BlueCross BlueShield of IL")
+    assert "BCBS Minnesota" in matching_names("Blue Cross and Blue Shield of Minnesota")
+    assert "BCBS Oklahoma" in matching_names("BlueCross BlueShield of Oklahoma")
+    assert "BCBS Nebraska" in matching_names("Blue Cross Blue Shield of NE")
     assert "BCBS Texas" in matching_names("Blue Cross Blue Sheild of TX")
+    assert "Premera Blue Cross" in matching_names("BLUE CROSS WA/AK PREMERA BLUE CROSS")
     assert "CareFirst" in matching_names("CareFirst BlueChoice, Inc.")
     assert "Highmark" in matching_names("Highmark Blue Shield")
     assert "Independence Blue Cross" in matching_names("Independence Blue Cross (IBX)")
@@ -1287,6 +1325,14 @@ async def test_master_list_public_alias_queries_match_expected_candidates():
         "MERITAIN HEALTH (NORTH AMERICAN HEALTH PLAN)"
     )
     assert "Health Plans Inc" in matching_names("Health Plans, Inc")
+    assert "Health Plans Inc" in matching_names("HealthPlans Inc.")
+    assert "Allied Benefit Systems" in matching_names("Allied Benefits")
+    assert "Professional Benefit Administrators" in matching_names(
+        "Professional Benefit Administrators (Oak Brook, IL)"
+    )
+    assert "EyeMed" in matching_names("Aetna Vision")
+    assert "EyeMed" in matching_names("Aetna Vision Preferred")
+    assert "EyeMed" in matching_names("Ameritas Vision EyeMed")
     assert "EyeMed" in matching_names("Surency")
     assert "EyeMed" in matching_names("Cigna Vision serviced by EyeMed")
     assert "EyeMed" in matching_names("BlueCare Vision of Texas (powered by EyeMed)")
@@ -1299,6 +1345,7 @@ async def test_master_list_public_alias_queries_match_expected_candidates():
     assert "VSP Vision" in matching_names("MetLife using VSP Choice Network")
     assert "VSP Vision" in matching_names("Metlife / VSP")
     assert "VSP Vision" in matching_names("Renaissance Vision VSP")
+    assert "VSP Vision" in matching_names("Ameritas Vision VSP")
     assert "Capital Blue Cross" in matching_names("Capital Blue Cross Vision NVA")
     assert "BCBS North Carolina" in matching_names("Community Eye Care")
     assert "Superior Vision" in matching_names("Versant Health Superior Vision")
