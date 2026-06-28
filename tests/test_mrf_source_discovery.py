@@ -972,6 +972,10 @@ async def test_master_list_keeps_high_value_public_aliases():
         "American Heritage Life Insurance Company"
         in aliases_by_name["Allied Benefit Systems"]
     )
+    assert "Dental Benefit Providers" in by_name["United Healthcare"].aliases
+    assert "Dental Benefit Providers DBP" in by_name["United Healthcare"].aliases
+    assert "DBP" in by_name["United Healthcare"].aliases
+    assert "DBP Network" in by_name["United Healthcare"].aliases
     assert "United Healthcare Dental" in by_name["United Healthcare"].aliases
     assert "UHC Vision" in by_name["United Healthcare"].aliases
     assert "UHC Vision Using Spectera Network" in by_name["United Healthcare"].aliases
@@ -1049,6 +1053,27 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "VBA" in by_name["Vision Benefits of America"].aliases
     assert by_name["Avesis"].status == "needs_review"
     assert "Avesis Vision" in by_name["Avesis"].aliases
+    assert by_name["Lincoln Financial DentalConnect"].entity_type == "dental"
+    assert by_name["Lincoln Financial DentalConnect"].status == "needs_review"
+    assert by_name["Lincoln Financial DentalConnect"].index_url is None
+    assert (
+        "Lincoln DentalConnect"
+        in by_name["Lincoln Financial DentalConnect"].aliases
+    )
+    assert by_name["LIBERTY Dental Plan"].entity_type == "dental"
+    assert by_name["LIBERTY Dental Plan"].status == "needs_review"
+    assert by_name["LIBERTY Dental Plan"].index_url is None
+    assert "Liberty Dental" in by_name["LIBERTY Dental Plan"].aliases
+    assert by_name["United Concordia Dental"].entity_type == "dental"
+    assert by_name["United Concordia Dental"].status == "needs_review"
+    assert by_name["United Concordia Dental"].index_url is None
+    assert "United Concordia" in by_name["United Concordia Dental"].aliases
+    assert by_name["Unum Dental / Starmount Life"].entity_type == "dental"
+    assert by_name["Unum Dental / Starmount Life"].status == "needs_review"
+    assert by_name["Unum Dental / Starmount Life"].index_url is None
+    assert "Starmount Life Insurance Company" in (
+        by_name["Unum Dental / Starmount Life"].aliases
+    )
     assert by_name["GEHA"].hosting_platform == "html_delegated_mrf_links"
     assert by_name["GEHA"].benefit_lines == ("dental", "medical")
     assert "Connection Dental Federal" in by_name["GEHA"].aliases
@@ -1107,6 +1132,10 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Priority Health of Michigan" in by_name["Priority Health"].aliases
     assert "Sutter Health Plus" in by_name["Sutter Health Plan"].aliases
     assert "UHA" in by_name["UHA Health Insurance"].aliases
+    assert by_name["EMI Health"].benefit_lines == ("dental",)
+    assert by_name["EMI Health"].hosting_platform == "html_mrf_links"
+    assert "Companion Life dental" in by_name["EMI Health"].aliases
+    assert "Companion Life EMI Dental Plans" in by_name["EMI Health"].aliases
     assert "Auxient TPA" in by_name["Auxiant"].aliases
     assert "EBPA Employee Benefits" in by_name["EBPA"].aliases
     assert "AmeriBen Anthem Blue Cross" in by_name["AmeriBen"].aliases
@@ -1133,6 +1162,8 @@ async def test_master_list_public_alias_queries_match_expected_candidates():
         }
 
     assert "United Healthcare" in matching_names("UMR (Using Spectera Network)")
+    assert "United Healthcare" in matching_names("DBP")
+    assert "United Healthcare" in matching_names("Dental Benefit Providers DBP")
     assert "EyeMed" in matching_names("Cigna Vision serviced by EyeMed")
     assert "EyeMed" in matching_names("BlueCare Vision of Texas (powered by EyeMed)")
     assert "EyeMed" in matching_names("DeltaVision administered by EyeMed")
@@ -1143,6 +1174,11 @@ async def test_master_list_public_alias_queries_match_expected_candidates():
     assert "Capital Blue Cross" in matching_names("Capital Blue Cross Vision NVA")
     assert "BCBS North Carolina" in matching_names("Community Eye Care")
     assert "Superior Vision" in matching_names("Versant Health Superior Vision")
+    assert "Lincoln Financial DentalConnect" in matching_names("Lincoln DentalConnect")
+    assert "LIBERTY Dental Plan" in matching_names("Liberty Dental")
+    assert "United Concordia Dental" in matching_names("United Concordia")
+    assert "Unum Dental / Starmount Life" in matching_names("Starmount Life")
+    assert "EMI Health" in matching_names("Companion Life dental")
 
 
 @pytest.mark.asyncio
