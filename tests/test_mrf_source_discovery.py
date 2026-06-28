@@ -3833,6 +3833,14 @@ def test_parse_html_mrf_links_extracts_sharp_direct_zip_files():
             "target_file_type": "in-network",
             "container_format": "zip",
             "html_attr": "href",
+            "plan_info": [
+                {
+                    "plan_id": None,
+                    "plan_id_type": None,
+                    "plan_market_type": "group",
+                    "plan_name": "In-Network - CAP",
+                }
+            ],
         },
         {
             "url": "https://docs.sharphealthplan.com/shp-documents/doc/2026-06-IN_NETWORK_FFS.zip",
@@ -3842,6 +3850,14 @@ def test_parse_html_mrf_links_extracts_sharp_direct_zip_files():
             "target_file_type": "in-network",
             "container_format": "zip",
             "html_attr": "href",
+            "plan_info": [
+                {
+                    "plan_id": None,
+                    "plan_id_type": None,
+                    "plan_market_type": "group",
+                    "plan_name": "In-Network - FFS",
+                }
+            ],
         },
     ]
 
@@ -3879,6 +3895,33 @@ def test_parse_html_mrf_links_extracts_group_health_eau_claire_json_files():
         "Medicare JSON",
         "Commercial JSON",
         "Commercial Allowed Amounts JSON",
+    ]
+    assert [target.get("plan_info") for target in targets] == [
+        [
+            {
+                "plan_id": None,
+                "plan_id_type": None,
+                "plan_market_type": "group",
+                "plan_name": "Medicaid JSON",
+            }
+        ],
+        [
+            {
+                "plan_id": None,
+                "plan_id_type": None,
+                "plan_market_type": "group",
+                "plan_name": "Medicare JSON",
+            }
+        ],
+        [
+            {
+                "plan_id": None,
+                "plan_id_type": None,
+                "plan_market_type": "group",
+                "plan_name": "Commercial JSON",
+            }
+        ],
+        None,
     ]
     assert all(target["target_kind"] == "file_reference" for target in targets)
 

@@ -5050,6 +5050,28 @@ def _html_label_looks_fileish(label: str | None, path: str) -> bool:
     return bool(re.match(r"^\d{4}-\d{2}-\d{2}[_-]", text))
 
 
+def _html_label_looks_planish(label: str | None) -> bool:
+    text = _clean_text(label)
+    if not text:
+        return False
+    normalized = re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+    normalized = re.sub(r"\s+(json|zip|file)$", "", normalized).strip()
+    if normalized in {
+        "allowed amount",
+        "allowed amounts",
+        "download",
+        "file",
+        "in network",
+        "in network rates",
+        "mrf",
+        "mrf file",
+        "table of contents",
+        "toc",
+    }:
+        return False
+    return bool(re.search(r"[a-z]", normalized))
+
+
 def _parse_html_mrf_links(html_text: str, *, base_url: str) -> list[dict[str, Any]]:
     urls: dict[tuple[str, str], dict[str, Any]] = {}
     section_file_type: str | None = None
@@ -5110,12 +5132,12 @@ def _parse_html_mrf_links(html_text: str, *, base_url: str) -> list[dict[str, An
                 label = inferred_label
         if not target_kind or not target_file_type:
             continue
-        plan_info = (
-            _plan_info_from_label(label)
-            if target_kind == "file_reference"
-            and _html_label_looks_fileish(candidate.get("label"), path)
-            else []
-        )
+        plan_info = []
+        if target_kind == "file_reference":
+            if _html_label_looks_fileish(candidate.get("label"), path) or (
+                target_file_type == "in-network" and _html_label_looks_planish(label)
+            ):
+                plan_info = _plan_info_from_label(label)
         key = (target_kind, _canonical_or_none(url) or url)
         row = {
             "url": url,
