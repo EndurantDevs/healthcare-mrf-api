@@ -609,6 +609,7 @@ async def test_manifest_serving_geo_expansion_uses_wider_location_candidate_wind
                 "radius_miles": "100",
                 "include_providers": "true",
                 "include_sources": "true",
+                "include_unverified_addresses": "true",
             },
         LimitOnePagination(),
         tables,
@@ -2852,6 +2853,19 @@ def test_compact_item_marks_missing_address_as_not_displayable():
     } in summary["issues"]
 
 
+def test_ptg2_display_policy_handles_malformed_address_verification_without_recursing():
+    item = {
+        "provider_name": "Example Surgeon",
+        "address_verification": "not-json",
+        "address": "100 Main St",
+    }
+
+    ptg2_serving._apply_ptg_address_display_policy(item, {})
+
+    assert item["address_verification"] == "not-json"
+    assert item["address"] == "100 Main St"
+
+
 def test_compact_item_marks_address_key_only_as_not_displayable():
     item = ptg2_serving._compact_item_from_row(
         {
@@ -3124,7 +3138,12 @@ async def test_compact_serving_include_providers_expands_without_geo_filter(monk
         "mrf.ptg2_serving_rate_compact_token",
         _compact_tables(),
         "snap-token",
-        {"plan_id": "010854205", "code": "450", "include_providers": "true"},
+        {
+            "plan_id": "010854205",
+            "code": "450",
+            "include_providers": "true",
+            "include_unverified_addresses": "true",
+        },
         FakePagination(),
         ["snapshot_id = :snapshot_id", "plan_id = :plan_id"],
         {"snapshot_id": "snap-token", "plan_id": "010854205", "limit": 25, "offset": 0},
@@ -3459,14 +3478,15 @@ async def test_compact_serving_include_providers_with_geo_uses_npi_scoped_locati
         "mrf.ptg2_serving_rate_compact_token",
         tables,
         "snap-token",
-        {
-            "plan_id": "010854205",
-            "code": "99213",
-            "city": "Houston",
-            "state": "TX",
-            "specialty": "family",
-            "include_providers": "true",
-        },
+            {
+                "plan_id": "010854205",
+                "code": "99213",
+                "city": "Houston",
+                "state": "TX",
+                "specialty": "family",
+                "include_providers": "true",
+                "include_unverified_addresses": "true",
+            },
         FakePagination(),
         ["snapshot_id = :snapshot_id", "plan_id = :plan_id"],
         {"snapshot_id": "snap-token", "plan_id": "010854205", "limit": 25, "offset": 0},

@@ -8,7 +8,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from sqlalchemy import bindparam, text
 
@@ -184,6 +184,29 @@ PTG_NO_DISPLAY_ADDRESS_FIELDS = {
     "multi_source_confirmed",
     "source_mask",
     "address_source_mask",
+}
+PTG_NO_DISPLAY_VERIFICATION_FIELDS = {
+    "location_source",
+    "location_confidence_code",
+    "address_precision",
+    "address_sources",
+    "source_count",
+    "multi_source_confirmed",
+    "source_mask",
+    "address_source_mask",
+    "provider_directory_source_id",
+    "provider_directory_location_resource_id",
+    "provider_directory_location_name",
+    "provider_directory_plan_context_matched",
+    "provider_directory_network_name_matched",
+    "provider_directory_network_context_present",
+    "provider_directory_network_refs",
+    "provider_directory_network_names",
+    "provider_directory_network_matches",
+    "provider_directory_insurance_plan_refs",
+    "provider_directory_insurance_plan_matches",
+    "provider_directory_match_type",
+    "address_verification_evidence",
 }
 PTG_DIRECT_PAYER_LOCATION_RECORD_KEYS = {
     "source_record_id",
@@ -689,6 +712,47 @@ def _strip_no_display_address_fields(item: dict[str, Any]) -> None:
         return
     for key in PTG_NO_DISPLAY_ADDRESS_FIELDS:
         item.pop(key, None)
+    for key in PTG_NO_DISPLAY_VERIFICATION_FIELDS:
+        verification.pop(key, None)
+
+
+def _include_unverified_ptg_addresses(args: Mapping[str, Any] | dict[str, Any]) -> bool:
+    return _request_bool(args.get("include_unverified_addresses"))
+
+
+def _is_plan_scoped_ptg_request(args: Mapping[str, Any] | dict[str, Any]) -> bool:
+    return bool(
+        str(
+            args.get("plan_id")
+            or args.get("plan_external_id")
+            or args.get("plan_market_type")
+            or args.get("market_type")
+            or ""
+        ).strip()
+    )
+
+
+def _apply_ptg_address_display_policy(item: dict[str, Any], args: Mapping[str, Any] | dict[str, Any]) -> None:
+    """Default member-facing PTG responses hide addresses not tied to the priced network."""
+    verification = item.get("address_verification")
+    if not isinstance(verification, dict):
+        _strip_no_display_address_fields(item)
+        return
+    if (
+        verification.get("displayed_address_present") is True
+        and verification.get("network_bound_address") is not True
+        and _is_plan_scoped_ptg_request(args)
+        and not _include_unverified_ptg_addresses(args)
+    ):
+        verification["displayed_address_present"] = False
+        verification["network_bound_address"] = False
+        verification["address_network_binding"] = "inferred_from_provider_identity"
+        verification["requires_location_confirmation"] = True
+        verification["reason"] = (
+            "PTG proves the provider identity is in network, but the displayed address is not tied "
+            "to the priced plan or network; address and phone fields are suppressed by default."
+        )
+    _strip_no_display_address_fields(item)
 
 
 def _ptg2_individual_npi_exists_sql(npi_sql: str) -> str:
@@ -2862,7 +2926,7 @@ async def _search_ptg2_manifest_db_serving_table(
             "confidence": {"network": "tic_rate_npi_tin", "location": "nppes_practice_location"},
         }
         base_item["address_verification"] = _address_verification_payload(base_item, {}, {})
-        _strip_no_display_address_fields(base_item)
+        _apply_ptg_address_display_policy(base_item, args)
         if not expand_providers:
             items.append(base_item)
             continue
@@ -2899,7 +2963,7 @@ async def _search_ptg2_manifest_db_serving_table(
             _add_location_phone_fields(item, provider, address_payload)
             _promote_address_provenance_fields(item, address_payload)
             item["address_verification"] = _address_verification_payload(item, provider, address_payload)
-            _strip_no_display_address_fields(item)
+            _apply_ptg_address_display_policy(item, args)
             items.append(item)
     if not items:
         return None
@@ -3451,7 +3515,7 @@ def _compact_item_from_row(data: dict[str, Any], args: dict[str, Any]) -> dict[s
     _add_location_phone_fields(item, data, address_payload)
     _promote_address_provenance_fields(item, address_payload)
     item["address_verification"] = _address_verification_payload(item, data, address_payload)
-    _strip_no_display_address_fields(item)
+    _apply_ptg_address_display_policy(item, args)
     return {key: value for key, value in item.items() if value is not None}
 
 

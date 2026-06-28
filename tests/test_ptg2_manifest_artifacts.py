@@ -517,10 +517,30 @@ def test_search_manifest_snapshot_adds_address_verification_to_expanded_provider
 
     assert payload is not None
     item = payload["items"][0]
-    assert item["address"]["first_line"] == "900 W Temple Ave"
     assert item["address_verification"]["rate_network_binding"] == "tic_provider_group_npi_tin"
     assert item["address_verification"]["address_evidence_level"] == "nppes_provider_address"
-    assert item["address_verification"]["displayed_address_present"] is True
+    assert item["address_verification"]["displayed_address_present"] is False
+    assert item["address_verification"]["address_network_binding"] == "inferred_from_provider_identity"
+    assert item["address_verification"]["requires_location_confirmation"] is True
+    assert "address" not in item
+
+    opt_in_payload = serving_manifest.search_ptg2_manifest_snapshot(
+        snapshot,
+        {
+            "plan_id": "010854205",
+            "code": "29888",
+            "code_system": "CPT",
+            "include_providers": "true",
+            "include_unverified_addresses": "true",
+        },
+        pagination,
+        mode_value="product_search",
+    )
+
+    assert opt_in_payload is not None
+    opt_in_item = opt_in_payload["items"][0]
+    assert opt_in_item["address"]["first_line"] == "900 W Temple Ave"
+    assert opt_in_item["address_verification"]["displayed_address_present"] is True
 
 
 def test_search_manifest_snapshot_strips_no_display_provider_address_fields():

@@ -74,6 +74,29 @@ PTG_NO_DISPLAY_ADDRESS_FIELDS = {
     "source_mask",
     "address_source_mask",
 }
+PTG_NO_DISPLAY_VERIFICATION_FIELDS = {
+    "location_source",
+    "location_confidence_code",
+    "address_precision",
+    "address_sources",
+    "source_count",
+    "multi_source_confirmed",
+    "source_mask",
+    "address_source_mask",
+    "provider_directory_source_id",
+    "provider_directory_location_resource_id",
+    "provider_directory_location_name",
+    "provider_directory_plan_context_matched",
+    "provider_directory_network_name_matched",
+    "provider_directory_network_context_present",
+    "provider_directory_network_refs",
+    "provider_directory_network_names",
+    "provider_directory_network_matches",
+    "provider_directory_insurance_plan_refs",
+    "provider_directory_insurance_plan_matches",
+    "provider_directory_match_type",
+    "address_verification_evidence",
+}
 PTG_DIRECT_PAYER_LOCATION_RECORD_KEYS = {
     "source_record_id",
     "source_record_key",
@@ -407,6 +430,46 @@ def _strip_no_display_address_fields(item: dict[str, Any]) -> None:
         return
     for key in PTG_NO_DISPLAY_ADDRESS_FIELDS:
         item.pop(key, None)
+    for key in PTG_NO_DISPLAY_VERIFICATION_FIELDS:
+        verification.pop(key, None)
+
+
+def _include_unverified_ptg_addresses(args: Mapping[str, Any]) -> bool:
+    return _request_bool(args.get("include_unverified_addresses"))
+
+
+def _is_plan_scoped_ptg_request(args: Mapping[str, Any]) -> bool:
+    return bool(
+        str(
+            args.get("plan_id")
+            or args.get("plan_external_id")
+            or args.get("plan_market_type")
+            or args.get("market_type")
+            or ""
+        ).strip()
+    )
+
+
+def _apply_ptg_address_display_policy(item: dict[str, Any], args: Mapping[str, Any]) -> None:
+    verification = item.get("address_verification")
+    if not isinstance(verification, dict):
+        _strip_no_display_address_fields(item)
+        return
+    if (
+        verification.get("displayed_address_present") is True
+        and verification.get("network_bound_address") is not True
+        and _is_plan_scoped_ptg_request(args)
+        and not _include_unverified_ptg_addresses(args)
+    ):
+        verification["displayed_address_present"] = False
+        verification["network_bound_address"] = False
+        verification["address_network_binding"] = "inferred_from_provider_identity"
+        verification["requires_location_confirmation"] = True
+        verification["reason"] = (
+            "PTG proves the provider identity is in network, but the displayed address is not tied "
+            "to the priced plan or network; address and phone fields are suppressed by default."
+        )
+    _strip_no_display_address_fields(item)
 
 
 @dataclass(frozen=True)
@@ -805,7 +868,7 @@ def search_ptg2_manifest_snapshot(
                 },
             }
         base_item["address_verification"] = _manifest_address_verification(base_item)
-        _strip_no_display_address_fields(base_item)
+        _apply_ptg_address_display_policy(base_item, args)
         if not expand_providers:
             items.append(base_item)
             continue
@@ -835,7 +898,7 @@ def search_ptg2_manifest_snapshot(
                 }
             )
             item["address_verification"] = _manifest_address_verification(item, provider=provider)
-            _strip_no_display_address_fields(item)
+            _apply_ptg_address_display_policy(item, args)
             items.append(item)
     total_items = len(items) if expand_providers else len(matched_rows)
     if expand_providers:
