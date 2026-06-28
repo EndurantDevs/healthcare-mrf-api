@@ -217,6 +217,9 @@ def test_upsert_changed_row_predicate_ignores_run_metadata_columns():
     assert "first_line" in sql
     assert "CAST" in sql
     assert "JSONB" in sql
+    assert "provider_directory_location.address_key IS DISTINCT FROM CASE" in sql
+    assert "WHEN (excluded.address_key IS NOT NULL) THEN excluded.address_key" in sql
+    assert "ELSE mrf.provider_directory_location.address_key END" in sql
     assert "last_seen_run_id" not in sql
     assert "observed_at" not in sql
     assert "updated_at" not in sql
@@ -240,6 +243,38 @@ def test_copy_stage_changed_where_ignores_run_metadata_columns():
     assert "last_seen_run_id" not in sql
     assert "observed_at" not in sql
     assert "updated_at" not in sql
+
+
+def test_provider_directory_location_upsert_preserves_existing_address_key_when_raw_address_unchanged():
+    table = ProviderDirectoryLocation.__table__
+    columns = [column.name for column in table.columns]
+    primary_keys = [column.name for column in table.primary_key.columns]
+
+    conflict_where = importer._copy_upsert_changed_where_sql(  # pylint: disable=protected-access
+        table,
+        columns,
+        primary_keys,
+    )
+    stage_where = importer._copy_stage_changed_where_sql(  # pylint: disable=protected-access
+        table,
+        columns,
+        primary_keys,
+        target_alias="target_row",
+        stage_alias="stage_row",
+    )
+
+    assert (
+        '"provider_directory_location"."address_key" IS DISTINCT FROM CASE '
+        'WHEN EXCLUDED."address_key" IS NOT NULL THEN EXCLUDED."address_key" '
+        'WHEN "provider_directory_location"."first_line" IS DISTINCT FROM EXCLUDED."first_line"'
+    ) in conflict_where
+    assert 'ELSE "provider_directory_location"."address_key" END' in conflict_where
+    assert (
+        'target_row."address_key" IS DISTINCT FROM CASE '
+        'WHEN stage_row."address_key" IS NOT NULL THEN stage_row."address_key" '
+        'WHEN target_row."first_line" IS DISTINCT FROM stage_row."first_line"'
+    ) in stage_where
+    assert 'ELSE target_row."address_key" END' in stage_where
 
 
 @pytest.mark.asyncio
@@ -1534,6 +1569,11 @@ async def test_copy_upsert_rows_uses_temp_copy_and_changed_predicate(monkeypatch
     assert 'LEFT JOIN "mrf"."provider_directory_location" AS target_row' in conn.statements[2]
     assert 'target_row."source_id" IS NULL' in conn.statements[2]
     assert 'ON CONFLICT ("source_id", "resource_id") DO UPDATE SET' in conn.statements[2]
+    assert (
+        '"address_key" = CASE WHEN EXCLUDED."address_key" IS NOT NULL THEN EXCLUDED."address_key" '
+        'WHEN "provider_directory_location"."first_line" IS DISTINCT FROM EXCLUDED."first_line"'
+    ) in conn.statements[2]
+    assert 'ELSE "provider_directory_location"."address_key" END' in conn.statements[2]
 
     where_sql = importer._copy_upsert_changed_where_sql(  # pylint: disable=protected-access
         table,

@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from sqlalchemy import or_
+from sqlalchemy import case, or_
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.sql.sqltypes import JSON as SQLAlchemyJSON
@@ -2502,6 +2502,68 @@ def _copy_record(row: dict[str, Any], columns: list[str], json_columns: set[str]
 
 
 PROVIDER_DIRECTORY_RUN_METADATA_COLUMNS = frozenset({"last_seen_run_id", "observed_at", "updated_at"})
+PROVIDER_DIRECTORY_LOCATION_ADDRESS_KEY_INPUT_COLUMNS = (
+    "first_line",
+    "second_line",
+    "city_name",
+    "state_name",
+    "state_code",
+    "postal_code",
+    "country_code",
+)
+
+
+def _preserve_null_location_address_key(table) -> bool:
+    return table.name == ProviderDirectoryLocation.__tablename__
+
+
+def _location_address_key_update_expression(table, excluded):
+    raw_address_changed = or_(
+        *(
+            getattr(table.c, column).is_distinct_from(getattr(excluded, column))
+            for column in PROVIDER_DIRECTORY_LOCATION_ADDRESS_KEY_INPUT_COLUMNS
+        )
+    )
+    return case(
+        (excluded.address_key.isnot(None), excluded.address_key),
+        (raw_address_changed, None),
+        else_=table.c.address_key,
+    )
+
+
+def _location_address_key_update_sql(
+    *,
+    target_prefix: str,
+    incoming_prefix: str,
+) -> str:
+    raw_address_changed = " OR ".join(
+        f"{target_prefix}.{_q(column)} IS DISTINCT FROM {incoming_prefix}.{_q(column)}"
+        for column in PROVIDER_DIRECTORY_LOCATION_ADDRESS_KEY_INPUT_COLUMNS
+    )
+    address_key = _q("address_key")
+    return (
+        f"CASE "
+        f"WHEN {incoming_prefix}.{address_key} IS NOT NULL THEN {incoming_prefix}.{address_key} "
+        f"WHEN {raw_address_changed} THEN NULL "
+        f"ELSE {target_prefix}.{address_key} "
+        f"END"
+    )
+
+
+def _effective_update_expression(table, statement, column: str):
+    excluded_value = getattr(statement.excluded, column)
+    if column == "address_key" and _preserve_null_location_address_key(table):
+        return _location_address_key_update_expression(table, statement.excluded)
+    return excluded_value
+
+
+def _effective_update_sql(table, column: str, *, target_prefix: str, incoming_prefix: str) -> str:
+    if column == "address_key" and _preserve_null_location_address_key(table):
+        return _location_address_key_update_sql(
+            target_prefix=target_prefix,
+            incoming_prefix=incoming_prefix,
+        )
+    return f"{incoming_prefix}.{_q(column)}"
 
 
 async def _mark_resource_rows_seen(
@@ -2636,7 +2698,7 @@ def _upsert_changed_row_predicate(table, statement, columns: list[str], primary_
     predicates = []
     for column in payload_columns:
         current_value = getattr(table.c, column)
-        excluded_value = getattr(statement.excluded, column)
+        excluded_value = _effective_update_expression(table, statement, column)
         if isinstance(current_value.type, SQLAlchemyJSON):
             current_value = current_value.cast(JSONB)
             excluded_value = excluded_value.cast(JSONB)
@@ -2657,12 +2719,18 @@ def _copy_upsert_changed_where_sql(table, columns: list[str], primary_keys: list
     target_table = _q(table.name)
     for column in payload_columns:
         quoted = _q(column)
+        excluded_sql = _effective_update_sql(
+            table,
+            column,
+            target_prefix=target_table,
+            incoming_prefix="EXCLUDED",
+        )
         if column in json_columns:
             predicates.append(
-                f"{target_table}.{quoted}::jsonb IS DISTINCT FROM EXCLUDED.{quoted}::jsonb"
+                f"{target_table}.{quoted}::jsonb IS DISTINCT FROM {excluded_sql}::jsonb"
             )
         else:
-            predicates.append(f"{target_table}.{quoted} IS DISTINCT FROM EXCLUDED.{quoted}")
+            predicates.append(f"{target_table}.{quoted} IS DISTINCT FROM {excluded_sql}")
     return " OR ".join(predicates)
 
 
@@ -2696,12 +2764,18 @@ def _copy_stage_changed_where_sql(
     json_columns = _json_columns(table)
     for column in payload_columns:
         quoted = _q(column)
+        incoming_sql = _effective_update_sql(
+            table,
+            column,
+            target_prefix=target_alias,
+            incoming_prefix=stage_alias,
+        )
         if column in json_columns:
             predicates.append(
-                f"{target_alias}.{quoted}::jsonb IS DISTINCT FROM {stage_alias}.{quoted}::jsonb"
+                f"{target_alias}.{quoted}::jsonb IS DISTINCT FROM {incoming_sql}::jsonb"
             )
         else:
-            predicates.append(f"{target_alias}.{quoted} IS DISTINCT FROM {stage_alias}.{quoted}")
+            predicates.append(f"{target_alias}.{quoted} IS DISTINCT FROM {incoming_sql}")
     return " OR ".join(predicates)
 
 
@@ -2731,7 +2805,7 @@ async def _upsert_rows_values(
     async with db.session() as session:
         statement = pg_insert(table).values(normalized)
         update_columns = {
-            column.name: getattr(statement.excluded, column.name)
+            column.name: _effective_update_expression(table, statement, column.name)
             for column in table.columns
             if column.name not in primary_keys
         }
@@ -2762,9 +2836,14 @@ async def _copy_upsert_rows(
     quoted_conflict = ", ".join(_q(column) for column in primary_keys)
     update_columns = [column for column in columns if column not in primary_keys]
     if update_columns:
+        target_table = _q(table.name)
         conflict_sql = (
             "DO UPDATE SET "
-            + ", ".join(f"{_q(column)} = EXCLUDED.{_q(column)}" for column in update_columns)
+            + ", ".join(
+                f"{_q(column)} = "
+                f"{_effective_update_sql(table, column, target_prefix=target_table, incoming_prefix='EXCLUDED')}"
+                for column in update_columns
+            )
         )
         update_where = _copy_upsert_changed_where_sql(table, columns, primary_keys) if skip_unchanged else ""
         if update_where:
