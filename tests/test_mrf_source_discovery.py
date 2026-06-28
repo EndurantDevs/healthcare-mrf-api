@@ -1128,13 +1128,26 @@ async def test_master_list_keeps_high_value_public_aliases():
     )
     assert "MISSOURI BLUE CROSS OF KANSAS CITY" in by_name["BCBS Kansas City"].aliases
     assert "BlueCross BlueShield of AZ" in by_name["BCBS Arizona"].aliases
+    assert "BlueCross BlueShield of Arizona" in by_name["BCBS Arizona"].aliases
+    assert (
+        "Blue Cross and Blue Shield of Arizona, Inc."
+        in by_name["BCBS Arizona"].aliases
+    )
+    assert "BlueCross BlueShield of IL" in by_name["BCBS Illinois"].aliases
+    assert "Blue Cross Blue Sheild of TX" in by_name["BCBS Texas"].aliases
     assert "Pacific Source" in by_name["PacificSource"].aliases
     assert "PacificSource Administrators" in by_name["PacificSource"].aliases
     assert "Angle" in by_name["Angle Health"].aliases
     assert "Adrem Administrators" in by_name["Angle Health"].aliases
+    assert (
+        "ALLEGIANCE BENEFIT PLAN MANAGEMENT INC."
+        in by_name["Allegiance Benefit Plan Management"].aliases
+    )
     assert "AskAllegiance" in by_name["Allegiance Benefit Plan Management"].aliases
     assert "Allegiance" in by_name["Allegiance Benefit Plan Management"].aliases
     assert "AccessHMA" in by_name["Healthcare Management Administrators"].aliases
+    assert "First Choice Health Network" in aliases_by_name["First Choice Health"]
+    assert "Health Plan of Nevada, Inc." in by_name["Health Plan of Nevada"].aliases
     assert "PCMI" in by_name["Pinnacle Claims Management"].aliases
     assert (
         "Robbins Regency Employee Benefits"
@@ -1142,6 +1155,19 @@ async def test_master_list_keeps_high_value_public_aliases():
     )
     assert "Cypress Benefit Administrators" in by_name["Lucent Health"].aliases
     assert "Sierra Health and Life" in by_name["United Healthcare"].aliases
+    assert (
+        "Sierra Health and Life Insurance Company, Inc."
+        in by_name["United Healthcare"].aliases
+    )
+    assert "Anthem CA" in by_name["Anthem"].aliases
+    assert "Anthem Health Plans of Kentucky, Inc." in by_name["Anthem"].aliases
+    assert "Anthem Health Plans of Virginia, Inc." in by_name["Anthem"].aliases
+    assert "Anthem Insurance Companies, Inc." in by_name["Anthem"].aliases
+    assert "Kaiser Foundation Health Plan, Inc." in by_name["Kaiser Permanente"].aliases
+    assert (
+        "Kaiser Foundation Health Plan of the Mid-Atlantic States, Inc."
+        in by_name["Kaiser Permanente"].aliases
+    )
     assert "Priority Health of Michigan" in by_name["Priority Health"].aliases
     assert "Sutter Health Plus" in by_name["Sutter Health Plan"].aliases
     assert "UHA" in by_name["UHA Health Insurance"].aliases
@@ -1152,10 +1178,22 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Health Plans, Inc" in by_name["Health Plans Inc"].aliases
     assert "Auxient TPA" in by_name["Auxiant"].aliases
     assert "EBPA Employee Benefits" in by_name["EBPA"].aliases
+    assert "AmeriBen: Anthem" in by_name["AmeriBen"].aliases
     assert "AmeriBen Anthem Blue Cross" in by_name["AmeriBen"].aliases
+    assert "AmeriBen: Anthem Blue Cross" in by_name["AmeriBen"].aliases
+    assert (
+        "Employee Benefit Management Services (EBMS)"
+        in by_name["EBMS"].aliases
+    )
+    assert "Anthem/Luminare Health" in by_name["Luminare Health Benefits"].aliases
+    assert (
+        "LUMINARE HEALTH AZ IL IN MD MN NC PA"
+        in by_name["Luminare Health Benefits"].aliases
+    )
     assert "EVHC" in by_name["Luminare Health Benefits"].aliases
     assert "Evolution Healthcare" in by_name["Luminare Health Benefits"].aliases
     assert "Evolution Healthcare EVHC" in by_name["Luminare Health Benefits"].aliases
+    assert "Medical Benefits Administrators, Inc." in by_name["MedBen"].aliases
 
 
 @pytest.mark.asyncio
@@ -1179,6 +1217,26 @@ async def test_master_list_public_alias_queries_match_expected_candidates():
     assert "United Healthcare" in matching_names("UHC Vision (Using Spectera Network)")
     assert "United Healthcare" in matching_names("DBP")
     assert "United Healthcare" in matching_names("Dental Benefit Providers DBP")
+    assert "United Healthcare" in matching_names(
+        "Sierra Health and Life Insurance Company, Inc."
+    )
+    assert "Anthem" in matching_names("Anthem Health Plans of Kentucky, Inc.")
+    assert "Anthem" in matching_names("Anthem CA")
+    assert "Kaiser Permanente" in matching_names("Kaiser Foundation Health Plan, Inc.")
+    assert "BCBS Arizona" in matching_names(
+        "Blue Cross and Blue Shield of Arizona, Inc."
+    )
+    assert "BCBS Illinois" in matching_names("BlueCross BlueShield of IL")
+    assert "BCBS Texas" in matching_names("Blue Cross Blue Sheild of TX")
+    assert "First Choice Health" in matching_names("First Choice Health Network")
+    assert "Health Plan of Nevada" in matching_names("Health Plan of Nevada, Inc.")
+    assert "Allegiance Benefit Plan Management" in matching_names(
+        "ALLEGIANCE BENEFIT PLAN MANAGEMENT INC."
+    )
+    assert "AmeriBen" in matching_names("AmeriBen: Anthem Blue Cross")
+    assert "EBMS" in matching_names("Employee Benefit Management Services (EBMS)")
+    assert "Luminare Health Benefits" in matching_names("Anthem/Luminare Health")
+    assert "MedBen" in matching_names("Medical Benefits Administrators, Inc.")
     assert "Meritain Health" in matching_names("Meritain Health, An Aetna Company")
     assert "Meritain Health" in matching_names(
         "MERITAIN HEALTH (NORTH AMERICAN HEALTH PLAN)"
