@@ -7183,6 +7183,7 @@ async def list_providers_by_procedure(request):
                 "include_providers": args.get("include_providers") or None,
                 "include_code_details": args.get("include_code_details") or None,
                 "include_sources": args.get("include_sources") or None,
+                "include_unverified_addresses": args.get("include_unverified_addresses") or None,
                 "include_details": args.get("include_details") or None,
                 "include_debug": args.get("include_debug") or None,
                 "npi": npi,

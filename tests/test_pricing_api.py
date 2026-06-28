@@ -1721,6 +1721,7 @@ async def test_list_providers_by_procedure_routes_plan_filter_to_ptg2(monkeypatc
             "include_providers": "true",
             "include_code_details": "true",
             "include_sources": "true",
+            "include_unverified_addresses": "true",
             "classification": "Internal Medicine",
             "taxonomy_codes": "207R00000X",
             "include_subspecialties": "false",
@@ -1741,6 +1742,7 @@ async def test_list_providers_by_procedure_routes_plan_filter_to_ptg2(monkeypatc
     assert seen_args["include_providers"] == "true"
     assert seen_args["include_code_details"] == "true"
     assert seen_args["include_sources"] == "true"
+    assert seen_args["include_unverified_addresses"] == "true"
     assert seen_args["include_details"] is None
     assert seen_args["classification"] == "Internal Medicine"
     assert seen_args["taxonomy_codes"] == "207R00000X"
