@@ -98,7 +98,7 @@ Last one-time research refresh: 2026-06-05.
 | Premera Blue Cross ASO | blue | - | needs official source URL |
 | Regence | blue | https://www.regence.com/transparency-in-coverage/ | curated source row; aliases: Regence Group Administrators, Regence BlueShield, Regence BlueCross BlueShield, Regence Blue Cross Blue Shield, REGENCE BLUE CROSS BLUE SHIELD of UTAH |
 | Regence Blue Cross Blue Shield ASO | blue | - | needs official source URL |
-| Triple-S Salud | blue | https://salud.grupotriples.com/en/transparency-in-coverage-machine-readable-files/ | curated source row |
+| Triple-S Salud | blue | https://salud.grupotriples.com/en/transparency-in-coverage-machine-readable-files/ | public transparency page backed by public MTT API; aliases: Triple-S, Triple S, Blue Cross Blue Shield Triple-S, Triple-S Salud Care Plus ELA, Care Plus ELA |
 | Wellmark | blue | https://web.healthsparq.com/app/public/#/one/insurerCode=WMRK_I&brandCode=WELLMARK/ | curated source row; aliases: Wellmark Blue Cross and Blue Shield, Wellmark Blue Cross Blue Shield of IA, Wellmark Blue Cross Blue Shield of Iowa and SD, Wellmark of Iowa |
 | Bright HealthCare | dtc | - | needs official source URL |
 | Clover Health | dtc | https://www.cloverhealth.com/members/plan-documents | public transparency URL |
@@ -248,7 +248,7 @@ Last one-time research refresh: 2026-06-05.
 | CommunityCare of OK | regional | https://www.ccok.com/transparency-coverage-information | curated source row |
 | ConnectiCare | regional | https://transparency.connecticare.com/ | observed stale |
 | ConnectiCare | regional | https://www.connecticare.com/about-us/transparency-coverage-compliance | curated source row |
-| Contra Costa | regional | - | needs official source URL |
+| Contra Costa Health Plan | regional | https://www.cchealth.org/health-insurance/my-contra-costa-health-plan/transparency-in-coverage | public transparency page backed by hostedjson Azure listing; aliases: Contra Costa, Contra Costa Health Plan CarePlus, Care Plus, CarePlus |
 | Cook Children's | regional | - | needs official source URL |
 | Curative Health Plan | regional | https://curative.com/transparency-in-coverage-rates | public transparency page with current TOC link; aliases: Curative, Curative Health |
 | Coventry | regional | - | needs official source URL |

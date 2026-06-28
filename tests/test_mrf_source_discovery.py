@@ -159,6 +159,16 @@ def test_source_urls_are_loaded_from_registry_file():
         == "azure_mrf_listing"
     )
     assert (
+        config["platform_resolvers"]["hostedjson_azure_mrf_listing"]["type"]
+        == "azure_mrf_listing"
+    )
+    assert (
+        config["platform_resolvers"]["hostedjson_azure_mrf_listing"][
+            "skip_toc_targets"
+        ]
+        is True
+    )
+    assert (
         config["platform_resolvers"]["pacificsource_azure_mrf_listing"]["type"]
         == "azure_mrf_listing"
     )
@@ -168,6 +178,10 @@ def test_source_urls_are_loaded_from_registry_file():
             "listing_urls"
         ][0]
     )
+    assert (
+        config["platform_resolvers"]["triples_mtt_api"]["type"] == "triples_mtt_api"
+    )
+    assert config["platform_resolvers"]["triples_mtt_api"]["latest_month_only"] is True
     assert (
         config["platform_resolvers"]["payercompass_mrf"]["type"] == "payercompass_mrf"
     )
@@ -987,6 +1001,13 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert by_name["BCBS North Carolina"].hosting_platform == "direct_toc"
     assert "Blue Cross Blue Shield of NC" in aliases_by_name["BCBS North Carolina"]
     assert "BlueCross BlueShield of NC" in aliases_by_name["BCBS North Carolina"]
+    assert by_name["Triple-S Salud"].hosting_platform == "triples_mtt_api"
+    assert "Care Plus ELA" in by_name["Triple-S Salud"].aliases
+    assert (
+        by_name["Contra Costa Health Plan"].hosting_platform
+        == "hostedjson_azure_mrf_listing"
+    )
+    assert "CarePlus" in by_name["Contra Costa Health Plan"].aliases
     assert "Blue Cross Blue Shield of SC" in aliases_by_name["BCBS South Carolina"]
     assert (
         "Blue Benefit Administrators of Massachusetts"
@@ -1496,6 +1517,30 @@ def test_classify_hosting_platforms():
             "https://mrf.pacificsource.com/File/Visit/Index"
         )
         == "pacificsource_azure_mrf_listing"
+    )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://www.cchealth.org/health-insurance/my-contra-costa-health-plan/transparency-in-coverage"
+        )
+        == "hostedjson_azure_mrf_listing"
+    )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://hostedjson.blob.core.windows.net/transparencyfiles?restype=container&comp=list"
+        )
+        == "hostedjson_azure_mrf_listing"
+    )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://salud.grupotriples.com/en/transparency-in-coverage-machine-readable-files/"
+        )
+        == "triples_mtt_api"
+    )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://salud.grupotriples.com/en/wp-json/app/v1/mtt?network=Puerto+Rico"
+        )
+        == "triples_mtt_api"
     )
     assert (
         discovery.classify_hosting_platform(
@@ -5522,6 +5567,193 @@ def test_azure_mrf_listing_targets_from_xml_extracts_toc_metadata():
     assert targets[0].metadata["target_kind"] == "toc_json"
     assert targets[0].metadata["content_length"] == "2153918"
     assert targets[0].metadata["target_max_bytes"] == 456789
+
+
+def test_azure_mrf_listing_targets_from_xml_extracts_hostedjson_files():
+    source = {
+        "source_id": "source_1",
+        "payer_id": "payer_1",
+        "display_name": "Contra Costa Health Plan",
+    }
+    xml = """<?xml version="1.0" encoding="utf-8"?>
+    <EnumerationResults ContainerName="https://hostedjson.blob.core.windows.net/transparencyfiles">
+      <Blobs>
+        <Blob>
+          <Name>2026-05-30_CCHP_ALLOWED_allowed-amounts.json</Name>
+          <Url>https://hostedjson.blob.core.windows.net/transparencyfiles/2026-05-30_CCHP_ALLOWED_allowed-amounts.json</Url>
+          <Properties><Content-Length>111</Content-Length></Properties>
+        </Blob>
+        <Blob>
+          <Name>2026-05-30_CCHP_index.json</Name>
+          <Url>https://hostedjson.blob.core.windows.net/transparencyfiles/2026-05-30_CCHP_index.json</Url>
+          <Properties><Content-Length>123</Content-Length></Properties>
+        </Blob>
+        <Blob>
+          <Name>2026-05-30_MEDICAL_2640000002_in-network-rates.json.gz</Name>
+          <Url>https://hostedjson.blob.core.windows.net/transparencyfiles/2026-05-30_MEDICAL_2640000002_in-network-rates.json.gz</Url>
+          <Properties><Content-Length>456</Content-Length></Properties>
+        </Blob>
+      </Blobs>
+    </EnumerationResults>
+    """
+
+    targets = discovery._azure_mrf_listing_targets_from_xml(
+        source,
+        xml,
+        listing_url=(
+            "https://hostedjson.blob.core.windows.net/transparencyfiles"
+            "?restype=container&comp=list"
+        ),
+        resolver={"type": "azure_mrf_listing", "toc_max_bytes": 789},
+    )
+
+    assert [target.metadata["target_file_type"] for target in targets] == [
+        "table-of-contents",
+        "in-network",
+        "allowed-amounts",
+    ]
+    assert targets[0].metadata["target_kind"] == "toc_json"
+    assert targets[1].metadata["target_kind"] == "file_reference"
+
+    direct_only_targets = discovery._azure_mrf_listing_targets_from_xml(
+        source,
+        xml,
+        listing_url=(
+            "https://hostedjson.blob.core.windows.net/transparencyfiles"
+            "?restype=container&comp=list"
+        ),
+        resolver={"type": "azure_mrf_listing", "skip_toc_targets": True},
+    )
+
+    assert [target.metadata["target_file_type"] for target in direct_only_targets] == [
+        "in-network",
+        "allowed-amounts",
+    ]
+
+
+def test_triples_mtt_targets_keep_latest_month_files():
+    source = {
+        "source_id": "source_1",
+        "payer_id": "payer_1",
+        "display_name": "Triple-S Salud",
+    }
+    payload = {
+        "list": [
+            {
+                "id": "old",
+                "network": "Puerto Rico",
+                "plan": "Triple-S Salud, Inc.",
+                "year": "2026",
+                "month": "04",
+                "marketing": "In Network PR - PPO",
+                "url": (
+                    "https://prodtshcontenportalblob.blob.core.windows.net/"
+                    "mrf-files/2026-04/2026-04-10_triples_in-network_PPO.json.gz"
+                ),
+            },
+            {
+                "id": "new-in",
+                "network": "Puerto Rico",
+                "plan": "Triple-S Salud, Inc.",
+                "year": "2026",
+                "month": "05",
+                "marketing": "In Network PR - PPO",
+                "url": (
+                    "https://prodtshcontenportalblob.blob.core.windows.net/"
+                    "mrf-files/2026-05/2026-05-10_triples_in-network_PPO.json.gz"
+                ),
+            },
+            {
+                "id": "new-oon",
+                "network": "Puerto Rico",
+                "plan": "Triple-S Salud, Inc.",
+                "year": "2026",
+                "month": "05",
+                "marketing": "Out of Network PR - Allowed Amounts",
+                "url": (
+                    "https://prodtshcontenportalblob.blob.core.windows.net/"
+                    "mrf-files/2026-05/OutOfNetwork-PPO-20260510124205.json"
+                ),
+            },
+        ]
+    }
+
+    targets = discovery._triples_mtt_targets_from_payload(
+        source,
+        payload,
+        resolved_from_url="https://salud.grupotriples.com/en/wp-json/app/v1/mtt",
+        resolver={"type": "triples_mtt_api", "latest_month_only": True},
+    )
+
+    assert [target.metadata["target_file_type"] for target in targets] == [
+        "in-network",
+        "allowed-amounts",
+    ]
+    assert {target.metadata["triples_id"] for target in targets} == {
+        "new-in",
+        "new-oon",
+    }
+    assert targets[0].metadata["plan_info"][0]["plan_name"] == (
+        "Triple-S Salud, Inc. - In Network PR - PPO"
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_triples_mtt_api_fetches_latest_select_month(monkeypatch):
+    source = {
+        "source_id": "source_1",
+        "payer_id": "payer_1",
+        "display_name": "Triple-S Salud",
+    }
+    calls = []
+
+    async def fake_fetch_json_value(url, **_kwargs):
+        calls.append(url)
+        if "month=05" in url:
+            return {
+                "list": [
+                    {
+                        "id": "48414",
+                        "network": "Puerto Rico",
+                        "plan": "Triple-S Salud, Inc.",
+                        "year": "2026",
+                        "month": "05",
+                        "marketing": "In Network PR - PPO",
+                        "url": (
+                            "https://prodtshcontenportalblob.blob.core.windows.net/"
+                            "mrf-files/2026-05/"
+                            "2026-05-10_triples_in-network_PPO.json.gz"
+                        ),
+                    }
+                ]
+            }
+        return {
+            "selects": {
+                "year": [{"year": "2025"}, {"year": "2026"}],
+                "month": [{"month": "04"}, {"month": "05"}],
+            },
+            "list": [],
+        }
+
+    monkeypatch.setattr(discovery, "_fetch_json_value", fake_fetch_json_value)
+
+    [target] = await discovery._resolve_triples_mtt_api(
+        source,
+        "https://salud.grupotriples.com/en/transparency-in-coverage-machine-readable-files/",
+        {
+            "type": "triples_mtt_api",
+            "api_url": "https://salud.grupotriples.com/en/wp-json/app/v1/mtt",
+            "network": "Puerto Rico",
+            "plan": "Triple-S Salud, Inc.",
+            "latest_month_only": True,
+        },
+        None,
+    )
+
+    assert len(calls) == 2
+    assert "year=2026" in calls[1]
+    assert "month=05" in calls[1]
+    assert target.metadata["target_file_type"] == "in-network"
 
 
 def test_payercompass_targets_from_structure_use_file_list_download_ids():

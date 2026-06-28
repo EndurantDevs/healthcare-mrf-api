@@ -915,6 +915,15 @@ def classify_hosting_platform(url: str | None) -> str | None:
     ):
         return "hmsa_monthly_toc"
     if (
+        host in {"salud.grupotriples.com", "www.salud.grupotriples.com"}
+        and (
+            "transparency-in-coverage-machine-readable-files" in path
+            or path.startswith("/en/wp-json/app/v1/mtt")
+            or path.startswith("/wp-json/app/v1/mtt")
+        )
+    ):
+        return "triples_mtt_api"
+    if (
         host in {"www.uhahealth.com", "uhahealth.com"}
         and "transparency-in-coverage" in path
     ) or (host == "app.uhahealth.com" and path.startswith("/mrf")):
@@ -925,6 +934,18 @@ def classify_hosting_platform(url: str | None) -> str | None:
         return "lacare_s3_listing"
     if host in {"www.bcbsri.com", "bcbsri.com"} and path.startswith("/developers"):
         return "bcbsri_azure_mrf_listing"
+    if (
+        host
+        in {
+            "hostedjson.z5.web.core.windows.net",
+            "hostedjson.blob.core.windows.net",
+        }
+        or (
+            host in {"www.cchealth.org", "cchealth.org"}
+            and "transparency-in-coverage" in path
+        )
+    ):
+        return "hostedjson_azure_mrf_listing"
     if host in {"alliantplans.com", "www.alliantplans.com"} and path.startswith(
         "/json/pt/"
     ):
@@ -6823,6 +6844,8 @@ def _azure_mrf_listing_targets_from_xml(
             target_file_type = _mrf_file_type_from_text(file_url, label)
         if not file_url or not target_kind or not target_file_type:
             continue
+        if resolver.get("skip_toc_targets") and target_kind == "toc_json":
+            continue
         key = _canonical_or_none(file_url) or file_url
         if key in seen:
             continue
@@ -6849,7 +6872,23 @@ def _azure_mrf_listing_targets_from_xml(
                 },
             )
         )
+    targets.sort(key=_crawl_target_priority_key)
     return targets
+
+
+def _crawl_target_priority_key(target: CrawlTarget) -> tuple[int, str]:
+    metadata = target.metadata or {}
+    file_type = str(metadata.get("target_file_type") or "")
+    kind = str(metadata.get("target_kind") or "")
+    priority = {
+        "table-of-contents": 0,
+        "in-network": 1,
+        "allowed-amounts": 2,
+        "payer-drug": 3,
+    }.get(file_type, 9)
+    if kind == "toc_json":
+        priority = min(priority, 0)
+    return priority, target.url
 
 
 async def _resolve_azure_mrf_listing(
@@ -6881,6 +6920,175 @@ async def _resolve_azure_mrf_listing(
         targets = targets[:max_targets]
     if not targets:
         raise ValueError(f"no Azure MRF listing targets found for {url}")
+    return targets
+
+
+def _url_with_query_params(url: str, params: dict[str, Any]) -> str:
+    parsed = urlsplit(str(url or ""))
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    for key, value in params.items():
+        query[str(key)] = "" if value is None else str(value)
+    return parsed._replace(query=urlencode(query)).geturl()
+
+
+def _triples_mtt_latest_year_month(payload: Any) -> tuple[str | None, str | None]:
+    if not isinstance(payload, dict):
+        return None, None
+    selects = payload.get("selects")
+    years: list[int] = []
+    months: list[int] = []
+    if isinstance(selects, dict):
+        for item in selects.get("year") or ():
+            try:
+                years.append(int(str(item.get("year") or "").strip()))
+            except (AttributeError, TypeError, ValueError):
+                continue
+        for item in selects.get("month") or ():
+            try:
+                months.append(int(str(item.get("month") or "").strip()))
+            except (AttributeError, TypeError, ValueError):
+                continue
+    for item in payload.get("list") or ():
+        if not isinstance(item, dict):
+            continue
+        try:
+            years.append(int(str(item.get("year") or "").strip()))
+            months.append(int(str(item.get("month") or "").strip()))
+        except (TypeError, ValueError):
+            continue
+    if not years or not months:
+        return None, None
+    return str(max(years)), f"{max(months):02d}"
+
+
+def _triples_mtt_targets_from_payload(
+    source: dict[str, Any],
+    payload: Any,
+    *,
+    resolved_from_url: str,
+    resolver: dict[str, Any],
+) -> list[CrawlTarget]:
+    if not isinstance(payload, dict):
+        return []
+    resolver_type = str(resolver.get("type") or "triples_mtt_api")
+    items = [item for item in payload.get("list") or () if isinstance(item, dict)]
+    if resolver.get("latest_month_only", True):
+        latest = max(
+            (
+                (str(item.get("year") or ""), str(item.get("month") or ""))
+                for item in items
+                if item.get("url")
+            ),
+            default=None,
+        )
+        if latest:
+            items = [
+                item
+                for item in items
+                if (str(item.get("year") or ""), str(item.get("month") or ""))
+                == latest
+            ]
+    targets: list[CrawlTarget] = []
+    seen: set[str] = set()
+    for item in items:
+        file_url = _clean_text(item.get("url"))
+        label = _clean_text(item.get("marketing")) or Path(urlsplit(file_url).path).name
+        file_type = _mrf_file_type_from_text(file_url, label)
+        if not file_url or not file_type:
+            continue
+        key = _canonical_or_none(file_url) or file_url
+        if key in seen:
+            continue
+        seen.add(key)
+        plan_name = " - ".join(
+            part
+            for part in (
+                _clean_text(item.get("plan")),
+                _clean_text(item.get("marketing")),
+            )
+            if part
+        )
+        targets.append(
+            CrawlTarget(
+                source=source,
+                url=file_url,
+                label=label,
+                resolved_from_url=resolved_from_url,
+                metadata={
+                    "resolver": resolver_type,
+                    "target_kind": (
+                        "toc_json"
+                        if file_type == "table-of-contents"
+                        else "file_reference"
+                    ),
+                    "target_file_type": file_type,
+                    "container_format": _container_format(file_url),
+                    "triples_id": item.get("id"),
+                    "network": item.get("network"),
+                    "plan": item.get("plan"),
+                    "year": item.get("year"),
+                    "month": item.get("month"),
+                    "marketing": item.get("marketing"),
+                    "plan_info": [
+                        {
+                            "plan_id": None,
+                            "plan_id_type": None,
+                            "plan_market_type": "group",
+                            "plan_name": plan_name or None,
+                        }
+                    ],
+                },
+            )
+        )
+    max_targets = _as_int(resolver.get("max_targets"))
+    if max_targets and max_targets > 0:
+        targets = targets[:max_targets]
+    return targets
+
+
+async def _resolve_triples_mtt_api(
+    source: dict[str, Any],
+    url: str,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    api_url = str(resolver.get("api_url") or url).strip()
+    params = {
+        "network": resolver.get("network") or "",
+        "month": "",
+        "year": "",
+        "plan": resolver.get("plan") or "",
+    }
+    initial_url = _url_with_query_params(api_url, params)
+    payload = await _fetch_json_value(
+        initial_url,
+        max_bytes=int(resolver.get("max_bytes") or 5 * 1024 * 1024),
+        session=session,
+    )
+    resolved_from_url = initial_url
+    if resolver.get("latest_month_only", True):
+        year, month = _triples_mtt_latest_year_month(payload)
+        if year and month:
+            latest_url = _url_with_query_params(
+                api_url,
+                {
+                    "network": resolver.get("network") or "",
+                    "month": month,
+                    "year": year,
+                    "plan": resolver.get("plan") or "",
+                },
+            )
+            payload = await _fetch_json_value(
+                latest_url,
+                max_bytes=int(resolver.get("max_bytes") or 5 * 1024 * 1024),
+                session=session,
+            )
+            resolved_from_url = latest_url
+    targets = _triples_mtt_targets_from_payload(
+        source, payload, resolved_from_url=resolved_from_url, resolver=resolver
+    )
+    if not targets:
+        raise ValueError(f"no Triple-S MTT targets found for {url}")
     return targets
 
 
@@ -7733,6 +7941,8 @@ async def _crawl_targets_for_source(
         return _monthly_toc_targets(source, url, resolver)
     if resolver_type == "azure_mrf_listing":
         return await _resolve_azure_mrf_listing(source, url, resolver, session)
+    if resolver_type == "triples_mtt_api":
+        return await _resolve_triples_mtt_api(source, url, resolver, session)
     if resolver_type == "s3_xml_listing":
         return await _resolve_s3_xml_listing(source, url, resolver, session)
     if resolver_type == "cigna_static_mrf_lookup":
