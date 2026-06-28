@@ -38,7 +38,8 @@ from db.models import (AddressArchive, EntityAddressUnified, Issuer,
                        ProviderEnrollmentFQHC,
                        ProviderEnrollmentHomeHealthAgency,
                        ProviderEnrollmentHospice, ProviderEnrollmentHospital,
-                       ProviderEnrollmentRHC, ProviderEnrollmentSNF, db)
+                       ProviderEnrollmentRHC, ProviderEnrollmentSNF,
+                       ProviderDirectorySource, db)
 from process.ext.utils import download_it
 from process.openaddresses import exact_lookup_sql, fuzzy_lookup_sql, lookup_params_from_address, relaxed_lookup_sql
 
@@ -112,6 +113,13 @@ PUBLIC_ADDRESS_ATTRIBUTION_COLUMNS = {
     "ptg_source_array",
     "group_plan_array",
 }
+PROVIDER_DIRECTORY_SOURCE_DETAIL_KEY = "provider_directory_sources"
+PUBLIC_PROVIDER_DIRECTORY_SOURCE_DETAIL_COLUMNS = (
+    "source",
+    "source_id",
+    "org_name",
+    "plan_name",
+)
 PUBLIC_NESTED_TAXONOMY_EXCLUDED_COLUMNS = {"npi", "checksum"}
 
 
@@ -702,6 +710,7 @@ def _merge_duplicate_address(base: dict[str, Any], duplicate: Mapping[str, Any])
     for key in (
         "address_sources",
         "source_record_ids",
+        PROVIDER_DIRECTORY_SOURCE_DETAIL_KEY,
         "aca_plan_array",
         "aca_network_array",
         "ptg_plan_array",
@@ -753,6 +762,112 @@ def _dedupe_addresses_by_key(addresses: Sequence[Any]) -> list[dict[str, Any]]:
             continue
         _merge_duplicate_address(existing, address)
     return list(keyed.values()) + unkeyed
+
+
+def _provider_directory_source_ids_from_record_ids(record_ids: Any) -> list[str]:
+    if not record_ids:
+        return []
+    candidates = record_ids if isinstance(record_ids, (list, tuple, set)) else [record_ids]
+    source_ids: list[str] = []
+    seen: set[str] = set()
+    for raw in candidates:
+        value = str(raw or "").strip()
+        parts = value.split(":")
+        if len(parts) < 3 or parts[0] != "provider_directory_fhir":
+            continue
+        source_id = parts[2].strip()
+        if not source_id or source_id in seen:
+            continue
+        seen.add(source_id)
+        source_ids.append(source_id)
+    return source_ids
+
+
+def _provider_directory_source_ids_from_addresses(addresses: Sequence[Any]) -> list[str]:
+    source_ids: list[str] = []
+    seen: set[str] = set()
+    for address in addresses or []:
+        if not isinstance(address, Mapping):
+            continue
+        for source_id in _provider_directory_source_ids_from_record_ids(address.get("source_record_ids")):
+            if source_id in seen:
+                continue
+            seen.add(source_id)
+            source_ids.append(source_id)
+    return source_ids
+
+
+async def _fetch_provider_directory_source_detail_map(
+    source_ids: Sequence[str],
+    *,
+    session: Any = None,
+) -> dict[str, dict[str, Any]]:
+    unique_ids = [source_id for source_id in dict.fromkeys(str(item or "").strip() for item in source_ids) if source_id]
+    if not unique_ids:
+        return {}
+    if not await _table_exists(ProviderDirectorySource.__tablename__, session=session):
+        return {}
+
+    table = ProviderDirectorySource.__table__
+    stmt = (
+        select(
+            table.c.source_id,
+            table.c.org_name,
+            table.c.plan_name,
+        )
+        .where(table.c.source_id.in_(unique_ids))
+    )
+    result = await _execute_stmt(stmt, session=session)
+    rows = result.all()
+    details: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        mapping = getattr(row, "_mapping", row)
+        source_id = str(mapping["source_id"] or "").strip()
+        if not source_id:
+            continue
+        details[source_id] = {
+            "source": "provider_directory_fhir",
+            "source_id": source_id,
+            "org_name": mapping["org_name"],
+            "plan_name": mapping["plan_name"],
+        }
+    return details
+
+
+def _public_provider_directory_source_detail(detail: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: detail[key]
+        for key in PUBLIC_PROVIDER_DIRECTORY_SOURCE_DETAIL_COLUMNS
+        if key in detail and detail[key] is not None
+    }
+
+
+async def _attach_provider_directory_source_details(
+    addresses: Sequence[Any],
+    *,
+    session: Any = None,
+) -> None:
+    source_ids = _provider_directory_source_ids_from_addresses(addresses)
+    if not source_ids:
+        return
+    detail_by_id = await _fetch_provider_directory_source_detail_map(source_ids, session=session)
+    if not detail_by_id:
+        return
+    for address in addresses:
+        if not isinstance(address, dict):
+            continue
+        details: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for source_id in _provider_directory_source_ids_from_record_ids(address.get("source_record_ids")):
+            detail = detail_by_id.get(source_id)
+            if not detail or source_id in seen:
+                continue
+            seen.add(source_id)
+            public_detail = _public_provider_directory_source_detail(detail)
+            if public_detail:
+                details.append(public_detail)
+        if details:
+            address[PROVIDER_DIRECTORY_SOURCE_DETAIL_KEY] = details
 
 
 async def _execute_stmt(stmt: Any, *, session: Any = None, params: Optional[dict[str, Any]] = None):
@@ -4576,6 +4691,8 @@ async def get_npi(request, npi):
         addresses = [address for address in addresses if _is_public_street_level_address(address)]
     addresses = _dedupe_addresses_by_key(addresses)
     if addresses:
+        if include_sources or include_evidence:
+            await _attach_provider_directory_source_details(addresses, session=request_session)
         update_address_tasks = [_update_address(a) for a in addresses if a]
         if update_address_tasks:
             data["address_list"] = list(await asyncio.gather(*update_address_tasks))
@@ -4587,6 +4704,8 @@ async def get_npi(request, npi):
         if isinstance(address, dict):
             for key in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
                 address.pop(key, None)
+            if not include_evidence:
+                address.pop("source_record_ids", None)
     if address_limit is not None:
         # Never silently truncate: tell the caller the full count and how to page.
         returned = len(data["address_list"])
@@ -4711,6 +4830,10 @@ async def _build_npi_details(
         # unified table fulfils its purpose: see where each address came from and
         # which plans/networks it belongs to. Heavier internals stay behind flags.
         allowed_address_columns.update(PUBLIC_ADDRESS_ATTRIBUTION_COLUMNS)
+        # Used internally to resolve provider_directory_fhir source ids to
+        # readable carrier/source details. The raw ids are removed from the
+        # response unless evidence output is requested.
+        allowed_address_columns.add("source_record_ids")
     if include_sources or include_evidence:
         allowed_address_columns.update(PUBLIC_ADDRESS_SOURCE_DEBUG_COLUMNS)
     if include_evidence:

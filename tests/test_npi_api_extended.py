@@ -2205,6 +2205,165 @@ async def test_get_npi_debug_flags_include_sources_and_evidence(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_get_npi_hides_provider_directory_source_details_by_default(monkeypatch):
+    async def fake_build(_npi, **_kwargs):
+        return {
+            'npi': _npi,
+            'do_business_as': [],
+            'taxonomy_list': [],
+            'taxonomy_group_list': [],
+            'address_list': [
+                {
+                    'npi': _npi,
+                    'type': 'practice',
+                    'checksum': 5,
+                    'address_key': '00000000-0000-0000-0000-000000000001',
+                    'address_precision': 'street',
+                    'first_line': '1 Main St',
+                    'city_name': 'Bloomfield',
+                    'state_name': 'CT',
+                    'postal_code': '06002',
+                    'lat': 41.0,
+                    'long': -72.0,
+                    'formatted_address': None,
+                    'place_id': None,
+                    'address_sources': ['provider_directory_fhir'],
+                    'source_record_ids': [
+                        'provider_directory_fhir:practitioner_role:pdfhir_cigna:role-1:loc-1'
+                    ],
+                    'source_count': 1,
+                    'plans_network_array': [],
+                    'taxonomy_array': [],
+                }
+            ],
+        }
+
+    fetch_details = AsyncMock(return_value={
+        'pdfhir_cigna': {
+            'source': 'provider_directory_fhir',
+            'source_id': 'pdfhir_cigna',
+            'org_name': 'Cigna',
+            'plan_name': 'Commercial',
+            'canonical_api_base': 'https://fhir.cigna.com/ProviderDirectory/v1',
+            'api_base': 'https://fhir.cigna.com/ProviderDirectory/v1',
+            'auth_type': 'none',
+            'last_validated_status': 'valid',
+        }
+    })
+
+    monkeypatch.setattr(npi_module, '_build_npi_details', fake_build)
+    monkeypatch.setattr(npi_module, '_fetch_provider_directory_source_detail_map', fetch_details)
+    monkeypatch.setattr(npi_module, '_fetch_other_names', AsyncMock(return_value=[]))
+
+    class FakeApp:
+        config = {'NPI_API_UPDATE_GEOCODE': False}
+
+        def add_task(self, coro):  # pragma: no cover - guard
+            raise AssertionError('no task expected')
+
+    request = types.SimpleNamespace(args={}, app=FakeApp())
+    response = await npi_module.get_npi(request, '1518379602')
+    payload = json.loads(response.body)
+    address = payload['address_list'][0]
+
+    fetch_details.assert_not_awaited()
+    assert 'provider_directory_sources' not in address
+    assert address['address_sources'] == ['provider_directory_fhir']
+    assert 'source_record_ids' not in address
+
+
+@pytest.mark.asyncio
+async def test_get_npi_include_sources_enriches_provider_directory_source_summary(monkeypatch):
+    async def fake_build(_npi, **_kwargs):
+        return {
+            'npi': _npi,
+            'do_business_as': [],
+            'taxonomy_list': [],
+            'taxonomy_group_list': [],
+            'address_list': [
+                {
+                    'npi': _npi,
+                    'type': 'practice',
+                    'checksum': 5,
+                    'address_key': '00000000-0000-0000-0000-000000000001',
+                    'address_precision': 'street',
+                    'first_line': '1 Main St',
+                    'city_name': 'Bloomfield',
+                    'state_name': 'CT',
+                    'postal_code': '06002',
+                    'lat': 41.0,
+                    'long': -72.0,
+                    'formatted_address': None,
+                    'place_id': None,
+                    'address_sources': ['provider_directory_fhir'],
+                    'source_record_ids': [
+                        'provider_directory_fhir:practitioner_role:pdfhir_cigna:role-1:loc-1'
+                    ],
+                    'source_count': 1,
+                    'plans_network_array': [],
+                    'taxonomy_array': [],
+                }
+            ],
+        }
+
+    source_detail = {
+        'source': 'provider_directory_fhir',
+        'source_id': 'pdfhir_cigna',
+        'org_name': 'Cigna',
+        'plan_name': 'Commercial',
+        'canonical_api_base': 'https://fhir.cigna.com/ProviderDirectory/v1',
+        'api_base': 'https://fhir.cigna.com/ProviderDirectory/v1',
+        'auth_type': 'none',
+        'auth_required': False,
+        'requires_api_key': False,
+        'credential_name': 'PAYER_DIRECTORY_KEY',
+        'headers': {'X-API-Key': 'secret'},
+        'token': 'secret-token',
+        'last_validated_status': 'valid',
+    }
+    fetch_details = AsyncMock(return_value={'pdfhir_cigna': source_detail})
+
+    monkeypatch.setattr(npi_module, '_build_npi_details', fake_build)
+    monkeypatch.setattr(npi_module, '_fetch_provider_directory_source_detail_map', fetch_details)
+    monkeypatch.setattr(npi_module, '_fetch_other_names', AsyncMock(return_value=[]))
+
+    class FakeApp:
+        config = {'NPI_API_UPDATE_GEOCODE': False}
+
+        def add_task(self, coro):  # pragma: no cover - guard
+            raise AssertionError('no task expected')
+
+    request = types.SimpleNamespace(args={'include_sources': 'true'}, app=FakeApp())
+    response = await npi_module.get_npi(request, '1518379602')
+    payload = json.loads(response.body)
+    address = payload['address_list'][0]
+
+    fetch_details.assert_awaited_once_with(['pdfhir_cigna'], session=None)
+    assert address['provider_directory_sources'] == [
+        {
+            'source': 'provider_directory_fhir',
+            'source_id': 'pdfhir_cigna',
+            'org_name': 'Cigna',
+            'plan_name': 'Commercial',
+        }
+    ]
+    source_json = json.dumps(address['provider_directory_sources'])
+    for sensitive_value in (
+        'api_base',
+        'canonical_api_base',
+        'auth_type',
+        'auth_required',
+        'requires_api_key',
+        'credential_name',
+        'headers',
+        'secret-token',
+    ):
+        assert sensitive_value not in source_json
+    assert address['address_sources'] == ['provider_directory_fhir']
+    assert 'source_record_ids' not in address
+
+
+@pytest.mark.asyncio
 async def test_get_npi_address_list_clears_empty_entries(monkeypatch):
     async def fake_build(_npi, **_kwargs):
         return {
