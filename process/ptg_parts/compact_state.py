@@ -53,6 +53,7 @@ def _compact_state(batch_rows: int | None = None) -> dict[str, Any]:
         "procedure_payloads": {},
         "price_payloads": {},
         "provider_set_counts": {},
+        "provider_set_network_names": {},
         "existing_price_set_hashes": None,
         "counts": {
             "provider_groups": 0,

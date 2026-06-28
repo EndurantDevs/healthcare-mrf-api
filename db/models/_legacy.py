@@ -2429,6 +2429,7 @@ class PTG2ServingRate(Base, JSONOutputMixin):
     provider_set_count = Column(Integer)
     price_set_hash = Column(String(64))
     source_trace_set_hash = Column(String(64))
+    network_names = Column(ARRAY(String))
     confidence_code = Column(String(64))
     prices = Column(JSON)
     source_trace = Column(JSON)

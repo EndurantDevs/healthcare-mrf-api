@@ -43,6 +43,7 @@ def _ptg2_serving_rate_row(
     prices: list[dict[str, Any]] | None,
     source_trace: list[dict[str, Any]] | None,
     source_trace_set_hash: str | None = None,
+    network_names: list[str] | tuple[str, ...] | set[str] | None = None,
     confidence: dict[str, Any] | None = None,
     confidence_code: str | None = None,
 ) -> dict[str, Any]:
@@ -86,6 +87,7 @@ def _ptg2_serving_rate_row(
         "provider_set_count": provider_set_count,
         "price_set_hash": rate_pack_row.get("price_set_hash"),
         "source_trace_set_hash": source_trace_set_hash,
+        "network_names": sorted({str(value) for value in (network_names or []) if str(value or "").strip()}),
         "confidence_code": confidence_code or PTG2_CONFIDENCE_TIC_RATE_NPI_TIN,
         "prices": prices,
         "source_trace": source_trace,
@@ -122,6 +124,7 @@ def _ptg2_compact_serving_rate_row(
         "provider_count": serving_row.get("provider_count"),
         "price_set_hash": serving_row.get("price_set_hash"),
         "source_trace_set_hash": serving_row.get("source_trace_set_hash"),
+        "network_names": serving_row.get("network_names") or [],
         "confidence_code": serving_row.get("confidence_code"),
         "created_at": serving_row.get("created_at") or _utcnow(),
     }

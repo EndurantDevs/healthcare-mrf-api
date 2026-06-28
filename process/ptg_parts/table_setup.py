@@ -154,6 +154,7 @@ async def _ensure_ptg2_serving_rate_columns(db_schema: str) -> None:
         "reported_code": "varchar(64)",
         "procedure_display_name": "varchar",
         "source_trace_set_hash": "varchar(64)",
+        "network_names": "varchar[]",
         "confidence_code": "varchar(64)",
     }
     for column_name, column_type in column_specs.items():
@@ -298,6 +299,7 @@ async def _ensure_ptg2_serving_rate_stage_table(db_schema: str) -> None:
             provider_set_count integer,
             price_set_hash varchar(64),
             source_trace_set_hash varchar(64),
+            network_names varchar[],
             confidence_code varchar(64),
             prices json,
             source_trace json,
@@ -334,6 +336,7 @@ async def _ensure_ptg2_serving_rate_stage_table(db_schema: str) -> None:
         "provider_set_count": "integer",
         "price_set_hash": "varchar(64)",
         "source_trace_set_hash": "varchar(64)",
+        "network_names": "varchar[]",
         "confidence_code": "varchar(64)",
         "prices": "json",
         "source_trace": "json",

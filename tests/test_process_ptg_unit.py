@@ -1971,6 +1971,7 @@ def test_ptg2_compact_rate_pack_flush_writes_serving_rows(monkeypatch):
     }
     state["price_payloads"] = {"price": [{"negotiated_rate": "50", "negotiated_type": "negotiated"}]}
     state["provider_set_counts"] = {"provider-a": 10, "provider-b": 20}
+    state["provider_set_network_names"] = {"provider-a": ["C2"], "provider-b": ["C2", "Choice Plus"]}
     state["source_trace_payload"] = [
         {
             "source_file_version_id": "source-version-1",
@@ -1988,6 +1989,8 @@ def test_ptg2_compact_rate_pack_flush_writes_serving_rows(monkeypatch):
     assert serving_row["procedure_code"] == process_ptg.return_checksum(["CPT", "00102"])
     assert serving_row["provider_count"] == 30
     assert serving_row["prices"][0]["negotiated_rate"] == 50
+    assert serving_row["source_trace_set_hash"] == "source"
+    assert serving_row["network_names"] == ["C2", "Choice Plus"]
     assert serving_row["source_trace"][0]["source_file_version_id"] == "source-version-1"
     assert serving_row["source_trace"][0]["original_url"] == "https://example.test/rates.json.gz"
 
@@ -2230,7 +2233,7 @@ def test_ptg2_serving_only_provider_set_uses_real_provider_group_hashes():
         file_id=1,
         provider_group_ref=provider_ref["provider_group_id"],
         provider_groups=provider_ref["provider_groups"],
-        network_names=[],
+        network_names=["C2"],
     )
     assert provider_entry is not None
     expected_group_hashes = sorted(provider_entry["provider_group_hashes"])
@@ -2259,10 +2262,14 @@ def test_ptg2_serving_only_provider_set_uses_real_provider_group_hashes():
     )
 
     provider_set = result["provider_set_rows"][0]
+    serving_row = result["serving_rows"][0]
+    compact_row = result["serving_rate_compact_rows"][0]
     assert provider_set["provider_set_hash"] == process_ptg._serving_only_hash_int_sets(
         "serving_provider_set",
         expected_group_hashes,
     )
+    assert serving_row["network_names"] == ["C2"]
+    assert compact_row["network_names"] == ["C2"]
 
 
 def test_ptg2_single_pass_in_network_parser_uses_provider_cache(tmp_path, monkeypatch):

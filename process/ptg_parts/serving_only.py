@@ -213,6 +213,7 @@ def _serving_only_rows_for_payload(
                 "provider_group_hashes": set(),
                 "provider_group_member_rows": [],
                 "provider_count": 0,
+                "network_names": set(),
             },
         )
         entry_hash = int(combined_entry["__hash__"])
@@ -225,6 +226,9 @@ def _serving_only_rows_for_payload(
         item_group["provider_group_member_rows"].extend(_provider_group_member_rows(combined_entry))
         item_group["provider_count"] += int(
             combined_entry.get("provider_count") or len(_as_int_list(combined_entry.get("npi")))
+        )
+        item_group["network_names"].update(
+            str(value) for value in _as_list(combined_entry.get("network_name")) if str(value or "").strip()
         )
 
     rows: list[dict[str, Any]] = []
@@ -276,6 +280,7 @@ def _serving_only_rows_for_payload(
                 prices=None if slim_serving_rows else item_group["prices"],
                 source_trace=None if slim_serving_rows else source_trace_payload,
                 source_trace_set_hash=source_trace_set_hash if slim_serving_rows else None,
+                network_names=item_group["network_names"],
                 confidence={} if slim_serving_rows else confidence_payload,
                 confidence_code=PTG2_CONFIDENCE_TIC_RATE_NPI_TIN,
             )

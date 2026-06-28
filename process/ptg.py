@@ -1685,6 +1685,13 @@ async def _parse_in_network_file_compact(
                     continue
                 provider_set_row = _ptg2_provider_set_row(super_entry)
                 state["provider_set_counts"][provider_set_row["provider_set_hash"]] = provider_set_row["provider_count"]
+                state["provider_set_network_names"][provider_set_row["provider_set_hash"]] = sorted(
+                    {
+                        str(value)
+                        for value in _as_list(super_entry.get("network_name"))
+                        if str(value or "").strip()
+                    }
+                )
                 if _compact_add_unique(state, "provider_set", "provider_set_hash", provider_set_row):
                     state["counts"]["provider_sets"] += 1
                 provider_set_hash = provider_set_row["provider_set_hash"]

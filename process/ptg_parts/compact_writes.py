@@ -206,6 +206,14 @@ async def _flush_compact_rate_pack_groups(state: dict[str, Any], context_hash: s
             )
             provider_set_hashes = list(grouped["provider_set_hashes"])
             provider_count = sum(int(state["provider_set_counts"].get(provider_hash, 0) or 0) for provider_hash in provider_set_hashes)
+            network_names = sorted(
+                {
+                    str(value)
+                    for provider_hash in provider_set_hashes
+                    for value in (state.get("provider_set_network_names") or {}).get(provider_hash, [])
+                    if str(value or "").strip()
+                }
+            )
             price_payload = _normalize_serving_price_payload(state["price_payloads"].get(grouped["price_set_hash"], []))
             source_trace_payload = state.get("source_trace_payload") or []
             for procedure_hash in procedure_hashes:
@@ -224,6 +232,8 @@ async def _flush_compact_rate_pack_groups(state: dict[str, Any], context_hash: s
                         provider_set_count=len(provider_set_hashes),
                         prices=price_payload,
                         source_trace=source_trace_payload,
+                        source_trace_set_hash=grouped["source_trace_set_hash"],
+                        network_names=network_names,
                     )
                     if _compact_add_unique(state, "serving_rate", "serving_rate_id", serving_row):
                         state["counts"]["serving_rates"] += 1
