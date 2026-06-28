@@ -85,6 +85,15 @@
       "max_frames": 5,
       "max_targets": 1000
     },
+    "avmed_html_mrf_links": {
+      "type": "html_mrf_links",
+      "max_bytes": 5242880,
+      "directory_max_bytes": 5242880,
+      "max_directories": 20,
+      "frame_max_bytes": 5242880,
+      "max_frames": 5,
+      "max_targets": 1000
+    },
     "html_mrf_links_mixed_directories": {
       "type": "html_mrf_links",
       "max_bytes": 5242880,

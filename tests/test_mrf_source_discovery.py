@@ -52,6 +52,11 @@ def test_source_urls_are_loaded_from_registry_file():
     assert config["platform_resolvers"]["html_mrf_links"]["type"] == "html_mrf_links"
     assert config["platform_resolvers"]["html_mrf_links"]["max_frames"] == 5
     assert (
+        config["platform_resolvers"]["avmed_html_mrf_links"]["type"]
+        == "html_mrf_links"
+    )
+    assert config["platform_resolvers"]["avmed_html_mrf_links"]["max_directories"] == 20
+    assert (
         config["platform_resolvers"]["blueadvantage_html_mrf_links"]["type"]
         == "html_mrf_links"
     )
@@ -430,8 +435,17 @@ def test_classify_hosting_platform_recognizes_public_adapter_pages():
     for url in (
         "https://www.optimahealth.com/transparency-in-coverage",
         "https://www.healthpartners.com/hp/legal-notices/disclosures/transparency/index.html",
+        "https://www.mclarenhealthplan.org/mhp/transparency-in-coverage-and-no-surprises-act",
     ):
         assert discovery.classify_hosting_platform(url) == "html_mrf_links"
+    assert (
+        discovery.classify_hosting_platform(
+            "https://deancare.healthsparq.com/healthsparq/public/#/one/"
+            "insurerCode=MEDICAHEALTHPLANS_I&brandCode=DEAN&productCode=MRF/"
+            "machine-readable-transparency-in-coverage"
+        )
+        == "healthsparq"
+    )
     for url in (
         "https://www.deancare.com/helpful-links/transparency-in-coverage",
         "https://www.avmed.org/transparency-in-coverage",
@@ -484,6 +498,14 @@ def test_classify_hosting_platform_recognizes_public_adapter_pages():
     assert (
         discovery.classify_hosting_platform("https://www.firstchoicenext.com/json")
         == "html_mrf_links"
+    )
+    assert (
+        discovery.classify_hosting_platform("https://www.amerihealthcaritasnext.com/json")
+        == "html_mrf_links"
+    )
+    assert (
+        discovery.classify_hosting_platform("https://www.avmed.org/en/for-developers")
+        == "avmed_html_mrf_links"
     )
     assert (
         discovery.classify_hosting_platform(
@@ -5446,6 +5468,96 @@ def test_parse_html_mrf_links_extracts_tocs_and_body_file_references():
     ]
 
 
+def test_parse_html_mrf_links_classifies_singular_table_of_content_indexes():
+    html = """
+    <a href="/files/McLarenHealthPlan_allowed-amount_table_of_content.json">
+      allowed amounts table of content
+    </a>
+    <a href="/files/McLarenHealthPlan_in-network-rates_table-of-content.json">
+      in-network rates table-of-content
+    </a>
+    <a href="/files/McLarenHealthPlan_allowed-amount.json">Allowed Amounts</a>
+    """
+
+    targets = discovery._parse_html_mrf_links(
+        html,
+        base_url=(
+            "https://www.mclarenhealthplan.org/mhp/"
+            "transparency-in-coverage-and-no-surprises-act"
+        ),
+    )
+
+    assert targets == [
+        {
+            "url": (
+                "https://www.mclarenhealthplan.org/files/"
+                "McLarenHealthPlan_allowed-amount_table_of_content.json"
+            ),
+            "label": "allowed amounts table of content",
+            "resolver": "html_mrf_link",
+            "target_kind": "toc_json",
+            "target_file_type": "table-of-contents",
+            "container_format": None,
+            "html_attr": "href",
+        },
+        {
+            "url": (
+                "https://www.mclarenhealthplan.org/files/"
+                "McLarenHealthPlan_in-network-rates_table-of-content.json"
+            ),
+            "label": "in-network rates table-of-content",
+            "resolver": "html_mrf_link",
+            "target_kind": "toc_json",
+            "target_file_type": "table-of-contents",
+            "container_format": None,
+            "html_attr": "href",
+        },
+        {
+            "url": (
+                "https://www.mclarenhealthplan.org/files/"
+                "McLarenHealthPlan_allowed-amount.json"
+            ),
+            "label": "Allowed Amounts",
+            "resolver": "html_file_reference",
+            "target_kind": "file_reference",
+            "target_file_type": "allowed-amounts",
+            "container_format": None,
+            "html_attr": "href",
+        },
+    ]
+
+
+def test_parse_html_mrf_links_accepts_dated_oon_plan_index_under_mrf_path():
+    html = """
+    <a href="https://mrfproddestinationdata.blob.core.windows.net/avmed-mrf-output/2026-06-01_AvMed-Health-Plans-OON_index.json">
+      2026-06-01_AvMed-Health-Plans-OON_index.json
+    </a>
+    """
+
+    targets = discovery._parse_html_mrf_links(
+        html,
+        base_url=(
+            "https://mrfproddestinationdata.blob.core.windows.net/"
+            "avmed-mrf-output/AvMed-Health-Plans-OON_index.html"
+        ),
+    )
+
+    assert targets == [
+        {
+            "url": (
+                "https://mrfproddestinationdata.blob.core.windows.net/"
+                "avmed-mrf-output/2026-06-01_AvMed-Health-Plans-OON_index.json"
+            ),
+            "label": "2026-06-01_AvMed-Health-Plans-OON_index.json",
+            "resolver": "html_mrf_link",
+            "target_kind": "toc_json",
+            "target_file_type": "table-of-contents",
+            "container_format": None,
+            "html_attr": "href",
+        }
+    ]
+
+
 def test_parse_html_mrf_links_accepts_plan_named_tic_index_under_mrf_path():
     html = """
     <a href="/mrf/thp/2026-06-01_The-Health-Plan-of-WV-Inc_index.json">
@@ -7473,12 +7585,20 @@ def test_public_rows_prefer_verified_direct_or_platform_urls():
 | CareSource | medicaid_mco | https://www.caresource.com/vendor/tic/tic-data-index.json | public direct TOC |
 | Independent Health | regional | https://web.healthsparq.com/healthsparq/public/#/one/insurerCode=IHNY_I&brandCode=IHNY&productCode=MRF/machine-readable-transparency-in-coverage | public HealthSparq files |
 | Network Health | regional | https://data.networkhealth.com/price-transparency/nhpricetransparency_table_of_contents.json | public direct TOC |
+| Dean Health Plan | provider_sponsored | https://deancare.healthsparq.com/healthsparq/public/#/one/insurerCode=MEDICAHEALTHPLANS_I&brandCode=DEAN&productCode=MRF/machine-readable-transparency-in-coverage | public HealthSparq files |
+| McLaren Health Plan | provider_sponsored | https://www.mclarenhealthplan.org/mhp/transparency-in-coverage-and-no-surprises-act | public HTML MRF files |
+| AmeriHealth Caritas Next | regional | https://www.amerihealthcaritasnext.com/json | public HTML MRF files |
+| AvMed | regional | https://www.avmed.org/en/for-developers | public AvMed developer page |
 """
     by_name = {candidate.payer_name: candidate for candidate in discovery.parse_master_list(markdown)}
 
     assert by_name["CareSource"].hosting_platform == "direct_toc"
     assert by_name["Independent Health"].hosting_platform == "healthsparq"
     assert by_name["Network Health"].hosting_platform == "direct_toc"
+    assert by_name["Dean Health Plan"].hosting_platform == "healthsparq"
+    assert by_name["McLaren Health Plan"].hosting_platform == "html_mrf_links"
+    assert by_name["AmeriHealth Caritas Next"].hosting_platform == "html_mrf_links"
+    assert by_name["AvMed"].hosting_platform == "avmed_html_mrf_links"
 
 
 def test_toc_target_file_row_keeps_index_provenance():

@@ -400,6 +400,8 @@ def _container_format(url: str | None) -> str | None:
 def _mrf_file_type_from_text(url: str | None, label: str | None = None) -> str | None:
     text = f"{url or ''} {label or ''}".lower().replace("_", "-")
     compact = re.sub(r"[^a-z0-9]+", "", text)
+    if "table-of-content" in text:
+        return "table-of-contents"
     if (
         "allowed-amount" in text
         or "allowed amount" in text
@@ -483,6 +485,24 @@ def _looks_non_tic_mrf_reference(url: str | None, label: str | None = None) -> b
         return True
     if re.match(r"^\d{4}-\d{2}-\d{2}[-_].*[-_]index\.json$", file_name) and re.search(
         r"/(?:mrf|mrfs)/", path
+    ):
+        return False
+    tic_index_file = bool(
+        re.match(r"^\d{4}-\d{2}-\d{2}[-_].*[-_]index\.json(?:\.gz)?$", file_name)
+        and any(token in text for token in ("mrf", "price-transparency", "transparency"))
+    )
+    if (
+        _mrf_file_type_from_text(url, label) == "table-of-contents" or tic_index_file
+    ) and any(
+        token in text
+        for token in (
+            "mrf",
+            "machine-readable",
+            "price-transparency",
+            "transparency",
+            "table-of-content",
+            "table of content",
+        )
     ):
         return False
     if re.search(
@@ -826,6 +846,11 @@ def classify_hosting_platform(url: str | None) -> str | None:
         and "transparency-in-coverage" in path
     ):
         return "html_mrf_links"
+    if (
+        host in {"www.mclarenhealthplan.org", "mclarenhealthplan.org"}
+        and "transparency-in-coverage" in path
+    ):
+        return "html_mrf_links"
     if host in {"www.healthplan.org", "healthplan.org"} and (
         path.startswith("/machine_readable_files")
         or path.startswith("/multiplan_mrfs")
@@ -841,6 +866,13 @@ def classify_hosting_platform(url: str | None) -> str | None:
         "/json"
     ):
         return "html_mrf_links"
+    if (
+        host in {"www.amerihealthcaritasnext.com", "amerihealthcaritasnext.com"}
+        and path.startswith("/json")
+    ):
+        return "html_mrf_links"
+    if host in {"www.avmed.org", "avmed.org"} and path.startswith("/en/for-developers"):
+        return "avmed_html_mrf_links"
     if (
         host in {"www.centene.com", "centene.com"}
         and "price-transparency-files" in path
@@ -6160,6 +6192,8 @@ def _looks_html_mrf_toc_url(url: str | None, label: str | None = None) -> bool:
                 "machine-readable",
                 "price-transparency",
                 "transparency",
+                "table-of-content",
+                "table of content",
                 "table-of-contents",
                 "table of contents",
             )
@@ -6171,6 +6205,8 @@ def _looks_html_mrf_toc_url(url: str | None, label: str | None = None) -> bool:
                 "index.json",
                 "index.json.gz",
                 "toc",
+                "table-of-content",
+                "table of content",
                 "table-of-contents",
                 "table of contents",
             )

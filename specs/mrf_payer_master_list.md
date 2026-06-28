@@ -109,6 +109,7 @@ Last one-time research refresh: 2026-06-05.
 | Alameda Alliance / CalOptima / CalViva / Central CA Alliance / Contra Costa / Partnership HealthPlan / Health Plan of San Mateo / Denver Health / Hennepin Health | medicaid_mco | - | needs official source URL |
 | Alameda Alliance for Health | medicaid_mco | https://alamedaalliance.org/about/pricing-transparency/ | public transparency URL |
 | AmeriHealth Caritas | medicaid_mco | https://www.amerihealthcaritas.com/price-transparency/ | curated source row |
+| AmeriHealth Caritas Next | regional | https://www.amerihealthcaritasnext.com/json | public AmeriHealth Caritas Next JSON directory with current TiC table-of-contents links; benefit lines: medical, pediatric dental; aliases: AmeriHealth Caritas Florida, AmeriHealth Caritas Next Louisiana, AmeriHealth Caritas North Carolina, AmeriHealth Caritas VIP Next |
 | CalOptima | medicaid_mco | https://www.caloptima.org/en/about-us/transparency | public transparency URL |
 | CareSource | medicaid_mco | https://www.caresource.com/vendor/tic/tic-data-index.json | verified public direct TiC table of contents linked from CareSource transparency page |
 | Central California Alliance for Health | medicaid_mco | https://thealliance.health/about-the-alliance/transparency-in-coverage-cms-9915-machine-readable-files/ | public transparency URL |
@@ -214,7 +215,7 @@ Last one-time research refresh: 2026-06-05.
 | Children's/VNS Health | provider_sponsored | https://www.hopkinshealthplans.org/transparency-in-coverage/ | curated source row |
 | CHRISTUS Health Plan | provider_sponsored | https://chppayment.christushealth.org/documents/ATEX/ | public MRF directory |
 | Cook Children's HP | provider_sponsored | - | needs official source URL |
-| Dean Health Plan | provider_sponsored | https://www.deancare.com/helpful-links/transparency-in-coverage | curated source row |
+| Dean Health Plan | provider_sponsored | https://deancare.healthsparq.com/healthsparq/public/#/one/insurerCode=MEDICAHEALTHPLANS_I&brandCode=DEAN&productCode=MRF/machine-readable-transparency-in-coverage | public HealthSparq MRF route linked from Dean transparency page |
 | Froedtert Health Plan | provider_sponsored | https://www.froedtert.com/price-transparency | public transparency URL |
 | Geisinger Health Plan | provider_sponsored | https://www.geisinger.org/health-plan/no-surprises-act | curated source row |
 | Hally/Health Alliance | provider_sponsored | - | needs official source URL |
@@ -225,7 +226,7 @@ Last one-time research refresh: 2026-06-05.
 | Jefferson HP | provider_sponsored | - | needs official source URL |
 | Johns Hopkins HealthCare | provider_sponsored | https://ehptransparency.org/ | public Johns Hopkins Employer Health Programs autoindex linked from EHP transparency page |
 | Mass General Brigham HP | provider_sponsored | https://massgeneralbrighamhealthplan.org/meet-us/transparency-regulations | curated source row |
-| McLaren Health Plan | provider_sponsored | https://www.phpmichigan.com/About-Us/Transparency-in-Coverage | curated source row |
+| McLaren Health Plan | provider_sponsored | https://www.mclarenhealthplan.org/mhp/transparency-in-coverage-and-no-surprises-act | public McLaren Health Plan MRF page with direct in-network, allowed-amount, and table-of-contents links |
 | Mercy/MercyCare | provider_sponsored | - | needs official source URL |
 | Ohio Health Choice | provider_sponsored | - | needs official source URL |
 | Optima Health | provider_sponsored | https://www.optimahealth.com/transparency-in-coverage | curated source row |
@@ -262,7 +263,7 @@ Last one-time research refresh: 2026-06-05.
 | Aspirus Health Plan | regional | https://aspirushealthplan.com/insurance/pricingTransparency | public transparency URL |
 | AultCare | regional | - | needs official source URL |
 | AultCare/Aultman | regional | https://aultcare.com/price-transparency | curated source row |
-| AvMed | regional | https://www.avmed.org/transparency-in-coverage | curated source row |
+| AvMed | regional | https://www.avmed.org/en/for-developers | public AvMed developer page with TiC table-of-contents and Azure MRF directory links |
 | AvMed Health Pledge | regional | - | needs official source URL |
 | BridgeSpan | regional | - | needs official source URL |
 | CalViva Health | regional | https://www.calvivahealth.org/interoperability/ | public transparency URL |
