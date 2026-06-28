@@ -488,6 +488,9 @@ def _has_source_file_version_trace(item: dict[str, Any]) -> bool:
 
 
 def _promote_address_provenance_fields(item: dict[str, Any], address_payload: dict[str, Any]) -> None:
+    address_key = address_payload.get("address_key")
+    if address_key not in (None, "") and item.get("address_key") in (None, ""):
+        item["address_key"] = address_key
     for key in (
         "address_precision",
         "source_count",

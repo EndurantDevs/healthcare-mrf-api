@@ -3156,6 +3156,7 @@ async def test_compact_serving_include_providers_expands_without_geo_filter(monk
     assert item["npi"] == 1234567890
     assert item["provider_name"] == "Example Provider"
     assert item["state"] == "IL"
+    assert item["address_key"] == "00000000-0000-0000-0000-000000000002"
     assert item["address"]["address_key"] == "00000000-0000-0000-0000-000000000002"
     assert item["tic_prices"][0]["negotiated_rate"] == 60
     sql = str(session.calls[-2][0][0])
@@ -3495,6 +3496,7 @@ async def test_compact_serving_include_providers_with_geo_uses_npi_scoped_locati
 
     assert payload["query"]["result_granularity"] == "provider"
     assert payload["items"][0]["location_source"] == "npi_address"
+    assert payload["items"][0]["address_key"] == "00000000-0000-0000-0000-000000000003"
     assert payload["items"][0]["address"]["address_key"] == "00000000-0000-0000-0000-000000000003"
     assert payload["items"][0]["specialties"] == ["Family Medicine Physician"]
     assert payload["items"][0]["specialization"] == "Sports Medicine"
