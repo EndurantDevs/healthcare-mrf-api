@@ -458,6 +458,14 @@ def _looks_non_tic_mrf_reference(url: str | None, label: str | None = None) -> b
     path = parsed.path.lower().replace("_", "-")
     file_name = Path(path).name
     text = f"{path} {parsed.query.lower()} {label or ''}".lower().replace("_", "-")
+    if (
+        file_name.endswith((".css", ".css.gz", ".js", ".js.gz", ".map", ".map.gz"))
+        or ".min.js" in file_name
+        or ".bundle.js" in file_name
+    ):
+        return True
+    if any(token in text for token in ("balance-billing", "out-of-network-liability")):
+        return True
     if "cms-data-index" in path:
         return True
     if "hospital-price-transparency" in text or "standardcharges" in file_name:
@@ -574,8 +582,6 @@ def classify_hosting_platform(url: str | None) -> str | None:
         return "magnacare_transparency_mrf"
     if host == "caa.ebms.com":
         return "ebms_caa_directory"
-    if _looks_direct_mrf_body_url(raw) and _mrf_body_file_type_from_text(raw):
-        return "direct_mrf_body"
     if host == "data.sccgov.org" and path == "/data.json":
         return "socrata_data_json_mrf_catalog"
     if host.endswith("sapphiremrfhub.com"):
@@ -585,10 +591,24 @@ def classify_hosting_platform(url: str | None) -> str | None:
         and _mrf_file_type_from_text(raw) == "table-of-contents"
     ):
         return "direct_toc"
+    if _looks_direct_mrf_body_url(raw) and _mrf_body_file_type_from_text(raw):
+        return "direct_mrf_body"
     if host == "mrf.healthgram.com":
         return "healthgram"
     if host == "github.com" and len([part for part in path.split("/") if part]) >= 2:
         return "github_repo_mrf"
+    if host == "developers.humana.com" and (
+        "cost-transparency" in path
+        or "healthplan-price-transparency" in path
+        or path.endswith("/resource/pctfileslist")
+        or path.endswith("/resource/getdata")
+    ):
+        return "humana_pct_file_list"
+    if host in {"www.fchn.com", "fchn.com"} and (
+        path.startswith("/machine-readable-files")
+        or path.startswith("/payorsearch")
+    ):
+        return "fchn_payor_search"
     if (
         host
         in {
@@ -766,6 +786,17 @@ def classify_hosting_platform(url: str | None) -> str | None:
     if (
         host in {"www.sanfordhealthplan.com", "sanfordhealthplan.com"}
         and "transparency-in-coverage-rule" in path
+    ):
+        return "html_mrf_links"
+    if (
+        (
+            host in {"www.optimahealth.com", "optimahealth.com"}
+            and "transparency-in-coverage" in path
+        )
+        or (
+            host in {"www.healthpartners.com", "healthpartners.com"}
+            and "transparency" in path
+        )
     ):
         return "html_mrf_links"
     if (
@@ -4378,6 +4409,45 @@ async def _resolve_html_mrf_links(
                 resolver="html_mrf_directory_link",
                 target_max_bytes=target_max_bytes,
             )
+            if not directory_targets:
+                nested_directory_urls = _html_mrf_directory_urls(
+                    directory_html, base_url=directory_url
+                )
+                max_nested_directories = (
+                    _as_int(resolver.get("max_nested_directories_per_directory")) or 5
+                )
+                for nested_directory_url in nested_directory_urls[
+                    :max_nested_directories
+                ]:
+                    try:
+                        nested_directory_html = await _fetch_text(
+                            nested_directory_url,
+                            max_bytes=directory_max_bytes,
+                            session=session,
+                        )
+                    except Exception:  # pylint: disable=broad-exception-caught
+                        continue
+                    for target in _crawl_targets_from_html_mrf_links(
+                        source,
+                        nested_directory_html,
+                        base_url=nested_directory_url,
+                        resolver="html_mrf_nested_directory_link",
+                        target_max_bytes=target_max_bytes,
+                    ):
+                        metadata = {
+                            **dict(target.metadata or {}),
+                            "directory_url": directory_url,
+                            "nested_directory_url": nested_directory_url,
+                        }
+                        targets.append(
+                            CrawlTarget(
+                                source=source,
+                                url=target.url,
+                                label=target.label,
+                                resolved_from_url=target.resolved_from_url,
+                                metadata=metadata,
+                            )
+                        )
             for target in directory_targets:
                 metadata = {
                     **dict(target.metadata or {}),
@@ -4588,7 +4658,13 @@ def _html_mrf_directory_urls(html_text: str, *, base_url: str) -> list[str]:
             continue
         if host.endswith("cms.gov") and "price-transparency" in path:
             continue
-        if not (path.endswith("/") or "." not in file_name):
+        azure_html_mrf_listing = (
+            host.endswith(".blob.core.windows.net")
+            and "mrf-output/" in path
+            and file_name.endswith((".html", ".htm"))
+            and "mrf" in text
+        )
+        if not (path.endswith("/") or "." not in file_name or azure_html_mrf_listing):
             continue
         if not path.endswith("/") and "." not in file_name:
             base_host = urlsplit(base_url).netloc.lower()
@@ -4779,6 +4855,307 @@ async def _resolve_json_mrf_directory_links(
     if not targets:
         raise ValueError(f"no JSON directory MRF targets found for {url}")
     return targets
+
+
+def _humana_pct_payload_rows(payload: dict[str, Any]) -> list[Any]:
+    for key in ("aaData", "data", "rows"):
+        rows = payload.get(key)
+        if isinstance(rows, list):
+            return rows
+    return []
+
+
+def _humana_pct_total_records(payload: dict[str, Any]) -> int | None:
+    for key in ("iTotalDisplayRecords", "iTotalRecords", "recordsFiltered", "recordsTotal"):
+        parsed = _as_int(payload.get(key))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _humana_pct_row_text(row: Any) -> str:
+    if isinstance(row, dict):
+        return " ".join(str(value or "") for value in row.values())
+    if isinstance(row, (list, tuple)):
+        return " ".join(str(value or "") for value in row)
+    return str(row or "")
+
+
+def _humana_pct_file_name_from_row(row: Any) -> str | None:
+    text = html.unescape(_humana_pct_row_text(row))
+    for url in _embedded_http_urls(text):
+        parsed = urlsplit(url)
+        values = parse_qs(parsed.query).get("fileName") or parse_qs(parsed.query).get(
+            "filename"
+        )
+        if values:
+            return _clean_text(values[0])
+        file_name = Path(parsed.path).name
+        if file_name:
+            return file_name
+    for match in re.finditer(
+        r"""(?P<name>[A-Za-z0-9._~%+ -]+(?:\.json(?:\.gz)?|\.zip|\.7z|\.csv(?:\.gz)?))""",
+        text,
+        flags=re.I,
+    ):
+        candidate = _clean_text(match.group("name"))
+        if candidate:
+            return candidate
+    return None
+
+
+def _humana_pct_download_url(base_url: str, resolver: dict[str, Any], file_name: str) -> str:
+    download_path = str(
+        resolver.get("download_path") or "/syntheticdata/Resource/DownloadTOCFile"
+    )
+    return urljoin(base_url, download_path) + "?" + urlencode({"fileName": file_name})
+
+
+def _humana_pct_targets_from_payload(
+    source: dict[str, Any],
+    payload: dict[str, Any],
+    *,
+    api_url: str,
+    resolver: dict[str, Any],
+    resolver_type: str,
+    include_body_files: bool = False,
+    max_targets: int | None = None,
+) -> list[CrawlTarget]:
+    base_url = f"{urlsplit(api_url).scheme}://{urlsplit(api_url).netloc}/"
+    targets: list[CrawlTarget] = []
+    seen: set[str] = set()
+    for row in _humana_pct_payload_rows(payload):
+        file_name = _humana_pct_file_name_from_row(row)
+        if not file_name:
+            continue
+        file_type = _mrf_file_type_from_text(file_name, _humana_pct_row_text(row))
+        target_kind: str | None = None
+        if file_type == "table-of-contents":
+            target_kind = "toc_json"
+        elif include_body_files:
+            file_type = _mrf_body_file_type_from_text(file_name, _humana_pct_row_text(row))
+            target_kind = "file_reference" if file_type else None
+        if not target_kind or not file_type:
+            continue
+        url = _humana_pct_download_url(base_url, resolver, file_name)
+        key = _canonical_or_none(url) or url
+        if key in seen:
+            continue
+        seen.add(key)
+        metadata = {
+            "resolver": resolver_type,
+            "target_kind": target_kind,
+            "target_file_type": file_type,
+            "container_format": _container_format(file_name),
+            "humana_file_name": file_name,
+            "humana_api_url": api_url,
+            "plan_info": (
+                _plan_info_from_label(file_name) if target_kind == "file_reference" else []
+            ),
+        }
+        targets.append(
+            CrawlTarget(
+                source=source,
+                url=url,
+                label=_mrf_file_plan_label(file_name) or file_name,
+                resolved_from_url=api_url,
+                metadata={
+                    key: value
+                    for key, value in metadata.items()
+                    if value not in (None, "", [])
+                },
+            )
+        )
+        if max_targets and len(targets) >= max_targets:
+            break
+    return targets
+
+
+async def _resolve_humana_pct_file_list(
+    source: dict[str, Any],
+    url: str,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    resolver_type = str(resolver.get("type") or "humana_pct_file_list")
+    api_url = str(
+        resolver.get("api_url")
+        or urljoin(url, "/syntheticdata/Resource/GetData")
+    )
+    file_types = [
+        str(item).strip()
+        for item in (resolver.get("file_types") or ["innetwork"])
+        if str(item).strip()
+    ]
+    page_size = _as_int(resolver.get("page_size")) or 100
+    max_pages = _as_int(resolver.get("max_pages")) or 25
+    max_targets = _as_int(resolver.get("max_targets")) or 1000
+    include_body_files = bool(resolver.get("include_body_files"))
+    targets: list[CrawlTarget] = []
+    for file_type in file_types:
+        for page in range(max_pages):
+            start = page * page_size
+            page_url = api_url + "?" + urlencode(
+                {
+                    "fileType": file_type,
+                    "iDisplayStart": start,
+                    "iDisplayLength": page_size,
+                    "sEcho": page + 1,
+                }
+            )
+            payload = await _fetch_json(
+                page_url,
+                max_bytes=int(resolver.get("max_bytes") or 10 * 1024 * 1024),
+                session=session,
+            )
+            rows = _humana_pct_payload_rows(payload)
+            if not rows:
+                break
+            remaining = max_targets - len(targets)
+            if remaining <= 0:
+                break
+            targets.extend(
+                _humana_pct_targets_from_payload(
+                    source,
+                    payload,
+                    api_url=page_url,
+                    resolver=resolver,
+                    resolver_type=resolver_type,
+                    include_body_files=include_body_files,
+                    max_targets=remaining,
+                )
+            )
+            total = _humana_pct_total_records(payload)
+            if total is not None and start + len(rows) >= total:
+                break
+            if len(rows) < page_size:
+                break
+        if len(targets) >= max_targets:
+            break
+    targets = _dedupe_crawl_targets_by_url(targets)
+    if not targets:
+        raise ValueError(f"no Humana PCT MRF targets found for {url}")
+    return targets[:max_targets]
+
+
+def _html_looks_cloudflare_challenge(html_text: str) -> bool:
+    lowered = str(html_text or "").lower()
+    return (
+        "cf-mitigated" in lowered
+        or "__cf_chl" in lowered
+        or "challenge-platform" in lowered
+        or "<title>just a moment" in lowered
+    )
+
+
+def _fchn_payor_detail_urls_from_html(html_text: str, *, base_url: str) -> list[str]:
+    urls: list[str] = []
+    seen: set[str] = set()
+    for candidate in _html_link_candidates(html_text, base_url=base_url):
+        url = str(candidate.get("url") or "")
+        path = urlsplit(url).path.lower()
+        if "/payorsearch/home/payordetail/" not in path:
+            continue
+        key = _canonical_or_none(url) or url
+        if key in seen:
+            continue
+        seen.add(key)
+        urls.append(url)
+    return urls
+
+
+def _fchn_targets_from_detail_html(
+    source: dict[str, Any],
+    html_text: str,
+    *,
+    detail_url: str,
+    resolver_type: str,
+) -> list[CrawlTarget]:
+    targets = _crawl_targets_from_html_mrf_links(
+        source,
+        html_text,
+        base_url=detail_url,
+        resolver=resolver_type,
+    )
+    enriched: list[CrawlTarget] = []
+    detail_id = next(
+        (
+            part
+            for part in reversed([part for part in urlsplit(detail_url).path.split("/") if part])
+            if part.isdigit()
+        ),
+        None,
+    )
+    for target in targets:
+        metadata = {
+            **dict(target.metadata or {}),
+            "resolver": resolver_type,
+            "fchn_detail_url": detail_url,
+            "fchn_payor_detail_id": detail_id,
+        }
+        enriched.append(
+            CrawlTarget(
+                source=source,
+                url=target.url,
+                label=target.label,
+                resolved_from_url=target.resolved_from_url or detail_url,
+                metadata={key: value for key, value in metadata.items() if value},
+            )
+        )
+    return enriched
+
+
+async def _resolve_fchn_payor_search(
+    source: dict[str, Any],
+    url: str,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    resolver_type = str(resolver.get("type") or "fchn_payor_search")
+    html_text = await _fetch_text(
+        url,
+        max_bytes=int(resolver.get("max_bytes") or 5 * 1024 * 1024),
+        session=session,
+    )
+    if _html_looks_cloudflare_challenge(html_text):
+        raise ValueError(f"cloudflare_challenge blocks FCHN MRF discovery for {url}")
+    targets = _fchn_targets_from_detail_html(
+        source, html_text, detail_url=url, resolver_type=resolver_type
+    )
+    max_details = _as_int(resolver.get("max_details")) or 100
+    max_targets = _as_int(resolver.get("max_targets")) or 1000
+    detail_urls = _fchn_payor_detail_urls_from_html(html_text, base_url=url)
+    detail_max_bytes = int(
+        resolver.get("detail_max_bytes")
+        or resolver.get("max_bytes")
+        or 5 * 1024 * 1024
+    )
+    for detail_url in detail_urls[:max_details]:
+        if len(targets) >= max_targets:
+            break
+        try:
+            detail_html = await _fetch_text(
+                detail_url,
+                max_bytes=detail_max_bytes,
+                session=session,
+            )
+        except Exception:  # pylint: disable=broad-exception-caught
+            continue
+        if _html_looks_cloudflare_challenge(detail_html):
+            continue
+        targets.extend(
+            _fchn_targets_from_detail_html(
+                source,
+                detail_html,
+                detail_url=detail_url,
+                resolver_type=resolver_type,
+            )
+        )
+        targets = _dedupe_crawl_targets_by_url(targets)
+    targets = _dedupe_crawl_targets_by_url(targets)
+    if not targets:
+        raise ValueError(f"no FCHN MRF links found for {url}")
+    return targets[:max_targets]
 
 
 def _payercompass_file_type(frame: dict[str, Any], label: str | None = None) -> str:
@@ -5538,6 +5915,14 @@ def _embedded_http_urls(value: str | None) -> list[str]:
         "\\x3A": ":",
         "\\u0026": "&",
         "\\u0026amp;": "&",
+        "\\u003c": "<",
+        "\\u003C": "<",
+        "\\x3c": "<",
+        "\\x3C": "<",
+        "\\u003e": ">",
+        "\\u003E": ">",
+        "\\x3e": ">",
+        "\\x3E": ">",
     }
     for old, new in replacements.items():
         text = text.replace(old, new)
@@ -8373,7 +8758,9 @@ def _looks_direct_toc_url(url: str | None) -> bool:
     query = parsed.query.lower()
     if host == "d3oz7y1cwsecds.cloudfront.net" and path == "/member-prod/bcbsal":
         return True
-    if path.endswith((".json", ".json.gz")):
+    if path.endswith((".json", ".json.gz")) and (
+        _mrf_file_type_from_text(url) == "table-of-contents"
+    ):
         return True
     if "sapphiremrfhub.com" in host and "/tocs/" in path:
         return True
@@ -8455,6 +8842,10 @@ async def _crawl_targets_for_source(
         return await _resolve_healthspace_machine_readable_files(
             source, url, resolver, session
         )
+    if resolver_type == "humana_pct_file_list":
+        return await _resolve_humana_pct_file_list(source, url, resolver, session)
+    if resolver_type == "fchn_payor_search":
+        return await _resolve_fchn_payor_search(source, url, resolver, session)
     if resolver_type == "healthez_benefits_mrf":
         return await _resolve_healthez_benefits_mrf(source, url, resolver, session)
     if resolver_type == "payercompass_mrf":
@@ -8636,6 +9027,10 @@ async def _crawl_targets_for_source(
         return await _resolve_healthspace_machine_readable_files(
             source, url, resolver, session
         )
+    if resolver_type == "humana_pct_file_list":
+        return await _resolve_humana_pct_file_list(source, url, resolver, session)
+    if resolver_type == "fchn_payor_search":
+        return await _resolve_fchn_payor_search(source, url, resolver, session)
     if resolver_type == "payercompass_mrf":
         return await _resolve_payercompass_mrf(source, url, resolver, session)
     if resolver_type == "webtpa_mrf_api":
@@ -8859,6 +9254,8 @@ def _direct_mrf_body_crawl_target(
     file_type = _mrf_body_file_type_from_text(
         url, str(source.get("display_name") or "")
     )
+    if file_type == "table-of-contents":
+        return None
     if not file_type:
         return None
     label = (

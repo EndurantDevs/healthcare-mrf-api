@@ -118,6 +118,11 @@ def test_source_urls_are_loaded_from_registry_file():
         is True
     )
     assert (
+        config["platform_resolvers"]["humana_pct_file_list"]["type"]
+        == "humana_pct_file_list"
+    )
+    assert config["platform_resolvers"]["fchn_payor_search"]["type"] == "fchn_payor_search"
+    assert (
         config["platform_resolvers"]["mymedicalshopper_talon_bounded"]["type"]
         == "mymedicalshopper_talon_mrf"
     )
@@ -417,6 +422,17 @@ def test_classify_hosting_platform_recognizes_public_adapter_pages():
         )
         == "html_mrf_links"
     )
+    for url in (
+        "https://www.optimahealth.com/transparency-in-coverage",
+        "https://www.healthpartners.com/hp/legal-notices/disclosures/transparency/index.html",
+    ):
+        assert discovery.classify_hosting_platform(url) == "html_mrf_links"
+    for url in (
+        "https://www.deancare.com/helpful-links/transparency-in-coverage",
+        "https://www.avmed.org/transparency-in-coverage",
+        "https://www.vivahealth.com/transparency-in-coverage/",
+    ):
+        assert discovery.classify_hosting_platform(url) == "custom"
     assert (
         discovery.classify_hosting_platform(
             "https://www.scrippshealthplan.com/transparency-in-coverage#component_8a5f07e7c7"
@@ -580,6 +596,26 @@ def test_classify_hosting_platform_recognizes_public_adapter_pages():
             "https://caa.imagine360.com/IMAGINE360%20SERVICES%20LLC/index.html"
         )
         == "html_mrf_links"
+    )
+    assert (
+        discovery.classify_hosting_platform("https://developers.humana.com/cost-transparency")
+        == "humana_pct_file_list"
+    )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://developers.humana.com/syntheticdata/Resource/PCTFilesList?fileType=innetwork"
+        )
+        == "humana_pct_file_list"
+    )
+    assert (
+        discovery.classify_hosting_platform("https://www.fchn.com/machine-readable-files")
+        == "fchn_payor_search"
+    )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://www.fchn.com/PayorSearch/Home/PayorDetail/64647"
+        )
+        == "fchn_payor_search"
     )
 
 
@@ -2687,6 +2723,56 @@ async def test_html_mrf_resolver_can_follow_directories_on_mixed_pages(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_html_mrf_resolver_follows_nested_directory_pages(monkeypatch):
+    source = {
+        "source_id": "source_1",
+        "payer_id": "payer_1",
+        "display_name": "Example Health Plan",
+    }
+    html_by_url = {
+        "https://example.test/transparency": """
+          <a href="/vendor/machine-readable-data">Machine-readable data</a>
+        """,
+        "https://example.test/vendor/machine-readable-data": """
+          <script>
+            window.__MRF__ = {
+              "inn": "https://mrfproddestinationdata.blob.core.windows.net/example-mrf-output/Example-INN_index.html"
+            };
+          </script>
+        """,
+        "https://mrfproddestinationdata.blob.core.windows.net/example-mrf-output/Example-INN_index.html": """
+          <a href="https://mrfproddestinationdata.blob.core.windows.net/example-mrf-output/2026-06-01_Example-INN_index.json">
+            Index
+          </a>
+        """,
+    }
+
+    async def fake_fetch_text(url, **_kwargs):
+        return html_by_url[url]
+
+    monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
+
+    targets = await discovery._resolve_html_mrf_links(
+        source,
+        "https://example.test/transparency",
+        {"type": "html_mrf_links", "max_directories": 2},
+        None,
+    )
+
+    assert [target.url for target in targets] == [
+        "https://mrfproddestinationdata.blob.core.windows.net/example-mrf-output/2026-06-01_Example-INN_index.json"
+    ]
+    assert targets[0].metadata["resolver"] == "html_mrf_link"
+    assert targets[0].metadata["target_file_type"] == "table-of-contents"
+    assert targets[0].metadata["directory_url"] == (
+        "https://example.test/vendor/machine-readable-data"
+    )
+    assert targets[0].metadata["nested_directory_url"] == (
+        "https://mrfproddestinationdata.blob.core.windows.net/example-mrf-output/Example-INN_index.html"
+    )
+
+
+@pytest.mark.asyncio
 async def test_healthez_resolver_normalizes_legacy_network_links(monkeypatch):
     source = {
         "source_id": "source_1",
@@ -3925,6 +4011,128 @@ async def test_uhc_provider_mrf_resolver_fetches_ifp_listing(monkeypatch):
     )
     assert target.resolved_from_url == "https://providermrf.uhc.com/api/files/ui/ifp/"
     assert target.metadata["resolver"] == "uhc_provider_mrf_files"
+
+
+def test_humana_pct_targets_from_payload_catalogs_tocs_only_by_default():
+    source = {"source_id": "source_1", "display_name": "Humana"}
+    payload = {
+        "aaData": [
+            [
+                "2026-06-01_Humana_index.json",
+                '<a href="/syntheticdata/Resource/DownloadTOCFile?fileName=2026-06-01_Humana_index.json">TOC</a>',
+            ],
+            ["000001.csv.gz", "body segment"],
+        ],
+        "iTotalRecords": 2,
+    }
+
+    targets = discovery._humana_pct_targets_from_payload(
+        source,
+        payload,
+        api_url="https://developers.humana.com/syntheticdata/Resource/GetData?fileType=innetwork",
+        resolver={"download_path": "/syntheticdata/Resource/DownloadTOCFile"},
+        resolver_type="humana_pct_file_list",
+    )
+
+    assert len(targets) == 1
+    assert targets[0].url == (
+        "https://developers.humana.com/syntheticdata/Resource/"
+        "DownloadTOCFile?fileName=2026-06-01_Humana_index.json"
+    )
+    assert targets[0].metadata["target_kind"] == "toc_json"
+    assert targets[0].metadata["target_file_type"] == "table-of-contents"
+    assert targets[0].metadata["humana_file_name"] == "2026-06-01_Humana_index.json"
+
+
+@pytest.mark.asyncio
+async def test_humana_pct_resolver_paginates_bounded_file_list(monkeypatch):
+    source = {"source_id": "source_1", "display_name": "Humana"}
+    calls = []
+
+    async def fake_fetch_json(url, **_kwargs):
+        calls.append(url)
+        if "iDisplayStart=0" in url:
+            return {
+                "aaData": [["2026-06-01_Humana_index.json"]],
+                "iTotalRecords": 2,
+            }
+        if "iDisplayStart=1" in url:
+            return {
+                "aaData": [["2026-06-01_Humana_Dental_index.json"]],
+                "iTotalRecords": 2,
+            }
+        return {"aaData": [], "iTotalRecords": 2}
+
+    monkeypatch.setattr(discovery, "_fetch_json", fake_fetch_json)
+
+    targets = await discovery._resolve_humana_pct_file_list(
+        source,
+        "https://developers.humana.com/cost-transparency",
+        {
+            "type": "humana_pct_file_list",
+            "api_url": "https://developers.humana.com/syntheticdata/Resource/GetData",
+            "download_path": "/syntheticdata/Resource/DownloadTOCFile",
+            "file_types": ["innetwork"],
+            "page_size": 1,
+            "max_pages": 3,
+            "max_targets": 10,
+        },
+        None,
+    )
+
+    assert [target.metadata["humana_file_name"] for target in targets] == [
+        "2026-06-01_Humana_index.json",
+        "2026-06-01_Humana_Dental_index.json",
+    ]
+    assert "iDisplayStart=0" in calls[0]
+    assert "iDisplayStart=1" in calls[1]
+
+
+def test_fchn_detail_parser_extracts_public_zip_file_reference():
+    source = {"source_id": "source_1", "display_name": "First Choice Health"}
+    html = """
+    <table>
+      <tr>
+        <td>In-Network Negotiated Rate - TPA - Client Network File</td>
+        <td><a href="/documents/ppo/providers/payorsearch/64647/innrftpac/example.zip">Download</a></td>
+      </tr>
+    </table>
+    """
+
+    targets = discovery._fchn_targets_from_detail_html(
+        source,
+        html,
+        detail_url="https://www.fchn.com/PayorSearch/Home/PayorDetail/64647",
+        resolver_type="fchn_payor_search",
+    )
+
+    assert len(targets) == 1
+    assert targets[0].url == (
+        "https://www.fchn.com/documents/ppo/providers/payorsearch/"
+        "64647/innrftpac/example.zip"
+    )
+    assert targets[0].metadata["target_kind"] == "file_reference"
+    assert targets[0].metadata["target_file_type"] == "in-network"
+    assert targets[0].metadata["container_format"] == "zip"
+    assert targets[0].metadata["fchn_payor_detail_id"] == "64647"
+
+
+@pytest.mark.asyncio
+async def test_fchn_resolver_reports_cloudflare_challenge(monkeypatch):
+    source = {"source_id": "source_1", "display_name": "First Choice Health"}
+
+    async def fake_fetch_text(*_args, **_kwargs):
+        return "<html><head><title>Just a moment...</title></head><script>__cf_chl</script></html>"
+
+    monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
+
+    with pytest.raises(ValueError, match="cloudflare_challenge"):
+        await discovery._resolve_fchn_payor_search(
+            source,
+            "https://www.fchn.com/PayorSearch",
+            {"type": "fchn_payor_search"},
+            None,
+        )
 
 
 def test_healthsparq_public_params_from_public_fragment():
@@ -5210,6 +5418,25 @@ def test_parse_html_mrf_links_uses_neighbor_label_for_zakipoint_rows():
     ]
 
 
+def test_parse_html_mrf_links_ignores_static_asset_gzip_files():
+    html = """
+    <script src="/js/bundles/HeaderJS.min.js.gz"></script>
+    <script src="/js/bundles/FooterJS.min.js.gz"></script>
+    <a href="/Legal/business-transparency/Out-of-network-liability-and-balance-billing">
+      Out-of-network liability and balance billing
+    </a>
+    <a href="/mrf/2026-06-01_example_in-network-rates.zip">In Network ZIP</a>
+    """
+
+    targets = discovery._parse_html_mrf_links(
+        html, base_url="https://example.test/transparency-in-coverage"
+    )
+
+    assert [target["url"] for target in targets] == [
+        "https://example.test/mrf/2026-06-01_example_in-network-rates.zip"
+    ]
+
+
 def test_html_mrf_links_treats_rate_directories_as_directories_not_files():
     html = """
     <a href="https://apps.example.test/PriceTransparency/HealthPlan/InNetwork/">
@@ -5716,6 +5943,11 @@ def test_html_mrf_directory_urls_extracts_clear_directory_links():
     html = """
     <a href="https://files.example.test/mrf/plan/TOC/">TOC</a>
     <a href="https://files.example.test/mrf/plan/InNetwork/">In Network</a>
+    <script>
+      window.__MRF__ = {
+        "index": "https://mrfproddestinationdata.blob.core.windows.net/mrf-output/Example_In-Network_MRF_Index.html"
+      };
+    </script>
     <a href="/pricetransparency/MRF/Base">
       Click here to access machine-readable files.
     </a>
@@ -5740,6 +5972,23 @@ def test_html_mrf_directory_urls_extracts_clear_directory_links():
         "https://example.test/pricetransparency/MRF/Base",
         "https://example.test/thp_mrfs",
         "http://20.114.211.146/CHP/",
+        "https://mrfproddestinationdata.blob.core.windows.net/mrf-output/Example_In-Network_MRF_Index.html",
+    ]
+
+
+def test_html_mrf_directory_urls_stop_embedded_urls_at_escaped_html_boundaries():
+    html = r"""
+    <script>
+      window.__HTML__ = "\u003Ca href=\"https:\/\/mrfproddestinationdata.blob.core.windows.net\/sentara-mrf-output\/Sentara_HMO_in-network-rates_MRF.html\"\u003EView\u003C\/a\u003E";
+    </script>
+    """
+
+    urls = discovery._html_mrf_directory_urls(
+        html, base_url="https://www.example.test/transparency"
+    )
+
+    assert urls == [
+        "https://mrfproddestinationdata.blob.core.windows.net/sentara-mrf-output/Sentara_HMO_in-network-rates_MRF.html"
     ]
 
 
@@ -6971,6 +7220,36 @@ def test_direct_toc_url_gate_skips_html_landing_pages():
         is False
     )
     assert discovery._looks_direct_toc_url("https://example.com/transparency") is False
+
+
+def test_direct_table_of_contents_json_is_not_body_file():
+    url = (
+        "https://data.networkhealth.com/price-transparency/"
+        "nhpricetransparency_table_of_contents.json"
+    )
+    source = {"source_id": "source_1", "display_name": "Network Health"}
+
+    assert discovery.classify_hosting_platform(url) == "direct_toc"
+    assert discovery._direct_mrf_body_crawl_target(source, url) is None
+    target = discovery._direct_toc_crawl_target(source, url)
+    assert target is not None
+    assert target.metadata["target_kind"] == "toc_json"
+    assert target.metadata["target_file_type"] == "table-of-contents"
+
+
+def test_public_rows_prefer_verified_direct_or_platform_urls():
+    markdown = """
+| Payer | Type | Public MRF TOC / landing URL | Notes |
+|---|---|---|---|
+| CareSource | medicaid_mco | https://www.caresource.com/vendor/tic/tic-data-index.json | public direct TOC |
+| Independent Health | regional | https://web.healthsparq.com/healthsparq/public/#/one/insurerCode=IHNY_I&brandCode=IHNY&productCode=MRF/machine-readable-transparency-in-coverage | public HealthSparq files |
+| Network Health | regional | https://data.networkhealth.com/price-transparency/nhpricetransparency_table_of_contents.json | public direct TOC |
+"""
+    by_name = {candidate.payer_name: candidate for candidate in discovery.parse_master_list(markdown)}
+
+    assert by_name["CareSource"].hosting_platform == "direct_toc"
+    assert by_name["Independent Health"].hosting_platform == "healthsparq"
+    assert by_name["Network Health"].hosting_platform == "direct_toc"
 
 
 def test_toc_target_file_row_keeps_index_provenance():

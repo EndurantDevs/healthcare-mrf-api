@@ -95,6 +95,22 @@
       "max_frames": 5,
       "max_targets": 1000
     },
+    "humana_pct_file_list": {
+      "type": "humana_pct_file_list",
+      "api_url": "https://developers.humana.com/syntheticdata/Resource/GetData",
+      "download_path": "/syntheticdata/Resource/DownloadTOCFile",
+      "file_types": ["innetwork"],
+      "page_size": 100,
+      "max_pages": 25,
+      "max_targets": 1000
+    },
+    "fchn_payor_search": {
+      "type": "fchn_payor_search",
+      "max_bytes": 5242880,
+      "detail_max_bytes": 5242880,
+      "max_details": 100,
+      "max_targets": 1000
+    },
     "blueadvantage_html_mrf_links": {
       "type": "html_mrf_links",
       "max_bytes": 5242880,

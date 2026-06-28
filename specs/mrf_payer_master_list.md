@@ -110,7 +110,7 @@ Last one-time research refresh: 2026-06-05.
 | Alameda Alliance for Health | medicaid_mco | https://alamedaalliance.org/about/pricing-transparency/ | public transparency URL |
 | AmeriHealth Caritas | medicaid_mco | https://www.amerihealthcaritas.com/price-transparency/ | curated source row |
 | CalOptima | medicaid_mco | https://www.caloptima.org/en/about-us/transparency | public transparency URL |
-| CareSource | medicaid_mco | https://www.caresource.com/about-us/legal/transparency-in-coverage/ | curated source row |
+| CareSource | medicaid_mco | https://www.caresource.com/vendor/tic/tic-data-index.json | verified public direct TiC table of contents linked from CareSource transparency page |
 | Central California Alliance for Health | medicaid_mco | https://thealliance.health/about-the-alliance/transparency-in-coverage-cms-9915-machine-readable-files/ | public transparency URL |
 | Community Care of NC | medicaid_mco | - | needs official source URL |
 | Health Alliance Plan | medicaid_mco | - | needs official source URL |
@@ -313,7 +313,7 @@ Last one-time research refresh: 2026-06-05.
 | Hennepin Health Plan | regional | - | needs official source URL |
 | HMAA | regional | https://www.hmaa.com/provider-directory/machine-readable-files/ | curated source row |
 | HMAA Hawaii Management | regional | https://www.hmaa.com/provider-directory/machine-readable-files/ | observed stale |
-| Independent Health | regional | https://www.independenthealth.com/about-independent-health/transparency-in-coverage | curated source row |
+| Independent Health | regional | https://web.healthsparq.com/healthsparq/public/#/one/insurerCode=IHNY_I&brandCode=IHNY&productCode=MRF/machine-readable-transparency-in-coverage | public HealthSparq machine-readable files route linked from Independent Health transparency page |
 | Indiana University Health Plans | regional | https://www.iuhealthplans.org/price-transparency-information | public transparency URL |
 | LA Care Health Plan | regional | - | needs official source URL |
 | Lifewise Assurance Company | regional | https://lifewise.healthsparq.com/healthsparq/public/#/one/insurerCode=LIFEWISE_I&brandCode=LIFEWISE/machine-readable-transparency-in-coverage | curated HealthSparq metadata source |
@@ -331,7 +331,7 @@ Last one-time research refresh: 2026-06-05.
 | MVP Health Care | regional | https://www.mvphealthcare.com/developers/machine-readable-files | curated source row |
 | Neighborhood Health Plan | regional | - | needs official source URL |
 | Neighborhood Health Plan of RI | regional | https://www.nhpri.org/members/commercial-members-individual-family-plans/price-transparency-machine-readable-files/ | observed current |
-| Network Health | regional | https://networkhealth.com/price-transparency | curated source row |
+| Network Health | regional | https://data.networkhealth.com/price-transparency/nhpricetransparency_table_of_contents.json | verified public direct TiC table of contents |
 | EMI Health | regional | https://emihealth.com/MachineReadables | public EMI Health MRF landing page; Companion Life marketplace dental pages reference Companion Life EMI Dental Plans; stable EMI index observed, but body files need JSON-validity and dental-code validation before PTG body import; benefit lines: dental; aliases: Companion Life, Companion Life Insurance Company, Companion Life EMI Dental Plans, EMI Health dental, Companion Life dental |
 | PacificSource | regional | https://mrf.pacificsource.com/File/Visit/Index | public PacificSource MRF directory; resolver enumerates current Azure index files; resources/json-files is provider/pharmacy/formulary JSON and not a rate MRF source; aliases: PACIFICSOURCE HEALTH PLANS, PacificSource Health Plans, Pacific Source, PacificSource Administrators |
 | Paramount | regional | - | needs official source URL |
