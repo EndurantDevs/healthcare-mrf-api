@@ -9613,8 +9613,12 @@ def _import_control_source_urls(row: dict[str, Any]) -> tuple[str | None, str | 
     index_url = row.get("index_url") or row.get("human_url")
     official_url = row.get("human_url") or row.get("index_url")
     platform = str(row.get("hosting_platform") or "").strip()
-    if platform == "healthsparq" and index_url:
-        resolver = _platform_resolver_config(platform)
+    resolver = _platform_resolver_config(platform)
+    if (
+        index_url
+        and str(resolver.get("type") or "").strip() == "healthsparq_public_mrf"
+        and resolver.get("metadata_url_template")
+    ):
         try:
             params = _healthsparq_public_params(str(index_url))
             metadata_url = _healthsparq_direct_metadata_url(resolver, params)
