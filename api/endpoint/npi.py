@@ -1089,12 +1089,14 @@ def _build_nearby_sql(
                                2
                            ) AS distance,
                            a.*
-                         FROM {address_table_sql} AS a{taxonomy_from}
+                        FROM {address_table_sql} AS a{taxonomy_from}
                         WHERE ST_DWithin(
                                 Geography(ST_MakePoint(long, lat)),
                                 Geography(ST_MakePoint(:in_long, :in_lat)),
                                 :radius * 1609.34
                              )
+                          AND a.lat IS NOT NULL
+                          AND a.long IS NOT NULL
                           {taxonomy_where}
                           {geo_precision_clause}
                           {geo_type_clause}
@@ -1356,6 +1358,24 @@ def _address_zip5_filter(alias: str, address_table_sql: str, *, any_array: bool 
     column = f"{alias}.zip5" if _address_table_is_unified(address_table_sql) else f"LEFT({alias}.postal_code, 5)"
     operator = "ANY (:zip_codes)" if any_array else ":zip_code"
     return f"{column} = {operator}"
+
+
+def _address_phone_digits_filter(alias: str, address_table_sql: str) -> str:
+    if _address_table_is_unified(address_table_sql):
+        return f"{alias}.telephone_number = :phone_digits"
+    return f"regexp_replace(COALESCE({alias}.telephone_number, ''), '[^0-9]', '', 'g') = :phone_digits"
+
+
+def _provider_list_address_type_clause(
+    alias: str,
+    address_table_sql: str,
+    *,
+    include_service_locations: bool,
+) -> str:
+    if include_service_locations and _address_table_is_unified(address_table_sql):
+        type_list = ", ".join(f"'{value}'" for value in GEO_SERVICE_LOCATION_TYPES)
+        return f"{alias}.type IN ({type_list})"
+    return f"{alias}.type = 'primary'"
 
 
 def _primary_address_order_clause(alias: str, address_table_sql: str) -> str:
@@ -2626,7 +2646,14 @@ async def get_all(request):
         )
 
         use_taxonomy_filter = bool(taxonomy_filters)
-        address_where = ["c.type = 'primary'"]
+        include_service_locations = bool(phone_digits or address_key)
+        address_where = [
+            _provider_list_address_type_clause(
+                "c",
+                address_table_sql,
+                include_service_locations=include_service_locations,
+            )
+        ]
         if use_taxonomy_filter:
             address_where.insert(0, "c.taxonomy_array && q.int_codes")
         if plan_network:
@@ -2640,9 +2667,7 @@ async def get_all(request):
         if zip_code:
             address_where.append(_address_zip5_filter("c", address_table_sql))
         if phone_digits:
-            address_where.append(
-                "regexp_replace(COALESCE(c.telephone_number, ''), '[^0-9]', '', 'g') = :phone_digits"
-            )
+            address_where.append(_address_phone_digits_filter("c", address_table_sql))
         if address_key:
             address_where.append("c.address_key = CAST(:address_key AS uuid)")
         dynamic_code_params = _append_array_filters(address_where, filters)
@@ -2780,7 +2805,14 @@ async def get_all(request):
             entity_type_code,
         )
 
-        address_where = ["c.type = 'primary'"]
+        include_service_locations = bool(phone_digits or address_key)
+        address_where = [
+            _provider_list_address_type_clause(
+                "c",
+                address_table_sql,
+                include_service_locations=include_service_locations,
+            )
+        ]
         if plan_network:
             address_where.append("plans_network_array && :plan_network_array")
         if has_insurance:
@@ -2792,9 +2824,7 @@ async def get_all(request):
         if zip_code:
             address_where.append(_address_zip5_filter("c", address_table_sql))
         if phone_digits:
-            address_where.append(
-                "regexp_replace(COALESCE(c.telephone_number, ''), '[^0-9]', '', 'g') = :phone_digits"
-            )
+            address_where.append(_address_phone_digits_filter("c", address_table_sql))
         if address_key:
             address_where.append("c.address_key = CAST(:address_key AS uuid)")
         dynamic_code_params = _append_array_filters(address_where, filters)
@@ -2957,7 +2987,14 @@ async def get_all(request):
         phone_digits = filters.get("phone_digits")
         address_key = filters.get("address_key")
         where = []
-        address_where = ["c.type = 'primary'"]
+        include_service_locations = bool(phone_digits or address_key)
+        address_where = [
+            _provider_list_address_type_clause(
+                "c",
+                address_table_sql,
+                include_service_locations=include_service_locations,
+            )
+        ]
         if classification:
             where.append("classification = :classification")
         if specialization:
@@ -2980,9 +3017,7 @@ async def get_all(request):
         if zip_code:
             address_where.append(_address_zip5_filter("c", address_table_sql))
         if phone_digits:
-            address_where.append(
-                "regexp_replace(COALESCE(c.telephone_number, ''), '[^0-9]', '', 'g') = :phone_digits"
-            )
+            address_where.append(_address_phone_digits_filter("c", address_table_sql))
         if address_key:
             address_where.append("c.address_key = CAST(:address_key AS uuid)")
         dynamic_code_params = _append_array_filters(address_where, filters)

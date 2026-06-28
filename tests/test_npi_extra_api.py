@@ -42,6 +42,19 @@ class FakeAcquire:
         return False
 
 
+def test_nearby_sql_filters_to_geocoded_rows_for_geo_index():
+    sql = npi_module._build_nearby_sql(
+        "taxonomy_group = 'x'",
+        "",
+        "",
+        use_taxonomy_filter=False,
+        address_table_sql="mrf.entity_address_unified",
+    )
+
+    assert "AND a.lat IS NOT NULL" in sql
+    assert "AND a.long IS NOT NULL" in sql
+
+
 @pytest.mark.asyncio
 async def test_active_pharmacists(monkeypatch):
     fake_conn = FakeConnection(first_result=(10,))

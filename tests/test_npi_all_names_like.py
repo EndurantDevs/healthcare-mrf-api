@@ -289,6 +289,27 @@ async def test_get_all_zip_phone_and_name_filters_are_applied(monkeypatch):
     assert "c.address_key = CAST(:address_key AS uuid)" in conn.last_sql
 
 
+def test_provider_list_address_type_clause_keeps_normal_lists_primary_only():
+    clause = npi_module._provider_list_address_type_clause(
+        "c",
+        "mrf.entity_address_unified",
+        include_service_locations=False,
+    )
+
+    assert clause == "c.type = 'primary'"
+
+
+def test_provider_list_address_type_clause_allows_service_locations_for_exact_unified_lookup():
+    clause = npi_module._provider_list_address_type_clause(
+        "c",
+        "mrf.entity_address_unified",
+        include_service_locations=True,
+    )
+
+    assert clause == "c.type IN ('primary', 'secondary', 'practice', 'site')"
+    assert "mail" not in clause
+
+
 @pytest.mark.asyncio
 async def test_get_all_unified_pages_distinct_npis_and_uses_zip5(monkeypatch):
     conn = RecordingConnection()
@@ -312,6 +333,7 @@ async def test_get_all_unified_pages_distinct_npis_and_uses_zip5(monkeypatch):
     request = types.SimpleNamespace(
         args={
             "zip_code": "60601-1234",
+            "phone": "(312) 555-1212",
             "limit": "5",
             "start": "0",
             "include_total": "0",
@@ -324,7 +346,11 @@ async def test_get_all_unified_pages_distinct_npis_and_uses_zip5(monkeypatch):
     assert "SELECT DISTINCT c.npi" in conn.last_sql
     assert "JOIN LATERAL" in conn.last_sql
     assert "AND c.npi = pn.npi" in conn.last_sql
+    assert "c.type IN ('primary', 'secondary', 'practice', 'site')" in conn.last_sql
     assert "c.zip5 = :zip_code" in conn.last_sql
+    assert "c.telephone_number = :phone_digits" in conn.last_sql
+    assert "c.type = 'primary'" not in conn.last_sql
+    assert "regexp_replace(COALESCE(c.telephone_number, ''), '[^0-9]', '', 'g') = :phone_digits" not in conn.last_sql
     assert "LEFT(c.postal_code, 5) = :zip_code" not in conn.last_sql
 
 
