@@ -566,6 +566,8 @@ def classify_hosting_platform(url: str | None) -> str | None:
         return "meritain_mrf_search"
     if host == "mrf.healthcarebluebook.com":
         return "healthcarebluebook_mrf"
+    if host == "clm.magnacare.com" and path.startswith("/transparency"):
+        return "magnacare_transparency_mrf"
     if host == "caa.ebms.com":
         return "ebms_caa_directory"
     if _looks_direct_mrf_body_url(raw) and _mrf_body_file_type_from_text(raw):
@@ -2760,6 +2762,234 @@ async def _resolve_mymedicalshopper_talon_mrf(
         return targets
     finally:
         await ws.close()
+
+
+def _magnacare_results_url(base_url: str, search_term: str) -> str:
+    parsed = urlsplit(str(base_url or ""))
+    origin = f"{parsed.scheme or 'https'}://{parsed.netloc}"
+    return (
+        f"{origin}/Transparency/magnacare/results?"
+        + urlencode(
+            {
+                "filters": f"search-by:{search_term}",
+                "orderBy": "",
+                "pageNumber": "",
+                "perPageCount": "0",
+            }
+        )
+    )
+
+
+def _magnacare_download_url(base_url: str, run_history_id: str, ip_address: str) -> str:
+    parsed = urlsplit(str(base_url or ""))
+    origin = f"{parsed.scheme or 'https'}://{parsed.netloc}"
+    return (
+        f"{origin}/Transparency/magnacare/download-file?"
+        + urlencode({"runHistoryID": run_history_id, "ipAddress": ip_address})
+    )
+
+
+def _magnacare_html_attrs(fragment: str) -> dict[str, str]:
+    attrs: dict[str, str] = {}
+    for match in re.finditer(
+        r"""\b(?P<name>[a-zA-Z0-9_-]+)\s*=\s*(?P<quote>["'])(?P<value>.*?)(?P=quote)""",
+        fragment or "",
+        flags=re.S,
+    ):
+        attrs[match.group("name").lower()] = html.unescape(match.group("value"))
+    return attrs
+
+
+def _magnacare_file_type(
+    *values: Any,
+) -> str | None:
+    text = " ".join(_clean_text(value) for value in values if value not in (None, ""))
+    normalized = text.lower().replace("_", "-")
+    if re.search(r"\bout[-\s]*network\b", normalized) or "out-of-network" in normalized:
+        return "allowed-amounts"
+    return _mrf_body_file_type_from_text(text, text)
+
+
+def _magnacare_row_plan_info(row: dict[str, Any]) -> list[dict[str, Any]]:
+    plan_id = _clean_text(row.get("plan_id"))
+    plan_name = _clean_text(row.get("plan_name"))
+    market_type = _clean_text(row.get("plan_market_type")).lower() or "group"
+    if not plan_id and not plan_name:
+        return []
+    return [
+        {
+            "plan_id": plan_id or semantic_hash(
+                {"plan_name": plan_name, "market_type": market_type},
+                domain="magnacare_plan",
+            )[:32],
+            "plan_id_type": _clean_text(row.get("plan_id_type")) or None,
+            "plan_market_type": market_type,
+            "plan_name": plan_name or None,
+        }
+    ]
+
+
+def _magnacare_result_rows(html_text: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for row_match in re.finditer(
+        r"<tr\b(?P<attrs>[^>]*)>(?P<body>.*?)</tr>",
+        html_text or "",
+        flags=re.I | re.S,
+    ):
+        attrs = row_match.group("attrs") or ""
+        if "default" not in attrs.lower():
+            continue
+        body = row_match.group("body") or ""
+        columns = [
+            _strip_html_tags(match.group("body") or "")
+            for match in re.finditer(
+                r"<td\b[^>]*>(?P<body>.*?)</td>", body, flags=re.I | re.S
+            )
+        ]
+        link_match = re.search(r"<a\b(?P<attrs>[^>]*)>", body, flags=re.I | re.S)
+        if len(columns) < 7 or not link_match:
+            continue
+        link_attrs = _magnacare_html_attrs(link_match.group("attrs") or "")
+        run_history_id = _clean_text(link_attrs.get("data-rhid"))
+        rows.append(
+            {
+                "plan_id_type": columns[0],
+                "plan_market_type": columns[1],
+                "plan_id": columns[2],
+                "plan_name": columns[3],
+                "network_name": columns[4] or link_attrs.get("data-network"),
+                "file_type_label": columns[5],
+                "file_size": columns[6] or link_attrs.get("data-fsize"),
+                "run_history_id": run_history_id,
+                "file_name": _clean_text(link_attrs.get("data-fname")),
+                "file_version": _clean_text(link_attrs.get("data-fversion")),
+                "external_url": _clean_text(link_attrs.get("data-href")),
+                "raw_ere": _clean_text(link_attrs.get("data-ere")),
+            }
+        )
+    return rows
+
+
+def _magnacare_target_key(row: dict[str, Any]) -> tuple[str, str, str, str]:
+    return (
+        _clean_text(row.get("run_history_id")),
+        _clean_text(row.get("file_name")).lower(),
+        _clean_text(row.get("network_name")).lower(),
+        _clean_text(row.get("file_type_label")).lower(),
+    )
+
+
+async def _resolve_magnacare_transparency_mrf(
+    source: dict[str, Any],
+    url: str,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    resolver_type = str(resolver.get("type") or "magnacare_transparency_mrf")
+    search_terms = [
+        str(item).strip()
+        for item in (resolver.get("search_terms") or ["magna", "employee", "benefit"])
+        if str(item).strip()
+    ]
+    max_bytes = int(resolver.get("max_bytes") or 5 * 1024 * 1024)
+    ip_address = str(resolver.get("download_ip_address") or "127.0.0.1")
+    grouped: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    max_targets = _as_int(resolver.get("max_targets"))
+    for search_term in search_terms:
+        results_url = _magnacare_results_url(url, search_term)
+        html_text = await _fetch_text(results_url, max_bytes=max_bytes, session=session)
+        for row in _magnacare_result_rows(html_text):
+            run_history_id = _clean_text(row.get("run_history_id"))
+            if not run_history_id or run_history_id == "0":
+                continue
+            file_name = _clean_text(row.get("file_name"))
+            file_type = _magnacare_file_type(
+                row.get("file_type_label"),
+                row.get("network_name"),
+                file_name,
+            )
+            if not file_name or not file_type:
+                continue
+            key = _magnacare_target_key(row)
+            item = grouped.setdefault(
+                key,
+                {
+                    "row": row,
+                    "search_terms": set(),
+                    "plan_info": [],
+                    "plan_keys": set(),
+                    "results_urls": set(),
+                    "file_type": file_type,
+                },
+            )
+            item["search_terms"].add(search_term)
+            item["results_urls"].add(results_url)
+            for plan in _magnacare_row_plan_info(row):
+                plan_key = (
+                    plan.get("plan_id"),
+                    plan.get("plan_id_type"),
+                    plan.get("plan_market_type"),
+                    plan.get("plan_name"),
+                )
+                if plan_key in item["plan_keys"]:
+                    continue
+                item["plan_keys"].add(plan_key)
+                item["plan_info"].append(plan)
+        if max_targets and len(grouped) >= max_targets:
+            break
+    if not grouped:
+        raise ValueError(f"no MagnaCare transparency MRF rows found for {url}")
+
+    targets: list[CrawlTarget] = []
+    for item in list(grouped.values())[: max_targets or len(grouped)]:
+        row = item["row"]
+        run_history_id = _clean_text(row.get("run_history_id"))
+        dynamic_download_url = _magnacare_download_url(url, run_history_id, ip_address)
+        payload = await _fetch_json(dynamic_download_url, max_bytes=max_bytes, session=session)
+        file_url = _clean_text(payload.get("Data") if isinstance(payload, dict) else "")
+        if not file_url.startswith(("http://", "https://")):
+            continue
+        file_name = _clean_text(row.get("file_name")) or Path(urlsplit(file_url).path).name
+        network_name = _clean_text(row.get("network_name"))
+        file_type = item["file_type"]
+        label = " - ".join(
+            part
+            for part in (
+                network_name,
+                _clean_text(row.get("file_type_label")) or file_type,
+                file_name,
+            )
+            if part
+        )
+        targets.append(
+            CrawlTarget(
+                source=source,
+                url=file_url,
+                label=label,
+                resolved_from_url=url,
+                metadata={
+                    "resolver": resolver_type,
+                    "target_kind": "file_reference",
+                    "target_file_type": file_type,
+                    "container_format": _container_format(file_url),
+                    "plan_info": item["plan_info"],
+                    "network_name": network_name or None,
+                    "file_name": file_name,
+                    "file_size": _clean_text(row.get("file_size")) or None,
+                    "size_bytes": _parse_size_bytes(row.get("file_size")),
+                    "schema_version": _clean_text(row.get("file_version")) or None,
+                    "run_history_id": run_history_id,
+                    "dynamic_download_url": dynamic_download_url,
+                    "search_terms": sorted(item["search_terms"]),
+                    "results_urls": sorted(item["results_urls"]),
+                    "reporting_entity_name": "MagnaCare and Brighton administered plans",
+                    "reporting_entity_type": "third_party_administrator",
+                },
+            )
+        )
+    if not targets:
+        raise ValueError(f"no downloadable MagnaCare transparency MRF files found for {url}")
+    return targets
 
 
 def _asr_group_number_from_url(url: str | None) -> str | None:
@@ -7413,6 +7643,10 @@ async def _crawl_targets_for_source(
         return await _resolve_healthsparq_public_mrf(source, url, resolver, session)
     if resolver_type == "providence_mrf_api":
         return await _resolve_providence_mrf_api(source, url, resolver, session)
+    if resolver_type == "magnacare_transparency_mrf":
+        return await _resolve_magnacare_transparency_mrf(
+            source, url, resolver, session
+        )
     if resolver_type == "mymedicalshopper_talon_mrf":
         return await _resolve_mymedicalshopper_talon_mrf(source, url, resolver, session)
     if resolver_type == "asr_health_benefits_mrf":

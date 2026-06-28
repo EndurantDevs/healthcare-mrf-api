@@ -340,6 +340,7 @@ Last one-time research refresh: 2026-06-05.
 | Auxiant | tpa | https://transparency.auxiant.com/directory-of-data-sources/ | public WordPress data source directory; resolver expands data-available network pages; aliases: Auxiant TPA, Auxient TPA, Auxient |
 | Benefits and Risk Management Services | tpa | - | needs official source URL |
 | Benefit Plan Administrators | tpa | https://www.mymedicalshopper.com/mrf-search/benefit-plan-administrators | public BPA/TALON MRF search linked from BPA machine-readable files page; aliases: BPA, BPA TPA, BPA Inc, Benefit Plan Administrators Inc |
+| Brighton Health Plan Solutions | tpa | https://clm.magnacare.com/transparency/ | public MagnaCare/Brighton machine-readable files portal; resolver searches public result terms and refreshes current download URLs by run-history id; aliases: Brighton HPS, Brighton Health, MagnaCare, Magnacare |
 | Boon-Chapman | tpa | https://boonchapman-mrf.zakipointhealth.com/ | public ZakiPoint MRF directory linked from Boon-Chapman transparency page; aliases: Boon Chapman, Boon-Chapman Benefit Administrators |
 | BRMS | tpa | https://www.myhealthbenefits.com/MyHealthBenefits/Home/MRFs/ | public MRF table; resolver catalogs direct files and Healthcare Bluebook delegated rows |
 | ByWater | tpa | https://www.mymedicalshopper.com/mrf-search/bywater | public ByWater transparency page delegates MRF search to TALON/MyMedicalShopper; aliases: Bywater, ByWater Health, Choose ByWater |

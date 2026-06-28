@@ -217,6 +217,12 @@
       "max_plans_per_employer": 500,
       "ddp_timeout_seconds": 30
     },
+    "magnacare_transparency_mrf": {
+      "type": "magnacare_transparency_mrf",
+      "search_terms": ["magna", "employee", "benefit", "medical", "hospital"],
+      "max_bytes": 5242880,
+      "max_targets": 250
+    },
     "asr_health_benefits": {
       "type": "asr_health_benefits_mrf",
       "toc_path": "/umbraco/surface/mrfdownload",

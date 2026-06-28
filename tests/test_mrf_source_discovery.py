@@ -89,6 +89,10 @@ def test_source_urls_are_loaded_from_registry_file():
         == "mymedicalshopper_talon_mrf"
     )
     assert (
+        config["platform_resolvers"]["magnacare_transparency_mrf"]["type"]
+        == "magnacare_transparency_mrf"
+    )
+    assert (
         config["platform_resolvers"]["asr_health_benefits"]["type"]
         == "asr_health_benefits_mrf"
     )
@@ -681,6 +685,7 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
 | ACS Benefit Services | tpa | https://acsbenefitservices.sapphiremrfhub.com/ | aliases: ACS Benefits |
 | American Plan Administrators | tpa | https://apatpa.com/disclosures-terms-conditions-privacy-policy-american-plan-administrators/ | aliases: APA, APA TPA |
 | Benefit Plan Administrators | tpa | https://www.mymedicalshopper.com/mrf-search/benefit-plan-administrators | aliases: BPA, BPA TPA |
+| Brighton Health Plan Solutions | tpa | https://clm.magnacare.com/transparency/ | aliases: Brighton HPS, MagnaCare |
 | ByWater | tpa | https://www.mymedicalshopper.com/mrf-search/bywater | aliases: Bywater, Choose ByWater |
 | Coastal Administrative Services | tpa | https://mrf.healthcarebluebook.com/CAS | aliases: CAS |
 | Diversified Group | tpa | https://www.mymedicalshopper.com/mrf-search/diversified-group | aliases: The Diversified Group |
@@ -768,6 +773,14 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
         == "mymedicalshopper_talon"
     )
     assert by_name["Benefit Plan Administrators"].aliases == ("BPA", "BPA TPA")
+    assert (
+        by_name["Brighton Health Plan Solutions"].hosting_platform
+        == "magnacare_transparency_mrf"
+    )
+    assert by_name["Brighton Health Plan Solutions"].aliases == (
+        "Brighton HPS",
+        "MagnaCare",
+    )
     assert by_name["ByWater"].hosting_platform == "mymedicalshopper_talon"
     assert by_name["ByWater"].aliases == ("Bywater", "Choose ByWater")
     assert (
@@ -1412,6 +1425,10 @@ def test_classify_hosting_platforms():
             "https://www.mymedicalshopper.com/mrf/electrical-workers-cofinity-varipro-77100"
         )
         == "mymedicalshopper_talon"
+    )
+    assert (
+        discovery.classify_hosting_platform("https://clm.magnacare.com/transparency/")
+        == "magnacare_transparency_mrf"
     )
     assert (
         discovery.classify_hosting_platform(
@@ -2654,6 +2671,138 @@ async def test_mymedicalshopper_resolver_honors_max_targets(monkeypatch):
 
     assert generated_for == ["client-one-bywater-10001", "client-two-bywater-10002"]
     assert [target.metadata["employer_slug"] for target in targets] == generated_for
+
+
+MAGNACARE_RESULTS_HTML = """
+<table id="claimresults">
+  <tbody>
+    <tr class="default">
+      <td>EIN</td>
+      <td>Group</td>
+      <td>113410766</td>
+      <td><div>Magna Employee Health Benefit Plan - HRA Plan</div></td>
+      <td><div>MagnaCare PPO</div></td>
+      <td>In-Network</td>
+      <td>24 MB</td>
+      <td>
+        <a href="download" data-rhid="339" data-network="MagnaCare PPO"
+           data-fversion="2.0" data-fsize="24 MB"
+           data-fname="MagnaCarePPO_In-Network.zip" data-href="">Download</a>
+      </td>
+    </tr>
+    <tr class="default">
+      <td>EIN</td>
+      <td>Group</td>
+      <td>113410766</td>
+      <td><div>Magna Employee Health Benefit Plan - Standard PPO Plan</div></td>
+      <td><div>MagnaCare PPO</div></td>
+      <td>In-Network</td>
+      <td>24 MB</td>
+      <td>
+        <a href="download" data-rhid="339" data-network="MagnaCare PPO"
+           data-fversion="2.0" data-fsize="24 MB"
+           data-fname="MagnaCarePPO_In-Network.zip" data-href="">Download</a>
+      </td>
+    </tr>
+    <tr class="default">
+      <td>EIN</td>
+      <td>Group</td>
+      <td>135608135</td>
+      <td><div>Delegated First Health Plan</div></td>
+      <td><div>First Health</div></td>
+      <td>In-Network</td>
+      <td>0 MB</td>
+      <td>
+        <a href="download" data-rhid="0" data-network="First Health"
+           data-fversion="1.0" data-fsize="0 MB" data-fname=""
+           data-href="https://health1.firsthealth.com/app/public/#/one/insurerCode=FIRSTHEALTH_I&amp;brandCode=FIRSTH/machine-readable-transparency-in-coverage">Download</a>
+      </td>
+    </tr>
+  </tbody>
+</table>
+"""
+
+
+def test_magnacare_result_rows_extract_download_metadata():
+    rows = discovery._magnacare_result_rows(MAGNACARE_RESULTS_HTML)
+
+    assert len(rows) == 3
+    assert rows[0]["plan_id"] == "113410766"
+    assert rows[0]["plan_name"] == "Magna Employee Health Benefit Plan - HRA Plan"
+    assert rows[0]["network_name"] == "MagnaCare PPO"
+    assert rows[0]["file_type_label"] == "In-Network"
+    assert rows[0]["run_history_id"] == "339"
+    assert rows[0]["file_name"] == "MagnaCarePPO_In-Network.zip"
+    assert rows[2]["run_history_id"] == "0"
+    assert rows[2]["external_url"].startswith("https://health1.firsthealth.com/")
+
+
+@pytest.mark.asyncio
+async def test_magnacare_resolver_refreshes_download_urls_and_aggregates_plans(
+    monkeypatch,
+):
+    fetched_result_urls = []
+    fetched_download_urls = []
+
+    async def fake_fetch_text(url, *, max_bytes, session):
+        fetched_result_urls.append(url)
+        assert max_bytes == 1024
+        assert session == "session"
+        return MAGNACARE_RESULTS_HTML
+
+    async def fake_fetch_json(url, *, max_bytes, session):
+        fetched_download_urls.append(url)
+        assert "runHistoryID=339" in url
+        assert "ipAddress=127.0.0.1" in url
+        assert max_bytes == 1024
+        assert session == "session"
+        return {
+            "Data": (
+                "https://transparencymrfprod.blob.core.windows.net/mrf-magnacare/"
+                "MagnaCarePPO_In-Network.zip?sv=2023&se=2026&sig=secret"
+            )
+        }
+
+    monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
+    monkeypatch.setattr(discovery, "_fetch_json", fake_fetch_json)
+
+    targets = await discovery._resolve_magnacare_transparency_mrf(
+        {"source_id": "source_brighton", "payer_id": "payer_brighton"},
+        "https://clm.magnacare.com/transparency/",
+        {
+            "type": "magnacare_transparency_mrf",
+            "search_terms": ["magna"],
+            "max_bytes": 1024,
+            "max_targets": 10,
+        },
+        session="session",
+    )
+
+    assert len(fetched_result_urls) == 1
+    assert "filters=search-by%3Amagna" in fetched_result_urls[0]
+    assert len(fetched_download_urls) == 1
+    assert len(targets) == 1
+    target = targets[0]
+    assert target.url.endswith("MagnaCarePPO_In-Network.zip?sv=2023&se=2026&sig=secret")
+    assert target.resolved_from_url == "https://clm.magnacare.com/transparency/"
+    assert target.metadata["target_kind"] == "file_reference"
+    assert target.metadata["target_file_type"] == "in-network"
+    assert target.metadata["run_history_id"] == "339"
+    assert target.metadata["size_bytes"] == 24_000_000
+    assert target.metadata["plan_info"] == [
+        {
+            "plan_id": "113410766",
+            "plan_id_type": "EIN",
+            "plan_market_type": "group",
+            "plan_name": "Magna Employee Health Benefit Plan - HRA Plan",
+        },
+        {
+            "plan_id": "113410766",
+            "plan_id_type": "EIN",
+            "plan_market_type": "group",
+            "plan_name": "Magna Employee Health Benefit Plan - Standard PPO Plan",
+        },
+    ]
 
 
 def test_highmark_hmhs_script_expands_current_month_index_urls():
