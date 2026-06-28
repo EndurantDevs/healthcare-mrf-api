@@ -9322,6 +9322,25 @@ def _eligible_for_public_promotion(row: dict[str, Any]) -> bool:
     return access_model == "free" and source_type != "vendor_aggregator"
 
 
+def _import_control_source_urls(row: dict[str, Any]) -> tuple[str | None, str | None]:
+    index_url = row.get("index_url") or row.get("human_url")
+    official_url = row.get("human_url") or row.get("index_url")
+    platform = str(row.get("hosting_platform") or "").strip()
+    if platform == "healthsparq" and index_url:
+        resolver = _platform_resolver_config(platform)
+        try:
+            params = _healthsparq_public_params(str(index_url))
+            metadata_url = _healthsparq_direct_metadata_url(resolver, params)
+        except (TypeError, ValueError):
+            metadata_url = None
+        if metadata_url:
+            return metadata_url, str(official_url or index_url)
+    return (
+        str(index_url) if index_url else None,
+        str(official_url) if official_url else None,
+    )
+
+
 def _chunked(items: list[Any], size: int):
     for start in range(0, len(items), max(1, size)):
         yield items[start : start + size]
@@ -9781,9 +9800,10 @@ async def _promote_import_control_source(
     source_id (it derives ids from the canonical URL, ignoring ours). The catalog sync stages
     sources as internal/needs_review and only flips them public after a full plan sync.
     """
+    index_url, official_url = _import_control_source_urls(row)
     payload = {
-        "index_url": row.get("index_url") or row.get("human_url"),
-        "official_url": row.get("human_url"),
+        "index_url": index_url,
+        "official_url": official_url,
         "source_key": row.get("source_key"),
         "display_name": row.get("display_name"),
         "payer_name": row.get("display_name"),

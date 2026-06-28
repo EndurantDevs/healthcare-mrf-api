@@ -3592,6 +3592,26 @@ def test_healthsparq_direct_metadata_url_skips_scoped_filters():
     assert discovery._healthsparq_direct_metadata_url(resolver, params) is None
 
 
+def test_import_control_source_urls_use_healthsparq_metadata_url():
+    public_url = (
+        "https://web.healthsparq.com/app/public/#/one/"
+        "insurerCode=WMRK_I&brandCode=WELLMARK/"
+    )
+    row = {
+        "index_url": public_url,
+        "human_url": public_url,
+        "hosting_platform": "healthsparq",
+    }
+
+    index_url, official_url = discovery._import_control_source_urls(row)
+
+    assert (
+        index_url
+        == "https://mrf.healthsparq.com/wmrk-egress.nophi.kyruushsq.com/prd/mrf/WMRK_I/WELLMARK/latest_metadata.json"
+    )
+    assert official_url == public_url
+
+
 def test_healthsparq_target_marks_metadata_url_as_toc_target():
     target = discovery._healthsparq_target(
         {"source_id": "source_1", "display_name": "Priority Health"},
