@@ -2,8 +2,10 @@
 
 import gzip
 import importlib
+import io
 import json
 import types
+import zipfile
 
 import pytest
 
@@ -5668,6 +5670,25 @@ def test_parse_html_mrf_links_accepts_zipped_table_of_contents_files():
     ]
 
 
+def test_json_values_from_zip_bytes_reads_zipped_toc_member():
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("readme.txt", "not json")
+        archive.writestr(
+            "2026-06-01_example_index.json",
+            json.dumps({"reporting_entity_name": "Example Payer"}),
+        )
+
+    values = discovery._json_values_from_zip_bytes(buffer.getvalue())
+
+    assert values == [
+        (
+            "2026-06-01_example_index.json",
+            {"reporting_entity_name": "Example Payer"},
+        )
+    ]
+
+
 def test_parse_html_mrf_links_ignores_provider_formulary_indexes():
     html = """
     <a href="https://files.example.test/provider-data/cms-data-index.json">
@@ -6074,6 +6095,7 @@ def test_json_mrf_directory_payload_extracts_toc_targets():
         "TOC_Files": [
             "https://cdn.example.test/TCR_TOC_Output/ASO/2026-06-01_example-plan_index.json",
             "https://cdn.example.test/TCR_TOC_Output/NON-ASO/2026-06-01_example_index.json",
+            "/TCR_TOC_Output/ASO/2026-07-01_relative-plan_index.json",
         ]
     }
 
@@ -6087,6 +6109,7 @@ def test_json_mrf_directory_payload_extracts_toc_targets():
     assert [target.url for target in targets] == [
         "https://cdn.example.test/TCR_TOC_Output/ASO/2026-06-01_example-plan_index.json",
         "https://cdn.example.test/TCR_TOC_Output/NON-ASO/2026-06-01_example_index.json",
+        "https://cdn.example.test/TCR_TOC_Output/ASO/2026-07-01_relative-plan_index.json",
     ]
     assert targets[0].metadata["target_kind"] == "toc_json"
     assert targets[0].metadata["target_file_type"] == "table-of-contents"
@@ -7113,6 +7136,75 @@ async def test_crawl_toc_metadata_reports_expanded_target_count(monkeypatch):
     assert [
         event["unit"] for event in progress if event["phase"] == "crawling TOC metadata"
     ] == ["targets", "targets"]
+
+
+@pytest.mark.asyncio
+async def test_crawl_toc_metadata_expands_zipped_toc_file_reference(monkeypatch):
+    pushed_batches = []
+    source_rows = [
+        {
+            "source_id": "source_1",
+            "payer_id": "payer_1",
+            "index_url": "https://example.com/source",
+        }
+    ]
+    target = discovery.CrawlTarget(
+        source=source_rows[0],
+        url="https://example.com/2026-06-01_example_index.zip",
+        label="Example ZIP TOC",
+        metadata={
+            "target_kind": "file_reference",
+            "target_file_type": "table-of-contents",
+            "container_format": "zip",
+        },
+    )
+
+    async def fake_resolve_crawl_targets(*_args, **_kwargs):
+        return [target], []
+
+    async def fake_fetch_zip_json_values(*_args, **_kwargs):
+        return [("2026-06-01_example_index.json", {"toc": True})]
+
+    def fake_toc_rows_from_content(source, url, toc):
+        assert source["source_id"] == "source_1"
+        assert url == "https://example.com/2026-06-01_example_index.zip"
+        assert toc == {"toc": True}
+        return [{"plan_id": "plan_1"}], [{"mrf_file_id": "file_1"}]
+
+    async def fake_push_crawl_row_batches(plan_rows, file_rows, observation_rows, **_kwargs):
+        pushed_batches.append(
+            {
+                "plan_rows": list(plan_rows),
+                "file_rows": list(file_rows),
+                "observation_rows": list(observation_rows),
+            }
+        )
+
+    monkeypatch.setattr(discovery, "_resolve_crawl_targets", fake_resolve_crawl_targets)
+    monkeypatch.setattr(discovery, "_fetch_zip_json_values", fake_fetch_zip_json_values)
+    monkeypatch.setattr(discovery, "_toc_rows_from_content", fake_toc_rows_from_content)
+    monkeypatch.setattr(
+        discovery, "_push_crawl_row_batches", fake_push_crawl_row_batches
+    )
+
+    plans, files, observations = await discovery._crawl_toc_metadata(
+        source_rows,
+        test_mode=False,
+        run_id="run_1",
+        max_toc_bytes=1024,
+        concurrency=1,
+    )
+
+    assert plans == 1
+    assert files == 2
+    assert len(observations) == 1
+    assert pushed_batches[0]["file_rows"][0]["file_type"] == "table-of-contents"
+    assert pushed_batches[-1]["plan_rows"] == [{"plan_id": "plan_1"}]
+    assert pushed_batches[-1]["file_rows"][0]["mrf_file_id"] == "file_1"
+    assert (
+        pushed_batches[-1]["file_rows"][0]["metadata_json"]["target_label"]
+        == "Example ZIP TOC"
+    )
 
 
 def test_toc_rows_skip_non_http_body_placeholders(monkeypatch):

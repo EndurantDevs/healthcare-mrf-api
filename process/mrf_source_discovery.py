@@ -8,6 +8,7 @@ import csv
 import datetime as dt
 import gzip
 import html
+import io
 import ipaddress
 import json
 import logging
@@ -15,6 +16,7 @@ import os
 import re
 import socket
 import ssl
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
@@ -1374,6 +1376,41 @@ async def _fetch_text(
     return _decode_response_body(b"".join(chunks), charset=charset)
 
 
+async def _fetch_bytes(
+    url: str,
+    *,
+    max_bytes: int = MAX_TOC_BYTES_DEFAULT,
+    session: aiohttp.ClientSession | None = None,
+) -> bytes:
+    await _assert_fetch_url_allowed(url)
+    if session is None:
+        timeout = aiohttp.ClientTimeout(
+            total=HTTP_TOTAL_TIMEOUT, connect=15, sock_read=HTTP_READ_TIMEOUT
+        )
+        connector = _tcp_connector(limit=0)
+        async with aiohttp.ClientSession(
+            headers={"User-Agent": USER_AGENT},
+            timeout=timeout,
+            connector=connector,
+            trust_env=False,
+        ) as owned_session:
+            return await _fetch_bytes(
+                url,
+                max_bytes=max_bytes,
+                session=owned_session,
+            )
+    async with session.get(url, allow_redirects=True) as resp:
+        await _assert_fetch_url_allowed(str(resp.url))
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in resp.content.iter_chunked(64 * 1024):
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(f"response exceeds {max_bytes} byte discovery limit")
+            chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def _decode_response_body(body: bytes, *, charset: str = "utf-8") -> str:
     if body.startswith(b"\x1f\x8b"):
         body = gzip.decompress(body)
@@ -1402,6 +1439,53 @@ async def _fetch_json_value(
         url, max_bytes=max_bytes, session=session, expect_json=True
     )
     return json.loads(text)
+
+
+def _json_values_from_zip_bytes(
+    body: bytes,
+    *,
+    max_bytes: int = MAX_TOC_BYTES_DEFAULT,
+) -> list[tuple[str, Any]]:
+    values: list[tuple[str, Any]] = []
+    try:
+        with zipfile.ZipFile(io.BytesIO(body)) as archive:
+            infos = sorted(
+                (info for info in archive.infolist() if not info.is_dir()),
+                key=lambda info: (
+                    0
+                    if _mrf_file_type_from_text(info.filename, info.filename)
+                    == "table-of-contents"
+                    else 1,
+                    info.filename,
+                ),
+            )
+            for info in infos:
+                name = info.filename
+                lower_name = name.lower()
+                if not lower_name.endswith((".json", ".json.gz")):
+                    continue
+                if info.file_size > max_bytes:
+                    raise ValueError(
+                        f"zip member {name} exceeds {max_bytes} byte discovery limit"
+                    )
+                payload = archive.read(info)
+                text = _decode_response_body(payload)
+                values.append((name, json.loads(text)))
+    except zipfile.BadZipFile as exc:
+        raise ValueError("response body is not a readable ZIP archive") from exc
+    if not values:
+        raise ValueError("ZIP archive does not contain JSON TOC members")
+    return values
+
+
+async def _fetch_zip_json_values(
+    url: str,
+    *,
+    max_bytes: int = MAX_TOC_BYTES_DEFAULT,
+    session: aiohttp.ClientSession | None = None,
+) -> list[tuple[str, Any]]:
+    body = await _fetch_bytes(url, max_bytes=max_bytes, session=session)
+    return _json_values_from_zip_bytes(body, max_bytes=max_bytes)
 
 
 async def _post_json(
@@ -4570,6 +4654,27 @@ def _json_mrf_directory_links_from_html(html_text: str, *, base_url: str) -> lis
     return urls
 
 
+def _embedded_mrf_urls(value: str, *, base_url: str | None = None) -> list[str]:
+    urls = list(_embedded_http_urls(value))
+    if base_url:
+        relative_text = re.sub(
+            r"https?://[^\s|)<>\"']+",
+            " ",
+            html.unescape(str(value or "")),
+        )
+        for match in re.finditer(
+            r"""(?<![A-Za-z0-9:/])(?P<url>/?[A-Za-z0-9._~!$&'()*+,;=:@%/-]+(?:\.json(?:\.gz)?|\.zip|\.7z|\.csv)(?:\?[A-Za-z0-9._~!$&'()*+,;=:@%/?-]+)?)""",
+            relative_text,
+        ):
+            relative = match.group("url").strip()
+            if not relative or relative.lower().startswith(("http://", "https://")):
+                continue
+            url = urljoin(base_url, relative)
+            if url not in urls:
+                urls.append(url)
+    return urls
+
+
 def _json_mrf_directory_targets_from_payload(
     source: dict[str, Any],
     payload: Any,
@@ -4591,7 +4696,7 @@ def _json_mrf_directory_targets_from_payload(
             return
         if not isinstance(value, str):
             return
-        for file_url in _embedded_http_urls(value):
+        for file_url in _embedded_mrf_urls(value, base_url=directory_url):
             label = Path(urlsplit(file_url).path).name
             target_kind: str | None = None
             target_file_type: str | None = None
@@ -9283,7 +9388,56 @@ async def _crawl_toc_metadata(
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], str]:
         try:
             target_kind = (target.metadata or {}).get("target_kind")
+            target_file_type = (target.metadata or {}).get("target_file_type")
             target_max_bytes = _target_fetch_max_bytes(target, max_toc_bytes)
+            if (
+                target_kind == "file_reference"
+                and target_file_type == "table-of-contents"
+            ):
+                if (target.metadata or {}).get("container_format") == "zip":
+                    toc_values = await _fetch_zip_json_values(
+                        target.url,
+                        max_bytes=target_max_bytes,
+                        session=session,
+                    )
+                else:
+                    toc_values = [
+                        (
+                            Path(urlsplit(target.url).path).name,
+                            await _fetch_json(
+                                target.url,
+                                max_bytes=target_max_bytes,
+                                session=session,
+                            ),
+                        )
+                    ]
+                plan_rows: list[dict[str, Any]] = []
+                file_rows: list[dict[str, Any]] = []
+                for _member_name, toc in toc_values:
+                    if not isinstance(toc, dict):
+                        raise ValueError("expected JSON object")
+                    member_plan_rows, member_file_rows = _toc_rows_from_content(
+                        target.source, target.url, toc
+                    )
+                    plan_rows.extend(member_plan_rows)
+                    file_rows.extend(
+                        _apply_crawl_target_context_to_file_rows(
+                            member_file_rows, target
+                        )
+                    )
+                return (
+                    plan_rows,
+                    file_rows,
+                    [
+                        _crawl_ok_observation(
+                            target,
+                            run_id=run_id,
+                            plans=len(plan_rows),
+                            files=len(file_rows),
+                        )
+                    ],
+                    target.url,
+                )
             if target_kind in {"file_reference", "source_landing_page"}:
                 plan_rows = _plan_rows_from_target_metadata(target)
                 return (
