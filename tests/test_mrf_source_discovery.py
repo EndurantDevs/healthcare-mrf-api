@@ -97,6 +97,13 @@ def test_source_urls_are_loaded_from_registry_file():
         == "mymedicalshopper_talon_mrf"
     )
     assert (
+        config["platform_resolvers"]["mymedicalshopper_talon_bounded"]["type"]
+        == "mymedicalshopper_talon_mrf"
+    )
+    assert config["platform_resolvers"]["mymedicalshopper_talon_bounded"][
+        "max_targets"
+    ] == 20
+    assert (
         config["platform_resolvers"]["magnacare_transparency_mrf"]["type"]
         == "magnacare_transparency_mrf"
     )
@@ -796,7 +803,10 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
         == "healthcarebluebook_mrf"
     )
     assert by_name["Coastal Administrative Services"].aliases == ("CAS",)
-    assert by_name["Diversified Group"].hosting_platform == "mymedicalshopper_talon"
+    assert (
+        by_name["Diversified Group"].hosting_platform
+        == "mymedicalshopper_talon_bounded"
+    )
     assert by_name["Diversified Group"].aliases == ("The Diversified Group",)
     assert by_name["Marpai"].hosting_platform == "mymedicalshopper_talon"
     assert by_name["Imagine360"].hosting_platform == "html_mrf_links"
@@ -1427,6 +1437,12 @@ def test_classify_hosting_platforms():
             "https://www.mymedicalshopper.com/mrf-search/varipro"
         )
         == "mymedicalshopper_talon"
+    )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://www.mymedicalshopper.com/mrf-search/diversified-group"
+        )
+        == "mymedicalshopper_talon_bounded"
     )
     assert (
         discovery.classify_hosting_platform(

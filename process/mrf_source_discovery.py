@@ -946,6 +946,10 @@ def classify_hosting_platform(url: str | None) -> str | None:
     ):
         return "auxiant_wordpress"
     if host in {"www.mymedicalshopper.com", "mymedicalshopper.com"} and path.startswith(
+        "/mrf-search/diversified-group"
+    ):
+        return "mymedicalshopper_talon_bounded"
+    if host in {"www.mymedicalshopper.com", "mymedicalshopper.com"} and path.startswith(
         ("/mrf-search/", "/mrf/")
     ):
         return "mymedicalshopper_talon"
