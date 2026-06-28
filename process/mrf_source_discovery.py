@@ -1085,9 +1085,14 @@ def _master_list_aliases(notes: str) -> tuple[str, ...]:
     )
     if not match:
         return ()
+    raw_aliases = match.group("aliases")
+    try:
+        parsed_aliases = next(csv.reader([raw_aliases], skipinitialspace=True))
+    except (csv.Error, StopIteration):
+        parsed_aliases = raw_aliases.split(",")
     aliases: list[str] = []
     seen: set[str] = set()
-    for raw_alias in match.group("aliases").split(","):
+    for raw_alias in parsed_aliases:
         alias = _clean_text(raw_alias)
         if not alias:
             continue
