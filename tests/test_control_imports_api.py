@@ -70,8 +70,11 @@ def test_importer_registry_exposes_ptg_and_finish_lifecycle():
     assert any(param["name"] == "resource_limit" and param["type"] == "integer" for param in items["provider-directory-fhir"]["params_schema"])
     assert any(param["name"] == "full_refresh" and param["type"] == "boolean" for param in items["provider-directory-fhir"]["params_schema"])
     assert any(param["name"] == "stale_cleanup" and param["type"] == "boolean" for param in items["provider-directory-fhir"]["params_schema"])
+    assert any(param["name"] == "publish_artifacts" and param["type"] == "boolean" for param in items["provider-directory-fhir"]["params_schema"])
     assert any(param["name"] == "stream_batch_size" and param["type"] == "integer" for param in items["provider-directory-fhir"]["params_schema"])
     assert any(param["name"] == "source_concurrency" and param["type"] == "integer" for param in items["provider-directory-fhir"]["params_schema"])
+    assert any(param["name"] == "concurrency" and param["type"] == "integer" for param in items["provider-directory-fhir"]["params_schema"])
+    assert any(param["name"] == "timeout" and param["type"] == "integer" for param in items["provider-directory-fhir"]["params_schema"])
     assert any(param["name"] == "open_only" and param["type"] == "boolean" for param in items["provider-directory-fhir"]["params_schema"])
     assert any(
         param["name"] == "source_key" and param["type"] == "text"
@@ -143,6 +146,10 @@ def test_importer_registry_exposes_ptg_and_finish_lifecycle():
         param["name"] == "refresh_mode" and param["type"] == "choice"
         for param in items["entity-address-unified"]["params_schema"]
     )
+    entity_refresh_mode = next(
+        param for param in items["entity-address-unified"]["params_schema"] if param["name"] == "refresh_mode"
+    )
+    assert "provider-directory-partial" in entity_refresh_mode["choices"]
     assert any(
         param["name"] == "ptg_source_key" and param["type"] == "text"
         for param in items["entity-address-unified"]["params_schema"]

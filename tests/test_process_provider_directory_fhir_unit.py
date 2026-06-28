@@ -13,6 +13,7 @@ from sqlalchemy.dialects import postgresql
 
 from db.models import (
     ProviderDirectoryCapability,
+    ProviderDirectoryEndpoint,
     ProviderDirectoryInsurancePlan,
     ProviderDirectoryLocation,
     ProviderDirectoryPractitioner,
@@ -221,13 +222,33 @@ def test_upsert_changed_row_predicate_ignores_run_metadata_columns():
     assert "updated_at" not in sql
 
 
+def test_copy_stage_changed_where_ignores_run_metadata_columns():
+    table = ProviderDirectoryLocation.__table__
+    columns = [column.name for column in table.columns]
+    primary_keys = [column.name for column in table.primary_key.columns]
+
+    sql = importer._copy_stage_changed_where_sql(  # pylint: disable=protected-access
+        table,
+        columns,
+        primary_keys,
+        target_alias="target_row",
+        stage_alias="stage_row",
+    )
+
+    assert 'target_row."source_id" IS NULL' in sql
+    assert 'target_row."telecom"::jsonb IS DISTINCT FROM stage_row."telecom"::jsonb' in sql
+    assert "last_seen_run_id" not in sql
+    assert "observed_at" not in sql
+    assert "updated_at" not in sql
+
+
 @pytest.mark.asyncio
 async def test_upsert_resource_rows_tracks_seen_and_skips_unchanged(monkeypatch):
     seen_calls = []
     upsert_calls = []
 
-    async def fake_mark_seen(model, rows, run_id):
-        seen_calls.append((model, rows, run_id))
+    async def fake_mark_seen(model, rows, run_id, **kwargs):
+        seen_calls.append((model, rows, run_id, kwargs))
         return len(rows)
 
     async def fake_upsert(model, rows, **kwargs):
@@ -246,7 +267,7 @@ async def test_upsert_resource_rows_tracks_seen_and_skips_unchanged(monkeypatch)
     )
 
     assert written == 1
-    assert seen_calls == [(ProviderDirectoryLocation, rows, "run_1")]
+    assert seen_calls == [(ProviderDirectoryLocation, rows, "run_1", {"seen_table": None})]
     assert upsert_calls == [(ProviderDirectoryLocation, rows, {"skip_unchanged": True})]
 
 
@@ -294,7 +315,7 @@ async def test_import_alohr_graphql_source_group_writes_existing_resource_tables
     monkeypatch.setattr(importer, "_fetch_alohr_graphql_page", fake_fetch_page)
     monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
 
-    source_ids, diagnostics, counts, linked_counts, stats, stale = await importer._import_alohr_graphql_source_group(  # pylint: disable=protected-access
+    source_ids, diagnostics, counts, linked_counts, stats, stale, stale_ready = await importer._import_alohr_graphql_source_group(  # pylint: disable=protected-access
         [{"source_id": "source_alohr", "api_base": importer.ALOHR_PUBLIC_PROVIDER_DIRECTORY_BASE}],
         resources=["Practitioner", "Location", "PractitionerRole", "Organization", "OrganizationAffiliation"],
         per_resource_limit=0,
@@ -307,6 +328,7 @@ async def test_import_alohr_graphql_source_group_writes_existing_resource_tables
     assert source_ids == ["source_alohr"]
     assert linked_counts == {}
     assert stale == {}
+    assert stale_ready == {}
     assert calls == [("providers", None), ("providerOrgs", None)]
     assert counts["Practitioner"] == 1
     assert counts["Location"] == 2
@@ -722,7 +744,7 @@ async def test_probe_sources_persists_resolved_api_base_for_repaired_catalog_url
     assert source_rows[0]["metadata_json"]["resolved_api_base_from"] == "https://fhir.humana.com/api/provider-directory"
 
 
-def test_parse_fhir_resource_maps_plan_practitioner_location_and_role():
+def test_parse_fhir_resource_maps_plan_practitioner_location_role_and_endpoint():
     plan_model, plan_row = importer.parse_fhir_resource(
         "source_a",
         {
@@ -768,7 +790,30 @@ def test_parse_fhir_resource_maps_plan_practitioner_location_and_role():
             "organization": {"reference": "Organization/org-1"},
             "location": [{"reference": "Location/loc-1"}],
             "insurancePlan": [{"reference": "InsurancePlan/plan-1"}],
+            "endpoint": [{"reference": "Endpoint/endpoint-1"}],
         },
+    )
+    endpoint_model, endpoint_row = importer.parse_fhir_resource(
+        "source_a",
+        {
+            "resourceType": "Endpoint",
+            "id": "endpoint-1",
+            "status": "active",
+            "connectionType": {
+                "system": "http://terminology.hl7.org/CodeSystem/endpoint-connection-type",
+                "code": "hl7-fhir-rest",
+                "display": "HL7 FHIR",
+            },
+            "name": "Provider Directory FHIR",
+            "managingOrganization": {"reference": "Organization/org-1"},
+            "contact": [{"system": "phone", "value": "312-555-1111"}],
+            "payloadType": [{"coding": [{"system": "http://hl7.org/fhir/resource-types", "code": "Organization"}]}],
+            "payloadMimeType": ["application/fhir+json"],
+            "address": "https://example.test/fhir",
+            "header": ["X-Test: true"],
+            "period": {"start": "2026-01-01"},
+        },
+        run_id="run_2",
     )
 
     assert plan_model is ProviderDirectoryInsurancePlan
@@ -785,6 +830,15 @@ def test_parse_fhir_resource_maps_plan_practitioner_location_and_role():
     assert role_model is ProviderDirectoryPractitionerRole
     assert role_row["location_refs"] == ["Location/loc-1"]
     assert role_row["insurance_plan_refs"] == ["InsurancePlan/plan-1"]
+    assert role_row["endpoint_refs"] == ["Endpoint/endpoint-1"]
+    assert endpoint_model is ProviderDirectoryEndpoint
+    assert endpoint_row["connection_type_code"] == "hl7-fhir-rest"
+    assert endpoint_row["managing_organization_ref"] == "Organization/org-1"
+    assert endpoint_row["payload_type_codes"][0]["code"] == "Organization"
+    assert endpoint_row["payload_mime_types"] == ["application/fhir+json"]
+    assert endpoint_row["address"] == "https://example.test/fhir"
+    assert endpoint_row["period_start"] == "2026-01-01"
+    assert endpoint_row["last_seen_run_id"] == "run_2"
 
 
 def test_provider_directory_ptg_address_corroboration_sql_links_ptg_npi_address_to_fhir_roles():
@@ -842,6 +896,54 @@ def test_provider_directory_ptg_address_corroboration_view_keeps_existing_column
         "        provider_directory_network_names,\n"
         "        provider_directory_network_matches"
     ) in sql
+
+
+def test_provider_directory_ptg_address_corroboration_select_sql_returns_query_body():
+    sql = importer.provider_directory_ptg_address_corroboration_select_sql("mrf")
+
+    assert not sql.startswith("CREATE OR REPLACE VIEW")
+    assert sql.startswith("WITH practitioner_role_locations AS")
+    assert 'FROM "mrf"."ptg_address" p' in sql
+    assert "provider_directory_network_names" in sql
+
+
+@pytest.mark.asyncio
+async def test_publish_provider_directory_ptg_address_corroboration_table_swaps_indexed_table(monkeypatch):
+    statements: list[str] = []
+
+    async def fake_status(sql, **_params):
+        statements.append(sql)
+        return 0
+
+    async def fake_scalar(sql, **_params):
+        statements.append(sql)
+        return 7
+
+    monkeypatch.setattr(importer.db, "status", fake_status)
+    monkeypatch.setattr(importer.db, "scalar", fake_scalar)
+    monkeypatch.setattr(importer, "_stage_table_name", lambda: "pd_stage_corrob")
+
+    result = await importer.publish_provider_directory_ptg_address_corroboration_table("mrf")
+    joined = "\n".join(statements)
+
+    assert result == {
+        "published": True,
+        "relation": '"mrf"."ptg_provider_directory_address_corroboration"',
+        "rows": 7,
+        "storage": "table",
+    }
+    assert 'DROP TABLE IF EXISTS "mrf"."pd_stage_corrob"' in joined
+    assert 'CREATE UNLOGGED TABLE "mrf"."pd_stage_corrob" AS' in joined
+    assert 'FROM "mrf"."ptg_address" p' in joined
+    assert 'DROP VIEW "mrf"."ptg_provider_directory_address_corroboration"' in joined
+    assert 'DROP TABLE "mrf"."ptg_provider_directory_address_corroboration"' in joined
+    assert (
+        'ALTER TABLE "mrf"."pd_stage_corrob" RENAME TO "ptg_provider_directory_address_corroboration"'
+        in joined
+    )
+    assert '"mrf"."pd_ptg_corrob_lookup_idx"' in joined
+    assert '"mrf"."pd_ptg_corrob_network_names_gin"' in joined
+    assert 'ANALYZE "mrf"."ptg_provider_directory_address_corroboration"' in joined
 
 
 def test_provider_directory_location_address_key_sql_uses_shared_canonical_functions():
@@ -913,6 +1015,24 @@ def test_linked_resource_candidate_urls_use_organization_endpoint_for_owner_refs
     ]
 
 
+def test_linked_resource_candidate_urls_use_endpoint_endpoint_for_endpoint_refs():
+    urls = importer._linked_resource_candidate_urls(  # pylint: disable=protected-access
+        {
+            "api_base": "https://example.test/fhir",
+            "endpoint_endpoint": "Endpoint?connection-type=hl7-fhir-rest",
+        },
+        "Endpoint",
+        "endpoint-1",
+        reference="Endpoint/endpoint-1",
+        reference_field="endpoint_refs",
+    )
+
+    assert urls[:2] == [
+        "https://example.test/fhir/Endpoint?connection-type=hl7-fhir-rest&_count=1&_id=endpoint-1",
+        "https://example.test/fhir/Endpoint/endpoint-1",
+    ]
+
+
 @pytest.mark.asyncio
 async def test_import_linked_resource_rows_fetches_role_references_and_upserts(monkeypatch):
     async def fake_fetch_json(url, *, timeout):  # pylint: disable=unused-argument
@@ -931,6 +1051,8 @@ async def test_import_linked_resource_rows_fetches_role_references_and_upserts(m
             )
         if "/InsurancePlan/plan-1" in url:
             return 200, {"resourceType": "InsurancePlan", "id": "plan-1", "name": "Plan"}, None, 5
+        if "/Endpoint/endpoint-1" in url:
+            return 200, {"resourceType": "Endpoint", "id": "endpoint-1", "status": "active"}, None, 5
         return 404, None, None, 5
 
     upserts = []
@@ -951,6 +1073,7 @@ async def test_import_linked_resource_rows_fetches_role_references_and_upserts(m
                     "practitioner_ref": "Practitioner/prac-1",
                     "location_refs": ["Location/loc-1"],
                     "insurance_plan_refs": ["InsurancePlan/plan-1"],
+                    "endpoint_refs": ["Endpoint/endpoint-1"],
                 }
             ]
         },
@@ -959,11 +1082,12 @@ async def test_import_linked_resource_rows_fetches_role_references_and_upserts(m
         run_id="run_1",
     )
 
-    assert counts == {"Practitioner": 1, "Location": 1, "InsurancePlan": 1}
+    assert counts == {"Practitioner": 1, "Location": 1, "InsurancePlan": 1, "Endpoint": 1}
     assert [model for model, _rows in upserts] == [
         ProviderDirectoryPractitioner,
         ProviderDirectoryLocation,
         ProviderDirectoryInsurancePlan,
+        ProviderDirectoryEndpoint,
     ]
 
 
@@ -1169,7 +1293,7 @@ async def test_publish_provider_directory_ptg_address_corroboration_if_available
 ):
     monkeypatch.setattr(importer, "_table_exists", AsyncMock(return_value=False))
     publish = AsyncMock()
-    monkeypatch.setattr(importer, "publish_provider_directory_ptg_address_corroboration_view", publish)
+    monkeypatch.setattr(importer, "publish_provider_directory_ptg_address_corroboration_table", publish)
 
     published = await importer.publish_provider_directory_ptg_address_corroboration_if_available("mrf")
 
@@ -1183,7 +1307,7 @@ async def test_publish_provider_directory_ptg_address_corroboration_if_available
 ):
     monkeypatch.setattr(importer, "_table_exists", AsyncMock(return_value=True))
     publish = AsyncMock()
-    monkeypatch.setattr(importer, "publish_provider_directory_ptg_address_corroboration_view", publish)
+    monkeypatch.setattr(importer, "publish_provider_directory_ptg_address_corroboration_table", publish)
 
     published = await importer.publish_provider_directory_ptg_address_corroboration_if_available("mrf")
 
@@ -1333,6 +1457,159 @@ def test_max_rows_per_statement_stays_under_asyncpg_parameter_limit():
     assert importer._max_rows_per_statement(1) == 500  # pylint: disable=protected-access
     assert importer._max_rows_per_statement(100) == 300  # pylint: disable=protected-access
     assert importer._max_rows_per_statement(40000) == 1  # pylint: disable=protected-access
+
+
+class _FakeCopyDriver:
+    def __init__(self):
+        self.calls = []
+
+    async def copy_records_to_table(self, table, **kwargs):
+        self.calls.append(
+            {
+                "table": table,
+                "schema_name": kwargs.get("schema_name"),
+                "columns": list(kwargs["columns"]),
+                "records": list(kwargs["records"]),
+            }
+        )
+
+
+class _FakeAcquireConnection:
+    def __init__(self):
+        self.driver = _FakeCopyDriver()
+        self.raw_connection = type("RawConnection", (), {"driver_connection": self.driver})()
+        self.statements = []
+
+    async def status(self, sql, **_params):
+        self.statements.append(sql)
+        return 0
+
+
+class _FakeAcquire:
+    def __init__(self, conn):
+        self.conn = conn
+
+    async def __aenter__(self):
+        return self.conn
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+@pytest.mark.asyncio
+async def test_copy_upsert_rows_uses_temp_copy_and_changed_predicate(monkeypatch):
+    conn = _FakeAcquireConnection()
+    monkeypatch.setattr(importer.db, "acquire", lambda: _FakeAcquire(conn))
+    monkeypatch.setattr(importer, "_stage_table_name", lambda: "pd_stage_test")
+
+    table = ProviderDirectoryLocation.__table__
+    columns = [column.name for column in table.columns]
+    row = {column: None for column in columns}
+    row.update(
+        {
+            "source_id": "source_a",
+            "resource_id": "loc-1",
+            "resource_url": "https://example.test/fhir/Location/loc-1",
+            "telecom": [{"system": "phone", "value": "555\x001212"}],
+            "last_seen_run_id": "run_1",
+        }
+    )
+
+    written = await importer._copy_upsert_rows(  # pylint: disable=protected-access
+        ProviderDirectoryLocation,
+        [row],
+        columns,
+        ["source_id", "resource_id"],
+        skip_unchanged=True,
+    )
+
+    assert written == 1
+    assert conn.driver.calls[0]["table"] == "pd_stage_test"
+    assert conn.driver.calls[0]["columns"] == columns
+    copied = conn.driver.calls[0]["records"][0]
+    assert json.loads(copied[columns.index("telecom")]) == [{"system": "phone", "value": "5551212"}]
+    assert "CREATE TEMP TABLE \"pd_stage_test\"" in conn.statements[0]
+    assert 'ANALYZE "pd_stage_test"' in conn.statements[1]
+    assert 'FROM "pd_stage_test" AS stage_row' in conn.statements[2]
+    assert 'LEFT JOIN "mrf"."provider_directory_location" AS target_row' in conn.statements[2]
+    assert 'target_row."source_id" IS NULL' in conn.statements[2]
+    assert 'ON CONFLICT ("source_id", "resource_id") DO UPDATE SET' in conn.statements[2]
+
+    where_sql = importer._copy_upsert_changed_where_sql(  # pylint: disable=protected-access
+        table,
+        columns,
+        ["source_id", "resource_id"],
+    )
+    assert '"provider_directory_location"."telecom"::jsonb IS DISTINCT FROM EXCLUDED."telecom"::jsonb' in where_sql
+    assert "last_seen_run_id" not in where_sql
+    assert "observed_at" not in where_sql
+    assert "updated_at" not in where_sql
+
+
+@pytest.mark.asyncio
+async def test_copy_mark_resource_rows_seen_uses_distinct_stage_merge(monkeypatch):
+    conn = _FakeAcquireConnection()
+    monkeypatch.setattr(importer.db, "acquire", lambda: _FakeAcquire(conn))
+    monkeypatch.setattr(importer, "_stage_table_name", lambda: "pd_seen_test")
+
+    written = await importer._copy_mark_resource_rows_seen(  # pylint: disable=protected-access
+        "Location",
+        [("source_a", "loc-1"), ("source_a", "loc-1"), ("source_a", "loc-2")],
+        "run_1",
+    )
+
+    assert written == 3
+    assert conn.driver.calls[0]["table"] == "pd_seen_test"
+    assert conn.driver.calls[0]["columns"] == ["run_id", "resource_type", "source_id", "resource_id"]
+    assert conn.driver.calls[0]["records"][0] == ("run_1", "Location", "source_a", "loc-1")
+    assert "CREATE TEMP TABLE \"pd_seen_test\"" in conn.statements[0]
+    assert "SELECT DISTINCT" in conn.statements[1]
+    assert "ON CONFLICT (run_id, resource_type, source_id, resource_id) DO NOTHING" in conn.statements[1]
+
+
+@pytest.mark.asyncio
+async def test_copy_mark_resource_rows_seen_appends_to_run_stage_without_indexed_merge(monkeypatch):
+    conn = _FakeAcquireConnection()
+    monkeypatch.setattr(importer.db, "acquire", lambda: _FakeAcquire(conn))
+
+    written = await importer._copy_mark_resource_rows_seen(  # pylint: disable=protected-access
+        "Location",
+        [("source_a", "loc-1"), ("source_a", "loc-2")],
+        "run_1",
+        seen_table="provider_directory_import_seen_stage_test",
+    )
+
+    assert written == 2
+    assert conn.driver.calls == [
+        {
+            "table": "provider_directory_import_seen_stage_test",
+            "schema_name": "mrf",
+            "columns": ["run_id", "resource_type", "source_id", "resource_id"],
+            "records": [
+                ("run_1", "Location", "source_a", "loc-1"),
+                ("run_1", "Location", "source_a", "loc-2"),
+            ],
+        }
+    ]
+    assert conn.statements == []
+
+
+@pytest.mark.asyncio
+async def test_ensure_provider_directory_seen_table_drops_redundant_prefix_index(monkeypatch):
+    statements: list[str] = []
+
+    async def fake_status(sql, **_params):
+        statements.append(sql)
+        return 0
+
+    monkeypatch.setattr(importer.db, "status", fake_status)
+
+    await importer._ensure_provider_directory_import_seen_table("mrf")  # pylint: disable=protected-access
+
+    combined = "\n".join(statements)
+    assert 'CREATE UNLOGGED TABLE IF NOT EXISTS "mrf"."provider_directory_import_seen"' in combined
+    assert 'DROP INDEX IF EXISTS "mrf"."provider_directory_import_seen_source_idx"' in combined
+    assert "CREATE INDEX IF NOT EXISTS provider_directory_import_seen_source_idx" not in combined
 
 
 def test_resource_start_url_prefers_endpoint_and_preserves_existing_count():
@@ -1762,6 +2039,7 @@ async def test_import_resources_fetches_duplicate_base_once_and_fans_out_rows(mo
 
 
 def test_selected_resources_rejects_unknown_resource():
+    assert "Endpoint" in importer._selected_resources(None)  # pylint: disable=protected-access
     assert importer._selected_resources("InsurancePlan,Location") == ["InsurancePlan", "Location"]  # pylint: disable=protected-access
     with pytest.raises(ValueError, match="Unsupported Provider Directory FHIR resources"):
         importer._selected_resources("InsurancePlan,Patient")  # pylint: disable=protected-access
@@ -1777,6 +2055,8 @@ def test_harness_fixture_case_and_report_rendering(tmp_path):
     harness.write_report(report, tmp_path)
 
     assert result.status == "succeeded"
+    assert result.metrics["supported_resources"] == ["Endpoint", "InsurancePlan", "PractitionerRole"]
+    assert result.metrics["resource_counts"]["provider_directory_endpoint"] == 1
     assert (tmp_path / "report.json").exists()
     assert (tmp_path / "report.md").exists()
     assert json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))["overall_status"] == "succeeded"

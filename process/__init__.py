@@ -1321,10 +1321,13 @@ def pharmacy_economics(test: bool):
 )
 @click.option(
     "--refresh-mode",
-    type=click.Choice(["full", "ptg-partial"], case_sensitive=False),
+    type=click.Choice(["full", "ptg-partial", "provider-directory-partial"], case_sensitive=False),
     default="full",
     show_default=True,
-    help="full rebuilds all sources; ptg-partial reuses live rows while refreshing one PTG source.",
+    help=(
+        "full rebuilds all sources; ptg-partial refreshes one PTG source; "
+        "provider-directory-partial patches Provider Directory serving rows."
+    ),
 )
 @click.option("--ptg-source-key", help="PTG source key to refresh when --refresh-mode=ptg-partial.")
 @click.option(

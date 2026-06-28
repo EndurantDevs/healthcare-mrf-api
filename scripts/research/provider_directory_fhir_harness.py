@@ -89,6 +89,21 @@ def _fixture_resources() -> list[dict[str, Any]]:
             "organization": {"reference": "Organization/org-1"},
             "location": [{"reference": "Location/loc-1"}],
             "insurancePlan": [{"reference": "InsurancePlan/plan-1"}],
+            "endpoint": [{"reference": "Endpoint/endpoint-1"}],
+        },
+        {
+            "resourceType": "Endpoint",
+            "id": "endpoint-1",
+            "status": "active",
+            "connectionType": {
+                "system": "http://terminology.hl7.org/CodeSystem/endpoint-connection-type",
+                "code": "hl7-fhir-rest",
+                "display": "HL7 FHIR",
+            },
+            "name": "Fixture Provider Directory Endpoint",
+            "address": "https://fixture.example/fhir",
+            "payloadType": [{"coding": [{"system": "http://hl7.org/fhir/resource-types", "code": "Practitioner"}]}],
+            "payloadMimeType": ["application/fhir+json"],
         },
     ]
 
@@ -109,6 +124,7 @@ def _run_fixture_case() -> CaseResult:
                         "resource": [
                             {"type": "InsurancePlan", "searchParam": [{"name": "name"}]},
                             {"type": "PractitionerRole", "searchParam": [{"name": "practitioner"}]},
+                            {"type": "Endpoint", "searchParam": [{"name": "connection-type"}]},
                         ]
                     }
                 ],
@@ -119,7 +135,7 @@ def _run_fixture_case() -> CaseResult:
         resource_counts: dict[str, int] = {}
         for model, _row in (item for item in parsed if item):
             resource_counts[model.__tablename__] = resource_counts.get(model.__tablename__, 0) + 1
-        status = "succeeded" if capability["fhir_version"] == "4.0.1" and len(parsed) == 4 else "failed"
+        status = "succeeded" if capability["fhir_version"] == "4.0.1" and len(parsed) == 5 else "failed"
         return CaseResult(
             case_id="fixture-parser",
             kind="fixture",
@@ -203,6 +219,10 @@ def _run_cli_case(case_id: str, args: argparse.Namespace) -> CaseResult:
             command.extend(["--stream-batch-size", str(args.stream_batch_size)])
         if args.source_concurrency is not None:
             command.extend(["--source-concurrency", str(args.source_concurrency)])
+        if args.publish_artifacts is True:
+            command.append("--publish-artifacts")
+        elif args.publish_artifacts is False:
+            command.append("--no-publish-artifacts")
         if args.resources:
             command.extend(["--resources", args.resources])
         if args.include_credentialed:
@@ -256,6 +276,8 @@ def _run_control_case(case_id: str, args: argparse.Namespace) -> CaseResult:
     }
     if args.stale_cleanup is not None:
         payload["params"]["stale_cleanup"] = args.stale_cleanup
+    if args.publish_artifacts is not None:
+        payload["params"]["publish_artifacts"] = args.publish_artifacts
     for key in ("resource_limit", "linked_resource_limit", "page_limit", "page_count", "stream_batch_size", "source_concurrency"):
         value = getattr(args, key)
         if value is not None:
@@ -365,6 +387,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     stale_group.add_argument("--stale-cleanup", dest="stale_cleanup", action="store_true", help="Explicitly enable stale-row cleanup.")
     stale_group.add_argument("--no-stale-cleanup", dest="stale_cleanup", action="store_false", help="Explicitly disable stale-row cleanup.")
     parser.set_defaults(stale_cleanup=None)
+    publish_group = parser.add_mutually_exclusive_group()
+    publish_group.add_argument("--publish-artifacts", dest="publish_artifacts", action="store_true", help="Refresh derived Provider Directory address/search artifacts.")
+    publish_group.add_argument("--no-publish-artifacts", dest="publish_artifacts", action="store_false", help="Skip derived Provider Directory artifact refresh.")
+    parser.set_defaults(publish_artifacts=None)
     parser.add_argument("--include-credentialed", action="store_true", help="Local CLI: include sources not marked open/none.")
     parser.add_argument("--resources", help="Comma-separated resource list for local CLI imports.")
     parser.add_argument("--resource-limit", type=int, default=None, help="Rows per source/resource; 0 means unbounded.")

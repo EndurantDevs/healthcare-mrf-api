@@ -34,6 +34,7 @@ valid CapabilityStatement, that resolved base is persisted back to
 - `provider_directory_practitioner_role`
 - `provider_directory_healthcare_service`
 - `provider_directory_organization_affiliation`
+- `provider_directory_endpoint`
 
 Provider, plan, network, and location references are retained as raw FHIR
 references first. Address canonical linkage can be filled later through
@@ -49,7 +50,7 @@ should treat them as PTG network proof only after emitting concrete
 
 Provider Directory FHIR can upgrade PTG addresses from NPPES-only inference to
 payer-directory corroboration. The helper
-`provider_directory_ptg_address_corroboration_sql()` builds the view
+`provider_directory_ptg_address_corroboration_sql()` builds the query shape for
 `ptg_provider_directory_address_corroboration`, which matches:
 
 - `ptg_address.npi` to `provider_directory_practitioner.npi` or
@@ -57,7 +58,14 @@ payer-directory corroboration. The helper
 - FHIR roles/affiliations to referenced FHIR locations; and
 - FHIR `provider_directory_location.address_key` to PTG `ptg_address.address_key`.
 
-Rows in this view are Provider Directory evidence, not direct TiC location
+The importer publishes `ptg_provider_directory_address_corroboration` as an
+unlogged table during artifact publishing. This pays the expensive FHIR/PTG join
+once after a full import, adds lookup indexes for serving and audit checks, and
+keeps API-side PTG address overlay fast. The disposable smoke helper can still
+build the same relation as a view for small fixture schemas, but normal dev and
+scheduled imports should use the table-backed publisher.
+
+Rows in this relation are Provider Directory evidence, not direct TiC location
 evidence. Address-only rows remain public
 `address_verification.address_network_binding=inferred_from_provider_identity`
 with `address_verification.address_evidence_level=provider_directory_address`,
@@ -95,7 +103,7 @@ python main.py start provider-directory-fhir \
   --resource-limit 0 \
   --page-limit 0 \
   --page-count 100 \
-  --stream-batch-size 1000 \
+  --stream-batch-size 5000 \
   --source-concurrency 4 \
   --publish-artifacts \
   --stale-cleanup \
@@ -122,9 +130,24 @@ that directory once and fans out persisted rows under each source id, preserving
 catalog/source provenance without doubling upstream API traffic. When
 role/affiliation rows reference resources outside the fetched page slice,
 `linked_resource_limit` bounds optional direct FHIR reads for those referenced
-Practitioners, Organizations, Locations, HealthcareServices, and InsurancePlans.
-A value of `0` disables that linked fallback; full refresh normally relies on
-the direct resource collections.
+Practitioners, Organizations, Locations, HealthcareServices, InsurancePlans, and
+Endpoints. A value of `0` disables that linked fallback; full refresh normally
+relies on the direct resource collections.
+
+Large resource batches use PostgreSQL `COPY` into temporary staging tables
+before merging into the Provider Directory tables. Disable that path with
+`HLTHPRT_PROVIDER_DIRECTORY_COPY_UPSERT=0` only for debugging. Tune the minimum
+batch size with `HLTHPRT_PROVIDER_DIRECTORY_COPY_UPSERT_MIN_ROWS` (default
+`100`). If the active driver cannot use `copy_records_to_table`, the importer
+logs a short fallback message and continues with the values-based upsert path.
+
+Full-refresh stale cleanup also uses an append-only unlogged seen stage by
+default (`HLTHPRT_PROVIDER_DIRECTORY_SEEN_STAGE=1`). During fetch, resource ids
+are copied into the run stage without a primary-key/index maintenance cost. When
+all source groups finish, the importer builds one lookup index, deletes stale
+rows for completed source/resource scans, and drops the stage table. Set
+`HLTHPRT_PROVIDER_DIRECTORY_SEEN_STAGE=0` to fall back to the persistent keyed
+`provider_directory_import_seen` table for debugging.
 
 Stale cleanup is conservative. The importer deletes rows missing from the
 current run only for a source/resource pair whose pagination completed without
@@ -133,8 +156,10 @@ sample scans can upsert fresh rows but cannot delete rows for incomplete
 resource scans.
 
 Artifact publishing is meant for full default-resource refreshes. It stamps
-`provider_directory_location.address_key` and republishes the PTG corroboration
-view used by serving/search. The CLI defaults `--publish-artifacts` on only
+`provider_directory_location.address_key`, publishes Provider Directory location
+rows into the shared address archive, and republishes the table-backed PTG
+corroboration relation used by serving/search. The CLI defaults
+`--publish-artifacts` on only
 when the selected resources equal the full Provider Directory resource set.
 Small payer or single-resource smoke runs should pass `--no-publish-artifacts`
 or `publish_artifacts=false`; otherwise a bounded test can spend most of its
@@ -243,7 +268,8 @@ HLTHPRT_TEST_DATABASE_SUFFIX=_test \
   --include-credentialed \
   --resource-limit 10 \
   --linked-resource-limit 25 \
-  --page-limit 1
+  --page-limit 1 \
+  --no-publish-artifacts
 ```
 
 Reports are written to:
@@ -268,12 +294,21 @@ network refs:
   --format markdown
 ```
 
-In dev Kubernetes, stream the script into the healthcare pod so it uses the
-deployed DB connection secrets without printing them:
+In dev Kubernetes, stream a pod-safe source/resource audit into the healthcare
+pod so it uses the deployed DB connection secrets without printing them. Keep
+the heavier unified-address, PTG, and network-resolution sections disabled in
+the API pod; run the full audit from the dev host or a dedicated worker context.
 
 ```bash
 sudo k3s kubectl -n healthporta-dev exec -i deploy/healthcare-mrf-api -- \
   /opt/venv/bin/python - --schema mrf --format markdown \
+  --statement-timeout-ms 30000 \
+  --skip-unified \
+  --skip-ptg \
+  --skip-network-resolution \
+  --skip-top-source-yield \
+  --skip-advertised-resource-gaps \
+  --skip-valid-zero-row-sources \
   < scripts/research/provider_directory_coverage_audit.py
 ```
 
@@ -287,6 +322,10 @@ signals:
   Known onboarding gateway hosts, such as Availity and Centene partner
   portals, are treated the same way when they return non-FHIR HTML without an
   applied credential.
+- `valid_non_fhir` should be read together with the audit's
+  `non-FHIR credential/gateway responses` line. If nearly all `valid_non_fhir`
+  rows are credential/gateway responses, the next coverage work is credential
+  onboarding rather than broad source URL discovery.
 - `valid_non_fhir` sources should be reviewed as source-catalog cleanup or
   payer-specific endpoint discovery work.
 - Provider Directory rows without `address_key` are not usable for canonical
@@ -302,13 +341,14 @@ signals:
 `import-control` defines `default-provider-directory-fhir-daily` at `20 1 * * *`
 America/Chicago. The default parameters probe the full seed catalog, run a full
 open-access resource refresh (`resource_limit=0`, `page_limit=0`,
-`page_count=100`, `stream_batch_size=1000`, `source_concurrency=4`,
+`page_count=100`, `stream_batch_size=5000`, `source_concurrency=4`,
 `publish_artifacts=true`), and delete stale rows only for completed
 source/resource scans.
 
 `import-control` also defines
 `default-entity-address-unified-provider-directory-daily` at `20 2 * * *`
 America/Chicago. It runs `entity-address-unified` with
-`serving_only_refresh=true` so Provider Directory FHIR rows become visible in
-provider/address search without waiting for the heavier monthly full support
-table rebuild.
+`refresh_mode=provider-directory-partial`, `serving_only_refresh=true`, and
+`publish=true` so Provider Directory FHIR rows become visible in
+provider/address search without rebuilding unchanged serving rows or the
+heavier monthly support/provenance tables.

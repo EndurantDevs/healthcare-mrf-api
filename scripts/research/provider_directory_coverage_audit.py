@@ -40,7 +40,25 @@ PROVIDER_DIRECTORY_RESOURCE_TABLES = (
     "provider_directory_practitioner_role",
     "provider_directory_healthcare_service",
     "provider_directory_organization_affiliation",
+    "provider_directory_endpoint",
 )
+PROVIDER_DIRECTORY_RESOURCE_TABLE_BY_TYPE = {
+    "InsurancePlan": "provider_directory_insurance_plan",
+    "Practitioner": "provider_directory_practitioner",
+    "Organization": "provider_directory_organization",
+    "Location": "provider_directory_location",
+    "PractitionerRole": "provider_directory_practitioner_role",
+    "HealthcareService": "provider_directory_healthcare_service",
+    "OrganizationAffiliation": "provider_directory_organization_affiliation",
+    "Endpoint": "provider_directory_endpoint",
+}
+FHIR_ONBOARDING_GATEWAY_HOSTS = frozenset(
+    {
+        "apps.availity.com",
+        "partners.centene.com",
+    }
+)
+FHIR_CREDENTIAL_AUTH_MARKERS = ("oauth", "api key", "bearer", "token", "client credential")
 
 
 def _env_int(name: str, default: int) -> int:
@@ -61,6 +79,14 @@ def _q(identifier: str) -> str:
 
 def _qt(schema: str, table: str) -> str:
     return f"{_q(schema)}.{_q(table)}"
+
+
+def _sql_string_literal(value: str) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _sql_string_array(values: list[str] | tuple[str, ...] | frozenset[str]) -> str:
+    return "ARRAY[" + ", ".join(_sql_string_literal(value) for value in sorted(values)) + "]::varchar[]"
 
 
 def _sql_ref_matches_resource(ref_expr: str, resource_type: str, resource_id_expr: str) -> str:
@@ -91,14 +117,29 @@ def _json_object(value: Any) -> dict[str, Any]:
     return {}
 
 
+def _list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
+
+
+def _markdown_cell(value: Any) -> str:
+    return str(value if value is not None else "").replace("\n", " ").replace("|", "\\|")
+
+
+def _network_name_key_sql(expr: str) -> str:
+    return f"regexp_replace(lower(coalesce({expr}, '')), '[^a-z0-9]+', '', 'g')"
+
+
 async def _connect(args: argparse.Namespace) -> asyncpg.Connection:
-    return await asyncpg.connect(
+    conn = await asyncpg.connect(
         host=args.host,
         port=args.port,
         user=args.user,
         password=args.password,
         database=args.database,
     )
+    if args.statement_timeout_ms:
+        await conn.execute("SELECT set_config('statement_timeout', $1, false)", str(args.statement_timeout_ms))
+    return conn
 
 
 async def _relation_exists(conn: asyncpg.Connection, schema: str, name: str) -> bool:
@@ -121,6 +162,27 @@ async def _relation_exists(conn: asyncpg.Connection, schema: str, name: str) -> 
             name,
         )
     )
+
+
+async def _relation_kind(conn: asyncpg.Connection, schema: str, name: str) -> str | None:
+    value = await conn.fetchval(
+        """
+        SELECT CASE cls.relkind
+                   WHEN 'r' THEN 'table'
+                   WHEN 'p' THEN 'partitioned_table'
+                   WHEN 'v' THEN 'view'
+                   WHEN 'm' THEN 'materialized_view'
+                   ELSE cls.relkind::text
+               END AS relation_kind
+          FROM pg_class cls
+          JOIN pg_namespace ns ON ns.oid = cls.relnamespace
+         WHERE ns.nspname = $1
+           AND cls.relname = $2
+        """,
+        schema,
+        name,
+    )
+    return str(value) if value else None
 
 
 async def _column_exists(conn: asyncpg.Connection, schema: str, table: str, column: str) -> bool:
@@ -150,21 +212,45 @@ async def _fetch_mapping(conn: asyncpg.Connection, sql: str, *args: Any) -> dict
 async def _source_summary(conn: asyncpg.Connection, schema: str) -> dict[str, Any]:
     if not await _relation_exists(conn, schema, "provider_directory_source"):
         return {"available": False}
+    gateway_hosts = _sql_string_array(FHIR_ONBOARDING_GATEWAY_HOSTS)
+    credential_markers = _sql_string_array(FHIR_CREDENTIAL_AUTH_MARKERS)
     row = await _fetch_mapping(
         conn,
         f"""
+        WITH src AS (
+            SELECT *,
+                   split_part(
+                       regexp_replace(coalesce(canonical_api_base, api_base, portal_url, ''), '^https?://', ''),
+                       '/',
+                       1
+                   ) AS source_host,
+                   lower(coalesce(auth_type, '')) AS auth_type_norm
+              FROM {_qt(schema, "provider_directory_source")}
+        )
         SELECT
             count(*)::bigint AS source_count,
             count(*) FILTER (WHERE canonical_api_base IS NOT NULL)::bigint AS api_base_count,
             count(*) FILTER (WHERE last_probe_status = 'valid')::bigint AS live_valid_count,
             count(*) FILTER (WHERE last_probe_status = 'auth_required')::bigint AS live_auth_required_count,
+            count(*) FILTER (WHERE last_probe_status = 'valid_non_fhir')::bigint AS live_valid_non_fhir_count,
+            count(*) FILTER (
+                WHERE last_probe_status = 'valid_non_fhir'
+                  AND (
+                      source_host = ANY({gateway_hosts})
+                      OR EXISTS (
+                          SELECT 1
+                            FROM unnest({credential_markers}) AS marker(value)
+                           WHERE auth_type_norm LIKE '%' || marker.value || '%'
+                      )
+                  )
+            )::bigint AS live_credential_or_gateway_non_fhir_count,
             count(*) FILTER (WHERE last_probe_status IS NULL)::bigint AS never_probed_count,
             count(*) FILTER (WHERE auth_type IN ('open', 'none', '') OR auth_type IS NULL)::bigint AS open_or_none_auth_count,
             count(*) FILTER (WHERE is_medicare_advantage IS TRUE)::bigint AS medicare_advantage_count,
             count(*) FILTER (WHERE is_medicaid_mco IS TRUE)::bigint AS medicaid_mco_count,
             count(*) FILTER (WHERE is_qhp IS TRUE)::bigint AS qhp_count,
             max(last_probed_at) AS last_probed_at
-          FROM {_qt(schema, "provider_directory_source")}
+          FROM src
         """,
     )
     source_count = _int(row.get("source_count"))
@@ -172,7 +258,102 @@ async def _source_summary(conn: asyncpg.Connection, schema: str) -> dict[str, An
     row["api_base_pct"] = _pct(_int(row.get("api_base_count")), source_count)
     row["live_valid_pct"] = _pct(_int(row.get("live_valid_count")), source_count)
     row["auth_required_pct"] = _pct(_int(row.get("live_auth_required_count")), source_count)
+    row["valid_non_fhir_pct"] = _pct(_int(row.get("live_valid_non_fhir_count")), source_count)
     return row
+
+
+async def _credential_onboarding_backlog(
+    conn: asyncpg.Connection,
+    schema: str,
+    *,
+    sample_limit: int,
+) -> dict[str, Any]:
+    if not await _relation_exists(conn, schema, "provider_directory_source"):
+        return {"available": False, "blocked_source_count": 0, "groups": []}
+    gateway_hosts = _sql_string_array(FHIR_ONBOARDING_GATEWAY_HOSTS)
+    credential_markers = _sql_string_array(FHIR_CREDENTIAL_AUTH_MARKERS)
+    rows = await conn.fetch(
+        f"""
+        WITH src AS (
+            SELECT source_id,
+                   org_name,
+                   plan_name,
+                   canonical_api_base,
+                   api_base,
+                   portal_url,
+                   last_probe_status,
+                   coalesce(NULLIF(auth_type, ''), '') AS auth_type,
+                   lower(coalesce(auth_type, '')) AS auth_type_norm,
+                   split_part(
+                       regexp_replace(coalesce(canonical_api_base, api_base, portal_url, ''), '^https?://', ''),
+                       '/',
+                       1
+                   ) AS source_host
+              FROM {_qt(schema, "provider_directory_source")}
+        ),
+        blocked AS (
+            SELECT *,
+                   CASE
+                       WHEN last_probe_status = 'auth_required' THEN 'auth_required'
+                       WHEN last_probe_status = 'valid_non_fhir'
+                            AND source_host = ANY({gateway_hosts})
+                           THEN 'onboarding_gateway'
+                       WHEN last_probe_status = 'valid_non_fhir'
+                            AND EXISTS (
+                                SELECT 1
+                                  FROM unnest({credential_markers}) AS marker(value)
+                                 WHERE auth_type_norm LIKE '%' || marker.value || '%'
+                            )
+                           THEN 'credentialed_non_fhir'
+                       ELSE 'unknown'
+                   END AS reason
+              FROM src
+             WHERE last_probe_status = 'auth_required'
+                OR (
+                    last_probe_status = 'valid_non_fhir'
+                    AND (
+                        source_host = ANY({gateway_hosts})
+                        OR EXISTS (
+                            SELECT 1
+                              FROM unnest({credential_markers}) AS marker(value)
+                             WHERE auth_type_norm LIKE '%' || marker.value || '%'
+                        )
+                    )
+                )
+        ),
+        ranked AS (
+            SELECT *,
+                   row_number() OVER (
+                       PARTITION BY source_host, last_probe_status, auth_type, reason
+                       ORDER BY lower(org_name), lower(coalesce(plan_name, '')), source_id
+                   ) AS sample_rank
+              FROM blocked
+        )
+        SELECT coalesce(NULLIF(source_host, ''), '(missing host)') AS source_host,
+               last_probe_status AS probe_status,
+               auth_type,
+               reason,
+               count(*)::bigint AS source_count,
+               array_agg(
+                   concat_ws(' / ', org_name, NULLIF(plan_name, ''))
+                   ORDER BY lower(org_name), lower(coalesce(plan_name, '')), source_id
+               ) FILTER (WHERE sample_rank <= $1)::varchar[] AS sample_payers
+          FROM ranked
+         GROUP BY source_host, last_probe_status, auth_type, reason
+         ORDER BY count(*) DESC, source_host, last_probe_status, auth_type, reason
+         LIMIT 50
+        """,
+        sample_limit,
+    )
+    groups = [dict(row) for row in rows]
+    for group in groups:
+        group["sample_payers"] = _list(group.get("sample_payers"))
+    return {
+        "available": True,
+        "blocked_source_count": sum(_int(group.get("source_count")) for group in groups),
+        "group_count": len(groups),
+        "groups": groups,
+    }
 
 
 async def _capability_status_counts(conn: asyncpg.Connection, schema: str) -> list[dict[str, Any]]:
@@ -271,7 +452,16 @@ async def _unified_summary(conn: asyncpg.Connection, schema: str) -> dict[str, A
     return row
 
 
-async def _ptg_summary(conn: asyncpg.Connection, schema: str, *, ptg_plan_id: str | None = None) -> dict[str, Any]:
+async def _ptg_summary(
+    conn: asyncpg.Connection,
+    schema: str,
+    *,
+    ptg_plan_id: str | None = None,
+    sample_limit: int,
+    skip_corroboration: bool = False,
+    skip_network_name_overlap: bool = False,
+    force_live_view_scans: bool = False,
+) -> dict[str, Any]:
     summary: dict[str, Any] = {}
     if await _relation_exists(conn, schema, "ptg_address"):
         plan_filter = (
@@ -296,7 +486,16 @@ async def _ptg_summary(conn: asyncpg.Connection, schema: str, *, ptg_plan_id: st
     else:
         summary["ptg_address"] = {"available": False}
     view = "ptg_provider_directory_address_corroboration"
-    if await _relation_exists(conn, schema, view):
+    view_kind = await _relation_kind(conn, schema, view)
+    if skip_corroboration:
+        summary["ptg_corroboration"] = _skipped_summary("disabled by --skip-ptg-corroboration")
+    elif not view_kind:
+        summary["ptg_corroboration"] = {"available": False}
+    elif view_kind == "view" and not force_live_view_scans:
+        summary["ptg_corroboration"] = _skipped_summary(
+            "corroboration relation is a live view; use --force-ptg-live-view-scans for exact aggregate"
+        )
+    else:
         plan_filter = "WHERE ($1::varchar IS NULL OR plan_id = $1 OR ptg_plan_id = $1)"
         row = await _fetch_mapping(
             conn,
@@ -319,24 +518,200 @@ async def _ptg_summary(conn: asyncpg.Connection, schema: str, *, ptg_plan_id: st
             ptg_plan_id,
         )
         summary["ptg_corroboration"] = {"available": True, **row}
-    else:
-        summary["ptg_corroboration"] = {"available": False}
+    summary["ptg_network_name_overlap"] = (
+        _skipped_summary("disabled by --skip-ptg-network-overlap", samples=[])
+        if skip_network_name_overlap
+        else await _ptg_network_name_overlap_summary(
+            conn,
+            schema,
+            ptg_plan_id=ptg_plan_id,
+            sample_limit=sample_limit,
+            force_live_view_scans=force_live_view_scans,
+        )
+    )
     return summary
+
+
+def _skipped_summary(reason: str, **extra: Any) -> dict[str, Any]:
+    return {"available": False, "skipped": True, "reason": reason, **extra}
 
 
 def _skipped_ptg_summary() -> dict[str, Any]:
     return {
-        "ptg_address": {
-            "available": False,
-            "skipped": True,
-            "reason": "disabled by --skip-ptg",
-        },
-        "ptg_corroboration": {
-            "available": False,
-            "skipped": True,
-            "reason": "disabled by --skip-ptg",
-        },
+        "ptg_address": _skipped_summary("disabled by --skip-ptg"),
+        "ptg_corroboration": _skipped_summary("disabled by --skip-ptg"),
+        "ptg_network_name_overlap": _skipped_summary("disabled by --skip-ptg", samples=[]),
     }
+
+
+def _ptg_network_name_overlap_cte_sql(schema: str, *, ptg_plan_filter: str) -> str:
+    view = "ptg_provider_directory_address_corroboration"
+    pd_name_key = _network_name_key_sql("pd_network_name.value")
+    ptg_name_key = _network_name_key_sql("ptg_network_name.value")
+    return f"""
+        WITH provider_directory_networks AS (
+            SELECT DISTINCT
+                   corr.snapshot_id,
+                   plan_ids.plan_id,
+                   corr.provider_directory_source_id,
+                   corr.provider_directory_org_name,
+                   pd_network_name.value AS provider_directory_network_name,
+                   {pd_name_key} AS provider_directory_network_key
+              FROM {_qt(schema, view)} corr
+              CROSS JOIN LATERAL (
+                    VALUES (NULLIF(corr.plan_id, '')), (NULLIF(corr.ptg_plan_id, ''))
+              ) AS plan_ids(plan_id)
+              CROSS JOIN LATERAL unnest(
+                    COALESCE(corr.provider_directory_network_names, ARRAY[]::varchar[])
+              ) AS pd_network_name(value)
+             WHERE corr.snapshot_id IS NOT NULL
+               AND plan_ids.plan_id IS NOT NULL
+               AND NULLIF(BTRIM(pd_network_name.value), '') IS NOT NULL
+               {ptg_plan_filter}
+        ),
+        plan_pairs AS (
+            SELECT DISTINCT snapshot_id, plan_id
+              FROM provider_directory_networks
+        ),
+        ptg_networks AS (
+            SELECT DISTINCT
+                   rates.snapshot_id,
+                   rates.plan_id,
+                   ptg_network_name.value AS ptg_network_name,
+                   {ptg_name_key} AS ptg_network_key
+              FROM {_qt(schema, "ptg2_serving_rate_compact")} rates
+              JOIN plan_pairs
+                ON plan_pairs.snapshot_id = rates.snapshot_id
+               AND plan_pairs.plan_id = rates.plan_id
+              CROSS JOIN LATERAL unnest(
+                    COALESCE(rates.network_names, ARRAY[]::varchar[])
+              ) AS ptg_network_name(value)
+             WHERE NULLIF(BTRIM(ptg_network_name.value), '') IS NOT NULL
+        ),
+        pairs AS (
+            SELECT pd.snapshot_id,
+                   pd.plan_id,
+                   pd.provider_directory_source_id,
+                   pd.provider_directory_org_name,
+                   pd.provider_directory_network_name,
+                   pd.provider_directory_network_key,
+                   ptg.ptg_network_name,
+                   ptg.ptg_network_key,
+                   (
+                       pd.provider_directory_network_key <> ''
+                       AND pd.provider_directory_network_key = ptg.ptg_network_key
+                   ) AS network_name_matched
+              FROM provider_directory_networks pd
+              LEFT JOIN ptg_networks ptg
+                ON ptg.snapshot_id = pd.snapshot_id
+               AND ptg.plan_id = pd.plan_id
+        ),
+        matched AS (
+            SELECT DISTINCT
+                   snapshot_id,
+                   plan_id,
+                   provider_directory_source_id,
+                   provider_directory_network_name,
+                   provider_directory_network_key,
+                   ptg_network_name
+              FROM pairs
+             WHERE network_name_matched IS TRUE
+        )
+    """
+
+
+async def _ptg_network_name_overlap_summary(
+    conn: asyncpg.Connection,
+    schema: str,
+    *,
+    ptg_plan_id: str | None,
+    sample_limit: int,
+    force_live_view_scans: bool,
+) -> dict[str, Any]:
+    view = "ptg_provider_directory_address_corroboration"
+    view_kind = await _relation_kind(conn, schema, view)
+    if view_kind == "view" and not force_live_view_scans:
+        return _skipped_summary(
+            "corroboration relation is a live view; use --force-ptg-live-view-scans for exact overlap",
+            samples=[],
+        )
+    required = (
+        view_kind is not None
+        and await _relation_exists(conn, schema, "ptg2_serving_rate_compact")
+        and await _column_exists(conn, schema, "ptg2_serving_rate_compact", "network_names")
+    )
+    if not required:
+        return {"available": False, "samples": []}
+    ptg_plan_filter = (
+        "AND ($1::varchar IS NULL OR plan_ids.plan_id = $1)"
+        if ptg_plan_id is not None
+        else ""
+    )
+    cte_sql = _ptg_network_name_overlap_cte_sql(schema, ptg_plan_filter=ptg_plan_filter)
+    args = [ptg_plan_id] if ptg_plan_id is not None else []
+    row = await _fetch_mapping(
+        conn,
+        f"""
+        {cte_sql}
+        SELECT
+            (SELECT count(*)::bigint FROM provider_directory_networks) AS provider_directory_plan_network_names,
+            (SELECT count(*)::bigint FROM ptg_networks) AS ptg_plan_network_names,
+            (SELECT count(DISTINCT (snapshot_id, plan_id))::bigint FROM provider_directory_networks)
+                AS plan_pairs_with_provider_directory_networks,
+            (SELECT count(DISTINCT (snapshot_id, plan_id))::bigint FROM ptg_networks)
+                AS plan_pairs_with_ptg_networks,
+            (SELECT count(DISTINCT (pd.snapshot_id, pd.plan_id))::bigint
+               FROM provider_directory_networks pd
+               JOIN ptg_networks ptg
+                 ON ptg.snapshot_id = pd.snapshot_id
+                AND ptg.plan_id = pd.plan_id)
+                AS plan_pairs_with_both_network_sets,
+            (SELECT count(*)::bigint FROM matched) AS matched_plan_network_names,
+            (SELECT count(DISTINCT (snapshot_id, plan_id))::bigint FROM matched) AS matched_plan_pairs
+        """,
+        *args,
+    )
+    sample_rows = await conn.fetch(
+        f"""
+        {cte_sql}
+        SELECT provider_directory_source_id,
+               provider_directory_org_name,
+               provider_directory_network_name,
+               count(DISTINCT (snapshot_id, plan_id))::bigint AS plan_pair_count,
+               array_agg(DISTINCT ptg_network_name ORDER BY ptg_network_name)
+                   FILTER (WHERE ptg_network_name IS NOT NULL)::varchar[] AS sample_ptg_network_names
+          FROM pairs
+         WHERE provider_directory_network_key <> ''
+           AND NOT EXISTS (
+                SELECT 1
+                  FROM matched
+                 WHERE matched.snapshot_id = pairs.snapshot_id
+                   AND matched.plan_id = pairs.plan_id
+                   AND matched.provider_directory_source_id = pairs.provider_directory_source_id
+                   AND matched.provider_directory_network_key = pairs.provider_directory_network_key
+           )
+         GROUP BY provider_directory_source_id, provider_directory_org_name, provider_directory_network_name
+         ORDER BY count(DISTINCT (snapshot_id, plan_id)) DESC,
+                  provider_directory_org_name,
+                  provider_directory_network_name
+         LIMIT ${len(args) + 1}
+        """,
+        *args,
+        sample_limit,
+    )
+    row["available"] = True
+    row["provider_directory_network_match_pct"] = _pct(
+        _int(row.get("matched_plan_network_names")),
+        _int(row.get("provider_directory_plan_network_names")),
+    )
+    row["plan_pair_match_pct"] = _pct(
+        _int(row.get("matched_plan_pairs")),
+        _int(row.get("plan_pairs_with_both_network_sets")),
+    )
+    row["samples"] = [dict(item) for item in sample_rows]
+    for item in row["samples"]:
+        item["sample_ptg_network_names"] = _list(item.get("sample_ptg_network_names"))
+    return row
 
 
 async def _network_resolution_summary(conn: asyncpg.Connection, schema: str, *, sample_limit: int) -> dict[str, Any]:
@@ -448,6 +823,121 @@ async def _top_source_yield(conn: asyncpg.Connection, schema: str, *, sample_lim
     return sorted(items, key=lambda item: (-item["resource_rows"], str(item["org_name"])))[:sample_limit]
 
 
+async def _advertised_resource_gap_summary(
+    conn: asyncpg.Connection,
+    schema: str,
+    *,
+    sample_limit: int,
+) -> dict[str, Any]:
+    if not await _relation_exists(conn, schema, "provider_directory_capability"):
+        return {"available": False, "resources": []}
+    if not await _column_exists(conn, schema, "provider_directory_capability", "supported_resources"):
+        return {"available": False, "resources": []}
+    has_source_table = await _relation_exists(conn, schema, "provider_directory_source")
+    resources: list[dict[str, Any]] = []
+    for resource_type, table in PROVIDER_DIRECTORY_RESOURCE_TABLE_BY_TYPE.items():
+        row_source_sql = (
+            f"SELECT DISTINCT source_id FROM {_qt(schema, table)}"
+            if await _relation_exists(conn, schema, table)
+            else "SELECT NULL::varchar AS source_id WHERE false"
+        )
+        row = await _fetch_mapping(
+            conn,
+            f"""
+            WITH advertised AS (
+                SELECT DISTINCT source_id
+                  FROM {_qt(schema, "provider_directory_capability")} capability
+                 WHERE capability.probe_status = 'valid'
+                   AND EXISTS (
+                        SELECT 1
+                          FROM jsonb_array_elements_text(
+                              COALESCE(capability.supported_resources::jsonb, '[]'::jsonb)
+                          ) AS supported(resource_type)
+                         WHERE supported.resource_type = $1
+                   )
+            ),
+            row_sources AS ({row_source_sql})
+            SELECT
+                count(*)::bigint AS advertised_source_count,
+                count(*) FILTER (
+                    WHERE EXISTS (
+                        SELECT 1
+                          FROM row_sources rows
+                         WHERE rows.source_id = advertised.source_id
+                    )
+                )::bigint AS source_with_rows_count,
+                count(*) FILTER (
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                          FROM row_sources rows
+                         WHERE rows.source_id = advertised.source_id
+                    )
+                )::bigint AS advertised_without_rows_count
+              FROM advertised
+            """,
+            resource_type,
+        )
+        item: dict[str, Any] = {
+            "resource_type": resource_type,
+            "table": table,
+            "available": await _relation_exists(conn, schema, table),
+            **row,
+        }
+        advertised_count = _int(item.get("advertised_source_count"))
+        item["source_with_rows_pct"] = _pct(_int(item.get("source_with_rows_count")), advertised_count)
+        if _int(item.get("advertised_without_rows_count")) and has_source_table:
+            samples = await conn.fetch(
+                f"""
+                WITH advertised AS (
+                    SELECT DISTINCT source_id
+                      FROM {_qt(schema, "provider_directory_capability")} capability
+                     WHERE capability.probe_status = 'valid'
+                       AND EXISTS (
+                            SELECT 1
+                              FROM jsonb_array_elements_text(
+                                  COALESCE(capability.supported_resources::jsonb, '[]'::jsonb)
+                              ) AS supported(resource_type)
+                             WHERE supported.resource_type = $1
+                       )
+                ),
+                row_sources AS ({row_source_sql})
+                SELECT src.source_id,
+                       src.org_name,
+                       src.plan_name,
+                       src.canonical_api_base,
+                       src.auth_type,
+                       src.metadata_json->'last_resource_import' AS last_resource_import
+                  FROM advertised
+                  JOIN {_qt(schema, "provider_directory_source")} src
+                    ON src.source_id = advertised.source_id
+                 WHERE NOT EXISTS (
+                        SELECT 1
+                          FROM row_sources rows
+                         WHERE rows.source_id = advertised.source_id
+                   )
+                 ORDER BY lower(src.org_name), lower(coalesce(src.plan_name, '')), src.source_id
+                 LIMIT $2
+                """,
+                resource_type,
+                sample_limit,
+            )
+            item["samples"] = [dict(sample) for sample in samples]
+            for sample in item["samples"]:
+                sample["last_resource_import"] = _json_object(sample.get("last_resource_import"))
+        else:
+            item["samples"] = []
+        resources.append(item)
+    totals = {
+        "advertised_source_resources": sum(_int(item.get("advertised_source_count")) for item in resources),
+        "advertised_without_rows": sum(_int(item.get("advertised_without_rows_count")) for item in resources),
+    }
+    totals["advertised_with_rows_pct"] = _pct(
+        totals["advertised_source_resources"] - totals["advertised_without_rows"],
+        totals["advertised_source_resources"],
+    )
+    return {"available": True, **totals, "resources": resources}
+
+
 async def _valid_sources_without_resource_rows(
     conn: asyncpg.Connection,
     schema: str,
@@ -523,6 +1013,10 @@ def _derive_gaps(report: dict[str, Any]) -> list[str]:
             gaps.append(
                 f"{source_summary['live_auth_required_count']} Provider Directory sources require auth/registration before full import."
             )
+        if _int(source_summary.get("live_credential_or_gateway_non_fhir_count")):
+            gaps.append(
+                f"{source_summary['live_credential_or_gateway_non_fhir_count']} Provider Directory non-FHIR probe responses look like credentialed/onboarding gateway responses."
+            )
         if _int(source_summary.get("never_probed_count")):
             gaps.append(f"{source_summary['never_probed_count']} Provider Directory source(s) have not been probed.")
     capability_counts = {item["probe_status"]: _int(item["count"]) for item in report.get("capability_status_counts", [])}
@@ -556,9 +1050,28 @@ def _derive_gaps(report: dict[str, Any]) -> list[str]:
         gaps.append(
             f"{valid_zero_rows['source_count']} Provider Directory source(s) have valid unauthenticated metadata but no imported resource rows."
         )
+    advertised_gaps = report.get("advertised_resource_gap_summary") or {}
+    if advertised_gaps.get("available") and _int(advertised_gaps.get("advertised_without_rows")):
+        missing = [
+            f"{item['resource_type']}={item['advertised_without_rows_count']}"
+            for item in advertised_gaps.get("resources", [])
+            if _int(item.get("advertised_without_rows_count"))
+        ]
+        gaps.append(
+            "Provider Directory advertised-resource imports have supported sources with zero rows: "
+            + ", ".join(missing)
+            + "."
+        )
     ptg = (report.get("ptg_summary") or {}).get("ptg_corroboration") or {}
     if ptg.get("available") and _int(ptg.get("network_context_rows")) and not _int(ptg.get("resolved_network_match_rows")):
         gaps.append("PTG-overlap Provider Directory rows carry network refs, but none currently resolve to network-name matches.")
+    ptg_network = (report.get("ptg_summary") or {}).get("ptg_network_name_overlap") or {}
+    if (
+        ptg_network.get("available")
+        and _int(ptg_network.get("provider_directory_plan_network_names"))
+        and not _int(ptg_network.get("matched_plan_network_names"))
+    ):
+        gaps.append("Provider Directory network names are present for PTG plan pairs, but none match PTG serving network_names.")
     ptg_plan_filter = report.get("ptg_plan_filter")
     if ptg_plan_filter:
         ptg_address = (report.get("ptg_summary") or {}).get("ptg_address") or {}
@@ -590,20 +1103,60 @@ async def build_report(args: argparse.Namespace) -> dict[str, Any]:
             "schema": schema,
             "ptg_plan_filter": args.ptg_plan_id or None,
             "source_summary": await _source_summary(conn, schema),
-            "capability_status_counts": await _capability_status_counts(conn, schema),
-            "resource_summary": await _resource_summary(conn, schema),
-            "unified_summary": await _unified_summary(conn, schema),
-            "ptg_summary": (
-                _skipped_ptg_summary()
-                if args.skip_ptg
-                else await _ptg_summary(conn, schema, ptg_plan_id=args.ptg_plan_id or None)
-            ),
-            "network_resolution_summary": network_resolution_summary,
-            "top_source_yield": await _top_source_yield(conn, schema, sample_limit=args.sample_limit),
-            "valid_sources_without_resource_rows": await _valid_sources_without_resource_rows(
+            "credential_onboarding_backlog": await _credential_onboarding_backlog(
                 conn,
                 schema,
                 sample_limit=args.sample_limit,
+            ),
+            "capability_status_counts": await _capability_status_counts(conn, schema),
+            "resource_summary": await _resource_summary(conn, schema),
+            "unified_summary": (
+                {"available": False, "skipped": True, "reason": "disabled by --skip-unified"}
+                if args.skip_unified
+                else await _unified_summary(conn, schema)
+            ),
+            "ptg_summary": (
+                _skipped_ptg_summary()
+                if args.skip_ptg
+                else await _ptg_summary(
+                    conn,
+                    schema,
+                    ptg_plan_id=args.ptg_plan_id or None,
+                    sample_limit=args.sample_limit,
+                    skip_corroboration=args.skip_ptg_corroboration,
+                    skip_network_name_overlap=args.skip_ptg_network_overlap,
+                    force_live_view_scans=args.force_ptg_live_view_scans,
+                )
+            ),
+            "network_resolution_summary": network_resolution_summary,
+            "top_source_yield": (
+                []
+                if args.skip_top_source_yield
+                else await _top_source_yield(conn, schema, sample_limit=args.sample_limit)
+            ),
+            "advertised_resource_gap_summary": (
+                {"available": False, "skipped": True, "reason": "disabled by --skip-advertised-resource-gaps"}
+                if args.skip_advertised_resource_gaps
+                else await _advertised_resource_gap_summary(
+                    conn,
+                    schema,
+                    sample_limit=args.sample_limit,
+                )
+            ),
+            "valid_sources_without_resource_rows": (
+                {
+                    "available": False,
+                    "source_count": 0,
+                    "samples": [],
+                    "skipped": True,
+                    "reason": "disabled by --skip-valid-zero-row-sources",
+                }
+                if args.skip_valid_zero_row_sources
+                else await _valid_sources_without_resource_rows(
+                    conn,
+                    schema,
+                    sample_limit=args.sample_limit,
+                )
             ),
         }
         report["gaps"] = _derive_gaps(report)
@@ -617,6 +1170,7 @@ def render_markdown(report: dict[str, Any]) -> str:
     unified = report.get("unified_summary") or {}
     network = report.get("network_resolution_summary") or {}
     ptg = report.get("ptg_summary") or {}
+    credential_backlog = report.get("credential_onboarding_backlog") or {}
     lines = [
         "# Provider Directory Coverage Audit",
         "",
@@ -633,8 +1187,13 @@ def render_markdown(report: dict[str, Any]) -> str:
                 f"- sources: `{source.get('source_count')}`",
                 f"- live-valid sources: `{source.get('live_valid_count')}` ({source.get('live_valid_pct')}%)",
                 f"- auth-required sources: `{source.get('live_auth_required_count')}` ({source.get('auth_required_pct')}%)",
+                f"- non-FHIR credential/gateway responses: `{source.get('live_credential_or_gateway_non_fhir_count')}` / `{source.get('live_valid_non_fhir_count')}` valid_non_fhir",
                 f"- sources with API base: `{source.get('api_base_count')}` ({source.get('api_base_pct')}%)",
             ]
+        )
+    if credential_backlog.get("available"):
+        lines.append(
+            f"- credential/onboarding backlog: `{credential_backlog.get('blocked_source_count')}` source(s) across `{credential_backlog.get('group_count')}` group(s)"
         )
     if unified.get("available"):
         lines.extend(
@@ -646,7 +1205,10 @@ def render_markdown(report: dict[str, Any]) -> str:
                 f"- Provider Directory rows with country `001`: `{unified.get('provider_directory_country_001_rows')}`",
             ]
         )
+    elif unified.get("skipped"):
+        lines.append(f"- unified Provider Directory rows: skipped ({unified.get('reason')})")
     ptg_corr = ptg.get("ptg_corroboration") or {}
+    ptg_network = ptg.get("ptg_network_name_overlap") or {}
     if ptg_corr.get("available"):
         lines.extend(
             [
@@ -657,10 +1219,29 @@ def render_markdown(report: dict[str, Any]) -> str:
         )
     elif ptg_corr.get("skipped"):
         lines.append(f"- PTG corroboration: skipped ({ptg_corr.get('reason')})")
+    if ptg_network.get("available"):
+        lines.append(
+            f"- PTG/FHIR network-name overlap: `{ptg_network.get('matched_plan_network_names')}` / `{ptg_network.get('provider_directory_plan_network_names')}` "
+            f"provider-directory plan-network names ({ptg_network.get('provider_directory_network_match_pct')}%); "
+            f"matched plan pairs `{ptg_network.get('matched_plan_pairs')}` / `{ptg_network.get('plan_pairs_with_both_network_sets')}` "
+            f"({ptg_network.get('plan_pair_match_pct')}%)"
+        )
+    elif ptg_network.get("skipped"):
+        lines.append(f"- PTG/FHIR network-name overlap: skipped ({ptg_network.get('reason')})")
     if network.get("available"):
         lines.append(
             f"- resolved network refs: `{network.get('resolved_network_refs')}` / `{network.get('distinct_network_refs')}` ({network.get('resolved_network_ref_pct')}%)"
         )
+    elif network.get("skipped"):
+        lines.append(f"- network resolution: skipped ({network.get('reason')})")
+    advertised_gaps = report.get("advertised_resource_gap_summary") or {}
+    if advertised_gaps.get("available"):
+        lines.append(
+            f"- advertised resource/source gaps: `{advertised_gaps.get('advertised_without_rows')}` / `{advertised_gaps.get('advertised_source_resources')}` "
+            f"({advertised_gaps.get('advertised_with_rows_pct')}% with rows)"
+        )
+    elif advertised_gaps.get("skipped"):
+        lines.append(f"- advertised resource/source gaps: skipped ({advertised_gaps.get('reason')})")
     if report.get("gaps"):
         lines.extend(["", "## Gaps", ""])
         lines.extend(f"- {gap}" for gap in report["gaps"])
@@ -668,12 +1249,62 @@ def render_markdown(report: dict[str, Any]) -> str:
         lines.extend(["", "## Capability Status", "", "| Status | Count |", "| --- | ---: |"])
         for item in report["capability_status_counts"]:
             lines.append(f"| `{item.get('probe_status')}` | {item.get('count')} |")
+    if credential_backlog.get("groups"):
+        lines.extend(
+            [
+                "",
+                "## Credential/Onboarding Backlog",
+                "",
+                "| Host | Status | Auth | Reason | Sources | Sample payers |",
+                "| --- | --- | --- | --- | ---: | --- |",
+            ]
+        )
+        for item in credential_backlog["groups"]:
+            samples = ", ".join(_markdown_cell(payer) for payer in item.get("sample_payers") or [])
+            lines.append(
+                f"| `{_markdown_cell(item.get('source_host'))}` | `{_markdown_cell(item.get('probe_status'))}` | `{_markdown_cell(item.get('auth_type'))}` | `{_markdown_cell(item.get('reason'))}` | {item.get('source_count')} | {samples} |"
+            )
+    if ptg_network.get("samples"):
+        lines.extend(
+            [
+                "",
+                "## PTG/FHIR Network Name Overlap Gaps",
+                "",
+                "| Source | Provider Directory Network | Plan Pairs | Sample PTG Networks |",
+                "| --- | --- | ---: | --- |",
+            ]
+        )
+        for item in ptg_network["samples"]:
+            samples = ", ".join(_markdown_cell(name) for name in item.get("sample_ptg_network_names") or [])
+            lines.append(
+                f"| {_markdown_cell(item.get('provider_directory_org_name') or item.get('provider_directory_source_id'))} | `{_markdown_cell(item.get('provider_directory_network_name'))}` | {item.get('plan_pair_count')} | {samples} |"
+            )
     if network.get("top_unresolved_refs"):
         lines.extend(["", "## Top Unresolved Network Refs", "", "| Source | Ref | Count |", "| --- | --- | ---: |"])
         for item in network["top_unresolved_refs"]:
             lines.append(
                 f"| {item.get('org_name') or item.get('source_id')} | `{item.get('ref')}` | {item.get('reference_count')} |"
             )
+    if advertised_gaps.get("resources"):
+        rows = [
+            item
+            for item in advertised_gaps["resources"]
+            if _int(item.get("advertised_source_count"))
+        ]
+        if rows:
+            lines.extend(
+                [
+                    "",
+                    "## Advertised Resource Import Gaps",
+                    "",
+                    "| Resource | Advertised Sources | Sources With Rows | Advertised Without Rows |",
+                    "| --- | ---: | ---: | ---: |",
+                ]
+            )
+            for item in rows:
+                lines.append(
+                    f"| `{item.get('resource_type')}` | {item.get('advertised_source_count')} | {item.get('source_with_rows_count')} | {item.get('advertised_without_rows_count')} |"
+                )
     valid_zero_rows = report.get("valid_sources_without_resource_rows") or {}
     if valid_zero_rows.get("samples"):
         lines.extend(
@@ -728,6 +1359,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--sample-limit", type=int, default=10)
     parser.add_argument(
+        "--statement-timeout-ms",
+        type=int,
+        default=_env_int("HLTHPRT_PROVIDER_DIRECTORY_AUDIT_STATEMENT_TIMEOUT_MS", 0),
+        help="Optional PostgreSQL statement_timeout in milliseconds for each audit query.",
+    )
+    parser.add_argument(
+        "--skip-unified",
+        action="store_true",
+        help="Skip entity_address_unified counts for pod-safe source/resource coverage checks.",
+    )
+    parser.add_argument(
         "--skip-network-resolution",
         action="store_true",
         help="Skip the heavier unresolved network-ref scan for quick checks during active imports.",
@@ -736,6 +1378,36 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--skip-ptg",
         action="store_true",
         help="Skip PTG address/corroboration scans for quick Provider Directory-only gates.",
+    )
+    parser.add_argument(
+        "--skip-ptg-corroboration",
+        action="store_true",
+        help="Skip the full Provider Directory/PTG corroboration aggregate while keeping cheaper PTG checks.",
+    )
+    parser.add_argument(
+        "--skip-ptg-network-overlap",
+        action="store_true",
+        help="Skip PTG serving network_names to FHIR network-name overlap checks.",
+    )
+    parser.add_argument(
+        "--force-ptg-live-view-scans",
+        action="store_true",
+        help="Allow exact PTG/FHIR aggregates against the live corroboration view. This can be slow on dev.",
+    )
+    parser.add_argument(
+        "--skip-top-source-yield",
+        action="store_true",
+        help="Skip per-source resource-yield ranking.",
+    )
+    parser.add_argument(
+        "--skip-advertised-resource-gaps",
+        action="store_true",
+        help="Skip advertised resource/source gap checks.",
+    )
+    parser.add_argument(
+        "--skip-valid-zero-row-sources",
+        action="store_true",
+        help="Skip valid-metadata-with-zero-resource-row sample checks.",
     )
     parser.add_argument("--format", choices=("json", "markdown"), default="json")
     return parser.parse_args(argv)

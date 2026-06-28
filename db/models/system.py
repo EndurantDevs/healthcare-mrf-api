@@ -21,6 +21,7 @@ __all__ = (
     "PartDImportRun",
     "PartDFormularySnapshot",
     "ProviderDirectoryCapability",
+    "ProviderDirectoryEndpoint",
     "ProviderDirectoryHealthcareService",
     "ProviderDirectoryInsurancePlan",
     "ProviderDirectoryLocation",
@@ -529,6 +530,7 @@ class ProviderDirectoryOrganization(Base, JSONOutputMixin):
     type_codes = Column(JSON)
     telecom = Column(JSON)
     address_json = Column(JSON)
+    endpoint_refs = Column(JSON)
     last_seen_run_id = Column(String(64))
     observed_at = Column(TIMESTAMP)
     updated_at = Column(TIMESTAMP)
@@ -600,6 +602,7 @@ class ProviderDirectoryPractitionerRole(Base, JSONOutputMixin):
     healthcare_service_refs = Column(JSON)
     network_refs = Column(JSON)
     insurance_plan_refs = Column(JSON)
+    endpoint_refs = Column(JSON)
     specialty_codes = Column(JSON)
     code_codes = Column(JSON)
     telecom = Column(JSON)
@@ -629,6 +632,7 @@ class ProviderDirectoryHealthcareService(Base, JSONOutputMixin):
     category_codes = Column(JSON)
     specialty_codes = Column(JSON)
     location_refs = Column(JSON)
+    endpoint_refs = Column(JSON)
     telecom = Column(JSON)
     coverage_area_refs = Column(JSON)
     last_seen_run_id = Column(String(64))
@@ -664,10 +668,52 @@ class ProviderDirectoryOrganizationAffiliation(Base, JSONOutputMixin):
     network_refs = Column(JSON)
     location_refs = Column(JSON)
     healthcare_service_refs = Column(JSON)
+    endpoint_refs = Column(JSON)
     specialty_codes = Column(JSON)
     code_codes = Column(JSON)
     period_start = Column(String(64))
     period_end = Column(String(64))
+    last_seen_run_id = Column(String(64))
+    observed_at = Column(TIMESTAMP)
+    updated_at = Column(TIMESTAMP)
+
+
+class ProviderDirectoryEndpoint(Base, JSONOutputMixin):
+    __tablename__ = "provider_directory_endpoint"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("source_id", "resource_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["source_id", "resource_id"]
+    __my_additional_indexes__ = [
+        {
+            "index_elements": ("source_id", "managing_organization_ref"),
+            "name": "provider_directory_endpoint_source_managing_org_idx",
+        },
+        {"index_elements": ("status",), "name": "provider_directory_endpoint_status_idx"},
+        {
+            "index_elements": ("connection_type_code",),
+            "name": "provider_directory_endpoint_connection_type_idx",
+        },
+    ]
+
+    source_id = Column(String(64), nullable=False)
+    resource_id = Column(String(256), nullable=False)
+    resource_url = Column(TEXT)
+    status = Column(String(64))
+    connection_type_system = Column(TEXT)
+    connection_type_code = Column(String(128))
+    connection_type_display = Column(String(256))
+    name = Column(String(512))
+    managing_organization_ref = Column(TEXT)
+    contact = Column(JSON)
+    period_start = Column(String(64))
+    period_end = Column(String(64))
+    payload_type_codes = Column(JSON)
+    payload_mime_types = Column(JSON)
+    address = Column(TEXT)
+    header = Column(JSON)
     last_seen_run_id = Column(String(64))
     observed_at = Column(TIMESTAMP)
     updated_at = Column(TIMESTAMP)

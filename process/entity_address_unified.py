@@ -85,7 +85,12 @@ DEFAULT_PTG_PARTIAL_PATCH_SUPPORT = True
 DEFAULT_PTG_PARTIAL_PATCH_MAIN = True
 ENTITY_ADDRESS_REFRESH_MODE_FULL = "full"
 ENTITY_ADDRESS_REFRESH_MODE_PTG_PARTIAL = "ptg-partial"
-ENTITY_ADDRESS_REFRESH_MODES = {ENTITY_ADDRESS_REFRESH_MODE_FULL, ENTITY_ADDRESS_REFRESH_MODE_PTG_PARTIAL}
+ENTITY_ADDRESS_REFRESH_MODE_PROVIDER_DIRECTORY_PARTIAL = "provider-directory-partial"
+ENTITY_ADDRESS_REFRESH_MODES = {
+    ENTITY_ADDRESS_REFRESH_MODE_FULL,
+    ENTITY_ADDRESS_REFRESH_MODE_PTG_PARTIAL,
+    ENTITY_ADDRESS_REFRESH_MODE_PROVIDER_DIRECTORY_PARTIAL,
+}
 ARCHIVE_IDENTITY_VERSION = "v2"
 BASE_ADDRESS_VERSION = "address_archive_v2:v2"
 SUPPORT_TABLE_MODELS = (
@@ -222,6 +227,14 @@ def _entity_address_refresh_mode(task: dict) -> str:
         return ENTITY_ADDRESS_REFRESH_MODE_FULL
     if value in {"ptg-partial", "partial-ptg", "ptg", "ptg-source", "ptg-source-refresh"}:
         return ENTITY_ADDRESS_REFRESH_MODE_PTG_PARTIAL
+    if value in {
+        "provider-directory-partial",
+        "partial-provider-directory",
+        "provider-directory",
+        "provider-directory-fhir",
+        "fhir-provider-directory",
+    }:
+        return ENTITY_ADDRESS_REFRESH_MODE_PROVIDER_DIRECTORY_PARTIAL
     raise ValueError(
         f"Unsupported entity-address-unified refresh_mode {raw!r}; "
         f"expected one of {sorted(ENTITY_ADDRESS_REFRESH_MODES)}"
@@ -2828,6 +2841,10 @@ def _ptg_partial_affected_group_table_name(stage_table: str) -> str:
     return _archived_identifier(stage_table, "_ptg_groups")
 
 
+def _provider_directory_partial_affected_group_table_name(stage_table: str) -> str:
+    return _archived_identifier(stage_table, "_pd_groups")
+
+
 def _prepare_ptg_partial_affected_groups_sql(db_schema: str, group_table: str, source_keys: list[str]) -> str:
     return f"""
     CREATE UNLOGGED TABLE {db_schema}.{group_table} AS
@@ -2860,6 +2877,76 @@ def _prepare_ptg_partial_affected_groups_sql(db_schema: str, group_table: str, s
     """
 
 
+def _is_provider_directory_source_select(db_schema: str, source_select: str) -> bool:
+    return (
+        f"FROM {db_schema}.provider_directory_practitioner_role AS role" in source_select
+        or f"FROM {db_schema}.provider_directory_organization_affiliation AS affiliation" in source_select
+    )
+
+
+def _provider_directory_current_group_select_sql(source_select: str) -> str:
+    return f"""
+    SELECT DISTINCT
+        src.entity_type::varchar AS entity_type,
+        src.entity_id::varchar AS entity_id,
+        src.address_key::uuid AS address_key,
+        {_street_soft_norm_expr("src.first_line")}::varchar AS street_key,
+        {_alnum_norm_expr("src.city_name")}::varchar AS city_key,
+        {_state_norm_expr("src.state_name")}::varchar AS state_key,
+        {_zip5_norm_expr("src.postal_code")}::varchar AS zip_key,
+        {_state_norm_expr("src.country_code")}::varchar AS country_key
+      FROM (
+            {source_select.strip()}
+      ) AS src
+     WHERE src.entity_type IS NOT NULL
+       AND src.entity_id IS NOT NULL
+       AND (
+            src.address_key IS NOT NULL
+         OR NULLIF(TRIM(src.first_line), '') IS NOT NULL
+         OR NULLIF(TRIM(src.city_name), '') IS NOT NULL
+       )
+    """
+
+
+def _prepare_provider_directory_partial_affected_groups_sql(
+    db_schema: str,
+    group_table: str,
+    source_selects: list[str],
+) -> str:
+    provider_selects = [
+        source_select
+        for source_select in source_selects
+        if _is_provider_directory_source_select(db_schema, source_select)
+    ]
+    if not provider_selects:
+        raise RuntimeError(
+            "entity-address-unified provider-directory-partial refresh requires "
+            "available Provider Directory source tables."
+        )
+    current_groups_sql = "\nUNION\n".join(
+        _provider_directory_current_group_select_sql(source_select)
+        for source_select in provider_selects
+    )
+    return f"""
+    CREATE UNLOGGED TABLE {db_schema}.{group_table} AS
+    SELECT DISTINCT
+        live.entity_type::varchar AS entity_type,
+        live.entity_id::varchar AS entity_id,
+        live.address_key::uuid AS address_key,
+        {_street_soft_norm_expr("live.first_line")}::varchar AS street_key,
+        {_alnum_norm_expr("live.city_name")}::varchar AS city_key,
+        {_state_norm_expr("live.state_name")}::varchar AS state_key,
+        {_zip5_norm_expr("live.postal_code")}::varchar AS zip_key,
+        {_state_norm_expr("live.country_code")}::varchar AS country_key
+      FROM {db_schema}.{EntityAddressUnified.__main_table__} AS live
+     WHERE COALESCE(live.address_sources, ARRAY[]::varchar[])
+           @> ARRAY['provider_directory_fhir']::varchar[]
+       AND live.location_key IS NOT NULL
+    UNION
+    {current_groups_sql};
+    """
+
+
 def _index_ptg_partial_affected_groups_sql(db_schema: str, group_table: str) -> str:
     index_name = _archived_identifier(f"{group_table}_idx_group", "")
     return f"""
@@ -2875,6 +2962,10 @@ def _index_ptg_partial_affected_groups_sql(db_schema: str, group_table: str) -> 
             country_key
         );
     """
+
+
+def _index_provider_directory_partial_affected_groups_sql(db_schema: str, group_table: str) -> str:
+    return _index_ptg_partial_affected_groups_sql(db_schema, group_table)
 
 
 def _affected_group_source_select_sql(db_schema: str, source_select: str, group_table: str) -> str:
@@ -2917,6 +3008,27 @@ def _ptg_partial_source_selects(
                 1,
             )
         )
+    return filtered
+
+
+def _provider_directory_partial_source_selects(
+    db_schema: str,
+    source_selects: list[str],
+    *,
+    affected_group_table: str,
+) -> list[str]:
+    filtered: list[str] = []
+    provider_selects = 0
+    for source_select in source_selects:
+        if _is_provider_directory_source_select(db_schema, source_select):
+            filtered.append(source_select)
+            provider_selects += 1
+        else:
+            filtered.append(
+                _affected_group_source_select_sql(db_schema, source_select, affected_group_table)
+            )
+    if provider_selects == 0:
+        return []
     return filtered
 
 
@@ -8576,15 +8688,20 @@ async def process_data(ctx, task=None):
     context["publish_requested"] = _publish_requested(task, test_mode=test_mode)
     refresh_mode = _entity_address_refresh_mode(task)
     partial_ptg_refresh = refresh_mode == ENTITY_ADDRESS_REFRESH_MODE_PTG_PARTIAL
+    partial_provider_directory_refresh = (
+        refresh_mode == ENTITY_ADDRESS_REFRESH_MODE_PROVIDER_DIRECTORY_PARTIAL
+    )
+    partial_source_refresh = partial_ptg_refresh or partial_provider_directory_refresh
     ptg_source_keys = _entity_address_ptg_source_keys(task) if partial_ptg_refresh else []
     if partial_ptg_refresh and not ptg_source_keys:
         raise RuntimeError("entity-address-unified ptg-partial refresh requires ptg_source_key.")
     context["refresh_mode"] = refresh_mode
     context["partial_ptg_source_keys"] = ptg_source_keys
+    context["partial_provider_directory_refresh"] = partial_provider_directory_refresh
     aggregate_source_record_ids = _aggregate_source_record_ids()
     context["aggregate_source_record_ids"] = aggregate_source_record_ids
-    serving_only_refresh = (
-        not partial_ptg_refresh
+    serving_only_refresh = partial_provider_directory_refresh or (
+        not partial_source_refresh
         and _task_bool_or_env(
             task,
             "serving_only_refresh",
@@ -8602,9 +8719,9 @@ async def process_data(ctx, task=None):
     stage_cls = make_class(EntityAddressUnified, import_date)
     stage_table = stage_cls.__tablename__
     reuse_stage = _env_bool("HLTHPRT_ENTITY_ADDRESS_UNIFIED_REUSE_STAGE", False)
-    if partial_ptg_refresh and reuse_stage:
+    if partial_source_refresh and reuse_stage:
         raise RuntimeError(
-            "entity-address-unified ptg-partial refresh cannot be combined with "
+            f"entity-address-unified {refresh_mode} refresh cannot be combined with "
             "HLTHPRT_ENTITY_ADDRESS_UNIFIED_REUSE_STAGE."
         )
 
@@ -8787,13 +8904,80 @@ async def process_data(ctx, task=None):
                 "entity-address-unified ptg-partial refresh requires an available ptg_address source table."
             )
         context["partial_ptg_source_selects"] = len(source_selects)
+    elif partial_provider_directory_refresh:
+        if not await _table_exists(db_schema, EntityAddressUnified.__main_table__):
+            raise RuntimeError(
+                "entity-address-unified provider-directory-partial refresh requested, but the live "
+                "entity_address_unified table does not exist; run refresh_mode=full first."
+            )
+        affected_group_table = _provider_directory_partial_affected_group_table_name(stage_table)
+        context["partial_provider_directory_affected_group_table"] = affected_group_table
+        context["partial_affected_group_table"] = affected_group_table
+        await db.status(f"DROP TABLE IF EXISTS {db_schema}.{affected_group_table};")
+        await _run_sql_phase(
+            _prepare_provider_directory_partial_affected_groups_sql(
+                db_schema,
+                affected_group_table,
+                source_selects,
+            ),
+            context=context,
+            run_id=run_id,
+            phase="entity-address-unified preparing affected Provider Directory groups",
+            unit="tables",
+            done=0,
+            total=1,
+            message="preparing affected Provider Directory evidence groups",
+            emit_start=True,
+            emit_done=True,
+        )
+        await _run_sql_phase(
+            _index_provider_directory_partial_affected_groups_sql(db_schema, affected_group_table),
+            context=context,
+            run_id=run_id,
+            phase="entity-address-unified indexing affected Provider Directory groups",
+            unit="indexes",
+            done=0,
+            total=1,
+            message="indexing affected Provider Directory evidence groups",
+            emit_start=True,
+            emit_done=True,
+        )
+        await _run_sql_phase(
+            f"ANALYZE {db_schema}.{affected_group_table};",
+            context=context,
+            run_id=run_id,
+            phase="entity-address-unified analyzing affected Provider Directory groups",
+            unit="tables",
+            done=0,
+            total=1,
+            message="analyzing affected Provider Directory evidence groups",
+            emit_start=True,
+            emit_done=True,
+        )
+        affected_group_rows = int(
+            await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{affected_group_table};") or 0
+        )
+        context["partial_provider_directory_affected_groups"] = affected_group_rows
+        source_selects = _provider_directory_partial_source_selects(
+            db_schema,
+            source_selects,
+            affected_group_table=affected_group_table,
+        )
+        if not source_selects:
+            raise RuntimeError(
+                "entity-address-unified provider-directory-partial refresh requires "
+                "available Provider Directory source tables."
+            )
+        context["partial_provider_directory_source_selects"] = len(source_selects)
+        context["partial_provider_directory_main_patch_publish"] = True
+        context["partial_main_patch_publish"] = True
     source_table_shards = _env_int(
         "HLTHPRT_ENTITY_ADDRESS_UNIFIED_SOURCE_TABLE_SHARDS",
         DEFAULT_SOURCE_TABLE_SHARDS,
         minimum=1,
     )
     context["source_table_shards"] = source_table_shards
-    if source_table_shards > 1 and not test_limit_per_source and not partial_ptg_refresh:
+    if source_table_shards > 1 and not test_limit_per_source and not partial_source_refresh:
         source_selects = _shard_source_selects(
             db_schema,
             source_selects,
@@ -8861,6 +9045,8 @@ async def process_data(ctx, task=None):
         DEFAULT_BUILD_NETWORK_BRIDGE,
     )
     context["build_network_bridge"] = build_network_bridge
+    context.setdefault("partial_support_patch_publish", False)
+    context.setdefault("partial_main_patch_publish", False)
     context["partial_ptg_support_bridge_reuse"] = False
     context["partial_ptg_support_patch_publish"] = False
     context["partial_ptg_main_patch_publish"] = False
@@ -8880,6 +9066,8 @@ async def process_data(ctx, task=None):
                 "HLTHPRT_ENTITY_ADDRESS_UNIFIED_PTG_PARTIAL_PATCH_MAIN",
                 DEFAULT_PTG_PARTIAL_PATCH_MAIN,
             )
+            context["partial_support_patch_publish"] = context["partial_ptg_support_patch_publish"]
+            context["partial_main_patch_publish"] = context["partial_ptg_main_patch_publish"]
 
     if run_id:
         enqueue_live_progress(
@@ -8894,9 +9082,9 @@ async def process_data(ctx, task=None):
         )
 
     chunked_load = _env_bool("HLTHPRT_ENTITY_ADDRESS_UNIFIED_CHUNKED_LOAD", True)
-    if partial_ptg_refresh and not chunked_load:
+    if partial_source_refresh and not chunked_load:
         raise RuntimeError(
-            "entity-address-unified ptg-partial refresh requires "
+            f"entity-address-unified {refresh_mode} refresh requires "
             "HLTHPRT_ENTITY_ADDRESS_UNIFIED_CHUNKED_LOAD=true."
         )
     raw_table: str | None = None
@@ -8936,7 +9124,7 @@ async def process_data(ctx, task=None):
             raise RuntimeError(
                 "HLTHPRT_ENTITY_ADDRESS_UNIFIED_REQUIRE_INLINE_SOURCE_EVIDENCE requested, "
                 "but inline source evidence is inactive "
-                f"(partial_ptg_refresh={partial_ptg_refresh}, reuse_stage={reuse_stage}, "
+                f"(partial_source_refresh={partial_source_refresh}, reuse_stage={reuse_stage}, "
                 f"chunked_load={chunked_load})."
             )
         split_array_aggregates = _env_bool(
@@ -9695,7 +9883,7 @@ async def process_data(ctx, task=None):
     elif context.get("support_stage_populated") and isinstance(cached_support_counts, dict):
         support_counts = {str(key): int(value) for key, value in cached_support_counts.items()}
     else:
-        support_raw_table = None if partial_ptg_refresh else raw_table
+        support_raw_table = None if partial_source_refresh else raw_table
         support_affected_group_table = None
         copy_unaffected_support_bridges = True
         if (
@@ -9731,8 +9919,8 @@ async def process_data(ctx, task=None):
         await db.status(f"DROP TABLE IF EXISTS {db_schema}.{raw_table};")
     if (
         affected_group_table
-        and not context.get("partial_ptg_support_patch_publish")
-        and not context.get("partial_ptg_main_patch_publish")
+        and not context.get("partial_support_patch_publish")
+        and not context.get("partial_main_patch_publish")
     ):
         await db.status(f"DROP TABLE IF EXISTS {db_schema}.{affected_group_table};")
 
@@ -9778,7 +9966,7 @@ async def process_data(ctx, task=None):
 
     if (
         not ctx["context"].get("stage_indexes_prepared")
-        and not context.get("partial_ptg_main_patch_publish")
+        and not context.get("partial_main_patch_publish")
     ):
         if run_id:
             enqueue_live_progress(
@@ -9797,7 +9985,7 @@ async def process_data(ctx, task=None):
 
     if (
         not ctx["context"].get("support_stage_indexes_prepared")
-        and not context.get("partial_ptg_support_patch_publish")
+        and not context.get("partial_support_patch_publish")
         and not serving_only_refresh
     ):
         await _create_support_stage_indexes(
@@ -9889,12 +10077,25 @@ async def shutdown(ctx):
     stage_cls = make_class(EntityAddressUnified, import_date)
     serving_only_refresh = bool(context.get("serving_only_refresh"))
     support_stage_classes = {} if serving_only_refresh else _support_stage_classes(import_date)
-    affected_group_table = str(context.get("partial_ptg_affected_group_table") or "").strip()
-    partial_support_patch = bool(context.get("partial_ptg_support_patch_publish"))
-    partial_main_patch = bool(context.get("partial_ptg_main_patch_publish"))
-    if partial_main_patch and not partial_support_patch:
+    affected_group_table = str(
+        context.get("partial_affected_group_table")
+        or context.get("partial_ptg_affected_group_table")
+        or context.get("partial_provider_directory_affected_group_table")
+        or ""
+    ).strip()
+    partial_support_patch = bool(
+        context.get("partial_support_patch_publish")
+        or context.get("partial_ptg_support_patch_publish")
+    )
+    partial_main_patch = bool(
+        context.get("partial_main_patch_publish")
+        or context.get("partial_ptg_main_patch_publish")
+        or context.get("partial_provider_directory_main_patch_publish")
+    )
+    if partial_main_patch and not partial_support_patch and not serving_only_refresh:
         raise RuntimeError(
-            "entity-address-unified ptg-partial main patch publish requires support patch publish."
+            f"entity-address-unified {context.get('refresh_mode') or 'partial'} "
+            "main patch publish requires support patch publish."
         )
 
     cached_stage_rows = _int_context_metric(context, "staged_rows")
@@ -9942,6 +10143,12 @@ async def shutdown(ctx):
                 "refresh_mode": context.get("refresh_mode") or ENTITY_ADDRESS_REFRESH_MODE_FULL,
                 "partial_ptg_source_keys": context.get("partial_ptg_source_keys") or [],
                 "partial_ptg_reused_rows": int(context.get("partial_ptg_reused_rows") or 0),
+                "partial_provider_directory_affected_groups": int(
+                    context.get("partial_provider_directory_affected_groups") or 0
+                ),
+                "partial_provider_directory_patched_rows": int(
+                    context.get("partial_provider_directory_patched_rows") or 0
+                ),
                 "npi_rows": int(context.get("npi_rows") or 0),
                 "inferred_rows": int(context.get("inferred_rows") or 0),
                 "multi_source_rows": int(context.get("multi_source_rows") or 0),
@@ -9960,7 +10167,8 @@ async def shutdown(ctx):
     if partial_main_patch:
         if previous_rows <= 0:
             raise RuntimeError(
-                "entity-address-unified ptg-partial main patch publish requires an existing live table."
+                f"entity-address-unified {context.get('refresh_mode') or 'partial'} "
+                "main patch publish requires an existing live table."
             )
     else:
         _validate_publish_row_count(
@@ -9995,25 +10203,27 @@ async def shutdown(ctx):
         if partial_main_patch:
             if not affected_group_table or not await _table_exists(db_schema, affected_group_table):
                 raise RuntimeError(
-                    "entity-address-unified ptg-partial main patch publish requires "
+                    f"entity-address-unified {context.get('refresh_mode') or 'partial'} "
+                    "main patch publish requires "
                     "the affected group table to remain available through shutdown."
                 )
-            for label, statement in _partial_support_patch_sql(
-                db_schema,
-                support_stage_classes,
-                old_entity_table=table,
-                affected_group_table=affected_group_table,
-                build_network_bridge=bool(context.get("build_network_bridge", DEFAULT_BUILD_NETWORK_BRIDGE)),
-                replacement_stage_table=stage_cls.__tablename__,
-            ):
-                started = time.monotonic()
-                rowcount = await db.status(statement)
-                _record_phase_timing(
-                    context,
-                    f"entity-address-unified patching support {label}",
-                    time.monotonic() - started,
-                    _coerce_rowcount(rowcount),
-                )
+            if partial_support_patch:
+                for label, statement in _partial_support_patch_sql(
+                    db_schema,
+                    support_stage_classes,
+                    old_entity_table=table,
+                    affected_group_table=affected_group_table,
+                    build_network_bridge=bool(context.get("build_network_bridge", DEFAULT_BUILD_NETWORK_BRIDGE)),
+                    replacement_stage_table=stage_cls.__tablename__,
+                ):
+                    started = time.monotonic()
+                    rowcount = await db.status(statement)
+                    _record_phase_timing(
+                        context,
+                        f"entity-address-unified patching support {label}",
+                        time.monotonic() - started,
+                        _coerce_rowcount(rowcount),
+                    )
             for label, statement in _partial_main_patch_sql(
                 db_schema,
                 live_table=table,
@@ -10096,7 +10306,17 @@ async def shutdown(ctx):
             await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{EntityAddressUnified.__main_table__};")
             or 0
         )
-        context["partial_ptg_patched_rows"] = stage_rows
+        context["partial_patched_rows"] = stage_rows
+        if (
+            context.get("refresh_mode") == ENTITY_ADDRESS_REFRESH_MODE_PTG_PARTIAL
+            or context.get("partial_ptg_main_patch_publish")
+        ):
+            context["partial_ptg_patched_rows"] = stage_rows
+        if (
+            context.get("refresh_mode") == ENTITY_ADDRESS_REFRESH_MODE_PROVIDER_DIRECTORY_PARTIAL
+            or context.get("partial_provider_directory_main_patch_publish")
+        ):
+            context["partial_provider_directory_patched_rows"] = stage_rows
     started_at = context.get("start")
     if isinstance(started_at, datetime.datetime):
         context["published_elapsed_seconds"] = round(
@@ -10134,6 +10354,13 @@ async def shutdown(ctx):
             "partial_ptg_source_keys": context.get("partial_ptg_source_keys") or [],
             "partial_ptg_reused_rows": int(context.get("partial_ptg_reused_rows") or 0),
             "partial_ptg_patched_rows": int(context.get("partial_ptg_patched_rows") or 0),
+            "partial_patched_rows": int(context.get("partial_patched_rows") or 0),
+            "partial_provider_directory_affected_groups": int(
+                context.get("partial_provider_directory_affected_groups") or 0
+            ),
+            "partial_provider_directory_patched_rows": int(
+                context.get("partial_provider_directory_patched_rows") or 0
+            ),
             "npi_rows": int(context.get("npi_rows") or 0),
             "inferred_rows": int(context.get("inferred_rows") or 0),
             "multi_source_rows": int(context.get("multi_source_rows") or 0),

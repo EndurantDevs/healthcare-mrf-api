@@ -1090,6 +1090,16 @@ def test_entity_address_unified_refresh_mode_and_ptg_source_keys(monkeypatch):
     assert entity_address_unified._entity_address_refresh_mode({}) == "full"
     assert entity_address_unified._entity_address_refresh_mode({"refresh_mode": "ptg-partial"}) == "ptg-partial"
     assert entity_address_unified._entity_address_refresh_mode({"mode": "partial-ptg"}) == "ptg-partial"
+    assert (
+        entity_address_unified._entity_address_refresh_mode(
+            {"refresh_mode": "provider-directory-partial"}
+        )
+        == "provider-directory-partial"
+    )
+    assert (
+        entity_address_unified._entity_address_refresh_mode({"mode": "provider-directory-fhir"})
+        == "provider-directory-partial"
+    )
 
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_REFRESH_MODE", "ptg-source-refresh")
     assert entity_address_unified._entity_address_refresh_mode({}) == "ptg-partial"
@@ -1104,6 +1114,45 @@ def test_entity_address_unified_refresh_mode_and_ptg_source_keys(monkeypatch):
 
     with pytest.raises(ValueError, match="Unsupported entity-address-unified refresh_mode"):
         entity_address_unified._entity_address_refresh_mode({"refresh_mode": "fastish"})
+
+
+def test_provider_directory_partial_sql_uses_live_and_current_fhir_groups():
+    source_selects = entity_address_unified._source_selects(
+        "mrf",
+        {
+            "provider_directory_practitioner": True,
+            "provider_directory_organization": True,
+            "provider_directory_location": True,
+            "provider_directory_location.address_key": True,
+            "provider_directory_practitioner_role": True,
+            "provider_directory_organization_affiliation": True,
+            "npi_address": False,
+            "address_archive_v2": False,
+        },
+    )
+
+    sql = entity_address_unified._prepare_provider_directory_partial_affected_groups_sql(  # pylint: disable=protected-access
+        "mrf",
+        "entity_address_unified_pd_groups",
+        source_selects,
+    )
+    filtered = entity_address_unified._provider_directory_partial_source_selects(  # pylint: disable=protected-access
+        "mrf",
+        ["SELECT * FROM mrf.npi_address AS a", *source_selects],
+        affected_group_table="entity_address_unified_pd_groups",
+    )
+
+    assert "CREATE UNLOGGED TABLE mrf.entity_address_unified_pd_groups AS" in sql
+    assert "@> ARRAY['provider_directory_fhir']::varchar[]" in sql
+    assert "provider_directory_practitioner_role AS role" in sql
+    assert "provider_directory_organization_affiliation AS affiliation" in sql
+    assert "src.address_key::uuid AS address_key" in sql
+    assert filtered[0].startswith("\n    SELECT src.*")
+    assert "entity_address_unified_pd_groups AS affected" in filtered[0]
+    assert any(
+        "provider_directory_practitioner_role AS role" in source_select
+        for source_select in filtered
+    )
 
 
 def test_entity_address_unified_stage_index_name_is_hash_safe_for_long_names():
@@ -4785,6 +4834,90 @@ async def test_entity_address_unified_shutdown_patch_publishes_partial_main_and_
         ]["rows"]
         == 2
     )
+
+
+@pytest.mark.asyncio
+async def test_entity_address_unified_shutdown_patch_publishes_provider_directory_main_only(monkeypatch):
+    statements = []
+    marked_runs = []
+
+    class FakeTransaction:
+        async def __aenter__(self):
+            statements.append("BEGIN")
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            statements.append("ROLLBACK" if exc else "COMMIT")
+            return False
+
+    class FakeDB:
+        async def scalar(self, statement, **_kwargs):
+            statements.append(statement)
+            normalized = " ".join(statement.split())
+            if normalized == "SELECT COUNT(*) FROM mrf.entity_address_unified_20260614;":
+                return 3
+            if normalized == "SELECT COUNT(*) FROM mrf.entity_address_unified;":
+                return 1000
+            if "to_regclass(" in statement:
+                return True
+            return 0
+
+        async def all(self, statement, **_kwargs):
+            statements.append(statement)
+            return []
+
+        async def status(self, statement):
+            statements.append(statement)
+            if "DELETE FROM mrf.entity_address_unified AS live" in statement:
+                return 3
+            if "INSERT INTO mrf.entity_address_unified" in statement:
+                return 3
+            return 0
+
+        def transaction(self):
+            return FakeTransaction()
+
+    async def fake_table_exists(_schema, _table):
+        return True
+
+    async def fake_mark_control_run(*_args, **kwargs):
+        marked_runs.append(kwargs)
+
+    monkeypatch.setattr(entity_address_unified, "db", FakeDB())
+    monkeypatch.setattr(entity_address_unified, "ensure_database", AsyncMock())
+    monkeypatch.setattr(entity_address_unified, "_table_exists", fake_table_exists)
+    monkeypatch.setattr(entity_address_unified, "mark_control_run", fake_mark_control_run)
+    monkeypatch.setattr(entity_address_unified, "print_time_info", lambda *_args, **_kwargs: None)
+
+    await entity_address_unified.shutdown(
+        {
+            "import_date": "20260614",
+            "context": {
+                "run": 1,
+                "test_mode": False,
+                "publish_requested": True,
+                "serving_only_refresh": True,
+                "refresh_mode": "provider-directory-partial",
+                "partial_main_patch_publish": True,
+                "partial_provider_directory_main_patch_publish": True,
+                "partial_provider_directory_affected_group_table": "entity_address_unified_20260614_pd_groups",
+                "build_network_bridge": False,
+                "support_counts": {},
+            },
+        }
+    )
+
+    joined = "\n".join(statements)
+    assert "DELETE FROM mrf.entity_address_unified AS live" in joined
+    assert "INSERT INTO mrf.entity_address_unified" in joined
+    assert "DELETE FROM mrf.entity_address_ptg_bridge AS support" not in joined
+    assert "ALTER TABLE IF EXISTS mrf.entity_address_unified_20260614 RENAME TO entity_address_unified;" not in joined
+    assert "DROP TABLE IF EXISTS mrf.entity_address_unified_20260614_pd_groups;" in joined
+    assert marked_runs
+    assert marked_runs[-1]["metrics"]["rows"] == 1000
+    assert marked_runs[-1]["metrics"]["partial_patched_rows"] == 3
+    assert marked_runs[-1]["metrics"]["partial_provider_directory_patched_rows"] == 3
+    assert marked_runs[-1]["metrics"]["serving_only_refresh"] is True
 
 
 @pytest.mark.asyncio

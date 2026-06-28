@@ -28,6 +28,7 @@ from sqlalchemy.sql.sqltypes import JSON as SQLAlchemyJSON
 
 from db.models import (
     ProviderDirectoryCapability,
+    ProviderDirectoryEndpoint,
     ProviderDirectoryHealthcareService,
     ProviderDirectoryInsurancePlan,
     ProviderDirectoryLocation,
@@ -55,9 +56,10 @@ DEFAULT_RESOURCES = (
     "Location",
     "HealthcareService",
     "OrganizationAffiliation",
+    "Endpoint",
 )
 FHIR_RESOURCE_PATH_SEGMENTS = frozenset(
-    resource_type.lower() for resource_type in DEFAULT_RESOURCES + ("Endpoint",)
+    resource_type.lower() for resource_type in DEFAULT_RESOURCES
 )
 FHIR_BASE_TRAILING_PATH_SEGMENTS = frozenset({"provider-directory", "providerdirectory"})
 LINKED_RESOURCE_TYPES = frozenset(
@@ -67,6 +69,7 @@ LINKED_RESOURCE_TYPES = frozenset(
         "Organization",
         "Location",
         "HealthcareService",
+        "Endpoint",
     }
 )
 LINKED_REFERENCE_FIELDS = {
@@ -80,14 +83,20 @@ LINKED_REFERENCE_FIELDS = {
         "Location": ("location_refs",),
         "HealthcareService": ("healthcare_service_refs",),
         "InsurancePlan": ("insurance_plan_refs",),
+        "Endpoint": ("endpoint_refs",),
+    },
+    "Organization": {
+        "Endpoint": ("endpoint_refs",),
     },
     "HealthcareService": {
         "Location": ("location_refs",),
+        "Endpoint": ("endpoint_refs",),
     },
     "OrganizationAffiliation": {
         "Organization": ("organization_ref", "participating_organization_ref", "network_refs"),
         "Location": ("location_refs",),
         "HealthcareService": ("healthcare_service_refs",),
+        "Endpoint": ("endpoint_refs",),
     },
 }
 RESOURCE_ENDPOINT_FIELDS = {
@@ -98,9 +107,19 @@ RESOURCE_ENDPOINT_FIELDS = {
     "PractitionerRole": "endpoint_practitioner_role",
     "HealthcareService": "endpoint_healthcare_service",
     "OrganizationAffiliation": "endpoint_organization_affiliation",
+    "Endpoint": "endpoint_endpoint",
 }
 PTG_PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW = "ptg_provider_directory_address_corroboration"
 PROVIDER_DIRECTORY_IMPORT_SEEN_TABLE = "provider_directory_import_seen"
+PROVIDER_DIRECTORY_IMPORT_SEEN_STAGE_PREFIX = "provider_directory_import_seen_stage"
+PTG_PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_INDEXES = (
+    "pd_ptg_corrob_lookup_idx",
+    "pd_ptg_corrob_active_lookup_idx",
+    "pd_ptg_corrob_source_snapshot_idx",
+    "pd_ptg_corrob_plan_pair_idx",
+    "pd_ptg_corrob_pd_source_idx",
+    "pd_ptg_corrob_network_names_gin",
+)
 PROVIDER_DIRECTORY_ADDRESS_ARCHIVE_SOURCE_BIT = 128
 PROVIDER_DIRECTORY_ADDRESS_ARCHIVE_PRIORITY = 6
 PROVIDER_DIRECTORY_ADDRESS_ARCHIVE_STAGE_PREFIX = "provider_directory_location_archive_stage"
@@ -112,6 +131,7 @@ RESOURCE_MODELS_BY_TYPE = {
     "PractitionerRole": ProviderDirectoryPractitionerRole,
     "HealthcareService": ProviderDirectoryHealthcareService,
     "OrganizationAffiliation": ProviderDirectoryOrganizationAffiliation,
+    "Endpoint": ProviderDirectoryEndpoint,
 }
 RESOURCE_TYPES_BY_MODEL = {model: resource_type for resource_type, model in RESOURCE_MODELS_BY_TYPE.items()}
 SOURCE_MODELS = (
@@ -124,6 +144,7 @@ SOURCE_MODELS = (
     ProviderDirectoryPractitionerRole,
     ProviderDirectoryHealthcareService,
     ProviderDirectoryOrganizationAffiliation,
+    ProviderDirectoryEndpoint,
 )
 USER_AGENT = os.getenv(
     "HLTHPRT_PROVIDER_DIRECTORY_USER_AGENT",
@@ -192,7 +213,7 @@ PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV = "HLTHPRT_PROVIDER_DIRECTORY_CREDENTIAL
 PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV = "HLTHPRT_PROVIDER_DIRECTORY_CREDENTIALS_FILE"
 SECRET_ENV_PREFIX = "env:"
 DEFAULT_FULL_REFRESH_MAX_PAGES = 10000
-DEFAULT_STREAM_BATCH_SIZE = 1000
+DEFAULT_STREAM_BATCH_SIZE = 5000
 OAUTH_TOKEN_EXPIRY_SKEW_SECONDS = 60
 _OAUTH_TOKEN_CACHE: dict[str, tuple[str, float]] = {}
 FHIR_ONBOARDING_GATEWAY_HOSTS = {
@@ -274,6 +295,10 @@ def _q(identifier: str) -> str:
 
 def _qt(schema: str, table: str) -> str:
     return f"{_q(schema)}.{_q(table)}"
+
+
+def _sql_string_literal(value: str) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
 
 
 def _sql_ref_matches_resource(ref_expr: str, resource_type: str, resource_id_expr: str) -> str:
@@ -985,6 +1010,16 @@ def _telecom(resource: dict[str, Any]) -> list[dict[str, Any]]:
     return [item for item in telecom if isinstance(item, dict)]
 
 
+def _string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+    return [text for item in value if (text := _clean_text(item))]
+
+
 def _phone(telecom: list[dict[str, Any]], *, system: str = "phone") -> str | None:
     for item in telecom:
         if _clean_text(item.get("system")) == system:
@@ -1165,6 +1200,7 @@ def parse_fhir_resource(
             "type_codes": _codings(resource.get("type")),
             "telecom": _telecom(resource),
             "address_json": resource.get("address") or [],
+            "endpoint_refs": _references(resource.get("endpoint")),
         }
         return ProviderDirectoryOrganization, row
     if resource_type == "Location":
@@ -1193,6 +1229,7 @@ def parse_fhir_resource(
             "healthcare_service_refs": _references(resource.get("healthcareService")),
             "network_refs": _references(resource.get("network")),
             "insurance_plan_refs": _references(resource.get("insurancePlan")),
+            "endpoint_refs": _references(resource.get("endpoint")),
             "specialty_codes": _codings(resource.get("specialty")),
             "code_codes": _codings(resource.get("code")),
             "telecom": _telecom(resource),
@@ -1210,6 +1247,7 @@ def parse_fhir_resource(
             "category_codes": _codings(resource.get("category")),
             "specialty_codes": _codings(resource.get("specialty")),
             "location_refs": _references(resource.get("location")),
+            "endpoint_refs": _references(resource.get("endpoint")),
             "telecom": _telecom(resource),
             "coverage_area_refs": _references(resource.get("coverageArea")),
         }
@@ -1224,12 +1262,34 @@ def parse_fhir_resource(
             "network_refs": _references(resource.get("network")),
             "location_refs": _references(resource.get("location")),
             "healthcare_service_refs": _references(resource.get("healthcareService")),
+            "endpoint_refs": _references(resource.get("endpoint")),
             "specialty_codes": _codings(resource.get("specialty")),
             "code_codes": _codings(resource.get("code")),
             "period_start": period_start,
             "period_end": period_end,
         }
         return ProviderDirectoryOrganizationAffiliation, row
+    if resource_type == "Endpoint":
+        period_start, period_end = _period(resource)
+        connection_type = resource.get("connectionType") if isinstance(resource.get("connectionType"), dict) else {}
+        contact = resource.get("contact") or []
+        row = {
+            **base,
+            "status": _clean_text(resource.get("status")),
+            "connection_type_system": _clean_text(connection_type.get("system")),
+            "connection_type_code": _clean_text(connection_type.get("code")),
+            "connection_type_display": _clean_text(connection_type.get("display")),
+            "name": _clean_text(resource.get("name")),
+            "managing_organization_ref": _first_reference(resource.get("managingOrganization")),
+            "contact": [item for item in contact if isinstance(item, dict)] if isinstance(contact, list) else [],
+            "period_start": period_start,
+            "period_end": period_end,
+            "payload_type_codes": _codings(resource.get("payloadType")),
+            "payload_mime_types": _string_list(resource.get("payloadMimeType")),
+            "address": _clean_text(resource.get("address")),
+            "header": _string_list(resource.get("header")),
+        }
+        return ProviderDirectoryEndpoint, row
     return None
 
 
@@ -1903,6 +1963,99 @@ async def publish_provider_directory_ptg_address_corroboration_view(db_schema: s
     await db.status(provider_directory_ptg_address_corroboration_sql(db_schema))
 
 
+def provider_directory_ptg_address_corroboration_select_sql(db_schema: str | None = None) -> str:
+    sql = provider_directory_ptg_address_corroboration_sql(db_schema)
+    marker = " AS\n"
+    if marker not in sql:
+        raise ValueError("Provider Directory PTG corroboration SQL does not contain view AS marker")
+    return sql.split(marker, 1)[1].strip().rstrip(";")
+
+
+def _drop_provider_directory_ptg_address_corroboration_relation_sql(schema: str, relation: str) -> str:
+    relation_ref = _qt(schema, relation)
+    return f"""
+    DO $$
+    DECLARE relkind_value "char";
+    BEGIN
+        SELECT cls.relkind
+          INTO relkind_value
+          FROM pg_class cls
+          JOIN pg_namespace ns ON ns.oid = cls.relnamespace
+         WHERE ns.nspname = {_sql_string_literal(schema)}
+           AND cls.relname = {_sql_string_literal(relation)};
+
+        IF relkind_value = 'v' THEN
+            EXECUTE 'DROP VIEW {relation_ref}';
+        ELSIF relkind_value = 'm' THEN
+            EXECUTE 'DROP MATERIALIZED VIEW {relation_ref}';
+        ELSIF relkind_value IN ('r', 'p') THEN
+            EXECUTE 'DROP TABLE {relation_ref}';
+        END IF;
+    END $$;
+    """
+
+
+async def _create_provider_directory_ptg_address_corroboration_indexes(
+    schema: str,
+    table_name: str = PTG_PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW,
+) -> None:
+    table_ref = _qt(schema, table_name)
+    statements = (
+        f"""
+        CREATE INDEX IF NOT EXISTS {_qt(schema, "pd_ptg_corrob_lookup_idx")}
+            ON {table_ref} (npi, address_key);
+        """,
+        f"""
+        CREATE INDEX IF NOT EXISTS {_qt(schema, "pd_ptg_corrob_active_lookup_idx")}
+            ON {table_ref} (npi, address_key, provider_directory_observed_at DESC NULLS LAST)
+            WHERE provider_directory_active_match IS TRUE;
+        """,
+        f"""
+        CREATE INDEX IF NOT EXISTS {_qt(schema, "pd_ptg_corrob_source_snapshot_idx")}
+            ON {table_ref} (source_key, snapshot_id);
+        """,
+        f"""
+        CREATE INDEX IF NOT EXISTS {_qt(schema, "pd_ptg_corrob_plan_pair_idx")}
+            ON {table_ref} (snapshot_id, plan_id, ptg_plan_id);
+        """,
+        f"""
+        CREATE INDEX IF NOT EXISTS {_qt(schema, "pd_ptg_corrob_pd_source_idx")}
+            ON {table_ref} (provider_directory_source_id);
+        """,
+        f"""
+        CREATE INDEX IF NOT EXISTS {_qt(schema, "pd_ptg_corrob_network_names_gin")}
+            ON {table_ref} USING gin (provider_directory_network_names);
+        """,
+    )
+    for statement in statements:
+        await db.status(statement)
+
+
+async def publish_provider_directory_ptg_address_corroboration_table(
+    db_schema: str | None = None,
+) -> dict[str, Any]:
+    schema = db_schema or _schema()
+    relation = PTG_PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW
+    stage_table = _stage_table_name()
+    stage_ref = _qt(schema, stage_table)
+    select_sql = provider_directory_ptg_address_corroboration_select_sql(schema)
+    try:
+        await db.status(f"DROP TABLE IF EXISTS {stage_ref};")
+        await db.status(f"CREATE UNLOGGED TABLE {stage_ref} AS\n{select_sql};")
+        row_count = int(await db.scalar(f"SELECT COUNT(*) FROM {stage_ref};") or 0)
+        await db.status(_drop_provider_directory_ptg_address_corroboration_relation_sql(schema, relation))
+        await db.status(f"ALTER TABLE {stage_ref} RENAME TO {_q(relation)};")
+        await _create_provider_directory_ptg_address_corroboration_indexes(schema, relation)
+        await db.status(f"ANALYZE {_qt(schema, relation)};")
+        return {"published": True, "relation": _qt(schema, relation), "rows": row_count, "storage": "table"}
+    except Exception:
+        try:
+            await db.status(f"DROP TABLE IF EXISTS {stage_ref};")
+        except Exception:  # pragma: no cover - cleanup best effort
+            pass
+        raise
+
+
 def provider_directory_location_address_key_sql(
     db_schema: str | None = None,
     *,
@@ -2152,7 +2305,7 @@ async def publish_provider_directory_ptg_address_corroboration_if_available(
     schema = db_schema or _schema()
     if not await _table_exists(schema, "ptg_address"):
         return False
-    await publish_provider_directory_ptg_address_corroboration_view(schema)
+    await publish_provider_directory_ptg_address_corroboration_table(schema)
     return True
 
 
@@ -2190,12 +2343,67 @@ async def _ensure_provider_directory_import_seen_table(schema: str | None = None
         );
         """
     )
+    # The primary key is (run_id, resource_type, source_id, resource_id), so it
+    # already supports the stale-delete prefix lookup. The old prefix index only
+    # doubled index writes during large imports.
     await db.status(
         f"""
-        CREATE INDEX IF NOT EXISTS provider_directory_import_seen_source_idx
-            ON {seen_ref} (run_id, resource_type, source_id);
+        DROP INDEX IF EXISTS {_qt(schema, "provider_directory_import_seen_source_idx")};
         """
     )
+
+
+async def _ensure_provider_directory_import_seen_stage_table(
+    run_id: str | None,
+    *,
+    schema: str | None = None,
+) -> str | None:
+    if not run_id:
+        return None
+    schema = schema or _schema()
+    stage_table = _provider_directory_import_seen_stage_table_name(run_id)
+    stage_ref = _qt(schema, stage_table)
+    await db.status(
+        f"""
+        CREATE UNLOGGED TABLE IF NOT EXISTS {stage_ref} (
+            run_id varchar(64) NOT NULL,
+            resource_type varchar(64) NOT NULL,
+            source_id varchar(64) NOT NULL,
+            resource_id varchar(256) NOT NULL,
+            seen_at timestamp NOT NULL DEFAULT now()
+        );
+        """
+    )
+    await db.status(f"TRUNCATE TABLE {stage_ref};")
+    return stage_table
+
+
+async def _drop_provider_directory_import_seen_stage_table(
+    stage_table: str | None,
+    *,
+    schema: str | None = None,
+) -> None:
+    if not stage_table:
+        return
+    schema = schema or _schema()
+    await db.status(f"DROP TABLE IF EXISTS {_qt(schema, stage_table)};")
+
+
+async def _prepare_provider_directory_import_seen_stage_lookup(
+    stage_table: str,
+    *,
+    schema: str | None = None,
+) -> None:
+    schema = schema or _schema()
+    stage_ref = _qt(schema, stage_table)
+    index_name = f"{stage_table}_lookup_idx"
+    await db.status(
+        f"""
+        CREATE INDEX IF NOT EXISTS {_q(index_name)}
+            ON {stage_ref} (resource_type, source_id, resource_id);
+        """
+    )
+    await db.status(f"ANALYZE {stage_ref};")
 
 
 def _dedupe_rows_by_primary_key(primary_keys: list[str], rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2212,10 +2420,97 @@ def _max_rows_per_statement(column_count: int) -> int:
     return max(1, min(500, 30000 // max(column_count, 1)))
 
 
+def _copy_upsert_enabled() -> bool:
+    return os.getenv("HLTHPRT_PROVIDER_DIRECTORY_COPY_UPSERT", "1").lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _seen_stage_enabled() -> bool:
+    return os.getenv("HLTHPRT_PROVIDER_DIRECTORY_SEEN_STAGE", "1").lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _copy_upsert_min_rows() -> int:
+    try:
+        return max(int(os.getenv("HLTHPRT_PROVIDER_DIRECTORY_COPY_UPSERT_MIN_ROWS", "100")), 1)
+    except ValueError:
+        return 100
+
+
+def _short_error(err: BaseException) -> str:
+    message = str(getattr(err, "orig", err)).replace("\n", " ").strip()
+    if len(message) > 240:
+        return f"{message[:240]}..."
+    return message
+
+
+def _stage_table_name() -> str:
+    return f"pd_stage_{os.getpid()}_{time.time_ns()}"
+
+
+def _provider_directory_import_seen_stage_table_name(run_id: str) -> str:
+    digest = hashlib.sha1(run_id.encode("utf-8", errors="ignore")).hexdigest()[:16]
+    return f"{PROVIDER_DIRECTORY_IMPORT_SEEN_STAGE_PREFIX}_{digest}"
+
+
+def _json_columns(table) -> set[str]:
+    result: set[str] = set()
+    for column in table.columns:
+        type_name = column.type.__class__.__name__.upper()
+        if "JSON" in type_name:
+            result.add(column.name)
+    return result
+
+
+def _json_default(value: Any) -> Any:
+    if isinstance(value, (datetime.date, datetime.datetime)):
+        return value.isoformat()
+    return str(value)
+
+
+def _strip_postgres_nuls(value: Any) -> Any:
+    if isinstance(value, str):
+        return value.replace("\x00", "")
+    if isinstance(value, list):
+        return [_strip_postgres_nuls(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_strip_postgres_nuls(item) for item in value)
+    if isinstance(value, dict):
+        return {
+            _strip_postgres_nuls(key): _strip_postgres_nuls(item)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _copy_record(row: dict[str, Any], columns: list[str], json_columns: set[str]) -> tuple[Any, ...]:
+    values: list[Any] = []
+    for column in columns:
+        value = _strip_postgres_nuls(row.get(column))
+        if value is not None and column in json_columns:
+            value = json.dumps(value, sort_keys=True, default=_json_default)
+        values.append(value)
+    return tuple(values)
+
+
 PROVIDER_DIRECTORY_RUN_METADATA_COLUMNS = frozenset({"last_seen_run_id", "observed_at", "updated_at"})
 
 
-async def _mark_resource_rows_seen(model, rows: list[dict[str, Any]], run_id: str | None) -> int:
+async def _mark_resource_rows_seen(
+    model,
+    rows: list[dict[str, Any]],
+    run_id: str | None,
+    *,
+    seen_table: str | None = None,
+) -> int:
     resource_type = RESOURCE_TYPES_BY_MODEL.get(model)
     if not run_id or not resource_type or not rows:
         return 0
@@ -2228,9 +2523,19 @@ async def _mark_resource_rows_seen(model, rows: list[dict[str, Any]], run_id: st
     if not seen:
         return 0
     items = list(seen.values())
+    if _copy_upsert_enabled() and len(items) >= _copy_upsert_min_rows():
+        try:
+            return await _copy_mark_resource_rows_seen(resource_type, items, run_id, seen_table=seen_table)
+        except Exception as exc:  # pragma: no cover - exercised on driver-specific fallback paths
+            print(f"Provider Directory COPY seen fallback for {resource_type}: {_short_error(exc)}")
     max_rows = _max_rows_per_statement(4)
     total = 0
-    seen_ref = _qt(_schema(), PROVIDER_DIRECTORY_IMPORT_SEEN_TABLE)
+    seen_ref = _qt(_schema(), seen_table or PROVIDER_DIRECTORY_IMPORT_SEEN_TABLE)
+    conflict_sql = (
+        ""
+        if seen_table
+        else "ON CONFLICT (run_id, resource_type, source_id, resource_id) DO NOTHING"
+    )
     for offset in range(0, len(items), max_rows):
         batch = items[offset : offset + max_rows]
         params: dict[str, Any] = {
@@ -2248,12 +2553,61 @@ async def _mark_resource_rows_seen(model, rows: list[dict[str, Any]], run_id: st
             f"""
             INSERT INTO {seen_ref} (run_id, resource_type, source_id, resource_id)
             VALUES {", ".join(values_sql)}
-            ON CONFLICT (run_id, resource_type, source_id, resource_id) DO NOTHING;
+            {conflict_sql};
             """,
             **params,
         )
         total += len(batch)
     return total
+
+
+async def _copy_mark_resource_rows_seen(
+    resource_type: str,
+    items: list[tuple[str, str]],
+    run_id: str,
+    *,
+    seen_table: str | None = None,
+) -> int:
+    schema = _schema()
+    if seen_table:
+        columns = ["run_id", "resource_type", "source_id", "resource_id"]
+        records = [(run_id, resource_type, source_id, resource_id) for source_id, resource_id in items]
+        async with db.acquire() as conn:
+            raw_conn = conn.raw_connection
+            driver_conn = getattr(raw_conn, "driver_connection", raw_conn)
+            copy_method = getattr(driver_conn, "copy_records_to_table", None)
+            if copy_method is None:
+                raise NotImplementedError("active database driver lacks copy_records_to_table")
+            await copy_method(seen_table, schema_name=schema, columns=columns, records=records)
+        return len(items)
+
+    seen_ref = _qt(schema, PROVIDER_DIRECTORY_IMPORT_SEEN_TABLE)
+    stage_table = _stage_table_name()
+    columns = ["run_id", "resource_type", "source_id", "resource_id"]
+    records = [(run_id, resource_type, source_id, resource_id) for source_id, resource_id in items]
+    async with db.acquire() as conn:
+        await conn.status(
+            f"""
+            CREATE TEMP TABLE {_q(stage_table)}
+            (LIKE {seen_ref} INCLUDING DEFAULTS) ON COMMIT DROP;
+            """
+        )
+        raw_conn = conn.raw_connection
+        driver_conn = getattr(raw_conn, "driver_connection", raw_conn)
+        copy_method = getattr(driver_conn, "copy_records_to_table", None)
+        if copy_method is None:
+            raise NotImplementedError("active database driver lacks copy_records_to_table")
+        await copy_method(stage_table, columns=columns, records=records)
+        quoted_columns = ", ".join(_q(column) for column in columns)
+        await conn.status(
+            f"""
+            INSERT INTO {seen_ref} ({quoted_columns})
+            SELECT DISTINCT {quoted_columns}
+            FROM {_q(stage_table)}
+            ON CONFLICT (run_id, resource_type, source_id, resource_id) DO NOTHING;
+            """
+        )
+    return len(items)
 
 
 async def _clear_resource_rows_seen(run_id: str | None) -> int:
@@ -2292,31 +2646,88 @@ def _upsert_changed_row_predicate(table, statement, columns: list[str], primary_
     )
 
 
-async def _upsert_rows(
-    model,
-    rows: list[dict[str, Any]],
+def _copy_upsert_changed_where_sql(table, columns: list[str], primary_keys: list[str]) -> str:
+    payload_columns = [
+        column
+        for column in columns
+        if column not in primary_keys and column not in PROVIDER_DIRECTORY_RUN_METADATA_COLUMNS
+    ]
+    predicates: list[str] = []
+    json_columns = _json_columns(table)
+    target_table = _q(table.name)
+    for column in payload_columns:
+        quoted = _q(column)
+        if column in json_columns:
+            predicates.append(
+                f"{target_table}.{quoted}::jsonb IS DISTINCT FROM EXCLUDED.{quoted}::jsonb"
+            )
+        else:
+            predicates.append(f"{target_table}.{quoted} IS DISTINCT FROM EXCLUDED.{quoted}")
+    return " OR ".join(predicates)
+
+
+def _copy_stage_primary_key_join_sql(
+    primary_keys: list[str],
     *,
-    skip_unchanged: bool = False,
+    target_alias: str = "target_row",
+    stage_alias: str = "stage_row",
+) -> str:
+    return " AND ".join(
+        f"{target_alias}.{_q(column)} = {stage_alias}.{_q(column)}"
+        for column in primary_keys
+    )
+
+
+def _copy_stage_changed_where_sql(
+    table,
+    columns: list[str],
+    primary_keys: list[str],
+    *,
+    target_alias: str = "target_row",
+    stage_alias: str = "stage_row",
+) -> str:
+    payload_columns = [
+        column
+        for column in columns
+        if column not in primary_keys and column not in PROVIDER_DIRECTORY_RUN_METADATA_COLUMNS
+    ]
+    missing_predicate = f"{target_alias}.{_q(primary_keys[0])} IS NULL"
+    predicates = [missing_predicate]
+    json_columns = _json_columns(table)
+    for column in payload_columns:
+        quoted = _q(column)
+        if column in json_columns:
+            predicates.append(
+                f"{target_alias}.{quoted}::jsonb IS DISTINCT FROM {stage_alias}.{quoted}::jsonb"
+            )
+        else:
+            predicates.append(f"{target_alias}.{quoted} IS DISTINCT FROM {stage_alias}.{quoted}")
+    return " OR ".join(predicates)
+
+
+async def _upsert_rows_values(
+    model,
+    normalized: list[dict[str, Any]],
+    columns: list[str],
+    primary_keys: list[str],
+    *,
+    skip_unchanged: bool,
 ) -> int:
-    if not rows:
-        return 0
-    table = model.__table__
-    columns = [column.name for column in table.columns]
-    primary_keys = [column.name for column in table.primary_key.columns]
-    rows = _dedupe_rows_by_primary_key(primary_keys, rows)
-    if not rows:
+    if not normalized:
         return 0
     max_rows_per_statement = _max_rows_per_statement(len(columns))
-    if len(rows) > max_rows_per_statement:
+    if len(normalized) > max_rows_per_statement:
         total = 0
-        for offset in range(0, len(rows), max_rows_per_statement):
-            total += await _upsert_rows(
+        for offset in range(0, len(normalized), max_rows_per_statement):
+            total += await _upsert_rows_values(
                 model,
-                rows[offset : offset + max_rows_per_statement],
+                normalized[offset : offset + max_rows_per_statement],
+                columns,
+                primary_keys,
                 skip_unchanged=skip_unchanged,
             )
         return total
-    normalized = [{key: row.get(key) for key in columns} for row in rows]
+    table = model.__table__
     async with db.session() as session:
         statement = pg_insert(table).values(normalized)
         update_columns = {
@@ -2331,7 +2742,120 @@ async def _upsert_rows(
             where=update_where,
         )
         await session.execute(statement)
-    return len(rows)
+    return len(normalized)
+
+
+async def _copy_upsert_rows(
+    model,
+    normalized: list[dict[str, Any]],
+    columns: list[str],
+    primary_keys: list[str],
+    *,
+    skip_unchanged: bool,
+) -> int:
+    table = model.__table__
+    schema = table.schema or _schema()
+    stage_table = _stage_table_name()
+    target_ref = _qt(schema, table.name)
+    quoted_stage = _q(stage_table)
+    quoted_columns = ", ".join(_q(column) for column in columns)
+    quoted_conflict = ", ".join(_q(column) for column in primary_keys)
+    update_columns = [column for column in columns if column not in primary_keys]
+    if update_columns:
+        conflict_sql = (
+            "DO UPDATE SET "
+            + ", ".join(f"{_q(column)} = EXCLUDED.{_q(column)}" for column in update_columns)
+        )
+        update_where = _copy_upsert_changed_where_sql(table, columns, primary_keys) if skip_unchanged else ""
+        if update_where:
+            conflict_sql = f"{conflict_sql} WHERE {update_where}"
+    else:
+        conflict_sql = "DO NOTHING"
+
+    json_columns = _json_columns(table)
+    records = [_copy_record(row, columns, json_columns) for row in normalized]
+    select_sql = f"SELECT {quoted_columns}\n            FROM {quoted_stage}"
+    if skip_unchanged:
+        stage_alias = "stage_row"
+        target_alias = "target_row"
+        changed_where = _copy_stage_changed_where_sql(
+            table,
+            columns,
+            primary_keys,
+            target_alias=target_alias,
+            stage_alias=stage_alias,
+        )
+        primary_key_join = _copy_stage_primary_key_join_sql(
+            primary_keys,
+            target_alias=target_alias,
+            stage_alias=stage_alias,
+        )
+        select_columns = ", ".join(f"{stage_alias}.{_q(column)}" for column in columns)
+        select_sql = f"""
+            SELECT {select_columns}
+            FROM {quoted_stage} AS {stage_alias}
+            LEFT JOIN {target_ref} AS {target_alias}
+              ON {primary_key_join}
+            WHERE {changed_where}
+            """
+    async with db.acquire() as conn:
+        await conn.status(
+            f"""
+            CREATE TEMP TABLE {quoted_stage}
+            (LIKE {target_ref} INCLUDING DEFAULTS) ON COMMIT DROP;
+            """
+        )
+        raw_conn = conn.raw_connection
+        driver_conn = getattr(raw_conn, "driver_connection", raw_conn)
+        copy_method = getattr(driver_conn, "copy_records_to_table", None)
+        if copy_method is None:
+            raise NotImplementedError("active database driver lacks copy_records_to_table")
+        await copy_method(stage_table, columns=columns, records=records)
+        if skip_unchanged:
+            await conn.status(f"ANALYZE {quoted_stage};")
+        await conn.status(
+            f"""
+            INSERT INTO {target_ref} ({quoted_columns})
+            {select_sql}
+            ON CONFLICT ({quoted_conflict}) {conflict_sql};
+            """
+        )
+    return len(normalized)
+
+
+async def _upsert_rows(
+    model,
+    rows: list[dict[str, Any]],
+    *,
+    skip_unchanged: bool = False,
+) -> int:
+    if not rows:
+        return 0
+    table = model.__table__
+    columns = [column.name for column in table.columns]
+    primary_keys = [column.name for column in table.primary_key.columns]
+    rows = _dedupe_rows_by_primary_key(primary_keys, rows)
+    if not rows:
+        return 0
+    normalized = [{key: row.get(key) for key in columns} for row in rows]
+    if _copy_upsert_enabled() and len(normalized) >= _copy_upsert_min_rows():
+        try:
+            return await _copy_upsert_rows(
+                model,
+                normalized,
+                columns,
+                primary_keys,
+                skip_unchanged=skip_unchanged,
+            )
+        except Exception as exc:  # pragma: no cover - exercised on driver-specific fallback paths
+            print(f"Provider Directory COPY upsert fallback for {model.__tablename__}: {_short_error(exc)}")
+    return await _upsert_rows_values(
+        model,
+        normalized,
+        columns,
+        primary_keys,
+        skip_unchanged=skip_unchanged,
+    )
 
 
 def _seed_rows_from_sqlite(path: Path, *, limit: int | None = None, source_query: str | None = None) -> list[dict[str, Any]]:
@@ -3070,11 +3594,12 @@ async def _upsert_resource_rows(
     *,
     run_id: str | None,
     track_seen: bool,
+    seen_table: str | None = None,
 ) -> int:
     if not rows:
         return 0
     if track_seen:
-        await _mark_resource_rows_seen(model, rows, run_id)
+        await _mark_resource_rows_seen(model, rows, run_id, seen_table=seen_table)
     return await _upsert_rows(model, rows, skip_unchanged=track_seen and bool(run_id))
 
 
@@ -3084,12 +3609,15 @@ async def _delete_stale_resource_rows(
     run_id: str | None,
     *,
     use_seen_table: bool = False,
+    seen_table: str | None = None,
 ) -> int:
     if not run_id:
         return 0
-    if use_seen_table:
+    if use_seen_table or seen_table:
         resource_type = RESOURCE_TYPES_BY_MODEL.get(model)
         if resource_type:
+            seen_ref = _qt(_schema(), seen_table or PROVIDER_DIRECTORY_IMPORT_SEEN_TABLE)
+            run_filter = "AND seen.run_id = :run_id" if not seen_table else ""
             return int(
                 await db.status(
                     f"""
@@ -3097,9 +3625,9 @@ async def _delete_stale_resource_rows(
                      WHERE resource.source_id = :source_id
                        AND NOT EXISTS (
                             SELECT 1
-                              FROM {_qt(_schema(), PROVIDER_DIRECTORY_IMPORT_SEEN_TABLE)} AS seen
-                             WHERE seen.run_id = :run_id
-                               AND seen.resource_type = :resource_type
+                              FROM {seen_ref} AS seen
+                             WHERE seen.resource_type = :resource_type
+                               {run_filter}
                                AND seen.source_id = resource.source_id
                                AND seen.resource_id = resource.resource_id
                        );
@@ -3305,6 +3833,7 @@ async def _import_alohr_graphql_source_group(
     timeout: int,
     run_id: str | None,
     stale_cleanup: bool,
+    seen_table: str | None = None,
 ) -> tuple[
     list[str],
     dict[str, dict[str, Any]],
@@ -3312,6 +3841,7 @@ async def _import_alohr_graphql_source_group(
     dict[str, int],
     dict[str, dict[str, Any]],
     dict[str, int],
+    dict[str, list[str]],
 ]:
     source_ids = [source["source_id"] for source in source_group]
     rows_by_model: dict[type, list[dict[str, Any]]] = {}
@@ -3319,6 +3849,7 @@ async def _import_alohr_graphql_source_group(
     source_resource_stats: dict[str, dict[str, Any]] = {}
     diagnostics: dict[str, dict[str, Any]] = {}
     stale_counts: dict[str, int] = {}
+    stale_ready_source_ids: dict[str, list[str]] = {}
     selected = set(resources)
 
     async def fetch_stream(
@@ -3405,22 +3936,31 @@ async def _import_alohr_graphql_source_group(
         resource_type = RESOURCE_TYPES_BY_MODEL.get(model)
         if resource_type not in selected:
             continue
-        written = await _upsert_resource_rows(model, rows, run_id=run_id, track_seen=stale_cleanup)
+        written = await _upsert_resource_rows(
+            model,
+            rows,
+            run_id=run_id,
+            track_seen=stale_cleanup,
+            seen_table=seen_table,
+        )
         source_counts[resource_type] = source_counts.get(resource_type, 0) + written
         if resource_type in diagnostics:
             diagnostics[resource_type]["rows_written"] = written // max(1, len(source_ids))
         if stale_cleanup and diagnostics.get(resource_type, {}).get("complete"):
-            for source_id in source_ids:
-                stale_deleted = await _delete_stale_resource_rows(
-                    model,
-                    source_id,
-                    run_id,
-                    use_seen_table=True,
-                )
-                if stale_deleted:
-                    stale_counts[resource_type] = stale_counts.get(resource_type, 0) + stale_deleted
+            if seen_table:
+                stale_ready_source_ids[resource_type] = list(source_ids)
+            else:
+                for source_id in source_ids:
+                    stale_deleted = await _delete_stale_resource_rows(
+                        model,
+                        source_id,
+                        run_id,
+                        use_seen_table=True,
+                    )
+                    if stale_deleted:
+                        stale_counts[resource_type] = stale_counts.get(resource_type, 0) + stale_deleted
 
-    return source_ids, diagnostics, source_counts, {}, source_resource_stats, stale_counts
+    return source_ids, diagnostics, source_counts, {}, source_resource_stats, stale_counts, stale_ready_source_ids
 
 
 async def _import_resources(
@@ -3463,6 +4003,7 @@ async def _import_resources(
         dict[str, int],
         dict[str, dict[str, Any]],
         dict[str, int],
+        dict[str, list[str]],
     ]:
         if cancel_ctx is not None:
             await raise_if_cancelled(cancel_ctx, cancel_task)
@@ -3473,6 +4014,7 @@ async def _import_resources(
         source_resource_stats: dict[str, dict[str, Any]] = {}
         source_resource_diagnostics: dict[str, dict[str, Any]] = {}
         source_stale_counts: dict[str, int] = {}
+        source_stale_ready_source_ids: dict[str, list[str]] = {}
         rows_by_resource: dict[str, list[dict[str, Any]]] = {}
         if _alohr_source_uses_graphql_connector(source):
             return await _import_alohr_graphql_source_group(
@@ -3483,6 +4025,7 @@ async def _import_resources(
                 timeout=timeout,
                 run_id=run_id,
                 stale_cleanup=stale_cleanup,
+                seen_table=seen_stage_table,
             )
         for resource_type in resources:
             if cancel_ctx is not None:
@@ -3495,6 +4038,7 @@ async def _import_resources(
                     _copy_rows_for_source_ids(rows, source_ids),
                     run_id=run_id,
                     track_seen=stale_cleanup,
+                    seen_table=seen_stage_table,
                 )
 
             result = await _fetch_resource_rows(
@@ -3524,6 +4068,7 @@ async def _import_resources(
                     _copy_rows_for_source_ids(result.rows, source_ids),
                     run_id=run_id,
                     track_seen=stale_cleanup,
+                    seen_table=seen_stage_table,
                 )
             )
             source_counts[resource_type] += written_total
@@ -3532,15 +4077,18 @@ async def _import_resources(
                 rows_written_per_source=written_total // max(1, len(source_ids)),
             )
             if stale_cleanup and result.complete:
-                for source_id in source_ids:
-                    stale_deleted = await _delete_stale_resource_rows(
-                        result.model,
-                        source_id,
-                        run_id,
-                        use_seen_table=True,
-                    )
-                    if stale_deleted:
-                        source_stale_counts[resource_type] = source_stale_counts.get(resource_type, 0) + stale_deleted
+                if seen_stage_table:
+                    source_stale_ready_source_ids[resource_type] = list(source_ids)
+                else:
+                    for source_id in source_ids:
+                        stale_deleted = await _delete_stale_resource_rows(
+                            result.model,
+                            source_id,
+                            run_id,
+                            use_seen_table=True,
+                        )
+                        if stale_deleted:
+                            source_stale_counts[resource_type] = source_stale_counts.get(resource_type, 0) + stale_deleted
         if linked_resource_limit > 0 and rows_by_resource:
             source_linked_counts = await _import_linked_resource_rows(
                 source,
@@ -3557,6 +4105,7 @@ async def _import_resources(
             source_linked_counts,
             source_resource_stats,
             source_stale_counts,
+            source_stale_ready_source_ids,
         )
 
     counts: dict[str, int] = {resource: 0 for resource in resources}
@@ -3565,6 +4114,12 @@ async def _import_resources(
     total_groups = len(source_groups)
     completed_groups = 0
     report_every = max(1, total_groups // 20)
+    seen_stage_table = (
+        await _ensure_provider_directory_import_seen_stage_table(run_id)
+        if stale_cleanup and run_id and _seen_stage_enabled()
+        else None
+    )
+    stale_ready_source_ids_by_resource: dict[str, set[str]] = {}
 
     async def run_with_limit(
         source_group: list[dict[str, Any]],
@@ -3575,38 +4130,69 @@ async def _import_resources(
         dict[str, int],
         dict[str, dict[str, Any]],
         dict[str, int],
+        dict[str, list[str]],
     ]:
         async with semaphore:
             return await import_one_group(source_group)
 
-    tasks = [asyncio.create_task(run_with_limit(source_group)) for source_group in source_groups]
-    for task in asyncio.as_completed(tasks):
-        (
-            source_ids,
-            source_resource_diagnostics,
-            source_counts,
-            source_linked_counts,
-            source_resource_stats,
-            source_stale_counts,
-        ) = await task
-        await _update_source_resource_import_metadata(
-            source_ids,
-            run_id=run_id,
-            diagnostics=source_resource_diagnostics,
-        )
-        merge_counts(counts, source_counts)
-        if linked_counts is not None:
-            merge_counts(linked_counts, source_linked_counts)
-        if resource_fetch_stats is not None:
-            merge_resource_stats(resource_fetch_stats, source_resource_stats)
-        if stale_counts is not None:
-            merge_counts(stale_counts, source_stale_counts)
-        completed_groups += 1
-        if progress_callback is not None and (
-            completed_groups == total_groups or completed_groups % report_every == 0
-        ):
-            await progress_callback(completed_groups, total_groups, dict(counts))
-    return counts
+    tasks: list[asyncio.Task] = []
+    try:
+        tasks = [asyncio.create_task(run_with_limit(source_group)) for source_group in source_groups]
+        for task in asyncio.as_completed(tasks):
+            (
+                source_ids,
+                source_resource_diagnostics,
+                source_counts,
+                source_linked_counts,
+                source_resource_stats,
+                source_stale_counts,
+                source_stale_ready_source_ids,
+            ) = await task
+            await _update_source_resource_import_metadata(
+                source_ids,
+                run_id=run_id,
+                diagnostics=source_resource_diagnostics,
+            )
+            merge_counts(counts, source_counts)
+            if linked_counts is not None:
+                merge_counts(linked_counts, source_linked_counts)
+            if resource_fetch_stats is not None:
+                merge_resource_stats(resource_fetch_stats, source_resource_stats)
+            if stale_counts is not None:
+                merge_counts(stale_counts, source_stale_counts)
+            for resource_type, ready_source_ids in source_stale_ready_source_ids.items():
+                stale_ready_source_ids_by_resource.setdefault(resource_type, set()).update(ready_source_ids)
+            completed_groups += 1
+            if progress_callback is not None and (
+                completed_groups == total_groups or completed_groups % report_every == 0
+            ):
+                await progress_callback(completed_groups, total_groups, dict(counts))
+
+        if seen_stage_table and stale_ready_source_ids_by_resource:
+            await _prepare_provider_directory_import_seen_stage_lookup(seen_stage_table)
+            for resource_type, ready_source_ids in stale_ready_source_ids_by_resource.items():
+                model = RESOURCE_MODELS_BY_TYPE.get(resource_type)
+                if model is None:
+                    continue
+                for source_id in sorted(ready_source_ids):
+                    stale_deleted = await _delete_stale_resource_rows(
+                        model,
+                        source_id,
+                        run_id,
+                        seen_table=seen_stage_table,
+                    )
+                    if stale_deleted and stale_counts is not None:
+                        stale_counts[resource_type] = stale_counts.get(resource_type, 0) + stale_deleted
+        return counts
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+    finally:
+        if seen_stage_table:
+            await _drop_provider_directory_import_seen_stage_table(seen_stage_table)
 
 
 async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) -> dict[str, Any]:

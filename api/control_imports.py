@@ -255,18 +255,19 @@ def _param_schema(command: click.Command) -> list[dict[str, Any]]:
     for param in command.params:
         if not isinstance(param, click.Option):
             continue
-        params.append(
-            {
-                "name": param.name,
-                "opts": list(param.opts),
-                "required": bool(param.required),
-                "multiple": bool(param.multiple),
-                "is_flag": bool(param.is_flag),
-                "type": _option_type_name(param),
-                "default": _json_safe_default(param.default),
-                "help": param.help,
-            }
-        )
+        entry = {
+            "name": param.name,
+            "opts": list(param.opts),
+            "required": bool(param.required),
+            "multiple": bool(param.multiple),
+            "is_flag": bool(param.is_flag),
+            "type": _option_type_name(param),
+            "default": _json_safe_default(param.default),
+            "help": param.help,
+        }
+        if isinstance(param.type, click.Choice):
+            entry["choices"] = list(param.type.choices)
+        params.append(entry)
     return params
 
 
