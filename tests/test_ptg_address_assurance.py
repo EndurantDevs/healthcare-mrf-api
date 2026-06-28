@@ -3,6 +3,7 @@
 import json
 import importlib.util
 import sys
+import types
 from pathlib import Path
 
 from process.ptg_parts.address_assurance import (
@@ -49,6 +50,7 @@ def test_ptg_address_assurance_accepts_plan_context_provider_directory_address()
                         "address_evidence_level": "payer_directory_network_location",
                         "requires_location_confirmation": False,
                         "displayed_address_present": True,
+                        "network_bound_address": True,
                         "provider_directory_plan_context_matched": True,
                         "address_verification_evidence": {
                             "matched_on": "npi_address_key_role_location_plan",
@@ -91,6 +93,7 @@ def test_ptg_address_assurance_accepts_network_name_provider_directory_address()
                         "address_evidence_level": "payer_directory_network_location",
                         "requires_location_confirmation": False,
                         "displayed_address_present": True,
+                        "network_bound_address": True,
                         "provider_directory_plan_context_matched": False,
                         "provider_directory_network_name_matched": True,
                         "provider_directory_network_matches": [
@@ -132,6 +135,7 @@ def test_ptg_address_assurance_rejects_network_name_proof_that_does_not_match_se
                         "address_evidence_level": "payer_directory_network_location",
                         "requires_location_confirmation": False,
                         "displayed_address_present": True,
+                        "network_bound_address": True,
                         "provider_directory_plan_context_matched": False,
                         "provider_directory_network_name_matched": True,
                         "provider_directory_network_matches": [
@@ -176,6 +180,7 @@ def test_ptg_address_assurance_rejects_network_name_proof_without_served_network
                         "address_evidence_level": "payer_directory_network_location",
                         "requires_location_confirmation": False,
                         "displayed_address_present": True,
+                        "network_bound_address": True,
                         "provider_directory_plan_context_matched": False,
                         "provider_directory_network_name_matched": True,
                         "provider_directory_network_matches": [
@@ -216,6 +221,7 @@ def test_ptg_address_assurance_rejects_network_name_marker_without_evidence():
                         "address_evidence_level": "payer_directory_network_location",
                         "requires_location_confirmation": False,
                         "displayed_address_present": True,
+                        "network_bound_address": True,
                         "provider_directory_plan_context_matched": False,
                         "provider_directory_network_name_matched": True,
                         "address_verification_evidence": {
@@ -250,6 +256,7 @@ def test_ptg_address_assurance_rejects_malformed_provider_directory_network_matc
                         "address_evidence_level": "payer_directory_network_location",
                         "requires_location_confirmation": False,
                         "displayed_address_present": True,
+                        "network_bound_address": True,
                         "provider_directory_plan_context_matched": False,
                         "provider_directory_network_name_matched": True,
                         "provider_directory_network_matches": [{"provider_directory_network_name": "C2"}],
@@ -286,6 +293,7 @@ def test_ptg_address_assurance_rejects_network_binding_without_plan_context():
                         "address_evidence_level": "provider_directory_address",
                         "requires_location_confirmation": False,
                         "displayed_address_present": True,
+                        "network_bound_address": True,
                         "provider_directory_plan_context_matched": False,
                     },
                 }
@@ -362,6 +370,34 @@ def test_ptg_address_assurance_requires_displayed_address_present_boolean():
     } in summary["issues"]
 
 
+def test_ptg_address_assurance_requires_network_bound_address_boolean():
+    payload = {
+        "data": {
+            "items": [
+                {
+                    "address": {"first_line": "900 W Temple Ave"},
+                    "address_verification": {
+                        "rate_network_binding": "tic_provider_group_npi_tin",
+                        "address_network_binding": "inferred_from_provider_identity",
+                        "address_evidence_level": "nppes_provider_address",
+                        "requires_location_confirmation": True,
+                        "displayed_address_present": True,
+                    },
+                }
+            ]
+        }
+    }
+
+    summary = summarize_ptg_price_address_payload(payload)
+
+    assert summary["ok"] is False
+    assert {
+        "severity": "error",
+        "item_index": 0,
+        "message": "network_bound_address is required",
+    } in summary["issues"]
+
+
 def test_ptg_address_assurance_rejects_provider_directory_string_booleans():
     payload = {
         "data": {
@@ -374,6 +410,7 @@ def test_ptg_address_assurance_rejects_provider_directory_string_booleans():
                         "address_evidence_level": "provider_directory_address",
                         "requires_location_confirmation": True,
                         "displayed_address_present": True,
+                        "network_bound_address": False,
                         "provider_directory_plan_context_matched": "false",
                         "provider_directory_network_context_present": "true",
                         "provider_directory_network_name_matched": "false",
@@ -403,6 +440,7 @@ def test_ptg_address_assurance_rejects_provider_directory_non_list_fields():
                         "address_evidence_level": "provider_directory_address",
                         "requires_location_confirmation": True,
                         "displayed_address_present": True,
+                        "network_bound_address": False,
                         "address_sources": "provider_directory_fhir",
                         "provider_directory_network_refs": "Organization/network-1",
                         "provider_directory_network_names": "C2",
@@ -438,6 +476,7 @@ def test_ptg_address_assurance_rejects_unknown_evidence_for_displayed_address():
                         "address_evidence_level": "unknown",
                         "requires_location_confirmation": True,
                         "displayed_address_present": True,
+                        "network_bound_address": False,
                     },
                 }
             ]
@@ -466,6 +505,7 @@ def test_ptg_address_assurance_rejects_ptg_address_source_without_payer_confirme
                         "address_evidence_level": "nppes_provider_address",
                         "requires_location_confirmation": True,
                         "displayed_address_present": True,
+                        "network_bound_address": False,
                         "address_sources": ["nppes", "ptg"],
                     },
                 }
@@ -496,6 +536,7 @@ def test_ptg_address_assurance_accepts_payer_confirmed_with_direct_location_sour
                         "address_evidence_level": "payer_confirmed_location",
                         "requires_location_confirmation": False,
                         "displayed_address_present": True,
+                        "network_bound_address": True,
                         "location_source": "payer_provider_group_location",
                         "address_verification_evidence": {
                             "source": "payer_provider_group_location",
@@ -526,6 +567,7 @@ def test_ptg_address_assurance_rejects_payer_confirmed_without_source_trace():
                         "address_evidence_level": "payer_confirmed_location",
                         "requires_location_confirmation": False,
                         "displayed_address_present": True,
+                        "network_bound_address": True,
                         "location_source": "payer_provider_group_location",
                         "address_verification_evidence": {
                             "source": "payer_provider_group_location",
@@ -560,6 +602,7 @@ def test_ptg_address_assurance_rejects_payer_confirmed_without_source_record_evi
                         "address_evidence_level": "payer_confirmed_location",
                         "requires_location_confirmation": False,
                         "displayed_address_present": True,
+                        "network_bound_address": True,
                         "location_source": "payer_provider_group_location",
                     },
                 }
@@ -589,6 +632,7 @@ def test_ptg_address_assurance_rejects_payer_confirmed_without_direct_location_s
                         "address_evidence_level": "payer_confirmed_location",
                         "requires_location_confirmation": False,
                         "displayed_address_present": True,
+                        "network_bound_address": True,
                     },
                 }
             ]
@@ -617,6 +661,7 @@ def test_ptg_address_assurance_rejects_payer_confirmed_with_only_tic_address_sou
                         "address_evidence_level": "payer_confirmed_location",
                         "requires_location_confirmation": False,
                         "displayed_address_present": True,
+                        "network_bound_address": True,
                         "address_sources": ["tic"],
                     },
                 }
@@ -646,6 +691,7 @@ def test_ptg_address_assurance_rejects_address_key_only_as_displayed_address():
                         "address_evidence_level": "unknown",
                         "requires_location_confirmation": True,
                         "displayed_address_present": True,
+                        "network_bound_address": False,
                     },
                 }
             ]
@@ -676,6 +722,7 @@ def test_ptg_address_assurance_schema_mode_accepts_explicit_no_address_row():
                         "address_evidence_level": "unknown",
                         "requires_location_confirmation": True,
                         "displayed_address_present": False,
+                        "network_bound_address": False,
                     },
                 }
             ]
@@ -709,6 +756,7 @@ def test_ptg_address_assurance_schema_mode_rejects_false_displayed_address_with_
                         "address_evidence_level": "unknown",
                         "requires_location_confirmation": True,
                         "displayed_address_present": False,
+                        "network_bound_address": False,
                     },
                 }
             ]
@@ -739,6 +787,7 @@ def test_ptg_address_assurance_schema_mode_rejects_false_displayed_address_with_
                     "provider_name": "TiC provider set",
                     "telephone_number": "217-555-0100",
                     "distance_miles": 2.4,
+                    "coordinates": {"lat": 39.12004, "long": -88.54338},
                     "location_source": "entity_address_unified",
                     "address_verification": {
                         "rate_network_binding": "tic_provider_group_npi_tin",
@@ -746,6 +795,7 @@ def test_ptg_address_assurance_schema_mode_rejects_false_displayed_address_with_
                         "address_evidence_level": "unknown",
                         "requires_location_confirmation": True,
                         "displayed_address_present": False,
+                        "network_bound_address": False,
                     },
                 }
             ]
@@ -760,7 +810,7 @@ def test_ptg_address_assurance_schema_mode_rejects_false_displayed_address_with_
         "item_index": 0,
         "message": (
             "displayed_address_present=false but address/map/phone/location fields are present: "
-            "distance_miles, location_source, telephone_number"
+            "coordinates, distance_miles, location_source, telephone_number"
         ),
     } in summary["issues"]
 
@@ -778,6 +828,7 @@ def test_ptg_address_assurance_schema_mode_rejects_no_display_verification_evide
                         "address_evidence_level": "unknown",
                         "requires_location_confirmation": True,
                         "displayed_address_present": False,
+                        "network_bound_address": False,
                         "location_source": "entity_address_unified",
                         "address_sources": ["nppes"],
                     },
@@ -811,6 +862,7 @@ def test_ptg_address_assurance_rejects_city_only_as_displayed_address():
                         "address_evidence_level": "city_zip_fallback",
                         "requires_location_confirmation": True,
                         "displayed_address_present": True,
+                        "network_bound_address": False,
                     },
                 }
             ]
@@ -840,6 +892,7 @@ def test_ptg_address_assurance_accepts_city_state_fallback_as_displayable_but_un
                         "address_evidence_level": "city_zip_fallback",
                         "requires_location_confirmation": True,
                         "displayed_address_present": True,
+                        "network_bound_address": False,
                     },
                 }
             ]
@@ -895,6 +948,7 @@ def test_ptg_address_assurance_combines_raw_artifact_and_api_payload(tmp_path):
                         "address_evidence_level": "nppes_provider_address",
                         "requires_location_confirmation": True,
                         "displayed_address_present": True,
+                        "network_bound_address": False,
                     },
                 }
             ]
@@ -911,6 +965,171 @@ def test_ptg_address_assurance_combines_raw_artifact_and_api_payload(tmp_path):
     assert report["raw_direct_displayable_location_fields_present"] is False
     assert report["api_payload"]["address_evidence_level_counts"] == {"nppes_provider_address": 1}
     assert "network_names identify the priced TiC/PTG network" in report["notes"][0]
+
+
+def test_ptg_address_assurance_can_require_network_bound_address():
+    payload = {
+        "data": {
+            "items": [
+                {
+                    "address": {
+                        "first_line": "900 W Temple Ave",
+                        "city": "Effingham",
+                        "state": "IL",
+                        "postal_code": "62401",
+                    },
+                    "address_verification": {
+                        "rate_network_binding": "tic_provider_group_npi_tin",
+                        "address_network_binding": "inferred_from_provider_identity",
+                        "address_evidence_level": "nppes_provider_address",
+                        "requires_location_confirmation": True,
+                        "displayed_address_present": True,
+                        "network_bound_address": False,
+                    },
+                }
+            ]
+        }
+    }
+
+    report = build_ptg_address_assurance_report(
+        api_payload=payload,
+        require_network_bound_address=True,
+    )
+
+    assert report["ok"] is False
+    assert {
+        "severity": "error",
+        "item_index": 0,
+        "message": "displayed PTG address is not network-bound to the priced plan or network",
+    } in report["api_payload"]["issues"]
+    assert report["api_payload"]["network_bound_address_rows"] == 0
+
+
+def test_ptg_address_assurance_accepts_network_bound_address_when_required():
+    payload = {
+        "data": {
+            "items": [
+                {
+                    "network_names": ["C2"],
+                    "source_trace": [{"source_file_version_id": "version-a"}],
+                    "address": {
+                        "first_line": "900 W Temple Ave",
+                        "city": "Effingham",
+                        "state": "IL",
+                        "postal_code": "62401",
+                    },
+                    "address_verification": {
+                        "rate_network_binding": "tic_provider_group_npi_tin",
+                        "address_network_binding": "payer_directory_corroborated_location",
+                        "address_evidence_level": "payer_directory_network_location",
+                        "requires_location_confirmation": False,
+                        "displayed_address_present": True,
+                        "network_bound_address": True,
+                        "provider_directory_plan_context_matched": False,
+                        "provider_directory_network_name_matched": True,
+                        "provider_directory_network_matches": [
+                            {
+                                "ptg_network_name": "C2",
+                                "provider_directory_network_name": "C2",
+                            }
+                        ],
+                        "address_verification_evidence": {
+                            "matched_on": "npi_address_key_role_location_network_name",
+                        },
+                    },
+                }
+            ]
+        }
+    }
+
+    report = build_ptg_address_assurance_report(
+        api_payload=payload,
+        require_network_bound_address=True,
+    )
+
+    assert report["ok"] is True
+    assert report["api_payload"]["issues"] == []
+    assert report["api_payload"]["network_bound_address_rows"] == 1
+
+
+def test_ptg_address_assurance_network_bound_requirement_implies_source_context():
+    payload = {
+        "data": {
+            "items": [
+                {
+                    "address": {
+                        "first_line": "900 W Temple Ave",
+                        "city": "Effingham",
+                        "state": "IL",
+                        "postal_code": "62401",
+                    },
+                    "address_verification": {
+                        "rate_network_binding": "tic_provider_group_npi_tin",
+                        "address_network_binding": "payer_directory_corroborated_location",
+                        "address_evidence_level": "payer_directory_network_location",
+                        "requires_location_confirmation": False,
+                        "displayed_address_present": True,
+                        "network_bound_address": True,
+                        "provider_directory_plan_context_matched": True,
+                        "address_verification_evidence": {
+                            "matched_on": "npi_address_key_role_location_plan",
+                        },
+                    },
+                }
+            ]
+        }
+    }
+
+    report = build_ptg_address_assurance_report(
+        api_payload=payload,
+        require_network_bound_address=True,
+    )
+
+    assert report["ok"] is False
+    assert {
+        "severity": "error",
+        "item_index": None,
+        "message": "no PTG price rows include network_names",
+    } in report["api_payload"]["issues"]
+    assert {
+        "severity": "error",
+        "item_index": None,
+        "message": "no PTG price rows include source_trace.source_file_version_id",
+    } in report["api_payload"]["issues"]
+
+
+def test_ptg_address_assurance_rejects_mismatched_network_bound_address():
+    payload = {
+        "data": {
+            "items": [
+                {
+                    "address": {
+                        "first_line": "900 W Temple Ave",
+                        "city": "Effingham",
+                        "state": "IL",
+                        "postal_code": "62401",
+                    },
+                    "address_verification": {
+                        "rate_network_binding": "tic_provider_group_npi_tin",
+                        "address_network_binding": "inferred_from_provider_identity",
+                        "address_evidence_level": "nppes_provider_address",
+                        "requires_location_confirmation": True,
+                        "displayed_address_present": True,
+                        "network_bound_address": True,
+                    },
+                }
+            ]
+        }
+    }
+
+    summary = summarize_ptg_price_address_payload(payload)
+
+    assert summary["ok"] is False
+    assert {
+        "severity": "error",
+        "item_index": 0,
+        "message": "network_bound_address must match address_network_binding and displayed_address_present",
+    } in summary["issues"]
 
 
 def test_ptg_address_assurance_rejects_payer_confirmed_when_traced_raw_lacks_address(tmp_path):
@@ -945,6 +1164,7 @@ def test_ptg_address_assurance_rejects_payer_confirmed_when_traced_raw_lacks_add
                         "address_evidence_level": "payer_confirmed_location",
                         "requires_location_confirmation": False,
                         "displayed_address_present": True,
+                        "network_bound_address": True,
                         "location_source": "payer_provider_group_location",
                         "address_verification_evidence": {
                             "source": "payer_provider_group_location",
@@ -1011,6 +1231,7 @@ def test_ptg_address_assurance_accepts_payer_confirmed_when_traced_raw_has_addre
                         "address_evidence_level": "payer_confirmed_location",
                         "requires_location_confirmation": False,
                         "displayed_address_present": True,
+                        "network_bound_address": True,
                         "location_source": "payer_provider_group_location",
                         "address_verification_evidence": {
                             "source": "payer_provider_group_location",
@@ -1070,6 +1291,7 @@ def test_ptg_address_assurance_rejects_payer_confirmed_when_source_trace_unresol
                         "address_evidence_level": "payer_confirmed_location",
                         "requires_location_confirmation": False,
                         "displayed_address_present": True,
+                        "network_bound_address": True,
                         "location_source": "payer_provider_group_location",
                         "address_verification_evidence": {
                             "source": "payer_provider_group_location",
@@ -1172,6 +1394,7 @@ def test_ptg_address_assurance_report_includes_api_source_file_version_ids():
                         "address_evidence_level": "unknown",
                         "requires_location_confirmation": True,
                         "displayed_address_present": False,
+                        "network_bound_address": False,
                     },
                 }
             ]
@@ -1205,6 +1428,7 @@ def test_ptg_address_assurance_report_can_require_source_context():
                         "address_evidence_level": "unknown",
                         "requires_location_confirmation": True,
                         "displayed_address_present": False,
+                        "network_bound_address": False,
                     },
                 }
             ]
@@ -1236,6 +1460,7 @@ def test_ptg_address_assurance_report_rejects_missing_required_source_context():
                         "address_evidence_level": "unknown",
                         "requires_location_confirmation": True,
                         "displayed_address_present": False,
+                        "network_bound_address": False,
                     },
                 }
             ]
@@ -1259,6 +1484,59 @@ def test_ptg_address_assurance_report_rejects_missing_required_source_context():
         "severity": "error",
         "item_index": None,
         "message": "no PTG price rows include source_trace.source_file_version_id",
+    } in report["api_payload"]["issues"]
+
+
+def test_ptg_address_assurance_report_rejects_partial_missing_required_source_context():
+    payload = {
+        "data": {
+            "items": [
+                {
+                    "provider_name": "TiC provider set A",
+                    "network_names": ["C2"],
+                    "source_trace": [{"source_file_version_id": "version-a"}],
+                    "address_verification": {
+                        "rate_network_binding": "tic_provider_group_npi_tin",
+                        "address_network_binding": "inferred_from_provider_identity",
+                        "address_evidence_level": "unknown",
+                        "requires_location_confirmation": True,
+                        "displayed_address_present": False,
+                        "network_bound_address": False,
+                    },
+                },
+                {
+                    "provider_name": "TiC provider set B",
+                    "source_trace": [{"original_url": "https://payer.example.invalid/mrf/rates.json.gz"}],
+                    "address_verification": {
+                        "rate_network_binding": "tic_provider_group_npi_tin",
+                        "address_network_binding": "inferred_from_provider_identity",
+                        "address_evidence_level": "unknown",
+                        "requires_location_confirmation": True,
+                        "displayed_address_present": False,
+                        "network_bound_address": False,
+                    },
+                },
+            ]
+        }
+    }
+
+    report = build_ptg_address_assurance_report(
+        api_payload=payload,
+        require_displayed_address=False,
+        require_network_names=True,
+        require_source_file_version_id=True,
+    )
+
+    assert report["ok"] is False
+    assert {
+        "severity": "error",
+        "item_index": None,
+        "message": "some PTG price rows do not include network_names: 1",
+    } in report["api_payload"]["issues"]
+    assert {
+        "severity": "error",
+        "item_index": None,
+        "message": "some PTG price rows do not include source_trace.source_file_version_id: 1",
     } in report["api_payload"]["issues"]
 
 
@@ -1316,6 +1594,212 @@ def test_ptg_address_assurance_cli_can_require_resolved_raw_artifacts():
         )
         == []
     )
+
+
+def test_ptg_address_assurance_cli_resolves_raw_artifacts_from_db(monkeypatch, tmp_path):
+    script = _load_cli_module()
+    raw_artifact = tmp_path / "raw-rates.json.gz"
+    raw_artifact.write_text("{}", encoding="utf-8")
+    missing_artifact = tmp_path / "missing-rates.json.gz"
+    captured = {}
+
+    class FakeConnection:
+        async def fetch(self, sql, source_file_version_ids):
+            captured["sql"] = sql
+            captured["source_file_version_ids"] = source_file_version_ids
+            return [
+                {
+                    "source_file_version_id": "version-a",
+                    "raw_storage_uri": raw_artifact.as_uri(),
+                    "raw_sha256": "a" * 64,
+                    "content_length": 2,
+                },
+                {
+                    "source_file_version_id": "version-b",
+                    "raw_storage_uri": missing_artifact.as_uri(),
+                    "raw_sha256": "b" * 64,
+                    "content_length": 10,
+                },
+                {
+                    "source_file_version_id": "version-c",
+                    "raw_storage_uri": "s3://bucket/raw-rates.json.gz",
+                    "raw_sha256": "c" * 64,
+                    "content_length": 20,
+                },
+            ]
+
+        async def close(self):
+            captured["closed"] = True
+
+    async def fake_connect(**kwargs):
+        captured["connect_kwargs"] = kwargs
+        return FakeConnection()
+
+    monkeypatch.setitem(sys.modules, "asyncpg", types.SimpleNamespace(connect=fake_connect))
+
+    resolutions = script.asyncio.run(
+        script._resolve_raw_artifacts_from_db(
+            ["version-a", "version-b", "version-c", "version-d"],
+            host="db.local",
+            port=5440,
+            database="healthporta_test",
+            user="postgres",
+            password="",
+            schema="mrf_custom",
+        )
+    )
+
+    assert captured["connect_kwargs"] == {
+        "host": "db.local",
+        "port": 5440,
+        "database": "healthporta_test",
+        "user": "postgres",
+        "password": None,
+    }
+    assert '"mrf_custom".ptg2_source_file_version' in captured["sql"]
+    assert captured["source_file_version_ids"] == ["version-a", "version-b", "version-c", "version-d"]
+    assert captured["closed"] is True
+    assert resolutions == [
+        {
+            "source_file_version_id": "version-a",
+            "raw_storage_uri": raw_artifact.as_uri(),
+            "raw_artifact_path": str(raw_artifact),
+            "raw_sha256": "a" * 64,
+            "content_length": 2,
+            "status": "resolved",
+        },
+        {
+            "source_file_version_id": "version-b",
+            "raw_storage_uri": missing_artifact.as_uri(),
+            "raw_artifact_path": str(missing_artifact),
+            "raw_sha256": "b" * 64,
+            "content_length": 10,
+            "status": "missing_file",
+        },
+        {
+            "source_file_version_id": "version-c",
+            "raw_storage_uri": "s3://bucket/raw-rates.json.gz",
+            "raw_artifact_path": None,
+            "raw_sha256": "c" * 64,
+            "content_length": 20,
+            "status": "non_file_uri",
+        },
+        {
+            "source_file_version_id": "version-d",
+            "status": "not_found",
+        },
+    ]
+
+
+def test_ptg_address_assurance_cli_main_verifies_traced_raw_artifact(monkeypatch, tmp_path, capsys):
+    script = _load_cli_module()
+    raw_artifact = tmp_path / "raw-rates.json"
+    api_payload = tmp_path / "api-payload.json"
+    _write_json(
+        raw_artifact,
+        {
+            "provider_references": [
+                {
+                    "provider_group_id": 1662,
+                    "provider_groups": [
+                        {
+                            "tin": {"type": "ein", "value": "123456789"},
+                            "npi": [1679524805],
+                            "address": {
+                                "street": "900 W Temple Ave",
+                                "city": "Effingham",
+                                "state": "IL",
+                                "postal_code": "62401",
+                            },
+                        }
+                    ],
+                }
+            ],
+            "in_network": [],
+        },
+    )
+    _write_json(
+        api_payload,
+        {
+            "data": {
+                "items": [
+                    {
+                        "provider_name": "Thomas A. Ambrose",
+                        "npi": "1679524805",
+                        "network_names": ["C2"],
+                        "source_trace": [{"source_file_version_id": "version-a"}],
+                        "address": {
+                            "first_line": "900 W Temple Ave",
+                            "city": "Effingham",
+                            "state": "IL",
+                            "postal_code": "62401",
+                        },
+                        "address_verification": {
+                            "rate_network_binding": "tic_provider_group_npi_tin",
+                            "address_network_binding": "payer_confirmed_location",
+                            "address_evidence_level": "payer_confirmed_location",
+                            "requires_location_confirmation": False,
+                            "displayed_address_present": True,
+                            "network_bound_address": True,
+                            "location_source": "payer_provider_group_location",
+                            "address_verification_evidence": {
+                                "source": "payer_provider_group_location",
+                                "provider_group_id": 1662,
+                                "json_pointer": "/provider_references/0/provider_groups/0/address",
+                            },
+                        },
+                    }
+                ]
+            }
+        },
+    )
+    captured = {}
+
+    class FakeConnection:
+        async def fetch(self, _sql, source_file_version_ids):
+            captured["source_file_version_ids"] = source_file_version_ids
+            return [
+                {
+                    "source_file_version_id": "version-a",
+                    "raw_storage_uri": raw_artifact.as_uri(),
+                    "raw_sha256": "a" * 64,
+                    "content_length": raw_artifact.stat().st_size,
+                }
+            ]
+
+        async def close(self):
+            captured["closed"] = True
+
+    async def fake_connect(**_kwargs):
+        return FakeConnection()
+
+    monkeypatch.setitem(sys.modules, "asyncpg", types.SimpleNamespace(connect=fake_connect))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "ptg_address_assurance_report.py",
+            "--api-payload",
+            str(api_payload),
+            "--resolve-raw-artifacts-from-db",
+            "--require-resolved-raw-artifacts",
+            "--require-network-bound-address",
+            "--strict",
+        ],
+    )
+
+    assert script.main() == 0
+    output = json.loads(capsys.readouterr().out)
+
+    assert captured["source_file_version_ids"] == ["version-a"]
+    assert captured["closed"] is True
+    assert output["ok"] is True
+    assert output["requested_source_file_version_ids"] == ["version-a"]
+    assert output["raw_artifact_resolution"][0]["status"] == "resolved"
+    assert output["raw_artifacts"][0]["source_file_version_ids"] == ["version-a"]
+    assert output["raw_artifacts"][0]["direct_displayable_location_fields_present"] is True
+    assert output["api_payload"]["network_bound_address_rows"] == 1
+    assert output["issues"] == []
 
 
 def test_ptg_address_assurance_cli_fetches_api_url(monkeypatch):

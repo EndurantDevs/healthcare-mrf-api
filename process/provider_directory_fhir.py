@@ -21,7 +21,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from sqlalchemy import or_
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.sql.sqltypes import JSON as SQLAlchemyJSON
 
 from db.models import (
     ProviderDirectoryCapability,
@@ -37,6 +40,7 @@ from db.models import (
 )
 from process.control_lifecycle import mark_control_run
 from process.control_cancel import raise_if_cancelled
+from process.ext.address_canon import resolve_into_archive
 from process.ext.utils import ensure_database
 
 
@@ -86,7 +90,20 @@ LINKED_REFERENCE_FIELDS = {
         "HealthcareService": ("healthcare_service_refs",),
     },
 }
+RESOURCE_ENDPOINT_FIELDS = {
+    "InsurancePlan": "endpoint_insurance_plan",
+    "Practitioner": "endpoint_practitioner",
+    "Organization": "endpoint_organization",
+    "Location": "endpoint_location",
+    "PractitionerRole": "endpoint_practitioner_role",
+    "HealthcareService": "endpoint_healthcare_service",
+    "OrganizationAffiliation": "endpoint_organization_affiliation",
+}
 PTG_PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW = "ptg_provider_directory_address_corroboration"
+PROVIDER_DIRECTORY_IMPORT_SEEN_TABLE = "provider_directory_import_seen"
+PROVIDER_DIRECTORY_ADDRESS_ARCHIVE_SOURCE_BIT = 128
+PROVIDER_DIRECTORY_ADDRESS_ARCHIVE_PRIORITY = 6
+PROVIDER_DIRECTORY_ADDRESS_ARCHIVE_STAGE_PREFIX = "provider_directory_location_archive_stage"
 RESOURCE_MODELS_BY_TYPE = {
     "InsurancePlan": ProviderDirectoryInsurancePlan,
     "Practitioner": ProviderDirectoryPractitioner,
@@ -113,6 +130,64 @@ USER_AGENT = os.getenv(
     "HealthPortaProviderDirectoryImporter/0.1 (+https://app.healthporta.com)",
 )
 ZIP5_RE = re.compile(r"(?<!\d)(\d{5})(?:-\d{4})?(?!\d)")
+US_STATE_FIPS_TO_ABBR = {
+    "01": "AL",
+    "02": "AK",
+    "04": "AZ",
+    "05": "AR",
+    "06": "CA",
+    "08": "CO",
+    "09": "CT",
+    "10": "DE",
+    "11": "DC",
+    "12": "FL",
+    "13": "GA",
+    "15": "HI",
+    "16": "ID",
+    "17": "IL",
+    "18": "IN",
+    "19": "IA",
+    "20": "KS",
+    "21": "KY",
+    "22": "LA",
+    "23": "ME",
+    "24": "MD",
+    "25": "MA",
+    "26": "MI",
+    "27": "MN",
+    "28": "MS",
+    "29": "MO",
+    "30": "MT",
+    "31": "NE",
+    "32": "NV",
+    "33": "NH",
+    "34": "NJ",
+    "35": "NM",
+    "36": "NY",
+    "37": "NC",
+    "38": "ND",
+    "39": "OH",
+    "40": "OK",
+    "41": "OR",
+    "42": "PA",
+    "44": "RI",
+    "45": "SC",
+    "46": "SD",
+    "47": "TN",
+    "48": "TX",
+    "49": "UT",
+    "50": "VT",
+    "51": "VA",
+    "53": "WA",
+    "54": "WV",
+    "55": "WI",
+    "56": "WY",
+    "60": "AS",
+    "66": "GU",
+    "69": "MP",
+    "72": "PR",
+    "78": "VI",
+}
 PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV = "HLTHPRT_PROVIDER_DIRECTORY_CREDENTIALS_JSON"
 PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV = "HLTHPRT_PROVIDER_DIRECTORY_CREDENTIALS_FILE"
 SECRET_ENV_PREFIX = "env:"
@@ -201,6 +276,14 @@ def _qt(schema: str, table: str) -> str:
     return f"{_q(schema)}.{_q(table)}"
 
 
+def _sql_ref_matches_resource(ref_expr: str, resource_type: str, resource_id_expr: str) -> str:
+    resource_type_literal = str(resource_type).replace("'", "''")
+    return (
+        f"({ref_expr} IN ({resource_id_expr}, '{resource_type_literal}/' || {resource_id_expr}) "
+        f"OR {ref_expr} LIKE '%/{resource_type_literal}/' || {resource_id_expr})"
+    )
+
+
 def _now() -> datetime.datetime:
     return datetime.datetime.utcnow()
 
@@ -219,6 +302,69 @@ def _clean_text(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _normalize_state_code(value: Any) -> str | None:
+    text = _clean_text(value)
+    if not text:
+        return None
+    upper = text.upper()
+    if re.fullmatch(r"[A-Z]{2}", upper):
+        return upper
+    if re.fullmatch(r"\d{1,2}", upper):
+        return US_STATE_FIPS_TO_ABBR.get(upper.zfill(2))
+    return None
+
+
+def _normalize_state_name(value: Any) -> str | None:
+    text = _clean_text(value)
+    if not text:
+        return None
+    if re.fullmatch(r"\d{1,2}", text):
+        return _normalize_state_code(text)
+    return text
+
+
+def _normalize_country_code(value: Any) -> str | None:
+    text = _clean_text(value)
+    if not text:
+        return None
+    token = re.sub(r"[^A-Za-z0-9]+", "", text).upper()
+    if token in {"US", "USA", "UNITEDSTATES", "UNITEDSTATESOFAMERICA", "840", "001"}:
+        return "US"
+    if re.fullmatch(r"[A-Z]{2}", token):
+        return token
+    return text.upper()
+
+
+def _state_fips_restore_sql(value_sql: str) -> str:
+    cases = "\n".join(
+        f"                    WHEN '{fips}' THEN '{abbr}'"
+        for fips, abbr in sorted(US_STATE_FIPS_TO_ABBR.items())
+    )
+    cleaned = f"NULLIF(BTRIM(({value_sql})::varchar), '')"
+    return f"""
+        CASE
+            WHEN {cleaned} ~ '^[0-9]{{1,2}}$' THEN
+                CASE LPAD({cleaned}, 2, '0')
+{cases}
+                    ELSE NULL
+                END
+            ELSE {value_sql}
+        END
+    """
+
+
+def _country_restore_sql(value_sql: str) -> str:
+    cleaned = f"NULLIF(BTRIM(({value_sql})::varchar), '')"
+    token = f"UPPER(REGEXP_REPLACE(COALESCE(({value_sql})::varchar, ''), '[^A-Za-z0-9]+', '', 'g'))"
+    return f"""
+        CASE
+            WHEN {cleaned} IS NULL THEN NULL::varchar
+            WHEN {token} IN ('US', 'USA', 'UNITEDSTATES', 'UNITEDSTATESOFAMERICA', '840', '001') THEN 'US'
+            ELSE UPPER({cleaned})
+        END
+    """
 
 
 def _bool_from_seed(value: Any) -> bool | None:
@@ -306,6 +452,38 @@ def _candidate_metadata_urls(source: dict[str, Any]) -> list[tuple[str, str]]:
             urls.append((api_base, url))
             seen.add(url)
     return urls
+
+
+def _is_placeholder_url(value: str | None) -> bool:
+    text = (value or "").strip()
+    return not text or text.upper() in {"N/A", "NA", "NONE", "NULL", "UNCONFIRMED", "TBD"}
+
+
+def _url_with_count(url: str, page_count: int) -> str:
+    parsed = urllib.parse.urlsplit(url)
+    query_items = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    if not any(key == "_count" for key, _value in query_items):
+        query_items.append(("_count", str(max(1, min(page_count, 100)))))
+    query = urllib.parse.urlencode(query_items, doseq=True)
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, query, parsed.fragment))
+
+
+def _resource_start_url(source: dict[str, Any], resource_type: str, *, page_count: int) -> str | None:
+    api_base = _canonical_base(source.get("api_base"))
+    endpoint_field = RESOURCE_ENDPOINT_FIELDS.get(resource_type)
+    endpoint = _clean_text(source.get(endpoint_field)) if endpoint_field else None
+    if endpoint and not _is_placeholder_url(endpoint):
+        parsed = urllib.parse.urlsplit(endpoint)
+        if parsed.scheme and parsed.netloc:
+            return _url_with_count(endpoint, page_count)
+        if api_base:
+            return _url_with_count(
+                urllib.parse.urljoin(api_base.rstrip("/") + "/", endpoint),
+                page_count,
+            )
+    if not api_base:
+        return None
+    return _url_with_count(f"{api_base}/{resource_type}", page_count)
 
 
 def _load_credentials_config() -> dict[str, Any]:
@@ -855,18 +1033,20 @@ def _address(resource: dict[str, Any]) -> dict[str, Any]:
         match = ZIP5_RE.search(postal_code)
         zip5 = match.group(1) if match else None
     city = _clean_text(first.get("city"))
-    state = _clean_text(first.get("state"))
+    raw_state = _clean_text(first.get("state"))
+    state = _normalize_state_name(raw_state)
+    state_code = _normalize_state_code(raw_state)
     position = resource.get("position") if isinstance(resource.get("position"), dict) else {}
     return {
         "first_line": lines[0] if lines else None,
         "second_line": lines[1] if len(lines) > 1 else None,
         "city_name": city,
         "state_name": state,
-        "state_code": state[:2].upper() if state and len(state) == 2 else None,
+        "state_code": state_code,
         "postal_code": postal_code,
         "zip5": zip5,
         "city_norm": city.upper() if city else None,
-        "country_code": _clean_text(first.get("country")),
+        "country_code": _normalize_country_code(first.get("country")),
         "latitude": _clean_text(position.get("latitude")),
         "longitude": _clean_text(position.get("longitude")),
         "address_json": first if first else None,
@@ -1310,6 +1490,23 @@ def provider_directory_ptg_address_corroboration_sql(
 
     schema = db_schema or _schema()
     view_ref = _qt(schema, view_name)
+    practitioner_ref_match = _sql_ref_matches_resource("role.practitioner_ref", "Practitioner", "practitioner.resource_id")
+    role_location_ref_match = _sql_ref_matches_resource("role.location_ref", "Location", "loc.resource_id")
+    role_plan_ref_match = _sql_ref_matches_resource("plan_ref.value", "InsurancePlan", "insurance_plan.resource_id")
+    role_network_ref_match = _sql_ref_matches_resource("network_ref.value", "Organization", "network_org.resource_id")
+    affiliation_org_ref_match = _sql_ref_matches_resource(
+        "affiliation.organization_ref", "Organization", "organization.resource_id"
+    )
+    affiliation_participating_org_ref_match = _sql_ref_matches_resource(
+        "affiliation.participating_organization_ref", "Organization", "organization.resource_id"
+    )
+    affiliation_location_ref_match = _sql_ref_matches_resource("affiliation.location_ref", "Location", "loc.resource_id")
+    affiliation_plan_ref_match = _sql_ref_matches_resource(
+        "plan_ref.value", "InsurancePlan", "insurance_plan.resource_id"
+    )
+    affiliation_network_ref_match = _sql_ref_matches_resource(
+        "network_ref.value", "Organization", "network_org.resource_id"
+    )
     return f"""
     CREATE OR REPLACE VIEW {view_ref} AS
     WITH practitioner_role_locations AS (
@@ -1380,13 +1577,10 @@ def provider_directory_ptg_address_corroboration_sql(
             ON practitioner.npi = p.npi
           JOIN practitioner_role_locations role
             ON role.source_id = practitioner.source_id
-           AND role.practitioner_ref IN (
-                practitioner.resource_id,
-                'Practitioner/' || practitioner.resource_id
-           )
+           AND {practitioner_ref_match}
           JOIN {_qt(schema, "provider_directory_location")} loc
             ON loc.source_id = role.source_id
-           AND role.location_ref IN (loc.resource_id, 'Location/' || loc.resource_id)
+           AND {role_location_ref_match}
            AND (
                 CASE
                     WHEN loc.address_key ~* '^[0-9a-f]{{8}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}$'
@@ -1428,10 +1622,7 @@ def provider_directory_ptg_address_corroboration_sql(
               ) AS plan_ref(value)
               LEFT JOIN {_qt(schema, "provider_directory_insurance_plan")} insurance_plan
                 ON insurance_plan.source_id = role.source_id
-               AND plan_ref.value IN (
-                    insurance_plan.resource_id,
-                    'InsurancePlan/' || insurance_plan.resource_id
-               )
+               AND {role_plan_ref_match}
           ) plan_context ON TRUE
           LEFT JOIN LATERAL (
             WITH network_ref_values AS (
@@ -1446,10 +1637,7 @@ def provider_directory_ptg_address_corroboration_sql(
                   ) AS plan_ref(value)
                   JOIN {_qt(schema, "provider_directory_insurance_plan")} insurance_plan
                     ON insurance_plan.source_id = role.source_id
-                   AND plan_ref.value IN (
-                        insurance_plan.resource_id,
-                        'InsurancePlan/' || insurance_plan.resource_id
-                   )
+                   AND {role_plan_ref_match}
                   CROSS JOIN LATERAL jsonb_array_elements_text(
                       COALESCE(insurance_plan.network_refs::jsonb, '[]'::jsonb)
                   ) AS plan_network_ref(value)
@@ -1475,10 +1663,7 @@ def provider_directory_ptg_address_corroboration_sql(
               FROM network_ref_values network_ref
               LEFT JOIN {_qt(schema, "provider_directory_organization")} network_org
                 ON network_org.source_id = role.source_id
-               AND network_ref.value IN (
-                    network_org.resource_id,
-                    'Organization/' || network_org.resource_id
-               )
+               AND {role_network_ref_match}
           ) network_context ON TRUE
           JOIN {_qt(schema, "provider_directory_source")} src
             ON src.source_id = role.source_id
@@ -1554,18 +1739,12 @@ def provider_directory_ptg_address_corroboration_sql(
           JOIN organization_affiliation_locations affiliation
             ON affiliation.source_id = organization.source_id
            AND (
-                affiliation.organization_ref IN (
-                    organization.resource_id,
-                    'Organization/' || organization.resource_id
-                )
-             OR affiliation.participating_organization_ref IN (
-                    organization.resource_id,
-                    'Organization/' || organization.resource_id
-                )
+                {affiliation_org_ref_match}
+             OR {affiliation_participating_org_ref_match}
            )
           JOIN {_qt(schema, "provider_directory_location")} loc
             ON loc.source_id = affiliation.source_id
-           AND affiliation.location_ref IN (loc.resource_id, 'Location/' || loc.resource_id)
+           AND {affiliation_location_ref_match}
            AND (
                 CASE
                     WHEN loc.address_key ~* '^[0-9a-f]{{8}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}$'
@@ -1607,10 +1786,7 @@ def provider_directory_ptg_address_corroboration_sql(
               ) AS plan_ref(value)
               LEFT JOIN {_qt(schema, "provider_directory_insurance_plan")} insurance_plan
                 ON insurance_plan.source_id = affiliation.source_id
-               AND plan_ref.value IN (
-                    insurance_plan.resource_id,
-                    'InsurancePlan/' || insurance_plan.resource_id
-               )
+               AND {affiliation_plan_ref_match}
           ) plan_context ON TRUE
           LEFT JOIN LATERAL (
             SELECT
@@ -1636,10 +1812,7 @@ def provider_directory_ptg_address_corroboration_sql(
               ) AS network_ref(value)
               LEFT JOIN {_qt(schema, "provider_directory_organization")} network_org
                 ON network_org.source_id = affiliation.source_id
-               AND network_ref.value IN (
-                    network_org.resource_id,
-                    'Organization/' || network_org.resource_id
-               )
+               AND {affiliation_network_ref_match}
           ) network_context ON TRUE
           JOIN {_qt(schema, "provider_directory_source")} src
             ON src.source_id = affiliation.source_id
@@ -1730,14 +1903,63 @@ async def publish_provider_directory_ptg_address_corroboration_view(db_schema: s
     await db.status(provider_directory_ptg_address_corroboration_sql(db_schema))
 
 
-def provider_directory_location_address_key_sql(db_schema: str | None = None) -> str:
+def provider_directory_location_address_key_sql(
+    db_schema: str | None = None,
+    *,
+    restore_state_from_zip: bool = True,
+) -> str:
     """Stamp imported FHIR Location rows with the shared canonical address key."""
 
     schema = db_schema or _schema()
     qschema = _q(schema)
     location_ref = _qt(schema, "provider_directory_location")
+    raw_state_expr = "COALESCE(NULLIF(state_name, ''), state_code)"
+    normalized_state_expr = _state_fips_restore_sql(raw_state_expr)
+    normalized_country_expr = _country_restore_sql("country_code")
+    country_token_expr = "UPPER(REGEXP_REPLACE(COALESCE(country_code::varchar, ''), '[^A-Za-z0-9]+', '', 'g'))"
+    zip_state_select = "geo.state::varchar" if restore_state_from_zip else "NULL::varchar"
+    zip_state_join = (
+        f"""
+          LEFT JOIN {_qt(schema, "geo_zip_lookup")} AS geo
+            ON geo.zip_code = normalized.source_zip5
+        """
+        if restore_state_from_zip
+        else ""
+    )
     return f"""
-    WITH keyed AS (
+    WITH normalized AS (
+        SELECT
+            source_id,
+            resource_id,
+            first_line,
+            second_line,
+            city_name,
+            postal_code,
+            country_code,
+            {qschema}.addr_zip5_norm_v1(postal_code)::varchar AS source_zip5,
+            {normalized_country_expr} AS normalized_country,
+            {raw_state_expr} AS raw_state,
+            {normalized_state_expr} AS normalized_state
+          FROM {location_ref}
+         WHERE address_key IS NULL
+            OR zip5 IS NULL
+            OR state_code IS NULL
+            OR city_norm IS NULL
+            OR {country_token_expr} IN ('001', '840', 'USA', 'UNITEDSTATES', 'UNITEDSTATESOFAMERICA')
+    ),
+    resolved AS (
+        SELECT
+            normalized.*,
+            CASE
+                WHEN NULLIF(BTRIM(COALESCE(normalized.normalized_state::varchar, '')), '') IS NULL
+                    THEN {zip_state_select}
+                ELSE NULL::varchar
+            END AS zip_restored_state,
+            COALESCE(NULLIF(BTRIM(normalized.normalized_state::varchar), ''), {zip_state_select}) AS resolved_state
+          FROM normalized
+          {zip_state_join}
+    ),
+    keyed AS (
         SELECT
             source_id,
             resource_id,
@@ -1745,20 +1967,31 @@ def provider_directory_location_address_key_sql(db_schema: str | None = None) ->
                 first_line,
                 second_line,
                 city_name,
-                COALESCE(NULLIF(state_name, ''), state_code),
+                resolved_state,
                 postal_code,
-                COALESCE(NULLIF(country_code, ''), 'US')
+                COALESCE(NULLIF(normalized_country, ''), 'US')
             ) AS computed_address_key,
-            {qschema}.addr_zip5_norm_v1(postal_code)::varchar AS computed_zip5,
-            {qschema}.addr_state_code_v1(COALESCE(NULLIF(state_name, ''), state_code))::varchar AS computed_state_code,
-            {qschema}.addr_city_norm_v1(city_name)::varchar AS computed_city_norm
-          FROM {location_ref}
+            source_zip5 AS computed_zip5,
+            {qschema}.addr_state_code_v1(resolved_state)::varchar AS computed_state_code,
+            {qschema}.addr_city_norm_v1(city_name)::varchar AS computed_city_norm,
+            CASE
+                WHEN raw_state ~ '^[0-9]{{1,2}}$'
+                    THEN {qschema}.addr_state_code_v1(resolved_state)::varchar
+                WHEN NULLIF(BTRIM(COALESCE(raw_state::varchar, '')), '') IS NULL
+                 AND zip_restored_state IS NOT NULL
+                    THEN {qschema}.addr_state_code_v1(zip_restored_state)::varchar
+                ELSE NULL::varchar
+            END AS restored_state_name,
+            normalized_country
+          FROM resolved
     )
     UPDATE {location_ref} AS loc
        SET address_key = keyed.computed_address_key::text,
            zip5 = COALESCE(keyed.computed_zip5, loc.zip5),
+           state_name = COALESCE(keyed.restored_state_name, loc.state_name),
            state_code = COALESCE(keyed.computed_state_code, loc.state_code),
            city_norm = COALESCE(keyed.computed_city_norm, loc.city_norm),
+           country_code = COALESCE(keyed.normalized_country, loc.country_code),
            updated_at = now()
       FROM keyed
      WHERE loc.source_id = keyed.source_id
@@ -1767,8 +2000,10 @@ def provider_directory_location_address_key_sql(db_schema: str | None = None) ->
        AND (
             loc.address_key IS DISTINCT FROM keyed.computed_address_key::text
          OR loc.zip5 IS DISTINCT FROM COALESCE(keyed.computed_zip5, loc.zip5)
+         OR loc.state_name IS DISTINCT FROM COALESCE(keyed.restored_state_name, loc.state_name)
          OR loc.state_code IS DISTINCT FROM COALESCE(keyed.computed_state_code, loc.state_code)
          OR loc.city_norm IS DISTINCT FROM COALESCE(keyed.computed_city_norm, loc.city_norm)
+         OR loc.country_code IS DISTINCT FROM COALESCE(keyed.normalized_country, loc.country_code)
        );
     """
 
@@ -1794,7 +2029,121 @@ async def publish_provider_directory_location_address_keys(db_schema: str | None
     schema = db_schema or _schema()
     if not await _address_canon_functions_available(schema):
         return 0
-    return int(await db.status(provider_directory_location_address_key_sql(schema)) or 0)
+    restore_state_from_zip = await _table_exists(schema, "geo_zip_lookup")
+    return int(
+        await db.status(
+            provider_directory_location_address_key_sql(
+                schema,
+                restore_state_from_zip=restore_state_from_zip,
+            )
+        )
+        or 0
+    )
+
+
+def _provider_directory_location_archive_stage_table_name(run_id: str | None = None) -> str:
+    raw = run_id or f"{os.getpid()}_{time.time_ns()}"
+    digest = hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()[:16]
+    return f"{PROVIDER_DIRECTORY_ADDRESS_ARCHIVE_STAGE_PREFIX}_{digest}"
+
+
+def provider_directory_location_archive_stage_sql(
+    db_schema: str | None = None,
+    stage_table: str | None = None,
+) -> str:
+    schema = db_schema or _schema()
+    stage = stage_table or _provider_directory_location_archive_stage_table_name()
+    stage_ref = _qt(schema, stage)
+    location_ref = _qt(schema, "provider_directory_location")
+    uuid_re = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    return f"""
+    CREATE UNLOGGED TABLE {stage_ref} AS
+    WITH eligible AS (
+        SELECT
+            loc.address_key::uuid AS address_key,
+            NULLIF(BTRIM(loc.first_line), '')::text AS first_line,
+            NULLIF(BTRIM(loc.second_line), '')::text AS second_line,
+            NULLIF(BTRIM(loc.city_name), '')::text AS city_name,
+            NULLIF(BTRIM(COALESCE(NULLIF(loc.state_name, ''), loc.state_code)), '')::text AS state_name,
+            NULLIF(BTRIM(COALESCE(NULLIF(loc.postal_code, ''), loc.zip5)), '')::text AS postal_code,
+            COALESCE(NULLIF(BTRIM(loc.country_code), ''), 'US')::text AS country_code,
+            loc.updated_at,
+            loc.source_id,
+            loc.resource_id
+          FROM {location_ref} AS loc
+         WHERE loc.address_key ~* '{uuid_re}'
+           AND NULLIF(BTRIM(COALESCE(NULLIF(loc.state_name, ''), loc.state_code)), '') IS NOT NULL
+           AND UPPER(NULLIF(BTRIM(COALESCE(NULLIF(loc.state_name, ''), loc.state_code)), ''))
+                NOT IN ('UN', 'XX', 'ZZ', 'NULL', 'N/A')
+           AND NULLIF(BTRIM(COALESCE(NULLIF(loc.postal_code, ''), loc.zip5)), '') IS NOT NULL
+           AND (
+                NULLIF(BTRIM(loc.first_line), '') IS NOT NULL
+             OR NULLIF(BTRIM(loc.city_name), '') IS NOT NULL
+           )
+           AND COALESCE(
+                NULLIF(
+                    UPPER(regexp_replace(COALESCE(NULLIF(loc.country_code, ''), 'US'), '[^A-Z0-9]', '', 'g')),
+                    ''
+                ),
+                'US'
+           ) IN ('US', 'USA', 'UNITEDSTATES', 'UNITEDSTATESOFAMERICA', '840', '001')
+    )
+    SELECT DISTINCT ON (address_key)
+        address_key,
+        first_line,
+        second_line,
+        city_name,
+        state_name,
+        postal_code,
+        country_code
+      FROM eligible
+     ORDER BY
+        address_key,
+        first_line IS NULL,
+        length(COALESCE(first_line, '')) DESC,
+        city_name IS NULL,
+        length(COALESCE(city_name, '')) DESC,
+        updated_at DESC NULLS LAST,
+        source_id,
+        resource_id;
+    """
+
+
+async def publish_provider_directory_location_archive(
+    db_schema: str | None = None,
+    *,
+    run_id: str | None = None,
+    stage_table: str | None = None,
+) -> dict[str, Any]:
+    schema = db_schema or _schema()
+    if not await _address_canon_functions_available(schema):
+        return {"skipped": True, "reason": "canonical_functions_unavailable"}
+    if not await _table_exists(schema, "address_archive_v2"):
+        return {"skipped": True, "reason": "address_archive_v2_unavailable"}
+    if not await _table_exists(schema, "provider_directory_location"):
+        return {"skipped": True, "reason": "provider_directory_location_unavailable"}
+    stage = stage_table or _provider_directory_location_archive_stage_table_name(run_id)
+    await db.status(f"DROP TABLE IF EXISTS {_qt(schema, stage)};")
+    try:
+        await db.status(provider_directory_location_archive_stage_sql(schema, stage))
+        await db.status(f"ANALYZE {_qt(schema, stage)};")
+        stats = await resolve_into_archive(
+            stage,
+            {
+                "first_line": "first_line",
+                "second_line": "second_line",
+                "city": "city_name",
+                "state": "state_name",
+                "zip": "postal_code",
+                "country": "COALESCE(NULLIF(country_code, ''), 'US')",
+            },
+            source_bit=PROVIDER_DIRECTORY_ADDRESS_ARCHIVE_SOURCE_BIT,
+            priority=PROVIDER_DIRECTORY_ADDRESS_ARCHIVE_PRIORITY,
+            schema=schema,
+        )
+        return dict(stats.__dict__)
+    finally:
+        await db.status(f"DROP TABLE IF EXISTS {_qt(schema, stage)};")
 
 
 async def publish_provider_directory_ptg_address_corroboration_if_available(
@@ -1823,6 +2172,30 @@ async def _ensure_provider_directory_tables() -> None:
                 f"CREATE {unique}INDEX IF NOT EXISTS {name} "
                 f"ON {_qt(schema, model.__tablename__)} {using}({elements}){where};"
             )
+    await _ensure_provider_directory_import_seen_table(schema)
+
+
+async def _ensure_provider_directory_import_seen_table(schema: str | None = None) -> None:
+    schema = schema or _schema()
+    seen_ref = _qt(schema, PROVIDER_DIRECTORY_IMPORT_SEEN_TABLE)
+    await db.status(
+        f"""
+        CREATE UNLOGGED TABLE IF NOT EXISTS {seen_ref} (
+            run_id varchar(64) NOT NULL,
+            resource_type varchar(64) NOT NULL,
+            source_id varchar(64) NOT NULL,
+            resource_id varchar(256) NOT NULL,
+            seen_at timestamp NOT NULL DEFAULT now(),
+            PRIMARY KEY (run_id, resource_type, source_id, resource_id)
+        );
+        """
+    )
+    await db.status(
+        f"""
+        CREATE INDEX IF NOT EXISTS provider_directory_import_seen_source_idx
+            ON {seen_ref} (run_id, resource_type, source_id);
+        """
+    )
 
 
 def _dedupe_rows_by_primary_key(primary_keys: list[str], rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1839,7 +2212,92 @@ def _max_rows_per_statement(column_count: int) -> int:
     return max(1, min(500, 30000 // max(column_count, 1)))
 
 
-async def _upsert_rows(model, rows: list[dict[str, Any]]) -> int:
+PROVIDER_DIRECTORY_RUN_METADATA_COLUMNS = frozenset({"last_seen_run_id", "observed_at", "updated_at"})
+
+
+async def _mark_resource_rows_seen(model, rows: list[dict[str, Any]], run_id: str | None) -> int:
+    resource_type = RESOURCE_TYPES_BY_MODEL.get(model)
+    if not run_id or not resource_type or not rows:
+        return 0
+    seen: dict[tuple[str, str], tuple[str, str]] = {}
+    for row in rows:
+        source_id = _clean_text(row.get("source_id"))
+        resource_id = _clean_text(row.get("resource_id"))
+        if source_id and resource_id:
+            seen[(source_id, resource_id)] = (source_id, resource_id)
+    if not seen:
+        return 0
+    items = list(seen.values())
+    max_rows = _max_rows_per_statement(4)
+    total = 0
+    seen_ref = _qt(_schema(), PROVIDER_DIRECTORY_IMPORT_SEEN_TABLE)
+    for offset in range(0, len(items), max_rows):
+        batch = items[offset : offset + max_rows]
+        params: dict[str, Any] = {
+            "run_id": run_id,
+            "resource_type": resource_type,
+        }
+        values_sql: list[str] = []
+        for idx, (source_id, resource_id) in enumerate(batch):
+            params[f"source_id_{idx}"] = source_id
+            params[f"resource_id_{idx}"] = resource_id
+            values_sql.append(
+                f"(:run_id, :resource_type, :source_id_{idx}, :resource_id_{idx})"
+            )
+        await db.status(
+            f"""
+            INSERT INTO {seen_ref} (run_id, resource_type, source_id, resource_id)
+            VALUES {", ".join(values_sql)}
+            ON CONFLICT (run_id, resource_type, source_id, resource_id) DO NOTHING;
+            """,
+            **params,
+        )
+        total += len(batch)
+    return total
+
+
+async def _clear_resource_rows_seen(run_id: str | None) -> int:
+    if not run_id:
+        return 0
+    return int(
+        await db.status(
+            f"""
+            DELETE FROM {_qt(_schema(), PROVIDER_DIRECTORY_IMPORT_SEEN_TABLE)}
+             WHERE run_id = :run_id;
+            """,
+            run_id=run_id,
+        )
+        or 0
+    )
+
+
+def _upsert_changed_row_predicate(table, statement, columns: list[str], primary_keys: list[str]):
+    payload_columns = [
+        column
+        for column in columns
+        if column not in primary_keys and column not in PROVIDER_DIRECTORY_RUN_METADATA_COLUMNS
+    ]
+    if not payload_columns:
+        return None
+    predicates = []
+    for column in payload_columns:
+        current_value = getattr(table.c, column)
+        excluded_value = getattr(statement.excluded, column)
+        if isinstance(current_value.type, SQLAlchemyJSON):
+            current_value = current_value.cast(JSONB)
+            excluded_value = excluded_value.cast(JSONB)
+        predicates.append(current_value.is_distinct_from(excluded_value))
+    return or_(
+        *predicates
+    )
+
+
+async def _upsert_rows(
+    model,
+    rows: list[dict[str, Any]],
+    *,
+    skip_unchanged: bool = False,
+) -> int:
     if not rows:
         return 0
     table = model.__table__
@@ -1852,7 +2310,11 @@ async def _upsert_rows(model, rows: list[dict[str, Any]]) -> int:
     if len(rows) > max_rows_per_statement:
         total = 0
         for offset in range(0, len(rows), max_rows_per_statement):
-            total += await _upsert_rows(model, rows[offset : offset + max_rows_per_statement])
+            total += await _upsert_rows(
+                model,
+                rows[offset : offset + max_rows_per_statement],
+                skip_unchanged=skip_unchanged,
+            )
         return total
     normalized = [{key: row.get(key) for key in columns} for row in rows]
     async with db.session() as session:
@@ -1862,7 +2324,12 @@ async def _upsert_rows(model, rows: list[dict[str, Any]]) -> int:
             for column in table.columns
             if column.name not in primary_keys
         }
-        statement = statement.on_conflict_do_update(index_elements=primary_keys, set_=update_columns)
+        update_where = _upsert_changed_row_predicate(table, statement, columns, primary_keys) if skip_unchanged else None
+        statement = statement.on_conflict_do_update(
+            index_elements=primary_keys,
+            set_=update_columns,
+            where=update_where,
+        )
         await session.execute(statement)
     return len(rows)
 
@@ -2225,13 +2692,12 @@ async def _fetch_resource_rows(
     cancel_ctx: dict[str, Any] | None = None,
     cancel_task: dict[str, Any] | None = None,
 ) -> ResourceFetchResult | None:
-    api_base = _canonical_base(source.get("api_base"))
-    if not api_base:
-        return None
     model = RESOURCE_MODELS_BY_TYPE.get(resource_type)
     if model is None:
         return None
-    url = f"{api_base}/{resource_type}?_count={max(1, min(page_count, 100))}"
+    url = _resource_start_url(source, resource_type, page_count=page_count)
+    if not url:
+        return None
     rows: list[dict[str, Any]] = []
     pending_rows: list[dict[str, Any]] = []
     rows_fetched = 0
@@ -2553,9 +3019,52 @@ async def _update_source_resource_import_metadata(
         )
 
 
-async def _delete_stale_resource_rows(model: type, source_id: str, run_id: str | None) -> int:
+async def _upsert_resource_rows(
+    model: type,
+    rows: list[dict[str, Any]],
+    *,
+    run_id: str | None,
+    track_seen: bool,
+) -> int:
+    if not rows:
+        return 0
+    if track_seen:
+        await _mark_resource_rows_seen(model, rows, run_id)
+    return await _upsert_rows(model, rows, skip_unchanged=track_seen and bool(run_id))
+
+
+async def _delete_stale_resource_rows(
+    model: type,
+    source_id: str,
+    run_id: str | None,
+    *,
+    use_seen_table: bool = False,
+) -> int:
     if not run_id:
         return 0
+    if use_seen_table:
+        resource_type = RESOURCE_TYPES_BY_MODEL.get(model)
+        if resource_type:
+            return int(
+                await db.status(
+                    f"""
+                    DELETE FROM {_qt(_schema(), model.__tablename__)} AS resource
+                     WHERE resource.source_id = :source_id
+                       AND NOT EXISTS (
+                            SELECT 1
+                              FROM {_qt(_schema(), PROVIDER_DIRECTORY_IMPORT_SEEN_TABLE)} AS seen
+                             WHERE seen.run_id = :run_id
+                               AND seen.resource_type = :resource_type
+                               AND seen.source_id = resource.source_id
+                               AND seen.resource_id = resource.resource_id
+                       );
+                    """,
+                    source_id=source_id,
+                    run_id=run_id,
+                    resource_type=resource_type,
+                )
+                or 0
+            )
     return int(
         await db.status(
             f"""
@@ -2851,13 +3360,18 @@ async def _import_alohr_graphql_source_group(
         resource_type = RESOURCE_TYPES_BY_MODEL.get(model)
         if resource_type not in selected:
             continue
-        written = await _upsert_rows(model, rows)
+        written = await _upsert_resource_rows(model, rows, run_id=run_id, track_seen=stale_cleanup)
         source_counts[resource_type] = source_counts.get(resource_type, 0) + written
         if resource_type in diagnostics:
             diagnostics[resource_type]["rows_written"] = written // max(1, len(source_ids))
         if stale_cleanup and diagnostics.get(resource_type, {}).get("complete"):
             for source_id in source_ids:
-                stale_deleted = await _delete_stale_resource_rows(model, source_id, run_id)
+                stale_deleted = await _delete_stale_resource_rows(
+                    model,
+                    source_id,
+                    run_id,
+                    use_seen_table=True,
+                )
                 if stale_deleted:
                     stale_counts[resource_type] = stale_counts.get(resource_type, 0) + stale_deleted
 
@@ -2931,7 +3445,12 @@ async def _import_resources(
             use_streaming = stream_batch_size > 0
 
             async def row_batch_handler(model: type, rows: list[dict[str, Any]]) -> int:
-                return await _upsert_rows(model, _copy_rows_for_source_ids(rows, source_ids))
+                return await _upsert_resource_rows(
+                    model,
+                    _copy_rows_for_source_ids(rows, source_ids),
+                    run_id=run_id,
+                    track_seen=stale_cleanup,
+                )
 
             result = await _fetch_resource_rows(
                 source,
@@ -2955,7 +3474,12 @@ async def _import_resources(
             written_total = (
                 result.rows_written
                 if use_streaming
-                else await _upsert_rows(result.model, _copy_rows_for_source_ids(result.rows, source_ids))
+                else await _upsert_resource_rows(
+                    result.model,
+                    _copy_rows_for_source_ids(result.rows, source_ids),
+                    run_id=run_id,
+                    track_seen=stale_cleanup,
+                )
             )
             source_counts[resource_type] += written_total
             source_resource_diagnostics[resource_type] = _resource_fetch_diagnostic(
@@ -2964,7 +3488,12 @@ async def _import_resources(
             )
             if stale_cleanup and result.complete:
                 for source_id in source_ids:
-                    stale_deleted = await _delete_stale_resource_rows(result.model, source_id, run_id)
+                    stale_deleted = await _delete_stale_resource_rows(
+                        result.model,
+                        source_id,
+                        run_id,
+                        use_seen_table=True,
+                    )
                     if stale_deleted:
                         source_stale_counts[resource_type] = source_stale_counts.get(resource_type, 0) + stale_deleted
         if linked_resource_limit > 0 and rows_by_resource:
@@ -3081,6 +3610,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
         task.get("publish_artifacts"),
         set(resources) == set(DEFAULT_RESOURCES),
     )
+    await _clear_resource_rows_seen(run_id)
 
     seed_rows: list[dict[str, Any]]
     tmpdir = None
@@ -3217,7 +3747,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                     run_id,
                     phase="provider-directory publishing artifacts",
                     done=0,
-                    total=2,
+                    total=3,
                     message="publishing Provider Directory address artifacts",
                     metrics=metrics,
                 )
@@ -3226,10 +3756,23 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                     run_id,
                     phase="provider-directory publishing artifacts",
                     done=1,
-                    total=2,
+                    total=3,
                     message=(
                         "stamped Provider Directory location address keys; "
                         f"rows={metrics['location_address_keys_stamped']}"
+                    ),
+                    metrics=metrics,
+                )
+                metrics["location_archive"] = await publish_provider_directory_location_archive(run_id=run_id)
+                await _mark_provider_directory_progress(
+                    run_id,
+                    phase="provider-directory publishing artifacts",
+                    done=2,
+                    total=3,
+                    message=(
+                        "published Provider Directory locations to address archive; "
+                        f"inserted={metrics['location_archive'].get('inserted', 0)} "
+                        f"updated={metrics['location_archive'].get('provenance_updates', 0)}"
                     ),
                     metrics=metrics,
                 )
@@ -3239,13 +3782,14 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                 await _mark_provider_directory_progress(
                     run_id,
                     phase="provider-directory publishing artifacts",
-                    done=2,
-                    total=2,
+                    done=3,
+                    total=3,
                     message="published Provider Directory PTG corroboration artifacts",
                     metrics=metrics,
                 )
             else:
                 metrics["location_address_keys_stamped"] = 0
+                metrics["location_archive"] = {"skipped": True, "reason": "publish_artifacts_disabled"}
                 metrics["ptg_corroboration_view_published"] = False
         ctx["context"]["audit"] = metrics
         ctx["context"]["run"] = ctx["context"].get("run", 0) + 1
@@ -3259,6 +3803,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
         print("PROVIDER_DIRECTORY_FHIR_IMPORT_DONE\t" + json.dumps(metrics, sort_keys=True, default=str))
         return metrics
     finally:
+        await _clear_resource_rows_seen(run_id)
         if tmpdir is not None:
             tmpdir.cleanup()
 

@@ -127,6 +127,7 @@ async def test_overlay_provider_directory_corroboration_marks_address_and_prefer
     assert item["address_verification"]["address_network_binding"] == "payer_directory_corroborated_location"
     assert item["address_verification"]["requires_location_confirmation"] is False
     assert item["address_verification"]["displayed_address_present"] is True
+    assert item["address_verification"]["network_bound_address"] is True
     assert item["address_verification"]["provider_directory_plan_context_matched"] is True
     assert item["address_verification"]["provider_directory_location_resource_id"] == "loc-1"
     assert item["address_verification"]["provider_directory_insurance_plan_matches"] == ["InsurancePlan/plan-1"]
@@ -192,6 +193,7 @@ async def test_overlay_provider_directory_address_only_keeps_network_binding_inf
     assert item["address_verification"]["address_network_binding"] == "inferred_from_provider_identity"
     assert item["address_verification"]["requires_location_confirmation"] is True
     assert item["address_verification"]["displayed_address_present"] is True
+    assert item["address_verification"]["network_bound_address"] is False
     assert item["address_verification"]["provider_directory_plan_context_matched"] is False
     assert item["address_verification"]["provider_directory_network_context_present"] is True
     assert item["address_verification"]["provider_directory_network_refs"] == ["Organization/network-1"]
@@ -2199,6 +2201,7 @@ def test_compact_item_marks_unified_address_as_inferred_from_provider_identity()
         "requires_location_confirmation": True,
         "reason": "PTG proves the NPI/TIN is in network; the displayed address comes from NPPES/provider enrichment.",
         "displayed_address_present": True,
+        "network_bound_address": False,
         "location_source": "entity_address_unified",
         "location_confidence_code": "entity_address_unified",
         "address_precision": "street",
@@ -2351,6 +2354,12 @@ def test_compact_item_marks_explicit_payer_location_as_payer_confirmed():
             "provider_name": "Example Surgeon",
             "location_source": "payer_provider_group_location",
             "location_confidence_code": "payer_confirmed_location",
+            "source_trace": [
+                {
+                    "source_file_version_id": "source-version-1",
+                    "original_url": "https://example.test/in-network-rates.json.gz",
+                }
+            ],
             "address_payload": {
                 "first_line": "100 Network Way",
                 "city": "Example",
@@ -2370,6 +2379,34 @@ def test_compact_item_marks_explicit_payer_location_as_payer_confirmed():
     assert item["address_verification"]["address_evidence_level"] == "payer_confirmed_location"
     assert item["address_verification"]["address_network_binding"] == "payer_confirmed_location"
     assert item["address_verification"]["requires_location_confirmation"] is False
+
+
+def test_compact_item_does_not_mark_payer_location_without_source_trace():
+    item = ptg2_serving._compact_item_from_row(
+        {
+            "npi": 1234567890,
+            "provider_name": "Example Surgeon",
+            "location_source": "payer_provider_group_location",
+            "location_confidence_code": "payer_confirmed_location",
+            "address_payload": {
+                "first_line": "100 Network Way",
+                "city": "Example",
+                "state": "IL",
+                "postal_code": "62401",
+                "address_verification_evidence": {
+                    "source": "payer_provider_group_location",
+                    "provider_group_id": 1662,
+                    "json_pointer": "/provider_references/0/provider_groups/0/address",
+                },
+            },
+            "prices": [],
+        },
+        {},
+    )
+
+    assert item["address_verification"]["address_network_binding"] == "inferred_from_provider_identity"
+    assert item["address_verification"]["address_evidence_level"] == "unknown"
+    assert item["address_verification"]["requires_location_confirmation"] is True
 
 
 def test_compact_item_does_not_mark_payer_location_without_source_record_evidence():
@@ -2831,6 +2868,7 @@ def test_compact_item_marks_address_key_only_as_not_displayable():
     assert item["address_verification"]["displayed_address_present"] is False
     assert item["address_verification"]["address_evidence_level"] == "unknown"
     assert item["address_verification"]["requires_location_confirmation"] is True
+    assert item["address_verification"]["network_bound_address"] is False
     for key in ("location_source", "address_sources", "address_precision", "source_count"):
         assert key not in item["address_verification"]
     assert "address" not in item
@@ -2861,6 +2899,7 @@ def test_compact_item_marks_city_only_as_not_displayable():
     assert item["address_verification"]["address_evidence_level"] == "unknown"
     assert item["address_verification"]["displayed_address_present"] is False
     assert item["address_verification"]["requires_location_confirmation"] is True
+    assert item["address_verification"]["network_bound_address"] is False
     for key in ("location_source", "address_sources", "address_precision", "source_count"):
         assert key not in item["address_verification"]
     assert "address" not in item
@@ -2886,6 +2925,7 @@ def test_compact_item_strips_phone_and_distance_for_no_display_address():
             },
             "distance_miles": 2.3,
             "zip_match_type": "radius",
+            "coordinates": {"lat": 39.12004, "long": -88.54338},
             "location_source": "entity_address_unified",
             "prices": [],
         },
@@ -2907,6 +2947,7 @@ def test_compact_item_strips_phone_and_distance_for_no_display_address():
         "fax_number",
         "distance_miles",
         "zip_match_type",
+        "coordinates",
         "location_source",
     ):
         assert key not in item

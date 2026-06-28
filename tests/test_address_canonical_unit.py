@@ -2667,8 +2667,14 @@ async def test_entity_address_unified_compacts_source_record_ids_by_metadata_res
     assert rows == 42
     joined = "\n".join(statements)
     assert "pg_class" in statements[0]
+    assert "DROP COLUMN IF EXISTS source_record_ids_compact" in joined
+    assert "ADD COLUMN source_record_ids_compact varchar[] NOT NULL DEFAULT '{}'" in joined
+    assert "UPDATE mrf.entity_address_unified_stage" in joined
+    assert "provider_directory_fhir:%" in joined
+    assert "WHERE address_sources @> ARRAY['provider_directory_fhir']::varchar[]" in joined
     assert "ALTER TABLE mrf.entity_address_unified_stage DROP COLUMN source_record_ids" in joined
-    assert "ADD COLUMN source_record_ids varchar[] NOT NULL DEFAULT '{}'" in joined
+    assert "RENAME COLUMN source_record_ids_compact TO source_record_ids" in joined
+    assert "ADD COLUMN source_record_ids varchar[] NOT NULL DEFAULT '{}'" not in joined
     assert "entity_address_unified_stage_compact" not in joined
 
 
@@ -2701,7 +2707,8 @@ async def test_entity_address_unified_can_compact_source_record_ids_by_rewrite(m
     insert_sql = statements[2]
     assert "INSERT INTO mrf.entity_address_unified_stage_compact" in insert_sql
     assert "source_record_ids" in insert_sql
-    assert "ARRAY[]::varchar[] AS source_record_ids" in insert_sql
+    assert "provider_directory_fhir:%" in insert_sql
+    assert "ARRAY[]::varchar[] END AS source_record_ids" in insert_sql
     assert "UPDATE mrf.entity_address_unified_stage" not in "\n".join(statements)
     assert statements[3] == "DROP TABLE mrf.entity_address_unified_stage;"
     assert (

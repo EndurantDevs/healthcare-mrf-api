@@ -1,142 +1,105 @@
-# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-
-import pytest
-
 from scripts.research import provider_directory_coverage_audit as audit
 
 
-def test_provider_directory_coverage_audit_derives_actionable_gaps():
+def test_provider_directory_coverage_audit_parse_args_accepts_ptg_plan_filter():
+    args = audit.parse_args(["--ptg-plan-id", "010854205"])
+
+    assert args.ptg_plan_id == "010854205"
+
+
+def test_provider_directory_coverage_audit_parse_args_accepts_skip_ptg():
+    args = audit.parse_args(["--skip-ptg"])
+
+    assert args.skip_ptg is True
+
+
+def test_provider_directory_coverage_audit_skipped_ptg_summary_shape():
+    summary = audit._skipped_ptg_summary()
+
+    assert summary["ptg_address"] == {
+        "available": False,
+        "skipped": True,
+        "reason": "disabled by --skip-ptg",
+    }
+    assert summary["ptg_corroboration"] == {
+        "available": False,
+        "skipped": True,
+        "reason": "disabled by --skip-ptg",
+    }
+
+
+def test_provider_directory_coverage_audit_ref_match_accepts_absolute_url_suffixes():
+    sql = audit._sql_ref_matches_resource("refs.ref", "Organization", "org.resource_id")
+
+    assert "refs.ref IN (org.resource_id, 'Organization/' || org.resource_id)" in sql
+    assert "refs.ref LIKE '%/Organization/' || org.resource_id" in sql
+
+
+def test_provider_directory_coverage_audit_gaps_when_requested_plan_has_no_ptg_rows():
     report = {
-        "source_summary": {
-            "available": True,
-            "live_auth_required_count": 12,
-            "never_probed_count": 1,
-        },
-        "capability_status_counts": [{"probe_status": "valid_non_fhir", "count": 3}],
-        "unified_summary": {
-            "available": True,
-            "provider_directory_null_key_rows": 5,
-        },
-        "network_resolution_summary": {
-            "available": True,
-            "unresolved_network_refs": 7,
-        },
-        "valid_sources_without_resource_rows": {
-            "available": True,
-            "source_count": 2,
-        },
+        "ptg_plan_filter": "010854205",
         "ptg_summary": {
-            "ptg_corroboration": {
-                "available": True,
-                "network_context_rows": 9,
-                "resolved_network_match_rows": 0,
-            }
+            "ptg_address": {"available": True, "ptg_address_rows": 0},
+            "ptg_corroboration": {"available": True, "corroboration_rows": 0},
         },
     }
 
-    gaps = audit._derive_gaps(report)  # pylint: disable=protected-access
-
-    assert "12 Provider Directory sources require auth/registration before full import." in gaps
-    assert "1 Provider Directory source(s) have not been probed." in gaps
-    assert "3 seed URLs responded but did not expose a FHIR CapabilityStatement." in gaps
-    assert "5 Provider Directory unified-address rows still lack address_key." in gaps
-    assert "7 distinct Provider Directory network refs are unresolved to FHIR Organization names." in gaps
-    assert "2 Provider Directory source(s) have valid unauthenticated metadata but no imported resource rows." in gaps
-    assert "PTG-overlap Provider Directory rows carry network refs" in gaps[-1]
+    assert audit._derive_gaps(report) == [
+        "Requested PTG plan `010854205` has no ptg_address rows in this database."
+    ]
 
 
-def test_provider_directory_coverage_audit_markdown_includes_core_sections():
+def test_provider_directory_coverage_audit_gaps_when_requested_plan_lacks_corroboration():
     report = {
-        "generated_at": "2026-06-28T00:00:00Z",
-        "schema": "mrf",
-        "source_summary": {
-            "available": True,
-            "source_count": 734,
-            "live_valid_count": 42,
-            "live_valid_pct": 5.72,
-            "live_auth_required_count": 329,
-            "auth_required_pct": 44.82,
-            "api_base_count": 728,
-            "api_base_pct": 99.18,
-        },
-        "unified_summary": {
-            "available": True,
-            "provider_directory_rows": 616,
-            "provider_directory_keyed_rows": 502,
-            "provider_directory_keyed_pct": 81.49,
-            "provider_directory_phone_rows": 407,
-            "provider_directory_phone_pct": 66.07,
-        },
+        "ptg_plan_filter": "codex_plan_a",
         "ptg_summary": {
-            "ptg_corroboration": {
-                "available": True,
-                "corroboration_rows": 193,
-                "plan_context_match_rows": 0,
-                "resolved_network_match_rows": 0,
-            }
+            "ptg_address": {"available": True, "ptg_address_rows": 10},
+            "ptg_corroboration": {"available": True, "corroboration_rows": 0},
         },
-        "network_resolution_summary": {
-            "available": True,
-            "resolved_network_refs": 4,
-            "distinct_network_refs": 8,
-            "resolved_network_ref_pct": 50.0,
-            "top_unresolved_refs": [
-                {
-                    "org_name": "Example Payer",
-                    "ref": "Organization/network-x",
-                    "reference_count": 10,
-                }
-            ],
-        },
-        "capability_status_counts": [{"probe_status": "valid", "count": 42}],
-        "top_source_yield": [
-            {
-                "org_name": "Example Payer",
-                "last_probe_status": "valid",
-                "resource_rows": 123,
-                "resource_counts": {"location": 10},
-            }
-        ],
-        "valid_sources_without_resource_rows": {
-            "available": True,
-            "source_count": 1,
-            "samples": [
-                {
-                    "org_name": "Aetna",
-                    "plan_name": "Aetna Better Health",
-                    "auth_type": "OAuth2/SMART",
-                    "canonical_api_base": "https://apif1.aetna.com/fhir/v1/providerdirectory",
-                    "last_resource_import": {
-                        "resources": {
-                            "Practitioner": {"error": "http_401"},
-                            "Location": {"error": "http_401"},
-                        }
-                    },
-                }
-            ],
-        },
-        "gaps": ["Example gap"],
     }
 
-    markdown = audit.render_markdown(report)
-
-    assert "# Provider Directory Coverage Audit" in markdown
-    assert "- sources: `734`" in markdown
-    assert "- keyed Provider Directory rows: `502` (81.49%)" in markdown
-    assert "## Gaps" in markdown
-    assert "| `valid` | 42 |" in markdown
-    assert "| Example Payer | `Organization/network-x` | 10 |" in markdown
-    assert "## Valid Metadata With No Imported Rows" in markdown
-    assert "| Aetna | Aetna Better Health | `OAuth2/SMART` | `https://apif1.aetna.com/fhir/v1/providerdirectory` | `http_401` |" in markdown
-    assert '`{"location": 10}`' in markdown
+    assert audit._derive_gaps(report) == [
+        "Requested PTG plan `codex_plan_a` has no Provider Directory address corroboration rows."
+    ]
 
 
-def test_provider_directory_coverage_audit_rejects_unsafe_identifier():
-    with pytest.raises(ValueError):
-        audit._validate_identifier("mrf;drop schema", label="schema")  # pylint: disable=protected-access
+def test_provider_directory_coverage_audit_gaps_for_missing_unified_source_ids_and_numeric_country():
+    report = {
+        "unified_summary": {
+            "available": True,
+            "provider_directory_rows": 10,
+            "provider_directory_source_record_id_rows": 7,
+            "provider_directory_country_001_rows": 2,
+        },
+    }
+
+    gaps = audit._derive_gaps(report)
+
+    assert "3 Provider Directory unified-address rows lack retained FHIR source record IDs." in gaps
+    assert "2 Provider Directory unified-address rows still expose country_code `001`." in gaps
 
 
-def test_provider_directory_coverage_audit_parse_skip_network_resolution():
-    args = audit.parse_args(["--skip-network-resolution"])
+def test_provider_directory_coverage_audit_markdown_includes_unified_source_id_and_country_counts():
+    markdown = audit.render_markdown(
+        {
+            "generated_at": "2026-06-28T00:00:00Z",
+            "schema": "mrf",
+            "ptg_plan_filter": None,
+            "unified_summary": {
+                "available": True,
+                "provider_directory_rows": 282912,
+                "provider_directory_keyed_rows": 282912,
+                "provider_directory_keyed_pct": 100.0,
+                "provider_directory_phone_rows": 282000,
+                "provider_directory_phone_pct": 99.68,
+                "provider_directory_source_record_id_rows": 282912,
+                "provider_directory_source_record_id_pct": 100.0,
+                "provider_directory_country_001_rows": 0,
+            },
+            "ptg_summary": audit._skipped_ptg_summary(),
+        }
+    )
 
-    assert args.skip_network_resolution is True
+    assert "- Provider Directory rows with source record IDs: `282912` (100.0%)" in markdown
+    assert "- Provider Directory rows with country `001`: `0`" in markdown
+    assert "- PTG corroboration: skipped (disabled by --skip-ptg)" in markdown

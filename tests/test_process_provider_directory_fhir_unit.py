@@ -9,6 +9,7 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from sqlalchemy.dialects import postgresql
 
 from db.models import (
     ProviderDirectoryCapability,
@@ -130,6 +131,125 @@ def test_alohr_provider_rows_emit_practitioner_location_and_role():
     assert role["location_refs"] == [f"Location/{location['resource_id']}"]
 
 
+def test_fhir_address_normalizes_numeric_state_fips():
+    address = importer._address(  # pylint: disable=protected-access
+        {
+            "address": [
+                {
+                    "line": ["777 Township Line Rd", "Suite 150"],
+                    "city": "Yardley",
+                    "state": "42",
+                    "postalCode": "19067",
+                }
+            ]
+        }
+    )
+
+    assert address["state_name"] == "PA"
+    assert address["state_code"] == "PA"
+
+
+def test_fhir_address_normalizes_us_numeric_country_code():
+    address = importer._address(  # pylint: disable=protected-access
+        {
+            "address": [
+                {
+                    "line": ["1525 W 2100 S"],
+                    "city": "S SALT LAKE",
+                    "state": "UT",
+                    "postalCode": "84119",
+                    "country": "001",
+                }
+            ]
+        }
+    )
+
+    assert address["country_code"] == "US"
+
+
+def test_provider_directory_location_address_key_sql_recovers_numeric_state_fips():
+    sql = importer.provider_directory_location_address_key_sql("mrf")
+
+    assert "WHEN '42' THEN 'PA'" in sql
+    assert "normalized_state" in sql
+    assert "normalized_country" in sql
+    assert "WHEN UPPER(REGEXP_REPLACE(COALESCE((country_code)::varchar, ''), '[^A-Za-z0-9]+', '', 'g')) IN" in sql
+    assert "'840', '001'" in sql
+    assert 'LEFT JOIN "mrf"."geo_zip_lookup" AS geo' in sql
+    assert "zip_restored_state" in sql
+    assert "resolved_state" in sql
+    assert "WHERE address_key IS NULL" in sql
+    assert "OR zip5 IS NULL" in sql
+    assert "state_name = COALESCE(keyed.restored_state_name, loc.state_name)" in sql
+    assert "country_code = COALESCE(keyed.normalized_country, loc.country_code)" in sql
+
+
+def test_provider_directory_location_address_key_sql_can_skip_zip_state_restore():
+    sql = importer.provider_directory_location_address_key_sql("mrf", restore_state_from_zip=False)
+
+    assert "geo_zip_lookup" not in sql
+    assert "END AS zip_restored_state" in sql
+    assert "NULL::varchar) AS resolved_state" in sql
+
+
+def test_upsert_changed_row_predicate_ignores_run_metadata_columns():
+    table = ProviderDirectoryLocation.__table__
+    columns = [column.name for column in table.columns]
+    primary_keys = [column.name for column in table.primary_key.columns]
+    statement = importer.pg_insert(table).values(  # pylint: disable=protected-access
+        {
+            "source_id": "source_a",
+            "resource_id": "loc-1",
+            "first_line": "100 Main St",
+            "last_seen_run_id": "run_2",
+        }
+    )
+
+    predicate = importer._upsert_changed_row_predicate(  # pylint: disable=protected-access
+        table,
+        statement,
+        columns,
+        primary_keys,
+    )
+    sql = str(predicate.compile(dialect=postgresql.dialect()))
+
+    assert "first_line" in sql
+    assert "CAST" in sql
+    assert "JSONB" in sql
+    assert "last_seen_run_id" not in sql
+    assert "observed_at" not in sql
+    assert "updated_at" not in sql
+
+
+@pytest.mark.asyncio
+async def test_upsert_resource_rows_tracks_seen_and_skips_unchanged(monkeypatch):
+    seen_calls = []
+    upsert_calls = []
+
+    async def fake_mark_seen(model, rows, run_id):
+        seen_calls.append((model, rows, run_id))
+        return len(rows)
+
+    async def fake_upsert(model, rows, **kwargs):
+        upsert_calls.append((model, rows, kwargs))
+        return len(rows)
+
+    monkeypatch.setattr(importer, "_mark_resource_rows_seen", fake_mark_seen)
+    monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
+
+    rows = [{"source_id": "source_a", "resource_id": "loc-1"}]
+    written = await importer._upsert_resource_rows(  # pylint: disable=protected-access
+        ProviderDirectoryLocation,
+        rows,
+        run_id="run_1",
+        track_seen=True,
+    )
+
+    assert written == 1
+    assert seen_calls == [(ProviderDirectoryLocation, rows, "run_1")]
+    assert upsert_calls == [(ProviderDirectoryLocation, rows, {"skip_unchanged": True})]
+
+
 @pytest.mark.asyncio
 async def test_import_alohr_graphql_source_group_writes_existing_resource_tables(monkeypatch):
     calls: list[tuple[str, str | None]] = []
@@ -167,7 +287,7 @@ async def test_import_alohr_graphql_source_group_writes_existing_resource_tables
 
     upserts: dict[type, list[dict[str, Any]]] = {}
 
-    async def fake_upsert(model, rows):
+    async def fake_upsert(model, rows, **_kwargs):
         upserts.setdefault(model, []).extend(rows)
         return len(rows)
 
@@ -412,7 +532,7 @@ async def test_probe_sources_records_credential_descriptor_without_secret(monkey
 
     upserts = []
 
-    async def fake_upsert(model, rows):
+    async def fake_upsert(model, rows, **_kwargs):
         upserts.append((model, rows))
         return len(rows)
 
@@ -570,7 +690,7 @@ async def test_probe_sources_persists_resolved_api_base_for_repaired_catalog_url
 
     upserts = []
 
-    async def fake_upsert(model, rows):
+    async def fake_upsert(model, rows, **_kwargs):
         upserts.append((model, rows))
         return len(rows)
 
@@ -680,6 +800,8 @@ def test_provider_directory_ptg_address_corroboration_sql_links_ptg_npi_address_
     assert "COALESCE(affiliation.location_refs::jsonb, '[]'::jsonb)" in sql
     assert "COALESCE(affiliation.network_refs::jsonb, '[]'::jsonb) AS network_refs" in sql
     assert "role.location_ref IN (loc.resource_id, 'Location/' || loc.resource_id)" in sql
+    assert "role.location_ref LIKE '%/Location/' || loc.resource_id" in sql
+    assert "network_ref.value LIKE '%/Organization/' || network_org.resource_id" in sql
     assert "loc.address_key ~* '^[0-9a-f]{8}-" in sql
     assert "THEN loc.address_key::uuid" in sql
     assert "jsonb_build_object(" in sql
@@ -728,7 +850,7 @@ def test_provider_directory_location_address_key_sql_uses_shared_canonical_funct
     assert 'UPDATE "mrf"."provider_directory_location" AS loc' in sql
     assert '"mrf".addr_key_v1(' in sql
     assert '"mrf".addr_zip5_norm_v1(postal_code)' in sql
-    assert '"mrf".addr_state_code_v1(COALESCE(NULLIF(state_name, \'\'), state_code))' in sql
+    assert '"mrf".addr_state_code_v1(resolved_state)' in sql
     assert '"mrf".addr_city_norm_v1(city_name)' in sql
     assert "keyed.computed_address_key IS NOT NULL" in sql
     assert "address_key = keyed.computed_address_key::text" in sql
@@ -744,6 +866,13 @@ def test_reference_resource_key_handles_relative_and_absolute_fhir_refs():
         "Practitioner",
     ) == ("Practitioner", "prac|1")
     assert importer._reference_resource_key("Organization/org-1", "Location") is None  # pylint: disable=protected-access
+
+
+def test_sql_ref_matches_resource_accepts_absolute_url_suffixes():
+    sql = importer._sql_ref_matches_resource("refs.ref", "Organization", "org.resource_id")  # pylint: disable=protected-access
+
+    assert "refs.ref IN (org.resource_id, 'Organization/' || org.resource_id)" in sql
+    assert "refs.ref LIKE '%/Organization/' || org.resource_id" in sql
 
 
 @pytest.mark.asyncio
@@ -768,7 +897,7 @@ async def test_import_linked_resource_rows_fetches_role_references_and_upserts(m
 
     upserts = []
 
-    async def fake_upsert(model, rows):
+    async def fake_upsert(model, rows, **_kwargs):
         upserts.append((model, rows))
         return len(rows)
 
@@ -827,7 +956,7 @@ async def test_import_resources_accumulates_linked_resource_counts(monkeypatch):
             next_url_remaining=False,
         )
 
-    async def fake_upsert(_model, rows):
+    async def fake_upsert(_model, rows, **_kwargs):
         return len(rows)
 
     async def fake_import_linked(_source, _rows_by_resource, **_kwargs):
@@ -869,14 +998,87 @@ async def test_publish_provider_directory_location_address_keys_skips_without_ca
 @pytest.mark.asyncio
 async def test_publish_provider_directory_location_address_keys_runs_canonical_update(monkeypatch):
     monkeypatch.setattr(importer, "_address_canon_functions_available", AsyncMock(return_value=True))
+    table_exists = AsyncMock(return_value=True)
+    monkeypatch.setattr(importer, "_table_exists", table_exists)
     status = AsyncMock(return_value=7)
     monkeypatch.setattr(importer.db, "status", status)
 
     stamped = await importer.publish_provider_directory_location_address_keys("mrf")
 
     assert stamped == 7
+    table_exists.assert_awaited_once_with("mrf", "geo_zip_lookup")
     status.assert_awaited_once()
     assert 'UPDATE "mrf"."provider_directory_location" AS loc' in status.await_args.args[0]
+    assert 'LEFT JOIN "mrf"."geo_zip_lookup" AS geo' in status.await_args.args[0]
+
+
+def test_provider_directory_location_archive_stage_sql_filters_keyable_uuid_locations():
+    sql = importer.provider_directory_location_archive_stage_sql("mrf", "provider_directory_location_archive_stage_test")
+
+    assert 'CREATE UNLOGGED TABLE "mrf"."provider_directory_location_archive_stage_test" AS' in sql
+    assert 'FROM "mrf"."provider_directory_location" AS loc' in sql
+    assert "loc.address_key ~*" in sql
+    assert "loc.address_key::uuid AS address_key" in sql
+    assert "NOT IN ('UN', 'XX', 'ZZ', 'NULL', 'N/A')" in sql
+    assert "IN ('US', 'USA', 'UNITEDSTATES', 'UNITEDSTATESOFAMERICA', '840', '001')" in sql
+    assert "NULLIF(BTRIM(loc.first_line), '') IS NOT NULL" in sql
+    assert "OR NULLIF(BTRIM(loc.city_name), '') IS NOT NULL" in sql
+    assert "SELECT DISTINCT ON (address_key)" in sql
+
+
+@pytest.mark.asyncio
+async def test_publish_provider_directory_location_archive_resolves_and_cleans_stage(monkeypatch):
+    monkeypatch.setattr(importer, "_address_canon_functions_available", AsyncMock(return_value=True))
+    monkeypatch.setattr(importer, "_table_exists", AsyncMock(return_value=True))
+    status = AsyncMock(return_value=0)
+    monkeypatch.setattr(importer.db, "status", status)
+
+    class Stats:
+        def __init__(self):
+            self.staged = 10
+            self.distinct_keys = 8
+            self.inserted = 7
+            self.provenance_updates = 1
+            self.null_key_rows = 0
+
+    resolve = AsyncMock(return_value=Stats())
+    monkeypatch.setattr(importer, "resolve_into_archive", resolve)
+
+    stats = await importer.publish_provider_directory_location_archive(
+        "mrf",
+        run_id="run_1",
+        stage_table="provider_directory_location_archive_stage_test",
+    )
+
+    assert stats["inserted"] == 7
+    assert stats["provenance_updates"] == 1
+    status_calls = [call.args[0] for call in status.await_args_list]
+    assert status_calls[0] == 'DROP TABLE IF EXISTS "mrf"."provider_directory_location_archive_stage_test";'
+    assert 'CREATE UNLOGGED TABLE "mrf"."provider_directory_location_archive_stage_test" AS' in status_calls[1]
+    assert status_calls[2] == 'ANALYZE "mrf"."provider_directory_location_archive_stage_test";'
+    assert status_calls[-1] == 'DROP TABLE IF EXISTS "mrf"."provider_directory_location_archive_stage_test";'
+    resolve.assert_awaited_once()
+    assert resolve.await_args.args[0] == "provider_directory_location_archive_stage_test"
+    assert resolve.await_args.kwargs["source_bit"] == importer.PROVIDER_DIRECTORY_ADDRESS_ARCHIVE_SOURCE_BIT
+    assert resolve.await_args.kwargs["priority"] == importer.PROVIDER_DIRECTORY_ADDRESS_ARCHIVE_PRIORITY
+    assert resolve.await_args.kwargs["schema"] == "mrf"
+
+
+@pytest.mark.asyncio
+async def test_publish_provider_directory_location_archive_skips_without_archive(monkeypatch):
+    monkeypatch.setattr(importer, "_address_canon_functions_available", AsyncMock(return_value=True))
+
+    async def fake_table_exists(_schema, table_name):
+        return table_name != "address_archive_v2"
+
+    monkeypatch.setattr(importer, "_table_exists", fake_table_exists)
+    status = AsyncMock()
+    monkeypatch.setattr(importer.db, "status", status)
+
+    stats = await importer.publish_provider_directory_location_archive("mrf")
+
+    assert stats == {"skipped": True, "reason": "address_archive_v2_unavailable"}
+    status.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -916,6 +1118,11 @@ async def test_process_data_stamps_locations_and_publishes_corroboration_view(mo
     monkeypatch.setattr(importer, "publish_provider_directory_location_address_keys", AsyncMock(return_value=3))
     monkeypatch.setattr(
         importer,
+        "publish_provider_directory_location_archive",
+        AsyncMock(return_value={"inserted": 4, "provenance_updates": 1}),
+    )
+    monkeypatch.setattr(
+        importer,
         "publish_provider_directory_ptg_address_corroboration_if_available",
         AsyncMock(return_value=True),
     )
@@ -934,8 +1141,10 @@ async def test_process_data_stamps_locations_and_publishes_corroboration_view(mo
     assert metrics["resource_rows"] == {"Location": 2}
     assert metrics["sources_import_attempted"] == 1
     assert metrics["location_address_keys_stamped"] == 3
+    assert metrics["location_archive"] == {"inserted": 4, "provenance_updates": 1}
     assert metrics["ptg_corroboration_view_published"] is True
     importer.publish_provider_directory_location_address_keys.assert_awaited_once()
+    importer.publish_provider_directory_location_archive.assert_awaited_once()
     importer.publish_provider_directory_ptg_address_corroboration_if_available.assert_awaited_once()
 
 
@@ -946,6 +1155,11 @@ async def test_process_data_skips_artifact_publish_for_targeted_resource_import(
     monkeypatch.setattr(importer, "_upsert_rows", AsyncMock(return_value=1))
     monkeypatch.setattr(importer, "_import_resources", AsyncMock(return_value={"PractitionerRole": 2}))
     monkeypatch.setattr(importer, "publish_provider_directory_location_address_keys", AsyncMock(return_value=3))
+    monkeypatch.setattr(
+        importer,
+        "publish_provider_directory_location_archive",
+        AsyncMock(return_value={"inserted": 4}),
+    )
     monkeypatch.setattr(
         importer,
         "publish_provider_directory_ptg_address_corroboration_if_available",
@@ -964,8 +1178,10 @@ async def test_process_data_skips_artifact_publish_for_targeted_resource_import(
 
     assert metrics["publish_artifacts"] is False
     assert metrics["location_address_keys_stamped"] == 0
+    assert metrics["location_archive"] == {"skipped": True, "reason": "publish_artifacts_disabled"}
     assert metrics["ptg_corroboration_view_published"] is False
     importer.publish_provider_directory_location_address_keys.assert_not_awaited()
+    importer.publish_provider_directory_location_archive.assert_not_awaited()
     importer.publish_provider_directory_ptg_address_corroboration_if_available.assert_not_awaited()
 
 
@@ -993,6 +1209,7 @@ async def test_process_data_uses_live_probe_success_over_seed_auth_required_stat
     import_resources = AsyncMock(return_value={"Practitioner": 1})
     monkeypatch.setattr(importer, "_import_resources", import_resources)
     monkeypatch.setattr(importer, "publish_provider_directory_location_address_keys", AsyncMock(return_value=0))
+    monkeypatch.setattr(importer, "publish_provider_directory_location_archive", AsyncMock(return_value={"inserted": 0}))
     monkeypatch.setattr(
         importer,
         "publish_provider_directory_ptg_address_corroboration_if_available",
@@ -1034,6 +1251,32 @@ def test_max_rows_per_statement_stays_under_asyncpg_parameter_limit():
     assert importer._max_rows_per_statement(1) == 500  # pylint: disable=protected-access
     assert importer._max_rows_per_statement(100) == 300  # pylint: disable=protected-access
     assert importer._max_rows_per_statement(40000) == 1  # pylint: disable=protected-access
+
+
+def test_resource_start_url_prefers_endpoint_and_preserves_existing_count():
+    url = importer._resource_start_url(  # pylint: disable=protected-access
+        {
+            "api_base": "https://example.test/fhir",
+            "endpoint_practitioner": "https://payer.example/custom/Practitioner?active=true&_count=20",
+        },
+        "Practitioner",
+        page_count=100,
+    )
+
+    assert url == "https://payer.example/custom/Practitioner?active=true&_count=20"
+
+
+def test_resource_start_url_resolves_relative_endpoint_and_adds_count():
+    url = importer._resource_start_url(  # pylint: disable=protected-access
+        {
+            "api_base": "https://example.test/fhir/base",
+            "endpoint_location": "Location?address-state=CA",
+        },
+        "Location",
+        page_count=250,
+    )
+
+    assert url == "https://example.test/fhir/base/Location?address-state=CA&_count=100"
 
 
 @pytest.mark.asyncio
@@ -1101,6 +1344,53 @@ async def test_fetch_resource_rows_resolves_relative_next_links(monkeypatch):
         "https://example.test/fhir/Practitioner?_count=10",
         "https://example.test/page/2",
     ]
+
+
+@pytest.mark.asyncio
+async def test_fetch_resource_rows_uses_specific_resource_endpoint(monkeypatch):
+    calls: list[str] = []
+
+    async def fake_fetch_json(url, *, timeout):  # pylint: disable=unused-argument
+        calls.append(url)
+        return (
+            200,
+            {
+                "resourceType": "Bundle",
+                "entry": [
+                    {
+                        "fullUrl": "https://payer.example/custom/Practitioner/prac-1",
+                        "resource": {
+                            "resourceType": "Practitioner",
+                            "id": "prac-1",
+                            "name": [{"family": "Endpoint"}],
+                        },
+                    }
+                ],
+            },
+            None,
+            10,
+        )
+
+    monkeypatch.setattr(importer, "_fetch_json", fake_fetch_json)
+
+    result = await importer._fetch_resource_rows(  # pylint: disable=protected-access
+        {
+            "source_id": "source_a",
+            "api_base": "https://example.test/fhir",
+            "endpoint_practitioner": "https://payer.example/custom/Practitioner?active=true",
+        },
+        "Practitioner",
+        per_resource_limit=1,
+        page_limit=1,
+        page_count=25,
+        timeout=3,
+        run_id="run_1",
+    )
+
+    assert result is not None
+    assert result.complete is True
+    assert [row["resource_id"] for row in result.rows] == ["prac-1"]
+    assert calls == ["https://payer.example/custom/Practitioner?active=true&_count=25"]
 
 
 @pytest.mark.asyncio
@@ -1242,14 +1532,16 @@ async def test_import_resources_deletes_stale_rows_only_after_complete_scan(monk
     async def fake_fetch_resource_rows(_source, _resource_type, **_kwargs):
         return fetch_results.pop(0)
 
-    async def fake_upsert(_model, rows):
+    async def fake_upsert(_model, rows, **_kwargs):
         return len(rows)
 
     deletes: list[tuple[str, dict[str, Any]]] = []
 
     async def fake_status(sql, **params):
-        deletes.append((sql, params))
-        return 4
+        if "DELETE FROM" in sql.upper():
+            deletes.append((sql, params))
+            return 4
+        return 0
 
     monkeypatch.setattr(importer, "_fetch_resource_rows", fake_fetch_resource_rows)
     monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
@@ -1274,7 +1566,8 @@ async def test_import_resources_deletes_stale_rows_only_after_complete_scan(monk
     assert stale_counts == {"Location": 4}
     assert len(deletes) == 1
     assert '"provider_directory_location"' in deletes[0][0]
-    assert deletes[0][1] == {"source_id": "source_a", "run_id": "run_1"}
+    assert "provider_directory_import_seen" in deletes[0][0]
+    assert deletes[0][1] == {"source_id": "source_a", "run_id": "run_1", "resource_type": "Location"}
     assert stats["Location"]["sources_completed"] == 1
     assert stats["Practitioner"]["sources_bounded"] == 1
 
@@ -1306,7 +1599,7 @@ async def test_import_resources_honors_source_concurrency(monkeypatch):
             next_url_remaining=False,
         )
 
-    async def fake_upsert(_model, rows):
+    async def fake_upsert(_model, rows, **_kwargs):
         return len(rows)
 
     monkeypatch.setattr(importer, "_fetch_resource_rows", fake_fetch_resource_rows)
@@ -1357,7 +1650,7 @@ async def test_import_resources_fetches_duplicate_base_once_and_fans_out_rows(mo
             next_url_remaining=False,
         )
 
-    async def fake_upsert(_model, rows):
+    async def fake_upsert(_model, rows, **_kwargs):
         upserted_source_ids.extend(row["source_id"] for row in rows)
         return len(rows)
 

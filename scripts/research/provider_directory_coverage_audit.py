@@ -63,6 +63,14 @@ def _qt(schema: str, table: str) -> str:
     return f"{_q(schema)}.{_q(table)}"
 
 
+def _sql_ref_matches_resource(ref_expr: str, resource_type: str, resource_id_expr: str) -> str:
+    resource_type_literal = str(resource_type).replace("'", "''")
+    return (
+        f"({ref_expr} IN ({resource_id_expr}, '{resource_type_literal}/' || {resource_id_expr}) "
+        f"OR {ref_expr} LIKE '%/{resource_type_literal}/' || {resource_id_expr})"
+    )
+
+
 def _pct(numerator: int, denominator: int) -> float:
     return round((float(numerator) / float(denominator) * 100.0), 2) if denominator else 0.0
 
@@ -236,7 +244,19 @@ async def _unified_summary(conn: asyncpg.Connection, schema: str) -> dict[str, A
             count(*) FILTER (
                 WHERE address_sources @> ARRAY['provider_directory_fhir']::varchar[]
                   AND address_key IS NULL
-            )::bigint AS provider_directory_null_key_rows
+            )::bigint AS provider_directory_null_key_rows,
+            count(*) FILTER (
+                WHERE address_sources @> ARRAY['provider_directory_fhir']::varchar[]
+                  AND cardinality(COALESCE(source_record_ids, ARRAY[]::varchar[])) > 0
+            )::bigint AS provider_directory_source_record_id_rows,
+            count(*) FILTER (
+                WHERE address_sources @> ARRAY['provider_directory_fhir']::varchar[]
+                  AND country_code = '001'
+            )::bigint AS provider_directory_country_001_rows,
+            count(*) FILTER (
+                WHERE address_sources @> ARRAY['provider_directory_fhir']::varchar[]
+                  AND country_code = 'US'
+            )::bigint AS provider_directory_country_us_rows
           FROM {_qt(schema, "entity_address_unified")}
         """,
     )
@@ -244,12 +264,20 @@ async def _unified_summary(conn: asyncpg.Connection, schema: str) -> dict[str, A
     row["available"] = True
     row["provider_directory_keyed_pct"] = _pct(_int(row.get("provider_directory_keyed_rows")), total)
     row["provider_directory_phone_pct"] = _pct(_int(row.get("provider_directory_phone_rows")), total)
+    row["provider_directory_source_record_id_pct"] = _pct(
+        _int(row.get("provider_directory_source_record_id_rows")),
+        total,
+    )
     return row
 
 
-async def _ptg_summary(conn: asyncpg.Connection, schema: str) -> dict[str, Any]:
+async def _ptg_summary(conn: asyncpg.Connection, schema: str, *, ptg_plan_id: str | None = None) -> dict[str, Any]:
     summary: dict[str, Any] = {}
     if await _relation_exists(conn, schema, "ptg_address"):
+        plan_filter = (
+            "WHERE ($1::varchar IS NULL OR plan_id = $1 OR ptg_plan_id = $1 "
+            "OR $1 = ANY(COALESCE(ptg_plan_array, ARRAY[]::varchar[])))"
+        )
         row = await _fetch_mapping(
             conn,
             f"""
@@ -259,7 +287,9 @@ async def _ptg_summary(conn: asyncpg.Connection, schema: str) -> dict[str, Any]:
                 count(DISTINCT npi)::bigint AS ptg_npi_count,
                 count(*) FILTER (WHERE address_key IS NOT NULL)::bigint AS ptg_keyed_address_rows
               FROM {_qt(schema, "ptg_address")}
+              {plan_filter}
             """,
+            ptg_plan_id,
         )
         row["ptg_keyed_address_pct"] = _pct(_int(row.get("ptg_keyed_address_rows")), _int(row.get("ptg_address_rows")))
         summary["ptg_address"] = {"available": True, **row}
@@ -267,6 +297,7 @@ async def _ptg_summary(conn: asyncpg.Connection, schema: str) -> dict[str, Any]:
         summary["ptg_address"] = {"available": False}
     view = "ptg_provider_directory_address_corroboration"
     if await _relation_exists(conn, schema, view):
+        plan_filter = "WHERE ($1::varchar IS NULL OR plan_id = $1 OR ptg_plan_id = $1)"
         row = await _fetch_mapping(
             conn,
             f"""
@@ -283,12 +314,29 @@ async def _ptg_summary(conn: asyncpg.Connection, schema: str) -> dict[str, Any]:
                     WHERE jsonb_array_length(COALESCE(provider_directory_network_matches, '[]'::jsonb)) > 0
                 )::bigint AS resolved_network_match_rows
               FROM {_qt(schema, view)}
+              {plan_filter}
             """,
+            ptg_plan_id,
         )
         summary["ptg_corroboration"] = {"available": True, **row}
     else:
         summary["ptg_corroboration"] = {"available": False}
     return summary
+
+
+def _skipped_ptg_summary() -> dict[str, Any]:
+    return {
+        "ptg_address": {
+            "available": False,
+            "skipped": True,
+            "reason": "disabled by --skip-ptg",
+        },
+        "ptg_corroboration": {
+            "available": False,
+            "skipped": True,
+            "reason": "disabled by --skip-ptg",
+        },
+    }
 
 
 async def _network_resolution_summary(conn: asyncpg.Connection, schema: str, *, sample_limit: int) -> dict[str, Any]:
@@ -300,6 +348,7 @@ async def _network_resolution_summary(conn: asyncpg.Connection, schema: str, *, 
     )
     if not all([await _relation_exists(conn, schema, table) for table in required]):
         return {"available": False, "top_unresolved_refs": []}
+    network_ref_match = _sql_ref_matches_resource("refs.ref", "Organization", "org.resource_id")
     row = await _fetch_mapping(
         conn,
         f"""
@@ -318,7 +367,7 @@ async def _network_resolution_summary(conn: asyncpg.Connection, schema: str, *, 
               FROM refs
               LEFT JOIN {_qt(schema, "provider_directory_organization")} org
                 ON org.source_id = refs.source_id
-               AND refs.ref IN (org.resource_id, 'Organization/' || org.resource_id)
+               AND {network_ref_match}
         )
         SELECT
             count(*)::bigint AS network_ref_rows,
@@ -346,7 +395,7 @@ async def _network_resolution_summary(conn: asyncpg.Connection, schema: str, *, 
           FROM refs
           LEFT JOIN {_qt(schema, "provider_directory_organization")} org
             ON org.source_id = refs.source_id
-           AND refs.ref IN (org.resource_id, 'Organization/' || org.resource_id)
+           AND {network_ref_match}
           LEFT JOIN {_qt(schema, "provider_directory_source")} src
             ON src.source_id = refs.source_id
          WHERE org.resource_id IS NULL
@@ -485,6 +534,18 @@ def _derive_gaps(report: dict[str, Any]) -> list[str]:
         gaps.append(
             f"{unified['provider_directory_null_key_rows']} Provider Directory unified-address rows still lack address_key."
         )
+    if unified.get("available"):
+        provider_directory_rows = _int(unified.get("provider_directory_rows"))
+        source_record_id_rows = _int(unified.get("provider_directory_source_record_id_rows"))
+        if provider_directory_rows and source_record_id_rows < provider_directory_rows:
+            missing = provider_directory_rows - source_record_id_rows
+            gaps.append(
+                f"{missing} Provider Directory unified-address rows lack retained FHIR source record IDs."
+            )
+        if _int(unified.get("provider_directory_country_001_rows")):
+            gaps.append(
+                f"{unified['provider_directory_country_001_rows']} Provider Directory unified-address rows still expose country_code `001`."
+            )
     network = report.get("network_resolution_summary") or {}
     if network.get("available") and _int(network.get("unresolved_network_refs")):
         gaps.append(
@@ -498,6 +559,16 @@ def _derive_gaps(report: dict[str, Any]) -> list[str]:
     ptg = (report.get("ptg_summary") or {}).get("ptg_corroboration") or {}
     if ptg.get("available") and _int(ptg.get("network_context_rows")) and not _int(ptg.get("resolved_network_match_rows")):
         gaps.append("PTG-overlap Provider Directory rows carry network refs, but none currently resolve to network-name matches.")
+    ptg_plan_filter = report.get("ptg_plan_filter")
+    if ptg_plan_filter:
+        ptg_address = (report.get("ptg_summary") or {}).get("ptg_address") or {}
+        ptg_corroboration = (report.get("ptg_summary") or {}).get("ptg_corroboration") or {}
+        if ptg_address.get("available") and not _int(ptg_address.get("ptg_address_rows")):
+            gaps.append(f"Requested PTG plan `{ptg_plan_filter}` has no ptg_address rows in this database.")
+        elif ptg_corroboration.get("available") and not _int(ptg_corroboration.get("corroboration_rows")):
+            gaps.append(
+                f"Requested PTG plan `{ptg_plan_filter}` has no Provider Directory address corroboration rows."
+            )
     return gaps
 
 
@@ -517,11 +588,16 @@ async def build_report(args: argparse.Namespace) -> dict[str, Any]:
         report = {
             "generated_at": dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
             "schema": schema,
+            "ptg_plan_filter": args.ptg_plan_id or None,
             "source_summary": await _source_summary(conn, schema),
             "capability_status_counts": await _capability_status_counts(conn, schema),
             "resource_summary": await _resource_summary(conn, schema),
             "unified_summary": await _unified_summary(conn, schema),
-            "ptg_summary": await _ptg_summary(conn, schema),
+            "ptg_summary": (
+                _skipped_ptg_summary()
+                if args.skip_ptg
+                else await _ptg_summary(conn, schema, ptg_plan_id=args.ptg_plan_id or None)
+            ),
             "network_resolution_summary": network_resolution_summary,
             "top_source_yield": await _top_source_yield(conn, schema, sample_limit=args.sample_limit),
             "valid_sources_without_resource_rows": await _valid_sources_without_resource_rows(
@@ -546,6 +622,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         "",
         f"- generated_at: `{report.get('generated_at')}`",
         f"- schema: `{report.get('schema')}`",
+        f"- PTG plan filter: `{report.get('ptg_plan_filter') or 'all'}`",
         "",
         "## Summary",
         "",
@@ -565,6 +642,8 @@ def render_markdown(report: dict[str, Any]) -> str:
                 f"- unified Provider Directory rows: `{unified.get('provider_directory_rows')}`",
                 f"- keyed Provider Directory rows: `{unified.get('provider_directory_keyed_rows')}` ({unified.get('provider_directory_keyed_pct')}%)",
                 f"- phone Provider Directory rows: `{unified.get('provider_directory_phone_rows')}` ({unified.get('provider_directory_phone_pct')}%)",
+                f"- Provider Directory rows with source record IDs: `{unified.get('provider_directory_source_record_id_rows')}` ({unified.get('provider_directory_source_record_id_pct')}%)",
+                f"- Provider Directory rows with country `001`: `{unified.get('provider_directory_country_001_rows')}`",
             ]
         )
     ptg_corr = ptg.get("ptg_corroboration") or {}
@@ -576,6 +655,8 @@ def render_markdown(report: dict[str, Any]) -> str:
                 f"- resolved network-name match rows: `{ptg_corr.get('resolved_network_match_rows')}`",
             ]
         )
+    elif ptg_corr.get("skipped"):
+        lines.append(f"- PTG corroboration: skipped ({ptg_corr.get('reason')})")
     if network.get("available"):
         lines.append(
             f"- resolved network refs: `{network.get('resolved_network_refs')}` / `{network.get('distinct_network_refs')}` ({network.get('resolved_network_ref_pct')}%)"
@@ -638,11 +719,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--user", default=os.getenv("HLTHPRT_DB_USER") or os.getenv("USER") or "postgres")
     parser.add_argument("--password", default=os.getenv("HLTHPRT_DB_PASSWORD") or "")
     parser.add_argument("--schema", default=os.getenv("HLTHPRT_DB_SCHEMA") or "mrf")
+    parser.add_argument(
+        "--ptg-plan-id",
+        help=(
+            "Limit PTG address/corroboration counts to one plan id. Matches ptg_address.plan_id, "
+            "ptg_address.ptg_plan_id, ptg_address.ptg_plan_array, and corroboration plan ids."
+        ),
+    )
     parser.add_argument("--sample-limit", type=int, default=10)
     parser.add_argument(
         "--skip-network-resolution",
         action="store_true",
         help="Skip the heavier unresolved network-ref scan for quick checks during active imports.",
+    )
+    parser.add_argument(
+        "--skip-ptg",
+        action="store_true",
+        help="Skip PTG address/corroboration scans for quick Provider Directory-only gates.",
     )
     parser.add_argument("--format", choices=("json", "markdown"), default="json")
     return parser.parse_args(argv)

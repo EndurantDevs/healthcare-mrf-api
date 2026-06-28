@@ -585,7 +585,9 @@ class ProviderDirectoryPractitionerRole(Base, JSONOutputMixin):
     __my_index_elements__ = ["source_id", "resource_id"]
     __my_additional_indexes__ = [
         {"index_elements": ("practitioner_ref",), "name": "provider_directory_role_practitioner_idx"},
+        {"index_elements": ("source_id", "practitioner_ref"), "name": "provider_directory_role_source_practitioner_idx"},
         {"index_elements": ("organization_ref",), "name": "provider_directory_role_organization_idx"},
+        {"index_elements": ("source_id", "organization_ref"), "name": "provider_directory_role_source_organization_idx"},
     ]
 
     source_id = Column(String(64), nullable=False)
@@ -642,6 +644,16 @@ class ProviderDirectoryOrganizationAffiliation(Base, JSONOutputMixin):
         {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
     )
     __my_index_elements__ = ["source_id", "resource_id"]
+    __my_additional_indexes__ = [
+        {
+            "index_elements": ("source_id", "organization_ref"),
+            "name": "provider_directory_affiliation_source_organization_idx",
+        },
+        {
+            "index_elements": ("source_id", "participating_organization_ref"),
+            "name": "provider_directory_affiliation_source_participating_idx",
+        },
+    ]
 
     source_id = Column(String(64), nullable=False)
     resource_id = Column(String(256), nullable=False)

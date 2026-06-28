@@ -13,6 +13,7 @@ Examples:
   rtk venv/bin/python scripts/research/ptg_address_assurance_report.py \
     --api-url "$PTG_URL" \
     --api-key "$HEALTHPORTA_API_KEY" \
+    --require-network-bound-address \
     --strict
 """
 
@@ -107,12 +108,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--require-network-names",
         action="store_true",
-        help="Fail when the API payload has no PTG rows with retained network_names.",
+        help="Fail when any PTG row in the API payload lacks retained network_names.",
     )
     parser.add_argument(
         "--require-source-file-version-id",
         action="store_true",
-        help="Fail when the API payload has no PTG rows with source_trace.source_file_version_id.",
+        help="Fail when any PTG row in the API payload lacks source_trace.source_file_version_id.",
+    )
+    parser.add_argument(
+        "--require-network-bound-address",
+        action="store_true",
+        help=(
+            "Fail when a displayed PTG address is only inferred from provider identity. "
+            "Use this for member-facing exact-office assurance; it requires payer-confirmed "
+            "location evidence or payer Provider Directory plan/network corroboration, plus retained "
+            "network_names and source_trace.source_file_version_id."
+        ),
     )
     parser.add_argument("--strict", action="store_true", help="Exit 1 when the assurance report is not ok.")
     return parser.parse_args()
@@ -338,6 +349,7 @@ def main() -> int:
         require_displayed_address=not args.allow_missing_displayed_address,
         require_network_names=bool(args.require_network_names),
         require_source_file_version_id=bool(args.require_source_file_version_id),
+        require_network_bound_address=bool(args.require_network_bound_address),
     )
     report["requested_source_file_version_ids"] = source_file_version_ids
     report["raw_artifact_resolution"] = raw_artifact_resolution

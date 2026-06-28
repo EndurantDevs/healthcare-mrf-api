@@ -54,6 +54,7 @@ PTG_NO_DISPLAY_ADDRESS_FIELDS = {
     "distance",
     "distance_miles",
     "zip_match_type",
+    "coordinates",
     "google_maps_url",
     "google_map_url",
     "maps_url",
@@ -245,6 +246,16 @@ def _manifest_has_direct_payer_location_record_evidence(address_payload: Mapping
     return any(evidence.get(key) not in (None, "", [], {}) for key in PTG_DIRECT_PAYER_LOCATION_RECORD_KEYS)
 
 
+def _manifest_has_source_file_version_trace(item: Mapping[str, Any]) -> bool:
+    source_trace = item.get("source_trace")
+    if not isinstance(source_trace, list):
+        return False
+    return any(
+        isinstance(entry, Mapping) and str(entry.get("source_file_version_id") or "").strip()
+        for entry in source_trace
+    )
+
+
 def _manifest_address_payload(item: Mapping[str, Any], provider: Mapping[str, Any] | None = None) -> dict[str, Any]:
     provider = provider or {}
     payload = _coerce_json_payload(item.get("address_payload") or provider.get("address_payload"), {})
@@ -284,21 +295,26 @@ def _manifest_address_verification(
             "requires_location_confirmation": True,
             "reason": "PTG proves the provider identity is in network, but no displayable address is available.",
             "displayed_address_present": False,
+            "network_bound_address": False,
         }
 
     markers = {
         *(_normalized_markers(*address_sources)),
         *_normalized_markers(location_source, location_confidence_code),
     }
-    direct_payer = bool(
-        markers
-        & {
-            "payer_confirmed_location",
-            "payer_provider_group_location",
-            "ptg_provider_group_location",
-            "tic_provider_group_location",
-        }
-    ) and _manifest_has_direct_payer_location_record_evidence(address_payload)
+    direct_payer = (
+        bool(
+            markers
+            & {
+                "payer_confirmed_location",
+                "payer_provider_group_location",
+                "ptg_provider_group_location",
+                "tic_provider_group_location",
+            }
+        )
+        and _manifest_has_direct_payer_location_record_evidence(address_payload)
+        and _manifest_has_source_file_version_trace(item)
+    )
     provider_directory = bool(
         markers & {"provider_directory", "provider_directory_fhir", "payer_provider_directory"}
     )
@@ -364,6 +380,10 @@ def _manifest_address_verification(
         "requires_location_confirmation": requires_confirmation,
         "reason": reason,
         "displayed_address_present": displayed,
+        "network_bound_address": address_binding in {
+            "payer_confirmed_location",
+            "payer_directory_corroborated_location",
+        },
     }
     optional_fields = {
         "location_source": location_source,

@@ -26,36 +26,83 @@ ADDRESS_FIELD_NAMES = {
     "addressline2",
     "addressline3",
     "addr",
+    "addr1",
+    "addr2",
+    "billingaddress",
     "city",
     "cityname",
+    "contactaddress",
+    "formattedaddress",
+    "fulladdress",
+    "line",
+    "line1",
+    "line2",
+    "line3",
+    "lines",
     "location",
+    "locationaddress",
     "locations",
     "postalcode",
     "practiceaddress",
+    "practicelocation",
+    "practicelocationaddress",
+    "provideraddress",
+    "providerlocation",
+    "providerlocationaddress",
+    "serviceaddress",
     "state",
     "statename",
     "street",
+    "street1",
+    "street2",
     "streetaddress",
+    "streetaddress1",
+    "streetaddress2",
     "zipcode",
     "zip",
     "zip5",
 }
 PHONE_FIELD_NAMES = {
+    "contactnumber",
+    "contactphone",
     "fax",
     "faxnumber",
+    "officephone",
     "phone",
+    "phone1",
     "phonenumber",
+    "practicephone",
+    "primaryphone",
+    "tel",
     "telephone",
     "telephonenumber",
 }
+TELECOM_FIELD_NAMES = {"telecom", "telecoms"}
 NETWORK_NAME_FIELD_NAMES = {"networkname", "networknames"}
 STREET_FIELD_NAMES = {
     "address1",
     "addressline",
     "addressline1",
+    "addr1",
+    "billingaddress",
+    "contactaddress",
+    "formattedaddress",
+    "fulladdress",
+    "line",
+    "line1",
+    "lines",
+    "locationaddress",
     "practiceaddress",
+    "practicelocation",
+    "practicelocationaddress",
+    "provideraddress",
+    "providerlocation",
+    "providerlocationaddress",
+    "serviceaddress",
     "street",
+    "street1",
     "streetaddress",
+    "streetaddress1",
 }
 CITY_FIELD_NAMES = {"city", "cityname"}
 REGION_FIELD_NAMES = {"postalcode", "state", "statename", "zipcode", "zip", "zip5"}
@@ -124,6 +171,25 @@ def _has_displayable_address_value(value: Any) -> bool:
     return False
 
 
+def _has_phone_telecom_value(value: Any) -> bool:
+    """Return true when a FHIR-like telecom payload contains a phone/fax value."""
+
+    if isinstance(value, dict):
+        system = _normalized_field_name(value.get("system"))
+        if system:
+            return system in {"fax", "phone", "tel", "telephone"} and _nonempty_scalar(value.get("value"))
+        return any(
+            _has_phone_telecom_value(child)
+            for child in value.values()
+            if isinstance(child, (dict, list))
+        )
+    if isinstance(value, list):
+        return any(_has_phone_telecom_value(child) for child in value)
+    if isinstance(value, str):
+        return bool(value.strip())
+    return False
+
+
 def _collect_matching_fields(
     value: Any,
     *,
@@ -142,6 +208,8 @@ def _collect_matching_fields(
             if normalized_key in ADDRESS_FIELD_NAMES:
                 address_fields[path] = _sample_value(child)
             if normalized_key in PHONE_FIELD_NAMES:
+                phone_fields[path] = _sample_value(child)
+            if normalized_key in TELECOM_FIELD_NAMES and _has_phone_telecom_value(child):
                 phone_fields[path] = _sample_value(child)
             if normalized_key in NETWORK_NAME_FIELD_NAMES:
                 network_name_fields[path] = _sample_value(child)

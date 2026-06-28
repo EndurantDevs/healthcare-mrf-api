@@ -344,6 +344,7 @@ async def test_ptg2_manifest_db_snapshot_serves_exact_plan_code_lookup():
         [
             True,
             1,
+            FakeResult(rows=[("network_names",)]),
             FakeResult(
                 rows=[
                     {
@@ -429,6 +430,7 @@ async def test_ptg2_manifest_db_snapshot_expands_provider_npi_sidecar(tmp_path):
         [
             True,
             1,
+            FakeResult(rows=[("network_names",)]),
             FakeResult(
                 rows=[
                     {
@@ -613,6 +615,7 @@ async def test_ptg2_manifest_provider_procedures_uses_inverted_provider_sidecar(
             True,
             FakeResult(rows=[{"provider_group_global_id_128": UUID(provider_group_id)}]),
             FakeResult(rows=[]),
+            FakeResult(rows=[("network_names",)]),
             FakeResult(
                 rows=[
                     {
@@ -628,6 +631,7 @@ async def test_ptg2_manifest_provider_procedures_uses_inverted_provider_sidecar(
                     }
                 ]
             ),
+            FakeResult(rows=[]),
             FakeResult(
                 rows=[
                     {

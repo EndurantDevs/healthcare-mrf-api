@@ -68,6 +68,7 @@ NO_DISPLAY_ADDRESS_FIELDS = {
     "distance",
     "distance_miles",
     "zip_match_type",
+    "coordinates",
     "google_maps_url",
     "google_map_url",
     "maps_url",
@@ -322,6 +323,7 @@ def validate_ptg_price_address_item(
     *,
     index: int = 0,
     require_displayed_address: bool = True,
+    require_network_bound_address: bool = False,
 ) -> list[dict[str, Any]]:
     issues: list[dict[str, Any]] = []
     verification = item.get("address_verification")
@@ -335,6 +337,7 @@ def validate_ptg_price_address_item(
     evidence_level = str(verification.get("address_evidence_level") or "").strip()
     requires_confirmation = verification.get("requires_location_confirmation")
     displayed_address_present = verification.get("displayed_address_present")
+    network_bound_address = verification.get("network_bound_address")
     plan_context = verification.get("provider_directory_plan_context_matched")
     network_context_present = verification.get("provider_directory_network_context_present")
     network_name_matched = verification.get("provider_directory_network_name_matched")
@@ -388,6 +391,21 @@ def validate_ptg_price_address_item(
                     index=index,
                 )
             )
+    expected_network_bound = (
+        displayed_address_present is True
+        and address_binding in {"payer_confirmed_location", "payer_directory_corroborated_location"}
+    )
+    if network_bound_address is None:
+        issues.append(_issue("network_bound_address is required", index=index))
+    elif not isinstance(network_bound_address, bool):
+        issues.append(_issue("network_bound_address must be boolean", index=index))
+    elif isinstance(network_bound_address, bool) and network_bound_address is not expected_network_bound:
+        issues.append(
+            _issue(
+                "network_bound_address must match address_network_binding and displayed_address_present",
+                index=index,
+            )
+        )
     if plan_context is not None and not isinstance(plan_context, bool):
         issues.append(_issue("provider_directory_plan_context_matched must be boolean when present", index=index))
     if network_context_present is not None and not isinstance(network_context_present, bool):
@@ -420,6 +438,17 @@ def validate_ptg_price_address_item(
         issues.append(_issue("provider_directory_insurance_plan_matches must be a string list when present", index=index))
     if not has_address and require_displayed_address:
         issues.append(_issue("address_verification is present but no usable address fields are displayed", index=index))
+    if (
+        require_network_bound_address
+        and displayed_address_present is True
+        and not expected_network_bound
+    ):
+        issues.append(
+            _issue(
+                "displayed PTG address is not network-bound to the priced plan or network",
+                index=index,
+            )
+        )
     if not require_displayed_address and displayed_address_present is False and not has_address:
         if address_binding != "inferred_from_provider_identity":
             issues.append(_issue("no-address PTG rows must keep address_network_binding='inferred_from_provider_identity'", index=index))
@@ -478,7 +507,10 @@ def summarize_ptg_price_address_payload(
     require_displayed_address: bool = True,
     require_network_names: bool = False,
     require_source_file_version_id: bool = False,
+    require_network_bound_address: bool = False,
 ) -> dict[str, Any]:
+    require_network_names = require_network_names or require_network_bound_address
+    require_source_file_version_id = require_source_file_version_id or require_network_bound_address
     items = _items_from_payload(payload)
     issues: list[dict[str, Any]] = []
     binding_counts: dict[str, int] = {}
@@ -489,6 +521,7 @@ def summarize_ptg_price_address_payload(
     network_name_rows = 0
     source_trace_rows = 0
     source_file_version_id_rows = 0
+    network_bound_address_rows = 0
     if not items:
         issues.append(_issue("no PTG price rows found", index=None))
     for index, item in enumerate(items):
@@ -505,6 +538,8 @@ def summarize_ptg_price_address_payload(
         verification = item.get("address_verification")
         if isinstance(verification, dict) and verification:
             verification_rows += 1
+            if verification.get("network_bound_address") is True:
+                network_bound_address_rows += 1
             binding = str(verification.get("address_network_binding") or "missing")
             evidence = str(verification.get("address_evidence_level") or "missing")
             binding_counts[binding] = binding_counts.get(binding, 0) + 1
@@ -514,12 +549,39 @@ def summarize_ptg_price_address_payload(
                 item,
                 index=index,
                 require_displayed_address=require_displayed_address,
+                require_network_bound_address=require_network_bound_address,
             )
         )
     if require_network_names and items and network_name_rows == 0:
         issues.append(_issue("no PTG price rows include network_names", index=None))
+    elif require_network_names and items and network_name_rows < len(items):
+        missing_indexes = [
+            index
+            for index, item in enumerate(items)
+            if not _network_names_from_item(item)
+        ]
+        issues.append(
+            _issue(
+                "some PTG price rows do not include network_names: "
+                + ", ".join(str(index) for index in missing_indexes[:10]),
+                index=None,
+            )
+        )
     if require_source_file_version_id and items and source_file_version_id_rows == 0:
         issues.append(_issue("no PTG price rows include source_trace.source_file_version_id", index=None))
+    elif require_source_file_version_id and items and source_file_version_id_rows < len(items):
+        missing_indexes = [
+            index
+            for index, item in enumerate(items)
+            if not _source_file_version_ids_from_item(item)
+        ]
+        issues.append(
+            _issue(
+                "some PTG price rows do not include source_trace.source_file_version_id: "
+                + ", ".join(str(index) for index in missing_indexes[:10]),
+                index=None,
+            )
+        )
     return {
         "ok": not any(issue["severity"] == "error" for issue in issues),
         "item_count": len(items),
@@ -528,6 +590,7 @@ def summarize_ptg_price_address_payload(
         "network_name_rows": network_name_rows,
         "source_trace_rows": source_trace_rows,
         "source_file_version_id_rows": source_file_version_id_rows,
+        "network_bound_address_rows": network_bound_address_rows,
         "network_name_values": sorted(network_name_values),
         "address_network_binding_counts": dict(sorted(binding_counts.items())),
         "address_evidence_level_counts": dict(sorted(evidence_counts.items())),
@@ -544,6 +607,7 @@ def build_ptg_address_assurance_report(
     require_displayed_address: bool = True,
     require_network_names: bool = False,
     require_source_file_version_id: bool = False,
+    require_network_bound_address: bool = False,
 ) -> dict[str, Any]:
     raw_reports = []
     raw_source_map = raw_artifact_source_file_version_ids_by_path or {}
@@ -568,6 +632,7 @@ def build_ptg_address_assurance_report(
             require_displayed_address=require_displayed_address,
             require_network_names=require_network_names,
             require_source_file_version_id=require_source_file_version_id,
+            require_network_bound_address=require_network_bound_address,
         )
         if api_payload is not None
         else None

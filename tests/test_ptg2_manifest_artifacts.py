@@ -49,6 +49,7 @@ def test_manifest_artifact_provider_address_verification_marks_inferred_nppes_ad
     assert verification["address_evidence_level"] == "nppes_provider_address"
     assert verification["requires_location_confirmation"] is True
     assert verification["displayed_address_present"] is True
+    assert verification["network_bound_address"] is False
     assert verification["address_sources"] == ["nppes"]
 
 
@@ -75,6 +76,12 @@ def test_manifest_artifact_marks_explicit_payer_location_as_payer_confirmed():
     verification = serving_manifest._manifest_address_verification(
         {
             "location_source": "payer_provider_group_location",
+            "source_trace": [
+                {
+                    "source_file_version_id": "source-version-1",
+                    "original_url": "https://example.test/in-network-rates.json.gz",
+                }
+            ],
             "address": {
                 "first_line": "900 W Temple Ave",
                 "city": "Effingham",
@@ -93,7 +100,33 @@ def test_manifest_artifact_marks_explicit_payer_location_as_payer_confirmed():
     assert verification["address_network_binding"] == "payer_confirmed_location"
     assert verification["address_evidence_level"] == "payer_confirmed_location"
     assert verification["requires_location_confirmation"] is False
+    assert verification["network_bound_address"] is True
     assert verification["address_sources"] == ["ptg"]
+
+
+def test_manifest_artifact_does_not_mark_payer_location_without_source_trace():
+    verification = serving_manifest._manifest_address_verification(
+        {
+            "location_source": "payer_provider_group_location",
+            "address": {
+                "first_line": "900 W Temple Ave",
+                "city": "Effingham",
+                "state": "IL",
+                "postal_code": "62401",
+                "address_sources": ["ptg"],
+                "address_verification_evidence": {
+                    "source": "payer_provider_group_location",
+                    "provider_group_id": 1662,
+                    "json_pointer": "/provider_references/0/provider_groups/0/address",
+                },
+            },
+        }
+    )
+
+    assert verification["address_network_binding"] == "inferred_from_provider_identity"
+    assert verification["address_evidence_level"] == "unified_provider_address"
+    assert verification["requires_location_confirmation"] is True
+    assert "address_sources" not in verification
 
 
 def test_manifest_artifact_does_not_mark_payer_location_without_source_record_evidence():
@@ -377,6 +410,7 @@ def test_manifest_artifact_provider_set_without_address_has_explicit_unknown_ver
     assert verification["address_evidence_level"] == "unknown"
     assert verification["requires_location_confirmation"] is True
     assert verification["displayed_address_present"] is False
+    assert verification["network_bound_address"] is False
     assert verification["reason"] == (
         "PTG proves the provider identity is in network, but no displayable address is available."
     )
@@ -403,6 +437,7 @@ def test_manifest_artifact_no_display_verification_drops_nested_address_evidence
         "requires_location_confirmation": True,
         "reason": "PTG proves the provider identity is in network, but no displayable address is available.",
         "displayed_address_present": False,
+        "network_bound_address": False,
     }
 
 
@@ -515,6 +550,7 @@ def test_search_manifest_snapshot_strips_no_display_provider_address_fields():
                     "telephone_number": "217-555-0100",
                 },
                 "telephone_number": "217-555-0100",
+                "coordinates": {"lat": 39.12004, "long": -88.54338},
             }
         },
         price_sets={},
@@ -546,7 +582,7 @@ def test_search_manifest_snapshot_strips_no_display_provider_address_fields():
     )
     for key in ("location_source", "address_sources", "address_precision", "source_count"):
         assert key not in item["address_verification"]
-    for key in ("address", "telephone_number", "phone", "location_source", "city", "state", "zip5"):
+    for key in ("address", "telephone_number", "phone", "location_source", "city", "state", "zip5", "coordinates"):
         assert key not in item
 
 

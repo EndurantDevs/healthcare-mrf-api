@@ -787,6 +787,19 @@ def _entity_address_unified_columns() -> list[str]:
     return [column.name for column in EntityAddressUnified.__table__.columns]
 
 
+def _compacted_source_record_ids_expr(source_record_ids: str = "source_record_ids") -> str:
+    return (
+        "CASE "
+        "WHEN address_sources @> ARRAY['provider_directory_fhir']::varchar[] THEN "
+        "COALESCE(("
+        "SELECT ARRAY_REMOVE(ARRAY_AGG(DISTINCT rid.rid ORDER BY rid.rid), NULL)::varchar[] "
+        f"FROM unnest(COALESCE({source_record_ids}, ARRAY[]::varchar[])) AS rid(rid) "
+        "WHERE rid.rid LIKE 'provider_directory_fhir:%'"
+        "), ARRAY[]::varchar[]) "
+        "ELSE ARRAY[]::varchar[] END"
+    )
+
+
 async def _compact_hot_row_source_record_ids(
     db_schema: str,
     stage_table: str,
@@ -811,6 +824,32 @@ async def _compact_hot_row_source_record_ids(
             )
             or 0
         )
+        compact_column = "source_record_ids_compact"
+        await _run_sql_phase(
+            f"""
+            ALTER TABLE {db_schema}.{stage_table}
+                DROP COLUMN IF EXISTS {compact_column};
+            """,
+            context=phase_context,
+            phase="entity-address-unified compacting hot rows metadata",
+        )
+        await _run_sql_phase(
+            f"""
+            ALTER TABLE {db_schema}.{stage_table}
+                ADD COLUMN {compact_column} varchar[] NOT NULL DEFAULT '{{}}'::varchar[];
+            """,
+            context=phase_context,
+            phase="entity-address-unified compacting hot rows metadata",
+        )
+        await _run_sql_phase(
+            f"""
+            UPDATE {db_schema}.{stage_table}
+               SET {compact_column} = {_compacted_source_record_ids_expr()}
+             WHERE address_sources @> ARRAY['provider_directory_fhir']::varchar[];
+            """,
+            context=phase_context,
+            phase="entity-address-unified compacting hot rows metadata",
+        )
         await _run_sql_phase(
             f"ALTER TABLE {db_schema}.{stage_table} DROP COLUMN source_record_ids;",
             context=phase_context,
@@ -819,7 +858,7 @@ async def _compact_hot_row_source_record_ids(
         await _run_sql_phase(
             f"""
             ALTER TABLE {db_schema}.{stage_table}
-                ADD COLUMN source_record_ids varchar[] NOT NULL DEFAULT '{{}}'::varchar[];
+                RENAME COLUMN {compact_column} TO source_record_ids;
             """,
             context=phase_context,
             phase="entity-address-unified compacting hot rows metadata",
@@ -830,7 +869,7 @@ async def _compact_hot_row_source_record_ids(
     columns = _entity_address_unified_columns()
     columns_sql = ", ".join(columns)
     select_sql = ", ".join(
-        "ARRAY[]::varchar[] AS source_record_ids" if column == "source_record_ids" else column
+        f"{_compacted_source_record_ids_expr()} AS source_record_ids" if column == "source_record_ids" else column
         for column in columns
     )
     await _run_sql_phase(
@@ -1950,13 +1989,32 @@ def _source_selects(
         else ""
     )
     provider_directory_pa_from = (
-        f"LEFT JOIN LATERAL ("
-        f"SELECT pa.taxonomy_array, pa.plans_network_array, pa.procedures_array, pa.medications_array "
-        f"FROM {db_schema}.npi_address AS pa WHERE pa.npi = provider_npi AND pa.type = 'primary' "
-        f"ORDER BY pa.checksum LIMIT 1) AS pa ON TRUE"
+        "LEFT JOIN provider_directory_primary_npi_address AS pa ON pa.npi = pd.provider_npi"
         if has_npi_address
         else ""
     )
+    def provider_directory_pa_cte(locations_cte_name: str) -> str:
+        if not has_npi_address:
+            return ""
+        return f"""
+            , provider_directory_primary_npi_address AS MATERIALIZED (
+                SELECT DISTINCT ON (pa.npi)
+                    pa.npi,
+                    pa.taxonomy_array,
+                    pa.plans_network_array,
+                    pa.procedures_array,
+                    pa.medications_array
+                  FROM {db_schema}.npi_address AS pa
+                  JOIN (
+                        SELECT DISTINCT provider_npi
+                          FROM {locations_cte_name}
+                         WHERE provider_npi IS NOT NULL
+                  ) AS provider_directory_npis
+                    ON provider_directory_npis.provider_npi = pa.npi
+                 WHERE pa.type = 'primary'
+                 ORDER BY pa.npi, pa.checksum
+            )
+        """
     ptg_npi_join = f"LEFT JOIN {db_schema}.npi AS n ON n.npi = p.npi" if has_npi else ""
     ptg_archive_join = (
         f"LEFT JOIN {db_schema}.address_archive_v2 AS aa ON aa.address_key = p.address_key"
@@ -2447,16 +2505,19 @@ def _source_selects(
                   FROM {db_schema}.provider_directory_practitioner_role AS role
                   JOIN {db_schema}.provider_directory_practitioner AS practitioner
                     ON practitioner.source_id = role.source_id
-                   AND role.practitioner_ref IN (
-                        practitioner.resource_id,
-                        'Practitioner/' || practitioner.resource_id
+                   AND practitioner.resource_id = NULLIF(
+                        regexp_replace(COALESCE(role.practitioner_ref, ''), '^.*/', ''),
+                        ''
                    )
                   JOIN LATERAL jsonb_array_elements_text(
                         COALESCE(role.location_refs::jsonb, '[]'::jsonb)
                   ) AS location_ref(value) ON TRUE
+                  JOIN LATERAL (
+                      SELECT NULLIF(regexp_replace(location_ref.value, '^.*/', ''), '') AS resource_id
+                  ) AS location_ref_id ON location_ref_id.resource_id IS NOT NULL
                   JOIN {db_schema}.provider_directory_location AS loc
                     ON loc.source_id = role.source_id
-                   AND location_ref.value IN (loc.resource_id, 'Location/' || loc.resource_id)
+                   AND loc.resource_id = location_ref_id.resource_id
                   LEFT JOIN LATERAL (
                       SELECT telecom.value->>'value' AS telephone_number
                         FROM jsonb_array_elements(COALESCE(role.telecom::jsonb, '[]'::jsonb)) AS telecom(value)
@@ -2470,6 +2531,7 @@ def _source_selects(
                    AND (loc.status IS NULL OR lower(loc.status) <> 'inactive')
                    AND {provider_directory_address_predicate}
             )
+            {provider_directory_pa_cte("provider_directory_practitioner_locations")}
             SELECT
                 'npi'::varchar AS entity_type,
                 pd.provider_npi::varchar AS entity_id,
@@ -2562,30 +2624,34 @@ def _source_selects(
                     loc.updated_at AS location_updated_at,
                     {provider_directory_address_key} AS address_key
                   FROM {db_schema}.provider_directory_organization_affiliation AS affiliation
+                  JOIN LATERAL (
+                      SELECT DISTINCT normalized_ref AS resource_id
+                        FROM (
+                            VALUES
+                                (NULLIF(regexp_replace(COALESCE(affiliation.organization_ref, ''), '^.*/', ''), '')),
+                                (NULLIF(regexp_replace(COALESCE(affiliation.participating_organization_ref, ''), '^.*/', ''), ''))
+                        ) AS refs(normalized_ref)
+                       WHERE normalized_ref IS NOT NULL
+                  ) AS organization_ref ON TRUE
                   JOIN {db_schema}.provider_directory_organization AS organization
                     ON organization.source_id = affiliation.source_id
-                   AND (
-                        affiliation.organization_ref IN (
-                            organization.resource_id,
-                            'Organization/' || organization.resource_id
-                        )
-                     OR affiliation.participating_organization_ref IN (
-                            organization.resource_id,
-                            'Organization/' || organization.resource_id
-                        )
-                   )
+                   AND organization.resource_id = organization_ref.resource_id
                   JOIN LATERAL jsonb_array_elements_text(
                         COALESCE(affiliation.location_refs::jsonb, '[]'::jsonb)
                   ) AS location_ref(value) ON TRUE
+                  JOIN LATERAL (
+                      SELECT NULLIF(regexp_replace(location_ref.value, '^.*/', ''), '') AS resource_id
+                  ) AS location_ref_id ON location_ref_id.resource_id IS NOT NULL
                   JOIN {db_schema}.provider_directory_location AS loc
                     ON loc.source_id = affiliation.source_id
-                   AND location_ref.value IN (loc.resource_id, 'Location/' || loc.resource_id)
+                   AND loc.resource_id = location_ref_id.resource_id
                  WHERE organization.npi IS NOT NULL
                    AND organization.active IS DISTINCT FROM false
                    AND affiliation.active IS DISTINCT FROM false
                    AND (loc.status IS NULL OR lower(loc.status) <> 'inactive')
                    AND {provider_directory_address_predicate}
             )
+            {provider_directory_pa_cte("provider_directory_organization_locations")}
             SELECT
                 'npi'::varchar AS entity_type,
                 pd.provider_npi::varchar AS entity_id,

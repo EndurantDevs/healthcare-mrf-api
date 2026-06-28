@@ -64,6 +64,35 @@ def test_provider_directory_source_selects_keep_keyable_address_and_phone_filter
     assert "organization.active IS DISTINCT FROM false" in sql
 
 
+def test_provider_directory_source_selects_precompute_primary_npi_attributes():
+    available = _provider_directory_available()
+    available["npi_address"] = True
+    selects = entity_address_unified._source_selects("mrf", available)
+    sql = "\n".join(selects)
+
+    assert "provider_directory_primary_npi_address AS MATERIALIZED" in sql
+    assert "SELECT DISTINCT ON (pa.npi)" in sql
+    assert "SELECT DISTINCT provider_npi" in sql
+    assert "FROM provider_directory_practitioner_locations" in sql
+    assert "FROM provider_directory_organization_locations" in sql
+    assert "LEFT JOIN provider_directory_primary_npi_address AS pa ON pa.npi = pd.provider_npi" in sql
+    assert "FROM mrf.npi_address AS pa WHERE pa.npi = provider_npi" not in sql
+
+
+def test_provider_directory_source_selects_normalize_fhir_refs_before_joining():
+    selects = entity_address_unified._source_selects("mrf", _provider_directory_available())
+    sql = "\n".join(selects)
+
+    assert "practitioner.resource_id = NULLIF(" in sql
+    assert "loc.resource_id = location_ref_id.resource_id" in sql
+    assert "organization.resource_id = organization_ref.resource_id" in sql
+    assert "SELECT DISTINCT normalized_ref AS resource_id" in sql
+    assert "regexp_replace(COALESCE(role.practitioner_ref, ''), '^.*/', '')" in sql
+    assert "role.practitioner_ref IN (" not in sql
+    assert "location_ref.value IN (loc.resource_id" not in sql
+    assert "OR affiliation.participating_organization_ref IN" not in sql
+
+
 def test_provider_directory_source_selects_are_guarded_by_table_availability():
     available = _provider_directory_available()
     available["provider_directory_location"] = False

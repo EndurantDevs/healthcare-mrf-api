@@ -199,7 +199,8 @@ async def _seed(conn: asyncpg.Connection, schema: str) -> None:
         INSERT INTO "{schema}".provider_directory_source VALUES
             ('pdfhir_1', 'Example Payer', 'Example Directory');
         INSERT INTO "{schema}".provider_directory_insurance_plan VALUES
-            ('pdfhir_1', 'plan-1', '010854205', 'Heartland Dental POS Choice Plus', '["Organization/network-c2"]'::jsonb);
+            ('pdfhir_1', 'plan-1', '010854205', 'Heartland Dental POS Choice Plus',
+             '["https://fhir.example.test/base/Organization/network-c2"]'::jsonb);
         INSERT INTO "{schema}".ptg_address (
             source_key, snapshot_id, plan_id, ptg_plan_id, npi, location_key, address_key,
             zip5, state_code, city_norm, ptg_plan_array, group_plan_array
@@ -221,11 +222,14 @@ async def _seed(conn: asyncpg.Connection, schema: str) -> None:
             ('pdfhir_1', 'location-address-only', 'Address Clinic', '312-555-0200', NULL, 'active', now(),
              '00000000-0000-0000-0000-000000000002');
         INSERT INTO "{schema}".provider_directory_practitioner_role VALUES
-            ('pdfhir_1', 'role-plan', 'Practitioner/prac-plan', NULL,
-             '["Location/location-plan"]'::jsonb, '["Organization/network-c2"]'::jsonb,
-             '["InsurancePlan/plan-1"]'::jsonb, '[]'::jsonb, '[]'::jsonb, true, now()),
-            ('pdfhir_1', 'role-address-only', 'Practitioner/prac-address-only', NULL,
-             '["Location/location-address-only"]'::jsonb, '["Organization/network-c2"]'::jsonb,
+            ('pdfhir_1', 'role-plan', 'https://fhir.example.test/base/Practitioner/prac-plan', NULL,
+             '["https://fhir.example.test/base/Location/location-plan"]'::jsonb,
+             '["https://fhir.example.test/base/Organization/network-c2"]'::jsonb,
+             '["https://fhir.example.test/base/InsurancePlan/plan-1"]'::jsonb,
+             '[]'::jsonb, '[]'::jsonb, true, now()),
+            ('pdfhir_1', 'role-address-only', 'https://fhir.example.test/base/Practitioner/prac-address-only', NULL,
+             '["https://fhir.example.test/base/Location/location-address-only"]'::jsonb,
+             '["https://fhir.example.test/base/Organization/network-c2"]'::jsonb,
              '[]'::jsonb, '[]'::jsonb, '[]'::jsonb, true, now());
         """
     )
@@ -277,18 +281,20 @@ async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
         plan_verification = _served_address_verification(plan_match, network_names=["C2"])
         assert plan_verification["address_network_binding"] == "payer_directory_corroborated_location", payload
         assert plan_verification["address_evidence_level"] == "payer_directory_network_location", payload
+        assert plan_verification["network_bound_address"] is True, payload
         assert plan_verification["provider_directory_plan_context_matched"] is True, payload
         assert plan_verification["provider_directory_network_matches"] == [
             {
                 "ptg_network_name": "C2",
                 "provider_directory_network_name": "C2",
                 "provider_directory_network_resource_id": "network-c2",
-                "provider_directory_network_ref": "Organization/network-c2",
+                "provider_directory_network_ref": "https://fhir.example.test/base/Organization/network-c2",
             }
         ], payload
         network_verification = _served_address_verification(address_only, network_names=["C2"])
         assert network_verification["address_network_binding"] == "payer_directory_corroborated_location", payload
         assert network_verification["address_evidence_level"] == "payer_directory_network_location", payload
+        assert network_verification["network_bound_address"] is True, payload
         assert network_verification["provider_directory_plan_context_matched"] is False, payload
         assert network_verification["address_verification_evidence"]["matched_on"].endswith("_network_name"), payload
         assert network_verification["provider_directory_network_matches"] == [
@@ -296,12 +302,13 @@ async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
                 "ptg_network_name": "C2",
                 "provider_directory_network_name": "C2",
                 "provider_directory_network_resource_id": "network-c2",
-                "provider_directory_network_ref": "Organization/network-c2",
+                "provider_directory_network_ref": "https://fhir.example.test/base/Organization/network-c2",
             }
         ], payload
         address_only_verification = _served_address_verification(address_only, network_names=["Other Network"])
         assert address_only_verification["address_network_binding"] == "inferred_from_provider_identity", payload
         assert address_only_verification["address_evidence_level"] == "provider_directory_address", payload
+        assert address_only_verification["network_bound_address"] is False, payload
         assert "provider_directory_network_matches" not in address_only_verification, payload
         return {"schema": schema, "rows": payload}
     finally:

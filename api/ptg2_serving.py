@@ -165,6 +165,7 @@ PTG_NO_DISPLAY_ADDRESS_FIELDS = {
     "distance",
     "distance_miles",
     "zip_match_type",
+    "coordinates",
     "google_maps_url",
     "google_map_url",
     "maps_url",
@@ -453,6 +454,16 @@ def _provider_directory_address_verification_evidence(
     return updated
 
 
+def _has_source_file_version_trace(item: dict[str, Any]) -> bool:
+    source_trace = item.get("source_trace")
+    if not isinstance(source_trace, list):
+        return False
+    return any(
+        isinstance(entry, dict) and str(entry.get("source_file_version_id") or "").strip()
+        for entry in source_trace
+    )
+
+
 def _promote_address_provenance_fields(item: dict[str, Any], address_payload: dict[str, Any]) -> None:
     for key in (
         "address_precision",
@@ -481,6 +492,7 @@ def _address_verification_payload(
             "requires_location_confirmation": True,
             "reason": "PTG proves the provider identity is in network, but no displayable address is available.",
             "displayed_address_present": False,
+            "network_bound_address": False,
         }
 
     location_source = item.get("location_source") or data.get("location_source")
@@ -532,7 +544,7 @@ def _address_verification_payload(
             "ptg_provider_group_location",
             "tic_provider_group_location",
         }
-    ) and _has_direct_payer_location_record_evidence(address_payload)
+    ) and _has_direct_payer_location_record_evidence(address_payload) and _has_source_file_version_trace(item)
     normalized_sources = {value.lower().replace("-", "_") for value in address_sources}
     provider_directory_address = bool(
         source_markers
@@ -632,6 +644,10 @@ def _address_verification_payload(
         "address_evidence_level": address_evidence_level,
         "requires_location_confirmation": requires_location_confirmation,
         "reason": reason,
+        "network_bound_address": address_network_binding in {
+            "payer_confirmed_location",
+            "payer_directory_corroborated_location",
+        },
     }
     optional_fields = {
         "displayed_address_present": displayed_address_present,
