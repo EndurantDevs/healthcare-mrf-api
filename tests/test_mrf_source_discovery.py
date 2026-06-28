@@ -1502,8 +1502,16 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "UHA" in by_name["UHA Health Insurance"].aliases
     assert by_name["EMI Health"].benefit_lines == ("dental",)
     assert by_name["EMI Health"].hosting_platform == "html_mrf_links"
+    assert by_name["EMI Health"].status == "active"
+    assert by_name["EMI Health"].index_url == "https://emihealth.com/machinereadables"
     assert "Companion Life dental" in by_name["EMI Health"].aliases
     assert "Companion Life EMI Dental Plans" in by_name["EMI Health"].aliases
+    emi_sources = [candidate for candidate in candidates if candidate.payer_name == "EMI Health"]
+    assert any(
+        candidate.status == "stale"
+        and candidate.index_url == "https://emihealth.com/MachineReadables"
+        for candidate in emi_sources
+    )
     assert by_name["WPS Health"].hosting_platform == "html_mrf_links"
     assert "WPS Health Insurance" in by_name["WPS Health"].aliases
     assert "Wisconsin Physicians Service Insurance Corporation" in (
