@@ -216,6 +216,7 @@ Last one-time research refresh: 2026-06-05.
 | CHRISTUS Health Plan | provider_sponsored | https://chppayment.christushealth.org/documents/ATEX/ | public MRF directory |
 | Cook Children's HP | provider_sponsored | - | needs official source URL |
 | Dean Health Plan | provider_sponsored | https://deancare.healthsparq.com/healthsparq/public/#/one/insurerCode=MEDICAHEALTHPLANS_I&brandCode=DEAN&productCode=MRF/machine-readable-transparency-in-coverage | public HealthSparq MRF route linked from Dean transparency page |
+| Dean Health Plan | provider_sponsored | https://www.deancare.com/helpful-links/transparency-in-coverage | observed stale; replaced by direct Dean HealthSparq MRF route |
 | Froedtert Health Plan | provider_sponsored | https://www.froedtert.com/price-transparency | public transparency URL |
 | Geisinger Health Plan | provider_sponsored | https://www.geisinger.org/health-plan/no-surprises-act | curated source row |
 | Hally/Health Alliance | provider_sponsored | - | needs official source URL |
@@ -227,6 +228,7 @@ Last one-time research refresh: 2026-06-05.
 | Johns Hopkins HealthCare | provider_sponsored | https://ehptransparency.org/ | public Johns Hopkins Employer Health Programs autoindex linked from EHP transparency page |
 | Mass General Brigham HP | provider_sponsored | https://massgeneralbrighamhealthplan.org/meet-us/transparency-regulations | curated source row |
 | McLaren Health Plan | provider_sponsored | https://www.mclarenhealthplan.org/mhp/transparency-in-coverage-and-no-surprises-act | public McLaren Health Plan MRF page with direct in-network, allowed-amount, and table-of-contents links |
+| McLaren Health Plan | provider_sponsored | https://www.phpmichigan.com/About-Us/Transparency-in-Coverage | observed stale; replaced by McLaren Health Plan transparency page |
 | Mercy/MercyCare | provider_sponsored | - | needs official source URL |
 | Ohio Health Choice | provider_sponsored | - | needs official source URL |
 | Optima Health | provider_sponsored | https://www.optimahealth.com/transparency-in-coverage | curated source row |
@@ -264,6 +266,7 @@ Last one-time research refresh: 2026-06-05.
 | AultCare | regional | - | needs official source URL |
 | AultCare/Aultman | regional | https://aultcare.com/price-transparency | curated source row |
 | AvMed | regional | https://www.avmed.org/en/for-developers | public AvMed developer page with TiC table-of-contents and Azure MRF directory links |
+| AvMed | regional | https://www.avmed.org/transparency-in-coverage | observed stale; replaced by AvMed developer page |
 | AvMed Health Pledge | regional | - | needs official source URL |
 | BridgeSpan | regional | - | needs official source URL |
 | CalViva Health | regional | https://www.calvivahealth.org/interoperability/ | public transparency URL |
