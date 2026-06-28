@@ -1011,6 +1011,10 @@ def classify_hosting_platform(url: str | None) -> str | None:
         "transparency-in-coverage.optum.com",
     }:
         return "uhc_public_blobs"
+    if host == "providermrf.uhc.com" and path.startswith(
+        ("/ifp", "/cs", "/api/files/ui/", "/api/stream/ui/")
+    ):
+        return "uhc_provider_mrf_files"
     if host == "transparency-in-coverage.bluecrossma.com":
         return "bcbsma_monthly_tocs"
     if (
@@ -2213,6 +2217,110 @@ def _parse_uhc_blob_listing(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 "size": _as_int(blob.get("size")),
             }
         )
+    return targets
+
+
+def _uhc_provider_mrf_collection_from_url(url: str | None) -> str:
+    parts = [
+        part.lower()
+        for part in urlsplit(str(url or "")).path.strip("/").split("/")
+        if part
+    ]
+    if parts:
+        if parts[0] in {"ifp", "cs"}:
+            return parts[0]
+        if len(parts) >= 4 and parts[:3] in (
+            ["api", "files", "ui"],
+            ["api", "stream", "ui"],
+        ):
+            collection = parts[3]
+            if collection in {"ifp", "cs"}:
+                return collection
+    return "ifp"
+
+
+def _uhc_provider_mrf_api_url(url: str | None) -> str:
+    collection = _uhc_provider_mrf_collection_from_url(url)
+    return f"https://providermrf.uhc.com/api/files/ui/{collection}/"
+
+
+def _uhc_provider_mrf_stream_url(blob_path: Any) -> str | None:
+    value = str(blob_path or "").strip().lstrip("/")
+    if not value:
+        return None
+    return urljoin("https://providermrf.uhc.com/api/stream/", value)
+
+
+def _uhc_provider_mrf_file_type(section: str) -> str | None:
+    normalized = str(section or "").strip().lower()
+    if normalized == "providers":
+        return "provider-network"
+    if normalized == "drugs":
+        return "payer-drug"
+    if normalized == "plans":
+        return "plan-reference"
+    return None
+
+
+def _uhc_provider_mrf_label(name: str) -> str:
+    label = re.sub(r"\.json(?:\.gz)?$", "", str(name or ""), flags=re.I)
+    label = re.sub(r"^json[_-]", "", label, flags=re.I)
+    label = label.replace("_", " ").replace("-", " ")
+    return _clean_text(label).title()
+
+
+def _uhc_provider_mrf_targets_from_payload(
+    source: dict[str, Any],
+    payload: dict[str, Any],
+    *,
+    listing_url: str,
+    resolver_type: str = "uhc_provider_mrf_files",
+    max_targets: int | None = None,
+) -> list[CrawlTarget]:
+    targets: list[CrawlTarget] = []
+    for section in ("providers", "drugs", "plans"):
+        file_type = _uhc_provider_mrf_file_type(section)
+        entries = payload.get(section) if isinstance(payload, dict) else None
+        if not isinstance(entries, list) or not file_type:
+            continue
+        sorted_entries = sorted(
+            (entry for entry in entries if isinstance(entry, dict)),
+            key=lambda entry: str(entry.get("date") or ""),
+            reverse=True,
+        )
+        for entry in sorted_entries:
+            name = str(entry.get("name") or "").strip()
+            if not name or name.lower() in {section, "filename"}:
+                continue
+            if name.lower().endswith(".trig"):
+                continue
+            target_url = str(entry.get("url") or "").strip()
+            if not target_url:
+                target_url = _uhc_provider_mrf_stream_url(entry.get("blobPath")) or ""
+            if not target_url:
+                continue
+            targets.append(
+                CrawlTarget(
+                    source=source,
+                    url=target_url,
+                    label=_uhc_provider_mrf_label(name),
+                    resolved_from_url=listing_url,
+                    metadata={
+                        "resolver": resolver_type,
+                        "target_kind": "file_reference",
+                        "target_file_type": file_type,
+                        "container_format": _container_format(target_url),
+                        "source_format": _container_format(target_url) or "json",
+                        "uhc_provider_section": section,
+                        "uhc_provider_file_name": name,
+                        "uhc_provider_blob_path": entry.get("blobPath"),
+                        "uhc_provider_file_date": entry.get("date"),
+                        "uhc_provider_external": bool(entry.get("isExternal")),
+                    },
+                )
+            )
+            if max_targets and len(targets) >= max_targets:
+                return targets
     return targets
 
 
@@ -8308,6 +8416,23 @@ async def _crawl_targets_for_source(
             )
             for target in targets
         ]
+    if resolver_type == "uhc_provider_mrf_files":
+        listing_url = _uhc_provider_mrf_api_url(url)
+        listing = await _fetch_json(
+            listing_url,
+            max_bytes=int(resolver.get("max_bytes") or 10 * 1024 * 1024),
+            session=session,
+        )
+        targets = _uhc_provider_mrf_targets_from_payload(
+            source,
+            listing,
+            listing_url=listing_url,
+            resolver_type=resolver_type,
+            max_targets=_as_int(resolver.get("max_targets")),
+        )
+        if not targets:
+            raise ValueError(f"no UHC provider MRF files found for {url}")
+        return targets
     if resolver_type == "uhc_blob_listing":
         host = _domain(url) or ""
         configured_paths = (

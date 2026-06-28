@@ -309,6 +309,11 @@
       "path_templates": ["/api/v1/uhc/blobs/"],
       "optum_path_templates": ["/api/v1/oh/blobs/", "/api/v1/orx/blobs/"]
     },
+    "uhc_provider_mrf_files": {
+      "type": "uhc_provider_mrf_files",
+      "max_bytes": 10485760,
+      "max_targets": 500
+    },
     "bcbsma_monthly_tocs": {
       "type": "bcbsma_monthly_tocs",
       "base_url": "https://transparency-in-coverage.bluecrossma.com/",

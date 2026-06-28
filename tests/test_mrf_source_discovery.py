@@ -147,6 +147,10 @@ def test_source_urls_are_loaded_from_registry_file():
         config["platform_resolvers"]["uhc_public_blobs"]["type"] == "uhc_blob_listing"
     )
     assert (
+        config["platform_resolvers"]["uhc_provider_mrf_files"]["type"]
+        == "uhc_provider_mrf_files"
+    )
+    assert (
         config["platform_resolvers"]["bcbsma_monthly_tocs"]["type"]
         == "bcbsma_monthly_tocs"
     )
@@ -530,6 +534,10 @@ def test_classify_hosting_platform_recognizes_public_adapter_pages():
     assert (
         discovery.classify_hosting_platform("https://price-transparency.webtpa.com/")
         == "webtpa_mrf_api"
+    )
+    assert (
+        discovery.classify_hosting_platform("https://providermrf.uhc.com/IFP")
+        == "uhc_provider_mrf_files"
     )
     assert (
         discovery.classify_hosting_platform("https://www.ibx.com/cmstic/?brand=qcc")
@@ -1859,6 +1867,12 @@ def test_classify_hosting_platforms():
     assert (
         discovery.classify_hosting_platform("https://transparency-in-coverage.uhc.com/")
         == "uhc_public_blobs"
+    )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://providermrf.uhc.com/api/files/ui/ifp/"
+        )
+        == "uhc_provider_mrf_files"
     )
     assert (
         discovery.classify_hosting_platform("https://bci.sapphiremrfhub.com/")
@@ -3624,6 +3638,108 @@ def test_parse_uhc_blob_listing_extracts_index_targets_only():
     assert target["label"] == "Abc Company"
     assert target["size"] == 1234
     assert target["url"].endswith("?sig=abc")
+
+
+def test_uhc_provider_mrf_targets_from_payload_catalogs_file_references():
+    source = {
+        "source_id": "source_1",
+        "payer_id": "payer_1",
+        "display_name": "UnitedHealthcare IFP",
+    }
+    payload = {
+        "providers": [
+            {
+                "name": "providers",
+                "date": "2026-06-25T11:12:03.000Z",
+                "blobPath": "ui/ifp/providers",
+            },
+            {
+                "name": "JSON_Providers_NMIEX.json",
+                "date": "2026-06-26T15:30:52.000Z",
+                "blobPath": "ui/ifp/providers/JSON_Providers_NMIEX.json",
+            },
+            {
+                "name": "JSON_Providers_NMIEX.json.trig",
+                "date": "2026-06-26T15:30:00.000Z",
+                "blobPath": "ui/ifp/providers/JSON_Providers_NMIEX.json.trig",
+            },
+        ],
+        "drugs": [
+            {"name": "filename", "url": "URL"},
+            {
+                "name": "JSON_Drugs_UHCALEX_HIX.json",
+                "url": "https://legacy.providerlookuponline.com/mrf/optumrx/drugs/2877216/JSON_Drugs_UHCALEX_HIX.json",
+                "date": "2025-09-02T10:41:01.000Z",
+                "isExternal": True,
+            },
+        ],
+        "plans": [
+            {
+                "name": "JSON_PLANS_AL.json",
+                "date": "2025-11-11T11:45:20.000Z",
+                "blobPath": "ui/ifp/plans/JSON_PLANS_AL.json",
+            }
+        ],
+    }
+
+    targets = discovery._uhc_provider_mrf_targets_from_payload(
+        source,
+        payload,
+        listing_url="https://providermrf.uhc.com/api/files/ui/ifp/",
+    )
+
+    assert [target.url for target in targets] == [
+        "https://providermrf.uhc.com/api/stream/ui/ifp/providers/JSON_Providers_NMIEX.json",
+        "https://legacy.providerlookuponline.com/mrf/optumrx/drugs/2877216/JSON_Drugs_UHCALEX_HIX.json",
+        "https://providermrf.uhc.com/api/stream/ui/ifp/plans/JSON_PLANS_AL.json",
+    ]
+    assert [target.metadata["target_file_type"] for target in targets] == [
+        "provider-network",
+        "payer-drug",
+        "plan-reference",
+    ]
+    assert all(target.metadata["target_kind"] == "file_reference" for target in targets)
+    assert targets[0].label == "Providers Nmiex"
+    assert targets[0].metadata["uhc_provider_blob_path"] == (
+        "ui/ifp/providers/JSON_Providers_NMIEX.json"
+    )
+    assert targets[1].metadata["uhc_provider_external"] is True
+
+
+@pytest.mark.asyncio
+async def test_uhc_provider_mrf_resolver_fetches_ifp_listing(monkeypatch):
+    source = {
+        "source_id": "source_1",
+        "payer_id": "payer_1",
+        "display_name": "UnitedHealthcare IFP",
+    }
+    payload = {
+        "providers": [
+            {
+                "name": "JSON_Providers_NMIEX.json",
+                "date": "2026-06-26T15:30:52.000Z",
+                "blobPath": "ui/ifp/providers/JSON_Providers_NMIEX.json",
+            }
+        ]
+    }
+
+    async def fake_fetch_json(url, **_kwargs):
+        assert url == "https://providermrf.uhc.com/api/files/ui/ifp/"
+        return payload
+
+    monkeypatch.setattr(discovery, "_fetch_json", fake_fetch_json)
+
+    [target] = await discovery._crawl_targets_for_source(
+        source,
+        "https://providermrf.uhc.com/IFP",
+        None,
+    )
+
+    assert target.url == (
+        "https://providermrf.uhc.com/api/stream/ui/ifp/providers/JSON_Providers_NMIEX.json"
+    )
+    assert target.resolved_from_url == "https://providermrf.uhc.com/api/files/ui/ifp/"
+    assert target.metadata["resolver"] == "uhc_provider_mrf_files"
 
 
 def test_healthsparq_public_params_from_public_fragment():
