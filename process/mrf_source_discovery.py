@@ -611,6 +611,11 @@ def classify_hosting_platform(url: str | None) -> str | None:
         return "fchn_payor_search"
     if host in {"ehptransparency.org", "www.ehptransparency.org"}:
         return "html_mrf_links"
+    if host in {"www.vivahealth.com", "vivahealth.com"} and (
+        path.startswith("/mrf")
+        or path.startswith("/files/mrf/viva-health-commercial-")
+    ):
+        return "viva_health_mrf"
     if (
         host
         in {
@@ -2461,8 +2466,12 @@ def _mymedicalshopper_employer_slug_from_url(url: str | None) -> str | None:
 
 def _mymedicalshopper_group_id_from_employer_slug(slug: str | None) -> str | None:
     parts = [part for part in re.split(r"[-_]+", str(slug or "").strip()) if part]
-    if parts and re.fullmatch(r"\d+", parts[-1]):
-        return parts[-1]
+    if parts:
+        suffix = parts[-1].lower()
+        if re.fullmatch(r"\d+", suffix):
+            return suffix
+        if re.fullmatch(r"[a-z]{1,8}\d{3,}", suffix):
+            return suffix
     return None
 
 
@@ -3037,6 +3046,166 @@ async def _resolve_mymedicalshopper_talon_mrf(
         return targets
     finally:
         await ws.close()
+
+
+_VIVA_HEALTH_COMMERCIAL_MRF_FILES: tuple[dict[str, str], ...] = (
+    {
+        "url": "https://www.vivahealth.com/files/mrf/viva-health-commercial-in-network-rates",
+        "label": "VIVA Health Commercial in-network rates",
+        "target_file_type": "in-network",
+        "content_disposition_filename": "2026-06-01_vivahealthcommercial_in-network_rates.zip",
+    },
+    {
+        "url": "https://www.vivahealth.com/files/mrf/viva-health-commercial-out-of-network-rates",
+        "label": "VIVA Health Commercial allowed amounts",
+        "target_file_type": "allowed-amounts",
+        "content_disposition_filename": "2026-06-01_vivahealth_commercial_allowed-amounts.zip",
+    },
+)
+
+
+def _viva_health_commercial_target(
+    source: dict[str, Any], file_info: dict[str, str], *, resolved_from_url: str
+) -> CrawlTarget:
+    return CrawlTarget(
+        source=source,
+        url=file_info["url"],
+        label=file_info["label"],
+        resolved_from_url=resolved_from_url,
+        metadata={
+            "resolver": "viva_health_mrf",
+            "target_kind": "file_reference",
+            "target_file_type": file_info["target_file_type"],
+            "container_format": "zip",
+            "plan_market_type": "group",
+            "network_name": "VIVA Health Commercial",
+            "content_disposition_filename": file_info["content_disposition_filename"],
+        },
+    )
+
+
+def _viva_health_commercial_targets(
+    source: dict[str, Any], url: str
+) -> list[CrawlTarget]:
+    canonical_url = _canonical_or_none(url) or url
+    targets: list[CrawlTarget] = []
+    for file_info in _VIVA_HEALTH_COMMERCIAL_MRF_FILES:
+        file_url = file_info["url"]
+        if urlsplit(url).path.startswith("/files/mrf/") and (
+            _canonical_or_none(file_url) or file_url
+        ) != canonical_url:
+            continue
+        targets.append(
+            _viva_health_commercial_target(source, file_info, resolved_from_url=url)
+        )
+    return targets
+
+
+def _viva_health_employer_landing_target(
+    source: dict[str, Any],
+    *,
+    employer_url: str,
+    employer_page_url: str,
+) -> CrawlTarget:
+    employer_slug = _mymedicalshopper_employer_slug_from_url(employer_url)
+    group_id = _mymedicalshopper_group_id_from_employer_slug(employer_slug)
+    tpa_slug = _mymedicalshopper_tpa_slug_from_employer_slug(employer_slug) or (
+        "viva-health" if group_id else None
+    )
+    employer_name = _slug_label(employer_slug)
+    plan_info = []
+    if employer_name or group_id:
+        plan_info.append(
+            {
+                "plan_id": group_id,
+                "plan_id_type": "group_number" if group_id else None,
+                "plan_name": employer_name,
+                "plan_market_type": "group",
+            }
+        )
+    return CrawlTarget(
+        source=source,
+        url=employer_url,
+        label=employer_name or "VIVA Health employer MRF page",
+        resolved_from_url=employer_page_url,
+        metadata={
+            "resolver": "viva_health_mrf",
+            "target_kind": "source_landing_page",
+            "target_file_type": "source-landing-page",
+            "external_source_url": employer_url,
+            "external_hosting_platform": classify_hosting_platform(employer_url),
+            "viva_employer_page_url": employer_page_url,
+            "employer_slug": employer_slug,
+            "employer_name": employer_name,
+            "group_id": group_id,
+            "group_number": group_id,
+            "tpa_slug": tpa_slug,
+            "tpa_name": _slug_label(tpa_slug),
+            "landing_reason": "public_employer_mrf_page",
+            "plan_info": plan_info,
+        },
+    )
+
+
+async def _viva_health_employer_landing_targets(
+    source: dict[str, Any],
+    *,
+    employer_page_url: str,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    html_text = await _fetch_text(
+        employer_page_url,
+        max_bytes=int(resolver.get("max_bytes") or 5 * 1024 * 1024),
+        session=session,
+    )
+    urls = _delegated_mrf_source_urls_from_html(html_text, base_url=employer_page_url)
+    max_links = _as_int(resolver.get("max_employer_links")) or 40
+    return [
+        _viva_health_employer_landing_target(
+            source, employer_url=employer_url, employer_page_url=employer_page_url
+        )
+        for employer_url in urls[:max_links]
+        if classify_hosting_platform(employer_url) == "mymedicalshopper_talon"
+    ]
+
+
+async def _resolve_viva_health_mrf(
+    source: dict[str, Any],
+    url: str,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    path = urlsplit(url).path.rstrip("/").lower()
+    targets: list[CrawlTarget] = []
+    if path.startswith("/files/mrf/"):
+        targets.extend(_viva_health_commercial_targets(source, url))
+        if not targets:
+            raise ValueError(f"no VIVA Health commercial MRF target found for {url}")
+        return targets
+    if resolver.get("include_commercial_static", True):
+        targets.extend(_viva_health_commercial_targets(source, url))
+    if resolver.get("include_employer_mrf_links", True):
+        employer_url = urljoin(
+            url, str(resolver.get("employer_path") or "/mrf/employers/")
+        )
+        try:
+            employer_targets = await _viva_health_employer_landing_targets(
+                source,
+                employer_page_url=employer_url,
+                resolver=resolver,
+                session=session,
+            )
+        except Exception:  # pylint: disable=broad-exception-caught
+            employer_targets = []
+        targets.extend(employer_targets)
+    targets = _dedupe_crawl_targets_by_url(targets)
+    max_targets = _as_int(resolver.get("max_targets"))
+    if max_targets and max_targets > 0:
+        targets = targets[:max_targets]
+    if not targets:
+        raise ValueError(f"no VIVA Health MRF targets found for {url}")
+    return targets
 
 
 def _magnacare_results_url(base_url: str, search_term: str) -> str:
@@ -8859,6 +9028,8 @@ async def _crawl_targets_for_source(
         return await _resolve_humana_pct_file_list(source, url, resolver, session)
     if resolver_type == "fchn_payor_search":
         return await _resolve_fchn_payor_search(source, url, resolver, session)
+    if resolver_type == "viva_health_mrf":
+        return await _resolve_viva_health_mrf(source, url, resolver, session)
     if resolver_type == "healthez_benefits_mrf":
         return await _resolve_healthez_benefits_mrf(source, url, resolver, session)
     if resolver_type == "payercompass_mrf":

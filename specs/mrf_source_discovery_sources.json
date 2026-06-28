@@ -292,6 +292,15 @@
       "max_plans_per_employer": 10,
       "ddp_timeout_seconds": 20
     },
+    "viva_health_mrf": {
+      "type": "viva_health_mrf",
+      "employer_path": "/mrf/employers/",
+      "max_bytes": 5242880,
+      "max_employer_links": 40,
+      "max_targets": 100,
+      "include_commercial_static": true,
+      "include_employer_mrf_links": true
+    },
     "magnacare_transparency_mrf": {
       "type": "magnacare_transparency_mrf",
       "search_terms": ["magna", "employee", "benefit", "medical", "hospital"],

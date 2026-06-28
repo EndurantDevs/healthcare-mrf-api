@@ -130,6 +130,11 @@ def test_source_urls_are_loaded_from_registry_file():
         "max_targets"
     ] == 20
     assert (
+        config["platform_resolvers"]["viva_health_mrf"]["type"]
+        == "viva_health_mrf"
+    )
+    assert config["platform_resolvers"]["viva_health_mrf"]["max_employer_links"] == 40
+    assert (
         config["platform_resolvers"]["magnacare_transparency_mrf"]["type"]
         == "magnacare_transparency_mrf"
     )
@@ -430,9 +435,15 @@ def test_classify_hosting_platform_recognizes_public_adapter_pages():
     for url in (
         "https://www.deancare.com/helpful-links/transparency-in-coverage",
         "https://www.avmed.org/transparency-in-coverage",
-        "https://www.vivahealth.com/transparency-in-coverage/",
     ):
         assert discovery.classify_hosting_platform(url) == "custom"
+    for url in (
+        "https://www.vivahealth.com/mrf/",
+        "https://www.vivahealth.com/mrf/employers/",
+        "https://www.vivahealth.com/files/mrf/viva-health-commercial-in-network-rates",
+        "https://www.vivahealth.com/files/mrf/viva-health-commercial-out-of-network-rates",
+    ):
+        assert discovery.classify_hosting_platform(url) == "viva_health_mrf"
     assert (
         discovery.classify_hosting_platform(
             "https://www.scrippshealthplan.com/transparency-in-coverage#component_8a5f07e7c7"
@@ -792,6 +803,7 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
 | PacificSource | regional | https://mrf.pacificsource.com/File/Visit/Index | aliases: Pacific Source |
 | Allegiance Benefit Plan Management | tpa | https://mrf.healthcarebluebook.com/Allegiance | aliases: AskAllegiance |
 | Healthcare Management Administrators | tpa | https://sawus2prdticmrfhma.z5.web.core.windows.net/ | aliases: HMA, AccessHMA |
+| VIVA Health | provider_sponsored | https://www.vivahealth.com/mrf/ | public VIVA MRF landing |
 | HealthComp | tpa | https://healthcomp.sapphiremrfhub.com/ | aliases: Personify Health, Personify |
 | Pinnacle Claims Management | tpa | https://mrf.healthcarebluebook.com/Pinnacle | aliases: PCMI |
 | Regency Employee Benefits | tpa | https://www.mymedicalshopper.com/mrf-search/robbins-regency-employee-benefits-inc-regn | aliases: Robbins Regency Employee Benefits |
@@ -866,6 +878,7 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
         by_name["Healthcare Management Administrators"].hosting_platform
         == "html_mrf_links"
     )
+    assert by_name["VIVA Health"].hosting_platform == "viva_health_mrf"
     assert by_name["HealthComp"].hosting_platform == "sapphire"
     assert by_name["HealthComp"].aliases == ("Personify Health", "Personify")
     assert (
@@ -3676,6 +3689,12 @@ def test_mymedicalshopper_direct_employer_slug_infers_tpa_and_group_context():
         == "77100"
     )
     assert (
+        discovery._mymedicalshopper_group_id_from_employer_slug(
+            "a-plus-portable-restrooms-viva-health-x00977"
+        )
+        == "x00977"
+    )
+    assert (
         discovery._mymedicalshopper_tpa_slug_from_employer_slug(
             "electrical-workers-cofinity-varipro-77100"
         )
@@ -3740,6 +3759,104 @@ async def test_mymedicalshopper_resolver_honors_max_targets(monkeypatch):
 
     assert generated_for == ["client-one-bywater-10001", "client-two-bywater-10002"]
     assert [target.metadata["employer_slug"] for target in targets] == generated_for
+
+
+@pytest.mark.asyncio
+async def test_viva_health_resolver_adds_commercial_and_employer_landing_targets(
+    monkeypatch,
+):
+    employer_seen = {}
+
+    async def fake_employer_targets(source, *, employer_page_url, resolver, session):
+        employer_seen["source"] = source
+        employer_seen["url"] = employer_page_url
+        employer_seen["resolver"] = resolver
+        employer_seen["session"] = session
+        return [
+            discovery._viva_health_employer_landing_target(
+                source=source,
+                employer_url="https://www.mymedicalshopper.com/mrf/viva-client-x01234",
+                employer_page_url=employer_page_url,
+            )
+        ]
+
+    monkeypatch.setattr(
+        discovery, "_viva_health_employer_landing_targets", fake_employer_targets
+    )
+
+    source = {"source_id": "source_viva", "payer_id": "payer_viva"}
+    resolver = {
+        "type": "viva_health_mrf",
+        "employer_path": "/mrf/employers/",
+        "max_bytes": 1024,
+        "max_employer_links": 7,
+        "max_targets": 10,
+    }
+    targets = await discovery._resolve_viva_health_mrf(
+        source,
+        "https://www.vivahealth.com/mrf/",
+        resolver,
+        session=object(),
+    )
+
+    assert [target.url for target in targets[:2]] == [
+        "https://www.vivahealth.com/files/mrf/viva-health-commercial-in-network-rates",
+        "https://www.vivahealth.com/files/mrf/viva-health-commercial-out-of-network-rates",
+    ]
+    assert targets[0].metadata["target_file_type"] == "in-network"
+    assert targets[0].metadata["container_format"] == "zip"
+    assert targets[1].metadata["target_file_type"] == "allowed-amounts"
+    assert targets[2].metadata["target_kind"] == "source_landing_page"
+    assert targets[2].metadata["target_file_type"] == "source-landing-page"
+    assert targets[2].metadata["external_hosting_platform"] == "mymedicalshopper_talon"
+    assert targets[2].metadata["group_id"] == "x01234"
+    assert (
+        targets[2].metadata["viva_employer_page_url"]
+        == "https://www.vivahealth.com/mrf/employers/"
+    )
+    assert employer_seen["url"] == "https://www.vivahealth.com/mrf/employers/"
+    assert employer_seen["resolver"]["max_employer_links"] == 7
+
+
+def test_viva_health_direct_commercial_target_handles_extensionless_downloads():
+    source = {"source_id": "source_viva", "payer_id": "payer_viva"}
+
+    targets = discovery._viva_health_commercial_targets(
+        source,
+        "https://www.vivahealth.com/files/mrf/viva-health-commercial-out-of-network-rates",
+    )
+
+    assert len(targets) == 1
+    assert targets[0].url.endswith("viva-health-commercial-out-of-network-rates")
+    assert targets[0].metadata["target_kind"] == "file_reference"
+    assert targets[0].metadata["target_file_type"] == "allowed-amounts"
+    assert targets[0].metadata["container_format"] == "zip"
+
+
+def test_viva_health_employer_landing_target_indexes_group_context():
+    source = {"source_id": "source_viva", "payer_id": "payer_viva"}
+
+    target = discovery._viva_health_employer_landing_target(
+        source,
+        employer_url="https://www.mymedicalshopper.com/mrf/acme-viva-health-x01234",
+        employer_page_url="https://www.vivahealth.com/mrf/employers/",
+    )
+
+    assert target.label == "Acme Viva Health X01234"
+    assert target.metadata["target_kind"] == "source_landing_page"
+    assert target.metadata["external_hosting_platform"] == "mymedicalshopper_talon"
+    assert target.metadata["employer_slug"] == "acme-viva-health-x01234"
+    assert target.metadata["group_id"] == "x01234"
+    assert target.metadata["group_number"] == "x01234"
+    assert target.metadata["tpa_slug"] == "viva-health"
+    assert target.metadata["plan_info"] == [
+        {
+            "plan_id": "x01234",
+            "plan_id_type": "group_number",
+            "plan_name": "Acme Viva Health X01234",
+            "plan_market_type": "group",
+        }
+    ]
 
 
 MAGNACARE_RESULTS_HTML = """
