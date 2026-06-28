@@ -348,7 +348,7 @@ Last one-time research refresh: 2026-06-05.
 | QualChoice | regional | - | needs official source URL |
 | Select Health | regional | https://www.selecthealth.org/disclaimers/machine-readable-data | public machine-readable data page with commercial plan index links; aliases: SelectHealth, Select Health |
 | Spectrum | regional | - | needs official source URL |
-| SummaCare | regional | - | needs official source URL |
+| SummaCare | regional | https://files.myplancentral.com/TIC/TOC/ | public PlanCentral SummaCare TOC directory linked from SummaCare pricing transparency page; aliases: SummaCare Health Plan, SummaCare MEWA, Summa Health System |
 | The Health Plan | regional | https://www.healthplan.org/machine_readable_files | public parent MRF page with network-specific directories; aliases: The Health Plan of West Virginia, The Health Plan of WV, The Health Plan of the Upper Ohio Valley, THP |
 | The Health Plan of the Upper Ohio Valley | regional | - | represented by The Health Plan public parent MRF page alias |
 | The Jefferson Health Plan | regional | - | needs official source URL |

@@ -856,6 +856,8 @@ def classify_hosting_platform(url: str | None) -> str | None:
         and "price-transparency" in path
     ):
         return "html_mrf_links"
+    if host == "files.myplancentral.com" and path.startswith("/tic/toc"):
+        return "html_mrf_links"
     if host in {"www.healthplan.org", "healthplan.org"} and (
         path.startswith("/machine_readable_files")
         or path.startswith("/multiplan_mrfs")

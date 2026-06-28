@@ -875,6 +875,7 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
 | The Health Plan | regional | https://www.healthplan.org/machine_readable_files | aliases: The Health Plan of West Virginia, THP |
 | BCBS Wyoming | blue | https://www.bcbswy.com/machine-readable-files/ | aliases: Blue Cross and Blue Shield of Wyoming, BCBSWY |
 | WPS Health | regional | https://www.wpshealth.com/resources/customer-resources/price-transparency.shtml | aliases: Wisconsin Physicians Service, WPS |
+| SummaCare | regional | https://files.myplancentral.com/TIC/TOC/ | aliases: SummaCare MEWA, Summa Health System |
 """
 
     candidates = discovery.parse_master_list(markdown)
@@ -1043,6 +1044,8 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
     )
     assert by_name["WPS Health"].hosting_platform == "html_mrf_links"
     assert by_name["WPS Health"].aliases == ("Wisconsin Physicians Service", "WPS")
+    assert by_name["SummaCare"].hosting_platform == "html_mrf_links"
+    assert by_name["SummaCare"].aliases == ("SummaCare MEWA", "Summa Health System")
 
 
 @pytest.mark.asyncio
@@ -1506,6 +1509,9 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Wisconsin Physicians Service Insurance Corporation" in (
         by_name["WPS Health"].aliases
     )
+    assert by_name["SummaCare"].hosting_platform == "html_mrf_links"
+    assert "SummaCare MEWA" in by_name["SummaCare"].aliases
+    assert "Summa Health System" in by_name["SummaCare"].aliases
     assert "Health Plans, Inc" in by_name["Health Plans Inc"].aliases
     assert "Health Plans, Inc." in by_name["Health Plans Inc"].aliases
     assert "HealthPlans Inc." in by_name["Health Plans Inc"].aliases
@@ -2384,6 +2390,10 @@ def test_classify_hosting_platforms():
         discovery.classify_hosting_platform(
             "https://www.wpshealth.com/resources/customer-resources/price-transparency.shtml"
         )
+        == "html_mrf_links"
+    )
+    assert (
+        discovery.classify_hosting_platform("https://files.myplancentral.com/TIC/TOC/")
         == "html_mrf_links"
     )
     assert (
@@ -6448,6 +6458,40 @@ def test_parse_html_mrf_links_extracts_ehp_autoindex_files():
             "https://ehptransparency.org/May_2026/innetwork-G-EHPCAREMARK-file-1.json",
             "file_reference",
             "in-network",
+        ),
+    ]
+
+
+def test_parse_html_mrf_links_extracts_myplancentral_gzip_tocs():
+    html = """
+    <h1>Index of /TIC/TOC/</h1>
+    <a href="../">../</a>
+    <a href="2026-06-02_SummaCare_index.json.gz">
+      2026-06-02_SummaCare_index.json.gz
+    </a>
+    <a href="2026-06-02_SummaCare_MEWA_index.json.gz">
+      2026-06-02_SummaCare_MEWA_index.json.gz
+    </a>
+    """
+
+    targets = discovery._parse_html_mrf_links(
+        html,
+        base_url="https://files.myplancentral.com/TIC/TOC/",
+    )
+
+    assert [
+        (target["url"], target["target_file_type"], target["container_format"])
+        for target in targets
+    ] == [
+        (
+            "https://files.myplancentral.com/TIC/TOC/2026-06-02_SummaCare_index.json.gz",
+            "table-of-contents",
+            "gzip",
+        ),
+        (
+            "https://files.myplancentral.com/TIC/TOC/2026-06-02_SummaCare_MEWA_index.json.gz",
+            "table-of-contents",
+            "gzip",
         ),
     ]
 
