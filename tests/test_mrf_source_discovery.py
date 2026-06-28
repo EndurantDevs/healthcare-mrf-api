@@ -84,6 +84,10 @@ def test_source_urls_are_loaded_from_registry_file():
         config["platform_resolvers"]["healthspace_machine_readable_files"]["type"]
         == "healthspace_machine_readable_files"
     )
+    assert (
+        config["platform_resolvers"]["healthez_benefits_mrf"]["type"]
+        == "healthez_benefits_mrf"
+    )
     assert config["platform_resolvers"]["webtpa_mrf_api"]["type"] == "webtpa_mrf_api"
     assert (
         config["platform_resolvers"]["cmstic_file_info"]["type"] == "cmstic_file_info"
@@ -95,6 +99,16 @@ def test_source_urls_are_loaded_from_registry_file():
     assert (
         config["platform_resolvers"]["mymedicalshopper_talon"]["type"]
         == "mymedicalshopper_talon_mrf"
+    )
+    assert (
+        config["platform_resolvers"]["html_mrf_links_mixed_directories"]["type"]
+        == "html_mrf_links"
+    )
+    assert (
+        config["platform_resolvers"]["html_mrf_links_mixed_directories"][
+            "follow_directory_links_when_targets"
+        ]
+        is True
     )
     assert (
         config["platform_resolvers"]["mymedicalshopper_talon_bounded"]["type"]
@@ -342,7 +356,7 @@ def test_classify_hosting_platform_recognizes_public_adapter_pages():
         discovery.classify_hosting_platform(
             "https://boonchapman-mrf.zakipointhealth.com/"
         )
-        == "html_mrf_links"
+        == "html_mrf_links_mixed_directories"
     )
     assert (
         discovery.classify_hosting_platform(
@@ -367,6 +381,10 @@ def test_classify_hosting_platform_recognizes_public_adapter_pages():
             "https://tuition.ebpabenefits.com/employers/machine-readable-file-links"
         )
         == "html_mrf_links"
+    )
+    assert (
+        discovery.classify_hosting_platform("https://healthezbenefits.com/plandocuments/")
+        == "healthez_benefits_mrf"
     )
     assert (
         discovery.classify_hosting_platform(
@@ -724,6 +742,7 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
 | HealthNow Administrative Services | tpa | https://www.hnas.com/digital-resources/machine-readable-files | aliases: HNAS |
 | Insurance Management Services | tpa | https://mrf.healthcarebluebook.com/IMS | aliases: IMS, IMS TPA |
 | Boon-Chapman | tpa | https://boonchapman-mrf.zakipointhealth.com/ | aliases: Boon Chapman |
+| HealthEZ | tpa | https://healthezbenefits.com/plandocuments/ | aliases: Health EZ, HealthEZ Benefits |
 | Tall Tree Administrators | tpa | https://talltreeadmin.com/machine-readable-files | aliases: Tall Tree |
 | Carefactor | tpa | https://mrf.healthcarebluebook.com/Carefactor | aliases: CareFactor |
 | Point C | tpa | https://mrf.healthcarebluebook.com/pointc | aliases: Point C Health |
@@ -869,7 +888,9 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
         == "healthcarebluebook_mrf"
     )
     assert by_name["Insurance Management Services"].aliases == ("IMS", "IMS TPA")
-    assert by_name["Boon-Chapman"].hosting_platform == "html_mrf_links"
+    assert by_name["Boon-Chapman"].hosting_platform == "html_mrf_links_mixed_directories"
+    assert by_name["HealthEZ"].hosting_platform == "healthez_benefits_mrf"
+    assert by_name["HealthEZ"].aliases == ("Health EZ", "HealthEZ Benefits")
     assert by_name["Tall Tree Administrators"].hosting_platform == "html_mrf_links"
     assert by_name["Carefactor"].hosting_platform == "healthcarebluebook_mrf"
     assert by_name["Carefactor"].aliases == ("CareFactor",)
@@ -913,6 +934,7 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Horizon Blue Cross of New Jersey" in by_name["Horizon BCBS NJ"].aliases
     assert by_name["Delta Dental Plan of Michigan"].entity_type == "dental"
     assert by_name["Delta Dental Plan of Michigan"].hosting_platform == "sapphire"
+    assert by_name["Delta Dental Plan of Michigan"].benefit_lines == ("dental",)
     assert (
         "Delta Dental of Michigan" in by_name["Delta Dental Plan of Michigan"].aliases
     )
@@ -1841,6 +1863,117 @@ async def test_html_mrf_resolver_follows_mrf_iframe_pages(monkeypatch):
         "https://www.groupadministrators.com/mrfhtml/mrf2023082301.html?parm=2023082302"
     )
     assert targets[1].metadata["target_file_type"] == "allowed-amounts"
+
+
+@pytest.mark.asyncio
+async def test_html_mrf_resolver_can_follow_directories_on_mixed_pages(monkeypatch):
+    source = {
+        "source_id": "source_1",
+        "payer_id": "payer_1",
+        "display_name": "Boon-Chapman",
+    }
+    html_by_url = {
+        "https://boonchapman-mrf.zakipointhealth.com/": """
+          <a href="https://mrf-public-collection.s3.amazonaws.com/boonchapman/allowed_amount/division_id=002429/002429.zip">
+            002429
+          </a>
+          <span class="label">Out of network</span>
+          <a href="https://www.healthplan.org/first_health_mrfs">First Health</a>
+        """,
+        "https://www.healthplan.org/first_health_mrfs": """
+          <a href="/mrf/first-health/2026-06-01_first-health_index.json">
+            First Health index
+          </a>
+        """,
+    }
+
+    async def fake_fetch_text(url, **_kwargs):
+        return html_by_url[url]
+
+    monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
+
+    targets = await discovery._resolve_html_mrf_links(
+        source,
+        "https://boonchapman-mrf.zakipointhealth.com/",
+        {
+            "type": "html_mrf_links",
+            "follow_directory_links_when_targets": True,
+            "max_directories": 2,
+        },
+        None,
+    )
+
+    assert [target.url for target in targets] == [
+        (
+            "https://mrf-public-collection.s3.amazonaws.com/boonchapman/"
+            "allowed_amount/division_id=002429/002429.zip"
+        ),
+        "https://www.healthplan.org/mrf/first-health/2026-06-01_first-health_index.json",
+    ]
+    assert targets[0].metadata["target_file_type"] == "allowed-amounts"
+    assert targets[1].metadata["target_file_type"] == "table-of-contents"
+    assert targets[1].metadata["directory_url"] == (
+        "https://www.healthplan.org/first_health_mrfs"
+    )
+
+
+@pytest.mark.asyncio
+async def test_healthez_resolver_normalizes_legacy_network_links(monkeypatch):
+    source = {
+        "source_id": "source_1",
+        "payer_id": "payer_1",
+        "display_name": "HealthEZ",
+    }
+    html = """
+    <a href="/api/outbound/latest?fileType=inNetwork&groupName=HealthEZ=AP">
+      AP Machine Readable Files
+    </a>
+    <a href="/api/outbound/latest?fileType=inNetwork&groupName=HealthEZ=AE">
+      AE Machine Readable Files
+    </a>
+    <a href="/api/outbound/latest?fileType=outOfNetwork&groupName=HealthEZ">
+      Out of Network Machine Readable Files
+    </a>
+    """
+
+    async def fake_fetch_text(url, **_kwargs):
+        assert url == "https://healthezbenefits.com/plandocuments/"
+        return html
+
+    monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
+
+    targets = await discovery._resolve_healthez_benefits_mrf(
+        source,
+        "https://healthezbenefits.com/plandocuments/",
+        {"type": "healthez_benefits_mrf"},
+        None,
+    )
+
+    assert [target.url for target in targets] == [
+        (
+            "https://healthezbenefits.com/api/outbound/latest?"
+            "fileType=inNetwork&groupName=HealthEZ&network=AP"
+        ),
+        (
+            "https://healthezbenefits.com/api/outbound/latest?"
+            "fileType=inNetwork&groupName=HealthEZ&network=AE"
+        ),
+        (
+            "https://healthezbenefits.com/api/outbound/latest?"
+            "fileType=outOfNetwork&groupName=HealthEZ"
+        ),
+    ]
+    assert [target.label for target in targets] == [
+        "HealthEZ AP",
+        "HealthEZ AE",
+        "HealthEZ",
+    ]
+    assert [target.metadata["target_file_type"] for target in targets] == [
+        "in-network",
+        "in-network",
+        "allowed-amounts",
+    ]
+    assert all(target.metadata["container_format"] == "zip" for target in targets)
 
 
 @pytest.mark.asyncio
@@ -3973,6 +4106,40 @@ def test_parse_html_mrf_links_uses_section_context_for_split_body_files():
                 }
             ],
         },
+    ]
+
+
+def test_parse_html_mrf_links_uses_neighbor_label_for_zakipoint_rows():
+    html = """
+    <div class="network-row">
+      <a href="https://mrf-public-collection.s3.us-east-1.amazonaws.com/boonchapman/aetna/aetna.gz">
+        Aetna Signature Administrators
+      </a>
+      <span class="label">In-network</span>
+    </div>
+    <div class="network-row">
+      <a href="https://mrf-public-collection.s3.amazonaws.com/boonchapman/allowed_amount/division_id=002429/002429.zip">
+        002429
+      </a>
+      <span class="label">Out of network</span>
+    </div>
+    """
+
+    targets = discovery._parse_html_mrf_links(
+        html, base_url="https://boonchapman-mrf.zakipointhealth.com/"
+    )
+
+    assert [(item["label"], item["target_file_type"]) for item in targets] == [
+        ("Aetna Signature Administrators", "in-network"),
+        ("002429", "allowed-amounts"),
+    ]
+    assert targets[0]["plan_info"] == [
+        {
+            "plan_id": None,
+            "plan_id_type": None,
+            "plan_market_type": "group",
+            "plan_name": "Aetna Signature Administrators",
+        }
     ]
 
 

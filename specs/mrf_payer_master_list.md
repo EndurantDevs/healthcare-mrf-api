@@ -166,7 +166,7 @@ Last one-time research refresh: 2026-06-05.
 | American Specialty Health | network/tpa | - | needs official source URL |
 | Carelon | network/tpa | - | needs official source URL |
 | Davis Vision | network/tpa | - | needs official source URL |
-| Delta Dental Plan of Michigan | dental | https://bcbsm.sapphiremrfhub.com/tocs/current/delta_dental_plan_of_mich | public Delta Dental Plan of Michigan machine-readable file linked through BCBSM Sapphire current TOC; aliases: Delta Dental of Michigan, Delta Dental Plan of Mich, Delta Dental of Indiana, Delta Dental of Ohio, Delta Dental Plan of Indiana, Delta Dental Plan of Ohio |
+| Delta Dental Plan of Michigan | dental | https://bcbsm.sapphiremrfhub.com/tocs/current/delta_dental_plan_of_mich | public Delta Dental Plan of Michigan machine-readable file linked through BCBSM Sapphire current TOC; benefit lines: dental; aliases: Delta Dental of Michigan, Delta Dental Plan of Mich, Delta Dental of Indiana, Delta Dental of Ohio, Delta Dental Plan of Indiana, Delta Dental Plan of Ohio |
 | EyeMed | vision | https://content.eyemedvisioncare.com/EyeMed_HCSC/eyemed_in-network-rates.json | public HCSC-linked EyeMed in-network MRF body; benefit lines: vision; aliases: EyeMed Vision Care, EyeMed Vision Benefits, EyeMed Vision Network, EyeMed Vision Care LLC, Eye Med, Ameritas EyeMed, Ameritas with EyeMed, Mutual of Omaha EyeMed, Mutual of Omaha EyeMed Vision Care, BlueCare Vision EyeMed, BlueCare Vision of Texas |
 | GEHA | network/tpa | https://www.geha.com/transparency-in-coverage | official GEHA TiC landing page; delegates MRF access to UnitedHealthcare; benefit lines: dental, medical; aliases: Government Employees Health Association, Connection Dental Federal, Connection Dental Plus, Connection Dental |
 | HealthLink | network/tpa | https://www.healthlink.com/machine-readable-file/search/ | public Anthem/Elevance machine-readable file search page; aliases: HealthLink Network |
@@ -358,6 +358,7 @@ Last one-time research refresh: 2026-06-05.
 | HealthNow Administrative Services | tpa | https://www.hnas.com/digital-resources/machine-readable-files | public HNAS delegated MRF directory; aliases: HNAS, Brokerage Concepts LLC dba HealthNow Administrative Services |
 | Healthcare Management Administrators | tpa | https://sawus2prdticmrfhma.z5.web.core.windows.net/ | public HMA machine-readable file directory; aliases: HMA, AccessHMA |
 | HealthScope Benefits | tpa | - | needs official source URL |
+| HealthEZ | tpa | https://healthezbenefits.com/plandocuments/ | public HealthEZ plan-documents MRF page with Azure latest endpoints; aliases: Health EZ, HealthEZ Benefits |
 | Health Plans Inc (HPI) | tpa | https://hpitpa.com/transparency-in-coverage-machine-readable-files/ | public transparency URL; delegates MRF listing to Healthcare Bluebook; aliases: HPI, Health Plans Inc, Health Plans, Inc, HealthPlans Inc |
 | HealthComp | tpa | https://healthcomp.sapphiremrfhub.com/ | public Sapphire MRF hub; aliases: HealthComp LLC, HCOnline, Personify Health, Personify |
 | Healthgram | tpa | https://mrf.healthgram.com/ | public MRF network directory; resolver expands network pages to current TOC JSON links |

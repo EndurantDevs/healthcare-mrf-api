@@ -527,6 +527,7 @@ def _mrf_file_type_from_html_section(html_fragment: str | None) -> str | None:
         (
             "allowed-amounts",
             (
+                r"\bout[-\s]+of[-\s]+network\b",
                 r"\bout[-\s]+of[-\s]+network\s+allowed(?:\s+amounts?)?",
                 r"\ballowed\s+amounts?(?:\s+and\s+billed\s+charges)?",
                 r"\ballowed[-\s]+amt(?:[-\s]+details)?",
@@ -535,6 +536,7 @@ def _mrf_file_type_from_html_section(html_fragment: str | None) -> str | None:
         (
             "in-network",
             (
+                r"\bin[-\s]+network\b",
                 r"\bin[-\s]+network\s+(?:provider\s+)?rates?\b",
                 r"\bin[-\s]+network\s+negotiated\b",
                 r"\bnegotiated\s+rates?\b",
@@ -720,7 +722,7 @@ def classify_hosting_platform(url: str | None) -> str | None:
     ):
         return "html_mrf_links"
     if host == "boonchapman-mrf.zakipointhealth.com":
-        return "html_mrf_links"
+        return "html_mrf_links_mixed_directories"
     if (
         host in {"www.boonchapman.com", "boonchapman.com"}
         and "machine-readable-files" in path
@@ -743,6 +745,10 @@ def classify_hosting_platform(url: str | None) -> str | None:
         and "machine-readable-file" in path
     ):
         return "html_mrf_links"
+    if host in {"healthezbenefits.com", "www.healthezbenefits.com"} and path.startswith(
+        "/plandocuments"
+    ):
+        return "healthez_benefits_mrf"
     if host == "mrf.pacificsource.com" and path.startswith("/file/visit"):
         return "pacificsource_azure_mrf_listing"
     if host in {
@@ -2011,7 +2017,7 @@ def _metadata_text_file_type(value: Any) -> str:
 
 def _looks_direct_mrf_body_url(url: str | None) -> bool:
     path = urlsplit(str(url or "")).path.lower()
-    if not path.endswith((".json", ".json.gz", ".zip", ".7z", ".csv")):
+    if not path.endswith((".json", ".json.gz", ".gz", ".zip", ".7z", ".csv")):
         return False
     if re.search(r"(^|[_/-])index\.json(?:\.gz)?$", path):
         return False
@@ -4009,7 +4015,10 @@ async def _resolve_html_mrf_links(
         resolver="html_mrf_links",
         target_max_bytes=target_max_bytes,
     )
-    if not targets and resolver.get("follow_directory_links", True):
+    follow_directory_links = resolver.get("follow_directory_links", True) and (
+        not targets or bool(resolver.get("follow_directory_links_when_targets"))
+    )
+    if follow_directory_links:
         directory_urls = _html_mrf_directory_urls(html_text, base_url=url)
         max_directories = _as_int(resolver.get("max_directories")) or 10
         directory_max_bytes = int(
@@ -5320,6 +5329,21 @@ def _html_label_looks_planish(label: str | None) -> bool:
     return bool(re.search(r"[a-z]", normalized))
 
 
+def _mrf_file_type_from_html_link_context(
+    html_text: str, html_start: int | None, html_end: int | None
+) -> str | None:
+    if not isinstance(html_start, int) or not isinstance(html_end, int):
+        return None
+    after = html_text[html_end : html_end + 700]
+    after = re.split(
+        r"<a\b|</(?:tr|li|div|section|article)\b",
+        after,
+        maxsplit=1,
+        flags=re.I,
+    )[0]
+    return _mrf_file_type_from_html_section(after)
+
+
 def _parse_html_mrf_links(html_text: str, *, base_url: str) -> list[dict[str, Any]]:
     urls: dict[tuple[str, str], dict[str, Any]] = {}
     section_file_type: str | None = None
@@ -5349,6 +5373,13 @@ def _parse_html_mrf_links(html_text: str, *, base_url: str) -> list[dict[str, An
         resolver = "html_mrf_link"
         query_file_name = _query_mrf_file_name(url)
         direct_body = _looks_direct_mrf_body_url(url) or bool(query_file_name)
+        link_file_type = _mrf_file_type_from_html_link_context(
+            html_text,
+            html_start if isinstance(html_start, int) else None,
+            candidate.get("html_end")
+            if isinstance(candidate.get("html_end"), int)
+            else None,
+        )
         if path.endswith(".txt") and any(
             token in label_or_path
             for token in ("meta", "mrf", "machine-readable", "transparency")
@@ -5361,12 +5392,12 @@ def _parse_html_mrf_links(html_text: str, *, base_url: str) -> list[dict[str, An
             target_file_type = "table-of-contents"
         elif _looks_html_mrf_body_reference(url, label) or (
             direct_body
-            and section_file_type
+            and (link_file_type or section_file_type)
             and not _looks_non_tic_mrf_reference(url, label)
         ):
             target_kind = "file_reference"
             target_file_type = _mrf_body_file_type_from_text(url, label) or (
-                section_file_type if direct_body else None
+                (link_file_type or section_file_type) if direct_body else None
             )
             if not target_file_type:
                 continue
@@ -6997,6 +7028,114 @@ async def _resolve_healthspace_machine_readable_files(
     return targets
 
 
+def _healthez_outbound_file_type(url: str | None, label: str | None = None) -> str | None:
+    parsed = urlsplit(str(url or ""))
+    query = {key.lower(): value for key, value in parse_qsl(parsed.query)}
+    file_type = str(query.get("filetype") or "").strip().lower()
+    if file_type == "innetwork":
+        return "in-network"
+    if file_type == "outofnetwork":
+        return "allowed-amounts"
+    return _mrf_file_type_from_text(url, label)
+
+
+def _healthez_normalized_outbound_url(url: str | None) -> str | None:
+    parsed = urlsplit(str(url or ""))
+    if not parsed.scheme or not parsed.netloc or not parsed.path.endswith(
+        "/api/outbound/latest"
+    ):
+        return None
+    pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    normalized: list[tuple[str, str]] = []
+    has_network = any(key.lower() == "network" for key, _value in pairs)
+    pending_network: str | None = None
+    for key, value in pairs:
+        if key.lower() == "groupname" and "=" in value:
+            group_name, network = value.rsplit("=", 1)
+            if network.upper() in {"AP", "AE"}:
+                value = group_name
+                if not has_network:
+                    pending_network = network.upper()
+        normalized.append((key, value))
+    if pending_network:
+        normalized.append(("network", pending_network))
+    return parsed._replace(query=urlencode(normalized)).geturl()
+
+
+def _healthez_plan_label(url: str, label: str | None) -> str:
+    query = {key.lower(): value for key, value in parse_qsl(urlsplit(url).query)}
+    network = str(query.get("network") or "").strip().upper()
+    if network in {"AP", "AE"}:
+        return f"HealthEZ {network}"
+    cleaned = _clean_text(label)
+    if cleaned and "machine readable" not in cleaned.lower():
+        return cleaned
+    return "HealthEZ"
+
+
+def _healthez_targets_from_html(
+    source: dict[str, Any],
+    html_text: str,
+    *,
+    base_url: str,
+    resolver_type: str,
+) -> list[CrawlTarget]:
+    targets: list[CrawlTarget] = []
+    seen: set[str] = set()
+    for candidate in _html_link_candidates(html_text, base_url=base_url):
+        url = _healthez_normalized_outbound_url(str(candidate.get("url") or ""))
+        if not url:
+            continue
+        file_type = _healthez_outbound_file_type(url, str(candidate.get("label") or ""))
+        if file_type not in {"in-network", "allowed-amounts"}:
+            continue
+        key = _canonical_or_none(url) or url
+        if key in seen:
+            continue
+        seen.add(key)
+        label = _healthez_plan_label(url, str(candidate.get("label") or ""))
+        targets.append(
+            CrawlTarget(
+                source=source,
+                url=url,
+                label=label,
+                resolved_from_url=base_url,
+                metadata={
+                    "resolver": resolver_type,
+                    "target_kind": "file_reference",
+                    "target_file_type": file_type,
+                    "container_format": "zip",
+                    "plan_info": _plan_info_from_label(label),
+                },
+            )
+        )
+    return targets
+
+
+async def _resolve_healthez_benefits_mrf(
+    source: dict[str, Any],
+    url: str,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    resolver_type = str(resolver.get("type") or "healthez_benefits_mrf")
+    html_text = await _fetch_text(
+        url,
+        max_bytes=int(resolver.get("max_bytes") or 5 * 1024 * 1024),
+        session=session,
+    )
+    targets = _healthez_targets_from_html(
+        source, html_text, base_url=url, resolver_type=resolver_type
+    )
+    targets = _dedupe_crawl_targets_by_url(targets)
+    max_targets = _as_int(resolver.get("max_targets"))
+    if max_targets and max_targets > 0:
+        targets = targets[:max_targets]
+    if not targets:
+        raise ValueError(f"no HealthEZ MRF targets found for {url}")
+    return targets
+
+
 def _s3_xml_listing_targets_from_xml(
     source: dict[str, Any],
     xml_text: str,
@@ -7626,6 +7765,8 @@ async def _crawl_targets_for_source(
         return await _resolve_healthspace_machine_readable_files(
             source, url, resolver, session
         )
+    if resolver_type == "healthez_benefits_mrf":
+        return await _resolve_healthez_benefits_mrf(source, url, resolver, session)
     if resolver_type == "payercompass_mrf":
         return await _resolve_payercompass_mrf(source, url, resolver, session)
     if resolver_type == "webtpa_mrf_api":
