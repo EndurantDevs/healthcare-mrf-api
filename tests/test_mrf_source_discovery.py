@@ -58,6 +58,7 @@ def test_source_urls_are_loaded_from_registry_file():
         == 100 * 1024 * 1024
     )
     assert config["platform_resolvers"]["direct_mrf_body"]["type"] == "direct_mrf_body"
+    assert config["platform_resolvers"]["direct_toc"]["type"] == "direct_toc"
     assert (
         config["platform_resolvers"]["socrata_data_json_mrf_catalog"]["type"]
         == "socrata_data_json_mrf_catalog"
@@ -950,6 +951,10 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "EyeMed Vision Care" in by_name["EyeMed"].aliases
     assert "Eye Med" in by_name["EyeMed"].aliases
     assert "Ameritas with EyeMed" in by_name["EyeMed"].aliases
+    assert "DeltaVision EyeMed" in by_name["EyeMed"].aliases
+    assert "DeltaVision with EyeMed" in by_name["EyeMed"].aliases
+    assert "ProTec" in by_name["EyeMed"].aliases
+    assert "Advantica" in by_name["EyeMed"].aliases
     assert "HealthLink Network" in by_name["HealthLink"].aliases
     assert by_name["HealthLink"].hosting_platform == "anthem_s3_mrf"
     assert "Delta Dental of Oregon" in by_name["Moda Health"].aliases
@@ -962,6 +967,8 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Principal Financial Group VSP" in by_name["VSP Vision"].aliases
     assert "MetLife VSP Choice" in by_name["VSP Vision"].aliases
     assert "Ameritas with VSP" in by_name["VSP Vision"].aliases
+    assert "DeltaVision VSP" in by_name["VSP Vision"].aliases
+    assert "DeltaVision with VSP" in by_name["VSP Vision"].aliases
     assert by_name["GEHA"].hosting_platform == "html_delegated_mrf_links"
     assert by_name["GEHA"].benefit_lines == ("dental", "medical")
     assert "Connection Dental Federal" in by_name["GEHA"].aliases
@@ -977,7 +984,9 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Valipro TPA" in by_name["Varipro"].aliases
     assert "Professional Benefits Services" in by_name["Varipro"].aliases
     assert "PBS" in by_name["Varipro"].aliases
+    assert by_name["BCBS North Carolina"].hosting_platform == "direct_toc"
     assert "Blue Cross Blue Shield of NC" in aliases_by_name["BCBS North Carolina"]
+    assert "BlueCross BlueShield of NC" in aliases_by_name["BCBS North Carolina"]
     assert "Blue Cross Blue Shield of SC" in aliases_by_name["BCBS South Carolina"]
     assert (
         "Blue Benefit Administrators of Massachusetts"
@@ -1070,6 +1079,31 @@ async def test_direct_mrf_body_source_becomes_file_reference_without_fetching(
             "plan_name": "Eyemed",
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_direct_toc_source_becomes_toc_target_without_fetching(monkeypatch):
+    async def fail_fetch(*_args, **_kwargs):
+        raise AssertionError("direct TOCs should be cataloged without HTML fetching")
+
+    monkeypatch.setattr(discovery, "_fetch_text", fail_fetch)
+    source = {
+        "source_id": "source_bcbsnc",
+        "payer_id": "payer_bcbsnc",
+        "display_name": "BCBS North Carolina",
+    }
+    url = (
+        "https://mrfmftprod.bcbsnc.com/prod/etl/outbound/table-of-contents/non-aso/"
+        "2026-05-27_blue-cross-and-blue-shield-of-north-carolina_index.json"
+    )
+
+    [target] = await discovery._crawl_targets_for_source(source, url, None)
+
+    assert target.url == url
+    assert target.label == "BCBS North Carolina"
+    assert target.metadata["resolver"] == "direct_toc"
+    assert target.metadata["target_kind"] == "toc_json"
+    assert target.metadata["target_file_type"] == "table-of-contents"
 
 
 @pytest.mark.asyncio
@@ -1373,6 +1407,19 @@ def test_classify_hosting_platforms():
             "https://www.bcbsil.com/asomrf?EIN=260241222"
         )
         == "bcbs_asomrf"
+    )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://www.bluecrossnc.com/policies-best-practices/machine-readable-files"
+        )
+        == "html_mrf_links"
+    )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://mrfmftprod.bcbsnc.com/prod/etl/outbound/table-of-contents/non-aso/"
+            "2026-05-27_blue-cross-and-blue-shield-of-north-carolina_index.json"
+        )
+        == "direct_toc"
     )
     assert (
         discovery.classify_hosting_platform(

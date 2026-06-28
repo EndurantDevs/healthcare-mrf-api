@@ -108,6 +108,9 @@
     "direct_mrf_body": {
       "type": "direct_mrf_body"
     },
+    "direct_toc": {
+      "type": "direct_toc"
+    },
     "socrata_data_json_mrf_catalog": {
       "type": "socrata_data_json_mrf_catalog",
       "title_regex": "(?i)(in\\s+network\\s+rates|allowed\\s+amounts|out[-\\s]+of[-\\s]+network\\s+allowed\\s+amounts)",

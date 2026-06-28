@@ -578,6 +578,11 @@ def classify_hosting_platform(url: str | None) -> str | None:
         return "socrata_data_json_mrf_catalog"
     if host.endswith("sapphiremrfhub.com"):
         return "sapphire"
+    if (
+        _looks_direct_toc_url(raw)
+        and _mrf_file_type_from_text(raw) == "table-of-contents"
+    ):
+        return "direct_toc"
     if host == "mrf.healthgram.com":
         return "healthgram"
     if host == "github.com" and len([part for part in path.split("/") if part]) >= 2:
@@ -826,7 +831,10 @@ def classify_hosting_platform(url: str | None) -> str | None:
         )
         or (
             host in {"www.bluecrossnc.com", "bluecrossnc.com"}
-            and "transparency-coverage-mrf" in path
+            and (
+                "transparency-coverage-mrf" in path
+                or "machine-readable-files" in path
+            )
         )
         or (
             host in {"www.southcarolinablues.com", "southcarolinablues.com"}
@@ -7773,6 +7781,11 @@ async def _crawl_targets_for_source(
         return await _resolve_webtpa_mrf_api(source, url, resolver, session)
     if resolver_type == "cmstic_file_info":
         return await _resolve_cmstic_file_info(source, url, resolver, session)
+    if resolver_type == "direct_toc":
+        target = _direct_toc_crawl_target(source, url, resolver=resolver_type)
+        if target:
+            return [target]
+        raise ValueError(f"no direct MRF TOC target found for {url}")
     if resolver_type == "direct_mrf_body":
         target = _direct_mrf_body_crawl_target(source, url, resolver=resolver_type)
         if target:
@@ -7926,11 +7939,19 @@ async def _crawl_targets_for_source(
         return await _resolve_webtpa_mrf_api(source, url, resolver, session)
     if resolver_type == "cmstic_file_info":
         return await _resolve_cmstic_file_info(source, url, resolver, session)
+    if resolver_type == "direct_toc":
+        target = _direct_toc_crawl_target(source, url, resolver=resolver_type)
+        if target:
+            return [target]
+        raise ValueError(f"no direct MRF TOC target found for {url}")
     if resolver_type == "direct_mrf_body":
         target = _direct_mrf_body_crawl_target(source, url, resolver=resolver_type)
         if target:
             return [target]
         raise ValueError(f"no direct MRF body target found for {url}")
+    direct_toc_target = _direct_toc_crawl_target(source, url)
+    if direct_toc_target:
+        return [direct_toc_target]
     direct_body_target = _direct_mrf_body_crawl_target(source, url)
     if direct_body_target:
         return [direct_body_target]
@@ -8149,6 +8170,25 @@ def _direct_mrf_body_crawl_target(
             "target_file_type": file_type,
             "container_format": _container_format(url),
             "plan_info": _plan_info_from_label(label),
+        },
+    )
+
+
+def _direct_toc_crawl_target(
+    source: dict[str, Any], url: str, *, resolver: str = "direct_toc"
+) -> CrawlTarget | None:
+    if not _looks_direct_toc_url(url):
+        return None
+    return CrawlTarget(
+        source=source,
+        url=url,
+        label=str(source.get("display_name") or ""),
+        metadata={
+            "resolver": resolver,
+            "target_kind": "toc_json",
+            "target_file_type": "table-of-contents",
+            "file_name": Path(urlsplit(str(url or "")).path).name,
+            "payer_name": source.get("display_name"),
         },
     )
 
