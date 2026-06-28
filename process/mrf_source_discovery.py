@@ -435,6 +435,22 @@ def _mrf_file_type_from_text(url: str | None, label: str | None = None) -> str |
     return None
 
 
+_MONTH_NAME_TO_NUMBER = {
+    "january": 1,
+    "february": 2,
+    "march": 3,
+    "april": 4,
+    "may": 5,
+    "june": 6,
+    "july": 7,
+    "august": 8,
+    "september": 9,
+    "october": 10,
+    "november": 11,
+    "december": 12,
+}
+
+
 def _looks_non_tic_mrf_reference(url: str | None, label: str | None = None) -> bool:
     parsed = urlsplit(str(url or ""))
     path = parsed.path.lower().replace("_", "-")
@@ -554,6 +570,8 @@ def classify_hosting_platform(url: str | None) -> str | None:
         return "ebms_caa_directory"
     if _looks_direct_mrf_body_url(raw) and _mrf_body_file_type_from_text(raw):
         return "direct_mrf_body"
+    if host == "data.sccgov.org" and path == "/data.json":
+        return "socrata_data_json_mrf_catalog"
     if host.endswith("sapphiremrfhub.com"):
         return "sapphire"
     if host == "mrf.healthgram.com":
@@ -5794,6 +5812,251 @@ async def _resolve_html_mrf_with_healthcarebluebook(
     return targets
 
 
+def _regex_matches_config(value: Any, pattern: Any) -> bool:
+    pattern_text = str(pattern or "").strip()
+    if not pattern_text:
+        return True
+    try:
+        return bool(re.search(pattern_text, str(value or "")))
+    except re.error:
+        return False
+
+
+def _socrata_dataset_download(dataset: dict[str, Any]) -> tuple[str | None, str | None]:
+    distributions = dataset.get("distribution") or []
+    if not isinstance(distributions, list):
+        return None, None
+    candidates: list[tuple[str, str | None]] = []
+    for distribution in distributions:
+        if not isinstance(distribution, dict):
+            continue
+        download_url = str(distribution.get("downloadURL") or "").strip()
+        if not download_url:
+            continue
+        media_type = str(distribution.get("mediaType") or "").strip() or None
+        candidates.append((download_url, media_type))
+    if not candidates:
+        return None, None
+    for download_url, media_type in candidates:
+        media_text = str(media_type or "").lower()
+        if "json" in media_text or "geo+json" in media_text:
+            return download_url, media_type
+    return candidates[0]
+
+
+def _socrata_dataset_id(
+    dataset: dict[str, Any], download_url: str | None
+) -> str | None:
+    for value in (dataset.get("identifier"), dataset.get("landingPage"), download_url):
+        parsed = urlsplit(str(value or ""))
+        parts = [part for part in parsed.path.split("/") if part]
+        for marker in ("views", "download", "d"):
+            if marker in parts:
+                index = parts.index(marker)
+                if index + 1 < len(parts):
+                    return parts[index + 1]
+        if parts and re.fullmatch(r"[a-z0-9]{4}-[a-z0-9]{4}", parts[-1], flags=re.I):
+            return parts[-1]
+    return None
+
+
+def _socrata_coverage_month(title: str) -> tuple[int, int] | None:
+    for match in re.finditer(
+        r"\b(?P<month>" + "|".join(_MONTH_NAME_TO_NUMBER) + r")\s+(?P<year>20\d{2})\b",
+        str(title or ""),
+        flags=re.I,
+    ):
+        return (
+            int(match.group("year")),
+            _MONTH_NAME_TO_NUMBER[match.group("month").lower()],
+        )
+    return None
+
+
+def _socrata_file_type(title: str, description: str) -> str | None:
+    text = f"{title} {description}".lower().replace("_", "-")
+    if re.search(r"\bin[-\s]+network\s+rates?\b", text):
+        return "in-network"
+    if (
+        re.search(r"\bout[-\s]+of[-\s]+network\s+allowed\s+amounts?\b", text)
+        or re.search(r"\ballowed\s+amounts?\b", text)
+        or "outside of the vhp network" in text
+    ):
+        return "allowed-amounts"
+    return None
+
+
+def _socrata_market_type(title: str) -> str | None:
+    text = str(title or "").lower()
+    if "employer group" in text or "commercial" in text or "ihss" in text:
+        return "group"
+    if "covered california" in text or "individual and family" in text:
+        return "individual"
+    return None
+
+
+def _socrata_benefit_metadata(
+    title: str, description: str, download_url: str
+) -> dict[str, Any]:
+    lines = _infer_benefit_lines_from_text(title, description, download_url) or (
+        "medical",
+    )
+    metadata: dict[str, Any] = {"benefit_lines": list(lines)}
+    if len(lines) == 1:
+        metadata["benefit_line"] = lines[0]
+    return metadata
+
+
+def _socrata_dataset_contact_text(dataset: dict[str, Any]) -> str:
+    contact = dataset.get("contactPoint") or {}
+    publisher = dataset.get("publisher") or {}
+    values = [
+        contact.get("fn") if isinstance(contact, dict) else None,
+        contact.get("hasEmail") if isinstance(contact, dict) else None,
+        dataset.get("attribution"),
+        publisher.get("name") if isinstance(publisher, dict) else None,
+    ]
+    return " ".join(str(value or "") for value in values)
+
+
+def _socrata_dataset_matches(dataset: dict[str, Any], resolver: dict[str, Any]) -> bool:
+    title = _clean_text(dataset.get("title"))
+    description = _clean_text(dataset.get("description"))
+    if not title:
+        return False
+    if str(dataset.get("accessLevel") or "").lower() not in {"", "public"}:
+        return False
+    if not _socrata_file_type(title, description):
+        return False
+    if not _regex_matches_config(title, resolver.get("title_regex")):
+        return False
+    if not _regex_matches_config(
+        _socrata_dataset_contact_text(dataset), resolver.get("contact_regex")
+    ):
+        return False
+    keyword_any = [
+        str(item or "").strip().lower()
+        for item in (resolver.get("keyword_any") or [])
+        if str(item or "").strip()
+    ]
+    if keyword_any:
+        keyword_text = " ".join(
+            str(item or "").lower() for item in (dataset.get("keyword") or [])
+        )
+        if not any(keyword in keyword_text for keyword in keyword_any):
+            return False
+    download_url, _media_type = _socrata_dataset_download(dataset)
+    return bool(download_url)
+
+
+def _socrata_target_from_dataset(
+    source: dict[str, Any],
+    dataset: dict[str, Any],
+    *,
+    catalog_url: str,
+    resolver_type: str,
+) -> CrawlTarget | None:
+    title = _clean_text(dataset.get("title"))
+    description = _clean_text(dataset.get("description"))
+    download_url, media_type = _socrata_dataset_download(dataset)
+    if not download_url:
+        return None
+    file_type = _socrata_file_type(title, description)
+    if not file_type:
+        return None
+    dataset_id = _socrata_dataset_id(dataset, download_url)
+    market_type = _socrata_market_type(title)
+    plan_info = _plan_info_from_label(
+        title,
+        plan_id=dataset_id,
+        plan_id_type="socrata_view_id" if dataset_id else None,
+        market_type=market_type,
+    )
+    coverage_month = _socrata_coverage_month(title)
+    benefit_metadata = _socrata_benefit_metadata(title, description, download_url)
+    metadata = {
+        "resolver": resolver_type,
+        "target_kind": "file_reference",
+        "target_file_type": file_type,
+        "source_format": "json",
+        "socrata_dataset_id": dataset_id,
+        "socrata_landing_page": dataset.get("landingPage"),
+        "socrata_media_type": media_type,
+        "socrata_issued": dataset.get("issued"),
+        "socrata_modified": dataset.get("modified"),
+        "socrata_coverage_month": (
+            f"{coverage_month[0]:04d}-{coverage_month[1]:02d}"
+            if coverage_month
+            else None
+        ),
+        "reporting_entity_name": source.get("display_name"),
+        "reporting_entity_type": "health_insurance_issuer",
+        "plan_info": plan_info,
+        **benefit_metadata,
+    }
+    return CrawlTarget(
+        source=source,
+        url=download_url,
+        label=title,
+        resolved_from_url=catalog_url,
+        metadata={
+            key: value for key, value in metadata.items() if value not in (None, "", [])
+        },
+    )
+
+
+async def _resolve_socrata_data_json_mrf_catalog(
+    source: dict[str, Any],
+    url: str,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    resolver_type = str(resolver.get("type") or "socrata_data_json_mrf_catalog")
+    payload = await _fetch_json(
+        url,
+        max_bytes=int(resolver.get("max_bytes") or 50 * 1024 * 1024),
+        session=session,
+    )
+    datasets = [
+        item
+        for item in (payload.get("dataset") or [])
+        if isinstance(item, dict) and _socrata_dataset_matches(item, resolver)
+    ]
+    if resolver.get("latest_coverage_month_only"):
+        coverage_months = [
+            month
+            for month in (
+                _socrata_coverage_month(_clean_text(item.get("title")))
+                for item in datasets
+            )
+            if month
+        ]
+        if coverage_months:
+            latest_month = max(coverage_months)
+            datasets = [
+                item
+                for item in datasets
+                if _socrata_coverage_month(_clean_text(item.get("title")))
+                == latest_month
+            ]
+    targets: list[CrawlTarget] = []
+    for dataset in sorted(datasets, key=lambda item: _clean_text(item.get("title"))):
+        target = _socrata_target_from_dataset(
+            source,
+            dataset,
+            catalog_url=url,
+            resolver_type=resolver_type,
+        )
+        if target:
+            targets.append(target)
+    max_targets = _as_int(resolver.get("max_targets"))
+    if max_targets:
+        targets = targets[:max_targets]
+    if not targets:
+        raise ValueError(f"no Socrata MRF catalog files found for {url}")
+    return targets
+
+
 def _cigna_lookup_urls_from_html(
     html_text: str, *, base_url: str, resolver: dict[str, Any]
 ) -> list[str]:
@@ -7073,6 +7336,10 @@ async def _crawl_targets_for_source(
         return await _resolve_html_delegated_mrf_links(source, url, resolver, session)
     if resolver_type == "html_mrf_links":
         return await _resolve_html_mrf_links(source, url, resolver, session)
+    if resolver_type == "socrata_data_json_mrf_catalog":
+        return await _resolve_socrata_data_json_mrf_catalog(
+            source, url, resolver, session
+        )
     if resolver_type == "json_mrf_directory_links":
         return await _resolve_json_mrf_directory_links(source, url, resolver, session)
     if resolver_type == "healthspace_machine_readable_files":
@@ -7218,6 +7485,10 @@ async def _crawl_targets_for_source(
         return await _resolve_html_delegated_mrf_links(source, url, resolver, session)
     if resolver_type == "html_mrf_links":
         return await _resolve_html_mrf_links(source, url, resolver, session)
+    if resolver_type == "socrata_data_json_mrf_catalog":
+        return await _resolve_socrata_data_json_mrf_catalog(
+            source, url, resolver, session
+        )
     if resolver_type == "json_mrf_directory_links":
         return await _resolve_json_mrf_directory_links(source, url, resolver, session)
     if resolver_type == "healthspace_machine_readable_files":

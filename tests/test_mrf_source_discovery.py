@@ -51,6 +51,16 @@ def test_source_urls_are_loaded_from_registry_file():
     assert config["platform_resolvers"]["html_mrf_links"]["max_frames"] == 5
     assert config["platform_resolvers"]["direct_mrf_body"]["type"] == "direct_mrf_body"
     assert (
+        config["platform_resolvers"]["socrata_data_json_mrf_catalog"]["type"]
+        == "socrata_data_json_mrf_catalog"
+    )
+    assert (
+        config["platform_resolvers"]["socrata_data_json_mrf_catalog"][
+            "latest_coverage_month_only"
+        ]
+        is True
+    )
+    assert (
         config["platform_resolvers"]["healthplan_html_mrf_links"]["type"]
         == "html_mrf_links"
     )
@@ -651,6 +661,7 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
 | UMWA Health and Retirement Funds | tpa | https://mrf.healthcarebluebook.com/healthsmartfundsaccount | aliases: UMWA Funds |
 | BlueAdvantage Administrators of Arkansas | tpa | https://www.blueadvantagearkansas.com/interoperability/machine-readable-files | aliases: BlueAdvantage, Skai BCBS |
 | GEHA | network/tpa | https://www.geha.com/transparency-in-coverage | benefit lines: dental, medical; aliases: Connection Dental |
+| Valley Health Plan | medicaid_mco | https://data.sccgov.org/data.json | benefit lines: medical, dental, vision; aliases: VHP |
 | S&S Health | tpa | https://mrf.healthcarebluebook.com/SandS | aliases: S&S HealthCare, SandS, Reflect Health |
 | SimplePay Health | tpa | https://www.simplepayhealth.com/ | aliases: SimplePay |
 | SISCO | tpa | https://sisconosurprise.com/ppo/phcs/index.html | aliases: SISCO Benefits, Self Insured Services Company |
@@ -727,6 +738,15 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
     )
     assert by_name["GEHA"].hosting_platform == "html_delegated_mrf_links"
     assert by_name["GEHA"].benefit_lines == ("dental", "medical")
+    assert (
+        by_name["Valley Health Plan"].hosting_platform
+        == "socrata_data_json_mrf_catalog"
+    )
+    assert by_name["Valley Health Plan"].benefit_lines == (
+        "medical",
+        "dental",
+        "vision",
+    )
     assert by_name["S&S Health"].hosting_platform == "healthcarebluebook_mrf"
     assert by_name["S&S Health"].aliases == (
         "S&S HealthCare",
@@ -1329,6 +1349,10 @@ def test_classify_hosting_platforms():
         == "html_delegated_mrf_links"
     )
     assert (
+        discovery.classify_hosting_platform("https://data.sccgov.org/data.json")
+        == "socrata_data_json_mrf_catalog"
+    )
+    assert (
         discovery.classify_hosting_platform("https://transparency.emblemhealth.com/")
         == "html_mrf_links"
     )
@@ -1840,6 +1864,152 @@ async def test_html_healthcarebluebook_resolver_passes_max_targets_to_nested(
 
     assert len(targets) == 1
     assert captured_resolvers[0]["max_targets"] == 5
+
+
+@pytest.mark.asyncio
+async def test_socrata_data_json_resolver_discovers_latest_vhp_mrf_files(monkeypatch):
+    source = {
+        "source_id": "source_vhp",
+        "payer_id": "payer_vhp",
+        "display_name": "Valley Health Plan",
+        "metadata_json": {"benefit_lines": ["medical", "dental", "vision"]},
+    }
+    payload = {
+        "dataset": [
+            {
+                "accessLevel": "public",
+                "title": "In Network Rates - Individual and Family Plans - Gold 80 - Santa Clara County - June 2026",
+                "description": "Machine-readable file that contains In-network rates.",
+                "issued": "2026-05-20",
+                "modified": "2026-05-20",
+                "contactPoint": {"fn": "Ethan Giang"},
+                "keyword": ["price transparency"],
+                "identifier": "https://data.sccgov.org/api/views/qq69-6225",
+                "landingPage": "https://data.sccgov.org/d/qq69-6225",
+                "distribution": [
+                    {
+                        "downloadURL": "https://data.sccgov.org/download/qq69-6225/application/vnd.geo+json",
+                        "mediaType": "application/vnd.geo+json",
+                    }
+                ],
+            },
+            {
+                "accessLevel": "public",
+                "title": "In Network Rates - Pediatric Dental - Covered California and IFP - Santa Clara County - June 2026",
+                "description": "Machine-readable file that contains In-network rates.",
+                "issued": "2026-05-20",
+                "modified": "2026-05-20",
+                "contactPoint": {"fn": "ryan.aralar@vhp.sccgov.org"},
+                "keyword": ["price transparency"],
+                "identifier": "https://data.sccgov.org/api/views/rj4i-khih",
+                "landingPage": "https://data.sccgov.org/d/rj4i-khih",
+                "distribution": [
+                    {
+                        "downloadURL": "https://data.sccgov.org/download/rj4i-khih/application/vnd.geo+json",
+                        "mediaType": "application/vnd.geo+json",
+                    }
+                ],
+            },
+            {
+                "accessLevel": "public",
+                "title": "In Network Rates - VSP Vision Care Advantage - June 2026",
+                "description": "Machine-readable file that contains In-network rates.",
+                "issued": "2026-06-05",
+                "modified": "2026-06-05",
+                "contactPoint": {"fn": "Ethan Giang"},
+                "keyword": ["price transparency"],
+                "identifier": "https://data.sccgov.org/api/views/bxvw-whxu",
+                "landingPage": "https://data.sccgov.org/d/bxvw-whxu",
+                "distribution": [
+                    {
+                        "downloadURL": "https://data.sccgov.org/download/bxvw-whxu/application/vnd.geo+json",
+                        "mediaType": "application/vnd.geo+json",
+                    }
+                ],
+            },
+            {
+                "accessLevel": "public",
+                "title": "Out-of-Network Allowed Amounts - Covered California - Gold 80 - June 2026",
+                "description": "Allowed amounts paid to providers outside of the VHP network.",
+                "issued": "2026-05-20",
+                "modified": "2026-05-20",
+                "contactPoint": {"fn": "ryan.aralar@vhp.sccgov.org"},
+                "keyword": ["price transparency"],
+                "identifier": "https://data.sccgov.org/api/views/d6r6-tdzg",
+                "landingPage": "https://data.sccgov.org/d/d6r6-tdzg",
+                "distribution": [
+                    {
+                        "downloadURL": "https://data.sccgov.org/download/d6r6-tdzg/application/vnd.geo+json",
+                        "mediaType": "application/vnd.geo+json",
+                    }
+                ],
+            },
+            {
+                "accessLevel": "public",
+                "title": "In Network Rates - VSP Vision Care Advantage - May 2026",
+                "description": "Machine-readable file that contains In-network rates.",
+                "issued": "2026-04-28",
+                "contactPoint": {"fn": "Ethan Giang"},
+                "keyword": ["price transparency"],
+                "identifier": "https://data.sccgov.org/api/views/mhey-u94c",
+                "distribution": [
+                    {
+                        "downloadURL": "https://data.sccgov.org/download/mhey-u94c/application/vnd.geo+json",
+                        "mediaType": "application/vnd.geo+json",
+                    }
+                ],
+            },
+            {
+                "accessLevel": "public",
+                "title": "County budget rows",
+                "description": "Not a machine-readable rate file.",
+                "contactPoint": {"fn": "County"},
+                "keyword": ["finance"],
+                "distribution": [
+                    {
+                        "downloadURL": "https://data.sccgov.org/download/abcd-1234/application/json",
+                        "mediaType": "application/json",
+                    }
+                ],
+            },
+        ]
+    }
+
+    async def fake_fetch_json(url, **_kwargs):
+        assert url == "https://data.sccgov.org/data.json"
+        return payload
+
+    monkeypatch.setattr(discovery, "_fetch_json", fake_fetch_json)
+
+    targets = await discovery._resolve_socrata_data_json_mrf_catalog(
+        source,
+        "https://data.sccgov.org/data.json",
+        {
+            "type": "socrata_data_json_mrf_catalog",
+            "title_regex": "(?i)(in\\s+network\\s+rates|allowed\\s+amounts)",
+            "contact_regex": "(?i)(vhp|ryan\\.aralar|ethan\\s+giang)",
+            "keyword_any": ["price transparency"],
+            "latest_coverage_month_only": True,
+        },
+        None,
+    )
+
+    by_id = {target.metadata["socrata_dataset_id"]: target for target in targets}
+    assert set(by_id) == {"qq69-6225", "rj4i-khih", "bxvw-whxu", "d6r6-tdzg"}
+    assert by_id["qq69-6225"].metadata["target_file_type"] == "in-network"
+    assert by_id["qq69-6225"].metadata["benefit_line"] == "medical"
+    assert by_id["rj4i-khih"].metadata["benefit_line"] == "dental"
+    assert by_id["bxvw-whxu"].metadata["benefit_line"] == "vision"
+    assert by_id["d6r6-tdzg"].metadata["target_file_type"] == "allowed-amounts"
+    assert by_id["d6r6-tdzg"].metadata["socrata_coverage_month"] == "2026-06"
+    assert by_id["qq69-6225"].metadata["plan_info"] == [
+        {
+            "plan_id": "qq69-6225",
+            "plan_id_type": "socrata_view_id",
+            "plan_market_type": "individual",
+            "plan_name": "In Network Rates - Individual and Family Plans - Gold 80 - Santa Clara County - June 2026",
+        }
+    ]
 
 
 def test_asr_health_benefits_resolver_expands_configured_group_numbers():

@@ -88,6 +88,15 @@
     "direct_mrf_body": {
       "type": "direct_mrf_body"
     },
+    "socrata_data_json_mrf_catalog": {
+      "type": "socrata_data_json_mrf_catalog",
+      "title_regex": "(?i)(in\\s+network\\s+rates|allowed\\s+amounts|out[-\\s]+of[-\\s]+network\\s+allowed\\s+amounts)",
+      "contact_regex": "(?i)(vhp|ryan\\.aralar|ethan\\s+giang)",
+      "keyword_any": ["price transparency"],
+      "latest_coverage_month_only": true,
+      "max_bytes": 52428800,
+      "max_targets": 500
+    },
     "healthplan_html_mrf_links": {
       "type": "html_mrf_links",
       "max_bytes": 5242880,

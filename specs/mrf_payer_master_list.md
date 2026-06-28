@@ -126,7 +126,7 @@ Last one-time research refresh: 2026-06-05.
 | Molina Healthcare | medicaid_mco | https://www.molinamarketplace.com/marketplace/oh/en-us/About/compinfo/PricingTransparency | observed current; 719 plans; 7,776 files |
 | Neighborhood Health Plan RI | medicaid_mco | https://www.nhpri.org/members/commercial-members-individual-family-plans/price-transparency-machine-readable-files/ | curated source row |
 | UCare | medicaid_mco | - | needs official source URL |
-| Valley Health Plan | medicaid_mco | - | needs official source URL |
+| Valley Health Plan | medicaid_mco | https://data.sccgov.org/data.json | public Santa Clara County Socrata catalog with Valley Health Plan medical, pediatric dental, and VSP vision machine-readable file assets; benefit lines: medical, dental, vision; aliases: VHP, Santa Clara County Valley Health Plan |
 | WellSense Health Plan | medicaid_mco | https://www.wellsense.org/about-us/interoperability | curated source row |
 | Alignment Health | medicare_advantage | - | needs official source URL |
 | SCAN | medicare_advantage | - | needs official source URL |
