@@ -223,7 +223,7 @@ Last one-time research refresh: 2026-06-05.
 | HealthPartners | provider_sponsored | https://www.healthpartners.com/hp/legal-notices/disclosures/transparency/index.html | curated source row |
 | Indiana University HP | provider_sponsored | - | needs official source URL |
 | Jefferson HP | provider_sponsored | - | needs official source URL |
-| Johns Hopkins HealthCare | provider_sponsored | https://www.hopkinshealthplans.org/transparency-in-coverage/ | curated source row |
+| Johns Hopkins HealthCare | provider_sponsored | https://ehptransparency.org/ | public Johns Hopkins Employer Health Programs autoindex linked from EHP transparency page |
 | Mass General Brigham HP | provider_sponsored | https://massgeneralbrighamhealthplan.org/meet-us/transparency-regulations | curated source row |
 | McLaren Health Plan | provider_sponsored | https://www.phpmichigan.com/About-Us/Transparency-in-Coverage | curated source row |
 | Mercy/MercyCare | provider_sponsored | - | needs official source URL |
@@ -322,7 +322,7 @@ Last one-time research refresh: 2026-06-05.
 | Mass General Brigham | regional | https://massgeneralbrighamhealthplan.org/meet-us/transparency-regulations | observed stale; 1,001 plans; 225 files |
 | Massachusetts General Brigham | regional | - | needs official source URL |
 | Medica | regional | https://web.healthsparq.com/healthsparq/public/#/one/insurerCode=MEDICA_I&brandCode=MEDICA&productCode=MRF/machine-readable-transparency-in-coverage | observed stale; 60 plans; 1,084 files |
-| Medical Mutual of Ohio | regional | https://www.medmutual.com/Employers/Machine-Readable-Files.aspx | curated source row |
+| Medical Mutual of Ohio | regional | https://medmutual.healthsparq.com/healthsparq/public/#/one/insurerCode=MMO_I&brandCode=MMO&productCode=MRF/machine-readable-transparency-in-coverage | public HealthSparq machine-readable files route linked from Medical Mutual transparency page |
 | Mercy Health Plan | regional | - | needs official source URL |
 | Midwest Health Plan | regional | - | needs official source URL |
 | Moda Health | regional | https://www.modahealth.com/privacy-center/machine-readable-files.shtml | curated source row; benefit lines: medical, dental; aliases: Oregon Dental Service, Delta Dental Plan of Oregon, Delta Dental of Oregon, Delta Dental of Alaska |

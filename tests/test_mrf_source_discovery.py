@@ -617,6 +617,10 @@ def test_classify_hosting_platform_recognizes_public_adapter_pages():
         )
         == "fchn_payor_search"
     )
+    assert (
+        discovery.classify_hosting_platform("https://ehptransparency.org/")
+        == "html_mrf_links"
+    )
 
 
 def test_parse_master_list_preserves_payers_and_urls():
@@ -1314,6 +1318,9 @@ async def test_master_list_keeps_high_value_public_aliases():
         "The Health Plan of the Upper Ohio Valley" in by_name["The Health Plan"].aliases
     )
     assert "THP" in by_name["The Health Plan"].aliases
+    assert by_name["Johns Hopkins HealthCare"].hosting_platform == "html_mrf_links"
+    assert by_name["Johns Hopkins HealthCare"].index_url == "https://ehptransparency.org/"
+    assert by_name["Medical Mutual of Ohio"].hosting_platform == "healthsparq"
     assert by_name["Varipro"].hosting_platform == "mymedicalshopper_talon"
     assert "Varipro TPA" in by_name["Varipro"].aliases
     assert "Valipro" in by_name["Varipro"].aliases
@@ -4245,6 +4252,25 @@ def test_import_control_source_urls_use_healthsparq_metadata_url():
     )
     assert aetna_official_url == aetna_public_url
 
+    medmutual_public_url = (
+        "https://medmutual.healthsparq.com/healthsparq/public/#/one/"
+        "insurerCode=MMO_I&brandCode=MMO&productCode=MRF/"
+        "machine-readable-transparency-in-coverage"
+    )
+    medmutual_index_url, medmutual_official_url = discovery._import_control_source_urls(
+        {
+            "index_url": medmutual_public_url,
+            "human_url": medmutual_public_url,
+            "hosting_platform": "healthsparq",
+        }
+    )
+
+    assert (
+        medmutual_index_url
+        == "https://mrf.healthsparq.com/mmo-egress.nophi.kyruushsq.com/prd/mrf/MMO_I/MMO/latest_metadata.json"
+    )
+    assert medmutual_official_url == medmutual_public_url
+
 
 def test_healthsparq_target_marks_metadata_url_as_toc_target():
     target = discovery._healthsparq_target(
@@ -5973,6 +5999,76 @@ def test_html_mrf_directory_urls_extracts_clear_directory_links():
         "https://example.test/thp_mrfs",
         "http://20.114.211.146/CHP/",
         "https://mrfproddestinationdata.blob.core.windows.net/mrf-output/Example_In-Network_MRF_Index.html",
+    ]
+
+
+def test_html_mrf_directory_urls_extracts_ehp_month_autoindex_links():
+    html = """
+    <h1>Index of /</h1>
+    <a href="/April_2026/">April_2026</a>
+    <a href="/May_2026/">May_2026</a>
+    <a href="/_autoindex/assets/css/autoindex.css">autoindex.css</a>
+    """
+
+    urls = discovery._html_mrf_directory_urls(
+        html,
+        base_url="https://ehptransparency.org/",
+    )
+
+    assert urls == [
+        "https://ehptransparency.org/April_2026/",
+        "https://ehptransparency.org/May_2026/",
+    ]
+
+
+def test_parse_html_mrf_links_extracts_ehp_autoindex_files():
+    html = """
+    <h1>Index of /May_2026/</h1>
+    <a href="/">Parent Directory</a>
+    <a href="/May_2026/Providers/">Providers</a>
+    <a href="/May_2026/2026-05-01_jhhc_ehp_allowed-amounts.json">
+      2026-05-01_jhhc_ehp_allowed-amounts.json
+    </a>
+    <a href="/May_2026/2026-05-01_jhhc_ehp_table-of-contents.json">
+      2026-05-01_jhhc_ehp_table-of-contents.json
+    </a>
+    <a href="/May_2026/2026-05-01_jhhc_ehp_table-of-contents.zip">
+      2026-05-01_jhhc_ehp_table-of-contents.zip
+    </a>
+    <a href="/May_2026/innetwork-G-EHPCAREMARK-file-1.json">
+      innetwork-G-EHPCAREMARK-file-1.json
+    </a>
+    """
+
+    targets = discovery._parse_html_mrf_links(
+        html,
+        base_url="https://ehptransparency.org/May_2026/",
+    )
+
+    assert [
+        (target["url"], target["target_kind"], target["target_file_type"])
+        for target in targets
+    ] == [
+        (
+            "https://ehptransparency.org/May_2026/2026-05-01_jhhc_ehp_allowed-amounts.json",
+            "file_reference",
+            "allowed-amounts",
+        ),
+        (
+            "https://ehptransparency.org/May_2026/2026-05-01_jhhc_ehp_table-of-contents.json",
+            "toc_json",
+            "table-of-contents",
+        ),
+        (
+            "https://ehptransparency.org/May_2026/2026-05-01_jhhc_ehp_table-of-contents.zip",
+            "file_reference",
+            "table-of-contents",
+        ),
+        (
+            "https://ehptransparency.org/May_2026/innetwork-G-EHPCAREMARK-file-1.json",
+            "file_reference",
+            "in-network",
+        ),
     ]
 
 

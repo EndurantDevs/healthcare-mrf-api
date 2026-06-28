@@ -609,6 +609,8 @@ def classify_hosting_platform(url: str | None) -> str | None:
         or path.startswith("/payorsearch")
     ):
         return "fchn_payor_search"
+    if host in {"ehptransparency.org", "www.ehptransparency.org"}:
+        return "html_mrf_links"
     if (
         host
         in {
@@ -4664,14 +4666,24 @@ def _html_mrf_directory_urls(html_text: str, *, base_url: str) -> list[str]:
             and file_name.endswith((".html", ".htm"))
             and "mrf" in text
         )
-        if not (path.endswith("/") or "." not in file_name or azure_html_mrf_listing):
+        autoindex_month_directory = (
+            host in {"ehptransparency.org", "www.ehptransparency.org"}
+            and path.endswith("/")
+            and re.search(r"/[a-z]+-20\d{2}/?$", path.replace("_", "-"))
+        )
+        if not (
+            path.endswith("/")
+            or "." not in file_name
+            or azure_html_mrf_listing
+            or autoindex_month_directory
+        ):
             continue
         if not path.endswith("/") and "." not in file_name:
             base_host = urlsplit(base_url).netloc.lower()
             host = parsed.netloc.lower()
             if host != base_host and "mrf" not in f"{host} {path} {text}":
                 continue
-        if not any(
+        if not autoindex_month_directory and not any(
             token in text
             for token in (
                 "/mrf/",
@@ -6075,6 +6087,7 @@ def _looks_html_mrf_body_reference(url: str | None, label: str | None = None) ->
             "allowed",
             "in-network",
             "in network",
+            "innetwork",
             "negotiated",
             "rate",
             "rates",
