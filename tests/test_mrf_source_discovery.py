@@ -435,6 +435,7 @@ def test_classify_hosting_platform_recognizes_public_adapter_pages():
     for url in (
         "https://www.deancare.com/helpful-links/transparency-in-coverage",
         "https://www.avmed.org/transparency-in-coverage",
+        "https://www.vivahealth.com/transparency-in-coverage/",
     ):
         assert discovery.classify_hosting_platform(url) == "custom"
     for url in (
@@ -1956,6 +1957,21 @@ def test_master_list_importable_source_filter_keeps_only_working_url_rows():
             status="archived",
         )
     )
+
+
+def test_master_list_marks_replaced_viva_transparency_url_archived():
+    markdown = """
+| Payer | Type | Public MRF TOC / landing URL | Notes |
+|---|---|---|---|
+| VIVA Health | provider_sponsored | https://www.vivahealth.com/transparency-in-coverage/ | observed archived; replaced by public VIVA MRF landing |
+"""
+
+    [candidate] = discovery.parse_master_list(markdown)
+
+    assert candidate.payer_name == "VIVA Health"
+    assert candidate.status == "archived"
+    assert candidate.hosting_platform == "custom"
+    assert not discovery._candidate_is_importable_source(candidate)
 
 
 def test_import_control_snapshot_company_fallback_from_index_url():

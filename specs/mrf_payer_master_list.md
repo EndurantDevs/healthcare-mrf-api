@@ -251,6 +251,7 @@ Last one-time research refresh: 2026-06-05.
 | UPMC Health Plan | provider_sponsored | https://www.upmchealthplan.com/transparency-in-coverage/mrf/ | curated source row |
 | UPMC Health System | provider_sponsored | - | needs official source URL |
 | VIVA Health | provider_sponsored | https://www.vivahealth.com/mrf/ | public VIVA MRF landing; resolver adds commercial static files and bounded public employer MyMedicalShopper links |
+| VIVA Health | provider_sponsored | https://www.vivahealth.com/transparency-in-coverage/ | observed archived; replaced by public VIVA MRF landing |
 | Alliant Health Plans | regional | https://alliantplans.com/json/pt/latestpt_nlc.html | official latest price transparency index redirect |
 | Alliant Health Plans | regional | https://alliantplans.com/machine-readable-data/ | observed unsupported |
 | AllWays Health Partners | regional | - | needs official source URL |
