@@ -316,7 +316,7 @@ def _load_credentials_config() -> dict[str, Any]:
             payload = json.loads(Path(path).read_text(encoding="utf-8"))
             if isinstance(payload, dict):
                 config.update(payload)
-        except Exception:  # pylint: disable=broad-exception-caught
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             pass
     raw = _clean_text(os.getenv(PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV))
     if raw:
@@ -324,7 +324,7 @@ def _load_credentials_config() -> dict[str, Any]:
             payload = json.loads(raw)
             if isinstance(payload, dict):
                 config.update(payload)
-        except Exception:  # pylint: disable=broad-exception-caught
+        except json.JSONDecodeError:
             pass
     return config
 
