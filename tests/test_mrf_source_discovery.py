@@ -2168,6 +2168,33 @@ def test_healthcarebluebook_grid_parser_extracts_link_type_pairs():
     ]
 
 
+def test_healthcarebluebook_grid_parser_extracts_nested_data_href_context():
+    html = """
+    <article class="card">
+      <h2>Lucent Health 042171239</h2>
+      <button data-href="/Lucent/350380">Download</button>
+      <p>Out of Network</p>
+    </article>
+    """
+
+    items = discovery._healthcarebluebook_grid_items(
+        html, base_url="https://mrf.healthcarebluebook.com/Lucent"
+    )
+
+    assert items == [
+        {
+            "url": "https://mrf.healthcarebluebook.com/Lucent/350380",
+            "label": "Lucent Health 042171239 Download Out of Network",
+            "text": "Lucent Health 042171239 Download Out of Network",
+        },
+        {
+            "url": None,
+            "label": "Lucent Health 042171239 Download Out of Network",
+            "text": "Lucent Health 042171239 Download Out of Network",
+        },
+    ]
+
+
 @pytest.mark.asyncio
 async def test_healthgram_resolver_expands_network_pages_to_toc_links(monkeypatch):
     source = {
@@ -2560,6 +2587,42 @@ async def test_healthcarebluebook_resolver_catalogs_stable_file_links(monkeypatc
     assert targets[1].metadata["plan_info"][0]["plan_id_type"] == "ein"
     assert targets[2].metadata["target_file_type"] == "in-network"
     assert targets[2].metadata["container_format"] == "zip"
+
+
+@pytest.mark.asyncio
+async def test_healthcarebluebook_resolver_extracts_table_row_data_href(monkeypatch):
+    source = {
+        "source_id": "source_1",
+        "payer_id": "payer_1",
+        "display_name": "Lucent Health",
+    }
+    html = """
+    <table>
+      <tr>
+        <td>Lucent Health 042171239</td>
+        <td>Out of Network</td>
+        <td><a data-href="/Lucent/350380">Download</a></td>
+      </tr>
+    </table>
+    """
+
+    async def fake_fetch_text(url, **_kwargs):
+        assert url == "https://mrf.healthcarebluebook.com/Lucent"
+        return html
+
+    monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
+
+    [target] = await discovery._resolve_healthcarebluebook_mrf(
+        source,
+        "https://mrf.healthcarebluebook.com/Lucent",
+        {"type": "healthcarebluebook_mrf"},
+        None,
+    )
+
+    assert target.url == "https://mrf.healthcarebluebook.com/Lucent/350380"
+    assert target.metadata["target_file_type"] == "allowed-amounts"
+    assert target.metadata["plan_info"][0]["plan_id"] == "042171239"
+    assert target.metadata["plan_info"][0]["plan_id_type"] == "ein"
 
 
 @pytest.mark.asyncio
@@ -4360,6 +4423,46 @@ def test_parse_sapphire_toc_links_extracts_unique_json_hrefs():
         {
             "url": "https://bci.sapphiremrfhub.com/tocs/202606/2026-06-01_blue-cross-of-idaho_index.json",
             "label": "Blue Cross Of Idaho",
+            "file_name": "2026-06-01_blue-cross-of-idaho_index.json",
+        }
+    ]
+
+
+def test_parse_sapphire_toc_links_extracts_data_href_and_extensionless_tocs():
+    html = """
+    <button data-href="/tocs/current/example_vision">Download</button>
+    <a href="/tocs/current/example_vision">Duplicate</a>
+    """
+
+    targets = discovery._parse_sapphire_toc_links(
+        html, base_url="https://example.sapphiremrfhub.com/"
+    )
+
+    assert targets == [
+        {
+            "url": "https://example.sapphiremrfhub.com/tocs/current/example_vision",
+            "label": "Example Vision",
+            "file_name": "example_vision",
+        }
+    ]
+
+
+def test_parse_sapphire_toc_links_extracts_embedded_relative_tocs():
+    html = """
+    <script>
+      window.__DATA__ = {"toc": "\\/tocs\\/202606\\/2026-06-01_example_index.json"};
+    </script>
+    """
+
+    targets = discovery._parse_sapphire_toc_links(
+        html, base_url="https://healthcomp.sapphiremrfhub.com/"
+    )
+
+    assert targets == [
+        {
+            "url": "https://healthcomp.sapphiremrfhub.com/tocs/202606/2026-06-01_example_index.json",
+            "label": "Example",
+            "file_name": "2026-06-01_example_index.json",
         }
     ]
 
@@ -4410,6 +4513,36 @@ def test_parse_sapphire_static_query_toc_links_extracts_current_tocs():
             "label": "Example Employer",
             "file_name": "2026-06-01_example-employer_index.json",
             "payer_name": "Example Employer",
+        }
+    ]
+
+
+def test_parse_sapphire_static_query_toc_links_recurses_gatsby_nodes():
+    query_json = json.dumps(
+        {
+            "data": {
+                "allFile": {
+                    "nodes": [
+                        {
+                            "childTocsJson": {
+                                "payer_name": "Nested Employer",
+                                "publicURL": "/tocs/current/nested_employer",
+                            }
+                        }
+                    ]
+                }
+            }
+        }
+    )
+
+    assert discovery._parse_sapphire_static_query_toc_links(
+        query_json, base_url="https://healthcomp.sapphiremrfhub.com/"
+    ) == [
+        {
+            "url": "https://healthcomp.sapphiremrfhub.com/tocs/current/nested_employer",
+            "label": "Nested Employer",
+            "file_name": "nested_employer",
+            "payer_name": "Nested Employer",
         }
     ]
 
@@ -4475,6 +4608,57 @@ async def test_sapphire_resolver_falls_back_to_gatsby_static_queries(monkeypatch
             },
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_sapphire_resolver_reads_page_data_tocs_before_static_queries(
+    monkeypatch,
+):
+    source = {
+        "source_id": "source_1",
+        "payer_id": "payer_1",
+        "display_name": "HealthComp",
+    }
+    page_data = json.dumps(
+        {
+            "staticQueryHashes": ["254433488"],
+            "result": {
+                "pageContext": {
+                    "payer_name": "Page Data Employer",
+                    "url": "/tocs/current/page_data_employer",
+                }
+            },
+        }
+    )
+    html_by_url = {
+        "https://healthcomp.sapphiremrfhub.com/": "<html></html>",
+        "https://healthcomp.sapphiremrfhub.com/page-data/index/page-data.json": page_data,
+    }
+
+    async def fake_fetch_text(url, **_kwargs):
+        if url.endswith("/page-data/sq/d/254433488.json"):
+            raise AssertionError("page-data TOCs should avoid static-query fetches")
+        return html_by_url[url]
+
+    monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
+
+    [target] = await discovery._crawl_targets_for_source(
+        source,
+        "https://healthcomp.sapphiremrfhub.com/",
+        None,
+    )
+
+    assert target == discovery.CrawlTarget(
+        source=source,
+        url="https://healthcomp.sapphiremrfhub.com/tocs/current/page_data_employer",
+        label="Page Data Employer",
+        resolved_from_url="https://healthcomp.sapphiremrfhub.com/",
+        metadata={
+            "resolver": "sapphire_html_tocs",
+            "file_name": "page_data_employer",
+            "payer_name": "Page Data Employer",
+        },
+    )
 
 
 def test_parse_html_mrf_metadata_links_extracts_meta_txt_files():

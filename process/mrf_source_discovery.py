@@ -3585,20 +3585,80 @@ async def _resolve_auxiant_wordpress_directory(
     return targets
 
 
+def _sapphire_toc_target(
+    raw_url: Any,
+    *,
+    base_url: str | None,
+    label: Any = None,
+    file_name: Any = None,
+    payer_name: Any = None,
+) -> dict[str, Any] | None:
+    value = html.unescape(str(raw_url or "")).strip()
+    if not value:
+        return None
+    url = urljoin(base_url or "", value)
+    path = urlsplit(url).path
+    path_lower = path.lower()
+    if "/tocs/" not in path_lower:
+        return None
+    inferred_file_name = str(file_name or Path(path).name or "").strip()
+    inferred_payer_name = _clean_text(payer_name)
+    clean_label = _clean_text(label)
+    generic_labels = {
+        "",
+        "copy",
+        "download",
+        "duplicate",
+        "file",
+        "open",
+        "view",
+        inferred_file_name.lower(),
+    }
+    if clean_label.lower() in generic_labels:
+        clean_label = ""
+    inferred_label = (
+        clean_label
+        or inferred_payer_name
+        or _label_from_index_name(inferred_file_name or Path(path).name)
+    )
+    if not _looks_html_mrf_toc_url(url, inferred_file_name or inferred_label):
+        return None
+    target: dict[str, Any] = {
+        "url": url,
+        "label": inferred_label,
+    }
+    if inferred_file_name:
+        target["file_name"] = inferred_file_name
+    if inferred_payer_name:
+        target["payer_name"] = inferred_payer_name
+    return target
+
+
 def _parse_sapphire_toc_links(html_text: str, *, base_url: str) -> list[dict[str, Any]]:
     urls: dict[str, dict[str, Any]] = {}
-    for href in re.findall(r"""href=["']([^"']+)["']""", html_text or "", flags=re.I):
-        href = html.unescape(href).strip()
-        if not href:
+    for candidate in _html_link_candidates(html_text or "", base_url=base_url):
+        target = _sapphire_toc_target(
+            candidate.get("url"),
+            base_url=base_url,
+            label=candidate.get("label"),
+        )
+        if not target:
             continue
-        url = urljoin(base_url, href)
-        path = urlsplit(url).path.lower()
-        if "/tocs/" not in path or not path.endswith(".json"):
+        urls[_canonical_or_none(str(target["url"])) or str(target["url"])] = target
+    decoded_text = (html_text or "").replace("\\/", "/")
+    for match in re.finditer(
+        r"""(?P<quote>["'])(?P<url>(?:https?://[^"']+)?/tocs/[^"']+)(?P=quote)""",
+        decoded_text,
+        flags=re.I,
+    ):
+        raw = match.group("url")
+        target = _sapphire_toc_target(raw, base_url=base_url)
+        if not target:
             continue
-        urls[_canonical_or_none(url) or url] = {
-            "url": url,
-            "label": _label_from_index_name(Path(path).name),
-        }
+        urls.setdefault(
+            _canonical_or_none(str(target["url"])) or str(target["url"]),
+            target,
+        )
     return list(urls.values())
 
 
@@ -3653,33 +3713,67 @@ def _sapphire_static_query_hashes(page_data_text: str | None) -> list[str]:
 
 def _parse_sapphire_static_query_toc_links(
     query_text: str | None,
+    *,
+    base_url: str | None = None,
 ) -> list[dict[str, Any]]:
     try:
         payload = json.loads(query_text or "{}")
     except json.JSONDecodeError:
         return []
-    data = payload.get("data") if isinstance(payload, dict) else None
-    all_tocs = data.get("allTocsJson") if isinstance(data, dict) else None
-    edges = all_tocs.get("edges") if isinstance(all_tocs, dict) else None
-    if not isinstance(edges, list):
-        return []
     urls: dict[str, dict[str, Any]] = {}
-    for edge in edges:
-        node = edge.get("node") if isinstance(edge, dict) else None
-        if not isinstance(node, dict):
-            continue
-        url = str(node.get("url") or "").strip()
-        file_name = str(node.get("file_name") or Path(urlsplit(url).path).name)
-        payer_name = _clean_text(node.get("payer_name"))
-        if not url or not _looks_html_mrf_toc_url(url, file_name or payer_name):
-            continue
-        label = payer_name or _label_from_index_name(file_name)
-        urls[_canonical_or_none(url) or url] = {
-            "url": url,
-            "label": label,
-            "file_name": file_name,
-            "payer_name": payer_name,
-        }
+
+    def visit(value: Any, context: dict[str, Any] | None = None) -> None:
+        if isinstance(value, dict):
+            next_context = dict(context or {})
+            for key in ("payer_name", "name", "label", "title", "file_name"):
+                if value.get(key):
+                    next_context.setdefault(key, value.get(key))
+            for key in ("url", "href", "publicURL", "downloadUrl", "path"):
+                if not value.get(key):
+                    continue
+                target = _sapphire_toc_target(
+                    value.get(key),
+                    base_url=base_url,
+                    label=next_context.get("label")
+                    or next_context.get("title")
+                    or next_context.get("name"),
+                    file_name=next_context.get("file_name"),
+                    payer_name=next_context.get("payer_name"),
+                )
+                if not target:
+                    continue
+                urls.setdefault(
+                    _canonical_or_none(str(target["url"])) or str(target["url"]),
+                    target
+                )
+            for child in value.values():
+                visit(child, next_context)
+            return
+        if isinstance(value, list):
+            for child in value:
+                visit(child, context)
+            return
+        if isinstance(value, str) and "/tocs/" in value:
+            target = _sapphire_toc_target(
+                value,
+                base_url=base_url,
+                label=(
+                    context.get("label")
+                    or context.get("title")
+                    or context.get("name")
+                    if context
+                    else None
+                ),
+                file_name=context.get("file_name") if context else None,
+                payer_name=context.get("payer_name") if context else None,
+            )
+            if target:
+                urls.setdefault(
+                    _canonical_or_none(str(target["url"])) or str(target["url"]),
+                    target
+                )
+
+    visit(payload)
     return list(urls.values())
 
 
@@ -3698,6 +3792,16 @@ async def _resolve_sapphire_static_query_toc_links(
     max_queries = _as_int(resolver.get("max_static_queries")) or 8
     max_targets = _as_int(resolver.get("max_targets"))
     targets: dict[str, dict[str, Any]] = {}
+    for target in _parse_sapphire_static_query_toc_links(page_data_text, base_url=url):
+        key = _canonical_or_none(str(target.get("url") or "")) or str(
+            target.get("url") or ""
+        )
+        if key:
+            targets[key] = target
+        if max_targets and len(targets) >= max_targets:
+            return list(targets.values())
+    if targets:
+        return list(targets.values())
     for query_hash in _sapphire_static_query_hashes(page_data_text)[:max_queries]:
         query_text = await _fetch_text(
             _sapphire_static_query_url(url, query_hash),
@@ -3705,7 +3809,7 @@ async def _resolve_sapphire_static_query_toc_links(
             session=session,
             expect_json=True,
         )
-        for target in _parse_sapphire_static_query_toc_links(query_text):
+        for target in _parse_sapphire_static_query_toc_links(query_text, base_url=url):
             key = _canonical_or_none(str(target.get("url") or "")) or str(
                 target.get("url") or ""
             )
@@ -6012,6 +6116,62 @@ def _healthcarebluebook_source_format(url: str) -> str | None:
     return None
 
 
+def _html_enclosing_fragment(html_text: str, start: int, end: int) -> str:
+    best = ""
+    best_size: int | None = None
+    for tag in ("tr", "li", "article", "section", "div"):
+        pattern = re.compile(
+            rf"<{tag}\b[^>]*>.*?</{tag}>",
+            flags=re.I | re.S,
+        )
+        for match in pattern.finditer(html_text or ""):
+            if match.start() > start or match.end() < end:
+                continue
+            size = match.end() - match.start()
+            if best_size is None or size < best_size:
+                best = match.group(0)
+                best_size = size
+    return best
+
+
+def _healthcarebluebook_link_items_from_context(
+    html_text: str, *, base_url: str
+) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for candidate in _html_link_candidates(html_text or "", base_url=base_url):
+        link_url = str(candidate.get("url") or "").strip()
+        if not link_url:
+            continue
+        if not (
+            _healthcarebluebook_relative_file_url(link_url)
+            or _looks_direct_mrf_body_url(link_url)
+            or classify_hosting_platform(link_url)
+        ):
+            continue
+        key = _canonical_or_none(link_url) or link_url
+        if key in seen:
+            continue
+        seen.add(key)
+        context_html = ""
+        start = candidate.get("html_start")
+        end = candidate.get("html_end")
+        if isinstance(start, int) and isinstance(end, int):
+            context_html = _html_enclosing_fragment(html_text or "", start, end)
+        context_text = _strip_html_tags(context_html or html_text or "")
+        label = _clean_text(candidate.get("label"))
+        path_label = Path(urlsplit(link_url).path).name
+        if context_text and (
+            not label
+            or label.lower() in {"download", "view", "open", "file"}
+            or label == path_label
+        ):
+            label = context_text or Path(urlsplit(link_url).path).name
+        items.append({"url": link_url, "label": label, "text": label})
+        items.append({"url": None, "label": context_text, "text": context_text})
+    return items
+
+
 def _healthcarebluebook_grid_items(
     html_text: str, *, base_url: str
 ) -> list[dict[str, Any]]:
@@ -6023,7 +6183,7 @@ def _healthcarebluebook_grid_items(
     for match in pattern.finditer(html_text or ""):
         content = match.group("content") or ""
         links = _html_link_candidates(content, base_url=base_url)
-        link = next((item for item in links if item.get("attr") == "href"), None)
+        link = next((item for item in links if item.get("url")), None)
         label = _strip_html_tags(content)
         items.append(
             {
@@ -6032,6 +6192,8 @@ def _healthcarebluebook_grid_items(
                 "text": label,
             }
         )
+    if not items:
+        items = _healthcarebluebook_link_items_from_context(html_text, base_url=base_url)
     return items
 
 
