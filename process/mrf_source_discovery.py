@@ -956,7 +956,7 @@ def classify_hosting_platform(url: str | None) -> str | None:
     if host in {"www.blueadvantagearkansas.com", "blueadvantagearkansas.com"} and (
         "machine-readable-files" in path
     ):
-        return "html_mrf_links"
+        return "blueadvantage_html_mrf_links"
     if host in {"www.geha.com", "geha.com"} and path.startswith(
         "/transparency-in-coverage"
     ):

@@ -49,6 +49,14 @@ def test_source_urls_are_loaded_from_registry_file():
     )
     assert config["platform_resolvers"]["html_mrf_links"]["type"] == "html_mrf_links"
     assert config["platform_resolvers"]["html_mrf_links"]["max_frames"] == 5
+    assert (
+        config["platform_resolvers"]["blueadvantage_html_mrf_links"]["type"]
+        == "html_mrf_links"
+    )
+    assert (
+        config["platform_resolvers"]["blueadvantage_html_mrf_links"]["toc_max_bytes"]
+        == 100 * 1024 * 1024
+    )
     assert config["platform_resolvers"]["direct_mrf_body"]["type"] == "direct_mrf_body"
     assert (
         config["platform_resolvers"]["socrata_data_json_mrf_catalog"]["type"]
@@ -804,7 +812,7 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
     )
     assert (
         by_name["BlueAdvantage Administrators of Arkansas"].hosting_platform
-        == "html_mrf_links"
+        == "blueadvantage_html_mrf_links"
     )
     assert by_name["GEHA"].hosting_platform == "html_delegated_mrf_links"
     assert by_name["GEHA"].benefit_lines == ("dental", "medical")
@@ -1434,7 +1442,7 @@ def test_classify_hosting_platforms():
         discovery.classify_hosting_platform(
             "https://www.blueadvantagearkansas.com/interoperability/machine-readable-files"
         )
-        == "html_mrf_links"
+        == "blueadvantage_html_mrf_links"
     )
     assert (
         discovery.classify_hosting_platform(

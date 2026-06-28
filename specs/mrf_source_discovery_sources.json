@@ -85,6 +85,16 @@
       "max_frames": 5,
       "max_targets": 1000
     },
+    "blueadvantage_html_mrf_links": {
+      "type": "html_mrf_links",
+      "max_bytes": 5242880,
+      "directory_max_bytes": 5242880,
+      "max_directories": 10,
+      "frame_max_bytes": 5242880,
+      "max_frames": 5,
+      "toc_max_bytes": 104857600,
+      "max_targets": 1000
+    },
     "direct_mrf_body": {
       "type": "direct_mrf_body"
     },
