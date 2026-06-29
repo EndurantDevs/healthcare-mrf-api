@@ -2531,6 +2531,18 @@ def test_canonical_backfill_resource_sql_uses_existing_resource_rows():
     assert "ON CONFLICT (source_id, resource_type, resource_id) DO UPDATE" in edge_sql
 
 
+def test_provider_directory_location_contact_backfill_sql_updates_canonical_contacts():
+    sql = importer.provider_directory_location_contact_backfill_sql("mrf")
+
+    assert 'UPDATE "mrf"."provider_directory_location" AS target' in sql
+    assert "target.phone_number IS DISTINCT FROM computed.phone_number" in sql
+    assert "target.fax_number_digits IS DISTINCT FROM computed.fax_number_digits" in sql
+    assert "regexp_replace(COALESCE(loc.telephone_number, '')" in sql
+    assert "regexp_replace(COALESCE(loc.fax_number, '')" in sql
+    assert "('US', 'USA', 'UNITEDSTATES', 'UNITEDSTATESOFAMERICA')" in sql
+    assert "updated_at = now()" in sql
+
+
 @pytest.mark.asyncio
 async def test_process_data_canonical_backfill_only_skips_seed_resolution(monkeypatch):
     expected = {"canonical_rows": 2, "source_edge_rows": 3, "resources": {"Location": {}}}
@@ -2552,6 +2564,29 @@ async def test_process_data_canonical_backfill_only_skips_seed_resolution(monkey
 
     assert result == expected
     backfill.assert_awaited_once_with(resources="Location")
+
+
+@pytest.mark.asyncio
+async def test_process_data_contact_backfill_only_skips_seed_resolution(monkeypatch):
+    expected = {"location_contact_rows_updated": 7}
+    backfill = AsyncMock(return_value=expected)
+
+    monkeypatch.setattr(importer, "ensure_database", AsyncMock())
+    monkeypatch.setattr(importer, "_ensure_provider_directory_tables", AsyncMock())
+    monkeypatch.setattr(importer, "backfill_provider_directory_location_contacts", backfill)
+    monkeypatch.setattr(
+        importer,
+        "_resolve_seed_db",
+        lambda *_args, **_kwargs: pytest.fail("seed DB should not be resolved for contact backfill"),
+    )
+
+    result = await importer.process_data(
+        {"context": {}},
+        {"contact_backfill_only": True},
+    )
+
+    assert result == expected
+    backfill.assert_awaited_once_with()
 
 
 def test_harness_fixture_case_and_report_rendering(tmp_path):

@@ -1161,6 +1161,11 @@ def provider_enrichment(test: bool):
     help="Populate canonical resource/source-edge tables from existing Provider Directory resource rows.",
 )
 @click.option(
+    "--contact-backfill-only",
+    is_flag=True,
+    help="Populate canonical phone/fax columns from existing Provider Directory Location rows.",
+)
+@click.option(
     "--full-refresh/--sample-refresh",
     default=False,
     show_default=True,
@@ -1213,6 +1218,7 @@ def provider_directory_fhir(
     no_probe: bool,
     import_resources: bool,
     canonical_backfill_only: bool,
+    contact_backfill_only: bool,
     full_refresh: bool,
     stale_cleanup: bool | None,
     publish_artifacts: bool | None,
@@ -1240,6 +1246,7 @@ def provider_directory_fhir(
             probe=not no_probe,
             import_resources=import_resources,
             canonical_backfill_only=canonical_backfill_only,
+            contact_backfill_only=contact_backfill_only,
             full_refresh=full_refresh,
             stale_cleanup=stale_cleanup,
             publish_artifacts=publish_artifacts,

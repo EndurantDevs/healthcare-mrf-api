@@ -1073,6 +1073,55 @@ def _location_contact_fields(
     }
 
 
+def _contact_main_expr(expr: str) -> str:
+    extension_pattern = (
+        "'[[:space:]]*(extension|ext\\.?|;ext=|#|x)"
+        "[[:space:]]*[0-9]{1,16}[[:space:]]*$'"
+    )
+    return f"regexp_replace(COALESCE({expr}, ''), {extension_pattern}, '', 'i')"
+
+
+def _contact_digits_expr(expr: str) -> str:
+    return f"regexp_replace({_contact_main_expr(expr)}, '[^0-9]', '', 'g')"
+
+
+def _contact_country_key_expr(expr: str) -> str:
+    return f"regexp_replace(upper(COALESCE({expr}, '')), '[^A-Z]', '', 'g')"
+
+
+def _canonical_contact_number_expr(expr: str, country_expr: str = "country_code") -> str:
+    digits = _contact_digits_expr(expr)
+    country_key = _contact_country_key_expr(country_expr)
+    default_us = (
+        f"({country_key} = '' OR {country_key} IN "
+        "('US', 'USA', 'UNITEDSTATES', 'UNITEDSTATESOFAMERICA'))"
+    )
+    main = _contact_main_expr(expr)
+    return (
+        "CASE "
+        f"WHEN {default_us} AND length({digits}) = 10 THEN {digits} "
+        f"WHEN {default_us} AND length({digits}) = 11 AND left({digits}, 1) = '1' "
+        f"THEN substring({digits} from 2) "
+        f"WHEN BTRIM({main}) LIKE '+%' AND length({digits}) BETWEEN 8 AND 15 THEN {digits} "
+        "ELSE NULL::varchar END"
+    )
+
+
+def _contact_extension_expr(expr: str) -> str:
+    extension_pattern = (
+        "'(extension|ext\\.?|;ext=|#|x)[[:space:]]*[0-9]{1,16}[[:space:]]*$'"
+    )
+    extract_pattern = (
+        "'^.*(extension|ext\\.?|;ext=|#|x)[[:space:]]*([0-9]{1,16})[[:space:]]*$'"
+    )
+    return (
+        "CASE "
+        f"WHEN COALESCE({expr}, '') ~* {extension_pattern} "
+        f"THEN NULLIF(regexp_replace(COALESCE({expr}, ''), {extract_pattern}, '\\2', 'i'), '')::varchar "
+        "ELSE NULL::varchar END"
+    )
+
+
 def _name(resource: dict[str, Any]) -> tuple[str | None, list[str], str | None]:
     names = resource.get("name")
     if isinstance(names, dict):
@@ -3140,6 +3189,50 @@ def _status_row_count(status: Any) -> int:
     return int(match.group(1)) if match else 0
 
 
+def provider_directory_location_contact_backfill_sql(schema: str) -> str:
+    table_ref = _qt(schema, ProviderDirectoryLocation.__tablename__)
+    phone_number = _canonical_contact_number_expr("loc.telephone_number", "loc.country_code")
+    phone_extension = _contact_extension_expr("loc.telephone_number")
+    fax_number_digits = _canonical_contact_number_expr("loc.fax_number", "loc.country_code")
+    fax_extension = _contact_extension_expr("loc.fax_number")
+    return f"""
+        WITH computed AS (
+            SELECT loc.source_id,
+                   loc.resource_id,
+                   {phone_number}::varchar AS phone_number,
+                   {phone_extension}::varchar AS phone_extension,
+                   {fax_number_digits}::varchar AS fax_number_digits,
+                   {fax_extension}::varchar AS fax_extension
+              FROM {table_ref} AS loc
+             WHERE NULLIF(BTRIM(COALESCE(loc.telephone_number, '')), '') IS NOT NULL
+                OR NULLIF(BTRIM(COALESCE(loc.fax_number, '')), '') IS NOT NULL
+        )
+        UPDATE {table_ref} AS target
+           SET phone_number = computed.phone_number,
+               phone_extension = computed.phone_extension,
+               fax_number_digits = computed.fax_number_digits,
+               fax_extension = computed.fax_extension,
+               updated_at = now()
+          FROM computed
+         WHERE target.source_id = computed.source_id
+           AND target.resource_id = computed.resource_id
+           AND (
+                target.phone_number IS DISTINCT FROM computed.phone_number
+             OR target.phone_extension IS DISTINCT FROM computed.phone_extension
+             OR target.fax_number_digits IS DISTINCT FROM computed.fax_number_digits
+             OR target.fax_extension IS DISTINCT FROM computed.fax_extension
+           );
+    """
+
+
+async def backfill_provider_directory_location_contacts() -> dict[str, Any]:
+    await _ensure_provider_directory_tables()
+    updated = _status_row_count(await db.status(provider_directory_location_contact_backfill_sql(_schema())))
+    summary = {"location_contact_rows_updated": updated}
+    print("PROVIDER_DIRECTORY_CONTACT_BACKFILL_DONE\t" + json.dumps(summary, sort_keys=True, default=str))
+    return summary
+
+
 def _canonical_backfill_resource_sql(resource_type: str, table_name: str) -> tuple[str, str]:
     schema = _schema()
     source_ref = _qt(schema, "provider_directory_source")
@@ -5116,6 +5209,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
     probe = bool(task.get("probe", True))
     import_resources = bool(task.get("import_resources", False))
     canonical_backfill_only = bool(task.get("canonical_backfill_only", False))
+    contact_backfill_only = bool(task.get("contact_backfill_only", False))
     open_only = bool(task.get("open_only", True))
     include_auth_required = bool(task.get("include_auth_required", False))
     full_refresh = bool(task.get("full_refresh", False))
@@ -5154,6 +5248,11 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
         metrics = await backfill_provider_directory_canonical_resources(
             resources=_clean_text(task.get("resources")),
         )
+        ctx["context"]["audit"] = metrics
+        ctx["context"]["run"] = ctx["context"].get("run", 0) + 1
+        return metrics
+    if contact_backfill_only:
+        metrics = await backfill_provider_directory_location_contacts()
         ctx["context"]["audit"] = metrics
         ctx["context"]["run"] = ctx["context"].get("run", 0) + 1
         return metrics
@@ -5410,6 +5509,7 @@ async def main(
     probe: bool = True,
     import_resources: bool = False,
     canonical_backfill_only: bool = False,
+    contact_backfill_only: bool = False,
     full_refresh: bool = False,
     stale_cleanup: bool | None = None,
     publish_artifacts: bool | None = None,
@@ -5438,6 +5538,7 @@ async def main(
         "probe": probe,
         "import_resources": import_resources,
         "canonical_backfill_only": canonical_backfill_only,
+        "contact_backfill_only": contact_backfill_only,
         "full_refresh": full_refresh,
         "stale_cleanup": stale_cleanup,
         "publish_artifacts": publish_artifacts,
