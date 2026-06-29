@@ -1569,6 +1569,10 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Reliance Standard Vision" in by_name["Reliance Matrix"].aliases
     assert "Davis Vision" in by_name["Reliance Matrix"].aliases
     assert "Davis Vision Network" in by_name["Reliance Matrix"].aliases
+    assert "Davis Vision by MetLife" in by_name["Reliance Matrix"].aliases
+    assert "Guardian - Davis Vision" in by_name["Reliance Matrix"].aliases
+    assert "Guardian Vision with Davis Vision" in by_name["Reliance Matrix"].aliases
+    assert "Highmark Davis Vision" in by_name["Reliance Matrix"].aliases
     assert "QCC Insurance Company" in by_name["Reliance Matrix"].aliases
     assert by_name["BCBS North Carolina"].hosting_platform == "direct_toc"
     assert "Blue Cross Blue Shield of NC" in aliases_by_name["BCBS North Carolina"]
@@ -1882,6 +1886,8 @@ async def test_master_list_public_alias_queries_match_expected_candidates():
     assert "Reliance Matrix" in matching_importable_names("reliancematrix")
     assert "Reliance Matrix" in matching_importable_names("Davis Vision")
     assert "Reliance Matrix" in matching_importable_names("Davis Vision Network")
+    assert "Reliance Matrix" in matching_importable_names("Guardian - Davis Vision")
+    assert "Reliance Matrix" in matching_importable_names("MetLife Davis Vision")
     assert "Meritain Health" in matching_names("Meritain Health, An Aetna Company")
     assert "Meritain Health" in matching_names(
         "MERITAIN HEALTH (NORTH AMERICAN HEALTH PLAN)"
