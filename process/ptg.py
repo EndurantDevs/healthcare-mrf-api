@@ -325,7 +325,11 @@ PTG2_AUTO_ADDRESS_REFRESH_PUBLISH_ENV = "HLTHPRT_PTG2_AUTO_ADDRESS_REFRESH_PUBLI
 
 
 def _ptg2_auto_address_refresh_enabled(*, test_mode: bool) -> tuple[bool, str | None]:
-    if not _env_bool(PTG2_AUTO_ADDRESS_REFRESH_ENV, True):
+    # PTG/TiC files do not carry authoritative provider locations. Address
+    # refreshes are now owned by address-bearing sources and the unified address
+    # importer, so PTG imports should not rebuild a synthetic PTG address layer by
+    # default. Keep the env gate for one-off operator-triggered unified refreshes.
+    if not _env_bool(PTG2_AUTO_ADDRESS_REFRESH_ENV, False):
         return False, "disabled"
     if test_mode and not _env_bool(PTG2_AUTO_ADDRESS_REFRESH_TEST_ENV, False):
         return False, "test-mode-disabled"
@@ -340,10 +344,9 @@ def _ptg2_auto_address_refresh_payload(
     test_mode: bool,
 ) -> dict[str, Any]:
     params: dict[str, Any] = {
-        "source_key": source_key,
-        "snapshot_id": snapshot_id,
-        "ptg_refresh_mode": "partial",
-        "entity_refresh_mode": "ptg-partial",
+        "refresh_mode": "full",
+        "trigger_source_key": source_key,
+        "trigger_snapshot_id": snapshot_id,
         "publish": _env_bool(PTG2_AUTO_ADDRESS_REFRESH_PUBLISH_ENV, True),
     }
     if test_mode:
@@ -353,13 +356,13 @@ def _ptg2_auto_address_refresh_payload(
         params["limit_per_source"] = limit_per_source
     return {
         "run_id": None,
-        "importer": "ptg-address-entity-refresh",
+        "importer": "entity-address-unified",
         "params": params,
-        "idempotency_key": f"ptg-address-entity-refresh:{source_key}:{snapshot_id}",
+        "idempotency_key": f"entity-address-unified:{source_key}:{snapshot_id}",
         "triggered_by": "ptg_import",
         "schedule_id": None,
         "subscription_id": None,
-        "import_id": f"ptg-address-entity-refresh:{import_run_id}",
+        "import_id": f"entity-address-unified:{import_run_id}",
     }
 
 

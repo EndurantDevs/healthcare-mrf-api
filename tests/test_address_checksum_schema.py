@@ -30,7 +30,6 @@ from db.models import (
     NPIDataTaxonomyGroup,
     PartDPharmacyActivity,
     PartDPharmacyActivityStage,
-    PTGAddress,
     PharmacyLicenseRecord,
     PharmacyLicenseRecordHistory,
     PharmacyLicenseRecordStage,
@@ -232,10 +231,6 @@ def test_entity_address_serving_models_expose_compact_keys_and_bridges():
     ):
         assert column_name in unified_columns
 
-    assert PTGAddress.__tablename__ == "ptg_address"
-    assert PTGAddress.__my_index_elements__ == ["source_key", "snapshot_id", "location_key"]
-    for column_name in ("phone_number", "phone_extension", "fax_number_digits", "fax_extension"):
-        assert column_name in PTGAddress.__table__.c
     assert EntityAddressEvidence.__tablename__ == "entity_address_evidence"
     assert EntityAddressPlanBridge.__tablename__ == "entity_address_plan_bridge"
     assert EntityAddressNetworkBridge.__tablename__ == "entity_address_network_bridge"
@@ -326,7 +321,6 @@ def test_entity_address_facility_anchor_uses_source_npi_and_ccn_inference():
                 "provider_enrollment_hospital": True,
                 "provider_enrollment_fqhc": True,
                 "mrf_address": False,
-                "ptg_address": False,
                 "address_archive_v2": False,
             },
         )

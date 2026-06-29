@@ -302,25 +302,23 @@ def _ptg_source_snapshot_refresh_payload(payload: dict, *, source_key: str, snap
         "limit_per_source",
         "publish",
         "skip_publish",
-        "ptg_refresh_mode",
-        "entity_refresh_mode",
+        "refresh_mode",
     ):
         if key in refresh and key not in params:
             params[key] = refresh[key]
         elif key in payload and key not in params:
             params[key] = payload[key]
-    params["source_key"] = source_key
-    params["snapshot_id"] = snapshot_id
-    params.setdefault("ptg_refresh_mode", "partial")
-    params.setdefault("entity_refresh_mode", "ptg-partial")
+    params.setdefault("refresh_mode", "full")
+    params["trigger_source_key"] = source_key
+    params["trigger_snapshot_id"] = snapshot_id
     return {
         "run_id": refresh.get("run_id") or payload.get("refresh_run_id"),
-        "importer": "ptg-address-entity-refresh",
+        "importer": "entity-address-unified",
         "params": params,
         "idempotency_key": (
             refresh.get("idempotency_key")
             or payload.get("refresh_idempotency_key")
-            or f"ptg-address-entity-refresh:{source_key}:{snapshot_id}"
+            or f"entity-address-unified:{source_key}:{snapshot_id}"
         ),
         "triggered_by": refresh.get("triggered_by") or payload.get("triggered_by") or "ptg_source_snapshot_promote",
         "schedule_id": refresh.get("schedule_id") or payload.get("schedule_id"),

@@ -79,19 +79,18 @@ def test_ptg2_auto_address_refresh_payload_defaults(monkeypatch):
 
     assert payload == {
         "run_id": None,
-        "importer": "ptg-address-entity-refresh",
+        "importer": "entity-address-unified",
         "params": {
-            "source_key": "healthjoy",
-            "snapshot_id": "snap-new",
-            "ptg_refresh_mode": "partial",
-            "entity_refresh_mode": "ptg-partial",
+            "refresh_mode": "full",
+            "trigger_source_key": "healthjoy",
+            "trigger_snapshot_id": "snap-new",
             "publish": True,
         },
-        "idempotency_key": "ptg-address-entity-refresh:healthjoy:snap-new",
+        "idempotency_key": "entity-address-unified:healthjoy:snap-new",
         "triggered_by": "ptg_import",
         "schedule_id": None,
         "subscription_id": None,
-        "import_id": "ptg-address-entity-refresh:run-healthjoy",
+        "import_id": "entity-address-unified:run-healthjoy",
     }
 
 
@@ -112,6 +111,7 @@ def test_ptg2_auto_address_refresh_payload_honors_limit_and_publish_env(monkeypa
 
 
 def test_ptg2_auto_address_refresh_skips_test_mode_by_default(monkeypatch):
+    monkeypatch.setenv(process_ptg.PTG2_AUTO_ADDRESS_REFRESH_ENV, "true")
     monkeypatch.delenv(process_ptg.PTG2_AUTO_ADDRESS_REFRESH_TEST_ENV, raising=False)
 
     result = asyncio.run(
@@ -131,6 +131,7 @@ def test_ptg2_auto_address_refresh_skips_test_mode_by_default(monkeypatch):
 def test_ptg2_auto_address_refresh_enqueues_control_run(monkeypatch):
     control_imports = importlib.import_module("api.control_imports")
     calls = []
+    monkeypatch.setenv(process_ptg.PTG2_AUTO_ADDRESS_REFRESH_ENV, "true")
 
     async def fake_ensure_import_run_table():
         calls.append({"ensure": True})
@@ -157,15 +158,17 @@ def test_ptg2_auto_address_refresh_enqueues_control_run(monkeypatch):
     assert result["created"] is True
     assert result["run_id"] == "run-refresh"
     assert calls[0] == {"ensure": True}
-    assert calls[1]["importer"] == "ptg-address-entity-refresh"
-    assert calls[1]["idempotency_key"] == "ptg-address-entity-refresh:healthjoy:snap-new"
+    assert calls[1]["importer"] == "entity-address-unified"
+    assert calls[1]["idempotency_key"] == "entity-address-unified:healthjoy:snap-new"
     assert calls[1]["triggered_by"] == "ptg_import"
-    assert calls[1]["params"]["source_key"] == "healthjoy"
-    assert calls[1]["params"]["snapshot_id"] == "snap-new"
+    assert calls[1]["params"]["refresh_mode"] == "full"
+    assert calls[1]["params"]["trigger_source_key"] == "healthjoy"
+    assert calls[1]["params"]["trigger_snapshot_id"] == "snap-new"
 
 
 def test_ptg2_auto_address_refresh_reports_existing_or_enqueue_failure(monkeypatch):
     control_imports = importlib.import_module("api.control_imports")
+    monkeypatch.setenv(process_ptg.PTG2_AUTO_ADDRESS_REFRESH_ENV, "true")
 
     async def fake_ensure_import_run_table():
         return None

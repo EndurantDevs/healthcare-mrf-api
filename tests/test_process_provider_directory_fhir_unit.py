@@ -1300,13 +1300,14 @@ def test_parse_fhir_resource_maps_plan_practitioner_location_role_and_endpoint()
     assert endpoint_row["last_seen_run_id"] == "run_2"
 
 
-def test_provider_directory_ptg_address_corroboration_sql_links_ptg_npi_address_to_fhir_roles():
+def test_provider_directory_ptg_address_corroboration_sql_links_unified_npi_address_to_fhir_roles():
     sql = importer.provider_directory_ptg_address_corroboration_sql("mrf")
 
     assert 'CREATE OR REPLACE VIEW "mrf"."ptg_provider_directory_address_corroboration" AS' in sql
-    assert 'FROM "mrf"."ptg_address" p' in sql
+    assert 'FROM "mrf"."entity_address_unified" e' in sql
+    assert "WITH address_candidates AS" in sql
     assert 'JOIN "mrf"."provider_directory_practitioner" practitioner' in sql
-    assert "practitioner.npi = p.npi" in sql
+    assert "practitioner.npi = e.npi" in sql
     assert 'JOIN "mrf"."provider_directory_location" loc' in sql
     assert "COALESCE(role.location_refs::jsonb, '[]'::jsonb)" in sql
     assert "COALESCE(role.network_refs::jsonb, '[]'::jsonb) AS network_refs" in sql
@@ -1331,7 +1332,10 @@ def test_provider_directory_ptg_address_corroboration_sql_links_ptg_npi_address_
     assert "insurance_plan.plan_identifier" in sql
     assert "insurance_plan.network_refs::jsonb" in sql
     assert '"provider_directory_organization" network_org' in sql
-    assert "COALESCE(p.ptg_plan_array, ARRAY[]::varchar[])" in sql
+    assert "NULL::varchar AS source_key" in sql
+    assert "NULL::varchar AS snapshot_id" in sql
+    assert "NULL::varchar AS plan_id" in sql
+    assert "NULL::varchar AS ptg_plan_id" in sql
     assert "'payer_directory_corroborated_location'" in sql
     assert "'provider_directory_address'" in sql
     assert "UNION ALL" in sql
@@ -1363,8 +1367,8 @@ def test_provider_directory_ptg_address_corroboration_select_sql_returns_query_b
     sql = importer.provider_directory_ptg_address_corroboration_select_sql("mrf")
 
     assert not sql.startswith("CREATE OR REPLACE VIEW")
-    assert sql.startswith("WITH practitioner_role_locations AS")
-    assert 'FROM "mrf"."ptg_address" p' in sql
+    assert sql.startswith("WITH address_candidates AS")
+    assert 'FROM "mrf"."entity_address_unified" e' in sql
     assert "provider_directory_network_names" in sql
 
 
@@ -1395,7 +1399,7 @@ async def test_publish_provider_directory_ptg_address_corroboration_table_swaps_
     }
     assert 'DROP TABLE IF EXISTS "mrf"."pd_stage_corrob"' in joined
     assert 'CREATE UNLOGGED TABLE "mrf"."pd_stage_corrob" AS' in joined
-    assert 'FROM "mrf"."ptg_address" p' in joined
+    assert 'FROM "mrf"."entity_address_unified" e' in joined
     assert 'DROP VIEW "mrf"."ptg_provider_directory_address_corroboration"' in joined
     assert 'DROP TABLE "mrf"."ptg_provider_directory_address_corroboration"' in joined
     assert (
@@ -1756,7 +1760,7 @@ async def test_publish_provider_directory_location_archive_skips_without_archive
 
 
 @pytest.mark.asyncio
-async def test_publish_provider_directory_ptg_address_corroboration_if_available_skips_without_ptg_address(
+async def test_publish_provider_directory_ptg_address_corroboration_if_available_skips_without_entity_address_unified(
     monkeypatch,
 ):
     monkeypatch.setattr(importer, "_table_exists", AsyncMock(return_value=False))
@@ -1770,7 +1774,7 @@ async def test_publish_provider_directory_ptg_address_corroboration_if_available
 
 
 @pytest.mark.asyncio
-async def test_publish_provider_directory_ptg_address_corroboration_if_available_publishes_when_ptg_address_exists(
+async def test_publish_provider_directory_ptg_address_corroboration_if_available_publishes_when_entity_address_unified_exists(
     monkeypatch,
 ):
     monkeypatch.setattr(importer, "_table_exists", AsyncMock(return_value=True))

@@ -3174,7 +3174,7 @@ def test_ptg2_display_policy_handles_malformed_address_verification_without_recu
         "address": "100 Main St",
     }
 
-    ptg2_serving._apply_ptg_address_display_policy(item, {})
+    ptg2_serving._apply_address_display_policy(item, {})
 
     assert item["address_verification"] == "not-json"
     assert item["address"] == "100 Main St"

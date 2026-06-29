@@ -760,7 +760,7 @@ def _strip_no_display_address_fields(item: dict[str, Any]) -> None:
         verification.pop(key, None)
 
 
-def _include_unverified_ptg_addresses(args: Mapping[str, Any] | dict[str, Any]) -> bool:
+def _include_unverified_addresses(args: Mapping[str, Any] | dict[str, Any]) -> bool:
     return _request_bool(args.get("include_unverified_addresses"), default=True)
 
 
@@ -776,7 +776,7 @@ def _is_plan_scoped_ptg_request(args: Mapping[str, Any] | dict[str, Any]) -> boo
     )
 
 
-def _apply_ptg_address_display_policy(item: dict[str, Any], args: Mapping[str, Any] | dict[str, Any]) -> None:
+def _apply_address_display_policy(item: dict[str, Any], args: Mapping[str, Any] | dict[str, Any]) -> None:
     """PTG responses display inferred addresses by default, unless the caller asks to suppress them."""
     verification = item.get("address_verification")
     if not isinstance(verification, dict):
@@ -786,7 +786,7 @@ def _apply_ptg_address_display_policy(item: dict[str, Any], args: Mapping[str, A
         verification.get("displayed_address_present") is True
         and verification.get("network_bound_address") is not True
         and _is_plan_scoped_ptg_request(args)
-        and not _include_unverified_ptg_addresses(args)
+        and not _include_unverified_addresses(args)
     ):
         verification["displayed_address_present"] = False
         verification["network_bound_address"] = False
@@ -935,10 +935,11 @@ async def _overlay_provider_directory_corroboration(
                 WHERE provider_directory_active_match IS TRUE
                   AND npi = ANY(CAST(:npis AS bigint[]))
                   AND address_key = ANY(CAST(:address_keys AS uuid[]))
-                  AND (:source_key IS NULL OR source_key = :source_key)
-                  AND (:snapshot_id IS NULL OR snapshot_id = :snapshot_id)
+                  AND (:source_key IS NULL OR source_key IS NULL OR source_key = :source_key)
+                  AND (:snapshot_id IS NULL OR snapshot_id IS NULL OR snapshot_id = :snapshot_id)
                   AND (
                         :plan_id IS NULL
+                     OR (plan_id IS NULL AND ptg_plan_id IS NULL)
                      OR plan_id = :plan_id
                      OR ptg_plan_id = :plan_id
                   )
@@ -3084,7 +3085,7 @@ async def _search_ptg2_manifest_db_serving_table(
             "confidence": {"network": "tic_rate_npi_tin", "location": "nppes_practice_location"},
         }
         base_item["address_verification"] = _address_verification_payload(base_item, {}, {})
-        _apply_ptg_address_display_policy(base_item, args)
+        _apply_address_display_policy(base_item, args)
         if not expand_providers:
             items.append(base_item)
             continue
@@ -3121,7 +3122,7 @@ async def _search_ptg2_manifest_db_serving_table(
             _add_location_phone_fields(item, provider, address_payload)
             _promote_address_provenance_fields(item, address_payload)
             item["address_verification"] = _address_verification_payload(item, provider, address_payload)
-            _apply_ptg_address_display_policy(item, args)
+            _apply_address_display_policy(item, args)
             items.append(item)
     if not items:
         return None
@@ -3673,7 +3674,7 @@ def _compact_item_from_row(data: dict[str, Any], args: dict[str, Any]) -> dict[s
     _add_location_phone_fields(item, data, address_payload)
     _promote_address_provenance_fields(item, address_payload)
     item["address_verification"] = _address_verification_payload(item, data, address_payload)
-    _apply_ptg_address_display_policy(item, args)
+    _apply_address_display_policy(item, args)
     return {key: value for key, value in item.items() if value is not None}
 
 

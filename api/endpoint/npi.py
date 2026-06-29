@@ -92,7 +92,6 @@ PUBLIC_ADDRESS_SOURCE_DEBUG_COLUMNS = {
 PUBLIC_ADDRESS_EVIDENCE_DEBUG_COLUMNS = {
     "source_record_ids",
     "base_address_version",
-    "ptg_address_version",
     "inferred_npi",
     "inference_confidence",
     "inference_method",

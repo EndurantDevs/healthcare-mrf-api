@@ -1,7 +1,14 @@
 # Entity Address Unified Serving Model
 
-**Status:** Proposed for team review
+**Status:** Historical design package; PTG overlay portions superseded
 **Date:** 2026-06-13
+
+**Superseded note, 2026-06-29:** The separate `ptg_address` projection and
+`ptg-address` importer described in these specs were retired. PTG/TiC files do
+not normally provide authoritative provider locations or contact numbers, so
+runtime serving now uses `entity_address_unified` plus Provider Directory/NPPES
+corroboration. PTG contributes price/provider/group/plan identity and network
+context, not a standalone postal-address cache.
 
 ## Purpose
 
@@ -18,8 +25,8 @@ The reviewed design keeps source truth separate from serving truth:
 
 - Raw imports keep their own tables and provenance.
 - `address_archive_v2` remains the canonical physical address book.
-- `ptg_address` becomes a fast logical node-scoped PTG provider-location and
-  coverage projection rebuilt from current PTG2 snapshots.
+- PTG/TiC contributes provider/group/plan identity and network context; it no
+  longer publishes a separate `ptg_address` cache.
 - `entity_address_evidence` records every source assertion.
 - `entity_address_unified` is rebuilt from published source tables and optimized
   for API search.
@@ -50,10 +57,11 @@ The reviewed design keeps source truth separate from serving truth:
 - Do not treat PTG as a postal-address source unless PTG actually supplied the
   address. PTG usually contributes provider/group/plan coverage and uses NPI/TIN
   identity to inherit best-known addresses from other sources.
-- PTG-only changes must not require a full heavy NPI/MRF address rebuild.
-- `entity_address_unified` and `ptg_address` must obey the
-  `address_archive_v2` identity contract: record archive identity version,
-  follow merges, and never treat city/ZIP-only precision as exact placement.
+- PTG-only changes can trigger a normal `entity_address_unified` refresh, but
+  they do not create or patch a PTG address projection.
+- `entity_address_unified` must obey the `address_archive_v2` identity
+  contract: record archive identity version, follow merges, and never treat
+  city/ZIP-only precision as exact placement.
 
 ## Primary Outcome
 

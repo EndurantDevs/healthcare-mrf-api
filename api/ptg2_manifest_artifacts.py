@@ -484,7 +484,7 @@ def _strip_no_display_address_fields(item: dict[str, Any]) -> None:
         verification.pop(key, None)
 
 
-def _include_unverified_ptg_addresses(args: Mapping[str, Any]) -> bool:
+def _include_unverified_addresses(args: Mapping[str, Any]) -> bool:
     return _request_bool(args.get("include_unverified_addresses"), default=True)
 
 
@@ -500,7 +500,7 @@ def _is_plan_scoped_ptg_request(args: Mapping[str, Any]) -> bool:
     )
 
 
-def _apply_ptg_address_display_policy(item: dict[str, Any], args: Mapping[str, Any]) -> None:
+def _apply_address_display_policy(item: dict[str, Any], args: Mapping[str, Any]) -> None:
     verification = item.get("address_verification")
     if not isinstance(verification, dict):
         _strip_no_display_address_fields(item)
@@ -509,7 +509,7 @@ def _apply_ptg_address_display_policy(item: dict[str, Any], args: Mapping[str, A
         verification.get("displayed_address_present") is True
         and verification.get("network_bound_address") is not True
         and _is_plan_scoped_ptg_request(args)
-        and not _include_unverified_ptg_addresses(args)
+        and not _include_unverified_addresses(args)
     ):
         verification["displayed_address_present"] = False
         verification["network_bound_address"] = False
@@ -918,7 +918,7 @@ def search_ptg2_manifest_snapshot(
                 },
             }
         base_item["address_verification"] = _manifest_address_verification(base_item)
-        _apply_ptg_address_display_policy(base_item, args)
+        _apply_address_display_policy(base_item, args)
         if not expand_providers:
             items.append(base_item)
             continue
@@ -949,7 +949,7 @@ def search_ptg2_manifest_snapshot(
             )
             _add_manifest_contact_fields(item, provider, address_payload)
             item["address_verification"] = _manifest_address_verification(item, provider=provider)
-            _apply_ptg_address_display_policy(item, args)
+            _apply_address_display_policy(item, args)
             items.append(item)
     total_items = len(items) if expand_providers else len(matched_rows)
     if expand_providers:

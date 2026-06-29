@@ -4275,7 +4275,6 @@ class EntityAddressUnified(Base, JSONOutputMixin):
     ptg_source_array = Column(ARRAY(String), nullable=False, server_default=text("'{}'::varchar[]"))
     group_plan_array = Column(ARRAY(String), nullable=False, server_default=text("'{}'::varchar[]"))
     base_address_version = Column(String(64))
-    ptg_address_version = Column(String(64))
 
     checksum = Column(BigInteger, nullable=False)
     type = Column(String(32), nullable=False)
@@ -4304,67 +4303,6 @@ class EntityAddressUnified(Base, JSONOutputMixin):
     updated_at = Column(DateTime)
     last_seen_at = Column(DateTime)
     address_key = Column(PG_UUID(as_uuid=True))
-
-
-class PTGAddress(Base, JSONOutputMixin):
-    __tablename__ = "ptg_address"
-    __main_table__ = __tablename__
-    __table_args__ = (
-        PrimaryKeyConstraint("source_key", "snapshot_id", "location_key"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
-    )
-    __my_index_elements__ = ["source_key", "snapshot_id", "location_key"]
-    __my_additional_indexes__ = [
-        {"index_elements": ("source_key", "snapshot_id"), "name": "source_snapshot"},
-        {"index_elements": ("plan_id",), "name": "plan_id"},
-        {"index_elements": ("ptg_plan_id",), "name": "ptg_plan_id"},
-        {"index_elements": ("npi",), "name": "npi"},
-        {"index_elements": ("tin",), "name": "tin"},
-        {"index_elements": ("address_key",), "name": "address_key"},
-        {"index_elements": ("premise_key",), "name": "premise_key"},
-        {"index_elements": ("zip5",), "name": "zip5"},
-        {"index_elements": ("state_code", "city_norm"), "name": "state_city_norm"},
-        {"index_elements": ("ptg_plan_array",), "using": "gin", "name": "ptg_plan_array"},
-        {"index_elements": ("ptg_source_array",), "using": "gin", "name": "ptg_source_array"},
-        {"index_elements": ("group_plan_array",), "using": "gin", "name": "group_plan_array"},
-    ]
-
-    node_id = Column(String)
-    source_key = Column(String, nullable=False)
-    snapshot_id = Column(String, nullable=False)
-    plan_id = Column(String)
-    ptg_plan_id = Column(String)
-    market_type = Column(String)
-    provider_group_id = Column(String)
-    provider_set_id = Column(String)
-    npi = Column(BigInteger)
-    tin = Column(String)
-    location_key = Column(String(64), nullable=False)
-    address_key = Column(PG_UUID(as_uuid=True))
-    premise_key = Column(PG_UUID(as_uuid=True))
-    archive_identity_version = Column(String(16), nullable=False, server_default="v2")
-    address_precision = Column(String(32), nullable=False, server_default="unknown")
-    address_source_id = Column(SMALLINT, nullable=False, server_default="0")
-    address_source_record_key = Column(String)
-    address_role_id = Column(SMALLINT, nullable=False, server_default="0")
-    location_confidence_id = Column(SMALLINT, nullable=False, server_default="0")
-    zip5 = Column(String(5))
-    state_code = Column(String(2))
-    city_norm = Column(String)
-    county_fips = Column(String(5))
-    lat = Column(Numeric(scale=8, precision=11, asdecimal=False, decimal_return_scale=None))
-    long = Column(Numeric(scale=8, precision=11, asdecimal=False, decimal_return_scale=None))
-    ptg_plan_array = Column(ARRAY(String), nullable=False, server_default=text("'{}'::varchar[]"))
-    ptg_source_array = Column(ARRAY(String), nullable=False, server_default=text("'{}'::varchar[]"))
-    group_plan_array = Column(ARRAY(String), nullable=False, server_default=text("'{}'::varchar[]"))
-    phone_number = Column(String(15))
-    phone_extension = Column(String(16))
-    fax_number_digits = Column(String(15))
-    fax_extension = Column(String(16))
-    base_address_version = Column(String(64))
-    ptg_snapshot_published_at = Column(TIMESTAMP(timezone=True))
-    observed_at = Column(TIMESTAMP(timezone=True))
-    updated_at = Column(TIMESTAMP(timezone=True))
 
 
 class EntityAddressEvidence(Base, JSONOutputMixin):

@@ -50,7 +50,7 @@ def test_provider_directory_coverage_audit_parse_args_accepts_pod_safe_skip_flag
 def test_provider_directory_coverage_audit_skipped_ptg_summary_shape():
     summary = audit._skipped_ptg_summary()
 
-    assert summary["ptg_address"] == {
+    assert summary["ptg_unified_address"] == {
         "available": False,
         "skipped": True,
         "reason": "disabled by --skip-ptg",
@@ -91,13 +91,13 @@ def test_provider_directory_coverage_audit_gaps_when_requested_plan_has_no_ptg_r
     report = {
         "ptg_plan_filter": "010854205",
         "ptg_summary": {
-            "ptg_address": {"available": True, "ptg_address_rows": 0},
+            "ptg_unified_address": {"available": True, "ptg_unified_address_rows": 0},
             "ptg_corroboration": {"available": True, "corroboration_rows": 0},
         },
     }
 
     assert audit._derive_gaps(report) == [
-        "Requested PTG plan `010854205` has no ptg_address rows in this database."
+        "Requested PTG plan `010854205` has no PTG-associated unified address rows."
     ]
 
 
@@ -105,7 +105,7 @@ def test_provider_directory_coverage_audit_gaps_when_requested_plan_lacks_corrob
     report = {
         "ptg_plan_filter": "codex_plan_a",
         "ptg_summary": {
-            "ptg_address": {"available": True, "ptg_address_rows": 10},
+            "ptg_unified_address": {"available": True, "ptg_unified_address_rows": 10},
             "ptg_corroboration": {"available": True, "corroboration_rows": 0},
         },
     }

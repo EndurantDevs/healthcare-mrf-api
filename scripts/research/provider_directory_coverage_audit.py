@@ -494,28 +494,37 @@ async def _ptg_summary(
     force_live_view_scans: bool = False,
 ) -> dict[str, Any]:
     summary: dict[str, Any] = {}
-    if await _relation_exists(conn, schema, "ptg_address"):
+    if await _relation_exists(conn, schema, "entity_address_unified"):
         plan_filter = (
-            "WHERE ($1::varchar IS NULL OR plan_id = $1 OR ptg_plan_id = $1 "
-            "OR $1 = ANY(COALESCE(ptg_plan_array, ARRAY[]::varchar[])))"
+            "WHERE COALESCE(CARDINALITY(ptg_plan_array), 0) > 0 "
+            "AND ($1::varchar IS NULL OR $1 = ANY(COALESCE(ptg_plan_array, ARRAY[]::varchar[])))"
         )
         row = await _fetch_mapping(
             conn,
             f"""
+            WITH filtered AS (
+                SELECT *
+                  FROM {_qt(schema, "entity_address_unified")}
+                  {plan_filter}
+            )
             SELECT
-                count(*)::bigint AS ptg_address_rows,
-                count(DISTINCT source_key)::bigint AS ptg_source_count,
+                count(*)::bigint AS ptg_unified_address_rows,
+                count(DISTINCT source_key.value)::bigint AS ptg_source_count,
                 count(DISTINCT npi)::bigint AS ptg_npi_count,
                 count(*) FILTER (WHERE address_key IS NOT NULL)::bigint AS ptg_keyed_address_rows
-              FROM {_qt(schema, "ptg_address")}
-              {plan_filter}
+              FROM filtered
+              LEFT JOIN LATERAL unnest(COALESCE(ptg_source_array, ARRAY[]::varchar[])) AS source_key(value)
+                ON TRUE
             """,
             ptg_plan_id,
         )
-        row["ptg_keyed_address_pct"] = _pct(_int(row.get("ptg_keyed_address_rows")), _int(row.get("ptg_address_rows")))
-        summary["ptg_address"] = {"available": True, **row}
+        row["ptg_keyed_address_pct"] = _pct(
+            _int(row.get("ptg_keyed_address_rows")),
+            _int(row.get("ptg_unified_address_rows")),
+        )
+        summary["ptg_unified_address"] = {"available": True, **row}
     else:
-        summary["ptg_address"] = {"available": False}
+        summary["ptg_unified_address"] = {"available": False}
     view = "ptg_provider_directory_address_corroboration"
     view_kind = await _relation_kind(conn, schema, view)
     if skip_corroboration:
@@ -569,7 +578,7 @@ def _skipped_summary(reason: str, **extra: Any) -> dict[str, Any]:
 
 def _skipped_ptg_summary() -> dict[str, Any]:
     return {
-        "ptg_address": _skipped_summary("disabled by --skip-ptg"),
+        "ptg_unified_address": _skipped_summary("disabled by --skip-ptg"),
         "ptg_corroboration": _skipped_summary("disabled by --skip-ptg"),
         "ptg_network_name_overlap": _skipped_summary("disabled by --skip-ptg", samples=[]),
     }
@@ -1310,10 +1319,14 @@ def _derive_gaps(report: dict[str, Any]) -> list[str]:
         gaps.append("Provider Directory network names are present for PTG plan pairs, but none match PTG serving network_names.")
     ptg_plan_filter = report.get("ptg_plan_filter")
     if ptg_plan_filter:
-        ptg_address = (report.get("ptg_summary") or {}).get("ptg_address") or {}
+        ptg_unified_address = (report.get("ptg_summary") or {}).get("ptg_unified_address") or {}
         ptg_corroboration = (report.get("ptg_summary") or {}).get("ptg_corroboration") or {}
-        if ptg_address.get("available") and not _int(ptg_address.get("ptg_address_rows")):
-            gaps.append(f"Requested PTG plan `{ptg_plan_filter}` has no ptg_address rows in this database.")
+        if ptg_unified_address.get("available") and not _int(
+            ptg_unified_address.get("ptg_unified_address_rows")
+        ):
+            gaps.append(
+                f"Requested PTG plan `{ptg_plan_filter}` has no PTG-associated unified address rows."
+            )
         elif ptg_corroboration.get("available") and not _int(ptg_corroboration.get("corroboration_rows")):
             gaps.append(
                 f"Requested PTG plan `{ptg_plan_filter}` has no Provider Directory address corroboration rows."
@@ -1652,8 +1665,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--ptg-plan-id",
         help=(
-            "Limit PTG address/corroboration counts to one plan id. Matches ptg_address.plan_id, "
-            "ptg_address.ptg_plan_id, ptg_address.ptg_plan_array, and corroboration plan ids."
+            "Limit PTG-associated unified address and corroboration counts to one plan id. "
+            "Matches entity_address_unified.ptg_plan_array and corroboration plan ids."
         ),
     )
     parser.add_argument("--sample-limit", type=int, default=10)

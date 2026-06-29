@@ -128,11 +128,6 @@ from process.entity_address_unified import main as initiate_entity_address_unifi
 from process.entity_address_unified import process_data as process_entity_address_unified_data
 from process.entity_address_unified import shutdown as entity_address_unified_shutdown
 from process.entity_address_unified import startup as entity_address_unified_startup
-from process.ptg_address import main as initiate_ptg_address
-from process.ptg_address import process_data as process_ptg_address_data
-from process.ptg_address import shutdown as ptg_address_shutdown
-from process.ptg_address import startup as ptg_address_startup
-from process.ptg_address_entity_refresh import main as initiate_ptg_address_entity_refresh
 from process.address_archive_migration import main as initiate_address_archive_migration
 from process.address_archive_migration import process_data as process_address_archive_migration_data
 from process.openaddresses import main as initiate_openaddresses
@@ -825,32 +820,6 @@ class EntityAddressUnified_finish:  # pylint: disable=invalid-name
     job_deserializer = deserialize_job
 
 
-class PTGAddress:
-    functions = [process_ptg_address_data, control_single_job_start]
-    on_startup = ptg_address_startup
-    on_shutdown = ptg_address_shutdown
-    max_jobs = 1
-    queue_read_limit = 2
-    queue_name = "arq:PTGAddress"
-    job_timeout = 14400
-    redis_settings = build_redis_settings()
-    job_serializer = serialize_job
-    job_deserializer = deserialize_job
-
-
-class PTGAddress_finish:  # pylint: disable=invalid-name
-    functions = [ptg_address_shutdown]
-    on_startup = db_startup
-    max_jobs = 1
-    queue_read_limit = 2
-    queue_name = "arq:PTGAddress_finish"
-    job_timeout = 1800
-    burst = True
-    redis_settings = build_redis_settings()
-    job_serializer = serialize_job
-    job_deserializer = deserialize_job
-
-
 class AddressArchive:
     functions = [process_address_archive_migration_data, control_single_job_start]
     on_startup = db_startup
@@ -1349,15 +1318,14 @@ def pharmacy_economics(test: bool):
 )
 @click.option(
     "--refresh-mode",
-    type=click.Choice(["full", "ptg-partial", "provider-directory-partial"], case_sensitive=False),
+    type=click.Choice(["full", "provider-directory-partial"], case_sensitive=False),
     default="full",
     show_default=True,
     help=(
-        "full rebuilds all sources; ptg-partial refreshes one PTG source; "
+        "full rebuilds all address-bearing sources; "
         "provider-directory-partial patches Provider Directory serving rows."
     ),
 )
-@click.option("--ptg-source-key", help="PTG source key to refresh when --refresh-mode=ptg-partial.")
 @click.option(
     "--serving-only-refresh/--full-refresh-support",
     default=None,
@@ -1379,7 +1347,6 @@ def entity_address_unified(
     limit_per_source: int | None,
     publish: bool | None,
     refresh_mode: str,
-    ptg_source_key: str | None,
     serving_only_refresh: bool | None,
     provider_directory_run_id: str | None,
     provider_directory_source_id: tuple[str, ...],
@@ -1391,79 +1358,10 @@ def entity_address_unified(
             limit_per_source=limit_per_source,
             publish=publish,
             refresh_mode=refresh_mode,
-            ptg_source_key=ptg_source_key,
             serving_only_refresh=serving_only_refresh,
             provider_directory_run_id=provider_directory_run_id,
             provider_directory_source_ids=list(provider_directory_source_id),
             provider_directory_partial_scope=provider_directory_partial_scope,
-        )
-    )
-
-
-@click.command(help="Run fast PTG provider-location address projection")
-@click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
-@click.option("--source-key", help="Refresh a single PTG source key.")
-@click.option("--snapshot-id", help="Refresh a specific PTG source snapshot; defaults to the current snapshot.")
-@click.option(
-    "--refresh-mode",
-    type=click.Choice(["full", "partial"], case_sensitive=False),
-    default="full",
-    show_default=True,
-    help="full rebuilds every current PTG source; partial reuses unchanged live rows for the requested source.",
-)
-def ptg_address(test: bool, source_key: str | None, snapshot_id: str | None, refresh_mode: str):
-    _run(
-        initiate_ptg_address(
-            test_mode=test,
-            source_key=source_key,
-            snapshot_id=snapshot_id,
-            refresh_mode=refresh_mode,
-        )
-    )
-
-
-@click.command(help="Run PTG address refresh followed by entity-address PTG refresh")
-@click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
-@click.option("--source-key", help="PTG source key to refresh.")
-@click.option("--snapshot-id", help="Refresh a specific PTG source snapshot; defaults to the current snapshot.")
-@click.option(
-    "--ptg-refresh-mode",
-    type=click.Choice(["full", "partial"], case_sensitive=False),
-    default="partial",
-    show_default=True,
-    help="PTG address mode; partial patches only the requested source.",
-)
-@click.option(
-    "--entity-refresh-mode",
-    type=click.Choice(["full", "ptg-partial"], case_sensitive=False),
-    default="ptg-partial",
-    show_default=True,
-    help="Entity-address mode; ptg-partial patches only affected PTG rows.",
-)
-@click.option("--limit-per-source", type=int, help="Limit entity-address rows per source for bounded smoke or pilot runs.")
-@click.option(
-    "--publish/--no-publish",
-    default=None,
-    help="Publish entity-address staged output; defaults to false in test mode and true otherwise.",
-)
-def ptg_address_entity_refresh(
-    test: bool,
-    source_key: str | None,
-    snapshot_id: str | None,
-    ptg_refresh_mode: str,
-    entity_refresh_mode: str,
-    limit_per_source: int | None,
-    publish: bool | None,
-):
-    _run(
-        initiate_ptg_address_entity_refresh(
-            test_mode=test,
-            source_key=source_key,
-            snapshot_id=snapshot_id,
-            ptg_refresh_mode=ptg_refresh_mode,
-            entity_refresh_mode=entity_refresh_mode,
-            limit_per_source=limit_per_source,
-            publish=publish,
         )
     )
 
@@ -1698,8 +1596,6 @@ process_group.add_command(cms_doctors, name="cms-doctors")
 process_group.add_command(facility_anchors, name="facility-anchors")
 process_group.add_command(pharmacy_economics, name="pharmacy-economics")
 process_group.add_command(entity_address_unified, name="entity-address-unified")
-process_group.add_command(ptg_address, name="ptg-address")
-process_group.add_command(ptg_address_entity_refresh, name="ptg-address-entity-refresh")
 process_group.add_command(openaddresses, name="openaddresses")
 process_group.add_command(address_archive_v2_migrate, name="address-archive-v2-migrate")
 process_group.add_command(geo_lookup, name="geo")

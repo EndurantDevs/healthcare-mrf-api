@@ -24,7 +24,6 @@ from db.models import (
     EntityAddressProcedureBridge,
     EntityAddressUnified,
     FacilityAnchorNPICandidate,
-    PTGAddress,
     db,
 )
 from process.control_lifecycle import mark_control_run
@@ -81,15 +80,11 @@ DEFAULT_SQL_LOCK_TIMEOUT = "30s"
 DEFAULT_SQL_STATEMENT_TIMEOUT = "0"
 DEFAULT_SQL_SYNCHRONOUS_COMMIT = "off"
 DEFAULT_SQL_JIT = "off"
-DEFAULT_PTG_PARTIAL_PATCH_SUPPORT = True
-DEFAULT_PTG_PARTIAL_PATCH_MAIN = True
 DEFAULT_PROVIDER_DIRECTORY_PARTIAL_SCOPE = "latest-run"
 ENTITY_ADDRESS_REFRESH_MODE_FULL = "full"
-ENTITY_ADDRESS_REFRESH_MODE_PTG_PARTIAL = "ptg-partial"
 ENTITY_ADDRESS_REFRESH_MODE_PROVIDER_DIRECTORY_PARTIAL = "provider-directory-partial"
 ENTITY_ADDRESS_REFRESH_MODES = {
     ENTITY_ADDRESS_REFRESH_MODE_FULL,
-    ENTITY_ADDRESS_REFRESH_MODE_PTG_PARTIAL,
     ENTITY_ADDRESS_REFRESH_MODE_PROVIDER_DIRECTORY_PARTIAL,
 }
 ARCHIVE_IDENTITY_VERSION = "v2"
@@ -227,7 +222,12 @@ def _entity_address_refresh_mode(task: dict) -> str:
     if value in {"full", "rebuild", "full-rebuild"}:
         return ENTITY_ADDRESS_REFRESH_MODE_FULL
     if value in {"ptg-partial", "partial-ptg", "ptg", "ptg-source", "ptg-source-refresh"}:
-        return ENTITY_ADDRESS_REFRESH_MODE_PTG_PARTIAL
+        logger.warning(
+            "entity-address-unified refresh_mode=%s is obsolete because PTG no longer "
+            "publishes address rows; running a full unified-address refresh instead.",
+            raw,
+        )
+        return ENTITY_ADDRESS_REFRESH_MODE_FULL
     if value in {
         "provider-directory-partial",
         "partial-provider-directory",
@@ -240,18 +240,6 @@ def _entity_address_refresh_mode(task: dict) -> str:
         f"Unsupported entity-address-unified refresh_mode {raw!r}; "
         f"expected one of {sorted(ENTITY_ADDRESS_REFRESH_MODES)}"
     )
-
-
-def _entity_address_ptg_source_keys(task: dict) -> list[str]:
-    explicit = (
-        task.get("ptg_source_keys")
-        or task.get("ptg_source_key")
-        or task.get("source_keys")
-        or task.get("source_key")
-        or os.getenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_PTG_SOURCE_KEYS")
-        or os.getenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_PTG_SOURCE_KEY")
-    )
-    return _coerce_str_list(explicit)
 
 
 def _entity_address_provider_directory_source_ids(task: dict) -> list[str]:
@@ -2083,8 +2071,6 @@ def _source_selects(
     has_hospital_enrollment = available.get("provider_enrollment_hospital", False)
     has_fqhc_enrollment = available.get("provider_enrollment_fqhc", False)
     has_mrf_address = available.get("mrf_address", False)
-    has_ptg_address = available.get("ptg_address", False)
-    has_ptg_address_key = available.get("ptg_address.address_key", has_ptg_address)
     has_provider_directory_practitioner = available.get("provider_directory_practitioner", False)
     has_provider_directory_organization = available.get("provider_directory_organization", False)
     has_provider_directory_location = available.get("provider_directory_location", False)
@@ -2106,7 +2092,6 @@ def _source_selects(
     ffs_address_key = source_address_key("provider_enrollment_ffs_address", "fa")
     facility_address_key = source_address_key("facility_anchor", "fa")
     mrf_address_key = source_address_key("mrf_address", "a")
-    ptg_address_key = source_address_key("ptg_address", "p")
     provider_directory_address_key = (
         """
         CASE
@@ -2211,12 +2196,6 @@ def _source_selects(
                  ORDER BY pa.npi, pa.checksum
             )
         """
-    ptg_npi_join = f"LEFT JOIN {db_schema}.npi AS n ON n.npi = p.npi" if has_npi else ""
-    ptg_archive_join = (
-        f"LEFT JOIN {db_schema}.address_archive_v2 AS aa ON aa.address_key = p.address_key"
-        if has_archive and has_ptg_address_key
-        else ""
-    )
     nppes_zip_restore_join = _nppes_zip_restore_join(db_schema) if has_archive else ""
     nppes_postal_code = _nppes_postal_code_expr(db_schema, alias="a") if has_archive else "a.postal_code"
     if has_npi_address:
@@ -2242,7 +2221,6 @@ def _source_selects(
                 ARRAY[]::varchar[] AS ptg_source_array,
                 ARRAY[]::varchar[] AS group_plan_array,
                 '{BASE_ADDRESS_VERSION}'::varchar AS base_address_version,
-                NULL::varchar AS ptg_address_version,
                 a.first_line::varchar AS first_line,
                 a.second_line::varchar AS second_line,
                 a.city_name::varchar AS city_name,
@@ -2290,7 +2268,6 @@ def _source_selects(
                 ARRAY[]::varchar[] AS ptg_source_array,
                 ARRAY[]::varchar[] AS group_plan_array,
                 '{BASE_ADDRESS_VERSION}'::varchar AS base_address_version,
-                NULL::varchar AS ptg_address_version,
                 d.address_line1::varchar AS first_line,
                 d.address_line2::varchar AS second_line,
                 d.city::varchar AS city_name,
@@ -2338,7 +2315,6 @@ def _source_selects(
                 ARRAY[]::varchar[] AS ptg_source_array,
                 ARRAY[]::varchar[] AS group_plan_array,
                 '{BASE_ADDRESS_VERSION}'::varchar AS base_address_version,
-                NULL::varchar AS ptg_address_version,
                 NULL::varchar AS first_line,
                 NULL::varchar AS second_line,
                 fa.city::varchar AS city_name,
@@ -2598,7 +2574,6 @@ def _source_selects(
                 ARRAY[]::varchar[] AS ptg_source_array,
                 ARRAY[]::varchar[] AS group_plan_array,
                 '{BASE_ADDRESS_VERSION}'::varchar AS base_address_version,
-                NULL::varchar AS ptg_address_version,
                 fa.address_line1::varchar AS first_line,
                 NULL::varchar AS second_line,
                 fa.city::varchar AS city_name,
@@ -2646,7 +2621,6 @@ def _source_selects(
                 ARRAY[]::varchar[] AS ptg_source_array,
                 ARRAY[]::varchar[] AS group_plan_array,
                 '{BASE_ADDRESS_VERSION}'::varchar AS base_address_version,
-                NULL::varchar AS ptg_address_version,
                 a.first_line::varchar AS first_line,
                 a.second_line::varchar AS second_line,
                 a.city_name::varchar AS city_name,
@@ -2754,7 +2728,6 @@ def _source_selects(
                 ARRAY[]::varchar[] AS ptg_source_array,
                 ARRAY[]::varchar[] AS group_plan_array,
                 '{BASE_ADDRESS_VERSION}'::varchar AS base_address_version,
-                NULL::varchar AS ptg_address_version,
                 pd.first_line::varchar AS first_line,
                 pd.second_line::varchar AS second_line,
                 pd.city_name::varchar AS city_name,
@@ -2875,7 +2848,6 @@ def _source_selects(
                 ARRAY[]::varchar[] AS ptg_source_array,
                 ARRAY[]::varchar[] AS group_plan_array,
                 '{BASE_ADDRESS_VERSION}'::varchar AS base_address_version,
-                NULL::varchar AS ptg_address_version,
                 pd.first_line::varchar AS first_line,
                 pd.second_line::varchar AS second_line,
                 pd.city_name::varchar AS city_name,
@@ -2915,58 +2887,6 @@ def _source_selects(
             """
         )
 
-    if has_ptg_address:
-        selects.append(
-            f"""
-            SELECT
-                'npi'::varchar AS entity_type,
-                p.npi::varchar AS entity_id,
-                p.npi::bigint AS npi,
-                NULL::bigint AS inferred_npi,
-                NULL::float8 AS inference_confidence,
-                NULL::varchar AS inference_method,
-                {(_npi_entity_name_expr('n') if has_npi else 'NULL::varchar')} AS entity_name,
-                {(_npi_entity_subtype_expr('n') if has_npi else 'NULL::varchar')} AS entity_subtype,
-                'practice'::varchar AS type,
-                {('COALESCE(pa.taxonomy_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS taxonomy_array,
-                {('COALESCE(pa.plans_network_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS plans_network_array,
-                {('COALESCE(pa.procedures_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS procedures_array,
-                {('COALESCE(pa.medications_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS medications_array,
-                ARRAY[]::varchar[] AS aca_plan_array,
-                ARRAY[]::varchar[] AS aca_network_array,
-                COALESCE(p.ptg_plan_array, ARRAY[]::varchar[])::varchar[] AS ptg_plan_array,
-                CASE
-                    WHEN COALESCE(CARDINALITY(p.ptg_source_array), 0) = 0 THEN ARRAY[p.source_key]::varchar[]
-                    ELSE p.ptg_source_array
-                END::varchar[] AS ptg_source_array,
-                COALESCE(p.group_plan_array, ARRAY[]::varchar[])::varchar[] AS group_plan_array,
-                COALESCE(p.base_address_version, '{BASE_ADDRESS_VERSION}')::varchar AS base_address_version,
-                ('ptg:' || p.snapshot_id)::varchar AS ptg_address_version,
-                {('aa.first_line::varchar' if has_archive else 'NULL::varchar')} AS first_line,
-                {('aa.second_line::varchar' if has_archive else 'NULL::varchar')} AS second_line,
-                {('COALESCE(aa.city_name, p.city_norm)::varchar' if has_archive else 'p.city_norm::varchar')} AS city_name,
-                {('COALESCE(aa.state_name, p.state_code)::varchar' if has_archive else 'p.state_code::varchar')} AS state_name,
-                {('COALESCE(aa.postal_code, p.zip5)::varchar' if has_archive else 'p.zip5::varchar')} AS postal_code,
-                'US'::varchar AS country_code,
-                NULL::varchar AS telephone_number,
-                NULL::varchar AS fax_number,
-                {('aa.formatted_address::varchar' if has_archive else 'NULL::varchar')} AS formatted_address,
-                p.lat::numeric AS lat,
-                p.long::numeric AS long,
-                NULL::date AS date_added,
-                NULL::varchar AS place_id,
-                {ptg_address_key} AS address_key,
-                COALESCE(p.updated_at, NOW())::timestamp AS updated_at,
-                'ptg'::varchar AS address_source,
-                ('ptg:' || p.source_key || ':' || p.snapshot_id || ':' || p.location_key)::varchar AS source_record_id
-              FROM {db_schema}.ptg_address AS p
-              {ptg_npi_join}
-              {ptg_pa_from}
-              {ptg_archive_join}
-             WHERE p.npi IS NOT NULL
-            """
-        )
-
     if test_limit_per_source and test_limit_per_source > 0:
         return [
             "(\n"
@@ -2981,27 +2901,6 @@ def _string_array_literal(values: list[str]) -> str:
     if not values:
         raise ValueError("values must be non-empty")
     return "ARRAY[" + ", ".join(_sql_literal(value) for value in values) + "]::varchar[]"
-
-
-def _ptg_source_key_filter(
-    db_schema: str,
-    source_keys: list[str],
-    *,
-    column_sql: str = "p.source_key",
-) -> str:
-    if not source_keys:
-        raise ValueError("source_keys must be non-empty for PTG partial refresh")
-    source_literals = ", ".join(_sql_literal(source_key) for source_key in source_keys)
-    source_array = _string_array_literal(source_keys)
-    return (
-        f"({column_sql} IN ({source_literals}) "
-        f"OR COALESCE(p.ptg_source_array, ARRAY[]::varchar[]) && {source_array} "
-        "OR EXISTS ("
-        f"SELECT 1 FROM {db_schema}.{EntityAddressUnified.__main_table__} AS live "
-        "WHERE live.location_key = p.location_key "
-        f"AND {_entity_address_ptg_source_overlap_sql(source_keys, alias='live')}"
-        "))"
-    )
 
 
 def _entity_address_evidence_group_match_sql(group_alias: str, row_alias: str) -> str:
@@ -3022,44 +2921,8 @@ def _entity_address_evidence_group_match_sql(group_alias: str, row_alias: str) -
     )
 
 
-def _ptg_partial_affected_group_table_name(stage_table: str) -> str:
-    return _archived_identifier(stage_table, "_ptg_groups")
-
-
 def _provider_directory_partial_affected_group_table_name(stage_table: str) -> str:
     return _archived_identifier(stage_table, "_pd_groups")
-
-
-def _prepare_ptg_partial_affected_groups_sql(db_schema: str, group_table: str, source_keys: list[str]) -> str:
-    return f"""
-    CREATE UNLOGGED TABLE {db_schema}.{group_table} AS
-    SELECT DISTINCT
-        live.entity_type::varchar AS entity_type,
-        live.entity_id::varchar AS entity_id,
-        live.address_key::uuid AS address_key,
-        {_street_soft_norm_expr("live.first_line")}::varchar AS street_key,
-        {_alnum_norm_expr("live.city_name")}::varchar AS city_key,
-        {_state_norm_expr("live.state_name")}::varchar AS state_key,
-        {_zip5_norm_expr("live.postal_code")}::varchar AS zip_key,
-        {_state_norm_expr("live.country_code")}::varchar AS country_key
-      FROM {db_schema}.{EntityAddressUnified.__main_table__} AS live
-     WHERE {_entity_address_ptg_source_overlap_sql(source_keys, alias="live")}
-       AND live.location_key IS NOT NULL
-    UNION
-    SELECT DISTINCT
-        'npi'::varchar AS entity_type,
-        p.npi::varchar AS entity_id,
-        p.address_key::uuid AS address_key,
-        NULL::varchar AS street_key,
-        {_alnum_norm_expr("p.city_norm")}::varchar AS city_key,
-        {_state_norm_expr("p.state_code")}::varchar AS state_key,
-        {_zip5_norm_expr("p.zip5")}::varchar AS zip_key,
-        'us'::varchar AS country_key
-      FROM {db_schema}.ptg_address AS p
-     WHERE p.npi IS NOT NULL
-       AND p.location_key IS NOT NULL
-       AND {_ptg_source_key_filter(db_schema, source_keys)};
-    """
 
 
 def _is_provider_directory_source_select(db_schema: str, source_select: str) -> bool:
@@ -3135,7 +2998,7 @@ def _prepare_provider_directory_partial_affected_groups_sql(
     """
 
 
-def _index_ptg_partial_affected_groups_sql(db_schema: str, group_table: str) -> str:
+def _index_affected_groups_sql(db_schema: str, group_table: str) -> str:
     index_name = _archived_identifier(f"{group_table}_idx_group", "")
     return f"""
     CREATE INDEX {index_name}
@@ -3153,7 +3016,7 @@ def _index_ptg_partial_affected_groups_sql(db_schema: str, group_table: str) -> 
 
 
 def _index_provider_directory_partial_affected_groups_sql(db_schema: str, group_table: str) -> str:
-    return _index_ptg_partial_affected_groups_sql(db_schema, group_table)
+    return _index_affected_groups_sql(db_schema, group_table)
 
 
 def _provider_directory_partial_scope_index_sql(db_schema: str) -> list[str]:
@@ -3183,35 +3046,6 @@ def _affected_group_source_select_sql(db_schema: str, source_select: str, group_
     """
 
 
-def _ptg_partial_source_selects(
-    db_schema: str,
-    source_selects: list[str],
-    *,
-    source_keys: list[str],
-    affected_group_table: str | None = None,
-) -> list[str]:
-    marker = f"FROM {db_schema}.ptg_address AS p"
-    where_marker = "WHERE p.npi IS NOT NULL"
-    filtered: list[str] = []
-    for source_select in source_selects:
-        if marker not in source_select:
-            if affected_group_table:
-                filtered.append(
-                    _affected_group_source_select_sql(db_schema, source_select, affected_group_table)
-                )
-            continue
-        if where_marker not in source_select:
-            raise RuntimeError("PTG source select shape changed; cannot apply ptg-partial source filter")
-        filtered.append(
-            source_select.replace(
-                where_marker,
-                f"{where_marker}\n               AND {_ptg_source_key_filter(db_schema, source_keys)}",
-                1,
-            )
-        )
-    return filtered
-
-
 def _provider_directory_partial_source_selects(
     db_schema: str,
     source_selects: list[str],
@@ -3239,44 +3073,6 @@ def _entity_address_column_names() -> list[str]:
 
 def _entity_address_column_list() -> str:
     return ", ".join(_entity_address_column_names())
-
-
-def _entity_address_ptg_source_overlap_sql(source_keys: list[str], *, alias: str = "live") -> str:
-    return (
-        f"COALESCE({alias}.ptg_source_array, ARRAY[]::varchar[]) "
-        f"&& {_string_array_literal(source_keys)}"
-    )
-
-
-def _entity_address_reuse_live_rows_sql(
-    db_schema: str,
-    stage_table: str,
-    raw_table: str,
-    *,
-    source_keys: list[str],
-    affected_group_table: str | None = None,
-) -> str:
-    columns = _entity_address_column_list()
-    affected_group_exclusion = ""
-    if affected_group_table:
-        affected_group_exclusion = f"""
-       AND NOT EXISTS (
-            SELECT 1
-              FROM {db_schema}.{affected_group_table} AS affected
-             WHERE {_entity_address_evidence_group_match_sql("affected", "live")}
-       )"""
-    return f"""
-    INSERT INTO {db_schema}.{stage_table} ({columns})
-    SELECT {columns}
-      FROM {db_schema}.{EntityAddressUnified.__main_table__} AS live
-     WHERE NOT ({_entity_address_ptg_source_overlap_sql(source_keys, alias="live")})
-       {affected_group_exclusion}
-       AND NOT EXISTS (
-            SELECT 1
-              FROM {db_schema}.{raw_table} AS raw
-             WHERE raw.location_key = live.location_key
-       );
-    """
 
 
 def _delete_live_entity_for_affected_groups_sql(
@@ -3345,31 +3141,6 @@ def _partial_main_patch_sql(
             _insert_stage_entity_into_live_sql(db_schema, live_table, stage_table),
         ),
     ]
-
-
-async def _copy_reusable_entity_address_rows(
-    db_schema: str,
-    stage_table: str,
-    raw_table: str,
-    *,
-    source_keys: list[str],
-    affected_group_table: str | None = None,
-) -> int:
-    if not await _table_exists(db_schema, EntityAddressUnified.__main_table__):
-        raise RuntimeError(
-            "entity-address-unified ptg-partial refresh requested, but the live "
-            "entity_address_unified table does not exist; run refresh_mode=full first."
-        )
-    rowcount = await db.status(
-        _entity_address_reuse_live_rows_sql(
-            db_schema,
-            stage_table,
-            raw_table,
-            source_keys=source_keys,
-            affected_group_table=affected_group_table,
-        )
-    )
-    return int(rowcount or 0)
 
 
 def _integer_ranges(min_value: int | None, max_value: int | None, shards: int) -> list[tuple[int, int]]:
@@ -3538,7 +3309,6 @@ def _prepare_raw_stage_sql(db_schema: str, raw_table: str, *, unlogged: bool = T
         ptg_source_array varchar[] NOT NULL DEFAULT '{{}}',
         group_plan_array varchar[] NOT NULL DEFAULT '{{}}',
         base_address_version varchar(64),
-        ptg_address_version varchar(64),
         checksum bigint NOT NULL
     );
     """
@@ -4160,7 +3930,6 @@ def _insert_raw_from_source_sql(
         ptg_source_array,
         group_plan_array,
         base_address_version,
-        ptg_address_version,
         first_line,
         second_line,
         city_name,
@@ -4209,7 +3978,6 @@ def _insert_raw_from_source_sql(
             COALESCE(ptg_source_array, ARRAY[]::varchar[])::varchar[] AS ptg_source_array,
             COALESCE(group_plan_array, ARRAY[]::varchar[])::varchar[] AS group_plan_array,
             NULLIF(TRIM(base_address_version), '')::varchar AS base_address_version,
-            NULLIF(TRIM(ptg_address_version), '')::varchar AS ptg_address_version,
             NULLIF(TRIM(first_line), '')::varchar AS first_line,
             NULLIF(TRIM(second_line), '')::varchar AS second_line,
             NULLIF(TRIM(city_name), '')::varchar AS city_name,
@@ -4255,7 +4023,6 @@ def _insert_raw_from_source_sql(
             ptg_source_array,
             group_plan_array,
             base_address_version,
-            ptg_address_version,
             first_line,
             second_line,
             city_name,
@@ -4309,7 +4076,6 @@ def _insert_raw_from_source_sql(
         ptg_source_array,
         group_plan_array,
         base_address_version,
-        ptg_address_version,
         first_line,
         second_line,
         city_name,
@@ -4500,7 +4266,6 @@ def _materialize_from_raw_sql(
         ptg_source_array,
         group_plan_array,
         base_address_version,
-        ptg_address_version,
         checksum,
         type,
         taxonomy_array,
@@ -4546,7 +4311,6 @@ def _materialize_from_raw_sql(
             bit_or(COALESCE(address_source_mask, 0))::bigint AS address_source_mask,
             MIN(COALESCE(location_confidence_id, 0))::smallint AS location_confidence_id,
             (ARRAY_AGG(base_address_version ORDER BY source_priority ASC, updated_at DESC NULLS LAST))[1]::varchar AS base_address_version,
-            (ARRAY_AGG(ptg_address_version ORDER BY source_priority ASC, updated_at DESC NULLS LAST))[1]::varchar AS ptg_address_version,
             (ARRAY_AGG(checksum ORDER BY source_priority ASC, updated_at DESC NULLS LAST, LENGTH(COALESCE(first_line, '')) DESC, source_record_id ASC))[1]::bigint AS checksum,
             MAX(npi)::bigint AS npi,
             MAX(inferred_npi)::bigint AS inferred_npi,
@@ -4626,7 +4390,6 @@ def _materialize_from_raw_sql(
         COALESCE(source_record_ids, ARRAY[]::varchar[]) AS source_record_ids,
         {array_selects},
         base_address_version,
-        ptg_address_version,
         checksum,
         type,
         taxonomy_array,
@@ -5648,30 +5411,6 @@ def _ptg_bridge_sql(
            AND NULLIF(plan_id.value, '') IS NOT NULL
            AND NULLIF(split_part(record_id.value, ':', 2), '') IS NOT NULL
            AND NULLIF(split_part(record_id.value, ':', 3), '') IS NOT NULL
-    ),
-    array_bridge AS (
-        SELECT DISTINCT
-            t.location_key,
-            t.entity_type,
-            t.entity_id,
-            source_key.value AS source_key,
-            NULLIF(regexp_replace(COALESCE(t.ptg_address_version, ''), '^ptg:', ''), '') AS snapshot_id,
-            plan_id.value AS ptg_plan_id
-          FROM {db_schema}.{stage_table} AS t
-          JOIN LATERAL unnest(COALESCE(t.ptg_source_array, ARRAY[]::varchar[])) AS source_key(value) ON TRUE
-          JOIN LATERAL unnest(COALESCE(t.ptg_plan_array, ARRAY[]::varchar[])) AS plan_id(value) ON TRUE
-         WHERE t.location_key IS NOT NULL
-           {affected_filter}
-           AND NULLIF(source_key.value, '') IS NOT NULL
-           AND NULLIF(plan_id.value, '') IS NOT NULL
-           AND NULLIF(regexp_replace(COALESCE(t.ptg_address_version, ''), '^ptg:', ''), '') IS NOT NULL
-           AND NOT EXISTS (
-                SELECT 1
-                  FROM source_record_bridge AS existing
-                 WHERE existing.location_key = t.location_key
-                   AND existing.entity_type = t.entity_type
-                   AND existing.entity_id = t.entity_id
-           )
     )
     SELECT DISTINCT
         location_key,
@@ -5680,16 +5419,7 @@ def _ptg_bridge_sql(
         source_key,
         snapshot_id,
         ptg_plan_id
-      FROM source_record_bridge
-    UNION
-    SELECT DISTINCT
-        location_key,
-        entity_type,
-        entity_id,
-        source_key,
-        snapshot_id,
-        ptg_plan_id
-      FROM array_bridge;
+      FROM source_record_bridge;
     """
 
 
@@ -8939,14 +8669,10 @@ async def process_data(ctx, task=None):
     test_mode = bool(context.get("test_mode", False))
     context["publish_requested"] = _publish_requested(task, test_mode=test_mode)
     refresh_mode = _entity_address_refresh_mode(task)
-    partial_ptg_refresh = refresh_mode == ENTITY_ADDRESS_REFRESH_MODE_PTG_PARTIAL
     partial_provider_directory_refresh = (
         refresh_mode == ENTITY_ADDRESS_REFRESH_MODE_PROVIDER_DIRECTORY_PARTIAL
     )
-    partial_source_refresh = partial_ptg_refresh or partial_provider_directory_refresh
-    ptg_source_keys = _entity_address_ptg_source_keys(task) if partial_ptg_refresh else []
-    if partial_ptg_refresh and not ptg_source_keys:
-        raise RuntimeError("entity-address-unified ptg-partial refresh requires ptg_source_key.")
+    partial_source_refresh = partial_provider_directory_refresh
     provider_directory_partial_scope = (
         _entity_address_provider_directory_partial_scope(task)
         if partial_provider_directory_refresh
@@ -8963,7 +8689,6 @@ async def process_data(ctx, task=None):
         else None
     )
     context["refresh_mode"] = refresh_mode
-    context["partial_ptg_source_keys"] = ptg_source_keys
     context["partial_provider_directory_refresh"] = partial_provider_directory_refresh
     context["partial_provider_directory_scope"] = provider_directory_partial_scope
     aggregate_source_record_ids = _aggregate_source_record_ids()
@@ -8996,8 +8721,7 @@ async def process_data(ctx, task=None):
     if not ctx["context"].get("stage_prepared"):
         await _ensure_schema_exists(db_schema)
         unlogged_stage = (
-            not partial_ptg_refresh
-            and not reuse_stage
+            not reuse_stage
             and _env_bool(
                 "HLTHPRT_ENTITY_ADDRESS_UNIFIED_UNLOGGED_STAGE",
                 DEFAULT_UNLOGGED_STAGE,
@@ -9041,7 +8765,6 @@ async def process_data(ctx, task=None):
         "facility_anchor_npi_override",
         "facility_anchor_npi_candidate",
         "mrf_address",
-        "ptg_address",
         "provider_directory_practitioner",
         "provider_directory_organization",
         "provider_directory_location",
@@ -9056,7 +8779,6 @@ async def process_data(ctx, task=None):
         "provider_enrollment_ffs_address",
         "facility_anchor",
         "mrf_address",
-        "ptg_address",
         "provider_directory_location",
     ):
         available[f"{table_name}.address_key"] = (
@@ -9130,71 +8852,7 @@ async def process_data(ctx, task=None):
         provider_directory_run_id=provider_directory_run_id,
     )
     affected_group_table: str | None = None
-    if partial_ptg_refresh:
-        if not await _table_exists(db_schema, EntityAddressUnified.__main_table__):
-            raise RuntimeError(
-                "entity-address-unified ptg-partial refresh requested, but the live "
-                "entity_address_unified table does not exist; run refresh_mode=full first."
-            )
-        affected_group_table = _ptg_partial_affected_group_table_name(stage_table)
-        context["partial_ptg_affected_group_table"] = affected_group_table
-        await db.status(f"DROP TABLE IF EXISTS {db_schema}.{affected_group_table};")
-        await _run_sql_phase(
-            _prepare_ptg_partial_affected_groups_sql(
-                db_schema,
-                affected_group_table,
-                ptg_source_keys,
-            ),
-            context=context,
-            run_id=run_id,
-            phase="entity-address-unified preparing affected PTG groups",
-            unit="tables",
-            done=0,
-            total=1,
-            message="preparing affected PTG evidence groups",
-            emit_start=True,
-            emit_done=True,
-        )
-        await _run_sql_phase(
-            _index_ptg_partial_affected_groups_sql(db_schema, affected_group_table),
-            context=context,
-            run_id=run_id,
-            phase="entity-address-unified indexing affected PTG groups",
-            unit="indexes",
-            done=0,
-            total=1,
-            message="indexing affected PTG evidence groups",
-            emit_start=True,
-            emit_done=True,
-        )
-        await _run_sql_phase(
-            f"ANALYZE {db_schema}.{affected_group_table};",
-            context=context,
-            run_id=run_id,
-            phase="entity-address-unified analyzing affected PTG groups",
-            unit="tables",
-            done=0,
-            total=1,
-            message="analyzing affected PTG evidence groups",
-            emit_start=True,
-            emit_done=True,
-        )
-        affected_group_rows = int(
-            await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{affected_group_table};") or 0
-        )
-        context["partial_ptg_affected_groups"] = affected_group_rows
-        source_selects = _ptg_partial_source_selects(
-            db_schema,
-            source_selects,
-            source_keys=ptg_source_keys,
-            affected_group_table=affected_group_table,
-        )
-        if not source_selects:
-            raise RuntimeError(
-                "entity-address-unified ptg-partial refresh requires an available ptg_address source table."
-            )
-        context["partial_ptg_source_selects"] = len(source_selects)
-    elif partial_provider_directory_refresh:
+    if partial_provider_directory_refresh:
         if not await _table_exists(db_schema, EntityAddressUnified.__main_table__):
             raise RuntimeError(
                 "entity-address-unified provider-directory-partial refresh requested, but the live "
@@ -9352,27 +9010,6 @@ async def process_data(ctx, task=None):
     context["build_network_bridge"] = build_network_bridge
     context.setdefault("partial_support_patch_publish", False)
     context.setdefault("partial_main_patch_publish", False)
-    context["partial_ptg_support_bridge_reuse"] = False
-    context["partial_ptg_support_patch_publish"] = False
-    context["partial_ptg_main_patch_publish"] = False
-    if partial_ptg_refresh and affected_group_table:
-        support_reuse_available = await _support_bridge_reuse_available(
-            db_schema,
-            build_network_bridge=build_network_bridge,
-        )
-        context["partial_ptg_support_bridge_reuse"] = support_reuse_available
-        if support_reuse_available:
-            patch_support = _env_bool(
-                "HLTHPRT_ENTITY_ADDRESS_UNIFIED_PTG_PARTIAL_PATCH_SUPPORT",
-                DEFAULT_PTG_PARTIAL_PATCH_SUPPORT,
-            )
-            context["partial_ptg_support_patch_publish"] = patch_support
-            context["partial_ptg_main_patch_publish"] = patch_support and _env_bool(
-                "HLTHPRT_ENTITY_ADDRESS_UNIFIED_PTG_PARTIAL_PATCH_MAIN",
-                DEFAULT_PTG_PARTIAL_PATCH_MAIN,
-            )
-            context["partial_support_patch_publish"] = context["partial_ptg_support_patch_publish"]
-            context["partial_main_patch_publish"] = context["partial_ptg_main_patch_publish"]
 
     if run_id:
         enqueue_live_progress(
@@ -9418,8 +9055,7 @@ async def process_data(ctx, task=None):
         )
         context["aggregate_concurrency"] = aggregate_concurrency
         inline_source_evidence = (
-            not partial_ptg_refresh
-            and _env_bool(
+            _env_bool(
                 "HLTHPRT_ENTITY_ADDRESS_UNIFIED_INLINE_SOURCE_EVIDENCE",
                 DEFAULT_INLINE_SOURCE_EVIDENCE,
             )
@@ -9703,44 +9339,6 @@ async def process_data(ctx, task=None):
             emit_done=True,
         )
         await db.status(f"TRUNCATE TABLE {db_schema}.{stage_table};")
-        if partial_ptg_refresh:
-            if context.get("partial_ptg_main_patch_publish"):
-                reused_rows = 0
-                if run_id:
-                    enqueue_live_progress(
-                        run_id=run_id,
-                        importer="entity-address-unified",
-                        status="running",
-                        phase="entity-address-unified using affected-only stage",
-                        unit="rows",
-                        done=0,
-                        total=0,
-                        pct=55,
-                        message="using affected-only stage for partial PTG main patch",
-                    )
-            else:
-                reused_rows = await _copy_reusable_entity_address_rows(
-                    db_schema,
-                    stage_table,
-                    raw_table,
-                    source_keys=ptg_source_keys,
-                    affected_group_table=affected_group_table,
-                )
-            context["partial_ptg_reused_rows"] = reused_rows
-            if run_id and not context.get("partial_ptg_main_patch_publish"):
-                enqueue_live_progress(
-                    run_id=run_id,
-                    importer="entity-address-unified",
-                    status="running",
-                    phase="entity-address-unified reusing unchanged rows",
-                    unit="rows",
-                    done=reused_rows,
-                    total=reused_rows,
-                    pct=55,
-                    message=f"reused {reused_rows:,} live entity-address rows",
-                )
-        else:
-            context["partial_ptg_reused_rows"] = 0
         if run_id:
             enqueue_live_progress(
                 run_id=run_id,
@@ -10191,15 +9789,6 @@ async def process_data(ctx, task=None):
         support_raw_table = None if partial_source_refresh else raw_table
         support_affected_group_table = None
         copy_unaffected_support_bridges = True
-        if (
-            partial_ptg_refresh
-            and affected_group_table
-            and context.get("partial_ptg_support_bridge_reuse")
-        ):
-            support_affected_group_table = affected_group_table
-            copy_unaffected_support_bridges = not bool(
-                context.get("partial_ptg_support_patch_publish")
-            )
         support_counts = await _populate_support_stage_tables(
             db_schema,
             stage_table,
@@ -10304,7 +9893,7 @@ async def process_data(ctx, task=None):
     final_summary_counts = _final_summary_counts()
     context["final_summary_counts"] = final_summary_counts
     summary_counts = None
-    if not final_summary_counts and not partial_ptg_refresh:
+    if not final_summary_counts:
         aggregated_rows = _phase_timing_rows(context, "entity-address-unified aggregating")
         if aggregated_rows > 0:
             summary_counts = {
@@ -10384,17 +9973,12 @@ async def shutdown(ctx):
     support_stage_classes = {} if serving_only_refresh else _support_stage_classes(import_date)
     affected_group_table = str(
         context.get("partial_affected_group_table")
-        or context.get("partial_ptg_affected_group_table")
         or context.get("partial_provider_directory_affected_group_table")
         or ""
     ).strip()
-    partial_support_patch = bool(
-        context.get("partial_support_patch_publish")
-        or context.get("partial_ptg_support_patch_publish")
-    )
+    partial_support_patch = bool(context.get("partial_support_patch_publish"))
     partial_main_patch = bool(
         context.get("partial_main_patch_publish")
-        or context.get("partial_ptg_main_patch_publish")
         or context.get("partial_provider_directory_main_patch_publish")
     )
     if partial_main_patch and not partial_support_patch and not serving_only_refresh:
@@ -10446,8 +10030,6 @@ async def shutdown(ctx):
                 "rows": stage_rows,
                 "publish_skipped": True,
                 "refresh_mode": context.get("refresh_mode") or ENTITY_ADDRESS_REFRESH_MODE_FULL,
-                "partial_ptg_source_keys": context.get("partial_ptg_source_keys") or [],
-                "partial_ptg_reused_rows": int(context.get("partial_ptg_reused_rows") or 0),
                 "partial_provider_directory_affected_groups": int(
                     context.get("partial_provider_directory_affected_groups") or 0
                 ),
@@ -10575,7 +10157,7 @@ async def shutdown(ctx):
             if partial_support_patch:
                 if not affected_group_table or not await _table_exists(db_schema, affected_group_table):
                     raise RuntimeError(
-                        "entity-address-unified ptg-partial support patch publish requires "
+                        "entity-address-unified support patch publish requires "
                         "the affected group table to remain available through shutdown."
                     )
                 for label, statement in _partial_support_patch_sql(
@@ -10612,11 +10194,6 @@ async def shutdown(ctx):
             or 0
         )
         context["partial_patched_rows"] = stage_rows
-        if (
-            context.get("refresh_mode") == ENTITY_ADDRESS_REFRESH_MODE_PTG_PARTIAL
-            or context.get("partial_ptg_main_patch_publish")
-        ):
-            context["partial_ptg_patched_rows"] = stage_rows
         if (
             context.get("refresh_mode") == ENTITY_ADDRESS_REFRESH_MODE_PROVIDER_DIRECTORY_PARTIAL
             or context.get("partial_provider_directory_main_patch_publish")
@@ -10656,9 +10233,6 @@ async def shutdown(ctx):
         return {
             "rows": published_rows,
             "refresh_mode": context.get("refresh_mode") or ENTITY_ADDRESS_REFRESH_MODE_FULL,
-            "partial_ptg_source_keys": context.get("partial_ptg_source_keys") or [],
-            "partial_ptg_reused_rows": int(context.get("partial_ptg_reused_rows") or 0),
-            "partial_ptg_patched_rows": int(context.get("partial_ptg_patched_rows") or 0),
             "partial_patched_rows": int(context.get("partial_patched_rows") or 0),
             "partial_provider_directory_affected_groups": int(
                 context.get("partial_provider_directory_affected_groups") or 0
@@ -10806,7 +10380,6 @@ async def main(
     limit_per_source: int | None = None,
     publish: bool | None = None,
     refresh_mode: str | None = None,
-    ptg_source_key: str | None = None,
     serving_only_refresh: bool | None = None,
     provider_directory_run_id: str | None = None,
     provider_directory_source_ids: list[str] | tuple[str, ...] | str | None = None,
@@ -10824,8 +10397,6 @@ async def main(
         payload["publish"] = bool(publish)
     if refresh_mode:
         payload["refresh_mode"] = refresh_mode
-    if ptg_source_key:
-        payload["ptg_source_key"] = ptg_source_key
     if serving_only_refresh is not None:
         payload["serving_only_refresh"] = bool(serving_only_refresh)
     if provider_directory_run_id:

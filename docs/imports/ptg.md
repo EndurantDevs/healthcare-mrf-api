@@ -48,16 +48,14 @@ TOC imports can be scoped with repeatable filters:
 
 When filters match a TOC structure containing multiple plans, only the matched plan metadata is attached to imported rows.
 
-After a PTG source publishes a new compact snapshot, `ptg-address` can refresh
-that source without rebuilding unchanged PTG sources:
-
-```bash
-python main.py start ptg-address --refresh-mode partial --source-key <source_key>
-python main.py worker process.PTGAddress --burst
-```
+PTG/TiC files provide contracted price evidence, not authoritative provider
+locations. PTG imports therefore do not publish a separate `ptg_address` cache;
+served addresses come from `entity_address_unified` and its address-bearing
+sources such as NPPES, MRF address tables, CMS Doctors, enrollment, facility
+anchors, and Provider Directory FHIR.
 
 When the source snapshot pointer is promoted through import-control, operators
-can enqueue the chained fast refresh in the same request:
+can optionally enqueue a unified-address refresh in the same request:
 
 ```json
 {
@@ -72,20 +70,14 @@ can enqueue the chained fast refresh in the same request:
 }
 ```
 
-This creates a `ptg-address-entity-refresh` import run with default modes
-`ptg_refresh_mode=partial` and `entity_refresh_mode=ptg-partial`. To run it
+This creates an `entity-address-unified` import run with `refresh_mode=full` and
+records the triggering PTG `source_key`/`snapshot_id` in the run params. To run it
 manually instead, enqueue:
 
 ```bash
-python main.py start ptg-address-entity-refresh --source-key <source_key> --snapshot-id <snapshot_id> --publish
+python main.py start entity-address-unified --refresh-mode full --publish
 python main.py worker process.EntityAddressUnified --burst
 ```
-
-`--refresh-mode full` remains the default and rebuilds every current PTG source.
-The partial path stages a full replacement table by copying live `ptg_address`
-rows for unchanged source keys and recomputing only the requested source. It
-requires an existing live `ptg_address` table and fails closed for
-member-fallback-only snapshots; run the full path in those cases.
 
 ## Main Outputs
 - PTG2 control tables such as `ptg2_import_run`, `ptg2_snapshot`, `ptg2_current_snapshot`, `ptg2_current_source_snapshot`, `ptg2_current_plan_source`, and `ptg2_artifact_manifest`

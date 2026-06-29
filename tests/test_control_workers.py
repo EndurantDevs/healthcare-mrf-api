@@ -14,8 +14,9 @@ def test_worker_registry_exposes_shared_and_finish_workers():
     by_queue = {item["queue"]: item for item in items}
 
     assert by_importer["claims-procedures"]["worker_class"] == "process.ClaimsPricing"
-    assert by_importer["ptg-address"]["worker_class"] == "process.PTGAddress"
-    assert by_importer["ptg-address-entity-refresh"]["worker_class"] == "process.EntityAddressUnified"
+    assert "ptg-address" not in by_importer
+    assert "ptg-address-entity-refresh" not in by_importer
+    assert by_importer["entity-address-unified"]["worker_class"] == "process.EntityAddressUnified"
     assert by_importer["provider-directory-fhir"]["worker_class"] == "process.ProviderDirectoryFHIR"
     assert by_importer["ms-drg"]["worker_class"] == "process.MSDRG"
     assert by_importer["terminology-synonyms"]["worker_class"] == "process.TerminologySynonyms"
@@ -26,9 +27,8 @@ def test_worker_registry_exposes_shared_and_finish_workers():
     assert by_queue["arq:PTGNormal"]["worker_class"] == "process.PTGNormal"
     assert by_queue["arq:PTGLarge"]["worker_class"] == "process.PTGLarge"
     assert by_queue["arq:PTGHuge"]["worker_class"] == "process.PTGHuge"
-    assert "ptg-address-entity-refresh" in by_queue["arq:EntityAddressUnified"]["importers"]
+    assert "entity-address-unified" in by_queue["arq:EntityAddressUnified"]["importers"]
     assert by_queue["arq:PartDFormularyNetwork_finish"]["role"] == "finish"
-    assert by_queue["arq:PTGAddress_finish"]["role"] == "finish"
 
 
 def test_resolve_specs_prefers_finish_role_over_stale_start_queue():
@@ -133,7 +133,7 @@ def test_ensure_worker_uses_explicit_ptg_lane(monkeypatch, tmp_path):
     assert captured["env"]["HLTHPRT_ACTIVE_WORKER_CLASS"] == "process.PTGSmall"
 
 
-def test_ensure_worker_starts_ptg_address_entity_refresh_shared_worker(monkeypatch, tmp_path):
+def test_ensure_worker_starts_entity_address_unified_shared_worker(monkeypatch, tmp_path):
     class FakeProcess:
         pid = 2468
 
@@ -151,7 +151,7 @@ def test_ensure_worker_starts_ptg_address_entity_refresh_shared_worker(monkeypat
     monkeypatch.setattr(control_workers, "_pid_running", lambda pid: pid == FakeProcess.pid)
     monkeypatch.setattr(control_workers, "_pid_matches_spec", lambda pid, spec: True)
 
-    result = control_workers.ensure_worker({"importer": "ptg-address-entity-refresh", "run_id": "run_refresh"})
+    result = control_workers.ensure_worker({"importer": "entity-address-unified", "run_id": "run_refresh"})
 
     assert result["status"] == "started"
     assert result["items"][0]["worker_class"] == "process.EntityAddressUnified"

@@ -1670,12 +1670,11 @@ def provider_directory_ptg_address_corroboration_sql(
     *,
     view_name: str = PTG_PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW,
 ) -> str:
-    """Build a view that corroborates PTG addresses with payer FHIR directory data.
+    """Build a view that corroborates unified addresses with payer FHIR data.
 
-    A match means a payer Provider Directory source links the PTG NPI to a FHIR
-    role/affiliation location whose canonical address_key equals the PTG
-    address_key. This is stronger than NPPES-only inference, but remains
-    distinct from a TiC rate file directly supplying the service location.
+    The relation name is kept for serving compatibility, but this no longer
+    reads PTG/TiC-derived address rows. PTG files prove a provider has a rate;
+    address proof comes from entity_address_unified and the payer directory.
     """
 
     schema = db_schema or _schema()
@@ -1699,7 +1698,20 @@ def provider_directory_ptg_address_corroboration_sql(
     )
     return f"""
     CREATE OR REPLACE VIEW {view_ref} AS
-    WITH practitioner_role_locations AS (
+    WITH address_candidates AS (
+        SELECT
+            COALESCE(e.npi, e.inferred_npi)::bigint AS npi,
+            e.location_key::varchar AS location_key,
+            e.address_key::uuid AS address_key,
+            e.zip5::varchar AS zip5,
+            e.state_code::varchar AS state_code,
+            e.city_norm::varchar AS city_norm
+          FROM {_qt(schema, "entity_address_unified")} e
+         WHERE COALESCE(e.npi, e.inferred_npi) IS NOT NULL
+           AND e.address_key IS NOT NULL
+           AND e.type IN ('practice', 'primary', 'secondary', 'site')
+    ),
+    practitioner_role_locations AS (
         SELECT
             role.source_id,
             role.resource_id AS role_resource_id,
@@ -1719,16 +1731,16 @@ def provider_directory_ptg_address_corroboration_sql(
     ),
     practitioner_matches AS (
         SELECT
-            p.source_key,
-            p.snapshot_id,
-            p.plan_id,
-            p.ptg_plan_id,
-            p.npi,
-            p.location_key,
-            p.address_key,
-            p.zip5,
-            p.state_code,
-            p.city_norm,
+            NULL::varchar AS source_key,
+            NULL::varchar AS snapshot_id,
+            NULL::varchar AS plan_id,
+            NULL::varchar AS ptg_plan_id,
+            e.npi,
+            e.location_key,
+            e.address_key,
+            e.zip5,
+            e.state_code,
+            e.city_norm,
             src.source_id AS provider_directory_source_id,
             src.org_name AS provider_directory_org_name,
             src.plan_name AS provider_directory_plan_name,
@@ -1749,8 +1761,7 @@ def provider_directory_ptg_address_corroboration_sql(
                 AS provider_directory_network_names,
             COALESCE(network_context.provider_directory_network_matches, '[]'::jsonb)
                 AS provider_directory_network_matches,
-            COALESCE(plan_context.provider_directory_plan_context_matched, false)
-                AS provider_directory_plan_context_matched,
+            false AS provider_directory_plan_context_matched,
             COALESCE(network_context.provider_directory_network_context_present, false)
                 AS provider_directory_network_context_present,
             COALESCE(plan_context.provider_directory_insurance_plan_matches, '[]'::jsonb)
@@ -1766,9 +1777,9 @@ def provider_directory_ptg_address_corroboration_sql(
                 COALESCE(practitioner.observed_at, TIMESTAMP 'epoch'),
                 COALESCE(loc.observed_at, TIMESTAMP 'epoch')
             ) AS provider_directory_observed_at
-          FROM {_qt(schema, "ptg_address")} p
+          FROM address_candidates e
           JOIN {_qt(schema, "provider_directory_practitioner")} practitioner
-            ON practitioner.npi = p.npi
+            ON practitioner.npi = e.npi
           JOIN practitioner_role_locations role
             ON role.source_id = practitioner.source_id
            AND {practitioner_ref_match}
@@ -1781,25 +1792,9 @@ def provider_directory_ptg_address_corroboration_sql(
                         THEN loc.address_key::uuid
                     ELSE NULL::uuid
                 END
-           ) = p.address_key
+           ) = e.address_key
           LEFT JOIN LATERAL (
             SELECT
-                COALESCE(
-                    bool_or(
-                        insurance_plan.resource_id IS NOT NULL
-                        AND NULLIF(BTRIM(insurance_plan.plan_identifier), '') IS NOT NULL
-                        AND (
-                            NULLIF(BTRIM(insurance_plan.plan_identifier), '') IN (p.plan_id, p.ptg_plan_id)
-                         OR NULLIF(BTRIM(insurance_plan.plan_identifier), '') = ANY(
-                                COALESCE(p.ptg_plan_array, ARRAY[]::varchar[])
-                            )
-                         OR NULLIF(BTRIM(insurance_plan.plan_identifier), '') = ANY(
-                                COALESCE(p.group_plan_array, ARRAY[]::varchar[])
-                            )
-                        )
-                    ),
-                    false
-                ) AS provider_directory_plan_context_matched,
                 COALESCE(
                     jsonb_agg(
                         DISTINCT jsonb_build_object(
@@ -1861,8 +1856,8 @@ def provider_directory_ptg_address_corroboration_sql(
           ) network_context ON TRUE
           JOIN {_qt(schema, "provider_directory_source")} src
             ON src.source_id = role.source_id
-         WHERE p.npi IS NOT NULL
-           AND p.address_key IS NOT NULL
+         WHERE e.npi IS NOT NULL
+           AND e.address_key IS NOT NULL
     ),
     organization_affiliation_locations AS (
         SELECT
@@ -1884,16 +1879,16 @@ def provider_directory_ptg_address_corroboration_sql(
     ),
     organization_matches AS (
         SELECT
-            p.source_key,
-            p.snapshot_id,
-            p.plan_id,
-            p.ptg_plan_id,
-            p.npi,
-            p.location_key,
-            p.address_key,
-            p.zip5,
-            p.state_code,
-            p.city_norm,
+            NULL::varchar AS source_key,
+            NULL::varchar AS snapshot_id,
+            NULL::varchar AS plan_id,
+            NULL::varchar AS ptg_plan_id,
+            e.npi,
+            e.location_key,
+            e.address_key,
+            e.zip5,
+            e.state_code,
+            e.city_norm,
             src.source_id AS provider_directory_source_id,
             src.org_name AS provider_directory_org_name,
             src.plan_name AS provider_directory_plan_name,
@@ -1914,8 +1909,7 @@ def provider_directory_ptg_address_corroboration_sql(
                 AS provider_directory_network_names,
             COALESCE(network_context.provider_directory_network_matches, '[]'::jsonb)
                 AS provider_directory_network_matches,
-            COALESCE(plan_context.provider_directory_plan_context_matched, false)
-                AS provider_directory_plan_context_matched,
+            false AS provider_directory_plan_context_matched,
             COALESCE(network_context.provider_directory_network_context_present, false)
                 AS provider_directory_network_context_present,
             COALESCE(plan_context.provider_directory_insurance_plan_matches, '[]'::jsonb)
@@ -1931,9 +1925,9 @@ def provider_directory_ptg_address_corroboration_sql(
                 COALESCE(organization.observed_at, TIMESTAMP 'epoch'),
                 COALESCE(loc.observed_at, TIMESTAMP 'epoch')
             ) AS provider_directory_observed_at
-          FROM {_qt(schema, "ptg_address")} p
+          FROM address_candidates e
           JOIN {_qt(schema, "provider_directory_organization")} organization
-            ON organization.npi = p.npi
+            ON organization.npi = e.npi
           JOIN organization_affiliation_locations affiliation
             ON affiliation.source_id = organization.source_id
            AND (
@@ -1949,25 +1943,9 @@ def provider_directory_ptg_address_corroboration_sql(
                         THEN loc.address_key::uuid
                     ELSE NULL::uuid
                 END
-           ) = p.address_key
+           ) = e.address_key
           LEFT JOIN LATERAL (
             SELECT
-                COALESCE(
-                    bool_or(
-                        insurance_plan.resource_id IS NOT NULL
-                        AND NULLIF(BTRIM(insurance_plan.plan_identifier), '') IS NOT NULL
-                        AND (
-                            NULLIF(BTRIM(insurance_plan.plan_identifier), '') IN (p.plan_id, p.ptg_plan_id)
-                         OR NULLIF(BTRIM(insurance_plan.plan_identifier), '') = ANY(
-                                COALESCE(p.ptg_plan_array, ARRAY[]::varchar[])
-                            )
-                         OR NULLIF(BTRIM(insurance_plan.plan_identifier), '') = ANY(
-                                COALESCE(p.group_plan_array, ARRAY[]::varchar[])
-                            )
-                        )
-                    ),
-                    false
-                ) AS provider_directory_plan_context_matched,
                 COALESCE(
                     jsonb_agg(
                         DISTINCT jsonb_build_object(
@@ -2014,8 +1992,8 @@ def provider_directory_ptg_address_corroboration_sql(
           ) network_context ON TRUE
           JOIN {_qt(schema, "provider_directory_source")} src
             ON src.source_id = affiliation.source_id
-         WHERE p.npi IS NOT NULL
-           AND p.address_key IS NOT NULL
+         WHERE e.npi IS NOT NULL
+           AND e.address_key IS NOT NULL
     ),
     matches AS (
         SELECT * FROM practitioner_matches
@@ -2748,7 +2726,7 @@ async def publish_provider_directory_ptg_address_corroboration_if_available(
     db_schema: str | None = None,
 ) -> bool:
     schema = db_schema or _schema()
-    if not await _table_exists(schema, "ptg_address"):
+    if not await _table_exists(schema, "entity_address_unified"):
         return False
     await publish_provider_directory_ptg_address_corroboration_table(schema)
     return True

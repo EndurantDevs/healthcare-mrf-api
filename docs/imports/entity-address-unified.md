@@ -11,24 +11,10 @@ python main.py start entity-address-unified
 python main.py worker process.EntityAddressUnified --burst
 ```
 
-For a PTG-only source refresh after `ptg-address` has published the updated
-source projection, use the conservative partial path:
-
-```bash
-python main.py start entity-address-unified --refresh-mode ptg-partial --ptg-source-key <source_key>
-python main.py worker process.EntityAddressUnified --burst
-```
-
-For source snapshot promotions, prefer the chained `ptg-address-entity-refresh`
-importer or the import-control `refresh_addresses=true` option documented in
-`docs/imports/ptg.md`; it refreshes `ptg_address` first and then runs this
-PTG-partial entity refresh against the same source key.
-
-The partial path reuses the published `entity_address_unified` rows for unchanged
-locations, reloads only the requested PTG source from `ptg_address`, and still
-publishes via the normal stage-table swap. It fails closed and requires
-`--refresh-mode full` when the changed PTG source is already merged with base
-NPI/MRF evidence or with other PTG sources in live rows.
+PTG/TiC price files do not carry authoritative provider locations. Source
+snapshot promotions can optionally trigger this importer through import-control,
+but that runs a normal unified-address refresh from address-bearing sources
+rather than rebuilding a PTG-specific address cache.
 
 ## Source Inputs
 
@@ -151,8 +137,7 @@ runs independent archive, coordinate, practice, and fallback checks in parallel.
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_LIMIT_PER_SOURCE` (bounded pilots only; import-control can also pass `limit_per_source`)
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_PUBLISH` (overrides publish decision; by default test mode skips publish and full mode publishes)
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_SKIP_PUBLISH`
-- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_REFRESH_MODE` (`full` or `ptg-partial`; import-control can also pass `refresh_mode`)
-- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_PTG_SOURCE_KEY` / `HLTHPRT_ENTITY_ADDRESS_UNIFIED_PTG_SOURCE_KEYS` (required for `ptg-partial`; import-control can also pass `ptg_source_key`)
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_REFRESH_MODE` (`full` or `provider-directory-partial`; import-control can also pass `refresh_mode`)
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_REQUIRE_ARCHIVE_COORDINATES` (default `false`; when `true`, publish fails if archive rows still lack coordinates)
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENABLE_INFERENCE` (default `false`; enables automatic NPI inference updates; review candidates are still populated when this is off)
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENABLE_NAME_FALLBACK_INFERENCE` (default `false`; enables expensive broad name+ZIP+street automatic inference after deterministic facility-anchor matches)

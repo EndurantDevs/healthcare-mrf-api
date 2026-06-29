@@ -41,25 +41,26 @@ references first. Address canonical linkage can be filled later through
 `provider_directory_location.address_key`. Network references are resolved to
 FHIR `Organization` names during PTG corroboration so served PTG
 `network_names` can be matched without denormalizing network names into
-`ptg_address`. Raw Provider Directory network names are context only; serving
-should treat them as PTG network proof only after emitting concrete
+PTG price rows. Raw Provider Directory network names are context only; serving
+should treat them as network proof only after emitting concrete
 `provider_directory_network_matches` objects with both `ptg_network_name` and
 `provider_directory_network_name`.
 
 ## PTG Address Corroboration
 
-Provider Directory FHIR can upgrade PTG addresses from NPPES-only inference to
-payer-directory corroboration. The helper
+Provider Directory FHIR can upgrade unified addresses from NPPES-only inference
+to payer-directory corroboration. The helper
 `provider_directory_ptg_address_corroboration_sql()` builds the query shape for
 `ptg_provider_directory_address_corroboration`, which matches:
 
-- `ptg_address.npi` to `provider_directory_practitioner.npi` or
+- `entity_address_unified.npi` / `inferred_npi` to `provider_directory_practitioner.npi` or
   `provider_directory_organization.npi`;
 - FHIR roles/affiliations to referenced FHIR locations; and
-- FHIR `provider_directory_location.address_key` to PTG `ptg_address.address_key`.
+- FHIR `provider_directory_location.address_key` to unified
+  `entity_address_unified.address_key`.
 
 The importer publishes `ptg_provider_directory_address_corroboration` as an
-unlogged table during artifact publishing. This pays the expensive FHIR/PTG join
+unlogged table during artifact publishing. This pays the expensive FHIR/unified-address join
 once after a full import, adds lookup indexes for serving and audit checks, and
 keeps API-side PTG address overlay fast. The disposable smoke helper can still
 build the same relation as a view for small fixture schemas, but normal dev and
