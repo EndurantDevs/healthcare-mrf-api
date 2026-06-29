@@ -360,6 +360,24 @@ def test_provider_directory_coverage_audit_markdown_includes_unified_source_id_a
                     }
                 ],
             },
+            "canonical_resource_summary": {
+                "available": True,
+                "canonical_rows": 160000,
+                "source_edge_rows": 2880000,
+                "edge_surplus_rows": 2720000,
+                "source_count": 18,
+                "canonical_api_base_count": 1,
+                "resources": [
+                    {
+                        "resource_type": "Practitioner",
+                        "canonical_rows": 160000,
+                        "source_edge_rows": 2880000,
+                        "edge_surplus_rows": 2720000,
+                        "source_count": 18,
+                        "canonical_api_base_count": 1,
+                    }
+                ],
+            },
         }
     )
 
@@ -376,6 +394,9 @@ def test_provider_directory_coverage_audit_markdown_includes_unified_source_id_a
     assert "| `apps.availity.com` | `valid_non_fhir` | `OAuth2/SMART` | `onboarding_gateway` | 263 | Aetna / Provider Directory, Availity payer |" in markdown
     assert "## Alias Fan-Out" in markdown
     assert "| `Practitioner` | `https://fhir.humana.com/api` | 18 | 2880000 | 160000 | 2720000 | 18.0 | Humana Inc. |" in markdown
+    assert "- canonical resource storage: `160000` canonical row(s), `2880000` source edge row(s), `2720000` edge surplus row(s)" in markdown
+    assert "## Canonical Resource Storage" in markdown
+    assert "| `Practitioner` | 160000 | 2880000 | 2720000 | 18 | 1 |" in markdown
 
 
 def test_provider_directory_coverage_audit_markdown_includes_skipped_live_sections():

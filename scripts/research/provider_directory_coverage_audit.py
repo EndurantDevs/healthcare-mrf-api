@@ -912,6 +912,67 @@ async def _alias_fanout_summary(conn: asyncpg.Connection, schema: str, *, sample
     }
 
 
+async def _canonical_resource_summary(conn: asyncpg.Connection, schema: str) -> dict[str, Any]:
+    if not await _relation_exists(conn, schema, "provider_directory_canonical_resource"):
+        return {
+            "available": False,
+            "reason": "provider_directory_canonical_resource unavailable",
+            "resources": [],
+        }
+    if not await _relation_exists(conn, schema, "provider_directory_source_resource"):
+        return {
+            "available": False,
+            "reason": "provider_directory_source_resource unavailable",
+            "resources": [],
+        }
+    row = await conn.fetchrow(
+        f"""
+        SELECT (SELECT count(*)::bigint FROM {_qt(schema, "provider_directory_canonical_resource")}) AS canonical_rows,
+               (SELECT count(*)::bigint FROM {_qt(schema, "provider_directory_source_resource")}) AS source_edge_rows,
+               (
+                   SELECT count(DISTINCT source_id)::bigint
+                     FROM {_qt(schema, "provider_directory_source_resource")}
+               ) AS source_count,
+               (
+                   SELECT count(DISTINCT canonical_api_base)::bigint
+                     FROM {_qt(schema, "provider_directory_canonical_resource")}
+               ) AS canonical_api_base_count
+        """
+    )
+    resources = await conn.fetch(
+        f"""
+        SELECT COALESCE(c.resource_type, s.resource_type) AS resource_type,
+               count(DISTINCT (c.canonical_api_base, c.resource_id))::bigint AS canonical_rows,
+               count(s.source_id)::bigint AS source_edge_rows,
+               count(DISTINCT s.source_id)::bigint AS source_count,
+               count(DISTINCT COALESCE(c.canonical_api_base, s.canonical_api_base))::bigint AS canonical_api_base_count
+          FROM {_qt(schema, "provider_directory_canonical_resource")} AS c
+          FULL JOIN {_qt(schema, "provider_directory_source_resource")} AS s
+            ON s.canonical_api_base = c.canonical_api_base
+           AND s.resource_type = c.resource_type
+           AND s.resource_id = c.resource_id
+         GROUP BY 1
+         ORDER BY count(s.source_id) DESC, count(DISTINCT (c.canonical_api_base, c.resource_id)) DESC
+        """
+    )
+    canonical_rows = _int(row["canonical_rows"] if row else 0)
+    source_edge_rows = _int(row["source_edge_rows"] if row else 0)
+    items = []
+    for item_row in resources:
+        item = dict(item_row)
+        item["edge_surplus_rows"] = max(0, _int(item["source_edge_rows"]) - _int(item["canonical_rows"]))
+        items.append(item)
+    return {
+        "available": True,
+        "canonical_rows": canonical_rows,
+        "source_edge_rows": source_edge_rows,
+        "edge_surplus_rows": max(0, source_edge_rows - canonical_rows),
+        "source_count": _int(row["source_count"] if row else 0),
+        "canonical_api_base_count": _int(row["canonical_api_base_count"] if row else 0),
+        "resources": items,
+    }
+
+
 async def _advertised_resource_gap_summary(
     conn: asyncpg.Connection,
     schema: str,
@@ -1285,6 +1346,7 @@ async def build_report(args: argparse.Namespace) -> dict[str, Any]:
             ),
             "capability_status_counts": await _capability_status_counts(conn, schema),
             "resource_summary": await _resource_summary(conn, schema),
+            "canonical_resource_summary": await _canonical_resource_summary(conn, schema),
             "unified_summary": (
                 {"available": False, "skipped": True, "reason": "disabled by --skip-unified"}
                 if args.skip_unified
@@ -1352,6 +1414,7 @@ def render_markdown(report: dict[str, Any]) -> str:
     ptg = report.get("ptg_summary") or {}
     credential_backlog = report.get("credential_onboarding_backlog") or {}
     alias_fanout = report.get("alias_fanout_summary") or {}
+    canonical_resources = report.get("canonical_resource_summary") or {}
     lines = [
         "# Provider Directory Coverage Audit",
         "",
@@ -1376,6 +1439,14 @@ def render_markdown(report: dict[str, Any]) -> str:
         lines.append(
             f"- credential/onboarding backlog: `{credential_backlog.get('blocked_source_count')}` source(s) across `{credential_backlog.get('group_count')}` group(s)"
         )
+    if canonical_resources.get("available"):
+        lines.append(
+            f"- canonical resource storage: `{canonical_resources.get('canonical_rows')}` canonical row(s), "
+            f"`{canonical_resources.get('source_edge_rows')}` source edge row(s), "
+            f"`{canonical_resources.get('edge_surplus_rows')}` edge surplus row(s)"
+        )
+    elif canonical_resources.get("reason"):
+        lines.append(f"- canonical resource storage: unavailable ({canonical_resources.get('reason')})")
     if unified.get("available"):
         lines.extend(
             [
@@ -1552,6 +1623,20 @@ def render_markdown(report: dict[str, Any]) -> str:
                 lines.append(
                     f"| `{resource.get('resource_type')}` | `{_markdown_cell(item.get('api_base'))}` | {item.get('source_count')} | {item.get('source_resource_rows')} | {item.get('distinct_resource_ids')} | {item.get('excess_source_resource_rows')} | {item.get('fanout_ratio')} | {_markdown_cell(sample)} |"
                 )
+    if canonical_resources.get("resources"):
+        lines.extend(
+            [
+                "",
+                "## Canonical Resource Storage",
+                "",
+                "| Resource | Canonical rows | Source edges | Edge surplus | Sources | API bases |",
+                "| --- | ---: | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for item in canonical_resources["resources"]:
+            lines.append(
+                f"| `{item.get('resource_type')}` | {item.get('canonical_rows')} | {item.get('source_edge_rows')} | {item.get('edge_surplus_rows')} | {item.get('source_count')} | {item.get('canonical_api_base_count')} |"
+            )
     lines.append("")
     return "\n".join(lines)
 
