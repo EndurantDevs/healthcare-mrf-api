@@ -1010,6 +1010,15 @@ async def test_import_run_request_paths_do_not_run_ddl(monkeypatch):
     assert row["status"] == "queued"
 
 
+def test_normalize_triggered_by_bounds_database_value():
+    assert control_imports._normalize_triggered_by("") == "api"
+    assert (
+        control_imports._normalize_triggered_by("codex-retry-after-read-deadline-deploy")
+        == "codex-retry-after-read-deadline"
+    )
+    assert len(control_imports._normalize_triggered_by("x" * 100)) == control_imports.MAX_TRIGGERED_BY_LENGTH
+
+
 @pytest.mark.asyncio
 async def test_list_import_runs_page_returns_next_cursor(monkeypatch):
     now = control_imports.utc_now()

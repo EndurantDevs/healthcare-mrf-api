@@ -30,6 +30,7 @@ ACTIVE_STATUSES = {"queued", "starting", "running", "finalizing", "canceling"}
 TERMINAL_STATUSES = {"succeeded", "failed", "canceled", "dead_letter"}
 CANCEL_FLAG_TTL_SECONDS = 7 * 24 * 60 * 60
 MAX_IMPORT_RUN_LIST_LIMIT = 200
+MAX_TRIGGERED_BY_LENGTH = 32
 _IMPORT_RUN_ENSURE_LOCK = asyncio.Lock()
 _IMPORT_RUN_ENSURED = False
 _IMPORT_RUN_ADVISORY_LOCK_KEY = 44_706_101_200_001
@@ -774,6 +775,11 @@ def _allows_parallel_active_importer_runs(
     return bool(source_file_import_id and idempotency_key)
 
 
+def _normalize_triggered_by(value: Any) -> str:
+    triggered_by = str(value or "api").strip() or "api"
+    return triggered_by[:MAX_TRIGGERED_BY_LENGTH].rstrip("-_:. ") or "api"
+
+
 async def create_import_run(payload: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     importer = str(payload.get("importer") or "").strip()
     if importer not in importer_names():
@@ -801,7 +807,7 @@ async def create_import_run(payload: dict[str, Any]) -> tuple[dict[str, Any], bo
         "phase_detail": "created",
         "params": payload.get("params") if isinstance(payload.get("params"), dict) else {},
         "idempotency_key": idempotency_key,
-        "triggered_by": str(payload.get("triggered_by") or "api"),
+        "triggered_by": _normalize_triggered_by(payload.get("triggered_by")),
         "schedule_id": payload.get("schedule_id"),
         "subscription_id": payload.get("subscription_id"),
         "source_file_import_id": payload.get("source_file_import_id"),
