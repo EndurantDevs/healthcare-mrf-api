@@ -812,6 +812,29 @@ def test_candidate_text_filter_matches_public_aliases():
     )
 
 
+def test_candidate_query_expansion_keeps_searchable_platform_sources():
+    sapphire = discovery.SourceCandidate(
+        payer_name="BCBS Louisiana",
+        provider="master-list",
+        index_url="https://bcbsla.sapphiremrfhub.com/",
+        hosting_platform="sapphire",
+    )
+    direct_group = discovery.SourceCandidate(
+        payer_name="Example Employer",
+        provider="master-list",
+        index_url="https://example.test/current_index.json",
+        hosting_platform="direct_toc",
+    )
+
+    assert discovery._candidate_supports_source_query_expansion(sapphire)
+    assert not discovery._candidate_supports_source_query_expansion(direct_group)
+    expanded = discovery._candidate_with_target_payer_query(
+        sapphire, "Plastipak Packaging"
+    )
+    assert expanded.raw_payload["target_payer_query"] == "Plastipak Packaging"
+    assert expanded.raw_payload["query_expansion_source"] is True
+
+
 def test_parse_master_list_prefers_active_duplicate_over_unsupported_fragment():
     markdown = """
 ## C. Regional, provider-sponsored, Medicaid-MCO, DTC & TPA payers
@@ -3111,6 +3134,49 @@ async def test_crawl_target_limit_caps_persisted_target_rows(monkeypatch):
         "Example Plan 0",
         "Example Plan 1",
     ]
+
+
+@pytest.mark.asyncio
+async def test_resolve_crawl_targets_filters_query_expansion_matches(monkeypatch):
+    source = {
+        "source_id": "source_1",
+        "payer_id": "payer_1",
+        "display_name": "BCBS Louisiana",
+        "metadata_json": {"raw": {"target_payer_query": "Example Employer"}},
+    }
+    targets = [
+        discovery.CrawlTarget(
+            source=source,
+            url="https://example.sapphiremrfhub.com/tocs/current/example-employer",
+            label="Example Employer",
+            metadata={"payer_name": "Example Employer", "file_name": "example-employer"},
+        ),
+        discovery.CrawlTarget(
+            source=source,
+            url="https://example.sapphiremrfhub.com/tocs/current/other-employer",
+            label="Other Employer",
+            metadata={"payer_name": "Other Employer", "file_name": "other-employer"},
+        ),
+    ]
+
+    async def fake_crawl_targets_for_source(*_args, **_kwargs):
+        return targets
+
+    monkeypatch.setattr(
+        discovery, "_crawl_targets_for_source", fake_crawl_targets_for_source
+    )
+
+    resolved, observations = await discovery._resolve_crawl_targets(
+        [{**source, "index_url": "https://example.sapphiremrfhub.com/"}],
+        session=None,
+        run_id="run_1",
+        concurrency=2,
+    )
+
+    assert observations == []
+    assert [target.label for target in resolved] == ["Example Employer"]
+    assert resolved[0].metadata["query_expansion_match"] is True
+    assert resolved[0].metadata["company_name"] == "Example Employer"
 
 
 @pytest.mark.asyncio
@@ -5970,6 +6036,46 @@ def test_parse_sapphire_toc_links_extracts_embedded_relative_tocs():
             "file_name": "2026-06-01_example_index.json",
         }
     ]
+
+
+def test_sapphire_query_slug_variants_normalize_company_suffixes():
+    assert discovery._sapphire_query_slug_variants("Example Packaging, Inc.") == [
+        "example-packaging-inc",
+        "example-packaging",
+    ]
+    assert discovery._sapphire_query_slug_variants("Example Limited Liability Company") == [
+        "example-llc",
+        "example",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sapphire_query_probe_targets_keep_existing_current_tocs(monkeypatch):
+    source = {
+        "source_id": "source_1",
+        "payer_id": "payer_1",
+        "display_name": "BCBS Louisiana",
+    }
+
+    async def fake_head_url(url, **_kwargs):
+        return {
+            "status": "ok" if url.endswith("/example-packaging-inc") else "failed",
+            "checked_at": discovery._utc_now(),
+        }
+
+    monkeypatch.setattr(discovery, "_head_url", fake_head_url)
+
+    targets = await discovery._sapphire_query_probe_targets(
+        source,
+        "https://bcbsla.sapphiremrfhub.com/",
+        "Example Packaging Inc",
+        None,
+    )
+
+    assert [target.url for target in targets] == [
+        "https://bcbsla.sapphiremrfhub.com/tocs/current/example-packaging-inc"
+    ]
+    assert targets[0].metadata["company_name"] == "Example Packaging Inc"
 
 
 def test_sapphire_static_query_hashes_are_loaded_from_gatsby_page_data():

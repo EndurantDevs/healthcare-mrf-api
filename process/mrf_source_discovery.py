@@ -17,7 +17,7 @@ import re
 import socket
 import ssl
 import zipfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Iterable
@@ -93,6 +93,11 @@ MRF_URL_OBSERVATION_NULLABLE_KEYS = (
 )
 _SOURCE_CONFIG_CACHE: dict[str, Any] | None = None
 _SSL_CONTEXT: ssl.SSLContext | None = None
+DEFAULT_SOURCE_QUERY_EXPANSION_PLATFORMS = (
+    "sapphire",
+    "uhc_public_blobs",
+    "mymedicalshopper_talon",
+)
 
 
 @dataclass(frozen=True)
@@ -228,6 +233,17 @@ def _platform_resolver_config(platform: str | None) -> dict[str, Any]:
     resolvers = _source_config().get("platform_resolvers") or {}
     config = resolvers.get(str(platform))
     return dict(config) if isinstance(config, dict) else {}
+
+
+def _source_query_expansion_platforms() -> set[str]:
+    values = _source_config().get("source_query_expansion_platforms")
+    if not isinstance(values, list):
+        values = list(DEFAULT_SOURCE_QUERY_EXPANSION_PLATFORMS)
+    return {
+        str(value or "").strip()
+        for value in values
+        if str(value or "").strip()
+    }
 
 
 def _seed_list_config(name: str | None) -> dict[str, Any]:
@@ -4271,6 +4287,67 @@ def _sapphire_origin_url(url: str) -> str:
     if not parsed.scheme or not parsed.netloc:
         return url
     return f"{parsed.scheme}://{parsed.netloc}/"
+
+
+def _sapphire_query_slug_variants(query: str | None) -> list[str]:
+    raw = _clean_text(query)
+    if not raw:
+        return []
+    normalized = raw.lower()
+    replacements = {
+        " incorporated": " inc",
+        " limited liability company": " llc",
+        " corporation": " corp",
+        " company": " co",
+    }
+    for old, new in replacements.items():
+        normalized = normalized.replace(old, new)
+    tokens = re.findall(r"[a-z0-9]+", normalized)
+    if not tokens:
+        return []
+    variants: list[list[str]] = [tokens]
+    corporate_suffixes = {"inc", "llc", "ltd", "co", "corp", "corporation", "company"}
+    if len(tokens) > 1 and tokens[-1] in corporate_suffixes:
+        variants.append(tokens[:-1])
+    slugs: list[str] = []
+    for variant in variants:
+        slug = "-".join(variant).strip("-")
+        if slug and slug not in slugs:
+            slugs.append(slug)
+    return slugs[:5]
+
+
+async def _sapphire_query_probe_targets(
+    source: dict[str, Any],
+    url: str,
+    query: str | None,
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    if classify_hosting_platform(url) != "sapphire":
+        return []
+    origin = _sapphire_origin_url(url)
+    targets: list[CrawlTarget] = []
+    for slug in _sapphire_query_slug_variants(query):
+        probe_url = urljoin(origin, f"tocs/current/{slug}")
+        head = await _head_url(probe_url, session=session)
+        if str(head.get("status") or "") != "ok":
+            continue
+        targets.append(
+            CrawlTarget(
+                source=source,
+                url=probe_url,
+                label=_clean_text(query) or _label_from_index_name(slug),
+                resolved_from_url=url,
+                metadata={
+                    "resolver": "sapphire_html_tocs",
+                    "file_name": slug,
+                    "payer_name": _clean_text(query) or None,
+                    "company_name": _clean_text(query) or None,
+                    "query_probe_slug": slug,
+                },
+            )
+        )
+    return targets
 
 
 def _sapphire_page_data_url(url: str) -> str:
@@ -10128,6 +10205,72 @@ def _crawl_ok_observation(
     }
 
 
+def _source_target_payer_query(source: dict[str, Any]) -> str | None:
+    metadata = dict((source or {}).get("metadata_json") or {})
+    raw = metadata.get("raw")
+    if isinstance(raw, dict):
+        query = _clean_text(raw.get("target_payer_query"))
+        if query:
+            return query
+    return None
+
+
+def _crawl_target_search_values(target: CrawlTarget) -> list[Any]:
+    metadata = dict(target.metadata or {})
+    values: list[Any] = [
+        target.label,
+        target.url,
+        target.resolved_from_url,
+        metadata.get("file_name"),
+        metadata.get("payer_name"),
+        metadata.get("blob_name"),
+        metadata.get("company_name"),
+        metadata.get("employer_name"),
+        metadata.get("employer_slug"),
+        metadata.get("entity_slug"),
+        metadata.get("target_label"),
+    ]
+    for plan in _metadata_plan_info(metadata):
+        values.extend(
+            [
+                plan.get("plan_name"),
+                plan.get("plan_sponsor_name"),
+                plan.get("sponsor_name"),
+                plan.get("issuer_name"),
+                plan.get("company_name"),
+            ]
+        )
+    return values
+
+
+def _matched_query_expansion_target(
+    target: CrawlTarget, query: str | None
+) -> CrawlTarget | None:
+    if not query:
+        return target
+    if not _search_values_match_query(_crawl_target_search_values(target), query):
+        return None
+    metadata = dict(target.metadata or {})
+    target_label = _clean_text(
+        metadata.get("company_name")
+        or metadata.get("payer_name")
+        or metadata.get("employer_name")
+        or target.label
+    )
+    if target_label:
+        metadata.setdefault("company_name", target_label)
+        metadata.setdefault("employer_name", target_label)
+    metadata["target_payer_query"] = query
+    metadata["query_expansion_match"] = True
+    return CrawlTarget(
+        source=target.source,
+        url=target.url,
+        label=target.label,
+        resolved_from_url=target.resolved_from_url,
+        metadata=metadata,
+    )
+
+
 async def _resolve_crawl_targets(
     source_rows: list[dict[str, Any]],
     *,
@@ -10159,6 +10302,23 @@ async def _resolve_crawl_targets(
                     session,
                     target_limit=crawl_target_limit,
                 )
+                target_query = _source_target_payer_query(source)
+                if target_query:
+                    resolved_targets.extend(
+                        await _sapphire_query_probe_targets(
+                            source, url_text, target_query, session
+                        )
+                    )
+                    resolved_targets = [
+                        matched
+                        for target in resolved_targets
+                        if (
+                            matched := _matched_query_expansion_target(
+                                target, target_query
+                            )
+                        )
+                        is not None
+                    ]
                 if not resolved_targets:
                     return [], [
                         _crawl_skipped_observation(
@@ -10461,6 +10621,65 @@ def _candidate_search_name_matches_query(name: str, query: str) -> bool:
     if len(tokens) >= 2 and len(text) >= 8 and text in query:
         return True
     return False
+
+
+def _query_tokens(value: Any) -> tuple[str, ...]:
+    return tuple(
+        token.lower()
+        for token in re.findall(r"[a-z0-9]+", _clean_text(value).lower())
+        if token
+    )
+
+
+def _search_values_match_query(values: Iterable[Any], query: str | None) -> bool:
+    clean_query = _clean_text(query).lower()
+    if not clean_query:
+        return True
+    query_tokens = _query_tokens(clean_query)
+    for value in values:
+        text = _search_match_text(value)
+        if not text:
+            continue
+        if clean_query in text:
+            return True
+        if query_tokens:
+            value_tokens = set(_query_tokens(text))
+            if all(token in value_tokens for token in query_tokens):
+                return True
+    return False
+
+
+def _search_match_text(value: Any) -> str:
+    text = _clean_text(value).lower()
+    parsed = urlsplit(str(value or "").strip())
+    if parsed.scheme in {"http", "https"} and parsed.netloc:
+        text = _clean_text(
+            " ".join(part for part in (unquote(parsed.path), unquote(parsed.query)) if part)
+        ).lower()
+    return text
+
+
+def _candidate_supports_source_query_expansion(candidate: SourceCandidate) -> bool:
+    source_url = candidate.index_url or candidate.human_url
+    platform = candidate.hosting_platform or classify_hosting_platform(source_url)
+    if platform not in _source_query_expansion_platforms():
+        return False
+    if not _platform_resolver_config(platform):
+        return False
+    return bool(source_url)
+
+
+def _candidate_with_target_payer_query(
+    candidate: SourceCandidate, query: str
+) -> SourceCandidate:
+    return replace(
+        candidate,
+        raw_payload={
+            **dict(candidate.raw_payload or {}),
+            "target_payer_query": query,
+            "query_expansion_source": True,
+        },
+    )
 
 
 def _candidate_is_importable_source(candidate: SourceCandidate) -> bool:
@@ -12178,15 +12397,27 @@ async def main(
                 )
     candidates = _dedupe_candidates(candidates)
     if parsed_source_entity_types or parsed_source_payer_query:
-        candidates = [
-            candidate
-            for candidate in candidates
+        filtered_candidates: list[SourceCandidate] = []
+        query_expansion_candidates: list[SourceCandidate] = []
+        query_can_expand = bool(
+            parsed_source_payer_query
+            and sum(len(token) for token in _query_tokens(parsed_source_payer_query)) >= 3
+        )
+        for candidate in candidates:
             if _candidate_matches_text_filters(
                 candidate,
                 entity_types=parsed_source_entity_types,
                 payer_query=parsed_source_payer_query,
-            )
-        ]
+            ):
+                filtered_candidates.append(candidate)
+                continue
+            if query_can_expand and _candidate_supports_source_query_expansion(candidate):
+                query_expansion_candidates.append(
+                    _candidate_with_target_payer_query(
+                        candidate, parsed_source_payer_query or ""
+                    )
+                )
+        candidates = _dedupe_candidates(filtered_candidates + query_expansion_candidates)
     candidates = [
         candidate
         for candidate in candidates

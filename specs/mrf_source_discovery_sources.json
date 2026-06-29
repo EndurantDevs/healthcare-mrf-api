@@ -1,6 +1,11 @@
 {
   "default_providers": ["master-list"],
   "test_providers": ["master-list"],
+  "source_query_expansion_platforms": [
+    "sapphire",
+    "uhc_public_blobs",
+    "mymedicalshopper_talon"
+  ],
   "providers": {
     "master-list": {
       "parser": "master-list",
