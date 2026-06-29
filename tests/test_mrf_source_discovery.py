@@ -8034,6 +8034,148 @@ def test_payercompass_targets_from_structure_use_file_list_download_ids():
     )
 
 
+@pytest.mark.asyncio
+async def test_resolve_payercompass_mrf_enriches_plans_from_index_zip(monkeypatch):
+    source = {
+        "source_id": "source_1",
+        "payer_id": "payer_1",
+        "display_name": "PayerCompass Plan",
+    }
+    resolver = {
+        "type": "payercompass_mrf",
+        "download_path": "/api/File/Download",
+        "max_timeframes": 2,
+    }
+    structure = {
+        "mrfConfig": {
+            "timeFrames": [
+                {
+                    "id": "2026-06-01_2",
+                    "name": "June 01, 2026",
+                    "fileCount": 1,
+                    "fileType": 2,
+                },
+                {
+                    "id": "2026-06-01_1",
+                    "name": "June 01, 2026",
+                    "fileCount": 1,
+                    "fileType": 1,
+                },
+            ]
+        }
+    }
+    file_lists = {
+        "2026-06-01_2": [
+            {
+                "id": "index-file",
+                "name": "2026-06-01_example_index.json.zip",
+                "size": "8.97 KB",
+            }
+        ],
+        "2026-06-01_1": [
+            {
+                "id": "inn-file",
+                "name": (
+                    "2026-06-01_example_11111111-2222-3333-4444-555555555555_"
+                    "in-network-rates.json.zip"
+                ),
+                "size": "25.85 MB",
+            }
+        ],
+    }
+    index_toc = {
+        "reporting_entity_name": "Example TPA",
+        "reporting_entity_type": "third_party_administrator",
+        "reporting_structure": [
+            {
+                "reporting_plans": [
+                    {
+                        "plan_name": "Acme Health Plan",
+                        "plan_id_type": "EIN",
+                        "plan_id": "123456789",
+                        "plan_market_type": "group",
+                    }
+                ],
+                "in_network_files": [
+                    {
+                        "location": (
+                            "https://example.mrf.payercompass.com/file/get?name="
+                            "2026-06-01_example_11111111-2222-3333-4444-"
+                            "555555555555_in-network-rates.json.zip"
+                        )
+                    }
+                ],
+            },
+            {
+                "reporting_plans": [
+                    {
+                        "plan_name": "Beta Health Plan",
+                        "plan_id_type": "EIN",
+                        "plan_id": "987654321",
+                        "plan_market_type": "group",
+                    }
+                ],
+                "in_network_files": [
+                    {
+                        "location": (
+                            "https://example.mrf.payercompass.com/file/get?name="
+                            "2026-06-01_example_11111111-2222-3333-4444-"
+                            "555555555555_in-network-rates.json.zip"
+                        )
+                    }
+                ],
+            },
+        ],
+    }
+    fetch_calls = []
+
+    async def fake_post_json(url, payload, **_kwargs):
+        assert url == "https://example.mrf.payercompass.com/api/Home/GetStructureInfo"
+        assert payload == {}
+        return structure
+
+    async def fake_post_json_value(url, payload, **_kwargs):
+        assert url == "https://example.mrf.payercompass.com/api/File/List"
+        return file_lists[payload["timeFrameId"]]
+
+    async def fake_fetch_zip_json_values(url, **_kwargs):
+        fetch_calls.append(url)
+        return [("2026-06-01_example_index.json", index_toc)]
+
+    monkeypatch.setattr(discovery, "_post_json", fake_post_json)
+    monkeypatch.setattr(discovery, "_post_json_value", fake_post_json_value)
+    monkeypatch.setattr(discovery, "_fetch_zip_json_values", fake_fetch_zip_json_values)
+
+    targets = await discovery._resolve_payercompass_mrf(
+        source,
+        "https://example.mrf.payercompass.com/",
+        resolver,
+        None,
+    )
+
+    assert fetch_calls == [
+        "https://example.mrf.payercompass.com/api/File/Download?Id=index-file"
+    ]
+    index_target, in_network_target = targets
+    assert "plan_info" not in index_target.metadata
+    assert in_network_target.metadata["payercompass_plan_info_source"] == "index_toc"
+    assert in_network_target.metadata["reporting_entity_name"] == "Example TPA"
+    assert in_network_target.metadata["plan_info"] == [
+        {
+            "plan_id": "123456789",
+            "plan_id_type": "EIN",
+            "plan_market_type": "group",
+            "plan_name": "Acme Health Plan",
+        },
+        {
+            "plan_id": "987654321",
+            "plan_id_type": "EIN",
+            "plan_market_type": "group",
+            "plan_name": "Beta Health Plan",
+        },
+    ]
+
+
 def test_metadata_text_rows_only_store_direct_body_files():
     source = {
         "source_id": "source_1",

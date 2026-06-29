@@ -21,7 +21,15 @@ from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import parse_qs, parse_qsl, quote, urlencode, urljoin, urlsplit
+from urllib.parse import (
+    parse_qs,
+    parse_qsl,
+    quote,
+    unquote,
+    urlencode,
+    urljoin,
+    urlsplit,
+)
 from xml.etree import ElementTree
 
 import aiohttp
@@ -5530,6 +5538,238 @@ def _payercompass_target_for_file(
     )
 
 
+def _payercompass_as_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, dict):
+        return [value]
+    return []
+
+
+def _payercompass_file_name_from_value(value: Any) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    parsed = urlsplit(text)
+    if parsed.query:
+        query = parse_qs(parsed.query)
+        for key, values in query.items():
+            if key.lower() not in {"id", "name", "file", "filename"}:
+                continue
+            for raw in values:
+                candidate = unquote(str(raw or "")).strip()
+                if candidate:
+                    return candidate
+    path_name = unquote(Path(parsed.path or text).name).strip()
+    return path_name or text
+
+
+def _payercompass_file_match_keys(*values: Any) -> set[str]:
+    keys: set[str] = set()
+    for value in values:
+        for candidate in (value, _payercompass_file_name_from_value(value)):
+            text = unquote(str(candidate or "")).strip()
+            if not text:
+                continue
+            lower = text.lower()
+            keys.add(lower)
+            path_name = unquote(Path(urlsplit(text).path or text).name).strip().lower()
+            if path_name:
+                keys.add(path_name)
+            for suffix in (".zip", ".gz"):
+                if lower.endswith(suffix):
+                    keys.add(lower[: -len(suffix)])
+                if path_name.endswith(suffix):
+                    keys.add(path_name[: -len(suffix)])
+            for uuid_match in re.findall(
+                r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+                lower,
+                flags=re.I,
+            ):
+                keys.add(uuid_match.lower())
+    return {key for key in keys if key}
+
+
+def _payercompass_normalized_plan_info(plan: dict[str, Any]) -> dict[str, Any] | None:
+    plan_id = _clean_text(plan.get("plan_id") or plan.get("planId"))
+    plan_name = _clean_text(plan.get("plan_name") or plan.get("planName"))
+    sponsor_name = _clean_text(
+        plan.get("plan_sponsor_name")
+        or plan.get("plan_sponser_name")
+        or plan.get("sponsor_name")
+        or plan.get("company_name")
+        or plan.get("planSponsorName")
+    )
+    issuer_name = _clean_text(plan.get("issuer_name") or plan.get("issuerName"))
+    if not any((plan_id, plan_name, sponsor_name, issuer_name)):
+        return None
+    normalized = {
+        "plan_id": plan_id or None,
+        "plan_id_type": _clean_text(plan.get("plan_id_type") or plan.get("planIdType"))
+        or None,
+        "plan_market_type": _clean_text(
+            plan.get("plan_market_type")
+            or plan.get("planMarketType")
+            or plan.get("market_type")
+        )
+        or "group",
+        "plan_name": plan_name or None,
+    }
+    if sponsor_name:
+        normalized["plan_sponsor_name"] = sponsor_name
+    if issuer_name:
+        normalized["issuer_name"] = issuer_name
+    return normalized
+
+
+def _payercompass_plan_key(plan: dict[str, Any]) -> tuple[str, str, str, str, str]:
+    return (
+        str(plan.get("plan_id") or ""),
+        str(plan.get("plan_id_type") or ""),
+        str(plan.get("plan_market_type") or ""),
+        str(plan.get("plan_name") or ""),
+        str(plan.get("plan_sponsor_name") or plan.get("issuer_name") or ""),
+    )
+
+
+def _payercompass_add_plan_info(
+    index: dict[str, list[dict[str, Any]]],
+    key: str,
+    plans: list[dict[str, Any]],
+) -> None:
+    if not key:
+        return
+    existing = index.setdefault(key, [])
+    seen = {_payercompass_plan_key(plan) for plan in existing}
+    for plan in plans:
+        plan_key = _payercompass_plan_key(plan)
+        if plan_key in seen:
+            continue
+        existing.append(plan)
+        seen.add(plan_key)
+
+
+def _payercompass_plan_info_by_file_key(
+    toc: dict[str, Any],
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, str | None]]:
+    plan_info_by_key: dict[str, list[dict[str, Any]]] = {}
+    toc_metadata = {
+        "reporting_entity_name": _clean_text(toc.get("reporting_entity_name")),
+        "reporting_entity_type": _clean_text(toc.get("reporting_entity_type")),
+    }
+    for structure in _payercompass_as_list(toc.get("reporting_structure")):
+        if not isinstance(structure, dict):
+            continue
+        plans = [
+            normalized
+            for raw_plan in _payercompass_as_list(structure.get("reporting_plans"))
+            if isinstance(raw_plan, dict)
+            for normalized in [_payercompass_normalized_plan_info(raw_plan)]
+            if normalized
+        ]
+        if not plans:
+            continue
+        for file_entry in _payercompass_as_list(structure.get("in_network_files")):
+            if not isinstance(file_entry, dict):
+                continue
+            keys = _payercompass_file_match_keys(
+                file_entry.get("location"), file_entry.get("description")
+            )
+            for key in keys:
+                _payercompass_add_plan_info(plan_info_by_key, key, plans)
+    return plan_info_by_key, toc_metadata
+
+
+def _payercompass_is_index_target(target: CrawlTarget) -> bool:
+    metadata = target.metadata or {}
+    file_name = str(metadata.get("payercompass_file_name") or target.label or "")
+    normalized = file_name.lower()
+    return (
+        "index" in normalized
+        and ".json" in normalized
+        and str(metadata.get("container_format") or "").lower() == "zip"
+    )
+
+
+def _payercompass_target_match_keys(target: CrawlTarget) -> set[str]:
+    metadata = target.metadata or {}
+    return _payercompass_file_match_keys(
+        target.url,
+        target.label,
+        metadata.get("payercompass_file_id"),
+        metadata.get("payercompass_file_name"),
+    )
+
+
+async def _enrich_payercompass_targets_with_index_plan_info(
+    targets: list[CrawlTarget],
+    *,
+    resolver: dict[str, Any],
+    max_bytes: int,
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    index_fetch_max_bytes = (
+        _as_int(resolver.get("index_max_bytes"))
+        or _as_int(resolver.get("max_index_bytes"))
+        or max_bytes
+    )
+    plan_info_by_key: dict[str, list[dict[str, Any]]] = {}
+    toc_metadata: dict[str, str | None] = {}
+    for target in targets:
+        if not _payercompass_is_index_target(target):
+            continue
+        size_bytes = _parse_size_bytes((target.metadata or {}).get("size_bytes"))
+        if size_bytes and size_bytes > index_fetch_max_bytes:
+            continue
+        try:
+            toc_values = await _fetch_zip_json_values(
+                target.url,
+                max_bytes=index_fetch_max_bytes,
+                session=session,
+            )
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            logging.getLogger(__name__).debug(
+                "failed to fetch PayerCompass index %s: %s", target.url, exc
+            )
+            continue
+        for _member_name, toc in toc_values:
+            if not isinstance(toc, dict):
+                continue
+            member_index, member_metadata = _payercompass_plan_info_by_file_key(toc)
+            for key, plans in member_index.items():
+                _payercompass_add_plan_info(plan_info_by_key, key, plans)
+            for metadata_key, metadata_value in member_metadata.items():
+                if metadata_value and not toc_metadata.get(metadata_key):
+                    toc_metadata[metadata_key] = metadata_value
+    if not plan_info_by_key:
+        return targets
+    for target in targets:
+        metadata = target.metadata or {}
+        if metadata.get("target_file_type") != "in-network":
+            continue
+        if metadata.get("plan_info"):
+            continue
+        plan_info: list[dict[str, Any]] = []
+        seen_plan_keys: set[tuple[str, str, str, str, str]] = set()
+        for key in _payercompass_target_match_keys(target):
+            for plan in plan_info_by_key.get(key) or []:
+                plan_key = _payercompass_plan_key(plan)
+                if plan_key in seen_plan_keys:
+                    continue
+                plan_info.append(plan)
+                seen_plan_keys.add(plan_key)
+        if not plan_info:
+            continue
+        metadata["plan_info"] = plan_info
+        metadata["payercompass_plan_info_source"] = "index_toc"
+        for metadata_key, metadata_value in toc_metadata.items():
+            if metadata_value and not metadata.get(metadata_key):
+                metadata[metadata_key] = metadata_value
+    return targets
+
+
 def _payercompass_targets_from_structure(
     source: dict[str, Any],
     *,
@@ -5617,6 +5857,12 @@ async def _resolve_payercompass_mrf(
         resolver=resolver,
         structure=structure,
         file_lists=file_lists,
+    )
+    targets = await _enrich_payercompass_targets_with_index_plan_info(
+        targets,
+        resolver=resolver,
+        max_bytes=max_bytes,
+        session=session,
     )
     if not targets:
         raise ValueError(f"no PayerCompass MRF files found for {url}")
