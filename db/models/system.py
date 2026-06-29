@@ -551,6 +551,11 @@ class ProviderDirectoryLocation(Base, JSONOutputMixin):
         {"index_elements": ("zip5",), "name": "provider_directory_location_zip5_idx"},
         {"index_elements": ("state_code", "city_norm"), "name": "provider_directory_location_state_city_idx"},
         {"index_elements": ("last_seen_run_id",), "name": "provider_directory_location_run_idx"},
+        {
+            "index_elements": ("phone_number",),
+            "name": "provider_directory_location_phone_number_idx",
+            "where": "phone_number IS NOT NULL AND phone_number <> ''",
+        },
     ]
 
     source_id = Column(String(64), nullable=False)
@@ -570,7 +575,11 @@ class ProviderDirectoryLocation(Base, JSONOutputMixin):
     city_norm = Column(String)
     country_code = Column(String)
     telephone_number = Column(String)
+    phone_number = Column(String(15))
+    phone_extension = Column(String(16))
     fax_number = Column(String)
+    fax_number_digits = Column(String(15))
+    fax_extension = Column(String(16))
     telecom = Column(JSON)
     latitude = Column(String(64))
     longitude = Column(String(64))

@@ -36,6 +36,7 @@ from process.ext.address_canon import (
     stamp_address_keys,
 )
 from process.ext.address_fast import canonicalize_batch as canonicalize_address_batch
+from process.ext.contact_canon import canonicalize_one as canonicalize_contact_one
 from process.ext.utils import (download_it, download_it_and_save,
                                ensure_database, make_class, my_init_db,
                                print_time_info, push_objects, return_checksum)
@@ -58,6 +59,16 @@ ADDRESS_KEY_MISMATCH_MESSAGE = "Stamped canonical address key does not match ide
 
 class NPIPrerequisiteError(RuntimeError):
     """Raised when a full NPI import would publish incomplete derived data."""
+
+
+def _contact_fields(telephone_number=None, fax_number=None, country_code=None):
+    canonical = canonicalize_contact_one((telephone_number, fax_number, country_code))
+    return {
+        "phone_number": canonical.get("phone_number"),
+        "phone_extension": canonical.get("phone_extension"),
+        "fax_number_digits": canonical.get("fax_number_digits") or canonical.get("fax_number"),
+        "fax_extension": canonical.get("fax_extension"),
+    }
 
 
 def _env_positive_int(name: str, default: int) -> int:
@@ -284,6 +295,7 @@ async def process_npi_chunk(ctx, task):
                 if row['Last Update Date']
                 else None,
             })
+            obj.update(_contact_fields(obj.get("telephone_number"), obj.get("fax_number"), obj.get("country_code")))
             npi_address_list_dict['_'.join([str(obj['npi']), str(obj['checksum']), obj['type'],])] = obj
 
         if row['Provider First Line Business Mailing Address']:
@@ -307,6 +319,7 @@ async def process_npi_chunk(ctx, task):
                 if row['Last Update Date']
                 else None,
             })
+            obj.update(_contact_fields(obj.get("telephone_number"), obj.get("fax_number"), obj.get("country_code")))
             npi_address_list_dict['_'.join([str(obj['npi']), str(obj['checksum']), obj['type'],])] = obj
 
         for i in range(1, 16):
@@ -685,6 +698,7 @@ async def process_data(ctx, task=None):  # pragma: no cover
                         'fax_number': row['Provider Practice Location Address - Fax Number'],
                         'date_added': pytz.utc.localize(datetime.datetime.now())
                     })
+                    obj.update(_contact_fields(obj.get("telephone_number"), obj.get("fax_number"), obj.get("country_code")))
                     npi_address_list_dict['_'.join([str(obj['npi']), str(obj['checksum']), obj['type'], ])] = obj
 
                     if count > current_sql_chunk_size:

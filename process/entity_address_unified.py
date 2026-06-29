@@ -1744,6 +1744,55 @@ def _phone_norm_expr(expr: str) -> str:
     return f"NULLIF(regexp_replace(COALESCE({expr}, ''), '[^0-9]', '', 'g'), '')"
 
 
+def _contact_main_expr(expr: str) -> str:
+    extension_pattern = (
+        "'[[:space:]]*(extension|ext\\.?|;ext=|#|x)"
+        "[[:space:]]*[0-9]{1,16}[[:space:]]*$'"
+    )
+    return f"regexp_replace(COALESCE({expr}, ''), {extension_pattern}, '', 'i')"
+
+
+def _contact_digits_expr(expr: str) -> str:
+    return f"regexp_replace({_contact_main_expr(expr)}, '[^0-9]', '', 'g')"
+
+
+def _contact_country_key_expr(expr: str) -> str:
+    return f"regexp_replace(upper(COALESCE({expr}, '')), '[^A-Z]', '', 'g')"
+
+
+def _canonical_contact_number_expr(expr: str, country_expr: str = "country_code") -> str:
+    digits = _contact_digits_expr(expr)
+    country_key = _contact_country_key_expr(country_expr)
+    default_us = (
+        f"({country_key} = '' OR {country_key} IN "
+        "('US', 'USA', 'UNITEDSTATES', 'UNITEDSTATESOFAMERICA'))"
+    )
+    main = _contact_main_expr(expr)
+    return (
+        "CASE "
+        f"WHEN {default_us} AND length({digits}) = 10 THEN {digits} "
+        f"WHEN {default_us} AND length({digits}) = 11 AND left({digits}, 1) = '1' "
+        f"THEN substring({digits} from 2) "
+        f"WHEN BTRIM({main}) LIKE '+%' AND length({digits}) BETWEEN 8 AND 15 THEN {digits} "
+        "ELSE NULL::varchar END"
+    )
+
+
+def _contact_extension_expr(expr: str) -> str:
+    extension_pattern = (
+        "'(extension|ext\\.?|;ext=|#|x)[[:space:]]*[0-9]{1,16}[[:space:]]*$'"
+    )
+    extract_pattern = (
+        "'^.*(extension|ext\\.?|;ext=|#|x)[[:space:]]*([0-9]{1,16})[[:space:]]*$'"
+    )
+    return (
+        "CASE "
+        f"WHEN COALESCE({expr}, '') ~* {extension_pattern} "
+        f"THEN NULLIF(regexp_replace(COALESCE({expr}, ''), {extract_pattern}, '\\2', 'i'), '')::varchar "
+        "ELSE NULL::varchar END"
+    )
+
+
 def _source_priority_expr(expr: str) -> str:
     return (
         "CASE "
@@ -3454,6 +3503,10 @@ def _prepare_raw_stage_sql(db_schema: str, raw_table: str, *, unlogged: bool = T
         country_code varchar,
         telephone_number varchar,
         fax_number varchar,
+        phone_number varchar(15),
+        phone_extension varchar(16),
+        fax_number_digits varchar(15),
+        fax_extension varchar(16),
         formatted_address varchar,
         lat numeric(11,8),
         long numeric(11,8),
@@ -4116,6 +4169,10 @@ def _insert_raw_from_source_sql(
         country_code,
         telephone_number,
         fax_number,
+        phone_number,
+        phone_extension,
+        fax_number_digits,
+        fax_extension,
         formatted_address,
         lat,
         long,
@@ -4161,6 +4218,10 @@ def _insert_raw_from_source_sql(
             COALESCE(NULLIF(TRIM(country_code), ''), 'US')::varchar AS country_code,
             NULLIF(TRIM(telephone_number), '')::varchar AS telephone_number,
             NULLIF(TRIM(fax_number), '')::varchar AS fax_number,
+            {_canonical_contact_number_expr("telephone_number", "country_code")}::varchar AS phone_number,
+            {_contact_extension_expr("telephone_number")}::varchar AS phone_extension,
+            {_canonical_contact_number_expr("fax_number", "country_code")}::varchar AS fax_number_digits,
+            {_contact_extension_expr("fax_number")}::varchar AS fax_extension,
             NULLIF(TRIM(formatted_address), '')::varchar AS formatted_address,
             lat::numeric AS lat,
             long::numeric AS long,
@@ -4203,6 +4264,10 @@ def _insert_raw_from_source_sql(
             country_code,
             telephone_number,
             fax_number,
+            phone_number,
+            phone_extension,
+            fax_number_digits,
+            fax_extension,
             formatted_address,
             lat,
             long,
@@ -4253,6 +4318,10 @@ def _insert_raw_from_source_sql(
         country_code,
         telephone_number,
         fax_number,
+        phone_number,
+        phone_extension,
+        fax_number_digits,
+        fax_extension,
         formatted_address,
         lat,
         long,
@@ -4446,6 +4515,10 @@ def _materialize_from_raw_sql(
         country_code,
         telephone_number,
         fax_number,
+        phone_number,
+        phone_extension,
+        fax_number_digits,
+        fax_extension,
         formatted_address,
         lat,
         long,
@@ -4493,6 +4566,10 @@ def _materialize_from_raw_sql(
             (ARRAY_AGG(country_code ORDER BY source_priority ASC, (country_code IS NULL), LENGTH(COALESCE(country_code, '')) DESC, updated_at DESC NULLS LAST))[1]::varchar AS country_code,
             (ARRAY_AGG(telephone_number ORDER BY source_priority ASC, (telephone_number IS NULL), LENGTH(COALESCE(telephone_number, '')) DESC, updated_at DESC NULLS LAST))[1]::varchar AS telephone_number,
             (ARRAY_AGG(fax_number ORDER BY source_priority ASC, (fax_number IS NULL), LENGTH(COALESCE(fax_number, '')) DESC, updated_at DESC NULLS LAST))[1]::varchar AS fax_number,
+            (ARRAY_AGG(phone_number ORDER BY source_priority ASC, (phone_number IS NULL), updated_at DESC NULLS LAST))[1]::varchar AS phone_number,
+            (ARRAY_AGG(phone_extension ORDER BY source_priority ASC, (phone_extension IS NULL), updated_at DESC NULLS LAST))[1]::varchar AS phone_extension,
+            (ARRAY_AGG(fax_number_digits ORDER BY source_priority ASC, (fax_number_digits IS NULL), updated_at DESC NULLS LAST))[1]::varchar AS fax_number_digits,
+            (ARRAY_AGG(fax_extension ORDER BY source_priority ASC, (fax_extension IS NULL), updated_at DESC NULLS LAST))[1]::varchar AS fax_extension,
             (ARRAY_AGG(formatted_address ORDER BY source_priority ASC, (formatted_address IS NULL), LENGTH(COALESCE(formatted_address, '')) DESC, updated_at DESC NULLS LAST))[1]::varchar AS formatted_address,
             (ARRAY_AGG(lat ORDER BY (lat IS NULL), source_priority ASC, updated_at DESC NULLS LAST))[1]::numeric AS lat,
             (ARRAY_AGG(long ORDER BY (long IS NULL), source_priority ASC, updated_at DESC NULLS LAST))[1]::numeric AS long,
@@ -4564,6 +4641,10 @@ def _materialize_from_raw_sql(
         country_code,
         telephone_number,
         fax_number,
+        phone_number,
+        phone_extension,
+        fax_number_digits,
+        fax_extension,
         formatted_address,
         lat,
         long,
@@ -4618,6 +4699,10 @@ def _materialize_sql(
         country_code,
         telephone_number,
         fax_number,
+        phone_number,
+        phone_extension,
+        fax_number_digits,
+        fax_extension,
         formatted_address,
         lat,
         long,
@@ -4652,6 +4737,10 @@ def _materialize_sql(
             COALESCE(NULLIF(TRIM(country_code), ''), 'US')::varchar AS country_code,
             NULLIF(TRIM(telephone_number), '')::varchar AS telephone_number,
             NULLIF(TRIM(fax_number), '')::varchar AS fax_number,
+            {_canonical_contact_number_expr("telephone_number", "country_code")}::varchar AS phone_number,
+            {_contact_extension_expr("telephone_number")}::varchar AS phone_extension,
+            {_canonical_contact_number_expr("fax_number", "country_code")}::varchar AS fax_number_digits,
+            {_contact_extension_expr("fax_number")}::varchar AS fax_extension,
             NULLIF(TRIM(formatted_address), '')::varchar AS formatted_address,
             lat::numeric AS lat,
             long::numeric AS long,
@@ -4687,6 +4776,10 @@ def _materialize_sql(
             country_code,
             telephone_number,
             fax_number,
+            phone_number,
+            phone_extension,
+            fax_number_digits,
+            fax_extension,
             formatted_address,
             lat,
             long,
@@ -4747,6 +4840,10 @@ def _materialize_sql(
             (ARRAY_AGG(country_code ORDER BY source_priority ASC, (country_code IS NULL), LENGTH(COALESCE(country_code, '')) DESC, updated_at DESC NULLS LAST))[1]::varchar AS country_code,
             (ARRAY_AGG(telephone_number ORDER BY source_priority ASC, (telephone_number IS NULL), LENGTH(COALESCE(telephone_number, '')) DESC, updated_at DESC NULLS LAST))[1]::varchar AS telephone_number,
             (ARRAY_AGG(fax_number ORDER BY source_priority ASC, (fax_number IS NULL), LENGTH(COALESCE(fax_number, '')) DESC, updated_at DESC NULLS LAST))[1]::varchar AS fax_number,
+            (ARRAY_AGG(phone_number ORDER BY source_priority ASC, (phone_number IS NULL), updated_at DESC NULLS LAST))[1]::varchar AS phone_number,
+            (ARRAY_AGG(phone_extension ORDER BY source_priority ASC, (phone_extension IS NULL), updated_at DESC NULLS LAST))[1]::varchar AS phone_extension,
+            (ARRAY_AGG(fax_number_digits ORDER BY source_priority ASC, (fax_number_digits IS NULL), updated_at DESC NULLS LAST))[1]::varchar AS fax_number_digits,
+            (ARRAY_AGG(fax_extension ORDER BY source_priority ASC, (fax_extension IS NULL), updated_at DESC NULLS LAST))[1]::varchar AS fax_extension,
             (ARRAY_AGG(formatted_address ORDER BY source_priority ASC, (formatted_address IS NULL), LENGTH(COALESCE(formatted_address, '')) DESC, updated_at DESC NULLS LAST))[1]::varchar AS formatted_address,
             (ARRAY_AGG(lat ORDER BY (lat IS NULL), source_priority ASC, updated_at DESC NULLS LAST))[1]::numeric AS lat,
             (ARRAY_AGG(long ORDER BY (long IS NULL), source_priority ASC, updated_at DESC NULLS LAST))[1]::numeric AS long,
@@ -4787,6 +4884,10 @@ def _materialize_sql(
         country_code,
         telephone_number,
         fax_number,
+        phone_number,
+        phone_extension,
+        fax_number_digits,
+        fax_extension,
         formatted_address,
         lat,
         long,

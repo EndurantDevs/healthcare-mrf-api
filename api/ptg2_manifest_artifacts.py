@@ -38,6 +38,11 @@ PTG2_MANIFEST_PRICE_SET_MEMBER_KINDS = {"price_set_members", "price_set_membersh
 PTG2_MANIFEST_SOURCE_TRACE_KINDS = {"source_trace_sets", "source_traces"}
 PTG2_MANIFEST_ROW_LIMIT_ENV = "HLTHPRT_PTG2_MANIFEST_ROW_LIMIT"
 PTG2_MANIFEST_BYTE_LIMIT_ENV = "HLTHPRT_PTG2_MANIFEST_BYTE_LIMIT"
+PTG_CONTACT_DETAIL_FIELDS = (
+    "fax_number_digits",
+    "phone_extension",
+    "fax_extension",
+)
 PTG_NO_DISPLAY_ADDRESS_FIELDS = {
     "address",
     "formatted_address",
@@ -64,6 +69,7 @@ PTG_NO_DISPLAY_ADDRESS_FIELDS = {
     "phone_number",
     "fax",
     "fax_number",
+    *PTG_CONTACT_DETAIL_FIELDS,
     "location_hash",
     "location_source",
     "location_confidence_code",
@@ -157,6 +163,50 @@ def _optional_bool(value: Any) -> bool | None:
 
 def _nonempty_value(source: Mapping[str, Any], *keys: str) -> bool:
     return any(source.get(key) not in (None, "", [], {}) for key in keys)
+
+
+def _first_payload_value(*values: Any) -> Any:
+    for value in values:
+        if value not in (None, "", []):
+            return value
+    return None
+
+
+def _add_manifest_contact_fields(
+    item: dict[str, Any],
+    provider: Mapping[str, Any],
+    address_payload: Mapping[str, Any],
+) -> None:
+    display_phone = _first_payload_value(
+        provider.get("telephone_number"),
+        item.get("telephone_number"),
+        address_payload.get("telephone_number"),
+        address_payload.get("telephone"),
+        address_payload.get("phone"),
+        provider.get("phone"),
+        provider.get("phone_number"),
+        address_payload.get("phone_number"),
+    )
+    canonical_phone = _first_payload_value(provider.get("phone_number"), address_payload.get("phone_number"))
+    if display_phone not in (None, "", "null"):
+        item["telephone_number"] = display_phone
+        item["phone"] = display_phone
+    if canonical_phone not in (None, "", "null"):
+        item["phone_number"] = canonical_phone
+    elif display_phone not in (None, "", "null"):
+        item["phone_number"] = display_phone
+    display_fax = _first_payload_value(
+        provider.get("fax_number"),
+        item.get("fax_number"),
+        address_payload.get("fax_number"),
+        address_payload.get("fax"),
+    )
+    if display_fax not in (None, "", "null"):
+        item["fax_number"] = display_fax
+    for field in PTG_CONTACT_DETAIL_FIELDS:
+        value = _first_payload_value(provider.get(field), address_payload.get(field))
+        if value not in (None, "", "null"):
+            item[field] = value
 
 
 def _has_displayable_address(source: Mapping[str, Any]) -> bool:
@@ -897,6 +947,7 @@ def search_ptg2_manifest_snapshot(
                     "specialties": provider.get("specialties") or [],
                 }
             )
+            _add_manifest_contact_fields(item, provider, address_payload)
             item["address_verification"] = _manifest_address_verification(item, provider=provider)
             _apply_ptg_address_display_policy(item, args)
             items.append(item)

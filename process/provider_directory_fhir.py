@@ -46,6 +46,7 @@ from db.models import (
 from process.control_lifecycle import mark_control_run
 from process.control_cancel import raise_if_cancelled
 from process.ext.address_canon import resolve_into_archive
+from process.ext.contact_canon import canonicalize_one as canonicalize_contact_one
 from process.ext.utils import ensure_database
 
 
@@ -1054,6 +1055,24 @@ def _fax(telecom: list[dict[str, Any]]) -> str | None:
     return _phone(telecom, system="fax")
 
 
+def _location_contact_fields(
+    telephone_number: str | None,
+    fax_number: str | None,
+    country_code: str | None,
+) -> dict[str, str | None]:
+    canonical = canonicalize_contact_one((telephone_number, fax_number, country_code))
+    phone_number = canonical.get("phone_number")
+    fax_number_digits = canonical.get("fax_number")
+    phone_extension = canonical.get("phone_extension")
+    fax_extension = canonical.get("fax_extension")
+    return {
+        "phone_number": phone_number if isinstance(phone_number, str) else None,
+        "fax_number_digits": fax_number_digits if isinstance(fax_number_digits, str) else None,
+        "phone_extension": phone_extension if isinstance(phone_extension, str) else None,
+        "fax_extension": fax_extension if isinstance(fax_extension, str) else None,
+    }
+
+
 def _name(resource: dict[str, Any]) -> tuple[str | None, list[str], str | None]:
     names = resource.get("name")
     if isinstance(names, dict):
@@ -1229,14 +1248,17 @@ def parse_fhir_resource(
     if resource_type == "Location":
         telecom = _telecom(resource)
         address = _address(resource)
+        telephone_number = _phone(telecom)
+        fax_number = _fax(telecom)
         row = {
             **base,
             "status": _clean_text(resource.get("status")),
             "name": _clean_text(resource.get("name")),
             "mode": _clean_text(resource.get("mode")),
             "type_codes": _codings(resource.get("type")),
-            "telephone_number": _phone(telecom),
-            "fax_number": _fax(telecom),
+            "telephone_number": telephone_number,
+            "fax_number": fax_number,
+            **_location_contact_fields(telephone_number, fax_number, address.get("country_code")),
             "telecom": telecom,
             **{key: value for key, value in address.items() if key != "address_json"},
         }
@@ -1631,7 +1653,11 @@ def provider_directory_ptg_address_corroboration_sql(
             loc.resource_id AS provider_directory_location_resource_id,
             loc.name AS provider_directory_location_name,
             loc.telephone_number AS provider_directory_telephone_number,
+            loc.phone_number AS provider_directory_phone_number,
+            loc.phone_extension AS provider_directory_phone_extension,
             loc.fax_number AS provider_directory_fax_number,
+            loc.fax_number_digits AS provider_directory_fax_number_digits,
+            loc.fax_extension AS provider_directory_fax_extension,
             role.network_refs AS provider_directory_network_refs,
             role.insurance_plan_refs AS provider_directory_insurance_plan_refs,
             COALESCE(network_context.provider_directory_network_names, ARRAY[]::varchar[])
@@ -1792,7 +1818,11 @@ def provider_directory_ptg_address_corroboration_sql(
             loc.resource_id AS provider_directory_location_resource_id,
             loc.name AS provider_directory_location_name,
             loc.telephone_number AS provider_directory_telephone_number,
+            loc.phone_number AS provider_directory_phone_number,
+            loc.phone_extension AS provider_directory_phone_extension,
             loc.fax_number AS provider_directory_fax_number,
+            loc.fax_number_digits AS provider_directory_fax_number_digits,
+            loc.fax_extension AS provider_directory_fax_extension,
             affiliation.network_refs AS provider_directory_network_refs,
             affiliation.insurance_plan_refs AS provider_directory_insurance_plan_refs,
             COALESCE(network_context.provider_directory_network_names, ARRAY[]::varchar[])
@@ -1927,7 +1957,11 @@ def provider_directory_ptg_address_corroboration_sql(
         provider_directory_location_resource_id,
         provider_directory_location_name,
         provider_directory_telephone_number,
+        provider_directory_phone_number,
+        provider_directory_phone_extension,
         provider_directory_fax_number,
+        provider_directory_fax_number_digits,
+        provider_directory_fax_extension,
         provider_directory_network_refs,
         provider_directory_insurance_plan_refs,
         provider_directory_specialty_codes,

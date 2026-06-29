@@ -106,6 +106,7 @@ from api.ptg2_tables import (
 )
 from api.ptg2_types import PTG2ServingIndex, PTG2ServingTables
 from api.ptg2_manifest_artifacts import search_ptg2_manifest_serving_snapshot
+from process.ext.contact_canon import canonicalize_one
 from process.ptg_parts.ptg2_manifest_artifacts import lookup_global_sidecar_members, lookup_global_sidecar_members_many
 from api.ptg2_serving_utils import (
     _normalize_zip5,
@@ -146,8 +147,19 @@ _PTG2_LEGACY_ADDRESS_COLUMNS = {
     "second_line",
     "telephone_number",
     "fax_number",
+    "phone_number",
+    "phone_extension",
+    "fax_number_digits",
+    "fax_extension",
 }
-_PTG2_UNIFIED_ADDRESS_COLUMNS = _PTG2_LEGACY_ADDRESS_COLUMNS | {"address_precision"}
+_PTG2_UNIFIED_ADDRESS_COLUMNS = _PTG2_LEGACY_ADDRESS_COLUMNS | {
+    "address_precision",
+}
+PTG_CONTACT_DETAIL_FIELDS = (
+    "fax_number_digits",
+    "phone_extension",
+    "fax_extension",
+)
 PTG_PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW = (
     f"{PTG2_SCHEMA}.ptg_provider_directory_address_corroboration"
 )
@@ -177,6 +189,7 @@ PTG_NO_DISPLAY_ADDRESS_FIELDS = {
     "phone_number",
     "fax",
     "fax_number",
+    *PTG_CONTACT_DETAIL_FIELDS,
     "location_hash",
     "location_source",
     "location_confidence_code",
@@ -272,20 +285,46 @@ def _ptg2_provider_name_sql(alias: str = "n") -> str:
 
 
 def _add_location_phone_fields(item: dict[str, Any], data: dict[str, Any], address_payload: dict[str, Any]) -> None:
-    phone = (
-        data.get("telephone_number")
-        or data.get("phone_number")
-        or address_payload.get("telephone_number")
-        or address_payload.get("phone_number")
-        or address_payload.get("phone")
+    display_phone = _first_payload_value(
+        data.get("telephone_number"),
+        address_payload.get("telephone_number"),
+        address_payload.get("telephone"),
+        address_payload.get("phone"),
+        data.get("phone"),
+        data.get("phone_number"),
+        address_payload.get("phone_number"),
     )
-    if phone not in (None, "", "null"):
-        item["telephone_number"] = phone
-        item["phone_number"] = phone
-        item["phone"] = phone
-    fax = data.get("fax_number") or address_payload.get("fax_number")
-    if fax not in (None, "", "null"):
-        item["fax_number"] = fax
+    canonical_phone = _first_payload_value(data.get("phone_number"), address_payload.get("phone_number"))
+    display_fax = _first_payload_value(
+        data.get("fax_number"),
+        address_payload.get("fax_number"),
+        address_payload.get("fax"),
+    )
+    canonical_fax = _first_payload_value(data.get("fax_number_digits"), address_payload.get("fax_number_digits"))
+    fallback_contact: dict[str, str | bool | None] = {}
+    if (canonical_phone in (None, "", "null") and display_phone not in (None, "", "null")) or (
+        canonical_fax in (None, "", "null") and display_fax not in (None, "", "null")
+    ):
+        fallback_contact = canonicalize_one(
+            (
+                display_phone,
+                display_fax,
+                _first_payload_value(data.get("country_code"), address_payload.get("country_code"), "US"),
+            )
+        )
+
+    if display_phone not in (None, "", "null"):
+        item["telephone_number"] = display_phone
+        item["phone"] = display_phone
+    canonical_phone = _first_payload_value(canonical_phone, fallback_contact.get("phone_number"))
+    if canonical_phone not in (None, "", "null"):
+        item["phone_number"] = canonical_phone
+    if display_fax not in (None, "", "null"):
+        item["fax_number"] = display_fax
+    for field in PTG_CONTACT_DETAIL_FIELDS:
+        value = _first_payload_value(data.get(field), address_payload.get(field), fallback_contact.get(field))
+        if value not in (None, "", "null"):
+            item[field] = value
 
 
 def _coerce_bool_payload(value: Any) -> bool:
@@ -876,7 +915,11 @@ async def _overlay_provider_directory_corroboration(
                     provider_directory_location_resource_id,
                     provider_directory_location_name,
                     provider_directory_telephone_number,
+                    provider_directory_phone_number,
+                    provider_directory_phone_extension,
                     provider_directory_fax_number,
+                    provider_directory_fax_number_digits,
+                    provider_directory_fax_extension,
                     provider_directory_network_refs,
                     provider_directory_insurance_plan_refs,
                     provider_directory_network_names,
@@ -947,8 +990,16 @@ async def _overlay_provider_directory_corroboration(
         updated["location_confidence_code"] = address_network_binding
         if corroboration.get("provider_directory_telephone_number"):
             updated["telephone_number"] = corroboration.get("provider_directory_telephone_number")
+        if corroboration.get("provider_directory_phone_number"):
+            updated["phone_number"] = corroboration.get("provider_directory_phone_number")
+        if corroboration.get("provider_directory_phone_extension"):
+            updated["phone_extension"] = corroboration.get("provider_directory_phone_extension")
         if corroboration.get("provider_directory_fax_number"):
             updated["fax_number"] = corroboration.get("provider_directory_fax_number")
+        if corroboration.get("provider_directory_fax_number_digits"):
+            updated["fax_number_digits"] = corroboration.get("provider_directory_fax_number_digits")
+        if corroboration.get("provider_directory_fax_extension"):
+            updated["fax_extension"] = corroboration.get("provider_directory_fax_extension")
         address_payload = _coerce_json_payload(updated.get("address_payload") or updated.get("address"), {})
         if not isinstance(address_payload, dict):
             address_payload = {}
@@ -980,8 +1031,16 @@ async def _overlay_provider_directory_corroboration(
         )
         if updated.get("telephone_number"):
             address_payload["telephone_number"] = updated.get("telephone_number")
+        if updated.get("phone_number"):
+            address_payload["phone_number"] = updated.get("phone_number")
+        if updated.get("phone_extension"):
+            address_payload["phone_extension"] = updated.get("phone_extension")
         if updated.get("fax_number"):
             address_payload["fax_number"] = updated.get("fax_number")
+        if updated.get("fax_number_digits"):
+            address_payload["fax_number_digits"] = updated.get("fax_number_digits")
+        if updated.get("fax_extension"):
+            address_payload["fax_extension"] = updated.get("fax_extension")
         updated["address_payload"] = address_payload
         overlaid.append(updated)
     return overlaid
@@ -1650,6 +1709,8 @@ async def _ptg2_manifest_enriched_provider_rows_for_npis(
                 SELECT DISTINCT ON (na.npi)
                        na.npi, na.first_line, na.second_line, na.city_name, na.state_name,
                        na.postal_code, na.country_code, na.telephone_number, na.fax_number,
+                       na.phone_number, na.phone_extension,
+                       na.fax_number_digits, na.fax_extension,
                        na.lat, na.long
                   FROM {PTG2_SCHEMA}.npi_address na
                   JOIN source_npis source_filter ON source_filter.npi = na.npi
@@ -1691,21 +1752,33 @@ async def _ptg2_manifest_enriched_provider_rows_for_npis(
                 LEFT(COALESCE({_eff_enrich('postal_code')}, ''), 5) AS zip5,
                 '{address_location_source}' AS location_source,
                 '{address_location_source}' AS location_confidence_code,
-                json_build_object(
-                    'first_line', {_eff_enrich('first_line')},
-                    'second_line', {_eff_enrich('second_line')},
-                    'city', {_eff_enrich('city_name')},
-                    'state', {_eff_enrich('state_name')},
-                    'postal_code', {_eff_enrich('postal_code')},
-                    'country_code', {_eff_enrich('country_code')},
-                    'telephone_number', {_eff_enrich('telephone_number')},
-                    'fax_number', {_eff_enrich('fax_number')},
-                    'address_key', addr.address_key::text,
-                    'lat', {_eff_enrich('lat')},
-                    'long', {_eff_enrich('long')}
+                (
+                    COALESCE(to_jsonb(addr.*), '{{}}'::jsonb)
+                    - 'premise_key'
+                    || jsonb_build_object(
+                        'first_line', {_eff_enrich('first_line')},
+                        'second_line', {_eff_enrich('second_line')},
+                        'city', {_eff_enrich('city_name')},
+                        'state', {_eff_enrich('state_name')},
+                        'postal_code', {_eff_enrich('postal_code')},
+                        'country_code', {_eff_enrich('country_code')},
+                        'telephone_number', {_eff_enrich('telephone_number')},
+                        'fax_number', {_eff_enrich('fax_number')},
+                        'phone_number', {_eff_enrich('phone_number')},
+                        'phone_extension', {_eff_enrich('phone_extension')},
+                        'fax_number_digits', {_eff_enrich('fax_number_digits')},
+                        'fax_extension', {_eff_enrich('fax_extension')},
+                        'address_key', addr.address_key::text,
+                        'lat', {_eff_enrich('lat')},
+                        'long', {_eff_enrich('long')}
+                    )
                 )::text AS address_payload,
                 {_eff_enrich('telephone_number')} AS telephone_number,
                 {_eff_enrich('fax_number')} AS fax_number,
+                {_eff_enrich('phone_number')} AS phone_number,
+                {_eff_enrich('phone_extension')} AS phone_extension,
+                {_eff_enrich('fax_number_digits')} AS fax_number_digits,
+                {_eff_enrich('fax_extension')} AS fax_extension,
                 COALESCE(tax.taxonomy_codes, ARRAY[]::varchar[]) AS taxonomy_codes,
                 COALESCE(tax.specialties, ARRAY[]::varchar[]) AS specialties,
                 COALESCE(tax.classifications, ARRAY[]::varchar[]) AS classifications,
@@ -2233,6 +2306,8 @@ async def _ptg2_manifest_location_provider_matches(
                 SELECT DISTINCT ON (na.npi)
                        na.npi, na.first_line, na.second_line, na.city_name, na.state_name,
                        na.postal_code, na.country_code, na.telephone_number, na.fax_number,
+                       na.phone_number, na.phone_extension,
+                       na.fax_number_digits, na.fax_extension,
                        na.lat, na.long
                   FROM {PTG2_SCHEMA}.npi_address na
                   JOIN location_npis loc ON loc.npi = na.npi
@@ -2278,12 +2353,17 @@ async def _ptg2_manifest_location_provider_matches(
                     addr.country_code,
                     addr.address_key,
                     {premise_key_select_sql}
+                    to_jsonb(addr.*) AS base_address_payload,
                     addr.lat,
                     addr.long,
                     addr.first_line,
                     addr.second_line,
                     addr.telephone_number,
                     addr.fax_number,
+                    addr.phone_number,
+                    addr.phone_extension,
+                    addr.fax_number_digits,
+                    addr.fax_extension,
                     {location_select_sql}
                 FROM {npi_address_table} addr
                 WHERE {" AND ".join(address_filters)}
@@ -2339,21 +2419,33 @@ async def _ptg2_manifest_location_provider_matches(
                 addr.zip_radius_miles,
                 '{address_location_source}' AS location_source,
                 '{address_location_source}' AS location_confidence_code,
-                json_build_object(
-                    'first_line', {_eff('first_line')},
-                    'second_line', {_eff('second_line')},
-                    'city', {_eff('city_name')},
-                    'state', {_eff('state_name')},
-                    'postal_code', {_eff('postal_code')},
-                    'country_code', {_eff('country_code')},
-                    'telephone_number', {_eff('telephone_number')},
-                    'fax_number', {_eff('fax_number')},
-                    'address_key', addr.address_key::text,
-                    'lat', {_eff('lat')},
-                    'long', {_eff('long')}
+                (
+                    COALESCE(addr.base_address_payload, '{{}}'::jsonb)
+                    - 'premise_key'
+                    || jsonb_build_object(
+                        'first_line', {_eff('first_line')},
+                        'second_line', {_eff('second_line')},
+                        'city', {_eff('city_name')},
+                        'state', {_eff('state_name')},
+                        'postal_code', {_eff('postal_code')},
+                        'country_code', {_eff('country_code')},
+                        'telephone_number', {_eff('telephone_number')},
+                        'fax_number', {_eff('fax_number')},
+                        'phone_number', {_eff('phone_number')},
+                        'phone_extension', {_eff('phone_extension')},
+                        'fax_number_digits', {_eff('fax_number_digits')},
+                        'fax_extension', {_eff('fax_extension')},
+                        'address_key', addr.address_key::text,
+                        'lat', {_eff('lat')},
+                        'long', {_eff('long')}
+                    )
                 )::text AS address_payload,
                 {_eff('telephone_number')} AS telephone_number,
                 {_eff('fax_number')} AS fax_number,
+                {_eff('phone_number')} AS phone_number,
+                {_eff('phone_extension')} AS phone_extension,
+                {_eff('fax_number_digits')} AS fax_number_digits,
+                {_eff('fax_extension')} AS fax_extension,
                 COALESCE(addr.taxonomy_codes, ARRAY[]::varchar[]) AS taxonomy_codes,
                 COALESCE(addr.specialties, ARRAY[]::varchar[]) AS specialties,
                 COALESCE(addr.classifications, ARRAY[]::varchar[]) AS classifications,
@@ -2384,7 +2476,7 @@ async def _ptg2_manifest_location_provider_matches(
     async def _fill_location_phone_fallbacks(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not using_unified_address_table:
             return rows
-        missing_rows = [row for row in rows if not row.get("telephone_number")]
+        missing_rows = [row for row in rows if not row.get("telephone_number") and not row.get("phone_number")]
         if not missing_rows:
             return rows
         address_keys = sorted({str(row.get("address_key")) for row in missing_rows if row.get("address_key")})
@@ -2398,11 +2490,15 @@ async def _ptg2_manifest_location_provider_matches(
                        address_key::text AS address_key,
                        premise_key::text AS premise_key,
                        telephone_number,
+                       phone_number,
+                       phone_extension,
                        fax_number,
+                       fax_number_digits,
+                       fax_extension,
                        type,
                        checksum
                   FROM {npi_address_table}
-                 WHERE NULLIF(BTRIM(telephone_number), '') IS NOT NULL
+                 WHERE NULLIF(BTRIM(COALESCE(phone_number, telephone_number)), '') IS NOT NULL
                    AND (
                         address_key = ANY(CAST(:address_keys AS uuid[]))
                         OR premise_key = ANY(CAST(:premise_keys AS uuid[]))
@@ -2426,7 +2522,7 @@ async def _ptg2_manifest_location_provider_matches(
 
         filled_rows: list[dict[str, Any]] = []
         for row in rows:
-            if row.get("telephone_number"):
+            if row.get("telephone_number") or row.get("phone_number"):
                 filled_rows.append(row)
                 continue
             row_address_key = str(row.get("address_key") or "")
@@ -2445,22 +2541,34 @@ async def _ptg2_manifest_location_provider_matches(
                 best = sorted(same_npi_matches, key=lambda candidate: _fallback_rank(candidate, row))[0]
             else:
                 distinct_phones = {
-                    str(candidate.get("telephone_number") or "").strip()
+                    str(candidate.get("phone_number") or "").strip()
                     for candidate in matches
-                    if str(candidate.get("telephone_number") or "").strip()
+                    if str(candidate.get("phone_number") or "").strip()
                 }
                 if len(distinct_phones) != 1:
                     filled_rows.append(row)
                     continue
                 best = sorted(matches, key=lambda candidate: _fallback_rank(candidate, row))[0]
             row = dict(row)
-            row["telephone_number"] = best.get("telephone_number")
+            row["telephone_number"] = best.get("telephone_number") or best.get("phone_number")
+            row["phone_number"] = row.get("phone_number") or best.get("phone_number")
+            row["phone_extension"] = row.get("phone_extension") or best.get("phone_extension")
             row["fax_number"] = row.get("fax_number") or best.get("fax_number")
+            row["fax_number_digits"] = row.get("fax_number_digits") or best.get("fax_number_digits")
+            row["fax_extension"] = row.get("fax_extension") or best.get("fax_extension")
             address_payload = _coerce_json_payload(row.get("address_payload"), {})
             if isinstance(address_payload, dict):
                 address_payload["telephone_number"] = row["telephone_number"]
+                if row.get("phone_number"):
+                    address_payload["phone_number"] = row["phone_number"]
+                if row.get("phone_extension"):
+                    address_payload["phone_extension"] = row["phone_extension"]
                 if row.get("fax_number"):
                     address_payload["fax_number"] = row["fax_number"]
+                if row.get("fax_number_digits"):
+                    address_payload["fax_number_digits"] = row["fax_number_digits"]
+                if row.get("fax_extension"):
+                    address_payload["fax_extension"] = row["fax_extension"]
                 row["address_payload"] = address_payload
             filled_rows.append(row)
         return filled_rows

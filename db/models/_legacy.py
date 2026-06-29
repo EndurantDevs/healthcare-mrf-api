@@ -1312,6 +1312,11 @@ class NPIAddress(AddressPrototype):
             'where': "type='primary'",
         },
         {
+            'index_elements': ('phone_number', 'npi'),
+            'name': 'primary_phone_number_npi',
+            'where': "type='primary' AND phone_number IS NOT NULL AND phone_number <> ''",
+        },
+        {
             'index_elements': ('npi',),
             'name': 'primary_with_coverage_npi',
             'where': "type='primary' AND NOT (plans_network_array @@ '0'::query_int)",
@@ -1362,6 +1367,10 @@ class NPIAddress(AddressPrototype):
     procedures_array = Column(ARRAY(Integer), nullable=False, server_default="{0}")
     medications_array = Column(ARRAY(Integer), nullable=False, server_default="{0}")
     address_key = Column(PG_UUID(as_uuid=True))
+    phone_number = Column(String(15))
+    phone_extension = Column(String(16))
+    fax_number_digits = Column(String(15))
+    fax_extension = Column(String(16))
 
     # NPI	Provider Secondary Practice Location Address- Address Line 1	Provider Secondary Practice Location Address-  Address Line 2	Provider Secondary Practice Location Address - City Name	Provider Secondary Practice Location Address - State Name	Provider Secondary Practice Location Address - Postal Code	Provider Secondary Practice Location Address - Country Code (If outside U.S.)	Provider Secondary Practice Location Address - Telephone Number	Provider Secondary Practice Location Address - Telephone Extension	Provider Practice Location Address - Fax Number
 
@@ -1392,6 +1401,11 @@ class MRFAddress(AddressPrototype):
             "where": "type='practice'",
         },
         {
+            "index_elements": ("phone_number", "npi"),
+            "name": "practice_phone_number_npi",
+            "where": "type='practice' AND phone_number IS NOT NULL AND phone_number <> ''",
+        },
+        {
             "index_elements": ("address_sources",),
             "using": "gin",
             "name": "address_sources",
@@ -1420,6 +1434,10 @@ class MRFAddress(AddressPrototype):
     source_issuer_names = Column(ARRAY(String), nullable=False, server_default=text("'{}'::varchar[]"))
     source_urls = Column(ARRAY(String), nullable=False, server_default=text("'{}'::varchar[]"))
     address_key = Column(PG_UUID(as_uuid=True))
+    phone_number = Column(String(15))
+    phone_extension = Column(String(16))
+    fax_number_digits = Column(String(15))
+    fax_extension = Column(String(16))
 
 
 class MRFAddressEvidence(Base, JSONOutputMixin):
@@ -1475,6 +1493,10 @@ class MRFAddressEvidence(Base, JSONOutputMixin):
     postal_code = Column(String)
     country_code = Column(String)
     telephone_number = Column(String)
+    phone_number = Column(String(15))
+    phone_extension = Column(String(16))
+    fax_number_digits = Column(String(15))
+    fax_extension = Column(String(16))
     observed_at = Column(TIMESTAMP)
     address_key = Column(PG_UUID(as_uuid=True))
 
@@ -4151,6 +4173,11 @@ class EntityAddressUnified(Base, JSONOutputMixin):
             "name": "primary_phone_npi",
             "where": "type='primary' AND telephone_number IS NOT NULL AND telephone_number <> ''",
         },
+        {
+            "index_elements": ("phone_number", "npi"),
+            "name": "primary_phone_number_npi",
+            "where": "type='primary' AND phone_number IS NOT NULL AND phone_number <> ''",
+        },
         {"index_elements": ("address_sources",), "using": "gin", "name": "address_sources"},
         {"index_elements": ("row_origin",), "name": "row_origin"},
         {"index_elements": ("address_precision",), "name": "address_precision"},
@@ -4264,7 +4291,11 @@ class EntityAddressUnified(Base, JSONOutputMixin):
     postal_code = Column(String)
     country_code = Column(String)
     telephone_number = Column(String)
+    phone_number = Column(String(15))
+    phone_extension = Column(String(16))
     fax_number = Column(String)
+    fax_number_digits = Column(String(15))
+    fax_extension = Column(String(16))
     formatted_address = Column(String)
     lat = Column(Numeric(scale=8, precision=11, asdecimal=False, decimal_return_scale=None))
     long = Column(Numeric(scale=8, precision=11, asdecimal=False, decimal_return_scale=None))
@@ -4326,6 +4357,10 @@ class PTGAddress(Base, JSONOutputMixin):
     ptg_plan_array = Column(ARRAY(String), nullable=False, server_default=text("'{}'::varchar[]"))
     ptg_source_array = Column(ARRAY(String), nullable=False, server_default=text("'{}'::varchar[]"))
     group_plan_array = Column(ARRAY(String), nullable=False, server_default=text("'{}'::varchar[]"))
+    phone_number = Column(String(15))
+    phone_extension = Column(String(16))
+    fax_number_digits = Column(String(15))
+    fax_extension = Column(String(16))
     base_address_version = Column(String(64))
     ptg_snapshot_published_at = Column(TIMESTAMP(timezone=True))
     observed_at = Column(TIMESTAMP(timezone=True))

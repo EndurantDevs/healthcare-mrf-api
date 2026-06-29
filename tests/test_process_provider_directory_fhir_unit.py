@@ -170,6 +170,35 @@ def test_fhir_address_normalizes_us_numeric_country_code():
     assert address["country_code"] == "US"
 
 
+def test_provider_directory_location_preserves_raw_contact_and_adds_canonical_digits():
+    model, row = importer.parse_fhir_resource(
+        "source_a",
+        {
+            "resourceType": "Location",
+            "id": "loc-contact",
+            "telecom": [
+                {"system": "phone", "value": "+1 (312) 555-0100 ext. 45"},
+                {"system": "fax", "value": "312.555.0199 # 22"},
+            ],
+            "address": {
+                "line": ["100 Main St"],
+                "city": "Chicago",
+                "state": "IL",
+                "postalCode": "60601",
+                "country": "US",
+            },
+        },
+    )
+
+    assert model is ProviderDirectoryLocation
+    assert row["telephone_number"] == "+1 (312) 555-0100 ext. 45"
+    assert row["fax_number"] == "312.555.0199 # 22"
+    assert row["phone_number"] == "3125550100"
+    assert row["fax_number_digits"] == "3125550199"
+    assert row["phone_extension"] == "45"
+    assert row["fax_extension"] == "22"
+
+
 def test_provider_directory_location_address_key_sql_recovers_numeric_state_fips():
     sql = importer.provider_directory_location_address_key_sql("mrf")
 
@@ -991,6 +1020,7 @@ def test_parse_fhir_resource_maps_plan_practitioner_location_role_and_endpoint()
     assert location_row["zip5"] == "60601"
     assert location_row["state_code"] == "IL"
     assert location_row["telephone_number"] == "312-555-0100"
+    assert location_row["phone_number"] == "3125550100"
     assert role_model is ProviderDirectoryPractitionerRole
     assert role_row["location_refs"] == ["Location/loc-1"]
     assert role_row["insurance_plan_refs"] == ["InsurancePlan/plan-1"]
@@ -1031,6 +1061,8 @@ def test_provider_directory_ptg_address_corroboration_sql_links_ptg_npi_address_
     assert "provider_directory_network_names" in sql
     assert "provider_directory_network_matches" in sql
     assert "provider_directory_insurance_plan_matches" in sql
+    assert "loc.phone_number AS provider_directory_phone_number" in sql
+    assert "loc.fax_number_digits AS provider_directory_fax_number_digits" in sql
     assert "insurance_plan.plan_identifier" in sql
     assert "insurance_plan.network_refs::jsonb" in sql
     assert '"provider_directory_organization" network_org' in sql

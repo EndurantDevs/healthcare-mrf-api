@@ -491,6 +491,12 @@ def test_search_manifest_snapshot_adds_address_verification_to_expanded_provider
                     "city": "Effingham",
                     "state": "IL",
                     "postal_code": "62401",
+                    "telephone_number": "(217) 555-0100 ext. 45",
+                    "phone_number": "2175550100",
+                    "phone_extension": "45",
+                    "fax_number": "(217) 555-0101",
+                    "fax_number_digits": "2175550101",
+                    "fax_extension": "9",
                     "address_sources": ["nppes"],
                 },
             }
@@ -523,6 +529,13 @@ def test_search_manifest_snapshot_adds_address_verification_to_expanded_provider
     assert item["address_verification"]["displayed_address_present"] is True
     assert item["address_verification"]["address_network_binding"] == "inferred_from_provider_identity"
     assert item["address_verification"]["requires_location_confirmation"] is True
+    assert item["phone"] == "(217) 555-0100 ext. 45"
+    assert item["telephone_number"] == "(217) 555-0100 ext. 45"
+    assert item["phone_number"] == "2175550100"
+    assert item["phone_extension"] == "45"
+    assert item["fax_number"] == "(217) 555-0101"
+    assert item["fax_number_digits"] == "2175550101"
+    assert item["fax_extension"] == "9"
 
     opt_out_payload = serving_manifest.search_ptg2_manifest_snapshot(
         snapshot,
@@ -543,6 +556,16 @@ def test_search_manifest_snapshot_adds_address_verification_to_expanded_provider
     assert opt_out_item["address_verification"]["network_bound_address"] is False
     assert opt_out_item["address_verification"]["requires_location_confirmation"] is True
     assert "address" not in opt_out_item
+    for key in (
+        "telephone_number",
+        "phone",
+        "phone_number",
+        "phone_extension",
+        "fax_number",
+        "fax_number_digits",
+        "fax_extension",
+    ):
+        assert key not in opt_out_item
 
 
 def test_search_manifest_snapshot_strips_no_display_provider_address_fields():
@@ -570,6 +593,10 @@ def test_search_manifest_snapshot_strips_no_display_provider_address_fields():
                 "address_payload": {
                     "address_key": "00000000-0000-0000-0000-000000000001",
                     "telephone_number": "217-555-0100",
+                    "phone_number": "2175550100",
+                    "phone_extension": "101",
+                    "fax_number_digits": "2175550101",
+                    "fax_extension": "102",
                 },
                 "telephone_number": "217-555-0100",
                 "coordinates": {"lat": 39.12004, "long": -88.54338},
@@ -604,7 +631,20 @@ def test_search_manifest_snapshot_strips_no_display_provider_address_fields():
     )
     for key in ("location_source", "address_sources", "address_precision", "source_count"):
         assert key not in item["address_verification"]
-    for key in ("address", "telephone_number", "phone", "location_source", "city", "state", "zip5", "coordinates"):
+    for key in (
+        "address",
+        "telephone_number",
+        "phone",
+        "phone_number",
+        "phone_extension",
+        "fax_number_digits",
+        "fax_extension",
+        "location_source",
+        "city",
+        "state",
+        "zip5",
+        "coordinates",
+    ):
         assert key not in item
 
 

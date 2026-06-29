@@ -173,6 +173,8 @@ def test_unified_address_stage_sql_uses_bigint_checksum():
     )
 
     assert "checksum bigint NOT NULL" in raw_sql
+    assert "phone_number varchar(15)" in raw_sql
+    assert "fax_number_digits varchar(15)" in raw_sql
     assert "NULL::bigint AS checksum" in inference_sql
     assert "NULL::integer AS checksum" not in inference_sql
 
@@ -223,11 +225,17 @@ def test_entity_address_serving_models_expose_compact_keys_and_bridges():
         "ptg_plan_array",
         "ptg_source_array",
         "group_plan_array",
+        "phone_number",
+        "phone_extension",
+        "fax_number_digits",
+        "fax_extension",
     ):
         assert column_name in unified_columns
 
     assert PTGAddress.__tablename__ == "ptg_address"
     assert PTGAddress.__my_index_elements__ == ["source_key", "snapshot_id", "location_key"]
+    for column_name in ("phone_number", "phone_extension", "fax_number_digits", "fax_extension"):
+        assert column_name in PTGAddress.__table__.c
     assert EntityAddressEvidence.__tablename__ == "entity_address_evidence"
     assert EntityAddressPlanBridge.__tablename__ == "entity_address_plan_bridge"
     assert EntityAddressNetworkBridge.__tablename__ == "entity_address_network_bridge"

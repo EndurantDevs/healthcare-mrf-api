@@ -77,7 +77,11 @@ async def test_overlay_provider_directory_corroboration_marks_address_and_prefer
                         "provider_directory_location_resource_id": "loc-1",
                         "provider_directory_location_name": "Example Clinic",
                         "provider_directory_telephone_number": "312-555-0100",
+                        "provider_directory_phone_number": "3125550100",
+                        "provider_directory_phone_extension": "45",
                         "provider_directory_fax_number": "312-555-0101",
+                        "provider_directory_fax_number_digits": "3125550101",
+                        "provider_directory_fax_extension": "9",
                         "provider_directory_plan_context_matched": True,
                         "provider_directory_network_context_present": True,
                         "provider_directory_network_refs": ["Organization/network-1"],
@@ -119,10 +123,16 @@ async def test_overlay_provider_directory_corroboration_marks_address_and_prefer
     assert row["location_source"] == "provider_directory_fhir"
     assert row["location_confidence_code"] == "payer_directory_corroborated_location"
     assert row["telephone_number"] == "312-555-0100"
+    assert row["phone_number"] == "3125550100"
+    assert row["phone_extension"] == "45"
     assert row["fax_number"] == "312-555-0101"
+    assert row["fax_number_digits"] == "3125550101"
+    assert row["fax_extension"] == "9"
     assert row["address_payload"]["address_sources"] == ["provider_directory_fhir"]
     assert row["address_payload"]["address_network_binding"] == "payer_directory_corroborated_location"
     assert row["address_payload"]["provider_directory_location_name"] == "Example Clinic"
+    assert row["address_payload"]["phone_number"] == "3125550100"
+    assert row["address_payload"]["fax_number_digits"] == "3125550101"
     item = ptg2_serving._compact_item_from_row({**row, "prices": []}, {})
     assert item["address_verification"]["address_network_binding"] == "payer_directory_corroborated_location"
     assert item["address_verification"]["requires_location_confirmation"] is False
@@ -700,6 +710,10 @@ async def test_manifest_enriched_provider_unified_fallback_uses_bounded_cte(monk
     assert "fallback_addresses AS MATERIALIZED" in sql
     assert "JOIN source_npis source_filter ON source_filter.npi = na.npi" in sql
     assert "LEFT JOIN fallback_addresses na" in sql
+    assert "na.phone_number" in sql
+    assert "addr.phone_number" in sql
+    assert "'fax_number_digits'" in sql
+    assert "json_build_object(\n                (" not in sql
     assert "LEFT JOIN LATERAL (\n                SELECT na.first_line" not in sql
 
 
@@ -2367,6 +2381,37 @@ def test_compact_item_promotes_location_phone_from_address_payload():
     assert item["address"]["telephone_number"] == "3125551212"
 
 
+def test_compact_item_preserves_canonical_contact_fields_from_address_payload():
+    item = ptg2_serving._compact_item_from_row(
+        {
+            "npi": 1234567890,
+            "provider_name": "Example Surgeon",
+            "address_payload": {
+                "address_key": "00000000-0000-0000-0000-000000000001",
+                "first_line": "100 Network Way",
+                "city": "Chicago",
+                "state": "IL",
+                "telephone_number": "(312) 555-1212 ext. 45",
+                "phone_number": "3125551212",
+                "phone_extension": "45",
+                "fax_number": "(312) 555-1213",
+                "fax_number_digits": "3125551213",
+                "fax_extension": "9",
+            },
+            "prices": [],
+        },
+        {},
+    )
+
+    assert item["phone"] == "(312) 555-1212 ext. 45"
+    assert item["telephone_number"] == "(312) 555-1212 ext. 45"
+    assert item["phone_number"] == "3125551212"
+    assert item["phone_extension"] == "45"
+    assert item["fax_number"] == "(312) 555-1213"
+    assert item["fax_number_digits"] == "3125551213"
+    assert item["fax_extension"] == "9"
+
+
 def test_compact_item_marks_unified_address_as_inferred_from_provider_identity():
     item = ptg2_serving._compact_item_from_row(
         {
@@ -3204,7 +3249,11 @@ def test_compact_item_strips_phone_and_distance_for_no_display_address():
             "address_payload": {
                 "address_key": "00000000-0000-0000-0000-000000000001",
                 "telephone_number": "217-555-0100",
+                "phone_number": "2175550100",
+                "phone_extension": "101",
                 "fax_number": "217-555-0101",
+                "fax_number_digits": "2175550101",
+                "fax_extension": "102",
             },
             "distance_miles": 2.3,
             "zip_match_type": "radius",
@@ -3228,6 +3277,9 @@ def test_compact_item_strips_phone_and_distance_for_no_display_address():
         "phone_number",
         "phone",
         "fax_number",
+        "fax_number_digits",
+        "phone_extension",
+        "fax_extension",
         "distance_miles",
         "zip_match_type",
         "coordinates",

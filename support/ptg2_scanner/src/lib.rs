@@ -2,6 +2,7 @@
 
 pub mod address_canon;
 pub mod config;
+pub mod contact_canon;
 pub mod copy_format;
 pub mod dedupe;
 pub mod hashing;
@@ -14,6 +15,7 @@ pub mod progress;
 #[cfg(feature = "python")]
 mod python_api {
     use crate::address_canon::{canon_version_json, canonicalize_address, CanonicalAddress};
+    use crate::contact_canon::canonicalize_contact_pair;
     use pyo3::exceptions::PyRuntimeError;
     use pyo3::prelude::*;
     use pyo3::types::{PyDict, PyList};
@@ -28,6 +30,7 @@ mod python_api {
         Option<String>,
         Option<String>,
     );
+    type ContactRow = (Option<String>, Option<String>, Option<String>);
 
     #[pyfunction]
     fn canonicalize_batch(py: Python<'_>, rows: Vec<AddressRow>) -> PyResult<Py<PyList>> {
@@ -48,6 +51,32 @@ mod python_api {
         let list = PyList::empty(py);
         for item in results {
             list.append(canonical_to_dict(py, &item)?)?;
+        }
+        Ok(list.into())
+    }
+
+    #[pyfunction]
+    fn canonicalize_contact_batch(py: Python<'_>, rows: Vec<ContactRow>) -> PyResult<Py<PyList>> {
+        let results = py.detach(|| {
+            rows.par_iter()
+                .map(|row| {
+                    canonicalize_contact_pair(row.0.as_deref(), row.1.as_deref(), row.2.as_deref())
+                })
+                .collect::<Vec<_>>()
+        });
+        let list = PyList::empty(py);
+        for item in results {
+            let dict = PyDict::new(py);
+            dict.set_item("phone_number", item.phone.number.as_deref())?;
+            dict.set_item("phone_extension", item.phone.extension.as_deref())?;
+            dict.set_item("phone_is_international", item.phone.is_international)?;
+            dict.set_item("phone_valid_for_fallback", item.phone.valid_for_fallback)?;
+            dict.set_item("fax_number", item.fax.number.as_deref())?;
+            dict.set_item("fax_number_digits", item.fax.number.as_deref())?;
+            dict.set_item("fax_extension", item.fax.extension.as_deref())?;
+            dict.set_item("fax_is_international", item.fax.is_international)?;
+            dict.set_item("fax_valid_for_fallback", item.fax.valid_for_fallback)?;
+            list.append(dict)?;
         }
         Ok(list.into())
     }
@@ -94,6 +123,7 @@ mod python_api {
     #[pymodule]
     fn ptg2_address_canon(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(canonicalize_batch, m)?)?;
+        m.add_function(wrap_pyfunction!(canonicalize_contact_batch, m)?)?;
         m.add_function(wrap_pyfunction!(canon_version, m)?)?;
         Ok(())
     }

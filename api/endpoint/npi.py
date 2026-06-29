@@ -1477,7 +1477,7 @@ def _address_zip5_filter(alias: str, address_table_sql: str, *, any_array: bool 
 
 def _address_phone_digits_filter(alias: str, address_table_sql: str) -> str:
     if _address_table_is_unified(address_table_sql):
-        return f"{alias}.telephone_number = :phone_digits"
+        return f"{alias}.phone_number = :phone_digits"
     return f"regexp_replace(COALESCE({alias}.telephone_number, ''), '[^0-9]', '', 'g') = :phone_digits"
 
 

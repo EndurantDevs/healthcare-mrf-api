@@ -40,6 +40,7 @@ from process.ext.address_canon import (
     stamp_address_keys,
 )
 from process.ext.archive import unzip
+from process.ext.contact_canon import canonicalize_one as canonicalize_contact_one
 from process.ext.utils import (download_it_and_save, ensure_database,
                                flush_error_log, get_import_schema, log_error,
                                make_class, my_init_db, print_time_info,
@@ -762,6 +763,8 @@ def _normalize_marketplace_address_entry(address):
     )
     country_code = _normalize_upper(address.get("country") or address.get("country_code"))
     telephone_number = _coerce_text(address.get("phone") or address.get("telephone"))
+    fax_number = _coerce_text(address.get("fax") or address.get("fax_number"))
+    canonical_contact = canonicalize_contact_one((telephone_number, fax_number, country_code or "US"))
     checksum = return_checksum(
         [
             first_line or "",
@@ -781,6 +784,11 @@ def _normalize_marketplace_address_entry(address):
         "postal_code": postal_code,
         "country_code": country_code,
         "telephone_number": telephone_number,
+        "fax_number": fax_number,
+        "phone_number": canonical_contact.get("phone_number"),
+        "phone_extension": canonical_contact.get("phone_extension"),
+        "fax_number_digits": canonical_contact.get("fax_number_digits") or canonical_contact.get("fax_number"),
+        "fax_extension": canonical_contact.get("fax_extension"),
         "formatted_address": ", ".join(
             [
                 part
@@ -867,6 +875,10 @@ def _build_mrf_address_rows(res, network_tiers, import_id, source_url, last_upda
                 "postal_code": normalized["postal_code"],
                 "country_code": normalized["country_code"],
                 "telephone_number": normalized["telephone_number"],
+                "phone_number": normalized["phone_number"],
+                "phone_extension": normalized["phone_extension"],
+                "fax_number_digits": normalized["fax_number_digits"],
+                "fax_extension": normalized["fax_extension"],
                 "observed_at": last_updated_on,
                 "address_key": computed_address_key,
             }
@@ -882,6 +894,11 @@ def _build_mrf_address_rows(res, network_tiers, import_id, source_url, last_upda
             "postal_code": normalized["postal_code"],
             "country_code": normalized["country_code"],
             "telephone_number": normalized["telephone_number"],
+            "fax_number": normalized["fax_number"],
+            "phone_number": normalized["phone_number"],
+            "phone_extension": normalized["phone_extension"],
+            "fax_number_digits": normalized["fax_number_digits"],
+            "fax_extension": normalized["fax_extension"],
             "formatted_address": normalized["formatted_address"],
             "date_added": last_updated_on.date() if last_updated_on else None,
             "address_key": computed_address_key,
@@ -901,6 +918,11 @@ _MRF_ADDRESS_INSERT_COLUMNS = (
     "postal_code",
     "country_code",
     "telephone_number",
+    "fax_number",
+    "phone_number",
+    "phone_extension",
+    "fax_number_digits",
+    "fax_extension",
     "formatted_address",
     "date_added",
     "address_key",
@@ -947,6 +969,11 @@ async def _refresh_mrf_address_summary(import_date: str, db_schema: str) -> None
             postal_code,
             country_code,
             telephone_number,
+            fax_number,
+            phone_number,
+            phone_extension,
+            fax_number_digits,
+            fax_extension,
             formatted_address,
             date_added,
             address_key,
@@ -970,6 +997,11 @@ async def _refresh_mrf_address_summary(import_date: str, db_schema: str) -> None
             postal_code,
             country_code,
             telephone_number,
+            fax_number,
+            phone_number,
+            phone_extension,
+            fax_number_digits,
+            fax_extension,
             formatted_address,
             date_added,
             address_key,
@@ -996,6 +1028,11 @@ async def _refresh_mrf_address_summary(import_date: str, db_schema: str) -> None
                         'US'
                     ) AS country_code,
                     MIN(telephone_number) FILTER (WHERE telephone_number IS NOT NULL AND telephone_number <> '') AS telephone_number,
+                    NULL::varchar AS fax_number,
+                    MIN(phone_number) FILTER (WHERE phone_number IS NOT NULL AND phone_number <> '') AS phone_number,
+                    MIN(phone_extension) FILTER (WHERE phone_extension IS NOT NULL AND phone_extension <> '') AS phone_extension,
+                    MIN(fax_number_digits) FILTER (WHERE fax_number_digits IS NOT NULL AND fax_number_digits <> '') AS fax_number_digits,
+                    MIN(fax_extension) FILTER (WHERE fax_extension IS NOT NULL AND fax_extension <> '') AS fax_extension,
                     concat_ws(
                         ', ',
                         NULLIF(
@@ -1037,6 +1074,11 @@ async def _refresh_mrf_address_summary(import_date: str, db_schema: str) -> None
                postal_code = EXCLUDED.postal_code,
                country_code = EXCLUDED.country_code,
                telephone_number = EXCLUDED.telephone_number,
+               fax_number = EXCLUDED.fax_number,
+               phone_number = EXCLUDED.phone_number,
+               phone_extension = EXCLUDED.phone_extension,
+               fax_number_digits = EXCLUDED.fax_number_digits,
+               fax_extension = EXCLUDED.fax_extension,
                formatted_address = EXCLUDED.formatted_address,
                date_added = EXCLUDED.date_added,
                address_key = COALESCE({address_cls.__tablename__}.address_key, EXCLUDED.address_key),

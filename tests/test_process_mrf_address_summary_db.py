@@ -46,7 +46,8 @@ async def test_refresh_mrf_address_summary_materializes_grouped_evidence_rows(mo
                 year, checksum_network, network_tier, import_id, import_date,
                 address_source, source_table, source_url, source_record_id,
                 first_line, second_line, city_name, state_name, postal_code,
-                country_code, telephone_number, observed_at, address_key
+                country_code, telephone_number, phone_number, phone_extension,
+                fax_number_digits, fax_extension, observed_at, address_key
             )
             VALUES
                 (
@@ -54,7 +55,8 @@ async def test_refresh_mrf_address_summary_materializes_grouped_evidence_rows(mo
                     2026, 7001, 'preferred', 'import-b', DATE '2026-06-16',
                     'network', 'plan_npi_raw', 'https://example.test/b', 'rec-b',
                     '22 Main Street', NULL, 'Boston', 'MA', '02108',
-                    NULL, '6175550102', TIMESTAMP '2026-06-16 12:05:00',
+                    NULL, '6175550102', '6175550102', NULL, NULL, NULL,
+                    TIMESTAMP '2026-06-16 12:05:00',
                     '00000000-0000-0000-0000-000000000002'
                 ),
                 (
@@ -62,7 +64,8 @@ async def test_refresh_mrf_address_summary_materializes_grouped_evidence_rows(mo
                     2026, 7001, 'preferred', 'import-a', DATE '2026-06-15',
                     'marketplace_provider', 'plan_npi_raw', 'https://example.test/a', 'rec-a',
                     '22 Main Street', 'Suite 3', 'Boston', 'MA', '02108',
-                    'US', '6175550101', TIMESTAMP '2026-06-15 09:00:00',
+                    'US', '6175550101', '6175550101', '45', '6175550199', '9',
+                    TIMESTAMP '2026-06-15 09:00:00',
                     '00000000-0000-0000-0000-000000000001'
                 ),
                 (
@@ -70,7 +73,8 @@ async def test_refresh_mrf_address_summary_materializes_grouped_evidence_rows(mo
                     2026, 7002, NULL, 'import-c', DATE '2026-06-14',
                     'network', 'plan_npi_raw', 'https://example.test/c', 'rec-c',
                     'PO Box 9', NULL, 'Cambridge', 'MA', '02139',
-                    'US', NULL, TIMESTAMP '2026-06-14 08:00:00',
+                    'US', NULL, NULL, NULL, NULL, NULL,
+                    TIMESTAMP '2026-06-14 08:00:00',
                     NULL
                 );
             """
@@ -83,6 +87,7 @@ async def test_refresh_mrf_address_summary_materializes_grouped_evidence_rows(mo
             SELECT
                 npi, type, checksum, first_line, second_line, city_name,
                 state_name, postal_code, country_code, telephone_number,
+                phone_number, phone_extension, fax_number_digits, fax_extension,
                 formatted_address, date_added, address_key::text AS address_key,
                 address_sources, source_record_ids, source_import_ids,
                 source_import_dates, source_issuer_ids, source_issuer_names,
@@ -100,6 +105,10 @@ async def test_refresh_mrf_address_summary_materializes_grouped_evidence_rows(mo
         assert practice["second_line"] == "Suite 3"
         assert practice["country_code"] == "US"
         assert practice["telephone_number"] == "6175550101"
+        assert practice["phone_number"] == "6175550101"
+        assert practice["phone_extension"] == "45"
+        assert practice["fax_number_digits"] == "6175550199"
+        assert practice["fax_extension"] == "9"
         assert practice["formatted_address"] == "22 Main Street Suite 3, Boston MA 02108"
         assert str(practice["date_added"]) == "2026-06-15"
         assert practice["address_key"] == "00000000-0000-0000-0000-000000000001"
