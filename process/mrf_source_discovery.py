@@ -2260,15 +2260,7 @@ def _healthsparq_rows_from_metadata(
                 "last_updated_on": file_item.get("lastUpdatedOn"),
                 "reporting_entity_name": file_item.get("reportingEntityName"),
                 # Normalized to the import-control preview plan shape (snake_case keys).
-                "plan_info": [
-                    {
-                        "plan_id": plan.get("planId"),
-                        "plan_id_type": plan.get("planIdType"),
-                        "plan_market_type": plan.get("planMarketType"),
-                        "plan_name": plan.get("planName"),
-                    }
-                    for plan in reporting_plans
-                ],
+                "plan_info": _healthsparq_plan_info(file_item),
             },
             "first_seen_at": now,
             "last_seen_at": now,

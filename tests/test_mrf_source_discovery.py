@@ -917,6 +917,53 @@ def test_healthsparq_query_expansion_filters_before_limit_and_disambiguates_plan
     assert len({plan["engine_plan_hash"] for plan in plan_info}) == 2
 
 
+def test_healthsparq_metadata_rows_preserve_engine_plan_hashes_for_catalog_sync():
+    source = {
+        "source_id": "src_aetna",
+        "payer_id": "payer_aetna",
+        "display_name": "Example Carrier",
+    }
+    payload = {
+        "files": [
+            {
+                "reportingEntityName": "Example Reporting Entity",
+                "reportingEntityType": "Third Party Administrator_222",
+                "reportingPlans": [
+                    {
+                        "planId": "222222222",
+                        "planIdType": "ein",
+                        "planMarketType": "group",
+                        "planName": "Example Packaging HSA Choice Plan",
+                    },
+                    {
+                        "planId": "222222222",
+                        "planIdType": "ein",
+                        "planMarketType": "group",
+                        "planName": "Example Packaging Choice Plan",
+                    },
+                ],
+                "fileSchema": "TABLE_OF_CONTENTS",
+                "fileName": "2026-06-01_222_index.json.gz",
+                "filePath": "2026-06-01/tableOfContents/2026-06-01_222_index.json.gz",
+            }
+        ]
+    }
+
+    _, file_rows = discovery._healthsparq_rows_from_metadata(
+        source,
+        "https://mrf.healthsparq.com/example/prd/mrf/A/BRAND/latest_metadata.json",
+        payload,
+    )
+
+    assert len(file_rows) == 1
+    plan_info = file_rows[0]["metadata_json"]["plan_info"]
+    assert [plan["plan_name"] for plan in plan_info] == [
+        "Example Packaging HSA Choice Plan",
+        "Example Packaging Choice Plan",
+    ]
+    assert len({plan["engine_plan_hash"] for plan in plan_info}) == 2
+
+
 def test_query_expansion_match_tolerates_legal_suffix_and_concatenated_plan_text():
     assert discovery._search_values_match_query(
         ["Absopure Water Co., et. al DBA Example PackagingHSA Aetna Choice POS II"],
@@ -5200,7 +5247,13 @@ def test_healthsparq_metadata_rows_include_direct_file_urls_and_plans():
     )
     assert file_rows[0]["from_index_url"] == metadata_url
     assert file_rows[0]["metadata_json"]["resolver"] == "healthsparq_public_mrf"
-    assert file_rows[0]["metadata_json"]["plan_info"] == [
+    assert [
+        {
+            key: plan[key]
+            for key in ("plan_id", "plan_id_type", "plan_market_type", "plan_name")
+        }
+        for plan in file_rows[0]["metadata_json"]["plan_info"]
+    ] == [
         {
             "plan_id": "20523CA003",
             "plan_id_type": "hios",
@@ -5208,6 +5261,7 @@ def test_healthsparq_metadata_rows_include_direct_file_urls_and_plans():
             "plan_name": "Aetna Open Access",
         }
     ]
+    assert file_rows[0]["metadata_json"]["plan_info"][0]["engine_plan_hash"]
 
 
 def test_healthsparq_targets_from_metadata_expand_direct_file_urls_and_plans():
