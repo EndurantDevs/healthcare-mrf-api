@@ -891,7 +891,7 @@ async def _overlay_provider_directory_corroboration(
                 FROM {corroboration_table}
                 WHERE provider_directory_active_match IS TRUE
                   AND npi = ANY(CAST(:npis AS bigint[]))
-                  AND address_key::text = ANY(CAST(:address_keys AS text[]))
+                  AND address_key = ANY(CAST(:address_keys AS uuid[]))
                   AND (:source_key IS NULL OR source_key = :source_key)
                   AND (:snapshot_id IS NULL OR snapshot_id = :snapshot_id)
                   AND (
@@ -2404,8 +2404,8 @@ async def _ptg2_manifest_location_provider_matches(
                   FROM {npi_address_table}
                  WHERE NULLIF(BTRIM(telephone_number), '') IS NOT NULL
                    AND (
-                        address_key::text = ANY(CAST(:address_keys AS text[]))
-                        OR premise_key::text = ANY(CAST(:premise_keys AS text[]))
+                        address_key = ANY(CAST(:address_keys AS uuid[]))
+                        OR premise_key = ANY(CAST(:premise_keys AS uuid[]))
                    )
                 """
             ),
