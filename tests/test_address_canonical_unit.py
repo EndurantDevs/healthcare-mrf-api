@@ -3515,9 +3515,10 @@ def test_ptg_address_partial_patch_sql_deletes_same_changed_scope_and_inserts_st
     assert 'DELETE FROM "mrf"."ptg_address" AS live' in delete_sql
     assert "live.source_key IN ('payer_a')" in delete_sql
     assert "live.source_key = 'ptg_member_fallback'" in delete_sql
-    assert "COALESCE(live.ptg_source_array, ARRAY[]::varchar[]) && ARRAY['payer_a']::varchar[]" in delete_sql
+    assert "live.ptg_source_array && ARRAY['payer_a']::varchar[]" in delete_sql
     assert 'FROM "mrf"."ptg2_provider_group_member_a" member_src' in delete_sql
-    assert "live.npi IN (" in delete_sql
+    assert "USING (" in delete_sql
+    assert "live.npi = changed_member.npi" in delete_sql
     assert 'INSERT INTO "mrf"."ptg_address"' in insert_sql
     assert 'FROM "mrf"."ptg_address_20260623" AS stage' in insert_sql
     assert 'stage."source_key"' in insert_sql

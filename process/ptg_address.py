@@ -376,10 +376,46 @@ def _delete_live_ptg_address_partial_sql(
     changed_source_keys: list[str],
     changed_member_tables: list[str] | None = None,
 ) -> str:
-    return f"""
-    DELETE FROM {_qualified_table_ref(db_schema, PTGAddress.__main_table__)} AS live
-     WHERE {_ptg_address_changed_live_predicate_sql(db_schema, "live", changed_source_keys, changed_member_tables)};
-    """
+    source_literals = ", ".join(_sql_literal(source_key) for source_key in changed_source_keys)
+    source_array = "ARRAY[" + source_literals + "]::varchar[]"
+    live_table = _qualified_table_ref(db_schema, PTGAddress.__main_table__)
+    fallback_source = _sql_literal(PTG_ADDRESS_MEMBER_FALLBACK_SOURCE_KEY)
+    statements = [
+        f"""
+    DELETE FROM {live_table} AS live
+     WHERE live.source_key IN ({source_literals});
+        """,
+        f"""
+    DELETE FROM {live_table} AS live
+     WHERE live.source_key = {fallback_source}
+       AND live.ptg_source_array && {source_array};
+        """,
+    ]
+    member_tables = sorted(
+        {
+            cleaned
+            for table_name in changed_member_tables or []
+            if (cleaned := _clean_optional(table_name))
+        }
+    )
+    if member_tables:
+        member_npi_selects = "\n            UNION\n".join(
+            f"            SELECT member_src.npi::bigint AS npi\n"
+            f"              FROM {_qualified_table_ref(db_schema, table_name)} member_src\n"
+            "             WHERE member_src.npi IS NOT NULL"
+            for table_name in member_tables
+        )
+        statements.append(
+            f"""
+    DELETE FROM {live_table} AS live
+          USING (
+{member_npi_selects}
+          ) AS changed_member(npi)
+     WHERE live.source_key = {fallback_source}
+       AND live.npi = changed_member.npi;
+            """
+        )
+    return "\n".join(statements)
 
 
 def _insert_stage_ptg_address_into_live_sql(db_schema: str, stage_table: str) -> str:
