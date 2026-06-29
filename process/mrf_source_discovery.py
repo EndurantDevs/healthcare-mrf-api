@@ -11684,13 +11684,15 @@ async def _push_import_control_catalog(
                 if not ic_source_id:
                     continue
                 stored = await _fetch_import_control_source(session, base, ic_source_id)
-                # Only flip to public if the row still carries our staged sentinel; any other
-                # state means the source pre-existed and an operator decision must stand.
+                # Flip staged rows public after ingest. Also let an active registry row with
+                # crawled files clear a stale state left by an older duplicate URL row.
                 staged = stored is None or (
                     str(stored.get("visibility") or "")
                     == _IMPORT_CONTROL_STAGED_VISIBILITY
                     and str(stored.get("status") or "") == _IMPORT_CONTROL_STAGED_STATUS
                 )
+                stored_status = str((stored or {}).get("status") or "").lower()
+                source_status_lower = source_status.lower()
                 source_plans = 0
                 if items:
                     for batch in _chunked(_split_preview_items(items), 100):
@@ -11700,7 +11702,11 @@ async def _push_import_control_catalog(
                     await _mark_import_control_seed_promoted(
                         session, base, row, ic_source_id
                     )
-                if staged or source_status.lower() != "active":
+                if (
+                    staged
+                    or source_status_lower != "active"
+                    or (items and stored_status == "stale")
+                ):
                     await _promote_import_control_source(
                         session,
                         base,

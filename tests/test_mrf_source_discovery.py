@@ -5511,8 +5511,8 @@ async def test_push_import_control_catalog_dedupes_same_url_to_active_snapshot(
                 return FakeResponse(
                     {
                         "source_id": "ic_source_1",
-                        "visibility": "internal",
-                        "status": "needs_review",
+                        "visibility": "public",
+                        "status": "stale",
                     }
                 )
             return FakeResponse({}, status=404)
