@@ -5426,8 +5426,20 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                     run_id,
                     phase="provider-directory publishing artifacts",
                     done=0,
-                    total=3,
+                    total=4,
                     message="publishing Provider Directory address artifacts",
+                    metrics=metrics,
+                )
+                metrics["location_contacts_backfilled"] = await backfill_provider_directory_location_contacts()
+                await _mark_provider_directory_progress(
+                    run_id,
+                    phase="provider-directory publishing artifacts",
+                    done=1,
+                    total=4,
+                    message=(
+                        "backfilled Provider Directory location contacts; "
+                        f"rows={metrics['location_contacts_backfilled'].get('location_contact_rows_updated', 0)}"
+                    ),
                     metrics=metrics,
                 )
                 if seen_stage_table_for_publish:
@@ -5439,8 +5451,8 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                 await _mark_provider_directory_progress(
                     run_id,
                     phase="provider-directory publishing artifacts",
-                    done=1,
-                    total=3,
+                    done=2,
+                    total=4,
                     message=(
                         "stamped Provider Directory location address keys; "
                         f"rows={metrics['location_address_keys_stamped']}"
@@ -5451,8 +5463,8 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                 await _mark_provider_directory_progress(
                     run_id,
                     phase="provider-directory publishing artifacts",
-                    done=2,
-                    total=3,
+                    done=3,
+                    total=4,
                     message=(
                         "published Provider Directory locations to address archive; "
                         f"inserted={metrics['location_archive'].get('inserted', 0)} "
@@ -5466,12 +5478,16 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                 await _mark_provider_directory_progress(
                     run_id,
                     phase="provider-directory publishing artifacts",
-                    done=3,
-                    total=3,
+                    done=4,
+                    total=4,
                     message="published Provider Directory PTG corroboration artifacts",
                     metrics=metrics,
                 )
             else:
+                metrics["location_contacts_backfilled"] = {
+                    "skipped": True,
+                    "reason": "publish_artifacts_disabled",
+                }
                 metrics["location_address_keys_stamped"] = 0
                 metrics["location_archive"] = {"skipped": True, "reason": "publish_artifacts_disabled"}
                 metrics["ptg_corroboration_view_published"] = False

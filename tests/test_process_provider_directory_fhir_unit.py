@@ -1646,6 +1646,11 @@ async def test_process_data_stamps_locations_and_publishes_corroboration_view(mo
     monkeypatch.setattr(importer, "_ensure_provider_directory_tables", AsyncMock())
     monkeypatch.setattr(importer, "_upsert_rows", AsyncMock(return_value=1))
     monkeypatch.setattr(importer, "_import_resources", AsyncMock(return_value={"Location": 2}))
+    monkeypatch.setattr(
+        importer,
+        "backfill_provider_directory_location_contacts",
+        AsyncMock(return_value={"location_contact_rows_updated": 5}),
+    )
     monkeypatch.setattr(importer, "publish_provider_directory_location_address_keys", AsyncMock(return_value=3))
     monkeypatch.setattr(
         importer,
@@ -1671,9 +1676,11 @@ async def test_process_data_stamps_locations_and_publishes_corroboration_view(mo
 
     assert metrics["resource_rows"] == {"Location": 2}
     assert metrics["sources_import_attempted"] == 1
+    assert metrics["location_contacts_backfilled"] == {"location_contact_rows_updated": 5}
     assert metrics["location_address_keys_stamped"] == 3
     assert metrics["location_archive"] == {"inserted": 4, "provenance_updates": 1}
     assert metrics["ptg_corroboration_view_published"] is True
+    importer.backfill_provider_directory_location_contacts.assert_awaited_once()
     importer.publish_provider_directory_location_address_keys.assert_awaited_once()
     importer.publish_provider_directory_location_archive.assert_awaited_once()
     importer.publish_provider_directory_ptg_address_corroboration_if_available.assert_awaited_once()
@@ -1685,6 +1692,11 @@ async def test_process_data_skips_artifact_publish_for_targeted_resource_import(
     monkeypatch.setattr(importer, "_ensure_provider_directory_tables", AsyncMock())
     monkeypatch.setattr(importer, "_upsert_rows", AsyncMock(return_value=1))
     monkeypatch.setattr(importer, "_import_resources", AsyncMock(return_value={"PractitionerRole": 2}))
+    monkeypatch.setattr(
+        importer,
+        "backfill_provider_directory_location_contacts",
+        AsyncMock(return_value={"location_contact_rows_updated": 5}),
+    )
     monkeypatch.setattr(importer, "publish_provider_directory_location_address_keys", AsyncMock(return_value=3))
     monkeypatch.setattr(
         importer,
@@ -1708,9 +1720,14 @@ async def test_process_data_skips_artifact_publish_for_targeted_resource_import(
     )
 
     assert metrics["publish_artifacts"] is False
+    assert metrics["location_contacts_backfilled"] == {
+        "skipped": True,
+        "reason": "publish_artifacts_disabled",
+    }
     assert metrics["location_address_keys_stamped"] == 0
     assert metrics["location_archive"] == {"skipped": True, "reason": "publish_artifacts_disabled"}
     assert metrics["ptg_corroboration_view_published"] is False
+    importer.backfill_provider_directory_location_contacts.assert_not_awaited()
     importer.publish_provider_directory_location_address_keys.assert_not_awaited()
     importer.publish_provider_directory_location_archive.assert_not_awaited()
     importer.publish_provider_directory_ptg_address_corroboration_if_available.assert_not_awaited()
