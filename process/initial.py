@@ -40,7 +40,7 @@ from process.ext.address_canon import (
     stamp_address_keys,
 )
 from process.ext.archive import unzip
-from process.ext.contact_canon import canonicalize_one as canonicalize_contact_one
+from process.ext.contact_canon import canonicalize_batch as canonicalize_contact_batch
 from process.ext.utils import (download_it_and_save, ensure_database,
                                flush_error_log, get_import_schema, log_error,
                                make_class, my_init_db, print_time_info,
@@ -747,7 +747,23 @@ def _normalize_marketplace_benefits(plan_id, year, issuer_id, benefits, last_upd
     return rows
 
 
-def _normalize_marketplace_address_entry(address):
+def _marketplace_contact_row(address):
+    return (
+        address.get("telephone_number"),
+        address.get("fax_number"),
+        address.get("country_code") or "US",
+    )
+
+
+def _apply_marketplace_contact_fields(address, canonical_contact):
+    address["phone_number"] = canonical_contact.get("phone_number")
+    address["phone_extension"] = canonical_contact.get("phone_extension")
+    address["fax_number_digits"] = canonical_contact.get("fax_number_digits") or canonical_contact.get("fax_number")
+    address["fax_extension"] = canonical_contact.get("fax_extension")
+    return address
+
+
+def _normalize_marketplace_address_entry_base(address):
     if not isinstance(address, dict):
         return None
 
@@ -764,7 +780,6 @@ def _normalize_marketplace_address_entry(address):
     country_code = _normalize_upper(address.get("country") or address.get("country_code"))
     telephone_number = _coerce_text(address.get("phone") or address.get("telephone"))
     fax_number = _coerce_text(address.get("fax") or address.get("fax_number"))
-    canonical_contact = canonicalize_contact_one((telephone_number, fax_number, country_code or "US"))
     checksum = return_checksum(
         [
             first_line or "",
@@ -785,10 +800,6 @@ def _normalize_marketplace_address_entry(address):
         "country_code": country_code,
         "telephone_number": telephone_number,
         "fax_number": fax_number,
-        "phone_number": canonical_contact.get("phone_number"),
-        "phone_extension": canonical_contact.get("phone_extension"),
-        "fax_number_digits": canonical_contact.get("fax_number_digits") or canonical_contact.get("fax_number"),
-        "fax_extension": canonical_contact.get("fax_extension"),
         "formatted_address": ", ".join(
             [
                 part
@@ -800,6 +811,16 @@ def _normalize_marketplace_address_entry(address):
             ]
         ),
     }
+
+
+def _normalize_marketplace_address_entry(address):
+    normalized = _normalize_marketplace_address_entry_base(address)
+    if not normalized:
+        return None
+    canonical_contact = canonicalize_contact_batch([_marketplace_contact_row(normalized)])[0]
+    return _apply_marketplace_contact_fields(normalized, canonical_contact)
+
+
 def _build_mrf_address_rows(res, network_tiers, import_id, source_url, last_updated_on, issuer_lookup=None):
     addresses = res.get("addresses", []) or []
     if not isinstance(addresses, list):
@@ -815,10 +836,18 @@ def _build_mrf_address_rows(res, network_tiers, import_id, source_url, last_upda
     except (TypeError, ValueError):
         import_date_value = None
 
-    for address in addresses:
-        normalized = _normalize_marketplace_address_entry(address)
-        if not normalized:
-            continue
+    normalized_addresses = [
+        normalized
+        for address in addresses
+        if (normalized := _normalize_marketplace_address_entry_base(address))
+    ]
+    canonical_contacts = canonicalize_contact_batch(
+        _marketplace_contact_row(normalized)
+        for normalized in normalized_addresses
+    )
+
+    for normalized, canonical_contact in zip(normalized_addresses, canonical_contacts):
+        normalized = _apply_marketplace_contact_fields(normalized, canonical_contact)
         computed_address_key = address_key_v1(
             normalized["first_line"],
             normalized["second_line"],

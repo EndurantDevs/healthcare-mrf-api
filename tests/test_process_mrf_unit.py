@@ -1376,6 +1376,73 @@ def test_build_mrf_address_rows_creates_address_and_evidence():
     assert evidence_row["address_key"] == expected_address_key
 
 
+def test_build_mrf_address_rows_batches_contact_normalization(monkeypatch):
+    seen_batches = []
+
+    def fake_canonicalize_contact_batch(rows):
+        rows = list(rows)
+        seen_batches.append(rows)
+        return [
+            {
+                "phone_number": "5125550000",
+                "phone_extension": None,
+                "fax_number_digits": "5125550199",
+                "fax_extension": None,
+            },
+            {
+                "phone_number": "5125550001",
+                "phone_extension": "12",
+                "fax_number_digits": None,
+                "fax_extension": None,
+            },
+        ]
+
+    monkeypatch.setattr(process_initial, "canonicalize_contact_batch", fake_canonicalize_contact_batch)
+
+    address_rows, _evidence_rows = process_initial._build_mrf_address_rows(
+        {
+            "npi": "1234567890",
+            "addresses": [
+                {
+                    "address": "123 Main St",
+                    "city": "Austin",
+                    "state": "TX",
+                    "zip": "78701",
+                    "phone": "512-555-0000",
+                    "fax": "512-555-0199",
+                },
+                {
+                    "address": "124 Main St",
+                    "city": "Austin",
+                    "state": "TX",
+                    "zip": "78701",
+                    "phone": "512-555-0001 x12",
+                },
+            ],
+        },
+        {
+            1: {
+                "issuer_id": 12345,
+                "year": 2026,
+                "checksum_network": 111,
+                "network_tier": "PREFERRED",
+            },
+        },
+        "20260601000000",
+        "https://example.test/provider.json",
+        datetime.datetime(2026, 6, 1, 12, 0, 0),
+    )
+
+    assert seen_batches == [
+        [
+            ("512-555-0000", "512-555-0199", "US"),
+            ("512-555-0001 x12", None, "US"),
+        ]
+    ]
+    assert [row["phone_number"] for row in address_rows] == ["5125550000", "5125550001"]
+    assert address_rows[1]["phone_extension"] == "12"
+
+
 @pytest.mark.asyncio
 async def test_push_mrf_address_rows_skips_aggregate_ingest_by_default(monkeypatch):
     calls = []

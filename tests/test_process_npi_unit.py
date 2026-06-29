@@ -343,6 +343,62 @@ async def test_process_npi_chunk_batches_address_key_precompute(monkeypatch, npi
 
 
 @pytest.mark.asyncio
+async def test_process_npi_chunk_batches_contact_normalization(monkeypatch, npi_module):
+    monkeypatch.delenv("HLTHPRT_ADDRESS_CANON_SOURCES", raising=False)
+
+    seen_batches = []
+
+    def fake_canonicalize_contact_batch(rows):
+        rows = list(rows)
+        seen_batches.append(rows)
+        return [
+            {
+                "phone_number": "5125550100",
+                "phone_extension": None,
+                "fax_number_digits": None,
+                "fax_extension": None,
+            },
+            {
+                "phone_number": "5125550199",
+                "phone_extension": None,
+                "fax_number_digits": None,
+                "fax_extension": None,
+            },
+        ]
+
+    monkeypatch.setattr(npi_module, "canonicalize_contact_batch", fake_canonicalize_contact_batch)
+    fake_redis = SimpleNamespace(enqueue_job=AsyncMock())
+    ctx = {"redis": fake_redis, "import_date": "20251104"}
+
+    npi_csv_map = {
+        "NPI": "npi",
+        "Entity Type Code": "entity_type_code",
+        "Provider Organization Name (Legal Business Name)": "provider_organization_name",
+    }
+    npi_csv_map_reverse = {value: key for key, value in npi_csv_map.items()}
+
+    await npi_module.process_npi_chunk(
+        ctx,
+        {
+            "npi_csv_map": npi_csv_map,
+            "npi_csv_map_reverse": npi_csv_map_reverse,
+            "row_list": [_build_minimal_row("1215387113")],
+        },
+    )
+
+    payload = fake_redis.enqueue_job.await_args.args[1]
+    address_by_type = {entry["type"]: entry for entry in payload["npi_address_list"]}
+    assert seen_batches == [
+        [
+            ("5125550100", "", "US"),
+            ("5125550199", "", "US"),
+        ]
+    ]
+    assert address_by_type["primary"]["phone_number"] == "5125550100"
+    assert address_by_type["mail"]["phone_number"] == "5125550199"
+
+
+@pytest.mark.asyncio
 async def test_process_npi_chunk_populates_taxonomy_variants(monkeypatch, npi_module):
     monkeypatch.delenv("HLTHPRT_ADDRESS_CANON_SOURCES", raising=False)
 
