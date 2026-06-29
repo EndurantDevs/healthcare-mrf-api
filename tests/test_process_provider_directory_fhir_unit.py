@@ -612,6 +612,8 @@ async def test_probe_sources_records_credential_descriptor_without_secret(monkey
 
     source_rows = next(rows for model, rows in upserts if model is ProviderDirectorySource)
     metadata = source_rows[0]["metadata_json"]
+    assert source_rows[0]["last_validated_status"] == "valid"
+    assert source_rows[0]["last_validated_at"] is not None
     assert metadata["credential"] == {
         "matched_by": ["sources:source_a"],
         "header_names": ["Authorization"],
@@ -776,6 +778,7 @@ async def test_probe_sources_persists_resolved_api_base_for_repaired_catalog_url
     source_rows = next(rows for model, rows in upserts if model is ProviderDirectorySource)
     assert capability_rows[0]["api_base"] == "https://fhir.humana.com/api"
     assert source_rows[0]["api_base"] == "https://fhir.humana.com/api"
+    assert source_rows[0]["last_validated_status"] == "valid"
     assert source_rows[0]["metadata_json"]["resolved_api_base_from"] == "https://fhir.humana.com/api/provider-directory"
 
 

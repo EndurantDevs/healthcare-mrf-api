@@ -3215,6 +3215,8 @@ async def _probe_sources(
                 "last_probe_error": probe.get("error"),
                 "last_probe_run_id": run_id,
                 "last_probed_at": now,
+                "last_validated_status": probe["status"],
+                "last_validated_at": now,
                 "updated_at": now,
             }
             resolved_api_base = _canonical_base(probe.get("api_base"))
