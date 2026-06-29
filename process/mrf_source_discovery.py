@@ -78,8 +78,6 @@ BROWSER_FALLBACK_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 )
-CURL_HTML_FALLBACK_HOSTS = {"www.sutterhealthplan.org", "sutterhealthplan.org"}
-CURL_HTML_FALLBACK_META_MARKER = b"\n__HLTHPRT_CURL_META__"
 MRF_URL_OBSERVATION_NULLABLE_KEYS = (
     "canonical_url",
     "url_type",
@@ -868,7 +866,7 @@ def classify_hosting_platform(url: str | None) -> str | None:
             or "technical-information" in path
         )
     ):
-        return "html_mrf_links"
+        return "sutter_health_plan_sitecore"
     if (
         host in {"www.sharphealthplan.com", "sharphealthplan.com"}
         and "api-access-for-developers" in path
@@ -1510,15 +1508,6 @@ async def _fetch_text(
     try:
         async with session.get(url, allow_redirects=True) as resp:
             body, charset = await read_response(resp)
-            if (
-                not expect_json
-                and resp.status >= 400
-                and _curl_html_fallback_allowed(url)
-            ):
-                try:
-                    return await _fetch_text_via_curl(url, max_bytes=max_bytes)
-                except Exception:
-                    pass
     except aiohttp.ServerDisconnectedError:
         retry_headers = {
             "User-Agent": BROWSER_FALLBACK_USER_AGENT,
@@ -1537,68 +1526,7 @@ async def _fetch_text(
         ) as retry_session:
             async with retry_session.get(url, allow_redirects=True) as resp:
                 body, charset = await read_response(resp)
-                if (
-                    not expect_json
-                    and resp.status >= 400
-                    and _curl_html_fallback_allowed(url)
-                ):
-                    try:
-                        return await _fetch_text_via_curl(url, max_bytes=max_bytes)
-                    except Exception:
-                        pass
     return _decode_response_body(body, charset=charset)
-
-
-def _curl_html_fallback_allowed(url: str | None) -> bool:
-    parsed = urlsplit(str(url or ""))
-    host = parsed.netloc.lower()
-    path = parsed.path.lower()
-    return host in CURL_HTML_FALLBACK_HOSTS and (
-        "healthcare-cost-transparency" in path or "technical-information" in path
-    )
-
-
-async def _fetch_text_via_curl(
-    url: str,
-    *,
-    max_bytes: int = MAX_TOC_BYTES_DEFAULT,
-) -> str:
-    await _assert_fetch_url_allowed(url)
-    timeout_seconds = str(max(5, min(int(HTTP_TOTAL_TIMEOUT), 60)))
-    proc = await asyncio.create_subprocess_exec(
-        "curl",
-        "-sS",
-        "-L",
-        "--compressed",
-        "--max-time",
-        timeout_seconds,
-        "--max-filesize",
-        str(max_bytes),
-        "--write-out",
-        f"{CURL_HTML_FALLBACK_META_MARKER.decode()}%{{http_code}}\t%{{url_effective}}",
-        url,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        message = stderr.decode("utf-8", errors="replace").strip()
-        raise ValueError(f"curl fallback failed: {message or proc.returncode}")
-    body, marker, metadata = stdout.rpartition(CURL_HTML_FALLBACK_META_MARKER)
-    if not marker:
-        raise ValueError("curl fallback response metadata missing")
-    metadata_text = metadata.decode("utf-8", errors="replace")
-    status_text, _, final_url = metadata_text.partition("\t")
-    try:
-        status_code = int(status_text.strip())
-    except ValueError as exc:
-        raise ValueError("curl fallback response status missing") from exc
-    if status_code >= 400:
-        raise ValueError(f"curl fallback returned HTTP {status_code}")
-    await _assert_fetch_url_allowed(final_url.strip() or url)
-    if len(body) > max_bytes:
-        raise ValueError(f"response exceeds {max_bytes} byte discovery limit")
-    return _decode_response_body(body, charset="utf-8")
 
 
 async def _fetch_bytes(
