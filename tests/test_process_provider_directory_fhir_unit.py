@@ -176,12 +176,13 @@ def test_provider_directory_location_address_key_sql_recovers_numeric_state_fips
     assert "WHEN '42' THEN 'PA'" in sql
     assert "normalized_state" in sql
     assert "normalized_country" in sql
-    assert "WHEN UPPER(REGEXP_REPLACE(COALESCE((country_code)::varchar, ''), '[^A-Za-z0-9]+', '', 'g')) IN" in sql
-    assert "'840', '001'" in sql
+    assert "country_code IS DISTINCT FROM" in sql
+    assert "'840'" in sql
+    assert "'001'" in sql
     assert 'LEFT JOIN "mrf"."geo_zip_lookup" AS geo' in sql
     assert "zip_restored_state" in sql
     assert "resolved_state" in sql
-    assert "WHERE address_key IS NULL" in sql
+    assert "WHERE (address_key IS NULL" in sql
     assert "OR zip5 IS NULL" in sql
     assert "state_name = COALESCE(keyed.restored_state_name, loc.state_name)" in sql
     assert "country_code = COALESCE(keyed.normalized_country, loc.country_code)" in sql
@@ -193,6 +194,17 @@ def test_provider_directory_location_address_key_sql_can_skip_zip_state_restore(
     assert "geo_zip_lookup" not in sql
     assert "END AS zip_restored_state" in sql
     assert "NULL::varchar) AS resolved_state" in sql
+
+
+def test_provider_directory_location_address_key_sql_can_scope_to_current_run_and_sources():
+    sql = importer.provider_directory_location_address_key_sql(
+        "mrf",
+        run_id="run_1",
+        source_ids=["source_a", "source_b"],
+    )
+
+    assert "last_seen_run_id = :run_id" in sql
+    assert "source_id = ANY(CAST(:source_ids AS varchar[]))" in sql
 
 
 def test_upsert_changed_row_predicate_ignores_run_metadata_columns():
@@ -1345,13 +1357,18 @@ async def test_publish_provider_directory_location_address_keys_runs_canonical_u
     status = AsyncMock(return_value=7)
     monkeypatch.setattr(importer.db, "status", status)
 
-    stamped = await importer.publish_provider_directory_location_address_keys("mrf")
+    stamped = await importer.publish_provider_directory_location_address_keys(
+        "mrf",
+        run_id="run_1",
+        source_ids=["source_a"],
+    )
 
     assert stamped == 7
     table_exists.assert_awaited_once_with("mrf", "geo_zip_lookup")
     status.assert_awaited_once()
     assert 'UPDATE "mrf"."provider_directory_location" AS loc' in status.await_args.args[0]
     assert 'LEFT JOIN "mrf"."geo_zip_lookup" AS geo' in status.await_args.args[0]
+    assert status.await_args.kwargs == {"run_id": "run_1", "source_ids": ["source_a"]}
 
 
 def test_provider_directory_location_archive_stage_sql_filters_keyable_uuid_locations():

@@ -550,6 +550,7 @@ class ProviderDirectoryLocation(Base, JSONOutputMixin):
         {"index_elements": ("address_key",), "name": "provider_directory_location_address_key_idx"},
         {"index_elements": ("zip5",), "name": "provider_directory_location_zip5_idx"},
         {"index_elements": ("state_code", "city_norm"), "name": "provider_directory_location_state_city_idx"},
+        {"index_elements": ("last_seen_run_id",), "name": "provider_directory_location_run_idx"},
     ]
 
     source_id = Column(String(64), nullable=False)

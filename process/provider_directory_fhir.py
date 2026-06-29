@@ -2083,6 +2083,8 @@ def provider_directory_location_address_key_sql(
     db_schema: str | None = None,
     *,
     restore_state_from_zip: bool = True,
+    run_id: str | None = None,
+    source_ids: list[str] | tuple[str, ...] | None = None,
 ) -> str:
     """Stamp imported FHIR Location rows with the shared canonical address key."""
 
@@ -2092,7 +2094,10 @@ def provider_directory_location_address_key_sql(
     raw_state_expr = "COALESCE(NULLIF(state_name, ''), state_code)"
     normalized_state_expr = _state_fips_restore_sql(raw_state_expr)
     normalized_country_expr = _country_restore_sql("country_code")
-    country_token_expr = "UPPER(REGEXP_REPLACE(COALESCE(country_code::varchar, ''), '[^A-Za-z0-9]+', '', 'g'))"
+    needs_country_normalization_expr = (
+        f"(NULLIF({normalized_country_expr}, '') IS NOT NULL "
+        f"AND country_code IS DISTINCT FROM {normalized_country_expr})"
+    )
     zip_state_select = "geo.state::varchar" if restore_state_from_zip else "NULL::varchar"
     zip_state_join = (
         f"""
@@ -2102,6 +2107,21 @@ def provider_directory_location_address_key_sql(
         if restore_state_from_zip
         else ""
     )
+    needs_work_clauses = [
+        "address_key IS NULL",
+        "zip5 IS NULL",
+        "state_code IS NULL",
+        "city_norm IS NULL",
+        f"{raw_state_expr} ~ '^[0-9]{{1,2}}$'",
+        needs_country_normalization_expr,
+    ]
+    scope_clauses: list[str] = []
+    if run_id is not None:
+        scope_clauses.append("last_seen_run_id = :run_id")
+    if source_ids:
+        scope_clauses.append("source_id = ANY(CAST(:source_ids AS varchar[]))")
+    where_clauses = [f"({' OR '.join(needs_work_clauses)})", *scope_clauses]
+    where_sql = " AND ".join(where_clauses)
     return f"""
     WITH normalized AS (
         SELECT
@@ -2117,11 +2137,7 @@ def provider_directory_location_address_key_sql(
             {raw_state_expr} AS raw_state,
             {normalized_state_expr} AS normalized_state
           FROM {location_ref}
-         WHERE address_key IS NULL
-            OR zip5 IS NULL
-            OR state_code IS NULL
-            OR city_norm IS NULL
-            OR {country_token_expr} IN ('001', '840', 'USA', 'UNITEDSTATES', 'UNITEDSTATESOFAMERICA')
+         WHERE {where_sql}
     ),
     resolved AS (
         SELECT
@@ -2201,17 +2217,30 @@ async def _table_exists(db_schema: str, table_name: str) -> bool:
     )
 
 
-async def publish_provider_directory_location_address_keys(db_schema: str | None = None) -> int:
+async def publish_provider_directory_location_address_keys(
+    db_schema: str | None = None,
+    *,
+    run_id: str | None = None,
+    source_ids: list[str] | tuple[str, ...] | None = None,
+) -> int:
     schema = db_schema or _schema()
     if not await _address_canon_functions_available(schema):
         return 0
     restore_state_from_zip = await _table_exists(schema, "geo_zip_lookup")
+    params: dict[str, Any] = {}
+    if run_id is not None:
+        params["run_id"] = run_id
+    if source_ids:
+        params["source_ids"] = list(source_ids)
     return int(
         await db.status(
             provider_directory_location_address_key_sql(
                 schema,
                 restore_state_from_zip=restore_state_from_zip,
-            )
+                run_id=run_id,
+                source_ids=source_ids,
+            ),
+            **params,
         )
         or 0
     )
@@ -4898,7 +4927,9 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                     message="publishing Provider Directory address artifacts",
                     metrics=metrics,
                 )
-                metrics["location_address_keys_stamped"] = await publish_provider_directory_location_address_keys()
+                metrics["location_address_keys_stamped"] = await publish_provider_directory_location_address_keys(
+                    run_id=run_id,
+                )
                 await _mark_provider_directory_progress(
                     run_id,
                     phase="provider-directory publishing artifacts",
