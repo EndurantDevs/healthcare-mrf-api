@@ -287,7 +287,8 @@ def test_provider_directory_location_address_key_batch_sql_uses_keyset_limit():
 
     assert 'FROM "mrf"."provider_directory_location" AS loc_src' in sql
     assert "loc_src.last_seen_run_id = :run_id" in sql
-    assert ":after_source_id IS NULL" in sql
+    assert "CAST(:after_source_id AS varchar) IS NULL" in sql
+    assert "(CAST(:after_source_id AS varchar), CAST(:after_resource_id AS varchar))" in sql
     assert "(loc_src.source_id, loc_src.resource_id)" in sql
     assert "LIMIT :batch_size" in sql
     assert "SELECT COUNT(*) FROM candidates" in sql

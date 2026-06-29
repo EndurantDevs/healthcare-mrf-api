@@ -2385,9 +2385,9 @@ def provider_directory_location_address_key_batch_sql(
         scope_clauses.append(f"{source_alias}.source_id = ANY(CAST(:source_ids AS varchar[]))")
     scope_clauses.append(
         f"""(
-            :after_source_id IS NULL
+            CAST(:after_source_id AS varchar) IS NULL
             OR ({source_alias}.source_id, {source_alias}.resource_id)
-                > (:after_source_id, :after_resource_id)
+                > (CAST(:after_source_id AS varchar), CAST(:after_resource_id AS varchar))
         )"""
     )
     where_clauses = [f"({' OR '.join(needs_work_clauses)})", *scope_clauses]
