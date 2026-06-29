@@ -2149,10 +2149,10 @@ async def test_import_resources_reports_streaming_partial_progress(monkeypatch):
     async def fake_upsert_resource_rows(_model, rows, **_kwargs):
         return len(rows)
 
-    progress_events: list[tuple[int, int, dict[str, int]]] = []
+    progress_events: list[tuple[int, int, dict[str, int], dict[str, object] | None]] = []
 
-    async def progress_callback(done, total, counts):
-        progress_events.append((done, total, dict(counts)))
+    async def progress_callback(done, total, counts, details=None):
+        progress_events.append((done, total, dict(counts), details))
 
     monkeypatch.setattr(importer, "_fetch_resource_rows", fake_fetch_resource_rows)
     monkeypatch.setattr(importer, "_upsert_resource_rows", fake_upsert_resource_rows)
@@ -2170,8 +2170,18 @@ async def test_import_resources_reports_streaming_partial_progress(monkeypatch):
     )
 
     assert counts == {"Location": 1}
-    assert progress_events[0] == (0, 1, {"Location": 1})
-    assert progress_events[-1] == (1, 1, {"Location": 1})
+    assert progress_events[0][:3] == (0, 1, {"Location": 0})
+    first_active = progress_events[0][3]["active_source_groups"][0]
+    assert first_active["sample_source_id"] == "source_a"
+    assert first_active["api_base"] == "https://a.example/fhir"
+    assert first_active["current_resource"] is None
+    assert any(
+        event[:3] == (0, 1, {"Location": 1})
+        and event[3]["active_source_groups"][0]["current_resource"] == "Location"
+        for event in progress_events
+    )
+    assert progress_events[-1][:3] == (1, 1, {"Location": 1})
+    assert progress_events[-1][3]["active_source_groups"] == []
 
 
 @pytest.mark.asyncio

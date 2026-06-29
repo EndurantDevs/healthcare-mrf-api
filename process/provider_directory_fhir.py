@@ -4343,7 +4343,7 @@ async def _import_resources(
     source_concurrency: int = 1,
     cancel_ctx: dict[str, Any] | None = None,
     cancel_task: dict[str, Any] | None = None,
-    progress_callback: Callable[[int, int, dict[str, int]], Awaitable[None]] | None = None,
+    progress_callback: Callable[[int, int, dict[str, int], dict[str, Any] | None], Awaitable[None]] | None = None,
 ) -> dict[str, int]:
     counts: dict[str, int] = {resource: 0 for resource in resources}
     semaphore = asyncio.Semaphore(max(1, source_concurrency))
@@ -4353,6 +4353,7 @@ async def _import_resources(
     report_every = max(1, total_groups // 20)
     progress_lock = asyncio.Lock()
     active_partial_counts: dict[int, dict[str, int]] = {}
+    active_group_details: dict[int, dict[str, Any]] = {}
     next_partial_progress_at = 0.0
 
     def merge_counts(target: dict[str, int], source_counts: dict[str, int]) -> None:
@@ -4371,28 +4372,60 @@ async def _import_resources(
             merge_counts(snapshot, partial_counts)
         return snapshot
 
+    def active_group_snapshot() -> list[dict[str, Any]]:
+        now = time.monotonic()
+        groups: list[dict[str, Any]] = []
+        for detail in active_group_details.values():
+            group = {
+                key: value
+                for key, value in detail.items()
+                if key not in {"started_monotonic", "resource_started_monotonic"}
+            }
+            group["elapsed_seconds"] = int(now - detail["started_monotonic"])
+            if detail.get("resource_started_monotonic") is not None:
+                group["resource_elapsed_seconds"] = int(now - detail["resource_started_monotonic"])
+            groups.append(group)
+        return sorted(
+            groups,
+            key=lambda item: (
+                str(item.get("sample_org_name") or ""),
+                str(item.get("sample_plan_name") or ""),
+                str(item.get("sample_source_id") or ""),
+            ),
+        )
+
+    async def report_progress(force: bool = False) -> None:
+        nonlocal next_partial_progress_at
+        if not progress_callback:
+            return
+        snapshot: dict[str, int] | None = None
+        details: dict[str, Any] | None = None
+        async with progress_lock:
+            now = time.monotonic()
+            if force or now >= next_partial_progress_at:
+                if not force:
+                    next_partial_progress_at = now + 15.0
+                snapshot = progress_counts_snapshot()
+                details = {"active_source_groups": active_group_snapshot()}
+        if snapshot is not None:
+            await progress_callback(completed_groups, total_groups, snapshot, details)
+
     async def maybe_report_partial_progress(
         group_key: int,
         resource_type: str,
         written: int,
     ) -> None:
-        nonlocal next_partial_progress_at
         if not progress_callback or written <= 0:
             return
-        snapshot: dict[str, int] | None = None
         async with progress_lock:
             group_counts = active_partial_counts.setdefault(group_key, {})
             group_counts[resource_type] = group_counts.get(resource_type, 0) + written
-            now = time.monotonic()
-            if now >= next_partial_progress_at:
-                next_partial_progress_at = now + 15.0
-                snapshot = progress_counts_snapshot()
-        if snapshot is not None:
-            await progress_callback(completed_groups, total_groups, snapshot)
+        await report_progress()
 
     async def clear_partial_progress(group_key: int) -> None:
         async with progress_lock:
             active_partial_counts.pop(group_key, None)
+            active_group_details.pop(group_key, None)
 
     async def import_one_group(
         source_group: list[dict[str, Any]],
@@ -4410,6 +4443,21 @@ async def _import_resources(
         group_key = id(source_group)
         source = source_group[0]
         source_ids = [item["source_id"] for item in source_group]
+        async with progress_lock:
+            active_group_details[group_key] = {
+                "source_ids": source_ids[:10],
+                "source_count": len(source_ids),
+                "sample_source_id": source.get("source_id"),
+                "sample_org_name": source.get("org_name"),
+                "sample_plan_name": source.get("plan_name"),
+                "api_base": source.get("canonical_api_base") or source.get("api_base"),
+                "current_resource": None,
+                "started_at": _now().isoformat(timespec="seconds") + "Z",
+                "started_monotonic": time.monotonic(),
+                "resource_started_at": None,
+                "resource_started_monotonic": None,
+            }
+        await report_progress(force=True)
         source_counts: dict[str, int] = {resource: 0 for resource in resources}
         source_linked_counts: dict[str, int] = {}
         source_resource_stats: dict[str, dict[str, Any]] = {}
@@ -4418,6 +4466,11 @@ async def _import_resources(
         source_stale_ready_source_ids: dict[str, list[str]] = {}
         rows_by_resource: dict[str, list[dict[str, Any]]] = {}
         if _alohr_source_uses_graphql_connector(source):
+            async with progress_lock:
+                active_group_details[group_key]["current_resource"] = "ALOHR GraphQL"
+                active_group_details[group_key]["resource_started_at"] = _now().isoformat(timespec="seconds") + "Z"
+                active_group_details[group_key]["resource_started_monotonic"] = time.monotonic()
+            await report_progress(force=True)
             return await _import_alohr_graphql_source_group(
                 source_group,
                 resources=resources,
@@ -4431,6 +4484,11 @@ async def _import_resources(
         for resource_type in resources:
             if cancel_ctx is not None:
                 await raise_if_cancelled(cancel_ctx, cancel_task)
+            async with progress_lock:
+                active_group_details[group_key]["current_resource"] = resource_type
+                active_group_details[group_key]["resource_started_at"] = _now().isoformat(timespec="seconds") + "Z"
+                active_group_details[group_key]["resource_started_monotonic"] = time.monotonic()
+            await report_progress(force=True)
             use_streaming = stream_batch_size > 0
 
             async def row_batch_handler(model: type, rows: list[dict[str, Any]]) -> int:
@@ -4570,9 +4628,7 @@ async def _import_resources(
             if progress_callback is not None and (
                 completed_groups == total_groups or completed_groups % report_every == 0
             ):
-                async with progress_lock:
-                    snapshot = progress_counts_snapshot()
-                await progress_callback(completed_groups, total_groups, snapshot)
+                await report_progress(force=True)
 
         if seen_stage_table and stale_ready_source_ids_by_resource:
             await _prepare_provider_directory_import_seen_stage_lookup(seen_stage_table)
@@ -4744,8 +4800,27 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
             metrics["source_import_groups_attempted"] = len(source_import_groups)
             metrics["source_import_duplicate_sources_collapsed"] = len(importable) - len(source_import_groups)
 
-            async def resource_progress(done: int, total: int, counts: dict[str, int]) -> None:
+            async def resource_progress(
+                done: int,
+                total: int,
+                counts: dict[str, int],
+                details: dict[str, Any] | None = None,
+            ) -> None:
                 metrics["resource_rows"] = counts
+                active_source_groups = (
+                    details.get("active_source_groups", [])
+                    if isinstance(details, dict)
+                    else []
+                )
+                metrics["active_source_groups"] = active_source_groups
+                active_preview = ", ".join(
+                    (
+                        f"{group.get('sample_org_name') or group.get('sample_source_id')}:"
+                        f"{group.get('current_resource') or 'starting'}"
+                    )
+                    for group in active_source_groups[:3]
+                )
+                active_suffix = f"; active={active_preview}" if active_preview else ""
                 await _mark_provider_directory_progress(
                     run_id,
                     phase="provider-directory importing resources",
@@ -4754,6 +4829,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                     message=(
                         f"imported resources for {done}/{total} source group(s); "
                         f"rows={sum(counts.values())}"
+                        f"{active_suffix}"
                     ),
                     metrics=metrics,
                 )
