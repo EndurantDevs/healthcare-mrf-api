@@ -6723,6 +6723,8 @@ def _embedded_mrf_host_urls(value: str | None) -> list[str]:
         r"(?P<host>mrf\.healthgram\.com)(?P<path>/[A-Za-z0-9_.~%/-]+)?",
         r"(?P<host>mrfsearch\.meritain\.com)(?P<path>/[A-Za-z0-9_.~%/-]+)?",
         r"(?P<host>transparency-in-coverage\.uhc\.com)(?P<path>/[A-Za-z0-9_.~%/-]+)?",
+        r"(?P<host>(?:www\.)?mymedicalshopper\.com)(?P<path>/(?:mrf-search|mrf)/[A-Za-z0-9_.~%/-]+)",
+        r"(?P<host>www\.asrhealthbenefits\.com)(?P<path>/(?:mrf|MRF|umbraco/surface/mrfdownload|home/umbraco/surface/mrfdownload)[A-Za-z0-9_.~%/?=&-]*)",
     )
     urls: list[str] = []
     seen: set[str] = set()
@@ -9484,6 +9486,37 @@ async def _crawl_targets_for_source(
                 )
                 for target in html_targets
             ]
+        delegated_targets: list[CrawlTarget] = []
+        for delegated_url in _delegated_mrf_source_urls_from_html(
+            html_text, base_url=url
+        ):
+            delegated_platform = classify_hosting_platform(delegated_url)
+            if not delegated_platform:
+                continue
+            delegated_source = {**source, "hosting_platform": delegated_platform}
+            nested_targets = await _crawl_targets_for_source(
+                delegated_source,
+                delegated_url,
+                session,
+                target_limit=target_limit,
+            )
+            for target in nested_targets:
+                metadata = dict(target.metadata or {})
+                metadata.setdefault("delegated_source_url", delegated_url)
+                metadata.setdefault("delegated_source_platform", delegated_platform)
+                delegated_targets.append(
+                    CrawlTarget(
+                        source=source,
+                        url=target.url,
+                        label=target.label,
+                        resolved_from_url=url,
+                        metadata=metadata,
+                    )
+                )
+                if target_limit and target_limit > 0 and len(delegated_targets) >= target_limit:
+                    return delegated_targets[:target_limit]
+        if delegated_targets:
+            return _dedupe_crawl_targets_by_url(delegated_targets)
         return []
     return [
         CrawlTarget(

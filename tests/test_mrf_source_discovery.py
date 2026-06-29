@@ -7066,6 +7066,10 @@ def test_delegated_mrf_source_urls_extracts_supported_links_and_bare_hosts():
     <a href="https://www.anthem.com/machine-readable-file/search">Anthem</a>
     <a href="https://bcbsil.com/asomrf?EIN=300088171">BCBS ASO</a>
     <p>MRF Hub: alliedbenefit.sapphiremrfhub.com.</p>
+    <p>Delegated TPA: mrf.healthcarebluebook.com/Lucent.</p>
+    <p>TALON search: www.mymedicalshopper.com/mrf-search/varipro.</p>
+    <p>TALON employer: www.mymedicalshopper.com/mrf/example-varipro-77100.</p>
+    <p>ASR groups: www.asrhealthbenefits.com/MRF.</p>
     <a href="https://example.com/not-mrf">Ignore</a>
     <a href="https://github.com/CMSgov/price-transparency-guide">CMS docs</a>
     """
@@ -7078,7 +7082,59 @@ def test_delegated_mrf_source_urls_extracts_supported_links_and_bare_hosts():
         "https://www.anthem.com/machine-readable-file/search",
         "https://bcbsil.com/asomrf?EIN=300088171",
         "https://alliedbenefit.sapphiremrfhub.com/",
+        "https://mrf.healthcarebluebook.com/Lucent",
+        "https://www.mymedicalshopper.com/mrf-search/varipro",
+        "https://www.mymedicalshopper.com/mrf/example-varipro-77100",
+        "https://www.asrhealthbenefits.com/MRF",
     ]
+
+
+@pytest.mark.asyncio
+async def test_crawl_targets_for_source_delegates_plain_mrf_host_text(monkeypatch):
+    async def fake_fetch_text(url, *, max_bytes, session):
+        assert url == "https://wrapper.example/mrf"
+        assert max_bytes == 5 * 1024 * 1024
+        assert session is fake_session
+        return "<p>See current MRFs at mrf.healthcarebluebook.com/Lucent.</p>"
+
+    async def fake_resolve_healthcarebluebook_mrf(source, url, resolver, session):
+        assert source["hosting_platform"] == "healthcarebluebook_mrf"
+        assert url == "https://mrf.healthcarebluebook.com/Lucent"
+        assert resolver["type"] == "healthcarebluebook_mrf"
+        assert session is fake_session
+        return [
+            discovery.CrawlTarget(
+                source=source,
+                url="https://cdn.example/lucent_index.json",
+                label="Lucent delegated TOC",
+                resolved_from_url=url,
+                metadata={"resolver": "healthcarebluebook_mrf"},
+            )
+        ]
+
+    fake_session = object()
+    monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
+    monkeypatch.setattr(
+        discovery,
+        "_resolve_healthcarebluebook_mrf",
+        fake_resolve_healthcarebluebook_mrf,
+    )
+
+    targets = await discovery._crawl_targets_for_source(
+        {"display_name": "Wrapper source"},
+        "https://wrapper.example/mrf",
+        fake_session,
+    )
+
+    assert len(targets) == 1
+    assert targets[0].source == {"display_name": "Wrapper source"}
+    assert targets[0].url == "https://cdn.example/lucent_index.json"
+    assert targets[0].resolved_from_url == "https://wrapper.example/mrf"
+    assert targets[0].metadata["resolver"] == "healthcarebluebook_mrf"
+    assert targets[0].metadata["delegated_source_url"] == (
+        "https://mrf.healthcarebluebook.com/Lucent"
+    )
+    assert targets[0].metadata["delegated_source_platform"] == "healthcarebluebook_mrf"
 
 
 def test_delegated_mrf_source_urls_extracts_ibx_keyed_toc_links():
