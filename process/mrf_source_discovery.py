@@ -701,6 +701,10 @@ def classify_hosting_platform(url: str | None) -> str | None:
             and "transparency-files" in path
         )
         or (
+            host in {"www.bcbsnd.com", "bcbsnd.com"}
+            and "transparency-in-coverage" in path
+        )
+        or (
             host in {"www.lacare.org", "lacare.org"}
             and "transparency-coverage-machine-readable-files" in path
         )

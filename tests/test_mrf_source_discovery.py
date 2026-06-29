@@ -315,6 +315,12 @@ def test_classify_hosting_platform_recognizes_public_adapter_pages():
     )
     assert (
         discovery.classify_hosting_platform(
+            "https://www.bcbsnd.com/employers/group-insurance-101/understanding-transparency-in-coverage-rule"
+        )
+        == "html_delegated_mrf_links"
+    )
+    assert (
+        discovery.classify_hosting_platform(
             "https://alliantplans.com/json/pt/latestpt_nlc.html"
         )
         == "html_mrf_links"
@@ -853,6 +859,7 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
 | Select Health | regional | https://www.selecthealth.org/disclaimers/machine-readable-data | aliases: SelectHealth |
 | EyeMed | vision | https://content.eyemedvisioncare.com/EyeMed_HCSC/eyemed_in-network-rates.json | benefit lines: vision; aliases: EyeMed Vision Care, Eye Med, Ameritas with EyeMed |
 | Example Marketplace Family | national | https://www.centene.com/price-transparency-files.html | aliases: Example Marketplace, Example Managed Network |
+| Example Northern Blue | blue | https://www.bcbsnd.com/employers/group-insurance-101/understanding-transparency-in-coverage-rule | aliases: Example Northern, Example Blue |
 | EMI Health | regional | https://emihealth.com/machinereadables | public machine-readable files page |
 | MotivHealth Insurance Company | regional | https://www.motivhealth.com/machinereadablefiles/ | aliases: MotivHealth |
 | Angle Health | regional | https://www.anglehealth.com/machine-readable-files | aliases: Angle, Adrem Administrators |
@@ -961,6 +968,11 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
     assert by_name["Example Marketplace Family"].aliases == (
         "Example Marketplace",
         "Example Managed Network",
+    )
+    assert by_name["Example Northern Blue"].hosting_platform == "html_delegated_mrf_links"
+    assert by_name["Example Northern Blue"].aliases == (
+        "Example Northern",
+        "Example Blue",
     )
     assert by_name["EMI Health"].hosting_platform == "html_mrf_links"
     assert by_name["MotivHealth Insurance Company"].hosting_platform == "html_mrf_links"
