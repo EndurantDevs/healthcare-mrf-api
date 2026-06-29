@@ -150,11 +150,34 @@ def _build_result_row(npi_value: int) -> list:
     return row
 
 
+def _set_result_address_column(row: list, key: str, value):
+    for idx, column in enumerate(NPIAddress.__table__.columns):
+        if column.key == key:
+            row[1 + len(NPIData.__table__.columns) + idx] = value
+            return
+    raise AssertionError(f"Unknown NPIAddress column: {key}")
+
+
+def _set_near_address_column(row: list, key: str, value):
+    for idx, column in enumerate(NPIAddress.__table__.columns):
+        if column.key == key:
+            row[2 + idx] = value
+            return
+    raise AssertionError(f"Unknown NPIAddress column: {key}")
+
+
 @pytest.mark.asyncio
 async def test_get_all_returns_rows(monkeypatch):
+    result_row = _build_result_row(1234567890)
+    _set_result_address_column(result_row, "telephone_number", "1 (312) 555-1212 ext. 44")
+    _set_result_address_column(result_row, "fax_number", "(312) 555-0199")
+    _set_result_address_column(result_row, "phone_number", None)
+    _set_result_address_column(result_row, "phone_extension", None)
+    _set_result_address_column(result_row, "fax_number_digits", None)
+    _set_result_address_column(result_row, "country_code", "US")
     connections = [
         FakeConnection([[(2,)]]),
-        FakeConnection([[ _build_result_row(1234567890) ]]),
+        FakeConnection([[result_row]]),
     ]
 
     class FakeDB:
@@ -184,6 +207,9 @@ async def test_get_all_returns_rows(monkeypatch):
     assert payload["rows"][0]["taxonomy_list"]
     assert payload["rows"][0]["do_business_as"] == ['DBA']
     assert payload["rows"][0]["address_key"] == "addr_address_key"
+    assert payload["rows"][0]["phone_number"] == "3125551212"
+    assert payload["rows"][0]["phone_extension"] == "44"
+    assert payload["rows"][0]["fax_number_digits"] == "3125550199"
 
 
 def _build_near_row(npi_value: int) -> list:
@@ -212,9 +238,13 @@ def _build_near_row(npi_value: int) -> list:
 
 @pytest.mark.asyncio
 async def test_get_near_npi(monkeypatch):
+    near_row = _build_near_row(1112223334)
+    _set_near_address_column(near_row, "telephone_number", "(217) 555-0100")
+    _set_near_address_column(near_row, "phone_number", None)
+    _set_near_address_column(near_row, "country_code", "US")
     responses = [
         [{"intptlat": "41.0", "intptlon": "-87.0"}],
-        [_build_near_row(1112223334), _build_near_row(1112223334)],
+        [near_row, _build_near_row(1112223334)],
     ]
     fake_conn = FakeConnection(responses)
 
@@ -233,6 +263,7 @@ async def test_get_near_npi(monkeypatch):
     assert payload[0]["distance"] == 0.5
     assert payload[0]["taxonomy_list"]
     assert payload[0]["do_business_as"] == ['DBA']
+    assert payload[0]["phone_number"] == "2175550100"
 
 
 @pytest.mark.asyncio

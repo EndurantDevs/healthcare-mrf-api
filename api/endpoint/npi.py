@@ -40,6 +40,7 @@ from db.models import (AddressArchive, EntityAddressUnified, Issuer,
                        ProviderEnrollmentHospice, ProviderEnrollmentHospital,
                        ProviderEnrollmentRHC, ProviderEnrollmentSNF,
                        ProviderDirectorySource, db)
+from process.ext.contact_canon import canonicalize_one as canonicalize_contact_one
 from process.ext.utils import download_it
 from process.openaddresses import exact_lookup_sql, fuzzy_lookup_sql, lookup_params_from_address, relaxed_lookup_sql
 
@@ -725,7 +726,18 @@ def _merge_duplicate_address(base: dict[str, Any], duplicate: Mapping[str, Any])
         if merged:
             base[key] = merged
 
-    for key in ("telephone_number", "fax_number", "formatted_address", "lat", "long", "place_id"):
+    for key in (
+        "telephone_number",
+        "phone_number",
+        "phone_extension",
+        "fax_number",
+        "fax_number_digits",
+        "fax_extension",
+        "formatted_address",
+        "lat",
+        "long",
+        "place_id",
+    ):
         if base.get(key) in (None, "") and duplicate.get(key) not in (None, ""):
             base[key] = duplicate.get(key)
 
@@ -742,6 +754,36 @@ def _merge_duplicate_address(base: dict[str, Any], duplicate: Mapping[str, Any])
             len(merged_sources),
         )
         base["multi_source_confirmed"] = len(merged_sources) > 1
+
+
+def _has_contact_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    return True
+
+
+def _add_canonical_contact_fields_to_address(address: dict[str, Any]) -> dict[str, Any]:
+    if not (_has_contact_value(address.get("telephone_number")) or _has_contact_value(address.get("fax_number"))):
+        return address
+
+    canonical = canonicalize_contact_one(
+        (
+            address.get("telephone_number"),
+            address.get("fax_number"),
+            address.get("country_code") or "US",
+        )
+    )
+    if not _has_contact_value(address.get("phone_number")) and _has_contact_value(canonical.get("phone_number")):
+        address["phone_number"] = canonical.get("phone_number")
+    if not _has_contact_value(address.get("phone_extension")) and _has_contact_value(canonical.get("phone_extension")):
+        address["phone_extension"] = canonical.get("phone_extension")
+    if not _has_contact_value(address.get("fax_number_digits")) and _has_contact_value(canonical.get("fax_number_digits")):
+        address["fax_number_digits"] = canonical.get("fax_number_digits")
+    if not _has_contact_value(address.get("fax_extension")) and _has_contact_value(canonical.get("fax_extension")):
+        address["fax_extension"] = canonical.get("fax_extension")
+    return address
 
 
 def _dedupe_addresses_by_key(addresses: Sequence[Any]) -> list[dict[str, Any]]:
@@ -761,7 +803,10 @@ def _dedupe_addresses_by_key(addresses: Sequence[Any]) -> list[dict[str, Any]]:
             keyed[key] = address
             continue
         _merge_duplicate_address(existing, address)
-    return list(keyed.values()) + unkeyed
+    return [
+        _add_canonical_contact_fields_to_address(address)
+        for address in (list(keyed.values()) + unkeyed)
+    ]
 
 
 def _provider_directory_source_ids_from_record_ids(record_ids: Any) -> list[str]:
@@ -3316,6 +3361,7 @@ async def get_all(request):
         res = list(res.values())
         for row in res:
             row["do_business_as"] = row.get("do_business_as") or []
+            _add_canonical_contact_fields_to_address(row)
             _redact_internal_address_fields(row)
         return res
 
@@ -4144,6 +4190,9 @@ async def get_near_npi(request):
         res[npi_value] = obj
 
     res = list(res.values())
+    for row in res:
+        if isinstance(row, dict):
+            _add_canonical_contact_fields_to_address(row)
     _redact_internal_address_fields(res)
     return response.json(res, default=str)
 

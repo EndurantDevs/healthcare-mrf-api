@@ -55,6 +55,60 @@ def test_nearby_sql_filters_to_geocoded_rows_for_geo_index():
     assert "AND a.long IS NOT NULL" in sql
 
 
+def test_npi_address_contact_fallback_derives_canonical_digits_from_raw_fields():
+    address = {
+        "telephone_number": "1 (312) 555-1212 ext. 34",
+        "fax_number": "(312) 555-0199",
+        "country_code": "US",
+    }
+
+    normalized = npi_module._add_canonical_contact_fields_to_address(address)
+
+    assert normalized["telephone_number"] == "1 (312) 555-1212 ext. 34"
+    assert normalized["phone_number"] == "3125551212"
+    assert normalized["phone_extension"] == "34"
+    assert normalized["fax_number"] == "(312) 555-0199"
+    assert normalized["fax_number_digits"] == "3125550199"
+
+
+def test_npi_address_contact_fallback_does_not_overwrite_canonical_digits():
+    address = {
+        "telephone_number": "(312) 555-1212",
+        "phone_number": "2175550100",
+        "fax_number": "(312) 555-0199",
+        "fax_number_digits": "2175550199",
+        "country_code": "US",
+    }
+
+    normalized = npi_module._add_canonical_contact_fields_to_address(address)
+
+    assert normalized["phone_number"] == "2175550100"
+    assert normalized["fax_number_digits"] == "2175550199"
+
+
+def test_npi_address_dedupe_preserves_duplicate_contact_before_fallback():
+    addresses = [
+        {
+            "address_key": "same",
+            "type": "primary",
+            "first_line": "1 Main St",
+            "telephone_number": None,
+        },
+        {
+            "address_key": "same",
+            "type": "practice",
+            "first_line": "1 Main St",
+            "telephone_number": "(217) 555-0100",
+        },
+    ]
+
+    deduped = npi_module._dedupe_addresses_by_key(addresses)
+
+    assert len(deduped) == 1
+    assert deduped[0]["telephone_number"] == "(217) 555-0100"
+    assert deduped[0]["phone_number"] == "2175550100"
+
+
 @pytest.mark.asyncio
 async def test_active_pharmacists(monkeypatch):
     fake_conn = FakeConnection(first_result=(10,))
