@@ -3,6 +3,7 @@
   "test_providers": ["master-list"],
   "source_query_expansion_platforms": [
     "sapphire",
+    "aetna_health1",
     "uhc_public_blobs",
     "mymedicalshopper_talon"
   ],

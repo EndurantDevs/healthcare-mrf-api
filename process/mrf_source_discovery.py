@@ -95,9 +95,21 @@ _SOURCE_CONFIG_CACHE: dict[str, Any] | None = None
 _SSL_CONTEXT: ssl.SSLContext | None = None
 DEFAULT_SOURCE_QUERY_EXPANSION_PLATFORMS = (
     "sapphire",
+    "aetna_health1",
     "uhc_public_blobs",
     "mymedicalshopper_talon",
 )
+LEGAL_ENTITY_QUERY_STOPWORDS = {
+    "co",
+    "company",
+    "corp",
+    "corporation",
+    "inc",
+    "incorporated",
+    "llc",
+    "ltd",
+    "limited",
+}
 
 
 @dataclass(frozen=True)
@@ -9458,6 +9470,27 @@ def _healthsparq_target(
     )
 
 
+def _healthsparq_plan_engine_hash(
+    file_item: dict[str, Any], plan: dict[str, Any]
+) -> str | None:
+    plan_name = _clean_text(plan.get("planName"))
+    plan_id = str(plan.get("planId") or "").strip()
+    market_type = str(plan.get("planMarketType") or "").strip()
+    if not plan_name or not plan_id or not market_type:
+        return None
+    return semantic_hash(
+        {
+            "reporting_entity_name": file_item.get("reportingEntityName"),
+            "reporting_entity_type": file_item.get("reportingEntityType"),
+            "plan_id": plan_id,
+            "plan_id_type": plan.get("planIdType"),
+            "market_type": market_type,
+            "plan_name": plan_name,
+        },
+        domain="healthsparq_plan",
+    )
+
+
 def _healthsparq_plan_info(file_item: dict[str, Any]) -> list[dict[str, Any]]:
     reporting_plans = [
         plan
@@ -9470,9 +9503,37 @@ def _healthsparq_plan_info(file_item: dict[str, Any]) -> list[dict[str, Any]]:
             "plan_id_type": plan.get("planIdType"),
             "plan_market_type": plan.get("planMarketType"),
             "plan_name": plan.get("planName"),
+            "engine_plan_hash": _healthsparq_plan_engine_hash(file_item, plan),
         }
         for plan in reporting_plans
     ]
+
+
+def _healthsparq_file_matches_query(
+    file_item: dict[str, Any], query: str | None
+) -> bool:
+    if not query:
+        return True
+    return _search_values_match_query(
+        [
+            file_item.get("fileName"),
+            file_item.get("filePath"),
+            file_item.get("reportingEntityName"),
+            file_item.get("reportingEntityType"),
+            *(
+                value
+                for plan in (file_item.get("reportingPlans") or [])
+                if isinstance(plan, dict)
+                for value in (
+                    plan.get("planName"),
+                    plan.get("planId"),
+                    plan.get("planIdType"),
+                    plan.get("planMarketType"),
+                )
+            ),
+        ],
+        query,
+    )
 
 
 def _healthsparq_targets_from_metadata(
@@ -9486,9 +9547,12 @@ def _healthsparq_targets_from_metadata(
     files = payload.get("files") if isinstance(payload, dict) else None
     if not isinstance(files, list):
         return []
+    target_query = _source_target_payer_query(source)
     targets_by_key: dict[tuple[str, str], CrawlTarget] = {}
     for file_item in files:
         if not isinstance(file_item, dict):
+            continue
+        if not _healthsparq_file_matches_query(file_item, target_query):
             continue
         file_url = _healthsparq_file_url(metadata_url, file_item.get("filePath"))
         if not file_url:
@@ -10631,11 +10695,19 @@ def _query_tokens(value: Any) -> tuple[str, ...]:
     )
 
 
+def _query_match_tokens(value: Any) -> tuple[str, ...]:
+    tokens = _query_tokens(value)
+    substantive = tuple(
+        token for token in tokens if token not in LEGAL_ENTITY_QUERY_STOPWORDS
+    )
+    return substantive or tokens
+
+
 def _search_values_match_query(values: Iterable[Any], query: str | None) -> bool:
     clean_query = _clean_text(query).lower()
     if not clean_query:
         return True
-    query_tokens = _query_tokens(clean_query)
+    query_tokens = _query_match_tokens(clean_query)
     for value in values:
         text = _search_match_text(value)
         if not text:
@@ -10645,6 +10717,8 @@ def _search_values_match_query(values: Iterable[Any], query: str | None) -> bool
         if query_tokens:
             value_tokens = set(_query_tokens(text))
             if all(token in value_tokens for token in query_tokens):
+                return True
+            if all(token in text for token in query_tokens if len(token) >= 3):
                 return True
     return False
 

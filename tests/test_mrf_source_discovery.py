@@ -819,6 +819,16 @@ def test_candidate_query_expansion_keeps_searchable_platform_sources():
         index_url="https://bcbsla.sapphiremrfhub.com/",
         hosting_platform="sapphire",
     )
+    aetna = discovery.SourceCandidate(
+        payer_name="Aetna",
+        provider="master-list",
+        index_url=(
+            "https://health1.aetna.com/app/public/#/one/"
+            "insurerCode=AETNACVS_I&brandCode=ALICSI/"
+            "machine-readable-transparency-in-coverage"
+        ),
+        hosting_platform="aetna_health1",
+    )
     direct_group = discovery.SourceCandidate(
         payer_name="Example Employer",
         provider="master-list",
@@ -827,12 +837,95 @@ def test_candidate_query_expansion_keeps_searchable_platform_sources():
     )
 
     assert discovery._candidate_supports_source_query_expansion(sapphire)
+    assert discovery._candidate_supports_source_query_expansion(aetna)
     assert not discovery._candidate_supports_source_query_expansion(direct_group)
     expanded = discovery._candidate_with_target_payer_query(
         sapphire, "Plastipak Packaging"
     )
     assert expanded.raw_payload["target_payer_query"] == "Plastipak Packaging"
     assert expanded.raw_payload["query_expansion_source"] is True
+
+
+def test_healthsparq_query_expansion_filters_before_limit_and_disambiguates_plans():
+    source = {
+        "source_id": "src_aetna",
+        "display_name": "Aetna",
+        "metadata_json": {
+            "raw": {
+                "target_payer_query": "Example Packaging",
+                "query_expansion_source": True,
+            }
+        },
+    }
+    payload = {
+        "files": [
+            {
+                "reportingEntityName": "Example Reporting Entity",
+                "reportingEntityType": "Third Party Administrator_111",
+                "reportingPlans": [
+                    {
+                        "planId": "111111111",
+                        "planIdType": "ein",
+                        "planMarketType": "group",
+                        "planName": "Unrelated Employer Aetna Choice POS II",
+                    }
+                ],
+                "fileSchema": "IN_NETWORK_RATES",
+                "fileName": "2026-06-01_unrelated.json.gz",
+                "filePath": "2026-06-01/inNetworkRates/unrelated.json.gz",
+            },
+            {
+                "reportingEntityName": "Example Reporting Entity",
+                "reportingEntityType": "Third Party Administrator_222",
+                "reportingPlans": [
+                    {
+                        "planId": "222222222",
+                        "planIdType": "ein",
+                        "planMarketType": "group",
+                        "planName": "Example Packaging HSA Aetna Choice POS II",
+                    },
+                    {
+                        "planId": "222222222",
+                        "planIdType": "ein",
+                        "planMarketType": "group",
+                        "planName": "Example Packaging Aetna Choice POS II",
+                    },
+                ],
+                "fileSchema": "TABLE_OF_CONTENTS",
+                "fileName": "2026-06-01_222_index.json.gz",
+                "filePath": "2026-06-01/tableOfContents/2026-06-01_222_index.json.gz",
+            },
+        ]
+    }
+
+    targets = discovery._healthsparq_targets_from_metadata(
+        source,
+        "https://mrf.healthsparq.com/example/prd/mrf/A/BRAND/latest_metadata.json",
+        payload,
+        resolved_from_url="https://health1.aetna.com/app/public/#/one/insurerCode=A&brandCode=BRAND/",
+        params={"insurerCode": "A", "brandCode": "BRAND"},
+    )
+
+    assert len(targets) == 1
+    [target] = targets
+    assert target.metadata["file_path"].endswith("2026-06-01_222_index.json.gz")
+    plan_info = target.metadata["plan_info"]
+    assert [plan["plan_name"] for plan in plan_info] == [
+        "Example Packaging HSA Aetna Choice POS II",
+        "Example Packaging Aetna Choice POS II",
+    ]
+    assert len({plan["engine_plan_hash"] for plan in plan_info}) == 2
+
+
+def test_query_expansion_match_tolerates_legal_suffix_and_concatenated_plan_text():
+    assert discovery._search_values_match_query(
+        ["Absopure Water Co., et. al DBA Example PackagingHSA Aetna Choice POS II"],
+        "Example Packaging Inc",
+    )
+    assert not discovery._search_values_match_query(
+        ["Unrelated PackagingHSA Aetna Choice POS II"],
+        "Example Packaging Inc",
+    )
 
 
 def test_parse_master_list_prefers_active_duplicate_over_unsupported_fragment():
@@ -5131,14 +5224,17 @@ def test_healthsparq_targets_from_metadata_expand_direct_file_urls_and_plans():
     assert targets[0].metadata["target_file_type"] == "in-network"
     assert targets[0].metadata["container_format"] == "zip"
     assert targets[0].metadata["metadata_url"] == metadata_url
-    assert targets[0].metadata["plan_info"] == [
-        {
-            "plan_id": "123456789",
-            "plan_id_type": "ein",
-            "plan_market_type": "group",
-            "plan_name": "Group PPO",
-        }
-    ]
+    [plan_info] = targets[0].metadata["plan_info"]
+    assert {
+        key: plan_info[key]
+        for key in ("plan_id", "plan_id_type", "plan_market_type", "plan_name")
+    } == {
+        "plan_id": "123456789",
+        "plan_id_type": "ein",
+        "plan_market_type": "group",
+        "plan_name": "Group PPO",
+    }
+    assert plan_info["engine_plan_hash"]
     assert targets[1].metadata["target_file_type"] == "table-of-contents"
 
 
