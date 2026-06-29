@@ -879,6 +879,7 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
 | Employee Benefit Logistics | tpa | https://ebl.mrf.payercompass.com/ | aliases: EBL |
 | Employers Health Network | tpa | https://ehn.mrf.payercompass.com/ | aliases: EHN |
 | Fox/Everett | tpa | https://www.mymedicalshopper.com/mrf-search/fox-everett | aliases: Fox Everett |
+| HealthChoice - HPI | tpa | https://hcn.mrf.payercompass.com/ | aliases: HealthChoice HPI, HCN |
 | Marpai | tpa | https://www.mymedicalshopper.com/mrf-search/marpai | aliases: Marpai Health |
 | Insurance Systems | tpa | https://isi.mrf.payercompass.com/ | aliases: ISI |
 | Kapnick Insurance Group | tpa | https://bcbsm.sapphiremrfhub.com/tocs/current/kapnick_co_inc | aliases: Kapnick |
@@ -890,6 +891,9 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
 | SIHO | tpa | https://www.mymedicalshopper.com/mrf-search/siho | aliases: SIHO Insurance Services |
 | Stanislaus County Health Plan | tpa | https://schp.mrf.payercompass.com/ | aliases: SCHP, HPNC |
 | Trustmark Small Business Benefits | tpa | https://mrf.healthcarebluebook.com/trustmarksb | aliases: Trustmark Small Business, Trustmark SB |
+| Med-Pay | tpa | https://mrf.healthcarebluebook.com/medpay | aliases: Med Pay, MedPay |
+| Municipal Benefit Health Program | network/tpa | https://mhbp.mrf.payercompass.com/ | aliases: MHBP |
+| The Care Network | network | https://www.claimsbridge.net/tic/tcn/TCN_in-Network-rates.json | aliases: TCN |
 | Nippon Life Benefits | tpa | https://mrf.healthcarebluebook.com/Nippon | aliases: Nippon Life |
 | UMWA Health and Retirement Funds | tpa | https://mrf.healthcarebluebook.com/healthsmartfundsaccount | aliases: UMWA Funds |
 | BlueAdvantage Administrators of Arkansas | tpa | https://www.blueadvantagearkansas.com/interoperability/machine-readable-files | aliases: BlueAdvantage, Skai BCBS |
@@ -1026,6 +1030,7 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
     assert by_name["Employee Benefit Logistics"].hosting_platform == "payercompass_mrf"
     assert by_name["Employers Health Network"].hosting_platform == "payercompass_mrf"
     assert by_name["Fox/Everett"].hosting_platform == "mymedicalshopper_talon"
+    assert by_name["HealthChoice - HPI"].hosting_platform == "payercompass_mrf"
     assert by_name["Marpai"].hosting_platform == "mymedicalshopper_talon"
     assert by_name["Insurance Systems"].hosting_platform == "payercompass_mrf"
     assert by_name["Kapnick Insurance Group"].hosting_platform == "sapphire"
@@ -1048,6 +1053,9 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
         by_name["Trustmark Small Business Benefits"].hosting_platform
         == "healthcarebluebook_mrf"
     )
+    assert by_name["Med-Pay"].hosting_platform == "healthcarebluebook_mrf"
+    assert by_name["Municipal Benefit Health Program"].hosting_platform == "payercompass_mrf"
+    assert by_name["The Care Network"].hosting_platform == "direct_mrf_body"
     assert by_name["Nippon Life Benefits"].hosting_platform == "healthcarebluebook_mrf"
     assert (
         by_name["UMWA Health and Retirement Funds"].hosting_platform
@@ -1498,9 +1506,13 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert by_name["Employers Health Network"].hosting_platform == "payercompass_mrf"
     assert by_name["Center Care"].hosting_platform == "payercompass_mrf"
     assert by_name["Employee Benefit Logistics"].hosting_platform == "payercompass_mrf"
+    assert by_name["HealthChoice - HPI"].hosting_platform == "payercompass_mrf"
     assert by_name["Insurance Systems"].hosting_platform == "payercompass_mrf"
     assert by_name["Stanislaus County Health Plan"].hosting_platform == "payercompass_mrf"
     assert by_name["CSC Zelis Repository"].hosting_platform == "payercompass_mrf"
+    assert by_name["Med-Pay"].hosting_platform == "healthcarebluebook_mrf"
+    assert by_name["Municipal Benefit Health Program"].hosting_platform == "payercompass_mrf"
+    assert by_name["The Care Network"].hosting_platform == "direct_mrf_body"
     assert by_name["Kapnick Insurance Group"].hosting_platform == "sapphire"
     assert by_name["Reliance Matrix"].hosting_platform == "html_delegated_mrf_links"
     assert "Reliance Standard" in by_name["Reliance Matrix"].aliases
@@ -5062,6 +5074,34 @@ def test_import_control_file_context_plan_info_skips_generic_file_labels():
         )
         == []
     )
+
+
+def test_import_control_file_context_plan_info_uses_meaningful_target_label():
+    plan_info = discovery._import_control_file_context_plan_info(
+        source_id="source_1",
+        description="In-Network file",
+        network_name="Local network",
+        company_name="Machine Readable Files",
+        target_label="Example Public TPA",
+        from_index_url="https://example.test/machine-readable-files",
+        canonical_url="https://example.test/rates.json.gz",
+    )
+
+    assert plan_info[0]["plan_id_type"] == "source_file_context_hash"
+    assert plan_info[0]["plan_name"] == "Example Public TPA"
+
+
+def test_crawl_target_context_uses_source_display_as_company_name():
+    context = discovery._crawl_target_context_metadata(
+        discovery.CrawlTarget(
+            source={"display_name": "Example Public TPA"},
+            url="https://example.test/in-network-rates.json.gz",
+            label="In-network rates",
+            metadata={},
+        )
+    )
+
+    assert context["company_name"] == "Example Public TPA"
 
 
 def test_split_preview_items_slices_large_plan_info_without_changing_file_identity():

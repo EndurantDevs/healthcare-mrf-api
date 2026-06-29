@@ -3643,6 +3643,7 @@ def _crawl_target_context_metadata(target: CrawlTarget) -> dict[str, Any]:
     for key in (
         "client_id",
         "client_name",
+        "company_name",
         "employer_id",
         "employer_name",
         "employer_slug",
@@ -3656,6 +3657,10 @@ def _crawl_target_context_metadata(target: CrawlTarget) -> dict[str, Any]:
         value = str(metadata.get(key) or "").strip()
         if value:
             context[key] = value
+    if not context.get("company_name"):
+        source_display_name = str((target.source or {}).get("display_name") or "").strip()
+        if source_display_name:
+            context["company_name"] = source_display_name
     return context
 
 
@@ -11074,8 +11079,9 @@ def _import_control_file_context_plan_info(
     company_name: Any,
     from_index_url: Any,
     canonical_url: Any,
+    target_label: Any = None,
 ) -> list[dict[str, Any]]:
-    for candidate in (description, network_name, company_name):
+    for candidate in (description, network_name, company_name, target_label):
         plan_name = _clean_text(candidate)
         if not plan_name:
             continue
@@ -11345,6 +11351,7 @@ async def _import_control_snapshot_items(
                 company_name=company_name,
                 from_index_url=row[11],
                 canonical_url=row[2] or original_url,
+                target_label=metadata.get("target_label"),
             )
         if not plan_info:
             continue
