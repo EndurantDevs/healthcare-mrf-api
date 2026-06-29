@@ -6278,6 +6278,55 @@ def test_parse_html_mrf_links_accepts_extensionless_dated_body_files():
     ]
 
 
+@pytest.mark.asyncio
+async def test_curl_html_fallback_fetches_allowed_sutter_page(monkeypatch):
+    html = b"<html>Download JSON File</html>"
+    captured = {}
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self):
+            return (
+                html
+                + discovery.CURL_HTML_FALLBACK_META_MARKER
+                + b"200\thttps://www.sutterhealthplan.org/technical-information",
+                b"",
+            )
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        discovery.asyncio,
+        "create_subprocess_exec",
+        fake_create_subprocess_exec,
+    )
+
+    text = await discovery._fetch_text_via_curl(
+        "https://www.sutterhealthplan.org/healthcare-cost-transparency",
+        max_bytes=1024,
+    )
+
+    assert text == html.decode()
+    assert captured["args"][:4] == ("curl", "-sS", "-L", "--compressed")
+    assert "--max-filesize" in captured["args"]
+
+
+def test_curl_html_fallback_is_limited_to_known_public_pages():
+    assert discovery._curl_html_fallback_allowed(
+        "https://www.sutterhealthplan.org/technical-information"
+    )
+    assert not discovery._curl_html_fallback_allowed(
+        "https://example.test/technical-information"
+    )
+    assert not discovery._curl_html_fallback_allowed(
+        "https://www.sutterhealthplan.org/provider-directory"
+    )
+
+
 def test_parse_html_mrf_links_accepts_spaced_anchor_close_tags():
     html = """
     <a href="/files/2026-06-01_MERCYCARE-COMMERCIAL_in-network-rates.json">
