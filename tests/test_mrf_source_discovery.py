@@ -896,6 +896,11 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
 | The Care Network | network | https://www.claimsbridge.net/tic/tcn/TCN_in-Network-rates.json | aliases: TCN |
 | Nippon Life Benefits | tpa | https://mrf.healthcarebluebook.com/Nippon | aliases: Nippon Life |
 | UMWA Health and Retirement Funds | tpa | https://mrf.healthcarebluebook.com/healthsmartfundsaccount | aliases: UMWA Funds |
+| PTI Engineered Plastics | group | https://mrf.healthcarebluebook.com/PTIEngineeredPlastics | aliases: PTI |
+| RCI Group II, LLC | group | https://mrf.healthcarebluebook.com/RCI | aliases: RCI Group II, RCI |
+| The Ohio State University | group | https://mrf.healthcarebluebook.com/TheOhioStateUniversity | aliases: Ohio State University, OSU |
+| U.S. Renal Care | group | https://mrf.healthcarebluebook.com/USRenalCare | aliases: US Renal Care, U.S. Renal |
+| Washington Community Schools | group | https://www.mymedicalshopper.com/mrf/washington-community-schools-hdp-family | aliases: Washington Community Schools HDP Family |
 | BlueAdvantage Administrators of Arkansas | tpa | https://www.blueadvantagearkansas.com/interoperability/machine-readable-files | aliases: BlueAdvantage, Skai BCBS |
 | GEHA | network/tpa | https://www.geha.com/transparency-in-coverage | benefit lines: dental, medical; aliases: Connection Dental |
 | HealthSmart | network/tpa | https://mrf.healthcarebluebook.com/Healthsmart | benefit lines: medical, dental; aliases: HealthSmart Benefit Solutions, HealthSmart-Dental, HealthSmart Dental |
@@ -1061,6 +1066,11 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
         by_name["UMWA Health and Retirement Funds"].hosting_platform
         == "healthcarebluebook_mrf"
     )
+    assert by_name["PTI Engineered Plastics"].hosting_platform == "healthcarebluebook_mrf"
+    assert by_name["RCI Group II, LLC"].hosting_platform == "healthcarebluebook_mrf"
+    assert by_name["The Ohio State University"].hosting_platform == "healthcarebluebook_mrf"
+    assert by_name["U.S. Renal Care"].hosting_platform == "healthcarebluebook_mrf"
+    assert by_name["Washington Community Schools"].hosting_platform == "mymedicalshopper_talon"
     assert (
         by_name["BlueAdvantage Administrators of Arkansas"].hosting_platform
         == "blueadvantage_html_mrf_links"
@@ -1514,6 +1524,11 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert by_name["Municipal Benefit Health Program"].hosting_platform == "payercompass_mrf"
     assert by_name["The Care Network"].hosting_platform == "direct_mrf_body"
     assert by_name["Kapnick Insurance Group"].hosting_platform == "sapphire"
+    assert by_name["PTI Engineered Plastics"].hosting_platform == "healthcarebluebook_mrf"
+    assert by_name["RCI Group II, LLC"].hosting_platform == "healthcarebluebook_mrf"
+    assert by_name["The Ohio State University"].hosting_platform == "healthcarebluebook_mrf"
+    assert by_name["U.S. Renal Care"].hosting_platform == "healthcarebluebook_mrf"
+    assert by_name["Washington Community Schools"].hosting_platform == "mymedicalshopper_talon"
     assert by_name["Reliance Matrix"].hosting_platform == "html_delegated_mrf_links"
     assert "Reliance Standard" in by_name["Reliance Matrix"].aliases
     assert (

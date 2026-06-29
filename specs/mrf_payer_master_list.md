@@ -457,6 +457,11 @@ Last one-time research refresh: 2026-06-05.
 | WebTPA | tpa | https://www.webtpa.com/rights-protections | curated source row |
 | WebTPA | tpa | https://price-transparency.webtpa.com/ | public transparency URL |
 | WellNet | tpa | https://mrf.healthcarebluebook.com/Wellnet | public Healthcare Bluebook MRF directory; aliases: WellNet Healthcare |
+| PTI Engineered Plastics | group | https://mrf.healthcarebluebook.com/PTIEngineeredPlastics | public Healthcare Bluebook MRF directory for group plan source; aliases: PTI |
+| RCI Group II, LLC | group | https://mrf.healthcarebluebook.com/RCI | public Healthcare Bluebook MRF directory for group plan source; aliases: RCI Group II, RCI |
+| The Ohio State University | group | https://mrf.healthcarebluebook.com/TheOhioStateUniversity | public Healthcare Bluebook MRF directory for group plan source; aliases: Ohio State University, OSU |
+| U.S. Renal Care | group | https://mrf.healthcarebluebook.com/USRenalCare | public Healthcare Bluebook MRF directory for group plan source; aliases: US Renal Care, U.S. Renal |
+| Washington Community Schools | group | https://www.mymedicalshopper.com/mrf/washington-community-schools-hdp-family | public Washington Community Schools MRF compliance page delegates to TALON/MyMedicalShopper; aliases: Washington Community Schools HDP Family |
 
 ## Maintenance
 
