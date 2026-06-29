@@ -2041,6 +2041,57 @@ async def test_import_resources_honors_source_concurrency(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_import_resources_reports_streaming_partial_progress(monkeypatch):
+    _stub_resource_import_metadata(monkeypatch)
+
+    async def fake_fetch_resource_rows(source, _resource_type, **kwargs):
+        row_batch_handler = kwargs["row_batch_handler"]
+        written = await row_batch_handler(
+            ProviderDirectoryLocation,
+            [{"source_id": source["source_id"], "resource_id": "loc-1"}],
+        )
+        return importer.ResourceFetchResult(
+            model=ProviderDirectoryLocation,
+            rows=[],
+            rows_fetched=1,
+            rows_written=written,
+            pages_fetched=1,
+            complete=True,
+            row_limit_reached=False,
+            page_limit_reached=False,
+            hard_page_limit_reached=False,
+            next_url_remaining=False,
+        )
+
+    async def fake_upsert_resource_rows(_model, rows, **_kwargs):
+        return len(rows)
+
+    progress_events: list[tuple[int, int, dict[str, int]]] = []
+
+    async def progress_callback(done, total, counts):
+        progress_events.append((done, total, dict(counts)))
+
+    monkeypatch.setattr(importer, "_fetch_resource_rows", fake_fetch_resource_rows)
+    monkeypatch.setattr(importer, "_upsert_resource_rows", fake_upsert_resource_rows)
+
+    counts = await importer._import_resources(  # pylint: disable=protected-access
+        [{"source_id": "source_a", "api_base": "https://a.example/fhir"}],
+        resources=["Location"],
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=100,
+        timeout=3,
+        run_id="run_1",
+        stream_batch_size=1,
+        progress_callback=progress_callback,
+    )
+
+    assert counts == {"Location": 1}
+    assert progress_events[0] == (0, 1, {"Location": 1})
+    assert progress_events[-1] == (1, 1, {"Location": 1})
+
+
+@pytest.mark.asyncio
 async def test_import_resources_fetches_duplicate_base_once_and_fans_out_rows(monkeypatch):
     _stub_resource_import_metadata(monkeypatch)
 

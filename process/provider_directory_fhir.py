@@ -4077,6 +4077,16 @@ async def _import_resources(
     cancel_task: dict[str, Any] | None = None,
     progress_callback: Callable[[int, int, dict[str, int]], Awaitable[None]] | None = None,
 ) -> dict[str, int]:
+    counts: dict[str, int] = {resource: 0 for resource in resources}
+    semaphore = asyncio.Semaphore(max(1, source_concurrency))
+    source_groups = _group_resource_import_sources(sources, linked_resource_limit=linked_resource_limit)
+    total_groups = len(source_groups)
+    completed_groups = 0
+    report_every = max(1, total_groups // 20)
+    progress_lock = asyncio.Lock()
+    active_partial_counts: dict[int, dict[str, int]] = {}
+    next_partial_progress_at = 0.0
+
     def merge_counts(target: dict[str, int], source_counts: dict[str, int]) -> None:
         for key, value in source_counts.items():
             target[key] = target.get(key, 0) + value
@@ -4086,6 +4096,35 @@ async def _import_resources(
             target_entry = target.setdefault(resource_type, _empty_resource_stats())
             for key, value in entry.items():
                 target_entry[key] = target_entry.get(key, 0) + value
+
+    def progress_counts_snapshot() -> dict[str, int]:
+        snapshot = dict(counts)
+        for partial_counts in active_partial_counts.values():
+            merge_counts(snapshot, partial_counts)
+        return snapshot
+
+    async def maybe_report_partial_progress(
+        group_key: int,
+        resource_type: str,
+        written: int,
+    ) -> None:
+        nonlocal next_partial_progress_at
+        if not progress_callback or written <= 0:
+            return
+        snapshot: dict[str, int] | None = None
+        async with progress_lock:
+            group_counts = active_partial_counts.setdefault(group_key, {})
+            group_counts[resource_type] = group_counts.get(resource_type, 0) + written
+            now = time.monotonic()
+            if now >= next_partial_progress_at:
+                next_partial_progress_at = now + 15.0
+                snapshot = progress_counts_snapshot()
+        if snapshot is not None:
+            await progress_callback(completed_groups, total_groups, snapshot)
+
+    async def clear_partial_progress(group_key: int) -> None:
+        async with progress_lock:
+            active_partial_counts.pop(group_key, None)
 
     async def import_one_group(
         source_group: list[dict[str, Any]],
@@ -4100,6 +4139,7 @@ async def _import_resources(
     ]:
         if cancel_ctx is not None:
             await raise_if_cancelled(cancel_ctx, cancel_task)
+        group_key = id(source_group)
         source = source_group[0]
         source_ids = [item["source_id"] for item in source_group]
         source_counts: dict[str, int] = {resource: 0 for resource in resources}
@@ -4126,13 +4166,15 @@ async def _import_resources(
             use_streaming = stream_batch_size > 0
 
             async def row_batch_handler(model: type, rows: list[dict[str, Any]]) -> int:
-                return await _upsert_resource_rows(
+                written = await _upsert_resource_rows(
                     model,
                     _copy_rows_for_source_ids(rows, source_ids),
                     run_id=run_id,
                     track_seen=stale_cleanup,
                     seen_table=seen_stage_table,
                 )
+                await maybe_report_partial_progress(group_key, resource_type, written)
+                return written
 
             result = await _fetch_resource_rows(
                 source,
@@ -4201,12 +4243,6 @@ async def _import_resources(
             source_stale_ready_source_ids,
         )
 
-    counts: dict[str, int] = {resource: 0 for resource in resources}
-    semaphore = asyncio.Semaphore(max(1, source_concurrency))
-    source_groups = _group_resource_import_sources(sources, linked_resource_limit=linked_resource_limit)
-    total_groups = len(source_groups)
-    completed_groups = 0
-    report_every = max(1, total_groups // 20)
     seen_stage_table = (
         await _ensure_provider_directory_import_seen_stage_table(run_id)
         if stale_cleanup and run_id and _seen_stage_enabled()
@@ -4226,7 +4262,10 @@ async def _import_resources(
         dict[str, list[str]],
     ]:
         async with semaphore:
-            return await import_one_group(source_group)
+            try:
+                return await import_one_group(source_group)
+            finally:
+                await clear_partial_progress(id(source_group))
 
     tasks: list[asyncio.Task] = []
     try:
@@ -4259,7 +4298,9 @@ async def _import_resources(
             if progress_callback is not None and (
                 completed_groups == total_groups or completed_groups % report_every == 0
             ):
-                await progress_callback(completed_groups, total_groups, dict(counts))
+                async with progress_lock:
+                    snapshot = progress_counts_snapshot()
+                await progress_callback(completed_groups, total_groups, snapshot)
 
         if seen_stage_table and stale_ready_source_ids_by_resource:
             await _prepare_provider_directory_import_seen_stage_lookup(seen_stage_table)
