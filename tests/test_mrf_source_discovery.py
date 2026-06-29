@@ -226,6 +226,10 @@ def test_source_urls_are_loaded_from_registry_file():
         == "cigna_static_mrf_lookup"
     )
     assert (
+        config["platform_resolvers"]["bcbs_global_solutions_mrf"]["type"]
+        == "bcbs_global_solutions_mrf"
+    )
+    assert (
         config["platform_resolvers"]["meritain_mrf_search"]["type"]
         == "meritain_mrf_search"
     )
@@ -937,6 +941,7 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
 | U.S. Renal Care | group | https://mrf.healthcarebluebook.com/USRenalCare | aliases: US Renal Care, U.S. Renal |
 | Washington Community Schools | group | https://www.mymedicalshopper.com/mrf/washington-community-schools-hdp-family | aliases: Washington Community Schools HDP Family |
 | BlueAdvantage Administrators of Arkansas | tpa | https://www.blueadvantagearkansas.com/interoperability/machine-readable-files | aliases: BlueAdvantage, Skai BCBS |
+| BCBS Global Solutions | blue | https://bcbsglobalsolutions.com/transparency-in-coverage/ | aliases: Blue Cross Blue Shield Global Solutions |
 | GEHA | network/tpa | https://www.geha.com/transparency-in-coverage | benefit lines: dental, medical; aliases: Connection Dental |
 | HealthSmart | network/tpa | https://mrf.healthcarebluebook.com/Healthsmart | benefit lines: medical, dental; aliases: HealthSmart Benefit Solutions, HealthSmart-Dental, HealthSmart Dental |
 | Valley Health Plan | medicaid_mco | https://data.sccgov.org/data.json | benefit lines: medical, dental, vision; aliases: VHP |
@@ -1123,6 +1128,13 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
         by_name["BlueAdvantage Administrators of Arkansas"].hosting_platform
         == "blueadvantage_html_mrf_links"
     )
+    assert (
+        by_name["BCBS Global Solutions"].hosting_platform
+        == "bcbs_global_solutions_mrf"
+    )
+    assert by_name["BCBS Global Solutions"].aliases == (
+        "Blue Cross Blue Shield Global Solutions",
+    )
     assert by_name["GEHA"].hosting_platform == "html_delegated_mrf_links"
     assert by_name["GEHA"].benefit_lines == ("dental", "medical")
     assert (
@@ -1229,6 +1241,10 @@ async def test_master_list_keeps_high_value_public_aliases():
 
     assert "Wellmark Blue Cross and Blue Shield" in by_name["Wellmark"].aliases
     assert "Wellmark Health Plan of Iowa, Inc." in by_name["Wellmark"].aliases
+    assert (
+        "Blue Cross Blue Shield Global Solutions"
+        in by_name["BCBS Global Solutions"].aliases
+    )
     assert "Meritain Health An Aetna Company" in by_name["Meritain Health"].aliases
     assert "Meritain Health, An Aetna Company" in by_name["Meritain Health"].aliases
     assert (
@@ -1669,6 +1685,9 @@ async def test_master_list_keeps_high_value_public_aliases():
         "Blue Benefit Administrators of Massachusetts"
         in by_name["BCBS Massachusetts"].aliases
     )
+    assert "Blue Benefit Administrators" in by_name["BCBS Massachusetts"].aliases
+    assert "BBA" in by_name["BCBS Massachusetts"].aliases
+    assert "Cobalt Benefits Group BBA" in by_name["BCBS Massachusetts"].aliases
     assert (
         "Blue Cross and Blue Shield of Massachusetts HMO Blue, Inc."
         in by_name["BCBS Massachusetts"].aliases
@@ -1799,7 +1818,14 @@ async def test_master_list_keeps_high_value_public_aliases():
         "PROFESSIONAL BENEFIT ADMINISTRATORS (OAK BROOK,IL)"
         in aliases_by_name["Professional Benefit Administrators"]
     )
+    assert "Comprehensive Benefits Administrators" in by_name["CBA Blue"].aliases
+    assert "Cobalt Benefits Group CBA Blue" in by_name["CBA Blue"].aliases
+    assert discovery._candidate_matches_text_filters(
+        by_name["CBA Blue"], entity_types=(), payer_query="Cobalt Benefits Group"
+    )
     assert "EBPA Employee Benefits" in by_name["EBPA"].aliases
+    assert "Employee Benefit Plan Administrators" in by_name["EBPA"].aliases
+    assert "Cobalt Benefits Group EBPA" in by_name["EBPA"].aliases
     assert "AmeriBen: Anthem" in by_name["AmeriBen"].aliases
     assert "AmeriBen Anthem Blue Cross" in by_name["AmeriBen"].aliases
     assert "AmeriBen: Anthem Blue Cross" in by_name["AmeriBen"].aliases
@@ -2571,6 +2597,18 @@ def test_classify_hosting_platforms():
             "https://www.bcbsil.com/asomrf?EIN=260241222"
         )
         == "bcbs_asomrf"
+    )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://bcbsglobalsolutions.com/transparency-in-coverage/"
+        )
+        == "bcbs_global_solutions_mrf"
+    )
+    assert (
+        discovery.classify_hosting_platform(
+            "https://groupadmin.bcbsglobalsolutions.com/transparency-in-coverage-toc-json.cfm?planType=4EverLife"
+        )
+        == "bcbs_global_solutions_mrf"
     )
     assert (
         discovery.classify_hosting_platform(
@@ -8108,6 +8146,116 @@ def test_cigna_lookup_html_extracts_configured_and_page_lookup_urls():
         "https://www.cigna.com/static/mrf/latest.json",
         "https://www.cigna.com/static/mrf/co/latest.json",
     ]
+
+
+def test_bcbs_global_solutions_extracts_toc_links():
+    html = """
+    <a href="/transparency-in-coverage-toc-json.cfm?planType=4EverLife">4 Ever Life</a>
+    <a href="/transparency-in-coverage-toc-json.cfm?planType=GeoBlue">GeoBlue</a>
+    """
+
+    links = discovery._bcbs_global_solutions_toc_links_from_html(
+        html,
+        base_url="https://groupadmin.bcbsglobalsolutions.com/transparency-in-coverage.cfm",
+    )
+
+    assert [link["plan_type"] for link in links] == ["4EverLife", "GeoBlue"]
+    assert links[0]["url"] == (
+        "https://groupadmin.bcbsglobalsolutions.com/"
+        "transparency-in-coverage-toc-json.cfm?planType=4EverLife"
+    )
+
+
+@pytest.mark.asyncio
+async def test_bcbs_global_solutions_resolver_follows_landing_and_skips_stale_tocs(
+    monkeypatch,
+):
+    public_landing = "https://bcbsglobalsolutions.com/transparency-in-coverage/"
+    group_landing = (
+        "https://groupadmin.bcbsglobalsolutions.com/transparency-in-coverage.cfm"
+    )
+    live_toc = (
+        "https://groupadmin.bcbsglobalsolutions.com/"
+        "transparency-in-coverage-toc-json.cfm?planType=4EverLife"
+    )
+    stale_toc = (
+        "https://groupadmin.bcbsglobalsolutions.com/"
+        "transparency-in-coverage-toc-json.cfm?planType=GeoBlue"
+    )
+    allowed_only_toc = (
+        "https://groupadmin.bcbsglobalsolutions.com/"
+        "transparency-in-coverage-toc-json.cfm?planType=AllowedOnly"
+    )
+
+    async def fake_fetch_text(url, **_kwargs):
+        if url == public_landing:
+            return f'<a href="{group_landing}">MRF table of contents</a>'
+        if url == group_landing:
+            return f"""
+            <a href="{live_toc}">4 Ever Life</a>
+            <a href="{stale_toc}">GeoBlue</a>
+            <a href="{allowed_only_toc}">Allowed only</a>
+            """
+        raise AssertionError(f"unexpected fetch_text URL: {url}")
+
+    async def fake_fetch_json_value(url, **_kwargs):
+        if url == stale_toc:
+            raise ValueError("response body is not JSON")
+        if url == allowed_only_toc:
+            return {
+                "reporting_entity_name": "Example Reporting Entity",
+                "reporting_entity_type": "third-party administrator",
+                "reporting_structure": [
+                    {
+                        "reporting_plans": [
+                            {"reporting_entity_name": "Allowed Only Plan"}
+                        ],
+                        "allowed_amount_file": {
+                            "description": "allowed",
+                            "location": "https://example.test/allowed.json.gz",
+                        },
+                    }
+                ],
+            }
+        if url == live_toc:
+            return {
+                "reporting_entity_name": "Example Reporting Entity",
+                "reporting_entity_type": "third-party administrator",
+                "reporting_structure": [
+                    {
+                        "reporting_plans": [
+                            {"reporting_entity_name": "Example Live Plan"}
+                        ],
+                        "in_network_files": [
+                            {
+                                "description": "in_network_files",
+                                "location": "https://example.test/in-network.json.gz",
+                            }
+                        ],
+                    }
+                ],
+            }
+        raise AssertionError(f"unexpected fetch_json URL: {url}")
+
+    monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
+    monkeypatch.setattr(discovery, "_fetch_json_value", fake_fetch_json_value)
+
+    targets = await discovery._resolve_bcbs_global_solutions_mrf(
+        {
+            "source_id": "source_1",
+            "payer_id": "payer_1",
+            "display_name": "BCBS Global Solutions",
+        },
+        public_landing,
+        {"type": "bcbs_global_solutions_mrf", "toc_max_bytes": 12345},
+        session=None,
+    )
+
+    assert [target.url for target in targets] == [live_toc]
+    assert targets[0].metadata["target_file_type"] == "table-of-contents"
+    assert targets[0].metadata["target_max_bytes"] == 12345
+    assert targets[0].metadata["plan_type"] == "4EverLife"
+    assert targets[0].metadata["reporting_plan_name"] == "Example Live Plan"
 
 
 def test_bcbs_asomrf_filelist_html_extracts_filelist_url():

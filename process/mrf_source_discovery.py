@@ -667,6 +667,14 @@ def classify_hosting_platform(url: str | None) -> str | None:
     if host in {"www.hcsc.com", "hcsc.com"} and "transparency-in-coverage" in path:
         return "hcsc_asomrf_landing"
     if (
+        host in {"bcbsglobalsolutions.com", "www.bcbsglobalsolutions.com"}
+        and "transparency-in-coverage" in path
+    ) or (
+        host == "groupadmin.bcbsglobalsolutions.com"
+        and path.startswith("/transparency-in-coverage")
+    ):
+        return "bcbs_global_solutions_mrf"
+    if (
         (
             host in {"www.harvardpilgrim.org", "harvardpilgrim.org"}
             and "machine-readable-files" in path
@@ -8252,6 +8260,160 @@ def _limit_crawl_targets_round_robin(
     return limited
 
 
+def _bcbs_global_solutions_toc_links_from_html(
+    html_text: str, *, base_url: str
+) -> list[dict[str, str]]:
+    links: dict[str, dict[str, str]] = {}
+    for candidate in _html_link_candidates(html_text, base_url=base_url):
+        url = str(candidate.get("url") or "").strip()
+        parsed = urlsplit(url)
+        if parsed.netloc.lower() != "groupadmin.bcbsglobalsolutions.com":
+            continue
+        if parsed.path.lower() != "/transparency-in-coverage-toc-json.cfm":
+            continue
+        plan_type = (parse_qs(parsed.query).get("planType") or [""])[0].strip()
+        label = _clean_text(candidate.get("label")) or plan_type or "BCBS Global TOC"
+        key = _canonical_or_none(url) or url
+        links[key] = {"url": url, "plan_type": plan_type, "label": label}
+    return list(links.values())
+
+
+def _bcbs_global_solutions_landing_links_from_html(
+    html_text: str, *, base_url: str
+) -> list[str]:
+    urls: list[str] = []
+    seen: set[str] = set()
+    for candidate in _html_link_candidates(html_text, base_url=base_url):
+        url = str(candidate.get("url") or "").strip()
+        parsed = urlsplit(url)
+        if parsed.netloc.lower() != "groupadmin.bcbsglobalsolutions.com":
+            continue
+        if parsed.path.lower() != "/transparency-in-coverage.cfm":
+            continue
+        key = _canonical_or_none(url) or url
+        if key in seen:
+            continue
+        seen.add(key)
+        urls.append(url)
+    return urls
+
+
+def _bcbs_global_solutions_toc_has_in_network(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    reporting_structure = payload.get("reporting_structure")
+    if not isinstance(reporting_structure, list):
+        return False
+    return any(
+        isinstance(item, dict)
+        and isinstance(item.get("in_network_files"), list)
+        and bool(item.get("in_network_files"))
+        for item in reporting_structure
+    )
+
+
+def _bcbs_global_solutions_first_plan_name(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    for structure in payload.get("reporting_structure") or []:
+        if not isinstance(structure, dict):
+            continue
+        for plan in structure.get("reporting_plans") or []:
+            if not isinstance(plan, dict):
+                continue
+            name = _clean_text(plan.get("reporting_entity_name"))
+            if name:
+                return name
+    return None
+
+
+async def _resolve_bcbs_global_solutions_mrf(
+    source: dict[str, Any],
+    url: str,
+    resolver: dict[str, Any],
+    session: aiohttp.ClientSession,
+) -> list[CrawlTarget]:
+    resolver_type = str(resolver.get("type") or "bcbs_global_solutions_mrf")
+    max_pages = _as_int(resolver.get("max_pages")) or 5
+    max_targets = _as_int(resolver.get("max_targets")) or 20
+    toc_max_bytes = (
+        _parse_size_bytes(resolver.get("toc_max_bytes")) or MAX_TOC_BYTES_DEFAULT
+    )
+    page_urls = [url]
+    seen_pages: set[str] = set()
+    toc_links: dict[str, dict[str, str]] = {}
+    while page_urls and len(seen_pages) < max_pages:
+        page_url = page_urls.pop(0)
+        page_key = _canonical_or_none(page_url) or page_url
+        if page_key in seen_pages:
+            continue
+        seen_pages.add(page_key)
+        html_text = await _fetch_text(
+            page_url,
+            max_bytes=int(resolver.get("max_bytes") or 5 * 1024 * 1024),
+            session=session,
+        )
+        for link in _bcbs_global_solutions_toc_links_from_html(
+            html_text, base_url=page_url
+        ):
+            link_url = str(link.get("url") or "")
+            link_key = _canonical_or_none(link_url) or link_url
+            if link_key:
+                toc_links[link_key] = link
+        for landing_url in _bcbs_global_solutions_landing_links_from_html(
+            html_text, base_url=page_url
+        ):
+            landing_key = _canonical_or_none(landing_url) or landing_url
+            if landing_key not in seen_pages and landing_url not in page_urls:
+                page_urls.append(landing_url)
+
+    targets: list[CrawlTarget] = []
+    for link in toc_links.values():
+        toc_url = str(link.get("url") or "").strip()
+        if not toc_url:
+            continue
+        try:
+            payload = await _fetch_json_value(
+                toc_url,
+                max_bytes=toc_max_bytes,
+                session=session,
+            )
+        except Exception:  # pylint: disable=broad-exception-caught
+            continue
+        if not _bcbs_global_solutions_toc_has_in_network(payload):
+            continue
+        plan_type = _clean_text(link.get("plan_type"))
+        plan_name = _bcbs_global_solutions_first_plan_name(payload)
+        label = _clean_text(link.get("label")) or plan_name or plan_type
+        targets.append(
+            CrawlTarget(
+                source=source,
+                url=toc_url,
+                label=label or str(source.get("display_name") or "BCBS Global TOC"),
+                resolved_from_url=url,
+                metadata={
+                    "resolver": resolver_type,
+                    "target_kind": "toc_json",
+                    "target_file_type": "table-of-contents",
+                    "target_max_bytes": toc_max_bytes,
+                    "plan_type": plan_type,
+                    "reporting_entity_name": _clean_text(
+                        payload.get("reporting_entity_name")
+                    ),
+                    "reporting_entity_type": _clean_text(
+                        payload.get("reporting_entity_type")
+                    ),
+                    "reporting_plan_name": plan_name,
+                },
+            )
+        )
+        if max_targets and len(targets) >= max_targets:
+            break
+    if not targets:
+        raise ValueError(f"no BCBS Global Solutions TOCs found for {url}")
+    return targets
+
+
 def _bcbs_asomrf_filelist_urls_from_html(html_text: str, *, base_url: str) -> list[str]:
     urls: list[str] = []
     for candidate in _html_link_candidates(html_text, base_url=base_url):
@@ -9567,6 +9729,8 @@ async def _crawl_targets_for_source(
         return await _resolve_s3_xml_listing(source, url, resolver, session)
     if resolver_type == "cigna_static_mrf_lookup":
         return await _resolve_cigna_static_mrf_lookup(source, url, resolver, session)
+    if resolver_type == "bcbs_global_solutions_mrf":
+        return await _resolve_bcbs_global_solutions_mrf(source, url, resolver, session)
     if resolver_type == "bcbs_asomrf_filelist":
         return await _resolve_bcbs_asomrf_filelist(source, url, resolver, session)
     if resolver_type == "meritain_mrf_search":
