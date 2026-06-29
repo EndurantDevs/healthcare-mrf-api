@@ -363,6 +363,12 @@ def test_classify_hosting_platform_recognizes_public_adapter_pages():
     )
     assert (
         discovery.classify_hosting_platform(
+            "https://www.sutterhealthplan.org/healthcare-cost-transparency"
+        )
+        == "html_mrf_links"
+    )
+    assert (
+        discovery.classify_hosting_platform(
             "https://group-health.com/price-transparency"
         )
         == "html_mrf_links"

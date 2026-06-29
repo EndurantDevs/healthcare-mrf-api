@@ -860,6 +860,14 @@ def classify_hosting_platform(url: str | None) -> str | None:
     ):
         return "html_mrf_links"
     if (
+        host in {"www.sutterhealthplan.org", "sutterhealthplan.org"}
+        and (
+            "healthcare-cost-transparency" in path
+            or "technical-information" in path
+        )
+    ):
+        return "html_mrf_links"
+    if (
         host in {"www.sharphealthplan.com", "sharphealthplan.com"}
         and "api-access-for-developers" in path
     ):
