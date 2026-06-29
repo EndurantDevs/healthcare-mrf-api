@@ -46,7 +46,7 @@ from db.models import (
 from process.control_lifecycle import mark_control_run
 from process.control_cancel import raise_if_cancelled
 from process.ext.address_canon import resolve_into_archive
-from process.ext.contact_canon import canonicalize_one as canonicalize_contact_one
+from process.ext.contact_canon import canonicalize_batch as canonicalize_contact_batch
 from process.ext.utils import ensure_database
 
 
@@ -1060,9 +1060,9 @@ def _location_contact_fields(
     fax_number: str | None,
     country_code: str | None,
 ) -> dict[str, str | None]:
-    canonical = canonicalize_contact_one((telephone_number, fax_number, country_code))
+    canonical = canonicalize_contact_batch([(telephone_number, fax_number, country_code)])[0]
     phone_number = canonical.get("phone_number")
-    fax_number_digits = canonical.get("fax_number")
+    fax_number_digits = canonical.get("fax_number_digits") or canonical.get("fax_number")
     phone_extension = canonical.get("phone_extension")
     fax_extension = canonical.get("fax_extension")
     return {
@@ -1071,6 +1071,38 @@ def _location_contact_fields(
         "phone_extension": phone_extension if isinstance(phone_extension, str) else None,
         "fax_extension": fax_extension if isinstance(fax_extension, str) else None,
     }
+
+
+def _attach_location_contact_fields(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not rows:
+        return rows
+    canonical_rows = canonicalize_contact_batch(
+        (
+            row.get("telephone_number"),
+            row.get("fax_number"),
+            row.get("country_code") or "US",
+        )
+        for row in rows
+    )
+    for row, canonical in zip(rows, canonical_rows):
+        phone_number = canonical.get("phone_number")
+        fax_number_digits = canonical.get("fax_number_digits") or canonical.get("fax_number")
+        phone_extension = canonical.get("phone_extension")
+        fax_extension = canonical.get("fax_extension")
+        row["phone_number"] = phone_number if isinstance(phone_number, str) else None
+        row["fax_number_digits"] = fax_number_digits if isinstance(fax_number_digits, str) else None
+        row["phone_extension"] = phone_extension if isinstance(phone_extension, str) else None
+        row["fax_extension"] = fax_extension if isinstance(fax_extension, str) else None
+    return rows
+
+
+def _location_contact_fields_missing(rows: list[dict[str, Any]]) -> bool:
+    contact_keys = ("phone_number", "phone_extension", "fax_number_digits", "fax_extension")
+    return any(
+        (row.get("telephone_number") or row.get("fax_number"))
+        and any(key not in row for key in contact_keys)
+        for row in rows
+    )
 
 
 def _contact_main_expr(expr: str) -> str:
@@ -1235,6 +1267,7 @@ def parse_fhir_resource(
     *,
     resource_url: str | None = None,
     run_id: str | None = None,
+    normalize_location_contacts: bool = True,
 ) -> tuple[type, dict[str, Any]] | None:
     resource_type = resource.get("resourceType")
     observed_at = _now()
@@ -1307,10 +1340,11 @@ def parse_fhir_resource(
             "type_codes": _codings(resource.get("type")),
             "telephone_number": telephone_number,
             "fax_number": fax_number,
-            **_location_contact_fields(telephone_number, fax_number, address.get("country_code")),
             "telecom": telecom,
             **{key: value for key, value in address.items() if key != "address_json"},
         }
+        if normalize_location_contacts:
+            row.update(_location_contact_fields(telephone_number, fax_number, address.get("country_code")))
         return ProviderDirectoryLocation, row
     if resource_type == "PractitionerRole":
         period_start, period_end = _period(resource)
@@ -1523,6 +1557,7 @@ def _append_alohr_parsed_resource(
         resource,
         resource_url=f"{ALOHR_GRAPHQL_URL}#{resource.get('resourceType')}/{resource.get('id')}",
         run_id=run_id,
+        normalize_location_contacts=resource.get("resourceType") != "Location",
     )
     if parsed:
         model, row = parsed
@@ -3153,6 +3188,8 @@ async def _upsert_rows(
 ) -> int:
     if not rows:
         return 0
+    if model is ProviderDirectoryLocation and _location_contact_fields_missing(rows):
+        rows = _attach_location_contact_fields(rows)
     table = model.__table__
     columns = [column.name for column in table.columns]
     primary_keys = [column.name for column in table.primary_key.columns]
@@ -3913,6 +3950,7 @@ async def _stream_bulk_export_output_rows(
             resource,
             resource_url=url,
             run_id=run_id,
+            normalize_location_contacts=not (resource_type == "Location" and row_batch_handler),
         )
         if not parsed:
             return None
@@ -4136,6 +4174,7 @@ async def _fetch_resource_rows(
                 entry["resource"],
                 resource_url=_clean_text(entry.get("fullUrl")),
                 run_id=run_id,
+                normalize_location_contacts=not (resource_type == "Location" and row_batch_handler),
             )
             if not parsed:
                 continue
@@ -4467,6 +4506,8 @@ async def _upsert_resource_rows(
 ) -> int:
     if not rows:
         return 0
+    if model is ProviderDirectoryLocation and _location_contact_fields_missing(rows):
+        rows = _attach_location_contact_fields(rows)
     if canonical_api_base and source_ids:
         canonical_rows = _canonical_resource_rows(
             model,

@@ -199,6 +199,34 @@ def test_provider_directory_location_preserves_raw_contact_and_adds_canonical_di
     assert row["fax_extension"] == "22"
 
 
+def test_provider_directory_location_can_skip_contact_derivation_for_streaming_batches():
+    model, row = importer.parse_fhir_resource(
+        "source_a",
+        {
+            "resourceType": "Location",
+            "id": "loc-contact",
+            "telecom": [
+                {"system": "phone", "value": "+1 (312) 555-0100 ext. 45"},
+                {"system": "fax", "value": "312.555.0199 # 22"},
+            ],
+            "address": {
+                "line": ["100 Main St"],
+                "city": "Chicago",
+                "state": "IL",
+                "postalCode": "60601",
+                "country": "US",
+            },
+        },
+        normalize_location_contacts=False,
+    )
+
+    assert model is ProviderDirectoryLocation
+    assert row["telephone_number"] == "+1 (312) 555-0100 ext. 45"
+    assert row["fax_number"] == "312.555.0199 # 22"
+    assert "phone_number" not in row
+    assert "fax_number_digits" not in row
+
+
 def test_provider_directory_location_address_key_sql_recovers_numeric_state_fips():
     sql = importer.provider_directory_location_address_key_sql("mrf")
 
@@ -363,6 +391,72 @@ async def test_upsert_resource_rows_tracks_seen_and_skips_unchanged(monkeypatch)
     assert written == 1
     assert seen_calls == [(ProviderDirectoryLocation, rows, "run_1", {"seen_table": None})]
     assert upsert_calls == [(ProviderDirectoryLocation, rows, {"skip_unchanged": True})]
+
+
+@pytest.mark.asyncio
+async def test_upsert_resource_rows_batches_location_contact_derivation(monkeypatch):
+    seen_batches = []
+    upsert_calls = []
+
+    def fake_canonicalize_contact_batch(rows):
+        rows = list(rows)
+        seen_batches.append(rows)
+        return [
+            {
+                "phone_number": "3125550100",
+                "phone_extension": "45",
+                "fax_number_digits": "3125550199",
+                "fax_extension": None,
+            },
+            {
+                "phone_number": "3125550101",
+                "phone_extension": None,
+                "fax_number_digits": None,
+                "fax_extension": None,
+            },
+        ]
+
+    async def fake_upsert(model, rows, **kwargs):
+        upsert_calls.append((model, rows, kwargs))
+        return len(rows)
+
+    monkeypatch.setattr(importer, "canonicalize_contact_batch", fake_canonicalize_contact_batch)
+    monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
+
+    rows = [
+        {
+            "source_id": "source_a",
+            "resource_id": "loc-1",
+            "telephone_number": "+1 (312) 555-0100 ext. 45",
+            "fax_number": "312.555.0199",
+            "country_code": "US",
+        },
+        {
+            "source_id": "source_a",
+            "resource_id": "loc-2",
+            "telephone_number": "312-555-0101",
+            "country_code": "US",
+        },
+    ]
+    written = await importer._upsert_resource_rows(  # pylint: disable=protected-access
+        ProviderDirectoryLocation,
+        rows,
+        run_id="run_1",
+        track_seen=False,
+    )
+
+    assert written == 2
+    assert seen_batches == [
+        [
+            ("+1 (312) 555-0100 ext. 45", "312.555.0199", "US"),
+            ("312-555-0101", None, "US"),
+        ]
+    ]
+    assert upsert_calls == [(ProviderDirectoryLocation, rows, {"skip_unchanged": False})]
+    assert rows[0]["phone_number"] == "3125550100"
+    assert rows[0]["phone_extension"] == "45"
+    assert rows[0]["fax_number_digits"] == "3125550199"
+    assert rows[1]["phone_number"] == "3125550101"
 
 
 @pytest.mark.asyncio
