@@ -176,14 +176,14 @@ def test_provider_directory_location_address_key_sql_recovers_numeric_state_fips
     assert "WHEN '42' THEN 'PA'" in sql
     assert "normalized_state" in sql
     assert "normalized_country" in sql
-    assert "country_code IS DISTINCT FROM" in sql
+    assert "loc_src.country_code IS DISTINCT FROM" in sql
     assert "'840'" in sql
     assert "'001'" in sql
     assert 'LEFT JOIN "mrf"."geo_zip_lookup" AS geo' in sql
     assert "zip_restored_state" in sql
     assert "resolved_state" in sql
-    assert "WHERE (address_key IS NULL" in sql
-    assert "OR zip5 IS NULL" in sql
+    assert "WHERE (loc_src.address_key IS NULL" in sql
+    assert "OR loc_src.zip5 IS NULL" in sql
     assert "state_name = COALESCE(keyed.restored_state_name, loc.state_name)" in sql
     assert "country_code = COALESCE(keyed.normalized_country, loc.country_code)" in sql
 
@@ -203,8 +203,24 @@ def test_provider_directory_location_address_key_sql_can_scope_to_current_run_an
         source_ids=["source_a", "source_b"],
     )
 
-    assert "last_seen_run_id = :run_id" in sql
-    assert "source_id = ANY(CAST(:source_ids AS varchar[]))" in sql
+    assert "loc_src.last_seen_run_id = :run_id" in sql
+    assert "loc_src.source_id = ANY(CAST(:source_ids AS varchar[]))" in sql
+
+
+def test_provider_directory_location_address_key_sql_can_scope_to_seen_stage():
+    sql = importer.provider_directory_location_address_key_sql(
+        "mrf",
+        run_id="run_1",
+        seen_table="provider_directory_import_seen_stage_test",
+    )
+
+    assert 'FROM "mrf"."provider_directory_location" AS loc_src' in sql
+    assert 'FROM "mrf"."provider_directory_import_seen_stage_test" AS seen' in sql
+    assert "seen.resource_type = 'Location'" in sql
+    assert "AND seen.run_id = :run_id" in sql
+    assert "seen.source_id = loc_src.source_id" in sql
+    assert "seen.resource_id = loc_src.resource_id" in sql
+    assert "loc_src.last_seen_run_id = :run_id" not in sql
 
 
 def test_upsert_changed_row_predicate_ignores_run_metadata_columns():
@@ -1099,7 +1115,7 @@ def test_provider_directory_location_address_key_sql_uses_shared_canonical_funct
 
     assert 'UPDATE "mrf"."provider_directory_location" AS loc' in sql
     assert '"mrf".addr_key_v1(' in sql
-    assert '"mrf".addr_zip5_norm_v1(postal_code)' in sql
+    assert '"mrf".addr_zip5_norm_v1(loc_src.postal_code)' in sql
     assert '"mrf".addr_state_code_v1(resolved_state)' in sql
     assert '"mrf".addr_city_norm_v1(city_name)' in sql
     assert "keyed.computed_address_key IS NOT NULL" in sql
@@ -1361,6 +1377,7 @@ async def test_publish_provider_directory_location_address_keys_runs_canonical_u
         "mrf",
         run_id="run_1",
         source_ids=["source_a"],
+        seen_table="provider_directory_import_seen_stage_test",
     )
 
     assert stamped == 7
@@ -1368,6 +1385,7 @@ async def test_publish_provider_directory_location_address_keys_runs_canonical_u
     status.assert_awaited_once()
     assert 'UPDATE "mrf"."provider_directory_location" AS loc' in status.await_args.args[0]
     assert 'LEFT JOIN "mrf"."geo_zip_lookup" AS geo' in status.await_args.args[0]
+    assert 'FROM "mrf"."provider_directory_import_seen_stage_test" AS seen' in status.await_args.args[0]
     assert status.await_args.kwargs == {"run_id": "run_1", "source_ids": ["source_a"]}
 
 
@@ -1750,6 +1768,30 @@ async def test_copy_mark_resource_rows_seen_appends_to_run_stage_without_indexed
         }
     ]
     assert conn.statements == []
+
+
+@pytest.mark.asyncio
+async def test_import_resources_can_preserve_seen_stage_for_publish(monkeypatch):
+    ensure_stage = AsyncMock(return_value="provider_directory_import_seen_stage_test")
+    drop_stage = AsyncMock()
+    monkeypatch.setattr(importer, "_ensure_provider_directory_import_seen_stage_table", ensure_stage)
+    monkeypatch.setattr(importer, "_drop_provider_directory_import_seen_stage_table", drop_stage)
+
+    counts = await importer._import_resources(  # pylint: disable=protected-access
+        [],
+        resources=["Location"],
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=100,
+        timeout=3,
+        run_id="run_1",
+        stale_cleanup=True,
+        preserve_seen_stage=True,
+    )
+
+    assert counts == {"Location": 0}
+    ensure_stage.assert_awaited_once_with("run_1")
+    drop_stage.assert_not_awaited()
 
 
 @pytest.mark.asyncio

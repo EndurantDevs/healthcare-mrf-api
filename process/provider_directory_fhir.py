@@ -2085,18 +2085,20 @@ def provider_directory_location_address_key_sql(
     restore_state_from_zip: bool = True,
     run_id: str | None = None,
     source_ids: list[str] | tuple[str, ...] | None = None,
+    seen_table: str | None = None,
 ) -> str:
     """Stamp imported FHIR Location rows with the shared canonical address key."""
 
     schema = db_schema or _schema()
     qschema = _q(schema)
     location_ref = _qt(schema, "provider_directory_location")
-    raw_state_expr = "COALESCE(NULLIF(state_name, ''), state_code)"
+    source_alias = "loc_src"
+    raw_state_expr = f"COALESCE(NULLIF({source_alias}.state_name, ''), {source_alias}.state_code)"
     normalized_state_expr = _state_fips_restore_sql(raw_state_expr)
-    normalized_country_expr = _country_restore_sql("country_code")
+    normalized_country_expr = _country_restore_sql(f"{source_alias}.country_code")
     needs_country_normalization_expr = (
         f"(NULLIF({normalized_country_expr}, '') IS NOT NULL "
-        f"AND country_code IS DISTINCT FROM {normalized_country_expr})"
+        f"AND {source_alias}.country_code IS DISTINCT FROM {normalized_country_expr})"
     )
     zip_state_select = "geo.state::varchar" if restore_state_from_zip else "NULL::varchar"
     zip_state_join = (
@@ -2108,35 +2110,48 @@ def provider_directory_location_address_key_sql(
         else ""
     )
     needs_work_clauses = [
-        "address_key IS NULL",
-        "zip5 IS NULL",
-        "state_code IS NULL",
-        "city_norm IS NULL",
+        f"{source_alias}.address_key IS NULL",
+        f"{source_alias}.zip5 IS NULL",
+        f"{source_alias}.state_code IS NULL",
+        f"{source_alias}.city_norm IS NULL",
         f"{raw_state_expr} ~ '^[0-9]{{1,2}}$'",
         needs_country_normalization_expr,
     ]
     scope_clauses: list[str] = []
-    if run_id is not None:
-        scope_clauses.append("last_seen_run_id = :run_id")
+    if run_id is not None and not seen_table:
+        scope_clauses.append(f"{source_alias}.last_seen_run_id = :run_id")
     if source_ids:
-        scope_clauses.append("source_id = ANY(CAST(:source_ids AS varchar[]))")
+        scope_clauses.append(f"{source_alias}.source_id = ANY(CAST(:source_ids AS varchar[]))")
+    if seen_table:
+        seen_ref = _qt(schema, seen_table)
+        seen_run_filter = "AND seen.run_id = :run_id" if run_id is not None else ""
+        scope_clauses.append(
+            f"""EXISTS (
+                SELECT 1
+                  FROM {seen_ref} AS seen
+                 WHERE seen.resource_type = 'Location'
+                   {seen_run_filter}
+                   AND seen.source_id = {source_alias}.source_id
+                   AND seen.resource_id = {source_alias}.resource_id
+            )"""
+        )
     where_clauses = [f"({' OR '.join(needs_work_clauses)})", *scope_clauses]
     where_sql = " AND ".join(where_clauses)
     return f"""
     WITH normalized AS (
         SELECT
-            source_id,
-            resource_id,
-            first_line,
-            second_line,
-            city_name,
-            postal_code,
-            country_code,
-            {qschema}.addr_zip5_norm_v1(postal_code)::varchar AS source_zip5,
+            {source_alias}.source_id,
+            {source_alias}.resource_id,
+            {source_alias}.first_line,
+            {source_alias}.second_line,
+            {source_alias}.city_name,
+            {source_alias}.postal_code,
+            {source_alias}.country_code,
+            {qschema}.addr_zip5_norm_v1({source_alias}.postal_code)::varchar AS source_zip5,
             {normalized_country_expr} AS normalized_country,
             {raw_state_expr} AS raw_state,
             {normalized_state_expr} AS normalized_state
-          FROM {location_ref}
+          FROM {location_ref} AS {source_alias}
          WHERE {where_sql}
     ),
     resolved AS (
@@ -2222,6 +2237,7 @@ async def publish_provider_directory_location_address_keys(
     *,
     run_id: str | None = None,
     source_ids: list[str] | tuple[str, ...] | None = None,
+    seen_table: str | None = None,
 ) -> int:
     schema = db_schema or _schema()
     if not await _address_canon_functions_available(schema):
@@ -2239,6 +2255,7 @@ async def publish_provider_directory_location_address_keys(
                 restore_state_from_zip=restore_state_from_zip,
                 run_id=run_id,
                 source_ids=source_ids,
+                seen_table=seen_table,
             ),
             **params,
         )
@@ -4398,6 +4415,7 @@ async def _import_resources(
     cancel_ctx: dict[str, Any] | None = None,
     cancel_task: dict[str, Any] | None = None,
     progress_callback: Callable[[int, int, dict[str, int], dict[str, Any] | None], Awaitable[None]] | None = None,
+    preserve_seen_stage: bool = False,
 ) -> dict[str, int]:
     counts: dict[str, int] = {resource: 0 for resource in resources}
     semaphore = asyncio.Semaphore(max(1, source_concurrency))
@@ -4707,7 +4725,7 @@ async def _import_resources(
             await asyncio.gather(*tasks, return_exceptions=True)
         raise
     finally:
-        if seen_stage_table:
+        if seen_stage_table and not preserve_seen_stage:
             await _drop_provider_directory_import_seen_stage_table(seen_stage_table)
 
 
@@ -4757,6 +4775,11 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
     publish_artifacts = _bool_or_default(
         task.get("publish_artifacts"),
         set(resources) == set(DEFAULT_RESOURCES),
+    )
+    seen_stage_table_for_publish = (
+        _provider_directory_import_seen_stage_table_name(run_id)
+        if publish_artifacts and stale_cleanup and run_id and _seen_stage_enabled()
+        else None
     )
     if canonical_backfill_only:
         metrics = await backfill_provider_directory_canonical_resources(
@@ -4916,6 +4939,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                 cancel_ctx=ctx,
                 cancel_task={**task, "run_id": run_id},
                 progress_callback=resource_progress,
+                preserve_seen_stage=bool(seen_stage_table_for_publish),
             )
             metrics["sources_import_attempted"] = len(importable)
             if publish_artifacts:
@@ -4927,8 +4951,11 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                     message="publishing Provider Directory address artifacts",
                     metrics=metrics,
                 )
+                if seen_stage_table_for_publish:
+                    await _prepare_provider_directory_import_seen_stage_lookup(seen_stage_table_for_publish)
                 metrics["location_address_keys_stamped"] = await publish_provider_directory_location_address_keys(
                     run_id=run_id,
+                    seen_table=seen_stage_table_for_publish,
                 )
                 await _mark_provider_directory_progress(
                     run_id,
@@ -4981,6 +5008,8 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
         print("PROVIDER_DIRECTORY_FHIR_IMPORT_DONE\t" + json.dumps(metrics, sort_keys=True, default=str))
         return metrics
     finally:
+        if seen_stage_table_for_publish:
+            await _drop_provider_directory_import_seen_stage_table(seen_stage_table_for_publish)
         await _clear_resource_rows_seen(run_id)
         if tmpdir is not None:
             tmpdir.cleanup()
