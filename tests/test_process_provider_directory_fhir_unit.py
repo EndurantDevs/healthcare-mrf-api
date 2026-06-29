@@ -271,12 +271,14 @@ def test_provider_directory_location_address_key_sql_can_scope_to_seen_stage():
         seen_table="provider_directory_import_seen_stage_test",
     )
 
-    assert 'FROM "mrf"."provider_directory_location" AS loc_src' in sql
+    assert "SELECT DISTINCT seen.source_id" in sql
     assert 'FROM "mrf"."provider_directory_import_seen_stage_test" AS seen' in sql
+    assert 'JOIN "mrf"."provider_directory_location" AS loc_src' in sql
+    assert "loc_src.source_id = seen_scope.source_id" in sql
+    assert "loc_src.resource_id = seen_scope.resource_id" in sql
     assert "seen.resource_type = 'Location'" in sql
     assert "AND seen.run_id = :run_id" in sql
-    assert "seen.source_id = loc_src.source_id" in sql
-    assert "seen.resource_id = loc_src.resource_id" in sql
+    assert "EXISTS (" not in sql
     assert "loc_src.last_seen_run_id = :run_id" not in sql
 
 
@@ -2820,6 +2822,52 @@ async def test_process_data_contact_backfill_only_skips_seed_resolution(monkeypa
 
     assert result == expected
     backfill.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_process_data_publish_artifacts_only_skips_seed_resolution(monkeypatch):
+    monkeypatch.setattr(importer, "ensure_database", AsyncMock())
+    monkeypatch.setattr(importer, "_ensure_provider_directory_tables", AsyncMock())
+    monkeypatch.setattr(importer, "_mark_provider_directory_progress", AsyncMock())
+    monkeypatch.setattr(
+        importer,
+        "backfill_provider_directory_location_contacts",
+        AsyncMock(return_value={"location_contact_rows_updated": 5}),
+    )
+    monkeypatch.setattr(importer, "publish_provider_directory_location_address_keys", AsyncMock(return_value=3))
+    monkeypatch.setattr(
+        importer,
+        "publish_provider_directory_location_archive",
+        AsyncMock(return_value={"inserted": 4, "provenance_updates": 1}),
+    )
+    monkeypatch.setattr(
+        importer,
+        "publish_provider_directory_ptg_address_corroboration_if_available",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(
+        importer,
+        "_resolve_seed_db",
+        lambda *_args, **_kwargs: pytest.fail("seed DB should not be resolved for artifact publish"),
+    )
+
+    result = await importer.process_data(
+        {"context": {}},
+        {"publish_artifacts_only": True, "run_id": "run_publish"},
+    )
+
+    assert result["publish_artifacts_only"] is True
+    assert result["location_contacts_backfilled"] == {"location_contact_rows_updated": 5}
+    assert result["location_address_keys_stamped"] == 3
+    assert result["location_archive"] == {"inserted": 4, "provenance_updates": 1}
+    assert result["ptg_corroboration_view_published"] is True
+    importer.backfill_provider_directory_location_contacts.assert_awaited_once()
+    importer.publish_provider_directory_location_address_keys.assert_awaited_once_with(
+        run_id=None,
+        seen_table=None,
+    )
+    importer.publish_provider_directory_location_archive.assert_awaited_once_with(run_id="run_publish")
+    importer.publish_provider_directory_ptg_address_corroboration_if_available.assert_awaited_once()
 
 
 def test_harness_fixture_case_and_report_rendering(tmp_path):

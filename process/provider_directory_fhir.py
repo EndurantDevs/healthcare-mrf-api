@@ -2240,6 +2240,7 @@ def provider_directory_location_address_key_sql(
         needs_country_normalization_expr,
     ]
     scope_clauses: list[str] = []
+    from_sql = f"FROM {location_ref} AS {source_alias}"
     if run_id is not None and not seen_table:
         scope_clauses.append(f"{source_alias}.last_seen_run_id = :run_id")
     if source_ids:
@@ -2247,16 +2248,18 @@ def provider_directory_location_address_key_sql(
     if seen_table:
         seen_ref = _qt(schema, seen_table)
         seen_run_filter = "AND seen.run_id = :run_id" if run_id is not None else ""
-        scope_clauses.append(
-            f"""EXISTS (
-                SELECT 1
+        from_sql = f"""
+          FROM (
+                SELECT DISTINCT seen.source_id,
+                       seen.resource_id
                   FROM {seen_ref} AS seen
                  WHERE seen.resource_type = 'Location'
                    {seen_run_filter}
-                   AND seen.source_id = {source_alias}.source_id
-                   AND seen.resource_id = {source_alias}.resource_id
-            )"""
-        )
+               ) AS seen_scope
+          JOIN {location_ref} AS {source_alias}
+            ON {source_alias}.source_id = seen_scope.source_id
+           AND {source_alias}.resource_id = seen_scope.resource_id
+        """
     where_clauses = [f"({' OR '.join(needs_work_clauses)})", *scope_clauses]
     where_sql = " AND ".join(where_clauses)
     return f"""
@@ -2273,7 +2276,7 @@ def provider_directory_location_address_key_sql(
             {normalized_country_expr} AS normalized_country,
             {raw_state_expr} AS raw_state,
             {normalized_state_expr} AS normalized_state
-          FROM {location_ref} AS {source_alias}
+          {from_sql}
          WHERE {where_sql}
     ),
     resolved AS (
@@ -2383,6 +2386,77 @@ async def publish_provider_directory_location_address_keys(
         )
         or 0
     )
+
+
+async def _publish_provider_directory_artifacts(
+    *,
+    run_id: str | None,
+    metrics: dict[str, Any],
+    seen_table: str | None = None,
+    address_key_run_id: str | None = None,
+) -> dict[str, Any]:
+    await _mark_provider_directory_progress(
+        run_id,
+        phase="provider-directory publishing artifacts",
+        done=0,
+        total=4,
+        message="publishing Provider Directory address artifacts",
+        metrics=metrics,
+    )
+    metrics["location_contacts_backfilled"] = await backfill_provider_directory_location_contacts()
+    await _mark_provider_directory_progress(
+        run_id,
+        phase="provider-directory publishing artifacts",
+        done=1,
+        total=4,
+        message=(
+            "backfilled Provider Directory location contacts; "
+            f"rows={metrics['location_contacts_backfilled'].get('location_contact_rows_updated', 0)}"
+        ),
+        metrics=metrics,
+    )
+    if seen_table:
+        await _prepare_provider_directory_import_seen_stage_lookup(seen_table)
+    metrics["location_address_keys_stamped"] = await publish_provider_directory_location_address_keys(
+        run_id=address_key_run_id,
+        seen_table=seen_table,
+    )
+    await _mark_provider_directory_progress(
+        run_id,
+        phase="provider-directory publishing artifacts",
+        done=2,
+        total=4,
+        message=(
+            "stamped Provider Directory location address keys; "
+            f"rows={metrics['location_address_keys_stamped']}"
+        ),
+        metrics=metrics,
+    )
+    metrics["location_archive"] = await publish_provider_directory_location_archive(run_id=run_id)
+    await _mark_provider_directory_progress(
+        run_id,
+        phase="provider-directory publishing artifacts",
+        done=3,
+        total=4,
+        message=(
+            "published Provider Directory locations to address archive; "
+            f"inserted={metrics['location_archive'].get('inserted', 0)} "
+            f"updated={metrics['location_archive'].get('provenance_updates', 0)}"
+        ),
+        metrics=metrics,
+    )
+    metrics["ptg_corroboration_view_published"] = (
+        await publish_provider_directory_ptg_address_corroboration_if_available()
+    )
+    await _mark_provider_directory_progress(
+        run_id,
+        phase="provider-directory publishing artifacts",
+        done=4,
+        total=4,
+        message="published Provider Directory PTG corroboration artifacts",
+        metrics=metrics,
+    )
+    return metrics
 
 
 def _provider_directory_location_archive_stage_table_name(run_id: str | None = None) -> str:
@@ -5260,6 +5334,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
     import_resources = bool(task.get("import_resources", False))
     canonical_backfill_only = bool(task.get("canonical_backfill_only", False))
     contact_backfill_only = bool(task.get("contact_backfill_only", False))
+    publish_artifacts_only = bool(task.get("publish_artifacts_only", False))
     open_only = bool(task.get("open_only", True))
     include_auth_required = bool(task.get("include_auth_required", False))
     full_refresh = bool(task.get("full_refresh", False))
@@ -5305,6 +5380,19 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
         metrics = await backfill_provider_directory_location_contacts()
         ctx["context"]["audit"] = metrics
         ctx["context"]["run"] = ctx["context"].get("run", 0) + 1
+        return metrics
+    if publish_artifacts_only:
+        metrics = {
+            "publish_artifacts": True,
+            "publish_artifacts_only": True,
+        }
+        metrics = await _publish_provider_directory_artifacts(
+            run_id=run_id,
+            metrics=metrics,
+        )
+        ctx["context"]["audit"] = metrics
+        ctx["context"]["run"] = ctx["context"].get("run", 0) + 1
+        print("PROVIDER_DIRECTORY_ARTIFACT_PUBLISH_DONE\t" + json.dumps(metrics, sort_keys=True, default=str))
         return metrics
     await _clear_resource_rows_seen(run_id)
 
@@ -5463,66 +5551,11 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
             )
             metrics["sources_import_attempted"] = len(importable)
             if publish_artifacts:
-                await _mark_provider_directory_progress(
-                    run_id,
-                    phase="provider-directory publishing artifacts",
-                    done=0,
-                    total=4,
-                    message="publishing Provider Directory address artifacts",
-                    metrics=metrics,
-                )
-                metrics["location_contacts_backfilled"] = await backfill_provider_directory_location_contacts()
-                await _mark_provider_directory_progress(
-                    run_id,
-                    phase="provider-directory publishing artifacts",
-                    done=1,
-                    total=4,
-                    message=(
-                        "backfilled Provider Directory location contacts; "
-                        f"rows={metrics['location_contacts_backfilled'].get('location_contact_rows_updated', 0)}"
-                    ),
-                    metrics=metrics,
-                )
-                if seen_stage_table_for_publish:
-                    await _prepare_provider_directory_import_seen_stage_lookup(seen_stage_table_for_publish)
-                metrics["location_address_keys_stamped"] = await publish_provider_directory_location_address_keys(
+                metrics = await _publish_provider_directory_artifacts(
                     run_id=run_id,
+                    metrics=metrics,
                     seen_table=seen_stage_table_for_publish,
-                )
-                await _mark_provider_directory_progress(
-                    run_id,
-                    phase="provider-directory publishing artifacts",
-                    done=2,
-                    total=4,
-                    message=(
-                        "stamped Provider Directory location address keys; "
-                        f"rows={metrics['location_address_keys_stamped']}"
-                    ),
-                    metrics=metrics,
-                )
-                metrics["location_archive"] = await publish_provider_directory_location_archive(run_id=run_id)
-                await _mark_provider_directory_progress(
-                    run_id,
-                    phase="provider-directory publishing artifacts",
-                    done=3,
-                    total=4,
-                    message=(
-                        "published Provider Directory locations to address archive; "
-                        f"inserted={metrics['location_archive'].get('inserted', 0)} "
-                        f"updated={metrics['location_archive'].get('provenance_updates', 0)}"
-                    ),
-                    metrics=metrics,
-                )
-                metrics["ptg_corroboration_view_published"] = (
-                    await publish_provider_directory_ptg_address_corroboration_if_available()
-                )
-                await _mark_provider_directory_progress(
-                    run_id,
-                    phase="provider-directory publishing artifacts",
-                    done=4,
-                    total=4,
-                    message="published Provider Directory PTG corroboration artifacts",
-                    metrics=metrics,
+                    address_key_run_id=run_id,
                 )
             else:
                 metrics["location_contacts_backfilled"] = {
@@ -5576,6 +5609,7 @@ async def main(
     import_resources: bool = False,
     canonical_backfill_only: bool = False,
     contact_backfill_only: bool = False,
+    publish_artifacts_only: bool = False,
     full_refresh: bool = False,
     stale_cleanup: bool | None = None,
     publish_artifacts: bool | None = None,
@@ -5605,6 +5639,7 @@ async def main(
         "import_resources": import_resources,
         "canonical_backfill_only": canonical_backfill_only,
         "contact_backfill_only": contact_backfill_only,
+        "publish_artifacts_only": publish_artifacts_only,
         "full_refresh": full_refresh,
         "stale_cleanup": stale_cleanup,
         "publish_artifacts": publish_artifacts,

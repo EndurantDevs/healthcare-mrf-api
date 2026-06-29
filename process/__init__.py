@@ -1166,6 +1166,11 @@ def provider_enrichment(test: bool):
     help="Populate canonical phone/fax columns from existing Provider Directory Location rows.",
 )
 @click.option(
+    "--publish-artifacts-only",
+    is_flag=True,
+    help="Publish Provider Directory contact, address archive, and PTG corroboration artifacts without fetching FHIR resources.",
+)
+@click.option(
     "--full-refresh/--sample-refresh",
     default=False,
     show_default=True,
@@ -1219,6 +1224,7 @@ def provider_directory_fhir(
     import_resources: bool,
     canonical_backfill_only: bool,
     contact_backfill_only: bool,
+    publish_artifacts_only: bool,
     full_refresh: bool,
     stale_cleanup: bool | None,
     publish_artifacts: bool | None,
@@ -1247,6 +1253,7 @@ def provider_directory_fhir(
             import_resources=import_resources,
             canonical_backfill_only=canonical_backfill_only,
             contact_backfill_only=contact_backfill_only,
+            publish_artifacts_only=publish_artifacts_only,
             full_refresh=full_refresh,
             stale_cleanup=stale_cleanup,
             publish_artifacts=publish_artifacts,
