@@ -806,6 +806,128 @@ async def test_probe_source_classifies_declared_credentialed_non_fhir_as_auth_re
 
 
 @pytest.mark.asyncio
+async def test_probe_source_classifies_declared_credentialed_metadata_as_auth_required_without_credentials(monkeypatch):
+    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV, raising=False)  # pylint: disable=protected-access
+    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV, raising=False)  # pylint: disable=protected-access
+
+    async def fake_fetch_source_json(source, url, *, timeout):  # pylint: disable=unused-argument
+        return (
+            200,
+            {
+                "resourceType": "CapabilityStatement",
+                "fhirVersion": "4.0.1",
+                "rest": [{"resource": [{"type": "Practitioner"}]}],
+            },
+            None,
+            14,
+        )
+
+    monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_source_json)
+
+    probe, payload = await importer._probe_source(  # pylint: disable=protected-access
+        {
+            "source_id": "source_a",
+            "api_base": "https://payer.example/fhir",
+            "auth_type": "OAuth2/SMART",
+            "requires_registration": True,
+        },
+        timeout=3,
+        run_id="run_1",
+    )
+
+    assert payload["resourceType"] == "CapabilityStatement"
+    assert probe["status"] == "auth_required"
+    assert probe["http_status"] == 200
+    assert probe["credential"] is None
+    assert "resource access" in probe["error"]
+
+
+@pytest.mark.asyncio
+async def test_probe_sources_does_not_count_credentialed_metadata_without_credentials_as_valid(monkeypatch):
+    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV, raising=False)  # pylint: disable=protected-access
+    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV, raising=False)  # pylint: disable=protected-access
+
+    async def fake_fetch_source_json(source, url, *, timeout):  # pylint: disable=unused-argument
+        return (
+            200,
+            {
+                "resourceType": "CapabilityStatement",
+                "fhirVersion": "4.0.1",
+                "rest": [{"resource": [{"type": "Practitioner"}]}],
+            },
+            None,
+            14,
+        )
+
+    upserts = []
+
+    async def fake_upsert(model, rows, **_kwargs):
+        upserts.append((model, rows))
+        return len(rows)
+
+    monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_source_json)
+    monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
+
+    source = {
+        "source_id": "source_a",
+        "org_name": "Payer",
+        "api_base": "https://payer.example/fhir",
+        "canonical_api_base": "https://payer.example/fhir",
+        "auth_type": "OAuth2/SMART",
+        "requires_registration": True,
+    }
+    probed, valid, valid_source_ids = await importer._probe_sources(  # pylint: disable=protected-access
+        [source],
+        timeout=3,
+        concurrency=1,
+        run_id="run_1",
+    )
+
+    assert (probed, valid, valid_source_ids) == (1, 0, set())
+    capability_rows = next(rows for model, rows in upserts if model is ProviderDirectoryCapability)
+    source_rows = next(rows for model, rows in upserts if model is ProviderDirectorySource)
+    assert capability_rows[0]["probe_status"] == "auth_required"
+    assert capability_rows[0]["auth_required"] is True
+    assert source_rows[0]["last_validated_status"] == "auth_required"
+
+
+@pytest.mark.asyncio
+async def test_probe_source_keeps_alohr_graphql_connector_valid_without_fhir_credentials(monkeypatch):
+    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV, raising=False)  # pylint: disable=protected-access
+    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV, raising=False)  # pylint: disable=protected-access
+
+    async def fake_fetch_source_json(source, url, *, timeout):  # pylint: disable=unused-argument
+        return (
+            200,
+            {
+                "resourceType": "CapabilityStatement",
+                "fhirVersion": "4.0.1",
+                "rest": [{"resource": [{"type": "Practitioner"}]}],
+            },
+            None,
+            14,
+        )
+
+    monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_source_json)
+
+    probe, payload = await importer._probe_source(  # pylint: disable=protected-access
+        {
+            "source_id": "source_alohr",
+            "api_base": importer.ALOHR_FHIR_PROVIDER_DIRECTORY_BASE,
+            "auth_type": "OAuth2/SMART",
+            "requires_registration": True,
+            "metadata_json": {"provider_directory_graphql_tenant_id": importer.ALOHR_TENANT_ID},
+        },
+        timeout=3,
+        run_id="run_1",
+    )
+
+    assert payload["resourceType"] == "CapabilityStatement"
+    assert probe["status"] == "valid"
+    assert probe["credential"] is None
+
+
+@pytest.mark.asyncio
 async def test_probe_source_classifies_known_onboarding_gateway_non_fhir_as_auth_required(monkeypatch):
     monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV, raising=False)  # pylint: disable=protected-access
     monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV, raising=False)  # pylint: disable=protected-access

@@ -3588,6 +3588,14 @@ async def _probe_source(source: dict[str, Any], *, timeout: int, run_id: str | N
         status = _classify_http(status_code, error, payload)
         credential = _credential_request_options_for_source(source, url)
         if (
+            status == "valid"
+            and _source_declares_credentialed_access(source)
+            and not _alohr_source_uses_graphql_connector(source)
+            and not credential["descriptor"]
+        ):
+            status = "auth_required"
+            error = error or "source requires credentialed Provider Directory resource access but no matching credentials are configured"
+        if (
             status == "valid_non_fhir"
             and (_source_declares_credentialed_access(source) or _source_uses_known_onboarding_gateway(source))
             and not credential["descriptor"]
@@ -3678,8 +3686,9 @@ async def _probe_sources(
             if payload and payload.get("resourceType") == "CapabilityStatement":
                 capability_rows.append(parse_capability(source, payload, probe))
                 update["fhir_version"] = _clean_text(payload.get("fhirVersion")) or update.get("fhir_version")
-                valid += 1
-                valid_source_ids.add(source["source_id"])
+                if probe["status"] == "valid":
+                    valid += 1
+                    valid_source_ids.add(source["source_id"])
             else:
                 capability_rows.append(
                     {
