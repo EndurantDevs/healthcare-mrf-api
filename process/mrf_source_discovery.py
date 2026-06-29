@@ -4430,10 +4430,11 @@ def _sapphire_query_slug_variants(query: str | None) -> list[str]:
         variants.append(tokens[:-1])
     slugs: list[str] = []
     for variant in variants:
-        slug = "-".join(variant).strip("-")
-        if slug and slug not in slugs:
-            slugs.append(slug)
-    return slugs[:5]
+        for separator in ("-", "_"):
+            slug = separator.join(variant).strip(separator)
+            if slug and slug not in slugs:
+                slugs.append(slug)
+    return slugs[:8]
 
 
 async def _sapphire_query_probe_targets(

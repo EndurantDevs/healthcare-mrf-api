@@ -6342,10 +6342,13 @@ def test_parse_sapphire_toc_links_extracts_embedded_relative_tocs():
 def test_sapphire_query_slug_variants_normalize_company_suffixes():
     assert discovery._sapphire_query_slug_variants("Example Packaging, Inc.") == [
         "example-packaging-inc",
+        "example_packaging_inc",
         "example-packaging",
+        "example_packaging",
     ]
     assert discovery._sapphire_query_slug_variants("Example Limited Liability Company") == [
         "example-llc",
+        "example_llc",
         "example",
     ]
 
@@ -6360,7 +6363,7 @@ async def test_sapphire_query_probe_targets_keep_existing_current_tocs(monkeypat
 
     async def fake_head_url(url, **_kwargs):
         return {
-            "status": "ok" if url.endswith("/example-packaging-inc") else "failed",
+            "status": "ok" if url.endswith("/example_packaging_inc") else "failed",
             "checked_at": discovery._utc_now(),
         }
 
@@ -6374,7 +6377,7 @@ async def test_sapphire_query_probe_targets_keep_existing_current_tocs(monkeypat
     )
 
     assert [target.url for target in targets] == [
-        "https://bcbsla.sapphiremrfhub.com/tocs/current/example-packaging-inc"
+        "https://bcbsla.sapphiremrfhub.com/tocs/current/example_packaging_inc"
     ]
     assert targets[0].metadata["company_name"] == "Example Packaging Inc"
 
