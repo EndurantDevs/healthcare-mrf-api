@@ -172,6 +172,7 @@ def progress_payload_from_live(live: dict[str, Any]) -> dict[str, Any]:
         "pct": live.get("pct"),
         "message": live.get("message") or live.get("phase") or "running",
         "phase": live.get("phase"),
+        "detail": live.get("detail"),
         "updated_at": live.get("updated_at"),
     }
     return {key: value for key, value in payload.items() if value is not None}

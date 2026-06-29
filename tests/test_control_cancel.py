@@ -346,6 +346,36 @@ def test_control_run_heartbeat_update_values_prefers_live_progress():
     }
 
 
+def test_control_run_heartbeat_update_values_preserves_live_progress_detail():
+    now = dt.datetime(2026, 6, 29, 14, 0, 0)
+    detail = {
+        "active_source_groups": [
+            {
+                "sample_source_id": "source_a",
+                "sample_org_name": "Cigna",
+                "current_resource": "PractitionerRole",
+            }
+        ]
+    }
+
+    values = control_lifecycle._control_run_heartbeat_update_values(
+        "process_data",
+        {
+            "phase": "provider-directory importing resources",
+            "unit": "steps",
+            "done": 8,
+            "total": 25,
+            "pct": 32,
+            "message": "imported resources for 8/25 source group(s)",
+            "detail": detail,
+            "updated_at": "2026-06-29T14:00:00Z",
+        },
+        now,
+    )
+
+    assert values["progress"]["detail"] == detail
+
+
 @pytest.mark.asyncio
 async def test_mark_control_run_always_persists_terminal_update(monkeypatch):
     db_updates = []
