@@ -134,6 +134,20 @@ Practitioners, Organizations, Locations, HealthcareServices, InsurancePlans, and
 Endpoints. A value of `0` disables that linked fallback; full refresh normally
 relies on the direct resource collections.
 
+If resource rows were imported before canonical resource storage was enabled,
+populate the canonical resource and source-edge tables from existing
+source-level rows without refetching payer FHIR endpoints:
+
+```bash
+python main.py start provider-directory-fhir --canonical-backfill-only
+```
+
+Use `--resources Location,Practitioner` to backfill only selected resource
+types during controlled validation. This backfill is additive/idempotent: it
+upserts canonical rows keyed by `(canonical_api_base, resource_type,
+resource_id)` and source edges keyed by `(source_id, resource_type,
+resource_id)`.
+
 Large resource batches use PostgreSQL `COPY` into temporary staging tables
 before merging into the Provider Directory tables. Disable that path with
 `HLTHPRT_PROVIDER_DIRECTORY_COPY_UPSERT=0` only for debugging. Tune the minimum

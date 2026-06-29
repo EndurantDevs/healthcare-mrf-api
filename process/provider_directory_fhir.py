@@ -3044,6 +3044,148 @@ async def _upsert_rows(
     )
 
 
+def _status_row_count(status: Any) -> int:
+    if isinstance(status, int):
+        return status
+    if not status:
+        return 0
+    match = re.search(r"(\d+)(?!.*\d)", str(status))
+    return int(match.group(1)) if match else 0
+
+
+def _canonical_backfill_resource_sql(resource_type: str, table_name: str) -> tuple[str, str]:
+    schema = _schema()
+    source_ref = _qt(schema, "provider_directory_source")
+    resource_ref = _qt(schema, table_name)
+    canonical_ref = _qt(schema, ProviderDirectoryCanonicalResource.__tablename__)
+    edge_ref = _qt(schema, ProviderDirectorySourceResource.__tablename__)
+    canonical_target = _q(ProviderDirectoryCanonicalResource.__tablename__)
+    edge_target = _q(ProviderDirectorySourceResource.__tablename__)
+    resource_type_literal = _sql_string_literal(resource_type)
+    payload_sql = (
+        "(to_jsonb(r) - 'source_id' - 'last_seen_run_id' - 'observed_at' - 'updated_at')"
+    )
+    base_sql = "COALESCE(NULLIF(src.canonical_api_base, ''), NULLIF(src.api_base, ''))"
+    rows_where = (
+        f"{base_sql} IS NOT NULL "
+        "AND NULLIF(r.source_id, '') IS NOT NULL "
+        "AND NULLIF(r.resource_id, '') IS NOT NULL"
+    )
+    canonical_sql = f"""
+        INSERT INTO {canonical_ref} (
+            canonical_api_base,
+            resource_type,
+            resource_id,
+            resource_url,
+            payload_hash,
+            payload_json,
+            first_seen_run_id,
+            last_seen_run_id,
+            observed_at,
+            updated_at
+        )
+        SELECT canonical_api_base,
+               resource_type,
+               resource_id,
+               resource_url,
+               payload_hash,
+               payload_json,
+               first_seen_run_id,
+               last_seen_run_id,
+               observed_at,
+               updated_at
+          FROM (
+            SELECT DISTINCT ON ({base_sql}, r.resource_id)
+                   {base_sql} AS canonical_api_base,
+                   {resource_type_literal} AS resource_type,
+                   r.resource_id,
+                   r.resource_url,
+                   md5(({payload_sql})::text) AS payload_hash,
+                   {payload_sql} AS payload_json,
+                   r.last_seen_run_id AS first_seen_run_id,
+                   r.last_seen_run_id,
+                   r.observed_at,
+                   COALESCE(r.updated_at, r.observed_at) AS updated_at
+              FROM {resource_ref} AS r
+              JOIN {source_ref} AS src
+                ON src.source_id = r.source_id
+             WHERE {rows_where}
+             ORDER BY {base_sql},
+                      r.resource_id,
+                      r.updated_at DESC NULLS LAST,
+                      r.observed_at DESC NULLS LAST,
+                      r.source_id
+          ) AS ranked
+        ON CONFLICT (canonical_api_base, resource_type, resource_id) DO UPDATE
+            SET resource_url = EXCLUDED.resource_url,
+                payload_hash = EXCLUDED.payload_hash,
+                payload_json = EXCLUDED.payload_json,
+                first_seen_run_id = COALESCE(
+                    {canonical_target}.first_seen_run_id,
+                    EXCLUDED.first_seen_run_id
+                ),
+                last_seen_run_id = EXCLUDED.last_seen_run_id,
+                observed_at = EXCLUDED.observed_at,
+                updated_at = EXCLUDED.updated_at;
+    """
+    edge_sql = f"""
+        INSERT INTO {edge_ref} (
+            source_id,
+            canonical_api_base,
+            resource_type,
+            resource_id,
+            last_seen_run_id,
+            observed_at,
+            updated_at
+        )
+        SELECT DISTINCT r.source_id,
+               {base_sql} AS canonical_api_base,
+               {resource_type_literal} AS resource_type,
+               r.resource_id,
+               r.last_seen_run_id,
+               r.observed_at,
+               COALESCE(r.updated_at, r.observed_at) AS updated_at
+          FROM {resource_ref} AS r
+          JOIN {source_ref} AS src
+            ON src.source_id = r.source_id
+         WHERE {rows_where}
+        ON CONFLICT (source_id, resource_type, resource_id) DO UPDATE
+            SET canonical_api_base = EXCLUDED.canonical_api_base,
+                last_seen_run_id = EXCLUDED.last_seen_run_id,
+                observed_at = EXCLUDED.observed_at,
+                updated_at = EXCLUDED.updated_at;
+    """
+    return canonical_sql, edge_sql
+
+
+async def backfill_provider_directory_canonical_resources(
+    *,
+    resources: str | None = None,
+) -> dict[str, Any]:
+    await _ensure_provider_directory_tables()
+    selected = _selected_resources(resources)
+    summary: dict[str, Any] = {
+        "resources": {},
+        "canonical_rows": 0,
+        "source_edge_rows": 0,
+    }
+    for resource_type in selected:
+        model = RESOURCE_MODELS_BY_TYPE.get(resource_type)
+        if model is None:
+            continue
+        canonical_sql, edge_sql = _canonical_backfill_resource_sql(resource_type, model.__tablename__)
+        canonical_rows = _status_row_count(await db.status(canonical_sql))
+        source_edge_rows = _status_row_count(await db.status(edge_sql))
+        summary["resources"][resource_type] = {
+            "canonical_rows": canonical_rows,
+            "source_edge_rows": source_edge_rows,
+        }
+        summary["canonical_rows"] += canonical_rows
+        summary["source_edge_rows"] += source_edge_rows
+    print("PROVIDER_DIRECTORY_CANONICAL_BACKFILL_DONE\t" + json.dumps(summary, sort_keys=True, default=str))
+    return summary
+
+
 def _seed_rows_from_sqlite(path: Path, *, limit: int | None = None, source_query: str | None = None) -> list[dict[str, Any]]:
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
@@ -4476,6 +4618,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
     seed_only = bool(task.get("seed_only", False))
     probe = bool(task.get("probe", True))
     import_resources = bool(task.get("import_resources", False))
+    canonical_backfill_only = bool(task.get("canonical_backfill_only", False))
     open_only = bool(task.get("open_only", True))
     include_auth_required = bool(task.get("include_auth_required", False))
     full_refresh = bool(task.get("full_refresh", False))
@@ -4504,6 +4647,13 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
         task.get("publish_artifacts"),
         set(resources) == set(DEFAULT_RESOURCES),
     )
+    if canonical_backfill_only:
+        metrics = await backfill_provider_directory_canonical_resources(
+            resources=_clean_text(task.get("resources")),
+        )
+        ctx["context"]["audit"] = metrics
+        ctx["context"]["run"] = ctx["context"].get("run", 0) + 1
+        return metrics
     await _clear_resource_rows_seen(run_id)
 
     seed_rows: list[dict[str, Any]]
@@ -4725,6 +4875,7 @@ async def main(
     seed_only: bool = False,
     probe: bool = True,
     import_resources: bool = False,
+    canonical_backfill_only: bool = False,
     full_refresh: bool = False,
     stale_cleanup: bool | None = None,
     publish_artifacts: bool | None = None,
@@ -4751,6 +4902,7 @@ async def main(
         "seed_only": seed_only,
         "probe": probe,
         "import_resources": import_resources,
+        "canonical_backfill_only": canonical_backfill_only,
         "full_refresh": full_refresh,
         "stale_cleanup": stale_cleanup,
         "publish_artifacts": publish_artifacts,

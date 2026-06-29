@@ -2217,6 +2217,45 @@ def test_selected_resources_rejects_unknown_resource():
         importer._selected_resources("InsurancePlan,Patient")  # pylint: disable=protected-access
 
 
+def test_canonical_backfill_resource_sql_uses_existing_resource_rows():
+    canonical_sql, edge_sql = importer._canonical_backfill_resource_sql(  # pylint: disable=protected-access
+        "Location",
+        ProviderDirectoryLocation.__tablename__,
+    )
+
+    assert 'INSERT INTO "mrf"."provider_directory_canonical_resource"' in canonical_sql
+    assert 'INSERT INTO "mrf"."provider_directory_source_resource"' in edge_sql
+    assert 'JOIN "mrf"."provider_directory_source" AS src' in canonical_sql
+    assert 'JOIN "mrf"."provider_directory_source" AS src' in edge_sql
+    assert "COALESCE(NULLIF(src.canonical_api_base, ''), NULLIF(src.api_base, ''))" in canonical_sql
+    assert "(to_jsonb(r) - 'source_id' - 'last_seen_run_id' - 'observed_at' - 'updated_at')" in canonical_sql
+    assert "ON CONFLICT (canonical_api_base, resource_type, resource_id) DO UPDATE" in canonical_sql
+    assert "ON CONFLICT (source_id, resource_type, resource_id) DO UPDATE" in edge_sql
+
+
+@pytest.mark.asyncio
+async def test_process_data_canonical_backfill_only_skips_seed_resolution(monkeypatch):
+    expected = {"canonical_rows": 2, "source_edge_rows": 3, "resources": {"Location": {}}}
+    backfill = AsyncMock(return_value=expected)
+
+    monkeypatch.setattr(importer, "ensure_database", AsyncMock())
+    monkeypatch.setattr(importer, "_ensure_provider_directory_tables", AsyncMock())
+    monkeypatch.setattr(importer, "backfill_provider_directory_canonical_resources", backfill)
+    monkeypatch.setattr(
+        importer,
+        "_resolve_seed_db",
+        lambda *_args, **_kwargs: pytest.fail("seed DB should not be resolved for canonical backfill"),
+    )
+
+    result = await importer.process_data(
+        {"context": {}},
+        {"canonical_backfill_only": True, "resources": "Location"},
+    )
+
+    assert result == expected
+    backfill.assert_awaited_once_with(resources="Location")
+
+
 def test_harness_fixture_case_and_report_rendering(tmp_path):
     result = harness._run_fixture_case()  # pylint: disable=protected-access
     report = {
