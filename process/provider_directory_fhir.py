@@ -229,6 +229,7 @@ DEFAULT_STREAM_BATCH_SIZE = 5000
 DEFAULT_BULK_EXPORT_MAX_POLLS = 120
 DEFAULT_BULK_EXPORT_POLL_SECONDS = 5
 DEFAULT_LOCATION_ADDRESS_KEY_BATCH_SIZE = 50000
+PUBLISH_CORROBORATION_ENV = "HLTHPRT_PROVIDER_DIRECTORY_PUBLISH_CORROBORATION"
 OAUTH_TOKEN_EXPIRY_SKEW_SECONDS = 60
 _OAUTH_TOKEN_CACHE: dict[str, tuple[str, float]] = {}
 FHIR_ONBOARDING_GATEWAY_HOSTS = {
@@ -2552,6 +2553,7 @@ async def _publish_provider_directory_artifacts(
     metrics: dict[str, Any],
     seen_table: str | None = None,
     address_key_run_id: str | None = None,
+    publish_corroboration: bool = False,
 ) -> dict[str, Any]:
     await _mark_provider_directory_progress(
         run_id,
@@ -2603,15 +2605,24 @@ async def _publish_provider_directory_artifacts(
         ),
         metrics=metrics,
     )
-    metrics["ptg_corroboration_view_published"] = (
-        await publish_provider_directory_ptg_address_corroboration_if_available()
-    )
+    metrics["publish_corroboration"] = publish_corroboration
+    if publish_corroboration:
+        metrics["ptg_corroboration_view_published"] = (
+            await publish_provider_directory_ptg_address_corroboration_if_available()
+        )
+        message = "published Provider Directory PTG corroboration artifacts"
+    else:
+        metrics["ptg_corroboration_view_published"] = False
+        metrics["ptg_corroboration_view_skipped"] = {
+            "reason": "publish_corroboration_disabled",
+        }
+        message = "skipped Provider Directory PTG corroboration artifacts"
     await _mark_provider_directory_progress(
         run_id,
         phase="provider-directory publishing artifacts",
         done=4,
         total=4,
-        message="published Provider Directory PTG corroboration artifacts",
+        message=message,
         metrics=metrics,
     )
     return metrics
@@ -4859,6 +4870,13 @@ def _bool_or_default(value: Any, default: bool) -> bool:
     return bool(value)
 
 
+def _publish_corroboration_enabled(value: Any) -> bool:
+    return _bool_or_default(
+        value,
+        _bool_or_default(os.getenv(PUBLISH_CORROBORATION_ENV), False),
+    )
+
+
 def _int_or_default(value: Any, default: int) -> int:
     if value is None or value == "":
         return default
@@ -5508,6 +5526,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
     canonical_backfill_only = bool(task.get("canonical_backfill_only", False))
     contact_backfill_only = bool(task.get("contact_backfill_only", False))
     publish_artifacts_only = bool(task.get("publish_artifacts_only", False))
+    publish_corroboration = _publish_corroboration_enabled(task.get("publish_corroboration"))
     open_only = bool(task.get("open_only", True))
     include_auth_required = bool(task.get("include_auth_required", False))
     full_refresh = bool(task.get("full_refresh", False))
@@ -5562,6 +5581,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
         metrics = await _publish_provider_directory_artifacts(
             run_id=run_id,
             metrics=metrics,
+            publish_corroboration=publish_corroboration,
         )
         ctx["context"]["audit"] = metrics
         ctx["context"]["run"] = ctx["context"].get("run", 0) + 1
@@ -5614,6 +5634,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
             "source_concurrency": source_concurrency,
             "stale_cleanup": stale_cleanup,
             "publish_artifacts": publish_artifacts,
+            "publish_corroboration": publish_corroboration,
         }
         await _mark_provider_directory_progress(
             run_id,
@@ -5729,6 +5750,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                     metrics=metrics,
                     seen_table=seen_stage_table_for_publish,
                     address_key_run_id=run_id,
+                    publish_corroboration=publish_corroboration,
                 )
             else:
                 metrics["location_contacts_backfilled"] = {
@@ -5783,6 +5805,7 @@ async def main(
     canonical_backfill_only: bool = False,
     contact_backfill_only: bool = False,
     publish_artifacts_only: bool = False,
+    publish_corroboration: bool | None = None,
     full_refresh: bool = False,
     stale_cleanup: bool | None = None,
     publish_artifacts: bool | None = None,
@@ -5813,6 +5836,7 @@ async def main(
         "canonical_backfill_only": canonical_backfill_only,
         "contact_backfill_only": contact_backfill_only,
         "publish_artifacts_only": publish_artifacts_only,
+        "publish_corroboration": publish_corroboration,
         "full_refresh": full_refresh,
         "stale_cleanup": stale_cleanup,
         "publish_artifacts": publish_artifacts,

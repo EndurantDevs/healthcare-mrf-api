@@ -1788,7 +1788,7 @@ async def test_publish_provider_directory_ptg_address_corroboration_if_available
 
 
 @pytest.mark.asyncio
-async def test_process_data_stamps_locations_and_publishes_corroboration_view(monkeypatch):
+async def test_process_data_stamps_locations_and_publishes_corroboration_view_when_requested(monkeypatch):
     monkeypatch.setattr(importer, "ensure_database", AsyncMock())
     monkeypatch.setattr(importer, "_ensure_provider_directory_tables", AsyncMock())
     monkeypatch.setattr(importer, "_upsert_rows", AsyncMock(return_value=1))
@@ -1818,6 +1818,7 @@ async def test_process_data_stamps_locations_and_publishes_corroboration_view(mo
             "import_resources": True,
             "resources": "Location",
             "publish_artifacts": True,
+            "publish_corroboration": True,
         },
     )
 
@@ -1826,6 +1827,7 @@ async def test_process_data_stamps_locations_and_publishes_corroboration_view(mo
     assert metrics["location_contacts_backfilled"] == {"location_contact_rows_updated": 5}
     assert metrics["location_address_keys_stamped"] == 3
     assert metrics["location_archive"] == {"inserted": 4, "provenance_updates": 1}
+    assert metrics["publish_corroboration"] is True
     assert metrics["ptg_corroboration_view_published"] is True
     importer.backfill_provider_directory_location_contacts.assert_awaited_once()
     importer.publish_provider_directory_location_address_keys.assert_awaited_once()
@@ -2911,14 +2913,18 @@ async def test_process_data_publish_artifacts_only_skips_seed_resolution(monkeyp
     assert result["location_contacts_backfilled"] == {"location_contact_rows_updated": 5}
     assert result["location_address_keys_stamped"] == 3
     assert result["location_archive"] == {"inserted": 4, "provenance_updates": 1}
-    assert result["ptg_corroboration_view_published"] is True
+    assert result["publish_corroboration"] is False
+    assert result["ptg_corroboration_view_published"] is False
+    assert result["ptg_corroboration_view_skipped"] == {
+        "reason": "publish_corroboration_disabled",
+    }
     importer.backfill_provider_directory_location_contacts.assert_awaited_once()
     importer.publish_provider_directory_location_address_keys.assert_awaited_once_with(
         run_id=None,
         seen_table=None,
     )
     importer.publish_provider_directory_location_archive.assert_awaited_once_with(run_id="run_publish")
-    importer.publish_provider_directory_ptg_address_corroboration_if_available.assert_awaited_once()
+    importer.publish_provider_directory_ptg_address_corroboration_if_available.assert_not_awaited()
 
 
 def test_harness_fixture_case_and_report_rendering(tmp_path):

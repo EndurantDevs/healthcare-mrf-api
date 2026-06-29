@@ -1137,7 +1137,15 @@ def provider_enrichment(test: bool):
 @click.option(
     "--publish-artifacts-only",
     is_flag=True,
-    help="Publish Provider Directory contact, address archive, and PTG corroboration artifacts without fetching FHIR resources.",
+    help="Publish Provider Directory contact and address archive artifacts without fetching FHIR resources.",
+)
+@click.option(
+    "--publish-corroboration/--no-publish-corroboration",
+    default=None,
+    help=(
+        "Rebuild the expensive Provider Directory/PTG corroboration relation during artifact publishing. "
+        "Defaults off unless HLTHPRT_PROVIDER_DIRECTORY_PUBLISH_CORROBORATION is enabled."
+    ),
 )
 @click.option(
     "--full-refresh/--sample-refresh",
@@ -1194,6 +1202,7 @@ def provider_directory_fhir(
     canonical_backfill_only: bool,
     contact_backfill_only: bool,
     publish_artifacts_only: bool,
+    publish_corroboration: bool | None,
     full_refresh: bool,
     stale_cleanup: bool | None,
     publish_artifacts: bool | None,
@@ -1223,6 +1232,7 @@ def provider_directory_fhir(
             canonical_backfill_only=canonical_backfill_only,
             contact_backfill_only=contact_backfill_only,
             publish_artifacts_only=publish_artifacts_only,
+            publish_corroboration=publish_corroboration,
             full_refresh=full_refresh,
             stale_cleanup=stale_cleanup,
             publish_artifacts=publish_artifacts,

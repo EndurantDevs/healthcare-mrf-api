@@ -59,12 +59,15 @@ to payer-directory corroboration. The helper
 - FHIR `provider_directory_location.address_key` to unified
   `entity_address_unified.address_key`.
 
-The importer publishes `ptg_provider_directory_address_corroboration` as an
-unlogged table during artifact publishing. This pays the expensive FHIR/unified-address join
-once after a full import, adds lookup indexes for serving and audit checks, and
-keeps API-side PTG address overlay fast. The disposable smoke helper can still
-build the same relation as a view for small fixture schemas, but normal dev and
-scheduled imports should use the table-backed publisher.
+The importer can publish `ptg_provider_directory_address_corroboration` as an
+unlogged table during artifact publishing when `publish_corroboration=true`,
+`--publish-corroboration`, or `HLTHPRT_PROVIDER_DIRECTORY_PUBLISH_CORROBORATION=1`
+is set. This pays the expensive FHIR/unified-address join once after a full
+import, adds lookup indexes for serving and audit checks, and keeps API-side PTG
+address overlay fast. The disposable smoke helper can still build the same
+relation as a view for small fixture schemas, but normal dev and scheduled
+imports leave this disabled unless a PTG corroboration refresh is explicitly
+needed.
 
 Rows in this relation are Provider Directory evidence, not direct TiC location
 evidence. Address-only rows remain public
@@ -182,10 +185,12 @@ resource scans.
 
 Artifact publishing is meant for full default-resource refreshes. It stamps
 `provider_directory_location.address_key`, publishes Provider Directory location
-rows into the shared address archive, and republishes the table-backed PTG
-corroboration relation used by serving/search. The CLI defaults
-`--publish-artifacts` on only
-when the selected resources equal the full Provider Directory resource set.
+rows into the shared address archive, and can optionally republish the
+table-backed PTG corroboration relation used by serving/search. The CLI defaults
+`--publish-artifacts` on only when the selected resources equal the full
+Provider Directory resource set. PTG corroboration publication defaults off
+because it is a global join; use `--publish-corroboration` only when refreshing
+that optional relation is part of the run.
 Small payer or single-resource smoke runs should pass `--no-publish-artifacts`
 or `publish_artifacts=false`; otherwise a bounded test can spend most of its
 runtime rebuilding global address artifacts that are unrelated to the smoke.
