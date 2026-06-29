@@ -2052,6 +2052,14 @@ def test_master_list_importable_source_filter_keeps_only_working_url_rows():
     )
     assert not discovery._candidate_is_importable_source(
         discovery.SourceCandidate(
+            payer_name="Needs Review With Url",
+            provider="master-list",
+            index_url="https://example.com/unverified",
+            status="needs_review",
+        )
+    )
+    assert not discovery._candidate_is_importable_source(
+        discovery.SourceCandidate(
             payer_name="Unsupported",
             provider="master-list",
             index_url="https://example.com/old",

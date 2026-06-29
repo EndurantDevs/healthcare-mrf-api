@@ -10217,7 +10217,11 @@ def _candidate_matches_text_filters(
 def _candidate_is_importable_source(candidate: SourceCandidate) -> bool:
     if not (candidate.index_url or candidate.human_url):
         return False
-    return str(candidate.status or "").lower() not in {"unsupported", "archived"}
+    return str(candidate.status or "").lower() not in {
+        "archived",
+        "needs_review",
+        "unsupported",
+    }
 
 
 def _discovery_run_mode(*, crawl: bool, check_urls: bool, probe_files: bool) -> str:
