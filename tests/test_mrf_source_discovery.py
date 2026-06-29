@@ -1323,8 +1323,15 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Ameritas Vision EyeMed" in by_name["EyeMed"].aliases
     assert "Ameritas Vision with EyeMed" in by_name["EyeMed"].aliases
     assert "Ameritas with EyeMed" in by_name["EyeMed"].aliases
+    assert "Ameritas Life Insurance Corp. EyeMed" in by_name["EyeMed"].aliases
+    assert "Ameritas Life Ins Corp. EyeMed" in by_name["EyeMed"].aliases
     assert "Mutual of Omaha with EyeMed" in by_name["EyeMed"].aliases
     assert "Mutual of Omaha Vision with EyeMed" in by_name["EyeMed"].aliases
+    assert "Mutual of Omaha Insurance Company EyeMed" in by_name["EyeMed"].aliases
+    assert (
+        "Mutual of Omaha Insurance Company Vision with EyeMed"
+        in by_name["EyeMed"].aliases
+    )
     assert "BlueCare Vision of Texas (powered by EyeMed)" in by_name["EyeMed"].aliases
     assert (
         "Blue 20/20 of Massachusetts (powered by EyeMed)"
@@ -1344,8 +1351,12 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "DeltaVision EyeMed" in by_name["EyeMed"].aliases
     assert "DeltaVision administered by EyeMed" in by_name["EyeMed"].aliases
     assert "DeltaVision with EyeMed" in by_name["EyeMed"].aliases
+    assert "The Standard Vision EyeMed" in by_name["EyeMed"].aliases
+    assert "Standard Insurance Company EyeMed" in by_name["EyeMed"].aliases
     assert "Unum Vision Powered by Eyemed" in by_name["EyeMed"].aliases
     assert "Unum Vision EyeMed" in by_name["EyeMed"].aliases
+    assert "Starmount Life EyeMed" in by_name["EyeMed"].aliases
+    assert "Starmount Life Insurance Company EyeMed" in by_name["EyeMed"].aliases
     assert "Surency" in by_name["EyeMed"].aliases
     assert "Surency Vision" in by_name["EyeMed"].aliases
     assert "Surency EyeMed" in by_name["EyeMed"].aliases
@@ -1373,6 +1384,18 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Guardian Vision VSP" in by_name["VSP Vision"].aliases
     assert "Guardian Vision with VSP" in by_name["VSP Vision"].aliases
     assert "Guardian Vision Powered by VSP" in by_name["VSP Vision"].aliases
+    assert "Guardian Life Insurance Company VSP" in by_name["VSP Vision"].aliases
+    assert (
+        "Guardian Life Insurance Company of America VSP"
+        in by_name["VSP Vision"].aliases
+    )
+    assert (
+        "The Guardian Life Insurance Company VSP" in by_name["VSP Vision"].aliases
+    )
+    assert (
+        "The Guardian Life Insurance Company of America VSP"
+        in by_name["VSP Vision"].aliases
+    )
     assert "VSP Guardian" in by_name["VSP Vision"].aliases
     assert "VSP Service Plan" in by_name["VSP Vision"].aliases
     assert "VPS Vision Care" in by_name["VSP Vision"].aliases
@@ -1381,6 +1404,7 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Principal / VSP" in by_name["VSP Vision"].aliases
     assert "Principal Vision VSP" in by_name["VSP Vision"].aliases
     assert "Principal Vision with VSP" in by_name["VSP Vision"].aliases
+    assert "Principal Life Insurance Company VSP" in by_name["VSP Vision"].aliases
     assert "MetLife VSP Choice" in by_name["VSP Vision"].aliases
     assert "MetLife Vision VSP" in by_name["VSP Vision"].aliases
     assert "MetLife using VSP Choice Network" in by_name["VSP Vision"].aliases
@@ -1389,12 +1413,32 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "SunLife Vision with VSP" in by_name["VSP Vision"].aliases
     assert "Sun Life Vision VSP" in by_name["VSP Vision"].aliases
     assert "SunLife/VSP" in by_name["VSP Vision"].aliases
+    assert (
+        "Sun Life and Health Insurance Company VSP"
+        in by_name["VSP Vision"].aliases
+    )
+    assert (
+        "Sun Life and Health Insurance Company (U.S.) VSP"
+        in by_name["VSP Vision"].aliases
+    )
     assert "Ameritas Vision VSP" in by_name["VSP Vision"].aliases
     assert "Ameritas Vision with VSP" in by_name["VSP Vision"].aliases
     assert "Ameritas with VSP" in by_name["VSP Vision"].aliases
+    assert "Ameritas Life Insurance Corp. VSP" in by_name["VSP Vision"].aliases
+    assert "Ameritas Life Ins Corp. VSP" in by_name["VSP Vision"].aliases
     assert "VSP Ameritas" in by_name["VSP Vision"].aliases
     assert "Equitable Vision VSP" in by_name["VSP Vision"].aliases
+    assert "The Standard Vision VSP" in by_name["VSP Vision"].aliases
+    assert "Standard Insurance Company VSP" in by_name["VSP Vision"].aliases
     assert "Renaissance Vision VSP" in by_name["VSP Vision"].aliases
+    assert (
+        "Renaissance Life & Health Insurance Company VSP"
+        in by_name["VSP Vision"].aliases
+    )
+    assert (
+        "Renaissance Life & Health Insurance Company of America VSP"
+        in by_name["VSP Vision"].aliases
+    )
     assert "Beam Benefits VSP" in by_name["VSP Vision"].aliases
     assert "Companion Life VSP" in by_name["VSP Vision"].aliases
     assert "DeltaVision" in by_name["VSP Vision"].aliases
