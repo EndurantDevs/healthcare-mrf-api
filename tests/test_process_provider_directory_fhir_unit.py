@@ -2219,6 +2219,29 @@ async def test_import_resources_reports_streaming_partial_progress(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_mark_provider_directory_progress_persists_structured_detail(monkeypatch):
+    calls: list[dict[str, Any]] = []
+
+    async def fake_mark_control_run(*_args, **kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr(importer, "mark_control_run", fake_mark_control_run)
+
+    await importer._mark_provider_directory_progress(  # pylint: disable=protected-access
+        "run_1",
+        phase="provider-directory importing resources",
+        done=1,
+        total=2,
+        message="importing",
+        details={"active_source_groups": [{"sample_source_id": "source_a", "current_resource": "Location"}]},
+    )
+
+    assert calls[0]["progress"]["detail"] == {
+        "active_source_groups": [{"sample_source_id": "source_a", "current_resource": "Location"}]
+    }
+
+
+@pytest.mark.asyncio
 async def test_import_resources_fetches_duplicate_base_once_and_fans_out_rows(monkeypatch):
     _stub_resource_import_metadata(monkeypatch)
 

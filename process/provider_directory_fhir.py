@@ -4077,6 +4077,7 @@ async def _mark_provider_directory_progress(
     done: int,
     total: int,
     message: str,
+    details: dict[str, Any] | None = None,
     metrics: dict[str, Any] | None = None,
 ) -> None:
     if not run_id:
@@ -4091,6 +4092,8 @@ async def _mark_provider_directory_progress(
         "phase": phase,
         "message": message,
     }
+    if isinstance(details, dict) and details:
+        progress["detail"] = details
     try:
         await mark_control_run(
             run_id,
@@ -4853,6 +4856,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                         f"rows={sum(counts.values())}"
                         f"{active_suffix}"
                     ),
+                    details={"active_source_groups": active_source_groups},
                     metrics=metrics,
                 )
 
