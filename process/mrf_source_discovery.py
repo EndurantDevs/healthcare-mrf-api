@@ -2724,7 +2724,12 @@ async def _mymedicalshopper_ddp_recv(
                     f"MyMedicalShopper DDP {operation} timed out after {timeout_seconds:g}s"
                 )
             frame_timeout = min(timeout_seconds, remaining)
-        frame = await asyncio.wait_for(ws.receive(), timeout=frame_timeout)
+        try:
+            frame = await asyncio.wait_for(ws.receive(), timeout=frame_timeout)
+        except TimeoutError as exc:
+            raise TimeoutError(
+                f"MyMedicalShopper DDP {operation} timed out after {timeout_seconds:g}s"
+            ) from exc
         if frame.type == aiohttp.WSMsgType.TEXT:
             messages = _mymedicalshopper_sockjs_messages(str(frame.data))
             returned: list[dict[str, Any]] = []
