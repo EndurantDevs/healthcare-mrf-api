@@ -5,6 +5,7 @@ from db.maintenance import (
     _iter_index_specs,
     _managed_schemas,
     _normalize_index_columns,
+    _retire_obsolete_objects,
     _should_manage_table_schema,
 )
 from sqlalchemy import Column, MetaData, String, Table
@@ -63,3 +64,36 @@ def test_should_manage_table_schema_skips_tiger_when_only_mrf_managed() -> None:
     managed = {"mrf"}
     assert _should_manage_table_schema("mrf", managed) is True
     assert _should_manage_table_schema("tiger", managed) is False
+
+
+def test_retire_obsolete_objects_drops_only_explicit_ptg_cache() -> None:
+    class Conn:
+        def __init__(self) -> None:
+            self.statements: list[str] = []
+
+        def execute(self, statement) -> None:
+            self.statements.append(str(statement))
+
+    class Inspector:
+        def has_table(self, table_name: str, *, schema: str | None = None) -> bool:
+            assert schema == "mrf"
+            return table_name in {"ptg_address", "entity_address_unified"}
+
+        def get_columns(self, table_name: str, *, schema: str | None = None) -> list[dict[str, str]]:
+            assert table_name == "entity_address_unified"
+            assert schema == "mrf"
+            return [{"name": "location_key"}, {"name": "ptg_address_version"}]
+
+    conn = Conn()
+    results = {"retired": []}
+
+    _retire_obsolete_objects(conn, Inspector(), "mrf", results)
+
+    assert conn.statements == [
+        'DROP TABLE IF EXISTS "mrf"."ptg_address" CASCADE',
+        'ALTER TABLE "mrf"."entity_address_unified" DROP COLUMN IF EXISTS "ptg_address_version"',
+    ]
+    assert results["retired"] == [
+        "mrf.ptg_address",
+        "mrf.entity_address_unified.ptg_address_version",
+    ]
