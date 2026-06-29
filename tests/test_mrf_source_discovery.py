@@ -931,6 +931,9 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
 | BCBS Wyoming | blue | https://www.bcbswy.com/machine-readable-files/ | aliases: Blue Cross and Blue Shield of Wyoming, BCBSWY |
 | WPS Health | regional | https://www.wpshealth.com/resources/customer-resources/price-transparency.shtml | aliases: Wisconsin Physicians Service, WPS |
 | SummaCare | regional | https://files.myplancentral.com/TIC/TOC/ | aliases: SummaCare MEWA, Summa Health System |
+| Health Alliance Plan | provider_sponsored | https://hap.healthsparq.com/healthsparq/public/#/one/insurerCode=HAP_I&brandCode=HAP/machine-readable-transparency-in-coverage | aliases: HAP, Alliance Health and Life Insurance Company |
+| Peak Health | regional | https://peakhealth.org/transparency/ | aliases: Peak Health Plan |
+| Centivo - Rockwell Automation | group | https://eldoradocomputing.hosted-by-files.com/centivopublicRCKWL/ | aliases: Centivo, Centivo Health, Rockwell Automation |
 """
 
     candidates = discovery.parse_master_list(markdown)
@@ -1146,6 +1149,9 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
     assert by_name["WPS Health"].aliases == ("Wisconsin Physicians Service", "WPS")
     assert by_name["SummaCare"].hosting_platform == "html_mrf_links"
     assert by_name["SummaCare"].aliases == ("SummaCare MEWA", "Summa Health System")
+    assert by_name["Health Alliance Plan"].hosting_platform == "healthsparq"
+    assert by_name["Peak Health"].hosting_platform == "html_mrf_links"
+    assert by_name["Centivo - Rockwell Automation"].hosting_platform == "html_mrf_links"
     assert by_name["HealthSmart"].hosting_platform == "healthcarebluebook_mrf"
     assert by_name["HealthSmart"].benefit_lines == ("medical", "dental")
     assert by_name["HealthSmart"].aliases == (
@@ -1212,6 +1218,8 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "UMR (Using Spectera Network)" in by_name["United Healthcare"].aliases
     assert "Lincoln Financial Group - Spectera" in by_name["United Healthcare"].aliases
     assert "UHC Global" in by_name["United Healthcare"].aliases
+    assert "Kansas City Life" in by_name["United Healthcare"].aliases
+    assert "Kansas City Life Insurance Company" in by_name["United Healthcare"].aliases
     assert by_name["United Healthcare"].benefit_lines == (
         "medical",
         "dental",
@@ -1536,6 +1544,7 @@ async def test_master_list_keeps_high_value_public_aliases():
         in by_name["Reliance Matrix"].aliases
     )
     assert "Reliance Standard Life Ins Co" in by_name["Reliance Matrix"].aliases
+    assert "reliancematrix" in by_name["Reliance Matrix"].aliases
     assert by_name["BCBS North Carolina"].hosting_platform == "direct_toc"
     assert "Blue Cross Blue Shield of NC" in aliases_by_name["BCBS North Carolina"]
     assert "BlueCross BlueShield of NC" in aliases_by_name["BCBS North Carolina"]
@@ -1625,6 +1634,7 @@ async def test_master_list_keeps_high_value_public_aliases():
         in by_name["United Healthcare"].aliases
     )
     assert "Ameritas Holding Company Health Plan" in by_name["United Healthcare"].aliases
+    assert "KCL Group Benefits" in by_name["United Healthcare"].aliases
     assert "Anthem CA" in by_name["Anthem"].aliases
     assert "Anthem BlueCross & BlueShield Plan" in by_name["Anthem"].aliases
     assert "Blue Cross of California" in by_name["Anthem"].aliases
@@ -1703,8 +1713,18 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "EVHC" in by_name["Luminare Health Benefits"].aliases
     assert "Evolution Healthcare" in by_name["Luminare Health Benefits"].aliases
     assert "Evolution Healthcare EVHC" in by_name["Luminare Health Benefits"].aliases
+    assert "Cofinity" in by_name["Luminare Health Benefits"].aliases
+    assert "First Health Cofinity" in by_name["Luminare Health Benefits"].aliases
     assert "Medical Benefits Administrators, Inc." in by_name["MedBen"].aliases
     assert "Unified Group" in by_name["Unified Group Services"].aliases
+    assert by_name["EMI Health"].benefit_lines == ("dental",)
+    assert "TDA Dental" in by_name["EMI Health"].aliases
+    assert "Total Dental Administrators" in by_name["EMI Health"].aliases
+    assert by_name["HAP"].hosting_platform == "healthsparq"
+    assert "Alliance Health and Life Insurance Company" in by_name["HAP"].aliases
+    assert by_name["Peak Health"].hosting_platform == "html_mrf_links"
+    assert by_name["Centivo - Rockwell Automation"].hosting_platform == "html_mrf_links"
+    assert "Centivo" in by_name["Centivo - Rockwell Automation"].aliases
 
 
 @pytest.mark.asyncio
@@ -1742,6 +1762,10 @@ async def test_master_list_public_alias_queries_match_expected_candidates():
     assert "United Healthcare" in matching_names("Dental Benefit Providers DBP")
     assert "United Healthcare" in matching_names(
         "Sierra Health and Life Insurance Company, Inc."
+    )
+    assert "United Healthcare" in matching_importable_names("Kansas City Life")
+    assert "United Healthcare" in matching_importable_names(
+        "Kansas City Life Insurance Company"
     )
     assert "Aetna" in matching_names("Aetna Dental")
     assert "Aetna" in matching_importable_names("Aetna Dental")
@@ -1815,6 +1839,18 @@ async def test_master_list_public_alias_queries_match_expected_candidates():
     assert "Luminare Health Benefits" in matching_names("Anthem/Luminare Health")
     assert "MedBen" in matching_names("Medical Benefits Administrators, Inc.")
     assert "Unified Group Services" in matching_names("Unified Group")
+    assert "Luminare Health Benefits" in matching_importable_names("Cofinity")
+    assert "Luminare Health Benefits" in matching_importable_names(
+        "First Health Cofinity"
+    )
+    assert "EMI Health" in matching_importable_names("TDA Dental")
+    assert "EMI Health" in matching_importable_names("Total Dental Administrators")
+    assert "HAP" in matching_importable_names(
+        "Alliance Health and Life Insurance Company"
+    )
+    assert "Peak Health" in matching_importable_names("Peak Health Plan")
+    assert "Centivo - Rockwell Automation" in matching_importable_names("Centivo")
+    assert "Reliance Matrix" in matching_importable_names("reliancematrix")
     assert "Meritain Health" in matching_names("Meritain Health, An Aetna Company")
     assert "Meritain Health" in matching_names(
         "MERITAIN HEALTH (NORTH AMERICAN HEALTH PLAN)"
@@ -2192,9 +2228,9 @@ def test_master_list_marks_replaced_viva_transparency_url_archived():
 def test_import_control_snapshot_company_fallback_from_index_url():
     assert (
         discovery._company_name_from_index_url(
-            "https://transparency-in-coverage.uhc.com/2026-06-01_Heartland-Dental-LLC_index.json"
+            "https://transparency-in-coverage.uhc.com/2026-06-01_Example-Dental-Services-LLC_index.json"
         )
-        == "Heartland Dental LLC"
+        == "Example Dental Services LLC"
     )
     assert (
         discovery._company_name_from_index_url(
@@ -2205,15 +2241,15 @@ def test_import_control_snapshot_company_fallback_from_index_url():
     enriched = discovery._apply_company_fallback(
         [
             {
-                "plan_id": "010854205",
+                "plan_id": "SYNTH-GROUP-001",
                 "plan_market_type": "group",
                 "plan_name": "POS-CHOICE-PLUS",
             }
         ],
-        "Heartland Dental LLC",
+        "Example Dental Services LLC",
     )
 
-    assert enriched[0]["plan_sponsor_name"] == "Heartland Dental LLC"
+    assert enriched[0]["plan_sponsor_name"] == "Example Dental Services LLC"
 
 
 @pytest.mark.asyncio
@@ -2517,7 +2553,7 @@ def test_classify_hosting_platforms():
     )
     assert (
         discovery.classify_hosting_platform(
-            "https://www.mymedicalshopper.com/mrf/electrical-workers-cofinity-varipro-77100"
+            "https://www.mymedicalshopper.com/mrf/sample-employer-network-varipro-77100"
         )
         == "mymedicalshopper_talon"
     )
@@ -3780,9 +3816,9 @@ def test_mymedicalshopper_url_helpers_and_employer_selector():
     )
     assert (
         discovery._mymedicalshopper_employer_slug_from_url(
-            "https://www.mymedicalshopper.com/mrf/electrical-workers-cofinity-varipro-77100"
+            "https://www.mymedicalshopper.com/mrf/sample-employer-network-varipro-77100"
         )
-        == "electrical-workers-cofinity-varipro-77100"
+        == "sample-employer-network-varipro-77100"
     )
     assert discovery._mymedicalshopper_employer_selector(
         "varipro", all_employers_searchable=True
@@ -3820,8 +3856,8 @@ def test_mymedicalshopper_sockjs_frame_and_publication_helpers():
                     "collection": "employers",
                     "id": "61a",
                     "fields": {
-                        "name": "EWIF - HAP / First Health",
-                        "slug": "electrical-workers-cofinity-varipro-77100",
+                        "name": "Sample Employer - Network A",
+                        "slug": "sample-employer-network-varipro-77100",
                         "tpaSlug": "varipro",
                         "status": "Enabled",
                     },
@@ -3839,8 +3875,8 @@ def test_mymedicalshopper_sockjs_frame_and_publication_helpers():
     assert employers == [
         {
             "_id": "61a",
-            "name": "EWIF - HAP / First Health",
-            "slug": "electrical-workers-cofinity-varipro-77100",
+            "name": "Sample Employer - Network A",
+            "slug": "sample-employer-network-varipro-77100",
             "tpaSlug": "varipro",
             "status": "Enabled",
         }
@@ -3850,41 +3886,41 @@ def test_mymedicalshopper_sockjs_frame_and_publication_helpers():
 def test_mymedicalshopper_targets_keep_latest_generated_toc_per_plan():
     source = {"source_id": "source_varipro", "payer_id": "payer_varipro"}
     employer = {
-        "slug": "electrical-workers-cofinity-varipro-77100",
-        "name": "EWIF - HAP / First Health",
+        "slug": "sample-employer-network-varipro-77100",
+        "name": "Sample Employer - Network A",
         "tpaSlug": "varipro",
         "groupId": "77100",
-        "ein": "381393235",
+        "ein": "111222333",
     }
     generated = [
         {
             "planId": "4907",
-            "planName": "EWIF In Network 01/01/2023",
+            "planName": "Sample Employer In Network 01/01/2023",
             "mrfGeneratedInfo": [
                 {
                     "month": "2026-05-01",
                     "mrfGenerated": True,
-                    "link": "https://mrf.mmsanalytics.com/2026-05-01_ewif_index.json",
+                    "link": "https://mrf.mmsanalytics.com/2026-05-01_sample_employer_index.json",
                 },
                 {
                     "month": "2026-06-01",
                     "mrfGenerated": True,
-                    "link": "https://mrf.mmsanalytics.com/2026-06-01_ewif_index.json",
+                    "link": "https://mrf.mmsanalytics.com/2026-06-01_sample_employer_index.json",
                 },
                 {
                     "month": "2026-07-01",
                     "mrfGenerated": False,
-                    "link": "https://mrf.mmsanalytics.com/2026-07-01_ewif_index.json",
+                    "link": "https://mrf.mmsanalytics.com/2026-07-01_sample_employer_index.json",
                 },
             ],
         },
         {
-            "plan": {"id": "4907", "name": "EWIF In Network 01/01/2022"},
+            "plan": {"id": "4907", "name": "Sample Employer In Network 01/01/2022"},
             "mrfGeneratedInfo": [
                 {
                     "month": "2026-06-01",
                     "mrfGenerated": True,
-                    "link": "https://mrf.mmsanalytics.com/2026-06-01_ewif_2022_index.json",
+                    "link": "https://mrf.mmsanalytics.com/2026-06-01_sample_employer_2022_index.json",
                 }
             ],
         },
@@ -3900,30 +3936,30 @@ def test_mymedicalshopper_targets_keep_latest_generated_toc_per_plan():
     )
 
     assert [target.url for target in targets] == [
-        "https://mrf.mmsanalytics.com/2026-06-01_ewif_index.json",
-        "https://mrf.mmsanalytics.com/2026-06-01_ewif_2022_index.json",
+        "https://mrf.mmsanalytics.com/2026-06-01_sample_employer_index.json",
+        "https://mrf.mmsanalytics.com/2026-06-01_sample_employer_2022_index.json",
     ]
     assert (
         targets[0].label
-        == "EWIF - HAP / First Health - EWIF In Network 01/01/2023 - 2026-06-01"
+        == "Sample Employer - Network A - Sample Employer In Network 01/01/2023 - 2026-06-01"
     )
     assert targets[0].metadata["target_file_type"] == "table-of-contents"
     assert targets[0].metadata["entity_slug"] == "varipro"
     assert targets[0].metadata["tpa_slug"] == "varipro"
     assert targets[0].metadata["tpa_name"] == "Varipro"
     assert targets[0].metadata["client_id"] is None
-    assert targets[0].metadata["client_name"] == "EWIF - HAP / First Health"
+    assert targets[0].metadata["client_name"] == "Sample Employer - Network A"
     assert (
         targets[0].metadata["employer_slug"]
-        == "electrical-workers-cofinity-varipro-77100"
+        == "sample-employer-network-varipro-77100"
     )
-    assert targets[0].metadata["employer_name"] == "EWIF - HAP / First Health"
+    assert targets[0].metadata["employer_name"] == "Sample Employer - Network A"
     assert targets[0].metadata["group_id"] == "77100"
     assert targets[0].metadata["group_number"] == "77100"
-    assert targets[0].metadata["ein"] == "381393235"
+    assert targets[0].metadata["ein"] == "111222333"
     assert targets[0].metadata["history_month_count"] == 3
     context = discovery._crawl_target_context_metadata(targets[0])
-    assert context["client_name"] == "EWIF - HAP / First Health"
+    assert context["client_name"] == "Sample Employer - Network A"
     assert context["tpa_slug"] == "varipro"
     assert context["group_number"] == "77100"
 
@@ -3988,7 +4024,7 @@ async def test_mymedicalshopper_subscription_uses_overall_deadline_for_heartbeat
 def test_mymedicalshopper_direct_employer_slug_infers_tpa_and_group_context():
     assert (
         discovery._mymedicalshopper_group_id_from_employer_slug(
-            "electrical-workers-cofinity-varipro-77100"
+            "sample-employer-network-varipro-77100"
         )
         == "77100"
     )
@@ -4000,7 +4036,7 @@ def test_mymedicalshopper_direct_employer_slug_infers_tpa_and_group_context():
     )
     assert (
         discovery._mymedicalshopper_tpa_slug_from_employer_slug(
-            "electrical-workers-cofinity-varipro-77100"
+            "sample-employer-network-varipro-77100"
         )
         == "varipro"
     )

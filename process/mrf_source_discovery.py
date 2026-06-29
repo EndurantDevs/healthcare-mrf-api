@@ -788,6 +788,15 @@ def classify_hosting_platform(url: str | None) -> str | None:
         "/machinereadables"
     ):
         return "html_mrf_links"
+    if host in {"peakhealth.org", "www.peakhealth.org"}:
+        if path.endswith(".zip") and re.search(r"[_-]index\.zip$", path):
+            return "direct_toc"
+        if path.startswith("/transparency"):
+            return "html_mrf_links"
+    if host == "eldoradocomputing.hosted-by-files.com" and path.startswith(
+        "/centivopublic"
+    ):
+        return "html_mrf_links"
     if host == "boonchapman-mrf.zakipointhealth.com":
         return "html_mrf_links_mixed_directories"
     if (
