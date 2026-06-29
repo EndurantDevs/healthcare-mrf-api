@@ -497,6 +497,7 @@ def _is_placeholder_url(value: str | None) -> bool:
         or "http 400" in lowered
         or "http 404" in lowered
         or "not a direct endpoint" in lowered
+        or "unreachable" in lowered
     )
 
 

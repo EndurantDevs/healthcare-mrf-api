@@ -1758,6 +1758,22 @@ def test_resource_start_url_ignores_catalog_annotation_endpoint():
     assert url == "https://fhir.humana.com/api/Location?_count=100"
 
 
+def test_resource_start_url_ignores_unreachable_catalog_endpoint():
+    url = importer._resource_start_url(  # pylint: disable=protected-access
+        {
+            "api_base": "https://fp.medicaid.utah.gov/ProviderDirectoryServices",
+            "endpoint_location": (
+                "https://fp.medicaid.utah.gov/ProviderDirectoryServices/metadata/Location "
+                "(unreachable)"
+            ),
+        },
+        "Location",
+        page_count=100,
+    )
+
+    assert url == "https://fp.medicaid.utah.gov/ProviderDirectoryServices/Location?_count=100"
+
+
 @pytest.mark.asyncio
 async def test_fetch_resource_rows_resolves_relative_next_links(monkeypatch):
     calls: list[str] = []
