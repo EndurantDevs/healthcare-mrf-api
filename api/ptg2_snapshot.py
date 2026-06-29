@@ -113,6 +113,84 @@ async def current_source_snapshot_id_for_plan(session, args: dict[str, object]) 
     return _snapshot_cache_set(cache_key, value) if _snapshot_cache_enabled(session) else value
 
 
+async def current_source_snapshot_ids_for_plan(
+    session, args: dict[str, object]
+) -> list[tuple[str, str]]:
+    """Resolve the newest *materialized* serving snapshot for EACH network of a plan.
+
+    A group plan can be served by several networks/sources at once (e.g. a dental
+    C2 network plus a PPO carrier feed). ``current_source_snapshot_id_for_plan``
+    collapses those to a single snapshot via ``LIMIT 1``, which silently drops
+    every other network's pricing -- so a procedure only priced in one network
+    returns 0 results whenever a different network happens to own the newest
+    snapshot. This plural variant returns one ``(source_key, snapshot_id)`` pair
+    per network -- the newest snapshot whose serving table is actually
+    materialized (mirroring the single-plan resolver's ``to_regclass`` tiebreaker
+    so an unloaded newer network does not win and contribute 0 rows) -- letting
+    callers fan out across all of a plan's networks and combine the results.
+    """
+    requested_plan = str(args.get("plan_id") or args.get("plan_external_id") or "").strip()
+    if not requested_plan:
+        return []
+    market_type = str(args.get("plan_market_type") or "").strip().lower()
+    source_key = str(args.get("source_key") or "").strip().lower()
+    cache_key = ("source_plan_all", requested_plan, market_type, source_key)
+    if _snapshot_cache_enabled(session):
+        cached = _snapshot_cache_get(cache_key)
+        if cached is not None:
+            return [tuple(pair) for pair in cached]  # type: ignore[misc]
+    params: dict[str, object] = {"plan_id": requested_plan}
+    market_sql = ""
+    if market_type:
+        params["plan_market_type"] = market_type
+        market_sql = "AND cps.plan_market_type = :plan_market_type"
+    source_sql = ""
+    if source_key:
+        params["source_key"] = source_key
+        source_sql = "AND cps.source_key = :source_key"
+    try:
+        result = await session.execute(
+            text(
+                f"""
+                SELECT DISTINCT ON (cps.source_key) cps.source_key, cps.snapshot_id
+                  FROM {PTG2_SCHEMA}.ptg2_current_plan_source cps
+                  JOIN {PTG2_SCHEMA}.ptg2_snapshot s ON s.snapshot_id = cps.snapshot_id
+                 WHERE cps.plan_id = :plan_id
+                   {market_sql}
+                   {source_sql}
+                   AND s.status = 'published'
+                   AND s.manifest->'serving_index'->>'table' IS NOT NULL
+                 -- One snapshot per network (source_key): the newest whose serving
+                 -- table is actually materialized. DISTINCT ON requires source_key
+                 -- to lead the ORDER BY; the to_regclass check keeps an unloaded
+                 -- newer network from winning and returning snapshot_not_loaded.
+                 ORDER BY cps.source_key,
+                          (to_regclass(s.manifest->'serving_index'->>'table') IS NOT NULL) DESC,
+                          cps.import_month DESC NULLS LAST, cps.updated_at DESC NULLS LAST
+                """
+            ),
+            params,
+        )
+    except Exception:
+        rollback = getattr(session, "rollback", None)
+        if callable(rollback):
+            try:
+                await rollback()
+            except Exception as rollback_exc:
+                logger.debug("failed to rollback source snapshot lookup: %s", rollback_exc)
+        if _snapshot_cache_enabled(session):
+            _snapshot_cache_set(cache_key, ())  # type: ignore[arg-type]
+        return []
+    pairs = [
+        (str(row[0] or ""), str(row[1]))
+        for row in result
+        if row[1]
+    ]
+    if _snapshot_cache_enabled(session):
+        _snapshot_cache_set(cache_key, tuple(pairs))  # type: ignore[arg-type]
+    return pairs
+
+
 async def resolve_current_ptg2_snapshot_id(session, args: dict[str, object]) -> str | None:
     if args.get("snapshot_id"):
         return str(args["snapshot_id"])

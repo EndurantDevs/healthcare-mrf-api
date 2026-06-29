@@ -1458,6 +1458,113 @@ async def test_search_current_ptg2_index_does_not_negative_cache_missing_payload
 
 
 @pytest.mark.asyncio
+async def test_search_current_ptg2_index_combines_networks_for_multi_network_plan(monkeypatch):
+    async def fake_ids(_session, _args):
+        # A Heartland-style plan served by two networks, each with its own snapshot.
+        return [("c2", "snap-c2"), ("ppo_ndc", "snap-ppo")]
+
+    async def fake_one(_session, snapshot_id, _args, pagination):
+        # Each network prices a different surgeon; the PPO row is cheaper.
+        per_network = {
+            "snap-c2": {
+                "items": [
+                    {"npi": 111, "provider_name": "Ambrose", "prices": [{"negotiated_rate": 1138.57}]}
+                ],
+                "pagination": {"total": 1, "limit": pagination.limit, "offset": pagination.offset},
+                "query": {"snapshot_id": snapshot_id, "code": "29888"},
+            },
+            "snap-ppo": {
+                "items": [
+                    {"npi": 222, "provider_name": "Boswell", "prices": [{"negotiated_rate": 905.0}]}
+                ],
+                "pagination": {"total": 1, "limit": pagination.limit, "offset": pagination.offset},
+                "query": {"snapshot_id": snapshot_id, "code": "29888"},
+            },
+        }
+        return per_network.get(snapshot_id)
+
+    monkeypatch.setattr(ptg2_serving, "current_source_snapshot_ids_for_plan", fake_ids)
+    monkeypatch.setattr(ptg2_serving, "_search_one_ptg2_snapshot", fake_one)
+
+    payload = await ptg2_serving.search_current_ptg2_index(
+        FakeSession([]),
+        {"plan_id": "010854205", "code": "29888", "order_by": "rate", "order": "asc"},
+        FakePagination(),
+    )
+
+    # Union of both networks, globally re-sorted by rate asc (cheaper PPO row first).
+    assert [item["npi"] for item in payload["items"]] == [222, 111]
+    assert payload["pagination"]["total"] == 2
+    # Each row stays attributable to the network it came from.
+    assert {item["npi"]: item["network"] for item in payload["items"]} == {111: "c2", 222: "ppo_ndc"}
+    assert payload["query"]["combined"] is True
+    assert payload["query"]["snapshot_id"] is None
+    assert {n["source_key"] for n in payload["query"]["networks"]} == {"c2", "ppo_ndc"}
+
+
+@pytest.mark.asyncio
+async def test_search_current_ptg2_index_single_network_plan_uses_single_path(monkeypatch):
+    seen = {}
+
+    async def fake_ids(_session, _args):
+        return [("c2", "snap-c2")]
+
+    async def fake_one(_session, snapshot_id, _args, _pagination):
+        seen["snapshot_id"] = snapshot_id
+        return {
+            "items": [{"npi": 111, "provider_name": "Ambrose", "prices": [{"negotiated_rate": 1138.57}]}],
+            "pagination": {"total": 1},
+            "query": {"snapshot_id": snapshot_id},
+        }
+
+    monkeypatch.setattr(ptg2_serving, "current_source_snapshot_ids_for_plan", fake_ids)
+    monkeypatch.setattr(ptg2_serving, "_search_one_ptg2_snapshot", fake_one)
+
+    payload = await ptg2_serving.search_current_ptg2_index(
+        FakeSession([]),
+        {"plan_id": "010854205", "code": "29888"},
+        FakePagination(),
+    )
+
+    # A single-network plan stays on the untouched single-snapshot path: no combine
+    # envelope, no per-item network tag.
+    assert seen["snapshot_id"] == "snap-c2"
+    assert payload["items"][0]["npi"] == 111
+    assert "network" not in payload["items"][0]
+    assert "combined" not in payload["query"]
+
+
+@pytest.mark.asyncio
+async def test_search_current_ptg2_index_pinned_snapshot_skips_network_combine(monkeypatch):
+    called = {"ids": 0}
+
+    async def fake_ids(_session, _args):
+        called["ids"] += 1
+        return [("c2", "snap-c2"), ("ppo_ndc", "snap-ppo")]
+
+    async def fake_one(_session, snapshot_id, _args, _pagination):
+        return {
+            "items": [{"npi": 999, "prices": [{"negotiated_rate": 10.0}]}],
+            "pagination": {"total": 1},
+            "query": {"snapshot_id": snapshot_id},
+        }
+
+    monkeypatch.setattr(ptg2_serving, "current_source_snapshot_ids_for_plan", fake_ids)
+    monkeypatch.setattr(ptg2_serving, "_search_one_ptg2_snapshot", fake_one)
+
+    payload = await ptg2_serving.search_current_ptg2_index(
+        FakeSession([]),
+        {"plan_id": "010854205", "code": "29888", "snapshot_id": "snap-pinned"},
+        FakePagination(),
+    )
+
+    # A caller-pinned snapshot must not trigger the multi-network resolver/combine.
+    assert called["ids"] == 0
+    assert "combined" not in payload["query"]
+    assert payload["query"]["snapshot_id"] == "snap-pinned"
+
+
+@pytest.mark.asyncio
 async def test_current_ptg2_snapshot_routes_by_plan_source_pointer():
     session = FakeSession(["snap-source"])
 
@@ -2052,9 +2159,13 @@ async def test_manifest_location_provider_matches_filters_coordinates_with_unifi
     assert "JOIN location_npis loc ON loc.npi = na.npi" in sql
     assert "LEFT JOIN fallback_addresses na" in sql
     assert "LEFT JOIN LATERAL (\n                SELECT na.first_line" not in sql
-    assert "COALESCE(tax.classifications, ARRAY[]::varchar[]) AS classifications" in sql
-    assert "COALESCE(tax.specializations, ARRAY[]::varchar[]) AS specializations" in sql
-    assert "WHERE nt.npi = addr.npi" in sql
+    # Taxonomy is resolved once per NPI in the located_with_tax CTE (before the
+    # provider_group_member fan-out) and surfaced via addr.* in the final SELECT.
+    assert "located_with_tax AS MATERIALIZED" in sql
+    assert "FROM located_with_tax addr" in sql
+    assert "COALESCE(addr.classifications, ARRAY[]::varchar[]) AS classifications" in sql
+    assert "COALESCE(addr.specializations, ARRAY[]::varchar[]) AS specializations" in sql
+    assert "WHERE nt.npi = loc.npi" in sql
     assert params["geo_lat"] == 34.14024131
     assert params["geo_long"] == -118.255125
     assert params["geo_radius_miles"] == 10.0

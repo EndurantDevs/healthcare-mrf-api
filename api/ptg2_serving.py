@@ -13,6 +13,7 @@ from typing import Any, Mapping
 from sqlalchemy import bindparam, text
 
 from api.code_systems import EQUIVALENT_PROCEDURE_CODE_SYSTEMS, canonical_catalog_code
+from api.endpoint.pagination import PaginationParams
 from api.ptg2_code_filters import (
     INFERRED_PROVIDER_TAXONOMY_RULES,
     INTERNAL_PROCEDURE_CODE_SYSTEM,
@@ -53,6 +54,7 @@ from api.ptg2_code_context import (
 from api.ptg2_snapshot import (
     current_snapshot_id,
     current_source_snapshot_id_for_plan,
+    current_source_snapshot_ids_for_plan,
     load_current_ptg2_index,
     resolve_current_ptg2_snapshot_id,
     snapshot_artifact_uri,
@@ -1753,9 +1755,16 @@ def _ptg2_manifest_rate_candidate_limit(
     requested_limit = max(int(pagination.limit), 1)
     requested_offset = max(int(getattr(pagination, "offset", 0) or 0), 0)
     if expand_providers and location_filter_requested:
+        # Bound the nearby-candidate pool the location expansion materializes.
+        # The downstream provider_group_member fan-out + per-row enrichment cost
+        # scales with this pool, so a dense metro (thousands of in-radius
+        # in-network providers) used to blow past the request timeout at the old
+        # limit*200 (=2000-4000) fetch. limit*40 (floored at 500, env-capped)
+        # keeps a generous nearest-first pool -- results stay "cheapest among the
+        # N nearest" -- while staying well under the wall in the densest metros.
         return min(
             _ptg2_manifest_location_match_limit(),
-            max(requested_limit * 200, requested_offset + requested_limit, 500),
+            max(requested_limit * 40, requested_offset + requested_limit, 500),
         )
     if expand_providers and not location_filter_requested and _ptg2_provider_taxonomy_filter_requested(args):
         return min(
@@ -2295,6 +2304,26 @@ async def _ptg2_manifest_location_provider_matches(
                 LIMIT :limit
             )
             {address_fallback_cte}
+            -- Resolve each candidate's taxonomy/specialty summary ONCE per NPI,
+            -- before the provider_group_member fan-out below. Previously this
+            -- LATERAL hung off the final SELECT, so it was re-evaluated for every
+            -- (npi, provider_group) pair -- a provider in many groups paid the
+            -- taxonomy lookup dozens of times. In dense metros that fan-out is
+            -- what pushed the query past the request timeout. Computing it here,
+            -- over the already-bounded location_npis set, makes it O(candidates)
+            -- instead of O(candidates x groups).
+            , located_with_tax AS MATERIALIZED (
+                SELECT
+                    loc.*,
+                    tax.taxonomy_codes,
+                    tax.specialties,
+                    tax.classifications,
+                    tax.specializations,
+                    tax.primary_specialty,
+                    tax.primary_specialization
+                FROM location_npis loc
+                {_provider_taxonomy_summary_lateral_sql("loc.npi")}
+            )
             SELECT DISTINCT ON (pgm.provider_group_global_id_128, addr.npi)
                 pgm.provider_group_global_id_128,
                 addr.npi,
@@ -2325,18 +2354,17 @@ async def _ptg2_manifest_location_provider_matches(
                 )::text AS address_payload,
                 {_eff('telephone_number')} AS telephone_number,
                 {_eff('fax_number')} AS fax_number,
-                COALESCE(tax.taxonomy_codes, ARRAY[]::varchar[]) AS taxonomy_codes,
-                COALESCE(tax.specialties, ARRAY[]::varchar[]) AS specialties,
-                COALESCE(tax.classifications, ARRAY[]::varchar[]) AS classifications,
-                COALESCE(tax.specializations, ARRAY[]::varchar[]) AS specializations,
-                tax.primary_specialty,
-                tax.primary_specialization,
+                COALESCE(addr.taxonomy_codes, ARRAY[]::varchar[]) AS taxonomy_codes,
+                COALESCE(addr.specialties, ARRAY[]::varchar[]) AS specialties,
+                COALESCE(addr.classifications, ARRAY[]::varchar[]) AS classifications,
+                COALESCE(addr.specializations, ARRAY[]::varchar[]) AS specializations,
+                addr.primary_specialty,
+                addr.primary_specialization,
                 {provider_name_sql} AS provider_name
-            FROM location_npis addr
+            FROM located_with_tax addr
             JOIN {provider_group_member_table} pgm ON pgm.npi = addr.npi
             {provider_join}
             {address_fallback_join}
-            {_provider_taxonomy_summary_lateral_sql("addr.npi")}
             ORDER BY pgm.provider_group_global_id_128,
                 addr.npi,
                 CASE addr.type
@@ -4330,10 +4358,22 @@ async def search_ptg2_provider_procedures(session, npi: int, args: dict[str, Any
     )
 
 
-async def search_current_ptg2_index(session, args: dict[str, Any], pagination) -> dict[str, Any] | None:
-    snapshot_id = await resolve_current_ptg2_snapshot_id(session, args)
-    if not snapshot_id:
-        return None
+def _ptg2_location_filter_requested(args: dict[str, Any]) -> bool:
+    return bool(
+        args.get("state")
+        or args.get("city")
+        or args.get("zip5")
+        or args.get("zip")
+        or args.get("npi")
+        or args.get("lat") is not None
+        or args.get("long") is not None
+        or args.get("radius_miles") is not None
+    )
+
+
+async def _search_one_ptg2_snapshot(
+    session, snapshot_id: str, args: dict[str, Any], pagination
+) -> dict[str, Any] | None:
     cache_key = _ptg2_response_cache_key(snapshot_id, args, pagination)
     cached_payload = _ptg2_response_cache_get(cache_key)
     if cached_payload is not _CACHE_MISS:
@@ -4350,3 +4390,112 @@ async def search_current_ptg2_index(session, args: dict[str, Any], pagination) -
         db_payload = await _enrich_ptg2_code_details(session, db_payload, args)
         return _ptg2_response_cache_set(cache_key, _shape_ptg2_response(db_payload, args))
     return None
+
+
+async def _search_multi_ptg2_snapshots(
+    session,
+    network_snapshots: list[tuple[str, str]],
+    args: dict[str, Any],
+    pagination,
+) -> dict[str, Any] | None:
+    """Search every network's snapshot for a plan and combine the results.
+
+    A plan can be served by multiple networks/sources at once, each with its own
+    snapshot. We query each independently with the caller's filters/sort, then
+    re-sort the union on the same key (so the merged page is globally ordered,
+    not network-blocked) and slice to the requested window. Items are *unioned,
+    not deduplicated*: a provider present in two networks is genuinely two priced
+    options (rates are network-specific), and a procedure priced in only one
+    network has no overlap to collapse. Each item is tagged with the originating
+    network (``source_key``) so a combined result stays attributable.
+    """
+    # Pull enough from each network to fill the requested page after the merge:
+    # the global window [offset, offset+limit) could be satisfied entirely by a
+    # single network, so fetch (offset+limit) rows from each, merge, then slice.
+    fetch_count = max(1, int(pagination.offset) + int(pagination.limit))
+    sub_pagination = PaginationParams(
+        page=1,
+        limit=fetch_count,
+        offset=0,
+        source=getattr(pagination, "source", "page"),
+    )
+
+    combined: list[dict[str, Any]] = []
+    total = 0
+    base_query: dict[str, Any] | None = None
+    matched_networks: list[dict[str, str]] = []
+    for source_key, snapshot_id in network_snapshots:
+        payload = await _search_one_ptg2_snapshot(session, snapshot_id, args, sub_pagination)
+        if not payload:
+            continue
+        if base_query is None:
+            base_query = dict(payload.get("query") or {})
+        page_info = payload.get("pagination") or {}
+        try:
+            total += int(page_info.get("total") or 0)
+        except (TypeError, ValueError):
+            pass
+        items = payload.get("items") or []
+        if items:
+            matched_networks.append({"source_key": source_key, "snapshot_id": snapshot_id})
+        for item in items:
+            # Copy before tagging -- payload items may come from the response
+            # cache and must not be mutated in place.
+            tagged = dict(item)
+            if source_key:
+                tagged.setdefault("network", source_key)
+            combined.append(tagged)
+
+    if base_query is None:
+        # No network produced a payload (e.g. none materialized) -- behave like
+        # the single-snapshot path returning no match.
+        return None
+
+    combined = _sort_ptg2_manifest_provider_items(
+        combined,
+        args,
+        location_filter_requested=_ptg2_location_filter_requested(args),
+    )
+    start = max(int(pagination.offset), 0)
+    end = start + max(int(pagination.limit), 0)
+    page_items = combined[start:end]
+
+    query = dict(base_query)
+    query["snapshot_id"] = None
+    query["snapshots"] = [snapshot_id for _, snapshot_id in network_snapshots]
+    query["networks"] = matched_networks
+    query["combined"] = True
+
+    return {
+        "items": page_items,
+        "pagination": {
+            "total": total,
+            "limit": pagination.limit,
+            "offset": pagination.offset,
+            "page": (pagination.offset // pagination.limit) + 1 if pagination.limit else 1,
+        },
+        "query": query,
+    }
+
+
+async def search_current_ptg2_index(session, args: dict[str, Any], pagination) -> dict[str, Any] | None:
+    explicit_snapshot = str(args.get("snapshot_id") or "").strip()
+    explicit_source = str(args.get("source_key") or "").strip()
+    plan_scoped = bool(str(args.get("plan_id") or args.get("plan_external_id") or "").strip())
+    # Plan-scoped queries with no pinned snapshot/network fan out across every
+    # network in the plan (a plan can be served by multiple networks, each with
+    # its own snapshot) and combine results. A pinned snapshot_id or source_key,
+    # or a non-plan query, stays on the original single-snapshot path untouched.
+    if plan_scoped and not explicit_snapshot and not explicit_source:
+        network_snapshots = await current_source_snapshot_ids_for_plan(session, args)
+        if len(network_snapshots) > 1:
+            return await _search_multi_ptg2_snapshots(session, network_snapshots, args, pagination)
+        if len(network_snapshots) == 1:
+            return await _search_one_ptg2_snapshot(
+                session, network_snapshots[0][1], args, pagination
+            )
+        # No per-network snapshot resolved -> fall through to global current.
+    snapshot_id = await resolve_current_ptg2_snapshot_id(session, args)
+    if not snapshot_id:
+        return None
+    return await _search_one_ptg2_snapshot(session, snapshot_id, args, pagination)
