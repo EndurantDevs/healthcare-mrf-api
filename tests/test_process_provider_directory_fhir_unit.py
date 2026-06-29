@@ -13,6 +13,7 @@ from sqlalchemy.dialects import postgresql
 
 from db.models import (
     ProviderDirectoryCapability,
+    ProviderDirectoryCanonicalResource,
     ProviderDirectoryEndpoint,
     ProviderDirectoryInsurancePlan,
     ProviderDirectoryLocation,
@@ -21,6 +22,7 @@ from db.models import (
     ProviderDirectoryOrganizationAffiliation,
     ProviderDirectoryPractitionerRole,
     ProviderDirectorySource,
+    ProviderDirectorySourceResource,
 )
 from scripts.research import provider_directory_fhir_harness as harness
 
@@ -304,6 +306,68 @@ async def test_upsert_resource_rows_tracks_seen_and_skips_unchanged(monkeypatch)
     assert written == 1
     assert seen_calls == [(ProviderDirectoryLocation, rows, "run_1", {"seen_table": None})]
     assert upsert_calls == [(ProviderDirectoryLocation, rows, {"skip_unchanged": True})]
+
+
+@pytest.mark.asyncio
+async def test_upsert_resource_rows_writes_canonical_resource_and_source_edges(monkeypatch):
+    seen_calls = []
+    upsert_calls = []
+
+    async def fake_mark_seen(model, rows, run_id, **kwargs):
+        seen_calls.append((model, rows, run_id, kwargs))
+        return len(rows)
+
+    async def fake_upsert(model, rows, **kwargs):
+        upsert_calls.append((model, rows, kwargs))
+        return len(rows)
+
+    monkeypatch.setattr(importer, "_mark_resource_rows_seen", fake_mark_seen)
+    monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
+
+    rows = [
+        {
+            "source_id": "source_a",
+            "resource_id": "loc-1",
+            "resource_url": "https://payer.example/fhir/Location/loc-1",
+            "name": "Clinic",
+            "last_seen_run_id": "run_1",
+        },
+        {
+            "source_id": "source_b",
+            "resource_id": "loc-1",
+            "resource_url": "https://payer.example/fhir/Location/loc-1",
+            "name": "Clinic",
+            "last_seen_run_id": "run_1",
+        },
+    ]
+
+    written = await importer._upsert_resource_rows(  # pylint: disable=protected-access
+        ProviderDirectoryLocation,
+        rows,
+        run_id="run_1",
+        track_seen=True,
+        canonical_api_base="https://payer.example/fhir/",
+        source_ids=["source_a", "source_b"],
+    )
+
+    assert written == 2
+    canonical_call = upsert_calls[0]
+    assert canonical_call[0] is ProviderDirectoryCanonicalResource
+    assert canonical_call[2] == {"skip_unchanged": True}
+    assert len(canonical_call[1]) == 1
+    assert canonical_call[1][0]["canonical_api_base"] == "https://payer.example/fhir"
+    assert canonical_call[1][0]["resource_type"] == "Location"
+    assert canonical_call[1][0]["resource_id"] == "loc-1"
+    assert canonical_call[1][0]["payload_json"]["name"] == "Clinic"
+    assert canonical_call[1][0]["payload_hash"]
+
+    edge_call = upsert_calls[1]
+    assert edge_call[0] is ProviderDirectorySourceResource
+    assert sorted(row["source_id"] for row in edge_call[1]) == ["source_a", "source_b"]
+    assert {row["resource_id"] for row in edge_call[1]} == {"loc-1"}
+
+    assert upsert_calls[2] == (ProviderDirectoryLocation, rows, {"skip_unchanged": True})
+    assert seen_calls == [(ProviderDirectoryLocation, rows, "run_1", {"seen_table": None})]
 
 
 @pytest.mark.asyncio
@@ -2116,8 +2180,9 @@ async def test_import_resources_fetches_duplicate_base_once_and_fans_out_rows(mo
             next_url_remaining=False,
         )
 
-    async def fake_upsert(_model, rows, **_kwargs):
-        upserted_source_ids.extend(row["source_id"] for row in rows)
+    async def fake_upsert(model, rows, **_kwargs):
+        if model is ProviderDirectoryLocation:
+            upserted_source_ids.extend(row["source_id"] for row in rows)
         return len(rows)
 
     monkeypatch.setattr(importer, "_fetch_resource_rows", fake_fetch_resource_rows)

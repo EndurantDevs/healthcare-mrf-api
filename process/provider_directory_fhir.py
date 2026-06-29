@@ -22,13 +22,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from sqlalchemy import case, or_
+from sqlalchemy import case, func, or_
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.sql.sqltypes import JSON as SQLAlchemyJSON
 
 from db.models import (
     ProviderDirectoryCapability,
+    ProviderDirectoryCanonicalResource,
     ProviderDirectoryEndpoint,
     ProviderDirectoryHealthcareService,
     ProviderDirectoryInsurancePlan,
@@ -38,6 +39,7 @@ from db.models import (
     ProviderDirectoryPractitioner,
     ProviderDirectoryPractitionerRole,
     ProviderDirectorySource,
+    ProviderDirectorySourceResource,
     db,
 )
 from process.control_lifecycle import mark_control_run
@@ -147,6 +149,10 @@ SOURCE_MODELS = (
     ProviderDirectoryHealthcareService,
     ProviderDirectoryOrganizationAffiliation,
     ProviderDirectoryEndpoint,
+)
+CANONICAL_RESOURCE_MODELS = (
+    ProviderDirectoryCanonicalResource,
+    ProviderDirectorySourceResource,
 )
 USER_AGENT = os.getenv(
     "HLTHPRT_PROVIDER_DIRECTORY_USER_AGENT",
@@ -2326,9 +2332,9 @@ async def publish_provider_directory_ptg_address_corroboration_if_available(
 async def _ensure_provider_directory_tables() -> None:
     schema = _schema()
     await db.status(f"CREATE SCHEMA IF NOT EXISTS {_q(schema)};")
-    for model in SOURCE_MODELS:
+    for model in (*SOURCE_MODELS, *CANONICAL_RESOURCE_MODELS):
         await db.create_table(model.__table__, checkfirst=True)
-    for model in SOURCE_MODELS:
+    for model in (*SOURCE_MODELS, *CANONICAL_RESOURCE_MODELS):
         for index in getattr(model, "__my_additional_indexes__", []) or []:
             name = index.get("name") or "_".join(index.get("index_elements", ()))
             using = f"USING {index.get('using')} " if index.get("using") else ""
@@ -2566,12 +2572,16 @@ def _location_address_key_update_sql(
 
 def _effective_update_expression(table, statement, column: str):
     excluded_value = getattr(statement.excluded, column)
+    if table.name == ProviderDirectoryCanonicalResource.__tablename__ and column == "first_seen_run_id":
+        return func.coalesce(table.c.first_seen_run_id, excluded_value)
     if column == "address_key" and _preserve_null_location_address_key(table):
         return _location_address_key_update_expression(table, statement.excluded)
     return excluded_value
 
 
 def _effective_update_sql(table, column: str, *, target_prefix: str, incoming_prefix: str) -> str:
+    if table.name == ProviderDirectoryCanonicalResource.__tablename__ and column == "first_seen_run_id":
+        return f"COALESCE({target_prefix}.{_q(column)}, {incoming_prefix}.{_q(column)})"
     if column == "address_key" and _preserve_null_location_address_key(table):
         return _location_address_key_update_sql(
             target_prefix=target_prefix,
@@ -2699,6 +2709,89 @@ async def _clear_resource_rows_seen(run_id: str | None) -> int:
         )
         or 0
     )
+
+
+def _canonical_resource_payload(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in row.items()
+        if key
+        not in {
+            "source_id",
+            "last_seen_run_id",
+            "observed_at",
+            "updated_at",
+        }
+    }
+
+
+def _canonical_resource_rows(
+    model,
+    rows: list[dict[str, Any]],
+    *,
+    canonical_api_base: str | None,
+    run_id: str | None,
+) -> list[dict[str, Any]]:
+    resource_type = RESOURCE_TYPES_BY_MODEL.get(model)
+    api_base = _canonical_base(canonical_api_base)
+    if not resource_type or not api_base:
+        return []
+    seen: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        resource_id = _clean_text(row.get("resource_id"))
+        if not resource_id:
+            continue
+        payload = _canonical_resource_payload(row)
+        payload_hash = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, default=_json_default).encode("utf-8")
+        ).hexdigest()
+        observed_at = row.get("observed_at") or _now()
+        seen[resource_id] = {
+            "canonical_api_base": api_base,
+            "resource_type": resource_type,
+            "resource_id": resource_id,
+            "resource_url": row.get("resource_url"),
+            "payload_hash": payload_hash,
+            "payload_json": payload,
+            "first_seen_run_id": run_id,
+            "last_seen_run_id": run_id,
+            "observed_at": observed_at,
+            "updated_at": row.get("updated_at") or observed_at,
+        }
+    return list(seen.values())
+
+
+def _source_resource_edge_rows(
+    model,
+    rows: list[dict[str, Any]],
+    *,
+    canonical_api_base: str | None,
+    source_ids: list[str],
+    run_id: str | None,
+) -> list[dict[str, Any]]:
+    resource_type = RESOURCE_TYPES_BY_MODEL.get(model)
+    api_base = _canonical_base(canonical_api_base)
+    if not resource_type or not api_base or not source_ids:
+        return []
+    resource_ids = {
+        resource_id
+        for row in rows
+        if (resource_id := _clean_text(row.get("resource_id")))
+    }
+    observed_at = _now()
+    return [
+        {
+            "source_id": source_id,
+            "canonical_api_base": api_base,
+            "resource_type": resource_type,
+            "resource_id": resource_id,
+            "last_seen_run_id": run_id,
+            "observed_at": observed_at,
+            "updated_at": observed_at,
+        }
+        for source_id in source_ids
+        for resource_id in sorted(resource_ids)
+    ]
 
 
 def _upsert_changed_row_predicate(table, statement, columns: list[str], primary_keys: list[str]):
@@ -3690,9 +3783,37 @@ async def _upsert_resource_rows(
     run_id: str | None,
     track_seen: bool,
     seen_table: str | None = None,
+    canonical_api_base: str | None = None,
+    source_ids: list[str] | None = None,
 ) -> int:
     if not rows:
         return 0
+    if canonical_api_base and source_ids:
+        canonical_rows = _canonical_resource_rows(
+            model,
+            rows,
+            canonical_api_base=canonical_api_base,
+            run_id=run_id,
+        )
+        if canonical_rows:
+            await _upsert_rows(
+                ProviderDirectoryCanonicalResource,
+                canonical_rows,
+                skip_unchanged=track_seen and bool(run_id),
+            )
+        edge_rows = _source_resource_edge_rows(
+            model,
+            rows,
+            canonical_api_base=canonical_api_base,
+            source_ids=source_ids,
+            run_id=run_id,
+        )
+        if edge_rows:
+            await _upsert_rows(
+                ProviderDirectorySourceResource,
+                edge_rows,
+                skip_unchanged=track_seen and bool(run_id),
+            )
     if track_seen:
         await _mark_resource_rows_seen(model, rows, run_id, seen_table=seen_table)
     return await _upsert_rows(model, rows, skip_unchanged=track_seen and bool(run_id))
@@ -4037,6 +4158,8 @@ async def _import_alohr_graphql_source_group(
             run_id=run_id,
             track_seen=stale_cleanup,
             seen_table=seen_table,
+            canonical_api_base=source_group[0].get("canonical_api_base") or source_group[0].get("api_base"),
+            source_ids=source_ids,
         )
         source_counts[resource_type] = source_counts.get(resource_type, 0) + written
         if resource_type in diagnostics:
@@ -4174,6 +4297,8 @@ async def _import_resources(
                     run_id=run_id,
                     track_seen=stale_cleanup,
                     seen_table=seen_stage_table,
+                    canonical_api_base=source.get("canonical_api_base") or source.get("api_base"),
+                    source_ids=source_ids,
                 )
                 await maybe_report_partial_progress(group_key, resource_type, written)
                 return written
@@ -4206,6 +4331,8 @@ async def _import_resources(
                     run_id=run_id,
                     track_seen=stale_cleanup,
                     seen_table=seen_stage_table,
+                    canonical_api_base=source.get("canonical_api_base") or source.get("api_base"),
+                    source_ids=source_ids,
                 )
             )
             source_counts[resource_type] += written_total

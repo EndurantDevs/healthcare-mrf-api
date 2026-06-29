@@ -21,6 +21,7 @@ __all__ = (
     "PartDImportRun",
     "PartDFormularySnapshot",
     "ProviderDirectoryCapability",
+    "ProviderDirectoryCanonicalResource",
     "ProviderDirectoryEndpoint",
     "ProviderDirectoryHealthcareService",
     "ProviderDirectoryInsurancePlan",
@@ -30,6 +31,7 @@ __all__ = (
     "ProviderDirectoryPractitioner",
     "ProviderDirectoryPractitionerRole",
     "ProviderDirectorySource",
+    "ProviderDirectorySourceResource",
 )
 
 
@@ -714,6 +716,60 @@ class ProviderDirectoryEndpoint(Base, JSONOutputMixin):
     payload_mime_types = Column(JSON)
     address = Column(TEXT)
     header = Column(JSON)
+    last_seen_run_id = Column(String(64))
+    observed_at = Column(TIMESTAMP)
+    updated_at = Column(TIMESTAMP)
+
+
+class ProviderDirectoryCanonicalResource(Base, JSONOutputMixin):
+    __tablename__ = "provider_directory_canonical_resource"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("canonical_api_base", "resource_type", "resource_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["canonical_api_base", "resource_type", "resource_id"]
+    __my_additional_indexes__ = [
+        {
+            "index_elements": ("resource_type", "resource_id"),
+            "name": "provider_directory_canonical_resource_type_id_idx",
+        },
+        {"index_elements": ("payload_hash",), "name": "provider_directory_canonical_resource_hash_idx"},
+        {"index_elements": ("last_seen_run_id",), "name": "provider_directory_canonical_resource_run_idx"},
+    ]
+
+    canonical_api_base = Column(TEXT, nullable=False)
+    resource_type = Column(String(64), nullable=False)
+    resource_id = Column(String(256), nullable=False)
+    resource_url = Column(TEXT)
+    payload_hash = Column(String(64))
+    payload_json = Column(JSON)
+    first_seen_run_id = Column(String(64))
+    last_seen_run_id = Column(String(64))
+    observed_at = Column(TIMESTAMP)
+    updated_at = Column(TIMESTAMP)
+
+
+class ProviderDirectorySourceResource(Base, JSONOutputMixin):
+    __tablename__ = "provider_directory_source_resource"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("source_id", "resource_type", "resource_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["source_id", "resource_type", "resource_id"]
+    __my_additional_indexes__ = [
+        {
+            "index_elements": ("canonical_api_base", "resource_type", "resource_id"),
+            "name": "provider_directory_source_resource_canonical_idx",
+        },
+        {"index_elements": ("last_seen_run_id",), "name": "provider_directory_source_resource_run_idx"},
+    ]
+
+    source_id = Column(String(64), nullable=False)
+    canonical_api_base = Column(TEXT, nullable=False)
+    resource_type = Column(String(64), nullable=False)
+    resource_id = Column(String(256), nullable=False)
     last_seen_run_id = Column(String(64))
     observed_at = Column(TIMESTAMP)
     updated_at = Column(TIMESTAMP)
