@@ -120,13 +120,13 @@ RESOURCE_ENDPOINT_FIELDS = {
 PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW = "provider_directory_address_corroboration"
 PROVIDER_DIRECTORY_IMPORT_SEEN_TABLE = "provider_directory_import_seen"
 PROVIDER_DIRECTORY_IMPORT_SEEN_STAGE_PREFIX = "provider_directory_import_seen_stage"
-PTG_PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_INDEXES = (
-    "pd_ptg_corrob_lookup_idx",
-    "pd_ptg_corrob_active_lookup_idx",
-    "pd_ptg_corrob_source_snapshot_idx",
-    "pd_ptg_corrob_plan_pair_idx",
-    "pd_ptg_corrob_pd_source_idx",
-    "pd_ptg_corrob_network_names_gin",
+PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_INDEXES = (
+    "pd_price_addr_corrob_lookup_idx",
+    "pd_price_addr_corrob_active_lookup_idx",
+    "pd_price_addr_corrob_source_snapshot_idx",
+    "pd_price_addr_corrob_plan_pair_idx",
+    "pd_price_addr_corrob_pd_source_idx",
+    "pd_price_addr_corrob_network_names_gin",
 )
 PROVIDER_DIRECTORY_ADDRESS_ARCHIVE_SOURCE_BIT = 128
 PROVIDER_DIRECTORY_ADDRESS_ARCHIVE_PRIORITY = 6
@@ -2123,28 +2123,28 @@ async def _create_provider_directory_address_corroboration_indexes(
     table_ref = _qt(schema, table_name)
     statements = (
         f"""
-        CREATE INDEX IF NOT EXISTS {_qt(schema, "pd_ptg_corrob_lookup_idx")}
+        CREATE INDEX IF NOT EXISTS {_qt(schema, "pd_price_addr_corrob_lookup_idx")}
             ON {table_ref} (npi, address_key);
         """,
         f"""
-        CREATE INDEX IF NOT EXISTS {_qt(schema, "pd_ptg_corrob_active_lookup_idx")}
+        CREATE INDEX IF NOT EXISTS {_qt(schema, "pd_price_addr_corrob_active_lookup_idx")}
             ON {table_ref} (npi, address_key, provider_directory_observed_at DESC NULLS LAST)
             WHERE provider_directory_active_match IS TRUE;
         """,
         f"""
-        CREATE INDEX IF NOT EXISTS {_qt(schema, "pd_ptg_corrob_source_snapshot_idx")}
+        CREATE INDEX IF NOT EXISTS {_qt(schema, "pd_price_addr_corrob_source_snapshot_idx")}
             ON {table_ref} (source_key, snapshot_id);
         """,
         f"""
-        CREATE INDEX IF NOT EXISTS {_qt(schema, "pd_ptg_corrob_plan_pair_idx")}
+        CREATE INDEX IF NOT EXISTS {_qt(schema, "pd_price_addr_corrob_plan_pair_idx")}
             ON {table_ref} (snapshot_id, plan_id, ptg_plan_id);
         """,
         f"""
-        CREATE INDEX IF NOT EXISTS {_qt(schema, "pd_ptg_corrob_pd_source_idx")}
+        CREATE INDEX IF NOT EXISTS {_qt(schema, "pd_price_addr_corrob_pd_source_idx")}
             ON {table_ref} (provider_directory_source_id);
         """,
         f"""
-        CREATE INDEX IF NOT EXISTS {_qt(schema, "pd_ptg_corrob_network_names_gin")}
+        CREATE INDEX IF NOT EXISTS {_qt(schema, "pd_price_addr_corrob_network_names_gin")}
             ON {table_ref} USING gin (provider_directory_network_names);
         """,
     )

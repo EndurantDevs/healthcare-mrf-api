@@ -327,7 +327,7 @@ PTG2_AUTO_ADDRESS_REFRESH_PUBLISH_ENV = "HLTHPRT_PTG2_AUTO_ADDRESS_REFRESH_PUBLI
 def _ptg2_auto_address_refresh_enabled(*, test_mode: bool) -> tuple[bool, str | None]:
     # PTG/TiC files do not carry authoritative provider locations. Address
     # refreshes are now owned by address-bearing sources and the unified address
-    # importer, so PTG imports should not rebuild a synthetic PTG address layer by
+    # importer, so PTG imports should not rebuild a synthetic pricing address layer by
     # default. Keep the env gate for one-off operator-triggered unified refreshes.
     if not _env_bool(PTG2_AUTO_ADDRESS_REFRESH_ENV, False):
         return False, "disabled"
@@ -404,7 +404,7 @@ async def _enqueue_ptg2_auto_address_refresh_after_import(
             "params": payload["params"],
         }
     except Exception as exc:
-        logger.exception("Failed to enqueue PTG address refresh after PTG import %s", import_run_id)
+        logger.exception("Failed to enqueue pricing address refresh after PTG import %s", import_run_id)
         return {
             "status": "enqueue_failed",
             "error": str(exc),

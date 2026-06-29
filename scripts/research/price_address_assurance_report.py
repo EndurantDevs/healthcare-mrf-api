@@ -119,7 +119,7 @@ def parse_args() -> argparse.Namespace:
         "--require-network-bound-address",
         action="store_true",
         help=(
-            "Fail when a displayed PTG address is only inferred from provider identity. "
+            "Fail when a displayed pricing address is only inferred from provider identity. "
             "Use this for member-facing exact-office assurance; it requires payer-confirmed "
             "location evidence or payer Provider Directory plan/network corroboration, plus retained "
             "network_names and source_trace.source_file_version_id."

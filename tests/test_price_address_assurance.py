@@ -489,7 +489,7 @@ def test_price_address_assurance_rejects_unknown_evidence_for_displayed_address(
     assert {
         "severity": "error",
         "item_index": 0,
-        "message": "address_evidence_level=unknown is not sufficient for a displayed PTG address",
+        "message": "address_evidence_level=unknown is not sufficient for a displayed pricing address",
     } in summary["issues"]
 
 
@@ -1000,7 +1000,7 @@ def test_price_address_assurance_can_require_network_bound_address():
     assert {
         "severity": "error",
         "item_index": 0,
-        "message": "displayed PTG address is not network-bound to the priced plan or network",
+        "message": "displayed pricing address is not network-bound to the priced plan or network",
     } in report["api_payload"]["issues"]
     assert report["api_payload"]["network_bound_address_rows"] == 0
 

@@ -59,7 +59,7 @@ to payer-directory corroboration. The helper
 - FHIR `provider_directory_location.address_key` to unified
   `entity_address_unified.address_key`.
 
-The importer can publish `ptg_provider_directory_address_corroboration` as an
+The importer can publish `provider_directory_address_corroboration` as an
 unlogged table during artifact publishing when `publish_corroboration=true`,
 `--publish-corroboration`, or `HLTHPRT_PROVIDER_DIRECTORY_PUBLISH_CORROBORATION=1`
 is set. This pays the expensive FHIR/unified-address join once after a full
@@ -331,15 +331,9 @@ the API pod; run the full audit from the dev host or a dedicated worker context.
 
 ```bash
 sudo k3s kubectl -n healthporta-dev exec -i deploy/healthcare-mrf-api -- \
-  /opt/venv/bin/python - --schema mrf --format markdown \
+  venv/bin/python - --schema mrf --format markdown \
+  --pod-safe \
   --statement-timeout-ms 30000 \
-  --skip-unified \
-  --skip-ptg \
-  --skip-network-resolution \
-  --skip-top-source-yield \
-  --skip-advertised-resource-gaps \
-  --skip-valid-zero-row-sources \
-  --skip-canonical-resource-summary \
   < scripts/research/provider_directory_coverage_audit.py
 ```
 
@@ -360,7 +354,7 @@ signals:
 - `valid_non_fhir` sources should be reviewed as source-catalog cleanup or
   payer-specific endpoint discovery work.
 - Provider Directory rows without `address_key` are not usable for canonical
-  address search or PTG address corroboration.
+  address search or pricing address corroboration.
 - unresolved network refs mean the payer exposed a network reference but the
   imported FHIR resources did not resolve it to an `Organization` name/alias.
 - PTG rows with Provider Directory network refs but no resolved network-name

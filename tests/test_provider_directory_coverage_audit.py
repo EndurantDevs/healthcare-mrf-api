@@ -49,6 +49,19 @@ def test_provider_directory_coverage_audit_parse_args_accepts_pod_safe_skip_flag
     assert args.statement_timeout_ms == 5000
 
 
+def test_provider_directory_coverage_audit_pod_safe_sets_expensive_skip_flags():
+    args = audit.parse_args(["--pod-safe"])
+
+    assert args.pod_safe is True
+    assert args.skip_unified is True
+    assert args.skip_ptg is True
+    assert args.skip_network_resolution is True
+    assert args.skip_top_source_yield is True
+    assert args.skip_advertised_resource_gaps is True
+    assert args.skip_valid_zero_row_sources is True
+    assert args.skip_canonical_resource_summary is True
+
+
 def test_provider_directory_coverage_audit_skipped_ptg_summary_shape():
     summary = audit._skipped_ptg_summary()
 

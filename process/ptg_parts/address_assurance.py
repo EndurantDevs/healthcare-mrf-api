@@ -363,7 +363,7 @@ def validate_ptg_price_address_item(
     if evidence_level not in ALLOWED_ADDRESS_EVIDENCE_LEVELS:
         issues.append(_issue(f"invalid address_evidence_level={evidence_level!r}", index=index))
     elif evidence_level == "unknown" and require_displayed_address:
-        issues.append(_issue("address_evidence_level=unknown is not sufficient for a displayed PTG address", index=index))
+        issues.append(_issue("address_evidence_level=unknown is not sufficient for a displayed pricing address", index=index))
     if not isinstance(requires_confirmation, bool):
         issues.append(_issue("requires_location_confirmation must be boolean", index=index))
     if not isinstance(displayed_address_present, bool):
@@ -445,17 +445,17 @@ def validate_ptg_price_address_item(
     ):
         issues.append(
             _issue(
-                "displayed PTG address is not network-bound to the priced plan or network",
+                "displayed pricing address is not network-bound to the priced plan or network",
                 index=index,
             )
         )
     if not require_displayed_address and displayed_address_present is False and not has_address:
         if address_binding != "inferred_from_provider_identity":
-            issues.append(_issue("no-address PTG rows must keep address_network_binding='inferred_from_provider_identity'", index=index))
+            issues.append(_issue("no-address pricing rows must keep address_network_binding='inferred_from_provider_identity'", index=index))
         if evidence_level != "unknown":
-            issues.append(_issue("no-address PTG rows must use address_evidence_level='unknown'", index=index))
+            issues.append(_issue("no-address pricing rows must use address_evidence_level='unknown'", index=index))
         if requires_confirmation is not True:
-            issues.append(_issue("no-address PTG rows must require location confirmation", index=index))
+            issues.append(_issue("no-address pricing rows must require location confirmation", index=index))
     if normalized_address_sources & {"ptg", "tic", "tic_provider_group"} and address_binding != "payer_confirmed_location":
         issues.append(_issue("PTG/TiC may not appear in address_sources unless the address is payer-confirmed", index=index))
 

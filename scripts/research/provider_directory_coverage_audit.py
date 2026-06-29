@@ -25,6 +25,7 @@ import json
 import os
 import re
 import sys
+import urllib.parse
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +60,8 @@ FHIR_ONBOARDING_GATEWAY_HOSTS = frozenset(
     }
 )
 FHIR_CREDENTIAL_AUTH_MARKERS = ("oauth", "api key", "bearer", "token", "client credential")
+PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV = "HLTHPRT_PROVIDER_DIRECTORY_CREDENTIALS_JSON"
+PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV = "HLTHPRT_PROVIDER_DIRECTORY_CREDENTIALS_FILE"
 
 
 def _env_int(name: str, default: int) -> int:
@@ -103,6 +106,13 @@ def _pct(numerator: int, denominator: int) -> float:
 
 def _int(value: Any) -> int:
     return int(value or 0)
+
+
+def _clean_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def _json_object(value: Any) -> dict[str, Any]:
@@ -158,6 +168,123 @@ def _markdown_cell(value: Any) -> str:
 
 def _network_name_key_sql(expr: str) -> str:
     return f"regexp_replace(lower(coalesce({expr}, '')), '[^a-z0-9]+', '', 'g')"
+
+
+def _mapping(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _canonical_base(api_base: Any) -> str | None:
+    text = _clean_text(api_base)
+    if not text or text.upper() == "N/A":
+        return None
+    parsed = urllib.parse.urlsplit(text)
+    if not parsed.scheme or not parsed.netloc:
+        return text.rstrip("/")
+    return urllib.parse.urlunsplit(
+        (parsed.scheme.lower(), parsed.netloc.lower(), parsed.path.rstrip("/"), "", "")
+    )
+
+
+def _load_credentials_config() -> dict[str, Any]:
+    config: dict[str, Any] = {}
+    path = _clean_text(os.getenv(PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV))
+    if path:
+        try:
+            payload = json.loads(Path(path).read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                config.update(payload)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            pass
+    raw = _clean_text(os.getenv(PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV))
+    if raw:
+        try:
+            payload = json.loads(raw)
+            if isinstance(payload, dict):
+                config.update(payload)
+        except json.JSONDecodeError:
+            pass
+    return config
+
+
+def _normalize_credential_key(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _merge_credential_spec(base: dict[str, Any], overlay: dict[str, Any], *, matched_by: str) -> dict[str, Any]:
+    merged = dict(base)
+    merged_headers = {**_mapping(base.get("headers")), **_mapping(overlay.get("headers"))}
+    merged_query = {
+        **_mapping(base.get("query")),
+        **_mapping(base.get("query_params")),
+        **_mapping(overlay.get("query")),
+        **_mapping(overlay.get("query_params")),
+    }
+    if merged_headers:
+        merged["headers"] = merged_headers
+    if merged_query:
+        merged["query_params"] = merged_query
+    for key in ("bearer_token", "api_key", "oauth2", "oauth", "enabled"):
+        if key in overlay:
+            merged[key] = overlay[key]
+    matched = list(merged.get("_matched_by") or [])
+    matched.append(matched_by)
+    merged["_matched_by"] = matched
+    return merged
+
+
+def _credential_spec_for_source(source: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    if not config:
+        return {}
+    spec: dict[str, Any] = {}
+    defaults = _mapping(config.get("defaults") or config.get("default"))
+    if defaults:
+        spec = _merge_credential_spec(spec, defaults, matched_by="defaults")
+
+    source_id = _clean_text(source.get("source_id"))
+    canonical_api_base = _canonical_base(source.get("api_base") or source.get("canonical_api_base"))
+    host = urllib.parse.urlsplit(canonical_api_base or "").netloc.lower()
+    org_name = _normalize_credential_key(source.get("org_name"))
+
+    hosts = _mapping(config.get("hosts"))
+    normalized_hosts = {str(key).lower(): key for key in hosts}
+    if host and host in normalized_hosts:
+        key = normalized_hosts[host]
+        spec = _merge_credential_spec(spec, _mapping(hosts.get(key)), matched_by=f"hosts:{host}")
+
+    api_bases = _mapping(config.get("api_bases") or config.get("apiBases"))
+    normalized_api_bases = {
+        _canonical_base(str(key)) or str(key).rstrip("/"): key
+        for key in api_bases
+    }
+    if canonical_api_base and canonical_api_base in normalized_api_bases:
+        key = normalized_api_bases[canonical_api_base]
+        spec = _merge_credential_spec(spec, _mapping(api_bases.get(key)), matched_by=f"api_bases:{canonical_api_base}")
+
+    org_names = _mapping(config.get("org_names") or config.get("orgNames"))
+    normalized_orgs = {_normalize_credential_key(key): key for key in org_names}
+    if org_name and org_name in normalized_orgs:
+        key = normalized_orgs[org_name]
+        spec = _merge_credential_spec(spec, _mapping(org_names.get(key)), matched_by=f"org_names:{org_name}")
+
+    sources = _mapping(config.get("sources"))
+    if source_id and source_id in sources:
+        spec = _merge_credential_spec(spec, _mapping(sources.get(source_id)), matched_by=f"sources:{source_id}")
+    if spec.get("enabled") is False:
+        return {}
+    return spec
+
+
+def _credential_spec_has_material(spec: dict[str, Any]) -> bool:
+    if not spec:
+        return False
+    if _mapping(spec.get("headers")) or _mapping(spec.get("query_params")):
+        return True
+    if spec.get("bearer_token") or spec.get("api_key"):
+        return True
+    if _mapping(spec.get("oauth2") or spec.get("oauth")):
+        return True
+    return False
 
 
 async def _connect(args: argparse.Namespace) -> asyncpg.Connection:
@@ -351,37 +478,85 @@ async def _credential_onboarding_backlog(
                         )
                     )
                 )
-        ),
-        ranked AS (
-            SELECT *,
-                   row_number() OVER (
-                       PARTITION BY source_host, last_probe_status, auth_type, reason
-                       ORDER BY lower(org_name), lower(coalesce(plan_name, '')), source_id
-                   ) AS sample_rank
-              FROM blocked
         )
-        SELECT coalesce(NULLIF(source_host, ''), '(missing host)') AS source_host,
+        SELECT source_id,
+               org_name,
+               plan_name,
+               canonical_api_base,
+               api_base,
+               portal_url,
+               coalesce(NULLIF(source_host, ''), '(missing host)') AS source_host,
                last_probe_status AS probe_status,
                auth_type,
-               reason,
-               count(*)::bigint AS source_count,
-               array_agg(
-                   concat_ws(' / ', org_name, NULLIF(plan_name, ''))
-                   ORDER BY lower(org_name), lower(coalesce(plan_name, '')), source_id
-               ) FILTER (WHERE sample_rank <= $1)::varchar[] AS sample_payers
-          FROM ranked
-         GROUP BY source_host, last_probe_status, auth_type, reason
-         ORDER BY count(*) DESC, source_host, last_probe_status, auth_type, reason
-         LIMIT 50
-        """,
-        sample_limit,
+               reason
+          FROM blocked
+         ORDER BY lower(org_name), lower(coalesce(plan_name, '')), source_id
+        """
     )
-    groups = [dict(row) for row in rows]
-    for group in groups:
-        group["sample_payers"] = _list(group.get("sample_payers"))
+    config = _load_credentials_config()
+    groups_by_key: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    configured_source_count = 0
+    missing_source_count = 0
+    for row in rows:
+        item = dict(row)
+        key = (
+            str(item.get("source_host") or "(missing host)"),
+            str(item.get("probe_status") or ""),
+            str(item.get("auth_type") or ""),
+            str(item.get("reason") or ""),
+        )
+        group = groups_by_key.setdefault(
+            key,
+            {
+                "source_host": key[0],
+                "probe_status": key[1],
+                "auth_type": key[2],
+                "reason": key[3],
+                "source_count": 0,
+                "credential_configured_source_count": 0,
+                "credential_config_missing_source_count": 0,
+                "sample_payers": [],
+                "sample_missing_credential_payers": [],
+            },
+        )
+        payer_label = " / ".join(
+            part
+            for part in (
+                _clean_text(item.get("org_name")),
+                _clean_text(item.get("plan_name")),
+            )
+            if part
+        )
+        group["source_count"] += 1
+        if len(group["sample_payers"]) < sample_limit:
+            group["sample_payers"].append(payer_label or item.get("source_id"))
+
+        spec = _credential_spec_for_source(item, config)
+        if _credential_spec_has_material(spec):
+            configured_source_count += 1
+            group["credential_configured_source_count"] += 1
+        else:
+            missing_source_count += 1
+            group["credential_config_missing_source_count"] += 1
+            if len(group["sample_missing_credential_payers"]) < sample_limit:
+                group["sample_missing_credential_payers"].append(payer_label or item.get("source_id"))
+
+    groups = sorted(
+        groups_by_key.values(),
+        key=lambda group: (
+            -_int(group.get("source_count")),
+            str(group.get("source_host")),
+            str(group.get("probe_status")),
+            str(group.get("auth_type")),
+            str(group.get("reason")),
+        ),
+    )[:50]
     return {
         "available": True,
-        "blocked_source_count": sum(_int(group.get("source_count")) for group in groups),
+        "blocked_source_count": len(rows),
+        "credential_config_available": bool(config),
+        "credential_configured_source_count": configured_source_count,
+        "credential_config_missing_source_count": missing_source_count,
         "group_count": len(groups),
         "groups": groups,
     }
@@ -1284,6 +1459,11 @@ def _derive_gaps(report: dict[str, Any]) -> list[str]:
         gaps.append(
             f"{valid_zero_rows['source_count']} Provider Directory source(s) have valid metadata but no imported resource rows."
         )
+    credential_backlog = report.get("credential_onboarding_backlog") or {}
+    if credential_backlog.get("available") and _int(credential_backlog.get("credential_config_missing_source_count")):
+        gaps.append(
+            f"{credential_backlog['credential_config_missing_source_count']} Provider Directory auth/onboarding source(s) do not match a configured credential rule."
+        )
     advertised_gaps = report.get("advertised_resource_gap_summary") or {}
     if advertised_gaps.get("available") and _int(advertised_gaps.get("advertised_without_rows")):
         if _int(advertised_gaps.get("advertised_auth_blocked_without_rows")):
@@ -1461,6 +1641,11 @@ def render_markdown(report: dict[str, Any]) -> str:
         lines.append(
             f"- credential/onboarding backlog: `{credential_backlog.get('blocked_source_count')}` source(s) across `{credential_backlog.get('group_count')}` group(s)"
         )
+        lines.append(
+            f"- credential config coverage: `{credential_backlog.get('credential_configured_source_count')}` configured / "
+            f"`{credential_backlog.get('blocked_source_count')}` gated source(s); "
+            f"missing config `{credential_backlog.get('credential_config_missing_source_count')}`"
+        )
     if canonical_resources.get("available"):
         lines.append(
             f"- canonical resource storage: `{canonical_resources.get('canonical_rows')}` canonical row(s), "
@@ -1538,14 +1723,17 @@ def render_markdown(report: dict[str, Any]) -> str:
                 "",
                 "## Credential/Onboarding Backlog",
                 "",
-                "| Host | Status | Auth | Reason | Sources | Sample payers |",
-                "| --- | --- | --- | --- | ---: | --- |",
+                "| Host | Status | Auth | Reason | Sources | Configured | Missing Config | Sample payers | Sample missing credentials |",
+                "| --- | --- | --- | --- | ---: | ---: | ---: | --- | --- |",
             ]
         )
         for item in credential_backlog["groups"]:
             samples = ", ".join(_markdown_cell(payer) for payer in item.get("sample_payers") or [])
+            missing_samples = ", ".join(
+                _markdown_cell(payer) for payer in item.get("sample_missing_credential_payers") or []
+            )
             lines.append(
-                f"| `{_markdown_cell(item.get('source_host'))}` | `{_markdown_cell(item.get('probe_status'))}` | `{_markdown_cell(item.get('auth_type'))}` | `{_markdown_cell(item.get('reason'))}` | {item.get('source_count')} | {samples} |"
+                f"| `{_markdown_cell(item.get('source_host'))}` | `{_markdown_cell(item.get('probe_status'))}` | `{_markdown_cell(item.get('auth_type'))}` | `{_markdown_cell(item.get('reason'))}` | {item.get('source_count')} | {item.get('credential_configured_source_count')} | {item.get('credential_config_missing_source_count')} | {samples} | {missing_samples} |"
             )
     if ptg_network.get("samples"):
         lines.extend(
@@ -1688,6 +1876,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Optional PostgreSQL statement_timeout in milliseconds for each audit query.",
     )
     parser.add_argument(
+        "--pod-safe",
+        action="store_true",
+        help=(
+            "Run only source/capability/resource table checks that are safe to execute "
+            "inside the API pod during active imports. This enables the expensive-section "
+            "skip flags; use a full audit from a worker/dev host for unified, PTG, network, "
+            "advertised-resource, and canonical-resource aggregate checks."
+        ),
+    )
+    parser.add_argument(
         "--skip-unified",
         action="store_true",
         help="Skip entity_address_unified counts for pod-safe source/resource coverage checks.",
@@ -1700,7 +1898,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--skip-ptg",
         action="store_true",
-        help="Skip PTG address/corroboration scans for quick Provider Directory-only gates.",
+        help="Skip PTG pricing/corroboration scans for quick Provider Directory-only gates.",
     )
     parser.add_argument(
         "--skip-ptg-corroboration",
@@ -1738,7 +1936,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Skip canonical-resource/source-edge fan-out summary; this can be slow on dev-scale catalogs.",
     )
     parser.add_argument("--format", choices=("json", "markdown"), default="json")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.pod_safe:
+        args.skip_unified = True
+        args.skip_network_resolution = True
+        args.skip_ptg = True
+        args.skip_top_source_yield = True
+        args.skip_advertised_resource_gaps = True
+        args.skip_valid_zero_row_sources = True
+        args.skip_canonical_resource_summary = True
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:

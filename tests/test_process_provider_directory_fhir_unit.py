@@ -1406,8 +1406,8 @@ async def test_publish_provider_directory_address_corroboration_table_swaps_inde
         'ALTER TABLE "mrf"."pd_stage_corrob" RENAME TO "provider_directory_address_corroboration"'
         in joined
     )
-    assert '"mrf"."pd_ptg_corrob_lookup_idx"' in joined
-    assert '"mrf"."pd_ptg_corrob_network_names_gin"' in joined
+    assert '"mrf"."pd_price_addr_corrob_lookup_idx"' in joined
+    assert '"mrf"."pd_price_addr_corrob_network_names_gin"' in joined
     assert 'ANALYZE "mrf"."provider_directory_address_corroboration"' in joined
 
 
