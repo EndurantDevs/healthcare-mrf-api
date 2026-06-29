@@ -117,6 +117,37 @@ def _json_object(value: Any) -> dict[str, Any]:
     return {}
 
 
+def _resource_import_diagnostics(value: Any) -> dict[str, Any]:
+    payload = _json_object(value)
+    # Older rows stored the JSON payload as a JSON string inside json/jsonb.
+    if len(payload) == 1 and next(iter(payload), None) == "":
+        return {}
+    resources = payload.get("resources")
+    return resources if isinstance(resources, dict) else {}
+
+
+def _resource_diagnostic_error(resources: dict[str, Any], resource_type: str) -> str | None:
+    diagnostic = resources.get(resource_type)
+    if not isinstance(diagnostic, dict):
+        return None
+    error = diagnostic.get("error")
+    return str(error) if error else None
+
+
+def _is_resource_auth_error(error: str | None) -> bool:
+    return str(error or "").lower() in {"http_401", "http_403"}
+
+
+def _resource_error_counts(resources: dict[str, Any]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for diagnostic in resources.values():
+        if not isinstance(diagnostic, dict) or not diagnostic.get("error"):
+            continue
+        error = str(diagnostic["error"])
+        counts[error] = counts.get(error, 0) + 1
+    return counts
+
+
 def _list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else []
 
@@ -921,15 +952,60 @@ async def _advertised_resource_gap_summary(
                 resource_type,
                 sample_limit,
             )
+            missing_rows = await conn.fetch(
+                f"""
+                WITH advertised AS (
+                    SELECT DISTINCT source_id
+                      FROM {_qt(schema, "provider_directory_capability")} capability
+                     WHERE capability.probe_status = 'valid'
+                       AND EXISTS (
+                            SELECT 1
+                              FROM jsonb_array_elements_text(
+                                  COALESCE(capability.supported_resources::jsonb, '[]'::jsonb)
+                              ) AS supported(resource_type)
+                             WHERE supported.resource_type = $1
+                       )
+                ),
+                row_sources AS ({row_source_sql})
+                SELECT src.source_id,
+                       src.metadata_json->'last_resource_import' AS last_resource_import
+                  FROM advertised
+                  JOIN {_qt(schema, "provider_directory_source")} src
+                    ON src.source_id = advertised.source_id
+                 WHERE NOT EXISTS (
+                        SELECT 1
+                          FROM row_sources rows
+                         WHERE rows.source_id = advertised.source_id
+                   )
+                """,
+                resource_type,
+            )
+            auth_blocked_without_rows = 0
+            error_counts: dict[str, int] = {}
+            for missing in missing_rows:
+                diagnostics = _resource_import_diagnostics(missing["last_resource_import"])
+                error = _resource_diagnostic_error(diagnostics, resource_type)
+                if not error:
+                    continue
+                error_counts[error] = error_counts.get(error, 0) + 1
+                if _is_resource_auth_error(error):
+                    auth_blocked_without_rows += 1
+            item["resource_error_counts"] = error_counts
+            item["auth_blocked_without_rows_count"] = auth_blocked_without_rows
             item["samples"] = [dict(sample) for sample in samples]
             for sample in item["samples"]:
                 sample["last_resource_import"] = _json_object(sample.get("last_resource_import"))
         else:
+            item["resource_error_counts"] = {}
+            item["auth_blocked_without_rows_count"] = 0
             item["samples"] = []
         resources.append(item)
     totals = {
         "advertised_source_resources": sum(_int(item.get("advertised_source_count")) for item in resources),
         "advertised_without_rows": sum(_int(item.get("advertised_without_rows_count")) for item in resources),
+        "advertised_auth_blocked_without_rows": sum(
+            _int(item.get("auth_blocked_without_rows_count")) for item in resources
+        ),
     }
     totals["advertised_with_rows_pct"] = _pct(
         totals["advertised_source_resources"] - totals["advertised_without_rows"],
@@ -996,11 +1072,37 @@ async def _valid_sources_without_resource_rows(
         sample_limit,
     )
     samples = [dict(row) for row in rows]
+    auth_blocked_count = 0
+    error_counts: dict[str, int] = {}
+    count_rows = await conn.fetch(
+        f"""
+        WITH resource_sources AS ({resource_source_union})
+        SELECT src.metadata_json->'last_resource_import' AS last_resource_import
+          FROM {_qt(schema, "provider_directory_source")} src
+         WHERE src.last_probe_status = 'valid'
+           AND NOT EXISTS (
+                SELECT 1
+                  FROM resource_sources rows
+                 WHERE rows.source_id = src.source_id
+           )
+        """
+    )
+    for row in count_rows:
+        diagnostics = _resource_import_diagnostics(row["last_resource_import"])
+        source_auth_blocked = False
+        for error, error_count in _resource_error_counts(diagnostics).items():
+            error_counts[error] = error_counts.get(error, 0) + error_count
+            if _is_resource_auth_error(error):
+                source_auth_blocked = True
+        if source_auth_blocked:
+            auth_blocked_count += 1
     for sample in samples:
         sample["last_resource_import"] = _json_object(sample.get("last_resource_import"))
     return {
         "available": True,
         "source_count": _int(count),
+        "resource_auth_required_source_count": auth_blocked_count,
+        "resource_error_counts": error_counts,
         "samples": samples,
     }
 
@@ -1047,11 +1149,26 @@ def _derive_gaps(report: dict[str, Any]) -> list[str]:
         )
     valid_zero_rows = report.get("valid_sources_without_resource_rows") or {}
     if valid_zero_rows.get("available") and _int(valid_zero_rows.get("source_count")):
+        if _int(valid_zero_rows.get("resource_auth_required_source_count")):
+            gaps.append(
+                f"{valid_zero_rows['resource_auth_required_source_count']} Provider Directory source(s) have valid metadata but resource endpoints require auth."
+            )
         gaps.append(
-            f"{valid_zero_rows['source_count']} Provider Directory source(s) have valid unauthenticated metadata but no imported resource rows."
+            f"{valid_zero_rows['source_count']} Provider Directory source(s) have valid metadata but no imported resource rows."
         )
     advertised_gaps = report.get("advertised_resource_gap_summary") or {}
     if advertised_gaps.get("available") and _int(advertised_gaps.get("advertised_without_rows")):
+        if _int(advertised_gaps.get("advertised_auth_blocked_without_rows")):
+            auth_missing = [
+                f"{item['resource_type']}={item['auth_blocked_without_rows_count']}"
+                for item in advertised_gaps.get("resources", [])
+                if _int(item.get("auth_blocked_without_rows_count"))
+            ]
+            gaps.append(
+                "Provider Directory advertised-resource imports are auth-blocked after metadata success: "
+                + ", ".join(auth_missing)
+                + "."
+            )
         missing = [
             f"{item['resource_type']}={item['advertised_without_rows_count']}"
             for item in advertised_gaps.get("resources", [])
@@ -1238,7 +1355,8 @@ def render_markdown(report: dict[str, Any]) -> str:
     if advertised_gaps.get("available"):
         lines.append(
             f"- advertised resource/source gaps: `{advertised_gaps.get('advertised_without_rows')}` / `{advertised_gaps.get('advertised_source_resources')}` "
-            f"({advertised_gaps.get('advertised_with_rows_pct')}% with rows)"
+            f"({advertised_gaps.get('advertised_with_rows_pct')}% with rows); "
+            f"auth-blocked after metadata: `{advertised_gaps.get('advertised_auth_blocked_without_rows')}`"
         )
     elif advertised_gaps.get("skipped"):
         lines.append(f"- advertised resource/source gaps: skipped ({advertised_gaps.get('reason')})")
@@ -1297,20 +1415,30 @@ def render_markdown(report: dict[str, Any]) -> str:
                     "",
                     "## Advertised Resource Import Gaps",
                     "",
-                    "| Resource | Advertised Sources | Sources With Rows | Advertised Without Rows |",
-                    "| --- | ---: | ---: | ---: |",
+                    "| Resource | Advertised Sources | Sources With Rows | Advertised Without Rows | Auth-Blocked Without Rows | Resource Errors |",
+                    "| --- | ---: | ---: | ---: | ---: | --- |",
                 ]
             )
             for item in rows:
+                errors = ", ".join(
+                    f"{error}={count}"
+                    for error, count in sorted((item.get("resource_error_counts") or {}).items())
+                )
                 lines.append(
-                    f"| `{item.get('resource_type')}` | {item.get('advertised_source_count')} | {item.get('source_with_rows_count')} | {item.get('advertised_without_rows_count')} |"
+                    f"| `{item.get('resource_type')}` | {item.get('advertised_source_count')} | {item.get('source_with_rows_count')} | {item.get('advertised_without_rows_count')} | {item.get('auth_blocked_without_rows_count')} | `{errors}` |"
                 )
     valid_zero_rows = report.get("valid_sources_without_resource_rows") or {}
     if valid_zero_rows.get("samples"):
+        error_counts = ", ".join(
+            f"{error}={count}" for error, count in sorted((valid_zero_rows.get("resource_error_counts") or {}).items())
+        )
         lines.extend(
             [
                 "",
                 "## Valid Metadata With No Imported Rows",
+                "",
+                f"- resource-auth-required sources: `{valid_zero_rows.get('resource_auth_required_source_count')}` / `{valid_zero_rows.get('source_count')}`",
+                f"- resource error counts: `{error_counts}`",
                 "",
                 "| Source | Plan | Auth | API Base | Resource Errors |",
                 "| --- | --- | --- | --- | --- |",

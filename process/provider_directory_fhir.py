@@ -483,7 +483,15 @@ def _candidate_metadata_urls(source: dict[str, Any]) -> list[tuple[str, str]]:
 
 def _is_placeholder_url(value: str | None) -> bool:
     text = (value or "").strip()
-    return not text or text.upper() in {"N/A", "NA", "NONE", "NULL", "UNCONFIRMED", "TBD"}
+    if not text or text.upper() in {"N/A", "NA", "NONE", "NULL", "UNCONFIRMED", "TBD"}:
+        return True
+    lowered = text.lower()
+    return (
+        "may need query parameter" in lowered
+        or "http 400" in lowered
+        or "http 404" in lowered
+        or "not a direct endpoint" in lowered
+    )
 
 
 def _url_with_count(url: str, page_count: int) -> str:

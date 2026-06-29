@@ -1678,6 +1678,19 @@ def test_resource_start_url_resolves_relative_endpoint_and_adds_count():
     assert url == "https://example.test/fhir/base/Location?address-state=CA&_count=100"
 
 
+def test_resource_start_url_ignores_catalog_annotation_endpoint():
+    url = importer._resource_start_url(  # pylint: disable=protected-access
+        {
+            "api_base": "https://fhir.humana.com/api",
+            "endpoint_location": "/api/provider-directory/Location (HTTP 400 - may need query parameters)",
+        },
+        "Location",
+        page_count=100,
+    )
+
+    assert url == "https://fhir.humana.com/api/Location?_count=100"
+
+
 @pytest.mark.asyncio
 async def test_fetch_resource_rows_resolves_relative_next_links(monkeypatch):
     calls: list[str] = []

@@ -154,6 +154,40 @@ def test_provider_directory_coverage_audit_gaps_for_advertised_resource_without_
     ]
 
 
+def test_provider_directory_coverage_audit_gaps_for_resource_level_auth_blocks():
+    report = {
+        "valid_sources_without_resource_rows": {
+            "available": True,
+            "source_count": 3,
+            "resource_auth_required_source_count": 2,
+        },
+        "advertised_resource_gap_summary": {
+            "available": True,
+            "advertised_without_rows": 5,
+            "advertised_auth_blocked_without_rows": 4,
+            "resources": [
+                {
+                    "resource_type": "Location",
+                    "advertised_without_rows_count": 3,
+                    "auth_blocked_without_rows_count": 2,
+                },
+                {
+                    "resource_type": "Practitioner",
+                    "advertised_without_rows_count": 2,
+                    "auth_blocked_without_rows_count": 2,
+                },
+            ],
+        },
+    }
+
+    assert audit._derive_gaps(report) == [
+        "2 Provider Directory source(s) have valid metadata but resource endpoints require auth.",
+        "3 Provider Directory source(s) have valid metadata but no imported resource rows.",
+        "Provider Directory advertised-resource imports are auth-blocked after metadata success: Location=2, Practitioner=2.",
+        "Provider Directory advertised-resource imports have supported sources with zero rows: Location=3, Practitioner=2.",
+    ]
+
+
 def test_provider_directory_coverage_audit_gaps_for_non_fhir_credential_gateways():
     report = {
         "source_summary": {
@@ -281,6 +315,7 @@ def test_provider_directory_coverage_audit_markdown_includes_unified_source_id_a
             "advertised_resource_gap_summary": {
                 "available": True,
                 "advertised_without_rows": 2,
+                "advertised_auth_blocked_without_rows": 0,
                 "advertised_source_resources": 5,
                 "advertised_with_rows_pct": 60.0,
                 "resources": [
@@ -289,12 +324,16 @@ def test_provider_directory_coverage_audit_markdown_includes_unified_source_id_a
                         "advertised_source_count": 3,
                         "source_with_rows_count": 2,
                         "advertised_without_rows_count": 1,
+                        "auth_blocked_without_rows_count": 0,
+                        "resource_error_counts": {},
                     },
                     {
                         "resource_type": "Endpoint",
                         "advertised_source_count": 2,
                         "source_with_rows_count": 1,
                         "advertised_without_rows_count": 1,
+                        "auth_blocked_without_rows_count": 0,
+                        "resource_error_counts": {},
                     },
                 ],
             },
@@ -306,9 +345,9 @@ def test_provider_directory_coverage_audit_markdown_includes_unified_source_id_a
     assert "- credential/onboarding backlog: `592` source(s) across `2` group(s)" in markdown
     assert "- Provider Directory rows with country `001`: `0`" in markdown
     assert "- PTG corroboration: skipped (disabled by --skip-ptg)" in markdown
-    assert "- advertised resource/source gaps: `2` / `5` (60.0% with rows)" in markdown
+    assert "- advertised resource/source gaps: `2` / `5` (60.0% with rows); auth-blocked after metadata: `0`" in markdown
     assert "## Advertised Resource Import Gaps" in markdown
-    assert "| `Endpoint` | 2 | 1 | 1 |" in markdown
+    assert "| `Endpoint` | 2 | 1 | 1 | 0 | `` |" in markdown
     assert "## Credential/Onboarding Backlog" in markdown
     assert "| `apps.availity.com` | `valid_non_fhir` | `OAuth2/SMART` | `onboarding_gateway` | 263 | Aetna / Provider Directory, Availity payer |" in markdown
 
