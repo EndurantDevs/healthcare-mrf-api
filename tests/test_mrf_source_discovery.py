@@ -2242,6 +2242,7 @@ def test_import_control_snapshot_company_fallback_from_index_url():
         discovery._company_name_from_index_url("https://example.test/machinereadables/")
         is None
     )
+    assert discovery._company_name_from_index_url("https://example.test/MRFs/") is None
     assert (
         discovery._import_control_company_name(
             {"company_name": "Example Public TPA"}, "https://example.test/transparency/"
