@@ -3833,7 +3833,8 @@ paths:
           in: query
           schema:
             type: boolean
-          description: Internal diagnostics only. When true, returns PTG provider addresses that are not proven network-bound; default responses suppress them.
+            default: true
+          description: When true or omitted, returns best-known PTG provider addresses when available. Verified/network-bound addresses remain marked with address_verification.network_bound_address=true; inferred addresses are marked network_bound_address=false and requires_location_confirmation=true. Set false to suppress unverified address fields.
         - name: include_evidence
           in: query
           schema:

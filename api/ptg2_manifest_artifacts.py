@@ -435,7 +435,7 @@ def _strip_no_display_address_fields(item: dict[str, Any]) -> None:
 
 
 def _include_unverified_ptg_addresses(args: Mapping[str, Any]) -> bool:
-    return _request_bool(args.get("include_unverified_addresses"))
+    return _request_bool(args.get("include_unverified_addresses"), default=True)
 
 
 def _is_plan_scoped_ptg_request(args: Mapping[str, Any]) -> bool:
@@ -467,7 +467,7 @@ def _apply_ptg_address_display_policy(item: dict[str, Any], args: Mapping[str, A
         verification["requires_location_confirmation"] = True
         verification["reason"] = (
             "PTG proves the provider identity is in network, but the displayed address is not tied "
-            "to the priced plan or network; address and phone fields are suppressed by default."
+            "to the priced plan or network; address and phone fields are suppressed by request."
         )
     _strip_no_display_address_fields(item)
 

@@ -720,7 +720,7 @@ def _strip_no_display_address_fields(item: dict[str, Any]) -> None:
 
 
 def _include_unverified_ptg_addresses(args: Mapping[str, Any] | dict[str, Any]) -> bool:
-    return _request_bool(args.get("include_unverified_addresses"))
+    return _request_bool(args.get("include_unverified_addresses"), default=True)
 
 
 def _is_plan_scoped_ptg_request(args: Mapping[str, Any] | dict[str, Any]) -> bool:
@@ -736,7 +736,7 @@ def _is_plan_scoped_ptg_request(args: Mapping[str, Any] | dict[str, Any]) -> boo
 
 
 def _apply_ptg_address_display_policy(item: dict[str, Any], args: Mapping[str, Any] | dict[str, Any]) -> None:
-    """Default member-facing PTG responses hide addresses not tied to the priced network."""
+    """PTG responses display inferred addresses by default, unless the caller asks to suppress them."""
     verification = item.get("address_verification")
     if not isinstance(verification, dict):
         _strip_no_display_address_fields(item)
@@ -753,7 +753,7 @@ def _apply_ptg_address_display_policy(item: dict[str, Any], args: Mapping[str, A
         verification["requires_location_confirmation"] = True
         verification["reason"] = (
             "PTG proves the provider identity is in network, but the displayed address is not tied "
-            "to the priced plan or network; address and phone fields are suppressed by default."
+            "to the priced plan or network; address and phone fields are suppressed by request."
         )
     _strip_no_display_address_fields(item)
 
@@ -1787,6 +1787,16 @@ def _ptg2_provider_distance_sort_value(item: dict[str, Any]) -> float:
     return value if value is not None else math.inf
 
 
+def _ptg2_address_verification_sort_value(item: dict[str, Any]) -> int:
+    verification = item.get("address_verification")
+    if isinstance(verification, dict):
+        if verification.get("network_bound_address") is True:
+            return 0
+        if verification.get("displayed_address_present") is True:
+            return 1
+    return 2
+
+
 def _sort_ptg2_manifest_provider_items(
     items: list[dict[str, Any]],
     args: dict[str, Any],
@@ -1828,7 +1838,16 @@ def _sort_ptg2_manifest_provider_items(
             ),
             reverse=descending,
         )
-    return items
+    return sorted(
+        items,
+        key=lambda item: (
+            _ptg2_address_verification_sort_value(item),
+            _ptg2_provider_price_sort_value(item),
+            _ptg2_provider_distance_sort_value(item),
+            str(item.get("provider_name") or ""),
+            str(item.get("npi") or ""),
+        ),
+    )
 
 
 def _ptg2_manifest_provider_procedure_item(

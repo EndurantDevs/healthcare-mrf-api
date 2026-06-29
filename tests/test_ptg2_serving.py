@@ -2244,6 +2244,74 @@ def test_compact_item_with_displayable_address_passes_assurance_contract():
     assert summary["issues"] == []
 
 
+def test_compact_item_can_suppress_unverified_plan_address_when_requested():
+    item = ptg2_serving._compact_item_from_row(
+        {
+            "npi": 1234567890,
+            "provider_name": "Example Surgeon",
+            "location_source": "entity_address_unified",
+            "location_confidence_code": "entity_address_unified",
+            "address_payload": {
+                "first_line": "900 W Temple Ave",
+                "city": "Effingham",
+                "state": "IL",
+                "postal_code": "62401",
+                "address_sources": ["nppes"],
+            },
+            "network_names": ["C2"],
+            "prices": [],
+        },
+        {"plan_id": "010854205", "include_unverified_addresses": "false"},
+    )
+
+    assert item["address_verification"]["displayed_address_present"] is False
+    assert item["address_verification"]["network_bound_address"] is False
+    assert item["address_verification"]["requires_location_confirmation"] is True
+    assert "address" not in item
+    assert "phone" not in item
+
+
+def test_ptg2_default_sort_prioritizes_network_bound_addresses():
+    items = [
+        {
+            "provider_name": "No Address",
+            "npi": 3,
+            "address_verification": {
+                "displayed_address_present": False,
+                "network_bound_address": False,
+            },
+        },
+        {
+            "provider_name": "Inferred Address",
+            "npi": 2,
+            "address_verification": {
+                "displayed_address_present": True,
+                "network_bound_address": False,
+            },
+        },
+        {
+            "provider_name": "Verified Address",
+            "npi": 1,
+            "address_verification": {
+                "displayed_address_present": True,
+                "network_bound_address": True,
+            },
+        },
+    ]
+
+    sorted_items = ptg2_serving._sort_ptg2_manifest_provider_items(
+        items,
+        {},
+        location_filter_requested=False,
+    )
+
+    assert [item["provider_name"] for item in sorted_items] == [
+        "Verified Address",
+        "Inferred Address",
+        "No Address",
+    ]
+
+
 def test_manifest_provider_procedure_item_includes_address_verification():
     item = ptg2_serving._ptg2_manifest_provider_procedure_item(
         npi=1234567890,
