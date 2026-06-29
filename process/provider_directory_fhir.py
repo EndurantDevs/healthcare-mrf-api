@@ -3608,7 +3608,12 @@ def _bulk_export_start_url(source: dict[str, Any], resource_type: str) -> str | 
     api_base = _canonical_base(source.get("api_base"))
     if not api_base:
         return None
-    query = urllib.parse.urlencode({"_type": resource_type})
+    query = urllib.parse.urlencode(
+        {
+            "_type": resource_type,
+            "_outputFormat": "application/fhir+ndjson",
+        }
+    )
     return f"{api_base}/$export?{query}"
 
 
@@ -3643,8 +3648,10 @@ def _bulk_export_output_urls(payload: dict[str, Any] | None, resource_type: str)
     return urls
 
 
-def _is_bulk_export_unsupported_status(status_code: int | None) -> bool:
-    return status_code in {400, 404, 405, 501}
+def _bulk_export_pre_stream_should_fallback(status_code: int | None, error: str | None) -> bool:
+    if error:
+        return True
+    return status_code not in {200, 202}
 
 
 def _bulk_json_headers(*, prefer_async: bool = False) -> dict[str, str]:
@@ -3841,63 +3848,25 @@ async def _fetch_bulk_export_resource_rows(
             timeout=timeout,
             prefer_async=True,
         )
-        if error:
+        if _bulk_export_pre_stream_should_fallback(status_code, error):
             return None
-        if _is_bulk_export_unsupported_status(status_code):
-            return None
-        if status_code != 202:
-            return ResourceFetchResult(
-                model=model,
-                rows=[],
-                rows_fetched=0,
-                rows_written=0,
-                pages_fetched=0,
-                complete=False,
-                row_limit_reached=False,
-                page_limit_reached=False,
-                hard_page_limit_reached=False,
-                next_url_remaining=False,
-                error=f"bulk_export_http_{status_code}",
-                fetch_mode="bulk_export",
+
+        polls = 0
+        if status_code == 200:
+            output_urls = _bulk_export_output_urls(_payload, resource_type)
+        else:
+            status_url = _clean_text(headers.get("content-location") or headers.get("location"))
+            if not status_url:
+                return None
+            output_urls, poll_error, polls = await _bulk_export_poll_outputs(
+                session,
+                source,
+                urllib.parse.urljoin(url, status_url),
+                resource_type=resource_type,
+                timeout=timeout,
             )
-        status_url = _clean_text(headers.get("content-location") or headers.get("location"))
-        if not status_url:
-            return ResourceFetchResult(
-                model=model,
-                rows=[],
-                rows_fetched=0,
-                rows_written=0,
-                pages_fetched=0,
-                complete=False,
-                row_limit_reached=False,
-                page_limit_reached=False,
-                hard_page_limit_reached=False,
-                next_url_remaining=False,
-                error="bulk_export_missing_content_location",
-                fetch_mode="bulk_export",
-            )
-        output_urls, poll_error, polls = await _bulk_export_poll_outputs(
-            session,
-            source,
-            urllib.parse.urljoin(url, status_url),
-            resource_type=resource_type,
-            timeout=timeout,
-        )
-        if poll_error is not None:
-            return ResourceFetchResult(
-                model=model,
-                rows=[],
-                rows_fetched=0,
-                rows_written=0,
-                pages_fetched=polls,
-                complete=False,
-                row_limit_reached=False,
-                page_limit_reached=False,
-                hard_page_limit_reached=False,
-                next_url_remaining=False,
-                error=poll_error,
-                fetch_mode="bulk_export",
-            )
+            if poll_error is not None:
+                return None
         rows: list[dict[str, Any]] = []
         rows_fetched = 0
         rows_written = 0
@@ -3926,6 +3895,8 @@ async def _fetch_bulk_export_resource_rows(
             if limited:
                 row_limit_reached = True
                 break
+        if output_error and rows_fetched == 0 and rows_written == 0:
+            return None
         complete = not output_error and not row_limit_reached
         return ResourceFetchResult(
             model=model,

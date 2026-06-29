@@ -1873,7 +1873,18 @@ def test_bulk_export_start_url_uses_base_export_operation():
         "PractitionerRole",
     )
 
-    assert url == "https://example.test/fhir/$export?_type=PractitionerRole"
+    assert url == (
+        "https://example.test/fhir/$export?_type=PractitionerRole"
+        "&_outputFormat=application%2Ffhir%2Bndjson"
+    )
+
+
+def test_bulk_export_pre_stream_failures_fall_back_to_paged_reads():
+    assert importer._bulk_export_pre_stream_should_fallback(500, None) is True  # pylint: disable=protected-access
+    assert importer._bulk_export_pre_stream_should_fallback(401, None) is True  # pylint: disable=protected-access
+    assert importer._bulk_export_pre_stream_should_fallback(None, "timeout") is True  # pylint: disable=protected-access
+    assert importer._bulk_export_pre_stream_should_fallback(202, None) is False  # pylint: disable=protected-access
+    assert importer._bulk_export_pre_stream_should_fallback(200, None) is False  # pylint: disable=protected-access
 
 
 def test_bulk_export_output_urls_filters_requested_resource_type():
