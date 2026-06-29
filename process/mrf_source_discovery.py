@@ -10444,10 +10444,23 @@ def _candidate_matches_text_filters(
         query = _clean_text(payer_query).lower()
         searchable_names = (candidate.payer_name, *candidate.aliases)
         if not any(
-            query in _clean_text(name).lower() for name in searchable_names if name
+            _candidate_search_name_matches_query(name, query)
+            for name in searchable_names
         ):
             return False
     return True
+
+
+def _candidate_search_name_matches_query(name: str, query: str) -> bool:
+    text = _clean_text(name).lower()
+    if not text:
+        return False
+    if query in text:
+        return True
+    tokens = re.findall(r"[a-z0-9]+", text)
+    if len(tokens) >= 2 and len(text) >= 8 and text in query:
+        return True
+    return False
 
 
 def _candidate_is_importable_source(candidate: SourceCandidate) -> bool:

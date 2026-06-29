@@ -799,6 +799,14 @@ def test_candidate_text_filter_matches_public_aliases():
     assert discovery._candidate_matches_text_filters(
         candidate, entity_types=(), payer_query="THP"
     )
+    assert discovery._candidate_matches_text_filters(
+        candidate,
+        entity_types=(),
+        payer_query="Example Group - The Health Plan of the Upper Ohio Valley",
+    )
+    assert not discovery._candidate_matches_text_filters(
+        candidate, entity_types=(), payer_query="Example Group using THP"
+    )
     assert not discovery._candidate_matches_text_filters(
         candidate, entity_types=(), payer_query="Unrelated"
     )
@@ -1312,6 +1320,11 @@ async def test_master_list_keeps_high_value_public_aliases():
         in by_name["Delta Dental Plan of Michigan"].aliases
     )
     assert "Cigna Dental PPO" in by_name["Cigna"].aliases
+    assert "Allegiance Life & Health Insurance Company" in by_name["Cigna"].aliases
+    assert (
+        "Allegiance Life & Health Insurance Company, Inc."
+        in by_name["Cigna"].aliases
+    )
     assert by_name["Cigna"].benefit_lines == ("medical", "dental")
     assert "Horizon Healthcare Dental" in by_name["Horizon BCBS NJ"].aliases
     assert "NVA" in aliases_by_name["Capital Blue Cross"]
@@ -1893,6 +1906,9 @@ async def test_master_list_public_alias_queries_match_expected_candidates():
     assert "United Healthcare" in matching_names(
         "Sierra Health and Life Insurance Company, Inc."
     )
+    assert "Cigna" in matching_importable_names(
+        "Allegiance Life & Health Insurance Company, Inc."
+    )
     assert "United Healthcare" in matching_importable_names("Kansas City Life")
     assert "United Healthcare" in matching_importable_names(
         "Kansas City Life Insurance Company"
@@ -1978,6 +1994,9 @@ async def test_master_list_public_alias_queries_match_expected_candidates():
     assert "EMI Health" in matching_importable_names("Total Dental Administrators")
     assert "HAP" in matching_importable_names(
         "Alliance Health and Life Insurance Company"
+    )
+    assert "Auxiant" in matching_importable_names(
+        "Example Group - Auxient TPA HealthLink Network"
     )
     assert "Peak Health" in matching_importable_names("Peak Health Plan")
     assert "Centivo - Rockwell Automation" in matching_importable_names("Centivo")
