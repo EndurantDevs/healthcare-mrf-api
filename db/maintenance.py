@@ -16,11 +16,6 @@ import_module("db.models")
 
 logger = logging.getLogger(__name__)
 
-RETIRED_TABLES: Tuple[str, ...] = ("ptg_address",)
-RETIRED_COLUMNS: Dict[str, Tuple[str, ...]] = {
-    "entity_address_unified": ("ptg_address_version",),
-}
-
 
 async def sync_structure(add_columns: bool = True, add_indexes: bool = True) -> Dict[str, List[str]]:
     """
@@ -52,9 +47,6 @@ def _sync_structure(sync_conn, results: Dict[str, List[str]], add_columns: bool,
     model_map = _model_by_table_fullname()
     managed_schemas = set(_managed_schemas())
 
-    for schema in managed_schemas:
-        _retire_obsolete_objects(sync_conn, inspector, schema, results)
-
     for table in metadata.sorted_tables:
         schema = table.schema
         if not _should_manage_table_schema(schema, managed_schemas):
@@ -74,39 +66,6 @@ def _sync_structure(sync_conn, results: Dict[str, List[str]], add_columns: bool,
             model = model_map.get(fullname)
             if model is not None:
                 _ensure_indexes(sync_conn, inspector, table, model, results)
-
-
-def _quote_identifier(value: str) -> str:
-    return '"' + value.replace('"', '""') + '"'
-
-
-def _qualified_table(schema: str | None, table_name: str) -> str:
-    if schema:
-        return f"{_quote_identifier(schema)}.{_quote_identifier(table_name)}"
-    return _quote_identifier(table_name)
-
-
-def _retire_obsolete_objects(sync_conn, inspector, schema: str, results: Dict[str, List[str]]) -> None:
-    for table_name in RETIRED_TABLES:
-        if not inspector.has_table(table_name, schema=schema):
-            continue
-        sync_conn.execute(text(f"DROP TABLE IF EXISTS {_qualified_table(schema, table_name)} CASCADE"))
-        results["retired"].append(f"{schema}.{table_name}")
-
-    for table_name, column_names in RETIRED_COLUMNS.items():
-        if not inspector.has_table(table_name, schema=schema):
-            continue
-        existing_columns = {col["name"] for col in inspector.get_columns(table_name, schema=schema)}
-        for column_name in column_names:
-            if column_name not in existing_columns:
-                continue
-            sync_conn.execute(
-                text(
-                    f"ALTER TABLE {_qualified_table(schema, table_name)} "
-                    f"DROP COLUMN IF EXISTS {_quote_identifier(column_name)}"
-                )
-            )
-            results["retired"].append(f"{schema}.{table_name}.{column_name}")
 
 
 def _model_by_table_fullname() -> Dict[str, Any]:

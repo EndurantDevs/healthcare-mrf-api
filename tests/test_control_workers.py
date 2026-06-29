@@ -14,8 +14,6 @@ def test_worker_registry_exposes_shared_and_finish_workers():
     by_queue = {item["queue"]: item for item in items}
 
     assert by_importer["claims-procedures"]["worker_class"] == "process.ClaimsPricing"
-    assert "ptg-address" not in by_importer
-    assert "ptg-address-entity-refresh" not in by_importer
     assert by_importer["entity-address-unified"]["worker_class"] == "process.EntityAddressUnified"
     assert by_importer["provider-directory-fhir"]["worker_class"] == "process.ProviderDirectoryFHIR"
     assert by_importer["ms-drg"]["worker_class"] == "process.MSDRG"

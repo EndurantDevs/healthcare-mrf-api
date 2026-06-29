@@ -160,8 +160,8 @@ PTG_CONTACT_DETAIL_FIELDS = (
     "phone_extension",
     "fax_extension",
 )
-PTG_PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW = (
-    f"{PTG2_SCHEMA}.ptg_provider_directory_address_corroboration"
+PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW = (
+    f"{PTG2_SCHEMA}.provider_directory_address_corroboration"
 )
 PTG_NO_DISPLAY_ADDRESS_FIELDS = {
     "address",
@@ -863,8 +863,8 @@ def _ptg2_row_address_key(row: dict[str, Any]) -> str | None:
 
 
 async def _ptg2_provider_directory_corroboration_table(session) -> str | None:
-    if await _serving_table_available(session, PTG_PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW):
-        return PTG_PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW
+    if await _serving_table_available(session, PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW):
+        return PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW
     return None
 
 

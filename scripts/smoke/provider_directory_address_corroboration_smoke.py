@@ -1,15 +1,15 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Disposable Provider Directory to PTG address corroboration smoke.
+"""Disposable Provider Directory address corroboration smoke.
 
-This script proves the generated ``ptg_provider_directory_address_corroboration``
+This script proves the generated ``provider_directory_address_corroboration``
 view against a real PostgreSQL database without touching shared schemas. It
-creates a temporary schema with minimal PTG and Provider Directory tables, loads
+creates a temporary schema with minimal Provider Directory tables, loads
 two rows, builds the real view SQL, and verifies:
 
 - NPI + address + matching FHIR InsurancePlan => payer_directory_corroborated_location
 - NPI + address without matching FHIR InsurancePlan => provider_directory_address in the raw view
-- served PTG address_verification converts raw view evidence into the public
-  contract, including exact network-name corroboration when a PTG network name
+- provider address_verification converts raw view evidence into the public
+  contract, including exact network-name corroboration when a network name
   matches a Provider Directory network Organization.
 """
 
@@ -42,7 +42,7 @@ ROOT = _repo_root()
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from process.provider_directory_fhir import provider_directory_ptg_address_corroboration_sql  # noqa: E402
+from process.provider_directory_fhir import provider_directory_address_corroboration_sql  # noqa: E402
 from api.ptg2_serving import _address_verification_payload  # noqa: E402
 
 
@@ -54,7 +54,7 @@ def _validate_identifier(value: str, *, label: str) -> str:
 
 
 def _default_schema() -> str:
-    return "ptg_addr_corrob_" + dt.datetime.now(dt.UTC).strftime("%Y%m%d%H%M%S")
+    return "provider_addr_corrob_" + dt.datetime.now(dt.UTC).strftime("%Y%m%d%H%M%S")
 
 
 def _env_int(name: str, default: int) -> int:
@@ -240,7 +240,7 @@ async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
     try:
         await conn.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE;')
         await _seed(conn, schema)
-        await conn.execute(provider_directory_ptg_address_corroboration_sql(schema))
+        await conn.execute(provider_directory_address_corroboration_sql(schema))
         rows = await conn.fetch(
             f"""
             SELECT npi,
@@ -252,7 +252,7 @@ async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
                    address_verification_evidence,
                    address_verification_evidence->>'matched_on' AS matched_on,
                    provider_directory_telephone_number
-              FROM "{schema}".ptg_provider_directory_address_corroboration
+              FROM "{schema}".provider_directory_address_corroboration
              ORDER BY npi;
             """
         )

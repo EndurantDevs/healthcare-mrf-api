@@ -117,7 +117,7 @@ RESOURCE_ENDPOINT_FIELDS = {
     "OrganizationAffiliation": "endpoint_organization_affiliation",
     "Endpoint": "endpoint_endpoint",
 }
-PTG_PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW = "ptg_provider_directory_address_corroboration"
+PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW = "provider_directory_address_corroboration"
 PROVIDER_DIRECTORY_IMPORT_SEEN_TABLE = "provider_directory_import_seen"
 PROVIDER_DIRECTORY_IMPORT_SEEN_STAGE_PREFIX = "provider_directory_import_seen_stage"
 PTG_PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_INDEXES = (
@@ -1666,10 +1666,10 @@ def _append_alohr_organization_rows(
         _append_alohr_parsed_resource(rows_by_model, source_id, affiliation, run_id=run_id)
 
 
-def provider_directory_ptg_address_corroboration_sql(
+def provider_directory_address_corroboration_sql(
     db_schema: str | None = None,
     *,
-    view_name: str = PTG_PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW,
+    view_name: str = PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW,
 ) -> str:
     """Build a view that corroborates unified addresses with payer FHIR data.
 
@@ -2080,19 +2080,19 @@ def provider_directory_ptg_address_corroboration_sql(
     """
 
 
-async def publish_provider_directory_ptg_address_corroboration_view(db_schema: str | None = None) -> None:
-    await db.status(provider_directory_ptg_address_corroboration_sql(db_schema))
+async def publish_provider_directory_address_corroboration_view(db_schema: str | None = None) -> None:
+    await db.status(provider_directory_address_corroboration_sql(db_schema))
 
 
-def provider_directory_ptg_address_corroboration_select_sql(db_schema: str | None = None) -> str:
-    sql = provider_directory_ptg_address_corroboration_sql(db_schema)
+def provider_directory_address_corroboration_select_sql(db_schema: str | None = None) -> str:
+    sql = provider_directory_address_corroboration_sql(db_schema)
     marker = " AS\n"
     if marker not in sql:
         raise ValueError("Provider Directory PTG corroboration SQL does not contain view AS marker")
     return sql.split(marker, 1)[1].strip().rstrip(";")
 
 
-def _drop_provider_directory_ptg_address_corroboration_relation_sql(schema: str, relation: str) -> str:
+def _drop_provider_directory_address_corroboration_relation_sql(schema: str, relation: str) -> str:
     relation_ref = _qt(schema, relation)
     return f"""
     DO $$
@@ -2116,9 +2116,9 @@ def _drop_provider_directory_ptg_address_corroboration_relation_sql(schema: str,
     """
 
 
-async def _create_provider_directory_ptg_address_corroboration_indexes(
+async def _create_provider_directory_address_corroboration_indexes(
     schema: str,
-    table_name: str = PTG_PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW,
+    table_name: str = PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW,
 ) -> None:
     table_ref = _qt(schema, table_name)
     statements = (
@@ -2152,21 +2152,21 @@ async def _create_provider_directory_ptg_address_corroboration_indexes(
         await db.status(statement)
 
 
-async def publish_provider_directory_ptg_address_corroboration_table(
+async def publish_provider_directory_address_corroboration_table(
     db_schema: str | None = None,
 ) -> dict[str, Any]:
     schema = db_schema or _schema()
-    relation = PTG_PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW
+    relation = PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW
     stage_table = _stage_table_name()
     stage_ref = _qt(schema, stage_table)
-    select_sql = provider_directory_ptg_address_corroboration_select_sql(schema)
+    select_sql = provider_directory_address_corroboration_select_sql(schema)
     try:
         await db.status(f"DROP TABLE IF EXISTS {stage_ref};")
         await db.status(f"CREATE UNLOGGED TABLE {stage_ref} AS\n{select_sql};")
         row_count = int(await db.scalar(f"SELECT COUNT(*) FROM {stage_ref};") or 0)
-        await db.status(_drop_provider_directory_ptg_address_corroboration_relation_sql(schema, relation))
+        await db.status(_drop_provider_directory_address_corroboration_relation_sql(schema, relation))
         await db.status(f"ALTER TABLE {stage_ref} RENAME TO {_q(relation)};")
-        await _create_provider_directory_ptg_address_corroboration_indexes(schema, relation)
+        await _create_provider_directory_address_corroboration_indexes(schema, relation)
         await db.status(f"ANALYZE {_qt(schema, relation)};")
         return {"published": True, "relation": _qt(schema, relation), "rows": row_count, "storage": "table"}
     except Exception:
@@ -2174,7 +2174,7 @@ async def publish_provider_directory_ptg_address_corroboration_table(
             await db.status(f"DROP TABLE IF EXISTS {stage_ref};")
         except Exception:  # pragma: no cover - cleanup best effort
             LOGGER.warning(
-                "Failed to clean provider directory PTG address stage table %s",
+                "Failed to clean provider directory address stage table %s",
                 stage_ref,
                 exc_info=True,
             )
@@ -2608,7 +2608,7 @@ async def _publish_provider_directory_artifacts(
     metrics["publish_corroboration"] = publish_corroboration
     if publish_corroboration:
         metrics["ptg_corroboration_view_published"] = (
-            await publish_provider_directory_ptg_address_corroboration_if_available()
+            await publish_provider_directory_address_corroboration_if_available()
         )
         message = "published Provider Directory PTG corroboration artifacts"
     else:
@@ -2733,13 +2733,13 @@ async def publish_provider_directory_location_archive(
         await db.status(f"DROP TABLE IF EXISTS {_qt(schema, stage)};")
 
 
-async def publish_provider_directory_ptg_address_corroboration_if_available(
+async def publish_provider_directory_address_corroboration_if_available(
     db_schema: str | None = None,
 ) -> bool:
     schema = db_schema or _schema()
     if not await _table_exists(schema, "entity_address_unified"):
         return False
-    await publish_provider_directory_ptg_address_corroboration_table(schema)
+    await publish_provider_directory_address_corroboration_table(schema)
     return True
 
 

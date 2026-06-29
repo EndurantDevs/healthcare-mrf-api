@@ -1300,10 +1300,10 @@ def test_parse_fhir_resource_maps_plan_practitioner_location_role_and_endpoint()
     assert endpoint_row["last_seen_run_id"] == "run_2"
 
 
-def test_provider_directory_ptg_address_corroboration_sql_links_unified_npi_address_to_fhir_roles():
-    sql = importer.provider_directory_ptg_address_corroboration_sql("mrf")
+def test_provider_directory_address_corroboration_sql_links_unified_npi_address_to_fhir_roles():
+    sql = importer.provider_directory_address_corroboration_sql("mrf")
 
-    assert 'CREATE OR REPLACE VIEW "mrf"."ptg_provider_directory_address_corroboration" AS' in sql
+    assert 'CREATE OR REPLACE VIEW "mrf"."provider_directory_address_corroboration" AS' in sql
     assert 'FROM "mrf"."entity_address_unified" e' in sql
     assert "WITH address_candidates AS" in sql
     assert 'JOIN "mrf"."provider_directory_practitioner" practitioner' in sql
@@ -1342,8 +1342,8 @@ def test_provider_directory_ptg_address_corroboration_sql_links_unified_npi_addr
     assert 'provider_directory_organization_affiliation' in sql
 
 
-def test_provider_directory_ptg_address_corroboration_view_keeps_existing_column_order():
-    sql = importer.provider_directory_ptg_address_corroboration_sql("mrf")
+def test_provider_directory_address_corroboration_view_keeps_existing_column_order():
+    sql = importer.provider_directory_address_corroboration_sql("mrf")
 
     assert "SELECT DISTINCT\n        *," not in sql
     assert (
@@ -1363,8 +1363,8 @@ def test_provider_directory_ptg_address_corroboration_view_keeps_existing_column
     ) in sql
 
 
-def test_provider_directory_ptg_address_corroboration_select_sql_returns_query_body():
-    sql = importer.provider_directory_ptg_address_corroboration_select_sql("mrf")
+def test_provider_directory_address_corroboration_select_sql_returns_query_body():
+    sql = importer.provider_directory_address_corroboration_select_sql("mrf")
 
     assert not sql.startswith("CREATE OR REPLACE VIEW")
     assert sql.startswith("WITH address_candidates AS")
@@ -1373,7 +1373,7 @@ def test_provider_directory_ptg_address_corroboration_select_sql_returns_query_b
 
 
 @pytest.mark.asyncio
-async def test_publish_provider_directory_ptg_address_corroboration_table_swaps_indexed_table(monkeypatch):
+async def test_publish_provider_directory_address_corroboration_table_swaps_indexed_table(monkeypatch):
     statements: list[str] = []
 
     async def fake_status(sql, **_params):
@@ -1388,27 +1388,27 @@ async def test_publish_provider_directory_ptg_address_corroboration_table_swaps_
     monkeypatch.setattr(importer.db, "scalar", fake_scalar)
     monkeypatch.setattr(importer, "_stage_table_name", lambda: "pd_stage_corrob")
 
-    result = await importer.publish_provider_directory_ptg_address_corroboration_table("mrf")
+    result = await importer.publish_provider_directory_address_corroboration_table("mrf")
     joined = "\n".join(statements)
 
     assert result == {
         "published": True,
-        "relation": '"mrf"."ptg_provider_directory_address_corroboration"',
+        "relation": '"mrf"."provider_directory_address_corroboration"',
         "rows": 7,
         "storage": "table",
     }
     assert 'DROP TABLE IF EXISTS "mrf"."pd_stage_corrob"' in joined
     assert 'CREATE UNLOGGED TABLE "mrf"."pd_stage_corrob" AS' in joined
     assert 'FROM "mrf"."entity_address_unified" e' in joined
-    assert 'DROP VIEW "mrf"."ptg_provider_directory_address_corroboration"' in joined
-    assert 'DROP TABLE "mrf"."ptg_provider_directory_address_corroboration"' in joined
+    assert 'DROP VIEW "mrf"."provider_directory_address_corroboration"' in joined
+    assert 'DROP TABLE "mrf"."provider_directory_address_corroboration"' in joined
     assert (
-        'ALTER TABLE "mrf"."pd_stage_corrob" RENAME TO "ptg_provider_directory_address_corroboration"'
+        'ALTER TABLE "mrf"."pd_stage_corrob" RENAME TO "provider_directory_address_corroboration"'
         in joined
     )
     assert '"mrf"."pd_ptg_corrob_lookup_idx"' in joined
     assert '"mrf"."pd_ptg_corrob_network_names_gin"' in joined
-    assert 'ANALYZE "mrf"."ptg_provider_directory_address_corroboration"' in joined
+    assert 'ANALYZE "mrf"."provider_directory_address_corroboration"' in joined
 
 
 def test_provider_directory_location_address_key_sql_uses_shared_canonical_functions():
@@ -1760,28 +1760,28 @@ async def test_publish_provider_directory_location_archive_skips_without_archive
 
 
 @pytest.mark.asyncio
-async def test_publish_provider_directory_ptg_address_corroboration_if_available_skips_without_entity_address_unified(
+async def test_publish_provider_directory_address_corroboration_if_available_skips_without_entity_address_unified(
     monkeypatch,
 ):
     monkeypatch.setattr(importer, "_table_exists", AsyncMock(return_value=False))
     publish = AsyncMock()
-    monkeypatch.setattr(importer, "publish_provider_directory_ptg_address_corroboration_table", publish)
+    monkeypatch.setattr(importer, "publish_provider_directory_address_corroboration_table", publish)
 
-    published = await importer.publish_provider_directory_ptg_address_corroboration_if_available("mrf")
+    published = await importer.publish_provider_directory_address_corroboration_if_available("mrf")
 
     assert published is False
     publish.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_publish_provider_directory_ptg_address_corroboration_if_available_publishes_when_entity_address_unified_exists(
+async def test_publish_provider_directory_address_corroboration_if_available_publishes_when_entity_address_unified_exists(
     monkeypatch,
 ):
     monkeypatch.setattr(importer, "_table_exists", AsyncMock(return_value=True))
     publish = AsyncMock()
-    monkeypatch.setattr(importer, "publish_provider_directory_ptg_address_corroboration_table", publish)
+    monkeypatch.setattr(importer, "publish_provider_directory_address_corroboration_table", publish)
 
-    published = await importer.publish_provider_directory_ptg_address_corroboration_if_available("mrf")
+    published = await importer.publish_provider_directory_address_corroboration_if_available("mrf")
 
     assert published is True
     publish.assert_awaited_once_with("mrf")
@@ -1806,7 +1806,7 @@ async def test_process_data_stamps_locations_and_publishes_corroboration_view_wh
     )
     monkeypatch.setattr(
         importer,
-        "publish_provider_directory_ptg_address_corroboration_if_available",
+        "publish_provider_directory_address_corroboration_if_available",
         AsyncMock(return_value=True),
     )
 
@@ -1832,7 +1832,7 @@ async def test_process_data_stamps_locations_and_publishes_corroboration_view_wh
     importer.backfill_provider_directory_location_contacts.assert_awaited_once()
     importer.publish_provider_directory_location_address_keys.assert_awaited_once()
     importer.publish_provider_directory_location_archive.assert_awaited_once()
-    importer.publish_provider_directory_ptg_address_corroboration_if_available.assert_awaited_once()
+    importer.publish_provider_directory_address_corroboration_if_available.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -1854,7 +1854,7 @@ async def test_process_data_skips_artifact_publish_for_targeted_resource_import(
     )
     monkeypatch.setattr(
         importer,
-        "publish_provider_directory_ptg_address_corroboration_if_available",
+        "publish_provider_directory_address_corroboration_if_available",
         AsyncMock(return_value=True),
     )
 
@@ -1879,7 +1879,7 @@ async def test_process_data_skips_artifact_publish_for_targeted_resource_import(
     importer.backfill_provider_directory_location_contacts.assert_not_awaited()
     importer.publish_provider_directory_location_address_keys.assert_not_awaited()
     importer.publish_provider_directory_location_archive.assert_not_awaited()
-    importer.publish_provider_directory_ptg_address_corroboration_if_available.assert_not_awaited()
+    importer.publish_provider_directory_address_corroboration_if_available.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1909,7 +1909,7 @@ async def test_process_data_uses_live_probe_success_over_seed_auth_required_stat
     monkeypatch.setattr(importer, "publish_provider_directory_location_archive", AsyncMock(return_value={"inserted": 0}))
     monkeypatch.setattr(
         importer,
-        "publish_provider_directory_ptg_address_corroboration_if_available",
+        "publish_provider_directory_address_corroboration_if_available",
         AsyncMock(return_value=True),
     )
 
@@ -2895,7 +2895,7 @@ async def test_process_data_publish_artifacts_only_skips_seed_resolution(monkeyp
     )
     monkeypatch.setattr(
         importer,
-        "publish_provider_directory_ptg_address_corroboration_if_available",
+        "publish_provider_directory_address_corroboration_if_available",
         AsyncMock(return_value=True),
     )
     monkeypatch.setattr(
@@ -2924,7 +2924,7 @@ async def test_process_data_publish_artifacts_only_skips_seed_resolution(monkeyp
         seen_table=None,
     )
     importer.publish_provider_directory_location_archive.assert_awaited_once_with(run_id="run_publish")
-    importer.publish_provider_directory_ptg_address_corroboration_if_available.assert_not_awaited()
+    importer.publish_provider_directory_address_corroboration_if_available.assert_not_awaited()
 
 
 def test_harness_fixture_case_and_report_rendering(tmp_path):

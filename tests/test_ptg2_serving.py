@@ -58,7 +58,7 @@ class FakePagination:
 async def test_overlay_provider_directory_corroboration_marks_address_and_prefers_directory_phone():
     session = FakeSession(
         [
-            "mrf.ptg_provider_directory_address_corroboration",
+            "mrf.provider_directory_address_corroboration",
             FakeResult(
                 rows=[
                     {
@@ -151,7 +151,7 @@ async def test_overlay_provider_directory_corroboration_marks_address_and_prefer
 async def test_overlay_provider_directory_address_only_keeps_network_binding_inferred():
     session = FakeSession(
         [
-            "mrf.ptg_provider_directory_address_corroboration",
+            "mrf.provider_directory_address_corroboration",
             FakeResult(
                 rows=[
                     {
@@ -217,7 +217,7 @@ async def test_overlay_provider_directory_address_only_keeps_network_binding_inf
 async def test_overlay_provider_directory_without_plan_match_downgrades_network_marker():
     session = FakeSession(
         [
-            "mrf.ptg_provider_directory_address_corroboration",
+            "mrf.provider_directory_address_corroboration",
             FakeResult(
                 rows=[
                     {

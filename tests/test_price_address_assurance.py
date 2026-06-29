@@ -7,7 +7,7 @@ import types
 from pathlib import Path
 
 from process.ptg_parts.address_assurance import (
-    build_ptg_address_assurance_report,
+    build_price_address_assurance_report,
     source_file_version_ids_from_ptg_payload,
     summarize_ptg_price_address_payload,
 )
@@ -21,8 +21,8 @@ def _write_json(path, payload):
 
 def _load_cli_module():
     spec = importlib.util.spec_from_file_location(
-        "ptg_address_assurance_report_script",
-        ROOT / "scripts" / "research" / "ptg_address_assurance_report.py",
+        "price_address_assurance_report_script",
+        ROOT / "scripts" / "research" / "price_address_assurance_report.py",
     )
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -31,7 +31,7 @@ def _load_cli_module():
     return module
 
 
-def test_ptg_address_assurance_accepts_plan_context_provider_directory_address():
+def test_price_address_assurance_accepts_plan_context_provider_directory_address():
     payload = {
         "data": {
             "items": [
@@ -74,7 +74,7 @@ def test_ptg_address_assurance_accepts_plan_context_provider_directory_address()
     assert summary["issues"] == []
 
 
-def test_ptg_address_assurance_accepts_network_name_provider_directory_address():
+def test_price_address_assurance_accepts_network_name_provider_directory_address():
     payload = {
         "data": {
             "items": [
@@ -117,7 +117,7 @@ def test_ptg_address_assurance_accepts_network_name_provider_directory_address()
     assert summary["issues"] == []
 
 
-def test_ptg_address_assurance_rejects_network_name_proof_that_does_not_match_served_network():
+def test_price_address_assurance_rejects_network_name_proof_that_does_not_match_served_network():
     payload = {
         "data": {
             "items": [
@@ -163,7 +163,7 @@ def test_ptg_address_assurance_rejects_network_name_proof_that_does_not_match_se
     } in summary["issues"]
 
 
-def test_ptg_address_assurance_rejects_network_name_proof_without_served_network_names():
+def test_price_address_assurance_rejects_network_name_proof_without_served_network_names():
     payload = {
         "data": {
             "items": [
@@ -208,7 +208,7 @@ def test_ptg_address_assurance_rejects_network_name_proof_without_served_network
     } in summary["issues"]
 
 
-def test_ptg_address_assurance_rejects_network_name_marker_without_evidence():
+def test_price_address_assurance_rejects_network_name_marker_without_evidence():
     payload = {
         "data": {
             "items": [
@@ -243,7 +243,7 @@ def test_ptg_address_assurance_rejects_network_name_marker_without_evidence():
     } in summary["issues"]
 
 
-def test_ptg_address_assurance_rejects_malformed_provider_directory_network_match():
+def test_price_address_assurance_rejects_malformed_provider_directory_network_match():
     payload = {
         "data": {
             "items": [
@@ -280,7 +280,7 @@ def test_ptg_address_assurance_rejects_malformed_provider_directory_network_matc
     } in summary["issues"]
 
 
-def test_ptg_address_assurance_rejects_network_binding_without_plan_context():
+def test_price_address_assurance_rejects_network_binding_without_plan_context():
     payload = {
         "data": {
             "items": [
@@ -309,7 +309,7 @@ def test_ptg_address_assurance_rejects_network_binding_without_plan_context():
     assert "payer-directory context match must expose plan context or network-name proof" in messages
 
 
-def test_ptg_address_assurance_rejects_empty_api_payload():
+def test_price_address_assurance_rejects_empty_api_payload():
     summary = summarize_ptg_price_address_payload({"data": {"items": []}})
 
     assert summary["ok"] is False
@@ -318,7 +318,7 @@ def test_ptg_address_assurance_rejects_empty_api_payload():
     ]
 
 
-def test_ptg_address_assurance_requires_address_verification_on_every_row():
+def test_price_address_assurance_requires_address_verification_on_every_row():
     summary = summarize_ptg_price_address_payload(
         {
             "data": {
@@ -343,7 +343,7 @@ def test_ptg_address_assurance_requires_address_verification_on_every_row():
     ]
 
 
-def test_ptg_address_assurance_requires_displayed_address_present_boolean():
+def test_price_address_assurance_requires_displayed_address_present_boolean():
     payload = {
         "data": {
             "items": [
@@ -370,7 +370,7 @@ def test_ptg_address_assurance_requires_displayed_address_present_boolean():
     } in summary["issues"]
 
 
-def test_ptg_address_assurance_requires_network_bound_address_boolean():
+def test_price_address_assurance_requires_network_bound_address_boolean():
     payload = {
         "data": {
             "items": [
@@ -398,7 +398,7 @@ def test_ptg_address_assurance_requires_network_bound_address_boolean():
     } in summary["issues"]
 
 
-def test_ptg_address_assurance_rejects_provider_directory_string_booleans():
+def test_price_address_assurance_rejects_provider_directory_string_booleans():
     payload = {
         "data": {
             "items": [
@@ -428,7 +428,7 @@ def test_ptg_address_assurance_rejects_provider_directory_string_booleans():
     assert "provider_directory_network_name_matched must be boolean when present" in messages
 
 
-def test_ptg_address_assurance_rejects_provider_directory_non_list_fields():
+def test_price_address_assurance_rejects_provider_directory_non_list_fields():
     payload = {
         "data": {
             "items": [
@@ -464,7 +464,7 @@ def test_ptg_address_assurance_rejects_provider_directory_non_list_fields():
     assert "provider_directory_insurance_plan_matches must be a string list when present" in messages
 
 
-def test_ptg_address_assurance_rejects_unknown_evidence_for_displayed_address():
+def test_price_address_assurance_rejects_unknown_evidence_for_displayed_address():
     payload = {
         "data": {
             "items": [
@@ -493,7 +493,7 @@ def test_ptg_address_assurance_rejects_unknown_evidence_for_displayed_address():
     } in summary["issues"]
 
 
-def test_ptg_address_assurance_rejects_ptg_address_source_without_payer_confirmed_binding():
+def test_price_address_assurance_rejects_price_address_source_without_payer_confirmed_binding():
     payload = {
         "data": {
             "items": [
@@ -523,7 +523,7 @@ def test_ptg_address_assurance_rejects_ptg_address_source_without_payer_confirme
     } in summary["issues"]
 
 
-def test_ptg_address_assurance_accepts_payer_confirmed_with_direct_location_source():
+def test_price_address_assurance_accepts_payer_confirmed_with_direct_location_source():
     payload = {
         "data": {
             "items": [
@@ -555,7 +555,7 @@ def test_ptg_address_assurance_accepts_payer_confirmed_with_direct_location_sour
     assert summary["issues"] == []
 
 
-def test_ptg_address_assurance_rejects_payer_confirmed_without_source_trace():
+def test_price_address_assurance_rejects_payer_confirmed_without_source_trace():
     payload = {
         "data": {
             "items": [
@@ -590,7 +590,7 @@ def test_ptg_address_assurance_rejects_payer_confirmed_without_source_trace():
     } in summary["issues"]
 
 
-def test_ptg_address_assurance_rejects_payer_confirmed_without_source_record_evidence():
+def test_price_address_assurance_rejects_payer_confirmed_without_source_record_evidence():
     payload = {
         "data": {
             "items": [
@@ -620,7 +620,7 @@ def test_ptg_address_assurance_rejects_payer_confirmed_without_source_record_evi
     } in summary["issues"]
 
 
-def test_ptg_address_assurance_rejects_payer_confirmed_without_direct_location_source():
+def test_price_address_assurance_rejects_payer_confirmed_without_direct_location_source():
     payload = {
         "data": {
             "items": [
@@ -649,7 +649,7 @@ def test_ptg_address_assurance_rejects_payer_confirmed_without_direct_location_s
     } in summary["issues"]
 
 
-def test_ptg_address_assurance_rejects_payer_confirmed_with_only_tic_address_source():
+def test_price_address_assurance_rejects_payer_confirmed_with_only_tic_address_source():
     payload = {
         "data": {
             "items": [
@@ -679,7 +679,7 @@ def test_ptg_address_assurance_rejects_payer_confirmed_with_only_tic_address_sou
     } in summary["issues"]
 
 
-def test_ptg_address_assurance_rejects_address_key_only_as_displayed_address():
+def test_price_address_assurance_rejects_address_key_only_as_displayed_address():
     payload = {
         "data": {
             "items": [
@@ -709,7 +709,7 @@ def test_ptg_address_assurance_rejects_address_key_only_as_displayed_address():
     } in summary["issues"]
 
 
-def test_ptg_address_assurance_schema_mode_accepts_explicit_no_address_row():
+def test_price_address_assurance_schema_mode_accepts_explicit_no_address_row():
     payload = {
         "data": {
             "items": [
@@ -744,7 +744,7 @@ def test_ptg_address_assurance_schema_mode_accepts_explicit_no_address_row():
     assert schema_summary["issues"] == []
 
 
-def test_ptg_address_assurance_schema_mode_rejects_false_displayed_address_with_fields():
+def test_price_address_assurance_schema_mode_rejects_false_displayed_address_with_fields():
     payload = {
         "data": {
             "items": [
@@ -779,7 +779,7 @@ def test_ptg_address_assurance_schema_mode_rejects_false_displayed_address_with_
     )
 
 
-def test_ptg_address_assurance_schema_mode_rejects_false_displayed_address_with_phone_only():
+def test_price_address_assurance_schema_mode_rejects_false_displayed_address_with_phone_only():
     payload = {
         "data": {
             "items": [
@@ -815,7 +815,7 @@ def test_ptg_address_assurance_schema_mode_rejects_false_displayed_address_with_
     } in summary["issues"]
 
 
-def test_ptg_address_assurance_schema_mode_rejects_no_display_verification_evidence_fields():
+def test_price_address_assurance_schema_mode_rejects_no_display_verification_evidence_fields():
     payload = {
         "data": {
             "items": [
@@ -850,7 +850,7 @@ def test_ptg_address_assurance_schema_mode_rejects_no_display_verification_evide
     } in summary["issues"]
 
 
-def test_ptg_address_assurance_rejects_city_only_as_displayed_address():
+def test_price_address_assurance_rejects_city_only_as_displayed_address():
     payload = {
         "data": {
             "items": [
@@ -880,7 +880,7 @@ def test_ptg_address_assurance_rejects_city_only_as_displayed_address():
     } in summary["issues"]
 
 
-def test_ptg_address_assurance_accepts_city_state_fallback_as_displayable_but_unconfirmed():
+def test_price_address_assurance_accepts_city_state_fallback_as_displayable_but_unconfirmed():
     payload = {
         "data": {
             "items": [
@@ -906,8 +906,8 @@ def test_ptg_address_assurance_accepts_city_state_fallback_as_displayable_but_un
     assert summary["address_evidence_level_counts"] == {"city_zip_fallback": 1}
 
 
-def test_ptg_address_assurance_rejects_report_without_inputs():
-    report = build_ptg_address_assurance_report()
+def test_price_address_assurance_rejects_report_without_inputs():
+    report = build_price_address_assurance_report()
 
     assert report["ok"] is False
     assert report["issues"] == [
@@ -917,7 +917,7 @@ def test_ptg_address_assurance_rejects_report_without_inputs():
     assert report["raw_artifacts"] == []
 
 
-def test_ptg_address_assurance_combines_raw_artifact_and_api_payload(tmp_path):
+def test_price_address_assurance_combines_raw_artifact_and_api_payload(tmp_path):
     raw_artifact = tmp_path / "rates.json"
     _write_json(
         raw_artifact,
@@ -955,7 +955,7 @@ def test_ptg_address_assurance_combines_raw_artifact_and_api_payload(tmp_path):
         }
     }
 
-    report = build_ptg_address_assurance_report(
+    report = build_price_address_assurance_report(
         api_payload=api_payload,
         raw_artifact_paths=[raw_artifact],
     )
@@ -967,7 +967,7 @@ def test_ptg_address_assurance_combines_raw_artifact_and_api_payload(tmp_path):
     assert "network_names identify the priced TiC/PTG network" in report["notes"][0]
 
 
-def test_ptg_address_assurance_can_require_network_bound_address():
+def test_price_address_assurance_can_require_network_bound_address():
     payload = {
         "data": {
             "items": [
@@ -991,7 +991,7 @@ def test_ptg_address_assurance_can_require_network_bound_address():
         }
     }
 
-    report = build_ptg_address_assurance_report(
+    report = build_price_address_assurance_report(
         api_payload=payload,
         require_network_bound_address=True,
     )
@@ -1005,7 +1005,7 @@ def test_ptg_address_assurance_can_require_network_bound_address():
     assert report["api_payload"]["network_bound_address_rows"] == 0
 
 
-def test_ptg_address_assurance_accepts_network_bound_address_when_required():
+def test_price_address_assurance_accepts_network_bound_address_when_required():
     payload = {
         "data": {
             "items": [
@@ -1042,7 +1042,7 @@ def test_ptg_address_assurance_accepts_network_bound_address_when_required():
         }
     }
 
-    report = build_ptg_address_assurance_report(
+    report = build_price_address_assurance_report(
         api_payload=payload,
         require_network_bound_address=True,
     )
@@ -1052,7 +1052,7 @@ def test_ptg_address_assurance_accepts_network_bound_address_when_required():
     assert report["api_payload"]["network_bound_address_rows"] == 1
 
 
-def test_ptg_address_assurance_network_bound_requirement_implies_source_context():
+def test_price_address_assurance_network_bound_requirement_implies_source_context():
     payload = {
         "data": {
             "items": [
@@ -1080,7 +1080,7 @@ def test_ptg_address_assurance_network_bound_requirement_implies_source_context(
         }
     }
 
-    report = build_ptg_address_assurance_report(
+    report = build_price_address_assurance_report(
         api_payload=payload,
         require_network_bound_address=True,
     )
@@ -1098,7 +1098,7 @@ def test_ptg_address_assurance_network_bound_requirement_implies_source_context(
     } in report["api_payload"]["issues"]
 
 
-def test_ptg_address_assurance_rejects_mismatched_network_bound_address():
+def test_price_address_assurance_rejects_mismatched_network_bound_address():
     payload = {
         "data": {
             "items": [
@@ -1132,7 +1132,7 @@ def test_ptg_address_assurance_rejects_mismatched_network_bound_address():
     } in summary["issues"]
 
 
-def test_ptg_address_assurance_rejects_payer_confirmed_when_traced_raw_lacks_address(tmp_path):
+def test_price_address_assurance_rejects_payer_confirmed_when_traced_raw_lacks_address(tmp_path):
     raw_artifact = tmp_path / "rates.json"
     _write_json(
         raw_artifact,
@@ -1177,7 +1177,7 @@ def test_ptg_address_assurance_rejects_payer_confirmed_when_traced_raw_lacks_add
         }
     }
 
-    report = build_ptg_address_assurance_report(
+    report = build_price_address_assurance_report(
         api_payload=api_payload,
         raw_artifact_paths=[raw_artifact],
         raw_artifact_source_file_version_ids_by_path={str(raw_artifact): "version-a"},
@@ -1195,7 +1195,7 @@ def test_ptg_address_assurance_rejects_payer_confirmed_when_traced_raw_lacks_add
     } in report["issues"]
 
 
-def test_ptg_address_assurance_accepts_payer_confirmed_when_traced_raw_has_address(tmp_path):
+def test_price_address_assurance_accepts_payer_confirmed_when_traced_raw_has_address(tmp_path):
     raw_artifact = tmp_path / "rates.json"
     _write_json(
         raw_artifact,
@@ -1244,7 +1244,7 @@ def test_ptg_address_assurance_accepts_payer_confirmed_when_traced_raw_has_addre
         }
     }
 
-    report = build_ptg_address_assurance_report(
+    report = build_price_address_assurance_report(
         api_payload=api_payload,
         raw_artifact_paths=[raw_artifact],
         raw_artifact_source_file_version_ids_by_path={str(raw_artifact): ["version-a"]},
@@ -1255,7 +1255,7 @@ def test_ptg_address_assurance_accepts_payer_confirmed_when_traced_raw_has_addre
     assert report["raw_direct_displayable_location_fields_present"] is True
 
 
-def test_ptg_address_assurance_rejects_payer_confirmed_when_source_trace_unresolved(tmp_path):
+def test_price_address_assurance_rejects_payer_confirmed_when_source_trace_unresolved(tmp_path):
     raw_artifact = tmp_path / "rates.json"
     _write_json(
         raw_artifact,
@@ -1304,7 +1304,7 @@ def test_ptg_address_assurance_rejects_payer_confirmed_when_source_trace_unresol
         }
     }
 
-    report = build_ptg_address_assurance_report(
+    report = build_price_address_assurance_report(
         api_payload=api_payload,
         raw_artifact_paths=[raw_artifact],
         raw_artifact_source_file_version_ids_by_path={str(raw_artifact): ["version-a"]},
@@ -1321,7 +1321,7 @@ def test_ptg_address_assurance_rejects_payer_confirmed_when_source_trace_unresol
     } in report["issues"]
 
 
-def test_ptg_address_assurance_report_exposes_raw_displayable_location_fields(tmp_path):
+def test_price_address_assurance_report_exposes_raw_displayable_location_fields(tmp_path):
     raw_artifact = tmp_path / "rates.json"
     _write_json(
         raw_artifact,
@@ -1346,7 +1346,7 @@ def test_ptg_address_assurance_report_exposes_raw_displayable_location_fields(tm
         },
     )
 
-    report = build_ptg_address_assurance_report(raw_artifact_paths=[raw_artifact])
+    report = build_price_address_assurance_report(raw_artifact_paths=[raw_artifact])
 
     assert report["ok"] is True
     assert report["api_payload"] is None
@@ -1380,7 +1380,7 @@ def test_source_file_version_ids_from_ptg_payload_extracts_nested_source_trace_i
     assert source_file_version_ids_from_ptg_payload(payload) == ["version-a", "version-b"]
 
 
-def test_ptg_address_assurance_report_includes_api_source_file_version_ids():
+def test_price_address_assurance_report_includes_api_source_file_version_ids():
     payload = {
         "data": {
             "items": [
@@ -1401,7 +1401,7 @@ def test_ptg_address_assurance_report_includes_api_source_file_version_ids():
         }
     }
 
-    report = build_ptg_address_assurance_report(
+    report = build_price_address_assurance_report(
         api_payload=payload,
         require_displayed_address=False,
     )
@@ -1414,7 +1414,7 @@ def test_ptg_address_assurance_report_includes_api_source_file_version_ids():
     assert report["api_payload"]["source_file_version_id_rows"] == 1
 
 
-def test_ptg_address_assurance_report_can_require_source_context():
+def test_price_address_assurance_report_can_require_source_context():
     payload = {
         "data": {
             "items": [
@@ -1435,7 +1435,7 @@ def test_ptg_address_assurance_report_can_require_source_context():
         }
     }
 
-    report = build_ptg_address_assurance_report(
+    report = build_price_address_assurance_report(
         api_payload=payload,
         require_displayed_address=False,
         require_network_names=True,
@@ -1447,7 +1447,7 @@ def test_ptg_address_assurance_report_can_require_source_context():
     assert report["api_payload"]["source_file_version_id_rows"] == 1
 
 
-def test_ptg_address_assurance_report_rejects_missing_required_source_context():
+def test_price_address_assurance_report_rejects_missing_required_source_context():
     payload = {
         "data": {
             "items": [
@@ -1467,7 +1467,7 @@ def test_ptg_address_assurance_report_rejects_missing_required_source_context():
         }
     }
 
-    report = build_ptg_address_assurance_report(
+    report = build_price_address_assurance_report(
         api_payload=payload,
         require_displayed_address=False,
         require_network_names=True,
@@ -1487,7 +1487,7 @@ def test_ptg_address_assurance_report_rejects_missing_required_source_context():
     } in report["api_payload"]["issues"]
 
 
-def test_ptg_address_assurance_report_rejects_partial_missing_required_source_context():
+def test_price_address_assurance_report_rejects_partial_missing_required_source_context():
     payload = {
         "data": {
             "items": [
@@ -1520,7 +1520,7 @@ def test_ptg_address_assurance_report_rejects_partial_missing_required_source_co
         }
     }
 
-    report = build_ptg_address_assurance_report(
+    report = build_price_address_assurance_report(
         api_payload=payload,
         require_displayed_address=False,
         require_network_names=True,
@@ -1540,7 +1540,7 @@ def test_ptg_address_assurance_report_rejects_partial_missing_required_source_co
     } in report["api_payload"]["issues"]
 
 
-def test_ptg_address_assurance_cli_helpers_prepare_raw_artifact_resolution():
+def test_price_address_assurance_cli_helpers_prepare_raw_artifact_resolution():
     script = _load_cli_module()
 
     assert script._dedupe(["a", "", "a", "b"]) == ["a", "b"]
@@ -1550,7 +1550,7 @@ def test_ptg_address_assurance_cli_helpers_prepare_raw_artifact_resolution():
     assert script._file_uri_to_path("s3://bucket/key.json.gz") is None
 
 
-def test_ptg_address_assurance_cli_can_require_resolved_raw_artifacts():
+def test_price_address_assurance_cli_can_require_resolved_raw_artifacts():
     script = _load_cli_module()
 
     assert script._raw_artifact_resolution_issues([], [], resolve_attempted=True) == [
@@ -1596,7 +1596,7 @@ def test_ptg_address_assurance_cli_can_require_resolved_raw_artifacts():
     )
 
 
-def test_ptg_address_assurance_cli_resolves_raw_artifacts_from_db(monkeypatch, tmp_path):
+def test_price_address_assurance_cli_resolves_raw_artifacts_from_db(monkeypatch, tmp_path):
     script = _load_cli_module()
     raw_artifact = tmp_path / "raw-rates.json.gz"
     raw_artifact.write_text("{}", encoding="utf-8")
@@ -1691,7 +1691,7 @@ def test_ptg_address_assurance_cli_resolves_raw_artifacts_from_db(monkeypatch, t
     ]
 
 
-def test_ptg_address_assurance_cli_main_verifies_traced_raw_artifact(monkeypatch, tmp_path, capsys):
+def test_price_address_assurance_cli_main_verifies_traced_raw_artifact(monkeypatch, tmp_path, capsys):
     script = _load_cli_module()
     raw_artifact = tmp_path / "raw-rates.json"
     api_payload = tmp_path / "api-payload.json"
@@ -1778,7 +1778,7 @@ def test_ptg_address_assurance_cli_main_verifies_traced_raw_artifact(monkeypatch
         sys,
         "argv",
         [
-            "ptg_address_assurance_report.py",
+            "price_address_assurance_report.py",
             "--api-payload",
             str(api_payload),
             "--resolve-raw-artifacts-from-db",
@@ -1802,7 +1802,7 @@ def test_ptg_address_assurance_cli_main_verifies_traced_raw_artifact(monkeypatch
     assert output["issues"] == []
 
 
-def test_ptg_address_assurance_cli_fetches_api_url(monkeypatch):
+def test_price_address_assurance_cli_fetches_api_url(monkeypatch):
     script = _load_cli_module()
     captured = {}
 

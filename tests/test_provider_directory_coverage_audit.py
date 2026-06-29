@@ -27,6 +27,7 @@ def test_provider_directory_coverage_audit_parse_args_accepts_pod_safe_skip_flag
             "--skip-top-source-yield",
             "--skip-advertised-resource-gaps",
             "--skip-valid-zero-row-sources",
+            "--skip-canonical-resource-summary",
             "--skip-ptg-corroboration",
             "--skip-ptg-network-overlap",
             "--force-ptg-live-view-scans",
@@ -41,6 +42,7 @@ def test_provider_directory_coverage_audit_parse_args_accepts_pod_safe_skip_flag
     assert args.skip_top_source_yield is True
     assert args.skip_advertised_resource_gaps is True
     assert args.skip_valid_zero_row_sources is True
+    assert args.skip_canonical_resource_summary is True
     assert args.skip_ptg_corroboration is True
     assert args.skip_ptg_network_overlap is True
     assert args.force_ptg_live_view_scans is True
@@ -71,7 +73,7 @@ def test_provider_directory_coverage_audit_skipped_ptg_summary_shape():
 def test_provider_directory_coverage_audit_ptg_network_overlap_sql_uses_serving_network_names():
     sql = audit._ptg_network_name_overlap_cte_sql("mrf", ptg_plan_filter="AND plan_ids.plan_id = $1")
 
-    assert '"mrf"."ptg_provider_directory_address_corroboration"' in sql
+    assert '"mrf"."provider_directory_address_corroboration"' in sql
     assert '"mrf"."ptg2_serving_rate_compact"' in sql
     assert "provider_directory_network_names" in sql
     assert "rates.network_names" in sql
@@ -422,6 +424,12 @@ def test_provider_directory_coverage_audit_markdown_includes_skipped_live_sectio
                 "skipped": True,
                 "reason": "disabled by --skip-top-source-yield",
             },
+            "canonical_resource_summary": {
+                "available": False,
+                "skipped": True,
+                "reason": "disabled by --skip-canonical-resource-summary",
+                "resources": [],
+            },
         }
     )
 
@@ -430,3 +438,4 @@ def test_provider_directory_coverage_audit_markdown_includes_skipped_live_sectio
     assert "- network resolution: skipped (disabled by --skip-network-resolution)" in markdown
     assert "- advertised resource/source gaps: skipped (disabled by --skip-advertised-resource-gaps)" in markdown
     assert "- alias fan-out: skipped (disabled by --skip-top-source-yield)" in markdown
+    assert "- canonical resource storage: skipped (disabled by --skip-canonical-resource-summary)" in markdown

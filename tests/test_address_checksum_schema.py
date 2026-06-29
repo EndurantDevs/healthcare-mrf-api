@@ -14,7 +14,6 @@ from db.models import (
     EntityAddressEvidence,
     EntityAddressMedicationBridge,
     EntityAddressNetworkBridge,
-    EntityAddressPTGBridge,
     EntityAddressPlanBridge,
     EntityAddressProcedureBridge,
     EntityAddressUnified,
@@ -234,7 +233,6 @@ def test_entity_address_serving_models_expose_compact_keys_and_bridges():
     assert EntityAddressEvidence.__tablename__ == "entity_address_evidence"
     assert EntityAddressPlanBridge.__tablename__ == "entity_address_plan_bridge"
     assert EntityAddressNetworkBridge.__tablename__ == "entity_address_network_bridge"
-    assert EntityAddressPTGBridge.__tablename__ == "entity_address_ptg_bridge"
     assert EntityAddressProcedureBridge.__tablename__ == "entity_address_procedure_bridge"
     assert EntityAddressMedicationBridge.__tablename__ == "entity_address_medication_bridge"
 

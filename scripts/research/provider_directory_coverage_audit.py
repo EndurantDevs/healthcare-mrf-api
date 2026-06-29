@@ -525,7 +525,7 @@ async def _ptg_summary(
         summary["ptg_unified_address"] = {"available": True, **row}
     else:
         summary["ptg_unified_address"] = {"available": False}
-    view = "ptg_provider_directory_address_corroboration"
+    view = "provider_directory_address_corroboration"
     view_kind = await _relation_kind(conn, schema, view)
     if skip_corroboration:
         summary["ptg_corroboration"] = _skipped_summary("disabled by --skip-ptg-corroboration")
@@ -585,7 +585,7 @@ def _skipped_ptg_summary() -> dict[str, Any]:
 
 
 def _ptg_network_name_overlap_cte_sql(schema: str, *, ptg_plan_filter: str) -> str:
-    view = "ptg_provider_directory_address_corroboration"
+    view = "provider_directory_address_corroboration"
     pd_name_key = _network_name_key_sql("pd_network_name.value")
     ptg_name_key = _network_name_key_sql("ptg_network_name.value")
     return f"""
@@ -668,7 +668,7 @@ async def _ptg_network_name_overlap_summary(
     sample_limit: int,
     force_live_view_scans: bool,
 ) -> dict[str, Any]:
-    view = "ptg_provider_directory_address_corroboration"
+    view = "provider_directory_address_corroboration"
     view_kind = await _relation_kind(conn, schema, view)
     if view_kind == "view" and not force_live_view_scans:
         return _skipped_summary(
@@ -1359,7 +1359,16 @@ async def build_report(args: argparse.Namespace) -> dict[str, Any]:
             ),
             "capability_status_counts": await _capability_status_counts(conn, schema),
             "resource_summary": await _resource_summary(conn, schema),
-            "canonical_resource_summary": await _canonical_resource_summary(conn, schema),
+            "canonical_resource_summary": (
+                {
+                    "available": False,
+                    "skipped": True,
+                    "reason": "disabled by --skip-canonical-resource-summary",
+                    "resources": [],
+                }
+                if args.skip_canonical_resource_summary
+                else await _canonical_resource_summary(conn, schema)
+            ),
             "unified_summary": (
                 {"available": False, "skipped": True, "reason": "disabled by --skip-unified"}
                 if args.skip_unified
@@ -1458,6 +1467,8 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"`{canonical_resources.get('source_edge_rows')}` source edge row(s), "
             f"`{canonical_resources.get('edge_surplus_rows')}` edge surplus row(s)"
         )
+    elif canonical_resources.get("skipped"):
+        lines.append(f"- canonical resource storage: skipped ({canonical_resources.get('reason')})")
     elif canonical_resources.get("reason"):
         lines.append(f"- canonical resource storage: unavailable ({canonical_resources.get('reason')})")
     if unified.get("available"):
@@ -1720,6 +1731,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--skip-valid-zero-row-sources",
         action="store_true",
         help="Skip valid-metadata-with-zero-resource-row sample checks.",
+    )
+    parser.add_argument(
+        "--skip-canonical-resource-summary",
+        action="store_true",
+        help="Skip canonical-resource/source-edge fan-out summary; this can be slow on dev-scale catalogs.",
     )
     parser.add_argument("--format", choices=("json", "markdown"), default="json")
     return parser.parse_args(argv)

@@ -52,8 +52,6 @@ def test_importer_registry_exposes_ptg_and_finish_lifecycle():
     assert items["address-archive-v2-migrate"]["enqueue_adapter"] == "arq_single_job"
     assert items["address-archive-v2-migrate"]["queue"] == "arq:AddressArchive"
     assert items["address-archive-v2-migrate"]["cancelable"] is True
-    assert "ptg-address" not in items
-    assert "ptg-address-entity-refresh" not in items
     assert items["provider-directory-fhir"]["family"] == "provider"
     assert items["provider-directory-fhir"]["enqueue_adapter"] == "arq_single_job"
     assert items["provider-directory-fhir"]["queue"] == "arq:ProviderDirectoryFHIR"

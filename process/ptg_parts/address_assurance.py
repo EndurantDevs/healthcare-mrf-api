@@ -598,7 +598,7 @@ def summarize_ptg_price_address_payload(
     }
 
 
-def build_ptg_address_assurance_report(
+def build_price_address_assurance_report(
     *,
     api_payload: Any | None = None,
     raw_artifact_paths: list[str | Path] | None = None,

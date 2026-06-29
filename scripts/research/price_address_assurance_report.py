@@ -4,13 +4,13 @@
 
 Examples:
 
-  rtk venv/bin/python scripts/research/ptg_address_assurance_report.py \
+  rtk venv/bin/python scripts/research/price_address_assurance_report.py \
     --api-payload /tmp/ptg-response.json \
     --raw-artifact /work/ptg2-artifacts/raw/source.json.gz
 
-  curl -sS "$PTG_URL" | rtk venv/bin/python scripts/research/ptg_address_assurance_report.py --api-payload -
+  curl -sS "$PTG_URL" | rtk venv/bin/python scripts/research/price_address_assurance_report.py --api-payload -
 
-  rtk venv/bin/python scripts/research/ptg_address_assurance_report.py \
+  rtk venv/bin/python scripts/research/price_address_assurance_report.py \
     --api-url "$PTG_URL" \
     --api-key "$HEALTHPORTA_API_KEY" \
     --require-network-bound-address \
@@ -35,7 +35,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from process.ptg_parts.address_assurance import (
-    build_ptg_address_assurance_report,
+    build_price_address_assurance_report,
     source_file_version_ids_from_ptg_payload,
 )
 
@@ -130,7 +130,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def _fetch_api_payload(url: str, api_key: str | None, timeout: float) -> Any:
-    headers = {"Accept": "application/json", "User-Agent": "healthporta-ptg-address-assurance/1.0"}
+    headers = {"Accept": "application/json", "User-Agent": "healthporta-price-address-assurance/1.0"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     request = urllib.request.Request(url, headers=headers)
@@ -341,7 +341,7 @@ def main() -> int:
             if source_file_version_id:
                 raw_artifact_source_file_version_ids_by_path.setdefault(path, []).append(source_file_version_id)
         raw_artifact_paths = _dedupe(raw_artifact_paths)
-    report = build_ptg_address_assurance_report(
+    report = build_price_address_assurance_report(
         api_payload=api_payload,
         raw_artifact_paths=raw_artifact_paths,
         raw_artifact_source_file_version_ids_by_path=raw_artifact_source_file_version_ids_by_path,

@@ -19,7 +19,6 @@ from db.models import (
     EntityAddressEvidence,
     EntityAddressMedicationBridge,
     EntityAddressNetworkBridge,
-    EntityAddressPTGBridge,
     EntityAddressPlanBridge,
     EntityAddressProcedureBridge,
     EntityAddressUnified,
@@ -93,7 +92,6 @@ SUPPORT_TABLE_MODELS = (
     EntityAddressEvidence,
     EntityAddressPlanBridge,
     EntityAddressNetworkBridge,
-    EntityAddressPTGBridge,
     EntityAddressProcedureBridge,
     EntityAddressMedicationBridge,
     FacilityAnchorNPICandidate,
@@ -1533,7 +1531,6 @@ async def _table_column_exists(db_schema: str, table_name: str, column_name: str
 async def _support_bridge_reuse_available(db_schema: str, *, build_network_bridge: bool) -> bool:
     bridge_models: list[type] = [
         EntityAddressPlanBridge,
-        EntityAddressPTGBridge,
         EntityAddressProcedureBridge,
         EntityAddressMedicationBridge,
     ]
@@ -5061,7 +5058,6 @@ def _support_patch_models(*, build_network_bridge: bool) -> list[type]:
     models: list[type] = [
         EntityAddressEvidence,
         EntityAddressPlanBridge,
-        EntityAddressPTGBridge,
         EntityAddressProcedureBridge,
         EntityAddressMedicationBridge,
     ]
@@ -5374,52 +5370,6 @@ def _network_bridge_sql(
            {affected_filter}
            AND NULLIF(aca_network.value, '') IS NOT NULL
       ) AS bridge_rows;
-    """
-
-
-def _ptg_bridge_sql(
-    db_schema: str,
-    ptg_stage_table: str,
-    stage_table: str,
-    *,
-    affected_group_table: str | None = None,
-) -> str:
-    affected_filter = _affected_stage_row_filter_sql(db_schema, affected_group_table)
-    return f"""
-    INSERT INTO {db_schema}.{ptg_stage_table} (
-        location_key,
-        entity_type,
-        entity_id,
-        source_key,
-        snapshot_id,
-        ptg_plan_id
-    )
-    WITH source_record_bridge AS (
-        SELECT DISTINCT
-            t.location_key,
-            t.entity_type,
-            t.entity_id,
-            NULLIF(split_part(record_id.value, ':', 2), '') AS source_key,
-            NULLIF(split_part(record_id.value, ':', 3), '') AS snapshot_id,
-            plan_id.value AS ptg_plan_id
-          FROM {db_schema}.{stage_table} AS t
-          JOIN LATERAL unnest(COALESCE(t.source_record_ids, ARRAY[]::varchar[])) AS record_id(value) ON TRUE
-          JOIN LATERAL unnest(COALESCE(t.ptg_plan_array, ARRAY[]::varchar[])) AS plan_id(value) ON TRUE
-         WHERE t.location_key IS NOT NULL
-           {affected_filter}
-           AND record_id.value LIKE 'ptg:%'
-           AND NULLIF(plan_id.value, '') IS NOT NULL
-           AND NULLIF(split_part(record_id.value, ':', 2), '') IS NOT NULL
-           AND NULLIF(split_part(record_id.value, ':', 3), '') IS NOT NULL
-    )
-    SELECT DISTINCT
-        location_key,
-        entity_type,
-        entity_id,
-        source_key,
-        snapshot_id,
-        ptg_plan_id
-      FROM source_record_bridge;
     """
 
 
@@ -6485,14 +6435,6 @@ def _support_stage_statements(
             "plan bridge",
             ("location_key", "entity_type", "entity_id", "plan_id", "market_type"),
             _plan_bridge_sql,
-            None,
-            1,
-        ),
-        (
-            EntityAddressPTGBridge,
-            "ptg bridge",
-            ("location_key", "entity_type", "entity_id", "source_key", "snapshot_id", "ptg_plan_id"),
-            _ptg_bridge_sql,
             None,
             1,
         ),

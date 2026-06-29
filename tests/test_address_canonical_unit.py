@@ -1190,11 +1190,11 @@ def test_latest_provider_directory_partial_scope_sql_uses_source_metadata_not_re
 
 def test_entity_address_unified_stage_index_name_is_hash_safe_for_long_names():
     first = entity_address_unified._stage_index_name(
-        "ptg_address_codex_member_partial_smokefull_member_coverage",
+        "provider_location_codex_member_partial_smokefull_member_coverage",
         "npi",
     )
     second = entity_address_unified._stage_index_name(
-        "ptg_address_codex_member_partial_smokefull_member_coverage",
+        "provider_location_codex_member_partial_smokefull_member_coverage",
         "shard_npi",
     )
 
@@ -1344,19 +1344,6 @@ def test_entity_address_unified_nppes_source_skips_zip_restore_without_archive()
     assert "nppes_zip_restore" not in nppes_source
 
 
-def test_entity_address_unified_ptg_bridge_uses_source_record_ids():
-    sql = entity_address_unified._ptg_bridge_sql(  # pylint: disable=protected-access
-        "mrf",
-        "entity_address_ptg_bridge_20260623",
-        "entity_address_unified_20260623",
-    )
-
-    assert "source_record_bridge AS" in sql
-    assert "array_bridge AS" not in sql
-    assert "regexp_replace(COALESCE(t.ptg_address_version" not in sql
-    assert "record_id.value LIKE 'ptg:%'" in sql
-
-
 def test_entity_address_unified_can_range_shard_large_source_selects():
     selects = entity_address_unified._source_selects(
         "mrf",
@@ -1462,7 +1449,6 @@ def test_entity_address_unified_sql_carries_address_key(monkeypatch):
     assert "address_key::uuid AS address_key" in insert_sql
     assert "ptg_plan_array," in insert_sql
     assert "COALESCE(ptg_plan_array, ARRAY[]::varchar[])::varchar[] AS ptg_plan_array" in insert_sql
-    assert "ptg_address_version" not in insert_sql
     assert "address_key," in materialize_sql
     assert "location_key," in materialize_sql
     assert "archive_identity_version," in materialize_sql
@@ -2147,9 +2133,6 @@ def test_entity_address_unified_support_statements_shard_facility_candidates(mon
             entity_address_unified.EntityAddressPlanBridge: stage(
                 "entity_address_plan_bridge_20260614"
             ),
-            entity_address_unified.EntityAddressPTGBridge: stage(
-                "entity_address_ptg_bridge_20260614"
-            ),
             entity_address_unified.EntityAddressProcedureBridge: stage(
                 "entity_address_procedure_bridge_20260614"
             ),
@@ -2198,9 +2181,6 @@ def test_entity_address_unified_support_statements_shard_code_bridges(monkeypatc
             entity_address_unified.EntityAddressEvidence: stage("entity_address_evidence_20260614"),
             entity_address_unified.EntityAddressPlanBridge: stage(
                 "entity_address_plan_bridge_20260614"
-            ),
-            entity_address_unified.EntityAddressPTGBridge: stage(
-                "entity_address_ptg_bridge_20260614"
             ),
             entity_address_unified.EntityAddressProcedureBridge: stage(
                 "entity_address_procedure_bridge_20260614"
@@ -2253,9 +2233,6 @@ def test_entity_address_unified_support_statements_can_skip_optional_serving_tab
             entity_address_unified.EntityAddressPlanBridge: stage(
                 "entity_address_plan_bridge_20260614"
             ),
-            entity_address_unified.EntityAddressPTGBridge: stage(
-                "entity_address_ptg_bridge_20260614"
-            ),
             entity_address_unified.EntityAddressProcedureBridge: stage(
                 "entity_address_procedure_bridge_20260614"
             ),
@@ -2279,7 +2256,6 @@ def test_entity_address_unified_support_statements_can_skip_optional_serving_tab
 
     assert "evidence" in labels
     assert "plan bridge" in labels
-    assert "ptg bridge" in labels
     assert not any(label.startswith("procedure bridge") for label in labels)
     assert not any(label.startswith("medication bridge") for label in labels)
     assert not any(label.startswith("facility anchor npi candidate") for label in labels)
@@ -2395,9 +2371,6 @@ def test_entity_address_unified_builds_evidence_and_bridge_stage_sql():
     assert "unnest(COALESCE(t.aca_plan_array, ARRAY[]::varchar[]))" in sql_blob
     assert "INSERT INTO mrf.entity_address_network_bridge_20260614" in sql_blob
     assert "unnest(COALESCE(t.plans_network_array, ARRAY[]::int[]))" in sql_blob
-    assert "INSERT INTO mrf.entity_address_ptg_bridge_20260614" in sql_blob
-    assert "unnest(COALESCE(t.ptg_plan_array, ARRAY[]::varchar[]))" in sql_blob
-    assert "record_id.value LIKE 'ptg:%'" in sql_blob
     assert "INSERT INTO mrf.entity_address_procedure_bridge_20260614" in sql_blob
     assert "'HP_PROCEDURE_CODE'::varchar AS code_system" in sql_blob
     assert "INSERT INTO mrf.entity_address_medication_bridge_20260614" in sql_blob
@@ -2421,7 +2394,6 @@ def test_entity_address_unified_partial_support_stage_reuses_live_bridge_rows():
     assert "INSERT INTO mrf.entity_address_procedure_bridge_20260614 (location_key, npi, code_system, code)" in sql_blob
     assert "FROM mrf.entity_address_procedure_bridge AS b" in sql_blob
     assert "FROM mrf.entity_address_medication_bridge AS b" in sql_blob
-    assert "FROM mrf.entity_address_ptg_bridge AS b" in sql_blob
     assert "FROM mrf.entity_address_plan_bridge AS b" in sql_blob
     assert "FROM mrf.entity_address_network_bridge AS b" in sql_blob
     assert "JOIN mrf.entity_address_unified AS live" in sql_blob
@@ -2479,8 +2451,6 @@ def test_entity_address_unified_partial_support_patch_sql_offsets_evidence_ids()
     assert "INSERT INTO mrf.entity_address_evidence (evidence_id" in sql_blob
     assert "SELECT COALESCE(MAX(evidence_id), 0) FROM mrf.entity_address_evidence" in sql_blob
     assert "ROW_NUMBER() OVER ())::bigint AS evidence_id" in sql_blob
-    assert "INSERT INTO mrf.entity_address_ptg_bridge" in sql_blob
-    assert "FROM mrf.entity_address_ptg_bridge_20260614 AS stage" in sql_blob
 
 
 def test_entity_address_unified_partial_main_patch_sql_deletes_and_inserts_affected_rows():

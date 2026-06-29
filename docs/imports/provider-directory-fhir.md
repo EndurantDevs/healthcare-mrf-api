@@ -46,12 +46,12 @@ should treat them as network proof only after emitting concrete
 `provider_directory_network_matches` objects with both `ptg_network_name` and
 `provider_directory_network_name`.
 
-## PTG Address Corroboration
+## Pricing Address Corroboration
 
 Provider Directory FHIR can upgrade unified addresses from NPPES-only inference
 to payer-directory corroboration. The helper
-`provider_directory_ptg_address_corroboration_sql()` builds the query shape for
-`ptg_provider_directory_address_corroboration`, which matches:
+`provider_directory_address_corroboration_sql()` builds the query shape for
+`provider_directory_address_corroboration`, which matches:
 
 - `entity_address_unified.npi` / `inferred_npi` to `provider_directory_practitioner.npi` or
   `provider_directory_organization.npi`;
@@ -339,6 +339,7 @@ sudo k3s kubectl -n healthporta-dev exec -i deploy/healthcare-mrf-api -- \
   --skip-top-source-yield \
   --skip-advertised-resource-gaps \
   --skip-valid-zero-row-sources \
+  --skip-canonical-resource-summary \
   < scripts/research/provider_directory_coverage_audit.py
 ```
 

@@ -4387,26 +4387,6 @@ class EntityAddressNetworkBridge(Base, JSONOutputMixin):
     network_id = Column(String, nullable=False)
 
 
-class EntityAddressPTGBridge(Base, JSONOutputMixin):
-    __tablename__ = "entity_address_ptg_bridge"
-    __main_table__ = __tablename__
-    __table_args__ = (
-        PrimaryKeyConstraint("location_key", "entity_type", "entity_id", "source_key", "snapshot_id", "ptg_plan_id"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
-    )
-    __my_index_elements__ = ["location_key", "entity_type", "entity_id", "source_key", "snapshot_id", "ptg_plan_id"]
-    __my_additional_indexes__ = [
-        {"index_elements": ("ptg_plan_id", "source_key", "location_key"), "name": "ptg_plan_source_location"}
-    ]
-
-    location_key = Column(String(64), nullable=False)
-    entity_type = Column(String(64), nullable=False)
-    entity_id = Column(String(128), nullable=False)
-    source_key = Column(String, nullable=False)
-    snapshot_id = Column(String, nullable=False)
-    ptg_plan_id = Column(String, nullable=False)
-
-
 class EntityAddressProcedureBridge(Base, JSONOutputMixin):
     __tablename__ = "entity_address_procedure_bridge"
     __main_table__ = __tablename__
