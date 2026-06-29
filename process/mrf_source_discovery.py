@@ -11440,6 +11440,53 @@ _IMPORT_CONTROL_STAGED_VISIBILITY = "internal"
 _IMPORT_CONTROL_STAGED_STATUS = "needs_review"
 
 
+def _import_control_source_identity_key(row: dict[str, Any]) -> str:
+    index_url, official_url = _import_control_source_urls(row)
+    return (
+        _canonical_or_none(index_url or official_url)
+        or str(row.get("source_id") or row.get("source_key") or "")
+    )
+
+
+def _import_control_source_promotion_rank(
+    row: dict[str, Any],
+    snapshot: dict[str, list[dict[str, Any]]],
+) -> tuple[int, int, int, int]:
+    status_rank = {
+        "active": 5,
+        "stale": 4,
+        "needs_review": 3,
+        "unsupported": 1,
+        "archived": 0,
+    }.get(str(row.get("status") or "").strip().lower(), 2)
+    metadata = row.get("metadata_json") or {}
+    aliases = metadata.get("aliases") or []
+    if not isinstance(aliases, list):
+        aliases = [aliases]
+    source_id = str(row.get("source_id") or "")
+    return (
+        1 if snapshot.get(source_id) else 0,
+        status_rank,
+        len([alias for alias in aliases if str(alias or "").strip()]),
+        1 if (row.get("index_url") or row.get("human_url")) else 0,
+    )
+
+
+def _dedupe_import_control_source_rows(
+    source_rows: list[dict[str, Any]],
+    snapshot: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    by_key: dict[str, dict[str, Any]] = {}
+    for row in source_rows:
+        key = _import_control_source_identity_key(row)
+        previous = by_key.get(key)
+        if previous is None or _import_control_source_promotion_rank(
+            row, snapshot
+        ) > _import_control_source_promotion_rank(previous, snapshot):
+            by_key[key] = row
+    return list(by_key.values())
+
+
 async def _promote_import_control_source(
     session: aiohttp.ClientSession,
     base: str,
@@ -11598,6 +11645,7 @@ async def _push_import_control_catalog(
     snapshot = await _import_control_snapshot_items(
         [str(row.get("source_id") or "") for row in eligible]
     )
+    eligible = _dedupe_import_control_source_rows(eligible, snapshot)
     if not snapshot and all(
         str(row.get("status") or "active").strip().lower() == "active"
         for row in eligible
