@@ -3622,6 +3622,186 @@ paths:
             application/json:
               schema:
                 type: object
+  /pricing/providers/search-by-procedure:
+    get:
+      operationId: searchPricingProvidersByProcedure
+      summary: Find providers by procedure/service text or code
+      parameters:
+        - name: year
+          in: query
+          schema: { type: integer }
+        - name: min_claims
+          in: query
+          schema: { type: number }
+        - name: min_total_cost
+          in: query
+          schema: { type: number }
+        - name: state
+          in: query
+          schema: { type: string }
+        - name: city
+          in: query
+          schema: { type: string }
+        - name: zip5
+          in: query
+          schema: { type: string }
+        - name: zip_radius_miles
+          in: query
+          schema: { type: number, minimum: 0, default: 10 }
+        - name: specialty
+          in: query
+          schema: { type: string }
+        - name: include_subspecialties
+          in: query
+          schema: { type: boolean }
+        - name: provider_type
+          in: query
+          schema: { type: string }
+        - name: classification
+          in: query
+          schema: { type: string }
+        - name: taxonomy_code
+          in: query
+          schema: { type: string }
+        - name: taxonomy_codes
+          in: query
+          schema: { type: string }
+        - name: primary_only
+          in: query
+          schema: { type: boolean }
+        - name: taxonomy_classification
+          in: query
+          schema: { type: string }
+        - name: taxonomy_specialization
+          in: query
+          schema: { type: string }
+        - name: taxonomy_section
+          in: query
+          schema: { type: string }
+        - name: q
+          in: query
+          schema: { type: string }
+        - name: code
+          in: query
+          schema: { type: string }
+        - name: code_system
+          in: query
+          schema: { type: string }
+        - name: plan_id
+          in: query
+          schema: { type: string }
+        - name: plan_external_id
+          in: query
+          schema: { type: string }
+        - name: plan_market_type
+          in: query
+          schema: { type: string }
+        - name: market_type
+          in: query
+          schema: { type: string }
+        - name: source_key
+          in: query
+          schema: { type: string }
+        - name: snapshot_id
+          in: query
+          schema: { type: string }
+        - name: mode
+          in: query
+          schema: { type: string, enum: [product_search, exact_source] }
+        - name: npi
+          in: query
+          schema: { type: integer }
+        - name: lat
+          in: query
+          schema: { type: number }
+        - name: long
+          in: query
+          schema: { type: number }
+        - name: radius
+          in: query
+          schema: { type: number }
+        - name: radius_miles
+          in: query
+          schema: { type: number }
+        - name: service_code
+          in: query
+          schema: { type: string }
+        - name: place_of_service
+          in: query
+          schema: { type: string }
+        - name: pos
+          in: query
+          schema: { type: string }
+        - name: modifier
+          in: query
+          schema: { type: string }
+        - name: modifiers
+          in: query
+          schema: { type: string }
+        - name: billing_code_modifier
+          in: query
+          schema: { type: string }
+        - name: rate
+          in: query
+          schema: { type: number }
+        - name: negotiated_rate
+          in: query
+          schema: { type: number }
+        - name: rate_tolerance
+          in: query
+          schema: { type: number }
+        - name: negotiated_rate_tolerance
+          in: query
+          schema: { type: number }
+        - name: include_providers
+          in: query
+          schema: { type: boolean }
+        - name: include_code_details
+          in: query
+          schema: { type: boolean }
+        - name: include_sources
+          in: query
+          schema: { type: boolean }
+        - name: include_unverified_addresses
+          in: query
+          schema: { type: boolean, default: true }
+        - name: include_evidence
+          in: query
+          schema: { type: boolean }
+        - name: include_details
+          in: query
+          schema: { type: boolean }
+        - name: include_debug
+          in: query
+          schema: { type: boolean }
+        - name: include_legacy_fields
+          in: query
+          schema: { type: boolean }
+        - name: order
+          in: query
+          schema: { type: string, enum: [asc, desc] }
+        - name: order_by
+          in: query
+          schema:
+            type: string
+            enum:
+              [
+                npi,
+                provider_name,
+                total_services,
+                total_submitted_charges,
+                total_allowed_amount,
+                total_beneficiaries,
+                matched_service_codes,
+                cost_index,
+              ]
+      responses:
+        '200':
+          description: Paginated provider matches by procedure
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PricingProcedureProviderListResponse'
   /pricing/providers/by-procedure:
     get:
       operationId: getPricingProvidersByProcedure
