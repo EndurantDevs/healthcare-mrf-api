@@ -52,6 +52,8 @@ DEFAULT_SEED_DB_URL = (
     "https://raw.githubusercontent.com/hltiunn/provider-directory-db/main/data/provider_directory.db"
 )
 LOGGER = logging.getLogger(__name__)
+MAX_FHIR_JSON_BODY_BYTES = 20 * 1024 * 1024
+READ_CHUNK_BYTES = 256 * 1024
 DEFAULT_RESOURCES = (
     "InsurancePlan",
     "PractitionerRole",
@@ -3268,6 +3270,26 @@ def _decode_json_body(body: bytes) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def _read_response_body_with_deadline(
+    response: Any,
+    *,
+    timeout: int,
+    max_bytes: int = MAX_FHIR_JSON_BODY_BYTES,
+) -> bytes:
+    deadline = time.monotonic() + max(1, timeout)
+    chunks: list[bytes] = []
+    total = 0
+    while total < max_bytes:
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"response body read exceeded {timeout}s")
+        chunk = response.read(min(READ_CHUNK_BYTES, max_bytes - total))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    return b"".join(chunks)
+
+
 def _fetch_json_sync(
     url: str,
     *,
@@ -3286,7 +3308,7 @@ def _fetch_json_sync(
     request = urllib.request.Request(fetch_url, headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=timeout, context=_ssl_context()) as response:
-            body = response.read(20 * 1024 * 1024)
+            body = _read_response_body_with_deadline(response, timeout=timeout)
             return response.status, _decode_json_body(body), None, int((time.monotonic() - started) * 1000)
     except urllib.error.HTTPError as exc:
         try:
@@ -3321,7 +3343,7 @@ def _post_json_sync(
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout, context=_ssl_context()) as response:
-            body = response.read(20 * 1024 * 1024)
+            body = _read_response_body_with_deadline(response, timeout=timeout)
             return response.status, _decode_json_body(body), None, int((time.monotonic() - started) * 1000)
     except urllib.error.HTTPError as exc:
         try:

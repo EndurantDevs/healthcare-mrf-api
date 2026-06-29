@@ -471,6 +471,40 @@ def test_decode_json_body_accepts_utf8_bom():
     assert payload == {"resourceType": "CapabilityStatement", "fhirVersion": "4.0.1"}
 
 
+def test_read_response_body_with_deadline_reads_chunks(monkeypatch):
+    class FakeResponse:
+        def __init__(self):
+            self.chunks = [b'{"resourceType":"', b'Bundle"}', b""]
+
+        def read(self, _size):
+            return self.chunks.pop(0)
+
+    monkeypatch.setattr(importer.time, "monotonic", lambda: 100.0)
+
+    assert (
+        importer._read_response_body_with_deadline(  # pylint: disable=protected-access
+            FakeResponse(),
+            timeout=10,
+        )
+        == b'{"resourceType":"Bundle"}'
+    )
+
+
+def test_read_response_body_with_deadline_times_out(monkeypatch):
+    class FakeResponse:
+        def read(self, _size):
+            return b"x"
+
+    timestamps = iter([100.0, 100.5, 111.0])
+    monkeypatch.setattr(importer.time, "monotonic", lambda: next(timestamps))
+
+    with pytest.raises(TimeoutError):
+        importer._read_response_body_with_deadline(  # pylint: disable=protected-access
+            FakeResponse(),
+            timeout=10,
+        )
+
+
 def test_candidate_metadata_urls_repairs_resource_and_provider_directory_suffixes():
     humana = importer._candidate_metadata_urls(  # pylint: disable=protected-access
         {"api_base": "https://fhir.humana.com/api/provider-directory/"}
