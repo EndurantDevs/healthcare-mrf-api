@@ -3830,6 +3830,63 @@ def test_mymedicalshopper_targets_keep_latest_generated_toc_per_plan():
     assert context["group_number"] == "77100"
 
 
+class _MMSHeartbeatOnlyWebSocket:
+    def __init__(self):
+        self.sent = []
+
+    async def send_str(self, payload):
+        self.sent.append(payload)
+
+    async def receive(self):
+        await discovery.asyncio.sleep(0)
+        return types.SimpleNamespace(
+            type=discovery.aiohttp.WSMsgType.TEXT,
+            data='a["{\\"msg\\":\\"ping\\",\\"id\\":\\"heartbeat\\"}"]',
+        )
+
+
+def _mms_sent_messages(ws):
+    messages = []
+    for payload in ws.sent:
+        for item in json.loads(payload):
+            messages.append(json.loads(item))
+    return messages
+
+
+@pytest.mark.asyncio
+async def test_mymedicalshopper_ddp_call_uses_overall_deadline_for_heartbeats():
+    ws = _MMSHeartbeatOnlyWebSocket()
+
+    with pytest.raises(TimeoutError, match="method getBenefitPlans timed out"):
+        await discovery._mymedicalshopper_ddp_call(
+            ws,
+            method="getBenefitPlans",
+            params=[{"employerSlug": "slow-source"}],
+            request_id="mms-plans-slow-source",
+            timeout_seconds=0.001,
+        )
+
+    assert ws.sent
+    assert any(message.get("msg") == "pong" for message in _mms_sent_messages(ws))
+
+
+@pytest.mark.asyncio
+async def test_mymedicalshopper_subscription_uses_overall_deadline_for_heartbeats():
+    ws = _MMSHeartbeatOnlyWebSocket()
+
+    with pytest.raises(TimeoutError, match="subscription tabular_getInfo timed out"):
+        await discovery._mymedicalshopper_ddp_subscribe_collect(
+            ws,
+            name="tabular_getInfo",
+            params=["EntityMRFEmployers", {}, [["name", "asc"]], 0, 20],
+            sub_id="mms-info-slow-source",
+            timeout_seconds=0.001,
+        )
+
+    assert ws.sent
+    assert any(message.get("msg") == "pong" for message in _mms_sent_messages(ws))
+
+
 def test_mymedicalshopper_direct_employer_slug_infers_tpa_and_group_context():
     assert (
         discovery._mymedicalshopper_group_id_from_employer_slug(

@@ -2694,10 +2694,22 @@ async def _mymedicalshopper_ddp_send(
 
 
 async def _mymedicalshopper_ddp_recv(
-    ws: aiohttp.ClientWebSocketResponse, *, timeout_seconds: float
+    ws: aiohttp.ClientWebSocketResponse,
+    *,
+    timeout_seconds: float,
+    deadline: float | None = None,
+    operation: str = "response",
 ) -> list[dict[str, Any]]:
     while True:
-        frame = await asyncio.wait_for(ws.receive(), timeout=timeout_seconds)
+        frame_timeout = timeout_seconds
+        if deadline is not None:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"MyMedicalShopper DDP {operation} timed out after {timeout_seconds:g}s"
+                )
+            frame_timeout = min(timeout_seconds, remaining)
+        frame = await asyncio.wait_for(ws.receive(), timeout=frame_timeout)
         if frame.type == aiohttp.WSMsgType.TEXT:
             messages = _mymedicalshopper_sockjs_messages(str(frame.data))
             returned: list[dict[str, Any]] = []
@@ -2763,9 +2775,13 @@ async def _mymedicalshopper_ddp_call(
     await _mymedicalshopper_ddp_send(
         ws, {"msg": "method", "id": request_id, "method": method, "params": params}
     )
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
     while True:
         for message in await _mymedicalshopper_ddp_recv(
-            ws, timeout_seconds=timeout_seconds
+            ws,
+            timeout_seconds=timeout_seconds,
+            deadline=deadline,
+            operation=f"method {method}",
         ):
             if message.get("msg") != "result" or message.get("id") != request_id:
                 continue
@@ -2788,9 +2804,13 @@ async def _mymedicalshopper_ddp_subscribe_collect(
         ws, {"msg": "sub", "id": sub_id, "name": name, "params": params}
     )
     collected: list[dict[str, Any]] = []
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
     while True:
         for message in await _mymedicalshopper_ddp_recv(
-            ws, timeout_seconds=timeout_seconds
+            ws,
+            timeout_seconds=timeout_seconds,
+            deadline=deadline,
+            operation=f"subscription {name}",
         ):
             if message.get("msg") in {"added", "changed", "removed"}:
                 collected.append(message)
