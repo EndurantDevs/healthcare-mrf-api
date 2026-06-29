@@ -413,6 +413,12 @@ def test_classify_hosting_platform_recognizes_public_adapter_pages():
     )
     assert (
         discovery.classify_hosting_platform(
+            "https://www.ebam.com/machine-readable-files/"
+        )
+        == "html_mrf_links"
+    )
+    assert (
+        discovery.classify_hosting_platform(
             "https://www.motivhealth.com/machinereadablefiles/"
         )
         == "html_mrf_links"
@@ -843,6 +849,7 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
 | Payer | Type | Public MRF TOC / landing URL | Notes |
 |---|---|---|---|
 | 90 Degree Benefits | tpa | https://portal.90degreebenefits.com/MemberPortal/MachineReadableFiles | aliases: 90 Degree, 90DB |
+| Banner Aetna | national | https://health1.aetna.com/app/public/#/one/insurerCode=AETNACVS_I&brandCode=BANNERJVFI/machine-readable-transparency-in-coverage | aliases: Banner Aetna, Banner Health Aetna |
 | Select Health | regional | https://www.selecthealth.org/disclaimers/machine-readable-data | aliases: SelectHealth |
 | EyeMed | vision | https://content.eyemedvisioncare.com/EyeMed_HCSC/eyemed_in-network-rates.json | benefit lines: vision; aliases: EyeMed Vision Care, Eye Med, Ameritas with EyeMed |
 | EMI Health | regional | https://emihealth.com/machinereadables | public machine-readable files page |
@@ -883,6 +890,7 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
 | SISCO | tpa | https://sisconosurprise.com/ppo/phcs/index.html | aliases: SISCO Benefits, Self Insured Services Company |
 | CBA Blue | tpa | https://www.cbabluevt.com/employer-resources/ | aliases: CBA BLUE |
 | EBMS | tpa | https://caa.ebms.com/ | aliases: Employee Benefit Management Services |
+| EBAM | tpa | https://www.ebam.com/machine-readable-files/ | aliases: EBA&M, Employee Benefit Administrators and Managers |
 | Univera Healthcare | regional | https://univerahc.healthsparq.com/healthsparq/public/#/one/insurerCode=UNVRA_I&brandCode=UNVRA&productCode=MRF/machine-readable-transparency-in-coverage | official HealthSparq MRF link |
 | EBPA | tpa | https://tuition.ebpabenefits.com/employers/machine-readable-file-links | aliases: EBPA Benefits |
 | HealthNow Administrative Services | tpa | https://www.hnas.com/digital-resources/machine-readable-files | aliases: HNAS |
@@ -908,6 +916,8 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
         == "healthspace_machine_readable_files"
     )
     assert by_name["90 Degree Benefits"].aliases == ("90 Degree", "90DB")
+    assert by_name["Banner Aetna"].hosting_platform == "aetna_health1"
+    assert by_name["Banner Aetna"].aliases == ("Banner Aetna", "Banner Health Aetna")
     assert by_name["Select Health"].hosting_platform == "html_mrf_links"
     assert by_name["Select Health"].aliases == ("SelectHealth",)
     assert by_name["EyeMed"].entity_type == "vision"
@@ -1032,6 +1042,7 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
     )
     assert by_name["CBA Blue"].hosting_platform == "html_mrf_links"
     assert by_name["EBMS"].hosting_platform == "ebms_caa_directory"
+    assert by_name["EBAM"].hosting_platform == "html_mrf_links"
     assert by_name["Univera Healthcare"].hosting_platform == "healthsparq"
     assert by_name["EBPA"].hosting_platform == "html_mrf_links"
     assert (
@@ -5656,6 +5667,39 @@ def test_parse_html_mrf_links_extracts_tocs_and_body_file_references():
                 }
             ],
         },
+    ]
+
+
+def test_parse_html_mrf_links_extracts_raw_embedded_rate_files():
+    html = """
+    <div
+      data-files='[
+        "/wp-content/uploads/2026/06/2026-06-01_example_allowed-amounts.csv",
+        "/wp-content/uploads/2026/06/2026-06-01_example_innetworkrates.json",
+        "/wp-content/uploads/theme/app.min.js"
+      ]'>
+      Machine Readable Files
+    </div>
+    """
+
+    targets = discovery._parse_html_mrf_links(
+        html, base_url="https://example-tpa.com/machine-readable-files/"
+    )
+
+    assert [
+        (target["url"], target["target_file_type"], target["target_kind"])
+        for target in targets
+    ] == [
+        (
+            "https://example-tpa.com/wp-content/uploads/2026/06/2026-06-01_example_allowed-amounts.csv",
+            "allowed-amounts",
+            "file_reference",
+        ),
+        (
+            "https://example-tpa.com/wp-content/uploads/2026/06/2026-06-01_example_innetworkrates.json",
+            "in-network",
+            "file_reference",
+        ),
     ]
 
 

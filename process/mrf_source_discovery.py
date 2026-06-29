@@ -66,6 +66,10 @@ HTTP_TOTAL_TIMEOUT = max(int(os.getenv("HLTHPRT_MRF_DISCOVERY_HTTP_TIMEOUT", "30
 HTTP_READ_TIMEOUT = max(int(os.getenv("HLTHPRT_MRF_DISCOVERY_READ_TIMEOUT", "120")), 1)
 DEFAULT_FILE_PROBE_TYPES = ("in-network", "allowed-amounts")
 USER_AGENT = "HealthPorta mrf-source-discovery/1.0"
+BROWSER_FALLBACK_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+)
 MRF_URL_OBSERVATION_NULLABLE_KEYS = (
     "canonical_url",
     "url_type",
@@ -788,6 +792,8 @@ def classify_hosting_platform(url: str | None) -> str | None:
         and "machine-readable-files" in path
     ):
         return "html_mrf_links"
+    if host in {"www.ebam.com", "ebam.com"} and "machine-readable-files" in path:
+        return "html_mrf_links"
     if (
         host in {"www.motivhealth.com", "motivhealth.com"}
         and "machinereadablefiles" in path
@@ -1441,7 +1447,7 @@ async def _fetch_text(
             return await _fetch_text(
                 url, max_bytes=max_bytes, session=owned_session, expect_json=expect_json
             )
-    async with session.get(url, allow_redirects=True) as resp:
+    async def read_response(resp: aiohttp.ClientResponse) -> tuple[bytes, str]:
         await _assert_fetch_url_allowed(str(resp.url))
         content_type = str(resp.headers.get("Content-Type") or "").lower()
         if expect_json and any(
@@ -1462,8 +1468,30 @@ async def _fetch_text(
                 if prefix.startswith((b"<!doctype", b"<html", b"<?xml")):
                     raise ValueError("response body is not JSON")
             chunks.append(chunk)
-        charset = resp.charset or "utf-8"
-    return _decode_response_body(b"".join(chunks), charset=charset)
+        return b"".join(chunks), resp.charset or "utf-8"
+
+    try:
+        async with session.get(url, allow_redirects=True) as resp:
+            body, charset = await read_response(resp)
+    except aiohttp.ServerDisconnectedError:
+        retry_headers = {
+            "User-Agent": BROWSER_FALLBACK_USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
+            "Connection": "close",
+        }
+        retry_timeout = getattr(session, "timeout", None) or aiohttp.ClientTimeout(
+            total=HTTP_TOTAL_TIMEOUT, connect=15, sock_read=HTTP_READ_TIMEOUT
+        )
+        retry_connector = _tcp_connector(limit=0)
+        async with aiohttp.ClientSession(
+            headers=retry_headers,
+            timeout=retry_timeout,
+            connector=retry_connector,
+            trust_env=False,
+        ) as retry_session:
+            async with retry_session.get(url, allow_redirects=True) as resp:
+                body, charset = await read_response(resp)
+    return _decode_response_body(body, charset=charset)
 
 
 async def _fetch_bytes(
@@ -6260,6 +6288,15 @@ def _html_link_candidates(html_text: str, *, base_url: str) -> list[dict[str, An
         candidates.append(
             {"attr": "text", "value": url, "label": Path(urlsplit(url).path).name}
         )
+    if embedded_source != (html_text or ""):
+        for url in _embedded_mrf_urls(html_text or "", base_url=base_url):
+            label = Path(urlsplit(url).path).name
+            if not (
+                _looks_html_mrf_toc_url(url, label)
+                or _looks_html_mrf_body_reference(url, label)
+            ):
+                continue
+            candidates.append({"attr": "text", "value": url, "label": label})
     normalized: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
     for item in candidates:
