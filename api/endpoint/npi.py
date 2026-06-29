@@ -1476,9 +1476,10 @@ def _address_zip5_filter(alias: str, address_table_sql: str, *, any_array: bool 
 
 
 def _address_phone_digits_filter(alias: str, address_table_sql: str) -> str:
+    legacy_filter = f"regexp_replace(COALESCE({alias}.telephone_number, ''), '[^0-9]', '', 'g') = :phone_digits"
     if _address_table_is_unified(address_table_sql):
-        return f"{alias}.phone_number = :phone_digits"
-    return f"regexp_replace(COALESCE({alias}.telephone_number, ''), '[^0-9]', '', 'g') = :phone_digits"
+        return f"({alias}.phone_number = :phone_digits OR ({alias}.phone_number IS NULL AND {legacy_filter}))"
+    return legacy_filter
 
 
 def _provider_list_address_type_clause(

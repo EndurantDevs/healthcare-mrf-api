@@ -350,8 +350,9 @@ async def test_get_all_unified_pages_distinct_npis_and_uses_zip5(monkeypatch):
     assert "c.type IN ('primary', 'secondary', 'practice', 'site')" in conn.last_sql
     assert "c.zip5 = :zip_code" in conn.last_sql
     assert "c.phone_number = :phone_digits" in conn.last_sql
+    assert "c.phone_number IS NULL" in conn.last_sql
+    assert "regexp_replace(COALESCE(c.telephone_number, ''), '[^0-9]', '', 'g') = :phone_digits" in conn.last_sql
     assert "c.type = 'primary'" not in conn.last_sql
-    assert "regexp_replace(COALESCE(c.telephone_number, ''), '[^0-9]', '', 'g') = :phone_digits" not in conn.last_sql
     assert "LEFT(c.postal_code, 5) = :zip_code" not in conn.last_sql
 
 
