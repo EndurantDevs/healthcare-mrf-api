@@ -6229,6 +6229,49 @@ def test_parse_html_mrf_links_extracts_raw_embedded_rate_files():
     ]
 
 
+def test_parse_html_mrf_links_accepts_extensionless_dated_body_files():
+    html = """
+    <script id="__NEXT_DATA__" type="application/json">
+    {
+      "props": {
+        "pageProps": {
+          "links": [
+            {
+              "url": "https://cdn.example.test/-/media/ExamplePlan/PDF/2026-06-01_example-plan_in-network-rates_large-group-plans",
+              "text": "Download JSON File"
+            },
+            {
+              "url": "https://cdn.example.test/-/media/ExamplePlan/PDF/2026-06-01_example-plan_allowed-amounts_large-group-plans",
+              "text": "Download JSON File"
+            }
+          ]
+        }
+      }
+    }
+    </script>
+    """
+
+    targets = discovery._parse_html_mrf_links(
+        html, base_url="https://example.test/technical-information"
+    )
+
+    assert [
+        (target["url"], target["target_file_type"], target["target_kind"])
+        for target in targets
+    ] == [
+        (
+            "https://cdn.example.test/-/media/ExamplePlan/PDF/2026-06-01_example-plan_in-network-rates_large-group-plans",
+            "in-network",
+            "file_reference",
+        ),
+        (
+            "https://cdn.example.test/-/media/ExamplePlan/PDF/2026-06-01_example-plan_allowed-amounts_large-group-plans",
+            "allowed-amounts",
+            "file_reference",
+        ),
+    ]
+
+
 def test_parse_html_mrf_links_accepts_spaced_anchor_close_tags():
     html = """
     <a href="/files/2026-06-01_MERCYCARE-COMMERCIAL_in-network-rates.json">

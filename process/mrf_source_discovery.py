@@ -6772,11 +6772,26 @@ def _looks_html_mrf_body_reference(url: str | None, label: str | None = None) ->
     if path.endswith("/") and not query_file_name:
         return False
     text = f"{path} {label or ''} {query_file_name or ''}".lower().replace("_", "-")
+    inferred_file_type = _mrf_file_type_from_text(url, label)
     if not direct_body:
         file_name = Path(path).name
         if "." in file_name:
             return False
-        if not any(
+        extensionless_mrf_body = inferred_file_type in {
+            "in-network",
+            "allowed-amounts",
+        } and (
+            re.search(r"(?:^|[-/])20\d{2}[-/]\d{2}[-/]\d{2}(?:[-/]|$)", text)
+            or any(
+                token in text
+                for token in (
+                    "large-group",
+                    "small-group",
+                    "individual-and-family",
+                )
+            )
+        )
+        if not extensionless_mrf_body and not any(
             token in text
             for token in (
                 "getmachinereadablefile",
