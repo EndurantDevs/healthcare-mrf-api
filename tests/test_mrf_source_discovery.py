@@ -865,15 +865,31 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
 | Varipro | tpa | https://www.mymedicalshopper.com/mrf-search/varipro | aliases: Varipro TPA, Valipro TPA |
 | Reliance Matrix | tpa | https://www.reliancematrix.com/privacy-notice/transparency-in-coverage | aliases: Reliance Standard, Reliance Standard Life Insurance Company |
 | ACS Benefit Services | tpa | https://acsbenefitservices.sapphiremrfhub.com/ | aliases: ACS Benefits |
+| ATA America | tpa | https://mrf.healthcarebluebook.com/ATA | aliases: American Trust Administrators, ATA |
 | American Plan Administrators | tpa | https://apatpa.com/disclosures-terms-conditions-privacy-policy-american-plan-administrators/ | aliases: APA, APA TPA |
 | Benefit Plan Administrators | tpa | https://www.mymedicalshopper.com/mrf-search/benefit-plan-administrators | aliases: BPA, BPA TPA |
+| Blackhawk Claims Service | tpa | https://www.mymedicalshopper.com/mrf-search/blackhawk | aliases: Blackhawk |
 | Brighton Health Plan Solutions | tpa | https://clm.magnacare.com/transparency/ | aliases: Brighton HPS, MagnaCare |
 | ByWater | tpa | https://www.mymedicalshopper.com/mrf-search/bywater | aliases: Bywater, Choose ByWater |
+| Center Care | tpa | https://ctc.mrf.payercompass.com/ | aliases: CTC |
 | Coastal Administrative Services | tpa | https://mrf.healthcarebluebook.com/CAS | aliases: CAS |
+| Concierge Administrative Services | tpa | https://www.mymedicalshopper.com/mrf-search/concierge | aliases: Concierge |
 | Diversified Group | tpa | https://www.mymedicalshopper.com/mrf-search/diversified-group | aliases: The Diversified Group |
+| Dunn & Associates | tpa | https://www.mymedicalshopper.com/mrf-search/dunn-and-associates | aliases: Dunn and Associates |
+| Employee Benefit Logistics | tpa | https://ebl.mrf.payercompass.com/ | aliases: EBL |
+| Employers Health Network | tpa | https://ehn.mrf.payercompass.com/ | aliases: EHN |
+| Fox/Everett | tpa | https://www.mymedicalshopper.com/mrf-search/fox-everett | aliases: Fox Everett |
 | Marpai | tpa | https://www.mymedicalshopper.com/mrf-search/marpai | aliases: Marpai Health |
+| Insurance Systems | tpa | https://isi.mrf.payercompass.com/ | aliases: ISI |
+| Kapnick Insurance Group | tpa | https://bcbsm.sapphiremrfhub.com/tocs/current/kapnick_co_inc | aliases: Kapnick |
 | Imagine360 | tpa | https://caa.imagine360.com/IMAGINE360%20SERVICES%20LLC/index.html | aliases: Imagine 360 |
+| Patient Advocates | tpa | https://www.mymedicalshopper.com/mrf-search/patient-advocates | aliases: Patient Advocates LLC |
+| Planned Administrators Inc | tpa | https://www.paisc.com/compliance-machine-readable-files-mrfs | aliases: PAI, Planned Administrators |
+| ReDirect Health | tpa | https://www.redirecthealth.com/machine-readable-data/ | aliases: Redirect Health |
 | Simplified Benefits Administrators | tpa | https://mrf.healthcarebluebook.com/SBA | aliases: SBA |
+| SIHO | tpa | https://www.mymedicalshopper.com/mrf-search/siho | aliases: SIHO Insurance Services |
+| Stanislaus County Health Plan | tpa | https://schp.mrf.payercompass.com/ | aliases: SCHP, HPNC |
+| Trustmark Small Business Benefits | tpa | https://mrf.healthcarebluebook.com/trustmarksb | aliases: Trustmark Small Business, Trustmark SB |
 | Nippon Life Benefits | tpa | https://mrf.healthcarebluebook.com/Nippon | aliases: Nippon Life |
 | UMWA Health and Retirement Funds | tpa | https://mrf.healthcarebluebook.com/healthsmartfundsaccount | aliases: UMWA Funds |
 | BlueAdvantage Administrators of Arkansas | tpa | https://www.blueadvantagearkansas.com/interoperability/machine-readable-files | aliases: BlueAdvantage, Skai BCBS |
@@ -962,6 +978,11 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
         "Reliance Standard Life Insurance Company",
     )
     assert by_name["ACS Benefit Services"].hosting_platform == "sapphire"
+    assert by_name["ATA America"].hosting_platform == "healthcarebluebook_mrf"
+    assert by_name["ATA America"].aliases == (
+        "American Trust Administrators",
+        "ATA",
+    )
     assert (
         by_name["American Plan Administrators"].hosting_platform
         == "html_delegated_mrf_links"
@@ -973,6 +994,10 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
     )
     assert by_name["Benefit Plan Administrators"].aliases == ("BPA", "BPA TPA")
     assert (
+        by_name["Blackhawk Claims Service"].hosting_platform
+        == "mymedicalshopper_talon"
+    )
+    assert (
         by_name["Brighton Health Plan Solutions"].hosting_platform
         == "magnacare_transparency_mrf"
     )
@@ -982,21 +1007,45 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
     )
     assert by_name["ByWater"].hosting_platform == "mymedicalshopper_talon"
     assert by_name["ByWater"].aliases == ("Bywater", "Choose ByWater")
+    assert by_name["Center Care"].hosting_platform == "payercompass_mrf"
     assert (
         by_name["Coastal Administrative Services"].hosting_platform
         == "healthcarebluebook_mrf"
     )
     assert by_name["Coastal Administrative Services"].aliases == ("CAS",)
     assert (
+        by_name["Concierge Administrative Services"].hosting_platform
+        == "mymedicalshopper_talon"
+    )
+    assert (
         by_name["Diversified Group"].hosting_platform
         == "mymedicalshopper_talon_bounded"
     )
     assert by_name["Diversified Group"].aliases == ("The Diversified Group",)
+    assert by_name["Dunn & Associates"].hosting_platform == "mymedicalshopper_talon"
+    assert by_name["Employee Benefit Logistics"].hosting_platform == "payercompass_mrf"
+    assert by_name["Employers Health Network"].hosting_platform == "payercompass_mrf"
+    assert by_name["Fox/Everett"].hosting_platform == "mymedicalshopper_talon"
     assert by_name["Marpai"].hosting_platform == "mymedicalshopper_talon"
+    assert by_name["Insurance Systems"].hosting_platform == "payercompass_mrf"
+    assert by_name["Kapnick Insurance Group"].hosting_platform == "sapphire"
     assert by_name["Imagine360"].hosting_platform == "html_mrf_links"
     assert by_name["Imagine360"].aliases == ("Imagine 360",)
+    assert by_name["Patient Advocates"].hosting_platform == "mymedicalshopper_talon"
+    assert by_name["Planned Administrators Inc"].hosting_platform == "html_mrf_links"
+    assert by_name["Planned Administrators Inc"].aliases == (
+        "PAI",
+        "Planned Administrators",
+    )
+    assert by_name["ReDirect Health"].hosting_platform == "html_mrf_links"
     assert (
         by_name["Simplified Benefits Administrators"].hosting_platform
+        == "healthcarebluebook_mrf"
+    )
+    assert by_name["SIHO"].hosting_platform == "mymedicalshopper_talon"
+    assert by_name["Stanislaus County Health Plan"].hosting_platform == "payercompass_mrf"
+    assert (
+        by_name["Trustmark Small Business Benefits"].hosting_platform
         == "healthcarebluebook_mrf"
     )
     assert by_name["Nippon Life Benefits"].hosting_platform == "healthcarebluebook_mrf"
@@ -1431,6 +1480,28 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Valipro TPA" in by_name["Varipro"].aliases
     assert "Professional Benefits Services" in by_name["Varipro"].aliases
     assert "PBS" in by_name["Varipro"].aliases
+    assert by_name["SIHO"].hosting_platform == "mymedicalshopper_talon"
+    assert "SIHO Insurance Services" in by_name["SIHO"].aliases
+    assert by_name["Blackhawk Claims Service"].hosting_platform == "mymedicalshopper_talon"
+    assert by_name["Dunn & Associates"].hosting_platform == "mymedicalshopper_talon"
+    assert "Dunn and Associates" in by_name["Dunn & Associates"].aliases
+    assert by_name["Patient Advocates"].hosting_platform == "mymedicalshopper_talon"
+    assert by_name["Fox/Everett"].hosting_platform == "mymedicalshopper_talon"
+    assert by_name["Concierge Administrative Services"].hosting_platform == "mymedicalshopper_talon"
+    assert by_name["ATA America"].hosting_platform == "healthcarebluebook_mrf"
+    assert "American Trust Administrators" in by_name["ATA America"].aliases
+    assert by_name["Trustmark Small Business Benefits"].hosting_platform == "healthcarebluebook_mrf"
+    assert "Trustmark SB" in by_name["Trustmark Small Business Benefits"].aliases
+    assert by_name["Planned Administrators Inc"].hosting_platform == "html_mrf_links"
+    assert "PAI" in by_name["Planned Administrators Inc"].aliases
+    assert by_name["ReDirect Health"].hosting_platform == "html_mrf_links"
+    assert by_name["Employers Health Network"].hosting_platform == "payercompass_mrf"
+    assert by_name["Center Care"].hosting_platform == "payercompass_mrf"
+    assert by_name["Employee Benefit Logistics"].hosting_platform == "payercompass_mrf"
+    assert by_name["Insurance Systems"].hosting_platform == "payercompass_mrf"
+    assert by_name["Stanislaus County Health Plan"].hosting_platform == "payercompass_mrf"
+    assert by_name["CSC Zelis Repository"].hosting_platform == "payercompass_mrf"
+    assert by_name["Kapnick Insurance Group"].hosting_platform == "sapphire"
     assert by_name["Reliance Matrix"].hosting_platform == "html_delegated_mrf_links"
     assert "Reliance Standard" in by_name["Reliance Matrix"].aliases
     assert (

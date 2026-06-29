@@ -377,25 +377,34 @@ Last one-time research refresh: 2026-06-05.
 | AmeriBen | tpa | https://github.com/AmeriBen/MRF | curated source row; aliases: AmeriBen Anthem, AmeriBen: Anthem, AmeriBen Anthem Blue Cross, AmeriBen: Anthem Blue Cross |
 | ASR Health Benefits | tpa | https://www.asrhealthbenefits.com/MRF | public group-number MRF lookup; resolver uses configured public group seeds |
 | Assured Benefits Administrators | tpa | https://transparency.abadmin.com/ | public transparency page with delegated network MRF links; aliases: ABA, ABAdmin |
+| ATA America | tpa | https://mrf.healthcarebluebook.com/ATA | public Healthcare Bluebook MRF directory; aliases: American Trust Administrators, ATA America / American Trust Administrators, ATA |
 | Auxiant | tpa | https://transparency.auxiant.com/directory-of-data-sources/ | public WordPress data source directory; resolver expands data-available network pages; aliases: Auxiant TPA, Auxient TPA, Auxient |
 | Benefits and Risk Management Services | tpa | - | needs official source URL |
 | Benefit Plan Administrators | tpa | https://www.mymedicalshopper.com/mrf-search/benefit-plan-administrators | public BPA/TALON MRF search linked from BPA machine-readable files page; aliases: BPA, BPA TPA, BPA Inc, Benefit Plan Administrators Inc |
+| Blackhawk Claims Service | tpa | https://www.mymedicalshopper.com/mrf-search/blackhawk | public Blackhawk/TALON MRF search; aliases: Blackhawk, Blackhawk Claims |
 | Brighton Health Plan Solutions | tpa | https://clm.magnacare.com/transparency/ | public MagnaCare/Brighton machine-readable files portal; resolver searches public result terms and refreshes current download URLs by run-history id; aliases: Brighton HPS, Brighton Health, MagnaCare, Magnacare |
 | Boon-Chapman | tpa | https://boonchapman-mrf.zakipointhealth.com/ | public ZakiPoint MRF directory linked from Boon-Chapman transparency page; aliases: Boon Chapman, Boon-Chapman Benefit Administrators |
 | BRMS | tpa | https://www.myhealthbenefits.com/MyHealthBenefits/Home/MRFs/ | public MRF table; resolver catalogs direct files and Healthcare Bluebook delegated rows |
 | ByWater | tpa | https://www.mymedicalshopper.com/mrf-search/bywater | public ByWater transparency page delegates MRF search to TALON/MyMedicalShopper; aliases: Bywater, ByWater Health, Choose ByWater |
 | CBA Blue | tpa | https://www.cbabluevt.com/employer-resources/ | public CBA Blue MRF page; aliases: CBA BLUE, CBA Blue VT |
+| Center Care | tpa | https://ctc.mrf.payercompass.com/ | public Zelis/PayerCompass MRF repository; aliases: Center Care, CTC |
 | Coastal Administrative Services | tpa | https://mrf.healthcarebluebook.com/CAS | public Healthcare Bluebook MRF directory for Coastal Administrative Services; aliases: CAS, CAS Benefits |
 | Collective Health | tpa | https://transparency-in-coverage.collectivehealth.com/ | public transparency URL |
 | Collective Health | tpa | https://transparency-in-coverage.collectivehealth.com/index.html | curated source row |
+| Concierge Administrative Services | tpa | https://www.mymedicalshopper.com/mrf-search/concierge | public Concierge/TALON MRF search; aliases: Concierge, Concierge Administrative |
 | Consociate Health | tpa | https://mrf.healthcarebluebook.com/Consociate | public Healthcare Bluebook MRF directory; aliases: Consociate, Consociate Inc. |
 | Carefactor | tpa | https://mrf.healthcarebluebook.com/Carefactor | public Healthcare Bluebook MRF directory; aliases: CareFactor |
 | ACS Benefit Services | tpa | https://acsbenefitservices.sapphiremrfhub.com/ | public ACS MRF hub; aliases: ACS Benefits, ACS Benefit Services LLC |
+| CSC Zelis Repository | tpa | https://csc.mrf.payercompass.com/ | public Zelis/PayerCompass MRF repository; aliases: CSC |
 | Diversified Group | tpa | https://www.mymedicalshopper.com/mrf-search/diversified-group | public Diversified Group transparency notice delegates group MRF search to TALON/MyMedicalShopper; aliases: The Diversified Group, Diversified Group Benefits, Diversified Group TPA |
+| Dunn & Associates | tpa | https://www.mymedicalshopper.com/mrf-search/dunn-and-associates | public Dunn & Associates/TALON MRF search; aliases: Dunn and Associates, Dunn Associates |
 | BlueAdvantage Administrators of Arkansas | tpa | https://www.blueadvantagearkansas.com/interoperability/machine-readable-files | official machine-readable files page with Arkansas Blue Cross, Health Advantage, Skai, and BlueAdvantage TOC links; aliases: BlueAdvantage, Skai Blue Cross Blue Shield, Skai BCBS |
 | EBMS | tpa | https://caa.ebms.com/ | public EBMS CAA MRF client directory; resolver expands public client pages to current TOC files; aliases: Employee Benefit Management Services, Employee Benefit Management Services EBMS, Employee Benefit Management Services Inc, Employee Benefit Management Services (EBMS) |
 | EBAM | tpa | https://www.ebam.com/machine-readable-files/ | public EBAM machine-readable files page with static JSON/CSV rate file links; aliases: EBA&M, Employee Benefit Administrators & Managers, Employee Benefit Administrators and Managers |
 | EBPA | tpa | https://tuition.ebpabenefits.com/employers/machine-readable-file-links | public EBPA MRF network selector; aliases: EBPA Benefits, EBPA Employee Benefits, EBPA LLC |
+| Employee Benefit Logistics | tpa | https://ebl.mrf.payercompass.com/ | public Zelis/PayerCompass MRF repository; aliases: EBL |
+| Employers Health Network | tpa | https://ehn.mrf.payercompass.com/ | public Zelis/PayerCompass MRF repository; aliases: EHN |
+| Fox/Everett | tpa | https://www.mymedicalshopper.com/mrf-search/fox-everett | public Fox/Everett TALON MRF search; aliases: Fox Everett, Fox-Everett |
 | HealthNow Administrative Services | tpa | https://www.hnas.com/digital-resources/machine-readable-files | public HNAS delegated MRF directory; aliases: HNAS, Brokerage Concepts LLC dba HealthNow Administrative Services |
 | Healthcare Management Administrators | tpa | https://sawus2prdticmrfhma.z5.web.core.windows.net/ | public HMA machine-readable file directory; aliases: HMA, AccessHMA |
 | HealthScope Benefits | tpa | - | needs official source URL |
@@ -405,6 +414,8 @@ Last one-time research refresh: 2026-06-05.
 | Healthgram | tpa | https://mrf.healthgram.com/ | public MRF network directory; resolver expands network pages to current TOC JSON links |
 | Imagine360 | tpa | https://caa.imagine360.com/IMAGINE360%20SERVICES%20LLC/index.html | public Imagine360 CAA table-of-contents directory linked from Imagine360 machine-readable files page; aliases: Imagine 360, Imagine360 Services, Imagine360 Services LLC |
 | Insurance Management Services | tpa | https://mrf.healthcarebluebook.com/IMS | public Healthcare Bluebook MRF directory linked from IMS healthcare reform page; aliases: IMS, IMS TPA, Insurance Management Services TX, Insurance Management Services Amarillo |
+| Insurance Systems | tpa | https://isi.mrf.payercompass.com/ | public Zelis/PayerCompass MRF repository; aliases: ISI, Insurance Systems Inc |
+| Kapnick Insurance Group | tpa | https://bcbsm.sapphiremrfhub.com/tocs/current/kapnick_co_inc | public Sapphire table-of-contents link; aliases: Kapnick, Kapnick Co Inc, Kapnick Insurance |
 | Group Administrators | tpa | https://www.groupadministrators.com/machinereadablefiles/ | public iframe-hosted MRF table; aliases: Group Administrators Ltd |
 | Loomis | tpa | https://mrf.healthcarebluebook.com/Loomis | public Healthcare Bluebook MRF directory; aliases: Loomis Company, Loomis Benefit Administrators, The Loomis Company, LOOMIS COMPANY (THE) |
 | Lucent Health | tpa | https://lucenthealth.com/transparency-in-coverage/ | public transparency page; delegates INN MRF listing to Healthcare Bluebook; aliases: Cypress Benefit Administrators, Cypress Benefit Administrators now Lucent Health |
@@ -417,18 +428,24 @@ Last one-time research refresh: 2026-06-05.
 | Nippon Life Benefits | tpa | https://mrf.healthcarebluebook.com/Nippon | public Healthcare Bluebook MRF directory; aliases: Nippon Life, Nippon Life Insurance Company of America |
 | Nova Healthcare Administrators | tpa | https://www.novahealthcare.com/resources/mrf.html | public transparency page with direct and delegated network MRF links; aliases: Nova Healthcare, Nova Healthcare Administrators Inc |
 | PBA | tpa | https://www.pbaclaims.com/mrfs/ | curated source row |
+| Patient Advocates | tpa | https://www.mymedicalshopper.com/mrf-search/patient-advocates | public Patient Advocates/TALON MRF search; aliases: Patient Advocates LLC |
+| Planned Administrators Inc | tpa | https://www.paisc.com/compliance-machine-readable-files-mrfs | public PAI machine-readable files page with current monthly TOC links; aliases: PAI, Planned Administrators, Planned Administrators Inc. |
 | Pinnacle Claims Management | tpa | https://mrf.healthcarebluebook.com/Pinnacle | public Healthcare Bluebook MRF directory; aliases: Pinnacle Claims Management Inc, PCMI |
 | Point C | tpa | https://mrf.healthcarebluebook.com/pointc | public Healthcare Bluebook MRF directory; aliases: Point C Health, Point-C |
 | Professional Benefit Administrators | tpa | https://www.pbaclaims.com/mrfs/ | curated source row; aliases: PBA, Professional Benefit Administrators Oak Brook IL, "Professional Benefit Administrators (Oak Brook, IL)", "PROFESSIONAL BENEFIT ADMINISTRATORS (OAK BROOK,IL)" |
 | Quartz Benefits | tpa | https://quartzfhir.healthsparq.com/app/public/#/one/insurerCode=QUARTZ_I&brandCode=QUARTZ/machine-readable-transparency-in-coverage | observed current; 2,557 plans; 49,120 files |
 | Regency Employee Benefits | tpa | https://www.mymedicalshopper.com/mrf-search/robbins-regency-employee-benefits-inc-regn | public MyMedicalShopper/TALON MRF search; aliases: Robbins Regency Employee Benefits |
+| ReDirect Health | tpa | https://www.redirecthealth.com/machine-readable-data/ | public machine-readable data page with direct in-network and allowed-amount MRF links; aliases: Redirect Health |
 | Reliance Matrix | tpa | https://www.reliancematrix.com/privacy-notice/transparency-in-coverage | public Reliance Matrix transparency page delegates Reliance Standard Life Insurance Co MRFs to QCC/IBX keyed table-of-contents link; aliases: Reliance Standard, Reliance Standard Life Insurance Company, Reliance Standard Life Ins Co, Reliance Matrix / Reliance Standard |
 | S&S Health | tpa | https://mrf.healthcarebluebook.com/SandS | public Healthcare Bluebook MRF directory; aliases: S&S HealthCare, S&S Healthcare, S&S HealthCare Strategies, SandS, Reflect Health |
+| SIHO | tpa | https://www.mymedicalshopper.com/mrf-search/siho | public SIHO/TALON MRF search; aliases: SIHO Insurance Services, SIHO Insurance |
 | SimplePay Health | tpa | https://www.simplepayhealth.com/ | public landing page delegates MRF access to Meritain/Aetna HealthSparq; aliases: SimplePay |
 | SISCO | tpa | https://sisconosurprise.com/ppo/phcs/index.html | public SISCO PPO machine-readable file page for PHCS TOC; aliases: SISCO Benefits, Self Insured Services Company |
 | SISCO | tpa | https://sisconosurprise.com/ppo/hps/index.html | public SISCO PPO machine-readable file page for HPS in-network file; aliases: SISCO Benefits, Self Insured Services Company |
 | Simplified Benefits Administrators | tpa | https://mrf.healthcarebluebook.com/SBA | public Healthcare Bluebook MRF directory; aliases: SBA, Simplified Benefits |
+| Stanislaus County Health Plan | tpa | https://schp.mrf.payercompass.com/ | public Zelis/PayerCompass MRF repository; aliases: SCHP, HPNC, Health Plan of San Joaquin and Stanislaus |
 | Tall Tree Administrators | tpa | https://talltreeadmin.com/machine-readable-files | public MRF link page; aliases: Tall Tree, Tall Tree Administration |
+| Trustmark Small Business Benefits | tpa | https://mrf.healthcarebluebook.com/trustmarksb | public Healthcare Bluebook MRF directory; aliases: Trustmark Small Business, Trustmark SB |
 | Unified Group Services | tpa | https://mrf.healthcarebluebook.com/unified | public Healthcare Bluebook MRF directory; aliases: UGS, UnifiedGrp, Unified Group |
 | UMWA Health and Retirement Funds | tpa | https://mrf.healthcarebluebook.com/healthsmartfundsaccount | public Healthcare Bluebook MRF directory linked from UMWA transparency page; aliases: UMWA Funds, HealthSmart Funds Account |
 | Varipro | tpa | https://www.mymedicalshopper.com/mrf-search/varipro | MyMedicalShopper/TALON MRF search; resolver enumerates current employer plan TOCs; aliases: Varipro TPA, Valipro, Valipro TPA, Professional Benefits Services, PBS |

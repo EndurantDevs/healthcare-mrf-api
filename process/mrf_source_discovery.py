@@ -1099,6 +1099,12 @@ def classify_hosting_platform(url: str | None) -> str | None:
         ("/mrf", "/umbraco/surface/mrfdownload", "/home/umbraco/surface/mrfdownload")
     ):
         return "asr_health_benefits"
+    if host in {"www.paisc.com", "paisc.com"} and "machine-readable-files" in path:
+        return "html_mrf_links"
+    if host in {"www.redirecthealth.com", "redirecthealth.com"} and (
+        "machine-readable-data" in path
+    ):
+        return "html_mrf_links"
     if host in {"www.blueadvantagearkansas.com", "blueadvantagearkansas.com"} and (
         "machine-readable-files" in path
     ):
