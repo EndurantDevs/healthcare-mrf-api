@@ -854,6 +854,64 @@ async def _top_source_yield(conn: asyncpg.Connection, schema: str, *, sample_lim
     return sorted(items, key=lambda item: (-item["resource_rows"], str(item["org_name"])))[:sample_limit]
 
 
+async def _alias_fanout_summary(conn: asyncpg.Connection, schema: str, *, sample_limit: int) -> dict[str, Any]:
+    if not await _relation_exists(conn, schema, "provider_directory_source"):
+        return {"available": False, "reason": "provider_directory_source unavailable", "resources": []}
+    resources: list[dict[str, Any]] = []
+    total_excess = 0
+    for resource_type, table in PROVIDER_DIRECTORY_RESOURCE_TABLE_BY_TYPE.items():
+        if not await _relation_exists(conn, schema, table):
+            continue
+        rows = await conn.fetch(
+            f"""
+            SELECT COALESCE(NULLIF(src.canonical_api_base, ''), NULLIF(src.api_base, '')) AS api_base,
+                   min(src.org_name) AS sample_org_name,
+                   min(src.plan_name) AS sample_plan_name,
+                   count(DISTINCT rows.source_id)::bigint AS source_count,
+                   count(*)::bigint AS source_resource_rows,
+                   count(DISTINCT rows.resource_id)::bigint AS distinct_resource_ids
+              FROM {_qt(schema, table)} AS rows
+              JOIN {_qt(schema, "provider_directory_source")} AS src
+                ON src.source_id = rows.source_id
+             WHERE COALESCE(NULLIF(src.canonical_api_base, ''), NULLIF(src.api_base, '')) IS NOT NULL
+             GROUP BY 1
+            HAVING count(DISTINCT rows.source_id) > 1
+               AND count(*) > count(DISTINCT rows.resource_id)
+             ORDER BY (count(*) - count(DISTINCT rows.resource_id)) DESC, count(*) DESC
+             LIMIT $1
+            """,
+            sample_limit,
+        )
+        samples = []
+        resource_excess = 0
+        for row in rows:
+            item = dict(row)
+            item["excess_source_resource_rows"] = _int(item["source_resource_rows"]) - _int(
+                item["distinct_resource_ids"]
+            )
+            item["fanout_ratio"] = round(
+                float(_int(item["source_resource_rows"])) / float(_int(item["distinct_resource_ids"])),
+                2,
+            ) if _int(item["distinct_resource_ids"]) else 0.0
+            resource_excess += item["excess_source_resource_rows"]
+            samples.append(item)
+        if samples:
+            total_excess += resource_excess
+            resources.append(
+                {
+                    "resource_type": resource_type,
+                    "excess_source_resource_rows": resource_excess,
+                    "samples": samples,
+                }
+            )
+    return {
+        "available": True,
+        "resource_count": len(resources),
+        "excess_source_resource_rows": total_excess,
+        "resources": resources,
+    }
+
+
 async def _advertised_resource_gap_summary(
     conn: asyncpg.Connection,
     schema: str,
@@ -1251,6 +1309,11 @@ async def build_report(args: argparse.Namespace) -> dict[str, Any]:
                 if args.skip_top_source_yield
                 else await _top_source_yield(conn, schema, sample_limit=args.sample_limit)
             ),
+            "alias_fanout_summary": (
+                {"available": False, "skipped": True, "reason": "disabled by --skip-top-source-yield", "resources": []}
+                if args.skip_top_source_yield
+                else await _alias_fanout_summary(conn, schema, sample_limit=args.sample_limit)
+            ),
             "advertised_resource_gap_summary": (
                 {"available": False, "skipped": True, "reason": "disabled by --skip-advertised-resource-gaps"}
                 if args.skip_advertised_resource_gaps
@@ -1288,6 +1351,7 @@ def render_markdown(report: dict[str, Any]) -> str:
     network = report.get("network_resolution_summary") or {}
     ptg = report.get("ptg_summary") or {}
     credential_backlog = report.get("credential_onboarding_backlog") or {}
+    alias_fanout = report.get("alias_fanout_summary") or {}
     lines = [
         "# Provider Directory Coverage Audit",
         "",
@@ -1360,6 +1424,12 @@ def render_markdown(report: dict[str, Any]) -> str:
         )
     elif advertised_gaps.get("skipped"):
         lines.append(f"- advertised resource/source gaps: skipped ({advertised_gaps.get('reason')})")
+    if alias_fanout.get("available"):
+        lines.append(
+            f"- alias fan-out excess source/resource rows: `{alias_fanout.get('excess_source_resource_rows')}` across `{alias_fanout.get('resource_count')}` resource type(s)"
+        )
+    elif alias_fanout.get("skipped"):
+        lines.append(f"- alias fan-out: skipped ({alias_fanout.get('reason')})")
     if report.get("gaps"):
         lines.extend(["", "## Gaps", ""])
         lines.extend(f"- {gap}" for gap in report["gaps"])
@@ -1466,6 +1536,22 @@ def render_markdown(report: dict[str, Any]) -> str:
             lines.append(
                 f"| {item.get('org_name') or item.get('source_id')} | `{item.get('last_probe_status')}` | {item.get('resource_rows')} | `{json.dumps(item.get('resource_counts'), sort_keys=True)}` |"
             )
+    if alias_fanout.get("resources"):
+        lines.extend(
+            [
+                "",
+                "## Alias Fan-Out",
+                "",
+                "| Resource | API Base | Sources | Source Rows | Distinct Remote IDs | Excess Rows | Ratio | Sample |",
+                "| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |",
+            ]
+        )
+        for resource in alias_fanout["resources"]:
+            for item in resource.get("samples") or []:
+                sample = item.get("sample_org_name") or item.get("sample_plan_name") or ""
+                lines.append(
+                    f"| `{resource.get('resource_type')}` | `{_markdown_cell(item.get('api_base'))}` | {item.get('source_count')} | {item.get('source_resource_rows')} | {item.get('distinct_resource_ids')} | {item.get('excess_source_resource_rows')} | {item.get('fanout_ratio')} | {_markdown_cell(sample)} |"
+                )
     lines.append("")
     return "\n".join(lines)
 

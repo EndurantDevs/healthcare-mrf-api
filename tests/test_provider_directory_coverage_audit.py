@@ -337,6 +337,29 @@ def test_provider_directory_coverage_audit_markdown_includes_unified_source_id_a
                     },
                 ],
             },
+            "alias_fanout_summary": {
+                "available": True,
+                "resource_count": 1,
+                "excess_source_resource_rows": 2720000,
+                "resources": [
+                    {
+                        "resource_type": "Practitioner",
+                        "excess_source_resource_rows": 2720000,
+                        "samples": [
+                            {
+                                "api_base": "https://fhir.humana.com/api",
+                                "sample_org_name": "Humana Inc.",
+                                "sample_plan_name": "Humana Choice PPO",
+                                "source_count": 18,
+                                "source_resource_rows": 2880000,
+                                "distinct_resource_ids": 160000,
+                                "excess_source_resource_rows": 2720000,
+                                "fanout_ratio": 18.0,
+                            }
+                        ],
+                    }
+                ],
+            },
         }
     )
 
@@ -346,10 +369,13 @@ def test_provider_directory_coverage_audit_markdown_includes_unified_source_id_a
     assert "- Provider Directory rows with country `001`: `0`" in markdown
     assert "- PTG corroboration: skipped (disabled by --skip-ptg)" in markdown
     assert "- advertised resource/source gaps: `2` / `5` (60.0% with rows); auth-blocked after metadata: `0`" in markdown
+    assert "- alias fan-out excess source/resource rows: `2720000` across `1` resource type(s)" in markdown
     assert "## Advertised Resource Import Gaps" in markdown
     assert "| `Endpoint` | 2 | 1 | 1 | 0 | `` |" in markdown
     assert "## Credential/Onboarding Backlog" in markdown
     assert "| `apps.availity.com` | `valid_non_fhir` | `OAuth2/SMART` | `onboarding_gateway` | 263 | Aetna / Provider Directory, Availity payer |" in markdown
+    assert "## Alias Fan-Out" in markdown
+    assert "| `Practitioner` | `https://fhir.humana.com/api` | 18 | 2880000 | 160000 | 2720000 | 18.0 | Humana Inc. |" in markdown
 
 
 def test_provider_directory_coverage_audit_markdown_includes_skipped_live_sections():
@@ -370,6 +396,11 @@ def test_provider_directory_coverage_audit_markdown_includes_skipped_live_sectio
                 "skipped": True,
                 "reason": "disabled by --skip-advertised-resource-gaps",
             },
+            "alias_fanout_summary": {
+                "available": False,
+                "skipped": True,
+                "reason": "disabled by --skip-top-source-yield",
+            },
         }
     )
 
@@ -377,3 +408,4 @@ def test_provider_directory_coverage_audit_markdown_includes_skipped_live_sectio
     assert "- PTG corroboration: skipped (disabled by --skip-ptg)" in markdown
     assert "- network resolution: skipped (disabled by --skip-network-resolution)" in markdown
     assert "- advertised resource/source gaps: skipped (disabled by --skip-advertised-resource-gaps)" in markdown
+    assert "- alias fan-out: skipped (disabled by --skip-top-source-yield)" in markdown
