@@ -754,6 +754,23 @@ def test_parse_master_list_preserves_benefit_lines_for_dental_vision_source():
     assert candidate.aliases == ("Example DV",)
 
 
+def test_parse_master_list_preserves_legacy_public_aliases_for_active_sources():
+    markdown = """
+## Public regional aliases
+| Payer | Type | Public MRF TOC / landing URL | Notes |
+|---|---|---|---|
+| Example Current Plan | regional | https://example.test/current | curated source row; aliases: Example Legacy Plan, Example Legacy Health Care |
+"""
+
+    [candidate] = discovery.parse_master_list(markdown)
+
+    assert candidate.payer_name == "Example Current Plan"
+    assert candidate.aliases == (
+        "Example Legacy Plan",
+        "Example Legacy Health Care",
+    )
+
+
 def test_candidate_text_filter_matches_public_aliases():
     candidate = discovery.SourceCandidate(
         payer_name="The Health Plan",
