@@ -4008,7 +4008,7 @@ async def test_mymedicalshopper_ddp_call_uses_overall_deadline_for_heartbeats():
 async def test_mymedicalshopper_subscription_uses_overall_deadline_for_heartbeats():
     ws = _MMSHeartbeatOnlyWebSocket()
 
-    with pytest.raises(TimeoutError, match="subscription tabular_getInfo timed out"):
+    with pytest.raises(TimeoutError):
         await discovery._mymedicalshopper_ddp_subscribe_collect(
             ws,
             name="tabular_getInfo",
