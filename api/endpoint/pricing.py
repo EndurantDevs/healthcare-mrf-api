@@ -7057,6 +7057,12 @@ async def autocomplete_prescriptions(request):
     )
 
 
+# Back-compat alias: api-layer and the public OpenAPI contract proxy to
+# /providers/search-by-procedure (operation searchPricingProvidersByProcedure).
+# After the route was renamed to /by-procedure, that path fell through to
+# /providers/<npi> -> "Parameter 'npi' must be an integer", 500-ing every
+# plan-scoped pricing search. Keep the old path pointed at this handler.
+@blueprint.get("/providers/search-by-procedure", name="pricing.providers.search_by_procedure")
 @blueprint.get("/providers/by-procedure", name="pricing.providers.by_procedure")
 @blueprint.get("/providers/by-service", name="pricing.providers.by_service")
 @blueprint.get("/physicians/by-service", name="pricing.physicians.by_service")
