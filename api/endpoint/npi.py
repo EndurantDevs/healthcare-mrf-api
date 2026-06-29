@@ -1476,10 +1476,7 @@ def _address_zip5_filter(alias: str, address_table_sql: str, *, any_array: bool 
 
 
 def _address_phone_digits_filter(alias: str, address_table_sql: str) -> str:
-    legacy_filter = f"regexp_replace(COALESCE({alias}.telephone_number, ''), '[^0-9]', '', 'g') = :phone_digits"
-    if _address_table_is_unified(address_table_sql):
-        return f"({alias}.phone_number = :phone_digits OR ({alias}.phone_number IS NULL AND {legacy_filter}))"
-    return legacy_filter
+    return f"regexp_replace(COALESCE({alias}.telephone_number, ''), '[^0-9]', '', 'g') = :phone_digits"
 
 
 def _provider_list_address_type_clause(
@@ -2762,7 +2759,7 @@ async def get_all(request):
         )
 
         use_taxonomy_filter = bool(taxonomy_filters)
-        include_service_locations = bool(phone_digits or address_key)
+        include_service_locations = bool(address_key)
         address_where = [
             _provider_list_address_type_clause(
                 "c",
@@ -2921,7 +2918,7 @@ async def get_all(request):
             entity_type_code,
         )
 
-        include_service_locations = bool(phone_digits or address_key)
+        include_service_locations = bool(address_key)
         address_where = [
             _provider_list_address_type_clause(
                 "c",
@@ -3103,7 +3100,7 @@ async def get_all(request):
         phone_digits = filters.get("phone_digits")
         address_key = filters.get("address_key")
         where = []
-        include_service_locations = bool(phone_digits or address_key)
+        include_service_locations = bool(address_key)
         address_where = [
             _provider_list_address_type_clause(
                 "c",
