@@ -964,6 +964,61 @@ def test_healthsparq_metadata_rows_preserve_engine_plan_hashes_for_catalog_sync(
     assert len({plan["engine_plan_hash"] for plan in plan_info}) == 2
 
 
+def test_healthsparq_toc_target_plan_hashes_enrich_parsed_file_rows():
+    target = discovery.CrawlTarget(
+        source={"source_id": "src_aetna", "display_name": "Example Carrier"},
+        url="https://example.com/2026-06-01_222_index.json.gz",
+        label="2026-06-01_222_index.json.gz",
+        resolved_from_url="https://example.com/latest_metadata.json",
+        metadata={
+            "plan_info": [
+                {
+                    "plan_id": "222222222",
+                    "plan_id_type": "ein",
+                    "plan_market_type": "group",
+                    "plan_name": "Example Packaging HSA Choice Plan",
+                    "engine_plan_hash": "hash-hsa",
+                },
+                {
+                    "plan_id": "222222222",
+                    "plan_id_type": "ein",
+                    "plan_market_type": "group",
+                    "plan_name": "Example Packaging Choice Plan",
+                    "engine_plan_hash": "hash-choice",
+                },
+            ]
+        },
+    )
+    file_rows = [
+        {
+            "metadata_json": {
+                "plan_info": [
+                    {
+                        "plan_id": "222222222",
+                        "plan_id_type": "ein",
+                        "plan_market_type": "group",
+                        "plan_name": "Example Packaging HSA Choice Plan",
+                    },
+                    {
+                        "plan_id": "222222222",
+                        "plan_id_type": "ein",
+                        "plan_market_type": "group",
+                        "plan_name": "Example Packaging Choice Plan",
+                    },
+                ]
+            }
+        }
+    ]
+
+    [annotated] = discovery._apply_crawl_target_context_to_file_rows(file_rows, target)
+
+    plan_info = annotated["metadata_json"]["plan_info"]
+    assert [plan["engine_plan_hash"] for plan in plan_info] == [
+        "hash-hsa",
+        "hash-choice",
+    ]
+
+
 def test_query_expansion_match_tolerates_legal_suffix_and_concatenated_plan_text():
     assert discovery._search_values_match_query(
         ["Absopure Water Co., et. al DBA Example PackagingHSA Aetna Choice POS II"],

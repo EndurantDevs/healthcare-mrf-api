@@ -3722,15 +3722,57 @@ def _apply_crawl_target_context_to_file_rows(
     file_rows: list[dict[str, Any]], target: CrawlTarget
 ) -> list[dict[str, Any]]:
     context = _crawl_target_context_metadata(target)
-    if not context:
+    target_plan_info = _metadata_plan_info(dict(target.metadata or {}))
+    if not context and not target_plan_info:
         return file_rows
     annotated: list[dict[str, Any]] = []
     for row in file_rows:
         metadata = dict(row.get("metadata_json") or {})
         for key, value in context.items():
             metadata.setdefault(key, value)
+        if target_plan_info:
+            metadata = _merge_crawl_target_plan_info(metadata, target_plan_info)
         annotated.append({**row, "metadata_json": metadata})
     return annotated
+
+
+def _plan_info_match_key(plan: dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(plan.get("plan_id") or "").strip().lower(),
+        _clean_text(plan.get("plan_name")).lower(),
+        str(plan.get("plan_market_type") or plan.get("market_type") or "").strip().lower(),
+    )
+
+
+def _merge_crawl_target_plan_info(
+    metadata: dict[str, Any], target_plan_info: list[dict[str, Any]]
+) -> dict[str, Any]:
+    plan_info = metadata.get("plan_info")
+    if not isinstance(plan_info, list):
+        return metadata
+    target_by_key = {
+        _plan_info_match_key(plan): plan
+        for plan in target_plan_info
+        if isinstance(plan, dict)
+    }
+    if not target_by_key:
+        return metadata
+    merged_plans: list[Any] = []
+    changed = False
+    for plan in plan_info:
+        if not isinstance(plan, dict):
+            merged_plans.append(plan)
+            continue
+        next_plan = dict(plan)
+        target_plan = target_by_key.get(_plan_info_match_key(next_plan)) or {}
+        for key in ("engine_plan_hash", "issuer_name", "plan_sponsor_name"):
+            if not next_plan.get(key) and target_plan.get(key):
+                next_plan[key] = target_plan[key]
+                changed = True
+        merged_plans.append(next_plan)
+    if not changed:
+        return metadata
+    return {**metadata, "plan_info": merged_plans}
 
 
 def _asr_group_numbers_from_seed_list(seed_list_name: str | None) -> list[str]:
