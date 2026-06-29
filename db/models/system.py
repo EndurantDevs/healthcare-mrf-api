@@ -593,6 +593,7 @@ class ProviderDirectoryPractitionerRole(Base, JSONOutputMixin):
         {"index_elements": ("source_id", "practitioner_ref"), "name": "provider_directory_role_source_practitioner_idx"},
         {"index_elements": ("organization_ref",), "name": "provider_directory_role_organization_idx"},
         {"index_elements": ("source_id", "organization_ref"), "name": "provider_directory_role_source_organization_idx"},
+        {"index_elements": ("last_seen_run_id", "source_id"), "name": "provider_directory_role_run_source_idx"},
     ]
 
     source_id = Column(String(64), nullable=False)
@@ -659,6 +660,10 @@ class ProviderDirectoryOrganizationAffiliation(Base, JSONOutputMixin):
         {
             "index_elements": ("source_id", "participating_organization_ref"),
             "name": "provider_directory_affiliation_source_participating_idx",
+        },
+        {
+            "index_elements": ("last_seen_run_id", "source_id"),
+            "name": "provider_directory_affiliation_run_source_idx",
         },
     ]
 

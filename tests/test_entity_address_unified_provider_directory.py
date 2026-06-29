@@ -93,6 +93,21 @@ def test_provider_directory_source_selects_normalize_fhir_refs_before_joining():
     assert "OR affiliation.participating_organization_ref IN" not in sql
 
 
+def test_provider_directory_source_selects_can_scope_by_source_and_run():
+    selects = entity_address_unified._source_selects(
+        "mrf",
+        _provider_directory_available(),
+        provider_directory_source_ids=["source_a", "source_b"],
+        provider_directory_run_id="run_123",
+    )
+    sql = "\n".join(selects)
+
+    assert "role.source_id = ANY(ARRAY['source_a', 'source_b']::varchar[])" in sql
+    assert "role.last_seen_run_id = 'run_123'" in sql
+    assert "affiliation.source_id = ANY(ARRAY['source_a', 'source_b']::varchar[])" in sql
+    assert "affiliation.last_seen_run_id = 'run_123'" in sql
+
+
 def test_provider_directory_source_selects_are_guarded_by_table_availability():
     available = _provider_directory_available()
     available["provider_directory_location"] = False

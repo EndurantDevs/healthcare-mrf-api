@@ -366,3 +366,14 @@ America/Chicago. It runs `entity-address-unified` with
 `publish=true` so Provider Directory FHIR rows become visible in
 provider/address search without rebuilding unchanged serving rows or the
 heavier monthly support/provenance tables.
+
+The provider-directory partial refresh is scoped by default
+(`provider_directory_partial_scope=latest-run`). It discovers the latest
+completed Provider Directory source set from
+`provider_directory_source.metadata_json.last_resource_import` and filters the
+FHIR practitioner-role / organization-affiliation paths by source/run before
+building affected address groups. This keeps a daily partial patch from
+re-running the full Provider Directory relationship graph. For a deliberate
+unscoped rebuild, pass `provider_directory_partial_scope=all`, or pass
+`provider_directory_run_id` / `provider_directory_source_ids` explicitly for a
+known run.

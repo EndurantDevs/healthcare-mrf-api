@@ -83,6 +83,7 @@ DEFAULT_SQL_SYNCHRONOUS_COMMIT = "off"
 DEFAULT_SQL_JIT = "off"
 DEFAULT_PTG_PARTIAL_PATCH_SUPPORT = True
 DEFAULT_PTG_PARTIAL_PATCH_MAIN = True
+DEFAULT_PROVIDER_DIRECTORY_PARTIAL_SCOPE = "latest-run"
 ENTITY_ADDRESS_REFRESH_MODE_FULL = "full"
 ENTITY_ADDRESS_REFRESH_MODE_PTG_PARTIAL = "ptg-partial"
 ENTITY_ADDRESS_REFRESH_MODE_PROVIDER_DIRECTORY_PARTIAL = "provider-directory-partial"
@@ -251,6 +252,40 @@ def _entity_address_ptg_source_keys(task: dict) -> list[str]:
         or os.getenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_PTG_SOURCE_KEY")
     )
     return _coerce_str_list(explicit)
+
+
+def _entity_address_provider_directory_source_ids(task: dict) -> list[str]:
+    explicit = (
+        task.get("provider_directory_source_ids")
+        or task.get("provider_directory_source_id")
+        or os.getenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_PROVIDER_DIRECTORY_SOURCE_IDS")
+        or os.getenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_PROVIDER_DIRECTORY_SOURCE_ID")
+    )
+    return _coerce_str_list(explicit)
+
+
+def _entity_address_provider_directory_run_id(task: dict) -> str | None:
+    return _clean_optional(
+        task.get("provider_directory_run_id")
+        or os.getenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_PROVIDER_DIRECTORY_RUN_ID")
+    )
+
+
+def _entity_address_provider_directory_partial_scope(task: dict) -> str:
+    raw = (
+        task.get("provider_directory_partial_scope")
+        or os.getenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_PROVIDER_DIRECTORY_PARTIAL_SCOPE")
+        or DEFAULT_PROVIDER_DIRECTORY_PARTIAL_SCOPE
+    )
+    value = str(raw).strip().lower().replace("_", "-")
+    if value in {"latest", "latest-run", "latest-complete", "latest-completed-run"}:
+        return "latest-run"
+    if value in {"all", "full", "unscoped"}:
+        return "all"
+    raise ValueError(
+        "Unsupported provider_directory_partial_scope "
+        f"{raw!r}; expected latest-run or all"
+    )
 
 
 def _publish_requested(task: dict, *, test_mode: bool) -> bool:
@@ -1907,11 +1942,86 @@ def _nppes_postal_code_expr(db_schema: str, *, alias: str = "a", restore_alias: 
     )
 
 
+def _provider_directory_scope_filter_sql(
+    alias: str,
+    *,
+    source_ids: list[str] | tuple[str, ...] | None = None,
+    run_id: str | None = None,
+    indent: str = "                   ",
+) -> str:
+    clauses: list[str] = []
+    if source_ids:
+        clauses.append(f"{alias}.source_id = ANY({_string_array_literal(list(source_ids))})")
+    if run_id:
+        clauses.append(f"{alias}.last_seen_run_id = {_sql_literal(run_id)}")
+    if not clauses:
+        return ""
+    return "".join(f"\n{indent}AND {clause}" for clause in clauses)
+
+
+def _provider_directory_live_source_filter_sql(
+    alias: str,
+    *,
+    source_ids: list[str] | tuple[str, ...] | None = None,
+) -> str:
+    if not source_ids:
+        return ""
+    return f"""
+       AND EXISTS (
+            SELECT 1
+              FROM unnest(COALESCE({alias}.source_record_ids, ARRAY[]::varchar[])) AS pd_rid(rid)
+             WHERE pd_rid.rid LIKE 'provider_directory_fhir:%'
+               AND split_part(pd_rid.rid, ':', 3) = ANY({_string_array_literal(list(source_ids))})
+       )"""
+
+
+def _latest_provider_directory_partial_scope_sql(db_schema: str) -> str:
+    source_ref = f"{db_schema}.provider_directory_source"
+    return f"""
+    WITH completed_sources AS (
+        SELECT
+            source_id::varchar AS source_id,
+            metadata_json::jsonb->'last_resource_import'->>'run_id' AS run_id,
+            updated_at
+          FROM {source_ref}
+         WHERE COALESCE(metadata_json::jsonb, '{{}}'::jsonb) ? 'last_resource_import'
+           AND metadata_json::jsonb->'last_resource_import'->'resources'->'Location'->>'complete' = 'true'
+           AND (
+                metadata_json::jsonb->'last_resource_import'->'resources'->'PractitionerRole'->>'complete' = 'true'
+             OR metadata_json::jsonb->'last_resource_import'->'resources'->'OrganizationAffiliation'->>'complete' = 'true'
+           )
+    )
+    SELECT
+        run_id,
+        ARRAY_AGG(source_id ORDER BY source_id)::varchar[] AS source_ids,
+        COUNT(*)::bigint AS source_count,
+        MAX(updated_at) AS latest_updated_at
+      FROM completed_sources
+     WHERE run_id IS NOT NULL
+  GROUP BY run_id
+  ORDER BY MAX(updated_at) DESC NULLS LAST, run_id DESC
+     LIMIT 1;
+    """
+
+
+async def _latest_provider_directory_partial_scope(db_schema: str) -> tuple[str | None, list[str]]:
+    if not await _table_exists(db_schema, "provider_directory_source"):
+        return None, []
+    row = await db.first(_latest_provider_directory_partial_scope_sql(db_schema))
+    if not row:
+        return None, []
+    values = row._mapping
+    source_ids = _coerce_str_list(values.get("source_ids"))
+    return _clean_optional(values.get("run_id")), source_ids
+
+
 def _source_selects(
     db_schema: str,
     available: dict[str, bool],
     *,
     test_limit_per_source: int | None = None,
+    provider_directory_source_ids: list[str] | tuple[str, ...] | None = None,
+    provider_directory_run_id: str | None = None,
 ) -> list[str]:
     selects: list[str] = []
     has_npi = available.get("npi", False)
@@ -1978,6 +2088,16 @@ def _source_selects(
         state="COALESCE(loc.state_name, loc.state_code)",
         zip_code="loc.postal_code",
         country="COALESCE(NULLIF(loc.country_code, ''), 'US')",
+    )
+    provider_directory_role_scope_filter = _provider_directory_scope_filter_sql(
+        "role",
+        source_ids=provider_directory_source_ids,
+        run_id=provider_directory_run_id,
+    )
+    provider_directory_affiliation_scope_filter = _provider_directory_scope_filter_sql(
+        "affiliation",
+        source_ids=provider_directory_source_ids,
+        run_id=provider_directory_run_id,
     )
 
     npi_join = f"LEFT JOIN {db_schema}.npi AS n ON n.npi = a.npi" if has_npi else ""
@@ -2557,6 +2677,7 @@ def _source_selects(
                    AND role.active IS DISTINCT FROM false
                    AND (loc.status IS NULL OR lower(loc.status) <> 'inactive')
                    AND {provider_directory_address_predicate}
+                   {provider_directory_role_scope_filter}
             )
             {provider_directory_pa_cte("provider_directory_practitioner_locations")}
             SELECT
@@ -2677,6 +2798,7 @@ def _source_selects(
                    AND affiliation.active IS DISTINCT FROM false
                    AND (loc.status IS NULL OR lower(loc.status) <> 'inactive')
                    AND {provider_directory_address_predicate}
+                   {provider_directory_affiliation_scope_filter}
             )
             {provider_directory_pa_cte("provider_directory_organization_locations")}
             SELECT
@@ -2926,6 +3048,8 @@ def _prepare_provider_directory_partial_affected_groups_sql(
     db_schema: str,
     group_table: str,
     source_selects: list[str],
+    *,
+    source_ids: list[str] | tuple[str, ...] | None = None,
 ) -> str:
     provider_selects = [
         source_select
@@ -2941,6 +3065,7 @@ def _prepare_provider_directory_partial_affected_groups_sql(
         _provider_directory_current_group_select_sql(source_select)
         for source_select in provider_selects
     )
+    live_source_filter = _provider_directory_live_source_filter_sql("live", source_ids=source_ids)
     return f"""
     CREATE UNLOGGED TABLE {db_schema}.{group_table} AS
     SELECT DISTINCT
@@ -2956,6 +3081,7 @@ def _prepare_provider_directory_partial_affected_groups_sql(
      WHERE COALESCE(live.address_sources, ARRAY[]::varchar[])
            @> ARRAY['provider_directory_fhir']::varchar[]
        AND live.location_key IS NOT NULL
+       {live_source_filter}
     UNION
     {current_groups_sql};
     """
@@ -2980,6 +3106,19 @@ def _index_ptg_partial_affected_groups_sql(db_schema: str, group_table: str) -> 
 
 def _index_provider_directory_partial_affected_groups_sql(db_schema: str, group_table: str) -> str:
     return _index_ptg_partial_affected_groups_sql(db_schema, group_table)
+
+
+def _provider_directory_partial_scope_index_sql(db_schema: str) -> list[str]:
+    return [
+        f"""
+        CREATE INDEX IF NOT EXISTS provider_directory_role_run_source_idx
+            ON {db_schema}.provider_directory_practitioner_role (last_seen_run_id, source_id);
+        """,
+        f"""
+        CREATE INDEX IF NOT EXISTS provider_directory_affiliation_run_source_idx
+            ON {db_schema}.provider_directory_organization_affiliation (last_seen_run_id, source_id);
+        """,
+    ]
 
 
 def _affected_group_source_select_sql(db_schema: str, source_select: str, group_table: str) -> str:
@@ -8708,9 +8847,25 @@ async def process_data(ctx, task=None):
     ptg_source_keys = _entity_address_ptg_source_keys(task) if partial_ptg_refresh else []
     if partial_ptg_refresh and not ptg_source_keys:
         raise RuntimeError("entity-address-unified ptg-partial refresh requires ptg_source_key.")
+    provider_directory_partial_scope = (
+        _entity_address_provider_directory_partial_scope(task)
+        if partial_provider_directory_refresh
+        else None
+    )
+    provider_directory_source_ids = (
+        _entity_address_provider_directory_source_ids(task)
+        if partial_provider_directory_refresh
+        else []
+    )
+    provider_directory_run_id = (
+        _entity_address_provider_directory_run_id(task)
+        if partial_provider_directory_refresh
+        else None
+    )
     context["refresh_mode"] = refresh_mode
     context["partial_ptg_source_keys"] = ptg_source_keys
     context["partial_provider_directory_refresh"] = partial_provider_directory_refresh
+    context["partial_provider_directory_scope"] = provider_directory_partial_scope
     aggregate_source_record_ids = _aggregate_source_record_ids()
     context["aggregate_source_record_ids"] = aggregate_source_record_ids
     serving_only_refresh = partial_provider_directory_refresh or (
@@ -8847,10 +9002,32 @@ async def process_data(ctx, task=None):
             )
         )
     context["limit_per_source"] = test_limit_per_source
+    if (
+        partial_provider_directory_refresh
+        and provider_directory_partial_scope == "latest-run"
+        and not provider_directory_source_ids
+        and not provider_directory_run_id
+    ):
+        provider_directory_run_id, provider_directory_source_ids = (
+            await _latest_provider_directory_partial_scope(db_schema)
+        )
+    if partial_provider_directory_refresh and provider_directory_partial_scope == "latest-run":
+        if not provider_directory_source_ids and not provider_directory_run_id:
+            raise RuntimeError(
+                "entity-address-unified provider-directory-partial refresh could not "
+                "discover a completed Provider Directory FHIR source scope; pass "
+                "provider_directory_source_ids/provider_directory_run_id explicitly or "
+                "provider_directory_partial_scope=all to run an unscoped refresh."
+            )
+    context["partial_provider_directory_run_id"] = provider_directory_run_id
+    context["partial_provider_directory_source_ids"] = provider_directory_source_ids
+    context["partial_provider_directory_source_count"] = len(provider_directory_source_ids)
     source_selects = _source_selects(
         db_schema,
         available,
         test_limit_per_source=test_limit_per_source,
+        provider_directory_source_ids=provider_directory_source_ids,
+        provider_directory_run_id=provider_directory_run_id,
     )
     affected_group_table: str | None = None
     if partial_ptg_refresh:
@@ -8926,12 +9103,27 @@ async def process_data(ctx, task=None):
         affected_group_table = _provider_directory_partial_affected_group_table_name(stage_table)
         context["partial_provider_directory_affected_group_table"] = affected_group_table
         context["partial_affected_group_table"] = affected_group_table
+        scope_index_sql = _provider_directory_partial_scope_index_sql(db_schema)
+        for index_idx, index_sql in enumerate(scope_index_sql):
+            await _run_sql_phase(
+                index_sql,
+                context=context,
+                run_id=run_id,
+                phase="entity-address-unified ensuring Provider Directory scope indexes",
+                unit="indexes",
+                done=index_idx,
+                total=len(scope_index_sql),
+                message="ensuring Provider Directory scope indexes",
+                emit_start=True,
+                emit_done=True,
+            )
         await db.status(f"DROP TABLE IF EXISTS {db_schema}.{affected_group_table};")
         await _run_sql_phase(
             _prepare_provider_directory_partial_affected_groups_sql(
                 db_schema,
                 affected_group_table,
                 source_selects,
+                source_ids=provider_directory_source_ids,
             ),
             context=context,
             run_id=run_id,
@@ -10374,6 +10566,11 @@ async def shutdown(ctx):
             "partial_provider_directory_patched_rows": int(
                 context.get("partial_provider_directory_patched_rows") or 0
             ),
+            "partial_provider_directory_scope": context.get("partial_provider_directory_scope"),
+            "partial_provider_directory_run_id": context.get("partial_provider_directory_run_id"),
+            "partial_provider_directory_source_count": int(
+                context.get("partial_provider_directory_source_count") or 0
+            ),
             "npi_rows": int(context.get("npi_rows") or 0),
             "inferred_rows": int(context.get("inferred_rows") or 0),
             "multi_source_rows": int(context.get("multi_source_rows") or 0),
@@ -10511,6 +10708,9 @@ async def main(
     refresh_mode: str | None = None,
     ptg_source_key: str | None = None,
     serving_only_refresh: bool | None = None,
+    provider_directory_run_id: str | None = None,
+    provider_directory_source_ids: list[str] | tuple[str, ...] | str | None = None,
+    provider_directory_partial_scope: str | None = None,
 ):
     redis = await create_pool(
         build_redis_settings(),
@@ -10528,4 +10728,11 @@ async def main(
         payload["ptg_source_key"] = ptg_source_key
     if serving_only_refresh is not None:
         payload["serving_only_refresh"] = bool(serving_only_refresh)
+    if provider_directory_run_id:
+        payload["provider_directory_run_id"] = provider_directory_run_id
+    source_ids = _coerce_str_list(provider_directory_source_ids)
+    if source_ids:
+        payload["provider_directory_source_ids"] = source_ids
+    if provider_directory_partial_scope:
+        payload["provider_directory_partial_scope"] = provider_directory_partial_scope
     await redis.enqueue_job("process_data", payload, _queue_name=ENTITY_ADDRESS_UNIFIED_QUEUE_NAME)

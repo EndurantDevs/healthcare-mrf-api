@@ -1155,6 +1155,48 @@ def test_provider_directory_partial_sql_uses_live_and_current_fhir_groups():
     )
 
 
+def test_provider_directory_partial_sql_can_scope_live_groups_by_source_id():
+    source_selects = entity_address_unified._source_selects(
+        "mrf",
+        {
+            "provider_directory_practitioner": True,
+            "provider_directory_organization": True,
+            "provider_directory_location": True,
+            "provider_directory_location.address_key": True,
+            "provider_directory_practitioner_role": True,
+            "provider_directory_organization_affiliation": True,
+            "npi_address": False,
+            "address_archive_v2": False,
+        },
+        provider_directory_source_ids=["source_a"],
+        provider_directory_run_id="run_123",
+    )
+
+    sql = entity_address_unified._prepare_provider_directory_partial_affected_groups_sql(  # pylint: disable=protected-access
+        "mrf",
+        "entity_address_unified_pd_groups",
+        source_selects,
+        source_ids=["source_a"],
+    )
+
+    assert "provider_directory_practitioner_role AS role" in sql
+    assert "role.source_id = ANY(ARRAY['source_a']::varchar[])" in sql
+    assert "role.last_seen_run_id = 'run_123'" in sql
+    assert "provider_directory_organization_affiliation AS affiliation" in sql
+    assert "affiliation.source_id = ANY(ARRAY['source_a']::varchar[])" in sql
+    assert "split_part(pd_rid.rid, ':', 3) = ANY(ARRAY['source_a']::varchar[])" in sql
+
+
+def test_latest_provider_directory_partial_scope_sql_uses_source_metadata_not_resource_tables():
+    sql = entity_address_unified._latest_provider_directory_partial_scope_sql("mrf")  # pylint: disable=protected-access
+
+    assert "FROM mrf.provider_directory_source" in sql
+    assert "last_resource_import" in sql
+    assert "provider_directory_practitioner_role" not in sql
+    assert "provider_directory_organization_affiliation" not in sql
+    assert "provider_directory_location" not in sql
+
+
 def test_entity_address_unified_stage_index_name_is_hash_safe_for_long_names():
     first = entity_address_unified._stage_index_name(
         "ptg_address_codex_member_partial_smokefull_member_coverage",

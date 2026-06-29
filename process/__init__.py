@@ -1342,6 +1342,17 @@ def pharmacy_economics(test: bool):
     default=None,
     help="For full refreshes, publish only the denormalized serving table and leave support tables unchanged.",
 )
+@click.option("--provider-directory-run-id", help="Provider Directory FHIR run id to scope provider-directory-partial.")
+@click.option(
+    "--provider-directory-source-id",
+    multiple=True,
+    help="Provider Directory source id to scope provider-directory-partial. Can be passed more than once.",
+)
+@click.option(
+    "--provider-directory-partial-scope",
+    type=click.Choice(["latest-run", "all"], case_sensitive=False),
+    help="Default provider-directory-partial scope; latest-run avoids unscoped full-source patches.",
+)
 def entity_address_unified(
     test: bool,
     limit_per_source: int | None,
@@ -1349,6 +1360,9 @@ def entity_address_unified(
     refresh_mode: str,
     ptg_source_key: str | None,
     serving_only_refresh: bool | None,
+    provider_directory_run_id: str | None,
+    provider_directory_source_id: tuple[str, ...],
+    provider_directory_partial_scope: str | None,
 ):
     _run(
         initiate_entity_address_unified(
@@ -1358,6 +1372,9 @@ def entity_address_unified(
             refresh_mode=refresh_mode,
             ptg_source_key=ptg_source_key,
             serving_only_refresh=serving_only_refresh,
+            provider_directory_run_id=provider_directory_run_id,
+            provider_directory_source_ids=list(provider_directory_source_id),
+            provider_directory_partial_scope=provider_directory_partial_scope,
         )
     )
 
