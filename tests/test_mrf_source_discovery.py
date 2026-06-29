@@ -1679,6 +1679,7 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert by_name["BCBS Wyoming"].hosting_platform == "bcbswy_hmhs_monthly_toc"
     assert "Blue Cross and Blue Shield of Wyoming" in by_name["BCBS Wyoming"].aliases
     assert "BCBSWY" in by_name["BCBS Wyoming"].aliases
+    assert "Blue Cross Blue Shield/Blue Water" in by_name["BCBS Michigan"].aliases
     assert "Blue Cross & Blue Shield of Mississippi" in by_name["BCBS Mississippi"].aliases
     assert "BlueCross BlueShield of Mississippi" in by_name["BCBS Mississippi"].aliases
     assert (
