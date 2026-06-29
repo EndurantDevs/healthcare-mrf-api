@@ -3078,8 +3078,7 @@ def _prepare_provider_directory_partial_affected_groups_sql(
         {_zip5_norm_expr("live.postal_code")}::varchar AS zip_key,
         {_state_norm_expr("live.country_code")}::varchar AS country_key
       FROM {db_schema}.{EntityAddressUnified.__main_table__} AS live
-     WHERE COALESCE(live.address_sources, ARRAY[]::varchar[])
-           @> ARRAY['provider_directory_fhir']::varchar[]
+     WHERE live.address_sources @> ARRAY['provider_directory_fhir']::varchar[]
        AND live.location_key IS NOT NULL
        {live_source_filter}
     UNION

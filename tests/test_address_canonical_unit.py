@@ -1144,6 +1144,7 @@ def test_provider_directory_partial_sql_uses_live_and_current_fhir_groups():
 
     assert "CREATE UNLOGGED TABLE mrf.entity_address_unified_pd_groups AS" in sql
     assert "@> ARRAY['provider_directory_fhir']::varchar[]" in sql
+    assert "COALESCE(live.address_sources" not in sql
     assert "provider_directory_practitioner_role AS role" in sql
     assert "provider_directory_organization_affiliation AS affiliation" in sql
     assert "src.address_key::uuid AS address_key" in sql
