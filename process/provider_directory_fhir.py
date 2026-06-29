@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+import aiohttp
 from sqlalchemy import case, func, or_
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -224,6 +225,8 @@ PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV = "HLTHPRT_PROVIDER_DIRECTORY_CREDENTIAL
 SECRET_ENV_PREFIX = "env:"
 DEFAULT_FULL_REFRESH_MAX_PAGES = 10000
 DEFAULT_STREAM_BATCH_SIZE = 5000
+DEFAULT_BULK_EXPORT_MAX_POLLS = 120
+DEFAULT_BULK_EXPORT_POLL_SECONDS = 5
 OAUTH_TOKEN_EXPIRY_SKEW_SECONDS = 60
 _OAUTH_TOKEN_CACHE: dict[str, tuple[str, float]] = {}
 FHIR_ONBOARDING_GATEWAY_HOSTS = {
@@ -289,6 +292,7 @@ class ResourceFetchResult:
     hard_page_limit_reached: bool
     next_url_remaining: bool
     error: str | None = None
+    fetch_mode: str = "paged"
 
     @property
     def bounded(self) -> bool:
@@ -3600,6 +3604,345 @@ def _next_link(payload: dict[str, Any] | None) -> str | None:
     return None
 
 
+def _bulk_export_start_url(source: dict[str, Any], resource_type: str) -> str | None:
+    api_base = _canonical_base(source.get("api_base"))
+    if not api_base:
+        return None
+    query = urllib.parse.urlencode({"_type": resource_type})
+    return f"{api_base}/$export?{query}"
+
+
+def _bulk_export_enabled(value: Any) -> bool:
+    if value is None:
+        value = os.getenv("HLTHPRT_PROVIDER_DIRECTORY_BULK_EXPORT")
+    return _bool_or_default(value, False)
+
+
+def _retry_after_seconds(value: str | None) -> int | None:
+    text = _clean_text(value)
+    if not text:
+        return None
+    try:
+        return max(0, min(int(text), 60))
+    except ValueError:
+        return None
+
+
+def _bulk_export_output_urls(payload: dict[str, Any] | None, resource_type: str) -> list[str]:
+    if not isinstance(payload, dict):
+        return []
+    urls: list[str] = []
+    for item in payload.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        if _clean_text(item.get("type")) != resource_type:
+            continue
+        url = _clean_text(item.get("url"))
+        if url:
+            urls.append(url)
+    return urls
+
+
+def _is_bulk_export_unsupported_status(status_code: int | None) -> bool:
+    return status_code in {400, 404, 405, 501}
+
+
+def _bulk_json_headers(*, prefer_async: bool = False) -> dict[str, str]:
+    headers = {
+        "Accept": "application/fhir+json, application/json;q=0.9, */*;q=0.1",
+        "User-Agent": USER_AGENT,
+    }
+    if prefer_async:
+        headers["Prefer"] = "respond-async"
+    return headers
+
+
+def _bulk_ndjson_headers() -> dict[str, str]:
+    return {
+        "Accept": "application/fhir+ndjson, application/ndjson;q=0.9, text/plain;q=0.5, */*;q=0.1",
+        "User-Agent": USER_AGENT,
+    }
+
+
+async def _bulk_http_get_json(
+    session: aiohttp.ClientSession,
+    source: dict[str, Any],
+    url: str,
+    *,
+    timeout: int,
+    prefer_async: bool = False,
+) -> tuple[int | None, dict[str, str], dict[str, Any] | None, str | None]:
+    options = _credential_request_options_for_source(source, url)
+    headers = _bulk_json_headers(prefer_async=prefer_async)
+    headers.update(options["headers"])
+    fetch_url = _url_with_query_params(url, options["query_params"])
+    try:
+        async with session.get(
+            fetch_url,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=timeout),
+            allow_redirects=False,
+            ssl=_ssl_context(),
+        ) as response:
+            body = await response.read()
+            header_map = {str(key).lower(): str(value) for key, value in response.headers.items()}
+            return response.status, header_map, _decode_json_body(body), None
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        return None, {}, None, f"{type(exc).__name__}: {exc}"
+
+
+async def _bulk_export_poll_outputs(
+    session: aiohttp.ClientSession,
+    source: dict[str, Any],
+    status_url: str,
+    *,
+    resource_type: str,
+    timeout: int,
+) -> tuple[list[str] | None, str | None, int]:
+    max_polls = _env_int("HLTHPRT_PROVIDER_DIRECTORY_BULK_EXPORT_MAX_POLLS", DEFAULT_BULK_EXPORT_MAX_POLLS)
+    poll_seconds = _env_int(
+        "HLTHPRT_PROVIDER_DIRECTORY_BULK_EXPORT_POLL_SECONDS",
+        DEFAULT_BULK_EXPORT_POLL_SECONDS,
+    )
+    polls = 0
+    while polls < max(1, max_polls):
+        polls += 1
+        status_code, headers, payload, error = await _bulk_http_get_json(
+            session,
+            source,
+            status_url,
+            timeout=timeout,
+        )
+        if error:
+            return None, error, polls
+        if status_code == 202:
+            await asyncio.sleep(_retry_after_seconds(headers.get("retry-after")) or poll_seconds)
+            continue
+        if status_code == 200:
+            return _bulk_export_output_urls(payload, resource_type), None, polls
+        return None, f"bulk_export_status_http_{status_code}", polls
+    return None, "bulk_export_timeout", polls
+
+
+async def _stream_bulk_export_output_rows(
+    session: aiohttp.ClientSession,
+    source: dict[str, Any],
+    url: str,
+    *,
+    model: type,
+    resource_type: str,
+    per_resource_limit: int,
+    timeout: int,
+    run_id: str | None,
+    row_batch_handler: Callable[[type, list[dict[str, Any]]], Awaitable[int]] | None,
+    row_batch_size: int,
+    retain_rows: bool,
+) -> tuple[list[dict[str, Any]], int, int, bool, str | None]:
+    options = _credential_request_options_for_source(source, url)
+    headers = _bulk_ndjson_headers()
+    headers.update(options["headers"])
+    fetch_url = _url_with_query_params(url, options["query_params"])
+    rows: list[dict[str, Any]] = []
+    pending_rows: list[dict[str, Any]] = []
+    rows_fetched = 0
+    rows_written = 0
+    row_limit_reached = False
+
+    async def flush_pending_rows() -> None:
+        nonlocal rows_written, pending_rows
+        if row_batch_handler and pending_rows:
+            rows_written += await row_batch_handler(model, pending_rows)
+            pending_rows = []
+
+    def handle_line(raw_line: bytes) -> str | None:
+        nonlocal rows_fetched, row_limit_reached
+        line = raw_line.strip()
+        if not line:
+            return None
+        try:
+            resource = json.loads(line.decode("utf-8-sig", errors="replace"))
+        except json.JSONDecodeError:
+            return "invalid_ndjson"
+        if not isinstance(resource, dict) or resource.get("resourceType") != resource_type:
+            return None
+        parsed = parse_fhir_resource(
+            source["source_id"],
+            resource,
+            resource_url=url,
+            run_id=run_id,
+        )
+        if not parsed:
+            return None
+        parsed_model, row = parsed
+        if parsed_model is not model:
+            return None
+        rows_fetched += 1
+        if retain_rows:
+            rows.append(row)
+        if row_batch_handler:
+            pending_rows.append(row)
+        if not _limit_allows_more(rows_fetched, per_resource_limit):
+            row_limit_reached = True
+        return None
+
+    try:
+        async with session.get(
+            fetch_url,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=None, sock_connect=timeout, sock_read=timeout),
+            allow_redirects=True,
+            ssl=_ssl_context(),
+        ) as response:
+            if response.status != 200:
+                return rows, rows_fetched, rows_written, row_limit_reached, f"bulk_export_output_http_{response.status}"
+            buffer = b""
+            async for chunk in response.content.iter_chunked(READ_CHUNK_BYTES):
+                buffer += chunk
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    error = handle_line(line)
+                    if error:
+                        return rows, rows_fetched, rows_written, row_limit_reached, error
+                    if row_batch_handler and len(pending_rows) >= max(1, row_batch_size):
+                        await flush_pending_rows()
+                    if row_limit_reached:
+                        await flush_pending_rows()
+                        return rows, rows_fetched, rows_written, True, None
+            if buffer.strip():
+                error = handle_line(buffer)
+                if error:
+                    return rows, rows_fetched, rows_written, row_limit_reached, error
+            await flush_pending_rows()
+            return rows, rows_fetched, rows_written, row_limit_reached, None
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        return rows, rows_fetched, rows_written, row_limit_reached, f"{type(exc).__name__}: {exc}"
+
+
+async def _fetch_bulk_export_resource_rows(
+    source: dict[str, Any],
+    resource_type: str,
+    *,
+    per_resource_limit: int,
+    timeout: int,
+    run_id: str | None,
+    row_batch_handler: Callable[[type, list[dict[str, Any]]], Awaitable[int]] | None = None,
+    row_batch_size: int = DEFAULT_STREAM_BATCH_SIZE,
+    retain_rows: bool = True,
+) -> ResourceFetchResult | None:
+    model = RESOURCE_MODELS_BY_TYPE.get(resource_type)
+    url = _bulk_export_start_url(source, resource_type)
+    if model is None or not url:
+        return None
+    async with aiohttp.ClientSession() as session:
+        status_code, headers, _payload, error = await _bulk_http_get_json(
+            session,
+            source,
+            url,
+            timeout=timeout,
+            prefer_async=True,
+        )
+        if error:
+            return None
+        if _is_bulk_export_unsupported_status(status_code):
+            return None
+        if status_code != 202:
+            return ResourceFetchResult(
+                model=model,
+                rows=[],
+                rows_fetched=0,
+                rows_written=0,
+                pages_fetched=0,
+                complete=False,
+                row_limit_reached=False,
+                page_limit_reached=False,
+                hard_page_limit_reached=False,
+                next_url_remaining=False,
+                error=f"bulk_export_http_{status_code}",
+                fetch_mode="bulk_export",
+            )
+        status_url = _clean_text(headers.get("content-location") or headers.get("location"))
+        if not status_url:
+            return ResourceFetchResult(
+                model=model,
+                rows=[],
+                rows_fetched=0,
+                rows_written=0,
+                pages_fetched=0,
+                complete=False,
+                row_limit_reached=False,
+                page_limit_reached=False,
+                hard_page_limit_reached=False,
+                next_url_remaining=False,
+                error="bulk_export_missing_content_location",
+                fetch_mode="bulk_export",
+            )
+        output_urls, poll_error, polls = await _bulk_export_poll_outputs(
+            session,
+            source,
+            urllib.parse.urljoin(url, status_url),
+            resource_type=resource_type,
+            timeout=timeout,
+        )
+        if poll_error is not None:
+            return ResourceFetchResult(
+                model=model,
+                rows=[],
+                rows_fetched=0,
+                rows_written=0,
+                pages_fetched=polls,
+                complete=False,
+                row_limit_reached=False,
+                page_limit_reached=False,
+                hard_page_limit_reached=False,
+                next_url_remaining=False,
+                error=poll_error,
+                fetch_mode="bulk_export",
+            )
+        rows: list[dict[str, Any]] = []
+        rows_fetched = 0
+        rows_written = 0
+        row_limit_reached = False
+        output_error: str | None = None
+        for output_url in output_urls or []:
+            batch_rows, fetched, written, limited, error = await _stream_bulk_export_output_rows(
+                session,
+                source,
+                output_url,
+                model=model,
+                resource_type=resource_type,
+                per_resource_limit=max(0, per_resource_limit - rows_fetched) if per_resource_limit > 0 else 0,
+                timeout=timeout,
+                run_id=run_id,
+                row_batch_handler=row_batch_handler,
+                row_batch_size=row_batch_size,
+                retain_rows=retain_rows,
+            )
+            rows.extend(batch_rows)
+            rows_fetched += fetched
+            rows_written += written
+            if error:
+                output_error = error
+                break
+            if limited:
+                row_limit_reached = True
+                break
+        complete = not output_error and not row_limit_reached
+        return ResourceFetchResult(
+            model=model,
+            rows=rows,
+            rows_fetched=rows_fetched,
+            rows_written=rows_written,
+            pages_fetched=(output_urls and len(output_urls) or 0) + polls,
+            complete=complete,
+            row_limit_reached=row_limit_reached,
+            page_limit_reached=False,
+            hard_page_limit_reached=False,
+            next_url_remaining=row_limit_reached,
+            error=output_error,
+            fetch_mode="bulk_export",
+        )
+
+
 async def _fetch_resource_rows(
     source: dict[str, Any],
     resource_type: str,
@@ -3614,10 +3957,24 @@ async def _fetch_resource_rows(
     retain_rows: bool = True,
     cancel_ctx: dict[str, Any] | None = None,
     cancel_task: dict[str, Any] | None = None,
+    bulk_export: bool = False,
 ) -> ResourceFetchResult | None:
     model = RESOURCE_MODELS_BY_TYPE.get(resource_type)
     if model is None:
         return None
+    if bulk_export:
+        result = await _fetch_bulk_export_resource_rows(
+            source,
+            resource_type,
+            per_resource_limit=per_resource_limit,
+            timeout=timeout,
+            run_id=run_id,
+            row_batch_handler=row_batch_handler,
+            row_batch_size=row_batch_size,
+            retain_rows=retain_rows,
+        )
+        if result is not None:
+            return result
     url = _resource_start_url(source, resource_type, page_count=page_count)
     if not url:
         return None
@@ -3924,6 +4281,7 @@ def _empty_resource_stats() -> dict[str, Any]:
         "sources_bounded": 0,
         "sources_failed": 0,
         "sources_empty": 0,
+        "bulk_export_sources": 0,
         "pages_fetched": 0,
         "rows_fetched": 0,
     }
@@ -3942,6 +4300,8 @@ def _record_resource_fetch_stats(stats: dict[str, dict[str, Any]], resource_type
         entry["sources_failed"] += 1
     if result.complete and result.rows_fetched == 0:
         entry["sources_empty"] += 1
+    if result.fetch_mode == "bulk_export":
+        entry["bulk_export_sources"] += 1
 
 
 def _resource_fetch_diagnostic(result: ResourceFetchResult, *, rows_written_per_source: int) -> dict[str, Any]:
@@ -3949,6 +4309,7 @@ def _resource_fetch_diagnostic(result: ResourceFetchResult, *, rows_written_per_
         "complete": result.complete,
         "bounded": result.bounded,
         "error": result.error,
+        "fetch_mode": result.fetch_mode,
         "pages_fetched": result.pages_fetched,
         "rows_fetched": result.rows_fetched,
         "rows_written": rows_written_per_source,
@@ -4412,6 +4773,7 @@ async def _import_resources(
     stale_cleanup: bool = False,
     stream_batch_size: int = 0,
     source_concurrency: int = 1,
+    bulk_export: bool = False,
     cancel_ctx: dict[str, Any] | None = None,
     cancel_task: dict[str, Any] | None = None,
     progress_callback: Callable[[int, int, dict[str, int], dict[str, Any] | None], Awaitable[None]] | None = None,
@@ -4589,6 +4951,7 @@ async def _import_resources(
                 retain_rows=linked_resource_limit > 0 or not use_streaming,
                 cancel_ctx=cancel_ctx,
                 cancel_task=cancel_task,
+                bulk_export=bulk_export,
             )
             if not result:
                 continue
@@ -4765,6 +5128,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
         task.get("stream_batch_size"),
         0 if test_mode else _env_int("HLTHPRT_PROVIDER_DIRECTORY_STREAM_BATCH_SIZE", DEFAULT_STREAM_BATCH_SIZE),
     )
+    bulk_export = _bulk_export_enabled(task.get("bulk_export"))
     source_concurrency = _int_or_default(
         task.get("source_concurrency"),
         1 if test_mode else _env_int("HLTHPRT_PROVIDER_DIRECTORY_SOURCE_CONCURRENCY", 1),
@@ -4831,6 +5195,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
             "page_limit": page_limit,
             "page_count": page_count,
             "stream_batch_size": stream_batch_size,
+            "bulk_export": bulk_export,
             "source_concurrency": source_concurrency,
             "stale_cleanup": stale_cleanup,
             "publish_artifacts": publish_artifacts,
@@ -4936,6 +5301,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
                 stale_cleanup=stale_cleanup,
                 stream_batch_size=stream_batch_size,
                 source_concurrency=source_concurrency,
+                bulk_export=bulk_export,
                 cancel_ctx=ctx,
                 cancel_task={**task, "run_id": run_id},
                 progress_callback=resource_progress,
@@ -5050,6 +5416,7 @@ async def main(
     page_limit: int | None = None,
     page_count: int | None = None,
     stream_batch_size: int | None = None,
+    bulk_export: bool | None = None,
     source_concurrency: int | None = None,
     concurrency: int | None = None,
     timeout: int | None = None,
@@ -5077,6 +5444,7 @@ async def main(
         "page_limit": page_limit,
         "page_count": page_count,
         "stream_batch_size": stream_batch_size,
+        "bulk_export": bulk_export,
         "source_concurrency": source_concurrency,
         "concurrency": concurrency,
         "timeout": timeout,

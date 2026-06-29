@@ -104,6 +104,7 @@ python main.py start provider-directory-fhir \
   --page-limit 0 \
   --page-count 100 \
   --stream-batch-size 5000 \
+  --bulk-export \
   --source-concurrency 4 \
   --publish-artifacts \
   --stale-cleanup \
@@ -154,6 +155,15 @@ before merging into the Provider Directory tables. Disable that path with
 batch size with `HLTHPRT_PROVIDER_DIRECTORY_COPY_UPSERT_MIN_ROWS` (default
 `100`). If the active driver cannot use `copy_records_to_table`, the importer
 logs a short fallback message and continues with the values-based upsert path.
+
+`--bulk-export` enables a safe FHIR Bulk Data fast path for resource reads. For
+each selected resource type, the importer first tries `[base]/$export?_type=...`
+with `Prefer: respond-async`, polls the returned status URL, streams matching
+NDJSON output files, and writes rows through the same parser/COPY upsert path as
+normal resource pages. If the payer returns a normal unsupported status such as
+400, 404, 405, or 501, the importer falls back to the existing paginated FHIR
+search. Export attempts that are accepted but later fail are recorded in the
+per-source resource diagnostics as `fetch_mode=bulk_export` errors.
 
 Full-refresh stale cleanup also uses an append-only unlogged seen stage by
 default (`HLTHPRT_PROVIDER_DIRECTORY_SEEN_STAGE=1`). During fetch, resource ids
@@ -355,9 +365,9 @@ signals:
 `import-control` defines `default-provider-directory-fhir-daily` at `20 1 * * *`
 America/Chicago. The default parameters probe the full seed catalog, run a full
 open-access resource refresh (`resource_limit=0`, `page_limit=0`,
-`page_count=100`, `stream_batch_size=5000`, `source_concurrency=4`,
-`publish_artifacts=true`), and delete stale rows only for completed
-source/resource scans.
+`page_count=100`, `stream_batch_size=5000`, `bulk_export=true`,
+`source_concurrency=4`, `publish_artifacts=true`), and delete stale rows only
+for completed source/resource scans.
 
 `import-control` also defines
 `default-entity-address-unified-provider-directory-daily` at `20 2 * * *`

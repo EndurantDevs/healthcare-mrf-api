@@ -1867,6 +1867,119 @@ def test_resource_start_url_ignores_unreachable_catalog_endpoint():
     assert url == "https://fp.medicaid.utah.gov/ProviderDirectoryServices/Location?_count=100"
 
 
+def test_bulk_export_start_url_uses_base_export_operation():
+    url = importer._bulk_export_start_url(  # pylint: disable=protected-access
+        {"api_base": "https://example.test/fhir/"},
+        "PractitionerRole",
+    )
+
+    assert url == "https://example.test/fhir/$export?_type=PractitionerRole"
+
+
+def test_bulk_export_output_urls_filters_requested_resource_type():
+    urls = importer._bulk_export_output_urls(  # pylint: disable=protected-access
+        {
+            "output": [
+                {"type": "Practitioner", "url": "https://bulk.example/practitioner.ndjson"},
+                {"type": "Location", "url": "https://bulk.example/location.ndjson"},
+                {"type": "Location"},
+            ]
+        },
+        "Location",
+    )
+
+    assert urls == ["https://bulk.example/location.ndjson"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_resource_rows_uses_bulk_export_when_available(monkeypatch):
+    async def fake_bulk_export(source, resource_type, **kwargs):  # pylint: disable=unused-argument
+        assert source["source_id"] == "source_a"
+        assert resource_type == "Practitioner"
+        assert kwargs["per_resource_limit"] == 10
+        return importer.ResourceFetchResult(
+            model=ProviderDirectoryPractitioner,
+            rows=[{"source_id": "source_a", "resource_id": "prac-1"}],
+            rows_fetched=1,
+            rows_written=0,
+            pages_fetched=2,
+            complete=True,
+            row_limit_reached=False,
+            page_limit_reached=False,
+            hard_page_limit_reached=False,
+            next_url_remaining=False,
+            fetch_mode="bulk_export",
+        )
+
+    async def fail_paged_fetch(*_args, **_kwargs):
+        raise AssertionError("paged fetch should not be used when bulk export succeeds")
+
+    monkeypatch.setattr(importer, "_fetch_bulk_export_resource_rows", fake_bulk_export)
+    monkeypatch.setattr(importer, "_fetch_json", fail_paged_fetch)
+
+    result = await importer._fetch_resource_rows(  # pylint: disable=protected-access
+        {"source_id": "source_a", "api_base": "https://example.test/fhir"},
+        "Practitioner",
+        per_resource_limit=10,
+        page_limit=1,
+        page_count=25,
+        timeout=3,
+        run_id="run_1",
+        bulk_export=True,
+    )
+
+    assert result is not None
+    assert result.fetch_mode == "bulk_export"
+    assert result.rows[0]["resource_id"] == "prac-1"
+    stats: dict[str, dict[str, Any]] = {}
+    importer._record_resource_fetch_stats(stats, "Practitioner", result)  # pylint: disable=protected-access
+    assert stats["Practitioner"]["bulk_export_sources"] == 1
+
+
+@pytest.mark.asyncio
+async def test_fetch_resource_rows_falls_back_when_bulk_export_unsupported(monkeypatch):
+    async def fake_bulk_export(*_args, **_kwargs):
+        return None
+
+    async def fake_fetch_json(url, *, timeout):  # pylint: disable=unused-argument
+        assert url == "https://example.test/fhir/Practitioner?_count=25"
+        return (
+            200,
+            {
+                "resourceType": "Bundle",
+                "entry": [
+                    {
+                        "resource": {
+                            "resourceType": "Practitioner",
+                            "id": "prac-1",
+                            "name": [{"family": "Fallback"}],
+                        },
+                    }
+                ],
+            },
+            None,
+            10,
+        )
+
+    monkeypatch.setattr(importer, "_fetch_bulk_export_resource_rows", fake_bulk_export)
+    monkeypatch.setattr(importer, "_fetch_json", fake_fetch_json)
+
+    result = await importer._fetch_resource_rows(  # pylint: disable=protected-access
+        {"source_id": "source_a", "api_base": "https://example.test/fhir"},
+        "Practitioner",
+        per_resource_limit=1,
+        page_limit=1,
+        page_count=25,
+        timeout=3,
+        run_id="run_1",
+        bulk_export=True,
+    )
+
+    assert result is not None
+    assert result.fetch_mode == "paged"
+    assert result.rows[0]["resource_id"] == "prac-1"
+
+
 @pytest.mark.asyncio
 async def test_fetch_resource_rows_resolves_relative_next_links(monkeypatch):
     calls: list[str] = []

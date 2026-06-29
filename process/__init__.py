@@ -1195,6 +1195,11 @@ def provider_enrichment(test: bool):
 @click.option("--page-limit", type=int, help="Maximum FHIR pages per source/resource.")
 @click.option("--page-count", type=int, help="FHIR _count page size.")
 @click.option("--stream-batch-size", type=int, help="Rows per streaming upsert batch. Use 0 to retain rows and upsert after each resource scan.")
+@click.option(
+    "--bulk-export/--no-bulk-export",
+    default=None,
+    help="Try FHIR Bulk Data $export for resource reads when the payer supports it; fallback to paginated reads when unsupported.",
+)
 @click.option("--source-concurrency", type=int, help="Concurrent source resource imports.")
 @click.option("--concurrency", type=int, help="Concurrent source metadata probes.")
 @click.option("--timeout", type=int, help="Per-request timeout in seconds.")
@@ -1219,6 +1224,7 @@ def provider_directory_fhir(
     page_limit: int | None,
     page_count: int | None,
     stream_batch_size: int | None,
+    bulk_export: bool | None,
     source_concurrency: int | None,
     concurrency: int | None,
     timeout: int | None,
@@ -1245,6 +1251,7 @@ def provider_directory_fhir(
             page_limit=page_limit,
             page_count=page_count,
             stream_batch_size=stream_batch_size,
+            bulk_export=bulk_export,
             source_concurrency=source_concurrency,
             concurrency=concurrency,
             timeout=timeout,
