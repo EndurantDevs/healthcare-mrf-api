@@ -928,6 +928,46 @@ def test_query_expansion_match_tolerates_legal_suffix_and_concatenated_plan_text
     )
 
 
+def test_crawl_source_dedupe_keeps_distinct_healthsparq_metadata_catalogs():
+    rows = [
+        {
+            "source_id": "src_aetna_self_insured",
+            "source_key": "src_aetna_self_insured",
+            "display_name": "Aetna CVS - Self Insured",
+            "hosting_platform": "aetna_health1",
+            "source_type": "curated_registry",
+            "seed_provider": "master-list",
+            "status": "active",
+            "index_url": (
+                "https://health1.aetna.com/app/public/#/one/"
+                "insurerCode=AETNACVS_I&brandCode=ALICSI/"
+                "machine-readable-transparency-in-coverage"
+            ),
+        },
+        {
+            "source_id": "src_aetna_signature",
+            "source_key": "src_aetna_signature",
+            "display_name": "Aetna Signature Administrators",
+            "hosting_platform": "aetna_health1",
+            "source_type": "curated_registry",
+            "seed_provider": "master-list",
+            "status": "active",
+            "index_url": (
+                "https://health1.aetna.com/app/public/#/one/"
+                "insurerCode=AETNACVS_I&brandCode=ASA/"
+                "machine-readable-transparency-in-coverage?searchTerm=ASA_01&lock=true"
+            ),
+        },
+    ]
+
+    deduped = discovery._dedupe_source_rows_for_crawl(rows)
+
+    assert {row["source_id"] for row in deduped} == {
+        "src_aetna_self_insured",
+        "src_aetna_signature",
+    }
+
+
 def test_parse_master_list_prefers_active_duplicate_over_unsupported_fragment():
     markdown = """
 ## C. Regional, provider-sponsored, Medicaid-MCO, DTC & TPA payers

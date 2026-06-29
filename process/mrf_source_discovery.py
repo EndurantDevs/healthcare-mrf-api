@@ -10567,6 +10567,23 @@ def _crawl_source_score(source: dict[str, Any]) -> tuple[int, int]:
     return curation_score, _as_int(source.get("confidence")) or 0
 
 
+def _crawl_source_identity_key(source: dict[str, Any]) -> str:
+    url = str(source.get("index_url") or source.get("human_url") or "").strip()
+    if not url:
+        return str(source.get("source_id") or source.get("source_key") or "")
+    resolver = _platform_resolver_config(source.get("hosting_platform"))
+    if str(resolver.get("type") or "").strip() == "healthsparq_public_mrf":
+        try:
+            params = _healthsparq_public_params(url)
+            metadata_url = _healthsparq_direct_metadata_url(resolver, params)
+        except (TypeError, ValueError):
+            metadata_url = None
+        if metadata_url:
+            return _canonical_or_none(metadata_url) or metadata_url
+        return url
+    return _canonical_or_none(url) or url
+
+
 def _dedupe_source_rows_for_crawl(
     source_rows: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -10577,7 +10594,7 @@ def _dedupe_source_rows_for_crawl(
         if not url:
             no_url.append(source)
             continue
-        key = _canonical_or_none(str(url)) or str(url)
+        key = _crawl_source_identity_key(source)
         previous = by_url.get(key)
         if previous is None or _crawl_source_score(source) > _crawl_source_score(
             previous
