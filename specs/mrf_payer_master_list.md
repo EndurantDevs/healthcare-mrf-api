@@ -382,12 +382,12 @@ Last one-time research refresh: 2026-06-05.
 | Assured Benefits Administrators | tpa | https://transparency.abadmin.com/ | public transparency page with delegated network MRF links; aliases: ABA, ABAdmin |
 | ATA America | tpa | https://mrf.healthcarebluebook.com/ATA | public Healthcare Bluebook MRF directory; aliases: American Trust Administrators, ATA America / American Trust Administrators, ATA |
 | Auxiant | tpa | https://transparency.auxiant.com/directory-of-data-sources/ | public WordPress data source directory; resolver expands data-available network pages; aliases: Auxiant TPA, Auxient TPA, Auxient |
-| Benefits and Risk Management Services | tpa | - | needs official source URL |
+| Benefits and Risk Management Services | tpa | - | represented by BRMS public source alias |
 | Benefit Plan Administrators | tpa | https://www.mymedicalshopper.com/mrf-search/benefit-plan-administrators | public BPA/TALON MRF search linked from BPA machine-readable files page; aliases: BPA, BPA TPA, BPA Inc, Benefit Plan Administrators Inc |
 | Blackhawk Claims Service | tpa | https://www.mymedicalshopper.com/mrf-search/blackhawk | public Blackhawk/TALON MRF search; aliases: Blackhawk, Blackhawk Claims |
 | Brighton Health Plan Solutions | tpa | https://clm.magnacare.com/transparency/ | public MagnaCare/Brighton machine-readable files portal; resolver searches public result terms and refreshes current download URLs by run-history id; aliases: Brighton HPS, Brighton Health, MagnaCare, Magnacare |
 | Boon-Chapman | tpa | https://boonchapman-mrf.zakipointhealth.com/ | public ZakiPoint MRF directory linked from Boon-Chapman transparency page; aliases: Boon Chapman, Boon-Chapman Benefit Administrators |
-| BRMS | tpa | https://www.myhealthbenefits.com/MyHealthBenefits/Home/MRFs/ | public MRF table; resolver catalogs direct files and Healthcare Bluebook delegated rows |
+| BRMS | tpa | https://www.myhealthbenefits.com/MyHealthBenefits/Home/MRFs/ | public MRF table; resolver catalogs direct files and Healthcare Bluebook delegated rows; aliases: Benefits and Risk Management Services, Benefits & Risk Management Services, Benefit and Risk Management Services, Benefit & Risk Management Services, BRMS TPA |
 | ByWater | tpa | https://www.mymedicalshopper.com/mrf-search/bywater | public ByWater transparency page delegates MRF search to TALON/MyMedicalShopper; aliases: Bywater, ByWater Health, Choose ByWater |
 | CBA Blue | tpa | https://www.cbabluevt.com/employer-resources/ | public CBA Blue MRF page; aliases: CBA BLUE, CBA Blue VT |
 | Center Care | tpa | https://ctc.mrf.payercompass.com/ | public Zelis/PayerCompass MRF repository; aliases: Center Care, CTC |

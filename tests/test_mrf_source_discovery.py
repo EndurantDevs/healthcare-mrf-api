@@ -1200,6 +1200,8 @@ async def test_master_list_keeps_high_value_public_aliases():
         "American Heritage Life Insurance Company"
         in aliases_by_name["Meritain Health"]
     )
+    assert "Benefits and Risk Management Services" in aliases_by_name["BRMS"]
+    assert "Benefits & Risk Management Services" in aliases_by_name["BRMS"]
     assert "Aetna Dental" in aliases_by_name["Aetna"]
     assert by_name["Aetna"].benefit_lines == ("medical", "dental")
     assert "The Standard AHL" in aliases_by_name["Allied Benefit Systems"]
@@ -2233,6 +2235,20 @@ def test_import_control_snapshot_company_fallback_from_index_url():
         == "Example Dental Services LLC"
     )
     assert (
+        discovery._company_name_from_index_url("https://example.test/transparency/")
+        is None
+    )
+    assert (
+        discovery._company_name_from_index_url("https://example.test/machinereadables/")
+        is None
+    )
+    assert (
+        discovery._import_control_company_name(
+            {"company_name": "Example Public TPA"}, "https://example.test/transparency/"
+        )
+        == "Example Public TPA"
+    )
+    assert (
         discovery._company_name_from_index_url(
             "https://www.asrhealthbenefits.com/umbraco/surface/mrfdownload?fileType=TableOfContents&groupNumber=1247"
         )
@@ -2323,6 +2339,47 @@ async def test_import_control_snapshot_items_keep_serving_rate_files(monkeypatch
     )
     assert items["source_1"][1]["domain"] == "in-network"
     assert items["source_1"][1]["from_index_url"] is None
+
+
+@pytest.mark.asyncio
+async def test_import_control_snapshot_items_use_metadata_company_before_generic_path(
+    monkeypatch,
+):
+    calls = 0
+
+    async def fake_all(_stmt):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return []
+        return [
+            (
+                "source_1",
+                "https://example.test/rates.json.gz",
+                "https://example.test/rates.json.gz",
+                "in-network",
+                456,
+                {
+                    "company_name": "Example Public TPA",
+                    "target_label": "Example Public TPA",
+                },
+                None,
+                None,
+                None,
+                "Local network",
+                "In-network file",
+                "https://example.test/transparency/",
+            ),
+        ]
+
+    monkeypatch.setattr(discovery.db, "all", fake_all)
+
+    items = await discovery._import_control_snapshot_items(["source_1"])
+
+    [item] = items["source_1"]
+    assert item["company_name"] == "Example Public TPA"
+    assert item["plan_info"][0]["plan_name"] == "Example Public TPA"
+    assert item["plan_info"][0]["plan_id_type"] == "source_file_context_hash"
 
 
 def test_import_control_snapshot_file_support_excludes_csv_catalog_references():
@@ -5140,6 +5197,20 @@ def test_import_control_file_context_plan_info_uses_meaningful_target_label():
 
     assert plan_info[0]["plan_id_type"] == "source_file_context_hash"
     assert plan_info[0]["plan_name"] == "Example Public TPA"
+
+
+def test_import_control_file_context_plan_info_skips_generic_url_labels_for_target():
+    plan_info = discovery._import_control_file_context_plan_info(
+        source_id="source_1",
+        description="In-Network file",
+        network_name="Local network",
+        company_name="transparency",
+        target_label="Example Public TPA group 1208",
+        from_index_url="https://example.test/transparency/",
+        canonical_url="https://example.test/rates.json.gz",
+    )
+
+    assert plan_info[0]["plan_name"] == "Example Public TPA group 1208"
 
 
 def test_crawl_target_context_uses_source_display_as_company_name():

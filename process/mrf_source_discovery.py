@@ -11082,7 +11082,25 @@ _GENERIC_IMPORT_CONTROL_PLAN_LABELS = {
     "local in-network negotiated rates file",
     "local network",
     "machine readable files",
+    "machinereadables",
+    "pricing transparency",
+    "transparency",
+    "transparency in coverage",
 }
+
+
+def _import_control_label_is_generic(value: Any) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+    return not normalized or normalized in _GENERIC_IMPORT_CONTROL_PLAN_LABELS
+
+
+def _meaningful_import_control_label(*values: Any) -> str | None:
+    for value in values:
+        plan_name = _clean_text(value)
+        if not plan_name or _import_control_label_is_generic(plan_name):
+            continue
+        return plan_name
+    return None
 
 
 def _import_control_file_context_plan_info(
@@ -11095,12 +11113,9 @@ def _import_control_file_context_plan_info(
     canonical_url: Any,
     target_label: Any = None,
 ) -> list[dict[str, Any]]:
-    for candidate in (description, network_name, company_name, target_label):
-        plan_name = _clean_text(candidate)
+    for candidate in (description, network_name, target_label, company_name):
+        plan_name = _meaningful_import_control_label(candidate)
         if not plan_name:
-            continue
-        normalized = re.sub(r"[^a-z0-9]+", " ", plan_name.lower()).strip()
-        if normalized in _GENERIC_IMPORT_CONTROL_PLAN_LABELS:
             continue
         plan_id = semantic_hash(
             {
@@ -11223,7 +11238,19 @@ def _company_name_from_index_url(value: Any) -> str | None:
     name = name.replace("_", " ").replace("-", " ").strip()
     if not name or name.lower() in {"index", "toc", "table of contents", "mrfdownload"}:
         return None
-    return re.sub(r"\s+", " ", name)
+    name = re.sub(r"\s+", " ", name)
+    if _import_control_label_is_generic(name):
+        return None
+    return name
+
+
+def _import_control_company_name(
+    metadata: dict[str, Any], from_index_url: Any
+) -> str | None:
+    return _meaningful_import_control_label(
+        metadata.get("company_name"),
+        _company_name_from_index_url(from_index_url),
+    )
 
 
 def _apply_company_fallback(
@@ -11266,6 +11293,7 @@ def _import_control_preview_context(
         "group_number",
         "client_id",
         "client_name",
+        "company_name",
         "employer_id",
         "employer_name",
         "employer_slug",
@@ -11278,7 +11306,9 @@ def _import_control_preview_context(
         "target_label",
     ):
         value = str(metadata.get(key) or "").strip()
-        if value:
+        if value and not (
+            key == "company_name" and _import_control_label_is_generic(value)
+        ):
             context[key] = value
     group_number = (
         context.get("group_id")
@@ -11352,7 +11382,7 @@ async def _import_control_snapshot_items(
             )
         else:
             plan_info = _enrich_plan_info_from_lookup(row[0], plan_info, plan_lookup)
-        company_name = _company_name_from_index_url(row[11])
+        company_name = _import_control_company_name(metadata, row[11])
         plan_info = _apply_company_fallback(plan_info, company_name)
         original_url = row[1] or row[2]
         if not original_url:
