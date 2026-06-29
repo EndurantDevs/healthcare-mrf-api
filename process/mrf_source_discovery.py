@@ -630,6 +630,11 @@ def classify_hosting_platform(url: str | None) -> str | None:
         return "healthgram"
     if host == "github.com" and len([part for part in path.split("/") if part]) >= 2:
         return "github_repo_mrf"
+    if (
+        host in {"www.centene.com", "centene.com"}
+        and "price-transparency-files" in path
+    ):
+        return "html_mrf_links"
     if host == "developers.humana.com" and (
         "cost-transparency" in path
         or "healthplan-price-transparency" in path

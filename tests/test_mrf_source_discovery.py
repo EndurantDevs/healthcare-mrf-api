@@ -852,6 +852,7 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
 | Banner Aetna | national | https://health1.aetna.com/app/public/#/one/insurerCode=AETNACVS_I&brandCode=BANNERJVFI/machine-readable-transparency-in-coverage | aliases: Banner Aetna, Banner Health Aetna |
 | Select Health | regional | https://www.selecthealth.org/disclaimers/machine-readable-data | aliases: SelectHealth |
 | EyeMed | vision | https://content.eyemedvisioncare.com/EyeMed_HCSC/eyemed_in-network-rates.json | benefit lines: vision; aliases: EyeMed Vision Care, Eye Med, Ameritas with EyeMed |
+| Example Marketplace Family | national | https://www.centene.com/price-transparency-files.html | aliases: Example Marketplace, Example Managed Network |
 | EMI Health | regional | https://emihealth.com/machinereadables | public machine-readable files page |
 | MotivHealth Insurance Company | regional | https://www.motivhealth.com/machinereadablefiles/ | aliases: MotivHealth |
 | Angle Health | regional | https://www.anglehealth.com/machine-readable-files | aliases: Angle, Adrem Administrators |
@@ -955,6 +956,11 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
         "EyeMed Vision Care",
         "Eye Med",
         "Ameritas with EyeMed",
+    )
+    assert by_name["Example Marketplace Family"].hosting_platform == "html_mrf_links"
+    assert by_name["Example Marketplace Family"].aliases == (
+        "Example Marketplace",
+        "Example Managed Network",
     )
     assert by_name["EMI Health"].hosting_platform == "html_mrf_links"
     assert by_name["MotivHealth Insurance Company"].hosting_platform == "html_mrf_links"
