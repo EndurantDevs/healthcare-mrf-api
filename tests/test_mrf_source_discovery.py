@@ -4109,6 +4109,62 @@ def test_asr_health_benefits_seed_list_filters_active_rows(tmp_path, monkeypatch
     assert discovery._asr_group_numbers_from_seed_list("asr_test") == ["1194", "1210"]
 
 
+def test_asr_health_benefits_seed_metadata_becomes_target_context(
+    tmp_path, monkeypatch
+):
+    seed_path = tmp_path / "asr-groups.csv"
+    seed_path.write_text(
+        "group_number,status,company_name,employer_name,plan_name,evidence_url\n"
+        "1208,active,Example Forge LLC,Example Forge LLC,Example Forge ASR Plan,https://example.test/asr-1208\n",
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "sources.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "providers": {},
+                "seed_lists": {
+                    "asr_test": {
+                        "schema": "group_number_seed_v1",
+                        "path": str(seed_path),
+                    }
+                },
+                "platform_resolvers": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(discovery.SOURCE_CONFIG_ENV, str(config_path))
+    monkeypatch.setattr(discovery, "_SOURCE_CONFIG_CACHE", None)
+    source = {"source_id": "source_1", "display_name": "ASR Health Benefits"}
+    resolver = {
+        "type": "asr_health_benefits_mrf",
+        "toc_path": "/umbraco/surface/mrfdownload",
+        "seed_list": "asr_test",
+    }
+
+    [target] = discovery._resolve_asr_health_benefits_mrf(
+        source, "https://www.asrhealthbenefits.com/MRF", resolver
+    )
+    [row] = discovery._apply_crawl_target_context_to_file_rows(
+        [{"mrf_file_id": "file_1", "metadata_json": {}}],
+        target,
+    )
+
+    assert target.label == "ASR Health Benefits group 1208 - Example Forge LLC"
+    assert target.metadata["company_name"] == "Example Forge LLC"
+    assert target.metadata["plan_name"] == "Example Forge ASR Plan"
+    assert target.metadata["evidence_url"] == "https://example.test/asr-1208"
+    assert row["metadata_json"]["group_number"] == "1208"
+    assert row["metadata_json"]["company_name"] == "Example Forge LLC"
+    assert row["metadata_json"]["employer_name"] == "Example Forge LLC"
+    assert row["metadata_json"]["plan_name"] == "Example Forge ASR Plan"
+    assert (
+        row["metadata_json"]["target_label"]
+        == "ASR Health Benefits group 1208 - Example Forge LLC"
+    )
+
+
 def test_asr_health_benefits_seed_list_dedupes_direct_and_configured_numbers(
     tmp_path, monkeypatch
 ):

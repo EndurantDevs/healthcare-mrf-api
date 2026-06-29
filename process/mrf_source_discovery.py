@@ -3776,9 +3776,17 @@ def _merge_crawl_target_plan_info(
 
 
 def _asr_group_numbers_from_seed_list(seed_list_name: str | None) -> list[str]:
+    return [
+        row["group_number"]
+        for row in _asr_seed_rows_from_seed_list(seed_list_name)
+        if row.get("group_number")
+    ]
+
+
+def _asr_seed_rows_from_seed_list(seed_list_name: str | None) -> list[dict[str, str]]:
     if not seed_list_name:
         return []
-    group_numbers: list[str] = []
+    seed_rows: list[dict[str, str]] = []
     for row in _load_seed_list_rows(seed_list_name):
         if str(row.get("status") or "").strip().lower() != "active":
             continue
@@ -3787,8 +3795,34 @@ def _asr_group_numbers_from_seed_list(seed_list_name: str | None) -> list[str]:
             raise ValueError(
                 f"ASR seed list {seed_list_name} contains a non-4-digit group number"
             )
-        group_numbers.append(group_number)
-    return group_numbers
+        seed_rows.append({**row, "group_number": group_number})
+    return seed_rows
+
+
+_ASR_SEED_CONTEXT_KEYS = (
+    "company_name",
+    "client_name",
+    "employer_id",
+    "employer_name",
+    "employer_slug",
+    "entity_slug",
+    "ein",
+    "plan_id",
+    "plan_name",
+    "plan_sponsor_name",
+    "tpa_name",
+    "tpa_slug",
+    "evidence_url",
+)
+
+
+def _asr_seed_context_metadata(row: dict[str, Any]) -> dict[str, str]:
+    metadata: dict[str, str] = {}
+    for key in _ASR_SEED_CONTEXT_KEYS:
+        value = str(row.get(key) or "").strip()
+        if value:
+            metadata[key] = value
+    return metadata
 
 
 def _asr_configured_group_numbers(resolver: dict[str, Any]) -> list[str]:
@@ -3807,19 +3841,43 @@ def _asr_configured_group_numbers(resolver: dict[str, Any]) -> list[str]:
     return group_numbers
 
 
-def _asr_group_numbers_for_source(url: str, resolver: dict[str, Any]) -> list[str]:
-    group_numbers: list[str] = []
+def _asr_group_targets_for_source(url: str, resolver: dict[str, Any]) -> list[dict[str, Any]]:
+    group_targets: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for value in (
-        _asr_group_number_from_url(url),
-        *_asr_configured_group_numbers(resolver),
-    ):
+    by_group: dict[str, dict[str, Any]] = {}
+
+    def add_group(value: Any, metadata: dict[str, Any] | None = None) -> None:
         group_number = str(value or "").strip()
         if not group_number or group_number in seen:
-            continue
+            if group_number and metadata:
+                by_group.get(group_number, {}).update(
+                    {key: item for key, item in metadata.items() if item not in (None, "")}
+                )
+            return
+        if not re.fullmatch(r"\d{4}", group_number):
+            raise ValueError("ASR configured group numbers must be 4 digits")
         seen.add(group_number)
-        group_numbers.append(group_number)
-    return group_numbers
+        target = {
+            "group_number": group_number,
+            **{key: item for key, item in (metadata or {}).items() if item not in (None, "")},
+        }
+        by_group[group_number] = target
+        group_targets.append(target)
+
+    add_group(_asr_group_number_from_url(url))
+    for row in _asr_seed_rows_from_seed_list(
+        str(resolver.get("seed_list") or "").strip() or None
+    ):
+        add_group(row.get("group_number"), _asr_seed_context_metadata(row))
+    for group_number in resolver.get("group_numbers") or ():
+        if group_number and not re.fullmatch(r"\d{4}", str(group_number).strip()):
+            raise ValueError("ASR configured group numbers must be 4 digits")
+        add_group(group_number)
+    return group_targets
+
+
+def _asr_group_numbers_for_source(url: str, resolver: dict[str, Any]) -> list[str]:
+    return [target["group_number"] for target in _asr_group_targets_for_source(url, resolver)]
 
 
 def _asr_toc_url(base_url: str, resolver: dict[str, Any], group_number: str) -> str:
@@ -3836,17 +3894,32 @@ def _resolve_asr_health_benefits_mrf(
 ) -> list[CrawlTarget]:
     resolver_type = str(resolver.get("type") or "asr_health_benefits_mrf")
     targets: list[CrawlTarget] = []
-    for group_number in _asr_group_numbers_for_source(url, resolver):
+    for group_target in _asr_group_targets_for_source(url, resolver):
+        group_number = str(group_target["group_number"])
+        context_metadata = {
+            key: value
+            for key, value in group_target.items()
+            if key != "group_number" and value not in (None, "")
+        }
+        label = f"{source.get('display_name') or 'ASR Health Benefits'} group {group_number}"
+        employer_label = (
+            context_metadata.get("company_name")
+            or context_metadata.get("employer_name")
+            or context_metadata.get("client_name")
+        )
+        if employer_label:
+            label = f"{label} - {employer_label}"
         targets.append(
             CrawlTarget(
                 source=source,
                 url=_asr_toc_url(url, resolver, group_number),
-                label=f"{source.get('display_name') or 'ASR Health Benefits'} group {group_number}",
+                label=label,
                 resolved_from_url=url,
                 metadata={
                     "resolver": resolver_type,
                     "target_file_type": "table-of-contents",
                     "group_number": group_number,
+                    **context_metadata,
                 },
             )
         )
