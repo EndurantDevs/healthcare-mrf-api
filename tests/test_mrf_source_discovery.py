@@ -1565,6 +1565,11 @@ async def test_master_list_keeps_high_value_public_aliases():
     )
     assert "Reliance Standard Life Ins Co" in by_name["Reliance Matrix"].aliases
     assert "reliancematrix" in by_name["Reliance Matrix"].aliases
+    assert by_name["Reliance Matrix"].benefit_lines == ("medical", "vision")
+    assert "Reliance Standard Vision" in by_name["Reliance Matrix"].aliases
+    assert "Davis Vision" in by_name["Reliance Matrix"].aliases
+    assert "Davis Vision Network" in by_name["Reliance Matrix"].aliases
+    assert "QCC Insurance Company" in by_name["Reliance Matrix"].aliases
     assert by_name["BCBS North Carolina"].hosting_platform == "direct_toc"
     assert "Blue Cross Blue Shield of NC" in aliases_by_name["BCBS North Carolina"]
     assert "BlueCross BlueShield of NC" in aliases_by_name["BCBS North Carolina"]
@@ -1656,7 +1661,10 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Ameritas Holding Company Health Plan" in by_name["United Healthcare"].aliases
     assert "KCL Group Benefits" in by_name["United Healthcare"].aliases
     assert "Anthem CA" in by_name["Anthem"].aliases
+    assert by_name["Anthem"].benefit_lines == ("medical", "vision")
     assert "Anthem BlueCross & BlueShield Plan" in by_name["Anthem"].aliases
+    assert "Anthem Vision Plan" in by_name["Anthem"].aliases
+    assert "Anthem Blue View Vision Plan" in by_name["Anthem"].aliases
     assert "Blue Cross of California" in by_name["Anthem"].aliases
     assert "Blue Cross and Blue Shield of Georgia (Anthem)" in by_name["Anthem"].aliases
     assert "Blue Cross and Blue Shield of GA (Anthem)" in by_name["Anthem"].aliases
@@ -1793,6 +1801,7 @@ async def test_master_list_public_alias_queries_match_expected_candidates():
     assert "Anthem" in matching_names("Anthem Health Plans of Kentucky, Inc.")
     assert "Anthem" in matching_names("Anthem CA")
     assert "Anthem" in matching_names("Anthem BlueCross & BlueShield Plan")
+    assert "Anthem" in matching_importable_names("Anthem Vision Plan")
     assert "Anthem" in matching_names("Blue Cross of California")
     assert "Anthem" in matching_names("Blue Cross and Blue Shield of Georgia, Inc.")
     assert "Anthem" in matching_names("Blue Cross and Blue Shield of GA (Anthem)")
@@ -1871,6 +1880,8 @@ async def test_master_list_public_alias_queries_match_expected_candidates():
     assert "Peak Health" in matching_importable_names("Peak Health Plan")
     assert "Centivo - Rockwell Automation" in matching_importable_names("Centivo")
     assert "Reliance Matrix" in matching_importable_names("reliancematrix")
+    assert "Reliance Matrix" in matching_importable_names("Davis Vision")
+    assert "Reliance Matrix" in matching_importable_names("Davis Vision Network")
     assert "Meritain Health" in matching_names("Meritain Health, An Aetna Company")
     assert "Meritain Health" in matching_names(
         "MERITAIN HEALTH (NORTH AMERICAN HEALTH PLAN)"
