@@ -228,6 +228,7 @@ DEFAULT_FULL_REFRESH_MAX_PAGES = 10000
 DEFAULT_STREAM_BATCH_SIZE = 5000
 DEFAULT_BULK_EXPORT_MAX_POLLS = 120
 DEFAULT_BULK_EXPORT_POLL_SECONDS = 5
+DEFAULT_LOCATION_ADDRESS_KEY_BATCH_SIZE = 50000
 OAUTH_TOKEN_EXPIRY_SKEW_SECONDS = 60
 _OAUTH_TOKEN_CACHE: dict[str, tuple[str, float]] = {}
 FHIR_ONBOARDING_GATEWAY_HOSTS = {
@@ -2340,6 +2341,152 @@ def provider_directory_location_address_key_sql(
     """
 
 
+def provider_directory_location_address_key_batch_sql(
+    db_schema: str | None = None,
+    *,
+    restore_state_from_zip: bool = True,
+    run_id: str | None = None,
+    source_ids: list[str] | tuple[str, ...] | None = None,
+) -> str:
+    """Stamp a bounded keyset batch of FHIR Location rows with address keys."""
+
+    schema = db_schema or _schema()
+    qschema = _q(schema)
+    location_ref = _qt(schema, "provider_directory_location")
+    source_alias = "loc_src"
+    raw_state_expr = f"COALESCE(NULLIF({source_alias}.state_name, ''), {source_alias}.state_code)"
+    normalized_state_expr = _state_fips_restore_sql(raw_state_expr)
+    normalized_country_expr = _country_restore_sql(f"{source_alias}.country_code")
+    needs_country_normalization_expr = (
+        f"(NULLIF({normalized_country_expr}, '') IS NOT NULL "
+        f"AND {source_alias}.country_code IS DISTINCT FROM {normalized_country_expr})"
+    )
+    zip_state_select = "geo.state::varchar" if restore_state_from_zip else "NULL::varchar"
+    zip_state_join = (
+        f"""
+          LEFT JOIN {_qt(schema, "geo_zip_lookup")} AS geo
+            ON geo.zip_code = normalized.source_zip5
+        """
+        if restore_state_from_zip
+        else ""
+    )
+    needs_work_clauses = [
+        f"{source_alias}.address_key IS NULL",
+        f"{source_alias}.zip5 IS NULL",
+        f"{source_alias}.state_code IS NULL",
+        f"{source_alias}.city_norm IS NULL",
+        f"{raw_state_expr} ~ '^[0-9]{{1,2}}$'",
+        needs_country_normalization_expr,
+    ]
+    scope_clauses: list[str] = []
+    if run_id is not None:
+        scope_clauses.append(f"{source_alias}.last_seen_run_id = :run_id")
+    if source_ids:
+        scope_clauses.append(f"{source_alias}.source_id = ANY(CAST(:source_ids AS varchar[]))")
+    scope_clauses.append(
+        f"""(
+            :after_source_id IS NULL
+            OR ({source_alias}.source_id, {source_alias}.resource_id)
+                > (:after_source_id, :after_resource_id)
+        )"""
+    )
+    where_clauses = [f"({' OR '.join(needs_work_clauses)})", *scope_clauses]
+    where_sql = " AND ".join(where_clauses)
+    return f"""
+    WITH candidates AS MATERIALIZED (
+        SELECT
+            {source_alias}.source_id,
+            {source_alias}.resource_id,
+            {source_alias}.first_line,
+            {source_alias}.second_line,
+            {source_alias}.city_name,
+            {source_alias}.postal_code,
+            {source_alias}.country_code,
+            {qschema}.addr_zip5_norm_v1({source_alias}.postal_code)::varchar AS source_zip5,
+            {normalized_country_expr} AS normalized_country,
+            {raw_state_expr} AS raw_state,
+            {normalized_state_expr} AS normalized_state
+          FROM {location_ref} AS {source_alias}
+         WHERE {where_sql}
+         ORDER BY {source_alias}.source_id,
+                  {source_alias}.resource_id
+         LIMIT :batch_size
+    ),
+    normalized AS (
+        SELECT * FROM candidates
+    ),
+    resolved AS (
+        SELECT
+            normalized.*,
+            CASE
+                WHEN NULLIF(BTRIM(COALESCE(normalized.normalized_state::varchar, '')), '') IS NULL
+                    THEN {zip_state_select}
+                ELSE NULL::varchar
+            END AS zip_restored_state,
+            COALESCE(NULLIF(BTRIM(normalized.normalized_state::varchar), ''), {zip_state_select}) AS resolved_state
+          FROM normalized
+          {zip_state_join}
+    ),
+    keyed AS (
+        SELECT
+            source_id,
+            resource_id,
+            {qschema}.addr_key_v1(
+                first_line,
+                second_line,
+                city_name,
+                resolved_state,
+                postal_code,
+                COALESCE(NULLIF(normalized_country, ''), 'US')
+            ) AS computed_address_key,
+            source_zip5 AS computed_zip5,
+            {qschema}.addr_state_code_v1(resolved_state)::varchar AS computed_state_code,
+            {qschema}.addr_city_norm_v1(city_name)::varchar AS computed_city_norm,
+            CASE
+                WHEN raw_state ~ '^[0-9]{{1,2}}$'
+                    THEN {qschema}.addr_state_code_v1(resolved_state)::varchar
+                WHEN NULLIF(BTRIM(COALESCE(raw_state::varchar, '')), '') IS NULL
+                 AND zip_restored_state IS NOT NULL
+                    THEN {qschema}.addr_state_code_v1(zip_restored_state)::varchar
+                ELSE NULL::varchar
+            END AS restored_state_name,
+            normalized_country
+          FROM resolved
+    ),
+    updated AS (
+        UPDATE {location_ref} AS loc
+           SET address_key = keyed.computed_address_key::text,
+               zip5 = COALESCE(keyed.computed_zip5, loc.zip5),
+               state_name = COALESCE(keyed.restored_state_name, loc.state_name),
+               state_code = COALESCE(keyed.computed_state_code, loc.state_code),
+               city_norm = COALESCE(keyed.computed_city_norm, loc.city_norm),
+               country_code = COALESCE(keyed.normalized_country, loc.country_code),
+               updated_at = now()
+          FROM keyed
+         WHERE loc.source_id = keyed.source_id
+           AND loc.resource_id = keyed.resource_id
+           AND keyed.computed_address_key IS NOT NULL
+           AND (
+                loc.address_key IS DISTINCT FROM keyed.computed_address_key::text
+             OR loc.zip5 IS DISTINCT FROM COALESCE(keyed.computed_zip5, loc.zip5)
+             OR loc.state_name IS DISTINCT FROM COALESCE(keyed.restored_state_name, loc.state_name)
+             OR loc.state_code IS DISTINCT FROM COALESCE(keyed.computed_state_code, loc.state_code)
+             OR loc.city_norm IS DISTINCT FROM COALESCE(keyed.computed_city_norm, loc.city_norm)
+             OR loc.country_code IS DISTINCT FROM COALESCE(keyed.normalized_country, loc.country_code)
+           )
+         RETURNING loc.source_id,
+                   loc.resource_id
+    )
+    SELECT
+        (SELECT COUNT(*) FROM candidates)::bigint AS candidate_rows,
+        (SELECT COUNT(*) FROM updated)::bigint AS updated_rows,
+        (SELECT source_id FROM candidates ORDER BY source_id DESC, resource_id DESC LIMIT 1)::varchar
+            AS last_source_id,
+        (SELECT resource_id FROM candidates ORDER BY source_id DESC, resource_id DESC LIMIT 1)::varchar
+            AS last_resource_id;
+    """
+
+
 async def _address_canon_functions_available(db_schema: str) -> bool:
     value = await db.scalar(
         "SELECT to_regprocedure(:signature);",
@@ -2363,6 +2510,7 @@ async def publish_provider_directory_location_address_keys(
     run_id: str | None = None,
     source_ids: list[str] | tuple[str, ...] | None = None,
     seen_table: str | None = None,
+    batch_size: int | None = None,
 ) -> int:
     schema = db_schema or _schema()
     if not await _address_canon_functions_available(schema):
@@ -2373,6 +2521,38 @@ async def publish_provider_directory_location_address_keys(
         params["run_id"] = run_id
     if source_ids:
         params["source_ids"] = list(source_ids)
+    if not seen_table:
+        total_updated = 0
+        after_source_id: str | None = None
+        after_resource_id: str | None = None
+        bounded_batch_size = max(int(batch_size or _location_address_key_batch_size()), 1)
+        sql = provider_directory_location_address_key_batch_sql(
+            schema,
+            restore_state_from_zip=restore_state_from_zip,
+            run_id=run_id,
+            source_ids=source_ids,
+        )
+        while True:
+            row = await db.first(
+                sql,
+                **params,
+                after_source_id=after_source_id,
+                after_resource_id=after_resource_id,
+                batch_size=bounded_batch_size,
+            )
+            payload = row._mapping if hasattr(row, "_mapping") else dict(row or {})
+            candidate_rows = int(payload.get("candidate_rows") or 0)
+            updated_rows = int(payload.get("updated_rows") or 0)
+            total_updated += updated_rows
+            next_source_id = _clean_text(payload.get("last_source_id"))
+            next_resource_id = _clean_text(payload.get("last_resource_id"))
+            if candidate_rows <= 0 or not next_source_id or not next_resource_id:
+                break
+            if next_source_id == after_source_id and next_resource_id == after_resource_id:
+                break
+            after_source_id = next_source_id
+            after_resource_id = next_resource_id
+        return total_updated
     return int(
         await db.status(
             provider_directory_location_address_key_sql(
@@ -2708,6 +2888,21 @@ def _copy_upsert_min_rows() -> int:
         return max(int(os.getenv("HLTHPRT_PROVIDER_DIRECTORY_COPY_UPSERT_MIN_ROWS", "100")), 1)
     except ValueError:
         return 100
+
+
+def _location_address_key_batch_size() -> int:
+    try:
+        return max(
+            int(
+                os.getenv(
+                    "HLTHPRT_PROVIDER_DIRECTORY_ADDRESS_KEY_BATCH_SIZE",
+                    str(DEFAULT_LOCATION_ADDRESS_KEY_BATCH_SIZE),
+                )
+            ),
+            1,
+        )
+    except ValueError:
+        return DEFAULT_LOCATION_ADDRESS_KEY_BATCH_SIZE
 
 
 def _short_error(err: BaseException) -> str:

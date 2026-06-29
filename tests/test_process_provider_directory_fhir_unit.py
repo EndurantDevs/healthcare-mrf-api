@@ -282,6 +282,52 @@ def test_provider_directory_location_address_key_sql_can_scope_to_seen_stage():
     assert "loc_src.last_seen_run_id = :run_id" not in sql
 
 
+def test_provider_directory_location_address_key_batch_sql_uses_keyset_limit():
+    sql = importer.provider_directory_location_address_key_batch_sql("mrf", run_id="run_1")
+
+    assert 'FROM "mrf"."provider_directory_location" AS loc_src' in sql
+    assert "loc_src.last_seen_run_id = :run_id" in sql
+    assert ":after_source_id IS NULL" in sql
+    assert "(loc_src.source_id, loc_src.resource_id)" in sql
+    assert "LIMIT :batch_size" in sql
+    assert "SELECT COUNT(*) FROM candidates" in sql
+    assert "SELECT COUNT(*) FROM updated" in sql
+    assert "last_source_id" in sql
+    assert "last_resource_id" in sql
+
+
+@pytest.mark.asyncio
+async def test_publish_provider_directory_location_address_keys_batches_without_seen_table(monkeypatch):
+    class Row:
+        def __init__(self, **values):
+            self._mapping = values
+
+    monkeypatch.setattr(importer, "_address_canon_functions_available", AsyncMock(return_value=True))
+    monkeypatch.setattr(importer, "_table_exists", AsyncMock(return_value=True))
+    first = AsyncMock(
+        side_effect=[
+            Row(candidate_rows=2, updated_rows=2, last_source_id="source_a", last_resource_id="loc-2"),
+            Row(candidate_rows=1, updated_rows=0, last_source_id="source_b", last_resource_id="loc-3"),
+            Row(candidate_rows=0, updated_rows=0, last_source_id=None, last_resource_id=None),
+        ]
+    )
+    status = AsyncMock()
+    monkeypatch.setattr(importer.db, "first", first)
+    monkeypatch.setattr(importer.db, "status", status)
+
+    stamped = await importer.publish_provider_directory_location_address_keys("mrf", batch_size=2)
+
+    assert stamped == 2
+    assert first.await_count == 3
+    assert first.await_args_list[0].kwargs["after_source_id"] is None
+    assert first.await_args_list[1].kwargs["after_source_id"] == "source_a"
+    assert first.await_args_list[1].kwargs["after_resource_id"] == "loc-2"
+    assert first.await_args_list[2].kwargs["after_source_id"] == "source_b"
+    assert first.await_args_list[2].kwargs["after_resource_id"] == "loc-3"
+    assert all(call.kwargs["batch_size"] == 2 for call in first.await_args_list)
+    status.assert_not_awaited()
+
+
 def test_upsert_changed_row_predicate_ignores_run_metadata_columns():
     table = ProviderDirectoryLocation.__table__
     columns = [column.name for column in table.columns]
