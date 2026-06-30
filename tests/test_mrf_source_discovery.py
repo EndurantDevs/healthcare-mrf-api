@@ -3912,6 +3912,60 @@ async def test_resolve_crawl_targets_filters_query_expansion_matches(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_healthcarebluebook_resolver_filters_nested_links_by_target_query(
+    monkeypatch,
+):
+    source = {
+        "source_id": "source_hbb",
+        "display_name": "Example HBB",
+        "metadata_json": {"raw": {"target_payer_query": "Example Employer"}},
+    }
+    html = """
+    <section>
+      <a href="https://example.sapphiremrfhub.com/">Example Employer</a>
+      <span>Table of Contents</span>
+    </section>
+    <section>
+      <a href="https://other.sapphiremrfhub.com/">Other Employer</a>
+      <span>Table of Contents</span>
+    </section>
+    """
+    nested_calls = []
+
+    async def fake_fetch_text(url, **_kwargs):
+        assert url == "https://mrf.healthcarebluebook.com/example"
+        return html
+
+    async def fake_crawl_targets_for_source(nested_source, link_url, _session, **_kwargs):
+        nested_calls.append(link_url)
+        return [
+            discovery.CrawlTarget(
+                source=nested_source,
+                url="https://example.sapphiremrfhub.com/tocs/current/example-employer",
+                label="Example Employer",
+                resolved_from_url=link_url,
+                metadata={"resolver": "sapphire"},
+            )
+        ]
+
+    monkeypatch.setattr(discovery, "_fetch_text", fake_fetch_text)
+    monkeypatch.setattr(
+        discovery, "_crawl_targets_for_source", fake_crawl_targets_for_source
+    )
+
+    targets = await discovery._resolve_healthcarebluebook_mrf(
+        source,
+        "https://mrf.healthcarebluebook.com/example",
+        {"type": "healthcarebluebook_mrf"},
+        session=None,
+    )
+
+    assert nested_calls == ["https://example.sapphiremrfhub.com/"]
+    assert [target.label for target in targets] == ["Example Employer"]
+    assert targets[0].metadata["healthcarebluebook_link_label"] == "Example Employer"
+
+
+@pytest.mark.asyncio
 async def test_generic_html_file_reference_infers_plan_info_from_filename(monkeypatch):
     source = {
         "source_id": "source_1",

@@ -8121,6 +8121,27 @@ def _healthcarebluebook_relative_file_url(url: str) -> bool:
     )
 
 
+def _healthcarebluebook_item_matches_query(
+    item: dict[str, Any],
+    *,
+    link_url: str,
+    label: str,
+    type_text: Any,
+    query: str | None,
+) -> bool:
+    if not query:
+        return True
+    return _search_values_match_query(
+        [
+            label,
+            link_url,
+            item.get("text"),
+            type_text,
+        ],
+        query,
+    )
+
+
 def _healthcarebluebook_nested_target(
     target: CrawlTarget,
     *,
@@ -8168,6 +8189,7 @@ async def _resolve_healthcarebluebook_mrf(
     items = _healthcarebluebook_grid_items(html_text, base_url=url)
     targets_by_url: dict[str, CrawlTarget] = {}
     max_targets = _as_int(resolver.get("max_targets"))
+    target_query = _source_target_payer_query(source)
     for index, item in enumerate(items):
         if max_targets and len(targets_by_url) >= max_targets:
             break
@@ -8182,6 +8204,14 @@ async def _resolve_healthcarebluebook_mrf(
         type_text = items[index + 1].get("text") if index + 1 < len(items) else ""
         file_type = _healthcarebluebook_file_type(type_text, label, link_url)
         if not file_type:
+            continue
+        if not _healthcarebluebook_item_matches_query(
+            item,
+            link_url=link_url,
+            label=label,
+            type_text=type_text,
+            query=target_query,
+        ):
             continue
         if _healthcarebluebook_relative_file_url(
             link_url
