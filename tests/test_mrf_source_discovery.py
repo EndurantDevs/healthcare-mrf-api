@@ -1771,6 +1771,9 @@ async def test_master_list_keeps_high_value_public_aliases():
         "Allegiance Life & Health Insurance Company, Inc."
         in by_name["Cigna"].aliases
     )
+    assert "Yuzu Health" in by_name["Cigna"].aliases
+    assert "YUZU HEALTH INC." in by_name["Cigna"].aliases
+    assert "Cigna Shared Administration PPO - Yuzu" in by_name["Cigna"].aliases
     assert by_name["Cigna"].benefit_lines == ("medical", "dental")
     assert "Horizon Healthcare Dental" in by_name["Horizon BCBS NJ"].aliases
     assert "NVA" in aliases_by_name["Capital Blue Cross"]
