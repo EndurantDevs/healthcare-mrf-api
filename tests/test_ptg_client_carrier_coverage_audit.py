@@ -23,6 +23,8 @@ def test_placeholder_carrier_detection():
     assert is_placeholder_carrier("N/A")
     assert is_placeholder_carrier("not offered")
     assert is_placeholder_carrier("-")
+    assert is_placeholder_carrier("self-funded")
+    assert is_placeholder_carrier("Employer Sponsored")
     assert not is_placeholder_carrier("Example Carrier")
 
 

@@ -33,7 +33,8 @@ DEFAULT_LINE_COLUMNS: tuple[tuple[str, str], ...] = (
 )
 
 PLACEHOLDER_RE = re.compile(
-    r"^(n/?a|na|none|no|not\s+offered|no\s+coverage|waived|unknown|tbd|--|-)$",
+    r"^(n/?a|na|none|no|not\s+offered|no\s+coverage|waived|unknown|tbd|--|-|"
+    r"self[-\s]*administered|self[-\s]*funded|employer[-\s]*sponsored)$",
     re.IGNORECASE,
 )
 
