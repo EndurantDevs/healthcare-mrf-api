@@ -54,6 +54,8 @@ from process.ptg_parts.source_jobs import parse_toc_catalog_entries
 
 SOURCE_CONFIG_ENV = "HLTHPRT_MRF_DISCOVERY_SOURCE_CONFIG"
 PRIVATE_SEED_CONTEXT_PATHS_ENV = "HLTHPRT_MRF_DISCOVERY_PRIVATE_SEED_CONTEXT_PATHS"
+PRIVATE_QUERY_CONTEXT_PATHS_ENV = "HLTHPRT_MRF_DISCOVERY_PRIVATE_QUERY_CONTEXT_PATHS"
+PRIVATE_QUERY_CONTEXT_LIMIT_ENV = "HLTHPRT_MRF_DISCOVERY_PRIVATE_QUERY_CONTEXT_LIMIT"
 DEFAULT_SOURCE_CONFIG = Path("specs/mrf_source_discovery_sources.json")
 DISCOVERY_TABLES = (
     MRFPayer,
@@ -103,6 +105,7 @@ DEFAULT_SOURCE_QUERY_EXPANSION_PLATFORMS = (
     "uhc_public_blobs",
     "mymedicalshopper_talon",
 )
+DEFAULT_PRIVATE_QUERY_CONTEXT_LIMIT = 5000
 LEGAL_ENTITY_QUERY_STOPWORDS = {
     "co",
     "company",
@@ -354,6 +357,184 @@ def _private_seed_context_rows(seed_list_name: str | None) -> list[dict[str, str
                     continue
                 rows.append(item)
     return rows
+
+
+def _private_query_context_paths() -> list[Path]:
+    raw = str(os.getenv(PRIVATE_QUERY_CONTEXT_PATHS_ENV) or "").strip()
+    if not raw:
+        return []
+    paths = []
+    for value in raw.split(os.pathsep):
+        value = value.strip()
+        if not value:
+            continue
+        path = _resolve_config_path(os.path.expanduser(value))
+        if not path.exists():
+            raise ValueError(f"private query context file does not exist: {path}")
+        paths.append(path)
+    return paths
+
+
+def _private_query_context_rows() -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for path in _private_query_context_paths():
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                rows.append(
+                    {key: str(value or "").strip() for key, value in row.items()}
+                )
+    return rows
+
+
+def _row_value_ci(row: dict[str, str], *keys: str) -> str:
+    by_key = {str(key or "").strip().lower(): value for key, value in row.items()}
+    for key in keys:
+        value = str(by_key.get(str(key or "").strip().lower()) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _split_private_query_carrier_cell(value: Any) -> list[str]:
+    text = str(value or "").strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, list):
+        return [_clean_text(item) for item in parsed if _clean_text(item)]
+    return [
+        part.strip(" \t-*")
+        for part in re.split(r"\r?\n|;", text)
+        if part.strip(" \t-*")
+    ]
+
+
+_PRIVATE_QUERY_CONTEXT_LINE_COLUMNS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("medical", ("medical_carriers", "medical_carrier", "medical")),
+    ("dental", ("dental_carriers", "dental_carrier", "dental")),
+    ("vision", ("vision_carriers", "vision_carrier", "vision")),
+)
+
+
+def _private_query_context_entries() -> list[dict[str, str]]:
+    entries: list[dict[str, str]] = []
+    for row in _private_query_context_rows():
+        query = _clean_text(
+            _row_value_ci(
+                row,
+                "target_payer_query",
+                "company_name",
+                "employer_name",
+                "client_name",
+                "alias",
+            )
+        )
+        if not query:
+            continue
+        for line, columns in _PRIVATE_QUERY_CONTEXT_LINE_COLUMNS:
+            carriers: list[str] = []
+            for column in columns:
+                carriers.extend(
+                    _split_private_query_carrier_cell(_row_value_ci(row, column))
+                )
+            for carrier in carriers:
+                carrier_query = _clean_text(carrier)
+                if not carrier_query:
+                    continue
+                entries.append(
+                    {
+                        "target_payer_query": query,
+                        "carrier_query": carrier_query,
+                        "benefit_line": line,
+                    }
+                )
+    return entries
+
+
+def _candidate_supports_benefit_line(
+    candidate: SourceCandidate, benefit_line: str
+) -> bool:
+    target = _clean_text(benefit_line).lower()
+    if not target:
+        return True
+    lines = _normalize_benefit_lines(candidate.benefit_lines)
+    if not lines:
+        return True
+    return target in lines or "mixed" in lines or "unknown" in lines
+
+
+def _candidate_private_query_context_key(
+    candidate: SourceCandidate, entry: dict[str, str]
+) -> tuple[str, str | None, str, str, str]:
+    return (
+        _clean_text(candidate.payer_name).lower(),
+        _canonical_or_none(candidate.index_url or candidate.human_url),
+        _clean_text(entry.get("target_payer_query")).lower(),
+        _clean_text(entry.get("carrier_query")).lower(),
+        _clean_text(entry.get("benefit_line")).lower(),
+    )
+
+
+def _private_query_context_limit() -> int:
+    raw = str(os.getenv(PRIVATE_QUERY_CONTEXT_LIMIT_ENV) or "").strip()
+    if not raw:
+        return DEFAULT_PRIVATE_QUERY_CONTEXT_LIMIT
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return DEFAULT_PRIVATE_QUERY_CONTEXT_LIMIT
+
+
+def _private_query_expanded_candidates(
+    candidates: list[SourceCandidate],
+) -> list[SourceCandidate]:
+    entries = _private_query_context_entries()
+    if not entries:
+        return []
+    limit = _private_query_context_limit()
+    expanded: list[SourceCandidate] = []
+    seen: set[tuple[str, str | None, str, str, str]] = set()
+    base_candidates = [
+        candidate
+        for candidate in candidates
+        if _candidate_is_importable_source(candidate)
+        and _candidate_supports_source_query_expansion(candidate)
+    ]
+    for entry in entries:
+        for candidate in base_candidates:
+            if not _candidate_supports_benefit_line(candidate, entry["benefit_line"]):
+                continue
+            if not _candidate_matches_text_filters(
+                candidate,
+                entity_types=(),
+                payer_query=entry["carrier_query"],
+            ):
+                continue
+            key = _candidate_private_query_context_key(candidate, entry)
+            if key in seen:
+                continue
+            seen.add(key)
+            expanded_candidate = _candidate_with_target_payer_query(
+                candidate, entry["target_payer_query"]
+            )
+            expanded.append(
+                replace(
+                    expanded_candidate,
+                    raw_payload={
+                        **dict(expanded_candidate.raw_payload or {}),
+                        "private_query_context": True,
+                        "private_context_benefit_line": entry["benefit_line"],
+                        "private_context_carrier_query": entry["carrier_query"],
+                    },
+                )
+            )
+            if len(expanded) >= limit:
+                return expanded
+    return expanded
 
 
 def _merge_private_seed_context_rows(
@@ -1618,8 +1799,13 @@ def _infer_parent_group(section: str, payer_name: str) -> str | None:
     return None
 
 
+def _candidate_target_payer_query(candidate: SourceCandidate) -> str | None:
+    query = _clean_text((candidate.raw_payload or {}).get("target_payer_query"))
+    return query.lower() if query else None
+
+
 def _dedupe_candidates(candidates: list[SourceCandidate]) -> list[SourceCandidate]:
-    by_key: dict[tuple[str, str | None], SourceCandidate] = {}
+    by_key: dict[tuple[str, str | None, str | None], SourceCandidate] = {}
 
     def rank(item: SourceCandidate) -> tuple[int, int, int]:
         status_rank = {
@@ -1636,6 +1822,7 @@ def _dedupe_candidates(candidates: list[SourceCandidate]) -> list[SourceCandidat
         key = (
             _clean_text(item.payer_name).lower(),
             _canonical_or_none(item.index_url or item.human_url),
+            _candidate_target_payer_query(item),
         )
         previous = by_key.get(key)
         if previous is None or rank(item) > rank(previous):
@@ -2018,7 +2205,11 @@ async def _load_candidates(
     parser = str(config.get("parser") or provider).strip().lower()
     if parser == "master-list":
         path = _resolve_config_path(str(config.get("path") or ""))
-        return parse_master_list(path.read_text(encoding="utf-8"))[:limit]
+        candidates = parse_master_list(path.read_text(encoding="utf-8"))
+        candidates = _dedupe_candidates(
+            candidates + _private_query_expanded_candidates(candidates)
+        )
+        return candidates[:limit] if limit else candidates
     if test_mode:
         return []
     raise ValueError(f"unsupported provider: {provider}")
@@ -2119,13 +2310,17 @@ def _candidate_to_rows(
         key=str.lower,
     )
     candidate_metadata = _candidate_metadata(candidate, aliases)
+    target_payer_query = _candidate_target_payer_query(candidate)
+    source_identity: dict[str, Any] = {
+        "payer": payer_id,
+        "url": _canonical_or_none(source_url),
+        "provider": candidate.provider,
+    }
+    if target_payer_query:
+        source_identity["target_payer_query"] = target_payer_query
     source_id = _id(
         "mrfsource",
-        {
-            "payer": payer_id,
-            "url": _canonical_or_none(source_url),
-            "provider": candidate.provider,
-        },
+        source_identity,
     )
     payer_row = {
         "payer_id": payer_id,
@@ -2147,7 +2342,16 @@ def _candidate_to_rows(
     if not source_url:
         return payer_row, None
     source_key_base = _slug(
-        f"{candidate.provider}-{candidate.payer_name}-{_domain(source_url) or ''}"
+        "-".join(
+            value
+            for value in (
+                candidate.provider,
+                candidate.payer_name,
+                target_payer_query,
+                _domain(source_url) or "",
+            )
+            if value
+        )
     )
     source_key = f"{source_key_base[:80]}-{source_id[-8:]}"
     source_row = {

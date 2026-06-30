@@ -979,6 +979,111 @@ def test_candidate_query_expansion_keeps_searchable_platform_sources():
     assert expanded.raw_payload["query_expansion_source"] is True
 
 
+@pytest.mark.asyncio
+async def test_private_query_context_expands_supported_public_sources(
+    tmp_path, monkeypatch
+):
+    master_list_path = tmp_path / "master.md"
+    master_list_path.write_text(
+        "\n".join(
+            [
+                "## National carriers",
+                "| Payer | Type | URL | Notes |",
+                "| --- | --- | --- | --- |",
+                (
+                    "| Example Aetna | national | "
+                    "https://health1.aetna.com/app/public/#/one/insurerCode=EXAMPLE&brandCode=ALICSI/"
+                    "machine-readable-transparency-in-coverage | aliases: Aetna; benefit_lines: medical |"
+                ),
+                (
+                    "| Example Direct | national | https://example.test/index.json | "
+                    "aliases: Aetna; benefit_lines: medical |"
+                ),
+                (
+                    "| Example Dental | national | "
+                    "https://health1.aetna.com/app/public/#/one/insurerCode=DENTAL&brandCode=ALICSI/"
+                    "machine-readable-transparency-in-coverage | aliases: Aetna Dental; benefit_lines: dental |"
+                ),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    private_path = tmp_path / "private-context.csv"
+    private_path.write_text(
+        "ALIAS,MEDICAL_CARRIERS,DENTAL_CARRIERS,VISION_CARRIERS\n"
+        "Example Packaging,Aetna,Aetna Dental,\n",
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "sources.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "default_providers": ["master-list"],
+                "test_providers": ["master-list"],
+                "providers": {
+                    "master-list": {
+                        "parser": "master-list",
+                        "path": str(master_list_path),
+                    }
+                },
+                "platform_resolvers": {
+                    "aetna_health1": {"type": "healthsparq_public_mrf"}
+                },
+                "source_query_expansion_platforms": ["aetna_health1"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(discovery.SOURCE_CONFIG_ENV, str(config_path))
+    monkeypatch.setenv(discovery.PRIVATE_QUERY_CONTEXT_PATHS_ENV, str(private_path))
+    monkeypatch.setattr(discovery, "_SOURCE_CONFIG_CACHE", None)
+
+    candidates = await discovery._load_candidates(
+        "master-list", test_mode=True, limit=None
+    )
+    expanded = [
+        candidate
+        for candidate in candidates
+        if candidate.raw_payload.get("target_payer_query") == "Example Packaging"
+    ]
+
+    assert [candidate.payer_name for candidate in expanded] == [
+        "Example Aetna",
+        "Example Dental",
+    ]
+    assert {
+        candidate.raw_payload["private_context_benefit_line"]
+        for candidate in expanded
+    } == {"medical", "dental"}
+    assert all(
+        candidate.raw_payload["private_query_context"] for candidate in expanded
+    )
+    assert not any(candidate.payer_name == "Example Direct" for candidate in expanded)
+
+
+def test_query_expansion_sources_have_query_specific_source_identity():
+    base = discovery.SourceCandidate(
+        payer_name="Example Aetna",
+        provider="master-list",
+        index_url=(
+            "https://health1.aetna.com/app/public/#/one/"
+            "insurerCode=EXAMPLE&brandCode=ALICSI/"
+            "machine-readable-transparency-in-coverage"
+        ),
+        hosting_platform="aetna_health1",
+    )
+    first = discovery._candidate_with_target_payer_query(base, "Example Packaging")
+    second = discovery._candidate_with_target_payer_query(base, "Example Forge")
+
+    _, first_row = discovery._candidate_to_rows(first, discovery._utc_now())
+    _, second_row = discovery._candidate_to_rows(second, discovery._utc_now())
+
+    assert first_row is not None
+    assert second_row is not None
+    assert first_row["source_id"] != second_row["source_id"]
+    assert first_row["source_key"] != second_row["source_key"]
+
+
 def test_sapphire_query_slug_variants_probe_common_legal_suffixes():
     assert discovery._sapphire_query_slug_variants("Example Packaging") == [
         "example-packaging",
