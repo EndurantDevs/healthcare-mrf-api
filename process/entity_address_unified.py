@@ -82,7 +82,7 @@ DEFAULT_SQL_STATEMENT_TIMEOUT = "0"
 DEFAULT_SQL_SYNCHRONOUS_COMMIT = "off"
 DEFAULT_SQL_JIT = "off"
 DEFAULT_PROVIDER_DIRECTORY_PARTIAL_SCOPE = "latest-run"
-DEFAULT_PROVIDER_DIRECTORY_SOURCE_BATCH_SIZE = 3
+DEFAULT_PROVIDER_DIRECTORY_SOURCE_BATCH_SIZE = 100
 ENTITY_ADDRESS_REFRESH_MODE_FULL = "full"
 ENTITY_ADDRESS_REFRESH_MODE_PROVIDER_DIRECTORY_PARTIAL = "provider-directory-partial"
 ENTITY_ADDRESS_REFRESH_MODES = {
@@ -2089,6 +2089,7 @@ def _provider_directory_live_source_filter_sql(
 
 def _latest_provider_directory_partial_scope_sql(db_schema: str) -> str:
     source_ref = f"{db_schema}.provider_directory_source"
+    entity_address_ref = f"{db_schema}.{EntityAddressUnified.__main_table__}"
     location_ref = f"{db_schema}.provider_directory_location"
     organization_ref = f"{db_schema}.provider_directory_organization"
     role_ref = f"{db_schema}.provider_directory_practitioner_role"
@@ -2169,12 +2170,38 @@ def _latest_provider_directory_partial_scope_sql(db_schema: str) -> str:
                 SELECT * FROM organization_row_sources
           ) AS row_sources
       GROUP BY source_id, run_id
-    ), selected_sources AS (
+    ), candidate_sources AS (
         SELECT * FROM completed_sources
         UNION ALL
         SELECT resource_row_sources.*
           FROM resource_row_sources
          WHERE NOT EXISTS (SELECT 1 FROM completed_sources)
+    ), projected_sources AS (
+        SELECT DISTINCT split_part(pd_rid.rid, ':', 3)::varchar AS source_id
+          FROM {entity_address_ref} AS live
+          JOIN LATERAL unnest(COALESCE(live.source_record_ids, ARRAY[]::varchar[])) AS pd_rid(rid)
+            ON TRUE
+         WHERE pd_rid.rid LIKE 'provider_directory_fhir:%'
+           AND NULLIF(split_part(pd_rid.rid, ':', 3), '') IS NOT NULL
+    ), unprojected_sources AS (
+        SELECT
+            candidate.source_id,
+            NULL::varchar AS run_id,
+            MAX(candidate.updated_at) AS updated_at,
+            ('unprojected_' || MAX(candidate.scope_source))::varchar AS scope_source
+          FROM candidate_sources AS candidate
+         WHERE NOT EXISTS (
+                SELECT 1
+                  FROM projected_sources AS projected
+                 WHERE projected.source_id = candidate.source_id
+         )
+      GROUP BY candidate.source_id
+    ), selected_sources AS (
+        SELECT * FROM unprojected_sources
+         WHERE EXISTS (SELECT 1 FROM unprojected_sources)
+        UNION ALL
+        SELECT * FROM candidate_sources
+         WHERE NOT EXISTS (SELECT 1 FROM unprojected_sources)
     )
     SELECT
         run_id,
@@ -2183,9 +2210,8 @@ def _latest_provider_directory_partial_scope_sql(db_schema: str) -> str:
         MAX(updated_at) AS latest_updated_at,
         ARRAY_AGG(DISTINCT scope_source ORDER BY scope_source)::varchar[] AS scope_sources
       FROM selected_sources
-     WHERE run_id IS NOT NULL
   GROUP BY run_id
-  ORDER BY MAX(updated_at) DESC NULLS LAST, run_id DESC
+  ORDER BY (run_id IS NULL) DESC, MAX(updated_at) DESC NULLS LAST, run_id DESC
      LIMIT 1;
     """
 
@@ -10717,6 +10743,13 @@ async def shutdown(ctx):
         context.get("partial_main_patch_publish")
         or context.get("partial_provider_directory_main_patch_publish")
     )
+    if context.get("refresh_mode") == ENTITY_ADDRESS_REFRESH_MODE_PROVIDER_DIRECTORY_PARTIAL and (
+        partial_main_patch or partial_support_patch
+    ):
+        raise RuntimeError(
+            "entity-address-unified provider-directory-partial refresh must publish "
+            "through replacement-stage table swap; live delete patch publishing is disabled."
+        )
     if partial_main_patch and not partial_support_patch and not serving_only_refresh:
         raise RuntimeError(
             f"entity-address-unified {context.get('refresh_mode') or 'partial'} "

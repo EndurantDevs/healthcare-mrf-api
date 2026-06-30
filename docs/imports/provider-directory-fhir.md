@@ -642,7 +642,7 @@ building its temporary stage table, so the monthly run avoids broad
 America/Chicago. It runs `entity-address-unified` with
 `refresh_mode=provider-directory-partial`,
 `provider_directory_partial_scope=latest-run`,
-`provider_directory_source_batch_size=3`, `serving_only_refresh=true`, and
+`provider_directory_source_batch_size=100`, `serving_only_refresh=true`, and
 `publish=true` so Provider Directory FHIR rows become visible in
 provider/address search without rebuilding unchanged serving rows or the
 heavier support/provenance tables on each Provider Directory refresh. The

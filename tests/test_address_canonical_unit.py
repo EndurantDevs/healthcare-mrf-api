@@ -1220,6 +1220,12 @@ def test_latest_provider_directory_partial_scope_sql_prefers_metadata_then_resou
     assert "eligible.source_id = loc.source_id" in sql
     assert "eligible.run_id = loc.last_seen_run_id" in sql
     assert "WHERE NOT EXISTS (SELECT 1 FROM completed_sources)" in sql
+    assert "projected_sources AS" in sql
+    assert "FROM mrf.entity_address_unified AS live" in sql
+    assert "unprojected_sources AS" in sql
+    assert "NULL::varchar AS run_id" in sql
+    assert "('unprojected_' || MAX(candidate.scope_source))::varchar AS scope_source" in sql
+    assert "ORDER BY (run_id IS NULL) DESC" in sql
 
 
 @pytest.mark.asyncio
@@ -2660,6 +2666,23 @@ def test_entity_address_unified_provider_directory_replacement_can_copy_into_hea
     assert "DELETE FROM" not in "\n".join((prepare_affected_sql, copy_live_sql, copy_stage_sql))
     assert f"INSERT INTO mrf.{heap_name}" in copy_stage_sql
     assert "FROM mrf.entity_address_unified_20260614 AS stage" in copy_stage_sql
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flag_name", ["partial_main_patch_publish", "partial_support_patch_publish"])
+async def test_provider_directory_shutdown_rejects_live_delete_patch_flags(monkeypatch, flag_name):
+    monkeypatch.setattr(entity_address_unified, "ensure_database", AsyncMock())
+    ctx = {
+        "import_date": "20260614",
+        "context": {
+            "run": 1,
+            "refresh_mode": "provider-directory-partial",
+            flag_name: True,
+        },
+    }
+
+    with pytest.raises(RuntimeError, match="replacement-stage table swap"):
+        await entity_address_unified.shutdown(ctx)
 
 
 def test_entity_address_unified_builds_facility_anchor_npi_candidate_stage_sql(monkeypatch):

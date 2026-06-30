@@ -163,6 +163,12 @@ def test_provider_directory_source_id_batches_are_bounded():
 
 
 def test_provider_directory_source_batch_size_accepts_task_and_env(monkeypatch):
+    monkeypatch.delenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_PROVIDER_DIRECTORY_SOURCE_BATCH_SIZE", raising=False)
+    assert (
+        entity_address_unified._entity_address_provider_directory_source_batch_size({})  # pylint: disable=protected-access
+        == 100
+    )
+
     assert (
         entity_address_unified._entity_address_provider_directory_source_batch_size(  # pylint: disable=protected-access
             {"provider_directory_source_batch_size": 4}
