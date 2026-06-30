@@ -979,6 +979,49 @@ def test_candidate_query_expansion_keeps_searchable_platform_sources():
     assert expanded.raw_payload["query_expansion_source"] is True
 
 
+def test_sapphire_query_slug_variants_probe_common_legal_suffixes():
+    assert discovery._sapphire_query_slug_variants("Example Packaging") == [
+        "example-packaging",
+        "example_packaging",
+        "example-packaging-inc",
+        "example_packaging_inc",
+        "example-packaging-llc",
+        "example_packaging_llc",
+        "example-packaging-corp",
+        "example_packaging_corp",
+        "example-packaging-co",
+        "example_packaging_co",
+    ]
+
+
+def test_query_expansion_target_uses_query_as_company_label():
+    target = discovery.CrawlTarget(
+        source={"source_id": "src_aetna", "display_name": "Example Aetna"},
+        url="https://example.test/2026-06-01_example-packaging-rates.json.gz",
+        label="2026-06-01_example-packaging-rates.json.gz",
+        resolved_from_url="https://example.test/latest_metadata.json",
+        metadata={
+            "plan_info": [
+                {
+                    "plan_id": "123",
+                    "plan_id_type": "ein",
+                    "plan_market_type": "group",
+                    "plan_name": "Example Packaging HSA Choice POS II",
+                }
+            ]
+        },
+    )
+
+    matched = discovery._matched_query_expansion_target(target, "Example Packaging")
+
+    assert matched is not None
+    assert matched.metadata["company_name"] == "Example Packaging"
+    assert matched.metadata["employer_name"] == "Example Packaging"
+    assert matched.metadata["target_payer_query"] == "Example Packaging"
+    assert matched.metadata["query_expansion_match"] is True
+    assert matched.metadata["plan_info"][0]["plan_name"] == "Example Packaging HSA Choice POS II"
+
+
 def test_healthsparq_query_expansion_filters_before_limit_and_disambiguates_plans():
     source = {
         "source_id": "src_aetna",

@@ -4617,13 +4617,15 @@ def _sapphire_query_slug_variants(query: str | None) -> list[str]:
     corporate_suffixes = {"inc", "llc", "ltd", "co", "corp", "corporation", "company"}
     if len(tokens) > 1 and tokens[-1] in corporate_suffixes:
         variants.append(tokens[:-1])
+    elif len(tokens) > 1:
+        variants.extend([tokens + [suffix] for suffix in ("inc", "llc", "corp", "co")])
     slugs: list[str] = []
     for variant in variants:
         for separator in ("-", "_"):
             slug = separator.join(variant).strip(separator)
             if slug and slug not in slugs:
                 slugs.append(slug)
-    return slugs[:8]
+    return slugs[:12]
 
 
 async def _sapphire_query_probe_targets(
@@ -10810,6 +10812,10 @@ def _matched_query_expansion_target(
     if not _search_values_match_query(_crawl_target_search_values(target), query):
         return None
     metadata = dict(target.metadata or {})
+    query_label = _clean_text(query)
+    if query_label:
+        metadata.setdefault("company_name", query_label)
+        metadata.setdefault("employer_name", query_label)
     target_label = _clean_text(
         metadata.get("company_name")
         or metadata.get("payer_name")
