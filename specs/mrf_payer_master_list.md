@@ -436,6 +436,7 @@ Last one-time research refresh: 2026-06-05.
 | HealthComp | tpa | https://healthcomp.sapphiremrfhub.com/ | public Sapphire MRF hub; aliases: HealthComp LLC, HCOnline, Personify Health, Personify |
 | Healthgram | tpa | https://mrf.healthgram.com/ | public MRF network directory; resolver expands network pages to current TOC JSON links |
 | Imagine360 | tpa | https://caa.imagine360.com/IMAGINE360%20SERVICES%20LLC/index.html | public Imagine360 CAA table-of-contents directory linked from Imagine360 machine-readable files page; aliases: Imagine 360, Imagine360 Services, Imagine360 Services LLC |
+| Insight Benefit Administrators | tpa | https://insightba.net/transparency-in-coverage-resources/ | public Transparency in Coverage page exposes Ohio Health Choice/FrontPath in-network machine-readable rate files; benefit lines: medical; aliases: Insight Benefit Admininistrators, Insight Benefits Administrator, Insight BA |
 | Insurance Management Services | tpa | https://mrf.healthcarebluebook.com/IMS | public Healthcare Bluebook MRF directory linked from IMS healthcare reform page; aliases: IMS, IMS TPA, Insurance Management Services TX, Insurance Management Services Amarillo |
 | Insurance Systems | tpa | https://isi.mrf.payercompass.com/ | public Zelis/PayerCompass MRF repository; aliases: ISI, Insurance Systems Inc |
 | Kapnick Insurance Group | tpa | https://bcbsm.sapphiremrfhub.com/tocs/current/kapnick_co_inc | public Sapphire table-of-contents link; aliases: Kapnick, Kapnick Co Inc, Kapnick Insurance |

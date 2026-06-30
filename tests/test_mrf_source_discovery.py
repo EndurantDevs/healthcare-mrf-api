@@ -38,6 +38,8 @@ def test_source_urls_are_loaded_from_registry_file():
         config["platform_resolvers"]["bcbswy_hmhs_monthly_toc"]["type"]
         == "monthly_toc_templates"
     )
+    assert config["platform_resolvers"]["insightba_html_mrf_links"]["type"] == "html_mrf_links"
+    assert config["platform_resolvers"]["insightba_html_mrf_links"]["include_url_patterns"]
     assert config["platform_resolvers"]["bcbswy_hmhs_monthly_toc"][
         "file_templates"
     ] == ["{month_start}_Blue_Cross_Blue_Shield_of_Wyoming_index.json"]
@@ -471,6 +473,12 @@ def test_classify_hosting_platform_recognizes_public_adapter_pages():
         "https://www.mclarenhealthplan.org/mhp/transparency-in-coverage-and-no-surprises-act",
     ):
         assert discovery.classify_hosting_platform(url) == "html_mrf_links"
+    assert (
+        discovery.classify_hosting_platform(
+            "https://insightba.net/transparency-in-coverage-resources/"
+        )
+        == "insightba_html_mrf_links"
+    )
     assert (
         discovery.classify_hosting_platform(
             "https://deancare.healthsparq.com/healthsparq/public/#/one/"
@@ -1188,6 +1196,7 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
 | Marpai | tpa | https://www.mymedicalshopper.com/mrf-search/marpai | aliases: Marpai Health |
 | Insurance Systems | tpa | https://isi.mrf.payercompass.com/ | aliases: ISI |
 | Kapnick Insurance Group | tpa | https://bcbsm.sapphiremrfhub.com/tocs/current/kapnick_co_inc | aliases: Kapnick |
+| Insight Benefit Administrators | tpa | https://insightba.net/transparency-in-coverage-resources/ | aliases: Insight Benefit Admininistrators, Insight BA |
 | Imagine360 | tpa | https://caa.imagine360.com/IMAGINE360%20SERVICES%20LLC/index.html | aliases: Imagine 360 |
 | Patient Advocates | tpa | https://www.mymedicalshopper.com/mrf-search/patient-advocates | aliases: Patient Advocates LLC |
 | Planned Administrators Inc | tpa | https://www.paisc.com/compliance-machine-readable-files-mrfs | aliases: PAI, Planned Administrators |
@@ -1361,6 +1370,14 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
     assert by_name["Marpai"].hosting_platform == "mymedicalshopper_talon"
     assert by_name["Insurance Systems"].hosting_platform == "payercompass_mrf"
     assert by_name["Kapnick Insurance Group"].hosting_platform == "sapphire"
+    assert (
+        by_name["Insight Benefit Administrators"].hosting_platform
+        == "insightba_html_mrf_links"
+    )
+    assert by_name["Insight Benefit Administrators"].aliases == (
+        "Insight Benefit Admininistrators",
+        "Insight BA",
+    )
     assert by_name["Imagine360"].hosting_platform == "html_mrf_links"
     assert by_name["Imagine360"].aliases == ("Imagine 360",)
     assert by_name["Patient Advocates"].hosting_platform == "mymedicalshopper_talon"
@@ -2746,6 +2763,37 @@ def test_crawl_target_context_metadata_carries_benefit_lines_from_source():
 
     assert context["benefit_lines"] == ["dental", "vision"]
     assert "benefit_line" not in context
+
+
+def test_filter_crawl_targets_by_resolver_patterns_keeps_configured_urls_only():
+    targets = [
+        discovery.CrawlTarget(
+            source={"source_id": "source_1"},
+            url="https://www.ohiohealthchoice.com/FPTIC/FP_in-network-rates_4.json",
+        ),
+        discovery.CrawlTarget(
+            source={"source_id": "source_1"},
+            url="https://www.ohiohealthchoice.com/FPTIC/Wrap/MPI_MPI_innetworkrates.json",
+        ),
+        discovery.CrawlTarget(
+            source={"source_id": "source_1"},
+            url="https://example.com/expired-signed-file.json.gz?Expires=1",
+        ),
+    ]
+
+    filtered = discovery._filter_crawl_targets_by_resolver_patterns(
+        targets,
+        {
+            "include_url_patterns": [
+                r"^https://www\.ohiohealthchoice\.com/FPTIC/FP_[^?#]+\.json$"
+            ],
+            "exclude_url_patterns": [r"Expires="],
+        },
+    )
+
+    assert [target.url for target in filtered] == [
+        "https://www.ohiohealthchoice.com/FPTIC/FP_in-network-rates_4.json"
+    ]
 
 
 def test_parse_master_list_skips_placeholder_source_urls():

@@ -673,6 +673,8 @@ def classify_hosting_platform(url: str | None) -> str | None:
         return "fchn_payor_search"
     if host in {"ehptransparency.org", "www.ehptransparency.org"}:
         return "html_mrf_links"
+    if host in {"insightba.net", "www.insightba.net"} and "transparency-in-coverage" in path:
+        return "insightba_html_mrf_links"
     if host in {"www.vivahealth.com", "vivahealth.com"} and (
         path.startswith("/mrf")
         or path.startswith("/files/mrf/viva-health-commercial-")
@@ -4947,6 +4949,35 @@ async def _resolve_html_delegated_mrf_links(
     return targets
 
 
+def _target_url_matches_any_pattern(target: CrawlTarget, patterns: Iterable[Any]) -> bool:
+    url = str(target.url or "")
+    return any(
+        str(pattern or "").strip()
+        and re.search(str(pattern), url, flags=re.IGNORECASE)
+        for pattern in patterns
+    )
+
+
+def _filter_crawl_targets_by_resolver_patterns(
+    targets: list[CrawlTarget], resolver: dict[str, Any]
+) -> list[CrawlTarget]:
+    include_patterns = list(resolver.get("include_url_patterns") or [])
+    exclude_patterns = list(resolver.get("exclude_url_patterns") or [])
+    if include_patterns:
+        targets = [
+            target
+            for target in targets
+            if _target_url_matches_any_pattern(target, include_patterns)
+        ]
+    if exclude_patterns:
+        targets = [
+            target
+            for target in targets
+            if not _target_url_matches_any_pattern(target, exclude_patterns)
+        ]
+    return targets
+
+
 async def _resolve_html_mrf_links(
     source: dict[str, Any],
     url: str,
@@ -5087,6 +5118,7 @@ async def _resolve_html_mrf_links(
                     )
                 )
         targets = _dedupe_crawl_targets_by_url(targets)
+    targets = _filter_crawl_targets_by_resolver_patterns(targets, resolver)
     max_targets = _as_int(resolver.get("max_targets"))
     if max_targets and max_targets > 0:
         targets = targets[:max_targets]

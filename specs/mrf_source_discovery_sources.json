@@ -98,6 +98,16 @@
       "max_frames": 5,
       "max_targets": 1000
     },
+    "insightba_html_mrf_links": {
+      "type": "html_mrf_links",
+      "max_bytes": 5242880,
+      "include_url_patterns": [
+        "^https://www\\.ohiohealthchoice\\.com/FPTIC/FP_[^?#]+\\.json$"
+      ],
+      "follow_directory_links": false,
+      "follow_iframe_links": false,
+      "max_targets": 50
+    },
     "bcbs_global_solutions_mrf": {
       "type": "bcbs_global_solutions_mrf",
       "max_bytes": 5242880,
