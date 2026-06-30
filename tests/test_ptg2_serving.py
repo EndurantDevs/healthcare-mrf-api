@@ -1587,7 +1587,7 @@ async def test_current_ptg2_snapshot_routes_by_plan_source_pointer():
 
     snapshot_id = await ptg2_serving.resolve_current_ptg2_snapshot_id(
         session,
-        {"plan_id": "010854205", "plan_market_type": "group", "source_key": "heartland_dental"},
+        {"plan_id": "010854205", "plan_market_type": "group", "source_key": "example_dental"},
     )
 
     assert snapshot_id == "snap-source"
@@ -1599,7 +1599,7 @@ async def test_current_ptg2_snapshot_routes_by_plan_source_pointer():
     assert "cps.source_key = :source_key" in sql
     assert "s.status = 'published'" in sql
     assert "serving_index" in sql
-    assert params["source_key"] == "heartland_dental"
+    assert params["source_key"] == "example_dental"
 
 
 @pytest.mark.asyncio
@@ -1701,7 +1701,7 @@ async def test_ptg2_provider_procedures_uses_compact_snapshot_without_market_col
         {
             "plan_id": "010854205",
             "plan_market_type": "group",
-            "source_key": "heartland_dental",
+            "source_key": "example_dental",
             "code": "99213",
             "code_system": "CPT",
         },
@@ -2434,11 +2434,11 @@ def test_compact_item_marks_unified_address_as_inferred_from_provider_identity()
             "network_names": ["C2"],
             "prices": [],
         },
-        {"source_key": "ptg_heartland", "snapshot_id": "ptg2:202606:demo"},
+        {"source_key": "ptg_example", "snapshot_id": "ptg2:202606:demo"},
     )
 
     assert item["address_precision"] == "street"
-    assert item["source_key"] == "ptg_heartland"
+    assert item["source_key"] == "ptg_example"
     assert item["snapshot_id"] == "ptg2:202606:demo"
     assert item["network_names"] == ["C2"]
     assert item["address_verification"] == {
@@ -2479,7 +2479,7 @@ def test_compact_item_with_displayable_address_passes_assurance_contract():
             "network_names": ["C2"],
             "prices": [],
         },
-        {"source_key": "ptg_heartland", "snapshot_id": "ptg2:202606:demo"},
+        {"source_key": "ptg_example", "snapshot_id": "ptg2:202606:demo"},
     )
 
     summary = summarize_ptg_price_address_payload({"data": {"items": [item]}})
@@ -2626,7 +2626,7 @@ def test_compact_item_filters_ptg_from_inferred_address_sources():
             "network_names": ["C2"],
             "prices": [],
         },
-        {"source_key": "ptg_heartland", "snapshot_id": "ptg2:202606:demo"},
+        {"source_key": "ptg_example", "snapshot_id": "ptg2:202606:demo"},
     )
 
     assert "address_sources" not in item

@@ -3007,7 +3007,7 @@ def test_ptg2_main_publishes_allowed_amount_only_metadata_snapshot(monkeypatch):
     assert final_report["files_processed"] in {1}
     assert final_report["files_failed"] in {0}
     assert final_report["serving_index"]["type"] == "allowed_amounts_only"
-    assert final_report["serving_rates"] == 0
+    assert final_report["serving_rates"] in {0}
     assert snapshot_rows[-1]["manifest"]["successful_files"][0]["source_type"] == "allowed_amounts"
     assert current_rows == []
     assert publish_serving.await_count in {0}

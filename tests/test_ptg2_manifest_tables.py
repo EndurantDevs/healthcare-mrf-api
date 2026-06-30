@@ -38,7 +38,7 @@ async def test_snapshot_serving_tables_rejects_non_manifest_storage():
                     "type": "db_compact",
                     "storage": "db_compact_snapshot",
                     "snapshot_scoped": True,
-                    "source_key": "heartland_dental",
+                    "source_key": "example_dental",
                     "table": "mrf.ptg2_serving_rate_compact_token",
                     "price_code_set_table": "mrf.ptg2_price_code_set_token",
                     "price_atom_table": "mrf.ptg2_price_atom_token",
@@ -56,7 +56,7 @@ async def test_snapshot_serving_tables_rejects_non_manifest_storage():
     assert tables.storage == "db_compact_snapshot"
     assert tables.type == "db_compact"
     assert tables.snapshot_scoped is True
-    assert tables.source_key == "heartland_dental"
+    assert tables.source_key == "example_dental"
     assert tables.serving_table == "mrf.ptg2_serving_rate_compact_token"
     assert tables.price_atom_table == "mrf.ptg2_price_atom_token"
     assert tables.provider_group_member_table == "mrf.ptg2_provider_group_member_token"
@@ -72,7 +72,7 @@ async def test_snapshot_serving_tables_represents_manifest_snapshot_without_v2_t
                     "type": "snapshot_index",
                     "storage": "manifest_snapshot",
                     "snapshot_scoped": True,
-                    "source_key": "heartland_dental",
+                    "source_key": "example_dental",
                     "artifact_uri": "file:///tmp/ptg2/snapshot_index/snap-manifest.json",
                     "table": "ptg2_serving_rate; DROP TABLE ptg2_snapshot",
                     "provider_group_member_table": "mrf.ptg2_provider_group_member; DROP",
@@ -86,7 +86,7 @@ async def test_snapshot_serving_tables_represents_manifest_snapshot_without_v2_t
     assert tables.storage == "manifest_snapshot"
     assert tables.type == "snapshot_index"
     assert tables.snapshot_scoped is True
-    assert tables.source_key == "heartland_dental"
+    assert tables.source_key == "example_dental"
     assert tables.artifact_uri == "file:///tmp/ptg2/snapshot_index/snap-manifest.json"
     assert tables.serving_table is None
     assert tables.provider_group_member_table is None

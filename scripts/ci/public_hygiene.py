@@ -39,6 +39,13 @@ CONTENT_PATTERNS = {
         r"\bpostgres(?:ql)?://[^:\s/@{}]+:[^@\s{}]+@",
         re.IGNORECASE,
     ),
+    "private-client-heartland": re.compile(r"\bheartland(?:[_ -]?dental)?\b", re.IGNORECASE),
+    "private-client-plastipak": re.compile(r"\b(?:plastipak|absopure)\b", re.IGNORECASE),
+    "private-client-serve-electric": re.compile(r"\bserve[_ -]?electric\b", re.IGNORECASE),
+    "private-client-invited-clubs": re.compile(
+        r"\b(?:invited[_ -]?clubs?|clubcorp)\b",
+        re.IGNORECASE,
+    ),
     "password-assignment": re.compile(
         r"\b(?:password|passwd|secret|token)\s*[:=]\s*['\"][^'\"\s]{8,}['\"]",
         re.IGNORECASE,

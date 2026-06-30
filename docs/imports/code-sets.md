@@ -54,7 +54,7 @@ curl "$API_BASE/api/v1/codes/HCPCS_MODIFIER/RR"
 
 PTG code detail enrichment is opt-in:
 ```bash
-curl "$API_BASE/api/v1/pricing/providers/by-procedure?plan_id=010854205&plan_market_type=group&source_key=heartland_dental_rust_publish_check&code_system=RC&code=450&limit=1&include_code_details=true"
+curl "$API_BASE/api/v1/pricing/providers/by-procedure?plan_id=010854205&plan_market_type=group&source_key=example_dental_rust_publish_check&code_system=RC&code=450&limit=1&include_code_details=true"
 ```
 
 When enabled, PTG responses may include:

@@ -1715,7 +1715,7 @@ async def test_list_providers_by_procedure_routes_plan_filter_to_ptg2(monkeypatc
         args={
             "plan_id": "010854205",
             "market_type": "group",
-            "source_key": "heartland_dental",
+            "source_key": "example_dental",
             "code": "70551",
             "limit": "10",
             "include_providers": "true",
@@ -1738,7 +1738,7 @@ async def test_list_providers_by_procedure_routes_plan_filter_to_ptg2(monkeypatc
     assert payload["items"][0]["tic_prices"][0]["negotiated_rate"] == "450.00"
     assert payload["query"]["source"] == "ptg2"
     assert seen_args["plan_market_type"] == "group"
-    assert seen_args["source_key"] == "heartland_dental"
+    assert seen_args["source_key"] == "example_dental"
     assert seen_args["include_providers"] == "true"
     assert seen_args["include_code_details"] == "true"
     assert seen_args["include_sources"] == "true"
