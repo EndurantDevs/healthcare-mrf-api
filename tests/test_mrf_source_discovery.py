@@ -1691,6 +1691,14 @@ async def test_master_list_keeps_high_value_public_aliases():
         "MERITAIN HEALTH (NORTH AMERICAN HEALTH PLAN)"
         in by_name["Meritain Health"].aliases
     )
+    meritain_health1 = [
+        candidate
+        for candidate in candidates
+        if candidate.payer_name == "Meritain Health"
+        and "MERITAINOVER" in candidate.index_url
+    ]
+    assert len(meritain_health1) == 1
+    assert meritain_health1[0].benefit_lines == ("medical", "dental")
     assert by_name["Firefly Health"].entity_type == "dtc"
     assert by_name["Firefly Health"].benefit_lines == ("medical",)
     assert by_name["Firefly Health"].source_tier == "coverage_evidence"
