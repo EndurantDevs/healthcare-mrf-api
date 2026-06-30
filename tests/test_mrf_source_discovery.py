@@ -1883,6 +1883,12 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Vision Plan Service VSP" in by_name["VSP Vision"].aliases
     assert "Vision Serivce Plan (VSP)" in by_name["VSP Vision"].aliases
     assert "VSP Choice Network" in by_name["VSP Vision"].aliases
+    assert "Community Eye Care" in by_name["VSP Vision"].aliases
+    assert "CEC Community Eye Care" in by_name["VSP Vision"].aliases
+    assert "CEC Vision" in by_name["VSP Vision"].aliases
+    assert discovery._candidate_matches_text_filters(
+        by_name["VSP Vision"], entity_types=(), payer_query="Community Eye Care"
+    )
     assert "Guardian VSP Network" in by_name["VSP Vision"].aliases
     assert "Guardian/VSP" in by_name["VSP Vision"].aliases
     assert "Guardian/VSP Vision" in by_name["VSP Vision"].aliases
