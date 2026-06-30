@@ -1,5 +1,4 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-# pylint: disable=too-many-lines
 
 import asyncio
 import codecs
@@ -1108,7 +1107,7 @@ async def _run_nppes_gap_check(ctx: dict[str, Any]) -> dict[str, Any]:
 
         ctx.setdefault("context", {}).setdefault("audit", {})["nppes_gap_report"] = report
         return report
-    except Exception as exc:  # pylint: disable=broad-exception-caught
+    except Exception as exc:
         report["error"] = str(exc)
         print(f"[warn] NPPES gap check failed: {exc}")
         ctx.setdefault("context", {}).setdefault("audit", {})["nppes_gap_report"] = report

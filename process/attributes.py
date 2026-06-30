@@ -62,7 +62,7 @@ async def _table_exists(schema: str, table_name: str) -> bool:
 
 
 async def _prepare_attribute_tables(ctx):
-    global _TABLES_PREPARED  # pylint: disable=global-statement
+    global _TABLES_PREPARED
     if _TABLES_PREPARED:
         return
 

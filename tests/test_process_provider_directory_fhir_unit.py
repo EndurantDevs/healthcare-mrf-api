@@ -35,7 +35,7 @@ def _stub_resource_import_metadata(monkeypatch):
 
 
 def test_source_row_from_seed_normalizes_base_and_flags():
-    row = importer._source_row_from_seed(  # pylint: disable=protected-access
+    row = importer._source_row_from_seed(
         {
             "id": "1",
             "org_name": " Cigna ",
@@ -59,7 +59,7 @@ def test_source_row_from_seed_normalizes_base_and_flags():
 
 
 def test_source_row_from_seed_overrides_aetna_developer_portal_base():
-    row = importer._source_row_from_seed(  # pylint: disable=protected-access
+    row = importer._source_row_from_seed(
         {
             "id": "aetna-1",
             "org_name": "Aetna",
@@ -80,7 +80,7 @@ def test_source_row_from_seed_overrides_aetna_developer_portal_base():
 
 
 def test_source_row_from_seed_overrides_cigna_availity_non_fhir_base():
-    row = importer._source_row_from_seed(  # pylint: disable=protected-access
+    row = importer._source_row_from_seed(
         {
             "id": "cigna-1",
             "org_name": "Cigna Corporation",
@@ -104,7 +104,7 @@ def test_source_row_from_seed_overrides_cigna_availity_non_fhir_base():
 
 
 def test_source_row_from_seed_overrides_centene_partner_portal_base():
-    row = importer._source_row_from_seed(  # pylint: disable=protected-access
+    row = importer._source_row_from_seed(
         {
             "id": "centene-1",
             "org_name": "Centene Corporation",
@@ -125,7 +125,7 @@ def test_source_row_from_seed_overrides_centene_partner_portal_base():
 
 
 def test_source_row_from_seed_overrides_uhc_interoperability_landing_page():
-    row = importer._source_row_from_seed(  # pylint: disable=protected-access
+    row = importer._source_row_from_seed(
         {
             "id": "uhc-1",
             "org_name": "UnitedHealthcare",
@@ -146,7 +146,7 @@ def test_source_row_from_seed_overrides_uhc_interoperability_landing_page():
 
 
 def test_source_row_from_seed_overrides_scan_developer_portal_base():
-    row = importer._source_row_from_seed(  # pylint: disable=protected-access
+    row = importer._source_row_from_seed(
         {
             "id": "scan-1",
             "org_name": "SCAN Health Plan",
@@ -168,7 +168,7 @@ def test_source_row_from_seed_overrides_scan_developer_portal_base():
 
 
 def test_source_row_from_seed_uses_normalized_base_for_stable_scan_source_id():
-    portal_row = importer._source_row_from_seed(  # pylint: disable=protected-access
+    portal_row = importer._source_row_from_seed(
         {
             "id": "scan-1",
             "org_name": "SCAN Health Plan",
@@ -178,7 +178,7 @@ def test_source_row_from_seed_uses_normalized_base_for_stable_scan_source_id():
             "source": "provider-directory-db",
         }
     )
-    concrete_row = importer._source_row_from_seed(  # pylint: disable=protected-access
+    concrete_row = importer._source_row_from_seed(
         {
             "id": "scan-1",
             "org_name": "SCAN Health Plan",
@@ -194,7 +194,7 @@ def test_source_row_from_seed_uses_normalized_base_for_stable_scan_source_id():
 
 
 def test_source_row_from_seed_normalizes_resource_specific_api_base():
-    row = importer._source_row_from_seed(  # pylint: disable=protected-access
+    row = importer._source_row_from_seed(
         {
             "id": "maine-1",
             "org_name": "State of Maine",
@@ -218,7 +218,7 @@ def test_source_row_from_seed_normalizes_resource_specific_api_base():
 
 
 def test_source_row_from_seed_uses_normalized_base_for_stable_resource_url_source_id():
-    resource_url_row = importer._source_row_from_seed(  # pylint: disable=protected-access
+    resource_url_row = importer._source_row_from_seed(
         {
             "id": "maine-1",
             "org_name": "State of Maine",
@@ -229,7 +229,7 @@ def test_source_row_from_seed_uses_normalized_base_for_stable_resource_url_sourc
             "source": "provider-directory-db",
         }
     )
-    parent_base_row = importer._source_row_from_seed(  # pylint: disable=protected-access
+    parent_base_row = importer._source_row_from_seed(
         {
             "id": "maine-1",
             "org_name": "State of Maine",
@@ -246,7 +246,7 @@ def test_source_row_from_seed_uses_normalized_base_for_stable_resource_url_sourc
 
 
 def test_source_row_from_seed_overrides_alohr_public_app_base():
-    row = importer._source_row_from_seed(  # pylint: disable=protected-access
+    row = importer._source_row_from_seed(
         {
             "id": "alohr-1",
             "org_name": "State of Alabama",
@@ -338,7 +338,7 @@ def test_source_row_from_seed_preserves_known_confirmed_importable_bases():
     ]
 
     for seed_row, expected_base, expected_override in cases:
-        row = importer._source_row_from_seed(seed_row)  # pylint: disable=protected-access
+        row = importer._source_row_from_seed(seed_row)
 
         assert row["api_base"] == expected_base
         assert row["canonical_api_base"] == expected_base
@@ -378,13 +378,13 @@ def test_resource_import_source_selection_reports_credentialed_policy_counts():
         },
     ]
 
-    selected, metrics = importer._select_resource_import_sources(  # pylint: disable=protected-access
+    selected, metrics = importer._select_resource_import_sources(
         sources,
         valid_source_ids=None,
         open_only=False,
         include_auth_required=True,
     )
-    selected_without_auth, metrics_without_auth = importer._select_resource_import_sources(  # pylint: disable=protected-access
+    selected_without_auth, metrics_without_auth = importer._select_resource_import_sources(
         sources,
         valid_source_ids=None,
         open_only=False,
@@ -411,7 +411,7 @@ def test_resource_import_source_selection_allows_live_probe_success_over_open_on
         "requires_registration": True,
     }
 
-    selected, metrics = importer._select_resource_import_sources(  # pylint: disable=protected-access
+    selected, metrics = importer._select_resource_import_sources(
         [source],
         valid_source_ids={"credentialed_valid"},
         open_only=True,
@@ -466,7 +466,7 @@ def test_seed_rows_from_retest_results_filters_to_provider_like_rows(tmp_path):
         encoding="utf-8",
     )
 
-    rows = importer._seed_rows_from_retest_results(retest_path)  # pylint: disable=protected-access
+    rows = importer._seed_rows_from_retest_results(retest_path)
 
     assert [row["org_name"] for row in rows] == ["Public FHIR Payer", "Public App Payer", "Auth Payer"]
     assert rows[0]["auth_type"] == "open"
@@ -479,7 +479,7 @@ def test_seed_rows_from_retest_results_filters_to_provider_like_rows(tmp_path):
 
 
 def test_dedupe_source_rows_skips_low_information_retest_duplicate():
-    sqlite_row = importer._source_row_from_seed(  # pylint: disable=protected-access
+    sqlite_row = importer._source_row_from_seed(
         {
             "id": "cigna-sqlite",
             "org_name": "Cigna",
@@ -488,7 +488,7 @@ def test_dedupe_source_rows_skips_low_information_retest_duplicate():
             "source": "provider-directory-db",
         }
     )
-    retest_row = importer._source_row_from_seed(  # pylint: disable=protected-access
+    retest_row = importer._source_row_from_seed(
         {
             "id": "cigna-retest",
             "org_name": "Cigna",
@@ -498,13 +498,13 @@ def test_dedupe_source_rows_skips_low_information_retest_duplicate():
         }
     )
 
-    rows = importer._dedupe_source_rows([sqlite_row, retest_row])  # pylint: disable=protected-access
+    rows = importer._dedupe_source_rows([sqlite_row, retest_row])
 
     assert rows == [sqlite_row]
 
 
 def test_dedupe_source_rows_keeps_unique_auth_required_retest_source():
-    sqlite_row = importer._source_row_from_seed(  # pylint: disable=protected-access
+    sqlite_row = importer._source_row_from_seed(
         {
             "id": "cigna-sqlite",
             "org_name": "Cigna",
@@ -513,7 +513,7 @@ def test_dedupe_source_rows_keeps_unique_auth_required_retest_source():
             "source": "provider-directory-db",
         }
     )
-    retest_row = importer._source_row_from_seed(  # pylint: disable=protected-access
+    retest_row = importer._source_row_from_seed(
         {
             "id": "wellmed-retest",
             "org_name": "WellMed (UHC subsidiary)",
@@ -526,7 +526,7 @@ def test_dedupe_source_rows_keeps_unique_auth_required_retest_source():
         }
     )
 
-    rows = importer._dedupe_source_rows([sqlite_row, retest_row])  # pylint: disable=protected-access
+    rows = importer._dedupe_source_rows([sqlite_row, retest_row])
 
     assert rows == [sqlite_row, retest_row]
     assert rows[1]["last_validated_status"] == "auth_required"
@@ -537,7 +537,7 @@ def test_dedupe_source_rows_keeps_unique_auth_required_retest_source():
 def test_alohr_provider_rows_emit_practitioner_location_and_role():
     rows_by_model: dict[type, list[dict[str, Any]]] = {}
 
-    importer._append_alohr_provider_rows(  # pylint: disable=protected-access
+    importer._append_alohr_provider_rows(
         rows_by_model,
         "source_alohr",
         {
@@ -569,7 +569,7 @@ def test_alohr_provider_rows_emit_practitioner_location_and_role():
 
 
 def test_fhir_address_normalizes_numeric_state_fips():
-    address = importer._address(  # pylint: disable=protected-access
+    address = importer._address(
         {
             "address": [
                 {
@@ -587,7 +587,7 @@ def test_fhir_address_normalizes_numeric_state_fips():
 
 
 def test_fhir_address_normalizes_us_numeric_country_code():
-    address = importer._address(  # pylint: disable=protected-access
+    address = importer._address(
         {
             "address": [
                 {
@@ -820,7 +820,7 @@ def test_upsert_changed_row_predicate_ignores_run_metadata_columns():
     table = ProviderDirectoryLocation.__table__
     columns = [column.name for column in table.columns]
     primary_keys = [column.name for column in table.primary_key.columns]
-    statement = importer.pg_insert(table).values(  # pylint: disable=protected-access
+    statement = importer.pg_insert(table).values(
         {
             "source_id": "source_a",
             "resource_id": "loc-1",
@@ -829,7 +829,7 @@ def test_upsert_changed_row_predicate_ignores_run_metadata_columns():
         }
     )
 
-    predicate = importer._upsert_changed_row_predicate(  # pylint: disable=protected-access
+    predicate = importer._upsert_changed_row_predicate(
         table,
         statement,
         columns,
@@ -853,7 +853,7 @@ def test_copy_stage_changed_where_ignores_run_metadata_columns():
     columns = [column.name for column in table.columns]
     primary_keys = [column.name for column in table.primary_key.columns]
 
-    sql = importer._copy_stage_changed_where_sql(  # pylint: disable=protected-access
+    sql = importer._copy_stage_changed_where_sql(
         table,
         columns,
         primary_keys,
@@ -873,12 +873,12 @@ def test_provider_directory_location_upsert_preserves_existing_address_key_when_
     columns = [column.name for column in table.columns]
     primary_keys = [column.name for column in table.primary_key.columns]
 
-    conflict_where = importer._copy_upsert_changed_where_sql(  # pylint: disable=protected-access
+    conflict_where = importer._copy_upsert_changed_where_sql(
         table,
         columns,
         primary_keys,
     )
-    stage_where = importer._copy_stage_changed_where_sql(  # pylint: disable=protected-access
+    stage_where = importer._copy_stage_changed_where_sql(
         table,
         columns,
         primary_keys,
@@ -901,7 +901,7 @@ def test_provider_directory_location_upsert_preserves_existing_address_key_when_
 
 
 def test_provider_directory_source_seed_upsert_preserves_existing_probe_state():
-    sql = importer._effective_update_sql(  # pylint: disable=protected-access
+    sql = importer._effective_update_sql(
         ProviderDirectorySource.__table__,
         "last_probe_status",
         target_prefix="target_row",
@@ -916,7 +916,7 @@ def test_provider_directory_source_seed_upsert_preserves_existing_probe_state():
 
 
 def test_provider_directory_source_seed_upsert_merges_metadata_json():
-    sql = importer._effective_update_sql(  # pylint: disable=protected-access
+    sql = importer._effective_update_sql(
         ProviderDirectorySource.__table__,
         "metadata_json",
         target_prefix="target_row",
@@ -941,7 +941,7 @@ async def test_ensure_provider_directory_model_columns_adds_missing_stale_table_
     monkeypatch.setattr(importer.db, "all", all_mock)
     monkeypatch.setattr(importer.db, "status", status_mock)
 
-    await importer._ensure_provider_directory_model_columns(  # pylint: disable=protected-access
+    await importer._ensure_provider_directory_model_columns(
         ProviderDirectoryLocation,
         "mrf",
     )
@@ -954,31 +954,31 @@ async def test_ensure_provider_directory_model_columns_adds_missing_stale_table_
 
 
 def test_source_catalog_stale_cleanup_only_runs_for_unfiltered_full_refresh():
-    assert importer._source_catalog_stale_cleanup_enabled(  # pylint: disable=protected-access
+    assert importer._source_catalog_stale_cleanup_enabled(
         stale_cleanup=True,
         full_refresh=True,
         source_query=None,
         limit=None,
     )
-    assert not importer._source_catalog_stale_cleanup_enabled(  # pylint: disable=protected-access
+    assert not importer._source_catalog_stale_cleanup_enabled(
         stale_cleanup=True,
         full_refresh=False,
         source_query=None,
         limit=None,
     )
-    assert not importer._source_catalog_stale_cleanup_enabled(  # pylint: disable=protected-access
+    assert not importer._source_catalog_stale_cleanup_enabled(
         stale_cleanup=True,
         full_refresh=True,
         source_query="cigna",
         limit=None,
     )
-    assert not importer._source_catalog_stale_cleanup_enabled(  # pylint: disable=protected-access
+    assert not importer._source_catalog_stale_cleanup_enabled(
         stale_cleanup=True,
         full_refresh=True,
         source_query=None,
         limit=10,
     )
-    assert not importer._source_catalog_stale_cleanup_enabled(  # pylint: disable=protected-access
+    assert not importer._source_catalog_stale_cleanup_enabled(
         stale_cleanup=True,
         full_refresh=True,
         source_query=None,
@@ -992,7 +992,7 @@ async def test_delete_stale_provider_directory_source_catalog_prunes_dependent_r
     status_mock = AsyncMock(return_value=1)
     monkeypatch.setattr(importer.db, "status", status_mock)
 
-    deleted = await importer._delete_stale_provider_directory_source_catalog(  # pylint: disable=protected-access
+    deleted = await importer._delete_stale_provider_directory_source_catalog(
         ["source_b", "source_a", "source_a", ""]
     )
 
@@ -1018,7 +1018,7 @@ async def test_delete_stale_resource_rows_prunes_canonical_source_edges(monkeypa
 
     monkeypatch.setattr(importer.db, "status", fake_status)
 
-    deleted = await importer._delete_stale_resource_rows(  # pylint: disable=protected-access
+    deleted = await importer._delete_stale_resource_rows(
         ProviderDirectoryLocation,
         "source_a",
         "run_1",
@@ -1060,7 +1060,7 @@ async def test_upsert_resource_rows_tracks_seen_and_skips_unchanged(monkeypatch)
     monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
 
     rows = [{"source_id": "source_a", "resource_id": "loc-1"}]
-    written = await importer._upsert_resource_rows(  # pylint: disable=protected-access
+    written = await importer._upsert_resource_rows(
         ProviderDirectoryLocation,
         rows,
         run_id="run_1",
@@ -1117,7 +1117,7 @@ async def test_upsert_resource_rows_batches_location_contact_derivation(monkeypa
             "country_code": "US",
         },
     ]
-    written = await importer._upsert_resource_rows(  # pylint: disable=protected-access
+    written = await importer._upsert_resource_rows(
         ProviderDirectoryLocation,
         rows,
         run_id="run_1",
@@ -1171,7 +1171,7 @@ async def test_upsert_resource_rows_writes_canonical_resource_and_source_edges(m
         },
     ]
 
-    written = await importer._upsert_resource_rows(  # pylint: disable=protected-access
+    written = await importer._upsert_resource_rows(
         ProviderDirectoryLocation,
         rows,
         run_id="run_1",
@@ -1204,7 +1204,7 @@ async def test_upsert_resource_rows_writes_canonical_resource_and_source_edges(m
 async def test_import_alohr_graphql_source_group_writes_existing_resource_tables(monkeypatch):
     calls: list[tuple[str, str | None]] = []
 
-    async def fake_fetch_page(query, root_key, item_key, *, next_token, timeout):  # pylint: disable=unused-argument
+    async def fake_fetch_page(query, root_key, item_key, *, next_token, timeout):
         calls.append((root_key, next_token))
         if root_key == "providers":
             return (
@@ -1244,7 +1244,7 @@ async def test_import_alohr_graphql_source_group_writes_existing_resource_tables
     monkeypatch.setattr(importer, "_fetch_alohr_graphql_page", fake_fetch_page)
     monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
 
-    source_ids, diagnostics, counts, linked_counts, stats, stale, stale_ready = await importer._import_alohr_graphql_source_group(  # pylint: disable=protected-access
+    source_ids, diagnostics, counts, linked_counts, stats, stale, stale_ready = await importer._import_alohr_graphql_source_group(
         [{"source_id": "source_alohr", "api_base": importer.ALOHR_PUBLIC_PROVIDER_DIRECTORY_BASE}],
         resources=["Practitioner", "Location", "PractitionerRole", "Organization", "OrganizationAffiliation"],
         per_resource_limit=0,
@@ -1280,7 +1280,7 @@ async def test_update_source_resource_import_metadata_casts_json_to_jsonb(monkey
 
     monkeypatch.setattr(importer.db, "status", fake_status)
 
-    await importer._update_source_resource_import_metadata(  # pylint: disable=protected-access
+    await importer._update_source_resource_import_metadata(
         ["source_a"],
         run_id="run_1",
         diagnostics={"Practitioner": {"error": "http_401", "rows_fetched": 0}},
@@ -1294,7 +1294,7 @@ async def test_update_source_resource_import_metadata_casts_json_to_jsonb(monkey
 
 
 def test_decode_json_body_accepts_utf8_bom():
-    payload = importer._decode_json_body(  # pylint: disable=protected-access
+    payload = importer._decode_json_body(
         b'\xef\xbb\xbf{"resourceType":"CapabilityStatement","fhirVersion":"4.0.1"}'
     )
 
@@ -1312,7 +1312,7 @@ def test_read_response_body_with_deadline_reads_chunks(monkeypatch):
     monkeypatch.setattr(importer.time, "monotonic", lambda: 100.0)
 
     assert (
-        importer._read_response_body_with_deadline(  # pylint: disable=protected-access
+        importer._read_response_body_with_deadline(
             FakeResponse(),
             timeout=10,
         )
@@ -1329,17 +1329,17 @@ def test_read_response_body_with_deadline_times_out(monkeypatch):
     monkeypatch.setattr(importer.time, "monotonic", lambda: next(timestamps))
 
     with pytest.raises(TimeoutError):
-        importer._read_response_body_with_deadline(  # pylint: disable=protected-access
+        importer._read_response_body_with_deadline(
             FakeResponse(),
             timeout=10,
         )
 
 
 def test_candidate_metadata_urls_repairs_resource_and_provider_directory_suffixes():
-    humana = importer._candidate_metadata_urls(  # pylint: disable=protected-access
+    humana = importer._candidate_metadata_urls(
         {"api_base": "https://fhir.humana.com/api/provider-directory/"}
     )
-    maine = importer._candidate_metadata_urls(  # pylint: disable=protected-access
+    maine = importer._candidate_metadata_urls(
         {"api_base": "https://maineproviderdirectory.verityanalytics.org/fhir/Practitioner"}
     )
 
@@ -1354,15 +1354,15 @@ def test_candidate_metadata_urls_repairs_resource_and_provider_directory_suffixe
 
 
 def test_candidate_metadata_urls_ignores_non_absolute_catalog_values():
-    assert importer._candidate_metadata_urls({"api_base": "UNCONFIRMED"}) == []  # pylint: disable=protected-access
-    assert importer._candidate_metadata_urls({"api_base": "N/A"}) == []  # pylint: disable=protected-access
+    assert importer._candidate_metadata_urls({"api_base": "UNCONFIRMED"}) == []
+    assert importer._candidate_metadata_urls({"api_base": "N/A"}) == []
 
 
 def test_provider_directory_credentials_resolve_env_headers_and_query(monkeypatch):
     monkeypatch.setenv("PAYER_DIRECTORY_KEY", "secret-key")
     monkeypatch.setenv("PAYER_DIRECTORY_CLIENT", "client-1")
     monkeypatch.setenv(
-        importer.PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV,  # pylint: disable=protected-access
+        importer.PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV,
         json.dumps(
             {
                 "hosts": {
@@ -1375,7 +1375,7 @@ def test_provider_directory_credentials_resolve_env_headers_and_query(monkeypatc
         ),
     )
 
-    options = importer._credential_request_options_for_source(  # pylint: disable=protected-access
+    options = importer._credential_request_options_for_source(
         {"source_id": "source_a", "api_base": "https://payer.example/fhir"},
         "https://payer.example/fhir/metadata",
     )
@@ -1393,7 +1393,7 @@ def test_provider_directory_credentials_resolve_generated_api_key_template(monke
     monkeypatch.setenv("PAYER_DIRECTORY_API_KEY_HEADER", "Ocp-Apim-Subscription-Key")
     monkeypatch.setenv("PAYER_DIRECTORY_API_KEY", "secret-key")
     monkeypatch.setenv(
-        importer.PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV,  # pylint: disable=protected-access
+        importer.PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV,
         json.dumps(
             {
                 "hosts": {
@@ -1408,7 +1408,7 @@ def test_provider_directory_credentials_resolve_generated_api_key_template(monke
         ),
     )
 
-    options = importer._credential_request_options_for_source(  # pylint: disable=protected-access
+    options = importer._credential_request_options_for_source(
         {"source_id": "source_a", "api_base": "https://payer.example/fhir"},
         "https://payer.example/fhir/metadata",
     )
@@ -1423,8 +1423,8 @@ def test_provider_directory_credentials_resolve_generated_api_key_template(monke
 
 
 def test_provider_directory_credentials_resolve_task_file_override(monkeypatch, tmp_path):
-    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV, raising=False)  # pylint: disable=protected-access
-    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV, raising=False)  # pylint: disable=protected-access
+    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV, raising=False)
+    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV, raising=False)
     monkeypatch.setenv("PAYER_DIRECTORY_KEY", "secret-key")
     config_path = tmp_path / "provider-directory-credentials.json"
     config_path.write_text(
@@ -1439,14 +1439,14 @@ def test_provider_directory_credentials_resolve_task_file_override(monkeypatch, 
         ),
         encoding="utf-8",
     )
-    token = importer._PROVIDER_DIRECTORY_CREDENTIALS_FILE_OVERRIDE.set(str(config_path))  # pylint: disable=protected-access
+    token = importer._PROVIDER_DIRECTORY_CREDENTIALS_FILE_OVERRIDE.set(str(config_path))
     try:
-        options = importer._credential_request_options_for_source(  # pylint: disable=protected-access
+        options = importer._credential_request_options_for_source(
             {"source_id": "source_a", "api_base": "https://payer.example/fhir"},
             "https://payer.example/fhir/metadata",
         )
     finally:
-        importer._PROVIDER_DIRECTORY_CREDENTIALS_FILE_OVERRIDE.reset(token)  # pylint: disable=protected-access
+        importer._PROVIDER_DIRECTORY_CREDENTIALS_FILE_OVERRIDE.reset(token)
 
     assert options["headers"] == {"X-API-Key": "secret-key"}
     assert options["query_params"] == {}
@@ -1462,7 +1462,7 @@ def test_provider_directory_credentials_resolve_oauth2_client_credentials(monkey
     monkeypatch.setenv("PAYER_DIRECTORY_CLIENT_ID", "client-id")
     monkeypatch.setenv("PAYER_DIRECTORY_CLIENT_SECRET", "client-secret")
     monkeypatch.setenv(
-        importer.PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV,  # pylint: disable=protected-access
+        importer.PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV,
         json.dumps(
             {
                 "api_bases": {
@@ -1484,7 +1484,7 @@ def test_provider_directory_credentials_resolve_oauth2_client_credentials(monkey
         lambda _oauth2: "oauth-token",
     )
 
-    options = importer._credential_request_options_for_source(  # pylint: disable=protected-access
+    options = importer._credential_request_options_for_source(
         {"source_id": "source_a", "api_base": "https://payer.example/fhir"},
         "https://payer.example/fhir/Practitioner?_count=1",
     )
@@ -1499,7 +1499,7 @@ def test_provider_directory_credentials_resolve_oauth2_client_credentials(monkey
 
 
 def test_oauth2_client_credentials_token_request_uses_basic_auth_and_cache(monkeypatch):
-    importer._OAUTH_TOKEN_CACHE.clear()  # pylint: disable=protected-access
+    importer._OAUTH_TOKEN_CACHE.clear()
     calls = []
 
     class FakeResponse:
@@ -1535,8 +1535,8 @@ def test_oauth2_client_credentials_token_request_uses_basic_auth_and_cache(monke
         "client_secret": "env:PAYER_DIRECTORY_CLIENT_SECRET",
         "scope": "system/*.read",
     }
-    first = importer._fetch_oauth2_client_credentials_token_sync(oauth2)  # pylint: disable=protected-access
-    second = importer._fetch_oauth2_client_credentials_token_sync(oauth2)  # pylint: disable=protected-access
+    first = importer._fetch_oauth2_client_credentials_token_sync(oauth2)
+    second = importer._fetch_oauth2_client_credentials_token_sync(oauth2)
 
     assert first == "token-1"
     assert second == "token-1"
@@ -1550,11 +1550,11 @@ def test_oauth2_client_credentials_token_request_uses_basic_auth_and_cache(monke
 def test_provider_directory_credentials_do_not_apply_to_cross_host_reference(monkeypatch):
     monkeypatch.setenv("PAYER_DIRECTORY_KEY", "secret-key")
     monkeypatch.setenv(
-        importer.PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV,  # pylint: disable=protected-access
+        importer.PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV,
         json.dumps({"hosts": {"payer.example": {"headers": {"X-API-Key": "env:PAYER_DIRECTORY_KEY"}}}}),
     )
 
-    options = importer._credential_request_options_for_source(  # pylint: disable=protected-access
+    options = importer._credential_request_options_for_source(
         {"source_id": "source_a", "api_base": "https://payer.example/fhir"},
         "https://other.example/fhir/Location/1",
     )
@@ -1566,11 +1566,11 @@ def test_provider_directory_credentials_do_not_apply_to_cross_host_reference(mon
 async def test_probe_sources_records_credential_descriptor_without_secret(monkeypatch):
     monkeypatch.setenv("PAYER_DIRECTORY_TOKEN", "secret-token")
     monkeypatch.setenv(
-        importer.PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV,  # pylint: disable=protected-access
+        importer.PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV,
         json.dumps({"sources": {"source_a": {"bearer_token": "env:PAYER_DIRECTORY_TOKEN"}}}),
     )
 
-    async def fake_fetch_json_with_options(url, *, timeout, extra_headers=None, query_params=None):  # pylint: disable=unused-argument
+    async def fake_fetch_json_with_options(url, *, timeout, extra_headers=None, query_params=None):
         assert url == "https://payer.example/fhir/metadata?_format=json"
         assert extra_headers == {"Authorization": "Bearer secret-token"}
         assert query_params == {}
@@ -1601,7 +1601,7 @@ async def test_probe_sources_records_credential_descriptor_without_secret(monkey
         "canonical_api_base": "https://payer.example/fhir",
         "metadata_json": {},
     }
-    await importer._probe_sources(  # pylint: disable=protected-access
+    await importer._probe_sources(
         [source],
         timeout=3,
         concurrency=1,
@@ -1622,7 +1622,7 @@ async def test_probe_sources_records_credential_descriptor_without_secret(monkey
 
 @pytest.mark.asyncio
 async def test_probe_sources_marks_source_timeout_when_probe_exceeds_hard_deadline(monkeypatch):
-    async def fake_probe_source(_source, *, timeout, run_id):  # pylint: disable=unused-argument
+    async def fake_probe_source(_source, *, timeout, run_id):
         await asyncio.sleep(1)
         return {"status": "valid"}, {"resourceType": "CapabilityStatement"}
 
@@ -1636,7 +1636,7 @@ async def test_probe_sources_marks_source_timeout_when_probe_exceeds_hard_deadli
     monkeypatch.setattr(importer, "_source_probe_hard_timeout_seconds", lambda _source, *, timeout: 0.01)
     monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
 
-    probed, valid, valid_source_ids = await importer._probe_sources(  # pylint: disable=protected-access
+    probed, valid, valid_source_ids = await importer._probe_sources(
         [
             {
                 "source_id": "source_timeout",
@@ -1661,15 +1661,15 @@ async def test_probe_sources_marks_source_timeout_when_probe_exceeds_hard_deadli
 
 @pytest.mark.asyncio
 async def test_probe_source_classifies_declared_credentialed_non_fhir_as_auth_required(monkeypatch):
-    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV, raising=False)  # pylint: disable=protected-access
-    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV, raising=False)  # pylint: disable=protected-access
+    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV, raising=False)
+    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV, raising=False)
 
-    async def fake_fetch_source_json(source, url, *, timeout):  # pylint: disable=unused-argument
+    async def fake_fetch_source_json(source, url, *, timeout):
         raise AssertionError("credential-gated sources without credentials should not be fetched")
 
     monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_source_json)
 
-    probe, payload = await importer._probe_source(  # pylint: disable=protected-access
+    probe, payload = await importer._probe_source(
         {
             "source_id": "source_a",
             "api_base": "https://apps.availity.com/availity/public-fhir/fhir/v1/example/r4",
@@ -1689,15 +1689,15 @@ async def test_probe_source_classifies_declared_credentialed_non_fhir_as_auth_re
 
 @pytest.mark.asyncio
 async def test_probe_source_classifies_declared_credentialed_metadata_as_auth_required_without_credentials(monkeypatch):
-    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV, raising=False)  # pylint: disable=protected-access
-    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV, raising=False)  # pylint: disable=protected-access
+    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV, raising=False)
+    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV, raising=False)
 
-    async def fake_fetch_source_json(source, url, *, timeout):  # pylint: disable=unused-argument
+    async def fake_fetch_source_json(source, url, *, timeout):
         raise AssertionError("credential-gated sources without credentials should not be fetched")
 
     monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_source_json)
 
-    probe, payload = await importer._probe_source(  # pylint: disable=protected-access
+    probe, payload = await importer._probe_source(
         {
             "source_id": "source_a",
             "api_base": "https://payer.example/fhir",
@@ -1717,15 +1717,15 @@ async def test_probe_source_classifies_declared_credentialed_metadata_as_auth_re
 
 @pytest.mark.asyncio
 async def test_probe_source_classifies_known_onboarding_gateway_without_credentials_as_auth_required(monkeypatch):
-    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV, raising=False)  # pylint: disable=protected-access
-    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV, raising=False)  # pylint: disable=protected-access
+    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV, raising=False)
+    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV, raising=False)
 
-    async def fake_fetch_source_json(source, url, *, timeout):  # pylint: disable=unused-argument
+    async def fake_fetch_source_json(source, url, *, timeout):
         raise AssertionError("known onboarding gateways without credentials should not be fetched")
 
     monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_source_json)
 
-    probe, payload = await importer._probe_source(  # pylint: disable=protected-access
+    probe, payload = await importer._probe_source(
         {
             "source_id": "source_availity",
             "api_base": "https://apps.availity.com/availity/public-fhir/fhir/v1/example/r4",
@@ -1744,15 +1744,15 @@ async def test_probe_source_classifies_known_onboarding_gateway_without_credenti
 
 @pytest.mark.asyncio
 async def test_probe_source_classifies_cms_public_no_seed_as_auth_required(monkeypatch):
-    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV, raising=False)  # pylint: disable=protected-access
-    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV, raising=False)  # pylint: disable=protected-access
+    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV, raising=False)
+    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV, raising=False)
 
-    async def fake_fetch_source_json(source, url, *, timeout):  # pylint: disable=unused-argument
+    async def fake_fetch_source_json(source, url, *, timeout):
         raise AssertionError("CMS Public=No provider directory sources without credentials should not be fetched")
 
     monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_source_json)
 
-    probe, payload = await importer._probe_source(  # pylint: disable=protected-access
+    probe, payload = await importer._probe_source(
         {
             "source_id": "source_non_public",
             "api_base": "https://us120.fhir.m3.edifecsfedcloud.com/nd_pd",
@@ -1775,10 +1775,10 @@ async def test_probe_source_classifies_cms_public_no_seed_as_auth_required(monke
 
 @pytest.mark.asyncio
 async def test_probe_sources_does_not_count_credentialed_metadata_without_credentials_as_valid(monkeypatch):
-    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV, raising=False)  # pylint: disable=protected-access
-    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV, raising=False)  # pylint: disable=protected-access
+    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV, raising=False)
+    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV, raising=False)
 
-    async def fake_fetch_source_json(source, url, *, timeout):  # pylint: disable=unused-argument
+    async def fake_fetch_source_json(source, url, *, timeout):
         return (
             200,
             {
@@ -1807,7 +1807,7 @@ async def test_probe_sources_does_not_count_credentialed_metadata_without_creden
         "auth_type": "OAuth2/SMART",
         "requires_registration": True,
     }
-    probed, valid, valid_source_ids = await importer._probe_sources(  # pylint: disable=protected-access
+    probed, valid, valid_source_ids = await importer._probe_sources(
         [source],
         timeout=3,
         concurrency=1,
@@ -1824,10 +1824,10 @@ async def test_probe_sources_does_not_count_credentialed_metadata_without_creden
 
 @pytest.mark.asyncio
 async def test_probe_source_keeps_alohr_graphql_connector_valid_without_fhir_credentials(monkeypatch):
-    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV, raising=False)  # pylint: disable=protected-access
-    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV, raising=False)  # pylint: disable=protected-access
+    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV, raising=False)
+    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV, raising=False)
 
-    async def fake_fetch_source_json(source, url, *, timeout):  # pylint: disable=unused-argument
+    async def fake_fetch_source_json(source, url, *, timeout):
         return (
             200,
             {
@@ -1841,7 +1841,7 @@ async def test_probe_source_keeps_alohr_graphql_connector_valid_without_fhir_cre
 
     monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_source_json)
 
-    probe, payload = await importer._probe_source(  # pylint: disable=protected-access
+    probe, payload = await importer._probe_source(
         {
             "source_id": "source_alohr",
             "api_base": importer.ALOHR_FHIR_PROVIDER_DIRECTORY_BASE,
@@ -1860,15 +1860,15 @@ async def test_probe_source_keeps_alohr_graphql_connector_valid_without_fhir_cre
 
 @pytest.mark.asyncio
 async def test_probe_source_classifies_known_onboarding_gateway_non_fhir_as_auth_required(monkeypatch):
-    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV, raising=False)  # pylint: disable=protected-access
-    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV, raising=False)  # pylint: disable=protected-access
+    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV, raising=False)
+    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV, raising=False)
 
-    async def fake_fetch_source_json(source, url, *, timeout):  # pylint: disable=unused-argument
+    async def fake_fetch_source_json(source, url, *, timeout):
         raise AssertionError("known onboarding gateways without credentials should not be fetched")
 
     monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_source_json)
 
-    probe, payload = await importer._probe_source(  # pylint: disable=protected-access
+    probe, payload = await importer._probe_source(
         {
             "source_id": "source_a",
             "api_base": "https://apps.availity.com/availity/public-fhir/fhir/v1/alignmenthealth/r4",
@@ -1888,15 +1888,15 @@ async def test_probe_source_classifies_known_onboarding_gateway_non_fhir_as_auth
 
 @pytest.mark.asyncio
 async def test_probe_source_keeps_open_non_fhir_as_valid_non_fhir(monkeypatch):
-    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV, raising=False)  # pylint: disable=protected-access
-    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV, raising=False)  # pylint: disable=protected-access
+    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV, raising=False)
+    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV, raising=False)
 
-    async def fake_fetch_source_json(source, url, *, timeout):  # pylint: disable=unused-argument
+    async def fake_fetch_source_json(source, url, *, timeout):
         return 200, None, None, 14
 
     monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_source_json)
 
-    probe, payload = await importer._probe_source(  # pylint: disable=protected-access
+    probe, payload = await importer._probe_source(
         {
             "source_id": "source_a",
             "api_base": "https://payer.example/fhir",
@@ -1941,7 +1941,7 @@ def test_parse_capability_extracts_resources_and_search_params():
 
 @pytest.mark.asyncio
 async def test_probe_sources_persists_resolved_api_base_for_repaired_catalog_url(monkeypatch):
-    async def fake_fetch_json(url, *, timeout):  # pylint: disable=unused-argument
+    async def fake_fetch_json(url, *, timeout):
         if url == "https://fhir.humana.com/api/metadata?_format=json":
             return (
                 200,
@@ -1964,7 +1964,7 @@ async def test_probe_sources_persists_resolved_api_base_for_repaired_catalog_url
     monkeypatch.setattr(importer, "_fetch_json", fake_fetch_json)
     monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
 
-    source = importer._source_row_from_seed(  # pylint: disable=protected-access
+    source = importer._source_row_from_seed(
         {
             "id": "humana",
             "org_name": "Humana",
@@ -1973,7 +1973,7 @@ async def test_probe_sources_persists_resolved_api_base_for_repaired_catalog_url
         }
     )
 
-    probed, valid, valid_source_ids = await importer._probe_sources(  # pylint: disable=protected-access
+    probed, valid, valid_source_ids = await importer._probe_sources(
         [source],
         timeout=3,
         concurrency=1,
@@ -2229,26 +2229,26 @@ def test_provider_directory_location_address_key_sql_uses_shared_canonical_funct
 
 
 def test_reference_resource_key_handles_relative_and_absolute_fhir_refs():
-    assert importer._reference_resource_key("Location/loc-1", "Location") == (  # pylint: disable=protected-access
+    assert importer._reference_resource_key("Location/loc-1", "Location") == (
         "Location",
         "loc-1",
     )
-    assert importer._reference_resource_key(  # pylint: disable=protected-access
+    assert importer._reference_resource_key(
         "https://example.test/fhir/Practitioner/prac%7C1",
         "Practitioner",
     ) == ("Practitioner", "prac|1")
-    assert importer._reference_resource_key("Organization/org-1", "Location") is None  # pylint: disable=protected-access
+    assert importer._reference_resource_key("Organization/org-1", "Location") is None
 
 
 def test_sql_ref_matches_resource_accepts_absolute_url_suffixes():
-    sql = importer._sql_ref_matches_resource("refs.ref", "Organization", "org.resource_id")  # pylint: disable=protected-access
+    sql = importer._sql_ref_matches_resource("refs.ref", "Organization", "org.resource_id")
 
     assert "refs.ref IN (org.resource_id, 'Organization/' || org.resource_id)" in sql
     assert "refs.ref LIKE '%/Organization/' || org.resource_id" in sql
 
 
 def test_linked_resource_candidate_urls_use_network_endpoint_for_network_refs():
-    urls = importer._linked_resource_candidate_urls(  # pylint: disable=protected-access
+    urls = importer._linked_resource_candidate_urls(
         {
             "api_base": "https://example.test/fhir",
             "endpoint_organization": "Organization",
@@ -2267,7 +2267,7 @@ def test_linked_resource_candidate_urls_use_network_endpoint_for_network_refs():
 
 
 def test_linked_resource_candidate_urls_use_organization_endpoint_for_owner_refs():
-    urls = importer._linked_resource_candidate_urls(  # pylint: disable=protected-access
+    urls = importer._linked_resource_candidate_urls(
         {
             "api_base": "https://example.test/fhir",
             "endpoint_organization": "Organization?type=prov",
@@ -2286,7 +2286,7 @@ def test_linked_resource_candidate_urls_use_organization_endpoint_for_owner_refs
 
 
 def test_linked_resource_candidate_urls_use_endpoint_endpoint_for_endpoint_refs():
-    urls = importer._linked_resource_candidate_urls(  # pylint: disable=protected-access
+    urls = importer._linked_resource_candidate_urls(
         {
             "api_base": "https://example.test/fhir",
             "endpoint_endpoint": "Endpoint?connection-type=hl7-fhir-rest",
@@ -2305,7 +2305,7 @@ def test_linked_resource_candidate_urls_use_endpoint_endpoint_for_endpoint_refs(
 
 @pytest.mark.asyncio
 async def test_import_linked_resource_rows_fetches_role_references_and_upserts(monkeypatch):
-    async def fake_fetch_json(url, *, timeout):  # pylint: disable=unused-argument
+    async def fake_fetch_json(url, *, timeout):
         if "/Practitioner/prac-1" in url:
             return 200, {"resourceType": "Practitioner", "id": "prac-1"}, None, 5
         if "/Location/loc-1" in url:
@@ -2334,7 +2334,7 @@ async def test_import_linked_resource_rows_fetches_role_references_and_upserts(m
     monkeypatch.setattr(importer, "_fetch_json", fake_fetch_json)
     monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
 
-    counts = await importer._import_linked_resource_rows(  # pylint: disable=protected-access
+    counts = await importer._import_linked_resource_rows(
         {"source_id": "source_a", "api_base": "https://example.test/fhir"},
         {
             "PractitionerRole": [
@@ -2397,7 +2397,7 @@ async def test_import_linked_resource_rows_fetches_role_references_and_upserts(m
 async def test_import_linked_resource_rows_fetches_network_organization_from_network_endpoint(monkeypatch):
     calls: list[str] = []
 
-    async def fake_fetch_json(url, *, timeout):  # pylint: disable=unused-argument
+    async def fake_fetch_json(url, *, timeout):
         calls.append(url)
         if "type=ntwk" in url:
             return 200, {"resourceType": "Bundle", "entry": [{"resource": {"resourceType": "Organization", "id": "network-1", "name": "Gold Network"}}]}, None, 5
@@ -2412,7 +2412,7 @@ async def test_import_linked_resource_rows_fetches_network_organization_from_net
     monkeypatch.setattr(importer, "_fetch_json", fake_fetch_json)
     monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
 
-    counts = await importer._import_linked_resource_rows(  # pylint: disable=protected-access
+    counts = await importer._import_linked_resource_rows(
         {
             "source_id": "source_a",
             "api_base": "https://example.test/fhir",
@@ -2447,7 +2447,7 @@ async def test_import_linked_resource_rows_fetches_network_organization_from_net
 
 @pytest.mark.asyncio
 async def test_import_linked_resource_rows_reports_progress_when_flushing(monkeypatch):
-    async def fake_fetch_json(url, *, timeout):  # pylint: disable=unused-argument
+    async def fake_fetch_json(url, *, timeout):
         if "/Practitioner/prac-1" in url:
             return 200, {"resourceType": "Practitioner", "id": "prac-1"}, None, 5
         if "/Location/loc-1" in url:
@@ -2474,7 +2474,7 @@ async def test_import_linked_resource_rows_reports_progress_when_flushing(monkey
     monkeypatch.setattr(importer, "_fetch_json", fake_fetch_json)
     monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
 
-    counts = await importer._import_linked_resource_rows(  # pylint: disable=protected-access
+    counts = await importer._import_linked_resource_rows(
         {"source_id": "source_a", "api_base": "https://example.test/fhir"},
         {
             "PractitionerRole": [
@@ -2500,7 +2500,7 @@ async def test_import_linked_resource_rows_reports_progress_when_flushing(monkey
 async def test_import_resources_accumulates_linked_resource_counts(monkeypatch):
     _stub_resource_import_metadata(monkeypatch)
 
-    async def fake_fetch_resource_rows(source, resource_type, **_kwargs):  # pylint: disable=unused-argument
+    async def fake_fetch_resource_rows(source, resource_type, **_kwargs):
         if resource_type != "PractitionerRole":
             return None
         return importer.ResourceFetchResult(
@@ -2537,7 +2537,7 @@ async def test_import_resources_accumulates_linked_resource_counts(monkeypatch):
     monkeypatch.setattr(importer, "_import_linked_resource_rows", fake_import_linked)
 
     linked_counts = {}
-    counts = await importer._import_resources(  # pylint: disable=protected-access
+    counts = await importer._import_resources(
         [{"source_id": "source_a", "api_base": "https://example.test/fhir"}],
         resources=["PractitionerRole"],
         per_resource_limit=1,
@@ -3108,7 +3108,7 @@ def test_dedupe_rows_by_primary_key_keeps_last_live_fhir_duplicate():
         {"source_id": "source_a", "resource_id": "prac-2", "full_name": "Other"},
     ]
 
-    deduped = importer._dedupe_rows_by_primary_key(["source_id", "resource_id"], rows)  # pylint: disable=protected-access
+    deduped = importer._dedupe_rows_by_primary_key(["source_id", "resource_id"], rows)
 
     assert deduped == [
         {"source_id": "source_a", "resource_id": "prac-1", "full_name": "New"},
@@ -3117,9 +3117,9 @@ def test_dedupe_rows_by_primary_key_keeps_last_live_fhir_duplicate():
 
 
 def test_max_rows_per_statement_stays_under_asyncpg_parameter_limit():
-    assert importer._max_rows_per_statement(1) == 500  # pylint: disable=protected-access
-    assert importer._max_rows_per_statement(100) == 300  # pylint: disable=protected-access
-    assert importer._max_rows_per_statement(40000) == 1  # pylint: disable=protected-access
+    assert importer._max_rows_per_statement(1) == 500
+    assert importer._max_rows_per_statement(100) == 300
+    assert importer._max_rows_per_statement(40000) == 1
 
 
 class _FakeCopyDriver:
@@ -3178,7 +3178,7 @@ async def test_copy_upsert_rows_uses_temp_copy_and_changed_predicate(monkeypatch
         }
     )
 
-    written = await importer._copy_upsert_rows(  # pylint: disable=protected-access
+    written = await importer._copy_upsert_rows(
         ProviderDirectoryLocation,
         [row],
         columns,
@@ -3203,7 +3203,7 @@ async def test_copy_upsert_rows_uses_temp_copy_and_changed_predicate(monkeypatch
     ) in conn.statements[2]
     assert 'ELSE "provider_directory_location"."address_key" END' in conn.statements[2]
 
-    where_sql = importer._copy_upsert_changed_where_sql(  # pylint: disable=protected-access
+    where_sql = importer._copy_upsert_changed_where_sql(
         table,
         columns,
         ["source_id", "resource_id"],
@@ -3220,7 +3220,7 @@ async def test_copy_mark_resource_rows_seen_uses_distinct_stage_merge(monkeypatc
     monkeypatch.setattr(importer.db, "acquire", lambda: _FakeAcquire(conn))
     monkeypatch.setattr(importer, "_stage_table_name", lambda: "pd_seen_test")
 
-    written = await importer._copy_mark_resource_rows_seen(  # pylint: disable=protected-access
+    written = await importer._copy_mark_resource_rows_seen(
         "Location",
         [("source_a", "loc-1"), ("source_a", "loc-1"), ("source_a", "loc-2")],
         "run_1",
@@ -3240,7 +3240,7 @@ async def test_copy_mark_resource_rows_seen_appends_to_run_stage_without_indexed
     conn = _FakeAcquireConnection()
     monkeypatch.setattr(importer.db, "acquire", lambda: _FakeAcquire(conn))
 
-    written = await importer._copy_mark_resource_rows_seen(  # pylint: disable=protected-access
+    written = await importer._copy_mark_resource_rows_seen(
         "Location",
         [("source_a", "loc-1"), ("source_a", "loc-2")],
         "run_1",
@@ -3269,7 +3269,7 @@ async def test_import_resources_can_preserve_seen_stage_for_publish(monkeypatch)
     monkeypatch.setattr(importer, "_ensure_provider_directory_import_seen_stage_table", ensure_stage)
     monkeypatch.setattr(importer, "_drop_provider_directory_import_seen_stage_table", drop_stage)
 
-    counts = await importer._import_resources(  # pylint: disable=protected-access
+    counts = await importer._import_resources(
         [],
         resources=["Location"],
         per_resource_limit=0,
@@ -3296,7 +3296,7 @@ async def test_ensure_provider_directory_seen_table_drops_redundant_prefix_index
 
     monkeypatch.setattr(importer.db, "status", fake_status)
 
-    await importer._ensure_provider_directory_import_seen_table("mrf")  # pylint: disable=protected-access
+    await importer._ensure_provider_directory_import_seen_table("mrf")
 
     combined = "\n".join(statements)
     assert 'CREATE UNLOGGED TABLE IF NOT EXISTS "mrf"."provider_directory_import_seen"' in combined
@@ -3305,7 +3305,7 @@ async def test_ensure_provider_directory_seen_table_drops_redundant_prefix_index
 
 
 def test_resource_start_url_prefers_endpoint_and_preserves_existing_count():
-    url = importer._resource_start_url(  # pylint: disable=protected-access
+    url = importer._resource_start_url(
         {
             "api_base": "https://example.test/fhir",
             "endpoint_practitioner": "https://payer.example/custom/Practitioner?active=true&_count=20",
@@ -3318,7 +3318,7 @@ def test_resource_start_url_prefers_endpoint_and_preserves_existing_count():
 
 
 def test_resource_start_url_resolves_relative_endpoint_and_adds_count():
-    url = importer._resource_start_url(  # pylint: disable=protected-access
+    url = importer._resource_start_url(
         {
             "api_base": "https://example.test/fhir/base",
             "endpoint_location": "Location?address-state=CA",
@@ -3333,7 +3333,7 @@ def test_resource_start_url_resolves_relative_endpoint_and_adds_count():
 def test_resource_start_url_bounds_count_by_configured_max(monkeypatch):
     monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_MAX_PAGE_COUNT", "500")
 
-    url = importer._resource_start_url(  # pylint: disable=protected-access
+    url = importer._resource_start_url(
         {"api_base": "https://example.test/fhir"},
         "HealthcareService",
         page_count=1000,
@@ -3343,7 +3343,7 @@ def test_resource_start_url_bounds_count_by_configured_max(monkeypatch):
 
 
 def test_resource_start_url_ignores_catalog_annotation_endpoint():
-    url = importer._resource_start_url(  # pylint: disable=protected-access
+    url = importer._resource_start_url(
         {
             "api_base": "https://fhir.humana.com/api",
             "endpoint_location": "/api/provider-directory/Location (HTTP 400 - may need query parameters)",
@@ -3356,7 +3356,7 @@ def test_resource_start_url_ignores_catalog_annotation_endpoint():
 
 
 def test_resource_start_url_ignores_unreachable_catalog_endpoint():
-    url = importer._resource_start_url(  # pylint: disable=protected-access
+    url = importer._resource_start_url(
         {
             "api_base": "https://fp.medicaid.utah.gov/ProviderDirectoryServices",
             "endpoint_location": (
@@ -3372,17 +3372,17 @@ def test_resource_start_url_ignores_unreachable_catalog_endpoint():
 
 
 def test_resource_start_urls_partitions_scan_too_costly_resources():
-    practitioner_urls = importer._resource_start_urls(  # pylint: disable=protected-access
+    practitioner_urls = importer._resource_start_urls(
         {"api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE},
         "Practitioner",
         page_count=25,
     )
-    location_urls = importer._resource_start_urls(  # pylint: disable=protected-access
+    location_urls = importer._resource_start_urls(
         {"api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE},
         "Location",
         page_count=25,
     )
-    plan_urls = importer._resource_start_urls(  # pylint: disable=protected-access
+    plan_urls = importer._resource_start_urls(
         {"api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE},
         "InsurancePlan",
         page_count=25,
@@ -3407,7 +3407,7 @@ def test_resource_start_urls_partitions_scan_too_costly_resources():
 async def test_fetch_resource_rows_continues_after_scan_partition_error(monkeypatch):
     calls: list[str] = []
 
-    async def fake_fetch_json(_source, url, *, timeout):  # pylint: disable=unused-argument
+    async def fake_fetch_json(_source, url, *, timeout):
         calls.append(url)
         if "name=A" in url:
             return 413, {"resourceType": "OperationOutcome"}, None, 5
@@ -3441,7 +3441,7 @@ async def test_fetch_resource_rows_continues_after_scan_partition_error(monkeypa
 
     monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_json)
 
-    result = await importer._fetch_resource_rows(  # pylint: disable=protected-access
+    result = await importer._fetch_resource_rows(
         {
             "source_id": "scan",
             "api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE,
@@ -3470,13 +3470,13 @@ async def test_fetch_resource_rows_continues_after_scan_partition_error(monkeypa
 async def test_fetch_resource_rows_defers_scan_practitioner_role_reverse_lookup(monkeypatch):
     calls: list[str] = []
 
-    async def fake_fetch_json(_source, url, *, timeout):  # pylint: disable=unused-argument
+    async def fake_fetch_json(_source, url, *, timeout):
         calls.append(url)
         raise AssertionError("SCAN PractitionerRole should not use a broad paged search")
 
     monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_json)
 
-    result = await importer._fetch_resource_rows(  # pylint: disable=protected-access
+    result = await importer._fetch_resource_rows(
         {
             "source_id": "scan",
             "api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE,
@@ -3503,7 +3503,7 @@ async def test_fetch_resource_rows_defers_scan_practitioner_role_reverse_lookup(
 async def test_fetch_scan_practitioner_role_rows_reverse_looks_up_by_practitioner(monkeypatch):
     calls: list[str] = []
 
-    async def fake_fetch_json(_source, url, *, timeout):  # pylint: disable=unused-argument
+    async def fake_fetch_json(_source, url, *, timeout):
         calls.append(url)
         return (
             200,
@@ -3527,7 +3527,7 @@ async def test_fetch_scan_practitioner_role_rows_reverse_looks_up_by_practitione
 
     monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_json)
 
-    result = await importer._fetch_scan_practitioner_role_rows(  # pylint: disable=protected-access
+    result = await importer._fetch_scan_practitioner_role_rows(
         {
             "source_id": "scan",
             "api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE,
@@ -3555,7 +3555,7 @@ async def test_fetch_scan_practitioner_role_rows_reverse_looks_up_by_practitione
 async def test_import_resources_fetches_scan_practitioner_roles_after_practitioners(monkeypatch):
     _stub_resource_import_metadata(monkeypatch)
 
-    async def fake_fetch_resource_rows(source, resource_type, **_kwargs):  # pylint: disable=unused-argument
+    async def fake_fetch_resource_rows(source, resource_type, **_kwargs):
         if resource_type == "PractitionerRole":
             raise AssertionError("SCAN PractitionerRole should be reverse-looked-up after practitioners")
         if resource_type != "Practitioner":
@@ -3581,7 +3581,7 @@ async def test_import_resources_fetches_scan_practitioner_roles_after_practition
 
     role_calls: list[str] = []
 
-    async def fake_fetch_source_json(_source, url, *, timeout):  # pylint: disable=unused-argument
+    async def fake_fetch_source_json(_source, url, *, timeout):
         role_calls.append(url)
         return (
             200,
@@ -3613,7 +3613,7 @@ async def test_import_resources_fetches_scan_practitioner_roles_after_practition
     monkeypatch.setattr(importer, "_upsert_resource_rows", fake_upsert_resource_rows)
 
     resource_fetch_stats: dict[str, dict[str, Any]] = {}
-    counts = await importer._import_resources(  # pylint: disable=protected-access
+    counts = await importer._import_resources(
         [
             {
                 "source_id": "scan",
@@ -3643,7 +3643,7 @@ async def test_import_resources_fetches_scan_practitioner_roles_after_practition
 
 
 def test_bulk_export_start_url_uses_base_export_operation():
-    url = importer._bulk_export_start_url(  # pylint: disable=protected-access
+    url = importer._bulk_export_start_url(
         {"api_base": "https://example.test/fhir/"},
         "PractitionerRole",
     )
@@ -3655,15 +3655,15 @@ def test_bulk_export_start_url_uses_base_export_operation():
 
 
 def test_bulk_export_pre_stream_failures_fall_back_to_paged_reads():
-    assert importer._bulk_export_pre_stream_should_fallback(500, None) is True  # pylint: disable=protected-access
-    assert importer._bulk_export_pre_stream_should_fallback(401, None) is True  # pylint: disable=protected-access
-    assert importer._bulk_export_pre_stream_should_fallback(None, "timeout") is True  # pylint: disable=protected-access
-    assert importer._bulk_export_pre_stream_should_fallback(202, None) is False  # pylint: disable=protected-access
-    assert importer._bulk_export_pre_stream_should_fallback(200, None) is False  # pylint: disable=protected-access
+    assert importer._bulk_export_pre_stream_should_fallback(500, None) is True
+    assert importer._bulk_export_pre_stream_should_fallback(401, None) is True
+    assert importer._bulk_export_pre_stream_should_fallback(None, "timeout") is True
+    assert importer._bulk_export_pre_stream_should_fallback(202, None) is False
+    assert importer._bulk_export_pre_stream_should_fallback(200, None) is False
 
 
 def test_bulk_export_output_urls_filters_requested_resource_type():
-    urls = importer._bulk_export_output_urls(  # pylint: disable=protected-access
+    urls = importer._bulk_export_output_urls(
         {
             "output": [
                 {"type": "Practitioner", "url": "https://bulk.example/practitioner.ndjson"},
@@ -3678,14 +3678,14 @@ def test_bulk_export_output_urls_filters_requested_resource_type():
 
 
 def test_bulk_export_status_payload_and_error_detection():
-    assert importer._bulk_export_status_payload(  # pylint: disable=protected-access
+    assert importer._bulk_export_status_payload(
         {"transactionTime": "2026-06-30T00:00:00Z", "output": []}
     )
-    assert not importer._bulk_export_status_payload(  # pylint: disable=protected-access
+    assert not importer._bulk_export_status_payload(
         {"resourceType": "Bundle", "entry": []}
     )
     assert (
-        importer._bulk_export_payload_error(  # pylint: disable=protected-access
+        importer._bulk_export_payload_error(
             {"error": [{"type": "OperationOutcome", "responseCode": 500}]}
         )
         == "bulk_export_error_http_500"
@@ -3694,7 +3694,7 @@ def test_bulk_export_status_payload_and_error_detection():
 
 @pytest.mark.asyncio
 async def test_fetch_resource_rows_uses_bulk_export_when_available(monkeypatch):
-    async def fake_bulk_export(source, resource_type, **kwargs):  # pylint: disable=unused-argument
+    async def fake_bulk_export(source, resource_type, **kwargs):
         assert source["source_id"] == "source_a"
         assert resource_type == "Practitioner"
         assert kwargs["per_resource_limit"] == 10
@@ -3718,7 +3718,7 @@ async def test_fetch_resource_rows_uses_bulk_export_when_available(monkeypatch):
     monkeypatch.setattr(importer, "_fetch_bulk_export_resource_rows", fake_bulk_export)
     monkeypatch.setattr(importer, "_fetch_json", fail_paged_fetch)
 
-    result = await importer._fetch_resource_rows(  # pylint: disable=protected-access
+    result = await importer._fetch_resource_rows(
         {"source_id": "source_a", "api_base": "https://example.test/fhir"},
         "Practitioner",
         per_resource_limit=10,
@@ -3733,7 +3733,7 @@ async def test_fetch_resource_rows_uses_bulk_export_when_available(monkeypatch):
     assert result.fetch_mode == "bulk_export"
     assert result.rows[0]["resource_id"] == "prac-1"
     stats: dict[str, dict[str, Any]] = {}
-    importer._record_resource_fetch_stats(stats, "Practitioner", result)  # pylint: disable=protected-access
+    importer._record_resource_fetch_stats(stats, "Practitioner", result)
     assert stats["Practitioner"]["bulk_export_sources"] == 1
 
 
@@ -3743,7 +3743,7 @@ async def test_fetch_resource_rows_falls_back_when_bulk_export_returns_non_bulk_
         assert kwargs["prefer_async"] is True
         return 200, {}, {"resourceType": "Bundle", "entry": []}, None
 
-    async def fake_fetch_json(url, *, timeout):  # pylint: disable=unused-argument
+    async def fake_fetch_json(url, *, timeout):
         assert url == "https://example.test/fhir/Practitioner?_count=25"
         return (
             200,
@@ -3766,7 +3766,7 @@ async def test_fetch_resource_rows_falls_back_when_bulk_export_returns_non_bulk_
     monkeypatch.setattr(importer, "_bulk_http_get_json", fake_bulk_http_get_json)
     monkeypatch.setattr(importer, "_fetch_json", fake_fetch_json)
 
-    result = await importer._fetch_resource_rows(  # pylint: disable=protected-access
+    result = await importer._fetch_resource_rows(
         {"source_id": "source_a", "api_base": "https://example.test/fhir"},
         "Practitioner",
         per_resource_limit=1,
@@ -3798,7 +3798,7 @@ async def test_fetch_resource_rows_records_accepted_bulk_export_poll_failure(mon
     monkeypatch.setattr(importer, "_bulk_export_poll_outputs", fake_poll_outputs)
     monkeypatch.setattr(importer, "_fetch_json", fail_paged_fetch)
 
-    result = await importer._fetch_resource_rows(  # pylint: disable=protected-access
+    result = await importer._fetch_resource_rows(
         {"source_id": "source_a", "api_base": "https://example.test/fhir"},
         "Practitioner",
         per_resource_limit=1,
@@ -3815,7 +3815,7 @@ async def test_fetch_resource_rows_records_accepted_bulk_export_poll_failure(mon
     assert result.complete is False
     assert result.next_url_remaining is True
     stats: dict[str, dict[str, Any]] = {}
-    importer._record_resource_fetch_stats(stats, "Practitioner", result)  # pylint: disable=protected-access
+    importer._record_resource_fetch_stats(stats, "Practitioner", result)
     assert stats["Practitioner"]["bulk_export_sources"] == 1
     assert stats["Practitioner"]["sources_failed"] == 1
 
@@ -3825,7 +3825,7 @@ async def test_fetch_resource_rows_falls_back_when_bulk_export_unsupported(monke
     async def fake_bulk_export(*_args, **_kwargs):
         return None
 
-    async def fake_fetch_json(url, *, timeout):  # pylint: disable=unused-argument
+    async def fake_fetch_json(url, *, timeout):
         assert url == "https://example.test/fhir/Practitioner?_count=25"
         return (
             200,
@@ -3848,7 +3848,7 @@ async def test_fetch_resource_rows_falls_back_when_bulk_export_unsupported(monke
     monkeypatch.setattr(importer, "_fetch_bulk_export_resource_rows", fake_bulk_export)
     monkeypatch.setattr(importer, "_fetch_json", fake_fetch_json)
 
-    result = await importer._fetch_resource_rows(  # pylint: disable=protected-access
+    result = await importer._fetch_resource_rows(
         {"source_id": "source_a", "api_base": "https://example.test/fhir"},
         "Practitioner",
         per_resource_limit=1,
@@ -3868,7 +3868,7 @@ async def test_fetch_resource_rows_falls_back_when_bulk_export_unsupported(monke
 async def test_fetch_resource_rows_resolves_relative_next_links(monkeypatch):
     calls: list[str] = []
 
-    async def fake_fetch_json(url, *, timeout):  # pylint: disable=unused-argument
+    async def fake_fetch_json(url, *, timeout):
         calls.append(url)
         if len(calls) == 1:
             return (
@@ -3911,7 +3911,7 @@ async def test_fetch_resource_rows_resolves_relative_next_links(monkeypatch):
 
     monkeypatch.setattr(importer, "_fetch_json", fake_fetch_json)
 
-    result = await importer._fetch_resource_rows(  # pylint: disable=protected-access
+    result = await importer._fetch_resource_rows(
         {"source_id": "source_a", "api_base": "https://example.test/fhir"},
         "Practitioner",
         per_resource_limit=2,
@@ -3935,7 +3935,7 @@ async def test_fetch_resource_rows_resolves_relative_next_links(monkeypatch):
 async def test_fetch_resource_rows_uses_specific_resource_endpoint(monkeypatch):
     calls: list[str] = []
 
-    async def fake_fetch_json(url, *, timeout):  # pylint: disable=unused-argument
+    async def fake_fetch_json(url, *, timeout):
         calls.append(url)
         return (
             200,
@@ -3958,7 +3958,7 @@ async def test_fetch_resource_rows_uses_specific_resource_endpoint(monkeypatch):
 
     monkeypatch.setattr(importer, "_fetch_json", fake_fetch_json)
 
-    result = await importer._fetch_resource_rows(  # pylint: disable=protected-access
+    result = await importer._fetch_resource_rows(
         {
             "source_id": "source_a",
             "api_base": "https://example.test/fhir",
@@ -3982,7 +3982,7 @@ async def test_fetch_resource_rows_uses_specific_resource_endpoint(monkeypatch):
 async def test_fetch_resource_rows_zero_limits_follow_until_terminal_page(monkeypatch):
     calls: list[str] = []
 
-    async def fake_fetch_json(url, *, timeout):  # pylint: disable=unused-argument
+    async def fake_fetch_json(url, *, timeout):
         calls.append(url)
         page_no = len(calls)
         payload = {
@@ -4003,7 +4003,7 @@ async def test_fetch_resource_rows_zero_limits_follow_until_terminal_page(monkey
 
     monkeypatch.setattr(importer, "_fetch_json", fake_fetch_json)
 
-    result = await importer._fetch_resource_rows(  # pylint: disable=protected-access
+    result = await importer._fetch_resource_rows(
         {"source_id": "source_a", "api_base": "https://example.test/fhir"},
         "Location",
         per_resource_limit=0,
@@ -4026,7 +4026,7 @@ async def test_fetch_resource_rows_zero_limits_follow_until_terminal_page(monkey
 
 @pytest.mark.asyncio
 async def test_fetch_resource_rows_streams_batches_without_retaining_rows(monkeypatch):
-    async def fake_fetch_json(url, *, timeout):  # pylint: disable=unused-argument
+    async def fake_fetch_json(url, *, timeout):
         page = "2" if "page=2" in url else "1"
         payload = {
             "resourceType": "Bundle",
@@ -4059,7 +4059,7 @@ async def test_fetch_resource_rows_streams_batches_without_retaining_rows(monkey
 
     monkeypatch.setattr(importer, "_fetch_json", fake_fetch_json)
 
-    result = await importer._fetch_resource_rows(  # pylint: disable=protected-access
+    result = await importer._fetch_resource_rows(
         {"source_id": "source_a", "api_base": "https://example.test/fhir"},
         "Practitioner",
         per_resource_limit=0,
@@ -4079,7 +4079,7 @@ async def test_fetch_resource_rows_streams_batches_without_retaining_rows(monkey
     assert result.rows_written == 4
     assert batches == [["prac-1-a", "prac-1-b", "prac-2-a"], ["prac-2-b"]]
     stats: dict[str, dict[str, Any]] = {}
-    importer._record_resource_fetch_stats(stats, "Practitioner", result)  # pylint: disable=protected-access
+    importer._record_resource_fetch_stats(stats, "Practitioner", result)
     assert stats["Practitioner"]["sources_empty"] == 0
 
 
@@ -4134,7 +4134,7 @@ async def test_import_resources_deletes_stale_rows_only_after_complete_scan(monk
 
     stats: dict[str, dict[str, Any]] = {}
     stale_counts: dict[str, int] = {}
-    counts = await importer._import_resources(  # pylint: disable=protected-access
+    counts = await importer._import_resources(
         [{"source_id": "source_a", "api_base": "https://example.test/fhir"}],
         resources=["Location", "Practitioner"],
         per_resource_limit=0,
@@ -4194,7 +4194,7 @@ async def test_import_resources_honors_source_concurrency(monkeypatch):
     monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
 
     stats: dict[str, dict[str, Any]] = {}
-    counts = await importer._import_resources(  # pylint: disable=protected-access
+    counts = await importer._import_resources(
         [
             {"source_id": "source_a", "api_base": "https://a.example/fhir"},
             {"source_id": "source_b", "api_base": "https://b.example/fhir"},
@@ -4250,7 +4250,7 @@ async def test_import_resources_reports_streaming_partial_progress(monkeypatch):
     monkeypatch.setattr(importer, "_fetch_resource_rows", fake_fetch_resource_rows)
     monkeypatch.setattr(importer, "_upsert_resource_rows", fake_upsert_resource_rows)
 
-    counts = await importer._import_resources(  # pylint: disable=protected-access
+    counts = await importer._import_resources(
         [{"source_id": "source_a", "api_base": "https://a.example/fhir"}],
         resources=["Location"],
         per_resource_limit=0,
@@ -4286,7 +4286,7 @@ async def test_mark_provider_directory_progress_persists_structured_detail(monke
 
     monkeypatch.setattr(importer, "mark_control_run", fake_mark_control_run)
 
-    await importer._mark_provider_directory_progress(  # pylint: disable=protected-access
+    await importer._mark_provider_directory_progress(
         "run_1",
         phase="provider-directory importing resources",
         done=1,
@@ -4331,7 +4331,7 @@ async def test_import_resources_fetches_duplicate_base_once_and_fans_out_rows(mo
     monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
 
     stats: dict[str, dict[str, Any]] = {}
-    counts = await importer._import_resources(  # pylint: disable=protected-access
+    counts = await importer._import_resources(
         [
             {"source_id": "source_a", "api_base": "https://same.example/fhir"},
             {"source_id": "source_b", "api_base": "https://same.example/fhir/"},
@@ -4353,14 +4353,14 @@ async def test_import_resources_fetches_duplicate_base_once_and_fans_out_rows(mo
 
 
 def test_selected_resources_rejects_unknown_resource():
-    assert "Endpoint" in importer._selected_resources(None)  # pylint: disable=protected-access
-    assert importer._selected_resources("InsurancePlan,Location") == ["InsurancePlan", "Location"]  # pylint: disable=protected-access
+    assert "Endpoint" in importer._selected_resources(None)
+    assert importer._selected_resources("InsurancePlan,Location") == ["InsurancePlan", "Location"]
     with pytest.raises(ValueError, match="Unsupported Provider Directory FHIR resources"):
-        importer._selected_resources("InsurancePlan,Patient")  # pylint: disable=protected-access
+        importer._selected_resources("InsurancePlan,Patient")
 
 
 def test_canonical_backfill_resource_sql_uses_existing_resource_rows():
-    canonical_sql, edge_sql = importer._canonical_backfill_resource_sql(  # pylint: disable=protected-access
+    canonical_sql, edge_sql = importer._canonical_backfill_resource_sql(
         "Location",
         ProviderDirectoryLocation.__tablename__,
     )
@@ -4487,7 +4487,7 @@ async def test_process_data_publish_artifacts_only_skips_seed_resolution(monkeyp
 
 
 def test_harness_fixture_case_and_report_rendering(tmp_path):
-    result = harness._run_fixture_case()  # pylint: disable=protected-access
+    result = harness._run_fixture_case()
     report = {
         "generated_at": "2026-06-28T00:00:00Z",
         "overall_status": "succeeded",
@@ -4504,11 +4504,11 @@ def test_harness_fixture_case_and_report_rendering(tmp_path):
 
 
 def test_harness_sql_typing_rejects_unsafe_schema_name():
-    assert harness._validate_identifier("provider_directory_sql_typing_test", label="schema") == (  # pylint: disable=protected-access
+    assert harness._validate_identifier("provider_directory_sql_typing_test", label="schema") == (
         "provider_directory_sql_typing_test"
     )
     with pytest.raises(ValueError):
-        harness._validate_identifier("provider_directory_sql_typing_test;drop", label="schema")  # pylint: disable=protected-access
+        harness._validate_identifier("provider_directory_sql_typing_test;drop", label="schema")
 
 
 def test_harness_local_cli_passes_retest_supplement_args(monkeypatch, tmp_path):
@@ -4555,7 +4555,7 @@ def test_harness_local_cli_passes_retest_supplement_args(monkeypatch, tmp_path):
         command_timeout=30,
     )
 
-    result = harness._run_cli_case("local-cli", args)  # pylint: disable=protected-access
+    result = harness._run_cli_case("local-cli", args)
 
     assert result.status == "succeeded"
     command = calls[0]["command"]
@@ -4587,7 +4587,7 @@ def test_harness_parse_args_accepts_retest_supplement_args():
 
 
 def test_harness_fixture_covers_healthcare_service_location_refs():
-    result = harness._run_fixture_case()  # pylint: disable=protected-access
+    result = harness._run_fixture_case()
 
     assert result.status == "succeeded"
     assert result.metrics["resource_counts"]["provider_directory_healthcare_service"] == 1

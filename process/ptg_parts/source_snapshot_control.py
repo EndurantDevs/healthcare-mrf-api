@@ -287,13 +287,13 @@ async def _artifact_manifest_ids(schema: str, snapshot_id: str) -> list[str]:
 
 def _clear_ptg2_snapshot_cache() -> None:
     try:
-        from api.ptg2_snapshot import _PTG2_SNAPSHOT_RESOLVE_CACHE  # pylint: disable=import-outside-toplevel,protected-access
+        from api.ptg2_snapshot import _PTG2_SNAPSHOT_RESOLVE_CACHE
     except Exception:
         return
     _PTG2_SNAPSHOT_RESOLVE_CACHE.clear()
 
 
 def _text(statement: str):
-    from sqlalchemy import text  # pylint: disable=import-outside-toplevel
+    from sqlalchemy import text
 
     return text(statement)

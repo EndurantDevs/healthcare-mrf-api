@@ -79,7 +79,7 @@ async def _run_materialize_shard_job(
                 shard_id=shard_id,
                 shard_count=shard_count,
             )
-        except Exception as exc:  # pylint: disable=broad-exception-caught
+        except Exception as exc:
             logger.warning(
                 "provider quality materialize shard pre-count failed run_id=%s phase=%s year=%s shard_id=%s/%s table=%s error=%s",
                 run_id,
@@ -104,7 +104,7 @@ async def _run_materialize_shard_job(
                 shard_id=shard_id,
                 shard_count=shard_count,
             )
-        except Exception as exc:  # pylint: disable=broad-exception-caught
+        except Exception as exc:
             logger.warning(
                 "provider quality materialize shard post-count failed run_id=%s phase=%s year=%s shard_id=%s/%s table=%s error=%s",
                 run_id,

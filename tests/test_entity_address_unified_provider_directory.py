@@ -148,15 +148,15 @@ def test_provider_directory_source_selects_can_scope_by_source_and_run():
 
 
 def test_provider_directory_source_id_batches_are_bounded():
-    assert entity_address_unified._provider_directory_source_id_batches(  # pylint: disable=protected-access
+    assert entity_address_unified._provider_directory_source_id_batches(
         ["source_a", "source_b", "source_c", "source_d", "source_e"],
         2,
     ) == [["source_a", "source_b"], ["source_c", "source_d"], ["source_e"]]
-    assert entity_address_unified._provider_directory_source_id_batches(  # pylint: disable=protected-access
+    assert entity_address_unified._provider_directory_source_id_batches(
         ["source_a", "source_b"],
         0,
     ) == [["source_a", "source_b"]]
-    assert entity_address_unified._provider_directory_source_id_batches(  # pylint: disable=protected-access
+    assert entity_address_unified._provider_directory_source_id_batches(
         [],
         2,
     ) == [[]]
@@ -170,7 +170,7 @@ def test_provider_directory_source_batch_size_accepts_task_and_env(monkeypatch):
     )
 
     assert (
-        entity_address_unified._entity_address_provider_directory_source_batch_size(  # pylint: disable=protected-access
+        entity_address_unified._entity_address_provider_directory_source_batch_size(
             {"provider_directory_source_batch_size": 4}
         )
         == 4
@@ -178,7 +178,7 @@ def test_provider_directory_source_batch_size_accepts_task_and_env(monkeypatch):
 
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_PROVIDER_DIRECTORY_SOURCE_BATCH_SIZE", "5")
     assert (
-        entity_address_unified._entity_address_provider_directory_source_batch_size({})  # pylint: disable=protected-access
+        entity_address_unified._entity_address_provider_directory_source_batch_size({})
         == 5
     )
 

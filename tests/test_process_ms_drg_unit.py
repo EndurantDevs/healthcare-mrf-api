@@ -169,7 +169,7 @@ def test_download_text_aborts_oversize_body(monkeypatch):
     body = b"x" * (256 * 1024)
 
     class _Handler(BaseHTTPRequestHandler):
-        def do_GET(self):  # noqa: N802 - http.server API
+        def do_GET(self):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))

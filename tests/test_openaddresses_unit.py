@@ -26,7 +26,7 @@ def test_openaddresses_record_uses_us_source_state_and_canonical_keys():
         "geometry": {"type": "Point", "coordinates": [-97.7431, 30.2672]},
     }
 
-    record = openaddresses._record_from_feature(  # pylint: disable=protected-access
+    record = openaddresses._record_from_feature(
         feature,
         source="us/tx/austin",
         data_id=10,
@@ -59,7 +59,7 @@ def test_openaddresses_missing_zip_point_is_staged_for_zip_recovery():
         "geometry": {"type": "Point", "coordinates": [-97.7431, 30.2672]},
     }
 
-    record, reason = openaddresses._zip_recovery_record_from_feature(  # pylint: disable=protected-access
+    record, reason = openaddresses._zip_recovery_record_from_feature(
         feature,
         source="us/tx/austin",
         data_id=10,
@@ -91,7 +91,7 @@ def test_openaddresses_record_rejects_non_us_coordinates():
     }
 
     assert (
-        openaddresses._record_from_feature(  # pylint: disable=protected-access
+        openaddresses._record_from_feature(
             feature,
             source="us/tx/austin",
             data_id=10,
@@ -137,7 +137,7 @@ def test_openaddresses_iter_geojson_features_reads_line_delimited_features(tmp_p
     path = tmp_path / "source.geojson"
     path.write_text("\n".join(json.dumps(feature) for feature in features), encoding="utf-8")
 
-    assert list(openaddresses._iter_geojson_features(path)) == features  # pylint: disable=protected-access
+    assert list(openaddresses._iter_geojson_features(path)) == features
 
 
 def test_openaddresses_lookup_sql_uses_strict_fuzzy_guards():
@@ -174,26 +174,26 @@ def test_openaddresses_relaxed_lookup_sql_uses_city_zip_guards():
 
 
 def test_archive_match_components_extracts_house_number_without_postgres_word_boundary():
-    sql = openaddresses._archive_match_components_cte("mrf", "address_archive_v2")  # pylint: disable=protected-access
+    sql = openaddresses._archive_match_components_cte("mrf", "address_archive_v2")
 
     assert "substring(first_line from '^\\s*([0-9]+[A-Za-z]?)')" in sql
     assert "([0-9]+[A-Za-z]?)\\b" not in sql
 
 
 def test_openaddresses_backfill_ctes_include_state_and_zip_shard_filters():
-    archive_sql = openaddresses._archive_match_components_cte(  # pylint: disable=protected-access
+    archive_sql = openaddresses._archive_match_components_cte(
         "mrf",
         "address_archive_v2",
         state_code="CA",
         zip_prefix="90",
     )
-    grouped_sql = openaddresses._openaddresses_grouped_cte(  # pylint: disable=protected-access
+    grouped_sql = openaddresses._openaddresses_grouped_cte(
         "mrf",
         "openaddresses_geocode",
         state_code="CA",
         zip_prefix="90",
     )
-    city_grouped_sql = openaddresses._openaddresses_city_grouped_cte(  # pylint: disable=protected-access
+    city_grouped_sql = openaddresses._openaddresses_city_grouped_cte(
         "mrf",
         "openaddresses_geocode",
         state_code="CA",
@@ -216,20 +216,20 @@ def test_openaddresses_backfill_source_contains_city_scoped_exact_phase():
 
 
 def test_openaddresses_backfill_match_modes_parser():
-    assert openaddresses._normalize_backfill_match_modes(None) == {"exact", "fuzzy", "relaxed"}  # pylint: disable=protected-access
-    assert openaddresses._normalize_backfill_match_modes(" exact, fuzzy ") == {"exact", "fuzzy"}  # pylint: disable=protected-access
-    assert openaddresses._normalize_backfill_match_modes(["relaxed"]) == {"relaxed"}  # pylint: disable=protected-access
-    assert openaddresses._normalize_backfill_match_modes("all") == {"exact", "fuzzy", "relaxed"}  # pylint: disable=protected-access
+    assert openaddresses._normalize_backfill_match_modes(None) == {"exact", "fuzzy", "relaxed"}
+    assert openaddresses._normalize_backfill_match_modes(" exact, fuzzy ") == {"exact", "fuzzy"}
+    assert openaddresses._normalize_backfill_match_modes(["relaxed"]) == {"relaxed"}
+    assert openaddresses._normalize_backfill_match_modes("all") == {"exact", "fuzzy", "relaxed"}
 
     with pytest.raises(ValueError, match="bogus"):
-        openaddresses._normalize_backfill_match_modes("exact,bogus")  # pylint: disable=protected-access
+        openaddresses._normalize_backfill_match_modes("exact,bogus")
 
 
 def test_openaddresses_load_progress_payload(monkeypatch):
     events = []
     monkeypatch.setattr(openaddresses, "enqueue_live_progress", lambda **payload: events.append(payload))
 
-    openaddresses._emit_load_progress(  # pylint: disable=protected-access
+    openaddresses._emit_load_progress(
         processed_files=12,
         total_files=100,
         processed_rows=3456,
@@ -261,7 +261,7 @@ def test_openaddresses_backfill_progress_payload(monkeypatch):
     events = []
     monkeypatch.setattr(openaddresses, "enqueue_live_progress", lambda **payload: events.append(payload))
 
-    openaddresses._emit_backfill_progress(  # pylint: disable=protected-access
+    openaddresses._emit_backfill_progress(
         completed_shards=2,
         total_shards=5,
         stats=openaddresses.OpenAddressesBackfillStats(exact_updates=3, fuzzy_updates=2, relaxed_updates=1),
@@ -294,21 +294,21 @@ def test_openaddresses_backfill_progress_payload(monkeypatch):
 
 def test_openaddresses_progress_run_id_prefers_task_then_context():
     assert (
-        openaddresses._progress_run_id(  # pylint: disable=protected-access
+        openaddresses._progress_run_id(
             {"control_run_id": "run_ctx", "context": {"control_run_id": "run_nested"}},
             {"run_id": " run_task "},
         )
         == "run_task"
     )
     assert (
-        openaddresses._progress_run_id(  # pylint: disable=protected-access
+        openaddresses._progress_run_id(
             {"control_run_id": "run_ctx", "context": {"control_run_id": "run_nested"}},
             {},
         )
         == "run_ctx"
     )
     assert (
-        openaddresses._progress_run_id(  # pylint: disable=protected-access
+        openaddresses._progress_run_id(
             {"context": {"control_run_id": "run_nested"}},
             {},
         )
@@ -331,7 +331,7 @@ async def test_openaddresses_backfill_plans_state_zip_prefix_shards(monkeypatch)
 
     monkeypatch.setattr(openaddresses, "db", FakeDb())
 
-    shards = await openaddresses._plan_openaddresses_backfill_shards(  # pylint: disable=protected-access
+    shards = await openaddresses._plan_openaddresses_backfill_shards(
         schema="mrf",
         archive_table="address_archive_v2",
         zip_prefix_length=2,
@@ -356,7 +356,7 @@ async def test_openaddresses_backfill_plan_skips_invalid_archive_state_shards(mo
 
     monkeypatch.setattr(openaddresses, "db", FakeDb())
 
-    shards = await openaddresses._plan_openaddresses_backfill_shards(  # pylint: disable=protected-access
+    shards = await openaddresses._plan_openaddresses_backfill_shards(
         schema="mrf",
         archive_table="address_archive_v2",
         zip_prefix_length=2,
@@ -509,7 +509,7 @@ async def test_openaddresses_download_retries_transient_http_status(monkeypatch,
     monkeypatch.setattr(openaddresses.asyncio, "sleep", fake_sleep)
     path = tmp_path / "source.geojson.gz"
 
-    await openaddresses._download_file(  # pylint: disable=protected-access
+    await openaddresses._download_file(
         client,
         "https://openaddresses.test/source.geojson.gz",
         path,
@@ -527,7 +527,7 @@ async def test_openaddresses_download_does_not_retry_non_transient_status(tmp_pa
     client = _FakeDownloadClient([_FakeDownloadResponse(404, body="missing")])
 
     with pytest.raises(RuntimeError, match="HTTP 404"):
-        await openaddresses._download_file(  # pylint: disable=protected-access
+        await openaddresses._download_file(
             client,
             "https://openaddresses.test/source.geojson.gz",
             tmp_path / "source.geojson.gz",
@@ -548,7 +548,7 @@ async def test_openaddresses_flush_uses_copy_first(monkeypatch):
     rows = [{"row_hash": "a" * 64}]
     monkeypatch.setattr(openaddresses, "push_objects", fake_push_objects)
 
-    accepted = await openaddresses._flush_rows(rows, object)  # pylint: disable=protected-access
+    accepted = await openaddresses._flush_rows(rows, object)
 
     assert accepted == 1
     assert rows == []
@@ -569,7 +569,7 @@ async def test_openaddresses_repairs_legacy_stage_row_hash_width(monkeypatch):
 
     monkeypatch.setattr(openaddresses, "db", FakeDb())
 
-    await openaddresses._ensure_openaddresses_stage_schema(  # pylint: disable=protected-access
+    await openaddresses._ensure_openaddresses_stage_schema(
         "openaddresses_geocode_202606151230024",
         "mrf",
     )
@@ -594,7 +594,7 @@ async def test_openaddresses_keeps_current_stage_row_hash_width(monkeypatch):
 
     monkeypatch.setattr(openaddresses, "db", FakeDb())
 
-    await openaddresses._ensure_openaddresses_stage_schema(  # pylint: disable=protected-access
+    await openaddresses._ensure_openaddresses_stage_schema(
         "openaddresses_geocode_202606151230024",
         "mrf",
     )
@@ -627,7 +627,7 @@ async def test_openaddresses_local_files_load_in_parallel(monkeypatch, tmp_path)
     monkeypatch.setattr(openaddresses, "_load_file", fake_load_file)
     monkeypatch.setattr(openaddresses, "_emit_load_progress", lambda **_payload: None)
 
-    stats = await openaddresses._load_openaddresses_data(  # pylint: disable=protected-access
+    stats = await openaddresses._load_openaddresses_data(
         {"context": {"test_mode": False}},
         {"local_files": [str(path) for path in paths], "source_concurrency": 3},
         object,
@@ -672,7 +672,7 @@ async def test_openaddresses_remote_sources_load_in_parallel(monkeypatch):
     monkeypatch.setattr(openaddresses, "_load_source_item", fake_load_source_item)
     monkeypatch.setattr(openaddresses, "_emit_load_progress", lambda **_payload: None)
 
-    stats = await openaddresses._load_openaddresses_data(  # pylint: disable=protected-access
+    stats = await openaddresses._load_openaddresses_data(
         {"context": {"test_mode": False}},
         {"source_concurrency": 3, "max_files": 3},
         object,
@@ -719,7 +719,7 @@ async def test_openaddresses_remote_tempdir_ignores_cleanup_errors(monkeypatch, 
     monkeypatch.setattr(openaddresses, "_load_source_item", fake_load_source_item)
     monkeypatch.setattr(openaddresses, "_emit_load_progress", lambda **_payload: None)
 
-    stats = await openaddresses._load_openaddresses_data(  # pylint: disable=protected-access
+    stats = await openaddresses._load_openaddresses_data(
         {"context": {"test_mode": False}},
         {"source_concurrency": 1, "max_files": 1},
         object,
@@ -766,7 +766,7 @@ async def test_openaddresses_remote_test_mode_honors_source_concurrency(monkeypa
     monkeypatch.setattr(openaddresses, "_load_source_item", fake_load_source_item)
     monkeypatch.setattr(openaddresses, "_emit_load_progress", lambda **_payload: None)
 
-    stats = await openaddresses._load_openaddresses_data(  # pylint: disable=protected-access
+    stats = await openaddresses._load_openaddresses_data(
         {"context": {"test_mode": True}},
         {"source_concurrency": 2, "test_file_limit": 3, "test_row_limit": 10},
         object,
@@ -924,7 +924,7 @@ async def test_openaddresses_load_file_stops_when_control_run_cancelled(tmp_path
     )
 
     with pytest.raises(ImportCancelledError):
-        await openaddresses._load_file(  # pylint: disable=protected-access
+        await openaddresses._load_file(
             path,
             stage_cls=object,
             batch_size=5000,
@@ -934,9 +934,9 @@ async def test_openaddresses_load_file_stops_when_control_run_cancelled(tmp_path
 
 
 def test_openaddresses_import_control_registration():
-    adapter = control_imports._SINGLE_JOB_ADAPTERS["openaddresses"]  # pylint: disable=protected-access
+    adapter = control_imports._SINGLE_JOB_ADAPTERS["openaddresses"]
 
     assert adapter["queue"] == "arq:OpenAddresses"
     assert adapter["target_module"] == "process.openaddresses"
     assert adapter["target_function"] == "process_data"
-    assert "openaddresses" in control_imports._CANCELABLE_IMPORTERS  # pylint: disable=protected-access
+    assert "openaddresses" in control_imports._CANCELABLE_IMPORTERS

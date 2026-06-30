@@ -1051,23 +1051,23 @@ def test_entity_address_unified_defaults_to_production_sized_publish_gate():
 
 def test_entity_address_unified_inline_source_evidence_guard_defaults_off(monkeypatch):
     monkeypatch.delenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_REQUIRE_INLINE_SOURCE_EVIDENCE", raising=False)
-    assert entity_address_unified._require_inline_source_evidence() is False  # pylint: disable=protected-access
+    assert entity_address_unified._require_inline_source_evidence() is False
 
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_REQUIRE_INLINE_SOURCE_EVIDENCE", "true")
-    assert entity_address_unified._require_inline_source_evidence() is True  # pylint: disable=protected-access
+    assert entity_address_unified._require_inline_source_evidence() is True
 
 
 def test_entity_address_unified_publish_decision_defaults_to_stage_only_for_test(monkeypatch):
     monkeypatch.delenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_PUBLISH", raising=False)
     monkeypatch.delenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_SKIP_PUBLISH", raising=False)
 
-    assert entity_address_unified._publish_requested({}, test_mode=True) is False  # pylint: disable=protected-access
-    assert entity_address_unified._publish_requested({}, test_mode=False) is True  # pylint: disable=protected-access
-    assert entity_address_unified._publish_requested(  # pylint: disable=protected-access
+    assert entity_address_unified._publish_requested({}, test_mode=True) is False
+    assert entity_address_unified._publish_requested({}, test_mode=False) is True
+    assert entity_address_unified._publish_requested(
         {"publish": True},
         test_mode=True,
     ) is True
-    assert entity_address_unified._publish_requested(  # pylint: disable=protected-access
+    assert entity_address_unified._publish_requested(
         {"skip_publish": True},
         test_mode=False,
     ) is False
@@ -1077,12 +1077,12 @@ def test_entity_address_unified_publish_decision_allows_env_override(monkeypatch
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_PUBLISH", "true")
     monkeypatch.delenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_SKIP_PUBLISH", raising=False)
 
-    assert entity_address_unified._publish_requested({}, test_mode=True) is True  # pylint: disable=protected-access
+    assert entity_address_unified._publish_requested({}, test_mode=True) is True
 
     monkeypatch.delenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_PUBLISH", raising=False)
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_SKIP_PUBLISH", "true")
 
-    assert entity_address_unified._publish_requested({}, test_mode=False) is False  # pylint: disable=protected-access
+    assert entity_address_unified._publish_requested({}, test_mode=False) is False
 
 
 def test_entity_address_unified_refresh_mode_aliases_obsolete_ptg_to_full(monkeypatch):
@@ -1125,12 +1125,12 @@ def test_provider_directory_partial_sql_uses_live_and_current_fhir_groups():
         },
     )
 
-    sql = entity_address_unified._prepare_provider_directory_partial_affected_groups_sql(  # pylint: disable=protected-access
+    sql = entity_address_unified._prepare_provider_directory_partial_affected_groups_sql(
         "mrf",
         "entity_address_unified_pd_groups",
         source_selects,
     )
-    filtered = entity_address_unified._provider_directory_partial_source_selects(  # pylint: disable=protected-access
+    filtered = entity_address_unified._provider_directory_partial_source_selects(
         "mrf",
         ["SELECT * FROM mrf.npi_address AS a", *source_selects],
         affected_group_table="entity_address_unified_pd_groups",
@@ -1147,7 +1147,7 @@ def test_provider_directory_partial_sql_uses_live_and_current_fhir_groups():
     assert "provider_directory_organization_addresses" in sql
     assert "src.entity_id::varchar AS entity_id" in sql
     assert "END AS entity_npi" in sql
-    index_sql = entity_address_unified._index_provider_directory_partial_affected_groups_sql(  # pylint: disable=protected-access
+    index_sql = entity_address_unified._index_provider_directory_partial_affected_groups_sql(
         "mrf",
         "entity_address_unified_pd_groups",
     )
@@ -1184,7 +1184,7 @@ def test_provider_directory_partial_sql_can_scope_live_groups_by_source_id():
         provider_directory_run_id="run_123",
     )
 
-    sql = entity_address_unified._prepare_provider_directory_partial_affected_groups_sql(  # pylint: disable=protected-access
+    sql = entity_address_unified._prepare_provider_directory_partial_affected_groups_sql(
         "mrf",
         "entity_address_unified_pd_groups",
         source_selects,
@@ -1203,7 +1203,7 @@ def test_provider_directory_partial_sql_can_scope_live_groups_by_source_id():
 
 
 def test_latest_provider_directory_partial_scope_sql_prefers_metadata_then_resource_rows():
-    sql = entity_address_unified._latest_provider_directory_partial_scope_sql("mrf")  # pylint: disable=protected-access
+    sql = entity_address_unified._latest_provider_directory_partial_scope_sql("mrf")
 
     assert "FROM mrf.provider_directory_source" in sql
     assert "last_resource_import" in sql
@@ -1244,7 +1244,7 @@ async def test_latest_provider_directory_partial_scope_returns_scope_sources(mon
     )
     monkeypatch.setattr(entity_address_unified.db, "first", first_mock)
 
-    run_id, source_ids, scope_sources = await entity_address_unified._latest_provider_directory_partial_scope(  # pylint: disable=protected-access
+    run_id, source_ids, scope_sources = await entity_address_unified._latest_provider_directory_partial_scope(
         "mrf"
     )
 
@@ -1736,7 +1736,7 @@ async def test_entity_address_unified_sql_phase_uses_scoped_bulk_settings(monkey
     monkeypatch.setattr(entity_address_unified, "enqueue_live_progress", lambda **payload: events.append(payload))
 
     context = {}
-    rowcount = await entity_address_unified._run_sql_phase(  # pylint: disable=protected-access
+    rowcount = await entity_address_unified._run_sql_phase(
         "UPDATE mrf.entity_address_unified_raw SET address_key = address_key;",
         context=context,
         run_id="run_eau",
@@ -1795,7 +1795,7 @@ async def test_entity_address_unified_sql_phase_skips_unprivileged_bulk_setting(
     monkeypatch.setattr(entity_address_unified, "db", FakeDB())
 
     context = {}
-    rowcount = await entity_address_unified._run_sql_phase(  # pylint: disable=protected-access
+    rowcount = await entity_address_unified._run_sql_phase(
         "UPDATE mrf.entity_address_unified_raw SET address_key = address_key;",
         context=context,
         phase="entity-address-unified test phase",
@@ -1839,12 +1839,12 @@ async def test_entity_address_unified_support_stage_records_bulk_phase_timings(m
 
     def fake_support_stage_statements(*_args, **_kwargs):
         return [
-            entity_address_unified._SupportStageStatement(  # pylint: disable=protected-access
+            entity_address_unified._SupportStageStatement(
                 "support tables",
                 "TRUNCATE TABLE mrf.entity_address_evidence_20260614;",
                 parallel=False,
             ),
-            entity_address_unified._SupportStageStatement(  # pylint: disable=protected-access
+            entity_address_unified._SupportStageStatement(
                 "evidence",
                 "INSERT INTO mrf.entity_address_evidence_20260614 SELECT 1;",
             ),
@@ -1859,7 +1859,7 @@ async def test_entity_address_unified_support_stage_records_bulk_phase_timings(m
     monkeypatch.setattr(entity_address_unified, "enqueue_live_progress", lambda **payload: events.append(payload))
 
     context = {}
-    counts = await entity_address_unified._populate_support_stage_tables(  # pylint: disable=protected-access
+    counts = await entity_address_unified._populate_support_stage_tables(
         "mrf",
         "entity_address_unified_stage",
         {FakeModel: FakeStage},
@@ -1909,20 +1909,20 @@ async def test_entity_address_unified_support_stage_runs_parallel_inserts(monkey
 
     def fake_support_stage_statements(*_args, **_kwargs):
         return [
-            entity_address_unified._SupportStageStatement(  # pylint: disable=protected-access
+            entity_address_unified._SupportStageStatement(
                 "support tables",
                 "TRUNCATE TABLE mrf.entity_address_evidence_20260614;",
                 parallel=False,
             ),
-            entity_address_unified._SupportStageStatement(  # pylint: disable=protected-access
+            entity_address_unified._SupportStageStatement(
                 "evidence",
                 "INSERT INTO mrf.entity_address_evidence_20260614 SELECT 1;",
             ),
-            entity_address_unified._SupportStageStatement(  # pylint: disable=protected-access
+            entity_address_unified._SupportStageStatement(
                 "procedure bridge",
                 "INSERT INTO mrf.entity_address_procedure_bridge_20260614 SELECT 1;",
             ),
-            entity_address_unified._SupportStageStatement(  # pylint: disable=protected-access
+            entity_address_unified._SupportStageStatement(
                 "medication bridge",
                 "INSERT INTO mrf.entity_address_medication_bridge_20260614 SELECT 1;",
             ),
@@ -1937,7 +1937,7 @@ async def test_entity_address_unified_support_stage_runs_parallel_inserts(monkey
     )
 
     context = {}
-    await entity_address_unified._populate_support_stage_tables(  # pylint: disable=protected-access
+    await entity_address_unified._populate_support_stage_tables(
         "mrf",
         "entity_address_unified_stage",
         {FakeModel: FakeStage},
@@ -1994,7 +1994,7 @@ async def test_entity_address_unified_support_stage_indexes_run_parallel(monkeyp
     monkeypatch.setattr(entity_address_unified, "enqueue_live_progress", lambda **payload: events.append(payload))
 
     context = {}
-    await entity_address_unified._create_support_stage_indexes(  # pylint: disable=protected-access
+    await entity_address_unified._create_support_stage_indexes(
         {
             FakeModelA: FakeStageA,
             FakeModelB: FakeStageB,
@@ -2035,7 +2035,7 @@ async def test_entity_address_unified_prepare_support_tables_heap_load_drops_pri
         lambda _import_date: {entity_address_unified.EntityAddressProcedureBridge: FakeStage},
     )
 
-    stages = await entity_address_unified._prepare_support_stage_tables(  # pylint: disable=protected-access
+    stages = await entity_address_unified._prepare_support_stage_tables(
         "mrf",
         "20260614",
     )
@@ -2070,7 +2070,7 @@ async def test_entity_address_unified_prepare_support_tables_can_keep_primary(mo
         lambda _import_date: {entity_address_unified.EntityAddressProcedureBridge: FakeStage},
     )
 
-    await entity_address_unified._prepare_support_stage_tables(  # pylint: disable=protected-access
+    await entity_address_unified._prepare_support_stage_tables(
         "mrf",
         "20260614",
     )
@@ -2079,7 +2079,7 @@ async def test_entity_address_unified_prepare_support_tables_can_keep_primary(mo
 
 
 def test_entity_address_unified_support_primary_key_sql_restores_constraint():
-    sql = entity_address_unified._ensure_stage_primary_key_sql(  # pylint: disable=protected-access
+    sql = entity_address_unified._ensure_stage_primary_key_sql(
         "mrf",
         "entity_address_procedure_bridge_20260614",
         ["location_key", "npi", "code_system", "code"],
@@ -2132,7 +2132,7 @@ async def test_entity_address_unified_support_indexes_restore_primary_before_sec
         fake_create_stage_indexes,
     )
 
-    await entity_address_unified._create_support_stage_indexes(  # pylint: disable=protected-access
+    await entity_address_unified._create_support_stage_indexes(
         {FakeModelA: FakeStageA, FakeModelB: FakeStageB},
         "mrf",
     )
@@ -2146,7 +2146,7 @@ async def test_entity_address_unified_support_indexes_restore_primary_before_sec
 
 
 def test_entity_address_unified_facility_candidate_sql_can_shard_targets():
-    sql = entity_address_unified._facility_anchor_npi_candidate_sql(  # pylint: disable=protected-access
+    sql = entity_address_unified._facility_anchor_npi_candidate_sql(
         "mrf",
         "facility_anchor_npi_candidate_20260614",
         "entity_address_unified_20260614",
@@ -2161,14 +2161,14 @@ def test_entity_address_unified_facility_candidate_sql_can_shard_targets():
 
 
 def test_entity_address_unified_bridge_sql_can_shard_by_location_key():
-    procedure_sql = entity_address_unified._procedure_bridge_sql(  # pylint: disable=protected-access
+    procedure_sql = entity_address_unified._procedure_bridge_sql(
         "mrf",
         "entity_address_procedure_bridge_20260614",
         "entity_address_unified_20260614",
         bridge_shards=4,
         bridge_shard=3,
     )
-    medication_sql = entity_address_unified._medication_bridge_sql(  # pylint: disable=protected-access
+    medication_sql = entity_address_unified._medication_bridge_sql(
         "mrf",
         "entity_address_medication_bridge_20260614",
         "entity_address_unified_20260614",
@@ -2190,7 +2190,7 @@ def test_entity_address_unified_support_statements_shard_facility_candidates(mon
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_PROCEDURE_BRIDGE_SHARDS", "1")
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_MEDICATION_BRIDGE_SHARDS", "1")
 
-    statements = entity_address_unified._support_stage_statements(  # pylint: disable=protected-access
+    statements = entity_address_unified._support_stage_statements(
         "mrf",
         "entity_address_unified_20260614",
         {
@@ -2239,7 +2239,7 @@ def test_entity_address_unified_support_statements_shard_code_bridges(monkeypatc
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_PROCEDURE_BRIDGE_SHARDS", "3")
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_MEDICATION_BRIDGE_SHARDS", "2")
 
-    statements = entity_address_unified._support_stage_statements(  # pylint: disable=protected-access
+    statements = entity_address_unified._support_stage_statements(
         "mrf",
         "entity_address_unified_20260614",
         {
@@ -2290,7 +2290,7 @@ def test_entity_address_unified_support_statements_can_skip_optional_serving_tab
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_BUILD_CODE_BRIDGES", "0")
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_BUILD_FACILITY_CANDIDATES", "0")
 
-    statements = entity_address_unified._support_stage_statements(  # pylint: disable=protected-access
+    statements = entity_address_unified._support_stage_statements(
         "mrf",
         "entity_address_unified_20260614",
         {
@@ -2518,7 +2518,7 @@ def test_entity_address_unified_partial_support_patch_stages_only_affected_rows(
 
 def test_entity_address_unified_partial_support_patch_sql_offsets_evidence_ids():
     stage_classes = entity_address_unified._support_stage_classes("20260614")
-    statements = entity_address_unified._partial_support_patch_sql(  # pylint: disable=protected-access
+    statements = entity_address_unified._partial_support_patch_sql(
         "mrf",
         stage_classes,
         old_entity_table="entity_address_unified_old",
@@ -2538,7 +2538,7 @@ def test_entity_address_unified_partial_support_patch_sql_offsets_evidence_ids()
 
 
 def test_entity_address_unified_partial_main_patch_sql_deletes_and_inserts_affected_rows():
-    statements = entity_address_unified._partial_main_patch_sql(  # pylint: disable=protected-access
+    statements = entity_address_unified._partial_main_patch_sql(
         "mrf",
         live_table="entity_address_unified",
         stage_table="entity_address_unified_20260614",
@@ -2559,7 +2559,7 @@ def test_entity_address_unified_partial_main_patch_sql_deletes_and_inserts_affec
 
 
 def test_entity_address_unified_provider_directory_replacement_copies_unaffected_live_rows():
-    sql = entity_address_unified._copy_unaffected_live_entity_rows_sql(  # pylint: disable=protected-access
+    sql = entity_address_unified._copy_unaffected_live_entity_rows_sql(
         "mrf",
         live_table="entity_address_unified",
         stage_table="entity_address_unified_20260614",
@@ -2825,7 +2825,7 @@ async def test_entity_address_unified_compacts_source_record_ids_by_metadata_res
     )
     monkeypatch.setattr(entity_address_unified, "db", FakeDB())
 
-    rows = await entity_address_unified._compact_hot_row_source_record_ids(  # pylint: disable=protected-access
+    rows = await entity_address_unified._compact_hot_row_source_record_ids(
         "mrf",
         "entity_address_unified_stage",
     )
@@ -2858,7 +2858,7 @@ async def test_entity_address_unified_can_compact_source_record_ids_by_rewrite(m
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_COMPACT_SOURCE_RECORD_IDS_BY_REWRITE", "1")
     monkeypatch.setattr(entity_address_unified, "db", FakeDB())
 
-    rows = await entity_address_unified._compact_hot_row_source_record_ids(  # pylint: disable=protected-access
+    rows = await entity_address_unified._compact_hot_row_source_record_ids(
         "mrf",
         "entity_address_unified_stage",
     )
@@ -3212,7 +3212,7 @@ async def test_ensure_entity_address_unified_live_columns_adds_missing_stale_col
         AsyncMock(return_value=True),
     )
 
-    await entity_address_unified._ensure_entity_address_unified_live_columns("mrf")  # pylint: disable=protected-access
+    await entity_address_unified._ensure_entity_address_unified_live_columns("mrf")
 
     all_mock.assert_awaited_once()
     status_mock.assert_awaited_once()
@@ -3239,7 +3239,7 @@ async def test_entity_address_unified_stage_summary_counts_use_single_scan(monke
 
     monkeypatch.setattr(entity_address_unified, "db", FakeDB())
 
-    counts = await entity_address_unified._stage_summary_counts(  # pylint: disable=protected-access
+    counts = await entity_address_unified._stage_summary_counts(
         "mrf",
         "entity_address_unified_20260614",
     )
@@ -3268,13 +3268,13 @@ def test_entity_address_unified_phase_timing_rows_reads_insert_rowcount():
     }
 
     assert (
-        entity_address_unified._phase_timing_rows(  # pylint: disable=protected-access
+        entity_address_unified._phase_timing_rows(
             context,
             "entity-address-unified aggregating",
         )
         == 35553296
     )
-    assert entity_address_unified._phase_timing_rows(context, "missing") == 0  # pylint: disable=protected-access
+    assert entity_address_unified._phase_timing_rows(context, "missing") == 0
 
 
 def test_entity_address_unified_fallback_summary_counts_prefer_replacement_rows():
@@ -3299,15 +3299,15 @@ def test_entity_address_unified_fallback_summary_counts_prefer_replacement_rows(
 def test_entity_address_unified_final_summary_counts_can_be_disabled(monkeypatch):
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_FINAL_SUMMARY_COUNTS", "false")
 
-    assert entity_address_unified._final_summary_counts() is False  # pylint: disable=protected-access
+    assert entity_address_unified._final_summary_counts() is False
 
 
 def test_entity_address_unified_keep_raw_stage_is_opt_in(monkeypatch):
     monkeypatch.delenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_KEEP_RAW_STAGE", raising=False)
-    assert entity_address_unified._keep_raw_stage() is False  # pylint: disable=protected-access
+    assert entity_address_unified._keep_raw_stage() is False
 
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_KEEP_RAW_STAGE", "true")
-    assert entity_address_unified._keep_raw_stage() is True  # pylint: disable=protected-access
+    assert entity_address_unified._keep_raw_stage() is True
 
 
 def test_entity_address_unified_indexes_cover_primary_serving_queries():

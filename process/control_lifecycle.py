@@ -450,7 +450,7 @@ def _claim_control_run_db_update_slot(slot_key: str, throttle_seconds: float) ->
 
 
 def _control_run_db_throttle_client() -> redis.Redis:
-    global _control_run_db_throttle_redis  # pylint: disable=global-statement
+    global _control_run_db_throttle_redis
     if _control_run_db_throttle_redis is None:
         settings = build_redis_settings()
         _control_run_db_throttle_redis = redis.Redis(
@@ -467,11 +467,11 @@ def _control_run_db_throttle_client() -> redis.Redis:
 async def _execute_control_run_update(stmt: Any) -> None:
     previous_override = getattr(db, "_database_override", None)
     base_database = os.getenv("HLTHPRT_DB_DATABASE", "postgres")
-    db._database_override = base_database  # type: ignore[attr-defined]
+    db._database_override = base_database
     try:
         await db.connect()
         await db.execute(stmt)
     finally:
-        db._database_override = previous_override  # type: ignore[attr-defined]
+        db._database_override = previous_override
         if previous_override != base_database:
             await db.connect()

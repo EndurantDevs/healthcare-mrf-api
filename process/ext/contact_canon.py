@@ -35,7 +35,7 @@ def _as_optional_text(value: Any) -> str | None:
 def _row_tuple(row: Sequence[Any]) -> ContactRow:
     if len(row) != 3:
         raise ValueError(f"Contact canonical batch rows must have 3 fields, got {len(row)}")
-    return tuple(_as_optional_text(value) for value in row)  # type: ignore[return-value]
+    return tuple(_as_optional_text(value) for value in row)
 
 
 def _digits_only(value: str) -> str:
@@ -138,7 +138,7 @@ def _python_canonicalize(row: ContactRow) -> dict[str, str | bool | None]:
 
 
 def _fast_module() -> Any | None:
-    global _FAST_MODULE, _FAST_MODULE_CHECKED  # pylint: disable=global-statement
+    global _FAST_MODULE, _FAST_MODULE_CHECKED
     if _FAST_MODULE_CHECKED:
         return _FAST_MODULE
     _FAST_MODULE_CHECKED = True
@@ -158,7 +158,7 @@ def canonicalize_batch(rows: Iterable[Sequence[Any]]) -> list[dict[str, str | bo
     if module is not None:
         try:
             return list(module.canonicalize_contact_batch(prepared))
-        except Exception as exc:  # pylint: disable=broad-exception-caught
+        except Exception as exc:
             logger.warning("Rust/PyO3 contact canonicalizer failed; using Python fallback: %s", exc)
     return [_python_canonicalize(row) for row in prepared]
 

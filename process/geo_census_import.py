@@ -318,7 +318,7 @@ async def _fetch_dataset_rows(
                     )
                 payload = await response.json(content_type=None)
             break
-        except Exception as exc:  # pylint: disable=broad-exception-caught
+        except Exception as exc:
             last_error = exc
             if attempt >= retries:
                 break

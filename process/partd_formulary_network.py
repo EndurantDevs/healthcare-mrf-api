@@ -1,5 +1,4 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-# pylint: disable=too-many-lines
 
 from __future__ import annotations
 
@@ -2263,13 +2262,13 @@ async def partd_formulary_network_start(ctx, task=None):  # pragma: no cover
                 "datasets": len(artifacts),
             },
         )
-    except Exception as exc:  # pylint: disable=broad-exception-caught
+    except Exception as exc:
         await _truncate_stage_tables(schema)
         if not test_mode and PARTD_DEFER_ADDITIONAL_INDEXES and PARTD_DROP_ADDITIONAL_INDEXES_BEFORE_IMPORT:
             try:
                 await _ensure_partd_secondary_indexes(schema)
                 await _analyze_partd_tables(schema)
-            except Exception as cleanup_exc:  # pylint: disable=broad-exception-caught
+            except Exception as cleanup_exc:
                 logger.warning("failed to restore/analyze Part D secondary indexes: %s", cleanup_exc)
         await _upsert_run(
             {

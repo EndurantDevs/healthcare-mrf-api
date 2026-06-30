@@ -42,8 +42,8 @@ ROOT = _repo_root()
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from process.provider_directory_fhir import provider_directory_address_corroboration_sql  # noqa: E402
-from api.ptg2_serving import _address_verification_payload  # noqa: E402
+from process.provider_directory_fhir import provider_directory_address_corroboration_sql
+from api.ptg2_serving import _address_verification_payload
 
 
 def _validate_identifier(value: str, *, label: str) -> str:

@@ -1,5 +1,4 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-# pylint: disable=too-many-lines
 
 from __future__ import annotations
 
@@ -1506,12 +1505,12 @@ async def _load_rows_from_direct_csv_source(
             source_url,
             max_bytes=PHARM_LICENSE_MAX_DOWNLOAD_BYTES,
         )
-    except Exception as exc:  # pylint: disable=broad-exception-caught
+    except Exception as exc:
         return [], None, metadata, f"adapter_fetch_failed:{exc}"
 
     try:
         records = _parse_csv_records(raw)
-    except Exception as exc:  # pylint: disable=broad-exception-caught
+    except Exception as exc:
         return [], final_url, metadata, f"adapter_parse_failed:{exc}"
 
     mapped_rows: list[dict[str, Any]] = []
@@ -1559,13 +1558,13 @@ async def _load_rows_from_socrata_source(
                 query_url,
                 max_bytes=PHARM_LICENSE_MAX_DOWNLOAD_BYTES,
             )
-        except Exception as exc:  # pylint: disable=broad-exception-caught
+        except Exception as exc:
             return [], None, metadata, f"adapter_fetch_failed:{exc}"
 
         pages_fetched += 1
         try:
             page_rows = _parse_csv_records(raw)
-        except Exception as exc:  # pylint: disable=broad-exception-caught
+        except Exception as exc:
             return [], final_url, metadata, f"adapter_parse_failed:{exc}"
 
         if not page_rows:
@@ -1641,14 +1640,14 @@ async def _load_rows_from_ny_rosa_source(
                     max_bytes=PHARM_LICENSE_MAX_DOWNLOAD_BYTES,
                     headers={"x-oapi-key": api_key},
                 )
-            except Exception as exc:  # pylint: disable=broad-exception-caught
+            except Exception as exc:
                 return [], final_url, metadata, f"adapter_fetch_failed:{exc}"
             requests_made += 1
             pages_fetched += 1
 
             try:
                 payload = json.loads(_decode_text(raw))
-            except Exception as exc:  # pylint: disable=broad-exception-caught
+            except Exception as exc:
                 return [], final_url, metadata, f"adapter_parse_failed:{exc}"
 
             page_rows = payload.get("content")
@@ -1704,12 +1703,12 @@ async def _load_rows_from_ma_export_source(
             export_url,
             max_bytes=PHARM_LICENSE_MAX_DOWNLOAD_BYTES,
         )
-    except Exception as exc:  # pylint: disable=broad-exception-caught
+    except Exception as exc:
         return [], None, metadata, f"adapter_fetch_failed:{exc}"
 
     try:
         records = _parse_zip_records(raw)
-    except Exception as exc:  # pylint: disable=broad-exception-caught
+    except Exception as exc:
         return [], final_url, metadata, f"adapter_parse_failed:{exc}"
 
     mapped_rows: list[dict[str, Any]] = []
@@ -1816,7 +1815,7 @@ async def _load_rows_from_aspnet_search_state(
             spec.search_url,
             max_bytes=min(PHARM_LICENSE_MAX_DOWNLOAD_BYTES, 2_000_000),
         )
-    except Exception as exc:  # pylint: disable=broad-exception-caught
+    except Exception as exc:
         return [], None, metadata, f"adapter_fetch_failed:{exc}"
 
     if _is_captcha_page(_decode_text(search_page)):
@@ -1859,7 +1858,7 @@ async def _load_rows_from_aspnet_search_state(
                 max_bytes=min(PHARM_LICENSE_MAX_DOWNLOAD_BYTES, 3_000_000),
             )
             result_url = str(response.url)
-    except Exception as exc:  # pylint: disable=broad-exception-caught
+    except Exception as exc:
         return [], search_final_url, metadata, f"adapter_search_failed:{exc}"
 
     current_html = _decode_text(result_html)
@@ -1915,7 +1914,7 @@ async def _load_rows_from_aspnet_search_state(
                     )
                 )
                 current_url = str(next_response.url)
-        except Exception as exc:  # pylint: disable=broad-exception-caught
+        except Exception as exc:
             metadata["pagination_error"] = str(exc)
             break
         current_page = next_page
@@ -2066,7 +2065,7 @@ async def _discover_machine_readable_sources(
             source.board_url,
             max_bytes=min(PHARM_LICENSE_MAX_DOWNLOAD_BYTES, 1_500_000),
         )
-    except Exception as exc:  # pylint: disable=broad-exception-caught
+    except Exception as exc:
         return [], f"board_fetch_failed:{exc}"
 
     ext = _entry_extensions(final_url)
@@ -2152,7 +2151,7 @@ async def _load_records_from_source(
             source_url,
             max_bytes=PHARM_LICENSE_MAX_DOWNLOAD_BYTES,
         )
-    except Exception as exc:  # pylint: disable=broad-exception-caught
+    except Exception as exc:
         return [], f"source_fetch_failed:{exc}"
 
     ext = _entry_extensions(final_url) or _entry_extensions(source_url)
@@ -2165,7 +2164,7 @@ async def _load_records_from_source(
             return _parse_json_records(raw), None
         if ext == "zip" or "zip" in lower_content_type:
             return _parse_zip_records(raw), None
-    except Exception as exc:  # pylint: disable=broad-exception-caught
+    except Exception as exc:
         return [], f"source_parse_failed:{exc}"
 
     return [], "unsupported_source_format"
@@ -3227,7 +3226,7 @@ async def pharmacy_license_start(ctx, task=None):
                         ),
                     )
 
-                except Exception as exc:  # pylint: disable=broad-exception-caught
+                except Exception as exc:
                     await _upsert_snapshot(
                         {
                             "snapshot_id": snapshot_id,
@@ -3326,13 +3325,13 @@ async def pharmacy_license_start(ctx, task=None):
             progress_message="succeeded",
             metrics=summary_totals,
         )
-    except Exception as exc:  # pylint: disable=broad-exception-caught
+    except Exception as exc:
         await _truncate_stage_table(schema)
         if PHARM_LICENSE_DEFER_ADDITIONAL_INDEXES and PHARM_LICENSE_DROP_ADDITIONAL_INDEXES_BEFORE_IMPORT:
             try:
                 await _ensure_secondary_indexes(schema)
                 await _analyze_tables(schema)
-            except Exception as cleanup_exc:  # pylint: disable=broad-exception-caught
+            except Exception as cleanup_exc:
                 logger.warning("failed to restore/analyze pharmacy license secondary indexes: %s", cleanup_exc)
         await _upsert_run(
             {

@@ -28,9 +28,9 @@ try:
                                         async_sessionmaker,
                                         create_async_engine)
 except ImportError as exc:  # pragma: no cover - triggered only before dependency upgrade
-    AsyncEngine = AsyncSession = None  # type: ignore[assignment]
-    async_sessionmaker = None  # type: ignore[assignment]
-    create_async_engine = None  # type: ignore[assignment]
+    AsyncEngine = AsyncSession = None
+    async_sessionmaker = None
+    create_async_engine = None
     _ASYNC_IMPORT_ERROR = exc
 else:
     _ASYNC_IMPORT_ERROR = None
@@ -39,7 +39,7 @@ try:
 except ImportError:  # pragma: no cover - SQLAlchemy < 1.4 fallback
     from sqlalchemy.ext.declarative import declarative_base
 
-    Base = declarative_base()  # type: ignore[assignment]
+    Base = declarative_base()
 else:
 
     class Base(DeclarativeBase):
@@ -238,13 +238,13 @@ class Database:
         pool_size = max(pool_min, 1)
         max_overflow = max(pool_max - pool_size, 0)
 
-        self.engine = create_async_engine(  # type: ignore[operator]
+        self.engine = create_async_engine(
             url,
             pool_size=pool_size,
             max_overflow=max_overflow,
             echo=_env_bool(os.getenv("HLTHPRT_DB_ECHO")),
         )
-        self.session_factory = async_sessionmaker(  # type: ignore[operator]
+        self.session_factory = async_sessionmaker(
             self.engine,
             expire_on_commit=False,
             autoflush=False,
@@ -399,7 +399,7 @@ class Database:
             token = _SESSION.set(session)
             request.ctx.sa_session = session
             request.ctx.session = session
-            request.ctx._sa_session_token = token  # type: ignore[attr-defined]
+            request.ctx._sa_session_token = token
 
         @app.middleware("response")
         async def _cleanup_session(request, response):

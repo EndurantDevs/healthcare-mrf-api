@@ -47,7 +47,7 @@ class _FakeClient:
     def __init__(self, payload: bytes):
         self._payload = payload
 
-    def get(self, _url, timeout=0):  # noqa: ARG002
+    def get(self, _url, timeout=0):
         return _FakeResponse(self._payload)
 
     async def close(self):

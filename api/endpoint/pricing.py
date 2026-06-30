@@ -1,5 +1,4 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-# pylint: disable=too-many-lines
 
 from __future__ import annotations
 
@@ -3114,7 +3113,7 @@ async def _resolve_procedure_override_codes(
     for code in normalized_codes:
         try:
             code_context = await _resolve_code_context(session, procedure_code_system, code, expand_codes=False)
-        except Exception:  # noqa: BLE001
+        except Exception:
             continue
         for internal_code in code_context.get("internal_codes", []):
             resolved_codes.add(str(internal_code))
@@ -3157,7 +3156,7 @@ async def _load_provider_quality_observed(session, *, npi: int, year: int) -> di
             qpp_payload = _row_to_dict(qpp_row)
             qpp_quality_score = _as_float(qpp_payload.get("quality_score"))
             qpp_cost_score = _as_float(qpp_payload.get("cost_score"))
-    except Exception:  # noqa: BLE001
+    except Exception:
         qpp_quality_score = None
         qpp_cost_score = None
 
@@ -3180,7 +3179,7 @@ async def _load_provider_quality_observed(session, *, npi: int, year: int) -> di
             rx_payload = _row_to_dict(rx_row)
             total_rx_claims = _as_float(rx_payload.get("total_rx_claims")) or 0.0
             total_rx_beneficiaries = _as_float(rx_payload.get("total_rx_beneficiaries")) or 0.0
-    except Exception:  # noqa: BLE001
+    except Exception:
         total_rx_claims = 0.0
         total_rx_beneficiaries = 0.0
 
@@ -3201,7 +3200,7 @@ async def _load_provider_quality_observed(session, *, npi: int, year: int) -> di
             svi_value = _as_float(svi_result.scalar())
             if svi_value is not None:
                 svi_overall = min(1.0, max(0.0, svi_value))
-        except Exception:  # noqa: BLE001
+        except Exception:
             svi_overall = PROVIDER_QUALITY_DEFAULT_SVI
 
     utilization_rate = None
@@ -3329,7 +3328,7 @@ async def _load_quality_peer_targets(
             return fallback_rows
         fallback_result = await session.execute(text(select_sql), params)
         return [_row_to_dict(row) for row in fallback_result]
-    except Exception:  # noqa: BLE001
+    except Exception:
         return []
 
 
@@ -4736,7 +4735,7 @@ async def get_pricing_provider_score(request, npi: str):
                     taxonomy_code_override=taxonomy_code,
                     specialty_key_override=specialty_key,
                 )
-            except Exception:  # noqa: BLE001
+            except Exception:
                 scores_by_benchmark_mode = {
                     mode: None
                     for mode in QUALITY_BENCHMARK_MODE_ORDER

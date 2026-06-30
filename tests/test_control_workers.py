@@ -30,7 +30,7 @@ def test_worker_registry_exposes_shared_and_finish_workers():
 
 
 def test_resolve_specs_prefers_finish_role_over_stale_start_queue():
-    specs = control_workers._resolve_specs(  # pylint: disable=protected-access
+    specs = control_workers._resolve_specs(
         {"importer": "mrf", "role": "finish", "queue": "arq:MRF"}
     )
 
@@ -38,7 +38,7 @@ def test_resolve_specs_prefers_finish_role_over_stale_start_queue():
 
 
 def test_resolve_specs_prefers_finalizing_status_over_stale_start_queue():
-    specs = control_workers._resolve_specs(  # pylint: disable=protected-access
+    specs = control_workers._resolve_specs(
         {"importer": "mrf", "status": "finalizing", "queue": "arq:MRF"}
     )
 
@@ -417,9 +417,9 @@ def test_find_running_pid_ignores_other_node_worker(monkeypatch):
     monkeypatch.setenv("HLTHPRT_IMPORT_NODE_ID", "local_mrf")
     monkeypatch.setattr(control_workers.subprocess, "check_output", lambda *_args, **_kwargs: output)
 
-    spec = control_workers._BY_QUEUE["arq:PTG"]  # pylint: disable=protected-access
+    spec = control_workers._BY_QUEUE["arq:PTG"]
 
-    assert control_workers._find_running_pid(spec) == 222  # pylint: disable=protected-access
+    assert control_workers._find_running_pid(spec) == 222
 
 
 def test_find_running_pid_requires_exact_worker_class(monkeypatch):
@@ -431,8 +431,8 @@ def test_find_running_pid_requires_exact_worker_class(monkeypatch):
     monkeypatch.setenv("HLTHPRT_IMPORT_NODE_ID", "local_mrf")
     monkeypatch.setattr(control_workers.subprocess, "check_output", lambda *_args, **_kwargs: output)
 
-    start_spec = control_workers._BY_QUEUE["arq:ProviderQuality"]  # pylint: disable=protected-access
-    finish_spec = control_workers._BY_QUEUE["arq:ProviderQuality_finish"]  # pylint: disable=protected-access
+    start_spec = control_workers._BY_QUEUE["arq:ProviderQuality"]
+    finish_spec = control_workers._BY_QUEUE["arq:ProviderQuality_finish"]
 
-    assert control_workers._find_running_pid(start_spec) == 222  # pylint: disable=protected-access
-    assert control_workers._find_running_pid(finish_spec) == 111  # pylint: disable=protected-access
+    assert control_workers._find_running_pid(start_spec) == 222
+    assert control_workers._find_running_pid(finish_spec) == 111

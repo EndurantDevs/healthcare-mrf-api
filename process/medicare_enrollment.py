@@ -222,7 +222,7 @@ async def _load_county_zip_weights(*, test_mode: bool = False) -> dict[str, list
         rows = await _load_county_zip_weight_rows()
     elif test_mode:
         previous_override = getattr(db, "_database_override", None)
-        db._database_override = None  # type: ignore[attr-defined]
+        db._database_override = None
         try:
             await db.connect()
             if not await _geo_zip_lookup_exists(db_schema):
@@ -231,7 +231,7 @@ async def _load_county_zip_weights(*, test_mode: bool = False) -> dict[str, list
             else:
                 rows = await _load_county_zip_weight_rows()
         finally:
-            db._database_override = previous_override  # type: ignore[attr-defined]
+            db._database_override = previous_override
             await db.connect()
     else:
         raise RuntimeError(f"Medicare Enrollment requires {db_schema}.geo_zip_lookup for ZIP allocation.")

@@ -49,14 +49,14 @@ class _QueryParamCollector(ast.NodeVisitor):
         self.aliases = {"request.args"}
         self.params: set[str] = set()
 
-    def visit_Assign(self, node: ast.Assign) -> None:  # type: ignore[override]
+    def visit_Assign(self, node: ast.Assign) -> None:
         if isinstance(node.value, ast.Attribute) and self._is_request_args(node.value):
             for target in node.targets:
                 if isinstance(target, ast.Name):
                     self.aliases.add(target.id)
         self.generic_visit(node)
 
-    def visit_Call(self, node: ast.Call) -> None:  # type: ignore[override]
+    def visit_Call(self, node: ast.Call) -> None:
         func = node.func
         if isinstance(func, ast.Attribute) and func.attr in {"get", "getlist"}:
             if self._resolves_to_request_args(func.value):
@@ -120,11 +120,11 @@ class _EndpointCollector(ast.NodeVisitor):
         self.prefix = prefix or ""
         self.routes: list[dict[str, object]] = []
 
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # type: ignore[override]
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self._process(node)
         self.generic_visit(node)
 
-    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:  # type: ignore[override]
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
         self._process(node)
         self.generic_visit(node)
 

@@ -124,7 +124,7 @@ async def _first_reachable_url(client, urls: list[str]) -> str | None:
                 if response.status < 400:
                     return url
                 logger.warning("CMS Doctors source candidate returned HTTP %s: %s", response.status, url)
-        except Exception as exc:  # pylint: disable=broad-exception-caught
+        except Exception as exc:
             logger.warning("CMS Doctors source candidate probe failed: %s (%s)", url, exc)
     return None
 
@@ -138,7 +138,7 @@ async def _fetch_doctors_download_url(client) -> str:
         url = await _first_reachable_url(client, _distribution_urls(dataset))
         if url:
             return url
-    except Exception as exc:  # pylint: disable=broad-exception-caught
+    except Exception as exc:
         logger.warning("Could not resolve CMS Doctors metastore URL, falling back to catalog: %s", exc)
 
     async with client.get(CMS_PROVIDER_DATA_JSON_URL, timeout=60) as response:

@@ -157,7 +157,7 @@ def _run_fixture_case() -> CaseResult:
             elapsed_seconds=time.monotonic() - started,
             metrics={"supported_resources": capability["supported_resources"], "resource_counts": resource_counts},
         )
-    except Exception as exc:  # pylint: disable=broad-exception-caught
+    except Exception as exc:
         return CaseResult(
             case_id="fixture-parser",
             kind="fixture",
@@ -243,9 +243,9 @@ async def _run_sql_typing_case_async(args: argparse.Namespace) -> CaseResult:
     status = "succeeded"
     error: str | None = None
     try:
-        import asyncpg  # pylint: disable=import-outside-toplevel
-        from sqlalchemy import text  # pylint: disable=import-outside-toplevel
-        from sqlalchemy.ext.asyncio import create_async_engine  # pylint: disable=import-outside-toplevel
+        import asyncpg
+        from sqlalchemy import text
+        from sqlalchemy.ext.asyncio import create_async_engine
 
         importer = importlib.import_module("process.provider_directory_fhir")
 
@@ -281,7 +281,7 @@ async def _run_sql_typing_case_async(args: argparse.Namespace) -> CaseResult:
             )
             seen_row = (await conn.execute(text(seen_sql), params)).fetchone()
             assert seen_row is not None and seen_row.candidate_rows == 0
-    except Exception as exc:  # pylint: disable=broad-exception-caught
+    except Exception as exc:
         status = "failed"
         error = str(exc)
     finally:
@@ -290,7 +290,7 @@ async def _run_sql_typing_case_async(args: argparse.Namespace) -> CaseResult:
         if schema_created and raw_execute is not None and not args.keep_sql_schema:
             try:
                 await raw_execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE;")
-            except Exception as exc:  # pylint: disable=broad-exception-caught
+            except Exception as exc:
                 cleanup_error = f"cleanup failed: {exc}"
                 status = "failed"
                 error = f"{error}; {cleanup_error}" if error else cleanup_error
@@ -417,7 +417,7 @@ def _run_cli_case(case_id: str, args: argparse.Namespace) -> CaseResult:
             error = proc.stdout[-4000:]
         metrics["returncode"] = proc.returncode
         return CaseResult(case_id=case_id, kind="cli", status=status, elapsed_seconds=elapsed, command=command, metrics=metrics, error=error)
-    except Exception as exc:  # pylint: disable=broad-exception-caught
+    except Exception as exc:
         return CaseResult(case_id=case_id, kind="cli", status="failed", elapsed_seconds=time.monotonic() - started, command=command, error=str(exc))
 
 
@@ -488,7 +488,7 @@ def _run_control_case(case_id: str, args: argparse.Namespace) -> CaseResult:
             metrics={"http_status": exc.code},
             error=body,
         )
-    except Exception as exc:  # pylint: disable=broad-exception-caught
+    except Exception as exc:
         return CaseResult(case_id=case_id, kind="control", status="failed", elapsed_seconds=time.monotonic() - started, error=str(exc))
 
 

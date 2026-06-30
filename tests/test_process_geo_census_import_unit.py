@@ -18,7 +18,7 @@ async def _dummy_get_http_client(*_args, **_kwargs):
         async def __aenter__(self):
             return self
 
-        async def __aexit__(self, exc_type, exc, tb):  # noqa: ANN001
+        async def __aexit__(self, exc_type, exc, tb):
             return False
 
     return _DummyClient()
@@ -69,7 +69,7 @@ class _DummyClient:
     async def __aenter__(self):
         return self
 
-    async def __aexit__(self, exc_type, exc, tb):  # noqa: ANN001
+    async def __aexit__(self, exc_type, exc, tb):
         return False
 
 
@@ -119,7 +119,7 @@ def test_to_float_handles_suppressed_values(value, expected):
 
 @pytest.mark.asyncio
 async def test_collect_profile_map_merges_and_filters_cbp_non_zcta(monkeypatch):
-    async def _fake_get_http_client(*_args, **_kwargs):  # noqa: ANN002
+    async def _fake_get_http_client(*_args, **_kwargs):
         return _DummyClient()
 
     async def _fake_fetch_rows(
@@ -241,7 +241,7 @@ async def test_collect_profile_map_merges_and_filters_cbp_non_zcta(monkeypatch):
 async def test_load_geo_census_lookup_truncates_and_writes(monkeypatch):
     captured = {"rows": []}
 
-    async def _fake_collect(*_args, **_kwargs):  # noqa: ANN002
+    async def _fake_collect(*_args, **_kwargs):
         return {
             "60654": {
                 "zip_code": "60654",
@@ -268,10 +268,10 @@ async def test_load_geo_census_lookup_truncates_and_writes(monkeypatch):
         async def __aenter__(self):
             return self
 
-        async def __aexit__(self, exc_type, exc, tb):  # noqa: ANN001
+        async def __aexit__(self, exc_type, exc, tb):
             return False
 
-    async def _fake_status(_statement, *args, **kwargs):  # noqa: ANN001, ARG001
+    async def _fake_status(_statement, *args, **kwargs):
         return None
 
     async def _fake_flush(rows):

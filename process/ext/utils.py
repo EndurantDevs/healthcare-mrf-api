@@ -445,7 +445,7 @@ async def db_startup(ctx):
     await my_init_db(db)
     from api.control_imports import (
         ensure_import_run_table,
-    )  # pylint: disable=import-outside-toplevel
+    )
 
     await ensure_import_run_table()
 
@@ -549,7 +549,7 @@ async def download_it_and_save(
                         return
                     except (
                         Exception
-                    ) as parallel_err:  # pylint: disable=broad-exception-caught
+                    ) as parallel_err:
                         print(
                             f"[warn] parallel download failed, falling back to stream for {url}: {parallel_err!r}"
                         )
@@ -830,7 +830,7 @@ async def ensure_database(test_mode: bool) -> None:
         target_database = f"{base_database}{TEST_DATABASE_SUFFIX}"
     override = target_database if target_database != base_database else None
     if getattr(db, "_database_override", None) != override:
-        db._database_override = override  # type: ignore[attr-defined]
+        db._database_override = override
     await db.connect()
 
 

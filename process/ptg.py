@@ -1,5 +1,4 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-# pylint: disable=broad-exception-caught,too-many-branches,too-many-locals,too-many-statements,too-many-lines
 
 import asyncio
 import concurrent.futures
@@ -391,7 +390,7 @@ async def _enqueue_ptg2_auto_address_refresh_after_import(
         test_mode=test_mode,
     )
     try:
-        from api.control_imports import create_import_run, ensure_import_run_table  # pylint: disable=import-outside-toplevel
+        from api.control_imports import create_import_run, ensure_import_run_table
 
         await ensure_import_run_table()
         run, created = await create_import_run(payload)

@@ -88,7 +88,7 @@ async def _push_objects_with_retry(
         try:
             await push_objects(rows, cls, rewrite=rewrite, use_copy=use_copy)
             return
-        except Exception as exc:  # pylint: disable=broad-exception-caught
+        except Exception as exc:
             if not _is_deadlock_error(exc) or attempt >= PROVIDER_QUALITY_DB_DEADLOCK_RETRIES:
                 raise
             delay = PROVIDER_QUALITY_DB_DEADLOCK_BASE_DELAY_SECONDS * (2 ** (attempt - 1))

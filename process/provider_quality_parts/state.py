@@ -209,7 +209,7 @@ async def _mark_chunk_done_with_retry(redis, run_id: str, chunk_id: str) -> None
         try:
             await _mark_chunk_done(redis, run_id, chunk_id)
             return
-        except Exception as exc:  # pylint: disable=broad-exception-caught
+        except Exception as exc:
             last_exc = exc
             if attempt >= PROVIDER_QUALITY_MARK_DONE_RETRIES:
                 break

@@ -18,7 +18,7 @@ blueprint = Blueprint("metrics")
 @blueprint.get("/metrics")
 async def prometheus_metrics(request):
     if _metrics_require_auth():
-        from api.control import _require_control_auth  # pylint: disable=import-outside-toplevel
+        from api.control import _require_control_auth
 
         _require_control_auth(request)
     return response.text(await render_prometheus_metrics(), content_type="text/plain; version=0.0.4")

@@ -95,7 +95,7 @@ async def assert_safe_url(url: str) -> None:
 class _ValidatingRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Re-validate every redirect target so a public host cannot bounce to a private one."""
 
-    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
         assert_safe_url_sync(newurl)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 

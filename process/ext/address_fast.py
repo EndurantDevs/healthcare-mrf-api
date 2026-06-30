@@ -33,7 +33,7 @@ def _as_optional_text(value: Any) -> str | None:
 def _row_tuple(row: Sequence[Any]) -> AddressRow:
     if len(row) != 6:
         raise ValueError(f"Address canonical batch rows must have 6 fields, got {len(row)}")
-    return tuple(_as_optional_text(value) for value in row)  # type: ignore[return-value]
+    return tuple(_as_optional_text(value) for value in row)
 
 
 def _zip4_norm(value: str | None) -> str | None:
@@ -71,7 +71,7 @@ def _python_canonicalize(row: AddressRow) -> dict[str, str | None]:
 
 
 def _fast_module() -> Any | None:
-    global _FAST_MODULE, _FAST_MODULE_CHECKED  # pylint: disable=global-statement
+    global _FAST_MODULE, _FAST_MODULE_CHECKED
     if _FAST_MODULE_CHECKED:
         return _FAST_MODULE
     _FAST_MODULE_CHECKED = True
@@ -81,10 +81,10 @@ def _fast_module() -> Any | None:
         return None
     try:
         version = module.canon_version()
-    except Exception as exc:  # pylint: disable=broad-exception-caught
+    except Exception as exc:
         logger.warning("Rust/PyO3 address canonicalizer version check failed; using Python fallback: %s", exc)
         return None
-    if not address_canon._canon_version_matches(version):  # pylint: disable=protected-access
+    if not address_canon._canon_version_matches(version):
         logger.warning(
             "Rust/PyO3 address canonicalizer version mismatch; using Python fallback "
             "(rust=%s python=%s)",
@@ -102,7 +102,7 @@ def canonicalize_batch(rows: Iterable[Sequence[Any]]) -> list[dict[str, str | No
     if module is not None:
         try:
             return list(module.canonicalize_batch(prepared))
-        except Exception as exc:  # pylint: disable=broad-exception-caught
+        except Exception as exc:
             logger.warning("Rust/PyO3 address canonicalizer failed; using Python fallback: %s", exc)
     return [_python_canonicalize(row) for row in prepared]
 

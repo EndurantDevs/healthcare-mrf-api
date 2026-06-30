@@ -491,7 +491,7 @@ async def process_data(ctx, task=None):  # pragma: no cover
 
             try:
                 await unzip(tmp_filename, tmpdirname, buffer_size=10 * 1024 * 1024)
-            except Exception:  # pylint: disable=broad-exception-caught
+            except Exception:
                 print(f"Failed to unzip {tmp_filename}, trying with zipfile")
                 with zipfile.ZipFile(tmp_filename, 'r') as zip_ref:
                     zip_ref.extractall(tmpdirname)
@@ -1198,7 +1198,7 @@ async def shutdown(ctx):  # pragma: no cover
         return
 
     test = make_class(NPIAddress, import_date)
-    npi_address_count = await db.scalar(select(func.count(test.npi)))  # pylint: disable=not-callable
+    npi_address_count = await db.scalar(select(func.count(test.npi)))
     if context.get("test_mode"):
         print(f"Test mode: imported {npi_address_count} NPI addresses (no minimum enforced).")
     else:

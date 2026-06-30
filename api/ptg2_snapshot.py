@@ -47,7 +47,7 @@ async def current_snapshot_id(session, requested_snapshot_id: str | None = None)
     if _snapshot_cache_enabled(session):
         cached = _snapshot_cache_get(cache_key)
         if cached is not None:
-            return cached  # type: ignore[return-value]
+            return cached
     result = await session.execute(
         text(f"SELECT snapshot_id FROM {PTG2_SCHEMA}.ptg2_current_snapshot WHERE slot = 'current'")
     )
@@ -66,7 +66,7 @@ async def current_source_snapshot_id_for_plan(session, args: dict[str, object]) 
     if _snapshot_cache_enabled(session):
         cached = _snapshot_cache_get(cache_key)
         if cached is not None:
-            return cached  # type: ignore[return-value]
+            return cached
     params: dict[str, object] = {"plan_id": requested_plan}
     market_sql = ""
     if market_type:
@@ -138,7 +138,7 @@ async def current_source_snapshot_ids_for_plan(
     if _snapshot_cache_enabled(session):
         cached = _snapshot_cache_get(cache_key)
         if cached is not None:
-            return [tuple(pair) for pair in cached]  # type: ignore[misc]
+            return [tuple(pair) for pair in cached]
     params: dict[str, object] = {"plan_id": requested_plan}
     market_sql = ""
     if market_type:
@@ -179,7 +179,7 @@ async def current_source_snapshot_ids_for_plan(
             except Exception as rollback_exc:
                 logger.debug("failed to rollback source snapshot lookup: %s", rollback_exc)
         if _snapshot_cache_enabled(session):
-            _snapshot_cache_set(cache_key, ())  # type: ignore[arg-type]
+            _snapshot_cache_set(cache_key, ())
         return []
     pairs = [
         (str(row[0] or ""), str(row[1]))
@@ -187,7 +187,7 @@ async def current_source_snapshot_ids_for_plan(
         if row[1]
     ]
     if _snapshot_cache_enabled(session):
-        _snapshot_cache_set(cache_key, tuple(pairs))  # type: ignore[arg-type]
+        _snapshot_cache_set(cache_key, tuple(pairs))
     return pairs
 
 

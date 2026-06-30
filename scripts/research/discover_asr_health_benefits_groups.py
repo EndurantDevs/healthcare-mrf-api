@@ -106,7 +106,7 @@ async def _probe_head(
                 "content_type": resp.headers.get("Content-Type"),
                 "error": None,
             }
-    except Exception as exc:  # pylint: disable=broad-exception-caught
+    except Exception as exc:
         return {
             "group_number": group_number,
             "url": url,
@@ -134,7 +134,7 @@ async def _validate_json(session: aiohttp.ClientSession, url: str, *, max_bytes:
         if not isinstance(payload, dict):
             return False, "TOC response is not a JSON object"
         return True, None
-    except Exception as exc:  # pylint: disable=broad-exception-caught
+    except Exception as exc:
         return False, str(exc)
 
 

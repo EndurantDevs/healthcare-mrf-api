@@ -8,7 +8,7 @@ import click
 try:
     import uvloop
 except ImportError:
-    uvloop = None  # noqa: F841
+    uvloop = None
 
 
 _ASYNCIO_RUN = asyncio.run
@@ -176,7 +176,7 @@ def _ptg_queue_read_limit(name: str, max_jobs: int) -> int:
     return max(16, 4 * max_jobs)
 
 
-class PTG:  # pylint: disable=too-few-public-methods
+class PTG:
     functions = [ptg_control_start]
     on_startup = db_startup
     max_jobs = int(os.environ.get("HLTHPRT_MAX_PTG_JOBS")) if os.environ.get("HLTHPRT_MAX_PTG_JOBS") else 1
@@ -193,7 +193,7 @@ class PTG:  # pylint: disable=too-few-public-methods
     job_deserializer = deserialize_job
 
 
-class PTGSmall:  # pylint: disable=too-few-public-methods
+class PTGSmall:
     functions = [ptg_control_start]
     on_startup = db_startup
     max_jobs = _ptg_max_jobs("HLTHPRT_MAX_PTG_SMALL_JOBS", 16)
@@ -206,7 +206,7 @@ class PTGSmall:  # pylint: disable=too-few-public-methods
     job_deserializer = deserialize_job
 
 
-class PTGNormal:  # pylint: disable=too-few-public-methods
+class PTGNormal:
     functions = [ptg_control_start]
     on_startup = db_startup
     max_jobs = _ptg_max_jobs("HLTHPRT_MAX_PTG_NORMAL_JOBS", 8)
@@ -219,7 +219,7 @@ class PTGNormal:  # pylint: disable=too-few-public-methods
     job_deserializer = deserialize_job
 
 
-class PTGLarge:  # pylint: disable=too-few-public-methods
+class PTGLarge:
     functions = [ptg_control_start]
     on_startup = db_startup
     max_jobs = _ptg_max_jobs("HLTHPRT_MAX_PTG_LARGE_JOBS", 3)
@@ -232,7 +232,7 @@ class PTGLarge:  # pylint: disable=too-few-public-methods
     job_deserializer = deserialize_job
 
 
-class PTGHuge:  # pylint: disable=too-few-public-methods
+class PTGHuge:
     functions = [ptg_control_start]
     on_startup = db_startup
     max_jobs = _ptg_max_jobs("HLTHPRT_MAX_PTG_HUGE_JOBS", 1)
@@ -245,7 +245,7 @@ class PTGHuge:  # pylint: disable=too-few-public-methods
     job_deserializer = deserialize_job
 
 
-class MRF_start:  # pylint: disable=invalid-name
+class MRF_start:
     functions = [init_file]
     on_startup = initial_startup
     max_jobs = 20
@@ -258,7 +258,7 @@ class MRF_start:  # pylint: disable=invalid-name
     job_deserializer = deserialize_job
 
 
-class MRF_finish:  # pylint: disable=invalid-name
+class MRF_finish:
     functions = [shutdown_mrf]
     on_startup = db_startup
     max_jobs = (
@@ -391,7 +391,7 @@ class NPI:
     job_deserializer = deserialize_job
 
 
-class NPI_finish:  # pylint: disable=invalid-name
+class NPI_finish:
     functions = [npi_shutdown]
     on_startup = db_startup
     max_jobs = (
@@ -437,7 +437,7 @@ class ClaimsProcedures(ClaimsPricing):
     queue_name = 'arq:ClaimsPricing'
 
 
-class ClaimsPricing_finish:  # pylint: disable=invalid-name
+class ClaimsPricing_finish:
     functions = [claims_pricing_finalize]
     on_startup = db_startup
     max_jobs = int(os.environ.get('HLTHPRT_MAX_CLAIMS_FINISH_JOBS')) if os.environ.get('HLTHPRT_MAX_CLAIMS_FINISH_JOBS') else 5
@@ -455,7 +455,7 @@ class ClaimsPricing_finish:  # pylint: disable=invalid-name
     job_deserializer = deserialize_job
 
 
-class ClaimsProcedures_finish(ClaimsPricing_finish):  # pylint: disable=invalid-name
+class ClaimsProcedures_finish(ClaimsPricing_finish):
     queue_name = 'arq:ClaimsPricing_finish'
 
 
@@ -471,7 +471,7 @@ class DrugClaims:
     job_deserializer = deserialize_job
 
 
-class DrugClaims_finish:  # pylint: disable=invalid-name
+class DrugClaims_finish:
     functions = [drug_claims_finalize]
     on_startup = db_startup
     max_jobs = int(os.environ.get('HLTHPRT_MAX_DRUG_CLAIMS_FINISH_JOBS')) if os.environ.get('HLTHPRT_MAX_DRUG_CLAIMS_FINISH_JOBS') else 5
@@ -517,7 +517,7 @@ class ProviderQuality:
     job_deserializer = deserialize_job
 
 
-class ProviderQuality_finish:  # pylint: disable=invalid-name
+class ProviderQuality_finish:
     functions = [
         provider_quality_finalize,
         provider_quality_materialize_lsh_shard,
@@ -554,7 +554,7 @@ class ProviderEnrichment:
     job_deserializer = deserialize_job
 
 
-class ProviderEnrichment_finish:  # pylint: disable=invalid-name
+class ProviderEnrichment_finish:
     functions = [provider_enrichment_shutdown]
     on_startup = db_startup
     max_jobs = int(os.environ.get('HLTHPRT_MAX_PROVIDER_ENRICHMENT_FINISH_JOBS')) if os.environ.get('HLTHPRT_MAX_PROVIDER_ENRICHMENT_FINISH_JOBS') else 5
@@ -600,7 +600,7 @@ class PartDFormularyNetwork:
     job_deserializer = deserialize_job
 
 
-class PartDFormularyNetwork_finish:  # pylint: disable=invalid-name
+class PartDFormularyNetwork_finish:
     functions = [partd_formulary_network_finalize]
     on_startup = db_startup
     max_jobs = int(os.environ.get("HLTHPRT_MAX_PARTD_FINISH_JOBS")) if os.environ.get("HLTHPRT_MAX_PARTD_FINISH_JOBS") else 4
@@ -625,7 +625,7 @@ class PharmacyLicense:
     job_deserializer = deserialize_job
 
 
-class PharmacyLicense_finish:  # pylint: disable=invalid-name
+class PharmacyLicense_finish:
     functions = [pharmacy_license_finalize]
     on_startup = db_startup
     max_jobs = int(os.environ.get("HLTHPRT_MAX_PHARM_LICENSE_FINISH_JOBS")) if os.environ.get("HLTHPRT_MAX_PHARM_LICENSE_FINISH_JOBS") else 4
@@ -651,7 +651,7 @@ class PlacesZcta:
     job_deserializer = deserialize_job
 
 
-class PlacesZcta_finish:  # pylint: disable=invalid-name
+class PlacesZcta_finish:
     functions = [places_zcta_shutdown]
     on_startup = db_startup
     max_jobs = int(os.environ.get("HLTHPRT_MAX_PLACES_ZCTA_FINISH_JOBS")) if os.environ.get("HLTHPRT_MAX_PLACES_ZCTA_FINISH_JOBS") else 4
@@ -677,7 +677,7 @@ class LODES:
     job_deserializer = deserialize_job
 
 
-class LODES_finish:  # pylint: disable=invalid-name
+class LODES_finish:
     functions = [lodes_shutdown]
     on_startup = db_startup
     max_jobs = 4
@@ -703,7 +703,7 @@ class MedicareEnrollment:
     job_deserializer = deserialize_job
 
 
-class MedicareEnrollment_finish:  # pylint: disable=invalid-name
+class MedicareEnrollment_finish:
     functions = [medicare_enrollment_shutdown]
     on_startup = db_startup
     max_jobs = 4
@@ -729,7 +729,7 @@ class CMSDoctors:
     job_deserializer = deserialize_job
 
 
-class CMSDoctors_finish:  # pylint: disable=invalid-name
+class CMSDoctors_finish:
     functions = [cms_doctors_shutdown]
     on_startup = db_startup
     max_jobs = 4
@@ -755,7 +755,7 @@ class FacilityAnchors:
     job_deserializer = deserialize_job
 
 
-class FacilityAnchors_finish:  # pylint: disable=invalid-name
+class FacilityAnchors_finish:
     functions = [facility_anchors_shutdown]
     on_startup = db_startup
     max_jobs = 4
@@ -781,7 +781,7 @@ class PharmacyEconomics:
     job_deserializer = deserialize_job
 
 
-class PharmacyEconomics_finish:  # pylint: disable=invalid-name
+class PharmacyEconomics_finish:
     functions = [pharmacy_economics_shutdown]
     on_startup = db_startup
     max_jobs = 4
@@ -807,7 +807,7 @@ class EntityAddressUnified:
     job_deserializer = deserialize_job
 
 
-class EntityAddressUnified_finish:  # pylint: disable=invalid-name
+class EntityAddressUnified_finish:
     functions = [entity_address_unified_shutdown]
     on_startup = db_startup
     max_jobs = 1

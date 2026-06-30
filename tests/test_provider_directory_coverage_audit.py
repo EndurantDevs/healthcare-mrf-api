@@ -97,33 +97,33 @@ def test_provider_directory_coverage_audit_accepts_credential_config_file():
 
 
 def test_provider_directory_coverage_audit_endpoint_discovery_classifier():
-    assert audit._looks_like_provider_directory_portal_target(  # pylint: disable=protected-access
+    assert audit._looks_like_provider_directory_portal_target(
         source_host="www.uhc.com",
         api_base="https://www.uhc.com/legal/interoperability-apis",
     )
-    assert audit._looks_like_provider_directory_portal_target(  # pylint: disable=protected-access
+    assert audit._looks_like_provider_directory_portal_target(
         source_host="developer.kp.org",
         api_base=None,
     )
-    assert audit._credential_backlog_endpoint_discovery_needed(  # pylint: disable=protected-access
+    assert audit._credential_backlog_endpoint_discovery_needed(
         {
             "source_host": "partners.centene.com",
             "portal_url": "https://partners.centene.com/apis",
         },
         api_base=None,
     )
-    assert not audit._looks_like_provider_directory_portal_target(  # pylint: disable=protected-access
+    assert not audit._looks_like_provider_directory_portal_target(
         source_host="api.1up.health",
         api_base="https://api.1up.health/fhir-r4/payer",
     )
-    assert not audit._looks_like_provider_directory_portal_target(  # pylint: disable=protected-access
+    assert not audit._looks_like_provider_directory_portal_target(
         source_host="fhir.cigna.com",
         api_base="https://fhir.cigna.com/ProviderDirectory/v1",
     )
 
 
 def test_provider_directory_coverage_audit_source_sample_retains_portal_url_without_api_base():
-    sample = audit._credential_source_sample(  # pylint: disable=protected-access
+    sample = audit._credential_source_sample(
         {
             "source_id": "pdfhir_uhc",
             "org_name": "UnitedHealthcare",
@@ -168,7 +168,7 @@ async def test_provider_directory_coverage_audit_credential_backlog_uses_seed_va
 
     monkeypatch.setattr(audit, "_relation_exists", AsyncMock(return_value=True))
 
-    backlog = await audit._credential_onboarding_backlog(  # pylint: disable=protected-access
+    backlog = await audit._credential_onboarding_backlog(
         FakeConn(),
         "mrf",
         sample_limit=5,
@@ -190,7 +190,7 @@ def test_provider_directory_coverage_audit_accepts_retest_results_path():
 
 
 def test_provider_directory_coverage_audit_retest_coverage_counts_current_redirected_and_missing():
-    coverage = audit._source_catalog_retest_coverage(  # pylint: disable=protected-access
+    coverage = audit._source_catalog_retest_coverage(
         {
             "tested_at": "2026-06-03T17:43:09Z",
             "results": [
@@ -325,7 +325,7 @@ def test_provider_directory_coverage_audit_renders_probe_timeout_backlog():
             ],
         },
     }
-    report["gaps"] = audit._derive_gaps(report)  # pylint: disable=protected-access
+    report["gaps"] = audit._derive_gaps(report)
 
     markdown = audit.render_markdown(report)
 
@@ -345,7 +345,7 @@ def test_provider_directory_coverage_audit_credential_spec_matches_importer_keys
         "sources": {"source_a": {"api_key": {"header": "Ocp-Apim-Subscription-Key", "value": "env:API_KEY"}}},
     }
 
-    spec = audit._credential_spec_for_source(  # pylint: disable=protected-access
+    spec = audit._credential_spec_for_source(
         {
             "source_id": "source_a",
             "org_name": "Example Payer",
@@ -361,24 +361,24 @@ def test_provider_directory_coverage_audit_credential_spec_matches_importer_keys
         "org_names:example payer",
         "sources:source_a",
     ]
-    assert audit._credential_spec_has_material(spec) is True  # pylint: disable=protected-access
+    assert audit._credential_spec_has_material(spec) is True
 
 
 def test_provider_directory_coverage_audit_credential_spec_disabled_rule_counts_missing():
-    spec = audit._credential_spec_for_source(  # pylint: disable=protected-access
+    spec = audit._credential_spec_for_source(
         {"source_id": "source_a", "api_base": "https://payer.example/fhir"},
         {"defaults": {"headers": {"X-Default": "env:DEFAULT_TOKEN"}}, "sources": {"source_a": {"enabled": False}}},
     )
 
     assert spec == {}
-    assert audit._credential_spec_has_material(spec) is False  # pylint: disable=protected-access
+    assert audit._credential_spec_has_material(spec) is False
 
 
 def test_provider_directory_coverage_audit_credential_secret_status_tracks_missing_env(monkeypatch):
     monkeypatch.delenv("PAYER_DIRECTORY_CLIENT_ID", raising=False)
     monkeypatch.setenv("PAYER_DIRECTORY_CLIENT_SECRET", "client-secret")
 
-    status = audit._credential_secret_status(  # pylint: disable=protected-access
+    status = audit._credential_secret_status(
         {
             "oauth2": {
                 "token_url": "https://auth.example/token",
@@ -400,7 +400,7 @@ def test_provider_directory_coverage_audit_credential_secret_status_ready_when_e
     monkeypatch.setenv("PAYER_DIRECTORY_CLIENT_ID", "client-id")
     monkeypatch.setenv("PAYER_DIRECTORY_CLIENT_SECRET", "client-secret")
 
-    status = audit._credential_secret_status(  # pylint: disable=protected-access
+    status = audit._credential_secret_status(
         {
             "oauth2": {
                 "token_url": "https://auth.example/token",
@@ -421,11 +421,11 @@ def test_provider_directory_coverage_audit_loads_candidate_credential_file_witho
         encoding="utf-8",
     )
     monkeypatch.setenv(
-        audit.PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV,  # pylint: disable=protected-access
+        audit.PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV,
         '{"hosts":{"env.example":{"headers":{"X-Env":"env:ENV_TOKEN"}}}}',
     )
 
-    config, source = audit._load_credentials_config(  # pylint: disable=protected-access
+    config, source = audit._load_credentials_config(
         credential_config_file=str(candidate)
     )
 
@@ -437,7 +437,7 @@ def test_provider_directory_coverage_audit_invalid_candidate_credential_file_is_
     candidate = tmp_path / "bad-provider-directory-credentials.json"
     candidate.write_text("{bad json", encoding="utf-8")
 
-    config, source = audit._load_credentials_config(  # pylint: disable=protected-access
+    config, source = audit._load_credentials_config(
         credential_config_file=str(candidate)
     )
 
@@ -446,7 +446,7 @@ def test_provider_directory_coverage_audit_invalid_candidate_credential_file_is_
 
 
 def test_provider_directory_coverage_audit_credential_backlog_export_is_non_secret():
-    export = audit._credential_backlog_export(  # pylint: disable=protected-access
+    export = audit._credential_backlog_export(
         {
             "generated_at": "2026-06-29T00:00:00Z",
             "schema": "mrf",
@@ -559,7 +559,7 @@ def test_provider_directory_coverage_audit_credential_backlog_export_is_non_secr
 
 
 def test_provider_directory_coverage_audit_credential_api_base_targets_export_is_actionable():
-    export = audit._credential_api_base_targets_export(  # pylint: disable=protected-access
+    export = audit._credential_api_base_targets_export(
         {
             "generated_at": "2026-06-29T00:00:00Z",
             "schema": "mrf",
@@ -659,7 +659,7 @@ def test_provider_directory_coverage_audit_credential_api_base_targets_export_is
 
 
 def test_provider_directory_coverage_audit_credential_config_template_groups_by_host():
-    template = audit._credential_config_template_export(  # pylint: disable=protected-access
+    template = audit._credential_config_template_export(
         {
             "generated_at": "2026-06-29T00:00:00Z",
             "schema": "mrf",
@@ -743,8 +743,8 @@ def test_provider_directory_coverage_audit_credential_config_template_groups_by_
         "This host has several known or sampled FHIR path variants; verify one host-level credential is valid for every path before enabling.",
         "This host has both OAuth2 and API-key credential groups; avoid a single host-level rule unless the payer portal confirms both credentials are required together for every path. Prefer api_bases or sources rules for payer-specific auth."
     ]
-    oauth_env_prefix = audit._credential_api_base_env_prefix(oauth_api_base)  # pylint: disable=protected-access
-    api_key_env_prefix = audit._credential_api_base_env_prefix(api_key_api_base)  # pylint: disable=protected-access
+    oauth_env_prefix = audit._credential_api_base_env_prefix(oauth_api_base)
+    api_key_env_prefix = audit._credential_api_base_env_prefix(api_key_api_base)
     assert api_base_rules[oauth_api_base]["oauth2"] == {
         "token_url": f"env:{oauth_env_prefix}_TOKEN_URL",
         "client_id": f"env:{oauth_env_prefix}_CLIENT_ID",
@@ -775,7 +775,7 @@ def test_provider_directory_coverage_audit_credential_config_template_groups_by_
 
 
 def test_provider_directory_coverage_audit_credential_priority_export_rolls_up_hosts():
-    priority = audit._credential_priority_export(  # pylint: disable=protected-access
+    priority = audit._credential_priority_export(
         {
             "generated_at": "2026-06-29T00:00:00Z",
             "schema": "mrf",
@@ -977,7 +977,7 @@ def test_provider_directory_coverage_audit_credential_priority_export_rolls_up_h
 
 
 def test_provider_directory_coverage_audit_credential_config_template_flags_portal_like_bases():
-    template = audit._credential_config_template_export(  # pylint: disable=protected-access
+    template = audit._credential_config_template_export(
         {
             "generated_at": "2026-06-29T00:00:00Z",
             "schema": "mrf",
@@ -1030,7 +1030,7 @@ def test_provider_directory_coverage_audit_credential_config_template_flags_port
 
 
 def test_provider_directory_coverage_audit_credential_config_template_flags_developer_portal_hosts():
-    template = audit._credential_config_template_export(  # pylint: disable=protected-access
+    template = audit._credential_config_template_export(
         {
             "generated_at": "2026-06-29T00:00:00Z",
             "schema": "mrf",
@@ -1113,7 +1113,7 @@ def test_provider_directory_coverage_audit_ref_match_accepts_absolute_url_suffix
 
 
 def test_provider_directory_coverage_audit_plan_network_context_sql_uses_ref_bearing_resources():
-    sql = audit._plan_network_context_cte_sql("mrf")  # pylint: disable=protected-access
+    sql = audit._plan_network_context_cte_sql("mrf")
 
     assert '"mrf"."provider_directory_insurance_plan"' in sql
     assert '"mrf"."provider_directory_practitioner_role"' in sql
@@ -1261,7 +1261,7 @@ def test_provider_directory_coverage_audit_gaps_for_source_resource_projection_c
 
 
 def test_provider_directory_coverage_audit_projection_gap_reason_classifier():
-    reason = audit._provider_directory_projection_gap_reason  # pylint: disable=protected-access
+    reason = audit._provider_directory_projection_gap_reason
 
     assert reason({"valid_npi_organization_address_rows": 7}) == (
         "valid_npi_organization_address_projection_pending"
@@ -1771,7 +1771,7 @@ async def test_provider_directory_coverage_audit_source_resource_coverage_summar
     monkeypatch.setattr(audit, "_relation_exists", relation_exists)
     monkeypatch.setattr(audit, "_column_exists", column_exists)
 
-    summary = await audit._source_resource_coverage_summary(  # pylint: disable=protected-access
+    summary = await audit._source_resource_coverage_summary(
         FakeConn(),
         "mrf",
         sample_limit=5,

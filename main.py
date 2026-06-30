@@ -17,16 +17,16 @@ load_dotenv(dotenv_path=env_path)
 with open(os.environ['HLTHPRT_LOG_CFG'], encoding="utf-8") as log_config_file:
     logging.config.dictConfig(yaml.safe_load(log_config_file))
 
-import arq.cli  # noqa: E402
-import click  # noqa: E402
-import uvloop  # noqa: E402
-from asyncpg import connection  # noqa: E402
-from asyncpg.connection import ServerCapabilities  # noqa: E402
-from sanic import Sanic  # noqa: E402
+import arq.cli
+import click
+import uvloop
+from asyncpg import connection
+from asyncpg.connection import ServerCapabilities
+from sanic import Sanic
 
-from api import init_api  # noqa: E402
-from db.migrator import db_group  # noqa: E402
-from process import process_group, process_group_end  # noqa: E402
+from api import init_api
+from db.migrator import db_group
+from process import process_group, process_group_end
 
 
 def _new_event_loop():

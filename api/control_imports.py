@@ -268,7 +268,7 @@ def _json_safe_default(value: Any) -> Any:
 
 
 def importer_registry() -> list[dict[str, Any]]:
-    from process import process_group, process_group_end  # pylint: disable=import-outside-toplevel
+    from process import process_group, process_group_end
 
     finish_commands = set(process_group_end.commands)
     importers: list[dict[str, Any]] = []
@@ -341,13 +341,13 @@ async def node_health() -> dict[str, Any]:
     try:
         workers = _worker_health()
         checks["workers"] = {"ok": True, "running": sum(1 for item in workers.values() if item.get("running"))}
-    except Exception as exc:  # pylint: disable=broad-exception-caught
+    except Exception as exc:
         checks["workers"] = {"ok": False, "error": str(exc)}
     queue_depth: dict[str, int] = {}
     try:
         queue_depth = _queue_depths()
         checks["queue_depth"] = {"ok": True}
-    except Exception as exc:  # pylint: disable=broad-exception-caught
+    except Exception as exc:
         checks["queue_depth"] = {"ok": False, "error": str(exc)}
     failing_checks = sorted(name for name, check in checks.items() if not check.get("ok"))
     return {
@@ -397,7 +397,7 @@ async def _database_check() -> dict[str, Any]:
     try:
         await db.execute(text("SELECT 1"))
         return {"ok": True}
-    except Exception as exc:  # pylint: disable=broad-exception-caught
+    except Exception as exc:
         return {"ok": False, "error": str(exc)}
 
 
@@ -405,12 +405,12 @@ def _redis_check() -> dict[str, Any]:
     try:
         _redis_client().ping()
         return {"ok": True}
-    except Exception as exc:  # pylint: disable=broad-exception-caught
+    except Exception as exc:
         return {"ok": False, "error": str(exc)}
 
 
 def _worker_health() -> dict[str, Any]:
-    from api.control_workers import worker_registry  # pylint: disable=import-outside-toplevel
+    from api.control_workers import worker_registry
 
     return {
         item["queue"]: {
@@ -455,7 +455,7 @@ def _redis_client() -> redis.Redis:
 
 
 async def ensure_import_run_table() -> None:
-    global _IMPORT_RUN_ENSURED  # pylint: disable=global-statement
+    global _IMPORT_RUN_ENSURED
     if _IMPORT_RUN_ENSURED:
         return
     async with _IMPORT_RUN_ENSURE_LOCK:
@@ -497,7 +497,7 @@ def _quote_ident(value: str) -> str:
 
 
 def parse_ptg_toc_preview(payload: dict[str, Any]) -> dict[str, Any]:
-    from process.ptg_parts.source_jobs import parse_toc_catalog_entries  # pylint: disable=import-outside-toplevel
+    from process.ptg_parts.source_jobs import parse_toc_catalog_entries
 
     toc_content = payload.get("toc")
     if not isinstance(toc_content, dict):
@@ -612,17 +612,17 @@ def _finish_params_for(importer: str, current: dict[str, Any], payload: dict[str
 
 def _finish_function(importer: str):
     if importer in {"claims-pricing", "claims-procedures"}:
-        from process.claims_pricing import finish_main  # pylint: disable=import-outside-toplevel
+        from process.claims_pricing import finish_main
     elif importer == "drug-claims":
-        from process.drug_claims import finish_main  # pylint: disable=import-outside-toplevel
+        from process.drug_claims import finish_main
     elif importer == "provider-quality":
-        from process.provider_quality import finish_main  # pylint: disable=import-outside-toplevel
+        from process.provider_quality import finish_main
     elif importer == "partd-formulary-network":
-        from process.partd_formulary_network import finish_main  # pylint: disable=import-outside-toplevel
+        from process.partd_formulary_network import finish_main
     elif importer == "pharmacy-license":
-        from process.pharmacy_license import finish_main  # pylint: disable=import-outside-toplevel
+        from process.pharmacy_license import finish_main
     elif importer == "mrf":
-        from process.initial import finish_main  # pylint: disable=import-outside-toplevel
+        from process.initial import finish_main
     else:
         raise ValueError(f"importer does not support finalize: {importer}")
     return finish_main
@@ -869,7 +869,7 @@ async def _enqueue_import_start(row: dict[str, Any]) -> dict[str, Any]:
             job_deserializer=deserialize_job,
         )
         job = await redis.enqueue_job(adapter["function"], job_payload, **kwargs)
-    except Exception as exc:  # pylint: disable=broad-exception-caught
+    except Exception as exc:
         return {
             "status": "failed",
             "phase_detail": "enqueue failed",
@@ -1047,7 +1047,7 @@ async def _set_cancel_flag(run_id: str) -> dict[str, Any]:
         )
         await redis.set(f"cancel:{run_id}", "1", ex=CANCEL_FLAG_TTL_SECONDS)
         return {"redis": True, "key": f"cancel:{run_id}", "ttl_seconds": CANCEL_FLAG_TTL_SECONDS}
-    except Exception as exc:  # pylint: disable=broad-exception-caught
+    except Exception as exc:
         return {"redis": False, "error": str(exc)}
 
 
@@ -1084,7 +1084,7 @@ async def _remove_queued_job(run: dict[str, Any]) -> dict[str, Any]:
             "deleted_job_key": deleted > 0,
             "deleted_keys": deleted,
         }
-    except Exception as exc:  # pylint: disable=broad-exception-caught
+    except Exception as exc:
         return {"redis": False, "removed": False, "error": str(exc), "queue": queue, "job_id": job_id}
 
 

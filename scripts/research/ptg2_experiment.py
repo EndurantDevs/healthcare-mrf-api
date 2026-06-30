@@ -624,7 +624,7 @@ def sql_literal(value: str) -> str:
 
 
 class QuietHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
-    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - stdlib method name
+    def log_message(self, format: str, *args: Any) -> None:
         return
 
 
@@ -1147,7 +1147,7 @@ def post_json(url: str, payload: dict[str, Any], *, token: str) -> dict[str, Any
             "Authorization": f"Bearer {token}",
         },
     )
-    with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310 - operator-controlled URL
+    with urllib.request.urlopen(request, timeout=30) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
@@ -1159,7 +1159,7 @@ def get_json(url: str, *, token: str) -> dict[str, Any]:
             "Authorization": f"Bearer {token}",
         },
     )
-    with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310 - operator-controlled URL
+    with urllib.request.urlopen(request, timeout=30) as response:
         return json.loads(response.read().decode("utf-8"))
 
 

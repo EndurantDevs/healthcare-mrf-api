@@ -33,7 +33,7 @@ async def _reset_import_run_schema() -> None:
     await asyncio.sleep(0)
     try:
         await db.connect()
-    except Exception as exc:  # pylint: disable=broad-exception-caught
+    except Exception as exc:
         pytest.skip(f"Postgres is not available for DB-backed control tests: {exc}")
     schema = ImportRun.__table__.schema or os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     if not schema.replace("_", "").isalnum():
@@ -42,7 +42,7 @@ async def _reset_import_run_schema() -> None:
     async with db.engine.begin() as conn:
         await conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
         await conn.execute(text(f'DROP TABLE IF EXISTS "{schema}"."{ImportRun.__tablename__}" CASCADE'))
-    control_imports._IMPORT_RUN_ENSURED = False  # pylint: disable=protected-access
+    control_imports._IMPORT_RUN_ENSURED = False
     await control_imports.ensure_import_run_table()
 
 
@@ -53,7 +53,7 @@ async def _drop_import_run_schema() -> None:
             await conn.execute(text(f'DROP TABLE IF EXISTS "{schema}"."{ImportRun.__tablename__}" CASCADE'))
     await db.disconnect()
     await asyncio.sleep(0)
-    control_imports._IMPORT_RUN_ENSURED = False  # pylint: disable=protected-access
+    control_imports._IMPORT_RUN_ENSURED = False
 
 
 async def _fake_enqueue(row: dict) -> dict:

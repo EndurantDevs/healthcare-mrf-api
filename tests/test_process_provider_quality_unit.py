@@ -24,7 +24,7 @@ class _FakeRedis:
         self.list_store: dict[str, list[str]] = {}
         self.jobs: list[dict[str, object]] = []
 
-    async def set(self, key: str, value, ex=None, nx: bool = False):  # noqa: ANN001, ARG002
+    async def set(self, key: str, value, ex=None, nx: bool = False):
         if nx and key in self.store:
             return False
         self.store[key] = str(value)
@@ -53,7 +53,7 @@ class _FakeRedis:
         self.store[key] = str(current)
         return current
 
-    async def expire(self, key: str, ttl: int):  # noqa: ARG002
+    async def expire(self, key: str, ttl: int):
         return 1 if key in self.store or key in self.list_store else 0
 
     async def sadd(self, key: str, value: str):
@@ -78,7 +78,7 @@ class _FakeRedis:
         payload: dict[str, object],
         _queue_name: str,
         _job_id: str,
-        _max_tries: int | None = None,  # noqa: ARG002
+        _max_tries: int | None = None,
     ):
         self.jobs.append(
             {
@@ -464,7 +464,7 @@ async def test_load_qpp_rows_parses_real_cms_field_names(monkeypatch, tmp_path):
 async def test_materialize_query_contains_state_benchmark_and_extra_measures(monkeypatch):
     statements: list[str] = []
 
-    async def _fake_status(statement: str, *args, **kwargs):  # noqa: ARG001
+    async def _fake_status(statement: str, *args, **kwargs):
         statements.append(statement)
 
     async def _fake_table_exists(_schema: str, _table: str) -> bool:
@@ -504,7 +504,7 @@ async def test_materialize_query_contains_state_benchmark_and_extra_measures(mon
 async def test_materialize_cohort_query_contains_lsh_and_fallback_rules(monkeypatch):
     statements: list[str] = []
 
-    async def _fake_status(statement: str, *args, **kwargs):  # noqa: ARG001
+    async def _fake_status(statement: str, *args, **kwargs):
         statements.append(statement)
 
     async def _fake_table_exists(_schema: str, _table: str) -> bool:
@@ -688,7 +688,7 @@ async def test_wait_for_materialize_phase_completion_logs_duration_summary(monke
 
     observed: list[tuple] = []
 
-    def _capture_info(msg, *args, **kwargs):  # noqa: ANN001, ARG002
+    def _capture_info(msg, *args, **kwargs):
         observed.append((msg, args))
 
     monkeypatch.setattr(provider_quality.logger, "info", _capture_info)

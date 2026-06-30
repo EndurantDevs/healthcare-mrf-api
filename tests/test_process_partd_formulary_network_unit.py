@@ -12,7 +12,7 @@ module = importlib.import_module("process.partd_formulary_network")
 
 
 def test_extract_dispensing_fee_fields_maps_known_headers():
-    values = module._row_index(  # pylint: disable=protected-access
+    values = module._row_index(
         {
             "Brand Dispensing Fee 30 Days Supply": "1.25",
             "Brand Dispensing Fee 60 Days Supply": "2.50",
@@ -25,7 +25,7 @@ def test_extract_dispensing_fee_fields_maps_known_headers():
             "Selected Drug Dispensing Fee 90 Days Supply": "4.75",
         }
     )
-    fees = module._extract_dispensing_fee_fields(values)  # pylint: disable=protected-access
+    fees = module._extract_dispensing_fee_fields(values)
     assert fees["dispensing_fee_brand_30"] == 1.25
     assert fees["dispensing_fee_generic_60"] == 0.5
     assert fees["dispensing_fee_selected_drug_90"] == 4.75
@@ -44,7 +44,7 @@ def test_activity_row_from_source_includes_dispensing_fee_fields():
         "Generic Dispensing Fee 90 Days Supply": "0.30",
         "Selected Drug Dispensing Fee 60 Days Supply": "2.20",
     }
-    activity = module._activity_row_from_source(  # pylint: disable=protected-access
+    activity = module._activity_row_from_source(
         row,
         snapshot_id="quarterly:20260101:test",
         source_type="quarterly",
@@ -57,7 +57,7 @@ def test_activity_row_from_source_includes_dispensing_fee_fields():
 
 
 def test_match_cost_fields_includes_fee_token():
-    entries = module._match_cost_fields(  # pylint: disable=protected-access
+    entries = module._match_cost_fields(
         {
             "Brand Dispensing Fee 30 Days Supply": "1.23",
             "Some Amount": "9.99",
@@ -69,11 +69,11 @@ def test_match_cost_fields_includes_fee_token():
 
 
 def test_entry_kind_accepts_singular_pharmacy_network_file():
-    assert module._entry_kind("2026_Q1/Pharmacy Network File.csv") == "activity"  # pylint: disable=protected-access
+    assert module._entry_kind("2026_Q1/Pharmacy Network File.csv") == "activity"
 
 
 def test_explicit_artifacts_accepts_source_urls_and_metadata():
-    artifacts = module._explicit_artifacts(  # pylint: disable=protected-access
+    artifacts = module._explicit_artifacts(
         {
             "artifacts": [
                 {
@@ -98,7 +98,7 @@ def test_stage_artifact_file_copies_local_path(tmp_path):
     target = tmp_path / "target.zip"
     source.write_bytes(b"zip-bytes")
 
-    asyncio.run(module._stage_artifact_file(str(source), str(target)))  # pylint: disable=protected-access
+    asyncio.run(module._stage_artifact_file(str(source), str(target)))
 
     assert target.read_bytes() == b"zip-bytes"
 
@@ -135,7 +135,7 @@ def test_wait_for_activity_chunks_emits_live_progress_and_fallback(monkeypatch):
     monkeypatch.setattr(module, "enqueue_live_progress", lambda **payload: events.append(payload))
 
     rows, done_chunks = asyncio.run(
-        module._wait_for_activity_chunks(  # pylint: disable=protected-access
+        module._wait_for_activity_chunks(
             FakeRedis(),
             "run_partd",
             "quarterly:20260428:test",
@@ -178,7 +178,7 @@ def test_process_activity_file_emits_byte_progress(tmp_path, monkeypatch):
     monkeypatch.setattr(module, "PARTD_PROGRESS_INTERVAL_ROWS", 1)
 
     accepted = asyncio.run(
-        module._process_activity_file(  # pylint: disable=protected-access
+        module._process_activity_file(
             source,
             snapshot_id="quarterly:20260428:test",
             source_type="quarterly",
@@ -212,7 +212,7 @@ def test_materialize_pricing_snapshot_analyzes_stage_and_uses_single_aggregate(m
 
     monkeypatch.setattr(module, "db", FakeDB())
 
-    asyncio.run(module._materialize_pricing_snapshot("mrf", "monthly:20260520:test"))  # pylint: disable=protected-access
+    asyncio.run(module._materialize_pricing_snapshot("mrf", "monthly:20260520:test"))
 
     assert executed[0] == "ANALYZE mrf.partd_medication_cost_stage_v2;"
     insert_sql = next(stmt for stmt in executed if "INSERT INTO mrf.partd_medication_cost_v2" in stmt)
@@ -250,7 +250,7 @@ def test_flush_batches_dedupes_exact_pricing_rows_before_copy(monkeypatch):
     }
     other_plan = dict(row, plan_id="S1234002000")
 
-    asyncio.run(module._flush_batches([], [dict(row), dict(row), other_plan]))  # pylint: disable=protected-access
+    asyncio.run(module._flush_batches([], [dict(row), dict(row), other_plan]))
 
     assert len(captured) == 1
     model, rows = captured[0]
@@ -259,7 +259,7 @@ def test_flush_batches_dedupes_exact_pricing_rows_before_copy(monkeypatch):
 
 
 def test_ensure_columns_adds_missing_columns(monkeypatch):
-    table = module.PartDPharmacyActivityStage.__table__  # pylint: disable=protected-access
+    table = module.PartDPharmacyActivityStage.__table__
     existing = {column.name for column in table.columns}
     existing.remove("dispensing_fee_brand_30")
     executed: list[str] = []
@@ -275,7 +275,7 @@ def test_ensure_columns_adds_missing_columns(monkeypatch):
             executed.append(stmt)
 
     monkeypatch.setattr(module, "db", FakeDB())
-    asyncio.run(module._ensure_columns(module.PartDPharmacyActivityStage, "mrf"))  # pylint: disable=protected-access
+    asyncio.run(module._ensure_columns(module.PartDPharmacyActivityStage, "mrf"))
     assert any("ADD COLUMN IF NOT EXISTS \"dispensing_fee_brand_30\"" in stmt for stmt in executed)
 
 
@@ -288,7 +288,7 @@ def test_fill_activity_state_from_zip_uses_geo_lookup(monkeypatch):
 
     monkeypatch.setattr(module, "db", FakeDB())
 
-    asyncio.run(module._fill_activity_state_from_zip("mrf", "partd_pharmacy_activity_stage_v2"))  # pylint: disable=protected-access
+    asyncio.run(module._fill_activity_state_from_zip("mrf", "partd_pharmacy_activity_stage_v2"))
 
     assert executed
     stmt = executed[0]
@@ -307,7 +307,7 @@ def test_fill_activity_address_from_npi_uses_primary_address(monkeypatch):
 
     monkeypatch.setattr(module, "db", FakeDB())
 
-    asyncio.run(module._fill_activity_address_from_npi("mrf", "partd_pharmacy_activity_stage_v2"))  # pylint: disable=protected-access
+    asyncio.run(module._fill_activity_address_from_npi("mrf", "partd_pharmacy_activity_stage_v2"))
 
     assert executed
     stmt = executed[0]

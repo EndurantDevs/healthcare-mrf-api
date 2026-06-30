@@ -1,5 +1,4 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-# pylint: disable=too-many-lines
 
 from __future__ import annotations
 
@@ -466,7 +465,7 @@ async def _download_source_file(
             if attempt >= DOWNLOAD_RETRIES:
                 break
             await asyncio.sleep(min(5 * attempt, 20))
-        except Exception as exc:  # pylint: disable=broad-exception-caught
+        except Exception as exc:
             logger.warning(
                 "provider-quality download failed (%s/%s) for %s: %r",
                 attempt,
@@ -1822,7 +1821,7 @@ async def provider_quality_start(ctx, task: dict[str, Any] | None = None, **_kwa
                     failure_manifest,
                     status="failed_source",
                 )
-            except Exception as metadata_exc:  # pylint: disable=broad-exception-caught
+            except Exception as metadata_exc:
                 logger.warning("Failed to write provider-quality failed_source metadata: %r", metadata_exc)
             raise
     finally:

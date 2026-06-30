@@ -1,5 +1,4 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-# pylint: disable=too-many-lines
 
 from __future__ import annotations
 
@@ -255,7 +254,7 @@ async def _mark_chunk_done_with_retry(redis, run_id: str, chunk_id: str) -> None
         try:
             await _mark_chunk_done(redis, run_id, chunk_id)
             return
-        except Exception as exc:  # pylint: disable=broad-exception-caught
+        except Exception as exc:
             last_exc = exc
             if attempt >= CLAIMS_MARK_DONE_RETRIES:
                 break
@@ -364,7 +363,7 @@ async def _push_objects_with_retry(
         try:
             await push_objects(rows, cls, rewrite=rewrite, use_copy=use_copy)
             return
-        except Exception as exc:  # pylint: disable=broad-exception-caught
+        except Exception as exc:
             if not _is_deadlock_error(exc) or attempt >= CLAIMS_DB_DEADLOCK_RETRIES:
                 raise
             delay = CLAIMS_DB_DEADLOCK_BASE_DELAY_SECONDS * (2 ** (attempt - 1))
@@ -728,7 +727,7 @@ async def _fetch_catalog() -> dict[str, Any]:
                 DOWNLOAD_RETRIES,
                 exc,
             )
-        except Exception as exc:  # pylint: disable=broad-exception-caught
+        except Exception as exc:
             last_error = exc
             logger.warning("Retrying catalog fetch (%s/%s): %r", attempt, DOWNLOAD_RETRIES, exc)
         await asyncio.sleep(min(3 * attempt, 10))
@@ -847,7 +846,7 @@ async def _download_source_file(
                 exc,
             )
             await asyncio.sleep(min(5 * attempt, 20))
-        except Exception as exc:  # pylint: disable=broad-exception-caught
+        except Exception as exc:
             if attempt >= DOWNLOAD_RETRIES:
                 raise
             logger.warning(

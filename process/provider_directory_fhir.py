@@ -907,7 +907,7 @@ def _fetch_oauth2_client_credentials_token_sync(oauth2: dict[str, Any], *, timeo
     try:
         with urllib.request.urlopen(request, timeout=timeout, context=_ssl_context()) as response:
             payload = _decode_json_body(response.read(1024 * 1024))
-    except Exception:  # pylint: disable=broad-exception-caught
+    except Exception:
         return None
     if not payload:
         return None
@@ -4445,7 +4445,7 @@ def _fetch_json_sync(
         except Exception:
             body = b""
         return exc.code, _decode_json_body(body), None, int((time.monotonic() - started) * 1000)
-    except Exception as exc:  # pylint: disable=broad-exception-caught
+    except Exception as exc:
         return None, None, f"{type(exc).__name__}: {exc}", int((time.monotonic() - started) * 1000)
 
 
@@ -4480,7 +4480,7 @@ def _post_json_sync(
         except Exception:
             body = b""
         return exc.code, _decode_json_body(body), None, int((time.monotonic() - started) * 1000)
-    except Exception as exc:  # pylint: disable=broad-exception-caught
+    except Exception as exc:
         return None, None, f"{type(exc).__name__}: {exc}", int((time.monotonic() - started) * 1000)
 
 
@@ -4887,7 +4887,7 @@ async def _bulk_http_get_json(
             body = await response.read()
             header_map = {str(key).lower(): str(value) for key, value in response.headers.items()}
             return response.status, header_map, _decode_json_body(body), None
-    except Exception as exc:  # pylint: disable=broad-exception-caught
+    except Exception as exc:
         return None, {}, None, f"{type(exc).__name__}: {exc}"
 
 
@@ -5021,7 +5021,7 @@ async def _stream_bulk_export_output_rows(
                     return rows, rows_fetched, rows_written, row_limit_reached, error
             await flush_pending_rows()
             return rows, rows_fetched, rows_written, row_limit_reached, None
-    except Exception as exc:  # pylint: disable=broad-exception-caught
+    except Exception as exc:
         return rows, rows_fetched, rows_written, row_limit_reached, f"{type(exc).__name__}: {exc}"
 
 
@@ -6042,7 +6042,7 @@ async def _mark_provider_directory_progress(
             progress=progress,
             metrics=metrics,
         )
-    except Exception as exc:  # pylint: disable=broad-exception-caught
+    except Exception as exc:
         print(f"Provider Directory progress update failed: {type(exc).__name__}: {exc}")
 
 

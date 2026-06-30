@@ -165,7 +165,7 @@ def _ensure_spec(spec: WorkerSpec, payload: dict[str, Any]) -> dict[str, Any]:
 
     try:
         pid = _start_process(spec, payload)
-    except Exception as exc:  # pylint: disable=broad-exception-caught
+    except Exception as exc:
         return {**state, "status": "failed", "message": str(exc)}
     return {**_worker_state(spec), "status": "started", "pid": pid}
 
@@ -184,7 +184,7 @@ def _start_process(spec: WorkerSpec, payload: dict[str, Any]) -> int:
     if import_id:
         env["HLTHPRT_IMPORT_ID_OVERRIDE"] = import_id
     with log_path.open("ab") as log_handle:
-        process = subprocess.Popen(  # pylint: disable=consider-using-with
+        process = subprocess.Popen(
             cmd,
             cwd=str(_repo_root()),
             env=env,
@@ -700,10 +700,10 @@ def _pid_matches_spec(pid: int | None, spec: WorkerSpec) -> bool:
         return False
     try:
         output = subprocess.check_output(["ps", "eww", "-p", str(pid), "-o", "command="], text=True)
-    except Exception:  # pylint: disable=broad-exception-caught
+    except Exception:
         try:
             output = subprocess.check_output(["ps", "-p", str(pid), "-o", "command="], text=True)
-        except Exception:  # pylint: disable=broad-exception-caught
+        except Exception:
             return True
     return _process_matches_worker_spec(output, spec)
 
@@ -713,10 +713,10 @@ def _pid_matches_current_node(pid: int | None) -> bool:
         return False
     try:
         output = subprocess.check_output(["ps", "eww", "-p", str(pid), "-o", "command="], text=True)
-    except Exception:  # pylint: disable=broad-exception-caught
+    except Exception:
         try:
             output = subprocess.check_output(["ps", "-p", str(pid), "-o", "command="], text=True)
-        except Exception:  # pylint: disable=broad-exception-caught
+        except Exception:
             return True
     return _matches_current_node(output)
 
@@ -724,10 +724,10 @@ def _pid_matches_current_node(pid: int | None) -> bool:
 def _find_running_pid(spec: WorkerSpec) -> int | None:
     try:
         output = subprocess.check_output(["ps", "eww", "-axo", "pid=,command="], text=True)
-    except Exception:  # pylint: disable=broad-exception-caught
+    except Exception:
         try:
             output = subprocess.check_output(["ps", "-axo", "pid=,command="], text=True)
-        except Exception:  # pylint: disable=broad-exception-caught
+        except Exception:
             return None
     for line in output.splitlines():
         text = line.strip()

@@ -1,5 +1,4 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-# pylint: disable=not-callable
 
 import sanic.exceptions
 from sanic import Blueprint, response

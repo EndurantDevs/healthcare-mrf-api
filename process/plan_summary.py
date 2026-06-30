@@ -59,11 +59,11 @@ def _normalize_keyword_groups(keywords: Sequence[Sequence[str]] | Sequence[str])
         return []
     first = keywords[0] if isinstance(keywords, Sequence) else keywords
     if isinstance(first, (tuple, list)):
-        groups = keywords  # type: ignore[assignment]
+        groups = keywords
     else:
-        groups = (keywords,)  # type: ignore[assignment]
+        groups = (keywords,)
     normalized = []
-    for group in groups:  # type: ignore[arg-type]
+    for group in groups:
         values = tuple(word.strip().lower() for word in group if isinstance(word, str) and word.strip())
         if values:
             normalized.append(values)

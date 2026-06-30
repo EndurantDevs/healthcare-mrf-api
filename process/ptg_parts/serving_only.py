@@ -354,7 +354,7 @@ def _serving_only_merge_worker_result(
 ) -> None:
     if not src:
         return
-    seen: dict[str, set[Any]] = dest.setdefault("__seen__", {})  # type: ignore[assignment]
+    seen: dict[str, set[Any]] = dest.setdefault("__seen__", {})
     for key, id_field in _SERVING_ONLY_WORKER_KEY_FIELDS.items():
         rows = src.get(key) or []
         if not rows:

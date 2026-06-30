@@ -1,5 +1,4 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-# pylint: disable=too-many-lines
 
 from __future__ import annotations
 
@@ -4596,7 +4595,7 @@ async def _search_one_ptg2_snapshot(
     cache_key = _ptg2_response_cache_key(snapshot_id, args, pagination)
     cached_payload = _ptg2_response_cache_get(cache_key)
     if cached_payload is not _CACHE_MISS:
-        return cached_payload  # type: ignore[return-value]
+        return cached_payload
     serving_tables = await snapshot_serving_tables(session, snapshot_id)
     db_payload = await search_ptg2_serving_table(
         session,

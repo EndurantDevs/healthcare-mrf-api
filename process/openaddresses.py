@@ -245,7 +245,7 @@ def _street_match_key(value: Any) -> str | None:
         return None
     parts = []
     for token in re.findall(r"[a-z0-9]+", text.lower()):
-        normalized = address_canon._street_token_norm(token)  # pylint: disable=protected-access
+        normalized = address_canon._street_token_norm(token)
         if normalized:
             parts.append(normalized)
     return "".join(parts) or None
@@ -844,7 +844,7 @@ def _iter_record_batches(
 
 def _next_record_batch(iterator: Iterable[_RecordBatch]) -> _RecordBatch | None:
     try:
-        return next(iterator)  # type: ignore[arg-type]
+        return next(iterator)
     except StopIteration:
         return None
 

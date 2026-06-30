@@ -1,5 +1,4 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-# pylint: disable=too-many-branches,too-many-locals,too-many-statements,too-many-nested-blocks,broad-exception-caught,too-many-return-statements,not-callable,too-many-lines
 
 import asyncio
 import datetime
@@ -3110,7 +3109,7 @@ async def shutdown(ctx, task):
         )
     )
     await upsert_history.status()
-    print("Plans in DB: ", await db.scalar(select(func.count(Plan.plan_id))))  # pylint: disable=E1101
+    print("Plans in DB: ", await db.scalar(select(func.count(Plan.plan_id))))
     if test_mode:
         summary_ready, missing_summary_tables = await _plan_summary_dependencies_ready(db_schema)
         if not summary_ready:

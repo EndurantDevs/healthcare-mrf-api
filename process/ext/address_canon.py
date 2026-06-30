@@ -812,7 +812,7 @@ async def _rust_canon_version_is_current(binary: Path) -> bool:
         return cached
     try:
         payload = await _rust_canon_version(binary)
-    except Exception as exc:  # pylint: disable=broad-exception-caught
+    except Exception as exc:
         logger.warning("Rust address canonicalizer version check failed; falling back to SQL: %s", exc)
         _RUST_CANON_VERSION_CACHE[cache_key] = False
         return False

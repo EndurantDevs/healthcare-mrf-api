@@ -1,5 +1,4 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-# pylint: disable=not-callable,too-many-lines
 
 import asyncio
 import json
@@ -527,7 +526,7 @@ def _cache_set(cache: dict[str, tuple[float, Any]], key: str, value: Any) -> Any
 def _filter_cache_get() -> Optional[dict[str, bool]]:
     if not ENABLE_NPI_SCHEMA_CACHE:
         return None
-    global _NPI_FILTER_CAPABILITIES_CACHE  # pylint: disable=global-statement
+    global _NPI_FILTER_CAPABILITIES_CACHE
     if _NPI_FILTER_CAPABILITIES_CACHE is None:
         return None
     cached_at, schema_key, value = _NPI_FILTER_CAPABILITIES_CACHE
@@ -541,7 +540,7 @@ def _filter_cache_get() -> Optional[dict[str, bool]]:
 
 
 def _filter_cache_set(value: dict[str, bool]) -> dict[str, bool]:
-    global _NPI_FILTER_CAPABILITIES_CACHE  # pylint: disable=global-statement
+    global _NPI_FILTER_CAPABILITIES_CACHE
     if ENABLE_NPI_SCHEMA_CACHE:
         _NPI_FILTER_CAPABILITIES_CACHE = (
             time.monotonic(),
@@ -554,7 +553,7 @@ def _filter_cache_set(value: dict[str, bool]) -> dict[str, bool]:
 def _primary_total_cache_get() -> Optional[int]:
     if not ENABLE_NPI_SCHEMA_CACHE:
         return None
-    global _NPI_PRIMARY_TOTAL_CACHE  # pylint: disable=global-statement
+    global _NPI_PRIMARY_TOTAL_CACHE
     if _NPI_PRIMARY_TOTAL_CACHE is None:
         return None
     cached_at, value = _NPI_PRIMARY_TOTAL_CACHE
@@ -565,7 +564,7 @@ def _primary_total_cache_get() -> Optional[int]:
 
 
 def _primary_total_cache_set(value: int) -> int:
-    global _NPI_PRIMARY_TOTAL_CACHE  # pylint: disable=global-statement
+    global _NPI_PRIMARY_TOTAL_CACHE
     if ENABLE_NPI_SCHEMA_CACHE:
         _NPI_PRIMARY_TOTAL_CACHE = (time.monotonic(), int(value))
     return int(value)
@@ -4659,7 +4658,7 @@ async def get_npi(request, npi):
                 )
                 .status()
             )
-        except Exception as exc:  # pylint: disable=broad-exception-caught
+        except Exception as exc:
             logger.warning("Could not archive address checksum=%s: %s", checksum, exc)
 
     async def _update_address(x):
@@ -4756,7 +4755,7 @@ async def get_npi(request, npi):
                         d["geo_source"] = res.geo_source
                         d["geocode_source"] = res.geocode_source
                         d["geocode_quality"] = res.geocode_quality
-                except Exception as exc:  # pylint: disable=broad-exception-caught
+                except Exception as exc:
                     logger.debug("OpenAddresses geocoding failed for %s: %s", t_addr, exc)
 
             if (sync_geocode or force_address_update) and not d["lat"]:
@@ -4791,7 +4790,7 @@ async def get_npi(request, npi):
                             d["formatted_address"] = geo_data["features"][0]["place_name"]
                         d["place_id"] = None
                         d["geo_source"] = "mapbox"
-                except Exception as exc:  # pylint: disable=broad-exception-caught
+                except Exception as exc:
                     logger.debug("Mapbox geocoding failed for %s: %s", t_addr, exc)
 
             if (sync_geocode or force_address_update) and not d["lat"]:
@@ -4824,7 +4823,7 @@ async def get_npi(request, npi):
                         d["formatted_address"] = geo_data["results"][0]["formatted_address"]
                         d["place_id"] = geo_data["results"][0]["place_id"]
                         d["geo_source"] = "google"
-                except Exception as exc:  # pylint: disable=broad-exception-caught
+                except Exception as exc:
                     logger.warning("Google geocoding failed for %s: %s", t_addr, exc)
 
             if update_geo and d.get("lat"):
