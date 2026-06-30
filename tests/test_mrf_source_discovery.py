@@ -1107,6 +1107,52 @@ def test_healthsparq_query_expansion_splits_concatenated_plan_label():
     assert sponsor_name == "Example Packaging"
 
 
+def test_healthsparq_metadata_rows_apply_query_expansion_plan_labels():
+    source = {
+        "source_id": "src_aetna",
+        "metadata_json": {
+            "raw": {
+                "target_payer_query": "Example Packaging",
+                "query_expansion_source": True,
+            }
+        },
+    }
+    payload = {
+        "files": [
+            {
+                "reportingEntityName": "Example Reporting Entity",
+                "reportingEntityType": "Third Party Administrator_222",
+                "reportingPlans": [
+                    {
+                        "planId": "222222222",
+                        "planIdType": "ein",
+                        "planMarketType": "group",
+                        "planName": "Example Water Co. DBA Example PackagingHSA Aetna Choice POS II",
+                    }
+                ],
+                "fileSchema": "IN_NETWORK_RATES",
+                "fileName": "2026-06-01_example.json.gz",
+                "filePath": "2026-06-01/inNetworkRates/example.json.gz",
+            }
+        ]
+    }
+
+    plan_rows, file_rows = discovery._healthsparq_rows_from_metadata(
+        source,
+        "https://mrf.healthsparq.com/example/prd/mrf/A/BRAND/latest_metadata.json",
+        payload,
+    )
+
+    assert [row["plan_name"] for row in plan_rows] == ["HSA Aetna Choice POS II"]
+    [file_row] = file_rows
+    assert file_row["plan_names"] == ["HSA Aetna Choice POS II"]
+    plan_info = file_row["metadata_json"]["plan_info"]
+    assert plan_info[0]["plan_name"] == "HSA Aetna Choice POS II"
+    assert plan_info[0]["plan_sponsor_name"] == "Example Packaging"
+    assert plan_info[0]["company_name"] == "Example Packaging"
+    assert plan_info[0]["engine_plan_hash"]
+
+
 def test_healthsparq_metadata_rows_preserve_engine_plan_hashes_for_catalog_sync():
     source = {
         "source_id": "src_aetna",

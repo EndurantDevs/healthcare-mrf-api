@@ -2304,6 +2304,7 @@ def _healthsparq_rows_from_metadata(
     if not isinstance(files, list):
         return [], []
     now = _utc_now()
+    target_query = _source_target_payer_query(source)
     plan_rows_by_id: dict[str, dict[str, Any]] = {}
     file_rows_by_id: dict[str, dict[str, Any]] = {}
     for file_item in files:
@@ -2317,9 +2318,12 @@ def _healthsparq_rows_from_metadata(
             for plan in (file_item.get("reportingPlans") or [])
             if isinstance(plan, dict)
         ]
-        for plan in reporting_plans:
+        normalized_plan_info = _healthsparq_plan_info(
+            file_item, target_query=target_query
+        )
+        for plan, normalized_plan in zip(reporting_plans, normalized_plan_info):
             plan_id = str(plan.get("planId") or "").strip()
-            plan_name = plan.get("planName")
+            plan_name = normalized_plan.get("plan_name") or plan.get("planName")
             market_type = plan.get("planMarketType")
             plan_row_id = _id(
                 "mrfplan",
@@ -2343,6 +2347,8 @@ def _healthsparq_rows_from_metadata(
                 "metadata_json": {
                     "raw_plan": plan,
                     "resolver": "healthsparq_public_mrf",
+                    "plan_sponsor_name": normalized_plan.get("plan_sponsor_name"),
+                    "company_name": normalized_plan.get("company_name"),
                 },
                 "first_seen_at": now,
                 "last_seen_at": now,
@@ -2364,16 +2370,20 @@ def _healthsparq_rows_from_metadata(
             "description": file_item.get("fileName"),
             "network_name": file_item.get("fileName"),
             "plan_ids": [
-                plan.get("planId") for plan in reporting_plans if plan.get("planId")
+                plan.get("plan_id")
+                for plan in normalized_plan_info
+                if plan.get("plan_id")
             ],
             "plan_names": [
-                plan.get("planName") for plan in reporting_plans if plan.get("planName")
+                plan.get("plan_name")
+                for plan in normalized_plan_info
+                if plan.get("plan_name")
             ],
             "market_types": sorted(
                 {
-                    plan.get("planMarketType")
-                    for plan in reporting_plans
-                    if plan.get("planMarketType")
+                    plan.get("plan_market_type")
+                    for plan in normalized_plan_info
+                    if plan.get("plan_market_type")
                 }
             ),
             "is_signed_url": _looks_signed(file_url),
@@ -2393,7 +2403,7 @@ def _healthsparq_rows_from_metadata(
                 "last_updated_on": file_item.get("lastUpdatedOn"),
                 "reporting_entity_name": file_item.get("reportingEntityName"),
                 # Normalized to the import-control preview plan shape (snake_case keys).
-                "plan_info": _healthsparq_plan_info(file_item),
+                "plan_info": normalized_plan_info,
             },
             "first_seen_at": now,
             "last_seen_at": now,
