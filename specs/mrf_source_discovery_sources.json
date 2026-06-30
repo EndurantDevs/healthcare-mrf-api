@@ -5,7 +5,11 @@
     "sapphire",
     "aetna_health1",
     "uhc_public_blobs",
-    "mymedicalshopper_talon"
+    "mymedicalshopper_talon",
+    "healthcarebluebook_mrf",
+    "html_mrf_with_healthcarebluebook",
+    "auxiant_wordpress",
+    "payercompass_mrf"
   ],
   "providers": {
     "master-list": {

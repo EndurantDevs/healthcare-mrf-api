@@ -962,6 +962,30 @@ def test_candidate_query_expansion_keeps_searchable_platform_sources():
         ),
         hosting_platform="aetna_health1",
     )
+    healthcarebluebook = discovery.SourceCandidate(
+        payer_name="Example TPA",
+        provider="master-list",
+        index_url="https://mrf.healthcarebluebook.com/ExampleTPA",
+        hosting_platform="healthcarebluebook_mrf",
+    )
+    payercompass = discovery.SourceCandidate(
+        payer_name="Example Network",
+        provider="master-list",
+        index_url="https://example.mrf.payercompass.com/",
+        hosting_platform="payercompass_mrf",
+    )
+    delegated_healthcarebluebook = discovery.SourceCandidate(
+        payer_name="Example Delegated TPA",
+        provider="master-list",
+        index_url="https://example.test/transparency-in-coverage",
+        hosting_platform="html_mrf_with_healthcarebluebook",
+    )
+    auxiant_directory = discovery.SourceCandidate(
+        payer_name="Example Auxiant",
+        provider="master-list",
+        index_url="https://transparency.example.test/directory-of-data-sources/",
+        hosting_platform="auxiant_wordpress",
+    )
     direct_group = discovery.SourceCandidate(
         payer_name="Example Employer",
         provider="master-list",
@@ -971,6 +995,12 @@ def test_candidate_query_expansion_keeps_searchable_platform_sources():
 
     assert discovery._candidate_supports_source_query_expansion(sapphire)
     assert discovery._candidate_supports_source_query_expansion(aetna)
+    assert discovery._candidate_supports_source_query_expansion(healthcarebluebook)
+    assert discovery._candidate_supports_source_query_expansion(payercompass)
+    assert discovery._candidate_supports_source_query_expansion(
+        delegated_healthcarebluebook
+    )
+    assert discovery._candidate_supports_source_query_expansion(auxiant_directory)
     assert not discovery._candidate_supports_source_query_expansion(direct_group)
     expanded = discovery._candidate_with_target_payer_query(
         sapphire, "Example Packaging"
@@ -1004,6 +1034,14 @@ async def test_private_query_context_expands_supported_public_sources(
                     "https://health1.aetna.com/app/public/#/one/insurerCode=DENTAL&brandCode=ALICSI/"
                     "machine-readable-transparency-in-coverage | aliases: Aetna Dental; benefit_lines: dental |"
                 ),
+                (
+                    "| Example Directory TPA | tpa | https://mrf.healthcarebluebook.com/ExampleTPA | "
+                    "aliases: Example TPA; benefit_lines: medical |"
+                ),
+                (
+                    "| Example PayerCompass | tpa | https://example.mrf.payercompass.com/ | "
+                    "aliases: Example Dental Network; benefit_lines: dental |"
+                ),
             ]
         ),
         encoding="utf-8",
@@ -1011,7 +1049,7 @@ async def test_private_query_context_expands_supported_public_sources(
     private_path = tmp_path / "private-context.csv"
     private_path.write_text(
         "ALIAS,MEDICAL_CARRIERS,DENTAL_CARRIERS,VISION_CARRIERS\n"
-        "Example Packaging,Aetna,Aetna Dental,\n",
+        "Example Packaging,\"Aetna; Example TPA\",\"Aetna Dental; Example Dental Network\",\n",
         encoding="utf-8",
     )
     config_path = tmp_path / "sources.json"
@@ -1027,9 +1065,15 @@ async def test_private_query_context_expands_supported_public_sources(
                     }
                 },
                 "platform_resolvers": {
-                    "aetna_health1": {"type": "healthsparq_public_mrf"}
+                    "aetna_health1": {"type": "healthsparq_public_mrf"},
+                    "healthcarebluebook_mrf": {"type": "healthcarebluebook_mrf"},
+                    "payercompass_mrf": {"type": "payercompass_mrf"},
                 },
-                "source_query_expansion_platforms": ["aetna_health1"],
+                "source_query_expansion_platforms": [
+                    "aetna_health1",
+                    "healthcarebluebook_mrf",
+                    "payercompass_mrf",
+                ],
             }
         ),
         encoding="utf-8",
@@ -1049,7 +1093,9 @@ async def test_private_query_context_expands_supported_public_sources(
 
     assert [candidate.payer_name for candidate in expanded] == [
         "Example Aetna",
+        "Example Directory TPA",
         "Example Dental",
+        "Example PayerCompass",
     ]
     assert {
         candidate.raw_payload["private_context_benefit_line"]

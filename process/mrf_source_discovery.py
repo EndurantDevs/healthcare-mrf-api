@@ -104,6 +104,10 @@ DEFAULT_SOURCE_QUERY_EXPANSION_PLATFORMS = (
     "aetna_health1",
     "uhc_public_blobs",
     "mymedicalshopper_talon",
+    "healthcarebluebook_mrf",
+    "html_mrf_with_healthcarebluebook",
+    "auxiant_wordpress",
+    "payercompass_mrf",
 )
 DEFAULT_PRIVATE_QUERY_CONTEXT_LIMIT = 5000
 LEGAL_ENTITY_QUERY_STOPWORDS = {
