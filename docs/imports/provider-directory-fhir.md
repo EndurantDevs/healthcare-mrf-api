@@ -23,6 +23,21 @@ such as `/Practitioner`, or `/provider-directory`. If a candidate publishes a
 valid CapabilityStatement, that resolved base is persisted back to
 `provider_directory_source.api_base` and used for the same run's resource fetches.
 
+The importer can also consume a pinned `provider-directory-db`
+`retest_results.json` snapshot as a supplemental source list:
+`--retest-results-path /path/to/retest_results.json` or
+`--retest-results-url https://.../retest_results.json`. This is explicit rather
+than enabled by default. It turns `valid`, `valid_non_fhir`, and
+`auth_required` retest rows into seed rows, then dedupes after normal source
+overrides so richer SQLite seed rows win when the same payer/base is already
+represented. `auth_required` retest rows are seeded as credential-gated
+Provider Directory candidates, not as immediately importable open endpoints.
+
+Source ids are calculated after source-specific URL overrides and generic
+resource-path normalization. This keeps equivalent seed rows, such as a payer
+portal URL and the confirmed FHIR base, from creating new logical source ids on
+future imports.
+
 ## Tables
 
 - `provider_directory_source`
@@ -55,7 +70,9 @@ to payer-directory corroboration. The helper
 
 - `entity_address_unified.npi` / `inferred_npi` to `provider_directory_practitioner.npi` or
   `provider_directory_organization.npi`;
-- FHIR roles/affiliations to referenced FHIR locations; and
+- FHIR roles/affiliations to referenced FHIR locations, including locations
+  reached indirectly through referenced `HealthcareService.location` resources;
+  and
 - FHIR `provider_directory_location.address_key` to unified
   `entity_address_unified.address_key`.
 
@@ -95,6 +112,16 @@ Seed the source catalog without network probes:
 
 ```bash
 python main.py start provider-directory-fhir --seed-db-path /tmp/provider_directory.db --seed-only --no-probe
+```
+
+Seed from the SQLite catalog plus a pinned retest snapshot:
+
+```bash
+python main.py start provider-directory-fhir \
+  --seed-db-path /tmp/provider_directory.db \
+  --retest-results-path /tmp/retest_results.json \
+  --seed-only \
+  --no-probe
 ```
 
 Probe every seed source and import full open-access resource pages:
@@ -165,9 +192,10 @@ each selected resource type, the importer first tries `[base]/$export?_type=...`
 with `Prefer: respond-async`, polls the returned status URL, streams matching
 NDJSON output files, and writes rows through the same parser/COPY upsert path as
 normal resource pages. If the payer returns a normal unsupported status such as
-400, 404, 405, or 501, the importer falls back to the existing paginated FHIR
-search. Export attempts that are accepted but later fail are recorded in the
-per-source resource diagnostics as `fetch_mode=bulk_export` errors.
+400, 404, 405, or 501, or returns a synchronous non-Bulk FHIR payload, the
+importer falls back to the existing paginated FHIR search. Export attempts that
+are accepted but later fail are recorded in the per-source resource diagnostics
+as `fetch_mode=bulk_export` errors.
 
 Full-refresh stale cleanup also uses an append-only unlogged seen stage by
 default (`HLTHPRT_PROVIDER_DIRECTORY_SEEN_STAGE=1`). During fetch, resource ids
@@ -200,6 +228,14 @@ progress back to import-control when the running worker image includes progress
 callbacks. Older active workers still show generic `process_data running`
 progress until they complete.
 
+The import-control default schedule plan runs the Provider Directory chain
+monthly: full `provider-directory-fhir` resource import, latest-run
+Provider Directory partial `entity-address-unified` refresh, then the optional
+table-backed PTG corroboration publish once the unified-address dependency is
+fresh. This is the production path for continuous reimports; ad hoc smoke runs
+should avoid publishing global artifacts unless they intentionally refresh the
+shared serving evidence.
+
 ## Credentialed API Access
 
 CMS requires these Provider Directory APIs to be public at the user-data level,
@@ -211,6 +247,19 @@ database. Configure either:
 HLTHPRT_PROVIDER_DIRECTORY_CREDENTIALS_JSON
 HLTHPRT_PROVIDER_DIRECTORY_CREDENTIALS_FILE
 ```
+
+`credential_config_file` can also be passed as an import parameter or CLI
+`--credential-config-file` for a single run. This is intended for secret-mounted
+files, not inline secret values. In dev Kubernetes the worker config points
+`HLTHPRT_PROVIDER_DIRECTORY_CREDENTIALS_FILE` at:
+
+```text
+/var/run/healthporta/provider-directory/credentials.json
+```
+
+Create or update the optional `provider-directory-credentials` secret with a
+`credentials.json` key to enable credentialed scheduled imports without
+changing the schedule payload.
 
 The JSON shape is:
 
@@ -253,6 +302,62 @@ do not receive payer-specific headers or query parameters. Probe metadata stores
 only non-secret descriptors such as matched rule and header/query parameter
 names.
 
+Import run metrics include non-secret source-selection counters:
+`source_import_sources_considered`, `source_import_sources_selected`,
+`source_import_skipped_probe_not_valid`, `source_import_skipped_open_only`,
+`source_import_skipped_validation_status`,
+`source_import_skipped_auth_required_policy`,
+`source_import_sources_selected_declared_credentialed`, and
+`source_import_sources_selected_auth_required_seed`. After installing a
+credential secret, these counters show whether credentialed sources moved from
+probe/auth skips into selected resource imports.
+
+The coverage audit reads the same credential config environment/file and reports
+how many auth/onboarding-gated sources match a configured credential rule. It
+does not print secret values, header values, query parameter values, OAuth client
+secrets, or resolved tokens. Treat the `missing config` count as the credential
+onboarding backlog that still blocks full Provider Directory coverage. The
+`configured` count means a source matched a credential rule; the
+`credential secret readiness` line separately reports how many matched rules
+have all referenced `env:` variables present in the running environment.
+Use `--format credential-backlog-json` to export a smaller non-secret onboarding
+artifact with host/auth groups, sample payer names, source-id/API-base samples,
+market impact counts for Medicare Advantage, Medicaid MCO, CHIP, and QHP
+sources, and placeholder credential-rule templates.
+Use `--format credential-api-bases-json` to export the complete non-secret list
+of blocked API-base targets, grouped with source counts, market counts, sample
+payers/source ids, and path-scoped credential-rule templates.
+Use `--format credential-priority-json` to aggregate those groups by host and
+rank credential onboarding targets by missing-config impact, then regulated
+market coverage.
+Use `--format credential-config-template-json` to generate a host-level
+`HLTHPRT_PROVIDER_DIRECTORY_CREDENTIALS_JSON` starting point from the same
+backlog. The template intentionally uses `env:` placeholders and `_notes`;
+confirm each payer portal's token URL, scope, API-key header, and registration
+terms before enabling a rule.
+When a host-level rule needs review, the template also includes sample
+`api_bases` credential rules for the sampled FHIR bases in that backlog group.
+Use those as the safer pattern for path-scoped onboarding; increase
+`--sample-limit` for broader host-template samples, or use
+`--format credential-api-bases-json` when you need every blocked API-base target
+from a high-volume host. Markdown reports display only the first 50
+credential/onboarding groups; the JSON exports are the machine-readable source
+of truth for complete onboarding. The JSON exports include `api_base_count`,
+`sample_api_base_count`, and `api_base_sample_complete` so operators can see
+whether the generated path-scoped rules cover every known base in that group or
+only the requested sample.
+Use the market counts in the backlog/template summaries to prioritize
+credentials that unblock the most regulated-market coverage first.
+Template entries can also include `_review` when sampled API bases or source
+hosts look like portal/documentation URLs, or when one host has several known or
+sampled FHIR path variants. `_review` also flags mixed host-level auth schemes such as one host
+having both OAuth2 and API-key groups. In those cases, keep the generated host
+rule as a starting point only; prefer `api_bases` or `sources` credential rules
+unless the payer portal confirms that the same credentials and auth scheme apply
+to every path on that host.
+Resolve those review notes before installing the rule so credentials are bound
+to the real FHIR base and not only to a public landing page.
+
 Known payer caveat: Aetna publishes an open CapabilityStatement at
 `https://apif1.aetna.com/fhir/v1/providerdirectory/metadata`, but resource reads
 such as `Practitioner`, `PractitionerRole`, `Organization`, `Location`, and
@@ -273,12 +378,67 @@ seed rows to that FHIR base and uses a source-specific GraphQL connector at
 and organization rows into the normal Provider Directory practitioner,
 organization, location, role, and affiliation tables.
 
+Cigna seed rows can appear through Availity non-FHIR/onboarding paths even
+though Cigna publishes a public R4 Provider Directory at
+`https://fhir.cigna.com/ProviderDirectory/v1`. The importer maps Cigna's
+Availity `cigna/r4` seed rows to that public FHIR base so clean source refreshes
+do not lose the directly importable Cigna endpoint.
+
+Centene seed rows can point at the public partner portal catalog page
+`https://partners.centene.com/apis` instead of a FHIR REST base. The portal's
+public API catalog advertises `FHIR - Provider Directory` with authentication
+`None`, production host `https://iopc-pd.api.centene.com/iopc/pd/`, and path
+`/fhir/providerdirectory`. The importer maps those portal rows to
+`https://iopc-pd.api.centene.com/iopc/pd/fhir/providerdirectory` and records the
+catalog/doc URLs in metadata. Runtime probes remain the authority for whether
+that base is reachable from the current environment; CloudFront/WAF 403s are
+kept as probe diagnostics instead of treating the portal page as an importable
+FHIR endpoint.
+
+UnitedHealthcare seed rows can point at the UHC interoperability landing page
+`https://www.uhc.com/legal/interoperability-apis`. UHC advertises Provider
+Directory Core metadata at `https://flex.optum.com/fhirpublic/R4/metadata`, so
+the importer maps those landing-page rows to the concrete FHIR base
+`https://flex.optum.com/fhirpublic/R4`. Runtime probes still decide whether the
+base is reachable from the import environment; connection timeouts stay as probe
+diagnostics instead of converting the landing page into a resource import.
+
+SCAN Health Plan seed rows can point at the developer portal
+`https://developer.scanhealthplan.com`. The portal's embedded Provider Directory
+OpenAPI spec advertises `https://providerdirectory.scanhealthplan.com` as the
+FHIR server, and `/metadata` returns an InterSystems FHIR CapabilityStatement.
+The importer maps SCAN portal rows to that FHIR base. Broad unfiltered resource
+searches can return `SearchTooCostly`, so SCAN resource harvesting may require
+source-specific paging/filter tuning even though endpoint discovery is resolved.
+The importer partitions SCAN `Practitioner` and `Organization` searches by
+two-letter name/family prefixes and `Location` searches by one-letter name
+prefixes. `PractitionerRole` is not fetched through the broad paged fallback.
+When SCAN roles are requested with practitioners, organizations, or locations,
+the importer reverse-lookups roles from those fetched resource ids, such as
+`PractitionerRole?practitioner=Practitioner/{id}`, and records
+`scan_practitioner_role_requires_reverse_lookup` only when no seed resources are
+available for that reverse lookup.
+
 ## Self-Harness
 
 Run the parser-only harness:
 
 ```bash
 ./venv314/bin/python scripts/research/provider_directory_fhir_harness.py
+```
+
+Run the disposable SQL typing harness before deploys that change artifact
+publishing SQL. It creates a temporary schema, executes the generated
+address-key batch SQL through SQLAlchemy's asyncpg dialect with null keyset
+parameters, and drops the schema:
+
+```bash
+./venv314/bin/python scripts/research/provider_directory_fhir_harness.py \
+  --sql-typing \
+  --db-host 127.0.0.1 \
+  --db-port 5440 \
+  --db-database healthporta_test \
+  --db-user nick
 ```
 
 Run a bounded local DB-backed CLI case:
@@ -292,6 +452,7 @@ HLTHPRT_TEST_DATABASE_SUFFIX=_test \
 ./venv314/bin/python scripts/research/provider_directory_fhir_harness.py \
   --local-cli \
   --seed-db-path /tmp/provider-directory-db/data/provider_directory.db \
+  --retest-results-path /tmp/provider-directory-db/data/retest_results.json \
   --limit 10 \
   --import-resources \
   --resources InsurancePlan,Practitioner \
@@ -321,8 +482,15 @@ network refs:
   --port 5440 \
   --database healthporta \
   --schema mrf \
+  --retest-results-path /tmp/retest_results.json \
   --format markdown
 ```
+
+When `--retest-results-path` is present, the audit checks that every
+`valid`, `valid_non_fhir`, and `auth_required` retest endpoint is covered by
+the current normalized `provider_directory_source` catalog or by an intentional
+source override redirect. Missing retest endpoints are emitted as gaps with
+importable and credential-gated counts split out.
 
 In dev Kubernetes, stream a pod-safe source/resource audit into the healthcare
 pod so it uses the deployed DB connection secrets without printing them. Keep
@@ -337,6 +505,57 @@ sudo k3s kubectl -n healthporta-dev exec -i deploy/healthcare-mrf-api -- \
   < scripts/research/provider_directory_coverage_audit.py
 ```
 
+Generate the non-secret credential onboarding artifact from the same deployed
+environment:
+
+```bash
+sudo k3s kubectl -n healthporta-dev exec -i deploy/healthcare-mrf-api -- \
+  venv/bin/python - --schema mrf --format credential-backlog-json \
+  --pod-safe \
+  --statement-timeout-ms 30000 \
+  < scripts/research/provider_directory_coverage_audit.py \
+  > provider-directory-credential-backlog.json
+```
+
+Generate a fill-in credential config template from the same backlog:
+
+```bash
+sudo k3s kubectl -n healthporta-dev exec -i deploy/healthcare-mrf-api -- \
+  venv/bin/python - --schema mrf --format credential-config-template-json \
+  --pod-safe \
+  --statement-timeout-ms 30000 \
+  < scripts/research/provider_directory_coverage_audit.py \
+  > provider-directory-credentials.template.json
+```
+
+Generate a prioritized host-level onboarding list:
+
+```bash
+sudo k3s kubectl -n healthporta-dev exec -i deploy/healthcare-mrf-api -- \
+  venv/bin/python - --schema mrf --format credential-priority-json \
+  --pod-safe \
+  --statement-timeout-ms 30000 \
+  < scripts/research/provider_directory_coverage_audit.py \
+  > provider-directory-credential-priority.json
+```
+
+Validate a candidate credential config file without changing the deployed
+worker environment:
+
+```bash
+sudo k3s kubectl -n healthporta-dev exec -i deploy/healthcare-mrf-api -- \
+  venv/bin/python - --schema mrf --format markdown \
+  --pod-safe \
+  --credential-config-file /path/in/pod/provider-directory-credentials.candidate.json \
+  --statement-timeout-ms 30000 \
+  < scripts/research/provider_directory_coverage_audit.py
+```
+
+The override is audit-only. When `--credential-config-file` is provided, the
+audit evaluates that file by itself and does not merge in live
+`HLTHPRT_PROVIDER_DIRECTORY_CREDENTIALS_JSON` or
+`HLTHPRT_PROVIDER_DIRECTORY_CREDENTIALS_FILE` values.
+
 The report is intentionally gap-oriented. Treat these as recurring operational
 signals:
 
@@ -347,6 +566,21 @@ signals:
   Known onboarding gateway hosts, such as Availity and Centene partner
   portals, are treated the same way when they return non-FHIR HTML without an
   applied credential.
+- `credential config coverage` shows how many auth/onboarding-gated sources
+  currently match secret-backed credential rules in the running environment.
+  A high `missing config` count means the next coverage work is credential
+  onboarding, not parser or source discovery work.
+- `credential secret readiness` shows whether the matched credential rules are
+  deploy-ready in the current environment. A rule that references missing
+  `env:` variables is counted as configured but not secret-ready.
+- `probe timeout backlog` groups source metadata probes that exceeded the
+  per-source hard deadline by host/auth type. Treat large timeout groups as
+  endpoint discovery or resolver tuning work. During ad hoc local/dev probes,
+  `HLTHPRT_PROVIDER_DIRECTORY_SOURCE_PROBE_HARD_TIMEOUT` can cap one source's
+  total metadata-probe time, while
+  `HLTHPRT_PROVIDER_DIRECTORY_PROBE_FLUSH_EVERY` controls how often completed
+  source/capability probe rows are persisted. Normal full probes flush
+  periodically so one slow host does not hide all completed probe results.
 - `valid_non_fhir` should be read together with the audit's
   `non-FHIR credential/gateway responses` line. If nearly all `valid_non_fhir`
   rows are credential/gateway responses, the next coverage work is credential
@@ -355,6 +589,11 @@ signals:
   payer-specific endpoint discovery work.
 - Provider Directory rows without `address_key` are not usable for canonical
   address search or pricing address corroboration.
+- `plan/network context` counts sources with imported `InsurancePlan` rows,
+  sources that expose network refs on plans/roles/affiliations, and how many of
+  those refs resolve to FHIR network `Organization` names. Use this before PTG
+  matching to tell whether missing overlap is caused by missing plan/network
+  data or by name normalization/matching.
 - unresolved network refs mean the payer exposed a network reference but the
   imported FHIR resources did not resolve it to an `Organization` name/alias.
 - PTG rows with Provider Directory network refs but no resolved network-name
@@ -363,28 +602,59 @@ signals:
 
 ## Schedule
 
-`import-control` defines `default-provider-directory-fhir-daily` at `20 1 * * *`
-America/Chicago. The default parameters probe the full seed catalog, run a full
-open-access resource refresh (`resource_limit=0`, `page_limit=0`,
-`page_count=100`, `stream_batch_size=5000`, `bulk_export=true`,
-`source_concurrency=4`, `publish_artifacts=true`), and delete stale rows only
-for completed source/resource scans.
+`import-control` defines `default-provider-directory-fhir-monthly` at
+`20 1 5 * *` America/Chicago. The default parameters probe the full seed
+catalog, include the upstream `provider-directory-db` retest snapshot
+supplement, include credentialed/auth-required sources when credentials are
+configured, run a full resource refresh (`resource_limit=0`,
+`linked_resource_limit=50000`, `page_limit=0`, `page_count=100`,
+`stream_batch_size=5000`, `bulk_export=true`, `source_concurrency=4`,
+`publish_artifacts=true`, `publish_corroboration=false`), and delete stale rows
+only for completed source/resource scans.
+`import-control` also schedules a follow-up artifact-only Provider Directory
+run after the monthly `entity-address-unified` Provider Directory partial
+projection. That run uses `publish_artifacts_only=true` and
+`publish_corroboration=true`, and requires the projection to have succeeded
+within the 24-hour same-cycle window before rebuilding the table-backed PTG
+corroboration relation. This keeps served PTG network-name and `InsurancePlan`
+evidence aligned with the latest unified address rows instead of publishing the
+expensive corroboration join before the projection has caught up.
+Full-refresh source catalog syncs also prune source rows that disappeared from
+the current upstream catalog, but only for unfiltered `full_refresh` +
+`stale_cleanup` runs that include the supplemental `retest_results` catalog.
+Filtered payer smokes, limited runs, and seed DB-only refreshes never delete
+source catalog rows. This keeps credential-gated retest aliases from being
+removed just because an optional supplemental catalog was omitted from a manual
+refresh. Seed-only catalog refreshes preserve existing live probe state until
+the probe phase updates it.
+During artifact publishing, Location address-key stamping uses bounded keyset
+batches even when scoped through the full-refresh seen-stage table. Location
+address archive publishing uses the same seen-stage/current-run scope when
+building its temporary stage table, so the monthly run avoids broad
+`provider_directory_location` publish scans for unchanged rows.
 
 `import-control` also defines
-`default-entity-address-unified-provider-directory-daily` at `20 2 * * *`
+`default-entity-address-unified-provider-directory-monthly` at `20 2 5 * *`
 America/Chicago. It runs `entity-address-unified` with
-`refresh_mode=provider-directory-partial`, `serving_only_refresh=true`, and
+`refresh_mode=provider-directory-partial`,
+`provider_directory_partial_scope=latest-run`,
+`provider_directory_source_batch_size=3`, `serving_only_refresh=true`, and
 `publish=true` so Provider Directory FHIR rows become visible in
 provider/address search without rebuilding unchanged serving rows or the
-heavier monthly support/provenance tables.
+heavier support/provenance tables on each Provider Directory refresh. The
+schedule requires the latest `provider-directory-fhir` success before it can
+fire, so the partial projection follows the refreshed source/run scope instead
+of running against stale Provider Directory data.
 
 The provider-directory partial refresh is scoped by default
 (`provider_directory_partial_scope=latest-run`). It discovers the latest
 completed Provider Directory source set from
 `provider_directory_source.metadata_json.last_resource_import` and filters the
-FHIR practitioner-role / organization-affiliation paths by source/run before
-building affected address groups. This keeps a daily partial patch from
+FHIR practitioner-role, organization-affiliation, and direct Organization-address
+paths by source/run before building affected address groups. This keeps the monthly partial patch from
 re-running the full Provider Directory relationship graph. For a deliberate
 unscoped rebuild, pass `provider_directory_partial_scope=all`, or pass
 `provider_directory_run_id` / `provider_directory_source_ids` explicitly for a
-known run.
+known run. Use `provider_directory_source_batch_size` (or
+`--provider-directory-source-batch-size` for manual CLI launches) to tune source
+batching; `0` disables source batching for deliberate one-off runs.

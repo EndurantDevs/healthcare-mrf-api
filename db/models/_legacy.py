@@ -4178,6 +4178,22 @@ class EntityAddressUnified(Base, JSONOutputMixin):
             "name": "primary_phone_number_npi",
             "where": "type='primary' AND phone_number IS NOT NULL AND phone_number <> ''",
         },
+        {
+            "index_elements": (
+                "regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g')",
+                "npi",
+            ),
+            "name": "service_phone_digits_npi",
+            "where": "type IN ('primary', 'secondary', 'practice', 'site')",
+        },
+        {
+            "index_elements": ("phone_number", "npi"),
+            "name": "service_phone_number_npi",
+            "where": (
+                "type IN ('primary', 'secondary', 'practice', 'site') "
+                "AND phone_number IS NOT NULL AND phone_number <> ''"
+            ),
+        },
         {"index_elements": ("address_sources",), "using": "gin", "name": "address_sources"},
         {"index_elements": ("row_origin",), "name": "row_origin"},
         {"index_elements": ("address_precision",), "name": "address_precision"},

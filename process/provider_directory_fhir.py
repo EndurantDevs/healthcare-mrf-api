@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextvars
 import datetime
 import hashlib
 import json
@@ -24,8 +25,10 @@ from typing import Any, Awaitable, Callable
 
 import aiohttp
 from sqlalchemy import case, func, or_
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.schema import CreateColumn
 from sqlalchemy.sql.sqltypes import JSON as SQLAlchemyJSON
 
 from db.models import (
@@ -141,6 +144,7 @@ RESOURCE_MODELS_BY_TYPE = {
     "OrganizationAffiliation": ProviderDirectoryOrganizationAffiliation,
     "Endpoint": ProviderDirectoryEndpoint,
 }
+RESOURCE_MODELS = tuple(RESOURCE_MODELS_BY_TYPE.values())
 RESOURCE_TYPES_BY_MODEL = {model: resource_type for resource_type, model in RESOURCE_MODELS_BY_TYPE.items()}
 SOURCE_MODELS = (
     ProviderDirectorySource,
@@ -223,6 +227,10 @@ US_STATE_FIPS_TO_ABBR = {
 }
 PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV = "HLTHPRT_PROVIDER_DIRECTORY_CREDENTIALS_JSON"
 PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV = "HLTHPRT_PROVIDER_DIRECTORY_CREDENTIALS_FILE"
+_PROVIDER_DIRECTORY_CREDENTIALS_FILE_OVERRIDE: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "provider_directory_credentials_file_override",
+    default=None,
+)
 SECRET_ENV_PREFIX = "env:"
 DEFAULT_FULL_REFRESH_MAX_PAGES = 10000
 DEFAULT_STREAM_BATCH_SIZE = 5000
@@ -236,6 +244,7 @@ FHIR_ONBOARDING_GATEWAY_HOSTS = {
     "apps.availity.com",
     "partners.centene.com",
 }
+CMS_NON_PUBLIC_PROVIDER_DIRECTORY_RE = re.compile(r"\bpublic\s*=\s*no\b", re.IGNORECASE)
 ALOHR_PUBLIC_PROVIDER_DIRECTORY_BASE = "https://alohr.esante.us/public/providers"
 ALOHR_FHIR_PROVIDER_DIRECTORY_BASE = "https://fhir.alabamaonehealthrecord.com/csp/healthshare/hsods/fhir/r4"
 ALOHR_GRAPHQL_URL = "https://api.esante.us/graphql"
@@ -280,6 +289,28 @@ query ALOHR_ORG_FIND($criteria: ProviderOrgSearchCriteria, $nextToken: String) {
 }
 """
 AETNA_PROVIDER_DIRECTORY_BASE = "https://apif1.aetna.com/fhir/v1/providerdirectory"
+CIGNA_PROVIDER_DIRECTORY_BASE = "https://fhir.cigna.com/ProviderDirectory/v1"
+CENTENE_PARTNER_PORTAL_APIS_URL = "https://partners.centene.com/apis"
+CENTENE_PROVIDER_DIRECTORY_BASE = "https://iopc-pd.api.centene.com/iopc/pd/fhir/providerdirectory"
+CENTENE_PROVIDER_DIRECTORY_DOC_URL = (
+    "https://external-api.my.centene.com/partner-portal/files?"
+    "url=OASFiles/docs/FHIR-ProviderDirectory-GettingStartedV7-PP-2026-06-25_20:40:13.md"
+)
+UHC_INTEROPERABILITY_APIS_URL = "https://www.uhc.com/legal/interoperability-apis"
+UHC_PROVIDER_DIRECTORY_BASE = "https://flex.optum.com/fhirpublic/R4"
+UHC_PROVIDER_DIRECTORY_METADATA_URL = f"{UHC_PROVIDER_DIRECTORY_BASE}/metadata"
+SCAN_DEVELOPER_PORTAL_URL = "https://developer.scanhealthplan.com"
+SCAN_PROVIDER_DIRECTORY_BASE = "https://providerdirectory.scanhealthplan.com"
+SCAN_PROVIDER_DIRECTORY_DOC_URL = (
+    "https://developer.scanhealthplan.com/default/documentation/providerdirectory"
+)
+SCAN_PRACTITIONER_ROLE_REVERSE_LOOKUP_ERROR = "scan_practitioner_role_requires_reverse_lookup"
+SCAN_PRACTITIONER_ROLE_REVERSE_LOOKUP_RESOURCES = ("Practitioner", "Organization", "Location")
+SCAN_PRACTITIONER_ROLE_REVERSE_LOOKUP_PARAMS = {
+    "Practitioner": "practitioner",
+    "Organization": "organization",
+    "Location": "location",
+}
 
 
 @dataclass(frozen=True)
@@ -444,6 +475,20 @@ def _parent_base_url(api_base: str) -> str | None:
     return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parent.rstrip("/"), "", ""))
 
 
+def _resource_or_metadata_parent_base(api_base: str | None) -> str | None:
+    canonical = _canonical_base(api_base)
+    if not canonical:
+        return None
+    parsed = urllib.parse.urlsplit(canonical)
+    if not parsed.scheme or not parsed.netloc:
+        return None
+    segments = [segment for segment in parsed.path.strip("/").split("/") if segment]
+    last_segment = segments[-1].lower() if segments else ""
+    if last_segment == "metadata" or last_segment in FHIR_RESOURCE_PATH_SEGMENTS:
+        return _parent_base_url(canonical)
+    return None
+
+
 def _append_unique(values: list[str], value: str | None) -> None:
     if value and value not in values:
         values.append(value)
@@ -520,7 +565,7 @@ def _url_with_count(url: str, page_count: int) -> str:
 
 
 def _resource_start_url(source: dict[str, Any], resource_type: str, *, page_count: int) -> str | None:
-    api_base = _canonical_base(source.get("api_base"))
+    api_base = _canonical_base(source.get("canonical_api_base") or source.get("api_base"))
     endpoint_field = RESOURCE_ENDPOINT_FIELDS.get(resource_type)
     endpoint = _clean_text(source.get(endpoint_field)) if endpoint_field else None
     if endpoint and not _is_placeholder_url(endpoint):
@@ -537,9 +582,109 @@ def _resource_start_url(source: dict[str, Any], resource_type: str, *, page_coun
     return _url_with_count(f"{api_base}/{resource_type}", page_count)
 
 
+SCAN_SEARCH_ALPHABET = tuple("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+
+def _scan_partition_values(resource_type: str) -> tuple[tuple[str, str], ...]:
+    if resource_type == "Practitioner":
+        return tuple(("family", first + second) for first in SCAN_SEARCH_ALPHABET for second in SCAN_SEARCH_ALPHABET)
+    if resource_type == "Organization":
+        return tuple(("name", first + second) for first in SCAN_SEARCH_ALPHABET for second in SCAN_SEARCH_ALPHABET)
+    if resource_type == "Location":
+        return tuple(("name", value) for value in SCAN_SEARCH_ALPHABET)
+    return ()
+
+
+def _url_with_query_item(url: str, key: str, value: str) -> str:
+    parsed = urllib.parse.urlsplit(url)
+    query_items = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    if not any(item_key == key for item_key, _item_value in query_items):
+        query_items.append((key, value))
+    query = urllib.parse.urlencode(query_items, doseq=True)
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, query, parsed.fragment))
+
+
+def _resource_start_urls(source: dict[str, Any], resource_type: str, *, page_count: int) -> list[str]:
+    start_url = _resource_start_url(source, resource_type, page_count=page_count)
+    if not start_url:
+        return []
+    api_base = _canonical_base(source.get("canonical_api_base") or source.get("api_base"))
+    if api_base != SCAN_PROVIDER_DIRECTORY_BASE:
+        return [start_url]
+    partitions = _scan_partition_values(resource_type)
+    if not partitions:
+        return [start_url]
+    return [_url_with_query_item(start_url, key, value) for key, value in partitions]
+
+
+def _scan_practitioner_role_requires_reverse_lookup(source: dict[str, Any], resource_type: str) -> bool:
+    return (
+        resource_type == "PractitionerRole"
+        and _canonical_base(source.get("canonical_api_base") or source.get("api_base")) == SCAN_PROVIDER_DIRECTORY_BASE
+    )
+
+
+def _scan_practitioner_role_reverse_lookup_planned(source: dict[str, Any], resources: list[str]) -> bool:
+    return (
+        _scan_practitioner_role_requires_reverse_lookup(source, "PractitionerRole")
+        and "PractitionerRole" in resources
+        and any(resource in resources for resource in SCAN_PRACTITIONER_ROLE_REVERSE_LOOKUP_RESOURCES)
+    )
+
+
+def _scan_practitioner_role_seed_rows(
+    rows_by_resource: dict[str, list[dict[str, Any]]]
+) -> list[tuple[str, str, str]]:
+    seeds: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for resource_type in SCAN_PRACTITIONER_ROLE_REVERSE_LOOKUP_RESOURCES:
+        search_param = SCAN_PRACTITIONER_ROLE_REVERSE_LOOKUP_PARAMS[resource_type]
+        for row in rows_by_resource.get(resource_type, []):
+            resource_id = _clean_text(row.get("resource_id"))
+            if not resource_id:
+                continue
+            key = (resource_type, resource_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            seeds.append((search_param, resource_type, resource_id))
+    return seeds
+
+
+def _scan_practitioner_role_reverse_lookup_url(
+    source: dict[str, Any],
+    search_param: str,
+    resource_type: str,
+    resource_id: str,
+    *,
+    page_count: int,
+) -> str | None:
+    api_base = _canonical_base(source.get("canonical_api_base") or source.get("api_base"))
+    if not api_base:
+        return None
+    reference = f"{resource_type}/{resource_id}"
+    return _url_with_query_params(
+        f"{api_base}/PractitionerRole",
+        {
+            search_param: reference,
+            "_count": str(max(1, min(page_count, 100))),
+        },
+    )
+
+
+def _minimal_resource_id_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {"resource_id": resource_id}
+        for row in rows
+        if (resource_id := _clean_text(row.get("resource_id")))
+    ]
+
+
 def _load_credentials_config() -> dict[str, Any]:
     config: dict[str, Any] = {}
-    path = _clean_text(os.getenv(PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV))
+    path = _clean_text(_PROVIDER_DIRECTORY_CREDENTIALS_FILE_OVERRIDE.get()) or _clean_text(
+        os.getenv(PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV)
+    )
     if path:
         try:
             payload = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -560,6 +705,22 @@ def _load_credentials_config() -> dict[str, Any]:
 
 def _mapping(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
+
+
+def _json_object(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value:
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _source_metadata(source: dict[str, Any]) -> dict[str, Any]:
+    return _json_object(source.get("metadata_json"))
 
 
 def _normalize_credential_key(value: Any) -> str:
@@ -659,7 +820,7 @@ def _api_key_header(spec: dict[str, Any]) -> tuple[str, str] | None:
     api_key = spec.get("api_key")
     if isinstance(api_key, dict):
         value = _resolve_secret_text(api_key.get("value") or api_key.get("key"))
-        header = _clean_text(api_key.get("header") or api_key.get("name")) or "X-API-Key"
+        header = _resolve_secret_text(api_key.get("header") or api_key.get("name")) or "X-API-Key"
     else:
         value = _resolve_secret_text(api_key)
         header = "X-API-Key"
@@ -678,16 +839,16 @@ def _oauth2_spec(spec: dict[str, Any]) -> dict[str, Any]:
 
 def _oauth2_cache_key(oauth2: dict[str, Any]) -> str:
     parts = [
-        _clean_text(oauth2.get("token_url") or oauth2.get("tokenUrl")) or "",
+        _resolve_secret_text(oauth2.get("token_url") or oauth2.get("tokenUrl")) or "",
         _resolve_secret_text(oauth2.get("client_id") or oauth2.get("clientId")) or "",
-        _clean_text(oauth2.get("scope")) or "",
-        _clean_text(oauth2.get("audience")) or "",
+        _resolve_secret_text(oauth2.get("scope")) or "",
+        _resolve_secret_text(oauth2.get("audience")) or "",
     ]
     return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
 
 
 def _fetch_oauth2_client_credentials_token_sync(oauth2: dict[str, Any], *, timeout: int = 15) -> str | None:
-    token_url = _clean_text(oauth2.get("token_url") or oauth2.get("tokenUrl"))
+    token_url = _resolve_secret_text(oauth2.get("token_url") or oauth2.get("tokenUrl"))
     client_id = _resolve_secret_text(oauth2.get("client_id") or oauth2.get("clientId"))
     client_secret = _resolve_secret_text(oauth2.get("client_secret") or oauth2.get("clientSecret"))
     if not token_url or not client_id or not client_secret:
@@ -786,6 +947,10 @@ def _credential_request_options_for_source(source: dict[str, Any], url: str) -> 
 def _source_declares_credentialed_access(source: dict[str, Any]) -> bool:
     if _bool_from_seed(source.get("requires_registration")) or _bool_from_seed(source.get("requires_api_key")):
         return True
+    metadata = _source_metadata(source)
+    note = _clean_text(metadata.get("note"))
+    if note and CMS_NON_PUBLIC_PROVIDER_DIRECTORY_RE.search(note):
+        return True
     auth_type = (_clean_text(source.get("auth_type")) or "").lower()
     if not auth_type or auth_type in {"n/a", "na", "none", "open", "public"}:
         return False
@@ -794,6 +959,60 @@ def _source_declares_credentialed_access(source: dict[str, Any]) -> bool:
 
 def _source_uses_known_onboarding_gateway(source: dict[str, Any]) -> bool:
     return bool(_source_hosts(source) & FHIR_ONBOARDING_GATEWAY_HOSTS)
+
+
+def _select_resource_import_sources(
+    source_rows: list[dict[str, Any]],
+    *,
+    valid_source_ids: set[str] | None,
+    open_only: bool,
+    include_auth_required: bool,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    selected: list[dict[str, Any]] = []
+    metrics = {
+        "source_import_sources_considered": len(source_rows),
+        "source_import_sources_selected": 0,
+        "source_import_skipped_missing_api_base": 0,
+        "source_import_skipped_probe_not_valid": 0,
+        "source_import_skipped_open_only": 0,
+        "source_import_skipped_validation_status": 0,
+        "source_import_skipped_auth_required_policy": 0,
+        "source_import_sources_selected_live_probe_valid": 0,
+        "source_import_sources_selected_declared_credentialed": 0,
+        "source_import_sources_selected_auth_required_seed": 0,
+    }
+    for source in source_rows:
+        if not _canonical_base(source.get("api_base")):
+            metrics["source_import_skipped_missing_api_base"] += 1
+            continue
+        auth_type = (_clean_text(source.get("auth_type")) or "").lower()
+        validation = (_clean_text(source.get("last_validated_status")) or "").lower()
+        live_probe_valid = valid_source_ids is not None and source["source_id"] in valid_source_ids
+        if valid_source_ids is not None and not live_probe_valid:
+            metrics["source_import_skipped_probe_not_valid"] += 1
+            continue
+        if open_only and auth_type not in {"open", "none", ""} and not live_probe_valid:
+            metrics["source_import_skipped_open_only"] += 1
+            continue
+        if valid_source_ids is None:
+            if not include_auth_required and validation == "auth_required":
+                metrics["source_import_skipped_auth_required_policy"] += 1
+                continue
+            allowed_statuses = {"", "valid"}
+            if include_auth_required:
+                allowed_statuses.add("auth_required")
+            if validation not in allowed_statuses:
+                metrics["source_import_skipped_validation_status"] += 1
+                continue
+        selected.append(source)
+        metrics["source_import_sources_selected"] += 1
+        if live_probe_valid:
+            metrics["source_import_sources_selected_live_probe_valid"] += 1
+        if _source_declares_credentialed_access(source):
+            metrics["source_import_sources_selected_declared_credentialed"] += 1
+        if validation == "auth_required":
+            metrics["source_import_sources_selected_auth_required_seed"] += 1
+    return selected, metrics
 
 
 def _url_with_query_params(url: str, query_params: dict[str, str] | None) -> str:
@@ -883,20 +1102,177 @@ def _alohr_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | 
     }
 
 
+def _cigna_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | None:
+    api_base = _canonical_base(row.get("api_base"))
+    org_name = (_clean_text(row.get("org_name")) or "").lower()
+    portal_url = (_clean_text(row.get("portal_url")) or "").lower()
+    source_url = (_clean_text(row.get("source_url")) or "").lower()
+    should_override = (
+        api_base == CIGNA_PROVIDER_DIRECTORY_BASE
+        or api_base == "https://apps.availity.com/availity/public-fhir/fhir/v1/cigna/r4"
+        or "fhir.cigna.com/providerdirectory" in (api_base or "").lower()
+        or (
+            "cigna" in org_name
+            and (
+                "apps.availity.com/availity/public-fhir/fhir/v1/cigna/r4" in (api_base or "").lower()
+                or "fhir.cigna.com" in portal_url
+                or "fhir.cigna.com" in source_url
+            )
+        )
+    )
+    if not should_override:
+        return None
+    return {
+        "api_base": CIGNA_PROVIDER_DIRECTORY_BASE,
+        "canonical_api_base": CIGNA_PROVIDER_DIRECTORY_BASE,
+        "requires_registration": False,
+        "auth_type": "none",
+        "metadata": {
+            "provider_directory_override": "cigna_public_providerdirectory",
+            "provider_directory_override_reason": (
+                "Cigna publishes public R4 Provider Directory metadata and resources at fhir.cigna.com; "
+                "upstream seed rows can point at Availity non-FHIR/onboarding paths."
+            ),
+            "provider_directory_previous_api_base": _clean_text(row.get("api_base")),
+            "provider_directory_confirmed_base": CIGNA_PROVIDER_DIRECTORY_BASE,
+        },
+    }
+
+
+def _centene_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | None:
+    api_base = _canonical_base(row.get("api_base"))
+    portal_url = (_clean_text(row.get("portal_url")) or "").lower()
+    source_url = (_clean_text(row.get("source_url")) or "").lower()
+    source_detail = (_clean_text(row.get("source_detail")) or "").lower()
+    should_override = (
+        api_base in {CENTENE_PARTNER_PORTAL_APIS_URL, CENTENE_PROVIDER_DIRECTORY_BASE}
+        or "partners.centene.com/apis" in portal_url
+        or "partners.centene.com/apis" in source_url
+        or "partner portal" in source_detail and "centene" in source_detail
+    )
+    if not should_override:
+        return None
+    return {
+        "api_base": CENTENE_PROVIDER_DIRECTORY_BASE,
+        "canonical_api_base": CENTENE_PROVIDER_DIRECTORY_BASE,
+        "requires_registration": False,
+        "auth_type": "none",
+        "metadata": {
+            "provider_directory_override": "centene_iopc_pd_providerdirectory",
+            "provider_directory_override_reason": (
+                "Centene's partner portal catalog publishes the concrete public FHIR Provider Directory "
+                "production host and path; seed rows can point at the portal API catalog page instead."
+            ),
+            "provider_directory_previous_api_base": _clean_text(row.get("api_base")),
+            "provider_directory_confirmed_base": CENTENE_PROVIDER_DIRECTORY_BASE,
+            "provider_directory_confirmed_catalog_url": CENTENE_PARTNER_PORTAL_APIS_URL,
+            "provider_directory_confirmed_doc_url": CENTENE_PROVIDER_DIRECTORY_DOC_URL,
+        },
+    }
+
+
+def _uhc_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | None:
+    api_base = _canonical_base(row.get("api_base"))
+    portal_url = (_clean_text(row.get("portal_url")) or "").lower()
+    source_url = (_clean_text(row.get("source_url")) or "").lower()
+    org_name = (_clean_text(row.get("org_name")) or "").lower()
+    should_override = (
+        api_base in {
+            UHC_INTEROPERABILITY_APIS_URL,
+            f"{UHC_INTEROPERABILITY_APIS_URL}/patient-access-api",
+            UHC_PROVIDER_DIRECTORY_BASE,
+        }
+        or "uhc.com/legal/interoperability-apis" in portal_url
+        or "uhc.com/legal/interoperability-apis" in source_url
+        or ("unitedhealthcare" in org_name and "uhc.com/legal/interoperability-apis" in (api_base or ""))
+    )
+    if not should_override:
+        return None
+    return {
+        "api_base": UHC_PROVIDER_DIRECTORY_BASE,
+        "canonical_api_base": UHC_PROVIDER_DIRECTORY_BASE,
+        "requires_registration": False,
+        "auth_type": "none",
+        "metadata": {
+            "provider_directory_override": "uhc_flex_optum_fhirpublic_r4",
+            "provider_directory_override_reason": (
+                "UnitedHealthcare publishes Provider Directory Core metadata under the Optum FLEX "
+                "public R4 FHIR base; seed rows can point at the UHC interoperability landing page."
+            ),
+            "provider_directory_previous_api_base": _clean_text(row.get("api_base")),
+            "provider_directory_confirmed_base": UHC_PROVIDER_DIRECTORY_BASE,
+            "provider_directory_confirmed_catalog_url": UHC_INTEROPERABILITY_APIS_URL,
+            "provider_directory_confirmed_metadata_url": UHC_PROVIDER_DIRECTORY_METADATA_URL,
+        },
+    }
+
+
+def _scan_provider_directory_override(row: dict[str, Any]) -> dict[str, Any] | None:
+    api_base = _canonical_base(row.get("api_base"))
+    portal_url = (_clean_text(row.get("portal_url")) or "").lower()
+    source_url = (_clean_text(row.get("source_url")) or "").lower()
+    org_name = (_clean_text(row.get("org_name")) or "").lower()
+    should_override = (
+        api_base in {SCAN_DEVELOPER_PORTAL_URL, SCAN_PROVIDER_DIRECTORY_BASE}
+        or "developer.scanhealthplan.com" in portal_url
+        or "developer.scanhealthplan.com" in source_url
+        or ("scan health plan" in org_name and "developer.scanhealthplan.com" in (api_base or ""))
+    )
+    if not should_override:
+        return None
+    return {
+        "api_base": SCAN_PROVIDER_DIRECTORY_BASE,
+        "canonical_api_base": SCAN_PROVIDER_DIRECTORY_BASE,
+        "requires_registration": False,
+        "auth_type": "none",
+        "last_validated_status": "valid",
+        "metadata": {
+            "provider_directory_override": "scan_providerdirectory_intersystems",
+            "provider_directory_override_reason": (
+                "SCAN's developer portal embeds the Provider Directory OpenAPI spec with "
+                "providerdirectory.scanhealthplan.com as the FHIR server."
+            ),
+            "provider_directory_previous_api_base": _clean_text(row.get("api_base")),
+            "provider_directory_confirmed_base": SCAN_PROVIDER_DIRECTORY_BASE,
+            "provider_directory_confirmed_catalog_url": SCAN_DEVELOPER_PORTAL_URL,
+            "provider_directory_confirmed_doc_url": SCAN_PROVIDER_DIRECTORY_DOC_URL,
+        },
+    }
+
+
 def _source_row_from_seed(row: dict[str, Any]) -> dict[str, Any]:
     now = _now()
-    source_id = _stable_source_id(row)
     api_base = _clean_text(row.get("api_base"))
     canonical_api_base = _canonical_base(api_base)
     metadata = {
         "external_seed_id": _clean_text(row.get("id")),
         "note": _clean_text(row.get("note")),
     }
-    override = _aetna_provider_directory_override(row) or _alohr_provider_directory_override(row)
+    override = (
+        _aetna_provider_directory_override(row)
+        or _alohr_provider_directory_override(row)
+        or _cigna_provider_directory_override(row)
+        or _centene_provider_directory_override(row)
+        or _uhc_provider_directory_override(row)
+        or _scan_provider_directory_override(row)
+    )
     if override:
         api_base = override["api_base"]
         canonical_api_base = override["canonical_api_base"]
         metadata = {**metadata, **override["metadata"]}
+    parent_api_base = _resource_or_metadata_parent_base(api_base)
+    if parent_api_base and _canonical_base(parent_api_base) != canonical_api_base:
+        metadata.setdefault("provider_directory_previous_api_base", api_base)
+        metadata["provider_directory_base_normalization"] = "resource_or_metadata_parent_base"
+        metadata["provider_directory_confirmed_base"] = parent_api_base
+        api_base = parent_api_base
+        canonical_api_base = _canonical_base(parent_api_base)
+    source_id = _stable_source_id(
+        {
+            **row,
+            "api_base": api_base,
+        }
+    )
     return {
         "source_id": source_id,
         "org_tin": _clean_text(row.get("org_tin")),
@@ -921,7 +1297,9 @@ def _source_row_from_seed(row: dict[str, Any]) -> dict[str, Any]:
         "requires_api_key": bool(_bool_from_seed(row.get("requires_api_key"))),
         "auth_type": override.get("auth_type") if override else _clean_text(row.get("auth_type")),
         "last_validated": _clean_text(row.get("last_validated")),
-        "last_validated_status": _clean_text(row.get("last_validated_status")),
+        "last_validated_status": (
+            override.get("last_validated_status") if override else _clean_text(row.get("last_validated_status"))
+        ),
         "fhir_version": _clean_text(row.get("fhir_version")),
         "compliance_flag": _clean_text(row.get("compliance_flag")),
         "violation_type": _clean_text(row.get("violation_type")),
@@ -1697,6 +2075,17 @@ def provider_directory_address_corroboration_sql(
     affiliation_network_ref_match = _sql_ref_matches_resource(
         "network_ref.value", "Organization", "network_org.resource_id"
     )
+    network_name_key_expr = (
+        "NULLIF(regexp_replace(lower(COALESCE(network_org.name, '')), '[^a-z0-9]+', '', 'g'), '')"
+    )
+    network_issuer_key_expr = (
+        "NULLIF(regexp_replace(lower(COALESCE(NULLIF(network_src.org_name, ''), "
+        "network_src.plan_name, '')), '[^a-z0-9]+', '', 'g'), '')"
+    )
+    network_issuer_network_key_expr = (
+        f"CASE WHEN {network_issuer_key_expr} IS NOT NULL AND {network_name_key_expr} IS NOT NULL "
+        f"THEN {network_issuer_key_expr} || ':' || {network_name_key_expr} ELSE NULL END"
+    )
     return f"""
     CREATE OR REPLACE VIEW {view_ref} AS
     WITH address_candidates AS (
@@ -1726,9 +2115,24 @@ def provider_directory_address_corroboration_sql(
             role.active AS role_active,
             role.observed_at AS role_observed_at
           FROM {_qt(schema, "provider_directory_practitioner_role")} role
-          CROSS JOIN LATERAL jsonb_array_elements_text(
-              COALESCE(role.location_refs::jsonb, '[]'::jsonb)
-          ) AS location_ref(value)
+          JOIN LATERAL (
+              SELECT direct_location_ref.value
+                FROM jsonb_array_elements_text(
+                    COALESCE(role.location_refs::jsonb, '[]'::jsonb)
+                ) AS direct_location_ref(value)
+              UNION
+              SELECT service_location_ref.value
+                FROM jsonb_array_elements_text(
+                    COALESCE(role.healthcare_service_refs::jsonb, '[]'::jsonb)
+                ) AS service_ref(value)
+                JOIN {_qt(schema, "provider_directory_healthcare_service")} AS healthcare_service
+                  ON healthcare_service.source_id = role.source_id
+                 AND healthcare_service.resource_id = NULLIF(regexp_replace(service_ref.value, '^.*/', ''), '')
+               CROSS JOIN LATERAL jsonb_array_elements_text(
+                    COALESCE(healthcare_service.location_refs::jsonb, '[]'::jsonb)
+               ) AS service_location_ref(value)
+               WHERE healthcare_service.active IS DISTINCT FROM false
+          ) AS location_ref(value) ON TRUE
     ),
     practitioner_matches AS (
         SELECT
@@ -1845,12 +2249,21 @@ def provider_directory_address_corroboration_sql(
                             'ref', network_ref.value,
                             'resource_id', network_org.resource_id,
                             'name', network_org.name,
-                            'aliases', COALESCE(network_org.aliases::jsonb, '[]'::jsonb)
+                            'aliases', COALESCE(network_org.aliases::jsonb, '[]'::jsonb),
+                            'provider_directory_network_key', {network_name_key_expr},
+                            'provider_directory_source', 'provider_directory_fhir',
+                            'provider_directory_source_id', role.source_id,
+                            'provider_directory_org_name', network_src.org_name,
+                            'provider_directory_plan_name', network_src.plan_name,
+                            'provider_directory_issuer_key', {network_issuer_key_expr},
+                            'provider_directory_issuer_network_match_key', {network_issuer_network_key_expr}
                         )
                     ) FILTER (WHERE network_org.resource_id IS NOT NULL),
                     '[]'::jsonb
                 ) AS provider_directory_network_matches
               FROM network_ref_values network_ref
+              LEFT JOIN {_qt(schema, "provider_directory_source")} network_src
+                ON network_src.source_id = role.source_id
               LEFT JOIN {_qt(schema, "provider_directory_organization")} network_org
                 ON network_org.source_id = role.source_id
                AND {role_network_ref_match}
@@ -1874,9 +2287,24 @@ def provider_directory_address_corroboration_sql(
             affiliation.active AS role_active,
             affiliation.observed_at AS role_observed_at
           FROM {_qt(schema, "provider_directory_organization_affiliation")} affiliation
-          CROSS JOIN LATERAL jsonb_array_elements_text(
-              COALESCE(affiliation.location_refs::jsonb, '[]'::jsonb)
-          ) AS location_ref(value)
+          JOIN LATERAL (
+              SELECT direct_location_ref.value
+                FROM jsonb_array_elements_text(
+                    COALESCE(affiliation.location_refs::jsonb, '[]'::jsonb)
+                ) AS direct_location_ref(value)
+              UNION
+              SELECT service_location_ref.value
+                FROM jsonb_array_elements_text(
+                    COALESCE(affiliation.healthcare_service_refs::jsonb, '[]'::jsonb)
+                ) AS service_ref(value)
+                JOIN {_qt(schema, "provider_directory_healthcare_service")} AS healthcare_service
+                  ON healthcare_service.source_id = affiliation.source_id
+                 AND healthcare_service.resource_id = NULLIF(regexp_replace(service_ref.value, '^.*/', ''), '')
+               CROSS JOIN LATERAL jsonb_array_elements_text(
+                    COALESCE(healthcare_service.location_refs::jsonb, '[]'::jsonb)
+               ) AS service_location_ref(value)
+               WHERE healthcare_service.active IS DISTINCT FROM false
+          ) AS location_ref(value) ON TRUE
     ),
     organization_matches AS (
         SELECT
@@ -1979,7 +2407,14 @@ def provider_directory_address_corroboration_sql(
                             'ref', network_ref.value,
                             'resource_id', network_org.resource_id,
                             'name', network_org.name,
-                            'aliases', COALESCE(network_org.aliases::jsonb, '[]'::jsonb)
+                            'aliases', COALESCE(network_org.aliases::jsonb, '[]'::jsonb),
+                            'provider_directory_network_key', {network_name_key_expr},
+                            'provider_directory_source', 'provider_directory_fhir',
+                            'provider_directory_source_id', affiliation.source_id,
+                            'provider_directory_org_name', network_src.org_name,
+                            'provider_directory_plan_name', network_src.plan_name,
+                            'provider_directory_issuer_key', {network_issuer_key_expr},
+                            'provider_directory_issuer_network_match_key', {network_issuer_network_key_expr}
                         )
                     ) FILTER (WHERE network_org.resource_id IS NOT NULL),
                     '[]'::jsonb
@@ -1987,6 +2422,8 @@ def provider_directory_address_corroboration_sql(
               FROM jsonb_array_elements_text(
                   COALESCE(affiliation.network_refs, '[]'::jsonb)
               ) AS network_ref(value)
+              LEFT JOIN {_qt(schema, "provider_directory_source")} network_src
+                ON network_src.source_id = affiliation.source_id
               LEFT JOIN {_qt(schema, "provider_directory_organization")} network_org
                 ON network_org.source_id = affiliation.source_id
                AND {affiliation_network_ref_match}
@@ -2061,6 +2498,11 @@ def provider_directory_address_corroboration_sql(
                     ELSE 'npi_address_key_role_location'
                 END,
             'source_id', provider_directory_source_id,
+            'org_name', provider_directory_org_name,
+            'plan_name', provider_directory_plan_name,
+            'provider_directory_source_id', provider_directory_source_id,
+            'provider_directory_org_name', provider_directory_org_name,
+            'provider_directory_plan_name', provider_directory_plan_name,
             'provider_resource_id', provider_directory_provider_resource_id,
             'role_resource_id', provider_directory_role_resource_id,
             'location_resource_id', provider_directory_location_resource_id,
@@ -2123,28 +2565,28 @@ async def _create_provider_directory_address_corroboration_indexes(
     table_ref = _qt(schema, table_name)
     statements = (
         f"""
-        CREATE INDEX IF NOT EXISTS {_qt(schema, "pd_price_addr_corrob_lookup_idx")}
+        CREATE INDEX IF NOT EXISTS {_q("pd_price_addr_corrob_lookup_idx")}
             ON {table_ref} (npi, address_key);
         """,
         f"""
-        CREATE INDEX IF NOT EXISTS {_qt(schema, "pd_price_addr_corrob_active_lookup_idx")}
+        CREATE INDEX IF NOT EXISTS {_q("pd_price_addr_corrob_active_lookup_idx")}
             ON {table_ref} (npi, address_key, provider_directory_observed_at DESC NULLS LAST)
             WHERE provider_directory_active_match IS TRUE;
         """,
         f"""
-        CREATE INDEX IF NOT EXISTS {_qt(schema, "pd_price_addr_corrob_source_snapshot_idx")}
+        CREATE INDEX IF NOT EXISTS {_q("pd_price_addr_corrob_source_snapshot_idx")}
             ON {table_ref} (source_key, snapshot_id);
         """,
         f"""
-        CREATE INDEX IF NOT EXISTS {_qt(schema, "pd_price_addr_corrob_plan_pair_idx")}
+        CREATE INDEX IF NOT EXISTS {_q("pd_price_addr_corrob_plan_pair_idx")}
             ON {table_ref} (snapshot_id, plan_id, ptg_plan_id);
         """,
         f"""
-        CREATE INDEX IF NOT EXISTS {_qt(schema, "pd_price_addr_corrob_pd_source_idx")}
+        CREATE INDEX IF NOT EXISTS {_q("pd_price_addr_corrob_pd_source_idx")}
             ON {table_ref} (provider_directory_source_id);
         """,
         f"""
-        CREATE INDEX IF NOT EXISTS {_qt(schema, "pd_price_addr_corrob_network_names_gin")}
+        CREATE INDEX IF NOT EXISTS {_q("pd_price_addr_corrob_network_names_gin")}
             ON {table_ref} USING gin (provider_directory_network_names);
         """,
     )
@@ -2222,12 +2664,12 @@ def provider_directory_location_address_key_sql(
     scope_clauses: list[str] = []
     from_sql = f"FROM {location_ref} AS {source_alias}"
     if run_id is not None and not seen_table:
-        scope_clauses.append(f"{source_alias}.last_seen_run_id = :run_id")
+        scope_clauses.append(f"{source_alias}.last_seen_run_id = CAST(:run_id AS varchar)")
     if source_ids:
         scope_clauses.append(f"{source_alias}.source_id = ANY(CAST(:source_ids AS varchar[]))")
     if seen_table:
         seen_ref = _qt(schema, seen_table)
-        seen_run_filter = "AND seen.run_id = :run_id" if run_id is not None else ""
+        seen_run_filter = "AND seen.run_id = CAST(:run_id AS varchar)" if run_id is not None else ""
         from_sql = f"""
           FROM (
                 SELECT DISTINCT seen.source_id,
@@ -2326,6 +2768,7 @@ def provider_directory_location_address_key_batch_sql(
     restore_state_from_zip: bool = True,
     run_id: str | None = None,
     source_ids: list[str] | tuple[str, ...] | None = None,
+    seen_table: str | None = None,
 ) -> str:
     """Stamp a bounded keyset batch of FHIR Location rows with address keys."""
 
@@ -2358,10 +2801,23 @@ def provider_directory_location_address_key_batch_sql(
         needs_country_normalization_expr,
     ]
     scope_clauses: list[str] = []
-    if run_id is not None:
-        scope_clauses.append(f"{source_alias}.last_seen_run_id = :run_id")
+    if run_id is not None and not seen_table:
+        scope_clauses.append(f"{source_alias}.last_seen_run_id = CAST(:run_id AS varchar)")
     if source_ids:
         scope_clauses.append(f"{source_alias}.source_id = ANY(CAST(:source_ids AS varchar[]))")
+    if seen_table:
+        seen_ref = _qt(schema, seen_table)
+        seen_run_filter = "AND seen.run_id = CAST(:run_id AS varchar)" if run_id is not None else ""
+        scope_clauses.append(
+            f"""EXISTS (
+                SELECT 1
+                  FROM {seen_ref} AS seen
+                 WHERE seen.resource_type = 'Location'
+                   {seen_run_filter}
+                   AND seen.source_id = {source_alias}.source_id
+                   AND seen.resource_id = {source_alias}.resource_id
+            )"""
+        )
     scope_clauses.append(
         f"""(
             CAST(:after_source_id AS varchar) IS NULL
@@ -2389,7 +2845,7 @@ def provider_directory_location_address_key_batch_sql(
          WHERE {where_sql}
          ORDER BY {source_alias}.source_id,
                   {source_alias}.resource_id
-         LIMIT :batch_size
+         LIMIT CAST(:batch_size AS integer)
     ),
     normalized AS (
         SELECT * FROM candidates
@@ -2500,51 +2956,38 @@ async def publish_provider_directory_location_address_keys(
         params["run_id"] = run_id
     if source_ids:
         params["source_ids"] = list(source_ids)
-    if not seen_table:
-        total_updated = 0
-        after_source_id: str | None = None
-        after_resource_id: str | None = None
-        bounded_batch_size = max(int(batch_size or _location_address_key_batch_size()), 1)
-        sql = provider_directory_location_address_key_batch_sql(
-            schema,
-            restore_state_from_zip=restore_state_from_zip,
-            run_id=run_id,
-            source_ids=source_ids,
-        )
-        while True:
-            row = await db.first(
-                sql,
-                **params,
-                after_source_id=after_source_id,
-                after_resource_id=after_resource_id,
-                batch_size=bounded_batch_size,
-            )
-            payload = row._mapping if hasattr(row, "_mapping") else dict(row or {})
-            candidate_rows = int(payload.get("candidate_rows") or 0)
-            updated_rows = int(payload.get("updated_rows") or 0)
-            total_updated += updated_rows
-            next_source_id = _clean_text(payload.get("last_source_id"))
-            next_resource_id = _clean_text(payload.get("last_resource_id"))
-            if candidate_rows <= 0 or not next_source_id or not next_resource_id:
-                break
-            if next_source_id == after_source_id and next_resource_id == after_resource_id:
-                break
-            after_source_id = next_source_id
-            after_resource_id = next_resource_id
-        return total_updated
-    return int(
-        await db.status(
-            provider_directory_location_address_key_sql(
-                schema,
-                restore_state_from_zip=restore_state_from_zip,
-                run_id=run_id,
-                source_ids=source_ids,
-                seen_table=seen_table,
-            ),
-            **params,
-        )
-        or 0
+    total_updated = 0
+    after_source_id: str | None = None
+    after_resource_id: str | None = None
+    bounded_batch_size = max(int(batch_size or _location_address_key_batch_size()), 1)
+    sql = provider_directory_location_address_key_batch_sql(
+        schema,
+        restore_state_from_zip=restore_state_from_zip,
+        run_id=run_id,
+        source_ids=source_ids,
+        seen_table=seen_table,
     )
+    while True:
+        row = await db.first(
+            sql,
+            **params,
+            after_source_id=after_source_id,
+            after_resource_id=after_resource_id,
+            batch_size=bounded_batch_size,
+        )
+        payload = row._mapping if hasattr(row, "_mapping") else dict(row or {})
+        candidate_rows = int(payload.get("candidate_rows") or 0)
+        updated_rows = int(payload.get("updated_rows") or 0)
+        total_updated += updated_rows
+        next_source_id = _clean_text(payload.get("last_source_id"))
+        next_resource_id = _clean_text(payload.get("last_resource_id"))
+        if candidate_rows <= 0 or not next_source_id or not next_resource_id:
+            break
+        if next_source_id == after_source_id and next_resource_id == after_resource_id:
+            break
+        after_source_id = next_source_id
+        after_resource_id = next_resource_id
+    return total_updated
 
 
 async def _publish_provider_directory_artifacts(
@@ -2592,7 +3035,10 @@ async def _publish_provider_directory_artifacts(
         ),
         metrics=metrics,
     )
-    metrics["location_archive"] = await publish_provider_directory_location_archive(run_id=run_id)
+    metrics["location_archive"] = await publish_provider_directory_location_archive(
+        run_id=run_id,
+        seen_table=seen_table,
+    )
     await _mark_provider_directory_progress(
         run_id,
         phase="provider-directory publishing artifacts",
@@ -2637,12 +3083,32 @@ def _provider_directory_location_archive_stage_table_name(run_id: str | None = N
 def provider_directory_location_archive_stage_sql(
     db_schema: str | None = None,
     stage_table: str | None = None,
+    *,
+    run_id: str | None = None,
+    seen_table: str | None = None,
 ) -> str:
     schema = db_schema or _schema()
     stage = stage_table or _provider_directory_location_archive_stage_table_name()
     stage_ref = _qt(schema, stage)
     location_ref = _qt(schema, "provider_directory_location")
     uuid_re = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    scope_clauses: list[str] = []
+    if seen_table:
+        seen_ref = _qt(schema, seen_table)
+        seen_run_filter = "AND seen.run_id = CAST(:run_id AS varchar)" if run_id is not None else ""
+        scope_clauses.append(
+            f"""EXISTS (
+                SELECT 1
+                  FROM {seen_ref} AS seen
+                 WHERE seen.resource_type = 'Location'
+                   {seen_run_filter}
+                   AND seen.source_id = loc.source_id
+                   AND seen.resource_id = loc.resource_id
+            )"""
+        )
+    elif run_id is not None:
+        scope_clauses.append("loc.last_seen_run_id = CAST(:run_id AS varchar)")
+    scope_sql = "".join(f"\n           AND {clause}" for clause in scope_clauses)
     return f"""
     CREATE UNLOGGED TABLE {stage_ref} AS
     WITH eligible AS (
@@ -2674,6 +3140,7 @@ def provider_directory_location_archive_stage_sql(
                 ),
                 'US'
            ) IN ('US', 'USA', 'UNITEDSTATES', 'UNITEDSTATESOFAMERICA', '840', '001')
+           {scope_sql}
     )
     SELECT DISTINCT ON (address_key)
         address_key,
@@ -2701,6 +3168,7 @@ async def publish_provider_directory_location_archive(
     *,
     run_id: str | None = None,
     stage_table: str | None = None,
+    seen_table: str | None = None,
 ) -> dict[str, Any]:
     schema = db_schema or _schema()
     if not await _address_canon_functions_available(schema):
@@ -2712,7 +3180,15 @@ async def publish_provider_directory_location_archive(
     stage = stage_table or _provider_directory_location_archive_stage_table_name(run_id)
     await db.status(f"DROP TABLE IF EXISTS {_qt(schema, stage)};")
     try:
-        await db.status(provider_directory_location_archive_stage_sql(schema, stage))
+        await db.status(
+            provider_directory_location_archive_stage_sql(
+                schema,
+                stage,
+                run_id=run_id,
+                seen_table=seen_table,
+            ),
+            **({"run_id": run_id} if run_id is not None else {}),
+        )
         await db.status(f"ANALYZE {_qt(schema, stage)};")
         stats = await resolve_into_archive(
             stage,
@@ -2748,6 +3224,7 @@ async def _ensure_provider_directory_tables() -> None:
     await db.status(f"CREATE SCHEMA IF NOT EXISTS {_q(schema)};")
     for model in (*SOURCE_MODELS, *CANONICAL_RESOURCE_MODELS):
         await db.create_table(model.__table__, checkfirst=True)
+        await _ensure_provider_directory_model_columns(model, schema)
     for model in (*SOURCE_MODELS, *CANONICAL_RESOURCE_MODELS):
         for index in getattr(model, "__my_additional_indexes__", []) or []:
             name = index.get("name") or "_".join(index.get("index_elements", ()))
@@ -2760,6 +3237,29 @@ async def _ensure_provider_directory_tables() -> None:
                 f"ON {_qt(schema, model.__tablename__)} {using}({elements}){where};"
             )
     await _ensure_provider_directory_import_seen_table(schema)
+
+
+async def _ensure_provider_directory_model_columns(model: Any, schema: str) -> None:
+    rows = await db.all(
+        """
+        SELECT column_name
+          FROM information_schema.columns
+         WHERE table_schema = :schema
+           AND table_name = :table_name
+        """,
+        schema=schema,
+        table_name=model.__tablename__,
+    )
+    existing = {_clean_text((row._mapping if hasattr(row, "_mapping") else row).get("column_name")) for row in rows}
+    table_ref = _qt(schema, model.__tablename__)
+    dialect = postgresql.dialect()
+    for column in model.__table__.columns:
+        if column.name in existing:
+            continue
+        column_ddl = str(CreateColumn(column).compile(dialect=dialect)).strip()
+        if not column_ddl:
+            continue
+        await db.status(f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS {column_ddl};")
 
 
 async def _ensure_provider_directory_import_seen_table(schema: str | None = None) -> None:
@@ -2951,6 +3451,15 @@ def _copy_record(row: dict[str, Any], columns: list[str], json_columns: set[str]
 
 
 PROVIDER_DIRECTORY_RUN_METADATA_COLUMNS = frozenset({"last_seen_run_id", "observed_at", "updated_at"})
+PROVIDER_DIRECTORY_SOURCE_PROBE_STATE_COLUMNS = frozenset(
+    {
+        "last_probe_status",
+        "last_probe_status_code",
+        "last_probe_error",
+        "last_probe_run_id",
+        "last_probed_at",
+    }
+)
 PROVIDER_DIRECTORY_LOCATION_ADDRESS_KEY_INPUT_COLUMNS = (
     "first_line",
     "second_line",
@@ -3003,6 +3512,15 @@ def _effective_update_expression(table, statement, column: str):
     excluded_value = getattr(statement.excluded, column)
     if table.name == ProviderDirectoryCanonicalResource.__tablename__ and column == "first_seen_run_id":
         return func.coalesce(table.c.first_seen_run_id, excluded_value)
+    if table.name == ProviderDirectorySource.__tablename__ and column == "metadata_json":
+        return func.coalesce(table.c.metadata_json.cast(JSONB), func.jsonb_build_object()).op("||")(
+            func.coalesce(excluded_value.cast(JSONB), func.jsonb_build_object())
+        )
+    if table.name == ProviderDirectorySource.__tablename__ and column in PROVIDER_DIRECTORY_SOURCE_PROBE_STATE_COLUMNS:
+        return case(
+            (statement.excluded.last_probe_status.is_(None), getattr(table.c, column)),
+            else_=excluded_value,
+        )
     if column == "address_key" and _preserve_null_location_address_key(table):
         return _location_address_key_update_expression(table, statement.excluded)
     return excluded_value
@@ -3011,6 +3529,21 @@ def _effective_update_expression(table, statement, column: str):
 def _effective_update_sql(table, column: str, *, target_prefix: str, incoming_prefix: str) -> str:
     if table.name == ProviderDirectoryCanonicalResource.__tablename__ and column == "first_seen_run_id":
         return f"COALESCE({target_prefix}.{_q(column)}, {incoming_prefix}.{_q(column)})"
+    if table.name == ProviderDirectorySource.__tablename__ and column == "metadata_json":
+        quoted = _q(column)
+        return (
+            f"COALESCE({target_prefix}.{quoted}::jsonb, '{{}}'::jsonb) "
+            f"|| COALESCE({incoming_prefix}.{quoted}::jsonb, '{{}}'::jsonb)"
+        )
+    if table.name == ProviderDirectorySource.__tablename__ and column in PROVIDER_DIRECTORY_SOURCE_PROBE_STATE_COLUMNS:
+        quoted = _q(column)
+        probe_status = _q("last_probe_status")
+        return (
+            f"CASE WHEN {incoming_prefix}.{probe_status} IS NULL "
+            f"THEN {target_prefix}.{quoted} "
+            f"ELSE {incoming_prefix}.{quoted} "
+            f"END"
+        )
     if column == "address_key" and _preserve_null_location_address_key(table):
         return _location_address_key_update_sql(
             target_prefix=target_prefix,
@@ -3132,7 +3665,7 @@ async def _clear_resource_rows_seen(run_id: str | None) -> int:
         await db.status(
             f"""
             DELETE FROM {_qt(_schema(), PROVIDER_DIRECTORY_IMPORT_SEEN_TABLE)}
-             WHERE run_id = :run_id;
+             WHERE run_id = CAST(:run_id AS varchar);
             """,
             run_id=run_id,
         )
@@ -3680,6 +4213,90 @@ def _seed_rows_from_sqlite(path: Path, *, limit: int | None = None, source_query
         conn.close()
 
 
+def _seed_row_matches_query(row: dict[str, Any], source_query: str | None) -> bool:
+    query = _clean_text(source_query)
+    if not query:
+        return True
+    needle = query.lower()
+    return any(
+        needle in (_clean_text(row.get(field)) or "").lower()
+        for field in ("org_name", "plan_name")
+    )
+
+
+def _seed_rows_from_retest_results(path: Path, *, source_query: str | None = None) -> list[dict[str, Any]]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Provider Directory retest results could not be read from {path}: {exc}") from exc
+    results = payload.get("results") if isinstance(payload, dict) else payload
+    if not isinstance(results, list):
+        raise RuntimeError(f"Provider Directory retest results at {path} must be a JSON object/list with results.")
+    seed_rows: list[dict[str, Any]] = []
+    for index, item in enumerate(results):
+        if not isinstance(item, dict):
+            continue
+        classification = (_clean_text(item.get("classification")) or "").lower()
+        if classification not in {"valid", "valid_non_fhir", "auth_required"}:
+            continue
+        api_base = _clean_text(item.get("api_base"))
+        org_name = _clean_text(item.get("org_name"))
+        if not api_base or not org_name:
+            continue
+        is_auth_required = classification == "auth_required"
+        row = {
+            "id": _clean_text(item.get("payer_id")) or f"retest-{index}",
+            "org_name": org_name,
+            "plan_name": _clean_text(item.get("plan_name")) or "Provider Directory Retest",
+            "api_base": api_base,
+            "auth_type": (
+                "open"
+                if classification == "valid"
+                else _clean_text(item.get("auth_type")) or (
+                    "OAuth2 Client Credentials" if is_auth_required else "none"
+                )
+            ),
+            "last_validated_status": classification,
+            "requires_registration": is_auth_required,
+            "fhir_version": _clean_text(item.get("fhir_version")),
+            "source": "provider-directory-db-retest",
+            "note": "Supplemental source from provider-directory-db retest_results.json",
+            "source_detail": f"retest classification={classification}; status_code={item.get('status_code')}",
+            "source_url": _clean_text(item.get("url")),
+            "source_date": _clean_text(payload.get("tested_at")) if isinstance(payload, dict) else None,
+        }
+        if _seed_row_matches_query(row, source_query):
+            seed_rows.append(row)
+    return seed_rows
+
+
+def _dedupe_source_rows(source_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    seen_source_ids: set[str] = set()
+    seen_source_keys: set[tuple[str, str, str]] = set()
+    seen_org_base_keys: set[tuple[str, str]] = set()
+    for row in source_rows:
+        source_id = _clean_text(row.get("source_id"))
+        org_name_key = (_clean_text(row.get("org_name")) or "").lower()
+        plan_name_key = (_clean_text(row.get("plan_name")) or "").lower()
+        api_base_key = _canonical_base(row.get("canonical_api_base") or row.get("api_base")) or ""
+        source_key = (org_name_key, plan_name_key, api_base_key)
+        org_base_key = (org_name_key, api_base_key)
+        is_retest = row.get("seed_source") == "provider-directory-db-retest"
+        if source_id and source_id in seen_source_ids:
+            continue
+        if is_retest and (source_key in seen_source_keys or org_base_key in seen_org_base_keys):
+            continue
+        if source_id:
+            seen_source_ids.add(source_id)
+        if is_retest:
+            seen_source_keys.add(source_key)
+        if org_name_key and api_base_key:
+            seen_org_base_keys.add(org_base_key)
+        deduped.append(row)
+    return deduped
+
+
 def _download_seed_db(seed_db_url: str, destination: Path) -> Path:
     destination.parent.mkdir(parents=True, exist_ok=True)
     request = urllib.request.Request(seed_db_url, headers={"User-Agent": USER_AGENT})
@@ -3698,6 +4315,31 @@ def _resolve_seed_db(seed_db_path: str | None, seed_db_url: str | None) -> tuple
     tmpdir = tempfile.TemporaryDirectory()
     path = Path(tmpdir.name) / "provider_directory.db"
     return _download_seed_db(seed_db_url, path), tmpdir
+
+
+def _download_retest_results(retest_results_url: str, destination: Path) -> Path:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    request = urllib.request.Request(retest_results_url, headers={"User-Agent": USER_AGENT})
+    tmp = destination.with_suffix(destination.suffix + ".tmp")
+    with urllib.request.urlopen(request, timeout=120) as response, tmp.open("wb") as handle:
+        shutil.copyfileobj(response, handle)
+    tmp.replace(destination)
+    return destination
+
+
+def _resolve_retest_results(
+    retest_results_path: str | None,
+    retest_results_url: str | None,
+) -> tuple[Path | None, tempfile.TemporaryDirectory | None]:
+    if retest_results_path:
+        return Path(retest_results_path), None
+    if not retest_results_url:
+        retest_results_url = os.getenv("HLTHPRT_PROVIDER_DIRECTORY_RETEST_RESULTS_URL")
+    if not retest_results_url:
+        return None, None
+    tmpdir = tempfile.TemporaryDirectory()
+    path = Path(tmpdir.name) / "retest_results.json"
+    return _download_retest_results(retest_results_url, path), tmpdir
 
 
 def _ssl_context() -> ssl.SSLContext:
@@ -3876,6 +4518,35 @@ async def _probe_source(source: dict[str, Any], *, timeout: int, run_id: str | N
             "run_id": run_id,
         }
         return probe, None
+    missing_credential_blocks_probe = (
+        (
+            _source_declares_credentialed_access(source)
+            or _source_uses_known_onboarding_gateway(source)
+        )
+        and not _alohr_source_uses_graphql_connector(source)
+        and not any(
+            _credential_request_options_for_source(source, url)["descriptor"]
+            for _candidate_base, url in urls
+        )
+    )
+    if missing_credential_blocks_probe:
+        candidate_base, url = urls[0]
+        return (
+            {
+                "status": "auth_required",
+                "http_status": None,
+                "response_time_ms": 0,
+                "url": url,
+                "api_base": candidate_base,
+                "error": (
+                    "source requires credentialed Provider Directory access "
+                    "but no matching credentials are configured"
+                ),
+                "run_id": run_id,
+                "credential": None,
+            },
+            None,
+        )
     best_probe: dict[str, Any] | None = None
     best_payload: dict[str, Any] | None = None
     for candidate_base, url in urls:
@@ -3916,6 +4587,24 @@ async def _probe_source(source: dict[str, Any], *, timeout: int, run_id: str | N
     return best_probe, best_payload
 
 
+def _source_probe_hard_timeout_seconds(source: dict[str, Any], *, timeout: int) -> int:
+    candidate_count = max(1, len(_candidate_metadata_urls(source)))
+    env_value = os.getenv("HLTHPRT_PROVIDER_DIRECTORY_SOURCE_PROBE_HARD_TIMEOUT")
+    if env_value:
+        try:
+            return max(1, int(env_value))
+        except ValueError:
+            pass
+    return max(timeout + 1, (timeout * candidate_count) + 2)
+
+
+def _probe_flush_every() -> int:
+    try:
+        return max(1, int(os.getenv("HLTHPRT_PROVIDER_DIRECTORY_PROBE_FLUSH_EVERY", "50")))
+    except ValueError:
+        return 50
+
+
 async def _probe_sources(
     sources: list[dict[str, Any]],
     *,
@@ -3931,6 +4620,8 @@ async def _probe_sources(
     probed = 0
     total_sources = len(sources)
     report_every = max(1, total_sources // 20)
+    flush_every = _probe_flush_every()
+    flush_lock = asyncio.Lock()
 
     await _mark_provider_directory_progress(
         run_id,
@@ -3940,10 +4631,42 @@ async def _probe_sources(
         message=f"probing 0/{total_sources} source(s)",
     )
 
+    async def _flush_probe_rows(*, force: bool = False) -> None:
+        nonlocal capability_rows, source_updates
+        async with flush_lock:
+            if not force and len(source_updates) < flush_every:
+                return
+            rows_to_flush = capability_rows
+            updates_to_flush = source_updates
+            capability_rows = []
+            source_updates = []
+        if rows_to_flush:
+            await _upsert_rows(ProviderDirectoryCapability, rows_to_flush)
+        if updates_to_flush:
+            await _upsert_rows(ProviderDirectorySource, updates_to_flush)
+
     async def _run_probe(source: dict[str, Any]) -> None:
         nonlocal probed, valid
         async with semaphore:
-            probe, payload = await _probe_source(source, timeout=timeout, run_id=run_id)
+            started = time.monotonic()
+            hard_timeout = _source_probe_hard_timeout_seconds(source, timeout=timeout)
+            try:
+                probe, payload = await asyncio.wait_for(
+                    _probe_source(source, timeout=timeout, run_id=run_id),
+                    timeout=hard_timeout,
+                )
+            except TimeoutError:
+                probe = {
+                    "status": "timeout",
+                    "http_status": None,
+                    "response_time_ms": int((time.monotonic() - started) * 1000),
+                    "url": None,
+                    "api_base": _canonical_base(source.get("api_base")),
+                    "error": f"source metadata probe exceeded {hard_timeout}s hard deadline",
+                    "run_id": run_id,
+                    "credential": None,
+                }
+                payload = None
             now = _now()
             update = {
                 "source_id": source["source_id"],
@@ -4001,6 +4724,7 @@ async def _probe_sources(
                 )
             source_updates.append(update)
             probed += 1
+            await _flush_probe_rows()
             if probed == total_sources or probed % report_every == 0:
                 await _mark_provider_directory_progress(
                     run_id,
@@ -4011,8 +4735,7 @@ async def _probe_sources(
                 )
 
     await asyncio.gather(*[_run_probe(source) for source in sources])
-    await _upsert_rows(ProviderDirectoryCapability, capability_rows)
-    await _upsert_rows(ProviderDirectorySource, source_updates)
+    await _flush_probe_rows(force=True)
     return len(sources), valid, valid_source_ids
 
 
@@ -4077,6 +4800,30 @@ def _bulk_export_output_urls(payload: dict[str, Any] | None, resource_type: str)
         if url:
             urls.append(url)
     return urls
+
+
+def _bulk_export_status_payload(payload: dict[str, Any] | None) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    return any(key in payload for key in ("transactionTime", "request", "requiresAccessToken", "output", "error"))
+
+
+def _bulk_export_payload_error(payload: dict[str, Any] | None) -> str | None:
+    if not isinstance(payload, dict):
+        return "bulk_export_invalid_status_payload"
+    errors = payload.get("error")
+    if not isinstance(errors, list) or not errors:
+        return None
+    first_error = next((item for item in errors if isinstance(item, dict)), None)
+    if not first_error:
+        return "bulk_export_error_output"
+    error_type = _clean_text(first_error.get("type"))
+    response_code = _clean_text(first_error.get("responseCode") or first_error.get("response_code"))
+    if response_code:
+        return f"bulk_export_error_http_{response_code}"
+    if error_type:
+        return f"bulk_export_error_{error_type}"
+    return "bulk_export_error_output"
 
 
 def _bulk_export_pre_stream_should_fallback(status_code: int | None, error: str | None) -> bool:
@@ -4157,7 +4904,13 @@ async def _bulk_export_poll_outputs(
             await asyncio.sleep(_retry_after_seconds(headers.get("retry-after")) or poll_seconds)
             continue
         if status_code == 200:
-            return _bulk_export_output_urls(payload, resource_type), None, polls
+            if not _bulk_export_status_payload(payload):
+                return None, "bulk_export_status_non_bulk_payload", polls
+            output_urls = _bulk_export_output_urls(payload, resource_type)
+            payload_error = _bulk_export_payload_error(payload)
+            if payload_error and not output_urls:
+                return None, payload_error, polls
+            return output_urls, None, polls
         return None, f"bulk_export_status_http_{status_code}", polls
     return None, "bulk_export_timeout", polls
 
@@ -4285,11 +5038,42 @@ async def _fetch_bulk_export_resource_rows(
 
         polls = 0
         if status_code == 200:
+            if not _bulk_export_status_payload(_payload):
+                return None
             output_urls = _bulk_export_output_urls(_payload, resource_type)
+            payload_error = _bulk_export_payload_error(_payload)
+            if payload_error and not output_urls:
+                return ResourceFetchResult(
+                    model=model,
+                    rows=[],
+                    rows_fetched=0,
+                    rows_written=0,
+                    pages_fetched=1,
+                    complete=False,
+                    row_limit_reached=False,
+                    page_limit_reached=False,
+                    hard_page_limit_reached=False,
+                    next_url_remaining=False,
+                    error=payload_error,
+                    fetch_mode="bulk_export",
+                )
         else:
             status_url = _clean_text(headers.get("content-location") or headers.get("location"))
             if not status_url:
-                return None
+                return ResourceFetchResult(
+                    model=model,
+                    rows=[],
+                    rows_fetched=0,
+                    rows_written=0,
+                    pages_fetched=1,
+                    complete=False,
+                    row_limit_reached=False,
+                    page_limit_reached=False,
+                    hard_page_limit_reached=False,
+                    next_url_remaining=False,
+                    error="bulk_export_missing_status_url",
+                    fetch_mode="bulk_export",
+                )
             output_urls, poll_error, polls = await _bulk_export_poll_outputs(
                 session,
                 source,
@@ -4298,7 +5082,20 @@ async def _fetch_bulk_export_resource_rows(
                 timeout=timeout,
             )
             if poll_error is not None:
-                return None
+                return ResourceFetchResult(
+                    model=model,
+                    rows=[],
+                    rows_fetched=0,
+                    rows_written=0,
+                    pages_fetched=max(1, polls),
+                    complete=False,
+                    row_limit_reached=False,
+                    page_limit_reached=False,
+                    hard_page_limit_reached=False,
+                    next_url_remaining=True,
+                    error=poll_error,
+                    fetch_mode="bulk_export",
+                )
         rows: list[dict[str, Any]] = []
         rows_fetched = 0
         rows_written = 0
@@ -4378,8 +5175,23 @@ async def _fetch_resource_rows(
         )
         if result is not None:
             return result
-    url = _resource_start_url(source, resource_type, page_count=page_count)
-    if not url:
+    if _scan_practitioner_role_requires_reverse_lookup(source, resource_type):
+        return ResourceFetchResult(
+            model=model,
+            rows=[],
+            rows_fetched=0,
+            rows_written=0,
+            pages_fetched=0,
+            complete=False,
+            row_limit_reached=False,
+            page_limit_reached=False,
+            hard_page_limit_reached=False,
+            next_url_remaining=False,
+            error=SCAN_PRACTITIONER_ROLE_REVERSE_LOOKUP_ERROR,
+            fetch_mode="source_specific_deferred",
+        )
+    start_urls = _resource_start_urls(source, resource_type, page_count=page_count)
+    if not start_urls:
         return None
     rows: list[dict[str, Any]] = []
     pending_rows: list[dict[str, Any]] = []
@@ -4393,6 +5205,8 @@ async def _fetch_resource_rows(
     next_url_remaining = False
     error_message: str | None = None
     max_pages = _env_int("HLTHPRT_PROVIDER_DIRECTORY_MAX_FULL_PAGES", DEFAULT_FULL_REFRESH_MAX_PAGES)
+    partitioned_fetch = len(start_urls) > 1
+    partition_error_count = 0
 
     async def flush_pending_rows() -> None:
         nonlocal rows_written, pending_rows
@@ -4401,59 +5215,80 @@ async def _fetch_resource_rows(
         rows_written += await row_batch_handler(model, pending_rows)
         pending_rows = []
 
-    while url and _limit_allows_more(rows_fetched, per_resource_limit):
-        if cancel_ctx is not None:
-            await raise_if_cancelled(cancel_ctx, cancel_task)
-        if page_limit > 0 and pages >= page_limit:
-            page_limit_reached = True
-            next_url_remaining = True
-            break
-        if max_pages > 0 and pages >= max_pages:
-            hard_page_limit_reached = True
-            next_url_remaining = True
-            break
-        if url in seen_urls:
-            error_message = "pagination loop detected"
-            next_url_remaining = True
-            break
-        seen_urls.add(url)
-        status_code, payload, error, _elapsed = await _fetch_source_json(source, url, timeout=timeout)
-        if status_code != 200 or error:
-            error_message = error or f"http_{status_code}"
-            break
-        if not payload or payload.get("resourceType") != "Bundle":
-            error_message = "non_bundle_payload"
-            break
-        pages += 1
-        entries = _bundle_entries(payload)
-        for entry_index, entry in enumerate(entries):
-            parsed = parse_fhir_resource(
-                source["source_id"],
-                entry["resource"],
-                resource_url=_clean_text(entry.get("fullUrl")),
-                run_id=run_id,
-                normalize_location_contacts=not (resource_type == "Location" and row_batch_handler),
-            )
-            if not parsed:
-                continue
-            parsed_model, row = parsed
-            if parsed_model is not model:
-                continue
-            rows_fetched += 1
-            if retain_rows:
-                rows.append(row)
-            if row_batch_handler:
-                pending_rows.append(row)
-                if len(pending_rows) >= max(1, row_batch_size):
-                    await flush_pending_rows()
-            if not _limit_allows_more(rows_fetched, per_resource_limit):
-                row_limit_reached = entry_index < len(entries) - 1
+    for start_url in start_urls:
+        url = start_url
+        while url and _limit_allows_more(rows_fetched, per_resource_limit):
+            if cancel_ctx is not None:
+                await raise_if_cancelled(cancel_ctx, cancel_task)
+            if page_limit > 0 and pages >= page_limit:
+                page_limit_reached = True
+                next_url_remaining = True
                 break
-        next_url = _next_link(payload)
-        url = urllib.parse.urljoin(url, next_url) if next_url else None
-        if not _limit_allows_more(rows_fetched, per_resource_limit) and url:
-            row_limit_reached = True
-            next_url_remaining = True
+            if max_pages > 0 and pages >= max_pages:
+                hard_page_limit_reached = True
+                next_url_remaining = True
+                break
+            if url in seen_urls:
+                error_message = "pagination loop detected"
+                next_url_remaining = True
+                break
+            seen_urls.add(url)
+            status_code, payload, error, _elapsed = await _fetch_source_json(source, url, timeout=timeout)
+            if status_code != 200 or error:
+                current_error = error or f"http_{status_code}"
+                if partitioned_fetch:
+                    partition_error_count += 1
+                    error_message = f"partition_errors_{partition_error_count}_last_{current_error}"
+                    url = None
+                    break
+                error_message = current_error
+                break
+            if not payload or payload.get("resourceType") != "Bundle":
+                if partitioned_fetch:
+                    partition_error_count += 1
+                    error_message = f"partition_errors_{partition_error_count}_last_non_bundle_payload"
+                    url = None
+                    break
+                error_message = "non_bundle_payload"
+                break
+            pages += 1
+            entries = _bundle_entries(payload)
+            for entry_index, entry in enumerate(entries):
+                parsed = parse_fhir_resource(
+                    source["source_id"],
+                    entry["resource"],
+                    resource_url=_clean_text(entry.get("fullUrl")),
+                    run_id=run_id,
+                    normalize_location_contacts=not (resource_type == "Location" and row_batch_handler),
+                )
+                if not parsed:
+                    continue
+                parsed_model, row = parsed
+                if parsed_model is not model:
+                    continue
+                rows_fetched += 1
+                if retain_rows:
+                    rows.append(row)
+                if row_batch_handler:
+                    pending_rows.append(row)
+                    if len(pending_rows) >= max(1, row_batch_size):
+                        await flush_pending_rows()
+                if not _limit_allows_more(rows_fetched, per_resource_limit):
+                    row_limit_reached = entry_index < len(entries) - 1
+                    break
+            next_url = _next_link(payload)
+            url = urllib.parse.urljoin(url, next_url) if next_url else None
+            if not _limit_allows_more(rows_fetched, per_resource_limit) and url:
+                row_limit_reached = True
+                next_url_remaining = True
+                break
+        if (
+            row_limit_reached
+            or page_limit_reached
+            or hard_page_limit_reached
+            or (error_message and not partitioned_fetch)
+            or not _limit_allows_more(rows_fetched, per_resource_limit)
+        ):
             break
     await flush_pending_rows()
     complete = not error_message and not row_limit_reached and not page_limit_reached and not hard_page_limit_reached and not url
@@ -4469,6 +5304,130 @@ async def _fetch_resource_rows(
         hard_page_limit_reached=hard_page_limit_reached,
         next_url_remaining=next_url_remaining or bool(url),
         error=error_message,
+    )
+
+
+async def _fetch_scan_practitioner_role_rows(
+    source: dict[str, Any],
+    rows_by_resource: dict[str, list[dict[str, Any]]],
+    *,
+    per_resource_limit: int,
+    page_limit: int,
+    page_count: int,
+    timeout: int,
+    run_id: str | None,
+) -> ResourceFetchResult:
+    model = ProviderDirectoryPractitionerRole
+    seeds = _scan_practitioner_role_seed_rows(rows_by_resource)
+    if not seeds:
+        return ResourceFetchResult(
+            model=model,
+            rows=[],
+            rows_fetched=0,
+            rows_written=0,
+            pages_fetched=0,
+            complete=False,
+            row_limit_reached=False,
+            page_limit_reached=False,
+            hard_page_limit_reached=False,
+            next_url_remaining=False,
+            error=SCAN_PRACTITIONER_ROLE_REVERSE_LOOKUP_ERROR,
+            fetch_mode="source_specific_deferred",
+        )
+
+    rows: list[dict[str, Any]] = []
+    seen_role_ids: set[str] = set()
+    rows_fetched = 0
+    pages = 0
+    row_limit_reached = False
+    page_limit_reached = False
+    hard_page_limit_reached = False
+    next_url_remaining = False
+    error_message: str | None = None
+    reverse_error_count = 0
+    max_pages = _env_int("HLTHPRT_PROVIDER_DIRECTORY_MAX_FULL_PAGES", DEFAULT_FULL_REFRESH_MAX_PAGES)
+
+    for search_param, seed_resource_type, seed_resource_id in seeds:
+        if not _limit_allows_more(rows_fetched, per_resource_limit):
+            break
+        url = _scan_practitioner_role_reverse_lookup_url(
+            source,
+            search_param,
+            seed_resource_type,
+            seed_resource_id,
+            page_count=page_count,
+        )
+        while url and _limit_allows_more(rows_fetched, per_resource_limit):
+            if page_limit > 0 and pages >= page_limit:
+                page_limit_reached = True
+                next_url_remaining = True
+                break
+            if max_pages > 0 and pages >= max_pages:
+                hard_page_limit_reached = True
+                next_url_remaining = True
+                break
+            status_code, payload, error, _elapsed = await _fetch_source_json(source, url, timeout=timeout)
+            if status_code != 200 or error:
+                current_error = error or f"http_{status_code}"
+                reverse_error_count += 1
+                error_message = f"reverse_lookup_errors_{reverse_error_count}_last_{current_error}"
+                break
+            if not payload or payload.get("resourceType") != "Bundle":
+                reverse_error_count += 1
+                error_message = f"reverse_lookup_errors_{reverse_error_count}_last_non_bundle_payload"
+                break
+            pages += 1
+            entries = _bundle_entries(payload)
+            for entry_index, entry in enumerate(entries):
+                parsed = parse_fhir_resource(
+                    source["source_id"],
+                    entry["resource"],
+                    resource_url=_clean_text(entry.get("fullUrl")),
+                    run_id=run_id,
+                )
+                if not parsed:
+                    continue
+                parsed_model, row = parsed
+                if parsed_model is not model:
+                    continue
+                role_id = _clean_text(row.get("resource_id"))
+                if not role_id or role_id in seen_role_ids:
+                    continue
+                seen_role_ids.add(role_id)
+                rows.append(row)
+                rows_fetched += 1
+                if not _limit_allows_more(rows_fetched, per_resource_limit):
+                    row_limit_reached = entry_index < len(entries) - 1
+                    break
+            next_url = _next_link(payload)
+            url = urllib.parse.urljoin(url, next_url) if next_url else None
+            if not _limit_allows_more(rows_fetched, per_resource_limit) and url:
+                row_limit_reached = True
+                next_url_remaining = True
+                break
+        if row_limit_reached or page_limit_reached or hard_page_limit_reached:
+            break
+
+    complete = (
+        not error_message
+        and not row_limit_reached
+        and not page_limit_reached
+        and not hard_page_limit_reached
+        and not next_url_remaining
+    )
+    return ResourceFetchResult(
+        model=model,
+        rows=rows,
+        rows_fetched=rows_fetched,
+        rows_written=0,
+        pages_fetched=pages,
+        complete=complete,
+        row_limit_reached=row_limit_reached,
+        page_limit_reached=page_limit_reached,
+        hard_page_limit_reached=hard_page_limit_reached,
+        next_url_remaining=next_url_remaining,
+        error=error_message,
+        fetch_mode="source_specific_reverse_lookup",
     )
 
 
@@ -4626,6 +5585,9 @@ async def _import_linked_resource_rows(
     concurrency: int = 5,
     timeout: int,
     run_id: str | None,
+    source_ids: list[str] | None = None,
+    track_seen: bool = False,
+    seen_table: str | None = None,
 ) -> dict[str, int]:
     if per_source_limit <= 0:
         return {}
@@ -4671,8 +5633,18 @@ async def _import_linked_resource_rows(
         existing.add((fetched_resource_type, row.get("resource_id")))
 
     counts: dict[str, int] = {}
+    edge_source_ids = source_ids or [source["source_id"]]
+    canonical_api_base = source.get("canonical_api_base") or source.get("api_base")
     for model, rows in by_model.items():
-        imported = await _upsert_rows(model, rows)
+        imported = await _upsert_resource_rows(
+            model,
+            rows,
+            run_id=run_id,
+            track_seen=track_seen,
+            seen_table=seen_table,
+            canonical_api_base=canonical_api_base,
+            source_ids=edge_source_ids,
+        )
         if imported:
             counts[model.__name__.removeprefix("ProviderDirectory")] = imported
     return counts
@@ -4807,11 +5779,29 @@ async def _delete_stale_resource_rows(
 ) -> int:
     if not run_id:
         return 0
+    resource_type = RESOURCE_TYPES_BY_MODEL.get(model)
     if use_seen_table or seen_table:
-        resource_type = RESOURCE_TYPES_BY_MODEL.get(model)
         if resource_type:
             seen_ref = _qt(_schema(), seen_table or PROVIDER_DIRECTORY_IMPORT_SEEN_TABLE)
-            run_filter = "AND seen.run_id = :run_id" if not seen_table else ""
+            run_filter = "AND seen.run_id = CAST(:run_id AS varchar)" if not seen_table else ""
+            await db.status(
+                f"""
+                DELETE FROM {_qt(_schema(), ProviderDirectorySourceResource.__tablename__)} AS edge
+                 WHERE edge.source_id = :source_id
+                   AND edge.resource_type = :resource_type
+                   AND NOT EXISTS (
+                        SELECT 1
+                          FROM {seen_ref} AS seen
+                         WHERE seen.resource_type = :resource_type
+                           {run_filter}
+                           AND seen.source_id = edge.source_id
+                           AND seen.resource_id = edge.resource_id
+                   );
+                """,
+                source_id=source_id,
+                run_id=run_id,
+                resource_type=resource_type,
+            )
             return int(
                 await db.status(
                     f"""
@@ -4832,6 +5822,18 @@ async def _delete_stale_resource_rows(
                 )
                 or 0
             )
+    if resource_type:
+        await db.status(
+            f"""
+            DELETE FROM {_qt(_schema(), ProviderDirectorySourceResource.__tablename__)}
+             WHERE source_id = :source_id
+               AND resource_type = :resource_type
+               AND last_seen_run_id IS DISTINCT FROM :run_id;
+            """,
+            source_id=source_id,
+            run_id=run_id,
+            resource_type=resource_type,
+        )
     return int(
         await db.status(
             f"""
@@ -4844,6 +5846,61 @@ async def _delete_stale_resource_rows(
         )
         or 0
     )
+
+
+SOURCE_CATALOG_STALE_TABLE_MODELS = (
+    *RESOURCE_MODELS,
+    ProviderDirectoryCapability,
+    ProviderDirectorySourceResource,
+)
+
+
+def _source_catalog_stale_cleanup_enabled(
+    *,
+    stale_cleanup: bool,
+    full_refresh: bool,
+    source_query: str | None,
+    limit: int | None,
+    retest_results_configured: bool = True,
+) -> bool:
+    return bool(stale_cleanup and full_refresh and not source_query and not limit and retest_results_configured)
+
+
+async def _delete_stale_provider_directory_source_catalog(
+    current_source_ids: list[str],
+) -> dict[str, int]:
+    source_ids = sorted({_clean_text(source_id) for source_id in current_source_ids if _clean_text(source_id)})
+    if not source_ids:
+        return {}
+    params = {"source_ids": source_ids}
+    deleted: dict[str, int] = {}
+    predicate = "NOT (source_id = ANY(CAST(:source_ids AS varchar[])))"
+    for model in SOURCE_CATALOG_STALE_TABLE_MODELS:
+        count = int(
+            await db.status(
+                f"""
+                DELETE FROM {_qt(_schema(), model.__tablename__)}
+                 WHERE {predicate};
+                """,
+                **params,
+            )
+            or 0
+        )
+        if count:
+            deleted[model.__tablename__] = count
+    source_count = int(
+        await db.status(
+            f"""
+            DELETE FROM {_qt(_schema(), ProviderDirectorySource.__tablename__)}
+             WHERE {predicate};
+            """,
+            **params,
+        )
+        or 0
+    )
+    if source_count:
+        deleted[ProviderDirectorySource.__tablename__] = source_count
+    return deleted
 
 
 def _selected_resources(raw: str | None) -> list[str]:
@@ -5312,6 +6369,7 @@ async def _import_resources(
         source_stale_counts: dict[str, int] = {}
         source_stale_ready_source_ids: dict[str, list[str]] = {}
         rows_by_resource: dict[str, list[dict[str, Any]]] = {}
+        scan_role_reverse_lookup_planned = _scan_practitioner_role_reverse_lookup_planned(source, resources)
         if _alohr_source_uses_graphql_connector(source):
             async with progress_lock:
                 active_group_details[group_key]["current_resource"] = "ALOHR GraphQL"
@@ -5331,6 +6389,11 @@ async def _import_resources(
         for resource_type in resources:
             if cancel_ctx is not None:
                 await raise_if_cancelled(cancel_ctx, cancel_task)
+            if (
+                resource_type == "PractitionerRole"
+                and scan_role_reverse_lookup_planned
+            ):
+                continue
             async with progress_lock:
                 active_group_details[group_key]["current_resource"] = resource_type
                 active_group_details[group_key]["resource_started_at"] = _now().isoformat(timespec="seconds") + "Z"
@@ -5339,6 +6402,8 @@ async def _import_resources(
             use_streaming = stream_batch_size > 0
 
             async def row_batch_handler(model: type, rows: list[dict[str, Any]]) -> int:
+                if scan_role_reverse_lookup_planned and resource_type in SCAN_PRACTITIONER_ROLE_REVERSE_LOOKUP_RESOURCES:
+                    rows_by_resource.setdefault(resource_type, []).extend(_minimal_resource_id_rows(rows))
                 written = await _upsert_resource_rows(
                     model,
                     _copy_rows_for_source_ids(rows, source_ids),
@@ -5370,7 +6435,8 @@ async def _import_resources(
                 continue
             for _source_id in source_ids:
                 _record_resource_fetch_stats(source_resource_stats, resource_type, result)
-            rows_by_resource[resource_type] = result.rows
+            if result.rows or resource_type not in rows_by_resource:
+                rows_by_resource[resource_type] = result.rows
             written_total = (
                 result.rows_written
                 if use_streaming
@@ -5402,6 +6468,57 @@ async def _import_resources(
                         )
                         if stale_deleted:
                             source_stale_counts[resource_type] = source_stale_counts.get(resource_type, 0) + stale_deleted
+        if (
+            "PractitionerRole" in resources
+            and _scan_practitioner_role_requires_reverse_lookup(source, "PractitionerRole")
+            and "PractitionerRole" not in source_resource_diagnostics
+        ):
+            async with progress_lock:
+                active_group_details[group_key]["current_resource"] = "PractitionerRole reverse lookup"
+                active_group_details[group_key]["resource_started_at"] = _now().isoformat(timespec="seconds") + "Z"
+                active_group_details[group_key]["resource_started_monotonic"] = time.monotonic()
+            await report_progress(force=True)
+            result = await _fetch_scan_practitioner_role_rows(
+                source,
+                rows_by_resource,
+                per_resource_limit=per_resource_limit,
+                page_limit=page_limit,
+                page_count=page_count,
+                timeout=timeout,
+                run_id=run_id,
+            )
+            for _source_id in source_ids:
+                _record_resource_fetch_stats(source_resource_stats, "PractitionerRole", result)
+            written_total = await _upsert_resource_rows(
+                result.model,
+                _copy_rows_for_source_ids(result.rows, source_ids),
+                run_id=run_id,
+                track_seen=stale_cleanup,
+                seen_table=seen_stage_table,
+                canonical_api_base=source.get("canonical_api_base") or source.get("api_base"),
+                source_ids=source_ids,
+            )
+            source_counts["PractitionerRole"] = source_counts.get("PractitionerRole", 0) + written_total
+            rows_by_resource["PractitionerRole"] = result.rows
+            source_resource_diagnostics["PractitionerRole"] = _resource_fetch_diagnostic(
+                result,
+                rows_written_per_source=written_total // max(1, len(source_ids)),
+            )
+            if stale_cleanup and result.complete:
+                if seen_stage_table:
+                    source_stale_ready_source_ids["PractitionerRole"] = list(source_ids)
+                else:
+                    for source_id in source_ids:
+                        stale_deleted = await _delete_stale_resource_rows(
+                            result.model,
+                            source_id,
+                            run_id,
+                            use_seen_table=True,
+                        )
+                        if stale_deleted:
+                            source_stale_counts["PractitionerRole"] = (
+                                source_stale_counts.get("PractitionerRole", 0) + stale_deleted
+                            )
         if linked_resource_limit > 0 and rows_by_resource:
             source_linked_counts = await _import_linked_resource_rows(
                 source,
@@ -5410,6 +6527,9 @@ async def _import_resources(
                 concurrency=linked_resource_concurrency,
                 timeout=timeout,
                 run_id=run_id,
+                source_ids=source_ids,
+                track_seen=stale_cleanup,
+                seen_table=seen_stage_table,
             )
         return (
             source_ids,
@@ -5529,6 +6649,8 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
     publish_corroboration = _publish_corroboration_enabled(task.get("publish_corroboration"))
     open_only = bool(task.get("open_only", True))
     include_auth_required = bool(task.get("include_auth_required", False))
+    credential_config_file = _clean_text(task.get("credential_config_file"))
+    _PROVIDER_DIRECTORY_CREDENTIALS_FILE_OVERRIDE.set(credential_config_file)
     full_refresh = bool(task.get("full_refresh", False))
     default_resource_limit = 1 if test_mode else (0 if full_refresh else 25)
     default_page_limit = 1 if test_mode else (0 if full_refresh else 3)
@@ -5554,7 +6676,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
     resources = _selected_resources(_clean_text(task.get("resources")))
     publish_artifacts = _bool_or_default(
         task.get("publish_artifacts"),
-        set(resources) == set(DEFAULT_RESOURCES),
+        import_resources and set(resources) == set(DEFAULT_RESOURCES),
     )
     seen_stage_table_for_publish = (
         _provider_directory_import_seen_stage_table_name(run_id)
@@ -5591,6 +6713,8 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
 
     seed_rows: list[dict[str, Any]]
     tmpdir = None
+    retest_tmpdir = None
+    supplemental_retest_seed_rows: list[dict[str, Any]] = []
     await _mark_provider_directory_progress(
         run_id,
         phase="provider-directory resolving source catalog",
@@ -5615,13 +6739,39 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
         seed_path, tmpdir = _resolve_seed_db(_clean_text(task.get("seed_db_path")), _clean_text(task.get("seed_db_url")))
         if seed_path is None:
             raise RuntimeError("Provider Directory seed database could not be resolved.")
-        seed_rows = _seed_rows_from_sqlite(seed_path, limit=limit, source_query=source_query)
+        seed_rows = _seed_rows_from_sqlite(
+            seed_path,
+            limit=None if (task.get("retest_results_path") or task.get("retest_results_url")) else limit,
+            source_query=source_query,
+        )
+    retest_path, retest_tmpdir = _resolve_retest_results(
+        _clean_text(task.get("retest_results_path")),
+        _clean_text(task.get("retest_results_url")),
+    )
+    if retest_path is not None:
+        supplemental_retest_seed_rows = _seed_rows_from_retest_results(retest_path, source_query=source_query)
+        seed_rows.extend(supplemental_retest_seed_rows)
 
     try:
-        source_rows = [_source_row_from_seed(row) for row in seed_rows]
+        source_rows = _dedupe_source_rows([_source_row_from_seed(row) for row in seed_rows])
+        if limit and (task.get("retest_results_path") or task.get("retest_results_url")):
+            source_rows = source_rows[:limit]
         await _upsert_rows(ProviderDirectorySource, source_rows)
+        stale_source_rows_deleted = {}
+        if _source_catalog_stale_cleanup_enabled(
+            stale_cleanup=stale_cleanup,
+            full_refresh=full_refresh,
+            source_query=source_query,
+            limit=limit,
+            retest_results_configured=retest_path is not None,
+        ):
+            stale_source_rows_deleted = await _delete_stale_provider_directory_source_catalog(
+                [row["source_id"] for row in source_rows]
+            )
         metrics: dict[str, Any] = {
             "sources_seeded": len(source_rows),
+            "supplemental_retest_sources_considered": len(supplemental_retest_seed_rows),
+            "stale_source_rows_deleted": stale_source_rows_deleted,
             "sources_probed": 0,
             "valid_capability_sources": 0,
             "resource_rows": {},
@@ -5635,6 +6785,7 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
             "stale_cleanup": stale_cleanup,
             "publish_artifacts": publish_artifacts,
             "publish_corroboration": publish_corroboration,
+            "credential_config_file_configured": bool(credential_config_file),
         }
         await _mark_provider_directory_progress(
             run_id,
@@ -5655,22 +6806,13 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
             metrics["sources_probed"] = probed
             metrics["valid_capability_sources"] = valid
         if not seed_only and import_resources and source_rows:
-            importable = []
-            for source in source_rows:
-                if not _canonical_base(source.get("api_base")):
-                    continue
-                if valid_source_ids is not None and source["source_id"] not in valid_source_ids:
-                    continue
-                auth_type = (_clean_text(source.get("auth_type")) or "").lower()
-                validation = (_clean_text(source.get("last_validated_status")) or "").lower()
-                live_probe_valid = valid_source_ids is not None and source["source_id"] in valid_source_ids
-                if open_only and auth_type not in {"open", "none", ""} and not live_probe_valid:
-                    continue
-                if valid_source_ids is None and validation not in {"", "valid"}:
-                    continue
-                if valid_source_ids is None and not include_auth_required and validation == "auth_required":
-                    continue
-                importable.append(source)
+            importable, selection_metrics = _select_resource_import_sources(
+                source_rows,
+                valid_source_ids=valid_source_ids,
+                open_only=open_only,
+                include_auth_required=include_auth_required,
+            )
+            metrics.update(selection_metrics)
             source_import_groups = _group_resource_import_sources(
                 importable,
                 linked_resource_limit=linked_resource_limit,
@@ -5777,6 +6919,8 @@ async def process_data(ctx: dict[str, Any], task: dict[str, Any] | None = None) 
         await _clear_resource_rows_seen(run_id)
         if tmpdir is not None:
             tmpdir.cleanup()
+        if retest_tmpdir is not None:
+            retest_tmpdir.cleanup()
 
 
 async def startup(ctx: dict[str, Any]) -> None:
@@ -5797,6 +6941,8 @@ async def main(
     test_mode: bool = False,
     seed_db_path: str | None = None,
     seed_db_url: str | None = None,
+    retest_results_path: str | None = None,
+    retest_results_url: str | None = None,
     limit: int | None = None,
     source_query: str | None = None,
     seed_only: bool = False,
@@ -5811,6 +6957,7 @@ async def main(
     publish_artifacts: bool | None = None,
     open_only: bool = True,
     include_auth_required: bool = False,
+    credential_config_file: str | None = None,
     resources: str | None = None,
     resource_limit: int | None = None,
     linked_resource_limit: int | None = None,
@@ -5828,6 +6975,8 @@ async def main(
         "test_mode": test_mode,
         "seed_db_path": seed_db_path,
         "seed_db_url": seed_db_url,
+        "retest_results_path": retest_results_path,
+        "retest_results_url": retest_results_url,
         "limit": limit,
         "source_query": source_query,
         "seed_only": seed_only,
@@ -5842,6 +6991,7 @@ async def main(
         "publish_artifacts": publish_artifacts,
         "open_only": open_only,
         "include_auth_required": include_auth_required,
+        "credential_config_file": credential_config_file,
         "resources": resources,
         "resource_limit": resource_limit,
         "linked_resource_limit": linked_resource_limit,

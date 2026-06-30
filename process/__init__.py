@@ -1119,6 +1119,9 @@ def provider_enrichment(test: bool):
 @click.option("--test", is_flag=True, help="Use a tiny built-in source fixture for a quick smoke run.")
 @click.option("--seed-db-path", help="Path to provider-directory-db SQLite seed file.")
 @click.option("--seed-db-url", help="URL for provider-directory-db SQLite seed file.")
+@click.option("--retest-results-path", help="Path to provider-directory-db retest_results.json supplemental source file.")
+@click.option("--retest-results-url", help="URL for provider-directory-db retest_results.json supplemental source file.")
+@click.option("--credential-config-file", help="Path to secret-backed Provider Directory credentials JSON file.")
 @click.option("--limit", type=int, help="Maximum seed sources to process.")
 @click.option("--source-query", help="Case-insensitive org/plan substring filter for the seed database.")
 @click.option("--seed-only", is_flag=True, help="Load source rows without probing endpoints.")
@@ -1194,6 +1197,9 @@ def provider_directory_fhir(
     test: bool,
     seed_db_path: str | None,
     seed_db_url: str | None,
+    retest_results_path: str | None,
+    retest_results_url: str | None,
+    credential_config_file: str | None,
     limit: int | None,
     source_query: str | None,
     seed_only: bool,
@@ -1224,6 +1230,9 @@ def provider_directory_fhir(
             test_mode=test,
             seed_db_path=seed_db_path,
             seed_db_url=seed_db_url,
+            retest_results_path=retest_results_path,
+            retest_results_url=retest_results_url,
+            credential_config_file=credential_config_file,
             limit=limit,
             source_query=source_query,
             seed_only=seed_only,
@@ -1352,6 +1361,11 @@ def pharmacy_economics(test: bool):
     type=click.Choice(["latest-run", "all"], case_sensitive=False),
     help="Default provider-directory-partial scope; latest-run avoids unscoped full-source patches.",
 )
+@click.option(
+    "--provider-directory-source-batch-size",
+    type=int,
+    help="Provider Directory source IDs per partial-refresh load unit; use 0 to disable source batching.",
+)
 def entity_address_unified(
     test: bool,
     limit_per_source: int | None,
@@ -1361,6 +1375,7 @@ def entity_address_unified(
     provider_directory_run_id: str | None,
     provider_directory_source_id: tuple[str, ...],
     provider_directory_partial_scope: str | None,
+    provider_directory_source_batch_size: int | None,
 ):
     _run(
         initiate_entity_address_unified(
@@ -1372,6 +1387,7 @@ def entity_address_unified(
             provider_directory_run_id=provider_directory_run_id,
             provider_directory_source_ids=list(provider_directory_source_id),
             provider_directory_partial_scope=provider_directory_partial_scope,
+            provider_directory_source_batch_size=provider_directory_source_batch_size,
         )
     )
 

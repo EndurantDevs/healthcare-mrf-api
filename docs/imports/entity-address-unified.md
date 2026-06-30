@@ -8,6 +8,7 @@ It consolidates provider, facility, and enrollment-side address evidence and app
 
 ```bash
 python main.py start entity-address-unified
+python main.py start entity-address-unified --refresh-mode provider-directory-partial --provider-directory-source-batch-size 3
 python main.py worker process.EntityAddressUnified --burst
 ```
 
@@ -138,6 +139,7 @@ runs independent archive, coordinate, practice, and fallback checks in parallel.
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_PUBLISH` (overrides publish decision; by default test mode skips publish and full mode publishes)
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_SKIP_PUBLISH`
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_REFRESH_MODE` (`full` or `provider-directory-partial`; import-control can also pass `refresh_mode`)
+- `HLTHPRT_ENTITY_ADDRESS_UNIFIED_PROVIDER_DIRECTORY_SOURCE_BATCH_SIZE` (default `3`; import-control can also pass `provider_directory_source_batch_size`, and the CLI exposes `--provider-directory-source-batch-size`; set `0` only for deliberate unbatched Provider Directory partial runs)
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_REQUIRE_ARCHIVE_COORDINATES` (default `false`; when `true`, publish fails if archive rows still lack coordinates)
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENABLE_INFERENCE` (default `false`; enables automatic NPI inference updates; review candidates are still populated when this is off)
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENABLE_NAME_FALLBACK_INFERENCE` (default `false`; enables expensive broad name+ZIP+street automatic inference after deterministic facility-anchor matches)

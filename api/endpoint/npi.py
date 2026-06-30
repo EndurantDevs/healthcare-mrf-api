@@ -1359,6 +1359,18 @@ def _normalize_address_key(raw: Optional[str]) -> Optional[str]:
         raise sanic.exceptions.InvalidUsage("address_key must be a valid UUID") from exc
 
 
+def _normalize_exact_npi(raw: Optional[str]) -> Optional[int]:
+    if raw is None:
+        return None
+    text_value = str(raw).strip()
+    if not text_value:
+        return None
+    digits = "".join(ch for ch in text_value if ch.isdigit())
+    if len(digits) != 10:
+        raise sanic.exceptions.InvalidUsage("npi must contain exactly 10 digits")
+    return int(digits)
+
+
 def _normalize_code_system(raw: Optional[str], param_name: str, allowed: set[str]) -> str:
     value = str(raw or "").strip().upper()
     if not value:
@@ -1520,7 +1532,19 @@ def _address_zip5_filter(alias: str, address_table_sql: str, *, any_array: bool 
 
 
 def _address_phone_digits_filter(alias: str, address_table_sql: str) -> str:
-    return f"regexp_replace(COALESCE({alias}.telephone_number, ''), '[^0-9]', '', 'g') = :phone_digits"
+    raw_digits = f"regexp_replace(COALESCE({alias}.telephone_number, ''), '[^0-9]', '', 'g')"
+    if _address_table_is_unified(address_table_sql):
+        return (
+            f"(NULLIF({alias}.phone_number, '') = :phone_digits "
+            f"OR (NULLIF({alias}.phone_number, '') IS NULL AND {raw_digits} = :phone_digits))"
+        )
+    return f"{raw_digits} = :phone_digits"
+
+
+def _address_npi_filter(alias: str, address_table_sql: str) -> str:
+    if _address_table_is_unified(address_table_sql):
+        return f"({alias}.npi = :npi_filter OR {alias}.inferred_npi = :npi_filter)"
+    return f"{alias}.npi = :npi_filter"
 
 
 def _provider_list_address_type_clause(
@@ -2463,7 +2487,15 @@ async def get_all(request):
     request.args.get("start")
     request.args.get("limit")
     request.args.get("include_total")
+    request.args.get("include_sources")
+    request.args.get("include_evidence")
     request.args.get("view")
+    request.args.get("npi")
+    include_sources = _parse_bool_arg(request.args.get("include_sources"), default=False)
+    include_evidence = _parse_bool_arg(request.args.get("include_evidence"), default=False)
+    if _parse_bool_arg(request.args.get("debug"), default=False):
+        include_sources = True
+        include_evidence = True
     q_value = str(request.args.get("q") or "").strip().lower()
     include_total = _parse_bool_arg(request.args.get("include_total"), default=True)
     view_mode = str(request.args.get("view") or "").strip().lower()
@@ -2495,6 +2527,7 @@ async def get_all(request):
     first_name = request.args.get("first_name")
     last_name = request.args.get("last_name")
     organization_name = request.args.get("organization_name")
+    npi_raw = request.args.get("npi")
     phone = request.args.get("phone")
     address_key_raw = request.args.get("address_key")
     zip_code_raw = request.args.get("zip_code")
@@ -2629,6 +2662,7 @@ async def get_all(request):
 
     phone_digits = _normalize_phone_digits(phone)
     address_key = _normalize_address_key(address_key_raw)
+    exact_npi = _normalize_exact_npi(npi_raw)
     entity_type_code: Optional[int] = None
     if entity_type_code_raw not in (None, ""):
         try:
@@ -2650,6 +2684,7 @@ async def get_all(request):
         "first_name": first_name,
         "last_name": last_name,
         "organization_name": organization_name,
+        "npi": exact_npi,
         "phone_digits": phone_digits,
         "address_key": address_key,
         "zip_code": zip_code,
@@ -2687,6 +2722,7 @@ async def get_all(request):
             "first_name",
             "last_name",
             "organization_name",
+            "npi",
             "phone_digits",
             "address_key",
             "zip_code",
@@ -2780,6 +2816,7 @@ async def get_all(request):
         zip_code = filters.get("zip_code")
         phone_digits = filters.get("phone_digits")
         address_key = filters.get("address_key")
+        exact_npi = filters.get("npi")
 
         taxonomy_filters = []
         if classification:
@@ -2803,7 +2840,7 @@ async def get_all(request):
         )
 
         use_taxonomy_filter = bool(taxonomy_filters)
-        include_service_locations = bool(address_key)
+        include_service_locations = bool(address_key or phone_digits or exact_npi)
         address_where = [
             _provider_list_address_type_clause(
                 "c",
@@ -2827,6 +2864,8 @@ async def get_all(request):
             address_where.append(_address_phone_digits_filter("c", address_table_sql))
         if address_key:
             address_where.append("c.address_key = CAST(:address_key AS uuid)")
+        if exact_npi is not None:
+            address_where.append(_address_npi_filter("c", address_table_sql))
         dynamic_code_params = _append_array_filters(address_where, filters)
 
         taxonomy_conditions = " AND ".join(taxonomy_filters) if taxonomy_filters else "1=1"
@@ -2890,6 +2929,7 @@ async def get_all(request):
             "zip_code": zip_code,
             "phone_digits": phone_digits,
             "address_key": address_key,
+            "npi_filter": exact_npi,
             "specialization": specialization,
             "first_name": first_name,
             "last_name": last_name,
@@ -2940,6 +2980,7 @@ async def get_all(request):
         zip_code = filters.get("zip_code")
         phone_digits = filters.get("phone_digits")
         address_key = filters.get("address_key")
+        exact_npi = filters.get("npi")
 
         taxonomy_filters = []
         if classification:
@@ -2962,7 +3003,7 @@ async def get_all(request):
             entity_type_code,
         )
 
-        include_service_locations = bool(address_key)
+        include_service_locations = bool(address_key or phone_digits or exact_npi)
         address_where = [
             _provider_list_address_type_clause(
                 "c",
@@ -2984,6 +3025,8 @@ async def get_all(request):
             address_where.append(_address_phone_digits_filter("c", address_table_sql))
         if address_key:
             address_where.append("c.address_key = CAST(:address_key AS uuid)")
+        if exact_npi is not None:
+            address_where.append(_address_npi_filter("c", address_table_sql))
         dynamic_code_params = _append_array_filters(address_where, filters)
         if npi_where:
             address_where.append(
@@ -3018,6 +3061,7 @@ async def get_all(request):
             "zip_code": zip_code,
             "phone_digits": phone_digits,
             "address_key": address_key,
+            "npi_filter": exact_npi,
             "specialization": specialization,
             "first_name": first_name,
             "last_name": last_name,
@@ -3143,8 +3187,9 @@ async def get_all(request):
         zip_code = filters.get("zip_code")
         phone_digits = filters.get("phone_digits")
         address_key = filters.get("address_key")
+        exact_npi = filters.get("npi")
         where = []
-        include_service_locations = bool(address_key)
+        include_service_locations = bool(address_key or phone_digits or exact_npi)
         address_where = [
             _provider_list_address_type_clause(
                 "c",
@@ -3177,6 +3222,8 @@ async def get_all(request):
             address_where.append(_address_phone_digits_filter("c", address_table_sql))
         if address_key:
             address_where.append("c.address_key = CAST(:address_key AS uuid)")
+        if exact_npi is not None:
+            address_where.append(_address_npi_filter("c", address_table_sql))
         dynamic_code_params = _append_array_filters(address_where, filters)
         npi_where, npi_params = _build_npi_where_clause(
             "b",
@@ -3262,6 +3309,7 @@ async def get_all(request):
                 zip_code=zip_code,
                 phone_digits=phone_digits,
                 address_key=address_key,
+                npi_filter=exact_npi,
                 **npi_params,
                 **dynamic_code_params,
             )
@@ -3298,6 +3346,8 @@ async def get_all(request):
                             for key in PUBLIC_ADDRESS_ATTRIBUTION_COLUMNS:
                                 if key in row_mapping and key not in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
                                     obj[key] = row_mapping.get(key)
+                            if "source_record_ids" in row_mapping:
+                                obj["source_record_ids"] = row_mapping.get("source_record_ids")
                         obj["do_business_as"] = obj.get("do_business_as") or []
                         obj.setdefault("procedures_array", [])
                         obj.setdefault("medications_array", [])
@@ -3357,6 +3407,76 @@ async def get_all(request):
                     obj["taxonomy_list"].append(taxonomy)
                 res[npi_value] = obj
 
+            if (
+                _address_table_is_unified(address_table_sql)
+                and (address_key or phone_digits or exact_npi is not None)
+                and len(res) < limit
+                and not npi_where
+                and not use_taxonomy_filter
+            ):
+                fallback_where = list(address_where)
+                if fallback_where:
+                    fallback_where[0] = _provider_list_address_type_clause(
+                        "c",
+                        address_table_sql,
+                        include_service_locations=True,
+                    )
+                fallback_params = {
+                    "plan_network_array": plan_network,
+                    "city": city,
+                    "state": state,
+                    "zip_code": zip_code,
+                    "phone_digits": phone_digits,
+                    "address_key": address_key,
+                    "npi_filter": exact_npi,
+                    **dynamic_code_params,
+                }
+                fallback_rows = await conn.all(
+                    text(
+                        f"""
+                        SELECT c.*
+                          FROM {address_table_sql} AS c
+                         WHERE {' AND '.join(fallback_where)}
+                         ORDER BY {_primary_address_order_clause("c", address_table_sql)}
+                         LIMIT :fallback_limit
+                        """
+                    ),
+                    fallback_limit=limit,
+                    **fallback_params,
+                )
+                for row in fallback_rows:
+                    mapping = getattr(row, "_mapping", row)
+                    if not isinstance(mapping, Mapping):
+                        continue
+                    npi_value = mapping.get("npi") or mapping.get("inferred_npi")
+                    if npi_value is None or npi_value in res:
+                        continue
+                    obj = {
+                        "npi": npi_value,
+                        "entity_type_code": 1
+                        if any(
+                            ":practitioner_role:" in str(record_id or "")
+                            for record_id in (mapping.get("source_record_ids") or [])
+                        )
+                        else 2,
+                        "provider_organization_name": mapping.get("entity_name"),
+                        "do_business_as": [],
+                        "taxonomy_list": [],
+                        "procedures_array": [],
+                        "medications_array": [],
+                    }
+                    for column in NPIAddress.__table__.columns:
+                        if column.key in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
+                            continue
+                        if column.key in mapping:
+                            obj[column.key] = mapping.get(column.key)
+                    for key in PUBLIC_ADDRESS_ATTRIBUTION_COLUMNS:
+                        if key in mapping and key not in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
+                            obj[key] = mapping.get(key)
+                    if "source_record_ids" in mapping:
+                        obj["source_record_ids"] = mapping.get("source_record_ids")
+                    res[npi_value] = obj
+
         res = list(res.values())
         for row in res:
             row["do_business_as"] = row.get("do_business_as") or []
@@ -3406,6 +3526,7 @@ async def get_all(request):
                 first_name,
                 last_name,
                 organization_name,
+                exact_npi,
                 phone_digits,
                 address_key,
                 zip_code,
@@ -3459,6 +3580,12 @@ async def get_all(request):
             summary = summary_map.get(int(npi_value))
             if summary:
                 row["provider_enrichment_summary"] = summary
+    if include_sources or include_evidence:
+        await _attach_provider_directory_source_details(rows, session=request_session)
+    if not include_evidence:
+        for row in rows:
+            if isinstance(row, dict):
+                row.pop("source_record_ids", None)
 
     payload: dict[str, Any] = {
         "total": total,

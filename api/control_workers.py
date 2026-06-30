@@ -352,14 +352,15 @@ def _worker_job_manifest(spec: WorkerSpec, payload: dict[str, Any], image: str) 
     resources = _worker_job_resources(spec, payload)
     if resources:
         container["resources"] = resources
-    volumes = _worker_job_pvc_volumes()
+    pvc_volumes = _worker_job_pvc_volumes()
+    volumes = [*pvc_volumes, *_worker_job_secret_volumes()]
     if volumes:
         container["volumeMounts"] = [item["volumeMount"] for item in volumes]
 
     pod_spec: dict[str, Any] = {
         "restartPolicy": "Never",
         "automountServiceAccountToken": False,
-        "securityContext": _worker_job_pod_security_context(has_pvc=bool(volumes)),
+        "securityContext": _worker_job_pod_security_context(has_pvc=bool(pvc_volumes)),
         "containers": [container],
     }
     if volumes:
@@ -534,6 +535,50 @@ def _worker_job_pvc_volumes() -> list[dict[str, Any]]:
             },
         }
     ]
+
+
+def _worker_job_secret_volumes() -> list[dict[str, Any]]:
+    raw = os.getenv("HLTHPRT_WORKER_JOB_SECRET_VOLUME_MOUNTS_JSON", "").strip()
+    if not raw:
+        return []
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(payload, list):
+        return []
+
+    volumes: list[dict[str, Any]] = []
+    used_names: set[str] = set()
+    for index, item in enumerate(payload):
+        if not isinstance(item, dict):
+            continue
+        secret_name = str(item.get("secretName") or item.get("secret_name") or "").strip()
+        mount_path = str(item.get("mountPath") or item.get("mount_path") or "").strip()
+        if not secret_name or not mount_path:
+            continue
+        volume_name = _dns_safe(str(item.get("name") or secret_name))[:54].strip("-") or f"secret-{index}"
+        if volume_name in used_names:
+            volume_name = f"{volume_name[:50].rstrip('-')}-{index}"
+        used_names.add(volume_name)
+        secret: dict[str, Any] = {"secretName": secret_name}
+        if bool(item.get("optional", False)):
+            secret["optional"] = True
+        volume_mount: dict[str, Any] = {
+            "name": volume_name,
+            "mountPath": mount_path,
+            "readOnly": item.get("readOnly", item.get("read_only", True)) is not False,
+        }
+        sub_path = str(item.get("subPath") or item.get("sub_path") or "").strip()
+        if sub_path:
+            volume_mount["subPath"] = sub_path
+        volumes.append(
+            {
+                "volume": {"name": volume_name, "secret": secret},
+                "volumeMount": volume_mount,
+            }
+        )
+    return volumes
 
 
 def _worker_job_name(spec: WorkerSpec, payload: dict[str, Any]) -> str:

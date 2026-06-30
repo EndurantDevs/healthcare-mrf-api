@@ -280,6 +280,68 @@ def test_price_address_assurance_rejects_malformed_provider_directory_network_ma
     } in summary["issues"]
 
 
+def test_price_address_assurance_rejects_malformed_provider_directory_network_keys():
+    base_match = {
+        "ptg_network_name": "C2",
+        "provider_directory_network_name": "C2",
+        "provider_directory_network_match_key": "c2",
+        "provider_directory_network_key": "c2",
+        "provider_directory_issuer_key": "aetna",
+        "provider_directory_issuer_network_match_key": "aetna:c2",
+    }
+    cases = (
+        (
+            {"provider_directory_network_match_key": "wrong"},
+            "provider_directory_network_matches provider_directory_network_match_key must canonicalize ptg_network_name",
+        ),
+        (
+            {"provider_directory_network_key": "C2"},
+            "provider_directory_network_matches provider_directory_network_key must be canonical",
+        ),
+        (
+            {"provider_directory_issuer_key": "Aetna"},
+            "provider_directory_network_matches provider_directory_issuer_key must be canonical",
+        ),
+        (
+            {"provider_directory_issuer_network_match_key": "aetna:wrong"},
+            "provider_directory_network_matches provider_directory_issuer_network_match_key must equal "
+            "provider_directory_issuer_key plus provider_directory_network_match_key",
+        ),
+    )
+    for overrides, expected_message in cases:
+        payload = {
+            "data": {
+                "items": [
+                    {
+                        "network_names": ["C2"],
+                        "source_trace": [{"source_file_version_id": "version-a"}],
+                        "address": {"first_line": "900 W Temple Ave"},
+                        "address_verification": {
+                            "rate_network_binding": "tic_provider_group_npi_tin",
+                            "address_network_binding": "payer_directory_corroborated_location",
+                            "address_evidence_level": "payer_directory_network_location",
+                            "requires_location_confirmation": False,
+                            "displayed_address_present": True,
+                            "network_bound_address": True,
+                            "provider_directory_plan_context_matched": False,
+                            "provider_directory_network_name_matched": True,
+                            "provider_directory_network_matches": [{**base_match, **overrides}],
+                            "address_verification_evidence": {
+                                "matched_on": "npi_address_key_role_location_network_name",
+                            },
+                        },
+                    }
+                ]
+            }
+        }
+
+        summary = summarize_ptg_price_address_payload(payload)
+
+        messages = [issue["message"] for issue in summary["issues"]]
+        assert summary["ok"] is False
+        assert expected_message in messages
+
+
 def test_price_address_assurance_rejects_network_binding_without_plan_context():
     payload = {
         "data": {

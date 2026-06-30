@@ -295,6 +295,33 @@ def _network_match_entries_issue(value: Any, *, field_name: str, index: int | No
                 f"{field_name} entries must include ptg_network_name and provider_directory_network_name",
                 index=index,
             )
+        match_key = str(entry.get("provider_directory_network_match_key") or "").strip()
+        if match_key and match_key != _canonical_network_name(entry.get("ptg_network_name")):
+            return _issue(
+                f"{field_name} provider_directory_network_match_key must canonicalize ptg_network_name",
+                index=index,
+            )
+        network_key = str(entry.get("provider_directory_network_key") or "").strip()
+        if network_key and network_key != _canonical_network_name(network_key):
+            return _issue(
+                f"{field_name} provider_directory_network_key must be canonical",
+                index=index,
+            )
+        issuer_key = str(entry.get("provider_directory_issuer_key") or "").strip()
+        if issuer_key and issuer_key != _canonical_network_name(issuer_key):
+            return _issue(
+                f"{field_name} provider_directory_issuer_key must be canonical",
+                index=index,
+            )
+        issuer_network_key = str(entry.get("provider_directory_issuer_network_match_key") or "").strip()
+        if issuer_network_key:
+            expected_match_key = match_key or _canonical_network_name(entry.get("ptg_network_name"))
+            if issuer_key and expected_match_key and issuer_network_key != f"{issuer_key}:{expected_match_key}":
+                return _issue(
+                    f"{field_name} provider_directory_issuer_network_match_key must equal "
+                    "provider_directory_issuer_key plus provider_directory_network_match_key",
+                    index=index,
+                )
     return None
 
 

@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from typing import Iterable
 
 from arq import create_pool
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.schema import CreateColumn
 
 from db.models import (
     EntityAddressEvidence,
@@ -80,6 +82,7 @@ DEFAULT_SQL_STATEMENT_TIMEOUT = "0"
 DEFAULT_SQL_SYNCHRONOUS_COMMIT = "off"
 DEFAULT_SQL_JIT = "off"
 DEFAULT_PROVIDER_DIRECTORY_PARTIAL_SCOPE = "latest-run"
+DEFAULT_PROVIDER_DIRECTORY_SOURCE_BATCH_SIZE = 3
 ENTITY_ADDRESS_REFRESH_MODE_FULL = "full"
 ENTITY_ADDRESS_REFRESH_MODE_PROVIDER_DIRECTORY_PARTIAL = "provider-directory-partial"
 ENTITY_ADDRESS_REFRESH_MODES = {
@@ -104,6 +107,8 @@ ENTITY_ADDRESS_UNIFIED_SERVING_STAGE_INDEXES = {
     "primary_state_city_npi",
     "primary_zip5_npi",
     "primary_phone_npi",
+    "service_phone_digits_npi",
+    "service_phone_number_npi",
     "taxonomy_plans_network",
     "procedures_array",
     "medications_array",
@@ -255,6 +260,28 @@ def _entity_address_provider_directory_run_id(task: dict) -> str | None:
         task.get("provider_directory_run_id")
         or os.getenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_PROVIDER_DIRECTORY_RUN_ID")
     )
+
+
+def _entity_address_provider_directory_source_batch_size(task: dict) -> int:
+    raw = (
+        task.get("provider_directory_source_batch_size")
+        or task.get("provider_directory_batch_size")
+        or os.getenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_PROVIDER_DIRECTORY_SOURCE_BATCH_SIZE")
+        or os.getenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_PROVIDER_DIRECTORY_BATCH_SIZE")
+    )
+    if raw in (None, ""):
+        return DEFAULT_PROVIDER_DIRECTORY_SOURCE_BATCH_SIZE
+    return max(int(raw), 0)
+
+
+def _provider_directory_source_id_batches(
+    source_ids: list[str] | tuple[str, ...] | None,
+    batch_size: int,
+) -> list[list[str]]:
+    ids = list(source_ids or [])
+    if not ids or batch_size <= 0 or len(ids) <= batch_size:
+        return [ids]
+    return [ids[index : index + batch_size] for index in range(0, len(ids), batch_size)]
 
 
 def _entity_address_provider_directory_partial_scope(task: dict) -> str:
@@ -1528,6 +1555,36 @@ async def _table_column_exists(db_schema: str, table_name: str, column_name: str
     )
 
 
+async def _ensure_entity_address_unified_live_columns(
+    db_schema: str,
+    table_name: str = EntityAddressUnified.__main_table__,
+) -> None:
+    if not await _table_exists(db_schema, table_name):
+        return
+    existing_rows = await db.all(
+        """
+        SELECT column_name
+          FROM information_schema.columns
+         WHERE table_schema = :db_schema
+           AND table_name = :table_name
+        """,
+        db_schema=db_schema,
+        table_name=table_name,
+    )
+    existing = {
+        str((row._mapping if hasattr(row, "_mapping") else row).get("column_name"))
+        for row in existing_rows
+    }
+    dialect = postgresql.dialect()
+    for column in EntityAddressUnified.__table__.columns:
+        if column.name in existing:
+            continue
+        column_ddl = str(CreateColumn(column).compile(dialect=dialect)).strip()
+        await db.status(
+            f"ALTER TABLE {db_schema}.{table_name} ADD COLUMN IF NOT EXISTS {column_ddl};"
+        )
+
+
 async def _support_bridge_reuse_available(db_schema: str, *, build_network_bridge: bool) -> bool:
     bridge_models: list[type] = [
         EntityAddressPlanBridge,
@@ -2011,26 +2068,100 @@ def _provider_directory_live_source_filter_sql(
 
 def _latest_provider_directory_partial_scope_sql(db_schema: str) -> str:
     source_ref = f"{db_schema}.provider_directory_source"
+    location_ref = f"{db_schema}.provider_directory_location"
+    organization_ref = f"{db_schema}.provider_directory_organization"
+    role_ref = f"{db_schema}.provider_directory_practitioner_role"
+    healthcare_service_ref = f"{db_schema}.provider_directory_healthcare_service"
+    affiliation_ref = f"{db_schema}.provider_directory_organization_affiliation"
     return f"""
     WITH completed_sources AS (
         SELECT
             source_id::varchar AS source_id,
             metadata_json::jsonb->'last_resource_import'->>'run_id' AS run_id,
-            updated_at
+            updated_at,
+            'metadata'::varchar AS scope_source
           FROM {source_ref}
          WHERE COALESCE(metadata_json::jsonb, '{{}}'::jsonb) ? 'last_resource_import'
-           AND metadata_json::jsonb->'last_resource_import'->'resources'->'Location'->>'complete' = 'true'
            AND (
-                metadata_json::jsonb->'last_resource_import'->'resources'->'PractitionerRole'->>'complete' = 'true'
-             OR metadata_json::jsonb->'last_resource_import'->'resources'->'OrganizationAffiliation'->>'complete' = 'true'
+                (
+                    metadata_json::jsonb->'last_resource_import'->'resources'->'Location'->>'complete' = 'true'
+                    AND (
+                        metadata_json::jsonb->'last_resource_import'->'resources'->'PractitionerRole'->>'complete' = 'true'
+                     OR metadata_json::jsonb->'last_resource_import'->'resources'->'OrganizationAffiliation'->>'complete' = 'true'
+                    )
+                )
+             OR metadata_json::jsonb->'last_resource_import'->'resources'->'Organization'->>'complete' = 'true'
            )
+    ), location_eligible_source_runs AS (
+        SELECT DISTINCT
+            role.source_id::varchar AS source_id,
+            role.last_seen_run_id::varchar AS run_id
+          FROM {role_ref} AS role
+         WHERE role.last_seen_run_id IS NOT NULL
+        UNION
+        SELECT DISTINCT
+            affiliation.source_id::varchar AS source_id,
+            affiliation.last_seen_run_id::varchar AS run_id
+          FROM {affiliation_ref} AS affiliation
+         WHERE affiliation.last_seen_run_id IS NOT NULL
+        UNION
+        SELECT DISTINCT
+            healthcare_service.source_id::varchar AS source_id,
+            healthcare_service.last_seen_run_id::varchar AS run_id
+          FROM {healthcare_service_ref} AS healthcare_service
+         WHERE healthcare_service.last_seen_run_id IS NOT NULL
+           AND healthcare_service.active IS DISTINCT FROM false
+           AND jsonb_array_length(COALESCE(healthcare_service.location_refs::jsonb, '[]'::jsonb)) > 0
+    ), location_row_sources AS (
+        SELECT
+            loc.source_id::varchar AS source_id,
+            loc.last_seen_run_id::varchar AS run_id,
+            MAX(loc.updated_at) AS updated_at,
+            'resource_rows'::varchar AS scope_source
+          FROM {location_ref} AS loc
+          JOIN location_eligible_source_runs AS eligible
+            ON eligible.source_id = loc.source_id
+           AND eligible.run_id = loc.last_seen_run_id
+         WHERE loc.last_seen_run_id IS NOT NULL
+      GROUP BY loc.source_id, loc.last_seen_run_id
+    ), organization_row_sources AS (
+        SELECT
+            organization.source_id::varchar AS source_id,
+            organization.last_seen_run_id::varchar AS run_id,
+            MAX(organization.updated_at) AS updated_at,
+            'resource_rows'::varchar AS scope_source
+          FROM {organization_ref} AS organization
+         WHERE organization.last_seen_run_id IS NOT NULL
+           AND organization.npi BETWEEN 1000000000 AND 9999999999
+           AND organization.active IS DISTINCT FROM false
+           AND jsonb_array_length(COALESCE(organization.address_json::jsonb, '[]'::jsonb)) > 0
+      GROUP BY organization.source_id, organization.last_seen_run_id
+    ), resource_row_sources AS (
+        SELECT
+            source_id,
+            run_id,
+            MAX(updated_at) AS updated_at,
+            'resource_rows'::varchar AS scope_source
+          FROM (
+                SELECT * FROM location_row_sources
+                UNION ALL
+                SELECT * FROM organization_row_sources
+          ) AS row_sources
+      GROUP BY source_id, run_id
+    ), selected_sources AS (
+        SELECT * FROM completed_sources
+        UNION ALL
+        SELECT resource_row_sources.*
+          FROM resource_row_sources
+         WHERE NOT EXISTS (SELECT 1 FROM completed_sources)
     )
     SELECT
         run_id,
         ARRAY_AGG(source_id ORDER BY source_id)::varchar[] AS source_ids,
         COUNT(*)::bigint AS source_count,
-        MAX(updated_at) AS latest_updated_at
-      FROM completed_sources
+        MAX(updated_at) AS latest_updated_at,
+        ARRAY_AGG(DISTINCT scope_source ORDER BY scope_source)::varchar[] AS scope_sources
+      FROM selected_sources
      WHERE run_id IS NOT NULL
   GROUP BY run_id
   ORDER BY MAX(updated_at) DESC NULLS LAST, run_id DESC
@@ -2038,15 +2169,16 @@ def _latest_provider_directory_partial_scope_sql(db_schema: str) -> str:
     """
 
 
-async def _latest_provider_directory_partial_scope(db_schema: str) -> tuple[str | None, list[str]]:
+async def _latest_provider_directory_partial_scope(db_schema: str) -> tuple[str | None, list[str], list[str]]:
     if not await _table_exists(db_schema, "provider_directory_source"):
-        return None, []
+        return None, [], []
     row = await db.first(_latest_provider_directory_partial_scope_sql(db_schema))
     if not row:
-        return None, []
-    values = row._mapping
+        return None, [], []
+    values = row._mapping if hasattr(row, "_mapping") else row
     source_ids = _coerce_str_list(values.get("source_ids"))
-    return _clean_optional(values.get("run_id")), source_ids
+    scope_sources = _coerce_str_list(values.get("scope_sources"))
+    return _clean_optional(values.get("run_id")), source_ids, scope_sources
 
 
 def _source_selects(
@@ -2073,6 +2205,7 @@ def _source_selects(
     has_provider_directory_location = available.get("provider_directory_location", False)
     has_provider_directory_role = available.get("provider_directory_practitioner_role", False)
     has_provider_directory_affiliation = available.get("provider_directory_organization_affiliation", False)
+    has_provider_directory_healthcare_service = available.get("provider_directory_healthcare_service", False)
     has_provider_directory_location_address_key = available.get(
         "provider_directory_location.address_key",
         has_provider_directory_location,
@@ -2120,6 +2253,13 @@ def _source_selects(
         zip_code="loc.postal_code",
         country="COALESCE(NULLIF(loc.country_code, ''), 'US')",
     )
+    provider_directory_organization_address_predicate = _address_source_keyable_predicate(
+        first_line="pd.first_line",
+        city="pd.city_name",
+        state="pd.state_name",
+        zip_code="pd.postal_code",
+        country="pd.country_code",
+    )
     provider_directory_role_scope_filter = _provider_directory_scope_filter_sql(
         "role",
         source_ids=provider_directory_source_ids,
@@ -2130,6 +2270,65 @@ def _source_selects(
         source_ids=provider_directory_source_ids,
         run_id=provider_directory_run_id,
     )
+    provider_directory_organization_scope_filter = _provider_directory_scope_filter_sql(
+        "organization",
+        source_ids=provider_directory_source_ids,
+        run_id=provider_directory_run_id,
+    )
+    if has_provider_directory_healthcare_service:
+        provider_directory_role_location_refs = f"""
+                  JOIN LATERAL (
+                      SELECT direct_location_ref.value
+                        FROM jsonb_array_elements_text(
+                              COALESCE(role.location_refs::jsonb, '[]'::jsonb)
+                        ) AS direct_location_ref(value)
+                      UNION
+                      SELECT service_location_ref.value
+                        FROM jsonb_array_elements_text(
+                              COALESCE(role.healthcare_service_refs::jsonb, '[]'::jsonb)
+                        ) AS service_ref(value)
+                        JOIN LATERAL (
+                            SELECT NULLIF(regexp_replace(service_ref.value, '^.*/', ''), '') AS resource_id
+                        ) AS service_ref_id ON service_ref_id.resource_id IS NOT NULL
+                        JOIN {db_schema}.provider_directory_healthcare_service AS healthcare_service
+                          ON healthcare_service.source_id = role.source_id
+                         AND healthcare_service.resource_id = service_ref_id.resource_id
+                       CROSS JOIN LATERAL jsonb_array_elements_text(
+                              COALESCE(healthcare_service.location_refs::jsonb, '[]'::jsonb)
+                       ) AS service_location_ref(value)
+                       WHERE healthcare_service.active IS DISTINCT FROM false
+                  ) AS location_ref(value) ON TRUE"""
+        provider_directory_affiliation_location_refs = f"""
+                  JOIN LATERAL (
+                      SELECT direct_location_ref.value
+                        FROM jsonb_array_elements_text(
+                              COALESCE(affiliation.location_refs::jsonb, '[]'::jsonb)
+                        ) AS direct_location_ref(value)
+                      UNION
+                      SELECT service_location_ref.value
+                        FROM jsonb_array_elements_text(
+                              COALESCE(affiliation.healthcare_service_refs::jsonb, '[]'::jsonb)
+                        ) AS service_ref(value)
+                        JOIN LATERAL (
+                            SELECT NULLIF(regexp_replace(service_ref.value, '^.*/', ''), '') AS resource_id
+                        ) AS service_ref_id ON service_ref_id.resource_id IS NOT NULL
+                        JOIN {db_schema}.provider_directory_healthcare_service AS healthcare_service
+                          ON healthcare_service.source_id = affiliation.source_id
+                         AND healthcare_service.resource_id = service_ref_id.resource_id
+                       CROSS JOIN LATERAL jsonb_array_elements_text(
+                              COALESCE(healthcare_service.location_refs::jsonb, '[]'::jsonb)
+                       ) AS service_location_ref(value)
+                       WHERE healthcare_service.active IS DISTINCT FROM false
+                  ) AS location_ref(value) ON TRUE"""
+    else:
+        provider_directory_role_location_refs = """
+                  JOIN LATERAL jsonb_array_elements_text(
+                        COALESCE(role.location_refs::jsonb, '[]'::jsonb)
+                  ) AS location_ref(value) ON TRUE"""
+        provider_directory_affiliation_location_refs = """
+                  JOIN LATERAL jsonb_array_elements_text(
+                        COALESCE(affiliation.location_refs::jsonb, '[]'::jsonb)
+                  ) AS location_ref(value) ON TRUE"""
 
     npi_join = f"LEFT JOIN {db_schema}.npi AS n ON n.npi = a.npi" if has_npi else ""
     doctors_npi_join = f"LEFT JOIN {db_schema}.npi AS n ON n.npi = d.npi" if has_npi else ""
@@ -2676,9 +2875,7 @@ def _source_selects(
                         regexp_replace(COALESCE(role.practitioner_ref, ''), '^.*/', ''),
                         ''
                    )
-                  JOIN LATERAL jsonb_array_elements_text(
-                        COALESCE(role.location_refs::jsonb, '[]'::jsonb)
-                  ) AS location_ref(value) ON TRUE
+                  {provider_directory_role_location_refs}
                   JOIN LATERAL (
                       SELECT NULLIF(regexp_replace(location_ref.value, '^.*/', ''), '') AS resource_id
                   ) AS location_ref_id ON location_ref_id.resource_id IS NOT NULL
@@ -2693,6 +2890,7 @@ def _source_selects(
                        LIMIT 1
                   ) AS role_phone ON TRUE
                  WHERE practitioner.npi IS NOT NULL
+                   AND practitioner.npi BETWEEN 1000000000 AND 9999999999
                    AND practitioner.active IS DISTINCT FROM false
                    AND role.active IS DISTINCT FROM false
                    AND (loc.status IS NULL OR lower(loc.status) <> 'inactive')
@@ -2803,9 +3001,7 @@ def _source_selects(
                   JOIN {db_schema}.provider_directory_organization AS organization
                     ON organization.source_id = affiliation.source_id
                    AND organization.resource_id = organization_ref.resource_id
-                  JOIN LATERAL jsonb_array_elements_text(
-                        COALESCE(affiliation.location_refs::jsonb, '[]'::jsonb)
-                  ) AS location_ref(value) ON TRUE
+                  {provider_directory_affiliation_location_refs}
                   JOIN LATERAL (
                       SELECT NULLIF(regexp_replace(location_ref.value, '^.*/', ''), '') AS resource_id
                   ) AS location_ref_id ON location_ref_id.resource_id IS NOT NULL
@@ -2813,6 +3009,7 @@ def _source_selects(
                     ON loc.source_id = affiliation.source_id
                    AND loc.resource_id = location_ref_id.resource_id
                  WHERE organization.npi IS NOT NULL
+                   AND organization.npi BETWEEN 1000000000 AND 9999999999
                    AND organization.active IS DISTINCT FROM false
                    AND affiliation.active IS DISTINCT FROM false
                    AND (loc.status IS NULL OR lower(loc.status) <> 'inactive')
@@ -2884,6 +3081,100 @@ def _source_selects(
             """
         )
 
+    if has_provider_directory_organization:
+        selects.append(
+            f"""
+            WITH provider_directory_organization_addresses AS (
+                SELECT
+                    organization.npi::bigint AS provider_npi,
+                    organization.name::varchar AS provider_name,
+                    organization.source_id,
+                    organization.resource_id AS organization_resource_id,
+                    organization.updated_at AS organization_updated_at,
+                    addr.ordinal::bigint AS address_ordinal,
+                    NULLIF(TRIM(addr.value->'line'->>0), '')::varchar AS first_line,
+                    NULLIF(TRIM(addr.value->'line'->>1), '')::varchar AS second_line,
+                    NULLIF(TRIM(addr.value->>'city'), '')::varchar AS city_name,
+                    NULLIF(TRIM(addr.value->>'state'), '')::varchar AS state_name,
+                    NULLIF(TRIM(addr.value->>'postalCode'), '')::varchar AS postal_code,
+                    CASE
+                        WHEN UPPER(REGEXP_REPLACE(TRIM(COALESCE(addr.value->>'country', '')), '[^A-Za-z]+', '', 'g'))
+                             IN ('', 'US', 'USA', 'UNITEDSTATES', 'UNITEDSTATESOFAMERICA')
+                            THEN 'US'
+                        ELSE NULLIF(TRIM(addr.value->>'country'), '')
+                    END::varchar AS country_code,
+                    org_phone.telephone_number::varchar AS telephone_number,
+                    org_fax.fax_number::varchar AS fax_number
+                  FROM {db_schema}.provider_directory_organization AS organization
+                  JOIN LATERAL jsonb_array_elements(
+                        COALESCE(organization.address_json::jsonb, '[]'::jsonb)
+                  ) WITH ORDINALITY AS addr(value, ordinal) ON TRUE
+                  LEFT JOIN LATERAL (
+                      SELECT telecom.value->>'value' AS telephone_number
+                        FROM jsonb_array_elements(COALESCE(organization.telecom::jsonb, '[]'::jsonb)) AS telecom(value)
+                       WHERE telecom.value->>'system' = 'phone'
+                         AND NULLIF(TRIM(telecom.value->>'value'), '') IS NOT NULL
+                       LIMIT 1
+                  ) AS org_phone ON TRUE
+                  LEFT JOIN LATERAL (
+                      SELECT telecom.value->>'value' AS fax_number
+                        FROM jsonb_array_elements(COALESCE(organization.telecom::jsonb, '[]'::jsonb)) AS telecom(value)
+                       WHERE telecom.value->>'system' = 'fax'
+                         AND NULLIF(TRIM(telecom.value->>'value'), '') IS NOT NULL
+                       LIMIT 1
+                  ) AS org_fax ON TRUE
+                 WHERE organization.npi IS NOT NULL
+                   AND organization.npi BETWEEN 1000000000 AND 9999999999
+                   AND organization.active IS DISTINCT FROM false
+                   {provider_directory_organization_scope_filter}
+            )
+            {provider_directory_pa_cte("provider_directory_organization_addresses")}
+            SELECT
+                'npi'::varchar AS entity_type,
+                pd.provider_npi::varchar AS entity_id,
+                pd.provider_npi::bigint AS npi,
+                NULL::bigint AS inferred_npi,
+                NULL::float8 AS inference_confidence,
+                NULL::varchar AS inference_method,
+                pd.provider_name::varchar AS entity_name,
+                'provider_directory_organization'::varchar AS entity_subtype,
+                'practice'::varchar AS type,
+                {('COALESCE(pa.taxonomy_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS taxonomy_array,
+                {('COALESCE(pa.plans_network_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS plans_network_array,
+                {('COALESCE(pa.procedures_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS procedures_array,
+                {('COALESCE(pa.medications_array, ARRAY[0]::int[])::int[]' if has_npi_address else 'ARRAY[0]::int[]')} AS medications_array,
+                ARRAY[]::varchar[] AS aca_plan_array,
+                ARRAY[]::varchar[] AS aca_network_array,
+                ARRAY[]::varchar[] AS ptg_plan_array,
+                ARRAY[]::varchar[] AS ptg_source_array,
+                ARRAY[]::varchar[] AS group_plan_array,
+                '{BASE_ADDRESS_VERSION}'::varchar AS base_address_version,
+                pd.first_line::varchar AS first_line,
+                pd.second_line::varchar AS second_line,
+                pd.city_name::varchar AS city_name,
+                pd.state_name::varchar AS state_name,
+                pd.postal_code::varchar AS postal_code,
+                pd.country_code::varchar AS country_code,
+                pd.telephone_number::varchar AS telephone_number,
+                pd.fax_number::varchar AS fax_number,
+                NULL::varchar AS formatted_address,
+                NULL::numeric AS lat,
+                NULL::numeric AS long,
+                NULL::date AS date_added,
+                NULL::varchar AS place_id,
+                NULL::uuid AS address_key,
+                COALESCE(pd.organization_updated_at, NOW())::timestamp AS updated_at,
+                'provider_directory_fhir'::varchar AS address_source,
+                (
+                    'provider_directory_fhir:organization_address:'
+                    || pd.source_id || ':' || pd.organization_resource_id || ':' || pd.address_ordinal::varchar
+                )::varchar AS source_record_id
+              FROM provider_directory_organization_addresses AS pd
+              {provider_directory_pa_from}
+             WHERE {provider_directory_organization_address_predicate}
+            """
+        )
+
     if test_limit_per_source and test_limit_per_source > 0:
         return [
             "(\n"
@@ -2926,6 +3217,7 @@ def _is_provider_directory_source_select(db_schema: str, source_select: str) -> 
     return (
         f"FROM {db_schema}.provider_directory_practitioner_role AS role" in source_select
         or f"FROM {db_schema}.provider_directory_organization_affiliation AS affiliation" in source_select
+        or f"FROM {db_schema}.provider_directory_organization AS organization" in source_select
     )
 
 
@@ -2934,6 +3226,11 @@ def _provider_directory_current_group_select_sql(source_select: str) -> str:
     SELECT DISTINCT
         src.entity_type::varchar AS entity_type,
         src.entity_id::varchar AS entity_id,
+        CASE
+            WHEN src.entity_type = 'npi' AND src.entity_id ~ '^[0-9]+$'
+                THEN src.entity_id::bigint
+            ELSE NULL::bigint
+        END AS entity_npi,
         src.address_key::uuid AS address_key,
         {_street_soft_norm_expr("src.first_line")}::varchar AS street_key,
         {_alnum_norm_expr("src.city_name")}::varchar AS city_key,
@@ -2980,6 +3277,11 @@ def _prepare_provider_directory_partial_affected_groups_sql(
     SELECT DISTINCT
         live.entity_type::varchar AS entity_type,
         live.entity_id::varchar AS entity_id,
+        CASE
+            WHEN live.entity_type = 'npi' AND live.entity_id ~ '^[0-9]+$'
+                THEN live.entity_id::bigint
+            ELSE NULL::bigint
+        END AS entity_npi,
         live.address_key::uuid AS address_key,
         {_street_soft_norm_expr("live.first_line")}::varchar AS street_key,
         {_alnum_norm_expr("live.city_name")}::varchar AS city_key,
@@ -3000,6 +3302,7 @@ def _index_affected_groups_sql(db_schema: str, group_table: str) -> str:
     return f"""
     CREATE INDEX {index_name}
         ON {db_schema}.{group_table} (
+            entity_npi,
             entity_type,
             entity_id,
             address_key,
@@ -3023,13 +3326,22 @@ def _provider_directory_partial_scope_index_sql(db_schema: str) -> list[str]:
             ON {db_schema}.provider_directory_practitioner_role (last_seen_run_id, source_id);
         """,
         f"""
+        CREATE INDEX IF NOT EXISTS provider_directory_organization_run_source_idx
+            ON {db_schema}.provider_directory_organization (last_seen_run_id, source_id);
+        """,
+        f"""
         CREATE INDEX IF NOT EXISTS provider_directory_affiliation_run_source_idx
             ON {db_schema}.provider_directory_organization_affiliation (last_seen_run_id, source_id);
+        """,
+        f"""
+        CREATE INDEX IF NOT EXISTS provider_directory_healthcare_service_run_source_idx
+            ON {db_schema}.provider_directory_healthcare_service (last_seen_run_id, source_id);
         """,
     ]
 
 
 def _affected_group_source_select_sql(db_schema: str, source_select: str, group_table: str) -> str:
+    source_select = _prefilter_npi_source_select_sql(db_schema, source_select, group_table)
     return f"""
     SELECT src.*
       FROM (
@@ -3041,6 +3353,30 @@ def _affected_group_source_select_sql(db_schema: str, source_select: str, group_
              WHERE {_entity_address_evidence_group_match_sql("affected", "src")}
      )
     """
+
+
+def _prefilter_npi_source_select_sql(db_schema: str, source_select: str, group_table: str) -> str:
+    affected_join = f"""
+              JOIN (
+                    SELECT DISTINCT entity_npi
+                      FROM {db_schema}.{group_table}
+                     WHERE entity_npi IS NOT NULL
+              ) AS affected_npi
+                ON affected_npi.entity_npi = {{alias}}.npi"""
+    markers = (
+        (f"FROM {db_schema}.npi_address AS a", "a"),
+        (f"FROM {db_schema}.doctor_clinician_address AS d", "d"),
+        (f"FROM {db_schema}.mrf_address AS a", "a"),
+        (f"FROM {db_schema}.provider_enrollment_ffs AS f", "f"),
+    )
+    for marker, alias in markers:
+        if marker in source_select:
+            return source_select.replace(
+                marker,
+                marker + affected_join.format(alias=alias),
+                1,
+            )
+    return source_select
 
 
 def _provider_directory_partial_source_selects(
@@ -3102,16 +3438,28 @@ def _insert_stage_entity_into_live_sql(db_schema: str, live_table: str, stage_ta
     columns = _entity_address_column_names()
     column_list = ", ".join(columns)
     select_list = ", ".join(f"stage.{column}" for column in columns)
+    conflict_columns = ("entity_type", "entity_id", "type", "checksum")
     update_list = ",\n        ".join(
         f"{column} = EXCLUDED.{column}"
         for column in columns
-        if column != "location_key"
+        if column not in conflict_columns
     )
     return f"""
     INSERT INTO {db_schema}.{live_table} ({column_list})
     SELECT {select_list}
-      FROM {db_schema}.{stage_table} AS stage
-    ON CONFLICT (location_key) DO UPDATE
+      FROM (
+            SELECT DISTINCT ON (entity_type, entity_id, type, checksum) *
+              FROM {db_schema}.{stage_table}
+          ORDER BY entity_type,
+                   entity_id,
+                   type,
+                   checksum,
+                   (address_key IS NOT NULL) DESC,
+                   source_count DESC NULLS LAST,
+                   updated_at DESC NULLS LAST,
+                   location_key
+      ) AS stage
+    ON CONFLICT (entity_type, entity_id, type, checksum) DO UPDATE
        SET {update_list};
     """
 
@@ -8630,6 +8978,12 @@ async def process_data(ctx, task=None):
         if partial_provider_directory_refresh
         else None
     )
+    provider_directory_source_batch_size = (
+        _entity_address_provider_directory_source_batch_size(task)
+        if partial_provider_directory_refresh
+        else 0
+    )
+    provider_directory_scope_sources: list[str] = []
     context["refresh_mode"] = refresh_mode
     context["partial_provider_directory_refresh"] = partial_provider_directory_refresh
     context["partial_provider_directory_scope"] = provider_directory_partial_scope
@@ -8772,7 +9126,11 @@ async def process_data(ctx, task=None):
         and not provider_directory_source_ids
         and not provider_directory_run_id
     ):
-        provider_directory_run_id, provider_directory_source_ids = (
+        (
+            provider_directory_run_id,
+            provider_directory_source_ids,
+            provider_directory_scope_sources,
+        ) = (
             await _latest_provider_directory_partial_scope(db_schema)
         )
     if partial_provider_directory_refresh and provider_directory_partial_scope == "latest-run":
@@ -8786,13 +9144,28 @@ async def process_data(ctx, task=None):
     context["partial_provider_directory_run_id"] = provider_directory_run_id
     context["partial_provider_directory_source_ids"] = provider_directory_source_ids
     context["partial_provider_directory_source_count"] = len(provider_directory_source_ids)
-    source_selects = _source_selects(
-        db_schema,
-        available,
-        test_limit_per_source=test_limit_per_source,
-        provider_directory_source_ids=provider_directory_source_ids,
-        provider_directory_run_id=provider_directory_run_id,
+    context["partial_provider_directory_scope_sources"] = provider_directory_scope_sources
+    provider_directory_source_batches = (
+        _provider_directory_source_id_batches(
+            provider_directory_source_ids,
+            provider_directory_source_batch_size,
+        )
+        if partial_provider_directory_refresh
+        else [provider_directory_source_ids]
     )
+    context["partial_provider_directory_source_batch_size"] = provider_directory_source_batch_size
+    context["partial_provider_directory_source_batches"] = len(provider_directory_source_batches)
+    source_selects: list[str] = []
+    for provider_directory_source_batch in provider_directory_source_batches:
+        source_selects.extend(
+            _source_selects(
+                db_schema,
+                available,
+                test_limit_per_source=test_limit_per_source,
+                provider_directory_source_ids=provider_directory_source_batch,
+                provider_directory_run_id=provider_directory_run_id,
+            )
+        )
     affected_group_table: str | None = None
     if partial_provider_directory_refresh:
         if not await _table_exists(db_schema, EntityAddressUnified.__main_table__):
@@ -9938,7 +10311,8 @@ async def shutdown(ctx):
         os.getenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_MIN_ROWS", str(DEFAULT_MIN_ROWS))
     )
     previous_rows = 0
-    if await _table_exists(db_schema, EntityAddressUnified.__main_table__):
+    live_table_exists = await _table_exists(db_schema, EntityAddressUnified.__main_table__)
+    if live_table_exists:
         previous_rows = int(
             await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{EntityAddressUnified.__main_table__};")
             or 0
@@ -9994,11 +10368,12 @@ async def shutdown(ctx):
         return
 
     if partial_main_patch:
-        if previous_rows <= 0:
+        if not live_table_exists:
             raise RuntimeError(
                 f"entity-address-unified {context.get('refresh_mode') or 'partial'} "
-                "main patch publish requires an existing live table."
+                "main patch publish requires the live table to exist."
             )
+        await _ensure_entity_address_unified_live_columns(db_schema)
     else:
         _validate_publish_row_count(
             stage_rows=stage_rows,
@@ -10187,6 +10562,9 @@ async def shutdown(ctx):
             "partial_provider_directory_source_count": int(
                 context.get("partial_provider_directory_source_count") or 0
             ),
+            "partial_provider_directory_scope_sources": (
+                context.get("partial_provider_directory_scope_sources") or []
+            ),
             "npi_rows": int(context.get("npi_rows") or 0),
             "inferred_rows": int(context.get("inferred_rows") or 0),
             "multi_source_rows": int(context.get("multi_source_rows") or 0),
@@ -10326,6 +10704,7 @@ async def main(
     provider_directory_run_id: str | None = None,
     provider_directory_source_ids: list[str] | tuple[str, ...] | str | None = None,
     provider_directory_partial_scope: str | None = None,
+    provider_directory_source_batch_size: int | None = None,
 ):
     redis = await create_pool(
         build_redis_settings(),
@@ -10348,4 +10727,6 @@ async def main(
         payload["provider_directory_source_ids"] = source_ids
     if provider_directory_partial_scope:
         payload["provider_directory_partial_scope"] = provider_directory_partial_scope
+    if provider_directory_source_batch_size is not None:
+        payload["provider_directory_source_batch_size"] = max(int(provider_directory_source_batch_size), 0)
     await redis.enqueue_job("process_data", payload, _queue_name=ENTITY_ADDRESS_UNIFIED_QUEUE_NAME)

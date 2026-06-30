@@ -1160,6 +1160,7 @@ mod tests {
         let payload: Value = serde_json::from_str(&canon_version_json()).unwrap();
         assert_eq!(payload["identity_version"], ADDRESS_IDENTITY_VERSION);
         assert_eq!(payload["identity_prefix"], ADDRESS_IDENTITY_PREFIX);
+        assert_eq!(payload["ruleset_version"], ADDRESS_CANON_RULESET_VERSION);
         assert_eq!(payload["pub28_sha256"].as_str().unwrap().len(), 64);
     }
 

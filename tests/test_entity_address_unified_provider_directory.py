@@ -15,6 +15,7 @@ def _provider_directory_available() -> dict[str, bool]:
         "provider_directory_location": True,
         "provider_directory_location.address_key": True,
         "provider_directory_practitioner_role": True,
+        "provider_directory_healthcare_service": True,
         "provider_directory_organization_affiliation": True,
     }
 
@@ -33,7 +34,7 @@ def test_source_selects_add_provider_directory_practitioner_and_organization_pat
     selects = entity_address_unified._source_selects("mrf", _provider_directory_available())
     sql = "\n".join(selects)
 
-    assert len(selects) == 2
+    assert len(selects) == 3
     assert "mrf.provider_directory_practitioner_role AS role" in sql
     assert "mrf.provider_directory_practitioner AS practitioner" in sql
     assert "mrf.provider_directory_organization_affiliation AS affiliation" in sql
@@ -41,10 +42,18 @@ def test_source_selects_add_provider_directory_practitioner_and_organization_pat
     assert "mrf.provider_directory_location AS loc" in sql
     assert "COALESCE(role.location_refs::jsonb, '[]'::jsonb)" in sql
     assert "COALESCE(affiliation.location_refs::jsonb, '[]'::jsonb)" in sql
+    assert "mrf.provider_directory_healthcare_service AS healthcare_service" in sql
+    assert "COALESCE(role.healthcare_service_refs::jsonb, '[]'::jsonb)" in sql
+    assert "COALESCE(affiliation.healthcare_service_refs::jsonb, '[]'::jsonb)" in sql
+    assert "COALESCE(healthcare_service.location_refs::jsonb, '[]'::jsonb)" in sql
+    assert "healthcare_service.resource_id = service_ref_id.resource_id" in sql
+    assert "healthcare_service.active IS DISTINCT FROM false" in sql
     assert "ORDER BY 1" in sql
     assert "'provider_directory_fhir'::varchar AS address_source" in sql
     assert "provider_directory_fhir:practitioner_role:" in sql
     assert "provider_directory_fhir:organization_affiliation:" in sql
+    assert "provider_directory_fhir:organization_address:" in sql
+    assert "jsonb_array_elements(\n                        COALESCE(organization.address_json::jsonb" in sql
 
 
 def test_provider_directory_source_selects_keep_keyable_address_and_phone_filters():
@@ -62,6 +71,9 @@ def test_provider_directory_source_selects_keep_keyable_address_and_phone_filter
     assert "pd.longitude::numeric BETWEEN -180 AND 180" in sql
     assert "practitioner.active IS DISTINCT FROM false" in sql
     assert "organization.active IS DISTINCT FROM false" in sql
+    assert "NULLIF(TRIM(addr.value->'line'->>0), '')::varchar AS first_line" in sql
+    assert "NULLIF(TRIM(addr.value->>'postalCode'), '')::varchar AS postal_code" in sql
+    assert "NULL::uuid AS address_key" in sql
 
 
 def test_provider_directory_source_selects_precompute_primary_npi_attributes():
@@ -75,6 +87,7 @@ def test_provider_directory_source_selects_precompute_primary_npi_attributes():
     assert "SELECT DISTINCT provider_npi" in sql
     assert "FROM provider_directory_practitioner_locations" in sql
     assert "FROM provider_directory_organization_locations" in sql
+    assert "FROM provider_directory_organization_addresses" in sql
     assert "LEFT JOIN provider_directory_primary_npi_address AS pa ON pa.npi = pd.provider_npi" in sql
     assert "FROM mrf.npi_address AS pa WHERE pa.npi = provider_npi" not in sql
 
@@ -93,6 +106,30 @@ def test_provider_directory_source_selects_normalize_fhir_refs_before_joining():
     assert "OR affiliation.participating_organization_ref IN" not in sql
 
 
+def test_provider_directory_source_selects_keep_direct_locations_without_healthcare_service_table():
+    available = _provider_directory_available()
+    available["provider_directory_healthcare_service"] = False
+    selects = entity_address_unified._source_selects("mrf", available)
+    sql = "\n".join(selects)
+
+    assert "mrf.provider_directory_healthcare_service AS healthcare_service" not in sql
+    assert "COALESCE(role.location_refs::jsonb, '[]'::jsonb)" in sql
+    assert "COALESCE(affiliation.location_refs::jsonb, '[]'::jsonb)" in sql
+    assert "COALESCE(role.healthcare_service_refs::jsonb" not in sql
+    assert "COALESCE(affiliation.healthcare_service_refs::jsonb" not in sql
+
+
+def test_provider_directory_partial_scope_includes_healthcare_service_location_refs():
+    sql = entity_address_unified._latest_provider_directory_partial_scope_sql("mrf")
+    indexes = "\n".join(entity_address_unified._provider_directory_partial_scope_index_sql("mrf"))
+
+    assert "mrf.provider_directory_healthcare_service" in sql
+    assert "healthcare_service.last_seen_run_id IS NOT NULL" in sql
+    assert "healthcare_service.active IS DISTINCT FROM false" in sql
+    assert "jsonb_array_length(COALESCE(healthcare_service.location_refs::jsonb, '[]'::jsonb)) > 0" in sql
+    assert "provider_directory_healthcare_service_run_source_idx" in indexes
+
+
 def test_provider_directory_source_selects_can_scope_by_source_and_run():
     selects = entity_address_unified._source_selects(
         "mrf",
@@ -106,13 +143,50 @@ def test_provider_directory_source_selects_can_scope_by_source_and_run():
     assert "role.last_seen_run_id = 'run_123'" in sql
     assert "affiliation.source_id = ANY(ARRAY['source_a', 'source_b']::varchar[])" in sql
     assert "affiliation.last_seen_run_id = 'run_123'" in sql
+    assert "organization.source_id = ANY(ARRAY['source_a', 'source_b']::varchar[])" in sql
+    assert "organization.last_seen_run_id = 'run_123'" in sql
+
+
+def test_provider_directory_source_id_batches_are_bounded():
+    assert entity_address_unified._provider_directory_source_id_batches(  # pylint: disable=protected-access
+        ["source_a", "source_b", "source_c", "source_d", "source_e"],
+        2,
+    ) == [["source_a", "source_b"], ["source_c", "source_d"], ["source_e"]]
+    assert entity_address_unified._provider_directory_source_id_batches(  # pylint: disable=protected-access
+        ["source_a", "source_b"],
+        0,
+    ) == [["source_a", "source_b"]]
+    assert entity_address_unified._provider_directory_source_id_batches(  # pylint: disable=protected-access
+        [],
+        2,
+    ) == [[]]
+
+
+def test_provider_directory_source_batch_size_accepts_task_and_env(monkeypatch):
+    assert (
+        entity_address_unified._entity_address_provider_directory_source_batch_size(  # pylint: disable=protected-access
+            {"provider_directory_source_batch_size": 4}
+        )
+        == 4
+    )
+
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_PROVIDER_DIRECTORY_SOURCE_BATCH_SIZE", "5")
+    assert (
+        entity_address_unified._entity_address_provider_directory_source_batch_size({})  # pylint: disable=protected-access
+        == 5
+    )
 
 
 def test_provider_directory_source_selects_are_guarded_by_table_availability():
     available = _provider_directory_available()
     available["provider_directory_location"] = False
 
-    assert entity_address_unified._source_selects("mrf", available) == []
+    selects = entity_address_unified._source_selects("mrf", available)
+
+    assert len(selects) == 1
+    assert "provider_directory_fhir:organization_address:" in selects[0]
+    assert "provider_directory_practitioner_role AS role" not in selects[0]
+    assert "provider_directory_organization_affiliation AS affiliation" not in selects[0]
 
 
 def test_serving_only_refresh_task_bool_overrides_env(monkeypatch):

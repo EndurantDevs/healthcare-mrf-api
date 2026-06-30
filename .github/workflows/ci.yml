@@ -124,7 +124,7 @@ jobs:
       - name: Smoke address canonical COPY CLI
         run: |
           tmp=$(mktemp -d)
-          support/ptg2_scanner/target/release/ptg2_scanner --canon-version
+          support/ptg2_scanner/target/release/ptg2_scanner --canon-version | python -c 'import json,sys; payload=json.load(sys.stdin); assert payload["ruleset_version"] == 3, payload'
           printf "1\t(0,1)\t\\N\t123 Main St\tSuite 2\tAustin\tTX\t78701\tUS\n" > "$tmp/raw.copy"
           support/ptg2_scanner/target/release/ptg2_scanner \
             --address-canonicalize-copy "$tmp/raw.copy" "$tmp/keyed.copy"

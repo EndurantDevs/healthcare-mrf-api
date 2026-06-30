@@ -10,14 +10,17 @@ writes ignored reports under reports/provider-directory-fhir/.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import datetime as dt
 import importlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +28,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_REPORT_DIR = ROOT / "reports" / "provider-directory-fhir"
+IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -88,7 +92,17 @@ def _fixture_resources() -> list[dict[str, Any]]:
             "practitioner": {"reference": "Practitioner/prac-1"},
             "organization": {"reference": "Organization/org-1"},
             "location": [{"reference": "Location/loc-1"}],
+            "healthcareService": [{"reference": "HealthcareService/service-1"}],
             "insurancePlan": [{"reference": "InsurancePlan/plan-1"}],
+            "endpoint": [{"reference": "Endpoint/endpoint-1"}],
+        },
+        {
+            "resourceType": "HealthcareService",
+            "id": "service-1",
+            "active": True,
+            "name": "Fixture Primary Care",
+            "type": [{"coding": [{"system": "http://snomed.info/sct", "code": "408443003"}]}],
+            "location": [{"reference": "Location/loc-1"}],
             "endpoint": [{"reference": "Endpoint/endpoint-1"}],
         },
         {
@@ -135,7 +149,7 @@ def _run_fixture_case() -> CaseResult:
         resource_counts: dict[str, int] = {}
         for model, _row in (item for item in parsed if item):
             resource_counts[model.__tablename__] = resource_counts.get(model.__tablename__, 0) + 1
-        status = "succeeded" if capability["fhir_version"] == "4.0.1" and len(parsed) == 5 else "failed"
+        status = "succeeded" if capability["fhir_version"] == "4.0.1" and len(parsed) == 6 else "failed"
         return CaseResult(
             case_id="fixture-parser",
             kind="fixture",
@@ -151,6 +165,147 @@ def _run_fixture_case() -> CaseResult:
             elapsed_seconds=time.monotonic() - started,
             error=str(exc),
         )
+
+
+def _validate_identifier(value: str, *, label: str) -> str:
+    cleaned = str(value or "").strip()
+    if not IDENTIFIER_RE.fullmatch(cleaned):
+        raise ValueError(f"{label} must be a PostgreSQL identifier, got {value!r}")
+    return cleaned
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    return int(value) if value not in (None, "") else default
+
+
+def _sql_typing_schema() -> str:
+    return "provider_directory_sql_typing_" + dt.datetime.now(dt.UTC).strftime("%Y%m%d%H%M%S")
+
+
+def _sql_typing_ddl(schema: str) -> str:
+    return f"""
+DROP SCHEMA IF EXISTS {schema} CASCADE;
+CREATE SCHEMA {schema};
+CREATE FUNCTION {schema}.addr_zip5_norm_v1(value text) RETURNS text LANGUAGE sql IMMUTABLE AS $$
+  SELECT NULLIF(substring(regexp_replace(coalesce(value, ''), '[^0-9]', '', 'g') from 1 for 5), '')
+$$;
+CREATE FUNCTION {schema}.addr_state_code_v1(value text) RETURNS text LANGUAGE sql IMMUTABLE AS $$
+  SELECT upper(NULLIF(btrim(value), ''))
+$$;
+CREATE FUNCTION {schema}.addr_city_norm_v1(value text) RETURNS text LANGUAGE sql IMMUTABLE AS $$
+  SELECT lower(NULLIF(btrim(value), ''))
+$$;
+CREATE FUNCTION {schema}.addr_key_v1(a text, b text, c text, d text, e text, f text) RETURNS text LANGUAGE sql IMMUTABLE AS $$
+  SELECT md5(coalesce(a,'') || '|' || coalesce(b,'') || '|' || coalesce(c,'') || '|' || coalesce(d,'') || '|' || coalesce(e,'') || '|' || coalesce(f,''))
+$$;
+CREATE TABLE {schema}.geo_zip_lookup (
+    zip_code text PRIMARY KEY,
+    state text
+);
+CREATE TABLE {schema}.provider_directory_location (
+    source_id varchar NOT NULL,
+    resource_id varchar NOT NULL,
+    first_line text,
+    second_line text,
+    city_name text,
+    postal_code text,
+    country_code text,
+    state_name text,
+    state_code text,
+    address_key text,
+    zip5 varchar,
+    city_norm varchar,
+    last_seen_run_id varchar,
+    updated_at timestamp,
+    PRIMARY KEY (source_id, resource_id)
+);
+CREATE TABLE {schema}.provider_directory_import_seen_stage_test (
+    run_id varchar,
+    resource_type varchar,
+    source_id varchar,
+    resource_id varchar
+);
+"""
+
+
+async def _run_sql_typing_case_async(args: argparse.Namespace) -> CaseResult:
+    started = time.monotonic()
+    schema = _validate_identifier(args.sql_schema or _sql_typing_schema(), label="sql schema")
+    user = urllib.parse.quote(str(args.db_user), safe="")
+    password = urllib.parse.quote(str(args.db_password), safe="")
+    auth = f"{user}:{password}" if password else user
+    asyncpg_dsn = f"postgresql://{auth}@{args.db_host}:{args.db_port}/{args.db_database}"
+    sqlalchemy_url = f"postgresql+asyncpg://{auth}@{args.db_host}:{args.db_port}/{args.db_database}"
+    engine = None
+    raw_execute = None
+    schema_created = False
+    status = "succeeded"
+    error: str | None = None
+    try:
+        import asyncpg  # pylint: disable=import-outside-toplevel
+        from sqlalchemy import text  # pylint: disable=import-outside-toplevel
+        from sqlalchemy.ext.asyncio import create_async_engine  # pylint: disable=import-outside-toplevel
+
+        importer = importlib.import_module("process.provider_directory_fhir")
+
+        async def raw(sql: str) -> None:
+            conn = await asyncpg.connect(asyncpg_dsn)
+            try:
+                await conn.execute(sql)
+            finally:
+                await conn.close()
+
+        raw_execute = raw
+        await raw(_sql_typing_ddl(schema))
+        schema_created = True
+        engine = create_async_engine(sqlalchemy_url)
+        async with engine.begin() as conn:
+            params = {
+                "run_id": "run_sql_typing",
+                "after_source_id": None,
+                "after_resource_id": None,
+                "batch_size": 10,
+            }
+            sql = importer.provider_directory_location_address_key_batch_sql(
+                schema,
+                run_id="run_sql_typing",
+            )
+            row = (await conn.execute(text(sql), params)).fetchone()
+            assert row is not None and row.candidate_rows == 0
+
+            seen_sql = importer.provider_directory_location_address_key_batch_sql(
+                schema,
+                run_id="run_sql_typing",
+                seen_table="provider_directory_import_seen_stage_test",
+            )
+            seen_row = (await conn.execute(text(seen_sql), params)).fetchone()
+            assert seen_row is not None and seen_row.candidate_rows == 0
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        status = "failed"
+        error = str(exc)
+    finally:
+        if engine is not None:
+            await engine.dispose()
+        if schema_created and raw_execute is not None and not args.keep_sql_schema:
+            try:
+                await raw_execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE;")
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                cleanup_error = f"cleanup failed: {exc}"
+                status = "failed"
+                error = f"{error}; {cleanup_error}" if error else cleanup_error
+    return CaseResult(
+        case_id="sql-typing",
+        kind="sql",
+        status=status,
+        elapsed_seconds=time.monotonic() - started,
+        metrics={"schema": schema, "database": args.db_database},
+        error=error,
+    )
+
+
+def _run_sql_typing_case(args: argparse.Namespace) -> CaseResult:
+    return asyncio.run(_run_sql_typing_case_async(args))
 
 
 def _parse_import_metrics(output: str) -> dict[str, Any]:
@@ -197,6 +352,12 @@ def _run_cli_case(case_id: str, args: argparse.Namespace) -> CaseResult:
         "--concurrency",
         str(args.concurrency),
     ]
+    if args.retest_results_path:
+        command.extend(["--retest-results-path", args.retest_results_path])
+    if args.retest_results_url:
+        command.extend(["--retest-results-url", args.retest_results_url])
+    if args.credential_config_file:
+        command.extend(["--credential-config-file", args.credential_config_file])
     if args.source_query:
         command.extend(["--source-query", args.source_query])
     if args.import_resources:
@@ -286,6 +447,10 @@ def _run_control_case(case_id: str, args: argparse.Namespace) -> CaseResult:
         payload["params"]["limit"] = args.limit
     if args.source_query:
         payload["params"]["source_query"] = args.source_query
+    if args.retest_results_path:
+        payload["params"]["retest_results_path"] = args.retest_results_path
+    if args.retest_results_url:
+        payload["params"]["retest_results_url"] = args.retest_results_url
     request = urllib.request.Request(
         f"{control_url}/imports",
         data=json.dumps(payload).encode("utf-8"),
@@ -345,6 +510,8 @@ def write_report(report: dict[str, Any], output_root: Path) -> None:
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
     results = [_run_fixture_case()]
+    if args.sql_typing:
+        results.append(_run_sql_typing_case(args))
     if args.local_cli:
         if not args.seed_db_path:
             results.append(CaseResult("local-cli", "cli", "skipped", 0, error="--seed-db-path is required for --local-cli"))
@@ -373,10 +540,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Provider Directory FHIR self-harness cases.")
     parser.add_argument("--output-dir", help="Report output directory. Defaults to reports/provider-directory-fhir/run-<timestamp>.")
     parser.add_argument("--python", help="Python executable for local CLI case. Defaults to current interpreter.")
+    parser.add_argument("--sql-typing", action="store_true", help="Run disposable DB-backed SQL typing checks through SQLAlchemy asyncpg.")
+    parser.add_argument("--sql-schema", default=os.getenv("HLTHPRT_PROVIDER_DIRECTORY_SQL_HARNESS_SCHEMA") or _sql_typing_schema())
+    parser.add_argument("--keep-sql-schema", action="store_true", help="Keep the disposable SQL typing schema after the run.")
+    parser.add_argument("--db-host", default=os.getenv("HLTHPRT_DB_HOST") or "127.0.0.1")
+    parser.add_argument("--db-port", type=int, default=_env_int("HLTHPRT_DB_PORT", 5440))
+    parser.add_argument("--db-database", default=os.getenv("HLTHPRT_DB_DATABASE") or "healthporta_test")
+    parser.add_argument("--db-user", default=os.getenv("HLTHPRT_DB_USER") or os.getenv("USER") or "nick")
+    parser.add_argument("--db-password", default=os.getenv("HLTHPRT_DB_PASSWORD") or "")
     parser.add_argument("--local-cli", action="store_true", help="Run the local DB-backed CLI importer case.")
     parser.add_argument("--control-url", help="Control API base URL, for example https://app-dev.healthporta.com/control/v1.")
     parser.add_argument("--control-token", help="Control API bearer token. Defaults to HLTHPRT_CONTROL_API_TOKEN.")
     parser.add_argument("--seed-db-path", help="SQLite seed database path for local CLI runs.")
+    parser.add_argument("--retest-results-path", help="Optional provider-directory-db retest_results.json path for local/control runs.")
+    parser.add_argument("--retest-results-url", help="Optional provider-directory-db retest_results.json URL for local/control runs.")
+    parser.add_argument("--credential-config-file", help="Optional Provider Directory credentials JSON file for local CLI runs.")
     parser.add_argument("--limit", type=int, default=10, help="Source limit for bounded runs.")
     parser.add_argument("--source-query", help="Optional source org/plan filter.")
     parser.add_argument("--seed-only", action="store_true", help="Local CLI: only load source rows.")

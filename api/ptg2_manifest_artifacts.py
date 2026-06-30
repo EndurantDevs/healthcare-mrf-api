@@ -90,6 +90,8 @@ PTG_NO_DISPLAY_VERIFICATION_FIELDS = {
     "source_mask",
     "address_source_mask",
     "provider_directory_source_id",
+    "provider_directory_org_name",
+    "provider_directory_plan_name",
     "provider_directory_location_resource_id",
     "provider_directory_location_name",
     "provider_directory_plan_context_matched",
@@ -241,6 +243,105 @@ def _canonical_network_name(value: Any) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
 
 
+def _pre_shaped_manifest_network_name_match(
+    network: Mapping[str, Any],
+    ptg_by_key: Mapping[str, str],
+) -> dict[str, Any] | None:
+    ptg_name = str(network.get("ptg_network_name") or "").strip()
+    provider_directory_name = str(network.get("provider_directory_network_name") or "").strip()
+    candidate_key = _canonical_network_name(ptg_name)
+    if not candidate_key or candidate_key not in ptg_by_key or not provider_directory_name:
+        return None
+    match = dict(network)
+    match["ptg_network_name"] = ptg_by_key[candidate_key]
+    return match
+
+
+def _manifest_network_match_context(
+    address_payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    evidence = _coerce_json_payload(address_payload.get("address_verification_evidence"), {})
+    if not isinstance(evidence, dict):
+        evidence = {}
+    address_sources = {
+        str(value or "").strip().lower().replace("-", "_")
+        for value in _coerce_str_list(address_payload.get("address_sources"))
+    }
+    source = evidence.get("source") or address_payload.get("provider_directory_source")
+    if not source and "provider_directory_fhir" in address_sources:
+        source = "provider_directory_fhir"
+    context = {
+        "provider_directory_source": source,
+        "provider_directory_source_id": (
+            address_payload.get("provider_directory_source_id")
+            or evidence.get("source_id")
+            or evidence.get("provider_directory_source_id")
+        ),
+        "provider_directory_org_name": (
+            address_payload.get("provider_directory_org_name")
+            or evidence.get("org_name")
+            or evidence.get("provider_directory_org_name")
+        ),
+        "provider_directory_plan_name": (
+            address_payload.get("provider_directory_plan_name")
+            or evidence.get("plan_name")
+            or evidence.get("provider_directory_plan_name")
+        ),
+    }
+    return {key: value for key, value in context.items() if value not in (None, "", [])}
+
+
+def _manifest_issuer_network_key_fields(
+    context: Mapping[str, Any],
+    candidate_key: str,
+) -> dict[str, str]:
+    issuer_key = str(context.get("provider_directory_issuer_key") or "").strip() or _canonical_network_name(
+        context.get("provider_directory_org_name") or context.get("provider_directory_plan_name")
+    )
+    if not issuer_key or not candidate_key:
+        return {}
+    return {
+        "provider_directory_issuer_key": issuer_key,
+        "provider_directory_issuer_network_match_key": f"{issuer_key}:{candidate_key}",
+    }
+
+
+def _candidate_manifest_network_name_match(
+    *,
+    ptg_network_name: str,
+    provider_directory_network_name: str,
+    candidate_key: str,
+    network: Mapping[str, Any],
+    context: Mapping[str, Any],
+) -> dict[str, Any]:
+    network_context = {
+        key: network.get(key)
+        for key in (
+            "provider_directory_source",
+            "provider_directory_source_id",
+            "provider_directory_org_name",
+            "provider_directory_plan_name",
+            "provider_directory_issuer_key",
+        )
+        if network.get(key) not in (None, "", [])
+    }
+    effective_context = {**network_context, **context}
+    return {
+        "ptg_network_name": ptg_network_name,
+        "provider_directory_network_name": provider_directory_network_name,
+        "provider_directory_network_key": network.get("provider_directory_network_key") or candidate_key,
+        "provider_directory_network_resource_id": (
+            network.get("resource_id") or network.get("provider_directory_network_resource_id")
+        ),
+        "provider_directory_network_ref": network.get("ref") or network.get("provider_directory_network_ref"),
+        "provider_directory_network_match_method": "canonical_network_name",
+        "provider_directory_network_match_confidence": "candidate",
+        "provider_directory_network_match_key": candidate_key,
+        **effective_context,
+        **_manifest_issuer_network_key_fields(effective_context, candidate_key),
+    }
+
+
 def _manifest_network_name_matches(
     item: Mapping[str, Any],
     address_payload: Mapping[str, Any],
@@ -260,8 +361,16 @@ def _manifest_network_name_matches(
 
     matches: list[dict[str, Any]] = []
     seen_candidate_keys: set[str] = set()
+    context = _manifest_network_match_context(address_payload)
     for network in directory_networks:
         if not isinstance(network, dict):
+            continue
+        pre_shaped_match = _pre_shaped_manifest_network_name_match(network, ptg_by_key)
+        if pre_shaped_match:
+            candidate_key = _canonical_network_name(pre_shaped_match.get("ptg_network_name"))
+            if candidate_key and candidate_key not in seen_candidate_keys:
+                seen_candidate_keys.add(candidate_key)
+                matches.append(pre_shaped_match)
             continue
         candidate_values = [network.get("name"), network.get("provider_directory_network_name")]
         aliases = _coerce_json_payload(network.get("aliases"), [])
@@ -273,14 +382,13 @@ def _manifest_network_name_matches(
                 continue
             seen_candidate_keys.add(candidate_key)
             matches.append(
-                {
-                    "ptg_network_name": ptg_by_key[candidate_key],
-                    "provider_directory_network_name": str(candidate or ""),
-                    "provider_directory_network_resource_id": (
-                        network.get("resource_id") or network.get("provider_directory_network_resource_id")
-                    ),
-                    "provider_directory_network_ref": network.get("ref") or network.get("provider_directory_network_ref"),
-                }
+                _candidate_manifest_network_name_match(
+                    ptg_network_name=ptg_by_key[candidate_key],
+                    provider_directory_network_name=str(candidate or ""),
+                    candidate_key=candidate_key,
+                    network=network,
+                    context=context,
+                )
             )
     return matches
 
@@ -462,6 +570,9 @@ def _manifest_address_verification(
         "location_source": location_source,
         "location_confidence_code": location_confidence_code,
         "address_sources": response_address_sources,
+        "provider_directory_source_id": address_payload.get("provider_directory_source_id"),
+        "provider_directory_org_name": address_payload.get("provider_directory_org_name"),
+        "provider_directory_plan_name": address_payload.get("provider_directory_plan_name"),
         "provider_directory_plan_context_matched": provider_directory_plan_context,
         "provider_directory_network_name_matched": bool(provider_directory_network_name_matches) or None,
         "provider_directory_network_names": _coerce_str_list(address_payload.get("provider_directory_network_names")),

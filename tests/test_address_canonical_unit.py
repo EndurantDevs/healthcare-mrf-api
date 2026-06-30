@@ -1136,9 +1136,23 @@ def test_provider_directory_partial_sql_uses_live_and_current_fhir_groups():
     assert "@> ARRAY['provider_directory_fhir']::varchar[]" in sql
     assert "COALESCE(live.address_sources" not in sql
     assert "provider_directory_practitioner_role AS role" in sql
+    assert "practitioner.npi BETWEEN 1000000000 AND 9999999999" in sql
     assert "provider_directory_organization_affiliation AS affiliation" in sql
+    assert "organization.npi BETWEEN 1000000000 AND 9999999999" in sql
+    assert "provider_directory_organization AS organization" in sql
+    assert "provider_directory_organization_addresses" in sql
+    assert "src.entity_id::varchar AS entity_id" in sql
+    assert "END AS entity_npi" in sql
+    index_sql = entity_address_unified._index_provider_directory_partial_affected_groups_sql(  # pylint: disable=protected-access
+        "mrf",
+        "entity_address_unified_pd_groups",
+    )
+    assert "entity_npi," in index_sql
+    assert index_sql.count("CREATE INDEX") == 1
     assert "src.address_key::uuid AS address_key" in sql
     assert filtered[0].startswith("\n    SELECT src.*")
+    assert "SELECT DISTINCT entity_npi" in filtered[0]
+    assert "affected_npi.entity_npi = a.npi" in filtered[0]
     assert "entity_address_unified_pd_groups AS affected" in filtered[0]
     assert any(
         "provider_directory_practitioner_role AS role" in source_select
@@ -1175,17 +1189,55 @@ def test_provider_directory_partial_sql_can_scope_live_groups_by_source_id():
     assert "role.last_seen_run_id = 'run_123'" in sql
     assert "provider_directory_organization_affiliation AS affiliation" in sql
     assert "affiliation.source_id = ANY(ARRAY['source_a']::varchar[])" in sql
+    assert "provider_directory_organization AS organization" in sql
+    assert "organization.source_id = ANY(ARRAY['source_a']::varchar[])" in sql
+    assert "organization.last_seen_run_id = 'run_123'" in sql
     assert "split_part(pd_rid.rid, ':', 3) = ANY(ARRAY['source_a']::varchar[])" in sql
 
 
-def test_latest_provider_directory_partial_scope_sql_uses_source_metadata_not_resource_tables():
+def test_latest_provider_directory_partial_scope_sql_prefers_metadata_then_resource_rows():
     sql = entity_address_unified._latest_provider_directory_partial_scope_sql("mrf")  # pylint: disable=protected-access
 
     assert "FROM mrf.provider_directory_source" in sql
     assert "last_resource_import" in sql
-    assert "provider_directory_practitioner_role" not in sql
-    assert "provider_directory_organization_affiliation" not in sql
-    assert "provider_directory_location" not in sql
+    assert "'metadata'::varchar AS scope_source" in sql
+    assert "location_eligible_source_runs AS" in sql
+    assert "organization_row_sources AS" in sql
+    assert "resource_row_sources AS" in sql
+    assert "FROM mrf.provider_directory_location AS loc" in sql
+    assert "FROM mrf.provider_directory_practitioner_role AS role" in sql
+    assert "FROM mrf.provider_directory_organization_affiliation AS affiliation" in sql
+    assert "FROM mrf.provider_directory_organization AS organization" in sql
+    assert "jsonb_array_length(COALESCE(organization.address_json::jsonb, '[]'::jsonb)) > 0" in sql
+    assert "JOIN location_eligible_source_runs AS eligible" in sql
+    assert "eligible.source_id = loc.source_id" in sql
+    assert "eligible.run_id = loc.last_seen_run_id" in sql
+    assert "WHERE NOT EXISTS (SELECT 1 FROM completed_sources)" in sql
+
+
+@pytest.mark.asyncio
+async def test_latest_provider_directory_partial_scope_returns_scope_sources(monkeypatch):
+    first_mock = AsyncMock(
+        return_value={
+            "run_id": "run_123",
+            "source_ids": ["pdfhir_a", "pdfhir_b"],
+            "scope_sources": ["resource_rows"],
+        }
+    )
+    monkeypatch.setattr(
+        entity_address_unified,
+        "_table_exists",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(entity_address_unified.db, "first", first_mock)
+
+    run_id, source_ids, scope_sources = await entity_address_unified._latest_provider_directory_partial_scope(  # pylint: disable=protected-access
+        "mrf"
+    )
+
+    assert run_id == "run_123"
+    assert source_ids == ["pdfhir_a", "pdfhir_b"]
+    assert scope_sources == ["resource_rows"]
 
 
 def test_entity_address_unified_stage_index_name_is_hash_safe_for_long_names():
@@ -2467,10 +2519,11 @@ def test_entity_address_unified_partial_main_patch_sql_deletes_and_inserts_affec
     assert "FROM mrf.entity_address_unified_20260614 AS replacement" in sql_blob
     assert "replacement.location_key = live.location_key" in sql_blob
     assert "INSERT INTO mrf.entity_address_unified" in sql_blob
-    assert "FROM mrf.entity_address_unified_20260614 AS stage" in sql_blob
-    assert "ON CONFLICT (location_key) DO UPDATE" in sql_blob
-    assert "entity_type = EXCLUDED.entity_type" in sql_blob
-    assert "location_key = EXCLUDED.location_key" not in sql_blob
+    assert "SELECT DISTINCT ON (entity_type, entity_id, type, checksum) *" in sql_blob
+    assert "FROM mrf.entity_address_unified_20260614" in sql_blob
+    assert "ON CONFLICT (entity_type, entity_id, type, checksum) DO UPDATE" in sql_blob
+    assert "location_key = EXCLUDED.location_key" in sql_blob
+    assert "checksum = EXCLUDED.checksum" not in sql_blob
 
 
 def test_entity_address_unified_builds_facility_anchor_npi_candidate_stage_sql(monkeypatch):
@@ -2775,6 +2828,22 @@ async def test_entity_address_unified_serving_stage_index_profile_skips_debug_in
                 "name": "primary_phone_npi",
                 "where": "type='primary' AND telephone_number IS NOT NULL AND telephone_number <> ''",
             },
+            {
+                "index_elements": (
+                    "regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g')",
+                    "npi",
+                ),
+                "name": "service_phone_digits_npi",
+                "where": "type IN ('primary', 'secondary', 'practice', 'site')",
+            },
+            {
+                "index_elements": ("phone_number", "npi"),
+                "name": "service_phone_number_npi",
+                "where": (
+                    "type IN ('primary', 'secondary', 'practice', 'site') "
+                    "AND phone_number IS NOT NULL AND phone_number <> ''"
+                ),
+            },
             {"index_elements": ("row_origin",), "name": "row_origin"},
             {"index_elements": ("zip5",), "name": "zip5"},
             {"index_elements": ("ptg_plan_array",), "using": "gin", "name": "ptg_plan_array"},
@@ -2803,6 +2872,8 @@ async def test_entity_address_unified_serving_stage_index_profile_skips_debug_in
     assert "idx_procedures_array" in joined
     assert "idx_geo_bbox" in joined
     assert "idx_primary_phone_npi" in joined
+    assert "idx_service_phone_digits_npi" in joined
+    assert "idx_service_phone_number_npi" in joined
     assert "idx_primary_phone_digits_npi" not in joined
     assert "idx_geo_idx" not in joined
     assert "idx_inferred_npi" not in joined
@@ -2957,6 +3028,32 @@ async def test_entity_address_unified_post_publish_drops_invalid_index_before_re
 
 
 @pytest.mark.asyncio
+async def test_ensure_entity_address_unified_live_columns_adds_missing_stale_columns(monkeypatch):
+    existing_columns = [
+        {"column_name": column.name}
+        for column in EntityAddressUnified.__table__.columns
+        if column.name != "phone_number"
+    ]
+    all_mock = AsyncMock(return_value=existing_columns)
+    status_mock = AsyncMock()
+    monkeypatch.setattr(entity_address_unified.db, "all", all_mock)
+    monkeypatch.setattr(entity_address_unified.db, "status", status_mock)
+    monkeypatch.setattr(
+        entity_address_unified,
+        "_table_exists",
+        AsyncMock(return_value=True),
+    )
+
+    await entity_address_unified._ensure_entity_address_unified_live_columns("mrf")  # pylint: disable=protected-access
+
+    all_mock.assert_awaited_once()
+    status_mock.assert_awaited_once()
+    sql = status_mock.await_args.args[0]
+    assert "ALTER TABLE mrf.entity_address_unified ADD COLUMN IF NOT EXISTS phone_number" in sql
+    assert "VARCHAR(15)" in sql
+
+
+@pytest.mark.asyncio
 async def test_entity_address_unified_stage_summary_counts_use_single_scan(monkeypatch):
     statements = []
 
@@ -3051,6 +3148,22 @@ def test_entity_address_unified_indexes_cover_primary_serving_queries():
         "index_elements": ("telephone_number", "npi"),
         "name": "primary_phone_npi",
         "where": "type='primary' AND telephone_number IS NOT NULL AND telephone_number <> ''",
+    }
+    assert indexes["service_phone_digits_npi"] == {
+        "index_elements": (
+            "regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g')",
+            "npi",
+        ),
+        "name": "service_phone_digits_npi",
+        "where": "type IN ('primary', 'secondary', 'practice', 'site')",
+    }
+    assert indexes["service_phone_number_npi"] == {
+        "index_elements": ("phone_number", "npi"),
+        "name": "service_phone_number_npi",
+        "where": (
+            "type IN ('primary', 'secondary', 'practice', 'site') "
+            "AND phone_number IS NOT NULL AND phone_number <> ''"
+        ),
     }
     assert indexes["primary_state_city_npi"] == {
         "index_elements": ("state_name", "city_name", "npi"),

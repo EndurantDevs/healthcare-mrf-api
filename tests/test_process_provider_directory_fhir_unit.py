@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import importlib
@@ -78,6 +79,172 @@ def test_source_row_from_seed_overrides_aetna_developer_portal_base():
     assert row["metadata_json"]["provider_directory_previous_api_base"] == "https://fhir-ehr.cerner.com/r4/aetna"
 
 
+def test_source_row_from_seed_overrides_cigna_availity_non_fhir_base():
+    row = importer._source_row_from_seed(  # pylint: disable=protected-access
+        {
+            "id": "cigna-1",
+            "org_name": "Cigna Corporation",
+            "plan_name": "Medicare Advantage",
+            "api_base": "https://apps.availity.com/availity/public-fhir/fhir/v1/cigna/r4",
+            "auth_type": "none",
+            "last_validated_status": "valid_non_fhir",
+            "source": "provider-directory-db",
+        }
+    )
+
+    assert row["api_base"] == importer.CIGNA_PROVIDER_DIRECTORY_BASE
+    assert row["canonical_api_base"] == importer.CIGNA_PROVIDER_DIRECTORY_BASE
+    assert row["requires_registration"] is False
+    assert row["auth_type"] == "none"
+    assert row["metadata_json"]["provider_directory_override"] == "cigna_public_providerdirectory"
+    assert (
+        row["metadata_json"]["provider_directory_previous_api_base"]
+        == "https://apps.availity.com/availity/public-fhir/fhir/v1/cigna/r4"
+    )
+
+
+def test_source_row_from_seed_overrides_centene_partner_portal_base():
+    row = importer._source_row_from_seed(  # pylint: disable=protected-access
+        {
+            "id": "centene-1",
+            "org_name": "Centene Corporation",
+            "plan_name": "Ambetter",
+            "api_base": "https://partners.centene.com/apis",
+            "auth_type": "OAuth2 Client Credentials",
+            "source": "provider-directory-db",
+        }
+    )
+
+    assert row["api_base"] == importer.CENTENE_PROVIDER_DIRECTORY_BASE
+    assert row["canonical_api_base"] == importer.CENTENE_PROVIDER_DIRECTORY_BASE
+    assert row["requires_registration"] is False
+    assert row["auth_type"] == "none"
+    assert row["metadata_json"]["provider_directory_override"] == "centene_iopc_pd_providerdirectory"
+    assert row["metadata_json"]["provider_directory_previous_api_base"] == "https://partners.centene.com/apis"
+    assert row["metadata_json"]["provider_directory_confirmed_catalog_url"] == importer.CENTENE_PARTNER_PORTAL_APIS_URL
+
+
+def test_source_row_from_seed_overrides_uhc_interoperability_landing_page():
+    row = importer._source_row_from_seed(  # pylint: disable=protected-access
+        {
+            "id": "uhc-1",
+            "org_name": "UnitedHealthcare",
+            "plan_name": "UHC Community Plan",
+            "api_base": "https://www.uhc.com/legal/interoperability-apis",
+            "auth_type": "OAuth2 Client Credentials",
+            "source": "provider-directory-db",
+        }
+    )
+
+    assert row["api_base"] == importer.UHC_PROVIDER_DIRECTORY_BASE
+    assert row["canonical_api_base"] == importer.UHC_PROVIDER_DIRECTORY_BASE
+    assert row["requires_registration"] is False
+    assert row["auth_type"] == "none"
+    assert row["metadata_json"]["provider_directory_override"] == "uhc_flex_optum_fhirpublic_r4"
+    assert row["metadata_json"]["provider_directory_previous_api_base"] == importer.UHC_INTEROPERABILITY_APIS_URL
+    assert row["metadata_json"]["provider_directory_confirmed_metadata_url"] == importer.UHC_PROVIDER_DIRECTORY_METADATA_URL
+
+
+def test_source_row_from_seed_overrides_scan_developer_portal_base():
+    row = importer._source_row_from_seed(  # pylint: disable=protected-access
+        {
+            "id": "scan-1",
+            "org_name": "SCAN Health Plan",
+            "plan_name": "Medicare Advantage",
+            "api_base": "https://developer.scanhealthplan.com",
+            "auth_type": "API Key",
+            "source": "provider-directory-db",
+        }
+    )
+
+    assert row["api_base"] == importer.SCAN_PROVIDER_DIRECTORY_BASE
+    assert row["canonical_api_base"] == importer.SCAN_PROVIDER_DIRECTORY_BASE
+    assert row["requires_registration"] is False
+    assert row["auth_type"] == "none"
+    assert row["last_validated_status"] == "valid"
+    assert row["metadata_json"]["provider_directory_override"] == "scan_providerdirectory_intersystems"
+    assert row["metadata_json"]["provider_directory_previous_api_base"] == importer.SCAN_DEVELOPER_PORTAL_URL
+    assert row["metadata_json"]["provider_directory_confirmed_doc_url"] == importer.SCAN_PROVIDER_DIRECTORY_DOC_URL
+
+
+def test_source_row_from_seed_uses_normalized_base_for_stable_scan_source_id():
+    portal_row = importer._source_row_from_seed(  # pylint: disable=protected-access
+        {
+            "id": "scan-1",
+            "org_name": "SCAN Health Plan",
+            "plan_name": "Medicare Advantage",
+            "api_base": "https://developer.scanhealthplan.com",
+            "auth_type": "none",
+            "source": "provider-directory-db",
+        }
+    )
+    concrete_row = importer._source_row_from_seed(  # pylint: disable=protected-access
+        {
+            "id": "scan-1",
+            "org_name": "SCAN Health Plan",
+            "plan_name": "Medicare Advantage",
+            "api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE,
+            "auth_type": "none",
+            "source": "provider-directory-db",
+        }
+    )
+
+    assert portal_row["source_id"] == concrete_row["source_id"]
+    assert portal_row["api_base"] == concrete_row["api_base"]
+
+
+def test_source_row_from_seed_normalizes_resource_specific_api_base():
+    row = importer._source_row_from_seed(  # pylint: disable=protected-access
+        {
+            "id": "maine-1",
+            "org_name": "State of Maine",
+            "plan_name": "Medicaid",
+            "api_base": "https://maineproviderdirectory.verityanalytics.org/fhir/Practitioner",
+            "auth_type": "none",
+            "last_validated_status": "valid",
+            "source": "provider-directory-db",
+        }
+    )
+
+    assert row["api_base"] == "https://maineproviderdirectory.verityanalytics.org/fhir"
+    assert row["canonical_api_base"] == "https://maineproviderdirectory.verityanalytics.org/fhir"
+    assert row["metadata_json"]["provider_directory_previous_api_base"] == (
+        "https://maineproviderdirectory.verityanalytics.org/fhir/Practitioner"
+    )
+    assert row["metadata_json"]["provider_directory_base_normalization"] == "resource_or_metadata_parent_base"
+    assert row["metadata_json"]["provider_directory_confirmed_base"] == (
+        "https://maineproviderdirectory.verityanalytics.org/fhir"
+    )
+
+
+def test_source_row_from_seed_uses_normalized_base_for_stable_resource_url_source_id():
+    resource_url_row = importer._source_row_from_seed(  # pylint: disable=protected-access
+        {
+            "id": "maine-1",
+            "org_name": "State of Maine",
+            "plan_name": "Medicaid",
+            "api_base": "https://maineproviderdirectory.verityanalytics.org/fhir/Practitioner",
+            "auth_type": "none",
+            "last_validated_status": "valid",
+            "source": "provider-directory-db",
+        }
+    )
+    parent_base_row = importer._source_row_from_seed(  # pylint: disable=protected-access
+        {
+            "id": "maine-1",
+            "org_name": "State of Maine",
+            "plan_name": "Medicaid",
+            "api_base": "https://maineproviderdirectory.verityanalytics.org/fhir",
+            "auth_type": "none",
+            "last_validated_status": "valid",
+            "source": "provider-directory-db",
+        }
+    )
+
+    assert resource_url_row["source_id"] == parent_base_row["source_id"]
+    assert resource_url_row["api_base"] == parent_base_row["api_base"]
+
+
 def test_source_row_from_seed_overrides_alohr_public_app_base():
     row = importer._source_row_from_seed(  # pylint: disable=protected-access
         {
@@ -98,6 +265,273 @@ def test_source_row_from_seed_overrides_alohr_public_app_base():
     assert row["metadata_json"]["provider_directory_override"] == "alohr_healthshare_providerdirectory"
     assert row["metadata_json"]["provider_directory_graphql_url"] == importer.ALOHR_GRAPHQL_URL
     assert row["metadata_json"]["provider_directory_graphql_tenant_id"] == importer.ALOHR_TENANT_ID
+
+
+def test_source_row_from_seed_preserves_known_confirmed_importable_bases():
+    cases = [
+        (
+            {
+                "id": "aetna-r4",
+                "org_name": "Aetna R4",
+                "api_base": "https://fhir-ehr.cerner.com/r4/aetna",
+                "auth_type": "OAuth2/SMART",
+                "source": "provider-directory-db",
+            },
+            importer.AETNA_PROVIDER_DIRECTORY_BASE,
+            "aetna_apif1_providerdirectory",
+        ),
+        (
+            {
+                "id": "alohr-public",
+                "org_name": "Blue Cross and Blue Shield of Alabama",
+                "api_base": "https://alohr.esante.us/public/providers",
+                "auth_type": "none",
+                "source": "provider-directory-db",
+            },
+            importer.ALOHR_FHIR_PROVIDER_DIRECTORY_BASE,
+            "alohr_healthshare_providerdirectory",
+        ),
+        (
+            {
+                "id": "cigna-availity",
+                "org_name": "Cigna",
+                "api_base": "https://apps.availity.com/availity/public-fhir/fhir/v1/cigna/r4",
+                "auth_type": "none",
+                "source": "provider-directory-db",
+            },
+            importer.CIGNA_PROVIDER_DIRECTORY_BASE,
+            "cigna_public_providerdirectory",
+        ),
+        (
+            {
+                "id": "centene-portal",
+                "org_name": "Centene Corporation",
+                "api_base": "https://partners.centene.com/apis",
+                "auth_type": "OAuth2 Client Credentials",
+                "source": "provider-directory-db",
+            },
+            importer.CENTENE_PROVIDER_DIRECTORY_BASE,
+            "centene_iopc_pd_providerdirectory",
+        ),
+        (
+            {
+                "id": "uhc-portal",
+                "org_name": "UnitedHealthcare",
+                "api_base": "https://www.uhc.com/legal/interoperability-apis/patient-access-api",
+                "auth_type": "OAuth2 Client Credentials",
+                "source": "provider-directory-db",
+            },
+            importer.UHC_PROVIDER_DIRECTORY_BASE,
+            "uhc_flex_optum_fhirpublic_r4",
+        ),
+        (
+            {
+                "id": "scan-portal",
+                "org_name": "SCAN Health Plan",
+                "api_base": "https://developer.scanhealthplan.com",
+                "auth_type": "API Key",
+                "source": "provider-directory-db",
+            },
+            importer.SCAN_PROVIDER_DIRECTORY_BASE,
+            "scan_providerdirectory_intersystems",
+        ),
+    ]
+
+    for seed_row, expected_base, expected_override in cases:
+        row = importer._source_row_from_seed(seed_row)  # pylint: disable=protected-access
+
+        assert row["api_base"] == expected_base
+        assert row["canonical_api_base"] == expected_base
+        assert row["metadata_json"]["provider_directory_override"] == expected_override
+        assert row["metadata_json"]["provider_directory_confirmed_base"] == expected_base
+
+
+def test_resource_import_source_selection_reports_credentialed_policy_counts():
+    sources = [
+        {
+            "source_id": "open_valid",
+            "api_base": "https://open.example/fhir",
+            "auth_type": "open",
+            "last_validated_status": "valid",
+            "requires_registration": False,
+        },
+        {
+            "source_id": "auth_required",
+            "api_base": "https://auth.example/fhir",
+            "auth_type": "OAuth2 Client Credentials",
+            "last_validated_status": "auth_required",
+            "requires_registration": True,
+        },
+        {
+            "source_id": "non_fhir",
+            "api_base": "https://app.example/providers",
+            "auth_type": "open",
+            "last_validated_status": "valid_non_fhir",
+            "requires_registration": False,
+        },
+        {
+            "source_id": "missing_base",
+            "api_base": None,
+            "auth_type": "open",
+            "last_validated_status": "valid",
+            "requires_registration": False,
+        },
+    ]
+
+    selected, metrics = importer._select_resource_import_sources(  # pylint: disable=protected-access
+        sources,
+        valid_source_ids=None,
+        open_only=False,
+        include_auth_required=True,
+    )
+    selected_without_auth, metrics_without_auth = importer._select_resource_import_sources(  # pylint: disable=protected-access
+        sources,
+        valid_source_ids=None,
+        open_only=False,
+        include_auth_required=False,
+    )
+
+    assert [source["source_id"] for source in selected] == ["open_valid", "auth_required"]
+    assert metrics["source_import_sources_considered"] == 4
+    assert metrics["source_import_sources_selected"] == 2
+    assert metrics["source_import_sources_selected_declared_credentialed"] == 1
+    assert metrics["source_import_sources_selected_auth_required_seed"] == 1
+    assert metrics["source_import_skipped_validation_status"] == 1
+    assert metrics["source_import_skipped_missing_api_base"] == 1
+    assert [source["source_id"] for source in selected_without_auth] == ["open_valid"]
+    assert metrics_without_auth["source_import_skipped_auth_required_policy"] == 1
+
+
+def test_resource_import_source_selection_allows_live_probe_success_over_open_only():
+    source = {
+        "source_id": "credentialed_valid",
+        "api_base": "https://auth.example/fhir",
+        "auth_type": "OAuth2 Client Credentials",
+        "last_validated_status": "auth_required",
+        "requires_registration": True,
+    }
+
+    selected, metrics = importer._select_resource_import_sources(  # pylint: disable=protected-access
+        [source],
+        valid_source_ids={"credentialed_valid"},
+        open_only=True,
+        include_auth_required=False,
+    )
+
+    assert selected == [source]
+    assert metrics["source_import_sources_selected"] == 1
+    assert metrics["source_import_sources_selected_live_probe_valid"] == 1
+    assert metrics["source_import_sources_selected_declared_credentialed"] == 1
+    assert metrics["source_import_sources_selected_auth_required_seed"] == 1
+
+
+def test_seed_rows_from_retest_results_filters_to_provider_like_rows(tmp_path):
+    retest_path = tmp_path / "retest_results.json"
+    retest_path.write_text(
+        json.dumps(
+            {
+                "tested_at": "2026-06-03T17:43:09Z",
+                "results": [
+                    {
+                        "payer_id": 10,
+                        "classification": "valid",
+                        "org_name": "Public FHIR Payer",
+                        "api_base": "https://public.example/fhir",
+                        "status_code": 200,
+                    },
+                    {
+                        "payer_id": 11,
+                        "classification": "valid_non_fhir",
+                        "org_name": "Public App Payer",
+                        "api_base": "https://public-app.example/providers",
+                        "status_code": 200,
+                    },
+                    {
+                        "payer_id": 12,
+                        "classification": "auth_required",
+                        "org_name": "Auth Payer",
+                        "api_base": "https://auth.example/fhir",
+                        "status_code": 403,
+                    },
+                    {
+                        "payer_id": 13,
+                        "classification": "not_found",
+                        "org_name": "Dead Payer",
+                        "api_base": "https://dead.example/fhir",
+                        "status_code": 404,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    rows = importer._seed_rows_from_retest_results(retest_path)  # pylint: disable=protected-access
+
+    assert [row["org_name"] for row in rows] == ["Public FHIR Payer", "Public App Payer", "Auth Payer"]
+    assert rows[0]["auth_type"] == "open"
+    assert rows[0]["source"] == "provider-directory-db-retest"
+    assert rows[0]["source_date"] == "2026-06-03T17:43:09Z"
+    assert rows[1]["last_validated_status"] == "valid_non_fhir"
+    assert rows[2]["last_validated_status"] == "auth_required"
+    assert rows[2]["requires_registration"] is True
+    assert rows[2]["auth_type"] == "OAuth2 Client Credentials"
+
+
+def test_dedupe_source_rows_skips_low_information_retest_duplicate():
+    sqlite_row = importer._source_row_from_seed(  # pylint: disable=protected-access
+        {
+            "id": "cigna-sqlite",
+            "org_name": "Cigna",
+            "plan_name": "Cigna (Primary)",
+            "api_base": "https://apps.availity.com/availity/public-fhir/fhir/v1/cigna/r4",
+            "source": "provider-directory-db",
+        }
+    )
+    retest_row = importer._source_row_from_seed(  # pylint: disable=protected-access
+        {
+            "id": "cigna-retest",
+            "org_name": "Cigna",
+            "plan_name": "Provider Directory Retest",
+            "api_base": "https://fhir.cigna.com/ProviderDirectory/v1",
+            "source": "provider-directory-db-retest",
+        }
+    )
+
+    rows = importer._dedupe_source_rows([sqlite_row, retest_row])  # pylint: disable=protected-access
+
+    assert rows == [sqlite_row]
+
+
+def test_dedupe_source_rows_keeps_unique_auth_required_retest_source():
+    sqlite_row = importer._source_row_from_seed(  # pylint: disable=protected-access
+        {
+            "id": "cigna-sqlite",
+            "org_name": "Cigna",
+            "plan_name": "Cigna (Primary)",
+            "api_base": "https://fhir.cigna.com/ProviderDirectory/v1",
+            "source": "provider-directory-db",
+        }
+    )
+    retest_row = importer._source_row_from_seed(  # pylint: disable=protected-access
+        {
+            "id": "wellmed-retest",
+            "org_name": "WellMed (UHC subsidiary)",
+            "plan_name": "Provider Directory Retest",
+            "api_base": "https://api.1up.health/fhir-r4/wellmeduhcsubsidiary",
+            "auth_type": "OAuth2 Client Credentials",
+            "last_validated_status": "auth_required",
+            "requires_registration": True,
+            "source": "provider-directory-db-retest",
+        }
+    )
+
+    rows = importer._dedupe_source_rows([sqlite_row, retest_row])  # pylint: disable=protected-access
+
+    assert rows == [sqlite_row, retest_row]
+    assert rows[1]["last_validated_status"] == "auth_required"
+    assert rows[1]["requires_registration"] is True
+    assert rows[1]["auth_type"] == "OAuth2 Client Credentials"
 
 
 def test_alohr_provider_rows_emit_practitioner_location_and_role():
@@ -260,7 +694,7 @@ def test_provider_directory_location_address_key_sql_can_scope_to_current_run_an
         source_ids=["source_a", "source_b"],
     )
 
-    assert "loc_src.last_seen_run_id = :run_id" in sql
+    assert "loc_src.last_seen_run_id = CAST(:run_id AS varchar)" in sql
     assert "loc_src.source_id = ANY(CAST(:source_ids AS varchar[]))" in sql
 
 
@@ -277,24 +711,42 @@ def test_provider_directory_location_address_key_sql_can_scope_to_seen_stage():
     assert "loc_src.source_id = seen_scope.source_id" in sql
     assert "loc_src.resource_id = seen_scope.resource_id" in sql
     assert "seen.resource_type = 'Location'" in sql
-    assert "AND seen.run_id = :run_id" in sql
+    assert "AND seen.run_id = CAST(:run_id AS varchar)" in sql
     assert "EXISTS (" not in sql
-    assert "loc_src.last_seen_run_id = :run_id" not in sql
+    assert "loc_src.last_seen_run_id = CAST(:run_id AS varchar)" not in sql
 
 
 def test_provider_directory_location_address_key_batch_sql_uses_keyset_limit():
     sql = importer.provider_directory_location_address_key_batch_sql("mrf", run_id="run_1")
 
     assert 'FROM "mrf"."provider_directory_location" AS loc_src' in sql
-    assert "loc_src.last_seen_run_id = :run_id" in sql
+    assert "loc_src.last_seen_run_id = CAST(:run_id AS varchar)" in sql
     assert "CAST(:after_source_id AS varchar) IS NULL" in sql
     assert "(CAST(:after_source_id AS varchar), CAST(:after_resource_id AS varchar))" in sql
     assert "(loc_src.source_id, loc_src.resource_id)" in sql
-    assert "LIMIT :batch_size" in sql
+    assert "LIMIT CAST(:batch_size AS integer)" in sql
     assert "SELECT COUNT(*) FROM candidates" in sql
     assert "SELECT COUNT(*) FROM updated" in sql
     assert "last_source_id" in sql
     assert "last_resource_id" in sql
+
+
+def test_provider_directory_location_address_key_batch_sql_can_scope_to_seen_stage():
+    sql = importer.provider_directory_location_address_key_batch_sql(
+        "mrf",
+        run_id="run_1",
+        seen_table="provider_directory_import_seen_stage_test",
+    )
+
+    assert 'FROM "mrf"."provider_directory_location" AS loc_src' in sql
+    assert 'FROM "mrf"."provider_directory_import_seen_stage_test" AS seen' in sql
+    assert "seen.resource_type = 'Location'" in sql
+    assert "AND seen.run_id = CAST(:run_id AS varchar)" in sql
+    assert "AND seen.source_id = loc_src.source_id" in sql
+    assert "AND seen.resource_id = loc_src.resource_id" in sql
+    assert "loc_src.last_seen_run_id = CAST(:run_id AS varchar)" not in sql
+    assert "CAST(:after_source_id AS varchar) IS NULL" in sql
+    assert "LIMIT CAST(:batch_size AS integer)" in sql
 
 
 @pytest.mark.asyncio
@@ -325,6 +777,41 @@ async def test_publish_provider_directory_location_address_keys_batches_without_
     assert first.await_args_list[1].kwargs["after_resource_id"] == "loc-2"
     assert first.await_args_list[2].kwargs["after_source_id"] == "source_b"
     assert first.await_args_list[2].kwargs["after_resource_id"] == "loc-3"
+    assert all(call.kwargs["batch_size"] == 2 for call in first.await_args_list)
+    status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_publish_provider_directory_location_address_keys_batches_with_seen_table(monkeypatch):
+    class Row:
+        def __init__(self, **values):
+            self._mapping = values
+
+    monkeypatch.setattr(importer, "_address_canon_functions_available", AsyncMock(return_value=True))
+    monkeypatch.setattr(importer, "_table_exists", AsyncMock(return_value=True))
+    first = AsyncMock(
+        side_effect=[
+            Row(candidate_rows=2, updated_rows=1, last_source_id="source_a", last_resource_id="loc-2"),
+            Row(candidate_rows=0, updated_rows=0, last_source_id=None, last_resource_id=None),
+        ]
+    )
+    status = AsyncMock()
+    monkeypatch.setattr(importer.db, "first", first)
+    monkeypatch.setattr(importer.db, "status", status)
+
+    stamped = await importer.publish_provider_directory_location_address_keys(
+        "mrf",
+        run_id="run_1",
+        seen_table="provider_directory_import_seen_stage_test",
+        batch_size=2,
+    )
+
+    assert stamped == 1
+    assert first.await_count == 2
+    assert first.await_args_list[0].kwargs["run_id"] == "run_1"
+    assert first.await_args_list[0].kwargs["after_source_id"] is None
+    assert first.await_args_list[1].kwargs["after_source_id"] == "source_a"
+    assert first.await_args_list[1].kwargs["after_resource_id"] == "loc-2"
     assert all(call.kwargs["batch_size"] == 2 for call in first.await_args_list)
     status.assert_not_awaited()
 
@@ -411,6 +898,149 @@ def test_provider_directory_location_upsert_preserves_existing_address_key_when_
         'WHEN target_row."first_line" IS DISTINCT FROM stage_row."first_line"'
     ) in stage_where
     assert 'ELSE target_row."address_key" END' in stage_where
+
+
+def test_provider_directory_source_seed_upsert_preserves_existing_probe_state():
+    sql = importer._effective_update_sql(  # pylint: disable=protected-access
+        ProviderDirectorySource.__table__,
+        "last_probe_status",
+        target_prefix="target_row",
+        incoming_prefix="stage_row",
+    )
+
+    assert (
+        'CASE WHEN stage_row."last_probe_status" IS NULL '
+        'THEN target_row."last_probe_status" '
+        'ELSE stage_row."last_probe_status" END'
+    ) == sql
+
+
+def test_provider_directory_source_seed_upsert_merges_metadata_json():
+    sql = importer._effective_update_sql(  # pylint: disable=protected-access
+        ProviderDirectorySource.__table__,
+        "metadata_json",
+        target_prefix="target_row",
+        incoming_prefix="stage_row",
+    )
+
+    assert sql == (
+        'COALESCE(target_row."metadata_json"::jsonb, \'{}\'::jsonb) '
+        '|| COALESCE(stage_row."metadata_json"::jsonb, \'{}\'::jsonb)'
+    )
+
+
+@pytest.mark.asyncio
+async def test_ensure_provider_directory_model_columns_adds_missing_stale_table_columns(monkeypatch):
+    existing_columns = [
+        {"column_name": column.name}
+        for column in ProviderDirectoryLocation.__table__.columns
+        if column.name != "phone_number"
+    ]
+    all_mock = AsyncMock(return_value=existing_columns)
+    status_mock = AsyncMock()
+    monkeypatch.setattr(importer.db, "all", all_mock)
+    monkeypatch.setattr(importer.db, "status", status_mock)
+
+    await importer._ensure_provider_directory_model_columns(  # pylint: disable=protected-access
+        ProviderDirectoryLocation,
+        "mrf",
+    )
+
+    all_mock.assert_awaited_once()
+    status_mock.assert_awaited_once()
+    sql = status_mock.await_args.args[0]
+    assert 'ALTER TABLE "mrf"."provider_directory_location" ADD COLUMN IF NOT EXISTS phone_number' in sql
+    assert "VARCHAR(15)" in sql
+
+
+def test_source_catalog_stale_cleanup_only_runs_for_unfiltered_full_refresh():
+    assert importer._source_catalog_stale_cleanup_enabled(  # pylint: disable=protected-access
+        stale_cleanup=True,
+        full_refresh=True,
+        source_query=None,
+        limit=None,
+    )
+    assert not importer._source_catalog_stale_cleanup_enabled(  # pylint: disable=protected-access
+        stale_cleanup=True,
+        full_refresh=False,
+        source_query=None,
+        limit=None,
+    )
+    assert not importer._source_catalog_stale_cleanup_enabled(  # pylint: disable=protected-access
+        stale_cleanup=True,
+        full_refresh=True,
+        source_query="cigna",
+        limit=None,
+    )
+    assert not importer._source_catalog_stale_cleanup_enabled(  # pylint: disable=protected-access
+        stale_cleanup=True,
+        full_refresh=True,
+        source_query=None,
+        limit=10,
+    )
+    assert not importer._source_catalog_stale_cleanup_enabled(  # pylint: disable=protected-access
+        stale_cleanup=True,
+        full_refresh=True,
+        source_query=None,
+        limit=None,
+        retest_results_configured=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_stale_provider_directory_source_catalog_prunes_dependent_rows(monkeypatch):
+    status_mock = AsyncMock(return_value=1)
+    monkeypatch.setattr(importer.db, "status", status_mock)
+
+    deleted = await importer._delete_stale_provider_directory_source_catalog(  # pylint: disable=protected-access
+        ["source_b", "source_a", "source_a", ""]
+    )
+
+    assert deleted["provider_directory_source"] == 1
+    assert status_mock.await_count == len(importer.SOURCE_CATALOG_STALE_TABLE_MODELS) + 1
+    for call in status_mock.await_args_list:
+        assert call.kwargs["source_ids"] == ["source_a", "source_b"]
+        assert "NOT (source_id = ANY(CAST(:source_ids AS varchar[])))" in call.args[0]
+    assert '"mrf"."provider_directory_source"' in status_mock.await_args_list[-1].args[0]
+
+
+@pytest.mark.asyncio
+async def test_delete_stale_resource_rows_prunes_canonical_source_edges(monkeypatch):
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def fake_status(sql, **params):
+        calls.append((sql, params))
+        if '"provider_directory_location"' in sql:
+            return 4
+        if '"provider_directory_source_resource"' in sql:
+            return 2
+        return 0
+
+    monkeypatch.setattr(importer.db, "status", fake_status)
+
+    deleted = await importer._delete_stale_resource_rows(  # pylint: disable=protected-access
+        ProviderDirectoryLocation,
+        "source_a",
+        "run_1",
+        use_seen_table=True,
+    )
+
+    assert deleted == 4
+    assert len(calls) == 2
+    edge_sql, edge_params = calls[0]
+    resource_sql, resource_params = calls[1]
+    assert '"provider_directory_source_resource"' in edge_sql
+    assert '"provider_directory_location"' in resource_sql
+    assert "provider_directory_import_seen" in edge_sql
+    assert "provider_directory_import_seen" in resource_sql
+    assert "seen.resource_id = edge.resource_id" in edge_sql
+    assert "seen.resource_id = resource.resource_id" in resource_sql
+    assert edge_params == {
+        "source_id": "source_a",
+        "run_id": "run_1",
+        "resource_type": "Location",
+    }
+    assert resource_params == edge_params
 
 
 @pytest.mark.asyncio
@@ -759,6 +1389,75 @@ def test_provider_directory_credentials_resolve_env_headers_and_query(monkeypatc
     }
 
 
+def test_provider_directory_credentials_resolve_generated_api_key_template(monkeypatch):
+    monkeypatch.setenv("PAYER_DIRECTORY_API_KEY_HEADER", "Ocp-Apim-Subscription-Key")
+    monkeypatch.setenv("PAYER_DIRECTORY_API_KEY", "secret-key")
+    monkeypatch.setenv(
+        importer.PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV,  # pylint: disable=protected-access
+        json.dumps(
+            {
+                "hosts": {
+                    "payer.example": {
+                        "api_key": {
+                            "header": "env:PAYER_DIRECTORY_API_KEY_HEADER",
+                            "value": "env:PAYER_DIRECTORY_API_KEY",
+                        }
+                    }
+                }
+            }
+        ),
+    )
+
+    options = importer._credential_request_options_for_source(  # pylint: disable=protected-access
+        {"source_id": "source_a", "api_base": "https://payer.example/fhir"},
+        "https://payer.example/fhir/metadata",
+    )
+
+    assert options["headers"] == {"Ocp-Apim-Subscription-Key": "secret-key"}
+    assert options["descriptor"] == {
+        "matched_by": ["hosts:payer.example"],
+        "header_names": ["Ocp-Apim-Subscription-Key"],
+        "query_param_names": [],
+    }
+    assert "secret-key" not in json.dumps(options["descriptor"])
+
+
+def test_provider_directory_credentials_resolve_task_file_override(monkeypatch, tmp_path):
+    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV, raising=False)  # pylint: disable=protected-access
+    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV, raising=False)  # pylint: disable=protected-access
+    monkeypatch.setenv("PAYER_DIRECTORY_KEY", "secret-key")
+    config_path = tmp_path / "provider-directory-credentials.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "hosts": {
+                    "payer.example": {
+                        "headers": {"X-API-Key": "env:PAYER_DIRECTORY_KEY"},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    token = importer._PROVIDER_DIRECTORY_CREDENTIALS_FILE_OVERRIDE.set(str(config_path))  # pylint: disable=protected-access
+    try:
+        options = importer._credential_request_options_for_source(  # pylint: disable=protected-access
+            {"source_id": "source_a", "api_base": "https://payer.example/fhir"},
+            "https://payer.example/fhir/metadata",
+        )
+    finally:
+        importer._PROVIDER_DIRECTORY_CREDENTIALS_FILE_OVERRIDE.reset(token)  # pylint: disable=protected-access
+
+    assert options["headers"] == {"X-API-Key": "secret-key"}
+    assert options["query_params"] == {}
+    assert options["descriptor"] == {
+        "matched_by": ["hosts:payer.example"],
+        "header_names": ["X-API-Key"],
+        "query_param_names": [],
+    }
+    assert "secret-key" not in json.dumps(options["descriptor"])
+
+
 def test_provider_directory_credentials_resolve_oauth2_client_credentials(monkeypatch):
     monkeypatch.setenv("PAYER_DIRECTORY_CLIENT_ID", "client-id")
     monkeypatch.setenv("PAYER_DIRECTORY_CLIENT_SECRET", "client-secret")
@@ -827,10 +1526,11 @@ def test_oauth2_client_credentials_token_request_uses_basic_auth_and_cache(monke
 
     monkeypatch.setenv("PAYER_DIRECTORY_CLIENT_ID", "client-id")
     monkeypatch.setenv("PAYER_DIRECTORY_CLIENT_SECRET", "client-secret")
+    monkeypatch.setenv("PAYER_DIRECTORY_TOKEN_URL", "https://auth.example/token")
     monkeypatch.setattr(importer.urllib.request, "urlopen", fake_urlopen)
 
     oauth2 = {
-        "token_url": "https://auth.example/token",
+        "token_url": "env:PAYER_DIRECTORY_TOKEN_URL",
         "client_id": "env:PAYER_DIRECTORY_CLIENT_ID",
         "client_secret": "env:PAYER_DIRECTORY_CLIENT_SECRET",
         "scope": "system/*.read",
@@ -921,12 +1621,51 @@ async def test_probe_sources_records_credential_descriptor_without_secret(monkey
 
 
 @pytest.mark.asyncio
+async def test_probe_sources_marks_source_timeout_when_probe_exceeds_hard_deadline(monkeypatch):
+    async def fake_probe_source(_source, *, timeout, run_id):  # pylint: disable=unused-argument
+        await asyncio.sleep(1)
+        return {"status": "valid"}, {"resourceType": "CapabilityStatement"}
+
+    upserts = []
+
+    async def fake_upsert(model, rows, **_kwargs):
+        upserts.append((model, rows))
+        return len(rows)
+
+    monkeypatch.setattr(importer, "_probe_source", fake_probe_source)
+    monkeypatch.setattr(importer, "_source_probe_hard_timeout_seconds", lambda _source, *, timeout: 0.01)
+    monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
+
+    probed, valid, valid_source_ids = await importer._probe_sources(  # pylint: disable=protected-access
+        [
+            {
+                "source_id": "source_timeout",
+                "org_name": "Slow Payer",
+                "api_base": "https://slow.example/fhir",
+                "canonical_api_base": "https://slow.example/fhir",
+            }
+        ],
+        timeout=3,
+        concurrency=1,
+        run_id="run_1",
+    )
+
+    assert (probed, valid, valid_source_ids) == (1, 0, set())
+    capability_rows = next(rows for model, rows in upserts if model is ProviderDirectoryCapability)
+    source_rows = next(rows for model, rows in upserts if model is ProviderDirectorySource)
+    assert capability_rows[0]["probe_status"] == "timeout"
+    assert "hard deadline" in capability_rows[0]["error"]
+    assert source_rows[0]["last_probe_status"] == "timeout"
+    assert "hard deadline" in source_rows[0]["last_probe_error"]
+
+
+@pytest.mark.asyncio
 async def test_probe_source_classifies_declared_credentialed_non_fhir_as_auth_required(monkeypatch):
     monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV, raising=False)  # pylint: disable=protected-access
     monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV, raising=False)  # pylint: disable=protected-access
 
     async def fake_fetch_source_json(source, url, *, timeout):  # pylint: disable=unused-argument
-        return 200, None, None, 14
+        raise AssertionError("credential-gated sources without credentials should not be fetched")
 
     monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_source_json)
 
@@ -943,7 +1682,7 @@ async def test_probe_source_classifies_declared_credentialed_non_fhir_as_auth_re
 
     assert payload is None
     assert probe["status"] == "auth_required"
-    assert probe["http_status"] == 200
+    assert probe["http_status"] is None
     assert probe["credential"] is None
     assert "no matching credentials" in probe["error"]
 
@@ -954,16 +1693,7 @@ async def test_probe_source_classifies_declared_credentialed_metadata_as_auth_re
     monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV, raising=False)  # pylint: disable=protected-access
 
     async def fake_fetch_source_json(source, url, *, timeout):  # pylint: disable=unused-argument
-        return (
-            200,
-            {
-                "resourceType": "CapabilityStatement",
-                "fhirVersion": "4.0.1",
-                "rest": [{"resource": [{"type": "Practitioner"}]}],
-            },
-            None,
-            14,
-        )
+        raise AssertionError("credential-gated sources without credentials should not be fetched")
 
     monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_source_json)
 
@@ -978,11 +1708,69 @@ async def test_probe_source_classifies_declared_credentialed_metadata_as_auth_re
         run_id="run_1",
     )
 
-    assert payload["resourceType"] == "CapabilityStatement"
+    assert payload is None
     assert probe["status"] == "auth_required"
-    assert probe["http_status"] == 200
+    assert probe["http_status"] is None
     assert probe["credential"] is None
-    assert "resource access" in probe["error"]
+    assert "no matching credentials" in probe["error"]
+
+
+@pytest.mark.asyncio
+async def test_probe_source_classifies_known_onboarding_gateway_without_credentials_as_auth_required(monkeypatch):
+    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV, raising=False)  # pylint: disable=protected-access
+    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV, raising=False)  # pylint: disable=protected-access
+
+    async def fake_fetch_source_json(source, url, *, timeout):  # pylint: disable=unused-argument
+        raise AssertionError("known onboarding gateways without credentials should not be fetched")
+
+    monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_source_json)
+
+    probe, payload = await importer._probe_source(  # pylint: disable=protected-access
+        {
+            "source_id": "source_availity",
+            "api_base": "https://apps.availity.com/availity/public-fhir/fhir/v1/example/r4",
+            "auth_type": "open",
+            "requires_registration": False,
+        },
+        timeout=3,
+        run_id="run_1",
+    )
+
+    assert payload is None
+    assert probe["status"] == "auth_required"
+    assert probe["http_status"] is None
+    assert "no matching credentials" in probe["error"]
+
+
+@pytest.mark.asyncio
+async def test_probe_source_classifies_cms_public_no_seed_as_auth_required(monkeypatch):
+    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_JSON_ENV, raising=False)  # pylint: disable=protected-access
+    monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV, raising=False)  # pylint: disable=protected-access
+
+    async def fake_fetch_source_json(source, url, *, timeout):  # pylint: disable=unused-argument
+        raise AssertionError("CMS Public=No provider directory sources without credentials should not be fetched")
+
+    monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_source_json)
+
+    probe, payload = await importer._probe_source(  # pylint: disable=protected-access
+        {
+            "source_id": "source_non_public",
+            "api_base": "https://us120.fhir.m3.edifecsfedcloud.com/nd_pd",
+            "auth_type": "none",
+            "requires_registration": False,
+            "metadata_json": {
+                "note": "CMS SMA Directory: Status=Active, Public=No, Impl=8/11/2022, FHIR=4.0.1",
+            },
+        },
+        timeout=3,
+        run_id="run_1",
+    )
+
+    assert payload is None
+    assert probe["status"] == "auth_required"
+    assert probe["http_status"] is None
+    assert probe["credential"] is None
+    assert "no matching credentials" in probe["error"]
 
 
 @pytest.mark.asyncio
@@ -1076,7 +1864,7 @@ async def test_probe_source_classifies_known_onboarding_gateway_non_fhir_as_auth
     monkeypatch.delenv(importer.PROVIDER_DIRECTORY_CREDENTIALS_FILE_ENV, raising=False)  # pylint: disable=protected-access
 
     async def fake_fetch_source_json(source, url, *, timeout):  # pylint: disable=unused-argument
-        return 200, None, None, 14
+        raise AssertionError("known onboarding gateways without credentials should not be fetched")
 
     monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_source_json)
 
@@ -1093,7 +1881,7 @@ async def test_probe_source_classifies_known_onboarding_gateway_non_fhir_as_auth
 
     assert payload is None
     assert probe["status"] == "auth_required"
-    assert probe["http_status"] == 200
+    assert probe["http_status"] is None
     assert probe["credential"] is None
     assert "no matching credentials" in probe["error"]
 
@@ -1310,8 +2098,12 @@ def test_provider_directory_address_corroboration_sql_links_unified_npi_address_
     assert "practitioner.npi = e.npi" in sql
     assert 'JOIN "mrf"."provider_directory_location" loc' in sql
     assert "COALESCE(role.location_refs::jsonb, '[]'::jsonb)" in sql
+    assert 'JOIN "mrf"."provider_directory_healthcare_service" AS healthcare_service' in sql
+    assert "COALESCE(role.healthcare_service_refs::jsonb, '[]'::jsonb)" in sql
+    assert "COALESCE(healthcare_service.location_refs::jsonb, '[]'::jsonb)" in sql
     assert "COALESCE(role.network_refs::jsonb, '[]'::jsonb) AS network_refs" in sql
     assert "COALESCE(affiliation.location_refs::jsonb, '[]'::jsonb)" in sql
+    assert "COALESCE(affiliation.healthcare_service_refs::jsonb, '[]'::jsonb)" in sql
     assert "COALESCE(affiliation.network_refs::jsonb, '[]'::jsonb) AS network_refs" in sql
     assert "role.location_ref IN (loc.resource_id, 'Location/' || loc.resource_id)" in sql
     assert "role.location_ref LIKE '%/Location/' || loc.resource_id" in sql
@@ -1326,6 +2118,18 @@ def test_provider_directory_address_corroboration_sql_links_unified_npi_address_
     assert "provider_directory_network_context_present" in sql
     assert "provider_directory_network_names" in sql
     assert "provider_directory_network_matches" in sql
+    assert "'provider_directory_source', 'provider_directory_fhir'" in sql
+    assert "'provider_directory_source_id', role.source_id" in sql
+    assert "'provider_directory_source_id', affiliation.source_id" in sql
+    assert "'provider_directory_network_key'," in sql
+    assert "regexp_replace(lower(COALESCE(network_org.name, '')), '[^a-z0-9]+', '', 'g')" in sql
+    assert "'provider_directory_org_name', network_src.org_name" in sql
+    assert "'provider_directory_plan_name', network_src.plan_name" in sql
+    assert "'provider_directory_issuer_key'," in sql
+    assert "'provider_directory_issuer_network_match_key'," in sql
+    assert "network_src.org_name" in sql
+    assert "'org_name', provider_directory_org_name" in sql
+    assert "'plan_name', provider_directory_plan_name" in sql
     assert "provider_directory_insurance_plan_matches" in sql
     assert "loc.phone_number AS provider_directory_phone_number" in sql
     assert "loc.fax_number_digits AS provider_directory_fax_number_digits" in sql
@@ -1406,8 +2210,9 @@ async def test_publish_provider_directory_address_corroboration_table_swaps_inde
         'ALTER TABLE "mrf"."pd_stage_corrob" RENAME TO "provider_directory_address_corroboration"'
         in joined
     )
-    assert '"mrf"."pd_price_addr_corrob_lookup_idx"' in joined
-    assert '"mrf"."pd_price_addr_corrob_network_names_gin"' in joined
+    assert 'CREATE INDEX IF NOT EXISTS "pd_price_addr_corrob_lookup_idx"' in joined
+    assert 'CREATE INDEX IF NOT EXISTS "pd_price_addr_corrob_network_names_gin"' in joined
+    assert 'CREATE INDEX IF NOT EXISTS "mrf"."pd_price_addr_corrob_lookup_idx"' not in joined
     assert 'ANALYZE "mrf"."provider_directory_address_corroboration"' in joined
 
 
@@ -1523,7 +2328,7 @@ async def test_import_linked_resource_rows_fetches_role_references_and_upserts(m
     upserts = []
 
     async def fake_upsert(model, rows, **_kwargs):
-        upserts.append((model, rows))
+        upserts.append((model, rows, _kwargs))
         return len(rows)
 
     monkeypatch.setattr(importer, "_fetch_json", fake_fetch_json)
@@ -1548,12 +2353,44 @@ async def test_import_linked_resource_rows_fetches_role_references_and_upserts(m
     )
 
     assert counts == {"Practitioner": 1, "Location": 1, "InsurancePlan": 1, "Endpoint": 1}
-    assert [model for model, _rows in upserts] == [
+    concrete_models = [
+        model
+        for model, _rows, _kwargs in upserts
+        if model not in {ProviderDirectoryCanonicalResource, ProviderDirectorySourceResource}
+    ]
+    assert concrete_models == [
         ProviderDirectoryPractitioner,
         ProviderDirectoryLocation,
         ProviderDirectoryInsurancePlan,
         ProviderDirectoryEndpoint,
     ]
+    canonical_rows = [
+        row
+        for model, rows, _kwargs in upserts
+        if model is ProviderDirectoryCanonicalResource
+        for row in rows
+    ]
+    source_edge_rows = [
+        row
+        for model, rows, _kwargs in upserts
+        if model is ProviderDirectorySourceResource
+        for row in rows
+    ]
+    assert {row["resource_type"] for row in canonical_rows} == {
+        "Practitioner",
+        "Location",
+        "InsurancePlan",
+        "Endpoint",
+    }
+    assert {row["canonical_api_base"] for row in canonical_rows} == {"https://example.test/fhir"}
+    assert {row["source_id"] for row in source_edge_rows} == {"source_a"}
+    assert {row["resource_type"] for row in source_edge_rows} == {
+        "Practitioner",
+        "Location",
+        "InsurancePlan",
+        "Endpoint",
+    }
+    assert {row["last_seen_run_id"] for row in source_edge_rows} == {"run_1"}
 
 
 @pytest.mark.asyncio
@@ -1569,7 +2406,7 @@ async def test_import_linked_resource_rows_fetches_network_organization_from_net
     upserts = []
 
     async def fake_upsert(model, rows, **_kwargs):
-        upserts.append((model, rows))
+        upserts.append((model, rows, _kwargs))
         return len(rows)
 
     monkeypatch.setattr(importer, "_fetch_json", fake_fetch_json)
@@ -1596,8 +2433,16 @@ async def test_import_linked_resource_rows_fetches_network_organization_from_net
 
     assert counts == {"Organization": 1}
     assert calls[0] == "https://example.test/fhir/Organization?type=ntwk&_count=1&_id=network-1"
-    assert upserts[0][0] is ProviderDirectoryOrganization
-    assert upserts[0][1][0]["name"] == "Gold Network"
+    assert [model for model, _rows, _kwargs in upserts] == [
+        ProviderDirectoryCanonicalResource,
+        ProviderDirectorySourceResource,
+        ProviderDirectoryOrganization,
+    ]
+    assert upserts[0][1][0]["canonical_api_base"] == "https://example.test/fhir"
+    assert upserts[0][1][0]["resource_type"] == "Organization"
+    assert upserts[1][1][0]["source_id"] == "source_a"
+    assert upserts[1][1][0]["last_seen_run_id"] == "run_1"
+    assert upserts[2][1][0]["name"] == "Gold Network"
 
 
 @pytest.mark.asyncio
@@ -1630,7 +2475,10 @@ async def test_import_resources_accumulates_linked_resource_counts(monkeypatch):
     async def fake_upsert(_model, rows, **_kwargs):
         return len(rows)
 
+    linked_kwargs = []
+
     async def fake_import_linked(_source, _rows_by_resource, **_kwargs):
+        linked_kwargs.append(_kwargs)
         return {"Location": 2}
 
     monkeypatch.setattr(importer, "_fetch_resource_rows", fake_fetch_resource_rows)
@@ -1652,6 +2500,17 @@ async def test_import_resources_accumulates_linked_resource_counts(monkeypatch):
 
     assert counts == {"PractitionerRole": 1}
     assert linked_counts == {"Location": 2}
+    assert linked_kwargs == [
+        {
+            "per_source_limit": 5,
+            "concurrency": 5,
+            "timeout": 3,
+            "run_id": "run_1",
+            "source_ids": ["source_a"],
+            "track_seen": False,
+            "seen_table": None,
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -1668,10 +2527,21 @@ async def test_publish_provider_directory_location_address_keys_skips_without_ca
 
 @pytest.mark.asyncio
 async def test_publish_provider_directory_location_address_keys_runs_canonical_update(monkeypatch):
+    class Row:
+        def __init__(self, **values):
+            self._mapping = values
+
     monkeypatch.setattr(importer, "_address_canon_functions_available", AsyncMock(return_value=True))
     table_exists = AsyncMock(return_value=True)
     monkeypatch.setattr(importer, "_table_exists", table_exists)
-    status = AsyncMock(return_value=7)
+    first = AsyncMock(
+        side_effect=[
+            Row(candidate_rows=7, updated_rows=7, last_source_id="source_a", last_resource_id="loc-7"),
+            Row(candidate_rows=0, updated_rows=0, last_source_id=None, last_resource_id=None),
+        ]
+    )
+    status = AsyncMock()
+    monkeypatch.setattr(importer.db, "first", first)
     monkeypatch.setattr(importer.db, "status", status)
 
     stamped = await importer.publish_provider_directory_location_address_keys(
@@ -1683,11 +2553,17 @@ async def test_publish_provider_directory_location_address_keys_runs_canonical_u
 
     assert stamped == 7
     table_exists.assert_awaited_once_with("mrf", "geo_zip_lookup")
-    status.assert_awaited_once()
-    assert 'UPDATE "mrf"."provider_directory_location" AS loc' in status.await_args.args[0]
-    assert 'LEFT JOIN "mrf"."geo_zip_lookup" AS geo' in status.await_args.args[0]
-    assert 'FROM "mrf"."provider_directory_import_seen_stage_test" AS seen' in status.await_args.args[0]
-    assert status.await_args.kwargs == {"run_id": "run_1", "source_ids": ["source_a"]}
+    assert first.await_count == 2
+    sql = first.await_args_list[0].args[0]
+    assert 'UPDATE "mrf"."provider_directory_location" AS loc' in sql
+    assert 'LEFT JOIN "mrf"."geo_zip_lookup" AS geo' in sql
+    assert 'FROM "mrf"."provider_directory_import_seen_stage_test" AS seen' in sql
+    assert first.await_args_list[0].kwargs["run_id"] == "run_1"
+    assert first.await_args_list[0].kwargs["source_ids"] == ["source_a"]
+    assert first.await_args_list[0].kwargs["after_source_id"] is None
+    assert first.await_args_list[1].kwargs["after_source_id"] == "source_a"
+    assert first.await_args_list[1].kwargs["after_resource_id"] == "loc-7"
+    status.assert_not_awaited()
 
 
 def test_provider_directory_location_archive_stage_sql_filters_keyable_uuid_locations():
@@ -1702,6 +2578,33 @@ def test_provider_directory_location_archive_stage_sql_filters_keyable_uuid_loca
     assert "NULLIF(BTRIM(loc.first_line), '') IS NOT NULL" in sql
     assert "OR NULLIF(BTRIM(loc.city_name), '') IS NOT NULL" in sql
     assert "SELECT DISTINCT ON (address_key)" in sql
+
+
+def test_provider_directory_location_archive_stage_sql_can_scope_to_seen_stage():
+    sql = importer.provider_directory_location_archive_stage_sql(
+        "mrf",
+        "provider_directory_location_archive_stage_test",
+        run_id="run_1",
+        seen_table="provider_directory_import_seen_stage_test",
+    )
+
+    assert 'FROM "mrf"."provider_directory_import_seen_stage_test" AS seen' in sql
+    assert "seen.resource_type = 'Location'" in sql
+    assert "AND seen.run_id = CAST(:run_id AS varchar)" in sql
+    assert "AND seen.source_id = loc.source_id" in sql
+    assert "AND seen.resource_id = loc.resource_id" in sql
+    assert "loc.last_seen_run_id = CAST(:run_id AS varchar)" not in sql
+
+
+def test_provider_directory_location_archive_stage_sql_can_scope_to_current_run_without_seen_stage():
+    sql = importer.provider_directory_location_archive_stage_sql(
+        "mrf",
+        "provider_directory_location_archive_stage_test",
+        run_id="run_1",
+    )
+
+    assert "loc.last_seen_run_id = CAST(:run_id AS varchar)" in sql
+    assert "provider_directory_import_seen_stage" not in sql
 
 
 @pytest.mark.asyncio
@@ -1733,6 +2636,8 @@ async def test_publish_provider_directory_location_archive_resolves_and_cleans_s
     status_calls = [call.args[0] for call in status.await_args_list]
     assert status_calls[0] == 'DROP TABLE IF EXISTS "mrf"."provider_directory_location_archive_stage_test";'
     assert 'CREATE UNLOGGED TABLE "mrf"."provider_directory_location_archive_stage_test" AS' in status_calls[1]
+    assert "loc.last_seen_run_id = CAST(:run_id AS varchar)" in status_calls[1]
+    assert status.await_args_list[1].kwargs == {"run_id": "run_1"}
     assert status_calls[2] == 'ANALYZE "mrf"."provider_directory_location_archive_stage_test";'
     assert status_calls[-1] == 'DROP TABLE IF EXISTS "mrf"."provider_directory_location_archive_stage_test";'
     resolve.assert_awaited_once()
@@ -1788,6 +2693,195 @@ async def test_publish_provider_directory_address_corroboration_if_available_pub
 
 
 @pytest.mark.asyncio
+async def test_process_data_merges_supplemental_retest_sources(monkeypatch, tmp_path):
+    retest_path = tmp_path / "retest_results.json"
+    retest_path.write_text(
+        json.dumps(
+            {
+                "tested_at": "2026-06-03T17:43:09Z",
+                "results": [
+                    {
+                        "payer_id": 21,
+                        "classification": "valid",
+                        "org_name": "Supplemental Public Payer",
+                        "api_base": "https://supplemental.example/fhir",
+                        "status_code": 200,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    upserted: list[dict[str, Any]] = []
+
+    async def fake_upsert(_model, rows, **_kwargs):
+        upserted.extend(rows)
+        return len(rows)
+
+    monkeypatch.setattr(importer, "ensure_database", AsyncMock())
+    monkeypatch.setattr(importer, "_ensure_provider_directory_tables", AsyncMock())
+    monkeypatch.setattr(importer, "_clear_resource_rows_seen", AsyncMock(return_value=0))
+    monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
+
+    metrics = await importer.process_data(
+        {"context": {}},
+        {
+            "test": True,
+            "probe": False,
+            "seed_only": True,
+            "retest_results_path": str(retest_path),
+        },
+    )
+
+    assert metrics["sources_seeded"] == 2
+    assert metrics["supplemental_retest_sources_considered"] == 1
+    assert {row["org_name"] for row in upserted} == {"Cigna", "Supplemental Public Payer"}
+    supplemental = next(row for row in upserted if row["org_name"] == "Supplemental Public Payer")
+    assert supplemental["api_base"] == "https://supplemental.example/fhir"
+    assert supplemental["seed_source"] == "provider-directory-db-retest"
+
+
+@pytest.mark.asyncio
+async def test_process_data_skips_full_refresh_source_catalog_stale_cleanup_without_retest(monkeypatch):
+    upserted: list[dict[str, Any]] = []
+
+    async def fake_upsert(_model, rows, **_kwargs):
+        upserted.extend(rows)
+        return len(rows)
+
+    cleanup = AsyncMock(return_value={"provider_directory_source": 1})
+    monkeypatch.setattr(importer, "ensure_database", AsyncMock())
+    monkeypatch.setattr(importer, "_ensure_provider_directory_tables", AsyncMock())
+    monkeypatch.setattr(importer, "_clear_resource_rows_seen", AsyncMock(return_value=0))
+    monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
+    monkeypatch.setattr(importer, "_delete_stale_provider_directory_source_catalog", cleanup)
+
+    metrics = await importer.process_data(
+        {"context": {}},
+        {
+            "test": True,
+            "probe": False,
+            "seed_only": True,
+            "full_refresh": True,
+            "stale_cleanup": True,
+        },
+    )
+
+    cleanup.assert_not_awaited()
+    assert metrics["sources_seeded"] == 1
+    assert metrics["stale_source_rows_deleted"] == {}
+
+
+@pytest.mark.asyncio
+async def test_process_data_reports_full_refresh_source_catalog_stale_cleanup_with_retest(
+    monkeypatch,
+    tmp_path,
+):
+    retest_path = tmp_path / "retest_results.json"
+    retest_path.write_text(
+        json.dumps(
+            {
+                "tested_at": "2026-06-03T17:43:09Z",
+                "results": [
+                    {
+                        "payer_id": 21,
+                        "classification": "valid",
+                        "org_name": "Supplemental Public Payer",
+                        "api_base": "https://supplemental.example/fhir",
+                        "status_code": 200,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    upserted: list[dict[str, Any]] = []
+
+    async def fake_upsert(_model, rows, **_kwargs):
+        upserted.extend(rows)
+        return len(rows)
+
+    cleanup = AsyncMock(return_value={"provider_directory_source": 1})
+    monkeypatch.setattr(importer, "ensure_database", AsyncMock())
+    monkeypatch.setattr(importer, "_ensure_provider_directory_tables", AsyncMock())
+    monkeypatch.setattr(importer, "_clear_resource_rows_seen", AsyncMock(return_value=0))
+    monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
+    monkeypatch.setattr(importer, "_delete_stale_provider_directory_source_catalog", cleanup)
+
+    metrics = await importer.process_data(
+        {"context": {}},
+        {
+            "test": True,
+            "probe": False,
+            "seed_only": True,
+            "full_refresh": True,
+            "stale_cleanup": True,
+            "retest_results_path": str(retest_path),
+        },
+    )
+
+    cleanup.assert_awaited_once_with([row["source_id"] for row in upserted])
+    assert metrics["sources_seeded"] == 2
+    assert metrics["stale_source_rows_deleted"] == {"provider_directory_source": 1}
+
+
+@pytest.mark.asyncio
+async def test_process_data_does_not_import_valid_non_fhir_retest_rows_without_valid_probe(monkeypatch, tmp_path):
+    retest_path = tmp_path / "retest_results.json"
+    retest_path.write_text(
+        json.dumps(
+            {
+                "tested_at": "2026-06-03T17:43:09Z",
+                "results": [
+                    {
+                        "payer_id": 31,
+                        "classification": "valid_non_fhir",
+                        "org_name": "Supplemental Public App",
+                        "api_base": "https://public-app.example/providers",
+                        "status_code": 200,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    imported_sources: list[dict[str, Any]] = []
+
+    async def fake_upsert(_model, rows, **_kwargs):
+        return len(rows)
+
+    async def fake_import_resources(sources, **_kwargs):
+        imported_sources.extend(sources)
+        return {"Location": 1}
+
+    monkeypatch.setattr(importer, "ensure_database", AsyncMock())
+    monkeypatch.setattr(importer, "_ensure_provider_directory_tables", AsyncMock())
+    monkeypatch.setattr(importer, "_clear_resource_rows_seen", AsyncMock(return_value=0))
+    monkeypatch.setattr(importer, "_upsert_rows", fake_upsert)
+    monkeypatch.setattr(importer, "_import_resources", fake_import_resources)
+
+    metrics = await importer.process_data(
+        {"context": {}},
+        {
+            "test": True,
+            "probe": False,
+            "import_resources": True,
+            "resources": "Location",
+            "publish_artifacts": False,
+            "retest_results_path": str(retest_path),
+        },
+    )
+
+    assert metrics["sources_seeded"] == 2
+    assert metrics["supplemental_retest_sources_considered"] == 1
+    assert [source["org_name"] for source in imported_sources] == ["Cigna"]
+    assert metrics["sources_import_attempted"] == 1
+    assert metrics["source_import_sources_considered"] == 2
+    assert metrics["source_import_sources_selected"] == 1
+    assert metrics["source_import_skipped_validation_status"] == 1
+
+
+@pytest.mark.asyncio
 async def test_process_data_stamps_locations_and_publishes_corroboration_view_when_requested(monkeypatch):
     monkeypatch.setattr(importer, "ensure_database", AsyncMock())
     monkeypatch.setattr(importer, "_ensure_provider_directory_tables", AsyncMock())
@@ -1833,6 +2927,31 @@ async def test_process_data_stamps_locations_and_publishes_corroboration_view_wh
     importer.publish_provider_directory_location_address_keys.assert_awaited_once()
     importer.publish_provider_directory_location_archive.assert_awaited_once()
     importer.publish_provider_directory_address_corroboration_if_available.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_process_data_probe_only_full_refresh_does_not_publish_artifacts_by_default(monkeypatch):
+    monkeypatch.setattr(importer, "ensure_database", AsyncMock())
+    monkeypatch.setattr(importer, "_ensure_provider_directory_tables", AsyncMock())
+    monkeypatch.setattr(importer, "_clear_resource_rows_seen", AsyncMock(return_value=0))
+    monkeypatch.setattr(importer, "_upsert_rows", AsyncMock(return_value=1))
+    monkeypatch.setattr(importer, "_probe_sources", AsyncMock(return_value=(1, 1, {"source_a"})))
+    publish_artifacts = AsyncMock(return_value={})
+    monkeypatch.setattr(importer, "_publish_provider_directory_artifacts", publish_artifacts)
+
+    metrics = await importer.process_data(
+        {"context": {}},
+        {
+            "test": True,
+            "full_refresh": True,
+            "probe": True,
+            "import_resources": False,
+        },
+    )
+
+    assert metrics["publish_artifacts"] is False
+    assert metrics["resource_rows"] == {}
+    publish_artifacts.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1924,6 +3043,9 @@ async def test_process_data_uses_live_probe_success_over_seed_auth_required_stat
     )
 
     assert metrics["sources_import_attempted"] == 1
+    assert metrics["source_import_sources_selected_live_probe_valid"] == 1
+    assert metrics["source_import_sources_selected_declared_credentialed"] == 1
+    assert metrics["source_import_sources_selected_auth_required_seed"] == 1
     import_resources.assert_awaited_once()
     assert import_resources.await_args.args[0][0]["source_id"] == "source_a"
 
@@ -2187,6 +3309,277 @@ def test_resource_start_url_ignores_unreachable_catalog_endpoint():
     assert url == "https://fp.medicaid.utah.gov/ProviderDirectoryServices/Location?_count=100"
 
 
+def test_resource_start_urls_partitions_scan_too_costly_resources():
+    practitioner_urls = importer._resource_start_urls(  # pylint: disable=protected-access
+        {"api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE},
+        "Practitioner",
+        page_count=25,
+    )
+    location_urls = importer._resource_start_urls(  # pylint: disable=protected-access
+        {"api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE},
+        "Location",
+        page_count=25,
+    )
+    plan_urls = importer._resource_start_urls(  # pylint: disable=protected-access
+        {"api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE},
+        "InsurancePlan",
+        page_count=25,
+    )
+
+    assert practitioner_urls[0] == (
+        "https://providerdirectory.scanhealthplan.com/Practitioner?_count=25&family=AA"
+    )
+    assert practitioner_urls[-1] == (
+        "https://providerdirectory.scanhealthplan.com/Practitioner?_count=25&family=ZZ"
+    )
+    assert len(practitioner_urls) == 26 * 26
+    assert location_urls[:2] == [
+        "https://providerdirectory.scanhealthplan.com/Location?_count=25&name=A",
+        "https://providerdirectory.scanhealthplan.com/Location?_count=25&name=B",
+    ]
+    assert len(location_urls) == 26
+    assert plan_urls == ["https://providerdirectory.scanhealthplan.com/InsurancePlan?_count=25"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_resource_rows_continues_after_scan_partition_error(monkeypatch):
+    calls: list[str] = []
+
+    async def fake_fetch_json(_source, url, *, timeout):  # pylint: disable=unused-argument
+        calls.append(url)
+        if "name=A" in url:
+            return 413, {"resourceType": "OperationOutcome"}, None, 5
+        if "name=B" in url:
+            return (
+                200,
+                {
+                    "resourceType": "Bundle",
+                    "entry": [
+                        {
+                            "fullUrl": "https://providerdirectory.scanhealthplan.com/Location/location-1",
+                            "resource": {
+                                "resourceType": "Location",
+                                "id": "location-1",
+                                "name": "B Clinic",
+                                "address": {
+                                    "line": ["1 Main St"],
+                                    "city": "Long Beach",
+                                    "state": "CA",
+                                    "postalCode": "90802",
+                                    "country": "US",
+                                },
+                            },
+                        }
+                    ],
+                },
+                None,
+                5,
+            )
+        raise AssertionError(f"unexpected URL {url}")
+
+    monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_json)
+
+    result = await importer._fetch_resource_rows(  # pylint: disable=protected-access
+        {
+            "source_id": "scan",
+            "api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE,
+            "canonical_api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE,
+        },
+        "Location",
+        per_resource_limit=1,
+        page_limit=0,
+        page_count=25,
+        timeout=3,
+        run_id="run_1",
+    )
+
+    assert calls == [
+        "https://providerdirectory.scanhealthplan.com/Location?_count=25&name=A",
+        "https://providerdirectory.scanhealthplan.com/Location?_count=25&name=B",
+    ]
+    assert result is not None
+    assert result.model is ProviderDirectoryLocation
+    assert result.rows_fetched == 1
+    assert result.rows[0]["resource_id"] == "location-1"
+    assert result.error == "partition_errors_1_last_http_413"
+
+
+@pytest.mark.asyncio
+async def test_fetch_resource_rows_defers_scan_practitioner_role_reverse_lookup(monkeypatch):
+    calls: list[str] = []
+
+    async def fake_fetch_json(_source, url, *, timeout):  # pylint: disable=unused-argument
+        calls.append(url)
+        raise AssertionError("SCAN PractitionerRole should not use a broad paged search")
+
+    monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_json)
+
+    result = await importer._fetch_resource_rows(  # pylint: disable=protected-access
+        {
+            "source_id": "scan",
+            "api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE,
+            "canonical_api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE,
+        },
+        "PractitionerRole",
+        per_resource_limit=5,
+        page_limit=0,
+        page_count=25,
+        timeout=3,
+        run_id="run_1",
+    )
+
+    assert calls == []
+    assert result is not None
+    assert result.model is ProviderDirectoryPractitionerRole
+    assert result.rows == []
+    assert result.complete is False
+    assert result.error == importer.SCAN_PRACTITIONER_ROLE_REVERSE_LOOKUP_ERROR
+    assert result.fetch_mode == "source_specific_deferred"
+
+
+@pytest.mark.asyncio
+async def test_fetch_scan_practitioner_role_rows_reverse_looks_up_by_practitioner(monkeypatch):
+    calls: list[str] = []
+
+    async def fake_fetch_json(_source, url, *, timeout):  # pylint: disable=unused-argument
+        calls.append(url)
+        return (
+            200,
+            {
+                "resourceType": "Bundle",
+                "entry": [
+                    {
+                        "fullUrl": "https://providerdirectory.scanhealthplan.com/PractitionerRole/role-1",
+                        "resource": {
+                            "resourceType": "PractitionerRole",
+                            "id": "role-1",
+                            "practitioner": {"reference": "Practitioner/prac-1"},
+                            "location": [{"reference": "Location/loc-1"}],
+                        },
+                    }
+                ],
+            },
+            None,
+            5,
+        )
+
+    monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_json)
+
+    result = await importer._fetch_scan_practitioner_role_rows(  # pylint: disable=protected-access
+        {
+            "source_id": "scan",
+            "api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE,
+            "canonical_api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE,
+        },
+        {"Practitioner": [{"resource_id": "prac-1"}]},
+        per_resource_limit=5,
+        page_limit=0,
+        page_count=25,
+        timeout=3,
+        run_id="run_1",
+    )
+
+    assert calls == [
+        "https://providerdirectory.scanhealthplan.com/PractitionerRole?practitioner=Practitioner%2Fprac-1&_count=25"
+    ]
+    assert result.model is ProviderDirectoryPractitionerRole
+    assert result.rows_fetched == 1
+    assert result.rows[0]["resource_id"] == "role-1"
+    assert result.rows[0]["practitioner_ref"] == "Practitioner/prac-1"
+    assert result.fetch_mode == "source_specific_reverse_lookup"
+
+
+@pytest.mark.asyncio
+async def test_import_resources_fetches_scan_practitioner_roles_after_practitioners(monkeypatch):
+    _stub_resource_import_metadata(monkeypatch)
+
+    async def fake_fetch_resource_rows(source, resource_type, **_kwargs):  # pylint: disable=unused-argument
+        if resource_type == "PractitionerRole":
+            raise AssertionError("SCAN PractitionerRole should be reverse-looked-up after practitioners")
+        if resource_type != "Practitioner":
+            return None
+        return importer.ResourceFetchResult(
+            model=ProviderDirectoryPractitioner,
+            rows=[
+                {
+                    "source_id": source["source_id"],
+                    "resource_id": "prac-1",
+                    "npi": "1234567890",
+                }
+            ],
+            rows_fetched=1,
+            rows_written=0,
+            pages_fetched=1,
+            complete=True,
+            row_limit_reached=False,
+            page_limit_reached=False,
+            hard_page_limit_reached=False,
+            next_url_remaining=False,
+        )
+
+    role_calls: list[str] = []
+
+    async def fake_fetch_source_json(_source, url, *, timeout):  # pylint: disable=unused-argument
+        role_calls.append(url)
+        return (
+            200,
+            {
+                "resourceType": "Bundle",
+                "entry": [
+                    {
+                        "fullUrl": "https://providerdirectory.scanhealthplan.com/PractitionerRole/role-1",
+                        "resource": {
+                            "resourceType": "PractitionerRole",
+                            "id": "role-1",
+                            "practitioner": {"reference": "Practitioner/prac-1"},
+                        },
+                    }
+                ],
+            },
+            None,
+            5,
+        )
+
+    upserts: list[tuple[type, list[dict[str, Any]]]] = []
+
+    async def fake_upsert_resource_rows(model, rows, **_kwargs):
+        upserts.append((model, rows))
+        return len(rows)
+
+    monkeypatch.setattr(importer, "_fetch_resource_rows", fake_fetch_resource_rows)
+    monkeypatch.setattr(importer, "_fetch_source_json", fake_fetch_source_json)
+    monkeypatch.setattr(importer, "_upsert_resource_rows", fake_upsert_resource_rows)
+
+    resource_fetch_stats: dict[str, dict[str, Any]] = {}
+    counts = await importer._import_resources(  # pylint: disable=protected-access
+        [
+            {
+                "source_id": "scan",
+                "api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE,
+                "canonical_api_base": importer.SCAN_PROVIDER_DIRECTORY_BASE,
+            }
+        ],
+        resources=["PractitionerRole", "Practitioner"],
+        per_resource_limit=5,
+        page_limit=0,
+        page_count=25,
+        timeout=3,
+        run_id="run_1",
+        resource_fetch_stats=resource_fetch_stats,
+    )
+
+    assert counts == {"PractitionerRole": 1, "Practitioner": 1}
+    assert [model for model, _rows in upserts] == [
+        ProviderDirectoryPractitioner,
+        ProviderDirectoryPractitionerRole,
+    ]
+    assert role_calls == [
+        "https://providerdirectory.scanhealthplan.com/PractitionerRole?practitioner=Practitioner%2Fprac-1&_count=25"
+    ]
+    assert resource_fetch_stats["PractitionerRole"]["sources_attempted"] == 1
+    assert resource_fetch_stats["PractitionerRole"]["rows_fetched"] == 1
+
+
 def test_bulk_export_start_url_uses_base_export_operation():
     url = importer._bulk_export_start_url(  # pylint: disable=protected-access
         {"api_base": "https://example.test/fhir/"},
@@ -2220,6 +3613,21 @@ def test_bulk_export_output_urls_filters_requested_resource_type():
     )
 
     assert urls == ["https://bulk.example/location.ndjson"]
+
+
+def test_bulk_export_status_payload_and_error_detection():
+    assert importer._bulk_export_status_payload(  # pylint: disable=protected-access
+        {"transactionTime": "2026-06-30T00:00:00Z", "output": []}
+    )
+    assert not importer._bulk_export_status_payload(  # pylint: disable=protected-access
+        {"resourceType": "Bundle", "entry": []}
+    )
+    assert (
+        importer._bulk_export_payload_error(  # pylint: disable=protected-access
+            {"error": [{"type": "OperationOutcome", "responseCode": 500}]}
+        )
+        == "bulk_export_error_http_500"
+    )
 
 
 @pytest.mark.asyncio
@@ -2265,6 +3673,89 @@ async def test_fetch_resource_rows_uses_bulk_export_when_available(monkeypatch):
     stats: dict[str, dict[str, Any]] = {}
     importer._record_resource_fetch_stats(stats, "Practitioner", result)  # pylint: disable=protected-access
     assert stats["Practitioner"]["bulk_export_sources"] == 1
+
+
+@pytest.mark.asyncio
+async def test_fetch_resource_rows_falls_back_when_bulk_export_returns_non_bulk_200(monkeypatch):
+    async def fake_bulk_http_get_json(*_args, **kwargs):
+        assert kwargs["prefer_async"] is True
+        return 200, {}, {"resourceType": "Bundle", "entry": []}, None
+
+    async def fake_fetch_json(url, *, timeout):  # pylint: disable=unused-argument
+        assert url == "https://example.test/fhir/Practitioner?_count=25"
+        return (
+            200,
+            {
+                "resourceType": "Bundle",
+                "entry": [
+                    {
+                        "resource": {
+                            "resourceType": "Practitioner",
+                            "id": "prac-1",
+                            "name": [{"family": "Fallback"}],
+                        },
+                    }
+                ],
+            },
+            None,
+            10,
+        )
+
+    monkeypatch.setattr(importer, "_bulk_http_get_json", fake_bulk_http_get_json)
+    monkeypatch.setattr(importer, "_fetch_json", fake_fetch_json)
+
+    result = await importer._fetch_resource_rows(  # pylint: disable=protected-access
+        {"source_id": "source_a", "api_base": "https://example.test/fhir"},
+        "Practitioner",
+        per_resource_limit=1,
+        page_limit=1,
+        page_count=25,
+        timeout=3,
+        run_id="run_1",
+        bulk_export=True,
+    )
+
+    assert result is not None
+    assert result.fetch_mode == "paged"
+    assert result.rows[0]["resource_id"] == "prac-1"
+
+
+@pytest.mark.asyncio
+async def test_fetch_resource_rows_records_accepted_bulk_export_poll_failure(monkeypatch):
+    async def fake_bulk_http_get_json(*_args, **kwargs):
+        assert kwargs["prefer_async"] is True
+        return 202, {"content-location": "/bulk-status/1"}, None, None
+
+    async def fake_poll_outputs(*_args, **_kwargs):
+        return None, "bulk_export_timeout", 3
+
+    async def fail_paged_fetch(*_args, **_kwargs):
+        raise AssertionError("accepted bulk export failures should not fall back to paged reads")
+
+    monkeypatch.setattr(importer, "_bulk_http_get_json", fake_bulk_http_get_json)
+    monkeypatch.setattr(importer, "_bulk_export_poll_outputs", fake_poll_outputs)
+    monkeypatch.setattr(importer, "_fetch_json", fail_paged_fetch)
+
+    result = await importer._fetch_resource_rows(  # pylint: disable=protected-access
+        {"source_id": "source_a", "api_base": "https://example.test/fhir"},
+        "Practitioner",
+        per_resource_limit=1,
+        page_limit=1,
+        page_count=25,
+        timeout=3,
+        run_id="run_1",
+        bulk_export=True,
+    )
+
+    assert result is not None
+    assert result.fetch_mode == "bulk_export"
+    assert result.error == "bulk_export_timeout"
+    assert result.complete is False
+    assert result.next_url_remaining is True
+    stats: dict[str, dict[str, Any]] = {}
+    importer._record_resource_fetch_stats(stats, "Practitioner", result)  # pylint: disable=protected-access
+    assert stats["Practitioner"]["bulk_export_sources"] == 1
+    assert stats["Practitioner"]["sources_failed"] == 1
 
 
 @pytest.mark.asyncio
@@ -2596,10 +4087,13 @@ async def test_import_resources_deletes_stale_rows_only_after_complete_scan(monk
 
     assert counts == {"Location": 1, "Practitioner": 1}
     assert stale_counts == {"Location": 4}
-    assert len(deletes) == 1
-    assert '"provider_directory_location"' in deletes[0][0]
+    assert len(deletes) == 2
+    assert '"provider_directory_source_resource"' in deletes[0][0]
+    assert '"provider_directory_location"' in deletes[1][0]
     assert "provider_directory_import_seen" in deletes[0][0]
+    assert "provider_directory_import_seen" in deletes[1][0]
     assert deletes[0][1] == {"source_id": "source_a", "run_id": "run_1", "resource_type": "Location"}
+    assert deletes[1][1] == {"source_id": "source_a", "run_id": "run_1", "resource_type": "Location"}
     assert stats["Location"]["sources_completed"] == 1
     assert stats["Practitioner"]["sources_bounded"] == 1
 
@@ -2923,7 +4417,10 @@ async def test_process_data_publish_artifacts_only_skips_seed_resolution(monkeyp
         run_id=None,
         seen_table=None,
     )
-    importer.publish_provider_directory_location_archive.assert_awaited_once_with(run_id="run_publish")
+    importer.publish_provider_directory_location_archive.assert_awaited_once_with(
+        run_id="run_publish",
+        seen_table=None,
+    )
     importer.publish_provider_directory_address_corroboration_if_available.assert_not_awaited()
 
 
@@ -2942,3 +4439,126 @@ def test_harness_fixture_case_and_report_rendering(tmp_path):
     assert (tmp_path / "report.json").exists()
     assert (tmp_path / "report.md").exists()
     assert json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))["overall_status"] == "succeeded"
+
+
+def test_harness_sql_typing_rejects_unsafe_schema_name():
+    assert harness._validate_identifier("provider_directory_sql_typing_test", label="schema") == (  # pylint: disable=protected-access
+        "provider_directory_sql_typing_test"
+    )
+    with pytest.raises(ValueError):
+        harness._validate_identifier("provider_directory_sql_typing_test;drop", label="schema")  # pylint: disable=protected-access
+
+
+def test_harness_local_cli_passes_retest_supplement_args(monkeypatch, tmp_path):
+    calls: list[dict[str, Any]] = []
+
+    class Result:
+        returncode = 0
+        stdout = (
+            "PROVIDER_DIRECTORY_FHIR_IMPORT_DONE\t"
+            '{"sources_seeded": 2, "supplemental_retest_sources_considered": 1}'
+        )
+
+    def fake_run(command, **kwargs):
+        calls.append({"command": command, "kwargs": kwargs})
+        return Result()
+
+    monkeypatch.setattr(harness.subprocess, "run", fake_run)
+    args = argparse.Namespace(
+        python="python-test",
+        seed_db_path="/tmp/provider_directory.db",
+        retest_results_path="/tmp/retest_results.json",
+        retest_results_url="https://example.test/retest_results.json",
+        credential_config_file="/tmp/provider-directory-credentials.json",
+        limit=5,
+        timeout=10,
+        concurrency=2,
+        source_query=None,
+        import_resources=False,
+        full_refresh=False,
+        stale_cleanup=None,
+        resource_limit=None,
+        linked_resource_limit=None,
+        page_limit=None,
+        page_count=None,
+        stream_batch_size=None,
+        source_concurrency=None,
+        publish_artifacts=None,
+        resources=None,
+        include_credentialed=False,
+        seed_only=True,
+        no_probe=True,
+        env={},
+        command_timeout=30,
+    )
+
+    result = harness._run_cli_case("local-cli", args)  # pylint: disable=protected-access
+
+    assert result.status == "succeeded"
+    command = calls[0]["command"]
+    assert command[:4] == ["python-test", "main.py", "start", "provider-directory-fhir"]
+    assert command[command.index("--retest-results-path") + 1] == "/tmp/retest_results.json"
+    assert command[command.index("--retest-results-url") + 1] == "https://example.test/retest_results.json"
+    assert command[command.index("--credential-config-file") + 1] == "/tmp/provider-directory-credentials.json"
+    assert result.metrics["supplemental_retest_sources_considered"] == 1
+
+
+def test_harness_parse_args_accepts_retest_supplement_args():
+    args = harness.parse_args(
+        [
+            "--retest-results-path",
+            "/tmp/retest_results.json",
+            "--retest-results-url",
+            "https://example.test/retest_results.json",
+            "--credential-config-file",
+            "/tmp/provider-directory-credentials.json",
+        ]
+    )
+
+    assert args.retest_results_path == "/tmp/retest_results.json"
+    assert args.retest_results_url == "https://example.test/retest_results.json"
+    assert args.credential_config_file == "/tmp/provider-directory-credentials.json"
+
+
+def test_harness_fixture_covers_healthcare_service_location_refs():
+    result = harness._run_fixture_case()  # pylint: disable=protected-access
+
+    assert result.status == "succeeded"
+    assert result.metrics["resource_counts"]["provider_directory_healthcare_service"] == 1
+    assert result.metrics["resource_counts"]["provider_directory_practitioner_role"] == 1
+
+
+def test_harness_run_includes_sql_typing_case(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        harness,
+        "_run_fixture_case",
+        lambda: harness.CaseResult(
+            case_id="fixture-parser",
+            kind="fixture",
+            status="succeeded",
+            elapsed_seconds=0.1,
+        ),
+    )
+    monkeypatch.setattr(
+        harness,
+        "_run_sql_typing_case",
+        lambda _args: harness.CaseResult(
+            case_id="sql-typing",
+            kind="sql",
+            status="succeeded",
+            elapsed_seconds=0.2,
+            metrics={"schema": "provider_directory_sql_typing_test"},
+        ),
+    )
+    args = argparse.Namespace(
+        output_dir=str(tmp_path),
+        sql_typing=True,
+        local_cli=False,
+        control_url=None,
+    )
+
+    report = harness.run(args)
+
+    assert report["overall_status"] == "succeeded"
+    assert [item["case_id"] for item in report["results"]] == ["fixture-parser", "sql-typing"]
+    assert json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))["results"][1]["kind"] == "sql"

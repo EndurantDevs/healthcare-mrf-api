@@ -58,6 +58,9 @@ def test_importer_registry_exposes_ptg_and_finish_lifecycle():
     assert items["provider-directory-fhir"]["schedulable"] is True
     assert items["provider-directory-fhir"]["cancelable"] is True
     assert any(param["name"] == "source_query" and param["type"] == "text" for param in items["provider-directory-fhir"]["params_schema"])
+    assert any(param["name"] == "retest_results_path" and param["type"] == "text" for param in items["provider-directory-fhir"]["params_schema"])
+    assert any(param["name"] == "retest_results_url" and param["type"] == "text" for param in items["provider-directory-fhir"]["params_schema"])
+    assert any(param["name"] == "credential_config_file" and param["type"] == "text" for param in items["provider-directory-fhir"]["params_schema"])
     assert any(param["name"] == "resource_limit" and param["type"] == "integer" for param in items["provider-directory-fhir"]["params_schema"])
     assert any(param["name"] == "full_refresh" and param["type"] == "boolean" for param in items["provider-directory-fhir"]["params_schema"])
     assert any(param["name"] == "stale_cleanup" and param["type"] == "boolean" for param in items["provider-directory-fhir"]["params_schema"])
@@ -72,6 +75,7 @@ def test_importer_registry_exposes_ptg_and_finish_lifecycle():
     assert any(param["name"] == "concurrency" and param["type"] == "integer" for param in items["provider-directory-fhir"]["params_schema"])
     assert any(param["name"] == "timeout" and param["type"] == "integer" for param in items["provider-directory-fhir"]["params_schema"])
     assert any(param["name"] == "open_only" and param["type"] == "boolean" for param in items["provider-directory-fhir"]["params_schema"])
+    assert any(param["name"] == "include_auth_required" and param["type"] == "boolean" for param in items["provider-directory-fhir"]["params_schema"])
     assert items["code-sets"]["enqueue_adapter"] == "arq_single_job"
     assert items["ms-drg"]["family"] == "reference"
     assert items["ms-drg"]["enqueue_adapter"] == "arq_single_job"
@@ -130,6 +134,10 @@ def test_importer_registry_exposes_ptg_and_finish_lifecycle():
         param["name"] == "refresh_mode" and param["type"] == "choice"
         for param in items["entity-address-unified"]["params_schema"]
     )
+    assert any(
+        param["name"] == "provider_directory_source_batch_size" and param["type"] == "integer"
+        for param in items["entity-address-unified"]["params_schema"]
+    )
     entity_refresh_mode = next(
         param for param in items["entity-address-unified"]["params_schema"] if param["name"] == "refresh_mode"
     )
@@ -163,7 +171,11 @@ def test_control_wrapped_publish_importers_request_shutdown():
     provider_directory_payload = control_imports._adapter_payload(
         control_imports._SINGLE_JOB_ADAPTERS["provider-directory-fhir"],
         {"run_id": "run_provider_directory", "importer": "provider-directory-fhir", "family": "provider"},
-        {"import_resources": True, "resource_limit": 100},
+        {
+            "import_resources": True,
+            "resource_limit": 100,
+            "retest_results_url": "https://raw.githubusercontent.com/hltiunn/provider-directory-db/main/data/retest_results.json",
+        },
     )
 
     assert facility_payload["run_shutdown"] is True
@@ -172,6 +184,10 @@ def test_control_wrapped_publish_importers_request_shutdown():
     assert provider_directory_payload["run_shutdown"] is True
     assert provider_directory_payload["target_module"] == "process.provider_directory_fhir"
     assert provider_directory_payload["task"]["resource_limit"] == 100
+    assert (
+        provider_directory_payload["task"]["retest_results_url"]
+        == "https://raw.githubusercontent.com/hltiunn/provider-directory-db/main/data/retest_results.json"
+    )
     assert npi_payload["run_shutdown"] is False
 
 def test_openaddresses_adapter_preserves_parallel_load_params():

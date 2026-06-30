@@ -519,6 +519,10 @@ class ProviderDirectoryOrganization(Base, JSONOutputMixin):
         {"index_elements": ("npi",), "name": "provider_directory_organization_npi_idx"},
         {"index_elements": ("tax_id",), "name": "provider_directory_organization_tax_id_idx"},
         {"index_elements": ("name",), "name": "provider_directory_organization_name_idx"},
+        {
+            "index_elements": ("last_seen_run_id", "source_id"),
+            "name": "provider_directory_organization_run_source_idx",
+        },
     ]
 
     source_id = Column(String(64), nullable=False)
@@ -551,6 +555,7 @@ class ProviderDirectoryLocation(Base, JSONOutputMixin):
         {"index_elements": ("zip5",), "name": "provider_directory_location_zip5_idx"},
         {"index_elements": ("state_code", "city_norm"), "name": "provider_directory_location_state_city_idx"},
         {"index_elements": ("last_seen_run_id",), "name": "provider_directory_location_run_idx"},
+        {"index_elements": ("last_seen_run_id", "source_id"), "name": "provider_directory_location_run_source_idx"},
         {
             "index_elements": ("phone_number",),
             "name": "provider_directory_location_phone_number_idx",

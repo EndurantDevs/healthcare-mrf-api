@@ -158,6 +158,9 @@ def test_manifest_artifact_marks_provider_directory_network_name_match_as_corrob
                 "state": "IL",
                 "postal_code": "62401",
                 "address_sources": ["provider_directory_fhir"],
+                "provider_directory_source_id": "pdfhir_aetna",
+                "provider_directory_org_name": "Aetna",
+                "provider_directory_plan_name": "Aetna Provider Directory",
                 "provider_directory_plan_context_matched": False,
                 "provider_directory_network_names": ["C2"],
                 "provider_directory_network_matches": [
@@ -185,8 +188,18 @@ def test_manifest_artifact_marks_provider_directory_network_name_match_as_corrob
         {
             "ptg_network_name": "C2",
             "provider_directory_network_name": "C2",
+            "provider_directory_network_key": "c2",
             "provider_directory_network_resource_id": "network-1",
             "provider_directory_network_ref": "Organization/network-1",
+            "provider_directory_network_match_method": "canonical_network_name",
+            "provider_directory_network_match_confidence": "candidate",
+            "provider_directory_network_match_key": "c2",
+            "provider_directory_source": "provider_directory_fhir",
+            "provider_directory_source_id": "pdfhir_aetna",
+            "provider_directory_org_name": "Aetna",
+            "provider_directory_plan_name": "Aetna Provider Directory",
+            "provider_directory_issuer_key": "aetna",
+            "provider_directory_issuer_network_match_key": "aetna:c2",
         }
     ]
     assert verification["address_verification_evidence"]["matched_on"] == (

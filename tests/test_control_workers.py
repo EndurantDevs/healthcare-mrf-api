@@ -187,6 +187,10 @@ def test_ensure_worker_can_create_kubernetes_job(monkeypatch):
     monkeypatch.setenv("HLTHPRT_WORKER_JOB_ENV_FROM_SECRET", "mrf-api-secret")
     monkeypatch.setenv("HLTHPRT_WORKER_JOB_PVC_NAME", "import-workdir")
     monkeypatch.setenv("HLTHPRT_WORKER_JOB_PVC_MOUNT_PATH", "/work")
+    monkeypatch.setenv(
+        "HLTHPRT_WORKER_JOB_SECRET_VOLUME_MOUNTS_JSON",
+        '[{"name":"provider-directory-credentials","secretName":"provider-directory-credentials","mountPath":"/var/run/healthporta/provider-directory","optional":true}]',
+    )
     monkeypatch.setenv("HLTHPRT_WORKER_JOB_ACTIVE_DEADLINE_SECONDS", "43200")
     monkeypatch.setenv("HLTHPRT_IMPORT_NODE_ID", "local_mrf")
     monkeypatch.setattr(control_workers, "_kubernetes_configured", lambda: True)
@@ -207,9 +211,20 @@ def test_ensure_worker_can_create_kubernetes_job(monkeypatch):
     assert container["command"][-2:] == ["process.ClaimsPricing", "--burst"]
     assert {"configMapRef": {"name": "mrf-api-config"}} in container["envFrom"]
     assert {"secretRef": {"name": "mrf-api-secret"}} in container["envFrom"]
-    assert container["volumeMounts"] == [{"name": "import-workdir", "mountPath": "/work"}]
+    assert container["volumeMounts"] == [
+        {"name": "import-workdir", "mountPath": "/work"},
+        {
+            "name": "provider-directory-credentials",
+            "mountPath": "/var/run/healthporta/provider-directory",
+            "readOnly": True,
+        },
+    ]
     assert job["spec"]["template"]["spec"]["volumes"] == [
-        {"name": "import-workdir", "persistentVolumeClaim": {"claimName": "import-workdir"}}
+        {"name": "import-workdir", "persistentVolumeClaim": {"claimName": "import-workdir"}},
+        {
+            "name": "provider-directory-credentials",
+            "secret": {"secretName": "provider-directory-credentials", "optional": True},
+        },
     ]
     assert "parallelism" not in job["spec"]
     assert "completions" not in job["spec"]
