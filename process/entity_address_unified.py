@@ -2119,13 +2119,37 @@ def _latest_provider_directory_partial_scope_sql(db_schema: str) -> str:
             role.source_id::varchar AS source_id,
             role.last_seen_run_id::varchar AS run_id
           FROM {role_ref} AS role
+          JOIN {db_schema}.provider_directory_practitioner AS practitioner
+            ON practitioner.source_id = role.source_id
+           AND practitioner.resource_id = NULLIF(
+                regexp_replace(COALESCE(role.practitioner_ref, ''), '^.*/', ''),
+                ''
+           )
          WHERE role.last_seen_run_id IS NOT NULL
+           AND practitioner.npi BETWEEN 1000000000 AND 9999999999
+           AND practitioner.active IS DISTINCT FROM false
+           AND role.active IS DISTINCT FROM false
         UNION
         SELECT DISTINCT
             affiliation.source_id::varchar AS source_id,
             affiliation.last_seen_run_id::varchar AS run_id
           FROM {affiliation_ref} AS affiliation
+          JOIN LATERAL (
+              SELECT DISTINCT normalized_ref AS resource_id
+                FROM (
+                    VALUES
+                        (NULLIF(regexp_replace(COALESCE(affiliation.organization_ref, ''), '^.*/', ''), '')),
+                        (NULLIF(regexp_replace(COALESCE(affiliation.participating_organization_ref, ''), '^.*/', ''), ''))
+                ) AS refs(normalized_ref)
+               WHERE normalized_ref IS NOT NULL
+          ) AS organization_ref ON TRUE
+          JOIN {organization_ref} AS organization
+            ON organization.source_id = affiliation.source_id
+           AND organization.resource_id = organization_ref.resource_id
          WHERE affiliation.last_seen_run_id IS NOT NULL
+           AND organization.npi BETWEEN 1000000000 AND 9999999999
+           AND organization.active IS DISTINCT FROM false
+           AND affiliation.active IS DISTINCT FROM false
         UNION
         SELECT DISTINCT
             healthcare_service.source_id::varchar AS source_id,

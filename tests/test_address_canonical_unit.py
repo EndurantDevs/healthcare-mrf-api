@@ -1215,6 +1215,11 @@ def test_latest_provider_directory_partial_scope_sql_prefers_metadata_then_resou
     assert "FROM mrf.provider_directory_practitioner_role AS role" in sql
     assert "FROM mrf.provider_directory_organization_affiliation AS affiliation" in sql
     assert "FROM mrf.provider_directory_organization AS organization" in sql
+    assert "JOIN mrf.provider_directory_practitioner AS practitioner" in sql
+    assert "practitioner.npi BETWEEN 1000000000 AND 9999999999" in sql
+    assert "JOIN LATERAL (" in sql
+    assert "organization.resource_id = organization_ref.resource_id" in sql
+    assert "organization.npi BETWEEN 1000000000 AND 9999999999" in sql
     assert "jsonb_array_length(COALESCE(organization.address_json::jsonb, '[]'::jsonb)) > 0" in sql
     assert "JOIN location_eligible_source_runs AS eligible" in sql
     assert "eligible.source_id = loc.source_id" in sql
