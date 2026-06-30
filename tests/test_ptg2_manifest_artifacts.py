@@ -482,7 +482,7 @@ def test_search_manifest_snapshot_adds_address_verification_to_expanded_provider
         snapshot_id="ptg2:202606:test",
         source_uri="file:///tmp/manifest.json",
         manifest={},
-        plans={"010854205": {"plan_name": "Heartland Dental"}},
+        plans={"010854205": {"plan_name": "Example Group"}},
         procedures={"CPT:29888": {"procedure_name": "ACL reconstruction"}},
         rows=(
             {
@@ -586,7 +586,7 @@ def test_search_manifest_snapshot_strips_no_display_provider_address_fields():
         snapshot_id="ptg2:202606:test",
         source_uri="file:///tmp/manifest.json",
         manifest={},
-        plans={"010854205": {"plan_name": "Heartland Dental"}},
+        plans={"010854205": {"plan_name": "Example Group"}},
         procedures={"CPT:29888": {"procedure_name": "ACL reconstruction"}},
         rows=(
             {

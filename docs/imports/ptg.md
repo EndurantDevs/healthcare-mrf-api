@@ -12,17 +12,17 @@ Imports Transparency in Coverage file structures through the PTG2 importer. PTG2
 python main.py start ptg
 ```
 
-Heartland Dental full-run example:
+Example group full-run command:
 ```bash
 HLTHPRT_PTG2_ARTIFACT_DIR="/Volumes/Data/data" \
 HLTHPRT_PTG2_KEEP_PARTIAL_ARTIFACTS=true \
 python main.py start ptg \
-  --toc-url "<SIGNED_UHC_HEARTLAND_DENTAL_INDEX_URL>" \
+  --toc-url "<SIGNED_UHC_EXAMPLE_GROUP_INDEX_URL>" \
   --plan-id 010854205 \
   --plan-market-type group \
   --import-month 2026-05-01 \
-  --import-id heartland_dental_202605_full \
-  --source-key heartland_dental
+  --import-id example_group_202605_full \
+  --source-key example_group
 ```
 
 ## Common Options

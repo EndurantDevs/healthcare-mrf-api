@@ -53,6 +53,7 @@ from process.ptg_parts.canonical import canonicalize_url, semantic_hash
 from process.ptg_parts.source_jobs import parse_toc_catalog_entries
 
 SOURCE_CONFIG_ENV = "HLTHPRT_MRF_DISCOVERY_SOURCE_CONFIG"
+PRIVATE_SEED_CONTEXT_PATHS_ENV = "HLTHPRT_MRF_DISCOVERY_PRIVATE_SEED_CONTEXT_PATHS"
 DEFAULT_SOURCE_CONFIG = Path("specs/mrf_source_discovery_sources.json")
 DISCOVERY_TABLES = (
     MRFPayer,
@@ -310,10 +311,85 @@ def _load_seed_list_rows(name: str | None) -> list[dict[str, str]]:
             raise ValueError(
                 f"seed list {name} missing required column(s): {', '.join(missing)}"
             )
-        return [
+        rows = [
             {key: str(value or "").strip() for key, value in row.items()}
             for row in reader
         ]
+    return _merge_private_seed_context_rows(name, rows)
+
+
+def _private_seed_context_paths() -> list[Path]:
+    raw = str(os.getenv(PRIVATE_SEED_CONTEXT_PATHS_ENV) or "").strip()
+    if not raw:
+        return []
+    paths = []
+    for value in raw.split(os.pathsep):
+        value = value.strip()
+        if not value:
+            continue
+        path = _resolve_config_path(os.path.expanduser(value))
+        if not path.exists():
+            raise ValueError(f"private seed context file does not exist: {path}")
+        paths.append(path)
+    return paths
+
+
+def _private_seed_context_rows(seed_list_name: str | None) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for path in _private_seed_context_paths():
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            fieldnames = set(reader.fieldnames or ())
+            if "group_number" not in fieldnames:
+                raise ValueError(f"private seed context {path} missing group_number")
+            for row in reader:
+                item = {key: str(value or "").strip() for key, value in row.items()}
+                row_seed_list = (
+                    item.get("seed_list")
+                    or item.get("seed_list_name")
+                    or item.get("list_name")
+                    or ""
+                ).strip()
+                if row_seed_list and row_seed_list != str(seed_list_name or ""):
+                    continue
+                rows.append(item)
+    return rows
+
+
+def _merge_private_seed_context_rows(
+    seed_list_name: str | None, rows: list[dict[str, str]]
+) -> list[dict[str, str]]:
+    private_rows = _private_seed_context_rows(seed_list_name)
+    if not private_rows:
+        return rows
+    by_group = {
+        str(row.get("group_number") or "").strip(): dict(row)
+        for row in rows
+        if str(row.get("group_number") or "").strip()
+    }
+    ordered_groups = [
+        str(row.get("group_number") or "").strip()
+        for row in rows
+        if str(row.get("group_number") or "").strip()
+    ]
+    for private_row in private_rows:
+        group_number = str(private_row.get("group_number") or "").strip()
+        if not group_number:
+            continue
+        existing = by_group.get(group_number, {})
+        merged = dict(existing)
+        for key, value in private_row.items():
+            if key in {"seed_list", "seed_list_name", "list_name"}:
+                continue
+            if value:
+                merged[key] = value
+        if not merged.get("status"):
+            merged["status"] = "active"
+        merged["group_number"] = group_number
+        by_group[group_number] = merged
+        if group_number not in ordered_groups:
+            ordered_groups.append(group_number)
+    return [by_group[group_number] for group_number in ordered_groups]
 
 
 def _configured_provider_names(key: str) -> list[str]:

@@ -973,9 +973,9 @@ def test_candidate_query_expansion_keeps_searchable_platform_sources():
     assert discovery._candidate_supports_source_query_expansion(aetna)
     assert not discovery._candidate_supports_source_query_expansion(direct_group)
     expanded = discovery._candidate_with_target_payer_query(
-        sapphire, "Plastipak Packaging"
+        sapphire, "Example Packaging"
     )
-    assert expanded.raw_payload["target_payer_query"] == "Plastipak Packaging"
+    assert expanded.raw_payload["target_payer_query"] == "Example Packaging"
     assert expanded.raw_payload["query_expansion_source"] is True
 
 
@@ -1356,8 +1356,8 @@ def test_query_expansion_match_tolerates_legal_suffix_and_concatenated_plan_text
         "Example Packaging Inc",
     )
     assert discovery._search_values_match_query(
-        ["Clubcorp USA Inc DBA Invited"],
-        "Invited Clubs",
+        ["Example Hospitality Group DBA Example Clubs"],
+        "Example Clubs",
     )
     assert not discovery._search_values_match_query(
         ["Unrelated PackagingHSA Aetna Choice POS II"],
@@ -4912,6 +4912,60 @@ def test_asr_health_benefits_seed_metadata_becomes_target_context(
         row["metadata_json"]["target_label"]
         == "ASR Health Benefits group 1208 - Example Forge LLC"
     )
+
+
+def test_asr_health_benefits_private_seed_context_overlay(tmp_path, monkeypatch):
+    seed_path = tmp_path / "asr-groups.csv"
+    seed_path.write_text(
+        "group_number,status,source_url\n"
+        "1208,active,https://www.asrhealthbenefits.com/MRF\n",
+        encoding="utf-8",
+    )
+    private_path = tmp_path / "private-asr-context.csv"
+    private_path.write_text(
+        "seed_list,group_number,status,company_name,employer_name,plan_name\n"
+        "asr_test,1208,active,Example Circuit LLC,Example Circuit LLC,Example Circuit ASR Plan\n"
+        "other_seed,1209,active,Other Private Group,Other Private Group,Other Plan\n"
+        "asr_test,1210,active,Example Added Group,Example Added Group,Example Added ASR Plan\n",
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "sources.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "providers": {},
+                "seed_lists": {
+                    "asr_test": {
+                        "schema": "group_number_seed_v1",
+                        "path": str(seed_path),
+                    }
+                },
+                "platform_resolvers": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(discovery.SOURCE_CONFIG_ENV, str(config_path))
+    monkeypatch.setenv(discovery.PRIVATE_SEED_CONTEXT_PATHS_ENV, str(private_path))
+    monkeypatch.setattr(discovery, "_SOURCE_CONFIG_CACHE", None)
+
+    source = {"source_id": "source_1", "display_name": "ASR Health Benefits"}
+    resolver = {
+        "type": "asr_health_benefits_mrf",
+        "toc_path": "/umbraco/surface/mrfdownload",
+        "seed_list": "asr_test",
+    }
+
+    targets = discovery._resolve_asr_health_benefits_mrf(
+        source, "https://www.asrhealthbenefits.com/MRF", resolver
+    )
+    by_group = {target.metadata["group_number"]: target for target in targets}
+
+    assert sorted(by_group) == ["1208", "1210"]
+    assert by_group["1208"].label == "ASR Health Benefits group 1208 - Example Circuit LLC"
+    assert by_group["1208"].metadata["company_name"] == "Example Circuit LLC"
+    assert by_group["1210"].label == "ASR Health Benefits group 1210 - Example Added Group"
+    assert by_group["1210"].metadata["plan_name"] == "Example Added ASR Plan"
 
 
 def test_asr_health_benefits_seed_list_dedupes_direct_and_configured_numbers(

@@ -820,7 +820,7 @@ def _fixture_payload():
     return {
         "version": 1,
         "snapshot_id": "snap-fixture",
-        "plans": {"010854205": {"name": "Heartland Dental"}},
+        "plans": {"010854205": {"name": "Example Group"}},
         "procedures": {
             "70551": {
                 "code": "70551",

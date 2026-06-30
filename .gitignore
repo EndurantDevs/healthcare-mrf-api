@@ -163,4 +163,6 @@ reports/*
 restore/
 service/*.csv
 service/*.csv.zip
+specs/mrf_seed_lists/*private*.csv
+specs/mrf_seed_lists/*context*.csv
 session.md
