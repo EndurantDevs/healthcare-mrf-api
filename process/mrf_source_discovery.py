@@ -11256,14 +11256,26 @@ async def _resolve_crawl_targets(
     crawl_target_limit: int | None = None,
 ) -> tuple[list[CrawlTarget], list[dict[str, Any]]]:
     items = [
-        (source, source.get("index_url") or source.get("human_url"))
-        for source in source_rows
+        (idx, source, source.get("index_url") or source.get("human_url"))
+        for idx, source in enumerate(source_rows)
         if source.get("index_url") or source.get("human_url")
     ]
     total = len(items)
     targets: list[CrawlTarget] = []
     observations: list[dict[str, Any]] = []
     semaphore = asyncio.Semaphore(max(1, int(concurrency or DEFAULT_CONCURRENCY)))
+    pending_labels = {
+        idx: _source_progress_label(source, url)
+        for idx, source, url in items
+    }
+
+    def pending_detail() -> str | None:
+        if not pending_labels:
+            return None
+        sample = list(pending_labels.values())[:5]
+        remaining = len(pending_labels) - len(sample)
+        suffix = f" +{remaining}" if remaining > 0 else ""
+        return f"waiting on: {', '.join(sample)}{suffix}"
 
     async def query_probe_targets(
         source: dict[str, Any], url_text: str, query: str | None
@@ -11283,8 +11295,8 @@ async def _resolve_crawl_targets(
         ]
 
     async def resolve_one(
-        source: dict[str, Any], url: Any
-    ) -> tuple[list[CrawlTarget], list[dict[str, Any]]]:
+        idx: int, source: dict[str, Any], url: Any
+    ) -> tuple[int, list[CrawlTarget], list[dict[str, Any]]]:
         url_text = str(url)
         async with semaphore:
             target_query = _source_target_payer_query(source)
@@ -11310,7 +11322,7 @@ async def _resolve_crawl_targets(
                         is not None
                     ]
                 if not resolved_targets:
-                    return [], [
+                    return idx, [], [
                         _crawl_skipped_observation(
                             source,
                             url_text,
@@ -11318,18 +11330,22 @@ async def _resolve_crawl_targets(
                             run_id,
                         )
                     ]
-                return resolved_targets, []
+                return idx, resolved_targets, []
             except Exception as exc:  # pylint: disable=broad-exception-caught
                 probe_targets = await query_probe_targets(
                     source, url_text, target_query
                 )
                 if probe_targets:
-                    return probe_targets, []
-                return [], [_crawl_failed_observation(source, url_text, exc, run_id)]
+                    return idx, probe_targets, []
+                return idx, [], [_crawl_failed_observation(source, url_text, exc, run_id)]
 
-    tasks = [asyncio.create_task(resolve_one(source, url)) for source, url in items]
+    tasks = [
+        asyncio.create_task(resolve_one(idx, source, url))
+        for idx, source, url in items
+    ]
     for done, task in enumerate(asyncio.as_completed(tasks), start=1):
-        resolved_targets, resolved_observations = await task
+        idx, resolved_targets, resolved_observations = await task
+        pending_labels.pop(idx, None)
         targets.extend(resolved_targets)
         observations.extend(resolved_observations)
         if progress_run_id:
@@ -11342,8 +11358,22 @@ async def _resolve_crawl_targets(
                 done=done,
                 total=total,
                 message=f"resolved {done}/{total} source pages",
+                detail=pending_detail(),
             )
     return targets, observations
+
+
+def _source_progress_label(source: dict[str, Any], url: Any) -> str:
+    label = str(
+        source.get("display_name")
+        or source.get("payer_name")
+        or source.get("source_id")
+        or ""
+    ).strip()
+    if not label:
+        parsed = urlsplit(str(url or ""))
+        label = parsed.netloc or str(url or "").strip() or "source"
+    return re.sub(r"\s+", " ", label)[:80]
 
 
 def _crawl_target_rank(target: CrawlTarget) -> tuple[int, str]:

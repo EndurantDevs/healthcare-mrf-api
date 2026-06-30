@@ -40,6 +40,10 @@ def _load_migration(filename: str):
     return module
 
 
+def _entity_address_unified_private(name: str):
+    return getattr(entity_address_unified, name)
+
+
 def test_suite_variants_share_one_address_key():
     variants = [
         ("123 MAIN STREET", "SUITE 200", "Miami", "FL", "33156-2814", "US"),
@@ -2570,41 +2574,72 @@ def test_entity_address_unified_provider_directory_replacement_copies_unaffected
     assert "DELETE FROM mrf.entity_address_unified" not in sql
 
 
-def test_entity_address_unified_provider_directory_replacement_can_copy_into_heap():
-    heap_name = entity_address_unified._provider_directory_replacement_stage_table_name(  # pylint: disable=protected-access
+def _provider_directory_replacement_sql_parts():
+    heap_name = _entity_address_unified_private(
+        "_provider_directory_replacement_stage_table_name"
+    )("entity_address_unified_20260614")
+    affected_location_table = _entity_address_unified_private(
+        "_provider_directory_affected_live_location_table_name"
+    )(
         "entity_address_unified_20260614"
     )
-    affected_location_table = entity_address_unified._provider_directory_affected_live_location_table_name(  # pylint: disable=protected-access
-        "entity_address_unified_20260614"
-    )
-    create_sql = entity_address_unified._create_provider_directory_replacement_stage_sql(  # pylint: disable=protected-access
+    create_sql = _entity_address_unified_private(
+        "_create_provider_directory_replacement_stage_sql"
+    )(
         "mrf",
         replacement_stage_table=heap_name,
         stage_table="entity_address_unified_20260614",
     )
-    prepare_affected_sql = entity_address_unified._prepare_provider_directory_affected_live_locations_sql(  # pylint: disable=protected-access
+    prepare_affected_sql = _entity_address_unified_private(
+        "_prepare_provider_directory_affected_live_locations_sql"
+    )(
         "mrf",
         live_table="entity_address_unified",
         affected_group_table="entity_address_unified_20260614_pd_groups",
         replacement_lookup_table="entity_address_unified_20260614",
         affected_location_table=affected_location_table,
     )
-    index_affected_sql = entity_address_unified._index_provider_directory_affected_live_locations_sql(  # pylint: disable=protected-access
+    index_affected_sql = _entity_address_unified_private(
+        "_index_provider_directory_affected_live_locations_sql"
+    )(
         "mrf",
         affected_location_table,
     )
-    copy_live_sql = entity_address_unified._copy_unaffected_live_entity_rows_by_location_sql(  # pylint: disable=protected-access
+    copy_live_sql = _entity_address_unified_private(
+        "_copy_unaffected_live_entity_rows_by_location_sql"
+    )(
         "mrf",
         live_table="entity_address_unified",
         target_stage_table=heap_name,
         affected_location_table=affected_location_table,
     )
-    copy_stage_sql = entity_address_unified._copy_stage_entity_rows_sql(  # pylint: disable=protected-access
+    copy_stage_sql = _entity_address_unified_private(
+        "_copy_stage_entity_rows_sql"
+    )(
         "mrf",
         source_stage_table="entity_address_unified_20260614",
         target_stage_table=heap_name,
     )
+    return {
+        "heap_name": heap_name,
+        "affected_location_table": affected_location_table,
+        "create_sql": create_sql,
+        "prepare_affected_sql": prepare_affected_sql,
+        "index_affected_sql": index_affected_sql,
+        "copy_live_sql": copy_live_sql,
+        "copy_stage_sql": copy_stage_sql,
+    }
 
+
+def test_entity_address_unified_provider_directory_replacement_can_copy_into_heap():
+    parts = _provider_directory_replacement_sql_parts()
+    heap_name = parts["heap_name"]
+    affected_location_table = parts["affected_location_table"]
+    create_sql = parts["create_sql"]
+    prepare_affected_sql = parts["prepare_affected_sql"]
+    index_affected_sql = parts["index_affected_sql"]
+    copy_live_sql = parts["copy_live_sql"]
+    copy_stage_sql = parts["copy_stage_sql"]
     assert heap_name.endswith("_pd_replacement")
     assert f"CREATE UNLOGGED TABLE mrf.{heap_name}" in create_sql
     assert "(LIKE mrf.entity_address_unified_20260614 INCLUDING DEFAULTS)" in create_sql

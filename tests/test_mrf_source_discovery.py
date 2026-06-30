@@ -10874,6 +10874,8 @@ async def test_resolve_crawl_targets_progress_reports_source_pages(monkeypatch):
     assert progress[-1]["phase"] == "resolving source pages"
     assert progress[-1]["unit"] == "sources"
     assert progress[-1]["message"] == "resolved 2/2 source pages"
+    assert progress[0]["detail"] == "waiting on: source_2"
+    assert progress[-1].get("detail") is None
 
 
 @pytest.mark.asyncio
