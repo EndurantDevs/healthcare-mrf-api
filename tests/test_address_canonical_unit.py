@@ -3196,6 +3196,7 @@ def test_entity_address_unified_phase_timing_rows_reads_insert_rowcount():
 
 
 def test_entity_address_unified_fallback_summary_counts_prefer_replacement_rows():
+    fallback_summary_counts = getattr(entity_address_unified, "_fallback_summary_counts")
     context = {
         "partial_provider_directory_replacement_rows": 35506247,
         "phase_timings": {
@@ -3205,7 +3206,7 @@ def test_entity_address_unified_fallback_summary_counts_prefer_replacement_rows(
         },
     }
 
-    assert entity_address_unified._fallback_summary_counts(context) == {  # pylint: disable=protected-access
+    assert fallback_summary_counts(context) == {
         "staged_rows": 35506247,
         "npi_rows": 0,
         "inferred_rows": 0,
