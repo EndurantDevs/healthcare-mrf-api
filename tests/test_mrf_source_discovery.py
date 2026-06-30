@@ -1191,6 +1191,7 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
 | Imagine360 | tpa | https://caa.imagine360.com/IMAGINE360%20SERVICES%20LLC/index.html | aliases: Imagine 360 |
 | Patient Advocates | tpa | https://www.mymedicalshopper.com/mrf-search/patient-advocates | aliases: Patient Advocates LLC |
 | Planned Administrators Inc | tpa | https://www.paisc.com/compliance-machine-readable-files-mrfs | aliases: PAI, Planned Administrators |
+| Prodegi | tpa | https://www.mymedicalshopper.com/mrf-search/prodegi | benefit lines: medical, dental, vision; aliases: Prodegi Benefits |
 | ReDirect Health | tpa | https://www.redirecthealth.com/machine-readable-data/ | aliases: Redirect Health |
 | Simplified Benefits Administrators | tpa | https://mrf.healthcarebluebook.com/SBA | aliases: SBA |
 | SIHO | tpa | https://www.mymedicalshopper.com/mrf-search/siho | aliases: SIHO Insurance Services |
@@ -1366,6 +1367,8 @@ def test_master_list_public_gap_sources_classify_supported_platforms():
         "PAI",
         "Planned Administrators",
     )
+    assert by_name["Prodegi"].hosting_platform == "mymedicalshopper_talon"
+    assert by_name["Prodegi"].benefit_lines == ("medical", "dental", "vision")
     assert by_name["ReDirect Health"].hosting_platform == "html_mrf_links"
     assert (
         by_name["Simplified Benefits Administrators"].hosting_platform
@@ -1507,6 +1510,7 @@ async def test_master_list_keeps_high_value_public_aliases():
 
     assert "Wellmark Blue Cross and Blue Shield" in by_name["Wellmark"].aliases
     assert "Wellmark Health Plan of Iowa, Inc." in by_name["Wellmark"].aliases
+    assert "Wellmark Blue Dental" in by_name["Wellmark"].aliases
     assert (
         "Blue Cross Blue Shield Global Solutions"
         in by_name["BCBS Global Solutions"].aliases
@@ -1521,6 +1525,11 @@ async def test_master_list_keeps_high_value_public_aliases():
         "MERITAIN HEALTH (NORTH AMERICAN HEALTH PLAN)"
         in by_name["Meritain Health"].aliases
     )
+    assert by_name["Firefly Health"].entity_type == "dtc"
+    assert by_name["Firefly Health"].benefit_lines == ("medical",)
+    assert by_name["Firefly Health"].status == "needs_review"
+    assert by_name["Firefly Health"].index_url is None
+    assert "Firefly Health Plan" in by_name["Firefly Health"].aliases
     assert "The Standard AHL" in aliases_by_name["Meritain Health"]
     assert "American Heritage Life" in aliases_by_name["Meritain Health"]
     assert (
@@ -1546,6 +1555,10 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "UHC Vision (Using Spectera Network)" in by_name["United Healthcare"].aliases
     assert "UMR (Using Spectera Network)" in by_name["United Healthcare"].aliases
     assert "Lincoln Financial Group - Spectera" in by_name["United Healthcare"].aliases
+    assert (
+        "The Lincoln National Life Insurance Company"
+        in by_name["United Healthcare"].aliases
+    )
     assert "UHC Global" in by_name["United Healthcare"].aliases
     assert "Kansas City Life" in by_name["United Healthcare"].aliases
     assert "Kansas City Life Insurance Company" in by_name["United Healthcare"].aliases
@@ -1639,6 +1652,7 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Ameritas with EyeMed" in by_name["EyeMed"].aliases
     assert "Ameritas Life Insurance Corp. EyeMed" in by_name["EyeMed"].aliases
     assert "Ameritas Life Ins Corp. EyeMed" in by_name["EyeMed"].aliases
+    assert "Mututal of Omaha" in by_name["EyeMed"].aliases
     assert "Mutual of Omaha with EyeMed" in by_name["EyeMed"].aliases
     assert "Mutual of Omaha Vision with EyeMed" in by_name["EyeMed"].aliases
     assert "Mutual of Omaha Insurance Company EyeMed" in by_name["EyeMed"].aliases
@@ -1778,6 +1792,11 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Guardian Vision Avesis" in by_name["Avesis"].aliases
     assert "Guardian Vision with Avesis" in by_name["Avesis"].aliases
     for review_only_name in (
+        "Dominion National Vision",
+        "Group Vision Service",
+        "Humana Vision",
+        "SecureCare Vision",
+        "Vision Care Direct",
         "Guardian Vision",
         "MetLife Vision",
         "Principal Vision",
@@ -1795,6 +1814,11 @@ async def test_master_list_keeps_high_value_public_aliases():
         assert by_name[review_only_name].benefit_lines == ("vision",)
         assert by_name[review_only_name].status == "needs_review"
         assert by_name[review_only_name].index_url is None
+    assert "Dominion National" in by_name["Dominion National Vision"].aliases
+    assert "GVS" in by_name["Group Vision Service"].aliases
+    assert "Humana Insurance Company" in by_name["Humana Vision"].aliases
+    assert "SecureCare" in by_name["SecureCare Vision"].aliases
+    assert "Vision Care Direct" in by_name["Vision Care Direct"].aliases
     assert "Guardian" in by_name["Guardian Vision"].aliases
     assert "Guaridan" in by_name["Guardian Vision"].aliases
     assert "MetLife" in by_name["MetLife Vision"].aliases
@@ -1803,6 +1827,8 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "Principle" in by_name["Principal Vision"].aliases
     assert "Ameritas" in by_name["Ameritas Vision"].aliases
     assert "Ameritas Life Ins. Corp." in by_name["Ameritas Vision"].aliases
+    assert "The Business Council" in by_name["Ameritas Vision"].aliases
+    assert "Fusion Vision" in by_name["Ameritas Vision"].aliases
     assert "SunLife" in by_name["Sun Life Vision"].aliases
     assert "SunLife Financail" in by_name["Sun Life Vision"].aliases
     assert "Equtiable" in by_name["Equitable Vision"].aliases
@@ -1814,6 +1840,30 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "DeltaDental" in by_name["Delta Dental"].aliases
     assert "Delta Dental of Iowa" in by_name["Delta Dental"].aliases
     assert "Delta Dental of Missouri" in by_name["Delta Dental"].aliases
+    for review_only_name in (
+        "Dominion National Dental",
+        "Florida Combined Life Dental",
+        "Highmark Blue Edge Dental",
+        "Humana Dental",
+        "Premier Access Dental",
+        "SecureCare Dental",
+        "Superior Dental Care",
+        "Solstice Dental",
+        "TruAssure Dental",
+    ):
+        assert by_name[review_only_name].entity_type == "dental"
+        assert by_name[review_only_name].benefit_lines == ("dental",)
+        assert by_name[review_only_name].status == "needs_review"
+        assert by_name[review_only_name].index_url is None
+    assert "Dominion National" in by_name["Dominion National Dental"].aliases
+    assert "Florida Combined Life" in by_name["Florida Combined Life Dental"].aliases
+    assert "Blue Edge Dental" in by_name["Highmark Blue Edge Dental"].aliases
+    assert "Humana Insurance Company" in by_name["Humana Dental"].aliases
+    assert "Premier Access" in by_name["Premier Access Dental"].aliases
+    assert "SecureCare" in by_name["SecureCare Dental"].aliases
+    assert "Superior Dental Care, Inc." in by_name["Superior Dental Care"].aliases
+    assert "Solstice Benefits, Inc." in by_name["Solstice Dental"].aliases
+    assert "TruAssure" in by_name["TruAssure Dental"].aliases
     assert by_name["Guardian Dental"].entity_type == "dental"
     assert by_name["Guardian Dental"].benefit_lines == ("dental",)
     assert by_name["Guardian Dental"].status == "needs_review"
@@ -1836,6 +1886,10 @@ async def test_master_list_keeps_high_value_public_aliases():
     )
     assert by_name["Ameritas Dental"].status == "needs_review"
     assert "Ameritas" in by_name["Ameritas Dental"].aliases
+    assert "The Business Council" in by_name["Ameritas Dental"].aliases
+    assert "First Ameritas Life Insurance Corp. of New York" in (
+        by_name["Ameritas Dental"].aliases
+    )
     assert by_name["Sun Life Dental"].status == "needs_review"
     assert "SunLife" in by_name["Sun Life Dental"].aliases
     assert "SunLife Financail" in by_name["Sun Life Dental"].aliases
@@ -2244,6 +2298,8 @@ async def test_master_list_public_alias_queries_match_expected_candidates():
     assert "Regence" in matching_names("UTAH REGENCE BLUE CROSS BLUE SHIELD")
     assert "Community Health Options" in matching_names("Maine Community Health Options")
     assert "Point C" in matching_names("Point-C")
+    assert "Firefly Health" in matching_names("Firefly Health")
+    assert "Firefly Health" not in matching_importable_names("Firefly Health")
     assert "First Choice Health" in matching_names("First Choice Health Network")
     assert "Health Plan of Nevada" in matching_names("Health Plan of Nevada, Inc.")
     assert "Allegiance Benefit Plan Management" in matching_names(
@@ -2278,6 +2334,22 @@ async def test_master_list_public_alias_queries_match_expected_candidates():
         "United of Omaha Life Insurance Company"
     )
     assert "Ameritas Vision" in matching_names("Ameritas Life Ins. Corp.")
+    assert "Ameritas Dental" in matching_names("The Business Council")
+    assert "Ameritas Vision" in matching_names("The Business Council")
+    assert "Dominion National Dental" in matching_names("Dominion National Dental")
+    assert "Dominion National Vision" in matching_names("Dominion National")
+    assert "Humana Dental" in matching_names("Humana Insurance Company")
+    assert "Humana Vision" in matching_names("Humana Insurance Company")
+    assert "Humana Dental" not in matching_importable_names("Humana Insurance Company")
+    assert "Humana Vision" not in matching_importable_names("Humana Insurance Company")
+    assert "EyeMed" in matching_importable_names("Mututal of Omaha")
+    assert "United Healthcare" in matching_importable_names(
+        "The Lincoln National Life Insurance Company"
+    )
+    assert "Prodegi" in matching_importable_names("Prodegi")
+    assert "Wellmark" in matching_importable_names("Wellmark Blue Dental")
+    assert "Solstice Dental" in matching_names("Solstice Benefits, Inc.")
+    assert "Solstice Dental" not in matching_importable_names("Solstice Benefits, Inc.")
     assert "Sun Life Dental" in matching_names("SunLife Financail")
     assert "United Concordia Dental" in matching_names("United Concorida")
     assert "EMI Health" in matching_importable_names("TDA Dental")
