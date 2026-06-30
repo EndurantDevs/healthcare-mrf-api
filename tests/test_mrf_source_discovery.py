@@ -2188,6 +2188,12 @@ async def test_master_list_keeps_high_value_public_aliases():
     assert "BlueCross BlueShield of NC" in aliases_by_name["BCBS North Carolina"]
     assert "Community Eye Care" in aliases_by_name["BCBS North Carolina"]
     assert "CEC Vision" in aliases_by_name["BCBS North Carolina"]
+    assert by_name["BCBS Louisiana"].benefit_lines == (
+        "medical",
+        "dental",
+        "vision",
+    )
+    assert "Blue Cross Blue Shield of Louisiana" in by_name["BCBS Louisiana"].aliases
     assert by_name["Triple-S Salud"].hosting_platform == "triples_mtt_api"
     assert "Care Plus ELA" in by_name["Triple-S Salud"].aliases
     assert (
@@ -2215,6 +2221,7 @@ async def test_master_list_keeps_high_value_public_aliases():
         "Blue Cross and Blue Shield of Massachusetts HMO Blue, Inc."
         in by_name["BCBS Massachusetts"].aliases
     )
+    assert by_name["BCBS Massachusetts"].benefit_lines == ("medical", "dental")
     assert "MISSOURI BLUE CROSS OF KANSAS CITY" in by_name["BCBS Kansas City"].aliases
     assert "BlueCross BlueShield of AZ" in by_name["BCBS Arizona"].aliases
     assert "BlueCross BlueShield of Arizona" in by_name["BCBS Arizona"].aliases
